@@ -227,6 +227,15 @@ class GrpoWindowBatcher:
                 self._canonical_prompt_tokens(request.prompt_idx)
             )
 
+        # Allow up to 1 truncated rollout per submission. At T_PROTO=0.9 on
+        # math problems with Qwen3-4B, ~1/8 rollouts statistically drift past
+        # max_new_tokens without sampling EOS. Failing the entire submission
+        # for a single drift makes acceptance vanishingly rare. The truncated
+        # rollout itself is still excluded from the per-rollout behavioural
+        # checks below (logprobs / distribution) since they assume completion.
+        MAX_TRUNCATED_PER_SUBMISSION = 1
+        truncated_count = 0
+
         for rollout in request.rollouts:
             # Schema check: structural validation of commit dict (cheap, no GPU)
             try:
@@ -269,7 +278,14 @@ class GrpoWindowBatcher:
                 if not verify_termination(
                     rollout.commit, self.tokenizer, proof.logits, self.model
                 ):
-                    return self._reject(RejectReason.BAD_TERMINATION)
+                    truncated_count += 1
+                    if truncated_count > MAX_TRUNCATED_PER_SUBMISSION:
+                        return self._reject(RejectReason.BAD_TERMINATION)
+                    # Skip the per-rollout behavioural checks below (logprobs,
+                    # distribution) for this truncated rollout — they assume a
+                    # completed sequence. The reward is still counted in the
+                    # group's σ for the out_of_zone gate.
+                    continue
 
             # Behavioural checks (use cached logits from the GRAIL forward pass).
             # Skip gracefully if the logits tensor is empty (legacy stubs in tests).
