@@ -758,7 +758,17 @@ def test_rejected_grail_fail_omits_sketch_diff_max(monkeypatch):
     assert rec.hotkey == "hk_grail"
     assert rec.prompt_idx == 3
     assert rec.reason == "grail_fail"
-    assert rec.sketch_diff_max is None  # ← anti-tuning invariant
+    # Anti-tuning invariant: NO diagnostic field may surface on GRAIL_FAIL.
+    # Identity fields (hotkey, prompt_idx, reason) are explicitly excluded;
+    # everything else must be scrubbed to None.
+    identity_fields = {"hotkey", "prompt_idx", "reason"}
+    for field_name in rec.__dataclass_fields__:
+        if field_name in identity_fields:
+            continue
+        assert getattr(rec, field_name) is None, (
+            f"GRAIL_FAIL leaked tuning signal via field {field_name!r} "
+            f"(value={getattr(rec, field_name)!r}); add scrubbing in _reject."
+        )
 
 
 def test_rejected_submissions_capped_per_hotkey(monkeypatch):
