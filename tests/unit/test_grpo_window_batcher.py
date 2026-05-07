@@ -759,3 +759,33 @@ def test_rejected_grail_fail_omits_sketch_diff_max(monkeypatch):
     assert rec.prompt_idx == 3
     assert rec.reason == "grail_fail"
     assert rec.sketch_diff_max is None  # ← anti-tuning invariant
+
+
+def test_rejected_submissions_capped_per_hotkey(monkeypatch):
+    """6th rejection from same hotkey must NOT grow the list (cap = 5)."""
+    from reliquary.protocol.submission import RejectReason
+    from reliquary.constants import REJECTED_LIST_CAP_PER_HOTKEY
+
+    assert REJECTED_LIST_CAP_PER_HOTKEY == 5  # plan invariant
+
+    b = _make_batcher()
+    # Trigger BAD_PROMPT_IDX repeatedly — cheapest reject path that needs no
+    # heavy stubbing (just send prompt_idx >= len(env)).
+    spam_hotkey = "hk_spam"
+    for i in range(REJECTED_LIST_CAP_PER_HOTKEY + 3):
+        req = _build_request(
+            hotkey=spam_hotkey,
+            prompt_idx=10_000 + i,  # past env size to force BAD_PROMPT_IDX
+        )
+        resp = b.accept_submission(req)
+        assert resp.reason == RejectReason.BAD_PROMPT_IDX
+
+    # List capped, but counter keeps climbing.
+    assert len(b.rejected_submissions) == REJECTED_LIST_CAP_PER_HOTKEY
+    assert b.reject_counts["bad_prompt_idx"] == REJECTED_LIST_CAP_PER_HOTKEY + 3
+
+    # Different hotkey gets its own quota.
+    other_req = _build_request(hotkey="hk_other", prompt_idx=99_999)
+    b.accept_submission(other_req)
+    assert len(b.rejected_submissions) == REJECTED_LIST_CAP_PER_HOTKEY + 1
+    assert b.rejected_submissions[-1].hotkey == "hk_other"
