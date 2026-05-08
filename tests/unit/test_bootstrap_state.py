@@ -103,34 +103,6 @@ async def test_bootstrap_checkpoint_n_from_hf_commits():
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_ema_replayed_from_archives():
-    """EMA is replayed from R2 archives so miners who contributed historically score."""
-    svc = _make_service()
-
-    archives = [
-        {"window_start": 1, "batch": [{"hotkey": "alice", "prompt_idx": 0}]},
-        {"window_start": 2, "batch": [{"hotkey": "alice", "prompt_idx": 1}]},
-        {"window_start": 3, "batch": [{"hotkey": "bob", "prompt_idx": 2}]},
-    ]
-
-    with (
-        patch(
-            "reliquary.infrastructure.storage.list_all_window_keys",
-            new=AsyncMock(return_value=[1, 2, 3]),
-        ),
-        patch(
-            "reliquary.infrastructure.storage.list_recent_datasets",
-            new=AsyncMock(return_value=archives),
-        ),
-        patch("huggingface_hub.HfApi.list_repo_commits", return_value=[]),
-    ):
-        await svc._bootstrap_state_from_external()
-
-    # Alice contributed 2 windows, bob 1 → alice should have higher EMA
-    assert svc._miner_scores_ema["alice"] > svc._miner_scores_ema.get("bob", 0.0)
-
-
-@pytest.mark.asyncio
 async def test_bootstrap_tolerates_r2_failure():
     """R2 failure during window key fetch → window_n stays 0, no exception raised."""
     svc = _make_service()

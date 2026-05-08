@@ -177,7 +177,6 @@ class ValidationService:
         # startup from R2 + HF (no local JSON state file).
         self._window_n: int = 0
         self._checkpoint_n: int = 0
-        self._miner_scores_ema: defaultdict[str, float] = defaultdict(float)
         self._publish_every = CHECKPOINT_PUBLISH_INTERVAL_WINDOWS
         self._checkpoint_store = CheckpointStore(
             validator_hotkey=wallet.hotkey.ss58_address,
@@ -191,34 +190,6 @@ class ValidationService:
 
         self._resume_from = resume_from
         self._load_model_fn = load_model_fn or _default_load_model
-
-    def _update_ema(self, batch: list) -> None:
-        """EMA update on the per-hotkey miner score dict.
-
-        Applied to every hotkey we've ever seen — absent miners this window
-        contribute 0 → their EMA decays by factor (1 - α). Active miners
-        blend in their fresh contribution.
-
-        The sum across all hotkeys converges to the smoothed fill rate of
-        the batch — burn is derived as the complement.
-        """
-        from reliquary.constants import EMA_ALPHA
-        alpha = EMA_ALPHA
-
-        window_contribs: dict[str, int] = defaultdict(int)
-        for sub in batch:
-            window_contribs[sub.hotkey] += 1
-
-        all_hotkeys = set(self._miner_scores_ema) | set(window_contribs)
-        for hk in all_hotkeys:
-            fraction = window_contribs.get(hk, 0) / B_BATCH
-            old = self._miner_scores_ema[hk]
-            self._miner_scores_ema[hk] = alpha * fraction + (1 - alpha) * old
-
-        # Prune near-zero entries to bound the dict size.
-        self._miner_scores_ema = defaultdict(float, {
-            hk: v for hk, v in self._miner_scores_ema.items() if v > 1e-6
-        })
 
     def _set_state(self, s: WindowState) -> None:
         self._current_window_state = s
@@ -606,9 +577,12 @@ class ValidationService:
             )
 
     async def _bootstrap_state_from_external(self) -> None:
-        """Derive window_n, checkpoint_n, and miner_scores_ema from R2 + HF.
+        """Derive window_n and checkpoint_n from R2 + HF.
 
-        Called once at startup before the main loop. Zero local state required.
+        Called once at startup before the main loop. Miner scoring (EMA) is
+        no longer bootstrapped here — ``_submit_weights`` recomputes it from
+        R2 archives at every submit, which keeps the trainer in lock-step
+        with weight-only validators replaying the same archives.
         """
         # 1. window_n from R2 archive keys
         try:
@@ -632,38 +606,6 @@ class ValidationService:
             logger.info("Bootstrapped checkpoint_n=%d from HF", self._checkpoint_n)
         except Exception:
             logger.exception("Failed to bootstrap checkpoint_n from HF; starting at 0")
-
-        # 3. miner_scores_ema by replaying last K archives
-        try:
-            archives = await storage.list_recent_datasets(
-                current_window=self._window_n + 1,
-                n=ROLLING_WINDOWS * 3,  # enough for EMA half-life to converge
-            )
-            self._miner_scores_ema = self._replay_ema(archives)
-            logger.info(
-                "Bootstrapped EMA from %d archives, %d hotkeys tracked",
-                len(archives), len(self._miner_scores_ema),
-            )
-        except Exception:
-            logger.exception("Failed to bootstrap EMA from R2; starting empty")
-
-    def _replay_ema(self, archives: list[dict]) -> "defaultdict[str, float]":
-        """Deterministically derive EMA state from a list of archives."""
-        from reliquary.constants import EMA_ALPHA
-        ema: defaultdict[str, float] = defaultdict(float)
-        alpha = EMA_ALPHA
-        # Sort ascending by window_start to replay in order
-        for record in sorted(archives, key=lambda r: int(r["window_start"])):
-            window_contribs: dict[str, int] = defaultdict(int)
-            for entry in record.get("batch", []):
-                window_contribs[entry["hotkey"]] += 1
-            all_hotkeys = set(ema) | set(window_contribs)
-            for hk in all_hotkeys:
-                fraction = window_contribs.get(hk, 0) / B_BATCH
-                old = ema[hk]
-                ema[hk] = alpha * fraction + (1 - alpha) * old
-            ema = defaultdict(float, {hk: v for hk, v in ema.items() if v > 1e-6})
-        return ema
 
     async def _rebuild_cooldown_from_history(self) -> None:
         """At startup, reconstruct CooldownMap from the last
@@ -718,6 +660,8 @@ class ValidationService:
         on-chain state. The trainer's in-memory EMA is no longer authoritative;
         R2 is the single source of truth for scoring.
         """
+        from reliquary.validator.weight_only import WeightOnlyValidator
+
         windows = await storage.list_all_window_keys()
         if not windows:
             logger.info("No archives yet; nothing to submit")
@@ -726,7 +670,7 @@ class ValidationService:
             current_window=max(windows) + 1,
             n=ROLLING_WINDOWS * 3,
         )
-        miner_weights = dict(self._replay_ema(archives))
+        miner_weights = dict(WeightOnlyValidator._replay_ema(archives))
         total = sum(miner_weights.values())
         burn_weight = max(0.0, 1.0 - total)
 
