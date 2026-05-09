@@ -61,6 +61,19 @@ class WeightOnlyValidator:
                     self._last_submit_block = current_block
             except asyncio.CancelledError:
                 raise
+            except asyncio.TimeoutError:
+                # Substrate WebSocket wedged — chain.* calls now surface
+                # this as TimeoutError instead of hanging forever. Drop
+                # the dead connection and rebuild before the next poll.
+                logger.warning(
+                    "substrate call timed out — recreating subtensor connection",
+                )
+                try:
+                    subtensor = await chain.get_subtensor()
+                    logger.info("substrate reconnected")
+                except Exception:
+                    logger.exception("substrate reconnect failed; will retry next poll")
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
             except Exception:
                 logger.exception("weight-only loop iteration failed")
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)
