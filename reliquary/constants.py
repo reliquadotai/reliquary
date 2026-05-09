@@ -59,7 +59,7 @@ ATTN_IMPLEMENTATION = _os.environ.get("GRAIL_ATTN_IMPL", "flash_attention_2")
 
 # Blocks per window — 5 blocks × 12s ≈ 60s.
 # All roles use this to determine window boundaries. With a typical tempo of
-# 360 blocks, that yields ROLLING_WINDOWS=72 windows of scoring per on-chain
+# 360 blocks, the EMA covers 72 windows of scoring history per on-chain
 # weight submission, providing ~72× smoothing of miner scores over the epoch.
 WINDOW_LENGTH = 5
 
@@ -219,7 +219,7 @@ CHECKPOINT_STAGING_DIR_DEFAULT = "reliquary/state/checkpoints"
 
 # ────────────────  SCORING  ────────────────
 
-# EMA smoothing factor for miner score. 2/(N+1) with N=ROLLING_WINDOWS=72
+# EMA smoothing factor for miner score. 2/(N+1) with N=72 (the EMA history depth).
 # gives a ~25-window half-life — a miner that stops contributing loses
 # half their score in ~25 windows.
 EMA_ALPHA = 2.0 / (72 + 1)  # ≈ 0.0274

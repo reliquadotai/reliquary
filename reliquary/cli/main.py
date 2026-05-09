@@ -258,7 +258,7 @@ def validate(
                 resume_from=resume_from or None,
             )
             # Run training + scoring as two independent concurrent loops so
-            # set_weights fires on its own 360-block cadence (~72 min) instead
+            # set_weights fires once per subnet epoch instead
             # of being gated by the trainer's window timeouts.
             from reliquary.validator.weight_only import WeightOnlyValidator
             weights_worker = WeightOnlyValidator(wallet=wallet, netuid=netuid)

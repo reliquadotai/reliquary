@@ -79,7 +79,7 @@ Earning is EMA-based, not flat per-submission. After each window, the validator 
 score_new = α × (slots_won / 8) + (1 − α) × score_old
 ```
 
-where `α ≈ 0.027` (`EMA_ALPHA = 2 / (72 + 1)`). Every `WEIGHT_SUBMISSION_INTERVAL = 360` blocks, the validator calls `set_weights` on-chain with these EMA values. Your emission for the interval is proportional to your EMA score relative to other miners.
+where `α ≈ 0.027` (`EMA_ALPHA = 2 / (72 + 1)`). Once per subnet epoch (~360 blocks), the validator calls `set_weights` on-chain with these EMA values. Your emission for the epoch is proportional to your EMA score relative to other miners.
 
 A miner that consistently wins 2 of 8 batch slots per window converges to roughly 25% of the filled-slot emission budget. Unused slots burn to `UID_BURN = 0`.
 

@@ -50,7 +50,7 @@ State transitions to `TRAINING`. `train_step()` computes group-relative advantag
 State transitions to `PUBLISHING`. Every `CHECKPOINT_PUBLISH_INTERVAL_WINDOWS = 10` windows the model is saved locally, pushed to HF Hub, and signed: `ed25519(checkpoint_n || revision)`. The signed manifest is installed in `/checkpoint`. Between publishes the miners stay on the last-published revision (enforced by the checkpoint hash gate). The window dataset is archived to R2.
 
 **9. State → READY → OPEN.**
-The next window opens immediately. Batched prompts enter a 50-window cooldown. Every `ROLLING_WINDOWS = 72` windows the validator calls `set_weights` on-chain with the current EMA snapshot.
+The next window opens immediately. Batched prompts enter a 50-window cooldown. Once per subnet epoch the validator calls `set_weights` on-chain with the current EMA snapshot.
 
 **Safety net.** If fewer than `B_BATCH` valid submissions arrive within `WINDOW_TIMEOUT_SECONDS = 600` seconds, the window seals on whatever arrived. Unused batch slots contribute to the burn weight for `UID_BURN`.
 
@@ -96,7 +96,7 @@ The EMA fixes this: after each window, every hotkey's score is updated as:
 score_new = α × (slots_won / B_BATCH) + (1 − α) × score_old
 ```
 
-where `α = EMA_ALPHA = 2 / (72 + 1) ≈ 0.027`. With `ROLLING_WINDOWS = 72`, this gives a ~25-window half-life. A miner that stops contributing loses half its score in ~25 windows. The EMA is replayed from R2 archives at startup (no local state file) — loss of local disk does not lose scoring history.
+where `α = EMA_ALPHA = 2 / (72 + 1) ≈ 0.027`. With a 72-window history, this gives a ~25-window half-life. A miner that stops contributing loses half its score in ~25 windows. The EMA is replayed from R2 archives at startup (no local state file) — loss of local disk does not lose scoring history.
 
 At each `set_weights` call the validator submits the current EMA values directly. The sum of all EMA scores is the smoothed fill rate; `burn = max(0, 1 − sum)` goes to `UID_BURN = 0`.
 
@@ -119,7 +119,7 @@ The base model is Qwen3-4B-Instruct (~4 billion parameters, ~8 GB in bfloat16). 
 1. Submit a valid in-zone group on a non-cooldown prompt when the window is `OPEN`.
 2. Be among the first `B_BATCH = 16` submissions with distinct `prompt_idx` values (FIFO by validator-side TCP arrival; first to claim each `prompt_idx` wins that slot).
 3. Each batch slot you win contributes `1/B_BATCH` to your EMA update for that window.
-4. Every `WEIGHT_SUBMISSION_INTERVAL = 360` blocks (`ROLLING_WINDOWS = 72` windows), the validator calls `set_weights` on-chain with the current EMA values. Your emission for that interval is proportional to your EMA score.
+4. Once per subnet epoch (~360 blocks), the validator calls `set_weights` on-chain with the current EMA values. All validators submit inside a shared ~20-block window before the epoch boundary so they converge on identical weights. Your emission for the epoch is proportional to your EMA score.
 
 ### Rough expected earnings
 

@@ -114,7 +114,7 @@ curl http://localhost:8080/health
 curl http://localhost:8080/state
 ```
 
-For the weight-only mode, the only signal that things are working is the log line `Submitting weights: N miners …` every ~30 minutes (`WEIGHT_SUBMISSION_INTERVAL = 360` blocks).
+For the weight-only mode, the only signal that things are working is the log line `Submitting weights: N miners …` once per subnet epoch (~30 minutes on netuid 81).
 
 ---
 

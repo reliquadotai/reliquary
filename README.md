@@ -51,7 +51,7 @@ Validators hold stake and run the training loop. Miners hold hotkeys, run GPU in
                          └──────────────┘
 ```
 
-Miners submit rollout groups to `/submit` and poll `/state` for checkpoint updates. The validator trains, publishes to HF, and broadcasts weights on-chain every `WEIGHT_SUBMISSION_INTERVAL = 360` blocks. Miners pull new weights via `/state` → HF `snapshot_download`. R2 stores the per-window rollout archive; the validator reads it at startup to rebuild the prompt cooldown map.
+Miners submit rollout groups to `/submit` and poll `/state` for checkpoint updates. The validator trains, publishes to HF, and broadcasts weights on-chain once per subnet epoch (~360 blocks on netuid 81), aligned to the epoch boundary so all validators converge on identical weights. Miners pull new weights via `/state` → HF `snapshot_download`. R2 stores the per-window rollout archive; the validator reads it at startup to rebuild the prompt cooldown map.
 
 ## Status
 
