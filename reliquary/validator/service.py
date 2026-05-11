@@ -490,6 +490,11 @@ class ValidationService:
             "Validator started (v2.1): env=%s, netuid=%d, http=%s:%d",
             self.env.name, self.netuid, self.server.host, self.server.port,
         )
+        # Build marker — uniquely identifies the deployed code version in
+        # logs after an auto-deploy (watchtower). Bump on every commit
+        # that ships new behavior; greppable via:
+        #   docker logs reliquary-trainer | grep "Reliquary build:"
+        logger.info("Reliquary build: r2-reliability-suite (Layers 1+2+3)")
         try:
             while True:
                 try:
