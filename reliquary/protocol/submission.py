@@ -41,6 +41,7 @@ class RejectReason(str, Enum):
     WRONG_ROLLOUT_COUNT = "wrong_rollout_count"
     WINDOW_MISMATCH = "window_mismatch"
     WINDOW_NOT_ACTIVE = "window_not_active"
+    WINDOW_BUSY = "window_busy"
     BAD_SCHEMA = "bad_schema"
     BAD_TOKENS = "bad_tokens"
     BAD_TERMINATION = "bad_termination"

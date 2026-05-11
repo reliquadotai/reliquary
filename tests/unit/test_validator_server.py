@@ -247,3 +247,123 @@ def test_checkpoint_endpoint_returns_manifest_when_set():
     assert body["repo_id"] == "aivolutionedge/reliquary-sn"
     assert body["revision"] == "rev_sha_042"
     assert body["signature"] == "ed25519:sig_42"
+
+
+# --- queue backpressure (bounded depth) ---
+
+def test_submit_rejects_window_busy_when_queue_full():
+    """When the submit queue is at or above MAX_SUBMIT_QUEUE_DEPTH, /submit
+    must reject new requests with WINDOW_BUSY instead of the silent
+    over-accept that used to drown miners post-seal.
+
+    The bound only fires under the worker path (real prod): the TestClient
+    sync path runs accept_submission inline. Mark ``_worker_task`` as
+    non-None so the prod branch is exercised, then pre-fill the queue.
+    """
+    import asyncio
+    from reliquary.constants import MAX_SUBMIT_QUEUE_DEPTH
+    from reliquary.protocol.submission import WindowState
+
+    server = ValidatorServer()
+    batcher = _batcher(window_start=500)
+    batcher.current_checkpoint_hash = "sha256:test"
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    # Pretend a worker is running so the prod enqueue branch is taken.
+    server._worker_task = object()  # any non-None sentinel
+    # Saturate the queue.
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        for _ in range(MAX_SUBMIT_QUEUE_DEPTH):
+            server._submit_queue.put_nowait((_request(), batcher))
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
+
+    client = TestClient(server.app)
+    resp = client.post("/submit", json=_request().model_dump(mode="json"))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["accepted"] is False
+    assert body["reason"] == "window_busy"
+
+
+def test_submit_accepts_when_queue_has_room():
+    """Below MAX_SUBMIT_QUEUE_DEPTH, /submit returns a provisional
+    accepted=True under the worker path."""
+    import asyncio
+    from reliquary.constants import MAX_SUBMIT_QUEUE_DEPTH
+    from reliquary.protocol.submission import WindowState
+
+    server = ValidatorServer()
+    batcher = _batcher(window_start=500)
+    batcher.current_checkpoint_hash = "sha256:test"
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    server._worker_task = object()
+    # One item already queued, well below MAX.
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        server._submit_queue.put_nowait((_request(), batcher))
+        assert server._submit_queue.qsize() < MAX_SUBMIT_QUEUE_DEPTH
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
+
+    client = TestClient(server.app)
+    resp = client.post("/submit", json=_request().model_dump(mode="json"))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["accepted"] is True
+    assert body["reason"] == "accepted"
+
+
+# --- worker drops items whose batcher is no longer active ---
+
+@pytest.mark.asyncio
+async def test_worker_drops_late_items_for_stale_batcher():
+    """The worker must skip queue items whose batcher is no longer the
+    server's active_batcher — those items were enqueued when the previous
+    window was OPEN and would otherwise burn GRAIL compute on a sealed
+    _valid that will never be archived.
+    """
+    import asyncio
+
+    server = ValidatorServer()
+    old_batcher = _batcher(window_start=500)
+    new_batcher = _batcher(window_start=501)
+    accept_calls: list[int] = []
+
+    def _spy_accept(req):
+        accept_calls.append(req.prompt_idx)
+        from reliquary.protocol.submission import BatchSubmissionResponse
+        return BatchSubmissionResponse(accepted=True, reason=RejectReason.ACCEPTED)
+
+    old_batcher.accept_submission = _spy_accept
+    new_batcher.accept_submission = _spy_accept
+
+    # Active is the new batcher. The queue has a leftover stale item plus
+    # one for the new batcher.
+    server.set_active_batcher(new_batcher)
+    await server._submit_queue.put((_request(prompt_idx=11), old_batcher))
+    await server._submit_queue.put((_request(prompt_idx=22), new_batcher))
+
+    # Run the worker just long enough to drain both items.
+    worker_task = asyncio.create_task(server._submit_worker())
+    # Yield until queue is empty.
+    for _ in range(50):
+        if server._submit_queue.empty():
+            break
+        await asyncio.sleep(0.01)
+    worker_task.cancel()
+    try:
+        await worker_task
+    except asyncio.CancelledError:
+        pass
+
+    # Only the active-batcher item should have hit accept_submission.
+    assert accept_calls == [22], (
+        f"expected only prompt 22 to be processed, got {accept_calls}"
+    )
