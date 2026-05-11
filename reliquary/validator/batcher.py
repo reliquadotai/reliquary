@@ -227,11 +227,6 @@ class GrpoWindowBatcher:
         if request.prompt_idx in self._claimed_prompts:
             return self._reject(RejectReason.SUPERSEDED, hotkey=hk, prompt_idx=pi)
 
-        # Record cooldown for this prompt as soon as it begins validation.
-        # Combined with the SUPERSEDED short-circuit above this ensures the
-        # same prompt isn't processed twice across the cooldown horizon.
-        self._cooldown.record_batched(request.prompt_idx, self.window_start)
-
         problem = self.env.get_problem(request.prompt_idx)
         completion_texts = []
         for rollout in request.rollouts:
