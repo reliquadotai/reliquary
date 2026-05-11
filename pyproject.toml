@@ -16,6 +16,7 @@ dependencies = [
     "huggingface-hub>=0.20.0",
     "datasets>=2.14.0",
     "aiobotocore>=2.0.0",
+    "boto3>=1.24.0",
     "botocore>=1.24.0",
     "typer>=0.9.0",
     "rich>=13.0.0",
