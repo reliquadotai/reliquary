@@ -142,6 +142,22 @@ class GrpoWindowBatcher:
             else CooldownMap(cooldown_windows=BATCH_PROMPT_COOLDOWN_WINDOWS)
         )
 
+        # Lock-free snapshot read by the HTTP /state handler. The submit
+        # worker holds ``_lock`` for the entire GRAIL verify (~5-25s); a
+        # /state caller acquiring the same lock synchronously on the asyncio
+        # event loop starved the loop and triggered cascading 60s timeouts
+        # on miners polling /state. The cooldown set for a given window is
+        # stable during the batcher's lifetime — ``_cooldown`` is only
+        # mutated by ``seal_batch`` at the very end — so a snapshot taken
+        # here is correct for /state's entire lifetime.
+        self.cooldown_prompts_snapshot: list[int] = sorted(
+            self._cooldown.current_cooldown_set(window_start)
+        )
+        # Atomic counter for /state's ``valid_submissions`` field. Updated
+        # under ``_lock`` after each successful accept; the read in /state
+        # is lock-free (int reads are GIL-atomic in CPython).
+        self.valid_count: int = 0
+
         if verify_commitment_proofs_fn is None:
             from reliquary.validator.verifier import verify_commitment_proofs
             verify_commitment_proofs_fn = verify_commitment_proofs
@@ -404,6 +420,8 @@ class GrpoWindowBatcher:
                 claimed_checkpoint_hash=request.checkpoint_hash,
             )
         )
+        # Lock-free read in /state — see ``__init__`` for rationale.
+        self.valid_count = len(self._valid)
 
         # v2.1: fire seal_event when B distinct non-cooldown prompts have been accepted.
         distinct_eligible = len({

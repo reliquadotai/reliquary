@@ -102,7 +102,13 @@ class ValidatorServer:
 
         @app.get("/state", response_model=GrpoBatchState)
         async def state() -> GrpoBatchState:
-            """Current window + checkpoint state. v2.1 has one active batcher per validator."""
+            """Current window + checkpoint state. Lock-free: reads only the
+            batcher's snapshot fields (set at construction) and the atomic
+            ``valid_count`` counter. The submit worker holds ``batcher._lock``
+            for up to ~25s per GRAIL verify, so this handler MUST NOT touch
+            it — otherwise miners polling /state starve the event loop and
+            timeout cascades hit every endpoint (see 2026-05-12 outage).
+            """
             batcher = self.active_batcher
             if batcher is None:
                 raise HTTPException(status_code=503, detail="no_active_window")
@@ -111,10 +117,8 @@ class ValidatorServer:
                 state=self._current_state,
                 window_n=batcher.window_start,
                 anchor_block=batcher.window_start,
-                cooldown_prompts=sorted(
-                    batcher._cooldown.current_cooldown_set(batcher.window_start)
-                ),
-                valid_submissions=len(batcher.valid_submissions()),
+                cooldown_prompts=batcher.cooldown_prompts_snapshot,
+                valid_submissions=batcher.valid_count,
                 checkpoint_n=cp.checkpoint_n if cp else 0,
                 checkpoint_repo_id=cp.repo_id if cp else None,
                 checkpoint_revision=cp.revision if cp else None,
