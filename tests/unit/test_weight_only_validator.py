@@ -96,10 +96,10 @@ async def test_submit_weights_maps_hotkeys_to_uids():
     assert UID_BURN in captured["uids"]
 
 
-async def _run_one_iteration(wov, subtensor):
+async def _run_one_iteration(wov):
     """Helper: run wov.run() until it completes one poll, then cancel."""
     import asyncio
-    task = asyncio.create_task(wov.run(subtensor))
+    task = asyncio.create_task(wov.run())
     await asyncio.sleep(0.05)
     task.cancel()
     try:
@@ -109,35 +109,43 @@ async def _run_one_iteration(wov, subtensor):
 
 
 def _patch_chain_and_storage(blocks_until: int, current_block: int = 1_000_000):
-    """Patch the four module-level chain/storage entry points
-    weight_only.run() touches. Returns (patches, captured_calls)."""
-    from unittest.mock import AsyncMock
+    """Patch the chain/storage entry points weight_only.run() touches.
+    Returns (originals, captured_calls)."""
+    from unittest.mock import AsyncMock, MagicMock
     import reliquary.validator.weight_only as wov_mod
 
     captured = {"submit_calls": 0}
-    originals = {
-        "blocks_until_next_epoch": wov_mod.chain.blocks_until_next_epoch,
-        "get_current_block": wov_mod.chain.get_current_block,
-        "list_all_window_keys": wov_mod.storage.list_all_window_keys,
-        "list_recent_datasets": wov_mod.storage.list_recent_datasets,
+    chain_mocks = {
+        "get_subtensor": AsyncMock(return_value=MagicMock()),
+        "close_subtensor": AsyncMock(),
+        "blocks_until_next_epoch": AsyncMock(return_value=blocks_until),
+        "get_current_block": AsyncMock(return_value=current_block),
     }
-    wov_mod.chain.blocks_until_next_epoch = AsyncMock(return_value=blocks_until)
-    wov_mod.chain.get_current_block = AsyncMock(return_value=current_block)
-    wov_mod.storage.list_all_window_keys = AsyncMock(return_value=[1, 2, 3])
-    wov_mod.storage.list_recent_datasets = AsyncMock(return_value=[
-        _archive(1, ["alice"]),
-        _archive(2, ["alice"]),
-        _archive(3, ["bob"]),
-    ])
+    storage_mocks = {
+        "list_all_window_keys": AsyncMock(return_value=[1, 2, 3]),
+        "list_recent_datasets": AsyncMock(return_value=[
+            _archive(1, ["alice"]),
+            _archive(2, ["alice"]),
+            _archive(3, ["bob"]),
+        ]),
+    }
+    originals = {
+        "chain": {k: getattr(wov_mod.chain, k) for k in chain_mocks},
+        "storage": {k: getattr(wov_mod.storage, k) for k in storage_mocks},
+    }
+    for k, v in chain_mocks.items():
+        setattr(wov_mod.chain, k, v)
+    for k, v in storage_mocks.items():
+        setattr(wov_mod.storage, k, v)
     return originals, captured
 
 
 def _restore(originals):
     import reliquary.validator.weight_only as wov_mod
-    wov_mod.chain.blocks_until_next_epoch = originals["blocks_until_next_epoch"]
-    wov_mod.chain.get_current_block = originals["get_current_block"]
-    wov_mod.storage.list_all_window_keys = originals["list_all_window_keys"]
-    wov_mod.storage.list_recent_datasets = originals["list_recent_datasets"]
+    for k, v in originals["chain"].items():
+        setattr(wov_mod.chain, k, v)
+    for k, v in originals["storage"].items():
+        setattr(wov_mod.storage, k, v)
 
 
 async def _wire_submit_counter(wov, captured):
@@ -158,7 +166,7 @@ async def test_bootstrap_submits_immediately_regardless_of_lead_window():
     originals, captured = _patch_chain_and_storage(blocks_until=200)
     await _wire_submit_counter(wov, captured)
     try:
-        await _run_one_iteration(wov, MagicMock())
+        await _run_one_iteration(wov)
     finally:
         _restore(originals)
     assert captured["submit_calls"] == 1
@@ -177,7 +185,7 @@ async def test_in_lead_window_submits():
     )
     await _wire_submit_counter(wov, captured)
     try:
-        await _run_one_iteration(wov, MagicMock())
+        await _run_one_iteration(wov)
     finally:
         _restore(originals)
     assert captured["submit_calls"] == 1
@@ -195,7 +203,7 @@ async def test_outside_lead_window_skips():
     )
     await _wire_submit_counter(wov, captured)
     try:
-        await _run_one_iteration(wov, MagicMock())
+        await _run_one_iteration(wov)
     finally:
         _restore(originals)
     assert captured["submit_calls"] == 0
@@ -212,7 +220,7 @@ async def test_repeat_poll_in_same_epoch_skips():
     )
     await _wire_submit_counter(wov, captured)
     try:
-        await _run_one_iteration(wov, MagicMock())
+        await _run_one_iteration(wov)
     finally:
         _restore(originals)
     assert captured["submit_calls"] == 0
@@ -232,8 +240,79 @@ async def test_next_epoch_submits_again():
     )
     await _wire_submit_counter(wov, captured)
     try:
-        await _run_one_iteration(wov, MagicMock())
+        await _run_one_iteration(wov)
     finally:
         _restore(originals)
     assert captured["submit_calls"] == 1
     assert wov._last_submit_epoch == 1_000_001 + EPOCH_SUBMIT_LEAD_BLOCKS
+
+
+@pytest.mark.asyncio
+async def test_blocks_until_timeout_recycles_subtensor():
+    """On a chain-call TimeoutError, the run loop must close the wedged
+    polling subtensor and pull a fresh one on the next iteration. The
+    previous reconnect path leaked the old subtensor, whose background
+    WebSocket task degraded the replacement and froze the loop for hours.
+    """
+    import asyncio as _asyncio
+    from unittest.mock import AsyncMock, MagicMock
+    from reliquary.validator.weight_only import WeightOnlyValidator
+    import reliquary.validator.weight_only as wov_mod
+
+    old_sub = MagicMock(name="old_sub")
+    new_sub = MagicMock(name="new_sub")
+    get_calls: list = []
+
+    async def fake_get_subtensor():
+        sub = old_sub if not get_calls else new_sub
+        get_calls.append(sub)
+        return sub
+
+    close_calls: list = []
+
+    async def fake_close(sub):
+        close_calls.append(sub)
+
+    bun_calls = {"n": 0}
+
+    async def fake_blocks_until(sub, netuid):
+        bun_calls["n"] += 1
+        if bun_calls["n"] == 1:
+            raise _asyncio.TimeoutError
+        return 200
+
+    originals = {
+        "get_subtensor": wov_mod.chain.get_subtensor,
+        "close_subtensor": wov_mod.chain.close_subtensor,
+        "blocks_until_next_epoch": wov_mod.chain.blocks_until_next_epoch,
+        "get_current_block": wov_mod.chain.get_current_block,
+    }
+    poll_orig = wov_mod.POLL_INTERVAL_SECONDS
+    wov_mod.chain.get_subtensor = fake_get_subtensor
+    wov_mod.chain.close_subtensor = fake_close
+    wov_mod.chain.blocks_until_next_epoch = fake_blocks_until
+    wov_mod.chain.get_current_block = AsyncMock(return_value=1_000_000)
+    wov_mod.POLL_INTERVAL_SECONDS = 0  # don't wait between iterations in test
+
+    wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+    wov._submit_weights = AsyncMock(return_value=True)
+    wov_mod.storage.list_all_window_keys = AsyncMock(return_value=[1])
+    wov_mod.storage.list_recent_datasets = AsyncMock(return_value=[])
+
+    try:
+        task = _asyncio.create_task(wov.run())
+        await _asyncio.sleep(0.1)  # let it iterate past the timeout + reconnect
+        task.cancel()
+        try:
+            await task
+        except _asyncio.CancelledError:
+            pass
+    finally:
+        for k, v in originals.items():
+            setattr(wov_mod.chain, k, v)
+        wov_mod.POLL_INTERVAL_SECONDS = poll_orig
+
+    # Initial connect + post-timeout reconnect = at least 2 get_subtensor calls.
+    assert len(get_calls) >= 2
+    # The wedged subtensor was closed before reconnect.
+    assert old_sub in close_calls

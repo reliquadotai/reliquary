@@ -32,6 +32,28 @@ async def get_subtensor():
     return subtensor
 
 
+async def close_subtensor(subtensor) -> None:
+    """Best-effort close of an ``AsyncSubtensor``.
+
+    Long-lived subtensors on the public Finney endpoint accumulate WebSocket
+    state and eventually wedge — every RPC call into them hangs past our
+    timeouts. The recovery path is to throw the connection away and open a
+    fresh one. This helper makes sure the old WebSocket + its background
+    recv task get released, otherwise they linger in the event loop and
+    have been observed to degrade subsequently-opened replacements too.
+
+    Errors are swallowed: the common case is closing a connection that's
+    already broken, and we don't want close failures to prevent the caller
+    from opening the replacement.
+    """
+    if subtensor is None:
+        return
+    try:
+        await asyncio.wait_for(subtensor.close(), timeout=5.0)
+    except Exception as e:
+        logger.warning("close_subtensor swallowed error: %s", e)
+
+
 async def get_metagraph(subtensor, netuid: int = NETUID):
     """Get subnet metagraph."""
     return await asyncio.wait_for(subtensor.metagraph(netuid), timeout=CHAIN_READ_TIMEOUT)

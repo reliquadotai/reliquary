@@ -264,13 +264,13 @@ def validate(
             weights_worker = WeightOnlyValidator(wallet=wallet, netuid=netuid)
             await asyncio.gather(
                 service.run(subtensor),
-                weights_worker.run(subtensor),
+                weights_worker.run(),
             )
         else:
             from reliquary.validator.weight_only import WeightOnlyValidator
 
             validator = WeightOnlyValidator(wallet=wallet, netuid=netuid)
-            await validator.run(subtensor)
+            await validator.run()
 
     asyncio.run(_run())
 
