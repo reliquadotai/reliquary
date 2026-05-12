@@ -153,6 +153,61 @@ def test_state_endpoint_503_when_no_active_batcher():
     assert resp.json()["detail"] == "no_active_window"
 
 
+def test_state_endpoint_does_not_block_on_batcher_lock():
+    """Regression for the 2026-05-12 miner-timeout outage.
+
+    The /state handler must NOT acquire batcher._lock. The submit worker
+    holds that lock for the entire GRAIL verify (~5-25s per submission).
+    When /state acquired the same lock synchronously on the asyncio event
+    loop, 12+ miners polling at once serialised through it and timed out
+    at the 60s HTTP budget — and the lock-wait starved the event loop so
+    /submit, /health, /checkpoint all backed up behind it too.
+    """
+    import threading
+    import time
+
+    from reliquary.protocol.submission import WindowState
+    cd = CooldownMap(cooldown_windows=50)
+    cd.record_batched(prompt_idx=42, window=490)
+    batcher = _batcher(window_start=500, cooldown_map=cd)
+    server = ValidatorServer()
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    client = TestClient(server.app)
+
+    # Hold batcher._lock from a thread for 2s — simulating a long GRAIL
+    # verify in progress. /state must still return promptly.
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+
+    def _hold_lock():
+        with batcher._lock:
+            lock_held.set()
+            release_lock.wait(timeout=5)
+
+    holder = threading.Thread(target=_hold_lock, daemon=True)
+    holder.start()
+    assert lock_held.wait(timeout=1), "background thread failed to grab _lock"
+
+    try:
+        start = time.monotonic()
+        resp = client.get("/state")
+        elapsed = time.monotonic() - start
+
+        assert resp.status_code == 200
+        assert elapsed < 0.5, (
+            f"/state took {elapsed:.2f}s while batcher._lock was held — "
+            f"it's still on the lock hot path"
+        )
+        state = GrpoBatchState(**resp.json())
+        assert state.window_n == 500
+        assert 42 in state.cooldown_prompts
+        assert state.valid_submissions == 0
+    finally:
+        release_lock.set()
+        holder.join(timeout=1)
+
+
 # --- v2.1: state-aware endpoints ---
 
 def test_submit_rejects_when_state_not_open():
