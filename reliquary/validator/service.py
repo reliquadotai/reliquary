@@ -226,8 +226,10 @@ class ValidationService:
         self._hash_set = RolloutHashSet(
             retention_windows=BATCH_PROMPT_COOLDOWN_WINDOWS,
         )
+        self._late_drops: dict[str, dict[str, int]] = {}
 
         self.server = ValidatorServer(host=http_host, port=http_port)
+        self.server.set_late_drop_callback(self.record_late_drop)
 
         # v2.1 state machine infrastructure — in-memory only, bootstrapped at
         # startup from R2 + HF (no local JSON state file).
@@ -251,6 +253,13 @@ class ValidationService:
         self._current_window_state = s
         # Also notify the server so /state returns the right value.
         self.server.set_current_state(s)
+
+    def record_late_drop(self, hotkey: str, reason: str) -> None:
+        """Bump the (hotkey, reason) counter. Both call sites run on the
+        asyncio event loop so no lock is needed. Reset in _archive_window.
+        """
+        bucket = self._late_drops.setdefault(hotkey, {})
+        bucket[reason] = bucket.get(reason, 0) + 1
 
     async def _apply_resume_from(self) -> None:
         """If --resume-from was set, load the model from that source and
@@ -626,7 +635,14 @@ class ValidationService:
             "runners_up": runners_up,
             "reject_summary": dict(getattr(batcher, "reject_counts", {})),
             "rejected": rejected_entries,
+            "late_drops": {
+                hk: dict(counts) for hk, counts in self._late_drops.items()
+            },
         }
+        # Reset the in-memory counter for the next window. New events
+        # arriving while this window's payload is uploading land in the
+        # fresh dict and will appear in the next archive.
+        self._late_drops.clear()
         # Non-blocking archive: enqueue to disk and return immediately.
         # The background ``ArchiveQueue`` worker (started in run()) picks
         # this up and uploads via the same sync-boto3 path used in

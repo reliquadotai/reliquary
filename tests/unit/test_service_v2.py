@@ -18,6 +18,33 @@ class _FakeEnv:
     def compute_reward(self, p, c): return 1.0
 
 
+class _LateDropFakeEnv:
+    name = "fake"
+    def __len__(self): return 100
+    def get_problem(self, i): return {"prompt": "p", "ground_truth": "a"}
+    def compute_reward(self, p, c): return 0.0
+
+
+class _LateDropFakeWallet:
+    class _Hk:
+        ss58_address = "5FHk"
+        @staticmethod
+        def sign(d): return b"sig"
+    hotkey = _Hk()
+
+
+def _build_late_drop_service():
+    """Bare ValidationService for late-drop tests."""
+    from unittest.mock import MagicMock
+    from reliquary.validator.service import ValidationService
+    fake_tok = MagicMock()
+    fake_tok.eos_token_id = 99
+    return ValidationService(
+        wallet=_LateDropFakeWallet(), model=MagicMock(), tokenizer=fake_tok,
+        env=_LateDropFakeEnv(), netuid=99,
+    )
+
+
 def test_service_creates_grpo_window_batcher():
     """The service's open_grpo_window() returns a GrpoWindowBatcher wired up
     with the shared CooldownMap."""
@@ -227,4 +254,27 @@ async def test_rebuild_hashes_from_history_populates_set():
 
     assert bytes.fromhex(h_explicit) in svc._hash_set
     assert compute_rollout_hash([40, 50, 60]) in svc._hash_set
+
+
+def test_record_late_drop_aggregates_per_hotkey_and_reason():
+    """record_late_drop bumps counters keyed by (hotkey, reason), starting
+    from empty, isolating different hotkeys."""
+    svc = _build_late_drop_service()
+    assert svc._late_drops == {}
+    svc.record_late_drop("hkA", "window_not_active")
+    svc.record_late_drop("hkA", "window_not_active")
+    svc.record_late_drop("hkA", "worker_dropped")
+    svc.record_late_drop("hkB", "worker_dropped")
+    assert svc._late_drops == {
+        "hkA": {"window_not_active": 2, "worker_dropped": 1},
+        "hkB": {"worker_dropped": 1},
+    }
+
+
+def test_service_registers_late_drop_callback_on_server():
+    """ValidationService wires record_late_drop into ValidatorServer at init."""
+    svc = _build_late_drop_service()
+    # Invoking via the server's stored callback must bump the service counter.
+    svc.server._late_drop_callback("hkX", "window_not_active")
+    assert svc._late_drops == {"hkX": {"window_not_active": 1}}
 

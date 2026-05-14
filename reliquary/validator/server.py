@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -46,6 +46,7 @@ class ValidatorServer:
         from reliquary.protocol.submission import WindowState
         self._current_state: WindowState = WindowState.READY
         self._current_checkpoint = None  # ManifestEntry | None
+        self._late_drop_callback: Callable[[str, str], None] | None = None
 
     def set_active_batcher(self, batcher: GrpoWindowBatcher | None) -> None:
         self.active_batcher = batcher
@@ -55,6 +56,15 @@ class ValidatorServer:
 
     def set_current_checkpoint(self, entry) -> None:
         self._current_checkpoint = entry
+
+    def set_late_drop_callback(
+        self, fn: Callable[[str, str], None] | None,
+    ) -> None:
+        """Register a callback fired as ``(hotkey, reason)`` on every late
+        drop — reasons are ``"window_not_active"`` (HTTP-level) or
+        ``"worker_dropped"`` (queue worker). Service registers in __init__.
+        """
+        self._late_drop_callback = fn
 
     def _build_app(self) -> FastAPI:
         app = FastAPI(title="Reliquary Validator", version="2.0")
@@ -73,6 +83,10 @@ class ValidatorServer:
             from reliquary.protocol.submission import WindowState
             # v2.1: reject if state != OPEN
             if self._current_state != WindowState.OPEN:
+                if self._late_drop_callback is not None:
+                    self._late_drop_callback(
+                        request.miner_hotkey, "window_not_active",
+                    )
                 return BatchSubmissionResponse(
                     accepted=False, reason=RejectReason.WINDOW_NOT_ACTIVE,
                 )
@@ -167,6 +181,10 @@ class ValidatorServer:
                     request.prompt_idx, request.miner_hotkey[:12],
                     batcher.window_start,
                 )
+                if self._late_drop_callback is not None:
+                    self._late_drop_callback(
+                        request.miner_hotkey, "worker_dropped",
+                    )
                 continue
             try:
                 response = await asyncio.to_thread(

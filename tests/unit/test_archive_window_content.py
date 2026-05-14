@@ -266,3 +266,53 @@ async def test_archive_includes_per_rollout_hash():
     assert len(entry["rollouts"]) == 2
     assert entry["rollouts"][0]["hash"] == compute_rollout_hash(r0_tokens).hex()
     assert entry["rollouts"][1]["hash"] == compute_rollout_hash(r1_tokens).hex()
+
+
+@pytest.mark.asyncio
+async def test_archive_includes_late_drops_and_clears_counter():
+    """First archive snapshot captures recorded late drops and resets the
+    counter; a subsequent archive with no events emits an empty dict."""
+    from unittest.mock import MagicMock, patch
+    from reliquary.validator.service import ValidationService
+
+    fake_tok = MagicMock()
+    fake_tok.eos_token_id = 99
+    svc = ValidationService(
+        wallet=_FakeWallet(), model=MagicMock(), tokenizer=fake_tok,
+        env=_FakeEnv(), netuid=99,
+    )
+    svc.record_late_drop("hkA", "window_not_active")
+    svc.record_late_drop("hkA", "window_not_active")
+    svc.record_late_drop("hkB", "worker_dropped")
+
+    valid_sub = _valid_submission(prompt_idx=42)
+
+    class _FakeBatcher:
+        window_start = 500
+        randomness = "abcd"
+        window_opened_at = 0.0
+        reject_counts: dict = {}
+        rejected_submissions: list = []
+        def valid_submissions(self): return [valid_sub]
+
+    captured = []
+
+    class _StubQueue:
+        def enqueue(self, w, a):
+            captured.append(a)
+
+    with patch(
+        "reliquary.infrastructure.archive_queue.get_archive_queue",
+        return_value=_StubQueue(),
+    ):
+        await svc._archive_window(_FakeBatcher(), [valid_sub])
+        # Populated archive carries the snapshot; counter is now reset.
+        assert captured[-1]["late_drops"] == {
+            "hkA": {"window_not_active": 2},
+            "hkB": {"worker_dropped": 1},
+        }
+        assert svc._late_drops == {}
+
+        # Second archive run with no new events must emit an empty dict.
+        await svc._archive_window(_FakeBatcher(), [valid_sub])
+        assert captured[-1]["late_drops"] == {}
