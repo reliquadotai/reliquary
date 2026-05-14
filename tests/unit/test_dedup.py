@@ -74,3 +74,37 @@ def test_hashset_negative_retention_rejected():
     from reliquary.validator.dedup import RolloutHashSet
     with pytest.raises(ValueError):
         RolloutHashSet(retention_windows=-1)
+
+
+def test_hashset_prune_drops_expired_entries():
+    from reliquary.validator.dedup import RolloutHashSet, compute_rollout_hash
+    s = RolloutHashSet(retention_windows=50)
+    old = compute_rollout_hash([1, 1, 1])
+    recent = compute_rollout_hash([2, 2, 2])
+    s.add(old, window=100)
+    s.add(recent, window=145)
+    # At window 151: window 100 is 51 away (>= 50) → drop
+    s.prune(current_window=151)
+    assert old not in s
+    assert recent in s
+
+
+def test_hashset_prune_keeps_boundary_at_minus_one():
+    """An entry at window=100 with retention=50 must stay until current=150."""
+    from reliquary.validator.dedup import RolloutHashSet, compute_rollout_hash
+    s = RolloutHashSet(retention_windows=50)
+    h = compute_rollout_hash([3, 3, 3])
+    s.add(h, window=100)
+    s.prune(current_window=149)
+    assert h in s
+    s.prune(current_window=150)
+    assert h not in s
+
+
+def test_hashset_prune_zero_retention_drops_everything():
+    from reliquary.validator.dedup import RolloutHashSet, compute_rollout_hash
+    s = RolloutHashSet(retention_windows=0)
+    h = compute_rollout_hash([4, 4, 4])
+    s.add(h, window=100)
+    s.prune(current_window=100)
+    assert h not in s

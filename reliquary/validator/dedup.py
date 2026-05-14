@@ -55,3 +55,18 @@ class RolloutHashSet:
 
     def __len__(self) -> int:
         return len(self._entries)
+
+    def prune(self, current_window: int) -> None:
+        """Drop entries whose window is older than the retention horizon.
+
+        An entry at ``window=W`` survives while
+        ``current_window - W < retention_windows``. At equality the entry
+        is dropped — same half-open interval semantics as ``CooldownMap``.
+        """
+        if self._retention_windows == 0:
+            self._entries.clear()
+            return
+        horizon = current_window - self._retention_windows
+        self._entries = {
+            h: w for h, w in self._entries.items() if w > horizon
+        }
