@@ -30,6 +30,23 @@ jobs:
   build-push:
     runs-on: ubuntu-latest
     steps:
+      # GitHub-hosted ubuntu-latest only has ~14 GB free at start. The
+      # CUDA+PyTorch base image plus the gha build cache (mode=max) blow
+      # past that and the runner dies with "No space left on device" mid
+      # build. Free ~30 GB by removing preinstalled tooling we never use
+      # (Android SDK, .NET, Haskell, large apt packages, the hostedtoolcache).
+      # Cost: ~1 min, much cheaper than a paid larger runner.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false   # we need docker for the build itself
+          swap-storage: false
+
       - uses: actions/checkout@v4
 
       - uses: docker/setup-buildx-action@v3
