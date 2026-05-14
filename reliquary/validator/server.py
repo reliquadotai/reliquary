@@ -119,6 +119,22 @@ class ValidatorServer:
             if request.window_start != batcher.window_start:
                 raise HTTPException(status_code=409, detail="window_mismatch")
 
+            # Early-cutoff: once the batcher has sealed (B_BATCH distinct
+            # non-cooldown valid submissions received), ``select_batch``
+            # will pick those by ``arrived_at``. Further submissions land
+            # strictly later in arrival order, so they cannot displace
+            # any of the already-selected entries. Queuing them costs
+            # ~5–25 s of GRAIL forward pass per item with zero protocol
+            # benefit, inflates the OPEN→TRAIN latency, and lets the
+            # worker keep grinding into the TRAINING phase. Reject here
+            # the moment the batch is closed.
+            if batcher.is_sealed():
+                if self._late_drop_callback is not None:
+                    self._late_drop_callback(hk, "batch_filled")
+                return BatchSubmissionResponse(
+                    accepted=False, reason=RejectReason.BATCH_FILLED,
+                )
+
             # Under TestClient (no worker running) we run synchronously so
             # tests see the real ``ACCEPTED`` verdict; under uvicorn we enqueue
             # for the worker and return ``SUBMITTED`` — a distinct sentinel
@@ -206,6 +222,25 @@ class ValidatorServer:
                 if self._late_drop_callback is not None:
                     self._late_drop_callback(
                         request.miner_hotkey, "worker_dropped",
+                    )
+                continue
+            # Drain past-seal items without running GRAIL. The HTTP early-
+            # cutoff catches submissions that arrive AFTER seal; this catches
+            # the ones already in the queue from BEFORE seal that haven't
+            # been dequeued yet. Together they cap per-window GRAIL work at
+            # ~B_BATCH × verify-time instead of letting it grow with raw
+            # arrival rate. Same accounting bucket as the HTTP path so a
+            # miner inspecting late_drops sees one consistent metric.
+            if batcher.is_sealed():
+                logger.info(
+                    "dropping post-seal queue item prompt=%d hotkey=%s "
+                    "(batcher window=%d already filled)",
+                    request.prompt_idx, request.miner_hotkey[:12],
+                    batcher.window_start,
+                )
+                if self._late_drop_callback is not None:
+                    self._late_drop_callback(
+                        request.miner_hotkey, "batch_filled",
                     )
                 continue
             try:

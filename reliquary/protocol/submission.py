@@ -49,6 +49,7 @@ class RejectReason(str, Enum):
     REWARD_MISMATCH = "reward_mismatch"
     OUT_OF_ZONE = "out_of_zone"
     RATE_LIMITED = "rate_limited"
+    BATCH_FILLED = "batch_filled"
     WRONG_ROLLOUT_COUNT = "wrong_rollout_count"
     WINDOW_MISMATCH = "window_mismatch"
     WINDOW_NOT_ACTIVE = "window_not_active"

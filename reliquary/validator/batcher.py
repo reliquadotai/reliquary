@@ -212,6 +212,21 @@ class GrpoWindowBatcher:
                 self._seal_event.set()
         return self._seal_event
 
+    def is_sealed(self) -> bool:
+        """True once B distinct non-cooldown valid submissions have been
+        accepted. Thread-safe and loop-independent (reads the underlying
+        ``threading.Event``, never touches the lazy ``asyncio.Event``).
+
+        After this returns True, ``select_batch`` will pick the first
+        ``B_BATCH`` by ``arrived_at`` — any further submission would have
+        a later ``arrived_at`` and therefore cannot displace one of the
+        already-selected entries. Verifying it costs ~5–25 s of GRAIL
+        forward pass and produces zero protocol benefit. Callers (the
+        HTTP /submit handler and the submit worker) use this to short-
+        circuit further work for the current window.
+        """
+        return self._seal_flag.is_set()
+
     # ----------------------------- ingestion -----------------------------
 
     def accept_submission(
