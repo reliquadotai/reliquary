@@ -142,7 +142,7 @@ class GrpoWindowBatcher:
         # at submit-receipt time. Distinct from ``_time_fn`` (monotonic)
         # which is used for response_time bookkeeping.
         self._wall_clock = wall_clock_fn or time.time
-        self._drand_round_check_enabled = drand_round_check_enabled
+        self.drand_round_check_enabled = drand_round_check_enabled
         # Lazy: fetched on first use if not injected (tests inject a fixed
         # {"genesis_time", "period"} dict to avoid live HTTP calls).
         self._drand_chain_info = drand_chain_info
@@ -247,6 +247,18 @@ class GrpoWindowBatcher:
         """
         return self._seal_flag.is_set()
 
+    def prompt_submission_count(self, prompt_idx: int) -> int:
+        """Number of GRAIL-validated submissions already in the per-prompt
+        bucket for ``prompt_idx``. Used by the HTTP /submit handler to
+        short-circuit ``PROMPT_FULL`` rejects without queueing.
+
+        Read of a dict-of-list len is GIL-atomic and lock-free in CPython,
+        same property ``valid_count`` relies on. Best-effort: a racing
+        accept inside the worker between this read and the queue.put is
+        harmless — the worker re-checks the cap inside ``_accept_locked``.
+        """
+        return len(self._submissions_per_prompt.get(prompt_idx, ()))
+
     # ----------------------------- ingestion -----------------------------
 
     def accept_submission(
@@ -256,7 +268,7 @@ class GrpoWindowBatcher:
         with self._lock:
             return self._accept_locked(request)
 
-    def _validate_drand_round(self, drand_round: int) -> RejectReason | None:
+    def validate_drand_round(self, drand_round: int) -> RejectReason | None:
         """Return the appropriate reject reason if ``drand_round`` doesn't
         equal ``current_round`` exactly, else None.
 
@@ -268,6 +280,9 @@ class GrpoWindowBatcher:
         round boundary now costs the submission; a future iteration may
         relax this with a millisecond-grain check before the round
         boundary instead of a full-round tolerance.
+
+        Public so the HTTP /submit handler can run it pre-queue and
+        short-circuit the rejection without waiting on the worker.
         """
         if self._drand_chain_info is None:
             from reliquary.infrastructure.drand import get_current_chain
@@ -300,8 +315,8 @@ class GrpoWindowBatcher:
         # to claim an earlier chronological slot than the submission
         # actually earned; attaching a future round is impossible without
         # having seen σ_R (so always rejected).
-        if self._drand_round_check_enabled:
-            round_check = self._validate_drand_round(request.drand_round)
+        if self.drand_round_check_enabled:
+            round_check = self.validate_drand_round(request.drand_round)
             if round_check is not None:
                 return self._reject(round_check, hotkey=hk, prompt_idx=pi)
         if request.prompt_idx >= len(self.env):

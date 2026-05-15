@@ -209,6 +209,61 @@ class ValidatorServer:
                     accepted=False, reason=RejectReason.BATCH_FILLED,
                 )
 
+            # Cheap rejects pre-queue: every check below is O(1) against
+            # batcher fields the worker re-runs inside _accept_locked. Doing
+            # them here keeps the worker free for GRAIL forward passes on
+            # submissions that have a real chance of being batched. Without
+            # this, a STALE_ROUND or WRONG_CHECKPOINT submission has to wait
+            # in the queue behind a 5–25 s GRAIL verify of an honest
+            # submission ahead of it — minutes of latency on what should be
+            # a microsecond rejection. Each check defers to the same logic
+            # the worker uses, so a miss here (e.g. concurrent batcher
+            # mutation) is benign — the worker rejects with the same reason.
+            from reliquary.constants import MAX_SUBMISSIONS_PER_PROMPT
+
+            if batcher.current_checkpoint_hash and request.checkpoint_hash != batcher.current_checkpoint_hash:
+                self.record_verdict(
+                    hk, request.merkle_root, False, RejectReason.WRONG_CHECKPOINT,
+                    window_n=request.window_start,
+                )
+                return BatchSubmissionResponse(
+                    accepted=False, reason=RejectReason.WRONG_CHECKPOINT,
+                )
+            if request.prompt_idx >= len(batcher.env):
+                self.record_verdict(
+                    hk, request.merkle_root, False, RejectReason.BAD_PROMPT_IDX,
+                    window_n=request.window_start,
+                )
+                return BatchSubmissionResponse(
+                    accepted=False, reason=RejectReason.BAD_PROMPT_IDX,
+                )
+            if request.prompt_idx in batcher.cooldown_prompts_snapshot:
+                self.record_verdict(
+                    hk, request.merkle_root, False, RejectReason.PROMPT_IN_COOLDOWN,
+                    window_n=request.window_start,
+                )
+                return BatchSubmissionResponse(
+                    accepted=False, reason=RejectReason.PROMPT_IN_COOLDOWN,
+                )
+            if batcher.drand_round_check_enabled:
+                round_reject = batcher.validate_drand_round(request.drand_round)
+                if round_reject is not None:
+                    self.record_verdict(
+                        hk, request.merkle_root, False, round_reject,
+                        window_n=request.window_start,
+                    )
+                    return BatchSubmissionResponse(
+                        accepted=False, reason=round_reject,
+                    )
+            if batcher.prompt_submission_count(request.prompt_idx) >= MAX_SUBMISSIONS_PER_PROMPT:
+                self.record_verdict(
+                    hk, request.merkle_root, False, RejectReason.PROMPT_FULL,
+                    window_n=request.window_start,
+                )
+                return BatchSubmissionResponse(
+                    accepted=False, reason=RejectReason.PROMPT_FULL,
+                )
+
             # Under TestClient (no worker running) we run synchronously so
             # tests see the real ``ACCEPTED`` verdict; under uvicorn we enqueue
             # for the worker and return ``SUBMITTED`` — a distinct sentinel
