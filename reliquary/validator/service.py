@@ -808,17 +808,88 @@ class ValidationService:
         except Exception:
             logger.exception("Failed to bootstrap window_n from R2; starting at 0")
 
-        # 2. checkpoint_n from HF commit history
+        # 2. checkpoint_n + revision from HF commit history.
+        #
+        # Auto-resume to the latest published "checkpoint N" commit. This
+        # replaces the previous count-only logic, which left
+        # ``_checkpoint_store._current`` populated by whatever
+        # ``RELIQUARY_RESUME_FROM`` was baked into the container env.
+        # A stale env var (e.g. set to an early checkpoint when the
+        # validator was first deployed) caused the validator to regress
+        # 19 published checkpoints (ckpt 45 → ckpt 26) on the PR #23
+        # redeploy, throwing away hours of training progress that was
+        # still safely on HF. HF is the durable source of truth — read
+        # it on every startup.
+        #
+        # Operator override semantics:
+        #   * No env var set: pick the latest HF checkpoint
+        #   * env var set, ENV ckpt >= HF latest: keep the env (operator
+        #     pinned to something they want, possibly under test)
+        #   * env var set, ENV ckpt <  HF latest: warn and override with
+        #     HF latest (the env is stale; HF has progressed past it)
         try:
+            import re as _re
             from huggingface_hub import HfApi
             repo_id = self._checkpoint_store.repo_id
             api = HfApi()
             commits = api.list_repo_commits(repo_id=repo_id)
-            ckpt_count = sum(1 for c in commits if c.title.startswith("checkpoint "))
-            self._checkpoint_n = ckpt_count
-            logger.info("Bootstrapped checkpoint_n=%d from HF", self._checkpoint_n)
+            ckpt_title = _re.compile(r"^checkpoint\s+(\d+)\s*$", _re.IGNORECASE)
+            latest_n = -1
+            latest_sha: str | None = None
+            count = 0
+            for c in commits:
+                m = ckpt_title.match(c.title or "")
+                if not m:
+                    continue
+                count += 1
+                n = int(m.group(1))
+                if n > latest_n:
+                    latest_n = n
+                    latest_sha = c.commit_id
+            if latest_n < 0:
+                logger.info(
+                    "Bootstrap: no 'checkpoint N' commits on %s; keeping base",
+                    repo_id,
+                )
+                return
+            # When ``_apply_resume_from`` already installed a manifest from
+            # ``RELIQUARY_RESUME_FROM``, ``self._checkpoint_n`` carries that
+            # ckpt number (set on line 334 of _apply_resume_from). Treat env
+            # >= HF as "operator-pinned, leave it".
+            resumed_from_env = self._checkpoint_store.current_manifest() is not None
+            if resumed_from_env and self._checkpoint_n >= latest_n:
+                logger.info(
+                    "Bootstrap: env-resumed at ckpt=%d ≥ HF latest=%d; "
+                    "trusting operator pin",
+                    self._checkpoint_n, latest_n,
+                )
+                return
+            # HF has a newer checkpoint than env (or env was unset).
+            # Override _resume_from and re-run _apply_resume_from to load
+            # the right weights into both train_model and verify_model.
+            if resumed_from_env:
+                logger.warning(
+                    "Bootstrap: env-resumed at ckpt=%d but HF has ckpt=%d "
+                    "(sha=%s) — overriding env to avoid regression. Set "
+                    "RELIQUARY_RESUME_FROM=sha:%s to silence this warning, "
+                    "or unset it to always track HF latest.",
+                    self._checkpoint_n, latest_n,
+                    latest_sha[:12] if latest_sha else "?",
+                    latest_sha,
+                )
+            else:
+                logger.info(
+                    "Bootstrap: no env resume; auto-resuming from latest HF "
+                    "ckpt=%d (sha=%s, %d total ckpt commits)",
+                    latest_n, latest_sha[:12] if latest_sha else "?", count,
+                )
+            self._resume_from = f"sha:{latest_sha}"
+            await self._apply_resume_from()
         except Exception:
-            logger.exception("Failed to bootstrap checkpoint_n from HF; starting at 0")
+            logger.exception(
+                "Failed to auto-discover latest HF checkpoint; "
+                "validator stays on whatever --resume-from gave us"
+            )
 
     async def _rebuild_cooldown_from_history(self) -> None:
         """At startup, reconstruct CooldownMap from the last

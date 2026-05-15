@@ -4,12 +4,21 @@
 event loop so GRAIL verification doesn't block HTTP responses). Under
 TestClient (no worker running), /submit runs synchronously so tests see
 the real verdict.
+
+/verdicts/{hotkey} surfaces the real per-submission verdicts (accept /
+specific reject reason) that ``/submit`` cannot return in real time. Under
+the production worker path /submit replies with a provisional ``SUBMITTED``
+sentinel and the actual verdict lands in this endpoint a few seconds later,
+once the worker has run the full verification pipeline. Miners learn the
+truth without having to wait minutes for the R2 archive upload.
 """
 
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
+import time
 from typing import Any, Callable
 
 from fastapi import FastAPI, HTTPException
@@ -25,10 +34,18 @@ from reliquary.protocol.submission import (
     BatchSubmissionResponse,
     GrpoBatchState,
     RejectReason,
+    Verdict,
+    VerdictsResponse,
 )
 from reliquary.validator.batcher import GrpoWindowBatcher
 
 logger = logging.getLogger(__name__)
+
+
+# How many recent verdicts to remember per hotkey. Bounded so the
+# ring buffer can't grow without limit if a misbehaving miner spams.
+# At ~250 B per verdict × 200 entries × ~50 hotkeys ≈ 2.5 MB — cheap.
+VERDICT_CAP_PER_HOTKEY = 200
 
 
 class _Health(BaseModel):
@@ -55,6 +72,12 @@ class ValidatorServer:
         # heavier check so a saturated miner trip the rate limit on the
         # cheapest possible path.
         self._per_window_counts: dict[str, int] = {}
+        # Per-hotkey ring buffer of recent verdicts. Keys are miner ss58
+        # addresses; values are deques of ``Verdict``-shaped dicts (stored
+        # as plain dicts to keep the hot path serialization-free).
+        # asyncio is single-threaded so no lock is needed — every mutation
+        # site runs on the event loop.
+        self._verdicts: dict[str, collections.deque[dict]] = {}
 
     def set_active_batcher(self, batcher: GrpoWindowBatcher | None) -> None:
         # New batcher → new window → reset per-hotkey counters.
@@ -77,6 +100,45 @@ class ValidatorServer:
         """
         self._late_drop_callback = fn
 
+    def record_verdict(
+        self,
+        hotkey: str,
+        merkle_root: str,
+        accepted: bool,
+        reason: RejectReason | str,
+        *,
+        window_n: int | None = None,
+    ) -> None:
+        """Record a per-submission verdict for ``/verdicts/{hotkey}``.
+
+        Called from every code path that decides accept/reject:
+
+          * HTTP rate-limit / window-not-active / batch-filled early cutoffs
+            in the ``/submit`` handler (before the request even reaches the
+            queue worker)
+          * ``_submit_worker`` after each ``batcher.accept_submission``
+            returns its real verdict (the path that's currently invisible
+            to miners because /submit returned ``SUBMITTED`` provisionally)
+          * ``_submit_worker`` late drops for items dequeued after the
+            batcher swap or seal (``worker_dropped`` / ``batch_filled``)
+
+        The verdict is stored in a per-hotkey ring buffer
+        (``VERDICT_CAP_PER_HOTKEY`` entries). Older verdicts roll off
+        silently. Read-side: ``GET /verdicts/{hotkey}`` filters by hotkey
+        and (optionally) by a ``since`` unix timestamp.
+        """
+        if hotkey not in self._verdicts:
+            self._verdicts[hotkey] = collections.deque(maxlen=VERDICT_CAP_PER_HOTKEY)
+        # Normalise enum → value so the ring is a uniform dict shape.
+        reason_str = reason.value if isinstance(reason, RejectReason) else reason
+        self._verdicts[hotkey].append({
+            "merkle_root": merkle_root,
+            "window_n": window_n,
+            "accepted": accepted,
+            "reason": reason_str,
+            "ts": time.time(),
+        })
+
     def _build_app(self) -> FastAPI:
         app = FastAPI(title="Reliquary Validator", version="2.0")
 
@@ -98,6 +160,10 @@ class ValidatorServer:
             if n >= MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW:
                 if self._late_drop_callback is not None:
                     self._late_drop_callback(hk, "rate_limited")
+                self.record_verdict(
+                    hk, request.merkle_root, False, RejectReason.RATE_LIMITED,
+                    window_n=request.window_start,
+                )
                 return BatchSubmissionResponse(
                     accepted=False, reason=RejectReason.RATE_LIMITED,
                 )
@@ -109,6 +175,10 @@ class ValidatorServer:
                     self._late_drop_callback(
                         request.miner_hotkey, "window_not_active",
                     )
+                self.record_verdict(
+                    hk, request.merkle_root, False, RejectReason.WINDOW_NOT_ACTIVE,
+                    window_n=request.window_start,
+                )
                 return BatchSubmissionResponse(
                     accepted=False, reason=RejectReason.WINDOW_NOT_ACTIVE,
                 )
@@ -131,6 +201,10 @@ class ValidatorServer:
             if batcher.is_sealed():
                 if self._late_drop_callback is not None:
                     self._late_drop_callback(hk, "batch_filled")
+                self.record_verdict(
+                    hk, request.merkle_root, False, RejectReason.BATCH_FILLED,
+                    window_n=request.window_start,
+                )
                 return BatchSubmissionResponse(
                     accepted=False, reason=RejectReason.BATCH_FILLED,
                 )
@@ -145,7 +219,14 @@ class ValidatorServer:
             # silently draining the leftover queue at the next batcher swap
             # (see ``_submit_worker`` below), not by HTTP-level rejections.
             if self._worker_task is None:
-                return batcher.accept_submission(request)
+                resp = batcher.accept_submission(request)
+                # Sync path (tests) — the real verdict is already known
+                # before we return, so record it directly.
+                self.record_verdict(
+                    hk, request.merkle_root, resp.accepted, resp.reason,
+                    window_n=request.window_start,
+                )
+                return resp
 
             await self._submit_queue.put((request, batcher))
             return BatchSubmissionResponse(
@@ -189,6 +270,41 @@ class ValidatorServer:
                 "signature": cp.signature,
             }
 
+        @app.get("/verdicts/{hotkey}", response_model=VerdictsResponse)
+        async def verdicts(hotkey: str, since: float = 0.0) -> VerdictsResponse:
+            """Recent per-submission verdicts for ``hotkey``, ordered by
+            ``ts`` ascending. The default ``since=0`` returns every verdict
+            currently in the ring; pass the timestamp of the last verdict
+            you saw to get only newer ones (incremental polling).
+
+            Bounded read — at most ``VERDICT_CAP_PER_HOTKEY`` entries per
+            hotkey live in the ring, so even a degenerate ``since=0`` poll
+            never returns more than ~200 entries. Lock-free in the same way
+            ``/state`` is (event-loop-only writes, atomic dict.get).
+
+            Why this exists: ``/submit`` under the production worker path
+            returns a provisional ``SUBMITTED`` sentinel, not the real
+            verdict — that's known only after the worker drains the queue
+            and runs the full verification pipeline (~5-25 s of GRAIL per
+            item). Without this endpoint, the truth was only visible via
+            the R2 archive (minutes-late, batched per window). Now miners
+            can learn within seconds whether a specific submission cleared
+            GRAIL, was rejected as a duplicate hash, hit the rate limit,
+            or failed any other check — diagnosable by ``merkle_root``.
+
+            Privacy: same trust model as the R2 archive (public). Anyone
+            can query any hotkey's verdicts; we don't auth this. If you
+            need confidential feedback, run a private validator.
+            """
+            ring = self._verdicts.get(hotkey)
+            if not ring:
+                return VerdictsResponse(verdicts=[])
+            out = [
+                Verdict(**entry) for entry in ring
+                if entry["ts"] > since
+            ]
+            return VerdictsResponse(verdicts=out)
+
         return app
 
     async def _submit_worker(self) -> None:
@@ -224,6 +340,13 @@ class ValidatorServer:
                     self._late_drop_callback(
                         request.miner_hotkey, "worker_dropped",
                     )
+                # Surface to the miner via /verdicts so they don't keep
+                # interpreting the SUBMITTED sentinel as an accept.
+                self.record_verdict(
+                    request.miner_hotkey, request.merkle_root, False,
+                    RejectReason.WORKER_DROPPED,
+                    window_n=request.window_start,
+                )
                 continue
             # Drain past-seal items without running GRAIL. The HTTP early-
             # cutoff catches submissions that arrive AFTER seal; this catches
@@ -243,6 +366,11 @@ class ValidatorServer:
                     self._late_drop_callback(
                         request.miner_hotkey, "batch_filled",
                     )
+                self.record_verdict(
+                    request.miner_hotkey, request.merkle_root, False,
+                    RejectReason.BATCH_FILLED,
+                    window_n=request.window_start,
+                )
                 continue
             try:
                 response = await asyncio.to_thread(
@@ -260,6 +388,13 @@ class ValidatorServer:
                         request.prompt_idx, request.miner_hotkey[:12],
                         response.reason.value, rewards,
                     )
+                # The verdict the /submit response *didn't* carry, now
+                # observable to the miner via /verdicts.
+                self.record_verdict(
+                    request.miner_hotkey, request.merkle_root,
+                    response.accepted, response.reason,
+                    window_n=request.window_start,
+                )
             except Exception as e:
                 logger.exception(
                     "submission worker failed on prompt %d", request.prompt_idx

@@ -14,7 +14,7 @@ Reliquary turns this filter problem into a **prediction market**. Every training
 
 Two structural guarantees come with the market:
 
-- **Forced curriculum diversity.** A prompt that enters a training batch is locked out for `BATCH_PROMPT_COOLDOWN_WINDOWS = 50` windows. The validator sees roughly 400 distinct prompts before any one recurs — no collapse onto a handful of high-variance outliers, a failure mode that a single-node pipeline has no automatic defense against.
+- **Forced curriculum diversity.** A prompt that enters a training batch is locked out for `BATCH_PROMPT_COOLDOWN_WINDOWS = 72` windows. The validator sees roughly 576 distinct prompts before any one recurs — no collapse onto a handful of high-variance outliers, a failure mode that a single-node pipeline has no automatic defense against.
 - **Cryptographic training-data provenance.** Every rollout carries a GRAIL sketch that binds the generation to the model weights that produced it. The validator re-verifies with its own forward pass. Fabricated data earns zero.
 
 The zone filter (`σ ≥ 0.43`, see below) is the mechanical realization of DAPO's Dynamic Sampling, reformulated to be reward-scale-agnostic. The miner-side incentive to predict σ *before* generating is what turns DAPO's post-hoc filter into an ex-ante market.
@@ -41,7 +41,7 @@ For each rollout the miner calls `env.compute_reward`, then runs a bit-identical
 `POST /submit` sends the request to the validator. The validator runs the full verification pipeline (see below). On success the submission is appended to the open window's valid pool. The response is immediate (`accepted=True`) — the heavy GRAIL verification runs in a background worker.
 
 **6. Validator verifies, filters, selects batch.**
-The validator checks: window match → checkpoint hash → prompt index bounds → cooldown → per-prompt FIFO short-circuit (`SUPERSEDED` if another miner already claimed this `prompt_idx` this window) → reward match → zone filter (`σ ≥ 0.43`) → GRAIL sketch. Any failure returns a `RejectReason` immediately. Valid submissions accumulate. Once `B_BATCH = 16` submissions with distinct `prompt_idx` values pass, `seal_event` fires.
+The validator checks: window match → checkpoint hash → prompt index bounds → cooldown → per-prompt FIFO short-circuit (`SUPERSEDED` if another miner already claimed this `prompt_idx` this window) → reward match → zone filter (`σ ≥ 0.43`) → GRAIL sketch. Any failure returns a `RejectReason` immediately. Valid submissions accumulate. Once `B_BATCH = 8` submissions with distinct `prompt_idx` values pass, `seal_event` fires.
 
 **7. Validator runs a GRPO step.**
 State transitions to `TRAINING`. `train_step()` computes group-relative advantages from each group's rewards, runs a PPO-clipped surrogate loss + KL penalty against the frozen reference model, and applies one AdamW step. The EMA scores are updated for all miners seen this window.
@@ -50,9 +50,9 @@ State transitions to `TRAINING`. `train_step()` computes group-relative advantag
 State transitions to `PUBLISHING`. Every `CHECKPOINT_PUBLISH_INTERVAL_WINDOWS = 10` windows the model is saved locally, pushed to HF Hub, and signed: `ed25519(checkpoint_n || revision)`. The signed manifest is installed in `/checkpoint`. Between publishes the miners stay on the last-published revision (enforced by the checkpoint hash gate). The window dataset is archived to R2.
 
 **9. State → READY → OPEN.**
-The next window opens immediately. Batched prompts enter a 50-window cooldown. Once per subnet epoch the validator calls `set_weights` on-chain with the current EMA snapshot.
+The next window opens immediately. Batched prompts enter a 72-window cooldown. Once per subnet epoch the validator calls `set_weights` on-chain with the current EMA snapshot.
 
-**Safety net.** If fewer than `B_BATCH` valid submissions arrive within `WINDOW_TIMEOUT_SECONDS = 600` seconds, the window seals on whatever arrived. Unused batch slots contribute to the burn weight for `UID_BURN`.
+**Safety net.** If fewer than `B_BATCH` valid submissions arrive within `WINDOW_TIMEOUT_SECONDS = 7200` seconds (2 h), the window seals on whatever arrived. Unused batch slots contribute to the burn weight for `UID_BURN`.
 
 ---
 
@@ -60,7 +60,7 @@ The next window opens immediately. Batched prompts enter a 50-window cooldown. O
 
 ### GRAIL proofs — anti-fabrication
 
-A GRAIL sketch is a compact linear commitment over a sampled subset of the model's last hidden-state activations for a given completion. The validator recomputes the forward pass on the same tokens with the same model, draws the same random challenge positions (seeded from the window's randomness), and checks that the two sketches agree within a position-dependent tolerance (`base = 6000`, growth `= 5.0 × sqrt(position)`). The tolerance is calibrated empirically to cover cross-GPU floating-point drift — legitimate proofs pass even on different hardware, while fabricated activations diverge by orders of magnitude.
+A GRAIL sketch is a compact linear commitment over a sampled subset of the model's last hidden-state activations for a given completion. The validator recomputes the forward pass on the same tokens with the same model, draws the same random challenge positions (seeded from the window's randomness), and checks that the two sketches agree within a position-dependent tolerance (`PROOF_SKETCH_TOLERANCE_BASE = 5000`, growth `= 5.0 × sqrt(position)`). The tolerance is calibrated empirically to cover cross-GPU floating-point drift — legitimate proofs pass even on different hardware, while fabricated activations diverge by orders of magnitude.
 
 Because each rollout's sketch is bound to the specific token sequence and the model's weights, a miner cannot fabricate completions, copy another miner's rollouts, or replay proofs from a different model revision without failing the sketch check.
 
@@ -72,11 +72,11 @@ Binary equivalence note: MATH rewards are binary `{0, 1}` (the validator extract
 
 Bootstrap phase (`BOOTSTRAP_WINDOWS = 100` windows from `SUBNET_START_BLOCK`): threshold relaxes to `σ ≥ 0.33` (binary equivalent: k ∈ [1, 7]) to keep batches filling while miner population and env coverage are thin.
 
-### Cooldown (50 windows) — curriculum rotation
+### Cooldown (72 windows) — curriculum rotation
 
-Once a `prompt_idx` enters the training batch it is ineligible for the next `BATCH_PROMPT_COOLDOWN_WINDOWS = 50` training steps. This prevents the policy from overfitting to a small set of high-signal prompts. With 50 windows of cooldown and `B_BATCH = 16` distinct prompts per window, roughly 800 distinct prompts are trained before any one prompt can recur.
+Once a `prompt_idx` enters the training batch it is ineligible for the next `BATCH_PROMPT_COOLDOWN_WINDOWS = 72` training steps. This prevents the policy from overfitting to a small set of high-signal prompts. With 72 windows of cooldown and `B_BATCH = 8` distinct prompts per window, roughly 576 distinct prompts are trained before any one prompt can recur.
 
-The cooldown map is rebuilt from R2 archives at validator startup — up to 50 recent windows are downloaded and replayed — so the curriculum state survives restarts without needing a local state file for cooldowns specifically.
+The cooldown map is rebuilt from R2 archives at validator startup — up to 72 recent windows are downloaded and replayed — so the curriculum state survives restarts without needing a local state file for cooldowns specifically.
 
 ### FIFO by TCP arrival — speed matters, not cherry-picking
 
@@ -117,16 +117,16 @@ The base model is Qwen3-4B-Instruct (~4 billion parameters, ~8 GB in bfloat16). 
 ### How a miner earns
 
 1. Submit a valid in-zone group on a non-cooldown prompt when the window is `OPEN`.
-2. Be among the first `B_BATCH = 16` submissions with distinct `prompt_idx` values (FIFO by validator-side TCP arrival; first to claim each `prompt_idx` wins that slot).
+2. Be among the first `B_BATCH = 8` submissions with distinct `prompt_idx` values (FIFO by validator-side TCP arrival; first to claim each `prompt_idx` wins that slot).
 3. Each batch slot you win contributes `1/B_BATCH` to your EMA update for that window.
 4. Once per subnet epoch (~360 blocks), the validator calls `set_weights` on-chain with the current EMA values. All validators submit inside a shared ~20-block window before the epoch boundary so they converge on identical weights. Your emission for the epoch is proportional to your EMA score.
 
 ### Rough expected earnings
 
-Suppose the network emits `E` TAO per epoch. You win an average of `s` batch slots per window. The EMA converges to approximately `s / B_BATCH = s / 16` of the total filled-slot budget. Your share of emissions per epoch is approximately:
+Suppose the network emits `E` TAO per epoch. You win an average of `s` batch slots per window. The EMA converges to approximately `s / B_BATCH = s / 8` of the total filled-slot budget. Your share of emissions per epoch is approximately:
 
 ```
-(s / 16) / (sum of all miners' EMA scores)
+(s / 8) / (sum of all miners' EMA scores)
 ```
 
 A miner consistently winning 2 slots per window gets roughly `2/8 = 25%` of the epoch's filled-slot emissions.
@@ -140,7 +140,7 @@ A miner consistently winning 2 slots per window gets roughly `2/8 = 25%` of the 
 | `WRONG_CHECKPOINT` | `checkpoint_hash` is stale | Re-poll `/state`, update revision, retry |
 | `BAD_PROMPT_IDX` | `prompt_idx >= len(env)` | Use a valid index from the environment |
 | `PROMPT_MISMATCH` | `tokens[:prompt_length]` does not match the canonical tokenization of `env.get_problem(prompt_idx).prompt` (CoT prefix, alternate chat template, custom system prompt, etc.) | Use the env's exact prompt string and the pinned tokenizer; do not modify the prompt before generation |
-| `PROMPT_IN_COOLDOWN` | Prompt is in the active 50-window cooldown set | Pick a different `prompt_idx` |
+| `PROMPT_IN_COOLDOWN` | Prompt is in the active 72-window cooldown set | Pick a different `prompt_idx` |
 | `SUPERSEDED` | Another submission for this `prompt_idx` already passed validation in this window — the slot is claimed | Submit faster next window, or pick a different `prompt_idx` |
 | `REWARD_MISMATCH` | Claimed reward does not match validator's `env.compute_reward` | Check env and model version alignment |
 | `OUT_OF_ZONE` | `σ < 0.43` (or `σ < 0.33` during bootstrap) | Pick a different prompt |

@@ -62,6 +62,7 @@ class RejectReason(str, Enum):
     BAD_TERMINATION = "bad_termination"
     WRONG_CHECKPOINT = "wrong_checkpoint"
     WRONG_RANDOMNESS = "wrong_randomness"
+    WORKER_DROPPED = "worker_dropped"
     STALE_ROUND = "stale_round"
     FUTURE_ROUND = "future_round"
 
@@ -146,6 +147,39 @@ class GrpoBatchState(BaseModel):
     # value rather than recomputing locally, which guarantees byte-for-byte
     # agreement with the validator's verify path.
     randomness: str = ""
+
+
+class Verdict(BaseModel):
+    """A single recorded verdict for a submission the validator has either
+    accepted or rejected after running the full verification pipeline.
+
+    Surfaced via the validator's ``GET /verdicts/{hotkey}`` endpoint so that
+    miners can learn the REAL outcome of each submission within seconds of
+    it being decided, instead of having to wait minutes for the R2 archive
+    upload. The /submit response (``BatchSubmissionResponse``) carries only
+    the provisional ``SUBMITTED`` sentinel under the production worker path
+    — the actual verdict (``ACCEPTED`` / ``GRAIL_FAIL`` / ``WRONG_RANDOMNESS``
+    / etc.) lands here once the worker drains the submission.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    merkle_root: str = Field(..., pattern=r"^[0-9a-fA-F]{64}$")
+    window_n: int | None = Field(default=None, ge=0)
+    accepted: bool
+    reason: RejectReason
+    ts: float = Field(..., description="Unix timestamp when the verdict landed")
+
+
+class VerdictsResponse(BaseModel):
+    """Reply body of ``GET /verdicts/{hotkey}``: list of recent verdicts for
+    one miner hotkey, ordered by timestamp ascending. Empty list is a
+    valid response — it just means the hotkey hasn't fired anything the
+    validator has remembered (capacity-limited ring buffer)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    verdicts: list[Verdict]
 
 
 class ModelInfo(BaseModel):
