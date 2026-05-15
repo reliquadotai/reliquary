@@ -234,21 +234,35 @@ MAX_SUBMISSIONS_PER_PROMPT = 10
 # How many drand-quicknet rounds backward of the validator's current round
 # the batcher accepts on the ``drand_round`` field. Original v2.3 design
 # was zero-tolerance ("the round currently in progress at receipt"), but
-# empirical prod data after the v2.3 deploy showed that any HTTP RTT or
-# small clock skew between miner and validator that crosses a 3 s drand
-# boundary turns into a STALE_ROUND rejection. PR #30 hoists the check
-# pre-queue so worker-side latency no longer compounds the problem, but
-# the boundary-crossing class of failure remains — a miner firing at
-# t=2.9 s of round R lands at the validator at t=3.0 s of round R+1.
+# empirical prod data after the v2.3 deploy showed two stacking issues:
 #
-# Tolerance = 1 means the miner's attached round may be (current, current-1).
-# Window of forgiveness: one drand period = 3 s. Security cost: an
-# attacker can antedate their submission's chronological bucket by at
-# most one round (3 s of priority). That's bounded, small, and uniform
-# across all miners — every miner gets the same one-round backward grace.
+#   1. Boundary crossing: a miner firing at t=2.9 s of round R lands at
+#      the validator at t=3.0 s of round R+1. PR #30 hoists the check
+#      pre-queue so this doesn't pile up behind GRAIL forward passes any
+#      more, but the boundary crossing itself still bins to R+1.
+#
+#   2. **Validator event-loop stalls.** The trainer / GRAIL forward pass
+#      runs in the same Python process as the FastAPI handler. When
+#      torch.compile recompiles, when set_weights() does a chain call,
+#      or when a GRPO step holds the GIL, the asyncio event loop stalls
+#      for 5–30 s. The cheap-reject's ``time.time()`` is taken when the
+#      handler actually runs, not when the TCP packet arrived — so a
+#      submission fired at round R can have its tolerance window
+#      compared against current_round R+10 (30 s of stall = 10 rounds).
+#      Until HTTP is process-isolated from the trainer, the only
+#      workaround at the protocol layer is to widen the tolerance.
+#
+# Default = 10 rounds (30 s) absorbs typical stalls without weakening
+# the chronological-ordering guarantee meaningfully: a 30 s antedate is
+# still bounded and uniform across all miners. Operators can override
+# via the ``DRAND_ROUND_BACKWARD_TOLERANCE`` env var; tests pin specific
+# values explicitly via ``GrpoWindowBatcher(drand_round_backward_tolerance=...)``.
+#
 # Forward direction stays zero (FUTURE_ROUND is unrecoverable: a miner
 # that attaches round R+1 hasn't seen σ_{R+1} yet, so they're cheating).
-DRAND_ROUND_BACKWARD_TOLERANCE = 1
+DRAND_ROUND_BACKWARD_TOLERANCE = int(
+    _os.environ.get("DRAND_ROUND_BACKWARD_TOLERANCE", "10")
+)
 
 # Bootstrap phase: first BOOTSTRAP_WINDOWS of a new subnet/checkpoint use
 # relaxed thresholds to keep the batch filling while miner pop + env

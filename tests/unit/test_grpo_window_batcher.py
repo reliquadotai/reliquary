@@ -618,11 +618,12 @@ def test_drand_round_current_accepted():
 
 
 def test_drand_round_one_behind_accepted_with_default_tolerance():
-    """Default ``DRAND_ROUND_BACKWARD_TOLERANCE = 1`` absorbs one-round
-    drift caused by HTTP RTT or small clock skew between miner and
-    validator. ``drand_round = current - 1`` MUST NOT be STALE_ROUND on a
-    default-configured batcher — the v2.3 zero-tolerance design produced
-    near-total throughput collapse in prod.
+    """Default ``DRAND_ROUND_BACKWARD_TOLERANCE = 10`` absorbs the typical
+    validator-side event-loop stall caused by trainer GIL contention plus
+    small HTTP RTT / clock skew. ``drand_round = current - 1`` is well
+    inside that window — the v2.3 zero-tolerance design produced
+    near-total throughput collapse in prod and tolerance = 1 still missed
+    train_step stalls that hold the asyncio loop for >3 s.
     """
     b = _make_batcher_with_drand_check(fixed_round=100)
     req = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
@@ -631,12 +632,25 @@ def test_drand_round_one_behind_accepted_with_default_tolerance():
     assert resp.accepted is True
 
 
-def test_drand_round_two_behind_still_stale_under_default_tolerance():
-    """Tolerance = 1 means [current - 1, current] is the accepted window.
-    Round = current - 2 is outside that window and MUST be STALE_ROUND."""
+def test_drand_round_ten_behind_accepted_with_default_tolerance():
+    """Tolerance = 10 must accept the ``current - 10`` edge — this is the
+    far boundary of the absorption window. A 30-s validator stall is
+    common enough during training cycles that this needs to land cleanly.
+    """
     b = _make_batcher_with_drand_check(fixed_round=100)
     req = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
-    req.drand_round = 98
+    req.drand_round = 90  # current - 10
+    resp = b.accept_submission(req)
+    assert resp.accepted is True
+
+
+def test_drand_round_eleven_behind_stale_under_default_tolerance():
+    """Tolerance = 10 means [current - 10, current] is accepted. Round =
+    current - 11 is outside that window and MUST be STALE_ROUND — the
+    gate stays a hard cliff."""
+    b = _make_batcher_with_drand_check(fixed_round=100)
+    req = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
+    req.drand_round = 89  # current - 11
     resp = b.accept_submission(req)
     assert resp.accepted is False
     assert resp.reason == RejectReason.STALE_ROUND
@@ -667,12 +681,53 @@ def test_drand_round_zero_tolerance_one_behind_stale():
     assert resp.reason == RejectReason.STALE_ROUND
 
 
-def test_drand_round_default_backward_tolerance_is_one():
+def test_drand_round_default_backward_tolerance_is_ten():
     """Pin the default. Changing this in constants is a deliberate
     protocol-tuning decision, not an incidental refactor — make any
-    drift loud."""
-    from reliquary.constants import DRAND_ROUND_BACKWARD_TOLERANCE
-    assert DRAND_ROUND_BACKWARD_TOLERANCE == 1
+    drift loud.
+
+    Bumped from 1 → 10 (PR #31) after empirical observation that the
+    validator's FastAPI event loop stalls 5–30 s during trainer GIL
+    contention. Cheap-reject ``time.time()`` is taken when the handler
+    runs, not when the TCP packet arrived, so tolerance = 1 still
+    rejected submissions across the stall. Operators can override via
+    the ``DRAND_ROUND_BACKWARD_TOLERANCE`` env var.
+    """
+    import os
+    # Pin the *unset* default — env-var override would skew the test.
+    prior = os.environ.pop("DRAND_ROUND_BACKWARD_TOLERANCE", None)
+    try:
+        import importlib
+        import reliquary.constants
+        importlib.reload(reliquary.constants)
+        assert reliquary.constants.DRAND_ROUND_BACKWARD_TOLERANCE == 10
+    finally:
+        if prior is not None:
+            os.environ["DRAND_ROUND_BACKWARD_TOLERANCE"] = prior
+        import importlib
+        import reliquary.constants
+        importlib.reload(reliquary.constants)
+
+
+def test_drand_round_backward_tolerance_env_var_override():
+    """``DRAND_ROUND_BACKWARD_TOLERANCE`` env var overrides the constant.
+    Lets operators tune for their validator's typical stall profile
+    without a code push — same ``RELIQUARY_*``-style ergonomic the
+    miner / validator CLI already exposes for env name and resume."""
+    import os
+    import importlib
+    import reliquary.constants
+    prior = os.environ.get("DRAND_ROUND_BACKWARD_TOLERANCE")
+    os.environ["DRAND_ROUND_BACKWARD_TOLERANCE"] = "25"
+    try:
+        importlib.reload(reliquary.constants)
+        assert reliquary.constants.DRAND_ROUND_BACKWARD_TOLERANCE == 25
+    finally:
+        if prior is None:
+            os.environ.pop("DRAND_ROUND_BACKWARD_TOLERANCE", None)
+        else:
+            os.environ["DRAND_ROUND_BACKWARD_TOLERANCE"] = prior
+        importlib.reload(reliquary.constants)
 
 
 def test_drand_round_explicit_tolerance_three_allows_three_behind():
