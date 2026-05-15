@@ -131,7 +131,14 @@ def _make_batcher(**overrides) -> GrpoWindowBatcher:
         hash_set=None,
     )
     kwargs.update(overrides)
-    return GrpoWindowBatcher(**kwargs)
+    b = GrpoWindowBatcher(**kwargs)
+    # Match the per-window randomness used by ``_make_commit`` so the new
+    # randomness-binding check (BAD_SIGNATURE → WRONG_RANDOMNESS → GRAIL)
+    # doesn't reject every test request. Production sets this via
+    # ``service._set_window_randomness`` before the window opens for
+    # submissions; tests skip that hop.
+    b.randomness = "cd" * 16
+    return b
 
 
 def test_constructor_sets_window():

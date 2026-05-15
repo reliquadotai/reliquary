@@ -343,6 +343,22 @@ class GrpoWindowBatcher:
                     return self._reject(RejectReason.PROMPT_MISMATCH, hotkey=hk, prompt_idx=pi)
             if not self._verify_signature(rollout.commit, request.miner_hotkey):
                 return self._reject(RejectReason.BAD_SIGNATURE, hotkey=hk, prompt_idx=pi)
+            # Randomness binding: the miner-claimed beacon randomness MUST equal
+            # the validator's per-window derived randomness. Without this check,
+            # the sketch-tolerance window (~5000 mod q≈2.15e9) is wide enough
+            # that miners using a constant pre-computed r_vec can still slip
+            # under the GRAIL diff threshold — observed sketch_diff_max sitting
+            # at ~3000–5000 on real submissions, just under the per-position
+            # limit. That collapses GRAIL's randomness-binding security to the
+            # tolerance × num_buckets product and removes the per-window
+            # unpredictability the sketch was designed to provide. Reject here,
+            # before paying for the GRAIL forward pass on a commit we already
+            # know is detached from the validator's window seed.
+            claimed_rand = (rollout.commit.get("beacon") or {}).get("randomness", "")
+            if claimed_rand != self.randomness:
+                return self._reject(
+                    RejectReason.WRONG_RANDOMNESS, hotkey=hk, prompt_idx=pi,
+                )
             proof = self._verify_commitment(
                 rollout.commit, self.model, self.randomness
             )
