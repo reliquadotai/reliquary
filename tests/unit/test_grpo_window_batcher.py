@@ -610,12 +610,14 @@ def test_drand_round_current_accepted():
     assert b.accept_submission(req).accepted is True
 
 
-def test_drand_round_one_behind_accepted():
-    """Tolerance of one round backward for network jitter."""
+def test_drand_round_one_behind_stale():
+    """v2.3: tolerance 0 — even one round behind is rejected."""
     b = _make_batcher_with_drand_check(fixed_round=100)
     req = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
     req.drand_round = 99
-    assert b.accept_submission(req).accepted is True
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.STALE_ROUND
 
 
 def test_drand_round_two_behind_stale():

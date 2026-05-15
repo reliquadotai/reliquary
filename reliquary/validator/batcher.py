@@ -257,14 +257,17 @@ class GrpoWindowBatcher:
             return self._accept_locked(request)
 
     def _validate_drand_round(self, drand_round: int) -> RejectReason | None:
-        """Return the appropriate reject reason if ``drand_round`` is outside
-        ``[current_round - 1, current_round]``, else None.
+        """Return the appropriate reject reason if ``drand_round`` doesn't
+        equal ``current_round`` exactly, else None.
 
-        ``current_round`` is derived from the validator's wall clock and the
-        cached drand chain params (genesis_time + period). Tolerance of one
-        round backward absorbs inter-continent network latency; attaching a
-        future round is rejected outright since the miner cannot legitimately
-        know σ_R for a round not yet published.
+        v2.3: tolerance is zero — the miner must attach the round currently
+        in progress at receipt time. Future rounds are always rejected
+        (σ_R doesn't exist yet); past rounds are rejected to prevent
+        antedating a submission into an earlier chronological bucket than
+        it actually earned. Network jitter that pushes a POST across a
+        round boundary now costs the submission; a future iteration may
+        relax this with a millisecond-grain check before the round
+        boundary instead of a full-round tolerance.
         """
         if self._drand_chain_info is None:
             from reliquary.infrastructure.drand import get_current_chain
@@ -276,7 +279,7 @@ class GrpoWindowBatcher:
         )
         if drand_round > current:
             return RejectReason.FUTURE_ROUND
-        if drand_round < current - 1:
+        if drand_round < current:
             return RejectReason.STALE_ROUND
         return None
 
