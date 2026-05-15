@@ -144,7 +144,7 @@ def _patch_open_grpo_window(svc):
     real_open = svc_mod.open_grpo_window
 
     def _mock_open(window_start, env, model, *, cooldown_map, hash_set, tokenizer, bootstrap=False):
-        return GrpoWindowBatcher(
+        b = GrpoWindowBatcher(
             window_start=window_start,
             env=env,
             model=model,
@@ -160,6 +160,10 @@ def _patch_open_grpo_window(svc):
             # timing gate so submissions with drand_round=0 still accept.
             drand_round_check_enabled=False,
         )
+        # Match the per-window randomness used in ``_make_commit`` so the
+        # WRONG_RANDOMNESS check from PR #23 accepts the test requests.
+        b.randomness = "cd" * 16
+        return b
 
     return patch.object(svc_mod, "open_grpo_window", side_effect=_mock_open)
 

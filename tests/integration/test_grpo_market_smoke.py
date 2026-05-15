@@ -87,7 +87,7 @@ def _always_true_proof(commit, model, randomness):
 
 
 def _make_batcher(window, cooldown):
-    return GrpoWindowBatcher(
+    b = GrpoWindowBatcher(
         window_start=window,
         env=FakeEnv(),
         model=_ModelStub(),
@@ -98,6 +98,10 @@ def _make_batcher(window, cooldown):
         # Smoke tests don't drive wall clock; disable the drand timing gate.
         drand_round_check_enabled=False,
     )
+    # Match the per-window randomness used in ``_make_commit`` so the
+    # WRONG_RANDOMNESS check from PR #23 accepts the test requests.
+    b.randomness = "cd" * 16
+    return b
 
 
 def test_two_windows_with_cooldown():
