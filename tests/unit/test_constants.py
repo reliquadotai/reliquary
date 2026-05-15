@@ -19,15 +19,32 @@ def test_v2_temperature_fixed_nonzero():
 
 
 def test_v2_cooldown_values():
-    assert C.BATCH_PROMPT_COOLDOWN_WINDOWS == 200
+    assert C.BATCH_PROMPT_COOLDOWN_WINDOWS == 1_000_000
     assert C.BOOTSTRAP_WINDOWS == 100
 
 
 def test_hash_dedup_retention_decoupled_from_cooldown():
-    """Hash retention must strictly exceed cooldown — otherwise the dedup
-    is redundant with PROMPT_IN_COOLDOWN and never fires."""
-    assert C.HASH_DEDUP_RETENTION_WINDOWS > C.BATCH_PROMPT_COOLDOWN_WINDOWS
+    """Hash retention is independent of prompt cooldown.
+
+    v2.3 + 1M cooldown: BATCH_PROMPT_COOLDOWN_WINDOWS now exceeds
+    HASH_DEDUP_RETENTION_WINDOWS, so a prompt is locked by cooldown long
+    before the hash horizon would catch a duplicate token sequence. The
+    hash dedup remains in place as a defense-in-depth (e.g. for cases
+    where the cooldown map is partially rebuilt after a long restart
+    gap) — its purpose shifted from "cooldown-extender" to
+    "post-cooldown safety net". The two values just need to be sensible
+    and explicit; no ordering invariant.
+    """
     assert C.HASH_DEDUP_RETENTION_WINDOWS == 10000
+    assert C.BATCH_PROMPT_COOLDOWN_WINDOWS == 1_000_000
+
+
+def test_cooldown_rebuild_lookback_bounded():
+    """The R2 rebuild cap must stay small enough for a startup scan to
+    complete in seconds even when BATCH_PROMPT_COOLDOWN_WINDOWS is set to
+    an astronomical value for one-shot semantics."""
+    assert C.COOLDOWN_REBUILD_LOOKBACK == 10_000
+    assert C.COOLDOWN_REBUILD_LOOKBACK < C.BATCH_PROMPT_COOLDOWN_WINDOWS
 
 
 def test_v2_bootstrap_sigma_lower_than_steady():

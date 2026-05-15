@@ -192,7 +192,22 @@ TOP_K_PROTO = 0
 # A prompt that entered the training batch is ineligible for B_BATCH for
 # the next N windows (= training steps). Forces curriculum rotation so
 # the policy has time to shift between reuses.
-BATCH_PROMPT_COOLDOWN_WINDOWS = 200
+# v2.3 + OpenMathInstruct (14M prompts): bumped from 200 to 1_000_000 so
+# each prompt is effectively single-use across the lifetime of any
+# realistic training run (1M windows ≈ 700 days at 5 blocks × 12s). The
+# 14M-prompt env supplies enough fresh material without needing reuse.
+BATCH_PROMPT_COOLDOWN_WINDOWS = 1_000_000
+
+# Validator startup: cap the number of R2 archives scanned to rebuild
+# CooldownMap. Independent of BATCH_PROMPT_COOLDOWN_WINDOWS — that
+# constant can be astronomically large for one-shot semantics, but R2
+# rebuild must stay O(1) in elapsed wall time. 10_000 archives ≈ 8.3
+# days of windows, which dominates any realistic restart gap. Older
+# entries are still in cooldown (the in-memory map is replayed from R2
+# and any miss is treated as ``no cooldown record``, which is safe: the
+# validator's hash-blacklist still rejects re-submission of the same
+# token sequence).
+COOLDOWN_REBUILD_LOOKBACK = 10_000
 
 # Per-rollout content dedup horizon. Independent of and strictly longer
 # than the prompt cooldown: cooldown lets a prompt come back for fresh

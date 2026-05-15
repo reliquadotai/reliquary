@@ -9,6 +9,7 @@ from typing import Any
 
 from reliquary.constants import (
     BATCH_PROMPT_COOLDOWN_WINDOWS,
+    COOLDOWN_REBUILD_LOOKBACK,
     B_BATCH,
     BOOTSTRAP_WINDOWS,
     CHECKPOINT_PUBLISH_INTERVAL_WINDOWS,
@@ -821,7 +822,7 @@ class ValidationService:
 
     async def _rebuild_cooldown_from_history(self) -> None:
         """At startup, reconstruct CooldownMap from the last
-        BATCH_PROMPT_COOLDOWN_WINDOWS archived windows on R2.
+        COOLDOWN_REBUILD_LOOKBACK archived windows on R2 (bounded cap; not BATCH_PROMPT_COOLDOWN_WINDOWS which is now astronomical for one-shot semantics).
 
         R2 is the durable source of truth — each window's sealed batch is
         uploaded by ``_archive_window``. Rebuilding from that history means:
@@ -835,7 +836,7 @@ class ValidationService:
             current_window = self._window_n
             archives = await storage.list_recent_datasets(
                 current_window=current_window + 1,
-                n=BATCH_PROMPT_COOLDOWN_WINDOWS,
+                n=COOLDOWN_REBUILD_LOOKBACK,
             )
             self._cooldown_map.rebuild_from_history(
                 archives, current_window=current_window,
