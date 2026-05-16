@@ -149,7 +149,7 @@ def test_callback_fires_on_worker_drop():
         request.miner_hotkey = "hkB"
         request.prompt_idx = 7
 
-        await s._submit_queue.put((request, old_batcher, 0.0))
+        await s._submit_queue.put((request, old_batcher))
         # Run one iteration of the worker manually: stop it after the first
         # queue item by injecting a sentinel that raises CancelledError.
         async def runner():

@@ -610,38 +610,34 @@ def _make_batcher_with_drand_check(*, fixed_round: int = 100, **overrides):
     return _make_batcher(**overrides)
 
 
+# The drand-round timing gate is now an HTTP-arrival-only check (see
+# ``server.py``'s ``stamp_arrival`` middleware + cheap-reject path). The
+# batcher's ``_accept_locked`` no longer re-validates drand_round at worker
+# dequeue — that re-check was using ``time.time()`` minutes after arrival
+# under GRAIL queue backpressure and turning on-time submissions into
+# spurious STALE_ROUND rejections (the bug this refactor removes). These
+# tests pin the gate's behaviour via the public ``validate_drand_round``
+# method that the HTTP cheap-reject calls directly.
+
 def test_drand_round_current_accepted():
     b = _make_batcher_with_drand_check(fixed_round=100)
-    req = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
-    req.drand_round = 100
-    assert b.accept_submission(req).accepted is True
+    assert b.validate_drand_round(100) is None
 
 
 def test_drand_round_one_behind_accepted_with_default_tolerance():
-    """Default ``DRAND_ROUND_BACKWARD_TOLERANCE = 10`` absorbs the typical
-    validator-side event-loop stall caused by trainer GIL contention plus
-    small HTTP RTT / clock skew. ``drand_round = current - 1`` is well
-    inside that window — the v2.3 zero-tolerance design produced
-    near-total throughput collapse in prod and tolerance = 1 still missed
-    train_step stalls that hold the asyncio loop for >3 s.
+    """Default ``DRAND_ROUND_BACKWARD_TOLERANCE = 10`` absorbs typical
+    HTTP RTT + small clock skew. ``drand_round = current - 1`` is well
+    inside that window.
     """
     b = _make_batcher_with_drand_check(fixed_round=100)
-    req = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
-    req.drand_round = 99
-    resp = b.accept_submission(req)
-    assert resp.accepted is True
+    assert b.validate_drand_round(99) is None
 
 
 def test_drand_round_ten_behind_accepted_with_default_tolerance():
-    """Tolerance = 10 must accept the ``current - 10`` edge — this is the
-    far boundary of the absorption window. A 30-s validator stall is
-    common enough during training cycles that this needs to land cleanly.
-    """
+    """Tolerance = 10 must accept the ``current - 10`` edge — far boundary
+    of the absorption window for cross-continent RTT jitter."""
     b = _make_batcher_with_drand_check(fixed_round=100)
-    req = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
-    req.drand_round = 90  # current - 10
-    resp = b.accept_submission(req)
-    assert resp.accepted is True
+    assert b.validate_drand_round(90) is None  # current - 10
 
 
 def test_drand_round_eleven_behind_stale_under_default_tolerance():
@@ -649,36 +645,23 @@ def test_drand_round_eleven_behind_stale_under_default_tolerance():
     current - 11 is outside that window and MUST be STALE_ROUND — the
     gate stays a hard cliff."""
     b = _make_batcher_with_drand_check(fixed_round=100)
-    req = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
-    req.drand_round = 89  # current - 11
-    resp = b.accept_submission(req)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.STALE_ROUND
+    assert b.validate_drand_round(89) == RejectReason.STALE_ROUND  # current-11
 
 
 def test_drand_round_future_rejected():
     """Forward direction is always zero-tolerance: a future round means
     the miner claims to have seen a beacon that hasn't been signed yet."""
     b = _make_batcher_with_drand_check(fixed_round=100)
-    req = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
-    req.drand_round = 101
-    resp = b.accept_submission(req)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.FUTURE_ROUND
+    assert b.validate_drand_round(101) == RejectReason.FUTURE_ROUND
 
 
 def test_drand_round_zero_tolerance_one_behind_stale():
     """Explicit ``drand_round_backward_tolerance = 0`` restores the
-    original v2.3 zero-tolerance spec (useful for stress-test fixtures
-    or future tighter-grain enforcement). One round behind is STALE."""
+    original v2.3 zero-tolerance spec. One round behind is STALE."""
     b = _make_batcher_with_drand_check(
         fixed_round=100, drand_round_backward_tolerance=0,
     )
-    req = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
-    req.drand_round = 99
-    resp = b.accept_submission(req)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.STALE_ROUND
+    assert b.validate_drand_round(99) == RejectReason.STALE_ROUND
 
 
 def test_drand_round_default_backward_tolerance_is_ten():
@@ -731,16 +714,12 @@ def test_drand_round_backward_tolerance_env_var_override():
 
 
 def test_drand_round_explicit_tolerance_three_allows_three_behind():
-    """Tolerance is a per-batcher knob — operators can dial it up when
-    drand network jitter or validator-side queue lag pushes typical
-    submissions further behind ``current_round``."""
+    """Tolerance is a per-batcher knob — operators can dial it down when
+    arrival-time stamping makes the wide default less necessary."""
     b = _make_batcher_with_drand_check(
         fixed_round=100, drand_round_backward_tolerance=3,
     )
-    req = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
-    req.drand_round = 97  # current - 3
-    resp = b.accept_submission(req)
-    assert resp.accepted is True
+    assert b.validate_drand_round(97) is None  # current - 3
 
 
 def test_drand_round_explicit_tolerance_three_rejects_four_behind():
@@ -749,11 +728,7 @@ def test_drand_round_explicit_tolerance_three_rejects_four_behind():
     b = _make_batcher_with_drand_check(
         fixed_round=100, drand_round_backward_tolerance=3,
     )
-    req = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
-    req.drand_round = 96  # current - 4
-    resp = b.accept_submission(req)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.STALE_ROUND
+    assert b.validate_drand_round(96) == RejectReason.STALE_ROUND  # current-4
 
 
 # ---------------------------------------------------------------------------
@@ -837,34 +812,34 @@ def test_drand_round_falls_back_to_wall_clock_when_no_arrival():
     assert b.validate_drand_round(101) == RejectReason.FUTURE_ROUND
 
 
-def test_accept_submission_threads_t_arrival_to_drand_check():
-    """End-to-end through ``accept_submission``: a request that would be
-    STALE under wall-clock-only checking is accepted when ``t_arrival``
-    places it inside its round. Pins the wiring: the kwarg actually flows
-    from the entry point down to ``validate_drand_round``.
+def test_accept_submission_no_longer_rechecks_drand_round():
+    """Regression: ``accept_submission`` (the worker path) must NOT
+    re-validate drand_round. Drand is an arrival-time gate decided once
+    by the HTTP cheap-reject path; re-checking here would use
+    ``time.time()`` at worker dequeue, which under GRAIL queue
+    backpressure can be minutes after arrival — turning on-time
+    submissions into STALE_ROUND rejections (the bug this design fixes).
+
+    A drand_round that the cheap-reject would have rejected as STALE
+    must STILL be accepted by ``accept_submission`` if it passes the
+    other gates. The arrival path is the single source of truth for
+    drand timing.
     """
-    b = _make_batcher_with_drand_check(
-        fixed_round=110, drand_round_backward_tolerance=0,
-    )
+    b = _make_batcher_with_drand_check(fixed_round=100)
     req = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
-    req.drand_round = 100  # ten rounds behind batcher's wall clock
+    req.drand_round = 50  # far stale — would be rejected at HTTP arrival
 
-    # Without t_arrival: STALE.
-    resp_no_arrival = b.accept_submission(req)
-    assert resp_no_arrival.accepted is False
-    assert resp_no_arrival.reason == RejectReason.STALE_ROUND
+    # Direct ``validate_drand_round`` would reject (cheap-reject path).
+    assert b.validate_drand_round(50) == RejectReason.STALE_ROUND
 
-    # With matching t_arrival: accepted.
-    t_arrival = 1000 + (100 - 1) * 3 + 1.0
-    # Need a fresh batcher because the first call recorded a rejection
-    # against this hotkey/prompt.
-    b2 = _make_batcher_with_drand_check(
-        fixed_round=110, drand_round_backward_tolerance=0,
+    # But ``accept_submission`` does NOT re-check, so it proceeds past
+    # the drand gate. (It may still reject for other reasons like GRAIL,
+    # but never STALE_ROUND from the worker path.)
+    resp = b.accept_submission(req)
+    assert resp.reason != RejectReason.STALE_ROUND, (
+        "worker path must not re-validate drand_round — that re-check "
+        "is the staleness-on-queue-wait bug we're fixing"
     )
-    req2 = _request_v21(prompt_idx=43, hotkey="B", checkpoint_hash="")
-    req2.drand_round = 100
-    resp_with_arrival = b2.accept_submission(req2, t_arrival=t_arrival)
-    assert resp_with_arrival.accepted is True
 
 
 def test_constructor_accepts_tokenizer():

@@ -200,9 +200,9 @@ async def test_worker_drops_post_seal_items_without_grail():
     grail_calls: list[BatchSubmissionRequest] = []
     original_accept = batcher.accept_submission
 
-    def trace_accept(req, *, t_arrival=None):
+    def trace_accept(req):
         grail_calls.append(req)
-        return original_accept(req, t_arrival=t_arrival)
+        return original_accept(req)
 
     batcher.accept_submission = trace_accept  # type: ignore[method-assign]
 
@@ -227,7 +227,7 @@ async def test_worker_drops_post_seal_items_without_grail():
     )
     # Manually flip the seal flag — the queued item is now post-seal.
     batcher._seal_flag.set()
-    await s._submit_queue.put((req, batcher, 0.0))
+    await s._submit_queue.put((req, batcher))
 
     # Run one iteration of the worker.
     worker = asyncio.create_task(s._submit_worker())
@@ -262,9 +262,9 @@ async def test_worker_processes_normally_when_not_sealed():
     grail_calls: list[BatchSubmissionRequest] = []
     original_accept = batcher.accept_submission
 
-    def trace_accept(req, *, t_arrival=None):
+    def trace_accept(req):
         grail_calls.append(req)
-        return original_accept(req, t_arrival=t_arrival)
+        return original_accept(req)
 
     batcher.accept_submission = trace_accept  # type: ignore[method-assign]
 
@@ -283,7 +283,7 @@ async def test_worker_processes_normally_when_not_sealed():
     )
     # Seal flag NOT set — worker must process normally.
     assert not batcher.is_sealed()
-    await s._submit_queue.put((req, batcher, 0.0))
+    await s._submit_queue.put((req, batcher))
 
     worker = asyncio.create_task(s._submit_worker())
     try:
@@ -332,7 +332,7 @@ async def test_worker_seal_check_after_batcher_swap_check():
         miner_hotkey="hkX", prompt_idx=1, window_start=500,
         merkle_root="00" * 32, rollouts=rollouts, checkpoint_hash="sha256:test",
     )
-    await s._submit_queue.put((req, old_batcher, 0.0))
+    await s._submit_queue.put((req, old_batcher))
 
     worker = asyncio.create_task(s._submit_worker())
     try:

@@ -354,7 +354,7 @@ async def test_worker_drops_late_items_for_stale_batcher():
     new_batcher = _batcher(window_start=501)
     accept_calls: list[int] = []
 
-    def _spy_accept(req, *, t_arrival=None):
+    def _spy_accept(req):
         accept_calls.append(req.prompt_idx)
         from reliquary.protocol.submission import BatchSubmissionResponse
         return BatchSubmissionResponse(accepted=True, reason=RejectReason.ACCEPTED)
@@ -365,8 +365,8 @@ async def test_worker_drops_late_items_for_stale_batcher():
     # Active is the new batcher. The queue has a leftover stale item plus
     # one for the new batcher.
     server.set_active_batcher(new_batcher)
-    await server._submit_queue.put((_request(prompt_idx=11), old_batcher, 0.0))
-    await server._submit_queue.put((_request(prompt_idx=22), new_batcher, 0.0))
+    await server._submit_queue.put((_request(prompt_idx=11), old_batcher))
+    await server._submit_queue.put((_request(prompt_idx=22), new_batcher))
 
     # Run the worker just long enough to drain both items.
     worker_task = asyncio.create_task(server._submit_worker())

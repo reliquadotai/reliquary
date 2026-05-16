@@ -149,20 +149,18 @@ class ValidatorServer:
             Runs before pydantic body validation and before the route
             handler, so ``request.state.t_arrival`` reflects when the
             asyncio loop first picked the request up — not when the
-            handler eventually executes. The drand-round check uses this
-            timestamp so submissions aren't penalized when the loop is
-            stalled (trainer GIL contention, slow body parsing, GRAIL
-            queue backpressure). See ``GrpoWindowBatcher.validate_drand_round``
-            for the rationale; the round computation downstream consumes
-            this attribute.
+            handler eventually executes. The /submit cheap-reject path
+            consumes this attribute and forwards it to
+            ``validate_drand_round`` so the drand timing gate is decided
+            against the actual arrival instant, not against the moment
+            the handler eventually runs (which can lag by tens of ms
+            under load even for fast handlers).
 
-            Caveat: if uvicorn's ``accept()`` itself is blocked (whole
-            event loop frozen, no coroutines running at all), this
-            middleware also doesn't run and ``t_arrival`` lands as late
-            as the handler would have anyway. That deeper case is what
-            the process-isolation refactor of the trainer addresses; the
-            stamping here covers the common 99 % where the loop is busy
-            but progressing.
+            The drand check happens EXCLUSIVELY here on the arrival path —
+            there's no worker-side re-check that would otherwise re-read
+            ``time.time()`` minutes later when GRAIL queue backpressure
+            delays dequeue (which would turn on-time submissions into
+            STALE_ROUND rejections, the bug pre-this-fix).
             """
             request.state.t_arrival = time.time()
             return await call_next(request)
@@ -294,7 +292,7 @@ class ValidatorServer:
             # silently draining the leftover queue at the next batcher swap
             # (see ``_submit_worker`` below), not by HTTP-level rejections.
             if self._worker_task is None:
-                resp = batcher.accept_submission(request, t_arrival=t_arrival)
+                resp = batcher.accept_submission(request)
                 # Sync path (tests) — the real verdict is already known
                 # before we return, so record it directly.
                 self.record_verdict(
@@ -303,7 +301,7 @@ class ValidatorServer:
                 )
                 return resp
 
-            await self._submit_queue.put((request, batcher, t_arrival))
+            await self._submit_queue.put((request, batcher))
             return BatchSubmissionResponse(
                 accepted=True, reason=RejectReason.SUBMITTED,
             )
@@ -388,7 +386,7 @@ class ValidatorServer:
 
         while True:
             try:
-                request, batcher, t_arrival = await self._submit_queue.get()
+                request, batcher = await self._submit_queue.get()
             except asyncio.CancelledError:
                 return
             # Silently drop items whose batcher is no longer the active one.
@@ -449,7 +447,7 @@ class ValidatorServer:
                 continue
             try:
                 response = await asyncio.to_thread(
-                    batcher.accept_submission, request, t_arrival=t_arrival,
+                    batcher.accept_submission, request
                 )
                 if response.accepted:
                     logger.info(
