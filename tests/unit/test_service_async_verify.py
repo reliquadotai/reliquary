@@ -100,3 +100,152 @@ async def test_derive_randomness_returns_none_beacon_in_mock_mode(monkeypatch):
     )
     assert randomness == "mock_randomness"
     assert beacon is None
+
+
+# ---------------------------------------------------------------------------
+# Task 5 — background _verify_beacon_async + _train_and_publish gate
+# ---------------------------------------------------------------------------
+
+
+def _make_test_batcher():
+    """Minimal stub mirroring just the batcher surface area the
+    service uses inside _train_and_publish's gate.
+    """
+    class _B:
+        randomness = None
+        beacon_invalid = False
+        def seal_batch(self):
+            raise AssertionError("seal_batch must not be called for invalid windows")
+    return _B()
+
+
+def _make_test_service(use_drand: bool):
+    """Bypass __init__: we only need a handful of attrs to drive the
+    methods under test. Mirrors the stub-Svc pattern in
+    tests/unit/test_window_randomness_retry.py.
+    """
+    from reliquary.validator.service import ValidationService
+    svc = ValidationService.__new__(ValidationService)
+    svc.use_drand = use_drand
+    svc._active_batcher = None
+    svc._window_n = 0
+    svc._verify_task = None
+    svc._last_beacon = None
+    svc.server = MagicMock()
+    svc._checkpoint_store = MagicMock(current_manifest=lambda: object())
+    svc._checkpoint_n = 0
+    svc._publish_every = 100
+    svc.train_model = None
+    svc.verify_model = None
+    return svc
+
+
+@pytest.mark.asyncio
+async def test_set_window_randomness_does_not_block_on_verify(monkeypatch):
+    """The hot-path requirement: even with a slow (5s) verify,
+    _set_window_randomness must return in <300ms so _activate_window
+    can publish the OPEN state to miners on the drand boundary.
+    """
+    from reliquary.validator import service as svc_mod
+
+    # 5-second blocking verify — if the hot path awaits this, the test
+    # will exceed its time budget by an order of magnitude.
+    def _slow_verify(*args, **kwargs):
+        time.sleep(5.0)
+        return True
+
+    fake_beacon = {"round": 1, "randomness": "aa" * 32, "signature": "bb" * 48}
+
+    async def _stub_derive(self, subtensor, target_window):
+        return "computed_randomness", fake_beacon
+
+    monkeypatch.setattr(svc_mod.ValidationService, "_derive_randomness", _stub_derive)
+    monkeypatch.setattr(
+        "reliquary.infrastructure.drand.verify_beacon_signature",
+        _slow_verify,
+    )
+    monkeypatch.setattr(
+        "reliquary.infrastructure.drand.get_current_chain",
+        lambda: {"hash": "test_hash", "genesis_time": 0, "period": 3},
+    )
+
+    svc = _make_test_service(use_drand=True)
+    svc._active_batcher = _make_test_batcher()
+    svc._window_n = 42
+
+    t0 = time.monotonic()
+    await svc._set_window_randomness(subtensor=None)
+    elapsed = time.monotonic() - t0
+
+    assert elapsed < 0.3, (
+        f"_set_window_randomness took {elapsed:.2f}s — the verify is "
+        f"blocking the hot path instead of running in background."
+    )
+    assert svc._active_batcher.randomness == "computed_randomness"
+    # Verify task should be scheduled — assert it exists then cancel
+    # so the slow sleep doesn't hang the test.
+    assert svc._verify_task is not None
+    svc._verify_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_async_verify_failure_flips_beacon_invalid(monkeypatch):
+    """If the background verify returns False, the batcher's
+    beacon_invalid flag must be set so _train_and_publish drops
+    the window.
+    """
+    from reliquary.validator import service as svc_mod
+
+    fake_beacon = {"round": 7, "randomness": "aa" * 32, "signature": "bb" * 48}
+
+    async def _stub_derive(self, subtensor, target_window):
+        return "computed_randomness", fake_beacon
+
+    monkeypatch.setattr(svc_mod.ValidationService, "_derive_randomness", _stub_derive)
+    monkeypatch.setattr(
+        "reliquary.infrastructure.drand.verify_beacon_signature",
+        lambda *a, **kw: False,  # forged beacon
+    )
+    monkeypatch.setattr(
+        "reliquary.infrastructure.drand.get_current_chain",
+        lambda: {"hash": "test_hash", "genesis_time": 0, "period": 3},
+    )
+
+    svc = _make_test_service(use_drand=True)
+    svc._active_batcher = _make_test_batcher()
+    svc._window_n = 7
+
+    await svc._set_window_randomness(subtensor=None)
+    # Wait for the background task to complete.
+    await svc._verify_task
+
+    assert svc._active_batcher.beacon_invalid is True
+
+
+@pytest.mark.asyncio
+async def test_train_and_publish_skips_when_beacon_invalid(monkeypatch):
+    """End-to-end gate: a window with beacon_invalid=True must NOT
+    seal, train, publish, or archive. Miners' submissions for that
+    window are dropped on the floor — same end-state as a sync-rejected
+    beacon, just delivered late by the background verify.
+    """
+    svc = _make_test_service(use_drand=True)
+    svc._active_batcher = _make_test_batcher()
+    svc._active_batcher.beacon_invalid = True
+    svc._window_n = 7
+
+    # If any of these get called, the gate failed.
+    seal_called = MagicMock()
+    svc._active_batcher.seal_batch = seal_called
+
+    archive_called = MagicMock()
+
+    async def _no_archive(*a, **kw):
+        archive_called()
+
+    monkeypatch.setattr(svc, "_archive_window", _no_archive)
+
+    await svc._train_and_publish()
+
+    assert seal_called.call_count == 0, "seal_batch should not run for an invalidated window"
+    assert archive_called.call_count == 0, "_archive_window should not run for an invalidated window"
