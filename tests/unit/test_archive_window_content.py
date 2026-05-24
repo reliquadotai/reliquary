@@ -35,13 +35,14 @@ def _rollout(r=1.0, eos=False):
         tokens=tokens,
         reward=r,
         commit={
-            "tokens": tokens, "proof_version": "v5",
+            "tokens": tokens, "proof_version": "v6",
             "rollout": {
                 "prompt_length": 2,
                 "completion_length": len(tokens) - 2,
                 "token_logprobs": [],
             },
         },
+        env_name="openmathinstruct",
     )
 
 
@@ -234,15 +235,17 @@ async def test_archive_includes_per_rollout_hash():
     valid_sub.rollouts = [
         RolloutSubmission(
             tokens=r0_tokens, reward=1.0,
-            commit={"tokens": r0_tokens, "proof_version": "v5",
+            commit={"tokens": r0_tokens, "proof_version": "v6",
                     "rollout": {"prompt_length": 2, "completion_length": 2,
                                 "token_logprobs": []}},
+            env_name="openmathinstruct",
         ),
         RolloutSubmission(
             tokens=r1_tokens, reward=0.0,
-            commit={"tokens": r1_tokens, "proof_version": "v5",
+            commit={"tokens": r1_tokens, "proof_version": "v6",
                     "rollout": {"prompt_length": 2, "completion_length": 2,
                                 "token_logprobs": []}},
+            env_name="openmathinstruct",
         ),
     ]
     valid_sub.completion_texts = ["a", "b"]

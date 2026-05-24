@@ -16,7 +16,8 @@ def _rollouts(k=4):
     return [
         RolloutSubmission(
             tokens=[1, 2, 3], reward=1.0 if i < k else 0.0,
-            commit={"tokens": [1, 2, 3], "proof_version": "v5"},
+            commit={"tokens": [1, 2, 3], "proof_version": "v6"},
+            env_name="openmathinstruct",
         )
         for i in range(M_ROLLOUTS)
     ]

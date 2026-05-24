@@ -118,7 +118,7 @@ class TestCommitmentCountMustMatchTokens:
         return {
             "tokens": tokens,
             "commitments": commitments,
-            "proof_version": "v5",
+            "proof_version": "v6",
             "model": {"name": "test-model", "layer_index": 6},
             "signature": "ab" * 32,
             "beacon": {"randomness": "cd" * 16},

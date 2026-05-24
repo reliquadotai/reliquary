@@ -95,6 +95,7 @@ class RolloutSubmission(BaseModel):
     tokens: list[int] = Field(..., min_length=1)
     reward: float  # miner's local env.compute_reward value; validator re-checks
     commit: dict[str, Any]
+    env_name: str  # environment that generated this rollout (e.g. "openmathinstruct")
 
     @model_validator(mode="after")
     def _tokens_match_commit_tokens(self):
@@ -277,7 +278,7 @@ class CommitModel(BaseModel):
 
     tokens: list[int] = Field(..., min_length=CHALLENGE_K)
     commitments: list[dict]
-    proof_version: Literal["v5"]
+    proof_version: Literal["v6"]
     model: ModelInfo
     signature: str = Field(..., pattern=r"^[0-9a-fA-F]+$")
     beacon: BeaconInfo

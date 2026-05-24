@@ -77,6 +77,7 @@ def _unsigned_bad_request(victim_hotkey: str) -> BatchSubmissionRequest:
             tokens=commit["tokens"],
             reward=float(i < 4),
             commit=commit,
+            env_name="openmathinstruct",
         ))
     return BatchSubmissionRequest(
         miner_hotkey=victim_hotkey,

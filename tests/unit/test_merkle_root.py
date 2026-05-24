@@ -16,9 +16,9 @@ def test_merkle_root_stable_across_dict_order():
     """Two rollout batches identical except for commit dict insertion order
     must produce the same Merkle root."""
     r1 = [_R(tokens=[1, 2], reward=1.0,
-            commit={"proof_version": "v5", "tokens": [1, 2]})]
+            commit={"proof_version": "v6", "tokens": [1, 2]})]
     r2 = [_R(tokens=[1, 2], reward=1.0,
-            commit={"tokens": [1, 2], "proof_version": "v5"})]  # different order
+            commit={"tokens": [1, 2], "proof_version": "v6"})]  # different order
     assert _compute_merkle_root(r1) == _compute_merkle_root(r2)
 
 

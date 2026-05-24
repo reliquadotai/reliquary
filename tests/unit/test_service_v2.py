@@ -130,12 +130,12 @@ def test_open_window_does_not_expose_batcher_before_activation():
     svc._open_window()
     # Batcher exists internally but the server hasn't been told.
     assert svc._active_batcher is not None
-    svc.server.set_active_batcher.assert_not_called()
+    svc.server.set_active_batchers.assert_not_called()
     assert svc._current_window_state != WindowState.OPEN
 
     svc._activate_window()
     # Now the server is registered and the state has flipped to OPEN.
-    svc.server.set_active_batcher.assert_called_once_with(svc._active_batcher)
+    svc.server.set_active_batchers.assert_called_once_with(svc._active_batchers)
     assert svc._current_window_state == WindowState.OPEN
 
 

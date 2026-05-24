@@ -76,7 +76,12 @@ def _submission(*, drand_round: int, hotkey: str = "hkA") -> dict:
         "window_start": 500,
         "merkle_root": f"{drand_round:064x}",
         "rollouts": [
-            {"tokens": [1], "reward": 1.0, "commit": {"tokens": [1]}}
+            {
+                "tokens": [1],
+                "reward": 1.0,
+                "commit": {"tokens": [1]},
+                "env_name": "openmathinstruct",
+            }
             for _ in range(M_ROLLOUTS)
         ],
         "checkpoint_hash": "",

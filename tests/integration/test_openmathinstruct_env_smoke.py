@@ -7,20 +7,19 @@ HuggingFace). Skipped if the dataset cannot be reached.
 import pytest
 
 
-def test_default_environment_is_openmathinstruct():
-    from reliquary.constants import ENVIRONMENT_NAME
-    assert ENVIRONMENT_NAME == "openmathinstruct"
+def test_default_environments_includes_openmathinstruct():
+    from reliquary.constants import ENVIRONMENT_MIX
+    assert any(name == "openmathinstruct" for name, _ in ENVIRONMENT_MIX)
 
 
 def test_default_environment_loads_and_scores():
     """Load the smallest possible shard set and run reward on a real row."""
     import os
     os.environ.setdefault("RELIQUARY_OMI_SHARDS", "1")
-    from reliquary.constants import ENVIRONMENT_NAME
     from reliquary.environment import load_environment, Environment
 
     try:
-        env = load_environment(ENVIRONMENT_NAME)
+        env = load_environment("openmathinstruct")
     except Exception as exc:
         pytest.skip(f"Could not load default environment: {exc}")
 

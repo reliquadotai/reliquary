@@ -1,0 +1,49 @@
+{
+  "ociVersion": "1.0.2",
+  "process": {
+    "terminal": false,
+    "user": {"uid": 0, "gid": 0},
+    "args": ["/usr/local/bin/python3", "/opt/worker.py"],
+    "env": [
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "PYTHONHASHSEED=0",
+      "PYTHONDONTWRITEBYTECODE=1",
+      "PYTHONUNBUFFERED=1"
+    ],
+    "cwd": "/",
+    "capabilities": {
+      "bounding": [], "effective": [], "inheritable": [], "permitted": [], "ambient": []
+    },
+    "rlimits": [
+      {"type": "RLIMIT_CPU", "hard": 5, "soft": 5},
+      {"type": "RLIMIT_NPROC", "hard": 16, "soft": 16},
+      {"type": "RLIMIT_FSIZE", "hard": 0, "soft": 0},
+      {"type": "RLIMIT_AS", "hard": 268435456, "soft": 268435456}
+    ],
+    "noNewPrivileges": true
+  },
+  "root": {
+    "path": "rootfs",
+    "readonly": true
+  },
+  "hostname": "grader-worker",
+  "mounts": [
+    {
+      "destination": "/tmp",
+      "type": "tmpfs",
+      "source": "tmpfs",
+      "options": ["nosuid", "noexec", "nodev", "size=10m"]
+    },
+    {
+      "destination": "/proc",
+      "type": "proc",
+      "source": "proc"
+    }
+  ],
+  "linux": {
+    "namespaces": [
+      {"type": "pid"}, {"type": "ipc"}, {"type": "uts"},
+      {"type": "mount"}, {"type": "network"}
+    ]
+  }
+}

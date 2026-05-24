@@ -53,6 +53,7 @@ def _request_with_randomness(
                 tokens=commit["tokens"],
                 reward=r,
                 commit=commit,
+                env_name="openmathinstruct",
             )
         )
     return BatchSubmissionRequest(
@@ -178,6 +179,7 @@ def test_per_rollout_randomness_is_checked() -> None:
                 tokens=commit["tokens"],
                 reward=r,
                 commit=commit,
+                env_name="openmathinstruct",
             )
         )
     req = BatchSubmissionRequest(

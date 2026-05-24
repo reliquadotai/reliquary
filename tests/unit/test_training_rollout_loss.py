@@ -172,7 +172,7 @@ def test_train_step_updates_optimizer(tiny_model_and_tokenizer):
     sample_param = next(model.parameters())
     before = sample_param.detach().clone()
 
-    result = train_step(model, [group], ref_model=_make_ref(model))
+    result = train_step(model, [[group]], ref_model=_make_ref(model))
     assert result is model
 
     # Parameter should have changed (tiny-gpt2 is tiny, but non-zero grad)
@@ -184,7 +184,7 @@ def test_train_step_updates_optimizer(tiny_model_and_tokenizer):
 def test_train_step_empty_batch_noop(tiny_model_and_tokenizer):
     reset_training_state()
     model, _ = tiny_model_and_tokenizer
-    result = train_step(model, [], ref_model=_make_ref(model))
+    result = train_step(model, [[]], ref_model=_make_ref(model))
     assert result is model
 
 
@@ -197,7 +197,7 @@ def test_train_step_degenerate_groups_skipped(tiny_model_and_tokenizer):
     group = _FakeGroup(rollouts=rollouts)
 
     before = next(model.parameters()).detach().clone()
-    train_step(model, [group], ref_model=_make_ref(model))
+    train_step(model, [[group]], ref_model=_make_ref(model))
     after = next(model.parameters()).detach().clone()
     # No update should happen
     assert torch.equal(before, after)
@@ -222,6 +222,6 @@ def test_train_step_uses_caller_provided_ref(tiny_model_and_tokenizer):
     rollouts = [_build_rollout([1, 2, 3, 4, 5, 6], r, 2) for r in [1, 1, 0, 0]]
     group = _FakeGroup(rollouts=rollouts, prompt_idx=0)
     before = next(model.parameters()).detach().clone()
-    train_step(model, [group], ref_model=ref)
+    train_step(model, [[group]], ref_model=ref)
     after = next(model.parameters()).detach().clone()
     assert (before - after).abs().max().item() > 0.0

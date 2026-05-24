@@ -263,12 +263,17 @@ def _rollout_loss(
 
 def train_step(
     model,
-    batch: list,
+    batches: list,
     *,
     ref_model,
     window_index: int | None = None,
 ) -> Any:
-    """Run one GRPO step on *batch* (list of ValidSubmission).
+    """Run one GRPO step over the union of *batches*.
+
+    All rollouts across every batch contribute backward calls before a
+    single optimizer.step(). *batches* is a list of batches, where each
+    batch is a list of group objects (ValidSubmission). Pass ``[batch]``
+    for the legacy mono-batch case.
 
     *ref_model* is the frozen reference policy for the KL penalty. The
     caller is responsible for keeping it up to date (in production:
@@ -278,7 +283,7 @@ def train_step(
     *window_index* is used as the wandb step when telemetry is enabled.
     Safe to omit in tests.
     """
-    if not batch:
+    if not batches or all(not b for b in batches):
         logger.info("train_step: empty batch, skipping")
         return model
 
@@ -292,34 +297,35 @@ def train_step(
 
     _optimizer.zero_grad()
 
-    n_total_rollouts = sum(len(g.rollouts) for g in batch)
+    n_total_rollouts = sum(len(g.rollouts) for batch in batches for g in batch)
     total_ppo = 0.0
     total_kl = 0.0
     n_processed = 0
     n_skipped = 0
 
-    for group in batch:
-        rewards = [r.reward for r in group.rollouts]
-        advantages = _compute_advantages(rewards)
-        if all(a == 0.0 for a in advantages):
-            n_skipped += 1
-            logger.debug("skipping degenerate group on prompt_idx=%d", group.prompt_idx)
-            continue
-
-        for rollout, adv in zip(group.rollouts, advantages):
-            try:
-                ppo_loss, kl = _rollout_loss(
-                    model=model, ref_model=ref_model,
-                    rollout=rollout, advantage=adv, device=device,
-                )
-            except ValueError as e:
-                logger.warning("rollout skipped: %s", e)
+    for batch in batches:
+        for group in batch:
+            rewards = [r.reward for r in group.rollouts]
+            advantages = _compute_advantages(rewards)
+            if all(a == 0.0 for a in advantages):
+                n_skipped += 1
+                logger.debug("skipping degenerate group on prompt_idx=%d", group.prompt_idx)
                 continue
-            loss = (ppo_loss + KL_BETA * kl) / n_total_rollouts
-            loss.backward()
-            total_ppo += ppo_loss.item()
-            total_kl += kl.item()
-            n_processed += 1
+
+            for rollout, adv in zip(group.rollouts, advantages):
+                try:
+                    ppo_loss, kl = _rollout_loss(
+                        model=model, ref_model=ref_model,
+                        rollout=rollout, advantage=adv, device=device,
+                    )
+                except ValueError as e:
+                    logger.warning("rollout skipped: %s", e)
+                    continue
+                loss = (ppo_loss + KL_BETA * kl) / n_total_rollouts
+                loss.backward()
+                total_ppo += ppo_loss.item()
+                total_kl += kl.item()
+                n_processed += 1
 
     if n_processed == 0:
         logger.info("train_step: no valid rollouts processed")
@@ -337,12 +343,12 @@ def train_step(
     )
 
     # Emit structured metrics to wandb (no-op if telemetry disabled).
-    all_rewards = [r.reward for g in batch for r in g.rollouts]
+    all_rewards = [r.reward for batch in batches for g in batch for r in g.rollouts]
     n_rewards = len(all_rewards)
     reward_mean = sum(all_rewards) / n_rewards
     reward_var = sum((r - reward_mean) ** 2 for r in all_rewards) / n_rewards
     reward_std = reward_var ** 0.5
-    n_groups = len(batch)
+    n_groups = sum(len(batch) for batch in batches)
     metrics = {
         "train/lr": lr,
         "train/ppo_loss": total_ppo / n_processed,

@@ -1,17 +1,107 @@
 """Reliquary CLI — mine and validate commands."""
 
 import asyncio
+import atexit
 import logging
 import os
+import shutil
+import socket as _socket
+import subprocess
 import threading
+import time as _time
 
 import typer
 
-from reliquary.constants import DEFAULT_BASE_MODEL, DEFAULT_HF_REPO_ID, ENVIRONMENT_NAME, VALIDATOR_HTTP_PORT
+from reliquary.constants import DEFAULT_BASE_MODEL, DEFAULT_HF_REPO_ID, ENVIRONMENT_MIX, VALIDATOR_HTTP_PORT
+
+_DEFAULT_ENVS = ",".join(name for name, _ in ENVIRONMENT_MIX)
 
 app = typer.Typer(name="reliquary", help="Reliquary — Verifiable Inference Subnet")
 
 logger = logging.getLogger(__name__)
+
+_grader_proc: "subprocess.Popen | None" = None
+
+
+def _grader_is_running(socket_path: str, timeout: float = 0.5) -> bool:
+    """Return True iff the grader is reachable on the Unix socket."""
+    try:
+        with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect(socket_path)
+        return True
+    except (FileNotFoundError, ConnectionRefusedError, _socket.timeout, OSError):
+        return False
+
+
+def _ensure_grader_running(use_runsc: "bool | None" = None) -> None:
+    """Start the grader server in the background if no one is listening.
+
+    The grader is required for reward computation on code-execution envs
+    (OpenCodeInstruct). Without it, OCI rewards silently return 0.0 and
+    the validator rejects every OCI submission as a reward-claim mismatch.
+
+    If `use_runsc` is None, auto-detect: use runsc when both the binary
+    and the OCI bundle are present; otherwise fall back to plain Python
+    workers (sufficient for dev / single-host testing; production miners
+    should install runsc for deterministic-with-validator reward parity).
+    """
+    global _grader_proc
+    from reliquary.constants import GRADER_SOCKET_PATH
+
+    _logger = logging.getLogger("reliquary.cli")
+
+    if _grader_is_running(GRADER_SOCKET_PATH):
+        _logger.info("Grader already running at %s; reusing it", GRADER_SOCKET_PATH)
+        return
+
+    if use_runsc is None:
+        bundle_python = (
+            "/opt/reliquary/reliquary/environment/grader/bundle/"
+            "rootfs/usr/local/bin/python3"
+        )
+        use_runsc = bool(shutil.which("runsc")) and os.path.exists(bundle_python)
+    if not use_runsc:
+        _logger.warning(
+            "Grader will run WITHOUT runsc — rewards may diverge from the "
+            "validator on edge cases. Install runsc + build the bundle "
+            "(scripts/build_grader_bundle.sh) for production miners."
+        )
+
+    cmd = ["python", "-m", "reliquary.environment.grader.server"]
+    if use_runsc:
+        cmd.append("--use-runsc")
+
+    _logger.info("Launching grader server (use_runsc=%s) ...", use_runsc)
+    _grader_proc = subprocess.Popen(
+        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+    def _cleanup() -> None:
+        if _grader_proc is not None and _grader_proc.poll() is None:
+            try:
+                _grader_proc.terminate()
+                _grader_proc.wait(timeout=5)
+            except Exception:
+                try:
+                    _grader_proc.kill()
+                except Exception:
+                    pass
+    atexit.register(_cleanup)
+
+    deadline = _time.time() + 15.0
+    while _time.time() < deadline:
+        if _grader_is_running(GRADER_SOCKET_PATH):
+            _logger.info("Grader server ready at %s", GRADER_SOCKET_PATH)
+            return
+        _time.sleep(0.2)
+
+    _logger.error(
+        "Grader server failed to bind %s within 15s. OCI rewards will "
+        "be 0 and all OCI submissions will be rejected. Diagnose by "
+        "running `python -m reliquary.environment.grader.server%s` manually.",
+        GRADER_SOCKET_PATH, " --use-runsc" if use_runsc else "",
+    )
 
 
 def setup_logging(level: str = "INFO"):
@@ -33,9 +123,9 @@ def mine(
     wallet_name: str = typer.Option("default", help="Wallet name"),
     hotkey: str = typer.Option("default", help="Hotkey name"),
     checkpoint: str = typer.Option(..., help="Model checkpoint path"),
-    environment: str = typer.Option(
-        os.getenv("RELIQUARY_ENVIRONMENT_NAME", ENVIRONMENT_NAME),
-        help="Environment name (env: RELIQUARY_ENVIRONMENT_NAME)",
+    environments: str = typer.Option(
+        os.getenv("RELIQUARY_ENVIRONMENTS", _DEFAULT_ENVS),
+        help="Comma-separated environment names (env: RELIQUARY_ENVIRONMENTS)",
     ),
     validator_url: str = typer.Option(
         "",
@@ -53,10 +143,16 @@ def mine(
     os.environ["BT_NETWORK"] = network
     os.environ["NETUID"] = str(netuid)
 
+    env_names = [n.strip() for n in environments.split(",") if n.strip()]
     logger.info(
-        "Starting Reliquary miner (network=%s, netuid=%d, env=%s)",
-        network, netuid, environment,
+        "Starting Reliquary miner (network=%s, netuid=%d, envs=%s)",
+        network, netuid, env_names,
     )
+
+    # Auto-launch the grader server so reward computation works for
+    # OpenCodeInstruct prompts out of the box. Idempotent: skipped if
+    # one's already listening.
+    _ensure_grader_running()
 
     async def _run():
         import bittensor as bt
@@ -64,7 +160,7 @@ def mine(
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         from reliquary.constants import ATTN_IMPLEMENTATION
-        from reliquary.environment import load_environment
+        from reliquary.environment import load_environments
         from reliquary.infrastructure.chain import get_subtensor, get_metagraph, NETUID
         from reliquary.miner.engine import MiningEngine
         from reliquary.miner.submitter import discover_validator_url, get_window_state_v2
@@ -131,13 +227,15 @@ def mine(
             attn_implementation=ATTN_IMPLEMENTATION,
         ).to(proof_device).eval()
 
-        env = load_environment(environment)
+        envs = load_environments(env_names)
+        mix = [(n, w) for n, w in ENVIRONMENT_MIX if n in envs]
         engine = MiningEngine(
             vllm_model,
             hf_model,
             tokenizer,
             wallet,
-            env,
+            envs=envs,
+            mix=mix,
             proof_gpu=0 if proof_device == "cuda:0" else 1,
             validator_url_override=validator_url or None,
         )
@@ -176,9 +274,9 @@ def validate(
     wallet_name: str = typer.Option("default", help="Wallet name"),
     hotkey: str = typer.Option("default", help="Hotkey name"),
     checkpoint: str = typer.Option(DEFAULT_BASE_MODEL, help="HF repo id or local path of the model to load (trainer mode only)"),
-    environment: str = typer.Option(
-        os.getenv("RELIQUARY_ENVIRONMENT_NAME", ENVIRONMENT_NAME),
-        help="Environment name (trainer mode only; env: RELIQUARY_ENVIRONMENT_NAME)",
+    environments: str = typer.Option(
+        os.getenv("RELIQUARY_ENVIRONMENTS", _DEFAULT_ENVS),
+        help="Comma-separated environment names (trainer mode only; env: RELIQUARY_ENVIRONMENTS)",
     ),
     http_host: str = typer.Option("0.0.0.0", help="HTTP bind address (trainer mode only)"),
     http_port: int = typer.Option(VALIDATOR_HTTP_PORT, help="HTTP listen port (trainer mode only)"),
@@ -217,9 +315,13 @@ def validate(
     os.environ["NETUID"] = str(netuid)
 
     if train:
+        _ensure_grader_running()
+
+    env_names = [n.strip() for n in environments.split(",") if n.strip()]
+    if train:
         logger.info(
-            "Starting Reliquary validator [trainer] (network=%s, netuid=%d, env=%s, http=%s:%d)",
-            network, netuid, environment, http_host, http_port,
+            "Starting Reliquary validator [trainer] (network=%s, netuid=%d, envs=%s, http=%s:%d)",
+            network, netuid, env_names, http_host, http_port,
         )
     else:
         logger.info(
@@ -240,7 +342,6 @@ def validate(
             from transformers import AutoModelForCausalLM, AutoTokenizer
 
             from reliquary.constants import ATTN_IMPLEMENTATION
-            from reliquary.environment import load_environment
             from reliquary.validator.service import ValidationService
 
             logger.info("Loading model from %s...", checkpoint)
@@ -254,13 +355,12 @@ def validate(
                 attn_implementation=ATTN_IMPLEMENTATION,
             ).to("cuda:0").eval()
 
-            env = load_environment(environment)
+            mix = [(n, w) for n, w in ENVIRONMENT_MIX if n in env_names]
             service = ValidationService(
                 wallet,
                 model,
                 tokenizer,
-                env,
-                netuid,
+                netuid=netuid,
                 use_drand=use_drand,
                 http_host=http_host,
                 http_port=http_port,
@@ -268,6 +368,7 @@ def validate(
                 external_port=(external_port or http_port) if external_ip else None,
                 hf_repo_id=hf_repo_id,
                 resume_from=resume_from or None,
+                env_mix=mix if mix else None,
             )
             # Run the weight setter in a dedicated OS thread with its own
             # event loop. asyncio is single-threaded, so any sync blocking
