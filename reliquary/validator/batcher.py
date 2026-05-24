@@ -32,9 +32,18 @@ from reliquary.protocol.submission import (
     WindowState,
 )
 from reliquary.protocol.tokens import verify_tokens
-from reliquary.validator.batch_selection import select_batch_and_distribute
+from reliquary.validator.batch_selection import (
+    explain_batch_selection,
+    select_batch_and_distribute,
+)
 from reliquary.validator.cooldown import CooldownMap
 from reliquary.validator.dedup import RolloutHashSet, compute_rollout_hash
+from reliquary.validator.observability import (
+    DrandRoundObservation,
+    SubmitTelemetry,
+    classify_drand_round,
+    log_submission_stage,
+)
 from reliquary.validator.verifier import (
     evaluate_token_distribution,
     is_in_zone,
@@ -79,6 +88,13 @@ class ValidSubmission:
     # v2.3: drand round attached by the miner at submit time. Determines
     # the submission's chronological position at seal time.
     drand_round: int = 0
+    arrival_ts: float | None = None
+    decision_ts: float | None = None
+    submitted_drand_round: int = 0
+    arrival_drand_round: int | None = None
+    drand_delta: int | None = None
+    seal_trigger_round: int | None = None
+    prompt_hash_lead: str | None = None
 
     def __post_init__(self):
         self.merkle_root = self.merkle_root_bytes
@@ -104,6 +120,14 @@ class RejectedSubmission:
     sketch_diff_max: int | None = None
     lp_dev_max: float | None = None
     dist_q10_min: float | None = None
+    arrival_ts: float | None = None
+    decision_ts: float | None = None
+    submitted_drand_round: int | None = None
+    arrival_drand_round: int | None = None
+    drand_delta: int | None = None
+    seal_trigger_round: int | None = None
+    prompt_hash_lead: str | None = None
+    reject_stage: str | None = None
 
 
 class GrpoWindowBatcher:
@@ -175,6 +199,8 @@ class GrpoWindowBatcher:
         # ``arrived_at - window_opened_at`` is the seconds the miner took
         # from window-open to accepted submission.
         self.window_opened_at: float = self._time_fn()
+        self.window_opened_wall_ts: float = self._wall_clock()
+        self.window_open_drand_round: int | None = None
 
         self._cooldown = (
             cooldown_map if cooldown_map is not None
@@ -225,6 +251,7 @@ class GrpoWindowBatcher:
         # Persisted in the R2 archive so miners can see which filter is
         # rejecting the most submissions in any given round.
         self.reject_counts: dict[str, int] = {}
+        self.selection_metadata_by_id: dict[int, dict[str, Any]] = {}
 
         # Per-hotkey-capped metadata for rejected submissions. Persisted in
         # the R2 archive next to ``reject_counts`` so a rejected miner can
@@ -319,7 +346,10 @@ class GrpoWindowBatcher:
     # ----------------------------- ingestion -----------------------------
 
     def accept_submission(
-        self, request: BatchSubmissionRequest
+        self,
+        request: BatchSubmissionRequest,
+        *,
+        telemetry: SubmitTelemetry | None = None,
     ) -> BatchSubmissionResponse:
         """Run the full verification pipeline; append to ``_valid`` on success.
 
@@ -333,7 +363,41 @@ class GrpoWindowBatcher:
         an arrival-time check, decided once.
         """
         with self._lock:
-            return self._accept_locked(request)
+            return self._accept_locked(request, telemetry=telemetry)
+
+    def observe_drand_round(
+        self,
+        drand_round: int,
+        *,
+        t_arrival: float | None = None,
+    ) -> DrandRoundObservation:
+        """Compute drand arrival fields and the timing-gate verdict."""
+        if self._drand_chain_info is None:
+            from reliquary.infrastructure.drand import get_current_chain
+            self._drand_chain_info = get_current_chain()
+        ci = self._drand_chain_info
+        from reliquary.infrastructure.chain import compute_current_drand_round
+        t = t_arrival if t_arrival is not None else self._wall_clock()
+        current = compute_current_drand_round(
+            t, ci["genesis_time"], ci["period"],
+        )
+        delta = int(drand_round) - int(current)
+        status = classify_drand_round(
+            int(drand_round), int(current), self.drand_round_backward_tolerance,
+        )
+        reject_reason: RejectReason | None = None
+        if drand_round > current:
+            reject_reason = RejectReason.FUTURE_ROUND
+        elif drand_round < current - self.drand_round_backward_tolerance:
+            reject_reason = RejectReason.STALE_ROUND
+        return DrandRoundObservation(
+            submitted_drand_round=int(drand_round),
+            arrival_drand_round=int(current),
+            drand_delta=delta,
+            drand_tolerance=int(self.drand_round_backward_tolerance),
+            drand_status=status,
+            reject_reason=reject_reason,
+        )
 
     def validate_drand_round(
         self,
@@ -387,26 +451,33 @@ class GrpoWindowBatcher:
         Public so the HTTP /submit handler can run it pre-queue and
         short-circuit the rejection without waiting on the worker.
         """
-        if self._drand_chain_info is None:
-            from reliquary.infrastructure.drand import get_current_chain
-            self._drand_chain_info = get_current_chain()
-        ci = self._drand_chain_info
-        from reliquary.infrastructure.chain import compute_current_drand_round
-        t = t_arrival if t_arrival is not None else self._wall_clock()
-        current = compute_current_drand_round(
-            t, ci["genesis_time"], ci["period"],
-        )
-        if drand_round > current:
-            return RejectReason.FUTURE_ROUND
-        if drand_round < current - self.drand_round_backward_tolerance:
-            return RejectReason.STALE_ROUND
-        return None
+        return self.observe_drand_round(
+            drand_round, t_arrival=t_arrival,
+        ).reject_reason
 
     def _accept_locked(
-        self, request: BatchSubmissionRequest
+        self,
+        request: BatchSubmissionRequest,
+        *,
+        telemetry: SubmitTelemetry | None = None,
     ) -> BatchSubmissionResponse:
         hk = request.miner_hotkey
         pi = request.prompt_idx
+
+        def reject(
+            reason: RejectReason,
+            stage: str,
+            **kwargs: Any,
+        ) -> BatchSubmissionResponse:
+            return self._reject(
+                reason,
+                hotkey=hk,
+                prompt_idx=pi,
+                telemetry=telemetry,
+                reject_stage=stage,
+                **kwargs,
+            )
+
         # v2.3 seal extension: once the trigger drand round is recorded
         # (B-th distinct prompt landed in round R), submissions from a
         # LATER drand round arrive too late — drop with BATCH_FILLED.
@@ -420,13 +491,13 @@ class GrpoWindowBatcher:
             self._seal_trigger_round is not None
             and request.drand_round > self._seal_trigger_round
         ):
-            return self._reject(RejectReason.BATCH_FILLED, hotkey=hk, prompt_idx=pi)
+            return reject(RejectReason.BATCH_FILLED, "seal_extension")
         if request.window_start != self.window_start:
-            return self._reject(RejectReason.WINDOW_MISMATCH, hotkey=hk, prompt_idx=pi)
+            return reject(RejectReason.WINDOW_MISMATCH, "window")
         # v2.1: checkpoint hash gate. Empty string = gate disabled
         # (pre-first-publish or test convenience).
         if self.current_checkpoint_hash and request.checkpoint_hash != self.current_checkpoint_hash:
-            return self._reject(RejectReason.WRONG_CHECKPOINT, hotkey=hk, prompt_idx=pi)
+            return reject(RejectReason.WRONG_CHECKPOINT, "checkpoint")
         # NOTE: drand_round is intentionally NOT re-checked here. It's a
         # wall-clock timing gate decided once at HTTP arrival (see
         # ``server.py``'s cheap-reject path → ``validate_drand_round`` with
@@ -438,9 +509,9 @@ class GrpoWindowBatcher:
         # validator's clock at receipt, so it belongs exclusively on the
         # arrival path.
         if request.prompt_idx >= len(self.env):
-            return self._reject(RejectReason.BAD_PROMPT_IDX, hotkey=hk, prompt_idx=pi)
+            return reject(RejectReason.BAD_PROMPT_IDX, "prompt")
         if self._cooldown.is_in_cooldown(request.prompt_idx, self.window_start):
-            return self._reject(RejectReason.PROMPT_IN_COOLDOWN, hotkey=hk, prompt_idx=pi)
+            return reject(RejectReason.PROMPT_IN_COOLDOWN, "cooldown")
         # v2.3: cap submissions per prompt before the heavy verify. Once a
         # prompt has ``MAX_SUBMISSIONS_PER_PROMPT`` GRAIL-validated entries,
         # further attempts are rejected PROMPT_FULL without running GRAIL.
@@ -448,7 +519,7 @@ class GrpoWindowBatcher:
         # miners attack the same prompt.
         existing = self._submissions_per_prompt.get(request.prompt_idx, [])
         if len(existing) >= MAX_SUBMISSIONS_PER_PROMPT:
-            return self._reject(RejectReason.PROMPT_FULL, hotkey=hk, prompt_idx=pi)
+            return reject(RejectReason.PROMPT_FULL, "prompt_capacity")
 
         # Per-rollout hash dedup against the persistent set + within this
         # submission. Computed once here, reused at seal_batch and archive.
@@ -464,9 +535,7 @@ class GrpoWindowBatcher:
                         "reject reason=hash_duplicate hotkey=%s prompt=%d",
                         hk, pi,
                     )
-                    return self._reject(
-                        RejectReason.HASH_DUPLICATE, hotkey=hk, prompt_idx=pi,
-                    )
+                    return reject(RejectReason.HASH_DUPLICATE, "dedup")
                 local_seen.add(h)
                 rollout_hashes.append(h)
 
@@ -476,11 +545,11 @@ class GrpoWindowBatcher:
             text = self._completion_text(rollout)
             completion_texts.append(text)
             if not verify_reward_claim(self.env, problem, text, rollout.reward):
-                return self._reject(RejectReason.REWARD_MISMATCH, hotkey=hk, prompt_idx=pi)
+                return reject(RejectReason.REWARD_MISMATCH, "reward")
 
         sigma = rewards_std([r.reward for r in request.rollouts])
         if not is_in_zone(sigma, bootstrap=self.bootstrap):
-            return self._reject(RejectReason.OUT_OF_ZONE, hotkey=hk, prompt_idx=pi)
+            return reject(RejectReason.OUT_OF_ZONE, "zone")
 
         # Per-submission worst-case filter telemetry (across all rollouts).
         sketch_diff_max = 0
@@ -515,11 +584,11 @@ class GrpoWindowBatcher:
             try:
                 CommitModel.model_validate(rollout.commit)
             except ValidationError:
-                return self._reject(RejectReason.BAD_SCHEMA, hotkey=hk, prompt_idx=pi)
+                return reject(RejectReason.BAD_SCHEMA, "schema")
 
             # Token check: vocab bounds + max length (cheap, protects forward pass)
             if not verify_tokens(rollout.commit["tokens"], self.model.config):
-                return self._reject(RejectReason.BAD_TOKENS, hotkey=hk, prompt_idx=pi)
+                return reject(RejectReason.BAD_TOKENS, "tokens")
 
             if canonical_prompt_tokens is not None:
                 rollout_meta = rollout.commit.get("rollout", {}) or {}
@@ -528,9 +597,9 @@ class GrpoWindowBatcher:
                     :miner_prompt_len
                 ]
                 if miner_prompt_tokens != canonical_prompt_tokens:
-                    return self._reject(RejectReason.PROMPT_MISMATCH, hotkey=hk, prompt_idx=pi)
+                    return reject(RejectReason.PROMPT_MISMATCH, "prompt_binding")
             if not self._verify_signature(rollout.commit, request.miner_hotkey):
-                return self._reject(RejectReason.BAD_SIGNATURE, hotkey=hk, prompt_idx=pi)
+                return reject(RejectReason.BAD_SIGNATURE, "rollout_signature")
             # Randomness binding: the miner-claimed beacon randomness MUST equal
             # the validator's per-window derived randomness. Without this check,
             # the sketch-tolerance window (~5000 mod q≈2.15e9) is wide enough
@@ -544,9 +613,7 @@ class GrpoWindowBatcher:
             # know is detached from the validator's window seed.
             claimed_rand = (rollout.commit.get("beacon") or {}).get("randomness", "")
             if claimed_rand != self.randomness:
-                return self._reject(
-                    RejectReason.WRONG_RANDOMNESS, hotkey=hk, prompt_idx=pi,
-                )
+                return reject(RejectReason.WRONG_RANDOMNESS, "randomness")
             proof = self._verify_commitment(
                 rollout.commit, self.model, self.randomness
             )
@@ -559,9 +626,9 @@ class GrpoWindowBatcher:
                     request.miner_hotkey, request.prompt_idx,
                     proof.sketch_diff_max, proof.passed, proof.checked,
                 )
-                return self._reject(
+                return reject(
                     RejectReason.GRAIL_FAIL,
-                    hotkey=hk, prompt_idx=pi,
+                    "grail",
                     sketch_diff_max=proof.sketch_diff_max,
                 )
 
@@ -575,9 +642,9 @@ class GrpoWindowBatcher:
                 ):
                     truncated_count += 1
                     if truncated_count > MAX_TRUNCATED_PER_SUBMISSION:
-                        return self._reject(
+                        return reject(
                             RejectReason.BAD_TERMINATION,
-                            hotkey=hk, prompt_idx=pi,
+                            "termination",
                             sketch_diff_max=sketch_diff_max,
                         )
                     continue
@@ -605,9 +672,9 @@ class GrpoWindowBatcher:
                     "reject reason=logprob_mismatch hotkey=%s median_dev=%.4f",
                     request.miner_hotkey, lp_dev,
                 )
-                return self._reject(
+                return reject(
                     RejectReason.LOGPROB_MISMATCH,
-                    hotkey=hk, prompt_idx=pi,
+                    "logprob",
                     sketch_diff_max=sketch_diff_max,
                     lp_dev_max=lp_dev_max,
                 )
@@ -627,9 +694,9 @@ class GrpoWindowBatcher:
                     "reject reason=distribution_suspicious hotkey=%s %s",
                     request.miner_hotkey, dist_metrics,
                 )
-                return self._reject(
+                return reject(
                     RejectReason.DISTRIBUTION_SUSPICIOUS,
-                    hotkey=hk, prompt_idx=pi,
+                    "distribution",
                     sketch_diff_max=sketch_diff_max,
                     lp_dev_max=lp_dev_max,
                     dist_q10_min=dist_q10_min,
@@ -651,6 +718,15 @@ class GrpoWindowBatcher:
             claimed_checkpoint_hash=request.checkpoint_hash,
             rollout_hashes=rollout_hashes,
             drand_round=request.drand_round,
+            arrival_ts=telemetry.t_arrival if telemetry else None,
+            decision_ts=self._wall_clock(),
+            submitted_drand_round=request.drand_round,
+            arrival_drand_round=(
+                telemetry.arrival_drand_round if telemetry else None
+            ),
+            drand_delta=telemetry.drand_delta if telemetry else None,
+            seal_trigger_round=self._seal_trigger_round,
+            prompt_hash_lead=telemetry.prompt_hash_lead if telemetry else None,
         )
         self._valid.append(new_sub)
         self._submissions_per_prompt.setdefault(
@@ -681,6 +757,19 @@ class GrpoWindowBatcher:
             # Whichever fires first wins; the other path becomes a no-op
             # because ``_seal_flag.is_set()`` short-circuits.
             self._seal_trigger_round = request.drand_round
+            new_sub.seal_trigger_round = self._seal_trigger_round
+            if telemetry is not None:
+                telemetry.seal_trigger_round = self._seal_trigger_round
+                telemetry.valid_submissions_at_decision = len(self._valid)
+                log_submission_stage(
+                    logger,
+                    logging.INFO,
+                    "seal_triggered",
+                    telemetry,
+                    distinct_eligible=distinct_eligible,
+                    batch_size=B_BATCH,
+                    seal_trigger_round=self._seal_trigger_round,
+                )
             if self._loop is not None:
                 # Production path: schedule the delayed fire on the
                 # validator's asyncio loop.
@@ -761,6 +850,8 @@ class GrpoWindowBatcher:
         sketch_diff_max: int | None = None,
         lp_dev_max: float | None = None,
         dist_q10_min: float | None = None,
+        telemetry: SubmitTelemetry | None = None,
+        reject_stage: str | None = None,
     ) -> BatchSubmissionResponse:
         self.reject_counts[reason.value] = self.reject_counts.get(reason.value, 0) + 1
 
@@ -772,8 +863,12 @@ class GrpoWindowBatcher:
                 # Anti-tuning: never surface the GRAIL sketch diff to miners.
                 # All other reasons get the diagnostics computed up to the
                 # rejection point.
+                decision_ts = self._wall_clock()
                 if reason is RejectReason.GRAIL_FAIL:
                     sketch_diff_max = None
+                    telemetry = None
+                    reject_stage = None
+                    decision_ts = None
                 self.rejected_submissions.append(
                     RejectedSubmission(
                         hotkey=hotkey,
@@ -782,6 +877,22 @@ class GrpoWindowBatcher:
                         sketch_diff_max=sketch_diff_max,
                         lp_dev_max=lp_dev_max,
                         dist_q10_min=dist_q10_min,
+                        arrival_ts=telemetry.t_arrival if telemetry else None,
+                        decision_ts=decision_ts,
+                        submitted_drand_round=(
+                            telemetry.submitted_drand_round if telemetry else None
+                        ),
+                        arrival_drand_round=(
+                            telemetry.arrival_drand_round if telemetry else None
+                        ),
+                        drand_delta=telemetry.drand_delta if telemetry else None,
+                        seal_trigger_round=(
+                            telemetry.seal_trigger_round if telemetry else self._seal_trigger_round
+                        ),
+                        prompt_hash_lead=(
+                            telemetry.prompt_hash_lead if telemetry else None
+                        ),
+                        reject_stage=reject_stage,
                     )
                 )
         return BatchSubmissionResponse(accepted=False, reason=reason)
@@ -803,6 +914,13 @@ class GrpoWindowBatcher:
         and were therefore "used" by this window.
         """
         with self._lock:
+            self.selection_metadata_by_id = explain_batch_selection(
+                submissions=self._valid,
+                b=B_BATCH,
+                cooldown_map=self._cooldown,
+                current_window=self.window_start,
+                pool=pool,
+            )
             batch, rewards = select_batch_and_distribute(
                 submissions=self._valid,
                 b=B_BATCH,

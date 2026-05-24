@@ -299,7 +299,9 @@ def test_verdict_payload_shape() -> None:
     body = client.get("/verdicts/hkH").json()
     assert set(body.keys()) == {"verdicts"}
     entry = body["verdicts"][0]
-    assert set(entry.keys()) == {"merkle_root", "window_n", "accepted", "reason", "ts"}
+    assert {"merkle_root", "window_n", "accepted", "reason", "ts"}.issubset(
+        entry.keys()
+    )
     assert isinstance(entry["merkle_root"], str)
     assert len(entry["merkle_root"]) == 64   # protocol pattern enforces
     assert isinstance(entry["accepted"], bool)

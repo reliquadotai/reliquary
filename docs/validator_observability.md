@@ -1,0 +1,53 @@
+# Validator Observability Notes
+
+Validator submit logs use the `validator_submit_lifecycle` event with a
+`stage` field. The important stages are:
+
+- `submit_received`: FastAPI has parsed the request and the middleware
+  arrival timestamp is attached. This is the HTTP arrival clock.
+- `drand_validated`: the miner's `submitted_drand_round` has been compared
+  to the validator's `arrival_drand_round`. `drand_delta =
+  submitted_drand_round - arrival_drand_round`; positive is future, zero is
+  current, negative is stale. `drand_tolerance` is the configured backward
+  grace in rounds.
+- `proof_started` / `proof_finished`: async worker verification timing.
+  `queue_wait_ms` is time from enqueue to proof start, `verify_ms` is proof
+  work time, and `total_ms` is decision time minus HTTP arrival time.
+- `candidate_accepted`: the submission passed validation and entered the
+  valid pool. This is not the same as final batch selection.
+- `candidate_rejected`: the validator made a final reject decision. Read
+  `reject_stage` and `reject_reason` together; for `batch_filled`, also read
+  `batch_filled_reason`, `current_valid_count`, and `trigger_round`.
+- `seal_triggered`: the B-th distinct eligible prompt landed and recorded
+  `seal_trigger_round`. Same-round submissions can still be accepted until
+  the delayed seal/drain completes.
+- `final_batch_selected`: final drand/canonical ordering has run. A submission
+  can be `accepted_into_pool=true` but `selected_for_batch=false`.
+- `reward_assigned`: the submission earned emission in the final distribution.
+
+Interpretation guide:
+
+- Delayed accepted logs are normal: production `/submit` returns
+  `reason=submitted` after queueing, while `candidate_accepted` appears only
+  after the async worker finishes proof verification. Use `t_arrival` for
+  HTTP ordering and `t_decision`/`t_verified` for validator processing time.
+- `submitted_drand_round` is what the miner attached. `arrival_drand_round`
+  is the validator's drand round at HTTP arrival. `drand_delta=0` means
+  current; `<0` means stale; `>0` means future.
+- `seal_trigger_round` is the drand round of the submission that filled the
+  B-th distinct prompt. Later submitted rounds are too late; same trigger
+  round submissions may still be accepted into the pool and then lose or win
+  by canonical ordering.
+- `batch_filled` does not always mean the same thing. Check
+  `batch_filled_reason`: common values include
+  `submitted_round_gt_seal_trigger_round`, `batch_already_sealed`,
+  `batch_already_sealed_or_draining`, and `batch_already_draining`.
+- Accepted into pool, final selected, and rewarded are separate outcomes:
+  `accepted_into_pool` means validation passed, `selected_for_batch` means the
+  representative was used for training, and `rewarded` means it received
+  emission under the final reward distribution.
+
+The `/health` endpoint exposes non-secret operator state such as image
+revision, app start time, checkpoint revision, current window, drand round,
+seal trigger, queue depth, valid count, and recent reject counts. It must not
+include access keys, tokens, wallet material, or private keys.

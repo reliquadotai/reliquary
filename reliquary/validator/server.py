@@ -26,6 +26,8 @@ from pydantic import BaseModel
 import uvicorn
 
 from reliquary.constants import (
+    B_BATCH,
+    DRAND_ROUND_BACKWARD_TOLERANCE,
     ENFORCE_ENVELOPE_SIGNATURE,
     MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW,
     MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
@@ -41,6 +43,13 @@ from reliquary.protocol.submission import (
     VerdictsResponse,
 )
 from reliquary.validator.batcher import GrpoWindowBatcher
+from reliquary.validator.observability import (
+    DrandRoundObservation,
+    SubmitTelemetry,
+    classify_drand_round,
+    log_submission_stage,
+    runtime_revision,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,12 +63,29 @@ VERDICT_CAP_PER_HOTKEY = 200
 class _Health(BaseModel):
     status: str
     active_window: int | None
+    image_revision: str | None = None
+    app_started_at: float
+    current_validator_state: str
+    current_window_n: int | None = None
+    current_quicknet_drand_round: int | None = None
+    current_window_open_ts: float | None = None
+    current_window_open_drand_round: int | None = None
+    seal_trigger_round: int | None = None
+    drand_round_backward_tolerance: int
+    batch_size: int
+    queue_depth: int | None = None
+    valid_submissions_count: int | None = None
+    checkpoint_repo_id: str | None = None
+    checkpoint_revision: str | None = None
+    recent_reject_counts_by_reason: dict[str, int]
 
 
 class ValidatorServer:
     def __init__(self, host: str = "0.0.0.0", port: int = VALIDATOR_HTTP_PORT) -> None:
         self.host = host
         self.port = port
+        self._app_started_at = time.time()
+        self._image_revision = runtime_revision()
         self.active_batcher: GrpoWindowBatcher | None = None
         self.app: FastAPI = self._build_app()
         self._server: uvicorn.Server | None = None
@@ -88,12 +114,14 @@ class ValidatorServer:
         # asyncio is single-threaded so no lock is needed — every mutation
         # site runs on the event loop.
         self._verdicts: dict[str, collections.deque[dict]] = {}
+        self._recent_reject_counts: collections.Counter[str] = collections.Counter()
 
     def set_active_batcher(self, batcher: GrpoWindowBatcher | None) -> None:
         # New batcher → new window → reset per-hotkey counters.
         if batcher is not self.active_batcher:
             self._per_window_counts = {}
             self._bad_envelope_counts = {}
+            self._recent_reject_counts = collections.Counter()
         self.active_batcher = batcher
 
     def set_current_state(self, state) -> None:
@@ -119,6 +147,12 @@ class ValidatorServer:
         reason: RejectReason | str,
         *,
         window_n: int | None = None,
+        telemetry: SubmitTelemetry | None = None,
+        reject_stage: str | None = None,
+        canonical_rank: int | None = None,
+        accepted_into_pool: bool | None = None,
+        selected_for_batch: bool | None = None,
+        rewarded: bool | None = None,
     ) -> None:
         """Record a per-submission verdict for ``/verdicts/{hotkey}``.
 
@@ -142,13 +176,116 @@ class ValidatorServer:
             self._verdicts[hotkey] = collections.deque(maxlen=VERDICT_CAP_PER_HOTKEY)
         # Normalise enum → value so the ring is a uniform dict shape.
         reason_str = reason.value if isinstance(reason, RejectReason) else reason
-        self._verdicts[hotkey].append({
+        if not accepted:
+            self._recent_reject_counts[reason_str] += 1
+        entry = {
             "merkle_root": merkle_root,
             "window_n": window_n,
             "accepted": accepted,
             "reason": reason_str,
             "ts": time.time(),
-        })
+        }
+        if telemetry is not None:
+            entry.update({
+                key: value
+                for key, value in telemetry.verdict_fields().items()
+                if value is not None
+            })
+        if reject_stage is not None:
+            entry["reject_stage"] = reject_stage
+        if not accepted:
+            entry["reject_reason"] = reason_str
+        if canonical_rank is not None:
+            entry["canonical_rank"] = canonical_rank
+        if accepted_into_pool is not None:
+            entry["accepted_into_pool"] = accepted_into_pool
+        if selected_for_batch is not None:
+            entry["selected_for_batch"] = selected_for_batch
+        if rewarded is not None:
+            entry["rewarded"] = rewarded
+        self._verdicts[hotkey].append(entry)
+
+    def _current_drand_round_best_effort(self) -> int | None:
+        batcher = self.active_batcher
+        ci = getattr(batcher, "_drand_chain_info", None) if batcher else None
+        try:
+            if ci is None:
+                from reliquary.infrastructure.drand import get_current_chain
+                ci = get_current_chain()
+            from reliquary.infrastructure.chain import compute_current_drand_round
+            return int(compute_current_drand_round(
+                time.time(), ci["genesis_time"], ci["period"],
+            ))
+        except Exception:
+            return None
+
+    def _health_payload(self) -> _Health:
+        batcher = self.active_batcher
+        cp = self._current_checkpoint
+        reject_counts: dict[str, int] = dict(self._recent_reject_counts)
+        if batcher is not None:
+            for reason, count in getattr(batcher, "reject_counts", {}).items():
+                reject_counts[reason] = max(reject_counts.get(reason, 0), count)
+        return _Health(
+            status="ok",
+            active_window=batcher.window_start if batcher else None,
+            image_revision=self._image_revision,
+            app_started_at=self._app_started_at,
+            current_validator_state=getattr(self._current_state, "value", str(self._current_state)),
+            current_window_n=batcher.window_start if batcher else None,
+            current_quicknet_drand_round=self._current_drand_round_best_effort(),
+            current_window_open_ts=(
+                getattr(batcher, "window_opened_wall_ts", None) if batcher else None
+            ),
+            current_window_open_drand_round=(
+                getattr(batcher, "window_open_drand_round", None) if batcher else None
+            ),
+            seal_trigger_round=(
+                getattr(batcher, "_seal_trigger_round", None) if batcher else None
+            ),
+            drand_round_backward_tolerance=DRAND_ROUND_BACKWARD_TOLERANCE,
+            batch_size=B_BATCH,
+            queue_depth=self._submit_queue.qsize(),
+            valid_submissions_count=(
+                getattr(batcher, "valid_count", None) if batcher else None
+            ),
+            checkpoint_repo_id=cp.repo_id if cp else None,
+            checkpoint_revision=cp.revision if cp else None,
+            recent_reject_counts_by_reason=reject_counts,
+        )
+
+    @staticmethod
+    def _call_accept_submission(
+        batcher: Any,
+        request: BatchSubmissionRequest,
+        telemetry: SubmitTelemetry,
+    ) -> BatchSubmissionResponse:
+        try:
+            return batcher.accept_submission(request, telemetry=telemetry)
+        except TypeError as exc:
+            if "telemetry" not in str(exc):
+                raise
+            return batcher.accept_submission(request)
+
+    @staticmethod
+    def _fallback_drand_observation(
+        request: BatchSubmissionRequest,
+        batcher: Any,
+        reject: RejectReason | None,
+    ) -> DrandRoundObservation:
+        tolerance = int(getattr(
+            batcher,
+            "drand_round_backward_tolerance",
+            DRAND_ROUND_BACKWARD_TOLERANCE,
+        ))
+        return DrandRoundObservation(
+            submitted_drand_round=int(request.drand_round),
+            arrival_drand_round=None,
+            drand_delta=None,
+            drand_tolerance=tolerance,
+            drand_status=classify_drand_round(request.drand_round, None, tolerance),
+            reject_reason=reject,
+        )
 
     def _build_app(self) -> FastAPI:
         app = FastAPI(title="Reliquary Validator", version="2.0")
@@ -178,12 +315,7 @@ class ValidatorServer:
 
         @app.get("/health", response_model=_Health)
         async def health() -> _Health:
-            return _Health(
-                status="ok",
-                active_window=(
-                    self.active_batcher.window_start if self.active_batcher else None
-                ),
-            )
+            return self._health_payload()
 
         @app.post("/submit", response_model=BatchSubmissionResponse)
         async def submit(
@@ -198,6 +330,17 @@ class ValidatorServer:
             if t_arrival is None:
                 t_arrival = time.time()
             hk = request.miner_hotkey
+            telemetry = SubmitTelemetry.from_request(
+                request, t_arrival=t_arrival,
+            )
+            telemetry.refresh_from_batcher(self.active_batcher)
+            log_submission_stage(
+                logger,
+                logging.INFO,
+                "submit_received",
+                telemetry,
+                queue_depth=self._submit_queue.qsize(),
+            )
 
             # ENVELOPE SIGNATURE CHECK — runs BEFORE rate-limit increment.
             #
@@ -281,6 +424,7 @@ class ValidatorServer:
                     # bad packets per hotkey per window still surface in
                     # /verdicts so a legitimate miner being spoofed
                     # learns about it.
+                    telemetry.mark_decision()
                     bn = self._bad_envelope_counts.get(hk, 0)
                     if bn < MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW:
                         self._bad_envelope_counts[hk] = bn + 1
@@ -293,7 +437,19 @@ class ValidatorServer:
                             hk, request.merkle_root, False,
                             RejectReason.BAD_ENVELOPE_SIGNATURE,
                             window_n=request.window_start,
+                            telemetry=telemetry,
+                            reject_stage="envelope",
+                            accepted_into_pool=False,
                         )
+                    log_submission_stage(
+                        logger,
+                        logging.WARNING,
+                        "candidate_rejected",
+                        telemetry,
+                        reject_stage="envelope",
+                        reject_reason=RejectReason.BAD_ENVELOPE_SIGNATURE.value,
+                        accepted_into_pool=False,
+                    )
                     return BatchSubmissionResponse(
                         accepted=False,
                         reason=RejectReason.BAD_ENVELOPE_SIGNATURE,
@@ -306,9 +462,22 @@ class ValidatorServer:
             if n >= MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW:
                 if self._late_drop_callback is not None:
                     self._late_drop_callback(hk, "rate_limited")
+                telemetry.mark_decision()
                 self.record_verdict(
                     hk, request.merkle_root, False, RejectReason.RATE_LIMITED,
                     window_n=request.window_start,
+                    telemetry=telemetry,
+                    reject_stage="rate_limit",
+                    accepted_into_pool=False,
+                )
+                log_submission_stage(
+                    logger,
+                    logging.WARNING,
+                    "candidate_rejected",
+                    telemetry,
+                    reject_stage="rate_limit",
+                    reject_reason=RejectReason.RATE_LIMITED.value,
+                    accepted_into_pool=False,
                 )
                 return BatchSubmissionResponse(
                     accepted=False, reason=RejectReason.RATE_LIMITED,
@@ -321,9 +490,22 @@ class ValidatorServer:
                     self._late_drop_callback(
                         request.miner_hotkey, "window_not_active",
                     )
+                telemetry.mark_decision()
                 self.record_verdict(
                     hk, request.merkle_root, False, RejectReason.WINDOW_NOT_ACTIVE,
                     window_n=request.window_start,
+                    telemetry=telemetry,
+                    reject_stage="window_state",
+                    accepted_into_pool=False,
+                )
+                log_submission_stage(
+                    logger,
+                    logging.WARNING,
+                    "candidate_rejected",
+                    telemetry,
+                    reject_stage="window_state",
+                    reject_reason=RejectReason.WINDOW_NOT_ACTIVE.value,
+                    accepted_into_pool=False,
                 )
                 return BatchSubmissionResponse(
                     accepted=False, reason=RejectReason.WINDOW_NOT_ACTIVE,
@@ -331,8 +513,29 @@ class ValidatorServer:
 
             batcher = self.active_batcher
             if batcher is None:
+                telemetry.mark_decision()
+                log_submission_stage(
+                    logger,
+                    logging.WARNING,
+                    "candidate_rejected",
+                    telemetry,
+                    reject_stage="window",
+                    reject_reason="no_active_window",
+                    accepted_into_pool=False,
+                )
                 raise HTTPException(status_code=503, detail="no_active_window")
+            telemetry.refresh_from_batcher(batcher)
             if request.window_start != batcher.window_start:
+                telemetry.mark_decision()
+                log_submission_stage(
+                    logger,
+                    logging.WARNING,
+                    "candidate_rejected",
+                    telemetry,
+                    reject_stage="window",
+                    reject_reason=RejectReason.WINDOW_MISMATCH.value,
+                    accepted_into_pool=False,
+                )
                 raise HTTPException(status_code=409, detail="window_mismatch")
 
             # Early-cutoff: once the batcher has sealed (B_BATCH distinct
@@ -347,9 +550,26 @@ class ValidatorServer:
             if batcher.is_sealed():
                 if self._late_drop_callback is not None:
                     self._late_drop_callback(hk, "batch_filled")
+                telemetry.refresh_from_batcher(batcher, at_decision=True)
+                telemetry.mark_decision()
                 self.record_verdict(
                     hk, request.merkle_root, False, RejectReason.BATCH_FILLED,
                     window_n=request.window_start,
+                    telemetry=telemetry,
+                    reject_stage="seal",
+                    accepted_into_pool=False,
+                )
+                log_submission_stage(
+                    logger,
+                    logging.WARNING,
+                    "candidate_rejected",
+                    telemetry,
+                    reject_stage="seal",
+                    reject_reason=RejectReason.BATCH_FILLED.value,
+                    batch_filled_reason="batch_already_sealed",
+                    current_valid_count=batcher.valid_count,
+                    trigger_round=getattr(batcher, "_seal_trigger_round", None),
+                    accepted_into_pool=False,
                 )
                 return BatchSubmissionResponse(
                     accepted=False, reason=RejectReason.BATCH_FILLED,
@@ -370,27 +590,79 @@ class ValidatorServer:
             # under the lock.
             from reliquary.constants import MAX_SUBMISSIONS_PER_PROMPT
 
-            def _cheap_reject(reason: RejectReason) -> BatchSubmissionResponse:
+            def _cheap_reject(
+                reason: RejectReason,
+                *,
+                reject_stage: str,
+                **extra: Any,
+            ) -> BatchSubmissionResponse:
                 logger.warning(
                     "rejected prompt=%d hotkey=%s drand_round=%d reason=%s rewards=%s",
                     request.prompt_idx, hk[:12], request.drand_round,
                     reason.value,
                     [r.reward for r in request.rollouts],
                 )
+                telemetry.refresh_from_batcher(batcher, at_decision=True)
+                telemetry.mark_decision()
                 self.record_verdict(
                     hk, request.merkle_root, False, reason,
                     window_n=request.window_start,
+                    telemetry=telemetry,
+                    reject_stage=reject_stage,
+                    accepted_into_pool=False,
+                )
+                log_submission_stage(
+                    logger,
+                    logging.WARNING,
+                    "candidate_rejected",
+                    telemetry,
+                    reject_stage=reject_stage,
+                    reject_reason=reason.value,
+                    accepted_into_pool=False,
+                    **extra,
                 )
                 return BatchSubmissionResponse(accepted=False, reason=reason)
 
             if batcher.current_checkpoint_hash and request.checkpoint_hash != batcher.current_checkpoint_hash:
-                return _cheap_reject(RejectReason.WRONG_CHECKPOINT)
-            if batcher.drand_round_check_enabled:
-                round_reject = batcher.validate_drand_round(
-                    request.drand_round, t_arrival=t_arrival,
+                return _cheap_reject(
+                    RejectReason.WRONG_CHECKPOINT,
+                    reject_stage="checkpoint",
                 )
+            if batcher.drand_round_check_enabled:
+                if hasattr(type(batcher), "observe_drand_round"):
+                    drand_observation = batcher.observe_drand_round(
+                        request.drand_round, t_arrival=t_arrival,
+                    )
+                else:
+                    round_reject = batcher.validate_drand_round(
+                        request.drand_round, t_arrival=t_arrival,
+                    )
+                    drand_observation = self._fallback_drand_observation(
+                        request, batcher, round_reject,
+                    )
+                telemetry.apply_drand(drand_observation)
+                log_submission_stage(
+                    logger,
+                    logging.INFO,
+                    "drand_validated",
+                    telemetry,
+                    reject_stage=(
+                        "drand" if drand_observation.reject_reason else None
+                    ),
+                    reject_reason=(
+                        drand_observation.reject_reason.value
+                        if drand_observation.reject_reason else None
+                    ),
+                    submitted_drand_round=drand_observation.submitted_drand_round,
+                    arrival_drand_round=drand_observation.arrival_drand_round,
+                    drand_delta=drand_observation.drand_delta,
+                    drand_tolerance=drand_observation.drand_tolerance,
+                    drand_status=drand_observation.drand_status,
+                    current_round=drand_observation.arrival_drand_round,
+                )
+                round_reject = drand_observation.reject_reason
                 if round_reject is not None:
-                    return _cheap_reject(round_reject)
+                    return _cheap_reject(round_reject, reject_stage="drand")
             # v2.3 seal extension: once the batcher has captured a
             # trigger drand round (the B-th distinct prompt has landed),
             # submissions whose drand_round is past that trigger arrived
@@ -402,13 +674,27 @@ class ValidatorServer:
                 trigger_round is not None
                 and request.drand_round > trigger_round
             ):
-                return _cheap_reject(RejectReason.BATCH_FILLED)
+                return _cheap_reject(
+                    RejectReason.BATCH_FILLED,
+                    reject_stage="seal_extension",
+                    batch_filled_reason="submitted_round_gt_seal_trigger_round",
+                    current_valid_count=batcher.valid_count,
+                    trigger_round=trigger_round,
+                )
             if request.prompt_idx >= len(batcher.env):
-                return _cheap_reject(RejectReason.BAD_PROMPT_IDX)
+                return _cheap_reject(RejectReason.BAD_PROMPT_IDX, reject_stage="prompt")
             if request.prompt_idx in batcher.cooldown_prompts_snapshot:
-                return _cheap_reject(RejectReason.PROMPT_IN_COOLDOWN)
+                return _cheap_reject(
+                    RejectReason.PROMPT_IN_COOLDOWN,
+                    reject_stage="cooldown",
+                    batch_filled_reason="prompt_in_cooldown",
+                )
             if batcher.prompt_submission_count(request.prompt_idx) >= MAX_SUBMISSIONS_PER_PROMPT:
-                return _cheap_reject(RejectReason.PROMPT_FULL)
+                return _cheap_reject(
+                    RejectReason.PROMPT_FULL,
+                    reject_stage="prompt_capacity",
+                    batch_filled_reason="prompt_duplicate_or_full",
+                )
 
             # Under TestClient (no worker running) we run synchronously so
             # tests see the real ``ACCEPTED`` verdict; under uvicorn we enqueue
@@ -420,16 +706,59 @@ class ValidatorServer:
             # silently draining the leftover queue at the next batcher swap
             # (see ``_submit_worker`` below), not by HTTP-level rejections.
             if self._worker_task is None:
-                resp = batcher.accept_submission(request)
+                telemetry.mark_proof_started()
+                log_submission_stage(
+                    logger,
+                    logging.INFO,
+                    "proof_started",
+                    telemetry,
+                    reject_stage=None,
+                    reject_reason=None,
+                )
+                resp = self._call_accept_submission(batcher, request, telemetry)
+                telemetry.refresh_from_batcher(batcher, at_decision=True)
+                telemetry.mark_decision(verified=True)
+                log_submission_stage(
+                    logger,
+                    logging.INFO,
+                    "proof_finished",
+                    telemetry,
+                    accepted=resp.accepted,
+                    reason=resp.reason.value,
+                )
+                if resp.accepted:
+                    log_submission_stage(
+                        logger,
+                        logging.INFO,
+                        "candidate_accepted",
+                        telemetry,
+                        reject_stage="none",
+                        reject_reason="none",
+                        accepted_into_pool=True,
+                    )
+                else:
+                    log_submission_stage(
+                        logger,
+                        logging.WARNING,
+                        "candidate_rejected",
+                        telemetry,
+                        reject_stage="proof",
+                        reject_reason=resp.reason.value,
+                        accepted_into_pool=False,
+                    )
                 # Sync path (tests) — the real verdict is already known
                 # before we return, so record it directly.
                 self.record_verdict(
                     hk, request.merkle_root, resp.accepted, resp.reason,
                     window_n=request.window_start,
+                    telemetry=telemetry,
+                    reject_stage=None if resp.accepted else "proof",
+                    accepted_into_pool=resp.accepted,
                 )
                 return resp
 
-            await self._submit_queue.put((request, batcher))
+            telemetry.mark_enqueued()
+            await self._submit_queue.put((request, batcher, telemetry))
             return BatchSubmissionResponse(
                 accepted=True, reason=RejectReason.SUBMITTED,
             )
@@ -471,7 +800,11 @@ class ValidatorServer:
                 "signature": cp.signature,
             }
 
-        @app.get("/verdicts/{hotkey}", response_model=VerdictsResponse)
+        @app.get(
+            "/verdicts/{hotkey}",
+            response_model=VerdictsResponse,
+            response_model_exclude_none=True,
+        )
         async def verdicts(hotkey: str, since: float = 0.0) -> VerdictsResponse:
             """Recent per-submission verdicts for ``hotkey``, ordered by
             ``ts`` ascending. The default ``since=0`` returns every verdict
@@ -514,9 +847,17 @@ class ValidatorServer:
 
         while True:
             try:
-                request, batcher = await self._submit_queue.get()
+                item = await self._submit_queue.get()
             except asyncio.CancelledError:
                 return
+            if len(item) == 3:
+                request, batcher, telemetry = item
+            else:
+                request, batcher = item
+                telemetry = SubmitTelemetry.from_request(
+                    request, t_arrival=time.time(),
+                )
+            telemetry.refresh_from_batcher(batcher)
             # Silently drop items whose batcher is no longer the active one.
             # This is what relieves pressure from a saturated window: the
             # queue is unbounded by design, so a busy window can pile up
@@ -531,6 +872,8 @@ class ValidatorServer:
             # the /submit response and learns the real outcome (or its
             # absence) from the R2 archive.
             if batcher is not self.active_batcher:
+                telemetry.refresh_from_batcher(batcher, at_decision=True)
+                telemetry.mark_decision()
                 logger.info(
                     "dropping late submission prompt=%d hotkey=%s "
                     "drand_round=%d (batcher window=%d no longer active)",
@@ -547,6 +890,21 @@ class ValidatorServer:
                     request.miner_hotkey, request.merkle_root, False,
                     RejectReason.WORKER_DROPPED,
                     window_n=request.window_start,
+                    telemetry=telemetry,
+                    reject_stage="worker",
+                    accepted_into_pool=False,
+                )
+                log_submission_stage(
+                    logger,
+                    logging.WARNING,
+                    "candidate_rejected",
+                    telemetry,
+                    reject_stage="worker",
+                    reject_reason=RejectReason.WORKER_DROPPED.value,
+                    batch_filled_reason="batch_already_draining",
+                    current_valid_count=getattr(batcher, "valid_count", None),
+                    trigger_round=getattr(batcher, "_seal_trigger_round", None),
+                    accepted_into_pool=False,
                 )
                 continue
             # Drain past-seal items without running GRAIL. The HTTP early-
@@ -557,6 +915,8 @@ class ValidatorServer:
             # arrival rate. Same accounting bucket as the HTTP path so a
             # miner inspecting late_drops sees one consistent metric.
             if batcher.is_sealed():
+                telemetry.refresh_from_batcher(batcher, at_decision=True)
+                telemetry.mark_decision()
                 logger.info(
                     "dropping post-seal queue item prompt=%d hotkey=%s "
                     "drand_round=%d (batcher window=%d already filled)",
@@ -571,17 +931,60 @@ class ValidatorServer:
                     request.miner_hotkey, request.merkle_root, False,
                     RejectReason.BATCH_FILLED,
                     window_n=request.window_start,
+                    telemetry=telemetry,
+                    reject_stage="seal",
+                    accepted_into_pool=False,
+                )
+                log_submission_stage(
+                    logger,
+                    logging.WARNING,
+                    "candidate_rejected",
+                    telemetry,
+                    reject_stage="seal",
+                    reject_reason=RejectReason.BATCH_FILLED.value,
+                    batch_filled_reason="batch_already_sealed_or_draining",
+                    current_valid_count=getattr(batcher, "valid_count", None),
+                    trigger_round=getattr(batcher, "_seal_trigger_round", None),
+                    accepted_into_pool=False,
                 )
                 continue
             try:
+                telemetry.mark_proof_started()
+                log_submission_stage(
+                    logger,
+                    logging.INFO,
+                    "proof_started",
+                    telemetry,
+                    reject_stage=None,
+                    reject_reason=None,
+                )
                 response = await asyncio.to_thread(
-                    batcher.accept_submission, request
+                    self._call_accept_submission, batcher, request, telemetry
+                )
+                telemetry.refresh_from_batcher(batcher, at_decision=True)
+                telemetry.mark_decision(verified=True)
+                log_submission_stage(
+                    logger,
+                    logging.INFO,
+                    "proof_finished",
+                    telemetry,
+                    accepted=response.accepted,
+                    reason=response.reason.value,
                 )
                 if response.accepted:
                     logger.info(
                         "accepted prompt=%d hotkey=%s drand_round=%d",
                         request.prompt_idx, request.miner_hotkey[:12],
                         request.drand_round,
+                    )
+                    log_submission_stage(
+                        logger,
+                        logging.INFO,
+                        "candidate_accepted",
+                        telemetry,
+                        reject_stage="none",
+                        reject_reason="none",
+                        accepted_into_pool=True,
                     )
                 else:
                     rewards = [r.reward for r in request.rollouts]
@@ -591,12 +994,24 @@ class ValidatorServer:
                         request.prompt_idx, request.miner_hotkey[:12],
                         request.drand_round, response.reason.value, rewards,
                     )
+                    log_submission_stage(
+                        logger,
+                        logging.WARNING,
+                        "candidate_rejected",
+                        telemetry,
+                        reject_stage="proof",
+                        reject_reason=response.reason.value,
+                        accepted_into_pool=False,
+                    )
                 # The verdict the /submit response *didn't* carry, now
                 # observable to the miner via /verdicts.
                 self.record_verdict(
                     request.miner_hotkey, request.merkle_root,
                     response.accepted, response.reason,
                     window_n=request.window_start,
+                    telemetry=telemetry,
+                    reject_stage=None if response.accepted else "proof",
+                    accepted_into_pool=response.accepted,
                 )
             except Exception as e:
                 logger.exception(

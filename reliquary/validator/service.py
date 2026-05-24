@@ -12,18 +12,23 @@ from reliquary.constants import (
     COOLDOWN_REBUILD_LOOKBACK,
     B_BATCH,
     BOOTSTRAP_WINDOWS,
+    BOOTSTRAP_SIGMA_MIN,
     CHECKPOINT_PUBLISH_INTERVAL_WINDOWS,
     CHECKPOINT_STAGING_DIR_DEFAULT,
     DEFAULT_HF_REPO_ID,
+    DRAND_ROUND_BACKWARD_TOLERANCE,
     GRAD_CLIP_NORM,
     HASH_DEDUP_RETENTION_WINDOWS,
     KL_BETA,
     LEARNING_RATE,
+    LOGPROB_IS_EPS,
     LR_COSINE_MAX_WINDOWS,
     LR_WARMUP_WINDOWS,
     M_ROLLOUTS,
+    MIN_EOS_PROBABILITY,
     POLL_INTERVAL_SECONDS,
     PPO_CLIP_EPSILON,
+    SIGMA_MIN,
     SUBNET_START_BLOCK,
     VALIDATOR_HTTP_PORT,
     WANDB_TRAINING_VERSION,
@@ -38,6 +43,7 @@ from reliquary.validator.batcher import GrpoWindowBatcher
 from reliquary.validator.checkpoint import CheckpointStore
 from reliquary.validator.cooldown import CooldownMap
 from reliquary.validator.dedup import RolloutHashSet
+from reliquary.validator.observability import log_structured, runtime_revision
 from reliquary.validator.server import ValidatorServer
 from reliquary.validator.training import train_step
 
@@ -227,6 +233,7 @@ class ValidationService:
         self.use_drand = use_drand
         self.external_ip = external_ip
         self.external_port = external_port
+        self.hf_repo_id = hf_repo_id or DEFAULT_HF_REPO_ID
 
         self._last_processed_window: int = -1
         self._windows_in_interval: int = 0
@@ -249,7 +256,7 @@ class ValidationService:
         self._checkpoint_store = CheckpointStore(
             validator_hotkey=wallet.hotkey.ss58_address,
             wallet=wallet,
-            repo_id=hf_repo_id or DEFAULT_HF_REPO_ID,
+            repo_id=self.hf_repo_id,
             staging_dir_path=CHECKPOINT_STAGING_DIR_DEFAULT,
             tokenizer=tokenizer,
         )
@@ -426,12 +433,17 @@ class ValidationService:
                 )
                 self._active_batcher.randomness = randomness
                 self._last_beacon = beacon
+                if beacon is not None and beacon.get("round") is not None:
+                    self._active_batcher.window_open_drand_round = int(
+                        beacon["round"]
+                    )
                 # Schedule background bittensor_drand cross-check. Only
                 # in real-drand mode (mock path returns beacon=None).
                 # Task reference stored so it's not GC'd mid-run.
                 if beacon is not None and beacon.get("signature"):
                     from reliquary.infrastructure.drand import get_current_chain
                     chain_info = get_current_chain()
+                    self._active_batcher._drand_chain_info = chain_info
                     self._verify_task = asyncio.create_task(
                         self._verify_beacon_async(
                             self._active_batcher,
@@ -532,6 +544,51 @@ class ValidationService:
         # fetch — all timing info is already attached to the submissions.
         batch, rewards = self._active_batcher.seal_batch()
         self._active_batcher.rewards_by_hotkey = rewards
+        selection_meta = getattr(
+            self._active_batcher, "selection_metadata_by_id", {}
+        )
+        for sub in self._active_batcher.valid_submissions():
+            meta = selection_meta.get(id(sub), {})
+            selected = bool(meta.get("selected_for_batch", False))
+            rewarded = bool(meta.get("rewarded", False))
+            base_fields = {
+                "window_n": self._active_batcher.window_start,
+                "prompt_idx": sub.prompt_idx,
+                "hotkey": sub.hotkey,
+                "arrival_ts": sub.arrival_ts,
+                "decision_ts": sub.decision_ts,
+                "submitted_drand_round": sub.submitted_drand_round or sub.drand_round,
+                "arrival_drand_round": sub.arrival_drand_round,
+                "drand_delta": sub.drand_delta,
+                "seal_trigger_round": getattr(
+                    self._active_batcher, "_seal_trigger_round", None
+                ),
+                "prompt_hash_lead": sub.prompt_hash_lead,
+                "canonical_rank": meta.get("canonical_rank"),
+                "accepted_into_pool": True,
+                "selected_for_batch": selected,
+                "rewarded": rewarded,
+                "reward_amount": meta.get("reward_amount"),
+                "selection_reason": meta.get("selection_reason"),
+                "batch_filled_reason": (
+                    meta.get("selection_reason") if not selected else None
+                ),
+                "reject_stage": "none",
+                "reject_reason": "none",
+            }
+            log_structured(
+                logger,
+                logging.INFO,
+                "validator_submit_lifecycle",
+                {"stage": "final_batch_selected", **base_fields},
+            )
+            if rewarded:
+                log_structured(
+                    logger,
+                    logging.INFO,
+                    "validator_submit_lifecycle",
+                    {"stage": "reward_assigned", **base_fields},
+                )
         # Note: miners earn slots regardless of training. Their contribution
         # is reflected in the next ``_submit_weights`` call, which replays
         # the EMA from R2 archives written by ``_archive_window`` below.
@@ -645,6 +702,37 @@ class ValidationService:
                 return None
             return arrived_at - window_opened_at
 
+        selection_meta = getattr(batcher, "selection_metadata_by_id", {})
+
+        def _submission_obs_payload(s, *, rejected: bool = False):
+            meta = selection_meta.get(id(s), {})
+            return {
+                "arrival_ts": getattr(s, "arrival_ts", None),
+                "decision_ts": getattr(s, "decision_ts", None),
+                "submitted_drand_round": getattr(
+                    s, "submitted_drand_round", getattr(s, "drand_round", None)
+                ),
+                "arrival_drand_round": getattr(s, "arrival_drand_round", None),
+                "drand_delta": getattr(s, "drand_delta", None),
+                "seal_trigger_round": getattr(
+                    s,
+                    "seal_trigger_round",
+                    getattr(batcher, "_seal_trigger_round", None),
+                ),
+                "prompt_hash_lead": getattr(s, "prompt_hash_lead", None),
+                "canonical_rank": meta.get("canonical_rank"),
+                "accepted_into_pool": not rejected,
+                "selected_for_batch": bool(meta.get("selected_for_batch", False)),
+                "rewarded": bool(meta.get("rewarded", False)),
+                "batch_filled_reason": (
+                    meta.get("selection_reason")
+                    if not meta.get("selected_for_batch", False)
+                    else None
+                ),
+                "reject_stage": getattr(s, "reject_stage", None),
+                "reject_reason": getattr(s, "reason", None) if rejected else None,
+            }
+
         def _rollout_payload(s, with_text: bool):
             out = []
             texts = s.completion_texts if with_text else [None] * len(s.rollouts)
@@ -693,6 +781,7 @@ class ValidationService:
                 "sketch_diff_max": s.sketch_diff_max,
                 "lp_dev_max": s.lp_dev_max,
                 "dist_q10_min": s.dist_q10_min,
+                **_submission_obs_payload(s),
             })
 
         # All validated submissions that didn't make the final batch — metadata
@@ -712,6 +801,7 @@ class ValidationService:
                 "sketch_diff_max": s.sketch_diff_max,
                 "lp_dev_max": s.lp_dev_max,
                 "dist_q10_min": s.dist_q10_min,
+                **_submission_obs_payload(s),
             })
 
         rejected_entries = [
@@ -722,6 +812,7 @@ class ValidationService:
                 "sketch_diff_max": r.sketch_diff_max,
                 "lp_dev_max": r.lp_dev_max,
                 "dist_q10_min": r.dist_q10_min,
+                **_submission_obs_payload(r, rejected=True),
             }
             for r in getattr(batcher, "rejected_submissions", [])
         ]
@@ -756,6 +847,50 @@ class ValidationService:
         from reliquary.infrastructure.archive_queue import get_archive_queue
         get_archive_queue().enqueue(batcher.window_start, archive)
 
+    def _log_startup_config_banner(self) -> None:
+        cp = self._checkpoint_store.current_manifest()
+        drand_chain_info = None
+        drand_chain_name = os.getenv("DRAND_CHAIN", "quicknet").strip() or "quicknet"
+        if self.use_drand:
+            try:
+                from reliquary.infrastructure.drand import get_current_chain
+                drand_chain_info = get_current_chain()
+            except Exception:
+                drand_chain_info = None
+        log_structured(
+            logger,
+            logging.INFO,
+            "validator_startup_config",
+            {
+                "image_revision": runtime_revision(),
+                "use_drand": self.use_drand,
+                "drand_chain": drand_chain_name,
+                "drand_period": (
+                    drand_chain_info.get("period") if drand_chain_info else None
+                ),
+                "drand_genesis_time": (
+                    drand_chain_info.get("genesis_time") if drand_chain_info else None
+                ),
+                "drand_round_backward_tolerance": DRAND_ROUND_BACKWARD_TOLERANCE,
+                "checkpoint_repo_id": cp.repo_id if cp else self.hf_repo_id,
+                "checkpoint_revision": cp.revision if cp else None,
+                "checkpoint_n": cp.checkpoint_n if cp else self._checkpoint_n,
+                "batch_size": B_BATCH,
+                "m_rollouts_per_prompt": M_ROLLOUTS,
+                "environment": self.env.name,
+                "netuid": self.netuid,
+                "sigma_min": SIGMA_MIN,
+                "bootstrap_sigma_min": BOOTSTRAP_SIGMA_MIN,
+                "min_eos_probability": MIN_EOS_PROBABILITY,
+                "logprob_is_eps": LOGPROB_IS_EPS,
+                "r2_bucket": os.getenv("R2_BUCKET_ID", "reliquary"),
+                "http_host": self.server.host,
+                "http_port": self.server.port,
+                "external_ip_configured": bool(self.external_ip),
+                "external_port": self.external_port,
+            },
+        )
+
     async def run(self, subtensor) -> None:
         await self.server.start()
         await self._serve_axon_on_chain(subtensor)
@@ -763,6 +898,7 @@ class ValidationService:
         await self._bootstrap_state_from_external()
         await self._rebuild_cooldown_from_history()
         await self._rebuild_hashes_from_history()
+        self._log_startup_config_banner()
 
         # Start the background archive-upload worker. It scans the queue
         # directory for any pending payloads (from before this restart
@@ -1100,4 +1236,3 @@ class ValidationService:
         # disable drand keep working without a live drand fetch.
         block_hash = await chain.get_block_hash(subtensor, target_window)
         return chain.compute_window_randomness(block_hash), None
-

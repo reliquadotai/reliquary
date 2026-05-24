@@ -133,6 +133,10 @@ The trainer exposes the last `VERDICT_CAP_PER_HOTKEY = 200` per-submission verdi
 
 This is the cheapest way for operators to debug "why is miner X not making the batch" without grep'ing the validator's own logs or pulling R2 archives. Public read by design — same trust model as the R2 archive. Memory cost is ~2.5 MB for a 50-hotkey subnet.
 
+For submit lifecycle fields, drand timing interpretation, `batch_filled`
+reasons, and final selected vs rewarded semantics, see
+[Validator Observability Notes](validator_observability.md).
+
 ---
 
 ## Troubleshooting

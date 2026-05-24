@@ -191,6 +191,25 @@ class Verdict(BaseModel):
     accepted: bool
     reason: RejectReason
     ts: float = Field(..., description="Unix timestamp when the verdict landed")
+    # Optional observability fields. Older verdict records omit these; the
+    # endpoint excludes nulls so legacy consumers keep seeing the compact shape
+    # for entries that lack lifecycle metadata.
+    arrival_ts: float | None = None
+    decision_ts: float | None = None
+    submitted_drand_round: int | None = None
+    arrival_drand_round: int | None = None
+    drand_delta: int | None = None
+    seal_trigger_round: int | None = None
+    prompt_hash_lead: str | None = None
+    canonical_rank: int | None = None
+    accepted_into_pool: bool | None = None
+    selected_for_batch: bool | None = None
+    rewarded: bool | None = None
+    reject_stage: str | None = None
+    reject_reason: str | None = None
+    queue_wait_ms: float | None = None
+    verify_ms: float | None = None
+    total_ms: float | None = None
 
 
 class VerdictsResponse(BaseModel):

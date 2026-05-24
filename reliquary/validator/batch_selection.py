@@ -200,3 +200,113 @@ def select_batch_and_distribute(
             break
 
     return training_batch, rewards
+
+
+def explain_batch_selection(
+    submissions: list[Any],
+    *,
+    b: int,
+    cooldown_map: CooldownMap,
+    current_window: int,
+    pool: float = 1.0,
+) -> dict[int, dict[str, Any]]:
+    """Return per-submission final-selection metadata without mutating state.
+
+    The traversal mirrors ``select_batch_and_distribute`` so operators can
+    distinguish "accepted into the pool" from "selected for training" from
+    "rewarded by emission sharing". Keys are ``id(submission)``.
+    """
+    meta: dict[int, dict[str, Any]] = {
+        id(sub): {
+            "accepted_into_pool": True,
+            "selected_for_batch": False,
+            "rewarded": False,
+            "reward_amount": 0.0,
+            "canonical_rank": None,
+            "selection_reason": "not_reached_before_batch_filled",
+        }
+        for sub in submissions
+    }
+    if b <= 0 or not submissions:
+        return meta
+
+    by_round: dict[int, dict[int, list[Any]]] = {}
+    for sub in submissions:
+        if cooldown_map.is_in_cooldown(sub.prompt_idx, current_window):
+            meta[id(sub)]["selection_reason"] = "prompt_in_cooldown_at_selection"
+            continue
+        prompts = by_round.setdefault(sub.drand_round, {})
+        prompts.setdefault(sub.prompt_idx, []).append(sub)
+    if not by_round:
+        return meta
+
+    slot_share = pool / b
+    selected_count = 0
+    claimed_prompts: set[int] = set()
+    rank = 0
+
+    for round_no in sorted(by_round):
+        remaining = b - selected_count
+        if remaining <= 0:
+            break
+
+        available = {
+            p: subs
+            for p, subs in by_round[round_no].items()
+            if p not in claimed_prompts
+        }
+        if not available:
+            continue
+
+        sorted_prompts = sorted(available, key=_prompt_canonical_key)
+
+        if len(sorted_prompts) <= remaining:
+            for prompt_idx in sorted_prompts:
+                rank += 1
+                slot_subs = available[prompt_idx]
+                representative = min(slot_subs, key=_within_slot_key)
+                per_miner = slot_share / len(slot_subs)
+                for sub in slot_subs:
+                    sub_meta = meta[id(sub)]
+                    sub_meta.update({
+                        "rewarded": True,
+                        "reward_amount": per_miner,
+                        "canonical_rank": rank,
+                        "selection_reason": (
+                            "selected_for_batch"
+                            if sub is representative
+                            else "rewarded_same_prompt"
+                        ),
+                    })
+                    if sub is representative:
+                        sub_meta["selected_for_batch"] = True
+                selected_count += 1
+                claimed_prompts.add(prompt_idx)
+        else:
+            chosen = set(sorted_prompts[:remaining])
+            per_prompt = remaining * slot_share / len(sorted_prompts)
+            for prompt_idx in sorted_prompts:
+                rank += 1
+                slot_subs = available[prompt_idx]
+                representative = min(slot_subs, key=_within_slot_key)
+                per_miner = per_prompt / len(slot_subs)
+                for sub in slot_subs:
+                    reason = (
+                        "selected_boundary_canonical"
+                        if prompt_idx in chosen and sub is representative
+                        else "rewarded_same_prompt"
+                        if prompt_idx in chosen
+                        else "same_trigger_round_lost_canonical_ordering"
+                    )
+                    sub_meta = meta[id(sub)]
+                    sub_meta.update({
+                        "rewarded": True,
+                        "reward_amount": per_miner,
+                        "canonical_rank": rank,
+                        "selection_reason": reason,
+                    })
+                    if prompt_idx in chosen and sub is representative:
+                        sub_meta["selected_for_batch"] = True
+            break
+
+    return meta
