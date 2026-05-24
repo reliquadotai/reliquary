@@ -1,0 +1,60 @@
+name: cross-box-determinism
+
+on:
+  pull_request:
+    paths:
+      - "reliquary/environment/grader/**"
+      - "reliquary/environment/opencodeinstruct.py"
+      - "scripts/build_opencodeinstruct_subset.py"
+      - ".github/workflows/cross-box-determinism.yml"
+  push:
+    branches: [main]
+    paths:
+      - "reliquary/environment/grader/**"
+      - "reliquary/environment/opencodeinstruct.py"
+
+jobs:
+  determinism:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+        python-version: ["3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install package
+        run: pip install -e .
+      - name: Run determinism corpus
+        env:
+          PYTHONHASHSEED: "0"
+        run: |
+          python -m reliquary.environment.grader.worker < tests/fixtures/determinism_corpus.jsonl > /tmp/results_${{ matrix.os }}.txt
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: determinism-${{ matrix.os }}
+          path: /tmp/results_${{ matrix.os }}.txt
+
+  compare:
+    needs: determinism
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: determinism-ubuntu-22.04
+          path: r22
+      - uses: actions/download-artifact@v4
+        with:
+          name: determinism-ubuntu-24.04
+          path: r24
+      - name: Diff results
+        run: |
+          if ! diff -u r22/results_ubuntu-22.04.txt r24/results_ubuntu-24.04.txt; then
+            echo "::error::Determinism corpus produced different results across runners."
+            exit 1
+          fi
+          echo "All runs identical across runners."

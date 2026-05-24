@@ -6,7 +6,7 @@ No os.getenv() overrides. Changes require coordinated deployment.
 
 # ────────────────  GRAIL PROOF VERSION  ────────────────
 
-GRAIL_PROOF_VERSION = "v5"
+GRAIL_PROOF_VERSION = "v6"
 
 # ────────────────  CRYPTOGRAPHIC CONSTANTS  ────────────────
 
@@ -96,9 +96,6 @@ REJECTED_LIST_CAP_PER_HOTKEY = 5
 
 # Default HTTP port the validator listens on for miner submissions.
 VALIDATOR_HTTP_PORT = 8888
-
-# Active environment name (resolved by reliquary.environment.load_environment).
-ENVIRONMENT_NAME = "openmathinstruct"
 
 # UID that receives unused slot emission budget (the burn address).
 UID_BURN = 0
@@ -190,6 +187,19 @@ M_ROLLOUTS = 8
 # Training batch size — the first B valid in-zone submissions (FIFO by
 # TCP arrival, distinct prompts, not in cooldown) feed the GRPO step.
 B_BATCH = 8
+
+# (env_name, prompts_per_batch). Sum across entries = total prompts
+# processed per optimizer step. With 2 envs at B_BATCH each, we train
+# on 16 prompts × M_ROLLOUTS = 128 sequences per step.
+ENVIRONMENT_MIX: list[tuple[str, int]] = [
+    ("openmathinstruct", B_BATCH),
+    ("opencodeinstruct", B_BATCH),
+]
+
+# Number of micro-batches accumulated before an optimizer step. Derived
+# from the mix — one micro-batch per active env. Not separately tunable
+# to keep semantics simple.
+GRAD_ACCUM_STEPS: int = len(ENVIRONMENT_MIX)
 
 # Sampling temperature fixed at protocol level. Miners who use a different
 # T would produce samples from a different distribution → biased GRPO
@@ -443,3 +453,25 @@ SAMPLING_LOW_P = 0.10           # prob <= this → "low" chosen token
 SAMPLING_HIGH_P = 0.90           # prob >= this → "high" chosen token
 SAMPLING_MEDIAN_LOW_MAX = 0.30  # median chosen prob must be above
 SAMPLING_LOW_Q10_MAX = 0.025    # 10th-percentile must be above
+
+# ────────────────  CODE EXECUTION GRADER  ────────────────
+
+# Path to the Unix domain socket the grader server listens on.
+# Default lives in /tmp so it's writable by both validator (UID 1000)
+# and grader (UID 1001) processes inside the container.
+GRADER_SOCKET_PATH = "/tmp/reliquary-grader.sock"
+
+# Number of warm gVisor workers in the grader pool. Sized to handle
+# M_ROLLOUTS in parallel for a single submission with headroom for
+# concurrent submissions. Increase for high-throughput validators.
+GRADER_POOL_SIZE = M_ROLLOUTS
+
+# Wall-clock timeout (seconds) for one `(code, tests)` evaluation.
+# Subprocess inside the sandbox is killed if it exceeds this. Tuned
+# so that pathological miner code (infinite loops, slow algorithms)
+# fails fast without blocking the queue.
+GRADER_EVAL_TIMEOUT_SECONDS = 5
+
+# How often (seconds) the server pings each worker via a no-op eval
+# to detect zombies. Triggers respawn if a worker fails to respond.
+GRADER_HEALTH_CHECK_INTERVAL_SECONDS = 30

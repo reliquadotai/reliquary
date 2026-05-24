@@ -1,0 +1,5 @@
+{"req_id":"d1","code":"def add(a,b): return a+b","tests":["assert add(1,2)==3","assert add(-1,1)==0"],"timeout_s":5.0}
+{"req_id":"d2","code":"def sort_unique(xs): return sorted(set(xs))","tests":["assert sort_unique([3,1,2,1])==[1,2,3]"],"timeout_s":5.0}
+{"req_id":"d3","code":"def fact(n): return 1 if n<=1 else n*fact(n-1)","tests":["assert fact(5)==120","assert fact(0)==1"],"timeout_s":5.0}
+{"req_id":"d4","code":"def is_prime(n):\n  if n<2: return False\n  for i in range(2,int(n**0.5)+1):\n    if n%i==0: return False\n  return True","tests":["assert is_prime(7)","assert not is_prime(9)"],"timeout_s":5.0}
+{"req_id":"d5","code":"def fib(n):\n  a,b=0,1\n  for _ in range(n): a,b=b,a+b\n  return a","tests":["assert fib(10)==55"],"timeout_s":5.0}

@@ -17,6 +17,7 @@ from reliquary.constants import (
     CHECKPOINT_STAGING_DIR_DEFAULT,
     DEFAULT_HF_REPO_ID,
     DRAND_ROUND_BACKWARD_TOLERANCE,
+    ENVIRONMENT_MIX,
     GRAD_CLIP_NORM,
     HASH_DEDUP_RETENTION_WINDOWS,
     KL_BETA,
@@ -35,6 +36,7 @@ from reliquary.constants import (
     WINDOW_LENGTH,
     WINDOW_TIMEOUT_SECONDS,
 )
+from reliquary.environment import load_environments
 from reliquary.environment.base import Environment
 from reliquary.infrastructure import chain, storage
 from reliquary.protocol.submission import RolloutSubmission, WindowState
@@ -48,6 +50,43 @@ from reliquary.validator.server import ValidatorServer
 from reliquary.validator.training import train_step
 
 logger = logging.getLogger(__name__)
+
+
+def _filter_archives_for_env(archives: list[dict], env_name: str) -> list[dict]:
+    """Return a filtered view of archives containing only entries for ``env_name``.
+
+    Handles both old (pre-multi-env) and new archive shapes:
+      * Old: top-level ``"environment"`` (singular), no per-entry ``env_name``.
+            All batch entries belong to that env.
+      * New: per-entry ``"env_name"`` field. Filter to matching entries.
+    """
+    out = []
+    for archive in archives:
+        # Determine the archive's env(s). New shape has "environments" list;
+        # old shape has "environment" singular. Both may be present together.
+        archive_envs: list[str] = archive.get("environments") or []
+        if not archive_envs:
+            singular = archive.get("environment", "")
+            if singular:
+                archive_envs = [singular]
+
+        # If env info is absent entirely, include all entries (defensive).
+        env_unknown = not archive_envs
+
+        # Filter batch entries to this env.
+        if env_unknown or env_name in archive_envs:
+            filtered_batch = []
+            for entry in archive.get("batch", []):
+                entry_env = entry.get("env_name", "")
+                # Include if: entry has no env_name (old archive) or matches.
+                if not entry_env or entry_env == env_name:
+                    filtered_batch.append(entry)
+            if filtered_batch:
+                out.append({
+                    "window_start": archive["window_start"],
+                    "batch": filtered_batch,
+                })
+    return out
 
 
 def _try_empty_cuda_cache() -> None:
@@ -165,8 +204,8 @@ class ValidationService:
         wallet,
         model,
         tokenizer,
-        env: Environment,
-        netuid: int,
+        env: Environment | None = None,
+        netuid: int = 0,
         *,
         use_drand: bool = True,
         http_host: str = "0.0.0.0",
@@ -176,6 +215,7 @@ class ValidationService:
         hf_repo_id: str | None = None,
         resume_from: str | None = None,
         load_model_fn: Any | None = None,
+        env_mix: list[tuple[str, int]] | None = None,
     ) -> None:
         self.wallet = wallet
         import importlib.metadata as _im
@@ -229,22 +269,49 @@ class ValidationService:
                 "train_model does not support gradient_checkpointing_enable"
             )
         self.tokenizer = tokenizer
-        self.env = env
         self.netuid = netuid
         self.use_drand = use_drand
         self.external_ip = external_ip
         self.external_port = external_port
         self.hf_repo_id = hf_repo_id or DEFAULT_HF_REPO_ID
 
+        # Multi-env setup. ``env_mix`` defaults to ENVIRONMENT_MIX from
+        # constants; callers (CLI, tests) may pass a single-entry mix or a
+        # custom one. When a legacy ``env`` is supplied it overrides the mix
+        # with a single-env config so existing call sites keep working.
+        if env is not None:
+            # Legacy single-env path: wrap the provided env in a 1-entry mix.
+            _env_name = getattr(env, "name", "unknown")
+            self.env_mix: list[tuple[str, int]] = [(_env_name, B_BATCH)]
+            self.envs: dict[str, Environment] = {_env_name: env}
+        else:
+            self.env_mix = env_mix if env_mix is not None else list(ENVIRONMENT_MIX)
+            env_names = [n for n, _ in self.env_mix]
+            self.envs = load_environments(env_names)
+
+        # Legacy accessor — archive code and tests grew up around single-env.
+        # Points to the first env in the mix; consumers needing all envs
+        # iterate ``self.envs``.
+        first_env_name = self.env_mix[0][0]
+        self.env: Environment = self.envs[first_env_name]
+
         self._last_processed_window: int = -1
         self._windows_in_interval: int = 0
-        self._cooldown_map = CooldownMap(
-            cooldown_windows=BATCH_PROMPT_COOLDOWN_WINDOWS
-        )
+        # One CooldownMap per env so prompt-cooldown is independent across
+        # environments (a math prompt cooling down doesn't block code prompts).
+        self._cooldown_per_env: dict[str, CooldownMap] = {
+            name: CooldownMap(cooldown_windows=BATCH_PROMPT_COOLDOWN_WINDOWS)
+            for name in self.envs
+        }
+        # Legacy accessor pointing to the first env's map.  Kept so
+        # ``_rebuild_cooldown_from_history`` and tests that read ``_cooldown_map``
+        # still work without change.
+        self._cooldown_map = self._cooldown_per_env[first_env_name]
         self._hash_set = RolloutHashSet(
             retention_windows=HASH_DEDUP_RETENTION_WINDOWS,
         )
         self._late_drops: dict[str, dict[str, int]] = {}
+        self._grader_failures: dict[str, int] = {}
 
         self.server = ValidatorServer(host=http_host, port=http_port)
         self.server.set_late_drop_callback(self.record_late_drop)
@@ -261,7 +328,8 @@ class ValidationService:
             staging_dir_path=CHECKPOINT_STAGING_DIR_DEFAULT,
             tokenizer=tokenizer,
         )
-        self._active_batcher = None
+        # Multi-batcher: one GrpoWindowBatcher per active env.
+        self._active_batchers: dict[str, GrpoWindowBatcher] = {}
         # Stashed by ``_set_window_randomness`` after the drand fetch
         # succeeds; consumed by the background verify task (Task 5).
         # ``None`` on the mock-only path.
@@ -273,6 +341,29 @@ class ValidationService:
 
         self._resume_from = resume_from
         self._load_model_fn = load_model_fn or _default_load_model
+
+    @property
+    def _active_batcher(self):
+        """Legacy scalar accessor: first active batcher, or None.
+
+        Kept for test backward-compatibility. Production code iterates
+        ``self._active_batchers`` directly.
+        """
+        d = self.__dict__.get("_active_batchers", {})
+        return next(iter(d.values()), None)
+
+    @_active_batcher.setter
+    def _active_batcher(self, value) -> None:
+        """Legacy setter: syncs a single batcher into ``_active_batchers``.
+
+        Setting to None clears the dict; setting to a batcher wraps it in
+        a single-entry dict keyed by the batcher's env name (or "unknown").
+        """
+        if value is None:
+            self.__dict__.setdefault("_active_batchers", {}).clear()
+        else:
+            env_name = getattr(getattr(value, "env", None), "name", "unknown")
+            self.__dict__["_active_batchers"] = {env_name: value}
 
     def _set_state(self, s: WindowState) -> None:
         self._current_window_state = s
@@ -363,10 +454,10 @@ class ValidationService:
         )
 
     def _open_window(self) -> None:
-        """Create a new GrpoWindowBatcher in a non-active state.
+        """Create GrpoWindowBatchers (one per env) in a non-active state.
 
-        Builds the batcher and wires the active checkpoint hash, but does
-        NOT expose it to the HTTP server yet — call ``_activate_window``
+        Builds all batchers and wires the active checkpoint hash, but does
+        NOT expose them to the HTTP server yet — call ``_activate_window``
         after ``_set_window_randomness`` succeeds. This two-phase open
         prevents miner submissions from reaching a batcher whose
         ``randomness`` is still the default ``""``, which crashes commitment
@@ -378,41 +469,43 @@ class ValidationService:
             window_start=self._window_n,
             subnet_start=SUBNET_START_BLOCK,
         )
-        self._active_batcher = open_grpo_window(
-            window_start=self._window_n,
-            env=self.env, model=self.verify_model,
-            cooldown_map=self._cooldown_map,
-            hash_set=self._hash_set,
-            tokenizer=self.tokenizer,
-            bootstrap=bootstrap,
-            # Seal extension waits on this to confirm every queued
-            # trigger-round submission has finished GRAIL before firing.
-            queue_drained_predicate=lambda: self.server._submit_queue.empty(),
-        )
         cp = self._checkpoint_store.current_manifest()
-        self._active_batcher.current_checkpoint_hash = (
-            cp.revision if cp else ""
-        )
+        cp_hash = cp.revision if cp else ""
+        self._active_batchers = {}
+        for env_name, env in self.envs.items():
+            batcher = open_grpo_window(
+                window_start=self._window_n,
+                env=env, model=self.verify_model,
+                cooldown_map=self._cooldown_per_env[env_name],
+                hash_set=self._hash_set,
+                tokenizer=self.tokenizer,
+                bootstrap=bootstrap,
+                # Seal extension waits on this to confirm every queued
+                # trigger-round submission has finished GRAIL before firing.
+                queue_drained_predicate=lambda: self.server._submit_queue.empty(),
+            )
+            batcher.current_checkpoint_hash = cp_hash
+            self._active_batchers[env_name] = batcher
 
     def _activate_window(self) -> None:
-        """Expose the prepared batcher to the HTTP server and mark OPEN.
+        """Expose all prepared batchers to the HTTP server and mark OPEN.
 
         Must be called only after ``_set_window_randomness`` has populated
-        ``self._active_batcher.randomness``; otherwise miner submissions
-        arriving in the window between OPEN and a later randomness set
-        would fail verification with ``Empty randomness hex string``.
+        randomness on every batcher; otherwise miner submissions arriving
+        between OPEN and a later randomness set would fail verification.
         """
-        if self._active_batcher is None:
+        if not self._active_batchers:
             return
-        self.server.set_active_batcher(self._active_batcher)
+        self.server.set_active_batchers(self._active_batchers)
         self._set_state(WindowState.OPEN)
 
     async def _set_window_randomness(self, subtensor) -> None:
-        """Populate the active batcher's per-window randomness seed.
+        """Populate all active batchers' per-window randomness seed.
 
         GRAIL sketch verification re-derives challenge indices from this
         seed; miner and validator must agree. The miner derives it from
         the same block hash + drand round, so the values match bit-for-bit.
+        All batchers share the same randomness for a given window.
 
         Retries on transient substrate failures (finney returning HTTP 503
         or WebSocket handshake errors) before bubbling. Without retries,
@@ -421,7 +514,7 @@ class ValidationService:
         empty. A small in-loop retry recovers transparently from the
         sub-second blips that dominate the failure mode in practice.
         """
-        if self._active_batcher is None:
+        if not self._active_batchers:
             return
         # 3 attempts total: original + 2 retries. Backoff is 0.5s then 1.0s,
         # so worst-case added latency is 1.5s — well inside the 60s window
@@ -432,7 +525,8 @@ class ValidationService:
                 randomness, beacon = await self._derive_randomness(
                     subtensor, self._window_n,
                 )
-                self._active_batcher.randomness = randomness
+                for batcher in self._active_batchers.values():
+                    batcher.randomness = randomness
                 self._last_beacon = beacon
                 if beacon is not None and beacon.get("round") is not None:
                     self._active_batcher.window_open_drand_round = int(
@@ -441,13 +535,14 @@ class ValidationService:
                 # Schedule background bittensor_drand cross-check. Only
                 # in real-drand mode (mock path returns beacon=None).
                 # Task reference stored so it's not GC'd mid-run.
+                # Pass all batchers so the cross-check can invalidate all.
                 if beacon is not None and beacon.get("signature"):
                     from reliquary.infrastructure.drand import get_current_chain
                     chain_info = get_current_chain()
                     self._active_batcher._drand_chain_info = chain_info
                     self._verify_task = asyncio.create_task(
                         self._verify_beacon_async(
-                            self._active_batcher,
+                            list(self._active_batchers.values()),
                             chain_info["hash"],
                             int(beacon["round"]),
                             str(beacon["randomness"]),
@@ -476,7 +571,7 @@ class ValidationService:
 
     async def _verify_beacon_async(
         self,
-        batcher,
+        batchers,
         chain_hash: str,
         round_number: int,
         randomness: str,
@@ -487,9 +582,13 @@ class ValidationService:
         Runs ``verify_beacon_signature`` in a worker thread (it's blocking
         I/O — fetches an independent signature from a second drand relay
         and byte-compares). On any failure (mismatch, network error, library
-        crash) flips ``batcher.beacon_invalid`` so ``_train_and_publish``
-        drops the window before sealing.
+        crash) flips ``beacon_invalid`` on ALL active batchers so
+        ``_train_and_publish`` drops the window before sealing.
+
+        ``batchers`` may be a single batcher or a list of batchers.
         """
+        # Normalise to a list so we always iterate.
+        batcher_list = batchers if isinstance(batchers, list) else [batchers]
         from reliquary.infrastructure.drand import verify_beacon_signature
         try:
             ok = await asyncio.to_thread(
@@ -500,19 +599,21 @@ class ValidationService:
                 "Beacon verification crashed for round %d (window %d); invalidating window",
                 round_number, self._window_n,
             )
-            batcher.beacon_invalid = True
+            for b in batcher_list:
+                b.beacon_invalid = True
             return
         if not ok:
             logger.error(
                 "Beacon verification FAILED post-OPEN for round %d; invalidating window %d",
                 round_number, self._window_n,
             )
-            batcher.beacon_invalid = True
+            for b in batcher_list:
+                b.beacon_invalid = True
 
     async def _train_and_publish(self) -> None:
         """TRAINING + PUBLISHING + READY phases."""
-        if self._active_batcher is None:
-            logger.warning("_train_and_publish called with no active batcher")
+        if not self._active_batchers:
+            logger.warning("_train_and_publish called with no active batchers")
             return
 
         # Background drand cross-check flips beacon_invalid if the beacon
@@ -529,13 +630,15 @@ class ValidationService:
                     "proceeding without final verdict (will check flag below)",
                     self._window_n,
                 )
-        if self._active_batcher.beacon_invalid:
+        # Check if any batcher has been invalidated (beacon_invalid propagated
+        # to all batchers by _verify_beacon_async, so checking any one suffices).
+        if any(b.beacon_invalid for b in self._active_batchers.values()):
             logger.error(
                 "Window %d: dropping seal+train+archive — beacon invalid",
                 self._window_n,
             )
-            self.server.set_active_batcher(None)
-            self._active_batcher = None
+            self.server.set_active_batchers({})
+            self._active_batchers = {}
             self._set_state(WindowState.READY)
             return
 
@@ -543,63 +646,83 @@ class ValidationService:
         # v2.3: seal_batch orders by the per-submission drand_round attached
         # by miners (see design A'). The validator does no post-close drand
         # fetch — all timing info is already attached to the submissions.
-        batch, rewards = self._active_batcher.seal_batch()
-        self._active_batcher.rewards_by_hotkey = rewards
-        selection_meta = getattr(
-            self._active_batcher, "selection_metadata_by_id", {}
-        )
-        for sub in self._active_batcher.valid_submissions():
-            meta = selection_meta.get(id(sub), {})
-            selected = bool(meta.get("selected_for_batch", False))
-            rewarded = bool(meta.get("rewarded", False))
-            base_fields = {
-                "window_n": self._active_batcher.window_start,
-                "prompt_idx": sub.prompt_idx,
-                "hotkey": sub.hotkey,
-                "arrival_ts": sub.arrival_ts,
-                "decision_ts": sub.decision_ts,
-                "submitted_drand_round": sub.submitted_drand_round or sub.drand_round,
-                "arrival_drand_round": sub.arrival_drand_round,
-                "drand_delta": sub.drand_delta,
-                "seal_trigger_round": getattr(
-                    self._active_batcher, "_seal_trigger_round", None
-                ),
-                "prompt_hash_lead": sub.prompt_hash_lead,
-                "canonical_rank": meta.get("canonical_rank"),
-                "accepted_into_pool": True,
-                "selected_for_batch": selected,
-                "rewarded": rewarded,
-                "reward_amount": meta.get("reward_amount"),
-                "selection_reason": meta.get("selection_reason"),
-                "batch_filled_reason": (
-                    meta.get("selection_reason") if not selected else None
-                ),
-                "reject_stage": "none",
-                "reject_reason": "none",
-            }
-            log_structured(
-                logger,
-                logging.INFO,
-                "validator_submit_lifecycle",
-                {"stage": "final_batch_selected", **base_fields},
-            )
-            if rewarded:
+        # Seal all batchers and collect results.
+        per_env_targets = dict(self.env_mix)
+        sealed: dict[str, tuple] = {
+            name: b.seal_batch()
+            for name, b in self._active_batchers.items()
+        }
+        for name, (batch, rewards) in sealed.items():
+            self._active_batchers[name].rewards_by_hotkey = rewards
+
+        # Emit per-submission lifecycle telemetry for every env's accepted
+        # pool. Carried over from PR #40 (validator observability) and
+        # extended with env_name so downstream consumers can split by env.
+        for env_name, batcher in self._active_batchers.items():
+            selection_meta = getattr(batcher, "selection_metadata_by_id", {})
+            for sub in batcher.valid_submissions():
+                meta = selection_meta.get(id(sub), {})
+                selected = bool(meta.get("selected_for_batch", False))
+                rewarded = bool(meta.get("rewarded", False))
+                base_fields = {
+                    "window_n": batcher.window_start,
+                    "env_name": env_name,
+                    "prompt_idx": sub.prompt_idx,
+                    "hotkey": sub.hotkey,
+                    "arrival_ts": sub.arrival_ts,
+                    "decision_ts": sub.decision_ts,
+                    "submitted_drand_round": sub.submitted_drand_round or sub.drand_round,
+                    "arrival_drand_round": sub.arrival_drand_round,
+                    "drand_delta": sub.drand_delta,
+                    "seal_trigger_round": getattr(
+                        batcher, "_seal_trigger_round", None
+                    ),
+                    "prompt_hash_lead": sub.prompt_hash_lead,
+                    "canonical_rank": meta.get("canonical_rank"),
+                    "accepted_into_pool": True,
+                    "selected_for_batch": selected,
+                    "rewarded": rewarded,
+                    "reward_amount": meta.get("reward_amount"),
+                    "selection_reason": meta.get("selection_reason"),
+                    "batch_filled_reason": (
+                        meta.get("selection_reason") if not selected else None
+                    ),
+                    "reject_stage": "none",
+                    "reject_reason": "none",
+                }
                 log_structured(
                     logger,
                     logging.INFO,
                     "validator_submit_lifecycle",
-                    {"stage": "reward_assigned", **base_fields},
+                    {"stage": "final_batch_selected", **base_fields},
                 )
+                if rewarded:
+                    log_structured(
+                        logger,
+                        logging.INFO,
+                        "validator_submit_lifecycle",
+                        {"stage": "reward_assigned", **base_fields},
+                    )
+
+        # Merge rewards across envs for unified weight scoring.
+        all_rewards: dict[str, float] = {}
+        for _batch, rewards in sealed.values():
+            for hk, r in rewards.items():
+                all_rewards[hk] = all_rewards.get(hk, 0.0) + r
+
+        # Collect batches in env_mix order for grad-accumulation consistency.
+        batches = [sealed[name][0] for name, _ in self.env_mix if name in sealed]
+
+        # Only train when EVERY env has a full batch. A partial seal in any
+        # env means the gradient signal is incomplete; we skip and archive.
         # Note: miners earn slots regardless of training. Their contribution
         # is reflected in the next ``_submit_weights`` call, which replays
         # the EMA from R2 archives written by ``_archive_window`` below.
+        trained = all(
+            len(sealed[name][0]) >= per_env_targets[name]
+            for name in sealed
+        )
 
-        # Only train on a full batch. A partial seal (timeout) means miner
-        # population + cadence didn't produce enough groups to train on;
-        # stepping on a smaller-than-target batch gives a noisier gradient
-        # and a different effective LR than full-batch steps, so we skip.
-        # The miners who did submit are still credited via _update_ema.
-        trained = len(batch) >= B_BATCH
         # Env-controlled skip: ``RELIQUARY_DISABLE_TRAIN=1`` bypasses the
         # train_step call entirely. Useful when the validator is configured
         # in inference-only mode (e.g. a frozen policy phase) or when the
@@ -616,7 +739,7 @@ class ValidationService:
         elif trained:
             try:
                 self.train_model = train_step(
-                    self.train_model, batch,
+                    self.train_model, batches,
                     ref_model=self.verify_model,
                     window_index=self._window_n,
                 )
@@ -637,9 +760,11 @@ class ValidationService:
                 # successive windows and eventually starve verify_commitment.
                 _try_empty_cuda_cache()
         else:
+            total_subs = sum(len(b) for b in batches)
+            total_target = sum(per_env_targets.values())
             logger.info(
                 "Window %d sealed with %d/%d submissions — skipping train_step + publish",
-                self._window_n, len(batch), B_BATCH,
+                self._window_n, total_subs, total_target,
             )
 
         self._set_state(WindowState.PUBLISHING)
@@ -683,16 +808,49 @@ class ValidationService:
                 )
 
         try:
-            await self._archive_window(self._active_batcher, batch)
+            await self._archive_window(self._active_batchers, sealed)
         except Exception:
             logger.exception("window archive failed")
 
-        self.server.set_active_batcher(None)
-        self._active_batcher = None
+        self.server.set_active_batchers({})
+        self._active_batchers = {}
         self._set_state(WindowState.READY)
 
-    async def _archive_window(self, batcher, batch) -> None:
-        window_opened_at = getattr(batcher, "window_opened_at", None)
+    async def _archive_window(self, batchers, sealed) -> None:
+        """Assemble and enqueue the per-window archive payload.
+
+        ``batchers`` is either:
+          * a dict {env_name: GrpoWindowBatcher} (multi-env, called from
+            _train_and_publish), or
+          * a single GrpoWindowBatcher (legacy / test call sites).
+
+        ``sealed`` is either:
+          * a dict {env_name: (batch_list, rewards_dict)} matching the
+            multi-env form, or
+          * a plain list of ValidSubmission (legacy / test call sites).
+
+        Both forms produce a unified archive with ``"environments"`` (list
+        of active env names) and per-submission ``"env_name"`` fields.
+        Older consumers reading ``"environment"`` (singular) get the first
+        env name for backward compat.
+        """
+        # Normalise inputs to multi-env form.
+        if isinstance(batchers, dict):
+            # Multi-env path: batchers is {env_name: batcher}
+            batcher_dict: dict = batchers
+            sealed_dict: dict = sealed  # {env_name: (batch, rewards)}
+        else:
+            # Legacy single-env path: batchers is one batcher, sealed is a list.
+            single_batcher = batchers
+            single_batch = sealed
+            env_name_single = getattr(single_batcher, "env", None)
+            env_name_single = getattr(env_name_single, "name", self.env.name)
+            batcher_dict = {env_name_single: single_batcher}
+            sealed_dict = {env_name_single: (single_batch, {})}
+
+        # Use the first batcher for window-level fields (they're shared).
+        first_batcher = next(iter(batcher_dict.values()))
+        window_opened_at = getattr(first_batcher, "window_opened_at", None)
         eos_id = (
             getattr(self.tokenizer, "eos_token_id", None)
             if self.tokenizer is not None else None
@@ -703,9 +861,8 @@ class ValidationService:
                 return None
             return arrived_at - window_opened_at
 
-        selection_meta = getattr(batcher, "selection_metadata_by_id", {})
-
-        def _submission_obs_payload(s, *, rejected: bool = False):
+        def _submission_obs_payload(s, batcher, *, rejected: bool = False):
+            selection_meta = getattr(batcher, "selection_metadata_by_id", {})
             meta = selection_meta.get(id(s), {})
             return {
                 "arrival_ts": getattr(s, "arrival_ts", None),
@@ -764,73 +921,93 @@ class ValidationService:
                 out.append(entry)
             return out
 
-        batched_keys = {(s.hotkey, s.prompt_idx) for s in batch}
-
+        # Build the combined batch entries and runners_up from all envs.
         batch_entries = []
-        for s in batch:
-            problem = self.env.get_problem(s.prompt_idx)
-            batch_entries.append({
-                "hotkey": s.hotkey,
-                "prompt_idx": s.prompt_idx,
-                "sigma": s.sigma,
-                "prompt": problem.get("prompt", ""),
-                "ground_truth": problem.get("ground_truth", ""),
-                "rollouts": _rollout_payload(s, with_text=True),
-                "response_time": _resp_time(s.arrived_at),
-                "merkle_root": s.merkle_root_bytes.hex(),
-                "claimed_checkpoint_hash": s.claimed_checkpoint_hash,
-                "sketch_diff_max": s.sketch_diff_max,
-                "lp_dev_max": s.lp_dev_max,
-                "dist_q10_min": s.dist_q10_min,
-                **_submission_obs_payload(s),
-            })
-
-        # All validated submissions that didn't make the final batch — metadata
-        # only (no rollouts/text, no prompt) so miners can see their participation
-        # without ballooning the dataset size.
         runners_up = []
-        for s in batcher.valid_submissions():
-            key = (s.hotkey, s.prompt_idx)
-            if key in batched_keys:
-                continue
-            runners_up.append({
-                "hotkey": s.hotkey,
-                "prompt_idx": s.prompt_idx,
-                "sigma": s.sigma,
-                "response_time": _resp_time(s.arrived_at),
-                "merkle_root": s.merkle_root_bytes.hex(),
-                "sketch_diff_max": s.sketch_diff_max,
-                "lp_dev_max": s.lp_dev_max,
-                "dist_q10_min": s.dist_q10_min,
-                **_submission_obs_payload(s),
-            })
+        rejected_entries = []
+        combined_rewards: dict[str, float] = {}
+        combined_reject_counts: dict[str, int] = {}
 
-        rejected_entries = [
-            {
-                "hotkey": r.hotkey,
-                "prompt_idx": r.prompt_idx,
-                "reason": r.reason,
-                "sketch_diff_max": r.sketch_diff_max,
-                "lp_dev_max": r.lp_dev_max,
-                "dist_q10_min": r.dist_q10_min,
-                **_submission_obs_payload(r, rejected=True),
-            }
-            for r in getattr(batcher, "rejected_submissions", [])
-        ]
+        for env_name, batcher in batcher_dict.items():
+            env_obj = self.envs.get(env_name, self.env)
+            env_batch, env_rewards = sealed_dict.get(env_name, ([], {}))
 
+            batched_keys = {(s.hotkey, s.prompt_idx) for s in env_batch}
+
+            for s in env_batch:
+                problem = env_obj.get_problem(s.prompt_idx)
+                batch_entries.append({
+                    "hotkey": s.hotkey,
+                    "prompt_idx": s.prompt_idx,
+                    "env_name": env_name,
+                    "sigma": s.sigma,
+                    "prompt": problem.get("prompt", ""),
+                    "ground_truth": problem.get("ground_truth", ""),
+                    "rollouts": _rollout_payload(s, with_text=True),
+                    "response_time": _resp_time(s.arrived_at),
+                    "merkle_root": s.merkle_root_bytes.hex(),
+                    "claimed_checkpoint_hash": s.claimed_checkpoint_hash,
+                    "sketch_diff_max": s.sketch_diff_max,
+                    "lp_dev_max": s.lp_dev_max,
+                    "dist_q10_min": s.dist_q10_min,
+                    **_submission_obs_payload(s, batcher),
+                })
+
+            # All validated submissions that didn't make the final batch —
+            # metadata only (no rollouts/text, no prompt).
+            for s in batcher.valid_submissions():
+                key = (s.hotkey, s.prompt_idx)
+                if key in batched_keys:
+                    continue
+                runners_up.append({
+                    "hotkey": s.hotkey,
+                    "prompt_idx": s.prompt_idx,
+                    "env_name": env_name,
+                    "sigma": s.sigma,
+                    "response_time": _resp_time(s.arrived_at),
+                    "merkle_root": s.merkle_root_bytes.hex(),
+                    "sketch_diff_max": s.sketch_diff_max,
+                    "lp_dev_max": s.lp_dev_max,
+                    "dist_q10_min": s.dist_q10_min,
+                    **_submission_obs_payload(s, batcher),
+                })
+
+            for r in getattr(batcher, "rejected_submissions", []):
+                rejected_entries.append({
+                    "hotkey": r.hotkey,
+                    "prompt_idx": r.prompt_idx,
+                    "env_name": env_name,
+                    "reason": r.reason,
+                    "sketch_diff_max": r.sketch_diff_max,
+                    "lp_dev_max": r.lp_dev_max,
+                    "dist_q10_min": r.dist_q10_min,
+                    **_submission_obs_payload(r, batcher, rejected=True),
+                })
+
+            for hk, r in env_rewards.items():
+                combined_rewards[hk] = combined_rewards.get(hk, 0.0) + r
+
+            for k, v in dict(getattr(batcher, "reject_counts", {})).items():
+                combined_reject_counts[k] = combined_reject_counts.get(k, 0) + v
+
+        env_names_list = list(batcher_dict.keys())
+        # Backward-compat: keep "environment" (singular) pointing to the first
+        # env so older readers that pre-date multi-env don't silently break.
         archive = {
-            "window_start": batcher.window_start,
+            "window_start": first_batcher.window_start,
             "validator_hotkey": self.wallet.hotkey.ss58_address,  # provenance
-            "randomness": batcher.randomness,
-            "environment": self.env.name,
+            "randomness": first_batcher.randomness,
+            "environment": env_names_list[0],   # legacy singular, kept for compat
+            "environments": env_names_list,      # multi-env canonical field
             "batch": batch_entries,
             "runners_up": runners_up,
-            "reject_summary": dict(getattr(batcher, "reject_counts", {})),
+            "reject_summary": combined_reject_counts,
+            "grader_failures": dict(getattr(self, "_grader_failures", {})),
             "rejected": rejected_entries,
             # v2.3: per-hotkey emission share from select_batch_and_distribute.
             # All miners whose prompt landed in the winning set appear here,
             # even if their specific submission wasn't picked for training.
-            "rewards_by_hotkey": dict(getattr(batcher, "rewards_by_hotkey", {})),
+            "rewards_by_hotkey": combined_rewards,
             "late_drops": {
                 hk: dict(counts) for hk, counts in self._late_drops.items()
             },
@@ -846,7 +1023,7 @@ class ValidationService:
         # Main-loop window iteration is unblocked even if R2 is down for
         # hours, and queued payloads survive process restarts.
         from reliquary.infrastructure.archive_queue import get_archive_queue
-        get_archive_queue().enqueue(batcher.window_start, archive)
+        get_archive_queue().enqueue(first_batcher.window_start, archive)
 
     def _log_startup_config_banner(self) -> None:
         cp = self._checkpoint_store.current_manifest()
@@ -912,8 +1089,8 @@ class ValidationService:
         )
 
         logger.info(
-            "Validator started (v2.1): env=%s, netuid=%d, http=%s:%d",
-            self.env.name, self.netuid, self.server.host, self.server.port,
+            "Validator started (v2.1): envs=%s, netuid=%d, http=%s:%d",
+            list(self.envs.keys()), self.netuid, self.server.host, self.server.port,
         )
         # Build marker — uniquely identifies the deployed code version in
         # logs after an auto-deploy (watchtower). Bump on every commit
@@ -927,14 +1104,22 @@ class ValidationService:
                     await self._wait_for_next_drand_boundary()
                     await self._set_window_randomness(subtensor)
                     self._activate_window()
+                    # Wait for ALL active batchers to seal (each seals
+                    # independently when its env reaches B_BATCH valid
+                    # submissions). We wait on all concurrently and time out
+                    # if any one hasn't sealed within WINDOW_TIMEOUT_SECONDS.
                     try:
+                        seal_coros = [
+                            b.seal_event.wait()
+                            for b in self._active_batchers.values()
+                        ]
                         await asyncio.wait_for(
-                            self._active_batcher.seal_event.wait(),
+                            asyncio.gather(*seal_coros),
                             timeout=WINDOW_TIMEOUT_SECONDS,
                         )
                         logger.info(
-                            "Window %d sealed (B valid received)",
-                            self._window_n,
+                            "Window %d: all %d batcher(s) sealed",
+                            self._window_n, len(self._active_batchers),
                         )
                     except asyncio.TimeoutError:
                         logger.warning(
@@ -952,8 +1137,8 @@ class ValidationService:
                 except Exception:
                     logger.exception("Window iteration failed")
                     # Reset to READY so the next iteration doesn't spin on error state.
-                    self.server.set_active_batcher(None)
-                    self._active_batcher = None
+                    self.server.set_active_batchers({})
+                    self._active_batchers = {}
                     self._set_state(WindowState.READY)
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
         finally:
@@ -1123,8 +1308,8 @@ class ValidationService:
             )
 
     async def _rebuild_cooldown_from_history(self) -> None:
-        """At startup, reconstruct CooldownMap from the last
-        COOLDOWN_REBUILD_LOOKBACK archived windows on R2 (bounded cap; not BATCH_PROMPT_COOLDOWN_WINDOWS which is now astronomical for one-shot semantics).
+        """At startup, reconstruct per-env CooldownMaps from the last
+        COOLDOWN_REBUILD_LOOKBACK archived windows on R2.
 
         R2 is the durable source of truth — each window's sealed batch is
         uploaded by ``_archive_window``. Rebuilding from that history means:
@@ -1133,6 +1318,11 @@ class ValidationService:
             same R2 prefix converges to the same cooldown map
           * a fresh validator joining an active subnet picks up the
             current cooldown state without coordination
+
+        Backward-compat: archives created before multi-env support have no
+        per-entry ``env_name``. Those archives carry a top-level ``environment``
+        (singular) field that we use to assign all batch entries to that env.
+        Newer archives have ``"env_name"`` on each batch entry.
         """
         try:
             current_window = self._window_n
@@ -1140,14 +1330,17 @@ class ValidationService:
                 current_window=current_window + 1,
                 n=COOLDOWN_REBUILD_LOOKBACK,
             )
-            self._cooldown_map.rebuild_from_history(
-                archives, current_window=current_window,
-            )
+            # Build per-env filtered views of the archives for rebuild.
+            for env_name, cooldown_map in self._cooldown_per_env.items():
+                env_archives = _filter_archives_for_env(archives, env_name)
+                cooldown_map.rebuild_from_history(
+                    env_archives, current_window=current_window,
+                )
             logger.info(
-                "Rebuilt cooldown from %d/%d archive windows "
-                "(current=%d, map size=%d)",
-                len(archives), COOLDOWN_REBUILD_LOOKBACK,
-                current_window, len(self._cooldown_map),
+                "Rebuilt cooldown from %d archive windows (current=%d, "
+                "map sizes=%s)",
+                len(archives), current_window,
+                {n: len(m) for n, m in self._cooldown_per_env.items()},
             )
         except Exception:
             logger.exception(

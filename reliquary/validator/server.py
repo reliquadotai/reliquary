@@ -86,6 +86,11 @@ class ValidatorServer:
         self.port = port
         self._app_started_at = time.time()
         self._image_revision = runtime_revision()
+        # Multi-env: keyed by env_name. ``active_batcher`` (singular) is
+        # maintained as a legacy accessor pointing to the first active batcher
+        # so existing code paths (/health, /state, the submit worker stale
+        # check) keep working without change.
+        self._active_batchers: dict[str, GrpoWindowBatcher] = {}
         self.active_batcher: GrpoWindowBatcher | None = None
         self.app: FastAPI = self._build_app()
         self._server: uvicorn.Server | None = None
@@ -116,13 +121,28 @@ class ValidatorServer:
         self._verdicts: dict[str, collections.deque[dict]] = {}
         self._recent_reject_counts: collections.Counter[str] = collections.Counter()
 
-    def set_active_batcher(self, batcher: GrpoWindowBatcher | None) -> None:
-        # New batcher → new window → reset per-hotkey counters.
-        if batcher is not self.active_batcher:
+    def set_active_batchers(self, batchers: dict[str, GrpoWindowBatcher]) -> None:
+        """Register multi-env batchers and update the legacy scalar accessor.
+
+        ``batchers`` is {env_name: GrpoWindowBatcher}. An empty dict means
+        no window is active (between READY and the next OPEN).
+        """
+        changed = batchers is not self._active_batchers or set(batchers) != set(self._active_batchers)
+        if changed:
             self._per_window_counts = {}
             self._bad_envelope_counts = {}
             self._recent_reject_counts = collections.Counter()
-        self.active_batcher = batcher
+        self._active_batchers = batchers
+        # Legacy scalar: first batcher in dict (or None if empty).
+        self.active_batcher = next(iter(batchers.values())) if batchers else None
+
+    def set_active_batcher(self, batcher: GrpoWindowBatcher | None) -> None:
+        """Legacy single-env shim. Wraps into a dict and delegates."""
+        if batcher is None:
+            self.set_active_batchers({})
+        else:
+            env_name = getattr(getattr(batcher, "env", None), "name", "unknown")
+            self.set_active_batchers({env_name: batcher})
 
     def set_current_state(self, state) -> None:
         self._current_state = state
@@ -511,7 +531,17 @@ class ValidatorServer:
                     accepted=False, reason=RejectReason.WINDOW_NOT_ACTIVE,
                 )
 
-            batcher = self.active_batcher
+            # Route by env_name: determine which batcher to use.
+            # env_name is carried on each rollout; all rollouts in one request
+            # must be for the same env (enforced by the miner engine).
+            submission_env_name = (
+                request.rollouts[0].env_name if request.rollouts else ""
+            )
+            batcher = self._active_batchers.get(submission_env_name)
+            if batcher is None:
+                # Fallback: if env_name is absent or unknown, try the legacy
+                # active_batcher path (single-env backward compat).
+                batcher = self.active_batcher
             if batcher is None:
                 telemetry.mark_decision()
                 log_submission_stage(
@@ -863,7 +893,7 @@ class ValidatorServer:
             # queue is unbounded by design, so a busy window can pile up
             # dozens of pending items behind the in-flight GRAIL. As soon
             # as the service's main loop opens the next window and swaps
-            # ``active_batcher``, every leftover item is for a sealed
+            # the batchers dict, every leftover item is for a sealed
             # batcher whose ``_valid`` will never be re-archived — running
             # GRAIL on them would burn ~5-25s per item for nothing and
             # would keep the next window starving for cycles. We log at
@@ -871,7 +901,7 @@ class ValidatorServer:
             # miner has already received a provisional ``SUBMITTED`` from
             # the /submit response and learns the real outcome (or its
             # absence) from the R2 archive.
-            if batcher is not self.active_batcher:
+            if batcher not in self._active_batchers.values():
                 telemetry.refresh_from_batcher(batcher, at_decision=True)
                 telemetry.mark_decision()
                 logger.info(

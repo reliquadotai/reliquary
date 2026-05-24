@@ -57,7 +57,7 @@ def _make_commit(success: bool = False, total_reward: float = 0.0) -> dict:
     return {
         "tokens": tokens,
         "commitments": [{"sketch": 0} for _ in range(seq_len)],
-        "proof_version": "v5",
+        "proof_version": "v6",
         "model": {"name": "test-model", "layer_index": 6},
         "signature": "ab" * 32,
         "beacon": {"randomness": "cd" * 16},
@@ -120,6 +120,7 @@ def _request(
                 tokens=commit["tokens"],
                 reward=reward,
                 commit=commit,
+                env_name="openmathinstruct",
             )
         )
     merkle_root = "00" * 32

@@ -46,10 +46,11 @@ stake compromise.
 
 - No changes to the GRAIL primitive, verification pipeline, GRPO math,
   drand ordering, or window state machine.
-- No multi-env runtime selection. The active env is still chosen by a
-  single `ENVIRONMENT_NAME` constant. Mixing OMI + code in one prompt
-  pool is out of scope (would require touching `pick_prompt_idx`, the
-  cooldown map, and the batcher).
+- Multi-environment mixing **is now in scope** — see the "Phase 2:
+  multi-environment mixing" section below. The original v1 single-env
+  swap path remains available; v2 adds true side-by-side training on
+  both envs in the same optimizer step via two-batcher orchestration
+  and cross-batch gradient accumulation.
 - No support for languages other than Python. OpenCodeInstruct is
   Python-only, and the sandbox rootfs ships only a Python 3.11
   interpreter.
@@ -424,6 +425,122 @@ Switching active env is a coordinated network event.
   + restart grader; consider revert if the issue is structural.
 - **Grader process leak/leftover after rollback**: the grader server is
   harmless when nothing calls it. Can be stopped on a subsequent deploy.
+
+## Phase 2: multi-environment mixing
+
+The v1 design (sections above) is a swap-only model: at any point the
+network runs exactly one env, with the active choice flipped via a
+coordinated `ENVIRONMENT_NAME` change. Phase 2 lifts that constraint and
+trains on both envs **in the same optimizer step**, giving the policy
+mixed-gradient updates per window instead of alternating.
+
+### Goal
+
+Each optimizer step sees `B_BATCH` prompts per env, summed across all
+active envs. With two envs (OMI + OpenCodeInstruct), one window
+produces 16 prompts × 8 rollouts = 128 sequences contributing to a
+single optimizer step. VRAM stays at the v1 level because the micro-
+batches are processed sequentially with gradient accumulation between
+them.
+
+### Protocol change (soft hardfork)
+
+`RolloutSubmission` gains a required `env_name: str` field. The
+validator dispatches each submission to the correct env (for prompt
+lookup and reward verification) based on this tag. Bump
+`GRAIL_PROOF_VERSION` to signal incompatibility with v1 miners.
+
+### Constants change
+
+```python
+# In reliquary/constants.py:
+ENVIRONMENT_MIX: list[tuple[str, int]] = [
+    ("openmathinstruct",   B_BATCH),  # 8
+    ("opencodeinstruct",   B_BATCH),  # 8
+]
+GRAD_ACCUM_STEPS: int = len(ENVIRONMENT_MIX)  # 2 — derived, not separately tunable
+```
+
+The single `ENVIRONMENT_NAME` constant is **removed**. CLI default is
+the names from `ENVIRONMENT_MIX`. No backward-compat alias — the
+hardfork is the cleanup moment.
+
+### Batcher orchestration
+
+One `GrpoWindowBatcher` per active env (approach A). Each batcher
+maintains its own `CooldownMap` independently — cooldown key remains
+`prompt_idx` within an env (no need for env-keyed tuples since the
+batchers are physically separate). At seal time the service collects
+one batch per env and passes the list to `train_step`.
+
+If one env's batcher fails to reach `B_BATCH` accepted submissions by
+the seal deadline (underflow), that window does not train at all —
+matching the existing partial-seal skip behaviour. We do NOT fall back
+to "train on the env that did seal" because that would amplify the
+imbalance we are trying to avoid.
+
+### Training loop
+
+```python
+def train_step(model, batches: list[list], *, ref_model, window_index=None):
+    """One optimizer step over the union of batches.
+
+    `batches` is one batch per active env. All rollouts contribute
+    backward calls before a single optimizer.step() is invoked, so the
+    effective batch size is sum(len(b) for b in batches) prompts.
+    """
+    n_total_rollouts = sum(len(g.rollouts) for b in batches for g in b)
+    _optimizer.zero_grad()
+    for batch in batches:
+        for group in batch:
+            for rollout in group.rollouts:
+                loss = (ppo + KL_BETA * kl) / n_total_rollouts
+                loss.backward()
+    _optimizer.step()
+    _scheduler.step()
+```
+
+VRAM cost is unchanged from v1 because only one rollout's activations
+are alive at a time. Compute cost per optimizer step roughly doubles
+(twice as many backward calls), but per-window wall-clock is dominated
+by GRAIL verification (5–25 s) which is unaffected.
+
+### Miner side
+
+`pick_prompt_idx` first samples an env according to the mix's weights
+(equal weights for an 8-8 setup, but the data structure supports any
+ratio), then picks a prompt from that env. The submission carries
+`env_name` so the validator can verify against the right env without
+guessing.
+
+The miner loads **all envs** in `ENVIRONMENT_MIX` at startup. With OMI
+(2 shards ≈ 1 GB) + OpenCodeInstruct subset (~3 GB), HF cache sits at
+~4-5 GB — acceptable.
+
+### Archive shape
+
+```python
+archive["environments"] = [env.name for env in self.envs]  # NEW (was archive["environment"])
+archive["batch"] = batch_entries  # entries gain "env_name" tag per submission
+```
+
+### Migration plan adjustment
+
+Phase 1 in the main migration plan (land dormant code) covers v1. The
+Phase 2 hardfork (env_name in submissions + multi-batcher) is a
+**separate release** layered on top. Sequence:
+
+| Phase | What ships |
+|---|---|
+| 1 | v1 dormant code (this spec, sections above) |
+| 2 | Testnet canary: single-env `ENVIRONMENT_NAME="opencodeinstruct"` |
+| 3 | Mainnet flip to single OCI (validate the new env in production at 100 %) |
+| 4 | v2 hardfork: introduce `ENVIRONMENT_MIX`, `env_name` field, two-batcher, grad-accum train_step |
+| 5 | Post-flip monitoring; rollback path = revert constants + protocol version bump |
+
+Phases 1–3 cover the v1 plan; Phases 4–5 cover the v2 addendum. Each
+flip is independent; v2 can be deferred indefinitely without blocking
+v1's value.
 
 ## Open questions / future work
 

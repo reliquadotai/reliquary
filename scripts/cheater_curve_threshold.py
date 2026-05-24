@@ -235,6 +235,7 @@ def _build_training_batch_from_rollouts(
                         "token_logprobs": r["token_logprobs"],
                     }
                 },
+                env_name="openmathinstruct",
             )
             for r in g["rollouts"]
         ]

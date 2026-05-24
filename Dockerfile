@@ -48,6 +48,27 @@ RUN pip install boto3
 # No-op at runtime if WANDB_API_KEY is unset.
 RUN pip install wandb
 
+# ────────────────  GRADER SANDBOX  ────────────────
+# Install gVisor (runsc) for the OpenCodeInstruct env's sandbox.
+# Version-pinned to the latest release at writing time; bump cautiously.
+RUN ARCH="$(uname -m)" \
+ && RUNSC_URL="https://storage.googleapis.com/gvisor/releases/release/latest/${ARCH}/runsc" \
+ && wget -q "${RUNSC_URL}" -O /usr/local/bin/runsc \
+ && chmod +x /usr/local/bin/runsc
+
+# Build the grader OCI bundle (python:3.12-slim rootfs + worker.py).
+# Requires the Docker socket at build time — provided by docker buildx.
+# If unavailable, this step can be deferred to entrypoint.sh.
+COPY scripts/build_grader_bundle.sh /opt/build_grader_bundle.sh
+RUN chmod +x /opt/build_grader_bundle.sh \
+ && (BUNDLE_DIR=/opt/reliquary/reliquary/environment/grader/bundle \
+     WORKER_SRC=/opt/reliquary/reliquary/environment/grader/worker.py \
+     /opt/build_grader_bundle.sh || echo "WARN: bundle build deferred (no docker at build time)")
+
+# Create unprivileged users for runtime UID separation.
+RUN useradd -m -u 1000 reliquary \
+ && useradd -m -u 1001 reliquary-grader
+
 # Runtime
 ENV GRAIL_ATTN_IMPL=flash_attention_2
 COPY docker/entrypoint.sh /opt/entrypoint.sh

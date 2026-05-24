@@ -60,7 +60,7 @@ def _make_commit(
     return {
         "tokens": tokens,
         "commitments": [{"sketch": 0} for _ in range(seq_len)],
-        "proof_version": "v5",
+        "proof_version": "v6",
         "model": {"name": "test-model", "layer_index": 6},
         "signature": "ab" * 32,
         "beacon": {"randomness": "cd" * 16},
@@ -92,6 +92,7 @@ def _request(
                 tokens=commit["tokens"],
                 reward=r,
                 commit=commit,
+                env_name="openmathinstruct",
             )
         )
     return BatchSubmissionRequest(
@@ -241,6 +242,7 @@ def test_reject_reward_mismatch():
                 tokens=commit["tokens"],
                 reward=claimed_reward,
                 commit=commit,
+                env_name="openmathinstruct",
             )
         )
     req = BatchSubmissionRequest(
@@ -373,6 +375,7 @@ def _request_v21(prompt_idx=42, window_start=500,
             RolloutSubmission(
                 tokens=commit["tokens"], reward=r,
                 commit=commit,
+                env_name="openmathinstruct",
             )
         )
     return BatchSubmissionRequest(
@@ -508,6 +511,7 @@ def _request_with_prompt_tokens(
             RolloutSubmission(
                 tokens=full_tokens, reward=r,
                 commit=commit,
+                env_name="openmathinstruct",
             )
         )
     return BatchSubmissionRequest(
@@ -1230,6 +1234,7 @@ def test_hash_dup_intra_submission_collision_rejects():
             RolloutSubmission(
                 tokens=commit["tokens"], reward=(1.0 if i < 4 else 0.0),
                 commit=commit,
+                env_name="openmathinstruct",
             )
         )
     req = BatchSubmissionRequest(

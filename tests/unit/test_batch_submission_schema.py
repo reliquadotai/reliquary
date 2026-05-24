@@ -27,7 +27,7 @@ def _valid_rollouts(k: int = 4):
         commit = {
             "tokens": tokens,
             "commitments": [{"sketch": 0} for _ in range(seq_len)],
-            "proof_version": "v5",
+            "proof_version": "v6",
             "model": {"name": "test-model", "layer_index": 6},
             "signature": "ab" * 32,
             "beacon": {"randomness": "cd" * 16},
@@ -45,6 +45,7 @@ def _valid_rollouts(k: int = 4):
                 tokens=tokens,
                 reward=1.0 if i < k else 0.0,
                 commit=commit,
+                env_name="openmathinstruct",
             )
         )
     return rollouts

@@ -17,7 +17,7 @@ def _submission(hotkey="hkX", window_start=500) -> dict:
     commit = {
         "tokens": list(range(36)),
         "commitments": [{"sketch": 0} for _ in range(36)],
-        "proof_version": "v5",
+        "proof_version": "v6",
         "model": {"name": "test", "layer_index": 6},
         "signature": "ab" * 32,
         "beacon": {"randomness": "cd" * 16},
@@ -32,7 +32,7 @@ def _submission(hotkey="hkX", window_start=500) -> dict:
         "prompt_idx": 42,
         "window_start": window_start,
         "merkle_root": "00" * 32,
-        "rollouts": [{"tokens": list(range(36)), "reward": 1.0, "commit": commit}] * 8,
+        "rollouts": [{"tokens": list(range(36)), "reward": 1.0, "commit": commit, "env_name": "openmathinstruct"}] * 8,
         "checkpoint_hash": "sha256:test",
     }
 

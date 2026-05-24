@@ -86,7 +86,7 @@ def _submission(hotkey: str = "hkX", window_start: int = 500) -> dict:
     commit = {
         "tokens": list(range(36)),
         "commitments": [{"sketch": 0} for _ in range(36)],
-        "proof_version": "v5",
+        "proof_version": "v6",
         "model": {"name": "test", "layer_index": 6},
         "signature": "ab" * 32,
         "beacon": {"randomness": "cd" * 16},
@@ -101,7 +101,7 @@ def _submission(hotkey: str = "hkX", window_start: int = 500) -> dict:
         "prompt_idx": 42,
         "window_start": window_start,
         "merkle_root": "00" * 32,
-        "rollouts": [{"tokens": list(range(36)), "reward": 1.0, "commit": commit}] * 8,
+        "rollouts": [{"tokens": list(range(36)), "reward": 1.0, "commit": commit, "env_name": "openmathinstruct"}] * 8,
         "checkpoint_hash": "sha256:test",
     }
 
@@ -219,6 +219,7 @@ async def test_worker_drops_post_seal_items_without_grail():
                 "tokens": list(range(36)),
                 "rollout": {"prompt_length": 4, "completion_length": 32},
             },
+            env_name="openmathinstruct",
         ) for _ in range(8)
     ]
     req = BatchSubmissionRequest(
@@ -275,6 +276,7 @@ async def test_worker_processes_normally_when_not_sealed():
                 "tokens": list(range(36)),
                 "rollout": {"prompt_length": 4, "completion_length": 32},
             },
+            env_name="openmathinstruct",
         ) for _ in range(8)
     ]
     req = BatchSubmissionRequest(
@@ -326,6 +328,7 @@ async def test_worker_seal_check_after_batcher_swap_check():
                 "tokens": list(range(36)),
                 "rollout": {"prompt_length": 4, "completion_length": 32},
             },
+            env_name="openmathinstruct",
         ) for _ in range(8)
     ]
     req = BatchSubmissionRequest(
