@@ -3,6 +3,11 @@ name: Build and publish validator image
 on:
   push:
     branches: [main]
+    # Docs-only merges must not push a fresh :latest image: watchtower treats
+    # any new digest as deploy-worthy and restarts the live trainer.
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
   workflow_dispatch:
 
 # Serialize image builds + always let the newest commit win.
