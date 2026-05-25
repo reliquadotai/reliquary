@@ -46,6 +46,7 @@ from reliquary.validator.observability import (
 )
 from reliquary.validator.verifier import (
     evaluate_token_distribution,
+    binary_reward_mix_in_frontier,
     has_eos_padding,
     is_cap_truncation,
     is_in_zone,
@@ -557,9 +558,12 @@ class GrpoWindowBatcher:
             if not verify_reward_claim(self.env, problem, text, rollout.reward):
                 return reject(RejectReason.REWARD_MISMATCH, "reward")
 
-        sigma = rewards_std([r.reward for r in request.rollouts])
+        rewards = [float(r.reward) for r in request.rollouts]
+        sigma = rewards_std(rewards)
         if not is_in_zone(sigma, bootstrap=self.bootstrap):
             return reject(RejectReason.OUT_OF_ZONE, "zone")
+        if not self.bootstrap and not binary_reward_mix_in_frontier(rewards):
+            return reject(RejectReason.REWARD_DISTRIBUTION, "reward_distribution")
 
         # Per-submission worst-case filter telemetry (across all rollouts).
         sketch_diff_max = 0

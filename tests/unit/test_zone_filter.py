@@ -2,7 +2,12 @@
 
 import math
 
-from reliquary.validator.verifier import is_in_zone, rewards_std
+from reliquary.validator.verifier import (
+    binary_reward_correct_count,
+    binary_reward_mix_in_frontier,
+    is_in_zone,
+    rewards_std,
+)
 
 
 def test_sigma_zero_rejected():
@@ -63,3 +68,23 @@ def test_rewards_std_continuous():
     variance = sum((r - mean) ** 2 for r in rewards) / len(rewards)
     expected = math.sqrt(variance)
     assert abs(rewards_std(rewards) - expected) < 1e-9
+
+
+def test_binary_reward_correct_count():
+    assert binary_reward_correct_count([0, 1, 1, 0, 1]) == 3
+    assert binary_reward_correct_count([0.0, 1.0, 0.5]) is None
+
+
+def test_binary_reward_mix_rejects_edge_groups():
+    assert binary_reward_mix_in_frontier([1.0] * 6 + [0.0] * 2) is False
+    assert binary_reward_mix_in_frontier([1.0] * 2 + [0.0] * 6) is False
+
+
+def test_binary_reward_mix_accepts_middle_frontier():
+    assert binary_reward_mix_in_frontier([1.0] * 3 + [0.0] * 5) is True
+    assert binary_reward_mix_in_frontier([1.0] * 4 + [0.0] * 4) is True
+    assert binary_reward_mix_in_frontier([1.0] * 5 + [0.0] * 3) is True
+
+
+def test_binary_reward_mix_leaves_continuous_rewards_to_sigma_gate():
+    assert binary_reward_mix_in_frontier([0.2, 0.4, 0.6, 0.8]) is True

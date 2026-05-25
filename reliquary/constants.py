@@ -173,6 +173,17 @@ DATASET_SPLIT = "train"
 SIGMA_MIN = 0.43
 BOOTSTRAP_SIGMA_MIN = 0.33    # matches old k ∈ [1, 7]
 
+# Binary-reward frontier band for OpenMathInstruct GRPO groups.
+#
+# SIGMA_MIN alone admits k=2 and k=6 for M=8 because both have
+# σ=sqrt((2/8)(6/8))≈0.433. In production this became a reward-oracle
+# selection target: miners can locally compute rewards, select mostly-correct
+# groups, and train the network on parser-shaped negatives while barely
+# clearing the sigma floor. Keep steady-state binary groups in the middle
+# frontier instead. Bootstrap remains governed by BOOTSTRAP_SIGMA_MIN only.
+BINARY_REWARD_MIN_CORRECT = 3
+BINARY_REWARD_MAX_CORRECT = 5
+
 # Number of rollouts per submission (= size of each GRPO group).
 M_ROLLOUTS = 8
 

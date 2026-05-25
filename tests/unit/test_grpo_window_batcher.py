@@ -185,6 +185,39 @@ def test_reject_out_of_zone_all_pass():
     assert resp.reason == RejectReason.OUT_OF_ZONE
 
 
+def test_reject_binary_edge_high_correct_reward_distribution():
+    b = _make_batcher()
+    req = _request(rewards=[1.0] * 6 + [0.0] * 2)
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.REWARD_DISTRIBUTION
+
+
+def test_reject_binary_edge_low_correct_reward_distribution():
+    b = _make_batcher()
+    req = _request(rewards=[1.0] * 2 + [0.0] * 6)
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.REWARD_DISTRIBUTION
+
+
+@pytest.mark.parametrize("k", [3, 4, 5])
+def test_accept_binary_middle_frontier_reward_distribution(k):
+    b = _make_batcher()
+    req = _request(rewards=[1.0] * k + [0.0] * (M_ROLLOUTS - k))
+    resp = b.accept_submission(req)
+    assert resp.accepted is True
+    assert resp.reason == RejectReason.ACCEPTED
+
+
+def test_bootstrap_keeps_legacy_binary_edge_band():
+    b = _make_batcher(bootstrap=True)
+    req = _request(rewards=[1.0] * 6 + [0.0] * 2)
+    resp = b.accept_submission(req)
+    assert resp.accepted is True
+    assert resp.reason == RejectReason.ACCEPTED
+
+
 def test_reject_grail_fail():
     b = _make_batcher(verify_commitment_proofs_fn=_always_false_grail)
     req = _request()

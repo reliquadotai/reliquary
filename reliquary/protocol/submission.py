@@ -57,6 +57,7 @@ class RejectReason(str, Enum):
     HASH_DUPLICATE = "hash_duplicate"
     LOGPROB_MISMATCH = "logprob_mismatch"
     REWARD_MISMATCH = "reward_mismatch"
+    REWARD_DISTRIBUTION = "reward_distribution"
     OUT_OF_ZONE = "out_of_zone"
     RATE_LIMITED = "rate_limited"
     BATCH_FILLED = "batch_filled"

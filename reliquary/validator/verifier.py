@@ -478,6 +478,50 @@ def rewards_std(rewards: list[float]) -> float:
     return variance ** 0.5
 
 
+def binary_reward_correct_count(
+    rewards: list[float],
+    *,
+    tolerance: float = 1e-6,
+) -> int | None:
+    """Return k for binary {0,1} reward groups, else None.
+
+    OpenMathInstruct rewards are binary today. Keeping this as a helper lets
+    the validator apply a stricter middle-frontier gate only when the reward
+    shape is actually binary, while leaving future continuous-reward
+    environments on the sigma filter alone.
+    """
+    correct = 0
+    for reward in rewards:
+        value = float(reward)
+        if abs(value - 1.0) <= tolerance:
+            correct += 1
+        elif abs(value) <= tolerance:
+            continue
+        else:
+            return None
+    return correct
+
+
+def binary_reward_mix_in_frontier(rewards: list[float]) -> bool:
+    """True if a binary reward group is inside the middle frontier band.
+
+    For M=8, SIGMA_MIN=0.43 admits k=2 and k=6 edge groups. Those groups are
+    exploitable by local reward-oracle selection and produce imbalanced GRPO
+    labels. This helper keeps binary groups in the steadier k=3..5 band.
+
+    Non-binary groups return True here and remain governed by the sigma gate.
+    """
+    from reliquary.constants import (
+        BINARY_REWARD_MAX_CORRECT,
+        BINARY_REWARD_MIN_CORRECT,
+    )
+
+    correct = binary_reward_correct_count(rewards)
+    if correct is None:
+        return True
+    return BINARY_REWARD_MIN_CORRECT <= correct <= BINARY_REWARD_MAX_CORRECT
+
+
 def is_in_zone(sigma: float, *, bootstrap: bool = False) -> bool:
     """True iff *sigma* exceeds the minimum threshold for training signal.
 
