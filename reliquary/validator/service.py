@@ -44,6 +44,7 @@ from reliquary.validator.checkpoint import CheckpointStore
 from reliquary.validator.cooldown import CooldownMap
 from reliquary.validator.dedup import RolloutHashSet
 from reliquary.validator.observability import log_structured, runtime_revision
+from reliquary.validator.quarantine import assess_training_batch
 from reliquary.validator.server import ValidatorServer
 from reliquary.validator.training import train_step
 
@@ -600,6 +601,17 @@ class ValidationService:
         # and a different effective LR than full-batch steps, so we skip.
         # The miners who did submit are still credited via _update_ema.
         trained = len(batch) >= B_BATCH
+        quarantine = assess_training_batch(
+            batch,
+            reject_counts=getattr(self._active_batcher, "reject_counts", {}),
+        )
+        self._active_batcher.training_quarantine = quarantine.to_archive()
+        if trained and quarantine.quarantined:
+            logger.warning(
+                "Window %d quarantined from training: reasons=%s metrics=%s",
+                self._window_n, quarantine.reasons, quarantine.metrics,
+            )
+            trained = False
         # Env-controlled skip: ``RELIQUARY_DISABLE_TRAIN=1`` bypasses the
         # train_step call entirely. Useful when the validator is configured
         # in inference-only mode (e.g. a frozen policy phase) or when the
@@ -827,6 +839,11 @@ class ValidationService:
             "runners_up": runners_up,
             "reject_summary": dict(getattr(batcher, "reject_counts", {})),
             "rejected": rejected_entries,
+            "training_quarantine": getattr(
+                batcher,
+                "training_quarantine",
+                {"quarantined": False, "reasons": [], "metrics": {}},
+            ),
             # v2.3: per-hotkey emission share from select_batch_and_distribute.
             # All miners whose prompt landed in the winning set appear here,
             # even if their specific submission wasn't picked for training.

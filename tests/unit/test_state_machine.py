@@ -47,6 +47,7 @@ def test_service_initial_state_is_ready():
 def test_open_window_sets_state_to_open():
     svc = _make_service()
     svc._open_window()
+    svc._activate_window()
     assert svc._current_window_state == WindowState.OPEN
     assert svc._active_batcher is not None
 
@@ -263,5 +264,4 @@ async def test_resume_from_load_failure_aborts():
         )
         with pytest.raises(RuntimeError, match="corrupt checkpoint"):
             await svc._apply_resume_from()
-
 

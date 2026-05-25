@@ -92,6 +92,18 @@ MAX_NEW_TOKENS_PROTOCOL_CAP = 8192
 MAX_TRUNCATED_PER_SUBMISSION = 0
 BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION = 1
 
+# Training quarantine policy. Quarantine is intentionally conservative: it
+# skips train_step for windows whose selected batch has high-confidence poison
+# signatures, while still archiving the window so emissions/forensics remain
+# visible.
+TRAINING_QUARANTINE_ENABLED = True
+TRAINING_QUARANTINE_MAX_HOTKEY_SHARE = 0.75
+TRAINING_QUARANTINE_MAX_REWARD_VECTOR_SHARE = 0.75
+TRAINING_QUARANTINE_REWARD_VECTOR_MIN_GROUPS = 4
+TRAINING_QUARANTINE_MAX_MEAN_COMPLETION_LENGTH = 4096
+TRAINING_QUARANTINE_MAX_SINGLE_COMPLETION_LENGTH = 7000
+TRAINING_QUARANTINE_REJECT_SPIKE_MIN = 32
+
 # Soft cap on per-hotkey entries persisted to ``archive["rejected"]`` per
 # window. Beyond this, ``reject_counts`` still increments but no metadata is
 # appended — protects the R2 payload size against a flood of garbage
