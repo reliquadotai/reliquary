@@ -275,7 +275,12 @@ class MiningEngine:
                     await asyncio.sleep(5)
                     continue
 
-                problem = self.env.get_problem(prompt_idx)
+                get_public_problem = getattr(self.env, "get_public_problem", None)
+                problem = (
+                    get_public_problem(prompt_idx)
+                    if callable(get_public_problem)
+                    else self.env.get_problem(prompt_idx)
+                )
                 generations = self._generate_m_rollouts(problem, randomness)
                 if len(generations) < M_ROLLOUTS:
                     logger.warning(
@@ -462,17 +467,14 @@ class MiningEngine:
         return rollouts
 
     def _build_rollout_submission(self, generation, problem, randomness):
-        """Build a RolloutSubmission: completion + claimed reward + GRAIL commit."""
+        """Build a RolloutSubmission with validator-authoritative reward."""
         all_tokens = generation["tokens"]
         prompt_length = generation["prompt_length"]
-        completion_tokens = all_tokens[prompt_length:]
-        completion_text = self.tokenizer.decode(completion_tokens)
-        reward = self.env.compute_reward(problem, completion_text)
 
         commit = self._build_grail_commit(generation, randomness)
         return RolloutSubmission(
             tokens=all_tokens,
-            reward=reward,
+            reward=0.0,
             commit=commit,
         )
 

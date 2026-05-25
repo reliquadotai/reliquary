@@ -184,5 +184,13 @@ class OpenMathInstructEnvironment:
             "id": problem_id,
         }
 
+    def get_public_problem(self, index: int) -> dict:
+        """Return the miner-facing problem view without answer labels."""
+        problem = self.get_problem(index)
+        return {
+            "prompt": problem["prompt"],
+            "id": problem["id"],
+        }
+
     def compute_reward(self, problem: dict, completion: str) -> float:
         return _compute_omi_reward(problem, completion)

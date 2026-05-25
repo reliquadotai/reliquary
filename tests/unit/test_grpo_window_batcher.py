@@ -237,20 +237,20 @@ def test_reject_grail_fail():
     assert resp.reason == RejectReason.GRAIL_FAIL
 
 
-def test_reject_reward_mismatch():
-    # Override completion_text_fn to always return "wrong", creating a reward mismatch
-    # when claim is 1.0
-    b = _make_batcher(completion_text_fn=lambda rollout: "wrong")
+def test_validator_overwrites_claimed_rewards():
+    b = _make_batcher(
+        completion_text_fn=lambda rollout: (
+            "CORRECT" if rollout.commit["rollout"]["success"] else "wrong"
+        )
+    )
     rollouts = []
     for i in range(M_ROLLOUTS):
-        commit = _make_commit(success=False, total_reward=0.0)
-        # Claim high reward for first 4, but completion_text_fn will return "wrong"
-        # which computes to 0.0 reward, triggering REWARD_MISMATCH
-        claimed_reward = 1.0 if i < 4 else 0.0
+        expected_correct = i < 4
+        commit = _make_commit(success=expected_correct, total_reward=0.0)
         rollouts.append(
             RolloutSubmission(
                 tokens=commit["tokens"],
-                reward=claimed_reward,
+                reward=0.0,
                 commit=commit,
             )
         )
@@ -263,8 +263,10 @@ def test_reject_reward_mismatch():
         checkpoint_hash="sha256:test",
     )
     resp = b.accept_submission(req)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.REWARD_MISMATCH
+    assert resp.accepted is True
+    assert resp.reason == RejectReason.ACCEPTED
+    accepted = b.valid_submissions()[0]
+    assert [r.reward for r in accepted.rollouts] == [1.0] * 4 + [0.0] * 4
 
 
 def test_reject_outer_inner_token_split_even_if_constructed():

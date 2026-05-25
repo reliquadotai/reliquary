@@ -127,8 +127,9 @@ async def test_archive_includes_prompt_and_rollout_content():
     import math
     entry0 = archive["batch"][0]
     assert entry0["prompt_idx"] == 7
+    assert entry0["prompt_id"] == "p7"
     assert entry0["prompt"] == "question 7"
-    assert entry0["ground_truth"] == "answer 7"
+    assert "ground_truth" not in entry0
     expected_sigma = math.sqrt((4 / 8) * (1 - 4 / 8))  # Bernoulli(p=0.5) → 0.5
     assert abs(entry0["sigma"] - expected_sigma) < 1e-9
     assert len(entry0["rollouts"]) == 8

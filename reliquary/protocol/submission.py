@@ -85,12 +85,15 @@ class WindowState(str, Enum):
 
 
 class RolloutSubmission(BaseModel):
-    """A single rollout's payload: tokens, miner-claimed reward, GRAIL commit."""
+    """A single rollout's payload: tokens, reward placeholder, GRAIL commit."""
 
     model_config = ConfigDict(extra="forbid")
 
     tokens: list[int] = Field(..., min_length=1)
-    reward: float  # miner's local env.compute_reward value; validator re-checks
+    # Back-compat placeholder. The validator is the reward authority and
+    # overwrites this value with its own env.compute_reward result before
+    # sigma, archive, or training use it.
+    reward: float = 0.0
     commit: dict[str, Any]
 
     @model_validator(mode="after")
