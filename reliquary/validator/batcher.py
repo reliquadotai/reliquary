@@ -46,6 +46,7 @@ from reliquary.validator.observability import (
 )
 from reliquary.validator.verifier import (
     evaluate_token_distribution,
+    has_eos_padding,
     is_cap_truncation,
     is_in_zone,
     rewards_std,
@@ -639,10 +640,19 @@ class GrpoWindowBatcher:
             # or hit the protocol cap. Cap hits without a natural EOS are counted
             # against the per-submission truncation budget; otherwise forced
             # max-length sampling can make every rollout bypass EOS validation.
+            # Reject EOS padding outright: honest miners truncate at the first
+            # EOS, and repeated stop-token tails are high-probability junk that
+            # can pass logprob/distribution while poisoning training.
             # Reads precomputed p_stop on ``proof`` — no logits round-trip.
             # Skipped when the stub didn't populate sparse outputs (legacy
             # test fixtures that opted out of behavioural enforcement).
             if proof.has_sparse_outputs:
+                if has_eos_padding(rollout.commit, self.tokenizer, self.model):
+                    return reject(
+                        RejectReason.BAD_TERMINATION,
+                        "termination",
+                        sketch_diff_max=sketch_diff_max,
+                    )
                 termination_ok = verify_termination(
                     rollout.commit, self.tokenizer, proof, self.model
                 )

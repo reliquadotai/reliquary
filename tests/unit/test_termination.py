@@ -18,6 +18,7 @@ import torch
 from reliquary.constants import MIN_EOS_PROBABILITY
 from reliquary.validator.verifier import (
     ProofResult,
+    has_eos_padding,
     is_cap_truncation,
     verify_termination,
 )
@@ -175,6 +176,27 @@ def test_cap_hit_with_natural_eos_is_not_truncation():
 
     assert verify_termination(commit, _FakeTokenizer(), proof) is True
     assert is_cap_truncation(commit, _FakeTokenizer(), proof) is False
+
+
+def test_single_terminal_eos_is_not_padding():
+    tokens = [10, 11, 12, 99]
+    commit = _commit_with_lengths(tokens, prompt_length=1, completion_length=3)
+
+    assert has_eos_padding(commit, _FakeTokenizer()) is False
+
+
+def test_repeated_eos_tokens_are_padding():
+    tokens = [10, 11, 99, 99]
+    commit = _commit_with_lengths(tokens, prompt_length=1, completion_length=3)
+
+    assert has_eos_padding(commit, _FakeTokenizer()) is True
+
+
+def test_tokens_after_eos_are_padding():
+    tokens = [10, 11, 99, 12]
+    commit = _commit_with_lengths(tokens, prompt_length=1, completion_length=3)
+
+    assert has_eos_padding(commit, _FakeTokenizer()) is True
 
 
 def test_path1_accepts_when_completion_alone_meets_cap():

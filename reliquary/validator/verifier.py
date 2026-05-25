@@ -205,6 +205,36 @@ def is_cap_truncation(
     )
 
 
+def has_eos_padding(
+    commit: dict,
+    tokenizer: Any,
+    model: Any = None,
+) -> bool:
+    """Return True when completion tokens continue after an EOS token.
+
+    Honest generation should stop at the first EOS; the reference miner also
+    truncates there before building the proof. Keeping extra EOS tokens (or any
+    tokens after EOS) manufactures long, high-probability tails that satisfy
+    the logprob/distribution checks while poisoning training with stop-token
+    padding.
+    """
+    eos_set = _eos_set_from_model(model, tokenizer)
+    if not eos_set:
+        return False
+
+    tokens = list(commit.get("tokens") or [])
+    rollout_meta = commit.get("rollout", {}) or {}
+    prompt_length = int(rollout_meta.get("prompt_length", 0))
+    completion_length = int(rollout_meta.get("completion_length", 0))
+    completion = tokens[prompt_length: prompt_length + completion_length]
+    eos_positions = [
+        idx for idx, token in enumerate(completion) if int(token) in eos_set
+    ]
+    if not eos_positions:
+        return False
+    return len(eos_positions) > 1 or eos_positions[0] != len(completion) - 1
+
+
 def verify_commitment_proofs(
     commit: dict,
     model: Any,

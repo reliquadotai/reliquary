@@ -1019,6 +1019,28 @@ def test_reject_repeated_cap_path_truncations():
     assert resp.reason == RejectReason.BAD_TERMINATION
 
 
+def test_reject_eos_padding_after_natural_stop():
+    seq_len = CHALLENGE_K + 4
+    b = _make_batcher(
+        model=_ModelStubWithVocab(),
+        verify_commitment_proofs_fn=_grail_with_logits(seq_len),
+    )
+    req = _request()
+
+    tokens = list(range(seq_len - 2)) + [99, 99]
+    commit = _make_commit(
+        tokens=tokens,
+        success=req.rollouts[0].reward > 0.5,
+        total_reward=req.rollouts[0].reward,
+    )
+    req.rollouts[0].commit = commit
+    req.rollouts[0].tokens = commit["tokens"]
+
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BAD_TERMINATION
+
+
 def test_termination_skipped_when_grail_returns_empty_logits():
     """Backward-compat: when the GRAIL stub returns empty logits, the
     termination check is skipped. The default ``_always_true_grail`` does
