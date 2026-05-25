@@ -72,6 +72,7 @@ def test_rollout_rejects_mismatched_outer_and_commit_tokens():
             tokens=bad.tokens[:-1] + [999],
             reward=bad.reward,
             commit=bad.commit,
+            env_name=bad.env_name,
         )
 
 

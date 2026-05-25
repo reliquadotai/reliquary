@@ -843,8 +843,13 @@ class ValidationService:
             # Legacy single-env path: batchers is one batcher, sealed is a list.
             single_batcher = batchers
             single_batch = sealed
-            env_name_single = getattr(single_batcher, "env", None)
-            env_name_single = getattr(env_name_single, "name", self.env.name)
+            # Pull env.name off the batcher if it's a real string; fall back
+            # to self.env.name otherwise. MagicMock-shaped attrs in tests
+            # auto-generate truthy children for any access, so a plain
+            # getattr fallback would never fire — explicit isinstance check.
+            env_obj = getattr(single_batcher, "env", None)
+            candidate = getattr(env_obj, "name", None) if env_obj is not None else None
+            env_name_single = candidate if isinstance(candidate, str) else self.env.name
             batcher_dict = {env_name_single: single_batcher}
             sealed_dict = {env_name_single: (single_batch, {})}
 
