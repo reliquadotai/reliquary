@@ -361,10 +361,10 @@ class ValidatorServer:
             # because the binding includes the validator's per-window
             # randomness.
             #
-            # The counter is touched ONLY after the signature is proven
-            # valid, so a flood of garbage signatures costs O(1) ed25519
-            # verifications per request but does not move any victim's
-            # quota.
+            # The counter is touched ONLY after the signature is proven valid
+            # AND after the request targets the active window, so a flood of
+            # garbage signatures or stale-window replays cannot move any
+            # victim's current-window quota.
             if ENFORCE_ENVELOPE_SIGNATURE:
                 # We need the validator's window randomness to verify the
                 # binding. Read it from the active batcher if present;
@@ -455,35 +455,6 @@ class ValidatorServer:
                         reason=RejectReason.BAD_ENVELOPE_SIGNATURE,
                     )
 
-            # Rate limit AFTER signature verification — the signer is now
-            # cryptographically bound to ``hk``, so this counter cannot
-            # be moved by anyone other than the keypair holder.
-            n = self._per_window_counts.get(hk, 0)
-            if n >= MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW:
-                if self._late_drop_callback is not None:
-                    self._late_drop_callback(hk, "rate_limited")
-                telemetry.mark_decision()
-                self.record_verdict(
-                    hk, request.merkle_root, False, RejectReason.RATE_LIMITED,
-                    window_n=request.window_start,
-                    telemetry=telemetry,
-                    reject_stage="rate_limit",
-                    accepted_into_pool=False,
-                )
-                log_submission_stage(
-                    logger,
-                    logging.WARNING,
-                    "candidate_rejected",
-                    telemetry,
-                    reject_stage="rate_limit",
-                    reject_reason=RejectReason.RATE_LIMITED.value,
-                    accepted_into_pool=False,
-                )
-                return BatchSubmissionResponse(
-                    accepted=False, reason=RejectReason.RATE_LIMITED,
-                )
-            self._per_window_counts[hk] = n + 1
-
             # v2.1: reject if state != OPEN
             if self._current_state != WindowState.OPEN:
                 if self._late_drop_callback is not None:
@@ -537,6 +508,37 @@ class ValidatorServer:
                     accepted_into_pool=False,
                 )
                 raise HTTPException(status_code=409, detail="window_mismatch")
+
+            # Rate limit AFTER signature verification and active-window
+            # binding. A signed stale-window replay or a miner still catching
+            # up after restart must not burn the hotkey's quota for the new
+            # window. Once the request is known to target this live window,
+            # count it before cheap rejects/GRAIL so spam still self-throttles.
+            n = self._per_window_counts.get(hk, 0)
+            if n >= MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW:
+                if self._late_drop_callback is not None:
+                    self._late_drop_callback(hk, "rate_limited")
+                telemetry.mark_decision()
+                self.record_verdict(
+                    hk, request.merkle_root, False, RejectReason.RATE_LIMITED,
+                    window_n=request.window_start,
+                    telemetry=telemetry,
+                    reject_stage="rate_limit",
+                    accepted_into_pool=False,
+                )
+                log_submission_stage(
+                    logger,
+                    logging.WARNING,
+                    "candidate_rejected",
+                    telemetry,
+                    reject_stage="rate_limit",
+                    reject_reason=RejectReason.RATE_LIMITED.value,
+                    accepted_into_pool=False,
+                )
+                return BatchSubmissionResponse(
+                    accepted=False, reason=RejectReason.RATE_LIMITED,
+                )
+            self._per_window_counts[hk] = n + 1
 
             # Early-cutoff: once the batcher has sealed (B_BATCH distinct
             # non-cooldown valid submissions received), ``select_batch``
