@@ -68,6 +68,7 @@ class RejectReason(str, Enum):
     BAD_TOKENS = "bad_tokens"
     TOKENS_MISMATCH = "tokens_mismatch"
     BAD_TERMINATION = "bad_termination"
+    BOXED_ANSWER_TAMPERED = "boxed_answer_tampered"
     WRONG_CHECKPOINT = "wrong_checkpoint"
     WRONG_RANDOMNESS = "wrong_randomness"
     WORKER_DROPPED = "worker_dropped"

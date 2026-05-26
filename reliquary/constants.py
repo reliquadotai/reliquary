@@ -86,11 +86,11 @@ UPLOAD_BUFFER = NETWORK_UPLOAD_LATENCY
 # Network-wide protocol cap on completion length.
 MAX_NEW_TOKENS_PROTOCOL_CAP = 8192
 
-# Cap/non-EOS truncation policy. Steady-state training should not ingest
-# truncated completions; bootstrap keeps the previous one-rollout allowance so
-# the network can still fill early windows while the model is weak.
-MAX_TRUNCATED_PER_SUBMISSION = 0
-BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION = 1
+# Cap/non-EOS truncation budget per submission. Sized to the model's natural
+# cap-hit rate (~40% per rollout on Qwen3-4B-Instruct), not to the cap-path
+# exploit pattern — that's caught by all-8 / sigma fingerprinting elsewhere.
+MAX_TRUNCATED_PER_SUBMISSION = 5
+BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION = 5
 
 # Training quarantine policy. Quarantine is intentionally conservative: it
 # skips train_step for windows whose selected batch has high-confidence poison
@@ -183,24 +183,12 @@ DATASET_SPLIT = "train"
 
 # ────────────────  GRPO MARKET (v2)  ────────────────
 
-# Minimum reward-std for a group to pass the zone filter.
-# For binary Bernoulli rewards this is equivalent to the old
-# k ∈ [2, 6] gate (σ of Bernoulli(p=2/8) ≈ 0.433). For continuous
-# rewards it filters groups whose rollouts clustered too tight to
-# carry meaningful GRPO signal.
+# Minimum reward-std for a group to pass the zone filter. For binary
+# Bernoulli rewards this admits k ∈ [2, 6] for M=8 (σ at k=2/6 ≈ 0.433).
+# For continuous rewards it filters groups whose rollouts clustered too
+# tight to carry meaningful GRPO signal.
 SIGMA_MIN = 0.43
-BOOTSTRAP_SIGMA_MIN = 0.33    # matches old k ∈ [1, 7]
-
-# Binary-reward frontier band for OpenMathInstruct GRPO groups.
-#
-# SIGMA_MIN alone admits k=2 and k=6 for M=8 because both have
-# σ=sqrt((2/8)(6/8))≈0.433. In production this became a reward-oracle
-# selection target: miners can locally compute rewards, select mostly-correct
-# groups, and train the network on parser-shaped negatives while barely
-# clearing the sigma floor. Keep steady-state binary groups in the middle
-# frontier instead. Bootstrap remains governed by BOOTSTRAP_SIGMA_MIN only.
-BINARY_REWARD_MIN_CORRECT = 3
-BINARY_REWARD_MAX_CORRECT = 5
+BOOTSTRAP_SIGMA_MIN = 0.33
 
 # Number of rollouts per submission (= size of each GRPO group).
 M_ROLLOUTS = 8
@@ -461,3 +449,9 @@ SAMPLING_LOW_P = 0.10           # prob <= this → "low" chosen token
 SAMPLING_HIGH_P = 0.90           # prob >= this → "high" chosen token
 SAMPLING_MEDIAN_LOW_MAX = 0.30  # median chosen prob must be above
 SAMPLING_LOW_Q10_MAX = 0.025    # 10th-percentile must be above
+
+# OpenMath final-answer tamper guard. The reward parser keys off the last
+# \boxed{...} content; swapping a few tokens there flips the reward without
+# moving median/q10. Honest sampling at T_PROTO leaves these tokens at high
+# probability — anything below this threshold flags as tampering.
+BOXED_ANSWER_MIN_PROB = 0.5

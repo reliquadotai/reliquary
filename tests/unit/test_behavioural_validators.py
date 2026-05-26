@@ -344,3 +344,137 @@ def test_verify_termination_missing_p_stop_fails():
     assert verifier.verify_termination(
         commit, tokenizer=None, proof=proof, model=_ModelWithEos(),
     ) is False
+
+
+# ---------------------------------------------------------------------------
+# evaluate_boxed_answer_probability
+# ---------------------------------------------------------------------------
+
+
+class _CharTokenizer:
+    """One-token-per-character tokenizer for boxed-answer tests.
+
+    Token id = ord(char); decode([id]) = chr(id). The completion text is
+    therefore the concatenation of completion tokens, which makes the
+    text-offset → token-index mapping trivial to reason about in tests.
+    """
+
+    def decode(self, ids, *, skip_special_tokens=False):
+        return "".join(chr(int(i)) for i in ids)
+
+
+def _ords(s: str) -> list[int]:
+    return [ord(c) for c in s]
+
+
+def test_evaluate_boxed_no_boxed_returns_true():
+    completion = "the answer is 42 (no box)"
+    tokens = [0] * 5 + _ords(completion)
+    proof = ProofResult(
+        all_passed=True, passed=1, checked=1,
+        has_sparse_outputs=True,
+        completion_chosen_probs=[0.01] * len(completion),
+    )
+    ok, metrics = verifier.evaluate_boxed_answer_probability(
+        tokens=tokens, prompt_length=5,
+        completion_length=len(completion),
+        proof=proof, tokenizer=_CharTokenizer(),
+    )
+    assert ok is True
+    assert metrics == {}
+
+
+def test_evaluate_boxed_high_prob_passes():
+    completion = "answer is \\boxed{42}"
+    tokens = [0] * 5 + _ords(completion)
+    proof = ProofResult(
+        all_passed=True, passed=1, checked=1,
+        has_sparse_outputs=True,
+        completion_chosen_probs=[0.99] * len(completion),
+    )
+    ok, metrics = verifier.evaluate_boxed_answer_probability(
+        tokens=tokens, prompt_length=5,
+        completion_length=len(completion),
+        proof=proof, tokenizer=_CharTokenizer(),
+    )
+    assert ok is True
+    assert metrics["min_prob"] == 0.99
+    assert metrics["n_tokens"] == 2  # "4" and "2"
+
+
+def test_evaluate_boxed_low_prob_rejects():
+    """One token inside \\boxed{} dropped to 0.01 → tampering signature."""
+    completion = "answer is \\boxed{42}"
+    tokens = [0] * 5 + _ords(completion)
+    probs = [0.99] * len(completion)
+    # Position of "4" inside the boxed content
+    boxed_open = completion.index("{") + 1
+    probs[boxed_open] = 0.01
+    proof = ProofResult(
+        all_passed=True, passed=1, checked=1,
+        has_sparse_outputs=True,
+        completion_chosen_probs=probs,
+    )
+    ok, metrics = verifier.evaluate_boxed_answer_probability(
+        tokens=tokens, prompt_length=5,
+        completion_length=len(completion),
+        proof=proof, tokenizer=_CharTokenizer(),
+    )
+    assert ok is False
+    assert metrics["min_prob"] == 0.01
+
+
+def test_evaluate_boxed_unclosed_returns_true():
+    """Truncated completion with open \\boxed{ but no } → skip the check."""
+    completion = "starting \\boxed{4"
+    tokens = [0] * 5 + _ords(completion)
+    proof = ProofResult(
+        all_passed=True, passed=1, checked=1,
+        has_sparse_outputs=True,
+        completion_chosen_probs=[0.01] * len(completion),
+    )
+    ok, _ = verifier.evaluate_boxed_answer_probability(
+        tokens=tokens, prompt_length=5,
+        completion_length=len(completion),
+        proof=proof, tokenizer=_CharTokenizer(),
+    )
+    assert ok is True
+
+
+def test_evaluate_boxed_last_boxed_wins():
+    """Multiple \\boxed{...} — only the LAST one is gated (matches OMI parser)."""
+    completion = "first \\boxed{1} then \\boxed{42}"
+    tokens = [0] * 5 + _ords(completion)
+    probs = [0.99] * len(completion)
+    # Make the FIRST boxed content low — should NOT reject.
+    first_boxed_open = completion.index("{") + 1
+    probs[first_boxed_open] = 0.01
+    proof = ProofResult(
+        all_passed=True, passed=1, checked=1,
+        has_sparse_outputs=True,
+        completion_chosen_probs=probs,
+    )
+    ok, _ = verifier.evaluate_boxed_answer_probability(
+        tokens=tokens, prompt_length=5,
+        completion_length=len(completion),
+        proof=proof, tokenizer=_CharTokenizer(),
+    )
+    assert ok is True
+
+
+def test_evaluate_boxed_fbox_alias_also_checked():
+    completion = "answer is \\fbox{42}"
+    tokens = [0] * 5 + _ords(completion)
+    probs = [0.99] * len(completion)
+    probs[completion.index("{") + 1] = 0.05
+    proof = ProofResult(
+        all_passed=True, passed=1, checked=1,
+        has_sparse_outputs=True,
+        completion_chosen_probs=probs,
+    )
+    ok, _ = verifier.evaluate_boxed_answer_probability(
+        tokens=tokens, prompt_length=5,
+        completion_length=len(completion),
+        proof=proof, tokenizer=_CharTokenizer(),
+    )
+    assert ok is False

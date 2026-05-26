@@ -185,33 +185,6 @@ def test_reject_out_of_zone_all_pass():
     assert resp.reason == RejectReason.OUT_OF_ZONE
 
 
-def test_reject_binary_edge_high_correct_reward_distribution():
-    b = _make_batcher()
-    req = _request(rewards=[1.0] * 6 + [0.0] * 2)
-    resp = b.accept_submission(req)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.REWARD_DISTRIBUTION
-
-
-def test_reject_binary_edge_low_correct_reward_distribution():
-    b = _make_batcher()
-    req = _request(rewards=[1.0] * 2 + [0.0] * 6)
-    resp = b.accept_submission(req)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.REWARD_DISTRIBUTION
-
-
-def test_reward_distribution_rejects_before_grail_compute():
-    def fail_if_called(commit, model, randomness):  # pragma: no cover
-        raise AssertionError("GRAIL proof should not run for reward_distribution")
-
-    b = _make_batcher(verify_commitment_proofs_fn=fail_if_called)
-    req = _request(rewards=[1.0] * 6 + [0.0] * 2)
-    resp = b.accept_submission(req)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.REWARD_DISTRIBUTION
-
-
 def test_reject_manufactured_opposite_reward_clones_before_grail_compute():
     def fail_if_called(commit, model, randomness):  # pragma: no cover
         raise AssertionError("GRAIL proof should not run for clone-pattern rejects")
@@ -272,18 +245,10 @@ def test_allow_less_than_three_opposite_reward_clone_pairs():
     assert resp.reason == RejectReason.ACCEPTED
 
 
-@pytest.mark.parametrize("k", [3, 4, 5])
-def test_accept_binary_middle_frontier_reward_distribution(k):
+@pytest.mark.parametrize("k", [2, 3, 4, 5, 6])
+def test_accept_all_sigma_zone_binary_configs(k):
     b = _make_batcher()
     req = _request(rewards=[1.0] * k + [0.0] * (M_ROLLOUTS - k))
-    resp = b.accept_submission(req)
-    assert resp.accepted is True
-    assert resp.reason == RejectReason.ACCEPTED
-
-
-def test_bootstrap_keeps_legacy_binary_edge_band():
-    b = _make_batcher(bootstrap=True)
-    req = _request(rewards=[1.0] * 6 + [0.0] * 2)
     resp = b.accept_submission(req)
     assert resp.accepted is True
     assert resp.reason == RejectReason.ACCEPTED
@@ -993,10 +958,16 @@ def _grail_with_logits(seq_len: int, eos_id: int = 99):
     the EOS-present and EOS-missing termination paths.
     """
     def _fn(commit, model, randomness):
+        prompt_length = int(
+            (commit.get("rollout") or {}).get("prompt_length", 0)
+        )
+        challenge_idxs = list(range(prompt_length, prompt_length + CHALLENGE_K))
         return ProofResult(
             all_passed=True, passed=1, checked=1, sketch_diff_max=0,
             has_sparse_outputs=True,
             p_stop=0.99,
+            challenge_lp_indices=challenge_idxs,
+            challenge_lp_values=[0.0] * CHALLENGE_K,
         )
     return _fn
 
@@ -1091,24 +1062,22 @@ def test_reject_bad_termination_when_last_token_not_eos():
     assert resp.reason == RejectReason.BAD_TERMINATION
 
 
-def test_reject_repeated_cap_path_truncations():
+class _LongContextModelStub:
+    class config:
+        vocab_size = 20000
+        max_position_embeddings = 20000
+
+
+def _request_with_cap_truncations(n_truncated: int, eos_id: int = 99):
     from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
 
-    class _LongContextModelStub:
-        class config:
-            vocab_size = 20000
-            max_position_embeddings = 20000
-
     prompt_length = 4
-    seq_len = prompt_length + MAX_NEW_TOKENS_PROTOCOL_CAP
-    b = _make_batcher(
-        model=_LongContextModelStub(),
-        verify_commitment_proofs_fn=_grail_with_logits(seq_len),
-    )
+    cap_seq_len = prompt_length + MAX_NEW_TOKENS_PROTOCOL_CAP
     req = _request()
-
-    for idx in range(2):
-        tokens = [t + idx for t in range(seq_len)]
+    # Cap-truncated rollouts: completion filled with a constant non-EOS token
+    # so has_eos_padding does not fire on a stray EOS inside the body.
+    for idx in range(n_truncated):
+        tokens = [10 + idx] * prompt_length + [5] * MAX_NEW_TOKENS_PROTOCOL_CAP
         commit = _make_commit(
             tokens=tokens,
             prompt_length=prompt_length,
@@ -1117,41 +1086,43 @@ def test_reject_repeated_cap_path_truncations():
         )
         req.rollouts[idx].commit = commit
         req.rollouts[idx].tokens = commit["tokens"]
+    # Remaining rollouts: short, naturally EOS-terminated.
+    for idx in range(n_truncated, len(req.rollouts)):
+        tokens = [20 + idx] * prompt_length + [5] * (CHALLENGE_K - 1) + [eos_id]
+        commit = _make_commit(
+            tokens=tokens,
+            prompt_length=prompt_length,
+            success=req.rollouts[idx].reward > 0.5,
+            total_reward=req.rollouts[idx].reward,
+        )
+        req.rollouts[idx].commit = commit
+        req.rollouts[idx].tokens = commit["tokens"]
+    return req, cap_seq_len
 
-    resp = b.accept_submission(req)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.BAD_TERMINATION
 
+def test_reject_cap_path_truncations_over_budget():
+    from reliquary.constants import MAX_TRUNCATED_PER_SUBMISSION
 
-def test_reject_single_cap_path_truncation_in_steady_state():
-    from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
-
-    class _LongContextModelStub:
-        class config:
-            vocab_size = 20000
-            max_position_embeddings = 20000
-
-    prompt_length = 4
-    seq_len = prompt_length + MAX_NEW_TOKENS_PROTOCOL_CAP
+    req, seq_len = _request_with_cap_truncations(MAX_TRUNCATED_PER_SUBMISSION + 1)
     b = _make_batcher(
         model=_LongContextModelStub(),
         verify_commitment_proofs_fn=_grail_with_logits(seq_len),
     )
-    req = _request()
-
-    tokens = list(range(seq_len))
-    commit = _make_commit(
-        tokens=tokens,
-        prompt_length=prompt_length,
-        success=req.rollouts[0].reward > 0.5,
-        total_reward=req.rollouts[0].reward,
-    )
-    req.rollouts[0].commit = commit
-    req.rollouts[0].tokens = commit["tokens"]
-
     resp = b.accept_submission(req)
     assert resp.accepted is False
     assert resp.reason == RejectReason.BAD_TERMINATION
+
+
+def test_accept_cap_path_truncations_at_budget():
+    from reliquary.constants import MAX_TRUNCATED_PER_SUBMISSION
+
+    req, seq_len = _request_with_cap_truncations(MAX_TRUNCATED_PER_SUBMISSION)
+    b = _make_batcher(
+        model=_LongContextModelStub(),
+        verify_commitment_proofs_fn=_grail_with_logits(seq_len),
+    )
+    resp = b.accept_submission(req)
+    assert resp.reason != RejectReason.BAD_TERMINATION
 
 
 def test_reject_eos_padding_after_natural_stop():
@@ -1645,3 +1616,164 @@ def test_batcher_beacon_invalid_defaults_false():
     """
     b = _make_batcher()
     assert b.beacon_invalid is False
+
+
+# ----- BoxedAnswerValidator wiring -----
+
+
+class _CharTokenizerWithEos:
+    """One-char-per-token tokenizer with eos_token_id=99 for batcher wiring."""
+
+    eos_token_id = 99
+
+    def decode(self, ids, *, skip_special_tokens=False):
+        return "".join(chr(int(i)) for i in ids if int(i) != 99)
+
+
+def _grail_with_chosen_probs(seq_len: int, completion_probs: list[float], prompt_length: int = 4):
+    """Stub returning sparse outputs incl. completion_chosen_probs.
+
+    Also pre-populates challenge_lp_indices/values with zeros at the first K
+    completion positions, matching the miner-claimed all-zero logprobs from
+    ``_make_commit`` so verify_logprobs_claim does not fire before us.
+    """
+    challenge_idxs = list(range(prompt_length, prompt_length + CHALLENGE_K))
+    challenge_vals = [0.0] * CHALLENGE_K
+
+    def _fn(commit, model, randomness):
+        return ProofResult(
+            all_passed=True, passed=1, checked=1, sketch_diff_max=0,
+            has_sparse_outputs=True,
+            p_stop=0.99,
+            challenge_lp_indices=challenge_idxs,
+            challenge_lp_values=challenge_vals,
+            completion_chosen_probs=list(completion_probs),
+        )
+    return _fn
+
+
+def _boxed_completion_padded(answer_text: str = "the final answer is \\boxed{42}") -> tuple[str, list[int]]:
+    # completion_length must be >= CHALLENGE_K to clear verify_logprobs_claim.
+    pad_chars = max(0, (CHALLENGE_K + 1) - len(answer_text))
+    text = "x" * pad_chars + answer_text
+    completion = [ord(c) for c in text] + [99]
+    return text, completion
+
+
+def test_reject_boxed_answer_tampered():
+    """One token inside the last \\boxed{...} sampled at p<0.5 → reject."""
+    prompt = [10, 11, 12, 13]
+    text, completion = _boxed_completion_padded()
+    tokens = prompt + completion
+    seq_len = len(tokens)
+
+    probs = [0.99] * len(completion)
+    probs[text.index("{") + 1] = 0.05
+
+    class _LongCtxModel:
+        class config:
+            vocab_size = 1000
+            max_position_embeddings = 4096
+
+    b = _make_batcher(
+        model=_LongCtxModel(),
+        tokenizer=_CharTokenizerWithEos(),
+        verify_commitment_proofs_fn=_grail_with_chosen_probs(seq_len, probs),
+    )
+    req = _request()
+    commit = _make_commit(
+        tokens=tokens,
+        prompt_length=len(prompt),
+        success=True,
+        total_reward=1.0,
+    )
+    req.rollouts[0].commit = commit
+    req.rollouts[0].tokens = commit["tokens"]
+
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BOXED_ANSWER_TAMPERED
+
+
+def test_accept_boxed_answer_high_prob():
+    """All tokens inside \\boxed{...} sampled at p>0.5 → no boxed reject."""
+    prompt = [10, 11, 12, 13]
+    _, completion = _boxed_completion_padded()
+    tokens = prompt + completion
+    seq_len = len(tokens)
+    probs = [0.95] * len(completion)
+
+    class _LongCtxModel:
+        class config:
+            vocab_size = 1000
+            max_position_embeddings = 4096
+
+    b = _make_batcher(
+        model=_LongCtxModel(),
+        tokenizer=_CharTokenizerWithEos(),
+        verify_commitment_proofs_fn=_grail_with_chosen_probs(seq_len, probs),
+    )
+    req = _request()
+    for idx in range(M_ROLLOUTS):
+        commit = _make_commit(
+            tokens=tokens,
+            prompt_length=len(prompt),
+            success=req.rollouts[idx].reward > 0.5,
+            total_reward=req.rollouts[idx].reward,
+        )
+        req.rollouts[idx].commit = commit
+        req.rollouts[idx].tokens = commit["tokens"]
+
+    resp = b.accept_submission(req)
+    assert resp.reason != RejectReason.BOXED_ANSWER_TAMPERED
+
+
+def test_cap_truncated_rollout_still_runs_behavioural_checks():
+    """Regression: cap-truncated rollouts are budget-tolerated for termination
+    but MUST still pass logprob/distribution/boxed integrity checks.
+
+    Without this, a miner force-caps a rollout to bypass behavioural checks
+    and tampers the \\boxed{...} content; the truncated-budget path used to
+    ``continue`` past every per-rollout check.
+    """
+    from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
+
+    prompt = [10, 11, 12, 13]
+    answer = "the final answer is \\boxed{42}"
+    # Body filled with non-EOS, non-`{` token + appended boxed answer.
+    # Total completion = MAX_NEW_TOKENS_PROTOCOL_CAP, last token != EOS →
+    # cap-truncated path.
+    body = [5] * (MAX_NEW_TOKENS_PROTOCOL_CAP - len(answer))
+    answer_tokens = [ord(c) for c in answer]
+    completion = body + answer_tokens
+    tokens = prompt + completion
+
+    probs = [0.99] * len(completion)
+    # Tamper: drop chosen prob at the digit inside \boxed{}
+    probs[len(body) + answer.index("{") + 1] = 0.02
+
+    class _LongCtxModel:
+        class config:
+            vocab_size = 1000
+            max_position_embeddings = MAX_NEW_TOKENS_PROTOCOL_CAP + 100
+
+    b = _make_batcher(
+        model=_LongCtxModel(),
+        tokenizer=_CharTokenizerWithEos(),
+        verify_commitment_proofs_fn=_grail_with_chosen_probs(
+            len(tokens), probs, prompt_length=len(prompt),
+        ),
+    )
+    req = _request()
+    commit = _make_commit(
+        tokens=tokens,
+        prompt_length=len(prompt),
+        success=True,
+        total_reward=1.0,
+    )
+    req.rollouts[0].commit = commit
+    req.rollouts[0].tokens = commit["tokens"]
+
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BOXED_ANSWER_TAMPERED

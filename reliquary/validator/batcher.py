@@ -48,8 +48,8 @@ from reliquary.validator.observability import (
 )
 from reliquary.validator.rollout_patterns import detect_opposite_reward_clones
 from reliquary.validator.verifier import (
+    evaluate_boxed_answer_probability,
     evaluate_token_distribution,
-    binary_reward_mix_in_frontier,
     has_eos_padding,
     is_cap_truncation,
     is_in_zone,
@@ -586,8 +586,6 @@ class GrpoWindowBatcher:
         sigma = rewards_std(rewards)
         if not is_in_zone(sigma, bootstrap=self.bootstrap):
             return reject(RejectReason.OUT_OF_ZONE, "zone")
-        if not self.bootstrap and not binary_reward_mix_in_frontier(rewards):
-            return reject(RejectReason.REWARD_DISTRIBUTION, "reward_distribution")
         clone_metrics = detect_opposite_reward_clones(completion_texts, rewards)
         if clone_metrics.suspicious:
             logger.info(
@@ -679,7 +677,12 @@ class GrpoWindowBatcher:
                             "termination",
                             sketch_diff_max=sketch_diff_max,
                         )
-                    continue
+                    # Only the EOS signal is missing on a cap-truncated rollout;
+                    # the per-token integrity checks (logprob, distribution,
+                    # boxed-answer) still apply to its body. Do NOT skip them
+                    # — a miner who force-caps to bypass behavioural checks
+                    # otherwise gets up to max_truncated_per_submission rollouts
+                    # of free tampering inside the same submission.
 
             if not proof.has_sparse_outputs:
                 continue
@@ -729,6 +732,26 @@ class GrpoWindowBatcher:
                 return reject(
                     RejectReason.DISTRIBUTION_SUSPICIOUS,
                     "distribution",
+                    sketch_diff_max=sketch_diff_max,
+                    lp_dev_max=lp_dev_max,
+                    dist_q10_min=dist_q10_min,
+                )
+
+            boxed_ok, boxed_metrics = evaluate_boxed_answer_probability(
+                tokens=rollout.commit["tokens"],
+                prompt_length=prompt_len,
+                completion_length=completion_len,
+                proof=proof,
+                tokenizer=self.tokenizer,
+            )
+            if not boxed_ok:
+                logger.info(
+                    "reject reason=boxed_answer_tampered hotkey=%s %s",
+                    request.miner_hotkey, boxed_metrics,
+                )
+                return reject(
+                    RejectReason.BOXED_ANSWER_TAMPERED,
+                    "boxed_answer",
                     sketch_diff_max=sketch_diff_max,
                     lp_dev_max=lp_dev_max,
                     dist_q10_min=dist_q10_min,

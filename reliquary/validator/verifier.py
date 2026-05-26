@@ -478,55 +478,8 @@ def rewards_std(rewards: list[float]) -> float:
     return variance ** 0.5
 
 
-def binary_reward_correct_count(
-    rewards: list[float],
-    *,
-    tolerance: float = 1e-6,
-) -> int | None:
-    """Return k for binary {0,1} reward groups, else None.
-
-    OpenMathInstruct rewards are binary today. Keeping this as a helper lets
-    the validator apply a stricter middle-frontier gate only when the reward
-    shape is actually binary, while leaving future continuous-reward
-    environments on the sigma filter alone.
-    """
-    correct = 0
-    for reward in rewards:
-        value = float(reward)
-        if abs(value - 1.0) <= tolerance:
-            correct += 1
-        elif abs(value) <= tolerance:
-            continue
-        else:
-            return None
-    return correct
-
-
-def binary_reward_mix_in_frontier(rewards: list[float]) -> bool:
-    """True if a binary reward group is inside the middle frontier band.
-
-    For M=8, SIGMA_MIN=0.43 admits k=2 and k=6 edge groups. Those groups are
-    exploitable by local reward-oracle selection and produce imbalanced GRPO
-    labels. This helper keeps binary groups in the steadier k=3..5 band.
-
-    Non-binary groups return True here and remain governed by the sigma gate.
-    """
-    from reliquary.constants import (
-        BINARY_REWARD_MAX_CORRECT,
-        BINARY_REWARD_MIN_CORRECT,
-    )
-
-    correct = binary_reward_correct_count(rewards)
-    if correct is None:
-        return True
-    return BINARY_REWARD_MIN_CORRECT <= correct <= BINARY_REWARD_MAX_CORRECT
-
-
 def is_in_zone(sigma: float, *, bootstrap: bool = False) -> bool:
     """True iff *sigma* exceeds the minimum threshold for training signal.
-
-    Steady state: σ ≥ SIGMA_MIN (0.43).
-    Bootstrap: σ ≥ BOOTSTRAP_SIGMA_MIN (0.33).
 
     A group with σ below this is dropped because its rollouts cluster
     too tightly for the normalised advantage (r - μ) / σ to carry a
@@ -654,3 +607,110 @@ def evaluate_token_distribution(
         or metrics["q10"] < SAMPLING_LOW_Q10_MAX
     )
     return (not suspicious), metrics
+
+
+def _find_last_boxed_token_range(
+    completion_tokens: list[int],
+    tokenizer: Any,
+) -> tuple[int, int] | None:
+    """Return ``(start, end)`` completion-relative token indices (inclusive)
+    that cover the content between ``{`` and ``}`` of the last
+    ``\\boxed{...}`` or ``\\fbox{...}`` in the decoded completion. ``None`` if
+    no closed boxed answer is present.
+
+    Walks token-by-token decode to map text offsets back to token positions.
+    Matches ``_last_boxed_only_string`` in the OMI env so the filter targets
+    the same substring the reward parser keys on.
+    """
+    if not completion_tokens:
+        return None
+    offsets: list[tuple[int, int]] = []
+    cum = ""
+    for tok in completion_tokens:
+        frag = tokenizer.decode([int(tok)], skip_special_tokens=False)
+        offsets.append((len(cum), len(cum) + len(frag)))
+        cum += frag
+
+    idx = max(cum.rfind("\\boxed{"), cum.rfind("\\fbox{"))
+    if idx < 0:
+        return None
+    try:
+        open_idx = cum.index("{", idx)
+    except ValueError:
+        return None
+    depth = 0
+    close_idx = -1
+    for j in range(open_idx, len(cum)):
+        c = cum[j]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                close_idx = j
+                break
+    if close_idx < 0:
+        return None
+
+    content_start = open_idx + 1
+    content_end = close_idx  # exclusive
+
+    start_tok = end_tok = None
+    for i, (s, e) in enumerate(offsets):
+        if start_tok is None and e > content_start:
+            start_tok = i
+        if s < content_end:
+            end_tok = i
+    if start_tok is None or end_tok is None:
+        return None
+    return start_tok, end_tok
+
+
+def evaluate_boxed_answer_probability(
+    tokens: list[int],
+    prompt_length: int,
+    completion_length: int,
+    proof: "ProofResult",
+    tokenizer: Any,
+    *,
+    threshold: float | None = None,
+) -> tuple[bool, dict]:
+    """Hard check (OMI-specific): every token inside the last ``\\boxed{...}``
+    must have chosen-token probability ≥ ``threshold``.
+
+    The OMI reward parser extracts the answer from the last ``\\boxed{...}``;
+    a miner can flip a wrong rollout to right by swapping a few answer tokens
+    post-hoc. The validator's forward pass on the tampered tokens shows a
+    collapsed chosen probability at those positions, while honest sampling
+    keeps boxed-answer probabilities high (>0.5 in measurements).
+
+    Returns ``(ok, metrics)`` where ``metrics`` carries ``min_prob`` and
+    ``n_tokens`` for telemetry. ``ok=True`` when no boxed answer is present
+    or no probabilities are available — the filter only fires on a concrete
+    low-probability boxed token.
+    """
+    from reliquary.constants import BOXED_ANSWER_MIN_PROB
+
+    if threshold is None:
+        threshold = BOXED_ANSWER_MIN_PROB
+    if completion_length <= 0:
+        return True, {}
+    probs = proof.completion_chosen_probs
+    if not probs:
+        return True, {}
+
+    completion_tokens = list(tokens[prompt_length: prompt_length + completion_length])
+    rng = _find_last_boxed_token_range(completion_tokens, tokenizer)
+    if rng is None:
+        return True, {}
+    start, end = rng
+
+    selected: list[float] = []
+    for i in range(start, end + 1):
+        if 0 <= i < len(probs):
+            selected.append(float(probs[i]))
+    if not selected:
+        return True, {}
+    min_prob = min(selected)
+    metrics = {"min_prob": min_prob, "n_tokens": len(selected)}
+    return min_prob >= threshold, metrics
