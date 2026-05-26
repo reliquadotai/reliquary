@@ -19,6 +19,8 @@ from reliquary.constants import (
     TRAINING_QUARANTINE_MAX_REWARD_VECTOR_SHARE,
     TRAINING_QUARANTINE_MAX_SINGLE_COMPLETION_LENGTH,
     TRAINING_QUARANTINE_REJECT_SPIKE_MIN,
+    TRAINING_QUARANTINE_EXTREME_LENGTH_MIN_GROUPS,
+    TRAINING_QUARANTINE_EXTREME_LENGTH_MIN_ROLLOUTS,
     TRAINING_QUARANTINE_REWARD_VECTOR_MIN_GROUPS,
 )
 
@@ -102,13 +104,31 @@ def assess_training_batch(
         dominant_vector_groups >= TRAINING_QUARANTINE_REWARD_VECTOR_MIN_GROUPS
         and dominant_vector_share >= TRAINING_QUARANTINE_MAX_REWARD_VECTOR_SHARE
     ):
-        reasons.append("reward_vector_dominance")
+        # Reward-vector concentration is important operator telemetry, but it
+        # is not by itself a high-confidence poison signal. During the current
+        # OpenMath phase, frontier/cherry-picked submissions naturally cluster
+        # around a small set of binary vectors; freezing training on that shape
+        # alone lets the meta stall on one checkpoint without proving the text
+        # is bad training data.
+        pass
 
-    completion_lengths = [
-        _completion_length(rollout)
-        for group in batch
-        for rollout in getattr(group, "rollouts", [])
-    ]
+    completion_lengths: list[int] = []
+    cap_length_groups = 0
+    extreme_length_groups = 0
+    for group in batch:
+        group_lengths = [
+            _completion_length(rollout)
+            for rollout in getattr(group, "rollouts", [])
+        ]
+        completion_lengths.extend(group_lengths)
+        if any(length >= MAX_NEW_TOKENS_PROTOCOL_CAP for length in group_lengths):
+            cap_length_groups += 1
+        if any(
+            length >= TRAINING_QUARANTINE_MAX_SINGLE_COMPLETION_LENGTH
+            for length in group_lengths
+        ):
+            extreme_length_groups += 1
+
     max_completion_length = max(completion_lengths, default=0)
     mean_completion_length = (
         sum(completion_lengths) / len(completion_lengths)
@@ -118,10 +138,26 @@ def assess_training_batch(
         1 for length in completion_lengths
         if length >= MAX_NEW_TOKENS_PROTOCOL_CAP
     )
-    if cap_length_rollouts:
-        reasons.append("cap_length_rollout")
-    elif max_completion_length >= TRAINING_QUARANTINE_MAX_SINGLE_COMPLETION_LENGTH:
-        reasons.append("extreme_completion_length")
+    extreme_length_rollouts = sum(
+        1 for length in completion_lengths
+        if length >= TRAINING_QUARANTINE_MAX_SINGLE_COMPLETION_LENGTH
+    )
+    if (
+        cap_length_groups >= TRAINING_QUARANTINE_EXTREME_LENGTH_MIN_GROUPS
+        or (
+            cap_length_groups >= 2
+            and cap_length_rollouts >= TRAINING_QUARANTINE_EXTREME_LENGTH_MIN_ROLLOUTS
+        )
+    ):
+        reasons.append("cap_length_density")
+    elif (
+        extreme_length_groups >= TRAINING_QUARANTINE_EXTREME_LENGTH_MIN_GROUPS
+        or (
+            extreme_length_groups >= 2
+            and extreme_length_rollouts >= TRAINING_QUARANTINE_EXTREME_LENGTH_MIN_ROLLOUTS
+        )
+    ):
+        reasons.append("extreme_completion_length_density")
     if mean_completion_length >= TRAINING_QUARANTINE_MAX_MEAN_COMPLETION_LENGTH:
         reasons.append("mean_completion_length_high")
 
@@ -141,9 +177,16 @@ def assess_training_batch(
         "dominant_reward_vector": dominant_vector,
         "dominant_reward_vector_groups": dominant_vector_groups,
         "dominant_reward_vector_share": dominant_vector_share,
+        "dominant_reward_vector_quarantine_threshold": (
+            dominant_vector_groups >= TRAINING_QUARANTINE_REWARD_VECTOR_MIN_GROUPS
+            and dominant_vector_share >= TRAINING_QUARANTINE_MAX_REWARD_VECTOR_SHARE
+        ),
         "mean_completion_length": mean_completion_length,
         "max_completion_length": max_completion_length,
         "cap_length_rollouts": cap_length_rollouts,
+        "cap_length_groups": cap_length_groups,
+        "extreme_length_rollouts": extreme_length_rollouts,
+        "extreme_length_groups": extreme_length_groups,
         "high_risk_rejects": high_risk_rejects,
     }
     return TrainingQuarantineDecision(

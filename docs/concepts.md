@@ -83,13 +83,14 @@ The cooldown map is rebuilt from recent R2 archives using `COOLDOWN_REBUILD_LOOK
 
 Training quarantine is a model-health gate, not an emission slash. When a
 selected batch has high-confidence poison signatures, the validator archives
-the window and credits emissions, but skips GRPO and checkpoint publishing.
-Current signals include repeated reward-vector dominance, cap-length or
-extreme-length completions, and high-risk reject spikes such as
+the window and credits emissions, but skips GRPO for that window. Current
+hard signals include dense cap-length/extreme-length completion patterns and
+high-risk reject spikes such as
 `reward_distribution`, `bad_termination`, `tokens_mismatch`, or
-`distribution_suspicious`. Hotkey concentration is archived as a metric, but
-does not quarantine by itself: a single honest miner may be the only one
-printing useful work in a sparse window.
+`distribution_suspicious`. Hotkey concentration and reward-vector dominance
+are archived as metrics, but do not quarantine by themselves: a single honest
+miner may be the only one printing useful work in a sparse window, and binary
+frontier mining naturally clusters around a small set of reward vectors.
 
 The archive carries:
 
@@ -141,9 +142,9 @@ Every `BatchSubmissionRequest` includes `checkpoint_hash` — the HF commit revi
 
 This guarantees that training data always reflects the currently-published policy. Without it, a stale miner could produce rollouts from an old model, creating a training distribution mismatch.
 
-### Publish-every-N (10 windows) — HF cannot keep up with per-step pushes
+### Publish every N trained windows — HF cannot keep up with per-step pushes
 
-The base model is Qwen3-4B-Instruct (~4 billion parameters, ~8 GB in bfloat16). Pushing a new safetensors file to HF Hub on every window (roughly every 60 seconds under load) is infeasible due to Git LFS latency and HF rate limits. The validator trains healthy full batches in-memory but publishes to HF every `CHECKPOINT_PUBLISH_INTERVAL_WINDOWS = 10` windows. Quarantined or partial windows are archived/credited but skip training and publishing. Between publishes, miners stay on the last-published revision — the hash gate keeps them there. `checkpoint_n` only increments on a successful publish, so the gate remains stable across the publish gap.
+The base model is Qwen3-4B-Instruct (~4 billion parameters, ~8 GB in bfloat16). Pushing a new safetensors file to HF Hub on every window (roughly every 60 seconds under load) is infeasible due to Git LFS latency and HF rate limits. The validator trains healthy full batches in-memory but publishes to HF every `CHECKPOINT_PUBLISH_INTERVAL_WINDOWS = 10` successful trained windows. Quarantined or partial windows are archived/credited but do not increment the publish cadence. Between publishes, miners stay on the last-published revision — the hash gate keeps them there. `checkpoint_n` only increments on a successful publish, so the gate remains stable across the publish gap.
 
 ---
 

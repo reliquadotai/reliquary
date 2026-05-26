@@ -26,7 +26,7 @@ prompt_length + completion_length >= MAX_NEW_TOKENS_PROTOCOL_CAP
 That happened before checking `tokens[-1]` against EOS and before checking
 `p_stop >= MIN_EOS_PROBABILITY`.
 
-The batcher already had a `MAX_TRUNCATED_PER_SUBMISSION = 1` policy, but cap
+The batcher already had a `MAX_TRUNCATED_PER_SUBMISSION` policy, but cap
 hits were not counted as truncations because `verify_termination` returned
 `True`.
 
@@ -90,12 +90,13 @@ Expected symptoms:
 
 ## Patch
 
-Initial hardening counted cap hits without natural EOS as truncations. The
-follow-up steady-state policy now sets `MAX_TRUNCATED_PER_SUBMISSION = 1`, so a
-single cap/non-EOS truncated rollout can pass as a rare exception, but cap-heavy
-groups reject as `bad_termination`. Bootstrap keeps
-`BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION = 2` to preserve early fill rate while
-the model is weak.
+Initial hardening counted cap hits without natural EOS as truncations and made
+sure tolerated truncations still pass GRAIL/logprob/distribution/boxed checks.
+The current acceptance budget is intentionally loose
+(`MAX_TRUNCATED_PER_SUBMISSION = 5`,
+`BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION = 5`) while the team observes miner
+adaptation. Training quarantine separately tracks dense cap/extreme-length
+patterns so one bad long sample does not freeze checkpoint progress by itself.
 
 Natural EOS at the cap is not counted as truncation if:
 

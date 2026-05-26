@@ -45,19 +45,37 @@ def test_clean_mixed_batch_is_not_quarantined():
     assert decision.reasons == []
 
 
-def test_cap_length_rollout_quarantines_training():
+def test_single_cap_length_rollout_is_telemetry_not_quarantine():
     batch = [
         _group("hk1", "11110000", MAX_NEW_TOKENS_PROTOCOL_CAP),
-        _group("hk2", "11001100"),
+    ] + [
+        _group(f"hk{i}", "11001100")
+        for i in range(2, 9)
+    ]
+
+    decision = assess_training_batch(batch, reject_counts={})
+
+    assert decision.quarantined is False
+    assert decision.metrics["cap_length_rollouts"] == 8
+    assert decision.metrics["cap_length_groups"] == 1
+
+
+def test_cap_length_density_quarantines_training():
+    batch = [
+        _group("hk1", "11110000", MAX_NEW_TOKENS_PROTOCOL_CAP),
+        _group("hk2", "11001100", MAX_NEW_TOKENS_PROTOCOL_CAP),
+    ] + [
+        _group(f"hk{i}", "10101010")
+        for i in range(3, 9)
     ]
 
     decision = assess_training_batch(batch, reject_counts={})
 
     assert decision.quarantined is True
-    assert "cap_length_rollout" in decision.reasons
+    assert "cap_length_density" in decision.reasons
 
 
-def test_dominant_reward_vector_quarantines_training():
+def test_dominant_reward_vector_is_telemetry_not_quarantine():
     batch = [
         _group(f"hk{i}", "11110000")
         for i in range(6)
@@ -68,8 +86,10 @@ def test_dominant_reward_vector_quarantines_training():
 
     decision = assess_training_batch(batch, reject_counts={})
 
-    assert decision.quarantined is True
-    assert "reward_vector_dominance" in decision.reasons
+    assert decision.quarantined is False
+    assert "reward_vector_dominance" not in decision.reasons
+    assert decision.metrics["dominant_reward_vector"] == "11110000"
+    assert decision.metrics["dominant_reward_vector_quarantine_threshold"] is True
 
 
 def test_hotkey_dominance_alone_is_observability_not_quarantine():
