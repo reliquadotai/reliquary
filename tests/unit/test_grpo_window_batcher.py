@@ -1056,24 +1056,22 @@ def test_reject_bad_termination_when_last_token_not_eos():
     assert resp.reason == RejectReason.BAD_TERMINATION
 
 
-def test_reject_repeated_cap_path_truncations():
+class _LongContextModelStub:
+    class config:
+        vocab_size = 20000
+        max_position_embeddings = 20000
+
+
+def _request_with_cap_truncations(n_truncated: int, eos_id: int = 99):
     from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
 
-    class _LongContextModelStub:
-        class config:
-            vocab_size = 20000
-            max_position_embeddings = 20000
-
     prompt_length = 4
-    seq_len = prompt_length + MAX_NEW_TOKENS_PROTOCOL_CAP
-    b = _make_batcher(
-        model=_LongContextModelStub(),
-        verify_commitment_proofs_fn=_grail_with_logits(seq_len),
-    )
+    cap_seq_len = prompt_length + MAX_NEW_TOKENS_PROTOCOL_CAP
     req = _request()
-
-    for idx in range(2):
-        tokens = [t + idx for t in range(seq_len)]
+    # Cap-truncated rollouts: completion filled with a constant non-EOS token
+    # so has_eos_padding does not fire on a stray EOS inside the body.
+    for idx in range(n_truncated):
+        tokens = [10 + idx] * prompt_length + [5] * MAX_NEW_TOKENS_PROTOCOL_CAP
         commit = _make_commit(
             tokens=tokens,
             prompt_length=prompt_length,
@@ -1082,41 +1080,43 @@ def test_reject_repeated_cap_path_truncations():
         )
         req.rollouts[idx].commit = commit
         req.rollouts[idx].tokens = commit["tokens"]
+    # Remaining rollouts: short, naturally EOS-terminated.
+    for idx in range(n_truncated, len(req.rollouts)):
+        tokens = [20 + idx] * prompt_length + [5] * (CHALLENGE_K - 1) + [eos_id]
+        commit = _make_commit(
+            tokens=tokens,
+            prompt_length=prompt_length,
+            success=req.rollouts[idx].reward > 0.5,
+            total_reward=req.rollouts[idx].reward,
+        )
+        req.rollouts[idx].commit = commit
+        req.rollouts[idx].tokens = commit["tokens"]
+    return req, cap_seq_len
 
-    resp = b.accept_submission(req)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.BAD_TERMINATION
 
+def test_reject_cap_path_truncations_over_budget():
+    from reliquary.constants import MAX_TRUNCATED_PER_SUBMISSION
 
-def test_reject_single_cap_path_truncation_in_steady_state():
-    from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
-
-    class _LongContextModelStub:
-        class config:
-            vocab_size = 20000
-            max_position_embeddings = 20000
-
-    prompt_length = 4
-    seq_len = prompt_length + MAX_NEW_TOKENS_PROTOCOL_CAP
+    req, seq_len = _request_with_cap_truncations(MAX_TRUNCATED_PER_SUBMISSION + 1)
     b = _make_batcher(
         model=_LongContextModelStub(),
         verify_commitment_proofs_fn=_grail_with_logits(seq_len),
     )
-    req = _request()
-
-    tokens = list(range(seq_len))
-    commit = _make_commit(
-        tokens=tokens,
-        prompt_length=prompt_length,
-        success=req.rollouts[0].reward > 0.5,
-        total_reward=req.rollouts[0].reward,
-    )
-    req.rollouts[0].commit = commit
-    req.rollouts[0].tokens = commit["tokens"]
-
     resp = b.accept_submission(req)
     assert resp.accepted is False
     assert resp.reason == RejectReason.BAD_TERMINATION
+
+
+def test_accept_cap_path_truncations_at_budget():
+    from reliquary.constants import MAX_TRUNCATED_PER_SUBMISSION
+
+    req, seq_len = _request_with_cap_truncations(MAX_TRUNCATED_PER_SUBMISSION)
+    b = _make_batcher(
+        model=_LongContextModelStub(),
+        verify_commitment_proofs_fn=_grail_with_logits(seq_len),
+    )
+    resp = b.accept_submission(req)
+    assert resp.reason != RejectReason.BAD_TERMINATION
 
 
 def test_reject_eos_padding_after_natural_stop():
