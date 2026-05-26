@@ -87,4 +87,4 @@ def test_wandb_constants_present():
 def test_min_eos_probability_constant_present():
     from reliquary.constants import MIN_EOS_PROBABILITY
     assert 0.0 < MIN_EOS_PROBABILITY < 1.0
-    assert MIN_EOS_PROBABILITY == 0.02
+    assert MIN_EOS_PROBABILITY == 0.01

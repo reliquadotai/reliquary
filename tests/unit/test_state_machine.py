@@ -132,11 +132,13 @@ def test_open_window_empty_hash_pre_first_publish():
 
 
 @pytest.mark.asyncio
-async def test_publish_every_n_windows(monkeypatch):
-    """With _publish_every=3, publish is called only on windows 3 (first due to
-    None manifest) then ... actually on windows 1 (first, manifest is None) and
-    then next on window 3 (3 % 3 == 0). Verify: 5 _train_and_publish calls
-    produce exactly 2 publish calls when publish_every=3 and manifest starts None."""
+async def test_publish_every_n_trained_windows(monkeypatch):
+    """With _publish_every=3, publish is driven by successful trained windows.
+
+    The first trained window publishes because no manifest exists. After that,
+    the next publish happens after three more successful trained windows,
+    regardless of the absolute window number.
+    """
     # Patch B_BATCH so empty batches count as "full" (real-batch behaviour is
     # covered by the integration test that uses real submissions).
     monkeypatch.setattr("reliquary.validator.service.B_BATCH", 0)
@@ -180,8 +182,9 @@ async def test_publish_every_n_windows(monkeypatch):
         svc_mod.storage.upload_window_dataset = original_upload
 
     # window_n increments: 1,2,3,4,5.
-    # Publish fires when: window_n==1 (manifest is None), window_n==3 (3%3==0).
-    # Windows 2,4,5 skip. checkpoint_n advances only on publish.
+    # Publish fires when: window_n==1 (manifest is None), window_n==4
+    # (three trained windows since the last publish). Windows 2,3,5 skip.
+    # checkpoint_n advances only on publish.
     assert mock_store.publish.await_count == 2
     assert published_entries[0].checkpoint_n == 1  # first publish: next_n = 0+1 = 1
     assert published_entries[1].checkpoint_n == 2  # second publish: next_n = 1+1 = 2
@@ -264,4 +267,3 @@ async def test_resume_from_load_failure_aborts():
         )
         with pytest.raises(RuntimeError, match="corrupt checkpoint"):
             await svc._apply_resume_from()
-

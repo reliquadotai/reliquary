@@ -255,6 +255,7 @@ class ValidationService:
         self._window_n: int = 0
         self._checkpoint_n: int = 0
         self._publish_every = CHECKPOINT_PUBLISH_INTERVAL_WINDOWS
+        self._trained_windows_since_publish = 0
         self._checkpoint_store = CheckpointStore(
             validator_hotkey=wallet.hotkey.ss58_address,
             wallet=wallet,
@@ -656,11 +657,15 @@ class ValidationService:
 
         self._set_state(WindowState.PUBLISHING)
         if trained:
-            # checkpoint_n only advances on publish; use window_n for cadence.
+            self._trained_windows_since_publish += 1
+            # checkpoint_n only advances on publish. Publish cadence is based
+            # on successful trained windows rather than exact window number so
+            # a quarantined boundary window cannot freeze the public checkpoint.
             next_n = self._checkpoint_n + 1
-            # Push to HF every N windows, or immediately if no checkpoint exists yet.
+            # Push to HF every N trained windows, or immediately if no
+            # checkpoint exists yet.
             should_publish = (
-                (self._window_n % self._publish_every == 0)
+                self._trained_windows_since_publish >= self._publish_every
                 or self._checkpoint_store.current_manifest() is None
             )
             if should_publish:
@@ -669,6 +674,7 @@ class ValidationService:
                         checkpoint_n=next_n, model=self.train_model,
                     )
                     self._checkpoint_n = next_n
+                    self._trained_windows_since_publish = 0
                     self.server.set_current_checkpoint(entry)
                     # Refresh verify_model in-place so the next window's
                     # batcher verifies miners against the just-published
@@ -690,8 +696,11 @@ class ValidationService:
                     logger.exception("HF publish failed; staying on previous checkpoint")
             else:
                 logger.info(
-                    "Skipping HF publish for window_n=%d (publishing every %d)",
-                    self._window_n, self._publish_every,
+                    "Skipping HF publish for window_n=%d "
+                    "(%d/%d trained windows since last publish)",
+                    self._window_n,
+                    self._trained_windows_since_publish,
+                    self._publish_every,
                 )
 
         try:

@@ -143,7 +143,11 @@ def _patch_open_grpo_window(svc):
 
     real_open = svc_mod.open_grpo_window
 
-    def _mock_open(window_start, env, model, *, cooldown_map, hash_set, tokenizer, bootstrap=False):
+    def _mock_open(
+        window_start, env, model, *,
+        cooldown_map, hash_set, tokenizer, bootstrap=False,
+        queue_drained_predicate=None,
+    ):
         b = GrpoWindowBatcher(
             window_start=window_start,
             env=env,
@@ -151,6 +155,7 @@ def _patch_open_grpo_window(svc):
             cooldown_map=cooldown_map,
             hash_set=hash_set,
             bootstrap=bootstrap,
+            queue_drained_predicate=queue_drained_predicate,
             # Stub out torch-dependent verifiers.
             verify_commitment_proofs_fn=_always_true_proof,
             verify_signature_fn=lambda c, h: True,
@@ -216,13 +221,18 @@ async def test_open_window_passes_verify_model_to_batcher(monkeypatch):
     import reliquary.validator.service as svc_mod
     real_open = svc_mod.open_grpo_window
 
-    def _capture_open(window_start, env, model, *, cooldown_map, hash_set, tokenizer, bootstrap=False):
+    def _capture_open(
+        window_start, env, model, *,
+        cooldown_map, hash_set, tokenizer, bootstrap=False,
+        queue_drained_predicate=None,
+    ):
         captured["model"] = model
         # Return a minimal batcher stub so the rest of _open_window doesn't crash
         from reliquary.validator.batcher import GrpoWindowBatcher
         return GrpoWindowBatcher(
             window_start=window_start, env=env, model=model,
             cooldown_map=cooldown_map, hash_set=hash_set, bootstrap=bootstrap,
+            queue_drained_predicate=queue_drained_predicate,
             verify_commitment_proofs_fn=_always_true_proof,
             verify_signature_fn=lambda c, h: True,
             completion_text_fn=lambda r: "",
