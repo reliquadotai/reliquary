@@ -245,7 +245,7 @@ def test_allow_less_than_three_opposite_reward_clone_pairs():
     assert resp.reason == RejectReason.ACCEPTED
 
 
-@pytest.mark.parametrize("k", [1, 2, 3, 4, 5, 6, 7])
+@pytest.mark.parametrize("k", [2, 3, 4, 5, 6])
 def test_accept_all_sigma_zone_binary_configs(k):
     b = _make_batcher()
     req = _request(rewards=[1.0] * k + [0.0] * (M_ROLLOUTS - k))

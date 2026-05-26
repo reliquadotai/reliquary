@@ -164,8 +164,8 @@ These are the live thresholds the trainer applies on every submission. The same 
 | `B_BATCH` | 8 | Number of valid distinct-prompt submissions that seal a window |
 | `M_ROLLOUTS` | 8 | Required rollout count per submission |
 | `T_PROTO` | 0.9 | Protocol-fixed sampling temperature (validator's recompute uses this) |
-| `SIGMA_MIN` (steady) | 0.33 | Zone filter: groups below this are rejected `OUT_OF_ZONE` (binary equivalent: k ∈ [1, 7] for M=8) |
-| `BOOTSTRAP_SIGMA_MIN` | 0.33 | Bootstrap zone filter (currently same as steady) |
+| `SIGMA_MIN` (steady) | 0.43 | Zone filter: groups below this are rejected `OUT_OF_ZONE` (binary equivalent: k ∈ [2, 6] for M=8) |
+| `BOOTSTRAP_SIGMA_MIN` | 0.33 | Relaxed zone filter during first `BOOTSTRAP_WINDOWS = 100` windows (k ∈ [1, 7]) |
 | `BATCH_PROMPT_COOLDOWN_WINDOWS` | 1,000,000 | A winning prompt is effectively one-shot in the OpenMath phase |
 | `COOLDOWN_REBUILD_LOOKBACK` | 300 | R2 windows replayed at startup to rebuild cooldown without scanning the whole one-shot horizon |
 | `PROOF_SKETCH_TOLERANCE_BASE` | 5000 | GRAIL sketch tolerance — actual threshold = `5000 + 5 × √position` |

@@ -184,10 +184,10 @@ DATASET_SPLIT = "train"
 # ────────────────  GRPO MARKET (v2)  ────────────────
 
 # Minimum reward-std for a group to pass the zone filter. For binary
-# Bernoulli rewards this admits k ∈ [1, 7] for M=8 (σ at k=1/7 ≈ 0.3307).
+# Bernoulli rewards this admits k ∈ [2, 6] for M=8 (σ at k=2/6 ≈ 0.433).
 # For continuous rewards it filters groups whose rollouts clustered too
 # tight to carry meaningful GRPO signal.
-SIGMA_MIN = 0.33
+SIGMA_MIN = 0.43
 BOOTSTRAP_SIGMA_MIN = 0.33
 
 # Number of rollouts per submission (= size of each GRPO group).

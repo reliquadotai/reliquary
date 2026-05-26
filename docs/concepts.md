@@ -18,7 +18,7 @@ Three structural guarantees come with the market:
 - **Cryptographic training-data provenance.** Every rollout carries a GRAIL sketch that binds the generation to the model weights that produced it. The validator re-verifies with its own forward pass. Fabricated data earns zero.
 - **Reward-claim verification and training quarantine.** Miners submit the reward they computed locally, and the validator independently recomputes it before accepting the group. Windows with high-confidence poison signatures are archived and credited but skipped for GRPO/publish.
 
-The zone filter (`σ ≥ 0.33`, see below) is the mechanical realization of DAPO's Dynamic Sampling, reformulated to be reward-scale-agnostic. The miner-side incentive to predict σ *before* generating is what turns DAPO's post-hoc filter into an ex-ante market.
+The zone filter (`σ ≥ 0.43`, see below) is the mechanical realization of DAPO's Dynamic Sampling, reformulated to be reward-scale-agnostic. The miner-side incentive to predict σ *before* generating is what turns DAPO's post-hoc filter into an ex-ante market.
 
 ---
 
@@ -42,7 +42,7 @@ For each rollout the miner runs a bit-identical HuggingFace forward pass on the 
 `POST /submit` sends the request to the validator. In production, the HTTP response is provisional (`accepted=True, reason="submitted"`) once the request is queued. A background worker later runs the full verification pipeline (see below) and appends the submission to the open window's valid pool only if it passes.
 
 **6. Validator verifies, filters, selects batch.**
-The validator checks: window match → checkpoint hash → prompt index bounds → cooldown → per-prompt capacity → schema/token invariants → prompt-token binding → rollout-hash dedup → reward-claim verification → zone filter (`σ ≥ 0.33`) → signatures/randomness → GRAIL sketch → termination/logprob/token-distribution checks. Any failure returns a `RejectReason`. Valid submissions accumulate. Once `B_BATCH = 8` eligible distinct prompts pass, `seal_event` fires after the drand-round drain.
+The validator checks: window match → checkpoint hash → prompt index bounds → cooldown → per-prompt capacity → schema/token invariants → prompt-token binding → rollout-hash dedup → reward-claim verification → zone filter (`σ ≥ 0.43`) → signatures/randomness → GRAIL sketch → termination/logprob/token-distribution checks. Any failure returns a `RejectReason`. Valid submissions accumulate. Once `B_BATCH = 8` eligible distinct prompts pass, `seal_event` fires after the drand-round drain.
 
 **7. Validator runs a GRPO step if the batch is healthy.**
 State transitions to `TRAINING`. Before GRPO, the validator runs a training-quarantine assessment over the selected batch and the window's reject profile. Quarantined windows are still archived and credited for emissions, but they do not mutate the train model and do not publish a checkpoint. Healthy full batches run `train_step()`, which computes group-relative advantages from verifier-checked rollout rewards, applies a PPO-clipped surrogate loss + KL penalty against the frozen reference model, and steps AdamW.
@@ -67,9 +67,11 @@ Because each rollout's sketch is bound to the specific token sequence and the mo
 
 ### Zone filter — only train on useful frontier prompts
 
-`σ` is the population standard deviation of the eight rollout rewards in a group. A group with `σ < 0.33` carries essentially no gradient signal for GRPO: either every rollout succeeds (all advantages ≈ 0) or every rollout fails (same). Dropping these groups saves compute without losing learning.
+`σ` is the population standard deviation of the eight rollout rewards in a group. A group with `σ < 0.43` carries essentially no gradient signal for GRPO: either every rollout succeeds (all advantages ≈ 0) or every rollout fails (same). Dropping these groups saves compute without losing learning.
 
-Binary equivalence note: OpenMath rewards are binary `{0, 1}` (the validator extracts the final `\boxed{...}` answer and compares after conservative normalization). With binary rewards, `σ = sqrt(p(1−p))` where `p = k/8`. `σ(p=1/8) ≈ σ(p=7/8) ≈ 0.331`, so `σ ≥ 0.33` admits k=1..7.
+Binary equivalence note: OpenMath rewards are binary `{0, 1}` (the validator extracts the final `\boxed{...}` answer and compares after conservative normalization). With binary rewards, `σ = sqrt(p(1−p))` where `p = k/8`. `σ(p=2/8) ≈ σ(p=6/8) ≈ 0.433`, so `σ ≥ 0.43` admits k=2..6.
+
+Bootstrap phase (`BOOTSTRAP_WINDOWS = 100` windows from `SUBNET_START_BLOCK`): threshold relaxes to `σ ≥ 0.33` (binary equivalent: k ∈ [1, 7]) to keep batches filling while miner population and env coverage are thin.
 
 ### Cooldown — one-shot prompt rotation
 
@@ -175,7 +177,7 @@ A miner consistently landing on 2 unshared winning prompts per window gets rough
 | `PROMPT_FULL` | `MAX_SUBMISSIONS_PER_PROMPT` validated submissions already exist for this prompt | Pick a less crowded prompt |
 | `HASH_DUPLICATE` | Rollout tokens duplicate a recently accepted rollout hash | Generate fresh tokens; do not replay |
 | `REWARD_MISMATCH` | Validator reward computation failed or produced a non-finite value | Treat as malformed output/env failure; miner rewards are not trusted |
-| `OUT_OF_ZONE` | `σ < 0.33` | Pick a different prompt |
+| `OUT_OF_ZONE` | `σ < 0.43` (or `σ < 0.33` during bootstrap) | Pick a different prompt |
 | `WRONG_ROLLOUT_COUNT` | Submission does not have exactly `M_ROLLOUTS = 8` rollouts | Always submit exactly 8 |
 | `BAD_SIGNATURE` | GRAIL commit signature verification failed | Check wallet hotkey and signing code |
 | `GRAIL_FAIL` | Sketch does not match validator's forward pass | Check checkpoint, `attn_implementation`, and CUDA version |

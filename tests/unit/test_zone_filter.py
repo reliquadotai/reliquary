@@ -14,24 +14,24 @@ def test_sigma_zero_rejected():
 
 
 def test_sigma_below_min_rejected():
-    """0.3 < 0.33 → rejected."""
+    """0.3 < 0.43 → rejected."""
     assert is_in_zone(0.3) is False
 
 
 def test_sigma_at_min_accepted():
-    """σ = 0.33 passes the gate (binary k=1/7 boundary)."""
-    assert is_in_zone(0.33) is True
+    """σ = 0.43 passes the steady-state gate."""
+    assert is_in_zone(0.43) is True
 
 
 def test_sigma_above_min_accepted():
-    """σ = 0.5 passes the gate."""
+    """σ = 0.5 passes the steady-state gate."""
     assert is_in_zone(0.5) is True
 
 
-def test_binary_k1_accepted():
-    """σ ≈ 0.3307 (k=1 of 8) passes the gate."""
-    sigma = math.sqrt((1 / 8) * (7 / 8))
-    assert is_in_zone(sigma) is True
+def test_bootstrap_threshold_lower():
+    """0.35 is rejected in steady state but accepted in bootstrap."""
+    assert is_in_zone(0.35, bootstrap=False) is False
+    assert is_in_zone(0.35, bootstrap=True) is True
 
 
 def test_bootstrap_still_rejects_zero_sigma():

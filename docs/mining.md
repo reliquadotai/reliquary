@@ -122,9 +122,9 @@ The goal is to locate the *learning frontier* — prompts where the current poli
 
 ### Zone filter
 
-The validator computes the population standard deviation σ of the verifier-checked rewards for your 8 rollouts. `σ ≥ 0.33` passes; `σ < 0.33` is rejected with `OUT_OF_ZONE`.
+The validator computes the population standard deviation σ of the verifier-checked rewards for your 8 rollouts. `σ ≥ 0.43` passes; `σ < 0.43` is rejected with `OUT_OF_ZONE`. During bootstrap (first `BOOTSTRAP_WINDOWS = 100` windows) the threshold is `σ ≥ 0.33`.
 
-For OpenMath's binary `{0, 1}` rewards, this admits k=1..7 correct out of 8. You cannot cherry-pick an easy prompt (8/8 correct → σ ≈ 0) or fail on a hard prompt (0/8 correct → σ ≈ 0). Both extremes are worthless for GRPO training.
+For OpenMath's binary `{0, 1}` rewards, this admits k=2..6 correct out of 8 in steady state (k=1..7 during bootstrap). You cannot cherry-pick an easy prompt (8/8 correct → σ ≈ 0) or fail on a hard prompt (0/8 correct → σ ≈ 0). Both extremes are worthless for GRPO training.
 
 ### Payment model
 
@@ -169,7 +169,7 @@ The validator emits one of the following reasons on every failed submission. Eac
 | `BAD_PROMPT_IDX` | `prompt_idx` out of range for the active environment | Use the env's prompt-index space (`0..N-1`). v2.3 / OpenMathInstruct-2: `N ≈ 14_000_000`. |
 | `PROMPT_IN_COOLDOWN` | `prompt_idx` was in the active cooldown set | v2.3: `BATCH_PROMPT_COOLDOWN_WINDOWS = 1_000_000` makes prompts effectively single-use. Read `cooldown_prompts[]` from `/state` **before each pick** and skip anything in the list. |
 | `SUPERSEDED` / `HASH_DUPLICATE` | (deprecated v2.3+) `SUPERSEDED` no longer emitted — multiple miners may submit on the same prompt. `HASH_DUPLICATE` still active: your rollout group is bit-identical to one already accepted in the recent hash retention window. | Generate fresh — don't replay tokens. |
-| `OUT_OF_ZONE` | σ of your 8 rewards is below threshold (`SIGMA_MIN = 0.33`) | Pick a prompt where your model gets 1–7 / 8 correct — not 0/8 or 8/8 |
+| `OUT_OF_ZONE` | σ of your 8 rewards is below threshold (`SIGMA_MIN = 0.43` steady, `0.33` during the first `BOOTSTRAP_WINDOWS = 100` windows) | Pick a prompt where your model gets 2–6 / 8 correct — not 0/8 or 8/8 |
 | `REWARD_MISMATCH` | Validator reward computation failed or produced a non-finite value. Miner reward claims are no longer trusted. | Treat as malformed completion/env failure; do not depend on local rewards |
 | `GRAIL_FAIL` | Sketch differs from the validator's forward pass by more than `PROOF_SKETCH_TOLERANCE_BASE + PROOF_SKETCH_TOLERANCE_GROWTH × √position` (currently `5000 + 5 × √P`) | Same checkpoint + `attn_implementation=flash_attention_2` + matching CUDA/torch + same GPU class as validator (H200 today) |
 | `LOGPROB_MISMATCH` | Per-token log-prob deviation from validator's recompute exceeds `LOGPROB_IS_EPS = 0.10` | Same root cause as `GRAIL_FAIL` — quantization, attention kernel, or precision drift |
