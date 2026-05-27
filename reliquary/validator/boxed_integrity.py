@@ -21,6 +21,11 @@ from typing import Optional
 # Stop/special tokens that must never appear inside a final answer box.
 SPECIAL_TOKENS = ("<|im_end|>", "<|endoftext|>", "<|im_start|>")
 
+# A rollout within this many tokens of the protocol cap is treated as
+# budget-exhausted (governed by the termination guard), not a deliberate
+# malformed final answer.
+CAP_MARGIN = 256
+
 _MARKER = r"\boxed{"
 
 
@@ -69,15 +74,22 @@ def extract_boxed_spans(text: str) -> list[BoxedSpan]:
 
 
 def has_malformed_final_answer(
-    reward: float, text: str
+    reward: float,
+    text: str,
+    completion_length: Optional[int] = None,
+    cap: Optional[int] = None,
 ) -> tuple[bool, Optional[str]]:
     r"""True when a reward=0 rollout's final ``\boxed{}`` is malformed.
 
     Aligned with the env (which scores the last box). Only evaluated for
     reward < 0.5. Returns ``(False, None)`` when there is no box at all (a clean
-    give-up) or when the last box is well-formed (a legitimate wrong answer).
+    give-up), when the last box is well-formed (a legitimate wrong answer), or
+    when the rollout is within ``CAP_MARGIN`` of the protocol cap (budget
+    exhaustion — governed by the termination guard, not flagged here).
     """
     if reward is not None and reward >= 0.5:
+        return False, None
+    if completion_length is not None and cap is not None and completion_length >= cap - CAP_MARGIN:
         return False, None
     spans = extract_boxed_spans(text)
     if not spans:

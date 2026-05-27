@@ -64,6 +64,23 @@ def test_unclosed_final_box_flagged():
     assert flagged is True and reason == "malformed_final_boxed"
 
 
+def test_cap_truncated_malformed_final_is_deferred():
+    # Near the token cap -> budget exhaustion, governed by the termination
+    # guard, not flagged here.
+    flagged, _ = has_malformed_final_answer(
+        0.0, r"\boxed{8}\boxed{", completion_length=8100, cap=8192
+    )
+    assert flagged is False
+
+
+def test_non_cap_malformed_final_is_flagged():
+    # Far from the cap -> deliberate stop with a junk final box.
+    flagged, reason = has_malformed_final_answer(
+        0.0, r"\boxed{8}\boxed{", completion_length=1025, cap=8192
+    )
+    assert flagged is True and reason == "malformed_final_boxed"
+
+
 def test_reject_reason_member_exists():
     from reliquary.protocol.submission import RejectReason
     assert RejectReason.MALFORMED_FINAL_ANSWER.value == "malformed_final_answer"

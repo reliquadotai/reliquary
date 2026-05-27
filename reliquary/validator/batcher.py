@@ -19,6 +19,7 @@ from reliquary.constants import (
     B_BATCH,
     BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION,
     M_ROLLOUTS,
+    MAX_NEW_TOKENS_PROTOCOL_CAP,
     MAX_SUBMISSIONS_PER_PROMPT,
     MAX_TRUNCATED_PER_SUBMISSION,
     REJECTED_LIST_CAP_PER_HOTKEY,
@@ -601,12 +602,18 @@ class GrpoWindowBatcher:
             return reject(RejectReason.DISTRIBUTION_SUSPICIOUS, "distribution")
 
         # A reward=0 rollout whose final \boxed{} is malformed (empty,
-        # special-token, or unclosed/cap-truncated) produced no parseable answer
-        # — a fake negative used to manufacture k=4 / sigma=0.5 and pass the zone
-        # filter. Aligned with the env (which scores the last box); a well-formed
-        # wrong answer is a legitimate negative and is not flagged. Before GRAIL.
+        # special-token, or unclosed) produced no parseable answer — a fake
+        # negative used to manufacture k=4 / sigma=0.5 and pass the zone filter.
+        # Aligned with the env (which scores the last box); a well-formed wrong
+        # answer is a legitimate negative and is not flagged. Cap-truncated
+        # rollouts are deferred to the termination guard below. Before GRAIL.
         for _ri, _text in enumerate(completion_texts):
-            _bad, _bad_reason = has_malformed_final_answer(rewards[_ri], _text)
+            _rmeta = request.rollouts[_ri].commit.get("rollout", {}) or {}
+            _clen = int(_rmeta.get("completion_length", 0))
+            _bad, _bad_reason = has_malformed_final_answer(
+                rewards[_ri], _text,
+                completion_length=_clen, cap=MAX_NEW_TOKENS_PROTOCOL_CAP,
+            )
             if _bad:
                 logger.info(
                     "reject reason=malformed_final_answer hotkey=%s rollout=%d cond=%s",
