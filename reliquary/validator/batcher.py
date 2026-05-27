@@ -20,6 +20,9 @@ from reliquary.constants import (
     BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION,
     M_ROLLOUTS,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
+    MAX_POST_TRIGGER_PROOF_CANDIDATES,
+    MAX_PROOF_CANDIDATES_PER_WINDOW,
+    MAX_SEAL_QUEUE_DRAIN_SECONDS,
     MAX_SUBMISSIONS_PER_PROMPT,
     MAX_TRUNCATED_PER_SUBMISSION,
     REJECTED_LIST_CAP_PER_HOTKEY,
@@ -301,10 +304,18 @@ class GrpoWindowBatcher:
         # contexts that bypass the HTTP/worker pipeline — in that case
         # the delayed seal coroutine fires as soon as the drand round
         # expires (drain phase skipped). Production wires this to
-        # ``lambda: server._submit_queue.empty()`` so every queued
-        # trigger-round submission gets GRAIL-validated before the
-        # batch is sealed.
+        # ``lambda: server._submit_queue.empty()`` so already admitted
+        # trigger-round submissions get a short chance to finish GRAIL
+        # before the batch is sealed.
         self._queue_drained_predicate = queue_drained_predicate
+        # Proof-admission accounting is separate from ``_lock`` because the
+        # submit worker holds ``_lock`` during GRAIL. The HTTP cheap path must
+        # be able to reject over-budget submissions without waiting behind the
+        # very GPU work it is trying to bound. Counts are reservations for
+        # expensive verification attempts, not successful accepts.
+        self._proof_admission_lock = threading.Lock()
+        self._proof_admission_count = 0
+        self._post_trigger_proof_admission_count = 0
         # v2.1: checkpoint hash miners must match. Empty string disables
         # the gate (test convenience / pre-first-publish).
         self.current_checkpoint_hash: str = ""
@@ -353,6 +364,45 @@ class GrpoWindowBatcher:
         harmless — the worker re-checks the cap inside ``_accept_locked``.
         """
         return len(self._submissions_per_prompt.get(prompt_idx, ()))
+
+    @property
+    def proof_admission_count(self) -> int:
+        """Number of submissions admitted to the expensive proof path."""
+        return self._proof_admission_count
+
+    @property
+    def post_trigger_proof_admission_count(self) -> int:
+        """Number of proof-path reservations after the seal trigger round."""
+        return self._post_trigger_proof_admission_count
+
+    def try_reserve_proof_admission(
+        self,
+        request: BatchSubmissionRequest,
+    ) -> tuple[bool, str | None]:
+        """Reserve one expensive proof-verification slot for this window.
+
+        The reservation is intentionally not released when a submission fails
+        later checks. The cap bounds validator GPU work under spam; refunding
+        failed attempts would make invalid proof traffic free again.
+        """
+        with self._proof_admission_lock:
+            if self._proof_admission_count >= MAX_PROOF_CANDIDATES_PER_WINDOW:
+                return False, "proof_admission_window_full"
+
+            trigger_round = self._seal_trigger_round
+            if (
+                trigger_round is not None
+                and request.drand_round == trigger_round
+            ):
+                if (
+                    self._post_trigger_proof_admission_count
+                    >= MAX_POST_TRIGGER_PROOF_CANDIDATES
+                ):
+                    return False, "proof_admission_post_trigger_full"
+                self._post_trigger_proof_admission_count += 1
+
+            self._proof_admission_count += 1
+            return True, None
 
     # ----------------------------- ingestion -----------------------------
 
@@ -879,14 +929,15 @@ class GrpoWindowBatcher:
         submissions whose ``drand_round > _seal_trigger_round`` as
         BATCH_FILLED, so the queue can only lose items from here on.
 
-        Phase 2 — queue drain. Poll ``_queue_drained_predicate`` every
-        ~200 ms until it returns True. Only THEN do we fire the seal.
+        Phase 2 — bounded queue drain. Poll ``_queue_drained_predicate`` every
+        ~200 ms until it returns True or the drain timeout expires. Only then
+        do we fire the seal.
         Without this phase, GRAIL-pending submissions queued during the
         trigger drand round would be dropped at the worker's
         ``is_sealed`` check the instant the seal fires — defeating the
-        entire boundary-fair-split design. The drain phase guarantees
-        every queued trigger-round submission contributes to the seal
-        batch's emission distribution.
+        entire boundary-fair-split design. The timeout is the safety valve:
+        fairness improves for normal trigger-round stragglers, but a slow or
+        constantly refilled queue cannot freeze checkpoints.
 
         Defensive fallback: if the drand chain info isn't available
         (synchronous tests that disable the drand check), the boundary
@@ -916,7 +967,20 @@ class GrpoWindowBatcher:
         # waiting on GRAIL. Without ``_queue_drained_predicate`` (test
         # context), this phase is a no-op and the seal fires immediately.
         if self._queue_drained_predicate is not None:
+            drain_started = self._time_fn()
             while not self._queue_drained_predicate():
+                waited_s = self._time_fn() - drain_started
+                if waited_s >= MAX_SEAL_QUEUE_DRAIN_SECONDS:
+                    logger.warning(
+                        "seal_drain_timeout window=%d trigger_round=%s "
+                        "waited_s=%.2f proof_admitted=%d post_trigger_admitted=%d",
+                        self.window_start,
+                        self._seal_trigger_round,
+                        waited_s,
+                        self._proof_admission_count,
+                        self._post_trigger_proof_admission_count,
+                    )
+                    break
                 await asyncio.sleep(0.2)
 
         self._seal_flag.set()

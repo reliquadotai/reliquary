@@ -1515,6 +1515,51 @@ def test_seal_extension_boundary_fair_split_fires_end_to_end():
     assert abs(sum(rewards.values()) - 1.0) < 1e-9
 
 
+def test_proof_admission_global_cap_rejects_after_limit():
+    """Proof admission counts reservations, not accepted submissions.
+
+    Once the per-window proof budget is exhausted, further candidates must
+    fail before they can reach GRAIL.
+    """
+    from reliquary.constants import MAX_PROOF_CANDIDATES_PER_WINDOW
+
+    b = _make_batcher()
+    req = _request()
+    for _ in range(MAX_PROOF_CANDIDATES_PER_WINDOW):
+        admitted, reason = b.try_reserve_proof_admission(req)
+        assert admitted is True
+        assert reason is None
+
+    admitted, reason = b.try_reserve_proof_admission(req)
+    assert admitted is False
+    assert reason == "proof_admission_window_full"
+    assert b.proof_admission_count == MAX_PROOF_CANDIDATES_PER_WINDOW
+
+
+def test_proof_admission_post_trigger_cap_rejects_same_round_tail():
+    """After the seal trigger round is known, only a bounded same-round
+    tail can enter the expensive proof queue.
+    """
+    from reliquary.constants import MAX_POST_TRIGGER_PROOF_CANDIDATES
+
+    b = _make_batcher()
+    b._seal_trigger_round = 100
+    req = _request()
+    req.drand_round = 100
+
+    for _ in range(MAX_POST_TRIGGER_PROOF_CANDIDATES):
+        admitted, reason = b.try_reserve_proof_admission(req)
+        assert admitted is True
+        assert reason is None
+
+    admitted, reason = b.try_reserve_proof_admission(req)
+    assert admitted is False
+    assert reason == "proof_admission_post_trigger_full"
+    assert b.post_trigger_proof_admission_count == (
+        MAX_POST_TRIGGER_PROOF_CANDIDATES
+    )
+
+
 def test_seal_batch_cooldowns_every_rewarded_boundary_prompt():
     """Boundary runners earn emission, so their prompts must enter cooldown."""
     b = _make_batcher()
@@ -1633,6 +1678,35 @@ def test_seal_extension_waits_for_queue_drain():
         assert b._seal_flag.is_set()
         # Predicate was actually polled multiple times before flipping.
         assert poll_calls[0] >= 4
+
+    asyncio.run(_run())
+
+
+def test_seal_extension_queue_drain_timeout(monkeypatch):
+    """A never-empty queue must not keep the seal extension alive forever."""
+    import asyncio
+    import reliquary.validator.batcher as batcher_mod
+
+    now = [0.0]
+
+    def advancing_time():
+        now[0] += 0.01
+        return now[0]
+
+    monkeypatch.setattr(
+        batcher_mod, "MAX_SEAL_QUEUE_DRAIN_SECONDS", 0.0,
+    )
+
+    async def _run():
+        b = _make_batcher(
+            time_fn=advancing_time,
+            queue_drained_predicate=lambda: False,
+        )
+        _ = b.seal_event
+        await asyncio.wait_for(
+            b._delayed_seal_at_drand_boundary(), timeout=0.5,
+        )
+        assert b._seal_flag.is_set()
 
     asyncio.run(_run())
 

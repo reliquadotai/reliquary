@@ -86,6 +86,36 @@ def _setup(*,
     return s, batcher
 
 
+class _ProofAdmissionFullBatcher:
+    window_start = 500
+    current_checkpoint_hash = "sha256:current"
+    cooldown_prompts_snapshot: list[int] = []
+    valid_count = 7
+    _seal_trigger_round = 123
+    drand_round_check_enabled = False
+    proof_admission_count = 32
+    post_trigger_proof_admission_count = 8
+
+    class _Env:
+        def __len__(self):
+            return 1000
+
+    def __init__(self):
+        self.env = self._Env()
+
+    def is_sealed(self) -> bool:
+        return False
+
+    def prompt_submission_count(self, prompt_idx: int) -> int:
+        return 0
+
+    def try_reserve_proof_admission(self, request):
+        return False, "proof_admission_window_full"
+
+    def accept_submission(self, request, *, telemetry=None):  # pragma: no cover
+        raise AssertionError("proof-admission reject must happen pre-queue")
+
+
 def _assert_pre_queue_reject(s: ValidatorServer, payload: dict,
                               expected: RejectReason) -> None:
     """Common assertion: /submit returns expected reason, queue stays empty."""
@@ -171,6 +201,22 @@ def test_prompt_full_below_cap_passes():
     with TestClient(s.app) as client:
         r = client.post("/submit", json=payload)
     assert r.json()["reason"] == RejectReason.ACCEPTED.value
+
+
+def test_proof_admission_full_rejected_pre_queue():
+    """When the global proof budget is exhausted, /submit must reject before
+    queueing or running the batcher's expensive accept path.
+    """
+    s = ValidatorServer()
+    s.set_current_state(WindowState.OPEN)
+    s.set_active_batcher(_ProofAdmissionFullBatcher())
+    s._worker_task = object()
+    payload = _submission(drand_round=123)
+
+    _assert_pre_queue_reject(s, payload, RejectReason.BATCH_FILLED)
+    verdicts = list(s._verdicts.get("hkA", []))
+    assert verdicts
+    assert verdicts[-1]["reject_stage"] == "proof_admission"
 
 
 def test_pre_queue_rejects_recorded_as_verdicts():

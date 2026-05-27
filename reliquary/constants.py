@@ -118,6 +118,24 @@ REJECTED_LIST_CAP_PER_HOTKEY = 5
 # Default HTTP port the validator listens on for miner submissions.
 VALIDATOR_HTTP_PORT = 8888
 
+# Hard cap on expensive proof-verification attempts admitted per window.
+# This counts submissions reserved for GRAIL, not only submissions that pass.
+# Failed proofs are deliberately not refunded: otherwise an attacker can make
+# rejected spam free and keep the validator's GPU queue saturated.
+MAX_PROOF_CANDIDATES_PER_WINDOW = 32
+
+# After the B-th distinct prompt records a seal-trigger drand round, admit only
+# a small tail of same-round stragglers. The hard window cap above remains the
+# outer bound; this cap protects the boundary fair-split extension from turning
+# one drand burst into an unbounded proof backlog.
+MAX_POST_TRIGGER_PROOF_CANDIDATES = 8
+
+# Safety timeout for the seal extension's submit-queue drain phase. Once the
+# trigger drand round has expired, the validator waits briefly for already
+# admitted trigger-round candidates to finish GRAIL; after this timeout it seals
+# anyway so a slow or constantly refilled queue cannot freeze checkpoints.
+MAX_SEAL_QUEUE_DRAIN_SECONDS = 20.0
+
 # Active environment name (resolved by reliquary.environment.load_environment).
 ENVIRONMENT_NAME = "openmathinstruct"
 

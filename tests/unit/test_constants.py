@@ -17,6 +17,9 @@ def test_v2_sigma_bounds():
 def test_v2_group_sizes():
     assert C.M_ROLLOUTS == 8
     assert C.B_BATCH == 8
+    assert C.MAX_PROOF_CANDIDATES_PER_WINDOW == 32
+    assert C.MAX_POST_TRIGGER_PROOF_CANDIDATES == 8
+    assert C.MAX_SEAL_QUEUE_DRAIN_SECONDS == 20.0
 
 
 def test_v2_temperature_fixed_nonzero():

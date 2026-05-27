@@ -30,6 +30,8 @@ from reliquary.constants import (
     DRAND_ROUND_BACKWARD_TOLERANCE,
     ENFORCE_ENVELOPE_SIGNATURE,
     MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW,
+    MAX_POST_TRIGGER_PROOF_CANDIDATES,
+    MAX_PROOF_CANDIDATES_PER_WINDOW,
     MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
     VALIDATOR_HTTP_PORT,
 )
@@ -75,6 +77,10 @@ class _Health(BaseModel):
     batch_size: int
     queue_depth: int | None = None
     valid_submissions_count: int | None = None
+    proof_admission_count: int | None = None
+    proof_admission_limit: int = MAX_PROOF_CANDIDATES_PER_WINDOW
+    post_trigger_proof_admission_count: int | None = None
+    post_trigger_proof_admission_limit: int = MAX_POST_TRIGGER_PROOF_CANDIDATES
     checkpoint_repo_id: str | None = None
     checkpoint_revision: str | None = None
     recent_reject_counts_by_reason: dict[str, int]
@@ -251,6 +257,13 @@ class ValidatorServer:
             queue_depth=self._submit_queue.qsize(),
             valid_submissions_count=(
                 getattr(batcher, "valid_count", None) if batcher else None
+            ),
+            proof_admission_count=(
+                getattr(batcher, "proof_admission_count", None) if batcher else None
+            ),
+            post_trigger_proof_admission_count=(
+                getattr(batcher, "post_trigger_proof_admission_count", None)
+                if batcher else None
             ),
             checkpoint_repo_id=cp.repo_id if cp else None,
             checkpoint_revision=cp.revision if cp else None,
@@ -705,15 +718,46 @@ class ValidatorServer:
                     batch_filled_reason="prompt_duplicate_or_full",
                 )
 
+            reserve_proof = getattr(
+                type(batcher), "try_reserve_proof_admission", None
+            )
+            if reserve_proof is not None:
+                admitted, admission_reason = batcher.try_reserve_proof_admission(
+                    request
+                )
+                if not admitted:
+                    if self._late_drop_callback is not None:
+                        self._late_drop_callback(hk, "proof_admission_full")
+                    return _cheap_reject(
+                        RejectReason.BATCH_FILLED,
+                        reject_stage="proof_admission",
+                        batch_filled_reason=admission_reason,
+                        current_valid_count=batcher.valid_count,
+                        trigger_round=getattr(
+                            batcher, "_seal_trigger_round", None
+                        ),
+                        proof_admission_count=getattr(
+                            batcher, "proof_admission_count", None
+                        ),
+                        proof_admission_limit=MAX_PROOF_CANDIDATES_PER_WINDOW,
+                        post_trigger_proof_admission_count=getattr(
+                            batcher,
+                            "post_trigger_proof_admission_count",
+                            None,
+                        ),
+                        post_trigger_proof_admission_limit=(
+                            MAX_POST_TRIGGER_PROOF_CANDIDATES
+                        ),
+                    )
+
             # Under TestClient (no worker running) we run synchronously so
             # tests see the real ``ACCEPTED`` verdict; under uvicorn we enqueue
             # for the worker and return ``SUBMITTED`` — a distinct sentinel
             # that tells the miner the request is queued, not yet validated.
             # The real verdict (accept/reject post-GRAIL) surfaces in the
-            # validator's logs and in the R2 archive. The queue is unbounded
-            # by design: pressure from a saturated window is relieved by
-            # silently draining the leftover queue at the next batcher swap
-            # (see ``_submit_worker`` below), not by HTTP-level rejections.
+            # validator's logs and in the R2 archive. Expensive proof work is
+            # bounded by ``try_reserve_proof_admission`` above; over-budget
+            # submissions are rejected before they can enter this queue.
             if self._worker_task is None:
                 telemetry.mark_proof_started()
                 log_submission_stage(
