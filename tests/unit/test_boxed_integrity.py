@@ -57,3 +57,8 @@ def test_normalization_parity_with_reward_fn():
     # "3.0" boxed must match GT "3" the same way the reward fn would.
     flagged, reason = is_reward_manipulated(0.0, r"\boxed{3.0} ... \boxed{x}", "3")
     assert flagged is True and reason == "boxed_gt_earlier"
+
+
+def test_reject_reason_member_exists():
+    from reliquary.protocol.submission import RejectReason
+    assert RejectReason.REWARD_MANIPULATION.value == "reward_manipulation"
