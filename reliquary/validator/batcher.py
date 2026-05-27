@@ -46,6 +46,7 @@ from reliquary.validator.observability import (
     classify_drand_round,
     log_submission_stage,
 )
+from reliquary.validator.boxed_integrity import is_reward_manipulated
 from reliquary.validator.rollout_patterns import detect_opposite_reward_clones
 from reliquary.validator.verifier import (
     evaluate_boxed_answer_probability,
@@ -598,6 +599,21 @@ class GrpoWindowBatcher:
                 clone_metrics.to_log_dict(),
             )
             return reject(RejectReason.DISTRIBUTION_SUSPICIOUS, "distribution")
+
+        # Reward-manipulation: a reward=0 rollout that boxed the ground truth
+        # earlier or has a malformed final box over an earlier valid one flipped
+        # correct->wrong to manufacture k=4 / sigma=0.5. Reject before GRAIL work.
+        gt_for_box = problem.get("ground_truth", "")
+        for _ri, _text in enumerate(completion_texts):
+            _flipped, _flip_reason = is_reward_manipulated(
+                rewards[_ri], _text, gt_for_box
+            )
+            if _flipped:
+                logger.info(
+                    "reject reason=reward_manipulation hotkey=%s rollout=%d cond=%s",
+                    request.miner_hotkey, _ri, _flip_reason,
+                )
+                return reject(RejectReason.REWARD_MANIPULATION, "reward_manipulation")
 
         # Per-submission worst-case filter telemetry (across all rollouts).
         sketch_diff_max = 0

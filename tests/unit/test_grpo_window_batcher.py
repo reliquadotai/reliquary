@@ -1844,3 +1844,25 @@ def test_cap_truncated_rollout_still_runs_behavioural_checks():
     resp = b.accept_submission(req)
     assert resp.accepted is False
     assert resp.reason == RejectReason.BOXED_ANSWER_TAMPERED
+
+
+def test_reject_reward_manipulation_flip_before_grail():
+    # reward=0 rollouts box GT "a" then dangle a special-token box -> flip.
+    # FakeEnv.compute_reward returns 0.0 (no "CORRECT"), so the reward claim matches.
+    def text_fn(rollout):
+        if rollout.reward > 0.5:
+            return "CORRECT \\boxed{a}"
+        return "work \\boxed{a} then $$\\boxed{<|im_end|>"
+    b = _make_batcher(completion_text_fn=text_fn)
+    req = _request_with_prompt_unique_tokens(rewards=[1.0] * 4 + [0.0] * 4)
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.REWARD_MANIPULATION
+
+
+def test_accept_honest_failures_not_flagged_as_manipulation():
+    # reward=0 rollouts are genuine give-ups (no boxed) -> not flagged.
+    b = _make_batcher()  # default text_fn: "CORRECT" / "wrong"
+    req = _request_with_prompt_unique_tokens(rewards=[1.0] * 4 + [0.0] * 4)
+    resp = b.accept_submission(req)
+    assert resp.reason != RejectReason.REWARD_MANIPULATION
