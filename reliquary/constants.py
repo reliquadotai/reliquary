@@ -136,6 +136,12 @@ MAX_POST_TRIGGER_PROOF_CANDIDATES = 8
 # anyway so a slow or constantly refilled queue cannot freeze checkpoints.
 MAX_SEAL_QUEUE_DRAIN_SECONDS = 20.0
 
+# Liveness poll interval while an OPEN validator window waits for either a
+# normal seal trigger or an exhausted proof-admission queue. This prevents a
+# window from waiting WINDOW_TIMEOUT_SECONDS after all admitted proof work has
+# drained but fewer than B valid submissions survived validation.
+PROOF_ADMISSION_STALL_POLL_SECONDS = 0.5
+
 # Active environment name (resolved by reliquary.environment.load_environment).
 ENVIRONMENT_NAME = "openmathinstruct"
 

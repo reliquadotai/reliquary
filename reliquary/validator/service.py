@@ -28,6 +28,8 @@ from reliquary.constants import (
     MIN_EOS_PROBABILITY,
     POLL_INTERVAL_SECONDS,
     PPO_CLIP_EPSILON,
+    MAX_PROOF_CANDIDATES_PER_WINDOW,
+    PROOF_ADMISSION_STALL_POLL_SECONDS,
     SIGMA_MIN,
     SUBNET_START_BLOCK,
     VALIDATOR_HTTP_PORT,
@@ -408,6 +410,70 @@ class ValidationService:
             return
         self.server.set_active_batcher(self._active_batcher)
         self._set_state(WindowState.OPEN)
+
+    def _proof_admission_exhausted_and_drained(self, batcher) -> bool:
+        """True when bounded proof admission cannot fill this window anymore."""
+        if batcher is None or batcher.is_sealed():
+            return False
+        if getattr(batcher, "valid_count", 0) >= B_BATCH:
+            return False
+        if (
+            getattr(batcher, "proof_admission_count", 0)
+            < MAX_PROOF_CANDIDATES_PER_WINDOW
+        ):
+            return False
+        queue_depth = int(getattr(self.server, "submit_queue_depth", 0) or 0)
+        inflight = int(getattr(self.server, "proof_verification_inflight", 0) or 0)
+        return queue_depth == 0 and inflight == 0
+
+    async def _wait_for_window_seal(self) -> str:
+        """Wait for a normal seal, timeout, or bounded-admission dead end.
+
+        The hard proof cap protects validator speed, but it creates a liveness
+        edge when all admitted proofs have drained and fewer than B submissions
+        survived validation. In that state no future candidate can enter the
+        expensive path, so waiting the full window timeout only freezes
+        checkpoint progress. We seal partial immediately; training already
+        skips partial batches, while archive/EMA can still account for the
+        window.
+        """
+        batcher = self._active_batcher
+        if batcher is None:
+            return "no_active_batcher"
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + WINDOW_TIMEOUT_SECONDS
+        while True:
+            if self._proof_admission_exhausted_and_drained(batcher):
+                reason = "proof_admission_exhausted_drained"
+                logger.warning(
+                    "Window %d force-sealing partial: reason=%s "
+                    "valid=%d/%d proof_admission=%d/%d queue_depth=%d "
+                    "inflight_proofs=%d",
+                    self._window_n,
+                    reason,
+                    getattr(batcher, "valid_count", 0),
+                    B_BATCH,
+                    getattr(batcher, "proof_admission_count", 0),
+                    MAX_PROOF_CANDIDATES_PER_WINDOW,
+                    getattr(self.server, "submit_queue_depth", 0),
+                    getattr(self.server, "proof_verification_inflight", 0),
+                )
+                batcher.force_seal(reason)
+                return reason
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return "timeout"
+
+            try:
+                await asyncio.wait_for(
+                    batcher.seal_event.wait(),
+                    timeout=min(PROOF_ADMISSION_STALL_POLL_SECONDS, remaining),
+                )
+                return "sealed"
+            except asyncio.TimeoutError:
+                continue
 
     async def _set_window_randomness(self, subtensor) -> None:
         """Populate the active batcher's per-window randomness seed.
@@ -850,6 +916,7 @@ class ValidationService:
             "validator_hotkey": self.wallet.hotkey.ss58_address,  # provenance
             "randomness": batcher.randomness,
             "environment": self.env.name,
+            "force_seal_reason": getattr(batcher, "force_seal_reason", None),
             "batch": batch_entries,
             "runners_up": runners_up,
             "reject_summary": dict(getattr(batcher, "reject_counts", {})),
@@ -962,19 +1029,21 @@ class ValidationService:
                     await self._wait_for_next_drand_boundary()
                     await self._set_window_randomness(subtensor)
                     self._activate_window()
-                    try:
-                        await asyncio.wait_for(
-                            self._active_batcher.seal_event.wait(),
-                            timeout=WINDOW_TIMEOUT_SECONDS,
-                        )
+                    seal_reason = await self._wait_for_window_seal()
+                    if seal_reason == "sealed":
                         logger.info(
                             "Window %d sealed (B valid received)",
                             self._window_n,
                         )
-                    except asyncio.TimeoutError:
+                    elif seal_reason == "timeout":
                         logger.warning(
                             "Window %d timed out at %ds — sealing partial",
                             self._window_n, WINDOW_TIMEOUT_SECONDS,
+                        )
+                    else:
+                        logger.warning(
+                            "Window %d sealed by liveness breaker: %s",
+                            self._window_n, seal_reason,
                         )
 
                     await self._train_and_publish()

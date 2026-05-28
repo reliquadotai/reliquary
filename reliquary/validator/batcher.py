@@ -308,6 +308,7 @@ class GrpoWindowBatcher:
         # trigger-round submissions get a short chance to finish GRAIL
         # before the batch is sealed.
         self._queue_drained_predicate = queue_drained_predicate
+        self.force_seal_reason: str | None = None
         # Proof-admission accounting is separate from ``_lock`` because the
         # submit worker holds ``_lock`` during GRAIL. The HTTP cheap path must
         # be able to reject over-budget submissions without waiting behind the
@@ -352,6 +353,21 @@ class GrpoWindowBatcher:
         circuit further work for the current window.
         """
         return self._seal_flag.is_set()
+
+    def force_seal(self, reason: str) -> None:
+        """Force this window to seal without B distinct valid submissions.
+
+        Used only as a liveness breaker after the bounded proof-admission
+        queue has fully drained and no further expensive submissions can be
+        admitted. The downstream training path already skips partial batches;
+        this just avoids waiting for the long window timeout.
+        """
+        if self._seal_flag.is_set():
+            return
+        self.force_seal_reason = reason
+        self._seal_flag.set()
+        if self._seal_event is not None:
+            self._seal_event.set()
 
     def prompt_submission_count(self, prompt_idx: int) -> int:
         """Number of GRAIL-validated submissions already in the per-prompt

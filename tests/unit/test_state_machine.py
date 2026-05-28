@@ -122,6 +122,45 @@ def test_open_window_wires_checkpoint_hash_into_batcher():
     assert svc._active_batcher.current_checkpoint_hash == "rev_sha_005"
 
 
+@pytest.mark.asyncio
+async def test_wait_for_window_seal_force_seals_drained_proof_cap():
+    """A full proof cap with no queued/in-flight work cannot fill later."""
+    from reliquary.validator.service import MAX_PROOF_CANDIDATES_PER_WINDOW
+
+    svc = _make_service()
+    svc._open_window()
+    svc._activate_window()
+    batcher = svc._active_batcher
+
+    batcher._proof_admission_count = MAX_PROOF_CANDIDATES_PER_WINDOW
+    assert batcher.valid_count == 0
+    assert svc.server.submit_queue_depth == 0
+    assert svc.server.proof_verification_inflight == 0
+
+    reason = await svc._wait_for_window_seal()
+
+    assert reason == "proof_admission_exhausted_drained"
+    assert batcher.is_sealed()
+    assert batcher.force_seal_reason == "proof_admission_exhausted_drained"
+
+
+def test_proof_cap_breaker_waits_for_inflight_or_queued_work():
+    from reliquary.validator.service import MAX_PROOF_CANDIDATES_PER_WINDOW
+
+    svc = _make_service()
+    svc._open_window()
+    svc._activate_window()
+    batcher = svc._active_batcher
+    batcher._proof_admission_count = MAX_PROOF_CANDIDATES_PER_WINDOW
+
+    svc.server._inflight_proofs = 1
+    assert svc._proof_admission_exhausted_and_drained(batcher) is False
+
+    svc.server._inflight_proofs = 0
+    svc.server._submit_queue.put_nowait((object(), batcher, object()))
+    assert svc._proof_admission_exhausted_and_drained(batcher) is False
+
+
 def test_open_window_empty_hash_pre_first_publish():
     svc = _make_service()
     # No checkpoint published yet → current_manifest returns None

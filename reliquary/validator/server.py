@@ -76,6 +76,7 @@ class _Health(BaseModel):
     drand_round_backward_tolerance: int
     batch_size: int
     queue_depth: int | None = None
+    proof_verification_inflight: int | None = None
     valid_submissions_count: int | None = None
     proof_admission_count: int | None = None
     proof_admission_limit: int = MAX_PROOF_CANDIDATES_PER_WINDOW
@@ -101,6 +102,7 @@ class ValidatorServer:
         self._task: asyncio.Task[Any] | None = None
         self._submit_queue: asyncio.Queue = asyncio.Queue()
         self._worker_task: asyncio.Task[Any] | None = None
+        self._inflight_proofs = 0
         from reliquary.protocol.submission import WindowState
         self._current_state: WindowState = WindowState.READY
         self._current_checkpoint = None  # ManifestEntry | None
@@ -138,6 +140,14 @@ class ValidatorServer:
 
     def set_current_checkpoint(self, entry) -> None:
         self._current_checkpoint = entry
+
+    @property
+    def submit_queue_depth(self) -> int:
+        return self._submit_queue.qsize()
+
+    @property
+    def proof_verification_inflight(self) -> int:
+        return self._inflight_proofs
 
     def set_late_drop_callback(
         self, fn: Callable[[str, str], None] | None,
@@ -255,6 +265,7 @@ class ValidatorServer:
             drand_round_backward_tolerance=DRAND_ROUND_BACKWARD_TOLERANCE,
             batch_size=B_BATCH,
             queue_depth=self._submit_queue.qsize(),
+            proof_verification_inflight=self._inflight_proofs,
             valid_submissions_count=(
                 getattr(batcher, "valid_count", None) if batcher else None
             ),
@@ -1011,9 +1022,13 @@ class ValidatorServer:
                     reject_stage=None,
                     reject_reason=None,
                 )
-                response = await asyncio.to_thread(
-                    self._call_accept_submission, batcher, request, telemetry
-                )
+                self._inflight_proofs += 1
+                try:
+                    response = await asyncio.to_thread(
+                        self._call_accept_submission, batcher, request, telemetry
+                    )
+                finally:
+                    self._inflight_proofs = max(0, self._inflight_proofs - 1)
                 telemetry.refresh_from_batcher(batcher, at_decision=True)
                 telemetry.mark_decision(verified=True)
                 log_submission_stage(
