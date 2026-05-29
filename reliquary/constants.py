@@ -86,12 +86,22 @@ UPLOAD_BUFFER = NETWORK_UPLOAD_LATENCY
 # Network-wide protocol cap on completion length.
 MAX_NEW_TOKENS_PROTOCOL_CAP = 8192
 
-# Cap/non-EOS truncation budget per submission. This is an acceptance-time
-# policy: cap hits still run through GRAIL/logprob/distribution/boxed checks,
-# and the training quarantine below separately decides whether the selected
-# window is healthy enough to mutate the model.
-MAX_TRUNCATED_PER_SUBMISSION = 5
-BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION = 5
+# Cap/non-EOS truncation budget per submission. A single missing-EOS rollout
+# can be an honest local max-token accident; repeated missing-EOS rollouts in
+# one GRPO group are a sampling policy, not a rare exception, and have become
+# the main manufactured-loser path.
+MAX_TRUNCATED_PER_SUBMISSION = 1
+BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION = 1
+
+# Group-level reward-shape guard. The live attack manufactures binary reward
+# vectors such as 11110000 while cutting every zero-reward rollout to the same
+# local cap (120/150/4500 tokens). Exact repeated loser lengths are vanishingly
+# unlikely under natural sampling, especially when they occupy the ordered
+# suffix of the reward vector.
+REWARD_SHAPE_ZERO_MODE_MIN_LENGTH = 64
+REWARD_SHAPE_ZERO_MODE_MIN_SHARE = 0.75
+REWARD_SHAPE_MIN_REPEATED_ZERO_ROLLOUTS = 2
+REWARD_SHAPE_MIN_EXACT_ZERO_ROLLOUTS = 3
 
 # Training quarantine policy. Quarantine is intentionally conservative: it
 # skips train_step for windows whose selected batch has high-confidence poison
@@ -106,6 +116,8 @@ TRAINING_QUARANTINE_MAX_SINGLE_COMPLETION_LENGTH = 7000
 TRAINING_QUARANTINE_EXTREME_LENGTH_MIN_ROLLOUTS = 4
 TRAINING_QUARANTINE_EXTREME_LENGTH_MIN_GROUPS = 3
 TRAINING_QUARANTINE_REJECT_SPIKE_MIN = 32
+TRAINING_QUARANTINE_REWARD_SHAPE_MIN_GROUPS = 2
+TRAINING_QUARANTINE_LONG_ZERO_TAIL_MIN_LENGTH = 2048
 
 # Soft cap on per-hotkey entries persisted to ``archive["rejected"]`` per
 # window. Beyond this, ``reject_counts`` still increments but no metadata is

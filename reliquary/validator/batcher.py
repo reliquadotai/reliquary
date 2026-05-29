@@ -51,6 +51,7 @@ from reliquary.validator.observability import (
     log_submission_stage,
 )
 from reliquary.validator.boxed_integrity import has_malformed_final_answer
+from reliquary.validator.reward_shape import detect_reward_shape_manipulation
 from reliquary.validator.rollout_patterns import detect_opposite_reward_clones
 from reliquary.validator.verifier import (
     evaluate_boxed_answer_probability,
@@ -106,6 +107,9 @@ class ValidSubmission:
     drand_delta: int | None = None
     seal_trigger_round: int | None = None
     prompt_hash_lead: str | None = None
+    reward_vector: str = ""
+    truncated_count: int = 0
+    reward_shape: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         self.merkle_root = self.merkle_root_bytes
@@ -654,6 +658,19 @@ class GrpoWindowBatcher:
                 return reject(RejectReason.REWARD_MISMATCH, "reward")
 
         rewards = [float(r.reward) for r in request.rollouts]
+        completion_lengths = []
+        for rollout in request.rollouts:
+            rollout_meta = (rollout.commit or {}).get("rollout", {}) or {}
+            prompt_len = int(rollout_meta.get("prompt_length", 0) or 0)
+            completion_lengths.append(
+                int(
+                    rollout_meta.get(
+                        "completion_length",
+                        max(0, len(rollout.commit.get("tokens", [])) - prompt_len),
+                    )
+                    or 0
+                )
+            )
         sigma = rewards_std(rewards)
         if not is_in_zone(sigma, bootstrap=self.bootstrap):
             return reject(RejectReason.OUT_OF_ZONE, "zone")
@@ -694,17 +711,18 @@ class GrpoWindowBatcher:
         lp_dev_max: float | None = None
         dist_q10_min: float | None = None
 
-        # Steady-state training should not ingest cap/non-EOS truncated
-        # completions. Bootstrap keeps a one-rollout allowance to preserve
-        # early-window fill rate while the model is weak.
+        # Cap/non-EOS truncation is tolerated only as a rare one-rollout
+        # accident. Multiple missing-EOS rollouts in the same group are a
+        # sampling policy and make weak loser slots too easy to manufacture.
         max_truncated_per_submission = (
             BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION
             if self.bootstrap
             else MAX_TRUNCATED_PER_SUBMISSION
         )
         truncated_count = 0
+        truncated_flags = [False] * len(request.rollouts)
 
-        for rollout in request.rollouts:
+        for rollout_idx, rollout in enumerate(request.rollouts):
             if not self._verify_signature(rollout.commit, request.miner_hotkey):
                 return reject(RejectReason.BAD_SIGNATURE, "rollout_signature")
             # Randomness binding: the miner-claimed beacon randomness MUST equal
@@ -763,6 +781,7 @@ class GrpoWindowBatcher:
                     rollout.commit, self.tokenizer, proof, self.model
                 )
                 if not termination_ok or cap_truncated:
+                    truncated_flags[rollout_idx] = True
                     truncated_count += 1
                     if truncated_count > max_truncated_per_submission:
                         return reject(
@@ -850,6 +869,25 @@ class GrpoWindowBatcher:
                     dist_q10_min=dist_q10_min,
                 )
 
+        reward_shape = detect_reward_shape_manipulation(
+            rewards,
+            completion_lengths,
+            truncated_flags,
+        )
+        if reward_shape.suspicious:
+            logger.info(
+                "reject reason=reward_shape_suspicious hotkey=%s %s",
+                request.miner_hotkey,
+                reward_shape.to_log_dict(),
+            )
+            return reject(
+                RejectReason.REWARD_SHAPE_SUSPICIOUS,
+                "reward_shape",
+                sketch_diff_max=sketch_diff_max,
+                lp_dev_max=lp_dev_max,
+                dist_q10_min=dist_q10_min,
+            )
+
         # All checks passed — append to both the flat list and the per-prompt
         # bucket. The bucket is what seal_batch groups over.
         new_sub = ValidSubmission(
@@ -875,6 +913,9 @@ class GrpoWindowBatcher:
             drand_delta=telemetry.drand_delta if telemetry else None,
             seal_trigger_round=self._seal_trigger_round,
             prompt_hash_lead=telemetry.prompt_hash_lead if telemetry else None,
+            reward_vector=reward_shape.reward_vector,
+            truncated_count=truncated_count,
+            reward_shape=reward_shape.to_log_dict(),
         )
         self._valid.append(new_sub)
         self._submissions_per_prompt.setdefault(

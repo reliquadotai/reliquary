@@ -140,3 +140,4 @@ def test_new_reject_reasons_exist():
     assert RejectReason.TOKENS_MISMATCH.value == "tokens_mismatch"
     assert RejectReason.BAD_TERMINATION.value == "bad_termination"
     assert RejectReason.REWARD_DISTRIBUTION.value == "reward_distribution"
+    assert RejectReason.REWARD_SHAPE_SUSPICIOUS.value == "reward_shape_suspicious"

@@ -21,6 +21,8 @@ from reliquary.constants import (
     TRAINING_QUARANTINE_REJECT_SPIKE_MIN,
     TRAINING_QUARANTINE_EXTREME_LENGTH_MIN_GROUPS,
     TRAINING_QUARANTINE_EXTREME_LENGTH_MIN_ROLLOUTS,
+    TRAINING_QUARANTINE_LONG_ZERO_TAIL_MIN_LENGTH,
+    TRAINING_QUARANTINE_REWARD_SHAPE_MIN_GROUPS,
     TRAINING_QUARANTINE_REWARD_VECTOR_MIN_GROUPS,
 )
 
@@ -31,6 +33,7 @@ HIGH_RISK_REJECT_REASONS = {
     "distribution_suspicious",
     "tokens_mismatch",
     "reward_mismatch",
+    "reward_shape_suspicious",
 }
 
 
@@ -115,12 +118,21 @@ def assess_training_batch(
     completion_lengths: list[int] = []
     cap_length_groups = 0
     extreme_length_groups = 0
+    reward_shape_groups = 0
+    long_zero_tail_shape_groups = 0
     for group in batch:
         group_lengths = [
             _completion_length(rollout)
             for rollout in getattr(group, "rollouts", [])
         ]
         completion_lengths.extend(group_lengths)
+        reward_shape = getattr(group, "reward_shape", {}) or {}
+        if bool(reward_shape.get("suspicious", False)):
+            reward_shape_groups += 1
+            if int(reward_shape.get("zero_length_mode", 0) or 0) >= (
+                TRAINING_QUARANTINE_LONG_ZERO_TAIL_MIN_LENGTH
+            ):
+                long_zero_tail_shape_groups += 1
         if any(length >= MAX_NEW_TOKENS_PROTOCOL_CAP for length in group_lengths):
             cap_length_groups += 1
         if any(
@@ -160,6 +172,10 @@ def assess_training_batch(
         reasons.append("extreme_completion_length_density")
     if mean_completion_length >= TRAINING_QUARANTINE_MAX_MEAN_COMPLETION_LENGTH:
         reasons.append("mean_completion_length_high")
+    if long_zero_tail_shape_groups > 0:
+        reasons.append("long_zero_tail_reward_shape")
+    elif reward_shape_groups >= TRAINING_QUARANTINE_REWARD_SHAPE_MIN_GROUPS:
+        reasons.append("reward_shape_density")
 
     reject_counts = reject_counts or {}
     high_risk_rejects = sum(
@@ -187,6 +203,9 @@ def assess_training_batch(
         "cap_length_groups": cap_length_groups,
         "extreme_length_rollouts": extreme_length_rollouts,
         "extreme_length_groups": extreme_length_groups,
+        "reward_shape_groups": reward_shape_groups,
+        "reward_shape_group_share": reward_shape_groups / n_groups,
+        "long_zero_tail_shape_groups": long_zero_tail_shape_groups,
         "high_risk_rejects": high_risk_rejects,
     }
     return TrainingQuarantineDecision(

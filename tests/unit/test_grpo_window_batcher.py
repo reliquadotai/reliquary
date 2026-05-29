@@ -1119,6 +1119,25 @@ def _request_with_cap_truncations(n_truncated: int, eos_id: int = 99):
     return req, cap_seq_len
 
 
+def _set_eos_completion_lengths(req: BatchSubmissionRequest, lengths: list[int]) -> None:
+    prompt_length = 4
+    for idx, completion_length in enumerate(lengths):
+        body_token = 200 + idx
+        tokens = (
+            [10 + idx] * prompt_length
+            + [body_token] * (completion_length - 1)
+            + [99]
+        )
+        commit = _make_commit(
+            tokens=tokens,
+            prompt_length=prompt_length,
+            success=req.rollouts[idx].reward > 0.5,
+            total_reward=req.rollouts[idx].reward,
+        )
+        req.rollouts[idx].commit = commit
+        req.rollouts[idx].tokens = commit["tokens"]
+
+
 def test_reject_cap_path_truncations_over_budget():
     from reliquary.constants import MAX_TRUNCATED_PER_SUBMISSION
 
@@ -1142,6 +1161,33 @@ def test_accept_cap_path_truncations_at_budget():
     )
     resp = b.accept_submission(req)
     assert resp.reason != RejectReason.BAD_TERMINATION
+
+
+def test_reject_repeated_zero_tail_reward_shape_even_with_eos():
+    b = _make_batcher(
+        model=_ModelStubWithVocab(),
+        verify_commitment_proofs_fn=_grail_with_logits(220),
+    )
+    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+    _set_eos_completion_lengths(req, [239, 212, 213, 232, 120, 120, 120, 120])
+
+    resp = b.accept_submission(req)
+
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.REWARD_SHAPE_SUSPICIOUS
+
+
+def test_accept_ordered_rewards_with_varied_zero_lengths():
+    b = _make_batcher(
+        model=_ModelStubWithVocab(),
+        verify_commitment_proofs_fn=_grail_with_logits(220),
+    )
+    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+    _set_eos_completion_lengths(req, [239, 212, 213, 232, 120, 133, 147, 161])
+
+    resp = b.accept_submission(req)
+
+    assert resp.accepted is True
 
 
 def test_reject_eos_padding_after_natural_stop():

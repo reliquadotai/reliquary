@@ -17,9 +17,15 @@ def _rollout(reward: float, completion_length: int = 128):
     )
 
 
-def _group(hotkey: str, rewards: str, completion_length: int = 128):
+def _group(
+    hotkey: str,
+    rewards: str,
+    completion_length: int = 128,
+    reward_shape=None,
+):
     return SimpleNamespace(
         hotkey=hotkey,
+        reward_shape=reward_shape or {},
         rollouts=[
             _rollout(1.0 if bit == "1" else 0.0, completion_length)
             for bit in rewards
@@ -122,3 +128,44 @@ def test_high_risk_reject_spike_quarantines_training():
 
     assert decision.quarantined is True
     assert "high_risk_reject_spike" in decision.reasons
+
+
+def test_reward_shape_density_quarantines_training():
+    suspicious_shape = {
+        "suspicious": True,
+        "zero_length_mode": 120,
+        "zero_length_mode_count": 4,
+    }
+    batch = [
+        _group("hk1", "11110000", reward_shape=suspicious_shape),
+        _group("hk2", "11110000", reward_shape=suspicious_shape),
+    ] + [
+        _group(f"hk{i}", "11001100")
+        for i in range(3, 9)
+    ]
+
+    decision = assess_training_batch(batch, reject_counts={})
+
+    assert decision.quarantined is True
+    assert "reward_shape_density" in decision.reasons
+    assert decision.metrics["reward_shape_groups"] == 2
+
+
+def test_single_long_zero_tail_shape_quarantines_training():
+    suspicious_shape = {
+        "suspicious": True,
+        "zero_length_mode": 4500,
+        "zero_length_mode_count": 2,
+    }
+    batch = [
+        _group("hk1", "11111100", reward_shape=suspicious_shape),
+    ] + [
+        _group(f"hk{i}", "11001100")
+        for i in range(2, 9)
+    ]
+
+    decision = assess_training_batch(batch, reject_counts={})
+
+    assert decision.quarantined is True
+    assert "long_zero_tail_reward_shape" in decision.reasons
+    assert decision.metrics["long_zero_tail_shape_groups"] == 1

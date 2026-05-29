@@ -819,6 +819,9 @@ class ValidationService:
                 ),
                 "reject_stage": getattr(s, "reject_stage", None),
                 "reject_reason": getattr(s, "reason", None) if rejected else None,
+                "reward_vector": getattr(s, "reward_vector", None),
+                "truncated_count": getattr(s, "truncated_count", None),
+                "reward_shape": getattr(s, "reward_shape", None),
             }
 
         def _rollout_payload(s, with_text: bool):

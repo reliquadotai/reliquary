@@ -70,6 +70,7 @@ class RejectReason(str, Enum):
     BAD_TERMINATION = "bad_termination"
     BOXED_ANSWER_TAMPERED = "boxed_answer_tampered"
     MALFORMED_FINAL_ANSWER = "malformed_final_answer"
+    REWARD_SHAPE_SUSPICIOUS = "reward_shape_suspicious"
     WRONG_CHECKPOINT = "wrong_checkpoint"
     WRONG_RANDOMNESS = "wrong_randomness"
     WORKER_DROPPED = "worker_dropped"
