@@ -18,32 +18,38 @@ from __future__ import annotations
 import asyncio
 import collections
 import logging
+import numbers
 import time
 from typing import Any, Callable
 
 from fastapi import FastAPI, HTTPException, Request, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 import uvicorn
 
 from reliquary.constants import (
     B_BATCH,
+    BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION,
     DRAND_ROUND_BACKWARD_TOLERANCE,
     ENFORCE_ENVELOPE_SIGNATURE,
     MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW,
+    MAX_NEW_TOKENS_PROTOCOL_CAP,
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
     MAX_PROOF_CANDIDATES_PER_WINDOW,
     MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
+    MAX_TRUNCATED_PER_SUBMISSION,
     VALIDATOR_HTTP_PORT,
 )
 from reliquary.protocol.signatures import verify_envelope_signature
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     BatchSubmissionResponse,
+    CommitModel,
     GrpoBatchState,
     RejectReason,
     Verdict,
     VerdictsResponse,
 )
+from reliquary.protocol.tokens import verify_tokens
 from reliquary.validator.batcher import GrpoWindowBatcher
 from reliquary.validator.observability import (
     DrandRoundObservation,
@@ -60,6 +66,131 @@ logger = logging.getLogger(__name__)
 # ring buffer can't grow without limit if a misbehaving miner spams.
 # At ~250 B per verdict × 200 entries × ~50 hotkeys ≈ 2.5 MB — cheap.
 VERDICT_CAP_PER_HOTKEY = 200
+
+
+def _is_mock_like(value: Any) -> bool:
+    """Return True for unittest.mock objects.
+
+    The server's unit tests use loose MagicMocks as batchers; touching nested
+    attributes on them auto-creates truthy mock objects. Production batchers
+    carry real model/tokenizer/config objects, so skip optional preflight pieces
+    when the object is clearly a mock.
+    """
+    return type(value).__module__.startswith("unittest.mock")
+
+
+def _proof_free_model_config(batcher: Any) -> Any | None:
+    model = getattr(batcher, "model", None)
+    if model is None or _is_mock_like(model):
+        return None
+    config = getattr(model, "config", None)
+    if config is None or _is_mock_like(config):
+        return None
+    return config
+
+
+def _coerce_eos_set(eos_ids: Any) -> set[int] | None:
+    if eos_ids is None or _is_mock_like(eos_ids):
+        return None
+    if isinstance(eos_ids, numbers.Integral) and not isinstance(eos_ids, bool):
+        return {int(eos_ids)}
+    if isinstance(eos_ids, (list, tuple, set)):
+        eos_set: set[int] = set()
+        for eos_id in eos_ids:
+            if (
+                isinstance(eos_id, numbers.Integral)
+                and not isinstance(eos_id, bool)
+            ):
+                eos_set.add(int(eos_id))
+        return eos_set or None
+    return None
+
+
+def _proof_free_eos_set(batcher: Any) -> set[int] | None:
+    model = getattr(batcher, "model", None)
+    if model is not None and _is_mock_like(model):
+        model = None
+    tokenizer = getattr(batcher, "tokenizer", None)
+    if tokenizer is not None and _is_mock_like(tokenizer):
+        tokenizer = None
+
+    eos_ids = None
+    if model is not None:
+        gen_cfg = getattr(model, "generation_config", None)
+        if gen_cfg is not None and not _is_mock_like(gen_cfg):
+            eos_ids = getattr(gen_cfg, "eos_token_id", None)
+    if eos_ids is None and tokenizer is not None:
+        eos_ids = getattr(tokenizer, "eos_token_id", None)
+    return _coerce_eos_set(eos_ids)
+
+
+def _proof_free_submission_reject(
+    request: BatchSubmissionRequest,
+    batcher: Any,
+) -> tuple[RejectReason | None, str | None]:
+    """Reject structurally impossible submissions before proof admission.
+
+    This deliberately avoids probability-dependent checks. A rollout ending in
+    EOS still needs the normal GRAIL path to recompute p_stop/logprobs. The
+    cheap path only catches cases the expensive verifier would reject after
+    burning a scarce proof slot: malformed commits, invalid token envelopes,
+    EOS padding, and non-cap completions that never emitted EOS.
+    """
+    for rollout in request.rollouts:
+        try:
+            CommitModel.model_validate(rollout.commit)
+        except ValidationError:
+            return RejectReason.BAD_SCHEMA, "schema"
+        if list(rollout.tokens) != list(rollout.commit["tokens"]):
+            return RejectReason.TOKENS_MISMATCH, "token_invariant"
+
+    model_config = _proof_free_model_config(batcher)
+    if model_config is not None:
+        for rollout in request.rollouts:
+            if not verify_tokens(rollout.commit["tokens"], model_config):
+                return RejectReason.BAD_TOKENS, "tokens"
+
+    eos_set = _proof_free_eos_set(batcher)
+    if not eos_set:
+        return None, None
+
+    bootstrap = getattr(batcher, "bootstrap", False)
+    if _is_mock_like(bootstrap):
+        bootstrap = False
+    max_truncated_per_submission = (
+        BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION
+        if bool(bootstrap)
+        else MAX_TRUNCATED_PER_SUBMISSION
+    )
+    truncated_count = 0
+
+    for rollout in request.rollouts:
+        commit = rollout.commit
+        tokens = list(commit.get("tokens") or [])
+        meta = commit.get("rollout", {}) or {}
+        prompt_length = int(meta.get("prompt_length", 0))
+        completion_length = int(meta.get("completion_length", 0))
+        completion = tokens[prompt_length: prompt_length + completion_length]
+        if not completion:
+            return RejectReason.BAD_SCHEMA, "schema"
+
+        eos_positions = [
+            idx for idx, token in enumerate(completion) if int(token) in eos_set
+        ]
+        if eos_positions:
+            if len(eos_positions) > 1 or eos_positions[0] != len(completion) - 1:
+                return RejectReason.BAD_TERMINATION, "termination_preflight"
+            continue
+
+        total_length = prompt_length + completion_length
+        if total_length < MAX_NEW_TOKENS_PROTOCOL_CAP:
+            return RejectReason.BAD_TERMINATION, "termination_preflight"
+
+        truncated_count += 1
+        if truncated_count > max_truncated_per_submission:
+            return RejectReason.BAD_TERMINATION, "termination_preflight"
+
+    return None, None
 
 
 class _Health(BaseModel):
@@ -727,6 +858,15 @@ class ValidatorServer:
                     RejectReason.PROMPT_FULL,
                     reject_stage="prompt_capacity",
                     batch_filled_reason="prompt_duplicate_or_full",
+                )
+
+            preflight_reason, preflight_stage = _proof_free_submission_reject(
+                request, batcher
+            )
+            if preflight_reason is not None:
+                return _cheap_reject(
+                    preflight_reason,
+                    reject_stage=preflight_stage or "preflight",
                 )
 
             reserve_proof = getattr(

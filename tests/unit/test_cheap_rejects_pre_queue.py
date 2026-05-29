@@ -12,6 +12,8 @@ on /submit, and the submit_queue is NOT populated (the worker never sees
 the request).
 """
 
+from copy import deepcopy
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from fastapi.testclient import TestClient
@@ -48,6 +50,27 @@ def _submission(prompt_idx: int = 42, checkpoint_hash: str = "sha256:current",
         "checkpoint_hash": checkpoint_hash,
         "drand_round": drand_round,
     }
+
+
+def _submission_with_completion_tokens(completion_tokens: list[int]) -> dict:
+    payload = _submission()
+    prompt_tokens = list(range(4))
+    tokens = prompt_tokens + list(completion_tokens)
+    rollouts = []
+    for rollout in payload["rollouts"]:
+        commit = deepcopy(rollout["commit"])
+        commit["tokens"] = list(tokens)
+        commit["commitments"] = [{"sketch": 0} for _ in tokens]
+        commit["rollout"]["prompt_length"] = len(prompt_tokens)
+        commit["rollout"]["completion_length"] = len(completion_tokens)
+        commit["rollout"]["token_logprobs"] = [0.0] * len(tokens)
+        rollouts.append({
+            "tokens": list(tokens),
+            "reward": rollout["reward"],
+            "commit": commit,
+        })
+    payload["rollouts"] = rollouts
+    return payload
 
 
 def _setup(*,
@@ -114,6 +137,48 @@ class _ProofAdmissionFullBatcher:
 
     def accept_submission(self, request, *, telemetry=None):  # pragma: no cover
         raise AssertionError("proof-admission reject must happen pre-queue")
+
+
+class _PreflightAdmissionBatcher:
+    window_start = 500
+    current_checkpoint_hash = "sha256:current"
+    cooldown_prompts_snapshot: list[int] = []
+    valid_count = 0
+    _seal_trigger_round = None
+    drand_round_check_enabled = False
+    proof_admission_count = 0
+    post_trigger_proof_admission_count = 0
+    bootstrap = False
+
+    class _Env:
+        def __len__(self):
+            return 1000
+
+    def __init__(self, eos_token_id: int = 99):
+        self.env = self._Env()
+        self.tokenizer = SimpleNamespace(eos_token_id=eos_token_id)
+        self.model = SimpleNamespace(
+            config=SimpleNamespace(
+                vocab_size=200_000,
+                max_position_embeddings=20_000,
+            ),
+            generation_config=SimpleNamespace(eos_token_id=eos_token_id),
+        )
+
+    def is_sealed(self) -> bool:
+        return False
+
+    def prompt_submission_count(self, prompt_idx: int) -> int:
+        return 0
+
+    def try_reserve_proof_admission(self, request):
+        self.proof_admission_count += 1
+        return True, None
+
+    def accept_submission(self, request, *, telemetry=None):
+        return BatchSubmissionResponse(
+            accepted=True, reason=RejectReason.ACCEPTED,
+        )
 
 
 def _assert_pre_queue_reject(s: ValidatorServer, payload: dict,
@@ -217,6 +282,55 @@ def test_proof_admission_full_rejected_pre_queue():
     verdicts = list(s._verdicts.get("hkA", []))
     assert verdicts
     assert verdicts[-1]["reject_stage"] == "proof_admission"
+
+
+def test_non_cap_non_eos_rejected_before_proof_admission():
+    """Short completions that never emit EOS cannot pass termination, so they
+    must not reserve one of the scarce proof slots first."""
+    s = ValidatorServer()
+    s.set_current_state(WindowState.OPEN)
+    batcher = _PreflightAdmissionBatcher(eos_token_id=99)
+    s.set_active_batcher(batcher)
+    payload = _submission_with_completion_tokens(list(range(4, 36)))
+
+    _assert_pre_queue_reject(s, payload, RejectReason.BAD_TERMINATION)
+    assert batcher.proof_admission_count == 0
+    verdicts = list(s._verdicts.get("hkA", []))
+    assert verdicts
+    assert verdicts[-1]["reject_stage"] == "termination_preflight"
+
+
+def test_eos_padding_rejected_before_proof_admission():
+    """Repeated or interior EOS tokens are structural padding and should be
+    rejected before they can enter the GRAIL queue."""
+    s = ValidatorServer()
+    s.set_current_state(WindowState.OPEN)
+    batcher = _PreflightAdmissionBatcher(eos_token_id=99)
+    s.set_active_batcher(batcher)
+    completion_tokens = list(range(4, 35)) + [99]
+    completion_tokens[10] = 99
+    payload = _submission_with_completion_tokens(completion_tokens)
+
+    _assert_pre_queue_reject(s, payload, RejectReason.BAD_TERMINATION)
+    assert batcher.proof_admission_count == 0
+
+
+def test_final_eos_reaches_proof_admission():
+    """The preflight is structural only: a normal final-EOS completion still
+    goes through proof admission and the existing verifier decides p_stop."""
+    s = ValidatorServer()
+    s.set_current_state(WindowState.OPEN)
+    batcher = _PreflightAdmissionBatcher(eos_token_id=99)
+    s.set_active_batcher(batcher)
+    payload = _submission_with_completion_tokens(list(range(4, 35)) + [99])
+
+    with TestClient(s.app) as client:
+        r = client.post("/submit", json=payload)
+
+    body = r.json()
+    assert body["accepted"] is True, body
+    assert body["reason"] == RejectReason.ACCEPTED.value
+    assert batcher.proof_admission_count == 1
 
 
 def test_pre_queue_rejects_recorded_as_verdicts():
