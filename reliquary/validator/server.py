@@ -51,6 +51,7 @@ from reliquary.protocol.submission import (
 )
 from reliquary.protocol.tokens import verify_tokens
 from reliquary.validator.batcher import GrpoWindowBatcher
+from reliquary.validator.dedup import compute_rollout_hash
 from reliquary.validator.observability import (
     DrandRoundObservation,
     SubmitTelemetry,
@@ -58,6 +59,7 @@ from reliquary.validator.observability import (
     log_submission_stage,
     runtime_revision,
 )
+from reliquary.validator.verifier import is_in_zone, rewards_std
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +126,13 @@ def _proof_free_eos_set(batcher: Any) -> set[int] | None:
     return _coerce_eos_set(eos_ids)
 
 
+def _proof_free_bootstrap(batcher: Any) -> bool:
+    bootstrap = getattr(batcher, "bootstrap", False)
+    if _is_mock_like(bootstrap):
+        return False
+    return bool(bootstrap)
+
+
 def _proof_free_submission_reject(
     request: BatchSubmissionRequest,
     batcher: Any,
@@ -145,21 +154,55 @@ def _proof_free_submission_reject(
             return RejectReason.TOKENS_MISMATCH, "token_invariant"
 
     model_config = _proof_free_model_config(batcher)
+    canonical_prompt_tokens: list[int] | None = None
+    canonical_prompt_fn = getattr(batcher, "_canonical_prompt_tokens", None)
+    if (
+        callable(canonical_prompt_fn)
+        and not _is_mock_like(canonical_prompt_fn)
+    ):
+        canonical_prompt_tokens = list(canonical_prompt_fn(request.prompt_idx))
+
     if model_config is not None:
         for rollout in request.rollouts:
             if not verify_tokens(rollout.commit["tokens"], model_config):
                 return RejectReason.BAD_TOKENS, "tokens"
 
+            if canonical_prompt_tokens is not None:
+                rollout_meta = rollout.commit.get("rollout", {}) or {}
+                miner_prompt_len = int(rollout_meta.get("prompt_length", 0))
+                miner_prompt_tokens = list(rollout.commit.get("tokens", []))[
+                    :miner_prompt_len
+                ]
+                if miner_prompt_tokens != canonical_prompt_tokens:
+                    return RejectReason.PROMPT_MISMATCH, "prompt_binding"
+
+    hash_set = getattr(batcher, "_hash_set", None)
+    if hash_set is not None and not _is_mock_like(hash_set):
+        local_seen: set[bytes] = set()
+        for rollout in request.rollouts:
+            try:
+                rollout_hash = compute_rollout_hash(rollout.commit["tokens"])
+            except ValueError:
+                return RejectReason.BAD_TOKENS, "tokens"
+            if rollout_hash in local_seen or rollout_hash in hash_set:
+                return RejectReason.HASH_DUPLICATE, "dedup"
+            local_seen.add(rollout_hash)
+
+    if not _is_mock_like(batcher):
+        rewards = [float(rollout.reward) for rollout in request.rollouts]
+        if not is_in_zone(
+            rewards_std(rewards),
+            bootstrap=_proof_free_bootstrap(batcher),
+        ):
+            return RejectReason.OUT_OF_ZONE, "zone"
+
     eos_set = _proof_free_eos_set(batcher)
     if not eos_set:
         return None, None
 
-    bootstrap = getattr(batcher, "bootstrap", False)
-    if _is_mock_like(bootstrap):
-        bootstrap = False
     max_truncated_per_submission = (
         BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION
-        if bool(bootstrap)
+        if _proof_free_bootstrap(batcher)
         else MAX_TRUNCATED_PER_SUBMISSION
     )
     truncated_count = 0
@@ -860,19 +903,19 @@ class ValidatorServer:
                     batch_filled_reason="prompt_duplicate_or_full",
                 )
 
-            preflight_reason, preflight_stage = _proof_free_submission_reject(
-                request, batcher
-            )
-            if preflight_reason is not None:
-                return _cheap_reject(
-                    preflight_reason,
-                    reject_stage=preflight_stage or "preflight",
-                )
-
             reserve_proof = getattr(
                 type(batcher), "try_reserve_proof_admission", None
             )
             if reserve_proof is not None:
+                preflight_reason, preflight_stage = _proof_free_submission_reject(
+                    request, batcher
+                )
+                if preflight_reason is not None:
+                    return _cheap_reject(
+                        preflight_reason,
+                        reject_stage=preflight_stage or "preflight",
+                    )
+
                 admitted, admission_reason = batcher.try_reserve_proof_admission(
                     request
                 )

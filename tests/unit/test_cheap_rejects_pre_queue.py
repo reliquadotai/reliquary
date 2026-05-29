@@ -24,6 +24,8 @@ from reliquary.protocol.submission import (
 )
 from reliquary.validator.server import ValidatorServer
 
+_IN_ZONE_REWARDS = [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+
 
 def _submission(prompt_idx: int = 42, checkpoint_hash: str = "sha256:current",
                 window_start: int = 500, drand_round: int = 0,
@@ -52,12 +54,17 @@ def _submission(prompt_idx: int = 42, checkpoint_hash: str = "sha256:current",
     }
 
 
-def _submission_with_completion_tokens(completion_tokens: list[int]) -> dict:
+def _submission_with_completion_tokens(
+    completion_tokens: list[int],
+    *,
+    rewards: list[float] | None = None,
+) -> dict:
     payload = _submission()
     prompt_tokens = list(range(4))
     tokens = prompt_tokens + list(completion_tokens)
     rollouts = []
-    for rollout in payload["rollouts"]:
+    reward_values = rewards or [rollout["reward"] for rollout in payload["rollouts"]]
+    for idx, rollout in enumerate(payload["rollouts"]):
         commit = deepcopy(rollout["commit"])
         commit["tokens"] = list(tokens)
         commit["commitments"] = [{"sketch": 0} for _ in tokens]
@@ -66,7 +73,7 @@ def _submission_with_completion_tokens(completion_tokens: list[int]) -> dict:
         commit["rollout"]["token_logprobs"] = [0.0] * len(tokens)
         rollouts.append({
             "tokens": list(tokens),
-            "reward": rollout["reward"],
+            "reward": reward_values[idx],
             "commit": commit,
         })
     payload["rollouts"] = rollouts
@@ -154,7 +161,13 @@ class _PreflightAdmissionBatcher:
         def __len__(self):
             return 1000
 
-    def __init__(self, eos_token_id: int = 99):
+    def __init__(
+        self,
+        eos_token_id: int = 99,
+        *,
+        canonical_prompt_tokens: list[int] | None = None,
+        hash_set=None,
+    ):
         self.env = self._Env()
         self.tokenizer = SimpleNamespace(eos_token_id=eos_token_id)
         self.model = SimpleNamespace(
@@ -164,6 +177,11 @@ class _PreflightAdmissionBatcher:
             ),
             generation_config=SimpleNamespace(eos_token_id=eos_token_id),
         )
+        self._hash_set = hash_set
+        if canonical_prompt_tokens is None:
+            self._canonical_prompt_tokens = None
+        else:
+            self._canonical_prompt_tokens = lambda prompt_idx: canonical_prompt_tokens
 
     def is_sealed(self) -> bool:
         return False
@@ -276,7 +294,11 @@ def test_proof_admission_full_rejected_pre_queue():
     s.set_current_state(WindowState.OPEN)
     s.set_active_batcher(_ProofAdmissionFullBatcher())
     s._worker_task = object()
-    payload = _submission(drand_round=123)
+    payload = _submission_with_completion_tokens(
+        list(range(4, 36)),
+        rewards=_IN_ZONE_REWARDS,
+    )
+    payload["drand_round"] = 123
 
     _assert_pre_queue_reject(s, payload, RejectReason.BATCH_FILLED)
     verdicts = list(s._verdicts.get("hkA", []))
@@ -291,7 +313,10 @@ def test_non_cap_non_eos_rejected_before_proof_admission():
     s.set_current_state(WindowState.OPEN)
     batcher = _PreflightAdmissionBatcher(eos_token_id=99)
     s.set_active_batcher(batcher)
-    payload = _submission_with_completion_tokens(list(range(4, 36)))
+    payload = _submission_with_completion_tokens(
+        list(range(4, 36)),
+        rewards=_IN_ZONE_REWARDS,
+    )
 
     _assert_pre_queue_reject(s, payload, RejectReason.BAD_TERMINATION)
     assert batcher.proof_admission_count == 0
@@ -309,7 +334,10 @@ def test_eos_padding_rejected_before_proof_admission():
     s.set_active_batcher(batcher)
     completion_tokens = list(range(4, 35)) + [99]
     completion_tokens[10] = 99
-    payload = _submission_with_completion_tokens(completion_tokens)
+    payload = _submission_with_completion_tokens(
+        completion_tokens,
+        rewards=_IN_ZONE_REWARDS,
+    )
 
     _assert_pre_queue_reject(s, payload, RejectReason.BAD_TERMINATION)
     assert batcher.proof_admission_count == 0
@@ -322,7 +350,10 @@ def test_final_eos_reaches_proof_admission():
     s.set_current_state(WindowState.OPEN)
     batcher = _PreflightAdmissionBatcher(eos_token_id=99)
     s.set_active_batcher(batcher)
-    payload = _submission_with_completion_tokens(list(range(4, 35)) + [99])
+    payload = _submission_with_completion_tokens(
+        list(range(4, 35)) + [99],
+        rewards=_IN_ZONE_REWARDS,
+    )
 
     with TestClient(s.app) as client:
         r = client.post("/submit", json=payload)
@@ -331,6 +362,56 @@ def test_final_eos_reaches_proof_admission():
     assert body["accepted"] is True, body
     assert body["reason"] == RejectReason.ACCEPTED.value
     assert batcher.proof_admission_count == 1
+
+
+def test_claimed_out_of_zone_rejected_before_proof_admission():
+    """A claimed reward vector with no GRPO variance can never be accepted, so
+    reject it before proof admission without running reward/env code."""
+    s = ValidatorServer()
+    s.set_current_state(WindowState.OPEN)
+    batcher = _PreflightAdmissionBatcher(eos_token_id=99)
+    s.set_active_batcher(batcher)
+    payload = _submission_with_completion_tokens(list(range(4, 35)) + [99])
+
+    _assert_pre_queue_reject(s, payload, RejectReason.OUT_OF_ZONE)
+    assert batcher.proof_admission_count == 0
+    verdicts = list(s._verdicts.get("hkA", []))
+    assert verdicts[-1]["reject_stage"] == "zone"
+
+
+def test_prompt_mismatch_rejected_before_proof_admission():
+    """Prompt-token binding is deterministic from the commit and canonical
+    prompt tokens, so mismatches should not consume proof admission."""
+    s = ValidatorServer()
+    s.set_current_state(WindowState.OPEN)
+    batcher = _PreflightAdmissionBatcher(
+        eos_token_id=99,
+        canonical_prompt_tokens=[100, 101, 102, 103],
+    )
+    s.set_active_batcher(batcher)
+    payload = _submission_with_completion_tokens(
+        list(range(4, 35)) + [99],
+        rewards=_IN_ZONE_REWARDS,
+    )
+
+    _assert_pre_queue_reject(s, payload, RejectReason.PROMPT_MISMATCH)
+    assert batcher.proof_admission_count == 0
+
+
+def test_hash_duplicate_rejected_before_proof_admission():
+    """Duplicate rollout-token hashes are a deterministic dedup failure and
+    should not spend a proof slot."""
+    s = ValidatorServer()
+    s.set_current_state(WindowState.OPEN)
+    batcher = _PreflightAdmissionBatcher(eos_token_id=99, hash_set=set())
+    s.set_active_batcher(batcher)
+    payload = _submission_with_completion_tokens(
+        list(range(4, 35)) + [99],
+        rewards=_IN_ZONE_REWARDS,
+    )
+
+    _assert_pre_queue_reject(s, payload, RejectReason.HASH_DUPLICATE)
+    assert batcher.proof_admission_count == 0
 
 
 def test_pre_queue_rejects_recorded_as_verdicts():
