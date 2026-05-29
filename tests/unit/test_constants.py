@@ -20,6 +20,9 @@ def test_v2_group_sizes():
     assert C.MAX_PROOF_CANDIDATES_PER_WINDOW == 32
     assert C.MAX_POST_TRIGGER_PROOF_CANDIDATES == 8
     assert C.MAX_SEAL_QUEUE_DRAIN_SECONDS == 20.0
+    assert C.SPARSE_VALID_IDLE_SEAL_SECONDS == 180.0
+    assert C.SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS == 4
+    assert C.SPARSE_VALID_MAX_WINDOW_SECONDS == 600.0
 
 
 def test_v2_temperature_fixed_nonzero():

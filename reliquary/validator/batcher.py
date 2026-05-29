@@ -228,6 +228,8 @@ class GrpoWindowBatcher:
         self.window_opened_at: float = self._time_fn()
         self.window_opened_wall_ts: float = self._wall_clock()
         self.window_open_drand_round: int | None = None
+        self.last_valid_submission_at: float | None = None
+        self.last_valid_submission_wall_ts: float | None = None
 
         self._cooldown = (
             cooldown_map if cooldown_map is not None
@@ -409,6 +411,12 @@ class GrpoWindowBatcher:
             s.prompt_idx for s in list(self._valid)
             if not self._cooldown.is_in_cooldown(s.prompt_idx, self.window_start)
         })
+
+    def seconds_since_last_valid_submission(self) -> float | None:
+        """Seconds since the last accepted valid submission, or None."""
+        if self.last_valid_submission_at is None:
+            return None
+        return max(0.0, self._time_fn() - self.last_valid_submission_at)
 
     @property
     def proof_admission_count(self) -> int:
@@ -962,6 +970,8 @@ class GrpoWindowBatcher:
         self._submissions_per_prompt.setdefault(
             request.prompt_idx, []
         ).append(new_sub)
+        self.last_valid_submission_at = self._time_fn()
+        self.last_valid_submission_wall_ts = self._wall_clock()
         # Lock-free read in /state — see ``__init__`` for rationale.
         self.valid_count = len(self._valid)
 

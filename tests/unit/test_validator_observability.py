@@ -29,6 +29,7 @@ class _ObservableBatcher:
     cooldown_prompts_snapshot: list[int] = []
     valid_count = 3
     window_open_drand_round = 100
+    last_valid_submission_wall_ts = 1234.5
     drand_round_backward_tolerance = 0
 
     def __init__(self) -> None:
@@ -42,6 +43,12 @@ class _ObservableBatcher:
 
     def prompt_submission_count(self, prompt_idx: int) -> int:
         return 0
+
+    def distinct_valid_prompt_count(self) -> int:
+        return 2
+
+    def seconds_since_last_valid_submission(self) -> float:
+        return 12.5
 
     def observe_drand_round(self, drand_round: int, *, t_arrival=None):
         reject = None
@@ -206,6 +213,12 @@ def test_health_endpoint_does_not_leak_secrets(monkeypatch):
     assert body["status"] == "ok"
     assert body["batch_size"] > 0
     assert body["current_quicknet_drand_round"] == 123
+    assert body["distinct_valid_prompt_count"] == 2
+    assert body["last_valid_submission_ts"] == 1234.5
+    assert body["seconds_since_last_valid_submission"] == 12.5
+    assert body["sparse_valid_idle_seal_seconds"] == 180.0
+    assert body["sparse_valid_idle_min_distinct_prompts"] == 4
+    assert body["sparse_valid_max_window_seconds"] == 600.0
     assert "secret-value-123" not in text
     assert "access-key-value-123" not in text
     assert "hf_secret_value_123" not in text

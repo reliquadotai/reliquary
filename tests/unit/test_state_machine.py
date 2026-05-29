@@ -204,6 +204,53 @@ async def test_wait_for_window_seal_force_seals_duplicate_prompt_shortfall(monke
     assert batcher.force_seal_reason == reason
 
 
+@pytest.mark.asyncio
+async def test_wait_for_window_seal_force_seals_sparse_valid_idle(monkeypatch):
+    """Sparse valid traffic should not wait for the long safety timeout."""
+    monkeypatch.setattr(
+        "reliquary.validator.service.SPARSE_VALID_IDLE_SEAL_SECONDS", 0.0,
+    )
+    monkeypatch.setattr(
+        "reliquary.validator.service.SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS", 4,
+    )
+    svc = _make_service()
+    svc._open_window()
+    svc._activate_window()
+    batcher = svc._active_batcher
+    batcher._valid = [SimpleNamespace(prompt_idx=i) for i in range(4)]
+    batcher.valid_count = 4
+    batcher.last_valid_submission_at = batcher._time_fn() - 1.0
+    batcher.last_valid_submission_wall_ts = batcher._wall_clock() - 1.0
+
+    reason = await svc._wait_for_window_seal()
+
+    assert reason == "sparse_valid_idle_timeout"
+    assert batcher.is_sealed()
+    assert batcher.force_seal_reason == reason
+
+
+@pytest.mark.asyncio
+async def test_wait_for_window_seal_force_seals_sparse_valid_max_age(monkeypatch):
+    """Very sparse windows eventually seal even below the idle distinct floor."""
+    monkeypatch.setattr(
+        "reliquary.validator.service.SPARSE_VALID_MAX_WINDOW_SECONDS", 0.0,
+    )
+    svc = _make_service()
+    svc._open_window()
+    svc._activate_window()
+    batcher = svc._active_batcher
+    batcher._valid = [SimpleNamespace(prompt_idx=123)]
+    batcher.valid_count = 1
+    batcher.last_valid_submission_at = batcher._time_fn()
+    batcher.last_valid_submission_wall_ts = batcher._wall_clock()
+
+    reason = await svc._wait_for_window_seal()
+
+    assert reason == "sparse_valid_window_timeout"
+    assert batcher.is_sealed()
+    assert batcher.force_seal_reason == reason
+
+
 def test_open_window_empty_hash_pre_first_publish():
     svc = _make_service()
     # No checkpoint published yet → current_manifest returns None

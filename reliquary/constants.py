@@ -161,6 +161,15 @@ MAX_SEAL_QUEUE_DRAIN_SECONDS = 20.0
 # drained but fewer than B valid submissions survived validation.
 PROOF_ADMISSION_STALL_POLL_SECONDS = 0.5
 
+# Sparse-window liveness breaker. After recent validator hardening, honest but
+# stale/misconfigured miners can leave a window with some valid submissions but
+# fewer than B distinct trainable prompts. Keep the normal 8-distinct seal as
+# the happy path, but do not let sparse valid traffic hold checkpoint progress
+# for the long safety-net timeout.
+SPARSE_VALID_IDLE_SEAL_SECONDS = 180.0
+SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS = 4
+SPARSE_VALID_MAX_WINDOW_SECONDS = 600.0
+
 # Active environment name (resolved by reliquary.environment.load_environment).
 ENVIRONMENT_NAME = "openmathinstruct"
 

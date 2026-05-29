@@ -39,6 +39,9 @@ from reliquary.constants import (
     MAX_PROOF_CANDIDATES_PER_WINDOW,
     MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
     MAX_TRUNCATED_PER_SUBMISSION,
+    SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS,
+    SPARSE_VALID_IDLE_SEAL_SECONDS,
+    SPARSE_VALID_MAX_WINDOW_SECONDS,
     VALIDATOR_HTTP_PORT,
 )
 from reliquary.protocol.signatures import verify_envelope_signature
@@ -281,10 +284,18 @@ class _Health(BaseModel):
     queue_depth: int | None = None
     proof_verification_inflight: int | None = None
     valid_submissions_count: int | None = None
+    distinct_valid_prompt_count: int | None = None
+    last_valid_submission_ts: float | None = None
+    seconds_since_last_valid_submission: float | None = None
     proof_admission_count: int | None = None
     proof_admission_limit: int = MAX_PROOF_CANDIDATES_PER_WINDOW
     post_trigger_proof_admission_count: int | None = None
     post_trigger_proof_admission_limit: int = MAX_POST_TRIGGER_PROOF_CANDIDATES
+    sparse_valid_idle_seal_seconds: float = SPARSE_VALID_IDLE_SEAL_SECONDS
+    sparse_valid_idle_min_distinct_prompts: int = (
+        SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS
+    )
+    sparse_valid_max_window_seconds: float = SPARSE_VALID_MAX_WINDOW_SECONDS
     expensive_proof_failures_by_hotkey: dict[str, int] = Field(
         default_factory=dict
     )
@@ -474,6 +485,26 @@ class ValidatorServer:
             proof_verification_inflight=self._inflight_proofs,
             valid_submissions_count=(
                 getattr(batcher, "valid_count", None) if batcher else None
+            ),
+            distinct_valid_prompt_count=(
+                batcher.distinct_valid_prompt_count()
+                if (
+                    batcher is not None
+                    and hasattr(batcher, "distinct_valid_prompt_count")
+                )
+                else None
+            ),
+            last_valid_submission_ts=(
+                getattr(batcher, "last_valid_submission_wall_ts", None)
+                if batcher else None
+            ),
+            seconds_since_last_valid_submission=(
+                batcher.seconds_since_last_valid_submission()
+                if (
+                    batcher is not None
+                    and hasattr(batcher, "seconds_since_last_valid_submission")
+                )
+                else None
             ),
             proof_admission_count=(
                 getattr(batcher, "proof_admission_count", None) if batcher else None
