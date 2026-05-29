@@ -398,6 +398,18 @@ class GrpoWindowBatcher:
         """
         return len(self._submissions_per_prompt.get(prompt_idx, ()))
 
+    def distinct_valid_prompt_count(self) -> int:
+        """Number of distinct, non-cooldown prompts among valid submissions.
+
+        This is the trainable fill level for the window. It can be lower than
+        ``valid_count`` when multiple miners submit the same prompt, so seal
+        liveness must reason about this value instead of raw submissions.
+        """
+        return len({
+            s.prompt_idx for s in list(self._valid)
+            if not self._cooldown.is_in_cooldown(s.prompt_idx, self.window_start)
+        })
+
     @property
     def proof_admission_count(self) -> int:
         """Number of submissions admitted to the expensive proof path."""
@@ -954,10 +966,7 @@ class GrpoWindowBatcher:
         self.valid_count = len(self._valid)
 
         # v2.1: fire seal_event when B distinct non-cooldown prompts have been accepted.
-        distinct_eligible = len({
-            s.prompt_idx for s in self._valid
-            if not self._cooldown.is_in_cooldown(s.prompt_idx, self.window_start)
-        })
+        distinct_eligible = self.distinct_valid_prompt_count()
         if distinct_eligible >= B_BATCH and self._seal_trigger_round is None:
             # B-th distinct prompt just landed. Record the trigger drand
             # round and DELAY the actual seal until the round expires —

@@ -1468,6 +1468,28 @@ def test_seal_trigger_round_recorded_on_b_th_distinct():
     assert b._seal_trigger_round == 100
 
 
+def test_distinct_valid_prompt_count_ignores_duplicate_valid_submissions():
+    """Duplicate prompt submissions can fill raw valid_count before trainable slots."""
+    b = _make_batcher()
+    b.current_checkpoint_hash = ""
+
+    for prompt_idx in range(B_BATCH - 1):
+        req = _request_v21(
+            prompt_idx=prompt_idx,
+            hotkey=f"hk{prompt_idx}",
+            checkpoint_hash="",
+        )
+        req.drand_round = 100
+        b.accept_submission(req)
+    duplicate = _request_v21(prompt_idx=0, hotkey="hk_dup", checkpoint_hash="")
+    duplicate.drand_round = 100
+    b.accept_submission(duplicate)
+
+    assert b.valid_count == B_BATCH
+    assert b.distinct_valid_prompt_count() == B_BATCH - 1
+    assert b._seal_trigger_round is None
+
+
 def test_seal_extension_accepts_same_drand_after_bth():
     """After the B-th distinct prompt lands in drand round R, further
     submissions IN ROUND R are still accepted. This is the whole point of
