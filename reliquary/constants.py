@@ -136,6 +136,13 @@ VALIDATOR_HTTP_PORT = 8888
 # rejected spam free and keep the validator's GPU queue saturated.
 MAX_PROOF_CANDIDATES_PER_WINDOW = 32
 
+# A hotkey that repeatedly reaches the expensive proof path and then fails
+# behavioural/integrity checks should not be allowed to consume the whole
+# window's scarce proof budget. Allow a small number of misses for honest
+# stack drift, then reject further proof admissions from that hotkey until the
+# next window.
+MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW = 2
+
 # After the B-th distinct prompt records a seal-trigger drand round, admit only
 # a small tail of same-round stragglers. The hard window cap above remains the
 # outer bound; this cap protects the boundary fair-split extension from turning

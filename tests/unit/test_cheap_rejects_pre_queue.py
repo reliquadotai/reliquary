@@ -12,6 +12,7 @@ on /submit, and the submit_queue is NOT populated (the worker never sees
 the request).
 """
 
+import math
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -362,6 +363,51 @@ def test_final_eos_reaches_proof_admission():
     assert body["accepted"] is True, body
     assert body["reason"] == RejectReason.ACCEPTED.value
     assert batcher.proof_admission_count == 1
+
+
+def test_low_claimed_final_eos_logprob_rejected_before_proof_admission():
+    """If a miner's own logprob claim says final EOS is below the p_stop
+    threshold, the submission cannot pass termination and should not spend
+    a proof slot first.
+    """
+    s = ValidatorServer()
+    s.set_current_state(WindowState.OPEN)
+    batcher = _PreflightAdmissionBatcher(eos_token_id=99)
+    s.set_active_batcher(batcher)
+    payload = _submission_with_completion_tokens(
+        list(range(4, 35)) + [99],
+        rewards=_IN_ZONE_REWARDS,
+    )
+    for rollout in payload["rollouts"]:
+        meta = rollout["commit"]["rollout"]
+        final_idx = meta["prompt_length"] + meta["completion_length"] - 1
+        meta["token_logprobs"][final_idx] = math.log(0.001)
+
+    _assert_pre_queue_reject(s, payload, RejectReason.BAD_TERMINATION)
+    assert batcher.proof_admission_count == 0
+    verdicts = list(s._verdicts.get("hkA", []))
+    assert verdicts[-1]["reject_stage"] == "termination_claim_preflight"
+
+
+def test_low_claimed_completion_only_final_eos_logprob_rejected_pre_queue():
+    """The same final-EOS claim check applies to completion-only logprob
+    layout, which the protocol accepts for miner compatibility.
+    """
+    s = ValidatorServer()
+    s.set_current_state(WindowState.OPEN)
+    batcher = _PreflightAdmissionBatcher(eos_token_id=99)
+    s.set_active_batcher(batcher)
+    payload = _submission_with_completion_tokens(
+        list(range(4, 35)) + [99],
+        rewards=_IN_ZONE_REWARDS,
+    )
+    for rollout in payload["rollouts"]:
+        meta = rollout["commit"]["rollout"]
+        meta["token_logprobs"] = [0.0] * meta["completion_length"]
+        meta["token_logprobs"][-1] = math.log(0.001)
+
+    _assert_pre_queue_reject(s, payload, RejectReason.BAD_TERMINATION)
+    assert batcher.proof_admission_count == 0
 
 
 def test_claimed_out_of_zone_rejected_before_proof_admission():

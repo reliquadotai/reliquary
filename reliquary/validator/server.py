@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import logging
+import math
 import numbers
 import time
 from typing import Any, Callable
@@ -32,6 +33,7 @@ from reliquary.constants import (
     DRAND_ROUND_BACKWARD_TOLERANCE,
     ENFORCE_ENVELOPE_SIGNATURE,
     MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW,
+    MIN_EOS_PROBABILITY,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
     MAX_PROOF_CANDIDATES_PER_WINDOW,
@@ -133,17 +135,37 @@ def _proof_free_bootstrap(batcher: Any) -> bool:
     return bool(bootstrap)
 
 
+def _claimed_final_token_logprob(commit: dict[str, Any]) -> float | None:
+    tokens = list(commit.get("tokens") or [])
+    meta = commit.get("rollout", {}) or {}
+    prompt_length = int(meta.get("prompt_length", 0))
+    completion_length = int(meta.get("completion_length", 0))
+    claimed = list(meta.get("token_logprobs") or [])
+    if completion_length <= 0:
+        return None
+
+    if len(claimed) == len(tokens):
+        final_idx = prompt_length + completion_length - 1
+        if 0 <= final_idx < len(claimed):
+            return float(claimed[final_idx])
+    if len(claimed) == completion_length:
+        return float(claimed[completion_length - 1])
+    return None
+
+
 def _proof_free_submission_reject(
     request: BatchSubmissionRequest,
     batcher: Any,
 ) -> tuple[RejectReason | None, str | None]:
     """Reject structurally impossible submissions before proof admission.
 
-    This deliberately avoids probability-dependent checks. A rollout ending in
-    EOS still needs the normal GRAIL path to recompute p_stop/logprobs. The
-    cheap path only catches cases the expensive verifier would reject after
-    burning a scarce proof slot: malformed commits, invalid token envelopes,
-    EOS padding, and non-cap completions that never emitted EOS.
+    This deliberately avoids trusting claimed probabilities as proof of
+    correctness. A rollout ending in EOS still needs the normal GRAIL path to
+    recompute p_stop/logprobs. The cheap path only catches cases the expensive
+    verifier would reject after burning a scarce proof slot: malformed commits,
+    invalid token envelopes, EOS padding, non-cap completions that never
+    emitted EOS, and self-declared final-EOS probabilities below the hard
+    termination threshold.
     """
     for rollout in request.rollouts:
         try:
@@ -223,6 +245,13 @@ def _proof_free_submission_reject(
         if eos_positions:
             if len(eos_positions) > 1 or eos_positions[0] != len(completion) - 1:
                 return RejectReason.BAD_TERMINATION, "termination_preflight"
+            final_lp = _claimed_final_token_logprob(commit)
+            if (
+                final_lp is not None
+                and math.isfinite(final_lp)
+                and final_lp < math.log(MIN_EOS_PROBABILITY)
+            ):
+                return RejectReason.BAD_TERMINATION, "termination_claim_preflight"
             continue
 
         total_length = prompt_length + completion_length
@@ -256,6 +285,9 @@ class _Health(BaseModel):
     proof_admission_limit: int = MAX_PROOF_CANDIDATES_PER_WINDOW
     post_trigger_proof_admission_count: int | None = None
     post_trigger_proof_admission_limit: int = MAX_POST_TRIGGER_PROOF_CANDIDATES
+    expensive_proof_failures_by_hotkey: dict[str, int] = Field(
+        default_factory=dict
+    )
     checkpoint_repo_id: str | None = None
     checkpoint_revision: str | None = None
     recent_reject_counts_by_reason: dict[str, int]
@@ -449,6 +481,10 @@ class ValidatorServer:
             post_trigger_proof_admission_count=(
                 getattr(batcher, "post_trigger_proof_admission_count", None)
                 if batcher else None
+            ),
+            expensive_proof_failures_by_hotkey=(
+                dict(getattr(batcher, "expensive_proof_failures_by_hotkey", {}))
+                if batcher else {}
             ),
             checkpoint_repo_id=cp.repo_id if cp else None,
             checkpoint_revision=cp.revision if cp else None,

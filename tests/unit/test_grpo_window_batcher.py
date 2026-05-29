@@ -1582,6 +1582,59 @@ def test_proof_admission_global_cap_rejects_after_limit():
     assert b.proof_admission_count == MAX_PROOF_CANDIDATES_PER_WINDOW
 
 
+def test_proof_admission_rejects_hotkey_after_expensive_failure_debt():
+    """Repeated post-proof failures from one hotkey should not consume all
+    proof slots in the window.
+    """
+    from reliquary.constants import (
+        MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW,
+    )
+
+    b = _make_batcher()
+    req = _request(hotkey="hk-debt")
+    for _ in range(MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW):
+        b._reject(
+            RejectReason.BAD_TERMINATION,
+            hotkey="hk-debt",
+            prompt_idx=42,
+            reject_stage="termination",
+        )
+
+    admitted, reason = b.try_reserve_proof_admission(req)
+    assert admitted is False
+    assert reason == "proof_failure_debt_hotkey"
+    assert b.proof_admission_count == 0
+    assert (
+        b.expensive_proof_failures_by_hotkey["hk-debt"]
+        == MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
+    )
+
+
+def test_proof_failure_debt_ignores_pre_proof_reject_stages():
+    """Reward/zone/schema rejects can happen after HTTP reservation in some
+    test paths, but they are not the post-proof failure pattern being
+    throttled here.
+    """
+    from reliquary.constants import (
+        MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW,
+    )
+
+    b = _make_batcher()
+    req = _request(hotkey="hk-zone")
+    for _ in range(MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW + 1):
+        b._reject(
+            RejectReason.OUT_OF_ZONE,
+            hotkey="hk-zone",
+            prompt_idx=42,
+            reject_stage="zone",
+        )
+
+    admitted, reason = b.try_reserve_proof_admission(req)
+    assert admitted is True
+    assert reason is None
+    assert b.proof_failure_debt("hk-zone") == 0
+
+
 def test_proof_admission_post_trigger_cap_rejects_same_round_tail():
     """After the seal trigger round is known, only a bounded same-round
     tail can enter the expensive proof queue.

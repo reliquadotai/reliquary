@@ -19,6 +19,7 @@ from reliquary.constants import (
     B_BATCH,
     BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION,
     M_ROLLOUTS,
+    MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
     MAX_PROOF_CANDIDATES_PER_WINDOW,
@@ -66,6 +67,17 @@ from reliquary.validator.verifier import (
 )
 
 logger = logging.getLogger(__name__)
+
+_PROOF_FAILURE_DEBT_STAGES = frozenset(
+    {
+        "grail",
+        "termination",
+        "logprob",
+        "distribution",
+        "boxed_answer",
+        "reward_shape",
+    }
+)
 
 
 # v2.3: batch selection is drand-anchored at seal time (see
@@ -321,6 +333,7 @@ class GrpoWindowBatcher:
         self._proof_admission_lock = threading.Lock()
         self._proof_admission_count = 0
         self._post_trigger_proof_admission_count = 0
+        self._expensive_proof_failures_by_hotkey: dict[str, int] = {}
         # v2.1: checkpoint hash miners must match. Empty string disables
         # the gate (test convenience / pre-first-publish).
         self.current_checkpoint_hash: str = ""
@@ -395,6 +408,14 @@ class GrpoWindowBatcher:
         """Number of proof-path reservations after the seal trigger round."""
         return self._post_trigger_proof_admission_count
 
+    @property
+    def expensive_proof_failures_by_hotkey(self) -> dict[str, int]:
+        """Per-window count of hotkey failures after entering proof path."""
+        return dict(self._expensive_proof_failures_by_hotkey)
+
+    def proof_failure_debt(self, hotkey: str) -> int:
+        return self._expensive_proof_failures_by_hotkey.get(hotkey, 0)
+
     def try_reserve_proof_admission(
         self,
         request: BatchSubmissionRequest,
@@ -406,6 +427,14 @@ class GrpoWindowBatcher:
         failed attempts would make invalid proof traffic free again.
         """
         with self._proof_admission_lock:
+            if (
+                self._expensive_proof_failures_by_hotkey.get(
+                    request.miner_hotkey, 0
+                )
+                >= MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
+            ):
+                return False, "proof_failure_debt_hotkey"
+
             if self._proof_admission_count >= MAX_PROOF_CANDIDATES_PER_WINDOW:
                 return False, "proof_admission_window_full"
 
@@ -1057,6 +1086,15 @@ class GrpoWindowBatcher:
         reject_stage: str | None = None,
     ) -> BatchSubmissionResponse:
         self.reject_counts[reason.value] = self.reject_counts.get(reason.value, 0) + 1
+
+        if (
+            hotkey is not None
+            and reject_stage in _PROOF_FAILURE_DEBT_STAGES
+        ):
+            with self._proof_admission_lock:
+                self._expensive_proof_failures_by_hotkey[hotkey] = (
+                    self._expensive_proof_failures_by_hotkey.get(hotkey, 0) + 1
+                )
 
         if hotkey is not None and prompt_idx is not None:
             already = sum(
