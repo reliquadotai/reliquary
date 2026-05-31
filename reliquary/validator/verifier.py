@@ -615,6 +615,41 @@ def evaluate_token_distribution(
     return (not suspicious), metrics
 
 
+def evaluate_token_authenticity(
+    proof: "ProofResult",
+    *,
+    threshold: float | None = None,
+    argmax_conf: float | None = None,
+) -> tuple[bool, dict]:
+    """Hard check: a completion token sampled at T_PROTO can never have
+    chosen probability below ``threshold`` while the model's argmax sits at
+    >= ``argmax_conf`` — that pattern is a post-hoc injection. Reads the
+    aligned ``completion_chosen_probs`` / ``completion_argmax_probs`` from the
+    GPU forward; no tokenizer needed. ``ok=True`` when no stats are available.
+    """
+    from reliquary.constants import TOKEN_AUTH_ARGMAX_CONF, TOKEN_AUTH_THRESHOLD
+
+    if threshold is None:
+        threshold = TOKEN_AUTH_THRESHOLD
+    if argmax_conf is None:
+        argmax_conf = TOKEN_AUTH_ARGMAX_CONF
+    chosen = proof.completion_chosen_probs
+    amax = proof.completion_argmax_probs
+    if not chosen or not amax:
+        return True, {}
+    n = min(len(chosen), len(amax))
+    for j in range(n):
+        if chosen[j] < threshold and amax[j] >= argmax_conf:
+            ids = proof.completion_argmax_ids
+            return False, {
+                "pos": j,
+                "p_chosen": float(chosen[j]),
+                "p_argmax": float(amax[j]),
+                "argmax_id": (ids[j] if j < len(ids) else None),
+            }
+    return True, {}
+
+
 def _find_last_boxed_token_range(
     completion_tokens: list[int],
     tokenizer: Any,

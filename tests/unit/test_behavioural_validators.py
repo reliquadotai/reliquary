@@ -481,6 +481,43 @@ def test_evaluate_boxed_fbox_alias_also_checked():
     assert ok is False
 
 
+def _proof_with_token_stats(chosen, argmax_probs, argmax_ids=None):
+    return ProofResult(
+        all_passed=True, passed=1, checked=1, has_sparse_outputs=True,
+        completion_chosen_probs=chosen,
+        completion_argmax_probs=argmax_probs,
+        completion_argmax_ids=argmax_ids or [0] * len(chosen),
+    )
+
+
+def test_token_authenticity_honest_passes():
+    proof = _proof_with_token_stats([0.99, 0.8, 1.0], [0.99, 0.8, 1.0])
+    ok, m = verifier.evaluate_token_authenticity(proof)
+    assert ok is True and m == {}
+
+
+def test_token_authenticity_injection_fails():
+    proof = _proof_with_token_stats(
+        [1.0, 2.0e-20, 1.0], [1.0, 1.0, 1.0], argmax_ids=[5, 7, 9],
+    )
+    ok, m = verifier.evaluate_token_authenticity(proof)
+    assert ok is False
+    assert m["pos"] == 1 and m["argmax_id"] == 7
+
+
+def test_token_authenticity_high_entropy_honest_passes():
+    proof = _proof_with_token_stats([1.0, 1.0e-9, 1.0], [1.0, 0.30, 1.0])
+    ok, _ = verifier.evaluate_token_authenticity(proof)
+    assert ok is True
+
+
+def test_token_authenticity_empty_skips():
+    ok, m = verifier.evaluate_token_authenticity(
+        ProofResult(all_passed=True, passed=1, checked=1)
+    )
+    assert ok is True and m == {}
+
+
 def test_gpu_completion_token_stats_returns_chosen_and_argmax():
     # 2 completion positions, vocab 4. Build logits so argmax is known.
     seq_len = 3
