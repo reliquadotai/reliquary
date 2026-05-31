@@ -27,6 +27,7 @@ from reliquary.constants import (
     MAX_SUBMISSIONS_PER_PROMPT,
     MAX_TRUNCATED_PER_SUBMISSION,
     REJECTED_LIST_CAP_PER_HOTKEY,
+    TOKEN_AUTH_ENFORCE,
 )
 from reliquary.environment.base import Environment
 from reliquary.protocol.submission import (
@@ -56,6 +57,7 @@ from reliquary.validator.reward_shape import detect_reward_shape_manipulation
 from reliquary.validator.rollout_patterns import detect_opposite_reward_clones
 from reliquary.validator.verifier import (
     evaluate_boxed_answer_probability,
+    evaluate_token_authenticity,
     evaluate_token_distribution,
     has_eos_padding,
     is_cap_truncation,
@@ -917,6 +919,21 @@ class GrpoWindowBatcher:
                     lp_dev_max=lp_dev_max,
                     dist_q10_min=dist_q10_min,
                 )
+
+            auth_ok, auth_metrics = evaluate_token_authenticity(proof)
+            if not auth_ok:
+                logger.info(
+                    "token_tampered hotkey=%s enforce=%s %s",
+                    request.miner_hotkey, TOKEN_AUTH_ENFORCE, auth_metrics,
+                )
+                if TOKEN_AUTH_ENFORCE:
+                    return reject(
+                        RejectReason.TOKEN_TAMPERED,
+                        "token_authenticity",
+                        sketch_diff_max=sketch_diff_max,
+                        lp_dev_max=lp_dev_max,
+                        dist_q10_min=dist_q10_min,
+                    )
 
         reward_shape = detect_reward_shape_manipulation(
             rewards,
