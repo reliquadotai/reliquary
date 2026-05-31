@@ -511,3 +511,13 @@ SAMPLING_LOW_Q10_MAX = 0.025    # 10th-percentile must be above
 # under the validator's forward; honest low-confidence answer tokens stay
 # above ~10⁻³. Threshold sits in the gap.
 BOXED_ANSWER_MIN_PROB = 0.001
+
+# Token authenticity: a completion token whose chosen probability collapses
+# below this while the model's argmax sits at >= TOKEN_AUTH_ARGMAX_CONF was not
+# sampled — it was injected. Calibrated on 550k honest vLLM->HF tokens (floor
+# 3.5e-7); measured injections <= 1e-13.
+TOKEN_AUTH_THRESHOLD = 1e-8
+TOKEN_AUTH_ARGMAX_CONF = 0.99
+# Shadow mode: compute + log the check without rejecting. Flip to True once prod
+# shadow logs confirm zero false positives.
+TOKEN_AUTH_ENFORCE = False
