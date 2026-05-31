@@ -11,8 +11,9 @@ materialises a CPU logits tensor for these checks.
 import math
 
 import pytest
+import torch
 
-from reliquary.constants import CHALLENGE_K, LOGPROB_IS_EPS
+from reliquary.constants import CHALLENGE_K, LOGPROB_IS_EPS, T_PROTO
 from reliquary.validator import verifier
 from reliquary.validator.verifier import ProofResult
 
@@ -478,3 +479,22 @@ def test_evaluate_boxed_fbox_alias_also_checked():
         proof=proof, tokenizer=_CharTokenizer(),
     )
     assert ok is False
+
+
+def test_gpu_completion_token_stats_returns_chosen_and_argmax():
+    # 2 completion positions, vocab 4. Build logits so argmax is known.
+    seq_len = 3
+    logits = torch.zeros(seq_len, 4)
+    logits[0] = torch.tensor([0.0, 5.0, 0.0, 0.0])   # predicts token at idx1
+    logits[1] = torch.tensor([0.0, 0.0, 0.0, 9.0])   # predicts token at idx2
+    tokens = [0, 1, 3]  # idx1 token=1 (the argmax), idx2 token=3 (the argmax)
+
+    chosen, amax_p, amax_id = verifier._gpu_completion_token_stats(
+        logits, tokens, prompt_length=1, completion_length=2,
+        seq_len=seq_len, device="cpu",
+    )
+    assert len(chosen) == len(amax_p) == len(amax_id) == 2
+    assert amax_id == [1, 3]
+    for c, a in zip(chosen, amax_p):
+        assert abs(c - a) < 1e-6
+        assert a > 0.9

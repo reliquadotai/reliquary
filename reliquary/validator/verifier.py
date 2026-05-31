@@ -305,7 +305,11 @@ def verify_commitment_proofs(
     challenge_lp_indices, challenge_lp_values = _gpu_challenge_logprobs(
         logits_gpu, tokens, prompt_length, completion_length, randomness, device,
     )
-    completion_chosen_probs = _gpu_completion_chosen_probs(
+    (
+        completion_chosen_probs,
+        completion_argmax_probs,
+        completion_argmax_ids,
+    ) = _gpu_completion_token_stats(
         logits_gpu, tokens, prompt_length, completion_length, seq_len, device,
     )
 
@@ -342,6 +346,8 @@ def verify_commitment_proofs(
         challenge_lp_indices=challenge_lp_indices,
         challenge_lp_values=challenge_lp_values,
         completion_chosen_probs=completion_chosen_probs,
+        completion_argmax_probs=completion_argmax_probs,
+        completion_argmax_ids=completion_argmax_ids,
     )
 
 
@@ -403,31 +409,26 @@ def _gpu_challenge_logprobs(
     return list(challenge_idxs), chosen.tolist()
 
 
-def _gpu_completion_chosen_probs(
+def _gpu_completion_token_stats(
     logits_gpu: torch.Tensor,
     tokens: list[int],
     prompt_length: int,
     completion_length: int,
     seq_len: int,
     device: Any,
-) -> list[float]:
-    """Compute chosen-token probability under T_PROTO at each valid
-    completion-producing position, on GPU, vectorised.
-
-    Mirrors the per-step loop in the legacy CPU implementation: for each
-    ``t in [prompt_length, prompt_length + completion_length)``, skip
-    when ``t == 0`` or ``t - 1`` lies outside ``logits``'s range or
-    ``t`` lies outside ``tokens``. The remaining (t-1, tokens[t]) pairs
-    are gathered in a single softmax + gather pass and shipped to CPU
-    as one Python float per surviving step.
+) -> tuple[list[float], list[float], list[int]]:
+    """Per completion-producing position under T_PROTO, on GPU, vectorised:
+    chosen-token prob, argmax prob, argmax token id. The three lists are
+    aligned 1:1. Boundary positions (t == 0, t - 1 >= seq_len, t >= len(tokens))
+    are skipped identically across all three.
     """
     if completion_length <= 0:
-        return []
+        return [], [], []
     t_start = prompt_length
     t_end = min(prompt_length + completion_length, len(tokens), seq_len + 1)
     valid_t = [t for t in range(t_start, t_end) if t > 0 and t - 1 < seq_len]
     if not valid_t:
-        return []
+        return [], [], []
 
     pos_tensor = torch.tensor(
         [t - 1 for t in valid_t], device=device, dtype=torch.long,
@@ -438,7 +439,8 @@ def _gpu_completion_chosen_probs(
     scaled = logits_gpu[pos_tensor].float() / float(T_PROTO)
     probs = scaled.softmax(dim=-1)
     chosen = probs.gather(1, tok_tensor.unsqueeze(1)).squeeze(1)
-    return chosen.tolist()
+    amax_probs, amax_ids = probs.max(dim=-1)
+    return chosen.tolist(), amax_probs.tolist(), amax_ids.tolist()
 
 
 def verify_reward_claim(
