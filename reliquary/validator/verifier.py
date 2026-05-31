@@ -67,6 +67,10 @@ class ProofResult:
     # be shorter than completion_length when boundary positions are
     # skipped (t == 0, t - 1 >= seq_len, t >= len(tokens)).
     completion_chosen_probs: list[float] = field(default_factory=list)
+    # Token authenticity: argmax probability and argmax token id under T_PROTO,
+    # aligned 1:1 with completion_chosen_probs (same surviving steps).
+    completion_argmax_probs: list[float] = field(default_factory=list)
+    completion_argmax_ids: list[int] = field(default_factory=list)
 
 
 def verify_signature(commit: dict, hotkey: str) -> bool:
