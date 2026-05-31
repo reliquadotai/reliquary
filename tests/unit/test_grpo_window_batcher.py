@@ -1910,6 +1910,7 @@ def _grail_with_chosen_probs(seq_len: int, completion_probs: list[float], prompt
             challenge_lp_indices=challenge_idxs,
             challenge_lp_values=challenge_vals,
             completion_chosen_probs=list(completion_probs),
+            completion_argmax_probs=[1.0] * len(completion_probs),
         )
     return _fn
 

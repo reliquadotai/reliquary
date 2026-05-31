@@ -730,7 +730,7 @@ def evaluate_boxed_answer_probability(
     or no probabilities are available — the filter only fires on a concrete
     low-probability boxed token.
     """
-    from reliquary.constants import BOXED_ANSWER_MIN_PROB
+    from reliquary.constants import BOXED_ANSWER_MIN_PROB, TOKEN_AUTH_ARGMAX_CONF
 
     if threshold is None:
         threshold = BOXED_ANSWER_MIN_PROB
@@ -739,6 +739,7 @@ def evaluate_boxed_answer_probability(
     probs = proof.completion_chosen_probs
     if not probs:
         return True, {}
+    amax = proof.completion_argmax_probs
 
     completion_tokens = list(tokens[prompt_length: prompt_length + completion_length])
     rng = _find_last_boxed_token_range(completion_tokens, tokenizer)
@@ -747,11 +748,18 @@ def evaluate_boxed_answer_probability(
     start, end = rng
 
     selected: list[float] = []
+    tampered = False
     for i in range(start, end + 1):
         if 0 <= i < len(probs):
-            selected.append(float(probs[i]))
+            p = float(probs[i])
+            selected.append(p)
+            # A collapsed boxed token is a swap only if the model was confident
+            # of a different token there. A low prob with no confident argmax is
+            # genuine sampling uncertainty — don't reject (avoids vLLM->HF drift
+            # false positives near the threshold).
+            if p < threshold and i < len(amax) and amax[i] >= TOKEN_AUTH_ARGMAX_CONF:
+                tampered = True
     if not selected:
         return True, {}
-    min_prob = min(selected)
-    metrics = {"min_prob": min_prob, "n_tokens": len(selected)}
-    return min_prob >= threshold, metrics
+    metrics = {"min_prob": min(selected), "n_tokens": len(selected)}
+    return (not tampered), metrics

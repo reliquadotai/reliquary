@@ -411,10 +411,12 @@ def test_evaluate_boxed_low_prob_rejects():
     # Position of "4" inside the boxed content
     boxed_open = completion.index("{") + 1
     probs[boxed_open] = 1e-6
+    argmax = [1.0] * len(completion)  # model was confident of a different token
     proof = ProofResult(
         all_passed=True, passed=1, checked=1,
         has_sparse_outputs=True,
         completion_chosen_probs=probs,
+        completion_argmax_probs=argmax,
     )
     ok, metrics = verifier.evaluate_boxed_answer_probability(
         tokens=tokens, prompt_length=5,
@@ -423,6 +425,30 @@ def test_evaluate_boxed_low_prob_rejects():
     )
     assert ok is False
     assert metrics["min_prob"] == 1e-6
+
+
+def test_evaluate_boxed_low_prob_no_confident_argmax_passes():
+    """Low boxed prob but no confident alternative (flat dist) — genuine
+    sampling uncertainty, not a post-hoc swap. With the argmax guard, accept."""
+    completion = "answer is \\boxed{42}"
+    tokens = [0] * 5 + _ords(completion)
+    probs = [0.99] * len(completion)
+    argmax = [1.0] * len(completion)
+    boxed_open = completion.index("{") + 1
+    probs[boxed_open] = 1e-6
+    argmax[boxed_open] = 0.30  # model had no confident alternative here
+    proof = ProofResult(
+        all_passed=True, passed=1, checked=1,
+        has_sparse_outputs=True,
+        completion_chosen_probs=probs,
+        completion_argmax_probs=argmax,
+    )
+    ok, _ = verifier.evaluate_boxed_answer_probability(
+        tokens=tokens, prompt_length=5,
+        completion_length=len(completion),
+        proof=proof, tokenizer=_CharTokenizer(),
+    )
+    assert ok is True
 
 
 def test_evaluate_boxed_unclosed_returns_true():
@@ -468,10 +494,12 @@ def test_evaluate_boxed_fbox_alias_also_checked():
     tokens = [0] * 5 + _ords(completion)
     probs = [0.99] * len(completion)
     probs[completion.index("{") + 1] = 1e-6
+    argmax = [1.0] * len(completion)  # model was confident of a different token
     proof = ProofResult(
         all_passed=True, passed=1, checked=1,
         has_sparse_outputs=True,
         completion_chosen_probs=probs,
+        completion_argmax_probs=argmax,
     )
     ok, _ = verifier.evaluate_boxed_answer_probability(
         tokens=tokens, prompt_length=5,
