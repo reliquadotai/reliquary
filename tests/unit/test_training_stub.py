@@ -100,7 +100,7 @@ def test_train_step_forwards_metrics_to_telemetry(monkeypatch):
     def fake_loss(model, ref_model, rollout, advantage, device):
         p = next(model.parameters())
         zero_loss = (p.sum() * 0.0)
-        return zero_loss, zero_loss.detach()
+        return zero_loss, zero_loss.detach(), 1  # (ppo, kl, n_completion_tokens)
 
     monkeypatch.setattr(_t, "_rollout_loss", fake_loss)
 

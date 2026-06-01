@@ -188,12 +188,14 @@ def _rollout_loss(
     rollout,
     advantage: float,
     device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute (ppo_loss, kl_term) for one rollout.
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Compute (ppo_loss, kl_term, n_completion_tokens) for one rollout.
 
-    Both scalars, averaged over completion tokens. Forward passes run in
-    bf16 autocast; softmax / log-softmax cast back to fp32 for numerical
-    stability.
+    ``ppo_loss`` and ``kl_term`` are scalars averaged over completion tokens;
+    ``n_completion_tokens`` is the count, which lets ``train_step`` apply DAPO
+    token-level normalisation (weigh every token equally) by recovering the
+    per-token sum as ``mean * n``. Forward passes run in bf16 autocast;
+    softmax / log-softmax cast back to fp32 for numerical stability.
 
     π_old comes from the miner's GRAIL commit (rollout.commit["rollout"]
     ["token_logprobs"]) — saves an extra forward pass.
@@ -254,7 +256,7 @@ def _rollout_loss(
     kl_log_ratio = ref_logprobs_c - new_logprobs_c
     kl = (torch.exp(kl_log_ratio) - 1 - kl_log_ratio).mean()
 
-    return ppo_loss, kl
+    return ppo_loss, kl, int(new_logprobs_c.shape[0])
 
 
 # ---------------------------------------------------------------------------
@@ -303,29 +305,49 @@ def train_step(
     n_processed = 0
     n_skipped = 0
 
+    # Pass 1 (metadata only, no forward): group advantages + total completion-
+    # token budget. DAPO token-level normalisation weighs every completion
+    # token equally, vs the old sample-level mean which averaged per rollout
+    # and so under-weighted (and under-penalised) tokens in long responses.
+    # Completion length is known from the miner-committed token_logprobs, so
+    # this pre-pass costs no extra forward.
+    plan: list[tuple[Any, list[float]]] = []
+    n_total_tokens = 0
     for batch in batches:
         for group in batch:
-            rewards = [r.reward for r in group.rollouts]
-            advantages = _compute_advantages(rewards)
+            advantages = _compute_advantages([r.reward for r in group.rollouts])
             if all(a == 0.0 for a in advantages):
                 n_skipped += 1
                 logger.debug("skipping degenerate group on prompt_idx=%d", group.prompt_idx)
                 continue
+            plan.append((group, advantages))
+            for rollout in group.rollouts:
+                meta = (rollout.commit or {}).get("rollout", {}) or {}
+                n_total_tokens += len(meta.get("token_logprobs", []) or [])
 
-            for rollout, adv in zip(group.rollouts, advantages):
-                try:
-                    ppo_loss, kl = _rollout_loss(
-                        model=model, ref_model=ref_model,
-                        rollout=rollout, advantage=adv, device=device,
-                    )
-                except ValueError as e:
-                    logger.warning("rollout skipped: %s", e)
-                    continue
-                loss = (ppo_loss + KL_BETA * kl) / n_total_rollouts
-                loss.backward()
-                total_ppo += ppo_loss.item()
-                total_kl += kl.item()
-                n_processed += 1
+    if n_total_tokens == 0:
+        logger.info("train_step: no trainable completion tokens")
+        return model
+
+    # Pass 2: forward/backward one rollout at a time (peak memory = one
+    # sequence) and accumulate the token-level-normalised loss.
+    for group, advantages in plan:
+        for rollout, adv in zip(group.rollouts, advantages):
+            try:
+                ppo_loss, kl, n_tok = _rollout_loss(
+                    model=model, ref_model=ref_model,
+                    rollout=rollout, advantage=adv, device=device,
+                )
+            except ValueError as e:
+                logger.warning("rollout skipped: %s", e)
+                continue
+            # ppo_loss / kl are per-token means; ``* n_tok`` recovers the token
+            # sum and ``/ n_total_tokens`` applies equal per-token weight.
+            loss = (ppo_loss + KL_BETA * kl) * n_tok / n_total_tokens
+            loss.backward()
+            total_ppo += ppo_loss.item()
+            total_kl += kl.item()
+            n_processed += 1
 
     if n_processed == 0:
         logger.info("train_step: no valid rollouts processed")
