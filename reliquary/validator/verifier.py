@@ -639,7 +639,7 @@ def evaluate_token_authenticity(
         return True, {}
     n = min(len(chosen), len(amax))
     for j in range(n):
-        if chosen[j] < threshold and amax[j] >= argmax_conf:
+        if chosen[j] < threshold:
             ids = proof.completion_argmax_ids
             return False, {
                 "pos": j,
