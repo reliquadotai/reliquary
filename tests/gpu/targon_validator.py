@@ -16,6 +16,7 @@ NETWORK = os.environ.get("BT_NETWORK", "finney")
 NETUID = int(os.environ.get("NETUID", "81"))
 WALLET_NAME = os.environ.get("BT_WALLET_NAME", "subnet")
 HOTKEY = os.environ.get("BT_HOTKEY", "hotkey1")
+WALLET_PATH = os.environ.get("BT_WALLET_PATH", "/opt/reliquary/wallets")
 HTTP_PORT = 8888
 
 # Secrets are read from the shell environment at deploy-build time and
@@ -38,6 +39,7 @@ ENV_VARS = {
     "NETUID": str(NETUID),
     "BT_WALLET_NAME": WALLET_NAME,
     "BT_HOTKEY": HOTKEY,
+    "BT_WALLET_PATH": WALLET_PATH,
     "R2_ENDPOINT_URL": os.environ.get(
         "R2_ENDPOINT_URL", "https://s3.us-east-1.amazonaws.com"
     ),
@@ -71,7 +73,7 @@ image = (
     .run_commands("cd /app && pip install -e . --no-deps")
     .add_local_dir(
         "/home/ubuntu/Catalyst/wallet_deploy",
-        "/root/.bittensor/wallets",
+        WALLET_PATH,
     )
     .env(ENV_VARS)
 )

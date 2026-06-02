@@ -9,7 +9,7 @@ services:
     volumes:
       - type: bind
         source: ${BT_WALLETS_DIR:?set BT_WALLETS_DIR to the host path of your wallets/}
-        target: /root/.bittensor/wallets
+        target: ${BT_WALLET_PATH:-/opt/reliquary/wallets}
         read_only: true
     labels:
       com.centurylinklabs.watchtower.enable: "true"

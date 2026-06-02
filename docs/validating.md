@@ -29,7 +29,7 @@ git clone https://github.com/reliquadotai/reliquary.git
 cd reliquary/docker
 cp .env.example.weight-only .env
 # Edit .env with your values (see "What goes in .env" below)
-export BT_WALLETS_DIR=/home/you/.bittensor/wallets
+export BT_WALLETS_DIR=/path/to/validator-signing-wallets
 docker compose -f docker-compose.weight-only.yml up -d
 ```
 
@@ -42,8 +42,8 @@ The example file is annotated. The required keys:
 ```bash
 BT_NETWORK=finney
 BT_NETUID=81
-BT_WALLET_NAME=<your-wallet-dir-name>     # under ~/.bittensor/wallets/<this>/
-BT_HOTKEY=<your-hotkey-file-name>         # under ~/.bittensor/wallets/<wallet>/hotkeys/<this>
+BT_WALLET_NAME=<your-wallet-name>
+BT_HOTKEY=<your-hotkey-name>
 
 RELIQUARY_TRAIN=0                          # weight-only mode — DO NOT change
 
@@ -55,6 +55,10 @@ R2_ENDPOINT_URL=https://<account>.r2.cloudflarestorage.com
 ```
 
 `RELIQUARY_TRAIN=0` is what makes this a weight-only deployment — the entrypoint reads it and starts in the right mode. **Don't change it to `1` unless you are the trainer.**
+
+Existing deployments do not need a new wallet-path variable. `BT_WALLETS_DIR`
+is still the host-side credential source. `BT_WALLET_PATH` is optional and
+only changes the in-container mount target for custom deployments.
 
 ### Verify it's running
 
@@ -85,7 +89,7 @@ git clone https://github.com/reliquadotai/reliquary.git
 cd reliquary/docker
 cp .env.example.trainer .env
 # Edit .env (see below)
-export BT_WALLETS_DIR=/home/you/.bittensor/wallets
+export BT_WALLETS_DIR=/path/to/validator-signing-wallets
 docker compose -f docker-compose.trainer.yml up -d
 docker logs -f reliquary-trainer
 ```
@@ -226,9 +230,11 @@ Submissions that get HTTP-accepted but reach the worker after the window seals a
 
 ---
 
-## Security notes on the wallet mount
+## Security notes on signing credentials
 
-The compose files mount your wallet directory **read-only** at `/root/.bittensor/wallets`. Even if the container were compromised, it could not write to that path.
+The compose files mount the validator signing credential directory
+**read-only**. Even if the container were compromised, it could not write
+to that mount.
 
 What goes there:
 
@@ -239,4 +245,6 @@ What must NOT be there:
 
 - The `coldkey` private file. Keep it on a separate machine entirely.
 
-A safe layout: a dedicated `operator-wallets/` directory containing only the hotkey, with `BT_WALLETS_DIR` pointed at it. Your real `~/.bittensor/wallets` (with the coldkey) lives elsewhere.
+A safe layout is a dedicated validator-signing directory containing only
+the public coldkey file and the required hotkey file. Keep any coldkey
+private material outside this directory and off the validator host.

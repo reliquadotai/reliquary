@@ -27,10 +27,10 @@ services:
     ports:
       - "${RELIQUARY_HTTP_PORT:-8080}:8080"
     volumes:
-      # Hotkey (readonly, needed to sign submissions + weights)
+      # Validator signing credentials (readonly)
       - type: bind
         source: ${BT_WALLETS_DIR:?set BT_WALLETS_DIR to the host path of your wallets/}
-        target: /root/.bittensor/wallets
+        target: ${BT_WALLET_PATH:-/opt/reliquary/wallets}
         read_only: true
       # Persistent state (staging checkpoints, HF cache)
       - reliquary-state:/root/reliquary/state

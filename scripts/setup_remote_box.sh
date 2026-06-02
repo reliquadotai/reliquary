@@ -14,6 +14,7 @@ set -e
 REPO_URL="${RELIQUARY_REPO_URL:-https://github.com/romain13190/reliquary.git}"
 BRANCH="${RELIQUARY_BRANCH:-main}"
 INSTALL_DIR="${RELIQUARY_INSTALL_DIR:-/root/reliquary}"
+BT_WALLET_PATH="${BT_WALLET_PATH:-/opt/reliquary/wallets}"
 
 echo "[setup] apt install python3.12-venv + git"
 apt update -qq
@@ -48,6 +49,6 @@ echo "[setup] pin torch to cu128 wheel for H100/H200 driver"
 echo "[setup] verify torch sees CUDA"
 .venv/bin/python -c "import torch; assert torch.cuda.is_available(), 'CUDA not available'; print('torch', torch.__version__, 'on', torch.cuda.get_device_name(0))"
 
-mkdir -p /root/.bittensor/wallets
+mkdir -p "$BT_WALLET_PATH"
 
-echo "[setup] done. Next: scp your hotkey to /root/.bittensor/wallets/<name>/hotkeys/<hotkey>, then source scripts/.env and run scripts/launch_validator.sh (or launch_miner.sh)."
+echo "[setup] done. Next: copy your validator signing credentials to BT_WALLET_PATH, then source scripts/.env and run scripts/launch_validator.sh (or launch_miner.sh)."

@@ -1,11 +1,59 @@
 # OpenCodeInstruct code-execution environment
 
+## Current production status (2026-06-02)
+
+This document began as the OpenCode design spec. The current
+production-candidate implementation is PR #70.
+
+Current normative behavior:
+
+- OpenCode can run side by side with OpenMath via `ENVIRONMENT_MIX`.
+  Docker/operator defaults remain OpenMath-only unless
+  `RELIQUARY_ENVIRONMENTS` explicitly includes `opencodeinstruct`.
+- OpenCode rewards are **validator-authoritative**. Miners do not know
+  hidden cases and should submit placeholder OpenCode rewards; the
+  validator recomputes and overwrites rewards before zone checks,
+  archive, and training.
+- The validator uses a private structured dataset with hidden cases.
+- Miners use the public prompt-only mirror:
+  `R0mAI/opencodeinstruct-prompts`.
+- Miner prompt-only mode requires:
+
+```bash
+export RELIQUARY_OCI_SUBSET_REPO=R0mAI/opencodeinstruct-prompts
+export RELIQUARY_OCI_PROMPT_ONLY=1
+```
+
+- Validator private mode requires:
+
+```bash
+export RELIQUARY_OCI_SUBSET_REPO=<private-structured-dataset>
+unset RELIQUARY_OCI_PROMPT_ONLY
+```
+
+- The untrusted runsc worker receives only miner code, entrypoint,
+  args, and kwargs. It never receives hidden assertion source or
+  expected values.
+- The trusted grader server owns expected values and computes
+  `passed / total`.
+- The structured production dataset was built and verified at 50,000
+  rows. The public prompt mirror has the same row order and no
+  `structured_cases` column.
+
+Older sections below keep the original rationale and architecture
+context. Where they mention miner-side reward equality,
+`ENVIRONMENT_NAME`, assertion-string workers, or
+`reliquadotai/opencode...` dataset names, treat that as superseded by
+this status block and the updated sections below.
+
 ## Problem
 
-The Reliquary validator/miner protocol currently exposes a single
+The original Reliquary validator/miner protocol exposed a single
 `Environment` (`reliquary/environment/openmathinstruct.py`, configured via
-`constants.py:ENVIRONMENT_NAME`). All training signal and validation
-traffic comes from one task family — math word problems with extractable
+`constants.py:ENVIRONMENT_NAME`). The current protocol uses
+`ENVIRONMENT_MIX`, but the original problem remains: most training
+signal and validation traffic came from one task family — math word
+problems with extractable
 `\boxed{...}` answers. This concentrates the learned policy on a narrow
 distribution and leaves no diversity in the reward landscape.
 
@@ -21,9 +69,9 @@ The obstacle is structural: OMI's reward is a pure string compare
 and trivially deterministic across miner and validator. For code, the
 ground truth is a list of Python `assert` statements that must be
 **executed** against the miner's completion. Executing arbitrary
-miner-supplied code inside the validator process is unacceptable: the
-validator holds the hotkey for weight submission, and a sandbox escape =
-stake compromise.
+miner-supplied code inside the validator process is unacceptable because
+validator credentials and training state must remain isolated from
+untrusted code.
 
 ## Goal
 
@@ -31,16 +79,17 @@ stake compromise.
    `Environment` Protocol (`base.py`) and slots into
    `load_environment()` without touching the validator main loop, the
    miner engine, the GRPO batcher, or the GRAIL verifier.
-2. Execute miner-supplied Python in a sandbox strong enough that an
-   evasion does not yield the hotkey. Defense-in-depth via gVisor +
-   process-/UID-level isolation.
+2. Execute miner-supplied Python in a sandbox strong enough that a
+   sandbox failure does not expose validator secrets. Defense-in-depth
+   via gVisor plus process and filesystem isolation.
 3. Keep the per-submission verification cost negligible against the
    existing ~5–25 s GRAIL forward pass.
-4. Guarantee bit-identical `compute_reward` results between miner and
-   validator so `verify_reward_claim` (tolerance 1e-6) passes.
+4. Keep hidden OpenCode scoring private. Miners submit placeholder
+   rewards in prompt-only mode; the validator recomputes and overwrites
+   OpenCode rewards authoritatively.
 5. Allow safe, reversible rollout: the env can ship dormant, be canaried
-   on testnet, then flipped network-wide via a coordinated `constants.py`
-   change.
+   on testnet, then enabled network-wide via a coordinated environment
+   mix change.
 
 ## Non-goals
 
@@ -75,34 +124,35 @@ Three new pieces glued together by the existing `Environment` Protocol:
    Frames JSON requests, retries once on transient socket error, never
    raises.
 
-3. `grader/server.py` + `grader/worker.py` — a separate process
-   (different UID from the validator) that maintains a warm pool of
-   gVisor (`runsc`) sandboxes. Each sandbox holds a long-lived Python
-   subprocess that reads `(code, tests)` from stdin and writes
-   `(passed, total)` to stdout. The grader server dispatches incoming
-   requests round-robin, kills+respawns on timeout/crash, and recycles
-   workers every N evaluations to bound memory growth.
+3. `grader/server.py` + `grader/worker.py` — a separate isolated
+   process that maintains a warm pool of gVisor (`runsc`) sandboxes.
+   The trusted server owns hidden cases and
+   expected values. Each sandbox holds a long-lived Python subprocess
+   that receives only `(code, entrypoint, args, kwargs)` and returns a
+   JSON-safe primitive output. The server compares that output to the
+   private expected value, dispatches requests round-robin,
+   kills+respawns on timeout/crash, and recycles workers every N
+   evaluations to bound memory growth.
 
-Trust model is unchanged from OMI: the miner computes a local reward in
-`MiningEngine._build_rollout_submission` (`engine.py:470`) using the same
-`env.compute_reward`. The validator re-runs it via
-`verify_reward_claim` (`verifier.py:391`) and rejects on mismatch. Both
-sides invoke the same grader interface; deterministic `passed/total`
-guarantees cross-box agreement.
+Trust model differs from OMI: OpenMath still verifies miner-claimed
+rewards, but OpenCode uses validator-authoritative rewards. Miners load
+only the public prompt mirror and submit placeholder rewards. The
+validator loads private structured cases, calls the trusted grader, then
+overwrites `rollout.reward` and commit rollout metadata before zone
+checks, archive, and training.
 
 ## Architecture
 
 ```
 ┌─────────────────────────┐         ┌──────────────────────────┐
-│   Validator process     │         │   Grader process         │
-│   (UID 1000, hotkey)    │         │   (UID 1001, no wallet)  │
+│   Validator process     │         │   Trusted grader process │
 │                         │  Unix   │                          │
 │  env.compute_reward()  ─┼─socket─►│   manages warm pool      │
 │        ▲                │  IPC    │   dispatches → workers   │
 │        │                │         │                          │
-│  verify_reward_claim    │         │   ┌────────────────────┐ │
+│  private reward compute │         │   ┌────────────────────┐ │
 │        │                │         │   │ runsc worker #1    │ │
-└────────┼────────────────┘         │   │ (Python + tests)   │ │
+└────────┼────────────────┘         │   │ (Python call only) │ │
          │                          │   ├────────────────────┤ │
    reliquary/environment/           │   │ runsc worker #2    │ │
    opencodeinstruct.py              │   │  ...               │ │
@@ -111,10 +161,10 @@ guarantees cross-box agreement.
                                     └──────────────────────────┘
 ```
 
-The miner runs an analogous architecture. Process isolation is less
-critical there (the miner controls the wallet anyway), but reusing the
-grader/server design keeps `compute_reward` semantics identical on both
-sides.
+Miners do not run the grader in live prompt-only mode. They load the
+public prompt mirror and submit valid rollouts with placeholder
+OpenCode rewards; local synthetic code tests may be useful for quality
+filtering, but they are not protocol reward authority.
 
 ## Components
 
@@ -124,8 +174,8 @@ sides.
 |---|---|
 | `reliquary/environment/opencodeinstruct.py` | `OpenCodeInstructEnvironment` class implementing the `Environment` Protocol. Loads filtered dataset, calls grader client in `compute_reward`. |
 | `reliquary/environment/grader_client.py` | IPC client: serializes JSON request, reads response, retries once on `ConnectionError`, returns `0.0` on persistent failure. Never raises. |
-| `reliquary/environment/grader/server.py` | Long-running process. Owns the worker pool, the Unix-socket listener, the dispatcher, the watchdog. Exposes Prometheus `/metrics`. |
-| `reliquary/environment/grader/worker.py` | Runs *inside* each gVisor sandbox. stdin → `exec(code)` + per-test `exec(t, dict(ns))` → count passes → stdout. |
+| `reliquary/environment/grader/server.py` | Long-running trusted process. Owns hidden expected values, worker pool, Unix-socket listener, dispatcher, watchdog, and Prometheus `/metrics`. |
+| `reliquary/environment/grader/worker.py` | Runs *inside* each gVisor sandbox. stdin → `exec(code)` + call one entrypoint with args/kwargs → JSON-safe output. It never receives hidden assertions or expected values. |
 | `reliquary/environment/grader/bundle/config.json` | OCI runtime config for `runsc`: rootfs path, args, `--network=none`, mount config, resource limits. |
 | `reliquary/environment/grader/bundle/rootfs/` | Minimal rootfs (~300 MB): `python3.12` (matches the host image's interpreter, see `Dockerfile`), stdlib, `worker.py`. Built once at image-build time, not committed to git. |
 | `scripts/build_grader_bundle.sh` | One-shot script that materializes the OCI rootfs (debootstrap or `python:3.12-slim` extracted + `worker.py` copied in). Run during Docker image build (`RUN scripts/build_grader_bundle.sh` in `Dockerfile`). |
@@ -141,9 +191,11 @@ sides.
 | File | Change |
 |---|---|
 | `reliquary/environment/__init__.py` | Add `OpenCodeInstructEnvironment` import + `"opencodeinstruct"` case in `load_environment`. |
-| `reliquary/constants.py` | Add `GRADER_SOCKET_PATH`, `GRADER_POOL_SIZE` (default 8), `GRADER_EVAL_TIMEOUT_SECONDS` (default 5). **`ENVIRONMENT_NAME` stays `"openmathinstruct"` until the coordinated flip.** |
-| `Dockerfile` | Install `gvisor-runsc`, run `build_grader_bundle.sh`, create UIDs `reliquary` (1000) and `reliquary-grader` (1001). The container currently runs as `root` — this work introduces UID separation. |
-| `docker/entrypoint.sh` | **Already exists** (`exec reliquary validate ...`). Modify to: (1) launch `grader_server` via `setpriv --reuid=1001 ... &` in the background, (2) `exec setpriv --reuid=1000 reliquary validate ...`. Deployment-side change: the host volume mount for `~/.bittensor` must target `/home/reliquary/.bittensor` (currently mounted at `/root/.bittensor`) and the host file ownership must be set to UID 1000 before mount. |
+| `reliquary/constants.py` | Add `GRADER_SOCKET_PATH`, `GRADER_POOL_SIZE` (default 8), `GRADER_EVAL_TIMEOUT_SECONDS` (default 5), and include OpenCode in `ENVIRONMENT_MIX` when enabled. |
+| `Dockerfile` | Install `gvisor-runsc`, run `build_grader_bundle.sh`, and create separate unprivileged service identities for the validator and grader. |
+| `docker/entrypoint.sh` | Launch the grader under a separate low-privilege identity with a scrubbed environment, then start the validator under its own service identity. Credential mounts stay readable only by the validator identity. |
+| `reliquary/validator/batcher.py` | For validator-authoritative envs, recompute and overwrite rollout rewards before zone/archive/training. |
+| `reliquary/miner/engine.py` | For validator-authoritative envs, submit placeholder rewards instead of trying local hidden-case scoring. |
 
 ## Data flow
 
@@ -151,35 +203,34 @@ End-to-end of one `env.compute_reward(problem, completion)`:
 
 ```
 1. env.compute_reward(problem, completion):
-     tests = json.loads(problem["ground_truth"])      # list[str] of asserts
+     case_id = problem["ground_truth"]                # opaque private id
+     cases = self._cases_by_id[case_id]               # trusted server side only
      code  = _extract_python(completion)              # ```python ... ``` regex,
                                                        # fallback to raw completion
-     return grader_client.evaluate(code, tests,
-                                   timeout=5.0)        # returns passed/total
+     return grader_client.evaluate_cases(code, cases,
+                                         timeout=5.0)  # returns passed/total
 
-2. grader_client.evaluate:
+2. grader_client.evaluate_cases:
      write JSON request to Unix socket
      read JSON response
      return passed/total (float in [0, 1])
      # On ConnectionError: retry once with 100 ms backoff, then return 0.0.
 
 3. grader/server.py:
-     receive request → pick idle worker from pool
-     pipe (code, tests) to worker stdin
-     read worker stdout: "passed total status"
+     receive request with private structured cases
+     for each case:
+       send only (code, entrypoint, args, kwargs) to an idle worker
+       receive worker output/status
+       compare output to private expected value
      reply to client
 
 4. grader/worker.py (inside runsc sandbox):
-     subprocess.run([sys.executable, "-c", payload],
-                    timeout=GRADER_EVAL_TIMEOUT_SECONDS)
-     # payload:
-     #   ns = {}
-     #   exec(code, ns)
-     #   passed = 0
-     #   for t in tests:
-     #       try: exec(t, dict(ns)); passed += 1
-     #       except: pass
-     #   print(f"{passed} {len(tests)} ok")
+     read JSON request
+     exec(code, ns)
+     resolve function or Solution().method entrypoint
+     call entrypoint(*args, **kwargs)
+     normalize JSON-safe primitive output
+     return {"status": "ok", "output": value}
 ```
 
 ### IPC framing
@@ -188,25 +239,25 @@ JSON-lines on a `SOCK_STREAM` Unix socket.
 
 ```json
 // client → server
-{"req_id": "<uuid4>", "code": "...", "tests": ["assert f(1) == 1", ...], "timeout_s": 5.0}
+{"req_id": "<uuid4>", "code": "...", "cases": [{"entry": {"kind": "function", "name": "add"}, "args": [1, 2], "kwargs": {}, "expected": 3, "compare": "exact"}], "timeout_s": 5.0}
 
 // server → client
 {"req_id": "<uuid4>", "passed": 3, "total": 5, "status": "ok"}
 ```
 
-`status` ∈ `{"ok", "timeout", "crash", "grader_error"}`. Anything other
-than `"ok"` → `compute_reward` returns `0.0`.
+The worker-facing request omits `expected`; the expected value stays in
+the trusted server. `status` includes `ok`, `timeout`, `runtime_error`,
+`forbidden_import`, `bad_output`, and `grader_error`. Anything other
+than a comparable `ok` output scores zero for that case.
 
 ### Determinism
 
-- `total` is fixed by the dataset → identical on miner and validator.
-- `passed` is integer-valued, computed by `exec`-ing the same code and
-  the same assertions. With the dataset pre-filtered to drop non-
-  deterministic tests (random without seed, time, network, FS),
-  `passed` is bit-identical across hosts.
-- `passed / total` is a rational with denominator ≤ `len(tests)`. Both
-  sides format it identically, so `verify_reward_claim`'s `1e-6`
-  tolerance is comfortably satisfied.
+- `total` is fixed by the private structured dataset.
+- `passed` is computed only by the validator/trusted grader, so miners
+  no longer need cross-box identical reward computation for OpenCode.
+- The dataset pre-filter drops non-deterministic cases, reference
+  crashes, and timeouts. Runtime failures score zero rather than
+  crashing the validator.
 
 ## Security & isolation
 
@@ -229,35 +280,16 @@ than `"ok"` → `compute_reward` returns `0.0`.
   migration path if gVisor's CVE rate proves unacceptable; the
   `Environment` API does not change.
 
-### UID and FS isolation
+### Process and filesystem isolation
 
-The container currently runs everything as `root` (verified in
-`Dockerfile` and `docker/entrypoint.sh` as of 2026-05-22). This work
-introduces UID separation:
+The validator and grader run under separate service identities. The
+grader starts with a minimal environment and no access to validator
+credential mounts. If sandboxed code escapes the worker, it lands in the
+grader boundary rather than the validator boundary.
 
-```Dockerfile
-RUN useradd -m -u 1000 reliquary && \
-    useradd -m -u 1001 reliquary-grader
-# /home/reliquary/.bittensor permissions are set at runtime by entrypoint.sh
-# after the host volume is mounted, since chmod inside the image is overwritten
-# by the volume mount.
-```
-
-`docker/entrypoint.sh` is updated to:
-1. `chown -R reliquary:reliquary /home/reliquary/.bittensor && chmod -R 700 /home/reliquary/.bittensor` after the volume mount.
-2. Drop sensitive env vars (`WANDB_API_KEY`, `R2_*`, etc.) before forking the grader: `env -i PATH=... GRADER_SOCKET_PATH=... setpriv --reuid=1001 --regid=1001 --clear-groups grader_server &`.
-3. `exec setpriv --reuid=1000 --regid=1000 --clear-groups reliquary validate "${args[@]}"`.
-
-UID 1001 has no read access to `~/.bittensor` (mode 700, owned by UID
-1000) and no env vars containing credentials. A sandbox escape from
-inside `runsc` lands in the UID-1001 process, which has nothing to
-steal.
-
-**Deployment note**: hosts currently mount the wallet at
-`/root/.bittensor`. After this change, the mount target becomes
-`/home/reliquary/.bittensor` and the host directory must be owned by
-UID 1000 (or chowned at container startup with `--cap-add=CHOWN`).
-Coordinated with the validator deployment runbook.
+Exact host paths, ownership commands, and deployment-specific credential
+layout belong in the private operator runbook, not this public design
+spec.
 
 ### Per-worker resource limits
 
@@ -359,10 +391,10 @@ new key `archive["grader_failures"] = {"timeout": int, "crash": int,
 
 ### Cross-box determinism
 
-A CI job runs `(code, tests)` from a fixed 10-problem corpus on two
-distinct GitHub runners (`ubuntu-22.04` and `ubuntu-24.04`) and asserts
-`passed/total` is bit-identical across runners. If any test flakes, it
-is excluded from the production dataset filter.
+A CI job runs a fixed structured-case corpus on two distinct GitHub
+runners (`ubuntu-22.04` and `ubuntu-24.04`) and asserts the resulting
+artifact comparison is bit-identical across runners. If any case flakes,
+it is excluded from the production dataset filter.
 
 ## Dataset preparation
 
@@ -373,52 +405,55 @@ Offline, one-shot pipeline in `scripts/build_opencodeinstruct_subset.py`:
    its own tests. Drops ~30 % of rows. Result: ~3–4 M rows.
 3. For each row, parse `unit_tests` (string-encoded list) into a list
    of assertions. Drop rows that fail to parse cleanly.
-4. Pattern filter on assertions: drop any row whose tests import or
-   reference `random`, `time`, `socket`, `urllib`, `requests`, `os`,
-   `subprocess`, `threading`, `multiprocessing`, or non-deterministic
-   stdlib (regex-based, conservative).
-5. **Double-execution check** with the actual grader bundle: run the
-   reference solution against its tests twice with different
-   `PYTHONHASHSEED`s. Drop rows that yield different `passed` counts.
-6. Push the filtered subset to
-   `reliquadotai/opencodeinstruct-deterministic-subset` (HF Hub) for
-   easy distribution. Expected final size: ~2–3 M rows, ~3 GB.
-7. The `OpenCodeInstructEnvironment` `__init__` loads this filtered
-   subset, not the raw NVIDIA dataset.
+4. Convert only simple deterministic assertions into structured cases:
+   `assert fn(args...) == literal`, reversed equality, truthy/falsy
+   asserts, and the same shapes for `Solution().method(args...)`.
+5. Drop assertion source that contains imports, arbitrary expressions,
+   non-JSON expected values, filesystem/network/process usage, or
+   non-deterministic stdlib references.
+6. **Double-execution check**: run the reference solution against the
+   structured cases twice with different `PYTHONHASHSEED`s. Drop rows
+   that disagree, crash, or time out.
+7. Save and publish two row-order-matched datasets:
+   - a private validator dataset containing structured hidden cases;
+   - a public miner prompt mirror containing prompts only.
+8. The validator loads the private structured dataset. Miners load the
+   public prompt-only mirror with `RELIQUARY_OCI_PROMPT_ONLY=1`.
 
 `get_problem(idx)` returns:
 
 ```python
 {
     "prompt": row["input"],
-    "ground_truth": json.dumps(row["unit_tests_parsed"]),  # list[str]
+    "ground_truth": case_set_id,  # opaque id, not hidden tests
     "id": sha256(row["input"]).hexdigest()[:16],
 }
 ```
 
-`ground_truth` is JSON because the archive expects a string field; the
-serialized tests are small (median ~1–2 KB, max ~9 KB per row) so the
-archive footprint stays well under `MAX_ROLLOUT_FILE_SIZE_BYTES`.
+The private environment keeps `case_set_id -> structured_cases` in
+memory. The public prompt mirror produces an empty case list and is only
+valid for miners, never validators.
 
 ## Migration plan
 
-`ENVIRONMENT_NAME` is a consensus parameter in `constants.py` (described
-as "Immutable values that all network participants must agree on. No
-os.getenv() overrides. Changes require coordinated deployment.").
-Switching active env is a coordinated network event.
+The live switch is now controlled by `RELIQUARY_ENVIRONMENTS` /
+`ENVIRONMENT_MIX` and deployment coordination. OpenCode can be enabled
+beside OpenMath instead of replacing it.
 
 | Phase | Action | Risk |
 |---|---|---|
 | 0 | Current state: OMI only | — |
-| 1 | Land the PR: env class + grader + sandbox + tests. `ENVIRONMENT_NAME` stays `"openmathinstruct"`. New code is dormant in prod. | None — dormant code path |
-| 2 | Deploy validator with this code. Verify grader process starts under UID 1001, pool healthy, `/metrics` exposed. Production traffic unaffected. | Bug at grader startup → log + non-fatal (env not active) |
-| 3 | Canary on testnet: side validator with `ENVIRONMENT_NAME="opencodeinstruct"` patched locally. Run 24–48 h. Verify submissions, claim/verify agreement, grader stability. | Isolated from mainnet |
-| 4 | Release with `ENVIRONMENT_NAME="opencodeinstruct"` flipped in `constants.py`. Announce flip date to miners with ~7-day upgrade window. Coordinated rollout. | Hard cutover — coordination required |
-| 5 | Post-flip 72 h monitoring. | Rollback if disaster |
+| 1 | Land PR #70: env class + structured grader + sandbox + private/public datasets + validator-authoritative rewards. | Dormant if `RELIQUARY_ENVIRONMENTS=openmathinstruct` |
+| 2 | Deploy validator math-only first. Verify no behavior change. | Low |
+| 3 | Announce miner upgrade. Miners set `RELIQUARY_OCI_SUBSET_REPO=R0mAI/opencodeinstruct-prompts` and `RELIQUARY_OCI_PROMPT_ONLY=1`. | Misconfigured miners may fail to load OpenCode prompts |
+| 4 | Canary mixed env on live validator with the private structured dataset. Monitor per-env health. | Grader latency / OpenCode out-of-zone rate |
+| 5 | Expand after 24–72 h stable telemetry. | Rollback to `RELIQUARY_ENVIRONMENTS=openmathinstruct` if needed |
 
 ## Rollback
 
-- **Validator-side issue post-flip**: revert `constants.py:ENVIRONMENT_NAME = "openmathinstruct"`, ship as a patch release, redeploy. OMI cooldown is deterministic and resumes from the latest archive state.
+- **Validator-side issue post-flip**: set
+  `RELIQUARY_ENVIRONMENTS=openmathinstruct` and restart. OMI cooldown is
+  deterministic and resumes from the latest archive state.
 - **Grader instability**: even if every grader call fails,
   `compute_reward` returns `0.0` for all rollouts. The window produces
   no useful training signal but the protocol does not halt. Investigate
@@ -426,13 +461,11 @@ Switching active env is a coordinated network event.
 - **Grader process leak/leftover after rollback**: the grader server is
   harmless when nothing calls it. Can be stopped on a subsequent deploy.
 
-## Phase 2: multi-environment mixing
+## Multi-environment mixing
 
-The v1 design (sections above) is a swap-only model: at any point the
-network runs exactly one env, with the active choice flipped via a
-coordinated `ENVIRONMENT_NAME` change. Phase 2 lifts that constraint and
-trains on both envs **in the same optimizer step**, giving the policy
-mixed-gradient updates per window instead of alternating.
+The production-candidate design trains on both envs **in the same
+optimizer step**, giving the policy mixed-gradient updates per window
+instead of alternating.
 
 ### Goal
 
@@ -513,9 +546,17 @@ ratio), then picks a prompt from that env. The submission carries
 `env_name` so the validator can verify against the right env without
 guessing.
 
-The miner loads **all envs** in `ENVIRONMENT_MIX` at startup. With OMI
-(2 shards ≈ 1 GB) + OpenCodeInstruct subset (~3 GB), HF cache sits at
-~4-5 GB — acceptable.
+The miner loads active envs at startup. For OpenCode it must use the
+public prompt-only mirror, not the private structured dataset:
+
+```bash
+export RELIQUARY_OCI_SUBSET_REPO=R0mAI/opencodeinstruct-prompts
+export RELIQUARY_OCI_PROMPT_ONLY=1
+```
+
+In this mode the miner does not launch a local grader and does not know
+hidden-case rewards. OpenCode reward claims are placeholders; the
+validator recomputes the real reward vector privately.
 
 ### Archive shape
 
@@ -526,35 +567,26 @@ archive["batch"] = batch_entries  # entries gain "env_name" tag per submission
 
 ### Migration plan adjustment
 
-Phase 1 in the main migration plan (land dormant code) covers v1. The
-Phase 2 hardfork (env_name in submissions + multi-batcher) is a
-**separate release** layered on top. Sequence:
-
-| Phase | What ships |
-|---|---|
-| 1 | v1 dormant code (this spec, sections above) |
-| 2 | Testnet canary: single-env `ENVIRONMENT_NAME="opencodeinstruct"` |
-| 3 | Mainnet flip to single OCI (validate the new env in production at 100 %) |
-| 4 | v2 hardfork: introduce `ENVIRONMENT_MIX`, `env_name` field, two-batcher, grad-accum train_step |
-| 5 | Post-flip monitoring; rollback path = revert constants + protocol version bump |
-
-Phases 1–3 cover the v1 plan; Phases 4–5 cover the v2 addendum. Each
-flip is independent; v2 can be deferred indefinitely without blocking
-v1's value.
+The previous single-env `ENVIRONMENT_NAME` migration plan is superseded.
+`ENVIRONMENT_MIX`, `env_name`, two-batcher routing, and gradient
+accumulation are already part of the production-candidate branch. The
+remaining rollout choice is operational: deploy math-only first, then
+enable mixed env after miners have upgraded to prompt-only OpenCode
+mode.
 
 ## Open questions / future work
 
 - **Migration to WASM** if gVisor CVE pace becomes a concern. The
   `Environment` Protocol and the IPC contract are runtime-agnostic;
   only `grader/worker.py` and the bundle change.
-- **Multi-env mixing** (OMI + code in a single prompt pool) would
-  require touching `pick_prompt_idx`, the cooldown map, and the
-  batcher. Tracked separately.
+- **Private/generated tasks** are the next major game-design step.
+  Prompt-only mirrors protect hidden cases, but static public-source
+  prompts can still create lookup pressure over time.
 - **Reward shaping**: currently `passed / total` linear. Future
   experiment: weighted by test difficulty, or partial credit for tests
   passed after the first failure (currently all run independently, so
   this is already partial credit).
-- **Dataset refresh policy**: the deterministic subset on HF Hub is
-  built once. If we want periodic refreshes (e.g., as NVIDIA updates
-  OpenCodeInstruct), need a CI job + a versioning scheme on the HF
+- **Dataset refresh policy**: the structured/private subset and public
+  prompt mirror are built once. If we want periodic refreshes (e.g., as
+  NVIDIA updates OpenCodeInstruct), need a CI job + a versioning scheme on the HF
   repo. Out of scope for v1.

@@ -525,8 +525,7 @@ BOXED_ANSWER_MIN_PROB = 0.001
 # ────────────────  CODE EXECUTION GRADER  ────────────────
 
 # Path to the Unix domain socket the grader server listens on.
-# Default lives in /tmp so it's writable by both validator (UID 1000)
-# and grader (UID 1001) processes inside the container.
+# Default lives in /tmp so both validator and grader processes can reach it.
 GRADER_SOCKET_PATH = "/tmp/reliquary-grader.sock"
 
 # Number of warm gVisor workers in the grader pool. Sized to handle

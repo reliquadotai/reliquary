@@ -13,6 +13,11 @@ PID_FILE="${RELIQUARY_MINER_PID:-/root/miner.pid}"
 
 : "${BT_WALLET_NAME?BT_WALLET_NAME not set; source scripts/.env}"
 : "${BT_HOTKEY?BT_HOTKEY not set; source scripts/.env}"
+ENVIRONMENTS="${RELIQUARY_ENVIRONMENTS:-openmathinstruct}"
+WALLET_PATH_ARG=""
+if [ -n "${BT_WALLET_PATH:-}" ]; then
+  WALLET_PATH_ARG="--wallet-path ${BT_WALLET_PATH}"
+fi
 
 cd "$INSTALL_DIR"
 
@@ -38,8 +43,9 @@ nohup .venv/bin/python -m reliquary.cli.main mine \
     --wallet-name "$BT_WALLET_NAME" \
     --hotkey "$BT_HOTKEY" \
     --checkpoint "${RELIQUARY_CHECKPOINT:-gpt2}" \
+    --environments "$ENVIRONMENTS" \
     --log-level INFO \
-    $drand_flag $validator_url_arg \
+    $drand_flag $validator_url_arg $WALLET_PATH_ARG \
     > "$LOG_FILE" 2>&1 &
 
 echo $! > "$PID_FILE"

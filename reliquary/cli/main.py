@@ -154,6 +154,10 @@ def mine(
     netuid: int = typer.Option(81, help="Subnet UID"),
     wallet_name: str = typer.Option("default", help="Wallet name"),
     hotkey: str = typer.Option("default", help="Hotkey name"),
+    wallet_path: str = typer.Option(
+        os.getenv("BT_WALLET_PATH", ""),
+        help="Optional wallet base path",
+    ),
     checkpoint: str = typer.Option(..., help="Model checkpoint path"),
     environments: str = typer.Option(
         os.getenv("RELIQUARY_ENVIRONMENTS", _DEFAULT_ENVS),
@@ -198,7 +202,10 @@ def mine(
         from reliquary.miner.engine import MiningEngine
         from reliquary.miner.submitter import discover_validator_url, get_window_state_v2
 
-        wallet = bt.Wallet(name=wallet_name, hotkey=hotkey)
+        wallet_kwargs = {"name": wallet_name, "hotkey": hotkey}
+        if wallet_path:
+            wallet_kwargs["path"] = wallet_path
+        wallet = bt.Wallet(**wallet_kwargs)
         subtensor = await get_subtensor()
 
         # --- Resolve initial checkpoint from validator if available ---
@@ -306,6 +313,10 @@ def validate(
     netuid: int = typer.Option(81, help="Subnet UID"),
     wallet_name: str = typer.Option("default", help="Wallet name"),
     hotkey: str = typer.Option("default", help="Hotkey name"),
+    wallet_path: str = typer.Option(
+        os.getenv("BT_WALLET_PATH", ""),
+        help="Optional wallet base path",
+    ),
     checkpoint: str = typer.Option(DEFAULT_BASE_MODEL, help="HF repo id or local path of the model to load (trainer mode only)"),
     environments: str = typer.Option(
         os.getenv("RELIQUARY_ENVIRONMENTS", _DEFAULT_ENVS),
@@ -366,7 +377,10 @@ def validate(
 
         from reliquary.infrastructure.chain import get_subtensor
 
-        wallet = bt.Wallet(name=wallet_name, hotkey=hotkey)
+        wallet_kwargs = {"name": wallet_name, "hotkey": hotkey}
+        if wallet_path:
+            wallet_kwargs["path"] = wallet_path
+        wallet = bt.Wallet(**wallet_kwargs)
         subtensor = await get_subtensor()
 
         if train:
