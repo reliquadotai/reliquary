@@ -251,6 +251,25 @@ async def test_wait_for_window_seal_force_seals_sparse_valid_max_age(monkeypatch
     assert batcher.force_seal_reason == reason
 
 
+@pytest.mark.asyncio
+async def test_wait_for_window_seal_force_seals_zero_valid_max_age(monkeypatch):
+    """A reset window with only rejected/stale miners must not freeze forever."""
+    monkeypatch.setattr(
+        "reliquary.validator.service.SPARSE_VALID_MAX_WINDOW_SECONDS", 0.0,
+    )
+    svc = _make_service()
+    svc._open_window()
+    svc._activate_window()
+    batcher = svc._active_batcher
+    assert batcher.valid_count == 0
+
+    reason = await svc._wait_for_window_seal()
+
+    assert reason == "zero_valid_window_timeout"
+    assert batcher.is_sealed()
+    assert batcher.force_seal_reason == reason
+
+
 def test_open_window_empty_hash_pre_first_publish():
     svc = _make_service()
     # No checkpoint published yet → current_manifest returns None

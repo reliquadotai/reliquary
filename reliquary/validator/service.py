@@ -569,9 +569,11 @@ class ValidationService:
         """Return force-seal reason for sparse valid windows, if any.
 
         This is a cadence guard, not a quality gate. It only fires when the
-        validator has some valid submissions, fewer than B distinct trainable
-        prompts, no queued/in-flight proof work, and either no valid progress
-        for the sparse idle threshold or an overlong sparse window.
+        validator has fewer than B distinct trainable prompts, no queued or
+        in-flight proof work, and either no valid progress for the sparse idle
+        threshold or an overlong sparse window. Zero-valid windows are included
+        only for the max-age path so a hard reset with stale miners cannot
+        freeze checkpoint progress indefinitely.
         """
         if batcher is None or batcher.is_sealed():
             return None
@@ -579,13 +581,17 @@ class ValidationService:
             return None
         valid_count = int(getattr(batcher, "valid_count", 0) or 0)
         distinct_valid = self._distinct_valid_prompt_count(batcher)
-        if valid_count <= 0 or distinct_valid >= B_BATCH:
+        if distinct_valid >= B_BATCH:
             return None
         if not self._queue_and_proofs_drained():
             return None
 
         idle_s = self._seconds_since_last_valid_submission(batcher)
         age_s = self._window_open_age_seconds(batcher)
+        if valid_count <= 0:
+            if age_s is not None and age_s >= SPARSE_VALID_MAX_WINDOW_SECONDS:
+                return "zero_valid_window_timeout"
+            return None
         if (
             distinct_valid >= SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS
             and idle_s is not None
