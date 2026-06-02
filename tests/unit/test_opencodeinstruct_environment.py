@@ -159,6 +159,36 @@ def _env_with(dataset_rows, grader_response=1.0):
     return env
 
 
+def test_init_rejects_prompt_only_dataset_without_explicit_flag(monkeypatch):
+    from reliquary.environment.opencodeinstruct import OpenCodeInstructEnvironment
+
+    monkeypatch.setattr(
+        OpenCodeInstructEnvironment,
+        "_dataset_cache",
+        _FakeDataset([{"input": "prompt only"}]),
+    )
+    monkeypatch.delenv("RELIQUARY_OCI_PROMPT_ONLY", raising=False)
+
+    with pytest.raises(RuntimeError, match="structured_cases"):
+        OpenCodeInstructEnvironment()
+
+
+def test_init_allows_prompt_only_dataset_with_explicit_flag(monkeypatch):
+    from reliquary.environment.opencodeinstruct import OpenCodeInstructEnvironment
+
+    monkeypatch.setattr(
+        OpenCodeInstructEnvironment,
+        "_dataset_cache",
+        _FakeDataset([{"input": "prompt only"}]),
+    )
+    monkeypatch.setenv("RELIQUARY_OCI_PROMPT_ONLY", "1")
+
+    env = OpenCodeInstructEnvironment()
+
+    assert len(env) == 1
+    assert env.get_problem(0)["prompt"] == "prompt only"
+
+
 def test_get_problem_shape():
     rows = [{
         "input": "Write a function add(a, b) returning their sum.",

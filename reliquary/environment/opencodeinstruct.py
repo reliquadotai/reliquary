@@ -62,6 +62,20 @@ def _load_subset_dataset(repo: str, hf_module=None):
     return hf_module.load_dataset(repo, split="train")
 
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _has_structured_cases_column(dataset) -> bool:
+    columns = getattr(dataset, "column_names", None)
+    if columns is not None:
+        return "structured_cases" in columns
+    if len(dataset) == 0:
+        return False
+    row = dataset[0]
+    return hasattr(row, "get") and row.get("structured_cases") is not None
+
+
 # ---------------------------------------------------------------------------
 # Environment class
 # ---------------------------------------------------------------------------
@@ -91,6 +105,12 @@ class OpenCodeInstructEnvironment:
             repo = os.environ.get("RELIQUARY_OCI_SUBSET_REPO", self._DEFAULT_SUBSET_REPO)
             OpenCodeInstructEnvironment._dataset_cache = _load_subset_dataset(repo)
         self._dataset = OpenCodeInstructEnvironment._dataset_cache
+        self._prompt_only = _env_flag("RELIQUARY_OCI_PROMPT_ONLY")
+        if not self._prompt_only and not _has_structured_cases_column(self._dataset):
+            raise RuntimeError(
+                "OpenCodeInstruct validator dataset must include structured_cases. "
+                "Use RELIQUARY_OCI_PROMPT_ONLY=1 only for miner prompt-only mirrors."
+            )
 
         from reliquary.environment.grader_client import GraderClient
         self._grader = GraderClient()
