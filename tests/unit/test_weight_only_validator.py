@@ -166,10 +166,10 @@ def _restore(originals):
         setattr(wov_mod.storage, k, v)
 
 
-async def _wire_submit_counter(wov, captured):
+async def _wire_submit_counter(wov, captured, *, result=True):
     async def _fake_submit(subtensor, miner_weights, burn_weight):
         captured["submit_calls"] += 1
-        return True
+        return result
     wov._submit_weights = _fake_submit
 
 
@@ -184,6 +184,24 @@ async def test_bootstrap_submits_immediately_regardless_of_lead_window():
     originals, captured = _patch_chain_and_storage(blocks_until=200)
     await _wire_submit_counter(wov, captured)
     try:
+        await _run_one_iteration(wov)
+    finally:
+        _restore(originals)
+    assert captured["submit_calls"] == 1
+    assert wov._last_submit_epoch == 1_000_200
+
+
+@pytest.mark.asyncio
+async def test_failed_attempt_does_not_hammer_same_epoch():
+    """A rejected set_weights call has already gone through bittensor's
+    internal retries. Do not retry it every poll inside the same epoch.
+    """
+    from reliquary.validator.weight_only import WeightOnlyValidator
+    wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+    originals, captured = _patch_chain_and_storage(blocks_until=200)
+    await _wire_submit_counter(wov, captured, result=False)
+    try:
+        await _run_one_iteration(wov)
         await _run_one_iteration(wov)
     finally:
         _restore(originals)
