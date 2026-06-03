@@ -29,6 +29,9 @@ def test_default_environment_loads_and_scores():
     problem = env.get_problem(0)
     assert "prompt" in problem and "ground_truth" in problem and "id" in problem
     assert len(problem["id"]) == 16
+    # The boxed-answer instruction must be appended so reward extraction works
+    # regardless of the base model's default style (validator + miner share this).
+    assert r"\boxed{}" in problem["prompt"]
 
     # Correct answer in boxed form
     assert env.compute_reward(

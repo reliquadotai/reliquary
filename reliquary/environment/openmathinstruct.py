@@ -127,6 +127,13 @@ def _compute_omi_reward(problem: dict, completion: str) -> float:
 # Environment
 # ---------------------------------------------------------------------------
 
+# Appended to every OMI prompt so the answer format does not depend on the base
+# model's default style. Without it, models that don't emit \boxed{} on their own
+# (e.g. Qwen3.5) make reward extraction return 0. Shared by validator + miner via
+# get_problem, so both encode the identical prompt (required for GRAIL consensus).
+_ANSWER_FORMAT_INSTRUCTION = "\n\nPut your final answer within \\boxed{}."
+
+
 class OpenMathInstructEnvironment:
     """Nvidia OpenMathInstruct-2: 14M synthetic math problems.
 
@@ -179,7 +186,7 @@ class OpenMathInstructEnvironment:
         expected: str = str(row.get("expected_answer", ""))
         problem_id = hashlib.sha256(question.encode()).hexdigest()[:16]
         return {
-            "prompt": question,
+            "prompt": question + _ANSWER_FORMAT_INSTRUCTION,
             "ground_truth": expected,
             "id": problem_id,
         }
