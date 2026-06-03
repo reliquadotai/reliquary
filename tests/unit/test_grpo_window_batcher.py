@@ -193,6 +193,29 @@ def test_accept_in_zone_submission():
     assert len(b.valid_submissions()) == 1
 
 
+def test_grail_verifier_receives_tokenizer_for_sparse_pstop():
+    import torch
+    from reliquary.validator.verifier import ProofResult
+
+    seen_tokenizers = []
+
+    def tokenizer_aware_grail(commit, model, randomness, *, tokenizer=None):
+        seen_tokenizers.append(tokenizer)
+        return ProofResult(
+            all_passed=True,
+            passed=1,
+            checked=1,
+            logits=torch.empty(0),
+        )
+
+    b = _make_batcher(verify_commitment_proofs_fn=tokenizer_aware_grail)
+    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+    resp = b.accept_submission(req)
+    assert resp.accepted is True
+    assert seen_tokenizers
+    assert all(tok is b.tokenizer for tok in seen_tokenizers)
+
+
 def test_reject_out_of_zone_all_fail():
     b = _make_batcher()
     req = _request(rewards=[0.0] * 8)

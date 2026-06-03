@@ -809,9 +809,19 @@ class GrpoWindowBatcher:
             claimed_rand = (rollout.commit.get("beacon") or {}).get("randomness", "")
             if claimed_rand != self.randomness:
                 return reject(RejectReason.WRONG_RANDOMNESS, "randomness")
-            proof = self._verify_commitment(
-                rollout.commit, self.model, self.randomness
-            )
+            try:
+                proof = self._verify_commitment(
+                    rollout.commit,
+                    self.model,
+                    self.randomness,
+                    tokenizer=self.tokenizer,
+                )
+            except TypeError as exc:
+                if "tokenizer" not in str(exc):
+                    raise
+                proof = self._verify_commitment(
+                    rollout.commit, self.model, self.randomness
+                )
             if proof.sketch_diff_max > sketch_diff_max:
                 sketch_diff_max = proof.sketch_diff_max
             if not proof.all_passed:
