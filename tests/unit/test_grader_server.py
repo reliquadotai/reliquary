@@ -256,10 +256,11 @@ def test_runsc_workers_get_unique_container_ids(monkeypatch, tmp_path):
     assert srv.GRADER_CONTAINER_ID_PLACEHOLDER not in container_ids
 
 
-def test_runsc_respawn_force_deletes_stale_container(monkeypatch, tmp_path):
+def test_runsc_respawn_uses_fresh_id_before_cleanup(monkeypatch, tmp_path):
     from reliquary.environment.grader import server as srv
 
     deletes: list[list[str]] = []
+    popens: list[list[str]] = []
 
     class _FakeProc:
         pid = 4321
@@ -268,8 +269,17 @@ def test_runsc_respawn_force_deletes_stale_container(monkeypatch, tmp_path):
         def poll(self):
             return None
 
-    monkeypatch.setattr(srv.subprocess, "Popen", lambda argv, **kw: _FakeProc())
+    monkeypatch.setattr(srv.subprocess, "Popen", lambda argv, **kw: popens.append(list(argv)) or _FakeProc())
     monkeypatch.setattr(srv.subprocess, "run", lambda argv, **kw: deletes.append(list(argv)))
+    monkeypatch.setattr(
+        srv.threading,
+        "Thread",
+        lambda target, args=(), kwargs=None, daemon=None: type(
+            "_T",
+            (),
+            {"start": lambda self: target(*args, **(kwargs or {}))},
+        )(),
+    )
 
     s = srv.GraderServer(
         socket_path=str(tmp_path / "g.sock"),
@@ -277,11 +287,13 @@ def test_runsc_respawn_force_deletes_stale_container(monkeypatch, tmp_path):
         worker_argv=["runsc", "run", "--bundle", "/b", srv.GRADER_CONTAINER_ID_PLACEHOLDER],
         metrics_port=0,
     )
-    s._spawn_worker(0)
-    assert deletes[-1][:3] == ["runsc", "delete", "--force"]
-    s._spawn_worker(0)
-    assert deletes[-1][:3] == ["runsc", "delete", "--force"]
-    assert len(deletes) == 2
+    old = s._spawn_worker(0)
+    s._respawn(old, reason="death")
+
+    container_ids = [argv[-1] for argv in popens]
+    assert len(container_ids) == 2
+    assert len(set(container_ids)) == 2
+    assert deletes == [["runsc", "delete", "--force", old.container_id]]
 
 
 def test_metrics_endpoint_exposes_eval_and_case_counters(grader_server):

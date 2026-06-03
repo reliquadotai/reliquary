@@ -91,6 +91,7 @@ class _MetricsRegistry:
 class Worker:
     proc: subprocess.Popen
     slot: int
+    container_id: str | None = None
     in_use: bool = False
     retired: bool = False
     eval_count: int = 0
@@ -115,10 +116,12 @@ class GraderServer:
             sys.executable, "-m", "reliquary.environment.grader.worker"
         ]
         # Runsc mode: each worker needs a unique container id (see
-        # GRADER_CONTAINER_ID_PLACEHOLDER). Track which slots have spawned
-        # before so respawns can clean up the killed container's stale state.
+        # GRADER_CONTAINER_ID_PLACEHOLDER). IDs include a generation counter
+        # so respawn never blocks on deleting a wedged old sandbox before it
+        # can restore capacity.
         self._uses_runsc = GRADER_CONTAINER_ID_PLACEHOLDER in self.worker_argv
-        self._spawned_slots: set[int] = set()
+        self._container_generation = 0
+        self._container_generation_lock = threading.Lock()
         self.eval_timeout_s = eval_timeout_s
         self.recycle_after_evals = recycle_after_evals
         self.metrics_port = metrics_port
@@ -192,40 +195,33 @@ class GraderServer:
         except FileNotFoundError:
             pass
 
-    def _container_id_for_slot(self, slot: int) -> str:
-        return f"grader-worker-{slot}"
+    def _next_container_id_for_slot(self, slot: int) -> str:
+        with self._container_generation_lock:
+            self._container_generation += 1
+            generation = self._container_generation
+        return f"grader-worker-{slot}-{generation}"
 
-    def _worker_argv_for_slot(self, slot: int) -> list[str]:
-        """Per-slot argv. For runsc, substitute a unique container id; a
-        SIGKILL'd container can't clean its own state, so force-delete the
-        slot's stale id before reusing it on respawn."""
+    def _worker_argv_for_container(self, container_id: str | None) -> list[str]:
+        """Per-worker argv. For runsc, substitute the generated container id."""
         if not self._uses_runsc:
             return self.worker_argv
-        container_id = self._container_id_for_slot(slot)
-        try:
-            subprocess.run(
-                [self.worker_argv[0], "delete", "--force", container_id],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                timeout=10.0,
-            )
-        except Exception:
-            pass
-        self._spawned_slots.add(slot)
+        assert container_id is not None
         return [
             container_id if a == GRADER_CONTAINER_ID_PLACEHOLDER else a
             for a in self.worker_argv
         ]
 
     def _spawn_worker(self, slot: int) -> Worker:
+        container_id = self._next_container_id_for_slot(slot) if self._uses_runsc else None
         proc = subprocess.Popen(
-            self._worker_argv_for_slot(slot),
+            self._worker_argv_for_container(container_id),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
             bufsize=1,
         )
-        w = Worker(proc=proc, slot=slot)
+        w = Worker(proc=proc, slot=slot, container_id=container_id)
         # Insert or replace at slot.
         while len(self._workers) <= slot:
             self._workers.append(w)
@@ -433,7 +429,28 @@ class GraderServer:
         w.eval_count += 1
         return resp
 
-    def _terminate_worker(self, w: Worker) -> None:
+    def _delete_container(self, container_id: str | None, timeout: float = 2.0) -> None:
+        if not self._uses_runsc or not container_id:
+            return
+        try:
+            subprocess.run(
+                [self.worker_argv[0], "delete", "--force", container_id],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=timeout,
+            )
+        except Exception:
+            pass
+
+    def _delete_container_async(self, container_id: str | None) -> None:
+        if not self._uses_runsc or not container_id or self._stop_event.is_set():
+            return
+        threading.Thread(
+            target=self._delete_container,
+            args=(container_id,),
+            daemon=True,
+        ).start()
+
+    def _terminate_worker(self, w: Worker, *, delete_container: bool = True) -> None:
         try:
             if w.proc.poll() is None:
                 w.proc.kill()
@@ -451,23 +468,18 @@ class GraderServer:
                 pass
         except Exception:
             pass
-        if self._uses_runsc:
-            try:
-                subprocess.run(
-                    [self.worker_argv[0], "delete", "--force", self._container_id_for_slot(w.slot)],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    timeout=10.0,
-                )
-            except Exception:
-                pass
+        if delete_container:
+            self._delete_container(w.container_id)
 
     def _respawn(self, w: Worker, reason: str = "death") -> None:
-        self._terminate_worker(w)
+        old_container_id = w.container_id
+        self._terminate_worker(w, delete_container=False)
         self._metrics.inc("grader_worker_restarts_total", {"reason": reason})
         if self._stop_event.is_set():
             return
         try:
             self._spawn_worker(w.slot)
+            self._delete_container_async(old_container_id)
         except Exception:
             # Spawning a replacement failed (runsc missing, OS limits, …).
             # Log loudly so an operator can investigate; the pool is now
