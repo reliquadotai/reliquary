@@ -602,110 +602,77 @@ class ValidationService:
             return "sparse_valid_window_timeout"
         return None
 
-    async def _wait_for_window_seal(self) -> str:
-        """Wait for a normal seal, timeout, or bounded-admission dead end.
+    def _force_seal_dead_batcher(self, batcher, dup_since: dict) -> str | None:
+        """Force-seal one batcher if its own liveness breaker fires; else None.
 
-        The hard proof cap protects validator speed, but it creates a liveness
-        edge when all admitted proofs have drained and fewer than B submissions
-        survived validation. In that state no future candidate can enter the
-        expensive path, so waiting the full window timeout only freezes
-        checkpoint progress. We seal partial immediately; training already
-        skips partial batches, while archive/EMA can still account for the
-        window.
+        Per-env so a fast env never seals a slower one short.
         """
-        batcher = self._active_batcher
-        if batcher is None:
+        env = getattr(getattr(batcher, "env", None), "name", "?")
+        if self._proof_admission_exhausted_and_drained(batcher):
+            reason = "proof_admission_exhausted_drained"
+        elif self._duplicate_prompt_shortfall_drained(batcher):
+            now = asyncio.get_running_loop().time()
+            if now - dup_since.setdefault(env, now) < MAX_SEAL_QUEUE_DRAIN_SECONDS:
+                return None
+            reason = "duplicate_prompt_distinct_shortfall_drained"
+        else:
+            dup_since.pop(env, None)
+            reason = self._sparse_valid_liveness_reason(batcher)
+        if reason is None:
+            return None
+        logger.warning(
+            "Window %d env=%s force-sealing partial: reason=%s valid=%d/%d "
+            "distinct=%d/%d idle_s=%s age_s=%s",
+            self._window_n, env, reason,
+            getattr(batcher, "valid_count", 0), B_BATCH,
+            self._distinct_valid_prompt_count(batcher), B_BATCH,
+            self._seconds_since_last_valid_submission(batcher),
+            self._window_open_age_seconds(batcher),
+        )
+        batcher.force_seal(reason)
+        return reason
+
+    async def _wait_for_window_seal(self) -> str:
+        """Wait until every active env's batcher seals.
+
+        Each batcher seals independently — via its own BATCH_FILLED fill or
+        its own liveness breaker — so a fast env never cuts a slower one
+        short. The window advances only once all are sealed (or the global
+        timeout). Training still requires all envs full (see ``trained``).
+        """
+        batchers = list(self._active_batchers.values())
+        if not batchers:
             return "no_active_batcher"
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + WINDOW_TIMEOUT_SECONDS
-        duplicate_shortfall_since: float | None = None
+        dup_since: dict[str, float] = {}
+        reasons: dict[str, str] = {}
         while True:
-            if self._proof_admission_exhausted_and_drained(batcher):
-                reason = "proof_admission_exhausted_drained"
-                logger.warning(
-                    "Window %d force-sealing partial: reason=%s "
-                    "valid=%d/%d distinct_valid=%d/%d "
-                    "proof_admission=%d/%d queue_depth=%d "
-                    "inflight_proofs=%d",
-                    self._window_n,
-                    reason,
-                    getattr(batcher, "valid_count", 0),
-                    B_BATCH,
-                    self._distinct_valid_prompt_count(batcher),
-                    B_BATCH,
-                    getattr(batcher, "proof_admission_count", 0),
-                    MAX_PROOF_CANDIDATES_PER_WINDOW,
-                    getattr(self.server, "submit_queue_depth", 0),
-                    getattr(self.server, "proof_verification_inflight", 0),
-                )
-                batcher.force_seal(reason)
-                return reason
+            for b in batchers:
+                if b.is_sealed():
+                    continue
+                r = self._force_seal_dead_batcher(b, dup_since)
+                if r is not None:
+                    reasons[getattr(getattr(b, "env", None), "name", "?")] = r
 
-            if self._duplicate_prompt_shortfall_drained(batcher):
-                now = loop.time()
-                if duplicate_shortfall_since is None:
-                    duplicate_shortfall_since = now
-                waited_s = now - duplicate_shortfall_since
-                if waited_s >= MAX_SEAL_QUEUE_DRAIN_SECONDS:
-                    reason = "duplicate_prompt_distinct_shortfall_drained"
-                    logger.warning(
-                        "Window %d force-sealing partial: reason=%s "
-                        "valid=%d/%d distinct_valid=%d/%d "
-                        "proof_admission=%d/%d queue_depth=%d "
-                        "inflight_proofs=%d waited_s=%.2f",
-                        self._window_n,
-                        reason,
-                        getattr(batcher, "valid_count", 0),
-                        B_BATCH,
-                        self._distinct_valid_prompt_count(batcher),
-                        B_BATCH,
-                        getattr(batcher, "proof_admission_count", 0),
-                        MAX_PROOF_CANDIDATES_PER_WINDOW,
-                        getattr(self.server, "submit_queue_depth", 0),
-                        getattr(self.server, "proof_verification_inflight", 0),
-                        waited_s,
-                    )
-                    batcher.force_seal(reason)
-                    return reason
-            else:
-                duplicate_shortfall_since = None
-
-            sparse_reason = self._sparse_valid_liveness_reason(batcher)
-            if sparse_reason is not None:
-                logger.warning(
-                    "Window %d force-sealing partial: reason=%s "
-                    "valid=%d/%d distinct_valid=%d/%d "
-                    "proof_admission=%d/%d queue_depth=%d "
-                    "inflight_proofs=%d idle_s=%s age_s=%s",
-                    self._window_n,
-                    sparse_reason,
-                    getattr(batcher, "valid_count", 0),
-                    B_BATCH,
-                    self._distinct_valid_prompt_count(batcher),
-                    B_BATCH,
-                    getattr(batcher, "proof_admission_count", 0),
-                    MAX_PROOF_CANDIDATES_PER_WINDOW,
-                    getattr(self.server, "submit_queue_depth", 0),
-                    getattr(self.server, "proof_verification_inflight", 0),
-                    self._seconds_since_last_valid_submission(batcher),
-                    self._window_open_age_seconds(batcher),
-                )
-                batcher.force_seal(sparse_reason)
-                return sparse_reason
+            if all(b.is_sealed() for b in batchers):
+                break
 
             remaining = deadline - loop.time()
             if remaining <= 0:
+                for b in batchers:
+                    if not b.is_sealed():
+                        b.force_seal("timeout")
                 return "timeout"
 
-            try:
-                await asyncio.wait_for(
-                    batcher.seal_event.wait(),
-                    timeout=min(PROOF_ADMISSION_STALL_POLL_SECONDS, remaining),
-                )
-                return "sealed"
-            except asyncio.TimeoutError:
-                continue
+            await asyncio.sleep(min(PROOF_ADMISSION_STALL_POLL_SECONDS, remaining))
+
+        if not reasons:
+            return "sealed"
+        if len(reasons) == 1:
+            return next(iter(reasons.values()))
+        return ",".join(f"{e}={r}" for e, r in reasons.items())
 
     async def _set_window_randomness(self, subtensor) -> None:
         """Populate all active batchers' per-window randomness seed.
