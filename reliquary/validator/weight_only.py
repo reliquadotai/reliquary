@@ -91,8 +91,14 @@ class WeightOnlyValidator:
                         await asyncio.sleep(POLL_INTERVAL_SECONDS)
                         continue
 
-                    if await self.submit_once():
-                        self._last_submit_epoch = current_epoch_id
+                    submitted = await self.submit_once()
+                    self._last_submit_epoch = current_epoch_id
+                    if not submitted:
+                        logger.warning(
+                            "set_weights attempt for epoch %d failed; "
+                            "waiting for the next epoch before retry",
+                            current_epoch_id,
+                        )
                 except asyncio.CancelledError:
                     raise
                 except asyncio.TimeoutError:
