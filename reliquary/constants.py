@@ -146,11 +146,12 @@ MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW = 2
 # one drand burst into an unbounded proof backlog.
 MAX_POST_TRIGGER_PROOF_CANDIDATES = 8
 
-# Safety timeout for the seal extension's submit-queue drain phase. Once the
-# trigger drand round has expired, the validator waits briefly for already
-# admitted trigger-round candidates to finish GRAIL; after this timeout it seals
-# anyway so a slow or constantly refilled queue cannot freeze checkpoints.
-MAX_SEAL_QUEUE_DRAIN_SECONDS = 20.0
+# Safety timeout for the seal extension's drain phase. Once the trigger drand
+# round expires, the validator waits for the queue AND in-flight GRAIL proofs to
+# drain so every admitted trigger-round candidate is paid. Sized to cover serial
+# verification (~1 proof/s) of a full window's admitted set; after this timeout
+# it seals anyway so a slow or constantly refilled queue cannot freeze checkpoints.
+MAX_SEAL_QUEUE_DRAIN_SECONDS = 60.0
 
 # Liveness poll interval while an OPEN validator window waits for either a
 # normal seal trigger or an exhausted proof-admission queue. This prevents a
