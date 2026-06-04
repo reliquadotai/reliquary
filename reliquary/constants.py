@@ -127,11 +127,22 @@ REJECTED_LIST_CAP_PER_HOTKEY = 5
 # Default HTTP port the validator listens on for miner submissions.
 VALIDATOR_HTTP_PORT = 8888
 
-# Hard cap on expensive proof-verification attempts admitted per window.
-# This counts submissions reserved for GRAIL, not only submissions that pass.
-# Failed proofs are deliberately not refunded: otherwise an attacker can make
-# rejected spam free and keep the validator's GPU queue saturated.
+# GRAIL candidate budget per window: bounds submissions that reach the GPU
+# proof. A submission rejected at the cheap reward-zone gate (OUT_OF_ZONE)
+# never reaches GRAIL and is a reward error — degenerate rollout rewards — not
+# cheating, so it is REFUNDED here (see ``release_proof_candidate_for_reward_error``).
+# Without the refund, a high out_of_zone rate (e.g. opencode's binary code
+# rewards) burns this budget before the env collects B distinct valid prompts.
+# Proof FAILURES (GRAIL/integrity) are still not refunded — those are attacks.
 MAX_PROOF_CANDIDATES_PER_WINDOW = 32
+
+# Hard ceiling on total grading attempts (reward computation) admitted per
+# window — the anti-DoS / queue bound that OUT_OF_ZONE refunds must NOT relax.
+# Counts every admitted submission and is never refunded, so a degenerate-reward
+# flood cannot grow the unbounded submit queue or saturate the grader pool.
+# Set above the GRAIL budget so an env with a low in-zone rate can still grade
+# enough submissions to reach B distinct valid prompts.
+MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW = 96
 
 # A hotkey that repeatedly reaches the expensive proof path and then fails
 # behavioural/integrity checks should not be allowed to consume the whole

@@ -23,6 +23,7 @@ from reliquary.constants import (
     MAX_NEW_TOKENS_PROTOCOL_CAP,
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
     MAX_PROOF_CANDIDATES_PER_WINDOW,
+    MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
     MAX_SEAL_QUEUE_DRAIN_SECONDS,
     MAX_SUBMISSIONS_PER_PROMPT,
     MAX_TRUNCATED_PER_SUBMISSION,
@@ -344,6 +345,10 @@ class GrpoWindowBatcher:
         # expensive verification attempts, not successful accepts.
         self._proof_admission_lock = threading.Lock()
         self._proof_admission_count = 0
+        # Total grading attempts admitted this window — the never-refunded
+        # anti-DoS ceiling. ``_proof_admission_count`` (GRAIL budget) is
+        # refunded on OUT_OF_ZONE; this is not.
+        self._proof_grading_attempts = 0
         self._post_trigger_proof_admission_count = 0
         self._expensive_proof_failures_by_hotkey: dict[str, int] = {}
         # v2.1: checkpoint hash miners must match. Empty string disables
@@ -442,8 +447,13 @@ class GrpoWindowBatcher:
 
     @property
     def proof_admission_count(self) -> int:
-        """Number of submissions admitted to the expensive proof path."""
+        """Live GRAIL candidate budget usage (refunded on OUT_OF_ZONE)."""
         return self._proof_admission_count
+
+    @property
+    def proof_grading_attempts(self) -> int:
+        """Total grading attempts admitted this window (never refunded)."""
+        return self._proof_grading_attempts
 
     @property
     def post_trigger_proof_admission_count(self) -> int:
@@ -462,11 +472,15 @@ class GrpoWindowBatcher:
         self,
         request: BatchSubmissionRequest,
     ) -> tuple[bool, str | None]:
-        """Reserve one expensive proof-verification slot for this window.
+        """Reserve a grading slot and a GRAIL candidate slot for this window.
 
-        The reservation is intentionally not released when a submission fails
-        later checks. The cap bounds validator GPU work under spam; refunding
-        failed attempts would make invalid proof traffic free again.
+        Two ceilings gate admission: the grading-attempts ceiling (never
+        refunded — bounds total grader/queue work under spam) and the GRAIL
+        candidate budget (refunded later on OUT_OF_ZONE via
+        ``release_proof_candidate_for_reward_error``, since a degenerate-reward
+        submission never reaches GRAIL and is not an attack). Proof FAILURES
+        stay non-refunded — refunding those would make invalid proof traffic
+        free again.
         """
         with self._proof_admission_lock:
             if (
@@ -476,6 +490,12 @@ class GrpoWindowBatcher:
                 >= MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
             ):
                 return False, "proof_failure_debt_hotkey"
+
+            if (
+                self._proof_grading_attempts
+                >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+            ):
+                return False, "proof_grading_attempts_full"
 
             if self._proof_admission_count >= MAX_PROOF_CANDIDATES_PER_WINDOW:
                 return False, "proof_admission_window_full"
@@ -493,7 +513,24 @@ class GrpoWindowBatcher:
                 self._post_trigger_proof_admission_count += 1
 
             self._proof_admission_count += 1
+            self._proof_grading_attempts += 1
             return True, None
+
+    def release_proof_candidate_for_reward_error(self) -> None:
+        """Refund the GRAIL candidate slot after an OUT_OF_ZONE reject.
+
+        A reward-zone reject means the submission's rollouts lack reward
+        variance — a useless-but-honest submission that never reaches GRAIL.
+        It must not permanently hold a GRAIL slot, or a high out_of_zone rate
+        starves the env below B distinct. The grading-attempts ceiling is left
+        untouched, so total grader work stays bounded. Floors at zero so the
+        direct-``accept_submission`` test path (no prior reservation) is a
+        no-op.
+        """
+        with self._proof_admission_lock:
+            self._proof_admission_count = max(
+                0, self._proof_admission_count - 1
+            )
 
     # ----------------------------- ingestion -----------------------------
 
@@ -755,6 +792,9 @@ class GrpoWindowBatcher:
             )
         sigma = rewards_std(rewards)
         if not is_in_zone(sigma, bootstrap=self.bootstrap):
+            # Reward error, not cheating: refund the GRAIL candidate slot so a
+            # degenerate-reward env (e.g. opencode) isn't starved below B.
+            self.release_proof_candidate_for_reward_error()
             return reject(RejectReason.OUT_OF_ZONE, "zone")
 
         # A reward=0 rollout whose final \boxed{} is malformed (empty,

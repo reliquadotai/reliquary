@@ -233,6 +233,52 @@ def test_reject_out_of_zone_all_pass():
     assert resp.reason == RejectReason.OUT_OF_ZONE
 
 
+def test_out_of_zone_refunds_grail_candidate_not_grading_attempt():
+    """An out_of_zone reject is a reward error (degenerate rollout rewards),
+    not a proof failure or cheating — so it must NOT permanently consume the
+    scarce GRAIL candidate budget, or a high out_of_zone rate (e.g. opencode's
+    binary rewards) starves the env below B distinct. The grading-attempts
+    ceiling (anti-DoS / queue bound) is NOT refunded, so flood protection holds.
+    """
+    b = _make_batcher()
+    req = _request(rewards=[1.0] * 8, hotkey="hkz")  # degenerate -> out_of_zone
+
+    admitted, _ = b.try_reserve_proof_admission(req)
+    assert admitted
+    assert b.proof_admission_count == 1
+    assert b.proof_grading_attempts == 1
+
+    resp = b.accept_submission(req)
+    assert resp.reason == RejectReason.OUT_OF_ZONE
+
+    assert b.proof_admission_count == 0      # GRAIL candidate budget refunded
+    assert b.proof_grading_attempts == 1     # grading ceiling NOT refunded
+
+
+def test_grading_attempts_ceiling_blocks_admission_despite_refunds(monkeypatch):
+    """Out_of_zone refunds free GRAIL candidate slots, but the grading-attempts
+    ceiling still bounds total grading work — otherwise a degenerate-reward
+    flood would grow the unbounded submit queue without limit."""
+    import reliquary.validator.batcher as batcher_mod
+
+    monkeypatch.setattr(batcher_mod, "MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW", 3)
+    b = _make_batcher()
+    for i in range(3):
+        req = _request(rewards=[1.0] * 8, hotkey=f"hk{i}")
+        ok, _ = b.try_reserve_proof_admission(req)
+        assert ok
+        b.accept_submission(req)  # out_of_zone -> refunds candidate count
+
+    assert b.proof_admission_count == 0          # all GRAIL slots refunded
+    assert b.proof_grading_attempts == 3         # ceiling reached, not refunded
+
+    ok, reason = b.try_reserve_proof_admission(
+        _request(rewards=[1.0] * 8, hotkey="hkX")
+    )
+    assert ok is False
+    assert reason == "proof_grading_attempts_full"
+
+
 def test_reject_manufactured_opposite_reward_clones_before_grail_compute():
     def fail_if_called(commit, model, randomness):  # pragma: no cover
         raise AssertionError("GRAIL proof should not run for clone-pattern rejects")
