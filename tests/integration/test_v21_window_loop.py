@@ -414,3 +414,51 @@ async def test_timeout_partial_seal_skips_train_and_publish():
     # New contract: no training → no publish → checkpoint_n unchanged.
     assert svc._checkpoint_n == initial_cn
     svc._checkpoint_store.publish.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_seal_drain_waits_for_inflight_proofs():
+    """The seal-extension drain must wait for in-flight GRAIL proofs, not just
+    an empty submit queue.
+
+    Regression: concurrent proof verification empties the submit queue while
+    proofs are still running. Sealing on queue-empty alone drops those
+    in-flight submissions, capping emission at ~B instead of paying the whole
+    trigger drand round.
+    """
+    svc = _make_service()
+
+    captured = {}
+    import reliquary.validator.service as svc_mod
+    from reliquary.validator.batcher import GrpoWindowBatcher
+
+    def _capture_open(
+        window_start, env, model, *, cooldown_map, hash_set, tokenizer,
+        bootstrap=False, queue_drained_predicate=None,
+    ):
+        captured["pred"] = queue_drained_predicate
+        return GrpoWindowBatcher(
+            window_start=window_start, env=env, model=model,
+            cooldown_map=cooldown_map, hash_set=hash_set, bootstrap=bootstrap,
+            queue_drained_predicate=queue_drained_predicate,
+            verify_commitment_proofs_fn=_always_true_proof,
+            verify_signature_fn=lambda c, h: True,
+            completion_text_fn=lambda r: "",
+            drand_round_check_enabled=False,
+        )
+
+    with patch.object(svc_mod, "open_grpo_window", side_effect=_capture_open):
+        svc._open_window()
+
+    pred = captured["pred"]
+    assert pred is not None
+
+    # Submit queue drained, but one proof is still verifying in-flight.
+    while not svc.server._submit_queue.empty():
+        svc.server._submit_queue.get_nowait()
+    svc.server._inflight_proofs = 1
+    assert pred() is False, "seal must not fire while a proof is still in flight"
+
+    # Queue AND in-flight proofs drained → safe to seal.
+    svc.server._inflight_proofs = 0
+    assert pred() is True

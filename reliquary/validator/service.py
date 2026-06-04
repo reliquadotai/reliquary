@@ -491,9 +491,10 @@ class ValidationService:
                 hash_set=self._hash_set,
                 tokenizer=self.tokenizer,
                 bootstrap=bootstrap,
-                # Seal extension waits on this to confirm every queued
-                # trigger-round submission has finished GRAIL before firing.
-                queue_drained_predicate=lambda: self.server._submit_queue.empty(),
+                # Seal extension waits until the submit queue AND in-flight
+                # GRAIL proofs have both drained — concurrent verification
+                # empties the queue while proofs are still running.
+                queue_drained_predicate=self._queue_and_proofs_drained,
             )
             batcher.current_checkpoint_hash = cp_hash
             self._active_batchers[env_name] = batcher

@@ -332,8 +332,8 @@ class GrpoWindowBatcher:
         # contexts that bypass the HTTP/worker pipeline — in that case
         # the delayed seal coroutine fires as soon as the drand round
         # expires (drain phase skipped). Production wires this to
-        # ``lambda: server._submit_queue.empty()`` so already admitted
-        # trigger-round submissions get a short chance to finish GRAIL
+        # ``_queue_and_proofs_drained`` so already admitted trigger-round
+        # submissions finish GRAIL (queue empty AND no proof in flight)
         # before the batch is sealed.
         self._queue_drained_predicate = queue_drained_predicate
         self.force_seal_reason: str | None = None
