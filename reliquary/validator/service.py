@@ -841,8 +841,19 @@ class ValidationService:
         # fetch — all timing info is already attached to the submissions.
         # Seal all batchers and collect results.
         per_env_targets = dict(self.env_mix)
+        # Split the window's emission budget (1.0) equally across the active
+        # envs so the merged ``combined_rewards`` stays <= 1.0 and the weight
+        # setter's ``burn = max(0, 1 - total)`` keeps working. Without this each
+        # env distributed a full pool of 1.0, so two envs summed to ~2.0 and the
+        # burn was permanently zeroed (it inherits the per-window total via the
+        # EMA). Single-validator assumption: divide by the count THIS validator
+        # runs. If multiple validators ever run different env subsets, switch
+        # the denominator to ``len(ENVIRONMENT_MIX)`` (the canonical protocol
+        # count, as GRAD_ACCUM_STEPS already does) so every validator uses the
+        # same pool and an env a validator does not run burns its share.
+        pool_per_env = 1.0 / len(self.env_mix)
         sealed: dict[str, tuple] = {
-            name: b.seal_batch()
+            name: b.seal_batch(pool=pool_per_env)
             for name, b in self._active_batchers.items()
         }
         for name, (batch, rewards) in sealed.items():
