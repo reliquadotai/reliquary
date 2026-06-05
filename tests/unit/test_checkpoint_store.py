@@ -282,3 +282,44 @@ async def test_publish_repeated_calls_do_not_accumulate_directories(tmp_path):
     assert leftover == [], (
         f"publish() left orphan staging directories: {leftover}"
     )
+
+
+@pytest.mark.asyncio
+async def test_publish_does_not_block_event_loop_during_save(tmp_path):
+    """The local snapshot save is offloaded to a thread, so other coroutines
+    (the HTTP server serving /state, /submit) keep running while a multi-GB
+    checkpoint is serialised. Regression: the save used to run synchronously
+    on the event loop and froze every concurrent request for its duration."""
+    import asyncio
+    import time
+
+    def slow_save(model, tokenizer, path):
+        _save_stub(model, tokenizer, path)
+        time.sleep(0.3)  # stand-in for multi-GB safetensors serialisation
+
+    store = CheckpointStore(
+        validator_hotkey="5FHk",
+        wallet=FakeWallet(),
+        repo_id="org/repo",
+        staging_dir_path=str(tmp_path),
+        upload_fn=AsyncMock(return_value="rev_sha_001"),
+        save_fn=slow_save,
+    )
+
+    ticks = 0
+
+    async def heartbeat():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    hb = asyncio.create_task(heartbeat())
+    try:
+        await store.publish(checkpoint_n=1, model=MagicMock())
+    finally:
+        hb.cancel()
+
+    # The 0.3s save overlaps ~30 heartbeat ticks when the loop stays free.
+    # If the save blocked the loop, ticks would be ~0. Slack for slow CI.
+    assert ticks >= 5, f"event loop was starved during save (ticks={ticks})"

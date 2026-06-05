@@ -204,6 +204,48 @@ def test_pool_scaling():
         assert abs(rewards_100[hk] - rewards_1[hk] * 100.0) < 1e-7
 
 
+def _merge_multi_env(pool_per_env, fills):
+    """Mirror service._train_and_publish: distribute each env with its own
+    pool and sum per-hotkey into ``combined_rewards`` across envs."""
+    cd = CooldownMap(cooldown_windows=50)
+    combined: dict[str, float] = {}
+    for env_idx, n_fill in enumerate(fills):
+        subs = [
+            _sub(f"e{env_idx}_hk{i}", prompt_idx=i, drand_round=1)
+            for i in range(n_fill)
+        ]
+        _, rewards = select_batch_and_distribute(
+            submissions=subs, b=8, cooldown_map=cd, current_window=100,
+            pool=pool_per_env,
+        )
+        for hk, r in rewards.items():
+            combined[hk] = combined.get(hk, 0.0) + r
+    return combined
+
+
+def test_multi_env_combined_emission_stays_within_one_pool():
+    """With N envs at pool=1/N each, the merged emission across envs stays
+    <= 1.0 — so the weight setter's burn = max(0, 1 - total) is not defeated.
+    Regression: pool=1.0 per env summed two full pools to ~2.0, zeroing burn.
+    """
+    combined = _merge_multi_env(pool_per_env=1.0 / 2, fills=(8, 8))
+    total = sum(combined.values())
+    assert total <= 1.0 + 1e-9
+    assert abs(total - 1.0) < 1e-9  # both envs full -> exactly one pool, burn 0
+
+
+def test_multi_env_partial_fill_leaves_positive_burn():
+    """An under-filled env must leave room to burn: total < 1.0 so
+    burn = 1 - total > 0. This is the whole point of the per-env split."""
+    # env A full (8/8) -> 0.5 ; env B half (4/8) -> 0.5 * 4/8 = 0.25
+    combined = _merge_multi_env(pool_per_env=1.0 / 2, fills=(8, 4))
+    total = sum(combined.values())
+    assert abs(total - 0.75) < 1e-9
+    burn = max(0.0, 1.0 - total)
+    assert burn > 0.0
+    assert abs(burn - 0.25) < 1e-9
+
+
 # ---------------------------------------------------------------------------
 # Boundary-round fair split
 # ---------------------------------------------------------------------------
