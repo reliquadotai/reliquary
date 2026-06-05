@@ -7,6 +7,7 @@ on checkpoint hash is a v2.2 concern.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
@@ -88,7 +89,10 @@ class CheckpointStore:
         snapshot_dir = self.staging_dir / f"ckpt_{checkpoint_n}"
         snapshot_dir.mkdir(parents=True, exist_ok=True)
         try:
-            self._save(model, self.tokenizer, snapshot_dir)
+            # Serialising the model (multi-GB safetensors) is sync and CPU/IO
+            # heavy; run it off the event loop so the HTTP server stays
+            # responsive while a checkpoint is being written.
+            await asyncio.to_thread(self._save, model, self.tokenizer, snapshot_dir)
 
             # 2. Upload the whole folder to HF — one commit per checkpoint.
             revision = await self._upload(

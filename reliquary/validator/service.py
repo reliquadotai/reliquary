@@ -953,7 +953,11 @@ class ValidationService:
             trained = False
         elif trained:
             try:
-                self.train_model = train_step(
+                # Forward/backward is the longest blocking step in the loop;
+                # run it in a thread so the HTTP server keeps serving /state
+                # and /submit while a window trains.
+                self.train_model = await asyncio.to_thread(
+                    train_step,
                     self.train_model, batches,
                     ref_model=self.verify_model,
                     window_index=self._window_n,
@@ -1661,11 +1665,16 @@ class ValidationService:
         if self.use_drand:
             import time
             from reliquary.infrastructure.drand import get_beacon, get_current_chain
-            chain_info = get_current_chain()
+            # Both calls do synchronous HTTP to the drand relays; run them off
+            # the event loop so a slow relay can't stall the window-open path
+            # (and the HTTP server) while the seed is fetched.
+            chain_info = await asyncio.to_thread(get_current_chain)
             drand_round = chain.compute_current_drand_round(
                 time.time(), chain_info["genesis_time"], chain_info["period"],
             )
-            beacon = get_beacon(round_id=str(drand_round), use_drand=True)
+            beacon = await asyncio.to_thread(
+                get_beacon, round_id=str(drand_round), use_drand=True,
+            )
             randomness = chain.compute_window_randomness(
                 None, beacon["randomness"], drand_round=beacon["round"],
             )
