@@ -233,32 +233,35 @@ def test_reject_out_of_zone_all_pass():
     assert resp.reason == RejectReason.OUT_OF_ZONE
 
 
-def test_out_of_zone_refunds_grail_candidate_not_grading_attempt():
+def test_out_of_zone_does_not_charge_grail_candidate():
     """An out_of_zone reject is a reward error (degenerate rollout rewards),
-    not a proof failure or cheating — so it must NOT permanently consume the
-    scarce GRAIL candidate budget, or a high out_of_zone rate (e.g. opencode's
-    binary rewards) starves the env below B distinct. The grading-attempts
-    ceiling (anti-DoS / queue bound) is NOT refunded, so flood protection holds.
+    not a proof failure or cheating. The scarce GRAIL candidate budget is
+    charged only AFTER the reward-zone gate passes, so a degenerate submission
+    never consumes it — no refund needed, and a high out_of_zone rate (e.g.
+    opencode's binary rewards) cannot starve the env below B distinct. The
+    grading-attempts ceiling (anti-DoS / queue bound) IS charged at admission,
+    so flood protection still holds.
     """
     b = _make_batcher()
     req = _request(rewards=[1.0] * 8, hotkey="hkz")  # degenerate -> out_of_zone
 
     admitted, _ = b.try_reserve_proof_admission(req)
     assert admitted
-    assert b.proof_admission_count == 1
-    assert b.proof_grading_attempts == 1
+    assert b.proof_admission_count == 0      # GRAIL budget NOT charged at admission
+    assert b.proof_grading_attempts == 1     # grading ceiling charged
 
     resp = b.accept_submission(req)
     assert resp.reason == RejectReason.OUT_OF_ZONE
 
-    assert b.proof_admission_count == 0      # GRAIL candidate budget refunded
-    assert b.proof_grading_attempts == 1     # grading ceiling NOT refunded
+    assert b.proof_admission_count == 0      # never reached GRAIL -> never charged
+    assert b.proof_grading_attempts == 1     # grading ceiling unaffected
 
 
-def test_grading_attempts_ceiling_blocks_admission_despite_refunds(monkeypatch):
-    """Out_of_zone refunds free GRAIL candidate slots, but the grading-attempts
-    ceiling still bounds total grading work — otherwise a degenerate-reward
-    flood would grow the unbounded submit queue without limit."""
+def test_grading_attempts_ceiling_blocks_admission(monkeypatch):
+    """The grading-attempts ceiling bounds total grading work and gates
+    admission — even when no submission ever charges the GRAIL budget (here all
+    are out_of_zone). Otherwise a degenerate-reward flood would grow the
+    unbounded submit queue without limit."""
     import reliquary.validator.batcher as batcher_mod
 
     monkeypatch.setattr(batcher_mod, "MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW", 3)
@@ -267,9 +270,9 @@ def test_grading_attempts_ceiling_blocks_admission_despite_refunds(monkeypatch):
         req = _request(rewards=[1.0] * 8, hotkey=f"hk{i}")
         ok, _ = b.try_reserve_proof_admission(req)
         assert ok
-        b.accept_submission(req)  # out_of_zone -> refunds candidate count
+        b.accept_submission(req)  # out_of_zone -> never charges GRAIL budget
 
-    assert b.proof_admission_count == 0          # all GRAIL slots refunded
+    assert b.proof_admission_count == 0          # GRAIL budget never charged
     assert b.proof_grading_attempts == 3         # ceiling reached, not refunded
 
     ok, reason = b.try_reserve_proof_admission(
@@ -1690,25 +1693,79 @@ def test_seal_extension_boundary_fair_split_fires_end_to_end():
     assert abs(sum(rewards.values()) - 1.0) < 1e-9
 
 
-def test_proof_admission_global_cap_rejects_after_limit():
-    """Proof admission counts reservations, not accepted submissions.
+def test_admission_gated_by_grading_ceiling_not_grail_budget():
+    """Admission counts grading attempts, not GRAIL candidates.
 
-    Once the per-window proof budget is exhausted, further candidates must
-    fail before they can reach GRAIL.
+    The window-open burst must queue for grading up to the grading ceiling —
+    far beyond the smaller GRAIL/GPU budget — instead of hard-bouncing once the
+    GRAIL budget is notionally full. (The GRAIL budget is charged later, after
+    the reward-zone gate; see ``test_grail_candidate_reserved_after_zone_gate``
+    and ``test_grail_budget_caps_in_zone_submissions_at_accept``.)
     """
-    from reliquary.constants import MAX_PROOF_CANDIDATES_PER_WINDOW
+    from reliquary.constants import (
+        MAX_PROOF_CANDIDATES_PER_WINDOW,
+        MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
+    )
 
+    assert MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW > MAX_PROOF_CANDIDATES_PER_WINDOW
     b = _make_batcher()
-    req = _request()
-    for _ in range(MAX_PROOF_CANDIDATES_PER_WINDOW):
-        admitted, reason = b.try_reserve_proof_admission(req)
-        assert admitted is True
-        assert reason is None
 
-    admitted, reason = b.try_reserve_proof_admission(req)
+    # A burst larger than the GRAIL budget is still fully admitted for grading,
+    # bounded only by the grading-attempts ceiling.
+    for i in range(MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW):
+        admitted, reason = b.try_reserve_proof_admission(
+            _request(prompt_idx=i, hotkey=f"hk{i}")
+        )
+        assert admitted is True, (i, reason)
+        assert reason is None
+    assert b.proof_admission_count == 0          # admission never charges GRAIL
+    assert b.proof_grading_attempts == MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+
+    # One past the grading ceiling is the anti-DoS bound that does reject.
+    admitted, reason = b.try_reserve_proof_admission(
+        _request(prompt_idx=999, hotkey="hkX")
+    )
     assert admitted is False
-    assert reason == "proof_admission_window_full"
-    assert b.proof_admission_count == MAX_PROOF_CANDIDATES_PER_WINDOW
+    assert reason == "proof_grading_attempts_full"
+
+
+def test_grail_candidate_reserved_after_zone_gate():
+    """The GRAIL/GPU candidate budget is charged when a submission passes the
+    reward-zone gate (heading to the proof), not at HTTP admission. A reserved-
+    but-not-yet-graded submission holds a grading slot but no GRAIL slot."""
+    b = _make_batcher()
+    req = _request(hotkey="hkok")  # default rewards are in-zone (k=4, sigma=0.5)
+
+    admitted, _ = b.try_reserve_proof_admission(req)
+    assert admitted
+    assert b.proof_admission_count == 0      # GRAIL not charged at admission
+    assert b.proof_grading_attempts == 1
+
+    resp = b.accept_submission(req)
+    assert resp.accepted is True, resp.reason
+    assert b.proof_admission_count == 1      # charged once the zone gate passed
+
+
+def test_grail_budget_caps_in_zone_submissions_at_accept(monkeypatch):
+    """The GRAIL budget still bounds GPU work — but at the proof step, on
+    zone-valid submissions only. Once exhausted, a further in-zone submission is
+    rejected BATCH_FILLED (the env already has more in-zone candidates than the
+    GPU can verify this window)."""
+    import reliquary.validator.batcher as batcher_mod
+
+    monkeypatch.setattr(batcher_mod, "MAX_PROOF_CANDIDATES_PER_WINDOW", 2)
+    b = _make_batcher()
+
+    a = b.accept_submission(_request(prompt_idx=1, hotkey="a"))
+    assert a.accepted is True, a.reason
+    c = b.accept_submission(_request(prompt_idx=2, hotkey="b"))
+    assert c.accepted is True, c.reason
+    assert b.proof_admission_count == 2
+
+    # 3rd in-zone submission: GRAIL budget exhausted -> BATCH_FILLED at accept.
+    d = b.accept_submission(_request(prompt_idx=3, hotkey="c"))
+    assert d.accepted is False
+    assert d.reason == RejectReason.BATCH_FILLED
 
 
 def test_proof_admission_rejects_hotkey_after_expensive_failure_debt():
