@@ -11,6 +11,7 @@ saves one forward pass per rollout.
 
 from __future__ import annotations
 
+import gc
 import logging
 import math
 from typing import Any, Optional
@@ -21,7 +22,7 @@ import torch.utils.checkpoint
 from reliquary.validator import telemetry
 from reliquary.constants import (
     GRAD_CLIP_NORM, KL_BETA, LEARNING_RATE, LR_COSINE_MAX_WINDOWS,
-    LR_WARMUP_WINDOWS, PPO_CLIP_EPSILON,
+    LR_WARMUP_WINDOWS, MICROBATCH_MAX_PADDED_TOKENS, PPO_CLIP_EPSILON,
 )
 
 logger = logging.getLogger(__name__)
@@ -333,6 +334,196 @@ def _rollout_loss(
 
 
 # ---------------------------------------------------------------------------
+# Micro-batched forward/backward — pack short rollouts into one forward.
+# Numerically ~equivalent to the per-rollout path (bf16 attention-kernel noise
+# only); ~2.6× faster on a realistic length mix. See the equivalence tests.
+# ---------------------------------------------------------------------------
+
+def _pack_by_token_budget(lengths: list[int], budget: int) -> list[list[int]]:
+    """Greedy length-sorted bin packing. Each bin's padded cost (n_seqs ×
+    longest_seq) stays ≤ budget; a sequence longer than budget bins alone (=
+    the legacy one-at-a-time path), so peak memory never exceeds one such bin.
+    Returns lists of indices into ``lengths``.
+    """
+    order = sorted(range(len(lengths)), key=lambda i: lengths[i], reverse=True)
+    bins: list[list[int]] = []
+    cur: list[int] = []
+    cur_max = 0
+    for i in order:
+        L = lengths[i]
+        if cur and (len(cur) + 1) * max(cur_max, L) > budget:
+            bins.append(cur)
+            cur, cur_max = [], 0
+        cur.append(i)
+        cur_max = max(cur_max, L)
+    if cur:
+        bins.append(cur)
+    return bins
+
+
+def _batched_completion_logprobs(model, input_ids, attention_mask, prompt_lengths, lengths):
+    """Selected next-token logprobs over every rollout's completion tokens in a
+    right-padded batch, concatenated in row order. Same per-token values as
+    ``_selected_logprobs_for_tokens`` (each row depends only on its own hidden
+    state) — only the completion-predicting rows are gathered. Returns
+    ``(logprobs[N], seg)`` where ``seg[i]`` is rollout i's completion-token count.
+    """
+    device = input_ids.device
+    b_rows: list[int] = []
+    p_rows: list[int] = []
+    seg: list[int] = []
+    for i, (p, L) in enumerate(zip(prompt_lengths, lengths)):
+        seg.append(L - p)
+        for t in range(p - 1, L - 1):
+            b_rows.append(i)
+            p_rows.append(t)
+    b_idx = torch.tensor(b_rows, device=device, dtype=torch.long)
+    p_idx = torch.tensor(p_rows, device=device, dtype=torch.long)
+    targets = input_ids[b_idx, p_idx + 1]
+    base, lm_head = _base_model_and_lm_head(model)
+    if base is not None and lm_head is not None:
+        try:
+            out = base(input_ids, attention_mask=attention_mask, use_cache=False)
+        except TypeError:
+            out = base(input_ids, use_cache=False)  # doubles without a mask kwarg
+        hidden = _last_hidden_state(out)
+        if hidden is not None:
+            return _selected_logprobs_from_hidden(hidden[b_idx, p_idx], targets, lm_head), seg
+    logits = model(input_ids, attention_mask=attention_mask, use_cache=False).logits
+    return _selected_logprobs(logits[b_idx, p_idx], targets), seg
+
+
+def _microbatch_grad(model, ref_model, batch, n_total_tokens, device, *, atomic):
+    """Forward + backward one micro-batch. ``batch`` is a list of
+    ``(tokens, prompt_length, old_logprobs, advantage)``. Returns
+    ``(sum_ppo_mean, sum_kl_mean, n)`` for logging (per-rollout means summed,
+    matching the legacy metric).
+
+    ``atomic=True`` commits gradients via ``torch.autograd.grad`` only after the
+    backward fully succeeds, so an OOM mid-backward (gradient-checkpoint
+    recompute) leaves already-accumulated ``.grad`` untouched — the failed
+    micro-batch contributes nothing and a split-retry stays correct.
+    """
+    B = len(batch)
+    T = max(len(it[0]) for it in batch)
+    input_ids = torch.zeros(B, T, dtype=torch.long, device=device)
+    attn = torch.zeros(B, T, dtype=torch.long, device=device)
+    plens, lens, olds, advs = [], [], [], []
+    for j, (tokens, p, old, adv) in enumerate(batch):
+        L = len(tokens)
+        input_ids[j, :L] = torch.tensor(tokens, device=device)
+        attn[j, :L] = 1
+        plens.append(p)
+        lens.append(L)
+        olds.append(old)
+        advs.append(adv)
+
+    with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
+                        enabled=device.type in ("cuda", "cpu")):
+        new_lp, seg = _batched_completion_logprobs(model, input_ids, attn, plens, lens)
+        with torch.no_grad():
+            ref_lp, _ = _batched_completion_logprobs(ref_model, input_ids, attn, plens, lens)
+
+    old_cat = torch.tensor([x for old in olds for x in old], device=device, dtype=new_lp.dtype)
+    adv_cat = torch.tensor([advs[k] for k in range(B) for _ in range(seg[k])],
+                           device=device, dtype=new_lp.dtype)
+    ratio = torch.exp(new_lp - old_cat)
+    surr = torch.min(ratio * adv_cat,
+                     torch.clamp(ratio, 1 - PPO_CLIP_EPSILON, 1 + PPO_CLIP_EPSILON) * adv_cat)
+    ppo_tok = -surr
+    kl_log = ref_lp - new_lp
+    kl_tok = torch.exp(kl_log) - 1 - kl_log
+    # Token-level (DAPO) normalisation: every completion token weighed equally.
+    loss = (ppo_tok.sum() + KL_BETA * kl_tok.sum()) / n_total_tokens
+
+    if atomic:
+        params = [p for p in model.parameters() if p.requires_grad]
+        grads = torch.autograd.grad(loss, params, allow_unused=True)
+        with torch.no_grad():
+            for p, g in zip(params, grads):
+                if g is None:
+                    continue  # param not in this micro-batch's graph -> 0 contribution
+                p.grad = g if p.grad is None else p.grad + g
+    else:
+        loss.backward()
+
+    sum_ppo = sum_kl = 0.0
+    off = 0
+    with torch.no_grad():
+        for k in range(B):
+            n = seg[k]
+            sum_ppo += float(ppo_tok[off:off + n].mean())
+            sum_kl += float(kl_tok[off:off + n].mean())
+            off += n
+    return sum_ppo, sum_kl, B
+
+
+def _process_microbatch(model, ref_model, batch, n_total_tokens, device, *, atomic):
+    """One micro-batch; when atomic, on OOM halve and retry down to a single
+    sequence (which, if it still OOMs, is a genuine unrecoverable OOM)."""
+    if not atomic:
+        return _microbatch_grad(model, ref_model, batch, n_total_tokens, device, atomic=False)
+    oom = False
+    try:
+        return _microbatch_grad(model, ref_model, batch, n_total_tokens, device, atomic=True)
+    except torch.cuda.OutOfMemoryError:
+        if len(batch) == 1:
+            raise
+        oom = True
+    # Reclaim OUTSIDE the except: while it is active its traceback pins the
+    # failed forward's frame (and tensors), so empty_cache there frees nothing.
+    if oom:
+        gc.collect()
+        torch.cuda.empty_cache()
+        mid = len(batch) // 2
+        a = _process_microbatch(model, ref_model, batch[:mid], n_total_tokens, device, atomic=True)
+        b = _process_microbatch(model, ref_model, batch[mid:], n_total_tokens, device, atomic=True)
+        return a[0] + b[0], a[1] + b[1], a[2] + b[2]
+
+
+def _build_microbatch_items(plan):
+    """Flatten plan -> list of (tokens, prompt_length, old_logprobs, advantage),
+    dropping rollouts the per-rollout path would have skipped (missing
+    prompt_length/token_logprobs, or a miner/model completion-length mismatch)."""
+    items = []
+    for group, advantages in plan:
+        for rollout, adv in zip(group.rollouts, advantages):
+            commit = rollout.commit or {}
+            tokens = commit.get("tokens")
+            meta = commit.get("rollout", {}) or {}
+            p = int(meta.get("prompt_length", 0))
+            old = meta.get("token_logprobs", []) or []
+            if not tokens or p <= 0 or not old:
+                logger.warning("rollout skipped: missing prompt_length or token_logprobs")
+                continue
+            n_completion = len(tokens) - p
+            if n_completion <= 0 or n_completion != len(old):
+                logger.warning("rollout skipped: log-prob length mismatch")
+                continue
+            items.append((tokens, p, old, adv))
+    return items
+
+
+def _accumulate_grouped_grads(model, ref_model, plan, n_total_tokens, device, *, budget, atomic):
+    """Pack the plan's rollouts into token-budget micro-batches and accumulate
+    gradients. Returns ``(total_ppo, total_kl, n_processed)``."""
+    items = _build_microbatch_items(plan)
+    if not items:
+        return 0.0, 0.0, 0
+    lengths = [len(it[0]) for it in items]
+    total_ppo = total_kl = 0.0
+    n_processed = 0
+    for idxs in _pack_by_token_budget(lengths, budget):
+        sp, sk, n = _process_microbatch(
+            model, ref_model, [items[i] for i in idxs], n_total_tokens, device, atomic=atomic,
+        )
+        total_ppo += sp
+        total_kl += sk
+        n_processed += n
+    return total_ppo, total_kl, n_processed
+
+
+# ---------------------------------------------------------------------------
 # Main entry point — one GRPO step per call
 # ---------------------------------------------------------------------------
 
@@ -373,9 +564,6 @@ def train_step(
     _optimizer.zero_grad()
 
     n_total_rollouts = sum(len(g.rollouts) for batch in batches for g in batch)
-    total_ppo = 0.0
-    total_kl = 0.0
-    n_processed = 0
     n_skipped = 0
 
     # Pass 1 (metadata only, no forward): group advantages + total completion-
@@ -402,25 +590,23 @@ def train_step(
         logger.info("train_step: no trainable completion tokens")
         return model
 
-    # Pass 2: forward/backward one rollout at a time (peak memory = one
-    # sequence) and accumulate the token-level-normalised loss.
-    for group, advantages in plan:
-        for rollout, adv in zip(group.rollouts, advantages):
-            try:
-                ppo_loss, kl, n_tok = _rollout_loss(
-                    model=model, ref_model=ref_model,
-                    rollout=rollout, advantage=adv, device=device,
-                )
-            except ValueError as e:
-                logger.warning("rollout skipped: %s", e)
-                continue
-            # ppo_loss / kl are per-token means; ``* n_tok`` recovers the token
-            # sum and ``/ n_total_tokens`` applies equal per-token weight.
-            loss = (ppo_loss + KL_BETA * kl) * n_tok / n_total_tokens
-            loss.backward()
-            total_ppo += ppo_loss.item()
-            total_kl += kl.item()
-            n_processed += 1
+    # Pass 2: micro-batched forward/backward (token-budget packing). The fast
+    # path accumulates straight into .grad; if a micro-batch OOMs, discard the
+    # partial grads and retry the whole pass with the atomic split-retry path at
+    # a halved budget (atomic = an OOM mid-backward commits no gradient).
+    try:
+        total_ppo, total_kl, n_processed = _accumulate_grouped_grads(
+            model, ref_model, plan, n_total_tokens, device,
+            budget=MICROBATCH_MAX_PADDED_TOKENS, atomic=False,
+        )
+    except torch.cuda.OutOfMemoryError:
+        logger.warning("train_step: OOM in micro-batch — retrying atomic at halved budget")
+        _optimizer.zero_grad()
+        torch.cuda.empty_cache()
+        total_ppo, total_kl, n_processed = _accumulate_grouped_grads(
+            model, ref_model, plan, n_total_tokens, device,
+            budget=max(1, MICROBATCH_MAX_PADDED_TOKENS // 2), atomic=True,
+        )
 
     if n_processed == 0:
         logger.info("train_step: no valid rollouts processed")

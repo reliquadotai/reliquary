@@ -476,6 +476,12 @@ KL_BETA = 0.04
 # Max gradient norm before step — standard RL stability guard.
 GRAD_CLIP_NORM = 1.0
 
+# train_step micro-batching: cap on padded tokens (n_seqs × longest_seq) per
+# forward/backward. Short rollouts pack together; a rollout longer than this
+# runs alone (= the legacy one-at-a-time path), so peak memory never exceeds a
+# single sequence of this length. Sized at the protocol completion cap.
+MICROBATCH_MAX_PADDED_TOKENS = 8192
+
 # Linear LR warmup for the first N training steps (= N windows sealed).
 LR_WARMUP_WINDOWS = 10
 
