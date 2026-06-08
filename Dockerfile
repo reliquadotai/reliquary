@@ -33,6 +33,12 @@ RUN wget -q "${FA_URL}" -P /tmp/ \
  && pip install /tmp/flash_attn-*.whl \
  && rm /tmp/flash_attn-*.whl
 
+# flash-linear-attention: fast triton kernel for Qwen3.5's GatedDeltaNet layers.
+# Without it they fall back to the slow torch_chunk_gated_delta_rule scan (~3x
+# slower GRAIL verify). causal-conv1d is skipped on purpose: it needs an nvcc
+# compile and only swaps a cheap conv -- the gated-delta scan is the real cost.
+RUN pip install flash-linear-attention==0.5.0
+
 # Source + install
 WORKDIR /opt/reliquary
 COPY . /opt/reliquary
