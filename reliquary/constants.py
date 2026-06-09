@@ -311,6 +311,24 @@ COOLDOWN_REBUILD_LOOKBACK = int(
     _os.environ.get("COOLDOWN_REBUILD_LOOKBACK", "300")
 )
 
+# Per-window prompt range (anti pre-curation). Each window, miner and
+# validator derive the same contiguous slice of the prompt index space from
+# the shared per-window randomness; once enforcement is armed only
+# submissions whose prompt_idx falls in the slice are accepted. A static or
+# shared bank of pre-curated prompts then lands in-range only
+# ~PROMPT_RANGE_SIZE/len(env) of windows. See reliquary/shared/prompt_range.py.
+PROMPT_RANGE_SIZE = int(_os.environ.get("PROMPT_RANGE_SIZE", "5000"))
+
+# Window number from which the validator hard-enforces the prompt range.
+# Below this window the slice is NOT enforced (current behavior, no rejects),
+# so the upgraded miner client can ship ahead of the cutover. The default is
+# a "never enforce" sentinel: set PROMPT_RANGE_ENFORCE_FROM_WINDOW=N* to the
+# agreed cutover window AFTER the gated client is released and announced,
+# otherwise un-upgraded miners are rejected ~every window.
+PROMPT_RANGE_ENFORCE_FROM_WINDOW = int(
+    _os.environ.get("PROMPT_RANGE_ENFORCE_FROM_WINDOW", str(2 ** 63 - 1))
+)
+
 # Per-rollout content dedup horizon. Independent of and strictly longer
 # than the prompt cooldown: cooldown lets a prompt come back for fresh
 # content, the hash set blacklists the specific (tokens) of every rollout

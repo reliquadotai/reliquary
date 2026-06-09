@@ -53,6 +53,7 @@ class RejectReason(str, Enum):
     # enum so historical archives in R2 that carry the string deserialize.
     SUPERSEDED = "superseded"
     PROMPT_FULL = "prompt_full"
+    PROMPT_OUT_OF_RANGE = "prompt_out_of_range"
     GRAIL_FAIL = "grail_fail"
     HASH_DUPLICATE = "hash_duplicate"
     LOGPROB_MISMATCH = "logprob_mismatch"

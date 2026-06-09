@@ -47,3 +47,18 @@ def test_membership_is_half_open():
     lo, hi = window_prompt_range("deadbeef", "openmathinstruct", 880_000, 5000)
     assert lo in range(lo, hi)
     assert hi not in range(lo, hi)
+
+
+def test_prompt_range_constants_exist():
+    from reliquary.constants import (
+        PROMPT_RANGE_SIZE,
+        PROMPT_RANGE_ENFORCE_FROM_WINDOW,
+    )
+    assert isinstance(PROMPT_RANGE_SIZE, int) and PROMPT_RANGE_SIZE > 0
+    # Default is a "never enforce" sentinel so the code ships disabled.
+    assert PROMPT_RANGE_ENFORCE_FROM_WINDOW >= 2 ** 62
+
+
+def test_reject_reason_out_of_range_value():
+    from reliquary.protocol.submission import RejectReason
+    assert RejectReason.PROMPT_OUT_OF_RANGE.value == "prompt_out_of_range"
