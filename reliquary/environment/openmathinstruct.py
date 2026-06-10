@@ -115,17 +115,61 @@ def _as_number(s: str) -> Optional[Fraction]:
         return None
 
 
+def _latex_to_pyexpr(s: str) -> Optional[str]:
+    """Rewrite the common LaTeX math macros (\\frac, \\sqrt, \\cdot, ...) into a
+    plain Python/sympy expression. Returns None if any unknown ``\\macro``
+    survives, so the caller falls back to string comparison rather than guess.
+    """
+    prev = None
+    while prev != s:
+        prev = s
+        s = re.sub(r"\\sqrt\[([^\[\]{}]+)\]\{([^{}]+)\}", r"((\2)**(1.0/(\1)))", s)
+        s = re.sub(r"\\sqrt\{([^{}]+)\}", r"sqrt((\1))", s)
+        s = re.sub(r"\\(?:d|t)?frac\{([^{}]+)\}\{([^{}]+)\}", r"((\1)/(\2))", s)
+    s = (s.replace(r"\cdot", "*").replace(r"\times", "*")
+          .replace(r"\div", "/").replace(r"\pi", "pi"))
+    s = s.replace("^", "**").replace("{", "(").replace("}", ")")
+    return None if "\\" in s else s
+
+
+def _latex_value_equal(candidate: str, gt: str) -> bool:
+    """Numeric value-equality for LaTeX answers, antlr-free and bounded.
+
+    Length cap + ``evaluate=False`` keep a malicious boxed payload (e.g. a power
+    tower) from hanging the validator. Returns False on any parse/eval error.
+    """
+    if not candidate or not gt or len(candidate) > 100 or len(gt) > 100:
+        return False
+    ec, eg = _latex_to_pyexpr(candidate), _latex_to_pyexpr(gt)
+    if ec is None or eg is None:
+        return False
+    try:
+        from sympy.parsing.sympy_parser import (
+            implicit_multiplication_application,
+            parse_expr,
+            standard_transformations,
+        )
+        tr = standard_transformations + (implicit_multiplication_application,)
+        vc = complex(parse_expr(ec, transformations=tr, evaluate=False).evalf())
+        vg = complex(parse_expr(eg, transformations=tr, evaluate=False).evalf())
+    except Exception:
+        return False
+    return abs(vc - vg) <= 1e-9 * (1 + abs(vg))
+
+
 def _answers_equal(candidate: str, gt: str) -> bool:
     """Compare by value when both sides are numbers, else by normalized string.
 
     The prompt asks for a value, so any surface form of that value is correct
-    (trailing zeros, fraction vs decimal). Non-numeric answers (LaTeX) keep the
-    existing exact normalized-string match.
+    (trailing zeros, fraction vs decimal, \\frac{5721}{5} == 1144.2). Falls back
+    to LaTeX value-equality, then exact normalized-string match.
     """
     c, g = _as_number(candidate), _as_number(gt)
     if c is not None and g is not None:
         return c == g
-    return candidate == gt
+    if candidate == gt:
+        return True
+    return _latex_value_equal(candidate, gt)
 
 
 def _compute_omi_reward(problem: dict, completion: str) -> float:
