@@ -84,16 +84,12 @@ def test_env_var_takes_precedence_over_safe_default(monkeypatch):
     assert _get_environments_option_default(cli, "validate") == "openmathinstruct,opencodeinstruct"
 
 
-def test_opencode_miner_requires_grader_by_default(monkeypatch):
-    monkeypatch.delenv("RELIQUARY_OCI_PROMPT_ONLY", raising=False)
+def test_miner_never_requires_grader(monkeypatch):
+    """Miners never grade — opencode reward is validator-authoritative — so the
+    reference miner never launches the gVisor grader."""
     cli = _reload_cli_main()
-    assert cli._miner_requires_grader(["opencodeinstruct"]) is True
+    assert cli._miner_requires_grader(["opencodeinstruct"]) is False
     assert cli._miner_requires_grader(["openmathinstruct"]) is False
-
-
-def test_opencode_prompt_only_miner_skips_grader(monkeypatch):
-    monkeypatch.setenv("RELIQUARY_OCI_PROMPT_ONLY", "1")
-    cli = _reload_cli_main()
     assert cli._miner_requires_grader(["openmathinstruct", "opencodeinstruct"]) is False
 
 

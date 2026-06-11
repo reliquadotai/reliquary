@@ -1,9 +1,10 @@
 """OpenCodeInstruct code-execution environment.
 
-Loads a deterministic subset of nvidia/OpenCodeInstruct (filtered for
-test stability — see scripts/build_opencodeinstruct_subset.py) and
-scores miner completions by calling hidden structured cases inside a
-gVisor sandbox managed by the grader subprocess.
+Loads the reproducible curated subset of nvidia/OpenCodeInstruct (per-test
+filtered + structured — see scripts/build_opencode_curated.py), lazily via a
+VirtualParquetDataset so only the row-groups a window touches are fetched, and
+scores miner completions by calling structured cases inside a gVisor sandbox
+managed by the grader subprocess.
 
 The class itself is a thin wrapper: it knows nothing about sandboxes.
 All execution happens via reliquary.environment.grader_client, which
@@ -52,31 +53,19 @@ def _extract_python(completion: str) -> str:
     return completion
 
 
-def _load_subset_dataset(repo: str, revision: str | None = None, hf_module=None):
-    """Load either a HF dataset repo or a local ``save_to_disk`` dataset."""
-    if hf_module is None:
-        import datasets as hf_module
+def _load_dataset(repo: str, revision: str):
+    """Lazy virtual-parquet view of the curated dataset.
+
+    A ``save_to_disk`` directory path is loaded eagerly (offline / fixtures);
+    a ``owner/name`` repo id is wrapped in a ``VirtualParquetDataset`` so only
+    the row-groups a window touches are fetched — no multi-GB bulk download.
+    """
     path = Path(repo).expanduser()
-    if path.exists() and (path / "dataset_info.json").exists() and (path / "state.json").exists():
-        return hf_module.load_from_disk(str(path))
-    kwargs = {"split": "train"}
-    if revision:
-        kwargs["revision"] = revision
-    return hf_module.load_dataset(repo, **kwargs)
-
-
-def _env_flag(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _has_structured_cases_column(dataset) -> bool:
-    columns = getattr(dataset, "column_names", None)
-    if columns is not None:
-        return "structured_cases" in columns
-    if len(dataset) == 0:
-        return False
-    row = dataset[0]
-    return hasattr(row, "get") and row.get("structured_cases") is not None
+    if path.exists() and (path / "dataset_info.json").exists():
+        import datasets as hf
+        return hf.load_from_disk(str(path))
+    from reliquary.environment.virtual_parquet import VirtualParquetDataset
+    return VirtualParquetDataset(repo, revision, columns=["input", "structured_cases"])
 
 
 # ---------------------------------------------------------------------------
@@ -91,47 +80,33 @@ class OpenCodeInstructEnvironment:
     opaque case-set id. The actual structured cases stay in this
     environment instance and are scored by the trusted grader server.
 
-    The dataset is the filtered subset built by
-    scripts/build_opencodeinstruct_subset.py and published to
-    R0mAI/opencodeinstruct-structured-subset on HF Hub.
-    Override the source repo with RELIQUARY_OCI_SUBSET_REPO.
+    The dataset is the reproducible curated subset built by
+    scripts/build_opencode_curated.py (per-test filtered + structured) and
+    published to R0mAI/opencodeinstruct-curated. Both validator and miner load
+    the same pinned revision lazily (only the touched row-groups), so tests are
+    no longer hidden — the reward grades honest model output by value, not
+    secrecy. Override with RELIQUARY_OCI_REPO / RELIQUARY_OCI_REVISION.
     """
 
     name: str = "opencodeinstruct"
     validator_authoritative_reward: ClassVar[bool] = True
 
     _dataset_cache: ClassVar = {}
-    _DEFAULT_SUBSET_REPO: ClassVar[str] = "R0mAI/opencodeinstruct-structured-subset"
-    _DEFAULT_SUBSET_REVISION: ClassVar[str] = "6e400051a0f1e972bc1a33c8e5058c20917ecc8d"
-    _DEFAULT_PROMPT_REPO: ClassVar[str] = "R0mAI/opencodeinstruct-prompts"
-    _DEFAULT_PROMPT_REVISION: ClassVar[str] = "f50bef12e244f5d51a7ae3f55ee8d31fdf33365f"
+    _CURATED_REPO: ClassVar[str] = "R0mAI/opencodeinstruct-curated"
+    _CURATED_REVISION: ClassVar[str] = "d3caaefc3b46f8642b251f9efaeccf0d1e95b0a7"
 
     def __init__(self) -> None:
-        self._prompt_only = _env_flag("RELIQUARY_OCI_PROMPT_ONLY")
-        default_repo = self._DEFAULT_PROMPT_REPO if self._prompt_only else self._DEFAULT_SUBSET_REPO
-        repo = os.environ.get("RELIQUARY_OCI_SUBSET_REPO", default_repo)
-        default_revision = None
-        if repo == self._DEFAULT_PROMPT_REPO:
-            default_revision = self._DEFAULT_PROMPT_REVISION
-        elif repo == self._DEFAULT_SUBSET_REPO:
-            default_revision = self._DEFAULT_SUBSET_REVISION
-        revision = os.environ.get("RELIQUARY_OCI_SUBSET_REVISION", default_revision or "")
-        revision = revision or None
-
+        repo = os.environ.get("RELIQUARY_OCI_REPO", self._CURATED_REPO)
+        revision = os.environ.get("RELIQUARY_OCI_REVISION", self._CURATED_REVISION)
         cache = OpenCodeInstructEnvironment._dataset_cache
         if isinstance(cache, dict):
             key = (repo, revision)
             if key not in cache:
-                cache[key] = _load_subset_dataset(repo, revision)
+                cache[key] = _load_dataset(repo, revision)
             self._dataset = cache[key]
         else:
             # Tests may monkeypatch _dataset_cache directly with a fake dataset.
             self._dataset = cache
-        if not self._prompt_only and not _has_structured_cases_column(self._dataset):
-            raise RuntimeError(
-                "OpenCodeInstruct validator dataset must include structured_cases. "
-                "Use RELIQUARY_OCI_PROMPT_ONLY=1 only for miner prompt-only mirrors."
-            )
 
         from reliquary.environment.grader_client import GraderClient
         self._grader = GraderClient()

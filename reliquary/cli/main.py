@@ -36,7 +36,10 @@ def _env_flag(name: str, default: str = "0") -> bool:
 
 
 def _miner_requires_grader(env_names: list[str]) -> bool:
-    return "opencodeinstruct" in env_names and not _env_flag("RELIQUARY_OCI_PROMPT_ONLY", "0")
+    # Miners never grade: opencode reward is validator-authoritative, so the
+    # reference miner only generates rollouts. The gVisor grader runs on the
+    # validator side. (Operators self-testing best-of-n run their own grader.)
+    return False
 
 
 def _grader_bundle_python() -> Path:
@@ -191,11 +194,12 @@ def mine(
         network, netuid, env_names,
     )
 
-    # Auto-launch only when the code environment is active.
+    # Miners never grade (opencode reward is validator-authoritative), so this
+    # stays False; the gVisor grader runs on the validator only.
     if _miner_requires_grader(env_names):
         _ensure_grader_running()
     elif "opencodeinstruct" in env_names:
-        logger.info("OpenCode prompt-only miner mode enabled; skipping local grader launch.")
+        logger.info("OpenCode miner: reward is validator-authoritative; skipping local grader launch.")
 
     async def _run():
         import bittensor as bt
