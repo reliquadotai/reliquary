@@ -193,6 +193,49 @@ def test_reward_numeric_close_but_unequal_still_wrong():
     assert _compute_omi_reward({"ground_truth": "1/2"}, r"\boxed{1/3}") == 0.0
 
 
+def test_reward_latex_fraction_vs_decimal_equivalence():
+    """Real R2 free-negative: \\frac{5721}{5} == 1144.2 (model was value-correct)."""
+    from reliquary.environment.openmathinstruct import _compute_omi_reward
+    assert _compute_omi_reward({"ground_truth": "1144.2"}, r"\boxed{\frac{5721}{5}}") == 1.0
+    assert _compute_omi_reward({"ground_truth": r"\frac{43}{5}"}, r"\boxed{8.6}") == 1.0
+
+
+def test_reward_latex_radical_surface_forms_equivalent():
+    from reliquary.environment.openmathinstruct import _compute_omi_reward
+    assert _compute_omi_reward(
+        {"ground_truth": r"\frac{1}{\sqrt{2}}"}, r"\boxed{\frac{\sqrt{2}}{2}}") == 1.0
+    assert _compute_omi_reward({"ground_truth": r"\sqrt{20}"}, r"\boxed{2\sqrt{5}}") == 1.0
+
+
+def test_reward_latex_value_equality_rejects_different():
+    """Guard: value-equality must not equate genuinely different expressions."""
+    from reliquary.environment.openmathinstruct import _compute_omi_reward
+    assert _compute_omi_reward({"ground_truth": r"\frac{1}{3}"}, r"\boxed{\frac{1}{4}}") == 0.0
+    assert _compute_omi_reward({"ground_truth": r"2\sqrt{5}"}, r"\boxed{\sqrt{30}}") == 0.0
+
+
+def test_reward_latex_explosive_payload_rejected_fast():
+    """Adversarial boxed payloads (power tower, huge exponent, factorial) must be
+    rejected by the structural whitelist BEFORE evalf — score 0.0 and no hang.
+    Guards against a length-cap-only regression that would let evalf run.
+    """
+    import time
+    from reliquary.environment.openmathinstruct import _compute_omi_reward
+    t0 = time.time()
+    assert _compute_omi_reward({"ground_truth": "1"}, r"\boxed{9^9^9^9}") == 0.0
+    assert _compute_omi_reward({"ground_truth": "1"}, r"\boxed{9^999999999}") == 0.0
+    assert _compute_omi_reward({"ground_truth": "1"}, r"\boxed{99999999!}") == 0.0
+    assert time.time() - t0 < 2.0  # whitelist short-circuits; never reaches evalf
+
+
+def test_reward_latex_value_equality_still_holds_after_guard():
+    """The whitelist must NOT reject legitimate fraction/radical answers."""
+    from reliquary.environment.openmathinstruct import _compute_omi_reward
+    assert _compute_omi_reward({"ground_truth": "1144.2"}, r"\boxed{\frac{5721}{5}}") == 1.0
+    assert _compute_omi_reward(
+        {"ground_truth": r"\frac{1}{\sqrt{2}}"}, r"\boxed{\frac{\sqrt{2}}{2}}") == 1.0
+
+
 def test_reward_handles_malformed_completion():
     """Reward function must never raise on garbage input."""
     from reliquary.environment.openmathinstruct import _compute_omi_reward
