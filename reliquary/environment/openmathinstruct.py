@@ -115,17 +115,118 @@ def _as_number(s: str) -> Optional[Fraction]:
         return None
 
 
+def _latex_to_pyexpr(s: str) -> Optional[str]:
+    """Rewrite the common LaTeX math macros (\\frac, \\sqrt, \\cdot, ...) into a
+    plain Python/sympy expression. Returns None if any unknown ``\\macro``
+    survives, so the caller falls back to string comparison rather than guess.
+    """
+    prev = None
+    while prev != s:
+        prev = s
+        s = re.sub(r"\\sqrt\[([^\[\]{}]+)\]\{([^{}]+)\}", r"((\2)**(1.0/(\1)))", s)
+        s = re.sub(r"\\sqrt\{([^{}]+)\}", r"sqrt((\1))", s)
+        s = re.sub(r"\\(?:d|t)?frac\{([^{}]+)\}\{([^{}]+)\}", r"((\1)/(\2))", s)
+    s = (s.replace(r"\cdot", "*").replace(r"\times", "*")
+          .replace(r"\div", "/").replace(r"\pi", "pi"))
+    s = s.replace("^", "**").replace("{", "(").replace("}", ")")
+    return None if "\\" in s else s
+
+
+def _expr_is_safe(expr, _depth: int = 0) -> bool:
+    """Structural whitelist guarding ``evalf`` against adversarial payloads.
+
+    Only numbers, named constants (pi, E), ``+ - * /`` and powers with a *small
+    numeric* exponent (which also covers roots and ``1/x``) are allowed. Power
+    towers (nested/symbolic exponents), huge exponents, factorials, other
+    functions and free symbols are rejected — anything whose ``evalf`` could
+    blow up on a miner-controlled boxed answer.
+    """
+    import sympy
+
+    if _depth > 40:
+        return False
+    if expr.is_Number or isinstance(expr, sympy.NumberSymbol):
+        return True
+    if isinstance(expr, (sympy.Add, sympy.Mul)):
+        return all(_expr_is_safe(a, _depth + 1) for a in expr.args)
+    if isinstance(expr, sympy.Pow):
+        base, exp = expr.as_base_exp()
+        if not exp.is_Number:
+            return False  # nested / symbolic exponent (e.g. a power tower)
+        try:
+            if abs(float(exp)) > 10:
+                return False  # huge exponent
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return _expr_is_safe(base, _depth + 1)
+    return False  # factorial, other functions, free symbols, ...
+
+
+def _expr_str_is_safe(s: str) -> bool:
+    """Token whitelist applied BEFORE ``parse_expr``.
+
+    ``parse_expr`` eagerly evaluates some constructs during parsing (notably
+    ``n!`` -> ``factorial(n)``), so a huge factorial would hang before the
+    structural guard ever runs. Allow only digits, ``+ - * / ( ) .``, spaces and
+    the tokens ``sqrt`` / ``pi``; anything else (``!``, function names like
+    ``exp``/``gamma``/``factorial``, stray symbols) is rejected up front.
+    """
+    # Strip the allowed alpha tokens even when digit-adjacent ("2sqrt(5)") but
+    # not when part of a longer identifier ("sqrtx"); whatever survives must be
+    # numbers / operators only.
+    cleaned = re.sub(r"(?<![A-Za-z])(?:sqrt|pi)(?![A-Za-z])", "", s)
+    return re.fullmatch(r"[0-9.+\-*/() \t]*", cleaned) is not None
+
+
+def _latex_value_equal(candidate: str, gt: str) -> bool:
+    """Numeric value-equality for LaTeX answers, antlr-free and bounded.
+
+    The candidate is a miner-controlled boxed payload, so two whitelists bound
+    compute before any heavy evaluation: ``_expr_str_is_safe`` rejects tokens
+    ``parse_expr`` would eager-evaluate (factorials, function names), and
+    ``_expr_is_safe`` rejects power towers / huge exponents before ``evalf``.
+    The length cap alone does not bound compute (``9^9^9^9`` is 7 chars but
+    astronomically large). Returns False on any parse/eval error or disallowed
+    structure.
+    """
+    if not candidate or not gt or len(candidate) > 100 or len(gt) > 100:
+        return False
+    ec, eg = _latex_to_pyexpr(candidate), _latex_to_pyexpr(gt)
+    if ec is None or eg is None:
+        return False
+    if not (_expr_str_is_safe(ec) and _expr_str_is_safe(eg)):
+        return False  # factorial / function name parse_expr would eager-evaluate
+    try:
+        from sympy.parsing.sympy_parser import (
+            implicit_multiplication_application,
+            parse_expr,
+            standard_transformations,
+        )
+        tr = standard_transformations + (implicit_multiplication_application,)
+        xc = parse_expr(ec, transformations=tr, evaluate=False)
+        xg = parse_expr(eg, transformations=tr, evaluate=False)
+        if not (_expr_is_safe(xc) and _expr_is_safe(xg)):
+            return False
+        vc = complex(xc.evalf())
+        vg = complex(xg.evalf())
+    except Exception:
+        return False
+    return abs(vc - vg) <= 1e-9 * (1 + abs(vg))
+
+
 def _answers_equal(candidate: str, gt: str) -> bool:
     """Compare by value when both sides are numbers, else by normalized string.
 
     The prompt asks for a value, so any surface form of that value is correct
-    (trailing zeros, fraction vs decimal). Non-numeric answers (LaTeX) keep the
-    existing exact normalized-string match.
+    (trailing zeros, fraction vs decimal, \\frac{5721}{5} == 1144.2). Falls back
+    to LaTeX value-equality, then exact normalized-string match.
     """
     c, g = _as_number(candidate), _as_number(gt)
     if c is not None and g is not None:
         return c == g
-    return candidate == gt
+    if candidate == gt:
+        return True
+    return _latex_value_equal(candidate, gt)
 
 
 def _compute_omi_reward(problem: dict, completion: str) -> float:
@@ -180,7 +281,7 @@ class OpenMathInstructEnvironment:
     name: str = "openmathinstruct"
 
     _dataset_cache: ClassVar[Optional[object]] = None
-    _DEFAULT_SHARDS: ClassVar[int] = 2
+    _DEFAULT_SHARDS: ClassVar[int] = 4
 
     def __init__(self) -> None:
         if OpenMathInstructEnvironment._dataset_cache is None:
