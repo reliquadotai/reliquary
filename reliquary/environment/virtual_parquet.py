@@ -50,9 +50,10 @@ class VirtualParquetDataset:
         self._pf: "OrderedDict[int, Any]" = OrderedDict()
         # get_row is called from the validator's submit-worker thread AND (via
         # asyncio.to_thread) the submit preflight, on the same shared instance,
-        # so access must be thread-safe. _lock guards the cache/pf/manifest
-        # dicts (held only briefly); _io_lock serializes the actual row-group
-        # reads, which share a per-file handle that is not concurrency-safe.
+        # so access must be thread-safe. _lock guards the LRU cache dict (held
+        # only briefly, never across I/O); _io_lock serializes the manifest
+        # build and the row-group reads + the _pf handle cache, which share a
+        # per-file handle that is not concurrency-safe.
         self._lock = threading.Lock()
         self._io_lock = threading.Lock()
 

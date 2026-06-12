@@ -324,8 +324,8 @@ TRAINING_RUN_ID = (
 # fall arbitrarily far behind current_window — beyond what the gap replay
 # (COOLDOWN_REBUILD_LOOKBACK) can recover, re-opening the replay exploit. A small
 # fixed cadence keeps snapshot_window within this many windows of current.
-COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS = int(
-    _os.environ.get("COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS", "10")
+COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS = max(
+    1, int(_os.environ.get("COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS", "10"))
 )
 
 # Per-window prompt range (anti pre-curation). Each window, miner and

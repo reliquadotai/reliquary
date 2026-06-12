@@ -51,10 +51,11 @@ def test_hash_dedup_retention_decoupled_from_cooldown():
 
 
 def test_cooldown_rebuild_lookback_bounded():
-    """The R2 rebuild cap must stay small enough for a startup scan to
-    complete in seconds even when BATCH_PROMPT_COOLDOWN_WINDOWS is set to
-    an astronomical value for one-shot semantics."""
-    assert C.COOLDOWN_REBUILD_LOOKBACK == 300
+    """The gap-replay / no-snapshot fallback scan must stay small enough for a
+    fast startup, comfortably exceed the snapshot cadence (so a normal gap is
+    always covered), and stay below the cooldown horizon."""
+    assert C.COOLDOWN_REBUILD_LOOKBACK == 2000
+    assert C.COOLDOWN_REBUILD_LOOKBACK > C.COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS
     assert C.COOLDOWN_REBUILD_LOOKBACK < C.BATCH_PROMPT_COOLDOWN_WINDOWS
 
 
