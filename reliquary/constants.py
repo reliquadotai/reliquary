@@ -318,6 +318,16 @@ TRAINING_RUN_ID = (
     _os.environ.get("RELIQUARY_TRAINING_RUN_ID", "default").strip() or "default"
 )
 
+# How often (in windows) to persist the cooldown snapshot, INDEPENDENT of the
+# checkpoint-publish cadence. Publishing can stall (training starvation, HF
+# publish failures) while windows keep advancing, which would let the snapshot
+# fall arbitrarily far behind current_window — beyond what the gap replay
+# (COOLDOWN_REBUILD_LOOKBACK) can recover, re-opening the replay exploit. A small
+# fixed cadence keeps snapshot_window within this many windows of current.
+COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS = int(
+    _os.environ.get("COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS", "10")
+)
+
 # Per-window prompt range (anti pre-curation). Each window, miner and
 # validator derive the same contiguous slice of the prompt index space from
 # the shared per-window randomness; once enforcement is armed only

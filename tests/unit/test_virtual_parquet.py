@@ -88,3 +88,29 @@ def test_deterministic_across_instances(tmp_path):
     ds1, _ = _dataset(tmp_path)
     ds2, _ = _dataset(tmp_path)
     assert [ds1.get_row(i)["v"] for i in range(8)] == [ds2.get_row(i)["v"] for i in range(8)]
+
+
+def test_thread_safe_concurrent_get_row(tmp_path):
+    """get_row is hit from the validator's submit preflight (event loop, via
+    to_thread) AND its worker thread on the same shared instance. Concurrent
+    access with heavy LRU eviction must never crash or return a wrong row."""
+    import threading
+
+    ds, _ = _dataset(tmp_path, cache_row_groups=1)  # tiny cache -> max eviction churn
+    errors: list = []
+
+    def hammer():
+        for i in range(300):
+            idx = (i * 3) % 8
+            try:
+                if ds.get_row(idx)["v"] != idx:
+                    errors.append(("wrong-row", idx))
+            except Exception as e:  # OrderedDict mutated-during-iteration, etc.
+                errors.append((type(e).__name__, str(e)[:40]))
+
+    threads = [threading.Thread(target=hammer) for _ in range(12)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []

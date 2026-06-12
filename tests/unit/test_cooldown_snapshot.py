@@ -122,3 +122,20 @@ async def test_snapshot_cooldown_writes_run_keyed_state():
     assert captured["data"]["run_id"] == "default"
     assert captured["data"]["snapshot_window"] == 77
     assert captured["data"]["envs"]["fake"] == {7: 70}
+
+
+@pytest.mark.asyncio
+async def test_corrupt_snapshot_does_not_crash_and_falls_back():
+    """B2: a malformed snapshot (bad envs payload) must not crash startup — it
+    is discarded and we fall back (empty for a fresh run)."""
+    svc = _service(40)
+    corrupt = {"run_id": "run5", "snapshot_window": "not-a-number", "envs": {"fake": [1, 2, 3]}}
+    with patch("reliquary.validator.service.TRAINING_RUN_ID", "run5"), patch(
+        "reliquary.infrastructure.storage.download_json",
+        new=AsyncMock(return_value=corrupt),
+    ), patch(
+        "reliquary.infrastructure.storage.list_recent_datasets",
+        new=AsyncMock(return_value=[]),
+    ):
+        await svc._rebuild_cooldown_from_history()  # must not raise
+    assert len(svc._cooldown_per_env["fake"]) == 0  # partial restore discarded

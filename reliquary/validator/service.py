@@ -10,6 +10,7 @@ from typing import Any
 from reliquary.constants import (
     BATCH_PROMPT_COOLDOWN_WINDOWS,
     COOLDOWN_REBUILD_LOOKBACK,
+    COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS,
     TRAINING_RUN_ID,
     B_BATCH,
     BOOTSTRAP_WINDOWS,
@@ -338,6 +339,7 @@ class ValidationService:
         self._checkpoint_n: int = 0
         self._publish_every = CHECKPOINT_PUBLISH_INTERVAL_WINDOWS
         self._trained_windows_since_publish = 0
+        self._windows_since_cooldown_snapshot = 0
         self._checkpoint_store = CheckpointStore(
             validator_hotkey=wallet.hotkey.ss58_address,
             wallet=wallet,
@@ -1041,9 +1043,6 @@ class ValidationService:
                         "Published checkpoint %d to %s@%s and refreshed verify_model",
                         entry.checkpoint_n, entry.repo_id, entry.revision[:12],
                     )
-                    # Snapshot the cooldown at the publish cadence so a restart
-                    # restores the full state (run-keyed) instead of replaying.
-                    await self._snapshot_cooldown()
                 except Exception:
                     logger.exception("HF publish failed; staying on previous checkpoint")
             else:
@@ -1189,7 +1188,17 @@ class ValidationService:
             batched_keys = {(s.hotkey, s.prompt_idx) for s in env_batch}
 
             for s in env_batch:
-                problem = env_obj.get_problem(s.prompt_idx)
+                try:
+                    problem = env_obj.get_problem(s.prompt_idx)
+                except Exception:
+                    # A lazy-dataset fetch failure must not abort the whole
+                    # window's archive — keep the entry (prompt_idx/rewards are
+                    # what the cooldown rebuild needs), just without prompt text.
+                    logger.warning(
+                        "archive: get_problem(%d) failed; archiving without prompt text",
+                        s.prompt_idx,
+                    )
+                    problem = {}
                 batch_entries.append({
                     "hotkey": s.hotkey,
                     "prompt_idx": s.prompt_idx,
@@ -1398,6 +1407,18 @@ class ValidationService:
 
                     await self._train_and_publish()
 
+                    # Persist the cooldown on a fixed window cadence, independent
+                    # of the publish cadence (which can stall): keeps the snapshot
+                    # within COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS of current_window
+                    # so the gap replay always covers it.
+                    self._windows_since_cooldown_snapshot += 1
+                    if (
+                        self._windows_since_cooldown_snapshot
+                        >= COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS
+                    ):
+                        await self._snapshot_cooldown()
+                        self._windows_since_cooldown_snapshot = 0
+
                     # set_weights is owned by a concurrent WeightOnlyValidator
                     # task running off the same R2 archives; no need to do it
                     # here. The trainer is purely about training + uploads.
@@ -1595,20 +1616,30 @@ class ValidationService:
             logger.exception("Failed to read cooldown snapshot")
 
         if snapshot and snapshot.get("run_id") == TRAINING_RUN_ID:
-            envs = snapshot.get("envs", {}) or {}
-            for env_name, cooldown_map in self._cooldown_per_env.items():
-                cooldown_map.import_state(envs.get(env_name, {}))
-            snapshot_window = int(snapshot.get("snapshot_window", current_window))
-            gap = max(0, current_window - snapshot_window)
-            if gap > 0:
-                await self._replay_cooldown_gap(current_window, gap)
-            logger.info(
-                "Restored cooldown from snapshot run=%s snapshot_window=%d "
-                "gap=%d (current=%d, sizes=%s)",
-                TRAINING_RUN_ID, snapshot_window, gap, current_window,
-                {n: len(m) for n, m in self._cooldown_per_env.items()},
-            )
-            return
+            try:
+                envs = snapshot.get("envs", {}) or {}
+                for env_name, cooldown_map in self._cooldown_per_env.items():
+                    cooldown_map.import_state(envs.get(env_name, {}))
+                snapshot_window = int(snapshot.get("snapshot_window", current_window))
+            except Exception:
+                # Corrupt / partially-written / tampered snapshot — must not
+                # crash startup. Discard any partial restore and fall through.
+                logger.exception(
+                    "Corrupt cooldown snapshot for run=%s; discarding it", TRAINING_RUN_ID,
+                )
+                for cooldown_map in self._cooldown_per_env.values():
+                    cooldown_map.import_state({})
+            else:
+                gap = max(0, current_window - snapshot_window)
+                if gap > 0:
+                    await self._replay_cooldown_gap(current_window, gap)
+                logger.info(
+                    "Restored cooldown from snapshot run=%s snapshot_window=%d "
+                    "gap=%d (current=%d, sizes=%s)",
+                    TRAINING_RUN_ID, snapshot_window, gap, current_window,
+                    {n: len(m) for n, m in self._cooldown_per_env.items()},
+                )
+                return
 
         if TRAINING_RUN_ID != "default":
             logger.info(
@@ -1674,16 +1705,24 @@ class ValidationService:
     async def _snapshot_cooldown(self) -> None:
         """Persist the per-env cooldown maps to R2, keyed by the training run id,
         so a restart restores the full cooldown without replaying history. Best
-        effort — a snapshot failure must never break the publish path."""
+        effort — a snapshot failure must never break the window loop."""
         try:
-            snapshot = {
-                "run_id": TRAINING_RUN_ID,
-                "snapshot_window": self._window_n,
-                "envs": {
-                    name: cd.export_state()
-                    for name, cd in self._cooldown_per_env.items()
-                },
-            }
+            window = self._window_n
+
+            def _build() -> dict:
+                # Copy can be multi-MB (cooldown never expires) — build it off
+                # the event loop. Safe: the window loop is sequential here, no
+                # concurrent record_batched between seal and the next window.
+                return {
+                    "run_id": TRAINING_RUN_ID,
+                    "snapshot_window": window,
+                    "envs": {
+                        name: cd.export_state()
+                        for name, cd in self._cooldown_per_env.items()
+                    },
+                }
+
+            snapshot = await asyncio.to_thread(_build)
             if await storage.upload_json(
                 _cooldown_snapshot_key(TRAINING_RUN_ID), snapshot
             ):

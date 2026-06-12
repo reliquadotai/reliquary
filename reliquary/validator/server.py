@@ -1011,8 +1011,11 @@ class ValidatorServer:
                 type(batcher), "try_reserve_proof_admission", None
             )
             if reserve_proof is not None:
-                preflight_reason, preflight_stage = _proof_free_submission_reject(
-                    request, batcher
+                # Runs in a thread: the canonical-prompt check calls
+                # env.get_problem, which for the lazy parquet dataset may do a
+                # blocking row-group fetch — must not stall the event loop.
+                preflight_reason, preflight_stage = await asyncio.to_thread(
+                    _proof_free_submission_reject, request, batcher
                 )
                 if preflight_reason is not None:
                     return _cheap_reject(

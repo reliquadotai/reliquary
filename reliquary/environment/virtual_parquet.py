@@ -13,6 +13,7 @@ filesystem and no network.
 from __future__ import annotations
 
 import bisect
+import threading
 from collections import OrderedDict
 from typing import Any, Optional
 
@@ -47,6 +48,13 @@ class VirtualParquetDataset:
         # Cache open ParquetFile handles so adjacent row-group reads from the
         # same shard don't re-fetch the footer each time (bounded LRU).
         self._pf: "OrderedDict[int, Any]" = OrderedDict()
+        # get_row is called from the validator's submit-worker thread AND (via
+        # asyncio.to_thread) the submit preflight, on the same shared instance,
+        # so access must be thread-safe. _lock guards the cache/pf/manifest
+        # dicts (held only briefly); _io_lock serializes the actual row-group
+        # reads, which share a per-file handle that is not concurrency-safe.
+        self._lock = threading.Lock()
+        self._io_lock = threading.Lock()
 
     # -- manifest (footers only; no row data) --------------------------------
     def _filesystem(self):
@@ -60,26 +68,28 @@ class VirtualParquetDataset:
             return
         import pyarrow.parquet as pq
 
-        fs = self._filesystem()
-        base = f"datasets/{self._repo}@{self._revision}/{self._data_dir}"
-        files = sorted(
-            p for p in fs.ls(base, detail=False) if str(p).endswith(".parquet")
-        )
-        if not files:
-            raise RuntimeError(f"no parquet files under {base}")
-        rg_start: list[int] = []
-        rg_loc: list[tuple[int, int]] = []
-        total = 0
-        for fi, path in enumerate(files):
-            with fs.open(path) as fh:
-                md = pq.ParquetFile(fh).metadata
-                for rg in range(md.num_row_groups):
-                    rg_start.append(total)
-                    rg_loc.append((fi, rg))
-                    total += md.row_group(rg).num_rows
-        self._files, self._rg_start, self._rg_loc, self._total = (
-            files, rg_start, rg_loc, total,
-        )
+        with self._io_lock:
+            if self._total is not None:  # built by another thread while we waited
+                return
+            fs = self._filesystem()
+            base = f"datasets/{self._repo}@{self._revision}/{self._data_dir}"
+            files = sorted(
+                p for p in fs.ls(base, detail=False) if str(p).endswith(".parquet")
+            )
+            if not files:
+                raise RuntimeError(f"no parquet files under {base}")
+            rg_start: list[int] = []
+            rg_loc: list[tuple[int, int]] = []
+            total = 0
+            for fi, path in enumerate(files):
+                with fs.open(path) as fh:
+                    md = pq.ParquetFile(fh).metadata
+                    for rg in range(md.num_row_groups):
+                        rg_start.append(total)
+                        rg_loc.append((fi, rg))
+                        total += md.row_group(rg).num_rows
+            self._files, self._rg_start, self._rg_loc = files, rg_start, rg_loc
+            self._total = total  # assigned last: the double-check sentinel
 
     # -- access --------------------------------------------------------------
     def __len__(self) -> int:
@@ -91,21 +101,36 @@ class VirtualParquetDataset:
         return self.get_row(idx)
 
     def get_row(self, idx: int) -> dict:
-        """Return row ``idx % len`` as a dict, fetching its row-group lazily."""
+        """Return row ``idx % len`` as a dict, fetching its row-group lazily.
+
+        Thread-safe: cache hits take only the brief ``_lock``; a miss serializes
+        the I/O on ``_io_lock`` (with a double-check) so concurrent callers never
+        read the shared parquet handle at once or corrupt the LRU.
+        """
         self._ensure_manifest()
         assert self._total and self._rg_start is not None and self._rg_loc is not None
         idx %= self._total
         gi = bisect.bisect_right(self._rg_start, idx) - 1
         key = self._rg_loc[gi]
-        rows = self._cache.get(key)
-        if rows is None:
-            rows = self._fetch_row_group(*key)
-            self._cache[key] = rows
-            if len(self._cache) > self._cache_cap:
-                self._cache.popitem(last=False)  # evict least-recently-used
-        else:
-            self._cache.move_to_end(key)
-        return rows[idx - self._rg_start[gi]]
+        rg_start = self._rg_start[gi]
+        with self._lock:
+            rows = self._cache.get(key)
+            if rows is not None:
+                self._cache.move_to_end(key)
+                return rows[idx - rg_start]
+        # Miss: fetch under the I/O lock — the per-file handle is shared and not
+        # concurrency-safe. Re-check the cache in case a peer fetched it first.
+        with self._io_lock:
+            with self._lock:
+                rows = self._cache.get(key)
+            if rows is None:
+                rows = self._fetch_row_group(*key)
+                with self._lock:
+                    self._cache[key] = rows
+                    self._cache.move_to_end(key)
+                    while len(self._cache) > self._cache_cap:
+                        self._cache.popitem(last=False)
+        return rows[idx - rg_start]
 
     def _fetch_row_group(self, file_idx: int, rg_idx: int) -> list[dict]:
         pf = self._parquet_file(file_idx)
