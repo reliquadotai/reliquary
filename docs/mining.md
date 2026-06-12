@@ -40,11 +40,11 @@ Every miner runs a continuous poll-submit loop:
    - If `state != "open"`, the validator is in `TRAINING` or `PUBLISHING`. Sleep briefly (1 s) and re-poll. Do not submit while the window is not open.
    - If `checkpoint_n` advanced since the last poll, download the new HF revision and reload weights.
 
-2. **Picks a prompt.** Selects a `prompt_idx` from one active environment. OpenMath uses **OpenMathInstruct-2** ([`nvidia/OpenMathInstruct-2`](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2), ~14 million problems, math-reasoning style) and local reward computation. OpenCode uses the public prompt-only mirror and validator-authoritative hidden tests. In both cases, skip prompts in `cooldown_prompts`. The reference engine uses uniform-random sampling with rejection against the cooldown set. (v2.3 switched OpenMath from Hendrycks MATH because the 12 500-prompt env exhausted under one-shot cooldown — see "One-shot prompts" below.)
+2. **Picks a prompt.** Selects a `prompt_idx` from one active environment. OpenMath uses **OpenMathInstruct-2** ([`nvidia/OpenMathInstruct-2`](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2), ~14 million problems, math-reasoning style) and local reward computation. OpenCode uses the public curated dataset (`R0mAI/opencodeinstruct-curated`) with validator-authoritative grading. In both cases, skip prompts in `cooldown_prompts`. The reference engine uses uniform-random sampling with rejection against the cooldown set. (v2.3 switched OpenMath from Hendrycks MATH because the 12 500-prompt env exhausted under one-shot cooldown — see "One-shot prompts" below.)
 
 3. **Generates M=8 rollouts.** Runs exactly 8 completions at the protocol-fixed `T_PROTO = 0.9`, `top_p = 1.0`, `top_k = 0`. Generate cleanly, terminate at the first EOS, and do not pad or force max length.
 
-4. **Provides rollout rewards.** OpenMath miners compute `env.compute_reward(problem, completion_text)` locally and send that value as `rollout.reward`; the validator recomputes it and rejects mismatches. OpenCode miners must run in prompt-only mode and should send placeholder rewards if the client shape requires them; the validator owns hidden cases, recomputes the real code reward, and overwrites local claims before the zone filter. This keeps math frontier priors available while preventing code from becoming a public hidden-test oracle game.
+4. **Provides rollout rewards.** OpenMath miners compute `env.compute_reward(problem, completion_text)` locally and send that value as `rollout.reward`; the validator recomputes it and rejects mismatches. OpenCode is validator-authoritative: miners send placeholder rewards if the client shape requires them, and the validator recomputes the real code reward and overwrites local claims before the zone filter. Miners never run the grader.
 
 5. **Builds GRAIL sketches.** Runs the bit-identical HuggingFace forward pass on the proof GPU to construct sketch commitments that bind the completions to the model. The r_vec seed **must** come from `state.randomness` exactly — local re-derivation will diverge from the validator's seed and the binding check rejects with `WRONG_RANDOMNESS`.
 
@@ -360,35 +360,35 @@ The live model family is `Qwen/Qwen3.5-4B`. This is a hard tokenizer/model reset
 - Checkpoint downloads are sharded safetensors. Custom miners must download `model*.safetensors`, `model.safetensors.index.json`, `config.json`, tokenizer files, `vocab.json`, `merges.txt`, and `chat_template.jinja`.
 - Expect longer completions than the old non-thinking checkpoint and recalibrate local EOS/truncation filters from validator verdicts.
 
-### OpenCode prompt-only mode
+### OpenCode mode
 
 The live mixed rollout enables `opencodeinstruct` next to `openmathinstruct`.
-OpenCode rewards are validator-authoritative: miners see prompts only, not the
-hidden structured cases. A miner that includes OpenCode must set:
+OpenCode rewards are **validator-authoritative**: the validator owns the grader
+and recomputes the code reward, so the miner only generates rollouts — it never
+runs the grader. A miner that includes OpenCode just sets:
 
 ```bash
 export RELIQUARY_ENVIRONMENTS=openmathinstruct,opencodeinstruct
-export RELIQUARY_OCI_PROMPT_ONLY=1
-export RELIQUARY_OCI_SUBSET_REPO=R0mAI/opencodeinstruct-prompts
-export RELIQUARY_OCI_SUBSET_REVISION=f50bef12e244f5d51a7ae3f55ee8d31fdf33365f
 ```
 
-With `RELIQUARY_OCI_PROMPT_ONLY=1`, the miner does not launch or require a
-local OpenCode grader. It should generate clean Python solutions, preserve the
-same GRAIL/logprob/termination rules as OpenMath, and let the validator score
-hidden cases. If your custom miner is not code-ready yet, keep:
+Both miner and validator load the same public curated dataset
+(`R0mAI/opencodeinstruct-curated`, pinned by default) **lazily** — only the
+row-groups a window touches are fetched, so there is no bulk dataset download on
+top of the model. The structured test cases are visible (the reward grades
+genuine model output, not secrecy); the miner does **not** launch or require a
+local OpenCode grader. Generate clean Python solutions and keep the same
+GRAIL/logprob/termination rules as OpenMath. If your custom miner is not
+code-ready yet, keep:
 
 ```bash
 export RELIQUARY_ENVIRONMENTS=openmathinstruct
 ```
 
-Do not use the private structured OpenCode dataset on miners.
-
 Additional flags:
 
 | Flag | Default | When to use it |
 |---|---|---|
-| `--environments` | `openmathinstruct` | Comma-separated active miner environments. Use `openmathinstruct,opencodeinstruct` only after configuring OpenCode prompt-only mode. |
+| `--environments` | `openmathinstruct` | Comma-separated active miner environments. Use `openmathinstruct,opencodeinstruct` for mixed mining. |
 | `--use-drand` / `--no-use-drand` | `--use-drand` | Turn off only for offline testing. Mainnet always uses drand. |
 | `--validator-url` | *(auto-discovered)* | **Required during the subnet-launch phase** (see note above) and for local testing, e.g. `http://127.0.0.1:8888`. Once the owner validator (`5CXzFHfeiJ4Xkiirq4ej1MrRVCd789wEJXhpf2ZKRW6MNFJF`) holds `validator_permit`, leave empty and the miner will discover it from the metagraph. |
 
@@ -397,9 +397,8 @@ Environment variables:
 | Variable | Default | Purpose |
 |---|---|---|
 | `RELIQUARY_ENVIRONMENTS` | `openmathinstruct` | Comma-separated environment list. Set to `openmathinstruct,opencodeinstruct` for mixed mining. |
-| `RELIQUARY_OCI_PROMPT_ONLY` | unset | Miner-only OpenCode mode; set to `1` so the miner loads the public prompt mirror and skips local grading. |
-| `RELIQUARY_OCI_SUBSET_REPO` | env default | OpenCode dataset repo. Miners should use `R0mAI/opencodeinstruct-prompts`. |
-| `RELIQUARY_OCI_SUBSET_REVISION` | repo default | Pin the OpenCode prompt-only mirror revision when announced. |
+| `RELIQUARY_OCI_REPO` | `R0mAI/opencodeinstruct-curated` | OpenCode dataset repo (public, curated). Override only to pin a fork. |
+| `RELIQUARY_OCI_REVISION` | pinned commit | OpenCode dataset revision. Override only to pin a different snapshot. |
 | `DRAND_CHAIN` | `quicknet` | Override only if drand announces a chain rotation. |
 | `GRAIL_ATTN_IMPL` | `flash_attention_2` | Override to `eager` or `sdpa` in test envs without flash-attn. Do not override on mainnet. |
 
@@ -409,7 +408,7 @@ On a healthy startup:
 
 ```
 ... | Starting Reliquary miner (network=finney, netuid=81, envs=['openmathinstruct', 'opencodeinstruct'])
-... | OpenCode prompt-only miner mode enabled; skipping local grader launch.
+... | OpenCode miner: reward is validator-authoritative; skipping local grader launch.
 ... | Validator at http://x.x.x.x:8080 is on checkpoint 7 (your-org/reliquary-sn@abc123def...)
 ... | Downloading to seed the miner model.
 ... | Loading models from /home/.../.cache/huggingface/...

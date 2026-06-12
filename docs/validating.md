@@ -107,23 +107,26 @@ RELIQUARY_EXTERNAL_PORT=8080
 ```
 
 By default the Docker/CLI trainer starts with `openmathinstruct` only. The live
-trainer may explicitly opt in to mixed training once the private grader and
-dataset are configured:
+trainer may opt in to mixed training once the grader is configured:
 
 ```bash
 RELIQUARY_ENVIRONMENTS=openmathinstruct,opencodeinstruct
-RELIQUARY_OCI_SUBSET_REPO=<private-structured-dataset>
-RELIQUARY_OCI_SUBSET_REVISION=<structured-dataset-commit-sha>
 ```
 
-The public miner prompt mirror is pinned separately by the miner-side
-OpenCode environment. Do not enable `opencodeinstruct` on the trainer until
-the Docker image contains the grader rootfs, `runsc` starts successfully, and
-the loopback grader canaries pass.
+Both validator and miner load the same public curated dataset
+(`R0mAI/opencodeinstruct-curated`, pinned by default) lazily — the
+`structured_cases` ship with it, and the validator runs the grader and
+recomputes the code reward authoritatively. Do not enable `opencodeinstruct` on
+the trainer until the Docker image contains the grader rootfs, `runsc` starts
+successfully, and the loopback grader canaries pass.
 
-Miners must use the public prompt-only OpenCode mirror. Validators must use the
-private structured dataset that contains hidden `structured_cases`; do not set
-`RELIQUARY_OCI_PROMPT_ONLY=1` on a validator.
+### Cooldown on training restart
+
+The prompt cooldown is restored at startup from a run-keyed snapshot on R2, so
+the full cooldown survives a restart. Key it with `RELIQUARY_TRAINING_RUN_ID`
+(default `default`): keep it stable while a training run continues, and **bump
+it to a fresh value when you start a new training from scratch** so the cooldown
+resets to zero — a fresh model must be allowed to re-see every prompt.
 
 
 ## Sanity checks (both modes)
