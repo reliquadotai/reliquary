@@ -177,10 +177,12 @@ PROOF_ADMISSION_STALL_POLL_SECONDS = 0.5
 # stale/misconfigured miners can leave a window with some valid submissions but
 # fewer than B distinct trainable prompts. Keep the normal 8-distinct seal as
 # the happy path, but do not let sparse valid traffic hold checkpoint progress
-# for the long safety-net timeout.
-SPARSE_VALID_IDLE_SEAL_SECONDS = 180.0
+# for the long safety-net timeout. Idle/age caps are sized to give slower
+# fresh-model submissions (longer generations, bursty arrivals) time to reach
+# 8 distinct before a sparse window is force-sealed.
+SPARSE_VALID_IDLE_SEAL_SECONDS = 300.0
 SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS = 4
-SPARSE_VALID_MAX_WINDOW_SECONDS = 600.0
+SPARSE_VALID_MAX_WINDOW_SECONDS = 900.0
 
 # UID that receives unused slot emission budget (the burn address).
 UID_BURN = 0

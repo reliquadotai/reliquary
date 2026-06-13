@@ -221,9 +221,9 @@ def test_health_endpoint_does_not_leak_secrets(monkeypatch):
     assert body["distinct_valid_prompt_count"] == 2
     assert body["last_valid_submission_ts"] == 1234.5
     assert body["seconds_since_last_valid_submission"] == 12.5
-    assert body["sparse_valid_idle_seal_seconds"] == 180.0
+    assert body["sparse_valid_idle_seal_seconds"] == 300.0
     assert body["sparse_valid_idle_min_distinct_prompts"] == 4
-    assert body["sparse_valid_max_window_seconds"] == 600.0
+    assert body["sparse_valid_max_window_seconds"] == 900.0
     assert "secret-value-123" not in text
     assert "access-key-value-123" not in text
     assert "hf_secret_value_123" not in text
