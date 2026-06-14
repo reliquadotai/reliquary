@@ -605,12 +605,19 @@ def evaluate_token_authenticity(
     *,
     threshold: float | None = None,
     argmax_conf: float | None = None,
+    tokens: list[int] | None = None,
+    prompt_length: int = 0,
+    completion_length: int = 0,
+    tokenizer: Any = None,
+    numeric_threshold: float | None = None,
 ) -> tuple[bool, dict]:
-    """Hard check: a completion token sampled at T_PROTO can never have
-    chosen probability below ``threshold`` while the model's argmax sits at
-    >= ``argmax_conf`` — that pattern is a post-hoc injection. Reads the
-    aligned ``completion_chosen_probs`` / ``completion_argmax_probs`` from the
-    GPU forward; no tokenizer needed. ``ok=True`` when no stats are available.
+    """Hard check on the GPU-forward token probs. Two collapse signatures:
+    (1) any token below ``threshold`` is a gross injection;
+    (2) an answer-bearing numeric token (digit, or sign/decimal adjacent to a
+    digit) below ``numeric_threshold`` while argmax >= ``argmax_conf`` is an
+    edited value (the arithmetic-result edit the boxed check misses). The
+    numeric pass runs only when ``tokens`` and ``tokenizer`` are supplied.
+    ``ok=True`` when no stats are available.
     """
     from reliquary.constants import TOKEN_AUTH_ARGMAX_CONF, TOKEN_AUTH_THRESHOLD
 
@@ -618,10 +625,16 @@ def evaluate_token_authenticity(
         threshold = TOKEN_AUTH_THRESHOLD
     if argmax_conf is None:
         argmax_conf = TOKEN_AUTH_ARGMAX_CONF
+    if numeric_threshold is None:
+        numeric_threshold = NUMERIC_AUTH_THRESHOLD
     chosen = proof.completion_chosen_probs
     amax = proof.completion_argmax_probs
     if not chosen or not amax:
         return True, {}
+    comp = digit_ids = sign_ids = None
+    if tokens is not None and tokenizer is not None and completion_length > 0:
+        comp = list(tokens[prompt_length: prompt_length + completion_length])
+        digit_ids, sign_ids = _numeric_token_ids(tokenizer)
     n = min(len(chosen), len(amax))
     for j in range(n):
         if chosen[j] < threshold:
@@ -632,6 +645,23 @@ def evaluate_token_authenticity(
                 "p_argmax": float(amax[j]),
                 "argmax_id": (ids[j] if j < len(ids) else None),
             }
+        if comp is not None and j < len(comp):
+            t = comp[j]
+            numeric = t in digit_ids or (
+                t in sign_ids
+                and (
+                    (j > 0 and comp[j - 1] in digit_ids)
+                    or (j + 1 < len(comp) and comp[j + 1] in digit_ids)
+                )
+            )
+            if numeric and chosen[j] < numeric_threshold and amax[j] >= argmax_conf:
+                return False, {
+                    "pos": j,
+                    "kind": "numeric",
+                    "p_chosen": float(chosen[j]),
+                    "p_argmax": float(amax[j]),
+                    "token_id": int(t),
+                }
     return True, {}
 
 
@@ -748,3 +778,33 @@ def evaluate_boxed_answer_probability(
         return True, {}
     metrics = {"min_prob": min(selected), "n_tokens": len(selected)}
     return (not tampered), metrics
+
+
+# Numeric-edit threshold (defined here, not in constants/env): an answer-bearing
+# numeric token below this while argmax >= conf is an edited value. Folded into
+# evaluate_token_authenticity. Set at the measured 0%-FP point.
+NUMERIC_AUTH_THRESHOLD = 1e-6
+
+_NUMERIC_ID_CACHE: dict[int, tuple[frozenset[int], frozenset[int]]] = {}
+
+
+def _numeric_token_ids(tokenizer: Any) -> tuple[frozenset[int], frozenset[int]]:
+    """``(digit_ids, sign_ids)`` for the vocab, built once per tokenizer.
+    sign_ids = standalone ``- + . /`` tokens (numeric only when digit-adjacent)."""
+    key = id(tokenizer)
+    cached = _NUMERIC_ID_CACHE.get(key)
+    if cached is not None:
+        return cached
+    digit_ids: set[int] = set()
+    sign_ids: set[int] = set()
+    for tid in tokenizer.get_vocab().values():
+        s = tokenizer.decode([int(tid)]).strip()
+        if not s:
+            continue
+        if s.isdigit():
+            digit_ids.add(int(tid))
+        elif s in ("-", "+", ".", "/", "−"):
+            sign_ids.add(int(tid))
+    out = (frozenset(digit_ids), frozenset(sign_ids))
+    _NUMERIC_ID_CACHE[key] = out
+    return out

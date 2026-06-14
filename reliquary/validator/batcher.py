@@ -1046,7 +1046,13 @@ class GrpoWindowBatcher:
                     dist_q10_min=dist_q10_min,
                 )
 
-            auth_ok, auth_metrics = evaluate_token_authenticity(proof)
+            auth_ok, auth_metrics = evaluate_token_authenticity(
+                proof,
+                tokens=rollout.commit["tokens"],
+                prompt_length=prompt_len,
+                completion_length=completion_len,
+                tokenizer=self.tokenizer,
+            )
             if not auth_ok:
                 logger.info(
                     "token_tampered hotkey=%s enforce=%s %s",
