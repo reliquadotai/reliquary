@@ -6,7 +6,7 @@ No os.getenv() overrides. Changes require coordinated deployment.
 
 # ────────────────  GRAIL PROOF VERSION  ────────────────
 
-GRAIL_PROOF_VERSION = "v6"
+GRAIL_PROOF_VERSION = "v7"
 
 # ────────────────  CRYPTOGRAPHIC CONSTANTS  ────────────────
 
@@ -80,15 +80,23 @@ UPLOAD_BUFFER = NETWORK_UPLOAD_LATENCY
 
 # ────────────────  ROLLOUT GENERATION  ────────────────
 
-# Network-wide protocol cap on completion length.
-MAX_NEW_TOKENS_PROTOCOL_CAP = 8192
+# Network-wide protocol cap on completion length. 32k = max safe under the
+# ~50-64k verify OOM (verifier.py:424 fp32 cast); CoT finish-rate plateaus ~55%
+# by 16-64k (measured), so higher buys little and needs that cast chunked first.
+MAX_NEW_TOKENS_PROTOCOL_CAP = 32768
 
-# Cap/non-EOS truncation budget per submission. A single missing-EOS rollout
-# can be an honest local max-token accident; repeated missing-EOS rollouts in
-# one GRPO group are a sampling policy, not a rare exception, and have become
-# the main manufactured-loser path.
-MAX_TRUNCATED_PER_SUBMISSION = 1
-BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION = 1
+# Cap/non-EOS truncation budget per submission. Effectively off (= M_ROLLOUTS):
+# truncated rollouts are admitted and graded down by MAX_TOKEN_TRUNCATION_PENALTY
+# instead of rejecting the whole submission, so truncation becomes a learning
+# signal (DAPO overlong shaping) rather than an admission gate.
+MAX_TRUNCATED_PER_SUBMISSION = 8
+BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION = 8
+
+# DAPO overlong reward shaping: SUBTRACTED from a rollout's reward when it hits
+# the cap without a natural EOS (so truncated-correct → 0.8, truncated-wrong →
+# -0.2), teaching the model to terminate while keeping correctness dominant.
+# Penalizes being cut off, not length.
+MAX_TOKEN_TRUNCATION_PENALTY = 0.2
 
 # Group-level reward-shape guard. The live attack manufactures binary reward
 # vectors such as 11110000 while cutting every zero-reward rollout to the same
@@ -108,13 +116,13 @@ TRAINING_QUARANTINE_ENABLED = True
 TRAINING_QUARANTINE_MAX_HOTKEY_SHARE = 0.75
 TRAINING_QUARANTINE_MAX_REWARD_VECTOR_SHARE = 0.75
 TRAINING_QUARANTINE_REWARD_VECTOR_MIN_GROUPS = 4
-TRAINING_QUARANTINE_MAX_MEAN_COMPLETION_LENGTH = 4096
-TRAINING_QUARANTINE_MAX_SINGLE_COMPLETION_LENGTH = 7000
+TRAINING_QUARANTINE_MAX_MEAN_COMPLETION_LENGTH = 24576
+TRAINING_QUARANTINE_MAX_SINGLE_COMPLETION_LENGTH = 32768
 TRAINING_QUARANTINE_EXTREME_LENGTH_MIN_ROLLOUTS = 4
 TRAINING_QUARANTINE_EXTREME_LENGTH_MIN_GROUPS = 3
 TRAINING_QUARANTINE_REJECT_SPIKE_MIN = 32
 TRAINING_QUARANTINE_REWARD_SHAPE_MIN_GROUPS = 2
-TRAINING_QUARANTINE_LONG_ZERO_TAIL_MIN_LENGTH = 2048
+TRAINING_QUARANTINE_LONG_ZERO_TAIL_MIN_LENGTH = 16384
 
 # Soft cap on per-hotkey entries persisted to ``archive["rejected"]`` per
 # window. Beyond this, ``reject_counts`` still increments but no metadata is
@@ -249,12 +257,11 @@ DATASET_SPLIT = "train"
 
 # ────────────────  GRPO MARKET (v2)  ────────────────
 
-# Minimum reward-std for a group to pass the zone filter. For binary
-# Bernoulli rewards this admits k ∈ [2, 6] for M=8 (σ at k=2/6 ≈ 0.433).
-# For continuous rewards it filters groups whose rollouts clustered too
-# tight to carry meaningful GRPO signal.
-SIGMA_MIN = 0.43
-BOOTSTRAP_SIGMA_MIN = 0.33
+# Minimum reward-std for a group to pass the zone filter (DAPO Dynamic Sampling).
+# Lowered to 0.33 = DAPO's k∈{1..7} boundary (drops only zero-variance k=0,8); the
+# max-tokens penalty now supplies in-band variance from termination behaviour.
+SIGMA_MIN = 0.33
+BOOTSTRAP_SIGMA_MIN = 0.25
 
 # Number of rollouts per submission (= size of each GRPO group).
 M_ROLLOUTS = 8
@@ -289,14 +296,19 @@ GRAD_ACCUM_STEPS: int = len(ENVIRONMENT_MIX)
 # "opencodeinstruct": 1.0}; unlisted envs default to 1.0.
 ENV_LOSS_WEIGHTS: dict[str, float] = {}
 
-# Sampling temperature fixed at protocol level. Miners who use a different
-# T would produce samples from a different distribution → biased GRPO
-# gradient. Value chosen in the GRPO-friendly range (non-zero).
-T_PROTO = 0.9
+# Sampling fixed at protocol level. Miners who use different values produce
+# samples from a different distribution → biased GRPO gradient. Set to Qwen3.5's
+# published thinking-mode config, which stops the small model looping its CoT.
+T_PROTO = 0.6
 
 # Top-p and top-k for sampling (fixed alongside T_PROTO).
-TOP_P_PROTO = 1.0
-TOP_K_PROTO = 0
+TOP_P_PROTO = 0.95
+TOP_K_PROTO = 20
+
+# Additive presence penalty applied during generation to suppress CoT loops.
+# Miner-side only — the validator scores chosen-probs unpenalised (margin is
+# large: measured median chosen-prob ~0.97 vs the 0.30 distribution floor).
+PRESENCE_PENALTY_PROTO = 1.5
 
 # A prompt that entered the training batch is ineligible for B_BATCH for
 # the next N windows (= training steps). Forces curriculum rotation so
@@ -525,7 +537,7 @@ GRAD_CLIP_NORM = 1.0
 # forward/backward. Short rollouts pack together; a rollout longer than this
 # runs alone (= the legacy one-at-a-time path), so peak memory never exceeds a
 # single sequence of this length. Sized at the protocol completion cap.
-MICROBATCH_MAX_PADDED_TOKENS = 8192
+MICROBATCH_MAX_PADDED_TOKENS = 32768
 
 # Linear LR warmup for the first N training steps (= N windows sealed).
 LR_WARMUP_WINDOWS = 10
@@ -536,7 +548,7 @@ LR_COSINE_MAX_WINDOWS = 10_000
 
 # Default base model (HF repo id). Served as the reference for KL and the
 # cold-start checkpoint.
-DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-4B"
+DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-2B"
 
 # ────────────────  WANDB TELEMETRY (opt-in, validator-only)  ────────────────
 

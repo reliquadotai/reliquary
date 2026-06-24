@@ -18,6 +18,7 @@ from reliquary.constants import (
     LAYER_INDEX,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
     M_ROLLOUTS,
+    PRESENCE_PENALTY_PROTO,
     PROMPT_RANGE_SIZE,
     T_PROTO,
     TOP_K_PROTO,
@@ -537,6 +538,27 @@ class MiningEngine:
                 "pad_token_id": pad_token_id,
                 "attention_mask": attention_mask,
             }
+            if PRESENCE_PENALTY_PROTO:
+                from transformers import LogitsProcessor, LogitsProcessorList
+
+                class _PresencePenalty(LogitsProcessor):
+                    # vLLM-style additive presence penalty: subtract it from the
+                    # logit of every already-emitted completion token, which stops
+                    # the small model looping its CoT (HF has no native option).
+                    def __init__(self, penalty, prompt_len):
+                        self.penalty = float(penalty)
+                        self.prompt_len = int(prompt_len)
+
+                    def __call__(self, input_ids, scores):
+                        gen = input_ids[:, self.prompt_len:]
+                        for b in range(gen.shape[0]):
+                            if gen.shape[1]:
+                                scores[b, gen[b].unique()] -= self.penalty
+                        return scores
+
+                generate_kwargs["logits_processor"] = LogitsProcessorList(
+                    [_PresencePenalty(PRESENCE_PENALTY_PROTO, prompt_length)]
+                )
             if eos_ids:
                 generate_kwargs["eos_token_id"] = sorted(eos_ids)
             outputs = self.vllm_model.generate(input_tensor, **generate_kwargs)

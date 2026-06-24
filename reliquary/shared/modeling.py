@@ -69,8 +69,8 @@ def auto_model_class_for_config(config: Any):
 def load_text_generation_model(source: str, **kwargs):
     """Load the model class used for text-only generation/training/proofs.
 
-    `Qwen/Qwen3.5-4B` is packaged as a conditional image-text-to-text model,
-    even for text-only use. Legacy Qwen3 checkpoints remain CausalLM.
+    `Qwen/Qwen3.5-2B` (and 4B) is packaged as a conditional image-text-to-text
+    model, even for text-only use. Legacy Qwen3 checkpoints remain CausalLM.
     """
     from transformers import AutoConfig
 
@@ -149,3 +149,26 @@ def first_eos_index(tokens: list[int], eos_ids: set[int]) -> int | None:
         if int(token) in eos_ids:
             return idx
     return None
+
+
+def truncation_penalized_reward(
+    base_reward: float,
+    tokens: list[int],
+    prompt_length: int,
+    completion_length: int,
+    eos_ids: set[int],
+    *,
+    penalty: float,
+    cap: int,
+) -> float:
+    """Overlong reward shaping. A cap-hit rollout whose last token is not an EOS
+    has ``penalty`` subtracted from ``base_reward`` (a correct-but-truncated
+    rollout keeps most of its credit, e.g. 1.0→0.8, a wrong one drops below 0);
+    one that ends on EOS — even near the cap — keeps ``base_reward``. Penalizes
+    being cut off, not thinking long. Validator-side and deterministic so all
+    validators agree."""
+    cap_hit = (int(prompt_length) + int(completion_length)) >= int(cap)
+    ended_on_eos = bool(tokens) and int(tokens[-1]) in eos_ids
+    if cap_hit and not ended_on_eos:
+        return float(base_reward) - float(penalty)
+    return float(base_reward)

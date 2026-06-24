@@ -17,7 +17,7 @@ def _submission(hotkey="hkX", window_start=500) -> dict:
     commit = {
         "tokens": list(range(36)),
         "commitments": [{"sketch": 0} for _ in range(36)],
-        "proof_version": "v6",
+        "proof_version": "v7",
         "model": {"name": "test", "layer_index": 6},
         "signature": "ab" * 32,
         "beacon": {"randomness": "cd" * 16},

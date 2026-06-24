@@ -7,11 +7,11 @@ from reliquary import constants as C
 
 
 def test_v2_sigma_bounds():
-    assert C.SIGMA_MIN == 0.43
-    assert C.BOOTSTRAP_SIGMA_MIN == 0.33
+    assert C.SIGMA_MIN == 0.33
+    assert C.BOOTSTRAP_SIGMA_MIN == 0.25
     assert C.BOOTSTRAP_SIGMA_MIN < C.SIGMA_MIN
-    assert C.MAX_TRUNCATED_PER_SUBMISSION == 1
-    assert C.BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION == 1
+    assert C.MAX_TRUNCATED_PER_SUBMISSION == 8
+    assert C.BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION == 8
 
 
 def test_v2_group_sizes():

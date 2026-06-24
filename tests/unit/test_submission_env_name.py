@@ -22,4 +22,4 @@ def test_rollout_submission_env_name_required_for_v2():
 
 def test_grail_proof_version_bumped_to_v6():
     from reliquary.constants import GRAIL_PROOF_VERSION
-    assert GRAIL_PROOF_VERSION == "v6"
+    assert GRAIL_PROOF_VERSION == "v7"

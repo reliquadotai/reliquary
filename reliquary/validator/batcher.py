@@ -795,6 +795,11 @@ class GrpoWindowBatcher:
 
         problem = self.env.get_problem(request.prompt_idx)
         validator_scored_reward = _uses_validator_authoritative_reward(self.env)
+        from reliquary.constants import MAX_TOKEN_TRUNCATION_PENALTY
+        from reliquary.shared.modeling import (
+            resolve_eos_token_ids, truncation_penalized_reward,
+        )
+        eos_ids_for_penalty = resolve_eos_token_ids(self.model, self.tokenizer)
         completion_texts = []
         for rollout in request.rollouts:
             text = self._completion_text(rollout)
@@ -805,12 +810,26 @@ class GrpoWindowBatcher:
                 return reject(RejectReason.REWARD_MISMATCH, "reward")
             if validator_scored_reward:
                 rollout.reward = computed_reward
-                rollout_meta = rollout.commit.get("rollout")
-                if isinstance(rollout_meta, dict):
-                    rollout_meta["success"] = computed_reward > 0.5
-                    rollout_meta["total_reward"] = computed_reward
             elif not _reward_matches_claim(computed_reward, rollout.reward):
                 return reject(RejectReason.REWARD_MISMATCH, "reward")
+            # After verifying the miner's correctness claim, apply the validator
+            # overlong reward shaping: a cap-truncated rollout (reached the cap
+            # without a natural EOS) has the penalty subtracted (correct-but-
+            # truncated keeps most of its credit, wrong drops below 0).
+            # Validator-side only — the miner needn't claim it.
+            rollout_meta = rollout.commit.get("rollout")
+            _toks = rollout.commit.get("tokens", [])
+            _plen = int((rollout_meta or {}).get("prompt_length", 0) or 0)
+            _clen = int((rollout_meta or {}).get(
+                "completion_length", max(0, len(_toks) - _plen)) or 0)
+            rollout.reward = truncation_penalized_reward(
+                rollout.reward, _toks, _plen, _clen, eos_ids_for_penalty,
+                penalty=MAX_TOKEN_TRUNCATION_PENALTY,
+                cap=MAX_NEW_TOKENS_PROTOCOL_CAP,
+            )
+            if isinstance(rollout_meta, dict):
+                rollout_meta["success"] = rollout.reward > 0.5
+                rollout_meta["total_reward"] = rollout.reward
 
         rewards = [float(r.reward) for r in request.rollouts]
         completion_lengths = []

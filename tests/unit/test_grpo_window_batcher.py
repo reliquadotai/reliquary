@@ -65,7 +65,7 @@ def _make_commit(
     return {
         "tokens": tokens,
         "commitments": [{"sketch": 0} for _ in range(seq_len)],
-        "proof_version": "v6",
+        "proof_version": "v7",
         "model": {"name": "test-model", "layer_index": 6},
         "signature": "ab" * 32,
         "beacon": {"randomness": "cd" * 16},
@@ -1173,7 +1173,10 @@ def test_reject_bad_tokens_negative_id():
 
 # ----- TerminationValidator wiring -----
 
-def test_reject_bad_termination_when_last_token_not_eos():
+def test_non_eos_last_token_no_longer_gate_rejected():
+    # MAX_TRUNCATED gate removed: a non-EOS / truncated rollout is admitted
+    # (graded down by the max-tokens penalty) instead of rejected for
+    # BAD_TERMINATION. has_eos_padding and per-token checks still apply.
     seq_len = CHALLENGE_K + 4
     b = _make_batcher(
         model=_ModelStubWithVocab(),
@@ -1184,8 +1187,7 @@ def test_reject_bad_termination_when_last_token_not_eos():
     req.rollouts[0].commit["tokens"] = list(range(seq_len))
     req.rollouts[0].tokens = req.rollouts[0].commit["tokens"]
     resp = b.accept_submission(req)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.BAD_TERMINATION
+    assert resp.reason != RejectReason.BAD_TERMINATION
 
 
 class _LongContextModelStub:
@@ -1243,19 +1245,6 @@ def _set_eos_completion_lengths(req: BatchSubmissionRequest, lengths: list[int])
         )
         req.rollouts[idx].commit = commit
         req.rollouts[idx].tokens = commit["tokens"]
-
-
-def test_reject_cap_path_truncations_over_budget():
-    from reliquary.constants import MAX_TRUNCATED_PER_SUBMISSION
-
-    req, seq_len = _request_with_cap_truncations(MAX_TRUNCATED_PER_SUBMISSION + 1)
-    b = _make_batcher(
-        model=_LongContextModelStub(),
-        verify_commitment_proofs_fn=_grail_with_logits(seq_len),
-    )
-    resp = b.accept_submission(req)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.BAD_TERMINATION
 
 
 def test_accept_cap_path_truncations_at_budget():

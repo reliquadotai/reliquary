@@ -34,7 +34,7 @@ def _submission(prompt_idx: int = 42, checkpoint_hash: str = "sha256:current",
     commit = {
         "tokens": list(range(36)),
         "commitments": [{"sketch": 0} for _ in range(36)],
-        "proof_version": "v6",
+        "proof_version": "v7",
         "model": {"name": "test", "layer_index": 6},
         "signature": "ab" * 32,
         "beacon": {"randomness": "cd" * 16},

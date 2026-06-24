@@ -283,7 +283,7 @@ class CommitModel(BaseModel):
 
     tokens: list[int] = Field(..., min_length=CHALLENGE_K)
     commitments: list[dict]
-    proof_version: Literal["v6"]
+    proof_version: Literal["v7"]
     model: ModelInfo
     signature: str = Field(..., pattern=r"^[0-9a-fA-F]+$")
     beacon: BeaconInfo
