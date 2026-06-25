@@ -154,7 +154,7 @@ def test_init_wires_curated_repo_via_load_dataset(monkeypatch):
         OpenCodeInstructEnvironment._CURATED_REVISION,
     )]
     assert len(env) == 1
-    assert env.get_problem(0)["prompt"] == "p"
+    assert env.get_problem(0)["prompt"].startswith("p")
 
 
 def test_init_respects_repo_and_revision_env_overrides(monkeypatch):
@@ -183,7 +183,8 @@ def test_get_problem_shape():
     }]
     env = _env_with(rows)
     p = env.get_problem(0)
-    assert p["prompt"] == "Write a function add(a, b) returning their sum."
+    assert p["prompt"].startswith("Write a function add(a, b) returning their sum.")
+    assert "`add`" in p["prompt"]  # appended contract names the grader's entry
     assert isinstance(p["ground_truth"], str)
     assert p["ground_truth"] in env._cases_by_id
     assert env._cases_by_id[p["ground_truth"]] == [_case()]
@@ -213,8 +214,8 @@ def test_get_problem_modulo_wrap():
         {"input": "p1", "structured_cases": [_case()]},
     ]
     env = _env_with(rows)
-    assert env.get_problem(0)["prompt"] == "p0"
-    assert env.get_problem(2)["prompt"] == "p0"  # wrap
+    assert env.get_problem(0)["prompt"].startswith("p0")
+    assert env.get_problem(2)["prompt"].startswith("p0")  # wrap
 
 
 def test_compute_reward_delegates_to_grader():
