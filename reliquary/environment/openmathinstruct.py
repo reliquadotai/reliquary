@@ -78,6 +78,11 @@ def _normalize_answer(s: str) -> str:
         s = s.replace(macro, "")
     s = s.replace(r"\left", "").replace(r"\right", "")
     s = s.replace(r"\dfrac", r"\frac").replace(r"\tfrac", r"\frac")
+    # Strip unit decorations so a value with units matches the bare value
+    # ("119^\circ" == "119"). These never carry numeric meaning for grading.
+    s = re.sub(r"\^\s*\{?\s*\\circ\s*\}?", "", s)
+    s = (s.replace(r"\circ", "").replace(r"\degree", "")
+          .replace(r"\%", "").replace("%", ""))
     s = _TEXT_RE.sub(r"\1", s)
     s = _MBOX_RE.sub(r"\1", s)
     s = s.replace(r"\$", "").replace("$", "")
@@ -214,13 +219,35 @@ def _latex_value_equal(candidate: str, gt: str) -> bool:
     return abs(vc - vg) <= 1e-9 * (1 + abs(vg))
 
 
+def _split_structure(s: str) -> Optional[list[str]]:
+    """Split a matrix/vector/tuple into its ordered elements, else None.
+
+    Lets a structured answer be compared element-by-element by value instead of
+    by exact string, so per-entry surface form (fraction vs decimal) does not
+    flip the reward. Scalars return None (handled by the scalar path).
+    """
+    m = re.search(r"\\begin\{[bp]?matrix\}(.*?)\\end\{[bp]?matrix\}", s, re.S)
+    if m:
+        return [c.strip() for row in m.group(1).split(r"\\") for c in row.split("&") if c.strip()]
+    if len(s) >= 2 and s[0] in "([" and s[-1] in ")]" and "," in s:
+        return [x.strip() for x in s[1:-1].split(",")]
+    return None
+
+
 def _answers_equal(candidate: str, gt: str) -> bool:
     """Compare by value when both sides are numbers, else by normalized string.
 
     The prompt asks for a value, so any surface form of that value is correct
-    (trailing zeros, fraction vs decimal, \\frac{5721}{5} == 1144.2). Falls back
+    (trailing zeros, fraction vs decimal, \\frac{5721}{5} == 1144.2). Structured
+    answers (matrix/vector/tuple) compare element-wise by value; scalars fall back
     to LaTeX value-equality, then exact normalized-string match.
     """
+    cs, gs = _split_structure(candidate), _split_structure(gt)
+    if cs is not None and gs is not None:
+        return len(cs) == len(gs) and all(
+            _answers_equal(_normalize_answer(a), _normalize_answer(b))
+            for a, b in zip(cs, gs)
+        )
     c, g = _as_number(candidate), _as_number(gt)
     if c is not None and g is not None:
         return c == g
