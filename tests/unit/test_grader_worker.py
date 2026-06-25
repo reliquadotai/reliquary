@@ -205,6 +205,33 @@ def test_call_fails_when_no_function_matches_arity():
     assert output is None
 
 
+def test_call_skips_print_only_helper_defined_last():
+    """A trailing print/format helper must not shadow the value-returning solution.
+
+    When the requested entry name is absent and a print-only helper is defined
+    after the real function, the old last-defined tie-break picked the helper
+    and crashed on the case args. The value-returning function must win.
+    """
+    from reliquary.environment.grader.worker import evaluate_call
+
+    code = (
+        "def generate_spiral_matrix(n):\n"
+        "    return [[1]] if n == 1 else [[0] * n for _ in range(n)]\n"
+        "def print_spiral_matrix(grid):\n"
+        "    for row in grid:\n"
+        "        print(row)\n"
+    )
+    output, status = evaluate_call(
+        code,
+        {"kind": "function", "name": "generate_spiral"},
+        [1],
+        {},
+        timeout_s=5.0,
+    )
+    assert status == "ok"
+    assert output == [[1]]  # the value-returning solution, not the printer
+
+
 def test_compile_tamper_fails_without_passing():
     from reliquary.environment.grader.worker import evaluate_call
 

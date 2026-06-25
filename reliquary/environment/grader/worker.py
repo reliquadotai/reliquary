@@ -156,6 +156,28 @@ def _call_graph_roots(code: str, fn_names: set[str]) -> set[str]:
     return set(fn_names) - called_by_others
 
 
+def _returns_a_value(code: str, name: str) -> bool:
+    """True if top-level function *name* has a ``return <expr>`` (not bare/None).
+
+    A print-only or None-returning function can never match a return-value case,
+    so it is never the graded entry. Unparseable code is treated as returning a
+    value so analysis failure never excludes a real solution.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return True
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return any(
+                isinstance(sub, ast.Return)
+                and sub.value is not None
+                and not (isinstance(sub.value, ast.Constant) and sub.value.value is None)
+                for sub in ast.walk(node)
+            )
+    return True
+
+
 def _resolve_function(ns: dict[str, Any], code: str, nargs: int) -> Any | None:
     """Resolve the entry function when the requested name is absent.
 
@@ -172,6 +194,11 @@ def _resolve_function(ns: dict[str, Any], code: str, nargs: int) -> Any | None:
     candidates = [name for name in order if _accepts_arity(ns[name], nargs)]
     if not candidates:
         return None
+    # Drop print-only / None-returning helpers when a value-returning one exists:
+    # they can never match a return-value case, so they are never the entry.
+    valued = [name for name in candidates if _returns_a_value(code, name)]
+    if valued:
+        candidates = valued
     if len(candidates) == 1:
         return ns[candidates[0]]
     roots = _call_graph_roots(code, set(order))
