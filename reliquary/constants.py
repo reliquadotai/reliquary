@@ -513,6 +513,12 @@ CHECKPOINT_STAGING_DIR_DEFAULT = "reliquary/state/checkpoints"
 # half their score in ~25 windows.
 EMA_ALPHA = 2.0 / (72 + 1)  # ≈ 0.0274
 
+# Top-heavy emission cutoff: miners whose 72-window emission-share EMA is
+# below this floor get 0 weight; their share is redistributed pro-rata to
+# the survivors (burn unchanged). 0.02 = 2% of one window's full emission.
+# 0 disables. Consensus-affecting — all validators must run the same value.
+TOPHEAVY_EMA_FLOOR = float(_os.environ.get("RELIQUARY_TOPHEAVY_EMA_FLOOR", "0.02"))
+
 # ────────────────  GRPO TRAINING (v2.1)  ────────────────
 
 # Learning rate for AdamW. RL fine-tuning on pretrained LLMs is sensitive;

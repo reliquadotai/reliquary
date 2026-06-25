@@ -489,3 +489,82 @@ async def test_replay_ema_conservation_bound():
     ema = WeightOnlyValidator._replay_ema([archive])
     expected_total = EMA_ALPHA * sum(rewards.values())
     assert abs(sum(ema.values()) - expected_total) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# _apply_topheavy_cutoff — drop sub-floor miners, redistribute to survivors
+# ---------------------------------------------------------------------------
+
+def _cutoff(ema, floor):
+    """Run the cutoff with TOPHEAVY_EMA_FLOOR patched to ``floor``."""
+    import reliquary.validator.weight_only as wov_mod
+    from reliquary.validator.weight_only import WeightOnlyValidator
+    with patch.object(wov_mod, "TOPHEAVY_EMA_FLOOR", floor):
+        return WeightOnlyValidator._apply_topheavy_cutoff(ema)
+
+
+def test_topheavy_cutoff_drops_below_floor():
+    """Miners strictly below the floor are removed; those at or above stay."""
+    ema = {"big": 0.5, "mid": 0.1, "small": 0.01}
+    out = _cutoff(ema, 0.02)
+    assert "small" not in out          # 0.01 < 0.02 → dropped
+    assert set(out) == {"big", "mid"}  # 0.5, 0.1 ≥ 0.02 → kept
+    # Exactly-at-floor survives (rule is "< floor → 0").
+    out2 = _cutoff({"a": 0.02, "b": 0.005}, 0.02)
+    assert set(out2) == {"a"}
+
+
+def test_topheavy_cutoff_preserves_total_mass_so_burn_unchanged():
+    """Redistribution scales survivors so their sum equals the original
+    miner mass — the burn weight (1 - total) is therefore untouched."""
+    ema = {"big": 0.5, "mid": 0.1, "small": 0.01, "dust": 0.008}
+    before = sum(ema.values())
+    out = _cutoff(ema, 0.02)
+    assert abs(sum(out.values()) - before) < 1e-12
+
+
+def test_topheavy_cutoff_redistributes_pro_rata():
+    """Each survivor keeps its relative proportion; freed mass is split
+    pro-rata to EMA (the ratio between two survivors is preserved)."""
+    ema = {"big": 0.5, "mid": 0.1, "small": 0.01}
+    out = _cutoff(ema, 0.02)
+    total = sum(ema.values())                 # 0.61
+    surv_total = ema["big"] + ema["mid"]      # 0.60
+    scale = total / surv_total
+    assert abs(out["big"] - 0.5 * scale) < 1e-12
+    assert abs(out["mid"] - 0.1 * scale) < 1e-12
+    # Proportion between survivors unchanged (5:1).
+    assert abs(out["big"] / out["mid"] - 5.0) < 1e-12
+
+
+def test_topheavy_cutoff_single_survivor_takes_all_miner_mass():
+    ema = {"a": 0.5, "b": 0.01, "c": 0.01}
+    out = _cutoff(ema, 0.02)
+    assert set(out) == {"a"}
+    assert abs(out["a"] - sum(ema.values())) < 1e-12  # 0.52
+
+
+def test_topheavy_cutoff_no_survivors_passes_through():
+    """If no miner clears the floor, return the EMA unchanged rather than
+    sending everything to burn (sparse-run guard)."""
+    ema = {"a": 0.01, "b": 0.005}
+    out = _cutoff(ema, 0.02)
+    assert out == ema
+
+
+def test_topheavy_cutoff_disabled_when_floor_zero():
+    """Floor of 0 disables the cutoff: identity transform, every miner kept."""
+    ema = {"a": 0.5, "b": 0.001, "c": 1e-5}
+    out = _cutoff(ema, 0.0)
+    assert out == ema
+
+
+def test_topheavy_cutoff_empty_ema():
+    assert _cutoff({}, 0.02) == {}
+
+
+def test_topheavy_cutoff_deterministic():
+    """Same input → same output (insertion order must not matter)."""
+    a = {"x": 0.3, "y": 0.2, "z": 0.01}
+    b = {"z": 0.01, "y": 0.2, "x": 0.3}
+    assert _cutoff(a, 0.02) == _cutoff(b, 0.02)

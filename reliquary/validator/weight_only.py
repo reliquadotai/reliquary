@@ -15,6 +15,7 @@ from reliquary.constants import (
     EMA_ALPHA,
     EPOCH_SUBMIT_LEAD_BLOCKS,
     POLL_INTERVAL_SECONDS,
+    TOPHEAVY_EMA_FLOOR,
     UID_BURN,
 )
 from reliquary.infrastructure import chain, storage
@@ -135,6 +136,7 @@ class WeightOnlyValidator:
             n=ROLLING_WINDOWS_HISTORY * 3,
         )
         ema = self._replay_ema(archives)
+        ema = self._apply_topheavy_cutoff(ema)
         miner_weights = dict(ema)
         total = sum(miner_weights.values())
         burn_weight = max(0.0, 1.0 - total)
@@ -193,6 +195,42 @@ class WeightOnlyValidator:
                 ema[hk] = alpha * fraction + (1 - alpha) * ema.get(hk, 0.0)
             ema = {hk: v for hk, v in ema.items() if v > 1e-6}
         return ema
+
+    @staticmethod
+    def _apply_topheavy_cutoff(ema: dict[str, float]) -> dict[str, float]:
+        """Zero miners below ``TOPHEAVY_EMA_FLOOR`` and redistribute their
+        share pro-rata to the survivors.
+
+        Keeps the total miner mass constant, so the burn weight is
+        unchanged — the dropped miners' emission concentrates on the
+        larger ones (top-heavy). Deterministic: every validator replays
+        identical archives and applies the same floor, so on-chain weights
+        still converge.
+
+        Guard: if no miner clears the floor (e.g. a sparse early run),
+        pass the EMA through unchanged rather than sending everything to
+        burn.
+        """
+        floor = TOPHEAVY_EMA_FLOOR
+        if floor <= 0.0:
+            return ema
+        survivors = {hk: v for hk, v in ema.items() if v >= floor}
+        if not survivors:
+            logger.warning(
+                "Top-heavy cutoff: no miner ≥ floor %.4f; passing EMA through",
+                floor,
+            )
+            return ema
+        total = sum(ema.values())
+        surv_total = sum(survivors.values())
+        scale = total / surv_total
+        dropped = len(ema) - len(survivors)
+        if dropped:
+            logger.info(
+                "Top-heavy cutoff: dropped %d miners < %.4f → %d survivors (×%.3f)",
+                dropped, floor, len(survivors), scale,
+            )
+        return {hk: v * scale for hk, v in survivors.items()}
 
     async def _submit_weights(
         self, subtensor, miner_weights: dict[str, float], burn_weight: float,
