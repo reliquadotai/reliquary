@@ -219,18 +219,19 @@ def _latex_value_equal(candidate: str, gt: str) -> bool:
     return abs(vc - vg) <= 1e-9 * (1 + abs(vg))
 
 
-def _split_structure(s: str) -> Optional[list[str]]:
-    """Split a matrix/vector/tuple into its ordered elements, else None.
+def _split_structure(s: str) -> Optional[tuple[str, list[str]]]:
+    """Return ``(signature, ordered elements)`` for a matrix/vector/tuple, else None.
 
-    Lets a structured answer be compared element-by-element by value instead of
-    by exact string, so per-entry surface form (fraction vs decimal) does not
-    flip the reward. Scalars return None (handled by the scalar path).
+    The signature is ``"matrix"`` or the opening delimiter (``(`` / ``[``). Two
+    answers only compare element-wise when their signatures match, so an open
+    ``(a,b)`` interval/point never matches a closed ``[a,b]`` one (the brackets
+    carry meaning). Scalars return None (handled by the scalar path).
     """
     m = re.search(r"\\begin\{[bp]?matrix\}(.*?)\\end\{[bp]?matrix\}", s, re.S)
     if m:
-        return [c.strip() for row in m.group(1).split(r"\\") for c in row.split("&") if c.strip()]
+        return "matrix", [c.strip() for row in m.group(1).split(r"\\") for c in row.split("&") if c.strip()]
     if len(s) >= 2 and s[0] in "([" and s[-1] in ")]" and "," in s:
-        return [x.strip() for x in s[1:-1].split(",")]
+        return s[0], [x.strip() for x in s[1:-1].split(",")]
     return None
 
 
@@ -238,15 +239,15 @@ def _answers_equal(candidate: str, gt: str) -> bool:
     """Compare by value when both sides are numbers, else by normalized string.
 
     The prompt asks for a value, so any surface form of that value is correct
-    (trailing zeros, fraction vs decimal, \\frac{5721}{5} == 1144.2). Structured
-    answers (matrix/vector/tuple) compare element-wise by value; scalars fall back
-    to LaTeX value-equality, then exact normalized-string match.
+    (trailing zeros, fraction vs decimal, \\frac{5721}{5} == 1144.2). Same-shape
+    structured answers (matrix/vector/tuple) compare element-wise by value;
+    scalars fall back to LaTeX value-equality, then exact normalized-string match.
     """
     cs, gs = _split_structure(candidate), _split_structure(gt)
-    if cs is not None and gs is not None:
-        return len(cs) == len(gs) and all(
+    if cs is not None and gs is not None and cs[0] == gs[0]:
+        return len(cs[1]) == len(gs[1]) and all(
             _answers_equal(_normalize_answer(a), _normalize_answer(b))
-            for a, b in zip(cs, gs)
+            for a, b in zip(cs[1], gs[1])
         )
     c, g = _as_number(candidate), _as_number(gt)
     if c is not None and g is not None:
