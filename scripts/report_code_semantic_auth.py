@@ -33,16 +33,30 @@ class Bucket:
     flagged_submissions: int = 0
     findings: int = 0
     min_prob: float | None = None
+    positive_findings: int = 0
+    positive_min_prob: float | None = None
 
-    def add(self, findings: int, min_prob: float | None) -> None:
+    def add(
+        self,
+        findings: int,
+        min_prob: float | None,
+        *,
+        positive_findings: int = 0,
+        positive_min_prob: float | None = None,
+    ) -> None:
         self.submissions += 1
         if findings > 0:
             self.flagged_submissions += 1
         self.findings += int(findings)
+        self.positive_findings += int(positive_findings)
         if min_prob is not None:
             p = float(min_prob)
             if self.min_prob is None or p < self.min_prob:
                 self.min_prob = p
+        if positive_min_prob is not None:
+            p = float(positive_min_prob)
+            if self.positive_min_prob is None or p < self.positive_min_prob:
+                self.positive_min_prob = p
 
     def as_dict(self) -> dict[str, Any]:
         rate = (
@@ -56,6 +70,8 @@ class Bucket:
             "flagged_rate": rate,
             "findings": self.findings,
             "min_prob": self.min_prob,
+            "positive_findings": self.positive_findings,
+            "positive_min_prob": self.positive_min_prob,
         }
 
 
@@ -138,6 +154,23 @@ def _entry_min_prob(entry: dict[str, Any]) -> float | None:
         return None
 
 
+def _entry_positive_findings(entry: dict[str, Any]) -> int:
+    try:
+        return int(entry.get("code_semantic_auth_positive_findings", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _entry_positive_min_prob(entry: dict[str, Any]) -> float | None:
+    raw = entry.get("code_semantic_auth_positive_min_prob")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def summarize_archives(
     archives: Iterable[dict[str, Any]],
     *,
@@ -168,21 +201,34 @@ def summarize_archives(
                 summary.entries_matching_env += 1
                 findings = _entry_findings(entry)
                 min_prob = _entry_min_prob(entry)
+                positive_findings = _entry_positive_findings(entry)
+                positive_min_prob = _entry_positive_min_prob(entry)
                 target = (
                     summary.runners_up
                     if group_name == "runners_up"
                     else summary.selected
                 )
-                target.add(findings, min_prob)
+                target.add(
+                    findings,
+                    min_prob,
+                    positive_findings=positive_findings,
+                    positive_min_prob=positive_min_prob,
+                )
 
                 hotkey = str(entry.get("hotkey") or "")
                 if hotkey:
                     summary.by_hotkey.setdefault(hotkey, Bucket()).add(
-                        findings, min_prob
+                        findings,
+                        min_prob,
+                        positive_findings=positive_findings,
+                        positive_min_prob=positive_min_prob,
                     )
                 if window >= 0:
                     summary.by_window.setdefault(window, Bucket()).add(
-                        findings, min_prob
+                        findings,
+                        min_prob,
+                        positive_findings=positive_findings,
+                        positive_min_prob=positive_min_prob,
                     )
     return summary
 
@@ -200,10 +246,20 @@ def format_text_report(summary: CodeSemanticAuthSummary, *, top_n: int = 12) -> 
         selected["flagged_submissions"] + runners_up["flagged_submissions"]
     )
     total_findings = selected["findings"] + runners_up["findings"]
+    total_positive_findings = (
+        selected["positive_findings"] + runners_up["positive_findings"]
+    )
     min_probs = [
         p for p in (selected["min_prob"], runners_up["min_prob"]) if p is not None
     ]
     min_prob = min(min_probs) if min_probs else None
+    positive_min_probs = [
+        p for p in (
+            selected["positive_min_prob"],
+            runners_up["positive_min_prob"],
+        ) if p is not None
+    ]
+    positive_min_prob = min(positive_min_probs) if positive_min_probs else None
     flagged_rate = total_flagged / total_submissions if total_submissions else 0.0
 
     lines = [
@@ -218,7 +274,9 @@ def format_text_report(summary: CodeSemanticAuthSummary, *, top_n: int = 12) -> 
             f"flagged={total_flagged} "
             f"rate={flagged_rate:.2%} "
             f"findings={total_findings} "
-            f"min_prob={_fmt_prob(min_prob)}"
+            f"min_prob={_fmt_prob(min_prob)} "
+            f"positive_findings={total_positive_findings} "
+            f"positive_min_prob={_fmt_prob(positive_min_prob)}"
         ),
         (
             "selected: "
@@ -226,7 +284,9 @@ def format_text_report(summary: CodeSemanticAuthSummary, *, top_n: int = 12) -> 
             f"flagged={selected['flagged_submissions']} "
             f"rate={selected['flagged_rate']:.2%} "
             f"findings={selected['findings']} "
-            f"min_prob={_fmt_prob(selected['min_prob'])}"
+            f"min_prob={_fmt_prob(selected['min_prob'])} "
+            f"positive_findings={selected['positive_findings']} "
+            f"positive_min_prob={_fmt_prob(selected['positive_min_prob'])}"
         ),
         (
             "runners_up: "
@@ -234,7 +294,9 @@ def format_text_report(summary: CodeSemanticAuthSummary, *, top_n: int = 12) -> 
             f"flagged={runners_up['flagged_submissions']} "
             f"rate={runners_up['flagged_rate']:.2%} "
             f"findings={runners_up['findings']} "
-            f"min_prob={_fmt_prob(runners_up['min_prob'])}"
+            f"min_prob={_fmt_prob(runners_up['min_prob'])} "
+            f"positive_findings={runners_up['positive_findings']} "
+            f"positive_min_prob={_fmt_prob(runners_up['positive_min_prob'])}"
         ),
     ]
 
@@ -256,7 +318,9 @@ def format_text_report(summary: CodeSemanticAuthSummary, *, top_n: int = 12) -> 
                 f"flagged={d['flagged_submissions']} "
                 f"rate={d['flagged_rate']:.2%} "
                 f"findings={d['findings']} "
-                f"min_prob={_fmt_prob(d['min_prob'])}"
+                f"min_prob={_fmt_prob(d['min_prob'])} "
+                f"positive_findings={d['positive_findings']} "
+                f"positive_min_prob={_fmt_prob(d['positive_min_prob'])}"
             )
 
     if total_submissions == 0:

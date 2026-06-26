@@ -66,6 +66,8 @@ def _valid_submission(prompt_idx, k=4, hotkey="hk", eos_first=False):
         dist_q10_min=0.74,
         code_semantic_auth_findings=3,
         code_semantic_auth_min_prob=0.0002,
+        code_semantic_auth_positive_findings=1,
+        code_semantic_auth_positive_min_prob=0.0004,
         claimed_checkpoint_hash="sha256:fake",
     )
 
@@ -165,6 +167,8 @@ async def test_archive_includes_prompt_and_rollout_content():
     assert entry0["dist_q10_min"] == pytest.approx(0.74)
     assert entry0["code_semantic_auth_findings"] == 3
     assert entry0["code_semantic_auth_min_prob"] == pytest.approx(0.0002)
+    assert entry0["code_semantic_auth_positive_findings"] == 1
+    assert entry0["code_semantic_auth_positive_min_prob"] == pytest.approx(0.0004)
 
     # forensic fields.
     assert entry0["merkle_root"] == "ab" * 32
@@ -183,6 +187,8 @@ async def test_archive_includes_prompt_and_rollout_content():
     assert ru["hotkey"] == "hk_runner"
     assert ru["prompt_idx"] == 99
     assert ru["response_time"] == pytest.approx(10.0)
+    assert ru["code_semantic_auth_positive_findings"] == 1
+    assert ru["code_semantic_auth_positive_min_prob"] == pytest.approx(0.0004)
     assert "rollouts" not in ru and "prompt" not in ru  # metadata only
     assert ru["rollout_hashes"] == [h.hex() for h in runner.rollout_hashes]
     assert archive["rewarded_but_not_selected_by_hotkey"] == {"hk_runner": 1}

@@ -2205,6 +2205,8 @@ def test_opencode_semantic_auth_shadow_records_without_rejecting():
     sub = b.valid_submissions()[0]
     assert sub.code_semantic_auth_findings == M_ROLLOUTS
     assert sub.code_semantic_auth_min_prob == pytest.approx(2.0e-4)
+    assert sub.code_semantic_auth_positive_findings == 4
+    assert sub.code_semantic_auth_positive_min_prob == pytest.approx(2.0e-4)
 
 
 def test_opencode_semantic_auth_enforce_ignores_zero_reward_rollout(monkeypatch):
@@ -2248,6 +2250,8 @@ def test_opencode_semantic_auth_enforce_ignores_zero_reward_rollout(monkeypatch)
     sub = b.valid_submissions()[0]
     assert sub.code_semantic_auth_findings == 1
     assert sub.code_semantic_auth_min_prob == pytest.approx(2.0e-4)
+    assert sub.code_semantic_auth_positive_findings == 0
+    assert sub.code_semantic_auth_positive_min_prob is None
 
 
 def test_opencode_semantic_auth_enforce_rejects_positive_reward_rollout(
