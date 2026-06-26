@@ -1213,6 +1213,12 @@ class ValidationService:
                     "sketch_diff_max": s.sketch_diff_max,
                     "lp_dev_max": s.lp_dev_max,
                     "dist_q10_min": s.dist_q10_min,
+                    "code_semantic_auth_findings": getattr(
+                        s, "code_semantic_auth_findings", 0
+                    ),
+                    "code_semantic_auth_min_prob": getattr(
+                        s, "code_semantic_auth_min_prob", None
+                    ),
                     **_submission_obs_payload(s, batcher),
                 })
 
@@ -1233,6 +1239,12 @@ class ValidationService:
                     "sketch_diff_max": s.sketch_diff_max,
                     "lp_dev_max": s.lp_dev_max,
                     "dist_q10_min": s.dist_q10_min,
+                    "code_semantic_auth_findings": getattr(
+                        s, "code_semantic_auth_findings", 0
+                    ),
+                    "code_semantic_auth_min_prob": getattr(
+                        s, "code_semantic_auth_min_prob", None
+                    ),
                     **obs,
                 }
                 # Rewarded runners-up carry rollout_hashes (ported from main):

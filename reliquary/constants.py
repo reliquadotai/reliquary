@@ -620,3 +620,14 @@ TOKEN_AUTH_ARGMAX_CONF = 0.99
 # Shadow mode: compute + log the check without rejecting. Flip to True once prod
 # shadow logs confirm zero false positives.
 TOKEN_AUTH_ENFORCE = True
+
+# OpenCode semantic-token authenticity shadow gate. Generic token auth catches
+# near-impossible injections, and numeric auth catches many literal edits, but
+# plausible code edits can live at probabilities far above 1e-10. In shadow
+# mode, flag low-probability tokens that fall inside AST-sensitive code spans
+# (operators, boolean/keyword values, return/index/literal regions). Keep this
+# disabled until honest OpenCode calibration proves an acceptable false-positive
+# rate.
+CODE_SEMANTIC_AUTH_THRESHOLD = 0.001
+CODE_SEMANTIC_AUTH_ARGMAX_CONF = TOKEN_AUTH_ARGMAX_CONF
+CODE_SEMANTIC_AUTH_ENFORCE = False

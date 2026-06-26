@@ -30,6 +30,7 @@ from reliquary.constants import (
     PROMPT_RANGE_SIZE,
     PROMPT_RANGE_ENFORCE_FROM_WINDOW,
     REJECTED_LIST_CAP_PER_HOTKEY,
+    CODE_SEMANTIC_AUTH_ENFORCE,
     TOKEN_AUTH_ENFORCE,
 )
 from reliquary.environment.base import Environment
@@ -60,6 +61,7 @@ from reliquary.validator.boxed_integrity import has_malformed_final_answer
 from reliquary.validator.reward_shape import detect_reward_shape_manipulation
 from reliquary.validator.rollout_patterns import detect_opposite_reward_clones
 from reliquary.validator.verifier import (
+    evaluate_code_semantic_token_authenticity,
     evaluate_boxed_answer_probability,
     evaluate_token_authenticity,
     evaluate_token_distribution,
@@ -119,6 +121,8 @@ class ValidSubmission:
     sketch_diff_max: int | None = None
     lp_dev_max: float | None = None
     dist_q10_min: float | None = None
+    code_semantic_auth_findings: int = 0
+    code_semantic_auth_min_prob: float | None = None
     # Miner-claimed checkpoint hash at submit time — useful for post-hoc
     # forensic analysis of who lied about their checkpoint.
     claimed_checkpoint_hash: str = ""
@@ -877,6 +881,8 @@ class GrpoWindowBatcher:
         sketch_diff_max = 0
         lp_dev_max: float | None = None
         dist_q10_min: float | None = None
+        code_semantic_auth_findings = 0
+        code_semantic_auth_min_prob: float | None = None
 
         # Cap/non-EOS truncation is tolerated only as a rare one-rollout
         # accident. Multiple missing-EOS rollouts in the same group are a
@@ -1067,6 +1073,42 @@ class GrpoWindowBatcher:
                         dist_q10_min=dist_q10_min,
                     )
 
+            if getattr(self.env, "name", "") == "opencodeinstruct":
+                code_auth_ok, code_auth_metrics = (
+                    evaluate_code_semantic_token_authenticity(
+                        tokens=rollout.commit["tokens"],
+                        prompt_length=prompt_len,
+                        completion_length=completion_len,
+                        proof=proof,
+                        tokenizer=self.tokenizer,
+                    )
+                )
+                if code_auth_metrics:
+                    findings = int(code_auth_metrics.get("findings", 0) or 0)
+                    code_semantic_auth_findings += findings
+                    min_prob = code_auth_metrics.get("min_prob")
+                    if min_prob is not None:
+                        p = float(min_prob)
+                        if (
+                            code_semantic_auth_min_prob is None
+                            or p < code_semantic_auth_min_prob
+                        ):
+                            code_semantic_auth_min_prob = p
+                if not code_auth_ok:
+                    logger.info(
+                        "code_semantic_token_suspicious hotkey=%s enforce=%s %s",
+                        request.miner_hotkey, CODE_SEMANTIC_AUTH_ENFORCE,
+                        code_auth_metrics,
+                    )
+                    if CODE_SEMANTIC_AUTH_ENFORCE:
+                        return reject(
+                            RejectReason.TOKEN_TAMPERED,
+                            "code_semantic_auth",
+                            sketch_diff_max=sketch_diff_max,
+                            lp_dev_max=lp_dev_max,
+                            dist_q10_min=dist_q10_min,
+                        )
+
         # Reward-shape metrics are still computed (they feed the softer
         # training-quarantine signal + archive telemetry) but no longer
         # REJECT a submission: the ordered-prefix heuristic was trivially
@@ -1095,6 +1137,8 @@ class GrpoWindowBatcher:
             sketch_diff_max=sketch_diff_max,
             lp_dev_max=lp_dev_max,
             dist_q10_min=dist_q10_min,
+            code_semantic_auth_findings=code_semantic_auth_findings,
+            code_semantic_auth_min_prob=code_semantic_auth_min_prob,
             claimed_checkpoint_hash=request.checkpoint_hash,
             rollout_hashes=rollout_hashes,
             drand_round=request.drand_round,

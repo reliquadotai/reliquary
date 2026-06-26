@@ -64,6 +64,8 @@ def _valid_submission(prompt_idx, k=4, hotkey="hk", eos_first=False):
         sketch_diff_max=412,
         lp_dev_max=0.00037,
         dist_q10_min=0.74,
+        code_semantic_auth_findings=3,
+        code_semantic_auth_min_prob=0.0002,
         claimed_checkpoint_hash="sha256:fake",
     )
 
@@ -161,6 +163,8 @@ async def test_archive_includes_prompt_and_rollout_content():
     assert entry0["sketch_diff_max"] == 412
     assert entry0["lp_dev_max"] == pytest.approx(0.00037)
     assert entry0["dist_q10_min"] == pytest.approx(0.74)
+    assert entry0["code_semantic_auth_findings"] == 3
+    assert entry0["code_semantic_auth_min_prob"] == pytest.approx(0.0002)
 
     # forensic fields.
     assert entry0["merkle_root"] == "ab" * 32
