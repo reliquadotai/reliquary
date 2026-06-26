@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize OpenCode semantic-token shadow telemetry from archives.
+"""Summarize token-auth shadow telemetry from archives.
 
 Usage examples:
 
@@ -7,13 +7,21 @@ Usage examples:
 
     python scripts/report_code_semantic_auth.py --from-r2 --current-window 1234 --n 24
 
-The report reads archive fields written by PR #94:
+    python scripts/report_code_semantic_auth.py --surface all-token-shadow \
+        --from-r2 --current-window 1234 --n 24
+
+By default the report reads OpenCode semantic fields written by PR #94:
 
     code_semantic_auth_findings
     code_semantic_auth_min_prob
 
-It is intentionally read-only. A non-zero finding count is not automatically a
-ban signal while CODE_SEMANTIC_AUTH_ENFORCE is false; it is calibration data.
+The all-token shadow surface reads:
+
+    all_token_auth_shadow_findings
+    all_token_auth_shadow_min_prob
+
+Reports are intentionally read-only. A non-zero finding count is calibration
+data, not an automatic ban signal.
 """
 
 from __future__ import annotations
@@ -25,6 +33,18 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
+
+
+SURFACES: dict[str, tuple[str, str]] = {
+    "code-semantic": (
+        "code_semantic_auth",
+        "OpenCode semantic-token shadow report",
+    ),
+    "all-token-shadow": (
+        "all_token_auth_shadow",
+        "All-token argmax-shadow report",
+    ),
+}
 
 
 @dataclass
@@ -137,15 +157,21 @@ def _entry_env(archive: dict[str, Any], entry: dict[str, Any]) -> str:
     return env if isinstance(env, str) else ""
 
 
-def _entry_findings(entry: dict[str, Any]) -> int:
+def _entry_findings(
+    entry: dict[str, Any],
+    field_prefix: str = "code_semantic_auth",
+) -> int:
     try:
-        return int(entry.get("code_semantic_auth_findings", 0) or 0)
+        return int(entry.get(f"{field_prefix}_findings", 0) or 0)
     except (TypeError, ValueError):
         return 0
 
 
-def _entry_min_prob(entry: dict[str, Any]) -> float | None:
-    raw = entry.get("code_semantic_auth_min_prob")
+def _entry_min_prob(
+    entry: dict[str, Any],
+    field_prefix: str = "code_semantic_auth",
+) -> float | None:
+    raw = entry.get(f"{field_prefix}_min_prob")
     if raw is None:
         return None
     try:
@@ -154,15 +180,21 @@ def _entry_min_prob(entry: dict[str, Any]) -> float | None:
         return None
 
 
-def _entry_positive_findings(entry: dict[str, Any]) -> int:
+def _entry_positive_findings(
+    entry: dict[str, Any],
+    field_prefix: str = "code_semantic_auth",
+) -> int:
     try:
-        return int(entry.get("code_semantic_auth_positive_findings", 0) or 0)
+        return int(entry.get(f"{field_prefix}_positive_findings", 0) or 0)
     except (TypeError, ValueError):
         return 0
 
 
-def _entry_positive_min_prob(entry: dict[str, Any]) -> float | None:
-    raw = entry.get("code_semantic_auth_positive_min_prob")
+def _entry_positive_min_prob(
+    entry: dict[str, Any],
+    field_prefix: str = "code_semantic_auth",
+) -> float | None:
+    raw = entry.get(f"{field_prefix}_positive_min_prob")
     if raw is None:
         return None
     try:
@@ -176,6 +208,7 @@ def summarize_archives(
     *,
     env_name: str = "opencodeinstruct",
     include_runners_up: bool = True,
+    field_prefix: str = "code_semantic_auth",
 ) -> CodeSemanticAuthSummary:
     summary = CodeSemanticAuthSummary()
     for archive in archives:
@@ -199,10 +232,10 @@ def summarize_archives(
                 if _entry_env(archive, entry) != env_name:
                     continue
                 summary.entries_matching_env += 1
-                findings = _entry_findings(entry)
-                min_prob = _entry_min_prob(entry)
-                positive_findings = _entry_positive_findings(entry)
-                positive_min_prob = _entry_positive_min_prob(entry)
+                findings = _entry_findings(entry, field_prefix)
+                min_prob = _entry_min_prob(entry, field_prefix)
+                positive_findings = _entry_positive_findings(entry, field_prefix)
+                positive_min_prob = _entry_positive_min_prob(entry, field_prefix)
                 target = (
                     summary.runners_up
                     if group_name == "runners_up"
@@ -237,7 +270,12 @@ def _fmt_prob(value: float | None) -> str:
     return "n/a" if value is None else f"{value:.3g}"
 
 
-def format_text_report(summary: CodeSemanticAuthSummary, *, top_n: int = 12) -> str:
+def format_text_report(
+    summary: CodeSemanticAuthSummary,
+    *,
+    top_n: int = 12,
+    title: str = "OpenCode semantic-token shadow report",
+) -> str:
     data = summary.as_dict()
     selected = data["selected"]
     runners_up = data["runners_up"]
@@ -263,7 +301,7 @@ def format_text_report(summary: CodeSemanticAuthSummary, *, top_n: int = 12) -> 
     flagged_rate = total_flagged / total_submissions if total_submissions else 0.0
 
     lines = [
-        "OpenCode semantic-token shadow report",
+        title,
         f"windows: {summary.windows}",
         f"entries_seen: {summary.entries_seen}",
         f"opencode_entries: {summary.entries_matching_env}",
@@ -335,7 +373,7 @@ def format_text_report(summary: CodeSemanticAuthSummary, *, top_n: int = 12) -> 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Summarize OpenCode semantic-token shadow telemetry.",
+        description="Summarize token-auth shadow telemetry.",
     )
     parser.add_argument("archives", nargs="*", help="Local .json or .json.gz archives")
     parser.add_argument("--env", default="opencodeinstruct", help="Environment name")
@@ -349,6 +387,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--from-r2", action="store_true", help="Fetch recent R2 archives")
     parser.add_argument("--current-window", type=int, default=0, help="Exclusive upper window")
     parser.add_argument("--n", type=int, default=24, help="Number of recent windows")
+    parser.add_argument(
+        "--surface",
+        choices=sorted(SURFACES),
+        default="code-semantic",
+        help="Archive telemetry surface to summarize",
+    )
     return parser.parse_args()
 
 
@@ -363,15 +407,17 @@ def main() -> None:
             raise SystemExit("pass archive paths or use --from-r2")
         archives = load_archives_from_paths(args.archives)
 
+    field_prefix, title = SURFACES[args.surface]
     summary = summarize_archives(
         archives,
         env_name=args.env,
         include_runners_up=not args.no_runners_up,
+        field_prefix=field_prefix,
     )
     if args.json:
         print(json.dumps(summary.as_dict(), indent=2, sort_keys=True))
     else:
-        print(format_text_report(summary, top_n=args.top), end="")
+        print(format_text_report(summary, top_n=args.top, title=title), end="")
 
 
 if __name__ == "__main__":

@@ -2155,6 +2155,45 @@ def test_accept_boxed_answer_high_prob():
     assert resp.reason != RejectReason.BOXED_ANSWER_TAMPERED
 
 
+def test_all_token_auth_shadow_records_without_rejecting(monkeypatch):
+    import reliquary.validator.batcher as batcher_mod
+
+    monkeypatch.setattr(
+        batcher_mod,
+        "evaluate_all_token_auth_shadow",
+        lambda _proof: (
+            False,
+            {
+                "findings": 2,
+                "min_prob": 4.0e-7,
+                "finding_min_prob": 7.0e-6,
+            },
+        ),
+    )
+    monkeypatch.setattr(batcher_mod, "has_eos_padding", lambda *_args, **_kw: False)
+    monkeypatch.setattr(batcher_mod, "verify_termination", lambda *_args, **_kw: True)
+    monkeypatch.setattr(batcher_mod, "is_cap_truncation", lambda *_args, **_kw: False)
+
+    b = _make_batcher(
+        env=FakeEnv(),
+        tokenizer=_CharTokenizerWithEos(),
+        verify_commitment_proofs_fn=_grail_with_chosen_probs(
+            CHALLENGE_K + 4,
+            [0.99] * CHALLENGE_K,
+        ),
+    )
+    req = _request()
+
+    resp = b.accept_submission(req)
+
+    assert resp.accepted is True
+    sub = b.valid_submissions()[0]
+    assert sub.all_token_auth_shadow_findings == M_ROLLOUTS * 2
+    assert sub.all_token_auth_shadow_min_prob == pytest.approx(4.0e-7)
+    assert sub.all_token_auth_shadow_positive_findings == 4 * 2
+    assert sub.all_token_auth_shadow_positive_min_prob == pytest.approx(7.0e-6)
+
+
 def test_opencode_semantic_auth_shadow_records_without_rejecting():
     class _CodeTokenizer:
         eos_token_id = 9999

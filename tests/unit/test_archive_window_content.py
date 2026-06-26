@@ -64,6 +64,10 @@ def _valid_submission(prompt_idx, k=4, hotkey="hk", eos_first=False):
         sketch_diff_max=412,
         lp_dev_max=0.00037,
         dist_q10_min=0.74,
+        all_token_auth_shadow_findings=5,
+        all_token_auth_shadow_min_prob=6.0e-7,
+        all_token_auth_shadow_positive_findings=2,
+        all_token_auth_shadow_positive_min_prob=8.0e-6,
         code_semantic_auth_findings=3,
         code_semantic_auth_min_prob=0.0002,
         code_semantic_auth_positive_findings=1,
@@ -165,6 +169,10 @@ async def test_archive_includes_prompt_and_rollout_content():
     assert entry0["sketch_diff_max"] == 412
     assert entry0["lp_dev_max"] == pytest.approx(0.00037)
     assert entry0["dist_q10_min"] == pytest.approx(0.74)
+    assert entry0["all_token_auth_shadow_findings"] == 5
+    assert entry0["all_token_auth_shadow_min_prob"] == pytest.approx(6.0e-7)
+    assert entry0["all_token_auth_shadow_positive_findings"] == 2
+    assert entry0["all_token_auth_shadow_positive_min_prob"] == pytest.approx(8.0e-6)
     assert entry0["code_semantic_auth_findings"] == 3
     assert entry0["code_semantic_auth_min_prob"] == pytest.approx(0.0002)
     assert entry0["code_semantic_auth_positive_findings"] == 1
@@ -187,6 +195,8 @@ async def test_archive_includes_prompt_and_rollout_content():
     assert ru["hotkey"] == "hk_runner"
     assert ru["prompt_idx"] == 99
     assert ru["response_time"] == pytest.approx(10.0)
+    assert ru["all_token_auth_shadow_positive_findings"] == 2
+    assert ru["all_token_auth_shadow_positive_min_prob"] == pytest.approx(8.0e-6)
     assert ru["code_semantic_auth_positive_findings"] == 1
     assert ru["code_semantic_auth_positive_min_prob"] == pytest.approx(0.0004)
     assert "rollouts" not in ru and "prompt" not in ru  # metadata only

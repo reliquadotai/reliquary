@@ -21,12 +21,18 @@ def _archive(window=10):
                 "code_semantic_auth_min_prob": 0.0002,
                 "code_semantic_auth_positive_findings": 1,
                 "code_semantic_auth_positive_min_prob": 0.0003,
+                "all_token_auth_shadow_findings": 3,
+                "all_token_auth_shadow_min_prob": 4e-7,
+                "all_token_auth_shadow_positive_findings": 2,
+                "all_token_auth_shadow_positive_min_prob": 5e-6,
             },
             {
                 "hotkey": "hk_math",
                 "env_name": "openmathinstruct",
                 "code_semantic_auth_findings": 99,
                 "code_semantic_auth_min_prob": 1e-9,
+                "all_token_auth_shadow_findings": 99,
+                "all_token_auth_shadow_min_prob": 1e-9,
             },
         ],
         "runners_up": [
@@ -35,6 +41,8 @@ def _archive(window=10):
                 "env_name": "opencodeinstruct",
                 "code_semantic_auth_findings": 0,
                 "code_semantic_auth_min_prob": None,
+                "all_token_auth_shadow_findings": 0,
+                "all_token_auth_shadow_min_prob": 0.02,
             },
             {
                 "hotkey": "hk_code_b",
@@ -43,6 +51,10 @@ def _archive(window=10):
                 "code_semantic_auth_min_prob": 8e-7,
                 "code_semantic_auth_positive_findings": 0,
                 "code_semantic_auth_positive_min_prob": None,
+                "all_token_auth_shadow_findings": 2,
+                "all_token_auth_shadow_min_prob": 7e-7,
+                "all_token_auth_shadow_positive_findings": 0,
+                "all_token_auth_shadow_positive_min_prob": None,
             },
         ],
     }
@@ -86,6 +98,26 @@ def test_summarize_archives_can_exclude_runners_up():
     assert "hk_code_b" not in data["by_hotkey"]
 
 
+def test_summarize_archives_can_read_all_token_shadow_surface():
+    summary = summarize_archives(
+        [_archive()],
+        field_prefix="all_token_auth_shadow",
+    )
+    data = summary.as_dict()
+
+    assert data["entries_matching_env"] == 3
+    assert data["selected"]["flagged_submissions"] == 1
+    assert data["selected"]["findings"] == 3
+    assert data["selected"]["min_prob"] == 4e-7
+    assert data["selected"]["positive_findings"] == 2
+    assert data["selected"]["positive_min_prob"] == 5e-6
+    assert data["runners_up"]["submissions"] == 2
+    assert data["runners_up"]["flagged_submissions"] == 1
+    assert data["runners_up"]["findings"] == 2
+    assert data["runners_up"]["min_prob"] == 7e-7
+    assert data["by_hotkey"]["hk_code_b"]["findings"] == 2
+
+
 def test_format_text_report_includes_recommendation():
     summary = summarize_archives([_archive()])
     report = format_text_report(summary, top_n=1)
@@ -96,6 +128,21 @@ def test_format_text_report_includes_recommendation():
     assert "positive_findings=1" in report
     assert "hk_code_a" in report
     assert "shadow findings present" in report
+
+
+def test_format_text_report_accepts_custom_surface_title():
+    summary = summarize_archives(
+        [_archive()],
+        field_prefix="all_token_auth_shadow",
+    )
+    report = format_text_report(
+        summary,
+        top_n=1,
+        title="All-token argmax-shadow report",
+    )
+
+    assert "All-token argmax-shadow report" in report
+    assert "findings=5" in report
 
 
 def test_load_archives_from_json_and_gzip_paths(tmp_path):

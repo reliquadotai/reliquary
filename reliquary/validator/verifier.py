@@ -674,6 +674,61 @@ def evaluate_token_authenticity(
     return True, {}
 
 
+def evaluate_all_token_auth_shadow(
+    proof: "ProofResult",
+    *,
+    threshold: float | None = None,
+    argmax_conf: float | None = None,
+) -> tuple[bool, dict]:
+    """Aggregate all-token argmax-gated authenticity shadow check.
+
+    This observes the broader detector proposed for plausible token edits:
+    a chosen completion token below ``threshold`` is suspicious only when the
+    validator model was highly confident in a different argmax. It returns
+    aggregate metrics only; callers can archive counts/minima without exposing
+    exact positions in public R2 data.
+    """
+    from reliquary.constants import (
+        ALL_TOKEN_AUTH_SHADOW_ARGMAX_CONF,
+        ALL_TOKEN_AUTH_SHADOW_THRESHOLD,
+    )
+
+    if threshold is None:
+        threshold = ALL_TOKEN_AUTH_SHADOW_THRESHOLD
+    if argmax_conf is None:
+        argmax_conf = ALL_TOKEN_AUTH_SHADOW_ARGMAX_CONF
+    chosen = proof.completion_chosen_probs
+    amax = proof.completion_argmax_probs
+    if not chosen or not amax:
+        return True, {}
+
+    n = min(len(chosen), len(amax))
+    if n <= 0:
+        return True, {}
+
+    min_prob: float | None = None
+    findings = 0
+    finding_min_prob: float | None = None
+    for j in range(n):
+        p = float(chosen[j])
+        if min_prob is None or p < min_prob:
+            min_prob = p
+        if p < threshold and float(amax[j]) >= argmax_conf:
+            findings += 1
+            if finding_min_prob is None or p < finding_min_prob:
+                finding_min_prob = p
+
+    metrics = {
+        "n_tokens": n,
+        "min_prob": min_prob,
+        "threshold": float(threshold),
+        "argmax_conf": float(argmax_conf),
+        "findings": findings,
+        "finding_min_prob": finding_min_prob,
+    }
+    return (findings == 0), metrics
+
+
 _CODE_FENCE_RE = re.compile(
     r"(```|~~~)(?:python3?|py)?\s*\n(.*?)\n\1",
     re.DOTALL,

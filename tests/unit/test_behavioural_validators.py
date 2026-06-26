@@ -539,6 +539,40 @@ def test_token_authenticity_high_entropy_honest_passes():
     assert ok is True
 
 
+def test_all_token_auth_shadow_flags_confident_midrange_edit():
+    proof = _proof_with_token_stats(
+        [1.0, 2.0e-6, 1.0],
+        [1.0, 0.995, 1.0],
+    )
+    ok, metrics = verifier.evaluate_all_token_auth_shadow(
+        proof,
+        threshold=1.0e-5,
+        argmax_conf=0.99,
+    )
+
+    assert ok is False
+    assert metrics["findings"] == 1
+    assert metrics["min_prob"] == pytest.approx(2.0e-6)
+    assert metrics["finding_min_prob"] == pytest.approx(2.0e-6)
+
+
+def test_all_token_auth_shadow_ignores_low_confidence_argmax():
+    proof = _proof_with_token_stats(
+        [1.0, 2.0e-6, 1.0],
+        [1.0, 0.30, 1.0],
+    )
+    ok, metrics = verifier.evaluate_all_token_auth_shadow(
+        proof,
+        threshold=1.0e-5,
+        argmax_conf=0.99,
+    )
+
+    assert ok is True
+    assert metrics["findings"] == 0
+    assert metrics["min_prob"] == pytest.approx(2.0e-6)
+    assert metrics["finding_min_prob"] is None
+
+
 def test_token_authenticity_empty_skips():
     ok, m = verifier.evaluate_token_authenticity(
         ProofResult(all_passed=True, passed=1, checked=1)
