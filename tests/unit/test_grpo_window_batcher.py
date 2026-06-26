@@ -2155,6 +2155,58 @@ def test_accept_boxed_answer_high_prob():
     assert resp.reason != RejectReason.BOXED_ANSWER_TAMPERED
 
 
+def test_opencode_semantic_auth_shadow_records_without_rejecting():
+    class _CodeTokenizer:
+        eos_token_id = 9999
+
+        def decode(self, ids, *, skip_special_tokens=False):
+            return "".join(chr(int(i)) for i in ids if int(i) != self.eos_token_id)
+
+    prompt = [10, 11, 12, 13]
+    body = (
+        "```python\n"
+        "def second_largest(nums):\n"
+        "    return sorted(set(nums), reverse=False)[-2]\n"
+        "```"
+    )
+    completion = [ord(c) for c in body] + [_CodeTokenizer.eos_token_id]
+    tokens = prompt + completion
+    probs = [0.99] * len(completion)
+    probs[body.index("False")] = 2.0e-4
+
+    class _LongCtxModel:
+        class config:
+            vocab_size = 20000
+            max_position_embeddings = 4096
+
+    b = _make_batcher(
+        env=PrivateRewardFakeEnv(),
+        model=_LongCtxModel(),
+        tokenizer=_CodeTokenizer(),
+        verify_commitment_proofs_fn=_grail_with_chosen_probs(
+            len(tokens), probs, prompt_length=len(prompt),
+        ),
+    )
+    req = _request()
+    for idx, rollout in enumerate(req.rollouts):
+        commit = _make_commit(
+            tokens=tokens,
+            prompt_length=len(prompt),
+            success=idx < 4,
+            total_reward=1.0 if idx < 4 else 0.0,
+        )
+        rollout.commit = commit
+        rollout.tokens = commit["tokens"]
+        rollout.env_name = "opencodeinstruct"
+
+    resp = b.accept_submission(req)
+
+    assert resp.accepted is True
+    sub = b.valid_submissions()[0]
+    assert sub.code_semantic_auth_findings == M_ROLLOUTS
+    assert sub.code_semantic_auth_min_prob == pytest.approx(2.0e-4)
+
+
 def test_cap_truncated_rollout_still_runs_behavioural_checks():
     """Regression: cap-truncated rollouts are budget-tolerated for termination
     but MUST still pass logprob/distribution/boxed integrity checks.

@@ -546,6 +546,127 @@ def test_token_authenticity_empty_skips():
     assert ok is True and m == {}
 
 
+def _code_semantic_proof(
+    completion: str,
+    low_positions: dict[int, float],
+    *,
+    argmax=1.0,
+):
+    probs = [0.99] * len(completion)
+    argmax_probs = [argmax] * len(completion)
+    for pos, p in low_positions.items():
+        probs[pos] = p
+    return ProofResult(
+        all_passed=True, passed=1, checked=1, has_sparse_outputs=True,
+        completion_chosen_probs=probs,
+        completion_argmax_probs=argmax_probs,
+    )
+
+
+def test_code_semantic_auth_flags_keyword_bool_edit():
+    completion = (
+        "```python\n"
+        "def second_largest(nums):\n"
+        "    sorted_unique = sorted(set(nums), reverse=False)\n"
+        "    return sorted_unique[-2]\n"
+        "```"
+    )
+    prompt_len = 5
+    tokens = [0] * prompt_len + _ords(completion)
+    false_pos = completion.index("False")
+    proof = _code_semantic_proof(completion, {false_pos: 2.0e-4})
+
+    ok, metrics = verifier.evaluate_code_semantic_token_authenticity(
+        tokens=tokens,
+        prompt_length=prompt_len,
+        completion_length=len(completion),
+        proof=proof,
+        tokenizer=_CharTokenizer(),
+        threshold=0.001,
+    )
+
+    assert ok is False
+    assert metrics["findings"] == 1
+    assert metrics["first_label"] == "keyword:reverse"
+    assert metrics["first_token_text"] == "F"
+
+
+def test_code_semantic_auth_flags_compare_operator_edit():
+    completion = (
+        "```python\n"
+        "def merge_sorted_lists(list1, list2):\n"
+        "    result = []\n"
+        "    i, j = 0, 0\n"
+        "    if j > len(list2):\n"
+        "        result.append(list2[j])\n"
+        "    return result\n"
+        "```"
+    )
+    prompt_len = 3
+    tokens = [0] * prompt_len + _ords(completion)
+    op_pos = completion.index(">")
+    proof = _code_semantic_proof(completion, {op_pos: 8.0e-7})
+
+    ok, metrics = verifier.evaluate_code_semantic_token_authenticity(
+        tokens=tokens,
+        prompt_length=prompt_len,
+        completion_length=len(completion),
+        proof=proof,
+        tokenizer=_CharTokenizer(),
+        threshold=0.001,
+    )
+
+    assert ok is False
+    assert metrics["findings"] == 1
+    assert metrics["first_label"] == "compare_op"
+    assert metrics["first_token_text"] == ">"
+
+
+def test_code_semantic_auth_low_prob_without_confident_argmax_passes():
+    completion = (
+        "```python\n"
+        "def f(x):\n"
+        "    return sorted(x, reverse=False)\n"
+        "```"
+    )
+    prompt_len = 2
+    tokens = [0] * prompt_len + _ords(completion)
+    false_pos = completion.index("False")
+    proof = _code_semantic_proof(completion, {false_pos: 2.0e-4}, argmax=0.30)
+
+    ok, metrics = verifier.evaluate_code_semantic_token_authenticity(
+        tokens=tokens,
+        prompt_length=prompt_len,
+        completion_length=len(completion),
+        proof=proof,
+        tokenizer=_CharTokenizer(),
+        threshold=0.001,
+        argmax_conf=0.99,
+    )
+
+    assert ok is True
+    assert metrics["findings"] == 0
+
+
+def test_code_semantic_auth_ignores_non_code_text():
+    completion = "I cannot solve this one without writing code."
+    prompt_len = 4
+    tokens = [0] * prompt_len + _ords(completion)
+    proof = _code_semantic_proof(completion, {3: 1.0e-9})
+
+    ok, metrics = verifier.evaluate_code_semantic_token_authenticity(
+        tokens=tokens,
+        prompt_length=prompt_len,
+        completion_length=len(completion),
+        proof=proof,
+        tokenizer=_CharTokenizer(),
+        threshold=0.001,
+    )
+
+    assert ok is True
+    assert metrics == {}
+
+
 def test_gpu_completion_token_stats_returns_chosen_and_argmax():
     # 2 completion positions, vocab 4. Build logits so argmax is known.
     seq_len = 3

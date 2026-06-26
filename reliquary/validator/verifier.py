@@ -4,7 +4,9 @@ The orchestration lives in `reliquary.validator.batcher`. This module only
 exposes the per-commit checks that touch the model or the signature scheme.
 """
 
+import ast
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -19,6 +21,13 @@ from reliquary.constants import (
 from reliquary.shared.modeling import resolve_eos_token_ids
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _CodeSemanticSpan:
+    start: int
+    end: int
+    label: str
 
 
 @dataclass
@@ -665,6 +674,320 @@ def evaluate_token_authenticity(
     return True, {}
 
 
+_CODE_FENCE_RE = re.compile(
+    r"(```|~~~)(?:python3?|py)?\s*\n(.*?)\n\1",
+    re.DOTALL,
+)
+_COMPARE_OP_RE = re.compile(
+    r"\bnot\s+in\b|\bis\s+not\b|==|!=|<=|>=|<|>|\bis\b|\bin\b"
+)
+_BINOP_RE = re.compile(r"\*\*|//|<<|>>|[@+\-*/%&|^]")
+_BOOLOP_RE = re.compile(r"\b(?:and|or)\b")
+_UNARYOP_RE = re.compile(r"\bnot\b|[+\-~]")
+
+
+def _extract_python_span(completion: str) -> tuple[str, int, int] | None:
+    """Return ``(code, start, end)`` for the last Python code block.
+
+    Falls back to the raw completion only when it parses as Python. OpenCode
+    completions normally fence the answer, but accepting raw code keeps this
+    shadow check useful for simpler local tests and miner outputs.
+    """
+    if not completion:
+        return None
+    matches = list(_CODE_FENCE_RE.finditer(completion))
+    if matches:
+        m = matches[-1]
+        return m.group(2), m.start(2), m.end(2)
+    try:
+        ast.parse(completion)
+    except SyntaxError:
+        return None
+    return completion, 0, len(completion)
+
+
+def _line_offsets(source: str) -> list[int]:
+    offsets = [0]
+    for line in source.splitlines(keepends=True):
+        offsets.append(offsets[-1] + len(line))
+    return offsets
+
+
+def _node_span(
+    source: str,
+    offsets: list[int],
+    node: ast.AST,
+) -> tuple[int, int] | None:
+    lineno = getattr(node, "lineno", None)
+    end_lineno = getattr(node, "end_lineno", None)
+    col = getattr(node, "col_offset", None)
+    end_col = getattr(node, "end_col_offset", None)
+    if None in (lineno, end_lineno, col, end_col):
+        return None
+    if (
+        lineno < 1
+        or end_lineno < 1
+        or lineno >= len(offsets)
+        or end_lineno >= len(offsets)
+    ):
+        return None
+    start = offsets[lineno - 1] + int(col)
+    end = offsets[end_lineno - 1] + int(end_col)
+    if 0 <= start < end <= len(source):
+        return start, end
+    return None
+
+
+def _add_span(
+    spans: list[_CodeSemanticSpan],
+    seen: set[tuple[int, int, str]],
+    start: int,
+    end: int,
+    label: str,
+) -> None:
+    if start < 0 or end <= start:
+        return
+    key = (start, end, label)
+    if key not in seen:
+        seen.add(key)
+        spans.append(_CodeSemanticSpan(start, end, label))
+
+
+def _add_between_operator_span(
+    source: str,
+    spans: list[_CodeSemanticSpan],
+    seen: set[tuple[int, int, str]],
+    start: int,
+    end: int,
+    pattern: re.Pattern,
+    label: str,
+) -> None:
+    if end <= start:
+        return
+    fragment = source[start:end]
+    match = pattern.search(fragment)
+    if match is None:
+        return
+    _add_span(spans, seen, start + match.start(), start + match.end(), label)
+
+
+def _constant_label(value: Any) -> str | None:
+    if isinstance(value, bool):
+        return "constant:bool"
+    if value is None:
+        return "constant:none"
+    if isinstance(value, (int, float, complex)) and not isinstance(value, bool):
+        return "constant:number"
+    if isinstance(value, str):
+        return "constant:string"
+    return None
+
+
+def _code_semantic_spans(source: str) -> list[_CodeSemanticSpan]:
+    """AST-sensitive spans where a tiny edit can flip OpenCode reward.
+
+    These spans are deliberately broader than a final enforcement policy should
+    be; the caller uses them for shadow telemetry first. Calibration can then
+    decide which labels are safe to hard-reject.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    offsets = _line_offsets(source)
+    spans: list[_CodeSemanticSpan] = []
+    seen: set[tuple[int, int, str]] = set()
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Compare):
+            left_span = _node_span(source, offsets, node.left)
+            for comparator in node.comparators:
+                right_span = _node_span(source, offsets, comparator)
+                if left_span is not None and right_span is not None:
+                    _add_between_operator_span(
+                        source, spans, seen,
+                        left_span[1], right_span[0],
+                        _COMPARE_OP_RE, "compare_op",
+                    )
+                left_span = right_span
+        elif isinstance(node, ast.BinOp):
+            left_span = _node_span(source, offsets, node.left)
+            right_span = _node_span(source, offsets, node.right)
+            if left_span is not None and right_span is not None:
+                _add_between_operator_span(
+                    source, spans, seen,
+                    left_span[1], right_span[0],
+                    _BINOP_RE, "binary_op",
+                )
+        elif isinstance(node, ast.BoolOp):
+            value_spans = [
+                span for value in node.values
+                if (span := _node_span(source, offsets, value)) is not None
+            ]
+            for left, right in zip(value_spans, value_spans[1:]):
+                _add_between_operator_span(
+                    source, spans, seen,
+                    left[1], right[0],
+                    _BOOLOP_RE, "bool_op",
+                )
+        elif isinstance(node, ast.UnaryOp):
+            node_span = _node_span(source, offsets, node)
+            operand_span = _node_span(source, offsets, node.operand)
+            if node_span is not None and operand_span is not None:
+                _add_between_operator_span(
+                    source, spans, seen,
+                    node_span[0], operand_span[0],
+                    _UNARYOP_RE, "unary_op",
+                )
+        elif isinstance(node, ast.keyword):
+            value_span = _node_span(source, offsets, node.value)
+            if value_span is not None:
+                label = f"keyword:{node.arg or 'unpack'}"
+                _add_span(spans, seen, value_span[0], value_span[1], label)
+        elif isinstance(node, ast.Constant):
+            label = _constant_label(node.value)
+            node_span = _node_span(source, offsets, node)
+            if label is not None and node_span is not None:
+                _add_span(spans, seen, node_span[0], node_span[1], label)
+        elif isinstance(node, ast.Return) and node.value is not None:
+            value_span = _node_span(source, offsets, node.value)
+            if value_span is not None:
+                _add_span(spans, seen, value_span[0], value_span[1], "return_expr")
+        elif isinstance(node, ast.Subscript):
+            slice_span = _node_span(source, offsets, node.slice)
+            if slice_span is not None:
+                _add_span(spans, seen, slice_span[0], slice_span[1], "subscript_slice")
+
+    return spans
+
+
+def _completion_token_offsets(
+    completion_tokens: list[int],
+    tokenizer: Any,
+) -> tuple[str, list[tuple[int, int]]]:
+    offsets: list[tuple[int, int]] = []
+    text = ""
+    for tok in completion_tokens:
+        frag = tokenizer.decode([int(tok)], skip_special_tokens=False)
+        offsets.append((len(text), len(text) + len(frag)))
+        text += frag
+    return text, offsets
+
+
+def _span_priority(span: _CodeSemanticSpan) -> tuple[int, int, str]:
+    label = span.label
+    if label.startswith("keyword:") or label.endswith("_op"):
+        label_priority = 0
+    elif label in {"subscript_slice", "constant:bool", "constant:number"}:
+        label_priority = 1
+    else:
+        label_priority = 2
+    return (span.end - span.start, label_priority, label)
+
+
+def evaluate_code_semantic_token_authenticity(
+    tokens: list[int],
+    prompt_length: int,
+    completion_length: int,
+    proof: "ProofResult",
+    tokenizer: Any,
+    *,
+    threshold: float | None = None,
+    argmax_conf: float | None = None,
+) -> tuple[bool, dict]:
+    """Shadow check for post-hoc edits to OpenCode semantic tokens.
+
+    Generic token auth is intentionally tuned for near-impossible injections.
+    Code reward, however, can flip on plausible alternate tokens such as
+    ``True``/``False``, comparison operators, or keyword values like
+    ``reverse=True``. This helper maps AST-sensitive spans back to completion
+    tokens and flags low-probability chosen tokens only when the model was
+    confident of a different argmax.
+
+    Returns ``(ok, metrics)``. ``ok=False`` means suspicious telemetry was
+    found; callers may keep this in shadow mode by logging/archive only.
+    """
+    from reliquary.constants import (
+        CODE_SEMANTIC_AUTH_ARGMAX_CONF,
+        CODE_SEMANTIC_AUTH_THRESHOLD,
+    )
+
+    if threshold is None:
+        threshold = CODE_SEMANTIC_AUTH_THRESHOLD
+    if argmax_conf is None:
+        argmax_conf = CODE_SEMANTIC_AUTH_ARGMAX_CONF
+    if completion_length <= 0 or tokenizer is None:
+        return True, {}
+    probs = proof.completion_chosen_probs
+    amax = proof.completion_argmax_probs
+    if not probs or not amax:
+        return True, {}
+
+    completion_tokens = list(tokens[prompt_length: prompt_length + completion_length])
+    completion_text, offsets = _completion_token_offsets(completion_tokens, tokenizer)
+    extracted = _extract_python_span(completion_text)
+    if extracted is None:
+        return True, {}
+    code, code_start, _code_end = extracted
+    spans = _code_semantic_spans(code)
+    if not spans:
+        return True, {}
+
+    semantic_by_pos: dict[int, str] = {}
+    for span in sorted(spans, key=_span_priority):
+        start = code_start + span.start
+        end = code_start + span.end
+        for pos, (tok_start, tok_end) in enumerate(offsets):
+            if tok_end <= start or tok_start >= end:
+                continue
+            semantic_by_pos.setdefault(pos, span.label)
+
+    if not semantic_by_pos:
+        return True, {}
+
+    selected: list[float] = []
+    findings: list[dict[str, Any]] = []
+    n = min(len(probs), len(amax), len(completion_tokens))
+    for pos in sorted(semantic_by_pos):
+        if pos >= n:
+            continue
+        p = float(probs[pos])
+        selected.append(p)
+        if p < threshold and float(amax[pos]) >= argmax_conf:
+            findings.append({
+                "pos": pos,
+                "label": semantic_by_pos[pos],
+                "p_chosen": p,
+                "p_argmax": float(amax[pos]),
+                "token_id": int(completion_tokens[pos]),
+                "token_text": tokenizer.decode(
+                    [int(completion_tokens[pos])],
+                    skip_special_tokens=False,
+                )[:32],
+            })
+
+    if not selected:
+        return True, {}
+    metrics = {
+        "n_spans": len(spans),
+        "n_tokens": len(semantic_by_pos),
+        "min_prob": min(selected),
+        "threshold": float(threshold),
+        "findings": len(findings),
+    }
+    if findings:
+        first = findings[0]
+        metrics.update({
+            "first_pos": first["pos"],
+            "first_label": first["label"],
+            "first_p_chosen": first["p_chosen"],
+            "first_p_argmax": first["p_argmax"],
+            "first_token_id": first["token_id"],
+            "first_token_text": first["token_text"],
+        })
+    return (len(findings) == 0), metrics
+
+
 def _find_last_boxed_token_range(
     completion_tokens: list[int],
     tokenizer: Any,
@@ -797,7 +1120,12 @@ def _numeric_token_ids(tokenizer: Any) -> tuple[frozenset[int], frozenset[int]]:
         return cached
     digit_ids: set[int] = set()
     sign_ids: set[int] = set()
-    for tid in tokenizer.get_vocab().values():
+    get_vocab = getattr(tokenizer, "get_vocab", None)
+    if not callable(get_vocab):
+        out = (frozenset(), frozenset())
+        _NUMERIC_ID_CACHE[key] = out
+        return out
+    for tid in get_vocab().values():
         s = tokenizer.decode([int(tid)]).strip()
         if not s:
             continue
