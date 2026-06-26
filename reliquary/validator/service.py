@@ -1213,6 +1213,18 @@ class ValidationService:
                     "sketch_diff_max": s.sketch_diff_max,
                     "lp_dev_max": s.lp_dev_max,
                     "dist_q10_min": s.dist_q10_min,
+                    "all_token_auth_shadow_findings": getattr(
+                        s, "all_token_auth_shadow_findings", 0
+                    ),
+                    "all_token_auth_shadow_min_prob": getattr(
+                        s, "all_token_auth_shadow_min_prob", None
+                    ),
+                    "all_token_auth_shadow_positive_findings": getattr(
+                        s, "all_token_auth_shadow_positive_findings", 0
+                    ),
+                    "all_token_auth_shadow_positive_min_prob": getattr(
+                        s, "all_token_auth_shadow_positive_min_prob", None
+                    ),
                     "code_semantic_auth_findings": getattr(
                         s, "code_semantic_auth_findings", 0
                     ),
@@ -1245,6 +1257,18 @@ class ValidationService:
                     "sketch_diff_max": s.sketch_diff_max,
                     "lp_dev_max": s.lp_dev_max,
                     "dist_q10_min": s.dist_q10_min,
+                    "all_token_auth_shadow_findings": getattr(
+                        s, "all_token_auth_shadow_findings", 0
+                    ),
+                    "all_token_auth_shadow_min_prob": getattr(
+                        s, "all_token_auth_shadow_min_prob", None
+                    ),
+                    "all_token_auth_shadow_positive_findings": getattr(
+                        s, "all_token_auth_shadow_positive_findings", 0
+                    ),
+                    "all_token_auth_shadow_positive_min_prob": getattr(
+                        s, "all_token_auth_shadow_positive_min_prob", None
+                    ),
                     "code_semantic_auth_findings": getattr(
                         s, "code_semantic_auth_findings", 0
                     ),

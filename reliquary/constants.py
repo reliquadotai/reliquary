@@ -621,6 +621,14 @@ TOKEN_AUTH_ARGMAX_CONF = 0.99
 # shadow logs confirm zero false positives.
 TOKEN_AUTH_ENFORCE = True
 
+# All-token argmax-gated authenticity shadow surface. This is the broad
+# candidate detector for plausible token edits: chosen probability below this
+# threshold only counts when the validator model was highly confident in a
+# different argmax. It is deliberately archive-only telemetry for now; keep
+# TOKEN_AUTH_THRESHOLD/TOKEN_AUTH_ENFORCE as the live rejection gate.
+ALL_TOKEN_AUTH_SHADOW_THRESHOLD = 1e-5
+ALL_TOKEN_AUTH_SHADOW_ARGMAX_CONF = TOKEN_AUTH_ARGMAX_CONF
+
 # OpenCode semantic-token authenticity shadow gate. Generic token auth catches
 # near-impossible injections, and numeric auth catches many literal edits, but
 # plausible code edits can live at probabilities far above 1e-10. In shadow
