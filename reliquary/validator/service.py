@@ -1219,6 +1219,12 @@ class ValidationService:
                     "code_semantic_auth_min_prob": getattr(
                         s, "code_semantic_auth_min_prob", None
                     ),
+                    "code_semantic_auth_positive_findings": getattr(
+                        s, "code_semantic_auth_positive_findings", 0
+                    ),
+                    "code_semantic_auth_positive_min_prob": getattr(
+                        s, "code_semantic_auth_positive_min_prob", None
+                    ),
                     **_submission_obs_payload(s, batcher),
                 })
 
@@ -1244,6 +1250,12 @@ class ValidationService:
                     ),
                     "code_semantic_auth_min_prob": getattr(
                         s, "code_semantic_auth_min_prob", None
+                    ),
+                    "code_semantic_auth_positive_findings": getattr(
+                        s, "code_semantic_auth_positive_findings", 0
+                    ),
+                    "code_semantic_auth_positive_min_prob": getattr(
+                        s, "code_semantic_auth_positive_min_prob", None
                     ),
                     **obs,
                 }

@@ -19,6 +19,8 @@ def _archive(window=10):
                 "env_name": "opencodeinstruct",
                 "code_semantic_auth_findings": 2,
                 "code_semantic_auth_min_prob": 0.0002,
+                "code_semantic_auth_positive_findings": 1,
+                "code_semantic_auth_positive_min_prob": 0.0003,
             },
             {
                 "hotkey": "hk_math",
@@ -39,6 +41,8 @@ def _archive(window=10):
                 "env_name": "opencodeinstruct",
                 "code_semantic_auth_findings": 1,
                 "code_semantic_auth_min_prob": 8e-7,
+                "code_semantic_auth_positive_findings": 0,
+                "code_semantic_auth_positive_min_prob": None,
             },
         ],
     }
@@ -55,14 +59,19 @@ def test_summarize_archives_filters_env_and_counts_selected_and_runners_up():
     assert data["selected"]["flagged_submissions"] == 1
     assert data["selected"]["findings"] == 2
     assert data["selected"]["min_prob"] == 0.0002
+    assert data["selected"]["positive_findings"] == 1
+    assert data["selected"]["positive_min_prob"] == 0.0003
     assert data["runners_up"]["submissions"] == 2
     assert data["runners_up"]["flagged_submissions"] == 1
     assert data["runners_up"]["findings"] == 1
     assert data["runners_up"]["min_prob"] == 8e-7
     assert data["by_hotkey"]["hk_code_a"]["submissions"] == 2
     assert data["by_hotkey"]["hk_code_a"]["findings"] == 2
+    assert data["by_hotkey"]["hk_code_a"]["positive_findings"] == 1
     assert data["by_hotkey"]["hk_code_b"]["findings"] == 1
+    assert data["by_hotkey"]["hk_code_b"]["positive_findings"] == 0
     assert data["by_window"]["10"]["findings"] == 3
+    assert data["by_window"]["10"]["positive_findings"] == 1
 
 
 def test_summarize_archives_can_exclude_runners_up():
@@ -72,6 +81,7 @@ def test_summarize_archives_can_exclude_runners_up():
     assert data["entries_seen"] == 2
     assert data["entries_matching_env"] == 1
     assert data["selected"]["findings"] == 2
+    assert data["selected"]["positive_findings"] == 1
     assert data["runners_up"]["submissions"] == 0
     assert "hk_code_b" not in data["by_hotkey"]
 
@@ -83,6 +93,7 @@ def test_format_text_report_includes_recommendation():
     assert "OpenCode semantic-token shadow report" in report
     assert "opencode_entries: 3" in report
     assert "flagged=2" in report
+    assert "positive_findings=1" in report
     assert "hk_code_a" in report
     assert "shadow findings present" in report
 

@@ -123,6 +123,8 @@ class ValidSubmission:
     dist_q10_min: float | None = None
     code_semantic_auth_findings: int = 0
     code_semantic_auth_min_prob: float | None = None
+    code_semantic_auth_positive_findings: int = 0
+    code_semantic_auth_positive_min_prob: float | None = None
     # Miner-claimed checkpoint hash at submit time — useful for post-hoc
     # forensic analysis of who lied about their checkpoint.
     claimed_checkpoint_hash: str = ""
@@ -883,6 +885,8 @@ class GrpoWindowBatcher:
         dist_q10_min: float | None = None
         code_semantic_auth_findings = 0
         code_semantic_auth_min_prob: float | None = None
+        code_semantic_auth_positive_findings = 0
+        code_semantic_auth_positive_min_prob: float | None = None
 
         # Cap/non-EOS truncation is tolerated only as a rare one-rollout
         # accident. Multiple missing-EOS rollouts in the same group are a
@@ -1083,6 +1087,9 @@ class GrpoWindowBatcher:
                         tokenizer=self.tokenizer,
                     )
                 )
+                rollout_reward_positive = float(
+                    getattr(rollout, "reward", 0.0) or 0.0
+                ) > 0.0
                 if code_auth_metrics:
                     findings = int(code_auth_metrics.get("findings", 0) or 0)
                     code_semantic_auth_findings += findings
@@ -1094,13 +1101,25 @@ class GrpoWindowBatcher:
                             or p < code_semantic_auth_min_prob
                         ):
                             code_semantic_auth_min_prob = p
+                    if rollout_reward_positive:
+                        code_semantic_auth_positive_findings += findings
+                        if findings > 0 and min_prob is not None:
+                            p = float(min_prob)
+                            if (
+                                code_semantic_auth_positive_min_prob is None
+                                or p < code_semantic_auth_positive_min_prob
+                            ):
+                                code_semantic_auth_positive_min_prob = p
                 if not code_auth_ok:
                     logger.info(
-                        "code_semantic_token_suspicious hotkey=%s enforce=%s %s",
-                        request.miner_hotkey, CODE_SEMANTIC_AUTH_ENFORCE,
+                        "code_semantic_token_suspicious hotkey=%s enforce=%s "
+                        "reward_positive=%s %s",
+                        request.miner_hotkey,
+                        CODE_SEMANTIC_AUTH_ENFORCE,
+                        rollout_reward_positive,
                         code_auth_metrics,
                     )
-                    if CODE_SEMANTIC_AUTH_ENFORCE:
+                    if CODE_SEMANTIC_AUTH_ENFORCE and rollout_reward_positive:
                         return reject(
                             RejectReason.TOKEN_TAMPERED,
                             "code_semantic_auth",
@@ -1139,6 +1158,12 @@ class GrpoWindowBatcher:
             dist_q10_min=dist_q10_min,
             code_semantic_auth_findings=code_semantic_auth_findings,
             code_semantic_auth_min_prob=code_semantic_auth_min_prob,
+            code_semantic_auth_positive_findings=(
+                code_semantic_auth_positive_findings
+            ),
+            code_semantic_auth_positive_min_prob=(
+                code_semantic_auth_positive_min_prob
+            ),
             claimed_checkpoint_hash=request.checkpoint_hash,
             rollout_hashes=rollout_hashes,
             drand_round=request.drand_round,

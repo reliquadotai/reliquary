@@ -4,11 +4,14 @@ FROM ${GRADER_PY_IMAGE} AS grader-rootfs
 
 FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu24.04
 
+ARG RELIQUARY_BUILD_REVISION=unknown
+
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    RELIQUARY_BUILD_REVISION=${RELIQUARY_BUILD_REVISION}
 
 RUN apt-get update -qq && apt-get install -y -qq \
         python3.12 python3.12-venv python3-pip \

@@ -271,6 +271,17 @@ def log_submission_stage(
 @lru_cache(maxsize=1)
 def runtime_revision() -> str | None:
     """Best-effort deployed revision without reading any secret env vars."""
+    # Prefer the immutable image-baked revision over deployment env overrides:
+    # watchtower preserves container env across image updates, so old compose
+    # values like RELIQUARY_IMAGE_REVISION can become stale.
+    for name in (
+        "RELIQUARY_BUILD_REVISION",
+        "RELIQUARY_IMAGE_BUILD_REVISION",
+    ):
+        value = os.getenv(name)
+        if value and value != "unknown":
+            return value[:40]
+
     for name in (
         "RELIQUARY_IMAGE_REVISION",
         "RELIQUARY_GIT_SHA",
