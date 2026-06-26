@@ -78,6 +78,11 @@ def _normalize_answer(s: str) -> str:
         s = s.replace(macro, "")
     s = s.replace(r"\left", "").replace(r"\right", "")
     s = s.replace(r"\dfrac", r"\frac").replace(r"\tfrac", r"\frac")
+    # Strip unit decorations so a value with units matches the bare value
+    # ("119^\circ" == "119"). These never carry numeric meaning for grading.
+    s = re.sub(r"\^\s*\{?\s*\\circ\s*\}?", "", s)
+    s = (s.replace(r"\circ", "").replace(r"\degree", "")
+          .replace(r"\%", "").replace("%", ""))
     s = _TEXT_RE.sub(r"\1", s)
     s = _MBOX_RE.sub(r"\1", s)
     s = s.replace(r"\$", "").replace("$", "")
@@ -214,13 +219,46 @@ def _latex_value_equal(candidate: str, gt: str) -> bool:
     return abs(vc - vg) <= 1e-9 * (1 + abs(vg))
 
 
+def _split_structure(s: str) -> Optional[tuple[str, list[str]]]:
+    """Return ``(signature, ordered elements)`` for a matrix/vector/tuple, else None.
+
+    The signature includes matrix dimensions or the opening delimiter
+    (``(`` / ``[``). Two answers only compare element-wise when their signatures
+    match, so a row vector never matches a column vector and an open ``(a,b)``
+    interval/point never matches a closed ``[a,b]`` one. Scalars return None.
+    """
+    m = re.search(r"\\begin\{[bp]?matrix\}(.*?)\\end\{[bp]?matrix\}", s, re.S)
+    if m:
+        rows = [
+            [c.strip() for c in row.split("&") if c.strip()]
+            for row in m.group(1).split(r"\\")
+        ]
+        rows = [row for row in rows if row]
+        if not rows:
+            return None
+        width = len(rows[0])
+        if width == 0 or any(len(row) != width for row in rows):
+            return None
+        return f"matrix:{len(rows)}x{width}", [c for row in rows for c in row]
+    if len(s) >= 2 and s[0] in "([" and s[-1] in ")]" and "," in s:
+        return s[0], [x.strip() for x in s[1:-1].split(",")]
+    return None
+
+
 def _answers_equal(candidate: str, gt: str) -> bool:
     """Compare by value when both sides are numbers, else by normalized string.
 
     The prompt asks for a value, so any surface form of that value is correct
-    (trailing zeros, fraction vs decimal, \\frac{5721}{5} == 1144.2). Falls back
-    to LaTeX value-equality, then exact normalized-string match.
+    (trailing zeros, fraction vs decimal, \\frac{5721}{5} == 1144.2). Same-shape
+    structured answers (matrix/vector/tuple) compare element-wise by value;
+    scalars fall back to LaTeX value-equality, then exact normalized-string match.
     """
+    cs, gs = _split_structure(candidate), _split_structure(gt)
+    if cs is not None and gs is not None and cs[0] == gs[0]:
+        return len(cs[1]) == len(gs[1]) and all(
+            _answers_equal(_normalize_answer(a), _normalize_answer(b))
+            for a, b in zip(cs[1], gs[1])
+        )
     c, g = _as_number(candidate), _as_number(gt)
     if c is not None and g is not None:
         return c == g

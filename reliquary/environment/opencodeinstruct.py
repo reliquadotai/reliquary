@@ -68,6 +68,26 @@ def _load_dataset(repo: str, revision: str):
     return VirtualParquetDataset(repo, revision, columns=["input", "structured_cases"])
 
 
+def _contract_instruction(cases: list[dict]) -> str:
+    """The grader calls a named function and checks its RETURN value, but the raw
+    prompts are stdin/stdout-framed and rarely name the function. Append the exact
+    contract (name + "return, don't print") derived from the cases so the model
+    writes a callable returning function instead of guessing. Empty for non-
+    function entries (nothing to pin)."""
+    for case in cases:
+        entry = case.get("entry") or {}
+        name = entry.get("name")
+        if entry.get("kind") == "function" and name:
+            nargs = len(case.get("args") or [])
+            args = "argument" if nargs == 1 else "arguments"
+            return (
+                f"\n\nWrite your solution as a Python function named `{name}` that "
+                f"takes {nargs} {args} and returns the result; do not read from "
+                f"stdin or print."
+            )
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Environment class
 # ---------------------------------------------------------------------------
@@ -120,6 +140,9 @@ class OpenCodeInstructEnvironment:
         row = self._dataset[idx]
         prompt: str = row["input"]
         cases = self._row_cases(row)
+        # Pin the grader's function-call contract onto the prompt. Changes prompt
+        # tokens (GRAIL-bound), so a release shipping this must reach miners too.
+        prompt = prompt + _contract_instruction(cases)
         problem_id = hashlib.sha256(prompt.encode()).hexdigest()[:16]
         case_id = hashlib.sha256(
             (problem_id + json.dumps(cases, sort_keys=True, separators=(",", ":"))).encode()

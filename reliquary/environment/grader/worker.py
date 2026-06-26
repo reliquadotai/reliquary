@@ -156,6 +156,48 @@ def _call_graph_roots(code: str, fn_names: set[str]) -> set[str]:
     return set(fn_names) - called_by_others
 
 
+def _returns_a_value(code: str, name: str) -> bool:
+    """True if top-level function *name* has a ``return <expr>`` (not bare/None).
+
+    A print-only or None-returning function can never match a return-value case,
+    so it is never the graded entry. Unparseable code is treated as returning a
+    value so analysis failure never excludes a real solution.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return True
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            visitor = _ValueReturnVisitor()
+            for stmt in node.body:
+                visitor.visit(stmt)
+            return visitor.has_value_return
+    return True
+
+
+class _ValueReturnVisitor(ast.NodeVisitor):
+    """Find value returns without descending into nested definitions."""
+
+    def __init__(self) -> None:
+        self.has_value_return = False
+
+    def visit_Return(self, node: ast.Return) -> None:
+        if node.value is not None and not (
+            isinstance(node.value, ast.Constant) and node.value.value is None
+        ):
+            self.has_value_return = True
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        return None
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        return None
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        return None
+
+
 def _resolve_function(ns: dict[str, Any], code: str, nargs: int) -> Any | None:
     """Resolve the entry function when the requested name is absent.
 
@@ -172,6 +214,11 @@ def _resolve_function(ns: dict[str, Any], code: str, nargs: int) -> Any | None:
     candidates = [name for name in order if _accepts_arity(ns[name], nargs)]
     if not candidates:
         return None
+    # Drop print-only / None-returning helpers when a value-returning one exists:
+    # they can never match a return-value case, so they are never the entry.
+    valued = [name for name in candidates if _returns_a_value(code, name)]
+    if valued:
+        candidates = valued
     if len(candidates) == 1:
         return ns[candidates[0]]
     roots = _call_graph_roots(code, set(order))
