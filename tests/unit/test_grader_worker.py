@@ -232,6 +232,29 @@ def test_call_skips_print_only_helper_defined_last():
     assert output == [[1]]  # the value-returning solution, not the printer
 
 
+def test_call_ignores_nested_return_inside_print_only_wrapper():
+    """A nested helper's return does not make the outer printer value-returning."""
+    from reliquary.environment.grader.worker import evaluate_call
+
+    code = (
+        "def solve(n):\n"
+        "    return n + 10\n"
+        "def display(n):\n"
+        "    def inner(x):\n"
+        "        return x + 1\n"
+        "    print(n)\n"
+    )
+    output, status = evaluate_call(
+        code,
+        {"kind": "function", "name": "missing"},
+        [1],
+        {},
+        timeout_s=5.0,
+    )
+    assert status == "ok"
+    assert output == 11
+
+
 def test_compile_tamper_fails_without_passing():
     from reliquary.environment.grader.worker import evaluate_call
 

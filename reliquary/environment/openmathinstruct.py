@@ -222,14 +222,24 @@ def _latex_value_equal(candidate: str, gt: str) -> bool:
 def _split_structure(s: str) -> Optional[tuple[str, list[str]]]:
     """Return ``(signature, ordered elements)`` for a matrix/vector/tuple, else None.
 
-    The signature is ``"matrix"`` or the opening delimiter (``(`` / ``[``). Two
-    answers only compare element-wise when their signatures match, so an open
-    ``(a,b)`` interval/point never matches a closed ``[a,b]`` one (the brackets
-    carry meaning). Scalars return None (handled by the scalar path).
+    The signature includes matrix dimensions or the opening delimiter
+    (``(`` / ``[``). Two answers only compare element-wise when their signatures
+    match, so a row vector never matches a column vector and an open ``(a,b)``
+    interval/point never matches a closed ``[a,b]`` one. Scalars return None.
     """
     m = re.search(r"\\begin\{[bp]?matrix\}(.*?)\\end\{[bp]?matrix\}", s, re.S)
     if m:
-        return "matrix", [c.strip() for row in m.group(1).split(r"\\") for c in row.split("&") if c.strip()]
+        rows = [
+            [c.strip() for c in row.split("&") if c.strip()]
+            for row in m.group(1).split(r"\\")
+        ]
+        rows = [row for row in rows if row]
+        if not rows:
+            return None
+        width = len(rows[0])
+        if width == 0 or any(len(row) != width for row in rows):
+            return None
+        return f"matrix:{len(rows)}x{width}", [c for row in rows for c in row]
     if len(s) >= 2 and s[0] in "([" and s[-1] in ")]" and "," in s:
         return s[0], [x.strip() for x in s[1:-1].split(",")]
     return None

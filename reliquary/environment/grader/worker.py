@@ -169,13 +169,33 @@ def _returns_a_value(code: str, name: str) -> bool:
         return True
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
-            return any(
-                isinstance(sub, ast.Return)
-                and sub.value is not None
-                and not (isinstance(sub.value, ast.Constant) and sub.value.value is None)
-                for sub in ast.walk(node)
-            )
+            visitor = _ValueReturnVisitor()
+            for stmt in node.body:
+                visitor.visit(stmt)
+            return visitor.has_value_return
     return True
+
+
+class _ValueReturnVisitor(ast.NodeVisitor):
+    """Find value returns without descending into nested definitions."""
+
+    def __init__(self) -> None:
+        self.has_value_return = False
+
+    def visit_Return(self, node: ast.Return) -> None:
+        if node.value is not None and not (
+            isinstance(node.value, ast.Constant) and node.value.value is None
+        ):
+            self.has_value_return = True
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        return None
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        return None
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        return None
 
 
 def _resolve_function(ns: dict[str, Any], code: str, nargs: int) -> Any | None:

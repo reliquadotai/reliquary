@@ -22,6 +22,24 @@ def test_matrix_elementwise_value_match():
     assert _eq(cand, gt)
 
 
+def test_matrix_shape_must_match():
+    assert not _eq(
+        r"\begin{pmatrix}1&2\end{pmatrix}",
+        r"\begin{pmatrix}1\\2\end{pmatrix}",
+    )
+    assert not _eq(
+        r"\begin{pmatrix}1&2\\3&4\end{pmatrix}",
+        r"\begin{pmatrix}1&2&3&4\end{pmatrix}",
+    )
+
+
+def test_same_shape_matrix_value_match():
+    assert _eq(
+        r"\begin{pmatrix}\frac{1}{2}&0.25\end{pmatrix}",
+        r"\begin{pmatrix}0.5&\frac{1}{4}\end{pmatrix}",
+    )
+
+
 def test_tuple_same_form_value_match():
     # Same container, decimal vs fraction per element.
     assert _eq("(0.5, 0.25)", "(1/2, 1/4)")
