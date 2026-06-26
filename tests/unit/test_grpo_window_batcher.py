@@ -2207,6 +2207,91 @@ def test_opencode_semantic_auth_shadow_records_without_rejecting():
     assert sub.code_semantic_auth_min_prob == pytest.approx(2.0e-4)
 
 
+def test_opencode_semantic_auth_enforce_ignores_zero_reward_rollout(monkeypatch):
+    import reliquary.validator.batcher as batcher_mod
+
+    monkeypatch.setattr(batcher_mod, "CODE_SEMANTIC_AUTH_ENFORCE", True)
+
+    def fake_code_auth(*, tokens, **_kwargs):
+        # Only the zero-reward rollout carries this sentinel token.
+        if 4242 in tokens:
+            return False, {"findings": 1, "min_prob": 2.0e-4}
+        return True, {"findings": 0, "min_prob": 0.5}
+
+    monkeypatch.setattr(
+        batcher_mod,
+        "evaluate_code_semantic_token_authenticity",
+        fake_code_auth,
+    )
+    monkeypatch.setattr(batcher_mod, "has_eos_padding", lambda *_args, **_kw: False)
+    monkeypatch.setattr(batcher_mod, "verify_termination", lambda *_args, **_kw: True)
+    monkeypatch.setattr(batcher_mod, "is_cap_truncation", lambda *_args, **_kw: False)
+
+    b = _make_batcher(
+        env=PrivateRewardFakeEnv(),
+        tokenizer=_CharTokenizerWithEos(),
+        verify_commitment_proofs_fn=_grail_with_chosen_probs(
+            CHALLENGE_K + 4,
+            [0.99] * CHALLENGE_K,
+        ),
+    )
+    req = _request()
+    for idx, rollout in enumerate(req.rollouts):
+        rollout.env_name = "opencodeinstruct"
+        if idx == len(req.rollouts) - 1:
+            rollout.tokens[0] = 4242
+            rollout.commit["tokens"][0] = 4242
+
+    resp = b.accept_submission(req)
+
+    assert resp.accepted is True
+    sub = b.valid_submissions()[0]
+    assert sub.code_semantic_auth_findings == 1
+    assert sub.code_semantic_auth_min_prob == pytest.approx(2.0e-4)
+
+
+def test_opencode_semantic_auth_enforce_rejects_positive_reward_rollout(
+    monkeypatch,
+):
+    import reliquary.validator.batcher as batcher_mod
+
+    monkeypatch.setattr(batcher_mod, "CODE_SEMANTIC_AUTH_ENFORCE", True)
+
+    def fake_code_auth(*, tokens, **_kwargs):
+        # First rollout is reward-positive in _request().
+        if 4242 in tokens:
+            return False, {"findings": 1, "min_prob": 2.0e-4}
+        return True, {"findings": 0, "min_prob": 0.5}
+
+    monkeypatch.setattr(
+        batcher_mod,
+        "evaluate_code_semantic_token_authenticity",
+        fake_code_auth,
+    )
+    monkeypatch.setattr(batcher_mod, "has_eos_padding", lambda *_args, **_kw: False)
+    monkeypatch.setattr(batcher_mod, "verify_termination", lambda *_args, **_kw: True)
+    monkeypatch.setattr(batcher_mod, "is_cap_truncation", lambda *_args, **_kw: False)
+
+    b = _make_batcher(
+        env=PrivateRewardFakeEnv(),
+        tokenizer=_CharTokenizerWithEos(),
+        verify_commitment_proofs_fn=_grail_with_chosen_probs(
+            CHALLENGE_K + 4,
+            [0.99] * CHALLENGE_K,
+        ),
+    )
+    req = _request()
+    for rollout in req.rollouts:
+        rollout.env_name = "opencodeinstruct"
+    req.rollouts[0].tokens[0] = 4242
+    req.rollouts[0].commit["tokens"][0] = 4242
+
+    resp = b.accept_submission(req)
+
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.TOKEN_TAMPERED
+
+
 def test_cap_truncated_rollout_still_runs_behavioural_checks():
     """Regression: cap-truncated rollouts are budget-tolerated for termination
     but MUST still pass logprob/distribution/boxed integrity checks.

@@ -1095,12 +1095,18 @@ class GrpoWindowBatcher:
                         ):
                             code_semantic_auth_min_prob = p
                 if not code_auth_ok:
+                    rollout_reward_positive = float(
+                        getattr(rollout, "reward", 0.0) or 0.0
+                    ) > 0.0
                     logger.info(
-                        "code_semantic_token_suspicious hotkey=%s enforce=%s %s",
-                        request.miner_hotkey, CODE_SEMANTIC_AUTH_ENFORCE,
+                        "code_semantic_token_suspicious hotkey=%s enforce=%s "
+                        "reward_positive=%s %s",
+                        request.miner_hotkey,
+                        CODE_SEMANTIC_AUTH_ENFORCE,
+                        rollout_reward_positive,
                         code_auth_metrics,
                     )
-                    if CODE_SEMANTIC_AUTH_ENFORCE:
+                    if CODE_SEMANTIC_AUTH_ENFORCE and rollout_reward_positive:
                         return reject(
                             RejectReason.TOKEN_TAMPERED,
                             "code_semantic_auth",
