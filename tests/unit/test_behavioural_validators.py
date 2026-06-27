@@ -556,6 +556,39 @@ def test_all_token_auth_shadow_flags_confident_midrange_edit():
     assert metrics["finding_min_prob"] == pytest.approx(2.0e-6)
 
 
+def test_all_token_auth_shadow_can_return_private_finding_details():
+    completion = "abcXdef"
+    tokens = _ords("pppp") + _ords(completion)
+    proof = _proof_with_token_stats(
+        [1.0, 1.0, 1.0, 2.0e-6, 1.0, 1.0, 1.0],
+        [1.0, 1.0, 1.0, 0.995, 1.0, 1.0, 1.0],
+        argmax_ids=[0, 0, 0, ord("Y"), 0, 0, 0],
+    )
+
+    ok, metrics = verifier.evaluate_all_token_auth_shadow(
+        proof,
+        threshold=1.0e-5,
+        argmax_conf=0.99,
+        tokens=tokens,
+        prompt_length=4,
+        completion_length=len(completion),
+        tokenizer=_CharTokenizer(),
+        include_findings=True,
+        context_chars=3,
+    )
+
+    assert ok is False
+    assert metrics["findings"] == 1
+    detail = metrics["finding_details"][0]
+    assert detail["completion_pos"] == 3
+    assert detail["absolute_token_pos"] == 7
+    assert detail["token_id"] == ord("X")
+    assert detail["token_text"] == "X"
+    assert detail["argmax_id"] == ord("Y")
+    assert detail["argmax_text"] == "Y"
+    assert detail["completion_context"] == "abcXdef"
+
+
 def test_all_token_auth_shadow_ignores_low_confidence_argmax():
     proof = _proof_with_token_stats(
         [1.0, 2.0e-6, 1.0],

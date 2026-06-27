@@ -58,6 +58,12 @@ from reliquary.validator.observability import (
     log_submission_stage,
 )
 from reliquary.validator.boxed_integrity import has_malformed_final_answer
+from reliquary.validator.auth_forensics import (
+    auth_forensics_context_chars,
+    auth_forensics_enabled,
+    auth_forensics_max_findings_per_rollout,
+    record_all_token_auth_findings,
+)
 from reliquary.validator.reward_shape import detect_reward_shape_manipulation
 from reliquary.validator.rollout_patterns import detect_opposite_reward_clones
 from reliquary.validator.verifier import (
@@ -892,6 +898,11 @@ class GrpoWindowBatcher:
         all_token_auth_shadow_min_prob: float | None = None
         all_token_auth_shadow_positive_findings = 0
         all_token_auth_shadow_positive_min_prob: float | None = None
+        all_token_forensics_enabled = auth_forensics_enabled()
+        all_token_forensics_max_findings = (
+            auth_forensics_max_findings_per_rollout()
+        )
+        all_token_forensics_context_chars = auth_forensics_context_chars()
         code_semantic_auth_findings = 0
         code_semantic_auth_min_prob: float | None = None
         code_semantic_auth_positive_findings = 0
@@ -1090,7 +1101,16 @@ class GrpoWindowBatcher:
                 getattr(rollout, "reward", 0.0) or 0.0
             ) > 0.0
             all_token_shadow_ok, all_token_shadow_metrics = (
-                evaluate_all_token_auth_shadow(proof)
+                evaluate_all_token_auth_shadow(
+                    proof,
+                    tokens=rollout.commit["tokens"],
+                    prompt_length=prompt_len,
+                    completion_length=completion_len,
+                    tokenizer=self.tokenizer,
+                    include_findings=all_token_forensics_enabled,
+                    max_findings=all_token_forensics_max_findings,
+                    context_chars=all_token_forensics_context_chars,
+                )
             )
             if all_token_shadow_metrics:
                 findings = int(
@@ -1118,12 +1138,29 @@ class GrpoWindowBatcher:
                         ):
                             all_token_auth_shadow_positive_min_prob = p
             if not all_token_shadow_ok:
+                if all_token_forensics_enabled:
+                    record_all_token_auth_findings(
+                        metrics=all_token_shadow_metrics,
+                        window_start=self.window_start,
+                        env_name=getattr(self.env, "name", ""),
+                        miner_hotkey=request.miner_hotkey,
+                        prompt_idx=request.prompt_idx,
+                        rollout_idx=rollout_idx,
+                        rollout_reward=float(
+                            getattr(rollout, "reward", 0.0) or 0.0
+                        ),
+                        reward_positive=rollout_reward_positive,
+                        prompt_length=prompt_len,
+                        completion_length=completion_len,
+                    )
+                log_shadow_metrics = dict(all_token_shadow_metrics)
+                log_shadow_metrics.pop("finding_details", None)
                 logger.info(
                     "all_token_auth_shadow_suspicious hotkey=%s "
                     "reward_positive=%s %s",
                     request.miner_hotkey,
                     rollout_reward_positive,
-                    all_token_shadow_metrics,
+                    log_shadow_metrics,
                 )
 
             if getattr(self.env, "name", "") == "opencodeinstruct":
