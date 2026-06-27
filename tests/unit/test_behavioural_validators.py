@@ -618,6 +618,7 @@ def _code_semantic_proof(
     low_positions: dict[int, float],
     *,
     argmax=1.0,
+    argmax_ids: list[int] | None = None,
 ):
     probs = [0.99] * len(completion)
     argmax_probs = [argmax] * len(completion)
@@ -627,6 +628,7 @@ def _code_semantic_proof(
         all_passed=True, passed=1, checked=1, has_sparse_outputs=True,
         completion_chosen_probs=probs,
         completion_argmax_probs=argmax_probs,
+        completion_argmax_ids=argmax_ids or [0] * len(completion),
     )
 
 
@@ -656,6 +658,47 @@ def test_code_semantic_auth_flags_keyword_bool_edit():
     assert metrics["findings"] == 1
     assert metrics["first_label"] == "keyword:reverse"
     assert metrics["first_token_text"] == "F"
+
+
+def test_code_semantic_auth_can_return_private_finding_details():
+    completion = (
+        "```python\n"
+        "def second_largest(nums):\n"
+        "    return sorted(set(nums), reverse=False)[-2]\n"
+        "```"
+    )
+    prompt_len = 5
+    tokens = [0] * prompt_len + _ords(completion)
+    false_pos = completion.index("False")
+    argmax_ids = [0] * len(completion)
+    argmax_ids[false_pos] = ord("T")
+    proof = _code_semantic_proof(
+        completion,
+        {false_pos: 2.0e-4},
+        argmax_ids=argmax_ids,
+    )
+
+    ok, metrics = verifier.evaluate_code_semantic_token_authenticity(
+        tokens=tokens,
+        prompt_length=prompt_len,
+        completion_length=len(completion),
+        proof=proof,
+        tokenizer=_CharTokenizer(),
+        threshold=0.001,
+        include_findings=True,
+        context_chars=18,
+    )
+
+    assert ok is False
+    assert metrics["findings"] == 1
+    detail = metrics["finding_details"][0]
+    assert detail["completion_pos"] == false_pos
+    assert detail["absolute_token_pos"] == prompt_len + false_pos
+    assert detail["label"] == "keyword:reverse"
+    assert detail["token_text"] == "F"
+    assert detail["argmax_text"] == "T"
+    assert "reverse=False" in detail["code_context"]
+    assert "reverse=False" in detail["completion_context"]
 
 
 def test_code_semantic_auth_flags_compare_operator_edit():

@@ -60,6 +60,14 @@ def auth_forensics_path() -> Path:
     return Path(state_dir) / "auth_forensics" / "all-token-auth-shadow.jsonl"
 
 
+def code_semantic_auth_forensics_path() -> Path:
+    explicit = os.environ.get("RELIQUARY_CODE_SEMANTIC_AUTH_FORENSICS_PATH")
+    if explicit:
+        return Path(explicit)
+    state_dir = os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")
+    return Path(state_dir) / "auth_forensics" / "code-semantic-auth.jsonl"
+
+
 def _float_or_none(value: Any) -> float | None:
     if value is None:
         return None
@@ -161,6 +169,98 @@ def record_all_token_auth_findings(
     except Exception as exc:
         logger.warning(
             "auth_forensics_write_failed path=%s error=%r",
+            out_path,
+            exc,
+        )
+
+
+def record_code_semantic_auth_findings(
+    *,
+    metrics: dict[str, Any],
+    window_start: int,
+    env_name: str,
+    miner_hotkey: str,
+    prompt_idx: int,
+    rollout_idx: int,
+    rollout_reward: float,
+    reward_positive: bool,
+    prompt_length: int,
+    completion_length: int,
+    path: str | Path | None = None,
+) -> None:
+    """Append local JSONL records for suspicious OpenCode semantic tokens."""
+    if not auth_forensics_enabled():
+        return
+    details = metrics.get("finding_details") or []
+    if not details:
+        return
+
+    out_path = (
+        Path(path) if path is not None else code_semantic_auth_forensics_path()
+    )
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        ts_unix = time.time()
+        with open(out_path, "a", encoding="utf-8") as f:
+            for detail in details:
+                record = {
+                    "schema_version": 1,
+                    "event": "code_semantic_auth_finding",
+                    "surface": "code-semantic",
+                    "ts_unix": ts_unix,
+                    "window_start": int(window_start),
+                    "env_name": str(env_name),
+                    "miner_hotkey": str(miner_hotkey),
+                    "prompt_idx": int(prompt_idx),
+                    "rollout_idx": int(rollout_idx),
+                    "rollout_reward": float(rollout_reward),
+                    "reward_positive": bool(reward_positive),
+                    "prompt_length": int(prompt_length),
+                    "completion_length": int(completion_length),
+                    "n_spans": _int_or_none(metrics.get("n_spans")),
+                    "n_tokens": _int_or_none(metrics.get("n_tokens")),
+                    "threshold": _float_or_none(metrics.get("threshold")),
+                    "argmax_conf": _float_or_none(metrics.get("argmax_conf")),
+                    "min_prob": _float_or_none(metrics.get("min_prob")),
+                    "finding_min_prob": _float_or_none(
+                        metrics.get("finding_min_prob")
+                    ),
+                    "completion_pos": _int_or_none(
+                        detail.get("completion_pos")
+                    ),
+                    "absolute_token_pos": _int_or_none(
+                        detail.get("absolute_token_pos")
+                    ),
+                    "completion_char_start": _int_or_none(
+                        detail.get("completion_char_start")
+                    ),
+                    "completion_char_end": _int_or_none(
+                        detail.get("completion_char_end")
+                    ),
+                    "code_char_start": _int_or_none(
+                        detail.get("code_char_start")
+                    ),
+                    "code_char_end": _int_or_none(
+                        detail.get("code_char_end")
+                    ),
+                    "label": _trim(detail.get("label"), 80),
+                    "p_chosen": _float_or_none(detail.get("p_chosen")),
+                    "p_argmax": _float_or_none(detail.get("p_argmax")),
+                    "token_id": _int_or_none(detail.get("token_id")),
+                    "argmax_id": _int_or_none(detail.get("argmax_id")),
+                    "token_text": _trim(detail.get("token_text"), 120),
+                    "argmax_text": _trim(detail.get("argmax_text"), 120),
+                    "completion_context": _trim(
+                        detail.get("completion_context"),
+                        280,
+                    ),
+                    "code_context": _trim(detail.get("code_context"), 280),
+                }
+                f.write(json.dumps(record, sort_keys=True, separators=(",", ":")))
+                f.write("\n")
+    except Exception as exc:
+        logger.warning(
+            "code_semantic_auth_forensics_write_failed path=%s error=%r",
             out_path,
             exc,
         )

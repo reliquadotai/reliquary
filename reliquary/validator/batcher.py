@@ -63,6 +63,7 @@ from reliquary.validator.auth_forensics import (
     auth_forensics_enabled,
     auth_forensics_max_findings_per_rollout,
     record_all_token_auth_findings,
+    record_code_semantic_auth_findings,
 )
 from reliquary.validator.reward_shape import detect_reward_shape_manipulation
 from reliquary.validator.rollout_patterns import detect_opposite_reward_clones
@@ -898,11 +899,11 @@ class GrpoWindowBatcher:
         all_token_auth_shadow_min_prob: float | None = None
         all_token_auth_shadow_positive_findings = 0
         all_token_auth_shadow_positive_min_prob: float | None = None
-        all_token_forensics_enabled = auth_forensics_enabled()
-        all_token_forensics_max_findings = (
+        private_auth_forensics_enabled = auth_forensics_enabled()
+        private_auth_forensics_max_findings = (
             auth_forensics_max_findings_per_rollout()
         )
-        all_token_forensics_context_chars = auth_forensics_context_chars()
+        private_auth_forensics_context_chars = auth_forensics_context_chars()
         code_semantic_auth_findings = 0
         code_semantic_auth_min_prob: float | None = None
         code_semantic_auth_positive_findings = 0
@@ -1107,9 +1108,9 @@ class GrpoWindowBatcher:
                     prompt_length=prompt_len,
                     completion_length=completion_len,
                     tokenizer=self.tokenizer,
-                    include_findings=all_token_forensics_enabled,
-                    max_findings=all_token_forensics_max_findings,
-                    context_chars=all_token_forensics_context_chars,
+                    include_findings=private_auth_forensics_enabled,
+                    max_findings=private_auth_forensics_max_findings,
+                    context_chars=private_auth_forensics_context_chars,
                 )
             )
             if all_token_shadow_metrics:
@@ -1138,7 +1139,7 @@ class GrpoWindowBatcher:
                         ):
                             all_token_auth_shadow_positive_min_prob = p
             if not all_token_shadow_ok:
-                if all_token_forensics_enabled:
+                if private_auth_forensics_enabled:
                     record_all_token_auth_findings(
                         metrics=all_token_shadow_metrics,
                         window_start=self.window_start,
@@ -1171,6 +1172,9 @@ class GrpoWindowBatcher:
                         completion_length=completion_len,
                         proof=proof,
                         tokenizer=self.tokenizer,
+                        include_findings=private_auth_forensics_enabled,
+                        max_findings=private_auth_forensics_max_findings,
+                        context_chars=private_auth_forensics_context_chars,
                     )
                 )
                 if code_auth_metrics:
@@ -1194,13 +1198,30 @@ class GrpoWindowBatcher:
                             ):
                                 code_semantic_auth_positive_min_prob = p
                 if not code_auth_ok:
+                    if private_auth_forensics_enabled:
+                        record_code_semantic_auth_findings(
+                            metrics=code_auth_metrics,
+                            window_start=self.window_start,
+                            env_name=getattr(self.env, "name", ""),
+                            miner_hotkey=request.miner_hotkey,
+                            prompt_idx=request.prompt_idx,
+                            rollout_idx=rollout_idx,
+                            rollout_reward=float(
+                                getattr(rollout, "reward", 0.0) or 0.0
+                            ),
+                            reward_positive=rollout_reward_positive,
+                            prompt_length=prompt_len,
+                            completion_length=completion_len,
+                        )
+                    log_code_metrics = dict(code_auth_metrics)
+                    log_code_metrics.pop("finding_details", None)
                     logger.info(
                         "code_semantic_token_suspicious hotkey=%s enforce=%s "
                         "reward_positive=%s %s",
                         request.miner_hotkey,
                         CODE_SEMANTIC_AUTH_ENFORCE,
                         rollout_reward_positive,
-                        code_auth_metrics,
+                        log_code_metrics,
                     )
                     if CODE_SEMANTIC_AUTH_ENFORCE and rollout_reward_positive:
                         return reject(

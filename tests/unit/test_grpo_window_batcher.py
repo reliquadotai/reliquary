@@ -2238,12 +2238,22 @@ def test_all_token_auth_shadow_records_without_rejecting(monkeypatch, tmp_path):
     assert first["token_text"] == "A"
 
 
-def test_opencode_semantic_auth_shadow_records_without_rejecting():
+def test_opencode_semantic_auth_shadow_records_without_rejecting(
+    monkeypatch,
+    tmp_path,
+):
     class _CodeTokenizer:
         eos_token_id = 9999
 
         def decode(self, ids, *, skip_special_tokens=False):
             return "".join(chr(int(i)) for i in ids if int(i) != self.eos_token_id)
+
+    forensics_path = tmp_path / "code-semantic-auth.jsonl"
+    monkeypatch.setenv("RELIQUARY_AUTH_FORENSICS_ENABLED", "1")
+    monkeypatch.setenv(
+        "RELIQUARY_CODE_SEMANTIC_AUTH_FORENSICS_PATH",
+        str(forensics_path),
+    )
 
     prompt = [10, 11, 12, 13]
     body = (
@@ -2290,6 +2300,20 @@ def test_opencode_semantic_auth_shadow_records_without_rejecting():
     assert sub.code_semantic_auth_min_prob == pytest.approx(2.0e-4)
     assert sub.code_semantic_auth_positive_findings == 4
     assert sub.code_semantic_auth_positive_min_prob == pytest.approx(2.0e-4)
+
+    records = [json.loads(line) for line in forensics_path.read_text().splitlines()]
+    assert len(records) == M_ROLLOUTS
+    first = records[0]
+    assert first["event"] == "code_semantic_auth_finding"
+    assert first["surface"] == "code-semantic"
+    assert first["window_start"] == 500
+    assert first["miner_hotkey"] == "hk"
+    assert first["prompt_idx"] == 42
+    assert first["rollout_idx"] == 0
+    assert first["reward_positive"] is True
+    assert first["label"] == "keyword:reverse"
+    assert first["token_text"] == "F"
+    assert "reverse=False" in first["code_context"]
 
 
 def test_opencode_semantic_auth_enforce_ignores_zero_reward_rollout(monkeypatch):

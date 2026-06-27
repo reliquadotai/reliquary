@@ -9,7 +9,10 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from reliquary.validator.auth_forensics import auth_forensics_path
+from reliquary.validator.auth_forensics import (
+    auth_forensics_path,
+    code_semantic_auth_forensics_path,
+)
 
 
 def _load_records(paths: list[Path]) -> list[dict[str, Any]]:
@@ -35,12 +38,17 @@ def _fmt_prob(value: Any) -> str:
         return "-"
 
 
-def summarize(records: list[dict[str, Any]], *, top_n: int) -> str:
+def summarize(
+    records: list[dict[str, Any]],
+    *,
+    top_n: int,
+    title: str = "Token-auth private forensics report",
+) -> str:
     windows = {r.get("window_start") for r in records}
     envs = {r.get("env_name") for r in records}
     positive = [r for r in records if r.get("reward_positive")]
     lines = [
-        "Token-auth private forensics report",
+        title,
         f"records: {len(records)}",
         f"windows: {len(windows)}",
         f"envs: {', '.join(sorted(str(e) for e in envs if e)) or '-'}",
@@ -82,13 +90,15 @@ def summarize(records: list[dict[str, Any]], *, top_n: int) -> str:
             f"{example.get('token_text')!r}"
             f" -> {example.get('argmax_text')!r}"
         )
+        label = example.get("label")
+        label_text = f" label={label}" if label else ""
         lines.append(
             f"- {hotkey}: records={len(hotkey_records)} "
             f"positive={len(h_positive)} windows={len(h_windows)} "
             f"min_p={_fmt_prob(min_p)} example="
             f"w{example.get('window_start')} p{example.get('prompt_idx')} "
             f"r{example.get('rollout_idx')} pos={example.get('completion_pos')} "
-            f"{swap}"
+            f"{swap}{label_text}"
         )
     if not ranked:
         lines.append("- none")
@@ -107,12 +117,28 @@ def main() -> int:
         type=Path,
         help="JSONL paths. Defaults to RELIQUARY_AUTH_FORENSICS_PATH/state dir.",
     )
+    parser.add_argument(
+        "--surface",
+        choices=("all-token-shadow", "code-semantic"),
+        default="all-token-shadow",
+        help="Private forensic surface to read when no paths are supplied.",
+    )
     parser.add_argument("--top-n", type=int, default=12)
     args = parser.parse_args()
 
-    paths = args.paths or [auth_forensics_path()]
+    default_path = (
+        code_semantic_auth_forensics_path()
+        if args.surface == "code-semantic"
+        else auth_forensics_path()
+    )
+    paths = args.paths or [default_path]
     records = _load_records(paths)
-    print(summarize(records, top_n=max(1, args.top_n)))
+    title = (
+        "Code-semantic private forensics report"
+        if args.surface == "code-semantic"
+        else "All-token private forensics report"
+    )
+    print(summarize(records, top_n=max(1, args.top_n), title=title))
     return 0
 
 
