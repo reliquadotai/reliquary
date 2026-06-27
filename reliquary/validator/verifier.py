@@ -1035,6 +1035,9 @@ def evaluate_code_semantic_token_authenticity(
     *,
     threshold: float | None = None,
     argmax_conf: float | None = None,
+    include_findings: bool = False,
+    max_findings: int | None = None,
+    context_chars: int = 80,
 ) -> tuple[bool, dict]:
     """Shadow check for post-hoc edits to OpenCode semantic tokens.
 
@@ -1088,6 +1091,8 @@ def evaluate_code_semantic_token_authenticity(
 
     selected: list[float] = []
     findings: list[dict[str, Any]] = []
+    finding_details: list[dict[str, Any]] = []
+    argmax_ids = proof.completion_argmax_ids
     n = min(len(probs), len(amax), len(completion_tokens))
     for pos in sorted(semantic_by_pos):
         if pos >= n:
@@ -1095,17 +1100,55 @@ def evaluate_code_semantic_token_authenticity(
         p = float(probs[pos])
         selected.append(p)
         if p < threshold and float(amax[pos]) >= argmax_conf:
-            findings.append({
+            tok_start, tok_end = offsets[pos]
+            label = semantic_by_pos[pos]
+            token_id = int(completion_tokens[pos])
+            argmax_id = (
+                int(argmax_ids[pos])
+                if pos < len(argmax_ids)
+                else None
+            )
+            finding = {
                 "pos": pos,
-                "label": semantic_by_pos[pos],
+                "label": label,
                 "p_chosen": p,
                 "p_argmax": float(amax[pos]),
-                "token_id": int(completion_tokens[pos]),
-                "token_text": tokenizer.decode(
-                    [int(completion_tokens[pos])],
-                    skip_special_tokens=False,
-                )[:32],
-            })
+                "token_id": token_id,
+                "token_text": (_safe_decode_ids(tokenizer, [token_id]) or "")[:32],
+            }
+            findings.append(finding)
+            if include_findings and (
+                max_findings is None or len(finding_details) < max_findings
+            ):
+                code_tok_start = max(0, tok_start - code_start)
+                code_tok_end = max(code_tok_start, tok_end - code_start)
+                finding_details.append({
+                    "completion_pos": pos,
+                    "absolute_token_pos": prompt_length + pos,
+                    "label": label,
+                    "p_chosen": p,
+                    "p_argmax": float(amax[pos]),
+                    "token_id": token_id,
+                    "token_text": _safe_decode_ids(tokenizer, [token_id]),
+                    "argmax_id": argmax_id,
+                    "argmax_text": _safe_decode_ids(tokenizer, [argmax_id]),
+                    "completion_char_start": tok_start,
+                    "completion_char_end": tok_end,
+                    "code_char_start": code_tok_start,
+                    "code_char_end": code_tok_end,
+                    "completion_context": _completion_context_for_position(
+                        completion_tokens,
+                        pos,
+                        tokenizer,
+                        context_chars=context_chars,
+                    ),
+                    "code_context": _text_context_for_span(
+                        code,
+                        code_tok_start,
+                        code_tok_end,
+                        context_chars=context_chars,
+                    ),
+                })
 
     if not selected:
         return True, {}
@@ -1114,7 +1157,13 @@ def evaluate_code_semantic_token_authenticity(
         "n_tokens": len(semantic_by_pos),
         "min_prob": min(selected),
         "threshold": float(threshold),
+        "argmax_conf": float(argmax_conf),
         "findings": len(findings),
+        "finding_min_prob": (
+            min(f["p_chosen"] for f in findings)
+            if findings
+            else None
+        ),
     }
     if findings:
         first = findings[0]
@@ -1126,7 +1175,22 @@ def evaluate_code_semantic_token_authenticity(
             "first_token_id": first["token_id"],
             "first_token_text": first["token_text"],
         })
+    if include_findings:
+        metrics["finding_details"] = finding_details
     return (len(findings) == 0), metrics
+
+
+def _text_context_for_span(
+    text: str,
+    start: int,
+    end: int,
+    *,
+    context_chars: int,
+) -> str:
+    chars = max(0, int(context_chars))
+    left = max(0, start - chars)
+    right = min(len(text), end + chars)
+    return text[left:right]
 
 
 def _find_last_boxed_token_range(
