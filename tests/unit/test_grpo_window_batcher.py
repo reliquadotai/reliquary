@@ -1,6 +1,7 @@
 """GrpoWindowBatcher: accepts submissions, enforces verification pipeline,
 exposes select_batch at window close."""
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -2155,18 +2156,49 @@ def test_accept_boxed_answer_high_prob():
     assert resp.reason != RejectReason.BOXED_ANSWER_TAMPERED
 
 
-def test_all_token_auth_shadow_records_without_rejecting(monkeypatch):
+def test_all_token_auth_shadow_records_without_rejecting(monkeypatch, tmp_path):
     import reliquary.validator.batcher as batcher_mod
+
+    forensics_path = tmp_path / "auth-forensics.jsonl"
+    monkeypatch.setenv("RELIQUARY_AUTH_FORENSICS_ENABLED", "1")
+    monkeypatch.setenv("RELIQUARY_AUTH_FORENSICS_PATH", str(forensics_path))
 
     monkeypatch.setattr(
         batcher_mod,
         "evaluate_all_token_auth_shadow",
-        lambda _proof: (
+        lambda _proof, **_kwargs: (
             False,
             {
+                "n_tokens": CHALLENGE_K,
                 "findings": 2,
                 "min_prob": 4.0e-7,
+                "threshold": 1.0e-5,
+                "argmax_conf": 0.99,
                 "finding_min_prob": 7.0e-6,
+                "finding_details": [
+                    {
+                        "completion_pos": 1,
+                        "absolute_token_pos": 5,
+                        "p_chosen": 4.0e-7,
+                        "p_argmax": 0.995,
+                        "token_id": 65,
+                        "token_text": "A",
+                        "argmax_id": 66,
+                        "argmax_text": "B",
+                        "completion_context": "xAy",
+                    },
+                    {
+                        "completion_pos": 2,
+                        "absolute_token_pos": 6,
+                        "p_chosen": 7.0e-6,
+                        "p_argmax": 0.996,
+                        "token_id": 67,
+                        "token_text": "C",
+                        "argmax_id": 68,
+                        "argmax_text": "D",
+                        "completion_context": "xCy",
+                    },
+                ],
             },
         ),
     )
@@ -2192,6 +2224,18 @@ def test_all_token_auth_shadow_records_without_rejecting(monkeypatch):
     assert sub.all_token_auth_shadow_min_prob == pytest.approx(4.0e-7)
     assert sub.all_token_auth_shadow_positive_findings == 4 * 2
     assert sub.all_token_auth_shadow_positive_min_prob == pytest.approx(7.0e-6)
+
+    records = [json.loads(line) for line in forensics_path.read_text().splitlines()]
+    assert len(records) == M_ROLLOUTS * 2
+    first = records[0]
+    assert first["event"] == "all_token_auth_shadow_finding"
+    assert first["window_start"] == 500
+    assert first["miner_hotkey"] == "hk"
+    assert first["prompt_idx"] == 42
+    assert first["rollout_idx"] == 0
+    assert first["reward_positive"] is True
+    assert first["completion_pos"] == 1
+    assert first["token_text"] == "A"
 
 
 def test_opencode_semantic_auth_shadow_records_without_rejecting():

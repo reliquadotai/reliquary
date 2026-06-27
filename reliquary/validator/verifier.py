@@ -679,14 +679,22 @@ def evaluate_all_token_auth_shadow(
     *,
     threshold: float | None = None,
     argmax_conf: float | None = None,
+    tokens: list[int] | None = None,
+    prompt_length: int = 0,
+    completion_length: int = 0,
+    tokenizer: Any = None,
+    include_findings: bool = False,
+    max_findings: int | None = None,
+    context_chars: int = 80,
 ) -> tuple[bool, dict]:
     """Aggregate all-token argmax-gated authenticity shadow check.
 
     This observes the broader detector proposed for plausible token edits:
     a chosen completion token below ``threshold`` is suspicious only when the
     validator model was highly confident in a different argmax. It returns
-    aggregate metrics only; callers can archive counts/minima without exposing
-    exact positions in public R2 data.
+    aggregate metrics by default; callers can archive counts/minima without
+    exposing exact positions in public R2 data. Validator-private callers may
+    opt into ``finding_details`` for local forensics.
     """
     from reliquary.constants import (
         ALL_TOKEN_AUTH_SHADOW_ARGMAX_CONF,
@@ -709,6 +717,13 @@ def evaluate_all_token_auth_shadow(
     min_prob: float | None = None
     findings = 0
     finding_min_prob: float | None = None
+    finding_details: list[dict[str, Any]] = []
+    completion_tokens: list[int] = []
+    argmax_ids = proof.completion_argmax_ids
+    if tokens is not None and completion_length > 0:
+        completion_tokens = list(
+            tokens[prompt_length: prompt_length + completion_length]
+        )
     for j in range(n):
         p = float(chosen[j])
         if min_prob is None or p < min_prob:
@@ -717,6 +732,35 @@ def evaluate_all_token_auth_shadow(
             findings += 1
             if finding_min_prob is None or p < finding_min_prob:
                 finding_min_prob = p
+            if include_findings and (
+                max_findings is None or len(finding_details) < max_findings
+            ):
+                token_id = (
+                    int(completion_tokens[j])
+                    if j < len(completion_tokens)
+                    else None
+                )
+                argmax_id = (
+                    int(argmax_ids[j])
+                    if j < len(argmax_ids)
+                    else None
+                )
+                finding_details.append({
+                    "completion_pos": j,
+                    "absolute_token_pos": prompt_length + j,
+                    "p_chosen": p,
+                    "p_argmax": float(amax[j]),
+                    "token_id": token_id,
+                    "token_text": _safe_decode_ids(tokenizer, [token_id]),
+                    "argmax_id": argmax_id,
+                    "argmax_text": _safe_decode_ids(tokenizer, [argmax_id]),
+                    "completion_context": _completion_context_for_position(
+                        completion_tokens,
+                        j,
+                        tokenizer,
+                        context_chars=context_chars,
+                    ),
+                })
 
     metrics = {
         "n_tokens": n,
@@ -726,7 +770,49 @@ def evaluate_all_token_auth_shadow(
         "findings": findings,
         "finding_min_prob": finding_min_prob,
     }
+    if include_findings:
+        metrics["finding_details"] = finding_details
     return (findings == 0), metrics
+
+
+def _safe_decode_ids(tokenizer: Any, ids: list[int | None]) -> str | None:
+    if tokenizer is None or any(t is None for t in ids):
+        return None
+    try:
+        return str(tokenizer.decode(
+            [int(t) for t in ids],
+            skip_special_tokens=False,
+        ))
+    except TypeError:
+        try:
+            return str(tokenizer.decode([int(t) for t in ids]))
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def _completion_context_for_position(
+    completion_tokens: list[int],
+    pos: int,
+    tokenizer: Any,
+    *,
+    context_chars: int,
+) -> str | None:
+    if tokenizer is None or not completion_tokens or pos >= len(completion_tokens):
+        return None
+    radius = 32
+    left = _safe_decode_ids(
+        tokenizer,
+        completion_tokens[max(0, pos - radius): pos],
+    ) or ""
+    token = _safe_decode_ids(tokenizer, [completion_tokens[pos]]) or ""
+    right = _safe_decode_ids(
+        tokenizer,
+        completion_tokens[pos + 1: pos + 1 + radius],
+    ) or ""
+    chars = max(0, int(context_chars))
+    return f"{left[-chars:]}{token}{right[:chars]}"
 
 
 _CODE_FENCE_RE = re.compile(
