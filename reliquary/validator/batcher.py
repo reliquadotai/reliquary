@@ -62,6 +62,8 @@ from reliquary.validator.auth_forensics import (
     auth_forensics_context_chars,
     auth_forensics_enabled,
     auth_forensics_max_findings_per_rollout,
+    code_semantic_counterfactual_enabled,
+    code_semantic_counterfactual_max_findings_per_rollout,
     record_all_token_auth_findings,
     record_code_semantic_auth_findings,
 )
@@ -82,6 +84,76 @@ from reliquary.validator.verifier import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _enrich_code_semantic_counterfactuals(
+    *,
+    metrics: dict[str, Any],
+    env: Any,
+    problem: dict,
+    completion_text: str,
+    rollout_reward: float,
+    max_findings: int,
+) -> None:
+    """Fail-softly regrade argmax-token replacements for local forensics only."""
+    if max_findings <= 0:
+        return
+    details = metrics.get("finding_details")
+    if not isinstance(details, list):
+        return
+
+    checked = 0
+    for detail in details:
+        if not isinstance(detail, dict):
+            continue
+        if checked >= max_findings:
+            return
+        start = _int_or_none(detail.get("completion_char_start"))
+        end = _int_or_none(detail.get("completion_char_end"))
+        replacement = detail.get("argmax_text")
+        if (
+            start is None
+            or end is None
+            or not isinstance(replacement, str)
+            or start < 0
+            or end < start
+            or end > len(completion_text)
+        ):
+            detail["counterfactual_error"] = "invalid_span"
+            continue
+
+        candidate = completion_text[:start] + replacement + completion_text[end:]
+        if candidate == completion_text:
+            detail["counterfactual_checked"] = False
+            detail["counterfactual_error"] = "unchanged"
+            continue
+
+        checked += 1
+        try:
+            counterfactual_reward = float(env.compute_reward(problem, candidate))
+        except Exception as exc:
+            detail["counterfactual_checked"] = True
+            detail["counterfactual_error"] = type(exc).__name__
+            continue
+
+        original_reward = float(rollout_reward)
+        detail["counterfactual_checked"] = True
+        detail["counterfactual_reward"] = counterfactual_reward
+        detail["counterfactual_reward_delta"] = (
+            counterfactual_reward - original_reward
+        )
+        detail["counterfactual_reward_flipped"] = (
+            original_reward > 0.0 and counterfactual_reward <= 0.0
+        )
 
 
 def _uses_validator_authoritative_reward(env: Any) -> bool:
@@ -904,6 +976,12 @@ class GrpoWindowBatcher:
             auth_forensics_max_findings_per_rollout()
         )
         private_auth_forensics_context_chars = auth_forensics_context_chars()
+        code_semantic_counterfactuals_enabled = (
+            code_semantic_counterfactual_enabled()
+        )
+        code_semantic_counterfactuals_max_findings = (
+            code_semantic_counterfactual_max_findings_per_rollout()
+        )
         code_semantic_auth_findings = 0
         code_semantic_auth_min_prob: float | None = None
         code_semantic_auth_positive_findings = 0
@@ -1199,6 +1277,23 @@ class GrpoWindowBatcher:
                                 code_semantic_auth_positive_min_prob = p
                 if not code_auth_ok:
                     if private_auth_forensics_enabled:
+                        rollout_reward = float(
+                            getattr(rollout, "reward", 0.0) or 0.0
+                        )
+                        if (
+                            code_semantic_counterfactuals_enabled
+                            and rollout_reward_positive
+                        ):
+                            _enrich_code_semantic_counterfactuals(
+                                metrics=code_auth_metrics,
+                                env=self.env,
+                                problem=problem,
+                                completion_text=completion_texts[rollout_idx],
+                                rollout_reward=rollout_reward,
+                                max_findings=(
+                                    code_semantic_counterfactuals_max_findings
+                                ),
+                            )
                         record_code_semantic_auth_findings(
                             metrics=code_auth_metrics,
                             window_start=self.window_start,
@@ -1206,9 +1301,7 @@ class GrpoWindowBatcher:
                             miner_hotkey=request.miner_hotkey,
                             prompt_idx=request.prompt_idx,
                             rollout_idx=rollout_idx,
-                            rollout_reward=float(
-                                getattr(rollout, "reward", 0.0) or 0.0
-                            ),
+                            rollout_reward=rollout_reward,
                             reward_positive=rollout_reward_positive,
                             prompt_length=prompt_len,
                             completion_length=completion_len,
