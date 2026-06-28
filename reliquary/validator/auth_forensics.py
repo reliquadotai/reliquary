@@ -17,6 +17,18 @@ logger = logging.getLogger(__name__)
 
 _FALSE_VALUES = {"0", "false", "no", "off"}
 
+CODE_SEMANTIC_HIGH_SIGNAL_LABELS = frozenset({
+    "binary_op",
+    "bool_op",
+    "compare_op",
+    "constant:bool",
+    "constant:none",
+    "constant:number",
+    "subscript_slice",
+    "unary_op",
+})
+CODE_SEMANTIC_LOW_SIGNAL_LABELS = frozenset({"constant:string"})
+
 
 def auth_forensics_enabled() -> bool:
     raw = os.environ.get("RELIQUARY_AUTH_FORENSICS_ENABLED", "1")
@@ -50,6 +62,40 @@ def auth_forensics_context_chars() -> int:
             raw,
         )
         return 80
+
+
+def code_semantic_counterfactual_enabled() -> bool:
+    raw = os.environ.get("RELIQUARY_CODE_SEMANTIC_COUNTERFACTUAL_ENABLED", "1")
+    return raw.strip().lower() not in _FALSE_VALUES
+
+
+def code_semantic_counterfactual_max_findings_per_rollout() -> int:
+    raw = os.environ.get(
+        "RELIQUARY_CODE_SEMANTIC_COUNTERFACTUAL_MAX_FINDINGS_PER_ROLLOUT"
+    )
+    if raw is None:
+        return 4
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid "
+            "RELIQUARY_CODE_SEMANTIC_COUNTERFACTUAL_MAX_FINDINGS_PER_ROLLOUT=%r; "
+            "using 4",
+            raw,
+        )
+        return 4
+
+
+def code_semantic_signal_bucket(label: Any) -> str:
+    text = str(label or "")
+    if text in CODE_SEMANTIC_HIGH_SIGNAL_LABELS:
+        return "high"
+    if text in CODE_SEMANTIC_LOW_SIGNAL_LABELS:
+        return "low"
+    if text == "return_expr" or text.startswith("keyword:"):
+        return "review"
+    return "unknown"
 
 
 def auth_forensics_path() -> Path:
@@ -244,6 +290,9 @@ def record_code_semantic_auth_findings(
                         detail.get("code_char_end")
                     ),
                     "label": _trim(detail.get("label"), 80),
+                    "signal_bucket": code_semantic_signal_bucket(
+                        detail.get("label")
+                    ),
                     "p_chosen": _float_or_none(detail.get("p_chosen")),
                     "p_argmax": _float_or_none(detail.get("p_argmax")),
                     "token_id": _int_or_none(detail.get("token_id")),
@@ -255,6 +304,21 @@ def record_code_semantic_auth_findings(
                         280,
                     ),
                     "code_context": _trim(detail.get("code_context"), 280),
+                    "counterfactual_checked": bool(
+                        detail.get("counterfactual_checked", False)
+                    ),
+                    "counterfactual_reward": _float_or_none(
+                        detail.get("counterfactual_reward")
+                    ),
+                    "counterfactual_reward_delta": _float_or_none(
+                        detail.get("counterfactual_reward_delta")
+                    ),
+                    "counterfactual_reward_flipped": bool(
+                        detail.get("counterfactual_reward_flipped", False)
+                    ),
+                    "counterfactual_error": _trim(
+                        detail.get("counterfactual_error"), 120
+                    ),
                 }
                 f.write(json.dumps(record, sort_keys=True, separators=(",", ":")))
                 f.write("\n")

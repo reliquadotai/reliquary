@@ -2057,7 +2057,12 @@ class _CharTokenizerWithEos:
         return "".join(chr(int(i)) for i in ids if int(i) != 99)
 
 
-def _grail_with_chosen_probs(seq_len: int, completion_probs: list[float], prompt_length: int = 4):
+def _grail_with_chosen_probs(
+    seq_len: int,
+    completion_probs: list[float],
+    prompt_length: int = 4,
+    argmax_ids: list[int] | None = None,
+):
     """Stub returning sparse outputs incl. completion_chosen_probs.
 
     Also pre-populates challenge_lp_indices/values with zeros at the first K
@@ -2076,6 +2081,7 @@ def _grail_with_chosen_probs(seq_len: int, completion_probs: list[float], prompt
             challenge_lp_values=challenge_vals,
             completion_chosen_probs=list(completion_probs),
             completion_argmax_probs=[1.0] * len(completion_probs),
+            completion_argmax_ids=argmax_ids or [0] * len(completion_probs),
         )
     return _fn
 
@@ -2314,6 +2320,88 @@ def test_opencode_semantic_auth_shadow_records_without_rejecting(
     assert first["label"] == "keyword:reverse"
     assert first["token_text"] == "F"
     assert "reverse=False" in first["code_context"]
+
+
+def test_opencode_semantic_auth_records_counterfactual_reward_flip(
+    monkeypatch,
+    tmp_path,
+):
+    class _CodeTokenizer:
+        eos_token_id = 9999
+
+        def decode(self, ids, *, skip_special_tokens=False):
+            return "".join(chr(int(i)) for i in ids if int(i) != self.eos_token_id)
+
+    class _CounterfactualEnv(PrivateRewardFakeEnv):
+        def compute_reward(self, problem, completion):
+            return 1.0 if "reverse=False" in completion else 0.0
+
+    forensics_path = tmp_path / "code-semantic-auth.jsonl"
+    monkeypatch.setenv("RELIQUARY_AUTH_FORENSICS_ENABLED", "1")
+    monkeypatch.setenv("RELIQUARY_CODE_SEMANTIC_COUNTERFACTUAL_ENABLED", "1")
+    monkeypatch.setenv(
+        "RELIQUARY_CODE_SEMANTIC_AUTH_FORENSICS_PATH",
+        str(forensics_path),
+    )
+
+    prompt = [10, 11, 12, 13]
+    body = (
+        "```python\n"
+        "def second_largest(nums):\n"
+        "    return sorted(set(nums), reverse=False)[-2]\n"
+        "```"
+    )
+    completion = [ord(c) for c in body] + [_CodeTokenizer.eos_token_id]
+    tokens = prompt + completion
+    false_pos = body.index("False")
+    probs = [0.99] * len(completion)
+    probs[false_pos] = 2.0e-4
+    argmax_ids = [0] * len(completion)
+    argmax_ids[false_pos] = ord("T")
+
+    class _LongCtxModel:
+        class config:
+            vocab_size = 20000
+            max_position_embeddings = 4096
+
+    b = _make_batcher(
+        env=_CounterfactualEnv(),
+        model=_LongCtxModel(),
+        tokenizer=_CodeTokenizer(),
+        completion_text_fn=lambda rollout: (
+            body if rollout.reward > 0.5 else "wrong"
+        ),
+        verify_commitment_proofs_fn=_grail_with_chosen_probs(
+            len(tokens),
+            probs,
+            prompt_length=len(prompt),
+            argmax_ids=argmax_ids,
+        ),
+    )
+    req = _request()
+    for rollout in req.rollouts:
+        commit = _make_commit(
+            tokens=tokens,
+            prompt_length=len(prompt),
+            success=False,
+            total_reward=0.0,
+        )
+        rollout.commit = commit
+        rollout.tokens = commit["tokens"]
+        rollout.env_name = "opencodeinstruct"
+
+    resp = b.accept_submission(req)
+
+    assert resp.accepted is True
+    records = [json.loads(line) for line in forensics_path.read_text().splitlines()]
+    assert len(records) == M_ROLLOUTS
+    first = records[0]
+    assert first["reward_positive"] is True
+    assert first["signal_bucket"] == "review"
+    assert first["counterfactual_checked"] is True
+    assert first["counterfactual_reward"] == 0.0
+    assert first["counterfactual_reward_delta"] == -1.0
+    assert first["counterfactual_reward_flipped"] is True
 
 
 def test_opencode_semantic_auth_enforce_ignores_zero_reward_rollout(monkeypatch):
