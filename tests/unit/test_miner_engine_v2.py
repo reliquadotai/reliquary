@@ -105,7 +105,9 @@ def test_build_rollout_submission_uses_placeholder_for_authoritative_reward_env(
     eng.env.compute_reward.assert_not_called()
 
 
-def test_generate_rollouts_passes_full_eos_set_and_trims_first_eos():
+def test_generate_rollouts_passes_full_eos_set_and_trims_first_eos(monkeypatch):
+    # Pins the non-BFT generation path (eos union + first-EOS trim).
+    monkeypatch.setattr("reliquary.constants.BFT_ENABLED", False)
     import torch
     from types import SimpleNamespace
 
@@ -145,6 +147,73 @@ def test_generate_rollouts_passes_full_eos_set_and_trims_first_eos():
     assert eng.vllm_model.kwargs["eos_token_id"] == [248044, 248046]
     assert len(rollouts) == M_ROLLOUTS
     assert all(r["tokens"] == [10, 11, 1, 248046] for r in rollouts)
+
+
+def test_generate_rollouts_bft_path_keeps_finished_rows():
+    # BFT default path: rows that already emitted </think> are kept (not forced),
+    # phase-1 max_new_tokens is capped at the thinking budget, no phase-2 call.
+    import torch
+    from types import SimpleNamespace
+
+    from reliquary.constants import BFT_THINKING_BUDGET, M_ROLLOUTS
+    from reliquary.miner.engine import MiningEngine
+
+    class _Tok:
+        chat_template = None
+        eos_token_id = 248046
+        pad_token_id = 248044
+
+        def encode(self, text, *, add_special_tokens):
+            assert add_special_tokens is False
+            return [10, 11]
+
+        def convert_tokens_to_ids(self, t):
+            return 777 if t == "</think>" else None
+
+    class _Model:
+        device = "cpu"
+        generation_config = SimpleNamespace(eos_token_id=248044)
+        config = SimpleNamespace(text_config=SimpleNamespace(eos_token_id=248044))
+
+        def __init__(self):
+            self.kwargs = None
+            self.calls = 0
+
+        def generate(self, input_tensor, **kwargs):
+            self.calls += 1
+            self.kwargs = kwargs
+            row = [10, 11, 777, 55, 248046]  # prompt + </think> + answer + EOS
+            return torch.tensor([row] * input_tensor.shape[0])
+
+    eng = object.__new__(MiningEngine)
+    eng.tokenizer = _Tok()
+    eng.vllm_model = _Model()
+    eng.max_new_tokens = 40000
+
+    rollouts = eng._generate_m_rollouts({"prompt": "p"}, "00")
+
+    assert eng.vllm_model.kwargs["max_new_tokens"] == min(40000, BFT_THINKING_BUDGET)
+    assert eng.vllm_model.calls == 1  # all finished → no phase-2 generation
+    assert len(rollouts) == M_ROLLOUTS
+    assert all(r["forced"] is False for r in rollouts)
+    assert all(r["tokens"] == [10, 11, 777, 55, 248046] for r in rollouts)
+
+
+def test_rollout_metadata_carries_bft_fields():
+    from reliquary.miner.engine import _rollout_metadata
+
+    forced = {"tokens": [1, 2, 3, 4, 5], "prompt_length": 2,
+              "forced": True, "force_span": (3, 5)}
+    m = _rollout_metadata(forced, [0.0, 0.0, 0.0])
+    assert m["forced"] is True
+    assert m["force_span"] == [3, 5]
+    assert m["completion_length"] == 3
+    assert m["token_logprobs"] == [0.0, 0.0, 0.0]
+
+    natural = {"tokens": [1, 2, 3], "prompt_length": 1, "forced": False}
+    m2 = _rollout_metadata(natural, [0.0, 0.0])
+    assert m2["forced"] is False
+    assert m2["force_span"] is None
 
 
 def test_pick_prompt_respects_explicit_range():

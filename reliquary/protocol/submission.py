@@ -269,6 +269,14 @@ class RolloutMetadata(BaseModel):
     total_reward: float
     advantage: float
     token_logprobs: list[float]
+    # BFT: forced=True when the rollout was force-terminated at the thinking
+    # budget; force_span = [start, end] token indices of the injected FORCE
+    # template (validated byte-exact by the validator carve-out).
+    forced: bool = False
+    force_span: list[int] | None = None
+    # Validator-set (not miner-claimed): cap-truncated / non-terminating. Feeds
+    # the overlong side of the reward shaping.
+    truncated: bool = False
 
 
 class CommitModel(BaseModel):

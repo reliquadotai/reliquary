@@ -151,24 +151,27 @@ def first_eos_index(tokens: list[int], eos_ids: set[int]) -> int | None:
     return None
 
 
-def truncation_penalized_reward(
-    base_reward: float,
-    tokens: list[int],
-    prompt_length: int,
-    completion_length: int,
-    eos_ids: set[int],
-    *,
-    penalty: float,
-    cap: int,
-) -> float:
-    """Overlong reward shaping. A cap-hit rollout whose last token is not an EOS
-    has ``penalty`` subtracted from ``base_reward`` (a correct-but-truncated
-    rollout keeps most of its credit, e.g. 1.0→0.8, a wrong one drops below 0);
-    one that ends on EOS — even near the cap — keeps ``base_reward``. Penalizes
-    being cut off, not thinking long. Validator-side and deterministic so all
-    validators agree."""
-    cap_hit = (int(prompt_length) + int(completion_length)) >= int(cap)
-    ended_on_eos = bool(tokens) and int(tokens[-1]) in eos_ids
-    if cap_hit and not ended_on_eos:
-        return float(base_reward) - float(penalty)
-    return float(base_reward)
+def think_close_token_ids(tokenizer) -> list[int]:
+    """Atomic ``</think>`` token id(s) for this tokenizer. Raises if it cannot
+    resolve an atomic id — we never fall back to a split encoding, which the BFT
+    carve-out relies on being atomic."""
+    tid = tokenizer.convert_tokens_to_ids("</think>")
+    if tid is None or (isinstance(tid, int) and tid < 0):
+        raise ValueError("tokenizer has no atomic </think> token")
+    return [int(tid)]
+
+
+def force_close_token_ids(tokenizer) -> list[int]:
+    """Token ids of ``BFT_FORCE_TEMPLATE``: the atomic </think> id followed by
+    the encoded answer preamble (no special tokens added to the tail)."""
+    from reliquary.constants import BFT_FORCE_TEMPLATE
+
+    close_ids = think_close_token_ids(tokenizer)
+    tail = BFT_FORCE_TEMPLATE[len("</think>"):]
+    tail_ids = list(tokenizer.encode(tail, add_special_tokens=False))
+    return close_ids + [int(t) for t in tail_ids]
+
+
+def has_think_close(tokens: list[int], think_close_ids: set[int]) -> bool:
+    """True iff any token is an atomic </think> id."""
+    return any(int(t) in think_close_ids for t in tokens)

@@ -1173,10 +1173,10 @@ def test_reject_bad_tokens_negative_id():
 
 # ----- TerminationValidator wiring -----
 
-def test_non_eos_last_token_no_longer_gate_rejected():
-    # MAX_TRUNCATED gate removed: a non-EOS / truncated rollout is admitted
-    # (graded down by the max-tokens penalty) instead of rejected for
-    # BAD_TERMINATION. has_eos_padding and per-token checks still apply.
+def test_reject_bad_termination_when_last_token_not_eos():
+    # A non-EOS last token that did NOT hit the cap is a mid-generation stop →
+    # BAD_TERMINATION. (Cap-hit truncations go through the cap path and are
+    # bounded by MAX_TRUNCATED_PER_SUBMISSION instead.)
     seq_len = CHALLENGE_K + 4
     b = _make_batcher(
         model=_ModelStubWithVocab(),
@@ -1187,13 +1187,16 @@ def test_non_eos_last_token_no_longer_gate_rejected():
     req.rollouts[0].commit["tokens"] = list(range(seq_len))
     req.rollouts[0].tokens = req.rollouts[0].commit["tokens"]
     resp = b.accept_submission(req)
-    assert resp.reason != RejectReason.BAD_TERMINATION
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BAD_TERMINATION
 
 
 class _LongContextModelStub:
     class config:
         vocab_size = 20000
-        max_position_embeddings = 20000
+        # ≥ prompt + MAX_NEW_TOKENS_PROTOCOL_CAP (32768) so a full-cap rollout
+        # clears the sequence-length check and reaches the truncation logic.
+        max_position_embeddings = 40000
 
 
 def _request_with_cap_truncations(n_truncated: int, eos_id: int = 99):
@@ -1245,6 +1248,19 @@ def _set_eos_completion_lengths(req: BatchSubmissionRequest, lengths: list[int])
         )
         req.rollouts[idx].commit = commit
         req.rollouts[idx].tokens = commit["tokens"]
+
+
+def test_reject_cap_path_truncations_over_budget():
+    from reliquary.constants import MAX_TRUNCATED_PER_SUBMISSION
+
+    req, seq_len = _request_with_cap_truncations(MAX_TRUNCATED_PER_SUBMISSION + 1)
+    b = _make_batcher(
+        model=_LongContextModelStub(),
+        verify_commitment_proofs_fn=_grail_with_logits(seq_len),
+    )
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BAD_TERMINATION
 
 
 def test_accept_cap_path_truncations_at_budget():
@@ -2109,6 +2125,59 @@ def test_reject_boxed_answer_tampered():
     resp = b.accept_submission(req)
     assert resp.accepted is False
     assert resp.reason == RejectReason.BOXED_ANSWER_TAMPERED
+
+
+def test_reject_forced_rollout_with_noncanonical_force_span(monkeypatch):
+    # A forced rollout whose declared force_span tokens differ from the canonical
+    # FORCE ids (atomic </think>=200 + tail [201,202]) → reject. The thinking
+    # budget is monkeypatched to the test's thinking length so the force-position
+    # check passes and the byte-exact content check is what fires.
+    monkeypatch.setattr("reliquary.constants.BFT_THINKING_BUDGET", CHALLENGE_K)
+
+    class _ForceTokenizer:
+        eos_token_id = 99
+
+        def decode(self, ids, *, skip_special_tokens=False):
+            return "".join(chr(int(i)) for i in ids if int(i) != 99)
+
+        def convert_tokens_to_ids(self, t):
+            return 200 if t == "</think>" else None
+
+        def encode(self, text, add_special_tokens=False):
+            return [201, 202]
+
+    class _LongCtxModel:
+        class config:
+            vocab_size = 1000
+            max_position_embeddings = 4096
+
+    prompt = [10, 11, 12, 13]
+    thinking = [5] * CHALLENGE_K
+    force_noncanonical = [200, 999, 202]  # 999 differs from the canonical 201
+    answer = [55, 99]
+    tokens = prompt + thinking + force_noncanonical + answer
+    seq_len = len(tokens)
+    fstart = len(prompt) + len(thinking)
+
+    b = _make_batcher(
+        model=_LongCtxModel(),
+        tokenizer=_ForceTokenizer(),
+        verify_commitment_proofs_fn=_grail_with_chosen_probs(
+            seq_len, [0.99] * (seq_len - len(prompt)), prompt_length=len(prompt),
+        ),
+    )
+    req = _request()
+    commit = _make_commit(
+        tokens=tokens, prompt_length=len(prompt), success=True, total_reward=1.0,
+    )
+    commit["rollout"]["forced"] = True
+    commit["rollout"]["force_span"] = [fstart, fstart + 3]
+    req.rollouts[0].commit = commit
+    req.rollouts[0].tokens = commit["tokens"]
+
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.TOKEN_TAMPERED
 
 
 def test_accept_boxed_answer_high_prob():

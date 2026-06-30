@@ -7,11 +7,21 @@ from reliquary import constants as C
 
 
 def test_v2_sigma_bounds():
-    assert C.SIGMA_MIN == 0.33
-    assert C.BOOTSTRAP_SIGMA_MIN == 0.25
+    assert C.SIGMA_MIN == 0.43
+    assert C.BOOTSTRAP_SIGMA_MIN == 0.33
     assert C.BOOTSTRAP_SIGMA_MIN < C.SIGMA_MIN
-    assert C.MAX_TRUNCATED_PER_SUBMISSION == 8
-    assert C.BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION == 8
+    assert C.MAX_TRUNCATED_PER_SUBMISSION == 1
+    assert C.BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION == 1
+
+
+def test_bft_constants_present_and_within_cap():
+    assert isinstance(C.BFT_ENABLED, bool)
+    assert C.BFT_THINKING_BUDGET > 0
+    assert C.BFT_ANSWER_BUDGET > 0
+    # Forced thinking + forced answer must fit under the hard generation cap.
+    assert C.BFT_THINKING_BUDGET + C.BFT_ANSWER_BUDGET <= C.MAX_NEW_TOKENS_PROTOCOL_CAP
+    assert C.BFT_FORCE_TEMPLATE.startswith("</think>")
+    assert "\\boxed{" in C.BFT_FORCE_TEMPLATE
 
 
 def test_v2_group_sizes():

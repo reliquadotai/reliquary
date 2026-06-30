@@ -549,6 +549,8 @@ def evaluate_token_distribution(
     prompt_length: int,
     completion_length: int,
     proof: "ProofResult",
+    *,
+    exempt_positions: set[int] | None = None,
 ) -> tuple[bool | None, dict]:
     """Soft check: detect suspicious chosen-token probability distributions.
 
@@ -581,6 +583,8 @@ def evaluate_token_distribution(
     if completion_length < SAMPLING_MIN_STEPS:
         return None, {}
     probs = proof.completion_chosen_probs
+    if exempt_positions:
+        probs = [p for i, p in enumerate(probs) if i not in exempt_positions]
     if len(probs) < SAMPLING_MIN_STEPS:
         return None, {}
 
@@ -600,11 +604,50 @@ def evaluate_token_distribution(
     return (not suspicious), metrics
 
 
+def validate_force_span(
+    tokens: list[int],
+    rollout_meta: dict,
+    canonical_force_ids: list[int],
+    prompt_length: int,
+    *,
+    thinking_budget: int,
+    think_close_ids: set[int],
+) -> tuple[bool, set[int]]:
+    """BFT carve-out gate. For a forced rollout, verify the declared
+    ``force_span``:
+      * content  — byte-exactly the canonical FORCE ids (which begin with the
+        atomic ``</think>`` id);
+      * position — starts exactly ``thinking_budget`` tokens into the completion;
+      * honesty  — no atomic ``</think>`` appears before it.
+
+    Returns ``(ok, exempt)`` where ``exempt`` is the set of completion-relative
+    positions to skip in the per-token authenticity / distribution checks. A
+    non-forced rollout is ``(True, set())`` (no carve); an invalid span is
+    ``(False, set())``.
+    """
+    if not rollout_meta.get("forced"):
+        return True, set()
+    span = rollout_meta.get("force_span")
+    if not isinstance(span, (list, tuple)) or len(span) != 2:
+        return False, set()
+    start, end = int(span[0]), int(span[1])
+    if not (prompt_length <= start < end <= len(tokens)):
+        return False, set()
+    if start - prompt_length != int(thinking_budget):
+        return False, set()
+    if any(int(t) in think_close_ids for t in tokens[prompt_length:start]):
+        return False, set()
+    if list(tokens[start:end]) != list(canonical_force_ids):
+        return False, set()
+    return True, set(range(start - prompt_length, end - prompt_length))
+
+
 def evaluate_token_authenticity(
     proof: "ProofResult",
     *,
     threshold: float | None = None,
     argmax_conf: float | None = None,
+    exempt_positions: set[int] | None = None,
 ) -> tuple[bool, dict]:
     """Hard check: a completion token sampled at T_PROTO can never have
     chosen probability below ``threshold`` while the model's argmax sits at
@@ -622,8 +665,11 @@ def evaluate_token_authenticity(
     amax = proof.completion_argmax_probs
     if not chosen or not amax:
         return True, {}
+    exempt = exempt_positions or set()
     n = min(len(chosen), len(amax))
     for j in range(n):
+        if j in exempt:
+            continue
         if chosen[j] < threshold:
             ids = proof.completion_argmax_ids
             return False, {

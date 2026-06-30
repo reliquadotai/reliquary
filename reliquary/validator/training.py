@@ -134,6 +134,39 @@ def _compute_advantages(rewards: list[float]) -> list[float]:
     return [(r - mean) / std for r in rewards]
 
 
+def _shape_advantages(rollouts, advantages):
+    """Two-sided length shaping, on ADVANTAGES only (the σ-gate stays on raw
+    correctness). Overrides an advantage to −SHAPE_PENALTY when:
+      * overlong       — the rollout is cap-truncated; or
+      * under-thinking — a non-forced rollout finished early
+        (completion_length < SHAPE_LEN_FRAC·BFT_THINKING_BUDGET) and is wrong.
+    All inputs are validator-determined (reward re-graded, completion_length
+    schema-checked, forced/truncated validator-set). SHAPE_PENALTY == 0 disables
+    it."""
+    from reliquary.constants import (
+        BFT_THINKING_BUDGET,
+        SHAPE_LEN_FRAC,
+        SHAPE_PENALTY,
+    )
+
+    if SHAPE_PENALTY <= 0:
+        return advantages
+    early_cap = SHAPE_LEN_FRAC * BFT_THINKING_BUDGET
+    shaped = list(advantages)
+    for i, r in enumerate(rollouts):
+        meta = (getattr(r, "commit", None) or {}).get("rollout", {}) or {}
+        if meta.get("truncated"):
+            shaped[i] = -SHAPE_PENALTY          # overlong (cap-truncated)
+            continue
+        if meta.get("forced"):
+            continue                            # forced rollouts untouched
+        correct = float(getattr(r, "reward", 0.0)) > 0.5
+        clen = int(meta.get("completion_length", 0))
+        if clen < early_cap and not correct:
+            shaped[i] = -SHAPE_PENALTY          # under-thinking (early + wrong)
+    return shaped
+
+
 def _batch_loss_weights(
     token_counts: list[float],
     raw_weights: Optional[list[float]] = None,
@@ -194,6 +227,7 @@ def _plan_from_batches(batches, env_weights: Optional[dict] = None):
                 logger.debug("skipping degenerate group on prompt_idx=%s",
                              getattr(group, "prompt_idx", "?"))
                 continue
+            advantages = _shape_advantages(group.rollouts, advantages)
             surviving.append((group, advantages, b_idx))
             for rollout in group.rollouts:
                 meta = (rollout.commit or {}).get("rollout", {}) or {}
@@ -334,6 +368,21 @@ def _selected_logprobs_for_tokens(model, tokens: torch.Tensor, next_tokens: torc
     return _selected_logprobs(logits[:-1], next_tokens)
 
 
+def _completion_keep_mask(rollout_meta, prompt_length, n_completion, device):
+    """Boolean keep-mask over completion positions with the BFT ``force_span``
+    excluded. Returns ``None`` when the rollout is not forced (train every
+    completion token, identical to the pre-BFT path)."""
+    force_span = rollout_meta.get("force_span")
+    if not force_span:
+        return None
+    keep = torch.ones(n_completion, dtype=torch.bool, device=device)
+    fs = max(0, int(force_span[0]) - prompt_length)
+    fe = min(n_completion, int(force_span[1]) - prompt_length)
+    if fs < fe:
+        keep[fs:fe] = False
+    return keep
+
+
 def _rollout_loss(
     model,
     ref_model,
@@ -390,20 +439,38 @@ def _rollout_loss(
             f"model predicts {len(new_logprobs_c)} completion tokens"
         )
 
+    # BFT: mask the injected FORCE span out of the loss (= DAPO Overlong
+    # Filtering, narrowed to the carve). Those tokens were not sampled by the
+    # policy, so policy-gradient on them is invalid and their tiny probability
+    # would blow up the ratio; train only thinking-before + answer-after.
+    keep = _completion_keep_mask(
+        rollout.commit.get("rollout", {}), prompt_length,
+        int(new_logprobs_c.shape[0]), device,
+    )
+
     # PPO clipped surrogate
     log_ratio = new_logprobs_c - old_logprobs
     ratio = torch.exp(log_ratio)
     surr1 = ratio * advantage
     surr2 = torch.clamp(ratio, 1 - PPO_CLIP_EPSILON, 1 + PPO_CLIP_EPSILON) * advantage
-    ppo_loss = -torch.min(surr1, surr2).mean()
+    ppo_per_token = -torch.min(surr1, surr2)
 
     # KL(π_new || π_ref) — Schulman's k3 estimator:
     #   kl ≈ exp(ref - new) - 1 - (ref - new)
     # Unbiased, low-variance, always ≥ 0.
     kl_log_ratio = ref_logprobs_c - new_logprobs_c
-    kl = (torch.exp(kl_log_ratio) - 1 - kl_log_ratio).mean()
+    kl_per_token = torch.exp(kl_log_ratio) - 1 - kl_log_ratio
 
-    return ppo_loss, kl, int(new_logprobs_c.shape[0])
+    if keep is not None:
+        ppo_per_token = ppo_per_token[keep]
+        kl_per_token = kl_per_token[keep]
+
+    n_keep = int(ppo_per_token.shape[0])
+    if n_keep == 0:
+        # Whole completion masked (degenerate) → no training signal.
+        return ppo_per_token.sum(), kl_per_token.sum(), 0
+
+    return ppo_per_token.mean(), kl_per_token.mean(), n_keep
 
 
 # ---------------------------------------------------------------------------
@@ -682,6 +749,16 @@ def train_step(
         return model
 
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
+    # Finite-guard: a non-finite grad (e.g. from the BFT carve or any numerical
+    # blowup) must never reach the weights — skip the step rather than poison
+    # the checkpoint.
+    if not bool(torch.isfinite(grad_norm)):
+        logger.warning(
+            "train_step: non-finite grad_norm=%s → skipping optimizer step",
+            float(grad_norm),
+        )
+        _optimizer.zero_grad(set_to_none=True)
+        return model
     _optimizer.step()
     _scheduler.step()
     lr = _scheduler.get_last_lr()[0]

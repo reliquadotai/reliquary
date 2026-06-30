@@ -85,18 +85,30 @@ UPLOAD_BUFFER = NETWORK_UPLOAD_LATENCY
 # by 16-64k (measured), so higher buys little and needs that cast chunked first.
 MAX_NEW_TOKENS_PROTOCOL_CAP = 32768
 
-# Cap/non-EOS truncation budget per submission. Effectively off (= M_ROLLOUTS):
-# truncated rollouts are admitted and graded down by MAX_TOKEN_TRUNCATION_PENALTY
-# instead of rejecting the whole submission, so truncation becomes a learning
-# signal (DAPO overlong shaping) rather than an admission gate.
-MAX_TRUNCATED_PER_SUBMISSION = 8
-BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION = 8
+# Budget-Forced Termination (BFT): if a rollout has not emitted </think> by
+# BFT_THINKING_BUDGET tokens, the miner appends BFT_FORCE_TEMPLATE and samples
+# the answer in BFT_ANSWER_BUDGET more tokens, so it terminates with a real
+# (gradeable) answer instead of truncating. Thinking + answer sum to the hard
+# cap. TODO: tune B to the model's natural finish length.
+BFT_ENABLED = True
+BFT_THINKING_BUDGET = 24576
+BFT_ANSWER_BUDGET = 8192
+BFT_FORCE_TEMPLATE = "</think>\n\nFinal Answer: \\boxed{"
 
-# DAPO overlong reward shaping: SUBTRACTED from a rollout's reward when it hits
-# the cap without a natural EOS (so truncated-correct → 0.8, truncated-wrong →
-# -0.2), teaching the model to terminate while keeping correctness dominant.
-# Penalizes being cut off, not length.
-MAX_TOKEN_TRUNCATION_PENALTY = 0.2
+# Two-sided length reward shaping (applied to ADVANTAGES, not the σ-gate).
+# Under-thinking side: a non-forced rollout that finished early
+# (completion_length < SHAPE_LEN_FRAC · BFT_THINKING_BUDGET) and is wrong gets its
+# advantage set to −SHAPE_PENALTY. Overlong side: a cap-truncated rollout gets
+# the same penalty. SHAPE_PENALTY = 0 disables shaping. TODO: sweep both values.
+SHAPE_PENALTY = 0.5
+SHAPE_LEN_FRAC = 0.5
+
+# Cap/non-EOS truncation budget per submission. A single missing-EOS rollout
+# can be an honest local max-token accident; repeated missing-EOS rollouts in
+# one GRPO group are a sampling policy, not a rare exception, and have become
+# the main manufactured-loser path.
+MAX_TRUNCATED_PER_SUBMISSION = 1
+BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION = 1
 
 # Group-level reward-shape guard. The live attack manufactures binary reward
 # vectors such as 11110000 while cutting every zero-reward rollout to the same
@@ -257,11 +269,12 @@ DATASET_SPLIT = "train"
 
 # ────────────────  GRPO MARKET (v2)  ────────────────
 
-# Minimum reward-std for a group to pass the zone filter (DAPO Dynamic Sampling).
-# Lowered to 0.33 = DAPO's k∈{1..7} boundary (drops only zero-variance k=0,8); the
-# max-tokens penalty now supplies in-band variance from termination behaviour.
-SIGMA_MIN = 0.33
-BOOTSTRAP_SIGMA_MIN = 0.25
+# Minimum reward-std for a group to pass the zone filter. For binary
+# Bernoulli rewards this admits k ∈ [2, 6] for M=8 (σ at k=2/6 ≈ 0.433).
+# For continuous rewards it filters groups whose rollouts clustered too
+# tight to carry meaningful GRPO signal.
+SIGMA_MIN = 0.43
+BOOTSTRAP_SIGMA_MIN = 0.33
 
 # Number of rollouts per submission (= size of each GRPO group).
 M_ROLLOUTS = 8
