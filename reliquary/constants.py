@@ -642,7 +642,7 @@ GRADER_HEALTH_CHECK_INTERVAL_SECONDS = 30
 # below this while the model's argmax sits at >= TOKEN_AUTH_ARGMAX_CONF was not
 # sampled — it was injected. Calibrated on 550k honest vLLM->HF tokens (floor
 # 3.5e-7); measured injections <= 1e-13.
-TOKEN_AUTH_THRESHOLD = 1e-10
+TOKEN_AUTH_THRESHOLD = 1e-8
 TOKEN_AUTH_ARGMAX_CONF = 0.99
 # Shadow mode: compute + log the check without rejecting. Flip to True once prod
 # shadow logs confirm zero false positives.
