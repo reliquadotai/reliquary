@@ -65,7 +65,11 @@ from reliquary.validator.observability import (
     log_submission_stage,
     runtime_revision,
 )
-from reliquary.validator.verifier import is_in_zone, rewards_std
+from reliquary.validator.verifier import (
+    is_forced_bft_cap_termination,
+    is_in_zone,
+    rewards_std,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -257,6 +261,8 @@ def _proof_free_submission_reject(
             continue
 
         total_length = prompt_length + completion_length
+        if is_forced_bft_cap_termination(commit):
+            continue
         if total_length < MAX_NEW_TOKENS_PROTOCOL_CAP:
             return RejectReason.BAD_TERMINATION, "termination_preflight"
 

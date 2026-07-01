@@ -200,6 +200,57 @@ def test_generate_rollouts_bft_path_keeps_finished_rows():
     assert all(r["tokens"] == [10, 11, 777, 55, 248046] for r in rollouts)
 
 
+def test_generate_rollouts_does_not_apply_boxed_bft_to_opencode():
+    import torch
+    from types import SimpleNamespace
+
+    from reliquary.constants import BFT_THINKING_BUDGET, M_ROLLOUTS
+    from reliquary.miner.engine import MiningEngine
+
+    class _Tok:
+        chat_template = None
+        eos_token_id = 248046
+        pad_token_id = 248044
+
+        def encode(self, text, *, add_special_tokens):
+            assert add_special_tokens is False
+            return [10, 11]
+
+        def convert_tokens_to_ids(self, t):
+            return 777 if t == "</think>" else None
+
+    class _Model:
+        device = "cpu"
+        generation_config = SimpleNamespace(eos_token_id=248044)
+        config = SimpleNamespace(text_config=SimpleNamespace(eos_token_id=248044))
+
+        def __init__(self):
+            self.kwargs = None
+            self.calls = 0
+
+        def generate(self, input_tensor, **kwargs):
+            self.calls += 1
+            self.kwargs = kwargs
+            row = [10, 11, 123, 248046]
+            return torch.tensor([row] * input_tensor.shape[0])
+
+    eng = object.__new__(MiningEngine)
+    eng.tokenizer = _Tok()
+    eng.vllm_model = _Model()
+    eng.max_new_tokens = BFT_THINKING_BUDGET + 777
+
+    rollouts = eng._generate_m_rollouts(
+        {"prompt": "write code"}, "00", env_name="opencodeinstruct"
+    )
+
+    assert eng.vllm_model.kwargs["max_new_tokens"] == eng.max_new_tokens
+    assert eng.vllm_model.calls == 1
+    assert len(rollouts) == M_ROLLOUTS
+    assert all(r["forced"] is False for r in rollouts)
+    assert all("force_span" not in r for r in rollouts)
+    assert all(r["tokens"] == [10, 11, 123, 248046] for r in rollouts)
+
+
 def test_rollout_metadata_carries_bft_fields():
     from reliquary.miner.engine import _rollout_metadata
 

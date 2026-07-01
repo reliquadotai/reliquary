@@ -214,11 +214,12 @@ def _bft_assemble_rollouts(
 ):
     """Budget-Forced Termination assembly.
 
-    Rows of ``phase1_tensor`` that already emitted ``</think>`` are kept as-is
-    (truncated at their first EOS). Rows that did not are *forced*: ``force_ids``
-    are appended and a single phase-2 ``model.generate`` samples the boxed answer
-    for just those rows. Returns one rollout dict per row with ``forced`` and,
-    for forced rows, ``force_span`` = (start, end) of the injected ids within
+    Rows that hit EOS are kept as-is (truncated at first EOS). Rows that emitted
+    ``</think>`` but did not hit EOS are naturally closed and continue sampling
+    the answer for ``answer_budget`` tokens. Rows that did not close thinking are
+    *forced*: ``force_ids`` are appended and the same phase-2 generation samples
+    the boxed answer. Returns one rollout dict per row with ``forced`` and, for
+    forced rows, ``force_span`` = (start, end) of the injected ids within
     ``tokens`` (so the validator carve-out and trainer mask can locate them).
     """
     import torch
@@ -233,20 +234,28 @@ def _bft_assemble_rollouts(
     out: list = [None] * n
     unfinished_idx: list[int] = []
     unfinished_primed: list[list[int]] = []
+    unfinished_force_spans: list[tuple[int, int] | None] = []
     for i in range(n):
         seq = phase1_tensor[i].tolist()
         gen = seq[plen:]
         fe = first_eos_index(gen, eos_ids)
-        if has_think_close(gen, close_set) or fe is not None:
-            # Closed </think>, or otherwise terminated on EOS: keep as-is,
-            # trimmed at the first EOS. Only a rollout that ran to the budget
-            # with neither </think> nor EOS is force-terminated.
-            gen = gen[: fe + 1] if fe is not None else gen
+        if fe is not None:
+            # Finished on EOS: trim padding/trailing garbage and keep as-is.
+            gen = gen[: fe + 1]
             out[i] = {"tokens": prompt_tokens + gen,
                       "prompt_length": plen, "forced": False}
-        else:
+        elif has_think_close(gen, close_set):
+            # Naturally closed thinking but did not EOS within phase-1. Continue
+            # into the answer phase without injecting FORCE and without a carve.
             unfinished_idx.append(i)
-            unfinished_primed.append(seq + force_ids)
+            unfinished_primed.append(seq)
+            unfinished_force_spans.append(None)
+        else:
+            force_start = len(seq)
+            primed = seq + force_ids
+            unfinished_idx.append(i)
+            unfinished_primed.append(primed)
+            unfinished_force_spans.append((force_start, force_start + len(force_ids)))
 
     if unfinished_primed:
         width = max(len(p) for p in unfinished_primed)
@@ -265,9 +274,12 @@ def _bft_assemble_rollouts(
             tail = ans[k].tolist()[width:]
             fe = first_eos_index(tail, eos_ids)
             tail = tail[: fe + 1] if fe is not None else tail
-            out[i] = {"tokens": primed + tail, "prompt_length": plen,
-                      "forced": True,
-                      "force_span": (len(primed) - len(force_ids), len(primed))}
+            forced_span = unfinished_force_spans[k]
+            rollout = {"tokens": primed + tail, "prompt_length": plen,
+                       "forced": forced_span is not None}
+            if forced_span is not None:
+                rollout["force_span"] = forced_span
+            out[i] = rollout
     return out
 
 
@@ -444,7 +456,9 @@ class MiningEngine:
 
                 env = self.envs[env_name]
                 problem = env.get_problem(prompt_idx)
-                generations = self._generate_m_rollouts(problem, randomness)
+                generations = self._generate_m_rollouts(
+                    problem, randomness, env_name=env_name
+                )
                 if len(generations) < M_ROLLOUTS:
                     logger.warning(
                         "generated %d/%d for prompt %d; skipping",
@@ -579,7 +593,9 @@ class MiningEngine:
         logger.info("Checkpoint %s loaded into both models", local_path)
         return self.hf_model
 
-    def _generate_m_rollouts(self, problem, randomness) -> list[dict]:
+    def _generate_m_rollouts(
+        self, problem, randomness, *, env_name: str | None = None
+    ) -> list[dict]:
         """Generate M_ROLLOUTS completions at T_PROTO in one batched call.
 
         One .generate() with batch shape (M_ROLLOUTS, prompt_len) is ~5-7×
@@ -613,6 +629,12 @@ class MiningEngine:
         pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
         if pad_token_id is None and eos_ids:
             pad_token_id = min(eos_ids)
+        active_env_name = env_name
+        if active_env_name is None:
+            active_env_name = getattr(getattr(self, "env", None), "name", None)
+        bft_applicable = BFT_ENABLED and (
+            active_env_name is None or active_env_name == "openmathinstruct"
+        )
 
         with torch.no_grad():
             input_tensor = torch.tensor(
@@ -623,7 +645,7 @@ class MiningEngine:
             generate_kwargs = {
                 "max_new_tokens": (
                     min(self.max_new_tokens, BFT_THINKING_BUDGET)
-                    if BFT_ENABLED else self.max_new_tokens
+                    if bft_applicable else self.max_new_tokens
                 ),
                 "do_sample": True,
                 "temperature": T_PROTO,
@@ -636,7 +658,7 @@ class MiningEngine:
                 generate_kwargs["eos_token_id"] = sorted(eos_ids)
             outputs = self.vllm_model.generate(input_tensor, **generate_kwargs)
 
-            if BFT_ENABLED:
+            if bft_applicable:
                 # Phase-2 answer generation reuses the same protocol sampler so
                 # the boxed answer is a valid sample under GRAIL.
                 phase2_kwargs = {

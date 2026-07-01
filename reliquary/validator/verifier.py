@@ -95,6 +95,45 @@ def _eos_set_from_model(model: Any, tokenizer: Any) -> set[int]:
     return resolve_eos_token_ids(model, tokenizer)
 
 
+def bft_forced_cap_length(rollout_meta: dict) -> int | None:
+    """Return the local forced-BFT cap for rollout metadata, if applicable.
+
+    Forced BFT rollouts stop at thinking budget + canonical FORCE span + answer
+    budget, which is intentionally lower than the global hard schema cap. The
+    force span is byte-validated later by ``validate_force_span``; this helper
+    only lets termination logic recognize the intended BFT local cap.
+    """
+    if not rollout_meta.get("forced"):
+        return None
+    span = rollout_meta.get("force_span")
+    if not isinstance(span, (list, tuple)) or len(span) != 2:
+        return None
+    try:
+        start = int(span[0])
+        end = int(span[1])
+    except (TypeError, ValueError):
+        return None
+    if end <= start:
+        return None
+
+    from reliquary.constants import BFT_ANSWER_BUDGET, BFT_THINKING_BUDGET
+
+    return BFT_THINKING_BUDGET + (end - start) + BFT_ANSWER_BUDGET
+
+
+def is_forced_bft_cap_termination(commit: dict) -> bool:
+    """True when a forced BFT rollout reached its local answer cap."""
+    rollout_meta = commit.get("rollout", {}) or {}
+    cap = bft_forced_cap_length(rollout_meta)
+    if cap is None:
+        return False
+    try:
+        completion_length = int(rollout_meta.get("completion_length", 0))
+    except (TypeError, ValueError):
+        return False
+    return completion_length >= cap
+
+
 def verify_termination(
     commit: dict,
     tokenizer: Any,
@@ -126,7 +165,10 @@ def verify_termination(
     completion_length = int(rollout_meta.get("completion_length", 0))
     prompt_length = int(rollout_meta.get("prompt_length", 0))
 
-    if prompt_length + completion_length >= MAX_NEW_TOKENS_PROTOCOL_CAP:
+    if (
+        prompt_length + completion_length >= MAX_NEW_TOKENS_PROTOCOL_CAP
+        or is_forced_bft_cap_termination(commit)
+    ):
         return True
 
     eos_set = _eos_set_from_model(model, tokenizer)
@@ -184,6 +226,9 @@ def is_cap_truncation(
     rollout_meta = commit.get("rollout", {}) or {}
     completion_length = int(rollout_meta.get("completion_length", 0))
     prompt_length = int(rollout_meta.get("prompt_length", 0))
+    if is_forced_bft_cap_termination(commit):
+        return False
+
     if prompt_length + completion_length < MAX_NEW_TOKENS_PROTOCOL_CAP:
         return False
 

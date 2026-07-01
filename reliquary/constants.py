@@ -80,19 +80,21 @@ UPLOAD_BUFFER = NETWORK_UPLOAD_LATENCY
 
 # ────────────────  ROLLOUT GENERATION  ────────────────
 
-# Network-wide protocol cap on completion length. 32k = max safe under the
-# ~50-64k verify OOM (verifier.py:424 fp32 cast); CoT finish-rate plateaus ~55%
-# by 16-64k (measured), so higher buys little and needs that cast chunked first.
+# Network-wide hard schema cap on completion length. BFT math rollouts use a
+# lower measured local cap (thinking + FORCE + answer) that the validator
+# recognizes separately for forced rows; keep this global cap high enough for
+# non-BFT / opt-in code rollouts without revisiting verifier memory ceilings.
 MAX_NEW_TOKENS_PROTOCOL_CAP = 32768
 
 # Budget-Forced Termination (BFT): if a rollout has not emitted </think> by
 # BFT_THINKING_BUDGET tokens, the miner appends BFT_FORCE_TEMPLATE and samples
 # the answer in BFT_ANSWER_BUDGET more tokens, so it terminates with a real
-# (gradeable) answer instead of truncating. Thinking + answer sum to the hard
-# cap. TODO: tune B to the model's natural finish length.
+# (gradeable) answer instead of an unparseable thinking truncation. H200 sweeps
+# on real OpenMathInstruct prompts found 2048/512 to match 2048/256 reward
+# (5/6) with better EOS rate, while 4096/256 was slower and lower reward.
 BFT_ENABLED = True
-BFT_THINKING_BUDGET = 24576
-BFT_ANSWER_BUDGET = 8192
+BFT_THINKING_BUDGET = 2048
+BFT_ANSWER_BUDGET = 512
 BFT_FORCE_TEMPLATE = "</think>\n\nFinal Answer: \\boxed{"
 
 # Two-sided length reward shaping (applied to ADVANTAGES, not the σ-gate).

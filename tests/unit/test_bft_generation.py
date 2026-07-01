@@ -11,9 +11,11 @@ class _Phase2Model:
     def __init__(self, phase2):
         self._phase2 = phase2
         self.calls = 0
+        self.batches = []
 
     def generate(self, batch, **kw):
         self.calls += 1
+        self.batches.append(batch.detach().cpu().tolist())
         return self._phase2
 
 
@@ -74,6 +76,35 @@ def test_bft_does_not_force_eos_without_think_close():
     assert rollouts[0]["forced"] is False
     assert rollouts[0]["tokens"] == [1, 1, 5, 6, 99]  # trimmed at EOS, no force
     assert model.calls == 0
+
+
+def test_bft_continues_natural_close_without_eos():
+    # Natural </think> before EOS means the thinking phase is done, but the
+    # rollout still needs its answer budget. It must continue without injecting
+    # the force template and without declaring a force_span.
+    prompt = [1, 1]
+    think_close = {777}
+    force_ids = [777, 7, 8]
+    eos = {99}
+    phase1 = torch.tensor([[1, 1, 5, 777, 42, 43]])
+    phase2 = torch.tensor([[1, 1, 5, 777, 42, 43, 55, 99]])
+    model = _Phase2Model(phase2)
+
+    rollouts = _bft_assemble_rollouts(
+        model=model,
+        phase1_tensor=phase1,
+        prompt_tokens=prompt,
+        think_close_ids=think_close,
+        force_ids=force_ids,
+        eos_ids=eos,
+        answer_budget=8,
+    )
+
+    assert model.calls == 1
+    assert model.batches == [[[1, 1, 5, 777, 42, 43]]]
+    assert rollouts[0]["forced"] is False
+    assert "force_span" not in rollouts[0]
+    assert rollouts[0]["tokens"] == [1, 1, 5, 777, 42, 43, 55, 99]
 
 
 def test_bft_no_force_when_all_rows_finished():
