@@ -118,11 +118,11 @@ class TestEncodePrompt:
         assert out == [2] + list(b"hi")
         assert all(isinstance(t, int) for t in out)
 
-    def test_disables_thinking_when_template_supports_it(self):
+    def test_enables_thinking_when_template_supports_it(self):
         tok = _ThinkingTokenizer()
         out = encode_prompt(tok, "hi")
         assert out == [3] + list(b"hi")
-        assert tok.enable_thinking_seen is False
+        assert tok.enable_thinking_seen is True
 
     def test_falls_back_when_no_chat_template(self):
         tok = _BareTokenizer()
@@ -156,15 +156,17 @@ class TestEncodePrompt:
 # transformers pin in pyproject.toml in lockstep). Any drift here means
 # miners and the validator would disagree -> mass PROMPT_MISMATCH.
 _GOLDEN_PROMPT = "What is the capital of France? Answer in one word."
-_GOLDEN_TOKENS_QWEN35_4B = [
+# thinking-on: ends with an open <think>\n block (248068, 198) for the model to
+# fill, vs the old thinking-off empty <think></think> block.
+_GOLDEN_TOKENS_QWEN35_2B = [
     248045, 846, 198, 3710, 369, 279, 6511, 314, 9338, 30,
     21134, 303, 799, 3299, 13, 248046, 198, 248045, 74455, 198,
-    248068, 271, 248069, 271,
+    248068, 198,
 ]
 
 
 def test_golden_encoding_matches_production_tokenizer():
-    """Pin the exact canonical encoding for Qwen3.5-4B.
+    """Pin the exact canonical encoding for Qwen3.5-2B (thinking on).
 
     Network-gated: skips if the tokenizer can't be fetched. Where it runs
     (validators, CI with the tokenizer cached), it locks the encoding so a
@@ -181,4 +183,4 @@ def test_golden_encoding_matches_production_tokenizer():
     except Exception as e:  # offline / model gated / network down
         pytest.skip(f"production tokenizer unavailable: {e}")
 
-    assert encode_prompt(tok, _GOLDEN_PROMPT) == _GOLDEN_TOKENS_QWEN35_4B
+    assert encode_prompt(tok, _GOLDEN_PROMPT) == _GOLDEN_TOKENS_QWEN35_2B

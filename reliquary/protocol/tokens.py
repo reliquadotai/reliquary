@@ -60,9 +60,9 @@ def encode_prompt(tokenizer: Any, prompt_text: str) -> list[int]:
             "return_dict": False,
         }
         if "enable_thinking" in chat_template:
-            # Disable thinking: Qwen3.5's long CoT overruns the token cap before
-            # the final \boxed{} answer is emitted, truncating the reward to 0.
-            kwargs["enable_thinking"] = False
+            # Enable thinking: the raised token cap gives the CoT room to close
+            # </think> and emit \boxed{} before truncating.
+            kwargs["enable_thinking"] = True
         encoded = tokenizer.apply_chat_template(messages, **kwargs)
         if isinstance(encoded, dict) or hasattr(encoded, "input_ids"):
             encoded = encoded["input_ids"]

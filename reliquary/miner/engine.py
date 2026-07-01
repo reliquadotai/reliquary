@@ -208,6 +208,88 @@ def _current_drand_round_at_send() -> int:
     return compute_current_drand_round(time.time(), ci["genesis_time"], ci["period"])
 
 
+def _bft_assemble_rollouts(
+    *, model, phase1_tensor, prompt_tokens, think_close_ids, force_ids,
+    eos_ids, answer_budget, gen_kwargs=None,
+):
+    """Budget-Forced Termination assembly.
+
+    Rows of ``phase1_tensor`` that already emitted ``</think>`` are kept as-is
+    (truncated at their first EOS). Rows that did not are *forced*: ``force_ids``
+    are appended and a single phase-2 ``model.generate`` samples the boxed answer
+    for just those rows. Returns one rollout dict per row with ``forced`` and,
+    for forced rows, ``force_span`` = (start, end) of the injected ids within
+    ``tokens`` (so the validator carve-out and trainer mask can locate them).
+    """
+    import torch
+
+    from reliquary.shared.modeling import first_eos_index, has_think_close
+
+    plen = len(prompt_tokens)
+    n = int(phase1_tensor.shape[0])
+    close_set = {int(t) for t in think_close_ids}
+    force_ids = [int(t) for t in force_ids]
+
+    out: list = [None] * n
+    unfinished_idx: list[int] = []
+    unfinished_primed: list[list[int]] = []
+    for i in range(n):
+        seq = phase1_tensor[i].tolist()
+        gen = seq[plen:]
+        fe = first_eos_index(gen, eos_ids)
+        if has_think_close(gen, close_set) or fe is not None:
+            # Closed </think>, or otherwise terminated on EOS: keep as-is,
+            # trimmed at the first EOS. Only a rollout that ran to the budget
+            # with neither </think> nor EOS is force-terminated.
+            gen = gen[: fe + 1] if fe is not None else gen
+            out[i] = {"tokens": prompt_tokens + gen,
+                      "prompt_length": plen, "forced": False}
+        else:
+            unfinished_idx.append(i)
+            unfinished_primed.append(seq + force_ids)
+
+    if unfinished_primed:
+        width = max(len(p) for p in unfinished_primed)
+        pad = min(eos_ids) if eos_ids else 0
+        rows = [[pad] * (width - len(p)) + p for p in unfinished_primed]
+        mask = [[0] * (width - len(p)) + [1] * len(p) for p in unfinished_primed]
+        device = getattr(model, "device", "cpu")
+        ans = model.generate(
+            torch.tensor(rows, device=device),
+            attention_mask=torch.tensor(mask, device=device),
+            max_new_tokens=answer_budget,
+            **(gen_kwargs or {}),
+        )
+        for k, i in enumerate(unfinished_idx):
+            primed = unfinished_primed[k]
+            tail = ans[k].tolist()[width:]
+            fe = first_eos_index(tail, eos_ids)
+            tail = tail[: fe + 1] if fe is not None else tail
+            out[i] = {"tokens": primed + tail, "prompt_length": plen,
+                      "forced": True,
+                      "force_span": (len(primed) - len(force_ids), len(primed))}
+    return out
+
+
+def _rollout_metadata(generation: dict, token_logprobs: list) -> dict:
+    """Per-rollout metadata embedded in the GRAIL commit. Carries the BFT
+    ``forced`` flag and ``force_span`` so the validator carve-out and trainer
+    mask can locate the injected span."""
+    prompt_length = int(generation["prompt_length"])
+    all_tokens = generation["tokens"]
+    force_span = generation.get("force_span")
+    return {
+        "prompt_length": prompt_length,
+        "completion_length": len(all_tokens) - prompt_length,
+        "success": True,
+        "total_reward": 0.0,
+        "advantage": 0.0,
+        "token_logprobs": token_logprobs,
+        "forced": bool(generation.get("forced", False)),
+        "force_span": list(force_span) if force_span else None,
+    }
+
+
 class MiningEngine:
     """Two-GPU mining: vLLM (GPU 0) for generation, HF (GPU 1) for proofs."""
 
@@ -512,8 +594,18 @@ class MiningEngine:
         """
         import torch
 
+        from reliquary.constants import (
+            BFT_ANSWER_BUDGET,
+            BFT_ENABLED,
+            BFT_THINKING_BUDGET,
+        )
         from reliquary.protocol.tokens import encode_prompt
-        from reliquary.shared.modeling import first_eos_index, resolve_eos_token_ids
+        from reliquary.shared.modeling import (
+            first_eos_index,
+            force_close_token_ids,
+            resolve_eos_token_ids,
+            think_close_token_ids,
+        )
 
         prompt_tokens = encode_prompt(self.tokenizer, problem["prompt"])
         prompt_length = len(prompt_tokens)
@@ -529,7 +621,10 @@ class MiningEngine:
             )
             attention_mask = torch.ones_like(input_tensor)
             generate_kwargs = {
-                "max_new_tokens": self.max_new_tokens,
+                "max_new_tokens": (
+                    min(self.max_new_tokens, BFT_THINKING_BUDGET)
+                    if BFT_ENABLED else self.max_new_tokens
+                ),
                 "do_sample": True,
                 "temperature": T_PROTO,
                 "top_p": TOP_P_PROTO,
@@ -540,6 +635,29 @@ class MiningEngine:
             if eos_ids:
                 generate_kwargs["eos_token_id"] = sorted(eos_ids)
             outputs = self.vllm_model.generate(input_tensor, **generate_kwargs)
+
+            if BFT_ENABLED:
+                # Phase-2 answer generation reuses the same protocol sampler so
+                # the boxed answer is a valid sample under GRAIL.
+                phase2_kwargs = {
+                    "do_sample": True,
+                    "temperature": T_PROTO,
+                    "top_p": TOP_P_PROTO,
+                    "top_k": TOP_K_PROTO,
+                    "pad_token_id": pad_token_id,
+                }
+                if eos_ids:
+                    phase2_kwargs["eos_token_id"] = sorted(eos_ids)
+                return _bft_assemble_rollouts(
+                    model=self.vllm_model,
+                    phase1_tensor=outputs,
+                    prompt_tokens=prompt_tokens,
+                    think_close_ids=set(think_close_token_ids(self.tokenizer)),
+                    force_ids=force_close_token_ids(self.tokenizer),
+                    eos_ids=eos_ids,
+                    answer_budget=BFT_ANSWER_BUDGET,
+                    gen_kwargs=phase2_kwargs,
+                )
         rollouts = []
         for i in range(M_ROLLOUTS):
             seq = outputs[i].tolist()
@@ -550,6 +668,7 @@ class MiningEngine:
             rollouts.append({
                 "tokens": prompt_tokens + gen,
                 "prompt_length": prompt_length,
+                "forced": False,
             })
         return rollouts
 
@@ -654,12 +773,5 @@ class MiningEngine:
             "model": {"name": model_name, "layer_index": LAYER_INDEX},
             "signature": signature.hex(),
             "beacon": {"randomness": randomness},
-            "rollout": {
-                "prompt_length": prompt_length,
-                "completion_length": len(all_tokens) - prompt_length,
-                "success": True,
-                "total_reward": 0.0,
-                "advantage": 0.0,
-                "token_logprobs": token_logprobs,
-            },
+            "rollout": _rollout_metadata(generation, token_logprobs),
         }

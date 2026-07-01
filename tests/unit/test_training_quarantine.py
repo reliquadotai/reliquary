@@ -154,7 +154,7 @@ def test_reward_shape_density_quarantines_training():
 def test_single_long_zero_tail_shape_quarantines_training():
     suspicious_shape = {
         "suspicious": True,
-        "zero_length_mode": 4500,
+        "zero_length_mode": 18000,
         "zero_length_mode_count": 2,
     }
     batch = [

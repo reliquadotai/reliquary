@@ -79,6 +79,7 @@ from reliquary.validator.verifier import (
     is_cap_truncation,
     is_in_zone,
     rewards_std,
+    validate_force_span,
     verify_logprobs_claim,
     verify_termination,
 )
@@ -997,6 +998,22 @@ class GrpoWindowBatcher:
         )
         truncated_count = 0
         truncated_flags = [False] * len(request.rollouts)
+        # BFT carve-out: resolve the canonical FORCE ids once, only if some
+        # rollout is forced; non-forced submissions never touch the tokenizer.
+        from reliquary.constants import BFT_THINKING_BUDGET
+        canonical_force_ids: list[int] = []
+        force_think_close_ids: set[int] = set()
+        if any((r.commit.get("rollout") or {}).get("forced")
+               for r in request.rollouts):
+            from reliquary.shared.modeling import force_close_token_ids
+            try:
+                canonical_force_ids = force_close_token_ids(self.tokenizer)
+                # the FORCE ids begin with the atomic </think> id
+                force_think_close_ids = (
+                    {int(canonical_force_ids[0])} if canonical_force_ids else set()
+                )
+            except Exception:
+                canonical_force_ids = []
 
         for rollout_idx, rollout in enumerate(request.rollouts):
             if not self._verify_signature(rollout.commit, request.miner_hotkey):
@@ -1069,6 +1086,10 @@ class GrpoWindowBatcher:
                 if not termination_ok or cap_truncated:
                     truncated_flags[rollout_idx] = True
                     truncated_count += 1
+                    # Validator-set flag for the overlong side of reward shaping.
+                    _rdict = rollout.commit.get("rollout")
+                    if isinstance(_rdict, dict):
+                        _rdict["truncated"] = True
                     if truncated_count > max_truncated_per_submission:
                         return reject(
                             RejectReason.BAD_TERMINATION,
@@ -1089,6 +1110,23 @@ class GrpoWindowBatcher:
             prompt_len = int(rollout_dict.get("prompt_length", 0))
             completion_len = int(rollout_dict.get("completion_length", 0))
             claimed_lp = rollout_dict.get("token_logprobs", []) or []
+
+            # BFT carve-out: validate a forced rollout's FORCE span (byte-exact,
+            # atomic-</think>-anchored, at the thinking budget); a valid span's
+            # positions are exempted from the per-token auth / distribution
+            # checks (their probability is legitimately ~0 — injected, not sampled).
+            carve_ok, exempt_positions = validate_force_span(
+                rollout.commit["tokens"], rollout_dict,
+                canonical_force_ids, prompt_len,
+                thinking_budget=BFT_THINKING_BUDGET,
+                think_close_ids=force_think_close_ids,
+            )
+            if not carve_ok:
+                return reject(
+                    RejectReason.TOKEN_TAMPERED,
+                    "force_span",
+                    sketch_diff_max=sketch_diff_max,
+                )
 
             lp_ok, lp_dev = verify_logprobs_claim(
                 tokens=rollout.commit["tokens"],
@@ -1117,6 +1155,7 @@ class GrpoWindowBatcher:
                 prompt_length=prompt_len,
                 completion_length=completion_len,
                 proof=proof,
+                exempt_positions=exempt_positions,
             )
             if dist_metrics and "q10" in dist_metrics:
                 q10 = float(dist_metrics["q10"])
@@ -1161,6 +1200,7 @@ class GrpoWindowBatcher:
                 prompt_length=prompt_len,
                 completion_length=completion_len,
                 tokenizer=self.tokenizer,
+                exempt_positions=exempt_positions,
             )
             if not auth_ok:
                 logger.info(
@@ -1189,6 +1229,7 @@ class GrpoWindowBatcher:
                     include_findings=private_auth_forensics_enabled,
                     max_findings=private_auth_forensics_max_findings,
                     context_chars=private_auth_forensics_context_chars,
+                    exempt_positions=exempt_positions,
                 )
             )
             if all_token_shadow_metrics:

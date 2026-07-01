@@ -6,7 +6,7 @@ No os.getenv() overrides. Changes require coordinated deployment.
 
 # ────────────────  GRAIL PROOF VERSION  ────────────────
 
-GRAIL_PROOF_VERSION = "v6"
+GRAIL_PROOF_VERSION = "v7"
 
 # ────────────────  CRYPTOGRAPHIC CONSTANTS  ────────────────
 
@@ -80,8 +80,28 @@ UPLOAD_BUFFER = NETWORK_UPLOAD_LATENCY
 
 # ────────────────  ROLLOUT GENERATION  ────────────────
 
-# Network-wide protocol cap on completion length.
-MAX_NEW_TOKENS_PROTOCOL_CAP = 8192
+# Network-wide protocol cap on completion length. 32k = max safe under the
+# ~50-64k verify OOM (verifier.py:424 fp32 cast); CoT finish-rate plateaus ~55%
+# by 16-64k (measured), so higher buys little and needs that cast chunked first.
+MAX_NEW_TOKENS_PROTOCOL_CAP = 32768
+
+# Budget-Forced Termination (BFT): if a rollout has not emitted </think> by
+# BFT_THINKING_BUDGET tokens, the miner appends BFT_FORCE_TEMPLATE and samples
+# the answer in BFT_ANSWER_BUDGET more tokens, so it terminates with a real
+# (gradeable) answer instead of truncating. Thinking + answer sum to the hard
+# cap. TODO: tune B to the model's natural finish length.
+BFT_ENABLED = True
+BFT_THINKING_BUDGET = 24576
+BFT_ANSWER_BUDGET = 8192
+BFT_FORCE_TEMPLATE = "</think>\n\nFinal Answer: \\boxed{"
+
+# Two-sided length reward shaping (applied to ADVANTAGES, not the σ-gate).
+# Under-thinking side: a non-forced rollout that finished early
+# (completion_length < SHAPE_LEN_FRAC · BFT_THINKING_BUDGET) and is wrong gets its
+# advantage set to −SHAPE_PENALTY. Overlong side: a cap-truncated rollout gets
+# the same penalty. SHAPE_PENALTY = 0 disables shaping. TODO: sweep both values.
+SHAPE_PENALTY = 0.5
+SHAPE_LEN_FRAC = 0.5
 
 # Cap/non-EOS truncation budget per submission. A single missing-EOS rollout
 # can be an honest local max-token accident; repeated missing-EOS rollouts in
@@ -108,13 +128,13 @@ TRAINING_QUARANTINE_ENABLED = True
 TRAINING_QUARANTINE_MAX_HOTKEY_SHARE = 0.75
 TRAINING_QUARANTINE_MAX_REWARD_VECTOR_SHARE = 0.75
 TRAINING_QUARANTINE_REWARD_VECTOR_MIN_GROUPS = 4
-TRAINING_QUARANTINE_MAX_MEAN_COMPLETION_LENGTH = 4096
-TRAINING_QUARANTINE_MAX_SINGLE_COMPLETION_LENGTH = 7000
+TRAINING_QUARANTINE_MAX_MEAN_COMPLETION_LENGTH = 24576
+TRAINING_QUARANTINE_MAX_SINGLE_COMPLETION_LENGTH = 32768
 TRAINING_QUARANTINE_EXTREME_LENGTH_MIN_ROLLOUTS = 4
 TRAINING_QUARANTINE_EXTREME_LENGTH_MIN_GROUPS = 3
 TRAINING_QUARANTINE_REJECT_SPIKE_MIN = 32
 TRAINING_QUARANTINE_REWARD_SHAPE_MIN_GROUPS = 2
-TRAINING_QUARANTINE_LONG_ZERO_TAIL_MIN_LENGTH = 2048
+TRAINING_QUARANTINE_LONG_ZERO_TAIL_MIN_LENGTH = 16384
 
 # Soft cap on per-hotkey entries persisted to ``archive["rejected"]`` per
 # window. Beyond this, ``reject_counts`` still increments but no metadata is
@@ -289,14 +309,19 @@ GRAD_ACCUM_STEPS: int = len(ENVIRONMENT_MIX)
 # "opencodeinstruct": 1.0}; unlisted envs default to 1.0.
 ENV_LOSS_WEIGHTS: dict[str, float] = {}
 
-# Sampling temperature fixed at protocol level. Miners who use a different
-# T would produce samples from a different distribution → biased GRPO
-# gradient. Value chosen in the GRPO-friendly range (non-zero).
-T_PROTO = 0.9
+# Sampling fixed at protocol level. Miners who use different values produce
+# samples from a different distribution -> biased GRPO gradient. Keep these
+# values exactly mirrored by the miner generation path and the validator's
+# chosen-token probability checks.
+T_PROTO = 0.6
 
 # Top-p and top-k for sampling (fixed alongside T_PROTO).
-TOP_P_PROTO = 1.0
-TOP_K_PROTO = 0
+TOP_P_PROTO = 0.95
+TOP_K_PROTO = 20
+
+# Do not add miner-only logits processors here. A presence/repetition penalty
+# changes the sampling policy; unless the validator also recomputes and verifies
+# the same penalized old logprobs, PPO/DAPO trains against the wrong pi_old.
 
 # A prompt that entered the training batch is ineligible for B_BATCH for
 # the next N windows (= training steps). Forces curriculum rotation so
@@ -525,7 +550,7 @@ GRAD_CLIP_NORM = 1.0
 # forward/backward. Short rollouts pack together; a rollout longer than this
 # runs alone (= the legacy one-at-a-time path), so peak memory never exceeds a
 # single sequence of this length. Sized at the protocol completion cap.
-MICROBATCH_MAX_PADDED_TOKENS = 8192
+MICROBATCH_MAX_PADDED_TOKENS = 32768
 
 # Linear LR warmup for the first N training steps (= N windows sealed).
 LR_WARMUP_WINDOWS = 10
@@ -536,7 +561,7 @@ LR_COSINE_MAX_WINDOWS = 10_000
 
 # Default base model (HF repo id). Served as the reference for KL and the
 # cold-start checkpoint.
-DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-4B"
+DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-2B"
 
 # ────────────────  WANDB TELEMETRY (opt-in, validator-only)  ────────────────
 

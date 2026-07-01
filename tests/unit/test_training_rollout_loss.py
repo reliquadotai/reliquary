@@ -193,6 +193,30 @@ def test_rollout_loss_returns_completion_token_count(tiny_model_and_tokenizer):
     assert n_tok == 5
 
 
+def test_rollout_loss_masks_force_span_from_loss(tiny_model_and_tokenizer):
+    """BFT: a forced rollout's injected FORCE span is excluded from the loss —
+    the trained-token count drops by the span length and the loss changes."""
+    reset_training_state()
+    model, _ = tiny_model_and_tokenizer
+    ref = _make_ref(model)
+    device = next(model.parameters()).device
+
+    tokens = [1, 2, 3, 4, 5, 6, 7, 8]  # prompt_length=3 → 5 completion tokens
+    natural = _build_rollout(tokens=tokens, reward=1.0, prompt_length=3)
+    forced = _build_rollout(tokens=tokens, reward=1.0, prompt_length=3)
+    forced.commit["rollout"]["forced"] = True
+    # absolute span [5,7) → completion-relative positions 2,3 (2 tokens)
+    forced.commit["rollout"]["force_span"] = [5, 7]
+
+    ppo_n, _kl_n, n_n = _rollout_loss(model, ref, natural, advantage=1.0, device=device)
+    ppo_f, _kl_f, n_f = _rollout_loss(model, ref, forced, advantage=1.0, device=device)
+
+    assert n_n == 5          # all completion tokens trained
+    assert n_f == 3          # 2-token FORCE span masked out
+    assert torch.isfinite(ppo_f)
+    assert ppo_f.item() != ppo_n.item()   # masking the span changed the loss
+
+
 def test_rollout_loss_uses_commit_tokens_as_source_of_truth(tiny_model_and_tokenizer):
     reset_training_state()
     model, _ = tiny_model_and_tokenizer
@@ -230,6 +254,26 @@ def test_train_step_updates_optimizer(tiny_model_and_tokenizer):
     after = next(model.parameters()).detach().clone()
     diff = (before - after).abs().max().item()
     assert diff > 0.0, "expected some parameter change after optimizer step"
+
+
+def test_train_step_skips_optimizer_on_nonfinite_grad(tiny_model_and_tokenizer, monkeypatch):
+    """Finite-guard: a non-finite grad_norm skips the optimizer step so a NaN
+    never reaches the weights."""
+    reset_training_state()
+    model, _ = tiny_model_and_tokenizer
+    rollouts = [_build_rollout([1, 2, 3, 4, 5, 6], r, 2) for r in [1, 1, 0, 0]]
+    group = _FakeGroup(rollouts=rollouts, prompt_idx=0)
+
+    monkeypatch.setattr(
+        torch.nn.utils, "clip_grad_norm_",
+        lambda *a, **k: torch.tensor(float("nan")),
+    )
+
+    before = next(model.parameters()).detach().clone()
+    result = train_step(model, [[group]], ref_model=_make_ref(model))
+    assert result is model
+    after = next(model.parameters()).detach().clone()
+    assert torch.equal(before, after), "weights must not change on non-finite grad"
 
 
 def test_train_step_token_level_handles_unequal_lengths(tiny_model_and_tokenizer):

@@ -1,7 +1,8 @@
 """End-to-end smoke test for the OpenMathInstruct-2 environment.
 
-Requires network + ~1 GB of disk (downloads the first parquet shard from
-HuggingFace). Skipped if the dataset cannot be reached.
+Requires network. Reads the parquet footers + only the touched row-groups
+from HuggingFace (no bulk shard download). Skipped if the dataset cannot be
+reached.
 """
 
 import pytest
@@ -13,9 +14,7 @@ def test_default_environments_includes_openmathinstruct():
 
 
 def test_default_environment_loads_and_scores():
-    """Load the smallest possible shard set and run reward on a real row."""
-    import os
-    os.environ.setdefault("RELIQUARY_OMI_SHARDS", "1")
+    """Load the full virtual dataset and run reward on a real row."""
     from reliquary.environment import load_environment, Environment
 
     try:
@@ -43,8 +42,6 @@ def test_default_environment_loads_and_scores():
 
 def test_get_problem_is_deterministic():
     """Same index always returns the same problem (cross-miner consistency)."""
-    import os
-    os.environ.setdefault("RELIQUARY_OMI_SHARDS", "1")
     from reliquary.environment import load_environment
     try:
         env = load_environment("openmathinstruct")
@@ -59,8 +56,6 @@ def test_get_problem_is_deterministic():
 
 def test_modulo_wrap_for_out_of_range_index():
     """Indices beyond len(env) wrap modulo without raising."""
-    import os
-    os.environ.setdefault("RELIQUARY_OMI_SHARDS", "1")
     from reliquary.environment import load_environment
     try:
         env = load_environment("openmathinstruct")

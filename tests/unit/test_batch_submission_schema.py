@@ -27,7 +27,7 @@ def _valid_rollouts(k: int = 4):
         commit = {
             "tokens": tokens,
             "commitments": [{"sketch": 0} for _ in range(seq_len)],
-            "proof_version": "v6",
+            "proof_version": "v7",
             "model": {"name": "test-model", "layer_index": 6},
             "signature": "ab" * 32,
             "beacon": {"randomness": "cd" * 16},
