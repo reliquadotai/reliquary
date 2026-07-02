@@ -213,6 +213,23 @@ def test_ingestion_resets_miner_supplied_truncated_flag():
     )
 
 
+def test_ingestion_resets_forced_flag_in_non_math_env():
+    """BFT is math-only (mirror the miner's env gate): a `forced` flag on a
+    non-math submission is wiped at ingestion so the carve-out stays scoped to
+    openmathinstruct. PrivateRewardFakeEnv.name == "opencodeinstruct"."""
+    b = _make_batcher(env=PrivateRewardFakeEnv())
+    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+    for rollout in req.rollouts:
+        rollout.commit["rollout"]["forced"] = True  # miner-supplied
+
+    resp = b.accept_submission(req)
+
+    assert resp.accepted is True, resp
+    assert all(
+        rollout.commit["rollout"]["forced"] is False for rollout in req.rollouts
+    )
+
+
 def test_grail_verifier_receives_tokenizer_for_sparse_pstop():
     import torch
     from reliquary.validator.verifier import ProofResult
@@ -2192,6 +2209,7 @@ def test_reject_forced_rollout_with_noncanonical_force_span(monkeypatch):
             seq_len, [0.99] * (seq_len - len(prompt)), prompt_length=len(prompt),
         ),
     )
+    b.env.name = "openmathinstruct"  # BFT forcing is honoured only in math
     req = _request()
     commit = _make_commit(
         tokens=tokens, prompt_length=len(prompt), success=True, total_reward=1.0,
