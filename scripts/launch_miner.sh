@@ -42,7 +42,7 @@ nohup .venv/bin/python -m reliquary.cli.main mine \
     --netuid "$NETUID" \
     --wallet-name "$BT_WALLET_NAME" \
     --hotkey "$BT_HOTKEY" \
-    --checkpoint "${RELIQUARY_CHECKPOINT:-Qwen/Qwen3.5-4B}" \
+    --checkpoint "${RELIQUARY_CHECKPOINT:-Qwen/Qwen3.5-2B}" \
     --environments "$ENVIRONMENTS" \
     --log-level INFO \
     $drand_flag $validator_url_arg $WALLET_PATH_ARG \
