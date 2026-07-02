@@ -194,6 +194,25 @@ def test_accept_in_zone_submission():
     assert len(b.valid_submissions()) == 1
 
 
+def test_ingestion_resets_miner_supplied_truncated_flag():
+    """`truncated` is a validator-set reward-shaping flag. A miner-supplied
+    value must be wiped at ingestion so it can't clamp a losing rollout's
+    advantage to -SHAPE_PENALTY via _shape_advantages. These rollouts are not
+    cap-truncated, so after the reset the validator leaves the flag False."""
+    b = _make_batcher()
+    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+    for rollout in req.rollouts:
+        rollout.commit["rollout"]["truncated"] = True  # miner-forged
+
+    resp = b.accept_submission(req)
+
+    assert resp.accepted is True, resp
+    assert all(
+        rollout.commit["rollout"]["truncated"] is False
+        for rollout in req.rollouts
+    )
+
+
 def test_grail_verifier_receives_tokenizer_for_sparse_pstop():
     import torch
     from reliquary.validator.verifier import ProofResult

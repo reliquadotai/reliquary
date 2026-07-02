@@ -1016,6 +1016,14 @@ class GrpoWindowBatcher:
                 canonical_force_ids = []
 
         for rollout_idx, rollout in enumerate(request.rollouts):
+            # `truncated` is a validator-set flag (overlong reward shaping, see
+            # submission.py). Wipe any miner-supplied value at ingestion so only
+            # the validator's own cap/EOS detection below can set it — otherwise
+            # a miner could flag a losing rollout to clamp its negative advantage
+            # to -SHAPE_PENALTY via _shape_advantages and attenuate the gradient.
+            _ingest_meta = rollout.commit.get("rollout")
+            if isinstance(_ingest_meta, dict):
+                _ingest_meta["truncated"] = False
             if not self._verify_signature(rollout.commit, request.miner_hotkey):
                 return reject(RejectReason.BAD_SIGNATURE, "rollout_signature")
             # Randomness binding: the miner-claimed beacon randomness MUST equal
