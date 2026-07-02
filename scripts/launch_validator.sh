@@ -46,7 +46,7 @@ nohup .venv/bin/python -m reliquary.cli.main validate \
     --netuid "$NETUID" \
     --wallet-name "$BT_WALLET_NAME" \
     --hotkey "$BT_HOTKEY" \
-    --checkpoint "${RELIQUARY_CHECKPOINT:-Qwen/Qwen3.5-4B}" \
+    --checkpoint "${RELIQUARY_CHECKPOINT:-Qwen/Qwen3.5-2B}" \
     --environments "$ENVIRONMENTS" \
     --http-host "$HTTP_HOST" \
     --http-port "$HTTP_PORT" \

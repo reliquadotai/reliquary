@@ -19,7 +19,7 @@ import tempfile
 from pathlib import Path
 
 
-DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-4B"
+DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-2B"
 CHECKPOINT_TITLE = re.compile(r"^checkpoint\s+(\d+)\s*$", re.IGNORECASE)
 
 
