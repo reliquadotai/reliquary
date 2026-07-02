@@ -205,6 +205,29 @@ class _PreflightAdmissionBatcher:
         )
 
 
+class _FakeBFTTokenizer:
+    """Minimal tokenizer that resolves the canonical FORCE ids so the preflight
+    force-span structural check is exercised without loading a real model.
+    ``</think>`` maps to ``close_id``; the template tail encodes to ``tail_ids``.
+    """
+
+    eos_token_id = 99
+
+    def __init__(self, close_id: int = 1001, tail_ids=(2001, 2002, 2003)):
+        self._close_id = close_id
+        self._tail_ids = list(tail_ids)
+
+    @property
+    def canonical_force_ids(self) -> list[int]:
+        return [self._close_id, *self._tail_ids]
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        return self._close_id if token == "</think>" else -1
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        return list(self._tail_ids)
+
+
 def _assert_pre_queue_reject(s: ValidatorServer, payload: dict,
                               expected: RejectReason) -> None:
     """Common assertion: /submit returns expected reason, queue stays empty."""
@@ -365,6 +388,73 @@ def test_forced_bft_cap_reaches_proof_admission_before_span_validation():
     assert body["accepted"] is True, body
     assert body["reason"] == RejectReason.ACCEPTED.value
     assert batcher.proof_admission_count == 1
+
+
+def _forced_payload(force_span_tokens: list[int]):
+    """Build a forced-BFT cap submission whose FORCE-span positions hold
+    ``force_span_tokens`` (canonical → valid; anything else → tampered)."""
+    from reliquary.constants import BFT_ANSWER_BUDGET, BFT_THINKING_BUDGET
+
+    prompt_length = 4
+    force_len = len(force_span_tokens)
+    completion = (
+        [5] * BFT_THINKING_BUDGET
+        + list(force_span_tokens)
+        + [5] * BFT_ANSWER_BUDGET
+    )
+    payload = _submission_with_completion_tokens(
+        completion, rewards=_IN_ZONE_REWARDS,
+    )
+    for rollout in payload["rollouts"]:
+        meta = rollout["commit"]["rollout"]
+        meta["forced"] = True
+        meta["force_span"] = [
+            prompt_length + BFT_THINKING_BUDGET,
+            prompt_length + BFT_THINKING_BUDGET + force_len,
+        ]
+    return payload
+
+
+def test_valid_forced_span_reaches_proof_admission_with_real_tokenizer():
+    """With a resolvable tokenizer, a byte-exact FORCE span is honoured and the
+    forced-cap rollout still reaches proof admission (no early reject)."""
+    s = ValidatorServer()
+    s.set_current_state(WindowState.OPEN)
+    batcher = _PreflightAdmissionBatcher(eos_token_id=99)
+    tokenizer = _FakeBFTTokenizer()
+    batcher.tokenizer = tokenizer
+    s.set_active_batcher(batcher)
+
+    payload = _forced_payload(tokenizer.canonical_force_ids)
+    with TestClient(s.app) as client:
+        r = client.post("/submit", json=payload)
+
+    body = r.json()
+    assert body["accepted"] is True, body
+    assert batcher.proof_admission_count == 1
+
+
+def test_fake_forced_span_rejected_before_proof_admission():
+    """A truncation-spam rollout marked forced=True with a plausible but
+    byte-INVALID span must be rejected by the cheap preflight, before it can
+    burn a scarce GPU proof slot (the full validate_force_span would reject it
+    regardless — the net decision is unchanged, only cheaper)."""
+    s = ValidatorServer()
+    s.set_current_state(WindowState.OPEN)
+    batcher = _PreflightAdmissionBatcher(eos_token_id=99)
+    tokenizer = _FakeBFTTokenizer()
+    batcher.tokenizer = tokenizer
+    s.set_active_batcher(batcher)
+
+    # Same width as the canonical span, but filler content (not the FORCE ids).
+    payload = _forced_payload([5] * len(tokenizer.canonical_force_ids))
+    with TestClient(s.app) as client:
+        r = client.post("/submit", json=payload)
+
+    body = r.json()
+    assert body["accepted"] is False, body
+    assert body["reason"] == RejectReason.TOKEN_TAMPERED.value, body
+    assert batcher.proof_admission_count == 0
 
 
 def test_eos_padding_rejected_before_proof_admission():

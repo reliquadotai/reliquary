@@ -69,6 +69,7 @@ from reliquary.validator.verifier import (
     is_forced_bft_cap_termination,
     is_in_zone,
     rewards_std,
+    validate_force_span,
 )
 
 logger = logging.getLogger(__name__)
@@ -135,6 +136,46 @@ def _proof_free_bootstrap(batcher: Any) -> bool:
     if _is_mock_like(bootstrap):
         return False
     return bool(bootstrap)
+
+
+def _proof_free_force_span_validator(batcher: Any):
+    """Resolve a cheap ``validate_force_span`` closure for the preflight, or
+    ``None`` when no real tokenizer is available (mock/test batchers).
+
+    The preflight grants a forced-BFT rollout an exemption from the truncation
+    budget based on the *miner-supplied* ``force_span``. Without a structural
+    check a node can mark ordinary cap-truncation spam ``forced=True`` with a
+    plausible span to bypass this cheap gate and force a scarce GPU proof slot.
+    Running the same byte-exact/position-pinned ``validate_force_span`` the full
+    path applies keeps the net accept/reject decision identical while rejecting
+    fakes before any GPU work.
+    """
+    tokenizer = getattr(batcher, "tokenizer", None)
+    if tokenizer is None or _is_mock_like(tokenizer):
+        return None
+    try:
+        from reliquary.constants import BFT_THINKING_BUDGET
+        from reliquary.shared.modeling import force_close_token_ids
+
+        canonical_force_ids = force_close_token_ids(tokenizer)
+    except Exception:
+        return None
+    if not canonical_force_ids:
+        return None
+    think_close_ids = {int(canonical_force_ids[0])}
+
+    def _validate(tokens: list[int], meta: dict) -> bool:
+        ok, _ = validate_force_span(
+            tokens,
+            meta,
+            canonical_force_ids,
+            int(meta.get("prompt_length", 0)),
+            thinking_budget=BFT_THINKING_BUDGET,
+            think_close_ids=think_close_ids,
+        )
+        return ok
+
+    return _validate
 
 
 def _claimed_final_token_logprob(commit: dict[str, Any]) -> float | None:
@@ -234,6 +275,7 @@ def _proof_free_submission_reject(
         else MAX_TRUNCATED_PER_SUBMISSION
     )
     truncated_count = 0
+    validate_forced_span = _proof_free_force_span_validator(batcher)
 
     for rollout in request.rollouts:
         commit = rollout.commit
@@ -262,6 +304,16 @@ def _proof_free_submission_reject(
 
         total_length = prompt_length + completion_length
         if is_forced_bft_cap_termination(commit):
+            # Only exempt from the truncation budget if the claimed FORCE span
+            # is structurally valid (byte-exact, position-pinned). A fake-forced
+            # rollout is rejected here instead of after a GPU proof; the full
+            # validate_force_span in the batcher would reject it regardless, so
+            # the net decision is unchanged.
+            if (
+                validate_forced_span is not None
+                and not validate_forced_span(tokens, meta)
+            ):
+                return RejectReason.TOKEN_TAMPERED, "force_span_preflight"
             continue
         if total_length < MAX_NEW_TOKENS_PROTOCOL_CAP:
             return RejectReason.BAD_TERMINATION, "termination_preflight"
