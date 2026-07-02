@@ -144,7 +144,7 @@ This guarantees that training data always reflects the currently-published polic
 
 ### Publish every N trained windows — HF cannot keep up with per-step pushes
 
-The base model is Qwen3.5-4B (~4 billion parameters, sharded safetensors, thinking chat template). Pushing a new safetensors snapshot to HF Hub on every window (roughly every 60 seconds under load) is infeasible due to Git LFS latency and HF rate limits. The validator trains healthy full batches in-memory but publishes to HF every `CHECKPOINT_PUBLISH_INTERVAL_WINDOWS = 10` successful trained windows. Quarantined or partial windows are archived/credited but do not increment the publish cadence. Between publishes, miners stay on the last-published revision — the hash gate keeps them there. `checkpoint_n` only increments on a successful publish, so the gate remains stable across the publish gap.
+The base model is Qwen3.5-2B (~2 billion parameters, sharded safetensors, thinking chat template). Pushing a new safetensors snapshot to HF Hub on every window (roughly every 60 seconds under load) is infeasible due to Git LFS latency and HF rate limits. The validator trains healthy full batches in-memory but publishes to HF every `CHECKPOINT_PUBLISH_INTERVAL_WINDOWS = 10` successful trained windows. Quarantined or partial windows are archived/credited but do not increment the publish cadence. Between publishes, miners stay on the last-published revision — the hash gate keeps them there. `checkpoint_n` only increments on a successful publish, so the gate remains stable across the publish gap.
 
 ---
 

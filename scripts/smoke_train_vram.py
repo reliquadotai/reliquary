@@ -11,7 +11,7 @@ Usage (on the H100 box, inside the validator Docker image):
 
     python scripts/smoke_train_vram.py
     python scripts/smoke_train_vram.py --completion-len 4096
-    python scripts/smoke_train_vram.py --model Qwen/Qwen3.5-4B
+    python scripts/smoke_train_vram.py --model Qwen/Qwen3.5-2B
 
 Exits non-zero on OOM. Use ``CUDA_VISIBLE_DEVICES=0`` to pin a GPU.
 """

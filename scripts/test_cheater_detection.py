@@ -287,7 +287,7 @@ def check_termination(
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--base-model", default="Qwen/Qwen3.5-4B")
+    p.add_argument("--base-model", default="Qwen/Qwen3.5-2B")
     p.add_argument("--validator-repo", default="R0mAI/reliquary-math")
     p.add_argument("--validator-revision", required=True,
                    help="HF commit SHA of the validator's current published ckpt")

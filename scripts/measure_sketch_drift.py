@@ -12,7 +12,7 @@ check — which is the weakness the live-testnet cheater test surfaced.
 Usage on a GPU box with ``reliquary`` installed:
     python scripts/measure_sketch_drift.py \
         --hf-repo R0mAI/reliquary-math \
-        --base-model Qwen/Qwen3.5-4B \
+        --base-model Qwen/Qwen3.5-2B \
         --revisions de8490f58de7d256ea9d35e0d7715... 1e81f2751fc4... \
         --output /tmp/sketch_drift.json
 
@@ -124,7 +124,7 @@ def pairwise_stats(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base-model", default="Qwen/Qwen3.5-4B")
+    parser.add_argument("--base-model", default="Qwen/Qwen3.5-2B")
     parser.add_argument("--hf-repo", required=True, help="Published validator repo")
     parser.add_argument(
         "--revisions",

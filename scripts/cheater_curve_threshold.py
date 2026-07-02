@@ -2,7 +2,7 @@
 """Cheater-curve threshold calibration.
 
 For each run (independent fresh training trajectory):
-  - Load base Qwen3.5-4B as the "validator_model" (will be trained).
+  - Load base Qwen3.5-2B as the "validator_model" (will be trained).
   - Keep a frozen second copy as the "miner_model" (= the lazy cheater
     who never updates).
   - At step 1..N:
@@ -456,7 +456,7 @@ def _summarize(rows: list[dict]) -> None:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base-model", default="Qwen/Qwen3.5-4B")
+    ap.add_argument("--base-model", default="Qwen/Qwen3.5-2B")
     ap.add_argument("--n-runs", type=int, default=10)
     ap.add_argument("--n-steps", type=int, default=30)
     ap.add_argument("--measurements-per-step", type=int, default=2)
