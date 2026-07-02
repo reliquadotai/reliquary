@@ -18,7 +18,7 @@ def _valid_commit(seq_len: int = 40, prompt_len: int = 8) -> dict:
     return {
         "tokens": list(range(seq_len)),
         "commitments": [{"sketch": 0} for _ in range(seq_len)],
-        "proof_version": "v6",
+        "proof_version": "v7",
         "model": {"name": "test-model", "layer_index": 6},
         "signature": "ab" * 32,
         "beacon": {"randomness": "cd" * 16},

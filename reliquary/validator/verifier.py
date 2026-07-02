@@ -95,6 +95,45 @@ def _eos_set_from_model(model: Any, tokenizer: Any) -> set[int]:
     return resolve_eos_token_ids(model, tokenizer)
 
 
+def bft_forced_cap_length(rollout_meta: dict) -> int | None:
+    """Return the local forced-BFT cap for rollout metadata, if applicable.
+
+    Forced BFT rollouts stop at thinking budget + canonical FORCE span + answer
+    budget, which is intentionally lower than the global hard schema cap. The
+    force span is byte-validated later by ``validate_force_span``; this helper
+    only lets termination logic recognize the intended BFT local cap.
+    """
+    if not rollout_meta.get("forced"):
+        return None
+    span = rollout_meta.get("force_span")
+    if not isinstance(span, (list, tuple)) or len(span) != 2:
+        return None
+    try:
+        start = int(span[0])
+        end = int(span[1])
+    except (TypeError, ValueError):
+        return None
+    if end <= start:
+        return None
+
+    from reliquary.constants import BFT_ANSWER_BUDGET, BFT_THINKING_BUDGET
+
+    return BFT_THINKING_BUDGET + (end - start) + BFT_ANSWER_BUDGET
+
+
+def is_forced_bft_cap_termination(commit: dict) -> bool:
+    """True when a forced BFT rollout reached its local answer cap."""
+    rollout_meta = commit.get("rollout", {}) or {}
+    cap = bft_forced_cap_length(rollout_meta)
+    if cap is None:
+        return False
+    try:
+        completion_length = int(rollout_meta.get("completion_length", 0))
+    except (TypeError, ValueError):
+        return False
+    return completion_length >= cap
+
+
 def verify_termination(
     commit: dict,
     tokenizer: Any,
@@ -126,7 +165,10 @@ def verify_termination(
     completion_length = int(rollout_meta.get("completion_length", 0))
     prompt_length = int(rollout_meta.get("prompt_length", 0))
 
-    if prompt_length + completion_length >= MAX_NEW_TOKENS_PROTOCOL_CAP:
+    if (
+        prompt_length + completion_length >= MAX_NEW_TOKENS_PROTOCOL_CAP
+        or is_forced_bft_cap_termination(commit)
+    ):
         return True
 
     eos_set = _eos_set_from_model(model, tokenizer)
@@ -184,6 +226,9 @@ def is_cap_truncation(
     rollout_meta = commit.get("rollout", {}) or {}
     completion_length = int(rollout_meta.get("completion_length", 0))
     prompt_length = int(rollout_meta.get("prompt_length", 0))
+    if is_forced_bft_cap_termination(commit):
+        return False
+
     if prompt_length + completion_length < MAX_NEW_TOKENS_PROTOCOL_CAP:
         return False
 
@@ -558,6 +603,8 @@ def evaluate_token_distribution(
     prompt_length: int,
     completion_length: int,
     proof: "ProofResult",
+    *,
+    exempt_positions: set[int] | None = None,
 ) -> tuple[bool | None, dict]:
     """Soft check: detect suspicious chosen-token probability distributions.
 
@@ -590,6 +637,8 @@ def evaluate_token_distribution(
     if completion_length < SAMPLING_MIN_STEPS:
         return None, {}
     probs = proof.completion_chosen_probs
+    if exempt_positions:
+        probs = [p for i, p in enumerate(probs) if i not in exempt_positions]
     if len(probs) < SAMPLING_MIN_STEPS:
         return None, {}
 
@@ -609,6 +658,44 @@ def evaluate_token_distribution(
     return (not suspicious), metrics
 
 
+def validate_force_span(
+    tokens: list[int],
+    rollout_meta: dict,
+    canonical_force_ids: list[int],
+    prompt_length: int,
+    *,
+    thinking_budget: int,
+    think_close_ids: set[int],
+) -> tuple[bool, set[int]]:
+    """BFT carve-out gate. For a forced rollout, verify the declared
+    ``force_span``:
+      * content  — byte-exactly the canonical FORCE ids (which begin with the
+        atomic ``</think>`` id);
+      * position — starts exactly ``thinking_budget`` tokens into the completion;
+      * honesty  — no atomic ``</think>`` appears before it.
+
+    Returns ``(ok, exempt)`` where ``exempt`` is the set of completion-relative
+    positions to skip in the per-token authenticity / distribution checks. A
+    non-forced rollout is ``(True, set())`` (no carve); an invalid span is
+    ``(False, set())``.
+    """
+    if not rollout_meta.get("forced"):
+        return True, set()
+    span = rollout_meta.get("force_span")
+    if not isinstance(span, (list, tuple)) or len(span) != 2:
+        return False, set()
+    start, end = int(span[0]), int(span[1])
+    if not (prompt_length <= start < end <= len(tokens)):
+        return False, set()
+    if start - prompt_length != int(thinking_budget):
+        return False, set()
+    if any(int(t) in think_close_ids for t in tokens[prompt_length:start]):
+        return False, set()
+    if list(tokens[start:end]) != list(canonical_force_ids):
+        return False, set()
+    return True, set(range(start - prompt_length, end - prompt_length))
+
+
 def evaluate_token_authenticity(
     proof: "ProofResult",
     *,
@@ -619,6 +706,7 @@ def evaluate_token_authenticity(
     completion_length: int = 0,
     tokenizer: Any = None,
     numeric_threshold: float | None = None,
+    exempt_positions: set[int] | None = None,
 ) -> tuple[bool, dict]:
     """Hard check on the GPU-forward token probs. Two collapse signatures:
     (1) any token below ``threshold`` is a gross injection;
@@ -640,12 +728,15 @@ def evaluate_token_authenticity(
     amax = proof.completion_argmax_probs
     if not chosen or not amax:
         return True, {}
+    exempt = exempt_positions or set()
     comp = digit_ids = sign_ids = None
     if tokens is not None and tokenizer is not None and completion_length > 0:
         comp = list(tokens[prompt_length: prompt_length + completion_length])
         digit_ids, sign_ids = _numeric_token_ids(tokenizer)
     n = min(len(chosen), len(amax))
     for j in range(n):
+        if j in exempt:
+            continue
         if chosen[j] < threshold:
             ids = proof.completion_argmax_ids
             return False, {
@@ -686,6 +777,7 @@ def evaluate_all_token_auth_shadow(
     include_findings: bool = False,
     max_findings: int | None = None,
     context_chars: int = 80,
+    exempt_positions: set[int] | None = None,
 ) -> tuple[bool, dict]:
     """Aggregate all-token argmax-gated authenticity shadow check.
 
@@ -714,6 +806,7 @@ def evaluate_all_token_auth_shadow(
     if n <= 0:
         return True, {}
 
+    exempt = exempt_positions or set()
     min_prob: float | None = None
     findings = 0
     finding_min_prob: float | None = None
@@ -725,6 +818,8 @@ def evaluate_all_token_auth_shadow(
             tokens[prompt_length: prompt_length + completion_length]
         )
     for j in range(n):
+        if j in exempt:
+            continue
         p = float(chosen[j])
         if min_prob is None or p < min_prob:
             min_prob = p

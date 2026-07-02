@@ -72,6 +72,31 @@ def test_checkpoint_download_patterns_include_qwen35_shards():
     assert "merges.txt" in MODEL_SNAPSHOT_ALLOW_PATTERNS
 
 
+def test_has_think_close_detects_atomic_id():
+    from reliquary.shared.modeling import has_think_close
+    assert has_think_close([1, 2, 248069, 3], {248069}) is True
+    assert has_think_close([1, 2, 3], {248069}) is False
+    assert has_think_close([], {248069}) is False
+
+
+def test_think_close_and_force_ids_from_tokenizer():
+    from reliquary.shared.modeling import (
+        force_close_token_ids,
+        think_close_token_ids,
+    )
+
+    class _Tok:
+        def convert_tokens_to_ids(self, t):
+            return 248069 if t == "</think>" else None
+
+        def encode(self, text, add_special_tokens=False):
+            assert add_special_tokens is False
+            return [7, 8, 9]  # stand-in for "\n\nFinal Answer: \boxed{"
+
+    assert think_close_token_ids(_Tok()) == [248069]
+    assert force_close_token_ids(_Tok()) == [248069, 7, 8, 9]
+
+
 def test_model_loader_normalizes_torch_dtype_for_transformers_5(monkeypatch):
     import reliquary.shared.modeling as modeling
     from transformers import AutoConfig

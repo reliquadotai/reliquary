@@ -269,6 +269,14 @@ class RolloutMetadata(BaseModel):
     total_reward: float
     advantage: float
     token_logprobs: list[float]
+    # BFT: forced=True when the rollout was force-terminated at the thinking
+    # budget; force_span = [start, end] token indices of the injected FORCE
+    # template (validated byte-exact by the validator carve-out).
+    forced: bool = False
+    force_span: list[int] | None = None
+    # Validator-set (not miner-claimed): cap-truncated / non-terminating. Feeds
+    # the overlong side of the reward shaping.
+    truncated: bool = False
 
 
 class CommitModel(BaseModel):
@@ -283,7 +291,7 @@ class CommitModel(BaseModel):
 
     tokens: list[int] = Field(..., min_length=CHALLENGE_K)
     commitments: list[dict]
-    proof_version: Literal["v6"]
+    proof_version: Literal["v7"]
     model: ModelInfo
     signature: str = Field(..., pattern=r"^[0-9a-fA-F]+$")
     beacon: BeaconInfo

@@ -249,3 +249,73 @@ def test_reward_handles_malformed_completion():
         except (AttributeError, TypeError):
             # None input is not a real protocol path; tolerated
             pass
+
+
+# ---------------------------------------------------------------------------
+# Dataset backing: full-repo virtual parquet, not an eager shard download.
+# A list-of-dicts stands in for the dataset (supports len + __getitem__), so
+# the env's shaping is exercised with no network.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _restore_omi_cache():
+    """Keep the class-level dataset cache from leaking a fake into other tests."""
+    from reliquary.environment.openmathinstruct import OpenMathInstructEnvironment
+    saved = OpenMathInstructEnvironment._dataset_cache
+    yield
+    OpenMathInstructEnvironment._dataset_cache = saved
+
+
+def _env_over(rows):
+    from reliquary.environment.openmathinstruct import OpenMathInstructEnvironment
+    OpenMathInstructEnvironment._dataset_cache = list(rows)
+    return OpenMathInstructEnvironment()
+
+
+def test_load_dataset_returns_virtual_parquet_for_repo_id():
+    from reliquary.environment.openmathinstruct import _load_dataset
+    from reliquary.environment.virtual_parquet import VirtualParquetDataset
+
+    ds = _load_dataset("nvidia/OpenMathInstruct-2", "rev123")
+    assert isinstance(ds, VirtualParquetDataset)
+
+
+def test_load_dataset_requests_problem_and_answer_columns():
+    """Only the two columns the env shapes are fetched — keeps row-groups tiny."""
+    from reliquary.environment.openmathinstruct import _load_dataset
+
+    ds = _load_dataset("nvidia/OpenMathInstruct-2", "rev123")
+    assert ds._columns == ["problem", "expected_answer"]
+
+
+def test_default_revision_is_pinned_sha():
+    """Both sides MUST read the same immutable revision (token binding +
+    prompt-range determinism); the default cannot be an unpinned 'main'."""
+    from reliquary.environment.openmathinstruct import OpenMathInstructEnvironment
+
+    rev = OpenMathInstructEnvironment._OMI_REVISION
+    assert len(rev) == 40 and all(c in "0123456789abcdef" for c in rev)
+
+
+def test_get_problem_shapes_prompt_and_ground_truth():
+    import hashlib
+    from reliquary.environment.openmathinstruct import _ANSWER_FORMAT_INSTRUCTION
+
+    env = _env_over([{"problem": "What is 2+2?", "expected_answer": "4"}])
+    p = env.get_problem(0)
+
+    assert p["prompt"] == "What is 2+2?" + _ANSWER_FORMAT_INSTRUCTION
+    assert p["ground_truth"] == "4"
+    assert p["id"] == hashlib.sha256(b"What is 2+2?").hexdigest()[:16]
+
+
+def test_len_reflects_dataset_not_shard_cap():
+    env = _env_over([{"problem": f"q{i}", "expected_answer": str(i)} for i in range(7)])
+    assert len(env) == 7
+
+
+def test_get_problem_modulo_wraps():
+    env = _env_over([{"problem": "q0", "expected_answer": "0"},
+                     {"problem": "q1", "expected_answer": "1"}])
+    assert env.get_problem(2)["ground_truth"] == "0"
+    assert env.get_problem(3)["ground_truth"] == "1"

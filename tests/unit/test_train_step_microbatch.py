@@ -20,7 +20,7 @@ from types import SimpleNamespace
 from reliquary.constants import KL_BETA
 from reliquary.validator.training import (
     _pack_by_token_budget, _accumulate_grouped_grads, _rollout_loss,
-    _compute_advantages, train_step, reset_training_state,
+    _compute_advantages, _plan_from_batches, train_step, reset_training_state,
 )
 
 
@@ -167,6 +167,32 @@ def test_batched_grads_match_per_rollout_qwenlike():
     m_ref = copy.deepcopy(model)
     ref_grads = _reference_grads(m_ref, _frozen(m_ref), plan, n_total, device)
     m_bat = copy.deepcopy(model)
+    bat_grads = _grads_after(m_bat, lambda: _accumulate_grouped_grads(
+        m_bat, _frozen(m_bat), plan, device, budget=64, atomic=False))
+    assert _rel_l2(bat_grads, ref_grads) < 5e-2
+
+
+def test_batched_grads_mask_bft_force_span_like_per_rollout():
+    import copy
+
+    torch.manual_seed(3)
+    base = _QwenLike()
+    device = next(base.parameters()).device
+    forced = _build_rollout([1, 2, 3, 4, 5, 6, 7, 8], 1.0, 3)
+    forced.commit["rollout"]["forced"] = True
+    # Absolute span [5, 7) -> completion-relative positions 2 and 3.
+    forced.commit["rollout"]["force_span"] = [5, 7]
+    loser = _build_rollout([1, 2, 3, 9, 10, 11], 0.0, 3)
+    group = _FakeGroup([forced, loser])
+    plan, skipped = _plan_from_batches([[group]])
+    assert skipped == 0
+    assert len(plan) == 1
+    # One present env: scale is 1 / surviving trainable completion tokens.
+    n_total = round(1.0 / plan[0][2])
+
+    m_ref = copy.deepcopy(base)
+    ref_grads = _reference_grads(m_ref, _frozen(m_ref), plan, n_total, device)
+    m_bat = copy.deepcopy(base)
     bat_grads = _grads_after(m_bat, lambda: _accumulate_grouped_grads(
         m_bat, _frozen(m_bat), plan, device, budget=64, atomic=False))
     assert _rel_l2(bat_grads, ref_grads) < 5e-2

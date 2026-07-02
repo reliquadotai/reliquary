@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import gzip
 import json
-from contextlib import asynccontextmanager
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -16,18 +15,15 @@ from reliquary.infrastructure.storage import upload_window_dataset
 async def test_upload_window_dataset_writes_gzipped_json_at_expected_key() -> None:
     captured: dict[str, object] = {}
 
-    fake_client = MagicMock()
-
-    async def _put(Bucket: str, Key: str, Body: bytes) -> None:
-        captured["bucket"] = Bucket
-        captured["key"] = Key
-        captured["body"] = Body
-
-    fake_client.put_object = _put
-
-    @asynccontextmanager
-    async def _fake_get_client(**kwargs):
-        yield fake_client
+    def _fake_put(
+        bucket: str,
+        key: str,
+        body: bytes,
+        *_: object,
+    ) -> None:
+        captured["bucket"] = bucket
+        captured["key"] = key
+        captured["body"] = body
 
     data = {
         "window_start": 1000,
@@ -48,7 +44,7 @@ async def test_upload_window_dataset_writes_gzipped_json_at_expected_key() -> No
         ],
     }
 
-    with patch("reliquary.infrastructure.storage.get_s3_client", _fake_get_client):
+    with patch("reliquary.infrastructure.storage._sync_boto3_put", _fake_put):
         ok = await upload_window_dataset(1000, data, bucket_name="testbucket")
 
     assert ok is True
@@ -66,16 +62,10 @@ async def test_upload_window_dataset_uses_env_bucket_when_not_provided(
     monkeypatch.setenv("R2_BUCKET_ID", "from-env")
     captured: dict[str, object] = {}
 
-    async def _put(Bucket: str, **_: object) -> None:
-        captured["bucket"] = Bucket
+    def _fake_put(bucket: str, *_: object) -> None:
+        captured["bucket"] = bucket
 
-    fake_client = MagicMock(put_object=_put)
-
-    @asynccontextmanager
-    async def _fake_get_client(**kwargs):
-        yield fake_client
-
-    with patch("reliquary.infrastructure.storage.get_s3_client", _fake_get_client):
+    with patch("reliquary.infrastructure.storage._sync_boto3_put", _fake_put):
         await upload_window_dataset(42, {"slots": []})
 
     assert captured["bucket"] == "from-env"
@@ -87,16 +77,10 @@ async def test_upload_window_dataset_always_uses_flat_key() -> None:
     archive body for provenance, not in the object key."""
     captured: dict[str, object] = {}
 
-    async def _put(Bucket: str, Key: str, Body: bytes) -> None:
-        captured["key"] = Key
+    def _fake_put(_bucket: str, key: str, *_: object) -> None:
+        captured["key"] = key
 
-    fake_client = MagicMock(put_object=_put)
-
-    @asynccontextmanager
-    async def _fake_get_client(**kwargs):
-        yield fake_client
-
-    with patch("reliquary.infrastructure.storage.get_s3_client", _fake_get_client):
+    with patch("reliquary.infrastructure.storage._sync_boto3_put", _fake_put):
         await upload_window_dataset(
             7987940, {"slots": [], "validator_hotkey": "5Cxxx"}, bucket_name="b"
         )

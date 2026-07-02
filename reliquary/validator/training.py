@@ -134,6 +134,39 @@ def _compute_advantages(rewards: list[float]) -> list[float]:
     return [(r - mean) / std for r in rewards]
 
 
+def _shape_advantages(rollouts, advantages):
+    """Two-sided length shaping, on ADVANTAGES only (the σ-gate stays on raw
+    correctness). Overrides an advantage to −SHAPE_PENALTY when:
+      * overlong       — the rollout is cap-truncated; or
+      * under-thinking — a non-forced rollout finished early
+        (completion_length < SHAPE_LEN_FRAC·BFT_THINKING_BUDGET) and is wrong.
+    All inputs are validator-determined (reward re-graded, completion_length
+    schema-checked, forced/truncated validator-set). SHAPE_PENALTY == 0 disables
+    it."""
+    from reliquary.constants import (
+        BFT_THINKING_BUDGET,
+        SHAPE_LEN_FRAC,
+        SHAPE_PENALTY,
+    )
+
+    if SHAPE_PENALTY <= 0:
+        return advantages
+    early_cap = SHAPE_LEN_FRAC * BFT_THINKING_BUDGET
+    shaped = list(advantages)
+    for i, r in enumerate(rollouts):
+        meta = (getattr(r, "commit", None) or {}).get("rollout", {}) or {}
+        if meta.get("truncated"):
+            shaped[i] = -SHAPE_PENALTY          # overlong (cap-truncated)
+            continue
+        if meta.get("forced"):
+            continue                            # forced rollouts untouched
+        correct = float(getattr(r, "reward", 0.0)) > 0.5
+        clen = int(meta.get("completion_length", 0))
+        if clen < early_cap and not correct:
+            shaped[i] = -SHAPE_PENALTY          # under-thinking (early + wrong)
+    return shaped
+
+
 def _batch_loss_weights(
     token_counts: list[float],
     raw_weights: Optional[list[float]] = None,
@@ -170,6 +203,35 @@ def _env_weight_for_batch(batch, env_weights: dict) -> float:
     return 1.0
 
 
+def _completion_keep_list(rollout_meta, prompt_length: int, n_completion: int):
+    """Return a boolean keep list over completion positions.
+
+    BFT forced-close tokens are validator-accepted but not policy-sampled, so
+    they must be excluded from every policy-gradient path and from token-count
+    normalization denominators. ``None`` means every completion token is kept.
+    """
+    force_span = rollout_meta.get("force_span")
+    if not force_span:
+        return None
+    keep = [True] * max(0, int(n_completion))
+    fs = max(0, int(force_span[0]) - int(prompt_length))
+    fe = min(len(keep), int(force_span[1]) - int(prompt_length))
+    if fs < fe:
+        keep[fs:fe] = [False] * (fe - fs)
+    return keep
+
+
+def _trainable_completion_count(
+    rollout_meta,
+    prompt_length: int,
+    n_completion: int,
+) -> int:
+    keep = _completion_keep_list(rollout_meta, prompt_length, n_completion)
+    if keep is None:
+        return max(0, int(n_completion))
+    return sum(1 for flag in keep if flag)
+
+
 def _plan_from_batches(batches, env_weights: Optional[dict] = None):
     """Pass 1 (metadata only, no forward): group-relative advantages + per-batch
     token-level loss weights. ``batches`` is one batch per env (env_mix order,
@@ -188,7 +250,10 @@ def _plan_from_batches(batches, env_weights: Optional[dict] = None):
     n_skipped = 0
     for b_idx, batch in enumerate(batches):
         for group in batch:
-            advantages = _compute_advantages([r.reward for r in group.rollouts])
+            advantages = _shape_advantages(
+                group.rollouts,
+                _compute_advantages([r.reward for r in group.rollouts]),
+            )
             if all(a == 0.0 for a in advantages):
                 n_skipped += 1
                 logger.debug("skipping degenerate group on prompt_idx=%s",
@@ -197,7 +262,11 @@ def _plan_from_batches(batches, env_weights: Optional[dict] = None):
             surviving.append((group, advantages, b_idx))
             for rollout in group.rollouts:
                 meta = (rollout.commit or {}).get("rollout", {}) or {}
-                batch_tokens[b_idx] += len(meta.get("token_logprobs", []) or [])
+                old = meta.get("token_logprobs", []) or []
+                prompt_length = int(meta.get("prompt_length", 0) or 0)
+                batch_tokens[b_idx] += _trainable_completion_count(
+                    meta, prompt_length, len(old),
+                )
 
     raw_weights = None
     if env_weights:
@@ -334,6 +403,16 @@ def _selected_logprobs_for_tokens(model, tokens: torch.Tensor, next_tokens: torc
     return _selected_logprobs(logits[:-1], next_tokens)
 
 
+def _completion_keep_mask(rollout_meta, prompt_length, n_completion, device):
+    """Boolean keep-mask over completion positions with the BFT ``force_span``
+    excluded. Returns ``None`` when the rollout is not forced (train every
+    completion token, identical to the pre-BFT path)."""
+    keep = _completion_keep_list(rollout_meta, prompt_length, n_completion)
+    if keep is None:
+        return None
+    return torch.tensor(keep, dtype=torch.bool, device=device)
+
+
 def _rollout_loss(
     model,
     ref_model,
@@ -390,20 +469,38 @@ def _rollout_loss(
             f"model predicts {len(new_logprobs_c)} completion tokens"
         )
 
+    # BFT: mask the injected FORCE span out of the loss (= DAPO Overlong
+    # Filtering, narrowed to the carve). Those tokens were not sampled by the
+    # policy, so policy-gradient on them is invalid and their tiny probability
+    # would blow up the ratio; train only thinking-before + answer-after.
+    keep = _completion_keep_mask(
+        rollout.commit.get("rollout", {}), prompt_length,
+        int(new_logprobs_c.shape[0]), device,
+    )
+
     # PPO clipped surrogate
     log_ratio = new_logprobs_c - old_logprobs
     ratio = torch.exp(log_ratio)
     surr1 = ratio * advantage
     surr2 = torch.clamp(ratio, 1 - PPO_CLIP_EPSILON, 1 + PPO_CLIP_EPSILON) * advantage
-    ppo_loss = -torch.min(surr1, surr2).mean()
+    ppo_per_token = -torch.min(surr1, surr2)
 
     # KL(π_new || π_ref) — Schulman's k3 estimator:
     #   kl ≈ exp(ref - new) - 1 - (ref - new)
     # Unbiased, low-variance, always ≥ 0.
     kl_log_ratio = ref_logprobs_c - new_logprobs_c
-    kl = (torch.exp(kl_log_ratio) - 1 - kl_log_ratio).mean()
+    kl_per_token = torch.exp(kl_log_ratio) - 1 - kl_log_ratio
 
-    return ppo_loss, kl, int(new_logprobs_c.shape[0])
+    if keep is not None:
+        ppo_per_token = ppo_per_token[keep]
+        kl_per_token = kl_per_token[keep]
+
+    n_keep = int(ppo_per_token.shape[0])
+    if n_keep == 0:
+        # Whole completion masked (degenerate) → no training signal.
+        return ppo_per_token.sum(), kl_per_token.sum(), 0
+
+    return ppo_per_token.mean(), kl_per_token.mean(), n_keep
 
 
 # ---------------------------------------------------------------------------
@@ -468,7 +565,7 @@ def _batched_completion_logprobs(model, input_ids, attention_mask, prompt_length
 
 def _microbatch_grad(model, ref_model, batch, device, *, atomic):
     """Forward + backward one micro-batch. ``batch`` is a list of
-    ``(tokens, prompt_length, old_logprobs, advantage, scale)`` where ``scale``
+    ``(tokens, prompt_length, old_logprobs, advantage, scale, keep)`` where ``scale``
     is the per-token loss weight ``w_e/N_e`` of the rollout's env. Returns
     ``(sum_ppo_mean, sum_kl_mean, n)`` for logging (per-rollout means summed,
     matching the legacy metric).
@@ -482,8 +579,8 @@ def _microbatch_grad(model, ref_model, batch, device, *, atomic):
     T = max(len(it[0]) for it in batch)
     input_ids = torch.zeros(B, T, dtype=torch.long, device=device)
     attn = torch.zeros(B, T, dtype=torch.long, device=device)
-    plens, lens, olds, advs, scales = [], [], [], [], []
-    for j, (tokens, p, old, adv, scale) in enumerate(batch):
+    plens, lens, olds, advs, scales, keeps = [], [], [], [], [], []
+    for j, (tokens, p, old, adv, scale, keep) in enumerate(batch):
         L = len(tokens)
         input_ids[j, :L] = torch.tensor(tokens, device=device)
         attn[j, :L] = 1
@@ -492,6 +589,7 @@ def _microbatch_grad(model, ref_model, batch, device, *, atomic):
         olds.append(old)
         advs.append(adv)
         scales.append(scale)
+        keeps.append(keep)
 
     with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
                         enabled=device.type in ("cuda", "cpu")):
@@ -499,11 +597,32 @@ def _microbatch_grad(model, ref_model, batch, device, *, atomic):
         with torch.no_grad():
             ref_lp, _ = _batched_completion_logprobs(ref_model, input_ids, attn, plens, lens)
 
-    old_cat = torch.tensor([x for old in olds for x in old], device=device, dtype=new_lp.dtype)
-    adv_cat = torch.tensor([advs[k] for k in range(B) for _ in range(seg[k])],
-                           device=device, dtype=new_lp.dtype)
-    scale_cat = torch.tensor([scales[k] for k in range(B) for _ in range(seg[k])],
-                             device=device, dtype=new_lp.dtype)
+    old_cat = torch.tensor(
+        [x for old in olds for x in old],
+        device=device,
+        dtype=new_lp.dtype,
+    )
+    adv_cat = torch.tensor(
+        [advs[k] for k in range(B) for _ in range(seg[k])],
+        device=device,
+        dtype=new_lp.dtype,
+    )
+    scale_cat = torch.tensor(
+        [scales[k] for k in range(B) for _ in range(seg[k])],
+        device=device,
+        dtype=new_lp.dtype,
+    )
+    keep_cat = torch.tensor(
+        [flag for keep in keeps for flag in keep],
+        device=device,
+        dtype=torch.bool,
+    )
+    new_lp = new_lp[keep_cat]
+    ref_lp = ref_lp[keep_cat]
+    old_cat = old_cat[keep_cat]
+    adv_cat = adv_cat[keep_cat]
+    scale_cat = scale_cat[keep_cat]
+    keep_seg = [sum(1 for flag in keep if flag) for keep in keeps]
     ratio = torch.exp(new_lp - old_cat)
     surr = torch.min(ratio * adv_cat,
                      torch.clamp(ratio, 1 - PPO_CLIP_EPSILON, 1 + PPO_CLIP_EPSILON) * adv_cat)
@@ -529,8 +648,7 @@ def _microbatch_grad(model, ref_model, batch, device, *, atomic):
     sum_ppo = sum_kl = 0.0
     off = 0
     with torch.no_grad():
-        for k in range(B):
-            n = seg[k]
+        for n in keep_seg:
             sum_ppo += float(ppo_tok[off:off + n].mean())
             sum_kl += float(kl_tok[off:off + n].mean())
             off += n
@@ -562,7 +680,7 @@ def _process_microbatch(model, ref_model, batch, device, *, atomic):
 
 def _build_microbatch_items(plan):
     """Flatten plan -> list of (tokens, prompt_length, old_logprobs, advantage,
-    scale), dropping rollouts the per-rollout path would have skipped (missing
+    scale, keep), dropping rollouts the per-rollout path would have skipped (missing
     prompt_length/token_logprobs, or a miner/model completion-length mismatch).
     ``scale`` is the per-token loss weight w_e/N_e carried from the plan entry."""
     items = []
@@ -580,7 +698,13 @@ def _build_microbatch_items(plan):
             if n_completion <= 0 or n_completion != len(old):
                 logger.warning("rollout skipped: log-prob length mismatch")
                 continue
-            items.append((tokens, p, old, adv, scale))
+            keep = _completion_keep_list(meta, p, n_completion)
+            if keep is None:
+                keep = [True] * n_completion
+            if not any(keep):
+                logger.warning("rollout skipped: force span masks all tokens")
+                continue
+            items.append((tokens, p, old, adv, scale, keep))
     return items
 
 
@@ -682,6 +806,16 @@ def train_step(
         return model
 
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
+    # Finite-guard: a non-finite grad (e.g. from the BFT carve or any numerical
+    # blowup) must never reach the weights — skip the step rather than poison
+    # the checkpoint.
+    if not bool(torch.isfinite(grad_norm)):
+        logger.warning(
+            "train_step: non-finite grad_norm=%s → skipping optimizer step",
+            float(grad_norm),
+        )
+        _optimizer.zero_grad(set_to_none=True)
+        return model
     _optimizer.step()
     _scheduler.step()
     lr = _scheduler.get_last_lr()[0]

@@ -69,8 +69,8 @@ def auto_model_class_for_config(config: Any):
 def load_text_generation_model(source: str, **kwargs):
     """Load the model class used for text-only generation/training/proofs.
 
-    `Qwen/Qwen3.5-4B` is packaged as a conditional image-text-to-text model,
-    even for text-only use. Legacy Qwen3 checkpoints remain CausalLM.
+    `Qwen/Qwen3.5-2B` (and 4B) is packaged as a conditional image-text-to-text
+    model, even for text-only use. Legacy Qwen3 checkpoints remain CausalLM.
     """
     from transformers import AutoConfig
 
@@ -149,3 +149,29 @@ def first_eos_index(tokens: list[int], eos_ids: set[int]) -> int | None:
         if int(token) in eos_ids:
             return idx
     return None
+
+
+def think_close_token_ids(tokenizer) -> list[int]:
+    """Atomic ``</think>`` token id(s) for this tokenizer. Raises if it cannot
+    resolve an atomic id — we never fall back to a split encoding, which the BFT
+    carve-out relies on being atomic."""
+    tid = tokenizer.convert_tokens_to_ids("</think>")
+    if tid is None or (isinstance(tid, int) and tid < 0):
+        raise ValueError("tokenizer has no atomic </think> token")
+    return [int(tid)]
+
+
+def force_close_token_ids(tokenizer) -> list[int]:
+    """Token ids of ``BFT_FORCE_TEMPLATE``: the atomic </think> id followed by
+    the encoded answer preamble (no special tokens added to the tail)."""
+    from reliquary.constants import BFT_FORCE_TEMPLATE
+
+    close_ids = think_close_token_ids(tokenizer)
+    tail = BFT_FORCE_TEMPLATE[len("</think>"):]
+    tail_ids = list(tokenizer.encode(tail, add_special_tokens=False))
+    return close_ids + [int(t) for t in tail_ids]
+
+
+def has_think_close(tokens: list[int], think_close_ids: set[int]) -> bool:
+    """True iff any token is an atomic </think> id."""
+    return any(int(t) in think_close_ids for t in tokens)

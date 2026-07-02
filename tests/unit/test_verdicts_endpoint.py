@@ -60,7 +60,7 @@ def _make_commit(success: bool = False, total_reward: float = 0.0) -> dict:
     return {
         "tokens": tokens,
         "commitments": [{"sketch": 0} for _ in range(seq_len)],
-        "proof_version": "v6",
+        "proof_version": "v7",
         "model": {"name": "test-model", "layer_index": 6},
         "signature": "ab" * 32,
         "beacon": {"randomness": "cd" * 16},

@@ -534,7 +534,7 @@ def test_token_authenticity_injection_fails():
 
 
 def test_token_authenticity_high_entropy_honest_passes():
-    proof = _proof_with_token_stats([1.0, 1.0e-9, 1.0], [1.0, 0.30, 1.0])
+    proof = _proof_with_token_stats([1.0, 4.0e-7, 1.0], [1.0, 0.30, 1.0])
     ok, _ = verifier.evaluate_token_authenticity(proof)
     assert ok is True
 

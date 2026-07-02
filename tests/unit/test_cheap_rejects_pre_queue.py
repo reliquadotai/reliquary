@@ -34,7 +34,7 @@ def _submission(prompt_idx: int = 42, checkpoint_hash: str = "sha256:current",
     commit = {
         "tokens": list(range(36)),
         "commitments": [{"sketch": 0} for _ in range(36)],
-        "proof_version": "v6",
+        "proof_version": "v7",
         "model": {"name": "test", "layer_index": 6},
         "signature": "ab" * 32,
         "beacon": {"randomness": "cd" * 16},
@@ -329,6 +329,42 @@ def test_non_cap_non_eos_rejected_before_proof_admission():
     verdicts = list(s._verdicts.get("hkA", []))
     assert verdicts
     assert verdicts[-1]["reject_stage"] == "termination_preflight"
+
+
+def test_forced_bft_cap_reaches_proof_admission_before_span_validation():
+    """A forced BFT answer cap is a protocol-local stop condition. The cheap
+    preflight must let it reach the full proof + force-span validator instead
+    of rejecting it as a short non-EOS truncation.
+    """
+    from reliquary.constants import BFT_ANSWER_BUDGET, BFT_THINKING_BUDGET
+
+    s = ValidatorServer()
+    s.set_current_state(WindowState.OPEN)
+    batcher = _PreflightAdmissionBatcher(eos_token_id=99)
+    s.set_active_batcher(batcher)
+
+    prompt_length = 4
+    force_len = 8
+    completion_len = BFT_THINKING_BUDGET + force_len + BFT_ANSWER_BUDGET
+    payload = _submission_with_completion_tokens(
+        [5] * completion_len,
+        rewards=_IN_ZONE_REWARDS,
+    )
+    for rollout in payload["rollouts"]:
+        meta = rollout["commit"]["rollout"]
+        meta["forced"] = True
+        meta["force_span"] = [
+            prompt_length + BFT_THINKING_BUDGET,
+            prompt_length + BFT_THINKING_BUDGET + force_len,
+        ]
+
+    with TestClient(s.app) as client:
+        r = client.post("/submit", json=payload)
+
+    body = r.json()
+    assert body["accepted"] is True, body
+    assert body["reason"] == RejectReason.ACCEPTED.value
+    assert batcher.proof_admission_count == 1
 
 
 def test_eos_padding_rejected_before_proof_admission():

@@ -19,7 +19,7 @@ def test_sigma_below_min_rejected():
 
 
 def test_sigma_at_min_accepted():
-    """σ = 0.43 passes the steady-state gate."""
+    """σ = 0.43 (k=2/6 of M=8) passes the steady-state gate."""
     assert is_in_zone(0.43) is True
 
 
@@ -29,9 +29,9 @@ def test_sigma_above_min_accepted():
 
 
 def test_bootstrap_threshold_lower():
-    """0.35 is rejected in steady state but accepted in bootstrap."""
-    assert is_in_zone(0.35, bootstrap=False) is False
-    assert is_in_zone(0.35, bootstrap=True) is True
+    """0.38 is rejected in steady state (<0.43) but accepted in bootstrap (≥0.33)."""
+    assert is_in_zone(0.38, bootstrap=False) is False
+    assert is_in_zone(0.38, bootstrap=True) is True
 
 
 def test_bootstrap_still_rejects_zero_sigma():

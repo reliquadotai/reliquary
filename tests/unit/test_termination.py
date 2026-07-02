@@ -175,6 +175,34 @@ def test_cap_hit_without_natural_eos_counts_as_truncation():
     assert is_cap_truncation(commit, _FakeTokenizer(), proof) is True
 
 
+def test_forced_bft_cap_passes_below_global_cap_without_truncation():
+    from reliquary.constants import (
+        BFT_ANSWER_BUDGET,
+        BFT_THINKING_BUDGET,
+        MAX_NEW_TOKENS_PROTOCOL_CAP,
+    )
+
+    prompt_length = 33
+    force_len = 8
+    completion_length = BFT_THINKING_BUDGET + force_len + BFT_ANSWER_BUDGET
+    assert prompt_length + completion_length < MAX_NEW_TOKENS_PROTOCOL_CAP
+    tokens = [42] * (prompt_length + completion_length)
+    commit = _commit_with_lengths(tokens, prompt_length, completion_length)
+    commit["rollout"]["forced"] = True
+    commit["rollout"]["force_span"] = [
+        prompt_length + BFT_THINKING_BUDGET,
+        prompt_length + BFT_THINKING_BUDGET + force_len,
+    ]
+    proof = ProofResult(
+        all_passed=True, passed=1, checked=1,
+        has_sparse_outputs=True,
+        p_stop=1e-10,
+    )
+
+    assert verify_termination(commit, _FakeTokenizer(), proof) is True
+    assert is_cap_truncation(commit, _FakeTokenizer(), proof) is False
+
+
 def test_cap_hit_with_natural_eos_is_not_truncation():
     from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
 
