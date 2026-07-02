@@ -1024,6 +1024,12 @@ class GrpoWindowBatcher:
             _ingest_meta = rollout.commit.get("rollout")
             if isinstance(_ingest_meta, dict):
                 _ingest_meta["truncated"] = False
+                # BFT is math-only (mirror the miner's env gate): `forced` is a
+                # validator-honoured flag solely for openmathinstruct. Wipe any
+                # non-math value at ingestion so the BFT carve-out stays scoped
+                # to math.
+                if getattr(self.env, "name", "") != "openmathinstruct":
+                    _ingest_meta["forced"] = False
             if not self._verify_signature(rollout.commit, request.miner_hotkey):
                 return reject(RejectReason.BAD_SIGNATURE, "rollout_signature")
             # Randomness binding: the miner-claimed beacon randomness MUST equal
