@@ -398,6 +398,19 @@ def test_reward_symbolic_expansion_bomb_rejected():
     assert _compute_omi_reward({"ground_truth": "x^2+2x+1"}, r"\boxed{(x+1)^2}") == 1.0
 
 
+def test_reward_symbolic_float_exponent_bomb_rejected():
+    import time
+    from reliquary.environment.openmathinstruct import _compute_omi_reward
+    # Float-typed exponent (a+..+o)**10.0 must be blocked by the structural bound,
+    # not left to sympy's internal expand gating.
+    bomb = "(" + "+".join("abcdefghijklmno") + ")^10.0"
+    start = time.perf_counter()
+    assert _compute_omi_reward({"ground_truth": "x"}, r"\boxed{" + bomb + "}") == 0.0
+    assert time.perf_counter() - start < 2.0
+    # a legit integer-power equivalence still upgrades
+    assert _compute_omi_reward({"ground_truth": "x^2+2x+1"}, r"\boxed{(x+1)^2}") == 1.0
+
+
 def test_reward_numeric_and_structured_not_regressed():
     from reliquary.environment.openmathinstruct import _compute_omi_reward
     assert _compute_omi_reward({"ground_truth": "1/2"}, r"\boxed{0.5}") == 1.0

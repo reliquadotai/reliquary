@@ -146,7 +146,10 @@ def _expr_is_safe(expr, _depth: int = 0, allow_symbols: bool = False) -> bool:
     numeric* exponent (which also covers roots and ``1/x``) are allowed. Power
     towers (nested/symbolic exponents), huge exponents, factorials, other
     functions and free symbols are rejected — anything whose ``evalf`` could
-    blow up on a miner-controlled boxed answer.
+    blow up on a miner-controlled boxed answer. When ``allow_symbols`` is set,
+    free symbols are also treated as safe (used by the symbolic-equality path,
+    which restricts inputs to single-letter variables via ``_expr_str_is_safe``
+    first).
     """
     import sympy
 
@@ -178,7 +181,9 @@ def _expr_str_is_safe(s: str, allow_symbols: bool = False) -> bool:
     ``n!`` -> ``factorial(n)``), so a huge factorial would hang before the
     structural guard ever runs. Allow only digits, ``+ - * / ( ) .``, spaces and
     the tokens ``sqrt`` / ``pi``; anything else (``!``, function names like
-    ``exp``/``gamma``/``factorial``, stray symbols) is rejected up front.
+    ``exp``/``gamma``/``factorial``, stray symbols) is rejected up front. With
+    ``allow_symbols`` set, isolated single-letter variables are also allowed
+    (multi-letter identifiers, function names and calls still rejected).
     """
     # Strip the allowed alpha tokens even when digit-adjacent ("2sqrt(5)") but
     # not when part of a longer identifier ("sqrtx"); whatever survives must be
@@ -255,12 +260,19 @@ def _expand_term_bound(expr, cap: int) -> int:
         return prod
     if isinstance(expr, sympy.Pow):
         base, exp = expr.as_base_exp()
-        if not exp.is_Integer or exp < 0:
+        if not exp.is_Number:
             return 1
+        try:
+            f = float(exp)
+        except (TypeError, ValueError, OverflowError):
+            return 1
+        if f < 0 or f != int(f):
+            return 1  # only positive integer-VALUED exponents expand multinomially
+        k = int(f)
         b = _expand_term_bound(base, cap)
         if b <= 1:
             return 1
-        terms = comb(b + int(exp) - 1, int(exp))
+        terms = comb(b + k - 1, k)
         return terms if terms <= cap else cap + 1
     return 1
 
