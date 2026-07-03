@@ -227,6 +227,44 @@ def _latex_value_equal(candidate: str, gt: str) -> bool:
     return abs(vc - vg) <= 1e-9 * (1 + abs(vg))
 
 
+def _expand_term_bound(expr, cap: int) -> int:
+    """Cheap upper bound on the monomial count ``sympy.expand(expr)`` would
+    produce, short-circuiting at ``cap + 1``. Walks the parsed tree WITHOUT
+    expanding, so it bounds ``expand``'s combinatorial cost — which the exponent
+    cap in ``_expr_is_safe`` does not: ``(a+b+...+n)**10`` stays within the char
+    and exponent limits yet expands to ``C(terms+9, 10)`` monomials. Deterministic.
+    """
+    import sympy
+    from math import comb
+
+    if expr.is_Atom:
+        return 1
+    if isinstance(expr, sympy.Add):
+        total = 0
+        for arg in expr.args:
+            total += _expand_term_bound(arg, cap)
+            if total > cap:
+                return cap + 1
+        return total
+    if isinstance(expr, sympy.Mul):
+        prod = 1
+        for arg in expr.args:
+            prod *= _expand_term_bound(arg, cap)
+            if prod > cap:
+                return cap + 1
+        return prod
+    if isinstance(expr, sympy.Pow):
+        base, exp = expr.as_base_exp()
+        if not exp.is_Integer or exp < 0:
+            return 1
+        b = _expand_term_bound(base, cap)
+        if b <= 1:
+            return 1
+        terms = comb(b + int(exp) - 1, int(exp))
+        return terms if terms <= cap else cap + 1
+    return 1
+
+
 def _latex_symbolic_equal(candidate: str, gt: str) -> bool:
     """True iff candidate and gt both parse to ALGEBRAIC expressions (each with
     at least one free symbol) whose expanded difference is identically zero.
@@ -258,6 +296,9 @@ def _latex_symbolic_equal(candidate: str, gt: str) -> bool:
             return False  # numbers stay on the numeric path
         if not (_expr_is_safe(xc, allow_symbols=True)
                 and _expr_is_safe(xg, allow_symbols=True)):
+            return False
+        cap = 2000
+        if _expand_term_bound(xc, cap) > cap or _expand_term_bound(xg, cap) > cap:
             return False
         return sympy.expand(xc - xg).is_zero is True
     except Exception:

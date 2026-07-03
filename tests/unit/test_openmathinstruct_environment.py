@@ -381,6 +381,23 @@ def test_reward_symbolic_adversarial_no_hang():
     assert _compute_omi_reward({"ground_truth": "x"}, "\\boxed{" + "x+" * 60 + "x}") == 0.0
 
 
+def test_reward_symbolic_expansion_bomb_rejected():
+    import time
+    from reliquary.environment.openmathinstruct import _compute_omi_reward
+    # in-cap, single-letter algebra whose expand() would blow up combinatorially
+    bomb = "(" + "+".join("abcdefghijklmno") + ")^10"  # 15 distinct symbols ^10
+    start = time.perf_counter()
+    assert _compute_omi_reward({"ground_truth": "x"}, r"\boxed{" + bomb + "}") == 0.0
+    assert time.perf_counter() - start < 2.0
+    # repeated-symbol variant
+    bomb2 = "(" + "+".join(["a"] * 40) + ")^10"
+    start = time.perf_counter()
+    assert _compute_omi_reward({"ground_truth": "a"}, r"\boxed{" + bomb2 + "}") == 0.0
+    assert time.perf_counter() - start < 2.0
+    # legitimate low-complexity equivalence STILL upgrades
+    assert _compute_omi_reward({"ground_truth": "x^2+2x+1"}, r"\boxed{(x+1)^2}") == 1.0
+
+
 def test_reward_numeric_and_structured_not_regressed():
     from reliquary.environment.openmathinstruct import _compute_omi_reward
     assert _compute_omi_reward({"ground_truth": "1/2"}, r"\boxed{0.5}") == 1.0
