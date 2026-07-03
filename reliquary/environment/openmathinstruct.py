@@ -227,6 +227,43 @@ def _latex_value_equal(candidate: str, gt: str) -> bool:
     return abs(vc - vg) <= 1e-9 * (1 + abs(vg))
 
 
+def _latex_symbolic_equal(candidate: str, gt: str) -> bool:
+    """True iff candidate and gt both parse to ALGEBRAIC expressions (each with
+    at least one free symbol) whose expanded difference is identically zero.
+
+    Closes algebraic reorderings the numeric path misses (2-b == -b+2,
+    (x+1)^2 == x^2+2x+1). Purely-numeric answers have no free symbols and never
+    enter here, so the numeric 1e-9 path still governs numbers and no rounding
+    false-positive can leak in. Bounded and deterministic; never raises.
+    """
+    if not candidate or not gt or len(candidate) > 100 or len(gt) > 100:
+        return False
+    ec, eg = _latex_to_pyexpr(candidate), _latex_to_pyexpr(gt)
+    if ec is None or eg is None:
+        return False
+    if not (_expr_str_is_safe(ec, allow_symbols=True)
+            and _expr_str_is_safe(eg, allow_symbols=True)):
+        return False
+    try:
+        import sympy
+        from sympy.parsing.sympy_parser import (
+            implicit_multiplication_application,
+            parse_expr,
+            standard_transformations,
+        )
+        tr = standard_transformations + (implicit_multiplication_application,)
+        xc = parse_expr(ec, transformations=tr, evaluate=False)
+        xg = parse_expr(eg, transformations=tr, evaluate=False)
+        if not (xc.free_symbols and xg.free_symbols):
+            return False  # numbers stay on the numeric path
+        if not (_expr_is_safe(xc, allow_symbols=True)
+                and _expr_is_safe(xg, allow_symbols=True)):
+            return False
+        return sympy.expand(xc - xg).is_zero is True
+    except Exception:
+        return False
+
+
 def _split_structure(s: str) -> Optional[tuple[str, list[str]]]:
     """Return ``(signature, ordered elements)`` for a matrix/vector/tuple, else None.
 
@@ -259,7 +296,8 @@ def _answers_equal(candidate: str, gt: str) -> bool:
     The prompt asks for a value, so any surface form of that value is correct
     (trailing zeros, fraction vs decimal, \\frac{5721}{5} == 1144.2). Same-shape
     structured answers (matrix/vector/tuple) compare element-wise by value;
-    scalars fall back to LaTeX value-equality, then exact normalized-string match.
+    scalars fall back to LaTeX value-equality, algebraic equivalence, then exact
+    normalized-string match.
     """
     cs, gs = _split_structure(candidate), _split_structure(gt)
     if cs is not None and gs is not None and cs[0] == gs[0]:
@@ -272,7 +310,9 @@ def _answers_equal(candidate: str, gt: str) -> bool:
         return c == g
     if candidate == gt:
         return True
-    return _latex_value_equal(candidate, gt)
+    if _latex_value_equal(candidate, gt):
+        return True
+    return _latex_symbolic_equal(candidate, gt)
 
 
 def _compute_omi_reward(problem: dict, completion: str) -> float:

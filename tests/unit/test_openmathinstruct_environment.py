@@ -347,3 +347,42 @@ def test_expr_struct_guard_symbols_flag():
     # power tower / huge exponent still rejected even with symbols allowed
     assert _expr_is_safe(x ** 50, allow_symbols=True) is False
     assert _expr_is_safe(sympy.Pow(2, x, evaluate=False), allow_symbols=True) is False
+
+
+def test_reward_algebraic_reorder_is_equal():
+    from reliquary.environment.openmathinstruct import _compute_omi_reward
+    # the exact free-negative family seen in R2 replay (w19002)
+    assert _compute_omi_reward({"ground_truth": "-b+2"}, r"\boxed{2 - b}") == 1.0
+    assert _compute_omi_reward({"ground_truth": "a+b"}, r"\boxed{b + a}") == 1.0
+    assert _compute_omi_reward({"ground_truth": "x^2+2x+1"}, r"\boxed{(x+1)^2}") == 1.0
+    assert _compute_omi_reward({"ground_truth": "2x+2"}, r"\boxed{2(x+1)}") == 1.0
+
+
+def test_reward_algebraic_nonequivalent_still_zero():
+    from reliquary.environment.openmathinstruct import _compute_omi_reward
+    assert _compute_omi_reward({"ground_truth": "2+b"}, r"\boxed{2 - b}") == 0.0
+    assert _compute_omi_reward({"ground_truth": "x^2"}, r"\boxed{x^3}") == 0.0
+    assert _compute_omi_reward({"ground_truth": "a+c"}, r"\boxed{a + b}") == 0.0
+
+
+def test_reward_rounding_stays_out_of_symbolic_path():
+    from reliquary.environment.openmathinstruct import _compute_omi_reward
+    # numbers have no free symbols -> numeric path governs -> rounding rejected
+    assert _compute_omi_reward({"ground_truth": "8.57"}, r"\boxed{60/7}") == 0.0
+    assert _compute_omi_reward({"ground_truth": "\\frac{5}{3}"}, r"\boxed{1.67}") == 0.0
+    assert _compute_omi_reward({"ground_truth": "4"}, r"\boxed{3.1}") == 0.0
+
+
+def test_reward_symbolic_adversarial_no_hang():
+    from reliquary.environment.openmathinstruct import _compute_omi_reward
+    # DoS-shaped payloads must return quickly as 0.0, never raise/hang
+    assert _compute_omi_reward({"ground_truth": "x"}, r"\boxed{9^9^9^9}") == 0.0
+    assert _compute_omi_reward({"ground_truth": "x"}, r"\boxed{x!}") == 0.0
+    assert _compute_omi_reward({"ground_truth": "x"}, "\\boxed{" + "x+" * 60 + "x}") == 0.0
+
+
+def test_reward_numeric_and_structured_not_regressed():
+    from reliquary.environment.openmathinstruct import _compute_omi_reward
+    assert _compute_omi_reward({"ground_truth": "1/2"}, r"\boxed{0.5}") == 1.0
+    assert _compute_omi_reward({"ground_truth": "82.50"}, r"\boxed{82.5}") == 1.0
+    assert _compute_omi_reward({"ground_truth": "43"}, r"\boxed{42}") == 0.0
