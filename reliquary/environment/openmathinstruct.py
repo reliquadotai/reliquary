@@ -139,7 +139,7 @@ def _latex_to_pyexpr(s: str) -> Optional[str]:
     return None if "\\" in s else s
 
 
-def _expr_is_safe(expr, _depth: int = 0) -> bool:
+def _expr_is_safe(expr, _depth: int = 0, allow_symbols: bool = False) -> bool:
     """Structural whitelist guarding ``evalf`` against adversarial payloads.
 
     Only numbers, named constants (pi, E), ``+ - * /`` and powers with a *small
@@ -154,8 +154,10 @@ def _expr_is_safe(expr, _depth: int = 0) -> bool:
         return False
     if expr.is_Number or isinstance(expr, sympy.NumberSymbol):
         return True
+    if allow_symbols and expr.is_Symbol:
+        return True
     if isinstance(expr, (sympy.Add, sympy.Mul)):
-        return all(_expr_is_safe(a, _depth + 1) for a in expr.args)
+        return all(_expr_is_safe(a, _depth + 1, allow_symbols) for a in expr.args)
     if isinstance(expr, sympy.Pow):
         base, exp = expr.as_base_exp()
         if not exp.is_Number:
@@ -165,11 +167,11 @@ def _expr_is_safe(expr, _depth: int = 0) -> bool:
                 return False  # huge exponent
         except (TypeError, ValueError, OverflowError):
             return False
-        return _expr_is_safe(base, _depth + 1)
-    return False  # factorial, other functions, free symbols, ...
+        return _expr_is_safe(base, _depth + 1, allow_symbols)
+    return False  # factorial, other functions, disallowed symbols, ...
 
 
-def _expr_str_is_safe(s: str) -> bool:
+def _expr_str_is_safe(s: str, allow_symbols: bool = False) -> bool:
     """Token whitelist applied BEFORE ``parse_expr``.
 
     ``parse_expr`` eagerly evaluates some constructs during parsing (notably
@@ -182,6 +184,10 @@ def _expr_str_is_safe(s: str) -> bool:
     # not when part of a longer identifier ("sqrtx"); whatever survives must be
     # numbers / operators only.
     cleaned = re.sub(r"(?<![A-Za-z])(?:sqrt|pi)(?![A-Za-z])", "", s)
+    if allow_symbols:
+        # drop lone single-letter variables (not part of a longer identifier and
+        # not a function call `f(`), leaving numbers / operators for the fullmatch.
+        cleaned = re.sub(r"(?<![A-Za-z])[A-Za-z](?![A-Za-z(])", "", cleaned)
     return re.fullmatch(r"[0-9.+\-*/() \t]*", cleaned) is not None
 
 

@@ -319,3 +319,31 @@ def test_get_problem_modulo_wraps():
                      {"problem": "q1", "expected_answer": "1"}])
     assert env.get_problem(2)["ground_truth"] == "0"
     assert env.get_problem(3)["ground_truth"] == "1"
+
+
+def test_expr_str_guard_symbols_flag():
+    from reliquary.environment.openmathinstruct import _expr_str_is_safe
+    # default (numeric) behaviour unchanged: a variable is rejected
+    assert _expr_str_is_safe("2 - b") is False
+    assert _expr_str_is_safe("2 + 3*(4)") is True
+    # with allow_symbols: single-letter variables allowed...
+    assert _expr_str_is_safe("2 - b", allow_symbols=True) is True
+    assert _expr_str_is_safe("x**2 + 2*x + 1", allow_symbols=True) is True
+    # ...but factorials and function calls still rejected
+    assert _expr_str_is_safe("5!", allow_symbols=True) is False
+    assert _expr_str_is_safe("exp(x)", allow_symbols=True) is False
+    assert _expr_str_is_safe("gamma(3)", allow_symbols=True) is False
+
+
+def test_expr_struct_guard_symbols_flag():
+    import sympy
+    from reliquary.environment.openmathinstruct import _expr_is_safe
+    x, b = sympy.symbols("x b")
+    # symbols rejected by default, allowed under the flag
+    assert _expr_is_safe(x) is False
+    assert _expr_is_safe(x, allow_symbols=True) is True
+    assert _expr_is_safe((x + 1) ** 2, allow_symbols=True) is True
+    assert _expr_is_safe(2 - b, allow_symbols=True) is True
+    # power tower / huge exponent still rejected even with symbols allowed
+    assert _expr_is_safe(x ** 50, allow_symbols=True) is False
+    assert _expr_is_safe(sympy.Pow(2, x, evaluate=False), allow_symbols=True) is False
