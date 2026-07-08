@@ -45,6 +45,22 @@ logger = logging.getLogger(__name__)
 GRADER_CONTAINER_ID_PLACEHOLDER = "{container_id}"
 
 
+def runsc_worker_argv(bundle: str) -> list[str]:
+    """Production runsc argv for a sandbox worker.
+
+    ``--ignore-cgroups`` is a GLOBAL flag and MUST sit before the ``run``
+    subcommand (this runsc build rejects it after ``run``). It stops runsc
+    creating a per-sandbox cgroup: gVisor never reaps that cgroup when a
+    worker is killed/recycled, so on cgroup-v2 + ``cgroupns=host`` hosts they
+    leak until ``/sys/fs/cgroup`` hits ``nr_descendants`` max (~65534) and
+    every new ``runsc run`` fails ENOSPC — silently killing all code grading.
+    The sandbox is already bounded by the bundle rlimits + ``--network=none``
+    + the server's wall-clock timeout, so the cgroup is redundant here.
+    """
+    return ["runsc", "--network=none", "--ignore-cgroups", "run",
+            "--bundle", bundle, GRADER_CONTAINER_ID_PLACEHOLDER]
+
+
 class _MetricsRegistry:
     """Tiny Prometheus-text-format counter registry. No external dep.
 
@@ -595,8 +611,7 @@ def main() -> None:
             "GRADER_BUNDLE_PATH",
             "/opt/reliquary/reliquary/environment/grader/bundle",
         )
-        worker_argv = ["runsc", "--network=none", "run",
-                       "--bundle", bundle, GRADER_CONTAINER_ID_PLACEHOLDER]
+        worker_argv = runsc_worker_argv(bundle)
     else:
         worker_argv = [sys.executable, "-m", "reliquary.environment.grader.worker"]
 
