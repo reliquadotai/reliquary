@@ -256,6 +256,24 @@ def test_runsc_workers_get_unique_container_ids(monkeypatch, tmp_path):
     assert srv.GRADER_CONTAINER_ID_PLACEHOLDER not in container_ids
 
 
+def test_production_runsc_argv_disables_cgroups():
+    """Production runsc argv must pass `--ignore-cgroups` as a GLOBAL flag
+    (before `run`) so runsc never creates a per-sandbox cgroup — gVisor doesn't
+    reap those on kill/recycle and they leak until `runsc run` fails ENOSPC,
+    silently killing all code grading."""
+    from reliquary.environment.grader import server as srv
+
+    argv = srv.runsc_worker_argv("/opt/grader/bundle")
+
+    assert argv[0] == "runsc"
+    assert "--ignore-cgroups" in argv
+    # Global flag: must precede the `run` subcommand, else this runsc build
+    # rejects it ("flag provided but not defined").
+    assert argv.index("--ignore-cgroups") < argv.index("run")
+    assert argv[-1] == srv.GRADER_CONTAINER_ID_PLACEHOLDER
+    assert "/opt/grader/bundle" in argv
+
+
 def test_runsc_respawn_uses_fresh_id_before_cleanup(monkeypatch, tmp_path):
     from reliquary.environment.grader import server as srv
 
