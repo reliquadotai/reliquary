@@ -236,7 +236,7 @@ def test_grail_verifier_receives_tokenizer_for_sparse_pstop():
 
     seen_tokenizers = []
 
-    def tokenizer_aware_grail(commit, model, randomness, *, tokenizer=None):
+    def tokenizer_aware_grail(commit, model, randomness, *, tokenizer=None, seed_u_values=None):
         seen_tokenizers.append(tokenizer)
         return ProofResult(
             all_passed=True,

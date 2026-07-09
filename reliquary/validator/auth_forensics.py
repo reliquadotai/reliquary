@@ -228,6 +228,9 @@ def record_all_token_auth_findings(
         )
 
 
+_forced_seed_shadow_write_warned = False
+
+
 def record_forced_seed_shadow(
     hotkey: str,
     prompt_idx: int,
@@ -243,6 +246,11 @@ def record_forced_seed_shadow(
     can calibrate ``FORCED_SEED_CONSISTENCY_FLOOR`` / ``FORCED_SEED_ENFORCE_FROM_WINDOW``
     before arming enforcement. Fail-soft: write errors are logged but never
     affect submission handling.
+
+    Unlike the finding-only shadow writers, this fires on every accepted
+    submission, so a persistent unwritable state dir would otherwise flood
+    the log with one warning per accept. The write failure is logged at most
+    once per process to surface the condition without spamming.
     """
     if not auth_forensics_enabled():
         return
@@ -265,11 +273,15 @@ def record_forced_seed_shadow(
             f.write(json.dumps(record, sort_keys=True, separators=(",", ":")))
             f.write("\n")
     except Exception as exc:
-        logger.warning(
-            "forced_seed_shadow_write_failed path=%s error=%r",
-            out_path,
-            exc,
-        )
+        global _forced_seed_shadow_write_warned
+        if not _forced_seed_shadow_write_warned:
+            _forced_seed_shadow_write_warned = True
+            logger.warning(
+                "forced_seed_shadow_write_failed path=%s error=%r "
+                "(further occurrences suppressed)",
+                out_path,
+                exc,
+            )
 
 
 def record_code_semantic_auth_findings(

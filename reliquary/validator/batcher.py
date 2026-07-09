@@ -181,6 +181,16 @@ def _forced_seed_verdict(n_stoch: int, n_match: int, window: int, enforce_from: 
     return (n_match / n_stoch) < FORCED_SEED_CONSISTENCY_FLOOR
 
 
+def _is_missing_kwarg_typeerror(exc: TypeError, kwarg: str) -> bool:
+    """True iff ``exc`` is Python's own "unexpected keyword argument" TypeError
+    for ``kwarg`` (e.g. a legacy/stub verifier signature), as opposed to some
+    other internal TypeError that merely happens to mention ``kwarg`` in its
+    message. A bare substring test on ``kwarg`` alone would swallow the latter
+    and silently disable the forced-seed gate every rollout."""
+    msg = str(exc)
+    return "unexpected keyword argument" in msg and kwarg in msg
+
+
 _PROOF_FAILURE_DEBT_STAGES = frozenset(
     {
         "grail",
@@ -1096,20 +1106,24 @@ class GrpoWindowBatcher:
                 # Backward-compat fallback for stub verifiers (tests, legacy
                 # callers) that don't accept one or both of the newer kwargs.
                 # Retry narrowing from most- to least-featured signature
-                # rather than guessing which kwarg tripped it.
-                if "seed_u_values" in str(exc):
+                # rather than guessing which kwarg tripped it. Matched
+                # strictly against Python's "unexpected keyword argument"
+                # TypeError text (not a bare substring test) so a genuine
+                # internal TypeError raised inside a real verifier propagates
+                # instead of being masked and retried without seed_u_values.
+                if _is_missing_kwarg_typeerror(exc, "seed_u_values"):
                     try:
                         proof = self._verify_commitment(
                             rollout.commit, self.model, self.randomness,
                             tokenizer=self.tokenizer,
                         )
                     except TypeError as exc2:
-                        if "tokenizer" not in str(exc2):
+                        if not _is_missing_kwarg_typeerror(exc2, "tokenizer"):
                             raise
                         proof = self._verify_commitment(
                             rollout.commit, self.model, self.randomness,
                         )
-                elif "tokenizer" in str(exc):
+                elif _is_missing_kwarg_typeerror(exc, "tokenizer"):
                     proof = self._verify_commitment(
                         rollout.commit, self.model, self.randomness,
                     )
