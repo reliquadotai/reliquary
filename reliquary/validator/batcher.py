@@ -32,6 +32,7 @@ from reliquary.constants import (
     REJECTED_LIST_CAP_PER_HOTKEY,
     CODE_SEMANTIC_AUTH_ENFORCE,
     TOKEN_AUTH_ENFORCE,
+    ALL_TOKEN_AUTH_ENFORCE,
 )
 from reliquary.environment.base import Environment
 from reliquary.shared.prompt_range import window_prompt_range
@@ -1296,6 +1297,14 @@ class GrpoWindowBatcher:
                     rollout_reward_positive,
                     log_shadow_metrics,
                 )
+                if ALL_TOKEN_AUTH_ENFORCE:
+                    return reject(
+                        RejectReason.TOKEN_TAMPERED,
+                        "all_token_authenticity",
+                        sketch_diff_max=sketch_diff_max,
+                        lp_dev_max=lp_dev_max,
+                        dist_q10_min=dist_q10_min,
+                    )
 
             if getattr(self.env, "name", "") == "opencodeinstruct":
                 code_auth_ok, code_auth_metrics = (

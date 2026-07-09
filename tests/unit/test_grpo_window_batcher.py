@@ -2260,6 +2260,9 @@ def test_accept_boxed_answer_high_prob():
 def test_all_token_auth_shadow_records_without_rejecting(monkeypatch, tmp_path):
     import reliquary.validator.batcher as batcher_mod
 
+    # Telemetry-recording path: with enforcement off, findings are counted but
+    # the submission is still accepted.
+    monkeypatch.setattr(batcher_mod, "ALL_TOKEN_AUTH_ENFORCE", False)
     forensics_path = tmp_path / "auth-forensics.jsonl"
     monkeypatch.setenv("RELIQUARY_AUTH_FORENSICS_ENABLED", "1")
     monkeypatch.setenv("RELIQUARY_AUTH_FORENSICS_PATH", str(forensics_path))
@@ -2337,6 +2340,37 @@ def test_all_token_auth_shadow_records_without_rejecting(monkeypatch, tmp_path):
     assert first["reward_positive"] is True
     assert first["completion_pos"] == 1
     assert first["token_text"] == "A"
+
+
+def test_all_token_auth_enforce_rejects(monkeypatch):
+    """With ALL_TOKEN_AUTH_ENFORCE on, an all-token argmax-gated finding rejects
+    the submission (unconditional on reward), like the primary token-auth gate."""
+    import reliquary.validator.batcher as batcher_mod
+
+    monkeypatch.setattr(batcher_mod, "ALL_TOKEN_AUTH_ENFORCE", True)
+    monkeypatch.setattr(
+        batcher_mod,
+        "evaluate_all_token_auth_shadow",
+        lambda _proof, **_kwargs: (False, {"findings": 1, "min_prob": 4.0e-7}),
+    )
+    monkeypatch.setattr(batcher_mod, "has_eos_padding", lambda *_args, **_kw: False)
+    monkeypatch.setattr(batcher_mod, "verify_termination", lambda *_args, **_kw: True)
+    monkeypatch.setattr(batcher_mod, "is_cap_truncation", lambda *_args, **_kw: False)
+
+    b = _make_batcher(
+        env=FakeEnv(),
+        tokenizer=_CharTokenizerWithEos(),
+        verify_commitment_proofs_fn=_grail_with_chosen_probs(
+            CHALLENGE_K + 4,
+            [0.99] * CHALLENGE_K,
+        ),
+    )
+    req = _request()
+
+    resp = b.accept_submission(req)
+
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.TOKEN_TAMPERED
 
 
 def test_opencode_semantic_auth_shadow_records_without_rejecting(
