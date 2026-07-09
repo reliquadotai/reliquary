@@ -368,8 +368,17 @@ def verify_commitment_proofs(
     seed_n_match = 0
     if seed_u_values is not None:
         valid_t = _completion_valid_t(tokens, prompt_length, completion_length, seq_len)
+        # Exclude BFT-injected force_span tokens: validator-accepted but not
+        # policy-sampled, so they never came from the forced stream and would
+        # false-mismatch (mirrors training._completion_keep_list). force_span
+        # is (start, end) in absolute token positions.
+        force_span = rollout_meta.get("force_span")
+        fs0, fs1 = (int(force_span[0]), int(force_span[1])) if force_span else (0, 0)
         # completion offset j = t - prompt_length indexes seed_u_values.
-        seed_t = [t for t in valid_t if t - prompt_length < len(seed_u_values)]
+        seed_t = [
+            t for t in valid_t
+            if t - prompt_length < len(seed_u_values) and not (fs0 <= t < fs1)
+        ]
         if seed_t:
             pos_tensor = torch.tensor(
                 [t - 1 for t in seed_t], device=device, dtype=torch.long,

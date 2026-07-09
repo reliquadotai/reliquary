@@ -139,6 +139,34 @@ def test_verify_commitment_proofs_mismatch_lowers_match_not_stochastic(_rhs, moc
 
 @patch("reliquary.shared.forward.forward_single_layer")
 @patch("reliquary.shared.hf_compat.resolve_hidden_size", return_value=_HIDDEN_DIM)
+def test_verify_commitment_proofs_excludes_bft_force_span_positions(_rhs, mock_fwd):
+    """A BFT-injected force_span token is validator-accepted but not
+    policy-sampled, so it must be excluded from the seed-consistency check
+    even though its distribution is stochastic. force_span=(3,4) removes
+    completion offset 1 (t=3). We corrupt that same token so that WITHOUT
+    exclusion it would both count as stochastic AND mismatch (n_stoch=3,
+    n_match=2); with exclusion it neither counts nor mismatches
+    (n_stoch=2, n_match=2)."""
+    logits_gpu = torch.stack(_seed_wiring_logits_rows())
+    u_values = _seed_wiring_u_values()
+    commit = _build_seed_wiring_commit(logits_gpu, u_values, corrupt_offset=1)  # t=3
+    commit["rollout"]["forced"] = True
+    commit["rollout"]["force_span"] = [3, 4]  # absolute token positions
+    mock_fwd.return_value = (
+        torch.randn(1, _SEQ_LEN, _HIDDEN_DIM),
+        logits_gpu.unsqueeze(0),
+    )
+
+    result = verifier.verify_commitment_proofs(
+        commit, _make_mock_model(), _RANDOMNESS, seed_u_values=u_values,
+    )
+
+    assert result.seed_n_stochastic == 2   # t=2, t=5 (t=3 excluded as force-span)
+    assert result.seed_n_match == 2        # corrupted t=3 does not drag match down
+
+
+@patch("reliquary.shared.forward.forward_single_layer")
+@patch("reliquary.shared.hf_compat.resolve_hidden_size", return_value=_HIDDEN_DIM)
 def test_verify_commitment_proofs_short_seed_u_values_skips_tail_positions(_rhs, mock_fwd):
     """seed_u_values shorter than completion_length must SKIP the
     uncovered tail positions, not score them. With only 2 values supplied,
