@@ -141,8 +141,11 @@ def test_generate_rollouts_passes_full_eos_set_and_trims_first_eos(monkeypatch):
     eng.tokenizer = _Tok()
     eng.vllm_model = _Model()
     eng.max_new_tokens = 32
+    eng.wallet = SimpleNamespace(hotkey=SimpleNamespace(ss58_address="hk"))
 
-    rollouts = eng._generate_m_rollouts({"prompt": "p"}, "00")
+    rollouts = eng._generate_m_rollouts(
+        {"prompt": "p"}, "00", prompt_idx=0, checkpoint_hash="c",
+    )
 
     assert eng.vllm_model.kwargs["eos_token_id"] == [248044, 248046]
     assert len(rollouts) == M_ROLLOUTS
@@ -189,11 +192,17 @@ def test_generate_rollouts_bft_path_keeps_finished_rows():
     eng.tokenizer = _Tok()
     eng.vllm_model = _Model()
     eng.max_new_tokens = 40000
+    eng.wallet = SimpleNamespace(hotkey=SimpleNamespace(ss58_address="hk"))
 
-    rollouts = eng._generate_m_rollouts({"prompt": "p"}, "00")
+    rollouts = eng._generate_m_rollouts(
+        {"prompt": "p"}, "00", prompt_idx=0, checkpoint_hash="c",
+    )
 
     assert eng.vllm_model.kwargs["max_new_tokens"] == min(40000, BFT_THINKING_BUDGET)
-    assert "logits_processor" not in eng.vllm_model.kwargs
+    # Forced-seed path attaches the sampler as a logits_processor and turns
+    # HF's own sampling off (do_sample=False) so it can't re-warp on top.
+    assert "logits_processor" in eng.vllm_model.kwargs
+    assert eng.vllm_model.kwargs["do_sample"] is False
     assert eng.vllm_model.calls == 1  # all finished → no phase-2 generation
     assert len(rollouts) == M_ROLLOUTS
     assert all(r["forced"] is False for r in rollouts)
@@ -238,9 +247,11 @@ def test_generate_rollouts_does_not_apply_boxed_bft_to_opencode():
     eng.tokenizer = _Tok()
     eng.vllm_model = _Model()
     eng.max_new_tokens = BFT_THINKING_BUDGET + 777
+    eng.wallet = SimpleNamespace(hotkey=SimpleNamespace(ss58_address="hk"))
 
     rollouts = eng._generate_m_rollouts(
-        {"prompt": "write code"}, "00", env_name="opencodeinstruct"
+        {"prompt": "write code"}, "00", env_name="opencodeinstruct",
+        prompt_idx=0, checkpoint_hash="c",
     )
 
     assert eng.vllm_model.kwargs["max_new_tokens"] == eng.max_new_tokens

@@ -683,3 +683,7 @@ FORCED_SEED_MIN_STOCH_POSITIONS = 30
 FORCED_SEED_ENFORCE_FROM_WINDOW = int(
     _os.environ.get("FORCED_SEED_ENFORCE_FROM_WINDOW", str(2 ** 63 - 1))
 )
+# Wire-advertised on BatchSubmissionRequest.protocol_version by clients that
+# sample from the forced stream (0 = legacy/pre-forced-seed). Lets the operator
+# track adoption in the shadow window before arming enforcement.
+FORCED_SEED_PROTOCOL_VERSION = 1
