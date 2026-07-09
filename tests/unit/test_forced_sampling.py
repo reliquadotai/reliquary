@@ -11,6 +11,14 @@ def test_pick_inverse_cdf_boundaries():
     assert fs.pick(probs, 0.999) == 1
 
 
+def test_pick_matches_probs_device_no_mismatch_error():
+    # pick must build its comparison tensor on probs.device (CUDA-or-CPU) so
+    # the GPU-resident verifier path never round-trips logits through PCIe.
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    probs = torch.tensor([0.5, 0.5], device=device)
+    assert fs.pick(probs, 0.5) == 1
+
+
 def test_warp_topk_topp_masks():
     logits = torch.tensor([10.0, 9.0, 1.0, 1.0])
     probs = fs.warp(logits, t=0.6, top_k=2, top_p=1.0)

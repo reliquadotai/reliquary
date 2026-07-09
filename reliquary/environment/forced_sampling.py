@@ -32,7 +32,8 @@ def warp(logits: torch.Tensor, t: float, top_k: int, top_p: float) -> torch.Tens
 def pick(probs: torch.Tensor, u: float) -> int:
     """First token id whose cumulative probability exceeds u (inverse-CDF)."""
     cdf = torch.cumsum(probs, dim=-1)
-    idx = int(torch.searchsorted(cdf, torch.tensor(float(u), dtype=cdf.dtype), right=True))
+    u_tensor = torch.tensor(float(u), device=cdf.device, dtype=cdf.dtype)
+    idx = int(torch.searchsorted(cdf, u_tensor, right=True))
     return min(idx, probs.numel() - 1)
 
 
