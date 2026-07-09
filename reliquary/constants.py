@@ -665,3 +665,21 @@ ALL_TOKEN_AUTH_ENFORCE = True
 CODE_SEMANTIC_AUTH_THRESHOLD = 0.001
 CODE_SEMANTIC_AUTH_ARGMAX_CONF = TOKEN_AUTH_ARGMAX_CONF
 CODE_SEMANTIC_AUTH_ENFORCE = False
+
+# ──────────────── FORCED-SEED SAMPLING ────────────────
+# Domain separation for the per-position public uniform u_{i,t}.
+FORCED_SEED_DOMAIN = "reliquary-forced-seed-v1"
+# A position counts toward the seed-consistency check only if its warped max
+# probability is below this (i.e. the forced draw actually chooses the token).
+FORCED_SEED_STOCHASTIC_MAXPROB = 0.99
+# Reject a group whose stochastic-position match rate is below this floor
+# (measured: honest ~0.92-0.96, non-forced ~0.60).
+FORCED_SEED_CONSISTENCY_FLOOR = 0.80
+# Below this many stochastic positions in a group, the gate abstains (accepts)
+# rather than risk a false reject on thin signal.
+FORCED_SEED_MIN_STOCH_POSITIONS = 30
+# Enforce from this window onward; before it the gate is shadow-only. Default
+# sentinel = never, until the operator announces + arms the cutover window.
+FORCED_SEED_ENFORCE_FROM_WINDOW = int(
+    _os.environ.get("FORCED_SEED_ENFORCE_FROM_WINDOW", str(2 ** 63 - 1))
+)
