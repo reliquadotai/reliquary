@@ -33,6 +33,7 @@ from reliquary.constants import (
     CODE_SEMANTIC_AUTH_ENFORCE,
     TOKEN_AUTH_ENFORCE,
     ALL_TOKEN_AUTH_ENFORCE,
+    FORCED_SEED_ENFORCE_FROM_WINDOW,
 )
 from reliquary.environment.base import Environment
 from reliquary.shared.prompt_range import window_prompt_range
@@ -67,6 +68,7 @@ from reliquary.validator.auth_forensics import (
     code_semantic_counterfactual_max_findings_per_rollout,
     record_all_token_auth_findings,
     record_code_semantic_auth_findings,
+    record_forced_seed_shadow,
 )
 from reliquary.validator.reward_shape import detect_reward_shape_manipulation
 from reliquary.validator.rollout_patterns import detect_opposite_reward_clones
@@ -164,6 +166,19 @@ def _uses_validator_authoritative_reward(env: Any) -> bool:
 
 def _reward_matches_claim(actual: float, claimed: float, *, tolerance: float = 1e-6) -> bool:
     return abs(float(actual) - float(claimed)) <= tolerance
+
+
+def _forced_seed_verdict(n_stoch: int, n_match: int, window: int, enforce_from: int) -> bool:
+    """True => reject the group for seed mismatch. Abstains on thin signal; shadow
+    before the cutover window."""
+    from reliquary.constants import (
+        FORCED_SEED_CONSISTENCY_FLOOR, FORCED_SEED_MIN_STOCH_POSITIONS,
+    )
+    if window < enforce_from:
+        return False
+    if n_stoch < FORCED_SEED_MIN_STOCH_POSITIONS:
+        return False
+    return (n_match / n_stoch) < FORCED_SEED_CONSISTENCY_FLOOR
 
 
 _PROOF_FAILURE_DEBT_STAGES = frozenset(
@@ -1016,6 +1031,14 @@ class GrpoWindowBatcher:
             except Exception:
                 canonical_force_ids = []
 
+        # Forced-seed group tally: summed across all rollouts in this
+        # submission, verdict decided once after the loop (see
+        # ``_forced_seed_verdict``) — per-rollout counts are too thin a
+        # sample to gate on individually.
+        from reliquary.environment.forced_sampling import u_at
+        grp_stoch = 0
+        grp_match = 0
+
         for rollout_idx, rollout in enumerate(request.rollouts):
             # `truncated` is a validator-set flag (overlong reward shaping, see
             # submission.py). Wipe any miner-supplied value at ingestion so only
@@ -1047,19 +1070,53 @@ class GrpoWindowBatcher:
             claimed_rand = (rollout.commit.get("beacon") or {}).get("randomness", "")
             if claimed_rand != self.randomness:
                 return reject(RejectReason.WRONG_RANDOMNESS, "randomness")
+            # Per-position forced-seed uniforms for this rollout's teacher-forced
+            # consistency check. Read completion_length here (ahead of the
+            # ``completion_len`` computed later at the sparse-outputs section)
+            # so the u-stream can accompany the verify call below.
+            _seed_completion_len = int(
+                (rollout.commit.get("rollout") or {}).get("completion_length", 0)
+            )
+            seed_u = [
+                u_at(
+                    self.randomness, request.miner_hotkey, request.prompt_idx,
+                    request.checkpoint_hash, rollout_idx, j,
+                )
+                for j in range(_seed_completion_len)
+            ]
             try:
                 proof = self._verify_commitment(
                     rollout.commit,
                     self.model,
                     self.randomness,
                     tokenizer=self.tokenizer,
+                    seed_u_values=seed_u,
                 )
             except TypeError as exc:
-                if "tokenizer" not in str(exc):
+                # Backward-compat fallback for stub verifiers (tests, legacy
+                # callers) that don't accept one or both of the newer kwargs.
+                # Retry narrowing from most- to least-featured signature
+                # rather than guessing which kwarg tripped it.
+                if "seed_u_values" in str(exc):
+                    try:
+                        proof = self._verify_commitment(
+                            rollout.commit, self.model, self.randomness,
+                            tokenizer=self.tokenizer,
+                        )
+                    except TypeError as exc2:
+                        if "tokenizer" not in str(exc2):
+                            raise
+                        proof = self._verify_commitment(
+                            rollout.commit, self.model, self.randomness,
+                        )
+                elif "tokenizer" in str(exc):
+                    proof = self._verify_commitment(
+                        rollout.commit, self.model, self.randomness,
+                    )
+                else:
                     raise
-                proof = self._verify_commitment(
-                    rollout.commit, self.model, self.randomness
-                )
+            grp_stoch += proof.seed_n_stochastic
+            grp_match += proof.seed_n_match
             if proof.sketch_diff_max > sketch_diff_max:
                 sketch_diff_max = proof.sketch_diff_max
             if not proof.all_passed:
@@ -1388,6 +1445,20 @@ class GrpoWindowBatcher:
                             lp_dev_max=lp_dev_max,
                             dist_q10_min=dist_q10_min,
                         )
+
+        # Forced-seed group gate: decided once per submission (not per
+        # rollout) from the summed teacher-forced consistency counts.
+        # Shadow-only until ``self.window_start`` reaches
+        # FORCED_SEED_ENFORCE_FROM_WINDOW (default sentinel = never).
+        if _forced_seed_verdict(
+            grp_stoch, grp_match, self.window_start, FORCED_SEED_ENFORCE_FROM_WINDOW,
+        ):
+            logger.info(
+                "seed_mismatch hotkey=%s stoch=%d match=%d",
+                hk, grp_stoch, grp_match,
+            )
+            return reject(RejectReason.SEED_MISMATCH, "forced_seed")
+        record_forced_seed_shadow(hk, request.prompt_idx, grp_stoch, grp_match)
 
         # Reward-shape metrics are still computed (they feed the softer
         # training-quarantine signal + archive telemetry) but no longer

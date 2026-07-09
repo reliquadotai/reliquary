@@ -114,6 +114,14 @@ def code_semantic_auth_forensics_path() -> Path:
     return Path(state_dir) / "auth_forensics" / "code-semantic-auth.jsonl"
 
 
+def forced_seed_shadow_path() -> Path:
+    explicit = os.environ.get("RELIQUARY_FORCED_SEED_SHADOW_PATH")
+    if explicit:
+        return Path(explicit)
+    state_dir = os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")
+    return Path(state_dir) / "auth_forensics" / "forced-seed-shadow.jsonl"
+
+
 def _float_or_none(value: Any) -> float | None:
     if value is None:
         return None
@@ -215,6 +223,50 @@ def record_all_token_auth_findings(
     except Exception as exc:
         logger.warning(
             "auth_forensics_write_failed path=%s error=%r",
+            out_path,
+            exc,
+        )
+
+
+def record_forced_seed_shadow(
+    hotkey: str,
+    prompt_idx: int,
+    n_stoch: int,
+    n_match: int,
+    *,
+    path: str | Path | None = None,
+) -> None:
+    """Append one local JSONL record per forced-seed group verdict.
+
+    Shadow-mode telemetry for the forced-seed consistency gate: logs the
+    per-group match rate (``n_match / n_stoch``) and raw counts so operators
+    can calibrate ``FORCED_SEED_CONSISTENCY_FLOOR`` / ``FORCED_SEED_ENFORCE_FROM_WINDOW``
+    before arming enforcement. Fail-soft: write errors are logged but never
+    affect submission handling.
+    """
+    if not auth_forensics_enabled():
+        return
+
+    out_path = Path(path) if path is not None else forced_seed_shadow_path()
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "schema_version": 1,
+            "event": "forced_seed_shadow",
+            "surface": "forced-seed-shadow",
+            "ts_unix": time.time(),
+            "miner_hotkey": str(hotkey),
+            "prompt_idx": int(prompt_idx),
+            "n_stoch": int(n_stoch),
+            "n_match": int(n_match),
+            "score": float(n_match) / float(max(1, n_stoch)),
+        }
+        with open(out_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, sort_keys=True, separators=(",", ":")))
+            f.write("\n")
+    except Exception as exc:
+        logger.warning(
+            "forced_seed_shadow_write_failed path=%s error=%r",
             out_path,
             exc,
         )

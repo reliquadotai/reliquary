@@ -2773,3 +2773,53 @@ def test_accept_in_range_passes_range_gate(monkeypatch):
     resp = b.accept_submission(_request(prompt_idx=lo, window_start=500))
     # Passes the range gate; may still hit a later gate, but never this one.
     assert resp.reason != RejectReason.PROMPT_OUT_OF_RANGE
+
+
+# ---- forced-seed group gate (Task 5) -------------------------------------
+
+
+def _grail_with_seed_counts(n_stoch: int, n_match: int):
+    """Stub verifier that opts into the (tokenizer, seed_u_values) signature
+    and reports a fixed per-rollout seed-consistency tally. The batcher sums
+    these across all 8 rollouts before deciding the group verdict."""
+    def _fn(commit, model, randomness, *, tokenizer=None, seed_u_values=None):
+        from reliquary.validator.verifier import ProofResult
+        return ProofResult(
+            all_passed=True, passed=1, checked=1,
+            seed_n_stochastic=n_stoch, seed_n_match=n_match,
+        )
+    return _fn
+
+
+def test_forced_seed_group_gate_rejects_below_floor_when_enforcing(monkeypatch):
+    """Aggregate over 8 rollouts: 80 stochastic positions, 8 matches (0.10)
+    is well below FORCED_SEED_CONSISTENCY_FLOOR (0.80). With enforcement
+    armed (window_start >= FORCED_SEED_ENFORCE_FROM_WINDOW), the group is
+    rejected SEED_MISMATCH after the per-rollout loop completes."""
+    import reliquary.validator.batcher as batcher_mod
+
+    monkeypatch.setattr(batcher_mod, "FORCED_SEED_ENFORCE_FROM_WINDOW", 100)
+    b = _make_batcher(
+        window_start=500,
+        verify_commitment_proofs_fn=_grail_with_seed_counts(n_stoch=10, n_match=1),
+    )
+    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.SEED_MISMATCH
+    assert len(b.valid_submissions()) == 0
+
+
+def test_forced_seed_group_gate_shadow_before_cutover():
+    """Same low match-rate as above, but FORCED_SEED_ENFORCE_FROM_WINDOW is
+    left at its default sentinel (never) -> shadow-only, submission is NOT
+    rejected for SEED_MISMATCH."""
+    b = _make_batcher(
+        window_start=500,
+        verify_commitment_proofs_fn=_grail_with_seed_counts(n_stoch=10, n_match=1),
+    )
+    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+    resp = b.accept_submission(req)
+    assert resp.reason != RejectReason.SEED_MISMATCH
+    assert resp.accepted is True
+    assert len(b.valid_submissions()) == 1
