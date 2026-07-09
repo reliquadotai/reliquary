@@ -71,6 +71,7 @@ class RejectReason(str, Enum):
     BAD_TERMINATION = "bad_termination"
     BOXED_ANSWER_TAMPERED = "boxed_answer_tampered"
     TOKEN_TAMPERED = "token_tampered"
+    SEED_MISMATCH = "seed_mismatch"
     MALFORMED_FINAL_ANSWER = "malformed_final_answer"
     # Deprecated: the reward-shape filter no longer rejects submissions
     # (trivially bypassable + false-positive-prone). Kept in the enum so
@@ -132,6 +133,10 @@ class BatchSubmissionRequest(BaseModel):
     # rejects 0 as STALE_ROUND in production but tests can still
     # construct legacy requests for the cooldown / cheap-check paths.
     drand_round: int = Field(default=0, ge=0)
+    # Protocol version indicator for forced-seed sampling. Default 0 =
+    # pre-forced-seed client; newer clients set this to indicate support
+    # for seed-based randomness derivation.
+    protocol_version: int = Field(default=0, ge=0)
     # Caller-chosen freshness nonce. Bound into the envelope signature
     # so a precomputed signature cannot be reused for a different
     # logical submission. The validator does not (currently) dedupe on
