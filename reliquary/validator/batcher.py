@@ -181,6 +181,25 @@ def _forced_seed_verdict(n_stoch: int, n_match: int, window: int, enforce_from: 
     return (n_match / n_stoch) < FORCED_SEED_CONSISTENCY_FLOOR
 
 
+def _forced_seed_rollout_reject(per_rollout, window: int, enforce_from: int) -> bool:
+    """True => reject because a SINGLE rollout is off the forced stream. The
+    group-average verdict dilutes a partial swap (a few curated rollouts hidden
+    among honest ones); this catches any one rollout that carries enough
+    stochastic positions yet falls below the per-rollout floor. ``per_rollout``
+    is a list of (n_stoch, n_match). Abstains on thin rollouts; shadow before
+    the cutover window."""
+    from reliquary.constants import (
+        FORCED_SEED_ROLLOUT_FLOOR, FORCED_SEED_ROLLOUT_MIN_STOCH,
+    )
+    if window < enforce_from:
+        return False
+    for n_stoch, n_match in per_rollout:
+        if (n_stoch >= FORCED_SEED_ROLLOUT_MIN_STOCH
+                and (n_match / n_stoch) < FORCED_SEED_ROLLOUT_FLOOR):
+            return True
+    return False
+
+
 def _is_missing_kwarg_typeerror(exc: TypeError, kwarg: str) -> bool:
     """True iff ``exc`` is Python's own "unexpected keyword argument" TypeError
     for ``kwarg`` (e.g. a legacy/stub verifier signature), as opposed to some
@@ -1048,6 +1067,9 @@ class GrpoWindowBatcher:
         from reliquary.environment.forced_sampling import u_at
         grp_stoch = 0
         grp_match = 0
+        # Per-rollout (n_stoch, n_match) — the per-rollout gate needs each
+        # rollout separately, since the group average hides a partial swap.
+        seed_per_rollout: list[tuple[int, int]] = []
 
         for rollout_idx, rollout in enumerate(request.rollouts):
             # `truncated` is a validator-set flag (overlong reward shaping, see
@@ -1131,6 +1153,7 @@ class GrpoWindowBatcher:
                     raise
             grp_stoch += proof.seed_n_stochastic
             grp_match += proof.seed_n_match
+            seed_per_rollout.append((proof.seed_n_stochastic, proof.seed_n_match))
             if proof.sketch_diff_max > sketch_diff_max:
                 sketch_diff_max = proof.sketch_diff_max
             if not proof.all_passed:
@@ -1460,16 +1483,20 @@ class GrpoWindowBatcher:
                             dist_q10_min=dist_q10_min,
                         )
 
-        # Forced-seed group gate: decided once per submission (not per
-        # rollout) from the summed teacher-forced consistency counts.
-        # Shadow-only until ``self.window_start`` reaches
-        # FORCED_SEED_ENFORCE_FROM_WINDOW (default sentinel = never).
-        if _forced_seed_verdict(
+        # Forced-seed gate. Group verdict = summed counts (catches diffuse
+        # deviation); per-rollout verdict catches a single off-stream rollout
+        # the group average would dilute. Both shadow-only until
+        # ``self.window_start`` reaches FORCED_SEED_ENFORCE_FROM_WINDOW.
+        group_reject = _forced_seed_verdict(
             grp_stoch, grp_match, self.window_start, FORCED_SEED_ENFORCE_FROM_WINDOW,
-        ):
+        )
+        rollout_reject = _forced_seed_rollout_reject(
+            seed_per_rollout, self.window_start, FORCED_SEED_ENFORCE_FROM_WINDOW,
+        )
+        if group_reject or rollout_reject:
             logger.info(
-                "seed_mismatch hotkey=%s stoch=%d match=%d",
-                hk, grp_stoch, grp_match,
+                "seed_mismatch hotkey=%s stoch=%d match=%d scope=%s",
+                hk, grp_stoch, grp_match, "group" if group_reject else "rollout",
             )
             return reject(RejectReason.SEED_MISMATCH, "forced_seed")
         record_forced_seed_shadow(hk, request.prompt_idx, grp_stoch, grp_match)

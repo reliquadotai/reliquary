@@ -678,6 +678,17 @@ FORCED_SEED_CONSISTENCY_FLOOR = 0.80
 # Below this many stochastic positions in a group, the gate abstains (accepts)
 # rather than risk a false reject on thin signal.
 FORCED_SEED_MIN_STOCH_POSITIONS = 30
+# Per-rollout hardening: the group-average floor dilutes a partial swap (7
+# honest rollouts at ~0.96 + 1 curated at ~0.60 still averages >0.80). Reject a
+# group if ANY single rollout with enough stochastic positions falls below this
+# per-rollout floor. Set lower than the group floor to absorb the higher
+# single-rollout variance (empirical single-rollout: honest 0.94-1.0, non-forced
+# 0.52-0.65); shadow-only until calibrated on the live floor.
+FORCED_SEED_ROLLOUT_FLOOR = 0.75
+# A single rollout is judged only if it carries at least this many stochastic
+# positions; below it the per-rollout check abstains (never false-reject a
+# short / peaked honest rollout).
+FORCED_SEED_ROLLOUT_MIN_STOCH = 20
 # Enforce from this window onward; before it the gate is shadow-only. Default
 # sentinel = never, until the operator announces + arms the cutover window.
 FORCED_SEED_ENFORCE_FROM_WINDOW = int(
