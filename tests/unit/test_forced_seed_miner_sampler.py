@@ -62,6 +62,47 @@ def test_forced_seed_generate_kwargs_strips_warpers_and_forces_greedy():
     assert base["temperature"] == T_PROTO  # input dict not mutated
 
 
+def test_forced_seed_generate_kwargs_neutralizes_generation_config_processors():
+    # HF builds repetition_penalty / no_repeat_ngram / min_length /
+    # suppress_tokens (etc.) processors from the model's generation_config and
+    # runs them BEFORE the forced processor -- they are NOT do_sample-gated. The
+    # miner would then warp penalized logits while the validator warps raw ones,
+    # a systematic honest false-mismatch. The forced kwargs must pin every such
+    # processor to its inert value (kwargs override generation_config in HF).
+    proc = ForcedSeedLogitsProcessor(
+        randomness="r", hotkey="h", prompt_idx=0, checkpoint_hash="c",
+        rollout_indices=[0], base_offsets=[0], start_len=1,
+    )
+    base = {
+        "max_new_tokens": 8, "pad_token_id": 0,
+        "repetition_penalty": 1.3, "encoder_repetition_penalty": 1.2,
+        "no_repeat_ngram_size": 3, "encoder_no_repeat_ngram_size": 3,
+        "min_length": 5, "min_new_tokens": 5,
+        "suppress_tokens": [1, 2], "begin_suppress_tokens": [3],
+        "bad_words_ids": [[4]], "forced_bos_token_id": 1,
+        "forced_eos_token_id": 2, "exponential_decay_length_penalty": (8, 1.1),
+        "sequence_bias": {(1,): 1.0},
+    }
+    kw = forced_seed_generate_kwargs(base, proc)
+
+    assert kw["repetition_penalty"] == 1.0
+    assert kw["encoder_repetition_penalty"] == 1.0
+    assert kw["no_repeat_ngram_size"] == 0
+    assert kw["encoder_no_repeat_ngram_size"] == 0
+    assert kw["min_length"] == 0
+    assert kw["min_new_tokens"] == 0
+    assert kw["suppress_tokens"] is None
+    assert kw["begin_suppress_tokens"] is None
+    assert kw["bad_words_ids"] is None
+    assert kw["forced_bos_token_id"] is None
+    assert kw["forced_eos_token_id"] is None
+    assert kw["exponential_decay_length_penalty"] is None
+    assert kw["sequence_bias"] is None
+    # Non-processor kwargs preserved; input dict not mutated.
+    assert kw["max_new_tokens"] == 8 and kw["pad_token_id"] == 0
+    assert base["repetition_penalty"] == 1.3
+
+
 def test_phase2_base_offsets_are_per_row_completion_offsets():
     # Each BFT phase-2 row resumes from its own primed length; the first
     # sampled answer token sits at completion offset (primed_len - prompt_len).

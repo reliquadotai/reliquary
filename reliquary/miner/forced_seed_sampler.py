@@ -26,6 +26,28 @@ from reliquary.environment.forced_sampling import pick, u_at, warp
 # would warp twice and drift the miner off the validator's forced pick.
 _WARPER_KWARGS = ("temperature", "top_p", "top_k")
 
+# HF builds these logits processors from the model's ``generation_config`` and
+# runs them BEFORE our processor -- they are NOT do_sample-gated, so a checkpoint
+# whose config sets e.g. ``repetition_penalty`` would mutate the scores our
+# processor then warps, drifting the miner off the validator's raw-logits forced
+# pick (a systematic honest false-mismatch). Pin each to its inert value so only
+# the forced processor acts; explicit generate() kwargs override generation_config.
+_NEUTRAL_PROCESSOR_KWARGS = {
+    "repetition_penalty": 1.0,
+    "encoder_repetition_penalty": 1.0,
+    "no_repeat_ngram_size": 0,
+    "encoder_no_repeat_ngram_size": 0,
+    "min_length": 0,
+    "min_new_tokens": 0,
+    "suppress_tokens": None,
+    "begin_suppress_tokens": None,
+    "bad_words_ids": None,
+    "forced_bos_token_id": None,
+    "forced_eos_token_id": None,
+    "exponential_decay_length_penalty": None,
+    "sequence_bias": None,
+}
+
 
 class ForcedSeedLogitsProcessor(LogitsProcessor):
     """Replace each row's sampled token with the forced inverse-CDF pick.
@@ -70,11 +92,14 @@ class ForcedSeedLogitsProcessor(LogitsProcessor):
 
 def forced_seed_generate_kwargs(base_kwargs: dict, processor: LogitsProcessor) -> dict:
     """Return a copy of ``base_kwargs`` wired for forced-seed generation:
-    strip HF's own sampling warpers, force greedy selection of the processor's
-    one-hot token, and attach the processor. ``base_kwargs`` is not mutated."""
+    strip HF's own sampling warpers, neutralize the generation_config-sourced
+    logit processors (so the forced processor sees raw logits, matching the
+    validator), force greedy selection of the processor's one-hot token, and
+    attach the processor. ``base_kwargs`` is not mutated."""
     kw = dict(base_kwargs)
     for k in _WARPER_KWARGS:
         kw.pop(k, None)
+    kw.update(_NEUTRAL_PROCESSOR_KWARGS)
     kw["do_sample"] = False
     kw["logits_processor"] = LogitsProcessorList([processor])
     return kw
