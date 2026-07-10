@@ -372,8 +372,15 @@ def verify_commitment_proofs(
         # policy-sampled, so they never came from the forced stream and would
         # false-mismatch (mirrors training._completion_keep_list). force_span
         # is (start, end) in absolute token positions.
+        # Only a FORCED rollout has a legitimate span to exclude, and only a
+        # well-formed 2-element one; ignore it otherwise so a non-forced
+        # force_span=[0, huge] cannot exclude every position and void the gate.
         force_span = rollout_meta.get("force_span")
-        fs0, fs1 = (int(force_span[0]), int(force_span[1])) if force_span else (0, 0)
+        if (rollout_meta.get("forced")
+                and isinstance(force_span, (list, tuple)) and len(force_span) == 2):
+            fs0, fs1 = int(force_span[0]), int(force_span[1])
+        else:
+            fs0, fs1 = 0, 0
         # completion offset j = t - prompt_length indexes seed_u_values.
         seed_t = [
             t for t in valid_t

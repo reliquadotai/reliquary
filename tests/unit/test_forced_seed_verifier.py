@@ -187,3 +187,59 @@ def test_verify_commitment_proofs_short_seed_u_values_skips_tail_positions(_rhs,
 
     assert result.seed_n_stochastic == 2
     assert result.seed_n_match == 2
+
+
+@patch("reliquary.shared.forward.forward_single_layer")
+@patch("reliquary.shared.hf_compat.resolve_hidden_size", return_value=_HIDDEN_DIM)
+def test_verify_commitment_proofs_ignores_force_span_when_not_forced(_rhs, mock_fwd):
+    """C1 regression: a NON-forced rollout must not be allowed to shrink the
+    checked set with a force_span. Only ``forced`` BFT rollouts have a
+    legitimate injected span (byte-exact validated in the batcher); a curated
+    rollout could otherwise set forced=False + force_span=[0, huge], exclude
+    every completion position -> seed_n_stochastic=0 -> the group abstains ->
+    the whole forced-seed gate is silently voided. The span must be ignored
+    when ``forced`` is falsy, so all stochastic positions are still counted."""
+    logits_gpu = torch.stack(_seed_wiring_logits_rows())
+    u_values = _seed_wiring_u_values()
+    commit = _build_seed_wiring_commit(logits_gpu, u_values)
+    # `forced` left unset (default False); span covers the whole completion.
+    commit["rollout"]["force_span"] = [0, 1_000_000_000]
+    mock_fwd.return_value = (
+        torch.randn(1, _SEQ_LEN, _HIDDEN_DIM),
+        logits_gpu.unsqueeze(0),
+    )
+
+    result = verifier.verify_commitment_proofs(
+        commit, _make_mock_model(), _RANDOMNESS, seed_u_values=u_values,
+    )
+
+    # Span ignored (not forced) -> same as the honest case: t=2,3,5 stochastic.
+    assert result.seed_n_stochastic == 3
+    assert result.seed_n_match == 3
+
+
+@patch("reliquary.shared.forward.forward_single_layer")
+@patch("reliquary.shared.hf_compat.resolve_hidden_size", return_value=_HIDDEN_DIM)
+def test_verify_commitment_proofs_malformed_force_span_is_ignored_not_crashing(_rhs, mock_fwd):
+    """A malformed (non-2-element) force_span must be ignored, not indexed
+    into: `force_span=[5]` previously reached `int(force_span[1])` and raised
+    an uncaught IndexError inside the seed block (after the GRAIL forward pass
+    already ran). It must be treated as no exclusion (a forced rollout with a
+    bogus span is independently rejected by validate_force_span downstream)."""
+    logits_gpu = torch.stack(_seed_wiring_logits_rows())
+    u_values = _seed_wiring_u_values()
+    commit = _build_seed_wiring_commit(logits_gpu, u_values)
+    commit["rollout"]["forced"] = True
+    commit["rollout"]["force_span"] = [5]  # length-1: malformed
+    mock_fwd.return_value = (
+        torch.randn(1, _SEQ_LEN, _HIDDEN_DIM),
+        logits_gpu.unsqueeze(0),
+    )
+
+    result = verifier.verify_commitment_proofs(
+        commit, _make_mock_model(), _RANDOMNESS, seed_u_values=u_values,
+    )
+
+    # Malformed span ignored -> all stochastic positions counted, no crash.
+    assert result.seed_n_stochastic == 3
+    assert result.seed_n_match == 3
