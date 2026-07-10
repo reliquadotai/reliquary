@@ -2802,11 +2802,32 @@ def test_forced_seed_group_gate_rejects_below_floor_when_enforcing(monkeypatch):
         window_start=500,
         verify_commitment_proofs_fn=_grail_with_seed_counts(n_stoch=10, n_match=1),
     )
+    b.current_checkpoint_hash = "sha256:test"   # pinned -> seed enforcement active
     req = _request(rewards=[1.0] * 4 + [0.0] * 4)
     resp = b.accept_submission(req)
     assert resp.accepted is False
     assert resp.reason == RejectReason.SEED_MISMATCH
     assert len(b.valid_submissions()) == 0
+
+
+def test_forced_seed_gate_abstains_when_checkpoint_hash_unpinned(monkeypatch):
+    """When current_checkpoint_hash is empty the WRONG_CHECKPOINT gate is off,
+    so the miner controls checkpoint_hash -- a forced-seed derivation input he
+    could grind. Enforcement is coupled to a pinned hash: even with
+    FORCED_SEED_ENFORCE on and a failing match-rate, an unpinned-hash window
+    abstains instead of rejecting."""
+    import reliquary.validator.batcher as batcher_mod
+
+    monkeypatch.setattr(batcher_mod, "FORCED_SEED_ENFORCE", True)
+    b = _make_batcher(
+        window_start=500,
+        verify_commitment_proofs_fn=_grail_with_seed_counts(n_stoch=10, n_match=1),
+    )
+    b.current_checkpoint_hash = ""              # not yet published -> not pinned
+    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+    resp = b.accept_submission(req)
+    assert resp.reason != RejectReason.SEED_MISMATCH
+    assert resp.accepted is True
 
 
 def test_forced_seed_group_gate_shadow_when_not_enforcing(monkeypatch):

@@ -124,7 +124,9 @@ class BatchSubmissionRequest(BaseModel):
     # Empty string is allowed as a bootstrap sentinel: before the validator
     # publishes its first checkpoint (checkpoint_n=0, revision=None) miners
     # have no hash to cite. The batcher disables the gate in that case.
-    checkpoint_hash: str = Field(..., min_length=0)
+    # max_length bounds the value: it feeds the forced-seed derivation's 2-byte
+    # length prefix (_lp), which overflows past 65535 bytes; a hash is short.
+    checkpoint_hash: str = Field(..., min_length=0, max_length=256)
     # v2.3: drand quicknet round in progress when the miner sent the
     # submission. Validator rejects if this is not in
     # [current_round_at_receipt - 1, current_round_at_receipt]. The

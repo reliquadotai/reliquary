@@ -1487,8 +1487,13 @@ class GrpoWindowBatcher:
         # deviation); per-rollout verdict catches a single off-stream rollout
         # the group average would dilute. Both shadow (compute + log, never
         # reject) unless FORCED_SEED_ENFORCE is on.
-        group_reject = _forced_seed_verdict(grp_stoch, grp_match, FORCED_SEED_ENFORCE)
-        rollout_reject = _forced_seed_rollout_reject(seed_per_rollout, FORCED_SEED_ENFORCE)
+        # Only enforce when the checkpoint hash is pinned: an empty
+        # current_checkpoint_hash disables WRONG_CHECKPOINT, so the miner
+        # controls checkpoint_hash (a forced-seed derivation input) and could
+        # grind it -- don't reject on a stream whose seed inputs aren't bound.
+        seed_enforce = FORCED_SEED_ENFORCE and bool(self.current_checkpoint_hash)
+        group_reject = _forced_seed_verdict(grp_stoch, grp_match, seed_enforce)
+        rollout_reject = _forced_seed_rollout_reject(seed_per_rollout, seed_enforce)
         if group_reject or rollout_reject:
             logger.info(
                 "seed_mismatch hotkey=%s stoch=%d match=%d scope=%s",
