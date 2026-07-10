@@ -2793,12 +2793,11 @@ def _grail_with_seed_counts(n_stoch: int, n_match: int):
 
 def test_forced_seed_group_gate_rejects_below_floor_when_enforcing(monkeypatch):
     """Aggregate over 8 rollouts: 80 stochastic positions, 8 matches (0.10)
-    is well below FORCED_SEED_CONSISTENCY_FLOOR (0.80). With enforcement
-    armed (window_start >= FORCED_SEED_ENFORCE_FROM_WINDOW), the group is
-    rejected SEED_MISMATCH after the per-rollout loop completes."""
+    is well below FORCED_SEED_CONSISTENCY_FLOOR (0.80). With FORCED_SEED_ENFORCE
+    on, the group is rejected SEED_MISMATCH after the per-rollout loop."""
     import reliquary.validator.batcher as batcher_mod
 
-    monkeypatch.setattr(batcher_mod, "FORCED_SEED_ENFORCE_FROM_WINDOW", 100)
+    monkeypatch.setattr(batcher_mod, "FORCED_SEED_ENFORCE", True)
     b = _make_batcher(
         window_start=500,
         verify_commitment_proofs_fn=_grail_with_seed_counts(n_stoch=10, n_match=1),
@@ -2810,10 +2809,12 @@ def test_forced_seed_group_gate_rejects_below_floor_when_enforcing(monkeypatch):
     assert len(b.valid_submissions()) == 0
 
 
-def test_forced_seed_group_gate_shadow_before_cutover():
-    """Same low match-rate as above, but FORCED_SEED_ENFORCE_FROM_WINDOW is
-    left at its default sentinel (never) -> shadow-only, submission is NOT
-    rejected for SEED_MISMATCH."""
+def test_forced_seed_group_gate_shadow_when_not_enforcing(monkeypatch):
+    """Same low match-rate as above, but FORCED_SEED_ENFORCE is off -> shadow
+    only, submission is NOT rejected for SEED_MISMATCH."""
+    import reliquary.validator.batcher as batcher_mod
+
+    monkeypatch.setattr(batcher_mod, "FORCED_SEED_ENFORCE", False)
     b = _make_batcher(
         window_start=500,
         verify_commitment_proofs_fn=_grail_with_seed_counts(n_stoch=10, n_match=1),

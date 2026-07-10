@@ -33,7 +33,7 @@ from reliquary.constants import (
     CODE_SEMANTIC_AUTH_ENFORCE,
     TOKEN_AUTH_ENFORCE,
     ALL_TOKEN_AUTH_ENFORCE,
-    FORCED_SEED_ENFORCE_FROM_WINDOW,
+    FORCED_SEED_ENFORCE,
 )
 from reliquary.environment.base import Environment
 from reliquary.shared.prompt_range import window_prompt_range
@@ -168,30 +168,30 @@ def _reward_matches_claim(actual: float, claimed: float, *, tolerance: float = 1
     return abs(float(actual) - float(claimed)) <= tolerance
 
 
-def _forced_seed_verdict(n_stoch: int, n_match: int, window: int, enforce_from: int) -> bool:
-    """True => reject the group for seed mismatch. Abstains on thin signal; shadow
-    before the cutover window."""
+def _forced_seed_verdict(n_stoch: int, n_match: int, enforce: bool) -> bool:
+    """True => reject the group for seed mismatch. Abstains on thin signal;
+    shadow (never rejects) when enforcement is off."""
     from reliquary.constants import (
         FORCED_SEED_CONSISTENCY_FLOOR, FORCED_SEED_MIN_STOCH_POSITIONS,
     )
-    if window < enforce_from:
+    if not enforce:
         return False
     if n_stoch < FORCED_SEED_MIN_STOCH_POSITIONS:
         return False
     return (n_match / n_stoch) < FORCED_SEED_CONSISTENCY_FLOOR
 
 
-def _forced_seed_rollout_reject(per_rollout, window: int, enforce_from: int) -> bool:
+def _forced_seed_rollout_reject(per_rollout, enforce: bool) -> bool:
     """True => reject because a SINGLE rollout is off the forced stream. The
     group-average verdict dilutes a partial swap (a few curated rollouts hidden
     among honest ones); this catches any one rollout that carries enough
     stochastic positions yet falls below the per-rollout floor. ``per_rollout``
-    is a list of (n_stoch, n_match). Abstains on thin rollouts; shadow before
-    the cutover window."""
+    is a list of (n_stoch, n_match). Abstains on thin rollouts; shadow (never
+    rejects) when enforcement is off."""
     from reliquary.constants import (
         FORCED_SEED_ROLLOUT_FLOOR, FORCED_SEED_ROLLOUT_MIN_STOCH,
     )
-    if window < enforce_from:
+    if not enforce:
         return False
     for n_stoch, n_match in per_rollout:
         if (n_stoch >= FORCED_SEED_ROLLOUT_MIN_STOCH
@@ -1485,14 +1485,10 @@ class GrpoWindowBatcher:
 
         # Forced-seed gate. Group verdict = summed counts (catches diffuse
         # deviation); per-rollout verdict catches a single off-stream rollout
-        # the group average would dilute. Both shadow-only until
-        # ``self.window_start`` reaches FORCED_SEED_ENFORCE_FROM_WINDOW.
-        group_reject = _forced_seed_verdict(
-            grp_stoch, grp_match, self.window_start, FORCED_SEED_ENFORCE_FROM_WINDOW,
-        )
-        rollout_reject = _forced_seed_rollout_reject(
-            seed_per_rollout, self.window_start, FORCED_SEED_ENFORCE_FROM_WINDOW,
-        )
+        # the group average would dilute. Both shadow (compute + log, never
+        # reject) unless FORCED_SEED_ENFORCE is on.
+        group_reject = _forced_seed_verdict(grp_stoch, grp_match, FORCED_SEED_ENFORCE)
+        rollout_reject = _forced_seed_rollout_reject(seed_per_rollout, FORCED_SEED_ENFORCE)
         if group_reject or rollout_reject:
             logger.info(
                 "seed_mismatch hotkey=%s stoch=%d match=%d scope=%s",

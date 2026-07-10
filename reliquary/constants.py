@@ -689,11 +689,15 @@ FORCED_SEED_ROLLOUT_FLOOR = 0.75
 # positions; below it the per-rollout check abstains (never false-reject a
 # short / peaked honest rollout).
 FORCED_SEED_ROLLOUT_MIN_STOCH = 20
-# Enforce from this window onward; before it the gate is shadow-only. Default
-# sentinel = never, until the operator announces + arms the cutover window.
-FORCED_SEED_ENFORCE_FROM_WINDOW = int(
-    _os.environ.get("FORCED_SEED_ENFORCE_FROM_WINDOW", str(2 ** 63 - 1))
-)
+# Master switch for forced-seed ENFORCEMENT. False = shadow (compute + log the
+# consistency score, never reject); True = enforce (reject a group / rollout
+# below the floors). Ships True so merging the branch arms the gate directly --
+# merge ONLY once miners run the forced-seed client, else honest legacy miners
+# are rejected. Env override (FORCED_SEED_ENFORCE=false) is a no-redeploy kill
+# switch; any non-truthy value disables (never crashes, never auto-arms garbage).
+FORCED_SEED_ENFORCE = _os.environ.get(
+    "FORCED_SEED_ENFORCE", "true"
+).strip().lower() in ("1", "true", "yes", "on")
 # Wire-advertised on BatchSubmissionRequest.protocol_version by clients that
 # sample from the forced stream (0 = legacy/pre-forced-seed). Lets the operator
 # track adoption in the shadow window before arming enforcement.

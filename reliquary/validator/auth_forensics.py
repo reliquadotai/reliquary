@@ -243,7 +243,7 @@ def record_forced_seed_shadow(
 
     Shadow-mode telemetry for the forced-seed consistency gate: logs the
     per-group match rate (``n_match / n_stoch``) and raw counts so operators
-    can calibrate ``FORCED_SEED_CONSISTENCY_FLOOR`` / ``FORCED_SEED_ENFORCE_FROM_WINDOW``
+    can calibrate ``FORCED_SEED_CONSISTENCY_FLOOR`` before flipping ``FORCED_SEED_ENFORCE``
     before arming enforcement. Fail-soft: write errors are logged but never
     affect submission handling.
 
