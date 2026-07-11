@@ -22,7 +22,6 @@ from reliquary.constants import (
     MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
-    MAX_PROOF_CANDIDATES_PER_WINDOW,
     MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
     MAX_SEAL_QUEUE_DRAIN_SECONDS,
     MAX_SUBMISSIONS_PER_PROMPT,
@@ -489,9 +488,9 @@ class GrpoWindowBatcher:
         self._proof_admission_lock = threading.Lock()
         self._proof_admission_count = 0
         # Total grading attempts admitted this window — the never-refunded
-        # anti-DoS ceiling that gates admission. ``_proof_admission_count``
-        # (GRAIL/GPU budget) is charged separately, after the reward-zone gate,
-        # so out_of_zone never consumes it; neither counter is refunded.
+        # anti-DoS ceiling that gates admission. ``_proof_admission_count`` is
+        # a telemetry counter of zone-valid submissions entering the GRAIL
+        # proof path (no longer a budget); neither counter is refunded.
         self._proof_grading_attempts = 0
         self._post_trigger_proof_admission_count = 0
         self._expensive_proof_failures_by_hotkey: dict[str, int] = {}
@@ -640,16 +639,11 @@ class GrpoWindowBatcher:
 
         Admission is gated only by the grading-attempts ceiling (never
         refunded — bounds total grader/queue work under spam) plus the
-        post-trigger straggler cap. The scarce GRAIL/GPU candidate budget is
-        NOT charged here: it is reserved later, AFTER the cheap reward-zone
-        gate, in ``_accept_locked`` via ``_try_reserve_grail_candidate``. That
-        way a high out_of_zone rate (e.g. opencode's binary rewards) cannot
-        burn the GRAIL budget on submissions that never reach the proof and
-        starve the env below B distinct. (Previously the GRAIL slot was
-        reserved here and refunded on out_of_zone — but the refund landed
-        after grading, so the window-open burst still hard-bounced on this
-        budget before any slot was freed, leaving the grader idle while the
-        window sealed short.)
+        post-trigger straggler cap and the per-hotkey proof-failure debt.
+        There is no separate GRAIL/GPU candidate budget: the drand-anchored
+        seal, this grading ceiling and the seal drain timeout already bound the
+        GPU work per window, so a zone-valid submission entering the proof is
+        only counted for telemetry, never rejected on a candidate budget.
         """
         with self._proof_admission_lock:
             if (
@@ -681,24 +675,21 @@ class GrpoWindowBatcher:
             self._proof_grading_attempts += 1
             return True, None
 
-    def _try_reserve_grail_candidate(self) -> bool:
-        """Charge the GRAIL/GPU candidate budget for a zone-valid submission.
+    def _note_grail_candidate(self) -> None:
+        """Count a zone-valid submission entering the GRAIL/GPU proof path.
 
-        Called from ``_accept_locked`` right after the reward-zone gate
-        passes — the point a submission actually becomes a candidate for the
-        expensive GRAIL forward pass (~5–25 s of GPU). Reserving here, rather
-        than at HTTP admission, means out_of_zone reward errors never consume
-        the budget (so no refund is needed): the window-open burst queues up
-        to the grading ceiling instead of hard-bouncing on this budget.
-        Returns False when the per-window GRAIL budget is exhausted — the env
-        already has more in-zone candidates than the GPU can verify this
-        window (and therefore far more than B distinct).
+        Telemetry only — the window is already bounded by the drand-anchored
+        seal (the B-th distinct prompt records the trigger round and later
+        rounds are dropped), the never-refunded grading-attempts ceiling, the
+        per-hotkey submission cap, the post-trigger straggler cap and the seal
+        drain timeout. The old per-window GRAIL candidate budget was a
+        pre-seal-drand relic: back when the 8-distinct seal did not fire it was
+        the only bound on GRAIL work within a window. It only starved honest
+        late arrivals whenever earlier candidates failed a post-reservation
+        gate (e.g. forced-seed) without refund, so it no longer rejects.
         """
         with self._proof_admission_lock:
-            if self._proof_admission_count >= MAX_PROOF_CANDIDATES_PER_WINDOW:
-                return False
             self._proof_admission_count += 1
-            return True
 
     # ----------------------------- ingestion -----------------------------
 
@@ -965,18 +956,17 @@ class GrpoWindowBatcher:
         sigma = rewards_std(rewards)
         if not is_in_zone(sigma, bootstrap=self.bootstrap):
             # Reward error (degenerate rollout rewards), not cheating. It never
-            # reaches GRAIL and never charged the GRAIL budget — that is
-            # reserved just below, only for zone-valid submissions — so there
-            # is nothing to refund. A high out_of_zone rate therefore cannot
-            # starve the env below B distinct.
+            # reaches the GRAIL proof path. A high out_of_zone rate is bounded
+            # upstream by the grading-attempts ceiling and cannot starve the
+            # env below B distinct.
             return reject(RejectReason.OUT_OF_ZONE, "zone")
 
-        # Zone-valid: now charge the scarce GRAIL/GPU candidate budget. Done
-        # here (post-grade), not at HTTP admission, so the window-open burst
-        # queues up to the grading ceiling rather than hard-bouncing on this
-        # budget while ~84% of it would have refunded as out_of_zone anyway.
-        if not self._try_reserve_grail_candidate():
-            return reject(RejectReason.BATCH_FILLED, "grail_candidate_budget_full")
+        # Zone-valid: entering the GRAIL/GPU proof path. Count it for telemetry
+        # only — the window is bounded by the drand seal + grading ceiling +
+        # drain timeout, not by a candidate budget (removed: it starved honest
+        # late arrivals when earlier candidates burned an unrefunded slot on a
+        # post-reservation gate such as forced-seed).
+        self._note_grail_candidate()
 
         # A reward=0 rollout whose final \boxed{} is malformed (empty,
         # special-token, or unclosed) produced no parseable answer — a fake

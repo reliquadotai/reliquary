@@ -1736,20 +1736,18 @@ def test_seal_extension_boundary_fair_split_fires_end_to_end():
 
 
 def test_admission_gated_by_grading_ceiling_not_grail_budget():
-    """Admission counts grading attempts, not GRAIL candidates.
+    """Admission counts grading attempts; there is no GRAIL candidate budget.
 
-    The window-open burst must queue for grading up to the grading ceiling —
-    far beyond the smaller GRAIL/GPU budget — instead of hard-bouncing once the
-    GRAIL budget is notionally full. (The GRAIL budget is charged later, after
-    the reward-zone gate; see ``test_grail_candidate_reserved_after_zone_gate``
-    and ``test_grail_budget_caps_in_zone_submissions_at_accept``.)
+    The window-open burst queues for grading up to the grading ceiling instead
+    of hard-bouncing on a candidate budget. (Entering the proof after the
+    reward-zone gate only bumps a telemetry counter now; see
+    ``test_grail_candidate_reserved_after_zone_gate`` and
+    ``test_grail_candidate_budget_removed_no_reject_on_burst``.)
     """
     from reliquary.constants import (
-        MAX_PROOF_CANDIDATES_PER_WINDOW,
         MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
     )
 
-    assert MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW > MAX_PROOF_CANDIDATES_PER_WINDOW
     b = _make_batcher()
 
     # A burst larger than the GRAIL budget is still fully admitted for grading,
@@ -1788,26 +1786,20 @@ def test_grail_candidate_reserved_after_zone_gate():
     assert b.proof_admission_count == 1      # charged once the zone gate passed
 
 
-def test_grail_budget_caps_in_zone_submissions_at_accept(monkeypatch):
-    """The GRAIL budget still bounds GPU work — but at the proof step, on
-    zone-valid submissions only. Once exhausted, a further in-zone submission is
-    rejected BATCH_FILLED (the env already has more in-zone candidates than the
-    GPU can verify this window)."""
-    import reliquary.validator.batcher as batcher_mod
-
-    monkeypatch.setattr(batcher_mod, "MAX_PROOF_CANDIDATES_PER_WINDOW", 2)
+def test_grail_candidate_budget_removed_no_reject_on_burst():
+    """There is no per-window GRAIL candidate budget: a burst of zone-valid
+    submissions well past the old cap (32) is accepted, bounded only by the
+    grading ceiling. Entering the proof only bumps a telemetry counter, and no
+    submission is rejected BATCH_FILLED on a candidate budget."""
     b = _make_batcher()
 
-    a = b.accept_submission(_request(prompt_idx=1, hotkey="a"))
-    assert a.accepted is True, a.reason
-    c = b.accept_submission(_request(prompt_idx=2, hotkey="b"))
-    assert c.accepted is True, c.reason
-    assert b.proof_admission_count == 2
+    n = 40  # > the old MAX_PROOF_CANDIDATES_PER_WINDOW (32)
+    for i in range(n):
+        resp = b.accept_submission(_request(prompt_idx=i, hotkey=f"hk{i}"))
+        assert resp.accepted is True, (i, resp.reason)
 
-    # 3rd in-zone submission: GRAIL budget exhausted -> BATCH_FILLED at accept.
-    d = b.accept_submission(_request(prompt_idx=3, hotkey="c"))
-    assert d.accepted is False
-    assert d.reason == RejectReason.BATCH_FILLED
+    assert b.proof_admission_count == n
+    assert b.reject_counts.get(RejectReason.BATCH_FILLED.value, 0) == 0
 
 
 def test_proof_admission_rejects_hotkey_after_expensive_failure_debt():

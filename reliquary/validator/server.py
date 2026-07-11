@@ -36,7 +36,6 @@ from reliquary.constants import (
     MIN_EOS_PROBABILITY,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
-    MAX_PROOF_CANDIDATES_PER_WINDOW,
     MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
     MAX_TRUNCATED_PER_SUBMISSION,
     SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS,
@@ -345,7 +344,6 @@ class _Health(BaseModel):
     last_valid_submission_ts: float | None = None
     seconds_since_last_valid_submission: float | None = None
     proof_admission_count: int | None = None
-    proof_admission_limit: int = MAX_PROOF_CANDIDATES_PER_WINDOW
     post_trigger_proof_admission_count: int | None = None
     post_trigger_proof_admission_limit: int = MAX_POST_TRIGGER_PROOF_CANDIDATES
     sparse_valid_idle_seal_seconds: float = SPARSE_VALID_IDLE_SEAL_SECONDS
@@ -1098,7 +1096,6 @@ class ValidatorServer:
                         proof_admission_count=getattr(
                             batcher, "proof_admission_count", None
                         ),
-                        proof_admission_limit=MAX_PROOF_CANDIDATES_PER_WINDOW,
                         post_trigger_proof_admission_count=getattr(
                             batcher,
                             "post_trigger_proof_admission_count",
