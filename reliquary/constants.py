@@ -149,24 +149,15 @@ REJECTED_LIST_CAP_PER_HOTKEY = 5
 # Default HTTP port the validator listens on for miner submissions.
 VALIDATOR_HTTP_PORT = 8888
 
-# GRAIL candidate budget per window: bounds submissions that reach the GPU
-# proof (~5-25 s each). Charged AFTER the cheap reward-zone gate, in
-# ``GrpoWindowBatcher._try_reserve_grail_candidate`` — NOT at HTTP admission —
-# so a submission rejected as OUT_OF_ZONE (degenerate rollout rewards: a reward
-# error, not cheating) never consumes it. This keeps a high out_of_zone rate
-# (e.g. opencode's binary code rewards) from burning the budget before the env
-# collects B distinct valid prompts. Admission itself is bounded by the
-# grading-attempts ceiling below, so the window-open burst queues for grading
-# instead of hard-bouncing on this budget. Submissions that reach GRAIL and
-# fail (GRAIL/integrity) still consume it — those reached the GPU.
-MAX_PROOF_CANDIDATES_PER_WINDOW = 32
-
 # Hard ceiling on total grading attempts (reward computation) admitted per
-# window — the anti-DoS / queue bound that OUT_OF_ZONE refunds must NOT relax.
+# window — the anti-DoS / queue bound and the outer cap on GPU proof work.
 # Counts every admitted submission and is never refunded, so a degenerate-reward
 # flood cannot grow the unbounded submit queue or saturate the grader pool.
-# Set above the GRAIL budget so an env with a low in-zone rate can still grade
-# enough submissions to reach B distinct valid prompts.
+# There is no separate per-window GRAIL candidate budget: the drand-anchored
+# 8-distinct seal, this ceiling and the seal drain timeout bound the work. The
+# old MAX_PROOF_CANDIDATES_PER_WINDOW (32) was a pre-seal-drand relic that only
+# starved honest late arrivals when earlier candidates failed a post-reservation
+# gate (e.g. forced-seed) without refund.
 MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW = 96
 
 # A hotkey that repeatedly reaches the expensive proof path and then fails
