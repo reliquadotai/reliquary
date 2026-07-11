@@ -236,7 +236,7 @@ def test_grail_verifier_receives_tokenizer_for_sparse_pstop():
 
     seen_tokenizers = []
 
-    def tokenizer_aware_grail(commit, model, randomness, *, tokenizer=None):
+    def tokenizer_aware_grail(commit, model, randomness, *, tokenizer=None, seed_u_values=None):
         seen_tokenizers.append(tokenizer)
         return ProofResult(
             all_passed=True,
@@ -2773,3 +2773,75 @@ def test_accept_in_range_passes_range_gate(monkeypatch):
     resp = b.accept_submission(_request(prompt_idx=lo, window_start=500))
     # Passes the range gate; may still hit a later gate, but never this one.
     assert resp.reason != RejectReason.PROMPT_OUT_OF_RANGE
+
+
+# ---- forced-seed group gate (Task 5) -------------------------------------
+
+
+def _grail_with_seed_counts(n_stoch: int, n_match: int):
+    """Stub verifier that opts into the (tokenizer, seed_u_values) signature
+    and reports a fixed per-rollout seed-consistency tally. The batcher sums
+    these across all 8 rollouts before deciding the group verdict."""
+    def _fn(commit, model, randomness, *, tokenizer=None, seed_u_values=None):
+        from reliquary.validator.verifier import ProofResult
+        return ProofResult(
+            all_passed=True, passed=1, checked=1,
+            seed_n_stochastic=n_stoch, seed_n_match=n_match,
+        )
+    return _fn
+
+
+def test_forced_seed_group_gate_rejects_below_floor_when_enforcing(monkeypatch):
+    """Aggregate over 8 rollouts: 80 stochastic positions, 8 matches (0.10)
+    is well below FORCED_SEED_CONSISTENCY_FLOOR (0.80). With FORCED_SEED_ENFORCE
+    on, the group is rejected SEED_MISMATCH after the per-rollout loop."""
+    import reliquary.validator.batcher as batcher_mod
+
+    monkeypatch.setattr(batcher_mod, "FORCED_SEED_ENFORCE", True)
+    b = _make_batcher(
+        window_start=500,
+        verify_commitment_proofs_fn=_grail_with_seed_counts(n_stoch=10, n_match=1),
+    )
+    b.current_checkpoint_hash = "sha256:test"   # pinned -> seed enforcement active
+    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.SEED_MISMATCH
+    assert len(b.valid_submissions()) == 0
+
+
+def test_forced_seed_gate_abstains_when_checkpoint_hash_unpinned(monkeypatch):
+    """When current_checkpoint_hash is empty the WRONG_CHECKPOINT gate is off,
+    so the miner controls checkpoint_hash -- a forced-seed derivation input he
+    could grind. Enforcement is coupled to a pinned hash: even with
+    FORCED_SEED_ENFORCE on and a failing match-rate, an unpinned-hash window
+    abstains instead of rejecting."""
+    import reliquary.validator.batcher as batcher_mod
+
+    monkeypatch.setattr(batcher_mod, "FORCED_SEED_ENFORCE", True)
+    b = _make_batcher(
+        window_start=500,
+        verify_commitment_proofs_fn=_grail_with_seed_counts(n_stoch=10, n_match=1),
+    )
+    b.current_checkpoint_hash = ""              # not yet published -> not pinned
+    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+    resp = b.accept_submission(req)
+    assert resp.reason != RejectReason.SEED_MISMATCH
+    assert resp.accepted is True
+
+
+def test_forced_seed_group_gate_shadow_when_not_enforcing(monkeypatch):
+    """Same low match-rate as above, but FORCED_SEED_ENFORCE is off -> shadow
+    only, submission is NOT rejected for SEED_MISMATCH."""
+    import reliquary.validator.batcher as batcher_mod
+
+    monkeypatch.setattr(batcher_mod, "FORCED_SEED_ENFORCE", False)
+    b = _make_batcher(
+        window_start=500,
+        verify_commitment_proofs_fn=_grail_with_seed_counts(n_stoch=10, n_match=1),
+    )
+    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+    resp = b.accept_submission(req)
+    assert resp.reason != RejectReason.SEED_MISMATCH
+    assert resp.accepted is True
+    assert len(b.valid_submissions()) == 1

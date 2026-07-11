@@ -42,6 +42,7 @@ def test_bft_injects_force_only_for_unfinished_rows():
         force_ids=force_ids,
         eos_ids=eos,
         answer_budget=8,
+        randomness="r", hotkey="hk", prompt_idx=0, checkpoint_hash="c",
     )
 
     # finished row: untouched, truncated at its EOS, not forced
@@ -71,6 +72,7 @@ def test_bft_does_not_force_eos_without_think_close():
         force_ids=[777, 7, 8],
         eos_ids={99},
         answer_budget=8,
+        randomness="r", hotkey="hk", prompt_idx=0, checkpoint_hash="c",
     )
 
     assert rollouts[0]["forced"] is False
@@ -98,6 +100,7 @@ def test_bft_continues_natural_close_without_eos():
         force_ids=force_ids,
         eos_ids=eos,
         answer_budget=8,
+        randomness="r", hotkey="hk", prompt_idx=0, checkpoint_hash="c",
     )
 
     assert model.calls == 1
@@ -123,6 +126,7 @@ def test_bft_no_force_when_all_rows_finished():
         force_ids=[248069, 7, 8],
         eos_ids={99},
         answer_budget=8,
+        randomness="r", hotkey="hk", prompt_idx=0, checkpoint_hash="c",
     )
 
     assert all(r["forced"] is False for r in rollouts)

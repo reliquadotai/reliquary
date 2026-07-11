@@ -81,6 +81,12 @@ class ProofResult:
     # aligned 1:1 with completion_chosen_probs (same surviving steps).
     completion_argmax_probs: list[float] = field(default_factory=list)
     completion_argmax_ids: list[int] = field(default_factory=list)
+    # Forced-seed consistency: how many completion positions were stochastic
+    # under T_PROTO (argmax prob < FORCED_SEED_STOCHASTIC_MAXPROB) and how
+    # many of those matched the forced inverse-CDF pick. Both 0 when the
+    # caller didn't supply seed_u_values (protocol_version 0 rollouts).
+    seed_n_stochastic: int = 0
+    seed_n_match: int = 0
 
 
 def verify_signature(commit: dict, hotkey: str) -> bool:
@@ -284,6 +290,7 @@ def verify_commitment_proofs(
     window_randomness: str,
     *,
     tokenizer: Any = None,
+    seed_u_values: list[float] | None = None,
 ) -> ProofResult:
     """Hard check: verify GRAIL sketch commitments against the model
     forward pass, AND precompute the sparse values the behavioural
@@ -298,6 +305,11 @@ def verify_commitment_proofs(
     cost via PCIe). Only the per-position hidden states needed by the
     sketch verification move to CPU as a [seq_len, hidden_dim] tensor,
     which is two orders of magnitude smaller than the logits would be.
+
+    ``seed_u_values``, when provided, are the forced per-position uniforms
+    for this rollout (completion-offset indexed); the seed-consistency
+    counts are computed on GPU the same way. When None (pre-forced-seed
+    clients), ``seed_n_stochastic``/``seed_n_match`` stay at 0 — no-op.
     """
     from reliquary.protocol.crypto import (
         indices_from_root, indices_from_root_in_range,
@@ -352,6 +364,38 @@ def verify_commitment_proofs(
         logits_gpu, tokens, prompt_length, completion_length, seq_len, device,
     )
 
+    seed_n_stochastic = 0
+    seed_n_match = 0
+    if seed_u_values is not None:
+        valid_t = _completion_valid_t(tokens, prompt_length, completion_length, seq_len)
+        # Exclude BFT-injected force_span tokens: validator-accepted but not
+        # policy-sampled, so they never came from the forced stream and would
+        # false-mismatch (mirrors training._completion_keep_list). force_span
+        # is (start, end) in absolute token positions.
+        # Only a FORCED rollout has a legitimate span to exclude, and only a
+        # well-formed 2-element one; ignore it otherwise so a non-forced
+        # force_span=[0, huge] cannot exclude every position and void the gate.
+        force_span = rollout_meta.get("force_span")
+        if (rollout_meta.get("forced")
+                and isinstance(force_span, (list, tuple)) and len(force_span) == 2):
+            fs0, fs1 = int(force_span[0]), int(force_span[1])
+        else:
+            fs0, fs1 = 0, 0
+        # completion offset j = t - prompt_length indexes seed_u_values.
+        seed_t = [
+            t for t in valid_t
+            if t - prompt_length < len(seed_u_values) and not (fs0 <= t < fs1)
+        ]
+        if seed_t:
+            pos_tensor = torch.tensor(
+                [t - 1 for t in seed_t], device=device, dtype=torch.long,
+            )
+            seed_tokens = [tokens[t] for t in seed_t]
+            seed_u = [seed_u_values[t - prompt_length] for t in seed_t]
+            seed_n_stochastic, seed_n_match = _gpu_seed_consistency(
+                logits_gpu[pos_tensor], seed_tokens, seed_u,
+            )
+
     hidden_states = hidden_states_gpu.detach().to("cpu")
 
     passed = 0
@@ -387,6 +431,8 @@ def verify_commitment_proofs(
         completion_chosen_probs=completion_chosen_probs,
         completion_argmax_probs=completion_argmax_probs,
         completion_argmax_ids=completion_argmax_ids,
+        seed_n_stochastic=seed_n_stochastic,
+        seed_n_match=seed_n_match,
     )
 
 
@@ -448,6 +494,21 @@ def _gpu_challenge_logprobs(
     return list(challenge_idxs), chosen.tolist()
 
 
+def _completion_valid_t(
+    tokens: list[int], prompt_length: int, completion_length: int, seq_len: int,
+) -> list[int]:
+    """Completion positions t predicting tokens[t] from logits[t-1], i.e.
+    t in [prompt_length, prompt_length + completion_length) with t > 0,
+    t - 1 < seq_len, and t < len(tokens). Shared by the token-stats and
+    seed-consistency checks so both walk the identical alignment.
+    """
+    if completion_length <= 0:
+        return []
+    t_start = prompt_length
+    t_end = min(prompt_length + completion_length, len(tokens), seq_len + 1)
+    return [t for t in range(t_start, t_end) if t > 0 and t - 1 < seq_len]
+
+
 def _gpu_completion_token_stats(
     logits_gpu: torch.Tensor,
     tokens: list[int],
@@ -461,11 +522,7 @@ def _gpu_completion_token_stats(
     aligned 1:1. Boundary positions (t == 0, t - 1 >= seq_len, t >= len(tokens))
     are skipped identically across all three.
     """
-    if completion_length <= 0:
-        return [], [], []
-    t_start = prompt_length
-    t_end = min(prompt_length + completion_length, len(tokens), seq_len + 1)
-    valid_t = [t for t in range(t_start, t_end) if t > 0 and t - 1 < seq_len]
+    valid_t = _completion_valid_t(tokens, prompt_length, completion_length, seq_len)
     if not valid_t:
         return [], [], []
 
@@ -480,6 +537,31 @@ def _gpu_completion_token_stats(
     chosen = probs.gather(1, tok_tensor.unsqueeze(1)).squeeze(1)
     amax_probs, amax_ids = probs.max(dim=-1)
     return chosen.tolist(), amax_probs.tolist(), amax_ids.tolist()
+
+
+def _gpu_seed_consistency(
+    logits_slice: torch.Tensor,
+    token_ids: list[int],
+    u_values: list[float],
+) -> tuple[int, int]:
+    """Teacher-forced seed-consistency counts, computed on
+    ``logits_slice.device`` end-to-end. ``logits_slice`` is [n, vocab]
+    (position i predicts ``token_ids[i]`` against forced draw
+    ``u_values[i]``); only the two returned ints leave the GPU — the
+    [n, vocab] slice itself is never copied to CPU (vocab ~248k makes a
+    full-completion transfer ~1GB/rollout). Reuses the miner's exact
+    warp+inverse-CDF algorithm so honest miners can't false-mismatch.
+    """
+    from reliquary.constants import (
+        FORCED_SEED_STOCHASTIC_MAXPROB, TOP_K_PROTO, TOP_P_PROTO,
+    )
+    from reliquary.environment.forced_sampling import seed_consistency
+
+    return seed_consistency(
+        logits_slice.float(), list(token_ids), list(u_values),
+        t=T_PROTO, top_k=TOP_K_PROTO, top_p=TOP_P_PROTO,
+        stochastic_threshold=FORCED_SEED_STOCHASTIC_MAXPROB,
+    )
 
 
 def verify_reward_claim(

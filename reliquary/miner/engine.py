@@ -15,13 +15,11 @@ from typing import TYPE_CHECKING
 import random as _random
 
 from reliquary.constants import (
+    FORCED_SEED_PROTOCOL_VERSION,
     LAYER_INDEX,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
     M_ROLLOUTS,
     PROMPT_RANGE_SIZE,
-    T_PROTO,
-    TOP_K_PROTO,
-    TOP_P_PROTO,
     UPLOAD_BUFFER,
     WINDOW_LENGTH,
 )
@@ -210,7 +208,8 @@ def _current_drand_round_at_send() -> int:
 
 def _bft_assemble_rollouts(
     *, model, phase1_tensor, prompt_tokens, think_close_ids, force_ids,
-    eos_ids, answer_budget, gen_kwargs=None,
+    eos_ids, answer_budget, randomness, hotkey, prompt_idx, checkpoint_hash,
+    gen_kwargs=None,
 ):
     """Budget-Forced Termination assembly.
 
@@ -221,9 +220,17 @@ def _bft_assemble_rollouts(
     the boxed answer. Returns one rollout dict per row with ``forced`` and, for
     forced rows, ``force_span`` = (start, end) of the injected ids within
     ``tokens`` (so the validator carve-out and trainer mask can locate them).
+
+    Phase-2 answer tokens are drawn from the same protocol forced-seed stream as
+    phase-1, resuming at each row's own completion offset (its primed length past
+    the prompt). The injected ``force_ids`` are not sampled and the validator
+    excludes that span from the seed-consistency check.
     """
     import torch
 
+    from reliquary.miner.forced_seed_sampler import (
+        ForcedSeedLogitsProcessor, forced_seed_generate_kwargs, phase2_base_offsets,
+    )
     from reliquary.shared.modeling import first_eos_index, has_think_close
 
     plen = len(prompt_tokens)
@@ -263,11 +270,20 @@ def _bft_assemble_rollouts(
         rows = [[pad] * (width - len(p)) + p for p in unfinished_primed]
         mask = [[0] * (width - len(p)) + [1] * len(p) for p in unfinished_primed]
         device = getattr(model, "device", "cpu")
+        proc = ForcedSeedLogitsProcessor(
+            randomness=randomness, hotkey=hotkey, prompt_idx=prompt_idx,
+            checkpoint_hash=checkpoint_hash,
+            rollout_indices=list(unfinished_idx),
+            base_offsets=phase2_base_offsets(
+                [len(p) for p in unfinished_primed], plen,
+            ),
+            start_len=width,
+        )
         ans = model.generate(
             torch.tensor(rows, device=device),
             attention_mask=torch.tensor(mask, device=device),
             max_new_tokens=answer_budget,
-            **(gen_kwargs or {}),
+            **forced_seed_generate_kwargs(gen_kwargs or {}, proc),
         )
         for k, i in enumerate(unfinished_idx):
             primed = unfinished_primed[k]
@@ -457,7 +473,8 @@ class MiningEngine:
                 env = self.envs[env_name]
                 problem = env.get_problem(prompt_idx)
                 generations = self._generate_m_rollouts(
-                    problem, randomness, env_name=env_name
+                    problem, randomness, env_name=env_name,
+                    prompt_idx=prompt_idx, checkpoint_hash=local_hash,
                 )
                 if len(generations) < M_ROLLOUTS:
                     logger.warning(
@@ -508,6 +525,8 @@ class MiningEngine:
                     drand_round=current_round,
                     nonce=_nonce,
                     envelope_signature=_envelope_sig,
+                    # Rollouts are drawn from the forced-seed stream; advertise it.
+                    protocol_version=FORCED_SEED_PROTOCOL_VERSION,
                 )
                 try:
                     resp = await submit_batch_v2(url, request, client=client)
@@ -594,7 +613,8 @@ class MiningEngine:
         return self.hf_model
 
     def _generate_m_rollouts(
-        self, problem, randomness, *, env_name: str | None = None
+        self, problem, randomness, *, env_name: str | None = None,
+        prompt_idx: int, checkpoint_hash: str,
     ) -> list[dict]:
         """Generate M_ROLLOUTS completions at T_PROTO in one batched call.
 
@@ -615,6 +635,9 @@ class MiningEngine:
             BFT_ENABLED,
             BFT_THINKING_BUDGET,
         )
+        from reliquary.miner.forced_seed_sampler import (
+            ForcedSeedLogitsProcessor, forced_seed_generate_kwargs,
+        )
         from reliquary.protocol.tokens import encode_prompt
         from reliquary.shared.modeling import (
             first_eos_index,
@@ -623,6 +646,7 @@ class MiningEngine:
             think_close_token_ids,
         )
 
+        hotkey = self.wallet.hotkey.ss58_address
         prompt_tokens = encode_prompt(self.tokenizer, problem["prompt"])
         prompt_length = len(prompt_tokens)
         eos_ids = resolve_eos_token_ids(self.vllm_model, self.tokenizer)
@@ -642,32 +666,36 @@ class MiningEngine:
                 device=getattr(self.vllm_model, "device", "cpu"),
             )
             attention_mask = torch.ones_like(input_tensor)
-            generate_kwargs = {
+            # Force phase-1 sampling onto the protocol seed stream: the
+            # processor applies the T_PROTO/top_k/top_p warp itself and picks
+            # the inverse-CDF token, so HF's own warpers are stripped and
+            # do_sample is off (see forced_seed_generate_kwargs). Row r is
+            # rollout index r, resuming at completion offset 0.
+            base_kwargs = {
                 "max_new_tokens": (
                     min(self.max_new_tokens, BFT_THINKING_BUDGET)
                     if bft_applicable else self.max_new_tokens
                 ),
-                "do_sample": True,
-                "temperature": T_PROTO,
-                "top_p": TOP_P_PROTO,
-                "top_k": TOP_K_PROTO,
                 "pad_token_id": pad_token_id,
                 "attention_mask": attention_mask,
             }
             if eos_ids:
-                generate_kwargs["eos_token_id"] = sorted(eos_ids)
-            outputs = self.vllm_model.generate(input_tensor, **generate_kwargs)
+                base_kwargs["eos_token_id"] = sorted(eos_ids)
+            phase1_proc = ForcedSeedLogitsProcessor(
+                randomness=randomness, hotkey=hotkey, prompt_idx=prompt_idx,
+                checkpoint_hash=checkpoint_hash,
+                rollout_indices=list(range(M_ROLLOUTS)),
+                base_offsets=[0] * M_ROLLOUTS, start_len=prompt_length,
+            )
+            outputs = self.vllm_model.generate(
+                input_tensor,
+                **forced_seed_generate_kwargs(base_kwargs, phase1_proc),
+            )
 
             if bft_applicable:
-                # Phase-2 answer generation reuses the same protocol sampler so
-                # the boxed answer is a valid sample under GRAIL.
-                phase2_kwargs = {
-                    "do_sample": True,
-                    "temperature": T_PROTO,
-                    "top_p": TOP_P_PROTO,
-                    "top_k": TOP_K_PROTO,
-                    "pad_token_id": pad_token_id,
-                }
+                # Phase-2 answer generation continues on the same forced stream
+                # (identity threaded so it resumes at each row's offset).
+                phase2_kwargs = {"pad_token_id": pad_token_id}
                 if eos_ids:
                     phase2_kwargs["eos_token_id"] = sorted(eos_ids)
                 return _bft_assemble_rollouts(
@@ -678,6 +706,8 @@ class MiningEngine:
                     force_ids=force_close_token_ids(self.tokenizer),
                     eos_ids=eos_ids,
                     answer_budget=BFT_ANSWER_BUDGET,
+                    randomness=randomness, hotkey=hotkey, prompt_idx=prompt_idx,
+                    checkpoint_hash=checkpoint_hash,
                     gen_kwargs=phase2_kwargs,
                 )
         rollouts = []

@@ -33,6 +33,7 @@ from reliquary.constants import (
     CODE_SEMANTIC_AUTH_ENFORCE,
     TOKEN_AUTH_ENFORCE,
     ALL_TOKEN_AUTH_ENFORCE,
+    FORCED_SEED_ENFORCE,
 )
 from reliquary.environment.base import Environment
 from reliquary.shared.prompt_range import window_prompt_range
@@ -67,6 +68,7 @@ from reliquary.validator.auth_forensics import (
     code_semantic_counterfactual_max_findings_per_rollout,
     record_all_token_auth_findings,
     record_code_semantic_auth_findings,
+    record_forced_seed_shadow,
 )
 from reliquary.validator.reward_shape import detect_reward_shape_manipulation
 from reliquary.validator.rollout_patterns import detect_opposite_reward_clones
@@ -164,6 +166,48 @@ def _uses_validator_authoritative_reward(env: Any) -> bool:
 
 def _reward_matches_claim(actual: float, claimed: float, *, tolerance: float = 1e-6) -> bool:
     return abs(float(actual) - float(claimed)) <= tolerance
+
+
+def _forced_seed_verdict(n_stoch: int, n_match: int, enforce: bool) -> bool:
+    """True => reject the group for seed mismatch. Abstains on thin signal;
+    shadow (never rejects) when enforcement is off."""
+    from reliquary.constants import (
+        FORCED_SEED_CONSISTENCY_FLOOR, FORCED_SEED_MIN_STOCH_POSITIONS,
+    )
+    if not enforce:
+        return False
+    if n_stoch < FORCED_SEED_MIN_STOCH_POSITIONS:
+        return False
+    return (n_match / n_stoch) < FORCED_SEED_CONSISTENCY_FLOOR
+
+
+def _forced_seed_rollout_reject(per_rollout, enforce: bool) -> bool:
+    """True => reject because a SINGLE rollout is off the forced stream. The
+    group-average verdict dilutes a partial swap (a few curated rollouts hidden
+    among honest ones); this catches any one rollout that carries enough
+    stochastic positions yet falls below the per-rollout floor. ``per_rollout``
+    is a list of (n_stoch, n_match). Abstains on thin rollouts; shadow (never
+    rejects) when enforcement is off."""
+    from reliquary.constants import (
+        FORCED_SEED_ROLLOUT_FLOOR, FORCED_SEED_ROLLOUT_MIN_STOCH,
+    )
+    if not enforce:
+        return False
+    for n_stoch, n_match in per_rollout:
+        if (n_stoch >= FORCED_SEED_ROLLOUT_MIN_STOCH
+                and (n_match / n_stoch) < FORCED_SEED_ROLLOUT_FLOOR):
+            return True
+    return False
+
+
+def _is_missing_kwarg_typeerror(exc: TypeError, kwarg: str) -> bool:
+    """True iff ``exc`` is Python's own "unexpected keyword argument" TypeError
+    for ``kwarg`` (e.g. a legacy/stub verifier signature), as opposed to some
+    other internal TypeError that merely happens to mention ``kwarg`` in its
+    message. A bare substring test on ``kwarg`` alone would swallow the latter
+    and silently disable the forced-seed gate every rollout."""
+    msg = str(exc)
+    return "unexpected keyword argument" in msg and kwarg in msg
 
 
 _PROOF_FAILURE_DEBT_STAGES = frozenset(
@@ -1016,6 +1060,17 @@ class GrpoWindowBatcher:
             except Exception:
                 canonical_force_ids = []
 
+        # Forced-seed group tally: summed across all rollouts in this
+        # submission, verdict decided once after the loop (see
+        # ``_forced_seed_verdict``) — per-rollout counts are too thin a
+        # sample to gate on individually.
+        from reliquary.environment.forced_sampling import u_at
+        grp_stoch = 0
+        grp_match = 0
+        # Per-rollout (n_stoch, n_match) — the per-rollout gate needs each
+        # rollout separately, since the group average hides a partial swap.
+        seed_per_rollout: list[tuple[int, int]] = []
+
         for rollout_idx, rollout in enumerate(request.rollouts):
             # `truncated` is a validator-set flag (overlong reward shaping, see
             # submission.py). Wipe any miner-supplied value at ingestion so only
@@ -1047,19 +1102,58 @@ class GrpoWindowBatcher:
             claimed_rand = (rollout.commit.get("beacon") or {}).get("randomness", "")
             if claimed_rand != self.randomness:
                 return reject(RejectReason.WRONG_RANDOMNESS, "randomness")
+            # Per-position forced-seed uniforms for this rollout's teacher-forced
+            # consistency check. Read completion_length here (ahead of the
+            # ``completion_len`` computed later at the sparse-outputs section)
+            # so the u-stream can accompany the verify call below.
+            _seed_completion_len = int(
+                (rollout.commit.get("rollout") or {}).get("completion_length", 0)
+            )
+            seed_u = [
+                u_at(
+                    self.randomness, request.miner_hotkey, request.prompt_idx,
+                    request.checkpoint_hash, rollout_idx, j,
+                )
+                for j in range(_seed_completion_len)
+            ]
             try:
                 proof = self._verify_commitment(
                     rollout.commit,
                     self.model,
                     self.randomness,
                     tokenizer=self.tokenizer,
+                    seed_u_values=seed_u,
                 )
             except TypeError as exc:
-                if "tokenizer" not in str(exc):
+                # Backward-compat fallback for stub verifiers (tests, legacy
+                # callers) that don't accept one or both of the newer kwargs.
+                # Retry narrowing from most- to least-featured signature
+                # rather than guessing which kwarg tripped it. Matched
+                # strictly against Python's "unexpected keyword argument"
+                # TypeError text (not a bare substring test) so a genuine
+                # internal TypeError raised inside a real verifier propagates
+                # instead of being masked and retried without seed_u_values.
+                if _is_missing_kwarg_typeerror(exc, "seed_u_values"):
+                    try:
+                        proof = self._verify_commitment(
+                            rollout.commit, self.model, self.randomness,
+                            tokenizer=self.tokenizer,
+                        )
+                    except TypeError as exc2:
+                        if not _is_missing_kwarg_typeerror(exc2, "tokenizer"):
+                            raise
+                        proof = self._verify_commitment(
+                            rollout.commit, self.model, self.randomness,
+                        )
+                elif _is_missing_kwarg_typeerror(exc, "tokenizer"):
+                    proof = self._verify_commitment(
+                        rollout.commit, self.model, self.randomness,
+                    )
+                else:
                     raise
-                proof = self._verify_commitment(
-                    rollout.commit, self.model, self.randomness
-                )
+            grp_stoch += proof.seed_n_stochastic
+            grp_match += proof.seed_n_match
+            seed_per_rollout.append((proof.seed_n_stochastic, proof.seed_n_match))
             if proof.sketch_diff_max > sketch_diff_max:
                 sketch_diff_max = proof.sketch_diff_max
             if not proof.all_passed:
@@ -1388,6 +1482,25 @@ class GrpoWindowBatcher:
                             lp_dev_max=lp_dev_max,
                             dist_q10_min=dist_q10_min,
                         )
+
+        # Forced-seed gate. Group verdict = summed counts (catches diffuse
+        # deviation); per-rollout verdict catches a single off-stream rollout
+        # the group average would dilute. Both shadow (compute + log, never
+        # reject) unless FORCED_SEED_ENFORCE is on.
+        # Only enforce when the checkpoint hash is pinned: an empty
+        # current_checkpoint_hash disables WRONG_CHECKPOINT, so the miner
+        # controls checkpoint_hash (a forced-seed derivation input) and could
+        # grind it -- don't reject on a stream whose seed inputs aren't bound.
+        seed_enforce = FORCED_SEED_ENFORCE and bool(self.current_checkpoint_hash)
+        group_reject = _forced_seed_verdict(grp_stoch, grp_match, seed_enforce)
+        rollout_reject = _forced_seed_rollout_reject(seed_per_rollout, seed_enforce)
+        if group_reject or rollout_reject:
+            logger.info(
+                "seed_mismatch hotkey=%s stoch=%d match=%d scope=%s",
+                hk, grp_stoch, grp_match, "group" if group_reject else "rollout",
+            )
+            return reject(RejectReason.SEED_MISMATCH, "forced_seed")
+        record_forced_seed_shadow(hk, request.prompt_idx, grp_stoch, grp_match)
 
         # Reward-shape metrics are still computed (they feed the softer
         # training-quarantine signal + archive telemetry) but no longer
