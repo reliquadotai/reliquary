@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from typing import Any
 
 from reliquary.constants import (
@@ -341,10 +342,15 @@ class ValidationService:
 
         self.server = ValidatorServer(host=http_host, port=http_port)
         self.server.set_late_drop_callback(self.record_late_drop)
+        self.server.configure_prompt_source_health(
+            self._prompt_source_health_snapshot
+        )
 
         # v2.1 state machine infrastructure — in-memory only, bootstrapped at
         # startup from R2 + HF (no local JSON state file).
         self._window_n: int = 0
+        self._candidate_window_n: int | None = None
+        self._window_preparation_stage: str | None = None
         self._checkpoint_n: int = 0
         self._publish_every = CHECKPOINT_PUBLISH_INTERVAL_WINDOWS
         self._trained_windows_since_publish = 0
@@ -403,6 +409,49 @@ class ValidationService:
         self._current_window_state = s
         # Also notify the server so /state returns the right value.
         self.server.set_current_state(s)
+
+    def _prompt_source_health_snapshot(self) -> dict[str, dict[str, Any]]:
+        snapshots: dict[str, dict[str, Any]] = {}
+        for env_name, env in self.envs.items():
+            snapshot_fn = getattr(env, "source_health", None)
+            if not callable(snapshot_fn):
+                snapshots[env_name] = {"status": "unreported"}
+                continue
+            try:
+                snapshots[env_name] = dict(snapshot_fn())
+            except Exception as exc:
+                snapshots[env_name] = {
+                    "status": "degraded",
+                    "last_error_type": type(exc).__name__,
+                }
+        return snapshots
+
+    def _publish_window_preparation_state(self) -> None:
+        self.server.set_window_preparation_state(
+            last_committed_window_n=self._window_n,
+            candidate_window_n=getattr(self, "_candidate_window_n", None),
+            stage=getattr(self, "_window_preparation_stage", None),
+        )
+
+    def _set_window_preparation_stage(self, stage: str) -> None:
+        self._window_preparation_stage = stage
+        self._publish_window_preparation_state()
+
+    def _rollback_preopen_window(self, exc: BaseException) -> None:
+        """Keep a failed candidate reusable instead of consuming its ID."""
+        if self._candidate_window_n is None:
+            return
+        failure = {
+            "candidate_window_n": self._candidate_window_n,
+            "stage": self._window_preparation_stage or "unknown",
+            "error_type": type(exc).__name__,
+            "ts": time.time(),
+        }
+        self.server.record_window_preparation_failure(failure)
+        self._window_preparation_stage = None
+        self._active_batchers = {}
+        self.server.set_active_batchers({})
+        self._publish_window_preparation_state()
 
     def record_late_drop(self, hotkey: str, reason: str) -> None:
         """Bump the (hotkey, reason) counter. Both call sites run on the
@@ -498,9 +547,12 @@ class ValidationService:
         verification in ``indices_from_root`` if the chain call that fills
         randomness fails (e.g. finney WebSocket returns 503).
         """
-        self._window_n += 1
+        if self._candidate_window_n is None:
+            self._candidate_window_n = self._window_n + 1
+        target_window = self._candidate_window_n
+        self._set_window_preparation_stage("batcher_construction")
         bootstrap = is_bootstrap_window(
-            window_start=self._window_n,
+            window_start=target_window,
             subnet_start=SUBNET_START_BLOCK,
         )
         cp = self._checkpoint_store.current_manifest()
@@ -508,7 +560,7 @@ class ValidationService:
         self._active_batchers = {}
         for env_name, env in self.envs.items():
             batcher = open_grpo_window(
-                window_start=self._window_n,
+                window_start=target_window,
                 env=env, model=self.verify_model,
                 cooldown_map=self._cooldown_per_env[env_name],
                 hash_set=self._hash_set,
@@ -531,6 +583,14 @@ class ValidationService:
         """
         if not self._active_batchers:
             return
+        target_windows = {
+            int(batcher.window_start) for batcher in self._active_batchers.values()
+        }
+        if target_windows != {self._candidate_window_n}:
+            raise RuntimeError(
+                "prepared batchers do not share the candidate window"
+            )
+        self._set_window_preparation_stage("activation")
         # Bind the main loop into each batcher BEFORE exposing them to the
         # server, so the delayed drand-boundary seal scheduled from the
         # worker thread targets this loop. No running loop (sync tests) →
@@ -543,6 +603,11 @@ class ValidationService:
             for batcher in self._active_batchers.values():
                 batcher.bind_event_loop(loop)
         self.server.set_active_batchers(self._active_batchers)
+        self._window_n = int(self._candidate_window_n)
+        self._candidate_window_n = None
+        self._window_preparation_stage = None
+        self.server.clear_window_preparation_failure()
+        self._publish_window_preparation_state()
         self._set_state(WindowState.OPEN)
 
     async def _refresh_registered_hotkeys(self, *, force: bool = False) -> bool:
@@ -781,46 +846,33 @@ class ValidationService:
         """
         if not self._active_batchers:
             return
+        first_batcher = next(iter(self._active_batchers.values()))
+        target_window = getattr(first_batcher, "window_start", None)
+        if not isinstance(target_window, int) or isinstance(target_window, bool):
+            candidate_window = getattr(self, "_candidate_window_n", None)
+            target_window = (
+                candidate_window
+                if candidate_window is not None
+                else self._window_n
+            )
+        self._set_window_preparation_stage("randomness")
         # 3 attempts total: original + 2 retries. Backoff is 0.5s then 1.0s,
         # so worst-case added latency is 1.5s — well inside the 60s window
         # budget. Sustained outages still bubble after attempt 3.
         last_exc: Exception | None = None
+        randomness: str | None = None
+        beacon: dict | None = None
         for attempt in range(3):
             try:
                 randomness, beacon = await self._derive_randomness(
-                    subtensor, self._window_n,
+                    subtensor, target_window,
                 )
-                for batcher in self._active_batchers.values():
-                    batcher.randomness = randomness
-                    batcher.set_prompt_range()
-                self._last_beacon = beacon
-                if beacon is not None and beacon.get("round") is not None:
-                    self._active_batcher.window_open_drand_round = int(
-                        beacon["round"]
-                    )
-                # Schedule background bittensor_drand cross-check. Only
-                # in real-drand mode (mock path returns beacon=None).
-                # Task reference stored so it's not GC'd mid-run.
-                # Pass all batchers so the cross-check can invalidate all.
-                if beacon is not None and beacon.get("signature"):
-                    from reliquary.infrastructure.drand import get_current_chain
-                    chain_info = get_current_chain()
-                    self._active_batcher._drand_chain_info = chain_info
-                    self._verify_task = asyncio.create_task(
-                        self._verify_beacon_async(
-                            list(self._active_batchers.values()),
-                            chain_info["hash"],
-                            int(beacon["round"]),
-                            str(beacon["randomness"]),
-                            beacon["signature"],
-                        )
-                    )
                 if attempt > 0:
                     logger.info(
                         "Window %d: randomness derived on attempt %d",
-                        self._window_n, attempt + 1,
+                        target_window, attempt + 1,
                     )
-                return
+                break
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -828,12 +880,51 @@ class ValidationService:
                 if attempt < 2:
                     logger.warning(
                         "Window %d: _derive_randomness attempt %d failed (%s: %s); retrying",
-                        self._window_n, attempt + 1,
+                        target_window, attempt + 1,
                         type(exc).__name__, str(exc)[:120],
                     )
                     await asyncio.sleep(0.5 * (attempt + 1))
-        assert last_exc is not None
-        raise last_exc
+        if randomness is None:
+            assert last_exc is not None
+            raise last_exc
+
+        for batcher in self._active_batchers.values():
+            batcher.randomness = randomness
+
+        self._set_window_preparation_stage("prompt_manifest")
+        try:
+            for batcher in self._active_batchers.values():
+                batcher.set_prompt_range()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "Window %d: prompt preparation failed (%s)",
+                target_window,
+                type(exc).__name__,
+            )
+            raise
+
+        self._last_beacon = beacon
+        if beacon is not None and beacon.get("round") is not None:
+            self._active_batcher.window_open_drand_round = int(beacon["round"])
+        # Schedule background bittensor_drand cross-check. Only in real-drand
+        # mode (mock path returns beacon=None). Pass all batchers so the
+        # cross-check can invalidate the whole multi-environment window.
+        if beacon is not None and beacon.get("signature"):
+            from reliquary.infrastructure.drand import get_current_chain
+
+            chain_info = get_current_chain()
+            self._active_batcher._drand_chain_info = chain_info
+            self._verify_task = asyncio.create_task(
+                self._verify_beacon_async(
+                    list(self._active_batchers.values()),
+                    chain_info["hash"],
+                    int(beacon["round"]),
+                    str(beacon["randomness"]),
+                    beacon["signature"],
+                )
+            )
 
     async def _verify_beacon_async(
         self,
@@ -1631,6 +1722,7 @@ class ValidationService:
         await self._serve_axon_on_chain(subtensor)
         await self._apply_resume_from()                  # ← resume before bootstrap
         await self._bootstrap_state_from_external()
+        self._publish_window_preparation_state()
         await self._rebuild_cooldown_from_history()
         await self._rebuild_hashes_from_history()
         self._log_startup_config_banner()
@@ -1656,6 +1748,10 @@ class ValidationService:
         try:
             while True:
                 try:
+                    if self._candidate_window_n is not None:
+                        self._set_window_preparation_stage(
+                            "registration_refresh"
+                        )
                     await self._refresh_registered_hotkeys()
                     self._open_window()
                     await self._wait_for_next_drand_boundary()
@@ -1697,8 +1793,9 @@ class ValidationService:
                     # here. The trainer is purely about training + uploads.
                 except asyncio.CancelledError:
                     raise
-                except Exception:
+                except Exception as exc:
                     logger.exception("Window iteration failed")
+                    self._rollback_preopen_window(exc)
                     # Reset to READY so the next iteration doesn't spin on error state.
                     self.server.set_active_batchers({})
                     self._active_batchers = {}
@@ -2045,7 +2142,12 @@ class ValidationService:
         """
         if not self.use_drand:
             return
-        import time
+        target_window = (
+            self._candidate_window_n
+            if self._candidate_window_n is not None
+            else self._window_n
+        )
+        self._set_window_preparation_stage("drand_boundary")
         from reliquary.infrastructure.drand import get_current_chain
         ci = get_current_chain()
         delay = chain.seconds_until_next_drand_boundary(
@@ -2054,7 +2156,7 @@ class ValidationService:
         if delay > 0:
             logger.info(
                 "Window %d: waiting %.2fs for next drand boundary before OPEN",
-                self._window_n, delay,
+                target_window, delay,
             )
             await asyncio.sleep(delay)
 

@@ -54,11 +54,71 @@ def test_open_window_sets_state_to_open():
     assert svc._active_batcher is not None
 
 
-def test_open_window_increments_window_n():
+def test_open_window_reserves_candidate_without_committing_window_n():
     svc = _make_service()
     initial = svc._window_n
     svc._open_window()
+    assert svc._window_n == initial
+    assert svc._candidate_window_n == initial + 1
+    assert svc._active_batcher.window_start == initial + 1
+
+
+def test_failed_preopen_reuses_candidate_until_activation():
+    svc = _make_service()
+    initial = svc._window_n
+
+    svc._open_window()
+    svc._set_window_preparation_stage("prompt_manifest")
+    svc._rollback_preopen_window(RuntimeError("source unavailable"))
+
+    health = svc.server._health_payload()
+    assert svc._window_n == initial
+    assert svc._candidate_window_n == initial + 1
+    assert health.status == "degraded"
+    assert health.last_committed_window_n == initial
+    assert health.candidate_window_n == initial + 1
+    assert health.window_preparation_failures_total == 1
+    assert health.window_preparation_failures_by_stage == {
+        "prompt_manifest": 1
+    }
+    assert health.last_window_preparation_failure == {
+        "candidate_window_n": initial + 1,
+        "stage": "prompt_manifest",
+        "error_type": "RuntimeError",
+        "ts": health.last_window_preparation_failure["ts"],
+    }
+
+    svc._open_window()
+    assert svc._active_batcher.window_start == initial + 1
+    svc._activate_window()
+
+    health = svc.server._health_payload()
     assert svc._window_n == initial + 1
+    assert svc._candidate_window_n is None
+    assert health.status == "ok"
+    assert health.last_committed_window_n == initial + 1
+    assert health.candidate_window_n is None
+    assert health.last_window_preparation_failure is None
+
+
+@pytest.mark.asyncio
+async def test_prompt_preparation_failure_does_not_retry_randomness():
+    from reliquary.environment.virtual_parquet import PromptSourceUnavailable
+
+    svc = _make_service()
+    svc._open_window()
+    svc._derive_randomness = AsyncMock(return_value=("seed", None))
+    svc._active_batcher.set_prompt_range = MagicMock(
+        side_effect=PromptSourceUnavailable("manifest unavailable")
+    )
+
+    with pytest.raises(PromptSourceUnavailable, match="manifest unavailable"):
+        await svc._set_window_randomness(subtensor=None)
+
+    svc._derive_randomness.assert_awaited_once_with(
+        None, svc._candidate_window_n
+    )
+    assert svc._window_preparation_stage == "prompt_manifest"
 
 
 def test_set_state_transitions():
@@ -81,6 +141,7 @@ async def test_train_and_publish_bumps_checkpoint_n(monkeypatch):
 
     # Open a window so there's an active batcher + seal_event to drive
     svc._open_window()
+    svc._activate_window()
 
     # Mock the checkpoint store to avoid HF calls
     svc._checkpoint_store = MagicMock()

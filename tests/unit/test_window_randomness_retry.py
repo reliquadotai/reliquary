@@ -23,8 +23,12 @@ import pytest
 class _FakeBatcher:
     randomness: str = ""
 
+    def __init__(self) -> None:
+        self.prompt_error: Exception | None = None
+
     def set_prompt_range(self) -> None:
-        pass
+        if self.prompt_error is not None:
+            raise self.prompt_error
 
 
 class _FakeService:
@@ -53,23 +57,26 @@ class _FakeService:
         if self._active_batcher is None:
             return
         last_exc: BaseException | None = None
+        randomness: str | None = None
+        beacon: dict | None = None
         for attempt in range(3):
             try:
                 randomness, beacon = await self._derive_randomness(
                     subtensor, self._window_n,
                 )
-                self._active_batcher.randomness = randomness
-                self._active_batcher.set_prompt_range()
-                self._last_beacon = beacon
-                return
+                break
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 last_exc = exc
                 if attempt < 2:
                     await asyncio.sleep(0.001)
-        assert last_exc is not None
-        raise last_exc
+        if randomness is None:
+            assert last_exc is not None
+            raise last_exc
+        self._active_batcher.randomness = randomness
+        self._active_batcher.set_prompt_range()
+        self._last_beacon = beacon
 
 
 @pytest.mark.asyncio
@@ -126,4 +133,16 @@ async def test_cancelled_error_short_circuits() -> None:
     svc._derive_succeed_on_attempt = 99
     with pytest.raises(asyncio.CancelledError):
         await svc._set_window_randomness(subtensor=None)
+    assert svc._derive_call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_prompt_preparation_failure_does_not_refetch_randomness() -> None:
+    svc = _FakeService()
+    assert svc._active_batcher is not None
+    svc._active_batcher.prompt_error = RuntimeError("manifest unavailable")
+
+    with pytest.raises(RuntimeError, match="manifest unavailable"):
+        await svc._set_window_randomness(subtensor=None)
+
     assert svc._derive_call_count == 1

@@ -1,7 +1,8 @@
 """v2.1 window state-machine smoke: open → seal → train → publish → ready.
 
 Fully-mocked — no R2, no torch, no real drand. Exercises the
-orchestration contract: _open_window advances window_n, seal_event
+orchestration contract: _open_window prepares and _activate_window commits
+window_n, seal_event
 drives _train_and_publish, checkpoint_n increments, state ends on READY.
 """
 
@@ -286,6 +287,7 @@ async def test_verify_model_refreshed_only_after_publish(monkeypatch):
     # publish_every=1 by default in _make_service → publish runs every window.
     with _patch_open_grpo_window(svc):
         svc._open_window()
+    svc._activate_window()
     svc._active_batcher.seal_event.set()
     # Pretend the seal produced a full batch so trained=True.
     svc._active_batcher.seal_batch = MagicMock(return_value=([MagicMock()] * 100, {}))
@@ -326,7 +328,8 @@ async def test_verify_model_NOT_refreshed_when_publish_skipped(monkeypatch):
     monkeypatch.setattr(svc_mod, "train_step", _fake_train_step)
 
     with _patch_open_grpo_window(svc):
-        svc._open_window()  # bumps to 6
+        svc._open_window()
+    svc._activate_window()  # commits window 6
     svc._active_batcher.seal_event.set()
     svc._active_batcher.seal_batch = MagicMock(return_value=([MagicMock()] * 100, {}))
 
@@ -368,6 +371,7 @@ async def test_submission_with_wrong_hash_rejected():
     svc = _make_service(checkpoint_hash="sha256:cpA")
     with _patch_open_grpo_window(svc):
         svc._open_window()
+    svc._activate_window()
     batcher = svc._active_batcher
 
     req = _request(
@@ -417,6 +421,7 @@ async def test_sparse_windows_train_once_accumulated_target_is_full():
     for start, count in ((0, 3), (3, B_BATCH - 3)):
         with _patch_open_grpo_window(svc):
             svc._open_window()
+        svc._activate_window()
         batcher = svc._active_batcher
         for i in range(start, start + count):
             req = _request(
@@ -440,6 +445,7 @@ async def test_checkpoint_rollover_discards_partial_accumulation():
     svc = _make_service(checkpoint_hash="sha256:cpA")
     with _patch_open_grpo_window(svc):
         svc._open_window()
+    svc._activate_window()
     for i in range(3):
         response = svc._active_batcher.accept_submission(_request(
             hotkey=f"hk-a-{i}", prompt_idx=i,
@@ -458,6 +464,7 @@ async def test_checkpoint_rollover_discards_partial_accumulation():
     )
     with _patch_open_grpo_window(svc):
         svc._open_window()
+    svc._activate_window()
     for i in range(3, 5):
         response = svc._active_batcher.accept_submission(_request(
             hotkey=f"hk-b-{i}", prompt_idx=i,
@@ -481,6 +488,7 @@ async def test_quarantined_partial_window_is_not_accumulated():
     svc = _make_service(checkpoint_hash="sha256:cpA")
     with _patch_open_grpo_window(svc):
         svc._open_window()
+    svc._activate_window()
     for i in range(3):
         response = svc._active_batcher.accept_submission(_request(
             hotkey=f"hk{i}", prompt_idx=i,
@@ -511,6 +519,7 @@ async def test_disable_train_retains_ready_batch_until_reenabled(monkeypatch):
 
     with _patch_open_grpo_window(svc):
         svc._open_window()
+    svc._activate_window()
     for i in range(B_BATCH):
         response = svc._active_batcher.accept_submission(_request(
             hotkey=f"hk{i}", prompt_idx=i,
@@ -527,6 +536,7 @@ async def test_disable_train_retains_ready_batch_until_reenabled(monkeypatch):
     monkeypatch.delenv("RELIQUARY_DISABLE_TRAIN")
     with _patch_open_grpo_window(svc):
         svc._open_window()
+    svc._activate_window()
     with patch(
         "reliquary.validator.service.train_step",
         side_effect=lambda model, batches, **kwargs: model,
