@@ -92,6 +92,9 @@ class ProofResult:
     seed_n_boundary_match: int = 0
     seed_n_hard_mismatch: int = 0
     seed_n_deterministic_hard_mismatch: int = 0
+    seed_n_miss_gt_0_01: int = 0
+    seed_n_miss_gt_0_05: int = 0
+    seed_n_miss_gt_0_10: int = 0
     seed_max_cdf_miss: float = 0.0
     # Termination escape: True when the final token IS the protocol's forced
     # inverse-CDF pick at the position that produced it. The miner cannot choose
@@ -469,6 +472,9 @@ def verify_commitment_proofs(
     seed_n_boundary_match = 0
     seed_n_hard_mismatch = 0
     seed_n_deterministic_hard_mismatch = 0
+    seed_n_miss_gt_0_01 = 0
+    seed_n_miss_gt_0_05 = 0
+    seed_n_miss_gt_0_10 = 0
     seed_max_cdf_miss = 0.0
     terminal_pick_ok = None
     natural_close_pick_ok = None
@@ -509,6 +515,9 @@ def verify_commitment_proofs(
             seed_n_deterministic_hard_mismatch = (
                 seed_diagnostics.n_deterministic_hard_mismatch
             )
+            seed_n_miss_gt_0_01 = seed_diagnostics.n_miss_gt_0_01
+            seed_n_miss_gt_0_05 = seed_diagnostics.n_miss_gt_0_05
+            seed_n_miss_gt_0_10 = seed_diagnostics.n_miss_gt_0_10
             seed_max_cdf_miss = seed_diagnostics.max_cdf_miss
         terminal_pick_ok = _gpu_terminal_forced_pick(
             logits_gpu, tokens, prompt_length, seq_len,
@@ -568,6 +577,9 @@ def verify_commitment_proofs(
         seed_n_deterministic_hard_mismatch=(
             seed_n_deterministic_hard_mismatch
         ),
+        seed_n_miss_gt_0_01=seed_n_miss_gt_0_01,
+        seed_n_miss_gt_0_05=seed_n_miss_gt_0_05,
+        seed_n_miss_gt_0_10=seed_n_miss_gt_0_10,
         seed_max_cdf_miss=seed_max_cdf_miss,
         terminal_pick_ok=terminal_pick_ok,
         natural_close_pick_ok=natural_close_pick_ok,

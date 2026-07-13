@@ -14,6 +14,7 @@ from pydantic import (
     ConfigDict,
     Field,
     FiniteFloat,
+    PrivateAttr,
     field_validator,
     model_validator,
 )
@@ -85,6 +86,7 @@ class RejectReason(str, Enum):
     # historical archives in R2 that carry the string still deserialize.
     REWARD_SHAPE_SUSPICIOUS = "reward_shape_suspicious"
     WRONG_CHECKPOINT = "wrong_checkpoint"
+    MERKLE_ROOT_MISMATCH = "merkle_root_mismatch"
     WRONG_RANDOMNESS = "wrong_randomness"
     HOTKEY_NOT_REGISTERED = "hotkey_not_registered"
     REGISTRATION_UNAVAILABLE = "registration_unavailable"
@@ -164,6 +166,9 @@ class BatchSubmissionRequest(BaseModel):
     # validator's ``enforce_envelope_signature`` flag decides whether an
     # empty sig is rejected as BAD_ENVELOPE_SIGNATURE or silently accepted.
     envelope_signature: str = Field(default="", pattern=r"^[0-9a-fA-F]*$")
+    # Validator-only marker. It is absent from JSON and the public schema, so
+    # adding it does not change the miner wire contract.
+    _legacy_merkle_verified: bool = PrivateAttr(default=False)
 
     @field_validator("rollouts")
     @classmethod

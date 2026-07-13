@@ -237,7 +237,8 @@ Every `/submit` flows through this sequence on the validator. The first rejectio
 HTTP enqueue          worker dequeue → verify
 ─────────────         ─────────────────────────
 WINDOW_NOT_ACTIVE? → reject     →    WINDOW_MISMATCH? → reject
-rate/envelope/drand checks           WRONG_CHECKPOINT? → reject
+envelope/env/root-shadow checks      WRONG_CHECKPOINT? → reject
+registration/rate/drand checks
 queue submission                     BAD_PROMPT_IDX / PROMPT_IN_COOLDOWN? → reject
 return reason="submitted"            PROMPT_FULL? → reject
                                      BAD_SCHEMA / TOKENS_MISMATCH / BAD_TOKENS? → reject
@@ -255,6 +256,43 @@ return reason="submitted"            PROMPT_FULL? → reject
 window seals → R2 archive published at reliquary/dataset/window-<N>.json.gz
              → /set_weights at next epoch boundary
 ```
+
+The wire-v1 root check is validator-only and defaults to shadow mode
+(`RELIQUARY_LEGACY_MERKLE_ROOT_ENFORCE=false`). It recomputes the exact root
+current miners already sign, logs a `legacy_merkle_checked` lifecycle stage,
+and carries the status into later verdicts. It does not reject until explicitly
+enabled. Summarize a captured validator log with:
+
+```bash
+python scripts/report_legacy_merkle_shadow.py validator.log \
+  --required-env openmathinstruct --required-env opencodeinstruct
+```
+
+Do not enable enforcement until the report has at least 500 authenticated
+checks, five hotkeys, 24 windows, both active environments, zero compute
+errors, and zero unexplained mismatches. `/health` exposes the cumulative
+counts and the active enforcement flag.
+
+`/health` also reports the forced-seed ratio/CDF runtime policy and persistent
+archive-queue state. A nonzero `archive_queue_depth` is safe during a transient
+R2 failure, but a growing depth or old `archive_queue_oldest_age_seconds`
+requires operator attention. `archive_last_uploaded_window` is the direct
+confirmation that a recent archive left the local retry queue.
+
+Forced-seed CDF enforcement also defaults off. Private schema-v3 calibration
+rows bind each observation to its window, environment, and checkpoint and
+count CDF misses above 0.01, 0.05, and 0.10. Run:
+
+```bash
+python scripts/report_forced_seed_cdf.py
+```
+
+Any unexplained hard mismatch produces an immediate
+`HOLD_AND_REVIEW_CDF_HARD_MISMATCHES`; the 24-hour, 1,000-group, five-hotkey
+threshold is only a minimum for becoming eligible to canary enforcement. Do
+not raise the boundary epsilon merely to make the report pass: first separate
+environment, checkpoint, forced-span, and numerical-kernel effects using the
+schema-v3 fields.
 
 Before `train_step`, the validator runs the training-quarantine gate. If the
 selected batch has high-confidence poison signals, the archive still publishes

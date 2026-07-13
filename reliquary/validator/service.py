@@ -22,11 +22,15 @@ from reliquary.constants import (
     ENVIRONMENT_MIX,
     FORCED_SEED_CDF_BOUNDARY_EPSILON,
     FORCED_SEED_CDF_ENFORCE,
+    FORCED_SEED_CONSISTENCY_FLOOR,
+    FORCED_SEED_ENFORCE,
+    FORCED_SEED_ROLLOUT_FLOOR,
     GRAD_CLIP_NORM,
     HASH_DEDUP_RETENTION_WINDOWS,
     KL_BETA,
     LEARNING_RATE,
     LOGPROB_IS_EPS,
+    LEGACY_MERKLE_ROOT_ENFORCE,
     LR_COSINE_MAX_WINDOWS,
     LR_WARMUP_WINDOWS,
     M_ROLLOUTS,
@@ -1556,10 +1560,16 @@ class ValidationService:
                 "sigma_min": SIGMA_MIN,
                 "bootstrap_sigma_min": BOOTSTRAP_SIGMA_MIN,
                 "min_eos_probability": MIN_EOS_PROBABILITY,
+                "forced_seed_enforce": FORCED_SEED_ENFORCE,
+                "forced_seed_consistency_floor": (
+                    FORCED_SEED_CONSISTENCY_FLOOR
+                ),
+                "forced_seed_rollout_floor": FORCED_SEED_ROLLOUT_FLOOR,
                 "forced_seed_cdf_enforce": FORCED_SEED_CDF_ENFORCE,
                 "forced_seed_cdf_boundary_epsilon": (
                     FORCED_SEED_CDF_BOUNDARY_EPSILON
                 ),
+                "legacy_merkle_root_enforce": LEGACY_MERKLE_ROOT_ENFORCE,
                 "logprob_is_eps": LOGPROB_IS_EPS,
                 "r2_bucket": os.getenv("R2_BUCKET_ID", "reliquary"),
                 "http_host": self.server.host,
@@ -1570,6 +1580,10 @@ class ValidationService:
         )
 
     async def run(self, subtensor) -> None:
+        from reliquary.infrastructure.archive_queue import get_archive_queue
+
+        archive_queue = get_archive_queue()
+        self.server.configure_archive_queue_telemetry(archive_queue.snapshot)
         self.server.configure_registration_gate(
             lambda: self._refresh_registered_hotkeys(force=True),
         )
@@ -1586,9 +1600,8 @@ class ValidationService:
         # directory for any pending payloads (from before this restart
         # or accumulated during R2 downtime) and uploads them via sync
         # boto3 with exponential backoff. Cancelled cleanly on shutdown.
-        from reliquary.infrastructure.archive_queue import get_archive_queue
         self._archive_worker_task = asyncio.create_task(
-            get_archive_queue().run_forever(),
+            archive_queue.run_forever(),
             name="archive_queue_worker",
         )
 

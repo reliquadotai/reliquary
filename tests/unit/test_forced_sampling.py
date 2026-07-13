@@ -144,6 +144,9 @@ def test_cdf_diagnostics_accepts_only_calibrated_boundary_distance():
     assert near.max_cdf_miss == pytest.approx(0.0005, abs=1e-6)
     assert hard.n_boundary_match == 0
     assert hard.n_hard_mismatch == 1
+    assert hard.n_miss_gt_0_01 == 0
+    assert hard.n_miss_gt_0_05 == 0
+    assert hard.n_miss_gt_0_10 == 0
 
 
 def test_cdf_diagnostics_checks_near_deterministic_positions_too():
@@ -163,3 +166,6 @@ def test_cdf_diagnostics_checks_near_deterministic_positions_too():
     assert diagnostics.n_exact_match == 0
     assert diagnostics.n_hard_mismatch == 1
     assert diagnostics.n_deterministic_hard_mismatch == 1
+    assert diagnostics.n_miss_gt_0_01 == 1
+    assert diagnostics.n_miss_gt_0_05 == 1
+    assert diagnostics.n_miss_gt_0_10 == 1

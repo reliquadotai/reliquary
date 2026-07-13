@@ -14,7 +14,12 @@ def test_forced_seed_forensics_records_boundary_and_reject_diagnostics(tmp_path)
             "n_boundary_match": 99,
             "n_hard_mismatch": 1,
             "n_deterministic_hard_mismatch": 0,
+            "n_miss_gt_0_01": 1,
+            "n_miss_gt_0_05": 1,
+            "n_miss_gt_0_10": 1,
             "max_cdf_miss": 0.2,
+            "completion_length": 100,
+            "forced": False,
         }
     ]
 
@@ -27,7 +32,13 @@ def test_forced_seed_forensics_records_boundary_and_reject_diagnostics(tmp_path)
         n_positions=100,
         n_boundary_match=99,
         n_hard_mismatch=1,
+        n_miss_gt_0_01=1,
+        n_miss_gt_0_05=1,
+        n_miss_gt_0_10=1,
         max_cdf_miss=0.2,
+        window_start=500,
+        env_name="openmathinstruct",
+        checkpoint_hash="sha256:test",
         cdf_boundary_epsilon=0.002,
         ratio_group_would_reject=False,
         ratio_rollout_would_reject=False,
@@ -37,8 +48,12 @@ def test_forced_seed_forensics_records_boundary_and_reject_diagnostics(tmp_path)
     )
 
     record = json.loads(path.read_text().strip())
-    assert record["schema_version"] == 2
+    assert record["schema_version"] == 3
+    assert record["window_start"] == 500
+    assert record["env_name"] == "openmathinstruct"
+    assert record["checkpoint_hash"] == "sha256:test"
     assert record["n_hard_mismatch"] == 1
+    assert record["n_miss_gt_0_10"] == 1
     assert record["cdf_would_reject"] is True
     assert record["cdf_enforced"] is False
     assert record["per_rollout"] == per_rollout

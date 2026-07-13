@@ -110,7 +110,7 @@ def _request(
         rollouts.append(
             RolloutSubmission(
                 tokens=commit["tokens"], reward=reward, commit=commit,
-                env_name="openmathinstruct",
+                env_name=_FakeEnv.name,
             )
         )
     # Default to a deterministic merkle-root per (hotkey, prompt) so tests

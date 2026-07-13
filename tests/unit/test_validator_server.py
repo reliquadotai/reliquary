@@ -7,6 +7,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from reliquary.constants import CHALLENGE_K, M_ROLLOUTS
+from reliquary.protocol.legacy_merkle import (
+    compute_legacy_rollouts_merkle_root,
+)
 from reliquary.protocol.signatures import sign_envelope
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
@@ -107,6 +110,7 @@ def _request(
     k=4,
     checkpoint_hash="sha256:test",
     randomness="cd" * 16,
+    valid_merkle=False,
 ):
     """Build a fully-signed envelope so tests pass the validator's
     ``ENFORCE_ENVELOPE_SIGNATURE`` gate. ``miner_hotkey`` is bound to
@@ -121,11 +125,16 @@ def _request(
                 tokens=commit["tokens"],
                 reward=reward,
                 commit=commit,
-                env_name="openmathinstruct",
+                env_name=FakeEnv.name,
             )
         )
-    merkle_root = "00" * 32
+    merkle_root = (
+        compute_legacy_rollouts_merkle_root(rollouts)
+        if valid_merkle
+        else "00" * 32
+    )
     drand_round = 0
+    protocol_version = 1
     nonce = os.urandom(8).hex()
     sig = sign_envelope(
         wallet=_TestWallet,
@@ -146,9 +155,104 @@ def _request(
         rollouts=rollouts,
         checkpoint_hash=checkpoint_hash,
         drand_round=drand_round,
+        protocol_version=protocol_version,
         nonce=nonce,
         envelope_signature=sig,
     )
+
+
+def test_legacy_merkle_shadow_accepts_mismatch_and_exposes_telemetry():
+    from reliquary.protocol.submission import WindowState
+
+    server = ValidatorServer()
+    server.set_active_batcher(_batcher(window_start=500))
+    server.set_current_state(WindowState.OPEN)
+
+    response = TestClient(server.app).post(
+        "/submit", json=_request(valid_merkle=False).model_dump(mode="json")
+    )
+    health = server._health_payload()
+
+    assert response.json()["accepted"] is True
+    assert health.legacy_merkle_root_enforced is False
+    assert health.legacy_merkle_checks_total == 1
+    assert health.legacy_merkle_matches == 0
+    assert health.legacy_merkle_mismatches == 1
+    assert health.legacy_merkle_errors == 0
+    assert health.legacy_merkle_distinct_hotkeys == 1
+    assert health.legacy_merkle_environments == [FakeEnv.name]
+    assert health.legacy_merkle_protocol_versions == {"1": 1}
+    assert health.legacy_merkle_last_mismatch_ts is not None
+
+
+def test_legacy_merkle_shadow_records_current_miner_match():
+    from reliquary.protocol.submission import WindowState
+
+    server = ValidatorServer()
+    server.set_active_batcher(_batcher(window_start=500))
+    server.set_current_state(WindowState.OPEN)
+
+    response = TestClient(server.app).post(
+        "/submit", json=_request(valid_merkle=True).model_dump(mode="json")
+    )
+    health = server._health_payload()
+
+    assert response.json()["accepted"] is True
+    assert health.legacy_merkle_matches == 1
+    assert health.legacy_merkle_mismatches == 0
+    assert health.legacy_merkle_last_mismatch_ts is None
+
+
+def test_legacy_merkle_enforcement_rejects_before_quota(monkeypatch):
+    from reliquary.protocol.submission import WindowState
+    from reliquary.validator import server as server_module
+
+    monkeypatch.setattr(server_module, "LEGACY_MERKLE_ROOT_ENFORCE", True)
+    server = ValidatorServer()
+    server.set_active_batcher(_batcher(window_start=500))
+    server.set_current_state(WindowState.OPEN)
+
+    response = TestClient(server.app).post(
+        "/submit", json=_request(valid_merkle=False).model_dump(mode="json")
+    )
+
+    assert response.json() == {
+        "accepted": False,
+        "reason": RejectReason.MERKLE_ROOT_MISMATCH.value,
+    }
+    assert _TEST_KEYPAIR.ss58_address not in server._per_window_counts
+
+
+def test_mixed_environment_is_rejected_before_quota():
+    from reliquary.protocol.submission import WindowState
+
+    server = ValidatorServer()
+    server.set_active_batcher(_batcher(window_start=500))
+    server.set_current_state(WindowState.OPEN)
+    payload = _request(valid_merkle=True).model_dump(mode="json")
+    payload["rollouts"][1]["env_name"] = "opencodeinstruct"
+
+    response = TestClient(server.app).post("/submit", json=payload)
+
+    assert response.json()["reason"] == RejectReason.BAD_SCHEMA.value
+    assert _TEST_KEYPAIR.ss58_address not in server._per_window_counts
+    assert server._health_payload().legacy_merkle_checks_total == 0
+
+
+def test_unknown_environment_never_falls_back_to_first_batcher():
+    from reliquary.protocol.submission import WindowState
+
+    server = ValidatorServer()
+    server.set_active_batcher(_batcher(window_start=500))
+    server.set_current_state(WindowState.OPEN)
+    payload = _request(valid_merkle=True).model_dump(mode="json")
+    for rollout in payload["rollouts"]:
+        rollout["env_name"] = "opencodeinstruct"
+
+    response = TestClient(server.app).post("/submit", json=payload)
+
+    assert response.json()["reason"] == RejectReason.BAD_SCHEMA.value
+    assert _TEST_KEYPAIR.ss58_address not in server._per_window_counts
 
 
 def test_submit_returns_queued_on_active_window():
