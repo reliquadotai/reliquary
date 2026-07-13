@@ -39,3 +39,21 @@ def test_wide_float_divergence_rejected():
     assert verify_reward_claim(
         env, problem, "CORRECT", claimed=0.5  # env says 1.0
     ) is False
+
+
+def test_non_finite_claim_rejected():
+    env = FakeEnv()
+    problem = {"prompt": "q", "ground_truth": "a"}
+    assert verify_reward_claim(
+        env, problem, "CORRECT", claimed=float("nan")
+    ) is False
+
+
+def test_non_finite_environment_reward_rejected():
+    class NonFiniteEnv:
+        def compute_reward(self, problem, completion):
+            return float("inf")
+
+    assert verify_reward_claim(
+        NonFiniteEnv(), {}, "completion", claimed=1.0
+    ) is False

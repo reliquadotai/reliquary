@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -168,7 +169,13 @@ def _uses_validator_authoritative_reward(env: Any) -> bool:
 
 
 def _reward_matches_claim(actual: float, claimed: float, *, tolerance: float = 1e-6) -> bool:
-    return abs(float(actual) - float(claimed)) <= tolerance
+    actual_f = float(actual)
+    claimed_f = float(claimed)
+    return (
+        math.isfinite(actual_f)
+        and math.isfinite(claimed_f)
+        and abs(actual_f - claimed_f) <= tolerance
+    )
 
 
 def _forced_seed_verdict(n_stoch: int, n_match: int, enforce: bool) -> bool:
@@ -945,6 +952,14 @@ class GrpoWindowBatcher:
             try:
                 computed_reward = float(self.env.compute_reward(problem, text))
             except Exception:
+                return reject(RejectReason.REWARD_MISMATCH, "reward")
+            if not math.isfinite(computed_reward):
+                logger.error(
+                    "non-finite validator reward env=%s prompt=%d hotkey=%s",
+                    getattr(self.env, "name", type(self.env).__name__),
+                    request.prompt_idx,
+                    hk,
+                )
                 return reject(RejectReason.REWARD_MISMATCH, "reward")
             if validator_scored_reward:
                 rollout.reward = computed_reward
