@@ -291,8 +291,25 @@ def test_forced_bft_cap_passes_below_global_cap_without_truncation():
         p_stop=1e-10,
     )
 
-    assert verify_termination(commit, _FakeTokenizer(), proof) is True
-    assert is_cap_truncation(commit, _FakeTokenizer(), proof) is False
+    assert verify_termination(
+        commit,
+        _FakeTokenizer(),
+        proof,
+        env_name="openmathinstruct",
+    ) is True
+    assert is_cap_truncation(
+        commit,
+        _FakeTokenizer(),
+        proof,
+        env_name="openmathinstruct",
+    ) is False
+
+    assert verify_termination(
+        commit,
+        _FakeTokenizer(),
+        proof,
+        env_name="opencodeinstruct",
+    ) is False
 
 
 def test_forced_bft_cap_requires_exact_completion_length():

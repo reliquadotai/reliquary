@@ -243,7 +243,10 @@ def verify_termination(
 
     if (
         prompt_length + completion_length >= MAX_NEW_TOKENS_PROTOCOL_CAP
-        or is_forced_bft_cap_termination(commit)
+        or (
+            env_name == "openmathinstruct"
+            and is_forced_bft_cap_termination(commit)
+        )
     ):
         return True
     if (
@@ -312,7 +315,10 @@ def is_cap_truncation(
     rollout_meta = commit.get("rollout", {}) or {}
     completion_length = int(rollout_meta.get("completion_length", 0))
     prompt_length = int(rollout_meta.get("prompt_length", 0))
-    if is_forced_bft_cap_termination(commit):
+    if (
+        env_name == "openmathinstruct"
+        and is_forced_bft_cap_termination(commit)
+    ):
         return False
     if (
         is_natural_bft_cap_candidate(commit, tokenizer, env_name=env_name)
