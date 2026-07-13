@@ -122,6 +122,14 @@ def forced_seed_shadow_path() -> Path:
     return Path(state_dir) / "auth_forensics" / "forced-seed-shadow.jsonl"
 
 
+def termination_shadow_path() -> Path:
+    explicit = os.environ.get("RELIQUARY_TERMINATION_SHADOW_PATH")
+    if explicit:
+        return Path(explicit)
+    state_dir = os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")
+    return Path(state_dir) / "auth_forensics" / "termination-shadow.jsonl"
+
+
 def _float_or_none(value: Any) -> float | None:
     if value is None:
         return None
@@ -316,6 +324,98 @@ def record_forced_seed_shadow(
             _forced_seed_shadow_write_warned = True
             logger.warning(
                 "forced_seed_shadow_write_failed path=%s error=%r "
+                "(further occurrences suppressed)",
+                out_path,
+                exc,
+            )
+
+
+_termination_shadow_write_warned = False
+
+
+def record_termination_shadow(
+    *,
+    hotkey: str,
+    window_start: int,
+    env_name: str,
+    checkpoint_hash: str,
+    prompt_idx: int,
+    rollout_idx: int,
+    completion_length: int,
+    p_stop: float | None,
+    terminal_pick_ok: bool | None,
+    terminal_pick_cdf_miss: float | None,
+    natural_close_pick_ok: bool | None,
+    natural_close_pick_cdf_miss: float | None,
+    termination_ok: bool,
+    cap_truncated: bool,
+    would_exceed_truncation_budget: bool,
+    boundary_epsilon: float,
+    path: str | Path | None = None,
+) -> None:
+    """Record interesting termination decisions without changing the gate.
+
+    Rows are private and contain no token text. A small CDF miss is a review
+    signal, not proof of an honest rollout: an attacker may also search for a
+    near-boundary stop, so this telemetry must never auto-relax enforcement.
+    """
+    if not auth_forensics_enabled():
+        return
+
+    out_path = Path(path) if path is not None else termination_shadow_path()
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        terminal_boundary_compatible = bool(
+            terminal_pick_ok is False
+            and terminal_pick_cdf_miss is not None
+            and terminal_pick_cdf_miss <= boundary_epsilon
+        )
+        natural_boundary_compatible = bool(
+            natural_close_pick_ok is False
+            and natural_close_pick_cdf_miss is not None
+            and natural_close_pick_cdf_miss <= boundary_epsilon
+        )
+        record = {
+            "schema_version": 1,
+            "event": "termination_shadow",
+            "surface": "termination-shadow",
+            "ts_unix": time.time(),
+            "miner_hotkey": str(hotkey),
+            "window_start": int(window_start),
+            "env_name": str(env_name),
+            "checkpoint_hash": str(checkpoint_hash),
+            "prompt_idx": int(prompt_idx),
+            "rollout_idx": int(rollout_idx),
+            "completion_length": int(completion_length),
+            "p_stop": _float_or_none(p_stop),
+            "terminal_pick_ok": terminal_pick_ok,
+            "terminal_pick_cdf_miss": _float_or_none(
+                terminal_pick_cdf_miss
+            ),
+            "terminal_boundary_compatible": terminal_boundary_compatible,
+            "natural_close_pick_ok": natural_close_pick_ok,
+            "natural_close_pick_cdf_miss": _float_or_none(
+                natural_close_pick_cdf_miss
+            ),
+            "natural_close_boundary_compatible": (
+                natural_boundary_compatible
+            ),
+            "termination_ok": bool(termination_ok),
+            "cap_truncated": bool(cap_truncated),
+            "would_exceed_truncation_budget": bool(
+                would_exceed_truncation_budget
+            ),
+            "cdf_boundary_epsilon": float(boundary_epsilon),
+        }
+        with open(out_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, sort_keys=True, separators=(",", ":")))
+            f.write("\n")
+    except Exception as exc:
+        global _termination_shadow_write_warned
+        if not _termination_shadow_write_warned:
+            _termination_shadow_write_warned = True
+            logger.warning(
+                "termination_shadow_write_failed path=%s error=%r "
                 "(further occurrences suppressed)",
                 out_path,
                 exc,

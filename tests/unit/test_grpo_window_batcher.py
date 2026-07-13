@@ -1417,6 +1417,30 @@ def test_accept_cap_path_truncations_at_budget():
     assert resp.reason != RejectReason.BAD_TERMINATION
 
 
+def test_cap_path_records_private_termination_shadow(monkeypatch):
+    import reliquary.validator.batcher as batcher_mod
+
+    recorded = []
+    monkeypatch.setattr(
+        batcher_mod,
+        "record_termination_shadow",
+        lambda **kwargs: recorded.append(kwargs),
+    )
+    req, seq_len = _request_with_cap_truncations(1)
+    b = _make_batcher(
+        model=_LongContextModelStub(),
+        verify_commitment_proofs_fn=_grail_with_logits(seq_len),
+    )
+
+    resp = b.accept_submission(req)
+
+    assert resp.reason != RejectReason.BAD_TERMINATION
+    assert len(recorded) == 1
+    assert recorded[0]["cap_truncated"] is True
+    assert recorded[0]["would_exceed_truncation_budget"] is False
+    assert recorded[0]["window_start"] == b.window_start
+
+
 def test_reward_shape_no_longer_rejects_repeated_zero_tail():
     """The reward-shape filter was removed: it was trivially bypassed
     (reorder rollouts / vary loser lengths) yet false-rejected honest

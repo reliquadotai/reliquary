@@ -22,6 +22,7 @@ from reliquary.constants import (
     M_ROLLOUTS,
     MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
+    MIN_EOS_PROBABILITY,
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
     MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
     MAX_SEAL_QUEUE_DRAIN_SECONDS,
@@ -73,6 +74,7 @@ from reliquary.validator.auth_forensics import (
     record_all_token_auth_findings,
     record_code_semantic_auth_findings,
     record_forced_seed_shadow,
+    record_termination_shadow,
 )
 from reliquary.validator.reward_shape import detect_reward_shape_manipulation
 from reliquary.validator.rollout_patterns import detect_opposite_reward_clones
@@ -85,6 +87,7 @@ from reliquary.validator.verifier import (
     evaluate_token_distribution,
     has_eos_padding,
     is_cap_truncation,
+    is_natural_bft_cap_candidate,
     is_in_zone,
     rewards_std,
     validate_force_span,
@@ -1410,6 +1413,63 @@ class GrpoWindowBatcher:
                     self.model,
                     env_name=getattr(self.env, "name", ""),
                 )
+                terminal_pick_ok = getattr(proof, "terminal_pick_ok", None)
+                terminal_pick_cdf_miss = getattr(
+                    proof, "terminal_pick_cdf_miss", None
+                )
+                natural_close_pick_ok = getattr(
+                    proof, "natural_close_pick_ok", None
+                )
+                natural_close_pick_cdf_miss = getattr(
+                    proof, "natural_close_pick_cdf_miss", None
+                )
+                p_stop = getattr(proof, "p_stop", None)
+                natural_cap_candidate = is_natural_bft_cap_candidate(
+                    rollout.commit,
+                    self.tokenizer,
+                    env_name=getattr(self.env, "name", ""),
+                )
+                low_probability_terminal = bool(
+                    terminal_pick_ok is not None
+                    and p_stop is not None
+                    and float(p_stop) < MIN_EOS_PROBABILITY
+                )
+                increments_truncation = not termination_ok or cap_truncated
+                if private_auth_forensics_enabled and (
+                    increments_truncation
+                    or low_probability_terminal
+                    or natural_cap_candidate
+                ):
+                    record_termination_shadow(
+                        hotkey=request.miner_hotkey,
+                        window_start=self.window_start,
+                        env_name=getattr(self.env, "name", ""),
+                        checkpoint_hash=request.checkpoint_hash,
+                        prompt_idx=request.prompt_idx,
+                        rollout_idx=rollout_idx,
+                        completion_length=int(
+                            (rollout.commit.get("rollout") or {}).get(
+                                "completion_length", 0
+                            )
+                        ),
+                        p_stop=p_stop,
+                        terminal_pick_ok=terminal_pick_ok,
+                        terminal_pick_cdf_miss=terminal_pick_cdf_miss,
+                        natural_close_pick_ok=natural_close_pick_ok,
+                        natural_close_pick_cdf_miss=(
+                            natural_close_pick_cdf_miss
+                        ),
+                        termination_ok=termination_ok,
+                        cap_truncated=cap_truncated,
+                        would_exceed_truncation_budget=(
+                            increments_truncation
+                            and truncated_count + 1
+                            > max_truncated_per_submission
+                        ),
+                        boundary_epsilon=(
+                            FORCED_SEED_CDF_BOUNDARY_EPSILON
+                        ),
+                    )
                 if not termination_ok or cap_truncated:
                     truncated_flags[rollout_idx] = True
                     truncated_count += 1
