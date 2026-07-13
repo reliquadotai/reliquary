@@ -279,6 +279,22 @@ R2 failure, but a growing depth or old `archive_queue_oldest_age_seconds`
 requires operator attention. `archive_last_uploaded_window` is the direct
 confirmation that a recent archive left the local retry queue.
 
+Prompt Parquet range reads prefer exact full files already present in the
+persistent Hugging Face cache. If the range backend fails, the validator may
+download the same revision-pinned blob once and continue locally. Prewarm both
+active sources before a restart with:
+
+```bash
+python -m scripts.prewarm_prompt_sources
+python -m scripts.prewarm_prompt_sources --verify-only
+```
+
+`/health.prompt_sources` reports each source revision, manifest readiness,
+range failures, local full-file hits, and fallback downloads. A source that
+cannot serve from either path changes health to `degraded`; `/submit` returns a
+retryable HTTP 503 and refunds the request's rate-limit reservation. Prompt
+source failures are operator outages, not miner protocol verdicts.
+
 Forced-seed CDF enforcement also defaults off. Private schema-v3 calibration
 rows bind each observation to its window, environment, and checkpoint and
 count CDF misses above 0.01, 0.05, and 0.10. Run:

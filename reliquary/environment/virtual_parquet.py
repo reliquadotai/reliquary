@@ -13,9 +13,19 @@ filesystem and no network.
 from __future__ import annotations
 
 import bisect
+import logging
+import os
 import threading
+import time
 from collections import OrderedDict
 from typing import Any, Optional
+
+
+logger = logging.getLogger(__name__)
+
+
+class PromptSourceUnavailable(RuntimeError):
+    """The pinned prompt source cannot serve an exact dataset row."""
 
 
 class VirtualParquetDataset:
@@ -33,6 +43,7 @@ class VirtualParquetDataset:
         data_dir: str = "data",
         cache_row_groups: int = 64,
         fs: Any = None,
+        full_file_fallback: Optional[bool] = None,
     ) -> None:
         self._repo = repo
         self._revision = revision
@@ -40,6 +51,15 @@ class VirtualParquetDataset:
         self._data_dir = data_dir
         self._cache_cap = cache_row_groups
         self._fs = fs  # injectable for tests; HfFileSystem when None
+        if full_file_fallback is None:
+            full_file_fallback = (
+                fs is None
+                and os.environ.get(
+                    "RELIQUARY_PARQUET_FULL_FILE_FALLBACK", "true"
+                ).lower()
+                in {"1", "true", "yes"}
+            )
+        self._full_file_fallback = bool(full_file_fallback)
         self._files: Optional[list[str]] = None
         self._rg_start: Optional[list[int]] = None  # global start idx per row-group
         self._rg_loc: Optional[list[tuple[int, int]]] = None  # (file_idx, rg_idx)
@@ -56,6 +76,14 @@ class VirtualParquetDataset:
         # per-file handle that is not concurrency-safe.
         self._lock = threading.Lock()
         self._io_lock = threading.Lock()
+        self._health_lock = threading.Lock()
+        self._source_successes = 0
+        self._source_failures = 0
+        self._local_full_file_hits = 0
+        self._full_file_fallbacks = 0
+        self._last_success_ts: Optional[float] = None
+        self._last_failure_ts: Optional[float] = None
+        self._last_error_type: Optional[str] = None
 
     # -- manifest (footers only; no row data) --------------------------------
     def _filesystem(self):
@@ -64,31 +92,183 @@ class VirtualParquetDataset:
             self._fs = HfFileSystem()
         return self._fs
 
+    def _repo_filename(self, path: str) -> str:
+        prefix = f"datasets/{self._repo}@{self._revision}/"
+        if path.startswith(prefix):
+            return path[len(prefix):]
+        marker = f"/{self._data_dir}/"
+        if marker in path:
+            return f"{self._data_dir}/{path.split(marker, 1)[1]}"
+        return path
+
+    def _record_success(self) -> None:
+        with self._health_lock:
+            self._source_successes += 1
+            self._last_success_ts = time.time()
+
+    def _record_failure(self, exc: BaseException) -> None:
+        with self._health_lock:
+            self._source_failures += 1
+            self._last_failure_ts = time.time()
+            self._last_error_type = type(exc).__name__
+
+    def _cached_file(self, path: str) -> Optional[str]:
+        if not self._full_file_fallback:
+            return None
+        try:
+            from huggingface_hub import try_to_load_from_cache
+
+            cached = try_to_load_from_cache(
+                repo_id=self._repo,
+                filename=self._repo_filename(path),
+                revision=self._revision,
+                repo_type="dataset",
+            )
+        except Exception:
+            return None
+        return cached if isinstance(cached, str) else None
+
+    def _download_exact_file(self, path: str) -> str:
+        from huggingface_hub import hf_hub_download
+
+        return hf_hub_download(
+            repo_id=self._repo,
+            filename=self._repo_filename(path),
+            revision=self._revision,
+            repo_type="dataset",
+        )
+
+    def _open_parquet_file(self, path: str):
+        """Open one pinned Parquet blob, preferring the persistent HF cache.
+
+        Hugging Face range reads and full-file downloads use different data
+        paths. If the range backend is unavailable, ``hf_hub_download`` still
+        verifies and stores the exact revision-pinned blob in the normal HF
+        cache. Subsequent windows then stay independent of that remote outage.
+        """
+        import pyarrow.parquet as pq
+
+        cached = self._cached_file(path)
+        if cached is not None:
+            try:
+                parquet_file = pq.ParquetFile(cached)
+                _ = parquet_file.metadata
+            except Exception as exc:
+                self._record_failure(exc)
+            else:
+                with self._health_lock:
+                    self._local_full_file_hits += 1
+                self._record_success()
+                return parquet_file
+
+        remote_handle = None
+        try:
+            remote_handle = self._filesystem().open(path)
+            parquet_file = pq.ParquetFile(remote_handle)
+            _ = parquet_file.metadata
+        except Exception as remote_exc:
+            self._record_failure(remote_exc)
+            if remote_handle is not None:
+                try:
+                    remote_handle.close()
+                except Exception:
+                    pass
+            if not self._full_file_fallback:
+                raise PromptSourceUnavailable(
+                    f"prompt source unavailable: {self._repo}@{self._revision} "
+                    f"({type(remote_exc).__name__})"
+                ) from remote_exc
+            try:
+                local_path = self._download_exact_file(path)
+                parquet_file = pq.ParquetFile(local_path)
+                _ = parquet_file.metadata
+            except Exception as fallback_exc:
+                self._record_failure(fallback_exc)
+                raise PromptSourceUnavailable(
+                    f"prompt source unavailable: {self._repo}@{self._revision} "
+                    f"({type(fallback_exc).__name__})"
+                ) from fallback_exc
+            with self._health_lock:
+                self._full_file_fallbacks += 1
+            logger.warning(
+                "prompt_source_full_file_fallback repo=%s revision=%s file=%s",
+                self._repo,
+                self._revision,
+                self._repo_filename(path),
+            )
+            self._record_success()
+            return parquet_file
+        self._record_success()
+        return parquet_file
+
+    def source_health(self) -> dict[str, Any]:
+        """Return secret-free prompt-source readiness telemetry."""
+        with self._health_lock:
+            last_success = self._last_success_ts
+            last_failure = self._last_failure_ts
+            status = "ready" if self._total is not None else "initializing"
+            if last_failure is not None and (
+                last_success is None or last_failure > last_success
+            ):
+                status = "degraded"
+            return {
+                "status": status,
+                "repo": self._repo,
+                "revision": self._revision,
+                "manifest_ready": self._total is not None,
+                "files": len(self._files or ()),
+                "row_groups": len(self._rg_loc or ()),
+                "cached_row_groups": len(self._cache),
+                "source_successes_total": self._source_successes,
+                "source_failures_total": self._source_failures,
+                "local_full_file_hits_total": self._local_full_file_hits,
+                "full_file_fallbacks_total": self._full_file_fallbacks,
+                "last_success_ts": last_success,
+                "last_failure_ts": last_failure,
+                "last_error_type": self._last_error_type,
+            }
+
     def _ensure_manifest(self) -> None:
         if self._total is not None:
             return
-        import pyarrow.parquet as pq
 
         with self._io_lock:
             if self._total is not None:  # built by another thread while we waited
                 return
             fs = self._filesystem()
             base = f"datasets/{self._repo}@{self._revision}/{self._data_dir}"
-            files = sorted(
-                p for p in fs.ls(base, detail=False) if str(p).endswith(".parquet")
-            )
+            try:
+                files = sorted(
+                    str(p)
+                    for p in fs.ls(base, detail=False)
+                    if str(p).endswith(".parquet")
+                )
+            except Exception as exc:
+                self._record_failure(exc)
+                raise PromptSourceUnavailable(
+                    f"prompt source manifest unavailable: "
+                    f"{self._repo}@{self._revision} ({type(exc).__name__})"
+                ) from exc
             if not files:
-                raise RuntimeError(f"no parquet files under {base}")
+                exc = RuntimeError(f"no parquet files under {base}")
+                self._record_failure(exc)
+                raise PromptSourceUnavailable(str(exc)) from exc
             rg_start: list[int] = []
             rg_loc: list[tuple[int, int]] = []
             total = 0
             for fi, path in enumerate(files):
-                with fs.open(path) as fh:
-                    md = pq.ParquetFile(fh).metadata
+                parquet_file = self._open_parquet_file(path)
+                try:
+                    md = parquet_file.metadata
                     for rg in range(md.num_row_groups):
                         rg_start.append(total)
                         rg_loc.append((fi, rg))
                         total += md.row_group(rg).num_rows
+                finally:
+                    try:
+                        parquet_file.close()
+                    except Exception:
+                        pass
             self._files, self._rg_start, self._rg_loc = files, rg_start, rg_loc
             self._total = total  # assigned last: the double-check sentinel
 
@@ -143,10 +323,8 @@ class VirtualParquetDataset:
         if pf is not None:
             self._pf.move_to_end(file_idx)
             return pf
-        import pyarrow.parquet as pq
-
         assert self._files is not None
-        pf = pq.ParquetFile(self._filesystem().open(self._files[file_idx]))
+        pf = self._open_parquet_file(self._files[file_idx])
         self._pf[file_idx] = pf
         if len(self._pf) > 4:  # keep a few shards open (1 for the curated set)
             _, old = self._pf.popitem(last=False)
@@ -155,3 +333,6 @@ class VirtualParquetDataset:
             except Exception:
                 pass
         return pf
+
+
+__all__ = ["PromptSourceUnavailable", "VirtualParquetDataset"]

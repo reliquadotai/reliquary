@@ -6,8 +6,12 @@ fetch logic are exercised with no network.
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
-from reliquary.environment.virtual_parquet import VirtualParquetDataset
+from reliquary.environment.virtual_parquet import (
+    PromptSourceUnavailable,
+    VirtualParquetDataset,
+)
 
 
 def _make_parquet(path, values, rg_size):
@@ -114,3 +118,84 @@ def test_thread_safe_concurrent_get_row(tmp_path):
     for t in threads:
         t.join()
     assert errors == []
+
+
+class _FailingRangeFS:
+    def __init__(self, path):
+        self.path = path
+
+    def ls(self, base, detail=False):
+        return [self.path]
+
+    def open(self, path):
+        raise OSError("range backend unavailable")
+
+
+def test_exact_full_file_fallback_survives_range_outage(
+    tmp_path, monkeypatch,
+):
+    import huggingface_hub
+
+    local_path = tmp_path / "fallback.parquet"
+    _make_parquet(local_path, [10, 11, 12], rg_size=2)
+    remote_path = "datasets/owner/repo@rev/data/fallback.parquet"
+    downloaded = False
+
+    def _cache_lookup(*args, **kwargs):
+        return str(local_path) if downloaded else None
+
+    def _download(*args, **kwargs):
+        nonlocal downloaded
+        downloaded = True
+        assert kwargs["repo_id"] == "owner/repo"
+        assert kwargs["revision"] == "rev"
+        assert kwargs["filename"] == "data/fallback.parquet"
+        assert kwargs["repo_type"] == "dataset"
+        return str(local_path)
+
+    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache", _cache_lookup)
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", _download)
+    ds = VirtualParquetDataset(
+        "owner/repo",
+        "rev",
+        columns=["v"],
+        fs=_FailingRangeFS(remote_path),
+        full_file_fallback=True,
+    )
+
+    assert len(ds) == 3
+    assert ds.get_row(2) == {"v": 12}
+    health = ds.source_health()
+    assert health["status"] == "ready"
+    assert health["source_failures_total"] == 1
+    assert health["full_file_fallbacks_total"] == 1
+    assert health["local_full_file_hits_total"] == 1
+
+
+def test_source_failure_is_typed_and_visible(tmp_path, monkeypatch):
+    import huggingface_hub
+
+    remote_path = "datasets/owner/repo@rev/data/fallback.parquet"
+    monkeypatch.setattr(
+        huggingface_hub, "try_to_load_from_cache", lambda *a, **k: None
+    )
+
+    def _download_failure(*args, **kwargs):
+        raise ConnectionError("full download unavailable")
+
+    monkeypatch.setattr(
+        huggingface_hub, "hf_hub_download", _download_failure
+    )
+    ds = VirtualParquetDataset(
+        "owner/repo",
+        "rev",
+        fs=_FailingRangeFS(remote_path),
+        full_file_fallback=True,
+    )
+
+    with pytest.raises(PromptSourceUnavailable):
+        len(ds)
+    health = ds.source_health()
+    assert health["status"] == "degraded"
+    assert health["source_failures_total"] == 2
+    assert health["last_error_type"] == "ConnectionError"

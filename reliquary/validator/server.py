@@ -52,6 +52,7 @@ from reliquary.constants import (
     SPARSE_VALID_MAX_WINDOW_SECONDS,
     VALIDATOR_HTTP_PORT,
 )
+from reliquary.environment.virtual_parquet import PromptSourceUnavailable
 from reliquary.protocol.legacy_merkle import (
     legacy_submission_merkle_matches,
 )
@@ -398,6 +399,8 @@ class _Health(BaseModel):
     archive_last_upload_failure_ts: float | None = None
     archive_last_uploaded_window: int | None = None
     archive_last_failed_window: int | None = None
+    prompt_sources: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    prompt_source_unavailable_total: int = 0
 
 
 class ValidatorServer:
@@ -421,6 +424,7 @@ class ValidatorServer:
         self._registration_refresh_lock = asyncio.Lock()
         self._last_registration_refresh_attempt = 0.0
         self._training_accumulator_state: dict[str, Any] = {}
+        self._prompt_source_unavailable_total = 0
         self._legacy_merkle_stats: collections.Counter[str] = (
             collections.Counter()
         )
@@ -736,6 +740,29 @@ class ValidatorServer:
         except Exception:
             return None
 
+    def _prompt_source_health(self) -> dict[str, dict[str, Any]]:
+        batchers = dict(self._active_batchers)
+        if not batchers and self.active_batcher is not None:
+            env = getattr(self.active_batcher, "env", None)
+            env_name = getattr(env, "name", "unknown")
+            batchers[str(env_name)] = self.active_batcher
+
+        snapshots: dict[str, dict[str, Any]] = {}
+        for env_name, batcher in batchers.items():
+            env = getattr(batcher, "env", None)
+            snapshot_fn = getattr(env, "source_health", None)
+            if not callable(snapshot_fn) or _is_mock_like(snapshot_fn):
+                snapshots[env_name] = {"status": "unreported"}
+                continue
+            try:
+                snapshots[env_name] = dict(snapshot_fn())
+            except Exception as exc:
+                snapshots[env_name] = {
+                    "status": "degraded",
+                    "last_error_type": type(exc).__name__,
+                }
+        return snapshots
+
     def _health_payload(self) -> _Health:
         batcher = self.active_batcher
         cp = self._current_checkpoint
@@ -755,8 +782,17 @@ class ValidatorServer:
         if batcher is not None:
             for reason, count in getattr(batcher, "reject_counts", {}).items():
                 reject_counts[reason] = max(reject_counts.get(reason, 0), count)
+        prompt_sources = self._prompt_source_health()
+        health_status = (
+            "degraded"
+            if any(
+                source.get("status") == "degraded"
+                for source in prompt_sources.values()
+            )
+            else "ok"
+        )
         return _Health(
-            status="ok",
+            status=health_status,
             active_window=batcher.window_start if batcher else None,
             image_revision=self._image_revision,
             app_started_at=self._app_started_at,
@@ -894,6 +930,10 @@ class ValidatorServer:
             ),
             archive_last_failed_window=archive_queue.get(
                 "last_failed_window"
+            ),
+            prompt_sources=prompt_sources,
+            prompt_source_unavailable_total=(
+                self._prompt_source_unavailable_total
             ),
         )
 
@@ -1322,6 +1362,47 @@ class ValidatorServer:
                 )
             self._per_window_counts[hk] = n + 1
 
+            def _prompt_source_unavailable(
+                exc: PromptSourceUnavailable,
+            ) -> None:
+                # Infrastructure availability is not miner behavior. Refund
+                # the exact quota reservation made above and return a typed
+                # retryable service response without creating a protocol
+                # verdict that could later be interpreted as miner fault.
+                current_count = self._per_window_counts.get(hk, 0)
+                if current_count <= 1:
+                    self._per_window_counts.pop(hk, None)
+                else:
+                    self._per_window_counts[hk] = current_count - 1
+                self._prompt_source_unavailable_total += 1
+                telemetry.refresh_from_batcher(batcher, at_decision=True)
+                telemetry.mark_decision()
+                logger.error(
+                    "prompt_source_unavailable environment=%s window=%d "
+                    "prompt=%d error_type=%s quota_refunded=true",
+                    submission_env_name,
+                    request.window_start,
+                    request.prompt_idx,
+                    type(exc).__name__,
+                )
+                log_submission_stage(
+                    logger,
+                    logging.ERROR,
+                    "service_unavailable",
+                    telemetry,
+                    reject_stage="prompt_source",
+                    reject_reason="prompt_source_unavailable",
+                    accepted_into_pool=False,
+                    submitted_environment=submission_env_name,
+                    prompt_source_error_type=type(exc).__name__,
+                    quota_refunded=True,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="prompt_source_unavailable",
+                    headers={"Retry-After": "30"},
+                ) from exc
+
             # Early-cutoff: once the batcher has sealed (B_BATCH distinct
             # non-cooldown valid submissions received), ``select_batch``
             # will pick those by ``arrived_at``. Further submissions land
@@ -1465,7 +1546,11 @@ class ValidatorServer:
                     current_valid_count=batcher.valid_count,
                     trigger_round=trigger_round,
                 )
-            if request.prompt_idx >= len(batcher.env):
+            try:
+                environment_size = await asyncio.to_thread(len, batcher.env)
+            except PromptSourceUnavailable as exc:
+                _prompt_source_unavailable(exc)
+            if request.prompt_idx >= environment_size:
                 return _cheap_reject(RejectReason.BAD_PROMPT_IDX, reject_stage="prompt")
             prompt_range = getattr(batcher, "prompt_range", None)
             if prompt_range is not None:
@@ -1488,6 +1573,20 @@ class ValidatorServer:
                     batch_filled_reason="prompt_duplicate_or_full",
                 )
 
+            # Materialize the exact prompt before reserving proof work. This
+            # is an availability check, not a second prompt contract: the
+            # canonical binding below and the batcher still perform their
+            # normal validation. Keeping it here guarantees a third-party
+            # source outage remains quota-neutral and never consumes GPU debt.
+            prompt_loader = getattr(batcher.env, "get_problem", None)
+            if callable(prompt_loader) and not _is_mock_like(prompt_loader):
+                try:
+                    await asyncio.to_thread(
+                        prompt_loader, request.prompt_idx
+                    )
+                except PromptSourceUnavailable as exc:
+                    _prompt_source_unavailable(exc)
+
             reserve_proof = getattr(
                 type(batcher), "try_reserve_proof_admission", None
             )
@@ -1495,9 +1594,12 @@ class ValidatorServer:
                 # Runs in a thread: the canonical-prompt check calls
                 # env.get_problem, which for the lazy parquet dataset may do a
                 # blocking row-group fetch — must not stall the event loop.
-                preflight_reason, preflight_stage = await asyncio.to_thread(
-                    _proof_free_submission_reject, request, batcher
-                )
+                try:
+                    preflight_reason, preflight_stage = await asyncio.to_thread(
+                        _proof_free_submission_reject, request, batcher
+                    )
+                except PromptSourceUnavailable as exc:
+                    _prompt_source_unavailable(exc)
                 if preflight_reason is not None:
                     return _cheap_reject(
                         preflight_reason,
@@ -1561,9 +1663,12 @@ class ValidatorServer:
                     reject_reason=None,
                 )
                 try:
-                    resp = self._call_accept_submission(
-                        batcher, request, telemetry,
-                    )
+                    try:
+                        resp = self._call_accept_submission(
+                            batcher, request, telemetry,
+                        )
+                    except PromptSourceUnavailable as exc:
+                        _prompt_source_unavailable(exc)
                 finally:
                     self._finish_proof_admission(batcher, request)
                 telemetry.refresh_from_batcher(batcher, at_decision=True)
