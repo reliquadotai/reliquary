@@ -131,6 +131,14 @@ class _FailingRangeFS:
         raise OSError("range backend unavailable")
 
 
+class _FailingListingFS:
+    def ls(self, base, detail=False):
+        raise OSError("listing backend unavailable")
+
+    def open(self, path):
+        raise AssertionError("cached files should be opened before remote paths")
+
+
 def test_exact_full_file_fallback_survives_range_outage(
     tmp_path, monkeypatch,
 ):
@@ -199,3 +207,47 @@ def test_source_failure_is_typed_and_visible(tmp_path, monkeypatch):
     assert health["status"] == "degraded"
     assert health["source_failures_total"] == 2
     assert health["last_error_type"] == "ConnectionError"
+
+
+def test_cached_manifest_fallback_is_deterministic(tmp_path, monkeypatch):
+    import huggingface_hub
+
+    snapshot = tmp_path / "snapshot"
+    data_dir = snapshot / "data"
+    data_dir.mkdir(parents=True)
+    _make_parquet(data_dir / "b.parquet", [2, 3], rg_size=1)
+    _make_parquet(data_dir / "a.parquet", [0, 1], rg_size=1)
+
+    def _snapshot_download(**kwargs):
+        assert kwargs["repo_id"] == "owner/repo"
+        assert kwargs["revision"] == "rev"
+        assert kwargs["repo_type"] == "dataset"
+        assert kwargs["allow_patterns"] == ["data/*.parquet"]
+        assert kwargs["local_files_only"] is True
+        return str(snapshot)
+
+    def _cache_lookup(*, filename, **kwargs):
+        return str(snapshot / filename)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", _snapshot_download)
+    monkeypatch.setattr(
+        huggingface_hub, "try_to_load_from_cache", _cache_lookup
+    )
+    ds = VirtualParquetDataset(
+        "owner/repo",
+        "rev",
+        columns=["v"],
+        fs=_FailingListingFS(),
+        full_file_fallback=True,
+    )
+
+    assert [ds.get_row(i)["v"] for i in range(4)] == [0, 1, 2, 3]
+    assert ds._files == [
+        "datasets/owner/repo@rev/data/a.parquet",
+        "datasets/owner/repo@rev/data/b.parquet",
+    ]
+    health = ds.source_health()
+    assert health["status"] == "ready"
+    assert health["source_failures_total"] == 1
+    assert health["local_manifest_fallbacks_total"] == 1
+    assert health["local_full_file_hits_total"] >= 2

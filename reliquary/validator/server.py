@@ -332,6 +332,17 @@ class _Health(BaseModel):
     app_started_at: float
     current_validator_state: str
     current_window_n: int | None = None
+    last_committed_window_n: int = 0
+    candidate_window_n: int | None = None
+    window_preparation_stage: str | None = None
+    last_window_preparation_failure: dict[str, Any] | None = None
+    window_preparation_failures_total: int = 0
+    window_preparation_failures_by_stage: dict[str, int] = Field(
+        default_factory=dict
+    )
+    window_preparation_failures_by_error: dict[str, int] = Field(
+        default_factory=dict
+    )
     current_quicknet_drand_round: int | None = None
     current_window_open_ts: float | None = None
     current_window_open_drand_round: int | None = None
@@ -429,6 +440,20 @@ class ValidatorServer:
         self._registration_refresh_lock = asyncio.Lock()
         self._last_registration_refresh_attempt = 0.0
         self._training_accumulator_state: dict[str, Any] = {}
+        self._last_committed_window_n = 0
+        self._candidate_window_n: int | None = None
+        self._window_preparation_stage: str | None = None
+        self._last_window_preparation_failure: dict[str, Any] | None = None
+        self._window_preparation_failures_total = 0
+        self._window_preparation_failures_by_stage: collections.Counter[str] = (
+            collections.Counter()
+        )
+        self._window_preparation_failures_by_error: collections.Counter[str] = (
+            collections.Counter()
+        )
+        self._prompt_source_health_callback: (
+            Callable[[], dict[str, dict[str, Any]]] | None
+        ) = None
         self._prompt_source_unavailable_total = 0
         self._legacy_merkle_stats: collections.Counter[str] = (
             collections.Counter()
@@ -503,6 +528,42 @@ class ValidatorServer:
     def set_training_accumulator_state(self, state: dict[str, Any]) -> None:
         """Expose a JSON-safe snapshot through ``/health``."""
         self._training_accumulator_state = dict(state)
+
+    def set_window_preparation_state(
+        self,
+        *,
+        last_committed_window_n: int,
+        candidate_window_n: int | None,
+        stage: str | None,
+    ) -> None:
+        """Expose the pre-OPEN state without advertising a live window."""
+        self._last_committed_window_n = int(last_committed_window_n)
+        self._candidate_window_n = (
+            int(candidate_window_n) if candidate_window_n is not None else None
+        )
+        self._window_preparation_stage = stage
+
+    def record_window_preparation_failure(
+        self, failure: dict[str, Any]
+    ) -> None:
+        """Record one secret-free pre-OPEN failure for operator telemetry."""
+        safe_failure = dict(failure)
+        self._last_window_preparation_failure = safe_failure
+        self._window_preparation_failures_total += 1
+        stage = str(safe_failure.get("stage") or "unknown")
+        error_type = str(safe_failure.get("error_type") or "unknown")
+        self._window_preparation_failures_by_stage[stage] += 1
+        self._window_preparation_failures_by_error[error_type] += 1
+
+    def clear_window_preparation_failure(self) -> None:
+        self._last_window_preparation_failure = None
+
+    def configure_prompt_source_health(
+        self,
+        snapshot_callback: Callable[[], dict[str, dict[str, Any]]],
+    ) -> None:
+        """Keep source health visible even when no batcher is active yet."""
+        self._prompt_source_health_callback = snapshot_callback
 
     def configure_archive_queue_telemetry(
         self,
@@ -746,6 +807,20 @@ class ValidatorServer:
             return None
 
     def _prompt_source_health(self) -> dict[str, dict[str, Any]]:
+        if self._prompt_source_health_callback is not None:
+            try:
+                return {
+                    str(env_name): dict(snapshot)
+                    for env_name, snapshot in self._prompt_source_health_callback().items()
+                }
+            except Exception as exc:
+                return {
+                    "validator": {
+                        "status": "degraded",
+                        "last_error_type": type(exc).__name__,
+                    }
+                }
+
         batchers = dict(self._active_batchers)
         if not batchers and self.active_batcher is not None:
             env = getattr(self.active_batcher, "env", None)
@@ -812,9 +887,15 @@ class ValidatorServer:
             }
         health_status = (
             "degraded"
-            if any(
-                source.get("status") == "degraded"
-                for source in prompt_sources.values()
+            if (
+                any(
+                    source.get("status") == "degraded"
+                    for source in prompt_sources.values()
+                )
+                or (
+                    self._candidate_window_n is not None
+                    and self._last_window_preparation_failure is not None
+                )
             )
             else "ok"
         )
@@ -825,6 +906,23 @@ class ValidatorServer:
             app_started_at=self._app_started_at,
             current_validator_state=getattr(self._current_state, "value", str(self._current_state)),
             current_window_n=batcher.window_start if batcher else None,
+            last_committed_window_n=self._last_committed_window_n,
+            candidate_window_n=self._candidate_window_n,
+            window_preparation_stage=self._window_preparation_stage,
+            last_window_preparation_failure=(
+                dict(self._last_window_preparation_failure)
+                if self._last_window_preparation_failure is not None
+                else None
+            ),
+            window_preparation_failures_total=(
+                self._window_preparation_failures_total
+            ),
+            window_preparation_failures_by_stage=dict(
+                self._window_preparation_failures_by_stage
+            ),
+            window_preparation_failures_by_error=dict(
+                self._window_preparation_failures_by_error
+            ),
             current_quicknet_drand_round=self._current_drand_round_best_effort(),
             current_window_open_ts=(
                 getattr(batcher, "window_opened_wall_ts", None) if batcher else None
