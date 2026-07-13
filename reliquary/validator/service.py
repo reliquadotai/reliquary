@@ -20,6 +20,8 @@ from reliquary.constants import (
     DEFAULT_HF_REPO_ID,
     DRAND_ROUND_BACKWARD_TOLERANCE,
     ENVIRONMENT_MIX,
+    FORCED_SEED_CDF_BOUNDARY_EPSILON,
+    FORCED_SEED_CDF_ENFORCE,
     GRAD_CLIP_NORM,
     HASH_DEDUP_RETENTION_WINDOWS,
     KL_BETA,
@@ -1445,6 +1447,10 @@ class ValidationService:
                 "sigma_min": SIGMA_MIN,
                 "bootstrap_sigma_min": BOOTSTRAP_SIGMA_MIN,
                 "min_eos_probability": MIN_EOS_PROBABILITY,
+                "forced_seed_cdf_enforce": FORCED_SEED_CDF_ENFORCE,
+                "forced_seed_cdf_boundary_epsilon": (
+                    FORCED_SEED_CDF_BOUNDARY_EPSILON
+                ),
                 "logprob_is_eps": LOGPROB_IS_EPS,
                 "r2_bucket": os.getenv("R2_BUCKET_ID", "reliquary"),
                 "http_host": self.server.host,

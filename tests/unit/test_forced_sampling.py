@@ -1,4 +1,5 @@
 import hashlib
+import pytest
 import torch
 from reliquary.environment import forced_sampling as fs
 
@@ -111,3 +112,54 @@ def test_seed_consistency_truncates_to_shortest_input():
     kw = dict(t=0.6, top_k=20, top_p=0.95, stochastic_threshold=0.99)
     assert fs.seed_consistency(logits, tokens, u, **kw) == \
         _seed_consistency_reference(logits, tokens, u, **kw)
+
+
+def test_cdf_diagnostics_accepts_only_calibrated_boundary_distance():
+    logits = torch.log(torch.tensor([[0.5, 0.5]]))
+
+    near = fs.seed_consistency_diagnostics(
+        logits,
+        [0],
+        [0.5005],
+        t=1.0,
+        top_k=0,
+        top_p=1.0,
+        stochastic_threshold=0.99,
+        boundary_epsilon=0.001,
+    )
+    hard = fs.seed_consistency_diagnostics(
+        logits,
+        [0],
+        [0.5005],
+        t=1.0,
+        top_k=0,
+        top_p=1.0,
+        stochastic_threshold=0.99,
+        boundary_epsilon=0.0001,
+    )
+
+    assert near.n_exact_match == 0
+    assert near.n_boundary_match == 1
+    assert near.n_hard_mismatch == 0
+    assert near.max_cdf_miss == pytest.approx(0.0005, abs=1e-6)
+    assert hard.n_boundary_match == 0
+    assert hard.n_hard_mismatch == 1
+
+
+def test_cdf_diagnostics_checks_near_deterministic_positions_too():
+    logits = torch.tensor([[10.0, 0.0]])
+    diagnostics = fs.seed_consistency_diagnostics(
+        logits,
+        [1],
+        [0.5],
+        t=1.0,
+        top_k=0,
+        top_p=1.0,
+        stochastic_threshold=0.99,
+        boundary_epsilon=0.001,
+    )
+
+    assert diagnostics.n_stochastic == 0
+    assert diagnostics.n_exact_match == 0
+    assert diagnostics.n_hard_mismatch == 1
+    assert diagnostics.n_deterministic_hard_mismatch == 1
