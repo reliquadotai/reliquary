@@ -36,6 +36,8 @@ extra groups from an already-full environment are not used to overweight it.
 
 > **v2.3 (May 2026)**: TCP-arrival FIFO is gone. Ordering is now anchored to the drand quicknet round each submission carries (`drand_round` field), and the per-prompt single-winner short-circuit (`SUPERSEDED`) is replaced by a per-prompt cap with **emission split among all submitters** for that prompt. Co-location with the validator no longer wins the race. Full design in [docs/superpowers/specs/2026-05-15-drand-ordering-and-prompt-split-design.md](superpowers/specs/2026-05-15-drand-ordering-and-prompt-split-design.md), implementation in [PR #28](https://github.com/reliquadotai/reliquary/pull/28).
 
+> **Wire protocol v2 (July 2026)**: validator and miners must upgrade together. Every request advertises `protocol_version = 2`, computes its Merkle root with `reliquary.protocol.merkle.compute_rollouts_merkle_root`, and binds that version and root into the envelope signature. The validator recomputes the root and accepts submissions only from hotkeys currently registered on the subnet. A legacy client is rejected before quota or proof work.
+
 Every miner runs a continuous poll-submit loop:
 
 1. **Polls `/state`.** The response (`GrpoBatchState`) carries `state`, `window_n`, `checkpoint_n`, `checkpoint_repo_id`, `checkpoint_revision`, `cooldown_prompts`, and (new in v2.3) **`randomness`** — the validator's per-window seed sourced from drand-quicknet + drand-round. Use it directly as the GRAIL r_vec seed; do **not** recompute it locally from `block_hash + drand` like v2.2 miners did. (`block_hash` was dropped from the v2.3 seed entirely — see the design spec for the reasoning).
@@ -50,7 +52,9 @@ Every miner runs a continuous poll-submit loop:
 
 5. **Builds GRAIL sketches.** Runs the bit-identical HuggingFace forward pass on the proof GPU to construct sketch commitments that bind the completions to the model. The r_vec seed **must** come from `state.randomness` exactly — local re-derivation will diverge from the validator's seed and the binding check rejects with `WRONG_RANDOMNESS`.
 
-6. **Submits.** POSTs a `BatchSubmissionRequest` to `/submit` containing: `miner_hotkey`, `prompt_idx`, `window_start` (from the last `/state`), 8 rollouts, claimed rewards, GRAIL commits, `merkle_root`, `checkpoint_hash`, and **(new in v2.3) `drand_round`** — the drand quicknet round currently in progress at the wall-clock instant of the POST. Compute it as `1 + (time.time() - drand_genesis_time) // drand_period`. Quicknet's `period = 3 s` since launch.
+6. **Submits.** POSTs a `BatchSubmissionRequest` to `/submit` containing: `miner_hotkey`, `prompt_idx`, `window_start` (from the last `/state`), 8 rollouts, claimed rewards, GRAIL commits, the canonical `merkle_root`, `checkpoint_hash`, `protocol_version = 2`, and **(new in v2.3) `drand_round`** — the drand quicknet round currently in progress at the wall-clock instant of the POST. Compute the root with the shared protocol helper; it binds rollout order, tokens, reward, environment, and the complete commit. Compute the round as `1 + (time.time() - drand_genesis_time) // drand_period`. Quicknet's `period = 3 s` since launch.
+   - Sign the complete envelope after setting `protocol_version`, root, drand round, randomness, and nonce. Changing any of those fields after signing invalidates the request.
+   - The submitting hotkey must still be registered on this subnet. Registration is checked before submission quota and proof capacity are consumed.
    - The validator gates this field with **zero tolerance**: too old → `STALE_ROUND`, too new → `FUTURE_ROUND`. Network jitter that pushes your POST across a round boundary now costs the submission.
    - Pre-baking `drand_round` at sketch-build time is **wrong** — gen takes 50-100 s, so by fire time the round is 1-2 buckets stale → guaranteed `STALE_ROUND`. Compute the round just before the POST.
 
@@ -167,6 +171,11 @@ The validator emits one of the following reasons on every failed submission. Eac
 | Reason | Meaning | Action |
 |---|---|---|
 | `WINDOW_NOT_ACTIVE` | Window is in `TRAINING`, `PUBLISHING`, or `READY` — not accepting submissions | Sleep and re-poll `/state` until `state == "open"` |
+| `BAD_ENVELOPE_SIGNATURE` | The envelope is unsigned, signed by another key, or changed after signing | Use the current shared `sign_envelope` helper and sign only after every request field is final |
+| `PROTOCOL_VERSION_MISMATCH` | Client does not advertise the validator's exact wire version (`2`) | Upgrade validator-compatible miner code; do not override the version locally |
+| `MERKLE_ROOT_MISMATCH` | Claimed root does not match the canonical hash of the eight complete rollouts | Use `compute_rollouts_merkle_root` after all rollout fields are final, then sign the envelope |
+| `HOTKEY_NOT_REGISTERED` | Signature is valid, but the signer is not registered on this subnet | Register the hotkey and wait for the metagraph update before submitting |
+| `REGISTRATION_UNAVAILABLE` | Validator cannot establish a recent registration snapshot and fails closed | Retry later; validator operator should inspect chain connectivity and registration-cache age |
 | `RATE_LIMITED` | You exceeded `MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW = 8` submissions in this window | Throttle locally; the counter resets at every window boundary |
 | `BATCH_FILLED` | The batcher already accepted `B_BATCH = 8` distinct non-cooldown valid submissions — your submission can never displace one, so it's rejected before GRAIL runs (PR #22) | Fire earlier next window, or accept that this window is closed |
 | `WINDOW_MISMATCH` | `window_start` in your request doesn't match the active batcher | Refresh `/state` and retry with the current `window_n` |
@@ -187,7 +196,7 @@ The validator emits one of the following reasons on every failed submission. Eac
 | `REWARD_MISMATCH` | OpenMath local reward claim disagreed with validator recompute, or validator reward computation failed. OpenCode rewards are validator-authoritative and local placeholders are ignored. | For OpenMath, recheck completion decoding, answer parsing, prompt indexing, and env version. For OpenCode, debug generated code validity and hidden-case score through returned verdict/archive data. |
 | `GRAIL_FAIL` | Sketch differs from the validator's forward pass by more than `PROOF_SKETCH_TOLERANCE_BASE + PROOF_SKETCH_TOLERANCE_GROWTH × √position` (currently `5000 + 5 × √P`) | Same checkpoint + `attn_implementation=flash_attention_2` + matching CUDA/torch + same GPU class as validator (H200 today) |
 | `LOGPROB_MISMATCH` | Per-token log-prob deviation from validator's recompute exceeds `LOGPROB_IS_EPS = 0.10` | Same root cause as `GRAIL_FAIL` — quantization, attention kernel, or precision drift |
-| `BAD_TERMINATION` | A rollout did not terminate naturally, hit the cap without EOS, or contains EOS padding/repeated stop-token tails | Confirm generation config matches protocol. Do not force `min_new_tokens`, suppress EOS, ride the 8192 cap, or append tokens after first EOS |
+| `BAD_TERMINATION` | Too many rollouts failed natural or protocol-legal termination, a BFT shape was invalid, or the completion contains EOS padding | Use the shared forced-seed/BFT generation path, stop at first EOS, and never forge `forced` or `force_span` metadata |
 | `DISTRIBUTION_SUSPICIOUS` | Token probability distribution heuristics flagged low-entropy / cheater-like generation | Submit natural rollouts at `T_PROTO = 0.9`; avoid forced prefixes or constrained fillers |
 | `WRONG_ROLLOUT_COUNT` | Group has fewer or more than `M_ROLLOUTS = 8` rollouts | Always submit exactly 8 |
 | `BAD_SCHEMA` / `BAD_TOKENS` | Submission payload malformed | Validate against the protocol schema |
