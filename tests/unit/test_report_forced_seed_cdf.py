@@ -31,8 +31,12 @@ def _row(index: int, *, cdf_reject: bool = False) -> dict:
 
 
 def test_report_requires_time_and_volume_before_canary():
-    report = MODULE.summarize([_row(i) for i in range(100)])
+    rows = [{"schema_version": 1, "score": 0.01}]
+    rows.extend(_row(i) for i in range(100))
+    report = MODULE.summarize(rows)
+
     assert report["decision"] == "INSUFFICIENT_EVIDENCE"
+    assert report["ratio_score"]["min"] == 0.96
 
 
 def test_report_holds_on_ratio_clean_hard_mismatch():

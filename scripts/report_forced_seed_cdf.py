@@ -29,7 +29,7 @@ def _quantile(values: list[float], q: float) -> float | None:
 def summarize(rows: list[dict]) -> dict:
     v2 = [row for row in rows if int(row.get("schema_version", 1)) >= 2]
     v3 = [row for row in rows if int(row.get("schema_version", 1)) >= 3]
-    scores = [float(row.get("score", 0.0)) for row in rows]
+    scores = [float(row.get("score", 0.0)) for row in v2]
     cdf_clean = [
         row
         for row in v2
