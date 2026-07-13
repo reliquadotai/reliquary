@@ -205,7 +205,7 @@ def test_accept_in_zone_submission():
 
 
 def test_accepted_submission_uses_validator_computed_selection_digest():
-    from reliquary.validator.selection_digest import (
+    from reliquary.protocol.merkle import (
         compute_rollouts_selection_digest,
     )
 

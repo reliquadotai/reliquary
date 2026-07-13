@@ -48,7 +48,10 @@ from reliquary.protocol.submission import (
     RolloutSubmission,
     WindowState,
 )
-from reliquary.protocol.merkle import submission_merkle_matches
+from reliquary.protocol.merkle import (
+    compute_rollouts_selection_digest,
+    submission_merkle_matches,
+)
 from reliquary.protocol.tokens import verify_tokens
 from reliquary.validator.batch_selection import (
     explain_batch_selection,
@@ -75,7 +78,6 @@ from reliquary.validator.auth_forensics import (
 )
 from reliquary.validator.reward_shape import detect_reward_shape_manipulation
 from reliquary.validator.rollout_patterns import detect_opposite_reward_clones
-from reliquary.validator.selection_digest import compute_rollouts_selection_digest
 from reliquary.validator.verifier import (
     evaluate_all_token_auth_shadow,
     evaluate_code_semantic_token_authenticity,
