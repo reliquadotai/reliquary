@@ -183,9 +183,6 @@ def test_legacy_merkle_shadow_accepts_mismatch_and_exposes_telemetry():
     assert health.legacy_merkle_environments == [FakeEnv.name]
     assert health.legacy_merkle_protocol_versions == {"1": 1}
     assert health.legacy_merkle_last_mismatch_ts is not None
-    verdict = server._verdicts[_TEST_KEYPAIR.ss58_address][-1]
-    assert verdict["legacy_merkle_status"] == "mismatch"
-    assert verdict["legacy_merkle_would_reject"] is True
 
 
 def test_legacy_merkle_shadow_records_current_miner_match():

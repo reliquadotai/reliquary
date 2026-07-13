@@ -273,7 +273,6 @@ class SubmitTelemetry:
         return {
             "arrival_ts": self.t_arrival,
             "decision_ts": self.t_decision,
-            "protocol_version": self.protocol_version,
             "submitted_drand_round": self.submitted_drand_round,
             "arrival_drand_round": self.arrival_drand_round,
             "drand_delta": self.drand_delta,
@@ -282,14 +281,6 @@ class SubmitTelemetry:
             "queue_wait_ms": self.queue_wait_ms,
             "verify_ms": self.verify_ms,
             "total_ms": self.total_ms,
-            "legacy_merkle_status": self.legacy_merkle_status,
-            "legacy_merkle_computed_lead": (
-                self.legacy_merkle_computed_lead
-            ),
-            "legacy_merkle_would_reject": (
-                self.legacy_merkle_would_reject
-            ),
-            "legacy_merkle_enforced": self.legacy_merkle_enforced,
         }
 
 
