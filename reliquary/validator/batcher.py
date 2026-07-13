@@ -57,7 +57,11 @@ from reliquary.validator.batch_selection import (
     select_batch_and_distribute,
 )
 from reliquary.validator.cooldown import CooldownMap
-from reliquary.validator.dedup import RolloutHashSet, compute_rollout_hash
+from reliquary.validator.dedup import (
+    RolloutHashSet,
+    compute_logical_group_hash,
+    compute_rollout_hash,
+)
 from reliquary.validator.observability import (
     DrandRoundObservation,
     SubmitTelemetry,
@@ -439,6 +443,14 @@ class GrpoWindowBatcher:
         self._verify_signature = verify_signature_fn
 
         self._lock = threading.Lock()
+        # Validator-owned economic identity reservations. This lock is
+        # separate from ``_lock`` because HTTP admission must atomically claim
+        # a group before it enters the potentially long GPU queue.
+        self._logical_group_lock = threading.Lock()
+        self._logical_group_reservations: dict[
+            tuple[str, bytes], BatchSubmissionRequest
+        ] = {}
+        self._logical_group_duplicate_rejects = 0
         self._valid: list[ValidSubmission] = []
         # v2.3: per-prompt bucket. Multiple miners may submit on the same
         # ``prompt_idx`` up to ``MAX_SUBMISSIONS_PER_PROMPT``. Tracked
@@ -681,6 +693,56 @@ class GrpoWindowBatcher:
 
     def proof_failure_debt(self, hotkey: str) -> int:
         return self._expensive_proof_failures_by_hotkey.get(hotkey, 0)
+
+    @property
+    def logical_group_reservation_count(self) -> int:
+        with self._logical_group_lock:
+            return len(self._logical_group_reservations)
+
+    @property
+    def logical_group_duplicate_rejects(self) -> int:
+        with self._logical_group_lock:
+            return self._logical_group_duplicate_rejects
+
+    def try_reserve_logical_group(
+        self,
+        request: BatchSubmissionRequest,
+    ) -> tuple[bool, str | None]:
+        """Atomically reserve one hotkey's logical group for this window."""
+        digest = compute_logical_group_hash(request)
+        key = (request.miner_hotkey, digest)
+        with self._logical_group_lock:
+            owner = self._logical_group_reservations.get(key)
+            if owner is request and request._logical_group_reservation == key:
+                return True, None
+            if owner is not None:
+                self._logical_group_duplicate_rejects += 1
+                return False, "logical_group_duplicate"
+            self._logical_group_reservations[key] = request
+            request._logical_group_reservation = key
+            return True, None
+
+    def cancel_logical_group_reservation(
+        self,
+        request: BatchSubmissionRequest,
+    ) -> bool:
+        """Release a reservation only while its owning request has not run."""
+        key = request._logical_group_reservation
+        if key is None:
+            return False
+        with self._logical_group_lock:
+            if self._logical_group_reservations.get(key) is not request:
+                return False
+            self._logical_group_reservations.pop(key, None)
+            request._logical_group_reservation = None
+            return True
+
+    def confirm_logical_group_reservation(
+        self,
+        request: BatchSubmissionRequest,
+    ) -> None:
+        """Make a reservation permanent for the rest of this window."""
+        request._logical_group_reservation = None
 
     def try_reserve_proof_admission(
         self,
@@ -1068,6 +1130,14 @@ class GrpoWindowBatcher:
                     return reject(RejectReason.HASH_DUPLICATE, "dedup")
                 local_seen.add(h)
                 rollout_hashes.append(h)
+
+        try:
+            logical_reserved, _ = self.try_reserve_logical_group(request)
+        except (TypeError, ValueError, OverflowError):
+            return reject(RejectReason.BAD_TOKENS, "logical_dedup")
+        if not logical_reserved:
+            return reject(RejectReason.HASH_DUPLICATE, "logical_dedup")
+        self.confirm_logical_group_reservation(request)
 
         problem = self.env.get_problem(request.prompt_idx)
         validator_scored_reward = _uses_validator_authoritative_reward(self.env)

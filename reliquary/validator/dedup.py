@@ -10,7 +10,58 @@ validator startup from the recent R2 archive payloads.
 from __future__ import annotations
 
 import hashlib
-from typing import Iterable
+from typing import Any, Iterable
+
+
+_LOGICAL_GROUP_DOMAIN = b"reliquary/logical-group/v1\x00"
+
+
+def _uint_bytes(value: Any, width: int, field: str) -> bytes:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
+    try:
+        return value.to_bytes(width, "big", signed=False)
+    except OverflowError as exc:
+        raise ValueError(f"{field} does not fit in {width} bytes") from exc
+
+
+def _length_prefixed(value: bytes, field: str) -> bytes:
+    return _uint_bytes(len(value), 4, f"{field} length") + value
+
+
+def compute_logical_group_hash(request: Any) -> bytes:
+    """Hash the validator-owned economic identity of one submitted group.
+
+    The digest binds the prompt, ordered environments and ordered committed
+    token streams. It intentionally excludes miner-controlled wrappers such as
+    nonce, Merkle root, claimed rewards, commitment metadata and signatures:
+    changing those fields must not mint another claim on the same generation.
+    Window and hotkey scope are applied by ``GrpoWindowBatcher`` when reserving
+    the digest, so independent miners may still produce the same token group.
+    """
+    h = hashlib.sha256()
+    h.update(_LOGICAL_GROUP_DOMAIN)
+    h.update(_uint_bytes(request.prompt_idx, 8, "prompt_idx"))
+    h.update(_uint_bytes(len(request.rollouts), 4, "rollout count"))
+
+    for index, rollout in enumerate(request.rollouts):
+        h.update(_uint_bytes(index, 4, "rollout index"))
+        env_name = rollout.env_name
+        if not isinstance(env_name, str):
+            raise ValueError("env_name must be a string")
+        h.update(_length_prefixed(env_name.encode("utf-8"), "env_name"))
+
+        try:
+            tokens = rollout.commit["tokens"]
+        except (KeyError, TypeError) as exc:
+            raise ValueError("commit.tokens must be present") from exc
+        if not isinstance(tokens, (list, tuple)):
+            raise ValueError("commit.tokens must be a sequence")
+        h.update(_uint_bytes(len(tokens), 4, "token count"))
+        for token in tokens:
+            h.update(_uint_bytes(token, 4, "token id"))
+
+    return h.digest()
 
 
 def compute_rollout_hash(tokens: Iterable[int]) -> bytes:

@@ -970,6 +970,17 @@ class ValidatorServer:
             cancel(batcher, request)
 
     @staticmethod
+    def _cancel_logical_group_reservation(
+        batcher: Any,
+        request: BatchSubmissionRequest,
+    ) -> None:
+        cancel = getattr(
+            type(batcher), "cancel_logical_group_reservation", None
+        )
+        if cancel is not None:
+            cancel(batcher, request)
+
+    @staticmethod
     def _finish_proof_admission(
         batcher: Any,
         request: BatchSubmissionRequest,
@@ -1362,6 +1373,13 @@ class ValidatorServer:
                 )
             self._per_window_counts[hk] = n + 1
 
+            def _refund_current_quota() -> None:
+                current_count = self._per_window_counts.get(hk, 0)
+                if current_count <= 1:
+                    self._per_window_counts.pop(hk, None)
+                else:
+                    self._per_window_counts[hk] = current_count - 1
+
             def _prompt_source_unavailable(
                 exc: PromptSourceUnavailable,
             ) -> None:
@@ -1369,11 +1387,7 @@ class ValidatorServer:
                 # the exact quota reservation made above and return a typed
                 # retryable service response without creating a protocol
                 # verdict that could later be interpreted as miner fault.
-                current_count = self._per_window_counts.get(hk, 0)
-                if current_count <= 1:
-                    self._per_window_counts.pop(hk, None)
-                else:
-                    self._per_window_counts[hk] = current_count - 1
+                _refund_current_quota()
                 self._prompt_source_unavailable_total += 1
                 telemetry.refresh_from_batcher(batcher, at_decision=True)
                 telemetry.mark_decision()
@@ -1606,10 +1620,33 @@ class ValidatorServer:
                         reject_stage=preflight_stage or "preflight",
                     )
 
+                reserve_logical = getattr(
+                    type(batcher), "try_reserve_logical_group", None
+                )
+                if reserve_logical is not None:
+                    try:
+                        logical_reserved, logical_reason = reserve_logical(
+                            batcher, request
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        return _cheap_reject(
+                            RejectReason.BAD_TOKENS,
+                            reject_stage="logical_dedup",
+                        )
+                    if not logical_reserved:
+                        _refund_current_quota()
+                        return _cheap_reject(
+                            RejectReason.HASH_DUPLICATE,
+                            reject_stage="logical_dedup",
+                            logical_group_reason=logical_reason,
+                            quota_refunded=True,
+                        )
+
                 admitted, admission_reason = batcher.try_reserve_proof_admission(
                     request
                 )
                 if not admitted:
+                    self._cancel_logical_group_reservation(batcher, request)
                     if self._late_drop_callback is not None:
                         self._late_drop_callback(hk, "proof_admission_full")
                     return _cheap_reject(
@@ -1646,6 +1683,7 @@ class ValidatorServer:
                     batcher, request,
                 )
                 if not started:
+                    self._cancel_logical_group_reservation(batcher, request)
                     if self._late_drop_callback is not None:
                         self._late_drop_callback(hk, "proof_admission_full")
                     return _cheap_reject(
@@ -1717,6 +1755,7 @@ class ValidatorServer:
                 self._submit_queue.put_nowait((request, batcher, telemetry))
             except asyncio.QueueFull:
                 self._cancel_proof_admission(batcher, request)
+                self._cancel_logical_group_reservation(batcher, request)
                 if self._late_drop_callback is not None:
                     self._late_drop_callback(hk, "proof_queue_full")
                 return _cheap_reject(
@@ -1854,6 +1893,7 @@ class ValidatorServer:
             # absence) from the R2 archive.
             if batcher not in self._active_batchers.values():
                 self._cancel_proof_admission(batcher, request)
+                self._cancel_logical_group_reservation(batcher, request)
                 telemetry.refresh_from_batcher(batcher, at_decision=True)
                 telemetry.mark_decision()
                 logger.info(
@@ -1898,6 +1938,7 @@ class ValidatorServer:
             # miner inspecting late_drops sees one consistent metric.
             if batcher.is_sealed():
                 self._cancel_proof_admission(batcher, request)
+                self._cancel_logical_group_reservation(batcher, request)
                 telemetry.refresh_from_batcher(batcher, at_decision=True)
                 telemetry.mark_decision()
                 logger.info(
@@ -1935,6 +1976,7 @@ class ValidatorServer:
                 batcher, request,
             )
             if not started:
+                self._cancel_logical_group_reservation(batcher, request)
                 telemetry.refresh_from_batcher(batcher, at_decision=True)
                 telemetry.mark_decision()
                 if self._late_drop_callback is not None:

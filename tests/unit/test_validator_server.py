@@ -293,6 +293,32 @@ def test_submit_returns_queued_on_active_window():
     assert body["reason"] == RejectReason.ACCEPTED.value
 
 
+def test_logical_group_duplicate_is_rejected_quota_neutral_before_proof():
+    from reliquary.protocol.submission import WindowState
+
+    server = ValidatorServer()
+    batcher = _batcher(window_start=500)
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    client = TestClient(server.app)
+
+    first = client.post("/submit", json=_request(k=4).model_dump(mode="json"))
+    duplicate = client.post(
+        "/submit", json=_request(k=5).model_dump(mode="json")
+    )
+
+    assert first.json()["accepted"] is True
+    assert duplicate.json() == {
+        "accepted": False,
+        "reason": RejectReason.HASH_DUPLICATE.value,
+    }
+    assert server._per_window_counts == {_TEST_KEYPAIR.ss58_address: 1}
+    assert batcher.proof_grading_attempts == 1
+    assert batcher.logical_group_reservation_count == 1
+    assert batcher.logical_group_duplicate_rejects == 1
+    assert len(batcher.valid_submissions()) == 1
+
+
 @pytest.mark.parametrize("fail_at", ["length", "row"])
 def test_prompt_source_outage_is_retryable_quota_neutral_and_visible(fail_at):
     from reliquary.protocol.submission import WindowState
