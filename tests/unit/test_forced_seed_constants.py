@@ -9,6 +9,6 @@ def test_forced_seed_constants_defaults():
     assert c.FORCED_SEED_ENFORCE is True   # ships armed: merging the branch enforces
     # Clients that sample from the forced stream advertise this on the wire so
     # the operator can watch adoption in the shadow window.
-    assert c.FORCED_SEED_PROTOCOL_VERSION == 1
+    assert c.FORCED_SEED_PROTOCOL_VERSION == 2
     assert c.FORCED_SEED_CDF_BOUNDARY_EPSILON == 0.002
     assert c.FORCED_SEED_CDF_ENFORCE is False

@@ -16,6 +16,11 @@ from reliquary.protocol.submission import (
 from reliquary.validator.batcher import GrpoWindowBatcher
 
 
+def _mark_test_merkle_verified(request: BatchSubmissionRequest) -> BatchSubmissionRequest:
+    request._canonical_merkle_verified = True
+    return request
+
+
 class FakeEnv:
     name = "fake"
     def __len__(self):
@@ -101,7 +106,7 @@ def _request(
                 env_name="openmathinstruct",
             )
         )
-    return BatchSubmissionRequest(
+    request = BatchSubmissionRequest(
         miner_hotkey=hotkey,
         prompt_idx=prompt_idx,
         window_start=window_start,
@@ -109,6 +114,11 @@ def _request(
         rollouts=rollouts,
         checkpoint_hash="sha256:test",
     )
+    # These tests isolate downstream batcher stages. Production requests are
+    # marked only after the HTTP path recomputes their canonical root; tests
+    # targeting the root invariant explicitly clear this private marker.
+    request._canonical_merkle_verified = True
+    return request
 
 
 def _request_with_prompt_unique_tokens(
@@ -208,6 +218,23 @@ def test_accepted_submission_uses_validator_computed_selection_digest():
         req.rollouts
     )
     assert accepted.selection_digest_bytes == accepted.selection_digest
+
+
+def test_direct_batcher_recomputes_canonical_merkle_root():
+    from reliquary.protocol.merkle import compute_rollouts_merkle_root
+
+    b = _make_batcher()
+    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+    req.merkle_root = compute_rollouts_merkle_root(req.rollouts)
+    req._canonical_merkle_verified = False
+    assert b.accept_submission(req).accepted is True
+
+    b = _make_batcher()
+    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+    req.merkle_root = "ff" * 32
+    req._canonical_merkle_verified = False
+    response = b.accept_submission(req)
+    assert response.reason == RejectReason.MERKLE_ROOT_MISMATCH
 
 
 def test_ingestion_resets_miner_supplied_truncated_flag():
@@ -511,6 +538,7 @@ def test_reject_reward_mismatch():
         rollouts=rollouts,
         checkpoint_hash="sha256:test",
     )
+    _mark_test_merkle_verified(req)
     resp = b.accept_submission(req)
     assert resp.accepted is False
     assert resp.reason == RejectReason.REWARD_MISMATCH
@@ -678,12 +706,12 @@ def _request_v21(prompt_idx=42, window_start=500,
                 env_name="openmathinstruct",
             )
         )
-    return BatchSubmissionRequest(
+    return _mark_test_merkle_verified(BatchSubmissionRequest(
         miner_hotkey=hotkey, prompt_idx=prompt_idx,
         window_start=window_start,
         merkle_root="00" * 32, rollouts=rollouts,
         checkpoint_hash=checkpoint_hash,
-    )
+    ))
 
 
 def test_reject_wrong_checkpoint():
@@ -814,12 +842,12 @@ def _request_with_prompt_tokens(
                 env_name="openmathinstruct",
             )
         )
-    return BatchSubmissionRequest(
+    return _mark_test_merkle_verified(BatchSubmissionRequest(
         miner_hotkey=hotkey, prompt_idx=prompt_idx,
         window_start=500,
         merkle_root="00" * 32, rollouts=rollouts,
         checkpoint_hash="",  # gate disabled for these tests
-    )
+    ))
 
 
 def test_prompt_mismatch_rejected_when_canonical_differs():
@@ -1631,6 +1659,7 @@ def test_hash_dup_intra_submission_collision_rejects():
         miner_hotkey="hk", prompt_idx=42, window_start=500,
         merkle_root="00" * 32, rollouts=rollouts, checkpoint_hash="sha256:test",
     )
+    _mark_test_merkle_verified(req)
 
     b = _make_batcher(hash_set=hs)
     resp = b.accept_submission(req)

@@ -717,7 +717,7 @@ FORCED_SEED_CDF_ENFORCE = _os.environ.get(
 FORCED_SEED_ENFORCE = _os.environ.get(
     "FORCED_SEED_ENFORCE", "true"
 ).strip().lower() in ("1", "true", "yes", "on")
-# Wire-advertised on BatchSubmissionRequest.protocol_version by clients that
-# sample from the forced stream (0 = legacy/pre-forced-seed). Lets the operator
-# track adoption in the shadow window before arming enforcement.
-FORCED_SEED_PROTOCOL_VERSION = 1
+# Wire-advertised on BatchSubmissionRequest.protocol_version. Version 2 adds
+# validator-recomputed canonical Merkle roots and binds each rollout's env_name
+# into that root. Version 0 remains the legacy/default schema sentinel.
+FORCED_SEED_PROTOCOL_VERSION = 2

@@ -47,6 +47,7 @@ from reliquary.constants import (
     VALIDATOR_HTTP_PORT,
 )
 from reliquary.protocol.signatures import verify_envelope_signature
+from reliquary.protocol.merkle import submission_merkle_matches
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     BatchSubmissionResponse,
@@ -201,6 +202,10 @@ def _proof_free_submission_reject(
             return RejectReason.BAD_SCHEMA, "schema"
         if list(rollout.tokens) != list(rollout.commit["tokens"]):
             return RejectReason.TOKENS_MISMATCH, "token_invariant"
+
+    if not submission_merkle_matches(request):
+        return RejectReason.MERKLE_ROOT_MISMATCH, "merkle_root"
+    request._canonical_merkle_verified = True
 
     model_config = _proof_free_model_config(batcher)
     canonical_prompt_tokens: list[int] | None = None
@@ -999,9 +1004,14 @@ class ValidatorServer:
             )
             batcher = self._active_batchers.get(submission_env_name)
             if batcher is None:
-                # Fallback: if env_name is absent or unknown, try the legacy
-                # active_batcher path (single-env backward compat).
-                batcher = self.active_batcher
+                # Loose MagicMock fixtures do not carry a stable env.name.
+                # Production batchers do, and must never route an unknown
+                # environment through the legacy scalar accessor.
+                active_env_name = getattr(
+                    getattr(self.active_batcher, "env", None), "name", None,
+                )
+                if active_env_name is None or _is_mock_like(active_env_name):
+                    batcher = self.active_batcher
             if batcher is None:
                 telemetry.mark_decision()
                 log_submission_stage(

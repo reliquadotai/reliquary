@@ -48,6 +48,7 @@ from reliquary.protocol.submission import (
     RolloutSubmission,
     WindowState,
 )
+from reliquary.protocol.merkle import submission_merkle_matches
 from reliquary.protocol.tokens import verify_tokens
 from reliquary.validator.batch_selection import (
     explain_batch_selection,
@@ -1003,6 +1004,11 @@ class GrpoWindowBatcher:
                 return reject(RejectReason.BAD_SCHEMA, "schema")
             if list(rollout.tokens) != list(rollout.commit["tokens"]):
                 return reject(RejectReason.TOKENS_MISMATCH, "token_invariant")
+
+        if not request._canonical_merkle_verified:
+            if not submission_merkle_matches(request):
+                return reject(RejectReason.MERKLE_ROOT_MISMATCH, "merkle_root")
+            request._canonical_merkle_verified = True
 
         # Proof-free checks before reward and GRAIL. These reject malformed
         # payloads before tokenizer decode, env reward work, or GPU proof work.

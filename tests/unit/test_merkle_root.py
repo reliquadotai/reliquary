@@ -3,6 +3,10 @@
 from dataclasses import dataclass
 
 from reliquary.miner.engine import _compute_merkle_root
+from reliquary.protocol.merkle import (
+    compute_rollouts_merkle_root,
+    submission_merkle_matches,
+)
 
 
 @dataclass
@@ -39,3 +43,36 @@ def test_merkle_root_changes_when_reward_differs():
     r1 = [_R(tokens=[1], reward=1.0, commit={})]
     r2 = [_R(tokens=[1], reward=0.0, commit={})]
     assert _compute_merkle_root(r1) != _compute_merkle_root(r2)
+
+
+def test_miner_wrapper_uses_protocol_canonical_root():
+    rollouts = [
+        _R(tokens=[1, 2], reward=1.0, commit={"tokens": [1, 2]}),
+        _R(tokens=[3, 4], reward=0.0, commit={"tokens": [3, 4]}),
+    ]
+    assert _compute_merkle_root(rollouts) == compute_rollouts_merkle_root(rollouts)
+
+
+def test_submission_root_match_detects_claim_mutation():
+    from types import SimpleNamespace
+
+    rollouts = [_R(tokens=[1], reward=1.0, commit={"tokens": [1]})]
+    request = SimpleNamespace(
+        rollouts=rollouts,
+        merkle_root=compute_rollouts_merkle_root(rollouts),
+    )
+    assert submission_merkle_matches(request) is True
+    request.merkle_root = "00" * 32
+    assert submission_merkle_matches(request) is False
+
+
+def test_merkle_root_binds_environment_name():
+    rollout = {
+        "tokens": [1],
+        "reward": 1.0,
+        "commit": {"tokens": [1]},
+        "env_name": "openmathinstruct",
+    }
+    math_root = compute_rollouts_merkle_root([rollout])
+    rollout["env_name"] = "opencodeinstruct"
+    assert compute_rollouts_merkle_root([rollout]) != math_root
