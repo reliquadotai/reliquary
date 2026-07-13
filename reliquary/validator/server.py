@@ -1660,8 +1660,8 @@ class ValidatorServer:
                 )
                 if reserve_logical is not None:
                     try:
-                        logical_reserved, logical_reason = reserve_logical(
-                            batcher, request
+                        logical_reserved, logical_reason = await asyncio.to_thread(
+                            reserve_logical, batcher, request
                         )
                     except (TypeError, ValueError, OverflowError):
                         return _cheap_reject(

@@ -325,6 +325,32 @@ def test_logical_group_duplicate_is_rejected_quota_neutral_before_proof():
     }
 
 
+def test_logical_group_digest_runs_off_event_loop(monkeypatch):
+    from reliquary.protocol.submission import WindowState
+    from reliquary.validator import server as server_module
+
+    server = ValidatorServer()
+    batcher = _batcher(window_start=500)
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    original_to_thread = server_module.asyncio.to_thread
+    offloaded = []
+
+    async def tracking_to_thread(func, *args, **kwargs):
+        if func is GrpoWindowBatcher.try_reserve_logical_group:
+            offloaded.append(func)
+        return await original_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(server_module.asyncio, "to_thread", tracking_to_thread)
+
+    response = TestClient(server.app).post(
+        "/submit", json=_request().model_dump(mode="json")
+    )
+
+    assert response.json()["accepted"] is True
+    assert offloaded == [GrpoWindowBatcher.try_reserve_logical_group]
+
+
 @pytest.mark.parametrize("fail_at", ["length", "row"])
 def test_prompt_source_outage_is_retryable_quota_neutral_and_visible(fail_at):
     from reliquary.protocol.submission import WindowState
