@@ -1547,7 +1547,7 @@ class ValidatorServer:
                     trigger_round=trigger_round,
                 )
             try:
-                environment_size = len(batcher.env)
+                environment_size = await asyncio.to_thread(len, batcher.env)
             except PromptSourceUnavailable as exc:
                 _prompt_source_unavailable(exc)
             if request.prompt_idx >= environment_size:
@@ -1581,7 +1581,9 @@ class ValidatorServer:
             prompt_loader = getattr(batcher.env, "get_problem", None)
             if callable(prompt_loader) and not _is_mock_like(prompt_loader):
                 try:
-                    prompt_loader(request.prompt_idx)
+                    await asyncio.to_thread(
+                        prompt_loader, request.prompt_idx
+                    )
                 except PromptSourceUnavailable as exc:
                     _prompt_source_unavailable(exc)
 
