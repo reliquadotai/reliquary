@@ -2,6 +2,7 @@
 exposes select_batch at window close."""
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -1683,6 +1684,58 @@ def test_hash_dup_accept_when_not_in_set():
     stored = b.valid_submissions()[0]
     assert len(stored.rollout_hashes) == M_ROLLOUTS
     assert all(isinstance(h, bytes) and len(h) == 32 for h in stored.rollout_hashes)
+
+
+def test_logical_group_duplicate_rejects_same_hotkey_wrapper_grind():
+    """Changing wrapper metadata cannot mint a second in-window claim."""
+    b = _make_batcher()
+    first = _request(hotkey="hk-copy")
+    second = _request(hotkey="hk-copy")
+    second.merkle_root = "ff" * 32
+    second.nonce = "new-wrapper"
+    for rollout in second.rollouts:
+        rollout.reward += 0.01
+
+    assert b.accept_submission(first).accepted is True
+    duplicate = b.accept_submission(second)
+
+    assert duplicate.accepted is False
+    assert duplicate.reason == RejectReason.HASH_DUPLICATE
+    assert b.logical_group_reservation_count == 1
+    assert b.logical_group_duplicate_rejects == 1
+    assert len(b.valid_submissions()) == 1
+
+
+def test_logical_group_identity_is_scoped_per_hotkey():
+    b = _make_batcher()
+
+    assert b.accept_submission(_request(hotkey="hk-a")).accepted is True
+    assert b.accept_submission(_request(hotkey="hk-b")).accepted is True
+    assert b.logical_group_reservation_count == 2
+
+
+def test_logical_group_reservation_can_cancel_before_proof_start():
+    b = _make_batcher()
+    request = _request(hotkey="hk-retry")
+
+    assert b.try_reserve_logical_group(request) == (True, None)
+    assert b.cancel_logical_group_reservation(request) is True
+    assert b.logical_group_reservation_count == 0
+    assert b.try_reserve_logical_group(request) == (True, None)
+
+
+def test_logical_group_reservation_is_atomic_under_race():
+    b = _make_batcher()
+    requests = [
+        _request(hotkey="hk-race").model_copy(deep=True) for _ in range(16)
+    ]
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        results = list(pool.map(b.try_reserve_logical_group, requests))
+
+    assert sum(admitted for admitted, _ in results) == 1
+    assert b.logical_group_reservation_count == 1
+    assert b.logical_group_duplicate_rejects == 15
 
 
 def test_seal_batch_populates_hash_set():

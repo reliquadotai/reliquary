@@ -1,6 +1,33 @@
 """Unit tests for hash-dedup primitives."""
 
+from copy import deepcopy
+from types import SimpleNamespace
+
 from reliquary.protocol.submission import RejectReason
+
+
+def _logical_request(
+    *,
+    prompt_idx: int = 7,
+    env_name: str = "openmathinstruct",
+    token_groups: list[list[int]] | None = None,
+):
+    groups = token_groups or [[1, 2, 3], [4, 5, 6]]
+    rollouts = [
+        SimpleNamespace(
+            env_name=env_name,
+            commit={"tokens": list(tokens)},
+            reward=float(index),
+        )
+        for index, tokens in enumerate(groups)
+    ]
+    return SimpleNamespace(
+        prompt_idx=prompt_idx,
+        rollouts=rollouts,
+        nonce="nonce-a",
+        merkle_root="00" * 32,
+        envelope_signature="aa",
+    )
 
 
 def test_hash_duplicate_reject_reason_exists():
@@ -33,6 +60,56 @@ def test_compute_rollout_hash_rejects_negative_tokens():
     from reliquary.validator.dedup import compute_rollout_hash
     with pytest.raises(ValueError):
         compute_rollout_hash([1, -2, 3])
+
+
+def test_logical_group_hash_is_deterministic_and_domain_sized():
+    from reliquary.validator.dedup import compute_logical_group_hash
+
+    request = _logical_request()
+    assert compute_logical_group_hash(request) == compute_logical_group_hash(
+        deepcopy(request)
+    )
+    assert len(compute_logical_group_hash(request)) == 32
+
+
+def test_logical_group_hash_ignores_mutable_wrapper_metadata():
+    from reliquary.validator.dedup import compute_logical_group_hash
+
+    original = _logical_request()
+    changed = deepcopy(original)
+    changed.nonce = "nonce-b"
+    changed.merkle_root = "ff" * 32
+    changed.envelope_signature = "bb"
+    for rollout in changed.rollouts:
+        rollout.reward += 100.0
+        rollout.commit["signature"] = "changed"
+
+    assert compute_logical_group_hash(original) == compute_logical_group_hash(
+        changed
+    )
+
+
+def test_logical_group_hash_binds_prompt_env_order_and_tokens():
+    from reliquary.validator.dedup import compute_logical_group_hash
+
+    original = _logical_request()
+    variants = [
+        _logical_request(prompt_idx=8),
+        _logical_request(env_name="opencodeinstruct"),
+        _logical_request(token_groups=[[4, 5, 6], [1, 2, 3]]),
+        _logical_request(token_groups=[[1, 2, 3], [4, 5, 7]]),
+    ]
+
+    original_hash = compute_logical_group_hash(original)
+    assert all(compute_logical_group_hash(v) != original_hash for v in variants)
+
+
+def test_logical_group_hash_rejects_invalid_token_id():
+    import pytest
+    from reliquary.validator.dedup import compute_logical_group_hash
+
+    with pytest.raises(ValueError, match="token id"):
+        compute_logical_group_hash(_logical_request(token_groups=[[1, -1]]))
 
 
 def test_hashset_empty_does_not_contain():
