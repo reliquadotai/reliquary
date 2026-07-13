@@ -292,8 +292,8 @@ def test_out_of_zone_does_not_charge_grail_candidate():
     charged only AFTER the reward-zone gate passes, so a degenerate submission
     never consumes it — no refund needed, and a high out_of_zone rate (e.g.
     opencode's binary rewards) cannot starve the env below B distinct. The
-    grading-attempts ceiling (anti-DoS / queue bound) IS charged at admission,
-    so flood protection still holds.
+    grading-attempts capacity (anti-DoS / queue bound) IS reserved at admission,
+    then charged irreversibly only when grading starts.
     """
     b = _make_batcher()
     req = _request(rewards=[1.0] * 8, hotkey="hkz")  # degenerate -> out_of_zone
@@ -301,9 +301,15 @@ def test_out_of_zone_does_not_charge_grail_candidate():
     admitted, _ = b.try_reserve_proof_admission(req)
     assert admitted
     assert b.proof_admission_count == 0      # GRAIL budget NOT charged at admission
-    assert b.proof_grading_attempts == 1     # grading ceiling charged
+    assert b.proof_grading_attempts == 0
+    assert b.pending_proof_reservations == 1
+    assert b.start_proof_admission(req) == (True, None)
+    assert b.proof_grading_attempts == 1
 
-    resp = b.accept_submission(req)
+    try:
+        resp = b.accept_submission(req)
+    finally:
+        b.finish_proof_admission(req)
     assert resp.reason == RejectReason.OUT_OF_ZONE
 
     assert b.proof_admission_count == 0      # never reached GRAIL -> never charged
@@ -323,7 +329,11 @@ def test_grading_attempts_ceiling_blocks_admission(monkeypatch):
         req = _request(rewards=[1.0] * 8, hotkey=f"hk{i}")
         ok, _ = b.try_reserve_proof_admission(req)
         assert ok
-        b.accept_submission(req)  # out_of_zone -> never charges GRAIL budget
+        assert b.start_proof_admission(req) == (True, None)
+        try:
+            b.accept_submission(req)  # out_of_zone -> never charges GRAIL budget
+        finally:
+            b.finish_proof_admission(req)
 
     assert b.proof_admission_count == 0          # GRAIL budget never charged
     assert b.proof_grading_attempts == 3         # ceiling reached, not refunded
@@ -333,6 +343,69 @@ def test_grading_attempts_ceiling_blocks_admission(monkeypatch):
     )
     assert ok is False
     assert reason == "proof_grading_attempts_full"
+
+
+def test_cancelled_pending_reservation_returns_unused_capacity(monkeypatch):
+    import reliquary.validator.batcher as batcher_mod
+
+    monkeypatch.setattr(batcher_mod, "MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW", 1)
+    b = _make_batcher()
+    dropped = _request(hotkey="hk-drop")
+    replacement = _request(prompt_idx=43, hotkey="hk-replacement")
+
+    assert b.try_reserve_proof_admission(dropped) == (True, None)
+    assert b.try_reserve_proof_admission(replacement) == (
+        False,
+        "proof_grading_attempts_full",
+    )
+    assert b.cancel_proof_admission(dropped) is True
+    assert b.proof_grading_attempts == 0
+    assert b.pending_proof_reservations == 0
+    assert b.try_reserve_proof_admission(replacement) == (True, None)
+
+
+def test_started_attempt_is_never_refunded(monkeypatch):
+    import reliquary.validator.batcher as batcher_mod
+
+    monkeypatch.setattr(batcher_mod, "MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW", 1)
+    b = _make_batcher()
+    started = _request(hotkey="hk-started")
+    later = _request(prompt_idx=43, hotkey="hk-later")
+
+    assert b.try_reserve_proof_admission(started) == (True, None)
+    assert b.start_proof_admission(started) == (True, None)
+    b.finish_proof_admission(started)
+
+    assert b.proof_grading_attempts == 1
+    assert b.inflight_proof_reservations == 0
+    assert b.try_reserve_proof_admission(later) == (
+        False,
+        "proof_grading_attempts_full",
+    )
+
+
+def test_pending_burst_rechecks_hotkey_debt_at_proof_start():
+    from reliquary.constants import (
+        MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW,
+    )
+
+    b = _make_batcher()
+    pending = _request(hotkey="hk-burst")
+    assert b.try_reserve_proof_admission(pending) == (True, None)
+    for _ in range(MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW):
+        b._reject(
+            RejectReason.TOKEN_TAMPERED,
+            hotkey="hk-burst",
+            prompt_idx=42,
+            reject_stage="forced_seed",
+        )
+
+    assert b.start_proof_admission(pending) == (
+        False,
+        "proof_failure_debt_hotkey",
+    )
+    assert b.pending_proof_reservations == 0
+    assert b.proof_grading_attempts == 0
 
 
 def test_reject_manufactured_opposite_reward_clones_before_grail_compute():
@@ -1791,7 +1864,12 @@ def test_admission_gated_by_grading_ceiling_not_grail_budget():
         assert admitted is True, (i, reason)
         assert reason is None
     assert b.proof_admission_count == 0          # admission never charges GRAIL
-    assert b.proof_grading_attempts == MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+    assert b.proof_grading_attempts == 0
+    assert b.pending_proof_reservations == MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+    assert (
+        b.proof_grading_capacity_used
+        == MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+    )
 
     # One past the grading ceiling is the anti-DoS bound that does reject.
     admitted, reason = b.try_reserve_proof_admission(
@@ -1811,9 +1889,14 @@ def test_grail_candidate_reserved_after_zone_gate():
     admitted, _ = b.try_reserve_proof_admission(req)
     assert admitted
     assert b.proof_admission_count == 0      # GRAIL not charged at admission
-    assert b.proof_grading_attempts == 1
+    assert b.proof_grading_attempts == 0
+    assert b.pending_proof_reservations == 1
+    assert b.start_proof_admission(req) == (True, None)
 
-    resp = b.accept_submission(req)
+    try:
+        resp = b.accept_submission(req)
+    finally:
+        b.finish_proof_admission(req)
     assert resp.accepted is True, resp.reason
     assert b.proof_admission_count == 1      # charged once the zone gate passed
 
@@ -1862,6 +1945,29 @@ def test_proof_admission_rejects_hotkey_after_expensive_failure_debt():
     )
 
 
+@pytest.mark.parametrize(
+    "stage",
+    [
+        "force_span",
+        "token_authenticity",
+        "all_token_authenticity",
+        "code_semantic_auth",
+        "forced_seed",
+    ],
+)
+def test_integrity_failures_all_accrue_proof_debt(stage):
+    b = _make_batcher()
+
+    b._reject(
+        RejectReason.TOKEN_TAMPERED,
+        hotkey="hk-integrity",
+        prompt_idx=42,
+        reject_stage=stage,
+    )
+
+    assert b.proof_failure_debt("hk-integrity") == 1
+
+
 def test_proof_failure_debt_ignores_pre_proof_reject_stages():
     """Reward/zone/schema rejects can happen after HTTP reservation in some
     test paths, but they are not the post-proof failure pattern being
@@ -1895,14 +2001,17 @@ def test_proof_admission_post_trigger_cap_rejects_same_round_tail():
 
     b = _make_batcher()
     b._seal_trigger_round = 100
-    req = _request()
-    req.drand_round = 100
-
-    for _ in range(MAX_POST_TRIGGER_PROOF_CANDIDATES):
+    requests = []
+    for i in range(MAX_POST_TRIGGER_PROOF_CANDIDATES):
+        req = _request(prompt_idx=i, hotkey=f"hk{i}")
+        req.drand_round = 100
+        requests.append(req)
         admitted, reason = b.try_reserve_proof_admission(req)
         assert admitted is True
         assert reason is None
 
+    req = _request(prompt_idx=999, hotkey="hk-tail")
+    req.drand_round = 100
     admitted, reason = b.try_reserve_proof_admission(req)
     assert admitted is False
     assert reason == "proof_admission_post_trigger_full"

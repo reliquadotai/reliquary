@@ -151,14 +151,21 @@ VALIDATOR_HTTP_PORT = 8888
 
 # Hard ceiling on total grading attempts (reward computation) admitted per
 # window — the anti-DoS / queue bound and the outer cap on GPU proof work.
-# Counts every admitted submission and is never refunded, so a degenerate-reward
-# flood cannot grow the unbounded submit queue or saturate the grader pool.
+# Counts every grading attempt that actually starts and is never refunded.
+# Pending work reserves capacity separately, so a degenerate-reward flood cannot
+# grow the bounded submit queue or saturate the grader pool while discarded
+# queue items do not burn work that never ran.
 # There is no separate per-window GRAIL candidate budget: the drand-anchored
 # 8-distinct seal, this ceiling and the seal drain timeout bound the work. The
 # old MAX_PROOF_CANDIDATES_PER_WINDOW (32) was a pre-seal-drand relic that only
 # starved honest late arrivals when earlier candidates failed a post-reservation
 # gate (e.g. forced-seed) without refund.
 MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW = 96
+
+# Absolute server-side bound across active and draining environment queues.
+# Per-batcher reservation caps remain the primary bound; this is the final
+# backstop during a window swap or prolonged GPU stall.
+MAX_PENDING_PROOF_QUEUE_DEPTH = 256
 
 # A hotkey that repeatedly reaches the expensive proof path and then fails
 # behavioural/integrity checks should not be allowed to consume the whole

@@ -565,6 +565,27 @@ def test_submit_returns_submitted_under_worker_path():
     assert body["reason"] == "submitted"
 
 
+def test_full_server_queue_returns_pending_proof_reservation():
+    import asyncio
+    from reliquary.protocol.submission import WindowState
+
+    server = ValidatorServer()
+    batcher = _batcher(window_start=500)
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    server._worker_task = object()
+    server._submit_queue = asyncio.Queue(maxsize=1)
+    server._submit_queue.put_nowait((object(), object()))
+
+    response = TestClient(server.app).post(
+        "/submit", json=_request().model_dump(mode="json"),
+    )
+
+    assert response.json()["reason"] == RejectReason.BATCH_FILLED.value
+    assert batcher.pending_proof_reservations == 0
+    assert batcher.proof_grading_attempts == 0
+
+
 # --- worker drops items whose batcher is no longer active ---
 
 @pytest.mark.asyncio
@@ -592,7 +613,9 @@ async def test_worker_drops_late_items_for_stale_batcher():
     # Active is the new batcher. The queue has a leftover stale item plus
     # one for the new batcher.
     server.set_active_batcher(new_batcher)
-    await server._submit_queue.put((_request(prompt_idx=11), old_batcher))
+    old_request = _request(prompt_idx=11)
+    assert old_batcher.try_reserve_proof_admission(old_request) == (True, None)
+    await server._submit_queue.put((old_request, old_batcher))
     await server._submit_queue.put((_request(prompt_idx=22), new_batcher))
 
     # Run the worker just long enough to drain both items.
@@ -612,3 +635,5 @@ async def test_worker_drops_late_items_for_stale_batcher():
     assert accept_calls == [22], (
         f"expected only prompt 22 to be processed, got {accept_calls}"
     )
+    assert old_batcher.pending_proof_reservations == 0
+    assert old_batcher.proof_grading_attempts == 0
