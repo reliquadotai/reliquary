@@ -734,24 +734,6 @@ def _gpu_natural_close_forced_pick_diagnostics(
     return False, min_miss
 
 
-def _gpu_natural_close_forced_pick(
-    logits_gpu: torch.Tensor,
-    tokens: list[int],
-    prompt_length: int,
-    completion_length: int,
-    seq_len: int,
-    tokenizer: Any,
-    seed_u_values: list[float],
-    rollout_meta: dict,
-) -> bool | None:
-    """Compatibility wrapper returning only exact natural-close status."""
-    exact, _ = _gpu_natural_close_forced_pick_diagnostics(
-        logits_gpu, tokens, prompt_length, completion_length, seq_len,
-        tokenizer, seed_u_values, rollout_meta,
-    )
-    return exact
-
-
 def _gpu_p_stop(
     logits_gpu: torch.Tensor,
     seq_len: int,
