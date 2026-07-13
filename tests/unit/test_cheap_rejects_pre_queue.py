@@ -19,7 +19,10 @@ from unittest.mock import MagicMock
 
 from fastapi.testclient import TestClient
 
-from reliquary.constants import MAX_SUBMISSIONS_PER_PROMPT
+from reliquary.constants import (
+    FORCED_SEED_PROTOCOL_VERSION,
+    MAX_SUBMISSIONS_PER_PROMPT,
+)
 from reliquary.protocol.submission import (
     BatchSubmissionResponse, RejectReason, WindowState,
 )
@@ -53,6 +56,7 @@ def _submission(prompt_idx: int = 42, checkpoint_hash: str = "sha256:current",
         "rollouts": [{"tokens": list(range(36)), "reward": 1.0, "commit": commit, "env_name": "openmathinstruct"}] * 8,
         "checkpoint_hash": checkpoint_hash,
         "drand_round": drand_round,
+        "protocol_version": FORCED_SEED_PROTOCOL_VERSION,
     }
     payload["merkle_root"] = compute_rollouts_merkle_root(payload["rollouts"])
     return payload

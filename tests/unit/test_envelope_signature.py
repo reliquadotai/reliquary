@@ -32,12 +32,17 @@ import bittensor as bt
 import pytest
 from fastapi.testclient import TestClient
 
-from reliquary.constants import CHALLENGE_K, M_ROLLOUTS
+from reliquary.constants import (
+    CHALLENGE_K,
+    FORCED_SEED_PROTOCOL_VERSION,
+    M_ROLLOUTS,
+)
 from reliquary.protocol.signatures import (
     build_envelope_binding,
     sign_envelope,
     verify_envelope_signature,
 )
+from reliquary.protocol.merkle import compute_rollouts_merkle_root
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     RolloutSubmission,
@@ -138,12 +143,12 @@ def _signed_request(
                 tokens=commit["tokens"],
                 reward=reward,
                 commit=commit,
-                env_name="openmathinstruct",
+                env_name="fake",
             )
         )
     if nonce is None:
         nonce = os.urandom(12).hex()
-    merkle_root = "00" * 32
+    merkle_root = compute_rollouts_merkle_root(rollouts)
 
     # Build a wallet-like object exposing .hotkey.sign(...).
     class _W:
@@ -160,6 +165,7 @@ def _signed_request(
         merkle_root=merkle_root,
         checkpoint_hash=checkpoint_hash,
         drand_round=drand_round,
+        protocol_version=FORCED_SEED_PROTOCOL_VERSION,
         randomness=randomness,
         nonce=nonce,
     ).hex()
@@ -171,6 +177,7 @@ def _signed_request(
         rollouts=rollouts,
         checkpoint_hash=checkpoint_hash,
         drand_round=drand_round,
+        protocol_version=FORCED_SEED_PROTOCOL_VERSION,
         nonce=nonce,
         envelope_signature=sig,
     )
@@ -190,6 +197,7 @@ def test_envelope_binding_is_deterministic():
         merkle_root="ab" * 32,
         checkpoint_hash="sha256:ckpt",
         drand_round=12345,
+        protocol_version=FORCED_SEED_PROTOCOL_VERSION,
         randomness="cd" * 16,
         nonce="abcd1234",
     )
@@ -208,6 +216,7 @@ def test_envelope_binding_is_deterministic():
         ("merkle_root", "ff" * 32),
         ("checkpoint_hash", "sha256:other"),
         ("drand_round", 12346),
+        ("protocol_version", FORCED_SEED_PROTOCOL_VERSION + 1),
         ("randomness", "ef" * 16),
         ("nonce", "abcd1235"),
     ],
@@ -223,6 +232,7 @@ def test_envelope_binding_changes_on_each_field(field, bad_value):
         merkle_root="ab" * 32,
         checkpoint_hash="sha256:ckpt",
         drand_round=12345,
+        protocol_version=FORCED_SEED_PROTOCOL_VERSION,
         randomness="cd" * 16,
         nonce="abcd1234",
     )
@@ -253,6 +263,7 @@ def test_sign_envelope_round_trips_through_verify():
         merkle_root="ab" * 32,
         checkpoint_hash="sha256:ckpt",
         drand_round=12345,
+        protocol_version=FORCED_SEED_PROTOCOL_VERSION,
         randomness="cd" * 16,
         nonce="nonce-1",
     )
@@ -272,6 +283,7 @@ def test_sign_envelope_round_trips_through_verify():
         ("prompt_idx", 999),
         ("merkle_root", "00" * 32),
         ("drand_round", 99999),
+        ("protocol_version", FORCED_SEED_PROTOCOL_VERSION + 1),
         ("randomness", "00" * 16),
         ("nonce", "tampered-nonce"),
     ],
@@ -291,6 +303,7 @@ def test_tampering_invalidates_signature(tamper_field, tamper_value):
         merkle_root="ab" * 32,
         checkpoint_hash="sha256:ckpt",
         drand_round=12345,
+        protocol_version=FORCED_SEED_PROTOCOL_VERSION,
         randomness="cd" * 16,
         nonce="nonce-1",
     )
@@ -320,6 +333,7 @@ def test_signature_under_different_hotkey_rejected():
         merkle_root="ab" * 32,
         checkpoint_hash="sha256:ckpt",
         drand_round=12345,
+        protocol_version=FORCED_SEED_PROTOCOL_VERSION,
         randomness="cd" * 16,
         nonce="nonce-1",
     )
@@ -398,6 +412,7 @@ def test_submit_rejects_spoofed_hotkey(enforce_envelope):
         merkle_root="00" * 32,
         checkpoint_hash="sha256:test",
         drand_round=0,
+        protocol_version=FORCED_SEED_PROTOCOL_VERSION,
         randomness="cd" * 16,
         nonce="attack",
     )
@@ -413,7 +428,7 @@ def test_submit_rejects_spoofed_hotkey(enforce_envelope):
             tokens=commit["tokens"],
             reward=float(i < 4),
             commit=commit,
-            env_name="openmathinstruct",
+            env_name="fake",
         ))
     # ``randomness`` is signed over but not a wire field — drop it before
     # constructing the request body.
@@ -466,7 +481,7 @@ def test_bad_signature_does_not_consume_victim_quota(enforce_envelope):
             tokens=commit["tokens"],
             reward=float(i < 4),
             commit=commit,
-            env_name="openmathinstruct",
+            env_name="fake",
         ))
     bad_req = BatchSubmissionRequest(
         miner_hotkey=kp_victim.ss58_address,

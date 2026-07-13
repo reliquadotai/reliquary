@@ -6,7 +6,11 @@ import bittensor as bt
 import pytest
 from fastapi.testclient import TestClient
 
-from reliquary.constants import CHALLENGE_K, M_ROLLOUTS
+from reliquary.constants import (
+    CHALLENGE_K,
+    FORCED_SEED_PROTOCOL_VERSION,
+    M_ROLLOUTS,
+)
 from reliquary.protocol.signatures import sign_envelope
 from reliquary.protocol.merkle import compute_rollouts_merkle_root
 from reliquary.protocol.submission import (
@@ -108,6 +112,7 @@ def _request(
     k=4,
     checkpoint_hash="sha256:test",
     randomness="cd" * 16,
+    protocol_version=FORCED_SEED_PROTOCOL_VERSION,
 ):
     """Build a fully-signed envelope so tests pass the validator's
     ``ENFORCE_ENVELOPE_SIGNATURE`` gate. ``miner_hotkey`` is bound to
@@ -136,6 +141,7 @@ def _request(
         merkle_root=merkle_root,
         checkpoint_hash=checkpoint_hash,
         drand_round=drand_round,
+        protocol_version=protocol_version,
         randomness=randomness,
         nonce=nonce,
     ).hex()
@@ -147,6 +153,7 @@ def _request(
         rollouts=rollouts,
         checkpoint_hash=checkpoint_hash,
         drand_round=drand_round,
+        protocol_version=protocol_version,
         nonce=nonce,
         envelope_signature=sig,
     )
@@ -308,6 +315,24 @@ def test_submit_409_on_window_mismatch():
     client = TestClient(server.app)
     resp = client.post("/submit", json=_request(window_start=999).model_dump(mode="json"))
     assert resp.status_code == 409
+
+
+def test_protocol_version_mismatch_rejected_before_quota():
+    from reliquary.protocol.submission import WindowState
+
+    server = ValidatorServer()
+    server.set_active_batcher(_batcher(window_start=500))
+    server.set_current_state(WindowState.OPEN)
+    request = _request(protocol_version=FORCED_SEED_PROTOCOL_VERSION - 1)
+
+    response = TestClient(server.app).post(
+        "/submit", json=request.model_dump(mode="json"),
+    )
+
+    assert response.json()["reason"] == (
+        RejectReason.PROTOCOL_VERSION_MISMATCH.value
+    )
+    assert _TEST_KEYPAIR.ss58_address not in server._per_window_counts
 
 
 def test_state_endpoint_returns_grpo_batch_state():
