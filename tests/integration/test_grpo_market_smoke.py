@@ -4,11 +4,10 @@ No on-chain dependencies — all verifiers are stubbed. The goal is to
 prove the pieces fit together end-to-end.
 """
 
-import hashlib
-
 import pytest
 
 from reliquary.constants import B_BATCH, CHALLENGE_K, M_ROLLOUTS
+from reliquary.protocol.merkle import compute_rollouts_merkle_root
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     RolloutSubmission,
@@ -72,13 +71,13 @@ def _rollouts(k):
             tokens=commit["tokens"],
             reward=reward,
             commit=commit,
-            env_name="openmathinstruct",
+            env_name="fake",
         ))
     return out
 
 
-def _merkle(n: int) -> str:
-    return hashlib.sha256(str(n).encode()).hexdigest()
+def _merkle(rollouts: list[RolloutSubmission]) -> str:
+    return compute_rollouts_merkle_root(rollouts)
 
 
 def _always_true_proof(commit, model, randomness):
@@ -115,12 +114,13 @@ def test_two_windows_with_cooldown():
     # Window 0: B_BATCH+2 distinct prompts arrive
     b0 = _make_batcher(window=0, cooldown=cooldown)
     for i in range(n_submissions):
+        rollouts = _rollouts(k=4)
         req = BatchSubmissionRequest(
             miner_hotkey=f"hk{i}",
             prompt_idx=i,
             window_start=0,
-            merkle_root=_merkle(i),
-            rollouts=_rollouts(k=4),
+            merkle_root=_merkle(rollouts),
+            rollouts=rollouts,
             checkpoint_hash="sha256:test",
         )
         resp = b0.accept_submission(req)
@@ -136,12 +136,13 @@ def test_two_windows_with_cooldown():
     # Window 1: re-submit the exact batched prompts → all rejected for cooldown
     b1 = _make_batcher(window=1, cooldown=cooldown)
     for prompt_idx in batched_prompts:
+        rollouts = _rollouts(k=4)
         req = BatchSubmissionRequest(
             miner_hotkey=f"hk{prompt_idx}",
             prompt_idx=prompt_idx,
             window_start=1,
-            merkle_root=_merkle(100 + prompt_idx),
-            rollouts=_rollouts(k=4),
+            merkle_root=_merkle(rollouts),
+            rollouts=rollouts,
             checkpoint_hash="sha256:test",
         )
         resp = b1.accept_submission(req)
@@ -151,12 +152,13 @@ def test_two_windows_with_cooldown():
     # Window 4 (after cooldown=3 expires): re-use any batched prompt
     reuse_prompt = next(iter(sorted(batched_prompts)))
     b4 = _make_batcher(window=4, cooldown=cooldown)
+    rollouts = _rollouts(k=4)
     req = BatchSubmissionRequest(
         miner_hotkey=f"hk{reuse_prompt}",
         prompt_idx=reuse_prompt,
         window_start=4,
-        merkle_root=_merkle(500),
-        rollouts=_rollouts(k=4),
+        merkle_root=_merkle(rollouts),
+        rollouts=rollouts,
         checkpoint_hash="sha256:test",
     )
     resp = b4.accept_submission(req)
@@ -213,12 +215,13 @@ def test_out_of_zone_rejected_end_to_end():
     """A submission with k=0 (all fail) is rejected at the zone filter."""
     cooldown = CooldownMap(cooldown_windows=50)
     b = _make_batcher(window=0, cooldown=cooldown)
+    rollouts = _rollouts(k=0)
     req = BatchSubmissionRequest(
         miner_hotkey="hk",
         prompt_idx=42,
         window_start=0,
-        merkle_root=_merkle(42),
-        rollouts=_rollouts(k=0),  # all losses
+        merkle_root=_merkle(rollouts),
+        rollouts=rollouts,  # all losses
         checkpoint_hash="sha256:test",
     )
     resp = b.accept_submission(req)
