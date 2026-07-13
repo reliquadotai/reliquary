@@ -44,8 +44,8 @@ For each rollout the miner runs a bit-identical HuggingFace forward pass on the 
 **6. Validator verifies, filters, selects batch.**
 The validator checks: window match → checkpoint hash → prompt index bounds → cooldown → per-prompt capacity → schema/token invariants → prompt-token binding → rollout-hash dedup → reward verification or validator-authoritative reward scoring → zone filter (`σ ≥ 0.43`) → signatures/randomness → GRAIL sketch → termination/logprob/token-distribution checks. Any failure returns a `RejectReason`. Valid submissions accumulate per active environment. Once the active environment targets have enough eligible distinct prompts, `seal_event` fires after the drand-round drain.
 
-**7. Validator runs a GRPO step if the batch is healthy.**
-State transitions to `TRAINING`. Before GRPO, the validator runs a training-quarantine assessment over the selected batch and the window's reject profile. Quarantined windows are still archived and credited for emissions, but they do not mutate the train model and do not publish a checkpoint. Healthy full batches run `train_step()`, which computes group-relative advantages from verifier-checked rollout rewards, applies a PPO-clipped surrogate loss + KL penalty against the frozen reference model, and steps AdamW.
+**7. Validator accumulates clean signal and runs a balanced GRPO step.**
+State transitions to `TRAINING`. Before retention, the validator assesses the selected groups and current reject profile. Quarantined windows remain archived and credited but do not enter training. Clean partial batches are retained across windows under the exact public checkpoint revision, capped at one target batch per environment. Once every active environment is full, the validator assesses the balanced retained batch again and runs `train_step()`. A checkpoint change discards pending samples before any new-revision samples are retained, so one optimizer step never mixes generation policies.
 
 **8. Validator publishes a new checkpoint.**
 State transitions to `PUBLISHING`. Every `CHECKPOINT_PUBLISH_INTERVAL_WINDOWS = 10` trained windows the model is saved locally, pushed to HF Hub, and signed: `ed25519(checkpoint_n || revision)`. The signed manifest is installed in `/checkpoint`. Between publishes the miners stay on the last-published revision (enforced by the checkpoint hash gate). The window dataset is archived to R2, including quarantine metadata when present.
@@ -53,7 +53,7 @@ State transitions to `PUBLISHING`. Every `CHECKPOINT_PUBLISH_INTERVAL_WINDOWS = 
 **9. State → READY → OPEN.**
 The next window opens immediately. Winning prompts enter one-shot cooldown. Once per subnet epoch the validator calls `set_weights` on-chain with the current EMA snapshot.
 
-**Safety net.** Normal windows seal by valid-prompt targets. Sparse windows force-seal partial when the validator has drained queued/proof work and either has at least `SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS = 4` distinct valid prompts with no new valid prompt for `SPARSE_VALID_IDLE_SEAL_SECONDS = 180`, or reaches `SPARSE_VALID_MAX_WINDOW_SECONDS = 600` with fewer than the target. The older `WINDOW_TIMEOUT_SECONDS = 7200` remains the outer safety net. Partial windows are archived and credited, but skip GRPO/publish unless every active environment is full. Unused batch slots contribute to the burn weight for `UID_BURN`.
+**Safety net.** Normal windows seal by valid-prompt targets. Sparse windows force-seal partial when the validator has drained queued/proof work and either has at least `SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS = 4` distinct valid prompts with no new valid prompt for `SPARSE_VALID_IDLE_SEAL_SECONDS = 180`, or reaches `SPARSE_VALID_MAX_WINDOW_SECONDS = 600` with fewer than the target. The older `WINDOW_TIMEOUT_SECONDS = 7200` remains the outer safety net. Partial windows are archived and credited immediately; clean selected groups can complete a later checkpoint-consistent balanced training batch. Unused reward slots still contribute to the burn weight for `UID_BURN`.
 
 ---
 
@@ -144,7 +144,7 @@ This guarantees that training data always reflects the currently-published polic
 
 ### Publish every N trained windows — HF cannot keep up with per-step pushes
 
-The base model is Qwen3.5-2B (~2 billion parameters, sharded safetensors, thinking chat template). Pushing a new safetensors snapshot to HF Hub on every window (roughly every 60 seconds under load) is infeasible due to Git LFS latency and HF rate limits. The validator trains healthy full batches in-memory but publishes to HF every `CHECKPOINT_PUBLISH_INTERVAL_WINDOWS = 10` successful trained windows. Quarantined or partial windows are archived/credited but do not increment the publish cadence. Between publishes, miners stay on the last-published revision — the hash gate keeps them there. `checkpoint_n` only increments on a successful publish, so the gate remains stable across the publish gap.
+The base model is Qwen3.5-2B (~2 billion parameters, sharded safetensors, thinking chat template). Pushing a new safetensors snapshot to HF Hub on every window (roughly every 60 seconds under load) is infeasible due to Git LFS latency and HF rate limits. The validator publishes to HF every `CHECKPOINT_PUBLISH_INTERVAL_WINDOWS = 10` successful balanced optimizer steps. A partial window may contribute retained samples but does not increment the cadence by itself. Quarantined windows are archived/credited but excluded from the accumulator. Between publishes, miners stay on the last-published revision — the hash gate keeps them there. `checkpoint_n` only increments on a successful publish, so the gate remains stable across the publish gap.
 
 ---
 

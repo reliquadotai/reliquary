@@ -210,6 +210,12 @@ def test_health_endpoint_does_not_leak_secrets(monkeypatch):
     monkeypatch.setenv("R2_BUCKET_ID", "public-bucket-name")
 
     server = _open_server()
+    server.set_training_accumulator_state({
+        "checkpoint_revision": "rev-a",
+        "targets": {"math": 8, "code": 8},
+        "counts": {"math": 3, "code": 8},
+        "ready": False,
+    })
     monkeypatch.setattr(server, "_current_drand_round_best_effort", lambda: 123)
     client = TestClient(server.app)
     body = client.get("/health").json()
@@ -224,6 +230,10 @@ def test_health_endpoint_does_not_leak_secrets(monkeypatch):
     assert body["sparse_valid_idle_seal_seconds"] == 300.0
     assert body["sparse_valid_idle_min_distinct_prompts"] == 4
     assert body["sparse_valid_max_window_seconds"] == 900.0
+    assert body["training_accumulator_checkpoint_revision"] == "rev-a"
+    assert body["training_accumulator_targets"] == {"math": 8, "code": 8}
+    assert body["training_accumulator_counts"] == {"math": 3, "code": 8}
+    assert body["training_accumulator_ready"] is False
     assert "secret-value-123" not in text
     assert "access-key-value-123" not in text
     assert "hf_secret_value_123" not in text
