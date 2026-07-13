@@ -1580,6 +1580,10 @@ class ValidationService:
         )
 
     async def run(self, subtensor) -> None:
+        from reliquary.infrastructure.archive_queue import get_archive_queue
+
+        archive_queue = get_archive_queue()
+        self.server.configure_archive_queue_telemetry(archive_queue.snapshot)
         self.server.configure_registration_gate(
             lambda: self._refresh_registered_hotkeys(force=True),
         )
@@ -1596,9 +1600,8 @@ class ValidationService:
         # directory for any pending payloads (from before this restart
         # or accumulated during R2 downtime) and uploads them via sync
         # boto3 with exponential backoff. Cancelled cleanly on shutdown.
-        from reliquary.infrastructure.archive_queue import get_archive_queue
         self._archive_worker_task = asyncio.create_task(
-            get_archive_queue().run_forever(),
+            archive_queue.run_forever(),
             name="archive_queue_worker",
         )
 

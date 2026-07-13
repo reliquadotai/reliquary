@@ -216,6 +216,17 @@ def test_health_endpoint_does_not_leak_secrets(monkeypatch):
         "counts": {"math": 3, "code": 8},
         "ready": False,
     })
+    server.configure_archive_queue_telemetry(lambda: {
+        "depth": 2,
+        "oldest_window": 490,
+        "oldest_age_seconds": 30.5,
+        "uploads_succeeded_total": 7,
+        "upload_failures_total": 1,
+        "last_upload_success_ts": 1200.0,
+        "last_upload_failure_ts": 1100.0,
+        "last_uploaded_window": 489,
+        "last_failed_window": 490,
+    })
     monkeypatch.setattr(server, "_current_drand_round_best_effort", lambda: 123)
     client = TestClient(server.app)
     body = client.get("/health").json()
@@ -228,6 +239,18 @@ def test_health_endpoint_does_not_leak_secrets(monkeypatch):
     assert body["last_valid_submission_ts"] == 1234.5
     assert body["seconds_since_last_valid_submission"] == 12.5
     assert body["sparse_valid_idle_seal_seconds"] == 300.0
+    assert body["forced_seed_enforced"] is True
+    assert body["forced_seed_consistency_floor"] == 0.8
+    assert body["forced_seed_rollout_floor"] == 0.75
+    assert body["forced_seed_cdf_enforced"] is False
+    assert body["forced_seed_cdf_boundary_epsilon"] == 0.002
+    assert body["archive_queue_depth"] == 2
+    assert body["archive_queue_oldest_window"] == 490
+    assert body["archive_queue_oldest_age_seconds"] == 30.5
+    assert body["archive_uploads_succeeded_total"] == 7
+    assert body["archive_upload_failures_total"] == 1
+    assert body["archive_last_uploaded_window"] == 489
+    assert body["archive_last_failed_window"] == 490
     assert body["sparse_valid_idle_min_distinct_prompts"] == 4
     assert body["sparse_valid_max_window_seconds"] == 900.0
     assert body["training_accumulator_checkpoint_revision"] == "rev-a"

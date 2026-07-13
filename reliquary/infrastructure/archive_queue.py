@@ -37,6 +37,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,12 @@ class ArchiveQueue:
         # When the worker is paused waiting on a file's backoff, we
         # record the earliest time at which that file may be retried.
         self._next_attempt_at: dict[str, float] = {}
+        self._uploads_succeeded_total = 0
+        self._upload_failures_total = 0
+        self._last_upload_success_ts: float | None = None
+        self._last_upload_failure_ts: float | None = None
+        self._last_uploaded_window: int | None = None
+        self._last_failed_window: int | None = None
 
     # ------------------------------------------------------------------
     # Producer API — called from the validator's main loop
@@ -128,6 +135,33 @@ class ArchiveQueue:
             return float(RETRY_BACKOFF_SECONDS[attempts - 1])
         return float(RETRY_BACKOFF_SECONDS[-1])
 
+    def snapshot(self, *, now: float | None = None) -> dict:
+        """Return a secret-free, JSON-safe queue health snapshot."""
+        pending = self._pending()
+        oldest_window = (
+            self._window_n_from_path(pending[0]) if pending else None
+        )
+        oldest_age_seconds = None
+        if pending:
+            try:
+                current = time.time() if now is None else float(now)
+                oldest_age_seconds = max(
+                    0.0, current - pending[0].stat().st_mtime
+                )
+            except OSError:
+                oldest_age_seconds = None
+        return {
+            "depth": len(pending),
+            "oldest_window": oldest_window,
+            "oldest_age_seconds": oldest_age_seconds,
+            "uploads_succeeded_total": self._uploads_succeeded_total,
+            "upload_failures_total": self._upload_failures_total,
+            "last_upload_success_ts": self._last_upload_success_ts,
+            "last_upload_failure_ts": self._last_upload_failure_ts,
+            "last_uploaded_window": self._last_uploaded_window,
+            "last_failed_window": self._last_failed_window,
+        }
+
     async def _try_upload(self, path: Path) -> bool:
         """Attempt to upload one pending file. Returns True on success.
 
@@ -172,6 +206,9 @@ class ArchiveQueue:
                 endpoint, region,
             )
         except Exception as e:
+            self._upload_failures_total += 1
+            self._last_upload_failure_ts = time.time()
+            self._last_failed_window = window_n
             attempts = self._attempts.get(str(path), 0) + 1
             self._attempts[str(path)] = attempts
             delay = self._backoff_delay(attempts)
@@ -187,6 +224,9 @@ class ArchiveQueue:
 
         attempts_used = self._attempts.pop(str(path), 0) + 1
         self._next_attempt_at.pop(str(path), None)
+        self._uploads_succeeded_total += 1
+        self._last_upload_success_ts = time.time()
+        self._last_uploaded_window = window_n
         try:
             path.unlink()
         except OSError as e:

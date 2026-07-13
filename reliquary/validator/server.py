@@ -389,6 +389,15 @@ class _Health(BaseModel):
         default_factory=dict
     )
     legacy_merkle_last_mismatch_ts: float | None = None
+    archive_queue_depth: int | None = None
+    archive_queue_oldest_window: int | None = None
+    archive_queue_oldest_age_seconds: float | None = None
+    archive_uploads_succeeded_total: int | None = None
+    archive_upload_failures_total: int | None = None
+    archive_last_upload_success_ts: float | None = None
+    archive_last_upload_failure_ts: float | None = None
+    archive_last_uploaded_window: int | None = None
+    archive_last_failed_window: int | None = None
 
 
 class ValidatorServer:
@@ -421,6 +430,9 @@ class ValidatorServer:
             collections.Counter()
         )
         self._legacy_merkle_last_mismatch_ts: float | None = None
+        self._archive_queue_snapshot_callback: (
+            Callable[[], dict[str, Any]] | None
+        ) = None
         self.app: FastAPI = self._build_app()
         self._server: uvicorn.Server | None = None
         self._task: asyncio.Task[Any] | None = None
@@ -482,6 +494,12 @@ class ValidatorServer:
     def set_training_accumulator_state(self, state: dict[str, Any]) -> None:
         """Expose a JSON-safe snapshot through ``/health``."""
         self._training_accumulator_state = dict(state)
+
+    def configure_archive_queue_telemetry(
+        self,
+        snapshot_callback: Callable[[], dict[str, Any]],
+    ) -> None:
+        self._archive_queue_snapshot_callback = snapshot_callback
 
     def set_current_checkpoint(self, entry) -> None:
         self._current_checkpoint = entry
@@ -723,6 +741,11 @@ class ValidatorServer:
         cp = self._current_checkpoint
         registration_age = self.registration_cache_age()
         accumulator = self._training_accumulator_state
+        archive_queue = (
+            self._archive_queue_snapshot_callback()
+            if self._archive_queue_snapshot_callback is not None
+            else {}
+        )
         reject_counts: dict[str, int] = dict(self._recent_reject_counts)
         if batcher is not None:
             for reason, count in getattr(batcher, "reject_counts", {}).items():
@@ -843,6 +866,29 @@ class ValidatorServer:
             },
             legacy_merkle_last_mismatch_ts=(
                 self._legacy_merkle_last_mismatch_ts
+            ),
+            archive_queue_depth=archive_queue.get("depth"),
+            archive_queue_oldest_window=archive_queue.get("oldest_window"),
+            archive_queue_oldest_age_seconds=archive_queue.get(
+                "oldest_age_seconds"
+            ),
+            archive_uploads_succeeded_total=archive_queue.get(
+                "uploads_succeeded_total"
+            ),
+            archive_upload_failures_total=archive_queue.get(
+                "upload_failures_total"
+            ),
+            archive_last_upload_success_ts=archive_queue.get(
+                "last_upload_success_ts"
+            ),
+            archive_last_upload_failure_ts=archive_queue.get(
+                "last_upload_failure_ts"
+            ),
+            archive_last_uploaded_window=archive_queue.get(
+                "last_uploaded_window"
+            ),
+            archive_last_failed_window=archive_queue.get(
+                "last_failed_window"
             ),
         )
 
