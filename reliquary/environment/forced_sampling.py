@@ -7,10 +7,22 @@ not generated from this draw is detectable by teacher-forced consistency.
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 
 import torch
 
 from reliquary.constants import FORCED_SEED_DOMAIN
+
+
+@dataclass(frozen=True)
+class SeedConsistencyDiagnostics:
+    n_positions: int = 0
+    n_stochastic: int = 0
+    n_exact_match: int = 0
+    n_boundary_match: int = 0
+    n_hard_mismatch: int = 0
+    n_deterministic_hard_mismatch: int = 0
+    max_cdf_miss: float = 0.0
 
 
 def warp(logits: torch.Tensor, t: float, top_k: int, top_p: float) -> torch.Tensor:
@@ -81,16 +93,88 @@ def seed_consistency(logits: torch.Tensor, token_ids: list[int], u_values: list[
     positions, with a single device sync for the two returned counts (the
     per-position loop used to force a GPU->CPU sync at every step, on the serial
     GRAIL-verify hot path)."""
+    diagnostics = seed_consistency_diagnostics(
+        logits,
+        token_ids,
+        u_values,
+        t=t,
+        top_k=top_k,
+        top_p=top_p,
+        stochastic_threshold=stochastic_threshold,
+        boundary_epsilon=0.0,
+    )
+    return diagnostics.n_stochastic, diagnostics.n_exact_match
+
+
+def seed_consistency_diagnostics(
+    logits: torch.Tensor,
+    token_ids: list[int],
+    u_values: list[float],
+    *,
+    t: float,
+    top_k: int,
+    top_p: float,
+    stochastic_threshold: float,
+    boundary_epsilon: float,
+) -> SeedConsistencyDiagnostics:
+    """Classify exact picks and numerical CDF-boundary misses on GPU.
+
+    A submitted token is exact when the public uniform lies in its
+    validator-recomputed inverse-CDF interval. A non-exact token is only
+    boundary-compatible when the uniform is within ``boundary_epsilon`` of
+    that interval. This distinguishes numerical drift near a real decision
+    boundary from generic percentage forgiveness for arbitrary branch edits.
+    """
     n = min(len(token_ids), len(u_values), int(logits.shape[0]))
     if n == 0:
-        return 0, 0
-    probs = _warp_batch(logits[:n], t=t, top_k=top_k, top_p=top_p)         # [n, vocab]
-    stochastic = probs.max(dim=-1).values < stochastic_threshold           # [n] bool
+        return SeedConsistencyDiagnostics()
+    if boundary_epsilon < 0:
+        raise ValueError("boundary_epsilon must be non-negative")
+
+    probs = _warp_batch(logits[:n], t=t, top_k=top_k, top_p=top_p)
+    max_probs = probs.max(dim=-1).values
+    stochastic = max_probs < stochastic_threshold
     cdf = torch.cumsum(probs, dim=-1)
-    u = torch.tensor([float(x) for x in u_values[:n]],
-                     device=cdf.device, dtype=cdf.dtype).unsqueeze(-1)     # [n, 1]
-    picks = torch.searchsorted(cdf, u, right=True).squeeze(-1).clamp(max=probs.shape[-1] - 1)
-    toks = torch.tensor([int(x) for x in token_ids[:n]],
-                        device=picks.device, dtype=picks.dtype)            # [n]
-    matched = stochastic & (picks == toks)
-    return int(stochastic.sum().item()), int(matched.sum().item())
+    toks = torch.tensor(
+        [int(x) for x in token_ids[:n]],
+        device=cdf.device,
+        dtype=torch.long,
+    )
+    row = torch.arange(n, device=cdf.device)
+    upper = cdf[row, toks]
+    mass = probs[row, toks]
+    lower = upper - mass
+    u = torch.tensor(
+        [float(x) for x in u_values[:n]],
+        device=cdf.device,
+        dtype=cdf.dtype,
+    )
+
+    exact = (u >= lower) & (u < upper)
+    miss = torch.where(
+        u < lower,
+        lower - u,
+        torch.where(u >= upper, u - upper, torch.zeros_like(u)),
+    )
+    boundary_match = exact | (miss <= float(boundary_epsilon))
+    hard_mismatch = ~boundary_match
+    deterministic_hard = hard_mismatch & ~stochastic
+
+    counts = torch.stack(
+        (
+            stochastic.sum(),
+            (stochastic & exact).sum(),
+            boundary_match.sum(),
+            hard_mismatch.sum(),
+            deterministic_hard.sum(),
+        )
+    ).tolist()
+    return SeedConsistencyDiagnostics(
+        n_positions=n,
+        n_stochastic=int(counts[0]),
+        n_exact_match=int(counts[1]),
+        n_boundary_match=int(counts[2]),
+        n_hard_mismatch=int(counts[3]),
+        n_deterministic_hard_mismatch=int(counts[4]),
+        max_cdf_miss=float(miss.max().item()),
+    )

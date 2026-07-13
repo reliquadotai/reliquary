@@ -33,6 +33,8 @@ from reliquary.constants import (
     CODE_SEMANTIC_AUTH_ENFORCE,
     TOKEN_AUTH_ENFORCE,
     ALL_TOKEN_AUTH_ENFORCE,
+    FORCED_SEED_CDF_BOUNDARY_EPSILON,
+    FORCED_SEED_CDF_ENFORCE,
     FORCED_SEED_ENFORCE,
 )
 from reliquary.environment.base import Environment
@@ -1194,9 +1196,15 @@ class GrpoWindowBatcher:
         from reliquary.environment.forced_sampling import u_at
         grp_stoch = 0
         grp_match = 0
+        grp_seed_positions = 0
+        grp_seed_boundary_match = 0
+        grp_seed_hard_mismatch = 0
+        grp_seed_deterministic_hard_mismatch = 0
+        grp_seed_max_cdf_miss = 0.0
         # Per-rollout (n_stoch, n_match) — the per-rollout gate needs each
         # rollout separately, since the group average hides a partial swap.
         seed_per_rollout: list[tuple[int, int]] = []
+        seed_cdf_per_rollout: list[dict[str, int | float]] = []
 
         for rollout_idx, rollout in enumerate(request.rollouts):
             # `truncated` is a validator-set flag (overlong reward shaping, see
@@ -1281,6 +1289,44 @@ class GrpoWindowBatcher:
             grp_stoch += proof.seed_n_stochastic
             grp_match += proof.seed_n_match
             seed_per_rollout.append((proof.seed_n_stochastic, proof.seed_n_match))
+            seed_positions = int(getattr(proof, "seed_n_positions", 0) or 0)
+            seed_boundary_match = int(
+                getattr(proof, "seed_n_boundary_match", 0) or 0
+            )
+            seed_hard_mismatch = int(
+                getattr(proof, "seed_n_hard_mismatch", 0) or 0
+            )
+            seed_deterministic_hard = int(
+                getattr(
+                    proof,
+                    "seed_n_deterministic_hard_mismatch",
+                    0,
+                )
+                or 0
+            )
+            seed_max_cdf_miss = float(
+                getattr(proof, "seed_max_cdf_miss", 0.0) or 0.0
+            )
+            grp_seed_positions += seed_positions
+            grp_seed_boundary_match += seed_boundary_match
+            grp_seed_hard_mismatch += seed_hard_mismatch
+            grp_seed_deterministic_hard_mismatch += seed_deterministic_hard
+            grp_seed_max_cdf_miss = max(
+                grp_seed_max_cdf_miss,
+                seed_max_cdf_miss,
+            )
+            seed_cdf_per_rollout.append(
+                {
+                    "rollout_idx": rollout_idx,
+                    "n_positions": seed_positions,
+                    "n_stochastic": int(proof.seed_n_stochastic),
+                    "n_exact_match": int(proof.seed_n_match),
+                    "n_boundary_match": seed_boundary_match,
+                    "n_hard_mismatch": seed_hard_mismatch,
+                    "n_deterministic_hard_mismatch": seed_deterministic_hard,
+                    "max_cdf_miss": seed_max_cdf_miss,
+                }
+            )
             if proof.sketch_diff_max > sketch_diff_max:
                 sketch_diff_max = proof.sketch_diff_max
             if not proof.all_passed:
@@ -1627,15 +1673,56 @@ class GrpoWindowBatcher:
         # controls checkpoint_hash (a forced-seed derivation input) and could
         # grind it -- don't reject on a stream whose seed inputs aren't bound.
         seed_enforce = FORCED_SEED_ENFORCE and bool(self.current_checkpoint_hash)
-        group_reject = _forced_seed_verdict(grp_stoch, grp_match, seed_enforce)
-        rollout_reject = _forced_seed_rollout_reject(seed_per_rollout, seed_enforce)
-        if group_reject or rollout_reject:
+        group_would_reject = _forced_seed_verdict(
+            grp_stoch, grp_match, True,
+        )
+        rollout_would_reject = _forced_seed_rollout_reject(
+            seed_per_rollout, True,
+        )
+        group_reject = seed_enforce and group_would_reject
+        rollout_reject = seed_enforce and rollout_would_reject
+        cdf_enforce = (
+            FORCED_SEED_CDF_ENFORCE and bool(self.current_checkpoint_hash)
+        )
+        cdf_would_reject = grp_seed_hard_mismatch > 0
+        cdf_reject = cdf_enforce and cdf_would_reject
+        record_forced_seed_shadow(
+            hk,
+            request.prompt_idx,
+            grp_stoch,
+            grp_match,
+            per_rollout=seed_cdf_per_rollout,
+            n_positions=grp_seed_positions,
+            n_boundary_match=grp_seed_boundary_match,
+            n_hard_mismatch=grp_seed_hard_mismatch,
+            n_deterministic_hard_mismatch=(
+                grp_seed_deterministic_hard_mismatch
+            ),
+            max_cdf_miss=grp_seed_max_cdf_miss,
+            cdf_boundary_epsilon=FORCED_SEED_CDF_BOUNDARY_EPSILON,
+            ratio_group_would_reject=group_would_reject,
+            ratio_rollout_would_reject=rollout_would_reject,
+            cdf_would_reject=cdf_would_reject,
+            cdf_enforced=cdf_enforce,
+        )
+        if group_reject or rollout_reject or cdf_reject:
+            if cdf_reject:
+                scope = "cdf_hard_mismatch"
+            elif group_reject:
+                scope = "group"
+            else:
+                scope = "rollout"
             logger.info(
-                "seed_mismatch hotkey=%s stoch=%d match=%d scope=%s",
-                hk, grp_stoch, grp_match, "group" if group_reject else "rollout",
+                "seed_mismatch hotkey=%s stoch=%d match=%d scope=%s "
+                "cdf_hard=%d cdf_max_miss=%.8f",
+                hk,
+                grp_stoch,
+                grp_match,
+                scope,
+                grp_seed_hard_mismatch,
+                grp_seed_max_cdf_miss,
             )
             return reject(RejectReason.SEED_MISMATCH, "forced_seed")
-        record_forced_seed_shadow(hk, request.prompt_idx, grp_stoch, grp_match)
 
         # Reward-shape metrics are still computed (they feed the softer
         # training-quarantine signal + archive telemetry) but no longer
