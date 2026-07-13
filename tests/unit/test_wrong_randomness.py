@@ -16,9 +16,8 @@ on randomness-matched commits where only bf16 rounding noise remains.
 
 from __future__ import annotations
 
-import pytest
-
 from reliquary.constants import CHALLENGE_K
+from reliquary.protocol.merkle import compute_rollouts_merkle_root
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     RejectReason,
@@ -60,7 +59,7 @@ def _request_with_randomness(
         miner_hotkey=hotkey,
         prompt_idx=prompt_idx,
         window_start=window_start,
-        merkle_root="00" * 32,
+        merkle_root=compute_rollouts_merkle_root(rollouts),
         rollouts=rollouts,
         checkpoint_hash="sha256:test",
     )
@@ -186,7 +185,7 @@ def test_per_rollout_randomness_is_checked() -> None:
         miner_hotkey="hk",
         prompt_idx=7,
         window_start=500,
-        merkle_root="00" * 32,
+        merkle_root=compute_rollouts_merkle_root(rollouts),
         rollouts=rollouts,
         checkpoint_hash="sha256:test",
     )
