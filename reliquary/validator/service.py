@@ -559,6 +559,10 @@ class ValidationService:
                 _load(),
                 timeout=REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS,
             )
+            if not hotkeys:
+                raise RuntimeError(
+                    "metagraph refresh returned no registered hotkeys"
+                )
             self.server.set_registered_hotkeys(hotkeys)
             logger.info(
                 "Registered-hotkey cache refreshed: netuid=%d hotkeys=%d",
