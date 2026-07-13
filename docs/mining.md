@@ -167,6 +167,7 @@ The validator emits one of the following reasons on every failed submission. Eac
 | Reason | Meaning | Action |
 |---|---|---|
 | `WINDOW_NOT_ACTIVE` | Window is in `TRAINING`, `PUBLISHING`, or `READY` — not accepting submissions | Sleep and re-poll `/state` until `state == "open"` |
+| `MERKLE_ROOT_MISMATCH` | The signed wire-v1 root does not equal the validator's byte-compatible recomputation | Use the repository's existing `_compute_merkle_root` output without altering its serialization |
 | `RATE_LIMITED` | You exceeded `MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW = 8` submissions in this window | Throttle locally; the counter resets at every window boundary |
 | `BATCH_FILLED` | The batcher already accepted `B_BATCH = 8` distinct non-cooldown valid submissions — your submission can never displace one, so it's rejected before GRAIL runs (PR #22) | Fire earlier next window, or accept that this window is closed |
 | `WINDOW_MISMATCH` | `window_start` in your request doesn't match the active batcher | Refresh `/state` and retry with the current `window_n` |
