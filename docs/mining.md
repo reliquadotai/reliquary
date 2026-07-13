@@ -29,8 +29,10 @@ queue and proof work are drained:
 - `SPARSE_VALID_MAX_WINDOW_SECONDS = 600` for sparse or zero-valid windows;
 - `WINDOW_TIMEOUT_SECONDS = 7200` remains the outer safety-net timeout.
 
-Partial windows are archived and credited, but they skip GRPO/publish unless
-every active environment reaches its target.
+Partial windows are archived and credited immediately. Clean selected groups
+are also retained in a bounded accumulator tied to the public checkpoint. GRPO
+waits until the accumulator has one target batch from every active environment;
+extra groups from an already-full environment are not used to overweight it.
 
 > **v2.3 (May 2026)**: TCP-arrival FIFO is gone. Ordering is now anchored to the drand quicknet round each submission carries (`drand_round` field), and the per-prompt single-winner short-circuit (`SUPERSEDED`) is replaced by a per-prompt cap with **emission split among all submitters** for that prompt. Co-location with the validator no longer wins the race. Full design in [docs/superpowers/specs/2026-05-15-drand-ordering-and-prompt-split-design.md](superpowers/specs/2026-05-15-drand-ordering-and-prompt-split-design.md), implementation in [PR #28](https://github.com/reliquadotai/reliquary/pull/28).
 
