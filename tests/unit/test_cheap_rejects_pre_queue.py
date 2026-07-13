@@ -496,10 +496,15 @@ def test_final_eos_reaches_proof_admission():
     assert batcher.proof_admission_count == 1
 
 
-def test_low_claimed_final_eos_logprob_rejected_before_proof_admission():
-    """If a miner's own logprob claim says final EOS is below the p_stop
-    threshold, the submission cannot pass termination and should not spend
-    a proof slot first.
+def test_low_claimed_final_eos_logprob_is_not_a_pre_queue_reject():
+    """A low claimed final-EOS logprob must NOT be rejected before proof.
+
+    An honest forced-seed rollout can legally draw EOS from the nucleus at a low
+    probability, and it reports that low value truthfully; the forced-seed
+    terminal-pick escape in verify_termination is what clears it — but only if the
+    rollout survives to the GPU. Rejecting on the claim killed exactly those, while
+    a forger simply claims a comfortable number and sails through. Termination is
+    decided on the validator's own logits.
     """
     s = ValidatorServer()
     s.set_current_state(WindowState.OPEN)
@@ -514,16 +519,17 @@ def test_low_claimed_final_eos_logprob_rejected_before_proof_admission():
         final_idx = meta["prompt_length"] + meta["completion_length"] - 1
         meta["token_logprobs"][final_idx] = math.log(0.001)
 
-    _assert_pre_queue_reject(s, payload, RejectReason.BAD_TERMINATION)
-    assert batcher.proof_admission_count == 0
-    verdicts = list(s._verdicts.get("hkA", []))
-    assert verdicts[-1]["reject_stage"] == "termination_claim_preflight"
+    with TestClient(s.app) as client:
+        r = client.post("/submit", json=payload)
+
+    body = r.json()
+    assert body["accepted"] is True, body
+    assert body["reason"] == RejectReason.ACCEPTED.value
+    assert batcher.proof_admission_count == 1
 
 
-def test_low_claimed_completion_only_final_eos_logprob_rejected_pre_queue():
-    """The same final-EOS claim check applies to completion-only logprob
-    layout, which the protocol accepts for miner compatibility.
-    """
+def test_completion_only_layout_low_final_logprob_also_reaches_proof():
+    """Same contract for the completion-only logprob layout the protocol accepts."""
     s = ValidatorServer()
     s.set_current_state(WindowState.OPEN)
     batcher = _PreflightAdmissionBatcher(eos_token_id=99)
@@ -537,8 +543,13 @@ def test_low_claimed_completion_only_final_eos_logprob_rejected_pre_queue():
         meta["token_logprobs"] = [0.0] * meta["completion_length"]
         meta["token_logprobs"][-1] = math.log(0.001)
 
-    _assert_pre_queue_reject(s, payload, RejectReason.BAD_TERMINATION)
-    assert batcher.proof_admission_count == 0
+    with TestClient(s.app) as client:
+        r = client.post("/submit", json=payload)
+
+    body = r.json()
+    assert body["accepted"] is True, body
+    assert body["reason"] == RejectReason.ACCEPTED.value
+    assert batcher.proof_admission_count == 1
 
 
 def test_claimed_out_of_zone_rejected_before_proof_admission():
