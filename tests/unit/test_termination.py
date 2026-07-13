@@ -19,14 +19,23 @@ from types import SimpleNamespace
 from reliquary.constants import MIN_EOS_PROBABILITY
 from reliquary.validator.verifier import (
     ProofResult,
+    _gpu_terminal_forced_pick,
     has_eos_padding,
     is_cap_truncation,
+    is_natural_bft_cap_candidate,
     verify_termination,
 )
 
 
 class _FakeTokenizer:
     eos_token_id = 99
+
+
+class _FakeBFTTokenizer(_FakeTokenizer):
+    think_close_id = 77
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        return self.think_close_id if token == "</think>" else -1
 
 
 def _commit(tokens: list[int]) -> dict:
@@ -101,6 +110,89 @@ def test_uses_p_stop_at_second_to_last_position():
     logits[-2, 99] = 5.0  # p(EOS|context-at-pos-2) ~ 0.97
     proof = _proof_from_logits(logits, eos_token_id=99)
     assert verify_termination(_commit(tokens), _FakeTokenizer(), proof) is True
+
+
+def test_forced_seed_pick_rescues_low_p_stop_termination():
+    """A rollout whose final EOS IS the protocol's forced inverse-CDF pick is a
+    legal draw, however improbable: the miner cannot choose where the public u
+    selects EOS. Honest mid-reasoning truncations land here (the model drew EOS
+    from the nucleus by chance) and must not be rejected as forgeries."""
+    tokens = [10, 20, 30, 99]
+    logits = torch.zeros(4, 100)
+    logits[:, 99] = -10.0  # p(EOS) ~ 4.5e-5 — far below the floor
+    proof = _proof_from_logits(logits, eos_token_id=99)
+    assert proof.p_stop < MIN_EOS_PROBABILITY
+    proof.terminal_pick_ok = True
+
+    assert verify_termination(_commit(tokens), _FakeTokenizer(), proof) is True
+
+
+def test_forced_seed_pick_mismatch_still_rejects_low_p_stop():
+    """The escape is an OR, not a bypass: when the final EOS is NOT the forced
+    pick, a sub-floor p_stop stays a rejection (this is the forged-truncation
+    case — the attacker injected EOS where u did not select it)."""
+    tokens = [10, 20, 30, 99]
+    logits = torch.zeros(4, 100)
+    logits[:, 99] = -10.0
+    proof = _proof_from_logits(logits, eos_token_id=99)
+    proof.terminal_pick_ok = False
+
+    assert verify_termination(_commit(tokens), _FakeTokenizer(), proof) is False
+
+
+def test_forced_seed_pick_cannot_rescue_a_non_eos_final_token():
+    """The escape never waives the structural requirement that the rollout
+    actually ends on a stop token."""
+    tokens = [10, 20, 30, 40]  # final token is not EOS
+    proof = ProofResult(all_passed=True, passed=1, checked=1, p_stop=0.99)
+    proof.terminal_pick_ok = True
+
+    assert verify_termination(_commit(tokens), _FakeTokenizer(), proof) is False
+
+
+def test_terminal_forced_pick_must_equal_the_submitted_eos_token():
+    """With multiple valid EOS ids, drawing EOS-A cannot authenticate EOS-B."""
+    logits = torch.full((3, 8), -20.0)
+    logits[1, 6] = 20.0
+    tokens = [1, 2, 7]
+
+    assert _gpu_terminal_forced_pick(
+        logits,
+        tokens,
+        prompt_length=1,
+        seq_len=len(tokens),
+        eos_set={6, 7},
+        seed_u_values=[0.5, 0.5],
+        force_span=(0, 0),
+    ) is False
+
+
+def test_absent_forced_seed_pick_preserves_current_behaviour():
+    """Pre-forced-seed rollouts (no u-stream) carry terminal_pick_ok=None and
+    must keep falling back to the p_stop floor alone."""
+    tokens = [10, 20, 30, 99]
+    logits = torch.zeros(4, 100)
+    logits[:, 99] = -10.0
+    proof = _proof_from_logits(logits, eos_token_id=99)
+    assert proof.terminal_pick_ok is None
+
+    assert verify_termination(_commit(tokens), _FakeTokenizer(), proof) is False
+
+
+def test_forced_seed_pick_rescues_cap_hit_from_truncation_count():
+    """A cap-length rollout that ended on a legally-drawn EOS is a natural stop,
+    not a truncation — otherwise it burns the per-submission truncation budget."""
+    from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
+
+    tokens = [1] * (MAX_NEW_TOKENS_PROTOCOL_CAP - 1) + [99]
+    commit = {
+        "tokens": tokens,
+        "rollout": {"prompt_length": 0, "completion_length": len(tokens)},
+    }
+    proof = ProofResult(all_passed=True, passed=1, checked=1, p_stop=1e-9)
+    proof.terminal_pick_ok = True
+
+    assert is_cap_truncation(commit, _FakeTokenizer(), proof) is False
 
 
 def test_accepts_tokenizer_eos_even_when_model_generation_eos_differs():
@@ -199,8 +291,96 @@ def test_forced_bft_cap_passes_below_global_cap_without_truncation():
         p_stop=1e-10,
     )
 
-    assert verify_termination(commit, _FakeTokenizer(), proof) is True
-    assert is_cap_truncation(commit, _FakeTokenizer(), proof) is False
+    assert verify_termination(
+        commit,
+        _FakeTokenizer(),
+        proof,
+        env_name="openmathinstruct",
+    ) is True
+    assert is_cap_truncation(
+        commit,
+        _FakeTokenizer(),
+        proof,
+        env_name="openmathinstruct",
+    ) is False
+
+    assert verify_termination(
+        commit,
+        _FakeTokenizer(),
+        proof,
+        env_name="opencodeinstruct",
+    ) is False
+
+
+def test_forced_bft_cap_requires_exact_completion_length():
+    from reliquary.constants import BFT_ANSWER_BUDGET, BFT_THINKING_BUDGET
+
+    prompt_length = 4
+    force_len = 3
+    completion_length = BFT_THINKING_BUDGET + force_len + BFT_ANSWER_BUDGET + 1
+    tokens = [42] * (prompt_length + completion_length)
+    commit = _commit_with_lengths(tokens, prompt_length, completion_length)
+    commit["rollout"]["forced"] = True
+    commit["rollout"]["force_span"] = [
+        prompt_length + BFT_THINKING_BUDGET,
+        prompt_length + BFT_THINKING_BUDGET + force_len,
+    ]
+    proof = ProofResult(all_passed=True, passed=1, checked=1, p_stop=1e-10)
+
+    assert verify_termination(commit, _FakeTokenizer(), proof) is False
+
+
+def test_natural_bft_cap_requires_math_shape_and_validator_pick_proof():
+    from reliquary.constants import BFT_ANSWER_BUDGET, BFT_THINKING_BUDGET
+
+    tokenizer = _FakeBFTTokenizer()
+    prompt_length = 4
+    completion_length = BFT_THINKING_BUDGET + BFT_ANSWER_BUDGET
+    completion = [42] * completion_length
+    completion[100] = tokenizer.think_close_id
+    commit = _commit_with_lengths(
+        [11] * prompt_length + completion,
+        prompt_length,
+        completion_length,
+    )
+    proof = ProofResult(
+        all_passed=True,
+        passed=1,
+        checked=1,
+        p_stop=1e-10,
+        natural_close_pick_ok=True,
+    )
+
+    assert is_natural_bft_cap_candidate(
+        commit, tokenizer, env_name="openmathinstruct"
+    ) is True
+    assert verify_termination(
+        commit,
+        tokenizer,
+        proof,
+        env_name="openmathinstruct",
+    ) is True
+    assert is_cap_truncation(
+        commit,
+        tokenizer,
+        proof,
+        env_name="openmathinstruct",
+    ) is False
+
+    proof.natural_close_pick_ok = False
+    assert verify_termination(
+        commit,
+        tokenizer,
+        proof,
+        env_name="openmathinstruct",
+    ) is False
+    proof.natural_close_pick_ok = True
+    assert verify_termination(
+        commit,
+        tokenizer,
+        proof,
+        env_name="opencodeinstruct",
+    ) is False
 
 
 def test_cap_hit_with_natural_eos_is_not_truncation():

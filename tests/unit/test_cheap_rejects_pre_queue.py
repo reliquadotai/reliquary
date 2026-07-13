@@ -457,6 +457,48 @@ def test_fake_forced_span_rejected_before_proof_admission():
     assert batcher.proof_admission_count == 0
 
 
+def test_non_math_forced_cap_does_not_receive_preflight_exemption():
+    """A code rollout cannot reserve proof capacity using math-only BFT metadata."""
+    tokenizer = _FakeBFTTokenizer()
+    s = ValidatorServer()
+    s.set_current_state(WindowState.OPEN)
+    batcher = _PreflightAdmissionBatcher(eos_token_id=99)
+    batcher.tokenizer = tokenizer
+    s.set_active_batcher(batcher)
+
+    payload = _forced_payload(tokenizer.canonical_force_ids)
+    for rollout in payload["rollouts"]:
+        rollout["env_name"] = "opencodeinstruct"
+
+    _assert_pre_queue_reject(s, payload, RejectReason.BAD_TERMINATION)
+    assert batcher.proof_admission_count == 0
+
+
+def test_natural_math_bft_cap_reaches_gpu_for_pick_verification():
+    """The 2048+512 natural-close shape is structural-only at preflight."""
+    from reliquary.constants import BFT_ANSWER_BUDGET, BFT_THINKING_BUDGET
+
+    tokenizer = _FakeBFTTokenizer()
+    s = ValidatorServer()
+    s.set_current_state(WindowState.OPEN)
+    batcher = _PreflightAdmissionBatcher(eos_token_id=99)
+    batcher.tokenizer = tokenizer
+    s.set_active_batcher(batcher)
+
+    completion = [5] * (BFT_THINKING_BUDGET + BFT_ANSWER_BUDGET)
+    completion[123] = tokenizer.canonical_force_ids[0]
+    payload = _submission_with_completion_tokens(
+        completion,
+        rewards=_IN_ZONE_REWARDS,
+    )
+
+    with TestClient(s.app) as client:
+        response = client.post("/submit", json=payload)
+
+    assert response.json()["reason"] == RejectReason.ACCEPTED.value
+    assert batcher.proof_admission_count == 1
+
+
 def test_eos_padding_rejected_before_proof_admission():
     """Repeated or interior EOS tokens are structural padding and should be
     rejected before they can enter the GRAIL queue."""
@@ -496,10 +538,15 @@ def test_final_eos_reaches_proof_admission():
     assert batcher.proof_admission_count == 1
 
 
-def test_low_claimed_final_eos_logprob_rejected_before_proof_admission():
-    """If a miner's own logprob claim says final EOS is below the p_stop
-    threshold, the submission cannot pass termination and should not spend
-    a proof slot first.
+def test_low_claimed_final_eos_logprob_is_not_a_pre_queue_reject():
+    """A low claimed final-EOS logprob must NOT be rejected before proof.
+
+    An honest forced-seed rollout can legally draw EOS from the nucleus at a low
+    probability, and it reports that low value truthfully; the forced-seed
+    terminal-pick escape in verify_termination is what clears it — but only if the
+    rollout survives to the GPU. Rejecting on the claim killed exactly those, while
+    a forger simply claims a comfortable number and sails through. Termination is
+    decided on the validator's own logits.
     """
     s = ValidatorServer()
     s.set_current_state(WindowState.OPEN)
@@ -514,16 +561,17 @@ def test_low_claimed_final_eos_logprob_rejected_before_proof_admission():
         final_idx = meta["prompt_length"] + meta["completion_length"] - 1
         meta["token_logprobs"][final_idx] = math.log(0.001)
 
-    _assert_pre_queue_reject(s, payload, RejectReason.BAD_TERMINATION)
-    assert batcher.proof_admission_count == 0
-    verdicts = list(s._verdicts.get("hkA", []))
-    assert verdicts[-1]["reject_stage"] == "termination_claim_preflight"
+    with TestClient(s.app) as client:
+        r = client.post("/submit", json=payload)
+
+    body = r.json()
+    assert body["accepted"] is True, body
+    assert body["reason"] == RejectReason.ACCEPTED.value
+    assert batcher.proof_admission_count == 1
 
 
-def test_low_claimed_completion_only_final_eos_logprob_rejected_pre_queue():
-    """The same final-EOS claim check applies to completion-only logprob
-    layout, which the protocol accepts for miner compatibility.
-    """
+def test_completion_only_layout_low_final_logprob_also_reaches_proof():
+    """Same contract for the completion-only logprob layout the protocol accepts."""
     s = ValidatorServer()
     s.set_current_state(WindowState.OPEN)
     batcher = _PreflightAdmissionBatcher(eos_token_id=99)
@@ -537,8 +585,13 @@ def test_low_claimed_completion_only_final_eos_logprob_rejected_pre_queue():
         meta["token_logprobs"] = [0.0] * meta["completion_length"]
         meta["token_logprobs"][-1] = math.log(0.001)
 
-    _assert_pre_queue_reject(s, payload, RejectReason.BAD_TERMINATION)
-    assert batcher.proof_admission_count == 0
+    with TestClient(s.app) as client:
+        r = client.post("/submit", json=payload)
+
+    body = r.json()
+    assert body["accepted"] is True, body
+    assert body["reason"] == RejectReason.ACCEPTED.value
+    assert batcher.proof_admission_count == 1
 
 
 def test_claimed_out_of_zone_rejected_before_proof_admission():
