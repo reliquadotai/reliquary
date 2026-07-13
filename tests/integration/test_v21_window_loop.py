@@ -91,12 +91,14 @@ def _rollouts(k, seed: int = 0):
 
 
 def _request(*, hotkey, prompt_idx, window_start, checkpoint_hash, seed=0):
+    from reliquary.protocol.merkle import compute_rollouts_merkle_root
+
     rollouts = _rollouts(k=4, seed=seed)
     return BatchSubmissionRequest(
         miner_hotkey=hotkey,
         prompt_idx=prompt_idx,
         window_start=window_start,
-        merkle_root="00" * 32,
+        merkle_root=compute_rollouts_merkle_root(rollouts),
         rollouts=rollouts,
         checkpoint_hash=checkpoint_hash,
     )
