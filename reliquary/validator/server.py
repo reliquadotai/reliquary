@@ -64,6 +64,7 @@ from reliquary.validator.observability import (
 )
 from reliquary.validator.verifier import (
     is_forced_bft_cap_termination,
+    is_natural_bft_cap_candidate,
     is_in_zone,
     rewards_std,
     validate_force_span,
@@ -281,7 +282,8 @@ def _proof_free_submission_reject(
             continue
 
         total_length = prompt_length + completion_length
-        if is_forced_bft_cap_termination(commit):
+        is_math = rollout.env_name == "openmathinstruct"
+        if is_math and is_forced_bft_cap_termination(commit):
             # Only exempt from the truncation budget if the claimed FORCE span
             # is structurally valid (byte-exact, position-pinned). A fake-forced
             # rollout is rejected here instead of after a GPU proof; the full
@@ -292,6 +294,12 @@ def _proof_free_submission_reject(
                 and not validate_forced_span(tokens, meta)
             ):
                 return RejectReason.TOKEN_TAMPERED, "force_span_preflight"
+            continue
+        if is_natural_bft_cap_candidate(
+            commit,
+            getattr(batcher, "tokenizer", None),
+            env_name=rollout.env_name,
+        ):
             continue
         if total_length < MAX_NEW_TOKENS_PROTOCOL_CAP:
             return RejectReason.BAD_TERMINATION, "termination_preflight"

@@ -1177,10 +1177,18 @@ class GrpoWindowBatcher:
                         sketch_diff_max=sketch_diff_max,
                     )
                 termination_ok = verify_termination(
-                    rollout.commit, self.tokenizer, proof, self.model
+                    rollout.commit,
+                    self.tokenizer,
+                    proof,
+                    self.model,
+                    env_name=getattr(self.env, "name", ""),
                 )
                 cap_truncated = is_cap_truncation(
-                    rollout.commit, self.tokenizer, proof, self.model
+                    rollout.commit,
+                    self.tokenizer,
+                    proof,
+                    self.model,
+                    env_name=getattr(self.env, "name", ""),
                 )
                 if not termination_ok or cap_truncated:
                     truncated_flags[rollout_idx] = True

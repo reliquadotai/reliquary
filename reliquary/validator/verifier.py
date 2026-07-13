@@ -93,6 +93,11 @@ class ProofResult:
     # of how improbable it was. None when there is no u-stream (pre-forced-seed
     # rollouts) or the rollout does not end on a stop token.
     terminal_pick_ok: bool | None = None
+    # True when an unforced BFT rollout's phase-1 ``</think>`` token is the
+    # exact public forced-seed pick at that position. This lets the validator
+    # recognize the reference miner's natural 2048+512 local cap without
+    # trusting a miner-supplied flag or permitting an injected close token.
+    natural_close_pick_ok: bool | None = None
 
 
 def verify_signature(commit: dict, hotkey: str) -> bool:
@@ -143,7 +148,54 @@ def is_forced_bft_cap_termination(commit: dict) -> bool:
         completion_length = int(rollout_meta.get("completion_length", 0))
     except (TypeError, ValueError):
         return False
-    return completion_length >= cap
+    return completion_length == cap
+
+
+def is_natural_bft_cap_candidate(
+    commit: dict,
+    tokenizer: Any,
+    *,
+    env_name: str | None,
+) -> bool:
+    """Return whether *commit* has the structural natural-BFT cap shape.
+
+    The reference miner runs 2048 phase-1 tokens. If that stream naturally
+    emitted the atomic ``</think>`` token but did not emit EOS, it continues
+    for exactly 512 answer tokens without an injected FORCE span. The cheap
+    HTTP preflight may use this structural predicate to let such a rollout
+    reach the GPU. Final acceptance additionally requires
+    ``ProofResult.natural_close_pick_ok`` so a miner cannot manufacture the
+    close token.
+    """
+    if env_name != "openmathinstruct":
+        return False
+
+    rollout_meta = commit.get("rollout", {}) or {}
+    if rollout_meta.get("forced") or rollout_meta.get("force_span") not in (None, []):
+        return False
+
+    from reliquary.constants import BFT_ANSWER_BUDGET, BFT_THINKING_BUDGET
+    from reliquary.shared.modeling import has_think_close, think_close_token_ids
+
+    try:
+        prompt_length = int(rollout_meta.get("prompt_length", 0))
+        completion_length = int(rollout_meta.get("completion_length", 0))
+    except (TypeError, ValueError):
+        return False
+    if completion_length != BFT_THINKING_BUDGET + BFT_ANSWER_BUDGET:
+        return False
+
+    tokens = list(commit.get("tokens") or [])
+    if prompt_length + completion_length != len(tokens):
+        return False
+    try:
+        close_ids = set(think_close_token_ids(tokenizer))
+    except Exception:
+        return False
+    phase1 = tokens[
+        prompt_length: prompt_length + BFT_THINKING_BUDGET
+    ]
+    return has_think_close(phase1, close_ids)
 
 
 def verify_termination(
@@ -151,6 +203,8 @@ def verify_termination(
     tokenizer: Any,
     proof: "ProofResult | None" = None,
     model: Any = None,
+    *,
+    env_name: str | None = None,
 ) -> bool:
     """Two paths to a valid termination, both gaming-safe:
 
@@ -190,6 +244,12 @@ def verify_termination(
     if (
         prompt_length + completion_length >= MAX_NEW_TOKENS_PROTOCOL_CAP
         or is_forced_bft_cap_termination(commit)
+    ):
+        return True
+    if (
+        is_natural_bft_cap_candidate(commit, tokenizer, env_name=env_name)
+        and proof is not None
+        and proof.natural_close_pick_ok is True
     ):
         return True
 
@@ -236,6 +296,8 @@ def is_cap_truncation(
     tokenizer: Any,
     proof: "ProofResult | None" = None,
     model: Any = None,
+    *,
+    env_name: str | None = None,
 ) -> bool:
     """Return True when a cap-hit rollout did not naturally stop on EOS.
 
@@ -251,6 +313,12 @@ def is_cap_truncation(
     completion_length = int(rollout_meta.get("completion_length", 0))
     prompt_length = int(rollout_meta.get("prompt_length", 0))
     if is_forced_bft_cap_termination(commit):
+        return False
+    if (
+        is_natural_bft_cap_candidate(commit, tokenizer, env_name=env_name)
+        and proof is not None
+        and proof.natural_close_pick_ok is True
+    ):
         return False
 
     if prompt_length + completion_length < MAX_NEW_TOKENS_PROTOCOL_CAP:
@@ -386,6 +454,7 @@ def verify_commitment_proofs(
     seed_n_stochastic = 0
     seed_n_match = 0
     terminal_pick_ok = None
+    natural_close_pick_ok = None
     if seed_u_values is not None:
         valid_t = _completion_valid_t(tokens, prompt_length, completion_length, seq_len)
         # Exclude BFT-injected force_span tokens: validator-accepted but not
@@ -418,6 +487,16 @@ def verify_commitment_proofs(
         terminal_pick_ok = _gpu_terminal_forced_pick(
             logits_gpu, tokens, prompt_length, seq_len,
             _eos_set_from_model(model, tokenizer), seed_u_values, (fs0, fs1),
+        )
+        natural_close_pick_ok = _gpu_natural_close_forced_pick(
+            logits_gpu,
+            tokens,
+            prompt_length,
+            completion_length,
+            seq_len,
+            tokenizer,
+            seed_u_values,
+            rollout_meta,
         )
 
     hidden_states = hidden_states_gpu.detach().to("cpu")
@@ -458,6 +537,7 @@ def verify_commitment_proofs(
         seed_n_stochastic=seed_n_stochastic,
         seed_n_match=seed_n_match,
         terminal_pick_ok=terminal_pick_ok,
+        natural_close_pick_ok=natural_close_pick_ok,
     )
 
 
@@ -501,7 +581,64 @@ def _gpu_terminal_forced_pick(
     probs = warp(
         logits_gpu[t - 1].float(), t=T_PROTO, top_k=TOP_K_PROTO, top_p=TOP_P_PROTO,
     )
-    return pick(probs, seed_u_values[j]) in eos_set
+    return pick(probs, seed_u_values[j]) == int(tokens[-1])
+
+
+def _gpu_natural_close_forced_pick(
+    logits_gpu: torch.Tensor,
+    tokens: list[int],
+    prompt_length: int,
+    completion_length: int,
+    seq_len: int,
+    tokenizer: Any,
+    seed_u_values: list[float],
+    rollout_meta: dict,
+) -> bool | None:
+    """Prove that a natural BFT ``</think>`` came from the public draw."""
+    from reliquary.constants import (
+        BFT_ANSWER_BUDGET,
+        BFT_THINKING_BUDGET,
+        TOP_K_PROTO,
+        TOP_P_PROTO,
+    )
+    from reliquary.environment.forced_sampling import pick, warp
+    from reliquary.shared.modeling import think_close_token_ids
+
+    if rollout_meta.get("forced") or rollout_meta.get("force_span") not in (None, []):
+        return None
+    if completion_length != BFT_THINKING_BUDGET + BFT_ANSWER_BUDGET:
+        return None
+    try:
+        close_ids = set(think_close_token_ids(tokenizer))
+    except Exception:
+        return None
+
+    phase1_end = min(
+        prompt_length + BFT_THINKING_BUDGET,
+        prompt_length + completion_length,
+        len(tokens),
+        seq_len,
+    )
+    close_positions = [
+        pos for pos in range(prompt_length, phase1_end)
+        if int(tokens[pos]) in close_ids and pos > 0
+    ]
+    if not close_positions:
+        return None
+
+    for pos in close_positions:
+        j = pos - prompt_length
+        if j >= len(seed_u_values):
+            continue
+        probs = warp(
+            logits_gpu[pos - 1].float(),
+            t=T_PROTO,
+            top_k=TOP_K_PROTO,
+            top_p=TOP_P_PROTO,
+        )
+        if pick(probs, seed_u_values[j]) == int(tokens[pos]):
+            return True
+    return False
 
 
 def _gpu_p_stop(

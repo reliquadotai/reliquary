@@ -457,6 +457,48 @@ def test_fake_forced_span_rejected_before_proof_admission():
     assert batcher.proof_admission_count == 0
 
 
+def test_non_math_forced_cap_does_not_receive_preflight_exemption():
+    """A code rollout cannot reserve proof capacity using math-only BFT metadata."""
+    tokenizer = _FakeBFTTokenizer()
+    s = ValidatorServer()
+    s.set_current_state(WindowState.OPEN)
+    batcher = _PreflightAdmissionBatcher(eos_token_id=99)
+    batcher.tokenizer = tokenizer
+    s.set_active_batcher(batcher)
+
+    payload = _forced_payload(tokenizer.canonical_force_ids)
+    for rollout in payload["rollouts"]:
+        rollout["env_name"] = "opencodeinstruct"
+
+    _assert_pre_queue_reject(s, payload, RejectReason.BAD_TERMINATION)
+    assert batcher.proof_admission_count == 0
+
+
+def test_natural_math_bft_cap_reaches_gpu_for_pick_verification():
+    """The 2048+512 natural-close shape is structural-only at preflight."""
+    from reliquary.constants import BFT_ANSWER_BUDGET, BFT_THINKING_BUDGET
+
+    tokenizer = _FakeBFTTokenizer()
+    s = ValidatorServer()
+    s.set_current_state(WindowState.OPEN)
+    batcher = _PreflightAdmissionBatcher(eos_token_id=99)
+    batcher.tokenizer = tokenizer
+    s.set_active_batcher(batcher)
+
+    completion = [5] * (BFT_THINKING_BUDGET + BFT_ANSWER_BUDGET)
+    completion[123] = tokenizer.canonical_force_ids[0]
+    payload = _submission_with_completion_tokens(
+        completion,
+        rewards=_IN_ZONE_REWARDS,
+    )
+
+    with TestClient(s.app) as client:
+        response = client.post("/submit", json=payload)
+
+    assert response.json()["reason"] == RejectReason.ACCEPTED.value
+    assert batcher.proof_admission_count == 1
+
+
 def test_eos_padding_rejected_before_proof_admission():
     """Repeated or interior EOS tokens are structural padding and should be
     rejected before they can enter the GRAIL queue."""
