@@ -679,16 +679,17 @@ FORCED_SEED_DOMAIN = "reliquary-forced-seed-v1"
 # probability is below this (i.e. the forced draw actually chooses the token).
 FORCED_SEED_STOCHASTIC_MAXPROB = 0.99
 # Reject a group whose stochastic-position match rate is below this floor.
-# Live 2026-07-14 corpus: 7,003 accepted groups had p01=0.911 and median=0.960;
-# active non-forced rejects clustered around 0.52-0.74. The old 0.80 floor was
-# being targeted directly, so 0.90 preserves measured honest headroom while
-# materially shrinking the aggregate mismatch budget.
-FORCED_SEED_CONSISTENCY_FLOOR = 0.90
+# Keep the wire-v1 acceptance floor unchanged during the telemetry-only
+# rollout. Live 2026-07-14 data supports a future 0.90 candidate, but changing
+# acceptance policy belongs to the announced miner/protocol cutover after the
+# exact-CDF shadow gate has been calibrated across implementations.
+FORCED_SEED_CONSISTENCY_FLOOR = 0.80
 # Below this many stochastic positions in a group, the gate abstains (accepts)
 # rather than risk a false reject on thin signal.
 FORCED_SEED_MIN_STOCH_POSITIONS = 30
 # Per-rollout hardening: the group-average floor dilutes a partial swap (7
-# honest rollouts at ~0.96 + 1 curated at ~0.60 still averages >0.90). Reject a
+# honest rollouts at ~0.96 + 1 curated at ~0.60 still passes the group floor).
+# Reject a
 # group if ANY single rollout with enough stochastic positions falls below this
 # per-rollout floor. Set lower than the group floor to absorb the higher
 # single-rollout variance (empirical single-rollout: honest 0.94-1.0, non-forced

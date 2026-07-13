@@ -2926,7 +2926,7 @@ def _grail_with_seed_counts(n_stoch: int, n_match: int):
 
 def test_forced_seed_group_gate_rejects_below_floor_when_enforcing(monkeypatch):
     """Aggregate over 8 rollouts: 80 stochastic positions, 8 matches (0.10)
-    is well below FORCED_SEED_CONSISTENCY_FLOOR (0.90). With FORCED_SEED_ENFORCE
+    is well below FORCED_SEED_CONSISTENCY_FLOOR (0.80). With FORCED_SEED_ENFORCE
     on, the group is rejected SEED_MISMATCH after the per-rollout loop."""
     import reliquary.validator.batcher as batcher_mod
 
