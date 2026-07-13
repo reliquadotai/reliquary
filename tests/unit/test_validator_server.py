@@ -1,6 +1,7 @@
 """Validator HTTP server — v2 GRPO market endpoints."""
 
 import os
+import time
 import bittensor as bt
 import pytest
 from fastapi.testclient import TestClient
@@ -163,6 +164,131 @@ def test_submit_returns_queued_on_active_window():
     body = resp.json()
     assert body["accepted"] is True
     assert body["reason"] == RejectReason.ACCEPTED.value
+
+
+def _registration_server(refresh_callback):
+    from reliquary.protocol.submission import WindowState
+
+    server = ValidatorServer()
+    server.set_active_batcher(_batcher(window_start=500))
+    server.set_current_state(WindowState.OPEN)
+    server.configure_registration_gate(refresh_callback)
+    return server
+
+
+def test_registered_hotkey_passes_without_refresh():
+    refresh_calls = 0
+
+    async def refresh():
+        nonlocal refresh_calls
+        refresh_calls += 1
+        return True
+
+    server = _registration_server(refresh)
+    server.set_registered_hotkeys({_TEST_KEYPAIR.ss58_address})
+    response = TestClient(server.app).post(
+        "/submit", json=_request().model_dump(mode="json"),
+    )
+
+    assert response.json()["accepted"] is True
+    assert refresh_calls == 0
+
+
+def test_registration_cache_miss_refreshes_before_quota():
+    refresh_calls = 0
+    server = None
+
+    async def refresh():
+        nonlocal refresh_calls
+        refresh_calls += 1
+        server.set_registered_hotkeys({_TEST_KEYPAIR.ss58_address})
+        return True
+
+    server = _registration_server(refresh)
+    response = TestClient(server.app).post(
+        "/submit", json=_request().model_dump(mode="json"),
+    )
+
+    assert response.json()["accepted"] is True
+    assert refresh_calls == 1
+    assert server._per_window_counts[_TEST_KEYPAIR.ss58_address] == 1
+
+
+def test_unregistered_hotkey_is_rejected_without_spending_quota():
+    async def refresh():
+        return True
+
+    server = _registration_server(refresh)
+    server.set_registered_hotkeys({"some-other-hotkey"})
+    response = TestClient(server.app).post(
+        "/submit", json=_request().model_dump(mode="json"),
+    )
+
+    assert response.json() == {
+        "accepted": False,
+        "reason": RejectReason.HOTKEY_NOT_REGISTERED.value,
+    }
+    assert _TEST_KEYPAIR.ss58_address not in server._per_window_counts
+
+
+def test_missing_registration_snapshot_fails_closed():
+    async def refresh():
+        return False
+
+    server = _registration_server(refresh)
+    response = TestClient(server.app).post(
+        "/submit", json=_request().model_dump(mode="json"),
+    )
+
+    assert response.json()["reason"] == RejectReason.REGISTRATION_UNAVAILABLE.value
+    assert _TEST_KEYPAIR.ss58_address not in server._per_window_counts
+
+
+def test_recent_last_known_good_registration_survives_refresh_failure():
+    async def refresh():
+        raise ConnectionError("chain unavailable")
+
+    server = _registration_server(refresh)
+    server.set_registered_hotkeys(
+        {_TEST_KEYPAIR.ss58_address},
+        refreshed_at=time.time() - 400,
+    )
+    response = TestClient(server.app).post(
+        "/submit", json=_request().model_dump(mode="json"),
+    )
+
+    assert response.json()["accepted"] is True
+
+
+def test_expired_registration_snapshot_fails_closed():
+    async def refresh():
+        return False
+
+    server = _registration_server(refresh)
+    server.set_registered_hotkeys(
+        {_TEST_KEYPAIR.ss58_address},
+        refreshed_at=time.time() - 901,
+    )
+    response = TestClient(server.app).post(
+        "/submit", json=_request().model_dump(mode="json"),
+    )
+
+    assert response.json()["reason"] == RejectReason.REGISTRATION_UNAVAILABLE.value
+
+
+def test_health_reports_registration_gate_state():
+    async def refresh():
+        return True
+
+    server = _registration_server(refresh)
+    server.set_registered_hotkeys({_TEST_KEYPAIR.ss58_address})
+
+    health = TestClient(server.app).get("/health").json()
+
+    assert health["registration_gate_enforced"] is True
+    assert health["registered_hotkey_count"] == 1
+    assert health["registration_cache_stale"] is False
+    assert health["registration_cache_age_seconds"] >= 0
 
 
 def test_submit_503_when_no_active_batcher():

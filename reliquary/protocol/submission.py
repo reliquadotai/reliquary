@@ -87,6 +87,8 @@ class RejectReason(str, Enum):
     WRONG_CHECKPOINT = "wrong_checkpoint"
     WRONG_RANDOMNESS = "wrong_randomness"
     MERKLE_ROOT_MISMATCH = "merkle_root_mismatch"
+    HOTKEY_NOT_REGISTERED = "hotkey_not_registered"
+    REGISTRATION_UNAVAILABLE = "registration_unavailable"
     WORKER_DROPPED = "worker_dropped"
     STALE_ROUND = "stale_round"
     FUTURE_ROUND = "future_round"

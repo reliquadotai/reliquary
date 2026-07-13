@@ -167,6 +167,14 @@ MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW = 96
 # next window.
 MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW = 2
 
+# Registered-hotkey admission cache. The validator refreshes the metagraph on
+# this cadence and once on a cache miss. A last-known-good snapshot may survive
+# a short chain outage, but admission fails closed after the grace period.
+REGISTERED_HOTKEY_CACHE_TTL_SECONDS = 300.0
+REGISTERED_HOTKEY_STALE_GRACE_SECONDS = 900.0
+REGISTERED_HOTKEY_REFRESH_MIN_INTERVAL_SECONDS = 15.0
+REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS = 20.0
+
 # After the B-th distinct prompt records a seal-trigger drand round, admit only
 # a small tail of same-round stragglers. The hard window cap above remains the
 # outer bound; this cap protects the boundary fair-split extension from turning
