@@ -5,8 +5,7 @@ import logging
 
 from fastapi.testclient import TestClient
 
-from reliquary.constants import FORCED_SEED_PROTOCOL_VERSION, M_ROLLOUTS
-from reliquary.protocol.merkle import compute_rollouts_merkle_root
+from reliquary.constants import M_ROLLOUTS
 from reliquary.protocol.submission import (
     BatchSubmissionResponse,
     RejectReason,
@@ -78,24 +77,22 @@ class _ObservableBatcher:
 
 
 def _submission(*, drand_round: int, hotkey: str = "hkA") -> dict:
-    rollouts = [
-        {
-            "tokens": [1],
-            "reward": 1.0,
-            "commit": {"tokens": [1]},
-            "env_name": "openmathinstruct",
-        }
-        for _ in range(M_ROLLOUTS)
-    ]
     return {
         "miner_hotkey": hotkey,
         "prompt_idx": 42,
         "window_start": 500,
-        "merkle_root": compute_rollouts_merkle_root(rollouts),
-        "rollouts": rollouts,
+        "merkle_root": f"{drand_round:064x}",
+        "rollouts": [
+            {
+                "tokens": [1],
+                "reward": 1.0,
+                "commit": {"tokens": [1]},
+                "env_name": "openmathinstruct",
+            }
+            for _ in range(M_ROLLOUTS)
+        ],
         "checkpoint_hash": "",
         "drand_round": drand_round,
-        "protocol_version": FORCED_SEED_PROTOCOL_VERSION,
     }
 
 
