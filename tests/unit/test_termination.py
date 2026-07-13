@@ -20,6 +20,7 @@ from reliquary.constants import MIN_EOS_PROBABILITY
 from reliquary.validator.verifier import (
     ProofResult,
     _gpu_terminal_forced_pick,
+    _gpu_terminal_forced_pick_diagnostics,
     has_eos_padding,
     is_cap_truncation,
     is_natural_bft_cap_candidate,
@@ -165,6 +166,22 @@ def test_terminal_forced_pick_must_equal_the_submitted_eos_token():
         seed_u_values=[0.5, 0.5],
         force_span=(0, 0),
     ) is False
+
+
+def test_terminal_forced_pick_reports_near_boundary_miss_without_relaxing():
+    logits = torch.zeros(2, 2)
+    exact, miss = _gpu_terminal_forced_pick_diagnostics(
+        logits,
+        tokens=[1, 0],
+        prompt_length=1,
+        seq_len=2,
+        eos_set={0},
+        seed_u_values=[0.5005],
+        force_span=(0, 0),
+    )
+
+    assert exact is False
+    assert miss == pytest.approx(0.0005, abs=1e-6)
 
 
 def test_absent_forced_seed_pick_preserves_current_behaviour():
