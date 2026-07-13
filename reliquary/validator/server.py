@@ -741,11 +741,16 @@ class ValidatorServer:
         cp = self._current_checkpoint
         registration_age = self.registration_cache_age()
         accumulator = self._training_accumulator_state
-        archive_queue = (
-            self._archive_queue_snapshot_callback()
-            if self._archive_queue_snapshot_callback is not None
-            else {}
-        )
+        try:
+            archive_queue = (
+                self._archive_queue_snapshot_callback()
+                if self._archive_queue_snapshot_callback is not None
+                else {}
+            )
+        except Exception:
+            # Observability must never turn a healthy validator into a failed
+            # health check. Missing queue data remains visible as null fields.
+            archive_queue = {}
         reject_counts: dict[str, int] = dict(self._recent_reject_counts)
         if batcher is not None:
             for reason, count in getattr(batcher, "reject_counts", {}).items():

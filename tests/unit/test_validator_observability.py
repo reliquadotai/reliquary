@@ -260,3 +260,17 @@ def test_health_endpoint_does_not_leak_secrets(monkeypatch):
     assert "secret-value-123" not in text
     assert "access-key-value-123" not in text
     assert "hf_secret_value_123" not in text
+
+
+def test_health_remains_available_when_archive_snapshot_fails():
+    server = _open_server()
+
+    def _fail_snapshot():
+        raise OSError("archive state temporarily unreadable")
+
+    server.configure_archive_queue_telemetry(_fail_snapshot)
+    response = TestClient(server.app).get("/health")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
+    assert response.json()["archive_queue_depth"] is None
