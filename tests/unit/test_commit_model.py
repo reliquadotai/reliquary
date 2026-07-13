@@ -37,6 +37,21 @@ def test_valid_commit_parses():
     CommitModel.model_validate(_valid_commit())
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("total_reward", float("nan")),
+        ("advantage", float("inf")),
+        ("token_logprobs", [0.0] * 39 + [float("-inf")]),
+    ],
+)
+def test_non_finite_rollout_metadata_rejected(field, value):
+    payload = _valid_commit()
+    payload["rollout"][field] = value
+    with pytest.raises(ValidationError, match="finite"):
+        CommitModel.model_validate(payload)
+
+
 def test_missing_tokens_rejected():
     payload = _valid_commit()
     del payload["tokens"]

@@ -6,6 +6,7 @@ exposes the per-commit checks that touch the model or the signature scheme.
 
 import ast
 import logging
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -794,10 +795,15 @@ def verify_reward_claim(
     absorbs float64 formatting round-trip (JSON serialisation) noise.
     """
     try:
-        actual = env.compute_reward(problem, completion_text)
+        actual = float(env.compute_reward(problem, completion_text))
+        claimed_f = float(claimed)
     except Exception:
         return False
-    return abs(float(actual) - float(claimed)) <= tolerance
+    return (
+        math.isfinite(actual)
+        and math.isfinite(claimed_f)
+        and abs(actual - claimed_f) <= tolerance
+    )
 
 
 def rewards_std(rewards: list[float]) -> float:

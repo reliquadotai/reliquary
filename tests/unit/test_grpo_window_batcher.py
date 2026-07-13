@@ -469,6 +469,22 @@ def test_validator_authoritative_reward_overwrites_placeholder_claims():
     ] == [True, True, True, True, False, False, False, False]
 
 
+def test_validator_authoritative_non_finite_reward_is_rejected():
+    class NonFinitePrivateRewardEnv(PrivateRewardFakeEnv):
+        def compute_reward(self, problem, completion):
+            return float("nan")
+
+    req = _request(rewards=[0.0] * M_ROLLOUTS)
+    for rollout in req.rollouts:
+        rollout.env_name = "opencodeinstruct"
+
+    b = _make_batcher(env=NonFinitePrivateRewardEnv())
+    response = b.accept_submission(req)
+
+    assert response.accepted is False
+    assert response.reason == RejectReason.REWARD_MISMATCH
+
+
 def test_reject_outer_inner_token_split_even_if_constructed():
     b = _make_batcher()
     req = _request()

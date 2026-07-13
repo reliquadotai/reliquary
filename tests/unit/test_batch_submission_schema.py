@@ -76,6 +76,18 @@ def test_rollout_rejects_mismatched_outer_and_commit_tokens():
         )
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_rollout_rejects_non_finite_reward(value):
+    rollout = _valid_rollouts(k=4)[0]
+    with pytest.raises(ValidationError, match="finite"):
+        RolloutSubmission(
+            tokens=rollout.tokens,
+            reward=value,
+            commit=rollout.commit,
+            env_name=rollout.env_name,
+        )
+
+
 def test_wrong_rollout_count_rejected():
     with pytest.raises(ValidationError, match="rollouts"):
         BatchSubmissionRequest(
