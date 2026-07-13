@@ -457,6 +457,15 @@ ENFORCE_ENVELOPE_SIGNATURE = _os.environ.get(
     "RELIQUARY_ENFORCE_ENVELOPE_SIGNATURE", "1"
 ).strip().lower() not in ("0", "false", "no", "off", "")
 
+# Recompute the exact root emitted by existing wire-v1 miners. The check ships
+# in shadow mode because privately maintained miners may have copied or
+# reimplemented the historical serializer. Once live telemetry demonstrates
+# byte parity, operators can enable rejection without changing miner payloads
+# or signatures.
+LEGACY_MERKLE_ROOT_ENFORCE = _os.environ.get(
+    "RELIQUARY_LEGACY_MERKLE_ROOT_ENFORCE", "false"
+).strip().lower() in ("1", "true", "yes", "on")
+
 # Max GRAIL-validated submissions retained per prompt per window. Once this
 # cap is reached for a prompt, further submissions for that prompt are
 # rejected as PROMPT_FULL before the heavy verify. Bounds the validator's

@@ -138,7 +138,7 @@ def _signed_request(
                 tokens=commit["tokens"],
                 reward=reward,
                 commit=commit,
-                env_name="openmathinstruct",
+                env_name=_FakeEnv.name,
             )
         )
     if nonce is None:
@@ -413,7 +413,7 @@ def test_submit_rejects_spoofed_hotkey(enforce_envelope):
             tokens=commit["tokens"],
             reward=float(i < 4),
             commit=commit,
-            env_name="openmathinstruct",
+            env_name=_FakeEnv.name,
         ))
     # ``randomness`` is signed over but not a wire field — drop it before
     # constructing the request body.
@@ -466,7 +466,7 @@ def test_bad_signature_does_not_consume_victim_quota(enforce_envelope):
             tokens=commit["tokens"],
             reward=float(i < 4),
             commit=commit,
-            env_name="openmathinstruct",
+            env_name=_FakeEnv.name,
         ))
     bad_req = BatchSubmissionRequest(
         miner_hotkey=kp_victim.ss58_address,

@@ -130,6 +130,7 @@ class SubmitTelemetry:
     prompt_idx: int
     hotkey: str
     merkle_root: str
+    protocol_version: int
     submitted_drand_round: int
     t_arrival: float
     prompt_hash_lead: str
@@ -149,6 +150,10 @@ class SubmitTelemetry:
     queue_wait_ms: float | None = None
     verify_ms: float | None = None
     total_ms: float | None = None
+    legacy_merkle_status: str | None = None
+    legacy_merkle_computed_lead: str | None = None
+    legacy_merkle_would_reject: bool | None = None
+    legacy_merkle_enforced: bool | None = None
 
     @classmethod
     def from_request(
@@ -162,11 +167,26 @@ class SubmitTelemetry:
             prompt_idx=request.prompt_idx,
             hotkey=request.miner_hotkey,
             merkle_root=request.merkle_root,
+            protocol_version=request.protocol_version,
             submitted_drand_round=request.drand_round,
             t_arrival=t_arrival,
             prompt_hash_lead=canonical_prompt_hash_lead(request.prompt_idx),
             merkle_root_lead=merkle_root_lead(request.merkle_root),
         )
+
+    def apply_legacy_merkle(
+        self,
+        *,
+        status: str,
+        computed_root: str | None,
+        enforced: bool,
+    ) -> None:
+        self.legacy_merkle_status = status
+        self.legacy_merkle_computed_lead = (
+            merkle_root_lead(computed_root) if computed_root else None
+        )
+        self.legacy_merkle_would_reject = status != "match"
+        self.legacy_merkle_enforced = bool(enforced)
 
     def apply_drand(self, observation: DrandRoundObservation) -> None:
         self.arrival_drand_round = observation.arrival_drand_round
@@ -224,6 +244,7 @@ class SubmitTelemetry:
             "queue_wait_ms": self.queue_wait_ms,
             "verify_ms": self.verify_ms,
             "total_ms": self.total_ms,
+            "protocol_version": self.protocol_version,
             "submitted_drand_round": self.submitted_drand_round,
             "arrival_drand_round": self.arrival_drand_round,
             "drand_delta": self.drand_delta,
@@ -238,12 +259,21 @@ class SubmitTelemetry:
             "prompt_hash_lead": self.prompt_hash_lead,
             "canonical_hash_prefix": self.prompt_hash_lead,
             "merkle_root_lead": self.merkle_root_lead,
+            "legacy_merkle_status": self.legacy_merkle_status,
+            "legacy_merkle_computed_lead": (
+                self.legacy_merkle_computed_lead
+            ),
+            "legacy_merkle_would_reject": (
+                self.legacy_merkle_would_reject
+            ),
+            "legacy_merkle_enforced": self.legacy_merkle_enforced,
         }
 
     def verdict_fields(self) -> dict[str, Any]:
         return {
             "arrival_ts": self.t_arrival,
             "decision_ts": self.t_decision,
+            "protocol_version": self.protocol_version,
             "submitted_drand_round": self.submitted_drand_round,
             "arrival_drand_round": self.arrival_drand_round,
             "drand_delta": self.drand_delta,
@@ -252,6 +282,14 @@ class SubmitTelemetry:
             "queue_wait_ms": self.queue_wait_ms,
             "verify_ms": self.verify_ms,
             "total_ms": self.total_ms,
+            "legacy_merkle_status": self.legacy_merkle_status,
+            "legacy_merkle_computed_lead": (
+                self.legacy_merkle_computed_lead
+            ),
+            "legacy_merkle_would_reject": (
+                self.legacy_merkle_would_reject
+            ),
+            "legacy_merkle_enforced": self.legacy_merkle_enforced,
         }
 
 

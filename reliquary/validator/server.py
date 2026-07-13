@@ -31,6 +31,12 @@ from reliquary.constants import (
     BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION,
     DRAND_ROUND_BACKWARD_TOLERANCE,
     ENFORCE_ENVELOPE_SIGNATURE,
+    FORCED_SEED_CDF_BOUNDARY_EPSILON,
+    FORCED_SEED_CDF_ENFORCE,
+    FORCED_SEED_CONSISTENCY_FLOOR,
+    FORCED_SEED_ENFORCE,
+    FORCED_SEED_ROLLOUT_FLOOR,
+    LEGACY_MERKLE_ROOT_ENFORCE,
     MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
     MAX_PENDING_PROOF_QUEUE_DEPTH,
@@ -45,6 +51,9 @@ from reliquary.constants import (
     SPARSE_VALID_IDLE_SEAL_SECONDS,
     SPARSE_VALID_MAX_WINDOW_SECONDS,
     VALIDATOR_HTTP_PORT,
+)
+from reliquary.protocol.legacy_merkle import (
+    legacy_submission_merkle_matches,
 )
 from reliquary.protocol.signatures import verify_envelope_signature
 from reliquary.protocol.submission import (
@@ -362,6 +371,24 @@ class _Health(BaseModel):
     training_accumulator_targets: dict[str, int] = Field(default_factory=dict)
     training_accumulator_counts: dict[str, int] = Field(default_factory=dict)
     training_accumulator_ready: bool = False
+    forced_seed_enforced: bool = FORCED_SEED_ENFORCE
+    forced_seed_consistency_floor: float = FORCED_SEED_CONSISTENCY_FLOOR
+    forced_seed_rollout_floor: float = FORCED_SEED_ROLLOUT_FLOOR
+    forced_seed_cdf_enforced: bool = FORCED_SEED_CDF_ENFORCE
+    forced_seed_cdf_boundary_epsilon: float = (
+        FORCED_SEED_CDF_BOUNDARY_EPSILON
+    )
+    legacy_merkle_root_enforced: bool = LEGACY_MERKLE_ROOT_ENFORCE
+    legacy_merkle_checks_total: int = 0
+    legacy_merkle_matches: int = 0
+    legacy_merkle_mismatches: int = 0
+    legacy_merkle_errors: int = 0
+    legacy_merkle_distinct_hotkeys: int = 0
+    legacy_merkle_environments: list[str] = Field(default_factory=list)
+    legacy_merkle_protocol_versions: dict[str, int] = Field(
+        default_factory=dict
+    )
+    legacy_merkle_last_mismatch_ts: float | None = None
 
 
 class ValidatorServer:
@@ -385,6 +412,15 @@ class ValidatorServer:
         self._registration_refresh_lock = asyncio.Lock()
         self._last_registration_refresh_attempt = 0.0
         self._training_accumulator_state: dict[str, Any] = {}
+        self._legacy_merkle_stats: collections.Counter[str] = (
+            collections.Counter()
+        )
+        self._legacy_merkle_hotkeys: set[str] = set()
+        self._legacy_merkle_environments: set[str] = set()
+        self._legacy_merkle_protocol_versions: collections.Counter[int] = (
+            collections.Counter()
+        )
+        self._legacy_merkle_last_mismatch_ts: float | None = None
         self.app: FastAPI = self._build_app()
         self._server: uvicorn.Server | None = None
         self._task: asyncio.Task[Any] | None = None
@@ -534,6 +570,56 @@ class ValidatorServer:
         if hotkey not in self._registered_hotkeys:
             return RejectReason.HOTKEY_NOT_REGISTERED
         return None
+
+    def _observe_legacy_merkle(
+        self,
+        request: BatchSubmissionRequest,
+        telemetry: SubmitTelemetry,
+        *,
+        env_name: str,
+    ) -> str:
+        """Measure current miner-root parity without changing wire-v1."""
+        computed_root: str | None = None
+        error_type: str | None = None
+        try:
+            matches, computed_root = legacy_submission_merkle_matches(request)
+            status = "match" if matches else "mismatch"
+        except (
+            AttributeError,
+            KeyError,
+            TypeError,
+            ValueError,
+            OverflowError,
+        ) as exc:
+            status = "error"
+            error_type = type(exc).__name__
+
+        request._legacy_merkle_verified = status == "match"
+        telemetry.apply_legacy_merkle(
+            status=status,
+            computed_root=computed_root,
+            enforced=LEGACY_MERKLE_ROOT_ENFORCE,
+        )
+        self._legacy_merkle_stats[status] += 1
+        self._legacy_merkle_hotkeys.add(request.miner_hotkey)
+        if env_name:
+            self._legacy_merkle_environments.add(env_name)
+        self._legacy_merkle_protocol_versions[request.protocol_version] += 1
+        if status != "match":
+            self._legacy_merkle_last_mismatch_ts = time.time()
+
+        log_submission_stage(
+            logger,
+            logging.INFO if status == "match" else logging.WARNING,
+            "legacy_merkle_checked",
+            telemetry,
+            reject_stage=("legacy_merkle" if status != "match" else None),
+            reject_reason=None,
+            legacy_merkle_error_type=error_type,
+            submission_env_name=env_name,
+            accepted_into_pool=None,
+        )
+        return status
 
     @property
     def submit_queue_depth(self) -> int:
@@ -733,6 +819,31 @@ class ValidatorServer:
             training_accumulator_targets=dict(accumulator.get("targets", {})),
             training_accumulator_counts=dict(accumulator.get("counts", {})),
             training_accumulator_ready=bool(accumulator.get("ready", False)),
+            forced_seed_enforced=FORCED_SEED_ENFORCE,
+            forced_seed_consistency_floor=FORCED_SEED_CONSISTENCY_FLOOR,
+            forced_seed_rollout_floor=FORCED_SEED_ROLLOUT_FLOOR,
+            forced_seed_cdf_enforced=FORCED_SEED_CDF_ENFORCE,
+            forced_seed_cdf_boundary_epsilon=(
+                FORCED_SEED_CDF_BOUNDARY_EPSILON
+            ),
+            legacy_merkle_root_enforced=LEGACY_MERKLE_ROOT_ENFORCE,
+            legacy_merkle_checks_total=sum(self._legacy_merkle_stats.values()),
+            legacy_merkle_matches=self._legacy_merkle_stats["match"],
+            legacy_merkle_mismatches=self._legacy_merkle_stats["mismatch"],
+            legacy_merkle_errors=self._legacy_merkle_stats["error"],
+            legacy_merkle_distinct_hotkeys=len(self._legacy_merkle_hotkeys),
+            legacy_merkle_environments=sorted(
+                self._legacy_merkle_environments
+            ),
+            legacy_merkle_protocol_versions={
+                str(version): count
+                for version, count in sorted(
+                    self._legacy_merkle_protocol_versions.items()
+                )
+            },
+            legacy_merkle_last_mismatch_ts=(
+                self._legacy_merkle_last_mismatch_ts
+            ),
         )
 
     @staticmethod
@@ -850,6 +961,35 @@ class ValidatorServer:
                 telemetry,
                 queue_depth=self._submit_queue.qsize(),
             )
+
+            def _reject_before_quota(
+                reason: RejectReason,
+                *,
+                reject_stage: str,
+                **extra: Any,
+            ) -> BatchSubmissionResponse:
+                telemetry.mark_decision()
+                self.record_verdict(
+                    hk,
+                    request.merkle_root,
+                    False,
+                    reason,
+                    window_n=request.window_start,
+                    telemetry=telemetry,
+                    reject_stage=reject_stage,
+                    accepted_into_pool=False,
+                )
+                log_submission_stage(
+                    logger,
+                    logging.WARNING,
+                    "candidate_rejected",
+                    telemetry,
+                    reject_stage=reject_stage,
+                    reject_reason=reason.value,
+                    accepted_into_pool=False,
+                    **extra,
+                )
+                return BatchSubmissionResponse(accepted=False, reason=reason)
 
             # ENVELOPE SIGNATURE CHECK — runs BEFORE rate-limit increment.
             #
@@ -991,18 +1131,22 @@ class ValidatorServer:
                     accepted=False, reason=RejectReason.WINDOW_NOT_ACTIVE,
                 )
 
-            # Route by env_name: determine which batcher to use.
-            # env_name is carried on each rollout; all rollouts in one request
-            # must be for the same env (enforced by the miner engine).
-            submission_env_name = (
-                request.rollouts[0].env_name if request.rollouts else ""
-            )
-            batcher = self._active_batchers.get(submission_env_name)
-            if batcher is None:
-                # Fallback: if env_name is absent or unknown, try the legacy
-                # active_batcher path (single-env backward compat).
-                batcher = self.active_batcher
-            if batcher is None:
+            # Route only homogeneous, explicitly known environments. Honest
+            # miners already emit one environment per group. The old fallback
+            # sent an unknown or mixed-env request to the first active batcher,
+            # leaving an unsigned routing field able to select the wrong
+            # verifier path.
+            submission_env_names = {
+                rollout.env_name for rollout in request.rollouts
+            }
+            if len(submission_env_names) != 1:
+                return _reject_before_quota(
+                    RejectReason.BAD_SCHEMA,
+                    reject_stage="environment",
+                    submitted_environment_count=len(submission_env_names),
+                )
+            submission_env_name = next(iter(submission_env_names))
+            if not self._active_batchers and self.active_batcher is None:
                 telemetry.mark_decision()
                 log_submission_stage(
                     logger,
@@ -1014,6 +1158,27 @@ class ValidatorServer:
                     accepted_into_pool=False,
                 )
                 raise HTTPException(status_code=503, detail="no_active_window")
+            batcher = self._active_batchers.get(submission_env_name)
+            if batcher is None:
+                # Loose MagicMock fixtures and legacy single-batcher embedding
+                # do not always expose a stable env.name. Production batchers
+                # do, and must never route an unknown environment through the
+                # scalar accessor.
+                active_env_name = getattr(
+                    getattr(self.active_batcher, "env", None), "name", None
+                )
+                if (
+                    not self._active_batchers
+                    or active_env_name is None
+                    or _is_mock_like(active_env_name)
+                ):
+                    batcher = self.active_batcher
+            if batcher is None:
+                return _reject_before_quota(
+                    RejectReason.BAD_SCHEMA,
+                    reject_stage="environment",
+                    submitted_environment=submission_env_name,
+                )
             telemetry.refresh_from_batcher(batcher)
             if request.window_start != batcher.window_start:
                 telemetry.mark_decision()
@@ -1027,6 +1192,21 @@ class ValidatorServer:
                     accepted_into_pool=False,
                 )
                 raise HTTPException(status_code=409, detail="window_mismatch")
+
+            legacy_merkle_status = self._observe_legacy_merkle(
+                request,
+                telemetry,
+                env_name=submission_env_name,
+            )
+            if (
+                LEGACY_MERKLE_ROOT_ENFORCE
+                and legacy_merkle_status != "match"
+            ):
+                return _reject_before_quota(
+                    RejectReason.MERKLE_ROOT_MISMATCH,
+                    reject_stage="legacy_merkle",
+                    legacy_merkle_status=legacy_merkle_status,
+                )
 
             # Only registered subnet hotkeys may consume submission quota or
             # proof capacity. The signature gate above proves ownership of the

@@ -36,9 +36,11 @@ from reliquary.constants import (
     FORCED_SEED_CDF_BOUNDARY_EPSILON,
     FORCED_SEED_CDF_ENFORCE,
     FORCED_SEED_ENFORCE,
+    LEGACY_MERKLE_ROOT_ENFORCE,
 )
 from reliquary.environment.base import Environment
 from reliquary.shared.prompt_range import window_prompt_range
+from reliquary.protocol.legacy_merkle import legacy_submission_merkle_matches
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     BatchSubmissionResponse,
@@ -1003,6 +1005,27 @@ class GrpoWindowBatcher:
                 return reject(RejectReason.BAD_SCHEMA, "schema")
             if list(rollout.tokens) != list(rollout.commit["tokens"]):
                 return reject(RejectReason.TOKENS_MISMATCH, "token_invariant")
+
+        # Defense in depth for direct batcher callers. The HTTP path computes
+        # this before quota/proof admission and marks the private request attr;
+        # no wire field or miner behavior changes.
+        if (
+            LEGACY_MERKLE_ROOT_ENFORCE
+            and not request._legacy_merkle_verified
+        ):
+            try:
+                matches, _ = legacy_submission_merkle_matches(request)
+            except (
+                AttributeError,
+                KeyError,
+                TypeError,
+                ValueError,
+                OverflowError,
+            ):
+                matches = False
+            if not matches:
+                return reject(RejectReason.MERKLE_ROOT_MISMATCH, "legacy_merkle")
+            request._legacy_merkle_verified = True
 
         # Proof-free checks before reward and GRAIL. These reject malformed
         # payloads before tokenizer decode, env reward work, or GPU proof work.
