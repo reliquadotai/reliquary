@@ -18,6 +18,7 @@ import os
 import threading
 import time
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any, Optional
 
 
@@ -81,6 +82,7 @@ class VirtualParquetDataset:
         self._source_failures = 0
         self._local_full_file_hits = 0
         self._full_file_fallbacks = 0
+        self._local_manifest_fallbacks = 0
         self._last_success_ts: Optional[float] = None
         self._last_failure_ts: Optional[float] = None
         self._last_error_type: Optional[str] = None
@@ -137,6 +139,33 @@ class VirtualParquetDataset:
             revision=self._revision,
             repo_type="dataset",
         )
+
+    def _local_manifest_files(self) -> list[str]:
+        """Discover exact pinned parquet files from the persistent HF cache."""
+        from huggingface_hub import snapshot_download
+
+        snapshot_root = Path(
+            snapshot_download(
+                repo_id=self._repo,
+                revision=self._revision,
+                repo_type="dataset",
+                allow_patterns=[f"{self._data_dir}/*.parquet"],
+                local_files_only=True,
+            )
+        )
+        data_root = snapshot_root / self._data_dir
+        local_files = sorted(
+            path for path in data_root.glob("*.parquet") if path.is_file()
+        )
+        if not local_files:
+            raise RuntimeError(
+                f"no cached parquet files under {self._data_dir}"
+            )
+        prefix = f"datasets/{self._repo}@{self._revision}/"
+        return [
+            prefix + path.relative_to(snapshot_root).as_posix()
+            for path in local_files
+        ]
 
     def _open_parquet_file(self, path: str):
         """Open one pinned Parquet blob, preferring the persistent HF cache.
@@ -223,6 +252,9 @@ class VirtualParquetDataset:
                 "source_failures_total": self._source_failures,
                 "local_full_file_hits_total": self._local_full_file_hits,
                 "full_file_fallbacks_total": self._full_file_fallbacks,
+                "local_manifest_fallbacks_total": (
+                    self._local_manifest_fallbacks
+                ),
                 "last_success_ts": last_success,
                 "last_failure_ts": last_failure,
                 "last_error_type": self._last_error_type,
@@ -237,6 +269,7 @@ class VirtualParquetDataset:
                 return
             fs = self._filesystem()
             base = f"datasets/{self._repo}@{self._revision}/{self._data_dir}"
+            listing_exc: Exception | None = None
             try:
                 files = sorted(
                     str(p)
@@ -244,15 +277,40 @@ class VirtualParquetDataset:
                     if str(p).endswith(".parquet")
                 )
             except Exception as exc:
+                files = []
+                listing_exc = exc
+            if not files and self._full_file_fallback:
+                try:
+                    files = self._local_manifest_files()
+                except Exception as local_exc:
+                    if listing_exc is not None:
+                        self._record_failure(listing_exc)
+                    self._record_failure(local_exc)
+                    raise PromptSourceUnavailable(
+                        f"prompt source manifest unavailable: "
+                        f"{self._repo}@{self._revision} "
+                        f"({type(local_exc).__name__})"
+                    ) from local_exc
+                if listing_exc is not None:
+                    self._record_failure(listing_exc)
+                with self._health_lock:
+                    self._local_manifest_fallbacks += 1
+                logger.warning(
+                    "prompt_source_local_manifest_fallback repo=%s "
+                    "revision=%s files=%d",
+                    self._repo,
+                    self._revision,
+                    len(files),
+                )
+            if not files:
+                exc = listing_exc or RuntimeError(
+                    f"no parquet files under {base}"
+                )
                 self._record_failure(exc)
                 raise PromptSourceUnavailable(
                     f"prompt source manifest unavailable: "
                     f"{self._repo}@{self._revision} ({type(exc).__name__})"
                 ) from exc
-            if not files:
-                exc = RuntimeError(f"no parquet files under {base}")
-                self._record_failure(exc)
-                raise PromptSourceUnavailable(str(exc)) from exc
             rg_start: list[int] = []
             rg_loc: list[tuple[int, int]] = []
             total = 0
