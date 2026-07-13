@@ -97,6 +97,34 @@ async def test_registration_refresh_failure_preserves_last_known_good():
     close_subtensor.assert_awaited_once_with(None)
 
 
+@pytest.mark.asyncio
+async def test_empty_metagraph_refresh_preserves_last_known_good():
+    svc = _build_late_drop_service()
+    svc.server.set_registered_hotkeys({"hk-a"}, refreshed_at=123.0)
+    subtensor = object()
+
+    with (
+        patch(
+            "reliquary.validator.service.chain.get_subtensor",
+            new=AsyncMock(return_value=subtensor),
+        ),
+        patch(
+            "reliquary.validator.service.chain.get_metagraph",
+            new=AsyncMock(return_value=MagicMock(hotkeys=[])),
+        ),
+        patch(
+            "reliquary.validator.service.chain.close_subtensor",
+            new=AsyncMock(),
+        ) as close_subtensor,
+    ):
+        refreshed = await svc._refresh_registered_hotkeys(force=True)
+
+    assert refreshed is False
+    assert svc.server._registered_hotkeys == frozenset({"hk-a"})
+    assert svc.server._registration_refreshed_at == 123.0
+    close_subtensor.assert_awaited_once_with(subtensor)
+
+
 def test_service_creates_grpo_window_batcher():
     """The service's open_grpo_window() returns a GrpoWindowBatcher wired up
     with the shared CooldownMap."""
