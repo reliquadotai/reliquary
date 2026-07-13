@@ -135,6 +135,12 @@ class OpenCodeInstructEnvironment:
     def __len__(self) -> int:
         return len(self._dataset)
 
+    def source_health(self) -> dict:
+        snapshot = getattr(self._dataset, "source_health", None)
+        if callable(snapshot):
+            return dict(snapshot())
+        return {"status": "unreported"}
+
     def get_problem(self, index: int) -> dict:
         idx = index % len(self._dataset)
         row = self._dataset[idx]
