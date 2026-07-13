@@ -279,6 +279,21 @@ R2 failure, but a growing depth or old `archive_queue_oldest_age_seconds`
 requires operator attention. `archive_last_uploaded_window` is the direct
 confirmation that a recent archive left the local retry queue.
 
+Forced-seed CDF enforcement also defaults off. Private schema-v3 calibration
+rows bind each observation to its window, environment, and checkpoint and
+count CDF misses above 0.01, 0.05, and 0.10. Run:
+
+```bash
+python scripts/report_forced_seed_cdf.py
+```
+
+Any unexplained hard mismatch produces an immediate
+`HOLD_AND_REVIEW_CDF_HARD_MISMATCHES`; the 24-hour, 1,000-group, five-hotkey
+threshold is only a minimum for becoming eligible to canary enforcement. Do
+not raise the boundary epsilon merely to make the report pass: first separate
+environment, checkpoint, forced-span, and numerical-kernel effects using the
+schema-v3 fields.
+
 Before `train_step`, the validator runs the training-quarantine gate. If the
 selected batch has high-confidence poison signals, the archive still publishes
 and emissions remain replayable from `rewards_by_hotkey`, but GRPO is skipped

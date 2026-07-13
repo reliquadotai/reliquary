@@ -22,6 +22,9 @@ class SeedConsistencyDiagnostics:
     n_boundary_match: int = 0
     n_hard_mismatch: int = 0
     n_deterministic_hard_mismatch: int = 0
+    n_miss_gt_0_01: int = 0
+    n_miss_gt_0_05: int = 0
+    n_miss_gt_0_10: int = 0
     max_cdf_miss: float = 0.0
 
 
@@ -167,6 +170,9 @@ def seed_consistency_diagnostics(
             boundary_match.sum(),
             hard_mismatch.sum(),
             deterministic_hard.sum(),
+            (miss > 0.01).sum(),
+            (miss > 0.05).sum(),
+            (miss > 0.10).sum(),
         )
     ).tolist()
     return SeedConsistencyDiagnostics(
@@ -176,5 +182,8 @@ def seed_consistency_diagnostics(
         n_boundary_match=int(counts[2]),
         n_hard_mismatch=int(counts[3]),
         n_deterministic_hard_mismatch=int(counts[4]),
+        n_miss_gt_0_01=int(counts[5]),
+        n_miss_gt_0_05=int(counts[6]),
+        n_miss_gt_0_10=int(counts[7]),
         max_cdf_miss=float(miss.max().item()),
     )

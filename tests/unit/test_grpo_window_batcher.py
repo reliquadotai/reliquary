@@ -3025,6 +3025,9 @@ def test_forced_seed_cdf_gate_rejects_sparse_branch_mismatch(monkeypatch):
     assert len(recorded) == 1
     assert recorded[0][1]["cdf_would_reject"] is True
     assert recorded[0][1]["cdf_enforced"] is True
+    assert recorded[0][1]["window_start"] == 500
+    assert recorded[0][1]["checkpoint_hash"] == "sha256:test"
+    assert recorded[0][1]["env_name"] == "fake"
 
 
 def test_forced_seed_cdf_gate_is_shadow_until_calibrated(monkeypatch):

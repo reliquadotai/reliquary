@@ -242,7 +242,13 @@ def record_forced_seed_shadow(
     n_boundary_match: int = 0,
     n_hard_mismatch: int = 0,
     n_deterministic_hard_mismatch: int = 0,
+    n_miss_gt_0_01: int = 0,
+    n_miss_gt_0_05: int = 0,
+    n_miss_gt_0_10: int = 0,
     max_cdf_miss: float = 0.0,
+    window_start: int | None = None,
+    env_name: str = "",
+    checkpoint_hash: str = "",
     cdf_boundary_epsilon: float = 0.0,
     ratio_group_would_reject: bool = False,
     ratio_rollout_would_reject: bool = False,
@@ -270,12 +276,17 @@ def record_forced_seed_shadow(
     try:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         record = {
-            "schema_version": 2,
+            "schema_version": 3,
             "event": "forced_seed_shadow",
             "surface": "forced-seed-shadow",
             "ts_unix": time.time(),
             "miner_hotkey": str(hotkey),
             "prompt_idx": int(prompt_idx),
+            "window_start": (
+                int(window_start) if window_start is not None else None
+            ),
+            "env_name": str(env_name),
+            "checkpoint_hash": str(checkpoint_hash),
             "n_stoch": int(n_stoch),
             "n_match": int(n_match),
             "score": float(n_match) / float(max(1, n_stoch)),
@@ -285,6 +296,9 @@ def record_forced_seed_shadow(
             "n_deterministic_hard_mismatch": int(
                 n_deterministic_hard_mismatch
             ),
+            "n_miss_gt_0_01": int(n_miss_gt_0_01),
+            "n_miss_gt_0_05": int(n_miss_gt_0_05),
+            "n_miss_gt_0_10": int(n_miss_gt_0_10),
             "max_cdf_miss": float(max_cdf_miss),
             "cdf_boundary_epsilon": float(cdf_boundary_epsilon),
             "ratio_group_would_reject": bool(ratio_group_would_reject),

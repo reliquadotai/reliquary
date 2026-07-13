@@ -1215,6 +1215,9 @@ class GrpoWindowBatcher:
         grp_seed_boundary_match = 0
         grp_seed_hard_mismatch = 0
         grp_seed_deterministic_hard_mismatch = 0
+        grp_seed_miss_gt_0_01 = 0
+        grp_seed_miss_gt_0_05 = 0
+        grp_seed_miss_gt_0_10 = 0
         grp_seed_max_cdf_miss = 0.0
         # Per-rollout (n_stoch, n_match) — the per-rollout gate needs each
         # rollout separately, since the group average hides a partial swap.
@@ -1319,6 +1322,15 @@ class GrpoWindowBatcher:
                 )
                 or 0
             )
+            seed_miss_gt_0_01 = int(
+                getattr(proof, "seed_n_miss_gt_0_01", 0) or 0
+            )
+            seed_miss_gt_0_05 = int(
+                getattr(proof, "seed_n_miss_gt_0_05", 0) or 0
+            )
+            seed_miss_gt_0_10 = int(
+                getattr(proof, "seed_n_miss_gt_0_10", 0) or 0
+            )
             seed_max_cdf_miss = float(
                 getattr(proof, "seed_max_cdf_miss", 0.0) or 0.0
             )
@@ -1326,6 +1338,9 @@ class GrpoWindowBatcher:
             grp_seed_boundary_match += seed_boundary_match
             grp_seed_hard_mismatch += seed_hard_mismatch
             grp_seed_deterministic_hard_mismatch += seed_deterministic_hard
+            grp_seed_miss_gt_0_01 += seed_miss_gt_0_01
+            grp_seed_miss_gt_0_05 += seed_miss_gt_0_05
+            grp_seed_miss_gt_0_10 += seed_miss_gt_0_10
             grp_seed_max_cdf_miss = max(
                 grp_seed_max_cdf_miss,
                 seed_max_cdf_miss,
@@ -1339,7 +1354,14 @@ class GrpoWindowBatcher:
                     "n_boundary_match": seed_boundary_match,
                     "n_hard_mismatch": seed_hard_mismatch,
                     "n_deterministic_hard_mismatch": seed_deterministic_hard,
+                    "n_miss_gt_0_01": seed_miss_gt_0_01,
+                    "n_miss_gt_0_05": seed_miss_gt_0_05,
+                    "n_miss_gt_0_10": seed_miss_gt_0_10,
                     "max_cdf_miss": seed_max_cdf_miss,
+                    "completion_length": _seed_completion_len,
+                    "forced": bool(
+                        (rollout.commit.get("rollout") or {}).get("forced")
+                    ),
                 }
             )
             if proof.sketch_diff_max > sketch_diff_max:
@@ -1713,7 +1735,13 @@ class GrpoWindowBatcher:
             n_deterministic_hard_mismatch=(
                 grp_seed_deterministic_hard_mismatch
             ),
+            n_miss_gt_0_01=grp_seed_miss_gt_0_01,
+            n_miss_gt_0_05=grp_seed_miss_gt_0_05,
+            n_miss_gt_0_10=grp_seed_miss_gt_0_10,
             max_cdf_miss=grp_seed_max_cdf_miss,
+            window_start=self.window_start,
+            env_name=getattr(self.env, "name", ""),
+            checkpoint_hash=request.checkpoint_hash,
             cdf_boundary_epsilon=FORCED_SEED_CDF_BOUNDARY_EPSILON,
             ratio_group_would_reject=group_would_reject,
             ratio_rollout_would_reject=rollout_would_reject,

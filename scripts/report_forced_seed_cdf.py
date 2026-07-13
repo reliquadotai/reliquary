@@ -28,6 +28,7 @@ def _quantile(values: list[float], q: float) -> float | None:
 
 def summarize(rows: list[dict]) -> dict:
     v2 = [row for row in rows if int(row.get("schema_version", 1)) >= 2]
+    v3 = [row for row in rows if int(row.get("schema_version", 1)) >= 3]
     scores = [float(row.get("score", 0.0)) for row in rows]
     cdf_clean = [
         row
@@ -37,8 +38,11 @@ def summarize(rows: list[dict]) -> dict:
     ]
     hard_clean = [row for row in cdf_clean if row.get("cdf_would_reject", False)]
     by_hotkey: dict[str, list[dict]] = defaultdict(list)
+    by_environment: dict[str, list[dict]] = defaultdict(list)
     for row in v2:
         by_hotkey[str(row.get("miner_hotkey", ""))].append(row)
+        if int(row.get("schema_version", 1)) >= 3:
+            by_environment[str(row.get("env_name", "") or "unknown")].append(row)
 
     timestamps = [float(row["ts_unix"]) for row in v2 if "ts_unix" in row]
     span_hours = (
@@ -46,18 +50,43 @@ def summarize(rows: list[dict]) -> dict:
         if len(timestamps) >= 2
         else 0.0
     )
-    if len(v2) < 1000 or len(by_hotkey) < 5 or span_hours < 24:
-        decision = "INSUFFICIENT_EVIDENCE"
-    elif hard_clean:
+    # One unexplained hard mismatch is enough to stop activation. Volume and
+    # duration thresholds are only evidence requirements for enabling a gate,
+    # not prerequisites for recognizing unsafe behavior.
+    if hard_clean:
         decision = "HOLD_AND_REVIEW_CDF_HARD_MISMATCHES"
+    elif len(v2) < 1000 or len(by_hotkey) < 5 or span_hours < 24:
+        decision = "INSUFFICIENT_EVIDENCE"
     else:
         decision = "ELIGIBLE_FOR_BOUNDED_ENFORCEMENT_CANARY"
+
+    ratio_clean_positions = sum(
+        int(row.get("n_positions", 0) or 0) for row in cdf_clean
+    )
+    ratio_clean_hard_mismatches = sum(
+        int(row.get("n_hard_mismatch", 0) or 0) for row in cdf_clean
+    )
 
     return {
         "records_total": len(rows),
         "records_schema_v2": len(v2),
+        "records_schema_v3": len(v3),
         "hotkeys_schema_v2": len(by_hotkey),
         "schema_v2_span_hours": span_hours,
+        "windows_schema_v3": len(
+            {
+                int(row["window_start"])
+                for row in v3
+                if row.get("window_start") is not None
+            }
+        ),
+        "checkpoints_schema_v3": sorted(
+            {
+                str(row.get("checkpoint_hash", ""))
+                for row in v3
+                if row.get("checkpoint_hash")
+            }
+        ),
         "ratio_score": {
             "min": min(scores) if scores else None,
             "p01": _quantile(scores, 0.01),
@@ -75,6 +104,20 @@ def summarize(rows: list[dict]) -> dict:
             bool(row.get("cdf_would_reject", False)) for row in v2
         ),
         "cdf_hard_mismatch_groups_among_ratio_clean": len(hard_clean),
+        "cdf_positions_among_ratio_clean": ratio_clean_positions,
+        "cdf_hard_mismatch_positions_among_ratio_clean": (
+            ratio_clean_hard_mismatches
+        ),
+        "cdf_hard_mismatch_rate_among_ratio_clean": (
+            float(ratio_clean_hard_mismatches) / float(ratio_clean_positions)
+            if ratio_clean_positions
+            else None
+        ),
+        "cdf_miss_severity_schema_v3": {
+            "gt_0_01": sum(int(row.get("n_miss_gt_0_01", 0) or 0) for row in v3),
+            "gt_0_05": sum(int(row.get("n_miss_gt_0_05", 0) or 0) for row in v3),
+            "gt_0_10": sum(int(row.get("n_miss_gt_0_10", 0) or 0) for row in v3),
+        },
         "max_cdf_miss_p99_ratio_clean": _quantile(
             [float(row.get("max_cdf_miss", 0.0)) for row in cdf_clean],
             0.99,
@@ -96,10 +139,28 @@ def summarize(rows: list[dict]) -> dict:
             ),
             key=lambda item: (-item["cdf_would_reject"], item["ratio_mean"]),
         ),
+        "by_environment_schema_v3": sorted(
+            (
+                {
+                    "environment": environment,
+                    "records": len(items),
+                    "cdf_would_reject": sum(
+                        bool(item.get("cdf_would_reject", False))
+                        for item in items
+                    ),
+                    "n_hard_mismatch": sum(
+                        int(item.get("n_hard_mismatch", 0) or 0)
+                        for item in items
+                    ),
+                }
+                for environment, items in by_environment.items()
+            ),
+            key=lambda item: item["environment"],
+        ),
         "decision": decision,
         "activation_rule": (
             "Do not set FORCED_SEED_CDF_ENFORCE=true until at least 24h, "
-            "1000 schema-v2 groups and 5 hotkeys show zero unexplained hard "
+            "1000 schema-v2+ groups and 5 hotkeys show zero unexplained hard "
             "mismatches among ratio-clean traffic, then run a bounded canary "
             "and confirm an adversarial branch-token control still rejects."
         ),
@@ -126,7 +187,9 @@ def main() -> None:
     print(f"decision: {report['decision']}")
     print(
         "records: "
-        f"{report['records_schema_v2']} v2 / {report['records_total']} total; "
+        f"{report['records_schema_v2']} v2+ "
+        f"({report['records_schema_v3']} v3) / "
+        f"{report['records_total']} total; "
         f"{report['hotkeys_schema_v2']} hotkeys; "
         f"{report['schema_v2_span_hours']:.1f}h"
     )
@@ -138,7 +201,15 @@ def main() -> None:
     )
     print(
         "ratio-clean CDF hard mismatches: "
-        f"{report['cdf_hard_mismatch_groups_among_ratio_clean']}"
+        f"{report['cdf_hard_mismatch_groups_among_ratio_clean']} groups, "
+        f"{report['cdf_hard_mismatch_positions_among_ratio_clean']} / "
+        f"{report['cdf_positions_among_ratio_clean']} positions"
+    )
+    print(
+        "v3 severity: "
+        f">.01={report['cdf_miss_severity_schema_v3']['gt_0_01']} "
+        f">.05={report['cdf_miss_severity_schema_v3']['gt_0_05']} "
+        f">.10={report['cdf_miss_severity_schema_v3']['gt_0_10']}"
     )
     print(report["activation_rule"])
 
