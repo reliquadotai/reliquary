@@ -2,6 +2,7 @@
 
 import os
 import time
+from types import SimpleNamespace
 import bittensor as bt
 import pytest
 from fastapi.testclient import TestClient
@@ -595,6 +596,47 @@ def test_state_endpoint_per_env_cooldown_via_query_param():
     unk = client.get("/state", params={"env": "nope"})
     assert unk.status_code == 404
     assert unk.json()["detail"] == "unknown_env"
+
+
+def test_health_exposes_each_environment_window_independently():
+    math = _batcher(window_start=500)
+    code = _batcher(window_start=500)
+    math.valid_count = 4
+    math._valid = [SimpleNamespace(prompt_idx=i) for i in range(4)]
+    math._proof_admission_count = 4
+    math._proof_grading_attempts = 4
+    code.valid_count = 8
+    code._valid = [SimpleNamespace(prompt_idx=i) for i in range(8)]
+    code._proof_admission_count = 8
+    code._proof_grading_attempts = 9
+    code.force_seal("batch_filled")
+
+    server = ValidatorServer()
+    server.set_active_batchers({
+        "openmathinstruct": math,
+        "opencodeinstruct": code,
+    })
+    health = TestClient(server.app).get("/health").json()
+
+    assert health["valid_submissions_count"] == 4
+    assert health["window_environments"]["openmathinstruct"] == {
+        "window_n": 500,
+        "sealed": False,
+        "force_seal_reason": None,
+        "valid_submissions_count": 4,
+        "distinct_valid_prompt_count": 4,
+        "last_valid_submission_ts": None,
+        "seconds_since_last_valid_submission": None,
+        "proof_admission_count": 4,
+        "proof_grading_attempts": 4,
+        "pending_proof_reservations": 0,
+        "inflight_proof_reservations": 0,
+        "post_trigger_proof_admission_count": 0,
+    }
+    code_health = health["window_environments"]["opencodeinstruct"]
+    assert code_health["valid_submissions_count"] == 8
+    assert code_health["sealed"] is True
+    assert code_health["force_seal_reason"] == "batch_filled"
 
 
 def test_state_endpoint_does_not_block_on_batcher_lock():

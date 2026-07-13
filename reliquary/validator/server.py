@@ -359,6 +359,9 @@ class _Health(BaseModel):
     proof_grading_attempts: int | None = None
     pending_proof_reservations: int | None = None
     inflight_proof_reservations: int | None = None
+    window_environments: dict[str, dict[str, Any]] = Field(
+        default_factory=dict
+    )
     logical_group_reservations: int = 0
     logical_group_duplicate_rejects: int = 0
     logical_group_dedup_by_environment: dict[str, dict[str, int]] = Field(
@@ -843,6 +846,67 @@ class ValidatorServer:
                 }
         return snapshots
 
+    @staticmethod
+    def _window_environment_health(batcher: Any) -> dict[str, Any]:
+        """Return a JSON-safe per-environment view of one active batcher."""
+        def _integer(value: Any) -> int | None:
+            if isinstance(value, numbers.Integral) and not isinstance(value, bool):
+                return int(value)
+            return None
+
+        def _floating(value: Any) -> float | None:
+            if isinstance(value, numbers.Real) and not isinstance(value, bool):
+                return float(value)
+            return None
+
+        distinct_fn = getattr(batcher, "distinct_valid_prompt_count", None)
+        idle_fn = getattr(batcher, "seconds_since_last_valid_submission", None)
+        sealed_fn = getattr(batcher, "is_sealed", None)
+        try:
+            distinct = distinct_fn() if callable(distinct_fn) else None
+        except Exception:
+            distinct = None
+        try:
+            idle_seconds = idle_fn() if callable(idle_fn) else None
+        except Exception:
+            idle_seconds = None
+        try:
+            sealed = bool(sealed_fn()) if callable(sealed_fn) else None
+        except Exception:
+            sealed = None
+
+        force_seal_reason = getattr(batcher, "force_seal_reason", None)
+        return {
+            "window_n": _integer(getattr(batcher, "window_start", None)),
+            "sealed": sealed,
+            "force_seal_reason": (
+                force_seal_reason if isinstance(force_seal_reason, str) else None
+            ),
+            "valid_submissions_count": _integer(
+                getattr(batcher, "valid_count", None)
+            ),
+            "distinct_valid_prompt_count": _integer(distinct),
+            "last_valid_submission_ts": _floating(
+                getattr(batcher, "last_valid_submission_wall_ts", None)
+            ),
+            "seconds_since_last_valid_submission": _floating(idle_seconds),
+            "proof_admission_count": _integer(
+                getattr(batcher, "proof_admission_count", None)
+            ),
+            "proof_grading_attempts": _integer(
+                getattr(batcher, "proof_grading_attempts", None)
+            ),
+            "pending_proof_reservations": _integer(
+                getattr(batcher, "pending_proof_reservations", None)
+            ),
+            "inflight_proof_reservations": _integer(
+                getattr(batcher, "inflight_proof_reservations", None)
+            ),
+            "post_trigger_proof_admission_count": _integer(
+                getattr(batcher, "post_trigger_proof_admission_count", None)
+            ),
+        }
+
     def _health_payload(self) -> _Health:
         batcher = self.active_batcher
         cp = self._current_checkpoint
@@ -863,6 +927,10 @@ class ValidatorServer:
             for reason, count in getattr(batcher, "reject_counts", {}).items():
                 reject_counts[reason] = max(reject_counts.get(reason, 0), count)
         prompt_sources = self._prompt_source_health()
+        window_environments = {
+            str(env_name): self._window_environment_health(env_batcher)
+            for env_name, env_batcher in self._active_batchers.items()
+        }
         logical_group_dedup: dict[str, dict[str, int]] = {}
         for env_name, env_batcher in self._active_batchers.items():
             reservations = getattr(
@@ -975,6 +1043,7 @@ class ValidatorServer:
                 getattr(batcher, "inflight_proof_reservations", None)
                 if batcher else None
             ),
+            window_environments=window_environments,
             logical_group_reservations=sum(
                 item["reservations"] for item in logical_group_dedup.values()
             ),
