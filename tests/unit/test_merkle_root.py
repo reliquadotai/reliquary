@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from reliquary.miner.engine import _compute_merkle_root
 from reliquary.protocol.merkle import (
     compute_rollouts_merkle_root,
+    compute_rollouts_selection_digest,
     submission_merkle_matches,
 )
 
@@ -76,3 +77,47 @@ def test_merkle_root_binds_environment_name():
     math_root = compute_rollouts_merkle_root([rollout])
     rollout["env_name"] = "opencodeinstruct"
     assert compute_rollouts_merkle_root([rollout]) != math_root
+
+
+def test_merkle_root_has_stable_domain_separated_vector():
+    rollout = {
+        "tokens": [1, 2],
+        "reward": 1.0,
+        "commit": {"tokens": [1, 2], "proof_version": "v7"},
+        "env_name": "openmathinstruct",
+    }
+    assert compute_rollouts_merkle_root([rollout]) == (
+        "3cc22f466eddcc9848d80a57635a05d0ec7827e15f9675fd32908bf54816b4ad"
+    )
+
+
+def test_selection_digest_ignores_non_generation_metadata():
+    rollout = {
+        "tokens": [1, 2],
+        "reward": 0.0,
+        "commit": {"tokens": [1, 2], "advantage": 0.0},
+        "env_name": "opencodeinstruct",
+    }
+    before_root = compute_rollouts_merkle_root([rollout])
+    before_selection = compute_rollouts_selection_digest([rollout])
+
+    rollout["reward"] = 1.0
+    rollout["commit"]["advantage"] = 999.0
+
+    assert compute_rollouts_merkle_root([rollout]) != before_root
+    assert compute_rollouts_selection_digest([rollout]) == before_selection
+
+
+def test_selection_digest_binds_tokens_order_and_environment():
+    first = {
+        "tokens": [1, 2],
+        "reward": 0.0,
+        "commit": {},
+        "env_name": "openmathinstruct",
+    }
+    baseline = compute_rollouts_selection_digest([first])
+    first["tokens"] = [2, 1]
+    assert compute_rollouts_selection_digest([first]) != baseline
+    first["tokens"] = [1, 2]
+    first["env_name"] = "opencodeinstruct"
+    assert compute_rollouts_selection_digest([first]) != baseline

@@ -7,10 +7,24 @@ import json
 from typing import Any, Iterable
 
 
+_LEAF_DOMAIN = b"reliquary-rollout-leaf-v2\x00"
+_NODE_DOMAIN = b"reliquary-rollout-node-v2\x00"
+_SELECTION_DOMAIN = b"reliquary-selection-stream-v1\x00"
+
+
 def _field(rollout: Any, name: str) -> Any:
     if isinstance(rollout, dict):
         return rollout[name]
     return getattr(rollout, name)
+
+
+def _canonical_json(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode()
 
 
 def compute_rollouts_merkle_root(rollouts: Iterable[Any]) -> str:
@@ -22,28 +36,21 @@ def compute_rollouts_merkle_root(rollouts: Iterable[Any]) -> str:
     """
     leaves: list[bytes] = []
     for index, rollout in enumerate(rollouts):
-        leaf = hashlib.sha256()
-        leaf.update(index.to_bytes(8, "big"))
-        leaf.update(
-            json.dumps(
-                _field(rollout, "tokens"), separators=(",", ":")
-            ).encode()
-        )
-        leaf.update(json.dumps(_field(rollout, "reward")).encode())
         env_name = (
             rollout.get("env_name", "")
             if isinstance(rollout, dict)
             else getattr(rollout, "env_name", "")
         )
-        leaf.update(json.dumps(str(env_name)).encode())
-        leaf.update(
-            json.dumps(
-                _field(rollout, "commit"),
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode()
+        payload = _canonical_json(
+            {
+                "commit": _field(rollout, "commit"),
+                "env_name": str(env_name),
+                "index": index,
+                "reward": _field(rollout, "reward"),
+                "tokens": _field(rollout, "tokens"),
+            }
         )
-        leaves.append(leaf.digest())
+        leaves.append(hashlib.sha256(_LEAF_DOMAIN + payload).digest())
 
     if not leaves:
         raise ValueError("cannot compute a Merkle root for an empty rollout group")
@@ -53,9 +60,39 @@ def compute_rollouts_merkle_root(rollouts: Iterable[Any]) -> str:
         for index in range(0, len(leaves), 2):
             left = leaves[index]
             right = leaves[index + 1] if index + 1 < len(leaves) else left
-            parents.append(hashlib.sha256(left + right).digest())
+            parents.append(
+                hashlib.sha256(_NODE_DOMAIN + left + right).digest()
+            )
         leaves = parents
     return leaves[0].hex()
+
+
+def compute_rollouts_selection_digest(rollouts: Iterable[Any]) -> bytes:
+    """Hash only generation-defining fields for canonical representative choice.
+
+    The full Merkle root authenticates every submitted field, but several of
+    those fields are intentionally tolerant or validator-overwritten. They are
+    therefore unsuitable as a deterministic lottery input: a miner could vary
+    harmless metadata and grind roots without generating a new rollout. The
+    ordered token streams and environment are the immutable generation output.
+    """
+    streams = []
+    for index, rollout in enumerate(rollouts):
+        env_name = (
+            rollout.get("env_name", "")
+            if isinstance(rollout, dict)
+            else getattr(rollout, "env_name", "")
+        )
+        streams.append(
+            {
+                "env_name": str(env_name),
+                "index": index,
+                "tokens": _field(rollout, "tokens"),
+            }
+        )
+    if not streams:
+        raise ValueError("cannot compute a selection digest for an empty group")
+    return hashlib.sha256(_SELECTION_DOMAIN + _canonical_json(streams)).digest()
 
 
 def submission_merkle_matches(request: Any) -> bool:
