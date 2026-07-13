@@ -237,7 +237,8 @@ Every `/submit` flows through this sequence on the validator. The first rejectio
 HTTP enqueue          worker dequeue → verify
 ─────────────         ─────────────────────────
 WINDOW_NOT_ACTIVE? → reject     →    WINDOW_MISMATCH? → reject
-rate/envelope/drand checks           WRONG_CHECKPOINT? → reject
+envelope/version/registration        WRONG_CHECKPOINT? → reject
+canonical-root/rate/drand checks     MERKLE_ROOT_MISMATCH? → reject
 queue submission                     BAD_PROMPT_IDX / PROMPT_IN_COOLDOWN? → reject
 return reason="submitted"            PROMPT_FULL? → reject
                                      BAD_SCHEMA / TOKENS_MISMATCH / BAD_TOKENS? → reject

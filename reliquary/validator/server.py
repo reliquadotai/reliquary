@@ -869,7 +869,7 @@ class ValidatorServer:
             #
             # The signature is sr25519 over the canonical envelope
             # (hotkey, window, prompt_idx, merkle_root, checkpoint_hash,
-            # drand_round, validator's window randomness, nonce) — see
+            # drand_round, protocol_version, validator randomness, nonce) — see
             # ``reliquary.protocol.signatures.build_envelope_binding``.
             # An attacker can't forge it without the miner's hotkey
             # private key, and they can't replay a captured signature
