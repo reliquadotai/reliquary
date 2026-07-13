@@ -294,6 +294,21 @@ not raise the boundary epsilon merely to make the report pass: first separate
 environment, checkpoint, forced-span, and numerical-kernel effects using the
 schema-v3 fields.
 
+Termination keeps its exact current gate, but interesting low-probability EOS,
+natural-close, and cap-truncation decisions are written privately to
+`auth_forensics/termination-shadow.jsonl`. The rows include the distance from
+the public uniform to the submitted stop token's CDF interval. Summarize them
+with:
+
+```bash
+python scripts/report_termination_shadow.py
+```
+
+`REVIEW_BOUNDARY_CANDIDATES_KEEP_GATE_UNCHANGED` means reproduce those rows on
+the matching checkpoint and generation stack. It does not authorize a wider
+acceptance interval: a miner can also search for near-boundary injected stops,
+so adversarial controls are required before any termination rule changes.
+
 Before `train_step`, the validator runs the training-quarantine gate. If the
 selected batch has high-confidence poison signals, the archive still publishes
 and emissions remain replayable from `rewards_by_hotkey`, but GRPO is skipped

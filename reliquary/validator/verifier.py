@@ -102,11 +102,15 @@ class ProofResult:
     # of how improbable it was. None when there is no u-stream (pre-forced-seed
     # rollouts) or the rollout does not end on a stop token.
     terminal_pick_ok: bool | None = None
+    # Distance from the public uniform to the submitted terminal token's CDF
+    # interval. This is telemetry only and never relaxes termination.
+    terminal_pick_cdf_miss: float | None = None
     # True when an unforced BFT rollout's phase-1 ``</think>`` token is the
     # exact public forced-seed pick at that position. This lets the validator
     # recognize the reference miner's natural 2048+512 local cap without
     # trusting a miner-supplied flag or permitting an injected close token.
     natural_close_pick_ok: bool | None = None
+    natural_close_pick_cdf_miss: float | None = None
 
 
 def verify_signature(commit: dict, hotkey: str) -> bool:
@@ -477,7 +481,9 @@ def verify_commitment_proofs(
     seed_n_miss_gt_0_10 = 0
     seed_max_cdf_miss = 0.0
     terminal_pick_ok = None
+    terminal_pick_cdf_miss = None
     natural_close_pick_ok = None
+    natural_close_pick_cdf_miss = None
     if seed_u_values is not None:
         valid_t = _completion_valid_t(tokens, prompt_length, completion_length, seq_len)
         # Exclude BFT-injected force_span tokens: validator-accepted but not
@@ -519,19 +525,19 @@ def verify_commitment_proofs(
             seed_n_miss_gt_0_05 = seed_diagnostics.n_miss_gt_0_05
             seed_n_miss_gt_0_10 = seed_diagnostics.n_miss_gt_0_10
             seed_max_cdf_miss = seed_diagnostics.max_cdf_miss
-        terminal_pick_ok = _gpu_terminal_forced_pick(
-            logits_gpu, tokens, prompt_length, seq_len,
-            _eos_set_from_model(model, tokenizer), seed_u_values, (fs0, fs1),
+        terminal_pick_ok, terminal_pick_cdf_miss = (
+            _gpu_terminal_forced_pick_diagnostics(
+                logits_gpu, tokens, prompt_length, seq_len,
+                _eos_set_from_model(model, tokenizer), seed_u_values,
+                (fs0, fs1),
+            )
         )
-        natural_close_pick_ok = _gpu_natural_close_forced_pick(
-            logits_gpu,
-            tokens,
-            prompt_length,
-            completion_length,
-            seq_len,
-            tokenizer,
-            seed_u_values,
-            rollout_meta,
+        (
+            natural_close_pick_ok,
+            natural_close_pick_cdf_miss,
+        ) = _gpu_natural_close_forced_pick_diagnostics(
+            logits_gpu, tokens, prompt_length, completion_length, seq_len,
+            tokenizer, seed_u_values, rollout_meta,
         )
 
     hidden_states = hidden_states_gpu.detach().to("cpu")
@@ -582,7 +588,79 @@ def verify_commitment_proofs(
         seed_n_miss_gt_0_10=seed_n_miss_gt_0_10,
         seed_max_cdf_miss=seed_max_cdf_miss,
         terminal_pick_ok=terminal_pick_ok,
+        terminal_pick_cdf_miss=terminal_pick_cdf_miss,
         natural_close_pick_ok=natural_close_pick_ok,
+        natural_close_pick_cdf_miss=natural_close_pick_cdf_miss,
+    )
+
+
+def _forced_pick_diagnostics(
+    logits: torch.Tensor,
+    token_id: int,
+    u: float,
+) -> tuple[bool, float]:
+    """Return exact-pick status and distance to the token's CDF interval."""
+    from reliquary.constants import TOP_K_PROTO, TOP_P_PROTO
+    from reliquary.environment.forced_sampling import pick, warp
+
+    probs = warp(
+        logits.float(), t=T_PROTO, top_k=TOP_K_PROTO, top_p=TOP_P_PROTO,
+    )
+    token = int(token_id)
+    exact = pick(probs, u) == token
+    if exact:
+        return True, 0.0
+    cdf = torch.cumsum(probs, dim=-1)
+    upper = float(cdf[token].item())
+    lower = upper - float(probs[token].item())
+    u_value = float(
+        torch.tensor(float(u), device=probs.device, dtype=probs.dtype).item()
+    )
+    if u_value < lower:
+        miss = lower - u_value
+    elif u_value >= upper:
+        miss = u_value - upper
+    else:
+        miss = 0.0
+    return exact, max(0.0, float(miss))
+
+
+def _gpu_terminal_forced_pick_diagnostics(
+    logits_gpu: torch.Tensor,
+    tokens: list[int],
+    prompt_length: int,
+    seq_len: int,
+    eos_set: set[int],
+    seed_u_values: list[float],
+    force_span: tuple[int, int],
+) -> tuple[bool | None, float | None]:
+    """Diagnose whether the final token is the forced inverse-CDF pick.
+
+    Recomputes the protocol draw the miner was obliged to make at the position
+    that produced ``tokens[-1]``: ``pick(warp(logits[t-1]), u_j)``. A match means
+    the stop was the one legal token there — the miner cannot steer ``u``, so this
+    cannot be manufactured, while a forged EOS (injected where ``u`` selected some
+    other token) does not match.
+
+    None when the rollout does not end on a stop token, the terminal position is
+    an injected BFT force-span token (never sampled), or the u-stream does not
+    reach it — in all three cases termination falls back to the p_stop floor.
+    """
+    if seq_len < 2 or not eos_set or not tokens:
+        return None, None
+    if int(tokens[-1]) not in eos_set:
+        return None, None
+
+    t = seq_len - 1                     # position of the final token
+    j = t - prompt_length               # its completion offset, indexing u
+    if j < 0 or j >= len(seed_u_values):
+        return None, None
+    fs0, fs1 = force_span
+    if fs0 <= t < fs1:
+        return None, None
+
+    return _forced_pick_diagnostics(
+        logits_gpu[t - 1], int(tokens[-1]), seed_u_values[j]
     )
 
 
@@ -595,41 +673,15 @@ def _gpu_terminal_forced_pick(
     seed_u_values: list[float],
     force_span: tuple[int, int],
 ) -> bool | None:
-    """True when the rollout's final token is the forced inverse-CDF pick.
-
-    Recomputes the protocol draw the miner was obliged to make at the position
-    that produced ``tokens[-1]``: ``pick(warp(logits[t-1]), u_j)``. A match means
-    the stop was the one legal token there — the miner cannot steer ``u``, so this
-    cannot be manufactured, while a forged EOS (injected where ``u`` selected some
-    other token) does not match.
-
-    None when the rollout does not end on a stop token, the terminal position is
-    an injected BFT force-span token (never sampled), or the u-stream does not
-    reach it — in all three cases termination falls back to the p_stop floor.
-    """
-    from reliquary.constants import TOP_K_PROTO, TOP_P_PROTO
-    from reliquary.environment.forced_sampling import pick, warp
-
-    if seq_len < 2 or not eos_set or not tokens:
-        return None
-    if int(tokens[-1]) not in eos_set:
-        return None
-
-    t = seq_len - 1                     # position of the final token
-    j = t - prompt_length               # its completion offset, indexing u
-    if j < 0 or j >= len(seed_u_values):
-        return None
-    fs0, fs1 = force_span
-    if fs0 <= t < fs1:
-        return None
-
-    probs = warp(
-        logits_gpu[t - 1].float(), t=T_PROTO, top_k=TOP_K_PROTO, top_p=TOP_P_PROTO,
+    """Compatibility wrapper returning only exact terminal-pick status."""
+    exact, _ = _gpu_terminal_forced_pick_diagnostics(
+        logits_gpu, tokens, prompt_length, seq_len, eos_set,
+        seed_u_values, force_span,
     )
-    return pick(probs, seed_u_values[j]) == int(tokens[-1])
+    return exact
 
 
-def _gpu_natural_close_forced_pick(
+def _gpu_natural_close_forced_pick_diagnostics(
     logits_gpu: torch.Tensor,
     tokens: list[int],
     prompt_length: int,
@@ -638,25 +690,22 @@ def _gpu_natural_close_forced_pick(
     tokenizer: Any,
     seed_u_values: list[float],
     rollout_meta: dict,
-) -> bool | None:
-    """Prove that a natural BFT ``</think>`` came from the public draw."""
+) -> tuple[bool | None, float | None]:
+    """Prove and measure a natural BFT ``</think>`` public draw."""
     from reliquary.constants import (
         BFT_ANSWER_BUDGET,
         BFT_THINKING_BUDGET,
-        TOP_K_PROTO,
-        TOP_P_PROTO,
     )
-    from reliquary.environment.forced_sampling import pick, warp
     from reliquary.shared.modeling import think_close_token_ids
 
     if rollout_meta.get("forced") or rollout_meta.get("force_span") not in (None, []):
-        return None
+        return None, None
     if completion_length != BFT_THINKING_BUDGET + BFT_ANSWER_BUDGET:
-        return None
+        return None, None
     try:
         close_ids = set(think_close_token_ids(tokenizer))
     except Exception:
-        return None
+        return None, None
 
     phase1_end = min(
         prompt_length + BFT_THINKING_BUDGET,
@@ -669,21 +718,20 @@ def _gpu_natural_close_forced_pick(
         if int(tokens[pos]) in close_ids and pos > 0
     ]
     if not close_positions:
-        return None
+        return None, None
 
+    min_miss: float | None = None
     for pos in close_positions:
         j = pos - prompt_length
         if j >= len(seed_u_values):
             continue
-        probs = warp(
-            logits_gpu[pos - 1].float(),
-            t=T_PROTO,
-            top_k=TOP_K_PROTO,
-            top_p=TOP_P_PROTO,
+        exact, miss = _forced_pick_diagnostics(
+            logits_gpu[pos - 1], int(tokens[pos]), seed_u_values[j]
         )
-        if pick(probs, seed_u_values[j]) == int(tokens[pos]):
-            return True
-    return False
+        min_miss = miss if min_miss is None else min(min_miss, miss)
+        if exact:
+            return True, 0.0
+    return False, min_miss
 
 
 def _gpu_p_stop(
