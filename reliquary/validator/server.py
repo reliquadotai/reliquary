@@ -20,7 +20,7 @@ import collections
 import logging
 import numbers
 import time
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field, ValidationError
@@ -36,6 +36,10 @@ from reliquary.constants import (
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
     MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
     MAX_TRUNCATED_PER_SUBMISSION,
+    REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
+    REGISTERED_HOTKEY_REFRESH_MIN_INTERVAL_SECONDS,
+    REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS,
+    REGISTERED_HOTKEY_STALE_GRACE_SECONDS,
     SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS,
     SPARSE_VALID_IDLE_SEAL_SECONDS,
     SPARSE_VALID_MAX_WINDOW_SECONDS,
@@ -347,6 +351,10 @@ class _Health(BaseModel):
     rewarded_but_not_selected_by_hotkey: dict[str, int] = Field(
         default_factory=dict
     )
+    registration_gate_enforced: bool = False
+    registered_hotkey_count: int | None = None
+    registration_cache_age_seconds: float | None = None
+    registration_cache_stale: bool | None = None
 
 
 class ValidatorServer:
@@ -361,6 +369,14 @@ class ValidatorServer:
         # check) keep working without change.
         self._active_batchers: dict[str, GrpoWindowBatcher] = {}
         self.active_batcher: GrpoWindowBatcher | None = None
+        self._registration_gate_enforced = False
+        self._registered_hotkeys: frozenset[str] | None = None
+        self._registration_refreshed_at: float | None = None
+        self._registration_refresh_callback: (
+            Callable[[], Awaitable[bool]] | None
+        ) = None
+        self._registration_refresh_lock = asyncio.Lock()
+        self._last_registration_refresh_attempt = 0.0
         self.app: FastAPI = self._build_app()
         self._server: uvicorn.Server | None = None
         self._task: asyncio.Task[Any] | None = None
@@ -419,6 +435,91 @@ class ValidatorServer:
 
     def set_current_checkpoint(self, entry) -> None:
         self._current_checkpoint = entry
+
+    def configure_registration_gate(
+        self,
+        refresh_callback: Callable[[], Awaitable[bool]],
+    ) -> None:
+        """Arm registered-hotkey admission for the production service."""
+        self._registration_refresh_callback = refresh_callback
+        self._registration_gate_enforced = True
+
+    def set_registered_hotkeys(
+        self,
+        hotkeys: set[str] | frozenset[str] | list[str],
+        *,
+        refreshed_at: float | None = None,
+    ) -> None:
+        self._registered_hotkeys = frozenset(
+            str(hotkey) for hotkey in hotkeys if str(hotkey)
+        )
+        self._registration_refreshed_at = (
+            time.time() if refreshed_at is None else float(refreshed_at)
+        )
+
+    def registration_cache_age(self, *, now: float | None = None) -> float | None:
+        if self._registration_refreshed_at is None:
+            return None
+        current = time.time() if now is None else float(now)
+        return max(0.0, current - self._registration_refreshed_at)
+
+    async def _registration_reject_reason(
+        self,
+        hotkey: str,
+    ) -> RejectReason | None:
+        if not self._registration_gate_enforced:
+            return None
+
+        now = time.time()
+        age = self.registration_cache_age(now=now)
+        missing = (
+            self._registered_hotkeys is None
+            or hotkey not in self._registered_hotkeys
+        )
+        refresh_due = age is None or age > REGISTERED_HOTKEY_CACHE_TTL_SECONDS
+        should_refresh = missing or refresh_due
+        callback = self._registration_refresh_callback
+
+        if (
+            should_refresh
+            and callback is not None
+            and now - self._last_registration_refresh_attempt
+            >= REGISTERED_HOTKEY_REFRESH_MIN_INTERVAL_SECONDS
+        ):
+            async with self._registration_refresh_lock:
+                now = time.time()
+                age = self.registration_cache_age(now=now)
+                missing = (
+                    self._registered_hotkeys is None
+                    or hotkey not in self._registered_hotkeys
+                )
+                refresh_due = (
+                    age is None or age > REGISTERED_HOTKEY_CACHE_TTL_SECONDS
+                )
+                if (
+                    (missing or refresh_due)
+                    and now - self._last_registration_refresh_attempt
+                    >= REGISTERED_HOTKEY_REFRESH_MIN_INTERVAL_SECONDS
+                ):
+                    self._last_registration_refresh_attempt = now
+                    try:
+                        await asyncio.wait_for(
+                            callback(),
+                            timeout=REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS,
+                        )
+                    except Exception:
+                        logger.exception("registered-hotkey cache refresh failed")
+
+        age = self.registration_cache_age()
+        if (
+            self._registered_hotkeys is None
+            or age is None
+            or age > REGISTERED_HOTKEY_STALE_GRACE_SECONDS
+        ):
+            return RejectReason.REGISTRATION_UNAVAILABLE
+        if hotkey not in self._registered_hotkeys:
+            return RejectReason.HOTKEY_NOT_REGISTERED
+        return None
 
     @property
     def submit_queue_depth(self) -> int:
@@ -520,6 +621,7 @@ class ValidatorServer:
     def _health_payload(self) -> _Health:
         batcher = self.active_batcher
         cp = self._current_checkpoint
+        registration_age = self.registration_cache_age()
         reject_counts: dict[str, int] = dict(self._recent_reject_counts)
         if batcher is not None:
             for reason, count in getattr(batcher, "reject_counts", {}).items():
@@ -585,6 +687,18 @@ class ValidatorServer:
             rewarded_but_not_selected_by_hotkey=(
                 dict(getattr(batcher, "rewarded_but_not_selected_by_hotkey", {}))
                 if batcher else {}
+            ),
+            registration_gate_enforced=self._registration_gate_enforced,
+            registered_hotkey_count=(
+                len(self._registered_hotkeys)
+                if self._registered_hotkeys is not None
+                else None
+            ),
+            registration_cache_age_seconds=registration_age,
+            registration_cache_stale=(
+                registration_age > REGISTERED_HOTKEY_CACHE_TTL_SECONDS
+                if registration_age is not None
+                else None
             ),
         )
 
@@ -852,6 +966,38 @@ class ValidatorServer:
                     accepted_into_pool=False,
                 )
                 raise HTTPException(status_code=409, detail="window_mismatch")
+
+            # Only registered subnet hotkeys may consume submission quota or
+            # proof capacity. The signature gate above proves ownership of the
+            # claimed hotkey; this gate binds that identity to the current
+            # metagraph. A cache miss triggers one bounded refresh, while a
+            # short chain outage may use a recent last-known-good snapshot.
+            registration_reason = await self._registration_reject_reason(hk)
+            if registration_reason is not None:
+                telemetry.mark_decision()
+                self.record_verdict(
+                    hk,
+                    request.merkle_root,
+                    False,
+                    registration_reason,
+                    window_n=request.window_start,
+                    telemetry=telemetry,
+                    reject_stage="registration",
+                    accepted_into_pool=False,
+                )
+                log_submission_stage(
+                    logger,
+                    logging.WARNING,
+                    "candidate_rejected",
+                    telemetry,
+                    reject_stage="registration",
+                    reject_reason=registration_reason.value,
+                    accepted_into_pool=False,
+                )
+                return BatchSubmissionResponse(
+                    accepted=False,
+                    reason=registration_reason,
+                )
 
             # Rate limit AFTER signature verification and active-window
             # binding. A signed stale-window replay or a miner still catching

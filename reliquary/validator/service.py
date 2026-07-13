@@ -34,6 +34,8 @@ from reliquary.constants import (
     MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
     MAX_SEAL_QUEUE_DRAIN_SECONDS,
     PROOF_ADMISSION_STALL_POLL_SECONDS,
+    REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
+    REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS,
     SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS,
     SPARSE_VALID_IDLE_SEAL_SECONDS,
     SPARSE_VALID_MAX_WINDOW_SECONDS,
@@ -529,6 +531,55 @@ class ValidationService:
                 batcher.bind_event_loop(loop)
         self.server.set_active_batchers(self._active_batchers)
         self._set_state(WindowState.OPEN)
+
+    async def _refresh_registered_hotkeys(self, *, force: bool = False) -> bool:
+        """Refresh registered subnet identities from a fresh chain session."""
+        age = self.server.registration_cache_age()
+        if (
+            not force
+            and age is not None
+            and age <= REGISTERED_HOTKEY_CACHE_TTL_SECONDS
+        ):
+            return True
+
+        subtensor = None
+
+        async def _load() -> set[str]:
+            nonlocal subtensor
+            subtensor = await chain.get_subtensor()
+            metagraph = await chain.get_metagraph(subtensor, self.netuid)
+            return {
+                hotkey
+                for value in getattr(metagraph, "hotkeys", [])
+                if isinstance(value, str) and (hotkey := value.strip())
+            }
+
+        try:
+            hotkeys = await asyncio.wait_for(
+                _load(),
+                timeout=REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS,
+            )
+            if not hotkeys:
+                raise RuntimeError(
+                    "metagraph refresh returned no registered hotkeys"
+                )
+            self.server.set_registered_hotkeys(hotkeys)
+            logger.info(
+                "Registered-hotkey cache refreshed: netuid=%d hotkeys=%d",
+                self.netuid,
+                len(hotkeys),
+            )
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Registered-hotkey cache refresh failed for netuid=%d",
+                self.netuid,
+            )
+            return False
+        finally:
+            await chain.close_subtensor(subtensor)
 
     def _proof_admission_exhausted_and_drained(self, batcher) -> bool:
         """True when bounded proof admission cannot fill this window anymore.
@@ -1209,6 +1260,7 @@ class ValidationService:
                     "rollouts": _rollout_payload(s, with_text=True),
                     "response_time": _resp_time(s.arrived_at),
                     "merkle_root": s.merkle_root_bytes.hex(),
+                    "selection_digest": s.selection_digest.hex(),
                     "claimed_checkpoint_hash": s.claimed_checkpoint_hash,
                     "sketch_diff_max": s.sketch_diff_max,
                     "lp_dev_max": s.lp_dev_max,
@@ -1254,6 +1306,7 @@ class ValidationService:
                     "sigma": s.sigma,
                     "response_time": _resp_time(s.arrived_at),
                     "merkle_root": s.merkle_root_bytes.hex(),
+                    "selection_digest": s.selection_digest.hex(),
                     "sketch_diff_max": s.sketch_diff_max,
                     "lp_dev_max": s.lp_dev_max,
                     "dist_q10_min": s.dist_q10_min,
@@ -1402,6 +1455,10 @@ class ValidationService:
         )
 
     async def run(self, subtensor) -> None:
+        self.server.configure_registration_gate(
+            lambda: self._refresh_registered_hotkeys(force=True),
+        )
+        await self._refresh_registered_hotkeys(force=True)
         await self.server.start()
         await self._serve_axon_on_chain(subtensor)
         await self._apply_resume_from()                  # ← resume before bootstrap
@@ -1432,6 +1489,7 @@ class ValidationService:
         try:
             while True:
                 try:
+                    await self._refresh_registered_hotkeys()
                     self._open_window()
                     await self._wait_for_next_drand_boundary()
                     await self._set_window_randomness(subtensor)

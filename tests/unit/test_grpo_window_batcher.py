@@ -194,6 +194,22 @@ def test_accept_in_zone_submission():
     assert len(b.valid_submissions()) == 1
 
 
+def test_accepted_submission_uses_validator_computed_selection_digest():
+    from reliquary.validator.selection_digest import (
+        compute_rollouts_selection_digest,
+    )
+
+    b = _make_batcher()
+    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+
+    assert b.accept_submission(req).accepted is True
+    accepted = b.valid_submissions()[0]
+    assert accepted.selection_digest == compute_rollouts_selection_digest(
+        req.rollouts
+    )
+    assert accepted.selection_digest_bytes == accepted.selection_digest
+
+
 def test_ingestion_resets_miner_supplied_truncated_flag():
     """`truncated` is a validator-set reward-shaping flag. A miner-supplied
     value must be wiped at ingestion so it can't clamp a losing rollout's
@@ -451,6 +467,22 @@ def test_validator_authoritative_reward_overwrites_placeholder_claims():
     assert [
         r.commit["rollout"]["success"] for r in b._valid[0].rollouts
     ] == [True, True, True, True, False, False, False, False]
+
+
+def test_validator_authoritative_non_finite_reward_is_rejected():
+    class NonFinitePrivateRewardEnv(PrivateRewardFakeEnv):
+        def compute_reward(self, problem, completion):
+            return float("nan")
+
+    req = _request(rewards=[0.0] * M_ROLLOUTS)
+    for rollout in req.rollouts:
+        rollout.env_name = "opencodeinstruct"
+
+    b = _make_batcher(env=NonFinitePrivateRewardEnv())
+    response = b.accept_submission(req)
+
+    assert response.accepted is False
+    assert response.reason == RejectReason.REWARD_MISMATCH
 
 
 def test_reject_outer_inner_token_split_even_if_constructed():

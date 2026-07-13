@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -71,6 +72,7 @@ from reliquary.validator.auth_forensics import (
 )
 from reliquary.validator.reward_shape import detect_reward_shape_manipulation
 from reliquary.validator.rollout_patterns import detect_opposite_reward_clones
+from reliquary.validator.selection_digest import compute_rollouts_selection_digest
 from reliquary.validator.verifier import (
     evaluate_all_token_auth_shadow,
     evaluate_code_semantic_token_authenticity,
@@ -164,7 +166,13 @@ def _uses_validator_authoritative_reward(env: Any) -> bool:
 
 
 def _reward_matches_claim(actual: float, claimed: float, *, tolerance: float = 1e-6) -> bool:
-    return abs(float(actual) - float(claimed)) <= tolerance
+    actual_f = float(actual)
+    claimed_f = float(claimed)
+    return (
+        math.isfinite(actual_f)
+        and math.isfinite(claimed_f)
+        and abs(actual_f - claimed_f) <= tolerance
+    )
 
 
 def _forced_seed_verdict(n_stoch: int, n_match: int, enforce: bool) -> bool:
@@ -237,6 +245,8 @@ class ValidSubmission:
     prompt_idx: int
     merkle_root_bytes: bytes
     merkle_root: bytes = field(init=False)  # alias for select_batch Protocol
+    selection_digest_bytes: bytes | None = None
+    selection_digest: bytes = field(init=False)
     sigma: float = 0.0
     rollouts: list[RolloutSubmission] = field(default_factory=list)
     completion_texts: list[str] = field(default_factory=list)
@@ -274,6 +284,11 @@ class ValidSubmission:
 
     def __post_init__(self):
         self.merkle_root = self.merkle_root_bytes
+        self.selection_digest = (
+            self.selection_digest_bytes
+            if self.selection_digest_bytes is not None
+            else self.merkle_root_bytes
+        )
 
 
 @dataclass
@@ -930,6 +945,14 @@ class GrpoWindowBatcher:
                 computed_reward = float(self.env.compute_reward(problem, text))
             except Exception:
                 return reject(RejectReason.REWARD_MISMATCH, "reward")
+            if not math.isfinite(computed_reward):
+                logger.error(
+                    "non-finite validator reward env=%s prompt=%d hotkey=%s",
+                    getattr(self.env, "name", type(self.env).__name__),
+                    request.prompt_idx,
+                    hk,
+                )
+                return reject(RejectReason.REWARD_MISMATCH, "reward")
             if validator_scored_reward:
                 rollout.reward = computed_reward
                 rollout_meta = rollout.commit.get("rollout")
@@ -1521,6 +1544,9 @@ class GrpoWindowBatcher:
             hotkey=request.miner_hotkey,
             prompt_idx=request.prompt_idx,
             merkle_root_bytes=bytes.fromhex(request.merkle_root),
+            selection_digest_bytes=compute_rollouts_selection_digest(
+                request.rollouts
+            ),
             sigma=sigma,
             rollouts=list(request.rollouts),
             completion_texts=completion_texts,

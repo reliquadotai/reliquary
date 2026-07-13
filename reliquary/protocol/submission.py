@@ -9,7 +9,14 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    FiniteFloat,
+    field_validator,
+    model_validator,
+)
 
 from reliquary.constants import CHALLENGE_K, M_ROLLOUTS, MAX_NEW_TOKENS_PROTOCOL_CAP
 
@@ -79,6 +86,8 @@ class RejectReason(str, Enum):
     REWARD_SHAPE_SUSPICIOUS = "reward_shape_suspicious"
     WRONG_CHECKPOINT = "wrong_checkpoint"
     WRONG_RANDOMNESS = "wrong_randomness"
+    HOTKEY_NOT_REGISTERED = "hotkey_not_registered"
+    REGISTRATION_UNAVAILABLE = "registration_unavailable"
     WORKER_DROPPED = "worker_dropped"
     STALE_ROUND = "stale_round"
     FUTURE_ROUND = "future_round"
@@ -99,7 +108,7 @@ class RolloutSubmission(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     tokens: list[int] = Field(..., min_length=1)
-    reward: float  # miner's local env.compute_reward value; validator re-checks
+    reward: FiniteFloat  # miner's local reward; validator re-checks it
     commit: dict[str, Any]
     env_name: str  # environment that generated this rollout (e.g. "openmathinstruct")
 
@@ -273,9 +282,9 @@ class RolloutMetadata(BaseModel):
     prompt_length: int = Field(..., ge=0)
     completion_length: int = Field(..., gt=0, le=MAX_NEW_TOKENS_PROTOCOL_CAP)
     success: bool
-    total_reward: float
-    advantage: float
-    token_logprobs: list[float]
+    total_reward: FiniteFloat
+    advantage: FiniteFloat
+    token_logprobs: list[FiniteFloat]
     # BFT: forced=True when the rollout was force-terminated at the thinking
     # budget; force_span = [start, end] token indices of the injected FORCE
     # template (validated byte-exact by the validator carve-out).
