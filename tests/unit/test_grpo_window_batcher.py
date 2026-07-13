@@ -2978,3 +2978,68 @@ def test_forced_seed_group_gate_shadow_when_not_enforcing(monkeypatch):
     assert resp.reason != RejectReason.SEED_MISMATCH
     assert resp.accepted is True
     assert len(b.valid_submissions()) == 1
+
+
+def _grail_with_cdf_hard_mismatch():
+    def _fn(commit, model, randomness, *, tokenizer=None, seed_u_values=None):
+        from reliquary.validator.verifier import ProofResult
+
+        return ProofResult(
+            all_passed=True,
+            passed=1,
+            checked=1,
+            seed_n_stochastic=10,
+            seed_n_match=10,
+            seed_n_positions=10,
+            seed_n_boundary_match=9,
+            seed_n_hard_mismatch=1,
+            seed_max_cdf_miss=0.2,
+        )
+
+    return _fn
+
+
+def test_forced_seed_cdf_gate_rejects_sparse_branch_mismatch(monkeypatch):
+    import reliquary.validator.batcher as batcher_mod
+
+    recorded = []
+    monkeypatch.setattr(batcher_mod, "FORCED_SEED_ENFORCE", False)
+    monkeypatch.setattr(batcher_mod, "FORCED_SEED_CDF_ENFORCE", True)
+    monkeypatch.setattr(
+        batcher_mod,
+        "record_forced_seed_shadow",
+        lambda *args, **kwargs: recorded.append((args, kwargs)),
+    )
+    b = _make_batcher(
+        window_start=500,
+        verify_commitment_proofs_fn=_grail_with_cdf_hard_mismatch(),
+    )
+    b.current_checkpoint_hash = "sha256:test"
+
+    response = b.accept_submission(
+        _request(rewards=[1.0] * 4 + [0.0] * 4),
+    )
+
+    assert response.reason == RejectReason.SEED_MISMATCH
+    assert not response.accepted
+    assert len(recorded) == 1
+    assert recorded[0][1]["cdf_would_reject"] is True
+    assert recorded[0][1]["cdf_enforced"] is True
+
+
+def test_forced_seed_cdf_gate_is_shadow_until_calibrated(monkeypatch):
+    import reliquary.validator.batcher as batcher_mod
+
+    monkeypatch.setattr(batcher_mod, "FORCED_SEED_ENFORCE", False)
+    monkeypatch.setattr(batcher_mod, "FORCED_SEED_CDF_ENFORCE", False)
+    b = _make_batcher(
+        window_start=500,
+        verify_commitment_proofs_fn=_grail_with_cdf_hard_mismatch(),
+    )
+    b.current_checkpoint_hash = "sha256:test"
+
+    response = b.accept_submission(
+        _request(rewards=[1.0] * 4 + [0.0] * 4),
+    )
+
+    assert response.accepted

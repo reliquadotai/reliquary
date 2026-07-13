@@ -237,15 +237,26 @@ def record_forced_seed_shadow(
     n_stoch: int,
     n_match: int,
     *,
+    per_rollout: list[dict[str, Any]] | None = None,
+    n_positions: int = 0,
+    n_boundary_match: int = 0,
+    n_hard_mismatch: int = 0,
+    n_deterministic_hard_mismatch: int = 0,
+    max_cdf_miss: float = 0.0,
+    cdf_boundary_epsilon: float = 0.0,
+    ratio_group_would_reject: bool = False,
+    ratio_rollout_would_reject: bool = False,
+    cdf_would_reject: bool = False,
+    cdf_enforced: bool = False,
     path: str | Path | None = None,
 ) -> None:
     """Append one local JSONL record per forced-seed group verdict.
 
     Shadow-mode telemetry for the forced-seed consistency gate: logs the
-    per-group match rate (``n_match / n_stoch``) and raw counts so operators
-    can calibrate ``FORCED_SEED_CONSISTENCY_FLOOR`` before flipping ``FORCED_SEED_ENFORCE``
-    before arming enforcement. Fail-soft: write errors are logged but never
-    affect submission handling.
+    per-group match rate and per-position CDF-boundary diagnostics so operators
+    can calibrate exact enforcement. This is called before the gate decision,
+    so rejected groups are present instead of disappearing from calibration.
+    Fail-soft: write errors are logged but never affect submission handling.
 
     Unlike the finding-only shadow writers, this fires on every accepted
     submission, so a persistent unwritable state dir would otherwise flood
@@ -259,7 +270,7 @@ def record_forced_seed_shadow(
     try:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         record = {
-            "schema_version": 1,
+            "schema_version": 2,
             "event": "forced_seed_shadow",
             "surface": "forced-seed-shadow",
             "ts_unix": time.time(),
@@ -268,6 +279,19 @@ def record_forced_seed_shadow(
             "n_stoch": int(n_stoch),
             "n_match": int(n_match),
             "score": float(n_match) / float(max(1, n_stoch)),
+            "n_positions": int(n_positions),
+            "n_boundary_match": int(n_boundary_match),
+            "n_hard_mismatch": int(n_hard_mismatch),
+            "n_deterministic_hard_mismatch": int(
+                n_deterministic_hard_mismatch
+            ),
+            "max_cdf_miss": float(max_cdf_miss),
+            "cdf_boundary_epsilon": float(cdf_boundary_epsilon),
+            "ratio_group_would_reject": bool(ratio_group_would_reject),
+            "ratio_rollout_would_reject": bool(ratio_rollout_would_reject),
+            "cdf_would_reject": bool(cdf_would_reject),
+            "cdf_enforced": bool(cdf_enforced),
+            "per_rollout": list(per_rollout or []),
         }
         with open(out_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, sort_keys=True, separators=(",", ":")))

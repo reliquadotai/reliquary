@@ -18,6 +18,9 @@ def test_gpu_completion_seed_counts_perfect_for_forced_tokens():
 def test_proof_result_has_seed_fields():
     p = verifier.ProofResult(all_passed=True, passed=0, checked=0, has_sparse_outputs=False)
     assert p.seed_n_stochastic == 0 and p.seed_n_match == 0
+    assert p.seed_n_positions == 0
+    assert p.seed_n_hard_mismatch == 0
+    assert p.seed_max_cdf_miss == 0.0
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -113,6 +116,9 @@ def test_verify_commitment_proofs_honest_seed_matches_all_stochastic(_rhs, mock_
     # t=2,3,5 flat (stochastic + matched); t=4 peaked (excluded).
     assert result.seed_n_stochastic == 3
     assert result.seed_n_match == 3
+    assert result.seed_n_positions == 4
+    assert result.seed_n_boundary_match == 4
+    assert result.seed_n_hard_mismatch == 0
 
 
 @patch("reliquary.shared.forward.forward_single_layer")
@@ -135,6 +141,9 @@ def test_verify_commitment_proofs_mismatch_lowers_match_not_stochastic(_rhs, moc
 
     assert result.seed_n_stochastic == 3
     assert result.seed_n_match == 2
+    assert result.seed_n_positions == 4
+    assert result.seed_n_hard_mismatch == 1
+    assert result.seed_max_cdf_miss > 0
 
 
 @patch("reliquary.shared.forward.forward_single_layer")

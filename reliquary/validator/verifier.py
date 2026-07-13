@@ -88,6 +88,11 @@ class ProofResult:
     # caller didn't supply seed_u_values (protocol_version 0 rollouts).
     seed_n_stochastic: int = 0
     seed_n_match: int = 0
+    seed_n_positions: int = 0
+    seed_n_boundary_match: int = 0
+    seed_n_hard_mismatch: int = 0
+    seed_n_deterministic_hard_mismatch: int = 0
+    seed_max_cdf_miss: float = 0.0
     # Termination escape: True when the final token IS the protocol's forced
     # inverse-CDF pick at the position that produced it. The miner cannot choose
     # where the public u selects EOS, so a match proves a legal draw regardless
@@ -460,6 +465,11 @@ def verify_commitment_proofs(
 
     seed_n_stochastic = 0
     seed_n_match = 0
+    seed_n_positions = 0
+    seed_n_boundary_match = 0
+    seed_n_hard_mismatch = 0
+    seed_n_deterministic_hard_mismatch = 0
+    seed_max_cdf_miss = 0.0
     terminal_pick_ok = None
     natural_close_pick_ok = None
     if seed_u_values is not None:
@@ -488,9 +498,18 @@ def verify_commitment_proofs(
             )
             seed_tokens = [tokens[t] for t in seed_t]
             seed_u = [seed_u_values[t - prompt_length] for t in seed_t]
-            seed_n_stochastic, seed_n_match = _gpu_seed_consistency(
+            seed_diagnostics = _gpu_seed_consistency_diagnostics(
                 logits_gpu[pos_tensor], seed_tokens, seed_u,
             )
+            seed_n_stochastic = seed_diagnostics.n_stochastic
+            seed_n_match = seed_diagnostics.n_exact_match
+            seed_n_positions = seed_diagnostics.n_positions
+            seed_n_boundary_match = seed_diagnostics.n_boundary_match
+            seed_n_hard_mismatch = seed_diagnostics.n_hard_mismatch
+            seed_n_deterministic_hard_mismatch = (
+                seed_diagnostics.n_deterministic_hard_mismatch
+            )
+            seed_max_cdf_miss = seed_diagnostics.max_cdf_miss
         terminal_pick_ok = _gpu_terminal_forced_pick(
             logits_gpu, tokens, prompt_length, seq_len,
             _eos_set_from_model(model, tokenizer), seed_u_values, (fs0, fs1),
@@ -543,6 +562,13 @@ def verify_commitment_proofs(
         completion_argmax_ids=completion_argmax_ids,
         seed_n_stochastic=seed_n_stochastic,
         seed_n_match=seed_n_match,
+        seed_n_positions=seed_n_positions,
+        seed_n_boundary_match=seed_n_boundary_match,
+        seed_n_hard_mismatch=seed_n_hard_mismatch,
+        seed_n_deterministic_hard_mismatch=(
+            seed_n_deterministic_hard_mismatch
+        ),
+        seed_max_cdf_miss=seed_max_cdf_miss,
         terminal_pick_ok=terminal_pick_ok,
         natural_close_pick_ok=natural_close_pick_ok,
     )
@@ -764,15 +790,36 @@ def _gpu_seed_consistency(
     full-completion transfer ~1GB/rollout). Reuses the miner's exact
     warp+inverse-CDF algorithm so honest miners can't false-mismatch.
     """
-    from reliquary.constants import (
-        FORCED_SEED_STOCHASTIC_MAXPROB, TOP_K_PROTO, TOP_P_PROTO,
+    diagnostics = _gpu_seed_consistency_diagnostics(
+        logits_slice, token_ids, u_values,
     )
-    from reliquary.environment.forced_sampling import seed_consistency
+    return diagnostics.n_stochastic, diagnostics.n_exact_match
 
-    return seed_consistency(
-        logits_slice.float(), list(token_ids), list(u_values),
-        t=T_PROTO, top_k=TOP_K_PROTO, top_p=TOP_P_PROTO,
+
+def _gpu_seed_consistency_diagnostics(
+    logits_slice: torch.Tensor,
+    token_ids: list[int],
+    u_values: list[float],
+):
+    from reliquary.constants import (
+        FORCED_SEED_CDF_BOUNDARY_EPSILON,
+        FORCED_SEED_STOCHASTIC_MAXPROB,
+        TOP_K_PROTO,
+        TOP_P_PROTO,
+    )
+    from reliquary.environment.forced_sampling import (
+        seed_consistency_diagnostics,
+    )
+
+    return seed_consistency_diagnostics(
+        logits_slice.float(),
+        list(token_ids),
+        list(u_values),
+        t=T_PROTO,
+        top_k=TOP_K_PROTO,
+        top_p=TOP_P_PROTO,
         stochastic_threshold=FORCED_SEED_STOCHASTIC_MAXPROB,
+        boundary_epsilon=FORCED_SEED_CDF_BOUNDARY_EPSILON,
     )
 
 

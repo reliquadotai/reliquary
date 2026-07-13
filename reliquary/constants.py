@@ -678,14 +678,18 @@ FORCED_SEED_DOMAIN = "reliquary-forced-seed-v1"
 # A position counts toward the seed-consistency check only if its warped max
 # probability is below this (i.e. the forced draw actually chooses the token).
 FORCED_SEED_STOCHASTIC_MAXPROB = 0.99
-# Reject a group whose stochastic-position match rate is below this floor
-# (measured: honest ~0.92-0.96, non-forced ~0.60).
+# Reject a group whose stochastic-position match rate is below this floor.
+# Keep the wire-v1 acceptance floor unchanged during the telemetry-only
+# rollout. Live 2026-07-14 data supports a future 0.90 candidate, but changing
+# acceptance policy belongs to the announced miner/protocol cutover after the
+# exact-CDF shadow gate has been calibrated across implementations.
 FORCED_SEED_CONSISTENCY_FLOOR = 0.80
 # Below this many stochastic positions in a group, the gate abstains (accepts)
 # rather than risk a false reject on thin signal.
 FORCED_SEED_MIN_STOCH_POSITIONS = 30
 # Per-rollout hardening: the group-average floor dilutes a partial swap (7
-# honest rollouts at ~0.96 + 1 curated at ~0.60 still averages >0.80). Reject a
+# honest rollouts at ~0.96 + 1 curated at ~0.60 still passes the group floor).
+# Reject a
 # group if ANY single rollout with enough stochastic positions falls below this
 # per-rollout floor. Set lower than the group floor to absorb the higher
 # single-rollout variance (empirical single-rollout: honest 0.94-1.0, non-forced
@@ -695,6 +699,15 @@ FORCED_SEED_ROLLOUT_FLOOR = 0.75
 # positions; below it the per-rollout check abstains (never false-reject a
 # short / peaked honest rollout).
 FORCED_SEED_ROLLOUT_MIN_STOCH = 20
+# Candidate tolerance for exact per-position CDF interval verification.
+# A mismatch farther than this from the submitted token's validator-computed
+# interval is a hard mismatch rather than numerical boundary ambiguity. The
+# exact gate ships in telemetry mode until live incremental-vs-teacher-forced
+# distance data establishes a consensus-safe epsilon.
+FORCED_SEED_CDF_BOUNDARY_EPSILON = 0.002
+FORCED_SEED_CDF_ENFORCE = _os.environ.get(
+    "FORCED_SEED_CDF_ENFORCE", "false"
+).strip().lower() in ("1", "true", "yes", "on")
 # Master switch for forced-seed ENFORCEMENT. False = shadow (compute + log the
 # consistency score, never reject); True = enforce (reject a group / rollout
 # below the floors). Ships True so merging the branch arms the gate directly --
