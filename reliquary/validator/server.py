@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 import collections
 import logging
-import math
 import numbers
 import time
 from typing import Any, Callable
@@ -33,7 +32,6 @@ from reliquary.constants import (
     DRAND_ROUND_BACKWARD_TOLERANCE,
     ENFORCE_ENVELOPE_SIGNATURE,
     MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW,
-    MIN_EOS_PROBABILITY,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
     MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
@@ -177,24 +175,6 @@ def _proof_free_force_span_validator(batcher: Any):
     return _validate
 
 
-def _claimed_final_token_logprob(commit: dict[str, Any]) -> float | None:
-    tokens = list(commit.get("tokens") or [])
-    meta = commit.get("rollout", {}) or {}
-    prompt_length = int(meta.get("prompt_length", 0))
-    completion_length = int(meta.get("completion_length", 0))
-    claimed = list(meta.get("token_logprobs") or [])
-    if completion_length <= 0:
-        return None
-
-    if len(claimed) == len(tokens):
-        final_idx = prompt_length + completion_length - 1
-        if 0 <= final_idx < len(claimed):
-            return float(claimed[final_idx])
-    if len(claimed) == completion_length:
-        return float(claimed[completion_length - 1])
-    return None
-
-
 def _proof_free_submission_reject(
     request: BatchSubmissionRequest,
     batcher: Any,
@@ -292,13 +272,12 @@ def _proof_free_submission_reject(
         if eos_positions:
             if len(eos_positions) > 1 or eos_positions[0] != len(completion) - 1:
                 return RejectReason.BAD_TERMINATION, "termination_preflight"
-            final_lp = _claimed_final_token_logprob(commit)
-            if (
-                final_lp is not None
-                and math.isfinite(final_lp)
-                and final_lp < math.log(MIN_EOS_PROBABILITY)
-            ):
-                return RejectReason.BAD_TERMINATION, "termination_claim_preflight"
+            # No claimed-logprob floor here. It could only ever bind on miners
+            # who report honestly (a forger simply claims a comfortable value and
+            # is caught by the GPU p_stop check anyway), and it fired BEFORE the
+            # forced-seed terminal-pick escape in verify_termination could rescue
+            # a legally-drawn improbable stop. Termination is decided on the
+            # validator's own logits, not on a number the miner sent.
             continue
 
         total_length = prompt_length + completion_length

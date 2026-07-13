@@ -87,6 +87,12 @@ class ProofResult:
     # caller didn't supply seed_u_values (protocol_version 0 rollouts).
     seed_n_stochastic: int = 0
     seed_n_match: int = 0
+    # Termination escape: True when the final token IS the protocol's forced
+    # inverse-CDF pick at the position that produced it. The miner cannot choose
+    # where the public u selects EOS, so a match proves a legal draw regardless
+    # of how improbable it was. None when there is no u-stream (pre-forced-seed
+    # rollouts) or the rollout does not end on a stop token.
+    terminal_pick_ok: bool | None = None
 
 
 def verify_signature(commit: dict, hotkey: str) -> bool:
@@ -157,12 +163,22 @@ def verify_termination(
     satisfy ``completion_length ≥ cap``.
 
     Path 2 — natural EOS termination: ``tokens[-1]`` is one of the
-    configured stop tokens AND its probability mass at the previous
-    position's softmax (``p_stop``) is at least ``MIN_EOS_PROBABILITY``.
+    configured stop tokens AND either
+
+      (a) its probability mass at the previous position's softmax
+          (``p_stop``) is at least ``MIN_EOS_PROBABILITY``, or
+      (b) it IS the protocol's forced inverse-CDF pick at that position
+          (``terminal_pick_ok``).
+
     The probability gate catches sampler-forced stops at near-zero
-    probability that wouldn't pass an honest decode. ``p_stop`` is
-    precomputed on GPU by ``verify_commitment_proofs`` and carried on
-    ``proof`` — there's no per-call softmax on a CPU logits tensor.
+    probability that wouldn't pass an honest decode. On its own it also
+    rejects the *honest* case where the forced stream drew EOS mid-reasoning
+    from the nucleus by chance — a legal but improbable stop the miner cannot
+    resample away. (b) recovers exactly those: ``u`` is a public hash of the
+    window randomness, so a miner cannot choose where it selects EOS, and a
+    forged stop still fails. Both values are precomputed on GPU by
+    ``verify_commitment_proofs`` and carried on ``proof`` — there's no
+    per-call softmax on a CPU logits tensor.
     """
     from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
 
@@ -191,6 +207,7 @@ def verify_termination(
     last_tok = int(tokens[-1])
     in_eos = last_tok in eos_set
     p_stop = proof.p_stop if proof is not None else None
+    forced_pick = bool(proof.terminal_pick_ok) if proof is not None else False
     if p_stop is None:
         logger.warning(
             "termination_fail reason=no_p_stop prompt_length=%d "
@@ -200,15 +217,16 @@ def verify_termination(
         )
         return False
 
-    ok = in_eos and p_stop >= MIN_EOS_PROBABILITY
+    ok = in_eos and (p_stop >= MIN_EOS_PROBABILITY or forced_pick)
     if not ok:
         logger.warning(
             "termination_fail prompt_length=%d completion_length=%d "
             "total=%d cap=%d last_token=%d in_eos=%s p_stop=%.5f "
-            "min_p=%.3f eos_set=%s",
+            "min_p=%.3f forced_pick=%s eos_set=%s",
             prompt_length, completion_length, total_length,
             MAX_NEW_TOKENS_PROTOCOL_CAP,
-            last_tok, in_eos, p_stop, MIN_EOS_PROBABILITY, sorted(eos_set),
+            last_tok, in_eos, p_stop, MIN_EOS_PROBABILITY, forced_pick,
+            sorted(eos_set),
         )
     return ok
 
@@ -247,10 +265,11 @@ def is_cap_truncation(
         return True
 
     p_stop = proof.p_stop if proof is not None else None
+    forced_pick = bool(proof.terminal_pick_ok) if proof is not None else False
     return not (
         int(tokens[-1]) in eos_set
         and p_stop is not None
-        and p_stop >= MIN_EOS_PROBABILITY
+        and (p_stop >= MIN_EOS_PROBABILITY or forced_pick)
     )
 
 
@@ -366,6 +385,7 @@ def verify_commitment_proofs(
 
     seed_n_stochastic = 0
     seed_n_match = 0
+    terminal_pick_ok = None
     if seed_u_values is not None:
         valid_t = _completion_valid_t(tokens, prompt_length, completion_length, seq_len)
         # Exclude BFT-injected force_span tokens: validator-accepted but not
@@ -395,6 +415,10 @@ def verify_commitment_proofs(
             seed_n_stochastic, seed_n_match = _gpu_seed_consistency(
                 logits_gpu[pos_tensor], seed_tokens, seed_u,
             )
+        terminal_pick_ok = _gpu_terminal_forced_pick(
+            logits_gpu, tokens, prompt_length, seq_len,
+            _eos_set_from_model(model, tokenizer), seed_u_values, (fs0, fs1),
+        )
 
     hidden_states = hidden_states_gpu.detach().to("cpu")
 
@@ -433,7 +457,51 @@ def verify_commitment_proofs(
         completion_argmax_ids=completion_argmax_ids,
         seed_n_stochastic=seed_n_stochastic,
         seed_n_match=seed_n_match,
+        terminal_pick_ok=terminal_pick_ok,
     )
+
+
+def _gpu_terminal_forced_pick(
+    logits_gpu: torch.Tensor,
+    tokens: list[int],
+    prompt_length: int,
+    seq_len: int,
+    eos_set: set[int],
+    seed_u_values: list[float],
+    force_span: tuple[int, int],
+) -> bool | None:
+    """True when the rollout's final token is the forced inverse-CDF pick.
+
+    Recomputes the protocol draw the miner was obliged to make at the position
+    that produced ``tokens[-1]``: ``pick(warp(logits[t-1]), u_j)``. A match means
+    the stop was the one legal token there — the miner cannot steer ``u``, so this
+    cannot be manufactured, while a forged EOS (injected where ``u`` selected some
+    other token) does not match.
+
+    None when the rollout does not end on a stop token, the terminal position is
+    an injected BFT force-span token (never sampled), or the u-stream does not
+    reach it — in all three cases termination falls back to the p_stop floor.
+    """
+    from reliquary.constants import TOP_K_PROTO, TOP_P_PROTO
+    from reliquary.environment.forced_sampling import pick, warp
+
+    if seq_len < 2 or not eos_set or not tokens:
+        return None
+    if int(tokens[-1]) not in eos_set:
+        return None
+
+    t = seq_len - 1                     # position of the final token
+    j = t - prompt_length               # its completion offset, indexing u
+    if j < 0 or j >= len(seed_u_values):
+        return None
+    fs0, fs1 = force_span
+    if fs0 <= t < fs1:
+        return None
+
+    probs = warp(
+        logits_gpu[t - 1].float(), t=T_PROTO, top_k=TOP_K_PROTO, top_p=TOP_P_PROTO,
+    )
+    return pick(probs, seed_u_values[j]) in eos_set
 
 
 def _gpu_p_stop(
