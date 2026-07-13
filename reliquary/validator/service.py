@@ -61,6 +61,7 @@ from reliquary.validator.observability import log_structured, runtime_revision
 from reliquary.validator.quarantine import assess_training_batch
 from reliquary.validator.server import ValidatorServer
 from reliquary.validator.training import train_step
+from reliquary.validator.training_accumulator import BalancedTrainingAccumulator
 
 logger = logging.getLogger(__name__)
 
@@ -343,6 +344,12 @@ class ValidationService:
         self._checkpoint_n: int = 0
         self._publish_every = CHECKPOINT_PUBLISH_INTERVAL_WINDOWS
         self._trained_windows_since_publish = 0
+        self._training_accumulator = BalancedTrainingAccumulator(
+            dict(self.env_mix)
+        )
+        self.server.set_training_accumulator_state(
+            self._training_accumulator.snapshot()
+        )
         self._windows_since_cooldown_snapshot = 0
         self._checkpoint_store = CheckpointStore(
             validator_hotkey=wallet.hotkey.ss58_address,
@@ -976,55 +983,122 @@ class ValidationService:
             for hk, r in rewards.items():
                 all_rewards[hk] = all_rewards.get(hk, 0.0) + r
 
-        # Collect batches in env_mix order for grad-accumulation consistency.
-        batches = [sealed[name][0] for name, _ in self.env_mix if name in sealed]
+        window_batches = {
+            name: sealed[name][0] for name, _ in self.env_mix if name in sealed
+        }
 
-        # Only train when EVERY env has a full batch. A partial seal in any
-        # env means the gradient signal is incomplete; we skip and archive.
-        # Note: miners earn slots regardless of training. Their contribution
-        # is reflected in the next ``_submit_weights`` call, which replays
-        # the EMA from R2 archives written by ``_archive_window`` below.
-        trained = all(
-            len(sealed[name][0]) >= per_env_targets[name]
-            for name in sealed
-        )
-
-        # Anti-exploit training quarantine (ported to multi-env): assess
-        # the combined batch across all envs. A poisoned window is still
-        # archived and credited; we only skip GRPO + publish. reject_counts
-        # are summed over every active batcher.
+        # Quarantine each window before retaining any of its groups. Rewards
+        # and archives remain per-window; this gate only protects model state.
         combined_reject_counts: dict[str, int] = {}
         for _b in self._active_batchers.values():
             for _k, _v in dict(getattr(_b, "reject_counts", {})).items():
                 combined_reject_counts[_k] = combined_reject_counts.get(_k, 0) + _v
-        flat_batch = [group for env_batch in batches for group in env_batch]
-        quarantine = assess_training_batch(
-            flat_batch,
+        flat_window_batch = [
+            group for env_batch in window_batches.values() for group in env_batch
+        ]
+        window_quarantine = assess_training_batch(
+            flat_window_batch,
             reject_counts=combined_reject_counts,
         )
-        _quarantine_archive = quarantine.to_archive()
+        _quarantine_archive = window_quarantine.to_archive()
         for _b in self._active_batchers.values():
             _b.training_quarantine = _quarantine_archive
-        if trained and quarantine.quarantined:
-            logger.warning(
-                "Window %d quarantined from training: reasons=%s metrics=%s",
-                self._window_n, quarantine.reasons, quarantine.metrics,
+
+        checkpoint_revisions = {
+            str(getattr(b, "current_checkpoint_hash", ""))
+            for b in self._active_batchers.values()
+        }
+        if len(checkpoint_revisions) != 1:
+            logger.error(
+                "Window %d has inconsistent checkpoint revisions across envs: %s",
+                self._window_n, sorted(checkpoint_revisions),
             )
-            trained = False
+            discarded = self._training_accumulator.reset()
+            accumulator_update = {
+                "checkpoint_reset": discarded,
+                "counts_before": discarded["counts"],
+                "added": {name: 0 for name in per_env_targets},
+                "not_accumulated": {
+                    name: len(window_batches.get(name, ()))
+                    for name in per_env_targets
+                },
+                "snapshot": self._training_accumulator.snapshot(),
+            }
+            accumulator_update["blocked_reason"] = "inconsistent_checkpoint"
+        else:
+            checkpoint_revision = next(iter(checkpoint_revisions))
+            accumulator_update = self._training_accumulator.add_window(
+                {} if window_quarantine.quarantined else window_batches,
+                window_n=self._window_n,
+                checkpoint_revision=checkpoint_revision,
+            )
+            if window_quarantine.quarantined:
+                accumulator_update["blocked_reason"] = "window_quarantine"
+                accumulator_update["not_accumulated"] = {
+                    name: len(window_batches.get(name, ()))
+                    for name in per_env_targets
+                }
+
+        accumulator_meta: dict[str, Any] = {
+            "schema_version": 1,
+            "window_groups": {
+                name: len(window_batches.get(name, ()))
+                for name in per_env_targets
+            },
+            **accumulator_update,
+            "training_attempted": False,
+            "trained": False,
+            "reset_reason": None,
+        }
+
+        env_order = [name for name, _ in self.env_mix]
+        accumulator_ready = (
+            len(checkpoint_revisions) == 1 and self._training_accumulator.ready
+        )
+        batches = (
+            self._training_accumulator.training_batches(env_order)
+            if accumulator_ready else []
+        )
+
+        # Assess the balanced retained batch as a second model-health gate.
+        # Reject spikes are window-scoped and were checked above, so they are
+        # deliberately not summed across source windows here.
+        accumulated_quarantine = assess_training_batch(
+            [group for env_batch in batches for group in env_batch],
+            reject_counts={},
+        )
+        accumulator_meta["accumulated_quarantine"] = (
+            accumulated_quarantine.to_archive()
+        )
+        if accumulator_ready and accumulated_quarantine.quarantined:
+            logger.warning(
+                "Window %d accumulated batch quarantined from training: "
+                "reasons=%s metrics=%s",
+                self._window_n,
+                accumulated_quarantine.reasons,
+                accumulated_quarantine.metrics,
+            )
+            accumulator_meta["reset_reason"] = "accumulated_quarantine"
+            accumulator_meta["discarded"] = self._training_accumulator.reset()
+            accumulator_ready = False
+            batches = []
+
+        trained = False
         # Env-controlled skip: ``RELIQUARY_DISABLE_TRAIN=1`` bypasses the
         # train_step call entirely. Useful when the validator is configured
         # in inference-only mode (e.g. a frozen policy phase) or when the
         # train_step has a known OOM/leak pattern that's poisoning the
-        # GPU pool across windows. With this flag set we proceed straight
-        # to archive + skip-publish, exactly like a partial-seal path.
+        # GPU pool across windows. With this flag set the balanced retained
+        # batch stays pending while this window is archived normally.
         skip_train = os.environ.get("RELIQUARY_DISABLE_TRAIN", "").lower() in {"1", "true", "yes", "on"}
-        if trained and skip_train:
+        if accumulator_ready and skip_train:
             logger.info(
-                "Window %d: RELIQUARY_DISABLE_TRAIN set — skipping train_step + publish",
+                "Window %d: RELIQUARY_DISABLE_TRAIN set — retaining balanced "
+                "batch and skipping train_step + publish",
                 self._window_n,
             )
-            trained = False
-        elif trained:
+        elif accumulator_ready:
+            accumulator_meta["training_attempted"] = True
             try:
                 # Forward/backward is the longest blocking step in the loop;
                 # run it in a thread so the HTTP server keeps serving /state
@@ -1035,6 +1109,7 @@ class ValidationService:
                     ref_model=self.verify_model,
                     window_index=self._window_n,
                 )
+                trained = True
             except Exception:
                 # Don't let a training failure (e.g. CUDA OOM) skip
                 # _archive_window — miners still need their R2 contribution
@@ -1043,7 +1118,7 @@ class ValidationService:
                     "train_step failed for window %d; archiving anyway and "
                     "skipping publish", self._window_n,
                 )
-                trained = False
+                accumulator_meta["reset_reason"] = "train_step_failed"
             finally:
                 # Reclaim any GPU memory the failed/successful train_step
                 # held in its activation cache. This is critical when
@@ -1051,13 +1126,42 @@ class ValidationService:
                 # the partial allocations fragment the CUDA pool over
                 # successive windows and eventually starve verify_commitment.
                 _try_empty_cuda_cache()
+                accumulator_meta["discarded"] = self._training_accumulator.reset()
+                if accumulator_meta["reset_reason"] is None:
+                    accumulator_meta["reset_reason"] = "training_consumed"
         else:
-            total_subs = sum(len(b) for b in batches)
+            total_subs = sum(len(b) for b in window_batches.values())
             total_target = sum(per_env_targets.values())
+            retained = accumulator_meta["snapshot"]["counts"]
             logger.info(
-                "Window %d sealed with %d/%d submissions — skipping train_step + publish",
-                self._window_n, total_subs, total_target,
+                "Window %d sealed with %d/%d submissions; retained=%s — "
+                "waiting for balanced training batch",
+                self._window_n, total_subs, total_target, retained,
             )
+
+        accumulator_meta["trained"] = trained
+        accumulator_meta["post_action"] = self._training_accumulator.snapshot()
+        self.server.set_training_accumulator_state(accumulator_meta["post_action"])
+        log_structured(
+            logger,
+            logging.INFO,
+            "validator_training_accumulator",
+            {
+                "window_n": self._window_n,
+                "window_groups": accumulator_meta["window_groups"],
+                "added": accumulator_meta["added"],
+                "not_accumulated": accumulator_meta["not_accumulated"],
+                "counts_after_add": accumulator_meta["snapshot"]["counts"],
+                "ready_after_add": accumulator_meta["snapshot"]["ready"],
+                "training_attempted": accumulator_meta["training_attempted"],
+                "trained": trained,
+                "blocked_reason": accumulator_meta.get("blocked_reason"),
+                "reset_reason": accumulator_meta["reset_reason"],
+                "post_action_counts": accumulator_meta["post_action"]["counts"],
+            },
+        )
+        for _b in self._active_batchers.values():
+            _b.training_accumulator = accumulator_meta
 
         self._set_state(WindowState.PUBLISHING)
         if trained:
@@ -1389,6 +1493,11 @@ class ValidationService:
                 batcher,
                 "training_quarantine",
                 {"quarantined": False, "reasons": [], "metrics": {}},
+            ),
+            "training_accumulator": getattr(
+                first_batcher,
+                "training_accumulator",
+                {"schema_version": 1, "trained": False},
             ),
             # v2.3: per-hotkey emission share from select_batch_and_distribute.
             # All miners whose prompt landed in the winning set appear here,

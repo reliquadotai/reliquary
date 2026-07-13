@@ -5,7 +5,8 @@ import logging
 
 from fastapi.testclient import TestClient
 
-from reliquary.constants import M_ROLLOUTS
+from reliquary.constants import FORCED_SEED_PROTOCOL_VERSION, M_ROLLOUTS
+from reliquary.protocol.merkle import compute_rollouts_merkle_root
 from reliquary.protocol.submission import (
     BatchSubmissionResponse,
     RejectReason,
@@ -77,22 +78,24 @@ class _ObservableBatcher:
 
 
 def _submission(*, drand_round: int, hotkey: str = "hkA") -> dict:
+    rollouts = [
+        {
+            "tokens": [1],
+            "reward": 1.0,
+            "commit": {"tokens": [1]},
+            "env_name": "openmathinstruct",
+        }
+        for _ in range(M_ROLLOUTS)
+    ]
     return {
         "miner_hotkey": hotkey,
         "prompt_idx": 42,
         "window_start": 500,
-        "merkle_root": f"{drand_round:064x}",
-        "rollouts": [
-            {
-                "tokens": [1],
-                "reward": 1.0,
-                "commit": {"tokens": [1]},
-                "env_name": "openmathinstruct",
-            }
-            for _ in range(M_ROLLOUTS)
-        ],
+        "merkle_root": compute_rollouts_merkle_root(rollouts),
+        "rollouts": rollouts,
         "checkpoint_hash": "",
         "drand_round": drand_round,
+        "protocol_version": FORCED_SEED_PROTOCOL_VERSION,
     }
 
 
@@ -210,6 +213,12 @@ def test_health_endpoint_does_not_leak_secrets(monkeypatch):
     monkeypatch.setenv("R2_BUCKET_ID", "public-bucket-name")
 
     server = _open_server()
+    server.set_training_accumulator_state({
+        "checkpoint_revision": "rev-a",
+        "targets": {"math": 8, "code": 8},
+        "counts": {"math": 3, "code": 8},
+        "ready": False,
+    })
     monkeypatch.setattr(server, "_current_drand_round_best_effort", lambda: 123)
     client = TestClient(server.app)
     body = client.get("/health").json()
@@ -224,6 +233,10 @@ def test_health_endpoint_does_not_leak_secrets(monkeypatch):
     assert body["sparse_valid_idle_seal_seconds"] == 300.0
     assert body["sparse_valid_idle_min_distinct_prompts"] == 4
     assert body["sparse_valid_max_window_seconds"] == 900.0
+    assert body["training_accumulator_checkpoint_revision"] == "rev-a"
+    assert body["training_accumulator_targets"] == {"math": 8, "code": 8}
+    assert body["training_accumulator_counts"] == {"math": 3, "code": 8}
+    assert body["training_accumulator_ready"] is False
     assert "secret-value-123" not in text
     assert "access-key-value-123" not in text
     assert "hf_secret_value_123" not in text

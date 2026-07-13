@@ -519,6 +519,14 @@ matching the existing partial-seal skip behaviour. We do NOT fall back
 to "train on the env that did seal" because that would amplify the
 imbalance we are trying to avoid.
 
+> **Production amendment (2026-07-14):** the one-window underflow rule above
+> caused a liveness cliff once OpenMath became sparse while OpenCode still
+> filled. The coordinator now uses bounded balanced cross-window accumulation.
+> It retains at most `B_BATCH` groups per environment under one public
+> checkpoint revision and trains only after every environment reaches its
+> target. This preserves the original no-imbalance invariant without throwing
+> away all clean partial-window signal.
+
 ### Training loop
 
 ```python

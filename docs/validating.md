@@ -213,6 +213,22 @@ These are the live thresholds the trainer applies on every submission. The same 
 
 Source of truth: `reliquary/constants.py`. If any of these change, this table and `concepts.md` need a sync.
 
+### Balanced training accumulation
+
+Sparse seals no longer discard otherwise valid gradient signal. The validator
+retains at most the configured target for each active environment and trains
+only when all targets are present. Pending groups are bound to one checkpoint
+revision and are cleared on revision drift, accumulated-batch quarantine, or a
+completed or failed training attempt. A process restart also clears this
+in-memory buffer; window archives and miner rewards are independent and remain
+durable.
+
+Operators can inspect `training_accumulator_checkpoint_revision`,
+`training_accumulator_targets`, `training_accumulator_counts`, and
+`training_accumulator_ready` in `/health`. Every archive also includes a
+`training_accumulator` record with per-window additions, overflow, source
+windows, reset reason, and whether a step was attempted.
+
 ### Submission pipeline
 
 Every `/submit` flows through this sequence on the validator. The first rejection short-circuits the rest.

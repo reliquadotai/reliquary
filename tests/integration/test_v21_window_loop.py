@@ -90,6 +90,20 @@ def _rollouts(k, seed: int = 0):
     return rollouts
 
 
+def _request(*, hotkey, prompt_idx, window_start, checkpoint_hash, seed=0):
+    from reliquary.protocol.merkle import compute_rollouts_merkle_root
+
+    rollouts = _rollouts(k=4, seed=seed)
+    return BatchSubmissionRequest(
+        miner_hotkey=hotkey,
+        prompt_idx=prompt_idx,
+        window_start=window_start,
+        merkle_root=compute_rollouts_merkle_root(rollouts),
+        rollouts=rollouts,
+        checkpoint_hash=checkpoint_hash,
+    )
+
+
 def _make_service(checkpoint_hash="sha256:cp"):
     """Construct a ValidationService with a mocked checkpoint store (no HF) +
     training stub.
@@ -139,10 +153,6 @@ def _patch_open_grpo_window(svc):
     """
     import reliquary.validator.service as svc_mod
     from reliquary.validator.batcher import GrpoWindowBatcher
-    from reliquary.validator.cooldown import CooldownMap
-    from reliquary.constants import BATCH_PROMPT_COOLDOWN_WINDOWS
-
-    real_open = svc_mod.open_grpo_window
 
     def _mock_open(
         window_start, env, model, *,
@@ -220,7 +230,6 @@ async def test_open_window_passes_verify_model_to_batcher(monkeypatch):
     captured = {}
 
     import reliquary.validator.service as svc_mod
-    real_open = svc_mod.open_grpo_window
 
     def _capture_open(
         window_start, env, model, *,
@@ -344,13 +353,10 @@ async def test_submission_with_matching_hash_accepted_during_open():
 
     # Feed B distinct submissions (k=4 → in zone); unique seed per miner.
     for i in range(B_BATCH):
-        req = BatchSubmissionRequest(
-            miner_hotkey=f"hk{i}",
-            prompt_idx=i,
+        req = _request(
+            hotkey=f"hk{i}", prompt_idx=i,
             window_start=batcher.window_start,
-            merkle_root="00" * 32,
-            rollouts=_rollouts(k=4, seed=i),
-            checkpoint_hash="sha256:cpA",
+            checkpoint_hash="sha256:cpA", seed=i,
         )
         resp = batcher.accept_submission(req)
         assert resp.accepted, f"unexpected reject for hk{i}: {resp.reason}"
@@ -366,11 +372,9 @@ async def test_submission_with_wrong_hash_rejected():
         svc._open_window()
     batcher = svc._active_batcher
 
-    req = BatchSubmissionRequest(
-        miner_hotkey="hk", prompt_idx=0,
+    req = _request(
+        hotkey="hk", prompt_idx=0,
         window_start=batcher.window_start,
-        merkle_root="00" * 32,
-        rollouts=_rollouts(k=4),
         checkpoint_hash="sha256:stale",  # mismatched
     )
     resp = batcher.accept_submission(req)
@@ -379,15 +383,8 @@ async def test_submission_with_wrong_hash_rejected():
 
 
 @pytest.mark.asyncio
-async def test_timeout_partial_seal_skips_train_and_publish():
-    """Partial seal (len(batch) < B_BATCH) → state machine advances to READY
-    but train_step is NOT called and checkpoint_n stays unchanged.
-
-    This is the skip-if-partial contract: a smaller-than-target batch gives
-    a noisy gradient and a different effective LR than a full-batch step,
-    so we refuse to step on it. Miners who did submit still earn slots via
-    _update_ema — this assertion is about training persistence, not payout.
-    """
+async def test_timeout_partial_seal_accumulates_without_publishing():
+    """A partial seal is retained but cannot train until its target is full."""
     svc = _make_service(checkpoint_hash="sha256:cpA")
     with _patch_open_grpo_window(svc):
         svc._open_window()
@@ -396,12 +393,10 @@ async def test_timeout_partial_seal_skips_train_and_publish():
 
     # Feed only 3 submissions — definitely less than any reasonable B_BATCH
     for i in range(3):
-        req = BatchSubmissionRequest(
-            miner_hotkey=f"hk{i}", prompt_idx=i,
+        req = _request(
+            hotkey=f"hk{i}", prompt_idx=i,
             window_start=batcher.window_start,
-            merkle_root="00" * 32,
-            rollouts=_rollouts(k=4, seed=i),
-            checkpoint_hash="sha256:cpA",
+            checkpoint_hash="sha256:cpA", seed=i,
         )
         batcher.accept_submission(req)
 
@@ -411,9 +406,137 @@ async def test_timeout_partial_seal_skips_train_and_publish():
     # Run loop calls _train_and_publish after the timeout fires regardless.
     await svc._train_and_publish()
     assert svc._current_window_state == WindowState.READY
-    # New contract: no training → no publish → checkpoint_n unchanged.
     assert svc._checkpoint_n == initial_cn
     svc._checkpoint_store.publish.assert_not_awaited()
+    assert svc._training_accumulator.snapshot()["counts"] == {"fake": 3}
+
+
+@pytest.mark.asyncio
+async def test_sparse_windows_train_once_accumulated_target_is_full():
+    """Checkpoint-consistent partial windows combine into one full step."""
+    svc = _make_service(checkpoint_hash="sha256:cpA")
+
+    for start, count in ((0, 3), (3, B_BATCH - 3)):
+        with _patch_open_grpo_window(svc):
+            svc._open_window()
+        batcher = svc._active_batcher
+        for i in range(start, start + count):
+            req = _request(
+                hotkey=f"hk{i}", prompt_idx=i,
+                window_start=batcher.window_start,
+                checkpoint_hash="sha256:cpA", seed=i,
+            )
+            resp = batcher.accept_submission(req)
+            assert resp.accepted, resp.reason
+        await svc._train_and_publish()
+
+    svc._checkpoint_store.publish.assert_awaited_once()
+    assert svc._checkpoint_n == 1
+    assert svc._training_accumulator.snapshot()["counts"] == {"fake": 0}
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_rollover_discards_partial_accumulation():
+    from reliquary.validator.checkpoint import ManifestEntry
+
+    svc = _make_service(checkpoint_hash="sha256:cpA")
+    with _patch_open_grpo_window(svc):
+        svc._open_window()
+    for i in range(3):
+        response = svc._active_batcher.accept_submission(_request(
+            hotkey=f"hk-a-{i}", prompt_idx=i,
+            window_start=svc._active_batcher.window_start,
+            checkpoint_hash="sha256:cpA", seed=i,
+        ))
+        assert response.accepted
+    await svc._train_and_publish()
+    assert svc._training_accumulator.snapshot()["counts"] == {"fake": 3}
+
+    svc._checkpoint_store.current_manifest.return_value = ManifestEntry(
+        checkpoint_n=1,
+        repo_id="aivolutionedge/reliquary-sn",
+        revision="sha256:cpB",
+        signature="ed25519:sig1",
+    )
+    with _patch_open_grpo_window(svc):
+        svc._open_window()
+    for i in range(3, 5):
+        response = svc._active_batcher.accept_submission(_request(
+            hotkey=f"hk-b-{i}", prompt_idx=i,
+            window_start=svc._active_batcher.window_start,
+            checkpoint_hash="sha256:cpB", seed=i,
+        ))
+        assert response.accepted
+    await svc._train_and_publish()
+
+    snapshot = svc._training_accumulator.snapshot()
+    assert snapshot["checkpoint_revision"] == "sha256:cpB"
+    assert snapshot["counts"] == {"fake": 2}
+    assert snapshot["source_windows"] == {"fake": [2]}
+    svc._checkpoint_store.publish.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_quarantined_partial_window_is_not_accumulated():
+    from reliquary.validator.quarantine import TrainingQuarantineDecision
+
+    svc = _make_service(checkpoint_hash="sha256:cpA")
+    with _patch_open_grpo_window(svc):
+        svc._open_window()
+    for i in range(3):
+        response = svc._active_batcher.accept_submission(_request(
+            hotkey=f"hk{i}", prompt_idx=i,
+            window_start=svc._active_batcher.window_start,
+            checkpoint_hash="sha256:cpA", seed=i,
+        ))
+        assert response.accepted
+
+    decision = TrainingQuarantineDecision(
+        quarantined=True,
+        reasons=["test_poison_shape"],
+        metrics={"n_groups": 3},
+    )
+    with patch(
+        "reliquary.validator.service.assess_training_batch",
+        return_value=decision,
+    ):
+        await svc._train_and_publish()
+
+    assert svc._training_accumulator.snapshot()["counts"] == {"fake": 0}
+    svc._checkpoint_store.publish.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_disable_train_retains_ready_batch_until_reenabled(monkeypatch):
+    svc = _make_service(checkpoint_hash="sha256:cpA")
+    monkeypatch.setenv("RELIQUARY_DISABLE_TRAIN", "1")
+
+    with _patch_open_grpo_window(svc):
+        svc._open_window()
+    for i in range(B_BATCH):
+        response = svc._active_batcher.accept_submission(_request(
+            hotkey=f"hk{i}", prompt_idx=i,
+            window_start=svc._active_batcher.window_start,
+            checkpoint_hash="sha256:cpA", seed=i,
+        ))
+        assert response.accepted
+    await svc._train_and_publish()
+
+    assert svc._training_accumulator.snapshot()["ready"] is True
+    assert svc.server._health_payload().training_accumulator_ready is True
+    svc._checkpoint_store.publish.assert_not_awaited()
+
+    monkeypatch.delenv("RELIQUARY_DISABLE_TRAIN")
+    with _patch_open_grpo_window(svc):
+        svc._open_window()
+    with patch(
+        "reliquary.validator.service.train_step",
+        side_effect=lambda model, batches, **kwargs: model,
+    ):
+        await svc._train_and_publish()
+
+    svc._checkpoint_store.publish.assert_awaited_once()
+    assert svc._training_accumulator.snapshot()["counts"] == {"fake": 0}
 
 
 @pytest.mark.asyncio

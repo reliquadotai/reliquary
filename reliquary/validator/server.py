@@ -364,6 +364,10 @@ class _Health(BaseModel):
     registered_hotkey_count: int | None = None
     registration_cache_age_seconds: float | None = None
     registration_cache_stale: bool | None = None
+    training_accumulator_checkpoint_revision: str | None = None
+    training_accumulator_targets: dict[str, int] = Field(default_factory=dict)
+    training_accumulator_counts: dict[str, int] = Field(default_factory=dict)
+    training_accumulator_ready: bool = False
 
 
 class ValidatorServer:
@@ -386,6 +390,7 @@ class ValidatorServer:
         ) = None
         self._registration_refresh_lock = asyncio.Lock()
         self._last_registration_refresh_attempt = 0.0
+        self._training_accumulator_state: dict[str, Any] = {}
         self.app: FastAPI = self._build_app()
         self._server: uvicorn.Server | None = None
         self._task: asyncio.Task[Any] | None = None
@@ -443,6 +448,10 @@ class ValidatorServer:
 
     def set_current_state(self, state) -> None:
         self._current_state = state
+
+    def set_training_accumulator_state(self, state: dict[str, Any]) -> None:
+        """Expose a JSON-safe snapshot through ``/health``."""
+        self._training_accumulator_state = dict(state)
 
     def set_current_checkpoint(self, entry) -> None:
         self._current_checkpoint = entry
@@ -633,6 +642,7 @@ class ValidatorServer:
         batcher = self.active_batcher
         cp = self._current_checkpoint
         registration_age = self.registration_cache_age()
+        accumulator = self._training_accumulator_state
         reject_counts: dict[str, int] = dict(self._recent_reject_counts)
         if batcher is not None:
             for reason, count in getattr(batcher, "reject_counts", {}).items():
@@ -723,6 +733,12 @@ class ValidatorServer:
                 if registration_age is not None
                 else None
             ),
+            training_accumulator_checkpoint_revision=accumulator.get(
+                "checkpoint_revision"
+            ),
+            training_accumulator_targets=dict(accumulator.get("targets", {})),
+            training_accumulator_counts=dict(accumulator.get("counts", {})),
+            training_accumulator_ready=bool(accumulator.get("ready", False)),
         )
 
     @staticmethod
