@@ -33,6 +33,7 @@ from reliquary.constants import (
     ENFORCE_ENVELOPE_SIGNATURE,
     MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
+    MAX_PENDING_PROOF_QUEUE_DEPTH,
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
     MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
     MAX_TRUNCATED_PER_SUBMISSION,
@@ -192,9 +193,8 @@ def _proof_free_submission_reject(
     correctness. A rollout ending in EOS still needs the normal GRAIL path to
     recompute p_stop/logprobs. The cheap path only catches cases the expensive
     verifier would reject after burning a scarce proof slot: malformed commits,
-    invalid token envelopes, EOS padding, non-cap completions that never
-    emitted EOS, and self-declared final-EOS probabilities below the hard
-    termination threshold.
+    invalid token envelopes, EOS padding, and non-cap completions that never
+    emitted EOS.
     """
     for rollout in request.rollouts:
         try:
@@ -341,6 +341,9 @@ class _Health(BaseModel):
     last_valid_submission_ts: float | None = None
     seconds_since_last_valid_submission: float | None = None
     proof_admission_count: int | None = None
+    proof_grading_attempts: int | None = None
+    pending_proof_reservations: int | None = None
+    inflight_proof_reservations: int | None = None
     post_trigger_proof_admission_count: int | None = None
     post_trigger_proof_admission_limit: int = MAX_POST_TRIGGER_PROOF_CANDIDATES
     sparse_valid_idle_seal_seconds: float = SPARSE_VALID_IDLE_SEAL_SECONDS
@@ -386,7 +389,9 @@ class ValidatorServer:
         self.app: FastAPI = self._build_app()
         self._server: uvicorn.Server | None = None
         self._task: asyncio.Task[Any] | None = None
-        self._submit_queue: asyncio.Queue = asyncio.Queue()
+        self._submit_queue: asyncio.Queue = asyncio.Queue(
+            maxsize=MAX_PENDING_PROOF_QUEUE_DEPTH,
+        )
         self._worker_task: asyncio.Task[Any] | None = None
         self._inflight_proofs = 0
         from reliquary.protocol.submission import WindowState
@@ -679,6 +684,18 @@ class ValidatorServer:
             proof_admission_count=(
                 getattr(batcher, "proof_admission_count", None) if batcher else None
             ),
+            proof_grading_attempts=(
+                getattr(batcher, "proof_grading_attempts", None)
+                if batcher else None
+            ),
+            pending_proof_reservations=(
+                getattr(batcher, "pending_proof_reservations", None)
+                if batcher else None
+            ),
+            inflight_proof_reservations=(
+                getattr(batcher, "inflight_proof_reservations", None)
+                if batcher else None
+            ),
             post_trigger_proof_admission_count=(
                 getattr(batcher, "post_trigger_proof_admission_count", None)
                 if batcher else None
@@ -720,6 +737,34 @@ class ValidatorServer:
             if "telemetry" not in str(exc):
                 raise
             return batcher.accept_submission(request)
+
+    @staticmethod
+    def _start_proof_admission(
+        batcher: Any,
+        request: BatchSubmissionRequest,
+    ) -> tuple[bool, str | None]:
+        starter = getattr(type(batcher), "start_proof_admission", None)
+        if starter is None:
+            return True, None
+        return starter(batcher, request)
+
+    @staticmethod
+    def _cancel_proof_admission(
+        batcher: Any,
+        request: BatchSubmissionRequest,
+    ) -> None:
+        cancel = getattr(type(batcher), "cancel_proof_admission", None)
+        if cancel is not None:
+            cancel(batcher, request)
+
+    @staticmethod
+    def _finish_proof_admission(
+        batcher: Any,
+        request: BatchSubmissionRequest,
+    ) -> None:
+        finish = getattr(type(batcher), "finish_proof_admission", None)
+        if finish is not None:
+            finish(batcher, request)
 
     @staticmethod
     def _fallback_drand_observation(
@@ -1290,6 +1335,17 @@ class ValidatorServer:
             # bounded by ``try_reserve_proof_admission`` above; over-budget
             # submissions are rejected before they can enter this queue.
             if self._worker_task is None:
+                started, start_reason = self._start_proof_admission(
+                    batcher, request,
+                )
+                if not started:
+                    if self._late_drop_callback is not None:
+                        self._late_drop_callback(hk, "proof_admission_full")
+                    return _cheap_reject(
+                        RejectReason.BATCH_FILLED,
+                        reject_stage="proof_admission",
+                        batch_filled_reason=start_reason,
+                    )
                 telemetry.mark_proof_started()
                 log_submission_stage(
                     logger,
@@ -1299,7 +1355,12 @@ class ValidatorServer:
                     reject_stage=None,
                     reject_reason=None,
                 )
-                resp = self._call_accept_submission(batcher, request, telemetry)
+                try:
+                    resp = self._call_accept_submission(
+                        batcher, request, telemetry,
+                    )
+                finally:
+                    self._finish_proof_admission(batcher, request)
                 telemetry.refresh_from_batcher(batcher, at_decision=True)
                 telemetry.mark_decision(verified=True)
                 log_submission_stage(
@@ -1342,7 +1403,18 @@ class ValidatorServer:
                 return resp
 
             telemetry.mark_enqueued()
-            await self._submit_queue.put((request, batcher, telemetry))
+            try:
+                self._submit_queue.put_nowait((request, batcher, telemetry))
+            except asyncio.QueueFull:
+                self._cancel_proof_admission(batcher, request)
+                if self._late_drop_callback is not None:
+                    self._late_drop_callback(hk, "proof_queue_full")
+                return _cheap_reject(
+                    RejectReason.BATCH_FILLED,
+                    reject_stage="proof_admission",
+                    batch_filled_reason="proof_queue_full",
+                    proof_queue_limit=MAX_PENDING_PROOF_QUEUE_DEPTH,
+                )
             return BatchSubmissionResponse(
                 accepted=True, reason=RejectReason.SUBMITTED,
             )
@@ -1459,8 +1531,8 @@ class ValidatorServer:
             telemetry.refresh_from_batcher(batcher)
             # Silently drop items whose batcher is no longer the active one.
             # This is what relieves pressure from a saturated window: the
-            # queue is unbounded by design, so a busy window can pile up
-            # dozens of pending items behind the in-flight GRAIL. As soon
+            # queue is bounded but a busy window can still hold pending items
+            # behind the in-flight GRAIL. As soon
             # as the service's main loop opens the next window and swaps
             # the batchers dict, every leftover item is for a sealed
             # batcher whose ``_valid`` will never be re-archived — running
@@ -1471,6 +1543,7 @@ class ValidatorServer:
             # the /submit response and learns the real outcome (or its
             # absence) from the R2 archive.
             if batcher not in self._active_batchers.values():
+                self._cancel_proof_admission(batcher, request)
                 telemetry.refresh_from_batcher(batcher, at_decision=True)
                 telemetry.mark_decision()
                 logger.info(
@@ -1514,6 +1587,7 @@ class ValidatorServer:
             # arrival rate. Same accounting bucket as the HTTP path so a
             # miner inspecting late_drops sees one consistent metric.
             if batcher.is_sealed():
+                self._cancel_proof_admission(batcher, request)
                 telemetry.refresh_from_batcher(batcher, at_decision=True)
                 telemetry.mark_decision()
                 logger.info(
@@ -1544,6 +1618,37 @@ class ValidatorServer:
                     batch_filled_reason="batch_already_sealed_or_draining",
                     current_valid_count=getattr(batcher, "valid_count", None),
                     trigger_round=getattr(batcher, "_seal_trigger_round", None),
+                    accepted_into_pool=False,
+                )
+                continue
+            started, start_reason = self._start_proof_admission(
+                batcher, request,
+            )
+            if not started:
+                telemetry.refresh_from_batcher(batcher, at_decision=True)
+                telemetry.mark_decision()
+                if self._late_drop_callback is not None:
+                    self._late_drop_callback(
+                        request.miner_hotkey, "proof_admission_full",
+                    )
+                self.record_verdict(
+                    request.miner_hotkey,
+                    request.merkle_root,
+                    False,
+                    RejectReason.BATCH_FILLED,
+                    window_n=request.window_start,
+                    telemetry=telemetry,
+                    reject_stage="proof_admission",
+                    accepted_into_pool=False,
+                )
+                log_submission_stage(
+                    logger,
+                    logging.WARNING,
+                    "candidate_rejected",
+                    telemetry,
+                    reject_stage="proof_admission",
+                    reject_reason=RejectReason.BATCH_FILLED.value,
+                    batch_filled_reason=start_reason,
                     accepted_into_pool=False,
                 )
                 continue
@@ -1630,6 +1735,7 @@ class ValidatorServer:
                 if any(s in msg for s in ("out of memory", "cublas", "cuda")):
                     await asyncio.to_thread(_try_empty_cuda_cache)
             finally:
+                self._finish_proof_admission(batcher, request)
                 # Always reclaim activation memory after a forward pass so
                 # back-to-back GRAIL verifies don't accumulate fragmentation.
                 # The helper is a no-op on CPU-only hosts. Cost: ~ms; benefit:
