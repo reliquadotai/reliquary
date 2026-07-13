@@ -317,6 +317,12 @@ def test_logical_group_duplicate_is_rejected_quota_neutral_before_proof():
     assert batcher.logical_group_reservation_count == 1
     assert batcher.logical_group_duplicate_rejects == 1
     assert len(batcher.valid_submissions()) == 1
+    health = client.get("/health").json()
+    assert health["logical_group_reservations"] == 1
+    assert health["logical_group_duplicate_rejects"] == 1
+    assert health["logical_group_dedup_by_environment"] == {
+        FakeEnv.name: {"reservations": 1, "duplicate_rejects": 1}
+    }
 
 
 @pytest.mark.parametrize("fail_at", ["length", "row"])

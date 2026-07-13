@@ -348,6 +348,11 @@ class _Health(BaseModel):
     proof_grading_attempts: int | None = None
     pending_proof_reservations: int | None = None
     inflight_proof_reservations: int | None = None
+    logical_group_reservations: int = 0
+    logical_group_duplicate_rejects: int = 0
+    logical_group_dedup_by_environment: dict[str, dict[str, int]] = Field(
+        default_factory=dict
+    )
     post_trigger_proof_admission_count: int | None = None
     post_trigger_proof_admission_limit: int = MAX_POST_TRIGGER_PROOF_CANDIDATES
     sparse_valid_idle_seal_seconds: float = SPARSE_VALID_IDLE_SEAL_SECONDS
@@ -783,6 +788,28 @@ class ValidatorServer:
             for reason, count in getattr(batcher, "reject_counts", {}).items():
                 reject_counts[reason] = max(reject_counts.get(reason, 0), count)
         prompt_sources = self._prompt_source_health()
+        logical_group_dedup: dict[str, dict[str, int]] = {}
+        for env_name, env_batcher in self._active_batchers.items():
+            reservations = getattr(
+                env_batcher, "logical_group_reservation_count", 0
+            )
+            duplicates = getattr(
+                env_batcher, "logical_group_duplicate_rejects", 0
+            )
+            logical_group_dedup[env_name] = {
+                "reservations": (
+                    reservations
+                    if isinstance(reservations, int)
+                    and not isinstance(reservations, bool)
+                    else 0
+                ),
+                "duplicate_rejects": (
+                    duplicates
+                    if isinstance(duplicates, int)
+                    and not isinstance(duplicates, bool)
+                    else 0
+                ),
+            }
         health_status = (
             "degraded"
             if any(
@@ -850,6 +877,14 @@ class ValidatorServer:
                 getattr(batcher, "inflight_proof_reservations", None)
                 if batcher else None
             ),
+            logical_group_reservations=sum(
+                item["reservations"] for item in logical_group_dedup.values()
+            ),
+            logical_group_duplicate_rejects=sum(
+                item["duplicate_rejects"]
+                for item in logical_group_dedup.values()
+            ),
+            logical_group_dedup_by_environment=logical_group_dedup,
             post_trigger_proof_admission_count=(
                 getattr(batcher, "post_trigger_proof_admission_count", None)
                 if batcher else None

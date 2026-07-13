@@ -92,8 +92,14 @@ async def test_archive_includes_prompt_and_rollout_content():
     batcher.randomness = "0xdeadbeef"
     batcher.window_opened_at = 100.0
     batcher.rewarded_but_not_selected_by_hotkey = {"hk_runner": 1}
+    batcher.logical_group_reservation_count = 9
+    batcher.logical_group_duplicate_rejects = 4
     from reliquary.validator.batcher import RejectedSubmission
     batcher.reject_counts = {"out_of_zone": 3, "logprob_mismatch": 1}
+    svc.server._recent_reject_counts.update({
+        "out_of_zone": 2,
+        "hash_duplicate": 4,
+    })
     batcher.rejected_submissions = [
         RejectedSubmission(
             hotkey="hk_evict", prompt_idx=4, reason="out_of_zone",
@@ -206,7 +212,18 @@ async def test_archive_includes_prompt_and_rollout_content():
     assert archive["rewarded_but_not_selected_by_hotkey"] == {"hk_runner": 1}
 
     # reject_summary persisted from batcher.
-    assert archive["reject_summary"] == {"out_of_zone": 3, "logprob_mismatch": 1}
+    assert archive["reject_summary"] == {
+        "out_of_zone": 3,
+        "logprob_mismatch": 1,
+        "hash_duplicate": 4,
+    }
+    assert archive["server_reject_summary"] == {
+        "out_of_zone": 2,
+        "hash_duplicate": 4,
+    }
+    assert archive["logical_group_dedup"] == {
+        "fake": {"reservations": 9, "duplicate_rejects": 4}
+    }
 
     # rejected[] persisted from batcher.rejected_submissions.
     # Test the archive contract WITHOUT pinning the full dataclass field set —

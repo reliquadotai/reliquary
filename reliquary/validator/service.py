@@ -1341,6 +1341,7 @@ class ValidationService:
         combined_rewards: dict[str, float] = {}
         combined_reject_counts: dict[str, int] = {}
         combined_rewarded_not_selected: dict[str, float] = {}
+        logical_group_dedup: dict[str, dict[str, int]] = {}
 
         for env_name, batcher in batcher_dict.items():
             env_obj = self.envs.get(env_name, self.env)
@@ -1478,6 +1479,42 @@ class ValidationService:
             for k, v in dict(getattr(batcher, "reject_counts", {})).items():
                 combined_reject_counts[k] = combined_reject_counts.get(k, 0) + v
 
+            reservations = getattr(
+                batcher, "logical_group_reservation_count", 0
+            )
+            duplicates = getattr(
+                batcher, "logical_group_duplicate_rejects", 0
+            )
+            logical_group_dedup[env_name] = {
+                "reservations": (
+                    reservations
+                    if isinstance(reservations, int)
+                    and not isinstance(reservations, bool)
+                    else 0
+                ),
+                "duplicate_rejects": (
+                    duplicates
+                    if isinstance(duplicates, int)
+                    and not isinstance(duplicates, bool)
+                    else 0
+                ),
+            }
+
+        server_reject_summary = {
+            str(reason): int(count)
+            for reason, count in dict(
+                getattr(self.server, "_recent_reject_counts", {})
+            ).items()
+            if isinstance(count, int) and not isinstance(count, bool)
+        }
+        # Worker rejects appear in both counters while HTTP cheap rejects only
+        # appear in the server counter. Taking the maximum preserves a total
+        # without double-counting and closes the public archive blind spot.
+        for reason, count in server_reject_summary.items():
+            combined_reject_counts[reason] = max(
+                combined_reject_counts.get(reason, 0), count
+            )
+
         env_names_list = list(batcher_dict.keys())
         # Backward-compat: keep "environment" (singular) pointing to the first
         # env so older readers that pre-date multi-env don't silently break.
@@ -1491,6 +1528,8 @@ class ValidationService:
             "batch": batch_entries,
             "runners_up": runners_up,
             "reject_summary": combined_reject_counts,
+            "server_reject_summary": server_reject_summary,
+            "logical_group_dedup": logical_group_dedup,
             "grader_failures": dict(getattr(self, "_grader_failures", {})),
             "rejected": rejected_entries,
             "training_quarantine": getattr(
