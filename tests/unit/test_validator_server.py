@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from reliquary.constants import CHALLENGE_K, M_ROLLOUTS
+from reliquary.environment.virtual_parquet import PromptSourceUnavailable
 from reliquary.protocol.legacy_merkle import (
     compute_legacy_rollouts_merkle_root,
 )
@@ -46,6 +47,29 @@ class FakeEnv:
     def compute_reward(self, p, c): return 1.0 if "CORRECT" in c else 0.0
 
 
+class _UnavailableEnv(FakeEnv):
+    def __init__(self, fail_at):
+        self.fail_at = fail_at
+
+    def __len__(self):
+        if self.fail_at == "length":
+            raise PromptSourceUnavailable("source unavailable")
+        return super().__len__()
+
+    def get_problem(self, idx):
+        if self.fail_at == "row":
+            raise PromptSourceUnavailable("source unavailable")
+        return super().get_problem(idx)
+
+    def source_health(self):
+        return {
+            "status": "degraded",
+            "repo": "owner/repo",
+            "revision": "rev",
+            "last_error_type": "PromptSourceUnavailable",
+        }
+
+
 def _always_true_proof(commit, model, randomness):
     import torch
     from reliquary.validator.verifier import ProofResult
@@ -83,10 +107,10 @@ class _ModelStub:
         max_position_embeddings = 4096
 
 
-def _batcher(window_start=500, cooldown_map=None):
+def _batcher(window_start=500, cooldown_map=None, env=None):
     batcher = GrpoWindowBatcher(
         window_start=window_start,
-        env=FakeEnv(),
+        env=env or FakeEnv(),
         model=_ModelStub(),
         cooldown_map=cooldown_map,
         verify_commitment_proofs_fn=_always_true_proof,
@@ -267,6 +291,30 @@ def test_submit_returns_queued_on_active_window():
     body = resp.json()
     assert body["accepted"] is True
     assert body["reason"] == RejectReason.ACCEPTED.value
+
+
+@pytest.mark.parametrize("fail_at", ["length", "row"])
+def test_prompt_source_outage_is_retryable_quota_neutral_and_visible(fail_at):
+    from reliquary.protocol.submission import WindowState
+
+    server = ValidatorServer()
+    batcher = _batcher(window_start=500)
+    batcher.env = _UnavailableEnv(fail_at)
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+
+    response = TestClient(server.app).post(
+        "/submit", json=_request().model_dump(mode="json")
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "prompt_source_unavailable"
+    assert response.headers["retry-after"] == "30"
+    assert _TEST_KEYPAIR.ss58_address not in server._per_window_counts
+    health = TestClient(server.app).get("/health").json()
+    assert health["status"] == "degraded"
+    assert health["prompt_source_unavailable_total"] == 1
+    assert health["prompt_sources"][FakeEnv.name]["status"] == "degraded"
 
 
 def _registration_server(refresh_callback):
