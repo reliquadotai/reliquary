@@ -136,22 +136,12 @@ class WeightOnlyValidator:
         )
         ema = self._replay_ema(archives)
         miner_weights = dict(ema)
-        total = sum(miner_weights.values())
-        burn_weight = max(0.0, 1.0 - total)
 
         subtensor = await chain.get_subtensor()
         try:
-            submitted = await self._submit_weights(
-                subtensor, miner_weights, burn_weight,
-            )
+            submitted = await self._submit_weights(subtensor, miner_weights)
         finally:
             await chain.close_subtensor(subtensor)
-
-        if submitted:
-            logger.info(
-                "Submitted weights: %d miners (total=%.4f), burn=%.4f",
-                len(miner_weights), total, burn_weight,
-            )
         return submitted
 
     @staticmethod
@@ -195,22 +185,51 @@ class WeightOnlyValidator:
         return ema
 
     async def _submit_weights(
-        self, subtensor, miner_weights: dict[str, float], burn_weight: float,
+        self, subtensor, miner_weights: dict[str, float],
     ) -> bool:
         meta = await chain.get_metagraph(subtensor, self.netuid)
         hotkey_to_uid = dict(zip(meta.hotkeys, meta.uids))
-        uids: list[int] = []
-        weight_vals: list[float] = []
+        weights_by_uid: dict[int, float] = {}
+        registered_total = 0.0
+        registered_hotkey_count = 0
+        omitted_total = 0.0
         for hk, w in miner_weights.items():
-            if hk in hotkey_to_uid and w > 0:
-                uids.append(int(hotkey_to_uid[hk]))
-                weight_vals.append(w)
+            if w <= 0:
+                continue
+            if hk not in hotkey_to_uid:
+                omitted_total += w
+                continue
+            uid = int(hotkey_to_uid[hk])
+            weights_by_uid[uid] = weights_by_uid.get(uid, 0.0) + w
+            registered_total += w
+            registered_hotkey_count += 1
+
+        # The on-chain vector must conserve the full unit mass after filtering
+        # against the current metagraph. Historical EMA belonging to a hotkey
+        # that has since deregistered is no longer payable and therefore burns;
+        # dropping it would make the vector sum below one and let chain-side
+        # normalization redistribute that mass among remaining miners.
+        burn_weight = max(0.0, 1.0 - registered_total)
         if burn_weight > 0:
-            uids.append(UID_BURN)
-            weight_vals.append(burn_weight)
-        if not uids:
+            weights_by_uid[UID_BURN] = (
+                weights_by_uid.get(UID_BURN, 0.0) + burn_weight
+            )
+        if not weights_by_uid:
             logger.info("No non-zero weights to submit; nothing to do.")
             return True
-        return await chain.set_weights(
+
+        uids = list(weights_by_uid)
+        weight_vals = [weights_by_uid[uid] for uid in uids]
+        submitted = await chain.set_weights(
             subtensor, self.wallet, self.netuid, uids, weight_vals,
         )
+        if submitted:
+            logger.info(
+                "Submitted weights: %d registered miners "
+                "(miner_total=%.4f, omitted=%.4f), burn=%.4f",
+                registered_hotkey_count,
+                registered_total,
+                omitted_total,
+                burn_weight,
+            )
+        return submitted
