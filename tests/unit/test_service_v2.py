@@ -45,6 +45,58 @@ def _build_late_drop_service():
     )
 
 
+@pytest.mark.asyncio
+async def test_registration_refresh_uses_fresh_metagraph_and_updates_server():
+    svc = _build_late_drop_service()
+    subtensor = object()
+    metagraph = MagicMock(hotkeys=[" hk-a ", "hk-b", "", None])
+
+    with (
+        patch(
+            "reliquary.validator.service.chain.get_subtensor",
+            new=AsyncMock(return_value=subtensor),
+        ) as get_subtensor,
+        patch(
+            "reliquary.validator.service.chain.get_metagraph",
+            new=AsyncMock(return_value=metagraph),
+        ) as get_metagraph,
+        patch(
+            "reliquary.validator.service.chain.close_subtensor",
+            new=AsyncMock(),
+        ) as close_subtensor,
+    ):
+        refreshed = await svc._refresh_registered_hotkeys(force=True)
+
+    assert refreshed is True
+    assert svc.server._registered_hotkeys == frozenset({"hk-a", "hk-b"})
+    get_subtensor.assert_awaited_once()
+    get_metagraph.assert_awaited_once_with(subtensor, 99)
+    close_subtensor.assert_awaited_once_with(subtensor)
+
+
+@pytest.mark.asyncio
+async def test_registration_refresh_failure_preserves_last_known_good():
+    svc = _build_late_drop_service()
+    svc.server.set_registered_hotkeys({"hk-a"}, refreshed_at=123.0)
+
+    with (
+        patch(
+            "reliquary.validator.service.chain.get_subtensor",
+            new=AsyncMock(side_effect=ConnectionError("chain down")),
+        ),
+        patch(
+            "reliquary.validator.service.chain.close_subtensor",
+            new=AsyncMock(),
+        ) as close_subtensor,
+    ):
+        refreshed = await svc._refresh_registered_hotkeys(force=True)
+
+    assert refreshed is False
+    assert svc.server._registered_hotkeys == frozenset({"hk-a"})
+    assert svc.server._registration_refreshed_at == 123.0
+    close_subtensor.assert_awaited_once_with(None)
+
+
 def test_service_creates_grpo_window_batcher():
     """The service's open_grpo_window() returns a GrpoWindowBatcher wired up
     with the shared CooldownMap."""
@@ -291,4 +343,3 @@ def test_service_registers_late_drop_callback_on_server():
     # Invoking via the server's stored callback must bump the service counter.
     svc.server._late_drop_callback("hkX", "window_not_active")
     assert svc._late_drops == {"hkX": {"window_not_active": 1}}
-

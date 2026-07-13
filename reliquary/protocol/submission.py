@@ -79,6 +79,8 @@ class RejectReason(str, Enum):
     REWARD_SHAPE_SUSPICIOUS = "reward_shape_suspicious"
     WRONG_CHECKPOINT = "wrong_checkpoint"
     WRONG_RANDOMNESS = "wrong_randomness"
+    HOTKEY_NOT_REGISTERED = "hotkey_not_registered"
+    REGISTRATION_UNAVAILABLE = "registration_unavailable"
     WORKER_DROPPED = "worker_dropped"
     STALE_ROUND = "stale_round"
     FUTURE_ROUND = "future_round"
