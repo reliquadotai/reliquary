@@ -38,6 +38,7 @@ class _SubmissionLike(Protocol):
     hotkey: str
     prompt_idx: int
     merkle_root: bytes
+    selection_digest: bytes
     drand_round: int
 
 
@@ -51,7 +52,11 @@ def _within_slot_key(sub: _SubmissionLike) -> bytes:
     h = hashlib.sha256()
     h.update(sub.hotkey.encode())
     h.update(sub.prompt_idx.to_bytes(8, "big", signed=False))
-    h.update(sub.merkle_root)
+    # The full Merkle root binds every submitted field, including metadata
+    # that is intentionally tolerant or validator-overwritten. Using it as a
+    # lottery input would let miners grind representatives by changing harmless
+    # metadata. The validator-computed digest binds only generation output.
+    h.update(getattr(sub, "selection_digest", sub.merkle_root))
     return h.digest()
 
 

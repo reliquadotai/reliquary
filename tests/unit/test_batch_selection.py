@@ -2,7 +2,10 @@
 
 from dataclasses import dataclass
 
-from reliquary.validator.batch_selection import select_batch_and_distribute
+from reliquary.validator.batch_selection import (
+    _within_slot_key,
+    select_batch_and_distribute,
+)
 from reliquary.validator.cooldown import CooldownMap
 
 
@@ -12,15 +15,29 @@ class FakeSubmission:
     prompt_idx: int
     drand_round: int
     merkle_root: bytes = b"\x00" * 32
+    selection_digest: bytes = b"\x00" * 32
 
 
 def _sub(hotkey, prompt_idx, drand_round, merkle_root=None):
+    digest = merkle_root or hotkey.encode().ljust(32, b"\x00")
     return FakeSubmission(
         hotkey=hotkey,
         prompt_idx=prompt_idx,
         drand_round=drand_round,
-        merkle_root=merkle_root or hotkey.encode().ljust(32, b"\x00"),
+        merkle_root=digest,
+        selection_digest=digest,
     )
+
+
+def test_within_slot_key_uses_generation_digest_not_payload_root():
+    sub = _sub("miner", prompt_idx=42, drand_round=7)
+    original_key = _within_slot_key(sub)
+
+    sub.merkle_root = b"\xff" * 32
+    assert _within_slot_key(sub) == original_key
+
+    sub.selection_digest = b"\x01" * 32
+    assert _within_slot_key(sub) != original_key
 
 
 def test_empty_pool_returns_empty():

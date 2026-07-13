@@ -180,6 +180,7 @@ async def test_archive_includes_prompt_and_rollout_content():
 
     # forensic fields.
     assert entry0["merkle_root"] == "ab" * 32
+    assert entry0["selection_digest"] == "ab" * 32
     assert entry0["claimed_checkpoint_hash"] == "sha256:fake"
 
     # eos detection: rollout 0 of entry 0 ends with eos_token_id=99 → True.
@@ -199,6 +200,7 @@ async def test_archive_includes_prompt_and_rollout_content():
     assert ru["all_token_auth_shadow_positive_min_prob"] == pytest.approx(8.0e-6)
     assert ru["code_semantic_auth_positive_findings"] == 1
     assert ru["code_semantic_auth_positive_min_prob"] == pytest.approx(0.0004)
+    assert ru["selection_digest"] == "ab" * 32
     assert "rollouts" not in ru and "prompt" not in ru  # metadata only
     assert ru["rollout_hashes"] == [h.hex() for h in runner.rollout_hashes]
     assert archive["rewarded_but_not_selected_by_hotkey"] == {"hk_runner": 1}
