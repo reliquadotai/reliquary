@@ -28,7 +28,7 @@ COMMIT_DOMAIN = b"grail-commit-v1"
 # is reserved for breaking changes to the envelope field set; rollout
 # clients are expected to construct the envelope with the same byte layout
 # the validator expects.
-ENVELOPE_DOMAIN = b"reliquary-envelope-v1"
+ENVELOPE_DOMAIN = b"reliquary-envelope-v2"
 
 
 def hash_commitments(commitments: list[dict]) -> bytes:
@@ -132,6 +132,7 @@ def build_envelope_binding(
     merkle_root: str,
     checkpoint_hash: str,
     drand_round: int,
+    protocol_version: int,
     randomness: str,
     nonce: str,
 ) -> bytes:
@@ -150,6 +151,7 @@ def build_envelope_binding(
       * ``merkle_root``   — the per-batch GRAIL merkle root
       * ``checkpoint_hash`` — the model revision the miner ran
       * ``drand_round``   — the drand quicknet round the miner attached
+      * ``protocol_version`` — the exact validator protocol contract
       * ``randomness``    — the validator-published window randomness the
         miner's GRAIL sketches are derived against (binds the signature
         to a specific validator's window so it can't be replayed cross-
@@ -161,7 +163,7 @@ def build_envelope_binding(
 
     Layout: ``SHA256(ENVELOPE_DOMAIN || len(x)||x for each x in
     [hotkey_bytes, window_be, prompt_be, merkle_bytes, ckpt_bytes,
-     round_be, rand_bytes, nonce_bytes])``.
+     round_be, protocol_version_be, rand_bytes, nonce_bytes])``.
 
     Same length-prefix-then-bytes pattern as ``build_commit_binding`` so
     field boundaries are unambiguous and no extension attack is possible.
@@ -176,6 +178,9 @@ def build_envelope_binding(
     window_b = int(window_start).to_bytes(8, "big", signed=False)
     prompt_b = int(prompt_idx).to_bytes(8, "big", signed=False)
     round_b = int(drand_round).to_bytes(8, "big", signed=False)
+    protocol_version_b = int(protocol_version).to_bytes(
+        8, "big", signed=False,
+    )
 
     # Hex-string fields: accept with or without ``0x`` prefix. Empty
     # string is permitted for ``checkpoint_hash`` (bootstrap sentinel)
@@ -195,7 +200,17 @@ def build_envelope_binding(
 
     h = hashlib.sha256()
     h.update(ENVELOPE_DOMAIN)
-    for part in (hotkey_b, window_b, prompt_b, merkle_b, ckpt_b, round_b, rand_b, nonce_b):
+    for part in (
+        hotkey_b,
+        window_b,
+        prompt_b,
+        merkle_b,
+        ckpt_b,
+        round_b,
+        protocol_version_b,
+        rand_b,
+        nonce_b,
+    ):
         h.update(_len_bytes(part))
         h.update(part)
     return h.digest()
@@ -210,6 +225,7 @@ def sign_envelope(
     merkle_root: str,
     checkpoint_hash: str,
     drand_round: int,
+    protocol_version: int,
     randomness: str,
     nonce: str,
 ) -> bytes:
@@ -231,6 +247,7 @@ def sign_envelope(
         merkle_root=merkle_root,
         checkpoint_hash=checkpoint_hash,
         drand_round=drand_round,
+        protocol_version=protocol_version,
         randomness=randomness,
         nonce=nonce,
     )
@@ -245,6 +262,7 @@ def verify_envelope_signature(
     merkle_root: str,
     checkpoint_hash: str,
     drand_round: int,
+    protocol_version: int,
     randomness: str,
     nonce: str,
     envelope_signature: str,
@@ -276,6 +294,7 @@ def verify_envelope_signature(
             merkle_root=merkle_root,
             checkpoint_hash=checkpoint_hash,
             drand_round=drand_round,
+            protocol_version=protocol_version,
             randomness=randomness,
             nonce=nonce,
         )

@@ -29,7 +29,11 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
-from reliquary.constants import B_BATCH, MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW
+from reliquary.constants import (
+    B_BATCH,
+    FORCED_SEED_PROTOCOL_VERSION,
+    MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
+)
 from reliquary.protocol.submission import (
     BatchSubmissionRequest, RejectReason, RolloutSubmission, WindowState,
 )
@@ -103,6 +107,7 @@ def _submission(hotkey: str = "hkX", window_start: int = 500) -> dict:
         "merkle_root": "00" * 32,
         "rollouts": [{"tokens": list(range(36)), "reward": 1.0, "commit": commit, "env_name": "openmathinstruct"}] * 8,
         "checkpoint_hash": "sha256:test",
+        "protocol_version": FORCED_SEED_PROTOCOL_VERSION,
     }
 
 

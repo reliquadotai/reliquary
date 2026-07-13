@@ -85,6 +85,7 @@ class RejectReason(str, Enum):
     # historical archives in R2 that carry the string still deserialize.
     REWARD_SHAPE_SUSPICIOUS = "reward_shape_suspicious"
     WRONG_CHECKPOINT = "wrong_checkpoint"
+    PROTOCOL_VERSION_MISMATCH = "protocol_version_mismatch"
     WRONG_RANDOMNESS = "wrong_randomness"
     MERKLE_ROOT_MISMATCH = "merkle_root_mismatch"
     HOTKEY_NOT_REGISTERED = "hotkey_not_registered"

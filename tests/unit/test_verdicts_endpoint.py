@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 
 from reliquary.constants import (
     CHALLENGE_K,
+    FORCED_SEED_PROTOCOL_VERSION,
     M_ROLLOUTS,
     MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
 )
@@ -27,6 +28,7 @@ from reliquary.protocol.submission import (
     RolloutSubmission,
     WindowState,
 )
+from reliquary.protocol.merkle import compute_rollouts_merkle_root
 from reliquary.validator.batcher import GrpoWindowBatcher
 from reliquary.validator.server import ValidatorServer, VERDICT_CAP_PER_HOTKEY
 
@@ -107,16 +109,16 @@ def _request(
         success = i < k_success
         reward = 1.0 if success else 0.0
         commit = _make_commit(success=success, total_reward=reward)
+        commit["tokens"][-1] = (commit["tokens"][-1] + prompt_idx) % 10_000
         rollouts.append(
             RolloutSubmission(
                 tokens=commit["tokens"], reward=reward, commit=commit,
-                env_name="openmathinstruct",
+                env_name="fake",
             )
         )
-    # Default to a deterministic merkle-root per (hotkey, prompt) so tests
-    # can find the verdict for the specific submission they fired.
+    # Default to the canonical rollout root; the validator recomputes it.
     if merkle_root is None:
-        merkle_root = f"{prompt_idx:032x}{0:032x}"
+        merkle_root = compute_rollouts_merkle_root(rollouts)
     return BatchSubmissionRequest(
         miner_hotkey=hotkey,
         prompt_idx=prompt_idx,
@@ -124,6 +126,7 @@ def _request(
         merkle_root=merkle_root,
         rollouts=rollouts,
         checkpoint_hash="sha256:test",
+        protocol_version=FORCED_SEED_PROTOCOL_VERSION,
     )
 
 

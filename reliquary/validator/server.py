@@ -36,6 +36,7 @@ from reliquary.constants import (
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
     MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
     MAX_TRUNCATED_PER_SUBMISSION,
+    FORCED_SEED_PROTOCOL_VERSION,
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
     REGISTERED_HOTKEY_REFRESH_MIN_INTERVAL_SECONDS,
     REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS,
@@ -838,6 +839,7 @@ class ValidatorServer:
                     merkle_root=request.merkle_root,
                     checkpoint_hash=request.checkpoint_hash,
                     drand_round=request.drand_round,
+                    protocol_version=request.protocol_version,
                     randomness=_randomness_for_sig,
                     nonce=request.nonce,
                     envelope_signature=request.envelope_signature,
@@ -976,6 +978,36 @@ class ValidatorServer:
                     accepted_into_pool=False,
                 )
                 raise HTTPException(status_code=409, detail="window_mismatch")
+
+            if request.protocol_version != FORCED_SEED_PROTOCOL_VERSION:
+                telemetry.mark_decision()
+                self.record_verdict(
+                    hk,
+                    request.merkle_root,
+                    False,
+                    RejectReason.PROTOCOL_VERSION_MISMATCH,
+                    window_n=request.window_start,
+                    telemetry=telemetry,
+                    reject_stage="protocol_version",
+                    accepted_into_pool=False,
+                )
+                log_submission_stage(
+                    logger,
+                    logging.WARNING,
+                    "candidate_rejected",
+                    telemetry,
+                    reject_stage="protocol_version",
+                    reject_reason=(
+                        RejectReason.PROTOCOL_VERSION_MISMATCH.value
+                    ),
+                    submitted_protocol_version=request.protocol_version,
+                    required_protocol_version=FORCED_SEED_PROTOCOL_VERSION,
+                    accepted_into_pool=False,
+                )
+                return BatchSubmissionResponse(
+                    accepted=False,
+                    reason=RejectReason.PROTOCOL_VERSION_MISMATCH,
+                )
 
             # Only registered subnet hotkeys may consume submission quota or
             # proof capacity. The signature gate above proves ownership of the

@@ -489,6 +489,7 @@ class MiningEngine:
                     merkle_root=merkle_root,
                     checkpoint_hash=local_hash,
                     drand_round=current_round,
+                    protocol_version=FORCED_SEED_PROTOCOL_VERSION,
                     randomness=state.randomness or "",
                     nonce=_nonce,
                 ).hex()
