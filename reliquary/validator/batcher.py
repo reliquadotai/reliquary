@@ -45,7 +45,10 @@ from reliquary.protocol.submission import (
     RolloutSubmission,
     WindowState,
 )
-from reliquary.protocol.merkle import submission_merkle_matches
+from reliquary.protocol.merkle import (
+    compute_rollouts_selection_digest,
+    submission_merkle_matches,
+)
 from reliquary.protocol.tokens import verify_tokens
 from reliquary.validator.batch_selection import (
     explain_batch_selection,
@@ -238,6 +241,8 @@ class ValidSubmission:
     prompt_idx: int
     merkle_root_bytes: bytes
     merkle_root: bytes = field(init=False)  # alias for select_batch Protocol
+    selection_digest_bytes: bytes | None = None
+    selection_digest: bytes = field(init=False)
     sigma: float = 0.0
     rollouts: list[RolloutSubmission] = field(default_factory=list)
     completion_texts: list[str] = field(default_factory=list)
@@ -275,6 +280,11 @@ class ValidSubmission:
 
     def __post_init__(self):
         self.merkle_root = self.merkle_root_bytes
+        self.selection_digest = (
+            self.selection_digest_bytes
+            if self.selection_digest_bytes is not None
+            else self.merkle_root_bytes
+        )
 
 
 @dataclass
@@ -1527,6 +1537,9 @@ class GrpoWindowBatcher:
             hotkey=request.miner_hotkey,
             prompt_idx=request.prompt_idx,
             merkle_root_bytes=bytes.fromhex(request.merkle_root),
+            selection_digest_bytes=compute_rollouts_selection_digest(
+                request.rollouts
+            ),
             sigma=sigma,
             rollouts=list(request.rollouts),
             completion_texts=completion_texts,

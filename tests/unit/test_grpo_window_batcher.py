@@ -221,6 +221,20 @@ def test_direct_batcher_recomputes_canonical_merkle_root():
     assert response.reason == RejectReason.MERKLE_ROOT_MISMATCH
 
 
+def test_accepted_submission_uses_validator_computed_selection_digest():
+    from reliquary.protocol.merkle import compute_rollouts_selection_digest
+
+    b = _make_batcher()
+    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+
+    assert b.accept_submission(req).accepted is True
+    accepted = b.valid_submissions()[0]
+    assert accepted.selection_digest == compute_rollouts_selection_digest(
+        req.rollouts
+    )
+    assert accepted.selection_digest_bytes == accepted.selection_digest
+
+
 def test_ingestion_resets_miner_supplied_truncated_flag():
     """`truncated` is a validator-set reward-shaping flag. A miner-supplied
     value must be wiped at ingestion so it can't clamp a losing rollout's
