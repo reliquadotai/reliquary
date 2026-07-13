@@ -23,6 +23,7 @@ from reliquary.constants import MAX_SUBMISSIONS_PER_PROMPT
 from reliquary.protocol.submission import (
     BatchSubmissionResponse, RejectReason, WindowState,
 )
+from reliquary.protocol.merkle import compute_rollouts_merkle_root
 from reliquary.validator.server import ValidatorServer
 
 _IN_ZONE_REWARDS = [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
@@ -44,7 +45,7 @@ def _submission(prompt_idx: int = 42, checkpoint_hash: str = "sha256:current",
             "token_logprobs": [0.0] * 36,
         },
     }
-    return {
+    payload = {
         "miner_hotkey": hotkey,
         "prompt_idx": prompt_idx,
         "window_start": window_start,
@@ -53,6 +54,8 @@ def _submission(prompt_idx: int = 42, checkpoint_hash: str = "sha256:current",
         "checkpoint_hash": checkpoint_hash,
         "drand_round": drand_round,
     }
+    payload["merkle_root"] = compute_rollouts_merkle_root(payload["rollouts"])
+    return payload
 
 
 def _submission_with_completion_tokens(
@@ -79,7 +82,27 @@ def _submission_with_completion_tokens(
             "env_name": rollout.get("env_name", "openmathinstruct"),
         })
     payload["rollouts"] = rollouts
+    payload["merkle_root"] = compute_rollouts_merkle_root(rollouts)
     return payload
+
+
+def _refresh_merkle(payload: dict) -> None:
+    payload["merkle_root"] = compute_rollouts_merkle_root(payload["rollouts"])
+
+
+def test_merkle_root_mismatch_rejected_before_proof_admission():
+    s = ValidatorServer()
+    s.set_current_state(WindowState.OPEN)
+    batcher = _PreflightAdmissionBatcher(eos_token_id=99)
+    s.set_active_batcher(batcher)
+    payload = _submission_with_completion_tokens(
+        list(range(4, 35)) + [99],
+        rewards=_IN_ZONE_REWARDS,
+    )
+    payload["merkle_root"] = "ff" * 32
+
+    _assert_pre_queue_reject(s, payload, RejectReason.MERKLE_ROOT_MISMATCH)
+    assert batcher.proof_admission_count == 0
 
 
 def _setup(*,
@@ -133,6 +156,8 @@ class _ProofAdmissionFullBatcher:
     post_trigger_proof_admission_count = 8
 
     class _Env:
+        name = "openmathinstruct"
+
         def __len__(self):
             return 1000
 
@@ -164,6 +189,8 @@ class _PreflightAdmissionBatcher:
     bootstrap = False
 
     class _Env:
+        name = "openmathinstruct"
+
         def __len__(self):
             return 1000
 
@@ -380,6 +407,7 @@ def test_forced_bft_cap_reaches_proof_admission_before_span_validation():
             prompt_length + BFT_THINKING_BUDGET,
             prompt_length + BFT_THINKING_BUDGET + force_len,
         ]
+    _refresh_merkle(payload)
 
     with TestClient(s.app) as client:
         r = client.post("/submit", json=payload)
@@ -412,6 +440,7 @@ def _forced_payload(force_span_tokens: list[int]):
             prompt_length + BFT_THINKING_BUDGET,
             prompt_length + BFT_THINKING_BUDGET + force_len,
         ]
+    _refresh_merkle(payload)
     return payload
 
 
@@ -464,11 +493,13 @@ def test_non_math_forced_cap_does_not_receive_preflight_exemption():
     s.set_current_state(WindowState.OPEN)
     batcher = _PreflightAdmissionBatcher(eos_token_id=99)
     batcher.tokenizer = tokenizer
+    batcher.env.name = "opencodeinstruct"
     s.set_active_batcher(batcher)
 
     payload = _forced_payload(tokenizer.canonical_force_ids)
     for rollout in payload["rollouts"]:
         rollout["env_name"] = "opencodeinstruct"
+    _refresh_merkle(payload)
 
     _assert_pre_queue_reject(s, payload, RejectReason.BAD_TERMINATION)
     assert batcher.proof_admission_count == 0
@@ -560,6 +591,7 @@ def test_low_claimed_final_eos_logprob_is_not_a_pre_queue_reject():
         meta = rollout["commit"]["rollout"]
         final_idx = meta["prompt_length"] + meta["completion_length"] - 1
         meta["token_logprobs"][final_idx] = math.log(0.001)
+    _refresh_merkle(payload)
 
     with TestClient(s.app) as client:
         r = client.post("/submit", json=payload)
@@ -584,6 +616,7 @@ def test_completion_only_layout_low_final_logprob_also_reaches_proof():
         meta = rollout["commit"]["rollout"]
         meta["token_logprobs"] = [0.0] * meta["completion_length"]
         meta["token_logprobs"][-1] = math.log(0.001)
+    _refresh_merkle(payload)
 
     with TestClient(s.app) as client:
         r = client.post("/submit", json=payload)
@@ -619,6 +652,7 @@ def test_private_reward_env_skips_claimed_reward_zone_preflight():
     s.set_current_state(WindowState.OPEN)
     batcher = _PreflightAdmissionBatcher(eos_token_id=99)
     batcher.env.validator_authoritative_reward = True
+    batcher.env.name = "opencodeinstruct"
     s.set_active_batcher(batcher)
     payload = _submission_with_completion_tokens(
         list(range(4, 35)) + [99],
@@ -626,6 +660,7 @@ def test_private_reward_env_skips_claimed_reward_zone_preflight():
     )
     for rollout in payload["rollouts"]:
         rollout["env_name"] = "opencodeinstruct"
+    _refresh_merkle(payload)
 
     with TestClient(s.app) as client:
         r = client.post("/submit", json=payload)

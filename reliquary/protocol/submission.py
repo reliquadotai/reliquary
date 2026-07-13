@@ -9,7 +9,14 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
 
 from reliquary.constants import CHALLENGE_K, M_ROLLOUTS, MAX_NEW_TOKENS_PROTOCOL_CAP
 
@@ -79,6 +86,7 @@ class RejectReason(str, Enum):
     REWARD_SHAPE_SUSPICIOUS = "reward_shape_suspicious"
     WRONG_CHECKPOINT = "wrong_checkpoint"
     WRONG_RANDOMNESS = "wrong_randomness"
+    MERKLE_ROOT_MISMATCH = "merkle_root_mismatch"
     WORKER_DROPPED = "worker_dropped"
     STALE_ROUND = "stale_round"
     FUTURE_ROUND = "future_round"
@@ -101,7 +109,7 @@ class RolloutSubmission(BaseModel):
     tokens: list[int] = Field(..., min_length=1)
     reward: float  # miner's local env.compute_reward value; validator re-checks
     commit: dict[str, Any]
-    env_name: str  # environment that generated this rollout (e.g. "openmathinstruct")
+    env_name: str = Field(..., min_length=1)
 
     @model_validator(mode="after")
     def _tokens_match_commit_tokens(self):
@@ -155,6 +163,9 @@ class BatchSubmissionRequest(BaseModel):
     # validator's ``enforce_envelope_signature`` flag decides whether an
     # empty sig is rejected as BAD_ENVELOPE_SIGNATURE or silently accepted.
     envelope_signature: str = Field(default="", pattern=r"^[0-9a-fA-F]*$")
+    # Set only after the validator recomputes the canonical rollout root.
+    # Private attrs never enter JSON/schema and cannot be supplied by miners.
+    _canonical_merkle_verified: bool = PrivateAttr(default=False)
 
     @field_validator("rollouts")
     @classmethod
@@ -164,6 +175,13 @@ class BatchSubmissionRequest(BaseModel):
                 f"rollouts must have exactly {M_ROLLOUTS} entries, got {len(v)}"
             )
         return v
+
+    @model_validator(mode="after")
+    def _rollouts_share_one_environment(self):
+        env_names = {rollout.env_name for rollout in self.rollouts}
+        if len(env_names) != 1:
+            raise ValueError("all rollouts in a submission must share one env_name")
+        return self
 
 
 class BatchSubmissionResponse(BaseModel):

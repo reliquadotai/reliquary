@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from reliquary.constants import CHALLENGE_K, M_ROLLOUTS
 from reliquary.protocol.signatures import sign_envelope
+from reliquary.protocol.merkle import compute_rollouts_merkle_root
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     GrpoBatchState,
@@ -120,10 +121,10 @@ def _request(
                 tokens=commit["tokens"],
                 reward=reward,
                 commit=commit,
-                env_name="openmathinstruct",
+                env_name="fake",
             )
         )
-    merkle_root = "00" * 32
+    merkle_root = compute_rollouts_merkle_root(rollouts)
     drand_round = 0
     nonce = os.urandom(8).hex()
     sig = sign_envelope(

@@ -162,33 +162,10 @@ def pick_env_and_prompt(
 
 
 def _compute_merkle_root(rollouts) -> str:
-    """Compute Merkle root over rollout leaves — returns 64-char hex.
+    """Backward-compatible wrapper around the protocol-owned root function."""
+    from reliquary.protocol.merkle import compute_rollouts_merkle_root
 
-    Uses canonical JSON (sort_keys=True, compact separators) for dict/list
-    serialisation so the root is deterministic across Python
-    implementations and refactor-stable against dict-construction-order
-    changes.
-    """
-    import hashlib
-    import json
-
-    leaves = []
-    for i, r in enumerate(rollouts):
-        h = hashlib.sha256()
-        h.update(i.to_bytes(8, "big"))
-        h.update(json.dumps(r.tokens, separators=(",", ":")).encode())
-        h.update(json.dumps(r.reward).encode())
-        h.update(json.dumps(r.commit, sort_keys=True, separators=(",", ":")).encode())
-        leaves.append(h.digest())
-
-    while len(leaves) > 1:
-        new = []
-        for i in range(0, len(leaves), 2):
-            left = leaves[i]
-            right = leaves[i + 1] if i + 1 < len(leaves) else left
-            new.append(hashlib.sha256(left + right).digest())
-        leaves = new
-    return leaves[0].hex()
+    return compute_rollouts_merkle_root(rollouts)
 
 
 def _current_drand_round_at_send() -> int:
