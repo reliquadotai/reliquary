@@ -474,6 +474,14 @@ LEGACY_MERKLE_ROOT_ENFORCE = _os.environ.get(
 # MAX_SUBMISSIONS_PER_PROMPT × min(|env|, MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW × n_hotkeys).
 MAX_SUBMISSIONS_PER_PROMPT = 10
 
+# Difficulty-auction research is observation-only. The active protocol keeps
+# its current admission, proof, seal, selection, and emission rules while the
+# validator archives a deterministic counterfactual over the same fully
+# validated candidate pool. Arming is deliberately a separate future change.
+DIFFICULTY_AUCTION_SHADOW_ENABLED = True
+DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS = ("openmathinstruct",)
+DIFFICULTY_AUCTION_DELTA = 1.0
+
 # How many drand-quicknet rounds backward of the validator's current round
 # the batcher accepts on the ``drand_round`` field. Default = 0: strict
 # equality. The miner must attach the drand round currently in progress
