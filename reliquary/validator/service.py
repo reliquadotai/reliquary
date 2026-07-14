@@ -1029,10 +1029,14 @@ class ValidationService:
         # count, as GRAD_ACCUM_STEPS already does) so every validator uses the
         # same pool and an env a validator does not run burns its share.
         pool_per_env = 1.0 / len(self.env_mix)
-        sealed: dict[str, tuple] = {
-            name: b.seal_batch(pool=pool_per_env)
-            for name, b in self._active_batchers.items()
-        }
+        # seal_batch now runs the GRAIL GPU proofs (up to ~18 forward passes at
+        # 5-25s each), so offload each batcher to a thread to keep the event
+        # loop responsive (/state, /health, submit and archive workers). Awaited
+        # sequentially in dict order so the deterministic fold into combined
+        # rewards, window_batches and archives is byte-for-byte unchanged.
+        sealed: dict[str, tuple] = {}
+        for name, b in self._active_batchers.items():
+            sealed[name] = await asyncio.to_thread(b.seal_batch, pool=pool_per_env)
         for name, (batch, rewards) in sealed.items():
             self._active_batchers[name].rewards_by_hotkey = rewards
 

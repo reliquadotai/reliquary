@@ -147,6 +147,26 @@ def test_valid_submissions_at_decision_reports_pending_not_valid():
     assert tel.valid_submissions_at_decision == 2
 
 
+def test_valid_submissions_at_arrival_reports_pending_not_valid():
+    """The arrival branch has the same flaw as the decision branch: valid_count
+    is 0 for the whole window under deferred proving, so the arrival count would
+    log a permanent 0. It must also ride the pending (graded, unproven) count."""
+    from reliquary.validator.observability import SubmitTelemetry
+    from tests.unit.test_grpo_window_batcher import _make_batcher, _request
+
+    b = _make_batcher()
+    b.accept_submission(_request(prompt_idx=7, hotkey="a"))
+    b.accept_submission(_request(prompt_idx=8, hotkey="b"))
+
+    tel = SubmitTelemetry.from_request(
+        _request(prompt_idx=9, hotkey="c"), t_arrival=0.0
+    )
+    tel.refresh_from_batcher(b, at_decision=False)
+
+    assert b.valid_count == 0            # nothing proven mid-window
+    assert tel.valid_submissions_at_arrival == 2
+
+
 def test_state_reports_admitted_submissions_not_proven_ones():
     """Miners poll /state and act on ``valid_submissions``. Proofs now run at
     seal, so reading ``_valid`` would report 0 for the whole window."""
