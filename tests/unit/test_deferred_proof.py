@@ -61,9 +61,17 @@ def test_accept_does_not_touch_the_gpu():
 
 
 def test_verify_expensive_runs_the_proof_and_returns_a_valid_submission():
+    import torch
+    from reliquary.validator.verifier import ProofResult
     from tests.unit.test_grpo_window_batcher import _make_batcher, _request
 
-    b = _make_batcher()
+    calls = []
+
+    def _counting_grail(*a, **kw):
+        calls.append(1)
+        return ProofResult(all_passed=True, passed=1, checked=1, logits=torch.empty(0))
+
+    b = _make_batcher(verify_commitment_proofs_fn=_counting_grail)
     b.accept_submission(_request(prompt_idx=7, hotkey="miner"))
     pending = b.pending_submissions()[0]
 
@@ -72,6 +80,71 @@ def test_verify_expensive_runs_the_proof_and_returns_a_valid_submission():
     assert proven is not None
     assert proven.hotkey == "miner"
     assert proven.value == pending.value
+    # The GPU proof actually ran — once per rollout. A _verify_expensive that
+    # silently skipped the proof would still satisfy the assertions above.
+    assert len(calls) == len(pending.request.rollouts)
+
+
+def test_verify_expensive_reject_charges_debt_archives_and_redacts_sketch():
+    """The task's core invariant: a submission rejected INSIDE _verify_expensive
+    still charges per-hotkey proof-failure debt, still lands in
+    rejected_submissions, and still has sketch_diff_max redacted to None. The
+    proof runs at seal now, but the reject bookkeeping must be unchanged."""
+    from tests.unit.test_grpo_window_batcher import (
+        _always_false_grail, _make_batcher, _request,
+    )
+
+    b = _make_batcher(verify_commitment_proofs_fn=_always_false_grail)
+    b.accept_submission(_request(prompt_idx=7, hotkey="cheater"))
+    pending = b.pending_submissions()[0]
+
+    assert b._verify_expensive(pending) is None
+    assert b.proof_failure_debt("cheater") == 1
+    assert len(b.rejected_submissions) == 1
+    rejected = b.rejected_submissions[0]
+    assert rejected.hotkey == "cheater"
+    assert rejected.reason == "grail_fail"
+    # Anti-tuning: the GRAIL sketch diff is never surfaced to miners.
+    assert rejected.sketch_diff_max is None
+
+
+def test_seal_trigger_counts_pending_not_valid():
+    """The seal trigger must fire on the B-th distinct PENDING prompt. Proofs
+    run at seal, so _valid stays empty for the whole window — a trigger reading
+    _valid would never fire."""
+    from reliquary.constants import B_BATCH
+    from tests.unit.test_grpo_window_batcher import _make_batcher, _request
+
+    b = _make_batcher()
+    assert b._seal_trigger_round is None
+    for i in range(B_BATCH):
+        b.accept_submission(_request(prompt_idx=i, hotkey=f"hk{i}"))
+
+    # The trigger armed off the pending pool, not off _valid.
+    assert b._seal_trigger_round is not None
+    assert b.is_sealed()
+    assert b._valid == []
+    assert len(b.pending_submissions()) == B_BATCH
+
+
+def test_valid_submissions_at_decision_reports_pending_not_valid():
+    """Miners read this telemetry to know how many submissions were admitted by
+    decision time. Proofs run at seal, so valid_count is 0 during the window;
+    reporting it would lie. The field must ride the pending count."""
+    from reliquary.validator.observability import SubmitTelemetry
+    from tests.unit.test_grpo_window_batcher import _make_batcher, _request
+
+    b = _make_batcher()
+    b.accept_submission(_request(prompt_idx=7, hotkey="a"))
+    b.accept_submission(_request(prompt_idx=8, hotkey="b"))
+
+    tel = SubmitTelemetry.from_request(
+        _request(prompt_idx=9, hotkey="c"), t_arrival=0.0
+    )
+    tel.refresh_from_batcher(b, at_decision=True)
+
+    assert b.valid_count == 0            # nothing proven mid-window
+    assert tel.valid_submissions_at_decision == 2
 
 
 def test_state_reports_admitted_submissions_not_proven_ones():

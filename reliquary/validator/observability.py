@@ -208,11 +208,17 @@ class SubmitTelemetry:
         self.seal_trigger_round = getattr(
             batcher, "_seal_trigger_round", self.seal_trigger_round
         )
-        valid_count = getattr(batcher, "valid_count", None)
         if at_decision:
-            self.valid_submissions_at_decision = valid_count
+            # Proofs run at seal, so ``valid_count`` is 0 mid-window. The
+            # meaningful "how many were admitted by decision time" value is the
+            # pending (graded, unproven) count.
+            self.valid_submissions_at_decision = getattr(
+                batcher, "pending_count", None
+            )
         else:
-            self.valid_submissions_at_arrival = valid_count
+            self.valid_submissions_at_arrival = getattr(
+                batcher, "valid_count", None
+            )
 
     def mark_enqueued(self, ts: float | None = None) -> None:
         self.t_enqueued = ts if ts is not None else time.time()

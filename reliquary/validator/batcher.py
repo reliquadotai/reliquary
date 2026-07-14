@@ -689,12 +689,12 @@ class GrpoWindowBatcher:
             self._seal_event.set()
 
     def prompt_submission_count(self, prompt_idx: int) -> int:
-        """Number of GRAIL-validated submissions already in the per-prompt
-        bucket for ``prompt_idx``. Used by the HTTP /submit handler to
-        short-circuit ``PROMPT_FULL`` rejects without queueing.
+        """Number of admitted (graded, not yet proven) submissions already in
+        the per-prompt bucket for ``prompt_idx``. Used by the HTTP /submit
+        handler to short-circuit ``PROMPT_FULL`` rejects without queueing.
 
         Read of a dict-of-list len is GIL-atomic and lock-free in CPython,
-        same property ``valid_count`` relies on. Best-effort: a racing
+        same property ``pending_count`` relies on. Best-effort: a racing
         accept inside the worker between this read and the queue.put is
         harmless — the worker re-checks the cap inside ``_accept_locked``.
         """
@@ -966,7 +966,10 @@ class GrpoWindowBatcher:
         *,
         telemetry: SubmitTelemetry | None = None,
     ) -> BatchSubmissionResponse:
-        """Run the full verification pipeline; append to ``_valid`` on success.
+        """Cheaply admit a submission: validate, grade and score it, then append
+        a ``PendingSubmission`` to ``_pending``. The GPU proof and every
+        proof-dependent gate are deferred to ``_verify_expensive`` at seal time,
+        so this path never touches ``_valid`` and never runs GRAIL.
 
         Does NOT re-check ``drand_round`` — that's a wall-clock timing gate,
         which is decided once at HTTP arrival by ``server.py``'s cheap-reject
@@ -1395,7 +1398,9 @@ class GrpoWindowBatcher:
             self._seal_trigger_round = request.drand_round
             if telemetry is not None:
                 telemetry.seal_trigger_round = self._seal_trigger_round
-                telemetry.valid_submissions_at_decision = len(self._pending)
+                # ``valid_submissions_at_decision`` is written by
+                # ``refresh_from_batcher(at_decision=True)`` from ``pending_count``;
+                # writing it here would be dead (immediately overwritten).
                 log_submission_stage(
                     logger,
                     logging.INFO,
@@ -2183,8 +2188,10 @@ class GrpoWindowBatcher:
             reward_shape=reward_shape.to_log_dict(),
         )
 
-        # Proven. The caller decides what to do with it — this method owns no
-        # batcher state, so it is safe to run outside ``_lock``.
+        # Proven. NOTE: _verify_expensive is NOT state-free — via ``self._reject``
+        # it mutates ``reject_counts``/``rejected_submissions`` and flips
+        # ``rollout.commit["rollout"]["truncated"]``. It therefore MUST be called
+        # serially (Task 3 runs a top-down loop over candidates, never in parallel).
         return new_sub
 
     async def _delayed_seal_at_drand_boundary(self) -> None:
