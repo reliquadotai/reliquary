@@ -757,27 +757,23 @@ git commit -am "feat(auction): one prompt, one slot — reject duplicates at adm
 
 ---
 
-### Task 8: Size the code grader, or keep code on the old path
+### Task 8: Code grader throughput — NOT NEEDED (scope note)
 
-**Files:** `reliquary/constants.py`, `reliquary/validator/service.py`
+Dropped after review. The original worry was that the deadline triples the graded
+pool (~19 → ~69) and code grading (gVisor, 5s, 8 workers) could exceed the window.
+It does not, for two reasons confirmed in the code:
 
-The deadline triples the admitted pool (~19 → ~69), and every one of them is
-graded. Math grading is sympy (cheap). **Code grading is not**: gVisor sandbox,
-`GRADER_EVAL_TIMEOUT_SECONDS = 5`, `GRADER_POOL_SIZE = 8`, 8 rollouts per
-submission → a worst case of `69 × 8 × 5 / 8 ≈ 345 s`, which **exceeds the 300 s
-window**.
+1. **Code is not on the live path.** `DEFAULT_ENVIRONMENTS = "openmathinstruct"`;
+   the sandboxed code grader does not run in production.
+2. **Grading is at admission, not at seal.** `env.compute_reward` runs in
+   `_accept_locked` (batcher.py:1108) as each submission arrives, so it is spread
+   across the full 300s collection window — never a seal-time spike. Eight workers
+   over 300s handle far more than the pool, and `MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW`
+   + `MAX_PENDING_PROOF_QUEUE_DEPTH` already bound bursts.
 
-- [ ] **Step 1:** Measure actual code-grading wall time per submission from live
-  archives before changing anything. If `p95 × 69 / GRADER_POOL_SIZE` fits inside
-  `WINDOW_COLLECTION_SECONDS`, do nothing.
-- [ ] **Step 2:** If it does not fit, raise `GRADER_POOL_SIZE` and re-measure.
-  If it still does not fit, ship the deadline for `openmathinstruct` only and keep
-  `opencodeinstruct` on the 8-distinct seal until the pool is sized. Math is
-  `DEFAULT_ENVIRONMENTS` and the live path, so this is an acceptable split.
-- [ ] **Step 3: Commit** whatever the measurement justifies, with the numbers in
-  the commit message.
-
----
+If `opencodeinstruct` is ever enabled under the deadline, re-measure code-grading
+wall time per submission and confirm `p95 × pool / GRADER_POOL_SIZE` fits inside
+`WINDOW_COLLECTION_SECONDS`; raise `GRADER_POOL_SIZE` if not. No change today.
 
 ### 🚦 Stage 2 gate
 
