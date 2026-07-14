@@ -1005,12 +1005,13 @@ class GrpoWindowBatcher:
                 return reject(RejectReason.PROMPT_OUT_OF_RANGE, "prompt_range")
         if self._cooldown.is_in_cooldown(request.prompt_idx, self.window_start):
             return reject(RejectReason.PROMPT_IN_COOLDOWN, "cooldown")
-        # One submission per prompt, decided at admission: the first
-        # submitter owns the prompt for this window. The forced-seed seed
-        # is H(drand ‖ hotkey ‖ prompt ‖ i ‖ t) — it contains the hotkey, so
-        # N hotkeys on one prompt would otherwise buy N independent draws of
-        # k and let an operator submit whichever landed nearest the reward
-        # peak. Rejecting every submission after the first removes that draw.
+        # One submission per prompt, decided at admission: the first submitter
+        # owns the prompt for this window. This saves the grading of submissions
+        # that could never win and retires the K-way same-prompt emission split.
+        # (It is NOT what bounds variance-farming — forced-seed pins one legal
+        # group per hotkey, and N draws still cost N registrations plus N× model
+        # compute inside the 300s window; that registration/compute cost is the
+        # real deterrent, not this rule.)
         existing = self._submissions_per_prompt.get(request.prompt_idx, [])
         if existing:
             return reject(RejectReason.PROMPT_CLAIMED, "prompt_claimed")

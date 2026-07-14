@@ -225,13 +225,14 @@ better on three counts:
 
 - It saves the grading (and sandbox) cost of submissions that could never win.
 - It removes the same-prompt K-way emission split entirely.
-- **It kills the variance-farming sybil outright.** The forced-seed seed is
-  `H(drand ‖ hotkey ‖ prompt ‖ i ‖ t)` — it contains the **hotkey**, so two
-  hotkeys on one prompt produce *different groups, hence different k*. An
-  operator with N hotkeys would otherwise get **N independent draws of k on one
-  prompt** and submit whichever landed nearest k=2, while an honest miner gets a
-  single draw and must take it. Admitting only the first submission per prompt
-  means there is only ever one draw to have.
+- **It narrows (does not kill) the variance-farming sybil.** The forced-seed
+  seed `H(drand ‖ hotkey ‖ prompt ‖ i ‖ t)` contains the **hotkey**, so N hotkeys
+  on one prompt are N independent draws of k. Admitting only the first submission
+  stops the operator from outsourcing the pick to the validator (submit all N,
+  let the auction keep the best) and retires the K-way split. It does NOT remove
+  the draw itself: the operator can still run N hotkeys offline-within-window and
+  submit only the best. That residual is bounded by the real cost — N UID
+  registrations plus N× model compute inside the 300s window — not by this rule.
 
 Residual, accepted: two miners who independently find the same hard prompt race
 for it, and the loser wasted 8 rollouts. With a 14M-prompt corpus and
