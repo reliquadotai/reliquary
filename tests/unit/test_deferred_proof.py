@@ -219,3 +219,128 @@ def test_decision_ts_of_a_proof_stage_reject_is_the_admission_instant():
     rejected = b.rejected_submissions[0]
     assert rejected.reason == "bad_termination"
     assert rejected.decision_ts == 1000.0
+
+
+# --------------------------- Task 3: prove top-down ---------------------------
+
+
+def test_proving_stops_once_b_submissions_pass():
+    """The GPU saving. We must not prove candidate 9 when 8 have already passed."""
+    from reliquary.constants import B_BATCH, M_ROLLOUTS
+    from tests.unit.test_grpo_window_batcher import (
+        _always_true_grail, _make_batcher, _request,
+    )
+
+    proofs = []
+
+    def _counting_proof(commit, model, randomness):
+        proofs.append(1)
+        return _always_true_grail(commit, model, randomness)
+
+    b = _make_batcher(verify_commitment_proofs_fn=_counting_proof)
+    for i in range(12):
+        b.accept_submission(_request(prompt_idx=i, hotkey=f"m{i}"))
+
+    b.seal_batch()
+
+    assert len(b.valid_submissions()) == B_BATCH
+    assert b.proof_attempts == B_BATCH                     # 8 candidates, NOT 12
+    # The GRAIL proof runs once per rollout, so the GPU bill is the 8 winners'
+    # rollouts only — candidates 9..12 never reach the model.
+    assert len(proofs) == B_BATCH * M_ROLLOUTS
+
+
+def test_failed_proof_promotes_the_next_ranked():
+    """Promote-on-failure: a fabricated group tops the ranking (it names its own
+    score), fails the proof, and the honest submission behind it takes the slot."""
+    from tests.unit.test_grpo_window_batcher import (
+        _always_false_grail, _always_true_grail, _make_batcher,
+        _request_with_prompt_unique_tokens,
+    )
+
+    faker_prompt, honest_prompt = 1, 2
+
+    def _fail_only_the_faker(commit, model, randomness):
+        # The commit carries no hotkey (CommitModel is extra="forbid"), but this
+        # helper keys every token on prompt_idx, so the group is identifiable.
+        if commit["tokens"][0] // 100 == faker_prompt:
+            return _always_false_grail(commit, model, randomness)
+        return _always_true_grail(commit, model, randomness)
+
+    b = _make_batcher(verify_commitment_proofs_fn=_fail_only_the_faker)
+    # k=2 is the peak of v(k): the faker hand-writes the top-ranked reward vector
+    # and so is proven FIRST, ahead of the honest k=4 group.
+    b.accept_submission(_request_with_prompt_unique_tokens(
+        prompt_idx=faker_prompt, hotkey="faker",
+        rewards=[1.0, 1.0] + [0.0] * 6,
+    ))
+    b.accept_submission(_request_with_prompt_unique_tokens(
+        prompt_idx=honest_prompt, hotkey="honest",
+        rewards=[1.0] * 4 + [0.0] * 4,
+    ))
+    assert (
+        b.pending_submissions()[0].value > b.pending_submissions()[1].value
+    ), "the fabricated group must outrank the honest one for this test to bite"
+
+    b.seal_batch()
+
+    assert [s.hotkey for s in b.valid_submissions()] == ["honest"]
+    assert b.proof_failure_debt("faker") == 1
+
+
+def test_proof_attempts_are_capped():
+    """A griefer fabricates groups that rank at the top and always fail the proof.
+    He costs us at most MAX_PROOF_ATTEMPTS_PER_WINDOW, never more."""
+    from reliquary.constants import MAX_PROOF_ATTEMPTS_PER_WINDOW
+    from tests.unit.test_grpo_window_batcher import (
+        _always_false_grail, _make_batcher, _request,
+    )
+
+    proofs = []
+
+    def _counting_false_grail(commit, model, randomness):
+        proofs.append(1)
+        return _always_false_grail(commit, model, randomness)
+
+    b = _make_batcher(verify_commitment_proofs_fn=_counting_false_grail)
+    for i in range(40):
+        b.accept_submission(_request(prompt_idx=i, hotkey=f"grief{i}"))
+
+    b.seal_batch()
+
+    assert b.valid_submissions() == []
+    assert len(proofs) == MAX_PROOF_ATTEMPTS_PER_WINDOW
+
+
+def test_single_hotkey_griefer_is_capped_by_per_hotkey_failures():
+    """The per-hotkey half of the griefer bound. One hotkey flooding fabricated
+    distinct-prompt groups (each ranks at the top by construction) is proven at
+    most MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW times, NOT up to the
+    global MAX_PROOF_ATTEMPTS_PER_WINDOW. The debt the failed proofs charge locks
+    the hotkey out of the remaining attempts."""
+    from reliquary.constants import (
+        MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW,
+        MAX_PROOF_ATTEMPTS_PER_WINDOW,
+    )
+    from tests.unit.test_grpo_window_batcher import (
+        _always_false_grail, _make_batcher, _request,
+    )
+
+    proofs = []
+
+    def _counting_false_grail(commit, model, randomness):
+        proofs.append(1)
+        return _always_false_grail(commit, model, randomness)
+
+    b = _make_batcher(verify_commitment_proofs_fn=_counting_false_grail)
+    # Many more distinct-prompt groups than the per-hotkey cap, all one hotkey.
+    for i in range(MAX_PROOF_ATTEMPTS_PER_WINDOW + 4):
+        b.accept_submission(_request(prompt_idx=i, hotkey="griefer"))
+
+    b.seal_batch()
+
+    assert b.valid_submissions() == []
+    assert len(proofs) == MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
+    assert b.proof_failure_debt("griefer") == (
+        MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
+    )

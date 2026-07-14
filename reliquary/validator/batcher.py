@@ -25,6 +25,7 @@ from reliquary.constants import (
     MAX_NEW_TOKENS_PROTOCOL_CAP,
     MIN_EOS_PROBABILITY,
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
+    MAX_PROOF_ATTEMPTS_PER_WINDOW,
     MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
     MAX_SEAL_QUEUE_DRAIN_SECONDS,
     MAX_SUBMISSIONS_PER_PROMPT,
@@ -58,6 +59,7 @@ from reliquary.validator.batch_selection import (
     select_batch_and_distribute,
 )
 from reliquary.validator.batch_auction import (
+    _rank_key,
     select_batch_auction,
 )
 from reliquary.validator.cooldown import CooldownMap
@@ -490,6 +492,9 @@ class GrpoWindowBatcher:
         # is what fills during the window now: ``valid_count`` only moves at
         # seal, once the ranked candidates have been proven.
         self.pending_count: int = 0
+        # GPU proofs spent by ``_prove_ranked`` this window. Bounded by
+        # MAX_PROOF_ATTEMPTS_PER_WINDOW; telemetry reads it after seal.
+        self.proof_attempts: int = 0
 
         if verify_commitment_proofs_fn is None:
             from reliquary.validator.verifier import verify_commitment_proofs
@@ -2378,16 +2383,73 @@ class GrpoWindowBatcher:
             "candidates": len(self._valid),
         }
 
+    def _prove_ranked(self, pool: float = 1.0) -> list[ValidSubmission]:
+        """Prove candidates in score order until B_BATCH pass. Never prove a loser.
+
+        Fabricated groups rank first (they name their own score), so the failures
+        we pay for cluster at the top. That is fine — they earn nothing, the proof
+        runs before payment — but it is why the attempt budget exists.
+
+        Runs OUTSIDE ``_lock``: ``_verify_expensive`` is 5-25 s of GPU per
+        candidate. It mutates reject state and is not thread-safe, so the loop is
+        strictly serial. Deterministic: the order is a pure function of the
+        pending set (``_rank_key``), never wall-clock or dict/set iteration order.
+        """
+        with self._lock:
+            ranked = sorted(self._pending, key=_rank_key)
+
+        attempts = 0
+        proven: list[ValidSubmission] = []
+        claimed: set[int] = set()
+
+        for pending in ranked:
+            if len(proven) >= B_BATCH:
+                break
+            if attempts >= MAX_PROOF_ATTEMPTS_PER_WINDOW:
+                logger.warning(
+                    "proof_budget_exhausted window=%s proven=%d attempts=%d",
+                    self.window_start, len(proven), attempts,
+                )
+                break
+            if pending.prompt_idx in claimed:
+                continue          # one proof per prompt; the top-ranked took it
+            if self._cooldown.is_in_cooldown(pending.prompt_idx, self.window_start):
+                continue
+            # Per-hotkey half of the griefer bound. The HTTP admission gate that
+            # used to enforce this is dead under deferred proving (proofs run
+            # after admission closes), so the cap lives here now. _verify_expensive
+            # charges the debt via _reject; we only read it.
+            if (
+                self.proof_failure_debt(pending.hotkey)
+                >= MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
+            ):
+                continue
+            attempts += 1
+            sub = self._verify_expensive(pending)
+            if sub is None:
+                continue          # rejected; promote the next-ranked
+            proven.append(sub)
+            claimed.add(pending.prompt_idx)
+
+        with self._lock:
+            self._valid = proven
+            self.valid_count = len(proven)
+        self.proof_attempts = attempts
+        return proven
+
     def seal_batch(
         self, pool: float = 1.0
     ) -> tuple[list[ValidSubmission], dict[str, float]]:
         """Pick the training batch and compute the reward distribution.
 
-        Returns (training_batch, rewards_by_hotkey). Cooldown and hash-set
-        bookkeeping is applied to every winning prompt — not just the one
-        submission picked for training — because all of them earn emission
-        and were therefore "used" by this window.
+        Proving happens first: ``_prove_ranked`` ranks the pending pool by
+        difficulty and fills ``self._valid`` with the proven winners, which
+        everything below reads. Returns (training_batch, rewards_by_hotkey).
+        Cooldown and hash-set bookkeeping is applied to every winning prompt —
+        not just the one submission picked for training — because all of them
+        earn emission and were therefore "used" by this window.
         """
+        self._prove_ranked(pool)
         with self._lock:
             self.selection_metadata_by_id = explain_batch_selection(
                 submissions=self._valid,

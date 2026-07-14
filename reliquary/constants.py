@@ -310,6 +310,27 @@ DIFFICULTY_DELTA = 1.0
 # fastest hardware would otherwise win every one of them.
 MAX_SLOTS_PER_COLDKEY_PER_WINDOW = 2
 
+# Ceiling on GPU proofs spent in one window under the difficulty auction. We prove
+# the ranked candidates top-down and stop as soon as B_BATCH have passed, so the
+# honest cost is exactly B_BATCH. This bounds the dishonest one.
+#
+# A fabricated group ranks at the TOP by construction: the score is computed from
+# the reward vector, and a miner who never runs the model can hand-write a k=2
+# vector, which is the exact peak of v(k). Fabricating cannot earn anything (the
+# proof runs before payment, so he fails and is paid zero), but it can make us
+# spend a proof. This caps that at 16 — and since a hotkey is locked out after
+# MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW=2 failures, burning all 16
+# requires 8 registered hotkeys, which registration cost already taxes.
+MAX_PROOF_ATTEMPTS_PER_WINDOW = 16
+
+# Random non-winners proven each window purely for forensics. Deferring the proof
+# means the authenticity gates (token-auth, distribution, forced-seed) only ever
+# see the WINNERS — enforcement stays complete (nobody unproven is paid) but fleet
+# VISIBILITY is lost, and those gates are how we caught the pre-generating miner
+# and 1088 seed_mismatch rejects in 855 windows. Sampled by drand so a miner
+# cannot predict whether he will be looked at.
+FORENSIC_SAMPLE_PER_WINDOW = 2
+
 # Number of rollouts per submission (= size of each GRPO group).
 M_ROLLOUTS = 8
 
