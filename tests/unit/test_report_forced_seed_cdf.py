@@ -53,6 +53,7 @@ def test_report_holds_on_ratio_clean_hard_mismatch():
     assert report["by_environment_schema_v3"][0]["environment"] == (
         "openmathinstruct"
     )
+    assert report["by_forced_status_schema_v3"][0]["forced"] is False
 
 
 def test_report_holds_immediately_when_small_sample_has_hard_mismatch():
@@ -112,3 +113,18 @@ def test_report_correlates_cdf_onset_with_repetition_by_termination_path():
     assert runtime["profile_hash"] == "ab" * 32
     assert runtime["n_hard_mismatch"] == 0
     assert runtime["fla_version"] == "0.5.0"
+
+
+def test_select_rows_can_isolate_latest_checkpoint_and_recent_windows():
+    rows = [
+        {"schema_version": 3, "checkpoint_hash": "old", "window_start": 1},
+        {"schema_version": 3, "checkpoint_hash": "new", "window_start": 2},
+        {"schema_version": 3, "checkpoint_hash": "new", "window_start": 3},
+        {"schema_version": 3, "checkpoint_hash": "new", "window_start": 3},
+    ]
+
+    selected = MODULE.select_rows(
+        rows, latest_checkpoint=True, last_windows=1, last_records=1,
+    )
+
+    assert selected == [rows[-1]]

@@ -65,6 +65,12 @@ def summarize(rows: list[dict]) -> dict:
     v2 = [row for row in rows if int(row.get("schema_version", 1)) >= 2]
     v3 = [row for row in rows if int(row.get("schema_version", 1)) >= 3]
     v4 = [row for row in rows if int(row.get("schema_version", 1)) >= 4]
+    rollouts_v3 = [
+        item
+        for row in v3
+        for item in (row.get("per_rollout") or [])
+        if isinstance(item, dict)
+    ]
     rollouts_v4 = [
         item
         for row in v4
@@ -229,6 +235,18 @@ def summarize(rows: list[dict]) -> dict:
             ),
             key=lambda item: item["environment"],
         ),
+        "by_forced_status_schema_v3": [
+            {
+                "forced": forced,
+                **_rollout_cohort(
+                    [
+                        item for item in rollouts_v3
+                        if bool(item.get("forced", False)) is forced
+                    ]
+                ),
+            }
+            for forced in (False, True)
+        ],
         "rollouts_schema_v4": len(rollouts_v4),
         "by_termination_path_schema_v4": sorted(
             (
@@ -300,10 +318,61 @@ def summarize(rows: list[dict]) -> dict:
     }
 
 
+def select_rows(
+    rows: list[dict],
+    *,
+    checkpoint: str | None = None,
+    latest_checkpoint: bool = False,
+    last_windows: int | None = None,
+    last_records: int | None = None,
+) -> list[dict]:
+    """Select a recent, checkpoint-homogeneous calibration cohort."""
+    selected = list(rows)
+    if latest_checkpoint:
+        candidates = [
+            row for row in selected
+            if int(row.get("schema_version", 1)) >= 3
+            and row.get("checkpoint_hash")
+        ]
+        if candidates:
+            checkpoint = str(candidates[-1]["checkpoint_hash"])
+    if checkpoint is not None:
+        selected = [
+            row for row in selected
+            if row.get("checkpoint_hash") == checkpoint
+        ]
+    if last_windows is not None:
+        if last_windows <= 0:
+            raise ValueError("last_windows must be positive")
+        windows = sorted(
+            {
+                int(row["window_start"])
+                for row in selected
+                if row.get("window_start") is not None
+            }
+        )[-last_windows:]
+        window_set = set(windows)
+        selected = [
+            row for row in selected
+            if row.get("window_start") is not None
+            and int(row["window_start"]) in window_set
+        ]
+    if last_records is not None:
+        if last_records <= 0:
+            raise ValueError("last_records must be positive")
+        selected = selected[-last_records:]
+    return selected
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("path", nargs="?", type=Path, default=DEFAULT_PATH)
     parser.add_argument("--json", action="store_true")
+    checkpoint_group = parser.add_mutually_exclusive_group()
+    checkpoint_group.add_argument("--checkpoint")
+    checkpoint_group.add_argument("--latest-checkpoint", action="store_true")
+    parser.add_argument("--last-windows", type=int)
+    parser.add_argument("--last-records", type=int)
     args = parser.parse_args()
 
     rows = [
@@ -311,7 +380,20 @@ def main() -> None:
         for line in args.path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+    rows = select_rows(
+        rows,
+        checkpoint=args.checkpoint,
+        latest_checkpoint=args.latest_checkpoint,
+        last_windows=args.last_windows,
+        last_records=args.last_records,
+    )
     report = summarize(rows)
+    report["selection"] = {
+        "checkpoint": args.checkpoint,
+        "latest_checkpoint": args.latest_checkpoint,
+        "last_windows": args.last_windows,
+        "last_records": args.last_records,
+    }
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
         return
