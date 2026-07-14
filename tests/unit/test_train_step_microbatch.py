@@ -182,6 +182,7 @@ def test_batched_grads_mask_bft_force_span_like_per_rollout():
     forced.commit["rollout"]["forced"] = True
     # Absolute span [5, 7) -> completion-relative positions 2 and 3.
     forced.commit["rollout"]["force_span"] = [5, 7]
+    forced._validated_force_span = (5, 7)
     loser = _build_rollout([1, 2, 3, 9, 10, 11], 0.0, 3)
     group = _FakeGroup([forced, loser])
     plan, skipped = _plan_from_batches([[group]])

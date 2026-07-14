@@ -80,6 +80,19 @@ def test_validate_force_span_rejects_out_of_range():
     assert ok is False
 
 
+def test_validate_force_span_rejects_non_numeric_bounds_without_raising():
+    ok, exempt = validate_force_span(
+        [0, 1, 5, 6, 777, 7, 8],
+        {"forced": True, "force_span": ("not-an-index", object())},
+        _FORCE,
+        2,
+        thinking_budget=2,
+        think_close_ids=_CLOSE,
+    )
+    assert ok is False
+    assert exempt == set()
+
+
 def test_auth_exempts_force_positions():
     # completion positions 2,3,4 are injected force tokens (prob ~0)
     proof = SimpleNamespace(

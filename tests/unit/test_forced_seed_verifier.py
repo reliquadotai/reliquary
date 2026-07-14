@@ -252,3 +252,26 @@ def test_verify_commitment_proofs_malformed_force_span_is_ignored_not_crashing(_
     # Malformed span ignored -> all stochastic positions counted, no crash.
     assert result.seed_n_stochastic == 3
     assert result.seed_n_match == 3
+
+
+@patch("reliquary.shared.forward.forward_single_layer")
+@patch("reliquary.shared.hf_compat.resolve_hidden_size", return_value=_HIDDEN_DIM)
+def test_verify_commitment_proofs_non_numeric_force_span_is_ignored(
+    _rhs, mock_fwd,
+):
+    logits_gpu = torch.stack(_seed_wiring_logits_rows())
+    u_values = _seed_wiring_u_values()
+    commit = _build_seed_wiring_commit(logits_gpu, u_values)
+    commit["rollout"]["forced"] = True
+    commit["rollout"]["force_span"] = ["bad", object()]
+    mock_fwd.return_value = (
+        torch.randn(1, _SEQ_LEN, _HIDDEN_DIM),
+        logits_gpu.unsqueeze(0),
+    )
+
+    result = verifier.verify_commitment_proofs(
+        commit, _make_mock_model(), _RANDOMNESS, seed_u_values=u_values,
+    )
+
+    assert result.seed_n_stochastic == 3
+    assert result.seed_n_match == 3
