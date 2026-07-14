@@ -1322,6 +1322,7 @@ class GrpoWindowBatcher:
             # same Pydantic object.  The private value is set only after the
             # signed commit's force span passes the canonical BFT checks below.
             rollout._validated_force_span = None
+            rollout._validated_termination_path = None
             # `truncated` is a validator-set flag (overlong reward shaping, see
             # submission.py). Wipe any miner-supplied value at ingestion so only
             # the validator's own cap/EOS detection below can set it — otherwise
@@ -1641,7 +1642,7 @@ class GrpoWindowBatcher:
                 if rollout._validated_force_span is not None
                 else 0
             )
-            seed_cdf_entry["termination_path"] = classify_bft_termination(
+            rollout._validated_termination_path = classify_bft_termination(
                 rollout.commit["tokens"],
                 prompt_length=prompt_len,
                 completion_length=completion_len,
@@ -1650,6 +1651,9 @@ class GrpoWindowBatcher:
                 validated_force_span=rollout._validated_force_span,
                 thinking_budget=BFT_THINKING_BUDGET,
                 answer_budget=BFT_ANSWER_BUDGET,
+            )
+            seed_cdf_entry["termination_path"] = (
+                rollout._validated_termination_path
             )
 
             lp_ok, lp_dev = verify_logprobs_claim(

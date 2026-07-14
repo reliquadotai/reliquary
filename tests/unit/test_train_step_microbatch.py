@@ -20,7 +20,8 @@ from types import SimpleNamespace
 from reliquary.constants import KL_BETA
 from reliquary.validator.training import (
     _pack_by_token_budget, _accumulate_grouped_grads, _rollout_loss,
-    _compute_advantages, _plan_from_batches, train_step, reset_training_state,
+    _bft_training_metrics, _compute_advantages, _plan_from_batches,
+    train_step, reset_training_state,
 )
 
 
@@ -197,6 +198,28 @@ def test_batched_grads_mask_bft_force_span_like_per_rollout():
     bat_grads = _grads_after(m_bat, lambda: _accumulate_grouped_grads(
         m_bat, _frozen(m_bat), plan, device, budget=64, atomic=False))
     assert _rel_l2(bat_grads, ref_grads) < 5e-2
+
+
+def test_bft_training_metrics_measure_masked_and_weighted_exposure():
+    forced = _build_rollout([1, 2, 3, 4, 5, 6, 7, 8], 1.0, 3)
+    forced._validated_force_span = (5, 7)
+    forced._validated_termination_path = "forced_phase2_eos"
+    natural = _build_rollout([1, 2, 3, 9, 10, 11], 0.0, 3)
+    natural._validated_termination_path = "phase1_eos"
+    plan, skipped = _plan_from_batches([[_FakeGroup([forced, natural])]])
+
+    metrics = _bft_training_metrics(plan)
+
+    assert skipped == 0
+    assert metrics["bft/plan_rollouts"] == 2
+    assert metrics["bft/forced_rollouts"] == 1
+    assert metrics["bft/injected_tokens_masked"] == 2
+    assert metrics["bft/trainable_completion_tokens"] == 6
+    assert metrics["bft/forced_trainable_token_ratio"] == 0.5
+    assert metrics["bft/path/forced_phase2_eos/rollouts"] == 1
+    assert metrics[
+        "bft/path/forced_phase2_eos/abs_adv_weighted_tokens"
+    ] > 0
 
 
 def test_atomic_matches_nonatomic_qwenlike():

@@ -278,6 +278,93 @@ def _plan_from_batches(batches, env_weights: Optional[dict] = None):
     return plan, n_skipped
 
 
+def _bft_training_metrics(plan) -> dict[str, float | int]:
+    """Summarize actual BFT exposure in the surviving training plan.
+
+    ``abs_adv_weighted_tokens`` includes the plan's environment scale and is a
+    gradient-exposure proxy, not an exact gradient norm. It is sufficient to
+    detect a forced path becoming disproportionately influential over time.
+    """
+    by_path: dict[str, dict[str, float]] = {}
+    total_rollouts = 0
+    total_raw_tokens = 0
+    total_trainable_tokens = 0
+    total_injected_tokens = 0
+    forced_rollouts = 0
+    forced_trainable_tokens = 0
+
+    for group, advantages, scale in plan:
+        for rollout, advantage in zip(group.rollouts, advantages):
+            meta = (rollout.commit or {}).get("rollout", {}) or {}
+            prompt_length = int(meta.get("prompt_length", 0) or 0)
+            raw_tokens = len(meta.get("token_logprobs", []) or [])
+            trainable_tokens = _trainable_completion_count(
+                rollout, prompt_length, raw_tokens,
+            )
+            span = getattr(rollout, "_validated_force_span", None)
+            injected_tokens = max(0, raw_tokens - trainable_tokens)
+            path = str(
+                getattr(rollout, "_validated_termination_path", None)
+                or "unknown"
+            )
+            path_metrics = by_path.setdefault(
+                path,
+                {
+                    "rollouts": 0.0,
+                    "trainable_tokens": 0.0,
+                    "injected_tokens_masked": 0.0,
+                    "abs_adv_weighted_tokens": 0.0,
+                },
+            )
+            exposure = (
+                abs(float(advantage)) * float(scale) * trainable_tokens
+            )
+            path_metrics["rollouts"] += 1
+            path_metrics["trainable_tokens"] += trainable_tokens
+            path_metrics["injected_tokens_masked"] += injected_tokens
+            path_metrics["abs_adv_weighted_tokens"] += exposure
+
+            total_rollouts += 1
+            total_raw_tokens += raw_tokens
+            total_trainable_tokens += trainable_tokens
+            total_injected_tokens += injected_tokens
+            if span is not None:
+                forced_rollouts += 1
+                forced_trainable_tokens += trainable_tokens
+
+    metrics: dict[str, float | int] = {
+        "bft/plan_rollouts": total_rollouts,
+        "bft/forced_rollouts": forced_rollouts,
+        "bft/forced_rollout_ratio": (
+            forced_rollouts / total_rollouts if total_rollouts else 0.0
+        ),
+        "bft/raw_completion_tokens": total_raw_tokens,
+        "bft/trainable_completion_tokens": total_trainable_tokens,
+        "bft/injected_tokens_masked": total_injected_tokens,
+        "bft/injected_token_ratio": (
+            total_injected_tokens / total_raw_tokens if total_raw_tokens else 0.0
+        ),
+        "bft/forced_trainable_token_ratio": (
+            forced_trainable_tokens / total_trainable_tokens
+            if total_trainable_tokens
+            else 0.0
+        ),
+    }
+    for path, values in sorted(by_path.items()):
+        prefix = f"bft/path/{path}"
+        metrics[f"{prefix}/rollouts"] = int(values["rollouts"])
+        metrics[f"{prefix}/trainable_tokens"] = int(
+            values["trainable_tokens"]
+        )
+        metrics[f"{prefix}/injected_tokens_masked"] = int(
+            values["injected_tokens_masked"]
+        )
+        metrics[f"{prefix}/abs_adv_weighted_tokens"] = float(
+            values["abs_adv_weighted_tokens"]
+        )
+    return metrics
+
+
 # ---------------------------------------------------------------------------
 # Per-rollout loss (forward-pass heavy — uses the model)
 # ---------------------------------------------------------------------------
@@ -852,6 +939,7 @@ def train_step(
         "batch/n_degenerate_groups": n_skipped,
         "batch/degenerate_ratio": n_skipped / n_groups,
     }
+    metrics.update(_bft_training_metrics(plan))
     telemetry.log_training_step(metrics, step=window_index)
 
     return model
