@@ -183,10 +183,14 @@ def test_operator_cap_requires_complete_mapping_for_eligible_population():
     assert incomplete["operator_mapping"]["complete_for_cap"] is False
     assert incomplete["production"]["operator_concentration"]["distinct"] == 1
     assert incomplete_shadow["operator_cap_applied"] is False
+    assert incomplete_shadow["operator_cap_applied_windows"] == 0
+    assert incomplete_shadow["operator_cap_skipped_windows"] == 1
     assert incomplete_shadow["selected_count"] == 2
 
     complete_shadow = complete["counterfactual_by_delta"]["1"]
     assert complete["operator_mapping"]["complete_for_cap"] is True
     assert complete["production"]["operator_concentration"]["distinct"] == 1
     assert complete_shadow["operator_cap_applied"] is True
+    assert complete_shadow["operator_cap_applied_windows"] == 1
+    assert complete_shadow["operator_cap_skipped_windows"] == 0
     assert complete_shadow["selected_count"] == 1

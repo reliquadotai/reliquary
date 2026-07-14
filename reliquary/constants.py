@@ -478,7 +478,9 @@ MAX_SUBMISSIONS_PER_PROMPT = 10
 # its current admission, proof, seal, selection, and emission rules while the
 # validator archives a deterministic counterfactual over the same fully
 # validated candidate pool. Arming is deliberately a separate future change.
-DIFFICULTY_AUCTION_SHADOW_ENABLED = True
+DIFFICULTY_AUCTION_SHADOW_ENABLED = _os.environ.get(
+    "RELIQUARY_DIFFICULTY_AUCTION_SHADOW_ENABLED", "1"
+).strip().lower() not in ("0", "false", "no", "off", "")
 DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS = ("openmathinstruct",)
 DIFFICULTY_AUCTION_DELTA = 1.0
 

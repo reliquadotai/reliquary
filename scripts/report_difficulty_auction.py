@@ -228,10 +228,10 @@ def select_candidates(
             _canonical_key(candidate),
         ),
     )
-    cap_applies = (
-        max_slots_per_operator is not None
-        and operator_of is not None
-        and all(candidate.hotkey in operator_of for candidate in ranked)
+    cap_applies = _operator_cap_applies(
+        ranked,
+        operator_of=operator_of,
+        max_slots_per_operator=max_slots_per_operator,
     )
     selected: list[Candidate] = []
     claimed_prompts: set[int] = set()
@@ -253,6 +253,21 @@ def select_candidates(
         if operator is not None:
             operator_slots[operator] += 1
     return selected
+
+
+def _operator_cap_applies(
+    eligible: Iterable[Candidate],
+    *,
+    operator_of: dict[str, str] | None,
+    max_slots_per_operator: int | None,
+) -> bool:
+    materialized = list(eligible)
+    return (
+        max_slots_per_operator is not None
+        and operator_of is not None
+        and bool(materialized)
+        and all(candidate.hotkey in operator_of for candidate in materialized)
+    )
 
 
 def _mean(values: Iterable[float]) -> float | None:
@@ -331,6 +346,9 @@ def replay_archives(
     overlap_by_delta: dict[float, list[float]] = {
         delta: [] for delta in delta_values
     }
+    cap_applied_by_delta: dict[float, list[bool]] = {
+        delta: [] for delta in delta_values
+    }
 
     for archive in archives:
         if not isinstance(archive, dict):
@@ -382,6 +400,18 @@ def replay_archives(
             for candidate in production
         }
         for delta in delta_values:
+            eligible = [
+                candidate
+                for candidate in candidates
+                if difficulty_value(candidate, delta) > 0.0
+            ]
+            cap_applied_by_delta[delta].append(
+                _operator_cap_applies(
+                    eligible,
+                    operator_of=operator_of,
+                    max_slots_per_operator=max_slots_per_operator,
+                )
+            )
             selected = select_candidates(
                 candidates,
                 delta=delta,
@@ -448,6 +478,8 @@ def replay_archives(
         )
     for delta in delta_values:
         selected = selected_by_delta[delta]
+        cap_windows = cap_applied_by_delta[delta]
+        cap_applied_windows = sum(cap_windows)
         summary = {
             "selected_count": len(selected),
             "mean_reward": _mean(candidate.mean_reward for candidate in selected),
@@ -460,7 +492,14 @@ def replay_archives(
             "operator_cap_requested": max_slots_per_operator,
             "operator_cap_applied": (
                 max_slots_per_operator is not None
-                and operator_mapping_complete
+                and bool(cap_windows)
+                and cap_applied_windows == len(cap_windows)
+            ),
+            "operator_cap_applied_windows": cap_applied_windows,
+            "operator_cap_skipped_windows": (
+                len(cap_windows) - cap_applied_windows
+                if max_slots_per_operator is not None
+                else 0
             ),
             "operator_mapping_complete": operator_mapping_complete,
         }
@@ -640,13 +679,20 @@ def _print_human(report: dict[str, Any]) -> None:
         operator_top1 = (
             summary.get("operator_concentration", {}).get("top1_share")
         )
+        if summary["operator_cap_requested"] is None:
+            cap_windows = "not_requested"
+        else:
+            applied = summary["operator_cap_applied_windows"]
+            total = applied + summary["operator_cap_skipped_windows"]
+            cap_windows = f"{applied}/{total}"
         print(
             f"delta={delta}: n={summary['selected_count']} "
             f"mean_reward={summary['mean_reward']} "
             f"mean_jaccard={summary['mean_selection_jaccard']} "
             f"top1={summary['hotkey_concentration']['top1_share']} "
             f"operator_top1={operator_top1} "
-            f"operator_cap_applied={summary['operator_cap_applied']}"
+            f"operator_cap_applied={summary['operator_cap_applied']} "
+            f"cap_windows={cap_windows}"
         )
 
 
