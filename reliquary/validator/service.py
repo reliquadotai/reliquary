@@ -38,20 +38,14 @@ from reliquary.constants import (
     MIN_EOS_PROBABILITY,
     POLL_INTERVAL_SECONDS,
     PPO_CLIP_EPSILON,
-    MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
-    MAX_SEAL_QUEUE_DRAIN_SECONDS,
-    PROOF_ADMISSION_STALL_POLL_SECONDS,
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
     REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS,
-    SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS,
-    SPARSE_VALID_IDLE_SEAL_SECONDS,
-    SPARSE_VALID_MAX_WINDOW_SECONDS,
     SIGMA_MIN,
     SUBNET_START_BLOCK,
     VALIDATOR_HTTP_PORT,
     WANDB_TRAINING_VERSION,
+    WINDOW_COLLECTION_SECONDS,
     WINDOW_LENGTH,
-    WINDOW_TIMEOUT_SECONDS,
 )
 from reliquary.environment import load_environments
 from reliquary.environment.base import Environment
@@ -179,11 +173,9 @@ def open_grpo_window(
     across windows. Each window's sealed batch updates it via
     ``GrpoWindowBatcher.seal_batch``.
 
-    ``queue_drained_predicate`` is wired by ``Service.run`` to the
-    server's submit-queue ``empty()`` check so the v2.3 seal extension
-    can wait for every queued trigger-round submission to be GRAIL-
-    validated before firing the seal. See
-    ``GrpoWindowBatcher._delayed_seal_at_drand_boundary``.
+    ``queue_drained_predicate`` is vestigial: the window now seals on the
+    fixed collection deadline, so the batcher no longer polls it. Retained so
+    the ``Service.run`` wiring and tests can keep passing it unchanged.
     """
     def _completion_text(rollout: RolloutSubmission) -> str:
         prompt_len = rollout.commit.get("rollout", {}).get("prompt_length", 0)
@@ -659,188 +651,47 @@ class ValidationService:
         finally:
             await chain.close_subtensor(subtensor)
 
-    def _proof_admission_exhausted_and_drained(self, batcher) -> bool:
-        """True when bounded admission cannot fill this window anymore.
-
-        Gated on the never-refunded grading ceiling — the only per-window
-        admission budget left. Once it is spent and nothing is queued or in
-        flight, no further submission can be admitted, so a window still short
-        of B distinct prompts will never reach it: force-seal instead of idling
-        to the window timeout.
-        """
-        if batcher is None or batcher.is_sealed():
-            return False
-        distinct_admitted = self._distinct_admitted_prompt_count(batcher)
-        if distinct_admitted >= B_BATCH:
-            return False
-        if (
-            getattr(batcher, "proof_grading_attempts", 0)
-            < MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
-        ):
-            return False
-        queue_depth = int(getattr(self.server, "submit_queue_depth", 0) or 0)
-        inflight = int(getattr(self.server, "proof_verification_inflight", 0) or 0)
-        return queue_depth == 0 and inflight == 0
-
-    def _distinct_admitted_prompt_count(self, batcher) -> int:
-        """Best-effort distinct prompt count for liveness decisions.
-
-        Reads the PENDING pool: proofs are deferred to seal, so the valid
-        counters stay 0 for the whole window and a breaker gated on them is
-        dead code.
-        """
-        counter = getattr(batcher, "distinct_pending_prompt_count", None)
-        if callable(counter):
-            return int(counter())
-        return self._admitted_count(batcher)
-
-    def _admitted_count(self, batcher) -> int:
-        """Submissions admitted and graded this window (proven or not)."""
-        return int(getattr(batcher, "pending_count", 0) or 0)
-
-    def _duplicate_prompt_shortfall_drained(self, batcher) -> bool:
-        """True when duplicates filled raw submissions but not trainable slots."""
-        if batcher is None or batcher.is_sealed():
-            return False
-        if getattr(batcher, "_seal_trigger_round", None) is not None:
-            return False
-        admitted_count = self._admitted_count(batcher)
-        distinct_admitted = self._distinct_admitted_prompt_count(batcher)
-        if admitted_count < B_BATCH or distinct_admitted >= B_BATCH:
-            return False
-        queue_depth = int(getattr(self.server, "submit_queue_depth", 0) or 0)
-        inflight = int(getattr(self.server, "proof_verification_inflight", 0) or 0)
-        return queue_depth == 0 and inflight == 0
-
     def _queue_and_proofs_drained(self) -> bool:
         queue_depth = int(getattr(self.server, "submit_queue_depth", 0) or 0)
         inflight = int(getattr(self.server, "proof_verification_inflight", 0) or 0)
         return queue_depth == 0 and inflight == 0
 
-    def _seconds_since_last_valid_submission(self, batcher) -> float | None:
-        counter = getattr(batcher, "seconds_since_last_valid_submission", None)
-        if callable(counter):
-            return counter()
-        return None
-
-    def _window_open_age_seconds(self, batcher) -> float | None:
+    def _seconds_to_seal_deadline(self, batcher) -> float:
+        """Seconds until this batcher hits the collection deadline (may be <=0)."""
         opened_at = getattr(batcher, "window_opened_at", None)
         time_fn = getattr(batcher, "_time_fn", None)
         if opened_at is None or not callable(time_fn):
-            return None
-        return max(0.0, float(time_fn()) - float(opened_at))
-
-    def _sparse_valid_liveness_reason(self, batcher) -> str | None:
-        """Return force-seal reason for sparse valid windows, if any.
-
-        This is a cadence guard, not a quality gate. It only fires when the
-        validator has fewer than B distinct trainable prompts, no queued or
-        in-flight proof work, and either no admission progress for the sparse
-        idle threshold or an overlong sparse window. Empty windows are included
-        only for the max-age path so a hard reset with stale miners cannot
-        freeze checkpoint progress indefinitely.
-
-        Counts admitted (pending) submissions, not proven ones — proofs run at
-        seal, so the valid counters are 0 while this runs.
-        """
-        if batcher is None or batcher.is_sealed():
-            return None
-        if getattr(batcher, "_seal_trigger_round", None) is not None:
-            return None
-        admitted_count = self._admitted_count(batcher)
-        distinct_admitted = self._distinct_admitted_prompt_count(batcher)
-        if distinct_admitted >= B_BATCH:
-            return None
-        if not self._queue_and_proofs_drained():
-            return None
-
-        idle_s = self._seconds_since_last_valid_submission(batcher)
-        age_s = self._window_open_age_seconds(batcher)
-        if admitted_count <= 0:
-            if age_s is not None and age_s >= SPARSE_VALID_MAX_WINDOW_SECONDS:
-                return "zero_valid_window_timeout"
-            return None
-        if (
-            distinct_admitted >= SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS
-            and idle_s is not None
-            and idle_s >= SPARSE_VALID_IDLE_SEAL_SECONDS
-        ):
-            return "sparse_valid_idle_timeout"
-        if age_s is not None and age_s >= SPARSE_VALID_MAX_WINDOW_SECONDS:
-            return "sparse_valid_window_timeout"
-        return None
-
-    def _force_seal_dead_batcher(self, batcher, dup_since: dict) -> str | None:
-        """Force-seal one batcher if its own liveness breaker fires; else None.
-
-        Per-env so a fast env never seals a slower one short.
-        """
-        env = getattr(getattr(batcher, "env", None), "name", "?")
-        if self._proof_admission_exhausted_and_drained(batcher):
-            reason = "proof_admission_exhausted_drained"
-        elif self._duplicate_prompt_shortfall_drained(batcher):
-            now = asyncio.get_running_loop().time()
-            if now - dup_since.setdefault(env, now) < MAX_SEAL_QUEUE_DRAIN_SECONDS:
-                return None
-            reason = "duplicate_prompt_distinct_shortfall_drained"
-        else:
-            dup_since.pop(env, None)
-            reason = self._sparse_valid_liveness_reason(batcher)
-        if reason is None:
-            return None
-        logger.warning(
-            "Window %d env=%s force-sealing partial: reason=%s admitted=%d/%d "
-            "distinct=%d/%d idle_s=%s age_s=%s",
-            self._window_n, env, reason,
-            self._admitted_count(batcher), B_BATCH,
-            self._distinct_admitted_prompt_count(batcher), B_BATCH,
-            self._seconds_since_last_valid_submission(batcher),
-            self._window_open_age_seconds(batcher),
-        )
-        batcher.force_seal(reason)
-        return reason
+            return 0.0
+        return WINDOW_COLLECTION_SECONDS - (float(time_fn()) - float(opened_at))
 
     async def _wait_for_window_seal(self) -> str:
-        """Wait until every active env's batcher seals.
+        """Hold every active env's batcher open until the fixed collection
+        deadline, then seal them all.
 
-        Each batcher seals independently — via its own BATCH_FILLED fill or
-        its own liveness breaker — so a fast env never cuts a slower one
-        short. The window advances only once all are sealed (or the global
-        timeout). Training still requires all envs full (see ``trained``).
+        The window stays open the full ``WINDOW_COLLECTION_SECONDS`` and
+        accepts everything; an early seal would be the speed race we removed —
+        a fast miner on an easy prompt cutting off slow-but-hard submissions
+        still generating. A fixed deadline is the unconditional answer to
+        "when do we stop waiting?", so the old sparse-window liveness breakers
+        are gone. Under-filled windows still seal here; their unused slots burn
+        (the training path already skips partial batches).
         """
         batchers = list(self._active_batchers.values())
         if not batchers:
             return "no_active_batcher"
 
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + WINDOW_TIMEOUT_SECONDS
-        dup_since: dict[str, float] = {}
-        reasons: dict[str, str] = {}
         while True:
             for b in batchers:
-                if b.is_sealed():
-                    continue
-                r = self._force_seal_dead_batcher(b, dup_since)
-                if r is not None:
-                    reasons[getattr(getattr(b, "env", None), "name", "?")] = r
-
+                b.poll_deadline()
             if all(b.is_sealed() for b in batchers):
-                break
-
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                for b in batchers:
-                    if not b.is_sealed():
-                        b.force_seal("timeout")
-                return "timeout"
-
-            await asyncio.sleep(min(PROOF_ADMISSION_STALL_POLL_SECONDS, remaining))
-
-        if not reasons:
-            return "sealed"
-        if len(reasons) == 1:
-            return next(iter(reasons.values()))
-        return ",".join(f"{e}={r}" for e, r in reasons.items())
+                return "sealed"
+            # Sleep to the soonest un-sealed deadline, then re-poll and seal.
+            remaining = min(
+                self._seconds_to_seal_deadline(b)
+                for b in batchers
+                if not b.is_sealed()
+            )
+            await asyncio.sleep(max(0.0, min(remaining, POLL_INTERVAL_SECONDS)))
 
     async def _set_window_randomness(self, subtensor) -> None:
         """Populate all active batchers' per-window randomness seed.
@@ -1788,17 +1639,12 @@ class ValidationService:
                     seal_reason = await self._wait_for_window_seal()
                     if seal_reason == "sealed":
                         logger.info(
-                            "Window %d: all %d batcher(s) sealed",
+                            "Window %d: all %d batcher(s) sealed at deadline",
                             self._window_n, len(self._active_batchers),
-                        )
-                    elif seal_reason == "timeout":
-                        logger.warning(
-                            "Window %d timed out at %ds — sealing partial",
-                            self._window_n, WINDOW_TIMEOUT_SECONDS,
                         )
                     else:
                         logger.warning(
-                            "Window %d sealed by liveness breaker: %s",
+                            "Window %d sealed: %s",
                             self._window_n, seal_reason,
                         )
 

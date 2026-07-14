@@ -1690,24 +1690,6 @@ class ValidatorServer:
                 round_reject = drand_observation.reject_reason
                 if round_reject is not None:
                     return _cheap_reject(round_reject, reject_stage="drand")
-            # v2.3 seal extension: once the batcher has captured a
-            # trigger drand round (the B-th distinct prompt has landed),
-            # submissions whose drand_round is past that trigger arrived
-            # in a later chronological tier than the boundary fair-split
-            # can absorb. Reject pre-queue with BATCH_FILLED so they
-            # don't sit in the worker queue costing a futile dequeue.
-            trigger_round = batcher._seal_trigger_round
-            if (
-                trigger_round is not None
-                and request.drand_round > trigger_round
-            ):
-                return _cheap_reject(
-                    RejectReason.BATCH_FILLED,
-                    reject_stage="seal_extension",
-                    batch_filled_reason="submitted_round_gt_seal_trigger_round",
-                    current_valid_count=batcher.valid_count,
-                    trigger_round=trigger_round,
-                )
             try:
                 environment_size = await asyncio.to_thread(len, batcher.env)
             except PromptSourceUnavailable as exc:

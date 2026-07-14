@@ -200,6 +200,17 @@ SPARSE_VALID_IDLE_SEAL_SECONDS = 300.0
 SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS = 4
 SPARSE_VALID_MAX_WINDOW_SECONDS = 900.0
 
+# Fixed collection window for the difficulty auction. The window no longer seals
+# on the 8th distinct prompt; it stays open for this long and accepts everything.
+#
+# This is also the MINIMUM window duration, by construction. An early seal would
+# be the speed race we are removing: whoever triggered it would cut off the
+# slow-but-hard submissions still generating. Sized from live traffic — math
+# generation is 176s at the median and 267s at p75, and windows already run 277s
+# of collection today, so 300s captures ~89% of submissions at near-zero cadence
+# cost ONCE proofs are deferred (spec §2.5).
+WINDOW_COLLECTION_SECONDS = 300.0
+
 # UID that receives unused slot emission budget (the burn address).
 UID_BURN = 0
 

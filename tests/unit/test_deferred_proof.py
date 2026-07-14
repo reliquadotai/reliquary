@@ -108,21 +108,19 @@ def test_verify_expensive_reject_charges_debt_archives_and_redacts_sketch():
     assert rejected.sketch_diff_max is None
 
 
-def test_seal_trigger_counts_pending_not_valid():
-    """The seal trigger must fire on the B-th distinct PENDING prompt. Proofs
-    run at seal, so _valid stays empty for the whole window — a trigger reading
-    _valid would never fire."""
+def test_admitted_submissions_land_in_pending_not_valid():
+    """Admission grades and scores into the PENDING pool; proofs run at seal, so
+    _valid stays empty during the window. Reaching B distinct prompts does NOT
+    seal — the window is time-boxed on the collection deadline."""
     from reliquary.constants import B_BATCH
     from tests.unit.test_grpo_window_batcher import _make_batcher, _request
 
     b = _make_batcher()
-    assert b._seal_trigger_round is None
     for i in range(B_BATCH):
         b.accept_submission(_request(prompt_idx=i, hotkey=f"hk{i}"))
 
-    # The trigger armed off the pending pool, not off _valid.
-    assert b._seal_trigger_round is not None
-    assert b.is_sealed()
+    # No count-based seal: proofs are deferred and the window stays open.
+    assert b.is_sealed() is False
     assert b._valid == []
     assert len(b.pending_submissions()) == B_BATCH
 

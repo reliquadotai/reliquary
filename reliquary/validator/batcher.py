@@ -27,12 +27,12 @@ from reliquary.constants import (
     MIN_EOS_PROBABILITY,
     FORENSIC_SAMPLE_PER_WINDOW,
     MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
-    MAX_SEAL_QUEUE_DRAIN_SECONDS,
     MAX_SUBMISSIONS_PER_PROMPT,
     MAX_TRUNCATED_PER_SUBMISSION,
     PROMPT_RANGE_SIZE,
     PROMPT_RANGE_ENFORCE_FROM_WINDOW,
     REJECTED_LIST_CAP_PER_HOTKEY,
+    WINDOW_COLLECTION_SECONDS,
     CODE_SEMANTIC_AUTH_ENFORCE,
     TOKEN_AUTH_ENFORCE,
     ALL_TOKEN_AUTH_ENFORCE,
@@ -575,40 +575,21 @@ class GrpoWindowBatcher:
         # an aggregate count. Cap protects against single-attacker flooding.
         self.rejected_submissions: list[RejectedSubmission] = []
 
-        # v2.1+: seal_event fires once the window is finalized. v2.3+:
-        # firing is delayed past the B-th distinct prompt to absorb the
-        # rest of that submission's drand round — see the "trigger round"
-        # comment in ``_accept_locked``. Stored as ``threading.Event`` for
-        # sync-safe ``set()`` from the worker thread; the asyncio.Event is
-        # lazy-bound to the running loop on first access.
+        # The window seals on the fixed collection deadline
+        # (``WINDOW_COLLECTION_SECONDS`` after it opened), not on a count.
+        # ``poll_deadline`` sets ``_seal_flag`` once the deadline expires;
+        # ``force_seal`` sets it early only as a safety valve (e.g. an
+        # invalidated beacon). Stored as ``threading.Event`` for sync-safe
+        # ``set()`` from the worker thread; the asyncio.Event is lazy-bound
+        # to the running loop on first access.
         self._seal_flag: threading.Event = threading.Event()
         self._seal_event: asyncio.Event | None = None
-        # v2.3 seal extension. When the B-th distinct prompt arrives in
-        # drand round R, we record R here and DELAY firing ``_seal_flag``
-        # until the next drand boundary so further submissions in R can
-        # still be accepted (and fairly share the boundary-round emission
-        # via ``select_batch_and_distribute``'s boundary branch). Until
-        # the boundary passes:
-        #   * submissions with ``drand_round == R`` are accepted normally
-        #   * submissions with ``drand_round > R`` are rejected with
-        #     ``BATCH_FILLED`` AND fire the seal immediately (no point
-        #     waiting if a later round has already shown up)
-        # ``_loop`` is captured the first time ``seal_event`` is accessed
-        # from an async context so we can schedule the delayed seal from
-        # the worker thread via ``run_coroutine_threadsafe``. ``None`` in
-        # synchronous test contexts — there the seal fires immediately on
-        # the B-th distinct, matching the pre-v2.3 timing.
-        self._seal_trigger_round: int | None = None
+        # ``_loop`` is captured the first time ``seal_event`` is accessed from
+        # an async context (or pre-bound via ``bind_event_loop``). Retained so
+        # a set from a worker thread propagates to the asyncio waiter.
         self._loop: asyncio.AbstractEventLoop | None = None
-        # Optional callback the seal-extension coroutine polls to check
-        # whether the server's submit_queue has finished draining items
-        # queued during the trigger drand round. ``None`` in test
-        # contexts that bypass the HTTP/worker pipeline — in that case
-        # the delayed seal coroutine fires as soon as the drand round
-        # expires (drain phase skipped). Production wires this to
-        # ``_queue_and_proofs_drained`` so already admitted trigger-round
-        # submissions finish GRAIL (queue empty AND no proof in flight)
-        # before the batch is sealed.
+        # Vestigial: kept so the service factory can still pass it, but the
+        # deadline seal no longer polls a queue-drain predicate.
         self._queue_drained_predicate = queue_drained_predicate
         self.force_seal_reason: str | None = None
         # Proof counters live under their own lock, not ``_lock``: the HTTP
@@ -649,9 +630,8 @@ class GrpoWindowBatcher:
     def seal_event(self) -> asyncio.Event:
         """Lazy asyncio.Event bound to whichever loop accesses it first.
 
-        Also captures the loop reference for the v2.3 seal-extension
-        mechanism, which needs to schedule a delayed seal-firing coroutine
-        from the worker thread.
+        Also captures the loop reference so a seal set from a worker thread
+        propagates to an asyncio waiter.
         """
         if self._seal_event is None:
             self._seal_event = asyncio.Event()
@@ -664,39 +644,50 @@ class GrpoWindowBatcher:
         return self._seal_event
 
     def bind_event_loop(self, loop: asyncio.AbstractEventLoop) -> None:
-        """Bind the validator's main event loop for the delayed seal.
+        """Bind the validator's main event loop.
 
         ``accept_submission`` runs in a worker thread (``asyncio.to_thread``)
-        with no running loop, so it cannot capture the loop itself — it reads
-        this pre-bound reference to schedule ``_delayed_seal_at_drand_boundary``
-        via ``run_coroutine_threadsafe``. Without this, ``_loop`` stays ``None``
-        and the B-th distinct prompt seals synchronously, dropping same-round
-        in-flight submissions and collapsing the drand-boundary fair split.
+        with no running loop, so it cannot capture the loop itself — this
+        pre-binds the reference an asyncio waiter needs.
         """
         self._loop = loop
 
     def is_sealed(self) -> bool:
-        """True once B distinct non-cooldown valid submissions have been
-        accepted. Thread-safe and loop-independent (reads the underlying
-        ``threading.Event``, never touches the lazy ``asyncio.Event``).
+        """True once the collection deadline has expired (or a safety-valve
+        ``force_seal`` fired). Thread-safe and loop-independent (reads the
+        underlying ``threading.Event``, never touches the lazy
+        ``asyncio.Event``).
 
-        After this returns True, ``select_batch`` will pick the first
-        ``B_BATCH`` by ``arrived_at`` — any further submission would have
-        a later ``arrived_at`` and therefore cannot displace one of the
-        already-selected entries. Verifying it costs ~5–25 s of GRAIL
-        forward pass and produces zero protocol benefit. Callers (the
-        HTTP /submit handler and the submit worker) use this to short-
-        circuit further work for the current window.
+        The window stays open the full ``WINDOW_COLLECTION_SECONDS`` and
+        accepts everything; only after this returns True does further work
+        for the window short-circuit. Callers (the HTTP /submit handler and
+        the submit worker) use it to drop post-deadline submissions.
         """
         return self._seal_flag.is_set()
 
-    def force_seal(self, reason: str) -> None:
-        """Force this window to seal without B distinct valid submissions.
+    def poll_deadline(self) -> bool:
+        """Seal iff the fixed collection deadline has expired. Idempotent.
 
-        Used only as a liveness breaker after the bounded proof-admission
-        queue has fully drained and no further expensive submissions can be
-        admitted. The downstream training path already skips partial batches;
-        this just avoids waiting for the long window timeout.
+        The deadline is the window's minimum duration by construction: an
+        early seal would be the speed race being removed, cutting off
+        slow-but-hard submissions still generating.
+        """
+        if self._seal_flag.is_set():
+            return True
+        if self._time_fn() - self.window_opened_at >= WINDOW_COLLECTION_SECONDS:
+            self._seal_flag.set()
+            if self._seal_event is not None:
+                self._seal_event.set()
+            return True
+        return False
+
+    def force_seal(self, reason: str) -> None:
+        """Seal this window early — a safety valve, not the normal path.
+
+        The window normally seals on the collection deadline (see
+        ``poll_deadline``). This exists for out-of-band drops such as an
+        invalidated beacon; the downstream training path already skips
+        partial batches.
         """
         if self._seal_flag.is_set():
             return
@@ -993,20 +984,6 @@ class GrpoWindowBatcher:
                 **kwargs,
             )
 
-        # v2.3 seal extension: once the trigger drand round is recorded
-        # (B-th distinct prompt landed in round R), submissions from a
-        # LATER drand round arrive too late — drop with BATCH_FILLED.
-        # CRITICAL: we do NOT fire the seal here, even though we now
-        # know a later round has shown up. The queue may still contain
-        # other trigger-round submissions waiting on GRAIL; firing the
-        # seal now would make the worker's ``is_sealed`` check drop
-        # them. The seal fires only when the delayed coroutine confirms
-        # the queue has drained.
-        if (
-            self._seal_trigger_round is not None
-            and request.drand_round > self._seal_trigger_round
-        ):
-            return reject(RejectReason.BATCH_FILLED, "seal_extension")
         if request.window_start != self.window_start:
             return reject(RejectReason.WINDOW_MISMATCH, "window")
         # v2.1: checkpoint hash gate. Empty string = gate disabled
@@ -1270,68 +1247,12 @@ class GrpoWindowBatcher:
         # Lock-free read in /state — see ``__init__`` for rationale.
         self.pending_count = len(self._pending)
 
-        self._maybe_trigger_seal(request, telemetry)
-
+        # No count-based seal: the window seals only on the collection
+        # deadline (``poll_deadline``), so a fast miner on an easy prompt can
+        # no longer cut off slow-but-hard submissions still generating.
         return BatchSubmissionResponse(
             accepted=True, reason=RejectReason.ACCEPTED
         )
-
-    def _maybe_trigger_seal(
-        self,
-        request: BatchSubmissionRequest,
-        telemetry: SubmitTelemetry | None,
-    ) -> None:
-        """Arm the delayed seal once B distinct non-cooldown prompts are PENDING.
-
-        Counts pending, not valid: proofs now run at seal, so ``_valid`` is
-        empty for the whole window and a trigger reading it would never fire.
-        """
-        # v2.1: fire seal_event when B distinct non-cooldown prompts have been accepted.
-        distinct_eligible = self.distinct_pending_prompt_count()
-        if distinct_eligible >= B_BATCH and self._seal_trigger_round is None:
-            # B-th distinct prompt just landed. Record the trigger drand
-            # round and DELAY the actual seal until the round expires —
-            # any further submissions in this same drand round can still
-            # be accepted and share the boundary slot value via
-            # ``select_batch_and_distribute``'s boundary branch.
-            #
-            # Two firing paths bring ``_seal_flag`` up:
-            #   1. ``_delayed_seal_at_drand_boundary`` — a coroutine
-            #      scheduled below sleeps until the next drand boundary
-            #      and fires the seal even if no further traffic arrives.
-            #   2. The early-fire above: a submission from a LATER drand
-            #      round arrives → seal fires immediately, the late
-            #      submission is rejected.
-            # Whichever fires first wins; the other path becomes a no-op
-            # because ``_seal_flag.is_set()`` short-circuits.
-            self._seal_trigger_round = request.drand_round
-            if telemetry is not None:
-                telemetry.seal_trigger_round = self._seal_trigger_round
-                # ``valid_submissions_at_decision`` is written by
-                # ``refresh_from_batcher(at_decision=True)`` from ``pending_count``;
-                # writing it here would be dead (immediately overwritten).
-                log_submission_stage(
-                    logger,
-                    logging.INFO,
-                    "seal_triggered",
-                    telemetry,
-                    distinct_eligible=distinct_eligible,
-                    batch_size=B_BATCH,
-                    seal_trigger_round=self._seal_trigger_round,
-                )
-            if self._loop is not None:
-                # Production path: schedule the delayed fire on the
-                # validator's asyncio loop.
-                asyncio.run_coroutine_threadsafe(
-                    self._delayed_seal_at_drand_boundary(),
-                    self._loop,
-                )
-            else:
-                # Synchronous test path (no running loop): fire seal
-                # immediately, matching the pre-v2.3 timing tests rely on.
-                self._seal_flag.set()
-                if self._seal_event is not None:
-                    self._seal_event.set()
 
     def _verify_expensive(
         self, pending: PendingSubmission
@@ -2090,7 +2011,7 @@ class GrpoWindowBatcher:
                 telemetry.arrival_drand_round if telemetry else None
             ),
             drand_delta=telemetry.drand_delta if telemetry else None,
-            seal_trigger_round=self._seal_trigger_round,
+            seal_trigger_round=None,
             prompt_hash_lead=telemetry.prompt_hash_lead if telemetry else None,
             reward_vector=reward_shape.reward_vector,
             truncated_count=truncated_count,
@@ -2102,73 +2023,6 @@ class GrpoWindowBatcher:
         # ``rollout.commit["rollout"]["truncated"]``. It therefore MUST be called
         # serially (Task 3 runs a top-down loop over candidates, never in parallel).
         return new_sub
-
-    async def _delayed_seal_at_drand_boundary(self) -> None:
-        """Fire ``_seal_flag`` once (a) the trigger drand round expires
-        AND (b) the submit queue has drained.
-
-        Phase 1 — drand boundary wait. Sleep until ``seconds_until_next_drand_boundary``
-        passes. After this point HTTP cheap-reject starts rejecting
-        submissions whose ``drand_round > _seal_trigger_round`` as
-        BATCH_FILLED, so the queue can only lose items from here on.
-
-        Phase 2 — bounded queue drain. Poll ``_queue_drained_predicate`` every
-        ~200 ms until it returns True or the drain timeout expires. Only then
-        do we fire the seal.
-        Without this phase, GRAIL-pending submissions queued during the
-        trigger drand round would be dropped at the worker's
-        ``is_sealed`` check the instant the seal fires — defeating the
-        entire boundary-fair-split design. The timeout is the safety valve:
-        fairness improves for normal trigger-round stragglers, but a slow or
-        constantly refilled queue cannot freeze checkpoints.
-
-        Defensive fallback: if the drand chain info isn't available
-        (synchronous tests that disable the drand check), the boundary
-        wait is skipped and seal fires immediately. If the predicate is
-        None (tests that don't wire one), the drain wait is also
-        skipped. Both fallbacks preserve pre-v2.3 timing for test
-        fixtures that don't exercise the full pipeline.
-
-        Cancellation: if the service swaps the active batcher (window
-        rolls over) while this coroutine is sleeping, the task is
-        cancelled by the loop teardown. That's fine — a stale batcher's
-        seal firing late is a no-op (the train step has already moved on).
-        """
-        # Phase 1 — wait for trigger drand round to expire.
-        if self._drand_chain_info is not None:
-            from reliquary.infrastructure.chain import seconds_until_next_drand_boundary
-            ci = self._drand_chain_info
-            delay = seconds_until_next_drand_boundary(
-                self._wall_clock(), ci["genesis_time"], ci["period"],
-            )
-            # Small margin past the boundary so a submission sent right
-            # at the boundary still resolves to the trigger round on
-            # arrival.
-            await asyncio.sleep(delay + 0.05)
-
-        # Phase 2 — drain the queue of trigger-round submissions still
-        # waiting on GRAIL. Without ``_queue_drained_predicate`` (test
-        # context), this phase is a no-op and the seal fires immediately.
-        if self._queue_drained_predicate is not None:
-            drain_started = self._time_fn()
-            while not self._queue_drained_predicate():
-                waited_s = self._time_fn() - drain_started
-                if waited_s >= MAX_SEAL_QUEUE_DRAIN_SECONDS:
-                    logger.warning(
-                        "seal_drain_timeout window=%d trigger_round=%s "
-                        "waited_s=%.2f proof_admitted=%d grading_attempts=%d",
-                        self.window_start,
-                        self._seal_trigger_round,
-                        waited_s,
-                        self._proof_admission_count,
-                        self._proof_grading_attempts,
-                    )
-                    break
-                await asyncio.sleep(0.2)
-
-        self._seal_flag.set()
-        if self._seal_event is not None:
-            self._seal_event.set()
 
     def _reject(
         self,
@@ -2227,7 +2081,7 @@ class GrpoWindowBatcher:
                         ),
                         drand_delta=telemetry.drand_delta if telemetry else None,
                         seal_trigger_round=(
-                            telemetry.seal_trigger_round if telemetry else self._seal_trigger_round
+                            telemetry.seal_trigger_round if telemetry else None
                         ),
                         prompt_hash_lead=(
                             telemetry.prompt_hash_lead if telemetry else None

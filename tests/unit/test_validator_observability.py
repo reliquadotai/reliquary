@@ -180,29 +180,6 @@ def test_accept_reject_lifecycle_logs_required_fields(caplog):
         assert required.issubset(payload.keys())
 
 
-def test_batch_filled_log_explains_trigger_round(caplog):
-    batcher = _ObservableBatcher()
-    batcher.drand_round_check_enabled = False
-    batcher._seal_trigger_round = 100
-    server = _open_server(batcher)
-    client = TestClient(server.app)
-
-    with caplog.at_level(logging.INFO, logger="reliquary.validator.server"):
-        resp = client.post(
-            "/submit", json=_submission(drand_round=101, hotkey="hkLate")
-        )
-
-    assert resp.json()["reason"] == RejectReason.BATCH_FILLED.value
-    rejected = [
-        p for p in _payloads(caplog)
-        if p.get("stage") == "candidate_rejected"
-    ][0]
-    assert rejected["batch_filled_reason"] == "submitted_round_gt_seal_trigger_round"
-    assert rejected["trigger_round"] == 100
-    assert rejected["seal_trigger_round"] == 100
-    assert rejected["current_valid_count"] == 3
-
-
 def test_health_endpoint_does_not_leak_secrets(monkeypatch):
     monkeypatch.setenv("R2_SECRET_ACCESS_KEY", "secret-value-123")
     monkeypatch.setenv("R2_ACCESS_KEY_ID", "access-key-value-123")

@@ -856,59 +856,19 @@ def test_stalled_handler_does_not_reject_round_inside_arrival_window():
     assert body["reason"] != RejectReason.STALE_ROUND.value
 
 
-def test_seal_extension_http_rejects_late_drand_pre_queue():
-    """When the batcher has captured a trigger drand round, HTTP
-    cheap-reject must reject any submission with
-    ``drand_round > trigger_round`` as BATCH_FILLED without queuing.
-    This is the v2.3 seal-extension gate: trigger-round stragglers are
-    still accepted (they feed the boundary fair-split), but later-drand
-    submissions are too late and don't deserve a worker dequeue."""
-    s, batcher = _setup(current_checkpoint_hash="sha256:current")
-    # Simulate the batcher having recorded a trigger drand round.
-    batcher._seal_trigger_round = 100
-    # A submission with drand_round = 101 — later than trigger — must
-    # be rejected at the HTTP cheap-reject layer.
+def test_late_submission_accepted_pre_queue_while_window_open():
+    """The window is time-boxed now: there is no early seal gate, so a later
+    drand_round submission is no longer rejected pre-queue as BATCH_FILLED —
+    it passes cheap-reject like any other while the window is open."""
+    s, _ = _setup(current_checkpoint_hash="sha256:current")
     payload = _submission(drand_round=101)
-    _assert_pre_queue_reject(s, payload, RejectReason.BATCH_FILLED)
-
-
-def test_seal_extension_http_accepts_trigger_round_post_trigger():
-    """The complement to the previous test: after trigger is recorded,
-    submissions WITHIN the trigger drand round must still be accepted
-    by HTTP cheap-reject. This is what lets the boundary fair-split
-    accumulate > B candidates."""
-    s, batcher = _setup(current_checkpoint_hash="sha256:current")
-    batcher._seal_trigger_round = 100
-    # drand_round == trigger_round → passes the seal-extension gate.
-    # (The drand_check is disabled in _setup default, so the request
-    # doesn't get rejected for being older than current.)
-    payload = _submission(drand_round=100)
     with TestClient(s.app) as client:
         r = client.post("/submit", json=payload)
     body = r.json()
     assert body["accepted"] is True, (
-        f"trigger-round submission post-trigger must pass cheap-reject; got {body}"
+        f"late-drand submission must pass cheap-reject while open; got {body}"
     )
-    # Specifically not BATCH_FILLED — that's the false-positive we're
-    # guarding against.
     assert body.get("reason") != RejectReason.BATCH_FILLED.value
-
-
-def test_seal_extension_http_no_change_when_trigger_not_set():
-    """Pre-trigger (the common case during the bulk of a window),
-    ``batcher._seal_trigger_round is None`` and the new HTTP gate is
-    a no-op. Any drand_round value goes through (subject to the other
-    cheap-reject gates)."""
-    s, batcher = _setup(current_checkpoint_hash="sha256:current")
-    # Default _setup leaves _seal_trigger_round = None.
-    assert batcher._seal_trigger_round is None
-    payload = _submission(drand_round=12345)  # arbitrary, way "later"
-    with TestClient(s.app) as client:
-        r = client.post("/submit", json=payload)
-    body = r.json()
-    assert body["accepted"] is True, (
-        f"no-trigger submission must pass cheap-reject; got {body}"
-    )
 
 
 def test_cheap_reject_does_not_burn_rate_limit_budget():

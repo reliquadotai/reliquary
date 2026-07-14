@@ -771,10 +771,10 @@ def test_empty_checkpoint_hash_disables_gate():
     assert resp.accepted is True
 
 
-@pytest.mark.asyncio
-async def test_seal_event_set_when_b_valid_distinct_landed():
-    """seal_event fires when the B-th valid distinct-prompt non-cooldown
-    submission is accepted."""
+def test_b_distinct_prompts_do_not_seal_the_window():
+    """The window is time-boxed now: reaching B distinct prompts must NOT seal
+    it. An early seal would be the speed race we removed, cutting off
+    slow-but-hard submissions still generating (see poll_deadline)."""
     b = _make_batcher()
     b.current_checkpoint_hash = "sha256:hash"
     assert not b.seal_event.is_set()
@@ -784,9 +784,8 @@ async def test_seal_event_set_when_b_valid_distinct_landed():
             checkpoint_hash="sha256:hash",
         )
         b.accept_submission(req)
-    # Give the event loop a tick to ensure the event is visible.
-    await asyncio.wait_for(b.seal_event.wait(), timeout=0.1)
-    assert b.seal_event.is_set()
+    assert not b.seal_event.is_set()
+    assert b.is_sealed() is False
 
 
 def test_seal_event_not_set_with_only_duplicate_prompts():
@@ -1852,28 +1851,13 @@ def test_seal_batch_with_none_hash_set_is_noop():
 
 
 # ---------------------------------------------------------------------------
-# v2.3 seal extension: trigger drand round absorbs more submissions
+# Time-boxed window: extra candidates compete at seal, no early trigger
 # ---------------------------------------------------------------------------
 
-def test_seal_trigger_round_recorded_on_b_th_distinct():
-    """When the B-th distinct prompt lands, ``_seal_trigger_round`` is set
-    to that submission's drand_round. The seal flag is NOT yet fired — the
-    delayed coroutine handles that (or a later-drand submission early-fires
-    it via the new ``_accept_locked`` short-circuit)."""
-    b = _make_batcher()
-    b.current_checkpoint_hash = ""
-    assert b._seal_trigger_round is None
-    for i in range(B_BATCH):
-        req = _request_v21(prompt_idx=i, hotkey=f"hk{i}", checkpoint_hash="")
-        req.drand_round = 100
-        b.accept_submission(req)
-    assert b._seal_trigger_round == 100
-
-
 def test_distinct_pending_prompt_count_ignores_duplicate_submissions():
-    """Duplicate prompt submissions can fill the raw admitted count before the
-    trainable (distinct-prompt) slots are full, so the seal trigger counts
-    DISTINCT prompts. Admitted submissions are pending until seal proves them."""
+    """Duplicate prompt submissions fill the raw admitted count before the
+    distinct-prompt (trainable) slots, so ``distinct_pending_prompt_count``
+    de-duplicates. Admitted submissions are pending until seal proves them."""
     b = _make_batcher()
     b.current_checkpoint_hash = ""
 
@@ -1883,87 +1867,51 @@ def test_distinct_pending_prompt_count_ignores_duplicate_submissions():
             hotkey=f"hk{prompt_idx}",
             checkpoint_hash="",
         )
-        req.drand_round = 100
         b.accept_submission(req)
     duplicate = _request_v21(prompt_idx=0, hotkey="hk_dup", checkpoint_hash="")
-    duplicate.drand_round = 100
     b.accept_submission(duplicate)
 
     assert b.pending_count == B_BATCH
     assert b.distinct_pending_prompt_count() == B_BATCH - 1
-    assert b._seal_trigger_round is None
+    # No count-based seal: the window is time-boxed now.
+    assert b.is_sealed() is False
 
 
-def test_seal_extension_accepts_same_drand_after_bth():
-    """After the B-th distinct prompt lands in drand round R, further
-    submissions IN ROUND R are still accepted. This is the whole point of
-    the extension — it lets the boundary fair-split fire in
-    ``select_batch_and_distribute`` with > B distinct candidate prompts."""
+def test_extra_candidates_are_accepted_and_compete_at_seal():
+    """Past B distinct prompts, submissions are still accepted (no early seal).
+    They join the pending pool and compete for the B_BATCH slots at seal — the
+    entire point of the collection deadline."""
     b = _make_batcher()
     b.current_checkpoint_hash = ""
-    # Land 8 distinct prompts in round 100.
     for i in range(B_BATCH):
         req = _request_v21(prompt_idx=i, hotkey=f"hk{i}", checkpoint_hash="")
-        req.drand_round = 100
         b.accept_submission(req)
-    # 9th submission in the SAME drand round → still accepted.
+    # A 9th distinct submission is still accepted while the window is open.
     extra = _request_v21(prompt_idx=99, hotkey="hk_extra", checkpoint_hash="")
-    extra.drand_round = 100
     resp = b.accept_submission(extra)
     assert resp.accepted is True, (
-        f"same-round submission post-Bth distinct should be accepted; "
-        f"got {resp.reason}"
+        f"submission past B distinct should be accepted; got {resp.reason}"
     )
-    # And it's in the pending pool — now 9 distinct prompts compete in the
-    # seal-time ranking for the B_BATCH slots.
     distinct = len({s.prompt_idx for s in b.pending_submissions()})
     assert distinct == B_BATCH + 1
 
 
-def test_seal_extension_rejects_later_drand():
-    """A submission with ``drand_round > _seal_trigger_round`` is too late.
-    It must be rejected as BATCH_FILLED — and the seal_flag must fire so
-    the window can close without waiting for the timer-based delayed seal."""
-    b = _make_batcher()
-    b.current_checkpoint_hash = ""
-    # Trigger the seal round at 100.
-    for i in range(B_BATCH):
-        req = _request_v21(prompt_idx=i, hotkey=f"hk{i}", checkpoint_hash="")
-        req.drand_round = 100
-        b.accept_submission(req)
-    assert b._seal_trigger_round == 100
-    # Submission in round 101 — too late.
-    late = _request_v21(prompt_idx=99, hotkey="hk_late", checkpoint_hash="")
-    late.drand_round = 101
-    resp = b.accept_submission(late)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.BATCH_FILLED
-    # Seal flag fired (no need to wait on the delayed coroutine).
-    assert b._seal_flag.is_set()
-
-
-def test_seal_extension_extra_candidates_compete_for_the_b_slots():
-    """End-to-end: the trigger drand round absorbs extra submissions, and at
+def test_extra_candidates_compete_for_the_b_slots():
+    """End-to-end: the open window absorbs > B distinct candidates, and at
     seal they COMPETE for the B slots instead of diluting them.
 
-    BEHAVIOUR CHANGE (ranked proving): ``_prove_ranked`` proves top-down and
-    stops at B_BATCH, so ``_valid`` never holds more than B candidates and the
-    boundary fair-split branch of ``select_batch_and_distribute`` — which used
-    to spread the pool across all 12 — can no longer fire from this path. The
-    12 runners no longer share pool/12 each; the 8 that win a slot take the full
-    pool/B and the 4 that never get proven earn nothing. That branch keeps its
-    direct coverage in tests/unit/test_batch_selection.py.
+    ``_prove_ranked`` proves top-down and stops at B_BATCH, so ``_valid`` never
+    holds more than B candidates: the 8 that win a slot take the full pool/B and
+    the 4 that never get proven earn nothing.
     """
     b = _make_batcher()
     b.current_checkpoint_hash = ""
-    # Land 8 distinct prompts in round 100 (fills the batch slots).
+    # Land 8 distinct prompts (fills the batch slots).
     for i in range(B_BATCH):
         req = _request_v21(prompt_idx=i, hotkey=f"hk{i}", checkpoint_hash="")
-        req.drand_round = 100
         b.accept_submission(req)
-    # Pre-seal-extension, the next submission would be rejected as
-    # BATCH_FILLED. Post-extension, same-drand submissions are still
-    # accepted — feed 4 more into the same round on new prompts.
+    # The window is still open (time-boxed, not count-sealed), so 4 more
+    # distinct submissions are still accepted.
     for j in range(4):
         extra = _request_v21(
             prompt_idx=100 + j, hotkey=f"hk_extra{j}", checkpoint_hash="",
@@ -2142,147 +2090,6 @@ def test_seal_batch_hash_dedup_records_only_rewarded_submissions():
     for pending in losers:
         for token_list in (r.commit["tokens"] for r in pending.request.rollouts):
             assert compute_rollout_hash(token_list) not in hs
-
-
-def test_seal_extension_disabled_when_no_chain_info():
-    """When ``_drand_chain_info`` isn't set (synchronous test path with the
-    drand check disabled) the delayed seal coroutine can't compute when
-    the drand round ends, so it fires immediately. This preserves the
-    pre-v2.3 timing for legacy tests that exercise the seal flow without
-    drand setup."""
-    import asyncio
-    b = _make_batcher()
-    # Force loop capture by accessing seal_event from this coroutine
-    # context — _make_batcher itself doesn't access seal_event so _loop
-    # remains None until we touch it here.
-    _ = b.seal_event  # binds _loop
-
-    async def _run():
-        b.current_checkpoint_hash = ""
-        for i in range(B_BATCH):
-            req = _request_v21(prompt_idx=i, hotkey=f"hk{i}", checkpoint_hash="")
-            req.drand_round = 100
-            b.accept_submission(req)
-        # Without chain_info, the delayed coroutine fires seal immediately
-        # on the next loop tick.
-        await asyncio.wait_for(b.seal_event.wait(), timeout=0.5)
-        assert b._seal_flag.is_set()
-
-    asyncio.run(_run())
-
-
-def test_seal_extension_waits_for_queue_drain():
-    """The delayed seal coroutine must wait for the submit queue to
-    finish draining before firing — otherwise GRAIL-pending trigger-
-    round submissions get dropped at the worker's ``is_sealed`` check
-    the instant the seal fires.
-
-    Pin: with a chain_info that puts us 0.05 s past the drand boundary
-    immediately AND a queue_drained_predicate that returns False the
-    first N calls, the seal must NOT fire until the predicate flips to
-    True.
-    """
-    import asyncio
-
-    poll_calls = [0]
-
-    def fake_queue_predicate():
-        poll_calls[0] += 1
-        # Pretend the queue is "draining" for the first 3 polls, then
-        # empty. Each poll happens ~0.2 s apart in the coroutine.
-        return poll_calls[0] > 3
-
-    async def _run():
-        # Use a chain_info whose boundary is essentially now (so phase 1
-        # of _delayed_seal_at_drand_boundary is a no-op): genesis at
-        # wall_clock and period = 1 ms means we're always at a boundary.
-        b = _make_batcher(
-            wall_clock_fn=lambda: 1000.0,  # fixed time
-            drand_chain_info={"genesis_time": 1000, "period": 1},
-            queue_drained_predicate=fake_queue_predicate,
-        )
-        _ = b.seal_event  # bind _loop
-        b.current_checkpoint_hash = ""
-        for i in range(B_BATCH):
-            req = _request_v21(prompt_idx=i, hotkey=f"hk{i}", checkpoint_hash="")
-            req.drand_round = 100
-            b.accept_submission(req)
-        # The coroutine has been scheduled by accept_submission. Now we
-        # wait for the seal — should take ~0.6 s (3 poll calls × 0.2 s
-        # each + a tiny margin).
-        await asyncio.wait_for(b.seal_event.wait(), timeout=2.0)
-        assert b._seal_flag.is_set()
-        # Predicate was actually polled multiple times before flipping.
-        assert poll_calls[0] >= 4
-
-    asyncio.run(_run())
-
-
-def test_seal_extension_queue_drain_timeout(monkeypatch):
-    """A never-empty queue must not keep the seal extension alive forever."""
-    import asyncio
-    import reliquary.validator.batcher as batcher_mod
-
-    now = [0.0]
-
-    def advancing_time():
-        now[0] += 0.01
-        return now[0]
-
-    monkeypatch.setattr(
-        batcher_mod, "MAX_SEAL_QUEUE_DRAIN_SECONDS", 0.0,
-    )
-
-    async def _run():
-        b = _make_batcher(
-            time_fn=advancing_time,
-            queue_drained_predicate=lambda: False,
-        )
-        _ = b.seal_event
-        await asyncio.wait_for(
-            b._delayed_seal_at_drand_boundary(), timeout=0.5,
-        )
-        assert b._seal_flag.is_set()
-
-    asyncio.run(_run())
-
-
-def test_seal_extension_no_early_fire_on_late_drand_submission():
-    """Regression pin: when a submission with drand_round > trigger
-    arrives at ``_accept_locked`` (worker dequeued it before HTTP
-    cheap-reject caught it), it must be rejected as BATCH_FILLED
-    WITHOUT firing the seal. Firing the seal at this point would make
-    the worker drop any remaining trigger-round items still in the
-    queue at its ``is_sealed`` gate, defeating the boundary fair-split.
-    """
-    b = _make_batcher()
-    b.current_checkpoint_hash = ""
-    # Trigger the seal round at 100 (8 distinct).
-    for i in range(B_BATCH):
-        req = _request_v21(prompt_idx=i, hotkey=f"hk{i}", checkpoint_hash="")
-        req.drand_round = 100
-        b.accept_submission(req)
-    assert b._seal_trigger_round == 100
-    # If queue_drained_predicate is None (test default), the seal fires
-    # immediately on the next loop tick — but here we're synchronous
-    # and never started a loop, so _loop is None and the immediate-seal
-    # fallback fired inside accept_submission already. The previous test
-    # covers that path; here we explicitly reset to test the late-drand
-    # case without it being masked by the immediate-seal fallback.
-    b._seal_flag.clear()
-
-    # Now a worker-dequeued submission from round 101 arrives directly
-    # in _accept_locked (bypassing HTTP cheap-reject for the test).
-    late = _request_v21(prompt_idx=99, hotkey="hk_late", checkpoint_hash="")
-    late.drand_round = 101
-    resp = b.accept_submission(late)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.BATCH_FILLED
-    # CRITICAL: seal must NOT have fired from this path.
-    assert not b._seal_flag.is_set(), (
-        "late-drand item in worker path must reject without firing seal; "
-        "otherwise queued trigger-round items get dropped at is_sealed"
-    )
 
 
 def test_batcher_beacon_invalid_defaults_false():
