@@ -19,7 +19,8 @@ from types import SimpleNamespace
 
 from reliquary.constants import KL_BETA
 from reliquary.validator.training import (
-    _pack_by_token_budget, _accumulate_grouped_grads, _rollout_loss,
+    _pack_by_token_budget, _accumulate_grouped_grads, _build_microbatch_items,
+    _rollout_loss,
     _bft_training_metrics, _compute_advantages, _plan_from_batches,
     train_step, reset_training_state,
 )
@@ -138,6 +139,18 @@ def test_pack_respects_budget():
             assert len(b) * max(lengths[i] for i in b) <= 12
 
 
+def test_microbatch_normalizes_protocol_full_sequence_logprobs():
+    rollout = _build_rollout([1, 2, 3, 4, 5, 6], 1.0, 2)
+    rollout.commit["rollout"]["token_logprobs"] = [-1.0] * 6
+    plan = [(_FakeGroup([rollout]), [1.0], 1.0)]
+
+    items = _build_microbatch_items(plan)
+
+    assert len(items) == 1
+    assert len(items[0][2]) == 4
+    assert len(items[0][5]) == 4
+
+
 # ---------------------------------------------------------------------------
 # Equivalence (the Embedding base makes batched == per-rollout up to bf16 head)
 # ---------------------------------------------------------------------------
@@ -216,6 +229,7 @@ def test_bft_training_metrics_measure_masked_and_weighted_exposure():
     assert metrics["bft/injected_tokens_masked"] == 2
     assert metrics["bft/trainable_completion_tokens"] == 6
     assert metrics["bft/forced_trainable_token_ratio"] == 0.5
+    assert metrics["bft/forced_abs_adv_weighted_token_ratio"] == 0.5
     assert metrics["bft/path/forced_phase2_eos/rollouts"] == 1
     assert metrics[
         "bft/path/forced_phase2_eos/abs_adv_weighted_tokens"

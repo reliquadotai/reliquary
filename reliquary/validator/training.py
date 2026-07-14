@@ -223,6 +223,18 @@ def _completion_keep_list(rollout, prompt_length: int, n_completion: int):
     return keep
 
 
+def _completion_token_logprobs(rollout) -> list:
+    """Normalize either protocol-supported log-prob layout to completion-only."""
+    commit = rollout.commit or {}
+    tokens = commit.get("tokens", []) or []
+    meta = commit.get("rollout", {}) or {}
+    prompt_length = int(meta.get("prompt_length", 0) or 0)
+    old = list(meta.get("token_logprobs", []) or [])
+    if tokens and len(old) == len(tokens):
+        return old[prompt_length:]
+    return old
+
+
 def _trainable_completion_count(
     rollout,
     prompt_length: int,
@@ -264,7 +276,7 @@ def _plan_from_batches(batches, env_weights: Optional[dict] = None):
             surviving.append((group, advantages, b_idx))
             for rollout in group.rollouts:
                 meta = (rollout.commit or {}).get("rollout", {}) or {}
-                old = meta.get("token_logprobs", []) or []
+                old = _completion_token_logprobs(rollout)
                 prompt_length = int(meta.get("prompt_length", 0) or 0)
                 batch_tokens[b_idx] += _trainable_completion_count(
                     rollout, prompt_length, len(old),
@@ -292,12 +304,14 @@ def _bft_training_metrics(plan) -> dict[str, float | int]:
     total_injected_tokens = 0
     forced_rollouts = 0
     forced_trainable_tokens = 0
+    total_abs_adv_weighted_tokens = 0.0
+    forced_abs_adv_weighted_tokens = 0.0
 
     for group, advantages, scale in plan:
         for rollout, advantage in zip(group.rollouts, advantages):
             meta = (rollout.commit or {}).get("rollout", {}) or {}
             prompt_length = int(meta.get("prompt_length", 0) or 0)
-            raw_tokens = len(meta.get("token_logprobs", []) or [])
+            raw_tokens = len(_completion_token_logprobs(rollout))
             trainable_tokens = _trainable_completion_count(
                 rollout, prompt_length, raw_tokens,
             )
@@ -323,6 +337,7 @@ def _bft_training_metrics(plan) -> dict[str, float | int]:
             path_metrics["trainable_tokens"] += trainable_tokens
             path_metrics["injected_tokens_masked"] += injected_tokens
             path_metrics["abs_adv_weighted_tokens"] += exposure
+            total_abs_adv_weighted_tokens += exposure
 
             total_rollouts += 1
             total_raw_tokens += raw_tokens
@@ -331,6 +346,7 @@ def _bft_training_metrics(plan) -> dict[str, float | int]:
             if span is not None:
                 forced_rollouts += 1
                 forced_trainable_tokens += trainable_tokens
+                forced_abs_adv_weighted_tokens += exposure
 
     metrics: dict[str, float | int] = {
         "bft/plan_rollouts": total_rollouts,
@@ -347,6 +363,15 @@ def _bft_training_metrics(plan) -> dict[str, float | int]:
         "bft/forced_trainable_token_ratio": (
             forced_trainable_tokens / total_trainable_tokens
             if total_trainable_tokens
+            else 0.0
+        ),
+        "bft/abs_adv_weighted_tokens": total_abs_adv_weighted_tokens,
+        "bft/forced_abs_adv_weighted_tokens": (
+            forced_abs_adv_weighted_tokens
+        ),
+        "bft/forced_abs_adv_weighted_token_ratio": (
+            forced_abs_adv_weighted_tokens / total_abs_adv_weighted_tokens
+            if total_abs_adv_weighted_tokens
             else 0.0
         ),
     }
@@ -522,7 +547,7 @@ def _rollout_loss(
     """
     tokens_list = rollout.commit["tokens"]
     prompt_length = rollout.commit.get("rollout", {}).get("prompt_length", 0)
-    old_logprobs_list = rollout.commit.get("rollout", {}).get("token_logprobs", [])
+    old_logprobs_list = _completion_token_logprobs(rollout)
 
     if prompt_length <= 0 or not old_logprobs_list:
         raise ValueError("rollout missing prompt_length or token_logprobs")
@@ -780,7 +805,7 @@ def _build_microbatch_items(plan):
             tokens = commit.get("tokens")
             meta = commit.get("rollout", {}) or {}
             p = int(meta.get("prompt_length", 0))
-            old = meta.get("token_logprobs", []) or []
+            old = _completion_token_logprobs(rollout)
             if not tokens or p <= 0 or not old:
                 logger.warning("rollout skipped: missing prompt_length or token_logprobs")
                 continue
