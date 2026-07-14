@@ -153,8 +153,8 @@ VALIDATOR_HTTP_PORT = 8888
 # anti-DoS bound on admission and on the submit queue. Grading is what
 # admission actually costs now that the GPU proof is deferred to seal, and a
 # grading attempt is charged only when grading starts, so it is never refunded
-# and discarded queue items never burn one. GPU work is bounded separately, at
-# seal, by MAX_PROOF_ATTEMPTS_PER_WINDOW.
+# and discarded queue items never burn one. It is also the outer bound on GPU
+# proof work at seal: _prove_ranked can prove at most this many candidates.
 MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW = 96
 
 # Absolute server-side bound across active and draining environment queues.
@@ -298,18 +298,15 @@ DIFFICULTY_DELTA = 1.0
 # fastest hardware would otherwise win every one of them.
 MAX_SLOTS_PER_COLDKEY_PER_WINDOW = 2
 
-# Ceiling on GPU proofs spent in one window under the difficulty auction. We prove
-# the ranked candidates top-down and stop as soon as B_BATCH have passed, so the
-# honest cost is exactly B_BATCH. This bounds the dishonest one.
-#
-# A fabricated group ranks at the TOP by construction: the score is computed from
-# the reward vector, and a miner who never runs the model can hand-write a k=2
-# vector, which is the exact peak of v(k). Fabricating cannot earn anything (the
-# proof runs before payment, so he fails and is paid zero), but it can make us
-# spend a proof. This caps that at 16 — and since a hotkey is locked out after
-# MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW=2 failures, burning all 16
-# requires 8 registered hotkeys, which registration cost already taxes.
-MAX_PROOF_ATTEMPTS_PER_WINDOW = 16
+# There is deliberately NO fixed per-window proof-count ceiling. `_prove_ranked`
+# proves ranked candidates top-down until B_BATCH pass. A fixed cap (we tried 16)
+# is worse than none: a fabricated group ranks at the TOP by construction (the
+# score comes from a hand-writable reward vector, peaking at k=2) and fails GRAIL,
+# so a fixed cap is exhausted by fakes BEFORE honest candidates ranked below them
+# are reached — starving the batch. The griefer is bounded instead by the
+# per-hotkey failure cap (each hotkey is skipped after
+# MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW failures = one registration
+# per 2 wasted proofs), and the pool itself by MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW.
 
 # Random non-winners proven each window purely for forensics. Deferring the proof
 # means the authenticity gates (token-auth, distribution, forced-seed) only ever

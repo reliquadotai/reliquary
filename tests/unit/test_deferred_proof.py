@@ -309,45 +309,54 @@ def test_failed_proof_promotes_the_next_ranked():
     assert b.proof_failure_debt("faker") == 1
 
 
-def test_proof_attempts_are_capped():
-    """A griefer fabricates groups that rank at the top and always fail the proof.
-    He costs us at most MAX_PROOF_ATTEMPTS_PER_WINDOW, never more."""
-    from reliquary.constants import (
-        FORENSIC_SAMPLE_PER_WINDOW, MAX_PROOF_ATTEMPTS_PER_WINDOW,
-    )
+def test_fabricated_groups_do_not_starve_honest_fill():
+    """The F2 fix. Many fabricated k=2 groups (the score peak) from DISTINCT
+    hotkeys rank above the honest k=4 groups and each fails GRAIL. With no global
+    proof cap, promote-on-failure keeps going past them and the honest groups
+    still fill the batch. Under the old MAX_PROOF_ATTEMPTS_PER_WINDOW=16 the fakes
+    exhausted the budget first and the honest groups were never reached — this
+    test would have left b.valid_submissions() empty."""
+    from reliquary.constants import B_BATCH
     from tests.unit.test_grpo_window_batcher import (
-        _always_false_grail, _make_batcher, _request,
+        _always_false_grail, _always_true_grail, _make_batcher,
+        _request_with_prompt_unique_tokens,
     )
 
-    proofs = []
+    n_fakes = 20  # deliberately > the old global cap of 16
+    # Prompt indices stay small so prompt_idx*100 tokens fit the test model vocab.
+    honest_prompts = set(range(50, 50 + B_BATCH))
 
-    def _counting_false_grail(commit, model, randomness):
-        proofs.append(1)
+    def _fail_the_fakes(commit, model, randomness):
+        prompt_idx = commit["tokens"][0] // 100
+        if prompt_idx in honest_prompts:
+            return _always_true_grail(commit, model, randomness)
         return _always_false_grail(commit, model, randomness)
 
-    b = _make_batcher(verify_commitment_proofs_fn=_counting_false_grail)
-    for i in range(40):
-        b.accept_submission(_request(prompt_idx=i, hotkey=f"grief{i}"))
+    b = _make_batcher(verify_commitment_proofs_fn=_fail_the_fakes)
+    for i in range(n_fakes):  # distinct hotkeys, so the per-hotkey cap never bites
+        b.accept_submission(_request_with_prompt_unique_tokens(
+            prompt_idx=i, hotkey=f"fake{i}", rewards=[1.0, 1.0] + [0.0] * 6,
+        ))
+    for p in honest_prompts:
+        b.accept_submission(_request_with_prompt_unique_tokens(
+            prompt_idx=p, hotkey=f"honest{p}", rewards=[1.0] * 4 + [0.0] * 4,
+        ))
 
     b.seal_batch()
 
-    assert b.valid_submissions() == []
-    # A failing proof rejects on the first rollout, so each ranked attempt is
-    # one call; the forensic sample (fresh hotkeys, no debt) adds its own
-    # failing attempts on top, outside this budget.
-    assert len(proofs) == MAX_PROOF_ATTEMPTS_PER_WINDOW + FORENSIC_SAMPLE_PER_WINDOW
+    winners = {s.hotkey for s in b.valid_submissions()}
+    assert winners == {f"honest{p}" for p in honest_prompts}
 
 
 def test_single_hotkey_griefer_is_capped_by_per_hotkey_failures():
     """The per-hotkey half of the griefer bound. One hotkey flooding fabricated
     distinct-prompt groups (each ranks at the top by construction) is proven at
     most MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW times, NOT up to the
-    global MAX_PROOF_ATTEMPTS_PER_WINDOW. The debt the failed proofs charge locks
-    the hotkey out of the remaining attempts."""
+    per-hotkey cap. The debt the failed proofs charge locks the hotkey out of the
+    remaining attempts, so the pool size does not matter."""
     from reliquary.constants import (
         FORENSIC_SAMPLE_PER_WINDOW,
         MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW,
-        MAX_PROOF_ATTEMPTS_PER_WINDOW,
     )
     from tests.unit.test_grpo_window_batcher import (
         _always_false_grail, _make_batcher, _request,
@@ -361,7 +370,7 @@ def test_single_hotkey_griefer_is_capped_by_per_hotkey_failures():
 
     b = _make_batcher(verify_commitment_proofs_fn=_counting_false_grail)
     # Many more distinct-prompt groups than the per-hotkey cap, all one hotkey.
-    for i in range(MAX_PROOF_ATTEMPTS_PER_WINDOW + 4):
+    for i in range(20):
         b.accept_submission(_request(prompt_idx=i, hotkey="griefer"))
 
     b.seal_batch()

@@ -26,7 +26,6 @@ from reliquary.constants import (
     MAX_NEW_TOKENS_PROTOCOL_CAP,
     MIN_EOS_PROBABILITY,
     FORENSIC_SAMPLE_PER_WINDOW,
-    MAX_PROOF_ATTEMPTS_PER_WINDOW,
     MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
     MAX_SEAL_QUEUE_DRAIN_SECONDS,
     MAX_SUBMISSIONS_PER_PROMPT,
@@ -508,8 +507,9 @@ class GrpoWindowBatcher:
         # is what fills during the window now: ``valid_count`` only moves at
         # seal, once the ranked candidates have been proven.
         self.pending_count: int = 0
-        # GPU proofs spent by ``_prove_ranked`` this window. Bounded by
-        # MAX_PROOF_ATTEMPTS_PER_WINDOW; telemetry reads it after seal.
+        # GPU proofs spent by ``_prove_ranked`` this window; telemetry reads it
+        # after seal. Bounded by the pending pool (the grading ceiling) and the
+        # per-hotkey failure cap, not a fixed count.
         self.proof_attempts: int = 0
 
         if verify_commitment_proofs_fn is None:
@@ -849,8 +849,8 @@ class GrpoWindowBatcher:
         """Count a zone-valid submission admitted to the pending pool.
 
         Telemetry only. GPU work is bounded at seal instead: ``_prove_ranked``
-        proves at most ``MAX_PROOF_ATTEMPTS_PER_WINDOW`` ranked candidates, and
-        admission itself is bounded by the grading ceiling.
+        proves top-down until ``B_BATCH`` pass, skipping a hotkey after its
+        failure cap, and admission itself is bounded by the grading ceiling.
         """
         with self._proof_counters_lock:
             self._proof_admission_count += 1
@@ -2310,20 +2310,21 @@ class GrpoWindowBatcher:
         for pending in ranked:
             if len(proven) >= B_BATCH:
                 break
-            if attempts >= MAX_PROOF_ATTEMPTS_PER_WINDOW:
-                logger.warning(
-                    "proof_budget_exhausted window=%s proven=%d attempts=%d",
-                    self.window_start, len(proven), attempts,
-                )
-                break
             if pending.prompt_idx in claimed:
                 continue          # one proof per prompt; the top-ranked took it
             if self._cooldown.is_in_cooldown(pending.prompt_idx, self.window_start):
                 continue
-            # Per-hotkey half of the griefer bound. The HTTP admission gate that
-            # used to enforce this is dead under deferred proving (proofs run
-            # after admission closes), so the cap lives here now. _verify_expensive
-            # charges the debt via _reject; we only read it.
+            # The griefer bound. A fabricated group ranks at the top by
+            # construction (its score comes from a hand-writable reward vector) and
+            # fails GRAIL, so without this a griefer could occupy the whole top of
+            # the ranking. There is NO global proof-count cap: one would cut the
+            # loop off before honest candidates ranked below the fakes are reached,
+            # starving the batch. Instead each hotkey is skipped after
+            # MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW failures, so a
+            # griefer pays one registration per 2 wasted proofs while honest fill
+            # always proceeds. The pool itself is bounded by the grading ceiling
+            # (MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW). _verify_expensive charges the
+            # debt via _reject; we only read it.
             if (
                 self.proof_failure_debt(pending.hotkey)
                 >= MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
@@ -2358,10 +2359,8 @@ class GrpoWindowBatcher:
         ``random.sample``: validators must converge on an identical sample, and
         a miner must not be able to predict whether he'll be looked at. Results
         are discarded (never enter ``_valid``, never paid); only the R2-archived
-        outcome is kept. Runs serially and OUTSIDE the
-        ``MAX_PROOF_ATTEMPTS_PER_WINDOW`` budget — that budget bounds a griefer
-        wasting proofs on candidates that could win, this is separate, bounded
-        telemetry work.
+        outcome is kept. Runs serially, a bounded constant
+        ``FORENSIC_SAMPLE_PER_WINDOW`` of extra proofs on top of the ranked pass.
         """
         with self._lock:
             remainder = [
