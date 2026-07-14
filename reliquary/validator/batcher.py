@@ -258,6 +258,37 @@ _PROOF_FAILURE_DEBT_STAGES = frozenset(
 
 
 @dataclass
+class PendingSubmission:
+    """A submission that passed every CHEAP check and has been graded, but has
+    NOT been proven on the GPU yet.
+
+    The proof (5-25 s of GPU, under ``_lock``) is the most expensive thing the
+    validator does, and today we spend it on every admitted submission — ~19 per
+    window, to keep 8. Since the score depends only on the rewards, we can rank
+    first and prove only the candidates that can actually win. A submission that
+    cannot reach the top B is never proven.
+
+    Fabricated groups DO rank at the top (a miner who never runs the model can
+    hand-write a k=2 reward vector). That is safe: the proof still runs before
+    anyone is paid, so fabricating earns zero. See the spec §7.
+    """
+
+    hotkey: str
+    prompt_idx: int
+    request: Any
+    rewards: list[float]
+    drand_round: int
+    merkle_root: bytes
+    selection_digest: bytes
+    arrived_at: float = 0.0
+    telemetry: Any = None
+    value: float = field(init=False, default=0.0)
+
+    def __post_init__(self):
+        self.value = submission_value(self.rewards)
+
+
+@dataclass
 class ValidSubmission:
     """A submission that passed all v2 verification checks."""
 
