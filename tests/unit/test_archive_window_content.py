@@ -130,6 +130,26 @@ async def test_archive_includes_prompt_and_rollout_content():
             "selection_reason": "same_trigger_round_lost_canonical_ordering",
         },
     }
+    batcher.difficulty_auction_metadata_by_id = {
+        id(batch[0]): {
+            "value": 0.25,
+            "mean_reward": 0.5,
+            "rank": 2,
+            "shadow_selected": True,
+        },
+        id(runner): {
+            "value": 0.25,
+            "mean_reward": 0.5,
+            "rank": 3,
+            "shadow_selected": False,
+        },
+    }
+    batcher.difficulty_auction_shadow = {
+        "schema_version": 1,
+        "status": "computed",
+        "mode": "observation_only",
+        "production_changed": False,
+    }
 
     captured = {}
 
@@ -188,6 +208,10 @@ async def test_archive_includes_prompt_and_rollout_content():
     assert entry0["merkle_root"] == "ab" * 32
     assert entry0["selection_digest"] == "ab" * 32
     assert entry0["claimed_checkpoint_hash"] == "sha256:fake"
+    assert entry0["difficulty_auction_value"] == pytest.approx(0.25)
+    assert entry0["difficulty_auction_mean_reward"] == pytest.approx(0.5)
+    assert entry0["difficulty_auction_rank"] == 2
+    assert entry0["difficulty_auction_selected"] is True
 
     # eos detection: rollout 0 of entry 0 ends with eos_token_id=99 → True.
     assert entry0["rollouts"][0]["eos_terminated"] is True
@@ -209,7 +233,15 @@ async def test_archive_includes_prompt_and_rollout_content():
     assert ru["selection_digest"] == "ab" * 32
     assert "rollouts" not in ru and "prompt" not in ru  # metadata only
     assert ru["rollout_hashes"] == [h.hex() for h in runner.rollout_hashes]
+    assert ru["difficulty_auction_rank"] == 3
+    assert ru["difficulty_auction_selected"] is False
     assert archive["rewarded_but_not_selected_by_hotkey"] == {"hk_runner": 1}
+    assert archive["difficulty_auction_shadow"]["fake"] == {
+        "schema_version": 1,
+        "status": "computed",
+        "mode": "observation_only",
+        "production_changed": False,
+    }
 
     # reject_summary persisted from batcher.
     assert archive["reject_summary"] == {

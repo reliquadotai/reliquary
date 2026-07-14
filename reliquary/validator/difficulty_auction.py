@@ -38,7 +38,8 @@ class DifficultyScore:
 class ShadowCandidate:
     submission: Any
     score: DifficultyScore
-    rank: int
+    rank: int | None
+    eligible: bool
     selected: bool
     operator_id: str | None
 
@@ -183,15 +184,20 @@ def select_shadow_auction(
             if operator is not None:
                 slots_by_operator[operator] += 1
 
+    ranks = {
+        id(submission): rank
+        for rank, (submission, _score) in enumerate(ranked, start=1)
+    }
     candidates = tuple(
         ShadowCandidate(
             submission=submission,
             score=score,
-            rank=rank,
+            rank=ranks.get(id(submission)),
+            eligible=id(submission) in ranks,
             selected=id(submission) in selected_ids,
             operator_id=operator_ids.get(id(submission)),
         )
-        for rank, (submission, score) in enumerate(ranked, start=1)
+        for submission, score in scored
     )
     return ShadowAuctionResult(
         candidates=candidates,

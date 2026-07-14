@@ -1367,6 +1367,14 @@ class ValidationService:
         def _submission_obs_payload(s, batcher, *, rejected: bool = False):
             selection_meta = getattr(batcher, "selection_metadata_by_id", {})
             meta = selection_meta.get(id(s), {})
+            difficulty_by_id = getattr(
+                batcher, "difficulty_auction_metadata_by_id", {}
+            )
+            difficulty_meta = (
+                difficulty_by_id.get(id(s), {})
+                if isinstance(difficulty_by_id, dict)
+                else {}
+            )
             return {
                 "arrival_ts": getattr(s, "arrival_ts", None),
                 "decision_ts": getattr(s, "decision_ts", None),
@@ -1395,6 +1403,24 @@ class ValidationService:
                 "reward_vector": getattr(s, "reward_vector", None),
                 "truncated_count": getattr(s, "truncated_count", None),
                 "reward_shape": getattr(s, "reward_shape", None),
+                "difficulty_auction_value": difficulty_meta.get("value"),
+                "difficulty_auction_mean_reward": difficulty_meta.get(
+                    "mean_reward"
+                ),
+                "difficulty_auction_rank": difficulty_meta.get("rank"),
+                "difficulty_auction_selected": difficulty_meta.get(
+                    "shadow_selected"
+                ),
+            }
+
+        def _difficulty_shadow_payload(batcher):
+            payload = getattr(batcher, "difficulty_auction_shadow", None)
+            if isinstance(payload, dict):
+                return payload
+            return {
+                "schema_version": 1,
+                "status": "unavailable",
+                "mode": "observation_only",
             }
 
         def _rollout_payload(s, with_text: bool):
@@ -1621,6 +1647,10 @@ class ValidationService:
             "reject_summary": combined_reject_counts,
             "server_reject_summary": server_reject_summary,
             "logical_group_dedup": logical_group_dedup,
+            "difficulty_auction_shadow": {
+                env_name: _difficulty_shadow_payload(env_batcher)
+                for env_name, env_batcher in batcher_dict.items()
+            },
             "grader_failures": dict(getattr(self, "_grader_failures", {})),
             "rejected": rejected_entries,
             "training_quarantine": getattr(
