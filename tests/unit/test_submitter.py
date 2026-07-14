@@ -13,6 +13,7 @@ from reliquary.miner.submitter import (
     NoValidatorFoundError,
     SubmissionError,
     discover_validator_url,
+    get_runtime_contract_v1,
     get_window_state_v2,
     submit_batch_v2,
 )
@@ -22,8 +23,11 @@ from reliquary.protocol.submission import (
     GrpoBatchState,
     RejectReason,
     RolloutSubmission,
+    RuntimeContract,
+    RuntimeFingerprint,
     WindowState,
 )
+from reliquary.shared.runtime_fingerprint import collect_runtime_fingerprint
 
 
 # --------------------- discover_validator_url ---------------------
@@ -188,6 +192,30 @@ async def test_get_window_state_v2_passes_env_query_param(monkeypatch):
     # No env → no query param (backward compatible).
     await get_window_state_v2("http://fake", client=client)
     assert "?" not in seen["url"]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_get_runtime_contract_v1_uses_separate_capability_endpoint(
+    monkeypatch,
+):
+    contract = RuntimeContract(
+        validator_profile=RuntimeFingerprint.model_validate(
+            collect_runtime_fingerprint()
+        )
+    )
+    seen = {}
+
+    async def _get(self, url, timeout=None):
+        seen["url"] = url
+        return httpx.Response(200, json=contract.model_dump(mode="json"))
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", _get)
+    client = httpx.AsyncClient()
+    result = await get_runtime_contract_v1("http://fake", client=client)
+
+    assert seen["url"] == "http://fake/runtime-contract"
+    assert result.telemetry_version == 1
     await client.aclose()
 
 

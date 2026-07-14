@@ -129,6 +129,14 @@ def summarize(rows: list[dict]) -> dict:
         if item.get("first_hard_mismatch_offset") is not None
         and item.get("first_repeated_ngram_offset") is not None
     ]
+    runtime_profiles: dict[str, list[dict]] = defaultdict(list)
+    runtime_profile_details: dict[str, dict] = {}
+    for row in v4:
+        profile = row.get("runtime_profile") or {}
+        profile_hash = str(profile.get("profile_hash") or "unreported")
+        runtime_profiles[profile_hash].append(row)
+        if profile_hash != "unreported":
+            runtime_profile_details[profile_hash] = profile
 
     return {
         "records_total": len(rows),
@@ -249,6 +257,39 @@ def summarize(rows: list[dict]) -> dict:
                 for item in directionality
             ),
         },
+        "by_runtime_profile_schema_v4": sorted(
+            (
+                {
+                    "profile_hash": profile_hash,
+                    "records": len(items),
+                    "n_positions": sum(
+                        int(item.get("n_positions", 0) or 0)
+                        for item in items
+                    ),
+                    "n_hard_mismatch": sum(
+                        int(item.get("n_hard_mismatch", 0) or 0)
+                        for item in items
+                    ),
+                    "torch_version": runtime_profile_details.get(
+                        profile_hash, {}
+                    ).get("torch_version"),
+                    "transformers_version": runtime_profile_details.get(
+                        profile_hash, {}
+                    ).get("transformers_version"),
+                    "fla_version": runtime_profile_details.get(
+                        profile_hash, {}
+                    ).get("fla_version"),
+                    "causal_conv1d_version": runtime_profile_details.get(
+                        profile_hash, {}
+                    ).get("causal_conv1d_version"),
+                    "qwen35_fast_path_all": runtime_profile_details.get(
+                        profile_hash, {}
+                    ).get("qwen35_fast_path_all"),
+                }
+                for profile_hash, items in runtime_profiles.items()
+            ),
+            key=lambda item: (-item["records"], item["profile_hash"]),
+        ),
         "decision": decision,
         "activation_rule": (
             "Do not set FORCED_SEED_CDF_ENFORCE=true until at least 24h, "
@@ -308,7 +349,8 @@ def main() -> None:
         "v4 causal telemetry: "
         f"{report['rollouts_schema_v4']} rollouts; "
         f"{report['directionality_schema_v4']['both_offsets_observed']} "
-        "with both CDF and repetition onsets"
+        "with both CDF and repetition onsets; "
+        f"{len(report['by_runtime_profile_schema_v4'])} runtime profiles"
     )
     print(report["activation_rule"])
 

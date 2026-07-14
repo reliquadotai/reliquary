@@ -20,6 +20,7 @@ from reliquary.protocol.submission import (
     BatchSubmissionResponse,
     GrpoBatchState,
     RejectReason,
+    RuntimeContract,
 )
 
 logger = logging.getLogger(__name__)
@@ -204,4 +205,18 @@ async def get_window_state_v2(
         client=client, timeout=timeout,
     )
 
+
+async def get_runtime_contract_v1(
+    url: str,
+    *,
+    client: httpx.AsyncClient | None = None,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> RuntimeContract:
+    """Discover optional runtime telemetry without changing legacy `/state`."""
+    return await _get_with_retry(
+        f"{url}/runtime-contract",
+        RuntimeContract,
+        client=client,
+        timeout=timeout,
+    )
 

@@ -64,6 +64,14 @@ def test_report_holds_immediately_when_small_sample_has_hard_mismatch():
 def test_report_correlates_cdf_onset_with_repetition_by_termination_path():
     row = _row(0)
     row["schema_version"] = 4
+    row["runtime_profile"] = {
+        "profile_hash": "ab" * 32,
+        "torch_version": "2.7.0+cu128",
+        "transformers_version": "5.9.0",
+        "fla_version": "0.5.0",
+        "causal_conv1d_version": None,
+        "qwen35_fast_path_all": False,
+    }
     row["per_rollout"] = [
         {
             "termination_path": "forced_phase2_eos",
@@ -100,3 +108,7 @@ def test_report_correlates_cdf_onset_with_repetition_by_termination_path():
         item["termination_path"]
         for item in report["by_termination_path_schema_v4"]
     } == {"forced_phase2_eos", "phase1_eos"}
+    runtime = report["by_runtime_profile_schema_v4"][0]
+    assert runtime["profile_hash"] == "ab" * 32
+    assert runtime["n_hard_mismatch"] == 0
+    assert runtime["fla_version"] == "0.5.0"

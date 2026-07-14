@@ -262,6 +262,7 @@ def record_forced_seed_shadow(
     ratio_rollout_would_reject: bool = False,
     cdf_would_reject: bool = False,
     cdf_enforced: bool = False,
+    runtime_profile: dict[str, Any] | None = None,
     path: str | Path | None = None,
 ) -> None:
     """Append one local JSONL record per forced-seed group verdict.
@@ -313,6 +314,7 @@ def record_forced_seed_shadow(
             "ratio_rollout_would_reject": bool(ratio_rollout_would_reject),
             "cdf_would_reject": bool(cdf_would_reject),
             "cdf_enforced": bool(cdf_enforced),
+            "runtime_profile": dict(runtime_profile or {}),
             "per_rollout": list(per_rollout or []),
         }
         with open(out_path, "a", encoding="utf-8") as f:

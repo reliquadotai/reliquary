@@ -1944,6 +1944,11 @@ class GrpoWindowBatcher:
             ratio_rollout_would_reject=rollout_would_reject,
             cdf_would_reject=cdf_would_reject,
             cdf_enforced=cdf_enforce,
+            runtime_profile=(
+                request.runtime_fingerprint.model_dump(mode="json")
+                if request.runtime_fingerprint is not None
+                else None
+            ),
         )
         if group_reject or rollout_reject or cdf_reject:
             if cdf_reject:
