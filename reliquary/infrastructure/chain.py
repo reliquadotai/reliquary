@@ -71,15 +71,23 @@ async def get_current_block(subtensor) -> int:
     return await asyncio.wait_for(subtensor.get_current_block(), timeout=CHAIN_READ_TIMEOUT)
 
 
-async def blocks_until_next_epoch(subtensor, netuid: int) -> int | None:
+async def blocks_until_next_epoch(
+    subtensor,
+    netuid: int,
+    *,
+    block: int | None = None,
+) -> int | None:
     """Blocks remaining in the current epoch for ``netuid``.
 
     All validators of the same netuid see the same boundary because the
     underlying SDK formula is purely a function of (netuid, current_block,
-    tempo). Used by ``WeightOnlyValidator.run()`` to sync weight submissions.
+    tempo). Passing ``block`` pins the calculation to the same chain snapshot
+    used to derive the epoch identifier, avoiding a boundary race between two
+    independent head reads.
     """
+    kwargs = {"block": block} if block is not None else {}
     return await asyncio.wait_for(
-        subtensor.blocks_until_next_epoch(netuid),
+        subtensor.blocks_until_next_epoch(netuid, **kwargs),
         timeout=CHAIN_READ_TIMEOUT,
     )
 

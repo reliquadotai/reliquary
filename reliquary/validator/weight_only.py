@@ -68,14 +68,17 @@ class WeightOnlyValidator:
                 try:
                     if subtensor is None:
                         subtensor = await chain.get_subtensor()
+                    # Read the head once and pin the epoch calculation to that
+                    # block. Separate head reads can straddle a boundary and
+                    # manufacture a second epoch id for the same epoch.
+                    current_block = await chain.get_current_block(subtensor)
                     blocks_until = await chain.blocks_until_next_epoch(
-                        subtensor, self.netuid,
+                        subtensor, self.netuid, block=current_block,
                     )
                     if blocks_until is None:
                         logger.warning("blocks_until_next_epoch returned None — retrying")
                         await asyncio.sleep(POLL_INTERVAL_SECONDS)
                         continue
-                    current_block = await chain.get_current_block(subtensor)
                     # Stable per-epoch identifier: the absolute block number of the
                     # next epoch boundary stays constant for every poll inside the
                     # current epoch (current_block + blocks_until is invariant).
@@ -93,6 +96,14 @@ class WeightOnlyValidator:
 
                     submitted = await self.submit_once()
                     self._last_submit_epoch = current_epoch_id
+                    logger.info(
+                        "Weight epoch attempt: epoch=%d snapshot_block=%d "
+                        "blocks_until=%d success=%s",
+                        current_epoch_id,
+                        current_block,
+                        blocks_until,
+                        submitted,
+                    )
                     if not submitted:
                         logger.warning(
                             "set_weights attempt for epoch %d failed; "
