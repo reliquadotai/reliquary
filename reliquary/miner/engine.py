@@ -423,9 +423,10 @@ class MiningEngine:
                     contract.telemetry_version,
                     contract.validator_profile.profile_hash,
                 )
-            except SubmissionError:
-                # Older validators do not expose the capability. Omitting the
-                # optional request field preserves their strict wire schema.
+            except (SubmissionError, ValueError):
+                # Older validators may omit the capability or expose an older
+                # telemetry schema. Omitting the optional request field keeps
+                # mining wire-compatible in both cases.
                 logger.info("validator runtime telemetry unavailable")
             while True:
                 try:

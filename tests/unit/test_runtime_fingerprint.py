@@ -70,7 +70,8 @@ def test_validator_exposes_runtime_contract_outside_legacy_state():
     health = client.get("/health")
 
     assert contract.status_code == 200
-    assert contract.json()["telemetry_version"] == 1
+    assert contract.json()["telemetry_version"] == 2
+    assert "fla_core_version" in contract.json()["validator_profile"]
     assert len(contract.json()["validator_profile"]["profile_hash"]) == 64
     assert health.json()["runtime_fingerprint"]["profile_hash"] == (
         contract.json()["validator_profile"]["profile_hash"]

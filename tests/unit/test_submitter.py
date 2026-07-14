@@ -215,7 +215,7 @@ async def test_get_runtime_contract_v1_uses_separate_capability_endpoint(
     result = await get_runtime_contract_v1("http://fake", client=client)
 
     assert seen["url"] == "http://fake/runtime-contract"
-    assert result.telemetry_version == 1
+    assert result.telemetry_version == 2
     await client.aclose()
 
 

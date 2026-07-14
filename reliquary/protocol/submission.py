@@ -139,12 +139,13 @@ class RuntimeFingerprint(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     python_version: str = Field(..., max_length=64)
     platform: str = Field(..., max_length=64)
     torch_version: str | None = Field(default=None, max_length=128)
     transformers_version: str | None = Field(default=None, max_length=128)
     fla_version: str | None = Field(default=None, max_length=128)
+    fla_core_version: str | None = Field(default=None, max_length=128)
     causal_conv1d_version: str | None = Field(default=None, max_length=128)
     flash_attn_version: str | None = Field(default=None, max_length=128)
     cuda_version: str | None = Field(default=None, max_length=64)
@@ -182,7 +183,7 @@ class RuntimeContract(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    telemetry_version: Literal[1] = 1
+    telemetry_version: Literal[2] = 2
     validator_profile: RuntimeFingerprint
 
 

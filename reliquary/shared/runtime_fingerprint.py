@@ -135,12 +135,13 @@ def collect_runtime_fingerprint(
         tf32_matmul = False
 
     profile: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "python_version": platform.python_version(),
         "platform": platform.system().lower(),
         "torch_version": torch_version,
         "transformers_version": _distribution_version("transformers"),
         "fla_version": _distribution_version("flash-linear-attention"),
+        "fla_core_version": _distribution_version("fla-core"),
         "causal_conv1d_version": _distribution_version("causal-conv1d"),
         "flash_attn_version": _distribution_version("flash-attn"),
         "cuda_version": cuda_version,
