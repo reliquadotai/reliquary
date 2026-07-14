@@ -56,6 +56,11 @@ def main() -> None:
             config["generation_use_cache"],
             config.get("bft_thinking_budget", 0),
             config.get("bft_answer_budget", 0),
+            config.get("verification_dtype", config["dtype"]),
+            config.get(
+                "verification_attn_implementation",
+                config.get("attn_implementation"),
+            ),
         )
         groups[key].append(artifact)
 
@@ -117,6 +122,8 @@ def main() -> None:
                 "generation_use_cache": key[4],
                 "bft_thinking_budget": key[5],
                 "bft_answer_budget": key[6],
+                "verification_dtype": key[7],
+                "verification_attn_implementation": key[8],
                 "replicates": len(runs),
                 "runtime_profile_hashes": sorted(
                     {a["runtime_profile"]["profile_hash"] for a in runs}
@@ -195,6 +202,8 @@ def main() -> None:
                 "generation_use_cache",
                 "bft_thinking_budget",
                 "bft_answer_budget",
+                "verification_dtype",
+                "verification_attn_implementation",
             )
             if any(
                 left_config.get(field, 0) != right_config.get(field, 0)

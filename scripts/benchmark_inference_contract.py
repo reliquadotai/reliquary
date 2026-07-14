@@ -82,6 +82,15 @@ def main() -> None:
     )
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--attn-implementation", default="flash_attention_2")
+    parser.add_argument(
+        "--verification-dtype",
+        choices=("bfloat16", "float16", "float32"),
+        help="Load a separate validator-style model at this dtype.",
+    )
+    parser.add_argument(
+        "--verification-attn-implementation",
+        help="Attention implementation for the separate verification model.",
+    )
     parser.add_argument("--generation-use-cache", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--deterministic-algorithms", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--cudnn-benchmark", action=argparse.BooleanOptionalAction, default=False)
@@ -145,6 +154,22 @@ def main() -> None:
         torch_dtype=_dtype(torch, args.dtype),
         attn_implementation=args.attn_implementation,
     ).to(device).eval()
+    verification_dtype = args.verification_dtype or args.dtype
+    verification_attention = (
+        args.verification_attn_implementation or args.attn_implementation
+    )
+    if (
+        verification_dtype == args.dtype
+        and verification_attention == args.attn_implementation
+    ):
+        verification_model = model
+    else:
+        verification_model = load_text_generation_model(
+            args.model,
+            revision=args.model_revision,
+            torch_dtype=_dtype(torch, verification_dtype),
+            attn_implementation=verification_attention,
+        ).to(device).eval()
     eos_ids = resolve_eos_token_ids(model, tokenizer)
     pad_token_id = getattr(tokenizer, "pad_token_id", None)
     if pad_token_id is None:
@@ -247,7 +272,7 @@ def main() -> None:
             verify_started = time.perf_counter()
             with torch.no_grad():
                 _, logits = forward_single_layer(
-                    model, full_ids, None, LAYER_INDEX,
+                    verification_model, full_ids, None, LAYER_INDEX,
                 )
             logits_slice = logits[
                 0,
@@ -371,12 +396,16 @@ def main() -> None:
             "bft_answer_budget": args.bft_answer_budget,
             "dtype": args.dtype,
             "attn_implementation": args.attn_implementation,
+            "verification_dtype": verification_dtype,
+            "verification_attn_implementation": verification_attention,
             "generation_use_cache": args.generation_use_cache,
             "deterministic_algorithms": args.deterministic_algorithms,
             "cudnn_benchmark": args.cudnn_benchmark,
             "allow_tf32": args.allow_tf32,
         },
-        "runtime_profile": collect_runtime_fingerprint(model, model),
+        "runtime_profile": collect_runtime_fingerprint(
+            model, verification_model,
+        ),
         "summary": {
             "prompts": len(prompts),
             "rollouts": len(rows),
