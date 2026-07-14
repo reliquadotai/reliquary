@@ -660,12 +660,13 @@ class ValidationService:
             await chain.close_subtensor(subtensor)
 
     def _proof_admission_exhausted_and_drained(self, batcher) -> bool:
-        """True when bounded proof admission cannot fill this window anymore.
+        """True when bounded admission cannot fill this window anymore.
 
-        Gated on the grading-attempts ceiling, not the GRAIL candidate budget:
-        out_of_zone rejects refund the latter, so for a degenerate-reward env
-        it never reaches its cap — the real "can't fill anymore" signal is the
-        never-refunded grading ceiling.
+        Gated on the never-refunded grading ceiling — the only per-window
+        admission budget left. Once it is spent and nothing is queued or in
+        flight, no further submission can be admitted, so a window still short
+        of B distinct prompts will never reach it: force-seal instead of idling
+        to the window timeout.
         """
         if batcher is None or batcher.is_sealed():
             return False

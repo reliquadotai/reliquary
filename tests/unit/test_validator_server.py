@@ -651,9 +651,6 @@ def test_health_exposes_each_environment_window_independently():
         "seconds_since_last_valid_submission": None,
         "proof_admission_count": 4,
         "proof_grading_attempts": 4,
-        "pending_proof_reservations": 0,
-        "inflight_proof_reservations": 0,
-        "post_trigger_proof_admission_count": 0,
     }
     code_health = health["window_environments"]["opencodeinstruct"]
     assert code_health["valid_submissions_count"] == 8
@@ -839,7 +836,7 @@ def test_submit_returns_submitted_under_worker_path():
     assert body["reason"] == "submitted"
 
 
-def test_full_server_queue_returns_pending_proof_reservation():
+def test_full_server_queue_rejects_without_charging_grading():
     import asyncio
     from reliquary.protocol.submission import WindowState
 
@@ -856,7 +853,6 @@ def test_full_server_queue_returns_pending_proof_reservation():
     )
 
     assert response.json()["reason"] == RejectReason.BATCH_FILLED.value
-    assert batcher.pending_proof_reservations == 0
     assert batcher.proof_grading_attempts == 0
 
 
@@ -888,7 +884,6 @@ async def test_worker_drops_late_items_for_stale_batcher():
     # one for the new batcher.
     server.set_active_batcher(new_batcher)
     old_request = _request(prompt_idx=11)
-    assert old_batcher.try_reserve_proof_admission(old_request) == (True, None)
     await server._submit_queue.put((old_request, old_batcher))
     await server._submit_queue.put((_request(prompt_idx=22), new_batcher))
 
@@ -909,5 +904,4 @@ async def test_worker_drops_late_items_for_stale_batcher():
     assert accept_calls == [22], (
         f"expected only prompt 22 to be processed, got {accept_calls}"
     )
-    assert old_batcher.pending_proof_reservations == 0
     assert old_batcher.proof_grading_attempts == 0

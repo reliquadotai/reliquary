@@ -122,7 +122,7 @@ def _setup(*,
     return s, batcher
 
 
-class _ProofAdmissionFullBatcher:
+class _GradingBudgetFullBatcher:
     window_start = 500
     current_checkpoint_hash = "sha256:current"
     cooldown_prompts_snapshot: list[int] = []
@@ -130,7 +130,7 @@ class _ProofAdmissionFullBatcher:
     _seal_trigger_round = 123
     drand_round_check_enabled = False
     proof_admission_count = 32
-    post_trigger_proof_admission_count = 8
+    proof_grading_attempts = 96
 
     class _Env:
         def __len__(self):
@@ -145,11 +145,11 @@ class _ProofAdmissionFullBatcher:
     def prompt_submission_count(self, prompt_idx: int) -> int:
         return 0
 
-    def try_reserve_proof_admission(self, request):
-        return False, "proof_admission_window_full"
+    def grading_budget_exhausted(self) -> bool:
+        return True
 
     def accept_submission(self, request, *, telemetry=None):  # pragma: no cover
-        raise AssertionError("proof-admission reject must happen pre-queue")
+        raise AssertionError("grading-budget reject must happen pre-queue")
 
 
 class _PreflightAdmissionBatcher:
@@ -160,7 +160,7 @@ class _PreflightAdmissionBatcher:
     _seal_trigger_round = None
     drand_round_check_enabled = False
     proof_admission_count = 0
-    post_trigger_proof_admission_count = 0
+    proof_grading_attempts = 0
     bootstrap = False
 
     class _Env:
@@ -195,9 +195,9 @@ class _PreflightAdmissionBatcher:
     def prompt_submission_count(self, prompt_idx: int) -> int:
         return 0
 
-    def try_reserve_proof_admission(self, request):
-        self.proof_admission_count += 1
-        return True, None
+    def grading_budget_exhausted(self) -> bool:
+        self.proof_admission_count += 1   # fake: "the request reached admission"
+        return False
 
     def accept_submission(self, request, *, telemetry=None):
         return BatchSubmissionResponse(
@@ -315,13 +315,13 @@ def test_prompt_full_below_cap_passes():
     assert r.json()["reason"] == RejectReason.ACCEPTED.value
 
 
-def test_proof_admission_full_rejected_pre_queue():
-    """When the global proof budget is exhausted, /submit must reject before
+def test_grading_budget_full_rejected_pre_queue():
+    """When the window's grading budget is exhausted, /submit must reject before
     queueing or running the batcher's expensive accept path.
     """
     s = ValidatorServer()
     s.set_current_state(WindowState.OPEN)
-    s.set_active_batcher(_ProofAdmissionFullBatcher())
+    s.set_active_batcher(_GradingBudgetFullBatcher())
     s._worker_task = object()
     payload = _submission_with_completion_tokens(
         list(range(4, 36)),
@@ -332,7 +332,7 @@ def test_proof_admission_full_rejected_pre_queue():
     _assert_pre_queue_reject(s, payload, RejectReason.BATCH_FILLED)
     verdicts = list(s._verdicts.get("hkA", []))
     assert verdicts
-    assert verdicts[-1]["reject_stage"] == "proof_admission"
+    assert verdicts[-1]["reject_stage"] == "grading_budget"
 
 
 def test_non_cap_non_eos_rejected_before_proof_admission():

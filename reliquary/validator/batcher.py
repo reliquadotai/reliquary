@@ -26,7 +26,6 @@ from reliquary.constants import (
     MAX_NEW_TOKENS_PROTOCOL_CAP,
     MIN_EOS_PROBABILITY,
     FORENSIC_SAMPLE_PER_WINDOW,
-    MAX_POST_TRIGGER_PROOF_CANDIDATES,
     MAX_PROOF_ATTEMPTS_PER_WINDOW,
     MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
     MAX_SEAL_QUEUE_DRAIN_SECONDS,
@@ -612,26 +611,15 @@ class GrpoWindowBatcher:
         # before the batch is sealed.
         self._queue_drained_predicate = queue_drained_predicate
         self.force_seal_reason: str | None = None
-        # Proof-admission accounting is separate from ``_lock`` because the
-        # submit worker holds ``_lock`` during GRAIL. The HTTP cheap path must
-        # be able to reject over-budget submissions without waiting behind the
-        # very GPU work it is trying to bound. Counts are reservations for
-        # expensive verification attempts, not successful accepts.
-        self._proof_admission_lock = threading.Lock()
+        # Proof counters live under their own lock, not ``_lock``: the HTTP
+        # cheap path reads the grading ceiling while the submit worker holds
+        # ``_lock`` for a whole grading pass.
+        self._proof_counters_lock = threading.Lock()
         self._proof_admission_count = 0
-        # Total grading attempts that actually started this window. Pending
-        # queue reservations are tracked separately so a request discarded on
-        # seal/window swap does not permanently consume work that never ran.
-        # Started attempts are never refunded.
+        # Grading attempts that actually started this window, never refunded.
+        # Grading (env reward, sandboxed for code) is the real admission cost
+        # now that the GPU proof is deferred to seal.
         self._proof_grading_attempts = 0
-        self._pending_proof_reservations: dict[
-            int, tuple[BatchSubmissionRequest, str, bool]
-        ] = {}
-        self._inflight_proof_reservations: dict[
-            int, tuple[BatchSubmissionRequest, str, bool]
-        ] = {}
-        self._pending_post_trigger_proof_reservations = 0
-        self._post_trigger_proof_admission_count = 0
         self._expensive_proof_failures_by_hotkey: dict[str, int] = {}
         # v2.1: checkpoint hash miners must match. Empty string disables
         # the gate (test convenience / pre-first-publish).
@@ -761,36 +749,13 @@ class GrpoWindowBatcher:
 
     @property
     def proof_admission_count(self) -> int:
-        """Live GRAIL candidate budget usage (refunded on OUT_OF_ZONE)."""
+        """Zone-valid submissions admitted to the pending pool (telemetry)."""
         return self._proof_admission_count
 
     @property
     def proof_grading_attempts(self) -> int:
         """Total grading attempts started this window (never refunded)."""
         return self._proof_grading_attempts
-
-    @property
-    def pending_proof_reservations(self) -> int:
-        return len(self._pending_proof_reservations)
-
-    @property
-    def inflight_proof_reservations(self) -> int:
-        return len(self._inflight_proof_reservations)
-
-    @property
-    def proof_grading_capacity_used(self) -> int:
-        """Started attempts plus pending reservations used for admission."""
-        return self._proof_grading_attempts + len(
-            self._pending_proof_reservations
-        )
-
-    @property
-    def post_trigger_proof_admission_count(self) -> int:
-        """Started plus pending proof work from the seal-trigger round."""
-        return (
-            self._post_trigger_proof_admission_count
-            + self._pending_post_trigger_proof_reservations
-        )
 
     @property
     def expensive_proof_failures_by_hotkey(self) -> dict[str, int]:
@@ -850,141 +815,44 @@ class GrpoWindowBatcher:
         """Make a reservation permanent for the rest of this window."""
         request._logical_group_reservation = None
 
-    def try_reserve_proof_admission(
-        self,
-        request: BatchSubmissionRequest,
-    ) -> tuple[bool, str | None]:
-        """Reserve a *grading* slot for this window (the anti-DoS bound).
+    def grading_budget_exhausted(self) -> bool:
+        """True when this window's grading ceiling is spent.
 
-        Admission is gated by started work plus pending reservations, the
-        post-trigger straggler cap and per-hotkey proof-failure debt. A pending
-        reservation can be cancelled if the queue item never starts; once
-        started, its grading attempt is never refunded.
-        There is no separate GRAIL/GPU candidate budget: the drand-anchored
-        seal, this grading ceiling and the seal drain timeout already bound the
-        GPU work per window, so a zone-valid submission entering the proof is
-        only counted for telemetry, never rejected on a candidate budget.
+        Cheap read for the HTTP pre-queue reject, so a flood stops entering the
+        submit queue at all. The authoritative charge is
+        ``_charge_grading_attempt`` inside ``_accept_locked``, where grading
+        actually runs; a few racers may slip past this read and are rejected
+        there.
         """
-        with self._proof_admission_lock:
-            reservation_id = id(request)
-            if (
-                reservation_id in self._pending_proof_reservations
-                or reservation_id in self._inflight_proof_reservations
-            ):
-                return False, "proof_reservation_duplicate"
+        with self._proof_counters_lock:
+            return (
+                self._proof_grading_attempts
+                >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+            )
 
-            if (
-                self._expensive_proof_failures_by_hotkey.get(
-                    request.miner_hotkey, 0
-                )
-                >= MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
-            ):
-                return False, "proof_failure_debt_hotkey"
+    def _charge_grading_attempt(self) -> bool:
+        """Charge one grading attempt; False when the ceiling is already spent.
 
+        Never refunded: it is charged where grading starts, so work that never
+        ran (queue drop, seal, window swap) never consumes it.
+        """
+        with self._proof_counters_lock:
             if (
                 self._proof_grading_attempts
-                + len(self._pending_proof_reservations)
                 >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
             ):
-                return False, "proof_grading_attempts_full"
-
-            trigger_round = self._seal_trigger_round
-            is_post_trigger = (
-                trigger_round is not None
-                and request.drand_round == trigger_round
-            )
-            if is_post_trigger:
-                if (
-                    self._post_trigger_proof_admission_count
-                    + self._pending_post_trigger_proof_reservations
-                    >= MAX_POST_TRIGGER_PROOF_CANDIDATES
-                ):
-                    return False, "proof_admission_post_trigger_full"
-                self._pending_post_trigger_proof_reservations += 1
-
-            self._pending_proof_reservations[reservation_id] = (
-                request,
-                request.miner_hotkey,
-                is_post_trigger,
-            )
-            return True, None
-
-    def start_proof_admission(
-        self,
-        request: BatchSubmissionRequest,
-    ) -> tuple[bool, str | None]:
-        """Move one pending reservation into irreversible started work."""
-        with self._proof_admission_lock:
-            reservation_id = id(request)
-            reservation = self._pending_proof_reservations.pop(
-                reservation_id, None,
-            )
-            if reservation is None:
-                # Compatibility for direct/legacy worker injection. Production
-                # requests always reserve in the HTTP path first.
-                if (
-                    self._proof_grading_attempts
-                    >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
-                ):
-                    return False, "proof_grading_attempts_full"
-                reservation = (request, request.miner_hotkey, False)
-
-            _, hotkey, is_post_trigger = reservation
-            if is_post_trigger:
-                self._pending_post_trigger_proof_reservations = max(
-                    0,
-                    self._pending_post_trigger_proof_reservations - 1,
-                )
-
-            # A burst may have queued several requests before the first two
-            # failures established debt. Re-check at dequeue so the remainder
-            # cannot bypass the per-hotkey circuit breaker.
-            if (
-                self._expensive_proof_failures_by_hotkey.get(hotkey, 0)
-                >= MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
-            ):
-                return False, "proof_failure_debt_hotkey"
-
-            self._proof_grading_attempts += 1
-            if is_post_trigger:
-                self._post_trigger_proof_admission_count += 1
-            self._inflight_proof_reservations[reservation_id] = reservation
-            return True, None
-
-    def cancel_proof_admission(self, request: BatchSubmissionRequest) -> bool:
-        """Return a pending reservation whose proof work never started."""
-        with self._proof_admission_lock:
-            reservation = self._pending_proof_reservations.pop(
-                id(request), None,
-            )
-            if reservation is None:
                 return False
-            if reservation[2]:
-                self._pending_post_trigger_proof_reservations = max(
-                    0,
-                    self._pending_post_trigger_proof_reservations - 1,
-                )
+            self._proof_grading_attempts += 1
             return True
 
-    def finish_proof_admission(self, request: BatchSubmissionRequest) -> None:
-        """Release the in-flight marker; started-attempt debt remains."""
-        with self._proof_admission_lock:
-            self._inflight_proof_reservations.pop(id(request), None)
-
     def _note_grail_candidate(self) -> None:
-        """Count a zone-valid submission entering the GRAIL/GPU proof path.
+        """Count a zone-valid submission admitted to the pending pool.
 
-        Telemetry only — the window is already bounded by the drand-anchored
-        seal (the B-th distinct prompt records the trigger round and later
-        rounds are dropped), the never-refunded grading-attempts ceiling, the
-        per-hotkey submission cap, the post-trigger straggler cap and the seal
-        drain timeout. The old per-window GRAIL candidate budget was a
-        pre-seal-drand relic: back when the 8-distinct seal did not fire it was
-        the only bound on GRAIL work within a window. It only starved honest
-        late arrivals whenever earlier candidates failed a post-reservation
-        gate (e.g. forced-seed) without refund, so it no longer rejects.
+        Telemetry only. GPU work is bounded at seal instead: ``_prove_ranked``
+        proves at most ``MAX_PROOF_ATTEMPTS_PER_WINDOW`` ranked candidates, and
+        admission itself is bounded by the grading ceiling.
         """
-        with self._proof_admission_lock:
+        with self._proof_counters_lock:
             self._proof_admission_count += 1
 
     # ----------------------------- ingestion -----------------------------
@@ -1248,6 +1116,13 @@ class GrpoWindowBatcher:
             return reject(RejectReason.HASH_DUPLICATE, "logical_dedup")
         self.confirm_logical_group_reservation(request)
 
+        # Everything above is cheap structural validation. Grading below runs
+        # the env reward (a sandboxed unit-test run for code) and is the real
+        # admission cost now that the GPU proof is deferred to seal, so the
+        # window's ceiling is charged exactly here — anti-DoS bound.
+        if not self._charge_grading_attempt():
+            return reject(RejectReason.BATCH_FILLED, "grading_budget")
+
         problem = self.env.get_problem(request.prompt_idx)
         validator_scored_reward = _uses_validator_authoritative_reward(self.env)
         completion_texts = []
@@ -1333,7 +1208,12 @@ class GrpoWindowBatcher:
                 request.miner_hotkey,
                 clone_metrics.to_log_dict(),
             )
-            return reject(RejectReason.DISTRIBUTION_SUSPICIOUS, "distribution")
+            # Distinct stage from the proof-derived ``distribution``: this check
+            # is CPU-only and runs before any GPU work, so it must not charge
+            # the per-hotkey proof-failure debt (see _PROOF_FAILURE_DEBT_STAGES).
+            return reject(
+                RejectReason.DISTRIBUTION_SUSPICIOUS, "distribution_clones",
+            )
 
         # Cheap per-rollout checks. Everything below that needs the GPU proof
         # now runs at seal, in ``_verify_expensive``, on ranked candidates only.
@@ -2276,12 +2156,12 @@ class GrpoWindowBatcher:
                 if waited_s >= MAX_SEAL_QUEUE_DRAIN_SECONDS:
                     logger.warning(
                         "seal_drain_timeout window=%d trigger_round=%s "
-                        "waited_s=%.2f proof_admitted=%d post_trigger_admitted=%d",
+                        "waited_s=%.2f proof_admitted=%d grading_attempts=%d",
                         self.window_start,
                         self._seal_trigger_round,
                         waited_s,
                         self._proof_admission_count,
-                        self.post_trigger_proof_admission_count,
+                        self._proof_grading_attempts,
                     )
                     break
                 await asyncio.sleep(0.2)
@@ -2309,7 +2189,7 @@ class GrpoWindowBatcher:
             hotkey is not None
             and reject_stage in _PROOF_FAILURE_DEBT_STAGES
         ):
-            with self._proof_admission_lock:
+            with self._proof_counters_lock:
                 self._expensive_proof_failures_by_hotkey[hotkey] = (
                     self._expensive_proof_failures_by_hotkey.get(hotkey, 0) + 1
                 )

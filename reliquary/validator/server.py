@@ -40,7 +40,6 @@ from reliquary.constants import (
     MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
     MAX_PENDING_PROOF_QUEUE_DEPTH,
-    MAX_POST_TRIGGER_PROOF_CANDIDATES,
     MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
     MAX_TRUNCATED_PER_SUBMISSION,
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
@@ -357,8 +356,6 @@ class _Health(BaseModel):
     seconds_since_last_valid_submission: float | None = None
     proof_admission_count: int | None = None
     proof_grading_attempts: int | None = None
-    pending_proof_reservations: int | None = None
-    inflight_proof_reservations: int | None = None
     window_environments: dict[str, dict[str, Any]] = Field(
         default_factory=dict
     )
@@ -367,8 +364,6 @@ class _Health(BaseModel):
     logical_group_dedup_by_environment: dict[str, dict[str, int]] = Field(
         default_factory=dict
     )
-    post_trigger_proof_admission_count: int | None = None
-    post_trigger_proof_admission_limit: int = MAX_POST_TRIGGER_PROOF_CANDIDATES
     sparse_valid_idle_seal_seconds: float = SPARSE_VALID_IDLE_SEAL_SECONDS
     sparse_valid_idle_min_distinct_prompts: int = (
         SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS
@@ -896,15 +891,6 @@ class ValidatorServer:
             "proof_grading_attempts": _integer(
                 getattr(batcher, "proof_grading_attempts", None)
             ),
-            "pending_proof_reservations": _integer(
-                getattr(batcher, "pending_proof_reservations", None)
-            ),
-            "inflight_proof_reservations": _integer(
-                getattr(batcher, "inflight_proof_reservations", None)
-            ),
-            "post_trigger_proof_admission_count": _integer(
-                getattr(batcher, "post_trigger_proof_admission_count", None)
-            ),
         }
 
     def _health_payload(self) -> _Health:
@@ -1035,14 +1021,6 @@ class ValidatorServer:
                 getattr(batcher, "proof_grading_attempts", None)
                 if batcher else None
             ),
-            pending_proof_reservations=(
-                getattr(batcher, "pending_proof_reservations", None)
-                if batcher else None
-            ),
-            inflight_proof_reservations=(
-                getattr(batcher, "inflight_proof_reservations", None)
-                if batcher else None
-            ),
             window_environments=window_environments,
             logical_group_reservations=sum(
                 item["reservations"] for item in logical_group_dedup.values()
@@ -1052,10 +1030,6 @@ class ValidatorServer:
                 for item in logical_group_dedup.values()
             ),
             logical_group_dedup_by_environment=logical_group_dedup,
-            post_trigger_proof_admission_count=(
-                getattr(batcher, "post_trigger_proof_admission_count", None)
-                if batcher else None
-            ),
             expensive_proof_failures_by_hotkey=(
                 dict(getattr(batcher, "expensive_proof_failures_by_hotkey", {}))
                 if batcher else {}
@@ -1153,25 +1127,6 @@ class ValidatorServer:
             return batcher.accept_submission(request)
 
     @staticmethod
-    def _start_proof_admission(
-        batcher: Any,
-        request: BatchSubmissionRequest,
-    ) -> tuple[bool, str | None]:
-        starter = getattr(type(batcher), "start_proof_admission", None)
-        if starter is None:
-            return True, None
-        return starter(batcher, request)
-
-    @staticmethod
-    def _cancel_proof_admission(
-        batcher: Any,
-        request: BatchSubmissionRequest,
-    ) -> None:
-        cancel = getattr(type(batcher), "cancel_proof_admission", None)
-        if cancel is not None:
-            cancel(batcher, request)
-
-    @staticmethod
     def _cancel_logical_group_reservation(
         batcher: Any,
         request: BatchSubmissionRequest,
@@ -1181,15 +1136,6 @@ class ValidatorServer:
         )
         if cancel is not None:
             cancel(batcher, request)
-
-    @staticmethod
-    def _finish_proof_admission(
-        batcher: Any,
-        request: BatchSubmissionRequest,
-    ) -> None:
-        finish = getattr(type(batcher), "finish_proof_admission", None)
-        if finish is not None:
-            finish(batcher, request)
 
     @staticmethod
     def _fallback_drand_observation(
@@ -1803,10 +1749,12 @@ class ValidatorServer:
                 except PromptSourceUnavailable as exc:
                     _prompt_source_unavailable(exc)
 
-            reserve_proof = getattr(
-                type(batcher), "try_reserve_proof_admission", None
+            # Duck-typed guard: test doubles that don't model admission skip
+            # the preflight, the grading ceiling and the logical-group claim.
+            grading_budget = getattr(
+                type(batcher), "grading_budget_exhausted", None
             )
-            if reserve_proof is not None:
+            if grading_budget is not None:
                 # Runs in a thread: the canonical-prompt check calls
                 # env.get_problem, which for the lazy parquet dataset may do a
                 # blocking row-group fetch — must not stall the event loop.
@@ -1820,6 +1768,25 @@ class ValidatorServer:
                     return _cheap_reject(
                         preflight_reason,
                         reject_stage=preflight_stage or "preflight",
+                    )
+
+                # The window's grading ceiling is the anti-DoS bound. Read it
+                # here so a flood is rejected before it can enter the submit
+                # queue; the batcher charges the attempt where grading runs.
+                if batcher.grading_budget_exhausted():
+                    if self._late_drop_callback is not None:
+                        self._late_drop_callback(hk, "grading_budget_full")
+                    return _cheap_reject(
+                        RejectReason.BATCH_FILLED,
+                        reject_stage="grading_budget",
+                        batch_filled_reason="proof_grading_attempts_full",
+                        current_valid_count=batcher.valid_count,
+                        trigger_round=getattr(
+                            batcher, "_seal_trigger_round", None
+                        ),
+                        proof_grading_attempts=getattr(
+                            batcher, "proof_grading_attempts", None
+                        ),
                     )
 
                 reserve_logical = getattr(
@@ -1844,55 +1811,13 @@ class ValidatorServer:
                             quota_refunded=True,
                         )
 
-                admitted, admission_reason = batcher.try_reserve_proof_admission(
-                    request
-                )
-                if not admitted:
-                    self._cancel_logical_group_reservation(batcher, request)
-                    if self._late_drop_callback is not None:
-                        self._late_drop_callback(hk, "proof_admission_full")
-                    return _cheap_reject(
-                        RejectReason.BATCH_FILLED,
-                        reject_stage="proof_admission",
-                        batch_filled_reason=admission_reason,
-                        current_valid_count=batcher.valid_count,
-                        trigger_round=getattr(
-                            batcher, "_seal_trigger_round", None
-                        ),
-                        proof_admission_count=getattr(
-                            batcher, "proof_admission_count", None
-                        ),
-                        post_trigger_proof_admission_count=getattr(
-                            batcher,
-                            "post_trigger_proof_admission_count",
-                            None,
-                        ),
-                        post_trigger_proof_admission_limit=(
-                            MAX_POST_TRIGGER_PROOF_CANDIDATES
-                        ),
-                    )
-
             # Under TestClient (no worker running) we run synchronously so
             # tests see the real ``ACCEPTED`` verdict; under uvicorn we enqueue
             # for the worker and return ``SUBMITTED`` — a distinct sentinel
             # that tells the miner the request is queued, not yet validated.
-            # The real verdict (accept/reject post-GRAIL) surfaces in the
-            # validator's logs and in the R2 archive. Expensive proof work is
-            # bounded by ``try_reserve_proof_admission`` above; over-budget
-            # submissions are rejected before they can enter this queue.
+            # The real verdict (accept/reject post-grading) surfaces in the
+            # validator's logs and in the R2 archive.
             if self._worker_task is None:
-                started, start_reason = self._start_proof_admission(
-                    batcher, request,
-                )
-                if not started:
-                    self._cancel_logical_group_reservation(batcher, request)
-                    if self._late_drop_callback is not None:
-                        self._late_drop_callback(hk, "proof_admission_full")
-                    return _cheap_reject(
-                        RejectReason.BATCH_FILLED,
-                        reject_stage="proof_admission",
-                        batch_filled_reason=start_reason,
-                    )
                 telemetry.mark_proof_started()
                 log_submission_stage(
                     logger,
@@ -1903,14 +1828,11 @@ class ValidatorServer:
                     reject_reason=None,
                 )
                 try:
-                    try:
-                        resp = self._call_accept_submission(
-                            batcher, request, telemetry,
-                        )
-                    except PromptSourceUnavailable as exc:
-                        _prompt_source_unavailable(exc)
-                finally:
-                    self._finish_proof_admission(batcher, request)
+                    resp = self._call_accept_submission(
+                        batcher, request, telemetry,
+                    )
+                except PromptSourceUnavailable as exc:
+                    _prompt_source_unavailable(exc)
                 telemetry.refresh_from_batcher(batcher, at_decision=True)
                 telemetry.mark_decision(verified=True)
                 log_submission_stage(
@@ -1956,13 +1878,12 @@ class ValidatorServer:
             try:
                 self._submit_queue.put_nowait((request, batcher, telemetry))
             except asyncio.QueueFull:
-                self._cancel_proof_admission(batcher, request)
                 self._cancel_logical_group_reservation(batcher, request)
                 if self._late_drop_callback is not None:
                     self._late_drop_callback(hk, "proof_queue_full")
                 return _cheap_reject(
                     RejectReason.BATCH_FILLED,
-                    reject_stage="proof_admission",
+                    reject_stage="proof_queue",
                     batch_filled_reason="proof_queue_full",
                     proof_queue_limit=MAX_PENDING_PROOF_QUEUE_DEPTH,
                 )
@@ -2096,7 +2017,6 @@ class ValidatorServer:
             # the /submit response and learns the real outcome (or its
             # absence) from the R2 archive.
             if batcher not in self._active_batchers.values():
-                self._cancel_proof_admission(batcher, request)
                 self._cancel_logical_group_reservation(batcher, request)
                 telemetry.refresh_from_batcher(batcher, at_decision=True)
                 telemetry.mark_decision()
@@ -2141,7 +2061,6 @@ class ValidatorServer:
             # arrival rate. Same accounting bucket as the HTTP path so a
             # miner inspecting late_drops sees one consistent metric.
             if batcher.is_sealed():
-                self._cancel_proof_admission(batcher, request)
                 self._cancel_logical_group_reservation(batcher, request)
                 telemetry.refresh_from_batcher(batcher, at_decision=True)
                 telemetry.mark_decision()
@@ -2173,38 +2092,6 @@ class ValidatorServer:
                     batch_filled_reason="batch_already_sealed_or_draining",
                     current_valid_count=getattr(batcher, "valid_count", None),
                     trigger_round=getattr(batcher, "_seal_trigger_round", None),
-                    accepted_into_pool=False,
-                )
-                continue
-            started, start_reason = self._start_proof_admission(
-                batcher, request,
-            )
-            if not started:
-                self._cancel_logical_group_reservation(batcher, request)
-                telemetry.refresh_from_batcher(batcher, at_decision=True)
-                telemetry.mark_decision()
-                if self._late_drop_callback is not None:
-                    self._late_drop_callback(
-                        request.miner_hotkey, "proof_admission_full",
-                    )
-                self.record_verdict(
-                    request.miner_hotkey,
-                    request.merkle_root,
-                    False,
-                    RejectReason.BATCH_FILLED,
-                    window_n=request.window_start,
-                    telemetry=telemetry,
-                    reject_stage="proof_admission",
-                    accepted_into_pool=False,
-                )
-                log_submission_stage(
-                    logger,
-                    logging.WARNING,
-                    "candidate_rejected",
-                    telemetry,
-                    reject_stage="proof_admission",
-                    reject_reason=RejectReason.BATCH_FILLED.value,
-                    batch_filled_reason=start_reason,
                     accepted_into_pool=False,
                 )
                 continue
@@ -2291,7 +2178,6 @@ class ValidatorServer:
                 if any(s in msg for s in ("out of memory", "cublas", "cuda")):
                     await asyncio.to_thread(_try_empty_cuda_cache)
             finally:
-                self._finish_proof_admission(batcher, request)
                 # Always reclaim activation memory after a forward pass so
                 # back-to-back GRAIL verifies don't accumulate fragmentation.
                 # The helper is a no-op on CPU-only hosts. Cost: ~ms; benefit:

@@ -149,29 +149,23 @@ REJECTED_LIST_CAP_PER_HOTKEY = 5
 # Default HTTP port the validator listens on for miner submissions.
 VALIDATOR_HTTP_PORT = 8888
 
-# Hard ceiling on total grading attempts (reward computation) admitted per
-# window — the anti-DoS / queue bound and the outer cap on GPU proof work.
-# Counts every grading attempt that actually starts and is never refunded.
-# Pending work reserves capacity separately, so a degenerate-reward flood cannot
-# grow the bounded submit queue or saturate the grader pool while discarded
-# queue items do not burn work that never ran.
-# There is no separate per-window GRAIL candidate budget: the drand-anchored
-# 8-distinct seal, this ceiling and the seal drain timeout bound the work. The
-# old MAX_PROOF_CANDIDATES_PER_WINDOW (32) was a pre-seal-drand relic that only
-# starved honest late arrivals when earlier candidates failed a post-reservation
-# gate (e.g. forced-seed) without refund.
+# Hard ceiling on grading attempts (reward computation) per window — the
+# anti-DoS bound on admission and on the submit queue. Grading is what
+# admission actually costs now that the GPU proof is deferred to seal, and a
+# grading attempt is charged only when grading starts, so it is never refunded
+# and discarded queue items never burn one. GPU work is bounded separately, at
+# seal, by MAX_PROOF_ATTEMPTS_PER_WINDOW.
 MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW = 96
 
 # Absolute server-side bound across active and draining environment queues.
-# Per-batcher reservation caps remain the primary bound; this is the final
+# The per-window grading ceiling remains the primary bound; this is the final
 # backstop during a window swap or prolonged GPU stall.
 MAX_PENDING_PROOF_QUEUE_DEPTH = 256
 
-# A hotkey that repeatedly reaches the expensive proof path and then fails
-# behavioural/integrity checks should not be allowed to consume the whole
-# window's scarce proof budget. Allow a small number of misses for honest
-# stack drift, then reject further proof admissions from that hotkey until the
-# next window.
+# A hotkey whose ranked candidates repeatedly fail the expensive proof should
+# not consume the whole window's proof budget. Allow a small number of misses
+# for honest stack drift, then skip that hotkey's remaining candidates until
+# the next window. Enforced in ``_prove_ranked`` at seal.
 MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW = 2
 
 # Registered-hotkey admission cache. The validator refreshes the metagraph on
@@ -181,12 +175,6 @@ REGISTERED_HOTKEY_CACHE_TTL_SECONDS = 300.0
 REGISTERED_HOTKEY_STALE_GRACE_SECONDS = 900.0
 REGISTERED_HOTKEY_REFRESH_MIN_INTERVAL_SECONDS = 15.0
 REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS = 20.0
-
-# After the B-th distinct prompt records a seal-trigger drand round, admit only
-# a small tail of same-round stragglers. The hard window cap above remains the
-# outer bound; this cap protects the boundary fair-split extension from turning
-# one drand burst into an unbounded proof backlog.
-MAX_POST_TRIGGER_PROOF_CANDIDATES = 8
 
 # Safety timeout for the seal extension's drain phase. Once the trigger drand
 # round expires, the validator waits for the queue AND in-flight GRAIL proofs to
