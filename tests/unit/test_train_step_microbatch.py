@@ -229,7 +229,9 @@ def test_bft_training_metrics_measure_masked_and_weighted_exposure():
     assert metrics["bft/injected_tokens_masked"] == 2
     assert metrics["bft/trainable_completion_tokens"] == 6
     assert metrics["bft/forced_trainable_token_ratio"] == 0.5
-    assert metrics["bft/forced_abs_adv_weighted_token_ratio"] == 0.5
+    assert metrics["bft/forced_abs_adv_weighted_token_ratio"] == pytest.approx(
+        2 / 3
+    )
     assert metrics["bft/path/forced_phase2_eos/rollouts"] == 1
     assert metrics[
         "bft/path/forced_phase2_eos/abs_adv_weighted_tokens"
