@@ -19,6 +19,7 @@ from reliquary.constants import (
     BATCH_PROMPT_COOLDOWN_WINDOWS,
     B_BATCH,
     BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION,
+    MAX_SLOTS_PER_COLDKEY_PER_WINDOW,
     M_ROLLOUTS,
     MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
@@ -55,6 +56,9 @@ from reliquary.protocol.tokens import verify_tokens
 from reliquary.validator.batch_selection import (
     explain_batch_selection,
     select_batch_and_distribute,
+)
+from reliquary.validator.batch_auction import (
+    select_batch_auction,
 )
 from reliquary.validator.cooldown import CooldownMap
 from reliquary.validator.dedup import (
@@ -94,6 +98,7 @@ from reliquary.validator.verifier import (
     is_natural_bft_cap_candidate,
     is_in_zone,
     rewards_std,
+    submission_value,
     validate_force_span,
     verify_logprobs_claim,
     verify_termination,
@@ -296,6 +301,9 @@ class ValidSubmission:
     reward_vector: str = ""
     truncated_count: int = 0
     reward_shape: dict[str, Any] = field(default_factory=dict)
+    # Difficulty-auction score. Unlike ``sigma`` this is asymmetric, so a group
+    # the model mostly FAILS outranks the mirror group it mostly passes.
+    value: float = field(init=False, default=0.0)
 
     def __post_init__(self):
         self.merkle_root = self.merkle_root_bytes
@@ -303,6 +311,9 @@ class ValidSubmission:
             self.selection_digest_bytes
             if self.selection_digest_bytes is not None
             else self.merkle_root_bytes
+        )
+        self.value = submission_value(
+            [float(r.reward) for r in self.rollouts]
         )
 
 
@@ -361,6 +372,7 @@ class GrpoWindowBatcher:
         drand_chain_info: dict | None = None,
         drand_round_backward_tolerance: int | None = None,
         queue_drained_predicate: Callable[[], bool] | None = None,
+        coldkey_of: Callable[[str], str] | None = None,
     ) -> None:
         import time
         from reliquary.constants import DRAND_ROUND_BACKWARD_TOLERANCE
@@ -370,6 +382,14 @@ class GrpoWindowBatcher:
         self.model = model
         self.tokenizer = tokenizer
         self.bootstrap = bootstrap
+        # hotkey -> coldkey, for the auction's per-operator slot cap. None means
+        # "no metagraph mapping available"; the auction then treats each hotkey
+        # as its own operator, which is the safe fallback (the cap still bounds
+        # a single hotkey, it just cannot see through a sybil).
+        self.coldkey_of = coldkey_of
+        # The batch the difficulty auction WOULD have picked, recomputed each
+        # seal. Observation only until M5 clears — see _compute_shadow_auction.
+        self.shadow_auction: dict[str, Any] = {}
         # Set True by the validator's background drand-verify task
         # if the cross-check against bittensor_drand fails post-OPEN.
         # ``_train_and_publish`` checks this before sealing and drops
@@ -2157,6 +2177,45 @@ class GrpoWindowBatcher:
         with self._lock:
             return list(self._valid)
 
+    def _compute_shadow_auction(self, pool: float) -> dict[str, Any]:
+        """The batch the difficulty auction WOULD have picked. Observation only.
+
+        Production still pays drand-FCFS (``select_batch_and_distribute``). This
+        runs alongside it so we can compare the two selections on live traffic
+        before arming: how far apart are the batches, does the auction batch
+        actually skew harder, does any single coldkey dominate the ranking.
+
+        Arming is gated on the free-negative measurement (M5) — under the
+        auction a FALSE negative is worth the maximum payout, so the grader's
+        correctness becomes the load-bearing security property. See
+        docs/superpowers/specs/2026-07-14-difficulty-auction-design.md
+        """
+        batch, rewards = select_batch_auction(
+            submissions=self._valid,
+            b=B_BATCH,
+            cooldown_map=self._cooldown,
+            current_window=self.window_start,
+            pool=pool,
+            max_slots_per_coldkey=MAX_SLOTS_PER_COLDKEY_PER_WINDOW,
+            coldkey_of=self.coldkey_of,
+        )
+        return {
+            "batch": [
+                {
+                    "hotkey": sub.hotkey,
+                    "prompt_idx": sub.prompt_idx,
+                    "env_name": getattr(self.env, "name", ""),
+                    "value": sub.value,
+                    "sigma": sub.sigma,
+                    "drand_round": sub.drand_round,
+                    "reward_vector": sub.reward_vector,
+                }
+                for sub in batch
+            ],
+            "rewards_by_hotkey": rewards,
+            "candidates": len(self._valid),
+        }
+
     def seal_batch(
         self, pool: float = 1.0
     ) -> tuple[list[ValidSubmission], dict[str, float]]:
@@ -2182,6 +2241,7 @@ class GrpoWindowBatcher:
                 current_window=self.window_start,
                 pool=pool,
             )
+            self.shadow_auction = self._compute_shadow_auction(pool)
             rewarded_submissions: list[ValidSubmission] = []
             rewarded_but_not_selected: dict[str, int] = {}
             for sub in self._valid:

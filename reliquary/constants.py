@@ -284,6 +284,32 @@ DATASET_SPLIT = "train"
 SIGMA_MIN = 0.43
 BOOTSTRAP_SIGMA_MIN = 0.33
 
+# Difficulty-auction tilt. The auction scores a group with
+# ``rewards_std(r) * (1 - p) ** DIFFICULTY_DELTA`` where p is the group's mean
+# reward. The first factor is sigma (what the zone filter already measures); the
+# second is the failure rate, and it is the ONLY thing that separates a group the
+# model mostly fails from its mirror image that it mostly passes.
+#
+# Sigma alone cannot: sqrt(p(1-p)) is symmetric, so k=2 and k=6 look identical to
+# it. They are not. GRPO's advantage is (r - mu)/sigma, so at k=6 the dominant
+# per-sample signal is -1.73 on the two mistakes (suppress noise on a prompt the
+# model already solves) while at k=2 it is +1.73 on the two rare successes
+# (amplify a discovery). Same sigma, opposite pedagogical value.
+#
+# delta = 1.0 puts the peak at k=2 of 8. Raising it tilts harder; delta = 0
+# collapses the score back to plain sigma. The peak is deliberately NOT at k=1:
+# a lone success in 8 may be a lucky guess on wrong reasoning, and reinforcing it
+# teaches the wrong thing.
+DIFFICULTY_DELTA = 1.0
+
+# Cap on slots one OPERATOR (coldkey) may win per window under the difficulty
+# auction. The 8-distinct seal cap is per PROMPT, not per miner — which is how a
+# single coldkey took 13.1% of emission by flooding distinct prompts across many
+# hotkeys. It also bounds the centralisation pressure the auction's speed
+# tie-break creates: with a coarse 7-valued score, ties are the norm, so the
+# fastest hardware would otherwise win every one of them.
+MAX_SLOTS_PER_COLDKEY_PER_WINDOW = 2
+
 # Number of rollouts per submission (= size of each GRPO group).
 M_ROLLOUTS = 8
 

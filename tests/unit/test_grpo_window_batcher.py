@@ -3123,3 +3123,45 @@ def test_forced_seed_cdf_gate_is_shadow_until_calibrated(monkeypatch):
     )
 
     assert response.accepted
+
+
+# --- difficulty auction (shadow) ---
+
+def test_seal_batch_exposes_shadow_auction_without_changing_production():
+    """The auction ships DARK. seal_batch records the batch the difficulty
+    auction would have picked, while production still pays drand-FCFS.
+
+    Arming is blocked on the free-negative measurement (M5): paying the most for
+    a low-k group also pays the most for a FALSE negative. Until that is
+    measured, we only observe.
+    """
+    b = _make_batcher()
+    assert b.accept_submission(_request(prompt_idx=7, hotkey="fast_easy")).accepted
+    assert b.accept_submission(_request(prompt_idx=42, hotkey="slow_hard")).accepted
+
+    fast_easy, slow_hard = b._valid[0], b._valid[1]
+    fast_easy.drand_round, fast_easy.value = 1, 0.11   # arrived first, k=6 (easy)
+    slow_hard.drand_round, slow_hard.value = 9, 0.32   # arrived late,  k=2 (hard)
+
+    batch, rewards = b.seal_batch()
+
+    # Production is untouched: the fastest submission still leads the batch.
+    assert [s.hotkey for s in batch] == ["fast_easy", "slow_hard"]
+    assert rewards["fast_easy"] == rewards["slow_hard"]
+
+    # The shadow inverts it: the hard prompt outranks the fast one.
+    shadow = b.shadow_auction
+    assert [e["hotkey"] for e in shadow["batch"]] == ["slow_hard", "fast_easy"]
+    assert shadow["batch"][0]["value"] == 0.32
+
+
+def test_shadow_auction_drops_unanimous_groups():
+    """value == 0 (k=0 or k=8) means no gradient at all — the auction's
+    replacement for the SIGMA_MIN gate."""
+    b = _make_batcher()
+    assert b.accept_submission(_request(prompt_idx=7, hotkey="unanimous")).accepted
+    b._valid[0].value = 0.0
+
+    b.seal_batch()
+
+    assert b.shadow_auction["batch"] == []

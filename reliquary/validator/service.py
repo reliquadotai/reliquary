@@ -1633,6 +1633,17 @@ class ValidationService:
                 "training_accumulator",
                 {"schema_version": 1, "trained": False},
             ),
+            # Difficulty auction, SHADOW: per env, the batch the auction would
+            # have selected (hardest first, speed only breaking ties) had it been
+            # armed. Production above is still drand-FCFS. Archived so the two
+            # selections can be compared on live traffic before arming — does the
+            # auction batch actually skew harder, and does one coldkey dominate
+            # the ranking? Arming is gated on the free-negative measurement (M5).
+            # See docs/superpowers/specs/2026-07-14-difficulty-auction-design.md
+            "shadow_auction": {
+                env_name: getattr(b, "shadow_auction", {})
+                for env_name, b in self._active_batchers.items()
+            },
             # v2.3: per-hotkey emission share from select_batch_and_distribute.
             # All miners whose prompt landed in the winning set appear here,
             # even if their specific submission wasn't picked for training.

@@ -943,6 +943,34 @@ def is_in_zone(sigma: float, *, bootstrap: bool = False) -> bool:
     return sigma >= (BOOTSTRAP_SIGMA_MIN if bootstrap else SIGMA_MIN)
 
 
+def submission_value(rewards: list[float], *, delta: float | None = None) -> float:
+    """Difficulty-auction score for a rollout group: how much the model learns.
+
+    ``sigma * (1 - p) ** delta``, with p the group's mean reward.
+
+    * ``sigma`` — is there anything to learn? Zero for a unanimous group, whose
+      advantages all cancel. This is exactly what ``is_in_zone`` gates on.
+    * ``(1 - p) ** delta`` — must the model *explore*? The failure rate. This is
+      what makes the score asymmetric, so a group the model mostly fails
+      outranks the mirror group it mostly passes (see ``DIFFICULTY_DELTA``).
+
+    For binary rewards this is exactly ``sqrt(p(1-p)) * (1-p)**delta`` — the
+    population std of a Bernoulli *is* ``sqrt(p(1-p))`` — while generalising
+    correctly to the continuous rewards an env may return.
+    """
+    from reliquary.constants import DIFFICULTY_DELTA
+
+    if len(rewards) < 2:
+        return 0.0            # degenerate: no group, no signal
+    if delta is None:
+        delta = DIFFICULTY_DELTA
+
+    p = sum(rewards) / len(rewards)
+    if p <= 0.0 or p >= 1.0:
+        return 0.0            # unanimous: every advantage cancels
+    return rewards_std(rewards) * (1.0 - p) ** delta
+
+
 def verify_logprobs_claim(
     tokens: list[int],
     prompt_length: int,
