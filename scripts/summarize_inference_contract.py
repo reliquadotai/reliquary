@@ -179,6 +179,60 @@ def main() -> None:
             }
         )
 
+    pairwise_profiles = []
+    for left_index, left in enumerate(artifacts):
+        for right in artifacts[left_index + 1:]:
+            if left["profile_label"] == right["profile_label"]:
+                continue
+            if left.get("replicate") != right.get("replicate"):
+                continue
+            left_config = left["config"]
+            right_config = right["config"]
+            config_fields = (
+                "batch_size",
+                "max_new_tokens",
+                "dtype",
+                "generation_use_cache",
+                "bft_thinking_budget",
+                "bft_answer_budget",
+            )
+            if any(
+                left_config.get(field, 0) != right_config.get(field, 0)
+                for field in config_fields
+            ):
+                continue
+            left_rows = {
+                (int(row["prompt_idx"]), int(row["rollout_idx"])): row
+                for row in left["rollouts"]
+            }
+            right_rows = {
+                (int(row["prompt_idx"]), int(row["rollout_idx"])): row
+                for row in right["rollouts"]
+            }
+            identities = left_rows.keys() & right_rows.keys()
+            comparable = [
+                identity for identity in identities
+                if left_rows[identity].get("completion_sha256") is not None
+                and right_rows[identity].get("completion_sha256") is not None
+            ]
+            pairwise_profiles.append(
+                {
+                    "left_profile": left["profile_label"],
+                    "right_profile": right["profile_label"],
+                    "replicate": left.get("replicate"),
+                    "comparable_rollouts": len(comparable),
+                    "completion_agreement": (
+                        sum(
+                            left_rows[identity]["completion_sha256"]
+                            == right_rows[identity]["completion_sha256"]
+                            for identity in comparable
+                        ) / len(comparable)
+                        if comparable
+                        else None
+                    ),
+                }
+            )
+
     output = {
         "schema_version": 1,
         "model_revision_resolved": next(iter(revisions)),
@@ -186,6 +240,7 @@ def main() -> None:
         "prompts_sha256": next(iter(corpora)),
         "artifacts": len(artifacts),
         "groups": summaries,
+        "pairwise_profile_completion_agreement": pairwise_profiles,
     }
     encoded = json.dumps(output, indent=2, sort_keys=True)
     if args.output:
