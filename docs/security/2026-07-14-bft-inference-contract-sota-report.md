@@ -270,6 +270,10 @@ presented changed SSH host keys, which were not bypassed. No shared process or
 reprovisioned host was modified. The matrix below is therefore implemented and
 ready, but its GPU result artifacts are still pending a trusted fresh instance.
 
+Local verification is complete: 1,177 tests passed, 13 CUDA/context-dependent
+tests skipped, and no functional tests failed. A CPU smoke run of the benchmark
+on tiny GPT-2 completed four generated positions with zero hard CDF mismatches.
+
 The new benchmark reproduces the protocol boundary directly:
 
 ```bash
