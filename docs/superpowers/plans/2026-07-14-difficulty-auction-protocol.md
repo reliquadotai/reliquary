@@ -314,7 +314,7 @@ into _verify_expensive, callable at seal time on the ranked candidates only."
 ### Task 3: Prove top-down at seal, bounded
 
 **Files:**
-- Modify: `reliquary/validator/constants.py`, `reliquary/validator/batcher.py` (`seal_batch`, ~2229)
+- Modify: `reliquary/constants.py`, `reliquary/validator/batcher.py` (`seal_batch`, ~2229)
 - Test: `tests/unit/test_deferred_proof.py`
 
 **Interfaces:**
@@ -328,13 +328,15 @@ into _verify_expensive, callable at seal time on the ranked candidates only."
 ```python
 def test_proving_stops_once_b_submissions_pass():
     """The GPU saving. We must not prove candidate 9 when 8 have already passed."""
-    from tests.unit.test_grpo_window_batcher import _make_batcher, _request
+    from tests.unit.test_grpo_window_batcher import (
+        _always_true_grail, _make_batcher, _request,
+    )
 
     proofs = []
 
-    def _counting_proof(*a, **kw):
+    def _counting_proof(commit, model, randomness):
         proofs.append(1)
-        return _always_true_grail(*a, **kw)   # import from test_grpo_window_batcher
+        return _always_true_grail(commit, model, randomness)
 
     b = _make_batcher(verify_commitment_proofs_fn=_counting_proof)
     for i in range(12):
@@ -347,14 +349,20 @@ def test_proving_stops_once_b_submissions_pass():
 
 
 def test_failed_proof_promotes_the_next_ranked():
-    """Promote-on-failure: a fabricated group tops the ranking, fails the proof,
-    and the honest submission behind it takes the slot."""
-    from tests.unit.test_grpo_window_batcher import _make_batcher, _request
+    """Promote-on-failure: a fabricated group tops the ranking (it names its own
+    score), fails the proof, and the honest submission behind it takes the slot."""
+    from tests.unit.test_grpo_window_batcher import (
+        _always_false_grail, _always_true_grail, _make_batcher, _request,
+    )
 
-    def _fail_for_faker(commits, *a, **kw):
-        ...  # returns a failing ProofResult iff the hotkey is "faker"
+    def _fail_only_the_faker(commit, model, randomness):
+        # the faker's group is the one whose rollouts carry its hotkey; the test
+        # helper stamps the hotkey into the commit, so key off that.
+        if commit.get("hotkey") == "faker":
+            return _always_false_grail(commit, model, randomness)
+        return _always_true_grail(commit, model, randomness)
 
-    b = _make_batcher(verify_commitment_proofs_fn=_fail_for_faker)
+    b = _make_batcher(verify_commitment_proofs_fn=_fail_only_the_faker)
     b.accept_submission(_request(prompt_idx=1, hotkey="faker"))
     b.accept_submission(_request(prompt_idx=2, hotkey="honest"))
 
@@ -367,15 +375,17 @@ def test_proof_attempts_are_capped():
     """A griefer fabricates groups that rank at the top and always fail the proof.
     He costs us at most MAX_PROOF_ATTEMPTS_PER_WINDOW, never more."""
     from reliquary.constants import MAX_PROOF_ATTEMPTS_PER_WINDOW
-    from tests.unit.test_grpo_window_batcher import _make_batcher, _request
+    from tests.unit.test_grpo_window_batcher import (
+        _always_false_grail, _make_batcher, _request,
+    )
 
     proofs = []
 
-    def _always_fail(*a, **kw):
+    def _counting_false_grail(commit, model, randomness):
         proofs.append(1)
-        return _failing_grail(*a, **kw)
+        return _always_false_grail(commit, model, randomness)
 
-    b = _make_batcher(verify_commitment_proofs_fn=_always_fail)
+    b = _make_batcher(verify_commitment_proofs_fn=_counting_false_grail)
     for i in range(40):
         b.accept_submission(_request(prompt_idx=i, hotkey=f"grief{i}"))
 
@@ -495,13 +505,15 @@ def test_forensic_sample_proves_some_losers():
     """We stop paying losers, but we must not stop LOOKING at them: the auth gates
     only run on proven submissions, and they are how tampering gets caught."""
     from reliquary.constants import FORENSIC_SAMPLE_PER_WINDOW
-    from tests.unit.test_grpo_window_batcher import _make_batcher, _request
+    from tests.unit.test_grpo_window_batcher import (
+        _always_true_grail, _make_batcher, _request,
+    )
 
     proofs = []
 
-    def _counting(*a, **kw):
+    def _counting(commit, model, randomness):
         proofs.append(1)
-        return _always_true_grail(*a, **kw)
+        return _always_true_grail(commit, model, randomness)
 
     b = _make_batcher(verify_commitment_proofs_fn=_counting)
     for i in range(20):
