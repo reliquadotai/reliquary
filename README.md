@@ -24,6 +24,7 @@ Validators hold stake and run the training loop. Miners hold hotkeys, run GPU in
 
 - To mine: see [docs/mining.md](docs/mining.md)
 - To validate: see [docs/validating.md](docs/validating.md)
+- To operate version-pinned checkpoint evals: see [docs/eval-dashboard.md](docs/eval-dashboard.md)
 - To understand the mechanism: see [docs/concepts.md](docs/concepts.md)
 
 ## Architecture at a glance

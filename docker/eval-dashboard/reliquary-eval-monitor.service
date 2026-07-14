@@ -1,0 +1,12 @@
+[Unit]
+Description=Check Reliquary eval evidence freshness
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=reliquary
+Group=reliquary
+WorkingDirectory=/opt/reliquary
+EnvironmentFile=/etc/reliquary/eval-dashboard.env
+ExecStart=/opt/reliquary/.venv/bin/python -m scripts.run_eval_dashboard check --validator-url ${RELIQUARY_VALIDATOR_URL} --expected-repo-id ReliquaryForge/qwen3.5-2b-reliquary-v2 --max-age-seconds 21600

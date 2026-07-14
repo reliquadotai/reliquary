@@ -1,0 +1,17 @@
+[Unit]
+Description=Reliquary version-pinned checkpoint evaluation
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=reliquary
+Group=reliquary
+WorkingDirectory=/opt/reliquary
+EnvironmentFile=/etc/reliquary/eval-dashboard.env
+ExecStart=/opt/reliquary/.venv/bin/python -m scripts.run_eval_dashboard once --validator-url ${RELIQUARY_VALIDATOR_URL} --config /etc/reliquary/eval/config.json --math-holdout /srv/reliquary-eval/holdouts/math.jsonl --math-review /srv/reliquary-eval/holdouts/math-review.json --code-holdout /srv/reliquary-eval/holdouts/code.jsonl --code-review /srv/reliquary-eval/holdouts/code-review.json --state-dir /srv/reliquary-eval/state --device cuda:0 --attention-implementation flash_attention_2
+TimeoutStartSec=infinity
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

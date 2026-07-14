@@ -1,0 +1,12 @@
+[Unit]
+Description=Evaluate unseen Reliquary checkpoints hourly
+
+[Timer]
+OnBootSec=10min
+OnUnitInactiveSec=1h
+RandomizedDelaySec=5min
+Persistent=true
+Unit=reliquary-eval.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Alert when Reliquary eval evidence is overdue
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Persistent=true
+Unit=reliquary-eval-monitor.service
+
+[Install]
+WantedBy=timers.target
