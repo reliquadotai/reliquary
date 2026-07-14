@@ -37,3 +37,20 @@ def test_late_submission_is_accepted_while_the_window_is_open():
     b = _make_batcher()
     for i in range(20):
         assert b.accept_submission(_request(prompt_idx=i, hotkey=f"m{i}")).accepted
+
+
+def test_second_submission_for_a_claimed_prompt_is_rejected():
+    """One prompt = one slot, decided at ADMISSION. This also kills the
+    variance-farming sybil: the forced-seed seed contains the hotkey, so N hotkeys
+    on one prompt would otherwise buy N independent draws of k and the operator
+    would submit whichever landed nearest k=2."""
+    from reliquary.validator.batcher import RejectReason
+    from tests.unit.test_grpo_window_batcher import _make_batcher, _request
+
+    b = _make_batcher()
+    assert b.accept_submission(_request(prompt_idx=7, hotkey="first")).accepted
+
+    resp = b.accept_submission(_request(prompt_idx=7, hotkey="second"))
+
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.PROMPT_CLAIMED

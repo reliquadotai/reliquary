@@ -1615,8 +1615,6 @@ class ValidatorServer:
             # which path decides. Concurrent batcher mutation between the
             # read here and the worker is benign — the worker re-verifies
             # under the lock.
-            from reliquary.constants import MAX_SUBMISSIONS_PER_PROMPT
-
             def _cheap_reject(
                 reason: RejectReason,
                 *,
@@ -1710,11 +1708,11 @@ class ValidatorServer:
                     reject_stage="cooldown",
                     batch_filled_reason="prompt_in_cooldown",
                 )
-            if batcher.prompt_submission_count(request.prompt_idx) >= MAX_SUBMISSIONS_PER_PROMPT:
+            if batcher.prompt_submission_count(request.prompt_idx) >= 1:
                 return _cheap_reject(
-                    RejectReason.PROMPT_FULL,
-                    reject_stage="prompt_capacity",
-                    batch_filled_reason="prompt_duplicate_or_full",
+                    RejectReason.PROMPT_CLAIMED,
+                    reject_stage="prompt_claimed",
+                    batch_filled_reason="prompt_claimed",
                 )
 
             # Materialize the exact prompt before reserving proof work. This

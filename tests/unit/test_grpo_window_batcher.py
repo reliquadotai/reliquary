@@ -926,43 +926,45 @@ def test_no_canonical_fn_disables_check():
 
 
 # ---------------------------------------------------------------------------
-# Per-prompt multi-miner acceptance (v2.3+)
+# Per-prompt single-slot acceptance (v2.4+)
 # ---------------------------------------------------------------------------
 #
-# Drand-anchored ordering at seal time replaced the FIFO SUPERSEDED short-
-# circuit. Multiple miners may submit on the same prompt within a window,
-# capped at MAX_SUBMISSIONS_PER_PROMPT. Each pays its own GRAIL verify; the
-# cap is the only thing bounding worst-case validator GPU load.
+# One submission per prompt, decided at admission: the first submitter claims
+# the prompt for the window, and every later submission for it is rejected
+# PROMPT_CLAIMED before any heavy verify. This closes the variance-farming
+# sybil: the forced-seed seed contains the hotkey, so N hotkeys submitting on
+# the same prompt would otherwise buy N independent draws of k.
 
 
-def test_same_prompt_multi_miner_accepted():
-    """v2.3: two different miners on the same prompt are both admitted — the
-    first does not 'claim' the prompt at admission. Which one wins the prompt's
-    slot is decided at seal, by the ranking (see ``_prove_ranked``)."""
+def test_second_miner_on_the_same_prompt_is_rejected_at_admission():
+    """The first submitter claims the prompt; the second is rejected
+    PROMPT_CLAIMED without ever being admitted to the pending pool."""
     b = _make_batcher()
     first = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
     second = _request_v21(prompt_idx=42, hotkey="B", checkpoint_hash="")
     assert b.accept_submission(first).accepted is True
-    r2 = b.accept_submission(second)
-    assert r2.accepted is True
-    assert len(b.pending_submissions()) == 2
-    assert len(b._submissions_per_prompt[42]) == 2
-
-
-def test_prompt_full_rejected_at_cap():
-    """Beyond MAX_SUBMISSIONS_PER_PROMPT submissions on a prompt, further
-    arrivals are rejected PROMPT_FULL before any heavy verify."""
-    from reliquary.constants import MAX_SUBMISSIONS_PER_PROMPT
-    b = _make_batcher()
-    for i in range(MAX_SUBMISSIONS_PER_PROMPT):
-        req = _request_v21(prompt_idx=42, hotkey=f"hk{i}", checkpoint_hash="")
-        assert b.accept_submission(req).accepted is True, f"miner {i} should fit"
-    overflow = _request_v21(prompt_idx=42, hotkey="overflow", checkpoint_hash="")
-    resp = b.accept_submission(overflow)
+    resp = b.accept_submission(second)
     assert resp.accepted is False
-    assert resp.reason == RejectReason.PROMPT_FULL
-    # The PROMPT_FULL reject was not admitted.
-    assert len(b.pending_submissions()) == MAX_SUBMISSIONS_PER_PROMPT
+    assert resp.reason == RejectReason.PROMPT_CLAIMED
+    assert len(b.pending_submissions()) == 1
+    assert len(b._submissions_per_prompt[42]) == 1
+
+
+def test_second_miner_cannot_claim_a_prompt_a_faker_already_holds():
+    """A fabricated group that will fail proof at seal still claims the
+    prompt at admission — there is no same-prompt promotion anymore. (See
+    ``test_failed_proof_promotes_the_next_ranked`` in test_deferred_proof.py
+    for promotion across DIFFERENT prompts, which is unaffected.)"""
+    b = _make_batcher(verify_commitment_proofs_fn=_fail_only_the_faker)
+    assert b.accept_submission(_mark_as_faker(_request_v21(
+        prompt_idx=42, hotkey="A", checkpoint_hash="",
+        rewards=[1.0, 1.0] + [0.0] * 6,
+    ))).accepted is True
+    resp = b.accept_submission(_request_v21(
+        prompt_idx=42, hotkey="B", checkpoint_hash="",
+    ))
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.PROMPT_CLAIMED
 
 
 def test_different_prompts_tracked_independently():
@@ -979,36 +981,6 @@ def test_different_prompts_tracked_independently():
     assert r_b.accepted is True
     assert len(b.pending_submissions()) == 2
     assert set(b._submissions_per_prompt) == {42, 43}
-
-
-def test_failed_submission_does_not_win_the_prompt_slot():
-    """A GRAIL-failing submission must not deny an honest miner the prompt.
-
-    BEHAVIOUR CHANGE (deferred proof): the proof runs at seal, so a fabricated
-    group IS admitted and DOES occupy a per-prompt bucket slot — we cannot know
-    it will fail without proving it. What still holds, and is what protects the
-    honest miner's emission, is promote-on-failure: the faker ranks first, fails
-    its proof, and the honest co-runner behind it takes the prompt's slot.
-    """
-    b = _make_batcher(verify_commitment_proofs_fn=_fail_only_the_faker)
-    # A fabricates the k=2 vector — the peak of v(k) — so it is ranked, and
-    # therefore proven, ahead of honest B's k=4 group.
-    assert b.accept_submission(_mark_as_faker(_request_v21(
-        prompt_idx=42, hotkey="A", checkpoint_hash="",
-        rewards=[1.0, 1.0] + [0.0] * 6,
-    ))).accepted is True
-    assert b.accept_submission(_request_v21(
-        prompt_idx=42, hotkey="B", checkpoint_hash="",
-    )).accepted is True
-    # Both hold a bucket slot while unproven.
-    assert len(b._submissions_per_prompt[42]) == 2
-
-    batch, rewards = b.seal_batch()
-
-    assert [s.hotkey for s in b.valid_submissions()] == ["B"]
-    assert [s.hotkey for s in batch] == ["B"]
-    assert set(rewards) == {"B"}
-    assert b.proof_failure_debt("A") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1754,7 +1726,13 @@ def test_hash_dup_accept_when_not_in_set():
 
 
 def test_logical_group_duplicate_rejects_same_hotkey_wrapper_grind():
-    """Changing wrapper metadata cannot mint a second in-window claim."""
+    """Changing wrapper metadata cannot mint a second in-window claim.
+
+    Both requests default to the same ``prompt_idx``, so the one-per-prompt
+    admission gate (PROMPT_CLAIMED) now fires before the request ever reaches
+    the hash/logical-group dedup — an earlier, cheaper rejection of the same
+    grind attempt.
+    """
     b = _make_batcher()
     first = _request(hotkey="hk-copy")
     second = _request(hotkey="hk-copy")
@@ -1767,17 +1745,19 @@ def test_logical_group_duplicate_rejects_same_hotkey_wrapper_grind():
     duplicate = b.accept_submission(second)
 
     assert duplicate.accepted is False
-    assert duplicate.reason == RejectReason.HASH_DUPLICATE
+    assert duplicate.reason == RejectReason.PROMPT_CLAIMED
     assert b.logical_group_reservation_count == 1
-    assert b.logical_group_duplicate_rejects == 1
+    assert b.logical_group_duplicate_rejects == 0   # never reached that gate
     assert len(b.pending_submissions()) == 1   # only the first was admitted
 
 
 def test_logical_group_identity_is_scoped_per_hotkey():
+    """Different hotkeys, different prompts — the logical-group reservation
+    is keyed per hotkey independently of the (now separate) prompt-claim gate."""
     b = _make_batcher()
 
-    assert b.accept_submission(_request(hotkey="hk-a")).accepted is True
-    assert b.accept_submission(_request(hotkey="hk-b")).accepted is True
+    assert b.accept_submission(_request(hotkey="hk-a", prompt_idx=42)).accepted is True
+    assert b.accept_submission(_request(hotkey="hk-b", prompt_idx=43)).accepted is True
     assert b.logical_group_reservation_count == 2
 
 
@@ -1854,10 +1834,10 @@ def test_seal_batch_with_none_hash_set_is_noop():
 # Time-boxed window: extra candidates compete at seal, no early trigger
 # ---------------------------------------------------------------------------
 
-def test_distinct_pending_prompt_count_ignores_duplicate_submissions():
-    """Duplicate prompt submissions fill the raw admitted count before the
-    distinct-prompt (trainable) slots, so ``distinct_pending_prompt_count``
-    de-duplicates. Admitted submissions are pending until seal proves them."""
+def test_distinct_pending_prompt_count_rejects_duplicate_prompt_submissions():
+    """One submission per prompt is enforced at admission (PROMPT_CLAIMED), so
+    a second hotkey on an already-claimed prompt never reaches the pending
+    pool and ``distinct_pending_prompt_count`` never has anything to dedup."""
     b = _make_batcher()
     b.current_checkpoint_hash = ""
 
@@ -1869,9 +1849,11 @@ def test_distinct_pending_prompt_count_ignores_duplicate_submissions():
         )
         b.accept_submission(req)
     duplicate = _request_v21(prompt_idx=0, hotkey="hk_dup", checkpoint_hash="")
-    b.accept_submission(duplicate)
+    resp = b.accept_submission(duplicate)
 
-    assert b.pending_count == B_BATCH
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.PROMPT_CLAIMED
+    assert b.pending_count == B_BATCH - 1
     assert b.distinct_pending_prompt_count() == B_BATCH - 1
     # No count-based seal: the window is time-boxed now.
     assert b.is_sealed() is False

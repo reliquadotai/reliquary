@@ -60,7 +60,14 @@ class RejectReason(str, Enum):
     # (drand ordering replaced the FIFO per-prompt claim). Kept in the
     # enum so historical archives in R2 that carry the string deserialize.
     SUPERSEDED = "superseded"
+    # Deprecated v2.4+: PROMPT_FULL is no longer emitted (the per-prompt cap
+    # it enforced, MAX_SUBMISSIONS_PER_PROMPT, is gone — see PROMPT_CLAIMED).
+    # Kept in the enum so historical archives in R2 that carry the string
+    # deserialize.
     PROMPT_FULL = "prompt_full"
+    # One submission per prompt, decided at admission — the first submitter
+    # owns the prompt for the window; any later submission for it is rejected.
+    PROMPT_CLAIMED = "prompt_claimed"
     PROMPT_OUT_OF_RANGE = "prompt_out_of_range"
     GRAIL_FAIL = "grail_fail"
     HASH_DUPLICATE = "hash_duplicate"

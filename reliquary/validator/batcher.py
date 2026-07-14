@@ -27,7 +27,6 @@ from reliquary.constants import (
     MIN_EOS_PROBABILITY,
     FORENSIC_SAMPLE_PER_WINDOW,
     MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
-    MAX_SUBMISSIONS_PER_PROMPT,
     MAX_TRUNCATED_PER_SUBMISSION,
     PROMPT_RANGE_SIZE,
     PROMPT_RANGE_ENFORCE_FROM_WINDOW,
@@ -251,12 +250,10 @@ _PROOF_FAILURE_DEBT_STAGES = frozenset(
 )
 
 
-# v2.3: batch selection is drand-anchored at seal time (see
-# ``batch_selection.py``). Multiple miners may submit on the same
-# ``prompt_idx`` within a window, capped at ``MAX_SUBMISSIONS_PER_PROMPT``
-# per prompt. Emission is split uniformly across all GRAIL-validated
-# submissions whose prompt lands in the winning set, so sybiling the same
-# prompt is strictly neutral.
+# v2.4: batch selection is drand-anchored at seal time (see
+# ``batch_selection.py``). One submission per ``prompt_idx`` is admitted per
+# window — the first submitter claims the prompt at admission (see
+# RejectReason.PROMPT_CLAIMED) — so sybiling the same prompt buys nothing.
 
 
 @dataclass
@@ -543,10 +540,10 @@ class GrpoWindowBatcher:
         # Non-winners proven purely for telemetry — see FORENSIC_SAMPLE_PER_WINDOW.
         # Never touches ``_valid``; a passing entry here is still unpaid.
         self.forensic_sample: list[ForensicSampleResult] = []
-        # v2.3: per-prompt bucket. Multiple miners may submit on the same
-        # ``prompt_idx`` up to ``MAX_SUBMISSIONS_PER_PROMPT``. Tracked
-        # alongside the flat ``_valid`` list because seal_batch needs the
-        # grouping but accept-time logic only needs the count.
+        # v2.4: per-prompt bucket, at most one entry per ``prompt_idx`` (see
+        # RejectReason.PROMPT_CLAIMED). Tracked alongside the flat ``_valid``
+        # list because seal_batch needs the grouping but accept-time logic
+        # only needs the count.
         self._submissions_per_prompt: dict[
             int, list[ValidSubmission | PendingSubmission]
         ] = {}
@@ -699,7 +696,7 @@ class GrpoWindowBatcher:
     def prompt_submission_count(self, prompt_idx: int) -> int:
         """Number of admitted (graded, not yet proven) submissions already in
         the per-prompt bucket for ``prompt_idx``. Used by the HTTP /submit
-        handler to short-circuit ``PROMPT_FULL`` rejects without queueing.
+        handler to short-circuit ``PROMPT_CLAIMED`` rejects without queueing.
 
         Read of a dict-of-list len is GIL-atomic and lock-free in CPython,
         same property ``pending_count`` relies on. Best-effort: a racing
@@ -1008,14 +1005,15 @@ class GrpoWindowBatcher:
                 return reject(RejectReason.PROMPT_OUT_OF_RANGE, "prompt_range")
         if self._cooldown.is_in_cooldown(request.prompt_idx, self.window_start):
             return reject(RejectReason.PROMPT_IN_COOLDOWN, "cooldown")
-        # v2.3: cap submissions per prompt before the heavy verify. Once a
-        # prompt has ``MAX_SUBMISSIONS_PER_PROMPT`` GRAIL-validated entries,
-        # further attempts are rejected PROMPT_FULL without running GRAIL.
-        # This bounds the validator's GPU cost in the worst case where many
-        # miners attack the same prompt.
+        # One submission per prompt, decided at admission: the first
+        # submitter owns the prompt for this window. The forced-seed seed
+        # is H(drand ‖ hotkey ‖ prompt ‖ i ‖ t) — it contains the hotkey, so
+        # N hotkeys on one prompt would otherwise buy N independent draws of
+        # k and let an operator submit whichever landed nearest the reward
+        # peak. Rejecting every submission after the first removes that draw.
         existing = self._submissions_per_prompt.get(request.prompt_idx, [])
-        if len(existing) >= MAX_SUBMISSIONS_PER_PROMPT:
-            return reject(RejectReason.PROMPT_FULL, "prompt_capacity")
+        if existing:
+            return reject(RejectReason.PROMPT_CLAIMED, "prompt_claimed")
 
         for rollout in request.rollouts:
             try:

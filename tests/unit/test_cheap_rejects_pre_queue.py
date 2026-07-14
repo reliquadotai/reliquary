@@ -19,7 +19,6 @@ from unittest.mock import MagicMock
 
 from fastapi.testclient import TestClient
 
-from reliquary.constants import MAX_SUBMISSIONS_PER_PROMPT
 from reliquary.protocol.submission import (
     BatchSubmissionResponse, RejectReason, WindowState,
 )
@@ -300,15 +299,15 @@ def test_drand_check_disabled_skips_gate():
     batcher.validate_drand_round.assert_not_called()
 
 
-def test_prompt_full_rejected_pre_queue():
-    s, _ = _setup(prompt_count=MAX_SUBMISSIONS_PER_PROMPT)
+def test_prompt_claimed_rejected_pre_queue():
+    s, _ = _setup(prompt_count=1)
     payload = _submission(prompt_idx=42)
-    _assert_pre_queue_reject(s, payload, RejectReason.PROMPT_FULL)
+    _assert_pre_queue_reject(s, payload, RejectReason.PROMPT_CLAIMED)
 
 
-def test_prompt_full_below_cap_passes():
-    """K_p < MAX is the common case; submission must queue normally."""
-    s, _ = _setup(prompt_count=MAX_SUBMISSIONS_PER_PROMPT - 1)
+def test_unclaimed_prompt_passes():
+    """No existing submission for the prompt; must queue normally."""
+    s, _ = _setup(prompt_count=0)
     payload = _submission(prompt_idx=42)
     with TestClient(s.app) as client:
         r = client.post("/submit", json=payload)
@@ -688,7 +687,7 @@ def test_reject_order_matches_accept_locked():
     """When a submission trips multiple cheap checks at once, the handler
     must return the SAME reason the worker's _accept_locked would have
     returned. Order pinned: WRONG_CHECKPOINT > drand_round >
-    BAD_PROMPT_IDX > PROMPT_IN_COOLDOWN > PROMPT_FULL."""
+    BAD_PROMPT_IDX > PROMPT_IN_COOLDOWN > PROMPT_CLAIMED."""
     # WRONG_CHECKPOINT trips first even if drand_round + cooldown also fail.
     s, _ = _setup(
         current_checkpoint_hash="sha256:current",

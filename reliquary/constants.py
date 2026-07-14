@@ -509,14 +509,6 @@ LEGACY_MERKLE_ROOT_ENFORCE = _os.environ.get(
     "RELIQUARY_LEGACY_MERKLE_ROOT_ENFORCE", "false"
 ).strip().lower() in ("1", "true", "yes", "on")
 
-# Max GRAIL-validated submissions retained per prompt per window. Once this
-# cap is reached for a prompt, further submissions for that prompt are
-# rejected as PROMPT_FULL before the heavy verify. Bounds the validator's
-# GPU cost when many miners attack the same prompt — combined with the
-# per-hotkey cap above, worst-case GRAIL load per window is
-# MAX_SUBMISSIONS_PER_PROMPT × min(|env|, MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW × n_hotkeys).
-MAX_SUBMISSIONS_PER_PROMPT = 10
-
 # How many drand-quicknet rounds backward of the validator's current round
 # the batcher accepts on the ``drand_round`` field. Default = 0: strict
 # equality. The miner must attach the drand round currently in progress
