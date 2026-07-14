@@ -27,6 +27,10 @@ logger = logging.getLogger(__name__)
 _SOCKET_TIMEOUT_HEADROOM_S = 5.0
 
 
+class GraderUnavailableError(RuntimeError):
+    """The trusted grader could not provide an authoritative result."""
+
+
 class GraderClient:
     """Thin JSON-over-Unix-socket client.
 
@@ -38,7 +42,9 @@ class GraderClient:
     def __init__(self, socket_path: str = GRADER_SOCKET_PATH) -> None:
         self.socket_path = socket_path
 
-    def evaluate_cases(self, code: str, cases: list[dict[str, Any]], timeout_s: float) -> float:
+    def evaluate_cases(
+        self, code: str, cases: list[dict[str, Any]], timeout_s: float
+    ) -> float:
         """Send (code, structured cases) and return passed/total in [0, 1].
 
         Returns 0.0 if the grader is unreachable, the response is
@@ -77,6 +83,52 @@ class GraderClient:
             return 0.0
         if total <= 0:
             return 0.0
+        return passed / total
+
+    def evaluate_cases_strict(
+        self,
+        code: str,
+        cases: list[dict[str, Any]],
+        timeout_s: float,
+    ) -> float:
+        """Evaluate cases, raising when grader authority is unavailable.
+
+        Validator reward computation intentionally fails soft through
+        :meth:`evaluate_cases`. Offline model evaluation must fail closed: a
+        dead grader must never be published as a real all-zero checkpoint.
+        """
+        if not isinstance(cases, list) or not cases:
+            raise ValueError("strict grading requires at least one case")
+        response: dict = {}
+        last_error: Exception | None = None
+        request = {
+            "req_id": uuid.uuid4().hex,
+            "code": code,
+            "cases": cases,
+            "timeout_s": timeout_s,
+        }
+        for attempt in (1, 2):
+            try:
+                response = self._round_trip(request)
+                break
+            except (OSError, ConnectionError) as exc:
+                last_error = exc
+                if attempt == 1:
+                    time.sleep(0.1)
+        else:
+            raise GraderUnavailableError("grader is unreachable") from last_error
+
+        if response.get("status") != "ok":
+            raise GraderUnavailableError(
+                f"grader returned non-authoritative status {response.get('status')!r}"
+            )
+        try:
+            passed = int(response["passed"])
+            total = int(response["total"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GraderUnavailableError("grader response is malformed") from exc
+        if total != len(cases) or not 0 <= passed <= total:
+            raise GraderUnavailableError("grader response counts are inconsistent")
         return passed / total
 
     def _round_trip(self, req: dict) -> dict:
