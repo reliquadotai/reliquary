@@ -207,6 +207,7 @@ def _patch_chain_and_storage(blocks_until: int, current_block: int = 1_000_000):
         "blocks_until_next_epoch": AsyncMock(return_value=blocks_until),
         "get_current_block": AsyncMock(return_value=current_block),
     }
+    captured["chain_mocks"] = chain_mocks
     storage_mocks = {
         "list_all_window_keys": AsyncMock(return_value=[1, 2, 3]),
         "list_recent_datasets": AsyncMock(return_value=[
@@ -331,6 +332,35 @@ async def test_repeat_poll_in_same_epoch_skips():
 
 
 @pytest.mark.asyncio
+async def test_epoch_position_is_pinned_to_current_block_snapshot():
+    """The two values used for the epoch id must come from the same block.
+
+    If the chain advances between independent reads, ``current_block +
+    blocks_until`` can be off by one and trigger a duplicate set_weights call
+    at the boundary.
+    """
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+    originals, captured = _patch_chain_and_storage(
+        blocks_until=5, current_block=1_000_000,
+    )
+    await _wire_submit_counter(wov, captured)
+    try:
+        await _run_one_iteration(wov)
+        chain_mocks = captured["chain_mocks"]
+        calls = chain_mocks["blocks_until_next_epoch"].await_args_list
+        assert calls
+        assert all(call.kwargs == {"block": 1_000_000} for call in calls)
+        assert all(
+            call.args == (chain_mocks["get_subtensor"].return_value, 81)
+            for call in calls
+        )
+    finally:
+        _restore(originals)
+
+
+@pytest.mark.asyncio
 async def test_next_epoch_submits_again():
     """After crossing the boundary, _last_submit_epoch != current_epoch_id
     and we're inside the lead window → submit fires again."""
@@ -379,7 +409,7 @@ async def test_blocks_until_timeout_recycles_subtensor():
 
     bun_calls = {"n": 0}
 
-    async def fake_blocks_until(sub, netuid):
+    async def fake_blocks_until(sub, netuid, *, block=None):
         bun_calls["n"] += 1
         if bun_calls["n"] == 1:
             raise _asyncio.TimeoutError
