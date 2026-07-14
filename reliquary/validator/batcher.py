@@ -281,6 +281,10 @@ class PendingSubmission:
     merkle_root: bytes
     selection_digest: bytes
     arrived_at: float = 0.0
+    # Wall clock of the CHEAP admission decision. The pre-generation forensic
+    # metric is arrival_ts - (decision_ts - response_time), so it must be the
+    # instant the validator decided, not the instant it later proved.
+    decision_ts: float | None = None
     telemetry: Any = None
     value: float = field(init=False, default=0.0)
 
@@ -1342,6 +1346,7 @@ class GrpoWindowBatcher:
             merkle_root=bytes.fromhex(request.merkle_root),
             selection_digest=compute_rollouts_selection_digest(request.rollouts),
             arrived_at=self._time_fn(),
+            decision_ts=self._wall_clock(),
             telemetry=telemetry,
         )
         self._pending.append(pending)
@@ -1441,6 +1446,9 @@ class GrpoWindowBatcher:
                 prompt_idx=pi,
                 telemetry=telemetry,
                 reject_stage=stage,
+                # Proof-stage rejects run at seal, but the archived forensic
+                # timestamp must stay the admission instant.
+                decision_ts=pending.decision_ts,
                 **kwargs,
             )
             return None
@@ -2162,7 +2170,7 @@ class GrpoWindowBatcher:
             rollout_hashes=rollout_hashes,
             drand_round=request.drand_round,
             arrival_ts=telemetry.t_arrival if telemetry else None,
-            decision_ts=self._wall_clock(),
+            decision_ts=pending.decision_ts,
             submitted_drand_round=request.drand_round,
             arrival_drand_round=(
                 telemetry.arrival_drand_round if telemetry else None
@@ -2257,6 +2265,7 @@ class GrpoWindowBatcher:
         dist_q10_min: float | None = None,
         telemetry: SubmitTelemetry | None = None,
         reject_stage: str | None = None,
+        decision_ts: float | None = None,
     ) -> BatchSubmissionResponse:
         self.reject_counts[reason.value] = self.reject_counts.get(reason.value, 0) + 1
 
@@ -2277,7 +2286,8 @@ class GrpoWindowBatcher:
                 # Anti-tuning: never surface the GRAIL sketch diff to miners.
                 # All other reasons get the diagnostics computed up to the
                 # rejection point.
-                decision_ts = self._wall_clock()
+                if decision_ts is None:
+                    decision_ts = self._wall_clock()
                 if reason is RejectReason.GRAIL_FAIL:
                     sketch_diff_max = None
                     telemetry = None
@@ -2420,6 +2430,9 @@ class GrpoWindowBatcher:
                 cooldown_prompts=sorted(
                     self._cooldown.current_cooldown_set(self.window_start)
                 ),
-                valid_submissions=len(self._valid),
+                # Miners poll this and act on it. Proofs run at seal now, so
+                # ``_valid`` is empty all window — report what was admitted.
+                # The field name is wire contract (extra="forbid"), so it stays.
+                valid_submissions=len(self._pending),
                 checkpoint_n=0,
             )

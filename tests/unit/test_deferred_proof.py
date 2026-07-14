@@ -72,3 +72,77 @@ def test_verify_expensive_runs_the_proof_and_returns_a_valid_submission():
     assert proven is not None
     assert proven.hotkey == "miner"
     assert proven.value == pending.value
+
+
+def test_state_reports_admitted_submissions_not_proven_ones():
+    """Miners poll /state and act on ``valid_submissions``. Proofs now run at
+    seal, so reading ``_valid`` would report 0 for the whole window."""
+    from tests.unit.test_grpo_window_batcher import _make_batcher, _request
+
+    b = _make_batcher()
+    b.accept_submission(_request(prompt_idx=7, hotkey="a"))
+    b.accept_submission(_request(prompt_idx=8, hotkey="b"))
+
+    state = b.get_state()
+
+    assert b._valid == []                    # nothing proven yet
+    assert state.valid_submissions == 2      # but /state must not lie
+
+
+def test_state_wire_contract_is_unchanged():
+    """GrpoBatchState is extra="forbid" with a strict miner-side parse: the
+    pending count must ride the EXISTING field, not a new one."""
+    from reliquary.protocol.submission import GrpoBatchState
+    from tests.unit.test_grpo_window_batcher import _make_batcher
+
+    fields = set(GrpoBatchState.model_fields)
+
+    assert "valid_submissions" in fields
+    assert not fields & {"pending_submissions", "pending_count"}
+    assert set(_make_batcher().get_state().model_dump()) == fields
+
+
+def test_decision_ts_is_stamped_at_admission_not_at_proof():
+    """The pre-generation forensic metric is arrival_ts - (decision_ts -
+    response_time). A seal-time decision_ts silently breaks it."""
+    from tests.unit.test_grpo_window_batcher import _make_batcher, _request
+
+    clock = [1000.0]
+    b = _make_batcher(wall_clock_fn=lambda: clock[0])
+    b.accept_submission(_request(prompt_idx=7, hotkey="miner"))
+    pending = b.pending_submissions()[0]
+
+    clock[0] = 1600.0  # the proof runs minutes later, at seal
+    proven = b._verify_expensive(pending)
+
+    assert pending.decision_ts == 1000.0
+    assert proven.decision_ts == 1000.0
+
+
+def test_decision_ts_of_a_proof_stage_reject_is_the_admission_instant():
+    """Rejected submissions are archived with the same forensic fields, so a
+    gate that now fires at seal must still report when the miner was seen."""
+    from reliquary.constants import CHALLENGE_K
+    from tests.unit.test_grpo_window_batcher import (
+        _grail_with_logits, _make_batcher, _ModelStubWithVocab, _request,
+    )
+
+    seq_len = CHALLENGE_K + 4
+    clock = [1000.0]
+    b = _make_batcher(
+        model=_ModelStubWithVocab(),
+        verify_commitment_proofs_fn=_grail_with_logits(seq_len),
+        wall_clock_fn=lambda: clock[0],
+    )
+    req = _request()
+    # Last token != 99 (EOS) and no cap hit → BAD_TERMINATION, a proof-stage gate.
+    req.rollouts[0].commit["tokens"] = list(range(seq_len))
+    req.rollouts[0].tokens = req.rollouts[0].commit["tokens"]
+    b.accept_submission(req)
+
+    clock[0] = 1600.0
+    assert b._verify_expensive(b.pending_submissions()[0]) is None
+
+    rejected = b.rejected_submissions[0]
+    assert rejected.reason == "bad_termination"
+    assert rejected.decision_ts == 1000.0

@@ -669,8 +669,8 @@ class ValidationService:
         """
         if batcher is None or batcher.is_sealed():
             return False
-        distinct_valid = self._distinct_valid_prompt_count(batcher)
-        if distinct_valid >= B_BATCH:
+        distinct_admitted = self._distinct_admitted_prompt_count(batcher)
+        if distinct_admitted >= B_BATCH:
             return False
         if (
             getattr(batcher, "proof_grading_attempts", 0)
@@ -681,12 +681,21 @@ class ValidationService:
         inflight = int(getattr(self.server, "proof_verification_inflight", 0) or 0)
         return queue_depth == 0 and inflight == 0
 
-    def _distinct_valid_prompt_count(self, batcher) -> int:
-        """Best-effort distinct prompt count for liveness decisions."""
-        counter = getattr(batcher, "distinct_valid_prompt_count", None)
+    def _distinct_admitted_prompt_count(self, batcher) -> int:
+        """Best-effort distinct prompt count for liveness decisions.
+
+        Reads the PENDING pool: proofs are deferred to seal, so the valid
+        counters stay 0 for the whole window and a breaker gated on them is
+        dead code.
+        """
+        counter = getattr(batcher, "distinct_pending_prompt_count", None)
         if callable(counter):
             return int(counter())
-        return int(getattr(batcher, "valid_count", 0) or 0)
+        return self._admitted_count(batcher)
+
+    def _admitted_count(self, batcher) -> int:
+        """Submissions admitted and graded this window (proven or not)."""
+        return int(getattr(batcher, "pending_count", 0) or 0)
 
     def _duplicate_prompt_shortfall_drained(self, batcher) -> bool:
         """True when duplicates filled raw submissions but not trainable slots."""
@@ -694,9 +703,9 @@ class ValidationService:
             return False
         if getattr(batcher, "_seal_trigger_round", None) is not None:
             return False
-        valid_count = int(getattr(batcher, "valid_count", 0) or 0)
-        distinct_valid = self._distinct_valid_prompt_count(batcher)
-        if valid_count < B_BATCH or distinct_valid >= B_BATCH:
+        admitted_count = self._admitted_count(batcher)
+        distinct_admitted = self._distinct_admitted_prompt_count(batcher)
+        if admitted_count < B_BATCH or distinct_admitted >= B_BATCH:
             return False
         queue_depth = int(getattr(self.server, "submit_queue_depth", 0) or 0)
         inflight = int(getattr(self.server, "proof_verification_inflight", 0) or 0)
@@ -725,30 +734,33 @@ class ValidationService:
 
         This is a cadence guard, not a quality gate. It only fires when the
         validator has fewer than B distinct trainable prompts, no queued or
-        in-flight proof work, and either no valid progress for the sparse idle
-        threshold or an overlong sparse window. Zero-valid windows are included
+        in-flight proof work, and either no admission progress for the sparse
+        idle threshold or an overlong sparse window. Empty windows are included
         only for the max-age path so a hard reset with stale miners cannot
         freeze checkpoint progress indefinitely.
+
+        Counts admitted (pending) submissions, not proven ones — proofs run at
+        seal, so the valid counters are 0 while this runs.
         """
         if batcher is None or batcher.is_sealed():
             return None
         if getattr(batcher, "_seal_trigger_round", None) is not None:
             return None
-        valid_count = int(getattr(batcher, "valid_count", 0) or 0)
-        distinct_valid = self._distinct_valid_prompt_count(batcher)
-        if distinct_valid >= B_BATCH:
+        admitted_count = self._admitted_count(batcher)
+        distinct_admitted = self._distinct_admitted_prompt_count(batcher)
+        if distinct_admitted >= B_BATCH:
             return None
         if not self._queue_and_proofs_drained():
             return None
 
         idle_s = self._seconds_since_last_valid_submission(batcher)
         age_s = self._window_open_age_seconds(batcher)
-        if valid_count <= 0:
+        if admitted_count <= 0:
             if age_s is not None and age_s >= SPARSE_VALID_MAX_WINDOW_SECONDS:
                 return "zero_valid_window_timeout"
             return None
         if (
-            distinct_valid >= SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS
+            distinct_admitted >= SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS
             and idle_s is not None
             and idle_s >= SPARSE_VALID_IDLE_SEAL_SECONDS
         ):
@@ -776,11 +788,11 @@ class ValidationService:
         if reason is None:
             return None
         logger.warning(
-            "Window %d env=%s force-sealing partial: reason=%s valid=%d/%d "
+            "Window %d env=%s force-sealing partial: reason=%s admitted=%d/%d "
             "distinct=%d/%d idle_s=%s age_s=%s",
             self._window_n, env, reason,
-            getattr(batcher, "valid_count", 0), B_BATCH,
-            self._distinct_valid_prompt_count(batcher), B_BATCH,
+            self._admitted_count(batcher), B_BATCH,
+            self._distinct_admitted_prompt_count(batcher), B_BATCH,
             self._seconds_since_last_valid_submission(batcher),
             self._window_open_age_seconds(batcher),
         )

@@ -251,22 +251,44 @@ def test_proof_cap_breaker_waits_for_inflight_or_queued_work():
     assert svc._proof_admission_exhausted_and_drained(batcher) is False
 
 
+def _admit(batcher, prompt_indices):
+    """Put graded-but-unproven submissions in the pending pool.
+
+    Proofs run at seal now, so the pending pool — not ``_valid`` — is what the
+    liveness breakers must read: ``_valid`` stays empty for the whole window.
+    """
+    batcher._pending = [SimpleNamespace(prompt_idx=i) for i in prompt_indices]
+    batcher.pending_count = len(batcher._pending)
+
+
 def test_proof_cap_breaker_uses_distinct_prompt_count():
-    """Raw valid duplicates should not mask an unfillable trainable shortfall."""
+    """Raw admitted duplicates should not mask an unfillable trainable shortfall."""
     from reliquary.validator.service import MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
 
     svc = _make_service()
     svc._open_window()
     svc._activate_window()
     batcher = svc._active_batcher
-    batcher._valid = [
-        SimpleNamespace(prompt_idx=i) for i in range(B_BATCH - 1)
-    ] + [SimpleNamespace(prompt_idx=0)]
-    batcher.valid_count = B_BATCH
+    _admit(batcher, list(range(B_BATCH - 1)) + [0])
     batcher._proof_grading_attempts = MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
 
-    assert batcher.distinct_valid_prompt_count() == B_BATCH - 1
+    assert batcher.distinct_pending_prompt_count() == B_BATCH - 1
     assert svc._proof_admission_exhausted_and_drained(batcher) is True
+
+
+def test_proof_cap_breaker_does_not_fire_on_a_full_window():
+    """A window with B distinct admitted prompts seals through the normal
+    trigger — the breaker must not cut it short and drop the boundary split."""
+    from reliquary.validator.service import MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+
+    svc = _make_service()
+    svc._open_window()
+    svc._activate_window()
+    batcher = svc._active_batcher
+    _admit(batcher, range(B_BATCH))
+    batcher._proof_grading_attempts = MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+
+    assert svc._proof_admission_exhausted_and_drained(batcher) is False
 
 
 @pytest.mark.asyncio
@@ -279,14 +301,12 @@ async def test_wait_for_window_seal_force_seals_duplicate_prompt_shortfall(monke
     svc._open_window()
     svc._activate_window()
     batcher = svc._active_batcher
-    batcher._valid = [
-        SimpleNamespace(prompt_idx=i) for i in range(B_BATCH - 1)
-    ] + [SimpleNamespace(prompt_idx=0)]
-    batcher.valid_count = B_BATCH
+    _admit(batcher, list(range(B_BATCH - 1)) + [0])
     batcher._proof_admission_count = B_BATCH + 1
 
     reason = await svc._wait_for_window_seal()
 
+    assert batcher._valid == []  # the breaker cannot depend on proven state
     assert reason == "duplicate_prompt_distinct_shortfall_drained"
     assert batcher.is_sealed()
     assert batcher.force_seal_reason == reason
@@ -294,7 +314,7 @@ async def test_wait_for_window_seal_force_seals_duplicate_prompt_shortfall(monke
 
 @pytest.mark.asyncio
 async def test_wait_for_window_seal_force_seals_sparse_valid_idle(monkeypatch):
-    """Sparse valid traffic should not wait for the long safety timeout."""
+    """Sparse traffic should not wait for the long safety timeout."""
     monkeypatch.setattr(
         "reliquary.validator.service.SPARSE_VALID_IDLE_SEAL_SECONDS", 0.0,
     )
@@ -305,13 +325,13 @@ async def test_wait_for_window_seal_force_seals_sparse_valid_idle(monkeypatch):
     svc._open_window()
     svc._activate_window()
     batcher = svc._active_batcher
-    batcher._valid = [SimpleNamespace(prompt_idx=i) for i in range(4)]
-    batcher.valid_count = 4
+    _admit(batcher, range(4))
     batcher.last_valid_submission_at = batcher._time_fn() - 1.0
     batcher.last_valid_submission_wall_ts = batcher._wall_clock() - 1.0
 
     reason = await svc._wait_for_window_seal()
 
+    assert batcher._valid == []  # the fast idle path must survive deferred proof
     assert reason == "sparse_valid_idle_timeout"
     assert batcher.is_sealed()
     assert batcher.force_seal_reason == reason
@@ -327,8 +347,7 @@ async def test_wait_for_window_seal_force_seals_sparse_valid_max_age(monkeypatch
     svc._open_window()
     svc._activate_window()
     batcher = svc._active_batcher
-    batcher._valid = [SimpleNamespace(prompt_idx=123)]
-    batcher.valid_count = 1
+    _admit(batcher, [123])
     batcher.last_valid_submission_at = batcher._time_fn()
     batcher.last_valid_submission_wall_ts = batcher._wall_clock()
 

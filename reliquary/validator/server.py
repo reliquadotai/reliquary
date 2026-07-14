@@ -1974,7 +1974,7 @@ class ValidatorServer:
         async def state(env: str | None = None) -> GrpoBatchState:
             """Current window + checkpoint state. Lock-free: reads only the
             batcher's snapshot fields (set at construction) and the atomic
-            ``valid_count`` counter. The submit worker holds ``batcher._lock``
+            ``pending_count`` counter. The submit worker holds ``batcher._lock``
             for up to ~25s per GRAIL verify, so this handler MUST NOT touch
             it — otherwise miners polling /state starve the event loop and
             timeout cascades hit every endpoint (see 2026-05-12 outage).
@@ -2003,7 +2003,9 @@ class ValidatorServer:
                 window_n=batcher.window_start,
                 anchor_block=batcher.window_start,
                 cooldown_prompts=batcher.cooldown_prompts_snapshot,
-                valid_submissions=batcher.valid_count,
+                # Proofs run at seal, so ``valid_count`` is 0 all window. Report
+                # what was admitted; the field name is miner wire contract.
+                valid_submissions=batcher.pending_count,
                 checkpoint_n=cp.checkpoint_n if cp else 0,
                 checkpoint_repo_id=cp.repo_id if cp else None,
                 checkpoint_revision=cp.revision if cp else None,
