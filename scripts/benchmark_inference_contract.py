@@ -46,7 +46,10 @@ def _load_prompts(path: Path | None, direct: list[str]) -> list[dict]:
             prompt_idx = row.get("prompt_idx") if isinstance(row, dict) else None
             if prompt_idx is None:
                 prompt_idx = len(prompts)
-            prompts.append({"prompt": value, "prompt_idx": int(prompt_idx)})
+            prompt_row = {"prompt": value, "prompt_idx": int(prompt_idx)}
+            if isinstance(row, dict) and row.get("ground_truth") is not None:
+                prompt_row["ground_truth"] = str(row["ground_truth"])
+            prompts.append(prompt_row)
     if not prompts:
         raise ValueError("provide --prompt or --prompts-jsonl")
     return prompts
@@ -120,6 +123,7 @@ def main() -> None:
         seed_consistency_diagnostics,
         u_at,
     )
+    from reliquary.environment.openmathinstruct import _compute_omi_reward
     from reliquary.miner.forced_seed_sampler import (
         ForcedSeedLogitsProcessor,
         forced_seed_generate_kwargs,
@@ -190,6 +194,7 @@ def main() -> None:
     for prompt_row in prompts:
         prompt = prompt_row["prompt"]
         prompt_idx = int(prompt_row["prompt_idx"])
+        ground_truth = prompt_row.get("ground_truth")
         prompt_tokens = encode_prompt(tokenizer, prompt)
         prompt_length = len(prompt_tokens)
         input_ids = torch.tensor(
@@ -369,8 +374,15 @@ def main() -> None:
                 ),
                 **token_degeneracy_metrics(completion),
             }
+            completion_text = None
+            if args.include_text or ground_truth is not None:
+                completion_text = tokenizer.decode(completion)
+            if ground_truth is not None:
+                row["reward"] = _compute_omi_reward(
+                    {"ground_truth": ground_truth}, completion_text or "",
+                )
             if args.include_text:
-                row["completion_text"] = tokenizer.decode(completion)
+                row["completion_text"] = completion_text
             rows.append(row)
 
     elapsed = time.perf_counter() - started

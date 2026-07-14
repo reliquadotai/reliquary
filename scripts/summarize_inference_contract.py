@@ -152,6 +152,18 @@ def main() -> None:
                     if rollouts
                     else None
                 ),
+                "graded_rollouts": sum(
+                    row.get("reward") is not None for row in rollouts
+                ),
+                "mean_reward": (
+                    mean(
+                        float(row["reward"])
+                        for row in rollouts
+                        if row.get("reward") is not None
+                    )
+                    if any(row.get("reward") is not None for row in rollouts)
+                    else None
+                ),
                 "bft_termination_paths": {
                     path: sum(
                         row.get("bft_termination_path") == path
