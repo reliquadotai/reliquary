@@ -21,6 +21,7 @@ def test_proof_result_has_seed_fields():
     assert p.seed_n_positions == 0
     assert p.seed_n_hard_mismatch == 0
     assert p.seed_max_cdf_miss == 0.0
+    assert p.seed_first_hard_mismatch_offset is None
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -144,6 +145,7 @@ def test_verify_commitment_proofs_mismatch_lowers_match_not_stochastic(_rhs, moc
     assert result.seed_n_positions == 4
     assert result.seed_n_hard_mismatch == 1
     assert result.seed_max_cdf_miss > 0
+    assert result.seed_first_hard_mismatch_offset == 1
 
 
 @patch("reliquary.shared.forward.forward_single_layer")

@@ -169,3 +169,21 @@ def test_cdf_diagnostics_checks_near_deterministic_positions_too():
     assert diagnostics.n_miss_gt_0_01 == 1
     assert diagnostics.n_miss_gt_0_05 == 1
     assert diagnostics.n_miss_gt_0_10 == 1
+
+
+def test_cdf_diagnostics_reports_completion_offset_of_first_hard_mismatch():
+    logits = torch.log(torch.tensor([[0.5, 0.5], [0.5, 0.5]]))
+    diagnostics = fs.seed_consistency_diagnostics(
+        logits,
+        [0, 0],
+        [0.25, 0.75],
+        t=1.0,
+        top_k=0,
+        top_p=1.0,
+        stochastic_threshold=0.99,
+        boundary_epsilon=0.0,
+        position_offsets=[4, 11],
+    )
+
+    assert diagnostics.n_hard_mismatch == 1
+    assert diagnostics.first_hard_mismatch_offset == 11

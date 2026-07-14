@@ -96,6 +96,7 @@ class ProofResult:
     seed_n_miss_gt_0_05: int = 0
     seed_n_miss_gt_0_10: int = 0
     seed_max_cdf_miss: float = 0.0
+    seed_first_hard_mismatch_offset: int | None = None
     # Termination escape: True when the final token IS the protocol's forced
     # inverse-CDF pick at the position that produced it. The miner cannot choose
     # where the public u selects EOS, so a match proves a legal draw regardless
@@ -480,6 +481,7 @@ def verify_commitment_proofs(
     seed_n_miss_gt_0_05 = 0
     seed_n_miss_gt_0_10 = 0
     seed_max_cdf_miss = 0.0
+    seed_first_hard_mismatch_offset = None
     terminal_pick_ok = None
     terminal_pick_cdf_miss = None
     natural_close_pick_ok = None
@@ -518,6 +520,7 @@ def verify_commitment_proofs(
             seed_u = [seed_u_values[t - prompt_length] for t in seed_t]
             seed_diagnostics = _gpu_seed_consistency_diagnostics(
                 logits_gpu[pos_tensor], seed_tokens, seed_u,
+                position_offsets=[t - prompt_length for t in seed_t],
             )
             seed_n_stochastic = seed_diagnostics.n_stochastic
             seed_n_match = seed_diagnostics.n_exact_match
@@ -531,6 +534,9 @@ def verify_commitment_proofs(
             seed_n_miss_gt_0_05 = seed_diagnostics.n_miss_gt_0_05
             seed_n_miss_gt_0_10 = seed_diagnostics.n_miss_gt_0_10
             seed_max_cdf_miss = seed_diagnostics.max_cdf_miss
+            seed_first_hard_mismatch_offset = (
+                seed_diagnostics.first_hard_mismatch_offset
+            )
         terminal_pick_ok, terminal_pick_cdf_miss = (
             _gpu_terminal_forced_pick_diagnostics(
                 logits_gpu, tokens, prompt_length, seq_len,
@@ -593,6 +599,7 @@ def verify_commitment_proofs(
         seed_n_miss_gt_0_05=seed_n_miss_gt_0_05,
         seed_n_miss_gt_0_10=seed_n_miss_gt_0_10,
         seed_max_cdf_miss=seed_max_cdf_miss,
+        seed_first_hard_mismatch_offset=seed_first_hard_mismatch_offset,
         terminal_pick_ok=terminal_pick_ok,
         terminal_pick_cdf_miss=terminal_pick_cdf_miss,
         natural_close_pick_ok=natural_close_pick_ok,
@@ -866,6 +873,8 @@ def _gpu_seed_consistency_diagnostics(
     logits_slice: torch.Tensor,
     token_ids: list[int],
     u_values: list[float],
+    *,
+    position_offsets: list[int] | None = None,
 ):
     from reliquary.constants import (
         FORCED_SEED_CDF_BOUNDARY_EPSILON,
@@ -886,6 +895,7 @@ def _gpu_seed_consistency_diagnostics(
         top_p=TOP_P_PROTO,
         stochastic_threshold=FORCED_SEED_STOCHASTIC_MAXPROB,
         boundary_epsilon=FORCED_SEED_CDF_BOUNDARY_EPSILON,
+        position_offsets=position_offsets,
     )
 
 

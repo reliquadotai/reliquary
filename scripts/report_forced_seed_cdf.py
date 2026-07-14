@@ -26,9 +26,51 @@ def _quantile(values: list[float], q: float) -> float | None:
     return ordered[lo] * (1.0 - fraction) + ordered[hi] * fraction
 
 
+def _rollout_cohort(items: list[dict]) -> dict:
+    positions = sum(int(item.get("n_positions", 0) or 0) for item in items)
+    hard = sum(int(item.get("n_hard_mismatch", 0) or 0) for item in items)
+
+    def values(field: str) -> list[float]:
+        return [
+            float(item[field])
+            for item in items
+            if item.get(field) is not None
+        ]
+
+    return {
+        "rollouts": len(items),
+        "positions": positions,
+        "hard_mismatches": hard,
+        "hard_mismatch_rate": hard / positions if positions else None,
+        "repeated_ngram_fraction_mean": (
+            statistics.fmean(values("repeated_ngram_fraction"))
+            if values("repeated_ngram_fraction")
+            else None
+        ),
+        "tail_repeated_ngram_fraction_mean": (
+            statistics.fmean(values("tail_repeated_ngram_fraction"))
+            if values("tail_repeated_ngram_fraction")
+            else None
+        ),
+        "max_same_token_run_p95": _quantile(
+            values("max_same_token_run"), 0.95,
+        ),
+        "first_hard_mismatch_offset_p50": _quantile(
+            values("first_hard_mismatch_offset"), 0.50,
+        ),
+    }
+
+
 def summarize(rows: list[dict]) -> dict:
     v2 = [row for row in rows if int(row.get("schema_version", 1)) >= 2]
     v3 = [row for row in rows if int(row.get("schema_version", 1)) >= 3]
+    v4 = [row for row in rows if int(row.get("schema_version", 1)) >= 4]
+    rollouts_v4 = [
+        item
+        for row in v4
+        for item in (row.get("per_rollout") or [])
+        if isinstance(item, dict)
+    ]
     scores = [float(row.get("score", 0.0)) for row in v2]
     cdf_clean = [
         row
@@ -66,11 +108,33 @@ def summarize(rows: list[dict]) -> dict:
     ratio_clean_hard_mismatches = sum(
         int(row.get("n_hard_mismatch", 0) or 0) for row in cdf_clean
     )
+    termination_paths: dict[str, list[dict]] = defaultdict(list)
+    for item in rollouts_v4:
+        termination_paths[str(item.get("termination_path") or "unknown")].append(
+            item
+        )
+    mismatch_rollouts = [
+        item
+        for item in rollouts_v4
+        if int(item.get("n_hard_mismatch", 0) or 0) > 0
+    ]
+    clean_rollouts = [
+        item
+        for item in rollouts_v4
+        if int(item.get("n_hard_mismatch", 0) or 0) == 0
+    ]
+    directionality = [
+        item
+        for item in rollouts_v4
+        if item.get("first_hard_mismatch_offset") is not None
+        and item.get("first_repeated_ngram_offset") is not None
+    ]
 
     return {
         "records_total": len(rows),
         "records_schema_v2": len(v2),
         "records_schema_v3": len(v3),
+        "records_schema_v4": len(v4),
         "hotkeys_schema_v2": len(by_hotkey),
         "schema_v2_span_hours": span_hours,
         "windows_schema_v3": len(
@@ -157,6 +221,34 @@ def summarize(rows: list[dict]) -> dict:
             ),
             key=lambda item: item["environment"],
         ),
+        "rollouts_schema_v4": len(rollouts_v4),
+        "by_termination_path_schema_v4": sorted(
+            (
+                {
+                    "termination_path": path,
+                    **_rollout_cohort(items),
+                }
+                for path, items in termination_paths.items()
+            ),
+            key=lambda item: item["termination_path"],
+        ),
+        "cdf_degeneracy_cohorts_schema_v4": {
+            "hard_mismatch": _rollout_cohort(mismatch_rollouts),
+            "no_hard_mismatch": _rollout_cohort(clean_rollouts),
+        },
+        "directionality_schema_v4": {
+            "both_offsets_observed": len(directionality),
+            "cdf_mismatch_at_or_before_repetition": sum(
+                int(item["first_hard_mismatch_offset"])
+                <= int(item["first_repeated_ngram_offset"])
+                for item in directionality
+            ),
+            "repetition_before_cdf_mismatch": sum(
+                int(item["first_repeated_ngram_offset"])
+                < int(item["first_hard_mismatch_offset"])
+                for item in directionality
+            ),
+        },
         "decision": decision,
         "activation_rule": (
             "Do not set FORCED_SEED_CDF_ENFORCE=true until at least 24h, "
@@ -188,7 +280,8 @@ def main() -> None:
     print(
         "records: "
         f"{report['records_schema_v2']} v2+ "
-        f"({report['records_schema_v3']} v3) / "
+        f"({report['records_schema_v3']} v3, "
+        f"{report['records_schema_v4']} v4) / "
         f"{report['records_total']} total; "
         f"{report['hotkeys_schema_v2']} hotkeys; "
         f"{report['schema_v2_span_hours']:.1f}h"
@@ -210,6 +303,12 @@ def main() -> None:
         f">.01={report['cdf_miss_severity_schema_v3']['gt_0_01']} "
         f">.05={report['cdf_miss_severity_schema_v3']['gt_0_05']} "
         f">.10={report['cdf_miss_severity_schema_v3']['gt_0_10']}"
+    )
+    print(
+        "v4 causal telemetry: "
+        f"{report['rollouts_schema_v4']} rollouts; "
+        f"{report['directionality_schema_v4']['both_offsets_observed']} "
+        "with both CDF and repetition onsets"
     )
     print(report["activation_rule"])
 

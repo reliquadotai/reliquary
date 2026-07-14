@@ -284,7 +284,7 @@ def record_forced_seed_shadow(
     try:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         record = {
-            "schema_version": 3,
+            "schema_version": 4,
             "event": "forced_seed_shadow",
             "surface": "forced-seed-shadow",
             "ts_unix": time.time(),
@@ -351,6 +351,9 @@ def record_termination_shadow(
     cap_truncated: bool,
     would_exceed_truncation_budget: bool,
     boundary_epsilon: float,
+    seed_n_hard_mismatch: int = 0,
+    seed_first_hard_mismatch_offset: int | None = None,
+    token_metrics: dict[str, Any] | None = None,
     path: str | Path | None = None,
 ) -> None:
     """Record interesting termination decisions without changing the gate.
@@ -375,8 +378,9 @@ def record_termination_shadow(
             and natural_close_pick_cdf_miss is not None
             and natural_close_pick_cdf_miss <= boundary_epsilon
         )
+        metrics = token_metrics or {}
         record = {
-            "schema_version": 1,
+            "schema_version": 2,
             "event": "termination_shadow",
             "surface": "termination-shadow",
             "ts_unix": time.time(),
@@ -406,6 +410,28 @@ def record_termination_shadow(
                 would_exceed_truncation_budget
             ),
             "cdf_boundary_epsilon": float(boundary_epsilon),
+            "seed_n_hard_mismatch": int(seed_n_hard_mismatch),
+            "seed_first_hard_mismatch_offset": _int_or_none(
+                seed_first_hard_mismatch_offset
+            ),
+            "unique_token_ratio": _float_or_none(
+                metrics.get("unique_token_ratio")
+            ),
+            "repeated_ngram_fraction": _float_or_none(
+                metrics.get("repeated_ngram_fraction")
+            ),
+            "tail_repeated_ngram_fraction": _float_or_none(
+                metrics.get("tail_repeated_ngram_fraction")
+            ),
+            "max_same_token_run": _int_or_none(
+                metrics.get("max_same_token_run")
+            ),
+            "first_repeated_ngram_offset": _int_or_none(
+                metrics.get("first_repeated_ngram_offset")
+            ),
+            "first_same_token_run_offset": _int_or_none(
+                metrics.get("first_same_token_run_offset")
+            ),
         }
         with open(out_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, sort_keys=True, separators=(",", ":")))

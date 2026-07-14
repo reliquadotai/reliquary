@@ -18,8 +18,13 @@ def test_forced_seed_forensics_records_boundary_and_reject_diagnostics(tmp_path)
             "n_miss_gt_0_05": 1,
             "n_miss_gt_0_10": 1,
             "max_cdf_miss": 0.2,
+            "first_hard_mismatch_offset": 17,
             "completion_length": 100,
+            "claimed_forced": False,
             "forced": False,
+            "validated_force_span_length": 0,
+            "termination_path": "phase1_eos",
+            "repeated_ngram_fraction": 0.1,
         }
     ]
 
@@ -48,7 +53,7 @@ def test_forced_seed_forensics_records_boundary_and_reject_diagnostics(tmp_path)
     )
 
     record = json.loads(path.read_text().strip())
-    assert record["schema_version"] == 3
+    assert record["schema_version"] == 4
     assert record["window_start"] == 500
     assert record["env_name"] == "openmathinstruct"
     assert record["checkpoint_hash"] == "sha256:test"
