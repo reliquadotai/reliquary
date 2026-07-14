@@ -143,6 +143,16 @@ def summarize(rows: list[dict]) -> dict:
         runtime_profiles[profile_hash].append(row)
         if profile_hash != "unreported":
             runtime_profile_details[profile_hash] = profile
+    sketch_diffs = [
+        float(item["sketch_diff_max"])
+        for item in rollouts_v4
+        if item.get("sketch_diff_max") is not None
+    ]
+    sketch_distinct_ratios = [
+        float(item["sketch_distinct_ratio"])
+        for item in rollouts_v4
+        if item.get("sketch_distinct_ratio") is not None
+    ]
 
     return {
         "records_total": len(rows),
@@ -308,6 +318,24 @@ def summarize(rows: list[dict]) -> dict:
             ),
             key=lambda item: (-item["records"], item["profile_hash"]),
         ),
+        "sketch_security_schema_v4": {
+            "rollouts_observed": len(sketch_diffs),
+            "constant_commitment_rollouts": sum(
+                bool(item.get("sketch_constant", False))
+                for item in rollouts_v4
+            ),
+            "zero_dominated_rollouts": sum(
+                float(item.get("sketch_zero_ratio", 0.0) or 0.0) >= 0.5
+                for item in rollouts_v4
+            ),
+            "sketch_diff_max_p50": _quantile(sketch_diffs, 0.50),
+            "sketch_diff_max_p95": _quantile(sketch_diffs, 0.95),
+            "sketch_diff_max_p99": _quantile(sketch_diffs, 0.99),
+            "sketch_diff_max_max": max(sketch_diffs) if sketch_diffs else None,
+            "sketch_distinct_ratio_p01": _quantile(
+                sketch_distinct_ratios, 0.01,
+            ),
+        },
         "decision": decision,
         "activation_rule": (
             "Do not set FORCED_SEED_CDF_ENFORCE=true until at least 24h, "
@@ -433,6 +461,12 @@ def main() -> None:
         f"{report['directionality_schema_v4']['both_offsets_observed']} "
         "with both CDF and repetition onsets; "
         f"{len(report['by_runtime_profile_schema_v4'])} runtime profiles"
+    )
+    print(
+        "v4 sketch telemetry: "
+        f"{report['sketch_security_schema_v4']['rollouts_observed']} rollouts; "
+        f"constant={report['sketch_security_schema_v4']['constant_commitment_rollouts']} "
+        f"zero-dominated={report['sketch_security_schema_v4']['zero_dominated_rollouts']}"
     )
     print(report["activation_rule"])
 

@@ -1,5 +1,6 @@
 from reliquary.validator.rollout_telemetry import (
     classify_bft_termination,
+    sketch_commitment_metrics,
     token_degeneracy_metrics,
 )
 
@@ -24,6 +25,21 @@ def test_token_degeneracy_metrics_handles_short_completion():
     assert metrics["repeated_ngram_fraction"] == 0.0
     assert metrics["first_repeated_ngram_offset"] is None
     assert metrics["max_same_token_run"] == 1
+
+
+def test_sketch_commitment_metrics_detects_constant_and_zero_dominated():
+    metrics = sketch_commitment_metrics(
+        [{"sketch": 0}, {"sketch": 0}, {"sketch": "0"}, {"bad": 1}]
+    )
+
+    assert metrics == {
+        "sketch_count": 3,
+        "sketch_distinct_count": 1,
+        "sketch_distinct_ratio": 1 / 3,
+        "sketch_zero_count": 3,
+        "sketch_zero_ratio": 1.0,
+        "sketch_constant": True,
+    }
 
 
 def test_classify_bft_termination_uses_only_validated_force_span():

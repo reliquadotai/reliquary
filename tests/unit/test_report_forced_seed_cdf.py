@@ -83,6 +83,10 @@ def test_report_correlates_cdf_onset_with_repetition_by_termination_path():
             "repeated_ngram_fraction": 0.2,
             "tail_repeated_ngram_fraction": 0.4,
             "max_same_token_run": 9,
+            "sketch_diff_max": 2100,
+            "sketch_distinct_ratio": 1.0,
+            "sketch_zero_ratio": 0.0,
+            "sketch_constant": False,
         },
         {
             "termination_path": "phase1_eos",
@@ -93,6 +97,10 @@ def test_report_correlates_cdf_onset_with_repetition_by_termination_path():
             "repeated_ngram_fraction": 0.0,
             "tail_repeated_ngram_fraction": 0.0,
             "max_same_token_run": 1,
+            "sketch_diff_max": 1200,
+            "sketch_distinct_ratio": 0.01,
+            "sketch_zero_ratio": 1.0,
+            "sketch_constant": True,
         },
     ]
 
@@ -113,6 +121,16 @@ def test_report_correlates_cdf_onset_with_repetition_by_termination_path():
     assert runtime["profile_hash"] == "ab" * 32
     assert runtime["n_hard_mismatch"] == 0
     assert runtime["fla_version"] == "0.5.0"
+    assert report["sketch_security_schema_v4"] == {
+        "rollouts_observed": 2,
+        "constant_commitment_rollouts": 1,
+        "zero_dominated_rollouts": 1,
+        "sketch_diff_max_p50": 1650.0,
+        "sketch_diff_max_p95": 2055.0,
+        "sketch_diff_max_p99": 2091.0,
+        "sketch_diff_max_max": 2100.0,
+        "sketch_distinct_ratio_p01": 0.0199,
+    }
 
 
 def test_select_rows_can_isolate_latest_checkpoint_and_recent_windows():

@@ -9,6 +9,34 @@ from __future__ import annotations
 from typing import Iterable
 
 
+def sketch_commitment_metrics(commitments: Iterable[object]) -> dict[str, int | float | bool]:
+    """Return content-free shape metrics for submitted GRAIL sketches.
+
+    Exact sketches stay out of telemetry.  The aggregate signals are enough to
+    detect constant, zero-dominated, or unusually low-entropy submissions while
+    the honest sketch-difference distribution is recalibrated.
+    """
+    values: list[int] = []
+    for commitment in commitments:
+        if not isinstance(commitment, dict):
+            continue
+        try:
+            values.append(int(commitment["sketch"]))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+    count = len(values)
+    distinct = len(set(values))
+    zeros = sum(value == 0 for value in values)
+    return {
+        "sketch_count": count,
+        "sketch_distinct_count": distinct,
+        "sketch_distinct_ratio": distinct / count if count else 0.0,
+        "sketch_zero_count": zeros,
+        "sketch_zero_ratio": zeros / count if count else 0.0,
+        "sketch_constant": bool(count and distinct == 1),
+    }
+
+
 def _repeated_ngram_metrics(tokens: list[int], n: int) -> tuple[float, int | None]:
     if n <= 0 or len(tokens) < n:
         return 0.0, None

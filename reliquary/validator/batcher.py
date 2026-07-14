@@ -84,6 +84,7 @@ from reliquary.validator.reward_shape import detect_reward_shape_manipulation
 from reliquary.validator.rollout_patterns import detect_opposite_reward_clones
 from reliquary.validator.rollout_telemetry import (
     classify_bft_termination,
+    sketch_commitment_metrics,
     token_degeneracy_metrics,
 )
 from reliquary.validator.selection_digest import compute_rollouts_selection_digest
@@ -1367,6 +1368,9 @@ class GrpoWindowBatcher:
             rollout_token_metrics = token_degeneracy_metrics(
                 _seed_completion_tokens
             )
+            rollout_sketch_metrics = sketch_commitment_metrics(
+                rollout.commit.get("commitments") or []
+            )
             seed_u = [
                 u_at(
                     self.randomness, request.miner_hotkey, request.prompt_idx,
@@ -1475,6 +1479,7 @@ class GrpoWindowBatcher:
                 "forced": False,
                 "validated_force_span_length": 0,
                 **rollout_token_metrics,
+                **rollout_sketch_metrics,
             }
             seed_cdf_per_rollout.append(seed_cdf_entry)
             if proof.sketch_diff_max > sketch_diff_max:
@@ -1654,6 +1659,9 @@ class GrpoWindowBatcher:
             )
             seed_cdf_entry["termination_path"] = (
                 rollout._validated_termination_path
+            )
+            seed_cdf_entry["sketch_diff_max"] = int(
+                proof.sketch_diff_max
             )
 
             lp_ok, lp_dev = verify_logprobs_claim(
@@ -1953,6 +1961,7 @@ class GrpoWindowBatcher:
                 if request.runtime_fingerprint is not None
                 else None
             ),
+            sketch_diff_max=sketch_diff_max,
         )
         if group_reject or rollout_reject or cdf_reject:
             if cdf_reject:
