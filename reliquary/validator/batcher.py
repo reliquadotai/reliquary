@@ -1298,6 +1298,10 @@ class GrpoWindowBatcher:
         seed_cdf_per_rollout: list[dict[str, int | float]] = []
 
         for rollout_idx, rollout in enumerate(request.rollouts):
+            # Never carry a validator-derived carve across re-validation of the
+            # same Pydantic object.  The private value is set only after the
+            # signed commit's force span passes the canonical BFT checks below.
+            rollout._validated_force_span = None
             # `truncated` is a validator-set flag (overlong reward shaping, see
             # submission.py). Wipe any miner-supplied value at ingestion so only
             # the validator's own cap/EOS detection below can set it — otherwise
@@ -1583,6 +1587,12 @@ class GrpoWindowBatcher:
                     RejectReason.TOKEN_TAMPERED,
                     "force_span",
                     sketch_diff_max=sketch_diff_max,
+                )
+            if rollout_dict.get("forced"):
+                declared_span = rollout_dict.get("force_span")
+                rollout._validated_force_span = (
+                    int(declared_span[0]),
+                    int(declared_span[1]),
                 )
 
             lp_ok, lp_dev = verify_logprobs_claim(

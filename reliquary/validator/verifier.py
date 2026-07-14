@@ -496,7 +496,13 @@ def verify_commitment_proofs(
         force_span = rollout_meta.get("force_span")
         if (rollout_meta.get("forced")
                 and isinstance(force_span, (list, tuple)) and len(force_span) == 2):
-            fs0, fs1 = int(force_span[0]), int(force_span[1])
+            try:
+                fs0, fs1 = int(force_span[0]), int(force_span[1])
+            except (TypeError, ValueError, OverflowError):
+                # The canonical force-span gate rejects this later. Keep all
+                # positions in the seed check here and, critically, do not let
+                # malformed untrusted metadata abort the verifier worker.
+                fs0, fs1 = 0, 0
         else:
             fs0, fs1 = 0, 0
         # completion offset j = t - prompt_length indexes seed_u_values.
@@ -1090,7 +1096,10 @@ def validate_force_span(
     span = rollout_meta.get("force_span")
     if not isinstance(span, (list, tuple)) or len(span) != 2:
         return False, set()
-    start, end = int(span[0]), int(span[1])
+    try:
+        start, end = int(span[0]), int(span[1])
+    except (TypeError, ValueError, OverflowError):
+        return False, set()
     if not (prompt_length <= start < end <= len(tokens)):
         return False, set()
     if start - prompt_length != int(thinking_budget):

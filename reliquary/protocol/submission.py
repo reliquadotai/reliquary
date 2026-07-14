@@ -109,6 +109,12 @@ class RolloutSubmission(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    # Validator-derived training boundary.  The wire-level ``force_span`` lives
+    # inside the signed commit, but remains untrusted until the batcher verifies
+    # its content and position.  Keeping the trusted value private prevents a
+    # miner-declared span from influencing GRPO loss masking.
+    _validated_force_span: tuple[int, int] | None = PrivateAttr(default=None)
+
     tokens: list[int] = Field(..., min_length=1)
     reward: FiniteFloat  # miner's local reward; validator re-checks it
     commit: dict[str, Any]

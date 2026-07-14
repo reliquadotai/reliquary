@@ -203,14 +203,16 @@ def _env_weight_for_batch(batch, env_weights: dict) -> float:
     return 1.0
 
 
-def _completion_keep_list(rollout_meta, prompt_length: int, n_completion: int):
+def _completion_keep_list(rollout, prompt_length: int, n_completion: int):
     """Return a boolean keep list over completion positions.
 
     BFT forced-close tokens are validator-accepted but not policy-sampled, so
     they must be excluded from every policy-gradient path and from token-count
-    normalization denominators. ``None`` means every completion token is kept.
+    normalization denominators.  Only the batcher's private, validator-derived
+    span is trusted; wire metadata is never a training input. ``None`` means
+    every completion token is kept.
     """
-    force_span = rollout_meta.get("force_span")
+    force_span = getattr(rollout, "_validated_force_span", None)
     if not force_span:
         return None
     keep = [True] * max(0, int(n_completion))
@@ -222,11 +224,11 @@ def _completion_keep_list(rollout_meta, prompt_length: int, n_completion: int):
 
 
 def _trainable_completion_count(
-    rollout_meta,
+    rollout,
     prompt_length: int,
     n_completion: int,
 ) -> int:
-    keep = _completion_keep_list(rollout_meta, prompt_length, n_completion)
+    keep = _completion_keep_list(rollout, prompt_length, n_completion)
     if keep is None:
         return max(0, int(n_completion))
     return sum(1 for flag in keep if flag)
@@ -265,7 +267,7 @@ def _plan_from_batches(batches, env_weights: Optional[dict] = None):
                 old = meta.get("token_logprobs", []) or []
                 prompt_length = int(meta.get("prompt_length", 0) or 0)
                 batch_tokens[b_idx] += _trainable_completion_count(
-                    meta, prompt_length, len(old),
+                    rollout, prompt_length, len(old),
                 )
 
     raw_weights = None
@@ -403,11 +405,11 @@ def _selected_logprobs_for_tokens(model, tokens: torch.Tensor, next_tokens: torc
     return _selected_logprobs(logits[:-1], next_tokens)
 
 
-def _completion_keep_mask(rollout_meta, prompt_length, n_completion, device):
+def _completion_keep_mask(rollout, prompt_length, n_completion, device):
     """Boolean keep-mask over completion positions with the BFT ``force_span``
     excluded. Returns ``None`` when the rollout is not forced (train every
     completion token, identical to the pre-BFT path)."""
-    keep = _completion_keep_list(rollout_meta, prompt_length, n_completion)
+    keep = _completion_keep_list(rollout, prompt_length, n_completion)
     if keep is None:
         return None
     return torch.tensor(keep, dtype=torch.bool, device=device)
@@ -469,12 +471,13 @@ def _rollout_loss(
             f"model predicts {len(new_logprobs_c)} completion tokens"
         )
 
-    # BFT: mask the injected FORCE span out of the loss (= DAPO Overlong
-    # Filtering, narrowed to the carve). Those tokens were not sampled by the
-    # policy, so policy-gradient on them is invalid and their tiny probability
-    # would blow up the ratio; train only thinking-before + answer-after.
+    # Mask the validator-injected FORCE span out of the loss. Those actions were
+    # not sampled by the policy, so policy-gradient on them is invalid and their
+    # tiny probability would blow up the ratio; train thinking-before and the
+    # answer-after only. This is injected-action masking, not DAPO overlong
+    # filtering (which drops whole overlong samples).
     keep = _completion_keep_mask(
-        rollout.commit.get("rollout", {}), prompt_length,
+        rollout, prompt_length,
         int(new_logprobs_c.shape[0]), device,
     )
 
@@ -698,7 +701,7 @@ def _build_microbatch_items(plan):
             if n_completion <= 0 or n_completion != len(old):
                 logger.warning("rollout skipped: log-prob length mismatch")
                 continue
-            keep = _completion_keep_list(meta, p, n_completion)
+            keep = _completion_keep_list(rollout, p, n_completion)
             if keep is None:
                 keep = [True] * n_completion
             if not any(keep):
