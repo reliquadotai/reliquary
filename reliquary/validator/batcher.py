@@ -482,6 +482,10 @@ class GrpoWindowBatcher:
         # under ``_lock`` after each successful accept; the read in /state
         # is lock-free (int reads are GIL-atomic in CPython).
         self.valid_count: int = 0
+        # Same lock-free contract, for admitted-but-unproven submissions. This
+        # is what fills during the window now: ``valid_count`` only moves at
+        # seal, once the ranked candidates have been proven.
+        self.pending_count: int = 0
 
         if verify_commitment_proofs_fn is None:
             from reliquary.validator.verifier import verify_commitment_proofs
@@ -503,11 +507,17 @@ class GrpoWindowBatcher:
         ] = {}
         self._logical_group_duplicate_rejects = 0
         self._valid: list[ValidSubmission] = []
+        # Admitted, graded and scored, but NOT yet proven. The auction ranks
+        # these at seal; only the candidates that can actually win pay for a
+        # GPU proof (see ``_verify_expensive``).
+        self._pending: list[PendingSubmission] = []
         # v2.3: per-prompt bucket. Multiple miners may submit on the same
         # ``prompt_idx`` up to ``MAX_SUBMISSIONS_PER_PROMPT``. Tracked
         # alongside the flat ``_valid`` list because seal_batch needs the
         # grouping but accept-time logic only needs the count.
-        self._submissions_per_prompt: dict[int, list[ValidSubmission]] = {}
+        self._submissions_per_prompt: dict[
+            int, list[ValidSubmission | PendingSubmission]
+        ] = {}
         self.randomness: str = ""
         # Per-window eligible prompt slice [lo, hi). None = no restriction
         # (randomness not yet known, or window is before the enforcement
@@ -696,6 +706,18 @@ class GrpoWindowBatcher:
         return len({
             s.prompt_idx for s in list(self._valid)
             if not self._cooldown.is_in_cooldown(s.prompt_idx, self.window_start)
+        })
+
+    def distinct_pending_prompt_count(self) -> int:
+        """Distinct non-cooldown prompts among graded (unproven) submissions.
+
+        This — not ``distinct_valid_prompt_count`` — is the window's fill level
+        now that proofs run at seal: ``_valid`` stays empty until then, so a
+        seal trigger reading it would never fire.
+        """
+        return len({
+            p.prompt_idx for p in list(self._pending)
+            if not self._cooldown.is_in_cooldown(p.prompt_idx, self.window_start)
         })
 
     def seconds_since_last_valid_submission(self) -> float | None:
@@ -1277,6 +1299,180 @@ class GrpoWindowBatcher:
             )
             return reject(RejectReason.DISTRIBUTION_SUSPICIOUS, "distribution")
 
+        # Cheap per-rollout checks. Everything below that needs the GPU proof
+        # now runs at seal, in ``_verify_expensive``, on ranked candidates only.
+        for rollout in request.rollouts:
+            # `truncated` is a validator-set flag (overlong reward shaping, see
+            # submission.py). Wipe any miner-supplied value at ingestion so only
+            # the validator's own cap/EOS detection below can set it — otherwise
+            # a miner could flag a losing rollout to clamp its negative advantage
+            # to -SHAPE_PENALTY via _shape_advantages and attenuate the gradient.
+            _ingest_meta = rollout.commit.get("rollout")
+            if isinstance(_ingest_meta, dict):
+                _ingest_meta["truncated"] = False
+                # BFT is math-only (mirror the miner's env gate): `forced` is a
+                # validator-honoured flag solely for openmathinstruct. Wipe any
+                # non-math value at ingestion so the BFT carve-out stays scoped
+                # to math.
+                if getattr(self.env, "name", "") != "openmathinstruct":
+                    _ingest_meta["forced"] = False
+            if not self._verify_signature(rollout.commit, request.miner_hotkey):
+                return reject(RejectReason.BAD_SIGNATURE, "rollout_signature")
+            # Randomness binding: the miner-claimed beacon randomness MUST equal
+            # the validator's per-window derived randomness. Without this check,
+            # the sketch-tolerance window (~5000 mod q≈2.15e9) is wide enough
+            # that miners using a constant pre-computed r_vec can still slip
+            # under the GRAIL diff threshold — observed sketch_diff_max sitting
+            # at ~3000–5000 on real submissions, just under the per-position
+            # limit. That collapses GRAIL's randomness-binding security to the
+            # tolerance × num_buckets product and removes the per-window
+            # unpredictability the sketch was designed to provide. Reject here,
+            # before paying for the GRAIL forward pass on a commit we already
+            # know is detached from the validator's window seed.
+            claimed_rand = (rollout.commit.get("beacon") or {}).get("randomness", "")
+            if claimed_rand != self.randomness:
+                return reject(RejectReason.WRONG_RANDOMNESS, "randomness")
+
+        pending = PendingSubmission(
+            hotkey=request.miner_hotkey,
+            prompt_idx=request.prompt_idx,
+            request=request,
+            rewards=list(rewards),
+            drand_round=request.drand_round,
+            merkle_root=bytes.fromhex(request.merkle_root),
+            selection_digest=compute_rollouts_selection_digest(request.rollouts),
+            arrived_at=self._time_fn(),
+            telemetry=telemetry,
+        )
+        self._pending.append(pending)
+        self._submissions_per_prompt.setdefault(
+            request.prompt_idx, []
+        ).append(pending)
+        self.last_valid_submission_at = self._time_fn()
+        self.last_valid_submission_wall_ts = self._wall_clock()
+        # Lock-free read in /state — see ``__init__`` for rationale.
+        self.pending_count = len(self._pending)
+
+        self._maybe_trigger_seal(request, telemetry)
+
+        return BatchSubmissionResponse(
+            accepted=True, reason=RejectReason.ACCEPTED
+        )
+
+    def _maybe_trigger_seal(
+        self,
+        request: BatchSubmissionRequest,
+        telemetry: SubmitTelemetry | None,
+    ) -> None:
+        """Arm the delayed seal once B distinct non-cooldown prompts are PENDING.
+
+        Counts pending, not valid: proofs now run at seal, so ``_valid`` is
+        empty for the whole window and a trigger reading it would never fire.
+        """
+        # v2.1: fire seal_event when B distinct non-cooldown prompts have been accepted.
+        distinct_eligible = self.distinct_pending_prompt_count()
+        if distinct_eligible >= B_BATCH and self._seal_trigger_round is None:
+            # B-th distinct prompt just landed. Record the trigger drand
+            # round and DELAY the actual seal until the round expires —
+            # any further submissions in this same drand round can still
+            # be accepted and share the boundary slot value via
+            # ``select_batch_and_distribute``'s boundary branch.
+            #
+            # Two firing paths bring ``_seal_flag`` up:
+            #   1. ``_delayed_seal_at_drand_boundary`` — a coroutine
+            #      scheduled below sleeps until the next drand boundary
+            #      and fires the seal even if no further traffic arrives.
+            #   2. The early-fire above: a submission from a LATER drand
+            #      round arrives → seal fires immediately, the late
+            #      submission is rejected.
+            # Whichever fires first wins; the other path becomes a no-op
+            # because ``_seal_flag.is_set()`` short-circuits.
+            self._seal_trigger_round = request.drand_round
+            if telemetry is not None:
+                telemetry.seal_trigger_round = self._seal_trigger_round
+                telemetry.valid_submissions_at_decision = len(self._pending)
+                log_submission_stage(
+                    logger,
+                    logging.INFO,
+                    "seal_triggered",
+                    telemetry,
+                    distinct_eligible=distinct_eligible,
+                    batch_size=B_BATCH,
+                    seal_trigger_round=self._seal_trigger_round,
+                )
+            if self._loop is not None:
+                # Production path: schedule the delayed fire on the
+                # validator's asyncio loop.
+                asyncio.run_coroutine_threadsafe(
+                    self._delayed_seal_at_drand_boundary(),
+                    self._loop,
+                )
+            else:
+                # Synchronous test path (no running loop): fire seal
+                # immediately, matching the pre-v2.3 timing tests rely on.
+                self._seal_flag.set()
+                if self._seal_event is not None:
+                    self._seal_event.set()
+
+    def _verify_expensive(
+        self, pending: PendingSubmission
+    ) -> ValidSubmission | None:
+        """Prove one graded candidate on the GPU and run every proof-dependent
+        gate. Returns the ``ValidSubmission`` on success, ``None`` on rejection.
+
+        Deliberately NOT called under ``self._lock``: the GRAIL forward is 5-25 s
+        and holding the lock across it is what serialized admission. On rejection
+        it calls ``self._reject`` exactly as the inline pipeline did, so per-hotkey
+        proof-failure debt and the R2 archive entries are unchanged.
+        """
+        request = pending.request
+        telemetry = pending.telemetry
+        hk = request.miner_hotkey
+        pi = request.prompt_idx
+
+        def reject(
+            reason: RejectReason,
+            stage: str,
+            **kwargs: Any,
+        ) -> None:
+            self._reject(
+                reason,
+                hotkey=hk,
+                prompt_idx=pi,
+                telemetry=telemetry,
+                reject_stage=stage,
+                **kwargs,
+            )
+            return None
+
+        # Re-derive the cheap locals the moved gates read. Each is a pure
+        # function of the request, so they are identical to what admission saw.
+        problem = self.env.get_problem(pi)
+        completion_texts = [
+            self._completion_text(rollout) for rollout in request.rollouts
+        ]
+        rewards = list(pending.rewards)
+        sigma = rewards_std(rewards)
+        completion_lengths = []
+        for rollout in request.rollouts:
+            rollout_meta = (rollout.commit or {}).get("rollout", {}) or {}
+            prompt_len = int(rollout_meta.get("prompt_length", 0) or 0)
+            completion_lengths.append(
+                int(
+                    rollout_meta.get(
+                        "completion_length",
+                        max(0, len(rollout.commit.get("tokens", [])) - prompt_len),
+                    )
+                    or 0
+                )
+            )
+        rollout_hashes: list[bytes] = []
+        if self._hash_set is not None:
+            rollout_hashes = [
+                compute_rollout_hash(rollout.commit["tokens"])
+                for rollout in request.rollouts
+            ]
+
         # Per-submission worst-case filter telemetry (across all rollouts).
         sketch_diff_max = 0
         lp_dev_max: float | None = None
@@ -1349,36 +1545,6 @@ class GrpoWindowBatcher:
         seed_cdf_per_rollout: list[dict[str, int | float]] = []
 
         for rollout_idx, rollout in enumerate(request.rollouts):
-            # `truncated` is a validator-set flag (overlong reward shaping, see
-            # submission.py). Wipe any miner-supplied value at ingestion so only
-            # the validator's own cap/EOS detection below can set it — otherwise
-            # a miner could flag a losing rollout to clamp its negative advantage
-            # to -SHAPE_PENALTY via _shape_advantages and attenuate the gradient.
-            _ingest_meta = rollout.commit.get("rollout")
-            if isinstance(_ingest_meta, dict):
-                _ingest_meta["truncated"] = False
-                # BFT is math-only (mirror the miner's env gate): `forced` is a
-                # validator-honoured flag solely for openmathinstruct. Wipe any
-                # non-math value at ingestion so the BFT carve-out stays scoped
-                # to math.
-                if getattr(self.env, "name", "") != "openmathinstruct":
-                    _ingest_meta["forced"] = False
-            if not self._verify_signature(rollout.commit, request.miner_hotkey):
-                return reject(RejectReason.BAD_SIGNATURE, "rollout_signature")
-            # Randomness binding: the miner-claimed beacon randomness MUST equal
-            # the validator's per-window derived randomness. Without this check,
-            # the sketch-tolerance window (~5000 mod q≈2.15e9) is wide enough
-            # that miners using a constant pre-computed r_vec can still slip
-            # under the GRAIL diff threshold — observed sketch_diff_max sitting
-            # at ~3000–5000 on real submissions, just under the per-position
-            # limit. That collapses GRAIL's randomness-binding security to the
-            # tolerance × num_buckets product and removes the per-window
-            # unpredictability the sketch was designed to provide. Reject here,
-            # before paying for the GRAIL forward pass on a commit we already
-            # know is detached from the validator's window seed.
-            claimed_rand = (rollout.commit.get("beacon") or {}).get("randomness", "")
-            if claimed_rand != self.randomness:
-                return reject(RejectReason.WRONG_RANDOMNESS, "randomness")
             # Per-position forced-seed uniforms for this rollout's teacher-forced
             # consistency check. Read completion_length here (ahead of the
             # ``completion_len`` computed later at the sparse-outputs section)
@@ -1963,19 +2129,16 @@ class GrpoWindowBatcher:
             truncated_flags,
         )
 
-        # All checks passed — append to both the flat list and the per-prompt
-        # bucket. The bucket is what seal_batch groups over.
+        # All checks passed.
         new_sub = ValidSubmission(
             hotkey=request.miner_hotkey,
             prompt_idx=request.prompt_idx,
-            merkle_root_bytes=bytes.fromhex(request.merkle_root),
-            selection_digest_bytes=compute_rollouts_selection_digest(
-                request.rollouts
-            ),
+            merkle_root_bytes=pending.merkle_root,
+            selection_digest_bytes=pending.selection_digest,
             sigma=sigma,
             rollouts=list(request.rollouts),
             completion_texts=completion_texts,
-            arrived_at=self._time_fn(),
+            arrived_at=pending.arrived_at,
             sketch_diff_max=sketch_diff_max,
             lp_dev_max=lp_dev_max,
             dist_q10_min=dist_q10_min,
@@ -2011,64 +2174,10 @@ class GrpoWindowBatcher:
             truncated_count=truncated_count,
             reward_shape=reward_shape.to_log_dict(),
         )
-        self._valid.append(new_sub)
-        self._submissions_per_prompt.setdefault(
-            request.prompt_idx, []
-        ).append(new_sub)
-        self.last_valid_submission_at = self._time_fn()
-        self.last_valid_submission_wall_ts = self._wall_clock()
-        # Lock-free read in /state — see ``__init__`` for rationale.
-        self.valid_count = len(self._valid)
 
-        # v2.1: fire seal_event when B distinct non-cooldown prompts have been accepted.
-        distinct_eligible = self.distinct_valid_prompt_count()
-        if distinct_eligible >= B_BATCH and self._seal_trigger_round is None:
-            # B-th distinct prompt just landed. Record the trigger drand
-            # round and DELAY the actual seal until the round expires —
-            # any further submissions in this same drand round can still
-            # be accepted and share the boundary slot value via
-            # ``select_batch_and_distribute``'s boundary branch.
-            #
-            # Two firing paths bring ``_seal_flag`` up:
-            #   1. ``_delayed_seal_at_drand_boundary`` — a coroutine
-            #      scheduled below sleeps until the next drand boundary
-            #      and fires the seal even if no further traffic arrives.
-            #   2. The early-fire above: a submission from a LATER drand
-            #      round arrives → seal fires immediately, the late
-            #      submission is rejected.
-            # Whichever fires first wins; the other path becomes a no-op
-            # because ``_seal_flag.is_set()`` short-circuits.
-            self._seal_trigger_round = request.drand_round
-            new_sub.seal_trigger_round = self._seal_trigger_round
-            if telemetry is not None:
-                telemetry.seal_trigger_round = self._seal_trigger_round
-                telemetry.valid_submissions_at_decision = len(self._valid)
-                log_submission_stage(
-                    logger,
-                    logging.INFO,
-                    "seal_triggered",
-                    telemetry,
-                    distinct_eligible=distinct_eligible,
-                    batch_size=B_BATCH,
-                    seal_trigger_round=self._seal_trigger_round,
-                )
-            if self._loop is not None:
-                # Production path: schedule the delayed fire on the
-                # validator's asyncio loop.
-                asyncio.run_coroutine_threadsafe(
-                    self._delayed_seal_at_drand_boundary(),
-                    self._loop,
-                )
-            else:
-                # Synchronous test path (no running loop): fire seal
-                # immediately, matching the pre-v2.3 timing tests rely on.
-                self._seal_flag.set()
-                if self._seal_event is not None:
-                    self._seal_event.set()
-
-        return BatchSubmissionResponse(
-            accepted=True, reason=RejectReason.ACCEPTED
-        )
+        # Proven. The caller decides what to do with it — this method owns no
+        # batcher state, so it is safe to run outside ``_lock``.
+        return new_sub
 
     async def _delayed_seal_at_drand_boundary(self) -> None:
         """Fire ``_seal_flag`` once (a) the trigger drand round expires
@@ -2207,6 +2316,11 @@ class GrpoWindowBatcher:
     def valid_submissions(self) -> list[ValidSubmission]:
         with self._lock:
             return list(self._valid)
+
+    def pending_submissions(self) -> list[PendingSubmission]:
+        """Graded, scored, not yet proven. The auction ranks these."""
+        with self._lock:
+            return list(self._pending)
 
     def _compute_shadow_auction(self, pool: float) -> dict[str, Any]:
         """The batch the difficulty auction WOULD have picked. Observation only.

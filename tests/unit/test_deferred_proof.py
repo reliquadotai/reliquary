@@ -38,3 +38,37 @@ def test_pending_submission_ranks_in_the_auction():
     )
 
     assert [s.hotkey for s in batch] == ["hard"]
+
+
+def test_accept_does_not_touch_the_gpu():
+    """Admission must be proof-free. If the GPU is called during accept, the
+    whole design collapses — we would be proving ~69 submissions per window."""
+    from tests.unit.test_grpo_window_batcher import _make_batcher, _request
+
+    calls = []
+
+    def _exploding_proof(*a, **kw):
+        calls.append(1)
+        raise AssertionError("GRAIL must not run during admission")
+
+    b = _make_batcher(verify_commitment_proofs_fn=_exploding_proof)
+    resp = b.accept_submission(_request(prompt_idx=7, hotkey="miner"))
+
+    assert resp.accepted is True
+    assert calls == []
+    assert len(b.pending_submissions()) == 1
+    assert b.pending_submissions()[0].value > 0.0   # graded + scored
+
+
+def test_verify_expensive_runs_the_proof_and_returns_a_valid_submission():
+    from tests.unit.test_grpo_window_batcher import _make_batcher, _request
+
+    b = _make_batcher()
+    b.accept_submission(_request(prompt_idx=7, hotkey="miner"))
+    pending = b.pending_submissions()[0]
+
+    proven = b._verify_expensive(pending)
+
+    assert proven is not None
+    assert proven.hotkey == "miner"
+    assert proven.value == pending.value
