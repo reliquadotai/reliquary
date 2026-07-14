@@ -7,6 +7,7 @@ validator's shared ``CooldownMap``.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import math
 import threading
@@ -24,6 +25,7 @@ from reliquary.constants import (
     MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
     MIN_EOS_PROBABILITY,
+    FORENSIC_SAMPLE_PER_WINDOW,
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
     MAX_PROOF_ATTEMPTS_PER_WINDOW,
     MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
@@ -384,6 +386,21 @@ class RejectedSubmission:
     reject_stage: str | None = None
 
 
+@dataclass
+class ForensicSampleResult:
+    """A non-winner proven purely for telemetry (see ``FORENSIC_SAMPLE_PER_WINDOW``).
+
+    The proof runs for its side effects — the authenticity/forensic gates in
+    ``_verify_expensive`` fire and any reject lands in ``rejected_submissions``
+    as usual — but ``passed`` submissions are still discarded: never added to
+    ``_valid``, never paid.
+    """
+
+    hotkey: str
+    prompt_idx: int
+    passed: bool
+
+
 class GrpoWindowBatcher:
     """Accepts v2 submissions, runs the full verification pipeline, and
     exposes ``valid_submissions()`` + ``select_batch()`` at window close.
@@ -520,6 +537,13 @@ class GrpoWindowBatcher:
         # these at seal; only the candidates that can actually win pay for a
         # GPU proof (see ``_verify_expensive``).
         self._pending: list[PendingSubmission] = []
+        # ids of pending submissions ``_prove_ranked`` already attempted this
+        # window (winner or failure). ``_prove_forensic_sample`` reads this to
+        # sample only from what was never looked at.
+        self._attempted_pending_ids: set[int] = set()
+        # Non-winners proven purely for telemetry — see FORENSIC_SAMPLE_PER_WINDOW.
+        # Never touches ``_valid``; a passing entry here is still unpaid.
+        self.forensic_sample: list[ForensicSampleResult] = []
         # v2.3: per-prompt bucket. Multiple miners may submit on the same
         # ``prompt_idx`` up to ``MAX_SUBMISSIONS_PER_PROMPT``. Tracked
         # alongside the flat ``_valid`` list because seal_batch needs the
@@ -2401,6 +2425,7 @@ class GrpoWindowBatcher:
         attempts = 0
         proven: list[ValidSubmission] = []
         claimed: set[int] = set()
+        attempted_ids: set[int] = set()
 
         for pending in ranked:
             if len(proven) >= B_BATCH:
@@ -2425,6 +2450,7 @@ class GrpoWindowBatcher:
             ):
                 continue
             attempts += 1
+            attempted_ids.add(id(pending))
             sub = self._verify_expensive(pending)
             if sub is None:
                 continue          # rejected; promote the next-ranked
@@ -2435,7 +2461,52 @@ class GrpoWindowBatcher:
             self._valid = proven
             self.valid_count = len(proven)
         self.proof_attempts = attempts
+        # Read by _prove_forensic_sample to find the pending pool this window
+        # never looked at.
+        self._attempted_pending_ids = attempted_ids
         return proven
+
+    def _prove_forensic_sample(self) -> list[ForensicSampleResult]:
+        """Prove ``FORENSIC_SAMPLE_PER_WINDOW`` non-winners for telemetry only.
+
+        Deferring the proof to seal time means the authenticity gates inside
+        ``_verify_expensive`` (token-auth, distribution, logprob, forced-seed)
+        only ever fire on the ranked winners — this is how the fleet-wide
+        pre-generation and token-tamper detections were made, and deferral
+        would otherwise blind them. Selection is deterministic —
+        ``sha256(randomness || merkle_root)``, lowest digests win — never
+        ``random.sample``: validators must converge on an identical sample, and
+        a miner must not be able to predict whether he'll be looked at. Results
+        are discarded (never enter ``_valid``, never paid); only the R2-archived
+        outcome is kept. Runs serially and OUTSIDE the
+        ``MAX_PROOF_ATTEMPTS_PER_WINDOW`` budget — that budget bounds a griefer
+        wasting proofs on candidates that could win, this is separate, bounded
+        telemetry work.
+        """
+        with self._lock:
+            remainder = [
+                p for p in self._pending
+                if id(p) not in self._attempted_pending_ids
+            ]
+
+        def _digest(p: PendingSubmission) -> bytes:
+            return hashlib.sha256(
+                self.randomness.encode() + p.merkle_root
+            ).digest()
+
+        remainder.sort(key=_digest)
+        sample = remainder[:FORENSIC_SAMPLE_PER_WINDOW]
+
+        results = [
+            ForensicSampleResult(
+                hotkey=pending.hotkey,
+                prompt_idx=pending.prompt_idx,
+                passed=self._verify_expensive(pending) is not None,
+            )
+            for pending in sample
+        ]
+        self.forensic_sample = results
+        return results
 
     def seal_batch(
         self, pool: float = 1.0
@@ -2444,12 +2515,15 @@ class GrpoWindowBatcher:
 
         Proving happens first: ``_prove_ranked`` ranks the pending pool by
         difficulty and fills ``self._valid`` with the proven winners, which
-        everything below reads. Returns (training_batch, rewards_by_hotkey).
-        Cooldown and hash-set bookkeeping is applied to every winning prompt —
-        not just the one submission picked for training — because all of them
-        earn emission and were therefore "used" by this window.
+        everything below reads. ``_prove_forensic_sample`` then proves a small
+        random sample of the non-winners for telemetry only — it never touches
+        ``_valid``. Returns (training_batch, rewards_by_hotkey). Cooldown and
+        hash-set bookkeeping is applied to every winning prompt — not just the
+        one submission picked for training — because all of them earn emission
+        and were therefore "used" by this window.
         """
         self._prove_ranked(pool)
+        self._prove_forensic_sample()
         with self._lock:
             self.selection_metadata_by_id = explain_batch_selection(
                 submissions=self._valid,
