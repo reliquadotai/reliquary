@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 from typing import Any
@@ -1375,8 +1376,23 @@ class ValidationService:
                 if isinstance(difficulty_by_id, dict)
                 else {}
             )
+            arrival_ts = getattr(s, "arrival_ts", None)
+            window_opened_wall_ts = getattr(
+                batcher, "window_opened_wall_ts", None
+            )
+            arrival_age_seconds = None
+            if arrival_ts is not None and window_opened_wall_ts is not None:
+                try:
+                    candidate_age = float(arrival_ts) - float(
+                        window_opened_wall_ts
+                    )
+                except (TypeError, ValueError):
+                    candidate_age = float("nan")
+                if math.isfinite(candidate_age) and candidate_age >= 0.0:
+                    arrival_age_seconds = candidate_age
             return {
-                "arrival_ts": getattr(s, "arrival_ts", None),
+                "arrival_ts": arrival_ts,
+                "arrival_age_seconds": arrival_age_seconds,
                 "decision_ts": getattr(s, "decision_ts", None),
                 "submitted_drand_round": getattr(
                     s, "submitted_drand_round", getattr(s, "drand_round", None)
@@ -1407,6 +1423,13 @@ class ValidationService:
                 "difficulty_auction_mean_reward": difficulty_meta.get(
                     "mean_reward"
                 ),
+                "difficulty_auction_reward_std": difficulty_meta.get(
+                    "reward_std"
+                ),
+                "difficulty_auction_reward_count": difficulty_meta.get(
+                    "reward_count"
+                ),
+                "difficulty_auction_eligible": difficulty_meta.get("eligible"),
                 "difficulty_auction_rank": difficulty_meta.get("rank"),
                 "difficulty_auction_selected": difficulty_meta.get(
                     "shadow_selected"
@@ -1642,6 +1665,10 @@ class ValidationService:
             "environment": env_names_list[0],   # legacy singular, kept for compat
             "environments": env_names_list,      # multi-env canonical field
             "force_seal_reason": getattr(first_batcher, "force_seal_reason", None),
+            "window_opened_wall_ts_by_environment": {
+                env_name: getattr(env_batcher, "window_opened_wall_ts", None)
+                for env_name, env_batcher in batcher_dict.items()
+            },
             "batch": batch_entries,
             "runners_up": runners_up,
             "reject_summary": combined_reject_counts,
