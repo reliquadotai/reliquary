@@ -22,8 +22,16 @@ sys.modules[SPEC.name] = report_module
 SPEC.loader.exec_module(report_module)
 
 
-def _entry(hotkey, prompt_idx, rewards, *, selected=False, drand_round=1):
-    return {
+def _entry(
+    hotkey,
+    prompt_idx,
+    rewards,
+    *,
+    selected=False,
+    drand_round=1,
+    operator_id=None,
+):
+    entry = {
         "hotkey": hotkey,
         "prompt_idx": prompt_idx,
         "env_name": "openmathinstruct",
@@ -33,6 +41,9 @@ def _entry(hotkey, prompt_idx, rewards, *, selected=False, drand_round=1):
         "selected_for_batch": selected,
         "rewarded": selected,
     }
+    if operator_id is not None:
+        entry["difficulty_auction_operator_id"] = operator_id
+    return entry
 
 
 def _with_arrival(entry, *, exact=None, proxy=None):
@@ -287,6 +298,48 @@ def test_operator_cap_marks_zero_difficulty_window_not_applicable():
     assert shadow["operator_cap_not_applicable_windows"] == 1
 
 
+def test_archived_operator_snapshot_drives_historical_cap_and_wins_conflicts():
+    archive = {
+        "window_start": 10,
+        "environment": "openmathinstruct",
+        "batch": [
+            _entry(
+                "hk1",
+                1,
+                [1, 1, 0, 0, 0, 0, 0, 0],
+                selected=True,
+                operator_id="owner-at-window",
+            ),
+            _entry(
+                "hk2",
+                2,
+                [1, 1, 0, 0, 0, 0, 0, 0],
+                selected=True,
+                operator_id="owner-at-window",
+            ),
+        ],
+    }
+
+    report = report_module.replay_archives(
+        [archive],
+        environment="openmathinstruct",
+        deltas=(1.0,),
+        batch_size=2,
+        operator_of={"hk1": "new-owner-a", "hk2": "new-owner-b"},
+        max_slots_per_operator=1,
+    )
+
+    mapping = report["operator_mapping"]
+    assert mapping["complete_for_cap"] is True
+    assert mapping["archived_operator_candidates"] == 2
+    assert mapping["fallback_operator_candidates"] == 0
+    assert mapping["archived_external_conflicts"] == 2
+    assert report["production"]["operator_concentration"]["distinct"] == 1
+    shadow = report["counterfactual_by_delta"]["1"]
+    assert shadow["operator_cap_applied"] is True
+    assert shadow["selected_count"] == 1
+
+
 def test_malformed_shadow_stats_are_counted_instead_of_crashing():
     archive = {
         "window_start": 10,
@@ -376,6 +429,7 @@ def test_replay_selector_matches_runtime_shadow_randomized(
                     response_time=None,
                     production_selected=False,
                     production_rewarded=False,
+                    operator_id=None,
                 )
             )
 

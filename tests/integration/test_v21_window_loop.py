@@ -157,6 +157,7 @@ def _patch_open_grpo_window(svc):
         window_start, env, model, *,
         cooldown_map, hash_set, tokenizer, bootstrap=False,
         queue_drained_predicate=None,
+        operator_by_hotkey=None,
     ):
         b = GrpoWindowBatcher(
             window_start=window_start,
@@ -166,6 +167,7 @@ def _patch_open_grpo_window(svc):
             hash_set=hash_set,
             bootstrap=bootstrap,
             queue_drained_predicate=queue_drained_predicate,
+            operator_by_hotkey=operator_by_hotkey,
             # Stub out torch-dependent verifiers.
             verify_commitment_proofs_fn=_always_true_proof,
             verify_signature_fn=lambda c, h: True,
@@ -234,6 +236,7 @@ async def test_open_window_passes_verify_model_to_batcher(monkeypatch):
         window_start, env, model, *,
         cooldown_map, hash_set, tokenizer, bootstrap=False,
         queue_drained_predicate=None,
+        operator_by_hotkey=None,
     ):
         captured["model"] = model
         # Return a minimal batcher stub so the rest of _open_window doesn't crash
@@ -242,6 +245,7 @@ async def test_open_window_passes_verify_model_to_batcher(monkeypatch):
             window_start=window_start, env=env, model=model,
             cooldown_map=cooldown_map, hash_set=hash_set, bootstrap=bootstrap,
             queue_drained_predicate=queue_drained_predicate,
+            operator_by_hotkey=operator_by_hotkey,
             verify_commitment_proofs_fn=_always_true_proof,
             verify_signature_fn=lambda c, h: True,
             completion_text_fn=lambda r: "",
@@ -566,12 +570,14 @@ async def test_seal_drain_waits_for_inflight_proofs():
     def _capture_open(
         window_start, env, model, *, cooldown_map, hash_set, tokenizer,
         bootstrap=False, queue_drained_predicate=None,
+        operator_by_hotkey=None,
     ):
         captured["pred"] = queue_drained_predicate
         return GrpoWindowBatcher(
             window_start=window_start, env=env, model=model,
             cooldown_map=cooldown_map, hash_set=hash_set, bootstrap=bootstrap,
             queue_drained_predicate=queue_drained_predicate,
+            operator_by_hotkey=operator_by_hotkey,
             verify_commitment_proofs_fn=_always_true_proof,
             verify_signature_fn=lambda c, h: True,
             completion_text_fn=lambda r: "",

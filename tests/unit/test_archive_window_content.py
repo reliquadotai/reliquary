@@ -143,6 +143,7 @@ async def test_archive_includes_prompt_and_rollout_content():
             "eligible": True,
             "rank": 2,
             "shadow_selected": True,
+            "operator_id": "operator-a",
         },
         id(runner): {
             "value": 0.25,
@@ -225,6 +226,7 @@ async def test_archive_includes_prompt_and_rollout_content():
     assert entry0["difficulty_auction_eligible"] is True
     assert entry0["difficulty_auction_rank"] == 2
     assert entry0["difficulty_auction_selected"] is True
+    assert entry0["difficulty_auction_operator_id"] == "operator-a"
 
     # eos detection: rollout 0 of entry 0 ends with eos_token_id=99 → True.
     assert entry0["rollouts"][0]["eos_terminated"] is True
