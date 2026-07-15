@@ -10,6 +10,7 @@ import asyncio
 import logging
 import math
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -19,6 +20,10 @@ from reliquary.constants import (
     BATCH_PROMPT_COOLDOWN_WINDOWS,
     B_BATCH,
     BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION,
+    DIFFICULTY_AUCTION_DELTA,
+    DIFFICULTY_AUCTION_SHADOW_ENABLED,
+    DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS,
+    DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES,
     M_ROLLOUTS,
     MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
@@ -61,6 +66,10 @@ from reliquary.validator.dedup import (
     RolloutHashSet,
     compute_logical_group_hash,
     compute_rollout_hash,
+)
+from reliquary.validator.difficulty_auction import (
+    ShadowSubmission,
+    select_shadow_auction,
 )
 from reliquary.validator.observability import (
     DrandRoundObservation,
@@ -367,7 +376,6 @@ class GrpoWindowBatcher:
         drand_round_backward_tolerance: int | None = None,
         queue_drained_predicate: Callable[[], bool] | None = None,
     ) -> None:
-        import time
         from reliquary.constants import DRAND_ROUND_BACKWARD_TOLERANCE
 
         self.window_start = window_start
@@ -480,6 +488,15 @@ class GrpoWindowBatcher:
         # rejecting the most submissions in any given round.
         self.reject_counts: dict[str, int] = {}
         self.selection_metadata_by_id: dict[int, dict[str, Any]] = {}
+        # Observation-only counterfactual. It is computed from the same fully
+        # validated pool production saw and must never affect admission,
+        # proofs, sealing, selection, cooldown, training, or emission.
+        self.difficulty_auction_shadow: dict[str, Any] = {
+            "schema_version": 1,
+            "status": "not_computed",
+            "mode": "observation_only",
+        }
+        self.difficulty_auction_metadata_by_id: dict[int, dict[str, Any]] = {}
 
         # Per-hotkey-capped metadata for rejected submissions. Persisted in
         # the R2 archive next to ``reject_counts`` so a rejected miner can
@@ -2242,6 +2259,172 @@ class GrpoWindowBatcher:
         with self._lock:
             return list(self._valid)
 
+    def _compute_difficulty_auction_shadow(self) -> None:
+        """Compute an inert auction counterfactual over ``self._valid``.
+
+        Production has already populated ``selection_metadata_by_id`` when
+        this runs. Any shadow failure is contained and surfaced in telemetry;
+        an observational experiment cannot break the live protocol.
+        """
+        env_name = str(getattr(self.env, "name", ""))
+        base = {
+            "schema_version": 1,
+            "mode": "observation_only",
+            "environment": env_name,
+            "population": "fully_validated_before_current_seal",
+            "population_limitations": [
+                "excludes_pre_validation_rejects",
+                "excludes_batch_filled_rejects",
+            ],
+            "production_changed": False,
+            "delta": DIFFICULTY_AUCTION_DELTA,
+            "batch_size": B_BATCH,
+            "validated_candidates": len(self._valid),
+            "max_candidates": DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES,
+        }
+        self.difficulty_auction_metadata_by_id = {}
+        if not DIFFICULTY_AUCTION_SHADOW_ENABLED:
+            self.difficulty_auction_shadow = {**base, "status": "disabled"}
+            return
+        if env_name not in DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS:
+            self.difficulty_auction_shadow = {
+                **base,
+                "status": "out_of_scope_environment",
+            }
+            return
+        if len(self._valid) > DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES:
+            self.difficulty_auction_shadow = {
+                **base,
+                "status": "skipped_candidate_limit",
+            }
+            return
+
+        started_at = time.perf_counter()
+        try:
+            shadow_pool = tuple(
+                ShadowSubmission(
+                    source_id=id(submission),
+                    hotkey=str(submission.hotkey),
+                    prompt_idx=int(submission.prompt_idx),
+                    drand_round=int(submission.drand_round),
+                    merkle_root=bytes(submission.merkle_root),
+                    selection_digest=bytes(submission.selection_digest),
+                    rewards=tuple(
+                        float(rollout.reward)
+                        for rollout in submission.rollouts
+                    ),
+                    in_cooldown=self._cooldown.is_in_cooldown(
+                        submission.prompt_idx, self.window_start
+                    ),
+                )
+                for submission in self._valid
+            )
+            result = select_shadow_auction(
+                shadow_pool,
+                b=B_BATCH,
+                delta=DIFFICULTY_AUCTION_DELTA,
+            )
+            production_selected_ids = {
+                id(submission)
+                for submission in self._valid
+                if self.selection_metadata_by_id.get(id(submission), {}).get(
+                    "selected_for_batch", False
+                )
+            }
+            production_rewarded_ids = {
+                id(submission)
+                for submission in self._valid
+                if self.selection_metadata_by_id.get(id(submission), {}).get(
+                    "rewarded", False
+                )
+            }
+            shadow_selected_ids = {
+                submission.source_id for submission in result.selected
+            }
+
+            candidate_rows = []
+            for candidate in result.candidates:
+                submission = candidate.submission
+                row = {
+                    "hotkey": submission.hotkey,
+                    "prompt_idx": submission.prompt_idx,
+                    "selection_digest": submission.selection_digest.hex(),
+                    "drand_round": submission.drand_round,
+                    "value": candidate.score.value,
+                    "mean_reward": candidate.score.mean_reward,
+                    "reward_std": candidate.score.reward_std,
+                    "reward_count": candidate.score.reward_count,
+                    "eligible": candidate.eligible,
+                    "rank": candidate.rank,
+                    "shadow_selected": candidate.selected,
+                    "production_selected": (
+                        id(submission) in production_selected_ids
+                    ),
+                    "production_rewarded": (
+                        id(submission) in production_rewarded_ids
+                    ),
+                }
+                self.difficulty_auction_metadata_by_id[
+                    submission.source_id
+                ] = row
+                candidate_rows.append(row)
+
+            overlap = production_selected_ids & shadow_selected_ids
+            union = production_selected_ids | shadow_selected_ids
+
+            def _mean_reward(submission_ids: set[int]) -> float | None:
+                values = []
+                for submission in self._valid:
+                    if id(submission) not in submission_ids:
+                        continue
+                    row = self.difficulty_auction_metadata_by_id.get(
+                        id(submission)
+                    )
+                    if row is not None:
+                        values.append(float(row["mean_reward"]))
+                return sum(values) / len(values) if values else None
+
+            self.difficulty_auction_shadow = {
+                **base,
+                "status": "computed",
+                "computation_ms": (
+                    time.perf_counter() - started_at
+                ) * 1000.0,
+                "eligible_candidates": result.eligible_count,
+                "distinct_eligible_prompts": result.distinct_prompt_count,
+                "production_selected_count": len(production_selected_ids),
+                "production_rewarded_count": len(production_rewarded_ids),
+                "shadow_selected_count": len(shadow_selected_ids),
+                "selection_overlap_count": len(overlap),
+                "selection_jaccard": (
+                    len(overlap) / len(union) if union else 1.0
+                ),
+                "production_selected_mean_reward": _mean_reward(
+                    production_selected_ids
+                ),
+                "shadow_selected_mean_reward": _mean_reward(
+                    shadow_selected_ids
+                ),
+                "operator_cap_requested": result.operator_cap_requested,
+                "operator_cap_applied": result.operator_cap_applied,
+                "operator_mapping_complete": result.operator_mapping_complete,
+                "candidates": candidate_rows,
+            }
+        except Exception as exc:
+            logger.exception(
+                "difficulty auction shadow failed window=%d env=%s",
+                self.window_start,
+                env_name,
+            )
+            self.difficulty_auction_shadow = {
+                **base,
+                "status": "error",
+                "error_type": type(exc).__name__,
+                "computation_ms": (
+                    time.perf_counter() - started_at
+                ) * 1000.0,
+            }
+
     def seal_batch(
         self, pool: float = 1.0
     ) -> tuple[list[ValidSubmission], dict[str, float]]:
@@ -2267,6 +2450,7 @@ class GrpoWindowBatcher:
                 current_window=self.window_start,
                 pool=pool,
             )
+            self._compute_difficulty_auction_shadow()
             rewarded_submissions: list[ValidSubmission] = []
             rewarded_but_not_selected: dict[str, int] = {}
             for sub in self._valid:

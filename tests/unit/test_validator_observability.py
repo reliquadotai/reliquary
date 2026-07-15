@@ -244,6 +244,12 @@ def test_health_endpoint_does_not_leak_secrets(monkeypatch):
     assert body["forced_seed_rollout_floor"] == 0.75
     assert body["forced_seed_cdf_enforced"] is False
     assert body["forced_seed_cdf_boundary_epsilon"] == 0.002
+    assert body["difficulty_auction_shadow_enabled"] is True
+    assert body["difficulty_auction_shadow_environments"] == [
+        "openmathinstruct"
+    ]
+    assert body["difficulty_auction_shadow_delta"] == 1.0
+    assert body["difficulty_auction_shadow_max_candidates"] == 96
     assert body["archive_queue_depth"] == 2
     assert body["archive_queue_oldest_window"] == 490
     assert body["archive_queue_oldest_age_seconds"] == 30.5

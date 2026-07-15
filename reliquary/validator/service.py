@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 from typing import Any
@@ -20,6 +21,10 @@ from reliquary.constants import (
     CHECKPOINT_STAGING_DIR_DEFAULT,
     DEFAULT_HF_REPO_ID,
     DRAND_ROUND_BACKWARD_TOLERANCE,
+    DIFFICULTY_AUCTION_DELTA,
+    DIFFICULTY_AUCTION_SHADOW_ENABLED,
+    DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS,
+    DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES,
     ENVIRONMENT_MIX,
     FORCED_SEED_CDF_BOUNDARY_EPSILON,
     FORCED_SEED_CDF_ENFORCE,
@@ -1367,8 +1372,31 @@ class ValidationService:
         def _submission_obs_payload(s, batcher, *, rejected: bool = False):
             selection_meta = getattr(batcher, "selection_metadata_by_id", {})
             meta = selection_meta.get(id(s), {})
+            difficulty_by_id = getattr(
+                batcher, "difficulty_auction_metadata_by_id", {}
+            )
+            difficulty_meta = (
+                difficulty_by_id.get(id(s), {})
+                if isinstance(difficulty_by_id, dict)
+                else {}
+            )
+            arrival_ts = getattr(s, "arrival_ts", None)
+            window_opened_wall_ts = getattr(
+                batcher, "window_opened_wall_ts", None
+            )
+            arrival_age_seconds = None
+            if arrival_ts is not None and window_opened_wall_ts is not None:
+                try:
+                    candidate_age = float(arrival_ts) - float(
+                        window_opened_wall_ts
+                    )
+                except (TypeError, ValueError):
+                    candidate_age = float("nan")
+                if math.isfinite(candidate_age) and candidate_age >= 0.0:
+                    arrival_age_seconds = candidate_age
             return {
-                "arrival_ts": getattr(s, "arrival_ts", None),
+                "arrival_ts": arrival_ts,
+                "arrival_age_seconds": arrival_age_seconds,
                 "decision_ts": getattr(s, "decision_ts", None),
                 "submitted_drand_round": getattr(
                     s, "submitted_drand_round", getattr(s, "drand_round", None)
@@ -1395,6 +1423,31 @@ class ValidationService:
                 "reward_vector": getattr(s, "reward_vector", None),
                 "truncated_count": getattr(s, "truncated_count", None),
                 "reward_shape": getattr(s, "reward_shape", None),
+                "difficulty_auction_value": difficulty_meta.get("value"),
+                "difficulty_auction_mean_reward": difficulty_meta.get(
+                    "mean_reward"
+                ),
+                "difficulty_auction_reward_std": difficulty_meta.get(
+                    "reward_std"
+                ),
+                "difficulty_auction_reward_count": difficulty_meta.get(
+                    "reward_count"
+                ),
+                "difficulty_auction_eligible": difficulty_meta.get("eligible"),
+                "difficulty_auction_rank": difficulty_meta.get("rank"),
+                "difficulty_auction_selected": difficulty_meta.get(
+                    "shadow_selected"
+                ),
+            }
+
+        def _difficulty_shadow_payload(batcher):
+            payload = getattr(batcher, "difficulty_auction_shadow", None)
+            if isinstance(payload, dict):
+                return payload
+            return {
+                "schema_version": 1,
+                "status": "unavailable",
+                "mode": "observation_only",
             }
 
         def _rollout_payload(s, with_text: bool):
@@ -1616,11 +1669,19 @@ class ValidationService:
             "environment": env_names_list[0],   # legacy singular, kept for compat
             "environments": env_names_list,      # multi-env canonical field
             "force_seal_reason": getattr(first_batcher, "force_seal_reason", None),
+            "window_opened_wall_ts_by_environment": {
+                env_name: getattr(env_batcher, "window_opened_wall_ts", None)
+                for env_name, env_batcher in batcher_dict.items()
+            },
             "batch": batch_entries,
             "runners_up": runners_up,
             "reject_summary": combined_reject_counts,
             "server_reject_summary": server_reject_summary,
             "logical_group_dedup": logical_group_dedup,
+            "difficulty_auction_shadow": {
+                env_name: _difficulty_shadow_payload(env_batcher)
+                for env_name, env_batcher in batcher_dict.items()
+            },
             "grader_failures": dict(getattr(self, "_grader_failures", {})),
             "rejected": rejected_entries,
             "training_quarantine": getattr(
@@ -1700,6 +1761,16 @@ class ValidationService:
                     FORCED_SEED_CDF_BOUNDARY_EPSILON
                 ),
                 "legacy_merkle_root_enforce": LEGACY_MERKLE_ROOT_ENFORCE,
+                "difficulty_auction_shadow_enabled": (
+                    DIFFICULTY_AUCTION_SHADOW_ENABLED
+                ),
+                "difficulty_auction_shadow_environments": list(
+                    DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS
+                ),
+                "difficulty_auction_shadow_delta": DIFFICULTY_AUCTION_DELTA,
+                "difficulty_auction_shadow_max_candidates": (
+                    DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES
+                ),
                 "logprob_is_eps": LOGPROB_IS_EPS,
                 "r2_bucket": os.getenv("R2_BUCKET_ID", "reliquary"),
                 "http_host": self.server.host,
