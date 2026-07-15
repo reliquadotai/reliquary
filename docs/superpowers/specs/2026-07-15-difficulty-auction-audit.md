@@ -1,8 +1,11 @@
 # Difficulty Auction Audit and Rollout Decision
 
-**Date:** 2026-07-15  
-**Branch:** `design/difficulty-auction`  
-**Original tip reviewed:** `d1374d8456c41f37d0d22812e9d69738182b0ade`  
+**Date:** 2026-07-15
+
+**Branch:** `design/difficulty-auction`
+
+**Original tip reviewed:** `d1374d8456c41f37d0d22812e9d69738182b0ade`
+
 **Production baseline reviewed:** `c33560d4cb810e394f7224419570bda87f32ed9e`
 
 ## Executive Decision
