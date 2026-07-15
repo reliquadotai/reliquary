@@ -1,10 +1,14 @@
 from dataclasses import FrozenInstanceError
+import hashlib
+import random
 from types import SimpleNamespace
 
 import pytest
 
 import reliquary.validator.batcher as batcher_module
 from reliquary.validator.batcher import GrpoWindowBatcher, ValidSubmission
+from reliquary.validator.cooldown import CooldownMap
+from reliquary.validator.dedup import RolloutHashSet
 from reliquary.validator.difficulty_auction import (
     ShadowSubmission,
     select_shadow_auction as real_select_shadow_auction,
@@ -25,12 +29,14 @@ class CodeEnv(MathEnv):
     name = "opencodeinstruct"
 
 
-def _batcher(env=None):
+def _batcher(env=None, *, cooldown_map=None, hash_set=None):
     return GrpoWindowBatcher(
         window_start=500,
         env=env or MathEnv(),
         model=SimpleNamespace(),
         completion_text_fn=lambda _rollout: "",
+        cooldown_map=cooldown_map,
+        hash_set=hash_set,
         verify_commitment_proofs_fn=lambda *_args, **_kwargs: None,
         verify_signature_fn=lambda *_args, **_kwargs: True,
         drand_round_check_enabled=False,
@@ -166,6 +172,104 @@ def test_shadow_candidate_limit_skips_work_without_changing_production(
         "max_candidates": 1,
         "status": "skipped_candidate_limit",
     }
+
+
+def test_shadow_enabled_and_disabled_are_production_equivalent_randomized(
+    monkeypatch,
+):
+    def _pool(seed):
+        rng = random.Random(seed)
+        submissions = []
+        for index in range(rng.randint(1, 30)):
+            digest = hashlib.sha256(f"{seed}:{index}".encode()).digest()
+            successes = rng.randrange(9)
+            rollouts = [SimpleNamespace(reward=1.0)] * successes + [
+                SimpleNamespace(reward=0.0)
+            ] * (8 - successes)
+            rollout_hashes = [
+                hashlib.sha256(
+                    f"{seed}:{index}:rollout:{rollout}".encode()
+                ).digest()
+                for rollout in range(8)
+            ]
+            submissions.append(
+                ValidSubmission(
+                    hotkey=f"hk{rng.randrange(10)}",
+                    prompt_idx=rng.randrange(12),
+                    merkle_root_bytes=digest,
+                    selection_digest_bytes=digest,
+                    drand_round=rng.randrange(5),
+                    rollouts=rollouts,
+                    rollout_hashes=rollout_hashes,
+                )
+            )
+        return submissions
+
+    def _run(seed, *, enabled):
+        cooldown = CooldownMap(cooldown_windows=50)
+        cooldown.record_batched(0, 499)
+        hash_set = RolloutHashSet(retention_windows=300)
+        batcher = _batcher(cooldown_map=cooldown, hash_set=hash_set)
+        batcher._valid = _pool(seed)
+        batcher.valid_count = len(batcher._valid)
+        monkeypatch.setattr(
+            batcher_module, "DIFFICULTY_AUCTION_SHADOW_ENABLED", enabled
+        )
+
+        batch, rewards = batcher.seal_batch()
+        metadata = {
+            submission.selection_digest.hex(): dict(
+                batcher.selection_metadata_by_id[id(submission)]
+            )
+            for submission in batcher._valid
+        }
+        return {
+            "batch": [submission.selection_digest.hex() for submission in batch],
+            "rewards": rewards,
+            "selection_metadata": metadata,
+            "rewarded_not_selected": dict(
+                batcher.rewarded_but_not_selected_by_hotkey
+            ),
+            "cooldown": cooldown.export_state(),
+            "hashes": dict(hash_set._entries),
+            "shadow_status": batcher.difficulty_auction_shadow["status"],
+        }
+
+    for seed in range(50):
+        enabled = _run(seed, enabled=True)
+        disabled = _run(seed, enabled=False)
+
+        assert enabled["shadow_status"] == "computed"
+        assert disabled["shadow_status"] == "disabled"
+        assert {
+            key: value
+            for key, value in enabled.items()
+            if key != "shadow_status"
+        } == {
+            key: value
+            for key, value in disabled.items()
+            if key != "shadow_status"
+        }
+
+
+def test_disabled_shadow_never_calls_counterfactual(monkeypatch):
+    batcher = _batcher()
+    batcher._valid = [_submission("miner", 1, drand_round=1, k=4)]
+    batcher.valid_count = 1
+    monkeypatch.setattr(
+        batcher_module, "DIFFICULTY_AUCTION_SHADOW_ENABLED", False
+    )
+
+    def _unexpected(*_args, **_kwargs):
+        raise AssertionError("disabled shadow must not call selector")
+
+    monkeypatch.setattr(batcher_module, "select_shadow_auction", _unexpected)
+
+    production_batch, rewards = batcher.seal_batch()
+
+    assert [submission.hotkey for submission in production_batch] == ["miner"]
+    assert rewards == {"miner": pytest.approx(1 / 8)}
+    assert batcher.difficulty_auction_shadow["status"] == "disabled"
 
 
 def test_code_environment_is_explicitly_out_of_scope():
