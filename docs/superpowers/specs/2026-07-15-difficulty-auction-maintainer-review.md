@@ -1,9 +1,11 @@
 # Difficulty Auction Maintainer Review
 
-**Date:** 2026-07-15  
+**Date:** 2026-07-15
 **Reviewed branch:** `design/difficulty-auction` at
-`d1374d8456c41f37d0d22812e9d69738182b0ade`  
-**Current main:** `d95e4254f12a9dc4c92692e80c251bccd3934024`  
+`d1374d8456c41f37d0d22812e9d69738182b0ade`
+**Original review baseline:** `d95e4254f12a9dc4c92692e80c251bccd3934024`
+**Shadow branch base after PR #130:**
+`9c887f4eee4b4fd926c75a581df1e63a533fb301`
 **Decision:** Do not merge or deploy the reviewed branch. Merge only the
 observation-only shadow instrumentation built from current `main`.
 
@@ -40,17 +42,19 @@ The correct next move is measurement, not activation:
 
 - Reconstructed the full diff from merge-base `10706b0`: 45 files, 8,371
   insertions, 1,616 deletions, including 24 unrelated historical documents.
-- Refetched GitHub before concluding. The reviewed branch and `main` revisions
-  above were still current.
+- Refetched GitHub before concluding. The reviewed design branch remained at
+  `d1374d8`; the safe shadow branch was rebased onto current `main` at `9c887f4`.
 - Ran the reviewed branch CPU suite: 1 failed, 1,191 passed, 5 skipped. The
   failure expected `hash_duplicate` but received `prompt_claimed`, showing the
   new first-claim rule preempts an existing dedup contract.
 - Inspected the live validator at `209.20.157.231`. It runs current `main`, not
-  the auction branch, and its OCI revision is `d95e4254...`.
+  the auction branch, and its OCI revision is `9c887f4...`.
 - Replayed 250 and 1,100 public R2 windows with a deterministic script.
 - Replayed the 250-window sample with a fresh SN81 hotkey-to-coldkey map.
-- Ran the clean shadow branch suite: 1,179 passed, 5 skipped. Focused auction,
-  archive, and replay tests: 19 passed.
+- Ran the final rebased shadow branch suite: 1,216 passed, 5 skipped. The
+  expanded auction, archive, replay, health, and server suite passed 73 tests.
+- Proved enabled-versus-disabled production equivalence across 50 randomized
+  pools and runtime-versus-offline selector parity across 200 randomized cases.
 - Reviewed current RLVR methods including
   [DAPO](https://arxiv.org/abs/2503.14476),
   [Dr. GRPO](https://arxiv.org/abs/2503.20783),
@@ -272,16 +276,17 @@ was set after validation. On the 250-window accepted population:
 This does not prove 300 seconds is bad; the rejected population may contain more
 valid candidates. It proves the current archive cannot support the claim that a
 300-second full auction preserves fill and cadence. Exact arrival telemetry is
-included in the safe shadow branch for future windows.
+included in the safe shadow branch for future windows. The replay now reports a
+separate `deadline_counterfactual_exact_http_arrival` surface and includes a
+window only when every observed candidate in that window has an exact HTTP
+arrival timestamp; proxy and exact timing are never mixed in that decision
+denominator.
 
 ## 6. Safe implementation built from current main
 
-Branch `codex/difficulty-auction-shadow` contains three isolated commits:
-
-1. `389ebad` - pure, side-effect-free shadow scoring and selection.
-2. `2896dd9` - archive the real counterfactual over production's fully validated
-   pool.
-3. `f96a05f` - reproducible R2 replay plus exact arrival-age telemetry.
+Branch `codex/difficulty-auction-shadow` is organized as independently
+revertible slices for scoring, archive telemetry, replay tooling, documentation,
+operational controls, structural isolation, and invariant tests.
 
 Properties:
 
@@ -289,21 +294,37 @@ Properties:
 - No miner wire change.
 - No new reject reason.
 - No admission, proof, queue, seal, cooldown, payout, weight, or training change.
+- Production selection and rewards run before the shadow hook.
+- The hook receives frozen detached values, never live `ValidSubmission` objects.
 - Shadow failures are caught and cannot fail production sealing.
+- Shadow work is skipped above 96 validated candidates rather than becoming an
+  unbounded seal-time task.
+- The operator kill switch is
+  `RELIQUARY_DIFFICULTY_AUCTION_SHADOW_ENABLED=0`.
+- `/health` exposes enabled state, environment scope, delta, and candidate cap.
+- Each computed archive records `computation_ms` for cadence monitoring.
 - The operator cap is reported as active only with a complete mapping; no
   hotkey-identity fallback.
 - Every archive states its population limitations.
 - Per-candidate mean, std, count, eligibility, rank, and selected state make any
   future delta replayable without another deployment.
+- Malformed historical rows are counted as missing evidence rather than
+  crashing or inventing scores.
+- Exact-only deadline results are separated from acceptance-time proxies.
 
 Reproduce historical analysis with:
 
 ```bash
 python scripts/report_difficulty_auction.py \
-  --from-r2 --current-window 23102 --n 250 \
+  --from-r2 --current-window <current_window> --n 250 \
   --environment openmathinstruct --operator-map-from-chain \
   --max-slots-per-operator 2
 ```
+
+Before interpreting the deadline table, require non-zero windows under
+`deadline_counterfactual_exact_http_arrival`. The legacy
+`deadline_counterfactual` table is explicitly best-available timing and may use
+the slower acceptance proxy.
 
 ## 7. Activation plan and stop rules
 
@@ -320,6 +341,9 @@ Merge the safe shadow branch. Collect at least:
 - candidate, selected, rewarded, and reject denominators split by checkpoint;
 - score/k histogram, selection overlap, operator concentration, underfill, and
   queue/verification latency.
+- zero shadow `error` or `skipped_candidate_limit` windows;
+- shadow computation latency that is negligible relative to seal cadence
+  (initial operational gate: p99 below 50 ms).
 
 Stop if production selection, rewards, archive publication, or window cadence
 changes. That would be a shadow-integrity bug.
