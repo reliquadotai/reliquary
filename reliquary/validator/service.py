@@ -730,11 +730,15 @@ class ValidationService:
         return queue_depth == 0 and inflight == 0
 
     def _distinct_valid_prompt_count(self, batcher) -> int:
-        """Best-effort distinct prompt count for liveness decisions."""
-        counter = getattr(batcher, "distinct_valid_prompt_count", None)
+        """Best-effort distinct trainable prompt count for liveness decisions.
+
+        Proofs run at seal now, so ``_valid`` is empty the whole window; the
+        window's fill level is the graded (unproven) PENDING pool.
+        """
+        counter = getattr(batcher, "distinct_pending_prompt_count", None)
         if callable(counter):
             return int(counter())
-        return int(getattr(batcher, "valid_count", 0) or 0)
+        return int(getattr(batcher, "pending_count", 0) or 0)
 
     def _duplicate_prompt_shortfall_drained(self, batcher) -> bool:
         """True when duplicates filled raw submissions but not trainable slots."""
@@ -742,7 +746,7 @@ class ValidationService:
             return False
         if getattr(batcher, "_seal_trigger_round", None) is not None:
             return False
-        valid_count = int(getattr(batcher, "valid_count", 0) or 0)
+        valid_count = int(getattr(batcher, "pending_count", 0) or 0)
         distinct_valid = self._distinct_valid_prompt_count(batcher)
         if valid_count < B_BATCH or distinct_valid >= B_BATCH:
             return False
@@ -782,7 +786,7 @@ class ValidationService:
             return None
         if getattr(batcher, "_seal_trigger_round", None) is not None:
             return None
-        valid_count = int(getattr(batcher, "valid_count", 0) or 0)
+        valid_count = int(getattr(batcher, "pending_count", 0) or 0)
         distinct_valid = self._distinct_valid_prompt_count(batcher)
         if distinct_valid >= B_BATCH:
             return None
@@ -838,10 +842,12 @@ class ValidationService:
     async def _wait_for_window_seal(self) -> str:
         """Wait until every active env's batcher seals.
 
-        Each batcher seals independently — via its own BATCH_FILLED fill or
-        its own liveness breaker — so a fast env never cuts a slower one
-        short. The window advances only once all are sealed (or the global
-        timeout). Training still requires all envs full (see ``trained``).
+        The window is time-boxed: each batcher seals on its own fixed collection
+        deadline (``poll_deadline``). The liveness breakers below stay as
+        early-exit safety valves for degenerate (sparse / fully drained)
+        windows, so a fast env never cuts a slower one short. The window
+        advances only once all are sealed (or the global timeout). Training
+        still requires all envs full (see ``trained``).
         """
         batchers = list(self._active_batchers.values())
         if not batchers:
@@ -853,6 +859,10 @@ class ValidationService:
         reasons: dict[str, str] = {}
         while True:
             for b in batchers:
+                # Normal path: seal on the fixed collection deadline.
+                poll = getattr(b, "poll_deadline", None)
+                if callable(poll):
+                    poll()
                 if b.is_sealed():
                     continue
                 r = self._force_seal_dead_batcher(b, dup_since)
@@ -1064,10 +1074,14 @@ class ValidationService:
         # count, as GRAD_ACCUM_STEPS already does) so every validator uses the
         # same pool and an env a validator does not run burns its share.
         pool_per_env = 1.0 / len(self.env_mix)
-        sealed: dict[str, tuple] = {
-            name: b.seal_batch(pool=pool_per_env)
-            for name, b in self._active_batchers.items()
-        }
+        # seal_batch now runs the GRAIL GPU proofs (``_prove_ranked``, up to ~8
+        # forward passes at 5-25s each), so offload each batcher to a thread to
+        # keep the event loop responsive (/state, /health, submit, archive).
+        # Awaited sequentially in dict order so the deterministic fold into
+        # combined rewards / window_batches / archives is byte-for-byte unchanged.
+        sealed: dict[str, tuple] = {}
+        for name, b in self._active_batchers.items():
+            sealed[name] = await asyncio.to_thread(b.seal_batch, pool=pool_per_env)
         for name, (batch, rewards) in sealed.items():
             self._active_batchers[name].rewards_by_hotkey = rewards
 

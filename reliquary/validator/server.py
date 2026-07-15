@@ -2065,7 +2065,12 @@ class ValidatorServer:
                 window_n=batcher.window_start,
                 anchor_block=batcher.window_start,
                 cooldown_prompts=batcher.cooldown_prompts_snapshot,
-                valid_submissions=batcher.valid_count,
+                # Proofs run at seal now, so ``valid_count`` is 0 for the whole
+                # window; miners act on this, so report the admitted (graded,
+                # unproven) pending count on the same wire field.
+                valid_submissions=getattr(
+                    batcher, "pending_count", batcher.valid_count
+                ),
                 checkpoint_n=cp.checkpoint_n if cp else 0,
                 checkpoint_repo_id=cp.repo_id if cp else None,
                 checkpoint_revision=cp.revision if cp else None,
