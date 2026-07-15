@@ -25,6 +25,7 @@ from reliquary.constants import (
     DIFFICULTY_AUCTION_SHADOW_ENABLED,
     DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS,
     DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES,
+    DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR,
     ENVIRONMENT_MIX,
     FORCED_SEED_CDF_BOUNDARY_EPSILON,
     FORCED_SEED_CDF_ENFORCE,
@@ -177,6 +178,7 @@ def open_grpo_window(
     tokenizer,
     bootstrap: bool = False,
     queue_drained_predicate=None,
+    operator_by_hotkey: dict[str, str] | None = None,
 ) -> GrpoWindowBatcher:
     """Instantiate a GrpoWindowBatcher for this window.
 
@@ -212,6 +214,7 @@ def open_grpo_window(
         completion_text_fn=_completion_text,
         canonical_prompt_tokens_fn=_canonical_prompt_tokens,
         queue_drained_predicate=queue_drained_predicate,
+        operator_by_hotkey=operator_by_hotkey,
     )
 
 
@@ -562,6 +565,7 @@ class ValidationService:
         )
         cp = self._checkpoint_store.current_manifest()
         cp_hash = cp.revision if cp else ""
+        operator_by_hotkey = self.server.operator_by_hotkey_snapshot()
         self._active_batchers = {}
         for env_name, env in self.envs.items():
             batcher = open_grpo_window(
@@ -575,6 +579,7 @@ class ValidationService:
                 # GRAIL proofs have both drained — concurrent verification
                 # empties the queue while proofs are still running.
                 queue_drained_predicate=self._queue_and_proofs_drained,
+                operator_by_hotkey=operator_by_hotkey,
             )
             batcher.current_checkpoint_hash = cp_hash
             self._active_batchers[env_name] = batcher
@@ -627,18 +632,50 @@ class ValidationService:
 
         subtensor = None
 
-        async def _load() -> set[str]:
+        async def _load() -> tuple[set[str], dict[str, str]]:
             nonlocal subtensor
             subtensor = await chain.get_subtensor()
             metagraph = await chain.get_metagraph(subtensor, self.netuid)
-            return {
+            hotkey_values = getattr(metagraph, "hotkeys", None)
+            raw_hotkeys = list(hotkey_values) if hotkey_values is not None else []
+            coldkey_values = getattr(metagraph, "coldkeys", None)
+            try:
+                raw_coldkeys = (
+                    list(coldkey_values) if coldkey_values is not None else []
+                )
+            except TypeError:
+                # Registration admission remains available even if an older
+                # metagraph object cannot expose ownership. The shadow cap then
+                # reports incomplete mapping and disables itself.
+                raw_coldkeys = []
+            hotkeys = {
                 hotkey
-                for value in getattr(metagraph, "hotkeys", [])
+                for value in raw_hotkeys
                 if isinstance(value, str) and (hotkey := value.strip())
             }
+            operators: dict[str, str] = {}
+            ambiguous_hotkeys: set[str] = set()
+            for index, value in enumerate(raw_hotkeys):
+                if not isinstance(value, str) or not (hotkey := value.strip()):
+                    continue
+                if index >= len(raw_coldkeys):
+                    continue
+                raw_operator = raw_coldkeys[index]
+                if not isinstance(raw_operator, str):
+                    continue
+                operator = raw_operator.strip()
+                if not operator or hotkey in ambiguous_hotkeys:
+                    continue
+                previous = operators.get(hotkey)
+                if previous is not None and previous != operator:
+                    operators.pop(hotkey, None)
+                    ambiguous_hotkeys.add(hotkey)
+                    continue
+                operators[hotkey] = operator
+            return hotkeys, operators
 
         try:
-            hotkeys = await asyncio.wait_for(
+            hotkeys, operator_by_hotkey = await asyncio.wait_for(
                 _load(),
                 timeout=REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS,
             )
@@ -646,11 +683,17 @@ class ValidationService:
                 raise RuntimeError(
                     "metagraph refresh returned no registered hotkeys"
                 )
-            self.server.set_registered_hotkeys(hotkeys)
+            self.server.set_registered_hotkeys(
+                hotkeys,
+                operator_by_hotkey=operator_by_hotkey,
+            )
             logger.info(
-                "Registered-hotkey cache refreshed: netuid=%d hotkeys=%d",
+                "Registered-hotkey cache refreshed: netuid=%d hotkeys=%d "
+                "operator_mappings=%d complete=%s",
                 self.netuid,
                 len(hotkeys),
+                len(operator_by_hotkey),
+                len(operator_by_hotkey) == len(hotkeys),
             )
             return True
         except asyncio.CancelledError:
@@ -1438,6 +1481,9 @@ class ValidationService:
                 "difficulty_auction_selected": difficulty_meta.get(
                     "shadow_selected"
                 ),
+                "difficulty_auction_operator_id": difficulty_meta.get(
+                    "operator_id"
+                ),
             }
 
         def _difficulty_shadow_payload(batcher):
@@ -1770,6 +1816,9 @@ class ValidationService:
                 "difficulty_auction_shadow_delta": DIFFICULTY_AUCTION_DELTA,
                 "difficulty_auction_shadow_max_candidates": (
                     DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES
+                ),
+                "difficulty_auction_shadow_max_slots_per_operator": (
+                    DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR
                 ),
                 "logprob_is_eps": LOGPROB_IS_EPS,
                 "r2_bucket": os.getenv("R2_BUCKET_ID", "reliquary"),

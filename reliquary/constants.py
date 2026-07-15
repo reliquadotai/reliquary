@@ -489,6 +489,16 @@ DIFFICULTY_AUCTION_DELTA = 1.0
 DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES = int(
     _os.environ.get("RELIQUARY_DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES", "96")
 )
+DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR = int(
+    _os.environ.get(
+        "RELIQUARY_DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR", "2"
+    )
+)
+if DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR <= 0:
+    raise ValueError(
+        "RELIQUARY_DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR "
+        "must be positive"
+    )
 
 # How many drand-quicknet rounds backward of the validator's current round
 # the batcher accepts on the ``drand_round`` field. Default = 0: strict

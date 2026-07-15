@@ -34,6 +34,7 @@ from reliquary.constants import (
     DIFFICULTY_AUCTION_SHADOW_ENABLED,
     DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS,
     DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES,
+    DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR,
     ENFORCE_ENVELOPE_SIGNATURE,
     FORCED_SEED_CDF_BOUNDARY_EPSILON,
     FORCED_SEED_CDF_ENFORCE,
@@ -393,6 +394,8 @@ class _Health(BaseModel):
     )
     registration_gate_enforced: bool = False
     registered_hotkey_count: int | None = None
+    registered_operator_mapping_count: int = 0
+    registered_operator_mapping_complete: bool | None = None
     registration_cache_age_seconds: float | None = None
     registration_cache_stale: bool | None = None
     training_accumulator_checkpoint_revision: str | None = None
@@ -414,6 +417,9 @@ class _Health(BaseModel):
     difficulty_auction_shadow_delta: float = DIFFICULTY_AUCTION_DELTA
     difficulty_auction_shadow_max_candidates: int = (
         DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES
+    )
+    difficulty_auction_shadow_max_slots_per_operator: int = (
+        DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR
     )
     legacy_merkle_checks_total: int = 0
     legacy_merkle_matches: int = 0
@@ -453,6 +459,7 @@ class ValidatorServer:
         self.active_batcher: GrpoWindowBatcher | None = None
         self._registration_gate_enforced = False
         self._registered_hotkeys: frozenset[str] | None = None
+        self._operator_by_hotkey: dict[str, str] = {}
         self._registration_refreshed_at: float | None = None
         self._registration_refresh_callback: (
             Callable[[], Awaitable[bool]] | None
@@ -611,13 +618,27 @@ class ValidatorServer:
         hotkeys: set[str] | frozenset[str] | list[str],
         *,
         refreshed_at: float | None = None,
+        operator_by_hotkey: dict[str, str] | None = None,
     ) -> None:
-        self._registered_hotkeys = frozenset(
-            str(hotkey) for hotkey in hotkeys if str(hotkey)
+        registered_hotkeys = frozenset(
+            normalized
+            for hotkey in hotkeys
+            if (normalized := str(hotkey).strip())
         )
+        self._registered_hotkeys = registered_hotkeys
+        self._operator_by_hotkey = {
+            normalized_hotkey: normalized_operator
+            for hotkey, operator in (operator_by_hotkey or {}).items()
+            if (normalized_hotkey := str(hotkey).strip()) in registered_hotkeys
+            and (normalized_operator := str(operator).strip())
+        }
         self._registration_refreshed_at = (
             time.time() if refreshed_at is None else float(refreshed_at)
         )
+
+    def operator_by_hotkey_snapshot(self) -> dict[str, str]:
+        """Return the chain ownership map associated with the registration cache."""
+        return dict(self._operator_by_hotkey)
 
     def registration_cache_age(self, *, now: float | None = None) -> float | None:
         if self._registration_refreshed_at is None:
@@ -1095,6 +1116,12 @@ class ValidatorServer:
                 if self._registered_hotkeys is not None
                 else None
             ),
+            registered_operator_mapping_count=len(self._operator_by_hotkey),
+            registered_operator_mapping_complete=(
+                len(self._operator_by_hotkey) == len(self._registered_hotkeys)
+                if self._registered_hotkeys is not None
+                else None
+            ),
             registration_cache_age_seconds=registration_age,
             registration_cache_stale=(
                 registration_age > REGISTERED_HOTKEY_CACHE_TTL_SECONDS
@@ -1124,6 +1151,9 @@ class ValidatorServer:
             difficulty_auction_shadow_delta=DIFFICULTY_AUCTION_DELTA,
             difficulty_auction_shadow_max_candidates=(
                 DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES
+            ),
+            difficulty_auction_shadow_max_slots_per_operator=(
+                DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR
             ),
             legacy_merkle_checks_total=sum(self._legacy_merkle_stats.values()),
             legacy_merkle_matches=self._legacy_merkle_stats["match"],

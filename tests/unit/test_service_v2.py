@@ -49,7 +49,10 @@ def _build_late_drop_service():
 async def test_registration_refresh_uses_fresh_metagraph_and_updates_server():
     svc = _build_late_drop_service()
     subtensor = object()
-    metagraph = MagicMock(hotkeys=[" hk-a ", "hk-b", "", None])
+    metagraph = MagicMock(
+        hotkeys=[" hk-a ", "hk-b", "", None],
+        coldkeys=[" operator-a ", "operator-b", "ignored", "ignored"],
+    )
 
     with (
         patch(
@@ -69,6 +72,10 @@ async def test_registration_refresh_uses_fresh_metagraph_and_updates_server():
 
     assert refreshed is True
     assert svc.server._registered_hotkeys == frozenset({"hk-a", "hk-b"})
+    assert svc.server.operator_by_hotkey_snapshot() == {
+        "hk-a": "operator-a",
+        "hk-b": "operator-b",
+    }
     get_subtensor.assert_awaited_once()
     get_metagraph.assert_awaited_once_with(subtensor, 99)
     close_subtensor.assert_awaited_once_with(subtensor)
@@ -77,7 +84,11 @@ async def test_registration_refresh_uses_fresh_metagraph_and_updates_server():
 @pytest.mark.asyncio
 async def test_registration_refresh_failure_preserves_last_known_good():
     svc = _build_late_drop_service()
-    svc.server.set_registered_hotkeys({"hk-a"}, refreshed_at=123.0)
+    svc.server.set_registered_hotkeys(
+        {"hk-a"},
+        refreshed_at=123.0,
+        operator_by_hotkey={"hk-a": "operator-a"},
+    )
 
     with (
         patch(
@@ -93,6 +104,9 @@ async def test_registration_refresh_failure_preserves_last_known_good():
 
     assert refreshed is False
     assert svc.server._registered_hotkeys == frozenset({"hk-a"})
+    assert svc.server.operator_by_hotkey_snapshot() == {
+        "hk-a": "operator-a"
+    }
     assert svc.server._registration_refreshed_at == 123.0
     close_subtensor.assert_awaited_once_with(None)
 
@@ -100,7 +114,11 @@ async def test_registration_refresh_failure_preserves_last_known_good():
 @pytest.mark.asyncio
 async def test_empty_metagraph_refresh_preserves_last_known_good():
     svc = _build_late_drop_service()
-    svc.server.set_registered_hotkeys({"hk-a"}, refreshed_at=123.0)
+    svc.server.set_registered_hotkeys(
+        {"hk-a"},
+        refreshed_at=123.0,
+        operator_by_hotkey={"hk-a": "operator-a"},
+    )
     subtensor = object()
 
     with (
@@ -121,8 +139,43 @@ async def test_empty_metagraph_refresh_preserves_last_known_good():
 
     assert refreshed is False
     assert svc.server._registered_hotkeys == frozenset({"hk-a"})
+    assert svc.server.operator_by_hotkey_snapshot() == {
+        "hk-a": "operator-a"
+    }
     assert svc.server._registration_refreshed_at == 123.0
     close_subtensor.assert_awaited_once_with(subtensor)
+
+
+@pytest.mark.asyncio
+async def test_partial_operator_mapping_does_not_break_registration_refresh():
+    svc = _build_late_drop_service()
+    subtensor = object()
+    metagraph = MagicMock(
+        hotkeys=["hk-a", "hk-b"],
+        coldkeys=["operator-a"],
+    )
+
+    with (
+        patch(
+            "reliquary.validator.service.chain.get_subtensor",
+            new=AsyncMock(return_value=subtensor),
+        ),
+        patch(
+            "reliquary.validator.service.chain.get_metagraph",
+            new=AsyncMock(return_value=metagraph),
+        ),
+        patch(
+            "reliquary.validator.service.chain.close_subtensor",
+            new=AsyncMock(),
+        ),
+    ):
+        refreshed = await svc._refresh_registered_hotkeys(force=True)
+
+    assert refreshed is True
+    assert svc.server._registered_hotkeys == frozenset({"hk-a", "hk-b"})
+    assert svc.server.operator_by_hotkey_snapshot() == {
+        "hk-a": "operator-a"
+    }
 
 
 def test_service_creates_grpo_window_batcher():
@@ -138,10 +191,12 @@ def test_service_creates_grpo_window_batcher():
         cooldown_map=shared_cooldown,
         hash_set=None,
         tokenizer=MagicMock(),
+        operator_by_hotkey={"hk-a": "operator-a"},
     )
     assert isinstance(batcher, GrpoWindowBatcher)
     assert batcher.window_start == 100
     assert batcher._cooldown is shared_cooldown
+    assert batcher._operator_by_hotkey == {"hk-a": "operator-a"}
 
 
 @pytest.mark.asyncio

@@ -250,6 +250,7 @@ def test_health_endpoint_does_not_leak_secrets(monkeypatch):
     ]
     assert body["difficulty_auction_shadow_delta"] == 1.0
     assert body["difficulty_auction_shadow_max_candidates"] == 96
+    assert body["difficulty_auction_shadow_max_slots_per_operator"] == 2
     assert body["archive_queue_depth"] == 2
     assert body["archive_queue_oldest_window"] == 490
     assert body["archive_queue_oldest_age_seconds"] == 30.5

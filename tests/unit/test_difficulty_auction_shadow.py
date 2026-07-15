@@ -29,7 +29,13 @@ class CodeEnv(MathEnv):
     name = "opencodeinstruct"
 
 
-def _batcher(env=None, *, cooldown_map=None, hash_set=None):
+def _batcher(
+    env=None,
+    *,
+    cooldown_map=None,
+    hash_set=None,
+    operator_by_hotkey=None,
+):
     return GrpoWindowBatcher(
         window_start=500,
         env=env or MathEnv(),
@@ -40,6 +46,7 @@ def _batcher(env=None, *, cooldown_map=None, hash_set=None):
         verify_commitment_proofs_fn=lambda *_args, **_kwargs: None,
         verify_signature_fn=lambda *_args, **_kwargs: True,
         drand_round_check_enabled=False,
+        operator_by_hotkey=operator_by_hotkey,
     )
 
 
@@ -176,7 +183,59 @@ def test_shadow_candidate_limit_skips_work_without_changing_production(
         "batch_size": 8,
         "validated_candidates": 2,
         "max_candidates": 1,
+        "operator_cap_requested": 2,
+        "operator_mapping_snapshot_count": 0,
         "status": "skipped_candidate_limit",
+    }
+
+
+def test_shadow_operator_cap_uses_complete_metagraph_snapshot():
+    mapping = {f"miner-{index}": "operator-a" for index in range(4)}
+    batcher = _batcher(operator_by_hotkey=mapping)
+    batcher._valid = [
+        _submission(f"miner-{index}", index, drand_round=1, k=4)
+        for index in range(4)
+    ]
+    batcher.valid_count = len(batcher._valid)
+
+    production_batch, rewards = batcher.seal_batch()
+
+    assert len(production_batch) == 4
+    assert len(rewards) == 4
+    shadow = batcher.difficulty_auction_shadow
+    assert shadow["operator_cap_requested"] == 2
+    assert shadow["operator_cap_applied"] is True
+    assert shadow["operator_mapping_complete"] is True
+    assert shadow["operator_mapping_snapshot_count"] == 4
+    assert shadow["shadow_selected_count"] == 2
+    assert {row["operator_id"] for row in shadow["candidates"]} == {
+        "operator-a"
+    }
+
+
+def test_shadow_operator_cap_disables_itself_on_incomplete_mapping():
+    batcher = _batcher(operator_by_hotkey={"miner-a": "operator-a"})
+    batcher._valid = [
+        _submission("miner-a", 1, drand_round=1, k=4),
+        _submission("miner-b", 2, drand_round=1, k=4),
+    ]
+    batcher.valid_count = len(batcher._valid)
+
+    production_batch, rewards = batcher.seal_batch()
+
+    assert len(production_batch) == 2
+    assert len(rewards) == 2
+    shadow = batcher.difficulty_auction_shadow
+    assert shadow["operator_cap_requested"] == 2
+    assert shadow["operator_cap_applied"] is False
+    assert shadow["operator_mapping_complete"] is False
+    assert shadow["shadow_selected_count"] == 2
+    operator_by_hotkey = {
+        row["hotkey"]: row["operator_id"] for row in shadow["candidates"]
+    }
+    assert operator_by_hotkey == {
+        "miner-a": "operator-a",
+        "miner-b": None,
     }
 
 

@@ -395,7 +395,10 @@ def test_registered_hotkey_passes_without_refresh():
         return True
 
     server = _registration_server(refresh)
-    server.set_registered_hotkeys({_TEST_KEYPAIR.ss58_address})
+    server.set_registered_hotkeys(
+        {_TEST_KEYPAIR.ss58_address},
+        operator_by_hotkey={_TEST_KEYPAIR.ss58_address: "operator-a"},
+    )
     response = TestClient(server.app).post(
         "/submit", json=_request().model_dump(mode="json"),
     )
@@ -491,12 +494,17 @@ def test_health_reports_registration_gate_state():
         return True
 
     server = _registration_server(refresh)
-    server.set_registered_hotkeys({_TEST_KEYPAIR.ss58_address})
+    server.set_registered_hotkeys(
+        {_TEST_KEYPAIR.ss58_address},
+        operator_by_hotkey={_TEST_KEYPAIR.ss58_address: "operator-a"},
+    )
 
     health = TestClient(server.app).get("/health").json()
 
     assert health["registration_gate_enforced"] is True
     assert health["registered_hotkey_count"] == 1
+    assert health["registered_operator_mapping_count"] == 1
+    assert health["registered_operator_mapping_complete"] is True
     assert health["registration_cache_stale"] is False
     assert health["registration_cache_age_seconds"] >= 0
 

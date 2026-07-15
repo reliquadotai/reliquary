@@ -24,6 +24,7 @@ from reliquary.constants import (
     DIFFICULTY_AUCTION_SHADOW_ENABLED,
     DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS,
     DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES,
+    DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR,
     M_ROLLOUTS,
     MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
@@ -375,6 +376,7 @@ class GrpoWindowBatcher:
         drand_chain_info: dict | None = None,
         drand_round_backward_tolerance: int | None = None,
         queue_drained_predicate: Callable[[], bool] | None = None,
+        operator_by_hotkey: dict[str, str] | None = None,
     ) -> None:
         from reliquary.constants import DRAND_ROUND_BACKWARD_TOLERANCE
 
@@ -428,6 +430,12 @@ class GrpoWindowBatcher:
             else CooldownMap(cooldown_windows=BATCH_PROMPT_COOLDOWN_WINDOWS)
         )
         self._hash_set: RolloutHashSet | None = hash_set
+        self._operator_by_hotkey = {
+            normalized_hotkey: normalized_operator
+            for hotkey, operator in (operator_by_hotkey or {}).items()
+            if (normalized_hotkey := str(hotkey).strip())
+            and (normalized_operator := str(operator).strip())
+        }
 
         # Lock-free snapshot read by the HTTP /state handler. The submit
         # worker holds ``_lock`` for the entire GRAIL verify (~5-25s); a
@@ -2281,6 +2289,10 @@ class GrpoWindowBatcher:
             "batch_size": B_BATCH,
             "validated_candidates": len(self._valid),
             "max_candidates": DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES,
+            "operator_cap_requested": (
+                DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR
+            ),
+            "operator_mapping_snapshot_count": len(self._operator_by_hotkey),
         }
         self.difficulty_auction_metadata_by_id = {}
         if not DIFFICULTY_AUCTION_SHADOW_ENABLED:
@@ -2323,6 +2335,10 @@ class GrpoWindowBatcher:
                 shadow_pool,
                 b=B_BATCH,
                 delta=DIFFICULTY_AUCTION_DELTA,
+                max_slots_per_operator=(
+                    DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR
+                ),
+                operator_of=self._operator_by_hotkey.get,
             )
             production_selected_ids = {
                 id(submission)
@@ -2354,6 +2370,7 @@ class GrpoWindowBatcher:
                     "mean_reward": candidate.score.mean_reward,
                     "reward_std": candidate.score.reward_std,
                     "reward_count": candidate.score.reward_count,
+                    "operator_id": candidate.operator_id,
                     "eligible": candidate.eligible,
                     "rank": candidate.rank,
                     "shadow_selected": candidate.selected,
