@@ -259,13 +259,14 @@ def test_proof_cap_breaker_uses_distinct_prompt_count():
     svc._open_window()
     svc._activate_window()
     batcher = svc._active_batcher
-    batcher._valid = [
+    # Proofs run at seal now, so the trainable fill level is the PENDING pool.
+    batcher._pending = [
         SimpleNamespace(prompt_idx=i) for i in range(B_BATCH - 1)
     ] + [SimpleNamespace(prompt_idx=0)]
-    batcher.valid_count = B_BATCH
+    batcher.pending_count = B_BATCH
     batcher._proof_grading_attempts = MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
 
-    assert batcher.distinct_valid_prompt_count() == B_BATCH - 1
+    assert batcher.distinct_pending_prompt_count() == B_BATCH - 1
     assert svc._proof_admission_exhausted_and_drained(batcher) is True
 
 
@@ -279,10 +280,10 @@ async def test_wait_for_window_seal_force_seals_duplicate_prompt_shortfall(monke
     svc._open_window()
     svc._activate_window()
     batcher = svc._active_batcher
-    batcher._valid = [
+    batcher._pending = [
         SimpleNamespace(prompt_idx=i) for i in range(B_BATCH - 1)
     ] + [SimpleNamespace(prompt_idx=0)]
-    batcher.valid_count = B_BATCH
+    batcher.pending_count = B_BATCH
     batcher._proof_admission_count = B_BATCH + 1
 
     reason = await svc._wait_for_window_seal()
@@ -305,8 +306,8 @@ async def test_wait_for_window_seal_force_seals_sparse_valid_idle(monkeypatch):
     svc._open_window()
     svc._activate_window()
     batcher = svc._active_batcher
-    batcher._valid = [SimpleNamespace(prompt_idx=i) for i in range(4)]
-    batcher.valid_count = 4
+    batcher._pending = [SimpleNamespace(prompt_idx=i) for i in range(4)]
+    batcher.pending_count = 4
     batcher.last_valid_submission_at = batcher._time_fn() - 1.0
     batcher.last_valid_submission_wall_ts = batcher._wall_clock() - 1.0
 
@@ -327,8 +328,8 @@ async def test_wait_for_window_seal_force_seals_sparse_valid_max_age(monkeypatch
     svc._open_window()
     svc._activate_window()
     batcher = svc._active_batcher
-    batcher._valid = [SimpleNamespace(prompt_idx=123)]
-    batcher.valid_count = 1
+    batcher._pending = [SimpleNamespace(prompt_idx=123)]
+    batcher.pending_count = 1
     batcher.last_valid_submission_at = batcher._time_fn()
     batcher.last_valid_submission_wall_ts = batcher._wall_clock()
 

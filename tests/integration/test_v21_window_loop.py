@@ -347,7 +347,9 @@ async def test_verify_model_NOT_refreshed_when_publish_skipped(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_submission_with_matching_hash_accepted_during_open():
-    """Inject an 8-submission batch into an OPEN batcher; seal_event fires."""
+    """Inject an 8-submission batch into an OPEN batcher; all are admitted to the
+    pending pool. The window is time-boxed now (v2), so reaching B distinct
+    prompts does NOT seal — only the collection deadline does."""
     svc = _make_service(checkpoint_hash="sha256:cpA")
 
     # Open a window (hash wired to current_manifest by _open_window)
@@ -366,8 +368,11 @@ async def test_submission_with_matching_hash_accepted_during_open():
         resp = batcher.accept_submission(req)
         assert resp.accepted, f"unexpected reject for hk{i}: {resp.reason}"
 
-    # seal_event should now be set.
-    assert batcher.seal_event.is_set()
+    # Deferred model: proofs run at seal, so reaching B distinct prompts does
+    # NOT seal the window — the fixed collection deadline does (covered by
+    # tests/unit/test_collection_deadline.py). All B are admitted to pending.
+    assert batcher.seal_event.is_set() is False
+    assert len(batcher.pending_submissions()) == B_BATCH
 
 
 @pytest.mark.asyncio
