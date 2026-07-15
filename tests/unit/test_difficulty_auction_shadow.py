@@ -85,6 +85,12 @@ def test_shadow_does_not_change_production_fcfs_selection_or_rewards():
     )
     assert hard_row["shadow_selected"] is True
     assert hard_row["production_selected"] is False
+    assert hard_row["production_rewarded"] is False
+    easy_rows = [
+        row for row in shadow["candidates"] if row["hotkey"].startswith("easy")
+    ]
+    assert all(row["production_selected"] is True for row in easy_rows)
+    assert all(row["production_rewarded"] is True for row in easy_rows)
 
 
 def test_shadow_failure_cannot_fail_production_seal(monkeypatch):
