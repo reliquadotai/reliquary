@@ -212,6 +212,20 @@ SPARSE_VALID_IDLE_SEAL_SECONDS = 300.0
 SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS = 4
 SPARSE_VALID_MAX_WINDOW_SECONDS = 900.0
 
+# Difficulty-auction v2: the window is time-boxed. It stays open for exactly
+# this many seconds and accepts everything valid, then seals on the deadline
+# (see ``GrpoWindowBatcher.poll_deadline``) instead of on the 8-distinct count.
+# Sized from live data (math gen median ~176s, p75 ~267s; windows already ran
+# ~277s of collection). An early seal would be the speed race we are removing —
+# whoever triggered it would cut off slow-but-hard submissions still generating.
+WINDOW_COLLECTION_SECONDS = 300.0
+
+# Difficulty-auction v2: number of ranked-pass non-winners proven per window
+# purely for the forensic auth gates (token-auth, distribution, forced-seed),
+# which otherwise only ever run on the winners. TODO: a follow-up selects this
+# sample from post-deadline drand entropy; until then it is disabled (0).
+FORENSIC_SAMPLE_PER_WINDOW = 0
+
 # UID that receives unused slot emission budget (the burn address).
 UID_BURN = 0
 
