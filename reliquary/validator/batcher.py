@@ -7,6 +7,7 @@ validator's shared ``CooldownMap``.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import math
 import threading
@@ -552,6 +553,10 @@ class GrpoWindowBatcher:
         # the grouping but accept-time logic only needs the count.
         self._submissions_per_prompt: dict[int, list[PendingSubmission]] = {}
         self.randomness: str = ""
+        # Drand beacon fetched at seal (post-deadline) to key the forensic
+        # sample so it cannot be predicted at submission time. See
+        # _prove_forensic_sample. Empty in mock/no-drand mode = no sampling.
+        self.seal_randomness: str = ""
         # Per-window eligible prompt slice [lo, hi). None = no restriction
         # (randomness not yet known, or window is before the enforcement
         # cutover). Set by set_prompt_range() once randomness is assigned.
@@ -2427,12 +2432,14 @@ class GrpoWindowBatcher:
         pre-generation / token-tamper detectors alive. Results never enter
         ``_valid`` and are never paid.
 
-        TODO(follow-up): select the sample from post-deadline drand entropy so a
-        miner cannot predict whether it is watched. Until then the sample size is
-        ``FORENSIC_SAMPLE_PER_WINDOW`` (currently 0 = disabled), so this is a
-        deterministic no-op that proves nothing extra.
+        The sample is keyed on ``self.seal_randomness`` — a drand beacon fetched
+        AFTER the collection deadline — so a miner cannot grind its merkle_root to
+        learn whether it will be watched (the entropy did not exist at submission
+        time). This is telemetry only and never feeds weights, so it needs no
+        cross-validator consensus: each validator may watch a different sample.
+        Empty seal_randomness (mock / no-drand) disables sampling.
         """
-        if FORENSIC_SAMPLE_PER_WINDOW <= 0:
+        if FORENSIC_SAMPLE_PER_WINDOW <= 0 or not self.seal_randomness:
             self.forensic_sample = []
             return self.forensic_sample
         with self._lock:
@@ -2440,13 +2447,12 @@ class GrpoWindowBatcher:
                 p for p in self._pending
                 if id(p) not in self._attempted_pending_ids
             ]
-        # Deterministic order (drand_round, canonical within-slot hash) so
-        # validators converge on the same sample without wall-clock or id().
+        seed = self.seal_randomness.encode()
         remainder.sort(
-            key=lambda p: (
-                int(p.drand_round),
-                _within_slot_key(p),
-            )
+            key=lambda p: hashlib.sha256(
+                seed + p.hotkey.encode()
+                + int(p.prompt_idx).to_bytes(8, "big") + p.merkle_root
+            ).digest()
         )
         sample = remainder[:FORENSIC_SAMPLE_PER_WINDOW]
         results = [

@@ -420,10 +420,9 @@ def test_global_proof_budget_bounds_a_multi_hotkey_flood():
     assert len(proofs) == 5
 
 
-def test_forensic_sample_is_disabled_for_now():
-    """The forensic sample is a follow-up (drand-future selection). Until then it
-    is disabled (FORENSIC_SAMPLE_PER_WINDOW=0): only the ranked winners are
-    proven, and forensic_sample stays empty."""
+def test_forensic_sample_disabled_without_seal_randomness():
+    """No post-deadline entropy (mock / no-drand) → no sample: only the 8 winners'
+    rollouts are proven and forensic_sample stays empty."""
     from reliquary.constants import M_ROLLOUTS
     from tests.unit.test_grpo_window_batcher import (
         _always_true_grail, _make_batcher, _request,
@@ -436,6 +435,7 @@ def test_forensic_sample_is_disabled_for_now():
         return _always_true_grail(commit, model, randomness)
 
     b = _make_batcher(verify_commitment_proofs_fn=_counting)
+    assert b.seal_randomness == ""              # unset by default
     for i in range(20):
         b.accept_submission(_request(prompt_idx=i, hotkey=f"m{i}"))
 
@@ -444,3 +444,31 @@ def test_forensic_sample_is_disabled_for_now():
     assert len(b.valid_submissions()) == 8
     assert len(proofs) == 8 * M_ROLLOUTS       # only the 8 winners' rollouts
     assert b.forensic_sample == []
+
+
+def test_forensic_sample_watches_non_winners_keyed_on_seal_randomness():
+    """With post-deadline drand entropy set, FORENSIC_SAMPLE_PER_WINDOW non-winners
+    are proven for telemetry, selected by hashing seal_randomness (which did not
+    exist at submission time, so a miner cannot grind its root to dodge it)."""
+    from reliquary.constants import FORENSIC_SAMPLE_PER_WINDOW, M_ROLLOUTS
+    from tests.unit.test_grpo_window_batcher import (
+        _always_true_grail, _make_batcher, _request,
+    )
+
+    def _make(seal_rand):
+        b = _make_batcher(verify_commitment_proofs_fn=_always_true_grail)
+        b.seal_randomness = seal_rand
+        for i in range(20):
+            b.accept_submission(_request(prompt_idx=i, hotkey=f"m{i}"))
+        b.seal_batch()
+        return b
+
+    b = _make("beacon-round-777")
+    winners = {s.hotkey for s in b.valid_submissions()}
+    assert len(b.forensic_sample) == FORENSIC_SAMPLE_PER_WINDOW
+    watched = {r.hotkey for r in b.forensic_sample}
+    assert watched.isdisjoint(winners)          # only non-winners are sampled
+
+    # Different post-deadline entropy → different watched set (unpredictable).
+    other = {r.hotkey for r in _make("beacon-round-999").forensic_sample}
+    assert watched != other

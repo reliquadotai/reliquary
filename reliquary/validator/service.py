@@ -1074,6 +1074,13 @@ class ValidationService:
         # count, as GRAD_ACCUM_STEPS already does) so every validator uses the
         # same pool and an env a validator does not run burns its share.
         pool_per_env = 1.0 / len(self.env_mix)
+        # Fetch a fresh drand beacon now — AFTER the collection deadline — to key
+        # each batcher's forensic sample. Its randomness did not exist when miners
+        # submitted, so they cannot grind their merkle_root to dodge being watched.
+        # Telemetry only, so a failed fetch just disables the sample this window.
+        seal_randomness = await self._fetch_seal_randomness()
+        for b in self._active_batchers.values():
+            b.seal_randomness = seal_randomness
         # seal_batch now runs the GRAIL GPU proofs (``_prove_ranked``, up to ~8
         # forward passes at 5-25s each), so offload each batcher to a thread to
         # keep the event loop responsive (/state, /health, submit, archive).
@@ -2331,3 +2338,27 @@ class ValidationService:
         # disable drand keep working without a live drand fetch.
         block_hash = await chain.get_block_hash(subtensor, target_window)
         return chain.compute_window_randomness(block_hash), None
+
+    async def _fetch_seal_randomness(self) -> str:
+        """Fetch the drand beacon current at seal (post-deadline) to key the
+        forensic sample. Telemetry only, so any failure returns "" (no sample)
+        rather than blocking the seal. Off-loop: the HTTP fetch must not stall
+        the event loop while the window seals.
+        """
+        if not self.use_drand:
+            return ""
+        try:
+            import time
+            from reliquary.infrastructure.drand import get_beacon, get_current_chain
+
+            chain_info = await asyncio.to_thread(get_current_chain)
+            drand_round = chain.compute_current_drand_round(
+                time.time(), chain_info["genesis_time"], chain_info["period"],
+            )
+            beacon = await asyncio.to_thread(
+                get_beacon, round_id=str(drand_round), use_drand=True,
+            )
+            return str(beacon["randomness"])
+        except Exception:
+            logger.warning("seal-randomness fetch failed; forensic sample skipped")
+            return ""

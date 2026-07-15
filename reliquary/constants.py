@@ -224,7 +224,7 @@ WINDOW_COLLECTION_SECONDS = 300.0
 # purely for the forensic auth gates (token-auth, distribution, forced-seed),
 # which otherwise only ever run on the winners. TODO: a follow-up selects this
 # sample from post-deadline drand entropy; until then it is disabled (0).
-FORENSIC_SAMPLE_PER_WINDOW = 0
+FORENSIC_SAMPLE_PER_WINDOW = 2
 
 # UID that receives unused slot emission budget (the burn address).
 UID_BURN = 0
