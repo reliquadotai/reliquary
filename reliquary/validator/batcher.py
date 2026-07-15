@@ -2358,10 +2358,10 @@ class GrpoWindowBatcher:
                     "rank": candidate.rank,
                     "shadow_selected": candidate.selected,
                     "production_selected": (
-                        id(submission) in production_selected_ids
+                        submission.source_id in production_selected_ids
                     ),
                     "production_rewarded": (
-                        id(submission) in production_rewarded_ids
+                        submission.source_id in production_rewarded_ids
                     ),
                 }
                 self.difficulty_auction_metadata_by_id[
