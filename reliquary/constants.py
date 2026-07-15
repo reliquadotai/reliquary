@@ -483,6 +483,12 @@ DIFFICULTY_AUCTION_SHADOW_ENABLED = _os.environ.get(
 ).strip().lower() not in ("0", "false", "no", "off", "")
 DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS = ("openmathinstruct",)
 DIFFICULTY_AUCTION_DELTA = 1.0
+# The live proof budget currently caps each environment at 96 grading attempts.
+# Keep an independent ceiling so a future admission change cannot turn passive
+# telemetry into unbounded seal-time CPU or archive growth.
+DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES = int(
+    _os.environ.get("RELIQUARY_DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES", "96")
+)
 
 # How many drand-quicknet rounds backward of the validator's current round
 # the batcher accepts on the ``drand_round`` field. Default = 0: strict

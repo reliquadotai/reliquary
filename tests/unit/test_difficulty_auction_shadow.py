@@ -70,6 +70,8 @@ def test_shadow_does_not_change_production_fcfs_selection_or_rewards():
     assert shadow["mode"] == "observation_only"
     assert shadow["production_changed"] is False
     assert shadow["status"] == "computed"
+    assert shadow["validated_candidates"] == 9
+    assert shadow["computation_ms"] >= 0.0
     assert shadow["shadow_selected_count"] == 8
     assert shadow["selection_overlap_count"] == 7
     hard_row = next(
@@ -122,6 +124,48 @@ def test_shadow_receives_only_detached_immutable_values(monkeypatch):
     assert production_batch == [live_submission]
     assert rewards == {"miner": pytest.approx(1 / 8)}
     assert live_submission.prompt_idx == 1
+
+
+def test_shadow_candidate_limit_skips_work_without_changing_production(
+    monkeypatch,
+):
+    batcher = _batcher()
+    batcher._valid = [
+        _submission("miner-a", 1, drand_round=1, k=4),
+        _submission("miner-b", 2, drand_round=1, k=4),
+    ]
+    batcher.valid_count = 2
+    monkeypatch.setattr(
+        batcher_module, "DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES", 1
+    )
+
+    production_batch, rewards = batcher.seal_batch()
+
+    assert {submission.hotkey for submission in production_batch} == {
+        "miner-a",
+        "miner-b",
+    }
+    assert rewards == {
+        "miner-a": pytest.approx(1 / 8),
+        "miner-b": pytest.approx(1 / 8),
+    }
+    assert batcher.difficulty_auction_metadata_by_id == {}
+    assert batcher.difficulty_auction_shadow == {
+        "schema_version": 1,
+        "mode": "observation_only",
+        "environment": "openmathinstruct",
+        "population": "fully_validated_before_current_seal",
+        "population_limitations": [
+            "excludes_pre_validation_rejects",
+            "excludes_batch_filled_rejects",
+        ],
+        "production_changed": False,
+        "delta": 1.0,
+        "batch_size": 8,
+        "validated_candidates": 2,
+        "max_candidates": 1,
+        "status": "skipped_candidate_limit",
+    }
 
 
 def test_code_environment_is_explicitly_out_of_scope():

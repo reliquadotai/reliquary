@@ -10,6 +10,7 @@ import asyncio
 import logging
 import math
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -22,6 +23,7 @@ from reliquary.constants import (
     DIFFICULTY_AUCTION_DELTA,
     DIFFICULTY_AUCTION_SHADOW_ENABLED,
     DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS,
+    DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES,
     M_ROLLOUTS,
     MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
@@ -374,7 +376,6 @@ class GrpoWindowBatcher:
         drand_round_backward_tolerance: int | None = None,
         queue_drained_predicate: Callable[[], bool] | None = None,
     ) -> None:
-        import time
         from reliquary.constants import DRAND_ROUND_BACKWARD_TOLERANCE
 
         self.window_start = window_start
@@ -2278,6 +2279,8 @@ class GrpoWindowBatcher:
             "production_changed": False,
             "delta": DIFFICULTY_AUCTION_DELTA,
             "batch_size": B_BATCH,
+            "validated_candidates": len(self._valid),
+            "max_candidates": DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES,
         }
         self.difficulty_auction_metadata_by_id = {}
         if not DIFFICULTY_AUCTION_SHADOW_ENABLED:
@@ -2289,7 +2292,14 @@ class GrpoWindowBatcher:
                 "status": "out_of_scope_environment",
             }
             return
+        if len(self._valid) > DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES:
+            self.difficulty_auction_shadow = {
+                **base,
+                "status": "skipped_candidate_limit",
+            }
+            return
 
+        started_at = time.perf_counter()
         try:
             shadow_pool = tuple(
                 ShadowSubmission(
@@ -2377,7 +2387,9 @@ class GrpoWindowBatcher:
             self.difficulty_auction_shadow = {
                 **base,
                 "status": "computed",
-                "validated_candidates": len(self._valid),
+                "computation_ms": (
+                    time.perf_counter() - started_at
+                ) * 1000.0,
                 "eligible_candidates": result.eligible_count,
                 "distinct_eligible_prompts": result.distinct_prompt_count,
                 "production_selected_count": len(production_selected_ids),
@@ -2408,6 +2420,9 @@ class GrpoWindowBatcher:
                 **base,
                 "status": "error",
                 "error_type": type(exc).__name__,
+                "computation_ms": (
+                    time.perf_counter() - started_at
+                ) * 1000.0,
             }
 
     def seal_batch(

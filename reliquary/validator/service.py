@@ -21,6 +21,10 @@ from reliquary.constants import (
     CHECKPOINT_STAGING_DIR_DEFAULT,
     DEFAULT_HF_REPO_ID,
     DRAND_ROUND_BACKWARD_TOLERANCE,
+    DIFFICULTY_AUCTION_DELTA,
+    DIFFICULTY_AUCTION_SHADOW_ENABLED,
+    DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS,
+    DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES,
     ENVIRONMENT_MIX,
     FORCED_SEED_CDF_BOUNDARY_EPSILON,
     FORCED_SEED_CDF_ENFORCE,
@@ -1757,6 +1761,16 @@ class ValidationService:
                     FORCED_SEED_CDF_BOUNDARY_EPSILON
                 ),
                 "legacy_merkle_root_enforce": LEGACY_MERKLE_ROOT_ENFORCE,
+                "difficulty_auction_shadow_enabled": (
+                    DIFFICULTY_AUCTION_SHADOW_ENABLED
+                ),
+                "difficulty_auction_shadow_environments": list(
+                    DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS
+                ),
+                "difficulty_auction_shadow_delta": DIFFICULTY_AUCTION_DELTA,
+                "difficulty_auction_shadow_max_candidates": (
+                    DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES
+                ),
                 "logprob_is_eps": LOGPROB_IS_EPS,
                 "r2_bucket": os.getenv("R2_BUCKET_ID", "reliquary"),
                 "http_host": self.server.host,

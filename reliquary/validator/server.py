@@ -30,6 +30,10 @@ from reliquary.constants import (
     B_BATCH,
     BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION,
     DRAND_ROUND_BACKWARD_TOLERANCE,
+    DIFFICULTY_AUCTION_DELTA,
+    DIFFICULTY_AUCTION_SHADOW_ENABLED,
+    DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS,
+    DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES,
     ENFORCE_ENVELOPE_SIGNATURE,
     FORCED_SEED_CDF_BOUNDARY_EPSILON,
     FORCED_SEED_CDF_ENFORCE,
@@ -403,6 +407,14 @@ class _Health(BaseModel):
         FORCED_SEED_CDF_BOUNDARY_EPSILON
     )
     legacy_merkle_root_enforced: bool = LEGACY_MERKLE_ROOT_ENFORCE
+    difficulty_auction_shadow_enabled: bool = DIFFICULTY_AUCTION_SHADOW_ENABLED
+    difficulty_auction_shadow_environments: list[str] = Field(
+        default_factory=lambda: list(DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS)
+    )
+    difficulty_auction_shadow_delta: float = DIFFICULTY_AUCTION_DELTA
+    difficulty_auction_shadow_max_candidates: int = (
+        DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES
+    )
     legacy_merkle_checks_total: int = 0
     legacy_merkle_matches: int = 0
     legacy_merkle_mismatches: int = 0
@@ -1103,6 +1115,16 @@ class ValidatorServer:
                 FORCED_SEED_CDF_BOUNDARY_EPSILON
             ),
             legacy_merkle_root_enforced=LEGACY_MERKLE_ROOT_ENFORCE,
+            difficulty_auction_shadow_enabled=(
+                DIFFICULTY_AUCTION_SHADOW_ENABLED
+            ),
+            difficulty_auction_shadow_environments=list(
+                DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS
+            ),
+            difficulty_auction_shadow_delta=DIFFICULTY_AUCTION_DELTA,
+            difficulty_auction_shadow_max_candidates=(
+                DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES
+            ),
             legacy_merkle_checks_total=sum(self._legacy_merkle_stats.values()),
             legacy_merkle_matches=self._legacy_merkle_stats["match"],
             legacy_merkle_mismatches=self._legacy_merkle_stats["mismatch"],
