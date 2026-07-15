@@ -54,9 +54,9 @@ Read-only validation on `ubuntu@209.20.157.231` at the time of this report:
 | Surface | Value |
 |---|---|
 | Validator status | `ok`, `open` |
-| Image revision | `10706b04393cebe382caddef4e31a93d00b03756` |
-| Active window | `23094` |
-| Valid submissions | `4` at observation time |
+| Image revision | `d95e4254f12a9dc4c92692e80c251bccd3934024` |
+| Active window | Healthy and advancing at final observation |
+| Archive | Uploads healthy; checkpoint-local rows advancing |
 | Checkpoint | `28`, revision `58dc1761acffe120a9e5e7b6f447a95f03a06b98` |
 | Ratio forced-seed gate | Enforced |
 | Exact CDF gate | Shadow only |
@@ -76,26 +76,25 @@ are active while causal convolution uses its fallback.
 
 ## Fresh Telemetry
 
-The most recent 500 private schema-v3 group records cover 28 windows and 30
-hotkeys:
+The active checkpoint's private schema-v3 records cover 346 groups, 20 windows,
+and 31 hotkeys:
 
 | Cohort | Rollouts | Positions | Hard CDF mismatch rate | Stochastic agreement |
 |---|---:|---:|---:|---:|
-| Natural | 3,940 | 3,635,668 | 0.3070% | 95.02% |
-| BFT forced | 60 | 125,758 | 0.5908% | 93.74% |
-| Combined | 4,000 | 3,761,426 | 0.3165% | 94.95% |
+| Natural | 2,758 | 2,576,198 | 0.3260% | 94.54% |
+| BFT forced | 10 | 21,133 | 0.2934% | 96.30% |
+| Combined | 2,768 | 2,597,331 | 0.3257% | 94.55% |
 
-Across those 500 groups:
+Across those 346 groups:
 
-- Ratio group would-reject: 0.
-- Ratio rollout would-reject: 0.
-- Exact CDF would-reject: 500.
-- Current forced-rollout share: 1.5%.
+- Ratio group/rollout rejects: 4.
+- Exact CDF would-reject: 346.
+- Current forced-rollout share: 0.36%.
 
 This decisively rules out exact-CDF enforcement under the present numerical
-contract. It also confirms an association between the forced path and more
-drift. It does not prove directionality: forced rollouts are longer and execute
-a second generation phase, both of which increase exposure to mismatches.
+contract. The earlier checkpoint showed higher drift in its forced cohort, but
+the current checkpoint does not. BFT and CDF drift are therefore
+checkpoint/trajectory-dependent, not a stable causal relationship.
 
 Earlier 120-window BFT analysis found:
 
@@ -170,7 +169,8 @@ Impact:
 - Non-forced legacy metadata remains wire-compatible but has no training
   effect.
 
-Commit: `3b10530 fix(training): trust only validated BFT force spans`
+This fix is live through PR #128 and validator revision
+`d95e4254f12a9dc4c92692e80c251bccd3934024`.
 
 ## Added Causal Telemetry
 
@@ -204,7 +204,7 @@ python scripts/report_forced_seed_cdf.py \
   /root/reliquary/state/auth_forensics/forced-seed-shadow.jsonl --json
 ```
 
-Commit: `a4cf8cc feat(telemetry): correlate CDF drift with BFT termination`
+Commit: `da75037 feat(telemetry): correlate CDF drift with BFT termination`
 
 ## Added Runtime Contract
 
@@ -212,9 +212,11 @@ The validator now exposes `GET /runtime-contract` separately from `/state`.
 Keeping capability discovery separate is important because legacy miners parse
 `/state` with a strict schema.
 
-When this endpoint exists, an upgraded miner submits a bounded runtime profile:
+When this endpoint exists, an upgraded miner submits a bounded runtime profile
+using telemetry schema 2:
 
-- Python, PyTorch, Transformers, CUDA, FLA, causal-conv and flash-attn versions.
+- Python, PyTorch, Transformers, CUDA, the `flash-linear-attention` wrapper,
+  its independently installed `fla-core`, causal-conv and flash-attn versions.
 - GPU family and compute capability, but no hostname, serial, wallet secret, or
   filesystem path.
 - Generation and proof dtype and attention implementation.
@@ -234,7 +236,7 @@ Compatibility sequence:
   omits the optional field.
 - New validator plus new miner: profile is attached and recorded privately.
 
-Commit: `9972ef3 feat(runtime): fingerprint inference kernel profiles`
+Commit: `0a9c127 feat(runtime): fingerprint inference kernel profiles`
 
 ## Added Training Contribution Telemetry
 
@@ -260,160 +262,181 @@ Initial review thresholds, not rejection thresholds:
 - A sustained rise in `bad_termination` coincident with a checkpoint or runtime
   profile change.
 
-Commit: `062f90e feat(training): expose BFT gradient contribution metrics`
+Commit: `f035678 feat(training): expose BFT gradient contribution metrics`
 
-## Controlled GPU Experiment
+## Controlled H200 Experiment
 
-Execution status for this report: the supplied Targon H200 deployment no
-longer accepted the corresponding local public key. Older H200 aliases also
-presented changed SSH host keys, which were not bypassed. No shared process or
-reprovisioned host was modified. The matrix below is therefore implemented and
-ready, but its GPU result artifacts are still pending a trusted fresh instance.
+The matrix ran on an NVIDIA H200 against immutable checkpoint
+`58dc1761acffe120a9e5e7b6f447a95f03a06b98` and the exact production image
+`ghcr.io/reliquadotai/reliquary-validator:sha-d95e425`. Three isolated images
+were used; no package was changed in the live validator or a miner:
 
-Local verification is complete: 1,177 tests passed, 13 CUDA/context-dependent
-tests skipped, and no functional tests failed. A CPU smoke run of the benchmark
-on tiny GPT-2 completed four generated positions with zero hard CDF mismatches.
+- Production stack: FLA wrapper/core 0.5.0, no causal-conv.
+- No-FLA control: FLA wrapper/core and causal-conv absent.
+- Causal control: FLA 0.5.0 plus verified `causal-conv1d==1.6.2.post1` wheel.
 
-The new benchmark reproduces the protocol boundary directly:
+The fixed 64-prompt corpus hash was
+`67544c0fd17ccfda58c298f0dc687a2fb7817cebf5b62a2d7072a7d4a08190d9`;
+corpus prompt indices, model revision, runtime profile, process
+ID, completion hashes, timings, and peak CUDA memory are recorded in every
+artifact.
 
-```bash
-python scripts/benchmark_inference_contract.py \
-  --model <checkpoint-path-or-repo> \
-  --checkpoint-hash <immutable-revision> \
-  --prompts-jsonl <fixed-prompts.jsonl> \
-  --batch-size 8 \
-  --max-new-tokens 512 \
-  --dtype bfloat16 \
-  --attn-implementation flash_attention_2 \
-  --output results/live-profile-b8.json
-```
+### Short fixed-corpus result
 
-It performs cached forced-seed generation, then the validator's full-sequence
-teacher-forced forward, and emits runtime, CDF, termination, repetition, and
-throughput evidence. Run every profile in a fresh process.
+Each profile generated 64 prompts x 8 rollouts x 128 tokens:
 
-Commit: `44af823 tools(runtime): add cached-vs-teacher-force benchmark`
+| Profile | Hard CDF mismatch | Pipeline tok/s | Peak reserved |
+|---|---:|---:|---:|
+| Production | 249 / 65,536 = 0.3799% | 236.4 | 5.95 GB |
+| No FLA | 251 / 65,536 = 0.3830% | 240.9 | 5.95 GB |
+| FLA plus causal-conv | 221 / 65,536 = 0.3372% | 235.2 | 5.95 GB |
 
-### Matrix
+The confidence intervals overlap. Causal-conv is therefore not a statistically
+established winner. More importantly, full-completion agreement between profile
+pairs was only 61.9% to 63.5%. A package switch changes roughly 37% of 128-token
+trajectories even when aggregate CDF rates look similar.
 
-Run the same immutable checkpoint, 64 to 128 fixed prompts, and public seed
-material across:
+Three fresh-process replicates of each profile produced identical aggregate
+counts within profile. The observed problem does not require cross-process
+nondeterminism.
 
-| Axis | Values |
-|---|---|
-| Runtime | no FLA/no causal; FLA 0.5/no causal; FLA 0.5 plus pinned causal |
-| Generation cache | on; off diagnostic control |
-| Dtype | BF16 production; FP32 diagnostic control |
-| Batch shape | 1, 4, 8 |
-| Process | three fresh processes per cell |
-| GPU | H200 primary; H100 production confirmation |
-| Length | 256 and 512 isolation; 2048 plus BFT phase in final canary |
+### Exact production BFT replay
 
-Do not compare profiles using free-form normal sampling. The forced public
-uniform and immutable prompt/checkpoint set are required to align each token
-decision.
+One accepted production group from window 23105 was replayed with the exact
+prompt, checkpoint, public randomness, prompt index, and batch shape. Production
+had accepted all eight forced rollouts with 53 / 17,016 hard mismatches and six
+correct answers.
 
-### Metrics
+| H200 profile | Forced | EOS | Hard mismatch | Pipeline tok/s |
+|---|---:|---:|---:|---:|
+| Production stack | 5 / 8 | 4 / 8 | 4.966% | 158.2 |
+| No FLA | 8 / 8 | 7 / 8 | 2.481% | 241.2 |
+| FLA plus causal-conv | 7 / 8 | 7 / 8 | 0.772% | 141.3 |
+| FP32 generation, BF16 verification | 7 / 8 | not a release metric | 0.945% | 114.0 |
 
-- Hard CDF mismatch rate and max miss.
-- Stochastic agreement.
-- First mismatch offset.
-- EOS and cap rate.
-- Repeated n-gram and same-token-run onset.
-- Whether mismatch precedes degeneration.
-- Tokens per second and peak memory.
-- Cross-process and cross-batch-shape variance.
+No completion was identical across profiles. The causal profile was exactly
+deterministic when replayed, yet it still did not reproduce the accepted miner
+trajectory. This proves that long-path runtime identity matters and that package
+presence alone cannot define the protocol contract.
 
-### Acceptance criteria
+Text inspection located repetition around completion offsets 30 to 55, far
+before the BFT insertion at 2048. BFT did not initiate rambling in this replay;
+it rescued five of eight causal-profile trajectories into a valid boxed answer.
+The training concern is narrower: a successful forced sample may retain a long
+repetitive pre-force prefix, so its weighted exposure must be monitored.
 
-A candidate canonical runtime must:
+### Cache and precision controls
 
-1. Reduce or equal the live profile's hard-mismatch rate with confidence
-   intervals over the fixed cohort.
-2. Not increase termination failures or repetition after length matching.
-3. Produce zero ratio-gate false rejects over at least 10,000 honest rollouts.
-4. Keep throughput within 10% of the best safe profile unless the quality gain
-   clearly justifies the cost.
-5. Reproduce on the production H100, not only the H200 lab host.
-6. Be deployable as the same pinned validator and miner image/runtime.
+- BF16 cached production: 3 / 1,024 hard mismatches.
+- BF16 no-cache production: 5 / 1,024. Disabling cache did not fix drift.
+- BF16 no-FLA eager: 4 / 1,024.
+- FP32 no-FLA eager self-verification: 0 / 1,024.
+- FP32 generation verified by the actual BF16/FA2 validator path:
+  217 / 65,536 = 0.3311% on the full short corpus.
 
-Exact CDF enforcement requires a stronger result: effectively zero unexplained
-hard mismatches under every supported runtime. Current evidence is nowhere near
-that condition.
+FP32 self-verification is a useful numerical control, not a production result.
+When crossed back into the actual validator path its confidence interval
+overlaps both production and causal-conv. It also costs substantially more
+memory on long BFT replay.
 
-## Deployment Plan
+### Graded BFT budget sweep
 
-### Phase 0: merge the known-safe changes
+The same eight real math prompts (corpus hash
+`81e829f903948772aecdb257f71c17e117dd6719221af89ead2beb63b4c1ceff`)
+and eight public-seed rollouts per prompt were graded under each policy:
 
-Merge and deploy the validator security and telemetry commits. They do not
-change generation, BFT budgets, reward, ratio thresholds, or exact-CDF policy.
+| Thinking/answer budget | Correct | Forced | EOS | Pipeline tok/s | Peak reserved |
+|---|---:|---:|---:|---:|---:|
+| 512 / 256 | 27 / 64 (42.2%) | 58 / 64 | 49 / 64 | 175.8 | 18.70 GB |
+| 1024 / 256 | 32 / 64 (50.0%) | 36 / 64 | 54 / 64 | 200.5 | 31.72 GB |
+| 1536 / 512 | 36 / 64 (56.3%) | 12 / 64 | 58 / 64 | 188.2 | 29.98 GB |
+| 2048 / 512 | 34 / 64 (53.1%) | 12 / 64 | 55 / 64 | 172.1 | 36.24 GB |
 
-### Phase 1: validator first
+The 2048 result was a strict subset of the 1536 successes: 34 paired successes,
+28 paired failures, and two answers won only by 1536. This makes 1536/512 the
+best next canary candidate, but 64 rollouts are not enough for a consensus
+budget change. Keep 2048/512 live until a larger paired H100 canary confirms the
+quality and checkpoint-transition result.
 
-Deploy the new validator image. Confirm:
+## Additional Security Finding: GRAIL Sketch Tolerance
 
-- `/health` is `ok` and contains `runtime_fingerprint`.
-- `/runtime-contract` returns telemetry version 1.
-- `/state` retains its previous shape.
-- A legacy miner submission is accepted.
-- Private forced-seed rows advance to schema v4.
-- Training metrics contain the `bft/` family.
+The newly executable GPU suite exposed a pre-existing false security
+assumption. Its wrong-model test expected random hidden states to fail, but all
+seven challenges passed. A direct real-checkpoint diagnostic then compared 82
+Qwen positions against random-unit, variance-matched random, shuffled-dimension,
+shuffled-position, and all-zero commitments. Every variant passed 82 / 82.
 
-### Phase 2: miner rollout
+The cause is structural: with 16 signed magnitude buckets and coefficients in
+`[-127, 127]`, observed sketch differences remained below 3,000, while the
+base tolerance is 5,000. A random field element still fails, but a fabricated
+low-range model-derived or constant sketch need not. The comment claiming
+roughly `tolerance / PRIME_Q` forgery probability does not describe this attack
+distribution.
 
-Upgrade one canary miner. It will attach a runtime profile only after capability
-discovery. Confirm its profile appears in private telemetry and no new schema or
-envelope reject occurs. Then roll to the remaining maintained miners.
+This does not by itself let a miner forge the forced-seed token trajectory: the
+validator independently recomputes logits, token probabilities, public-seed
+agreement, termination, and rewards. It does mean the hidden-state commitment
+is not currently providing the claimed independent proof strength and may let
+an attacker omit or substitute commitment computation.
 
-### Phase 3: observe
+Do not silently lower tolerance: that is consensus-sensitive and honest H100
+cross-runtime margins were not previously retained. Schema-v4 telemetry now
+records per-rollout maximum sketch difference, distinct-sketch ratio, zero
+ratio, and constant-commitment status without storing exact sketches. The report
+exposes p50/p95/p99 margins and low-entropy counts. This is the evidence required
+to design a coordinated GRAIL proof revision rather than guessing a threshold.
 
-Collect at least 24 hours, 1,000 groups, five hotkeys, multiple runtime profiles,
-and at least one checkpoint transition. Interpret repetition within completion
-length and termination-path cohorts.
+## Verification
 
-### Phase 4: run the H200 matrix
+- Local unit suite: 1,153 passed.
+- Focused telemetry/batcher suite after sketch instrumentation: 146 passed.
+- Integration tests reached 14 passed and 5 skipped before a network-dependent
+  prompt-source test blocked in SSL; the previously isolated offline selection
+  passed 28 with 5 skipped.
+- H200 GPU suite: seven passed; the one failure is the GRAIL wrong-model finding
+  documented above, not a BFT/runtime regression.
+- H200 was left with no running benchmark or test container.
+- Raw JSON artifacts and both fixed corpora are preserved at
+  `/Users/malouk/GRAIL/reliquary-h200-bft-results-20260715.tar.gz`, SHA-256
+  `2f0f1acf369d976d24906217a64178dd20ac2b680c8ab3c1fd56d7514cd44582`.
 
-Run isolated dependency environments. Never install or uninstall kernels inside
-the live validator or an active miner process. Preserve the JSON artifact from
-every cell and aggregate by profile hash.
+## Production Plan
 
-### Phase 5: choose and canary a canonical runtime
-
-If a profile wins, pin exact package versions and image digest for validator and
-miners. Deploy one miner lane and validator canary together. Keep the ratio gate
-active and exact CDF shadow-only.
-
-### Phase 6: revisit BFT only with causal evidence
-
-Change the 2048/512 budgets or post-force training policy only if the new data
-shows a sustained quality or gradient-exposure problem after controlling for
-runtime, length, checkpoint, and prompt.
+1. Merge the passive runtime, BFT, training, and sketch telemetry release. It
+   does not alter tokens, rewards, BFT budgets, or gate thresholds.
+2. Deploy validator first. Confirm `/health`, `/runtime-contract`, unchanged
+   `/state`, schema-v4 rows, legacy-miner acceptance, and `bft/` training metrics.
+3. Upgrade one maintained miner so its self-reported runtime profile appears in
+   private telemetry. Old miners remain compatible and need no immediate action.
+4. Keep `FORCED_SEED_CDF_ENFORCE=false`; current evidence already proves exact
+   CDF enforcement unsafe, so no 24-hour wait is needed for that decision.
+5. Collect at least 1,000 honest groups across five hotkeys and a checkpoint
+   transition for runtime/BFT correlations and honest sketch-margin calibration.
+   The volume target is for choosing a new policy, not for delaying this passive
+   release.
+6. Run a larger paired 1536/512 versus 2048/512 H100 canary before proposing a
+   coordinated budget change.
+7. Design GRAIL v8 from the observed honest margin distribution and adversarial
+   controls. Treat any threshold or commitment-format change as a coordinated
+   miner-validator protocol release.
 
 ## Rollback and Stop Rules
 
-Rollback the telemetry release if any of the following appears:
-
-- Legacy miners fail parsing or submission.
-- Proof throughput regresses materially from profile collection overhead.
-- Private JSONL growth threatens disk capacity.
-- Training omits natural tokens or masks beyond a canonically validated span.
-- `/state` shape changes.
-
-Stop a runtime canary immediately if:
-
-- Ratio-gate rejects increase for the canary profile.
-- Bad termination or degeneration rises relative to a length-matched control.
-- Checkpoint transition quality degrades network-wide.
-- Miner and validator profile hashes indicate an unintended package split.
+Rollback the observability release if legacy submissions fail, proof throughput
+regresses, private JSONL growth threatens disk, training masks beyond a validated
+force span, or `/state` changes shape. Stop a runtime or budget canary if ratio
+rejects, bad termination, repetition, or checkpoint-transition quality worsens
+against its paired control.
 
 ## Final Direction
 
-The mission remains on track. BFT is useful as a bounded termination mechanism,
-and current data does not justify removing it or treating its small synthetic
-segment as a demonstrated collapse source. The unsafe part was not BFT itself;
-it was an untrusted metadata boundary in training, now fixed.
+BFT remains useful and is not the demonstrated source of rambling. The force
+tokens are now safely masked from loss, while pre-force and post-force policy
+tokens remain trainable and measurable. The H200 work rejects a miner-only
+kernel installation and identifies 1536/512 as a canary candidate, not a live
+default.
 
-The next protocol decision should be driven by the new causal telemetry and the
-controlled runtime matrix. Until that evidence exists, the SOTA position is to
-preserve the tolerant forced-seed gate, keep exact CDF in shadow, retain 2048/512,
-and avoid unilateral kernel changes.
+The immediate SOTA action is a compatible observability deployment, followed by
+paired H100 budget validation and a separately versioned GRAIL proof hardening.
+Keep the tolerant forced-seed ratio gate on, exact CDF off, and the live runtime
+and 2048/512 budget unchanged until those coordinated canaries pass.
