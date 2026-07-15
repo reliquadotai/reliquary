@@ -13,6 +13,11 @@ Requires: GPU with CUDA, ~1GB VRAM
 import pytest
 import torch
 
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA GPU required for end-to-end GRAIL tests",
+)
+
 from reliquary.constants import CHALLENGE_K, LAYER_INDEX, PRIME_Q
 from reliquary.protocol.crypto import indices_from_root
 from reliquary.protocol.grail_verifier import GRAILVerifier

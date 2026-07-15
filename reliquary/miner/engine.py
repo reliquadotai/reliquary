@@ -385,10 +385,14 @@ class MiningEngine:
         from reliquary.constants import M_ROLLOUTS, POLL_INTERVAL_SECONDS
         from reliquary.miner.submitter import (
             SubmissionError, discover_validator_url,
-            get_window_state_v2, submit_batch_v2,
+            get_runtime_contract_v1, get_window_state_v2, submit_batch_v2,
         )
         from reliquary.protocol.submission import (
-            BatchSubmissionRequest, WindowState,
+            BatchSubmissionRequest, RuntimeFingerprint, WindowState,
+        )
+        from reliquary.shared.runtime_fingerprint import (
+            bind_runtime_profile_nonce,
+            collect_runtime_fingerprint,
         )
 
         # Resolve validator URL (once).
@@ -409,6 +413,30 @@ class MiningEngine:
         local_hash = ""
 
         async with httpx.AsyncClient(timeout=30) as client:
+            runtime_telemetry_enabled = False
+            runtime_fingerprint = None
+            try:
+                contract = await get_runtime_contract_v1(url, client=client)
+                runtime_telemetry_enabled = contract.telemetry_version >= 1
+                runtime_fingerprint = RuntimeFingerprint.model_validate(
+                    collect_runtime_fingerprint(
+                        generation_model=self.vllm_model,
+                        proof_model=self.hf_model,
+                    )
+                )
+                logger.info(
+                    "validator runtime telemetry enabled version=%d "
+                    "validator_profile=%s",
+                    contract.telemetry_version,
+                    contract.validator_profile.profile_hash,
+                )
+            except (SubmissionError, ValueError):
+                # Older validators may omit the capability or expose an older
+                # telemetry schema. Omitting the optional request field keeps
+                # mining wire-compatible in both cases.
+                runtime_telemetry_enabled = False
+                runtime_fingerprint = None
+                logger.info("validator runtime telemetry unavailable")
             while True:
                 try:
                     state = await get_window_state_v2(url, client=client)
@@ -504,6 +532,11 @@ class MiningEngine:
                 # window. The nonce is per-submission fresh randomness.
                 import os as _os
                 _nonce = _os.urandom(16).hex()
+                _runtime_fingerprint = runtime_fingerprint
+                if runtime_telemetry_enabled and _runtime_fingerprint is not None:
+                    _nonce = bind_runtime_profile_nonce(
+                        _nonce, _runtime_fingerprint.profile_hash,
+                    )
                 _envelope_sig = sign_envelope(
                     wallet=self.wallet,
                     miner_hotkey=self.wallet.hotkey.ss58_address,
@@ -525,6 +558,7 @@ class MiningEngine:
                     drand_round=current_round,
                     nonce=_nonce,
                     envelope_signature=_envelope_sig,
+                    runtime_fingerprint=_runtime_fingerprint,
                     # Rollouts are drawn from the forced-seed stream; advertise it.
                     protocol_version=FORCED_SEED_PROTOCOL_VERSION,
                 )

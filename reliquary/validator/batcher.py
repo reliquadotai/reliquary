@@ -82,6 +82,11 @@ from reliquary.validator.auth_forensics import (
 )
 from reliquary.validator.reward_shape import detect_reward_shape_manipulation
 from reliquary.validator.rollout_patterns import detect_opposite_reward_clones
+from reliquary.validator.rollout_telemetry import (
+    classify_bft_termination,
+    sketch_commitment_metrics,
+    token_degeneracy_metrics,
+)
 from reliquary.validator.selection_digest import compute_rollouts_selection_digest
 from reliquary.validator.verifier import (
     evaluate_all_token_auth_shadow,
@@ -1262,9 +1267,25 @@ class GrpoWindowBatcher:
         truncated_flags = [False] * len(request.rollouts)
         # BFT carve-out: resolve the canonical FORCE ids once, only if some
         # rollout is forced; non-forced submissions never touch the tokenizer.
-        from reliquary.constants import BFT_THINKING_BUDGET
+        from reliquary.constants import BFT_ANSWER_BUDGET, BFT_THINKING_BUDGET
+        from reliquary.shared.modeling import (
+            resolve_eos_token_ids,
+            think_close_token_ids,
+        )
         canonical_force_ids: list[int] = []
         force_think_close_ids: set[int] = set()
+        try:
+            telemetry_eos_ids = set(
+                resolve_eos_token_ids(self.model, self.tokenizer)
+            )
+        except Exception:
+            telemetry_eos_ids = set()
+        try:
+            telemetry_think_close_ids = set(
+                think_close_token_ids(self.tokenizer)
+            )
+        except Exception:
+            telemetry_think_close_ids = set()
         if any((r.commit.get("rollout") or {}).get("forced")
                for r in request.rollouts):
             from reliquary.shared.modeling import force_close_token_ids
@@ -1295,13 +1316,14 @@ class GrpoWindowBatcher:
         # Per-rollout (n_stoch, n_match) — the per-rollout gate needs each
         # rollout separately, since the group average hides a partial swap.
         seed_per_rollout: list[tuple[int, int]] = []
-        seed_cdf_per_rollout: list[dict[str, int | float]] = []
+        seed_cdf_per_rollout: list[dict[str, Any]] = []
 
         for rollout_idx, rollout in enumerate(request.rollouts):
             # Never carry a validator-derived carve across re-validation of the
             # same Pydantic object.  The private value is set only after the
             # signed commit's force span passes the canonical BFT checks below.
             rollout._validated_force_span = None
+            rollout._validated_termination_path = None
             # `truncated` is a validator-set flag (overlong reward shaping, see
             # submission.py). Wipe any miner-supplied value at ingestion so only
             # the validator's own cap/EOS detection below can set it — otherwise
@@ -1336,8 +1358,18 @@ class GrpoWindowBatcher:
             # consistency check. Read completion_length here (ahead of the
             # ``completion_len`` computed later at the sparse-outputs section)
             # so the u-stream can accompany the verify call below.
-            _seed_completion_len = int(
-                (rollout.commit.get("rollout") or {}).get("completion_length", 0)
+            _seed_meta = rollout.commit.get("rollout") or {}
+            _seed_completion_len = int(_seed_meta.get("completion_length", 0))
+            _seed_prompt_len = int(_seed_meta.get("prompt_length", 0))
+            _seed_tokens = rollout.commit.get("tokens") or []
+            _seed_completion_tokens = _seed_tokens[
+                _seed_prompt_len:_seed_prompt_len + _seed_completion_len
+            ]
+            rollout_token_metrics = token_degeneracy_metrics(
+                _seed_completion_tokens
+            )
+            rollout_sketch_metrics = sketch_commitment_metrics(
+                rollout.commit.get("commitments") or []
             )
             seed_u = [
                 u_at(
@@ -1411,6 +1443,9 @@ class GrpoWindowBatcher:
             seed_max_cdf_miss = float(
                 getattr(proof, "seed_max_cdf_miss", 0.0) or 0.0
             )
+            seed_first_hard_mismatch_offset = getattr(
+                proof, "seed_first_hard_mismatch_offset", None
+            )
             grp_seed_positions += seed_positions
             grp_seed_boundary_match += seed_boundary_match
             grp_seed_hard_mismatch += seed_hard_mismatch
@@ -1422,25 +1457,31 @@ class GrpoWindowBatcher:
                 grp_seed_max_cdf_miss,
                 seed_max_cdf_miss,
             )
-            seed_cdf_per_rollout.append(
-                {
-                    "rollout_idx": rollout_idx,
-                    "n_positions": seed_positions,
-                    "n_stochastic": int(proof.seed_n_stochastic),
-                    "n_exact_match": int(proof.seed_n_match),
-                    "n_boundary_match": seed_boundary_match,
-                    "n_hard_mismatch": seed_hard_mismatch,
-                    "n_deterministic_hard_mismatch": seed_deterministic_hard,
-                    "n_miss_gt_0_01": seed_miss_gt_0_01,
-                    "n_miss_gt_0_05": seed_miss_gt_0_05,
-                    "n_miss_gt_0_10": seed_miss_gt_0_10,
-                    "max_cdf_miss": seed_max_cdf_miss,
-                    "completion_length": _seed_completion_len,
-                    "forced": bool(
-                        (rollout.commit.get("rollout") or {}).get("forced")
-                    ),
-                }
-            )
+            seed_cdf_entry: dict[str, Any] = {
+                "rollout_idx": rollout_idx,
+                "n_positions": seed_positions,
+                "n_stochastic": int(proof.seed_n_stochastic),
+                "n_exact_match": int(proof.seed_n_match),
+                "n_boundary_match": seed_boundary_match,
+                "n_hard_mismatch": seed_hard_mismatch,
+                "n_deterministic_hard_mismatch": seed_deterministic_hard,
+                "n_miss_gt_0_01": seed_miss_gt_0_01,
+                "n_miss_gt_0_05": seed_miss_gt_0_05,
+                "n_miss_gt_0_10": seed_miss_gt_0_10,
+                "max_cdf_miss": seed_max_cdf_miss,
+                "first_hard_mismatch_offset": (
+                    int(seed_first_hard_mismatch_offset)
+                    if seed_first_hard_mismatch_offset is not None
+                    else None
+                ),
+                "completion_length": _seed_completion_len,
+                "claimed_forced": bool(_seed_meta.get("forced")),
+                "forced": False,
+                "validated_force_span_length": 0,
+                **rollout_token_metrics,
+                **rollout_sketch_metrics,
+            }
+            seed_cdf_per_rollout.append(seed_cdf_entry)
             if proof.sketch_diff_max > sketch_diff_max:
                 sketch_diff_max = proof.sketch_diff_max
             if not proof.all_passed:
@@ -1543,6 +1584,11 @@ class GrpoWindowBatcher:
                         boundary_epsilon=(
                             FORCED_SEED_CDF_BOUNDARY_EPSILON
                         ),
+                        seed_n_hard_mismatch=seed_hard_mismatch,
+                        seed_first_hard_mismatch_offset=(
+                            seed_first_hard_mismatch_offset
+                        ),
+                        token_metrics=rollout_token_metrics,
                     )
                 if not termination_ok or cap_truncated:
                     truncated_flags[rollout_idx] = True
@@ -1594,6 +1640,29 @@ class GrpoWindowBatcher:
                     int(declared_span[0]),
                     int(declared_span[1]),
                 )
+            seed_cdf_entry["forced"] = bool(rollout._validated_force_span)
+            seed_cdf_entry["validated_force_span_length"] = (
+                rollout._validated_force_span[1]
+                - rollout._validated_force_span[0]
+                if rollout._validated_force_span is not None
+                else 0
+            )
+            rollout._validated_termination_path = classify_bft_termination(
+                rollout.commit["tokens"],
+                prompt_length=prompt_len,
+                completion_length=completion_len,
+                eos_ids=telemetry_eos_ids,
+                think_close_ids=telemetry_think_close_ids,
+                validated_force_span=rollout._validated_force_span,
+                thinking_budget=BFT_THINKING_BUDGET,
+                answer_budget=BFT_ANSWER_BUDGET,
+            )
+            seed_cdf_entry["termination_path"] = (
+                rollout._validated_termination_path
+            )
+            seed_cdf_entry["sketch_diff_max"] = int(
+                proof.sketch_diff_max
+            )
 
             lp_ok, lp_dev = verify_logprobs_claim(
                 tokens=rollout.commit["tokens"],
@@ -1887,6 +1956,12 @@ class GrpoWindowBatcher:
             ratio_rollout_would_reject=rollout_would_reject,
             cdf_would_reject=cdf_would_reject,
             cdf_enforced=cdf_enforce,
+            runtime_profile=(
+                request.runtime_fingerprint.model_dump(mode="json")
+                if request.runtime_fingerprint is not None
+                else None
+            ),
+            sketch_diff_max=sketch_diff_max,
         )
         if group_reject or rollout_reject or cdf_reject:
             if cdf_reject:

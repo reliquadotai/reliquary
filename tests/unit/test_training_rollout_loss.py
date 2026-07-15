@@ -193,6 +193,28 @@ def test_rollout_loss_returns_completion_token_count(tiny_model_and_tokenizer):
     assert n_tok == 5
 
 
+def test_rollout_loss_accepts_protocol_full_sequence_logprobs(
+    tiny_model_and_tokenizer,
+):
+    model, _ = tiny_model_and_tokenizer
+    ref = _make_ref(model)
+    rollout = _build_rollout(
+        tokens=[1, 2, 3, 4, 5, 6, 7, 8],
+        reward=1.0,
+        prompt_length=3,
+    )
+    rollout.commit["rollout"]["token_logprobs"] = [-1.0] * 8
+
+    ppo, kl, n_tok = _rollout_loss(
+        model, ref, rollout, advantage=1.0,
+        device=next(model.parameters()).device,
+    )
+
+    assert n_tok == 5
+    assert torch.isfinite(ppo)
+    assert torch.isfinite(kl)
+
+
 def test_rollout_loss_masks_force_span_from_loss(tiny_model_and_tokenizer):
     """BFT: a forced rollout's injected FORCE span is excluded from the loss —
     the trained-token count drops by the span length and the loss changes."""

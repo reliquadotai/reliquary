@@ -26,6 +26,7 @@ class SeedConsistencyDiagnostics:
     n_miss_gt_0_05: int = 0
     n_miss_gt_0_10: int = 0
     max_cdf_miss: float = 0.0
+    first_hard_mismatch_offset: int | None = None
 
 
 def warp(logits: torch.Tensor, t: float, top_k: int, top_p: float) -> torch.Tensor:
@@ -119,6 +120,7 @@ def seed_consistency_diagnostics(
     top_p: float,
     stochastic_threshold: float,
     boundary_epsilon: float,
+    position_offsets: list[int] | None = None,
 ) -> SeedConsistencyDiagnostics:
     """Classify exact picks and numerical CDF-boundary misses on GPU.
 
@@ -129,6 +131,8 @@ def seed_consistency_diagnostics(
     boundary from generic percentage forgiveness for arbitrary branch edits.
     """
     n = min(len(token_ids), len(u_values), int(logits.shape[0]))
+    if position_offsets is not None:
+        n = min(n, len(position_offsets))
     if n == 0:
         return SeedConsistencyDiagnostics()
     if boundary_epsilon < 0:
@@ -162,6 +166,21 @@ def seed_consistency_diagnostics(
     boundary_match = exact | (miss <= float(boundary_epsilon))
     hard_mismatch = ~boundary_match
     deterministic_hard = hard_mismatch & ~stochastic
+    offsets = torch.tensor(
+        (
+            [int(value) for value in position_offsets[:n]]
+            if position_offsets is not None
+            else list(range(n))
+        ),
+        device=cdf.device,
+        dtype=torch.long,
+    )
+    first_hard = torch.where(
+        hard_mismatch,
+        offsets,
+        torch.full_like(offsets, -1),
+    )
+    first_hard = first_hard[first_hard >= 0]
 
     counts = torch.stack(
         (
@@ -186,4 +205,7 @@ def seed_consistency_diagnostics(
         n_miss_gt_0_05=int(counts[6]),
         n_miss_gt_0_10=int(counts[7]),
         max_cdf_miss=float(miss.max().item()),
+        first_hard_mismatch_offset=(
+            int(first_hard.min().item()) if first_hard.numel() else None
+        ),
     )

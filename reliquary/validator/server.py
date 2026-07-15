@@ -63,11 +63,14 @@ from reliquary.protocol.submission import (
     CommitModel,
     GrpoBatchState,
     RejectReason,
+    RuntimeContract,
+    RuntimeFingerprint,
     Verdict,
     VerdictsResponse,
 )
 from reliquary.protocol.tokens import verify_tokens
 from reliquary.shared.modeling import resolve_eos_token_ids
+from reliquary.shared.runtime_fingerprint import collect_runtime_fingerprint
 from reliquary.validator.batcher import GrpoWindowBatcher
 from reliquary.validator.dedup import compute_rollout_hash
 from reliquary.validator.observability import (
@@ -329,6 +332,7 @@ class _Health(BaseModel):
     status: str
     active_window: int | None
     image_revision: str | None = None
+    runtime_fingerprint: dict[str, Any] = Field(default_factory=dict)
     app_started_at: float
     current_validator_state: str
     current_window_n: int | None = None
@@ -428,6 +432,7 @@ class ValidatorServer:
         self.port = port
         self._app_started_at = time.time()
         self._image_revision = runtime_revision()
+        self._runtime_fingerprint = collect_runtime_fingerprint()
         # Multi-env: keyed by env_name. ``active_batcher`` (singular) is
         # maintained as a legacy accessor pointing to the first active batcher
         # so existing code paths (/health, /state, the submit worker stale
@@ -516,6 +521,10 @@ class ValidatorServer:
         self._active_batchers = batchers
         # Legacy scalar: first batcher in dict (or None if empty).
         self.active_batcher = next(iter(batchers.values())) if batchers else None
+        if self.active_batcher is not None:
+            self._runtime_fingerprint = collect_runtime_fingerprint(
+                proof_model=getattr(self.active_batcher, "model", None),
+            )
 
     def set_active_batcher(self, batcher: GrpoWindowBatcher | None) -> None:
         """Legacy single-env shim. Wraps into a dict and delegates."""
@@ -971,6 +980,7 @@ class ValidatorServer:
             status=health_status,
             active_window=batcher.window_start if batcher else None,
             image_revision=self._image_revision,
+            runtime_fingerprint=dict(self._runtime_fingerprint),
             app_started_at=self._app_started_at,
             current_validator_state=getattr(self._current_state, "value", str(self._current_state)),
             current_window_n=batcher.window_start if batcher else None,
@@ -2008,6 +2018,19 @@ class ValidatorServer:
                 checkpoint_repo_id=cp.repo_id if cp else None,
                 checkpoint_revision=cp.revision if cp else None,
                 randomness=batcher.randomness,
+            )
+
+        @app.get("/runtime-contract", response_model=RuntimeContract)
+        async def runtime_contract() -> RuntimeContract:
+            """Optional numerical-runtime telemetry capability.
+
+            Kept separate from strict `/state` so adding this feature remains
+            wire-compatible with older miners.
+            """
+            return RuntimeContract(
+                validator_profile=RuntimeFingerprint.model_validate(
+                    self._runtime_fingerprint
+                )
             )
 
         @app.get("/checkpoint")

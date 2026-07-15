@@ -1,0 +1,21 @@
+ARG BASE_IMAGE=ghcr.io/reliquadotai/reliquary-validator@sha256:ad1b1118008db63c1d6e7c1aad91670ab6dd8ead658815c14e898237d0a1dcde
+FROM ${BASE_IMAGE}
+
+ARG RUNTIME_PROFILE
+ARG CAUSAL_CONV_URL=https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.2.post1/causal_conv1d-1.6.2.post1%2Bcu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+ARG CAUSAL_CONV_SHA256=42582abc72646fcc7bd3371bcb7cde7b5cb9c7e78181e9f978318fc5d8982bc5
+ARG CAUSAL_CONV_WHEEL=causal_conv1d-1.6.2.post1+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+
+RUN case "${RUNTIME_PROFILE}" in \
+      no-fla) \
+        pip uninstall -y flash-linear-attention fla-core causal-conv1d ;; \
+      fla-causal) \
+        curl -fsSL "${CAUSAL_CONV_URL}" -o "/tmp/${CAUSAL_CONV_WHEEL}" \
+        && echo "${CAUSAL_CONV_SHA256}  /tmp/${CAUSAL_CONV_WHEEL}" | sha256sum -c - \
+        && pip install "/tmp/${CAUSAL_CONV_WHEEL}" \
+        && rm "/tmp/${CAUSAL_CONV_WHEEL}" ;; \
+      *) \
+        echo "unsupported RUNTIME_PROFILE=${RUNTIME_PROFILE}" >&2; exit 2 ;; \
+    esac
+
+LABEL ai.reliquary.runtime-matrix-profile="${RUNTIME_PROFILE}"

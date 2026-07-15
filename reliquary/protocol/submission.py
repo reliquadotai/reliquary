@@ -20,6 +20,7 @@ from pydantic import (
 )
 
 from reliquary.constants import CHALLENGE_K, M_ROLLOUTS, MAX_NEW_TOKENS_PROTOCOL_CAP
+from reliquary.shared.runtime_fingerprint import runtime_profile_hash
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +115,7 @@ class RolloutSubmission(BaseModel):
     # its content and position.  Keeping the trusted value private prevents a
     # miner-declared span from influencing GRPO loss masking.
     _validated_force_span: tuple[int, int] | None = PrivateAttr(default=None)
+    _validated_termination_path: str | None = PrivateAttr(default=None)
 
     tokens: list[int] = Field(..., min_length=1)
     reward: FiniteFloat  # miner's local reward; validator re-checks it
@@ -126,6 +128,63 @@ class RolloutSubmission(BaseModel):
         if commit_tokens is not None and list(self.tokens) != list(commit_tokens):
             raise ValueError("tokens must match commit.tokens")
         return self
+
+
+class RuntimeFingerprint(BaseModel):
+    """Self-reported, nonce-bound inference runtime profile.
+
+    This is calibration telemetry, not remote attestation. All strings are
+    bounded because the profile crosses the public submission endpoint.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[2] = 2
+    python_version: str = Field(..., max_length=64)
+    platform: str = Field(..., max_length=64)
+    torch_version: str | None = Field(default=None, max_length=128)
+    transformers_version: str | None = Field(default=None, max_length=128)
+    fla_version: str | None = Field(default=None, max_length=128)
+    fla_core_version: str | None = Field(default=None, max_length=128)
+    causal_conv1d_version: str | None = Field(default=None, max_length=128)
+    flash_attn_version: str | None = Field(default=None, max_length=128)
+    cuda_version: str | None = Field(default=None, max_length=64)
+    cuda_available: bool = False
+    gpu_name: str | None = Field(default=None, max_length=160)
+    compute_capability: str | None = Field(default=None, max_length=32)
+    generation_dtype: str | None = Field(default=None, max_length=64)
+    proof_dtype: str | None = Field(default=None, max_length=64)
+    generation_attention_implementation: str | None = Field(
+        default=None, max_length=128,
+    )
+    proof_attention_implementation: str | None = Field(
+        default=None, max_length=128,
+    )
+    deterministic_algorithms: bool = False
+    cudnn_benchmark: bool = False
+    tf32_matmul: bool = False
+    qwen35_fast_path_all: bool | None = None
+    qwen35_fla_chunk: bool | None = None
+    qwen35_fla_recurrent: bool | None = None
+    qwen35_causal_conv_prefill: bool | None = None
+    qwen35_causal_conv_update: bool | None = None
+    profile_hash: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def _profile_hash_matches(self):
+        payload = self.model_dump(exclude={"profile_hash"})
+        if self.profile_hash != runtime_profile_hash(payload):
+            raise ValueError("runtime profile_hash does not match profile")
+        return self
+
+
+class RuntimeContract(BaseModel):
+    """Capability response served separately from strict legacy `/state`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    telemetry_version: Literal[2] = 2
+    validator_profile: RuntimeFingerprint
 
 
 class BatchSubmissionRequest(BaseModel):
@@ -172,6 +231,7 @@ class BatchSubmissionRequest(BaseModel):
     # validator's ``enforce_envelope_signature`` flag decides whether an
     # empty sig is rejected as BAD_ENVELOPE_SIGNATURE or silently accepted.
     envelope_signature: str = Field(default="", pattern=r"^[0-9a-fA-F]*$")
+    runtime_fingerprint: RuntimeFingerprint | None = None
     # Validator-only marker. It is absent from JSON and the public schema, so
     # adding it does not change the miner wire contract.
     _legacy_merkle_verified: bool = PrivateAttr(default=False)
@@ -187,6 +247,15 @@ class BatchSubmissionRequest(BaseModel):
                 f"rollouts must have exactly {M_ROLLOUTS} entries, got {len(v)}"
             )
         return v
+
+    @model_validator(mode="after")
+    def _runtime_fingerprint_is_bound_to_nonce(self):
+        if self.runtime_fingerprint is None:
+            return self
+        expected_suffix = f".{self.runtime_fingerprint.profile_hash}"
+        if not self.nonce.endswith(expected_suffix):
+            raise ValueError("runtime_fingerprint must be bound to nonce")
+        return self
 
 
 class BatchSubmissionResponse(BaseModel):
