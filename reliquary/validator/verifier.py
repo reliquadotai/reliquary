@@ -96,6 +96,7 @@ class ProofResult:
     seed_n_miss_gt_0_05: int = 0
     seed_n_miss_gt_0_10: int = 0
     seed_max_cdf_miss: float = 0.0
+    seed_first_hard_mismatch_offset: int | None = None
     # Termination escape: True when the final token IS the protocol's forced
     # inverse-CDF pick at the position that produced it. The miner cannot choose
     # where the public u selects EOS, so a match proves a legal draw regardless
@@ -480,6 +481,7 @@ def verify_commitment_proofs(
     seed_n_miss_gt_0_05 = 0
     seed_n_miss_gt_0_10 = 0
     seed_max_cdf_miss = 0.0
+    seed_first_hard_mismatch_offset = None
     terminal_pick_ok = None
     terminal_pick_cdf_miss = None
     natural_close_pick_ok = None
@@ -496,7 +498,13 @@ def verify_commitment_proofs(
         force_span = rollout_meta.get("force_span")
         if (rollout_meta.get("forced")
                 and isinstance(force_span, (list, tuple)) and len(force_span) == 2):
-            fs0, fs1 = int(force_span[0]), int(force_span[1])
+            try:
+                fs0, fs1 = int(force_span[0]), int(force_span[1])
+            except (TypeError, ValueError, OverflowError):
+                # The canonical force-span gate rejects this later. Keep all
+                # positions in the seed check here and, critically, do not let
+                # malformed untrusted metadata abort the verifier worker.
+                fs0, fs1 = 0, 0
         else:
             fs0, fs1 = 0, 0
         # completion offset j = t - prompt_length indexes seed_u_values.
@@ -512,6 +520,7 @@ def verify_commitment_proofs(
             seed_u = [seed_u_values[t - prompt_length] for t in seed_t]
             seed_diagnostics = _gpu_seed_consistency_diagnostics(
                 logits_gpu[pos_tensor], seed_tokens, seed_u,
+                position_offsets=[t - prompt_length for t in seed_t],
             )
             seed_n_stochastic = seed_diagnostics.n_stochastic
             seed_n_match = seed_diagnostics.n_exact_match
@@ -525,6 +534,9 @@ def verify_commitment_proofs(
             seed_n_miss_gt_0_05 = seed_diagnostics.n_miss_gt_0_05
             seed_n_miss_gt_0_10 = seed_diagnostics.n_miss_gt_0_10
             seed_max_cdf_miss = seed_diagnostics.max_cdf_miss
+            seed_first_hard_mismatch_offset = (
+                seed_diagnostics.first_hard_mismatch_offset
+            )
         terminal_pick_ok, terminal_pick_cdf_miss = (
             _gpu_terminal_forced_pick_diagnostics(
                 logits_gpu, tokens, prompt_length, seq_len,
@@ -587,6 +599,7 @@ def verify_commitment_proofs(
         seed_n_miss_gt_0_05=seed_n_miss_gt_0_05,
         seed_n_miss_gt_0_10=seed_n_miss_gt_0_10,
         seed_max_cdf_miss=seed_max_cdf_miss,
+        seed_first_hard_mismatch_offset=seed_first_hard_mismatch_offset,
         terminal_pick_ok=terminal_pick_ok,
         terminal_pick_cdf_miss=terminal_pick_cdf_miss,
         natural_close_pick_ok=natural_close_pick_ok,
@@ -860,6 +873,8 @@ def _gpu_seed_consistency_diagnostics(
     logits_slice: torch.Tensor,
     token_ids: list[int],
     u_values: list[float],
+    *,
+    position_offsets: list[int] | None = None,
 ):
     from reliquary.constants import (
         FORCED_SEED_CDF_BOUNDARY_EPSILON,
@@ -880,6 +895,7 @@ def _gpu_seed_consistency_diagnostics(
         top_p=TOP_P_PROTO,
         stochastic_threshold=FORCED_SEED_STOCHASTIC_MAXPROB,
         boundary_epsilon=FORCED_SEED_CDF_BOUNDARY_EPSILON,
+        position_offsets=position_offsets,
     )
 
 
@@ -941,34 +957,6 @@ def is_in_zone(sigma: float, *, bootstrap: bool = False) -> bool:
     if sigma < 1e-8:
         return False   # degenerate
     return sigma >= (BOOTSTRAP_SIGMA_MIN if bootstrap else SIGMA_MIN)
-
-
-def submission_value(rewards: list[float], *, delta: float | None = None) -> float:
-    """Difficulty-auction score for a rollout group: how much the model learns.
-
-    ``sigma * (1 - p) ** delta``, with p the group's mean reward.
-
-    * ``sigma`` — is there anything to learn? Zero for a unanimous group, whose
-      advantages all cancel. This is exactly what ``is_in_zone`` gates on.
-    * ``(1 - p) ** delta`` — must the model *explore*? The failure rate. This is
-      what makes the score asymmetric, so a group the model mostly fails
-      outranks the mirror group it mostly passes (see ``DIFFICULTY_DELTA``).
-
-    For binary rewards this is exactly ``sqrt(p(1-p)) * (1-p)**delta`` — the
-    population std of a Bernoulli *is* ``sqrt(p(1-p))`` — while generalising
-    correctly to the continuous rewards an env may return.
-    """
-    from reliquary.constants import DIFFICULTY_DELTA
-
-    if len(rewards) < 2:
-        return 0.0            # degenerate: no group, no signal
-    if delta is None:
-        delta = DIFFICULTY_DELTA
-
-    p = sum(rewards) / len(rewards)
-    if p <= 0.0 or p >= 1.0:
-        return 0.0            # unanimous: every advantage cancels
-    return rewards_std(rewards) * (1.0 - p) ** delta
 
 
 def verify_logprobs_claim(
@@ -1118,7 +1106,10 @@ def validate_force_span(
     span = rollout_meta.get("force_span")
     if not isinstance(span, (list, tuple)) or len(span) != 2:
         return False, set()
-    start, end = int(span[0]), int(span[1])
+    try:
+        start, end = int(span[0]), int(span[1])
+    except (TypeError, ValueError, OverflowError):
+        return False, set()
     if not (prompt_length <= start < end <= len(tokens)):
         return False, set()
     if start - prompt_length != int(thinking_budget):

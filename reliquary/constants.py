@@ -149,23 +149,29 @@ REJECTED_LIST_CAP_PER_HOTKEY = 5
 # Default HTTP port the validator listens on for miner submissions.
 VALIDATOR_HTTP_PORT = 8888
 
-# Hard ceiling on grading attempts (reward computation) per window — the
-# anti-DoS bound on admission and on the submit queue. Grading is what
-# admission actually costs now that the GPU proof is deferred to seal, and a
-# grading attempt is charged only when grading starts, so it is never refunded
-# and discarded queue items never burn one. It is also the outer bound on GPU
-# proof work at seal: _prove_ranked can prove at most this many candidates.
+# Hard ceiling on total grading attempts (reward computation) admitted per
+# window — the anti-DoS / queue bound and the outer cap on GPU proof work.
+# Counts every grading attempt that actually starts and is never refunded.
+# Pending work reserves capacity separately, so a degenerate-reward flood cannot
+# grow the bounded submit queue or saturate the grader pool while discarded
+# queue items do not burn work that never ran.
+# There is no separate per-window GRAIL candidate budget: the drand-anchored
+# 8-distinct seal, this ceiling and the seal drain timeout bound the work. The
+# old MAX_PROOF_CANDIDATES_PER_WINDOW (32) was a pre-seal-drand relic that only
+# starved honest late arrivals when earlier candidates failed a post-reservation
+# gate (e.g. forced-seed) without refund.
 MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW = 96
 
 # Absolute server-side bound across active and draining environment queues.
-# The per-window grading ceiling remains the primary bound; this is the final
+# Per-batcher reservation caps remain the primary bound; this is the final
 # backstop during a window swap or prolonged GPU stall.
 MAX_PENDING_PROOF_QUEUE_DEPTH = 256
 
-# A hotkey whose ranked candidates repeatedly fail the expensive proof should
-# not consume the whole window's proof budget. Allow a small number of misses
-# for honest stack drift, then skip that hotkey's remaining candidates until
-# the next window. Enforced in ``_prove_ranked`` at seal.
+# A hotkey that repeatedly reaches the expensive proof path and then fails
+# behavioural/integrity checks should not be allowed to consume the whole
+# window's scarce proof budget. Allow a small number of misses for honest
+# stack drift, then reject further proof admissions from that hotkey until the
+# next window.
 MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW = 2
 
 # Registered-hotkey admission cache. The validator refreshes the metagraph on
@@ -175,6 +181,12 @@ REGISTERED_HOTKEY_CACHE_TTL_SECONDS = 300.0
 REGISTERED_HOTKEY_STALE_GRACE_SECONDS = 900.0
 REGISTERED_HOTKEY_REFRESH_MIN_INTERVAL_SECONDS = 15.0
 REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS = 20.0
+
+# After the B-th distinct prompt records a seal-trigger drand round, admit only
+# a small tail of same-round stragglers. The hard window cap above remains the
+# outer bound; this cap protects the boundary fair-split extension from turning
+# one drand burst into an unbounded proof backlog.
+MAX_POST_TRIGGER_PROOF_CANDIDATES = 8
 
 # Safety timeout for the seal extension's drain phase. Once the trigger drand
 # round expires, the validator waits for the queue AND in-flight GRAIL proofs to
@@ -199,17 +211,6 @@ PROOF_ADMISSION_STALL_POLL_SECONDS = 0.5
 SPARSE_VALID_IDLE_SEAL_SECONDS = 300.0
 SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS = 4
 SPARSE_VALID_MAX_WINDOW_SECONDS = 900.0
-
-# Fixed collection window for the difficulty auction. The window no longer seals
-# on the 8th distinct prompt; it stays open for this long and accepts everything.
-#
-# This is also the MINIMUM window duration, by construction. An early seal would
-# be the speed race we are removing: whoever triggered it would cut off the
-# slow-but-hard submissions still generating. Sized from live traffic — math
-# generation is 176s at the median and 267s at p75, and windows already run 277s
-# of collection today, so 300s captures ~89% of submissions at near-zero cadence
-# cost ONCE proofs are deferred (spec §2.5).
-WINDOW_COLLECTION_SECONDS = 300.0
 
 # UID that receives unused slot emission budget (the burn address).
 UID_BURN = 0
@@ -282,50 +283,6 @@ DATASET_SPLIT = "train"
 # tight to carry meaningful GRPO signal.
 SIGMA_MIN = 0.43
 BOOTSTRAP_SIGMA_MIN = 0.33
-
-# Difficulty-auction tilt. The auction scores a group with
-# ``rewards_std(r) * (1 - p) ** DIFFICULTY_DELTA`` where p is the group's mean
-# reward. The first factor is sigma (what the zone filter already measures); the
-# second is the failure rate, and it is the ONLY thing that separates a group the
-# model mostly fails from its mirror image that it mostly passes.
-#
-# Sigma alone cannot: sqrt(p(1-p)) is symmetric, so k=2 and k=6 look identical to
-# it. They are not. GRPO's advantage is (r - mu)/sigma, so at k=6 the dominant
-# per-sample signal is -1.73 on the two mistakes (suppress noise on a prompt the
-# model already solves) while at k=2 it is +1.73 on the two rare successes
-# (amplify a discovery). Same sigma, opposite pedagogical value.
-#
-# delta = 1.0 puts the peak at k=2 of 8. Raising it tilts harder; delta = 0
-# collapses the score back to plain sigma. The peak is deliberately NOT at k=1:
-# a lone success in 8 may be a lucky guess on wrong reasoning, and reinforcing it
-# teaches the wrong thing.
-DIFFICULTY_DELTA = 1.0
-
-# Cap on slots one OPERATOR (coldkey) may win per window under the difficulty
-# auction. The 8-distinct seal cap is per PROMPT, not per miner — which is how a
-# single coldkey took 13.1% of emission by flooding distinct prompts across many
-# hotkeys. It also bounds the centralisation pressure the auction's speed
-# tie-break creates: with a coarse 7-valued score, ties are the norm, so the
-# fastest hardware would otherwise win every one of them.
-MAX_SLOTS_PER_COLDKEY_PER_WINDOW = 2
-
-# There is deliberately NO fixed per-window proof-count ceiling. `_prove_ranked`
-# proves ranked candidates top-down until B_BATCH pass. A fixed cap (we tried 16)
-# is worse than none: a fabricated group ranks at the TOP by construction (the
-# score comes from a hand-writable reward vector, peaking at k=2) and fails GRAIL,
-# so a fixed cap is exhausted by fakes BEFORE honest candidates ranked below them
-# are reached — starving the batch. The griefer is bounded instead by the
-# per-hotkey failure cap (each hotkey is skipped after
-# MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW failures = one registration
-# per 2 wasted proofs), and the pool itself by MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW.
-
-# Random non-winners proven each window purely for forensics. Deferring the proof
-# means the authenticity gates (token-auth, distribution, forced-seed) only ever
-# see the WINNERS — enforcement stays complete (nobody unproven is paid) but fleet
-# VISIBILITY is lost, and those gates are how we caught the pre-generating miner
-# and 1088 seed_mismatch rejects in 855 windows. Sampled by drand so a miner
-# cannot predict whether he will be looked at.
-FORENSIC_SAMPLE_PER_WINDOW = 2
 
 # Number of rollouts per submission (= size of each GRPO group).
 M_ROLLOUTS = 8
@@ -508,6 +465,30 @@ ENFORCE_ENVELOPE_SIGNATURE = _os.environ.get(
 LEGACY_MERKLE_ROOT_ENFORCE = _os.environ.get(
     "RELIQUARY_LEGACY_MERKLE_ROOT_ENFORCE", "false"
 ).strip().lower() in ("1", "true", "yes", "on")
+
+# Max GRAIL-validated submissions retained per prompt per window. Once this
+# cap is reached for a prompt, further submissions for that prompt are
+# rejected as PROMPT_FULL before the heavy verify. Bounds the validator's
+# GPU cost when many miners attack the same prompt — combined with the
+# per-hotkey cap above, worst-case GRAIL load per window is
+# MAX_SUBMISSIONS_PER_PROMPT × min(|env|, MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW × n_hotkeys).
+MAX_SUBMISSIONS_PER_PROMPT = 10
+
+# Difficulty-auction research is observation-only. The active protocol keeps
+# its current admission, proof, seal, selection, and emission rules while the
+# validator archives a deterministic counterfactual over the same fully
+# validated candidate pool. Arming is deliberately a separate future change.
+DIFFICULTY_AUCTION_SHADOW_ENABLED = _os.environ.get(
+    "RELIQUARY_DIFFICULTY_AUCTION_SHADOW_ENABLED", "1"
+).strip().lower() not in ("0", "false", "no", "off", "")
+DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS = ("openmathinstruct",)
+DIFFICULTY_AUCTION_DELTA = 1.0
+# The live proof budget currently caps each environment at 96 grading attempts.
+# Keep an independent ceiling so a future admission change cannot turn passive
+# telemetry into unbounded seal-time CPU or archive growth.
+DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES = int(
+    _os.environ.get("RELIQUARY_DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES", "96")
+)
 
 # How many drand-quicknet rounds backward of the validator's current round
 # the batcher accepts on the ``drand_round`` field. Default = 0: strict

@@ -54,3 +54,25 @@ The `/health` endpoint exposes non-secret operator state such as image
 revision, app start time, checkpoint revision, current window, drand round,
 seal trigger, queue depth, valid count, and recent reject counts. It must not
 include access keys, tokens, wallet material, or private keys.
+
+## Inference runtime and BFT telemetry
+
+`GET /runtime-contract` advertises optional runtime telemetry without changing
+the strict legacy `/state` response. Upgraded miners attach a self-reported
+runtime fingerprint only when this endpoint exists. The profile hash is bound
+to the signed envelope nonce, but it is observability data rather than remote
+attestation.
+
+Private `forced-seed-shadow.jsonl` schema v4 adds validator-derived termination
+paths, first CDF mismatch offsets, token repetition metrics, and the miner
+runtime profile. Summarize it with:
+
+```bash
+python scripts/report_forced_seed_cdf.py \
+  /root/reliquary/state/auth_forensics/forced-seed-shadow.jsonl --json
+```
+
+Training telemetry under the `bft/` prefix reports forced-rollout share,
+masked injected-token share, trainable-token share, and absolute-advantage
+weighted exposure by validated termination path. These are review signals and
+do not alter acceptance, reward, or gradient computation.

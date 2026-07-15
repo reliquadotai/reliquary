@@ -317,9 +317,7 @@ def test_logical_group_duplicate_is_rejected_quota_neutral_before_proof():
     assert batcher.proof_grading_attempts == 1
     assert batcher.logical_group_reservation_count == 1
     assert batcher.logical_group_duplicate_rejects == 1
-    # Only the first was admitted. Proofs run at seal, so the pending pool is
-    # what holds it mid-window.
-    assert len(batcher.pending_submissions()) == 1
+    assert len(batcher.valid_submissions()) == 1
     health = client.get("/health").json()
     assert health["logical_group_reservations"] == 1
     assert health["logical_group_duplicate_rejects"] == 1
@@ -538,26 +536,6 @@ def test_state_endpoint_returns_grpo_batch_state():
     assert 42 in state.cooldown_prompts
 
 
-def test_state_endpoint_reports_admitted_submissions():
-    """Miners poll /state and act on ``valid_submissions``. Proofs are deferred
-    to seal, so ``valid_count`` is 0 all window — the endpoint must report the
-    admitted (pending) pool instead, on the SAME wire field."""
-    from reliquary.protocol.submission import WindowState
-    batcher = _batcher(window_start=500)
-    server = ValidatorServer()
-    server.set_active_batcher(batcher)
-    server.set_current_state(WindowState.OPEN)
-    client = TestClient(server.app)
-
-    resp = client.post("/submit", json=_request().model_dump(mode="json"))
-    assert resp.status_code == 200
-
-    state = GrpoBatchState(**client.get("/state").json())
-    assert batcher.valid_count == 0        # nothing proven yet
-    assert batcher.pending_count == 1
-    assert state.valid_submissions == 1    # but /state must not lie
-
-
 def test_state_endpoint_503_when_no_active_batcher():
     server = ValidatorServer()
     client = TestClient(server.app)
@@ -651,6 +629,9 @@ def test_health_exposes_each_environment_window_independently():
         "seconds_since_last_valid_submission": None,
         "proof_admission_count": 4,
         "proof_grading_attempts": 4,
+        "pending_proof_reservations": 0,
+        "inflight_proof_reservations": 0,
+        "post_trigger_proof_admission_count": 0,
     }
     code_health = health["window_environments"]["opencodeinstruct"]
     assert code_health["valid_submissions_count"] == 8
@@ -836,7 +817,7 @@ def test_submit_returns_submitted_under_worker_path():
     assert body["reason"] == "submitted"
 
 
-def test_full_server_queue_rejects_without_charging_grading():
+def test_full_server_queue_returns_pending_proof_reservation():
     import asyncio
     from reliquary.protocol.submission import WindowState
 
@@ -853,6 +834,7 @@ def test_full_server_queue_rejects_without_charging_grading():
     )
 
     assert response.json()["reason"] == RejectReason.BATCH_FILLED.value
+    assert batcher.pending_proof_reservations == 0
     assert batcher.proof_grading_attempts == 0
 
 
@@ -884,6 +866,7 @@ async def test_worker_drops_late_items_for_stale_batcher():
     # one for the new batcher.
     server.set_active_batcher(new_batcher)
     old_request = _request(prompt_idx=11)
+    assert old_batcher.try_reserve_proof_admission(old_request) == (True, None)
     await server._submit_queue.put((old_request, old_batcher))
     await server._submit_queue.put((_request(prompt_idx=22), new_batcher))
 
@@ -904,4 +887,5 @@ async def test_worker_drops_late_items_for_stale_batcher():
     assert accept_calls == [22], (
         f"expected only prompt 22 to be processed, got {accept_calls}"
     )
+    assert old_batcher.pending_proof_reservations == 0
     assert old_batcher.proof_grading_attempts == 0

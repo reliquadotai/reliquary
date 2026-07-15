@@ -53,9 +53,96 @@ def test_report_holds_on_ratio_clean_hard_mismatch():
     assert report["by_environment_schema_v3"][0]["environment"] == (
         "openmathinstruct"
     )
+    assert report["by_forced_status_schema_v3"][0]["forced"] is False
 
 
 def test_report_holds_immediately_when_small_sample_has_hard_mismatch():
     report = MODULE.summarize([_row(0, cdf_reject=True)])
 
     assert report["decision"] == "HOLD_AND_REVIEW_CDF_HARD_MISMATCHES"
+
+
+def test_report_correlates_cdf_onset_with_repetition_by_termination_path():
+    row = _row(0)
+    row["schema_version"] = 4
+    row["runtime_profile"] = {
+        "profile_hash": "ab" * 32,
+        "torch_version": "2.7.0+cu128",
+        "transformers_version": "5.9.0",
+        "fla_version": "0.5.0",
+        "causal_conv1d_version": None,
+        "qwen35_fast_path_all": False,
+    }
+    row["per_rollout"] = [
+        {
+            "termination_path": "forced_phase2_eos",
+            "n_positions": 100,
+            "n_hard_mismatch": 1,
+            "first_hard_mismatch_offset": 10,
+            "first_repeated_ngram_offset": 20,
+            "repeated_ngram_fraction": 0.2,
+            "tail_repeated_ngram_fraction": 0.4,
+            "max_same_token_run": 9,
+            "sketch_diff_max": 2100,
+            "sketch_distinct_ratio": 1.0,
+            "sketch_zero_ratio": 0.0,
+            "sketch_constant": False,
+        },
+        {
+            "termination_path": "phase1_eos",
+            "n_positions": 80,
+            "n_hard_mismatch": 0,
+            "first_hard_mismatch_offset": None,
+            "first_repeated_ngram_offset": None,
+            "repeated_ngram_fraction": 0.0,
+            "tail_repeated_ngram_fraction": 0.0,
+            "max_same_token_run": 1,
+            "sketch_diff_max": 1200,
+            "sketch_distinct_ratio": 0.01,
+            "sketch_zero_ratio": 1.0,
+            "sketch_constant": True,
+        },
+    ]
+
+    report = MODULE.summarize([row])
+
+    assert report["records_schema_v4"] == 1
+    assert report["rollouts_schema_v4"] == 2
+    assert report["directionality_schema_v4"] == {
+        "both_offsets_observed": 1,
+        "cdf_mismatch_at_or_before_repetition": 1,
+        "repetition_before_cdf_mismatch": 0,
+    }
+    assert {
+        item["termination_path"]
+        for item in report["by_termination_path_schema_v4"]
+    } == {"forced_phase2_eos", "phase1_eos"}
+    runtime = report["by_runtime_profile_schema_v4"][0]
+    assert runtime["profile_hash"] == "ab" * 32
+    assert runtime["n_hard_mismatch"] == 0
+    assert runtime["fla_version"] == "0.5.0"
+    assert report["sketch_security_schema_v4"] == {
+        "rollouts_observed": 2,
+        "constant_commitment_rollouts": 1,
+        "zero_dominated_rollouts": 1,
+        "sketch_diff_max_p50": 1650.0,
+        "sketch_diff_max_p95": 2055.0,
+        "sketch_diff_max_p99": 2091.0,
+        "sketch_diff_max_max": 2100.0,
+        "sketch_distinct_ratio_p01": 0.0199,
+    }
+
+
+def test_select_rows_can_isolate_latest_checkpoint_and_recent_windows():
+    rows = [
+        {"schema_version": 3, "checkpoint_hash": "old", "window_start": 1},
+        {"schema_version": 3, "checkpoint_hash": "new", "window_start": 2},
+        {"schema_version": 3, "checkpoint_hash": "new", "window_start": 3},
+        {"schema_version": 3, "checkpoint_hash": "new", "window_start": 3},
+    ]
+
+    selected = MODULE.select_rows(
+        rows, latest_checkpoint=True, last_windows=1, last_records=1,
+    )
+
+    assert selected == [rows[-1]]

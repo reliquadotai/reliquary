@@ -27,6 +27,7 @@ def test_bft_constants_present_and_within_cap():
 def test_v2_group_sizes():
     assert C.M_ROLLOUTS == 8
     assert C.B_BATCH == 8
+    assert C.MAX_POST_TRIGGER_PROOF_CANDIDATES == 8
     assert C.MAX_SEAL_QUEUE_DRAIN_SECONDS == 60.0
     assert C.SPARSE_VALID_IDLE_SEAL_SECONDS == 300.0
     assert C.SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS == 4

@@ -91,6 +91,7 @@ async def test_archive_includes_prompt_and_rollout_content():
     batcher.window_start = 42
     batcher.randomness = "0xdeadbeef"
     batcher.window_opened_at = 100.0
+    batcher.window_opened_wall_ts = 1_000.0
     batcher.rewarded_but_not_selected_by_hotkey = {"hk_runner": 1}
     batcher.logical_group_reservation_count = 9
     batcher.logical_group_duplicate_rejects = 4
@@ -116,9 +117,12 @@ async def test_archive_includes_prompt_and_rollout_content():
     ]
     batch[0].arrived_at = 102.5  # 2.5 s after window open
     batch[1].arrived_at = 107.0  # 7.0 s after window open
+    batch[0].arrival_ts = 1_002.0
+    batch[1].arrival_ts = 1_006.5
 
     runner = _valid_submission(prompt_idx=99, k=4, hotkey="hk_runner")
     runner.arrived_at = 110.0
+    runner.arrival_ts = 999.0  # Invalid pre-open timestamp is not clamped.
     runner.rollout_hashes = [bytes([i]) * 32 for i in range(8)]
     batcher.valid_submissions.return_value = list(batch) + [runner]
     batcher.selection_metadata_by_id = {
@@ -129,6 +133,29 @@ async def test_archive_includes_prompt_and_rollout_content():
             "rewarded": True,
             "selection_reason": "same_trigger_round_lost_canonical_ordering",
         },
+    }
+    batcher.difficulty_auction_metadata_by_id = {
+        id(batch[0]): {
+            "value": 0.25,
+            "mean_reward": 0.5,
+            "reward_std": 0.5,
+            "reward_count": 8,
+            "eligible": True,
+            "rank": 2,
+            "shadow_selected": True,
+        },
+        id(runner): {
+            "value": 0.25,
+            "mean_reward": 0.5,
+            "rank": 3,
+            "shadow_selected": False,
+        },
+    }
+    batcher.difficulty_auction_shadow = {
+        "schema_version": 1,
+        "status": "computed",
+        "mode": "observation_only",
+        "production_changed": False,
     }
 
     captured = {}
@@ -169,7 +196,10 @@ async def test_archive_includes_prompt_and_rollout_content():
 
     # response_time: seconds between window-open and submission-accepted.
     assert entry0["response_time"] == pytest.approx(2.5)
+    assert entry0["arrival_age_seconds"] == pytest.approx(2.0)
     assert archive["batch"][1]["response_time"] == pytest.approx(7.0)
+    assert archive["batch"][1]["arrival_age_seconds"] == pytest.approx(6.5)
+    assert archive["window_opened_wall_ts_by_environment"] == {"fake": 1_000.0}
 
     # filter telemetry passed through verbatim.
     assert entry0["sketch_diff_max"] == 412
@@ -188,6 +218,13 @@ async def test_archive_includes_prompt_and_rollout_content():
     assert entry0["merkle_root"] == "ab" * 32
     assert entry0["selection_digest"] == "ab" * 32
     assert entry0["claimed_checkpoint_hash"] == "sha256:fake"
+    assert entry0["difficulty_auction_value"] == pytest.approx(0.25)
+    assert entry0["difficulty_auction_mean_reward"] == pytest.approx(0.5)
+    assert entry0["difficulty_auction_reward_std"] == pytest.approx(0.5)
+    assert entry0["difficulty_auction_reward_count"] == 8
+    assert entry0["difficulty_auction_eligible"] is True
+    assert entry0["difficulty_auction_rank"] == 2
+    assert entry0["difficulty_auction_selected"] is True
 
     # eos detection: rollout 0 of entry 0 ends with eos_token_id=99 → True.
     assert entry0["rollouts"][0]["eos_terminated"] is True
@@ -209,7 +246,16 @@ async def test_archive_includes_prompt_and_rollout_content():
     assert ru["selection_digest"] == "ab" * 32
     assert "rollouts" not in ru and "prompt" not in ru  # metadata only
     assert ru["rollout_hashes"] == [h.hex() for h in runner.rollout_hashes]
+    assert ru["difficulty_auction_rank"] == 3
+    assert ru["difficulty_auction_selected"] is False
+    assert ru["arrival_age_seconds"] is None
     assert archive["rewarded_but_not_selected_by_hotkey"] == {"hk_runner": 1}
+    assert archive["difficulty_auction_shadow"]["fake"] == {
+        "schema_version": 1,
+        "status": "computed",
+        "mode": "observation_only",
+        "production_changed": False,
+    }
 
     # reject_summary persisted from batcher.
     assert archive["reject_summary"] == {

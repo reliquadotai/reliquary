@@ -25,6 +25,14 @@ def test_termination_shadow_records_boundary_candidate(tmp_path):
         cap_truncated=False,
         would_exceed_truncation_budget=True,
         boundary_epsilon=0.002,
+        seed_n_hard_mismatch=1,
+        seed_first_hard_mismatch_offset=12,
+        token_metrics={
+            "repeated_ngram_fraction": 0.25,
+            "tail_repeated_ngram_fraction": 0.5,
+            "max_same_token_run": 9,
+            "first_repeated_ngram_offset": 20,
+        },
         path=path,
     )
 
@@ -34,3 +42,6 @@ def test_termination_shadow_records_boundary_candidate(tmp_path):
     assert row["terminal_boundary_compatible"] is True
     assert row["natural_close_boundary_compatible"] is False
     assert row["would_exceed_truncation_budget"] is True
+    assert row["schema_version"] == 2
+    assert row["seed_first_hard_mismatch_offset"] == 12
+    assert row["repeated_ngram_fraction"] == 0.25

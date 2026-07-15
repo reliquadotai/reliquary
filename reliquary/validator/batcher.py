@@ -7,10 +7,10 @@ validator's shared ``CooldownMap``.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
 import math
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -20,18 +20,22 @@ from reliquary.constants import (
     BATCH_PROMPT_COOLDOWN_WINDOWS,
     B_BATCH,
     BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION,
-    MAX_SLOTS_PER_COLDKEY_PER_WINDOW,
+    DIFFICULTY_AUCTION_DELTA,
+    DIFFICULTY_AUCTION_SHADOW_ENABLED,
+    DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS,
+    DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES,
     M_ROLLOUTS,
     MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
     MIN_EOS_PROBABILITY,
-    FORENSIC_SAMPLE_PER_WINDOW,
+    MAX_POST_TRIGGER_PROOF_CANDIDATES,
     MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
+    MAX_SEAL_QUEUE_DRAIN_SECONDS,
+    MAX_SUBMISSIONS_PER_PROMPT,
     MAX_TRUNCATED_PER_SUBMISSION,
     PROMPT_RANGE_SIZE,
     PROMPT_RANGE_ENFORCE_FROM_WINDOW,
     REJECTED_LIST_CAP_PER_HOTKEY,
-    WINDOW_COLLECTION_SECONDS,
     CODE_SEMANTIC_AUTH_ENFORCE,
     TOKEN_AUTH_ENFORCE,
     ALL_TOKEN_AUTH_ENFORCE,
@@ -57,15 +61,15 @@ from reliquary.validator.batch_selection import (
     explain_batch_selection,
     select_batch_and_distribute,
 )
-from reliquary.validator.batch_auction import (
-    _rank_key,
-    select_batch_auction,
-)
 from reliquary.validator.cooldown import CooldownMap
 from reliquary.validator.dedup import (
     RolloutHashSet,
     compute_logical_group_hash,
     compute_rollout_hash,
+)
+from reliquary.validator.difficulty_auction import (
+    ShadowSubmission,
+    select_shadow_auction,
 )
 from reliquary.validator.observability import (
     DrandRoundObservation,
@@ -87,6 +91,11 @@ from reliquary.validator.auth_forensics import (
 )
 from reliquary.validator.reward_shape import detect_reward_shape_manipulation
 from reliquary.validator.rollout_patterns import detect_opposite_reward_clones
+from reliquary.validator.rollout_telemetry import (
+    classify_bft_termination,
+    sketch_commitment_metrics,
+    token_degeneracy_metrics,
+)
 from reliquary.validator.selection_digest import compute_rollouts_selection_digest
 from reliquary.validator.verifier import (
     evaluate_all_token_auth_shadow,
@@ -99,7 +108,6 @@ from reliquary.validator.verifier import (
     is_natural_bft_cap_candidate,
     is_in_zone,
     rewards_std,
-    submission_value,
     validate_force_span,
     verify_logprobs_claim,
     verify_termination,
@@ -250,45 +258,12 @@ _PROOF_FAILURE_DEBT_STAGES = frozenset(
 )
 
 
-# v2.4: batch selection is drand-anchored at seal time (see
-# ``batch_selection.py``). One submission per ``prompt_idx`` is admitted per
-# window — the first submitter claims the prompt at admission (see
-# RejectReason.PROMPT_CLAIMED) — so sybiling the same prompt buys nothing.
-
-
-@dataclass
-class PendingSubmission:
-    """A submission that passed every CHEAP check and has been graded, but has
-    NOT been proven on the GPU yet.
-
-    The proof (5-25 s of GPU, under ``_lock``) is the most expensive thing the
-    validator does, and today we spend it on every admitted submission — ~19 per
-    window, to keep 8. Since the score depends only on the rewards, we can rank
-    first and prove only the candidates that can actually win. A submission that
-    cannot reach the top B is never proven.
-
-    Fabricated groups DO rank at the top (a miner who never runs the model can
-    hand-write a k=2 reward vector). That is safe: the proof still runs before
-    anyone is paid, so fabricating earns zero. See the spec §7.
-    """
-
-    hotkey: str
-    prompt_idx: int
-    request: Any
-    rewards: list[float]
-    drand_round: int
-    merkle_root: bytes
-    selection_digest: bytes
-    arrived_at: float = 0.0
-    # Wall clock of the CHEAP admission decision. The pre-generation forensic
-    # metric is arrival_ts - (decision_ts - response_time), so it must be the
-    # instant the validator decided, not the instant it later proved.
-    decision_ts: float | None = None
-    telemetry: Any = None
-    value: float = field(init=False, default=0.0)
-
-    def __post_init__(self):
-        self.value = submission_value(self.rewards)
+# v2.3: batch selection is drand-anchored at seal time (see
+# ``batch_selection.py``). Multiple miners may submit on the same
+# ``prompt_idx`` within a window, capped at ``MAX_SUBMISSIONS_PER_PROMPT``
+# per prompt. Emission is split uniformly across all GRAIL-validated
+# submissions whose prompt lands in the winning set, so sybiling the same
+# prompt is strictly neutral.
 
 
 @dataclass
@@ -335,9 +310,6 @@ class ValidSubmission:
     reward_vector: str = ""
     truncated_count: int = 0
     reward_shape: dict[str, Any] = field(default_factory=dict)
-    # Difficulty-auction score. Unlike ``sigma`` this is asymmetric, so a group
-    # the model mostly FAILS outranks the mirror group it mostly passes.
-    value: float = field(init=False, default=0.0)
 
     def __post_init__(self):
         self.merkle_root = self.merkle_root_bytes
@@ -345,9 +317,6 @@ class ValidSubmission:
             self.selection_digest_bytes
             if self.selection_digest_bytes is not None
             else self.merkle_root_bytes
-        )
-        self.value = submission_value(
-            [float(r.reward) for r in self.rollouts]
         )
 
 
@@ -381,21 +350,6 @@ class RejectedSubmission:
     reject_stage: str | None = None
 
 
-@dataclass
-class ForensicSampleResult:
-    """A non-winner proven purely for telemetry (see ``FORENSIC_SAMPLE_PER_WINDOW``).
-
-    The proof runs for its side effects — the authenticity/forensic gates in
-    ``_verify_expensive`` fire and any reject lands in ``rejected_submissions``
-    as usual — but ``passed`` submissions are still discarded: never added to
-    ``_valid``, never paid.
-    """
-
-    hotkey: str
-    prompt_idx: int
-    passed: bool
-
-
 class GrpoWindowBatcher:
     """Accepts v2 submissions, runs the full verification pipeline, and
     exposes ``valid_submissions()`` + ``select_batch()`` at window close.
@@ -421,9 +375,7 @@ class GrpoWindowBatcher:
         drand_chain_info: dict | None = None,
         drand_round_backward_tolerance: int | None = None,
         queue_drained_predicate: Callable[[], bool] | None = None,
-        coldkey_of: Callable[[str], str] | None = None,
     ) -> None:
-        import time
         from reliquary.constants import DRAND_ROUND_BACKWARD_TOLERANCE
 
         self.window_start = window_start
@@ -431,14 +383,6 @@ class GrpoWindowBatcher:
         self.model = model
         self.tokenizer = tokenizer
         self.bootstrap = bootstrap
-        # hotkey -> coldkey, for the auction's per-operator slot cap. None means
-        # "no metagraph mapping available"; the auction then treats each hotkey
-        # as its own operator, which is the safe fallback (the cap still bounds
-        # a single hotkey, it just cannot see through a sybil).
-        self.coldkey_of = coldkey_of
-        # The batch the difficulty auction WOULD have picked, recomputed each
-        # seal. Observation only until M5 clears — see _compute_shadow_auction.
-        self.shadow_auction: dict[str, Any] = {}
         # Set True by the validator's background drand-verify task
         # if the cross-check against bittensor_drand fails post-OPEN.
         # ``_train_and_publish`` checks this before sealing and drops
@@ -500,14 +444,6 @@ class GrpoWindowBatcher:
         # under ``_lock`` after each successful accept; the read in /state
         # is lock-free (int reads are GIL-atomic in CPython).
         self.valid_count: int = 0
-        # Same lock-free contract, for admitted-but-unproven submissions. This
-        # is what fills during the window now: ``valid_count`` only moves at
-        # seal, once the ranked candidates have been proven.
-        self.pending_count: int = 0
-        # GPU proofs spent by ``_prove_ranked`` this window; telemetry reads it
-        # after seal. Bounded by the pending pool (the grading ceiling) and the
-        # per-hotkey failure cap, not a fixed count.
-        self.proof_attempts: int = 0
 
         if verify_commitment_proofs_fn is None:
             from reliquary.validator.verifier import verify_commitment_proofs
@@ -529,24 +465,11 @@ class GrpoWindowBatcher:
         ] = {}
         self._logical_group_duplicate_rejects = 0
         self._valid: list[ValidSubmission] = []
-        # Admitted, graded and scored, but NOT yet proven. The auction ranks
-        # these at seal; only the candidates that can actually win pay for a
-        # GPU proof (see ``_verify_expensive``).
-        self._pending: list[PendingSubmission] = []
-        # ids of pending submissions ``_prove_ranked`` already attempted this
-        # window (winner or failure). ``_prove_forensic_sample`` reads this to
-        # sample only from what was never looked at.
-        self._attempted_pending_ids: set[int] = set()
-        # Non-winners proven purely for telemetry — see FORENSIC_SAMPLE_PER_WINDOW.
-        # Never touches ``_valid``; a passing entry here is still unpaid.
-        self.forensic_sample: list[ForensicSampleResult] = []
-        # v2.4: per-prompt bucket, at most one entry per ``prompt_idx`` (see
-        # RejectReason.PROMPT_CLAIMED). Tracked alongside the flat ``_valid``
-        # list because seal_batch needs the grouping but accept-time logic
-        # only needs the count.
-        self._submissions_per_prompt: dict[
-            int, list[ValidSubmission | PendingSubmission]
-        ] = {}
+        # v2.3: per-prompt bucket. Multiple miners may submit on the same
+        # ``prompt_idx`` up to ``MAX_SUBMISSIONS_PER_PROMPT``. Tracked
+        # alongside the flat ``_valid`` list because seal_batch needs the
+        # grouping but accept-time logic only needs the count.
+        self._submissions_per_prompt: dict[int, list[ValidSubmission]] = {}
         self.randomness: str = ""
         # Per-window eligible prompt slice [lo, hi). None = no restriction
         # (randomness not yet known, or window is before the enforcement
@@ -565,6 +488,15 @@ class GrpoWindowBatcher:
         # rejecting the most submissions in any given round.
         self.reject_counts: dict[str, int] = {}
         self.selection_metadata_by_id: dict[int, dict[str, Any]] = {}
+        # Observation-only counterfactual. It is computed from the same fully
+        # validated pool production saw and must never affect admission,
+        # proofs, sealing, selection, cooldown, training, or emission.
+        self.difficulty_auction_shadow: dict[str, Any] = {
+            "schema_version": 1,
+            "status": "not_computed",
+            "mode": "observation_only",
+        }
+        self.difficulty_auction_metadata_by_id: dict[int, dict[str, Any]] = {}
 
         # Per-hotkey-capped metadata for rejected submissions. Persisted in
         # the R2 archive next to ``reject_counts`` so a rejected miner can
@@ -572,32 +504,62 @@ class GrpoWindowBatcher:
         # an aggregate count. Cap protects against single-attacker flooding.
         self.rejected_submissions: list[RejectedSubmission] = []
 
-        # The window seals on the fixed collection deadline
-        # (``WINDOW_COLLECTION_SECONDS`` after it opened), not on a count.
-        # ``poll_deadline`` sets ``_seal_flag`` once the deadline expires;
-        # ``force_seal`` sets it early only as a safety valve (e.g. an
-        # invalidated beacon). Stored as ``threading.Event`` for sync-safe
-        # ``set()`` from the worker thread; the asyncio.Event is lazy-bound
-        # to the running loop on first access.
+        # v2.1+: seal_event fires once the window is finalized. v2.3+:
+        # firing is delayed past the B-th distinct prompt to absorb the
+        # rest of that submission's drand round — see the "trigger round"
+        # comment in ``_accept_locked``. Stored as ``threading.Event`` for
+        # sync-safe ``set()`` from the worker thread; the asyncio.Event is
+        # lazy-bound to the running loop on first access.
         self._seal_flag: threading.Event = threading.Event()
         self._seal_event: asyncio.Event | None = None
-        # ``_loop`` is captured the first time ``seal_event`` is accessed from
-        # an async context (or pre-bound via ``bind_event_loop``). Retained so
-        # a set from a worker thread propagates to the asyncio waiter.
+        # v2.3 seal extension. When the B-th distinct prompt arrives in
+        # drand round R, we record R here and DELAY firing ``_seal_flag``
+        # until the next drand boundary so further submissions in R can
+        # still be accepted (and fairly share the boundary-round emission
+        # via ``select_batch_and_distribute``'s boundary branch). Until
+        # the boundary passes:
+        #   * submissions with ``drand_round == R`` are accepted normally
+        #   * submissions with ``drand_round > R`` are rejected with
+        #     ``BATCH_FILLED`` AND fire the seal immediately (no point
+        #     waiting if a later round has already shown up)
+        # ``_loop`` is captured the first time ``seal_event`` is accessed
+        # from an async context so we can schedule the delayed seal from
+        # the worker thread via ``run_coroutine_threadsafe``. ``None`` in
+        # synchronous test contexts — there the seal fires immediately on
+        # the B-th distinct, matching the pre-v2.3 timing.
+        self._seal_trigger_round: int | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
-        # Vestigial: kept so the service factory can still pass it, but the
-        # deadline seal no longer polls a queue-drain predicate.
+        # Optional callback the seal-extension coroutine polls to check
+        # whether the server's submit_queue has finished draining items
+        # queued during the trigger drand round. ``None`` in test
+        # contexts that bypass the HTTP/worker pipeline — in that case
+        # the delayed seal coroutine fires as soon as the drand round
+        # expires (drain phase skipped). Production wires this to
+        # ``_queue_and_proofs_drained`` so already admitted trigger-round
+        # submissions finish GRAIL (queue empty AND no proof in flight)
+        # before the batch is sealed.
         self._queue_drained_predicate = queue_drained_predicate
         self.force_seal_reason: str | None = None
-        # Proof counters live under their own lock, not ``_lock``: the HTTP
-        # cheap path reads the grading ceiling while the submit worker holds
-        # ``_lock`` for a whole grading pass.
-        self._proof_counters_lock = threading.Lock()
+        # Proof-admission accounting is separate from ``_lock`` because the
+        # submit worker holds ``_lock`` during GRAIL. The HTTP cheap path must
+        # be able to reject over-budget submissions without waiting behind the
+        # very GPU work it is trying to bound. Counts are reservations for
+        # expensive verification attempts, not successful accepts.
+        self._proof_admission_lock = threading.Lock()
         self._proof_admission_count = 0
-        # Grading attempts that actually started this window, never refunded.
-        # Grading (env reward, sandboxed for code) is the real admission cost
-        # now that the GPU proof is deferred to seal.
+        # Total grading attempts that actually started this window. Pending
+        # queue reservations are tracked separately so a request discarded on
+        # seal/window swap does not permanently consume work that never ran.
+        # Started attempts are never refunded.
         self._proof_grading_attempts = 0
+        self._pending_proof_reservations: dict[
+            int, tuple[BatchSubmissionRequest, str, bool]
+        ] = {}
+        self._inflight_proof_reservations: dict[
+            int, tuple[BatchSubmissionRequest, str, bool]
+        ] = {}
+        self._pending_post_trigger_proof_reservations = 0
+        self._post_trigger_proof_admission_count = 0
         self._expensive_proof_failures_by_hotkey: dict[str, int] = {}
         # v2.1: checkpoint hash miners must match. Empty string disables
         # the gate (test convenience / pre-first-publish).
@@ -627,8 +589,9 @@ class GrpoWindowBatcher:
     def seal_event(self) -> asyncio.Event:
         """Lazy asyncio.Event bound to whichever loop accesses it first.
 
-        Also captures the loop reference so a seal set from a worker thread
-        propagates to an asyncio waiter.
+        Also captures the loop reference for the v2.3 seal-extension
+        mechanism, which needs to schedule a delayed seal-firing coroutine
+        from the worker thread.
         """
         if self._seal_event is None:
             self._seal_event = asyncio.Event()
@@ -641,50 +604,39 @@ class GrpoWindowBatcher:
         return self._seal_event
 
     def bind_event_loop(self, loop: asyncio.AbstractEventLoop) -> None:
-        """Bind the validator's main event loop.
+        """Bind the validator's main event loop for the delayed seal.
 
         ``accept_submission`` runs in a worker thread (``asyncio.to_thread``)
-        with no running loop, so it cannot capture the loop itself — this
-        pre-binds the reference an asyncio waiter needs.
+        with no running loop, so it cannot capture the loop itself — it reads
+        this pre-bound reference to schedule ``_delayed_seal_at_drand_boundary``
+        via ``run_coroutine_threadsafe``. Without this, ``_loop`` stays ``None``
+        and the B-th distinct prompt seals synchronously, dropping same-round
+        in-flight submissions and collapsing the drand-boundary fair split.
         """
         self._loop = loop
 
     def is_sealed(self) -> bool:
-        """True once the collection deadline has expired (or a safety-valve
-        ``force_seal`` fired). Thread-safe and loop-independent (reads the
-        underlying ``threading.Event``, never touches the lazy
-        ``asyncio.Event``).
+        """True once B distinct non-cooldown valid submissions have been
+        accepted. Thread-safe and loop-independent (reads the underlying
+        ``threading.Event``, never touches the lazy ``asyncio.Event``).
 
-        The window stays open the full ``WINDOW_COLLECTION_SECONDS`` and
-        accepts everything; only after this returns True does further work
-        for the window short-circuit. Callers (the HTTP /submit handler and
-        the submit worker) use it to drop post-deadline submissions.
+        After this returns True, ``select_batch`` will pick the first
+        ``B_BATCH`` by ``arrived_at`` — any further submission would have
+        a later ``arrived_at`` and therefore cannot displace one of the
+        already-selected entries. Verifying it costs ~5–25 s of GRAIL
+        forward pass and produces zero protocol benefit. Callers (the
+        HTTP /submit handler and the submit worker) use this to short-
+        circuit further work for the current window.
         """
         return self._seal_flag.is_set()
 
-    def poll_deadline(self) -> bool:
-        """Seal iff the fixed collection deadline has expired. Idempotent.
-
-        The deadline is the window's minimum duration by construction: an
-        early seal would be the speed race being removed, cutting off
-        slow-but-hard submissions still generating.
-        """
-        if self._seal_flag.is_set():
-            return True
-        if self._time_fn() - self.window_opened_at >= WINDOW_COLLECTION_SECONDS:
-            self._seal_flag.set()
-            if self._seal_event is not None:
-                self._seal_event.set()
-            return True
-        return False
-
     def force_seal(self, reason: str) -> None:
-        """Seal this window early — a safety valve, not the normal path.
+        """Force this window to seal without B distinct valid submissions.
 
-        The window normally seals on the collection deadline (see
-        ``poll_deadline``). This exists for out-of-band drops such as an
-        invalidated beacon; the downstream training path already skips
-        partial batches.
+        Used only as a liveness breaker after the bounded proof-admission
+        queue has fully drained and no further expensive submissions can be
+        admitted. The downstream training path already skips partial batches;
+        this just avoids waiting for the long window timeout.
         """
         if self._seal_flag.is_set():
             return
@@ -694,12 +646,12 @@ class GrpoWindowBatcher:
             self._seal_event.set()
 
     def prompt_submission_count(self, prompt_idx: int) -> int:
-        """Number of admitted (graded, not yet proven) submissions already in
-        the per-prompt bucket for ``prompt_idx``. Used by the HTTP /submit
-        handler to short-circuit ``PROMPT_CLAIMED`` rejects without queueing.
+        """Number of GRAIL-validated submissions already in the per-prompt
+        bucket for ``prompt_idx``. Used by the HTTP /submit handler to
+        short-circuit ``PROMPT_FULL`` rejects without queueing.
 
         Read of a dict-of-list len is GIL-atomic and lock-free in CPython,
-        same property ``pending_count`` relies on. Best-effort: a racing
+        same property ``valid_count`` relies on. Best-effort: a racing
         accept inside the worker between this read and the queue.put is
         harmless — the worker re-checks the cap inside ``_accept_locked``.
         """
@@ -717,18 +669,6 @@ class GrpoWindowBatcher:
             if not self._cooldown.is_in_cooldown(s.prompt_idx, self.window_start)
         })
 
-    def distinct_pending_prompt_count(self) -> int:
-        """Distinct non-cooldown prompts among graded (unproven) submissions.
-
-        This — not ``distinct_valid_prompt_count`` — is the window's fill level
-        now that proofs run at seal: ``_valid`` stays empty until then, so a
-        seal trigger reading it would never fire.
-        """
-        return len({
-            p.prompt_idx for p in list(self._pending)
-            if not self._cooldown.is_in_cooldown(p.prompt_idx, self.window_start)
-        })
-
     def seconds_since_last_valid_submission(self) -> float | None:
         """Seconds since the last accepted valid submission, or None."""
         if self.last_valid_submission_at is None:
@@ -737,13 +677,36 @@ class GrpoWindowBatcher:
 
     @property
     def proof_admission_count(self) -> int:
-        """Zone-valid submissions admitted to the pending pool (telemetry)."""
+        """Live GRAIL candidate budget usage (refunded on OUT_OF_ZONE)."""
         return self._proof_admission_count
 
     @property
     def proof_grading_attempts(self) -> int:
         """Total grading attempts started this window (never refunded)."""
         return self._proof_grading_attempts
+
+    @property
+    def pending_proof_reservations(self) -> int:
+        return len(self._pending_proof_reservations)
+
+    @property
+    def inflight_proof_reservations(self) -> int:
+        return len(self._inflight_proof_reservations)
+
+    @property
+    def proof_grading_capacity_used(self) -> int:
+        """Started attempts plus pending reservations used for admission."""
+        return self._proof_grading_attempts + len(
+            self._pending_proof_reservations
+        )
+
+    @property
+    def post_trigger_proof_admission_count(self) -> int:
+        """Started plus pending proof work from the seal-trigger round."""
+        return (
+            self._post_trigger_proof_admission_count
+            + self._pending_post_trigger_proof_reservations
+        )
 
     @property
     def expensive_proof_failures_by_hotkey(self) -> dict[str, int]:
@@ -803,44 +766,141 @@ class GrpoWindowBatcher:
         """Make a reservation permanent for the rest of this window."""
         request._logical_group_reservation = None
 
-    def grading_budget_exhausted(self) -> bool:
-        """True when this window's grading ceiling is spent.
+    def try_reserve_proof_admission(
+        self,
+        request: BatchSubmissionRequest,
+    ) -> tuple[bool, str | None]:
+        """Reserve a *grading* slot for this window (the anti-DoS bound).
 
-        Cheap read for the HTTP pre-queue reject, so a flood stops entering the
-        submit queue at all. The authoritative charge is
-        ``_charge_grading_attempt`` inside ``_accept_locked``, where grading
-        actually runs; a few racers may slip past this read and are rejected
-        there.
+        Admission is gated by started work plus pending reservations, the
+        post-trigger straggler cap and per-hotkey proof-failure debt. A pending
+        reservation can be cancelled if the queue item never starts; once
+        started, its grading attempt is never refunded.
+        There is no separate GRAIL/GPU candidate budget: the drand-anchored
+        seal, this grading ceiling and the seal drain timeout already bound the
+        GPU work per window, so a zone-valid submission entering the proof is
+        only counted for telemetry, never rejected on a candidate budget.
         """
-        with self._proof_counters_lock:
-            return (
-                self._proof_grading_attempts
-                >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
-            )
+        with self._proof_admission_lock:
+            reservation_id = id(request)
+            if (
+                reservation_id in self._pending_proof_reservations
+                or reservation_id in self._inflight_proof_reservations
+            ):
+                return False, "proof_reservation_duplicate"
 
-    def _charge_grading_attempt(self) -> bool:
-        """Charge one grading attempt; False when the ceiling is already spent.
+            if (
+                self._expensive_proof_failures_by_hotkey.get(
+                    request.miner_hotkey, 0
+                )
+                >= MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
+            ):
+                return False, "proof_failure_debt_hotkey"
 
-        Never refunded: it is charged where grading starts, so work that never
-        ran (queue drop, seal, window swap) never consumes it.
-        """
-        with self._proof_counters_lock:
             if (
                 self._proof_grading_attempts
+                + len(self._pending_proof_reservations)
                 >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
             ):
-                return False
+                return False, "proof_grading_attempts_full"
+
+            trigger_round = self._seal_trigger_round
+            is_post_trigger = (
+                trigger_round is not None
+                and request.drand_round == trigger_round
+            )
+            if is_post_trigger:
+                if (
+                    self._post_trigger_proof_admission_count
+                    + self._pending_post_trigger_proof_reservations
+                    >= MAX_POST_TRIGGER_PROOF_CANDIDATES
+                ):
+                    return False, "proof_admission_post_trigger_full"
+                self._pending_post_trigger_proof_reservations += 1
+
+            self._pending_proof_reservations[reservation_id] = (
+                request,
+                request.miner_hotkey,
+                is_post_trigger,
+            )
+            return True, None
+
+    def start_proof_admission(
+        self,
+        request: BatchSubmissionRequest,
+    ) -> tuple[bool, str | None]:
+        """Move one pending reservation into irreversible started work."""
+        with self._proof_admission_lock:
+            reservation_id = id(request)
+            reservation = self._pending_proof_reservations.pop(
+                reservation_id, None,
+            )
+            if reservation is None:
+                # Compatibility for direct/legacy worker injection. Production
+                # requests always reserve in the HTTP path first.
+                if (
+                    self._proof_grading_attempts
+                    >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+                ):
+                    return False, "proof_grading_attempts_full"
+                reservation = (request, request.miner_hotkey, False)
+
+            _, hotkey, is_post_trigger = reservation
+            if is_post_trigger:
+                self._pending_post_trigger_proof_reservations = max(
+                    0,
+                    self._pending_post_trigger_proof_reservations - 1,
+                )
+
+            # A burst may have queued several requests before the first two
+            # failures established debt. Re-check at dequeue so the remainder
+            # cannot bypass the per-hotkey circuit breaker.
+            if (
+                self._expensive_proof_failures_by_hotkey.get(hotkey, 0)
+                >= MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
+            ):
+                return False, "proof_failure_debt_hotkey"
+
             self._proof_grading_attempts += 1
+            if is_post_trigger:
+                self._post_trigger_proof_admission_count += 1
+            self._inflight_proof_reservations[reservation_id] = reservation
+            return True, None
+
+    def cancel_proof_admission(self, request: BatchSubmissionRequest) -> bool:
+        """Return a pending reservation whose proof work never started."""
+        with self._proof_admission_lock:
+            reservation = self._pending_proof_reservations.pop(
+                id(request), None,
+            )
+            if reservation is None:
+                return False
+            if reservation[2]:
+                self._pending_post_trigger_proof_reservations = max(
+                    0,
+                    self._pending_post_trigger_proof_reservations - 1,
+                )
             return True
 
-    def _note_grail_candidate(self) -> None:
-        """Count a zone-valid submission admitted to the pending pool.
+    def finish_proof_admission(self, request: BatchSubmissionRequest) -> None:
+        """Release the in-flight marker; started-attempt debt remains."""
+        with self._proof_admission_lock:
+            self._inflight_proof_reservations.pop(id(request), None)
 
-        Telemetry only. GPU work is bounded at seal instead: ``_prove_ranked``
-        proves top-down until ``B_BATCH`` pass, skipping a hotkey after its
-        failure cap, and admission itself is bounded by the grading ceiling.
+    def _note_grail_candidate(self) -> None:
+        """Count a zone-valid submission entering the GRAIL/GPU proof path.
+
+        Telemetry only — the window is already bounded by the drand-anchored
+        seal (the B-th distinct prompt records the trigger round and later
+        rounds are dropped), the never-refunded grading-attempts ceiling, the
+        per-hotkey submission cap, the post-trigger straggler cap and the seal
+        drain timeout. The old per-window GRAIL candidate budget was a
+        pre-seal-drand relic: back when the 8-distinct seal did not fire it was
+        the only bound on GRAIL work within a window. It only starved honest
+        late arrivals whenever earlier candidates failed a post-reservation
+        gate (e.g. forced-seed) without refund, so it no longer rejects.
         """
-        with self._proof_counters_lock:
+        with self._proof_admission_lock:
             self._proof_admission_count += 1
 
     # ----------------------------- ingestion -----------------------------
@@ -851,10 +911,7 @@ class GrpoWindowBatcher:
         *,
         telemetry: SubmitTelemetry | None = None,
     ) -> BatchSubmissionResponse:
-        """Cheaply admit a submission: validate, grade and score it, then append
-        a ``PendingSubmission`` to ``_pending``. The GPU proof and every
-        proof-dependent gate are deferred to ``_verify_expensive`` at seal time,
-        so this path never touches ``_valid`` and never runs GRAIL.
+        """Run the full verification pipeline; append to ``_valid`` on success.
 
         Does NOT re-check ``drand_round`` — that's a wall-clock timing gate,
         which is decided once at HTTP arrival by ``server.py``'s cheap-reject
@@ -981,6 +1038,20 @@ class GrpoWindowBatcher:
                 **kwargs,
             )
 
+        # v2.3 seal extension: once the trigger drand round is recorded
+        # (B-th distinct prompt landed in round R), submissions from a
+        # LATER drand round arrive too late — drop with BATCH_FILLED.
+        # CRITICAL: we do NOT fire the seal here, even though we now
+        # know a later round has shown up. The queue may still contain
+        # other trigger-round submissions waiting on GRAIL; firing the
+        # seal now would make the worker's ``is_sealed`` check drop
+        # them. The seal fires only when the delayed coroutine confirms
+        # the queue has drained.
+        if (
+            self._seal_trigger_round is not None
+            and request.drand_round > self._seal_trigger_round
+        ):
+            return reject(RejectReason.BATCH_FILLED, "seal_extension")
         if request.window_start != self.window_start:
             return reject(RejectReason.WINDOW_MISMATCH, "window")
         # v2.1: checkpoint hash gate. Empty string = gate disabled
@@ -1005,16 +1076,14 @@ class GrpoWindowBatcher:
                 return reject(RejectReason.PROMPT_OUT_OF_RANGE, "prompt_range")
         if self._cooldown.is_in_cooldown(request.prompt_idx, self.window_start):
             return reject(RejectReason.PROMPT_IN_COOLDOWN, "cooldown")
-        # One submission per prompt, decided at admission: the first submitter
-        # owns the prompt for this window. This saves the grading of submissions
-        # that could never win and retires the K-way same-prompt emission split.
-        # (It is NOT what bounds variance-farming — forced-seed pins one legal
-        # group per hotkey, and N draws still cost N registrations plus N× model
-        # compute inside the 300s window; that registration/compute cost is the
-        # real deterrent, not this rule.)
+        # v2.3: cap submissions per prompt before the heavy verify. Once a
+        # prompt has ``MAX_SUBMISSIONS_PER_PROMPT`` GRAIL-validated entries,
+        # further attempts are rejected PROMPT_FULL without running GRAIL.
+        # This bounds the validator's GPU cost in the worst case where many
+        # miners attack the same prompt.
         existing = self._submissions_per_prompt.get(request.prompt_idx, [])
-        if existing:
-            return reject(RejectReason.PROMPT_CLAIMED, "prompt_claimed")
+        if len(existing) >= MAX_SUBMISSIONS_PER_PROMPT:
+            return reject(RejectReason.PROMPT_FULL, "prompt_capacity")
 
         for rollout in request.rollouts:
             try:
@@ -1091,13 +1160,6 @@ class GrpoWindowBatcher:
         if not logical_reserved:
             return reject(RejectReason.HASH_DUPLICATE, "logical_dedup")
         self.confirm_logical_group_reservation(request)
-
-        # Everything above is cheap structural validation. Grading below runs
-        # the env reward (a sandboxed unit-test run for code) and is the real
-        # admission cost now that the GPU proof is deferred to seal, so the
-        # window's ceiling is charged exactly here — anti-DoS bound.
-        if not self._charge_grading_attempt():
-            return reject(RejectReason.BATCH_FILLED, "grading_budget")
 
         problem = self.env.get_problem(request.prompt_idx)
         validator_scored_reward = _uses_validator_authoritative_reward(self.env)
@@ -1184,136 +1246,7 @@ class GrpoWindowBatcher:
                 request.miner_hotkey,
                 clone_metrics.to_log_dict(),
             )
-            # Distinct stage from the proof-derived ``distribution``: this check
-            # is CPU-only and runs before any GPU work, so it must not charge
-            # the per-hotkey proof-failure debt (see _PROOF_FAILURE_DEBT_STAGES).
-            return reject(
-                RejectReason.DISTRIBUTION_SUSPICIOUS, "distribution_clones",
-            )
-
-        # Cheap per-rollout checks. Everything below that needs the GPU proof
-        # now runs at seal, in ``_verify_expensive``, on ranked candidates only.
-        for rollout in request.rollouts:
-            # `truncated` is a validator-set flag (overlong reward shaping, see
-            # submission.py). Wipe any miner-supplied value at ingestion so only
-            # the validator's own cap/EOS detection below can set it — otherwise
-            # a miner could flag a losing rollout to clamp its negative advantage
-            # to -SHAPE_PENALTY via _shape_advantages and attenuate the gradient.
-            _ingest_meta = rollout.commit.get("rollout")
-            if isinstance(_ingest_meta, dict):
-                _ingest_meta["truncated"] = False
-                # BFT is math-only (mirror the miner's env gate): `forced` is a
-                # validator-honoured flag solely for openmathinstruct. Wipe any
-                # non-math value at ingestion so the BFT carve-out stays scoped
-                # to math.
-                if getattr(self.env, "name", "") != "openmathinstruct":
-                    _ingest_meta["forced"] = False
-            if not self._verify_signature(rollout.commit, request.miner_hotkey):
-                return reject(RejectReason.BAD_SIGNATURE, "rollout_signature")
-            # Randomness binding: the miner-claimed beacon randomness MUST equal
-            # the validator's per-window derived randomness. Without this check,
-            # the sketch-tolerance window (~5000 mod q≈2.15e9) is wide enough
-            # that miners using a constant pre-computed r_vec can still slip
-            # under the GRAIL diff threshold — observed sketch_diff_max sitting
-            # at ~3000–5000 on real submissions, just under the per-position
-            # limit. That collapses GRAIL's randomness-binding security to the
-            # tolerance × num_buckets product and removes the per-window
-            # unpredictability the sketch was designed to provide. Reject here,
-            # before paying for the GRAIL forward pass on a commit we already
-            # know is detached from the validator's window seed.
-            claimed_rand = (rollout.commit.get("beacon") or {}).get("randomness", "")
-            if claimed_rand != self.randomness:
-                return reject(RejectReason.WRONG_RANDOMNESS, "randomness")
-
-        pending = PendingSubmission(
-            hotkey=request.miner_hotkey,
-            prompt_idx=request.prompt_idx,
-            request=request,
-            rewards=list(rewards),
-            drand_round=request.drand_round,
-            merkle_root=bytes.fromhex(request.merkle_root),
-            selection_digest=compute_rollouts_selection_digest(request.rollouts),
-            arrived_at=self._time_fn(),
-            decision_ts=self._wall_clock(),
-            telemetry=telemetry,
-        )
-        self._pending.append(pending)
-        self._submissions_per_prompt.setdefault(
-            request.prompt_idx, []
-        ).append(pending)
-        self.last_valid_submission_at = self._time_fn()
-        self.last_valid_submission_wall_ts = self._wall_clock()
-        # Lock-free read in /state — see ``__init__`` for rationale.
-        self.pending_count = len(self._pending)
-
-        # No count-based seal: the window seals only on the collection
-        # deadline (``poll_deadline``), so a fast miner on an easy prompt can
-        # no longer cut off slow-but-hard submissions still generating.
-        return BatchSubmissionResponse(
-            accepted=True, reason=RejectReason.ACCEPTED
-        )
-
-    def _verify_expensive(
-        self, pending: PendingSubmission
-    ) -> ValidSubmission | None:
-        """Prove one graded candidate on the GPU and run every proof-dependent
-        gate. Returns the ``ValidSubmission`` on success, ``None`` on rejection.
-
-        Deliberately NOT called under ``self._lock``: the GRAIL forward is 5-25 s
-        and holding the lock across it is what serialized admission. On rejection
-        it calls ``self._reject`` exactly as the inline pipeline did, so per-hotkey
-        proof-failure debt and the R2 archive entries are unchanged.
-        """
-        request = pending.request
-        telemetry = pending.telemetry
-        hk = request.miner_hotkey
-        pi = request.prompt_idx
-
-        def reject(
-            reason: RejectReason,
-            stage: str,
-            **kwargs: Any,
-        ) -> None:
-            self._reject(
-                reason,
-                hotkey=hk,
-                prompt_idx=pi,
-                telemetry=telemetry,
-                reject_stage=stage,
-                # Proof-stage rejects run at seal, but the archived forensic
-                # timestamp must stay the admission instant.
-                decision_ts=pending.decision_ts,
-                **kwargs,
-            )
-            return None
-
-        # Re-derive the cheap locals the moved gates read. Each is a pure
-        # function of the request, so they are identical to what admission saw.
-        problem = self.env.get_problem(pi)
-        completion_texts = [
-            self._completion_text(rollout) for rollout in request.rollouts
-        ]
-        rewards = list(pending.rewards)
-        sigma = rewards_std(rewards)
-        completion_lengths = []
-        for rollout in request.rollouts:
-            rollout_meta = (rollout.commit or {}).get("rollout", {}) or {}
-            prompt_len = int(rollout_meta.get("prompt_length", 0) or 0)
-            completion_lengths.append(
-                int(
-                    rollout_meta.get(
-                        "completion_length",
-                        max(0, len(rollout.commit.get("tokens", [])) - prompt_len),
-                    )
-                    or 0
-                )
-            )
-        rollout_hashes: list[bytes] = []
-        if self._hash_set is not None:
-            rollout_hashes = [
-                compute_rollout_hash(rollout.commit["tokens"])
-                for rollout in request.rollouts
-            ]
+            return reject(RejectReason.DISTRIBUTION_SUSPICIOUS, "distribution")
 
         # Per-submission worst-case filter telemetry (across all rollouts).
         sketch_diff_max = 0
@@ -1351,9 +1284,25 @@ class GrpoWindowBatcher:
         truncated_flags = [False] * len(request.rollouts)
         # BFT carve-out: resolve the canonical FORCE ids once, only if some
         # rollout is forced; non-forced submissions never touch the tokenizer.
-        from reliquary.constants import BFT_THINKING_BUDGET
+        from reliquary.constants import BFT_ANSWER_BUDGET, BFT_THINKING_BUDGET
+        from reliquary.shared.modeling import (
+            resolve_eos_token_ids,
+            think_close_token_ids,
+        )
         canonical_force_ids: list[int] = []
         force_think_close_ids: set[int] = set()
+        try:
+            telemetry_eos_ids = set(
+                resolve_eos_token_ids(self.model, self.tokenizer)
+            )
+        except Exception:
+            telemetry_eos_ids = set()
+        try:
+            telemetry_think_close_ids = set(
+                think_close_token_ids(self.tokenizer)
+            )
+        except Exception:
+            telemetry_think_close_ids = set()
         if any((r.commit.get("rollout") or {}).get("forced")
                for r in request.rollouts):
             from reliquary.shared.modeling import force_close_token_ids
@@ -1384,15 +1333,60 @@ class GrpoWindowBatcher:
         # Per-rollout (n_stoch, n_match) — the per-rollout gate needs each
         # rollout separately, since the group average hides a partial swap.
         seed_per_rollout: list[tuple[int, int]] = []
-        seed_cdf_per_rollout: list[dict[str, int | float]] = []
+        seed_cdf_per_rollout: list[dict[str, Any]] = []
 
         for rollout_idx, rollout in enumerate(request.rollouts):
+            # Never carry a validator-derived carve across re-validation of the
+            # same Pydantic object.  The private value is set only after the
+            # signed commit's force span passes the canonical BFT checks below.
+            rollout._validated_force_span = None
+            rollout._validated_termination_path = None
+            # `truncated` is a validator-set flag (overlong reward shaping, see
+            # submission.py). Wipe any miner-supplied value at ingestion so only
+            # the validator's own cap/EOS detection below can set it — otherwise
+            # a miner could flag a losing rollout to clamp its negative advantage
+            # to -SHAPE_PENALTY via _shape_advantages and attenuate the gradient.
+            _ingest_meta = rollout.commit.get("rollout")
+            if isinstance(_ingest_meta, dict):
+                _ingest_meta["truncated"] = False
+                # BFT is math-only (mirror the miner's env gate): `forced` is a
+                # validator-honoured flag solely for openmathinstruct. Wipe any
+                # non-math value at ingestion so the BFT carve-out stays scoped
+                # to math.
+                if getattr(self.env, "name", "") != "openmathinstruct":
+                    _ingest_meta["forced"] = False
+            if not self._verify_signature(rollout.commit, request.miner_hotkey):
+                return reject(RejectReason.BAD_SIGNATURE, "rollout_signature")
+            # Randomness binding: the miner-claimed beacon randomness MUST equal
+            # the validator's per-window derived randomness. Without this check,
+            # the sketch-tolerance window (~5000 mod q≈2.15e9) is wide enough
+            # that miners using a constant pre-computed r_vec can still slip
+            # under the GRAIL diff threshold — observed sketch_diff_max sitting
+            # at ~3000–5000 on real submissions, just under the per-position
+            # limit. That collapses GRAIL's randomness-binding security to the
+            # tolerance × num_buckets product and removes the per-window
+            # unpredictability the sketch was designed to provide. Reject here,
+            # before paying for the GRAIL forward pass on a commit we already
+            # know is detached from the validator's window seed.
+            claimed_rand = (rollout.commit.get("beacon") or {}).get("randomness", "")
+            if claimed_rand != self.randomness:
+                return reject(RejectReason.WRONG_RANDOMNESS, "randomness")
             # Per-position forced-seed uniforms for this rollout's teacher-forced
             # consistency check. Read completion_length here (ahead of the
             # ``completion_len`` computed later at the sparse-outputs section)
             # so the u-stream can accompany the verify call below.
-            _seed_completion_len = int(
-                (rollout.commit.get("rollout") or {}).get("completion_length", 0)
+            _seed_meta = rollout.commit.get("rollout") or {}
+            _seed_completion_len = int(_seed_meta.get("completion_length", 0))
+            _seed_prompt_len = int(_seed_meta.get("prompt_length", 0))
+            _seed_tokens = rollout.commit.get("tokens") or []
+            _seed_completion_tokens = _seed_tokens[
+                _seed_prompt_len:_seed_prompt_len + _seed_completion_len
+            ]
+            rollout_token_metrics = token_degeneracy_metrics(
+                _seed_completion_tokens
+            )
+            rollout_sketch_metrics = sketch_commitment_metrics(
+                rollout.commit.get("commitments") or []
             )
             seed_u = [
                 u_at(
@@ -1466,6 +1460,9 @@ class GrpoWindowBatcher:
             seed_max_cdf_miss = float(
                 getattr(proof, "seed_max_cdf_miss", 0.0) or 0.0
             )
+            seed_first_hard_mismatch_offset = getattr(
+                proof, "seed_first_hard_mismatch_offset", None
+            )
             grp_seed_positions += seed_positions
             grp_seed_boundary_match += seed_boundary_match
             grp_seed_hard_mismatch += seed_hard_mismatch
@@ -1477,25 +1474,31 @@ class GrpoWindowBatcher:
                 grp_seed_max_cdf_miss,
                 seed_max_cdf_miss,
             )
-            seed_cdf_per_rollout.append(
-                {
-                    "rollout_idx": rollout_idx,
-                    "n_positions": seed_positions,
-                    "n_stochastic": int(proof.seed_n_stochastic),
-                    "n_exact_match": int(proof.seed_n_match),
-                    "n_boundary_match": seed_boundary_match,
-                    "n_hard_mismatch": seed_hard_mismatch,
-                    "n_deterministic_hard_mismatch": seed_deterministic_hard,
-                    "n_miss_gt_0_01": seed_miss_gt_0_01,
-                    "n_miss_gt_0_05": seed_miss_gt_0_05,
-                    "n_miss_gt_0_10": seed_miss_gt_0_10,
-                    "max_cdf_miss": seed_max_cdf_miss,
-                    "completion_length": _seed_completion_len,
-                    "forced": bool(
-                        (rollout.commit.get("rollout") or {}).get("forced")
-                    ),
-                }
-            )
+            seed_cdf_entry: dict[str, Any] = {
+                "rollout_idx": rollout_idx,
+                "n_positions": seed_positions,
+                "n_stochastic": int(proof.seed_n_stochastic),
+                "n_exact_match": int(proof.seed_n_match),
+                "n_boundary_match": seed_boundary_match,
+                "n_hard_mismatch": seed_hard_mismatch,
+                "n_deterministic_hard_mismatch": seed_deterministic_hard,
+                "n_miss_gt_0_01": seed_miss_gt_0_01,
+                "n_miss_gt_0_05": seed_miss_gt_0_05,
+                "n_miss_gt_0_10": seed_miss_gt_0_10,
+                "max_cdf_miss": seed_max_cdf_miss,
+                "first_hard_mismatch_offset": (
+                    int(seed_first_hard_mismatch_offset)
+                    if seed_first_hard_mismatch_offset is not None
+                    else None
+                ),
+                "completion_length": _seed_completion_len,
+                "claimed_forced": bool(_seed_meta.get("forced")),
+                "forced": False,
+                "validated_force_span_length": 0,
+                **rollout_token_metrics,
+                **rollout_sketch_metrics,
+            }
+            seed_cdf_per_rollout.append(seed_cdf_entry)
             if proof.sketch_diff_max > sketch_diff_max:
                 sketch_diff_max = proof.sketch_diff_max
             if not proof.all_passed:
@@ -1598,6 +1601,11 @@ class GrpoWindowBatcher:
                         boundary_epsilon=(
                             FORCED_SEED_CDF_BOUNDARY_EPSILON
                         ),
+                        seed_n_hard_mismatch=seed_hard_mismatch,
+                        seed_first_hard_mismatch_offset=(
+                            seed_first_hard_mismatch_offset
+                        ),
+                        token_metrics=rollout_token_metrics,
                     )
                 if not termination_ok or cap_truncated:
                     truncated_flags[rollout_idx] = True
@@ -1643,6 +1651,35 @@ class GrpoWindowBatcher:
                     "force_span",
                     sketch_diff_max=sketch_diff_max,
                 )
+            if rollout_dict.get("forced"):
+                declared_span = rollout_dict.get("force_span")
+                rollout._validated_force_span = (
+                    int(declared_span[0]),
+                    int(declared_span[1]),
+                )
+            seed_cdf_entry["forced"] = bool(rollout._validated_force_span)
+            seed_cdf_entry["validated_force_span_length"] = (
+                rollout._validated_force_span[1]
+                - rollout._validated_force_span[0]
+                if rollout._validated_force_span is not None
+                else 0
+            )
+            rollout._validated_termination_path = classify_bft_termination(
+                rollout.commit["tokens"],
+                prompt_length=prompt_len,
+                completion_length=completion_len,
+                eos_ids=telemetry_eos_ids,
+                think_close_ids=telemetry_think_close_ids,
+                validated_force_span=rollout._validated_force_span,
+                thinking_budget=BFT_THINKING_BUDGET,
+                answer_budget=BFT_ANSWER_BUDGET,
+            )
+            seed_cdf_entry["termination_path"] = (
+                rollout._validated_termination_path
+            )
+            seed_cdf_entry["sketch_diff_max"] = int(
+                proof.sketch_diff_max
+            )
 
             lp_ok, lp_dev = verify_logprobs_claim(
                 tokens=rollout.commit["tokens"],
@@ -1936,6 +1973,12 @@ class GrpoWindowBatcher:
             ratio_rollout_would_reject=rollout_would_reject,
             cdf_would_reject=cdf_would_reject,
             cdf_enforced=cdf_enforce,
+            runtime_profile=(
+                request.runtime_fingerprint.model_dump(mode="json")
+                if request.runtime_fingerprint is not None
+                else None
+            ),
+            sketch_diff_max=sketch_diff_max,
         )
         if group_reject or rollout_reject or cdf_reject:
             if cdf_reject:
@@ -1971,16 +2014,19 @@ class GrpoWindowBatcher:
             truncated_flags,
         )
 
-        # All checks passed.
+        # All checks passed — append to both the flat list and the per-prompt
+        # bucket. The bucket is what seal_batch groups over.
         new_sub = ValidSubmission(
             hotkey=request.miner_hotkey,
             prompt_idx=request.prompt_idx,
-            merkle_root_bytes=pending.merkle_root,
-            selection_digest_bytes=pending.selection_digest,
+            merkle_root_bytes=bytes.fromhex(request.merkle_root),
+            selection_digest_bytes=compute_rollouts_selection_digest(
+                request.rollouts
+            ),
             sigma=sigma,
             rollouts=list(request.rollouts),
             completion_texts=completion_texts,
-            arrived_at=pending.arrived_at,
+            arrived_at=self._time_fn(),
             sketch_diff_max=sketch_diff_max,
             lp_dev_max=lp_dev_max,
             dist_q10_min=dist_q10_min,
@@ -2004,24 +2050,143 @@ class GrpoWindowBatcher:
             rollout_hashes=rollout_hashes,
             drand_round=request.drand_round,
             arrival_ts=telemetry.t_arrival if telemetry else None,
-            decision_ts=pending.decision_ts,
+            decision_ts=self._wall_clock(),
             submitted_drand_round=request.drand_round,
             arrival_drand_round=(
                 telemetry.arrival_drand_round if telemetry else None
             ),
             drand_delta=telemetry.drand_delta if telemetry else None,
-            seal_trigger_round=None,
+            seal_trigger_round=self._seal_trigger_round,
             prompt_hash_lead=telemetry.prompt_hash_lead if telemetry else None,
             reward_vector=reward_shape.reward_vector,
             truncated_count=truncated_count,
             reward_shape=reward_shape.to_log_dict(),
         )
+        self._valid.append(new_sub)
+        self._submissions_per_prompt.setdefault(
+            request.prompt_idx, []
+        ).append(new_sub)
+        self.last_valid_submission_at = self._time_fn()
+        self.last_valid_submission_wall_ts = self._wall_clock()
+        # Lock-free read in /state — see ``__init__`` for rationale.
+        self.valid_count = len(self._valid)
 
-        # Proven. NOTE: _verify_expensive is NOT state-free — via ``self._reject``
-        # it mutates ``reject_counts``/``rejected_submissions`` and flips
-        # ``rollout.commit["rollout"]["truncated"]``. It therefore MUST be called
-        # serially (Task 3 runs a top-down loop over candidates, never in parallel).
-        return new_sub
+        # v2.1: fire seal_event when B distinct non-cooldown prompts have been accepted.
+        distinct_eligible = self.distinct_valid_prompt_count()
+        if distinct_eligible >= B_BATCH and self._seal_trigger_round is None:
+            # B-th distinct prompt just landed. Record the trigger drand
+            # round and DELAY the actual seal until the round expires —
+            # any further submissions in this same drand round can still
+            # be accepted and share the boundary slot value via
+            # ``select_batch_and_distribute``'s boundary branch.
+            #
+            # Two firing paths bring ``_seal_flag`` up:
+            #   1. ``_delayed_seal_at_drand_boundary`` — a coroutine
+            #      scheduled below sleeps until the next drand boundary
+            #      and fires the seal even if no further traffic arrives.
+            #   2. The early-fire above: a submission from a LATER drand
+            #      round arrives → seal fires immediately, the late
+            #      submission is rejected.
+            # Whichever fires first wins; the other path becomes a no-op
+            # because ``_seal_flag.is_set()`` short-circuits.
+            self._seal_trigger_round = request.drand_round
+            new_sub.seal_trigger_round = self._seal_trigger_round
+            if telemetry is not None:
+                telemetry.seal_trigger_round = self._seal_trigger_round
+                telemetry.valid_submissions_at_decision = len(self._valid)
+                log_submission_stage(
+                    logger,
+                    logging.INFO,
+                    "seal_triggered",
+                    telemetry,
+                    distinct_eligible=distinct_eligible,
+                    batch_size=B_BATCH,
+                    seal_trigger_round=self._seal_trigger_round,
+                )
+            if self._loop is not None:
+                # Production path: schedule the delayed fire on the
+                # validator's asyncio loop.
+                asyncio.run_coroutine_threadsafe(
+                    self._delayed_seal_at_drand_boundary(),
+                    self._loop,
+                )
+            else:
+                # Synchronous test path (no running loop): fire seal
+                # immediately, matching the pre-v2.3 timing tests rely on.
+                self._seal_flag.set()
+                if self._seal_event is not None:
+                    self._seal_event.set()
+
+        return BatchSubmissionResponse(
+            accepted=True, reason=RejectReason.ACCEPTED
+        )
+
+    async def _delayed_seal_at_drand_boundary(self) -> None:
+        """Fire ``_seal_flag`` once (a) the trigger drand round expires
+        AND (b) the submit queue has drained.
+
+        Phase 1 — drand boundary wait. Sleep until ``seconds_until_next_drand_boundary``
+        passes. After this point HTTP cheap-reject starts rejecting
+        submissions whose ``drand_round > _seal_trigger_round`` as
+        BATCH_FILLED, so the queue can only lose items from here on.
+
+        Phase 2 — bounded queue drain. Poll ``_queue_drained_predicate`` every
+        ~200 ms until it returns True or the drain timeout expires. Only then
+        do we fire the seal.
+        Without this phase, GRAIL-pending submissions queued during the
+        trigger drand round would be dropped at the worker's
+        ``is_sealed`` check the instant the seal fires — defeating the
+        entire boundary-fair-split design. The timeout is the safety valve:
+        fairness improves for normal trigger-round stragglers, but a slow or
+        constantly refilled queue cannot freeze checkpoints.
+
+        Defensive fallback: if the drand chain info isn't available
+        (synchronous tests that disable the drand check), the boundary
+        wait is skipped and seal fires immediately. If the predicate is
+        None (tests that don't wire one), the drain wait is also
+        skipped. Both fallbacks preserve pre-v2.3 timing for test
+        fixtures that don't exercise the full pipeline.
+
+        Cancellation: if the service swaps the active batcher (window
+        rolls over) while this coroutine is sleeping, the task is
+        cancelled by the loop teardown. That's fine — a stale batcher's
+        seal firing late is a no-op (the train step has already moved on).
+        """
+        # Phase 1 — wait for trigger drand round to expire.
+        if self._drand_chain_info is not None:
+            from reliquary.infrastructure.chain import seconds_until_next_drand_boundary
+            ci = self._drand_chain_info
+            delay = seconds_until_next_drand_boundary(
+                self._wall_clock(), ci["genesis_time"], ci["period"],
+            )
+            # Small margin past the boundary so a submission sent right
+            # at the boundary still resolves to the trigger round on
+            # arrival.
+            await asyncio.sleep(delay + 0.05)
+
+        # Phase 2 — drain the queue of trigger-round submissions still
+        # waiting on GRAIL. Without ``_queue_drained_predicate`` (test
+        # context), this phase is a no-op and the seal fires immediately.
+        if self._queue_drained_predicate is not None:
+            drain_started = self._time_fn()
+            while not self._queue_drained_predicate():
+                waited_s = self._time_fn() - drain_started
+                if waited_s >= MAX_SEAL_QUEUE_DRAIN_SECONDS:
+                    logger.warning(
+                        "seal_drain_timeout window=%d trigger_round=%s "
+                        "waited_s=%.2f proof_admitted=%d post_trigger_admitted=%d",
+                        self.window_start,
+                        self._seal_trigger_round,
+                        waited_s,
+                        self._proof_admission_count,
+                        self.post_trigger_proof_admission_count,
+                    )
+                    break
+                await asyncio.sleep(0.2)
+
+        self._seal_flag.set()
+        if self._seal_event is not None:
+            self._seal_event.set()
 
     def _reject(
         self,
@@ -2034,7 +2199,6 @@ class GrpoWindowBatcher:
         dist_q10_min: float | None = None,
         telemetry: SubmitTelemetry | None = None,
         reject_stage: str | None = None,
-        decision_ts: float | None = None,
     ) -> BatchSubmissionResponse:
         self.reject_counts[reason.value] = self.reject_counts.get(reason.value, 0) + 1
 
@@ -2042,7 +2206,7 @@ class GrpoWindowBatcher:
             hotkey is not None
             and reject_stage in _PROOF_FAILURE_DEBT_STAGES
         ):
-            with self._proof_counters_lock:
+            with self._proof_admission_lock:
                 self._expensive_proof_failures_by_hotkey[hotkey] = (
                     self._expensive_proof_failures_by_hotkey.get(hotkey, 0) + 1
                 )
@@ -2055,8 +2219,7 @@ class GrpoWindowBatcher:
                 # Anti-tuning: never surface the GRAIL sketch diff to miners.
                 # All other reasons get the diagnostics computed up to the
                 # rejection point.
-                if decision_ts is None:
-                    decision_ts = self._wall_clock()
+                decision_ts = self._wall_clock()
                 if reason is RejectReason.GRAIL_FAIL:
                     sketch_diff_max = None
                     telemetry = None
@@ -2080,7 +2243,7 @@ class GrpoWindowBatcher:
                         ),
                         drand_delta=telemetry.drand_delta if telemetry else None,
                         seal_trigger_round=(
-                            telemetry.seal_trigger_round if telemetry else None
+                            telemetry.seal_trigger_round if telemetry else self._seal_trigger_round
                         ),
                         prompt_hash_lead=(
                             telemetry.prompt_hash_lead if telemetry else None
@@ -2096,166 +2259,182 @@ class GrpoWindowBatcher:
         with self._lock:
             return list(self._valid)
 
-    def pending_submissions(self) -> list[PendingSubmission]:
-        """Graded, scored, not yet proven. The auction ranks these."""
-        with self._lock:
-            return list(self._pending)
+    def _compute_difficulty_auction_shadow(self) -> None:
+        """Compute an inert auction counterfactual over ``self._valid``.
 
-    def _compute_shadow_auction(self, pool: float) -> dict[str, Any]:
-        """The batch the difficulty auction WOULD have picked. Observation only.
-
-        Production still pays drand-FCFS (``select_batch_and_distribute``). This
-        runs alongside it so we can compare the two selections on live traffic
-        before arming: how far apart are the batches, does the auction batch
-        actually skew harder, does any single coldkey dominate the ranking.
-
-        Arming is gated on the free-negative measurement (M5) — under the
-        auction a FALSE negative is worth the maximum payout, so the grader's
-        correctness becomes the load-bearing security property. See
-        docs/superpowers/specs/2026-07-14-difficulty-auction-design.md
+        Production has already populated ``selection_metadata_by_id`` when
+        this runs. Any shadow failure is contained and surfaced in telemetry;
+        an observational experiment cannot break the live protocol.
         """
-        batch, rewards = select_batch_auction(
-            submissions=self._valid,
-            b=B_BATCH,
-            cooldown_map=self._cooldown,
-            current_window=self.window_start,
-            pool=pool,
-            max_slots_per_coldkey=MAX_SLOTS_PER_COLDKEY_PER_WINDOW,
-            coldkey_of=self.coldkey_of,
-        )
-        return {
-            "batch": [
-                {
-                    "hotkey": sub.hotkey,
-                    "prompt_idx": sub.prompt_idx,
-                    "env_name": getattr(self.env, "name", ""),
-                    "value": sub.value,
-                    "sigma": sub.sigma,
-                    "drand_round": sub.drand_round,
-                    "reward_vector": sub.reward_vector,
-                }
-                for sub in batch
+        env_name = str(getattr(self.env, "name", ""))
+        base = {
+            "schema_version": 1,
+            "mode": "observation_only",
+            "environment": env_name,
+            "population": "fully_validated_before_current_seal",
+            "population_limitations": [
+                "excludes_pre_validation_rejects",
+                "excludes_batch_filled_rejects",
             ],
-            "rewards_by_hotkey": rewards,
-            "candidates": len(self._valid),
+            "production_changed": False,
+            "delta": DIFFICULTY_AUCTION_DELTA,
+            "batch_size": B_BATCH,
+            "validated_candidates": len(self._valid),
+            "max_candidates": DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES,
         }
+        self.difficulty_auction_metadata_by_id = {}
+        if not DIFFICULTY_AUCTION_SHADOW_ENABLED:
+            self.difficulty_auction_shadow = {**base, "status": "disabled"}
+            return
+        if env_name not in DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS:
+            self.difficulty_auction_shadow = {
+                **base,
+                "status": "out_of_scope_environment",
+            }
+            return
+        if len(self._valid) > DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES:
+            self.difficulty_auction_shadow = {
+                **base,
+                "status": "skipped_candidate_limit",
+            }
+            return
 
-    def _prove_ranked(self, pool: float = 1.0) -> list[ValidSubmission]:
-        """Prove candidates in score order until B_BATCH pass. Never prove a loser.
-
-        Fabricated groups rank first (they name their own score), so the failures
-        we pay for cluster at the top. That is fine — they earn nothing, the proof
-        runs before payment — but it is why the attempt budget exists.
-
-        Runs OUTSIDE ``_lock``: ``_verify_expensive`` is 5-25 s of GPU per
-        candidate. It mutates reject state and is not thread-safe, so the loop is
-        strictly serial. Deterministic: the order is a pure function of the
-        pending set (``_rank_key``), never wall-clock or dict/set iteration order.
-        """
-        with self._lock:
-            ranked = sorted(self._pending, key=_rank_key)
-
-        attempts = 0
-        proven: list[ValidSubmission] = []
-        claimed: set[int] = set()
-        attempted_ids: set[int] = set()
-
-        for pending in ranked:
-            if len(proven) >= B_BATCH:
-                break
-            if pending.prompt_idx in claimed:
-                continue          # one proof per prompt; the top-ranked took it
-            if self._cooldown.is_in_cooldown(pending.prompt_idx, self.window_start):
-                continue
-            # The griefer bound. A fabricated group ranks at the top by
-            # construction (its score comes from a hand-writable reward vector) and
-            # fails GRAIL, so without this a griefer could occupy the whole top of
-            # the ranking. There is NO global proof-count cap: one would cut the
-            # loop off before honest candidates ranked below the fakes are reached,
-            # starving the batch. Instead each hotkey is skipped after
-            # MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW failures, so a
-            # griefer pays one registration per 2 wasted proofs while honest fill
-            # always proceeds. The pool itself is bounded by the grading ceiling
-            # (MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW). _verify_expensive charges the
-            # debt via _reject; we only read it.
-            if (
-                self.proof_failure_debt(pending.hotkey)
-                >= MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
-            ):
-                continue
-            attempts += 1
-            attempted_ids.add(id(pending))
-            sub = self._verify_expensive(pending)
-            if sub is None:
-                continue          # rejected; promote the next-ranked
-            proven.append(sub)
-            claimed.add(pending.prompt_idx)
-
-        with self._lock:
-            self._valid = proven
-            self.valid_count = len(proven)
-        self.proof_attempts = attempts
-        # Read by _prove_forensic_sample to find the pending pool this window
-        # never looked at.
-        self._attempted_pending_ids = attempted_ids
-        return proven
-
-    def _prove_forensic_sample(self) -> list[ForensicSampleResult]:
-        """Prove ``FORENSIC_SAMPLE_PER_WINDOW`` non-winners for telemetry only.
-
-        Deferring the proof to seal time means the authenticity gates inside
-        ``_verify_expensive`` (token-auth, distribution, logprob, forced-seed)
-        only ever fire on the ranked winners — this is how the fleet-wide
-        pre-generation and token-tamper detections were made, and deferral
-        would otherwise blind them. Selection is deterministic —
-        ``sha256(randomness || merkle_root)``, lowest digests win — never
-        ``random.sample``: validators must converge on an identical sample, and
-        a miner must not be able to predict whether he'll be looked at. Results
-        are discarded (never enter ``_valid``, never paid); only the R2-archived
-        outcome is kept. Runs serially, a bounded constant
-        ``FORENSIC_SAMPLE_PER_WINDOW`` of extra proofs on top of the ranked pass.
-        """
-        with self._lock:
-            remainder = [
-                p for p in self._pending
-                if id(p) not in self._attempted_pending_ids
-            ]
-
-        def _digest(p: PendingSubmission) -> bytes:
-            return hashlib.sha256(
-                self.randomness.encode() + p.merkle_root
-            ).digest()
-
-        remainder.sort(key=_digest)
-        sample = remainder[:FORENSIC_SAMPLE_PER_WINDOW]
-
-        results = [
-            ForensicSampleResult(
-                hotkey=pending.hotkey,
-                prompt_idx=pending.prompt_idx,
-                passed=self._verify_expensive(pending) is not None,
+        started_at = time.perf_counter()
+        try:
+            shadow_pool = tuple(
+                ShadowSubmission(
+                    source_id=id(submission),
+                    hotkey=str(submission.hotkey),
+                    prompt_idx=int(submission.prompt_idx),
+                    drand_round=int(submission.drand_round),
+                    merkle_root=bytes(submission.merkle_root),
+                    selection_digest=bytes(submission.selection_digest),
+                    rewards=tuple(
+                        float(rollout.reward)
+                        for rollout in submission.rollouts
+                    ),
+                    in_cooldown=self._cooldown.is_in_cooldown(
+                        submission.prompt_idx, self.window_start
+                    ),
+                )
+                for submission in self._valid
             )
-            for pending in sample
-        ]
-        self.forensic_sample = results
-        return results
+            result = select_shadow_auction(
+                shadow_pool,
+                b=B_BATCH,
+                delta=DIFFICULTY_AUCTION_DELTA,
+            )
+            production_selected_ids = {
+                id(submission)
+                for submission in self._valid
+                if self.selection_metadata_by_id.get(id(submission), {}).get(
+                    "selected_for_batch", False
+                )
+            }
+            production_rewarded_ids = {
+                id(submission)
+                for submission in self._valid
+                if self.selection_metadata_by_id.get(id(submission), {}).get(
+                    "rewarded", False
+                )
+            }
+            shadow_selected_ids = {
+                submission.source_id for submission in result.selected
+            }
+
+            candidate_rows = []
+            for candidate in result.candidates:
+                submission = candidate.submission
+                row = {
+                    "hotkey": submission.hotkey,
+                    "prompt_idx": submission.prompt_idx,
+                    "selection_digest": submission.selection_digest.hex(),
+                    "drand_round": submission.drand_round,
+                    "value": candidate.score.value,
+                    "mean_reward": candidate.score.mean_reward,
+                    "reward_std": candidate.score.reward_std,
+                    "reward_count": candidate.score.reward_count,
+                    "eligible": candidate.eligible,
+                    "rank": candidate.rank,
+                    "shadow_selected": candidate.selected,
+                    "production_selected": (
+                        submission.source_id in production_selected_ids
+                    ),
+                    "production_rewarded": (
+                        submission.source_id in production_rewarded_ids
+                    ),
+                }
+                self.difficulty_auction_metadata_by_id[
+                    submission.source_id
+                ] = row
+                candidate_rows.append(row)
+
+            overlap = production_selected_ids & shadow_selected_ids
+            union = production_selected_ids | shadow_selected_ids
+
+            def _mean_reward(submission_ids: set[int]) -> float | None:
+                values = []
+                for submission in self._valid:
+                    if id(submission) not in submission_ids:
+                        continue
+                    row = self.difficulty_auction_metadata_by_id.get(
+                        id(submission)
+                    )
+                    if row is not None:
+                        values.append(float(row["mean_reward"]))
+                return sum(values) / len(values) if values else None
+
+            self.difficulty_auction_shadow = {
+                **base,
+                "status": "computed",
+                "computation_ms": (
+                    time.perf_counter() - started_at
+                ) * 1000.0,
+                "eligible_candidates": result.eligible_count,
+                "distinct_eligible_prompts": result.distinct_prompt_count,
+                "production_selected_count": len(production_selected_ids),
+                "production_rewarded_count": len(production_rewarded_ids),
+                "shadow_selected_count": len(shadow_selected_ids),
+                "selection_overlap_count": len(overlap),
+                "selection_jaccard": (
+                    len(overlap) / len(union) if union else 1.0
+                ),
+                "production_selected_mean_reward": _mean_reward(
+                    production_selected_ids
+                ),
+                "shadow_selected_mean_reward": _mean_reward(
+                    shadow_selected_ids
+                ),
+                "operator_cap_requested": result.operator_cap_requested,
+                "operator_cap_applied": result.operator_cap_applied,
+                "operator_mapping_complete": result.operator_mapping_complete,
+                "candidates": candidate_rows,
+            }
+        except Exception as exc:
+            logger.exception(
+                "difficulty auction shadow failed window=%d env=%s",
+                self.window_start,
+                env_name,
+            )
+            self.difficulty_auction_shadow = {
+                **base,
+                "status": "error",
+                "error_type": type(exc).__name__,
+                "computation_ms": (
+                    time.perf_counter() - started_at
+                ) * 1000.0,
+            }
 
     def seal_batch(
         self, pool: float = 1.0
     ) -> tuple[list[ValidSubmission], dict[str, float]]:
         """Pick the training batch and compute the reward distribution.
 
-        Proving happens first: ``_prove_ranked`` ranks the pending pool by
-        difficulty and fills ``self._valid`` with the proven winners, which
-        everything below reads. ``_prove_forensic_sample`` then proves a small
-        random sample of the non-winners for telemetry only — it never touches
-        ``_valid``. Returns (training_batch, rewards_by_hotkey). Cooldown and
-        hash-set bookkeeping is applied to every winning prompt — not just the
-        one submission picked for training — because all of them earn emission
+        Returns (training_batch, rewards_by_hotkey). Cooldown and hash-set
+        bookkeeping is applied to every winning prompt — not just the one
+        submission picked for training — because all of them earn emission
         and were therefore "used" by this window.
         """
-        self._prove_ranked(pool)
-        self._prove_forensic_sample()
         with self._lock:
             self.selection_metadata_by_id = explain_batch_selection(
                 submissions=self._valid,
@@ -2271,7 +2450,7 @@ class GrpoWindowBatcher:
                 current_window=self.window_start,
                 pool=pool,
             )
-            self.shadow_auction = self._compute_shadow_auction(pool)
+            self._compute_difficulty_auction_shadow()
             rewarded_submissions: list[ValidSubmission] = []
             rewarded_but_not_selected: dict[str, int] = {}
             for sub in self._valid:
@@ -2305,9 +2484,6 @@ class GrpoWindowBatcher:
                 cooldown_prompts=sorted(
                     self._cooldown.current_cooldown_set(self.window_start)
                 ),
-                # Miners poll this and act on it. Proofs run at seal now, so
-                # ``_valid`` is empty all window — report what was admitted.
-                # The field name is wire contract (extra="forbid"), so it stays.
-                valid_submissions=len(self._pending),
+                valid_submissions=len(self._valid),
                 checkpoint_n=0,
             )

@@ -203,14 +203,16 @@ def _env_weight_for_batch(batch, env_weights: dict) -> float:
     return 1.0
 
 
-def _completion_keep_list(rollout_meta, prompt_length: int, n_completion: int):
+def _completion_keep_list(rollout, prompt_length: int, n_completion: int):
     """Return a boolean keep list over completion positions.
 
     BFT forced-close tokens are validator-accepted but not policy-sampled, so
     they must be excluded from every policy-gradient path and from token-count
-    normalization denominators. ``None`` means every completion token is kept.
+    normalization denominators.  Only the batcher's private, validator-derived
+    span is trusted; wire metadata is never a training input. ``None`` means
+    every completion token is kept.
     """
-    force_span = rollout_meta.get("force_span")
+    force_span = getattr(rollout, "_validated_force_span", None)
     if not force_span:
         return None
     keep = [True] * max(0, int(n_completion))
@@ -221,12 +223,24 @@ def _completion_keep_list(rollout_meta, prompt_length: int, n_completion: int):
     return keep
 
 
+def _completion_token_logprobs(rollout) -> list:
+    """Normalize either protocol-supported log-prob layout to completion-only."""
+    commit = rollout.commit or {}
+    tokens = commit.get("tokens", []) or []
+    meta = commit.get("rollout", {}) or {}
+    prompt_length = int(meta.get("prompt_length", 0) or 0)
+    old = list(meta.get("token_logprobs", []) or [])
+    if tokens and len(old) == len(tokens):
+        return old[prompt_length:]
+    return old
+
+
 def _trainable_completion_count(
-    rollout_meta,
+    rollout,
     prompt_length: int,
     n_completion: int,
 ) -> int:
-    keep = _completion_keep_list(rollout_meta, prompt_length, n_completion)
+    keep = _completion_keep_list(rollout, prompt_length, n_completion)
     if keep is None:
         return max(0, int(n_completion))
     return sum(1 for flag in keep if flag)
@@ -262,10 +276,10 @@ def _plan_from_batches(batches, env_weights: Optional[dict] = None):
             surviving.append((group, advantages, b_idx))
             for rollout in group.rollouts:
                 meta = (rollout.commit or {}).get("rollout", {}) or {}
-                old = meta.get("token_logprobs", []) or []
+                old = _completion_token_logprobs(rollout)
                 prompt_length = int(meta.get("prompt_length", 0) or 0)
                 batch_tokens[b_idx] += _trainable_completion_count(
-                    meta, prompt_length, len(old),
+                    rollout, prompt_length, len(old),
                 )
 
     raw_weights = None
@@ -274,6 +288,106 @@ def _plan_from_batches(batches, env_weights: Optional[dict] = None):
     scales = _batch_loss_weights(batch_tokens, raw_weights)
     plan = [(g, a, scales[b]) for g, a, b in surviving]
     return plan, n_skipped
+
+
+def _bft_training_metrics(plan) -> dict[str, float | int]:
+    """Summarize actual BFT exposure in the surviving training plan.
+
+    ``abs_adv_weighted_tokens`` includes the plan's environment scale and is a
+    gradient-exposure proxy, not an exact gradient norm. It is sufficient to
+    detect a forced path becoming disproportionately influential over time.
+    """
+    by_path: dict[str, dict[str, float]] = {}
+    total_rollouts = 0
+    total_raw_tokens = 0
+    total_trainable_tokens = 0
+    total_injected_tokens = 0
+    forced_rollouts = 0
+    forced_trainable_tokens = 0
+    total_abs_adv_weighted_tokens = 0.0
+    forced_abs_adv_weighted_tokens = 0.0
+
+    for group, advantages, scale in plan:
+        for rollout, advantage in zip(group.rollouts, advantages):
+            meta = (rollout.commit or {}).get("rollout", {}) or {}
+            prompt_length = int(meta.get("prompt_length", 0) or 0)
+            raw_tokens = len(_completion_token_logprobs(rollout))
+            trainable_tokens = _trainable_completion_count(
+                rollout, prompt_length, raw_tokens,
+            )
+            span = getattr(rollout, "_validated_force_span", None)
+            injected_tokens = max(0, raw_tokens - trainable_tokens)
+            path = str(
+                getattr(rollout, "_validated_termination_path", None)
+                or "unknown"
+            )
+            path_metrics = by_path.setdefault(
+                path,
+                {
+                    "rollouts": 0.0,
+                    "trainable_tokens": 0.0,
+                    "injected_tokens_masked": 0.0,
+                    "abs_adv_weighted_tokens": 0.0,
+                },
+            )
+            exposure = (
+                abs(float(advantage)) * float(scale) * trainable_tokens
+            )
+            path_metrics["rollouts"] += 1
+            path_metrics["trainable_tokens"] += trainable_tokens
+            path_metrics["injected_tokens_masked"] += injected_tokens
+            path_metrics["abs_adv_weighted_tokens"] += exposure
+            total_abs_adv_weighted_tokens += exposure
+
+            total_rollouts += 1
+            total_raw_tokens += raw_tokens
+            total_trainable_tokens += trainable_tokens
+            total_injected_tokens += injected_tokens
+            if span is not None:
+                forced_rollouts += 1
+                forced_trainable_tokens += trainable_tokens
+                forced_abs_adv_weighted_tokens += exposure
+
+    metrics: dict[str, float | int] = {
+        "bft/plan_rollouts": total_rollouts,
+        "bft/forced_rollouts": forced_rollouts,
+        "bft/forced_rollout_ratio": (
+            forced_rollouts / total_rollouts if total_rollouts else 0.0
+        ),
+        "bft/raw_completion_tokens": total_raw_tokens,
+        "bft/trainable_completion_tokens": total_trainable_tokens,
+        "bft/injected_tokens_masked": total_injected_tokens,
+        "bft/injected_token_ratio": (
+            total_injected_tokens / total_raw_tokens if total_raw_tokens else 0.0
+        ),
+        "bft/forced_trainable_token_ratio": (
+            forced_trainable_tokens / total_trainable_tokens
+            if total_trainable_tokens
+            else 0.0
+        ),
+        "bft/abs_adv_weighted_tokens": total_abs_adv_weighted_tokens,
+        "bft/forced_abs_adv_weighted_tokens": (
+            forced_abs_adv_weighted_tokens
+        ),
+        "bft/forced_abs_adv_weighted_token_ratio": (
+            forced_abs_adv_weighted_tokens / total_abs_adv_weighted_tokens
+            if total_abs_adv_weighted_tokens
+            else 0.0
+        ),
+    }
+    for path, values in sorted(by_path.items()):
+        prefix = f"bft/path/{path}"
+        metrics[f"{prefix}/rollouts"] = int(values["rollouts"])
+        metrics[f"{prefix}/trainable_tokens"] = int(
+            values["trainable_tokens"]
+        )
+        metrics[f"{prefix}/injected_tokens_masked"] = int(
+            values["injected_tokens_masked"]
+        )
+        metrics[f"{prefix}/abs_adv_weighted_tokens"] = float(
+            values["abs_adv_weighted_tokens"]
+        )
+    return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -403,11 +517,11 @@ def _selected_logprobs_for_tokens(model, tokens: torch.Tensor, next_tokens: torc
     return _selected_logprobs(logits[:-1], next_tokens)
 
 
-def _completion_keep_mask(rollout_meta, prompt_length, n_completion, device):
+def _completion_keep_mask(rollout, prompt_length, n_completion, device):
     """Boolean keep-mask over completion positions with the BFT ``force_span``
     excluded. Returns ``None`` when the rollout is not forced (train every
     completion token, identical to the pre-BFT path)."""
-    keep = _completion_keep_list(rollout_meta, prompt_length, n_completion)
+    keep = _completion_keep_list(rollout, prompt_length, n_completion)
     if keep is None:
         return None
     return torch.tensor(keep, dtype=torch.bool, device=device)
@@ -433,7 +547,7 @@ def _rollout_loss(
     """
     tokens_list = rollout.commit["tokens"]
     prompt_length = rollout.commit.get("rollout", {}).get("prompt_length", 0)
-    old_logprobs_list = rollout.commit.get("rollout", {}).get("token_logprobs", [])
+    old_logprobs_list = _completion_token_logprobs(rollout)
 
     if prompt_length <= 0 or not old_logprobs_list:
         raise ValueError("rollout missing prompt_length or token_logprobs")
@@ -469,12 +583,13 @@ def _rollout_loss(
             f"model predicts {len(new_logprobs_c)} completion tokens"
         )
 
-    # BFT: mask the injected FORCE span out of the loss (= DAPO Overlong
-    # Filtering, narrowed to the carve). Those tokens were not sampled by the
-    # policy, so policy-gradient on them is invalid and their tiny probability
-    # would blow up the ratio; train only thinking-before + answer-after.
+    # Mask the validator-injected FORCE span out of the loss. Those actions were
+    # not sampled by the policy, so policy-gradient on them is invalid and their
+    # tiny probability would blow up the ratio; train thinking-before and the
+    # answer-after only. This is injected-action masking, not DAPO overlong
+    # filtering (which drops whole overlong samples).
     keep = _completion_keep_mask(
-        rollout.commit.get("rollout", {}), prompt_length,
+        rollout, prompt_length,
         int(new_logprobs_c.shape[0]), device,
     )
 
@@ -690,7 +805,7 @@ def _build_microbatch_items(plan):
             tokens = commit.get("tokens")
             meta = commit.get("rollout", {}) or {}
             p = int(meta.get("prompt_length", 0))
-            old = meta.get("token_logprobs", []) or []
+            old = _completion_token_logprobs(rollout)
             if not tokens or p <= 0 or not old:
                 logger.warning("rollout skipped: missing prompt_length or token_logprobs")
                 continue
@@ -698,7 +813,7 @@ def _build_microbatch_items(plan):
             if n_completion <= 0 or n_completion != len(old):
                 logger.warning("rollout skipped: log-prob length mismatch")
                 continue
-            keep = _completion_keep_list(meta, p, n_completion)
+            keep = _completion_keep_list(rollout, p, n_completion)
             if keep is None:
                 keep = [True] * n_completion
             if not any(keep):
@@ -849,6 +964,7 @@ def train_step(
         "batch/n_degenerate_groups": n_skipped,
         "batch/degenerate_ratio": n_skipped / n_groups,
     }
+    metrics.update(_bft_training_metrics(plan))
     telemetry.log_training_step(metrics, step=window_index)
 
     return model

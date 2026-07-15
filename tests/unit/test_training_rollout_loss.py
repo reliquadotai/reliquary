@@ -193,6 +193,28 @@ def test_rollout_loss_returns_completion_token_count(tiny_model_and_tokenizer):
     assert n_tok == 5
 
 
+def test_rollout_loss_accepts_protocol_full_sequence_logprobs(
+    tiny_model_and_tokenizer,
+):
+    model, _ = tiny_model_and_tokenizer
+    ref = _make_ref(model)
+    rollout = _build_rollout(
+        tokens=[1, 2, 3, 4, 5, 6, 7, 8],
+        reward=1.0,
+        prompt_length=3,
+    )
+    rollout.commit["rollout"]["token_logprobs"] = [-1.0] * 8
+
+    ppo, kl, n_tok = _rollout_loss(
+        model, ref, rollout, advantage=1.0,
+        device=next(model.parameters()).device,
+    )
+
+    assert n_tok == 5
+    assert torch.isfinite(ppo)
+    assert torch.isfinite(kl)
+
+
 def test_rollout_loss_masks_force_span_from_loss(tiny_model_and_tokenizer):
     """BFT: a forced rollout's injected FORCE span is excluded from the loss —
     the trained-token count drops by the span length and the loss changes."""
@@ -207,6 +229,7 @@ def test_rollout_loss_masks_force_span_from_loss(tiny_model_and_tokenizer):
     forced.commit["rollout"]["forced"] = True
     # absolute span [5,7) → completion-relative positions 2,3 (2 tokens)
     forced.commit["rollout"]["force_span"] = [5, 7]
+    forced._validated_force_span = (5, 7)
 
     ppo_n, _kl_n, n_n = _rollout_loss(model, ref, natural, advantage=1.0, device=device)
     ppo_f, _kl_f, n_f = _rollout_loss(model, ref, forced, advantage=1.0, device=device)
@@ -215,6 +238,32 @@ def test_rollout_loss_masks_force_span_from_loss(tiny_model_and_tokenizer):
     assert n_f == 3          # 2-token FORCE span masked out
     assert torch.isfinite(ppo_f)
     assert ppo_f.item() != ppo_n.item()   # masking the span changed the loss
+
+
+def test_rollout_loss_ignores_unvalidated_wire_force_span(
+    tiny_model_and_tokenizer,
+):
+    """A miner-declared span cannot suppress arbitrary GRPO loss tokens."""
+    reset_training_state()
+    model, _ = tiny_model_and_tokenizer
+    ref = _make_ref(model)
+    device = next(model.parameters()).device
+
+    tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+    natural = _build_rollout(tokens=tokens, reward=1.0, prompt_length=3)
+    untrusted = _build_rollout(tokens=tokens, reward=1.0, prompt_length=3)
+    untrusted.commit["rollout"]["forced"] = False
+    untrusted.commit["rollout"]["force_span"] = [0, 10_000]
+
+    ppo_n, _kl_n, n_n = _rollout_loss(
+        model, ref, natural, advantage=1.0, device=device,
+    )
+    ppo_u, _kl_u, n_u = _rollout_loss(
+        model, ref, untrusted, advantage=1.0, device=device,
+    )
+
+    assert n_n == n_u == 5
+    torch.testing.assert_close(ppo_u, ppo_n)
 
 
 def test_rollout_loss_uses_commit_tokens_as_source_of_truth(tiny_model_and_tokenizer):

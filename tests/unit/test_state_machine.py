@@ -1,6 +1,7 @@
 """ValidationService state machine: OPEN → TRAINING → PUBLISHING → READY."""
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -185,13 +186,17 @@ def test_open_window_wires_checkpoint_hash_into_batcher():
 
 
 @pytest.mark.asyncio
-async def test_activate_window_binds_batcher_loop():
-    """``_activate_window`` must bind each batcher's event loop.
+async def test_activate_window_binds_batcher_loop_for_delayed_seal():
+    """Regression: ``_activate_window`` must bind each batcher's event loop.
 
-    ``accept_submission`` runs in a worker thread (``asyncio.to_thread``) with
-    no running loop, so it cannot capture the loop itself — the pre-bound
-    ``batcher._loop`` is what an asyncio seal waiter needs to be notified from a
-    worker thread.
+    ``accept_submission`` runs in a worker thread (``asyncio.to_thread``)
+    with no running loop, so it cannot capture the loop itself — it reads
+    the pre-bound ``batcher._loop`` to schedule the delayed drand-boundary
+    seal via ``run_coroutine_threadsafe``. If ``_loop`` is left ``None``,
+    the B-th distinct prompt seals the window synchronously, dropping every
+    same-drand-round submission still in flight (BATCH_FILLED) and
+    collapsing the boundary fair split — i.e. only ~B miners per round can
+    ever earn emission.
     """
     import asyncio
 
@@ -206,43 +211,151 @@ async def test_activate_window_binds_batcher_loop():
 
 
 @pytest.mark.asyncio
-async def test_wait_for_window_seal_seals_at_the_collection_deadline(monkeypatch):
-    """The window is time-boxed: ``_wait_for_window_seal`` holds every batcher
-    open until the fixed collection deadline, then seals them all — there is no
-    count-based trigger and no sparse-window liveness breaker. A deadline of 0
-    makes ``poll_deadline`` seal on the first poll."""
-    monkeypatch.setattr(
-        "reliquary.validator.batcher.WINDOW_COLLECTION_SECONDS", 0.0,
-    )
+async def test_wait_for_window_seal_force_seals_drained_proof_cap():
+    """A full proof cap with no queued/in-flight work cannot fill later."""
+    from reliquary.validator.service import MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+
     svc = _make_service()
     svc._open_window()
     svc._activate_window()
     batcher = svc._active_batcher
-    assert batcher.is_sealed() is False
+
+    # Exhaustion is now gated on the never-refunded grading-attempts ceiling,
+    # since out_of_zone refunds the GRAIL candidate budget.
+    batcher._proof_grading_attempts = MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+    assert batcher.valid_count == 0
+    assert svc.server.submit_queue_depth == 0
+    assert svc.server.proof_verification_inflight == 0
 
     reason = await svc._wait_for_window_seal()
 
-    assert reason == "sealed"
+    assert reason == "proof_admission_exhausted_drained"
     assert batcher.is_sealed()
+    assert batcher.force_seal_reason == "proof_admission_exhausted_drained"
+
+
+def test_proof_cap_breaker_waits_for_inflight_or_queued_work():
+    from reliquary.validator.service import MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+
+    svc = _make_service()
+    svc._open_window()
+    svc._activate_window()
+    batcher = svc._active_batcher
+    batcher._proof_grading_attempts = MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+
+    svc.server._inflight_proofs = 1
+    assert svc._proof_admission_exhausted_and_drained(batcher) is False
+
+    svc.server._inflight_proofs = 0
+    svc.server._submit_queue.put_nowait((object(), batcher, object()))
+    assert svc._proof_admission_exhausted_and_drained(batcher) is False
+
+
+def test_proof_cap_breaker_uses_distinct_prompt_count():
+    """Raw valid duplicates should not mask an unfillable trainable shortfall."""
+    from reliquary.validator.service import MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+
+    svc = _make_service()
+    svc._open_window()
+    svc._activate_window()
+    batcher = svc._active_batcher
+    batcher._valid = [
+        SimpleNamespace(prompt_idx=i) for i in range(B_BATCH - 1)
+    ] + [SimpleNamespace(prompt_idx=0)]
+    batcher.valid_count = B_BATCH
+    batcher._proof_grading_attempts = MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+
+    assert batcher.distinct_valid_prompt_count() == B_BATCH - 1
+    assert svc._proof_admission_exhausted_and_drained(batcher) is True
 
 
 @pytest.mark.asyncio
-async def test_wait_for_window_seal_stays_open_before_the_deadline(monkeypatch):
-    """Below the deadline the window must NOT seal, however many prompts landed —
-    an early seal is the speed race we removed. With a fake clock pinned inside
-    the window, ``poll_deadline`` leaves the batcher open."""
+async def test_wait_for_window_seal_force_seals_duplicate_prompt_shortfall(monkeypatch):
+    """A duplicate-filled raw batch must not wait for the long safety timeout."""
     monkeypatch.setattr(
-        "reliquary.validator.batcher.WINDOW_COLLECTION_SECONDS", 300.0,
+        "reliquary.validator.service.MAX_SEAL_QUEUE_DRAIN_SECONDS", 0.0,
     )
     svc = _make_service()
     svc._open_window()
     svc._activate_window()
     batcher = svc._active_batcher
-    # Freeze time at the open instant so the deadline never elapses.
-    batcher._time_fn = lambda: batcher.window_opened_at
+    batcher._valid = [
+        SimpleNamespace(prompt_idx=i) for i in range(B_BATCH - 1)
+    ] + [SimpleNamespace(prompt_idx=0)]
+    batcher.valid_count = B_BATCH
+    batcher._proof_admission_count = B_BATCH + 1
 
-    assert batcher.poll_deadline() is False
-    assert batcher.is_sealed() is False
+    reason = await svc._wait_for_window_seal()
+
+    assert reason == "duplicate_prompt_distinct_shortfall_drained"
+    assert batcher.is_sealed()
+    assert batcher.force_seal_reason == reason
+
+
+@pytest.mark.asyncio
+async def test_wait_for_window_seal_force_seals_sparse_valid_idle(monkeypatch):
+    """Sparse valid traffic should not wait for the long safety timeout."""
+    monkeypatch.setattr(
+        "reliquary.validator.service.SPARSE_VALID_IDLE_SEAL_SECONDS", 0.0,
+    )
+    monkeypatch.setattr(
+        "reliquary.validator.service.SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS", 4,
+    )
+    svc = _make_service()
+    svc._open_window()
+    svc._activate_window()
+    batcher = svc._active_batcher
+    batcher._valid = [SimpleNamespace(prompt_idx=i) for i in range(4)]
+    batcher.valid_count = 4
+    batcher.last_valid_submission_at = batcher._time_fn() - 1.0
+    batcher.last_valid_submission_wall_ts = batcher._wall_clock() - 1.0
+
+    reason = await svc._wait_for_window_seal()
+
+    assert reason == "sparse_valid_idle_timeout"
+    assert batcher.is_sealed()
+    assert batcher.force_seal_reason == reason
+
+
+@pytest.mark.asyncio
+async def test_wait_for_window_seal_force_seals_sparse_valid_max_age(monkeypatch):
+    """Very sparse windows eventually seal even below the idle distinct floor."""
+    monkeypatch.setattr(
+        "reliquary.validator.service.SPARSE_VALID_MAX_WINDOW_SECONDS", 0.0,
+    )
+    svc = _make_service()
+    svc._open_window()
+    svc._activate_window()
+    batcher = svc._active_batcher
+    batcher._valid = [SimpleNamespace(prompt_idx=123)]
+    batcher.valid_count = 1
+    batcher.last_valid_submission_at = batcher._time_fn()
+    batcher.last_valid_submission_wall_ts = batcher._wall_clock()
+
+    reason = await svc._wait_for_window_seal()
+
+    assert reason == "sparse_valid_window_timeout"
+    assert batcher.is_sealed()
+    assert batcher.force_seal_reason == reason
+
+
+@pytest.mark.asyncio
+async def test_wait_for_window_seal_force_seals_zero_valid_max_age(monkeypatch):
+    """A reset window with only rejected/stale miners must not freeze forever."""
+    monkeypatch.setattr(
+        "reliquary.validator.service.SPARSE_VALID_MAX_WINDOW_SECONDS", 0.0,
+    )
+    svc = _make_service()
+    svc._open_window()
+    svc._activate_window()
+    batcher = svc._active_batcher
+    assert batcher.valid_count == 0
+
+    reason = await svc._wait_for_window_seal()
+
+    assert reason == "zero_valid_window_timeout"
+    assert batcher.is_sealed()
+    assert batcher.force_seal_reason == reason
 
 
 def test_open_window_empty_hash_pre_first_publish():

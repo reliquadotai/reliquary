@@ -48,26 +48,6 @@ def _always_true_sig(commit, hotkey):
     return True
 
 
-# The commit carries no hotkey (CommitModel is extra="forbid"), so a proof stub
-# that must fail exactly one group singles it out by a token marker instead.
-_FAKER_TOKEN_BASE = 500
-
-
-def _mark_as_faker(req):
-    """Retag a group's tokens so ``_fail_only_the_faker`` can single it out."""
-    for rollout in req.rollouts:
-        tokens = [_FAKER_TOKEN_BASE + t for t in range(CHALLENGE_K + 4)]
-        rollout.tokens = tokens
-        rollout.commit["tokens"] = tokens
-    return req
-
-
-def _fail_only_the_faker(commit, model, randomness):
-    if commit["tokens"][0] == _FAKER_TOKEN_BASE:
-        return _always_false_grail(commit, model, randomness)
-    return _always_true_grail(commit, model, randomness)
-
-
 def _make_commit(
     *,
     tokens: list[int] | None = None,
@@ -193,17 +173,6 @@ def _make_batcher(**overrides) -> GrpoWindowBatcher:
     return b
 
 
-def _prove_one(b: GrpoWindowBatcher, req) -> "ValidSubmission | None":
-    """Cheap admission + the seal-time proof for a single request.
-
-    Proof-dependent gates (GRAIL, termination, token-auth, forced-seed) reject
-    inside ``_verify_expensive`` at seal now, not at ``accept_submission``.
-    Returns None when the proof phase rejected the submission.
-    """
-    assert b.accept_submission(req).accepted is True, "cheap admission must pass"
-    return b._verify_expensive(b.pending_submissions()[-1])
-
-
 def test_constructor_sets_window():
     b = _make_batcher()
     assert b.window_start == 500
@@ -223,8 +192,6 @@ def test_accept_in_zone_submission():
     resp = b.accept_submission(req)
     assert resp.accepted is True
     assert resp.reason == RejectReason.ACCEPTED
-    assert len(b.pending_submissions()) == 1   # proven at seal, not at admission
-    b.seal_batch()
     assert len(b.valid_submissions()) == 1
 
 
@@ -237,7 +204,6 @@ def test_accepted_submission_uses_validator_computed_selection_digest():
     req = _request(rewards=[1.0] * 4 + [0.0] * 4)
 
     assert b.accept_submission(req).accepted is True
-    b.seal_batch()
     accepted = b.valid_submissions()[0]
     assert accepted.selection_digest == compute_rollouts_selection_digest(
         req.rollouts
@@ -300,7 +266,6 @@ def test_grail_verifier_receives_tokenizer_for_sparse_pstop():
     req = _request(rewards=[1.0] * 4 + [0.0] * 4)
     resp = b.accept_submission(req)
     assert resp.accepted is True
-    b.seal_batch()                 # the proof runs at seal, not at admission
     assert seen_tokenizers
     assert all(tok is b.tokenizer for tok in seen_tokenizers)
 
@@ -324,87 +289,124 @@ def test_reject_out_of_zone_all_pass():
 
 def test_out_of_zone_does_not_charge_grail_candidate():
     """An out_of_zone reject is a reward error (degenerate rollout rewards),
-    not a proof failure or cheating, and it never reaches the proof path — so
-    it must not bump the proof-candidate telemetry. It DOES burn a grading
-    attempt: grading is what the validator actually spent on it.
+    not a proof failure or cheating. The scarce GRAIL candidate budget is
+    charged only AFTER the reward-zone gate passes, so a degenerate submission
+    never consumes it — no refund needed, and a high out_of_zone rate (e.g.
+    opencode's binary rewards) cannot starve the env below B distinct. The
+    grading-attempts capacity (anti-DoS / queue bound) IS reserved at admission,
+    then charged irreversibly only when grading starts.
     """
     b = _make_batcher()
     req = _request(rewards=[1.0] * 8, hotkey="hkz")  # degenerate -> out_of_zone
 
-    resp = b.accept_submission(req)
+    admitted, _ = b.try_reserve_proof_admission(req)
+    assert admitted
+    assert b.proof_admission_count == 0      # GRAIL budget NOT charged at admission
+    assert b.proof_grading_attempts == 0
+    assert b.pending_proof_reservations == 1
+    assert b.start_proof_admission(req) == (True, None)
+    assert b.proof_grading_attempts == 1
+
+    try:
+        resp = b.accept_submission(req)
+    finally:
+        b.finish_proof_admission(req)
     assert resp.reason == RejectReason.OUT_OF_ZONE
 
-    assert b.proof_admission_count == 0      # never reached the proof path
-    assert b.proof_grading_attempts == 1     # grading ran, so it is charged
+    assert b.proof_admission_count == 0      # never reached GRAIL -> never charged
+    assert b.proof_grading_attempts == 1     # grading ceiling unaffected
 
 
-def test_grading_ceiling_rejects_once_spent(monkeypatch):
-    """The grading ceiling bounds total grading work per window (anti-DoS).
-    Once spent, further submissions are rejected BATCH_FILLED without grading —
-    otherwise a degenerate-reward flood would grow the submit queue without
-    limit."""
+def test_grading_attempts_ceiling_blocks_admission(monkeypatch):
+    """The grading-attempts ceiling bounds total grading work and gates
+    admission — even when no submission ever charges the GRAIL budget (here all
+    are out_of_zone). Otherwise a degenerate-reward flood would grow the
+    unbounded submit queue without limit."""
     import reliquary.validator.batcher as batcher_mod
 
     monkeypatch.setattr(batcher_mod, "MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW", 3)
     b = _make_batcher()
     for i in range(3):
-        b.accept_submission(_request(rewards=[1.0] * 8, hotkey=f"hk{i}"))
+        req = _request(rewards=[1.0] * 8, hotkey=f"hk{i}")
+        ok, _ = b.try_reserve_proof_admission(req)
+        assert ok
+        assert b.start_proof_admission(req) == (True, None)
+        try:
+            b.accept_submission(req)  # out_of_zone -> never charges GRAIL budget
+        finally:
+            b.finish_proof_admission(req)
 
-    assert b.proof_admission_count == 0          # all out_of_zone
+    assert b.proof_admission_count == 0          # GRAIL budget never charged
     assert b.proof_grading_attempts == 3         # ceiling reached, not refunded
-    assert b.grading_budget_exhausted() is True
 
-    resp = b.accept_submission(_request(prompt_idx=99, hotkey="hkX"))
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.BATCH_FILLED
-    assert b.rejected_submissions[-1].reject_stage == "grading_budget"
-    assert b.proof_grading_attempts == 3         # the reject graded nothing
+    ok, reason = b.try_reserve_proof_admission(
+        _request(rewards=[1.0] * 8, hotkey="hkX")
+    )
+    assert ok is False
+    assert reason == "proof_grading_attempts_full"
 
 
-def test_cheap_reject_before_grading_does_not_burn_the_ceiling(monkeypatch):
-    """A submission bounced by a pre-grading structural check costs nothing, so
-    it must not consume a grading attempt (that would let a flood of malformed
-    payloads starve honest miners out of the window)."""
+def test_cancelled_pending_reservation_returns_unused_capacity(monkeypatch):
     import reliquary.validator.batcher as batcher_mod
 
     monkeypatch.setattr(batcher_mod, "MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW", 1)
     b = _make_batcher()
+    dropped = _request(hotkey="hk-drop")
+    replacement = _request(prompt_idx=43, hotkey="hk-replacement")
 
-    junk = _request(prompt_idx=42, hotkey="hk-junk")
-    junk.window_start = b.window_start + 1        # rejected before grading
-    resp = b.accept_submission(junk)
-    assert resp.reason == RejectReason.WINDOW_MISMATCH
+    assert b.try_reserve_proof_admission(dropped) == (True, None)
+    assert b.try_reserve_proof_admission(replacement) == (
+        False,
+        "proof_grading_attempts_full",
+    )
+    assert b.cancel_proof_admission(dropped) is True
     assert b.proof_grading_attempts == 0
-    assert b.grading_budget_exhausted() is False
+    assert b.pending_proof_reservations == 0
+    assert b.try_reserve_proof_admission(replacement) == (True, None)
 
-    # The single grading slot is still available to an honest submission.
-    assert b.accept_submission(_request(hotkey="hk-honest")).accepted is True
+
+def test_started_attempt_is_never_refunded(monkeypatch):
+    import reliquary.validator.batcher as batcher_mod
+
+    monkeypatch.setattr(batcher_mod, "MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW", 1)
+    b = _make_batcher()
+    started = _request(hotkey="hk-started")
+    later = _request(prompt_idx=43, hotkey="hk-later")
+
+    assert b.try_reserve_proof_admission(started) == (True, None)
+    assert b.start_proof_admission(started) == (True, None)
+    b.finish_proof_admission(started)
+
     assert b.proof_grading_attempts == 1
+    assert b.inflight_proof_reservations == 0
+    assert b.try_reserve_proof_admission(later) == (
+        False,
+        "proof_grading_attempts_full",
+    )
 
 
-def test_expensive_proof_debt_does_not_gate_admission():
-    """Proof failures only exist at seal now, so debt cannot bounce a miner at
-    admission — the griefer bound it feeds lives in ``_prove_ranked`` (see
-    test_deferred_proof.py). Admission must not double-charge for it."""
+def test_pending_burst_rechecks_hotkey_debt_at_proof_start():
     from reliquary.constants import (
         MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW,
     )
 
     b = _make_batcher()
+    pending = _request(hotkey="hk-burst")
+    assert b.try_reserve_proof_admission(pending) == (True, None)
     for _ in range(MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW):
         b._reject(
-            RejectReason.BAD_TERMINATION,
-            hotkey="hk-debt",
+            RejectReason.TOKEN_TAMPERED,
+            hotkey="hk-burst",
             prompt_idx=42,
-            reject_stage="termination",
+            reject_stage="forced_seed",
         )
-    assert (
-        b.proof_failure_debt("hk-debt")
-        == MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
-    )
 
-    resp = b.accept_submission(_request(hotkey="hk-debt"))
-    assert resp.accepted is True, resp.reason
+    assert b.start_proof_admission(pending) == (
+        False,
+        "proof_failure_debt_hotkey",
+    )
+    assert b.pending_proof_reservations == 0
+    assert b.proof_grading_attempts == 0
 
 
 def test_reject_manufactured_opposite_reward_clones_before_grail_compute():
@@ -437,50 +439,6 @@ def test_reject_manufactured_opposite_reward_clones_before_grail_compute():
     resp = b.accept_submission(req)
     assert resp.accepted is False
     assert resp.reason == RejectReason.DISTRIBUTION_SUSPICIOUS
-
-
-def test_clone_reject_does_not_charge_proof_failure_debt():
-    """The opposite-reward-clone check is CPU-only and runs before any GPU
-    work. Its reject must NOT charge the per-hotkey GPU-proof-failure debt —
-    two charges lock a hotkey out of the window's proofs entirely."""
-    def paired_text(slot: int, answer: int, *, correct: bool) -> str:
-        verdict = "CORRECT" if correct else "near miss"
-        return (
-            f"To solve template {slot}, compute the same intermediate values. "
-            "First expand the expression, then simplify every term carefully. "
-            "The derivation is intentionally long enough to look like a real "
-            "math completion and all steps are repeated across the paired "
-            "rollouts. After substitution, the final numeric value is "
-            f"{answer}. Therefore the final answer is \\boxed{{{answer}}}. "
-            f"{verdict}"
-        )
-
-    req = _request(rewards=[1.0] * 4 + [0.0] * 4, hotkey="hk-clone")
-    texts: dict[int, str] = {}
-    for slot in range(4):
-        texts[slot] = paired_text(slot, 40, correct=True)
-        texts[slot + 4] = paired_text(slot, 41 + slot, correct=False)
-
-    b = _make_batcher(completion_text_fn=lambda rollout: texts[rollout.tokens[0]])
-
-    resp = b.accept_submission(req)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.DISTRIBUTION_SUSPICIOUS
-    assert b.rejected_submissions[-1].reject_stage == "distribution_clones"
-    assert b.proof_failure_debt("hk-clone") == 0
-    assert b.expensive_proof_failures_by_hotkey == {}
-
-
-def test_proof_derived_distribution_reject_still_charges_debt():
-    """The proof-derived distribution stage stays in the debt set."""
-    b = _make_batcher()
-    b._reject(
-        RejectReason.DISTRIBUTION_SUSPICIOUS,
-        hotkey="hk-dist",
-        prompt_idx=42,
-        reject_stage="distribution",
-    )
-    assert b.proof_failure_debt("hk-dist") == 1
 
 
 def test_allow_less_than_three_opposite_reward_clone_pairs():
@@ -521,14 +479,11 @@ def test_accept_all_sigma_zone_binary_configs(k):
 
 
 def test_reject_grail_fail():
-    """The GRAIL proof runs at seal now, so admission accepts and the reject
-    lands in _verify_expensive."""
     b = _make_batcher(verify_commitment_proofs_fn=_always_false_grail)
     req = _request()
-    assert b.accept_submission(req).accepted is True
-
-    assert b._verify_expensive(b.pending_submissions()[0]) is None
-    assert b.reject_counts[RejectReason.GRAIL_FAIL.value] == 1
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.GRAIL_FAIL
 
 
 def test_reject_reward_mismatch():
@@ -578,7 +533,6 @@ def test_validator_authoritative_reward_overwrites_placeholder_claims():
     resp = b.accept_submission(req)
 
     assert resp.accepted is True, resp.reason
-    b.seal_batch()
     expected = [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
     assert [r.reward for r in b._valid[0].rollouts] == expected
     assert [
@@ -640,13 +594,11 @@ def test_seal_batch_chronological_by_drand_round():
     req_early = _request(prompt_idx=7, hotkey="early")
     assert b.accept_submission(req_late).accepted
     assert b.accept_submission(req_early).accepted
-    # Stamp the rounds after acceptance, on the PENDING pool — seal proves those
-    # into _valid (the test helper accepts with the check disabled, so
-    # drand_round on the request defaults to 0; we set them here to drive the
-    # seal-time ordering deterministically).
-    pendings = b.pending_submissions()
-    pendings[0].drand_round = 2  # late: round 2
-    pendings[1].drand_round = 1  # early: round 1
+    # Stamp the rounds after acceptance (the test helper accepts with the
+    # check disabled, so drand_round on the request defaults to 0; we set
+    # them here to drive the seal-time ordering deterministically).
+    b._valid[0].drand_round = 2  # late: round 2
+    b._valid[1].drand_round = 1  # early: round 1
     batch, _ = b.seal_batch()
     assert len(batch) == 2
     assert batch[0].hotkey == "early"
@@ -689,16 +641,8 @@ def test_state_endpoint_exposes_cooldown():
 
 
 def test_distinct_prompts_in_batch_only():
-    """One submission per winning prompt enters the training batch, even when
-    multiple miners successfully submitted on the same prompt.
-
-    BEHAVIOUR CHANGE (ranked proving): only the top-ranked candidate per prompt
-    is proven, so a prompt's slot now pays ONE miner in full instead of being
-    split K ways. Alice and Bob tie on value and drand round, so the canonical
-    hash tie-break picks between them — a lottery, hence expected-value
-    identical to the old 1/16 split, and still sybil-neutral (N hotkeys on one
-    prompt still win at most that prompt's single slot).
-    """
+    """One submission per winning prompt enters the training batch, even
+    when multiple miners successfully submitted on the same prompt."""
     b = _make_batcher()
     b.accept_submission(_request(prompt_idx=42, hotkey="alice"))
     b.accept_submission(_request(prompt_idx=42, hotkey="bob"))
@@ -706,10 +650,10 @@ def test_distinct_prompts_in_batch_only():
     batch, rewards = b.seal_batch()
     assert len(batch) == 2
     assert {s.prompt_idx for s in batch} == {42, 7}
-    # Each filled slot pays pool / B_BATCH = 1/8, to the prompt's single winner.
-    prompt_42_winner = {"alice", "bob"} & set(rewards)
-    assert len(prompt_42_winner) == 1
-    assert abs(rewards[prompt_42_winner.pop()] - 1 / 8) < 1e-9
+    # Each slot pays pool / B_BATCH = 1/8. Prompt 42 has 2 miners
+    # splitting 1/8 → 1/16 each. Prompt 7 has 1 miner taking 1/8.
+    assert abs(rewards["alice"] - 1 / 16) < 1e-9
+    assert abs(rewards["bob"] - 1 / 16) < 1e-9
     assert abs(rewards["carol"] - 1 / 8) < 1e-9
 
 
@@ -771,10 +715,10 @@ def test_empty_checkpoint_hash_disables_gate():
     assert resp.accepted is True
 
 
-def test_b_distinct_prompts_do_not_seal_the_window():
-    """The window is time-boxed now: reaching B distinct prompts must NOT seal
-    it. An early seal would be the speed race we removed, cutting off
-    slow-but-hard submissions still generating (see poll_deadline)."""
+@pytest.mark.asyncio
+async def test_seal_event_set_when_b_valid_distinct_landed():
+    """seal_event fires when the B-th valid distinct-prompt non-cooldown
+    submission is accepted."""
     b = _make_batcher()
     b.current_checkpoint_hash = "sha256:hash"
     assert not b.seal_event.is_set()
@@ -784,8 +728,9 @@ def test_b_distinct_prompts_do_not_seal_the_window():
             checkpoint_hash="sha256:hash",
         )
         b.accept_submission(req)
-    assert not b.seal_event.is_set()
-    assert b.is_sealed() is False
+    # Give the event loop a tick to ensure the event is visible.
+    await asyncio.wait_for(b.seal_event.wait(), timeout=0.1)
+    assert b.seal_event.is_set()
 
 
 def test_seal_event_not_set_with_only_duplicate_prompts():
@@ -926,45 +871,42 @@ def test_no_canonical_fn_disables_check():
 
 
 # ---------------------------------------------------------------------------
-# Per-prompt single-slot acceptance (v2.4+)
+# Per-prompt multi-miner acceptance (v2.3+)
 # ---------------------------------------------------------------------------
 #
-# One submission per prompt, decided at admission: the first submitter claims
-# the prompt for the window, and every later submission for it is rejected
-# PROMPT_CLAIMED before any heavy verify. This closes the variance-farming
-# sybil: the forced-seed seed contains the hotkey, so N hotkeys submitting on
-# the same prompt would otherwise buy N independent draws of k.
+# Drand-anchored ordering at seal time replaced the FIFO SUPERSEDED short-
+# circuit. Multiple miners may submit on the same prompt within a window,
+# capped at MAX_SUBMISSIONS_PER_PROMPT. Each pays its own GRAIL verify; the
+# cap is the only thing bounding worst-case validator GPU load.
 
 
-def test_second_miner_on_the_same_prompt_is_rejected_at_admission():
-    """The first submitter claims the prompt; the second is rejected
-    PROMPT_CLAIMED without ever being admitted to the pending pool."""
+def test_same_prompt_multi_miner_accepted():
+    """v2.3: two different miners on the same prompt both pass verification.
+    The first does not 'claim' the prompt — emission is split at seal time."""
     b = _make_batcher()
     first = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
     second = _request_v21(prompt_idx=42, hotkey="B", checkpoint_hash="")
     assert b.accept_submission(first).accepted is True
-    resp = b.accept_submission(second)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.PROMPT_CLAIMED
-    assert len(b.pending_submissions()) == 1
-    assert len(b._submissions_per_prompt[42]) == 1
+    r2 = b.accept_submission(second)
+    assert r2.accepted is True
+    assert len(b._valid) == 2
+    assert len(b._submissions_per_prompt[42]) == 2
 
 
-def test_second_miner_cannot_claim_a_prompt_a_faker_already_holds():
-    """A fabricated group that will fail proof at seal still claims the
-    prompt at admission — there is no same-prompt promotion anymore. (See
-    ``test_failed_proof_promotes_the_next_ranked`` in test_deferred_proof.py
-    for promotion across DIFFERENT prompts, which is unaffected.)"""
-    b = _make_batcher(verify_commitment_proofs_fn=_fail_only_the_faker)
-    assert b.accept_submission(_mark_as_faker(_request_v21(
-        prompt_idx=42, hotkey="A", checkpoint_hash="",
-        rewards=[1.0, 1.0] + [0.0] * 6,
-    ))).accepted is True
-    resp = b.accept_submission(_request_v21(
-        prompt_idx=42, hotkey="B", checkpoint_hash="",
-    ))
+def test_prompt_full_rejected_at_cap():
+    """Beyond MAX_SUBMISSIONS_PER_PROMPT submissions on a prompt, further
+    arrivals are rejected PROMPT_FULL before any heavy verify."""
+    from reliquary.constants import MAX_SUBMISSIONS_PER_PROMPT
+    b = _make_batcher()
+    for i in range(MAX_SUBMISSIONS_PER_PROMPT):
+        req = _request_v21(prompt_idx=42, hotkey=f"hk{i}", checkpoint_hash="")
+        assert b.accept_submission(req).accepted is True, f"miner {i} should fit"
+    overflow = _request_v21(prompt_idx=42, hotkey="overflow", checkpoint_hash="")
+    resp = b.accept_submission(overflow)
     assert resp.accepted is False
-    assert resp.reason == RejectReason.PROMPT_CLAIMED
+    assert resp.reason == RejectReason.PROMPT_FULL
+    # The PROMPT_FULL reject did not enter _valid.
+    assert len(b._valid) == MAX_SUBMISSIONS_PER_PROMPT
 
 
 def test_different_prompts_tracked_independently():
@@ -979,8 +921,29 @@ def test_different_prompts_tracked_independently():
     ))
     assert r_a.accepted is True
     assert r_b.accepted is True
-    assert len(b.pending_submissions()) == 2
+    assert len(b._valid) == 2
     assert set(b._submissions_per_prompt) == {42, 43}
+
+
+def test_failed_submission_does_not_consume_bucket_slot():
+    """A submission rejected mid-pipeline (GRAIL fail) must not occupy a
+    PROMPT_FULL slot — otherwise dishonest spam could starve honest miners."""
+    b = _make_batcher(verify_commitment_proofs_fn=_always_false_grail)
+    first_fails = _request_v21(
+        prompt_idx=42, hotkey="A", checkpoint_hash="",
+    )
+    r1 = b.accept_submission(first_fails)
+    assert r1.accepted is False
+    assert r1.reason == RejectReason.GRAIL_FAIL
+    # No bucket entry for prompt 42 — the rejected submission did not count.
+    assert 42 not in b._submissions_per_prompt
+    # A subsequent honest submission for prompt 42 is still accepted.
+    b._verify_commitment = _always_true_grail
+    r2 = b.accept_submission(_request_v21(
+        prompt_idx=42, hotkey="B", checkpoint_hash="",
+    ))
+    assert r2.accepted is True
+    assert len(b._submissions_per_prompt[42]) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1366,9 +1329,9 @@ def test_reject_bad_termination_when_last_token_not_eos():
     # Last token != 99 (EOS) — sequence ends in seq_len-1
     req.rollouts[0].commit["tokens"] = list(range(seq_len))
     req.rollouts[0].tokens = req.rollouts[0].commit["tokens"]
-
-    assert _prove_one(b, req) is None
-    assert b.reject_counts[RejectReason.BAD_TERMINATION.value] == 1
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BAD_TERMINATION
 
 
 class _LongContextModelStub:
@@ -1438,9 +1401,9 @@ def test_reject_cap_path_truncations_over_budget():
         model=_LongContextModelStub(),
         verify_commitment_proofs_fn=_grail_with_logits(seq_len),
     )
-
-    assert _prove_one(b, req) is None
-    assert b.reject_counts[RejectReason.BAD_TERMINATION.value] == 1
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BAD_TERMINATION
 
 
 def test_accept_cap_path_truncations_at_budget():
@@ -1451,11 +1414,8 @@ def test_accept_cap_path_truncations_at_budget():
         model=_LongContextModelStub(),
         verify_commitment_proofs_fn=_grail_with_logits(seq_len),
     )
-
-    # Negative control for the test above: at (not over) budget the proof-stage
-    # termination gate must let it through.
-    assert _prove_one(b, req) is not None
-    assert RejectReason.BAD_TERMINATION.value not in b.reject_counts
+    resp = b.accept_submission(req)
+    assert resp.reason != RejectReason.BAD_TERMINATION
 
 
 def test_cap_path_records_private_termination_shadow(monkeypatch):
@@ -1473,8 +1433,9 @@ def test_cap_path_records_private_termination_shadow(monkeypatch):
         verify_commitment_proofs_fn=_grail_with_logits(seq_len),
     )
 
-    # The termination shadow is written by the proof phase, which runs at seal.
-    assert _prove_one(b, req) is not None
+    resp = b.accept_submission(req)
+
+    assert resp.reason != RejectReason.BAD_TERMINATION
     assert len(recorded) == 1
     assert recorded[0]["cap_truncated"] is True
     assert recorded[0]["would_exceed_truncation_budget"] is False
@@ -1527,8 +1488,9 @@ def test_reject_eos_padding_after_natural_stop():
     req.rollouts[0].commit = commit
     req.rollouts[0].tokens = commit["tokens"]
 
-    assert _prove_one(b, req) is None
-    assert b.reject_counts[RejectReason.BAD_TERMINATION.value] == 1
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BAD_TERMINATION
 
 
 def test_termination_skipped_when_grail_returns_empty_logits():
@@ -1597,8 +1559,8 @@ def test_rejected_grail_fail_omits_sketch_diff_max(monkeypatch):
     b._verify_signature = lambda commit, hk: True
 
     req = _build_request(hotkey="hk_grail", prompt_idx=3)  # existing helper
-    assert _prove_one(b, req) is None
-    assert b.reject_counts[RejectReason.GRAIL_FAIL.value] == 1
+    resp = b.accept_submission(req)
+    assert resp.reason == RejectReason.GRAIL_FAIL
 
     assert len(b.rejected_submissions) == 1
     rec = b.rejected_submissions[0]
@@ -1718,7 +1680,6 @@ def test_hash_dup_accept_when_not_in_set():
     req = _request(prompt_idx=42, rewards=[1.0] * 4 + [0.0] * 4)
     resp = b.accept_submission(req)
     assert resp.accepted is True
-    b.seal_batch()
     # rollout_hashes populated on the stored ValidSubmission
     stored = b.valid_submissions()[0]
     assert len(stored.rollout_hashes) == M_ROLLOUTS
@@ -1726,13 +1687,7 @@ def test_hash_dup_accept_when_not_in_set():
 
 
 def test_logical_group_duplicate_rejects_same_hotkey_wrapper_grind():
-    """Changing wrapper metadata cannot mint a second in-window claim.
-
-    Both requests default to the same ``prompt_idx``, so the one-per-prompt
-    admission gate (PROMPT_CLAIMED) now fires before the request ever reaches
-    the hash/logical-group dedup — an earlier, cheaper rejection of the same
-    grind attempt.
-    """
+    """Changing wrapper metadata cannot mint a second in-window claim."""
     b = _make_batcher()
     first = _request(hotkey="hk-copy")
     second = _request(hotkey="hk-copy")
@@ -1745,19 +1700,17 @@ def test_logical_group_duplicate_rejects_same_hotkey_wrapper_grind():
     duplicate = b.accept_submission(second)
 
     assert duplicate.accepted is False
-    assert duplicate.reason == RejectReason.PROMPT_CLAIMED
+    assert duplicate.reason == RejectReason.HASH_DUPLICATE
     assert b.logical_group_reservation_count == 1
-    assert b.logical_group_duplicate_rejects == 0   # never reached that gate
-    assert len(b.pending_submissions()) == 1   # only the first was admitted
+    assert b.logical_group_duplicate_rejects == 1
+    assert len(b.valid_submissions()) == 1
 
 
 def test_logical_group_identity_is_scoped_per_hotkey():
-    """Different hotkeys, different prompts — the logical-group reservation
-    is keyed per hotkey independently of the (now separate) prompt-claim gate."""
     b = _make_batcher()
 
-    assert b.accept_submission(_request(hotkey="hk-a", prompt_idx=42)).accepted is True
-    assert b.accept_submission(_request(hotkey="hk-b", prompt_idx=43)).accepted is True
+    assert b.accept_submission(_request(hotkey="hk-a")).accepted is True
+    assert b.accept_submission(_request(hotkey="hk-b")).accepted is True
     assert b.logical_group_reservation_count == 2
 
 
@@ -1831,13 +1784,26 @@ def test_seal_batch_with_none_hash_set_is_noop():
 
 
 # ---------------------------------------------------------------------------
-# Time-boxed window: extra candidates compete at seal, no early trigger
+# v2.3 seal extension: trigger drand round absorbs more submissions
 # ---------------------------------------------------------------------------
 
-def test_distinct_pending_prompt_count_rejects_duplicate_prompt_submissions():
-    """One submission per prompt is enforced at admission (PROMPT_CLAIMED), so
-    a second hotkey on an already-claimed prompt never reaches the pending
-    pool and ``distinct_pending_prompt_count`` never has anything to dedup."""
+def test_seal_trigger_round_recorded_on_b_th_distinct():
+    """When the B-th distinct prompt lands, ``_seal_trigger_round`` is set
+    to that submission's drand_round. The seal flag is NOT yet fired — the
+    delayed coroutine handles that (or a later-drand submission early-fires
+    it via the new ``_accept_locked`` short-circuit)."""
+    b = _make_batcher()
+    b.current_checkpoint_hash = ""
+    assert b._seal_trigger_round is None
+    for i in range(B_BATCH):
+        req = _request_v21(prompt_idx=i, hotkey=f"hk{i}", checkpoint_hash="")
+        req.drand_round = 100
+        b.accept_submission(req)
+    assert b._seal_trigger_round == 100
+
+
+def test_distinct_valid_prompt_count_ignores_duplicate_valid_submissions():
+    """Duplicate prompt submissions can fill raw valid_count before trainable slots."""
     b = _make_batcher()
     b.current_checkpoint_hash = ""
 
@@ -1847,53 +1813,79 @@ def test_distinct_pending_prompt_count_rejects_duplicate_prompt_submissions():
             hotkey=f"hk{prompt_idx}",
             checkpoint_hash="",
         )
+        req.drand_round = 100
         b.accept_submission(req)
     duplicate = _request_v21(prompt_idx=0, hotkey="hk_dup", checkpoint_hash="")
-    resp = b.accept_submission(duplicate)
+    duplicate.drand_round = 100
+    b.accept_submission(duplicate)
 
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.PROMPT_CLAIMED
-    assert b.pending_count == B_BATCH - 1
-    assert b.distinct_pending_prompt_count() == B_BATCH - 1
-    # No count-based seal: the window is time-boxed now.
-    assert b.is_sealed() is False
+    assert b.valid_count == B_BATCH
+    assert b.distinct_valid_prompt_count() == B_BATCH - 1
+    assert b._seal_trigger_round is None
 
 
-def test_extra_candidates_are_accepted_and_compete_at_seal():
-    """Past B distinct prompts, submissions are still accepted (no early seal).
-    They join the pending pool and compete for the B_BATCH slots at seal — the
-    entire point of the collection deadline."""
+def test_seal_extension_accepts_same_drand_after_bth():
+    """After the B-th distinct prompt lands in drand round R, further
+    submissions IN ROUND R are still accepted. This is the whole point of
+    the extension — it lets the boundary fair-split fire in
+    ``select_batch_and_distribute`` with > B distinct candidate prompts."""
     b = _make_batcher()
     b.current_checkpoint_hash = ""
+    # Land 8 distinct prompts in round 100.
     for i in range(B_BATCH):
         req = _request_v21(prompt_idx=i, hotkey=f"hk{i}", checkpoint_hash="")
+        req.drand_round = 100
         b.accept_submission(req)
-    # A 9th distinct submission is still accepted while the window is open.
+    # 9th submission in the SAME drand round → still accepted.
     extra = _request_v21(prompt_idx=99, hotkey="hk_extra", checkpoint_hash="")
+    extra.drand_round = 100
     resp = b.accept_submission(extra)
     assert resp.accepted is True, (
-        f"submission past B distinct should be accepted; got {resp.reason}"
+        f"same-round submission post-Bth distinct should be accepted; "
+        f"got {resp.reason}"
     )
-    distinct = len({s.prompt_idx for s in b.pending_submissions()})
+    # And it's in self._valid — now 9 distinct prompts.
+    distinct = len({s.prompt_idx for s in b._valid})
     assert distinct == B_BATCH + 1
 
 
-def test_extra_candidates_compete_for_the_b_slots():
-    """End-to-end: the open window absorbs > B distinct candidates, and at
-    seal they COMPETE for the B slots instead of diluting them.
-
-    ``_prove_ranked`` proves top-down and stops at B_BATCH, so ``_valid`` never
-    holds more than B candidates: the 8 that win a slot take the full pool/B and
-    the 4 that never get proven earn nothing.
-    """
+def test_seal_extension_rejects_later_drand():
+    """A submission with ``drand_round > _seal_trigger_round`` is too late.
+    It must be rejected as BATCH_FILLED — and the seal_flag must fire so
+    the window can close without waiting for the timer-based delayed seal."""
     b = _make_batcher()
     b.current_checkpoint_hash = ""
-    # Land 8 distinct prompts (fills the batch slots).
+    # Trigger the seal round at 100.
     for i in range(B_BATCH):
         req = _request_v21(prompt_idx=i, hotkey=f"hk{i}", checkpoint_hash="")
+        req.drand_round = 100
         b.accept_submission(req)
-    # The window is still open (time-boxed, not count-sealed), so 4 more
-    # distinct submissions are still accepted.
+    assert b._seal_trigger_round == 100
+    # Submission in round 101 — too late.
+    late = _request_v21(prompt_idx=99, hotkey="hk_late", checkpoint_hash="")
+    late.drand_round = 101
+    resp = b.accept_submission(late)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BATCH_FILLED
+    # Seal flag fired (no need to wait on the delayed coroutine).
+    assert b._seal_flag.is_set()
+
+
+def test_seal_extension_boundary_fair_split_fires_end_to_end():
+    """End-to-end: trigger drand round absorbs extra submissions, then
+    seal_batch's ``select_batch_and_distribute`` boundary branch
+    distributes the slots fairly. Without the seal extension this
+    boundary case was unreachable in production."""
+    b = _make_batcher()
+    b.current_checkpoint_hash = ""
+    # Land 8 distinct prompts in round 100 (fills the batch slots).
+    for i in range(B_BATCH):
+        req = _request_v21(prompt_idx=i, hotkey=f"hk{i}", checkpoint_hash="")
+        req.drand_round = 100
+        b.accept_submission(req)
+    # Pre-seal-extension, the next submission would be rejected as
+    # BATCH_FILLED. Post-extension, same-drand submissions are still
+    # accepted — feed 4 more into the same round on new prompts.
     for j in range(4):
         extra = _request_v21(
             prompt_idx=100 + j, hotkey=f"hk_extra{j}", checkpoint_hash="",
@@ -1901,58 +1893,89 @@ def test_extra_candidates_compete_for_the_b_slots():
         extra.drand_round = 100
         assert b.accept_submission(extra).accepted is True
 
-    # 12 distinct prompts are now pending, all in round 100. Seal ranks them and
-    # proves top-down until B_BATCH pass. Force the seal so the test doesn't
-    # depend on the timer-based delayed seal.
-    assert len({s.prompt_idx for s in b.pending_submissions()}) == B_BATCH + 4
+    # Now self._valid has 12 distinct prompts, all in round 100. The
+    # boundary branch in select_batch_and_distribute should fire when
+    # seal_batch runs. Force the seal so the test doesn't depend on the
+    # timer-based delayed seal.
     b._seal_flag.set()
     batch, rewards = b.seal_batch()
 
-    # Training batch capped at B_BATCH, and only the winners were proven.
+    # Training batch capped at B_BATCH.
     assert len(batch) == B_BATCH
-    assert b.proof_attempts == B_BATCH
-    assert len(b.valid_submissions()) == B_BATCH
-    # Every proven winner takes a full slot, pool/B. Nobody else is paid, and
-    # nothing is minted beyond the pool.
-    winners = {s.hotkey for s in b.valid_submissions()}
-    assert set(rewards) == winners
-    for hotkey in winners:
-        assert abs(rewards[hotkey] - 1.0 / B_BATCH) < 1e-9
-    # Conservation: all B slots filled, so the whole pool is paid out.
+    # Reward distribution: 12 miners share total pool/B × B = pool/1 = pool.
+    # Each of the 12 gets pool / 12 = 1/12 (under default pool=1.0).
+    # ``select_batch_and_distribute`` divides ``slot_share`` (= 1/B) by
+    # N_distinct = 12 per prompt, K=1 each: pool/B × B / 12 = 1/12.
+    expected_per_miner = 1.0 / 12
+    for i in range(B_BATCH):
+        assert abs(rewards[f"hk{i}"] - expected_per_miner) < 1e-9, (
+            f"hk{i} should fair-share at boundary, got {rewards.get(f'hk{i}')}"
+        )
+    for j in range(4):
+        assert abs(rewards[f"hk_extra{j}"] - expected_per_miner) < 1e-9
+    # Conservation:
     assert abs(sum(rewards.values()) - 1.0) < 1e-9
 
 
-def test_admission_bounded_only_by_the_grading_ceiling():
-    """Admission counts grading attempts; there is no GRAIL candidate budget and
-    no post-trigger straggler cap any more. A window-open burst is graded up to
-    the ceiling, then rejected."""
+def test_admission_gated_by_grading_ceiling_not_grail_budget():
+    """Admission counts grading attempts; there is no GRAIL candidate budget.
+
+    The window-open burst queues for grading up to the grading ceiling instead
+    of hard-bouncing on a candidate budget. (Entering the proof after the
+    reward-zone gate only bumps a telemetry counter now; see
+    ``test_grail_candidate_reserved_after_zone_gate`` and
+    ``test_grail_candidate_budget_removed_no_reject_on_burst``.)
+    """
     from reliquary.constants import (
         MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
     )
 
     b = _make_batcher()
 
+    # A burst larger than the GRAIL budget is still fully admitted for grading,
+    # bounded only by the grading-attempts ceiling.
     for i in range(MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW):
-        resp = b.accept_submission(_request(prompt_idx=i, hotkey=f"hk{i}"))
-        assert resp.accepted is True, (i, resp.reason)
-    assert b.proof_grading_attempts == MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+        admitted, reason = b.try_reserve_proof_admission(
+            _request(prompt_idx=i, hotkey=f"hk{i}")
+        )
+        assert admitted is True, (i, reason)
+        assert reason is None
+    assert b.proof_admission_count == 0          # admission never charges GRAIL
+    assert b.proof_grading_attempts == 0
+    assert b.pending_proof_reservations == MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+    assert (
+        b.proof_grading_capacity_used
+        == MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+    )
 
     # One past the grading ceiling is the anti-DoS bound that does reject.
-    resp = b.accept_submission(_request(prompt_idx=999, hotkey="hkX"))
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.BATCH_FILLED
+    admitted, reason = b.try_reserve_proof_admission(
+        _request(prompt_idx=999, hotkey="hkX")
+    )
+    assert admitted is False
+    assert reason == "proof_grading_attempts_full"
 
 
-def test_grail_candidate_counted_after_zone_gate():
-    """The proof-candidate counter is telemetry charged when a submission passes
-    the reward-zone gate, not at HTTP admission."""
+def test_grail_candidate_reserved_after_zone_gate():
+    """The GRAIL/GPU candidate budget is charged when a submission passes the
+    reward-zone gate (heading to the proof), not at HTTP admission. A reserved-
+    but-not-yet-graded submission holds a grading slot but no GRAIL slot."""
     b = _make_batcher()
     req = _request(hotkey="hkok")  # default rewards are in-zone (k=4, sigma=0.5)
 
-    resp = b.accept_submission(req)
+    admitted, _ = b.try_reserve_proof_admission(req)
+    assert admitted
+    assert b.proof_admission_count == 0      # GRAIL not charged at admission
+    assert b.proof_grading_attempts == 0
+    assert b.pending_proof_reservations == 1
+    assert b.start_proof_admission(req) == (True, None)
+
+    try:
+        resp = b.accept_submission(req)
+    finally:
+        b.finish_proof_admission(req)
     assert resp.accepted is True, resp.reason
     assert b.proof_admission_count == 1      # charged once the zone gate passed
-    assert b.proof_grading_attempts == 1
 
 
 def test_grail_candidate_budget_removed_no_reject_on_burst():
@@ -1969,6 +1992,34 @@ def test_grail_candidate_budget_removed_no_reject_on_burst():
 
     assert b.proof_admission_count == n
     assert b.reject_counts.get(RejectReason.BATCH_FILLED.value, 0) == 0
+
+
+def test_proof_admission_rejects_hotkey_after_expensive_failure_debt():
+    """Repeated post-proof failures from one hotkey should not consume all
+    proof slots in the window.
+    """
+    from reliquary.constants import (
+        MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW,
+    )
+
+    b = _make_batcher()
+    req = _request(hotkey="hk-debt")
+    for _ in range(MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW):
+        b._reject(
+            RejectReason.BAD_TERMINATION,
+            hotkey="hk-debt",
+            prompt_idx=42,
+            reject_stage="termination",
+        )
+
+    admitted, reason = b.try_reserve_proof_admission(req)
+    assert admitted is False
+    assert reason == "proof_failure_debt_hotkey"
+    assert b.proof_admission_count == 0
+    assert (
+        b.expensive_proof_failures_by_hotkey["hk-debt"]
+        == MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
+    )
 
 
 @pytest.mark.parametrize(
@@ -1995,13 +2046,16 @@ def test_integrity_failures_all_accrue_proof_debt(stage):
 
 
 def test_proof_failure_debt_ignores_pre_proof_reject_stages():
-    """Reward/zone/schema rejects happen before any GPU work, so they are not
-    the post-proof failure pattern the per-hotkey debt throttles."""
+    """Reward/zone/schema rejects can happen after HTTP reservation in some
+    test paths, but they are not the post-proof failure pattern being
+    throttled here.
+    """
     from reliquary.constants import (
         MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW,
     )
 
     b = _make_batcher()
+    req = _request(hotkey="hk-zone")
     for _ in range(MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW + 1):
         b._reject(
             RejectReason.OUT_OF_ZONE,
@@ -2010,17 +2064,41 @@ def test_proof_failure_debt_ignores_pre_proof_reject_stages():
             reject_stage="zone",
         )
 
+    admitted, reason = b.try_reserve_proof_admission(req)
+    assert admitted is True
+    assert reason is None
     assert b.proof_failure_debt("hk-zone") == 0
 
 
-def test_seal_batch_cooldowns_exactly_the_rewarded_prompts():
-    """Cooldown follows emission: a prompt that earned enters cooldown, one that
-    did not stays available.
-
-    BEHAVIOUR CHANGE (ranked proving): the losers are no longer proven and no
-    longer earn, so — unlike the old boundary fair split — their prompts are NOT
-    burned by a window they were not paid for.
+def test_proof_admission_post_trigger_cap_rejects_same_round_tail():
+    """After the seal trigger round is known, only a bounded same-round
+    tail can enter the expensive proof queue.
     """
+    from reliquary.constants import MAX_POST_TRIGGER_PROOF_CANDIDATES
+
+    b = _make_batcher()
+    b._seal_trigger_round = 100
+    requests = []
+    for i in range(MAX_POST_TRIGGER_PROOF_CANDIDATES):
+        req = _request(prompt_idx=i, hotkey=f"hk{i}")
+        req.drand_round = 100
+        requests.append(req)
+        admitted, reason = b.try_reserve_proof_admission(req)
+        assert admitted is True
+        assert reason is None
+
+    req = _request(prompt_idx=999, hotkey="hk-tail")
+    req.drand_round = 100
+    admitted, reason = b.try_reserve_proof_admission(req)
+    assert admitted is False
+    assert reason == "proof_admission_post_trigger_full"
+    assert b.post_trigger_proof_admission_count == (
+        MAX_POST_TRIGGER_PROOF_CANDIDATES
+    )
+
+
+def test_seal_batch_cooldowns_every_rewarded_boundary_prompt():
+    """Boundary runners earn emission, so their prompts must enter cooldown."""
     b = _make_batcher()
     for i in range(B_BATCH + 4):
         req = _request(prompt_idx=i, hotkey=f"hk{i}")
@@ -2030,23 +2108,21 @@ def test_seal_batch_cooldowns_exactly_the_rewarded_prompts():
     b._seal_flag.set()
     batch, rewards = b.seal_batch()
 
+    selected_prompts = {s.prompt_idx for s in batch}
+    runner_prompts = set(range(B_BATCH + 4)) - selected_prompts
     assert len(batch) == B_BATCH
-    rewarded_prompts = {s.prompt_idx for s in b.valid_submissions()}
-    assert set(rewards) == {s.hotkey for s in b.valid_submissions()}
-    assert b.rewarded_but_not_selected_by_hotkey == {}
+    assert set(rewards) == {f"hk{i}" for i in range(B_BATCH + 4)}
+    assert runner_prompts
     for prompt_idx in range(B_BATCH + 4):
-        assert b._cooldown.is_in_cooldown(prompt_idx, b.window_start + 1) is (
-            prompt_idx in rewarded_prompts
-        )
+        assert b._cooldown.is_in_cooldown(prompt_idx, b.window_start + 1)
+    assert b.rewarded_but_not_selected_by_hotkey == {
+        f"hk{prompt_idx}": 1 for prompt_idx in runner_prompts
+    }
 
 
-def test_seal_batch_hash_dedup_records_only_rewarded_submissions():
-    """Rollout hashes for PAID submissions must be blocked in later windows.
-
-    The unproven losers were never paid, so their hashes are not burned — they
-    are free to be resubmitted.
-    """
-    from reliquary.validator.dedup import RolloutHashSet, compute_rollout_hash
+def test_seal_batch_hash_dedup_records_rewarded_boundary_runners():
+    """Rollout hashes for paid runners must be blocked in later windows."""
+    from reliquary.validator.dedup import RolloutHashSet
 
     hs = RolloutHashSet(retention_windows=50)
     b = _make_batcher(hash_set=hs)
@@ -2056,22 +2132,158 @@ def test_seal_batch_hash_dedup_records_only_rewarded_submissions():
         assert b.accept_submission(req).accepted is True
 
     b._seal_flag.set()
-    b.seal_batch()
+    batch, _ = b.seal_batch()
 
-    rewarded = b.valid_submissions()
-    assert len(rewarded) == B_BATCH
-    for sub in rewarded:
+    selected_prompts = {s.prompt_idx for s in batch}
+    runner_submissions = [
+        s for s in b.valid_submissions() if s.prompt_idx not in selected_prompts
+    ]
+    assert runner_submissions
+    for sub in runner_submissions:
         assert len(sub.rollout_hashes) == M_ROLLOUTS
         for h in sub.rollout_hashes:
             assert h in hs
-    rewarded_prompts = {s.prompt_idx for s in rewarded}
-    losers = [
-        p for p in b.pending_submissions() if p.prompt_idx not in rewarded_prompts
-    ]
-    assert losers
-    for pending in losers:
-        for token_list in (r.commit["tokens"] for r in pending.request.rollouts):
-            assert compute_rollout_hash(token_list) not in hs
+
+
+def test_seal_extension_disabled_when_no_chain_info():
+    """When ``_drand_chain_info`` isn't set (synchronous test path with the
+    drand check disabled) the delayed seal coroutine can't compute when
+    the drand round ends, so it fires immediately. This preserves the
+    pre-v2.3 timing for legacy tests that exercise the seal flow without
+    drand setup."""
+    import asyncio
+    b = _make_batcher()
+    # Force loop capture by accessing seal_event from this coroutine
+    # context — _make_batcher itself doesn't access seal_event so _loop
+    # remains None until we touch it here.
+    _ = b.seal_event  # binds _loop
+
+    async def _run():
+        b.current_checkpoint_hash = ""
+        for i in range(B_BATCH):
+            req = _request_v21(prompt_idx=i, hotkey=f"hk{i}", checkpoint_hash="")
+            req.drand_round = 100
+            b.accept_submission(req)
+        # Without chain_info, the delayed coroutine fires seal immediately
+        # on the next loop tick.
+        await asyncio.wait_for(b.seal_event.wait(), timeout=0.5)
+        assert b._seal_flag.is_set()
+
+    asyncio.run(_run())
+
+
+def test_seal_extension_waits_for_queue_drain():
+    """The delayed seal coroutine must wait for the submit queue to
+    finish draining before firing — otherwise GRAIL-pending trigger-
+    round submissions get dropped at the worker's ``is_sealed`` check
+    the instant the seal fires.
+
+    Pin: with a chain_info that puts us 0.05 s past the drand boundary
+    immediately AND a queue_drained_predicate that returns False the
+    first N calls, the seal must NOT fire until the predicate flips to
+    True.
+    """
+    import asyncio
+
+    poll_calls = [0]
+
+    def fake_queue_predicate():
+        poll_calls[0] += 1
+        # Pretend the queue is "draining" for the first 3 polls, then
+        # empty. Each poll happens ~0.2 s apart in the coroutine.
+        return poll_calls[0] > 3
+
+    async def _run():
+        # Use a chain_info whose boundary is essentially now (so phase 1
+        # of _delayed_seal_at_drand_boundary is a no-op): genesis at
+        # wall_clock and period = 1 ms means we're always at a boundary.
+        b = _make_batcher(
+            wall_clock_fn=lambda: 1000.0,  # fixed time
+            drand_chain_info={"genesis_time": 1000, "period": 1},
+            queue_drained_predicate=fake_queue_predicate,
+        )
+        _ = b.seal_event  # bind _loop
+        b.current_checkpoint_hash = ""
+        for i in range(B_BATCH):
+            req = _request_v21(prompt_idx=i, hotkey=f"hk{i}", checkpoint_hash="")
+            req.drand_round = 100
+            b.accept_submission(req)
+        # The coroutine has been scheduled by accept_submission. Now we
+        # wait for the seal — should take ~0.6 s (3 poll calls × 0.2 s
+        # each + a tiny margin).
+        await asyncio.wait_for(b.seal_event.wait(), timeout=2.0)
+        assert b._seal_flag.is_set()
+        # Predicate was actually polled multiple times before flipping.
+        assert poll_calls[0] >= 4
+
+    asyncio.run(_run())
+
+
+def test_seal_extension_queue_drain_timeout(monkeypatch):
+    """A never-empty queue must not keep the seal extension alive forever."""
+    import asyncio
+    import reliquary.validator.batcher as batcher_mod
+
+    now = [0.0]
+
+    def advancing_time():
+        now[0] += 0.01
+        return now[0]
+
+    monkeypatch.setattr(
+        batcher_mod, "MAX_SEAL_QUEUE_DRAIN_SECONDS", 0.0,
+    )
+
+    async def _run():
+        b = _make_batcher(
+            time_fn=advancing_time,
+            queue_drained_predicate=lambda: False,
+        )
+        _ = b.seal_event
+        await asyncio.wait_for(
+            b._delayed_seal_at_drand_boundary(), timeout=0.5,
+        )
+        assert b._seal_flag.is_set()
+
+    asyncio.run(_run())
+
+
+def test_seal_extension_no_early_fire_on_late_drand_submission():
+    """Regression pin: when a submission with drand_round > trigger
+    arrives at ``_accept_locked`` (worker dequeued it before HTTP
+    cheap-reject caught it), it must be rejected as BATCH_FILLED
+    WITHOUT firing the seal. Firing the seal at this point would make
+    the worker drop any remaining trigger-round items still in the
+    queue at its ``is_sealed`` gate, defeating the boundary fair-split.
+    """
+    b = _make_batcher()
+    b.current_checkpoint_hash = ""
+    # Trigger the seal round at 100 (8 distinct).
+    for i in range(B_BATCH):
+        req = _request_v21(prompt_idx=i, hotkey=f"hk{i}", checkpoint_hash="")
+        req.drand_round = 100
+        b.accept_submission(req)
+    assert b._seal_trigger_round == 100
+    # If queue_drained_predicate is None (test default), the seal fires
+    # immediately on the next loop tick — but here we're synchronous
+    # and never started a loop, so _loop is None and the immediate-seal
+    # fallback fired inside accept_submission already. The previous test
+    # covers that path; here we explicitly reset to test the late-drand
+    # case without it being masked by the immediate-seal fallback.
+    b._seal_flag.clear()
+
+    # Now a worker-dequeued submission from round 101 arrives directly
+    # in _accept_locked (bypassing HTTP cheap-reject for the test).
+    late = _request_v21(prompt_idx=99, hotkey="hk_late", checkpoint_hash="")
+    late.drand_round = 101
+    resp = b.accept_submission(late)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BATCH_FILLED
+    # CRITICAL: seal must NOT have fired from this path.
+    assert not b._seal_flag.is_set(), (
+        "late-drand item in worker path must reject without firing seal; "
+        "otherwise queued trigger-round items get dropped at is_sealed"
+    )
 
 
 def test_batcher_beacon_invalid_defaults_false():
@@ -2163,8 +2375,9 @@ def test_reject_boxed_answer_tampered():
     req.rollouts[0].commit = commit
     req.rollouts[0].tokens = commit["tokens"]
 
-    assert _prove_one(b, req) is None
-    assert b.reject_counts[RejectReason.BOXED_ANSWER_TAMPERED.value] == 1
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BOXED_ANSWER_TAMPERED
 
 
 def test_reject_forced_rollout_with_noncanonical_force_span(monkeypatch):
@@ -2216,8 +2429,9 @@ def test_reject_forced_rollout_with_noncanonical_force_span(monkeypatch):
     req.rollouts[0].commit = commit
     req.rollouts[0].tokens = commit["tokens"]
 
-    assert _prove_one(b, req) is None
-    assert b.reject_counts[RejectReason.TOKEN_TAMPERED.value] == 1
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.TOKEN_TAMPERED
 
 
 def test_accept_boxed_answer_high_prob():
@@ -2249,10 +2463,8 @@ def test_accept_boxed_answer_high_prob():
         req.rollouts[idx].commit = commit
         req.rollouts[idx].tokens = commit["tokens"]
 
-    # Negative control: the boxed-tamper gate runs in the proof phase and must
-    # NOT fire on an honest group.
-    assert _prove_one(b, req) is not None
-    assert RejectReason.BOXED_ANSWER_TAMPERED.value not in b.reject_counts
+    resp = b.accept_submission(req)
+    assert resp.reason != RejectReason.BOXED_ANSWER_TAMPERED
 
 
 def test_all_token_auth_shadow_records_without_rejecting(monkeypatch, tmp_path):
@@ -2318,9 +2530,10 @@ def test_all_token_auth_shadow_records_without_rejecting(monkeypatch, tmp_path):
     )
     req = _request()
 
-    sub = _prove_one(b, req)
+    resp = b.accept_submission(req)
 
-    assert sub is not None
+    assert resp.accepted is True
+    sub = b.valid_submissions()[0]
     assert sub.all_token_auth_shadow_findings == M_ROLLOUTS * 2
     assert sub.all_token_auth_shadow_min_prob == pytest.approx(4.0e-7)
     assert sub.all_token_auth_shadow_positive_findings == 4 * 2
@@ -2364,8 +2577,10 @@ def test_all_token_auth_enforce_rejects(monkeypatch):
     )
     req = _request()
 
-    assert _prove_one(b, req) is None
-    assert b.reject_counts[RejectReason.TOKEN_TAMPERED.value] == 1
+    resp = b.accept_submission(req)
+
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.TOKEN_TAMPERED
 
 
 def test_opencode_semantic_auth_shadow_records_without_rejecting(
@@ -2422,9 +2637,10 @@ def test_opencode_semantic_auth_shadow_records_without_rejecting(
         rollout.tokens = commit["tokens"]
         rollout.env_name = "opencodeinstruct"
 
-    sub = _prove_one(b, req)
+    resp = b.accept_submission(req)
 
-    assert sub is not None
+    assert resp.accepted is True
+    sub = b.valid_submissions()[0]
     assert sub.code_semantic_auth_findings == M_ROLLOUTS
     assert sub.code_semantic_auth_min_prob == pytest.approx(2.0e-4)
     assert sub.code_semantic_auth_positive_findings == 4
@@ -2513,8 +2729,9 @@ def test_opencode_semantic_auth_records_counterfactual_reward_flip(
         rollout.tokens = commit["tokens"]
         rollout.env_name = "opencodeinstruct"
 
-    assert _prove_one(b, req) is not None
+    resp = b.accept_submission(req)
 
+    assert resp.accepted is True
     records = [json.loads(line) for line in forensics_path.read_text().splitlines()]
     assert len(records) == M_ROLLOUTS
     first = records[0]
@@ -2561,9 +2778,10 @@ def test_opencode_semantic_auth_enforce_ignores_zero_reward_rollout(monkeypatch)
             rollout.tokens[0] = 4242
             rollout.commit["tokens"][0] = 4242
 
-    sub = _prove_one(b, req)
+    resp = b.accept_submission(req)
 
-    assert sub is not None
+    assert resp.accepted is True
+    sub = b.valid_submissions()[0]
     assert sub.code_semantic_auth_findings == 1
     assert sub.code_semantic_auth_min_prob == pytest.approx(2.0e-4)
     assert sub.code_semantic_auth_positive_findings == 0
@@ -2606,8 +2824,10 @@ def test_opencode_semantic_auth_enforce_rejects_positive_reward_rollout(
     req.rollouts[0].tokens[0] = 4242
     req.rollouts[0].commit["tokens"][0] = 4242
 
-    assert _prove_one(b, req) is None
-    assert b.reject_counts[RejectReason.TOKEN_TAMPERED.value] == 1
+    resp = b.accept_submission(req)
+
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.TOKEN_TAMPERED
 
 
 def test_cap_truncated_rollout_still_runs_behavioural_checks():
@@ -2656,8 +2876,9 @@ def test_cap_truncated_rollout_still_runs_behavioural_checks():
     req.rollouts[0].commit = commit
     req.rollouts[0].tokens = commit["tokens"]
 
-    assert _prove_one(b, req) is None
-    assert b.reject_counts[RejectReason.BOXED_ANSWER_TAMPERED.value] == 1
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BOXED_ANSWER_TAMPERED
 
 
 def test_reject_malformed_final_answer_before_grail():
@@ -2793,9 +3014,9 @@ def test_forced_seed_group_gate_rejects_below_floor_when_enforcing(monkeypatch):
     )
     b.current_checkpoint_hash = "sha256:test"   # pinned -> seed enforcement active
     req = _request(rewards=[1.0] * 4 + [0.0] * 4)
-
-    assert _prove_one(b, req) is None
-    assert b.reject_counts[RejectReason.SEED_MISMATCH.value] == 1
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.SEED_MISMATCH
     assert len(b.valid_submissions()) == 0
 
 
@@ -2814,9 +3035,9 @@ def test_forced_seed_gate_abstains_when_checkpoint_hash_unpinned(monkeypatch):
     )
     b.current_checkpoint_hash = ""              # not yet published -> not pinned
     req = _request(rewards=[1.0] * 4 + [0.0] * 4)
-
-    assert _prove_one(b, req) is not None
-    assert RejectReason.SEED_MISMATCH.value not in b.reject_counts
+    resp = b.accept_submission(req)
+    assert resp.reason != RejectReason.SEED_MISMATCH
+    assert resp.accepted is True
 
 
 def test_forced_seed_group_gate_shadow_when_not_enforcing(monkeypatch):
@@ -2830,10 +3051,9 @@ def test_forced_seed_group_gate_shadow_when_not_enforcing(monkeypatch):
         verify_commitment_proofs_fn=_grail_with_seed_counts(n_stoch=10, n_match=1),
     )
     req = _request(rewards=[1.0] * 4 + [0.0] * 4)
-
-    assert b.accept_submission(req).accepted is True
-    b.seal_batch()
-    assert RejectReason.SEED_MISMATCH.value not in b.reject_counts
+    resp = b.accept_submission(req)
+    assert resp.reason != RejectReason.SEED_MISMATCH
+    assert resp.accepted is True
     assert len(b.valid_submissions()) == 1
 
 
@@ -2873,9 +3093,12 @@ def test_forced_seed_cdf_gate_rejects_sparse_branch_mismatch(monkeypatch):
     )
     b.current_checkpoint_hash = "sha256:test"
 
-    assert _prove_one(b, _request(rewards=[1.0] * 4 + [0.0] * 4)) is None
+    response = b.accept_submission(
+        _request(rewards=[1.0] * 4 + [0.0] * 4),
+    )
 
-    assert b.reject_counts[RejectReason.SEED_MISMATCH.value] == 1
+    assert response.reason == RejectReason.SEED_MISMATCH
+    assert not response.accepted
     assert len(recorded) == 1
     assert recorded[0][1]["cdf_would_reject"] is True
     assert recorded[0][1]["cdf_enforced"] is True
@@ -2900,56 +3123,3 @@ def test_forced_seed_cdf_gate_is_shadow_until_calibrated(monkeypatch):
     )
 
     assert response.accepted
-
-
-# --- difficulty auction (shadow) ---
-
-def test_seal_batch_exposes_shadow_auction_without_changing_production():
-    """The auction ships DARK. seal_batch records the batch the difficulty
-    auction would have picked, while production still pays drand-FCFS.
-
-    Arming is blocked on the free-negative measurement (M5): paying the most for
-    a low-k group also pays the most for a FALSE negative. Until that is
-    measured, we only observe.
-    """
-    b = _make_batcher()
-    # k=6 is easy (low value), k=2 is hard (the peak of v(k)) — real reward
-    # vectors, so the score is the one the validator computes.
-    assert b.accept_submission(_request(
-        prompt_idx=7, hotkey="fast_easy", rewards=[1.0] * 6 + [0.0] * 2,
-    )).accepted
-    assert b.accept_submission(_request(
-        prompt_idx=42, hotkey="slow_hard", rewards=[1.0] * 2 + [0.0] * 6,
-    )).accepted
-
-    # Stamp the rounds on the PENDING pool — seal proves those into _valid.
-    fast_easy, slow_hard = b.pending_submissions()
-    fast_easy.drand_round = 1   # arrived first, easy
-    slow_hard.drand_round = 9   # arrived late,  hard
-    assert slow_hard.value > fast_easy.value
-
-    batch, rewards = b.seal_batch()
-
-    # Production is untouched: the fastest submission still leads the batch.
-    assert [s.hotkey for s in batch] == ["fast_easy", "slow_hard"]
-    assert rewards["fast_easy"] == rewards["slow_hard"]
-
-    # The shadow inverts it: the hard prompt outranks the fast one.
-    shadow = b.shadow_auction
-    assert [e["hotkey"] for e in shadow["batch"]] == ["slow_hard", "fast_easy"]
-    assert shadow["batch"][0]["value"] == pytest.approx(slow_hard.value)
-
-
-def test_shadow_auction_drops_unanimous_groups():
-    """value == 0 (k=0 or k=8) means no gradient at all — the auction's
-    replacement for the SIGMA_MIN gate.
-
-    A real unanimous group is rejected OUT_OF_ZONE at admission, so the zero
-    value is injected on the proven submission to exercise the auction's filter
-    directly."""
-    b = _make_batcher()
-    assert b.accept_submission(_request(prompt_idx=7, hotkey="unanimous")).accepted
-    b.seal_batch()
-    b._valid[0].value = 0.0
-
-    assert b._compute_shadow_auction(pool=1.0)["batch"] == []

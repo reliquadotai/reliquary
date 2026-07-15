@@ -19,6 +19,7 @@ from unittest.mock import MagicMock
 
 from fastapi.testclient import TestClient
 
+from reliquary.constants import MAX_SUBMISSIONS_PER_PROMPT
 from reliquary.protocol.submission import (
     BatchSubmissionResponse, RejectReason, WindowState,
 )
@@ -121,7 +122,7 @@ def _setup(*,
     return s, batcher
 
 
-class _GradingBudgetFullBatcher:
+class _ProofAdmissionFullBatcher:
     window_start = 500
     current_checkpoint_hash = "sha256:current"
     cooldown_prompts_snapshot: list[int] = []
@@ -129,7 +130,7 @@ class _GradingBudgetFullBatcher:
     _seal_trigger_round = 123
     drand_round_check_enabled = False
     proof_admission_count = 32
-    proof_grading_attempts = 96
+    post_trigger_proof_admission_count = 8
 
     class _Env:
         def __len__(self):
@@ -144,11 +145,11 @@ class _GradingBudgetFullBatcher:
     def prompt_submission_count(self, prompt_idx: int) -> int:
         return 0
 
-    def grading_budget_exhausted(self) -> bool:
-        return True
+    def try_reserve_proof_admission(self, request):
+        return False, "proof_admission_window_full"
 
     def accept_submission(self, request, *, telemetry=None):  # pragma: no cover
-        raise AssertionError("grading-budget reject must happen pre-queue")
+        raise AssertionError("proof-admission reject must happen pre-queue")
 
 
 class _PreflightAdmissionBatcher:
@@ -159,7 +160,7 @@ class _PreflightAdmissionBatcher:
     _seal_trigger_round = None
     drand_round_check_enabled = False
     proof_admission_count = 0
-    proof_grading_attempts = 0
+    post_trigger_proof_admission_count = 0
     bootstrap = False
 
     class _Env:
@@ -194,9 +195,9 @@ class _PreflightAdmissionBatcher:
     def prompt_submission_count(self, prompt_idx: int) -> int:
         return 0
 
-    def grading_budget_exhausted(self) -> bool:
-        self.proof_admission_count += 1   # fake: "the request reached admission"
-        return False
+    def try_reserve_proof_admission(self, request):
+        self.proof_admission_count += 1
+        return True, None
 
     def accept_submission(self, request, *, telemetry=None):
         return BatchSubmissionResponse(
@@ -299,28 +300,28 @@ def test_drand_check_disabled_skips_gate():
     batcher.validate_drand_round.assert_not_called()
 
 
-def test_prompt_claimed_rejected_pre_queue():
-    s, _ = _setup(prompt_count=1)
+def test_prompt_full_rejected_pre_queue():
+    s, _ = _setup(prompt_count=MAX_SUBMISSIONS_PER_PROMPT)
     payload = _submission(prompt_idx=42)
-    _assert_pre_queue_reject(s, payload, RejectReason.PROMPT_CLAIMED)
+    _assert_pre_queue_reject(s, payload, RejectReason.PROMPT_FULL)
 
 
-def test_unclaimed_prompt_passes():
-    """No existing submission for the prompt; must queue normally."""
-    s, _ = _setup(prompt_count=0)
+def test_prompt_full_below_cap_passes():
+    """K_p < MAX is the common case; submission must queue normally."""
+    s, _ = _setup(prompt_count=MAX_SUBMISSIONS_PER_PROMPT - 1)
     payload = _submission(prompt_idx=42)
     with TestClient(s.app) as client:
         r = client.post("/submit", json=payload)
     assert r.json()["reason"] == RejectReason.ACCEPTED.value
 
 
-def test_grading_budget_full_rejected_pre_queue():
-    """When the window's grading budget is exhausted, /submit must reject before
+def test_proof_admission_full_rejected_pre_queue():
+    """When the global proof budget is exhausted, /submit must reject before
     queueing or running the batcher's expensive accept path.
     """
     s = ValidatorServer()
     s.set_current_state(WindowState.OPEN)
-    s.set_active_batcher(_GradingBudgetFullBatcher())
+    s.set_active_batcher(_ProofAdmissionFullBatcher())
     s._worker_task = object()
     payload = _submission_with_completion_tokens(
         list(range(4, 36)),
@@ -331,7 +332,7 @@ def test_grading_budget_full_rejected_pre_queue():
     _assert_pre_queue_reject(s, payload, RejectReason.BATCH_FILLED)
     verdicts = list(s._verdicts.get("hkA", []))
     assert verdicts
-    assert verdicts[-1]["reject_stage"] == "grading_budget"
+    assert verdicts[-1]["reject_stage"] == "proof_admission"
 
 
 def test_non_cap_non_eos_rejected_before_proof_admission():
@@ -687,7 +688,7 @@ def test_reject_order_matches_accept_locked():
     """When a submission trips multiple cheap checks at once, the handler
     must return the SAME reason the worker's _accept_locked would have
     returned. Order pinned: WRONG_CHECKPOINT > drand_round >
-    BAD_PROMPT_IDX > PROMPT_IN_COOLDOWN > PROMPT_CLAIMED."""
+    BAD_PROMPT_IDX > PROMPT_IN_COOLDOWN > PROMPT_FULL."""
     # WRONG_CHECKPOINT trips first even if drand_round + cooldown also fail.
     s, _ = _setup(
         current_checkpoint_hash="sha256:current",
@@ -855,19 +856,59 @@ def test_stalled_handler_does_not_reject_round_inside_arrival_window():
     assert body["reason"] != RejectReason.STALE_ROUND.value
 
 
-def test_late_submission_accepted_pre_queue_while_window_open():
-    """The window is time-boxed now: there is no early seal gate, so a later
-    drand_round submission is no longer rejected pre-queue as BATCH_FILLED —
-    it passes cheap-reject like any other while the window is open."""
-    s, _ = _setup(current_checkpoint_hash="sha256:current")
+def test_seal_extension_http_rejects_late_drand_pre_queue():
+    """When the batcher has captured a trigger drand round, HTTP
+    cheap-reject must reject any submission with
+    ``drand_round > trigger_round`` as BATCH_FILLED without queuing.
+    This is the v2.3 seal-extension gate: trigger-round stragglers are
+    still accepted (they feed the boundary fair-split), but later-drand
+    submissions are too late and don't deserve a worker dequeue."""
+    s, batcher = _setup(current_checkpoint_hash="sha256:current")
+    # Simulate the batcher having recorded a trigger drand round.
+    batcher._seal_trigger_round = 100
+    # A submission with drand_round = 101 — later than trigger — must
+    # be rejected at the HTTP cheap-reject layer.
     payload = _submission(drand_round=101)
+    _assert_pre_queue_reject(s, payload, RejectReason.BATCH_FILLED)
+
+
+def test_seal_extension_http_accepts_trigger_round_post_trigger():
+    """The complement to the previous test: after trigger is recorded,
+    submissions WITHIN the trigger drand round must still be accepted
+    by HTTP cheap-reject. This is what lets the boundary fair-split
+    accumulate > B candidates."""
+    s, batcher = _setup(current_checkpoint_hash="sha256:current")
+    batcher._seal_trigger_round = 100
+    # drand_round == trigger_round → passes the seal-extension gate.
+    # (The drand_check is disabled in _setup default, so the request
+    # doesn't get rejected for being older than current.)
+    payload = _submission(drand_round=100)
     with TestClient(s.app) as client:
         r = client.post("/submit", json=payload)
     body = r.json()
     assert body["accepted"] is True, (
-        f"late-drand submission must pass cheap-reject while open; got {body}"
+        f"trigger-round submission post-trigger must pass cheap-reject; got {body}"
     )
+    # Specifically not BATCH_FILLED — that's the false-positive we're
+    # guarding against.
     assert body.get("reason") != RejectReason.BATCH_FILLED.value
+
+
+def test_seal_extension_http_no_change_when_trigger_not_set():
+    """Pre-trigger (the common case during the bulk of a window),
+    ``batcher._seal_trigger_round is None`` and the new HTTP gate is
+    a no-op. Any drand_round value goes through (subject to the other
+    cheap-reject gates)."""
+    s, batcher = _setup(current_checkpoint_hash="sha256:current")
+    # Default _setup leaves _seal_trigger_round = None.
+    assert batcher._seal_trigger_round is None
+    payload = _submission(drand_round=12345)  # arbitrary, way "later"
+    with TestClient(s.app) as client:
+        r = client.post("/submit", json=payload)
+    body = r.json()
+    assert body["accepted"] is True, (
+        f"no-trigger submission must pass cheap-reject; got {body}"
+    )
 
 
 def test_cheap_reject_does_not_burn_rate_limit_budget():

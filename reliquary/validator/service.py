@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 from typing import Any
@@ -20,6 +21,10 @@ from reliquary.constants import (
     CHECKPOINT_STAGING_DIR_DEFAULT,
     DEFAULT_HF_REPO_ID,
     DRAND_ROUND_BACKWARD_TOLERANCE,
+    DIFFICULTY_AUCTION_DELTA,
+    DIFFICULTY_AUCTION_SHADOW_ENABLED,
+    DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS,
+    DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES,
     ENVIRONMENT_MIX,
     FORCED_SEED_CDF_BOUNDARY_EPSILON,
     FORCED_SEED_CDF_ENFORCE,
@@ -38,14 +43,20 @@ from reliquary.constants import (
     MIN_EOS_PROBABILITY,
     POLL_INTERVAL_SECONDS,
     PPO_CLIP_EPSILON,
+    MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
+    MAX_SEAL_QUEUE_DRAIN_SECONDS,
+    PROOF_ADMISSION_STALL_POLL_SECONDS,
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
     REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS,
+    SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS,
+    SPARSE_VALID_IDLE_SEAL_SECONDS,
+    SPARSE_VALID_MAX_WINDOW_SECONDS,
     SIGMA_MIN,
     SUBNET_START_BLOCK,
     VALIDATOR_HTTP_PORT,
     WANDB_TRAINING_VERSION,
-    WINDOW_COLLECTION_SECONDS,
     WINDOW_LENGTH,
+    WINDOW_TIMEOUT_SECONDS,
 )
 from reliquary.environment import load_environments
 from reliquary.environment.base import Environment
@@ -173,9 +184,11 @@ def open_grpo_window(
     across windows. Each window's sealed batch updates it via
     ``GrpoWindowBatcher.seal_batch``.
 
-    ``queue_drained_predicate`` is vestigial: the window now seals on the
-    fixed collection deadline, so the batcher no longer polls it. Retained so
-    the ``Service.run`` wiring and tests can keep passing it unchanged.
+    ``queue_drained_predicate`` is wired by ``Service.run`` to the
+    server's submit-queue ``empty()`` check so the v2.3 seal extension
+    can wait for every queued trigger-round submission to be GRAIL-
+    validated before firing the seal. See
+    ``GrpoWindowBatcher._delayed_seal_at_drand_boundary``.
     """
     def _completion_text(rollout: RolloutSubmission) -> str:
         prompt_len = rollout.commit.get("rollout", {}).get("prompt_length", 0)
@@ -651,47 +664,175 @@ class ValidationService:
         finally:
             await chain.close_subtensor(subtensor)
 
+    def _proof_admission_exhausted_and_drained(self, batcher) -> bool:
+        """True when bounded proof admission cannot fill this window anymore.
+
+        Gated on the grading-attempts ceiling, not the GRAIL candidate budget:
+        out_of_zone rejects refund the latter, so for a degenerate-reward env
+        it never reaches its cap — the real "can't fill anymore" signal is the
+        never-refunded grading ceiling.
+        """
+        if batcher is None or batcher.is_sealed():
+            return False
+        distinct_valid = self._distinct_valid_prompt_count(batcher)
+        if distinct_valid >= B_BATCH:
+            return False
+        if (
+            getattr(batcher, "proof_grading_attempts", 0)
+            < MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+        ):
+            return False
+        queue_depth = int(getattr(self.server, "submit_queue_depth", 0) or 0)
+        inflight = int(getattr(self.server, "proof_verification_inflight", 0) or 0)
+        return queue_depth == 0 and inflight == 0
+
+    def _distinct_valid_prompt_count(self, batcher) -> int:
+        """Best-effort distinct prompt count for liveness decisions."""
+        counter = getattr(batcher, "distinct_valid_prompt_count", None)
+        if callable(counter):
+            return int(counter())
+        return int(getattr(batcher, "valid_count", 0) or 0)
+
+    def _duplicate_prompt_shortfall_drained(self, batcher) -> bool:
+        """True when duplicates filled raw submissions but not trainable slots."""
+        if batcher is None or batcher.is_sealed():
+            return False
+        if getattr(batcher, "_seal_trigger_round", None) is not None:
+            return False
+        valid_count = int(getattr(batcher, "valid_count", 0) or 0)
+        distinct_valid = self._distinct_valid_prompt_count(batcher)
+        if valid_count < B_BATCH or distinct_valid >= B_BATCH:
+            return False
+        queue_depth = int(getattr(self.server, "submit_queue_depth", 0) or 0)
+        inflight = int(getattr(self.server, "proof_verification_inflight", 0) or 0)
+        return queue_depth == 0 and inflight == 0
+
     def _queue_and_proofs_drained(self) -> bool:
         queue_depth = int(getattr(self.server, "submit_queue_depth", 0) or 0)
         inflight = int(getattr(self.server, "proof_verification_inflight", 0) or 0)
         return queue_depth == 0 and inflight == 0
 
-    def _seconds_to_seal_deadline(self, batcher) -> float:
-        """Seconds until this batcher hits the collection deadline (may be <=0)."""
+    def _seconds_since_last_valid_submission(self, batcher) -> float | None:
+        counter = getattr(batcher, "seconds_since_last_valid_submission", None)
+        if callable(counter):
+            return counter()
+        return None
+
+    def _window_open_age_seconds(self, batcher) -> float | None:
         opened_at = getattr(batcher, "window_opened_at", None)
         time_fn = getattr(batcher, "_time_fn", None)
         if opened_at is None or not callable(time_fn):
-            return 0.0
-        return WINDOW_COLLECTION_SECONDS - (float(time_fn()) - float(opened_at))
+            return None
+        return max(0.0, float(time_fn()) - float(opened_at))
+
+    def _sparse_valid_liveness_reason(self, batcher) -> str | None:
+        """Return force-seal reason for sparse valid windows, if any.
+
+        This is a cadence guard, not a quality gate. It only fires when the
+        validator has fewer than B distinct trainable prompts, no queued or
+        in-flight proof work, and either no valid progress for the sparse idle
+        threshold or an overlong sparse window. Zero-valid windows are included
+        only for the max-age path so a hard reset with stale miners cannot
+        freeze checkpoint progress indefinitely.
+        """
+        if batcher is None or batcher.is_sealed():
+            return None
+        if getattr(batcher, "_seal_trigger_round", None) is not None:
+            return None
+        valid_count = int(getattr(batcher, "valid_count", 0) or 0)
+        distinct_valid = self._distinct_valid_prompt_count(batcher)
+        if distinct_valid >= B_BATCH:
+            return None
+        if not self._queue_and_proofs_drained():
+            return None
+
+        idle_s = self._seconds_since_last_valid_submission(batcher)
+        age_s = self._window_open_age_seconds(batcher)
+        if valid_count <= 0:
+            if age_s is not None and age_s >= SPARSE_VALID_MAX_WINDOW_SECONDS:
+                return "zero_valid_window_timeout"
+            return None
+        if (
+            distinct_valid >= SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS
+            and idle_s is not None
+            and idle_s >= SPARSE_VALID_IDLE_SEAL_SECONDS
+        ):
+            return "sparse_valid_idle_timeout"
+        if age_s is not None and age_s >= SPARSE_VALID_MAX_WINDOW_SECONDS:
+            return "sparse_valid_window_timeout"
+        return None
+
+    def _force_seal_dead_batcher(self, batcher, dup_since: dict) -> str | None:
+        """Force-seal one batcher if its own liveness breaker fires; else None.
+
+        Per-env so a fast env never seals a slower one short.
+        """
+        env = getattr(getattr(batcher, "env", None), "name", "?")
+        if self._proof_admission_exhausted_and_drained(batcher):
+            reason = "proof_admission_exhausted_drained"
+        elif self._duplicate_prompt_shortfall_drained(batcher):
+            now = asyncio.get_running_loop().time()
+            if now - dup_since.setdefault(env, now) < MAX_SEAL_QUEUE_DRAIN_SECONDS:
+                return None
+            reason = "duplicate_prompt_distinct_shortfall_drained"
+        else:
+            dup_since.pop(env, None)
+            reason = self._sparse_valid_liveness_reason(batcher)
+        if reason is None:
+            return None
+        logger.warning(
+            "Window %d env=%s force-sealing partial: reason=%s valid=%d/%d "
+            "distinct=%d/%d idle_s=%s age_s=%s",
+            self._window_n, env, reason,
+            getattr(batcher, "valid_count", 0), B_BATCH,
+            self._distinct_valid_prompt_count(batcher), B_BATCH,
+            self._seconds_since_last_valid_submission(batcher),
+            self._window_open_age_seconds(batcher),
+        )
+        batcher.force_seal(reason)
+        return reason
 
     async def _wait_for_window_seal(self) -> str:
-        """Hold every active env's batcher open until the fixed collection
-        deadline, then seal them all.
+        """Wait until every active env's batcher seals.
 
-        The window stays open the full ``WINDOW_COLLECTION_SECONDS`` and
-        accepts everything; an early seal would be the speed race we removed —
-        a fast miner on an easy prompt cutting off slow-but-hard submissions
-        still generating. A fixed deadline is the unconditional answer to
-        "when do we stop waiting?", so the old sparse-window liveness breakers
-        are gone. Under-filled windows still seal here; their unused slots burn
-        (the training path already skips partial batches).
+        Each batcher seals independently — via its own BATCH_FILLED fill or
+        its own liveness breaker — so a fast env never cuts a slower one
+        short. The window advances only once all are sealed (or the global
+        timeout). Training still requires all envs full (see ``trained``).
         """
         batchers = list(self._active_batchers.values())
         if not batchers:
             return "no_active_batcher"
 
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + WINDOW_TIMEOUT_SECONDS
+        dup_since: dict[str, float] = {}
+        reasons: dict[str, str] = {}
         while True:
             for b in batchers:
-                b.poll_deadline()
+                if b.is_sealed():
+                    continue
+                r = self._force_seal_dead_batcher(b, dup_since)
+                if r is not None:
+                    reasons[getattr(getattr(b, "env", None), "name", "?")] = r
+
             if all(b.is_sealed() for b in batchers):
-                return "sealed"
-            # Sleep to the soonest un-sealed deadline, then re-poll and seal.
-            remaining = min(
-                self._seconds_to_seal_deadline(b)
-                for b in batchers
-                if not b.is_sealed()
-            )
-            await asyncio.sleep(max(0.0, min(remaining, POLL_INTERVAL_SECONDS)))
+                break
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                for b in batchers:
+                    if not b.is_sealed():
+                        b.force_seal("timeout")
+                return "timeout"
+
+            await asyncio.sleep(min(PROOF_ADMISSION_STALL_POLL_SECONDS, remaining))
+
+        if not reasons:
+            return "sealed"
+        if len(reasons) == 1:
+            return next(iter(reasons.values()))
+        return ",".join(f"{e}={r}" for e, r in reasons.items())
 
     async def _set_window_randomness(self, subtensor) -> None:
         """Populate all active batchers' per-window randomness seed.
@@ -880,14 +1021,10 @@ class ValidationService:
         # count, as GRAD_ACCUM_STEPS already does) so every validator uses the
         # same pool and an env a validator does not run burns its share.
         pool_per_env = 1.0 / len(self.env_mix)
-        # seal_batch now runs the GRAIL GPU proofs (up to ~18 forward passes at
-        # 5-25s each), so offload each batcher to a thread to keep the event
-        # loop responsive (/state, /health, submit and archive workers). Awaited
-        # sequentially in dict order so the deterministic fold into combined
-        # rewards, window_batches and archives is byte-for-byte unchanged.
-        sealed: dict[str, tuple] = {}
-        for name, b in self._active_batchers.items():
-            sealed[name] = await asyncio.to_thread(b.seal_batch, pool=pool_per_env)
+        sealed: dict[str, tuple] = {
+            name: b.seal_batch(pool=pool_per_env)
+            for name, b in self._active_batchers.items()
+        }
         for name, (batch, rewards) in sealed.items():
             self._active_batchers[name].rewards_by_hotkey = rewards
 
@@ -1235,8 +1372,31 @@ class ValidationService:
         def _submission_obs_payload(s, batcher, *, rejected: bool = False):
             selection_meta = getattr(batcher, "selection_metadata_by_id", {})
             meta = selection_meta.get(id(s), {})
+            difficulty_by_id = getattr(
+                batcher, "difficulty_auction_metadata_by_id", {}
+            )
+            difficulty_meta = (
+                difficulty_by_id.get(id(s), {})
+                if isinstance(difficulty_by_id, dict)
+                else {}
+            )
+            arrival_ts = getattr(s, "arrival_ts", None)
+            window_opened_wall_ts = getattr(
+                batcher, "window_opened_wall_ts", None
+            )
+            arrival_age_seconds = None
+            if arrival_ts is not None and window_opened_wall_ts is not None:
+                try:
+                    candidate_age = float(arrival_ts) - float(
+                        window_opened_wall_ts
+                    )
+                except (TypeError, ValueError):
+                    candidate_age = float("nan")
+                if math.isfinite(candidate_age) and candidate_age >= 0.0:
+                    arrival_age_seconds = candidate_age
             return {
-                "arrival_ts": getattr(s, "arrival_ts", None),
+                "arrival_ts": arrival_ts,
+                "arrival_age_seconds": arrival_age_seconds,
                 "decision_ts": getattr(s, "decision_ts", None),
                 "submitted_drand_round": getattr(
                     s, "submitted_drand_round", getattr(s, "drand_round", None)
@@ -1263,6 +1423,31 @@ class ValidationService:
                 "reward_vector": getattr(s, "reward_vector", None),
                 "truncated_count": getattr(s, "truncated_count", None),
                 "reward_shape": getattr(s, "reward_shape", None),
+                "difficulty_auction_value": difficulty_meta.get("value"),
+                "difficulty_auction_mean_reward": difficulty_meta.get(
+                    "mean_reward"
+                ),
+                "difficulty_auction_reward_std": difficulty_meta.get(
+                    "reward_std"
+                ),
+                "difficulty_auction_reward_count": difficulty_meta.get(
+                    "reward_count"
+                ),
+                "difficulty_auction_eligible": difficulty_meta.get("eligible"),
+                "difficulty_auction_rank": difficulty_meta.get("rank"),
+                "difficulty_auction_selected": difficulty_meta.get(
+                    "shadow_selected"
+                ),
+            }
+
+        def _difficulty_shadow_payload(batcher):
+            payload = getattr(batcher, "difficulty_auction_shadow", None)
+            if isinstance(payload, dict):
+                return payload
+            return {
+                "schema_version": 1,
+                "status": "unavailable",
+                "mode": "observation_only",
             }
 
         def _rollout_payload(s, with_text: bool):
@@ -1484,11 +1669,19 @@ class ValidationService:
             "environment": env_names_list[0],   # legacy singular, kept for compat
             "environments": env_names_list,      # multi-env canonical field
             "force_seal_reason": getattr(first_batcher, "force_seal_reason", None),
+            "window_opened_wall_ts_by_environment": {
+                env_name: getattr(env_batcher, "window_opened_wall_ts", None)
+                for env_name, env_batcher in batcher_dict.items()
+            },
             "batch": batch_entries,
             "runners_up": runners_up,
             "reject_summary": combined_reject_counts,
             "server_reject_summary": server_reject_summary,
             "logical_group_dedup": logical_group_dedup,
+            "difficulty_auction_shadow": {
+                env_name: _difficulty_shadow_payload(env_batcher)
+                for env_name, env_batcher in batcher_dict.items()
+            },
             "grader_failures": dict(getattr(self, "_grader_failures", {})),
             "rejected": rejected_entries,
             "training_quarantine": getattr(
@@ -1501,17 +1694,6 @@ class ValidationService:
                 "training_accumulator",
                 {"schema_version": 1, "trained": False},
             ),
-            # Difficulty auction, SHADOW: per env, the batch the auction would
-            # have selected (hardest first, speed only breaking ties) had it been
-            # armed. Production above is still drand-FCFS. Archived so the two
-            # selections can be compared on live traffic before arming — does the
-            # auction batch actually skew harder, and does one coldkey dominate
-            # the ranking? Arming is gated on the free-negative measurement (M5).
-            # See docs/superpowers/specs/2026-07-14-difficulty-auction-design.md
-            "shadow_auction": {
-                env_name: getattr(b, "shadow_auction", {})
-                for env_name, b in self._active_batchers.items()
-            },
             # v2.3: per-hotkey emission share from select_batch_and_distribute.
             # All miners whose prompt landed in the winning set appear here,
             # even if their specific submission wasn't picked for training.
@@ -1579,6 +1761,16 @@ class ValidationService:
                     FORCED_SEED_CDF_BOUNDARY_EPSILON
                 ),
                 "legacy_merkle_root_enforce": LEGACY_MERKLE_ROOT_ENFORCE,
+                "difficulty_auction_shadow_enabled": (
+                    DIFFICULTY_AUCTION_SHADOW_ENABLED
+                ),
+                "difficulty_auction_shadow_environments": list(
+                    DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS
+                ),
+                "difficulty_auction_shadow_delta": DIFFICULTY_AUCTION_DELTA,
+                "difficulty_auction_shadow_max_candidates": (
+                    DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES
+                ),
                 "logprob_is_eps": LOGPROB_IS_EPS,
                 "r2_bucket": os.getenv("R2_BUCKET_ID", "reliquary"),
                 "http_host": self.server.host,
@@ -1639,12 +1831,17 @@ class ValidationService:
                     seal_reason = await self._wait_for_window_seal()
                     if seal_reason == "sealed":
                         logger.info(
-                            "Window %d: all %d batcher(s) sealed at deadline",
+                            "Window %d: all %d batcher(s) sealed",
                             self._window_n, len(self._active_batchers),
+                        )
+                    elif seal_reason == "timeout":
+                        logger.warning(
+                            "Window %d timed out at %ds — sealing partial",
+                            self._window_n, WINDOW_TIMEOUT_SECONDS,
                         )
                     else:
                         logger.warning(
-                            "Window %d sealed: %s",
+                            "Window %d sealed by liveness breaker: %s",
                             self._window_n, seal_reason,
                         )
 

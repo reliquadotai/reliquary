@@ -16,7 +16,6 @@ This file initially holds the Task-4-level tests pinning the new
 from __future__ import annotations
 
 import asyncio
-import threading
 import time
 from unittest.mock import MagicMock, patch
 
@@ -252,58 +251,3 @@ async def test_train_and_publish_skips_when_beacon_invalid(monkeypatch):
 
     assert seal_called.call_count == 0, "seal_batch should not run for an invalidated window"
     assert archive_called.call_count == 0, "_archive_window should not run for an invalidated window"
-
-
-@pytest.mark.asyncio
-async def test_seal_batch_runs_off_the_event_loop():
-    """Regression (F1): seal_batch now runs the GRAIL GPU proofs — up to ~18
-    forward passes at 5-25s each. It must be offloaded to a worker thread, not
-    run inline on the event loop, or /state, /health, the submit worker and the
-    archive worker stall for the whole seal every window.
-
-    Smallest offload pin (this is asyncio + threads, so a full-lifecycle
-    behavioural test is impractical): seal_batch executes on a thread other than
-    the loop's, AND a concurrent coroutine keeps ticking while it blocks. The
-    stub aborts right after seal to skip the heavy post-seal machinery.
-    """
-    loop_thread = threading.current_thread()
-    ticks: list[int] = []
-    captured: dict[str, object] = {}
-
-    class _StopAfterSeal(Exception):
-        pass
-
-    class _B:
-        beacon_invalid = False
-        rewards_by_hotkey = None
-
-        def seal_batch(self, pool):
-            captured["thread"] = threading.current_thread()
-            captured["ticks_before"] = len(ticks)
-            time.sleep(0.3)  # stand in for the long GRAIL proof
-            captured["ticks_after"] = len(ticks)
-            raise _StopAfterSeal
-
-    async def _ticker():
-        # Cannot advance while a sync seal blocks the event loop thread.
-        while True:
-            ticks.append(1)
-            await asyncio.sleep(0.02)
-
-    svc = _make_test_service(use_drand=True)
-    svc.env_mix = [("math", 8)]
-    svc._active_batchers = {"math": _B()}
-    svc._window_n = 3
-
-    ticker = asyncio.create_task(_ticker())
-    try:
-        await asyncio.sleep(0.05)  # let the ticker spin up
-        with pytest.raises(_StopAfterSeal):
-            await svc._train_and_publish()
-    finally:
-        ticker.cancel()
-
-    assert captured["thread"] is not loop_thread, "seal_batch ran on the event loop thread"
-    assert captured["ticks_after"] > captured["ticks_before"], (
-        "the event loop stalled while seal_batch ran — proof was not offloaded"
-    )
