@@ -45,6 +45,7 @@ class Candidate:
     response_time: float | None
     production_selected: bool
     production_rewarded: bool
+    operator_id: str | None = None
 
 
 def _finite_unit(value: Any) -> float | None:
@@ -87,6 +88,13 @@ def _non_negative_int(value: Any) -> int | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return number if number >= 0 else None
+
+
+def _normalized_identity(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
 
 
 def _reward_stats(rewards: Iterable[Any]) -> tuple[float, float, int] | None:
@@ -201,6 +209,9 @@ def _candidate_from_entry(entry: dict[str, Any]) -> Candidate | None:
         response_time=_non_negative_float(entry.get("response_time")),
         production_selected=bool(entry.get("selected_for_batch", False)),
         production_rewarded=bool(entry.get("rewarded", False)),
+        operator_id=_normalized_identity(
+            entry.get("difficulty_auction_operator_id")
+        ),
     )
 
 
@@ -288,7 +299,7 @@ def select_candidates(
             break
         if candidate.prompt_idx in claimed_prompts:
             continue
-        operator = _operator_id(operator_of, candidate.hotkey)
+        operator = _candidate_operator(candidate, operator_of)
         if (
             cap_applies
             and operator is not None
@@ -315,7 +326,7 @@ def _operator_cap_applies(
         and operator_of is not None
         and bool(materialized)
         and all(
-            _operator_id(operator_of, candidate.hotkey) is not None
+            _candidate_operator(candidate, operator_of) is not None
             for candidate in materialized
         )
     )
@@ -327,11 +338,15 @@ def _operator_id(
 ) -> str | None:
     if operator_of is None:
         return None
-    value = operator_of.get(hotkey)
-    if value is None:
-        return None
-    normalized = str(value).strip()
-    return normalized or None
+    return _normalized_identity(operator_of.get(hotkey))
+
+
+def _candidate_operator(
+    candidate: Candidate,
+    operator_of: dict[str, str] | None,
+) -> str | None:
+    """Resolve ownership at the window, with current-chain data as fallback."""
+    return candidate.operator_id or _operator_id(operator_of, candidate.hotkey)
 
 
 def _mean(values: Iterable[float]) -> float | None:
@@ -572,28 +587,40 @@ def replay_archives(
         for candidate in all_candidates
         if candidate.reward_std > 0.0
     }
-    mapped_hotkeys = (
-        {
-            hotkey
-            for hotkey in candidate_hotkeys
-            if _operator_id(operator_of, hotkey) is not None
-        }
-        if operator_of is not None
-        else set()
-    )
-    mapped_eligible_hotkeys = (
-        {
-            hotkey
-            for hotkey in eligible_hotkeys
-            if _operator_id(operator_of, hotkey) is not None
-        }
-        if operator_of is not None
-        else set()
-    )
+    mapped_hotkeys = {
+        candidate.hotkey
+        for candidate in all_candidates
+        if _candidate_operator(candidate, operator_of) is not None
+    }
+    mapped_eligible_hotkeys = {
+        candidate.hotkey
+        for candidate in all_candidates
+        if candidate.reward_std > 0.0
+        and _candidate_operator(candidate, operator_of) is not None
+    }
+    eligible_candidates = [
+        candidate for candidate in all_candidates if candidate.reward_std > 0.0
+    ]
     operator_mapping_complete = (
-        operator_of is not None
-        and bool(eligible_hotkeys)
-        and len(mapped_eligible_hotkeys) == len(eligible_hotkeys)
+        bool(eligible_candidates)
+        and all(
+            _candidate_operator(candidate, operator_of) is not None
+            for candidate in eligible_candidates
+        )
+    )
+    archived_operator_candidates = sum(
+        candidate.operator_id is not None for candidate in all_candidates
+    )
+    fallback_operator_candidates = sum(
+        candidate.operator_id is None
+        and _operator_id(operator_of, candidate.hotkey) is not None
+        for candidate in all_candidates
+    )
+    operator_conflicts = sum(
+        candidate.operator_id is not None
+        and (external := _operator_id(operator_of, candidate.hotkey)) is not None
+        and external != candidate.operator_id
+        for candidate in all_candidates
     )
 
     production_summary = {
@@ -609,11 +636,14 @@ def replay_archives(
         ),
         "mean_reward_histogram": _reward_histogram(production_selected_all),
     }
-    if operator_of is not None:
+    if any(
+        _candidate_operator(candidate, operator_of) is not None
+        for candidate in production_selected_all
+    ):
         production_summary["operator_concentration"] = _share_summary(
             operator
             for candidate in production_selected_all
-            if (operator := _operator_id(operator_of, candidate.hotkey))
+            if (operator := _candidate_operator(candidate, operator_of))
             is not None
         )
     for delta in delta_values:
@@ -644,11 +674,14 @@ def replay_archives(
             ),
             "operator_mapping_complete": operator_mapping_complete,
         }
-        if operator_of is not None:
+        if any(
+            _candidate_operator(candidate, operator_of) is not None
+            for candidate in selected
+        ):
             summary["operator_concentration"] = _share_summary(
                 operator
                 for candidate in selected
-                if (operator := _operator_id(operator_of, candidate.hotkey))
+                if (operator := _candidate_operator(candidate, operator_of))
                 is not None
             )
         per_delta[f"{delta:g}"] = summary
@@ -696,6 +729,10 @@ def replay_archives(
             "eligible_hotkeys": len(eligible_hotkeys),
             "mapped_eligible_hotkeys": len(mapped_eligible_hotkeys),
             "complete_for_cap": operator_mapping_complete,
+            "archived_operator_candidates": archived_operator_candidates,
+            "fallback_operator_candidates": fallback_operator_candidates,
+            "archived_external_conflicts": operator_conflicts,
+            "resolution_order": "archived_window_snapshot_then_external_fallback",
         },
         "production": production_summary,
         "counterfactual_by_delta": per_delta,
@@ -816,7 +853,10 @@ def _print_human(report: dict[str, Any]) -> None:
         "operator mapping: "
         f"eligible={operator_mapping['eligible_hotkeys']} "
         f"mapped={operator_mapping['mapped_eligible_hotkeys']} "
-        f"complete_for_cap={operator_mapping['complete_for_cap']}"
+        f"complete_for_cap={operator_mapping['complete_for_cap']} "
+        f"archived={operator_mapping['archived_operator_candidates']} "
+        f"fallback={operator_mapping['fallback_operator_candidates']} "
+        f"conflicts={operator_mapping['archived_external_conflicts']}"
     )
     for deadline, summary in report["deadline_counterfactual"].items():
         print(
