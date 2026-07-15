@@ -11,7 +11,7 @@ from reliquary.miner.forced_seed_sampler import (
 
 def _forced_token(logits_row, randomness, hotkey, prompt_idx, ckpt, roll, t):
     probs = fs.warp(logits_row, t=T_PROTO, top_k=TOP_K_PROTO, top_p=TOP_P_PROTO)
-    return fs.pick(probs, fs.u_at(randomness, hotkey, prompt_idx, ckpt, roll, t))
+    return fs.pick(probs, fs.u_at(randomness, prompt_idx, ckpt, roll, t))
 
 
 def test_processor_forces_pick_and_advances_position():

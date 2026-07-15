@@ -1398,7 +1398,7 @@ class GrpoWindowBatcher:
             )
             seed_u = [
                 u_at(
-                    self.randomness, request.miner_hotkey, request.prompt_idx,
+                    self.randomness, request.prompt_idx,
                     request.checkpoint_hash, rollout_idx, j,
                 )
                 for j in range(_seed_completion_len)

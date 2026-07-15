@@ -49,7 +49,7 @@ def _expected_completion(rollout_index):
     return [
         fs.pick(
             fs.warp(_RAW_ROW, t=T_PROTO, top_k=TOP_K_PROTO, top_p=TOP_P_PROTO),
-            fs.u_at(_RANDOMNESS, _HOTKEY, _PROMPT_IDX, _CKPT, rollout_index, t),
+            fs.u_at(_RANDOMNESS, _PROMPT_IDX, _CKPT, rollout_index, t),
         )
         for t in range(_N_NEW)
     ]

@@ -709,7 +709,7 @@ CODE_SEMANTIC_AUTH_ENFORCE = False
 
 # ──────────────── FORCED-SEED SAMPLING ────────────────
 # Domain separation for the per-position public uniform u_{i,t}.
-FORCED_SEED_DOMAIN = "reliquary-forced-seed-v1"
+FORCED_SEED_DOMAIN = "reliquary-forced-seed-v2"
 # A position counts toward the seed-consistency check only if its warped max
 # probability is below this (i.e. the forced draw actually chooses the token).
 FORCED_SEED_STOCHASTIC_MAXPROB = 0.99
@@ -755,4 +755,9 @@ FORCED_SEED_ENFORCE = _os.environ.get(
 # Wire-advertised on BatchSubmissionRequest.protocol_version by clients that
 # sample from the forced stream (0 = legacy/pre-forced-seed). Lets the operator
 # track adoption in the shadow window before arming enforcement.
-FORCED_SEED_PROTOCOL_VERSION = 1
+# v2 drops the hotkey from the forced seed (u_at) to kill multi-hotkey variance
+# farming — a coordinated miner+validator change, so it bumps the version.
+# DEPLOY NOTE: during the adoption window the validator must compute the u-stream
+# per submission's advertised protocol_version (v1 = hotkey-in-seed, v2 =
+# hotkey-free); this branch ships the v2 derivation only.
+FORCED_SEED_PROTOCOL_VERSION = 2

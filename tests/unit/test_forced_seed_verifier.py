@@ -9,7 +9,7 @@ from reliquary.environment import forced_sampling as fs
 def test_gpu_completion_seed_counts_perfect_for_forced_tokens():
     # 3 completion positions, flat distributions -> all stochastic
     logits = torch.tensor([[0.2, 0.1, 0.0], [0.1, 0.2, 0.15], [0.0, 0.1, 0.2]])
-    u = [fs.u_at("r", "h", 0, "c", 0, t) for t in range(3)]
+    u = [fs.u_at("r", 0, "c", 0, t) for t in range(3)]
     tokens = [fs.pick(fs.warp(logits[i], t=0.6, top_k=20, top_p=0.95), u[i]) for i in range(3)]
     n_stoch, n_match = verifier._gpu_seed_consistency(logits, tokens, u)
     assert n_stoch == 3 and n_match == 3
@@ -65,7 +65,7 @@ def _seed_wiring_logits_rows():
 
 def _seed_wiring_u_values():
     return [
-        fs.u_at("seedwire", "hk", 7, "ckpt", 0, offset)
+        fs.u_at("seedwire", 7, "ckpt", 0, offset)
         for offset in range(_COMPLETION_LENGTH)
     ]
 
