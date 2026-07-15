@@ -15,14 +15,21 @@ import gzip
 import hashlib
 import json
 import math
+import sys
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+
 DEFAULT_DELTAS = (0.0, 0.5, 1.0, 1.5, 2.0)
 DEFAULT_DEADLINES = (120.0, 180.0, 300.0, 360.0)
+MAX_UNIT_INTERVAL_STD = 0.5 + 1e-12
 
 
 @dataclass(frozen=True)
@@ -48,6 +55,38 @@ def _finite_unit(value: Any) -> float | None:
     if not math.isfinite(number) or number < 0.0 or number > 1.0:
         return None
     return number
+
+
+def _non_negative_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number >= 0.0 else None
+
+
+def _positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if number > 0 else None
+
+
+def _non_negative_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if number >= 0 else None
 
 
 def _reward_stats(rewards: Iterable[Any]) -> tuple[float, float, int] | None:
@@ -87,9 +126,15 @@ def _entry_stats(entry: dict[str, Any]) -> tuple[float, float, int] | None:
         )
     except (TypeError, ValueError):
         reward_std = float("nan")
-    reward_count = 0
-    if mean_reward is not None and math.isfinite(reward_std) and reward_std >= 0:
-        reward_count = int(entry.get("difficulty_auction_reward_count") or 8)
+    reward_count = _positive_int(
+        entry.get("difficulty_auction_reward_count", 8)
+    )
+    if (
+        mean_reward is not None
+        and math.isfinite(reward_std)
+        and 0.0 <= reward_std <= MAX_UNIT_INTERVAL_STD
+        and reward_count is not None
+    ):
         return mean_reward, reward_std, reward_count
 
     rollouts = entry.get("rollouts")
@@ -112,7 +157,7 @@ def _digest_bytes(value: Any, fallback: str) -> bytes:
             decoded = bytes.fromhex(value)
         except ValueError:
             decoded = b""
-        if decoded:
+        if len(decoded) == 32:
             return decoded
     return hashlib.sha256(fallback.encode()).digest()
 
@@ -122,7 +167,10 @@ def _candidate_from_entry(entry: dict[str, Any]) -> Candidate | None:
     if stats is None:
         return None
     try:
-        hotkey = str(entry["hotkey"])
+        raw_hotkey = entry["hotkey"]
+        if raw_hotkey is None:
+            return None
+        hotkey = str(raw_hotkey).strip()
         prompt_idx = int(entry["prompt_idx"])
         drand_round = int(
             entry.get("submitted_drand_round")
@@ -131,18 +179,13 @@ def _candidate_from_entry(entry: dict[str, Any]) -> Candidate | None:
         )
     except (KeyError, TypeError, ValueError):
         return None
+    if not hotkey or prompt_idx < 0 or drand_round < 0:
+        return None
     digest = _digest_bytes(
         entry.get("selection_digest") or entry.get("merkle_root"),
         f"{hotkey}:{prompt_idx}:{drand_round}",
     )
     mean_reward, reward_std, reward_count = stats
-
-    def _non_negative_float(value: Any) -> float | None:
-        try:
-            number = float(value)
-        except (TypeError, ValueError):
-            return None
-        return number if math.isfinite(number) and number >= 0.0 else None
 
     return Candidate(
         hotkey=hotkey,
@@ -216,6 +259,10 @@ def select_candidates(
     operator_of: dict[str, str] | None = None,
     max_slots_per_operator: int | None = None,
 ) -> list[Candidate]:
+    if batch_size <= 0:
+        raise ValueError("batch size must be positive")
+    if max_slots_per_operator is not None and max_slots_per_operator <= 0:
+        raise ValueError("operator slot cap must be positive")
     ranked = sorted(
         (
             candidate
@@ -241,7 +288,7 @@ def select_candidates(
             break
         if candidate.prompt_idx in claimed_prompts:
             continue
-        operator = operator_of.get(candidate.hotkey) if operator_of else None
+        operator = _operator_id(operator_of, candidate.hotkey)
         if (
             cap_applies
             and operator is not None
@@ -264,10 +311,27 @@ def _operator_cap_applies(
     materialized = list(eligible)
     return (
         max_slots_per_operator is not None
+        and max_slots_per_operator > 0
         and operator_of is not None
         and bool(materialized)
-        and all(candidate.hotkey in operator_of for candidate in materialized)
+        and all(
+            _operator_id(operator_of, candidate.hotkey) is not None
+            for candidate in materialized
+        )
     )
+
+
+def _operator_id(
+    operator_of: dict[str, str] | None,
+    hotkey: str,
+) -> str | None:
+    if operator_of is None:
+        return None
+    value = operator_of.get(hotkey)
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
 
 
 def _mean(values: Iterable[float]) -> float | None:
@@ -311,6 +375,29 @@ def _candidate_arrival_age(candidate: Candidate) -> tuple[float | None, str]:
     return None, "missing"
 
 
+def _summarize_deadlines(
+    candidate_counts_by_deadline: dict[float, list[int]],
+    distinct_counts_by_deadline: dict[float, list[int]],
+    *,
+    batch_size: int,
+) -> dict[str, dict[str, float | int | None]]:
+    summary = {}
+    for deadline, candidate_counts in candidate_counts_by_deadline.items():
+        distinct_counts = distinct_counts_by_deadline[deadline]
+        filled = sum(count >= batch_size for count in distinct_counts)
+        summary[f"{deadline:g}"] = {
+            "windows": len(candidate_counts),
+            "mean_validated_candidates_by_deadline": _mean(candidate_counts),
+            "median_validated_candidates_by_deadline": _median(candidate_counts),
+            "mean_distinct_prompts_by_deadline": _mean(distinct_counts),
+            "windows_with_at_least_batch_size_distinct": filled,
+            "fraction_with_at_least_batch_size_distinct": (
+                filled / len(distinct_counts) if distinct_counts else None
+            ),
+        }
+    return summary
+
+
 def replay_archives(
     archives: Iterable[dict[str, Any]],
     *,
@@ -321,6 +408,10 @@ def replay_archives(
     max_slots_per_operator: int | None = None,
     deadlines: Iterable[float] = DEFAULT_DEADLINES,
 ) -> dict[str, Any]:
+    if batch_size <= 0:
+        raise ValueError("batch size must be positive")
+    if max_slots_per_operator is not None and max_slots_per_operator <= 0:
+        raise ValueError("operator slot cap must be positive")
     windows = []
     missing_scores = 0
     batch_filled_rejects = 0
@@ -332,21 +423,36 @@ def replay_archives(
     proxy_arrival_count = 0
     missing_arrival_count = 0
     deadline_values = tuple(float(deadline) for deadline in deadlines)
+    if any(
+        not math.isfinite(deadline) or deadline < 0.0
+        for deadline in deadline_values
+    ):
+        raise ValueError("deadlines must be finite and non-negative")
     deadline_candidate_counts: dict[float, list[int]] = {
         deadline: [] for deadline in deadline_values
     }
     deadline_distinct_counts: dict[float, list[int]] = {
         deadline: [] for deadline in deadline_values
     }
+    exact_deadline_candidate_counts: dict[float, list[int]] = {
+        deadline: [] for deadline in deadline_values
+    }
+    exact_deadline_distinct_counts: dict[float, list[int]] = {
+        deadline: [] for deadline in deadline_values
+    }
     per_delta: dict[str, dict[str, Any]] = {}
     delta_values = tuple(float(delta) for delta in deltas)
+    if not delta_values or any(
+        not math.isfinite(delta) or delta < 0.0 for delta in delta_values
+    ):
+        raise ValueError("deltas must be non-negative finite numbers")
     selected_by_delta: dict[float, list[Candidate]] = {
         delta: [] for delta in delta_values
     }
     overlap_by_delta: dict[float, list[float]] = {
         delta: [] for delta in delta_values
     }
-    cap_applied_by_delta: dict[float, list[bool]] = {
+    cap_status_by_delta: dict[float, list[str]] = {
         delta: [] for delta in delta_values
     }
 
@@ -360,7 +466,11 @@ def replay_archives(
         missing_scores += missing
         reject_summary = archive.get("reject_summary", {})
         if isinstance(reject_summary, dict):
-            batch_filled_rejects += int(reject_summary.get("batch_filled", 0) or 0)
+            batch_filled = _non_negative_int(
+                reject_summary.get("batch_filled", 0)
+            )
+            if batch_filled is not None:
+                batch_filled_rejects += batch_filled
         if not candidates:
             continue
         total_candidates += len(candidates)
@@ -368,13 +478,16 @@ def replay_archives(
         arrival_rows = []
         for candidate in candidates:
             age, basis = _candidate_arrival_age(candidate)
-            arrival_rows.append((candidate, age))
+            arrival_rows.append((candidate, age, basis))
             if basis == "http_arrival":
                 exact_arrival_count += 1
             elif basis == "acceptance_proxy":
                 proxy_arrival_count += 1
             else:
                 missing_arrival_count += 1
+        exact_http_window = all(
+            basis == "http_arrival" for _candidate, _age, basis in arrival_rows
+        )
         production = [
             candidate for candidate in candidates if candidate.production_selected
         ]
@@ -384,17 +497,25 @@ def replay_archives(
             "candidate_count": len(candidates),
             "production_selected_count": len(production),
             "distinct_prompts": len({candidate.prompt_idx for candidate in candidates}),
+            "exact_http_arrival_complete": exact_http_window,
         }
         for deadline in deadline_values:
             by_deadline = [
                 candidate
-                for candidate, age in arrival_rows
+                for candidate, age, _basis in arrival_rows
                 if age is not None and age <= deadline
             ]
             deadline_candidate_counts[deadline].append(len(by_deadline))
             deadline_distinct_counts[deadline].append(
                 len({candidate.prompt_idx for candidate in by_deadline})
             )
+            if exact_http_window:
+                exact_deadline_candidate_counts[deadline].append(
+                    len(by_deadline)
+                )
+                exact_deadline_distinct_counts[deadline].append(
+                    len({candidate.prompt_idx for candidate in by_deadline})
+                )
         production_keys = {
             (candidate.hotkey, candidate.prompt_idx, candidate.selection_digest)
             for candidate in production
@@ -405,13 +526,19 @@ def replay_archives(
                 for candidate in candidates
                 if difficulty_value(candidate, delta) > 0.0
             ]
-            cap_applied_by_delta[delta].append(
-                _operator_cap_applies(
-                    eligible,
-                    operator_of=operator_of,
-                    max_slots_per_operator=max_slots_per_operator,
-                )
-            )
+            if max_slots_per_operator is None:
+                cap_status = "not_requested"
+            elif not eligible:
+                cap_status = "not_applicable"
+            elif _operator_cap_applies(
+                eligible,
+                operator_of=operator_of,
+                max_slots_per_operator=max_slots_per_operator,
+            ):
+                cap_status = "applied"
+            else:
+                cap_status = "incomplete_mapping"
+            cap_status_by_delta[delta].append(cap_status)
             selected = select_candidates(
                 candidates,
                 delta=delta,
@@ -446,10 +573,22 @@ def replay_archives(
         if candidate.reward_std > 0.0
     }
     mapped_hotkeys = (
-        candidate_hotkeys & set(operator_of) if operator_of is not None else set()
+        {
+            hotkey
+            for hotkey in candidate_hotkeys
+            if _operator_id(operator_of, hotkey) is not None
+        }
+        if operator_of is not None
+        else set()
     )
     mapped_eligible_hotkeys = (
-        eligible_hotkeys & set(operator_of) if operator_of is not None else set()
+        {
+            hotkey
+            for hotkey in eligible_hotkeys
+            if _operator_id(operator_of, hotkey) is not None
+        }
+        if operator_of is not None
+        else set()
     )
     operator_mapping_complete = (
         operator_of is not None
@@ -472,14 +611,17 @@ def replay_archives(
     }
     if operator_of is not None:
         production_summary["operator_concentration"] = _share_summary(
-            operator_of[candidate.hotkey]
+            operator
             for candidate in production_selected_all
-            if candidate.hotkey in operator_of
+            if (operator := _operator_id(operator_of, candidate.hotkey))
+            is not None
         )
     for delta in delta_values:
         selected = selected_by_delta[delta]
-        cap_windows = cap_applied_by_delta[delta]
-        cap_applied_windows = sum(cap_windows)
+        cap_statuses = cap_status_by_delta[delta]
+        cap_applied_windows = cap_statuses.count("applied")
+        cap_skipped_windows = cap_statuses.count("incomplete_mapping")
+        cap_not_applicable_windows = cap_statuses.count("not_applicable")
         summary = {
             "selected_count": len(selected),
             "mean_reward": _mean(candidate.mean_reward for candidate in selected),
@@ -492,43 +634,35 @@ def replay_archives(
             "operator_cap_requested": max_slots_per_operator,
             "operator_cap_applied": (
                 max_slots_per_operator is not None
-                and bool(cap_windows)
-                and cap_applied_windows == len(cap_windows)
+                and cap_applied_windows > 0
+                and cap_skipped_windows == 0
             ),
             "operator_cap_applied_windows": cap_applied_windows,
-            "operator_cap_skipped_windows": (
-                len(cap_windows) - cap_applied_windows
-                if max_slots_per_operator is not None
-                else 0
+            "operator_cap_skipped_windows": cap_skipped_windows,
+            "operator_cap_not_applicable_windows": (
+                cap_not_applicable_windows
             ),
             "operator_mapping_complete": operator_mapping_complete,
         }
         if operator_of is not None:
             summary["operator_concentration"] = _share_summary(
-                operator_of[candidate.hotkey]
+                operator
                 for candidate in selected
-                if candidate.hotkey in operator_of
+                if (operator := _operator_id(operator_of, candidate.hotkey))
+                is not None
             )
         per_delta[f"{delta:g}"] = summary
 
-    deadline_summary = {}
-    for deadline in deadline_values:
-        candidate_counts = deadline_candidate_counts[deadline]
-        distinct_counts = deadline_distinct_counts[deadline]
-        deadline_summary[f"{deadline:g}"] = {
-            "windows": len(candidate_counts),
-            "mean_validated_candidates_by_deadline": _mean(candidate_counts),
-            "median_validated_candidates_by_deadline": _median(candidate_counts),
-            "mean_distinct_prompts_by_deadline": _mean(distinct_counts),
-            "windows_with_at_least_batch_size_distinct": sum(
-                count >= batch_size for count in distinct_counts
-            ),
-            "fraction_with_at_least_batch_size_distinct": (
-                sum(count >= batch_size for count in distinct_counts)
-                / len(distinct_counts)
-                if distinct_counts else None
-            ),
-        }
+    deadline_summary = _summarize_deadlines(
+        deadline_candidate_counts,
+        deadline_distinct_counts,
+        batch_size=batch_size,
+    )
+    exact_deadline_summary = _summarize_deadlines(
+        exact_deadline_candidate_counts,
+        exact_deadline_distinct_counts,
+        batch_size=batch_size,
+    )
 
     return {
         "schema_version": 1,
@@ -553,7 +687,9 @@ def replay_archives(
                 "is only an upper-bound proxy for HTTP arrival"
             ),
         },
+        "deadline_counterfactual_basis": "best_available_per_candidate",
         "deadline_counterfactual": deadline_summary,
+        "deadline_counterfactual_exact_http_arrival": exact_deadline_summary,
         "operator_mapping": {
             "candidate_hotkeys": len(candidate_hotkeys),
             "mapped_candidate_hotkeys": len(mapped_hotkeys),
@@ -601,11 +737,15 @@ async def _load_chain_operator_map(netuid: int) -> dict[str, str]:
         coldkeys = list(getattr(metagraph, "coldkeys", []))
         if len(hotkeys) != len(coldkeys):
             raise RuntimeError("metagraph hotkey/coldkey lengths differ")
-        return {
-            str(hotkey): str(coldkey)
-            for hotkey, coldkey in zip(hotkeys, coldkeys)
-            if str(hotkey) and str(coldkey)
-        }
+        operator_map = {}
+        for hotkey, coldkey in zip(hotkeys, coldkeys):
+            if hotkey is None or coldkey is None:
+                continue
+            normalized_hotkey = str(hotkey).strip()
+            normalized_coldkey = str(coldkey).strip()
+            if normalized_hotkey and normalized_coldkey:
+                operator_map[normalized_hotkey] = normalized_coldkey
+        return operator_map
     finally:
         await chain.close_subtensor(subtensor)
 
@@ -617,6 +757,22 @@ def _parse_deltas(raw: str) -> tuple[float, ...]:
     return values
 
 
+def _positive_cli_int(raw: str) -> int:
+    value = _positive_int(raw)
+    if value is None:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
+    return value
+
+
+def _non_negative_cli_int(raw: str) -> int:
+    value = _non_negative_int(raw)
+    if value is None:
+        raise argparse.ArgumentTypeError(
+            "value must be a non-negative integer"
+        )
+    return value
+
+
 def _load_operator_map(path: str | None) -> dict[str, str] | None:
     if path is None:
         return None
@@ -624,11 +780,15 @@ def _load_operator_map(path: str | None) -> dict[str, str] | None:
         payload = json.load(handle)
     if not isinstance(payload, dict):
         raise ValueError("operator map must be a JSON object: hotkey -> coldkey")
-    return {
-        str(hotkey): str(coldkey)
-        for hotkey, coldkey in payload.items()
-        if str(hotkey) and str(coldkey)
-    }
+    operator_map = {}
+    for hotkey, coldkey in payload.items():
+        if hotkey is None or coldkey is None:
+            continue
+        normalized_hotkey = str(hotkey).strip()
+        normalized_coldkey = str(coldkey).strip()
+        if normalized_hotkey and normalized_coldkey:
+            operator_map[normalized_hotkey] = normalized_coldkey
+    return operator_map
 
 
 def _print_human(report: dict[str, Any]) -> None:
@@ -660,8 +820,18 @@ def _print_human(report: dict[str, Any]) -> None:
     )
     for deadline, summary in report["deadline_counterfactual"].items():
         print(
-            f"deadline={deadline}s: mean_distinct="
+            f"deadline_best_available={deadline}s: mean_distinct="
             f"{summary['mean_distinct_prompts_by_deadline']} "
+            f"fill_rate={summary['fraction_with_at_least_batch_size_distinct']}"
+        )
+    for deadline, summary in report[
+        "deadline_counterfactual_exact_http_arrival"
+    ].items():
+        if summary["windows"] == 0:
+            continue
+        print(
+            f"deadline_exact={deadline}s: windows={summary['windows']} "
+            f"mean_distinct={summary['mean_distinct_prompts_by_deadline']} "
             f"fill_rate={summary['fraction_with_at_least_batch_size_distinct']}"
         )
     production = report["production"]
@@ -683,7 +853,11 @@ def _print_human(report: dict[str, Any]) -> None:
             cap_windows = "not_requested"
         else:
             applied = summary["operator_cap_applied_windows"]
-            total = applied + summary["operator_cap_skipped_windows"]
+            total = (
+                applied
+                + summary["operator_cap_skipped_windows"]
+                + summary["operator_cap_not_applicable_windows"]
+            )
             cap_windows = f"{applied}/{total}"
         print(
             f"delta={delta}: n={summary['selected_count']} "
@@ -700,8 +874,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("paths", nargs="*", help="window JSON/GZ files or directories")
     parser.add_argument("--from-r2", action="store_true")
-    parser.add_argument("--current-window", type=int)
-    parser.add_argument("--n", type=int, default=250)
+    parser.add_argument("--current-window", type=_non_negative_cli_int)
+    parser.add_argument("--n", type=_positive_cli_int, default=250)
     parser.add_argument("--environment", default="openmathinstruct")
     parser.add_argument(
         "--deltas",
@@ -709,11 +883,13 @@ def main() -> int:
         default=DEFAULT_DELTAS,
         help="comma-separated values (default: 0,0.5,1,1.5,2)",
     )
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=_positive_cli_int, default=8)
     parser.add_argument("--operator-map")
     parser.add_argument("--operator-map-from-chain", action="store_true")
-    parser.add_argument("--netuid", type=int, default=81)
-    parser.add_argument("--max-slots-per-operator", type=int)
+    parser.add_argument("--netuid", type=_non_negative_cli_int, default=81)
+    parser.add_argument(
+        "--max-slots-per-operator", type=_positive_cli_int
+    )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
