@@ -1,4 +1,10 @@
-# Difficulty Auction — Protocol Implementation Plan
+# Difficulty Auction - Protocol Implementation Plan
+
+> **Audit status (2026-07-15): DO NOT EXECUTE.** This is the original plan, not
+> an approved rollout checklist. The active branch has been reconciled with
+> current `main`; deferred proof, the 300 second collection deadline, and
+> `PROMPT_CLAIMED` are intentionally absent. Follow
+> `docs/superpowers/specs/2026-07-15-difficulty-auction-audit.md` instead.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

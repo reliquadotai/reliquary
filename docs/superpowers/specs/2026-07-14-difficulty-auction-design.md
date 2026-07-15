@@ -1,7 +1,15 @@
-# Difficulty Auction — Design
+# Difficulty Auction - Design
+
+> **Audit status (2026-07-15): NOT APPROVED FOR ACTIVATION.** This document
+> records the original proposal. Its fixed deadline, proof deferral, and
+> first-claim prompt ownership are rejected by current production evidence and
+> the threat model. The branch now contains only an observation-only
+> counterfactual. See
+> `docs/superpowers/specs/2026-07-15-difficulty-auction-audit.md` for the
+> controlling decision and activation gates.
 
 **Date:** 2026-07-14
-**Status:** Design approved, ARMING BLOCKED on one measurement (see §9)
+**Status:** Historical proposal; activation rejected by the 2026-07-15 audit
 **Supersedes the "Problem 2" fix direction in** `2026-07-09-incentive-training-state-of-situation.md`
 (whose stated mechanism is refuted below — see §2.3)
 
