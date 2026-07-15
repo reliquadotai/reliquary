@@ -1,9 +1,14 @@
+from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 
 import pytest
 
 import reliquary.validator.batcher as batcher_module
 from reliquary.validator.batcher import GrpoWindowBatcher, ValidSubmission
+from reliquary.validator.difficulty_auction import (
+    ShadowSubmission,
+    select_shadow_auction as real_select_shadow_auction,
+)
 
 
 class MathEnv:
@@ -90,6 +95,33 @@ def test_shadow_failure_cannot_fail_production_seal(monkeypatch):
     assert rewards == {"miner": pytest.approx(1 / 8)}
     assert batcher.difficulty_auction_shadow["status"] == "error"
     assert batcher.difficulty_auction_shadow["error_type"] == "RuntimeError"
+
+
+def test_shadow_receives_only_detached_immutable_values(monkeypatch):
+    batcher = _batcher()
+    live_submission = _submission("miner", 1, drand_round=1, k=4)
+    batcher._valid = [live_submission]
+    batcher.valid_count = 1
+
+    def _inspect(pool, **kwargs):
+        assert isinstance(pool, tuple)
+        assert len(pool) == 1
+        candidate = pool[0]
+        assert isinstance(candidate, ShadowSubmission)
+        assert candidate.source_id == id(live_submission)
+        assert candidate is not live_submission
+        assert candidate.rewards == (1.0,) * 4 + (0.0,) * 4
+        with pytest.raises(FrozenInstanceError):
+            candidate.prompt_idx = 99
+        return real_select_shadow_auction(pool, **kwargs)
+
+    monkeypatch.setattr(batcher_module, "select_shadow_auction", _inspect)
+
+    production_batch, rewards = batcher.seal_batch()
+
+    assert production_batch == [live_submission]
+    assert rewards == {"miner": pytest.approx(1 / 8)}
+    assert live_submission.prompt_idx == 1
 
 
 def test_code_environment_is_explicitly_out_of_scope():

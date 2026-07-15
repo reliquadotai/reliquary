@@ -2,7 +2,6 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from reliquary.validator.cooldown import CooldownMap
 from reliquary.validator.difficulty_auction import (
     difficulty_score,
     select_shadow_auction,
@@ -22,18 +21,17 @@ class FakeSubmission:
     rewards: list[float]
     selection_digest: bytes = field(default_factory=lambda: b"x" * 32)
     merkle_root: bytes = field(default_factory=lambda: b"x" * 32)
+    in_cooldown: bool = False
 
     @property
-    def rollouts(self):
-        return [FakeRollout(reward) for reward in self.rewards]
+    def source_id(self):
+        return id(self)
 
 
 def _select(submissions, *, b=8, **kwargs):
     return select_shadow_auction(
         submissions,
         b=b,
-        cooldown_map=CooldownMap(cooldown_windows=0),
-        current_window=100,
         delta=1.0,
         **kwargs,
     )

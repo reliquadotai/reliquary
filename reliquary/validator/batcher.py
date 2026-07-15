@@ -65,7 +65,10 @@ from reliquary.validator.dedup import (
     compute_logical_group_hash,
     compute_rollout_hash,
 )
-from reliquary.validator.difficulty_auction import select_shadow_auction
+from reliquary.validator.difficulty_auction import (
+    ShadowSubmission,
+    select_shadow_auction,
+)
 from reliquary.validator.observability import (
     DrandRoundObservation,
     SubmitTelemetry,
@@ -2288,11 +2291,27 @@ class GrpoWindowBatcher:
             return
 
         try:
+            shadow_pool = tuple(
+                ShadowSubmission(
+                    source_id=id(submission),
+                    hotkey=str(submission.hotkey),
+                    prompt_idx=int(submission.prompt_idx),
+                    drand_round=int(submission.drand_round),
+                    merkle_root=bytes(submission.merkle_root),
+                    selection_digest=bytes(submission.selection_digest),
+                    rewards=tuple(
+                        float(rollout.reward)
+                        for rollout in submission.rollouts
+                    ),
+                    in_cooldown=self._cooldown.is_in_cooldown(
+                        submission.prompt_idx, self.window_start
+                    ),
+                )
+                for submission in self._valid
+            )
             result = select_shadow_auction(
-                self._valid,
+                shadow_pool,
                 b=B_BATCH,
-                cooldown_map=self._cooldown,
-                current_window=self.window_start,
                 delta=DIFFICULTY_AUCTION_DELTA,
             )
             production_selected_ids = {
@@ -2310,7 +2329,7 @@ class GrpoWindowBatcher:
                 )
             }
             shadow_selected_ids = {
-                id(submission) for submission in result.selected
+                submission.source_id for submission in result.selected
             }
 
             candidate_rows = []
@@ -2335,7 +2354,9 @@ class GrpoWindowBatcher:
                         id(submission) in production_rewarded_ids
                     ),
                 }
-                self.difficulty_auction_metadata_by_id[id(submission)] = row
+                self.difficulty_auction_metadata_by_id[
+                    submission.source_id
+                ] = row
                 candidate_rows.append(row)
 
             overlap = production_selected_ids & shadow_selected_ids

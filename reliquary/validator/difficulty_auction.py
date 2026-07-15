@@ -11,19 +11,23 @@ from __future__ import annotations
 import math
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Protocol
+from typing import Callable, Iterable
 
 from reliquary.validator.batch_selection import _within_slot_key
-from reliquary.validator.cooldown import CooldownMap
 
 
-class ScoredSubmission(Protocol):
+@dataclass(frozen=True)
+class ShadowSubmission:
+    """Detached candidate values safe to expose to shadow experiments."""
+
+    source_id: int
     hotkey: str
     prompt_idx: int
     drand_round: int
     merkle_root: bytes
     selection_digest: bytes
-    rollouts: list[Any]
+    rewards: tuple[float, ...]
+    in_cooldown: bool = False
 
 
 @dataclass(frozen=True)
@@ -36,7 +40,7 @@ class DifficultyScore:
 
 @dataclass(frozen=True)
 class ShadowCandidate:
-    submission: Any
+    submission: ShadowSubmission
     score: DifficultyScore
     rank: int | None
     eligible: bool
@@ -47,7 +51,7 @@ class ShadowCandidate:
 @dataclass(frozen=True)
 class ShadowAuctionResult:
     candidates: tuple[ShadowCandidate, ...]
-    selected: tuple[Any, ...]
+    selected: tuple[ShadowSubmission, ...]
     eligible_count: int
     distinct_prompt_count: int
     operator_cap_requested: int | None
@@ -88,18 +92,15 @@ def difficulty_score(
 
 
 def submission_score(
-    submission: ScoredSubmission,
+    submission: ShadowSubmission,
     *,
     delta: float,
 ) -> DifficultyScore:
-    return difficulty_score(
-        (float(rollout.reward) for rollout in submission.rollouts),
-        delta=delta,
-    )
+    return difficulty_score(submission.rewards, delta=delta)
 
 
 def _rank_key(
-    item: tuple[Any, DifficultyScore],
+    item: tuple[ShadowSubmission, DifficultyScore],
 ) -> tuple[float, int, bytes]:
     submission, score = item
     return (
@@ -110,11 +111,9 @@ def _rank_key(
 
 
 def select_shadow_auction(
-    submissions: Iterable[Any],
+    submissions: Iterable[ShadowSubmission],
     *,
     b: int,
-    cooldown_map: CooldownMap,
-    current_window: int,
     delta: float,
     max_slots_per_operator: int | None = None,
     operator_of: Callable[[str], str | None] | None = None,
@@ -132,17 +131,20 @@ def select_shadow_auction(
     if max_slots_per_operator is not None and max_slots_per_operator <= 0:
         raise ValueError("operator slot cap must be positive")
 
+    materialized = tuple(submissions)
+    source_ids = [submission.source_id for submission in materialized]
+    if len(source_ids) != len(set(source_ids)):
+        raise ValueError("shadow submissions must have unique source ids")
+
     scored = [
         (submission, submission_score(submission, delta=delta))
-        for submission in submissions
+        for submission in materialized
     ]
     eligible = [
         item
         for item in scored
         if item[1].value > 0.0
-        and not cooldown_map.is_in_cooldown(
-            item[0].prompt_idx, current_window
-        )
+        and not item[0].in_cooldown
     ]
     ranked = sorted(eligible, key=_rank_key)
 
@@ -150,18 +152,18 @@ def select_shadow_auction(
     if operator_of is not None:
         for submission, _score in ranked:
             operator = operator_of(submission.hotkey)
-            operator_ids[id(submission)] = (
+            operator_ids[submission.source_id] = (
                 str(operator).strip() if operator is not None else None
             ) or None
 
     cap_requested = max_slots_per_operator is not None
     mapping_complete = bool(ranked) and operator_of is not None and all(
-        operator_ids.get(id(submission)) is not None
+        operator_ids.get(submission.source_id) is not None
         for submission, _score in ranked
     )
     cap_applied = cap_requested and mapping_complete
 
-    selected: list[Any] = []
+    selected: list[ShadowSubmission] = []
     selected_ids: set[int] = set()
     claimed_prompts: set[int] = set()
     slots_by_operator: Counter[str] = Counter()
@@ -171,7 +173,7 @@ def select_shadow_auction(
                 break
             if submission.prompt_idx in claimed_prompts:
                 continue
-            operator = operator_ids.get(id(submission))
+            operator = operator_ids.get(submission.source_id)
             if (
                 cap_applied
                 and operator is not None
@@ -179,23 +181,23 @@ def select_shadow_auction(
             ):
                 continue
             selected.append(submission)
-            selected_ids.add(id(submission))
+            selected_ids.add(submission.source_id)
             claimed_prompts.add(submission.prompt_idx)
             if operator is not None:
                 slots_by_operator[operator] += 1
 
     ranks = {
-        id(submission): rank
+        submission.source_id: rank
         for rank, (submission, _score) in enumerate(ranked, start=1)
     }
     candidates = tuple(
         ShadowCandidate(
             submission=submission,
             score=score,
-            rank=ranks.get(id(submission)),
-            eligible=id(submission) in ranks,
-            selected=id(submission) in selected_ids,
-            operator_id=operator_ids.get(id(submission)),
+            rank=ranks.get(submission.source_id),
+            eligible=submission.source_id in ranks,
+            selected=submission.source_id in selected_ids,
+            operator_id=operator_ids.get(submission.source_id),
         )
         for submission, score in scored
     )
