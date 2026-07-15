@@ -36,16 +36,17 @@ protocol or a miner's production verdict, reward, or selection probability.
 
 The live validator was healthy at revision
 `c33560d4cb810e394f7224419570bda87f32ed9e`. The audit sampled R2 windows
-23172 through 23175, all with exact HTTP arrival ages.
+23172 through 23177, all with exact HTTP arrival ages.
 
 | Metric | Observed |
 |---|---:|
-| Windows | 4 |
-| Fully validated Math candidates | 24 |
-| Candidate hotkeys | 7 |
-| Production-selected groups | 17 |
-| Production mean reward | 0.610294 |
-| Shadow compute time | 0.31-0.75 ms/window |
+| Windows | 6 |
+| Fully validated Math candidates | 34 |
+| Candidate hotkeys | 9 |
+| Production-selected groups | 26 |
+| Production mean reward | 0.600962 |
+| Archived `batch_filled` rejects outside the scored population | 358 |
+| Shadow compute time in the initial four-window sample | 0.31-0.75 ms/window |
 | Shadow errors | 0 |
 
 The sample is enough to reject unsafe assumptions, but not enough to choose a
@@ -55,22 +56,22 @@ production incentive curve.
 
 | Delta | Selected | Mean reward | Mean production Jaccard | Top hotkey share |
 |---:|---:|---:|---:|---:|
-| 0.0-0.5 | 17 | 0.595588 | 0.845238 | 41.18% |
-| 0.75-2.0 | 17 | 0.588235 | 0.720238 | 41.18% |
+| 0.0-0.5 | 26 | 0.591346 | 0.896825 | 34.62% |
+| 0.75-2.0 | 26 | 0.586538 | 0.813492 | 34.62% |
 
 This confirms that the score changes the training distribution. It does not yet
 show that the changed distribution improves the checkpoint.
 
 ### Operator-cap replay
 
-The seven candidate hotkeys were mapped completely from the SN81 metagraph.
+The nine candidate hotkeys were mapped completely from the SN81 metagraph.
 With a two-slot cap:
 
 | Metric | Production | Capped shadow |
 |---|---:|---:|
-| Selected groups | 17 | 15 |
-| Mean reward at delta 0-0.5 | 0.610294 | 0.575000 |
-| Top operator share | 35.29% | 33.33% |
+| Selected groups | 26 | 24 |
+| Mean reward at delta 0-0.5 | 0.600962 | 0.578125 |
+| Top operator share | 30.77% | 29.17% |
 
 The cap made only a small concentration improvement in this sample and burned
 two otherwise usable training slots. A hard cap is therefore not approved. It
@@ -81,10 +82,10 @@ operator-level diminishing returns before activation.
 
 | Deadline | Mean candidates | Mean distinct prompts | Windows reaching 8 prompts |
 |---:|---:|---:|---:|
-| 120 s | 1.75 | 1.25 | 0/4 |
-| 180 s | 2.75 | 1.75 | 0/4 |
-| 300 s | 3.25 | 2.00 | 0/4 |
-| 360 s | 3.25 | 2.00 | 0/4 |
+| 120 s | 1.17 | 0.83 | 0/6 |
+| 180 s | 2.17 | 1.50 | 0/6 |
+| 300 s | 2.83 | 2.00 | 0/6 |
+| 360 s | 2.83 | 2.00 | 0/6 |
 
 The proposed fixed 300 second deadline would have underfilled every observed
 window. The current state-driven sealing and sparse-window liveness controls
