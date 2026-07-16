@@ -25,6 +25,7 @@ from reliquary.constants import (
     GRAD_CLIP_NORM, GRAD_NORM_SKIP_THRESHOLD, KL_BETA, LEARNING_RATE,
     LR_COSINE_MAX_WINDOWS, LR_WARMUP_WINDOWS,
     MICROBATCH_MAX_PADDED_TOKENS, PPO_CLIP_EPSILON,
+    PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD,
 )
 
 logger = logging.getLogger(__name__)
@@ -1377,21 +1378,44 @@ def train_step(
 
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
     grad_norm_value = float(grad_norm)
+    policy_metrics = _kl_telemetry_metrics(kl_stats)
     nonfinite_gradient = not math.isfinite(grad_norm_value)
+    nonfinite_policy_ratio = (
+        policy_metrics["train/ppo_ratio_nonfinite_ratio"] > 0.0
+    )
     gradient_spike = (
         not nonfinite_gradient
         and grad_norm_value > GRAD_NORM_SKIP_THRESHOLD
     )
-    if nonfinite_gradient or gradient_spike:
-        reason = "nonfinite_gradient" if nonfinite_gradient else "gradient_spike"
+    policy_ratio_drift = (
+        policy_metrics["train/ppo_ratio_outside_clip_ratio"]
+        > PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD
+    )
+    if (
+        nonfinite_gradient
+        or nonfinite_policy_ratio
+        or gradient_spike
+        or policy_ratio_drift
+    ):
+        if nonfinite_gradient:
+            reason = "nonfinite_gradient"
+        elif nonfinite_policy_ratio:
+            reason = "nonfinite_policy_ratio"
+        elif gradient_spike:
+            reason = "gradient_spike"
+        else:
+            reason = "policy_ratio_drift"
         logger.warning(
-            "train_step: rejected %s grad_norm=%s threshold=%s; "
+            "train_step: rejected %s grad_norm=%s grad_threshold=%s "
+            "ppo_outside_clip=%.6g ppo_threshold=%.6g; "
             "optimizer and checkpoint cadence unchanged",
             reason,
             grad_norm_value,
             GRAD_NORM_SKIP_THRESHOLD,
+            policy_metrics["train/ppo_ratio_outside_clip_ratio"],
+            PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD,
         )
-        failure_metrics = _kl_telemetry_metrics(kl_stats)
+        failure_metrics = policy_metrics
         failure_metrics.update({
             "train/ppo_loss": total_ppo / n_processed,
             "train/kl": total_kl / n_processed,
@@ -1399,7 +1423,16 @@ def train_step(
             "train/lr_applied": lr_applied,
             "train/lr_next": lr_applied,
             "train/step_skipped_nonfinite": float(nonfinite_gradient),
+            "train/step_skipped_nonfinite_policy_ratio": float(
+                nonfinite_policy_ratio
+            ),
             "train/step_skipped_grad_spike": float(gradient_spike),
+            "train/step_skipped_policy_ratio_drift": float(
+                policy_ratio_drift
+            ),
+            "train/ppo_ratio_outside_clip_skip_threshold": (
+                PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD
+            ),
             "train/pi_old_recomputed": float(behavior_model is not None),
             "train/rollouts_processed": n_processed,
             "train/rollouts_total": n_total_rollouts,
@@ -1441,7 +1474,12 @@ def train_step(
         "train/grad_clip_ratio": float(grad_norm) / GRAD_CLIP_NORM,
         "train/grad_was_clipped": float(grad_norm > GRAD_CLIP_NORM),
         "train/step_skipped_nonfinite": 0.0,
+        "train/step_skipped_nonfinite_policy_ratio": 0.0,
         "train/step_skipped_grad_spike": 0.0,
+        "train/step_skipped_policy_ratio_drift": 0.0,
+        "train/ppo_ratio_outside_clip_skip_threshold": (
+            PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD
+        ),
         "train/pi_old_recomputed": float(behavior_model is not None),
         "train/rollouts_processed": n_processed,
         "train/rollouts_total": n_total_rollouts,

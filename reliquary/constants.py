@@ -597,11 +597,29 @@ if not _math.isfinite(LEARNING_RATE) or not 0.0 < LEARNING_RATE <= 1e-3:
 # PPO clip range. Standard in GRPO/RLHF literature.
 PPO_CLIP_EPSILON = 0.2
 
+# Optional pre-step trust-region circuit breaker. A value of 1.0 is the
+# compatibility default and cannot trigger because the observed fraction is at
+# most 1. Recovery runs can set a lower calibrated ceiling so an unpublished
+# policy that has drifted too far from the serving behavior policy is never
+# stepped or published.
+PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD = float(_os.environ.get(
+    "RELIQUARY_PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD", "1.0"
+))
+if (
+    not _math.isfinite(PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD)
+    or not 0.0 < PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD <= 1.0
+):
+    raise ValueError(
+        "RELIQUARY_PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD must be finite "
+        "and within (0, 1]"
+    )
+
 # KL penalty weight. The correct value depends on the reference lifecycle:
-# DeepSeekMath used 0.04 with a rolling reference, while DeepSeek-R1 reports
-# 0.001 with periodic refresh. Keep the current value as the compatibility
-# default, but make it operator-configurable so a fixed-reference experiment can
-# be calibrated without another code release.
+# DeepSeekMath reports 0.04, while DAPO removes the reference KL term entirely.
+# Neither choice transfers mechanically to this smaller mixed-domain online
+# run. Keep the current value as the compatibility default, but make it
+# operator-configurable so fixed-reference recovery can be calibrated without
+# another code release.
 KL_BETA = float(_os.environ.get("RELIQUARY_KL_BETA", "0.04"))
 if not 0.0 <= KL_BETA <= 1.0:
     raise ValueError("RELIQUARY_KL_BETA must be finite and within [0, 1]")

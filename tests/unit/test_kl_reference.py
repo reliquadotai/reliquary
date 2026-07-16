@@ -85,6 +85,9 @@ def test_fixed_kl_reference_is_pinned_frozen_and_observable(
         "behavior_logprobs": "verify_model",
         "learning_rate": service_mod.LEARNING_RATE,
         "grad_norm_skip_threshold": service_mod.GRAD_NORM_SKIP_THRESHOLD,
+        "ppo_ratio_outside_clip_skip_threshold": (
+            service_mod.PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD
+        ),
         "shape_penalty": service_mod.SHAPE_PENALTY,
         "shape_len_frac": service_mod.SHAPE_LEN_FRAC,
         "train_until_checkpoint_n": service_mod.TRAIN_UNTIL_CHECKPOINT_N,

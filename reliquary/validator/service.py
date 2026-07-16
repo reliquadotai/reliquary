@@ -49,6 +49,7 @@ from reliquary.constants import (
     MIN_EOS_PROBABILITY,
     POLL_INTERVAL_SECONDS,
     PPO_CLIP_EPSILON,
+    PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD,
     MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
     MAX_SEAL_QUEUE_DRAIN_SECONDS,
     PROOF_ADMISSION_STALL_POLL_SECONDS,
@@ -509,6 +510,9 @@ class ValidationService:
             ),
             "learning_rate": LEARNING_RATE,
             "grad_norm_skip_threshold": GRAD_NORM_SKIP_THRESHOLD,
+            "ppo_ratio_outside_clip_skip_threshold": (
+                PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD
+            ),
             "shape_penalty": SHAPE_PENALTY,
             "shape_len_frac": SHAPE_LEN_FRAC,
             "train_until_checkpoint_n": TRAIN_UNTIL_CHECKPOINT_N,
@@ -595,6 +599,9 @@ class ValidationService:
                 ),
                 "learning_rate": LEARNING_RATE,
                 "grad_norm_skip_threshold": GRAD_NORM_SKIP_THRESHOLD,
+                "ppo_ratio_outside_clip_skip_threshold": (
+                    PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD
+                ),
                 "shape_penalty": SHAPE_PENALTY,
                 "shape_len_frac": SHAPE_LEN_FRAC,
                 "train_until_checkpoint_n": TRAIN_UNTIL_CHECKPOINT_N,
@@ -622,6 +629,9 @@ class ValidationService:
             "pi_old_source": self.kl_reference_state["behavior_logprobs"],
             "learning_rate": LEARNING_RATE,
             "grad_norm_skip_threshold": GRAD_NORM_SKIP_THRESHOLD,
+            "ppo_ratio_outside_clip_skip_threshold": (
+                PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD
+            ),
             "shape_penalty": SHAPE_PENALTY,
             "shape_len_frac": SHAPE_LEN_FRAC,
             "train_until_checkpoint_n": TRAIN_UNTIL_CHECKPOINT_N,

@@ -384,6 +384,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--shape-penalty", type=float, default=0.5)
     parser.add_argument("--shape-len-frac", type=float, default=0.5)
     parser.add_argument("--grad-threshold", type=float, default=100.0)
+    parser.add_argument("--ppo-ratio-threshold", type=float, default=1.0)
     parser.add_argument(
         "--attention-implementation", default="flash_attention_2"
     )
@@ -401,6 +402,9 @@ def main() -> int:
     os.environ["RELIQUARY_SHAPE_LEN_FRAC"] = str(args.shape_len_frac)
     os.environ["RELIQUARY_GRAD_NORM_SKIP_THRESHOLD"] = str(
         args.grad_threshold
+    )
+    os.environ["RELIQUARY_PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD"] = str(
+        args.ppo_ratio_threshold
     )
     os.environ["RELIQUARY_RECOMPUTE_PI_OLD_FROM_VERIFY"] = "true"
     os.environ["GRAIL_ATTN_IMPL"] = args.attention_implementation
@@ -564,6 +568,7 @@ def main() -> int:
         "shape_penalty": args.shape_penalty,
         "shape_len_frac": args.shape_len_frac,
         "grad_threshold": args.grad_threshold,
+        "ppo_ratio_threshold": args.ppo_ratio_threshold,
         "attention_implementation": args.attention_implementation,
         "requested_steps": len(replay_batches),
         "completed_steps": sum(

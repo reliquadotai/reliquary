@@ -90,6 +90,21 @@ def test_startup_rebuild_horizon_env_overrides():
         importlib.reload(C)
 
 
+def test_policy_ratio_skip_threshold_env_override():
+    env_name = "RELIQUARY_PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD"
+    prior = os.environ.get(env_name)
+    os.environ[env_name] = "0.05"
+    try:
+        importlib.reload(C)
+        assert C.PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD == 0.05
+    finally:
+        if prior is None:
+            os.environ.pop(env_name, None)
+        else:
+            os.environ[env_name] = prior
+        importlib.reload(C)
+
+
 def test_v2_bootstrap_sigma_lower_than_steady():
     # Bootstrap accepts groups with lower σ (σ ≥ 0.33) vs steady (σ ≥ 0.43)
     assert C.BOOTSTRAP_SIGMA_MIN < C.SIGMA_MIN
