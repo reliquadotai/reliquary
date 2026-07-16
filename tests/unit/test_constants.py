@@ -105,6 +105,18 @@ def test_policy_ratio_skip_threshold_env_override():
         importlib.reload(C)
 
 
+def test_shaping_defaults_disabled():
+    env_name = "RELIQUARY_SHAPE_PENALTY"
+    prior = os.environ.pop(env_name, None)
+    try:
+        importlib.reload(C)
+        assert C.SHAPE_PENALTY == 0.0
+    finally:
+        if prior is not None:
+            os.environ[env_name] = prior
+        importlib.reload(C)
+
+
 def test_v2_bootstrap_sigma_lower_than_steady():
     # Bootstrap accepts groups with lower σ (σ ≥ 0.33) vs steady (σ ≥ 0.43)
     assert C.BOOTSTRAP_SIGMA_MIN < C.SIGMA_MIN

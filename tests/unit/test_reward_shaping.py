@@ -28,24 +28,22 @@ def _roll(
     return SimpleNamespace(
         reward=reward,
         env_name=env_name,
-        commit={
-            "rollout": {
-                "prompt_length": 1,
-                "completion_length": completion_length,
-                "token_logprobs": [-1.0] * completion_length,
-                "forced": forced,
-                "truncated": truncated,
-            }
-        },
+        commit={"rollout": {
+            "prompt_length": 1,
+            "completion_length": completion_length,
+            "token_logprobs": [-1.0] * completion_length,
+            "forced": forced,
+            "truncated": truncated,
+        }},
     )
 
 
 def test_shaping_penalizes_under_thinking_only(shaping_enabled):
     early = int(C.SHAPE_LEN_FRAC * C.BFT_THINKING_BUDGET) - 1
     rollouts = [
-        _roll(0.0, early),  # finished-early + wrong → penalize
-        _roll(1.0, early),  # finished-early + correct → keep
-        _roll(0.0, C.BFT_THINKING_BUDGET),  # long + wrong (tried hard) → keep
+        _roll(0.0, early),                    # finished-early + wrong → penalize
+        _roll(1.0, early),                    # finished-early + correct → keep
+        _roll(0.0, C.BFT_THINKING_BUDGET),    # long + wrong (tried hard) → keep
     ]
     out = _shape_advantages(rollouts, [0.3, 0.3, 0.3])
     assert out[0] == -C.SHAPE_PENALTY

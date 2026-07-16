@@ -51,7 +51,6 @@ PROOF_SKETCH_TOLERANCE_GROWTH = 5.0
 # because sketch commitments are bit-sensitive to attention kernel variance.
 import math as _math
 import os as _os
-
 ATTN_IMPLEMENTATION = _os.environ.get("GRAIL_ATTN_IMPL", "flash_attention_2")
 
 # ────────────────  TIMING (CONSENSUS)  ────────────────
@@ -108,10 +107,14 @@ BFT_FORCE_TEMPLATE = "</think>\n\nFinal Answer: \\boxed{"
 # SHAPE_PENALTY = 0 disables shaping.
 SHAPE_PENALTY = float(_os.environ.get("RELIQUARY_SHAPE_PENALTY", "0"))
 if not _math.isfinite(SHAPE_PENALTY) or not 0.0 <= SHAPE_PENALTY <= 10.0:
-    raise ValueError("RELIQUARY_SHAPE_PENALTY must be finite and within [0, 10]")
+    raise ValueError(
+        "RELIQUARY_SHAPE_PENALTY must be finite and within [0, 10]"
+    )
 SHAPE_LEN_FRAC = float(_os.environ.get("RELIQUARY_SHAPE_LEN_FRAC", "0.5"))
 if not _math.isfinite(SHAPE_LEN_FRAC) or not 0.0 < SHAPE_LEN_FRAC <= 1.0:
-    raise ValueError("RELIQUARY_SHAPE_LEN_FRAC must be finite and within (0, 1]")
+    raise ValueError(
+        "RELIQUARY_SHAPE_LEN_FRAC must be finite and within (0, 1]"
+    )
 
 # Cap/non-EOS truncation budget per submission. A single missing-EOS rollout
 # can be an honest local max-token accident; repeated missing-EOS rollouts in
@@ -357,7 +360,9 @@ BATCH_PROMPT_COOLDOWN_WINDOWS = 1_000_000
 # (CHECKPOINT_PUBLISH_INTERVAL_WINDOWS). It is also the scan size for the
 # no-snapshot fallback. The old 300 default under-covered the 1M horizon and
 # let prompts beyond 300 windows back re-enter the batch (replay exploit).
-COOLDOWN_REBUILD_LOOKBACK = int(_os.environ.get("COOLDOWN_REBUILD_LOOKBACK", "2000"))
+COOLDOWN_REBUILD_LOOKBACK = int(
+    _os.environ.get("COOLDOWN_REBUILD_LOOKBACK", "2000")
+)
 
 # Identity the cooldown snapshot is keyed by. Stable across restarts of the
 # SAME training run (successive checkpoints share it); change it when starting a
@@ -392,7 +397,7 @@ PROMPT_RANGE_SIZE = int(_os.environ.get("PROMPT_RANGE_SIZE", "5000"))
 # agreed cutover window AFTER the gated client is released and announced,
 # otherwise un-upgraded miners are rejected ~every window.
 PROMPT_RANGE_ENFORCE_FROM_WINDOW = int(
-    _os.environ.get("PROMPT_RANGE_ENFORCE_FROM_WINDOW", str(2**63 - 1))
+    _os.environ.get("PROMPT_RANGE_ENFORCE_FROM_WINDOW", str(2 ** 63 - 1))
 )
 
 # Per-rollout content dedup horizon. Independent of and strictly longer
@@ -459,7 +464,6 @@ MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW = 2
 # miners are publishing envelope sigs, set to True (default). The
 # False path is the pre-PR behaviour and remains DoS-exposed.
 import os as _os
-
 ENFORCE_ENVELOPE_SIGNATURE = _os.environ.get(
     "RELIQUARY_ENFORCE_ENVELOPE_SIGNATURE", "1"
 ).strip().lower() not in ("0", "false", "no", "off", "")
@@ -497,11 +501,14 @@ DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES = int(
     _os.environ.get("RELIQUARY_DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES", "96")
 )
 DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR = int(
-    _os.environ.get("RELIQUARY_DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR", "2")
+    _os.environ.get(
+        "RELIQUARY_DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR", "2"
+    )
 )
 if DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR <= 0:
     raise ValueError(
-        "RELIQUARY_DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR must be positive"
+        "RELIQUARY_DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR "
+        "must be positive"
     )
 
 # How many drand-quicknet rounds backward of the validator's current round
@@ -583,7 +590,9 @@ EMA_ALPHA = 2.0 / (72 + 1)  # ≈ 0.0274
 # DAPO / R1-Zero-scale literature (1e-6 to 5e-6) by bumping to 5e-6.
 LEARNING_RATE = float(_os.environ.get("RELIQUARY_LEARNING_RATE", "5e-6"))
 if not _math.isfinite(LEARNING_RATE) or not 0.0 < LEARNING_RATE <= 1e-3:
-    raise ValueError("RELIQUARY_LEARNING_RATE must be finite and within (0, 1e-3]")
+    raise ValueError(
+        "RELIQUARY_LEARNING_RATE must be finite and within (0, 1e-3]"
+    )
 
 # PPO clip range. Standard in GRPO/RLHF literature.
 PPO_CLIP_EPSILON = 0.2
@@ -593,9 +602,9 @@ PPO_CLIP_EPSILON = 0.2
 # most 1. Recovery runs can set a lower calibrated ceiling so an unpublished
 # policy that has drifted too far from the serving behavior policy is never
 # stepped or published.
-PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD = float(
-    _os.environ.get("RELIQUARY_PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD", "1.0")
-)
+PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD = float(_os.environ.get(
+    "RELIQUARY_PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD", "1.0"
+))
 if (
     not _math.isfinite(PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD)
     or not 0.0 < PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD <= 1.0
@@ -632,8 +641,13 @@ GRAD_CLIP_NORM = 1.0
 GRAD_NORM_SKIP_THRESHOLD = float(
     _os.environ.get("RELIQUARY_GRAD_NORM_SKIP_THRESHOLD", "100.0")
 )
-if not _math.isfinite(GRAD_NORM_SKIP_THRESHOLD) or GRAD_NORM_SKIP_THRESHOLD <= 0.0:
-    raise ValueError("RELIQUARY_GRAD_NORM_SKIP_THRESHOLD must be finite and positive")
+if (
+    not _math.isfinite(GRAD_NORM_SKIP_THRESHOLD)
+    or GRAD_NORM_SKIP_THRESHOLD <= 0.0
+):
+    raise ValueError(
+        "RELIQUARY_GRAD_NORM_SKIP_THRESHOLD must be finite and positive"
+    )
 
 # PPO's old policy is the published checkpoint miners generated against. When
 # enabled, recompute those log-probabilities with verify_model rather than
@@ -709,11 +723,11 @@ LOGPROB_IS_EPS = 0.10
 # token" is the token the miner sampled at step t; its probability under
 # the validator's model (at the protocol temperature) is
 # p_t = softmax(logits_{t-1} / T)[token_t].
-SAMPLING_MIN_STEPS = 30  # completion must be at least this long
-SAMPLING_LOW_P = 0.10  # prob <= this → "low" chosen token
-SAMPLING_HIGH_P = 0.90  # prob >= this → "high" chosen token
+SAMPLING_MIN_STEPS = 30         # completion must be at least this long
+SAMPLING_LOW_P = 0.10           # prob <= this → "low" chosen token
+SAMPLING_HIGH_P = 0.90           # prob >= this → "high" chosen token
 SAMPLING_MEDIAN_LOW_MAX = 0.30  # median chosen prob must be above
-SAMPLING_LOW_Q10_MAX = 0.025  # 10th-percentile must be above
+SAMPLING_LOW_Q10_MAX = 0.025    # 10th-percentile must be above
 
 # OpenMath final-answer tamper guard. The reward parser keys off the last
 # \boxed{...} content; swapping a few tokens there flips the reward without
