@@ -6,6 +6,7 @@ import pytest
 
 from scripts.screen_recovery_checkpoints import (
     _token_repetition,
+    resolve_model_source,
     select_tasks,
     summarize,
 )
@@ -107,3 +108,29 @@ def test_token_repetition_detects_runs_and_repeated_ngrams():
     diverse_ratio, diverse_run = _token_repetition(list(range(12)))
     assert diverse_ratio == 0.0
     assert diverse_run == 1
+
+
+def test_resolve_model_source_accepts_local_candidate(tmp_path):
+    source, kwargs, identity = resolve_model_source(
+        model_repo=None,
+        model_revision=None,
+        model_path=tmp_path,
+    )
+
+    assert source == str(tmp_path.resolve())
+    assert kwargs == {}
+    assert identity == {
+        "kind": "local",
+        "repo": None,
+        "revision": None,
+        "path": str(tmp_path.resolve()),
+    }
+
+
+def test_resolve_model_source_requires_pinned_hub_revision():
+    with pytest.raises(ValueError, match="require --model-repo"):
+        resolve_model_source(
+            model_repo="owner/model",
+            model_revision=None,
+            model_path=None,
+        )

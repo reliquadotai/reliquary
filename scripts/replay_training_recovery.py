@@ -21,6 +21,9 @@ from types import SimpleNamespace
 from typing import Any
 
 
+_SYNTHETIC_CLAIM_METRIC_PREFIX = "train/pi_old_claim_"
+
+
 def _read_archive(path: Path) -> dict[str, Any]:
     with gzip.open(path, "rt", encoding="utf-8") as handle:
         archive = json.load(handle)
@@ -206,6 +209,28 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def strip_synthetic_claim_metrics(
+    metrics: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    """Remove claim-error metrics that archives cannot faithfully replay.
+
+    Public window archives intentionally omit miner-claimed token
+    log-probabilities. ``materialize_training_batch`` inserts zero placeholders
+    because the trusted behavior model supplies PPO's actual pi_old. Comparing
+    those placeholders with recomputed values would produce plausible-looking
+    but meaningless claim-error telemetry.
+    """
+    cleaned = dict(metrics)
+    ignored = sorted(
+        key
+        for key in cleaned
+        if key.startswith(_SYNTHETIC_CLAIM_METRIC_PREFIX)
+    )
+    for key in ignored:
+        cleaned.pop(key)
+    return cleaned, ignored
+
+
 def _snapshot(repo_id: str, revision: str) -> str:
     from huggingface_hub import snapshot_download
     from reliquary.shared.modeling import MODEL_SNAPSHOT_ALLOW_PATTERNS
@@ -377,6 +402,9 @@ def main() -> int:
             skip_reason = exc.reason
         finally:
             telemetry.log_training_step = original_log
+        captured, ignored_synthetic_metrics = strip_synthetic_claim_metrics(
+            captured
+        )
         step_results.append({
             "step_index": step_offset,
             "window_index": telemetry_step,
@@ -390,6 +418,7 @@ def main() -> int:
             "accumulator": replay_batch["accumulator"],
             "batch": replay_batch["batch_summary"],
             "metrics": captured,
+            "ignored_synthetic_metrics": ignored_synthetic_metrics,
         })
         if status != "stepped":
             break
@@ -425,6 +454,14 @@ def main() -> int:
             "allocated_before_bytes": allocated_before,
             "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
             "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
+        },
+        "archive_limitations": {
+            "miner_claimed_token_logprobs_available": False,
+            "pi_old_claim_error_metrics_valid": False,
+            "reason": (
+                "public archives omit miner-claimed token log-probabilities; "
+                "PPO uses behavior-model recomputation during replay"
+            ),
         },
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

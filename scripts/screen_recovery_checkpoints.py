@@ -96,6 +96,39 @@ def _token_repetition(tokens: list[int], ngram: int = 4) -> tuple[float, int]:
     return repeated_ratio, max_run
 
 
+def resolve_model_source(
+    *,
+    model_repo: str | None,
+    model_revision: str | None,
+    model_path: Path | None,
+) -> tuple[str, dict[str, str], dict[str, str | None]]:
+    """Resolve either an immutable Hub checkpoint or a local candidate."""
+    if model_path is not None:
+        if model_repo is not None or model_revision is not None:
+            raise ValueError(
+                "--model-path cannot be combined with Hub model arguments"
+            )
+        resolved = model_path.expanduser().resolve()
+        if not resolved.is_dir():
+            raise ValueError(f"local model path is not a directory: {resolved}")
+        return str(resolved), {}, {
+            "kind": "local",
+            "repo": None,
+            "revision": None,
+            "path": str(resolved),
+        }
+    if not model_repo or not model_revision:
+        raise ValueError(
+            "Hub checkpoints require --model-repo and --model-revision"
+        )
+    return model_repo, {"revision": model_revision}, {
+        "kind": "hub",
+        "repo": model_repo,
+        "revision": model_revision,
+        "path": None,
+    }
+
+
 def summarize(samples: list[dict[str, Any]], n_prompts: int) -> dict[str, Any]:
     by_task: dict[str, list[dict[str, Any]]] = {}
     for sample in samples:
@@ -139,8 +172,10 @@ def summarize(samples: list[dict[str, Any]], n_prompts: int) -> dict[str, Any]:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model-repo", required=True)
-    parser.add_argument("--model-revision", required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--model-repo")
+    source.add_argument("--model-path", type=Path)
+    parser.add_argument("--model-revision")
     parser.add_argument("--checkpoint-label", required=True)
     parser.add_argument("--tokenizer-repo", default="Qwen/Qwen3.5-2B")
     parser.add_argument(
@@ -167,6 +202,12 @@ def main() -> int:
     args = _parser().parse_args()
     if args.samples_per_prompt <= 0:
         raise ValueError("samples_per_prompt must be positive")
+
+    model_source, model_kwargs, model_identity = resolve_model_source(
+        model_repo=args.model_repo,
+        model_revision=args.model_revision,
+        model_path=args.model_path,
+    )
 
     import torch
 
@@ -196,10 +237,10 @@ def main() -> int:
         revision=args.tokenizer_revision,
     )
     model = load_text_generation_model(
-        args.model_repo,
-        revision=args.model_revision,
+        model_source,
         dtype=torch.bfloat16,
         attn_implementation=args.attention_implementation,
+        **model_kwargs,
     ).to("cuda:0").eval()
     eos_ids = resolve_eos_token_ids(model, tokenizer)
     think_close_ids = set(think_close_token_ids(tokenizer))
@@ -317,6 +358,8 @@ def main() -> int:
         "checkpoint_label": args.checkpoint_label,
         "model_repo": args.model_repo,
         "model_revision": args.model_revision,
+        "model_path": model_identity["path"],
+        "model_source_kind": model_identity["kind"],
         "tokenizer_repo": args.tokenizer_repo,
         "tokenizer_revision": args.tokenizer_revision,
         "dataset_path": str(args.math_jsonl.resolve()),

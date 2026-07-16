@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import pytest
 
-from scripts.replay_training_recovery import reconstruct_balanced_batch
+from scripts.replay_training_recovery import (
+    reconstruct_balanced_batch,
+    strip_synthetic_claim_metrics,
+)
 
 
 def _archive(
@@ -79,3 +82,21 @@ def test_reconstruct_balanced_batch_rejects_missing_source_window():
 
     with pytest.raises(ValueError, match="missing source archive"):
         reconstruct_balanced_batch([second])
+
+
+def test_strip_synthetic_claim_metrics_keeps_policy_health_metrics():
+    cleaned, ignored = strip_synthetic_claim_metrics({
+        "train/grad_norm": 1.5,
+        "train/pi_old_claim_abs_error_mean": 0.25,
+        "train/pi_old_claim_token_count": 100.0,
+        "train/ppo_clip_active_ratio": 0.01,
+    })
+
+    assert cleaned == {
+        "train/grad_norm": 1.5,
+        "train/ppo_clip_active_ratio": 0.01,
+    }
+    assert ignored == [
+        "train/pi_old_claim_abs_error_mean",
+        "train/pi_old_claim_token_count",
+    ]
