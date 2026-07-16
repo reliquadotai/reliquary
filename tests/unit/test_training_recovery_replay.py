@@ -1,12 +1,27 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from scripts.replay_training_recovery import (
+    _source_revision,
     parse_legacy_targets,
     reconstruct_balanced_batch,
     strip_synthetic_claim_metrics,
 )
+
+
+def test_source_revision_captures_full_mounted_checkout_sha(
+    monkeypatch, tmp_path
+):
+    revision = "c" * 40
+    monkeypatch.setattr(
+        "scripts.replay_training_recovery.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout=f"{revision}\n"),
+    )
+
+    assert _source_revision(tmp_path) == revision
 
 
 def _archive(

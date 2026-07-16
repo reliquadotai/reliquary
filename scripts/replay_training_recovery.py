@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import time
 from types import SimpleNamespace
 from typing import Any
@@ -308,6 +309,36 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _source_revision(repository: Path | None = None) -> str | None:
+    """Best-effort identity of the mounted source tree used for replay."""
+    repository = (
+        Path(__file__).resolve().parents[1]
+        if repository is None
+        else repository.resolve()
+    )
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "-c",
+                f"safe.directory={repository}",
+                "rev-parse",
+                "HEAD",
+            ],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        revision = completed.stdout.strip().lower()
+        if _IMMUTABLE_REVISION.fullmatch(revision) is not None:
+            return revision
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    revision = os.environ.get("RELIQUARY_BUILD_REVISION", "").strip().lower()
+    return revision or None
+
+
 def strip_synthetic_claim_metrics(
     metrics: dict[str, Any],
 ) -> tuple[dict[str, Any], list[str]]:
@@ -396,6 +427,10 @@ def _parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = _parser().parse_args()
+    # Capture source identity before model work. Operators may fast-forward the
+    # mounted checkout while a long replay is still running.
+    reliquary_revision = _source_revision()
+    replay_script_sha256 = _sha256(Path(__file__).resolve())
     os.environ["RELIQUARY_LEARNING_RATE"] = str(args.learning_rate)
     os.environ["RELIQUARY_KL_BETA"] = str(args.kl_beta)
     os.environ["RELIQUARY_SHAPE_PENALTY"] = str(args.shape_penalty)
@@ -557,6 +592,8 @@ def main() -> int:
 
     result = {
         "schema_version": 1,
+        "reliquary_revision": reliquary_revision,
+        "replay_script_sha256": replay_script_sha256,
         "status": status,
         "skip_reason": skip_reason,
         "checkpoint_repo": args.checkpoint_repo,
