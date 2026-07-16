@@ -453,6 +453,15 @@ class ValidationService:
                 from huggingface_hub import snapshot_download
 
                 base_path = snapshot_download(repo_id=repo, revision=rev)
+                path_revision = Path(base_path).resolve().name.lower()
+                if (
+                    _HF_COMMIT_RE.fullmatch(path_revision) is not None
+                    and path_revision != rev
+                ):
+                    raise RuntimeError(
+                        "fixed KL snapshot resolved to an unexpected revision: "
+                        f"requested={rev} resolved={path_revision}"
+                    )
                 self.base_ref_model = self._load_model_fn(base_path)
                 self.base_ref_model.eval()
                 for _p in self.base_ref_model.parameters():
@@ -466,7 +475,7 @@ class ValidationService:
                     f"failed to load required fixed KL reference {KL_BASE_MODEL}"
                 ) from exc
 
-            resolved_revision = Path(base_path).resolve().name.lower()
+            resolved_revision = path_revision
             if _HF_COMMIT_RE.fullmatch(resolved_revision) is None:
                 # Some injected/custom downloaders return a non-cache path. The
                 # requested revision is already a full immutable SHA, so retain it

@@ -118,6 +118,25 @@ def test_fixed_kl_reference_load_failure_is_fatal(monkeypatch):
         _service(nn.Linear(2, 2))
 
 
+def test_fixed_kl_reference_rejects_unexpected_resolved_sha(
+    monkeypatch, tmp_path,
+):
+    requested = "b" * 40
+    resolved = "c" * 40
+    snapshot = tmp_path / "snapshots" / resolved
+    snapshot.mkdir(parents=True)
+    monkeypatch.setattr(
+        service_mod, "KL_BASE_MODEL", f"owner/repo@{requested}"
+    )
+    monkeypatch.setattr(
+        "huggingface_hub.snapshot_download",
+        lambda **_kwargs: str(snapshot),
+    )
+
+    with pytest.raises(RuntimeError, match="failed to load required fixed"):
+        _service(nn.Linear(2, 2), load_model_fn=lambda _path: nn.Linear(2, 2))
+
+
 def test_default_kl_reference_remains_rolling(monkeypatch):
     monkeypatch.setattr(service_mod, "KL_BASE_MODEL", "")
     svc = _service(nn.Linear(2, 2))
@@ -125,4 +144,3 @@ def test_default_kl_reference_remains_rolling(monkeypatch):
     assert svc.base_ref_model is None
     assert svc.kl_reference_state["mode"] == "rolling"
     assert svc.kl_reference_state["loaded"] is True
-
