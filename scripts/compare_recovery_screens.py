@@ -46,7 +46,9 @@ METRIC_DIRECTIONS = {
     "termination_rate": 1,
     "forced_rate": -1,
     "rambling_proxy_rate": -1,
-    "mean_completion_length": -1,
+    # Length has no monotonic direction: lower can mean concise reasoning or
+    # the under-thinking collapse this recovery process is meant to catch.
+    "mean_completion_length": 0,
 }
 
 
@@ -175,9 +177,11 @@ def compare_screens(
             ))
         ci_low = _quantile(bootstrapped, 0.025)
         ci_high = _quantile(bootstrapped, 0.975)
-        favorable_probability = sum(
-            direction * delta > 0.0 for delta in bootstrapped
-        ) / iterations
+        favorable_probability = None
+        if direction:
+            favorable_probability = sum(
+                direction * delta > 0.0 for delta in bootstrapped
+            ) / iterations
         metrics[metric] = {
             "baseline": statistics.fmean(
                 baseline_tasks[task_id][metric] for task_id in task_ids
@@ -187,7 +191,11 @@ def compare_screens(
             ),
             "delta": observed,
             "ci_95": [ci_low, ci_high],
-            "direction": "higher_is_better" if direction > 0 else "lower_is_better",
+            "direction": (
+                "higher_is_better"
+                if direction > 0
+                else "lower_is_better" if direction < 0 else "context_only"
+            ),
             "probability_favorable": favorable_probability,
         }
 
@@ -223,11 +231,13 @@ def render_markdown(report: dict[str, Any]) -> str:
     ]
     for metric, values in report["metrics"].items():
         ci_low, ci_high = values["ci_95"]
+        favorable = values["probability_favorable"]
+        favorable_text = "n/a" if favorable is None else f"{favorable:.3f}"
         lines.append(
             f"| {metric} | {values['baseline']:.6g} | "
             f"{values['candidate']:.6g} | {values['delta']:+.6g} | "
             f"[{ci_low:+.6g}, {ci_high:+.6g}] | "
-            f"{values['probability_favorable']:.3f} |"
+            f"{favorable_text} |"
         )
     return "\n".join(lines) + "\n"
 

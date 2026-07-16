@@ -87,4 +87,6 @@ def test_compare_screens_clusters_by_task_and_is_deterministic():
     assert first["metrics"]["forced_rate"]["delta"] == -0.5
     assert first["metrics"]["forced_rate"]["probability_favorable"] > 0.7
     assert first["metrics"]["mean_completion_length"]["delta"] == -10.0
+    assert first["metrics"]["mean_completion_length"]["direction"] == "context_only"
+    assert first["metrics"]["mean_completion_length"]["probability_favorable"] is None
     assert "candidate vs base" in render_markdown(first)
