@@ -213,6 +213,7 @@ def test_token_repetition_detects_runs_and_repeated_ngrams():
 
 
 def test_resolve_model_source_accepts_local_candidate(tmp_path):
+    (tmp_path / "model.safetensors").write_bytes(b"candidate-weights")
     source, kwargs, identity = resolve_model_source(
         model_repo=None,
         model_revision=None,
@@ -226,6 +227,9 @@ def test_resolve_model_source_accepts_local_candidate(tmp_path):
         "repo": None,
         "revision": None,
         "path": str(tmp_path.resolve()),
+        "snapshot_sha256": (
+            "938992c8a9eaf77fff080d0000df866473c24d0d6f2745e33747f948acf69e38"
+        ),
     }
 
 

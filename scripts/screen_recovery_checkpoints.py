@@ -32,6 +32,20 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _directory_snapshot_sha256(directory: Path) -> str:
+    """Bind every relative path and byte in a local model snapshot."""
+    digest = hashlib.sha256()
+    for path in sorted(candidate for candidate in directory.rglob("*") if candidate.is_file()):
+        relative = path.relative_to(directory).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(path.stat().st_size.to_bytes(8, "big"))
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _source_revision(repository: Path | None = None) -> str | None:
     """Best-effort identity of the mounted source tree used for the screen."""
     repository = (
@@ -194,6 +208,7 @@ def resolve_model_source(
             "repo": None,
             "revision": None,
             "path": str(resolved),
+            "snapshot_sha256": _directory_snapshot_sha256(resolved),
         }
     if not model_repo or not model_revision:
         raise ValueError(
@@ -204,6 +219,7 @@ def resolve_model_source(
         "repo": model_repo,
         "revision": model_revision,
         "path": None,
+        "snapshot_sha256": None,
     }
 
 
@@ -504,6 +520,7 @@ def main() -> int:
         "model_repo": args.model_repo,
         "model_revision": args.model_revision,
         "model_path": model_identity["path"],
+        "model_snapshot_sha256": model_identity["snapshot_sha256"],
         "model_source_kind": model_identity["kind"],
         "tokenizer_repo": args.tokenizer_repo,
         "tokenizer_revision": args.tokenizer_revision,
