@@ -90,9 +90,21 @@ def test_reconstruct_legacy_full_window_requires_exact_explicit_contract():
     archive = {
         "window_start": 20,
         "batch": [
-            {"env_name": "math", "prompt_idx": 1},
-            {"env_name": "math", "prompt_idx": 2},
-            {"env_name": "code", "prompt_idx": 3},
+            {
+                "env_name": "math",
+                "prompt_idx": 1,
+                "claimed_checkpoint_hash": revision,
+            },
+            {
+                "env_name": "math",
+                "prompt_idx": 2,
+                "claimed_checkpoint_hash": revision,
+            },
+            {
+                "env_name": "code",
+                "prompt_idx": 3,
+                "claimed_checkpoint_hash": revision,
+            },
         ],
     }
 
@@ -105,6 +117,8 @@ def test_reconstruct_legacy_full_window_requires_exact_explicit_contract():
     assert order == ["math", "code"]
     assert [len(batch) for batch in batches] == [2, 1]
     assert metadata["checkpoint_revision"] == revision
+    assert metadata["checkpoint_claims"] == [revision]
+    assert metadata["checkpoint_claims_available"] is True
     assert metadata["legacy_full_window"] is True
 
     with pytest.raises(ValueError, match="immutable checkpoint"):
@@ -117,6 +131,52 @@ def test_reconstruct_legacy_full_window_requires_exact_explicit_contract():
             legacy_checkpoint_revision=revision,
             legacy_targets={"math": 1, "code": 1},
         )
+
+
+def test_reconstruct_legacy_full_window_rejects_claim_mismatch():
+    explicit_revision = "b" * 40
+    archive = {
+        "window_start": 20,
+        "batch": [
+            {
+                "env_name": "math",
+                "prompt_idx": 1,
+                "claimed_checkpoint_hash": "c" * 40,
+            },
+            {
+                "env_name": "code",
+                "prompt_idx": 2,
+                "claimed_checkpoint_hash": "c" * 40,
+            },
+        ],
+    }
+
+    with pytest.raises(ValueError, match="claims do not match"):
+        reconstruct_balanced_batch(
+            [archive],
+            legacy_checkpoint_revision=explicit_revision,
+            legacy_targets={"math": 1, "code": 1},
+        )
+
+
+def test_reconstruct_legacy_full_window_allows_uniformly_missing_old_claims():
+    revision = "b" * 40
+    archive = {
+        "window_start": 20,
+        "batch": [
+            {"env_name": "math", "prompt_idx": 1},
+            {"env_name": "code", "prompt_idx": 2},
+        ],
+    }
+
+    _order, _batches, metadata = reconstruct_balanced_batch(
+        [archive],
+        legacy_checkpoint_revision=revision,
+        legacy_targets={"math": 1, "code": 1},
+    )
+
+    assert metadata["checkpoint_claims"] == []
+    assert metadata["checkpoint_claims_available"] is False
 
 
 def test_parse_legacy_targets_is_explicit_and_unique():

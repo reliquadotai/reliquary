@@ -69,12 +69,19 @@ def reconstruct_balanced_batch(
         grouped: dict[str, list[dict[str, Any]]] = {
             name: [] for name in legacy_targets
         }
+        observed_claims: set[str] = set()
+        missing_claims = 0
         for group in archive.get("batch") or []:
             env_name = str(group.get("env_name") or "")
             if env_name not in grouped:
                 raise ValueError(
                     f"legacy full window contains unexpected environment {env_name!r}"
                 )
+            claim = str(group.get("claimed_checkpoint_hash") or "").strip()
+            if claim:
+                observed_claims.add(claim)
+            else:
+                missing_claims += 1
             grouped[env_name].append(group)
         counts = {name: len(groups) for name, groups in grouped.items()}
         if counts != legacy_targets:
@@ -82,9 +89,23 @@ def reconstruct_balanced_batch(
                 "legacy full-window counts do not match explicit targets: "
                 f"counts={counts} targets={legacy_targets}"
             )
+        if observed_claims and missing_claims:
+            raise ValueError(
+                "legacy full window mixes present and missing checkpoint claims"
+            )
+        if observed_claims != {legacy_checkpoint_revision}:
+            if observed_claims:
+                raise ValueError(
+                    "legacy full-window checkpoint claims do not match the "
+                    "explicit revision: "
+                    f"claims={sorted(observed_claims)} "
+                    f"revision={legacy_checkpoint_revision}"
+                )
         env_order = list(legacy_targets)
         return env_order, [grouped[name] for name in env_order], {
             "checkpoint_revision": legacy_checkpoint_revision,
+            "checkpoint_claims": sorted(observed_claims),
+            "checkpoint_claims_available": bool(observed_claims),
             "targets": dict(legacy_targets),
             "counts": counts,
             "source_windows": [int(archive["window_start"])],
