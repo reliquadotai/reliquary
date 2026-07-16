@@ -7,9 +7,25 @@ test_training_grpo.py and test_training_rollout_loss.py.
 """
 
 import logging
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-from reliquary.validator.training import train_step, reset_training_state
+import torch
+
+from reliquary.validator.training import (
+    _build_optimizer,
+    reset_training_state,
+    train_step,
+)
+
+
+def test_optimizer_uses_torch_for_cpu_parameters_on_gpu_host(monkeypatch):
+    """GPU availability alone must not select a CUDA-only optimizer."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    parameter = torch.nn.Parameter(torch.ones(1))
+
+    optimizer = _build_optimizer([parameter])
+
+    assert isinstance(optimizer, torch.optim.AdamW)
 
 
 def test_train_step_with_empty_batch():
@@ -31,7 +47,6 @@ def test_train_step_returns_model_on_all_degenerate_groups():
     and the original model is still returned."""
     reset_training_state()
 
-    import torch
     import reliquary.validator.training as _t
 
     # Build a tiny linear model so _lazy_init and device resolution work.
@@ -61,8 +76,6 @@ def test_train_step_forwards_metrics_to_telemetry(monkeypatch):
     telemetry.log_training_step with the GRPO metrics dict and the
     window_index as the step."""
     from unittest.mock import MagicMock
-    import torch
-
     import reliquary.validator.training as _t
     from reliquary.validator import telemetry
 
@@ -106,18 +119,36 @@ def test_train_step_forwards_metrics_to_telemetry(monkeypatch):
     assert captured["step"] == 7
     m = captured["metrics"]
     for key in (
-        "train/lr", "train/ppo_loss", "train/kl", "train/grad_norm",
+        "train/lr", "train/lr_applied", "train/lr_next",
+        "train/ppo_loss", "train/kl", "train/grad_norm",
         "train/kl_beta", "train/kl_penalty_objective",
         "train/kl_to_ppo_abs_ratio", "train/kl_token_max",
         "train/kl_token_nonfinite_ratio", "train/grad_clip_ratio",
         "train/grad_was_clipped", "train/step_skipped_nonfinite",
-        "train/step_skipped_grad_spike", "train/pi_old_recomputed",
+        "train/step_skipped_nonfinite_policy_ratio",
+        "train/step_skipped_grad_spike",
+        "train/step_skipped_policy_ratio_drift",
+        "train/ppo_ratio_outside_clip_skip_threshold",
+        "train/pi_old_recomputed",
+        "train/ppo_clip_active_ratio", "train/ppo_ratio_below_clip_ratio",
+        "train/ppo_ratio_above_clip_ratio",
+        "train/ppo_ratio_outside_clip_ratio",
+        "train/ppo_ratio_nonfinite_ratio", "train/ppo_log_ratio_abs_max",
+        "train/ppo_log_ratio_abs_gt_1_ratio",
+        "train/ppo_log_ratio_abs_gt_2_ratio",
+        "train/ppo_log_ratio_abs_gt_5_ratio",
+        "train/pi_old_claim_token_count",
+        "train/pi_old_claim_abs_error_mean",
+        "train/pi_old_claim_abs_error_max",
+        "train/pi_old_claim_gt_1e_3_ratio",
         "train/rollouts_processed", "train/rollouts_total",
         "train/valid_rollout_ratio",
         "rewards/mean", "rewards/std", "rewards/min", "rewards/max",
         "batch/n_groups", "batch/n_degenerate_groups", "batch/degenerate_ratio",
     ):
         assert key in m, f"missing metric {key}"
+    assert m["train/lr"] == m["train/lr_next"]
+    assert m["train/lr_applied"] < m["train/lr_next"]
     assert m["batch/n_groups"] == 1
     assert m["batch/n_degenerate_groups"] == 0
     assert m["rewards/min"] == 0.0
@@ -129,8 +160,6 @@ def test_train_step_counts_degenerate_groups(monkeypatch):
     n_groups and does not emit metrics (no successful step — early
     return before the metrics branch)."""
     from unittest.mock import MagicMock
-    import torch
-
     import reliquary.validator.training as _t
     from reliquary.validator import telemetry
 

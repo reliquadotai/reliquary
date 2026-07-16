@@ -287,7 +287,10 @@ def test_batched_grads_mask_bft_force_span_like_per_rollout():
     assert _rel_l2(bat_grads, ref_grads) < 5e-2
 
 
-def test_bft_training_metrics_measure_masked_and_weighted_exposure():
+def test_bft_training_metrics_measure_masked_and_weighted_exposure(
+    monkeypatch,
+):
+    monkeypatch.setattr("reliquary.constants.SHAPE_PENALTY", 0.0)
     forced = _build_rollout([1, 2, 3, 4, 5, 6, 7, 8], 1.0, 3)
     forced._validated_force_span = (5, 7)
     forced._validated_termination_path = "forced_phase2_eos"
@@ -304,7 +307,7 @@ def test_bft_training_metrics_measure_masked_and_weighted_exposure():
     assert metrics["bft/trainable_completion_tokens"] == 6
     assert metrics["bft/forced_trainable_token_ratio"] == 0.5
     assert metrics["bft/forced_abs_adv_weighted_token_ratio"] == pytest.approx(
-        2 / 3
+        0.5
     )
     assert metrics["bft/path/forced_phase2_eos/rollouts"] == 1
     assert metrics[
@@ -331,7 +334,10 @@ def test_atomic_matches_nonatomic_qwenlike():
 def test_kl_tail_stats_capture_weighted_objective_and_outliers():
     import copy
 
-    from reliquary.validator.training import _new_kl_stats
+    from reliquary.validator.training import (
+        _kl_telemetry_metrics,
+        _new_kl_stats,
+    )
 
     torch.manual_seed(4)
     model = _QwenLike()
@@ -354,6 +360,56 @@ def test_kl_tail_stats_capture_weighted_objective_and_outliers():
     assert stats["max"] >= 0.0
     assert math.isfinite(stats["weighted_ppo"])
     assert math.isfinite(stats["weighted_kl"])
+    assert stats["ppo_token_count"] == stats["token_count"]
+    assert stats["ppo_ratio_nonfinite_count"] == 0
+    outside_count = (
+        stats["ppo_ratio_below_clip_count"]
+        + stats["ppo_ratio_above_clip_count"]
+    )
+    assert 0 <= outside_count <= stats["ppo_token_count"]
+    metrics = _kl_telemetry_metrics(stats)
+    assert metrics["train/ppo_ratio_outside_clip_ratio"] == pytest.approx(
+        outside_count / stats["ppo_token_count"]
+    )
+
+
+def test_policy_health_stats_measure_recomputed_claim_error():
+    import copy
+
+    from reliquary.validator.training import (
+        _kl_telemetry_metrics,
+        _new_kl_stats,
+    )
+
+    torch.manual_seed(9)
+    model = _QwenLike()
+    groups = _sample_groups()
+    for group in groups:
+        for rollout in group.rollouts:
+            n = len(rollout.commit["rollout"]["token_logprobs"])
+            rollout.commit["rollout"]["token_logprobs"] = [-9.0] * n
+    plan, _ = _make_plan(groups)
+    stats = _new_kl_stats()
+
+    _accumulate_grouped_grads(
+        model,
+        _frozen(copy.deepcopy(model)),
+        plan,
+        next(model.parameters()).device,
+        budget=64,
+        atomic=False,
+        kl_stats=stats,
+        behavior_model=_frozen(copy.deepcopy(model)),
+    )
+    metrics = _kl_telemetry_metrics(stats)
+
+    assert metrics["train/pi_old_claim_token_count"] > 0
+    assert metrics["train/pi_old_claim_abs_error_mean"] > 1.0
+    assert metrics["train/pi_old_claim_abs_error_max"] > 1.0
+    assert metrics["train/pi_old_claim_gt_1e_3_ratio"] == 1.0
+    assert metrics["train/ppo_ratio_nonfinite_ratio"] == 0.0
+    assert metrics["train/ppo_ratio_outside_clip_ratio"] == 0.0
+    assert metrics["train/ppo_log_ratio_abs_gt_1_ratio"] == 0.0
 
 
 # ---------------------------------------------------------------------------

@@ -423,6 +423,9 @@ class _Health(BaseModel):
     training_accumulator_targets: dict[str, int] = Field(default_factory=dict)
     training_accumulator_counts: dict[str, int] = Field(default_factory=dict)
     training_accumulator_ready: bool = False
+    training_trained_windows_since_publish: int = 0
+    training_checkpoint_publish_interval: int = 0
+    training_checkpoint_publication_pending: bool = False
     forced_seed_enforced: bool = FORCED_SEED_ENFORCE
     forced_seed_consistency_floor: float = FORCED_SEED_CONSISTENCY_FLOOR
     forced_seed_rollout_floor: float = FORCED_SEED_ROLLOUT_FLOOR
@@ -490,6 +493,7 @@ class ValidatorServer:
         self._registration_refresh_lock = asyncio.Lock()
         self._last_registration_refresh_attempt = 0.0
         self._training_accumulator_state: dict[str, Any] = {}
+        self._training_publish_state: dict[str, Any] = {}
         self._training_kl_reference_state: dict[str, Any] = {}
         self._last_committed_window_n = 0
         self._candidate_window_n: int | None = None
@@ -583,6 +587,10 @@ class ValidatorServer:
     def set_training_accumulator_state(self, state: dict[str, Any]) -> None:
         """Expose a JSON-safe snapshot through ``/health``."""
         self._training_accumulator_state = dict(state)
+
+    def set_training_publish_state(self, state: dict[str, Any]) -> None:
+        """Expose checkpoint-cadence and pending-publication state."""
+        self._training_publish_state = dict(state)
 
     def set_training_kl_reference_state(self, state: dict[str, Any]) -> None:
         """Expose the effective, resolved KL reference through ``/health``."""
@@ -994,6 +1002,7 @@ class ValidatorServer:
             else None
         )
         accumulator = self._training_accumulator_state
+        training_publish = self._training_publish_state
         try:
             archive_queue = (
                 self._archive_queue_snapshot_callback()
@@ -1179,6 +1188,15 @@ class ValidatorServer:
             training_accumulator_targets=dict(accumulator.get("targets", {})),
             training_accumulator_counts=dict(accumulator.get("counts", {})),
             training_accumulator_ready=bool(accumulator.get("ready", False)),
+            training_trained_windows_since_publish=int(
+                training_publish.get("trained_windows_since_publish", 0)
+            ),
+            training_checkpoint_publish_interval=int(
+                training_publish.get("publish_interval", 0)
+            ),
+            training_checkpoint_publication_pending=bool(
+                training_publish.get("publication_pending", False)
+            ),
             forced_seed_enforced=FORCED_SEED_ENFORCE,
             forced_seed_consistency_floor=FORCED_SEED_CONSISTENCY_FLOOR,
             forced_seed_rollout_floor=FORCED_SEED_ROLLOUT_FLOOR,

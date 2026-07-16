@@ -102,9 +102,19 @@ BFT_FORCE_TEMPLATE = "</think>\n\nFinal Answer: \\boxed{"
 # Under-thinking side: a non-forced rollout that finished early
 # (completion_length < SHAPE_LEN_FRAC · BFT_THINKING_BUDGET) and is wrong gets its
 # advantage set to −SHAPE_PENALTY. Overlong side: a cap-truncated rollout gets
-# the same penalty. SHAPE_PENALTY = 0 disables shaping. TODO: sweep both values.
-SHAPE_PENALTY = 0.5
-SHAPE_LEN_FRAC = 0.5
+# the same penalty. These are validator-only objective controls, not generation
+# or wire constants, so operators can calibrate them without changing miners.
+# SHAPE_PENALTY = 0 disables shaping.
+SHAPE_PENALTY = float(_os.environ.get("RELIQUARY_SHAPE_PENALTY", "0"))
+if not _math.isfinite(SHAPE_PENALTY) or not 0.0 <= SHAPE_PENALTY <= 10.0:
+    raise ValueError(
+        "RELIQUARY_SHAPE_PENALTY must be finite and within [0, 10]"
+    )
+SHAPE_LEN_FRAC = float(_os.environ.get("RELIQUARY_SHAPE_LEN_FRAC", "0.5"))
+if not _math.isfinite(SHAPE_LEN_FRAC) or not 0.0 < SHAPE_LEN_FRAC <= 1.0:
+    raise ValueError(
+        "RELIQUARY_SHAPE_LEN_FRAC must be finite and within (0, 1]"
+    )
 
 # Cap/non-EOS truncation budget per submission. A single missing-EOS rollout
 # can be an honest local max-token accident; repeated missing-EOS rollouts in
@@ -587,11 +597,29 @@ if not _math.isfinite(LEARNING_RATE) or not 0.0 < LEARNING_RATE <= 1e-3:
 # PPO clip range. Standard in GRPO/RLHF literature.
 PPO_CLIP_EPSILON = 0.2
 
+# Optional pre-step trust-region circuit breaker. A value of 1.0 is the
+# compatibility default and cannot trigger because the observed fraction is at
+# most 1. Recovery runs can set a lower calibrated ceiling so an unpublished
+# policy that has drifted too far from the serving behavior policy is never
+# stepped or published.
+PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD = float(_os.environ.get(
+    "RELIQUARY_PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD", "1.0"
+))
+if (
+    not _math.isfinite(PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD)
+    or not 0.0 < PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD <= 1.0
+):
+    raise ValueError(
+        "RELIQUARY_PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD must be finite "
+        "and within (0, 1]"
+    )
+
 # KL penalty weight. The correct value depends on the reference lifecycle:
-# DeepSeekMath used 0.04 with a rolling reference, while DeepSeek-R1 reports
-# 0.001 with periodic refresh. Keep the current value as the compatibility
-# default, but make it operator-configurable so a fixed-reference experiment can
-# be calibrated without another code release.
+# DeepSeekMath reports 0.04, while DAPO removes the reference KL term entirely.
+# Neither choice transfers mechanically to this smaller mixed-domain online
+# run. Keep the current value as the compatibility default, but make it
+# operator-configurable so fixed-reference recovery can be calibrated without
+# another code release.
 KL_BETA = float(_os.environ.get("RELIQUARY_KL_BETA", "0.04"))
 if not 0.0 <= KL_BETA <= 1.0:
     raise ValueError("RELIQUARY_KL_BETA must be finite and within [0, 1]")
@@ -628,6 +656,17 @@ RECOMPUTE_PI_OLD_FROM_VERIFY = _os.environ.get(
     "RELIQUARY_RECOMPUTE_PI_OLD_FROM_VERIFY", "false"
 ).strip().lower() in ("1", "true", "yes", "on")
 
+# Optional persistent canary ceiling. When non-zero, a validator whose current
+# published checkpoint is already at or above this number keeps serving and
+# accumulating but performs no further optimizer steps. Unlike an in-process
+# step counter, this remains effective after a watchdog restart because the
+# checkpoint number is bootstrapped from Hugging Face.
+TRAIN_UNTIL_CHECKPOINT_N = int(
+    _os.environ.get("RELIQUARY_TRAIN_UNTIL_CHECKPOINT_N", "0")
+)
+if TRAIN_UNTIL_CHECKPOINT_N < 0:
+    raise ValueError("RELIQUARY_TRAIN_UNTIL_CHECKPOINT_N must be non-negative")
+
 # train_step micro-batching: cap on padded tokens (n_seqs × longest_seq) per
 # forward/backward. Short rollouts pack together; a rollout longer than this
 # runs alone (= the legacy one-at-a-time path), so peak memory never exceeds a
@@ -654,7 +693,7 @@ WANDB_PROJECT = "reliquary-validator"
 # Bumping this constant (or setting RELIQUARY_WANDB_VERSION) starts a
 # fresh wandb run. Same value across restarts → wandb resumes the
 # existing run (resume="allow").
-WANDB_TRAINING_VERSION = "v1"
+WANDB_TRAINING_VERSION = _os.environ.get("RELIQUARY_WANDB_VERSION", "v1")
 
 # ────────────────  BEHAVIOURAL VALIDATORS  ────────────────
 # Thresholds calibrated in the original grail repo against ~430k honest
