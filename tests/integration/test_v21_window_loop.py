@@ -620,6 +620,44 @@ async def test_disable_train_retains_ready_batch_until_reenabled(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_checkpoint_ceiling_pauses_persistently_until_raised(monkeypatch):
+    svc = _make_service(checkpoint_hash="sha256:cpA")
+    svc._checkpoint_n = 35
+    monkeypatch.setattr(
+        "reliquary.validator.service.TRAIN_UNTIL_CHECKPOINT_N", 35
+    )
+
+    with _patch_open_grpo_window(svc):
+        svc._open_window()
+    svc._activate_window()
+    for i in range(B_BATCH):
+        response = svc._active_batcher.accept_submission(_request(
+            hotkey=f"hk{i}", prompt_idx=i,
+            window_start=svc._active_batcher.window_start,
+            checkpoint_hash="sha256:cpA", seed=i,
+        ))
+        assert response.accepted
+    await svc._train_and_publish()
+
+    assert svc._training_accumulator.snapshot()["ready"] is True
+    svc._checkpoint_store.publish.assert_not_awaited()
+
+    monkeypatch.setattr(
+        "reliquary.validator.service.TRAIN_UNTIL_CHECKPOINT_N", 36
+    )
+    with _patch_open_grpo_window(svc):
+        svc._open_window()
+    svc._activate_window()
+    with patch(
+        "reliquary.validator.service.train_step",
+        side_effect=lambda model, batches, **kwargs: model,
+    ):
+        await svc._train_and_publish()
+
+    svc._checkpoint_store.publish.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_seal_drain_waits_for_inflight_proofs():
     """The seal-extension drain must wait for in-flight GRAIL proofs, not just
     an empty submit queue.

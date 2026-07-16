@@ -638,6 +638,17 @@ RECOMPUTE_PI_OLD_FROM_VERIFY = _os.environ.get(
     "RELIQUARY_RECOMPUTE_PI_OLD_FROM_VERIFY", "false"
 ).strip().lower() in ("1", "true", "yes", "on")
 
+# Optional persistent canary ceiling. When non-zero, a validator whose current
+# published checkpoint is already at or above this number keeps serving and
+# accumulating but performs no further optimizer steps. Unlike an in-process
+# step counter, this remains effective after a watchdog restart because the
+# checkpoint number is bootstrapped from Hugging Face.
+TRAIN_UNTIL_CHECKPOINT_N = int(
+    _os.environ.get("RELIQUARY_TRAIN_UNTIL_CHECKPOINT_N", "0")
+)
+if TRAIN_UNTIL_CHECKPOINT_N < 0:
+    raise ValueError("RELIQUARY_TRAIN_UNTIL_CHECKPOINT_N must be non-negative")
+
 # train_step micro-batching: cap on padded tokens (n_seqs × longest_seq) per
 # forward/backward. Short rollouts pack together; a rollout longer than this
 # runs alone (= the legacy one-at-a-time path), so peak memory never exceeds a

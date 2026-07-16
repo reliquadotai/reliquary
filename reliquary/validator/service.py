@@ -62,6 +62,7 @@ from reliquary.constants import (
     SPARSE_VALID_MAX_WINDOW_SECONDS,
     SIGMA_MIN,
     SUBNET_START_BLOCK,
+    TRAIN_UNTIL_CHECKPOINT_N,
     VALIDATOR_HTTP_PORT,
     WANDB_TRAINING_VERSION,
     WINDOW_LENGTH,
@@ -510,6 +511,7 @@ class ValidationService:
             "grad_norm_skip_threshold": GRAD_NORM_SKIP_THRESHOLD,
             "shape_penalty": SHAPE_PENALTY,
             "shape_len_frac": SHAPE_LEN_FRAC,
+            "train_until_checkpoint_n": TRAIN_UNTIL_CHECKPOINT_N,
         }
         if KL_BASE_MODEL:
             if model is None:
@@ -589,6 +591,7 @@ class ValidationService:
                 "grad_norm_skip_threshold": GRAD_NORM_SKIP_THRESHOLD,
                 "shape_penalty": SHAPE_PENALTY,
                 "shape_len_frac": SHAPE_LEN_FRAC,
+                "train_until_checkpoint_n": TRAIN_UNTIL_CHECKPOINT_N,
             }
             logger.info(
                 "GRPO KL reference=fixed repo=%s revision=%s beta=%.6g "
@@ -615,6 +618,7 @@ class ValidationService:
             "grad_norm_skip_threshold": GRAD_NORM_SKIP_THRESHOLD,
             "shape_penalty": SHAPE_PENALTY,
             "shape_len_frac": SHAPE_LEN_FRAC,
+            "train_until_checkpoint_n": TRAIN_UNTIL_CHECKPOINT_N,
         })
 
     @property
@@ -1460,12 +1464,28 @@ class ValidationService:
         # train_step has a known OOM/leak pattern that's poisoning the
         # GPU pool across windows. With this flag set the balanced retained
         # batch stays pending while this window is archived normally.
-        skip_train = os.environ.get("RELIQUARY_DISABLE_TRAIN", "").lower() in {"1", "true", "yes", "on"}
+        emergency_freeze = os.environ.get(
+            "RELIQUARY_DISABLE_TRAIN", ""
+        ).lower() in {"1", "true", "yes", "on"}
+        checkpoint_ceiling_reached = (
+            TRAIN_UNTIL_CHECKPOINT_N > 0
+            and self._checkpoint_n >= TRAIN_UNTIL_CHECKPOINT_N
+        )
+        skip_train = emergency_freeze or checkpoint_ceiling_reached
         if accumulator_ready and skip_train:
+            blocked_reason = (
+                "emergency_training_freeze"
+                if emergency_freeze
+                else "training_checkpoint_ceiling"
+            )
+            accumulator_meta["blocked_reason"] = blocked_reason
             logger.info(
-                "Window %d: RELIQUARY_DISABLE_TRAIN set — retaining balanced "
-                "batch and skipping train_step + publish",
+                "Window %d: %s — retaining balanced batch and skipping "
+                "train_step + publish (checkpoint=%d ceiling=%d)",
                 self._window_n,
+                blocked_reason,
+                self._checkpoint_n,
+                TRAIN_UNTIL_CHECKPOINT_N,
             )
         elif accumulator_ready:
             accumulator_meta["training_attempted"] = True
