@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from reliquary import constants as C
 from reliquary.validator.training import (
     _compute_advantages,
@@ -8,6 +10,11 @@ from reliquary.validator.training import (
     _shaping_training_metrics,
     _training_environment_metrics,
 )
+
+
+@pytest.fixture
+def shaping_enabled(monkeypatch):
+    monkeypatch.setattr(C, "SHAPE_PENALTY", 0.5)
 
 
 def _roll(
@@ -21,22 +28,24 @@ def _roll(
     return SimpleNamespace(
         reward=reward,
         env_name=env_name,
-        commit={"rollout": {
-            "prompt_length": 1,
-            "completion_length": completion_length,
-            "token_logprobs": [-1.0] * completion_length,
-            "forced": forced,
-            "truncated": truncated,
-        }},
+        commit={
+            "rollout": {
+                "prompt_length": 1,
+                "completion_length": completion_length,
+                "token_logprobs": [-1.0] * completion_length,
+                "forced": forced,
+                "truncated": truncated,
+            }
+        },
     )
 
 
-def test_shaping_penalizes_under_thinking_only():
+def test_shaping_penalizes_under_thinking_only(shaping_enabled):
     early = int(C.SHAPE_LEN_FRAC * C.BFT_THINKING_BUDGET) - 1
     rollouts = [
-        _roll(0.0, early),                    # finished-early + wrong → penalize
-        _roll(1.0, early),                    # finished-early + correct → keep
-        _roll(0.0, C.BFT_THINKING_BUDGET),    # long + wrong (tried hard) → keep
+        _roll(0.0, early),  # finished-early + wrong → penalize
+        _roll(1.0, early),  # finished-early + correct → keep
+        _roll(0.0, C.BFT_THINKING_BUDGET),  # long + wrong (tried hard) → keep
     ]
     out = _shape_advantages(rollouts, [0.3, 0.3, 0.3])
     assert out[0] == -C.SHAPE_PENALTY
@@ -44,14 +53,14 @@ def test_shaping_penalizes_under_thinking_only():
     assert out[2] == 0.3
 
 
-def test_shaping_leaves_forced_untouched():
+def test_shaping_leaves_forced_untouched(shaping_enabled):
     early = int(C.SHAPE_LEN_FRAC * C.BFT_THINKING_BUDGET) - 1
     # forced + finished-early + wrong → still untouched (E7)
     out = _shape_advantages([_roll(0.0, early, forced=True)], [0.5])
     assert out[0] == 0.5
 
 
-def test_shaping_penalizes_truncated_overlong():
+def test_shaping_penalizes_truncated_overlong(shaping_enabled):
     # overlong side penalises a cap-truncated rollout regardless of correctness
     out = _shape_advantages([_roll(1.0, C.BFT_THINKING_BUDGET, truncated=True)], [0.4])
     assert out[0] == -C.SHAPE_PENALTY
@@ -64,7 +73,7 @@ def test_shaping_off_when_penalty_zero(monkeypatch):
     assert out == [0.3]
 
 
-def test_plan_keeps_all_wrong_group_when_shape_adds_signal():
+def test_plan_keeps_all_wrong_group_when_shape_adds_signal(shaping_enabled):
     early = int(C.SHAPE_LEN_FRAC * C.BFT_THINKING_BUDGET) - 1
     group = SimpleNamespace(
         rollouts=[
@@ -83,7 +92,9 @@ def test_plan_keeps_all_wrong_group_when_shape_adds_signal():
     assert advantages[1] == 0.0
 
 
-def test_shaping_metrics_separate_overlong_underthinking_and_forced():
+def test_shaping_metrics_separate_overlong_underthinking_and_forced(
+    shaping_enabled,
+):
     early = int(C.SHAPE_LEN_FRAC * C.BFT_THINKING_BUDGET) - 1
     group = SimpleNamespace(
         rollouts=[
