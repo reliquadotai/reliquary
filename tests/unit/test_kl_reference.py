@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 
 import reliquary.validator.service as service_mod
+from reliquary.shared.modeling import MODEL_SNAPSHOT_ALLOW_PATTERNS
 
 
 class _FakeEnv:
@@ -57,7 +58,11 @@ def test_fixed_kl_reference_is_pinned_frozen_and_observable(
     train = nn.Linear(4, 4)
     svc = _service(train, load_model_fn=lambda _path: copy.deepcopy(train))
 
-    assert download_calls == [{"repo_id": "owner/repo", "revision": revision}]
+    assert download_calls == [{
+        "repo_id": "owner/repo",
+        "revision": revision,
+        "allow_patterns": MODEL_SNAPSHOT_ALLOW_PATTERNS,
+    }]
     assert svc.base_ref_model is not None
     assert svc.base_ref_model is not svc.verify_model
     assert not svc.base_ref_model.training
@@ -72,7 +77,10 @@ def test_fixed_kl_reference_is_pinned_frozen_and_observable(
         "resolved_revision": revision,
         "loaded": True,
         "device": "cpu",
+        "dtype": "torch.float32",
+        "parameter_count": 20,
         "storage_bytes": 80,
+        "beta_explicit": True,
     }
     assert (
         svc.server._health_payload().training_kl_reference
@@ -138,6 +146,24 @@ def test_fixed_kl_reference_rejects_unexpected_resolved_sha(
 
     with pytest.raises(RuntimeError, match="failed to load required fixed"):
         _service(nn.Linear(2, 2), load_model_fn=lambda _path: nn.Linear(2, 2))
+
+
+def test_fixed_kl_reference_rejects_incompatible_model(monkeypatch, tmp_path):
+    revision = "e" * 40
+    snapshot = tmp_path / "snapshots" / revision
+    snapshot.mkdir(parents=True)
+    monkeypatch.setattr(service_mod, "KL_BASE_MODEL", f"owner/repo@{revision}")
+    monkeypatch.setattr(service_mod, "KL_BETA_EXPLICIT", True)
+    monkeypatch.setattr(
+        "huggingface_hub.snapshot_download",
+        lambda **_kwargs: str(snapshot),
+    )
+
+    with pytest.raises(RuntimeError, match="failed to load required fixed"):
+        _service(
+            nn.Linear(2, 2),
+            load_model_fn=lambda _path: nn.Linear(3, 3),
+        )
 
 
 def test_default_kl_reference_remains_rolling(monkeypatch):
