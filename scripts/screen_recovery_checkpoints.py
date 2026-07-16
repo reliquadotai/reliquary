@@ -35,14 +35,20 @@ def select_tasks(
     *,
     n_prompts: int,
     dataset_revision: str,
+    prompt_offset: int = 0,
 ) -> list[dict[str, str]]:
     rows = [
         json.loads(line)
         for line in path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    if n_prompts <= 0 or n_prompts > len(rows):
-        raise ValueError(f"n_prompts must be within [1, {len(rows)}]")
+    if prompt_offset < 0:
+        raise ValueError("prompt_offset must be non-negative")
+    if n_prompts <= 0 or prompt_offset + n_prompts > len(rows):
+        raise ValueError(
+            "prompt range must be within dataset bounds: "
+            f"offset={prompt_offset}, n_prompts={n_prompts}, rows={len(rows)}"
+        )
 
     def rank(row: dict[str, Any]) -> bytes:
         task_id = str(row.get("unique_id") or row.get("task_id") or "")
@@ -52,7 +58,9 @@ def select_tasks(
             f"{dataset_revision}\0{task_id}".encode("utf-8")
         ).digest()
 
-    selected = sorted(rows, key=rank)[:n_prompts]
+    selected = sorted(rows, key=rank)[
+        prompt_offset:prompt_offset + n_prompts
+    ]
     return [
         {
             "task_id": str(row.get("unique_id") or row.get("task_id")),
@@ -70,18 +78,25 @@ def select_code_tasks(
     *,
     n_prompts: int,
     dataset_revision: str,
+    prompt_offset: int = 0,
 ) -> list[dict[str, str]]:
     """Select a revision-bound code holdout without downloading every row."""
     dataset_size = len(environment)
-    if n_prompts <= 0 or n_prompts > dataset_size:
-        raise ValueError(f"n_prompts must be within [1, {dataset_size}]")
+    if prompt_offset < 0:
+        raise ValueError("prompt_offset must be non-negative")
+    if n_prompts <= 0 or prompt_offset + n_prompts > dataset_size:
+        raise ValueError(
+            "prompt range must be within dataset bounds: "
+            f"offset={prompt_offset}, n_prompts={n_prompts}, "
+            f"rows={dataset_size}"
+        )
 
     ranked_indices = sorted(
         range(dataset_size),
         key=lambda index: hashlib.sha256(
             f"{dataset_revision}\0{index}".encode("utf-8")
         ).digest(),
-    )[:n_prompts]
+    )[prompt_offset:prompt_offset + n_prompts]
     tasks = []
     for index in ranked_indices:
         problem = environment.get_problem(index)
@@ -228,6 +243,7 @@ def _parser() -> argparse.ArgumentParser:
         default="d3caaefc3b46f8642b251f9efaeccf0d1e95b0a7",
     )
     parser.add_argument("--n-prompts", type=int, default=16)
+    parser.add_argument("--prompt-offset", type=int, default=0)
     parser.add_argument("--samples-per-prompt", type=int, default=4)
     parser.add_argument("--thinking-budget", type=int, default=2048)
     parser.add_argument("--answer-budget", type=int, default=512)
@@ -280,6 +296,7 @@ def main() -> int:
             args.math_jsonl,
             n_prompts=args.n_prompts,
             dataset_revision=args.dataset_revision,
+            prompt_offset=args.prompt_offset,
         )
         reward_fn = lambda task, completion: _compute_omi_reward(  # noqa: E731
             {"ground_truth": task["ground_truth"]}, completion
@@ -317,6 +334,7 @@ def main() -> int:
             code_environment,
             n_prompts=args.n_prompts,
             dataset_revision=args.dataset_revision,
+            prompt_offset=args.prompt_offset,
         )
         reward_fn = code_environment.compute_reward
         answer_instruction = ""
@@ -459,6 +477,7 @@ def main() -> int:
         "dataset_repo": dataset_identity["repo"],
         "dataset_revision": args.dataset_revision,
         "n_prompts": args.n_prompts,
+        "prompt_offset": args.prompt_offset,
         "samples_per_prompt": args.samples_per_prompt,
         "thinking_budget": args.thinking_budget,
         "answer_budget": args.answer_budget,

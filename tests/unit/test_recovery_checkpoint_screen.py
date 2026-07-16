@@ -38,11 +38,20 @@ def test_select_tasks_is_order_independent_and_revision_bound(tmp_path):
     selected_a = select_tasks(first, n_prompts=4, dataset_revision="a" * 40)
     selected_b = select_tasks(second, n_prompts=4, dataset_revision="a" * 40)
     selected_c = select_tasks(first, n_prompts=4, dataset_revision="b" * 40)
+    selected_offset = select_tasks(
+        first,
+        n_prompts=4,
+        dataset_revision="a" * 40,
+        prompt_offset=4,
+    )
 
     assert selected_a == selected_b
     assert [row["task_id"] for row in selected_a] != [
         row["task_id"] for row in selected_c
     ]
+    assert not {
+        row["task_id"] for row in selected_a
+    } & {row["task_id"] for row in selected_offset}
 
 
 def test_select_code_tasks_is_revision_bound_and_materializes_only_holdout():
@@ -63,18 +72,52 @@ def test_select_code_tasks_is_revision_bound_and_materializes_only_holdout():
 
     first = FakeEnvironment()
     second = FakeEnvironment()
+    offset_environment = FakeEnvironment()
     selected_a = select_code_tasks(
         first, n_prompts=4, dataset_revision="a" * 40
     )
     selected_b = select_code_tasks(
         second, n_prompts=4, dataset_revision="b" * 40
     )
+    selected_offset = select_code_tasks(
+        offset_environment,
+        n_prompts=4,
+        dataset_revision="a" * 40,
+        prompt_offset=4,
+    )
 
     assert len(selected_a) == 4
     assert len(first.requested) == 4
+    assert len(offset_environment.requested) == 4
     assert [row["task_id"] for row in selected_a] != [
         row["task_id"] for row in selected_b
     ]
+    assert not {
+        row["task_id"] for row in selected_a
+    } & {row["task_id"] for row in selected_offset}
+
+
+def test_holdout_selection_rejects_out_of_bounds_ranges(tmp_path):
+    path = tmp_path / "tasks.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "unique_id": "only",
+                "problem": "p",
+                "answer": "a",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="dataset bounds"):
+        select_tasks(
+            path,
+            n_prompts=1,
+            dataset_revision="a" * 40,
+            prompt_offset=1,
+        )
 
 
 def test_summarize_uses_stable_sample_zero_and_best_of_k():
