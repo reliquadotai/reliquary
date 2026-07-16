@@ -6,6 +6,8 @@ import asyncio
 import logging
 import math
 import os
+from pathlib import Path
+import re
 import time
 from typing import Any
 
@@ -76,6 +78,8 @@ from reliquary.validator.training import train_step
 from reliquary.validator.training_accumulator import BalancedTrainingAccumulator
 
 logger = logging.getLogger(__name__)
+
+_HF_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 
 
 def _cooldown_snapshot_key(run_id: str) -> str:
@@ -232,6 +236,37 @@ def _default_load_model(local_path: str):
         torch_dtype=torch.bfloat16,
         attn_implementation=ATTN_IMPLEMENTATION,
     ).to("cuda:0").eval()
+
+
+def _parse_pinned_kl_reference(spec: str) -> tuple[str, str]:
+    """Parse ``repo@revision`` and require an immutable full HF commit SHA."""
+    repo_id, separator, revision = spec.rpartition("@")
+    if not separator or not repo_id or not revision:
+        raise ValueError(
+            "RELIQUARY_KL_BASE_MODEL must be repo@<full 40-character commit SHA>"
+        )
+    if _HF_COMMIT_RE.fullmatch(revision) is None:
+        raise ValueError(
+            "RELIQUARY_KL_BASE_MODEL revision must be a full 40-character "
+            "Hugging Face commit SHA"
+        )
+    return repo_id, revision.lower()
+
+
+def _model_storage_bytes(model: Any) -> int | None:
+    """Best-effort parameter+buffer storage size for capacity telemetry."""
+    try:
+        tensors = list(model.parameters()) + list(model.buffers())
+        return sum(t.numel() * t.element_size() for t in tensors)
+    except (AttributeError, TypeError):
+        return None
+
+
+def _model_device(model: Any) -> str | None:
+    try:
+        return str(next(model.parameters()).device)
+    except (AttributeError, StopIteration, TypeError):
+        return None
 
 
 class ValidationService:
@@ -392,27 +427,84 @@ class ValidationService:
         self._resume_from = resume_from
         self._load_model_fn = load_model_fn or _default_load_model
 
-        # KL reference: a permanently-frozen base (the run's ck0), loaded once and
-        # NEVER refreshed. Anchors the GRPO KL penalty to base coherence so RL
-        # over-optimization cannot drift the policy into degeneration. Empty config
-        # -> None -> train_step falls back to verify_model (legacy, no base anchor).
+        # Fixed mode is opt-in. An explicit fixed reference is a load-bearing
+        # training control, so it is immutable and fail-closed. Empty config keeps
+        # the legacy rolling reference (verify_model) exactly as before.
         self.base_ref_model = None
-        if KL_BASE_MODEL and model is not None:
+        self.kl_reference_state: dict[str, Any] = {
+            "schema_version": 1,
+            "mode": "rolling",
+            "beta": KL_BETA,
+            "requested_model": None,
+            "repo_id": None,
+            "requested_revision": None,
+            "resolved_revision": None,
+            "loaded": self.verify_model is not None,
+            "device": _model_device(self.verify_model),
+            "storage_bytes": _model_storage_bytes(self.verify_model),
+        }
+        if KL_BASE_MODEL:
+            if model is None:
+                raise RuntimeError(
+                    "fixed KL reference requested but no train model was loaded"
+                )
+            repo, rev = _parse_pinned_kl_reference(KL_BASE_MODEL)
             try:
-                repo, _, rev = KL_BASE_MODEL.partition("@")
                 from huggingface_hub import snapshot_download
-                base_path = snapshot_download(repo_id=repo, revision=rev or None)
+
+                base_path = snapshot_download(repo_id=repo, revision=rev)
                 self.base_ref_model = self._load_model_fn(base_path)
                 self.base_ref_model.eval()
                 for _p in self.base_ref_model.parameters():
                     _p.requires_grad = False
-                logger.info("GRPO KL reference = frozen base %s", KL_BASE_MODEL)
-            except Exception:
+            except Exception as exc:
                 logger.exception(
-                    "failed to load KL base ref %s; falling back to verify_model",
+                    "failed to load required fixed KL reference %s",
                     KL_BASE_MODEL,
                 )
-                self.base_ref_model = None
+                raise RuntimeError(
+                    f"failed to load required fixed KL reference {KL_BASE_MODEL}"
+                ) from exc
+
+            resolved_revision = Path(base_path).resolve().name.lower()
+            if _HF_COMMIT_RE.fullmatch(resolved_revision) is None:
+                # Some injected/custom downloaders return a non-cache path. The
+                # requested revision is already a full immutable SHA, so retain it
+                # rather than inventing a mutable identity from the path.
+                resolved_revision = rev
+            self.kl_reference_state = {
+                "schema_version": 1,
+                "mode": "fixed",
+                "beta": KL_BETA,
+                "requested_model": KL_BASE_MODEL,
+                "repo_id": repo,
+                "requested_revision": rev,
+                "resolved_revision": resolved_revision,
+                "loaded": True,
+                "device": _model_device(self.base_ref_model),
+                "storage_bytes": _model_storage_bytes(self.base_ref_model),
+            }
+            logger.info(
+                "GRPO KL reference=fixed repo=%s revision=%s beta=%.6g "
+                "device=%s storage_bytes=%s",
+                repo,
+                resolved_revision,
+                KL_BETA,
+                self.kl_reference_state["device"],
+                self.kl_reference_state["storage_bytes"],
+            )
+
+        self.server.set_training_kl_reference_state(self.kl_reference_state)
+        telemetry.update_config({
+            "kl_reference_mode": self.kl_reference_state["mode"],
+            "kl_reference_repo_id": self.kl_reference_state["repo_id"],
+            "kl_reference_revision": self.kl_reference_state[
+                "resolved_revision"
+            ],
+            "kl_reference_storage_bytes": self.kl_reference_state[
+                "storage_bytes"
+            ],
+        })
 
     @property
     def _active_batcher(self):
@@ -1768,6 +1860,7 @@ class ValidationService:
                 "training_accumulator",
                 {"schema_version": 1, "trained": False},
             ),
+            "training_kl_reference": dict(self.kl_reference_state),
             # v2.3: per-hotkey emission share from select_batch_and_distribute.
             # All miners whose prompt landed in the winning set appear here,
             # even if their specific submission wasn't picked for training.
@@ -1818,6 +1911,7 @@ class ValidationService:
                 "checkpoint_repo_id": cp.repo_id if cp else self.hf_repo_id,
                 "checkpoint_revision": cp.revision if cp else None,
                 "checkpoint_n": cp.checkpoint_n if cp else self._checkpoint_n,
+                "training_kl_reference": dict(self.kl_reference_state),
                 "batch_size": B_BATCH,
                 "m_rollouts_per_prompt": M_ROLLOUTS,
                 "environment": self.env.name,
