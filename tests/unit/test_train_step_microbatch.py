@@ -354,6 +354,45 @@ def test_kl_tail_stats_capture_weighted_objective_and_outliers():
     assert stats["max"] >= 0.0
     assert math.isfinite(stats["weighted_ppo"])
     assert math.isfinite(stats["weighted_kl"])
+    assert stats["ppo_token_count"] == stats["token_count"]
+    assert stats["ppo_ratio_nonfinite_count"] == 0
+
+
+def test_policy_health_stats_measure_recomputed_claim_error():
+    import copy
+
+    from reliquary.validator.training import (
+        _kl_telemetry_metrics,
+        _new_kl_stats,
+    )
+
+    torch.manual_seed(9)
+    model = _QwenLike()
+    groups = _sample_groups()
+    for group in groups:
+        for rollout in group.rollouts:
+            n = len(rollout.commit["rollout"]["token_logprobs"])
+            rollout.commit["rollout"]["token_logprobs"] = [-9.0] * n
+    plan, _ = _make_plan(groups)
+    stats = _new_kl_stats()
+
+    _accumulate_grouped_grads(
+        model,
+        _frozen(copy.deepcopy(model)),
+        plan,
+        next(model.parameters()).device,
+        budget=64,
+        atomic=False,
+        kl_stats=stats,
+        behavior_model=_frozen(copy.deepcopy(model)),
+    )
+    metrics = _kl_telemetry_metrics(stats)
+
+    assert metrics["train/pi_old_claim_token_count"] > 0
+    assert metrics["train/pi_old_claim_abs_error_mean"] > 1.0
+    assert metrics["train/pi_old_claim_abs_error_max"] > 1.0
+    assert metrics["train/pi_old_claim_gt_1e_3_ratio"] == 1.0
+    assert metrics["train/ppo_ratio_nonfinite_ratio"] == 0.0
 
 
 # ---------------------------------------------------------------------------

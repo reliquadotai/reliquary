@@ -717,6 +717,14 @@ def _new_kl_stats() -> dict[str, float | int]:
         "log_ratio_abs_max": 0.0,
         "weighted_ppo": 0.0,
         "weighted_kl": 0.0,
+        "ppo_token_count": 0,
+        "ppo_clip_active_count": 0,
+        "ppo_ratio_nonfinite_count": 0,
+        "ppo_log_ratio_abs_max": 0.0,
+        "pi_old_claim_token_count": 0,
+        "pi_old_claim_abs_error_sum": 0.0,
+        "pi_old_claim_abs_error_max": 0.0,
+        "pi_old_claim_gt_1e_3_count": 0,
     }
 
 
@@ -727,8 +735,13 @@ def _record_kl_stats(
     kl_tok,
     kl_log,
     scale_cat,
+    ppo_ratio,
+    ppo_log_ratio,
+    ppo_clip_active,
+    claimed_old,
+    behavior_old,
 ) -> None:
-    """Accumulate bounded KL-tail telemetry after a micro-batch succeeds."""
+    """Accumulate bounded policy-health telemetry after a micro-batch."""
     if stats is None:
         return
     with torch.no_grad():
@@ -746,6 +759,36 @@ def _record_kl_stats(
         )
         stats["weighted_ppo"] += float((scale_cat * ppo_tok).sum())
         stats["weighted_kl"] += float((scale_cat * kl_tok).sum())
+        stats["ppo_token_count"] += ppo_ratio.numel()
+        stats["ppo_clip_active_count"] += int(ppo_clip_active.sum())
+        stats["ppo_ratio_nonfinite_count"] += int(
+            (~torch.isfinite(ppo_ratio)).sum()
+        )
+        finite_log_ratio = ppo_log_ratio.detach().float()
+        finite_log_ratio = finite_log_ratio[torch.isfinite(finite_log_ratio)]
+        if finite_log_ratio.numel():
+            stats["ppo_log_ratio_abs_max"] = max(
+                float(stats["ppo_log_ratio_abs_max"]),
+                float(finite_log_ratio.abs().max()),
+            )
+        if behavior_old is not None:
+            claim_error = (
+                behavior_old.detach().float()
+                - claimed_old.detach().float()
+            ).abs()
+            finite_claim_error = claim_error[torch.isfinite(claim_error)]
+            stats["pi_old_claim_token_count"] += claim_error.numel()
+            stats["pi_old_claim_gt_1e_3_count"] += int(
+                (claim_error > 1e-3).sum()
+            )
+            if finite_claim_error.numel():
+                stats["pi_old_claim_abs_error_sum"] += float(
+                    finite_claim_error.sum()
+                )
+                stats["pi_old_claim_abs_error_max"] = max(
+                    float(stats["pi_old_claim_abs_error_max"]),
+                    float(finite_claim_error.max()),
+                )
 
 
 def _kl_telemetry_metrics(stats: dict[str, float | int]) -> dict[str, float]:
@@ -754,6 +797,10 @@ def _kl_telemetry_metrics(stats: dict[str, float | int]) -> dict[str, float]:
     weighted_ppo = float(stats["weighted_ppo"])
     weighted_kl = float(stats["weighted_kl"])
     weighted_penalty = KL_BETA * weighted_kl
+    ppo_token_count = int(stats["ppo_token_count"])
+    ppo_denominator = max(1, ppo_token_count)
+    claim_token_count = int(stats["pi_old_claim_token_count"])
+    claim_denominator = max(1, claim_token_count)
     return {
         "train/kl_beta": KL_BETA,
         "train/ppo_objective_component": weighted_ppo,
@@ -774,6 +821,25 @@ def _kl_telemetry_metrics(stats: dict[str, float | int]) -> dict[str, float]:
         "train/kl_token_gt_1_ratio": int(stats["gt_1_count"]) / denominator,
         "train/kl_token_gt_10_ratio": (
             int(stats["gt_10_count"]) / denominator
+        ),
+        "train/ppo_clip_active_ratio": (
+            int(stats["ppo_clip_active_count"]) / ppo_denominator
+        ),
+        "train/ppo_ratio_nonfinite_ratio": (
+            int(stats["ppo_ratio_nonfinite_count"]) / ppo_denominator
+        ),
+        "train/ppo_log_ratio_abs_max": float(
+            stats["ppo_log_ratio_abs_max"]
+        ),
+        "train/pi_old_claim_token_count": float(claim_token_count),
+        "train/pi_old_claim_abs_error_mean": (
+            float(stats["pi_old_claim_abs_error_sum"]) / claim_denominator
+        ),
+        "train/pi_old_claim_abs_error_max": float(
+            stats["pi_old_claim_abs_error_max"]
+        ),
+        "train/pi_old_claim_gt_1e_3_ratio": (
+            int(stats["pi_old_claim_gt_1e_3_count"]) / claim_denominator
         ),
     }
 
@@ -831,15 +897,18 @@ def _microbatch_grad(
             else:
                 behavior_lp = None
 
-    old_cat = torch.tensor(
+    claimed_old_cat = torch.tensor(
         [x for old in olds for x in old],
         device=device,
         dtype=new_lp.dtype,
     )
+    old_cat = claimed_old_cat
+    behavior_old_cat = None
     if behavior_lp is not None:
         if behavior_lp.shape != new_lp.shape:
             raise ValueError("behavior-model completion shape mismatch")
-        old_cat = behavior_lp.detach()
+        behavior_old_cat = behavior_lp.detach()
+        old_cat = behavior_old_cat
     adv_cat = torch.tensor(
         [advs[k] for k in range(B) for _ in range(seg[k])],
         device=device,
@@ -858,12 +927,21 @@ def _microbatch_grad(
     new_lp = new_lp[keep_cat]
     ref_lp = ref_lp[keep_cat]
     old_cat = old_cat[keep_cat]
+    claimed_old_cat = claimed_old_cat[keep_cat]
+    if behavior_old_cat is not None:
+        behavior_old_cat = behavior_old_cat[keep_cat]
     adv_cat = adv_cat[keep_cat]
     scale_cat = scale_cat[keep_cat]
     keep_seg = [sum(1 for flag in keep if flag) for keep in keeps]
-    ratio = torch.exp(new_lp - old_cat)
-    surr = torch.min(ratio * adv_cat,
-                     torch.clamp(ratio, 1 - PPO_CLIP_EPSILON, 1 + PPO_CLIP_EPSILON) * adv_cat)
+    ppo_log_ratio = new_lp - old_cat
+    ratio = torch.exp(ppo_log_ratio)
+    unclipped_surr = ratio * adv_cat
+    clipped_surr = (
+        torch.clamp(ratio, 1 - PPO_CLIP_EPSILON, 1 + PPO_CLIP_EPSILON)
+        * adv_cat
+    )
+    surr = torch.min(unclipped_surr, clipped_surr)
+    clip_active = clipped_surr < unclipped_surr
     ppo_tok = -surr
     kl_log = ref_lp - new_lp
     kl_tok = torch.exp(kl_log) - 1 - kl_log
@@ -889,6 +967,11 @@ def _microbatch_grad(
         kl_tok=kl_tok,
         kl_log=kl_log,
         scale_cat=scale_cat,
+        ppo_ratio=ratio,
+        ppo_log_ratio=ppo_log_ratio,
+        ppo_clip_active=clip_active,
+        claimed_old=claimed_old_cat,
+        behavior_old=behavior_old_cat,
     )
 
     sum_ppo = sum_kl = 0.0
