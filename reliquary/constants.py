@@ -49,6 +49,7 @@ PROOF_SKETCH_TOLERANCE_GROWTH = 5.0
 # Override with GRAIL_ATTN_IMPL for test envs without flash-attn compiled
 # (e.g. "eager" or "sdpa"). Production runs must stay on flash_attention_2
 # because sketch commitments are bit-sensitive to attention kernel variance.
+import math as _math
 import os as _os
 ATTN_IMPLEMENTATION = _os.environ.get("GRAIL_ATTN_IMPL", "flash_attention_2")
 
@@ -577,7 +578,11 @@ EMA_ALPHA = 2.0 / (72 + 1)  # ≈ 0.0274
 # tolerance) over 50 training steps — effectively indistinguishable from the
 # base model, which also means stale-model cheaters pass GRAIL. Matched
 # DAPO / R1-Zero-scale literature (1e-6 to 5e-6) by bumping to 5e-6.
-LEARNING_RATE = 5e-6
+LEARNING_RATE = float(_os.environ.get("RELIQUARY_LEARNING_RATE", "5e-6"))
+if not _math.isfinite(LEARNING_RATE) or not 0.0 < LEARNING_RATE <= 1e-3:
+    raise ValueError(
+        "RELIQUARY_LEARNING_RATE must be finite and within (0, 1e-3]"
+    )
 
 # PPO clip range. Standard in GRPO/RLHF literature.
 PPO_CLIP_EPSILON = 0.2
@@ -600,6 +605,28 @@ KL_BASE_MODEL = _os.environ.get("RELIQUARY_KL_BASE_MODEL", "").strip()
 
 # Max gradient norm before step — standard RL stability guard.
 GRAD_CLIP_NORM = 1.0
+
+# Reject a pathological update direction before optimizer.step(). Gradient
+# clipping caps magnitude, but a 10k-scale pre-clip gradient can still move the
+# model in a corrupted direction. The default is far above the observed healthy
+# band (~1-8) while catching the 2026-07-16 production spike (10,432).
+GRAD_NORM_SKIP_THRESHOLD = float(
+    _os.environ.get("RELIQUARY_GRAD_NORM_SKIP_THRESHOLD", "100.0")
+)
+if (
+    not _math.isfinite(GRAD_NORM_SKIP_THRESHOLD)
+    or GRAD_NORM_SKIP_THRESHOLD <= 0.0
+):
+    raise ValueError(
+        "RELIQUARY_GRAD_NORM_SKIP_THRESHOLD must be finite and positive"
+    )
+
+# PPO's old policy is the published checkpoint miners generated against. When
+# enabled, recompute those log-probabilities with verify_model rather than
+# trusting the miner-provided vector. A fixed KL anchor remains a separate model.
+RECOMPUTE_PI_OLD_FROM_VERIFY = _os.environ.get(
+    "RELIQUARY_RECOMPUTE_PI_OLD_FROM_VERIFY", "false"
+).strip().lower() in ("1", "true", "yes", "on")
 
 # train_step micro-batching: cap on padded tokens (n_seqs × longest_seq) per
 # forward/backward. Short rollouts pack together; a rollout longer than this

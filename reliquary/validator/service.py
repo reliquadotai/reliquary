@@ -35,6 +35,7 @@ from reliquary.constants import (
     FORCED_SEED_ENFORCE,
     FORCED_SEED_ROLLOUT_FLOOR,
     GRAD_CLIP_NORM,
+    GRAD_NORM_SKIP_THRESHOLD,
     HASH_DEDUP_RETENTION_WINDOWS,
     KL_BASE_MODEL,
     KL_BETA,
@@ -53,6 +54,7 @@ from reliquary.constants import (
     PROOF_ADMISSION_STALL_POLL_SECONDS,
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
     REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS,
+    RECOMPUTE_PI_OLD_FROM_VERIFY,
     SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS,
     SPARSE_VALID_IDLE_SEAL_SECONDS,
     SPARSE_VALID_MAX_WINDOW_SECONDS,
@@ -75,7 +77,7 @@ from reliquary.validator.dedup import RolloutHashSet
 from reliquary.validator.observability import log_structured, runtime_revision
 from reliquary.validator.quarantine import assess_training_batch
 from reliquary.validator.server import ValidatorServer
-from reliquary.validator.training import train_step
+from reliquary.validator.training import TrainingStepSkipped, train_step
 from reliquary.validator.training_accumulator import BalancedTrainingAccumulator
 
 logger = logging.getLogger(__name__)
@@ -366,10 +368,10 @@ class ValidationService:
         import copy
         # Two-model architecture (see docs/superpowers/plans/2026-05-13-...).
         # train_model: trainable, mutated by train_step every window.
-        # verify_model: frozen snapshot of the last published checkpoint —
-        # used by batcher.verify_commitment_proofs and as the KL reference
-        # inside train_step. Refreshed in-place after every successful
-        # publish via load_state_dict.
+        # verify_model: frozen snapshot of the last published checkpoint. It
+        # verifies commitment proofs and can independently supply PPO's old
+        # policy. In rolling mode it is also the KL reference; fixed mode uses
+        # a separately pinned base model. Refreshed only after publication.
         self.train_model = model
         if model is not None:
             try:
@@ -497,6 +499,13 @@ class ValidationService:
             "parameter_count": _model_parameter_count(self.verify_model),
             "storage_bytes": _model_storage_bytes(self.verify_model),
             "beta_explicit": KL_BETA_EXPLICIT,
+            "behavior_logprobs": (
+                "verify_model"
+                if RECOMPUTE_PI_OLD_FROM_VERIFY
+                else "miner_claim"
+            ),
+            "learning_rate": LEARNING_RATE,
+            "grad_norm_skip_threshold": GRAD_NORM_SKIP_THRESHOLD,
         }
         if KL_BASE_MODEL:
             if model is None:
@@ -567,6 +576,13 @@ class ValidationService:
                 ),
                 "storage_bytes": _model_storage_bytes(self.base_ref_model),
                 "beta_explicit": KL_BETA_EXPLICIT,
+                "behavior_logprobs": (
+                    "verify_model"
+                    if RECOMPUTE_PI_OLD_FROM_VERIFY
+                    else "miner_claim"
+                ),
+                "learning_rate": LEARNING_RATE,
+                "grad_norm_skip_threshold": GRAD_NORM_SKIP_THRESHOLD,
             }
             logger.info(
                 "GRPO KL reference=fixed repo=%s revision=%s beta=%.6g "
@@ -588,6 +604,9 @@ class ValidationService:
             "kl_reference_storage_bytes": self.kl_reference_state[
                 "storage_bytes"
             ],
+            "pi_old_source": self.kl_reference_state["behavior_logprobs"],
+            "learning_rate": LEARNING_RATE,
+            "grad_norm_skip_threshold": GRAD_NORM_SKIP_THRESHOLD,
         })
 
     @property
@@ -1455,8 +1474,24 @@ class ValidationService:
                         else self.verify_model
                     ),
                     window_index=self._window_n,
+                    **(
+                        {"behavior_model": self.verify_model}
+                        if RECOMPUTE_PI_OLD_FROM_VERIFY
+                        else {}
+                    ),
                 )
                 trained = True
+            except TrainingStepSkipped as exc:
+                logger.warning(
+                    "train_step rejected for window %d: reason=%s "
+                    "grad_norm=%s; archiving without checkpoint publication",
+                    self._window_n,
+                    exc.reason,
+                    exc.grad_norm,
+                )
+                accumulator_meta["reset_reason"] = (
+                    f"training_health_gate:{exc.reason}"
+                )
             except Exception:
                 # Don't let a training failure (e.g. CUDA OOM) skip
                 # _archive_window — miners still need their R2 contribution

@@ -20,7 +20,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from reliquary.validator.training import (
-    _rollout_loss, _compute_advantages, train_step, reset_training_state,
+    TrainingStepSkipped, _rollout_loss, _compute_advantages, train_step,
+    reset_training_state,
     _selected_logprobs, _selected_logprobs_for_tokens,
 )
 
@@ -319,10 +320,35 @@ def test_train_step_skips_optimizer_on_nonfinite_grad(tiny_model_and_tokenizer, 
     )
 
     before = next(model.parameters()).detach().clone()
-    result = train_step(model, [[group]], ref_model=_make_ref(model))
-    assert result is model
+    with pytest.raises(TrainingStepSkipped, match="nonfinite_gradient"):
+        train_step(model, [[group]], ref_model=_make_ref(model))
     after = next(model.parameters()).detach().clone()
     assert torch.equal(before, after), "weights must not change on non-finite grad"
+
+
+def test_train_step_skips_optimizer_on_pathological_finite_grad(
+    tiny_model_and_tokenizer, monkeypatch,
+):
+    """A finite pre-clip spike is rejected, not converted into a unit-sized
+    update in an untrustworthy direction."""
+    reset_training_state()
+    model, _ = tiny_model_and_tokenizer
+    rollouts = [
+        _build_rollout([1, 2, 3, 4, 5, 6], r, 2)
+        for r in [1, 1, 0, 0]
+    ]
+    group = _FakeGroup(rollouts=rollouts, prompt_idx=0)
+
+    monkeypatch.setattr(
+        torch.nn.utils, "clip_grad_norm_",
+        lambda *a, **k: torch.tensor(10_432.0),
+    )
+
+    before = next(model.parameters()).detach().clone()
+    with pytest.raises(TrainingStepSkipped, match="gradient_spike"):
+        train_step(model, [[group]], ref_model=_make_ref(model))
+    after = next(model.parameters()).detach().clone()
+    assert torch.equal(before, after), "weights must not change on a grad spike"
 
 
 def test_train_step_token_level_handles_unequal_lengths(tiny_model_and_tokenizer):

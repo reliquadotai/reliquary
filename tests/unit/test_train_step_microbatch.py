@@ -188,6 +188,78 @@ def test_batched_grads_match_per_rollout_qwenlike():
     assert _rel_l2(bat_grads, ref_grads) < 5e-2
 
 
+def test_behavior_model_overrides_untrusted_miner_logprobs():
+    """Validator-recomputed pi_old makes the objective independent of the
+    log-probability vector supplied in the miner commit."""
+    torch.manual_seed(7)
+    model = _QwenLike()
+    ref = _frozen(model)
+    behavior = _frozen(model)
+    device = next(model.parameters()).device
+
+    claimed_near = _build_rollout([1, 2, 3, 4, 5, 6], 1.0, 2)
+    claimed_far = _build_rollout([1, 2, 3, 4, 5, 6], 1.0, 2)
+    claimed_near.commit["rollout"]["token_logprobs"] = [-1.0] * 4
+    claimed_far.commit["rollout"]["token_logprobs"] = [-8.0] * 4
+
+    trusted_near, _, _ = _rollout_loss(
+        model, ref, claimed_near, 1.0, device,
+        behavior_model=behavior,
+    )
+    trusted_far, _, _ = _rollout_loss(
+        model, ref, claimed_far, 1.0, device,
+        behavior_model=behavior,
+    )
+    untrusted_near, _, _ = _rollout_loss(
+        model, ref, claimed_near, 1.0, device,
+    )
+    untrusted_far, _, _ = _rollout_loss(
+        model, ref, claimed_far, 1.0, device,
+    )
+
+    torch.testing.assert_close(trusted_near, trusted_far)
+    assert not torch.isclose(untrusted_near, untrusted_far)
+
+
+def test_microbatch_behavior_recompute_is_claim_invariant():
+    import copy
+
+    torch.manual_seed(8)
+    base = _QwenLike()
+
+    groups_a = _sample_groups()
+    groups_b = copy.deepcopy(groups_a)
+    for group in groups_b:
+        for rollout in group.rollouts:
+            n = len(rollout.commit["rollout"]["token_logprobs"])
+            rollout.commit["rollout"]["token_logprobs"] = [-9.0] * n
+    plan_a, _ = _make_plan(groups_a)
+    plan_b, _ = _make_plan(groups_b)
+
+    model_a = copy.deepcopy(base)
+    grads_a = _grads_after(model_a, lambda: _accumulate_grouped_grads(
+        model_a,
+        _frozen(base),
+        plan_a,
+        next(model_a.parameters()).device,
+        budget=64,
+        atomic=False,
+        behavior_model=_frozen(base),
+    ))
+    model_b = copy.deepcopy(base)
+    grads_b = _grads_after(model_b, lambda: _accumulate_grouped_grads(
+        model_b,
+        _frozen(base),
+        plan_b,
+        next(model_b.parameters()).device,
+        budget=64,
+        atomic=False,
+        behavior_model=_frozen(base),
+    ))
+
+    assert _rel_l2(grads_a, grads_b) < 1e-7
+
+
 def test_batched_grads_mask_bft_force_span_like_per_rollout():
     import copy
 
