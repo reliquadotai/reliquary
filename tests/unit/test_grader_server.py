@@ -327,3 +327,21 @@ def test_metrics_endpoint_exposes_eval_and_case_counters(grader_server):
     body = resp.read().decode()
     assert "grader_eval_total" in body
     assert "grader_case_total" in body
+
+
+def test_stop_releases_metrics_listener_for_restart(tmp_path):
+    from reliquary.environment.grader.server import GraderServer
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+
+    for index in range(2):
+        server = GraderServer(
+            socket_path=str(tmp_path / f"grader-{index}.sock"),
+            pool_size=0,
+            metrics_port=port,
+        )
+        server._start_metrics_server()
+        server.stop()

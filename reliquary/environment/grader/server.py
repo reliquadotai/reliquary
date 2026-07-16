@@ -206,6 +206,11 @@ class GraderServer:
                 self._metrics_server.shutdown()
             except Exception:
                 pass
+            try:
+                self._metrics_server.server_close()
+            except Exception:
+                pass
+            self._metrics_server = None
         try:
             os.unlink(self.socket_path)
         except FileNotFoundError:
