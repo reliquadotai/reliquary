@@ -38,9 +38,17 @@ OPTIONAL_IDENTITY_FIELDS = (
 )
 
 RUNTIME_CONTRACT_FIELDS = (
+    "python_version",
     "gpu_name",
+    "gpu_compute_capability",
     "torch_version",
     "cuda_version",
+    "cudnn_version",
+    "transformers_version",
+    "flash_linear_attention_version",
+    "flash_attn_version",
+    "causal_conv1d_version",
+    "bitsandbytes_version",
 )
 
 METRIC_DIRECTIONS = {

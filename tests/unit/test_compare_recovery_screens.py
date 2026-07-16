@@ -43,9 +43,17 @@ def _screen(label: str) -> dict:
         "reliquary_revision": "d" * 40,
         "screen_script_sha256": "f" * 64,
         "runtime": {
+            "python_version": "3.11.0",
             "gpu_name": "Test GPU",
+            "gpu_compute_capability": [9, 0],
             "torch_version": "2.7.0",
             "cuda_version": "12.8",
+            "cudnn_version": 90701,
+            "transformers_version": "5.9.0",
+            "flash_linear_attention_version": "0.5.0",
+            "flash_attn_version": "2.8.3",
+            "causal_conv1d_version": None,
+            "bitsandbytes_version": "0.46.0",
         },
         "samples": samples,
     }
@@ -67,6 +75,11 @@ def test_paired_contract_rejects_runtime_or_sample_mismatch():
     candidate = _screen("candidate")
     candidate["runtime"]["torch_version"] = "different"
     with pytest.raises(ValueError, match="torch_version"):
+        validate_paired_contract(baseline, candidate)
+
+    candidate = _screen("candidate")
+    candidate["runtime"]["flash_linear_attention_version"] = "different"
+    with pytest.raises(ValueError, match="flash_linear_attention_version"):
         validate_paired_contract(baseline, candidate)
 
     legacy = _screen("legacy")

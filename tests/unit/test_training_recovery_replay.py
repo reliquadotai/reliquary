@@ -5,11 +5,25 @@ from types import SimpleNamespace
 import pytest
 
 from scripts.replay_training_recovery import (
+    _directory_snapshot_sha256,
     _source_revision,
     parse_legacy_targets,
     reconstruct_balanced_batch,
     strip_synthetic_claim_metrics,
 )
+
+
+def test_saved_candidate_snapshot_hash_binds_paths_and_bytes(tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (first / "model.safetensors").write_bytes(b"weights")
+    (second / "renamed.safetensors").write_bytes(b"weights")
+
+    assert _directory_snapshot_sha256(first) != _directory_snapshot_sha256(
+        second
+    )
 
 
 def test_source_revision_captures_full_mounted_checkout_sha(

@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+from importlib import metadata
 import json
 import math
 import os
 from pathlib import Path
+import platform
 import statistics
 import subprocess
 import time
@@ -22,6 +24,14 @@ from typing import Any
 
 
 ANSWER_INSTRUCTION = "\n\nPut your final answer within \\boxed{}."
+
+_RUNTIME_PACKAGES = {
+    "transformers_version": "transformers",
+    "flash_linear_attention_version": "flash-linear-attention",
+    "flash_attn_version": "flash-attn",
+    "causal_conv1d_version": "causal-conv1d",
+    "bitsandbytes_version": "bitsandbytes",
+}
 
 
 def _sha256(path: Path) -> str:
@@ -44,6 +54,25 @@ def _directory_snapshot_sha256(directory: Path) -> str:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(chunk)
     return digest.hexdigest()
+
+
+def _runtime_fingerprint(torch: Any) -> dict[str, Any]:
+    """Record the numerical stack that can alter forced-token generation."""
+    packages: dict[str, str | None] = {}
+    for field, distribution in _RUNTIME_PACKAGES.items():
+        try:
+            packages[field] = metadata.version(distribution)
+        except metadata.PackageNotFoundError:
+            packages[field] = None
+    return {
+        "python_version": platform.python_version(),
+        "gpu_name": torch.cuda.get_device_name(0),
+        "gpu_compute_capability": list(torch.cuda.get_device_capability(0)),
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
+        "cudnn_version": torch.backends.cudnn.version(),
+        **packages,
+    }
 
 
 def _source_revision(repository: Path | None = None) -> str | None:
@@ -540,9 +569,7 @@ def main() -> int:
         "summary": summarize(samples, args.n_prompts),
         "samples": samples,
         "runtime": {
-            "gpu_name": torch.cuda.get_device_name(0),
-            "torch_version": torch.__version__,
-            "cuda_version": torch.version.cuda,
+            **_runtime_fingerprint(torch),
             "elapsed_seconds": time.perf_counter() - started,
             "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
             "peak_reserved_bytes": torch.cuda.max_memory_reserved(),

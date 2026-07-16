@@ -13,9 +13,11 @@ import argparse
 import copy
 import gzip
 import hashlib
+from importlib import metadata
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import subprocess
 import time
@@ -25,6 +27,13 @@ from typing import Any
 
 _SYNTHETIC_CLAIM_METRIC_PREFIX = "train/pi_old_claim_"
 _IMMUTABLE_REVISION = re.compile(r"^[0-9a-f]{40}$")
+_RUNTIME_PACKAGES = {
+    "transformers_version": "transformers",
+    "flash_linear_attention_version": "flash-linear-attention",
+    "flash_attn_version": "flash-attn",
+    "causal_conv1d_version": "causal-conv1d",
+    "bitsandbytes_version": "bitsandbytes",
+}
 
 
 def _read_archive(path: Path) -> dict[str, Any]:
@@ -309,6 +318,41 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _directory_snapshot_sha256(directory: Path) -> str:
+    """Bind every relative path and byte in a saved replay candidate."""
+    digest = hashlib.sha256()
+    for path in sorted(
+        candidate for candidate in directory.rglob("*") if candidate.is_file()
+    ):
+        relative = path.relative_to(directory).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(path.stat().st_size.to_bytes(8, "big"))
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _runtime_fingerprint(torch: Any) -> dict[str, Any]:
+    """Record the training stack that can alter the replayed update."""
+    packages: dict[str, str | None] = {}
+    for field, distribution in _RUNTIME_PACKAGES.items():
+        try:
+            packages[field] = metadata.version(distribution)
+        except metadata.PackageNotFoundError:
+            packages[field] = None
+    return {
+        "python_version": platform.python_version(),
+        "gpu_name": torch.cuda.get_device_name(0),
+        "gpu_compute_capability": list(torch.cuda.get_device_capability(0)),
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
+        "cudnn_version": torch.backends.cudnn.version(),
+        **packages,
+    }
+
+
 def _source_revision(repository: Path | None = None) -> str | None:
     """Best-effort identity of the mounted source tree used for replay."""
     repository = (
@@ -585,15 +629,20 @@ def main() -> int:
             break
     elapsed = time.perf_counter() - started
 
+    saved_model_snapshot_sha256 = None
     if status == "stepped" and args.save_model is not None:
         args.save_model.mkdir(parents=True, exist_ok=True)
         train_model.save_pretrained(args.save_model)
         tokenizer.save_pretrained(args.save_model)
+        saved_model_snapshot_sha256 = _directory_snapshot_sha256(
+            args.save_model
+        )
 
     result = {
         "schema_version": 1,
         "reliquary_revision": reliquary_revision,
         "replay_script_sha256": replay_script_sha256,
+        "saved_model_snapshot_sha256": saved_model_snapshot_sha256,
         "status": status,
         "skip_reason": skip_reason,
         "checkpoint_repo": args.checkpoint_repo,
@@ -613,9 +662,7 @@ def main() -> int:
         ),
         "steps": step_results,
         "runtime": {
-            "torch_version": torch.__version__,
-            "cuda_version": torch.version.cuda,
-            "gpu_name": torch.cuda.get_device_name(0),
+            **_runtime_fingerprint(torch),
             "elapsed_seconds": elapsed,
             "allocated_before_bytes": allocated_before,
             "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
