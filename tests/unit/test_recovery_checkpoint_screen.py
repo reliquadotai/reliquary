@@ -5,12 +5,38 @@ import json
 import pytest
 
 from scripts.screen_recovery_checkpoints import (
+    _source_revision,
     _token_repetition,
     resolve_model_source,
     select_code_tasks,
     select_tasks,
     summarize,
 )
+
+
+def test_source_revision_reads_mounted_checkout_with_explicit_safe_directory(
+    tmp_path, monkeypatch
+):
+    calls = []
+
+    class Completed:
+        stdout = "a" * 40 + "\n"
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return Completed()
+
+    monkeypatch.setattr(
+        "scripts.screen_recovery_checkpoints.subprocess.run", fake_run
+    )
+
+    assert _source_revision(tmp_path) == "a" * 40
+    assert calls[0][0][:3] == [
+        "git",
+        "-c",
+        f"safe.directory={tmp_path.resolve()}",
+    ]
+    assert calls[0][1]["cwd"] == tmp_path.resolve()
 
 
 def test_select_tasks_is_order_independent_and_revision_bound(tmp_path):

@@ -32,12 +32,22 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _source_revision() -> str | None:
+def _source_revision(repository: Path | None = None) -> str | None:
     """Best-effort identity of the mounted source tree used for the screen."""
-    repository = Path(__file__).resolve().parents[1]
+    repository = (
+        Path(__file__).resolve().parents[1]
+        if repository is None
+        else repository.resolve()
+    )
     try:
         completed = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            [
+                "git",
+                "-c",
+                f"safe.directory={repository}",
+                "rev-parse",
+                "HEAD",
+            ],
             cwd=repository,
             check=True,
             capture_output=True,
