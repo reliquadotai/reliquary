@@ -719,8 +719,13 @@ def _new_kl_stats() -> dict[str, float | int]:
         "weighted_kl": 0.0,
         "ppo_token_count": 0,
         "ppo_clip_active_count": 0,
+        "ppo_ratio_below_clip_count": 0,
+        "ppo_ratio_above_clip_count": 0,
         "ppo_ratio_nonfinite_count": 0,
         "ppo_log_ratio_abs_max": 0.0,
+        "ppo_log_ratio_abs_gt_1_count": 0,
+        "ppo_log_ratio_abs_gt_2_count": 0,
+        "ppo_log_ratio_abs_gt_5_count": 0,
         "pi_old_claim_token_count": 0,
         "pi_old_claim_abs_error_sum": 0.0,
         "pi_old_claim_abs_error_max": 0.0,
@@ -761,15 +766,31 @@ def _record_kl_stats(
         stats["weighted_kl"] += float((scale_cat * kl_tok).sum())
         stats["ppo_token_count"] += ppo_ratio.numel()
         stats["ppo_clip_active_count"] += int(ppo_clip_active.sum())
+        stats["ppo_ratio_below_clip_count"] += int(
+            (ppo_ratio < 1.0 - PPO_CLIP_EPSILON).sum()
+        )
+        stats["ppo_ratio_above_clip_count"] += int(
+            (ppo_ratio > 1.0 + PPO_CLIP_EPSILON).sum()
+        )
         stats["ppo_ratio_nonfinite_count"] += int(
             (~torch.isfinite(ppo_ratio)).sum()
         )
         finite_log_ratio = ppo_log_ratio.detach().float()
         finite_log_ratio = finite_log_ratio[torch.isfinite(finite_log_ratio)]
         if finite_log_ratio.numel():
+            abs_log_ratio = finite_log_ratio.abs()
             stats["ppo_log_ratio_abs_max"] = max(
                 float(stats["ppo_log_ratio_abs_max"]),
-                float(finite_log_ratio.abs().max()),
+                float(abs_log_ratio.max()),
+            )
+            stats["ppo_log_ratio_abs_gt_1_count"] += int(
+                (abs_log_ratio > 1.0).sum()
+            )
+            stats["ppo_log_ratio_abs_gt_2_count"] += int(
+                (abs_log_ratio > 2.0).sum()
+            )
+            stats["ppo_log_ratio_abs_gt_5_count"] += int(
+                (abs_log_ratio > 5.0).sum()
             )
         if behavior_old is not None:
             claim_error = (
@@ -825,11 +846,33 @@ def _kl_telemetry_metrics(stats: dict[str, float | int]) -> dict[str, float]:
         "train/ppo_clip_active_ratio": (
             int(stats["ppo_clip_active_count"]) / ppo_denominator
         ),
+        "train/ppo_ratio_below_clip_ratio": (
+            int(stats["ppo_ratio_below_clip_count"]) / ppo_denominator
+        ),
+        "train/ppo_ratio_above_clip_ratio": (
+            int(stats["ppo_ratio_above_clip_count"]) / ppo_denominator
+        ),
+        "train/ppo_ratio_outside_clip_ratio": (
+            (
+                int(stats["ppo_ratio_below_clip_count"])
+                + int(stats["ppo_ratio_above_clip_count"])
+            )
+            / ppo_denominator
+        ),
         "train/ppo_ratio_nonfinite_ratio": (
             int(stats["ppo_ratio_nonfinite_count"]) / ppo_denominator
         ),
         "train/ppo_log_ratio_abs_max": float(
             stats["ppo_log_ratio_abs_max"]
+        ),
+        "train/ppo_log_ratio_abs_gt_1_ratio": (
+            int(stats["ppo_log_ratio_abs_gt_1_count"]) / ppo_denominator
+        ),
+        "train/ppo_log_ratio_abs_gt_2_ratio": (
+            int(stats["ppo_log_ratio_abs_gt_2_count"]) / ppo_denominator
+        ),
+        "train/ppo_log_ratio_abs_gt_5_ratio": (
+            int(stats["ppo_log_ratio_abs_gt_5_count"]) / ppo_denominator
         ),
         "train/pi_old_claim_token_count": float(claim_token_count),
         "train/pi_old_claim_abs_error_mean": (

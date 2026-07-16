@@ -331,7 +331,10 @@ def test_atomic_matches_nonatomic_qwenlike():
 def test_kl_tail_stats_capture_weighted_objective_and_outliers():
     import copy
 
-    from reliquary.validator.training import _new_kl_stats
+    from reliquary.validator.training import (
+        _kl_telemetry_metrics,
+        _new_kl_stats,
+    )
 
     torch.manual_seed(4)
     model = _QwenLike()
@@ -356,6 +359,15 @@ def test_kl_tail_stats_capture_weighted_objective_and_outliers():
     assert math.isfinite(stats["weighted_kl"])
     assert stats["ppo_token_count"] == stats["token_count"]
     assert stats["ppo_ratio_nonfinite_count"] == 0
+    outside_count = (
+        stats["ppo_ratio_below_clip_count"]
+        + stats["ppo_ratio_above_clip_count"]
+    )
+    assert 0 <= outside_count <= stats["ppo_token_count"]
+    metrics = _kl_telemetry_metrics(stats)
+    assert metrics["train/ppo_ratio_outside_clip_ratio"] == pytest.approx(
+        outside_count / stats["ppo_token_count"]
+    )
 
 
 def test_policy_health_stats_measure_recomputed_claim_error():
@@ -393,6 +405,8 @@ def test_policy_health_stats_measure_recomputed_claim_error():
     assert metrics["train/pi_old_claim_abs_error_max"] > 1.0
     assert metrics["train/pi_old_claim_gt_1e_3_ratio"] == 1.0
     assert metrics["train/ppo_ratio_nonfinite_ratio"] == 0.0
+    assert metrics["train/ppo_ratio_outside_clip_ratio"] == 0.0
+    assert metrics["train/ppo_log_ratio_abs_gt_1_ratio"] == 0.0
 
 
 # ---------------------------------------------------------------------------
