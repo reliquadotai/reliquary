@@ -219,7 +219,20 @@ def _snapshot(repo_id: str, revision: str) -> str:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--archive", action="append", type=Path, required=True)
+    parser.add_argument(
+        "--archive",
+        action="append",
+        type=Path,
+        help="Source archive for one replay batch; repeat for cross-window data.",
+    )
+    parser.add_argument(
+        "--batch-archives",
+        action="append",
+        help=(
+            "Comma-separated source archives for one balanced batch. Repeat "
+            "the option to replay sequential production batches."
+        ),
+    )
     parser.add_argument(
         "--checkpoint-repo",
         default="ReliquaryForge/qwen3.5-2b-reliquary-v2",
@@ -262,15 +275,32 @@ def main() -> int:
         train_step,
     )
 
-    archive_paths = [path.resolve() for path in args.archive]
-    archives = [_read_archive(path) for path in archive_paths]
-    env_order, archived_batches, accumulator = reconstruct_balanced_batch(
-        archives
-    )
-    if accumulator["checkpoint_revision"] != args.behavior_revision:
-        raise ValueError(
-            "archive behavior revision does not match --behavior-revision: "
-            f"{accumulator['checkpoint_revision']} != {args.behavior_revision}"
+    if args.archive and args.batch_archives:
+        raise ValueError("use --archive or --batch-archives, not both")
+    if args.batch_archives:
+        archive_sets = [
+            [Path(value).resolve() for value in raw.split(",") if value]
+            for raw in args.batch_archives
+        ]
+    elif args.archive:
+        archive_sets = [[path.resolve() for path in args.archive]]
+    else:
+        raise ValueError("at least one archive batch is required")
+
+    reconstructed = []
+    for archive_paths in archive_sets:
+        archives = [_read_archive(path) for path in archive_paths]
+        env_order, archived_batches, accumulator = reconstruct_balanced_batch(
+            archives
+        )
+        if accumulator["checkpoint_revision"] != args.behavior_revision:
+            raise ValueError(
+                "archive behavior revision does not match --behavior-revision: "
+                f"{accumulator['checkpoint_revision']} != "
+                f"{args.behavior_revision}"
+            )
+        reconstructed.append(
+            (archive_paths, env_order, archived_batches, accumulator)
         )
 
     base_path = _snapshot(args.base_repo, args.base_revision)
@@ -278,9 +308,17 @@ def main() -> int:
         args.checkpoint_repo, args.behavior_revision
     )
     tokenizer = load_tokenizer(base_path)
-    batches, batch_summary = materialize_training_batch(
-        env_order, archived_batches, tokenizer
-    )
+    replay_batches = []
+    for archive_paths, env_order, archived_batches, accumulator in reconstructed:
+        batches, batch_summary = materialize_training_batch(
+            env_order, archived_batches, tokenizer
+        )
+        replay_batches.append({
+            "archive_paths": archive_paths,
+            "accumulator": accumulator,
+            "batches": batches,
+            "batch_summary": batch_summary,
+        })
 
     def load_model(path: str):
         return load_text_generation_model(
@@ -304,33 +342,57 @@ def main() -> int:
     for parameter in ref_model.parameters():
         parameter.requires_grad = False
 
-    captured: dict[str, Any] = {}
     original_log = telemetry.log_training_step
-
-    def capture(metrics: dict, step: int | None) -> None:
-        captured.update(metrics)
-        captured["_step"] = step
-
     reset_training_state()
-    telemetry.log_training_step = capture
     torch.cuda.reset_peak_memory_stats()
     allocated_before = torch.cuda.memory_allocated()
     started = time.perf_counter()
     status = "stepped"
     skip_reason = None
-    try:
-        train_step(
-            train_model,
-            batches,
-            ref_model=ref_model,
-            behavior_model=behavior_model,
-            window_index=args.window_index,
+    step_results = []
+    for step_offset, replay_batch in enumerate(replay_batches):
+        captured: dict[str, Any] = {}
+
+        def capture(metrics: dict, step: int | None) -> None:
+            captured.update(metrics)
+            captured["_step"] = step
+
+        telemetry.log_training_step = capture
+        step_started = time.perf_counter()
+        telemetry_step = (
+            args.window_index + step_offset
+            if args.window_index
+            else max(replay_batch["accumulator"]["source_windows"])
         )
-    except TrainingStepSkipped as exc:
-        status = "skipped"
-        skip_reason = exc.reason
-    finally:
-        telemetry.log_training_step = original_log
+        try:
+            train_step(
+                train_model,
+                replay_batch["batches"],
+                ref_model=ref_model,
+                behavior_model=behavior_model,
+                window_index=telemetry_step,
+            )
+        except TrainingStepSkipped as exc:
+            status = "skipped"
+            skip_reason = exc.reason
+        finally:
+            telemetry.log_training_step = original_log
+        step_results.append({
+            "step_index": step_offset,
+            "window_index": telemetry_step,
+            "status": status,
+            "skip_reason": skip_reason,
+            "elapsed_seconds": time.perf_counter() - step_started,
+            "archives": [
+                {"path": str(path), "sha256": _sha256(path)}
+                for path in replay_batch["archive_paths"]
+            ],
+            "accumulator": replay_batch["accumulator"],
+            "batch": replay_batch["batch_summary"],
+            "metrics": captured,
+        })
+        if status != "stepped":
+            break
     elapsed = time.perf_counter() - started
 
     if status == "stepped" and args.save_model is not None:
@@ -350,13 +412,11 @@ def main() -> int:
         "kl_beta": args.kl_beta,
         "grad_threshold": args.grad_threshold,
         "attention_implementation": args.attention_implementation,
-        "archives": [
-            {"path": str(path), "sha256": _sha256(path)}
-            for path in archive_paths
-        ],
-        "accumulator": accumulator,
-        "batch": batch_summary,
-        "metrics": captured,
+        "requested_steps": len(replay_batches),
+        "completed_steps": sum(
+            step["status"] == "stepped" for step in step_results
+        ),
+        "steps": step_results,
         "runtime": {
             "torch_version": torch.__version__,
             "cuda_version": torch.version.cuda,
