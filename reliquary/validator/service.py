@@ -263,11 +263,62 @@ def _model_storage_bytes(model: Any) -> int | None:
         return None
 
 
+def _model_parameter_count(model: Any) -> int | None:
+    try:
+        return sum(parameter.numel() for parameter in model.parameters())
+    except (AttributeError, TypeError):
+        return None
+
+
 def _model_device(model: Any) -> str | None:
     try:
         return str(next(model.parameters()).device)
     except (AttributeError, StopIteration, TypeError):
         return None
+
+
+def _model_dtype(model: Any) -> str | None:
+    try:
+        return str(next(model.parameters()).dtype)
+    except (AttributeError, StopIteration, TypeError):
+        return None
+
+
+def _model_config_value(model: Any, name: str) -> Any | None:
+    value = getattr(getattr(model, "config", None), name, None)
+    return value if isinstance(value, (str, int)) else None
+
+
+def _validate_fixed_kl_reference(train_model: Any, ref_model: Any) -> None:
+    """Fail at startup when a fixed reference cannot share the train inputs."""
+    if ref_model is train_model:
+        raise ValueError("fixed KL reference must be a distinct model instance")
+    checks = {
+        "device": (_model_device(train_model), _model_device(ref_model)),
+        "dtype": (_model_dtype(train_model), _model_dtype(ref_model)),
+        "parameter_count": (
+            _model_parameter_count(train_model),
+            _model_parameter_count(ref_model),
+        ),
+        "model_type": (
+            _model_config_value(train_model, "model_type"),
+            _model_config_value(ref_model, "model_type"),
+        ),
+        "vocab_size": (
+            _model_config_value(train_model, "vocab_size"),
+            _model_config_value(ref_model, "vocab_size"),
+        ),
+    }
+    for label, (train_value, ref_value) in checks.items():
+        if (
+            train_value is not None
+            and ref_value is not None
+            and train_value != ref_value
+        ):
+            raise ValueError(
+                f"fixed KL reference {label} mismatch: "
+                f"train={train_value!r} reference={ref_value!r}"
+            )
 
 
 class ValidationService:
@@ -442,7 +493,10 @@ class ValidationService:
             "resolved_revision": None,
             "loaded": self.verify_model is not None,
             "device": _model_device(self.verify_model),
+            "dtype": _model_dtype(self.verify_model),
+            "parameter_count": _model_parameter_count(self.verify_model),
             "storage_bytes": _model_storage_bytes(self.verify_model),
+            "beta_explicit": KL_BETA_EXPLICIT,
         }
         if KL_BASE_MODEL:
             if model is None:
@@ -457,8 +511,15 @@ class ValidationService:
                 )
             try:
                 from huggingface_hub import snapshot_download
+                from reliquary.shared.modeling import (
+                    MODEL_SNAPSHOT_ALLOW_PATTERNS,
+                )
 
-                base_path = snapshot_download(repo_id=repo, revision=rev)
+                base_path = snapshot_download(
+                    repo_id=repo,
+                    revision=rev,
+                    allow_patterns=MODEL_SNAPSHOT_ALLOW_PATTERNS,
+                )
                 path_revision = Path(base_path).resolve().name.lower()
                 if (
                     _HF_COMMIT_RE.fullmatch(path_revision) is not None
@@ -469,6 +530,9 @@ class ValidationService:
                         f"requested={rev} resolved={path_revision}"
                     )
                 self.base_ref_model = self._load_model_fn(base_path)
+                _validate_fixed_kl_reference(
+                    self.train_model, self.base_ref_model
+                )
                 self.base_ref_model.eval()
                 for _p in self.base_ref_model.parameters():
                     _p.requires_grad = False
@@ -497,7 +561,12 @@ class ValidationService:
                 "resolved_revision": resolved_revision,
                 "loaded": True,
                 "device": _model_device(self.base_ref_model),
+                "dtype": _model_dtype(self.base_ref_model),
+                "parameter_count": _model_parameter_count(
+                    self.base_ref_model
+                ),
                 "storage_bytes": _model_storage_bytes(self.base_ref_model),
+                "beta_explicit": KL_BETA_EXPLICIT,
             }
             logger.info(
                 "GRPO KL reference=fixed repo=%s revision=%s beta=%.6g "
