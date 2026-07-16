@@ -1,174 +1,209 @@
-# Training Recovery Runbook
+# Training Recovery Decision and Runbook
 
 Date: 2026-07-16
 
-## Operator Decision
+## Final Decision
 
-Keep validation, scoring, archive publication, and weight setting online while
-optimizer steps remain frozen with `RELIQUARY_DISABLE_TRAIN=1`. Checkpoint 33
-must not be used as the recovery starting point.
+Restore training through one bounded, append-only canary:
 
-The recovery must be append-only:
+1. Keep validation, scoring, weights, and archive publication online while
+   `RELIQUARY_DISABLE_TRAIN=1` remains set.
+2. Republish immutable checkpoint 15 as monotonically newer checkpoint 34.
+3. Resume with a fixed upstream-base KL reference, validator-recomputed
+   `pi_old`, `learning_rate=3e-6`, `KL beta=0.01`, and no length shaping.
+4. Reject a step before `optimizer.step()` when the gradient is nonfinite or
+   above `50`, or when more than `10%` of completion tokens lie outside PPO's
+   `[0.8, 1.2]` ratio band.
+5. Publish checkpoint 35 after ten successful balanced steps, then stop
+   automatically and evaluate before allowing another step.
 
-1. Select an immutable historical source from the holdout evidence.
-2. Republish those weights as checkpoint 34 so miners see a monotonic update.
-3. Deploy the recovery image while training is still frozen.
-4. Unfreeze only after the validator reports the complete pinned contract.
-5. Stop automatically after checkpoint 35 and evaluate before continuing.
+This release changes validator training and recovery operations only. It does
+not change miner generation, submission schemas, scoring, BFT budgets, or wire
+protocols. The difficulty-auction v2 protocol remains a separate release.
 
-This is a validator training change. It does not change miner generation,
-submission, scoring, or wire contracts.
+## Why Recovery Was Required
 
-## Incident Evidence
+The production validator remained available, but a training step at
+2026-07-16 07:57 UTC reported approximate KL `19.6033` and pre-clip gradient
+norm `10432`. Gradient clipping limited update magnitude but could not make the
+direction trustworthy. Those weights later became checkpoint 33 at revision
+`606434551d06f37098f30fe46edf93a0c41320c2`.
 
-The production validator remained OPEN and continued filling balanced batches,
-but one training step at 2026-07-16 07:57 UTC reported:
+A protocol-parity screen found checkpoint 33 below upstream base on math
+reward. Checkpoint 33 is therefore rejected as a recovery source. Production
+training was frozen before further optimizer steps while validation and archive
+publication continued.
 
-- approximate KL: `19.6033`
-- pre-clip gradient norm: `10432`
-- optimizer step: applied after clipping
-- later publication: checkpoint 33, revision
-  `606434551d06f37098f30fe46edf93a0c41320c2`
+During calibration, an independent Subtensor runtime codec change caused every
+miner to be rejected as `registration_unavailable`. PR #136 upgraded the chain
+stack and exposed registration-cache health. The immutable production image was
+verified with 256 registered hotkeys, accepted math and code submissions, and a
+successful R2 upload for window 23332. Training remained frozen throughout.
 
-Gradient clipping limits update magnitude. It does not make a pathological
-direction trustworthy. A paired protocol-parity screen subsequently measured
-checkpoint 33 below upstream base on math reward, so the checkpoint is rejected
-as a recovery source.
+## Policy Contracts
 
-Production is frozen with `RELIQUARY_DISABLE_TRAIN=1`. The flag does not disable
-serving or rewards. A ready balanced batch remains bounded in memory while the
-optimizer and checkpoint publisher are bypassed.
+The fixed-KL design is correct only when three policies remain distinct:
 
-## Correct Policy Contracts
+- `verify_model` is the last published behavior policy used by miners. It
+  supplies trusted, validator-recomputed `pi_old` for PPO.
+- `base_ref_model` is immutable upstream Qwen3.5-2B. It supplies only the KL
+  anchor that constrains long-run drift.
+- `train_model` is the mutable candidate receiving optimizer updates.
 
-The fixed KL design is useful only when three policies retain separate roles:
+Using the immutable base as both KL reference and `pi_old` would make PPO
+off-policy as soon as the published model differs from upstream. Trusting miner
+log-probability claims instead would leave the importance ratio miner-writable.
+Fixed-reference mode therefore fails closed unless the base revision, beta, and
+`RELIQUARY_RECOMPUTE_PI_OLD_FROM_VERIFY=true` are explicit.
 
-- `verify_model` is the published behavior policy used by miners. It supplies
-  validator-recomputed `pi_old` for PPO.
-- `base_ref_model` is the immutable upstream base checkpoint. It supplies only
-  the KL anchor that constrains long-run drift.
-- `train_model` is the mutable policy receiving the optimizer update.
+## Reconciliation With The Initial Design
 
-Fixed-reference mode now refuses startup unless both
-`RELIQUARY_KL_BETA` and
-`RELIQUARY_RECOMPUTE_PI_OLD_FROM_VERIFY=true` are explicit. Miner-reported
-log-probabilities remain useful telemetry, but no longer control PPO ratios in
-this mode.
+Rom's core diagnosis was right: the 2B model needed a stable reference to slow
+policy drift. That fixed-base KL mechanism is retained. The experiments changed
+the surrounding assumptions:
 
-## Recovery Controls
+| Initial choice | Recovery choice | Reason |
+|---|---|---|
+| Fixed upstream-base KL | Retained | It adds a real long-run drift constraint. |
+| `KL beta=0.04` | `0.01` | `0.04` pulled toward the upstream base's worse forced-close/rambling profile and lost held-out reward. |
+| `learning_rate=5e-6` | `3e-6` | The lower rate produced stable ten-step trajectories with useful gate margin. |
+| Two-sided shaping `0.5` | Disabled (`0`) | It changed `38.2%` of advantages, greatly enlarged PPO tails, and showed no held-out benefit. |
+| Miner-claimed `pi_old` | Validator recomputation | Fixed KL and PPO behavior policy are separate contracts; claims cannot control the PPO ratio. |
+| Open-ended continuation | One ten-step canary | Earlier training improved transiently and then collapsed; checkpoint publication is now an evaluation boundary. |
 
-The recovery image exposes and reports these independent controls:
+The miner-only presence penalty was not restored. A presence or repetition
+processor changes the sampled policy. Unless the validator applies the exact
+same stateful transform when recomputing old log-probabilities and forced-seed
+decisions, PPO trains against the wrong distribution. BFT remains the auditable
+math termination mechanism; CODE is still single-phase and has a separate
+long-tail termination problem.
 
-1. `RELIQUARY_KL_BASE_MODEL`: immutable `repo@40-character-sha` KL anchor.
-2. `RELIQUARY_KL_BETA`: explicit fixed-reference penalty strength.
-3. `RELIQUARY_RECOMPUTE_PI_OLD_FROM_VERIFY=true`: trusted PPO behavior policy.
-4. `RELIQUARY_LEARNING_RATE`: calibrated optimizer rate.
-5. `RELIQUARY_GRAD_NORM_SKIP_THRESHOLD`: rejects a bad update before
-   `optimizer.step()` and checkpoint cadence advancement.
-6. `RELIQUARY_SHAPE_PENALTY`: validator-only auxiliary objective; zero disables
-   it.
-7. `RELIQUARY_TRAIN_UNTIL_CHECKPOINT_N`: restart-persistent canary ceiling.
+## Reset Source Selection
 
-Rejected steps report loss, KL, PPO tails, shaping exposure, and gradient
-telemetry, then discard the failed batch without publishing a checkpoint.
+Base, checkpoint 10, and checkpoint 15 were screened on the same 48 pinned
+OpenMathInstruct prompts with one protocol-forced sample per prompt.
 
-## Exact Replay Evidence
+| Model | Pass | Forced close | Rambling proxy | Termination |
+|---|---:|---:|---:|---:|
+| Upstream base | `56.25%` | `95.83%` | `18.75%` | `50.00%` |
+| Checkpoint 10 | `58.33%` | `68.75%` | `2.08%` | `54.17%` |
+| Checkpoint 15 | `56.25%` | `62.50%` | `2.08%` | `52.08%` |
 
-All replay arms used the production runtime, immutable model revisions, the
-same archived balanced windows, fixed seeds, validator-recomputed `pi_old`, and
-the upstream Qwen base revision
-`15852e8c16360a2fea060d615a32b45270f8a8fc` as the KL reference.
+Checkpoint 15 revision
+`2f3d4a0b9224abdf1e5707d385f0620ab43e47c9` was selected. It is tied with
+base on reward while substantially improving forced-close and rambling rates,
+and it preserves five more historical training steps than checkpoint 10.
 
-### Checkpoint 32 stability grid
+Windows 22796 through 22805 each contain exactly eight math and eight code
+groups, and every accepted group claims that checkpoint-15 revision. They form
+the exact ten-step replay corpus.
 
-Eleven consecutive production batches were replayed from checkpoint 32.
+## Shaping Ablation
 
-| Learning rate | KL beta | Result | Max grad norm | Final PPO outside clip |
-|---:|---:|---|---:|---:|
-| `5e-6` | `0` | 11/11 applied | `1.375` | `1.276%` |
-| `5e-6` | `0.04` | 11/11 applied | `13.188` | not selected |
-| `5e-6` | `0.10` | rejected at batch 11 | `171` | rejected |
-| `3e-6` | `0` | 11/11 applied | `1.391` | `0.738%` |
-| `3e-6` | `0.001` | 11/11 applied | `1.383` | `0.668%` |
-| `3e-6` | `0.004` | 11/11 applied | stable | similar to `0.001` |
-
-The least aggressive configuration retaining a real fixed-base constraint is
-therefore `learning_rate=3e-6`, `KL beta=0.001`. The production circuit breaker
-is set to `50`, well above the healthy replay range and far below the incident
-value of `10432`.
-
-### Shaping ablation
-
-Ten exact checkpoint-10 windows, 22746 through 22755, were replayed from the
-same starting weights with either `shape=0` or `shape=0.5`.
+Ten exact checkpoint-10 windows were replayed with shape `0` and `0.5`.
 
 | Metric | Shape `0` | Shape `0.5` |
 |---|---:|---:|
 | Applied steps | `10/10` | `10/10` |
-| Max grad norm | `1.813` | `2.422` |
-| Final PPO outside clip | `0.309%` | `6.917%` |
+| Max gradient norm | `1.813` | `2.422` |
 | Mean PPO outside clip | `0.092%` | `1.074%` |
-| Final max absolute PPO log-ratio | `0.843` | `1.112` |
-| Rollout advantages changed, mean | `0%` | `38.203%` |
+| Final PPO outside clip | `0.309%` | `6.917%` |
+| Advantages changed | `0%` | `38.203%` |
 | Mean absolute advantage delta | `0` | `0.2691` |
 
-`shape=0.5` is a dominant auxiliary objective, not a small regularizer. It is
-provisionally disabled. It may be restored only if its paired held-out candidate
-shows a material quality benefit that justifies the much larger policy-ratio
-tail.
+Shape `0.5` is a dominant auxiliary objective, not a small regularizer. It is
+disabled for recovery. Shaping may return only through a new paired experiment
+that demonstrates quality benefit, not merely shorter output.
 
-## Checkpoint Lineage
+## KL Calibration
 
-The first 24 pinned OpenMathInstruct holdout prompts were screened with one
-protocol-forced sample per prompt and production generation budgets.
+All arms started from checkpoint 15, replayed the same ten balanced windows,
+used `LR=3e-6`, shape `0`, validator-recomputed `pi_old`, and immutable upstream
+Qwen revision `15852e8c16360a2fea060d615a32b45270f8a8fc`.
 
-| Model | Pass | Forced close | Rambling proxy | Termination |
-|---|---:|---:|---:|---:|
-| Upstream base | `54.17%` | `95.83%` | `20.83%` | `45.83%` |
-| Checkpoint 10 | `50.00%` | `83.33%` | `4.17%` | `45.83%` |
-| Checkpoint 15 | `50.00%` | `70.83%` | `4.17%` | `41.67%` |
-| Checkpoint 20 | `33.33%` | `66.67%` | `20.83%` | `62.50%` |
-| Checkpoint 25 | `29.17%` | `41.67%` | `4.17%` | `87.50%` |
-| Checkpoint 30 | `33.33%` | `70.83%` | `8.33%` | `37.50%` |
+| KL beta | Applied | Max grad | Mean PPO outside | Peak | Final | Final KL |
+|---:|---:|---:|---:|---:|---:|---:|
+| `0.001` | `10/10` | `6.281` | `2.951%` | `9.244%` | `8.397%` | `0.1736` |
+| `0.01` | `10/10` | `6.156` | `2.817%` | `8.812%` | `8.151%` | `0.1707` |
+| `0.04` | `10/10` | `5.656` | `2.365%` | `7.470%` | `6.849%` | `0.1601` |
 
-Checkpoint 20 is the first screened checkpoint with a statistically clear
-capability regression versus base: `-20.83` percentage points with paired 95%
-CI `[-37.50, -4.17]`. Checkpoint 15 remains statistically tied on reward while
-significantly reducing forced-close and rambling behavior. A second disjoint
-24-prompt holdout is running before the final reset-source decision.
+The 16-prompt, two-sample paired math screen then measured:
 
-The archive identity was checked from every accepted group, not inferred from
-timestamps. Windows 22796 through 22805 all claim checkpoint-15 revision
-`2f3d4a0b9224abdf1e5707d385f0620ab43e47c9` and contain exactly eight math
-plus eight code groups.
+| Model | Pass avg | Pass@1 | Pass@2 | Forced | Ramble | Termination |
+|---|---:|---:|---:|---:|---:|---:|
+| Checkpoint 15 | `43.75%` | `50.00%` | `50.00%` | `62.50%` | `3.13%` | `43.75%` |
+| Beta `0.001` | `46.88%` | `43.75%` | `50.00%` | `62.50%` | `12.50%` | `43.75%` |
+| Beta `0.01` | `43.75%` | `37.50%` | `50.00%` | `62.50%` | `0%` | `46.88%` |
+| Beta `0.04` | `37.50%` | `37.50%` | `43.75%` | `65.63%` | `6.25%` | `37.50%` |
 
-## Remaining Pre-Deployment Gates
+Beta `0.001` sits closest to the PPO gate and increased the rambling proxy.
+Beta `0.04` lost aggregate reward and moved forced-close, rambling, and
+termination in the wrong direction. Beta `0.01` preserved aggregate reward,
+removed observed rambling in this screen, and retained more drift margin. It is
+the selected compromise.
 
-The following gates must complete before unfreezing production:
+## Reproducibility And Numerical Contract
 
-1. Combine the disjoint 24-prompt holdouts and run paired bootstrap comparisons
-   for base, checkpoint 10, and checkpoint 15.
-2. Compare the held-out checkpoint-10 candidates trained with shape `0` and
-   shape `0.5`.
-3. Replay the selected controls across the exact ten checkpoint-15 windows if
-   checkpoint 15 is selected.
-4. Run pinned gVisor code screens for base and the selected reset candidate.
-5. Repeat a small selected-model math screen in a fresh solo process and compare
-   exact completion hashes as a numerical-runtime check.
-6. Run the complete test suite and verify the final diff.
+The selected replay was repeated in fresh processes under the production
+runtime. The final provenance-correct run reported:
 
-## Expected Production Contract
+- source revision: `f401a637e82cb4ef0ce2752c9c5783cd90a2b5b4`
+- runtime: H100 PCIe, torch `2.7.0+cu128`, transformers `5.9.0`,
+  flash-linear-attention `0.5.0`, no causal-conv1d
+- applied steps: `10/10`
+- max gradient norm: `6.125`
+- mean / peak / final PPO outside clip: `2.810% / 8.715% / 8.094%`
+- final KL: `0.17089`
+- nonfinite or rejected steps: `0`
 
-Subject to the remaining checkpoint and shaping screens, the recovery contract
-is expected to be:
+Three nominally identical runs produced different model byte hashes. The two
+gated repeats nevertheless differed by at most `0.1574` percentage points in
+per-step PPO outside-clip ratio, `0.0625` in gradient norm, and `0.000504` in
+per-step KL. Bit-identical weights are therefore not the release contract. The
+contract is pinned runtime identity plus bounded policy-health and held-out
+quality. This matches the known cached/full-forward kernel sensitivity.
+
+## CODE Sentinel
+
+CODE was screened with its actual single-phase generation path, full `32768`
+cap, pinned curated dataset revision, gVisor grader, common prompts, and common
+forced draws. No math BFT was applied.
+
+| Prompt set | Source reward | Candidate reward | Reward transitions | Source/candidate ramble | Termination |
+|---|---:|---:|---:|---:|---:|
+| First 8 | `87.50%` | `83.93%` | `+0 / -1 / =7` | `25.0% / 12.5%` | `100% / 100%` |
+| Disjoint 8 | `65.63%` | `84.38%` | `+2 / -0 / =6` | `25.0% / 12.5%` | `87.5% / 87.5%` |
+| Combined 16 | `76.56%` | `84.15%` | `+2 / -1 / =13` | `25.0% / 12.5%` | `93.75% / 93.75%` |
+
+One rollout hit the `32768` cap in both source and candidate. The recovery
+update does not regress CODE and improves this small sentinel overall, but it
+does not solve CODE's single-phase cap-running tail. That remains a separate
+protocol design question.
+
+## Safety Controls Added
+
+- Pre-step nonfinite, gradient-norm, and PPO-ratio circuit breakers.
+- Per-environment reward, token-mass, and policy-health telemetry.
+- BFT forced/natural path exposure and validated force-span masking metrics.
+- Runtime, source, archive, model, and candidate byte provenance.
+- Append-only reset publication with source and artifact hashes plus an HF
+  parent-commit race guard.
+- Publication retry that preserves the exact in-memory candidate and applies no
+  extra optimizer step while HF is unavailable.
+- Restart-persistent checkpoint ceiling.
+- Health fields for publication-pending and registration-cache state.
+- Unique grader runsc identities and metrics-socket shutdown cleanup.
+
+## Production Contract
 
 ```dotenv
 RELIQUARY_RESUME_FROM=sha:<checkpoint-34-commit>
 RELIQUARY_KL_BASE_MODEL=Qwen/Qwen3.5-2B@15852e8c16360a2fea060d615a32b45270f8a8fc
-RELIQUARY_KL_BETA=0.001
+RELIQUARY_KL_BETA=0.01
 RELIQUARY_LEARNING_RATE=0.000003
 RELIQUARY_RECOMPUTE_PI_OLD_FROM_VERIFY=true
 RELIQUARY_GRAD_NORM_SKIP_THRESHOLD=50
+RELIQUARY_PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD=0.1
 RELIQUARY_SHAPE_PENALTY=0
 RELIQUARY_SHAPE_LEN_FRAC=0.5
 RELIQUARY_TRAINING_RUN_ID=qwen35-2b-recovery-20260716
@@ -177,24 +212,53 @@ RELIQUARY_TRAIN_UNTIL_CHECKPOINT_N=35
 RELIQUARY_DISABLE_TRAIN=1
 ```
 
-Checkpoint 34 is an append-only reset publication, not a newly trained policy.
-After the frozen deployment reports every identity above, remove only
-`RELIQUARY_DISABLE_TRAIN`. Ten successful balanced optimizer steps publish
-checkpoint 35; the persistent ceiling then pauses further training while
-serving, scoring, archiving, and weight setting continue.
+## Deployment Sequence
+
+1. Merge the recovery PR and wait for its immutable validator image.
+2. Install the complete contract above while training remains frozen.
+3. Start the recovery image on checkpoint 33 and verify all health identities.
+4. Dry-run the reset publisher against immutable checkpoint 15.
+5. Publish those exact source weights as append-only checkpoint 34.
+6. Set `RELIQUARY_RESUME_FROM=sha:<checkpoint-34-commit>` and restart frozen.
+7. Verify checkpoint number, source manifest, artifact hashes, fixed-base
+   identity, beta, LR, shaping, PPO gate, ceiling, registration, and R2 health.
+8. Remove only `RELIQUARY_DISABLE_TRAIN`.
+9. Monitor successful balanced steps until checkpoint 35 is published. The
+   ceiling must then retain data and refuse further optimizer steps.
+10. Run paired math and CODE screens on the actual checkpoint-35 revision.
+    Continue only through a new explicit decision.
 
 ## Abort Conditions
 
-Re-freeze training immediately if any of the following occurs:
+Re-freeze immediately if any of the following occurs:
 
-- `train/step_skipped_nonfinite == 1`
-- `train/step_skipped_grad_spike == 1`
-- fixed KL identity, behavior policy, beta, learning rate, or shaping differs
-  from the approved contract
-- large unexplained movement in bad termination, forced-close, or rambling
-- sustained growth in PPO clipping, absolute log-ratio, KL tails, or gradients
-- checkpoint-35 evaluation regresses beyond paired holdout uncertainty
-- archive publication, checkpoint publication, or validator health degrades
+- nonfinite gradient or policy ratio
+- gradient norm above `50`
+- PPO outside-clip ratio above `0.10`
+- fixed base, behavior policy, beta, LR, shape, or source identity mismatch
+- checkpoint publication remains pending or retries a different candidate
+- large unexplained movement in reward, BFT force rate, bad termination,
+  rambling, or completion length
+- registration cache becomes unusable, archive uploads fail, or validator
+  health degrades
+- checkpoint 35 regresses outside paired holdout uncertainty
 
-An aborted optimizer step must never advance trained-window cadence or publish
-a checkpoint. Validation and reward accounting remain online during a freeze.
+An aborted training step must not advance optimizer, scheduler, publication
+cadence, or checkpoint number. Validation, rewards, archives, and weight setting
+remain online during any freeze.
+
+## Verification Record
+
+- Full CPU-contract suite: `1290 passed, 8 skipped`.
+- CUDA-visible affected training suite: `38 passed`.
+- Dedicated GPU proof suite: `7 passed, 1 known failure`.
+- Lint: all changed Python files pass apart from the repository's pre-existing
+  `constants.py` import-placement exceptions.
+- Compile and `git diff --check`: clean.
+
+The one GPU proof failure is the previously documented GRAIL-v7 wrong-model
+sketch weakness: the broad `5000` tolerance can accept random-model sketches.
+It is not introduced by this release and cannot be repaired validator-only
+without breaking miners. It remains a coordinated GRAIL-v8 item; forced-seed,
+token-distribution, termination, and reward verification continue to provide
+independent checks in the current protocol.
