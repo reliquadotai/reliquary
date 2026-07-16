@@ -117,6 +117,21 @@ def test_shaping_defaults_disabled():
         importlib.reload(C)
 
 
+def test_wandb_training_version_env_override():
+    env_name = "RELIQUARY_WANDB_VERSION"
+    prior = os.environ.get(env_name)
+    os.environ[env_name] = "training-recovery-test"
+    try:
+        importlib.reload(C)
+        assert C.WANDB_TRAINING_VERSION == "training-recovery-test"
+    finally:
+        if prior is None:
+            os.environ.pop(env_name, None)
+        else:
+            os.environ[env_name] = prior
+        importlib.reload(C)
+
+
 def test_v2_bootstrap_sigma_lower_than_steady():
     # Bootstrap accepts groups with lower σ (σ ≥ 0.33) vs steady (σ ≥ 0.43)
     assert C.BOOTSTRAP_SIGMA_MIN < C.SIGMA_MIN

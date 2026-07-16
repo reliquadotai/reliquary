@@ -693,7 +693,7 @@ WANDB_PROJECT = "reliquary-validator"
 # Bumping this constant (or setting RELIQUARY_WANDB_VERSION) starts a
 # fresh wandb run. Same value across restarts → wandb resumes the
 # existing run (resume="allow").
-WANDB_TRAINING_VERSION = "v1"
+WANDB_TRAINING_VERSION = _os.environ.get("RELIQUARY_WANDB_VERSION", "v1")
 
 # ────────────────  BEHAVIOURAL VALIDATORS  ────────────────
 # Thresholds calibrated in the original grail repo against ~430k honest
