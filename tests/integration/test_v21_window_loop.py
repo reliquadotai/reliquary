@@ -690,11 +690,17 @@ async def test_failed_publish_retries_without_an_extra_optimizer_step():
                 ))
                 assert response.accepted
             await svc._train_and_publish()
+            health = svc.server._health_payload()
+            assert health.training_checkpoint_publish_interval == 1
+            assert health.training_checkpoint_publication_pending is (
+                window == 0
+            )
 
     assert train.call_count == 1
     assert svc._checkpoint_store.publish.await_count == 2
     assert svc._checkpoint_n == 1
     assert svc._trained_windows_since_publish == 0
+    assert health.training_trained_windows_since_publish == 0
     assert svc._training_accumulator.snapshot()["counts"] == {"fake": 0}
 
 

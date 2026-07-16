@@ -457,6 +457,11 @@ class ValidationService:
         self._checkpoint_n: int = 0
         self._publish_every = CHECKPOINT_PUBLISH_INTERVAL_WINDOWS
         self._trained_windows_since_publish = 0
+        self.server.set_training_publish_state({
+            "trained_windows_since_publish": 0,
+            "publish_interval": self._publish_every,
+            "publication_pending": False,
+        })
         self._training_accumulator = BalancedTrainingAccumulator(
             dict(self.env_mix)
         )
@@ -1663,6 +1668,15 @@ class ValidationService:
                 self._trained_windows_since_publish,
                 self._publish_every,
             )
+        self.server.set_training_publish_state({
+            "trained_windows_since_publish": (
+                self._trained_windows_since_publish
+            ),
+            "publish_interval": self._publish_every,
+            "publication_pending": (
+                self._trained_windows_since_publish >= self._publish_every
+            ),
+        })
 
         try:
             await self._archive_window(self._active_batchers, sealed)
