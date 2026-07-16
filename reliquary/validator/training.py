@@ -678,7 +678,79 @@ def _batched_completion_logprobs(model, input_ids, attention_mask, prompt_length
     return _selected_logprobs(logits[b_idx, p_idx], targets), seg
 
 
-def _microbatch_grad(model, ref_model, batch, device, *, atomic):
+def _new_kl_stats() -> dict[str, float | int]:
+    return {
+        "token_count": 0,
+        "nonfinite_count": 0,
+        "gt_0_1_count": 0,
+        "gt_1_count": 0,
+        "gt_10_count": 0,
+        "max": 0.0,
+        "log_ratio_abs_max": 0.0,
+        "weighted_ppo": 0.0,
+        "weighted_kl": 0.0,
+    }
+
+
+def _record_kl_stats(
+    stats: dict[str, float | int] | None,
+    *,
+    ppo_tok,
+    kl_tok,
+    kl_log,
+    scale_cat,
+) -> None:
+    """Accumulate bounded KL-tail telemetry after a micro-batch succeeds."""
+    if stats is None:
+        return
+    with torch.no_grad():
+        values = kl_tok.detach().float()
+        log_ratio = kl_log.detach().float()
+        stats["token_count"] += values.numel()
+        stats["nonfinite_count"] += int((~torch.isfinite(values)).sum())
+        stats["gt_0_1_count"] += int((values > 0.1).sum())
+        stats["gt_1_count"] += int((values > 1.0).sum())
+        stats["gt_10_count"] += int((values > 10.0).sum())
+        stats["max"] = max(float(stats["max"]), float(values.max()))
+        stats["log_ratio_abs_max"] = max(
+            float(stats["log_ratio_abs_max"]),
+            float(log_ratio.abs().max()),
+        )
+        stats["weighted_ppo"] += float((scale_cat * ppo_tok).sum())
+        stats["weighted_kl"] += float((scale_cat * kl_tok).sum())
+
+
+def _kl_telemetry_metrics(stats: dict[str, float | int]) -> dict[str, float]:
+    token_count = int(stats["token_count"])
+    denominator = max(1, token_count)
+    weighted_ppo = float(stats["weighted_ppo"])
+    weighted_kl = float(stats["weighted_kl"])
+    weighted_penalty = KL_BETA * weighted_kl
+    return {
+        "train/kl_beta": KL_BETA,
+        "train/ppo_objective_component": weighted_ppo,
+        "train/kl_objective_component": weighted_kl,
+        "train/kl_penalty_objective": weighted_penalty,
+        "train/kl_to_ppo_abs_ratio": (
+            abs(weighted_penalty) / max(abs(weighted_ppo), 1e-12)
+        ),
+        "train/kl_token_count": float(token_count),
+        "train/kl_token_max": float(stats["max"]),
+        "train/kl_log_ratio_abs_max": float(stats["log_ratio_abs_max"]),
+        "train/kl_token_nonfinite_ratio": (
+            int(stats["nonfinite_count"]) / denominator
+        ),
+        "train/kl_token_gt_0_1_ratio": (
+            int(stats["gt_0_1_count"]) / denominator
+        ),
+        "train/kl_token_gt_1_ratio": int(stats["gt_1_count"]) / denominator,
+        "train/kl_token_gt_10_ratio": (
+            int(stats["gt_10_count"]) / denominator
+        ),
+    }
+
+
+def _microbatch_grad(model, ref_model, batch, device, *, atomic, kl_stats=None):
     """Forward + backward one micro-batch. ``batch`` is a list of
     ``(tokens, prompt_length, old_logprobs, advantage, scale, keep)`` where ``scale``
     is the per-token loss weight ``w_e/N_e`` of the rollout's env. Returns
@@ -760,6 +832,14 @@ def _microbatch_grad(model, ref_model, batch, device, *, atomic):
     else:
         loss.backward()
 
+    _record_kl_stats(
+        kl_stats,
+        ppo_tok=ppo_tok,
+        kl_tok=kl_tok,
+        kl_log=kl_log,
+        scale_cat=scale_cat,
+    )
+
     sum_ppo = sum_kl = 0.0
     off = 0
     with torch.no_grad():
@@ -770,14 +850,20 @@ def _microbatch_grad(model, ref_model, batch, device, *, atomic):
     return sum_ppo, sum_kl, B
 
 
-def _process_microbatch(model, ref_model, batch, device, *, atomic):
+def _process_microbatch(
+    model, ref_model, batch, device, *, atomic, kl_stats=None,
+):
     """One micro-batch; when atomic, on OOM halve and retry down to a single
     sequence (which, if it still OOMs, is a genuine unrecoverable OOM)."""
     if not atomic:
-        return _microbatch_grad(model, ref_model, batch, device, atomic=False)
+        return _microbatch_grad(
+            model, ref_model, batch, device, atomic=False, kl_stats=kl_stats,
+        )
     oom = False
     try:
-        return _microbatch_grad(model, ref_model, batch, device, atomic=True)
+        return _microbatch_grad(
+            model, ref_model, batch, device, atomic=True, kl_stats=kl_stats,
+        )
     except torch.cuda.OutOfMemoryError:
         if len(batch) == 1:
             raise
@@ -788,8 +874,14 @@ def _process_microbatch(model, ref_model, batch, device, *, atomic):
         gc.collect()
         torch.cuda.empty_cache()
         mid = len(batch) // 2
-        a = _process_microbatch(model, ref_model, batch[:mid], device, atomic=True)
-        b = _process_microbatch(model, ref_model, batch[mid:], device, atomic=True)
+        a = _process_microbatch(
+            model, ref_model, batch[:mid], device,
+            atomic=True, kl_stats=kl_stats,
+        )
+        b = _process_microbatch(
+            model, ref_model, batch[mid:], device,
+            atomic=True, kl_stats=kl_stats,
+        )
         return a[0] + b[0], a[1] + b[1], a[2] + b[2]
 
 
@@ -823,7 +915,9 @@ def _build_microbatch_items(plan):
     return items
 
 
-def _accumulate_grouped_grads(model, ref_model, plan, device, *, budget, atomic):
+def _accumulate_grouped_grads(
+    model, ref_model, plan, device, *, budget, atomic, kl_stats=None,
+):
     """Pack the plan's rollouts into token-budget micro-batches and accumulate
     gradients. Returns ``(total_ppo, total_kl, n_processed)``."""
     items = _build_microbatch_items(plan)
@@ -834,7 +928,8 @@ def _accumulate_grouped_grads(model, ref_model, plan, device, *, budget, atomic)
     n_processed = 0
     for idxs in _pack_by_token_budget(lengths, budget):
         sp, sk, n = _process_microbatch(
-            model, ref_model, [items[i] for i in idxs], device, atomic=atomic,
+            model, ref_model, [items[i] for i in idxs], device,
+            atomic=atomic, kl_stats=kl_stats,
         )
         total_ppo += sp
         total_kl += sk
@@ -860,10 +955,9 @@ def train_step(
     batch is a list of group objects (ValidSubmission). Pass ``[batch]``
     for the legacy mono-batch case.
 
-    *ref_model* is the frozen reference policy for the KL penalty. The
-    caller is responsible for keeping it up to date (in production:
-    ``ValidationService.verify_model``, refreshed at every successful
-    publish).
+    *ref_model* is the frozen reference policy for the KL penalty. The caller
+    owns its lifecycle: production uses either the rolling published
+    ``verify_model`` or an explicitly pinned fixed checkpoint.
 
     *window_index* is used as the wandb step when telemetry is enabled.
     Safe to omit in tests.
@@ -902,18 +996,22 @@ def train_step(
     # path accumulates straight into .grad; if a micro-batch OOMs, discard the
     # partial grads and retry the whole pass with the atomic split-retry path at
     # a halved budget (atomic = an OOM mid-backward commits no gradient).
+    kl_stats = _new_kl_stats()
     try:
         total_ppo, total_kl, n_processed = _accumulate_grouped_grads(
             model, ref_model, plan, device,
             budget=MICROBATCH_MAX_PADDED_TOKENS, atomic=False,
+            kl_stats=kl_stats,
         )
     except torch.cuda.OutOfMemoryError:
         logger.warning("train_step: OOM in micro-batch — retrying atomic at halved budget")
         _optimizer.zero_grad()
         torch.cuda.empty_cache()
+        kl_stats = _new_kl_stats()
         total_ppo, total_kl, n_processed = _accumulate_grouped_grads(
             model, ref_model, plan, device,
             budget=max(1, MICROBATCH_MAX_PADDED_TOKENS // 2), atomic=True,
+            kl_stats=kl_stats,
         )
 
     if n_processed == 0:
@@ -929,6 +1027,12 @@ def train_step(
             "train_step: non-finite grad_norm=%s → skipping optimizer step",
             float(grad_norm),
         )
+        failure_metrics = _kl_telemetry_metrics(kl_stats)
+        failure_metrics.update({
+            "train/grad_norm": float(grad_norm),
+            "train/step_skipped_nonfinite": 1.0,
+        })
+        telemetry.log_training_step(failure_metrics, step=window_index)
         _optimizer.zero_grad(set_to_none=True)
         return model
     _optimizer.step()
@@ -953,6 +1057,9 @@ def train_step(
         "train/ppo_loss": total_ppo / n_processed,
         "train/kl": total_kl / n_processed,
         "train/grad_norm": float(grad_norm),
+        "train/grad_clip_ratio": float(grad_norm) / GRAD_CLIP_NORM,
+        "train/grad_was_clipped": float(grad_norm > GRAD_CLIP_NORM),
+        "train/step_skipped_nonfinite": 0.0,
         "train/rollouts_processed": n_processed,
         "train/rollouts_total": n_total_rollouts,
         "train/valid_rollout_ratio": n_processed / n_total_rollouts,
@@ -964,6 +1071,7 @@ def train_step(
         "batch/n_degenerate_groups": n_skipped,
         "batch/degenerate_ratio": n_skipped / n_groups,
     }
+    metrics.update(_kl_telemetry_metrics(kl_stats))
     metrics.update(_bft_training_metrics(plan))
     telemetry.log_training_step(metrics, step=window_index)
 
