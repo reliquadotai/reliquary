@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from scripts.replay_training_recovery import (
+    parse_legacy_targets,
     reconstruct_balanced_batch,
     strip_synthetic_claim_metrics,
 )
@@ -82,6 +83,49 @@ def test_reconstruct_balanced_batch_rejects_missing_source_window():
 
     with pytest.raises(ValueError, match="missing source archive"):
         reconstruct_balanced_batch([second])
+
+
+def test_reconstruct_legacy_full_window_requires_exact_explicit_contract():
+    revision = "b" * 40
+    archive = {
+        "window_start": 20,
+        "batch": [
+            {"env_name": "math", "prompt_idx": 1},
+            {"env_name": "math", "prompt_idx": 2},
+            {"env_name": "code", "prompt_idx": 3},
+        ],
+    }
+
+    order, batches, metadata = reconstruct_balanced_batch(
+        [archive],
+        legacy_checkpoint_revision=revision,
+        legacy_targets={"math": 2, "code": 1},
+    )
+
+    assert order == ["math", "code"]
+    assert [len(batch) for batch in batches] == [2, 1]
+    assert metadata["checkpoint_revision"] == revision
+    assert metadata["legacy_full_window"] is True
+
+    with pytest.raises(ValueError, match="immutable checkpoint"):
+        reconstruct_balanced_batch(
+            [archive], legacy_targets={"math": 2, "code": 1}
+        )
+    with pytest.raises(ValueError, match="counts do not match"):
+        reconstruct_balanced_batch(
+            [archive],
+            legacy_checkpoint_revision=revision,
+            legacy_targets={"math": 1, "code": 1},
+        )
+
+
+def test_parse_legacy_targets_is_explicit_and_unique():
+    assert parse_legacy_targets(["math=8", "code=8"]) == {
+        "math": 8,
+        "code": 8,
+    }
+    with pytest.raises(ValueError, match="unique"):
+        parse_legacy_targets(["math=8", "math=8"])
 
 
 def test_strip_synthetic_claim_metrics_keeps_policy_health_metrics():

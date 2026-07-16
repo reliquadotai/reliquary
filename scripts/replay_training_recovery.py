@@ -16,12 +16,14 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import time
 from types import SimpleNamespace
 from typing import Any
 
 
 _SYNTHETIC_CLAIM_METRIC_PREFIX = "train/pi_old_claim_"
+_IMMUTABLE_REVISION = re.compile(r"^[0-9a-f]{40}$")
 
 
 def _read_archive(path: Path) -> dict[str, Any]:
@@ -34,9 +36,61 @@ def _read_archive(path: Path) -> dict[str, Any]:
 
 def reconstruct_balanced_batch(
     archives: list[dict[str, Any]],
+    *,
+    legacy_checkpoint_revision: str | None = None,
+    legacy_targets: dict[str, int] | None = None,
 ) -> tuple[list[str], list[list[dict[str, Any]]], dict[str, Any]]:
     """Rebuild the accumulator using each archive's accepted `added` counts."""
     ordered = sorted(archives, key=lambda row: int(row["window_start"]))
+    legacy_rows = [
+        archive
+        for archive in ordered
+        if not (archive.get("training_accumulator") or {})
+    ]
+    if legacy_rows:
+        if len(legacy_rows) != len(ordered) or len(ordered) != 1:
+            raise ValueError(
+                "legacy full-window replay requires exactly one legacy archive "
+                "per balanced batch"
+            )
+        if (
+            legacy_checkpoint_revision is None
+            or _IMMUTABLE_REVISION.fullmatch(legacy_checkpoint_revision) is None
+        ):
+            raise ValueError(
+                "legacy full-window replay requires a full immutable checkpoint "
+                "revision"
+            )
+        if not legacy_targets or any(count <= 0 for count in legacy_targets.values()):
+            raise ValueError(
+                "legacy full-window replay requires positive explicit env targets"
+            )
+        archive = ordered[0]
+        grouped: dict[str, list[dict[str, Any]]] = {
+            name: [] for name in legacy_targets
+        }
+        for group in archive.get("batch") or []:
+            env_name = str(group.get("env_name") or "")
+            if env_name not in grouped:
+                raise ValueError(
+                    f"legacy full window contains unexpected environment {env_name!r}"
+                )
+            grouped[env_name].append(group)
+        counts = {name: len(groups) for name, groups in grouped.items()}
+        if counts != legacy_targets:
+            raise ValueError(
+                "legacy full-window counts do not match explicit targets: "
+                f"counts={counts} targets={legacy_targets}"
+            )
+        env_order = list(legacy_targets)
+        return env_order, [grouped[name] for name in env_order], {
+            "checkpoint_revision": legacy_checkpoint_revision,
+            "targets": dict(legacy_targets),
+            "counts": counts,
+            "source_windows": [int(archive["window_start"])],
+            "legacy_full_window": True,
+        }
+
     retained: dict[str, list[dict[str, Any]]] = {}
     targets: dict[str, int] = {}
     checkpoint_revision: str | None = None
@@ -109,7 +163,31 @@ def reconstruct_balanced_batch(
         "targets": targets,
         "counts": {name: len(retained[name]) for name in env_order},
         "source_windows": source_windows,
+        "legacy_full_window": False,
     }
+
+
+def parse_legacy_targets(values: list[str] | None) -> dict[str, int] | None:
+    if not values:
+        return None
+    targets: dict[str, int] = {}
+    for value in values:
+        name, separator, raw_count = value.partition("=")
+        name = name.strip()
+        if not separator or not name or name in targets:
+            raise ValueError(
+                "--legacy-target must be unique NAME=COUNT entries"
+            )
+        try:
+            count = int(raw_count)
+        except ValueError as exc:
+            raise ValueError(
+                "--legacy-target count must be an integer"
+            ) from exc
+        if count <= 0:
+            raise ValueError("--legacy-target count must be positive")
+        targets[name] = count
+    return targets
 
 
 def materialize_training_batch(
@@ -263,6 +341,18 @@ def _parser() -> argparse.ArgumentParser:
         default="ReliquaryForge/qwen3.5-2b-reliquary-v2",
     )
     parser.add_argument("--behavior-revision", required=True)
+    parser.add_argument(
+        "--legacy-checkpoint-revision",
+        help=(
+            "Immutable behavior SHA for archives created before accumulator "
+            "metadata existed. Requires one or more --legacy-target entries."
+        ),
+    )
+    parser.add_argument(
+        "--legacy-target",
+        action="append",
+        help="Exact NAME=COUNT target for a legacy full-window archive.",
+    )
     parser.add_argument("--base-repo", default="Qwen/Qwen3.5-2B")
     parser.add_argument(
         "--base-revision",
@@ -315,12 +405,19 @@ def main() -> int:
         archive_sets = [[path.resolve() for path in args.archive]]
     else:
         raise ValueError("at least one archive batch is required")
+    legacy_targets = parse_legacy_targets(args.legacy_target)
+    if bool(args.legacy_checkpoint_revision) != bool(legacy_targets):
+        raise ValueError(
+            "--legacy-checkpoint-revision and --legacy-target must be used together"
+        )
 
     reconstructed = []
     for archive_paths in archive_sets:
         archives = [_read_archive(path) for path in archive_paths]
         env_order, archived_batches, accumulator = reconstruct_balanced_batch(
-            archives
+            archives,
+            legacy_checkpoint_revision=args.legacy_checkpoint_revision,
+            legacy_targets=legacy_targets,
         )
         if accumulator["checkpoint_revision"] != args.behavior_revision:
             raise ValueError(
