@@ -6,12 +6,21 @@ from reliquary.validator.training import (
     _plan_from_batches,
     _shape_advantages,
     _shaping_training_metrics,
+    _training_environment_metrics,
 )
 
 
-def _roll(reward, completion_length, *, forced=False, truncated=False):
+def _roll(
+    reward,
+    completion_length,
+    *,
+    env_name="openmathinstruct",
+    forced=False,
+    truncated=False,
+):
     return SimpleNamespace(
         reward=reward,
+        env_name=env_name,
         commit={"rollout": {
             "prompt_length": 1,
             "completion_length": completion_length,
@@ -94,3 +103,32 @@ def test_shaping_metrics_separate_overlong_underthinking_and_forced():
     assert metrics["train/shaping_underthinking_ratio"] == 0.25
     assert metrics["train/shaping_forced_exempt_ratio"] == 0.25
     assert metrics["train/shaping_changed_ratio"] == 0.5
+
+
+def test_training_environment_metrics_separate_domains_and_plan_signal():
+    math_group = SimpleNamespace(
+        rollouts=[_roll(1.0, 4), _roll(0.0, 4)],
+        prompt_idx=0,
+    )
+    code_group = SimpleNamespace(
+        rollouts=[
+            _roll(0.75, 6, env_name="opencodeinstruct"),
+            _roll(0.75, 6, env_name="opencodeinstruct"),
+        ],
+        prompt_idx=1,
+    )
+    batches = [[math_group], [code_group]]
+    plan, n_skipped = _plan_from_batches(batches)
+
+    metrics = _training_environment_metrics(batches, plan)
+
+    assert n_skipped == 1
+    assert metrics["train/env/openmathinstruct/reward_mean"] == 0.5
+    assert metrics["train/env/openmathinstruct/reward_std"] == 0.5
+    assert metrics["train/env/openmathinstruct/reward_nonzero_ratio"] == 0.5
+    assert metrics["train/env/openmathinstruct/plan_groups"] == 1.0
+    assert metrics["train/env/openmathinstruct/plan_rollouts"] == 2.0
+    assert metrics["train/env/opencodeinstruct/reward_mean"] == 0.75
+    assert metrics["train/env/opencodeinstruct/raw_completion_tokens"] == 12.0
+    assert metrics["train/env/opencodeinstruct/plan_groups"] == 0.0
+    assert metrics["train/env/opencodeinstruct/plan_rollouts"] == 0.0

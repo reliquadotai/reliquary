@@ -235,6 +235,115 @@ def _shaping_training_metrics(plan) -> dict[str, float]:
     }
 
 
+def _training_environment_metrics(batches, plan) -> dict[str, float]:
+    """Expose reward and gradient-signal balance for each trusted env."""
+    buckets: dict[str, dict[str, float]] = {}
+
+    def env_key(rollout) -> str:
+        raw_value = getattr(rollout, "env_name", "")
+        raw = (
+            raw_value.lower()
+            if isinstance(raw_value, str) and raw_value
+            else "unknown"
+        )
+        cleaned = "".join(
+            char if char.isalnum() or char == "_" else "_" for char in raw
+        ).strip("_")
+        return cleaned or "unknown"
+
+    def bucket_for(rollout) -> dict[str, float]:
+        return buckets.setdefault(env_key(rollout), {
+            "groups": 0.0,
+            "rollouts": 0.0,
+            "reward_sum": 0.0,
+            "reward_sq_sum": 0.0,
+            "reward_min": math.inf,
+            "reward_max": -math.inf,
+            "reward_nonzero": 0.0,
+            "raw_completion_tokens": 0.0,
+            "trainable_completion_tokens": 0.0,
+            "plan_groups": 0.0,
+            "plan_rollouts": 0.0,
+            "abs_adv_weighted_tokens": 0.0,
+        })
+
+    for batch in batches:
+        for group in batch:
+            if not group.rollouts:
+                continue
+            group_bucket = bucket_for(group.rollouts[0])
+            group_bucket["groups"] += 1.0
+            for rollout in group.rollouts:
+                current = bucket_for(rollout)
+                reward = float(rollout.reward)
+                old = _completion_token_logprobs(rollout)
+                meta = (rollout.commit or {}).get("rollout", {}) or {}
+                prompt_length = int(meta.get("prompt_length", 0) or 0)
+                trainable_tokens = _trainable_completion_count(
+                    rollout, prompt_length, len(old)
+                )
+                current["rollouts"] += 1.0
+                current["reward_sum"] += reward
+                current["reward_sq_sum"] += reward * reward
+                current["reward_min"] = min(current["reward_min"], reward)
+                current["reward_max"] = max(current["reward_max"], reward)
+                current["reward_nonzero"] += float(reward > 0.0)
+                current["raw_completion_tokens"] += len(old)
+                current["trainable_completion_tokens"] += trainable_tokens
+
+    for group, advantages, scale in plan:
+        if not group.rollouts:
+            continue
+        group_bucket = bucket_for(group.rollouts[0])
+        group_bucket["plan_groups"] += 1.0
+        for rollout, advantage in zip(group.rollouts, advantages):
+            current = bucket_for(rollout)
+            old = _completion_token_logprobs(rollout)
+            meta = (rollout.commit or {}).get("rollout", {}) or {}
+            prompt_length = int(meta.get("prompt_length", 0) or 0)
+            trainable_tokens = _trainable_completion_count(
+                rollout, prompt_length, len(old)
+            )
+            current["plan_rollouts"] += 1.0
+            current["abs_adv_weighted_tokens"] += (
+                abs(float(advantage)) * float(scale) * trainable_tokens
+            )
+
+    metrics: dict[str, float] = {}
+    for environment, values in sorted(buckets.items()):
+        prefix = f"train/env/{environment}"
+        rollouts = values["rollouts"]
+        reward_mean = values["reward_sum"] / max(1.0, rollouts)
+        reward_variance = max(
+            0.0,
+            values["reward_sq_sum"] / max(1.0, rollouts)
+            - reward_mean * reward_mean,
+        )
+        metrics.update({
+            f"{prefix}/groups": values["groups"],
+            f"{prefix}/rollouts": rollouts,
+            f"{prefix}/reward_mean": reward_mean,
+            f"{prefix}/reward_std": reward_variance ** 0.5,
+            f"{prefix}/reward_min": values["reward_min"],
+            f"{prefix}/reward_max": values["reward_max"],
+            f"{prefix}/reward_nonzero_ratio": (
+                values["reward_nonzero"] / max(1.0, rollouts)
+            ),
+            f"{prefix}/raw_completion_tokens": values[
+                "raw_completion_tokens"
+            ],
+            f"{prefix}/trainable_completion_tokens": values[
+                "trainable_completion_tokens"
+            ],
+            f"{prefix}/plan_groups": values["plan_groups"],
+            f"{prefix}/plan_rollouts": values["plan_rollouts"],
+            f"{prefix}/abs_adv_weighted_tokens": values[
+                "abs_adv_weighted_tokens"
+            ],
+        })
+    return metrics
+
+
 def _batch_loss_weights(
     token_counts: list[float],
     raw_weights: Optional[list[float]] = None,
@@ -1236,6 +1345,7 @@ def train_step(
         logger.info("train_step: no trainable groups")
         return model
     shaping_metrics = _shaping_training_metrics(plan)
+    environment_metrics = _training_environment_metrics(batches, plan)
 
     # Pass 2: micro-batched forward/backward (token-budget packing). The fast
     # path accumulates straight into .grad; if a micro-batch OOMs, discard the
@@ -1297,6 +1407,7 @@ def train_step(
         })
         failure_metrics.update(_bft_training_metrics(plan))
         failure_metrics.update(shaping_metrics)
+        failure_metrics.update(environment_metrics)
         telemetry.log_training_step(failure_metrics, step=window_index)
         _optimizer.zero_grad(set_to_none=True)
         raise TrainingStepSkipped(reason, grad_norm_value)
@@ -1346,6 +1457,7 @@ def train_step(
     metrics.update(_kl_telemetry_metrics(kl_stats))
     metrics.update(_bft_training_metrics(plan))
     metrics.update(shaping_metrics)
+    metrics.update(environment_metrics)
     telemetry.log_training_step(metrics, step=window_index)
 
     return model
