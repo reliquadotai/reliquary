@@ -1,7 +1,12 @@
 from types import SimpleNamespace
 
 from reliquary import constants as C
-from reliquary.validator.training import _plan_from_batches, _shape_advantages
+from reliquary.validator.training import (
+    _compute_advantages,
+    _plan_from_batches,
+    _shape_advantages,
+    _shaping_training_metrics,
+)
 
 
 def _roll(reward, completion_length, *, forced=False, truncated=False):
@@ -67,3 +72,25 @@ def test_plan_keeps_all_wrong_group_when_shape_adds_signal():
     _group, advantages, _scale = plan[0]
     assert advantages[0] == -C.SHAPE_PENALTY
     assert advantages[1] == 0.0
+
+
+def test_shaping_metrics_separate_overlong_underthinking_and_forced():
+    early = int(C.SHAPE_LEN_FRAC * C.BFT_THINKING_BUDGET) - 1
+    group = SimpleNamespace(
+        rollouts=[
+            _roll(0.0, C.BFT_THINKING_BUDGET, truncated=True),
+            _roll(0.0, early),
+            _roll(0.0, early, forced=True),
+            _roll(1.0, C.BFT_THINKING_BUDGET),
+        ],
+        prompt_idx=0,
+    )
+    raw = _compute_advantages([rollout.reward for rollout in group.rollouts])
+    shaped = _shape_advantages(group.rollouts, raw)
+
+    metrics = _shaping_training_metrics([(group, shaped, 1.0)])
+
+    assert metrics["train/shaping_overlong_ratio"] == 0.25
+    assert metrics["train/shaping_underthinking_ratio"] == 0.25
+    assert metrics["train/shaping_forced_exempt_ratio"] == 0.25
+    assert metrics["train/shaping_changed_ratio"] == 0.5

@@ -102,9 +102,19 @@ BFT_FORCE_TEMPLATE = "</think>\n\nFinal Answer: \\boxed{"
 # Under-thinking side: a non-forced rollout that finished early
 # (completion_length < SHAPE_LEN_FRAC · BFT_THINKING_BUDGET) and is wrong gets its
 # advantage set to −SHAPE_PENALTY. Overlong side: a cap-truncated rollout gets
-# the same penalty. SHAPE_PENALTY = 0 disables shaping. TODO: sweep both values.
-SHAPE_PENALTY = 0.5
-SHAPE_LEN_FRAC = 0.5
+# the same penalty. These are validator-only objective controls, not generation
+# or wire constants, so operators can calibrate them without changing miners.
+# SHAPE_PENALTY = 0 disables shaping.
+SHAPE_PENALTY = float(_os.environ.get("RELIQUARY_SHAPE_PENALTY", "0.5"))
+if not _math.isfinite(SHAPE_PENALTY) or not 0.0 <= SHAPE_PENALTY <= 10.0:
+    raise ValueError(
+        "RELIQUARY_SHAPE_PENALTY must be finite and within [0, 10]"
+    )
+SHAPE_LEN_FRAC = float(_os.environ.get("RELIQUARY_SHAPE_LEN_FRAC", "0.5"))
+if not _math.isfinite(SHAPE_LEN_FRAC) or not 0.0 < SHAPE_LEN_FRAC <= 1.0:
+    raise ValueError(
+        "RELIQUARY_SHAPE_LEN_FRAC must be finite and within (0, 1]"
+    )
 
 # Cap/non-EOS truncation budget per submission. A single missing-EOS rollout
 # can be an honest local max-token accident; repeated missing-EOS rollouts in

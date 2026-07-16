@@ -55,6 +55,8 @@ from reliquary.constants import (
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
     REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS,
     RECOMPUTE_PI_OLD_FROM_VERIFY,
+    SHAPE_LEN_FRAC,
+    SHAPE_PENALTY,
     SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS,
     SPARSE_VALID_IDLE_SEAL_SECONDS,
     SPARSE_VALID_MAX_WINDOW_SECONDS,
@@ -506,6 +508,8 @@ class ValidationService:
             ),
             "learning_rate": LEARNING_RATE,
             "grad_norm_skip_threshold": GRAD_NORM_SKIP_THRESHOLD,
+            "shape_penalty": SHAPE_PENALTY,
+            "shape_len_frac": SHAPE_LEN_FRAC,
         }
         if KL_BASE_MODEL:
             if model is None:
@@ -583,6 +587,8 @@ class ValidationService:
                 ),
                 "learning_rate": LEARNING_RATE,
                 "grad_norm_skip_threshold": GRAD_NORM_SKIP_THRESHOLD,
+                "shape_penalty": SHAPE_PENALTY,
+                "shape_len_frac": SHAPE_LEN_FRAC,
             }
             logger.info(
                 "GRPO KL reference=fixed repo=%s revision=%s beta=%.6g "
@@ -607,6 +613,8 @@ class ValidationService:
             "pi_old_source": self.kl_reference_state["behavior_logprobs"],
             "learning_rate": LEARNING_RATE,
             "grad_norm_skip_threshold": GRAD_NORM_SKIP_THRESHOLD,
+            "shape_penalty": SHAPE_PENALTY,
+            "shape_len_frac": SHAPE_LEN_FRAC,
         })
 
     @property

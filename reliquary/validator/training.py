@@ -178,6 +178,63 @@ def _shape_advantages(rollouts, advantages):
     return shaped
 
 
+def _shaping_training_metrics(plan) -> dict[str, float]:
+    """Describe how often length shaping changes the surviving train plan."""
+    from reliquary.constants import (
+        BFT_THINKING_BUDGET,
+        SHAPE_LEN_FRAC,
+        SHAPE_PENALTY,
+    )
+
+    total = 0
+    overlong = 0
+    underthinking = 0
+    forced_exempt = 0
+    changed = 0
+    signed_delta = 0.0
+    absolute_delta = 0.0
+    early_cap = SHAPE_LEN_FRAC * BFT_THINKING_BUDGET
+
+    for group, shaped_advantages, _scale in plan:
+        raw_advantages = _compute_advantages([
+            float(rollout.reward) for rollout in group.rollouts
+        ])
+        for rollout, raw, shaped in zip(
+            group.rollouts, raw_advantages, shaped_advantages
+        ):
+            total += 1
+            meta = (getattr(rollout, "commit", None) or {}).get(
+                "rollout", {}
+            ) or {}
+            if meta.get("truncated"):
+                overlong += 1
+            elif meta.get("forced"):
+                forced_exempt += 1
+            elif (
+                int(meta.get("completion_length", 0)) < early_cap
+                and float(getattr(rollout, "reward", 0.0)) <= 0.5
+            ):
+                underthinking += 1
+            delta = float(shaped) - float(raw)
+            if abs(delta) > 1e-12:
+                changed += 1
+            signed_delta += delta
+            absolute_delta += abs(delta)
+
+    denominator = max(1, total)
+    return {
+        "train/shaping_penalty": SHAPE_PENALTY,
+        "train/shaping_len_frac": SHAPE_LEN_FRAC,
+        "train/shaping_rollout_count": float(total),
+        "train/shaping_overlong_ratio": overlong / denominator,
+        "train/shaping_underthinking_ratio": underthinking / denominator,
+        "train/shaping_forced_exempt_ratio": forced_exempt / denominator,
+        "train/shaping_changed_ratio": changed / denominator,
+        "train/shaping_advantage_delta_mean": signed_delta / denominator,
+        "train/shaping_advantage_abs_delta_mean": absolute_delta / denominator,
+    }
+
+
 def _batch_loss_weights(
     token_counts: list[float],
     raw_weights: Optional[list[float]] = None,
@@ -1178,6 +1235,7 @@ def train_step(
     if not plan:
         logger.info("train_step: no trainable groups")
         return model
+    shaping_metrics = _shaping_training_metrics(plan)
 
     # Pass 2: micro-batched forward/backward (token-budget packing). The fast
     # path accumulates straight into .grad; if a micro-batch OOMs, discard the
@@ -1238,6 +1296,7 @@ def train_step(
             "train/valid_rollout_ratio": n_processed / n_total_rollouts,
         })
         failure_metrics.update(_bft_training_metrics(plan))
+        failure_metrics.update(shaping_metrics)
         telemetry.log_training_step(failure_metrics, step=window_index)
         _optimizer.zero_grad(set_to_none=True)
         raise TrainingStepSkipped(reason, grad_norm_value)
@@ -1286,6 +1345,7 @@ def train_step(
     }
     metrics.update(_kl_telemetry_metrics(kl_stats))
     metrics.update(_bft_training_metrics(plan))
+    metrics.update(shaping_metrics)
     telemetry.log_training_step(metrics, step=window_index)
 
     return model

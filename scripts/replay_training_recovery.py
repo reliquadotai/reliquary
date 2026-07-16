@@ -270,6 +270,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--learning-rate", type=float, required=True)
     parser.add_argument("--kl-beta", type=float, required=True)
+    parser.add_argument("--shape-penalty", type=float, default=0.5)
+    parser.add_argument("--shape-len-frac", type=float, default=0.5)
     parser.add_argument("--grad-threshold", type=float, default=100.0)
     parser.add_argument(
         "--attention-implementation", default="flash_attention_2"
@@ -284,6 +286,8 @@ def main() -> int:
     args = _parser().parse_args()
     os.environ["RELIQUARY_LEARNING_RATE"] = str(args.learning_rate)
     os.environ["RELIQUARY_KL_BETA"] = str(args.kl_beta)
+    os.environ["RELIQUARY_SHAPE_PENALTY"] = str(args.shape_penalty)
+    os.environ["RELIQUARY_SHAPE_LEN_FRAC"] = str(args.shape_len_frac)
     os.environ["RELIQUARY_GRAD_NORM_SKIP_THRESHOLD"] = str(
         args.grad_threshold
     )
@@ -439,6 +443,8 @@ def main() -> int:
         "base_revision": args.base_revision,
         "learning_rate": args.learning_rate,
         "kl_beta": args.kl_beta,
+        "shape_penalty": args.shape_penalty,
+        "shape_len_frac": args.shape_len_frac,
         "grad_threshold": args.grad_threshold,
         "attention_implementation": args.attention_implementation,
         "requested_steps": len(replay_batches),
