@@ -1113,6 +1113,7 @@ def train_step(
         logger.info("train_step: model not initializable (non-torch?), skipping")
         return model
     assert _optimizer is not None and _scheduler is not None
+    lr_applied = float(_optimizer.param_groups[0]["lr"])
 
     model.train()
     device = next(model.parameters()).device
@@ -1182,6 +1183,8 @@ def train_step(
         failure_metrics = _kl_telemetry_metrics(kl_stats)
         failure_metrics.update({
             "train/grad_norm": grad_norm_value,
+            "train/lr_applied": lr_applied,
+            "train/lr_next": lr_applied,
             "train/step_skipped_nonfinite": float(nonfinite_gradient),
             "train/step_skipped_grad_spike": float(gradient_spike),
             "train/pi_old_recomputed": float(behavior_model is not None),
@@ -1191,11 +1194,12 @@ def train_step(
         raise TrainingStepSkipped(reason, grad_norm_value)
     _optimizer.step()
     _scheduler.step()
-    lr = _scheduler.get_last_lr()[0]
+    lr_next = float(_scheduler.get_last_lr()[0])
 
     logger.info(
-        "train_step: lr=%.2e ppo=%.4f kl=%.4f grad_norm=%.3f rollouts=%d/%d",
-        lr, total_ppo / n_processed, total_kl / n_processed,
+        "train_step: lr_applied=%.2e lr_next=%.2e ppo=%.4f kl=%.4f "
+        "grad_norm=%.3f rollouts=%d/%d",
+        lr_applied, lr_next, total_ppo / n_processed, total_kl / n_processed,
         float(grad_norm), n_processed, n_total_rollouts,
     )
 
@@ -1207,7 +1211,11 @@ def train_step(
     reward_std = reward_var ** 0.5
     n_groups = sum(len(batch) for batch in batches)
     metrics = {
-        "train/lr": lr,
+        # Keep ``train/lr`` as the historical post-scheduler value while
+        # exposing the rate that actually produced this update explicitly.
+        "train/lr": lr_next,
+        "train/lr_applied": lr_applied,
+        "train/lr_next": lr_next,
         "train/ppo_loss": total_ppo / n_processed,
         "train/kl": total_kl / n_processed,
         "train/grad_norm": float(grad_norm),

@@ -106,7 +106,8 @@ def test_train_step_forwards_metrics_to_telemetry(monkeypatch):
     assert captured["step"] == 7
     m = captured["metrics"]
     for key in (
-        "train/lr", "train/ppo_loss", "train/kl", "train/grad_norm",
+        "train/lr", "train/lr_applied", "train/lr_next",
+        "train/ppo_loss", "train/kl", "train/grad_norm",
         "train/kl_beta", "train/kl_penalty_objective",
         "train/kl_to_ppo_abs_ratio", "train/kl_token_max",
         "train/kl_token_nonfinite_ratio", "train/grad_clip_ratio",
@@ -123,6 +124,8 @@ def test_train_step_forwards_metrics_to_telemetry(monkeypatch):
         "batch/n_groups", "batch/n_degenerate_groups", "batch/degenerate_ratio",
     ):
         assert key in m, f"missing metric {key}"
+    assert m["train/lr"] == m["train/lr_next"]
+    assert m["train/lr_applied"] < m["train/lr_next"]
     assert m["batch/n_groups"] == 1
     assert m["batch/n_degenerate_groups"] == 0
     assert m["rewards/min"] == 0.0
