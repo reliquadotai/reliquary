@@ -23,6 +23,7 @@ def _screen(label: str) -> dict:
                 "forced": task_index == 1,
                 "rambling_proxy": False,
                 "completion_length": 100 + task_index,
+                "completion_sha256": f"hash-{task_index}-{sample_index}",
             })
     return {
         "checkpoint_label": label,
@@ -100,6 +101,7 @@ def test_compare_screens_clusters_by_task_and_is_deterministic():
         row["reward"] = 1.0
         row["forced"] = False
         row["completion_length"] -= 10
+    candidate["samples"][0]["completion_sha256"] = "changed"
 
     first = compare_screens(baseline, candidate, iterations=1_000, seed=7)
     second = compare_screens(baseline, candidate, iterations=1_000, seed=7)
@@ -112,4 +114,16 @@ def test_compare_screens_clusters_by_task_and_is_deterministic():
     assert first["metrics"]["mean_completion_length"]["delta"] == -10.0
     assert first["metrics"]["mean_completion_length"]["direction"] == "context_only"
     assert first["metrics"]["mean_completion_length"]["probability_favorable"] is None
+    assert first["paired_sample_transitions"] == {
+        "sample_count": 4,
+        "reward_improved": 2,
+        "reward_regressed": 0,
+        "reward_unchanged": 2,
+        "completion_hash_available": 4,
+        "completion_hash_matches": 3,
+        "completion_hash_match_rate": 0.75,
+    }
     assert "candidate vs base" in render_markdown(first)
+    assert "exact completion hash matches: 3/4 (0.750)" in render_markdown(
+        first
+    )

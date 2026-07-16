@@ -161,6 +161,47 @@ def task_metrics(screen: dict[str, Any]) -> dict[str, dict[str, float]]:
     return result
 
 
+def paired_sample_transitions(
+    baseline: dict[str, Any], candidate: dict[str, Any]
+) -> dict[str, Any]:
+    """Describe exact trajectory identity and discrete outcome flips."""
+    baseline_rows = {
+        _sample_key(row): row for row in baseline["samples"]
+    }
+    candidate_rows = {
+        _sample_key(row): row for row in candidate["samples"]
+    }
+    keys = sorted(baseline_rows)
+    reward_improved = reward_regressed = reward_unchanged = 0
+    hash_available = hash_matches = 0
+    for key in keys:
+        before = baseline_rows[key]
+        after = candidate_rows[key]
+        reward_delta = float(after["reward"]) - float(before["reward"])
+        if reward_delta > 0.0:
+            reward_improved += 1
+        elif reward_delta < 0.0:
+            reward_regressed += 1
+        else:
+            reward_unchanged += 1
+        before_hash = before.get("completion_sha256")
+        after_hash = after.get("completion_sha256")
+        if isinstance(before_hash, str) and isinstance(after_hash, str):
+            hash_available += 1
+            hash_matches += int(before_hash == after_hash)
+    return {
+        "sample_count": len(keys),
+        "reward_improved": reward_improved,
+        "reward_regressed": reward_regressed,
+        "reward_unchanged": reward_unchanged,
+        "completion_hash_available": hash_available,
+        "completion_hash_matches": hash_matches,
+        "completion_hash_match_rate": (
+            hash_matches / hash_available if hash_available else None
+        ),
+    }
+
+
 def _quantile(values: list[float], q: float) -> float:
     ordered = sorted(values)
     position = (len(ordered) - 1) * q
@@ -239,16 +280,35 @@ def compare_screens(
         "task_clusters": len(task_ids),
         "bootstrap_iterations": iterations,
         "bootstrap_seed": seed,
+        "paired_sample_transitions": paired_sample_transitions(
+            baseline, candidate
+        ),
         "metrics": metrics,
     }
 
 
 def render_markdown(report: dict[str, Any]) -> str:
+    transitions = report["paired_sample_transitions"]
+    hash_rate = transitions["completion_hash_match_rate"]
+    hash_text = (
+        "n/a"
+        if hash_rate is None
+        else (
+            f"{transitions['completion_hash_matches']}/"
+            f"{transitions['completion_hash_available']} ({hash_rate:.3f})"
+        )
+    )
     lines = [
         f"## {report['candidate_label']} vs {report['baseline_label']}",
         "",
         f"Paired task clusters: {report['task_clusters']}; "
         f"bootstrap iterations: {report['bootstrap_iterations']}.",
+        "",
+        "Paired sample transitions: "
+        f"reward +{transitions['reward_improved']} / "
+        f"-{transitions['reward_regressed']} / "
+        f"={transitions['reward_unchanged']}; exact completion hash "
+        f"matches: {hash_text}.",
         "",
         "| Metric | Baseline | Candidate | Delta | 95% CI | Favorable |",
         "|---|---:|---:|---:|---:|---:|",
