@@ -218,6 +218,74 @@ async def test_one_window_lap_bumps_counters(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_training_health_gate_blocks_checkpoint_publish(monkeypatch):
+    """An intentionally rejected optimizer step is archived as untrained and
+    cannot advance the public checkpoint."""
+    monkeypatch.setattr("reliquary.validator.service.B_BATCH", 0)
+
+    import reliquary.validator.service as svc_mod
+    from reliquary.validator.training import TrainingStepSkipped
+
+    svc = _make_service()
+
+    def _reject_step(model, batch, *, ref_model, window_index=None):
+        raise TrainingStepSkipped("gradient_spike", 10_432.0)
+
+    monkeypatch.setattr(svc_mod, "train_step", _reject_step)
+
+    with _patch_open_grpo_window(svc):
+        svc._open_window()
+    svc._activate_window()
+    batcher = svc._active_batcher
+    batcher.seal_event.set()
+
+    await svc._train_and_publish()
+
+    svc._checkpoint_store.publish.assert_not_awaited()
+    assert svc._checkpoint_n == 0
+    assert batcher.training_accumulator["training_attempted"] is True
+    assert batcher.training_accumulator["trained"] is False
+    assert batcher.training_accumulator["reset_reason"] == (
+        "training_health_gate:gradient_spike"
+    )
+
+
+@pytest.mark.asyncio
+async def test_training_uses_distinct_behavior_and_fixed_reference(monkeypatch):
+    """Fixed KL must not replace the published behavior policy used for PPO."""
+    monkeypatch.setattr("reliquary.validator.service.B_BATCH", 0)
+    monkeypatch.setattr(
+        "reliquary.validator.service.RECOMPUTE_PI_OLD_FROM_VERIFY", True,
+    )
+
+    import reliquary.validator.service as svc_mod
+
+    svc = _make_service()
+    fixed_ref = MagicMock(name="fixed_kl_reference")
+    svc.base_ref_model = fixed_ref
+    captured = {}
+
+    def _capture_step(
+        model, batch, *, ref_model, behavior_model, window_index=None,
+    ):
+        captured["ref_model"] = ref_model
+        captured["behavior_model"] = behavior_model
+        return model
+
+    monkeypatch.setattr(svc_mod, "train_step", _capture_step)
+
+    with _patch_open_grpo_window(svc):
+        svc._open_window()
+    svc._activate_window()
+    svc._active_batcher.seal_event.set()
+
+    await svc._train_and_publish()
+
+    assert captured["ref_model"] is fixed_ref
+    assert captured["behavior_model"] is svc.verify_model
+
+
+@pytest.mark.asyncio
 async def test_open_window_passes_verify_model_to_batcher(monkeypatch):
     """The batcher must receive verify_model (not train_model) so
     verify_commitment_proofs runs against the published checkpoint."""

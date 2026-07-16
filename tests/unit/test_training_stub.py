@@ -111,6 +111,7 @@ def test_train_step_forwards_metrics_to_telemetry(monkeypatch):
         "train/kl_to_ppo_abs_ratio", "train/kl_token_max",
         "train/kl_token_nonfinite_ratio", "train/grad_clip_ratio",
         "train/grad_was_clipped", "train/step_skipped_nonfinite",
+        "train/step_skipped_grad_spike", "train/pi_old_recomputed",
         "train/rollouts_processed", "train/rollouts_total",
         "train/valid_rollout_ratio",
         "rewards/mean", "rewards/std", "rewards/min", "rewards/max",

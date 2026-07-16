@@ -81,6 +81,9 @@ def test_fixed_kl_reference_is_pinned_frozen_and_observable(
         "parameter_count": 20,
         "storage_bytes": 80,
         "beta_explicit": True,
+        "behavior_logprobs": "miner_claim",
+        "learning_rate": service_mod.LEARNING_RATE,
+        "grad_norm_skip_threshold": service_mod.GRAD_NORM_SKIP_THRESHOLD,
     }
     assert (
         svc.server._health_payload().training_kl_reference
