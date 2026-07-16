@@ -13,7 +13,12 @@ dependencies = [
     # tests/unit/test_tokens.py. Matches the live validator image.
     "transformers==5.9.0",
     "safetensors>=0.3.0",
-    "bittensor>=9.0.0,<10.3.0",
+    # NetUid is a SCALE newtype in the current Subtensor runtime. Keep the
+    # client and codec stack pinned together so runtime API calls encode it
+    # correctly and image rebuilds cannot silently change chain behavior.
+    "bittensor==10.5.0",
+    "async-substrate-interface==2.2.1",
+    "cyscale==0.5.0",
     "pydantic>=2.3,<3.0.0",
     "requests>=2.28.0",
     "httpx>=0.25.0",
