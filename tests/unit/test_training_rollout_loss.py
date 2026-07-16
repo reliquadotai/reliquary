@@ -338,6 +338,15 @@ def test_train_step_skips_optimizer_on_pathological_finite_grad(
         for r in [1, 1, 0, 0]
     ]
     group = _FakeGroup(rollouts=rollouts, prompt_idx=0)
+    captured = {}
+
+    from reliquary.validator import telemetry
+
+    monkeypatch.setattr(
+        telemetry,
+        "log_training_step",
+        lambda metrics, step: captured.update(metrics),
+    )
 
     monkeypatch.setattr(
         torch.nn.utils, "clip_grad_norm_",
@@ -349,6 +358,12 @@ def test_train_step_skips_optimizer_on_pathological_finite_grad(
         train_step(model, [[group]], ref_model=_make_ref(model))
     after = next(model.parameters()).detach().clone()
     assert torch.equal(before, after), "weights must not change on a grad spike"
+    assert captured["train/ppo_loss"] is not None
+    assert captured["train/kl"] is not None
+    assert captured["train/rollouts_processed"] == 4
+    assert captured["train/rollouts_total"] == 4
+    assert captured["train/valid_rollout_ratio"] == 1.0
+    assert "bft/forced_rollout_ratio" in captured
 
 
 def test_train_step_token_level_handles_unequal_lengths(tiny_model_and_tokenizer):

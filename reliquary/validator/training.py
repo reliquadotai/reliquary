@@ -1225,13 +1225,19 @@ def train_step(
         )
         failure_metrics = _kl_telemetry_metrics(kl_stats)
         failure_metrics.update({
+            "train/ppo_loss": total_ppo / n_processed,
+            "train/kl": total_kl / n_processed,
             "train/grad_norm": grad_norm_value,
             "train/lr_applied": lr_applied,
             "train/lr_next": lr_applied,
             "train/step_skipped_nonfinite": float(nonfinite_gradient),
             "train/step_skipped_grad_spike": float(gradient_spike),
             "train/pi_old_recomputed": float(behavior_model is not None),
+            "train/rollouts_processed": n_processed,
+            "train/rollouts_total": n_total_rollouts,
+            "train/valid_rollout_ratio": n_processed / n_total_rollouts,
         })
+        failure_metrics.update(_bft_training_metrics(plan))
         telemetry.log_training_step(failure_metrics, step=window_index)
         _optimizer.zero_grad(set_to_none=True)
         raise TrainingStepSkipped(reason, grad_norm_value)
