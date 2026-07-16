@@ -64,8 +64,8 @@ def _source_load_kwargs(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Upload RELIQUARY_CHECKPOINT/base model as the next HF "
-            "Reliquary checkpoint and print the resume env var."
+            "Republish source weights as the next append-only Reliquary HF "
+            "checkpoint and print the resume env var."
         )
     )
     parser.add_argument(
@@ -155,7 +155,7 @@ def main() -> None:
     from reliquary.shared.modeling import load_text_generation_model, load_tokenizer
 
     parent = Path(args.work_dir) if args.work_dir else Path(tempfile.gettempdir())
-    snapshot_dir = parent / f"reliquary_base_reset_ckpt_{next_n}"
+    snapshot_dir = parent / f"reliquary_recovery_ckpt_{next_n}"
     shutil.rmtree(snapshot_dir, ignore_errors=True)
     snapshot_dir.mkdir(parents=True, exist_ok=True)
 
