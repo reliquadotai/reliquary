@@ -34,6 +34,7 @@ from reliquary.constants import (
     FORCED_SEED_ROLLOUT_FLOOR,
     GRAD_CLIP_NORM,
     HASH_DEDUP_RETENTION_WINDOWS,
+    KL_BASE_MODEL,
     KL_BETA,
     LEARNING_RATE,
     LOGPROB_IS_EPS,
@@ -263,6 +264,7 @@ class ValidationService:
             config={
                 "learning_rate": LEARNING_RATE,
                 "kl_beta": KL_BETA,
+                "kl_base_model": KL_BASE_MODEL,
                 "ppo_clip_epsilon": PPO_CLIP_EPSILON,
                 "grad_clip_norm": GRAD_CLIP_NORM,
                 "lr_warmup_windows": LR_WARMUP_WINDOWS,
@@ -389,6 +391,28 @@ class ValidationService:
 
         self._resume_from = resume_from
         self._load_model_fn = load_model_fn or _default_load_model
+
+        # KL reference: a permanently-frozen base (the run's ck0), loaded once and
+        # NEVER refreshed. Anchors the GRPO KL penalty to base coherence so RL
+        # over-optimization cannot drift the policy into degeneration. Empty config
+        # -> None -> train_step falls back to verify_model (legacy, no base anchor).
+        self.base_ref_model = None
+        if KL_BASE_MODEL and model is not None:
+            try:
+                repo, _, rev = KL_BASE_MODEL.partition("@")
+                from huggingface_hub import snapshot_download
+                base_path = snapshot_download(repo_id=repo, revision=rev or None)
+                self.base_ref_model = self._load_model_fn(base_path)
+                self.base_ref_model.eval()
+                for _p in self.base_ref_model.parameters():
+                    _p.requires_grad = False
+                logger.info("GRPO KL reference = frozen base %s", KL_BASE_MODEL)
+            except Exception:
+                logger.exception(
+                    "failed to load KL base ref %s; falling back to verify_model",
+                    KL_BASE_MODEL,
+                )
+                self.base_ref_model = None
 
     @property
     def _active_batcher(self):
@@ -1270,7 +1294,11 @@ class ValidationService:
                 self.train_model = await asyncio.to_thread(
                     train_step,
                     self.train_model, batches,
-                    ref_model=self.verify_model,
+                    ref_model=(
+                        self.base_ref_model
+                        if self.base_ref_model is not None
+                        else self.verify_model
+                    ),
                     window_index=self._window_n,
                 )
                 trained = True

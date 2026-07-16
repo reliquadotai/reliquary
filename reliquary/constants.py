@@ -599,6 +599,12 @@ PPO_CLIP_EPSILON = 0.2
 # KL penalty weight (DeepSeek's GRPO default). Keeps π_new close to the
 # frozen reference; too low → drift / mode collapse; too high → no learning.
 KL_BETA = 0.04
+# KL-to-base anchor: HF model id of the run's frozen base/ck0 checkpoint, used as
+# the FIXED reference in the GRPO KL penalty so RL over-optimization cannot drift
+# the policy far from base and degenerate on hard prompts. Format "repo" or
+# "repo@revision". Empty keeps the legacy behaviour (KL measured against the
+# rolling last-published verify_model, which provides no base anchor).
+KL_BASE_MODEL = _os.environ.get("RELIQUARY_KL_BASE_MODEL", "").strip()
 
 # Max gradient norm before step — standard RL stability guard.
 GRAD_CLIP_NORM = 1.0
