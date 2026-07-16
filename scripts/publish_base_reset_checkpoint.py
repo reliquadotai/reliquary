@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Publish a base-model reset as the next Reliquary HF checkpoint.
+"""Publish recovery weights as the next Reliquary HF checkpoint.
 
 Use this after an incident when operators want miners to move forward to a
-fresh base-model checkpoint instead of resuming the latest trained checkpoint.
+fresh base model, an older immutable checkpoint, or a locally calibrated
+candidate instead of resuming the latest trained checkpoint.
 
 The script is intentionally append-only: it creates ``checkpoint N+1`` in the
 configured HF repo and prints the ``RELIQUARY_RESUME_FROM=sha:<commit>`` line
-to pin the validator restart.
+to pin the validator restart. Never expose an older checkpoint number directly:
+miners only download monotonically newer manifests.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from pathlib import Path
 
 DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-2B"
 CHECKPOINT_TITLE = re.compile(r"^checkpoint\s+(\d+)\s*$", re.IGNORECASE)
+IMMUTABLE_REVISION = re.compile(r"^[0-9a-f]{40}$")
 
 
 def _env_or_arg(value: str | None, env_name: str, label: str) -> str:
@@ -39,6 +42,25 @@ def _latest_checkpoint_n(api, repo_id: str) -> int:
     return latest
 
 
+def _source_load_kwargs(
+    source_model: str,
+    source_revision: str | None,
+    token: str,
+) -> dict[str, str]:
+    """Build fail-closed loader kwargs for a remote or local source."""
+    if source_revision is None:
+        return {"token": token}
+    if Path(source_model).expanduser().exists():
+        raise SystemExit(
+            "--source-revision cannot be combined with a local source path"
+        )
+    if IMMUTABLE_REVISION.fullmatch(source_revision) is None:
+        raise SystemExit(
+            "--source-revision must be a full 40-character commit SHA"
+        )
+    return {"token": token, "revision": source_revision}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -51,12 +73,26 @@ def main() -> None:
         default=None,
         help="HF repo to publish into; defaults to RELIQUARY_HF_REPO_ID.",
     )
-    parser.add_argument(
-        "--base-model",
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument(
+        "--source-model",
         default=None,
         help=(
-            "HF repo/path to reset to; defaults to RELIQUARY_CHECKPOINT or "
-            f"{DEFAULT_BASE_MODEL}."
+            "HF repo or local model path to republish; defaults to "
+            f"RELIQUARY_CHECKPOINT or {DEFAULT_BASE_MODEL}."
+        ),
+    )
+    source.add_argument(
+        "--base-model",
+        default=None,
+        help="Deprecated alias for --source-model.",
+    )
+    parser.add_argument(
+        "--source-revision",
+        default=None,
+        help=(
+            "Required full commit SHA when republishing an immutable older "
+            "checkpoint from a remote repository. Omit for a local path."
         ),
     )
     parser.add_argument(
@@ -83,12 +119,18 @@ def main() -> None:
     args = parser.parse_args()
 
     repo_id = _env_or_arg(args.repo_id, "RELIQUARY_HF_REPO_ID", "HF repo id")
-    base_model = (
-        args.base_model
+    source_model = (
+        args.source_model
+        or args.base_model
         or os.environ.get("RELIQUARY_CHECKPOINT")
         or DEFAULT_BASE_MODEL
     )
     token = _env_or_arg(None, "HF_TOKEN", "HF token")
+    source_kwargs = _source_load_kwargs(
+        source_model,
+        args.source_revision,
+        token,
+    )
 
     from huggingface_hub import HfApi
 
@@ -102,7 +144,8 @@ def main() -> None:
         )
 
     print(f"HF repo: {repo_id}")
-    print(f"Base model: {base_model}")
+    print(f"Source model: {source_model}")
+    print(f"Source revision: {args.source_revision or 'local/default'}")
     print(f"Latest checkpoint: {latest_n}")
     print(f"Publishing reset as: checkpoint {next_n}")
     if args.dry_run:
@@ -118,12 +161,12 @@ def main() -> None:
 
     try:
         print("Loading tokenizer...")
-        tokenizer = load_tokenizer(base_model, token=token)
-        print("Loading base model...")
+        tokenizer = load_tokenizer(source_model, **source_kwargs)
+        print("Loading source model...")
         model = load_text_generation_model(
-            base_model,
+            source_model,
             torch_dtype=torch.bfloat16,
-            token=token,
+            **source_kwargs,
         )
 
         print(f"Saving snapshot to {snapshot_dir} ...")
@@ -147,7 +190,7 @@ def main() -> None:
     print()
     print("Add these to docker/.env before restarting the trainer:")
     print(f"RELIQUARY_RESUME_FROM=sha:{commit.oid}")
-    print("RELIQUARY_WANDB_VERSION=base-reset-qwen35")
+    print(f"RELIQUARY_WANDB_VERSION=recovery-checkpoint-{next_n}")
     print(f"# checkpoint_n={next_n}")
 
 
