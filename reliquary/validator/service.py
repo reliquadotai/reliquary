@@ -1483,17 +1483,25 @@ class ValidationService:
         emergency_freeze = os.environ.get(
             "RELIQUARY_DISABLE_TRAIN", ""
         ).lower() in {"1", "true", "yes", "on"}
+        publication_retry_pending = (
+            self._trained_windows_since_publish >= self._publish_every
+        )
         checkpoint_ceiling_reached = (
             TRAIN_UNTIL_CHECKPOINT_N > 0
             and self._checkpoint_n >= TRAIN_UNTIL_CHECKPOINT_N
         )
-        skip_train = emergency_freeze or checkpoint_ceiling_reached
+        skip_train = (
+            emergency_freeze
+            or checkpoint_ceiling_reached
+            or publication_retry_pending
+        )
         if accumulator_ready and skip_train:
-            blocked_reason = (
-                "emergency_training_freeze"
-                if emergency_freeze
-                else "training_checkpoint_ceiling"
-            )
+            if emergency_freeze:
+                blocked_reason = "emergency_training_freeze"
+            elif checkpoint_ceiling_reached:
+                blocked_reason = "training_checkpoint_ceiling"
+            else:
+                blocked_reason = "checkpoint_publication_pending"
             accumulator_meta["blocked_reason"] = blocked_reason
             logger.info(
                 "Window %d: %s — retaining balanced batch and skipping "
@@ -1592,50 +1600,69 @@ class ValidationService:
         self._set_state(WindowState.PUBLISHING)
         if trained:
             self._trained_windows_since_publish += 1
-            # checkpoint_n only advances on publish. Publish cadence is based
-            # on successful trained windows rather than exact window number so
-            # a quarantined boundary window cannot freeze the public checkpoint.
-            next_n = self._checkpoint_n + 1
-            # Push to HF every N trained windows, or immediately if no
-            # checkpoint exists yet.
-            should_publish = (
-                self._trained_windows_since_publish >= self._publish_every
-                or self._checkpoint_store.current_manifest() is None
+        # checkpoint_n only advances on publish. Publish cadence is based on
+        # successful trained windows rather than exact window number so a
+        # quarantined boundary window cannot freeze the public checkpoint. Once
+        # the cadence is reached, retry a failed upload without applying another
+        # optimizer step to the pending candidate.
+        next_n = self._checkpoint_n + 1
+        should_publish = not emergency_freeze and (
+            self._trained_windows_since_publish >= self._publish_every
+            or (
+                trained
+                and self._checkpoint_store.current_manifest() is None
             )
-            if should_publish:
-                try:
-                    entry = await self._checkpoint_store.publish(
-                        checkpoint_n=next_n, model=self.train_model,
-                    )
-                    self._checkpoint_n = next_n
-                    self._trained_windows_since_publish = 0
-                    self.server.set_current_checkpoint(entry)
-                    # Refresh verify_model in-place so the next window's
-                    # batcher verifies miners against the just-published
-                    # checkpoint. In-place copy: no new allocation.
-                    try:
-                        self.verify_model.load_state_dict(
-                            self.train_model.state_dict()
-                        )
-                    except (AttributeError, RuntimeError):
-                        logger.exception(
-                            "verify_model refresh failed; verify_model now "
-                            "stale wrt checkpoint %d", entry.checkpoint_n,
-                        )
-                    logger.info(
-                        "Published checkpoint %d to %s@%s and refreshed verify_model",
-                        entry.checkpoint_n, entry.repo_id, entry.revision[:12],
-                    )
-                except Exception:
-                    logger.exception("HF publish failed; staying on previous checkpoint")
-            else:
-                logger.info(
-                    "Skipping HF publish for window_n=%d "
-                    "(%d/%d trained windows since last publish)",
-                    self._window_n,
-                    self._trained_windows_since_publish,
-                    self._publish_every,
+        )
+        if should_publish:
+            try:
+                entry = await self._checkpoint_store.publish(
+                    checkpoint_n=next_n, model=self.train_model,
                 )
+                self._checkpoint_n = next_n
+                self._trained_windows_since_publish = 0
+                self.server.set_current_checkpoint(entry)
+                # Refresh verify_model in-place so the next window's
+                # batcher verifies miners against the just-published
+                # checkpoint. In-place copy: no new allocation.
+                try:
+                    self.verify_model.load_state_dict(
+                        self.train_model.state_dict()
+                    )
+                except (AttributeError, RuntimeError):
+                    logger.exception(
+                        "verify_model refresh failed; verify_model now "
+                        "stale wrt checkpoint %d", entry.checkpoint_n,
+                    )
+                if publication_retry_pending:
+                    discarded = self._training_accumulator.reset()
+                    post_publish_state = self._training_accumulator.snapshot()
+                    accumulator_meta["post_publish_discarded"] = discarded
+                    accumulator_meta["post_action"] = post_publish_state
+                    self.server.set_training_accumulator_state(
+                        post_publish_state
+                    )
+                    for _b in self._active_batchers.values():
+                        _b.training_accumulator = accumulator_meta
+                    logger.info(
+                        "Published pending checkpoint %d; discarded %d "
+                        "retained groups generated against its parent",
+                        entry.checkpoint_n,
+                        sum(discarded["counts"].values()),
+                    )
+                logger.info(
+                    "Published checkpoint %d to %s@%s and refreshed verify_model",
+                    entry.checkpoint_n, entry.repo_id, entry.revision[:12],
+                )
+            except Exception:
+                logger.exception("HF publish failed; staying on previous checkpoint")
+        elif trained:
+            logger.info(
+                "Skipping HF publish for window_n=%d "
+                "(%d/%d trained windows since last publish)",
+                self._window_n,
+                self._trained_windows_since_publish,
+                self._publish_every,
+            )
 
         try:
             await self._archive_window(self._active_batchers, sealed)

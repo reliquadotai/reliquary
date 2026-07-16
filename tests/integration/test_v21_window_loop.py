@@ -658,6 +658,47 @@ async def test_checkpoint_ceiling_pauses_persistently_until_raised(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_failed_publish_retries_without_an_extra_optimizer_step():
+    from reliquary.validator.checkpoint import ManifestEntry
+
+    svc = _make_service(checkpoint_hash="sha256:cpA")
+    published = ManifestEntry(
+        checkpoint_n=1,
+        repo_id="aivolutionedge/reliquary-sn",
+        revision="sha256:cpB",
+        signature="ed25519:sig1",
+    )
+    svc._checkpoint_store.publish = AsyncMock(
+        side_effect=[RuntimeError("HF unavailable"), published]
+    )
+
+    with patch(
+        "reliquary.validator.service.train_step",
+        side_effect=lambda model, batches, **kwargs: model,
+    ) as train:
+        for window in range(2):
+            with _patch_open_grpo_window(svc):
+                svc._open_window()
+            svc._activate_window()
+            for i in range(B_BATCH):
+                response = svc._active_batcher.accept_submission(_request(
+                    hotkey=f"hk-{window}-{i}",
+                    prompt_idx=window * B_BATCH + i,
+                    window_start=svc._active_batcher.window_start,
+                    checkpoint_hash="sha256:cpA",
+                    seed=window * B_BATCH + i,
+                ))
+                assert response.accepted
+            await svc._train_and_publish()
+
+    assert train.call_count == 1
+    assert svc._checkpoint_store.publish.await_count == 2
+    assert svc._checkpoint_n == 1
+    assert svc._trained_windows_since_publish == 0
+    assert svc._training_accumulator.snapshot()["counts"] == {"fake": 0}
+
+
+@pytest.mark.asyncio
 async def test_seal_drain_waits_for_inflight_proofs():
     """The seal-extension drain must wait for in-flight GRAIL proofs, not just
     an empty submit queue.
