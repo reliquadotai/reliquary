@@ -13,8 +13,10 @@ import argparse
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import statistics
+import subprocess
 import time
 from typing import Any
 
@@ -28,6 +30,26 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _source_revision() -> str | None:
+    """Best-effort identity of the mounted source tree used for the screen."""
+    repository = Path(__file__).resolve().parents[1]
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        revision = completed.stdout.strip().lower()
+        if len(revision) == 40:
+            return revision
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    revision = os.environ.get("RELIQUARY_BUILD_REVISION", "").strip().lower()
+    return revision or None
 
 
 def select_tasks(
@@ -309,8 +331,6 @@ def main() -> int:
             "revision": args.dataset_revision,
         }
     else:
-        import os
-
         from reliquary.cli.main import (
             _ensure_grader_running,
             _grader_is_running,
@@ -483,6 +503,7 @@ def main() -> int:
         "answer_budget": args.answer_budget,
         "seed_domain": args.seed_domain,
         "attention_implementation": args.attention_implementation,
+        "reliquary_revision": _source_revision(),
         "summary": summarize(samples, args.n_prompts),
         "samples": samples,
         "runtime": {
