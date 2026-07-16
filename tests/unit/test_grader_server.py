@@ -256,6 +256,42 @@ def test_runsc_workers_get_unique_container_ids(monkeypatch, tmp_path):
     assert srv.GRADER_CONTAINER_ID_PLACEHOLDER not in container_ids
 
 
+def test_runsc_container_ids_are_unique_across_server_restarts(
+    monkeypatch, tmp_path
+):
+    from reliquary.environment.grader import server as srv
+
+    captured: list[list[str]] = []
+
+    class _FakeProc:
+        pid = 4321
+        stdin = None
+        stdout = None
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(
+        srv.subprocess,
+        "Popen",
+        lambda argv, **_kwargs: captured.append(list(argv)) or _FakeProc(),
+    )
+
+    for index in range(2):
+        server = srv.GraderServer(
+            socket_path=str(tmp_path / f"grader-{index}.sock"),
+            pool_size=1,
+            worker_argv=[
+                "runsc", "run", "--bundle", "/b",
+                srv.GRADER_CONTAINER_ID_PLACEHOLDER,
+            ],
+            metrics_port=0,
+        )
+        server._spawn_worker(0)
+
+    assert len({argv[-1] for argv in captured}) == 2
+
+
 def test_production_runsc_argv_disables_cgroups():
     """Production runsc argv must pass `--ignore-cgroups` as a GLOBAL flag
     (before `run`) so runsc never creates a per-sandbox cgroup — gVisor doesn't
