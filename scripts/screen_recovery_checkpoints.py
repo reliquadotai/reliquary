@@ -283,6 +283,11 @@ def main() -> int:
     args = _parser().parse_args()
     if args.samples_per_prompt <= 0:
         raise ValueError("samples_per_prompt must be positive")
+    # Capture provenance before any long-running model work. The checkout may be
+    # fast-forwarded while a screen is running; late resolution would mislabel
+    # already-imported code with the newer revision.
+    reliquary_revision = _source_revision()
+    screen_script_sha256 = _sha256(Path(__file__).resolve())
 
     model_source, model_kwargs, model_identity = resolve_model_source(
         model_repo=args.model_repo,
@@ -503,7 +508,8 @@ def main() -> int:
         "answer_budget": args.answer_budget,
         "seed_domain": args.seed_domain,
         "attention_implementation": args.attention_implementation,
-        "reliquary_revision": _source_revision(),
+        "reliquary_revision": reliquary_revision,
+        "screen_script_sha256": screen_script_sha256,
         "summary": summarize(samples, args.n_prompts),
         "samples": samples,
         "runtime": {

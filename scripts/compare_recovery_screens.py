@@ -32,7 +32,10 @@ CONTRACT_FIELDS = (
     "attention_implementation",
 )
 
-OPTIONAL_IDENTITY_FIELDS = ("reliquary_revision",)
+OPTIONAL_IDENTITY_FIELDS = (
+    "reliquary_revision",
+    "screen_script_sha256",
+)
 
 RUNTIME_CONTRACT_FIELDS = (
     "gpu_name",

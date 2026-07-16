@@ -41,6 +41,7 @@ def _screen(label: str) -> dict:
         "seed_domain": "test",
         "attention_implementation": "flash_attention_2",
         "reliquary_revision": "d" * 40,
+        "screen_script_sha256": "f" * 64,
         "runtime": {
             "gpu_name": "Test GPU",
             "torch_version": "2.7.0",
