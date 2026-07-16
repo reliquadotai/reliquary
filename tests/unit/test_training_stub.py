@@ -9,7 +9,23 @@ test_training_grpo.py and test_training_rollout_loss.py.
 import logging
 from unittest.mock import MagicMock
 
-from reliquary.validator.training import train_step, reset_training_state
+import torch
+
+from reliquary.validator.training import (
+    _build_optimizer,
+    reset_training_state,
+    train_step,
+)
+
+
+def test_optimizer_uses_torch_for_cpu_parameters_on_gpu_host(monkeypatch):
+    """GPU availability alone must not select a CUDA-only optimizer."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    parameter = torch.nn.Parameter(torch.ones(1))
+
+    optimizer = _build_optimizer([parameter])
+
+    assert isinstance(optimizer, torch.optim.AdamW)
 
 
 def test_train_step_with_empty_batch():
@@ -31,7 +47,6 @@ def test_train_step_returns_model_on_all_degenerate_groups():
     and the original model is still returned."""
     reset_training_state()
 
-    import torch
     import reliquary.validator.training as _t
 
     # Build a tiny linear model so _lazy_init and device resolution work.
@@ -61,8 +76,6 @@ def test_train_step_forwards_metrics_to_telemetry(monkeypatch):
     telemetry.log_training_step with the GRPO metrics dict and the
     window_index as the step."""
     from unittest.mock import MagicMock
-    import torch
-
     import reliquary.validator.training as _t
     from reliquary.validator import telemetry
 
@@ -147,8 +160,6 @@ def test_train_step_counts_degenerate_groups(monkeypatch):
     n_groups and does not emit metrics (no successful step — early
     return before the metrics branch)."""
     from unittest.mock import MagicMock
-    import torch
-
     import reliquary.validator.training as _t
     from reliquary.validator import telemetry
 

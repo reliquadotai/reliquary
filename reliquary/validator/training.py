@@ -55,7 +55,11 @@ def _build_optimizer(params) -> torch.optim.Optimizer:
     plain AdamW when CUDA or bitsandbytes is unavailable (CPU tests, dev
     boxes without a GPU).
     """
-    if torch.cuda.is_available():
+    params = list(params)
+    cuda_parameters = bool(params) and all(
+        parameter.device.type == "cuda" for parameter in params
+    )
+    if torch.cuda.is_available() and cuda_parameters:
         try:
             import bitsandbytes as bnb  # type: ignore[import-not-found]
             logger.info("Using bitsandbytes PagedAdamW8bit")
