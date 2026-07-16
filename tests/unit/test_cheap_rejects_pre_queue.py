@@ -17,6 +17,7 @@ from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 from fastapi.testclient import TestClient
 
 from reliquary.constants import MAX_SUBMISSIONS_PER_PROMPT
@@ -607,6 +608,32 @@ def test_claimed_out_of_zone_rejected_before_proof_admission():
     assert batcher.proof_admission_count == 0
     verdicts = list(s._verdicts.get("hkA", []))
     assert verdicts[-1]["reject_stage"] == "zone"
+
+
+@pytest.mark.parametrize(
+    "rewards",
+    ([1.0] + [0.0] * 7, [1.0] * 7 + [0.0]),
+    ids=("k1", "k7"),
+)
+def test_auction_frontier_groups_pass_http_preflight(rewards):
+    """The HTTP path must implement the same gate as deferred admission."""
+    s = ValidatorServer()
+    s.set_current_state(WindowState.OPEN)
+    batcher = _PreflightAdmissionBatcher(eos_token_id=99)
+    s.set_active_batcher(batcher)
+    payload = _submission_with_completion_tokens(
+        list(range(4, 35)) + [99],
+        rewards=rewards,
+    )
+
+    with TestClient(s.app) as client:
+        response = client.post("/submit", json=payload)
+
+    assert response.json() == {
+        "accepted": True,
+        "reason": RejectReason.ACCEPTED.value,
+    }
+    assert batcher.proof_admission_count == 1
 
 
 def test_private_reward_env_skips_claimed_reward_zone_preflight():

@@ -88,7 +88,6 @@ from reliquary.validator.observability import (
 from reliquary.validator.verifier import (
     is_forced_bft_cap_termination,
     is_natural_bft_cap_candidate,
-    is_in_zone,
     rewards_std,
     validate_force_span,
 )
@@ -261,10 +260,11 @@ def _proof_free_submission_reject(
     )
     if not _is_mock_like(batcher) and not validator_scored_reward:
         rewards = [float(rollout.reward) for rollout in request.rollouts]
-        if not is_in_zone(
-            rewards_std(rewards),
-            bootstrap=_proof_free_bootstrap(batcher),
-        ):
+        # Auction v2 admits every non-unanimous reward group and lets the
+        # difficulty score rank it. Keep this cheap preflight identical to the
+        # batcher gate; retaining the legacy sigma threshold here would reject
+        # k=1/k=7 before they ever reach the pending pool.
+        if rewards_std(rewards) < 1e-8:
             return RejectReason.OUT_OF_ZONE, "zone"
 
     eos_set = _proof_free_eos_set(batcher)
