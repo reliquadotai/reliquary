@@ -51,6 +51,7 @@ def test_fixed_kl_reference_is_pinned_frozen_and_observable(
 
     monkeypatch.setattr(service_mod, "KL_BASE_MODEL", f"owner/repo@{revision}")
     monkeypatch.setattr(service_mod, "KL_BETA_EXPLICIT", True)
+    monkeypatch.setattr(service_mod, "RECOMPUTE_PI_OLD_FROM_VERIFY", True)
     monkeypatch.setattr(
         "huggingface_hub.snapshot_download", fake_snapshot_download
     )
@@ -81,7 +82,7 @@ def test_fixed_kl_reference_is_pinned_frozen_and_observable(
         "parameter_count": 20,
         "storage_bytes": 80,
         "beta_explicit": True,
-        "behavior_logprobs": "miner_claim",
+        "behavior_logprobs": "verify_model",
         "learning_rate": service_mod.LEARNING_RATE,
         "grad_norm_skip_threshold": service_mod.GRAD_NORM_SKIP_THRESHOLD,
         "shape_penalty": service_mod.SHAPE_PENALTY,
@@ -124,6 +125,7 @@ def test_fixed_kl_reference_load_failure_is_fatal(monkeypatch):
     revision = "b" * 40
     monkeypatch.setattr(service_mod, "KL_BASE_MODEL", f"owner/repo@{revision}")
     monkeypatch.setattr(service_mod, "KL_BETA_EXPLICIT", True)
+    monkeypatch.setattr(service_mod, "RECOMPUTE_PI_OLD_FROM_VERIFY", True)
 
     def fail_download(**_kwargs):
         raise ConnectionError("HF down")
@@ -145,6 +147,7 @@ def test_fixed_kl_reference_rejects_unexpected_resolved_sha(
         service_mod, "KL_BASE_MODEL", f"owner/repo@{requested}"
     )
     monkeypatch.setattr(service_mod, "KL_BETA_EXPLICIT", True)
+    monkeypatch.setattr(service_mod, "RECOMPUTE_PI_OLD_FROM_VERIFY", True)
     monkeypatch.setattr(
         "huggingface_hub.snapshot_download",
         lambda **_kwargs: str(snapshot),
@@ -160,6 +163,7 @@ def test_fixed_kl_reference_rejects_incompatible_model(monkeypatch, tmp_path):
     snapshot.mkdir(parents=True)
     monkeypatch.setattr(service_mod, "KL_BASE_MODEL", f"owner/repo@{revision}")
     monkeypatch.setattr(service_mod, "KL_BETA_EXPLICIT", True)
+    monkeypatch.setattr(service_mod, "RECOMPUTE_PI_OLD_FROM_VERIFY", True)
     monkeypatch.setattr(
         "huggingface_hub.snapshot_download",
         lambda **_kwargs: str(snapshot),
@@ -187,4 +191,16 @@ def test_fixed_kl_reference_requires_explicit_beta(monkeypatch):
     monkeypatch.setattr(service_mod, "KL_BETA_EXPLICIT", False)
 
     with pytest.raises(ValueError, match="explicit RELIQUARY_KL_BETA"):
+        _service(nn.Linear(2, 2))
+
+
+def test_fixed_kl_reference_requires_validator_behavior_logprobs(monkeypatch):
+    revision = "d" * 40
+    monkeypatch.setattr(service_mod, "KL_BASE_MODEL", f"owner/repo@{revision}")
+    monkeypatch.setattr(service_mod, "KL_BETA_EXPLICIT", True)
+    monkeypatch.setattr(service_mod, "RECOMPUTE_PI_OLD_FROM_VERIFY", False)
+
+    with pytest.raises(
+        ValueError, match="RELIQUARY_RECOMPUTE_PI_OLD_FROM_VERIFY=true"
+    ):
         _service(nn.Linear(2, 2))

@@ -524,6 +524,12 @@ class ValidationService:
                     "fixed KL reference requires an explicit RELIQUARY_KL_BETA; "
                     "do not inherit the rolling-reference default"
                 )
+            if not RECOMPUTE_PI_OLD_FROM_VERIFY:
+                raise ValueError(
+                    "fixed KL reference requires "
+                    "RELIQUARY_RECOMPUTE_PI_OLD_FROM_VERIFY=true; the fixed "
+                    "anchor and PPO behavior policy are separate contracts"
+                )
             try:
                 from huggingface_hub import snapshot_download
                 from reliquary.shared.modeling import (
