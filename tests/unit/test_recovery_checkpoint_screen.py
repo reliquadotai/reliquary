@@ -1,0 +1,109 @@
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from scripts.screen_recovery_checkpoints import (
+    _token_repetition,
+    select_tasks,
+    summarize,
+)
+
+
+def test_select_tasks_is_order_independent_and_revision_bound(tmp_path):
+    rows = [
+        {
+            "unique_id": f"task-{index}",
+            "problem": f"problem {index}",
+            "answer": str(index),
+            "subject": "Algebra",
+            "level": 1,
+        }
+        for index in range(8)
+    ]
+    first = tmp_path / "first.jsonl"
+    second = tmp_path / "second.jsonl"
+    first.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    second.write_text(
+        "\n".join(json.dumps(row) for row in reversed(rows)) + "\n",
+        encoding="utf-8",
+    )
+
+    selected_a = select_tasks(first, n_prompts=4, dataset_revision="a" * 40)
+    selected_b = select_tasks(second, n_prompts=4, dataset_revision="a" * 40)
+    selected_c = select_tasks(first, n_prompts=4, dataset_revision="b" * 40)
+
+    assert selected_a == selected_b
+    assert [row["task_id"] for row in selected_a] != [
+        row["task_id"] for row in selected_c
+    ]
+
+
+def test_summarize_uses_stable_sample_zero_and_best_of_k():
+    samples = [
+        {
+            "task_id": "a",
+            "sample_index": 1,
+            "reward": 1.0,
+            "terminated": True,
+            "forced": False,
+            "boxed": True,
+            "rambling_proxy": False,
+            "completion_length": 20,
+        },
+        {
+            "task_id": "a",
+            "sample_index": 0,
+            "reward": 0.0,
+            "terminated": True,
+            "forced": True,
+            "boxed": False,
+            "rambling_proxy": False,
+            "completion_length": 30,
+        },
+        {
+            "task_id": "b",
+            "sample_index": 0,
+            "reward": 1.0,
+            "terminated": False,
+            "forced": False,
+            "boxed": True,
+            "rambling_proxy": True,
+            "completion_length": 40,
+        },
+        {
+            "task_id": "b",
+            "sample_index": 1,
+            "reward": 0.0,
+            "terminated": True,
+            "forced": False,
+            "boxed": True,
+            "rambling_proxy": False,
+            "completion_length": 10,
+        },
+    ]
+
+    report = summarize(samples, 2)
+
+    assert report["pass_at_1"] == 0.5
+    assert report["pass_at_k"] == 1.0
+    assert report["pass_average"] == 0.5
+    assert report["termination_rate"] == 0.75
+    assert report["forced_rate"] == 0.25
+    assert report["rambling_proxy_rate"] == 0.25
+    assert report["p50_completion_length"] == 25
+    assert report["p95_completion_length"] == pytest.approx(38.5)
+
+
+def test_token_repetition_detects_runs_and_repeated_ngrams():
+    repeated_ratio, max_run = _token_repetition([1] * 12)
+    assert repeated_ratio > 0.8
+    assert max_run == 12
+
+    diverse_ratio, diverse_run = _token_repetition(list(range(12)))
+    assert diverse_ratio == 0.0
+    assert diverse_run == 1
