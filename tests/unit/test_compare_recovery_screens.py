@@ -68,6 +68,15 @@ def test_paired_contract_rejects_runtime_or_sample_mismatch():
     with pytest.raises(ValueError, match="torch_version"):
         validate_paired_contract(baseline, candidate)
 
+    legacy = _screen("legacy")
+    legacy.pop("reliquary_revision")
+    validate_paired_contract(baseline, legacy)
+
+    candidate = _screen("candidate")
+    candidate["reliquary_revision"] = "e" * 40
+    with pytest.raises(ValueError, match="reliquary_revision"):
+        validate_paired_contract(baseline, candidate)
+
 
 def test_compare_screens_clusters_by_task_and_is_deterministic():
     baseline = _screen("base")

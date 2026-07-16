@@ -30,8 +30,9 @@ CONTRACT_FIELDS = (
     "answer_budget",
     "seed_domain",
     "attention_implementation",
-    "reliquary_revision",
 )
+
+OPTIONAL_IDENTITY_FIELDS = ("reliquary_revision",)
 
 RUNTIME_CONTRACT_FIELDS = (
     "gpu_name",
@@ -75,6 +76,18 @@ def validate_paired_contract(
     if mismatches:
         raise ValueError(
             "screen contracts differ for: " + ", ".join(mismatches)
+        )
+    identity_mismatches = [
+        field
+        for field in OPTIONAL_IDENTITY_FIELDS
+        if baseline.get(field) is not None
+        and candidate.get(field) is not None
+        and baseline.get(field) != candidate.get(field)
+    ]
+    if identity_mismatches:
+        raise ValueError(
+            "screen source identities differ for: "
+            + ", ".join(identity_mismatches)
         )
     runtime_mismatches = [
         field
