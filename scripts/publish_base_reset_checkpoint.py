@@ -109,11 +109,17 @@ def _source_load_kwargs(
     token: str,
 ) -> dict[str, str]:
     """Build fail-closed loader kwargs for a remote or local source."""
-    if source_revision is None:
-        return {"token": token}
-    if Path(source_model).expanduser().exists():
+    local_source = Path(source_model).expanduser().exists()
+    if local_source:
+        if source_revision is None:
+            return {"token": token}
         raise SystemExit(
             "--source-revision cannot be combined with a local source path"
+        )
+    if source_revision is None:
+        raise SystemExit(
+            "remote recovery sources require --source-revision with a full "
+            "40-character commit SHA"
         )
     if IMMUTABLE_REVISION.fullmatch(source_revision) is None:
         raise SystemExit(

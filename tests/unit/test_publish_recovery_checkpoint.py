@@ -30,8 +30,13 @@ def test_local_recovery_source_rejects_remote_revision(tmp_path):
         _source_load_kwargs(str(tmp_path), "a" * 40, "token")
 
 
-def test_unpinned_source_preserves_base_reset_compatibility():
-    assert _source_load_kwargs("Qwen/Qwen3.5-2B", None, "token") == {
+def test_remote_recovery_source_rejects_unpinned_revision():
+    with pytest.raises(SystemExit, match="remote recovery sources require"):
+        _source_load_kwargs("Qwen/Qwen3.5-2B", None, "token")
+
+
+def test_local_recovery_source_accepts_no_revision(tmp_path):
+    assert _source_load_kwargs(str(tmp_path), None, "token") == {
         "token": "token"
     }
 
