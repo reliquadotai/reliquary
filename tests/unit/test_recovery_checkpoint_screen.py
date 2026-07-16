@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -60,6 +61,30 @@ def test_source_revision_reads_mounted_checkout_with_explicit_safe_directory(
         f"safe.directory={tmp_path.resolve()}",
     ]
     assert calls[0][1]["cwd"] == tmp_path.resolve()
+
+
+def test_source_revision_uses_explicit_bind_mount_identity(
+    tmp_path, monkeypatch
+):
+    revision = "b" * 40
+    monkeypatch.setenv("RELIQUARY_SOURCE_REVISION", revision)
+    monkeypatch.setattr(
+        "scripts.screen_recovery_checkpoints.subprocess.run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError()),
+    )
+
+    assert _source_revision(tmp_path) == revision
+
+
+def test_source_revision_rejects_checkout_mismatch(tmp_path, monkeypatch):
+    monkeypatch.setenv("RELIQUARY_SOURCE_REVISION", "b" * 40)
+    monkeypatch.setattr(
+        "scripts.screen_recovery_checkpoints.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout="a" * 40),
+    )
+
+    with pytest.raises(ValueError, match="does not match checkout HEAD"):
+        _source_revision(tmp_path)
 
 
 def test_select_tasks_is_order_independent_and_revision_bound(tmp_path):

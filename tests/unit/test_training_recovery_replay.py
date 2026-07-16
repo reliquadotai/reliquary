@@ -38,6 +38,28 @@ def test_source_revision_captures_full_mounted_checkout_sha(
     assert _source_revision(tmp_path) == revision
 
 
+def test_source_revision_uses_explicit_bind_mount_identity(
+    monkeypatch, tmp_path
+):
+    revision = "d" * 40
+    monkeypatch.setenv("RELIQUARY_SOURCE_REVISION", revision)
+    monkeypatch.setattr(
+        "scripts.replay_training_recovery.subprocess.run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError()),
+    )
+
+    assert _source_revision(tmp_path) == revision
+
+
+def test_source_revision_rejects_invalid_explicit_identity(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("RELIQUARY_SOURCE_REVISION", "not-a-sha")
+
+    with pytest.raises(ValueError, match="40-character SHA"):
+        _source_revision(tmp_path)
+
+
 def _archive(
     window: int,
     *,

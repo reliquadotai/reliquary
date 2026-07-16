@@ -353,13 +353,20 @@ def _runtime_fingerprint(torch: Any) -> dict[str, Any]:
     }
 
 
-def _source_revision(repository: Path | None = None) -> str | None:
-    """Best-effort identity of the mounted source tree used for replay."""
+def _source_identity(
+    repository: Path | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve source identity without mistaking the image for a bind mount."""
     repository = (
         Path(__file__).resolve().parents[1]
         if repository is None
         else repository.resolve()
     )
+    explicit = os.environ.get("RELIQUARY_SOURCE_REVISION", "").strip().lower()
+    if explicit and _IMMUTABLE_REVISION.fullmatch(explicit) is None:
+        raise ValueError(
+            "RELIQUARY_SOURCE_REVISION must be a full 40-character SHA"
+        )
     try:
         completed = subprocess.run(
             [
@@ -376,11 +383,27 @@ def _source_revision(repository: Path | None = None) -> str | None:
         )
         revision = completed.stdout.strip().lower()
         if _IMMUTABLE_REVISION.fullmatch(revision) is not None:
-            return revision
+            if explicit and explicit != revision:
+                raise ValueError(
+                    "RELIQUARY_SOURCE_REVISION does not match checkout HEAD"
+                )
+            return revision, "git"
     except (OSError, subprocess.CalledProcessError):
         pass
+    if explicit:
+        return explicit, "explicit"
     revision = os.environ.get("RELIQUARY_BUILD_REVISION", "").strip().lower()
-    return revision or None
+    if (
+        repository == Path("/opt/reliquary").resolve()
+        and _IMMUTABLE_REVISION.fullmatch(revision) is not None
+    ):
+        return revision, "image"
+    return None, None
+
+
+def _source_revision(repository: Path | None = None) -> str | None:
+    """Return the immutable source revision used for replay."""
+    return _source_identity(repository)[0]
 
 
 def strip_synthetic_claim_metrics(
@@ -473,7 +496,12 @@ def main() -> int:
     args = _parser().parse_args()
     # Capture source identity before model work. Operators may fast-forward the
     # mounted checkout while a long replay is still running.
-    reliquary_revision = _source_revision()
+    reliquary_revision, reliquary_revision_source = _source_identity()
+    if reliquary_revision is None:
+        raise RuntimeError(
+            "source revision unavailable; set RELIQUARY_SOURCE_REVISION when "
+            "running from a bind-mounted checkout"
+        )
     replay_script_sha256 = _sha256(Path(__file__).resolve())
     os.environ["RELIQUARY_LEARNING_RATE"] = str(args.learning_rate)
     os.environ["RELIQUARY_KL_BETA"] = str(args.kl_beta)
@@ -641,6 +669,7 @@ def main() -> int:
     result = {
         "schema_version": 1,
         "reliquary_revision": reliquary_revision,
+        "reliquary_revision_source": reliquary_revision_source,
         "replay_script_sha256": replay_script_sha256,
         "saved_model_snapshot_sha256": saved_model_snapshot_sha256,
         "status": status,

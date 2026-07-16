@@ -17,6 +17,7 @@ import math
 import os
 from pathlib import Path
 import platform
+import re
 import statistics
 import subprocess
 import time
@@ -24,6 +25,7 @@ from typing import Any
 
 
 ANSWER_INSTRUCTION = "\n\nPut your final answer within \\boxed{}."
+_IMMUTABLE_REVISION = re.compile(r"^[0-9a-f]{40}$")
 
 _RUNTIME_PACKAGES = {
     "transformers_version": "transformers",
@@ -75,13 +77,20 @@ def _runtime_fingerprint(torch: Any) -> dict[str, Any]:
     }
 
 
-def _source_revision(repository: Path | None = None) -> str | None:
-    """Best-effort identity of the mounted source tree used for the screen."""
+def _source_identity(
+    repository: Path | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve source identity without mistaking the image for a bind mount."""
     repository = (
         Path(__file__).resolve().parents[1]
         if repository is None
         else repository.resolve()
     )
+    explicit = os.environ.get("RELIQUARY_SOURCE_REVISION", "").strip().lower()
+    if explicit and _IMMUTABLE_REVISION.fullmatch(explicit) is None:
+        raise ValueError(
+            "RELIQUARY_SOURCE_REVISION must be a full 40-character SHA"
+        )
     try:
         completed = subprocess.run(
             [
@@ -97,12 +106,28 @@ def _source_revision(repository: Path | None = None) -> str | None:
             text=True,
         )
         revision = completed.stdout.strip().lower()
-        if len(revision) == 40:
-            return revision
+        if _IMMUTABLE_REVISION.fullmatch(revision) is not None:
+            if explicit and explicit != revision:
+                raise ValueError(
+                    "RELIQUARY_SOURCE_REVISION does not match checkout HEAD"
+                )
+            return revision, "git"
     except (OSError, subprocess.CalledProcessError):
         pass
+    if explicit:
+        return explicit, "explicit"
     revision = os.environ.get("RELIQUARY_BUILD_REVISION", "").strip().lower()
-    return revision or None
+    if (
+        repository == Path("/opt/reliquary").resolve()
+        and _IMMUTABLE_REVISION.fullmatch(revision) is not None
+    ):
+        return revision, "image"
+    return None, None
+
+
+def _source_revision(repository: Path | None = None) -> str | None:
+    """Return the immutable source revision used for the screen."""
+    return _source_identity(repository)[0]
 
 
 def select_tasks(
@@ -377,7 +402,12 @@ def main() -> int:
     # Capture provenance before any long-running model work. The checkout may be
     # fast-forwarded while a screen is running; late resolution would mislabel
     # already-imported code with the newer revision.
-    reliquary_revision = _source_revision()
+    reliquary_revision, reliquary_revision_source = _source_identity()
+    if reliquary_revision is None:
+        raise RuntimeError(
+            "source revision unavailable; set RELIQUARY_SOURCE_REVISION when "
+            "running from a bind-mounted checkout"
+        )
     screen_script_sha256 = _sha256(Path(__file__).resolve())
 
     model_source, model_kwargs, model_identity = resolve_model_source(
@@ -619,6 +649,7 @@ def main() -> int:
         "seed_domain": args.seed_domain,
         "attention_implementation": args.attention_implementation,
         "reliquary_revision": reliquary_revision,
+        "reliquary_revision_source": reliquary_revision_source,
         "screen_script_sha256": screen_script_sha256,
         "summary": summarize(samples, args.n_prompts),
         "samples": samples,
