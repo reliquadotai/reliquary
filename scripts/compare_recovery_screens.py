@@ -28,6 +28,8 @@ CONTRACT_FIELDS = (
     "samples_per_prompt",
     "thinking_budget",
     "answer_budget",
+    "generation_mode",
+    "max_new_tokens",
     "seed_domain",
     "attention_implementation",
 )

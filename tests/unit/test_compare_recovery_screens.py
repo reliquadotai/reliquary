@@ -39,6 +39,8 @@ def _screen(label: str) -> dict:
         "samples_per_prompt": 2,
         "thinking_budget": 2048,
         "answer_budget": 512,
+        "generation_mode": "bft_math",
+        "max_new_tokens": 32768,
         "seed_domain": "test",
         "attention_implementation": "flash_attention_2",
         "reliquary_revision": "d" * 40,

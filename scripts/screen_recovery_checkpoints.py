@@ -252,6 +252,36 @@ def resolve_model_source(
     }
 
 
+def _single_phase_rollouts(
+    outputs: Any,
+    *,
+    prompt_tokens: list[int],
+    eos_ids: set[int],
+) -> list[dict[str, Any]]:
+    """Mirror the non-BFT miner path used by the code environment."""
+    prompt_length = len(prompt_tokens)
+    rollouts = []
+    for row in outputs:
+        sequence = row.tolist() if hasattr(row, "tolist") else list(row)
+        completion = sequence[prompt_length:]
+        first_eos = next(
+            (
+                index
+                for index, token in enumerate(completion)
+                if int(token) in eos_ids
+            ),
+            None,
+        )
+        if first_eos is not None:
+            completion = completion[:first_eos + 1]
+        rollouts.append({
+            "tokens": prompt_tokens + completion,
+            "prompt_length": prompt_length,
+            "forced": False,
+        })
+    return rollouts
+
+
 def summarize(samples: list[dict[str, Any]], n_prompts: int) -> dict[str, Any]:
     by_task: dict[str, list[dict[str, Any]]] = {}
     for sample in samples:
@@ -324,6 +354,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--samples-per-prompt", type=int, default=4)
     parser.add_argument("--thinking-budget", type=int, default=2048)
     parser.add_argument("--answer-budget", type=int, default=512)
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=32768,
+        help="Single-phase generation cap used by the code environment.",
+    )
     parser.add_argument(
         "--seed-domain", default="reliquary-recovery-common-draws-v1"
     )
@@ -463,8 +499,12 @@ def main() -> int:
             hashlib.sha256(task["task_id"].encode("utf-8")).digest()[:8],
             "big",
         )
+        bft_applicable = args.environment == "openmathinstruct"
         phase1_kwargs: dict[str, Any] = {
-            "max_new_tokens": args.thinking_budget,
+            "max_new_tokens": (
+                args.thinking_budget if bft_applicable
+                else args.max_new_tokens
+            ),
             "pad_token_id": pad_token_id,
             "attention_mask": attention_mask,
         }
@@ -484,23 +524,32 @@ def main() -> int:
                 input_tensor,
                 **forced_seed_generate_kwargs(phase1_kwargs, processor),
             )
-            phase2_kwargs: dict[str, Any] = {"pad_token_id": pad_token_id}
-            if eos_ids:
-                phase2_kwargs["eos_token_id"] = sorted(eos_ids)
-            rollouts = _bft_assemble_rollouts(
-                model=model,
-                phase1_tensor=phase1,
-                prompt_tokens=prompt_tokens,
-                think_close_ids=think_close_ids,
-                force_ids=force_ids,
-                eos_ids=eos_ids,
-                answer_budget=args.answer_budget,
-                randomness=randomness,
-                hotkey="reliquary-recovery-eval",
-                prompt_idx=prompt_idx,
-                checkpoint_hash=eval_checkpoint_hash,
-                gen_kwargs=phase2_kwargs,
-            )
+            if bft_applicable:
+                phase2_kwargs: dict[str, Any] = {
+                    "pad_token_id": pad_token_id
+                }
+                if eos_ids:
+                    phase2_kwargs["eos_token_id"] = sorted(eos_ids)
+                rollouts = _bft_assemble_rollouts(
+                    model=model,
+                    phase1_tensor=phase1,
+                    prompt_tokens=prompt_tokens,
+                    think_close_ids=think_close_ids,
+                    force_ids=force_ids,
+                    eos_ids=eos_ids,
+                    answer_budget=args.answer_budget,
+                    randomness=randomness,
+                    hotkey="reliquary-recovery-eval",
+                    prompt_idx=prompt_idx,
+                    checkpoint_hash=eval_checkpoint_hash,
+                    gen_kwargs=phase2_kwargs,
+                )
+            else:
+                rollouts = _single_phase_rollouts(
+                    phase1,
+                    prompt_tokens=prompt_tokens,
+                    eos_ids=eos_ids,
+                )
 
         for sample_index, rollout in enumerate(rollouts):
             completion_tokens = rollout["tokens"][prompt_length:]
@@ -562,6 +611,11 @@ def main() -> int:
         "samples_per_prompt": args.samples_per_prompt,
         "thinking_budget": args.thinking_budget,
         "answer_budget": args.answer_budget,
+        "generation_mode": (
+            "bft_math" if args.environment == "openmathinstruct"
+            else "single_phase_code"
+        ),
+        "max_new_tokens": args.max_new_tokens,
         "seed_domain": args.seed_domain,
         "attention_implementation": args.attention_implementation,
         "reliquary_revision": reliquary_revision,

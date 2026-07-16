@@ -5,6 +5,7 @@ import json
 import pytest
 
 from scripts.screen_recovery_checkpoints import (
+    _single_phase_rollouts,
     _source_revision,
     _token_repetition,
     resolve_model_source,
@@ -12,6 +13,28 @@ from scripts.screen_recovery_checkpoints import (
     select_tasks,
     summarize,
 )
+
+
+def test_single_phase_code_rollouts_trim_at_first_eos_without_forcing():
+    outputs = [
+        [10, 11, 20, 21, 99, 99],
+        [10, 11, 30, 31, 32, 33],
+    ]
+
+    assert _single_phase_rollouts(
+        outputs, prompt_tokens=[10, 11], eos_ids={99}
+    ) == [
+        {
+            "tokens": [10, 11, 20, 21, 99],
+            "prompt_length": 2,
+            "forced": False,
+        },
+        {
+            "tokens": [10, 11, 30, 31, 32, 33],
+            "prompt_length": 2,
+            "forced": False,
+        },
+    ]
 
 
 def test_source_revision_reads_mounted_checkout_with_explicit_safe_directory(
