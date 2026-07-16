@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Protocol-parity math screen for immutable recovery checkpoints.
+"""Protocol-parity recovery screen for immutable checkpoints.
 
 The screen uses common forced inverse-CDF draws across models, the production
-2048/512 BFT path, and Reliquary's symbolic grader. It is a paired recovery
-benchmark, not a replacement for the sealed private evaluation dashboard.
+2048/512 BFT path, and Reliquary's authoritative environment grader. It is a
+paired recovery benchmark, not a replacement for the sealed private
+evaluation dashboard.
 """
 
 from __future__ import annotations
@@ -62,6 +63,36 @@ def select_tasks(
         }
         for row in selected
     ]
+
+
+def select_code_tasks(
+    environment: Any,
+    *,
+    n_prompts: int,
+    dataset_revision: str,
+) -> list[dict[str, str]]:
+    """Select a revision-bound code holdout without downloading every row."""
+    dataset_size = len(environment)
+    if n_prompts <= 0 or n_prompts > dataset_size:
+        raise ValueError(f"n_prompts must be within [1, {dataset_size}]")
+
+    ranked_indices = sorted(
+        range(dataset_size),
+        key=lambda index: hashlib.sha256(
+            f"{dataset_revision}\0{index}".encode("utf-8")
+        ).digest(),
+    )[:n_prompts]
+    tasks = []
+    for index in ranked_indices:
+        problem = environment.get_problem(index)
+        tasks.append({
+            "task_id": str(problem["id"]),
+            "prompt": str(problem["prompt"]),
+            "ground_truth": str(problem["ground_truth"]),
+            "subject": "code",
+            "level": "unknown",
+        })
+    return tasks
 
 
 def _quantile(values: list[float], q: float) -> float | None:
@@ -177,13 +208,25 @@ def _parser() -> argparse.ArgumentParser:
     source.add_argument("--model-path", type=Path)
     parser.add_argument("--model-revision")
     parser.add_argument("--checkpoint-label", required=True)
+    parser.add_argument(
+        "--environment",
+        choices=("openmathinstruct", "opencodeinstruct"),
+        default="openmathinstruct",
+    )
     parser.add_argument("--tokenizer-repo", default="Qwen/Qwen3.5-2B")
     parser.add_argument(
         "--tokenizer-revision",
         default="15852e8c16360a2fea060d615a32b45270f8a8fc",
     )
-    parser.add_argument("--math-jsonl", type=Path, required=True)
+    parser.add_argument("--math-jsonl", type=Path)
     parser.add_argument("--dataset-revision", required=True)
+    parser.add_argument(
+        "--code-repo", default="R0mAI/opencodeinstruct-curated"
+    )
+    parser.add_argument(
+        "--code-revision",
+        default="d3caaefc3b46f8642b251f9efaeccf0d1e95b0a7",
+    )
     parser.add_argument("--n-prompts", type=int, default=16)
     parser.add_argument("--samples-per-prompt", type=int, default=4)
     parser.add_argument("--thinking-budget", type=int, default=2048)
@@ -211,7 +254,6 @@ def main() -> int:
 
     import torch
 
-    from reliquary.environment.openmathinstruct import _compute_omi_reward
     from reliquary.miner.engine import _bft_assemble_rollouts
     from reliquary.miner.forced_seed_sampler import (
         ForcedSeedLogitsProcessor,
@@ -227,11 +269,63 @@ def main() -> int:
         think_close_token_ids,
     )
 
-    tasks = select_tasks(
-        args.math_jsonl,
-        n_prompts=args.n_prompts,
-        dataset_revision=args.dataset_revision,
-    )
+    if args.environment == "openmathinstruct":
+        if args.math_jsonl is None:
+            raise ValueError(
+                "--math-jsonl is required for openmathinstruct"
+            )
+        from reliquary.environment.openmathinstruct import _compute_omi_reward
+
+        tasks = select_tasks(
+            args.math_jsonl,
+            n_prompts=args.n_prompts,
+            dataset_revision=args.dataset_revision,
+        )
+        reward_fn = lambda task, completion: _compute_omi_reward(  # noqa: E731
+            {"ground_truth": task["ground_truth"]}, completion
+        )
+        answer_instruction = ANSWER_INSTRUCTION
+        dataset_identity = {
+            "path": str(args.math_jsonl.resolve()),
+            "sha256": _sha256(args.math_jsonl),
+            "repo": None,
+            "revision": args.dataset_revision,
+        }
+    else:
+        import os
+
+        from reliquary.cli.main import (
+            _ensure_grader_running,
+            _grader_is_running,
+        )
+        from reliquary.constants import GRADER_SOCKET_PATH
+        from reliquary.environment.opencodeinstruct import (
+            OpenCodeInstructEnvironment,
+        )
+
+        if args.dataset_revision != args.code_revision:
+            raise ValueError(
+                "--dataset-revision must match --code-revision for code screens"
+            )
+        os.environ["RELIQUARY_OCI_REPO"] = args.code_repo
+        os.environ["RELIQUARY_OCI_REVISION"] = args.code_revision
+        _ensure_grader_running(use_runsc=True)
+        if not _grader_is_running(GRADER_SOCKET_PATH):
+            raise RuntimeError("the gVisor code grader did not become ready")
+        code_environment = OpenCodeInstructEnvironment()
+        tasks = select_code_tasks(
+            code_environment,
+            n_prompts=args.n_prompts,
+            dataset_revision=args.dataset_revision,
+        )
+        reward_fn = code_environment.compute_reward
+        answer_instruction = ""
+        dataset_identity = {
+            "path": None,
+            "sha256": None,
+            "repo": args.code_repo,
+            "revision": args.code_revision,
+        }
     tokenizer = load_tokenizer(
         args.tokenizer_repo,
         revision=args.tokenizer_revision,
@@ -258,7 +352,7 @@ def main() -> int:
     torch.cuda.reset_peak_memory_stats()
 
     for task_number, task in enumerate(tasks, start=1):
-        prompt = task["prompt"] + ANSWER_INSTRUCTION
+        prompt = task["prompt"] + answer_instruction
         prompt_tokens = encode_prompt(tokenizer, prompt)
         prompt_length = len(prompt_tokens)
         input_tensor = torch.tensor(
@@ -323,10 +417,7 @@ def main() -> int:
                 "subject": task["subject"],
                 "level": task["level"],
                 "sample_index": sample_index,
-                "reward": float(_compute_omi_reward(
-                    {"ground_truth": task["ground_truth"]},
-                    completion_text,
-                )),
+                "reward": float(reward_fn(task, completion_text)),
                 "completion_length": len(completion_tokens),
                 "terminated": terminated,
                 "forced": forced,
@@ -356,14 +447,16 @@ def main() -> int:
     result = {
         "schema_version": 1,
         "checkpoint_label": args.checkpoint_label,
+        "environment": args.environment,
         "model_repo": args.model_repo,
         "model_revision": args.model_revision,
         "model_path": model_identity["path"],
         "model_source_kind": model_identity["kind"],
         "tokenizer_repo": args.tokenizer_repo,
         "tokenizer_revision": args.tokenizer_revision,
-        "dataset_path": str(args.math_jsonl.resolve()),
-        "dataset_sha256": _sha256(args.math_jsonl),
+        "dataset_path": dataset_identity["path"],
+        "dataset_sha256": dataset_identity["sha256"],
+        "dataset_repo": dataset_identity["repo"],
         "dataset_revision": args.dataset_revision,
         "n_prompts": args.n_prompts,
         "samples_per_prompt": args.samples_per_prompt,

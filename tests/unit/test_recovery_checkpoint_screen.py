@@ -7,6 +7,7 @@ import pytest
 from scripts.screen_recovery_checkpoints import (
     _token_repetition,
     resolve_model_source,
+    select_code_tasks,
     select_tasks,
     summarize,
 )
@@ -41,6 +42,38 @@ def test_select_tasks_is_order_independent_and_revision_bound(tmp_path):
     assert selected_a == selected_b
     assert [row["task_id"] for row in selected_a] != [
         row["task_id"] for row in selected_c
+    ]
+
+
+def test_select_code_tasks_is_revision_bound_and_materializes_only_holdout():
+    class FakeEnvironment:
+        def __init__(self):
+            self.requested = []
+
+        def __len__(self):
+            return 20
+
+        def get_problem(self, index):
+            self.requested.append(index)
+            return {
+                "id": f"id-{index}",
+                "prompt": f"prompt {index}",
+                "ground_truth": f"cases-{index}",
+            }
+
+    first = FakeEnvironment()
+    second = FakeEnvironment()
+    selected_a = select_code_tasks(
+        first, n_prompts=4, dataset_revision="a" * 40
+    )
+    selected_b = select_code_tasks(
+        second, n_prompts=4, dataset_revision="b" * 40
+    )
+
+    assert len(selected_a) == 4
+    assert len(first.requested) == 4
+    assert [row["task_id"] for row in selected_a] != [
+        row["task_id"] for row in selected_b
     ]
 
 
