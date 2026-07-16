@@ -49,6 +49,7 @@ def test_fixed_kl_reference_is_pinned_frozen_and_observable(
         return str(snapshot)
 
     monkeypatch.setattr(service_mod, "KL_BASE_MODEL", f"owner/repo@{revision}")
+    monkeypatch.setattr(service_mod, "KL_BETA_EXPLICIT", True)
     monkeypatch.setattr(
         "huggingface_hub.snapshot_download", fake_snapshot_download
     )
@@ -108,6 +109,7 @@ def test_fixed_kl_reference_rejects_mutable_or_malformed_specs(
 def test_fixed_kl_reference_load_failure_is_fatal(monkeypatch):
     revision = "b" * 40
     monkeypatch.setattr(service_mod, "KL_BASE_MODEL", f"owner/repo@{revision}")
+    monkeypatch.setattr(service_mod, "KL_BETA_EXPLICIT", True)
 
     def fail_download(**_kwargs):
         raise ConnectionError("HF down")
@@ -128,6 +130,7 @@ def test_fixed_kl_reference_rejects_unexpected_resolved_sha(
     monkeypatch.setattr(
         service_mod, "KL_BASE_MODEL", f"owner/repo@{requested}"
     )
+    monkeypatch.setattr(service_mod, "KL_BETA_EXPLICIT", True)
     monkeypatch.setattr(
         "huggingface_hub.snapshot_download",
         lambda **_kwargs: str(snapshot),
@@ -144,3 +147,12 @@ def test_default_kl_reference_remains_rolling(monkeypatch):
     assert svc.base_ref_model is None
     assert svc.kl_reference_state["mode"] == "rolling"
     assert svc.kl_reference_state["loaded"] is True
+
+
+def test_fixed_kl_reference_requires_explicit_beta(monkeypatch):
+    revision = "d" * 40
+    monkeypatch.setattr(service_mod, "KL_BASE_MODEL", f"owner/repo@{revision}")
+    monkeypatch.setattr(service_mod, "KL_BETA_EXPLICIT", False)
+
+    with pytest.raises(ValueError, match="explicit RELIQUARY_KL_BETA"):
+        _service(nn.Linear(2, 2))

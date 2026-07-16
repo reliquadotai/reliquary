@@ -604,6 +604,7 @@ PPO_CLIP_EPSILON = 0.2
 KL_BETA = float(_os.environ.get("RELIQUARY_KL_BETA", "0.04"))
 if not 0.0 <= KL_BETA <= 1.0:
     raise ValueError("RELIQUARY_KL_BETA must be finite and within [0, 1]")
+KL_BETA_EXPLICIT = "RELIQUARY_KL_BETA" in _os.environ
 
 # Optional fixed KL reference checkpoint. This should normally be the run's ck0
 # policy, not an unrelated raw pretrained model. Fixed mode is an explicit
