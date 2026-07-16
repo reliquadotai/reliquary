@@ -185,6 +185,22 @@ def test_log_training_step_fail_soft_on_log_exception(monkeypatch, caplog):
     assert len(warnings) == 1  # second failure is suppressed
 
 
+def test_update_config_records_runtime_resolved_values(monkeypatch):
+    monkeypatch.setenv("WANDB_API_KEY", "fake-key")
+    fake_wandb = MagicMock()
+    fake_run = MagicMock(id="fakerun")
+    fake_wandb.init.return_value = fake_run
+    monkeypatch.setitem(__import__("sys").modules, "wandb", fake_wandb)
+
+    telemetry.init(hotkey_ss58="5abc" + "0" * 44, config={"kl_beta": 0.04})
+    telemetry.update_config({"kl_reference_revision": "a" * 40})
+
+    fake_run.config.update.assert_called_once_with(
+        {"kl_reference_revision": "a" * 40},
+        allow_val_change=True,
+    )
+
+
 def test_finish_calls_wandb_finish_when_active(monkeypatch):
     monkeypatch.setenv("WANDB_API_KEY", "fake-key")
     fake_wandb = MagicMock()
