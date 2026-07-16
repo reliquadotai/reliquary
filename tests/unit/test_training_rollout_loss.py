@@ -17,10 +17,9 @@ except Exception:
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 from reliquary.validator.training import (
-    TrainingStepSkipped, _rollout_loss, _compute_advantages, train_step,
+    TrainingStepSkipped, _rollout_loss, train_step,
     reset_training_state,
     _selected_logprobs, _selected_logprobs_for_tokens,
 )

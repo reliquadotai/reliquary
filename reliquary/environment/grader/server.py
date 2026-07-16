@@ -158,7 +158,9 @@ class GraderServer:
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 if self.path != "/metrics":
-                    self.send_response(404); self.end_headers(); return
+                    self.send_response(404)
+                    self.end_headers()
+                    return
                 body = registry.render().encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain; version=0.0.4")

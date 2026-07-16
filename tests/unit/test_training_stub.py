@@ -7,7 +7,7 @@ test_training_grpo.py and test_training_rollout_loss.py.
 """
 
 import logging
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from reliquary.validator.training import train_step, reset_training_state
 
