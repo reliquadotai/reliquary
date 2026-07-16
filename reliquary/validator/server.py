@@ -88,7 +88,6 @@ from reliquary.validator.observability import (
 from reliquary.validator.verifier import (
     is_forced_bft_cap_termination,
     is_natural_bft_cap_candidate,
-    is_in_zone,
     rewards_std,
     validate_force_span,
 )
@@ -261,10 +260,11 @@ def _proof_free_submission_reject(
     )
     if not _is_mock_like(batcher) and not validator_scored_reward:
         rewards = [float(rollout.reward) for rollout in request.rollouts]
-        if not is_in_zone(
-            rewards_std(rewards),
-            bootstrap=_proof_free_bootstrap(batcher),
-        ):
+        # Auction v2 admits every non-unanimous reward group and lets the
+        # difficulty score rank it. Keep this cheap preflight identical to the
+        # batcher gate; retaining the legacy sigma threshold here would reject
+        # k=1/k=7 before they ever reach the pending pool.
+        if rewards_std(rewards) < 1e-8:
             return RejectReason.OUT_OF_ZONE, "zone"
 
     eos_set = _proof_free_eos_set(batcher)
@@ -442,6 +442,7 @@ class _Health(BaseModel):
     archive_last_failed_window: int | None = None
     prompt_sources: dict[str, dict[str, Any]] = Field(default_factory=dict)
     prompt_source_unavailable_total: int = 0
+    training_kl_reference: dict[str, Any] = Field(default_factory=dict)
 
 
 class ValidatorServer:
@@ -467,6 +468,7 @@ class ValidatorServer:
         self._registration_refresh_lock = asyncio.Lock()
         self._last_registration_refresh_attempt = 0.0
         self._training_accumulator_state: dict[str, Any] = {}
+        self._training_kl_reference_state: dict[str, Any] = {}
         self._last_committed_window_n = 0
         self._candidate_window_n: int | None = None
         self._window_preparation_stage: str | None = None
@@ -559,6 +561,10 @@ class ValidatorServer:
     def set_training_accumulator_state(self, state: dict[str, Any]) -> None:
         """Expose a JSON-safe snapshot through ``/health``."""
         self._training_accumulator_state = dict(state)
+
+    def set_training_kl_reference_state(self, state: dict[str, Any]) -> None:
+        """Expose the effective, resolved KL reference through ``/health``."""
+        self._training_kl_reference_state = dict(state)
 
     def set_window_preparation_state(
         self,
@@ -1196,6 +1202,7 @@ class ValidatorServer:
                 "last_failed_window"
             ),
             prompt_sources=prompt_sources,
+            training_kl_reference=dict(self._training_kl_reference_state),
             prompt_source_unavailable_total=(
                 self._prompt_source_unavailable_total
             ),

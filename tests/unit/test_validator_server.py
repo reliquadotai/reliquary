@@ -317,7 +317,10 @@ def test_logical_group_duplicate_is_rejected_quota_neutral_before_proof():
     assert batcher.proof_grading_attempts == 1
     assert batcher.logical_group_reservation_count == 1
     assert batcher.logical_group_duplicate_rejects == 1
-    assert len(batcher.valid_submissions()) == 1
+    # Deferred-proof mode admits the first candidate into the pending pool;
+    # it does not become valid until the ranked proof pass at seal.
+    assert len(batcher.pending_submissions()) == 1
+    assert len(batcher.valid_submissions()) == 0
     health = client.get("/health").json()
     assert health["logical_group_reservations"] == 1
     assert health["logical_group_duplicate_rejects"] == 1

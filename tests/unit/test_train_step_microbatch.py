@@ -2,6 +2,8 @@
 numerically ~equivalent to the per-rollout path. Plus the atomic backward used
 by the OOM split-retry must match the plain path exactly.
 """
+import math
+
 import pytest
 
 try:
@@ -252,6 +254,34 @@ def test_atomic_matches_nonatomic_qwenlike():
     g_atomic = _grads_after(m2, lambda: _accumulate_grouped_grads(
         m2, _frozen(m2), plan, device, budget=32, atomic=True))
     assert _rel_l2(g_atomic, g_plain) < 1e-5
+
+
+def test_kl_tail_stats_capture_weighted_objective_and_outliers():
+    import copy
+
+    from reliquary.validator.training import _new_kl_stats
+
+    torch.manual_seed(4)
+    model = _QwenLike()
+    plan, _ = _make_plan(_sample_groups())
+    device = next(model.parameters()).device
+    stats = _new_kl_stats()
+
+    _accumulate_grouped_grads(
+        model,
+        _frozen(copy.deepcopy(model)),
+        plan,
+        device,
+        budget=64,
+        atomic=False,
+        kl_stats=stats,
+    )
+
+    assert stats["token_count"] > 0
+    assert stats["nonfinite_count"] == 0
+    assert stats["max"] >= 0.0
+    assert math.isfinite(stats["weighted_ppo"])
+    assert math.isfinite(stats["weighted_kl"])
 
 
 # ---------------------------------------------------------------------------

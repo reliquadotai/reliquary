@@ -79,6 +79,26 @@ def log_training_step(metrics: dict, step: int | None) -> None:
             _log_warned = True
 
 
+def update_config(values: dict) -> None:
+    """Record runtime-resolved configuration after startup discovery.
+
+    Some values, notably a Hugging Face snapshot's resolved commit and device,
+    only exist after ``wandb.init``. Keep this fail-soft like the metric path.
+    """
+    global _log_warned
+    if not _enabled or _run is None:
+        return
+    try:
+        _run.config.update(values, allow_val_change=True)
+    except Exception as e:  # noqa: BLE001
+        if not _log_warned:
+            logger.warning(
+                "wandb: config update failed (%s), suppressing further warnings",
+                e,
+            )
+            _log_warned = True
+
+
 def finish() -> None:
     """Close the wandb run. No-op if disabled. Fail-soft."""
     global _run, _enabled, _log_warned

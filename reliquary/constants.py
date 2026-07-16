@@ -596,14 +596,20 @@ LEARNING_RATE = 5e-6
 # PPO clip range. Standard in GRPO/RLHF literature.
 PPO_CLIP_EPSILON = 0.2
 
-# KL penalty weight (DeepSeek's GRPO default). Keeps π_new close to the
-# frozen reference; too low → drift / mode collapse; too high → no learning.
-KL_BETA = 0.04
-# KL-to-base anchor: HF model id of the run's frozen base/ck0 checkpoint, used as
-# the FIXED reference in the GRPO KL penalty so RL over-optimization cannot drift
-# the policy far from base and degenerate on hard prompts. Format "repo" or
-# "repo@revision". Empty keeps the legacy behaviour (KL measured against the
-# rolling last-published verify_model, which provides no base anchor).
+# KL penalty weight. The correct value depends on the reference lifecycle:
+# DeepSeekMath used 0.04 with a rolling reference, while DeepSeek-R1 reports
+# 0.001 with periodic refresh. Keep the current value as the compatibility
+# default, but make it operator-configurable so a fixed-reference experiment can
+# be calibrated without another code release.
+KL_BETA = float(_os.environ.get("RELIQUARY_KL_BETA", "0.04"))
+if not 0.0 <= KL_BETA <= 1.0:
+    raise ValueError("RELIQUARY_KL_BETA must be finite and within [0, 1]")
+KL_BETA_EXPLICIT = "RELIQUARY_KL_BETA" in _os.environ
+
+# Optional fixed KL reference checkpoint. This should normally be the run's ck0
+# policy, not an unrelated raw pretrained model. Fixed mode is an explicit
+# reproducibility contract: the value must be "repo@<full HF commit SHA>".
+# Empty keeps the legacy rolling last-published verify_model reference.
 KL_BASE_MODEL = _os.environ.get("RELIQUARY_KL_BASE_MODEL", "").strip()
 
 # Max gradient norm before step — standard RL stability guard.
