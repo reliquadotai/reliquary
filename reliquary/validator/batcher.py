@@ -111,7 +111,6 @@ from reliquary.validator.verifier import (
     has_eos_padding,
     is_cap_truncation,
     is_natural_bft_cap_candidate,
-    is_in_zone,
     rewards_std,
     validate_force_span,
     verify_logprobs_claim,
@@ -1304,11 +1303,14 @@ class GrpoWindowBatcher:
                 )
             )
         sigma = rewards_std(rewards)
-        if not is_in_zone(sigma, bootstrap=self.bootstrap):
-            # Reward error (degenerate rollout rewards), not cheating. It never
-            # reaches the GRAIL proof path. A high out_of_zone rate is bounded
-            # upstream by the grading-attempts ceiling and cannot starve the
-            # env below B distinct.
+        # The difficulty score v(k) = σ·(1-mean)^δ now gates AND ranks. It is zero
+        # only for a unanimous group (all rollouts agree → σ≈0 → no GRPO signal),
+        # so that is the only thing worth rejecting. This replaces the old σ_min
+        # band (which admitted only k∈[2,6]): a hard k=1 group — the highest-value
+        # frontier — and an easy k=7 group are now admitted, and the score ranks
+        # them (k=1 near the peak, k=7 near the bottom). A reward error, not
+        # cheating; never reaches GRAIL; bounded upstream by the grading ceiling.
+        if sigma < 1e-8:
             return reject(RejectReason.OUT_OF_ZONE, "zone")
 
         # Zone-valid: entering the GRAIL/GPU proof path. Count it for telemetry

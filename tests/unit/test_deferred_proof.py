@@ -472,3 +472,26 @@ def test_forensic_sample_watches_non_winners_keyed_on_seal_randomness():
     # Different post-deadline entropy → different watched set (unpredictable).
     other = {r.hotkey for r in _make("beacon-round-999").forensic_sample}
     assert watched != other
+
+
+def test_score_gate_admits_k1_and_k7_rejects_only_unanimous():
+    """v(k) replaces the sigma gate. A hard k=1 group (1 correct of 8) scores near
+    the peak and must be ADMITTED — the old sigma gate (k in [2,6]) rejected it as
+    out-of-zone. Only unanimous groups (k=0, k=8), which carry no GRPO signal
+    (v=0), are rejected."""
+    from reliquary.validator.batcher import RejectReason
+    from tests.unit.test_grpo_window_batcher import _make_batcher, _request
+
+    b = _make_batcher()
+    assert b.accept_submission(
+        _request(prompt_idx=1, hotkey="k1", rewards=[1.0] + [0.0] * 7)
+    ).accepted, "k=1 (hard) must be admitted"
+    assert b.accept_submission(
+        _request(prompt_idx=2, hotkey="k7", rewards=[1.0] * 7 + [0.0])
+    ).accepted, "k=7 (easy) must be admitted (it just ranks near the bottom)"
+    assert len(b.pending_submissions()) == 2
+
+    r8 = b.accept_submission(_request(prompt_idx=3, hotkey="k8", rewards=[1.0] * 8))
+    assert r8.accepted is False and r8.reason == RejectReason.OUT_OF_ZONE
+    r0 = b.accept_submission(_request(prompt_idx=4, hotkey="k0", rewards=[0.0] * 8))
+    assert r0.accepted is False and r0.reason == RejectReason.OUT_OF_ZONE
