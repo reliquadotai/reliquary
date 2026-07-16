@@ -38,6 +38,7 @@ from reliquary.constants import (
     HASH_DEDUP_RETENTION_WINDOWS,
     KL_BASE_MODEL,
     KL_BETA,
+    KL_BETA_EXPLICIT,
     LEARNING_RATE,
     LOGPROB_IS_EPS,
     LEGACY_MERKLE_ROOT_ENFORCE,
@@ -449,6 +450,11 @@ class ValidationService:
                     "fixed KL reference requested but no train model was loaded"
                 )
             repo, rev = _parse_pinned_kl_reference(KL_BASE_MODEL)
+            if not KL_BETA_EXPLICIT:
+                raise ValueError(
+                    "fixed KL reference requires an explicit RELIQUARY_KL_BETA; "
+                    "do not inherit the rolling-reference default"
+                )
             try:
                 from huggingface_hub import snapshot_download
 
