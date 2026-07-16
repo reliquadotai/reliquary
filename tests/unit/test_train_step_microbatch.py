@@ -287,7 +287,10 @@ def test_batched_grads_mask_bft_force_span_like_per_rollout():
     assert _rel_l2(bat_grads, ref_grads) < 5e-2
 
 
-def test_bft_training_metrics_measure_masked_and_weighted_exposure():
+def test_bft_training_metrics_measure_masked_and_weighted_exposure(
+    monkeypatch,
+):
+    monkeypatch.setattr("reliquary.constants.SHAPE_PENALTY", 0.0)
     forced = _build_rollout([1, 2, 3, 4, 5, 6, 7, 8], 1.0, 3)
     forced._validated_force_span = (5, 7)
     forced._validated_termination_path = "forced_phase2_eos"
@@ -304,7 +307,7 @@ def test_bft_training_metrics_measure_masked_and_weighted_exposure():
     assert metrics["bft/trainable_completion_tokens"] == 6
     assert metrics["bft/forced_trainable_token_ratio"] == 0.5
     assert metrics["bft/forced_abs_adv_weighted_token_ratio"] == pytest.approx(
-        2 / 3
+        0.5
     )
     assert metrics["bft/path/forced_phase2_eos/rollouts"] == 1
     assert metrics[
