@@ -72,7 +72,7 @@ from reliquary.constants import (
 from reliquary.environment import load_environments
 from reliquary.environment.base import Environment
 from reliquary.infrastructure import chain, storage
-from reliquary.protocol.submission import RolloutSubmission, WindowState
+from reliquary.protocol.submission import RejectReason, RolloutSubmission, WindowState
 from reliquary.validator import telemetry
 from reliquary.validator.batcher import GrpoWindowBatcher
 from reliquary.validator.checkpoint import CheckpointStore
@@ -1378,6 +1378,84 @@ class ValidationService:
             for b in batcher_list:
                 b.beacon_invalid = True
 
+    def _record_auction_final_verdicts(self, batcher: GrpoWindowBatcher) -> None:
+        """Publish the final lifecycle state of every auction candidate.
+
+        Admission and final selection are deliberately separate in auction mode:
+        the worker first records that a cheap-validated candidate entered the
+        pending pool, then ``seal_batch`` proves only the ranked candidates that
+        can still win. The second record added here is identifiable by the
+        non-null ``selected_for_batch`` and ``rewarded`` fields.
+
+        Non-winners remain accepted candidates with no reward. A candidate that
+        was sampled or selected for deferred proof and failed receives the real
+        proof rejection. Telemetry publication is best-effort and never changes
+        protocol state or rewards.
+        """
+        if not getattr(batcher, "difficulty_auction_enabled", False):
+            return
+        if getattr(batcher, "_auction_final_verdicts_published", False):
+            return
+
+        metadata = getattr(batcher, "difficulty_auction_metadata_by_id", {})
+        for pending in batcher.pending_submissions():
+            row = metadata.get(id(pending), {}) if isinstance(metadata, dict) else {}
+            selected = bool(row.get("selected", False))
+            proof_reject = pending.reject_response
+            accepted = proof_reject is None
+            reason = (
+                RejectReason.ACCEPTED
+                if proof_reject is None
+                else proof_reject.reason
+            )
+            canonical_rank = row.get("rank")
+            if not isinstance(canonical_rank, int) or isinstance(
+                canonical_rank, bool
+            ):
+                canonical_rank = None
+
+            try:
+                self.server.record_verdict(
+                    pending.hotkey,
+                    pending.request.merkle_root,
+                    accepted,
+                    reason,
+                    window_n=batcher.window_start,
+                    telemetry=pending.telemetry,
+                    reject_stage=None if accepted else "auction_seal",
+                    canonical_rank=canonical_rank,
+                    accepted_into_pool=True,
+                    selected_for_batch=selected,
+                    rewarded=selected,
+                )
+                log_structured(
+                    logger,
+                    logging.INFO if accepted else logging.WARNING,
+                    "validator_submit_lifecycle",
+                    {
+                        "stage": "auction_finalized",
+                        "window_n": batcher.window_start,
+                        "env_name": str(getattr(batcher.env, "name", "")),
+                        "prompt_idx": pending.prompt_idx,
+                        "hotkey": pending.hotkey,
+                        "accepted": accepted,
+                        "reason": reason.value,
+                        "canonical_rank": canonical_rank,
+                        "accepted_into_pool": True,
+                        "selected_for_batch": selected,
+                        "rewarded": selected,
+                        "auction_status": row.get("status"),
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "auction final verdict publication failed window=%d prompt=%d",
+                    batcher.window_start,
+                    pending.prompt_idx,
+                )
+
+        batcher._auction_final_verdicts_published = True
+
     async def _train_and_publish(self) -> None:
         """TRAINING + PUBLISHING + READY phases."""
         if not self._active_batchers:
@@ -1411,10 +1489,9 @@ class ValidationService:
             return
 
         self._set_state(WindowState.TRAINING)
-        # v2.3: seal_batch orders by the per-submission drand_round attached
-        # by miners (see design A'). The validator does no post-close drand
-        # fetch — all timing info is already attached to the submissions.
-        # Seal all batchers and collect results.
+        # Seal every environment after its collection deadline. Auction mode
+        # ranks the frozen pending population, proves candidates top-down, and
+        # selects at most B_BATCH winners independently for Math and Code.
         per_env_targets = dict(self.env_mix)
         # Split the window's emission budget (1.0) equally across the active
         # envs so the merged ``combined_rewards`` stays <= 1.0 and the weight
@@ -1428,9 +1505,10 @@ class ValidationService:
         # same pool and an env a validator does not run burns its share.
         pool_per_env = 1.0 / len(self.env_mix)
         # Fetch a fresh drand beacon now — AFTER the collection deadline — to key
-        # each batcher's forensic sample. Its randomness did not exist when miners
-        # submitted, so they cannot grind their merkle_root to dodge being watched.
-        # Telemetry only, so a failed fetch just disables the sample this window.
+        # each batcher's forensic sample and equal-score operator tie-break. Its
+        # randomness did not exist when miners submitted, so neither surface can be
+        # ground in advance. If the fetch fails, the window randomness is the
+        # deterministic ranking fallback and the forensic sample is disabled.
         seal_randomness = await self._fetch_seal_randomness()
         for b in self._active_batchers.values():
             b.seal_randomness = seal_randomness
@@ -1444,6 +1522,13 @@ class ValidationService:
             sealed[name] = await asyncio.to_thread(b.seal_batch, pool=pool_per_env)
         for name, (batch, rewards) in sealed.items():
             self._active_batchers[name].rewards_by_hotkey = rewards
+
+        # Worker acceptance means "admitted to the auction pool". Publish a
+        # second, final /verdicts record after seal so miners can distinguish a
+        # selected/rewarded candidate, an honest non-winner, and a deferred-proof
+        # failure. This is observability only and cannot change selection.
+        for batcher in self._active_batchers.values():
+            self._record_auction_final_verdicts(batcher)
 
         # Emit per-submission lifecycle telemetry for every env's accepted
         # pool. Carried over from PR #40 (validator observability) and
@@ -1493,12 +1578,6 @@ class ValidationService:
                         "validator_submit_lifecycle",
                         {"stage": "reward_assigned", **base_fields},
                     )
-
-        # Merge rewards across envs for unified weight scoring.
-        all_rewards: dict[str, float] = {}
-        for _batch, rewards in sealed.values():
-            for hk, r in rewards.items():
-                all_rewards[hk] = all_rewards.get(hk, 0.0) + r
 
         window_batches = {
             name: sealed[name][0] for name, _ in self.env_mix if name in sealed

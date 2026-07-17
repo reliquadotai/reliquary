@@ -996,16 +996,18 @@ class ValidatorServer:
     ) -> None:
         """Record a per-submission verdict for ``/verdicts/{hotkey}``.
 
-        Called from every code path that decides accept/reject:
+        Called from every code path that decides a lifecycle stage:
 
           * HTTP rate-limit / window-not-active / batch-filled early cutoffs
             in the ``/submit`` handler (before the request even reaches the
             queue worker)
           * ``_submit_worker`` after each ``batcher.accept_submission``
-            returns its real verdict (the path that's currently invisible
-            to miners because /submit returned ``SUBMITTED`` provisionally)
+            returns its pool-admission verdict (the path hidden by the
+            provisional ``SUBMITTED`` response)
           * ``_submit_worker`` late drops for items dequeued after the
             batcher swap or seal (``worker_dropped`` / ``batch_filled``)
+          * ``ValidationService`` after auction seal, with final selection,
+            reward, and deferred-proof outcome fields
 
         The verdict is stored in a per-hotkey ring buffer
         (``VERDICT_CAP_PER_HOTKEY`` entries). Older verdicts roll off
