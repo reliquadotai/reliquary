@@ -901,18 +901,30 @@ class ValidationService:
         )
 
     async def _maintain_registration_cache(self) -> None:
-        """Refresh the registered-hotkey snapshot before it becomes stale."""
+        """Refresh the registered-hotkey snapshot before it becomes stale.
+
+        A chain RPC can legitimately consume most of the 20-second refresh
+        timeout. Starting at half the TTL leaves several bounded attempts
+        before admission health degrades, while a failed attempt retries at
+        the existing minimum refresh interval instead of waiting a full poll.
+        """
         poll_seconds = self._registration_refresh_poll_seconds()
+        retry_seconds = min(
+            poll_seconds,
+            float(REGISTERED_HOTKEY_REFRESH_MIN_INTERVAL_SECONDS),
+        )
         refresh_threshold = max(
             0.0,
-            float(REGISTERED_HOTKEY_CACHE_TTL_SECONDS) - poll_seconds,
+            float(REGISTERED_HOTKEY_CACHE_TTL_SECONDS) / 2.0,
         )
+        sleep_seconds = poll_seconds
         while True:
-            await asyncio.sleep(poll_seconds)
+            await asyncio.sleep(sleep_seconds)
             age = self.server.registration_cache_age()
             if age is None or age >= refresh_threshold:
                 refreshed = await self._refresh_registered_hotkeys(
                     max_cache_age_seconds=refresh_threshold,
+                    reason="proactive",
                 )
                 if not refreshed:
                     logger.warning(
@@ -920,18 +932,23 @@ class ValidationService:
                         "age=%.1fs",
                         age if age is not None else -1.0,
                     )
+                    sleep_seconds = retry_seconds
+                    continue
+            sleep_seconds = poll_seconds
 
     async def _refresh_registered_hotkeys(
         self,
         *,
         force: bool = False,
         max_cache_age_seconds: float | None = None,
+        reason: str = "unspecified",
     ) -> bool:
         """Refresh registered subnet identities without concurrent chain reads."""
         async with self._registration_refresh_lock:
             return await self._refresh_registered_hotkeys_locked(
                 force=force,
                 max_cache_age_seconds=max_cache_age_seconds,
+                reason=reason,
             )
 
     async def _refresh_registered_hotkeys_locked(
@@ -939,6 +956,7 @@ class ValidationService:
         *,
         force: bool = False,
         max_cache_age_seconds: float | None = None,
+        reason: str = "unspecified",
     ) -> bool:
         """Refresh registered subnet identities from a fresh chain session."""
         age = self.server.registration_cache_age()
@@ -950,7 +968,7 @@ class ValidationService:
         if (
             not force
             and age is not None
-            and age <= cache_age_limit
+            and age < cache_age_limit
         ):
             return True
 
@@ -1011,6 +1029,10 @@ class ValidationService:
                 hotkeys,
                 operator_by_hotkey=operator_by_hotkey,
             )
+            self.server.record_registration_cache_refresh(
+                success=True,
+                reason=reason,
+            )
             logger.info(
                 "Registered-hotkey cache refreshed: netuid=%d hotkeys=%d "
                 "operator_mappings=%d complete=%s",
@@ -1022,7 +1044,12 @@ class ValidationService:
             return True
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            self.server.record_registration_cache_refresh(
+                success=False,
+                reason=reason,
+                failure_type=type(exc).__name__,
+            )
             logger.exception(
                 "Registered-hotkey cache refresh failed for netuid=%d",
                 self.netuid,
@@ -2496,9 +2523,12 @@ class ValidationService:
         archive_queue = get_archive_queue()
         self.server.configure_archive_queue_telemetry(archive_queue.snapshot)
         self.server.configure_registration_gate(
-            lambda: self._refresh_registered_hotkeys(force=True),
+            lambda: self._refresh_registered_hotkeys(
+                force=True,
+                reason="on_demand",
+            ),
         )
-        await self._refresh_registered_hotkeys(force=True)
+        await self._refresh_registered_hotkeys(force=True, reason="startup")
         await self.server.start()
         await self._serve_axon_on_chain(subtensor)
         await self._apply_resume_from()                  # ← resume before bootstrap
@@ -2537,7 +2567,9 @@ class ValidationService:
                         self._set_window_preparation_stage(
                             "registration_refresh"
                         )
-                    await self._refresh_registered_hotkeys()
+                    await self._refresh_registered_hotkeys(
+                        reason="window_boundary"
+                    )
                     self._open_window()
                     await self._wait_for_next_drand_boundary()
                     await self._set_window_randomness(subtensor)

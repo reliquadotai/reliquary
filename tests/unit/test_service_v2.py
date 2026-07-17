@@ -84,6 +84,63 @@ async def test_registration_cache_maintainer_refreshes_before_ttl(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_registration_cache_maintainer_retries_before_ttl(monkeypatch):
+    """A transient RPC timeout must leave enough runway for a retry."""
+    from reliquary.validator import service as service_module
+
+    svc = _build_late_drop_service()
+    ttl_seconds = 0.30
+    monkeypatch.setattr(
+        service_module, "REGISTERED_HOTKEY_CACHE_TTL_SECONDS", ttl_seconds,
+    )
+    monkeypatch.setattr(
+        service_module, "REGISTERED_HOTKEY_REFRESH_MIN_INTERVAL_SECONDS", 0.02,
+    )
+    elapsed = 0.0
+    base_age = 0.10
+    real_sleep = asyncio.sleep
+
+    async def advance_time(seconds: float) -> None:
+        nonlocal elapsed
+        elapsed += seconds
+        await real_sleep(0)
+
+    monkeypatch.setattr(service_module.asyncio, "sleep", advance_time)
+    monkeypatch.setattr(
+        svc.server,
+        "registration_cache_age",
+        lambda: base_age + elapsed,
+    )
+    call_ages: list[float] = []
+    recovered = asyncio.Event()
+
+    async def refresh(**kwargs):
+        del kwargs
+        age = svc.server.registration_cache_age()
+        assert age is not None
+        call_ages.append(age)
+        if len(call_ages) == 1:
+            return False
+        recovered.set()
+        await real_sleep(0)
+        return True
+
+    monkeypatch.setattr(svc, "_refresh_registered_hotkeys", refresh)
+    task = asyncio.create_task(svc._maintain_registration_cache())
+    try:
+        await asyncio.wait_for(recovered.wait(), timeout=1.0)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert len(call_ages) == 2
+    assert all(age < ttl_seconds for age in call_ages)
+    assert call_ages[0] < 0.20
+    assert abs((call_ages[1] - call_ages[0]) - 0.02) < 1e-9
+
+
+@pytest.mark.asyncio
 async def test_registration_refresh_uses_fresh_metagraph_and_updates_server():
     svc = _build_late_drop_service()
     subtensor = object()
@@ -114,6 +171,11 @@ async def test_registration_refresh_uses_fresh_metagraph_and_updates_server():
         "hk-a": "operator-a",
         "hk-b": "operator-b",
     }
+    health = svc.server._health_payload()
+    assert health.registration_cache_refresh_attempts_total == 1
+    assert health.registration_cache_refresh_successes_total == 1
+    assert health.registration_cache_refresh_failures_total == 0
+    assert health.registration_cache_last_refresh_reason == "unspecified"
     get_subtensor.assert_awaited_once()
     get_metagraph.assert_awaited_once_with(subtensor, 99)
     close_subtensor.assert_awaited_once_with(subtensor)
@@ -146,6 +208,12 @@ async def test_registration_refresh_failure_preserves_last_known_good():
         "hk-a": "operator-a"
     }
     assert svc.server._registration_refreshed_at == 123.0
+    health = svc.server._health_payload()
+    assert health.registration_cache_refresh_attempts_total == 1
+    assert health.registration_cache_refresh_successes_total == 0
+    assert health.registration_cache_refresh_failures_total == 1
+    assert health.registration_cache_last_refresh_failure_type == "ConnectionError"
+    assert health.registration_cache_last_refresh_failure_reason == "unspecified"
     close_subtensor.assert_awaited_once_with(None)
 
 
