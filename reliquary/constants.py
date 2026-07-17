@@ -166,11 +166,10 @@ VALIDATOR_HTTP_PORT = 8888
 # Pending work reserves capacity separately, so a degenerate-reward flood cannot
 # grow the bounded submit queue or saturate the grader pool while discarded
 # queue items do not burn work that never ran.
-# There is no separate per-window GRAIL candidate budget: the drand-anchored
-# 8-distinct seal, this ceiling and the seal drain timeout bound the work. The
-# old MAX_PROOF_CANDIDATES_PER_WINDOW (32) was a pre-seal-drand relic that only
-# starved honest late arrivals when earlier candidates failed a post-reservation
-# gate (e.g. forced-seed) without refund.
+# There is no smaller per-window GRAIL candidate budget: auction environments
+# freeze at the 300-second deadline, then this ceiling and the seal-time wall
+# budget bound ranked proof work. The old 32-candidate cap starved honest late
+# arrivals when earlier candidates failed after reservation.
 MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW = 96
 
 # Seal-time GRAIL work is serial and an adversarial ranked prefix may fail one
@@ -258,11 +257,10 @@ REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS = 20.0
 # one drand burst into an unbounded proof backlog.
 MAX_POST_TRIGGER_PROOF_CANDIDATES = 8
 
-# Safety timeout for the seal extension's drain phase. Once the trigger drand
-# round expires, the validator waits for the queue AND in-flight GRAIL proofs to
-# drain so every admitted trigger-round candidate is paid. Sized to cover serial
-# verification (~1 proof/s) of a full window's admitted set; after this timeout
-# it seals anyway so a slow or constantly refilled queue cannot freeze checkpoints.
+# Safety timeout for the pre-seal drain phase. Auction environments stop new
+# admission at the collection deadline, drain work that arrived before it, then
+# freeze the pending population. Legacy mode uses the same bound after its seal
+# trigger. A stuck queue cannot freeze checkpoints indefinitely.
 MAX_SEAL_QUEUE_DRAIN_SECONDS = 60.0
 
 # Liveness poll interval while an OPEN validator window waits for either a
@@ -271,13 +269,9 @@ MAX_SEAL_QUEUE_DRAIN_SECONDS = 60.0
 # drained but fewer than B valid submissions survived validation.
 PROOF_ADMISSION_STALL_POLL_SECONDS = 0.5
 
-# Sparse-window liveness breaker. After recent validator hardening, honest but
-# stale/misconfigured miners can leave a window with some valid submissions but
-# fewer than B distinct trainable prompts. Keep the normal 8-distinct seal as
-# the happy path, but do not let sparse valid traffic hold checkpoint progress
-# for the long safety-net timeout. Idle/age caps are sized to give slower
-# fresh-model submissions (longer generations, bursty arrivals) time to reach
-# 8 distinct before a sparse window is force-sealed.
+# Legacy-selector sparse-window liveness breaker. Production auction
+# environments use the fixed collection deadline instead; these values remain
+# for the emergency kill-switch path and any out-of-scope environment.
 SPARSE_VALID_IDLE_SEAL_SECONDS = 300.0
 SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS = 4
 SPARSE_VALID_MAX_WINDOW_SECONDS = 900.0
@@ -372,8 +366,8 @@ BOOTSTRAP_SIGMA_MIN = 0.33
 # Number of rollouts per submission (= size of each GRPO group).
 M_ROLLOUTS = 8
 
-# Training batch size per active environment. Final selection is drand-round /
-# canonical ordered, not TCP FIFO; distinct prompt representatives feed GRPO.
+# Maximum proven winners and uniform reward slots per active environment.
+# Distinct prompt representatives feed GRPO.
 B_BATCH = 8
 
 # (env_name, prompts_per_batch). Sum across entries = total prompts
@@ -562,18 +556,16 @@ LEGACY_MERKLE_ROOT_ENFORCE = _os.environ.get(
     "RELIQUARY_LEGACY_MERKLE_ROOT_ENFORCE", "false"
 ).strip().lower() in ("1", "true", "yes", "on")
 
-# Max GRAIL-validated submissions retained per prompt per window. Once this
-# cap is reached for a prompt, further submissions for that prompt are
-# rejected as PROMPT_FULL before the heavy verify. Bounds the validator's
-# GPU cost when many miners attack the same prompt — combined with the
-# per-hotkey cap above, worst-case GRAIL load per window is
-# MAX_SUBMISSIONS_PER_PROMPT × min(|env|, MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW × n_hotkeys).
+# Max graded pending submissions retained per prompt per window. Once reached,
+# further submissions for that prompt are rejected as PROMPT_FULL before any
+# deferred GPU proof. Auction logical dedup separately permits only one claim
+# per (operator, prompt), so this cap bounds distinct-operator crowding.
 MAX_SUBMISSIONS_PER_PROMPT = 10
 
-# Difficulty-auction research is observation-only. The active protocol keeps
-# its current admission, proof, seal, selection, and emission rules while the
-# validator archives a deterministic counterfactual over the same fully
-# validated candidate pool. Arming is deliberately a separate future change.
+# Legacy counterfactual retained for the emergency kill-switch path. Production
+# auction environments emit an armed schema through the same historical field
+# name for dashboard compatibility; this computation runs only when production
+# auction enforcement is disabled for an environment.
 DIFFICULTY_AUCTION_SHADOW_ENABLED = _os.environ.get(
     "RELIQUARY_DIFFICULTY_AUCTION_SHADOW_ENABLED", "1"
 ).strip().lower() not in ("0", "false", "no", "off", "")
@@ -917,7 +909,7 @@ FORCED_SEED_ENFORCE = _os.environ.get(
 ).strip().lower() in ("1", "true", "yes", "on")
 # Wire-advertised on BatchSubmissionRequest.protocol_version by clients that
 # sample from the forced stream (0 = legacy/pre-forced-seed). Lets the operator
-# track adoption in the shadow window before arming enforcement.
+# identify clients that implement the forced stream.
 # v2 drops the hotkey from the forced seed (u_at) to kill multi-hotkey variance
 # farming — a coordinated miner+validator change, so it bumps the version.
 # This runtime implements only the v2 stream. With a checkpoint pinned and

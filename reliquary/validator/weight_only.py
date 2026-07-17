@@ -165,24 +165,11 @@ class WeightOnlyValidator:
         already in units of ``pool`` (≤ 1.0 per window), so they map
         directly onto the EMA fraction with no further normalization.
 
-        Why this matters: the emission distribution has three properties
-        the older "count entries in ``batch``" approach did not preserve
-        on-chain:
-
-          * K-way same-prompt split. K miners on one winning prompt each
-            earn ``slot_share / K`` in ``rewards_by_hotkey``. The old code
-            only counted the canonical training representative, which
-            collapsed K sybils' total reward onto the rep — the K-way
-            split existed in the archive but never reached the chain.
-          * Boundary-round fair split. When the round that crosses
-            ``B_BATCH`` has more prompts than remaining slots, every
-            prompt in that round earns its share via
-            ``rewards_by_hotkey`` (see ``select_batch_and_distribute``).
-            The old code only credited the canonical-hash winners in the
-            training batch.
-          * Conservation. ``rewards_by_hotkey`` sums to at most ``pool``
-            per window, with unfilled slots burning their share. The EMA
-            fraction inherits the same bound naturally.
+        The field is deliberately mechanism-agnostic. Historical archives may
+        contain same-prompt/boundary splits; auction-v2 archives contain one
+        uniform share per proven winner. Replaying the authoritative field
+        preserves both eras without asking weight-only nodes to reimplement
+        selection. Its sum remains at most one pool and unfilled shares burn.
         """
         ema: dict[str, float] = {}
         alpha = EMA_ALPHA

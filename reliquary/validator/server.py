@@ -2311,14 +2311,11 @@ class ValidatorServer:
                         ),
                     )
 
-            # Under TestClient (no worker running) we run synchronously so
-            # tests see the real ``ACCEPTED`` verdict; under uvicorn we enqueue
-            # for the worker and return ``SUBMITTED`` — a distinct sentinel
-            # that tells the miner the request is queued, not yet validated.
-            # The real verdict (accept/reject post-GRAIL) surfaces in the
-            # validator's logs and in the R2 archive. Expensive proof work is
-            # bounded by ``try_reserve_proof_admission`` above; over-budget
-            # submissions are rejected before they can enter this queue.
+            # Under TestClient (no worker running) validation is synchronous;
+            # under uvicorn we enqueue and return ``SUBMITTED``. In auction mode
+            # worker ``ACCEPTED`` means admitted to the pending pool, and the
+            # seal-time /verdicts record reports proof/selection/reward outcome.
+            # Reservation bounds apply before either path enters grading.
             if self._worker_task is None:
                 started, start_reason = self._start_proof_admission(
                     batcher, request,
@@ -2766,8 +2763,8 @@ class ValidatorServer:
                         reject_reason=response.reason.value,
                         accepted_into_pool=False,
                     )
-                # The verdict the /submit response *didn't* carry, now
-                # observable to the miner via /verdicts.
+                # Pool-admission verdict hidden by the provisional /submit
+                # response. Auction selection publishes a second verdict at seal.
                 self.record_verdict(
                     request.miner_hotkey, request.merkle_root,
                     response.accepted, response.reason,

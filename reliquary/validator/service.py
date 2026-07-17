@@ -24,6 +24,8 @@ from reliquary.constants import (
     DEFAULT_HF_REPO_ID,
     DRAND_ROUND_BACKWARD_TOLERANCE,
     DIFFICULTY_AUCTION_DELTA,
+    DIFFICULTY_AUCTION_ENFORCE,
+    DIFFICULTY_AUCTION_ENVIRONMENTS,
     DIFFICULTY_AUCTION_SHADOW_ENABLED,
     DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS,
     DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES,
@@ -33,6 +35,7 @@ from reliquary.constants import (
     FORCED_SEED_CDF_ENFORCE,
     FORCED_SEED_CONSISTENCY_FLOOR,
     FORCED_SEED_ENFORCE,
+    FORCED_SEED_PROTOCOL_VERSION,
     FORCED_SEED_ROLLOUT_FLOOR,
     GRAD_CLIP_NORM,
     GRAD_NORM_SKIP_THRESHOLD,
@@ -46,12 +49,15 @@ from reliquary.constants import (
     LR_COSINE_MAX_WINDOWS,
     LR_WARMUP_WINDOWS,
     M_ROLLOUTS,
+    MAX_AUCTION_SLOTS_PER_OPERATOR,
+    MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW,
+    MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
+    MAX_PROOF_WALL_SECONDS,
+    MAX_SEAL_QUEUE_DRAIN_SECONDS,
     MIN_EOS_PROBABILITY,
     POLL_INTERVAL_SECONDS,
     PPO_CLIP_EPSILON,
     PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD,
-    MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
-    MAX_SEAL_QUEUE_DRAIN_SECONDS,
     PROOF_ADMISSION_STALL_POLL_SECONDS,
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
     REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS,
@@ -67,6 +73,7 @@ from reliquary.constants import (
     VALIDATOR_HTTP_PORT,
     WANDB_TRAINING_VERSION,
     WINDOW_LENGTH,
+    WINDOW_COLLECTION_SECONDS,
     WINDOW_TIMEOUT_SECONDS,
 )
 from reliquary.environment import load_environments
@@ -896,9 +903,9 @@ class ValidationService:
                     list(coldkey_values) if coldkey_values is not None else []
                 )
             except TypeError:
-                # Registration admission remains available even if an older
-                # metagraph object cannot expose ownership. The shadow cap then
-                # reports incomplete mapping and disables itself.
+                # Registration admission may use the hotkey list, but production
+                # auction claims fail closed when ownership is unavailable. A
+                # hotkey is never substituted for the missing operator identity.
                 raw_coldkeys = []
             hotkeys = {
                 hotkey
@@ -2001,17 +2008,41 @@ class ValidationService:
                 "difficulty_auction_reward_count": difficulty_meta.get(
                     "reward_count"
                 ),
-                "difficulty_auction_eligible": difficulty_meta.get("eligible"),
+                "difficulty_auction_mode": (
+                    "production"
+                    if getattr(batcher, "difficulty_auction_enabled", False)
+                    else "observation_only"
+                ),
+                "difficulty_auction_eligible": difficulty_meta.get(
+                    "eligible",
+                    True if "status" in difficulty_meta else None,
+                ),
                 "difficulty_auction_rank": difficulty_meta.get("rank"),
                 "difficulty_auction_selected": difficulty_meta.get(
-                    "shadow_selected"
+                    "selected", difficulty_meta.get("shadow_selected")
+                ),
+                "difficulty_auction_status": difficulty_meta.get("status"),
+                "difficulty_auction_proof_attempted": difficulty_meta.get(
+                    "proof_attempted"
+                ),
+                "difficulty_auction_proof_passed": difficulty_meta.get(
+                    "proof_passed"
+                ),
+                "difficulty_auction_forensic_sampled": difficulty_meta.get(
+                    "forensic_sampled", False
+                ),
+                "difficulty_auction_forensic_passed": difficulty_meta.get(
+                    "forensic_passed"
+                ),
+                "difficulty_auction_rank_entropy_source": difficulty_meta.get(
+                    "rank_entropy_source"
                 ),
                 "difficulty_auction_operator_id": difficulty_meta.get(
                     "operator_id"
                 ),
             }
 
-        def _difficulty_shadow_payload(batcher):
+        def _difficulty_auction_payload(batcher):
             payload = getattr(batcher, "difficulty_auction_shadow", None)
             if isinstance(payload, dict):
                 return payload
@@ -2244,6 +2275,10 @@ class ValidationService:
         env_names_list = list(batcher_dict.keys())
         # Backward-compat: keep "environment" (singular) pointing to the first
         # env so older readers that pre-date multi-env don't silently break.
+        difficulty_auction_payload = {
+            env_name: _difficulty_auction_payload(env_batcher)
+            for env_name, env_batcher in batcher_dict.items()
+        }
         archive = {
             "window_start": first_batcher.window_start,
             "validator_hotkey": self.wallet.hotkey.ss58_address,  # provenance
@@ -2260,10 +2295,10 @@ class ValidationService:
             "reject_summary": combined_reject_counts,
             "server_reject_summary": server_reject_summary,
             "logical_group_dedup": logical_group_dedup,
-            "difficulty_auction_shadow": {
-                env_name: _difficulty_shadow_payload(env_batcher)
-                for env_name, env_batcher in batcher_dict.items()
-            },
+            # Canonical production name plus the historical alias consumed by
+            # existing dashboards and replay scripts.
+            "difficulty_auction": difficulty_auction_payload,
+            "difficulty_auction_shadow": difficulty_auction_payload,
             "grader_failures": grader_failures,
             "grader_failures_by_environment": (
                 grader_failures_by_environment
@@ -2339,6 +2374,7 @@ class ValidationService:
                 "bootstrap_sigma_min": BOOTSTRAP_SIGMA_MIN,
                 "min_eos_probability": MIN_EOS_PROBABILITY,
                 "forced_seed_enforce": FORCED_SEED_ENFORCE,
+                "forced_seed_protocol_version": FORCED_SEED_PROTOCOL_VERSION,
                 "forced_seed_consistency_floor": (
                     FORCED_SEED_CONSISTENCY_FLOOR
                 ),
@@ -2348,6 +2384,25 @@ class ValidationService:
                     FORCED_SEED_CDF_BOUNDARY_EPSILON
                 ),
                 "legacy_merkle_root_enforce": LEGACY_MERKLE_ROOT_ENFORCE,
+                "difficulty_auction_enforce": DIFFICULTY_AUCTION_ENFORCE,
+                "difficulty_auction_environments": list(
+                    DIFFICULTY_AUCTION_ENVIRONMENTS
+                ),
+                "difficulty_auction_collection_seconds": (
+                    WINDOW_COLLECTION_SECONDS
+                ),
+                "difficulty_auction_max_slots_per_operator": (
+                    MAX_AUCTION_SLOTS_PER_OPERATOR
+                ),
+                "difficulty_auction_proof_attempt_limit": (
+                    MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+                ),
+                "difficulty_auction_proof_wall_limit_seconds": (
+                    MAX_PROOF_WALL_SECONDS
+                ),
+                "difficulty_auction_operator_proof_failure_cap": (
+                    MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW
+                ),
                 "difficulty_auction_shadow_enabled": (
                     DIFFICULTY_AUCTION_SHADOW_ENABLED
                 ),

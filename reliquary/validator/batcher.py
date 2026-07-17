@@ -583,22 +583,21 @@ class GrpoWindowBatcher:
         # (randomness not yet known, or window is before the enforcement
         # cutover). Set by set_prompt_range() once randomness is assigned.
         self.prompt_range: tuple[int, int] | None = None
-        # v2.3: post-seal emission distribution. Populated by seal_batch and
-        # consumed by _archive_window so the EMA / weight-setter can credit
-        # all GRAIL-validated submissions whose prompt landed in the
-        # winning set, not just the one picked for the training step.
+        # Authoritative post-seal emission distribution consumed by archive
+        # replay and weight-only validators. Auction mode pays one uniform slot
+        # to each proven winner; legacy mode may retain historical split rules.
         self.rewards_by_hotkey: dict[str, float] = {}
-        # Post-seal health metric: accepted submissions that earned emission
-        # via boundary sharing but did not enter the training batch.
+        # Legacy compatibility metric. Production auction winners are both
+        # selected and rewarded, so this remains empty in auction mode.
         self.rewarded_but_not_selected_by_hotkey: dict[str, int] = {}
         # Accumulated reject reasons this window (RejectReason.value → count).
         # Persisted in the R2 archive so miners can see which filter is
         # rejecting the most submissions in any given round.
         self.reject_counts: dict[str, int] = {}
         self.selection_metadata_by_id: dict[int, dict[str, Any]] = {}
-        # Observation-only counterfactual. It is computed from the same fully
-        # validated pool production saw and must never affect admission,
-        # proofs, sealing, selection, cooldown, training, or emission.
+        # Historical attribute name retained for archive/dashboard compatibility.
+        # Auction mode stores the armed production payload here; kill-switch
+        # legacy mode stores the observation-only counterfactual.
         self.difficulty_auction_shadow: dict[str, Any] = {
             "schema_version": 1,
             "status": "not_computed",
@@ -798,9 +797,10 @@ class GrpoWindowBatcher:
             self._seal_event.set()
 
     def prompt_submission_count(self, prompt_idx: int) -> int:
-        """Number of GRAIL-validated submissions already in the per-prompt
-        bucket for ``prompt_idx``. Used by the HTTP /submit handler to
-        short-circuit ``PROMPT_FULL`` rejects without queueing.
+        """Number of retained submissions in the per-prompt bucket.
+
+        Auction mode counts graded pending candidates; legacy mode counts proven
+        valid candidates. Used by HTTP to short-circuit ``PROMPT_FULL``.
 
         Read of a dict-of-list len is GIL-atomic and lock-free in CPython,
         same property ``valid_count`` relies on. Best-effort: a racing
@@ -1262,17 +1262,11 @@ class GrpoWindowBatcher:
                 self._release_hotkey_payload_locked(hotkey, payload_bytes)
 
     def _note_grail_candidate(self) -> None:
-        """Count a zone-valid submission entering the GRAIL/GPU proof path.
+        """Count a zone-valid submission entering the graded candidate path.
 
-        Telemetry only — the window is already bounded by the drand-anchored
-        seal (the B-th distinct prompt records the trigger round and later
-        rounds are dropped), the never-refunded grading-attempts ceiling, the
-        per-hotkey submission cap, the post-trigger straggler cap and the seal
-        drain timeout. The old per-window GRAIL candidate budget was a
-        pre-seal-drand relic: back when the 8-distinct seal did not fire it was
-        the only bound on GRAIL work within a window. It only starved honest
-        late arrivals whenever earlier candidates failed a post-reservation
-        gate (e.g. forced-seed) without refund, so it no longer rejects.
+        Telemetry only. Auction mode is bounded by the collection deadline,
+        grading ceiling, payload limits, and seal-time proof wall; legacy mode
+        retains its trigger-round and drain bounds. This counter never rejects.
         """
         with self._proof_admission_lock:
             self._proof_admission_count += 1
@@ -1457,11 +1451,9 @@ class GrpoWindowBatcher:
                 return reject(RejectReason.PROMPT_OUT_OF_RANGE, "prompt_range")
         if self._cooldown.is_in_cooldown(request.prompt_idx, self.window_start):
             return reject(RejectReason.PROMPT_IN_COOLDOWN, "cooldown")
-        # v2.3: cap submissions per prompt before the heavy verify. Once a
-        # prompt has ``MAX_SUBMISSIONS_PER_PROMPT`` GRAIL-validated entries,
-        # further attempts are rejected PROMPT_FULL without running GRAIL.
-        # This bounds the validator's GPU cost in the worst case where many
-        # miners attack the same prompt.
+        # Cap each prompt's retained population before deferred proof. Auction
+        # logical dedup already limits an operator to one claim per prompt; this
+        # bounds distinct-operator crowding and retained memory.
         existing = self._submissions_per_prompt.get(request.prompt_idx, [])
         if len(existing) >= MAX_SUBMISSIONS_PER_PROMPT:
             return reject(RejectReason.PROMPT_FULL, "prompt_capacity")
