@@ -54,6 +54,23 @@ def test_open_window_sets_state_to_open():
     assert svc._active_batcher is not None
 
 
+def test_activation_reanchors_window_clock_after_preparation():
+    svc = _make_service()
+    svc._open_window()
+    batcher = svc._active_batcher
+    now = [123.0]
+    wall = [1_234.0]
+    batcher._time_fn = lambda: now[0]
+    batcher._wall_clock = lambda: wall[0]
+    batcher.window_opened_at = -1.0
+    batcher.window_opened_wall_ts = -1.0
+
+    svc._activate_window()
+
+    assert batcher.window_opened_at == 123.0
+    assert batcher.window_opened_wall_ts == 1_234.0
+
+
 def test_open_window_reserves_candidate_without_committing_window_n():
     svc = _make_service()
     initial = svc._window_n

@@ -737,6 +737,17 @@ class GrpoWindowBatcher:
         """
         self._loop = loop
 
+    def mark_window_opened(self) -> None:
+        """Anchor collection and response-time telemetry at actual activation.
+
+        Batchers are constructed before drand preparation, then exposed to
+        miners in a separate activation phase. Starting the deadline in the
+        constructor would silently shorten a 300-second auction whenever
+        preparation is slow.
+        """
+        self.window_opened_at = self._time_fn()
+        self.window_opened_wall_ts = self._wall_clock()
+
     def is_sealed(self) -> bool:
         """True once the collection deadline has expired (or a safety-valve
         ``force_seal`` fired). Thread-safe and loop-independent (reads the

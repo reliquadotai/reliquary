@@ -29,6 +29,29 @@ def test_window_seals_when_the_deadline_expires():
     assert b.is_sealed() is True
 
 
+def test_collection_deadline_starts_at_activation_not_construction():
+    from reliquary.constants import WINDOW_COLLECTION_SECONDS
+    from tests.unit.test_grpo_window_batcher import _make_batcher
+
+    now = [1000.0]
+    wall = [10_000.0]
+    b = _make_batcher(
+        time_fn=lambda: now[0],
+        wall_clock_fn=lambda: wall[0],
+    )
+    now[0] += 45.0
+    wall[0] += 45.0
+
+    b.mark_window_opened()
+
+    assert b.window_opened_at == 1045.0
+    assert b.window_opened_wall_ts == 10_045.0
+    now[0] += WINDOW_COLLECTION_SECONDS - 0.1
+    assert b.poll_deadline() is False
+    now[0] += 0.2
+    assert b.poll_deadline() is True
+
+
 def test_late_submission_is_accepted_while_the_window_is_open():
     """No more count-based BATCH_FILLED. A miner who took 250s on a hard prompt
     still gets in — that is the entire point of the deadline."""

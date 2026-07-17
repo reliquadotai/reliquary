@@ -861,8 +861,9 @@ class ValidationService:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
-        if loop is not None:
-            for batcher in self._active_batchers.values():
+        for batcher in self._active_batchers.values():
+            batcher.mark_window_opened()
+            if loop is not None:
                 batcher.bind_event_loop(loop)
         self.server.set_active_batchers(self._active_batchers)
         self._window_n = int(self._candidate_window_n)
