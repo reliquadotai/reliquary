@@ -1,188 +1,251 @@
-# Difficulty Auction v2 — Design
+# Difficulty Auction v2 - Final Production Contract
 
-**Date:** 2026-07-15
-**Branch:** `design/difficulty-auction-v2` (off `design/difficulty-auction` @ c1ce152,
-which carries current `main` hardening incl. the `force_span` fix, the
-observation-only shadow module `difficulty_auction.py`, and operator attribution)
-**Builds on:** `2026-07-14-difficulty-auction-design.md` (the mechanism) and the
-protocol plan `2026-07-14-difficulty-auction-protocol.md` (deferred proof + deadline)
-**Answers:** `2026-07-15-difficulty-auction-maintainer-review.md` (the P0/P1 blockers)
+- **Initial design:** 2026-07-15
+- **Finalized:** 2026-07-17
+- **Implementation branch:** `design/difficulty-auction-v2`
+- **Status:** production mechanism, enabled by default
+**Environment scope:** `openmathinstruct` and `opencodeinstruct`
 
----
+This document supersedes the rollout assumptions in the earlier auction plans
+and reviews. In particular, the mechanism is intentionally active for both Math
+and Code. BFT remains Math-only; that is a generation/termination distinction,
+not an auction distinction.
 
-## 0. Why a v2
+## 1. Objective
 
-The v1 protocol branch (deferred proof + 300s deadline + prompt dedup) was
-correct in shape but the maintainer review blocked it for deployment with real
-P0s: multi-hotkey variance farming, prompt squatting, an unbounded proof
-wall-clock, a predictable forensic sample, a wire-breaking reject enum, and code
-included prematurely. v2 keeps the mechanism (pay for hard groups, time-boxed
-collection, prove only what can win) and closes each blocker. The mechanism math
-(the score, the ranking) is **unchanged** and is reused from the merged shadow
-module.
+The old event-driven selector rewarded the first eight valid prompt groups and
+split a prompt's slot among same-prompt runners-up. That made arrival coverage
+and extra identities economically important and diluted top miners even when a
+later group sat closer to the learning frontier.
 
-**Scope stays math-only** (`openmathinstruct`). `opencodeinstruct` is out until a
-separate grader-throughput canary passes.
+Auction v2 instead:
 
----
+1. collects a bounded population for a fixed interval;
+2. ranks in-zone groups by expected training value;
+3. proves only candidates that can still win;
+4. pays at most one proven group per prompt;
+5. caps each operator at two slots per environment; and
+6. burns unfilled slots rather than paying unproven or low-ranked work.
 
-## 1. What is carried over unchanged (from v1 + shadow)
+The score selects training examples. It does not scale the value of a selected
+slot: every winner receives one uniform `pool_per_env / B_BATCH` slot.
 
-- **Score** `v(k) = std(rewards) · (1 − mean)^δ`, `δ = 1.0`, peak at k=2. Reuse
-  `reliquary/validator/difficulty_auction.difficulty_score` (the shadow module
-  already on the branch) — do NOT fork a second copy.
-- **Ranking** `(-value, drand_round, _within_slot_key)` — reuse the module's
-  `_rank_key`.
-- **Time-boxed window** at `WINDOW_COLLECTION_SECONDS = 300`, seal on the
-  deadline (not on an 8-distinct count). Accept everything valid during the
-  window. Sized from live data (math gen median 176s, p75 267s; windows already
-  ran ~277s collection).
-- **Deferred proof**: cheap admission (schema/sig/prompt/grade/score, no GPU),
-  then prove the ranked candidates at seal. A submission that cannot win is never
-  proven.
-- **Operator attribution** (from the friend's commits) — the hotkey→operator map
-  used by the emission cap. Kept.
+## 2. Scope And Timing
 
----
+- Production environments: Math and Code.
+- Each environment has an independent admission queue, grading budget, retained
+  payload budget, pending population, proof accounting, and two-slot operator
+  cap.
+- The collection deadline is `WINDOW_COLLECTION_SECONDS = 300` seconds after
+  the environment is actually activated. Preparation time cannot consume the
+  miner's collection interval.
+- At the deadline, new admission stops. Work received before the deadline is
+  given at most `MAX_SEAL_QUEUE_DRAIN_SECONDS = 60` seconds to quiesce before the
+  pending population is frozen.
+- There is no count-triggered early seal in auction mode. A fast miner cannot
+  close the window while slower hard-prompt generations are still running.
 
-## 2. The v2 changes (one per maintainer P0/P1)
+## 3. Admission Contract
 
-### 2.1 Variance farming → remove the hotkey from the forced seed (P0 #3)
+Before queueing, the validator checks the signed envelope, active window,
+checkpoint, environment, registration, operator mapping, protocol version,
+rate limits, logical claim, queue capacity, and serialized payload bounds.
 
-**The fix chosen over the maintainer's coldkey seed-binding.** Today
-`u_at(randomness, hotkey, prompt_idx, checkpoint_hash, rollout, t)` keys the
-forced-sampling stream on the **hotkey**. That is exactly what lets one operator
-with N hotkeys draw N *different* legal groups on one prompt and submit the best
-(8 hotkeys → 60% chance of hitting k=2, per the review's binomial table).
+The worker then performs the bounded non-GPU path:
 
-Drop the hotkey from the hash:
+- canonical prompt and token binding;
+- signature and window-randomness binding;
+- rollout/hash invariants and recent content dedup;
+- validator-authoritative reward computation;
+- reward-shape and termination-independent cheap guards; and
+- the zone threshold (`sigma >= 0.43`, or bootstrap threshold when active).
 
+Passing this path means only **admitted to the pending auction pool**. It does
+not mean the group passed GRAIL or won a slot.
+
+Code grades its eight rollouts concurrently in isolated grader workers. A
+candidate-caused outcome such as bad output, forbidden import, runtime error,
+tampering, or timeout is a legitimate zero reward. Infrastructure outcomes such
+as an unreachable grader, malformed grader response, or grader service error
+never become a zero reward:
+
+- retryable service failures return `WORKER_DROPPED`, cancel the logical claim,
+  and refund submission quota;
+- an ambiguous worker crash returns `REWARD_MISMATCH` and consumes the claim,
+  preventing a crash-triggering candidate from obtaining free retries.
+
+## 4. Difficulty Score And Eligibility
+
+For validator-derived rollout rewards `r`:
+
+```text
+value(r) = std(r) * (1 - mean(r))^delta
+delta = 1.0
 ```
-u_at(randomness, prompt_idx, checkpoint_hash, rollout, t)   # no hotkey
+
+For eight binary rewards the zone gate admits `k = 2..6`, and the score peaks at
+`k = 2`. This favors hard groups that still contain positive signal instead of
+rewarding already-solved groups. Reward vectors outside the zone never enter the
+auction.
+
+## 5. Identity And Anti-Sybil Rules
+
+### Forced seed v2
+
+The forced sampling stream is:
+
+```text
+u_at(window_randomness, prompt_idx, checkpoint_revision, rollout_idx, token_idx)
 ```
 
-Now the forced group for a prompt is identical for everyone in the window, so N
-hotkeys buy N copies of the *same* draw — farming is dead.
+It deliberately excludes hotkey identity. Multiple hotkeys cannot buy different
+legal draws for the same prompt. `BatchSubmissionRequest.protocol_version = 2`
+is mandatory while forced-seed enforcement and a checkpoint are active. Older
+clients fail before quota, grading, or proof admission with `SEED_MISMATCH`.
 
-**Why this over coldkey-binding:** coldkey-binding needs a block-pinned metagraph
-snapshot synchronized across validators, fail-closed on missing mappings — a real
-consensus hazard the review itself flags. Removing the hotkey has **no identity
-in the seed at all**, so it needs no metagraph sync. Simpler and consensus-safer.
+Exact per-token CDF enforcement remains disabled. The tolerant consistency gate
+stays active because cached generation and validator teacher forcing are not a
+bit-identical numerical contract across all supported runtimes.
 
-**What it costs, and why it is acceptable:**
-- The group becomes a **public deterministic function** of (window randomness,
-  checkpoint, prompt). Anti-pregeneration still holds — randomness is unknown
-  until the window opens. To submit you still must run the model (GRAIL checks
-  real forward-pass tokens at 32 challenge positions), and mid-window nobody's
-  submission is visible, so there is no free-riding/copying.
-- Two honest miners on one prompt now produce **byte-identical tokens** →
-  `compute_rollout_hash(tokens)` collides → the content dedup makes it
-  one-submission-per-prompt automatically, resolved by who submits first. This
-  interacts with §2.2 and must be handled there (see the dedup note).
-- The competition becomes "cover the most prompts, submit the high-k ones fast"
-  rather than "curate a group" — a compute/coverage race. It re-centralizes
-  toward GPU scale (as the current race already does), NOT toward hotkey count.
+### One logical claim per operator and prompt
 
-**Coordinated change:** both sides must hash identically —
-`reliquary/miner/forced_seed_sampler.py:85` and
-`reliquary/validator/batcher.py:1400`, plus the `u_at` signature in
-`reliquary/environment/forced_sampling.py:60`. This is a miner-client protocol
-change with an adoption window (bump the forced-seed protocol version).
+Auction dedup reserves one `(operator, prompt_idx)` claim per window regardless
+of hotkey or harmless payload variation. Missing or ambiguous operator ownership
+fails closed. The historical hotkey fallback is not used in production auction
+mode.
 
-### 2.2 Prompt squatting → resolve same-prompt at seal, after proof (P0 #4)
+### Ranking tie-break
 
-Do **not** claim a prompt at admission, and do **not** add a wire-level
-`PROMPT_CLAIMED` enum (older miners fail deserialization on an unknown value —
-review P0). Instead:
+Candidates are ordered by:
 
-- Admit and grade every submission (bounded, §2.3). Multiple submissions for one
-  prompt may enter the pending pool.
-- At seal, rank; when filling slots, the **first submission per prompt that
-  PASSES the proof** takes the slot; the rest for that prompt are dropped
-  (promote-on-failure). A fabricated group fails the proof, so it can never lock
-  a prompt.
+```text
+(-difficulty_value, submitted_drand_round, operator_prompt_tiebreak)
+```
 
-**Dedup note (interaction with §2.1):** under the hotkey-free seed, two *honest*
-submissions for a prompt are byte-identical, so the content dedup would reject
-the second at admission as `HASH_DUPLICATE` — which already yields
-one-honest-submission-per-prompt without a new enum. A *fabricated* squatting
-group has different (garbage) tokens, so it does NOT collide and still enters the
-pool; it is removed at seal when it fails the proof. So squatting resolution =
-existing content dedup (for honest twins) + seal-time proof filter (for fakes).
-No new reject reason on the wire.
+The final tie-break hashes only the operator, prompt, and post-deadline drand
+salt. It excludes hotkey, Merkle root, and miner-controlled metadata, so an
+operator cannot mint extra equal-score lottery tickets. If seal-time drand is
+temporarily unavailable, window randomness is the deterministic liveness
+fallback.
 
-### 2.3 Unbounded proof wall-clock → global budget + wall-clock (P0 #5)
+## 6. Deferred Proof And Selection
 
-v1 removed the fixed proof-attempt cap (which had starved honest fill). v2 keeps
-honest fill safe AND bounds GPU: prove ranked top-down until `B_BATCH` pass, with
-**both** a global attempt ceiling (tie it to `MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW`,
-the pool bound) **and** a global proof wall-clock budget. On exhaustion: explicit
-fallback — archive the shortfall, burn unpaid slots, advance. The per-hotkey
-failure skip stays. (The earlier starvation came from a cap SMALLER than the fake
-population; here the ceiling is the pool itself, so fakes cannot exhaust it before
-honest candidates are reached, and the wall-clock stops a pathological flood.)
+At seal, the validator walks the frozen ranking top-down:
 
-### 2.4 Queue memory reserved too late (P1 #6)
+1. skip a prompt already won by a higher-ranked proven candidate;
+2. skip cooldown prompts;
+3. fail closed on missing operator identity;
+4. skip operators that already won two slots in this environment;
+5. skip identities whose proof-failure debt is exhausted;
+6. run the expensive GRAIL/auth/termination/distribution proof; and
+7. on pass, claim the prompt and one operator slot; on failure, promote the next
+   candidate.
 
-Reserve grading count AND payload bytes atomically **before** queue insertion,
-release on every cancel/drop path. Bound count, serialized bytes, per-hotkey
-bytes, per-env sandbox work. Closes the 256-payload backpressure hole.
+A fabricated high-scoring group therefore cannot squat a prompt. It must pass
+the proof before it can claim or earn anything.
 
-### 2.5 Predictable forensic sample (P1 #7)
+The proof loop is bounded independently per environment:
 
-v1 sampled non-winners by `sha256(window_randomness ‖ miner_merkle_root)` — the
-miner controls the root and sees the randomness, so it is grindable. Use **future
-drand entropy revealed only after the collection deadline** to choose the sample,
-then prove it before publication. Miner cannot predict whether it is watched.
+- at most 96 grading/proof attempts;
+- at most 240 seconds of seal-time proof wall clock;
+- at most 2 expensive failures per hotkey;
+- at most 4 expensive failures per operator; and
+- at most 8 proven winners.
 
-### 2.6 Selection changes production — state it plainly (P0 #1)
+Two post-deadline-drand-selected non-winners are additionally proven for auth
+forensics when budget remains. They never enter training or rewards.
 
-There is no "neutral shadow" once proving is ranked: proving only the top-ranked
-fills `_valid` with auction-selected winners, which is the point. v2 does not
-label this shadow. It is the armed selection. Emission still uses the existing
-distributor over `_valid`; paying *by score* is a later, separate switch, gated
-on the free-negative guard (§3).
+## 7. Resource Bounds
 
----
+- maximum parsed submission payload: 64 MiB;
+- maximum retained pending payload per hotkey: 128 MiB;
+- maximum retained pending payload per environment: 512 MiB;
+- global active/draining queue depth backstop: 256;
+- maximum retained groups per prompt: 10; and
+- maximum started grading attempts per environment/window: 96.
 
-## 3. Still required before ANY payout/training-selection activation
+Reservations are atomic before queue insertion and released on every reject,
+drop, outage, seal, and cancellation path. Math and Code queues are isolated so
+a pathological Code submission cannot head-of-line block Math admission.
 
-Carried from the original design §9 and the review:
+## 8. Reward And Training Semantics
 
-- **Grader false-negative guard.** A correct answer graded wrong lowers k toward
-  the score peak → a false negative is worth the maximum payout. Re-grade the
-  selected top-8 with the unbounded oracle (the fast path's DoS bounds are for 69
-  submissions; the auction keeps 8, so it can afford it). Measure the residual
-  free-negative rate first (M5).
-- **Operator emission cap.** `MAX_SLOTS_PER_COLDKEY_PER_WINDOW`, wired to the
-  operator attribution, bounds centralization (a farmer cartel filling all 8
-  slots). The seed change (§2.1) removes the score-inflation incentive; the cap
-  bounds residual concentration.
+Each environment receives half of the window emission pool in the canonical
+two-environment deployment. Every selected winner receives one of eight equal
+slots from its environment. There is no active same-prompt runner-up split.
+Unfilled slots remain unpaid and contribute to burn.
 
----
+Selected prompts enter cooldown and selected rollout hashes enter replay dedup.
+Only proven selected groups can enter the balanced Math+Code training
+accumulator. Quarantine may still credit rewards while preventing suspicious
+groups from changing model weights.
 
-## 4. Rollout
+Training recovery remains a separate but coupled safety contract:
 
-1. Land v2 mechanics behind the existing enforcement flag OFF (compute + archive,
-   change nothing), rebased on current main.
-2. Run a **full-pool, non-weight-setting canary** with the bounded resource
-   controls above — this is the measurement the pure shadow cannot do, because it
-   collects the real 300s population instead of the speed-race survivors.
-3. Compare optimizer-side difficulty balancing vs the market auction on a fixed
-   validated dataset (review step 3).
-4. Close M5 + the seed protocol adoption window, then arm.
+- immutable fixed KL reference
+  `Qwen/Qwen3.5-2B@15852e8c16360a2fea060d615a32b45270f8a8fc`;
+- explicit `RELIQUARY_KL_BETA=0.01`;
+- validator-recomputed behavior-policy `pi_old`;
+- `RELIQUARY_LEARNING_RATE=0.000003`;
+- no length shaping; and
+- pre-step gradient and PPO-ratio circuit breakers.
 
-**Reconcile with the maintainer before merge** — this branch answers their review
-rather than bypassing it, so it should go back through the same review.
+The fixed base is the KL anchor only. The last published checkpoint remains the
+behavior policy miners used and therefore the source of `pi_old`.
 
----
+## 9. Verdict And Archive Contract
 
-## 5. Open question for the maintainer
+The production lifecycle has three observable stages:
 
-The hotkey-free seed (§2.1) makes the per-prompt group a public deterministic
-artifact. This is a deliberate trade: it kills variance farming without a
-metagraph-synchronized operator map, at the cost of a compute/coverage race and
-losing per-hotkey token uniqueness. If per-operator draw diversity is considered
-valuable (each operator exploring a different draw), coldkey-binding is the
-alternative — heavier consensus, but preserves per-operator uniqueness. v2 picks
-the simpler, consensus-safer option; flag if the trade is wrong.
+1. `/submit`: `SUBMITTED` means queued only.
+2. First `/verdicts` record: `ACCEPTED` means admitted to the pending pool.
+3. Seal-time `/verdicts` record: non-null `selected_for_batch` and `rewarded`
+   report the final outcome; a deferred-proof failure carries its real reject
+   reason and `reject_stage="auction_seal"`.
+
+An honest non-winner remains `accepted=true`, with
+`selected_for_batch=false` and `rewarded=false`.
+
+R2 publishes the canonical per-environment payload under
+`difficulty_auction`. `difficulty_auction_shadow` remains an identical alias for
+older dashboards. Candidate rows include rank, score components, operator,
+proof status, selection status, proof budgets, wall time, cap skips, and entropy
+source. Code grader infrastructure failures are archived separately from
+candidate reward outcomes.
+
+## 10. Rollout And Rollback
+
+This is a coordinated miner/validator hard cutover because forced seed v2 is a
+wire-level generation contract. Deploy miners before or at validator activation.
+No legacy grace period is implied once enforcement is on.
+
+Production defaults to:
+
+```dotenv
+RELIQUARY_DIFFICULTY_AUCTION_ENFORCE=1
+FORCED_SEED_ENFORCE=true
+FORCED_SEED_CDF_ENFORCE=false
+```
+
+The emergency selection rollback is
+`RELIQUARY_DIFFICULTY_AUCTION_ENFORCE=0`. It restores the legacy selector but
+does not revert forced-seed protocol v2. Image rollback remains the stronger
+option when wire/runtime parity itself is in doubt.
+
+## 11. Release Gates
+
+The release is acceptable only when:
+
+- the complete unit/integration suite passes in the pinned validator runtime;
+- both environment queues and grader health are green;
+- the startup banner reports auction enabled for both environments;
+- operator mapping is complete;
+- one full live 300-second window seals without queue/proof-wall exhaustion;
+- both environment archives land in R2 under the same window;
+- final verdict records appear for winners, non-winners, and proof failures;
+- rewards sum to no more than the window pool; and
+- the balanced accumulator and training safety gates remain healthy.
+
+Any proof-wall exhaustion, grader infrastructure failure, incomplete ownership
+mapping, archive failure, reward over-allocation, or policy-health gate trip is a
+stop/rollback signal, not something to reinterpret as miner underperformance.

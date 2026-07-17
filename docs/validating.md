@@ -106,8 +106,8 @@ RELIQUARY_EXTERNAL_PORT=8080
 # RELIQUARY_RESUME_FROM=sha:<40-hex-hf-commit>
 ```
 
-By default the Docker/CLI trainer starts with `openmathinstruct` only. The live
-trainer may opt in to mixed training once the grader is configured:
+The CLI compatibility default remains `openmathinstruct`, but the production
+auction contract is mixed Math+Code. Configure the trainer explicitly:
 
 ```bash
 RELIQUARY_ENVIRONMENTS=openmathinstruct,opencodeinstruct
@@ -116,9 +116,22 @@ RELIQUARY_ENVIRONMENTS=openmathinstruct,opencodeinstruct
 Both validator and miner load the same public curated dataset
 (`R0mAI/opencodeinstruct-curated`, pinned by default) lazily — the
 `structured_cases` ship with it, and the validator runs the grader and
-recomputes the code reward authoritatively. Do not enable `opencodeinstruct` on
-the trainer until the Docker image contains the grader rootfs, `runsc` starts
+recomputes the code reward authoritatively. Auction, deferred proof, resource
+caps, and operator caps apply independently to both environments. Do not start
+the mixed trainer until the image contains the grader rootfs, `runsc` starts
 successfully, and the loopback grader canaries pass.
+
+Training recovery also requires the complete pinned policy contract:
+
+```bash
+RELIQUARY_KL_BASE_MODEL=Qwen/Qwen3.5-2B@15852e8c16360a2fea060d615a32b45270f8a8fc
+RELIQUARY_KL_BETA=0.01
+RELIQUARY_LEARNING_RATE=0.000003
+RELIQUARY_RECOMPUTE_PI_OLD_FROM_VERIFY=true
+RELIQUARY_GRAD_NORM_SKIP_THRESHOLD=50
+RELIQUARY_PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD=0.1
+RELIQUARY_SHAPE_PENALTY=0
+```
 
 ### Cooldown on training restart
 
@@ -150,14 +163,17 @@ For the weight-only mode, the only signal that things are working is the log lin
 
 ### `/verdicts/{hotkey}` — what to expect
 
-The trainer exposes the last `VERDICT_CAP_PER_HOTKEY = 200` per-submission verdicts per miner hotkey via a small in-memory ring buffer. Every code path that decides accept/reject records to it:
+The trainer exposes the last `VERDICT_CAP_PER_HOTKEY = 200` lifecycle verdicts per miner hotkey via a small in-memory ring buffer:
 
 - HTTP-level early rejects (`rate_limited`, `window_not_active`, `batch_filled`)
-- Worker-level rejects after GRAIL (`grail_fail`, `wrong_randomness`, `logprob_mismatch`, `out_of_zone`, `hash_duplicate`, `bad_termination`, etc.)
+- Worker admission outcomes after bounded checks and reward grading
+- Auction-seal outcomes with final rank, deferred-proof result, selection, and reward flags
 - Worker drains on window swap (`worker_dropped`)
 - Inline accepts under TestClient (`accepted`)
 
-This is the cheapest way for operators to debug "why is miner X not making the batch" without grep'ing the validator's own logs or pulling R2 archives. Public read by design — same trust model as the R2 archive. Memory cost is ~2.5 MB for a 50-hotkey subnet.
+An admission `accepted` is not a win. The final auction record is the one with
+non-null `selected_for_batch` and `rewarded`. Public read is intentional and
+uses the same trust model as the R2 archive.
 
 For submit lifecycle fields, drand timing interpretation, `batch_filled`
 reasons, and final selected vs rewarded semantics, see
@@ -187,9 +203,18 @@ These are the live thresholds the trainer applies on every submission. The same 
 
 | Constant | Value | Effect |
 |---|---|---|
-| `B_BATCH` | 8 | Number of valid distinct-prompt submissions targeted per active environment |
+| `B_BATCH` | 8 | Maximum proven winners and uniform reward slots per active environment |
 | `M_ROLLOUTS` | 8 | Required rollout count per submission |
 | `T_PROTO` | 0.9 | Protocol-fixed sampling temperature (validator's recompute uses this) |
+| `FORCED_SEED_PROTOCOL_VERSION` | 2 | Mandatory hotkey-free forced stream while enforcement is active |
+| `WINDOW_COLLECTION_SECONDS` | 300 | Fixed collection interval for both Math and Code auction populations |
+| `MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW` | 96 | Started grading/proof ceiling per environment/window |
+| `MAX_PROOF_WALL_SECONDS` | 240 | Seal-time proof wall-clock ceiling per environment |
+| `MAX_AUCTION_SLOTS_PER_OPERATOR` | 2 | Maximum winners per coldkey/operator in each environment |
+| `MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW` | 4 | Operator-wide seal GPU debt limit per environment |
+| `MAX_SUBMISSION_PAYLOAD_BYTES` | 64 MiB | Per-request parsed JSON payload limit |
+| `MAX_PENDING_SUBMISSION_BYTES_PER_HOTKEY` | 128 MiB | Retained pending payload cap per hotkey/environment |
+| `MAX_PENDING_SUBMISSION_BYTES_PER_ENV` | 512 MiB | Retained pending payload cap per environment |
 | `SIGMA_MIN` (steady) | 0.43 | Zone filter: groups below this are rejected `OUT_OF_ZONE` (binary equivalent: k ∈ [2, 6] for M=8) |
 | `BOOTSTRAP_SIGMA_MIN` | 0.33 | Relaxed zone filter during first `BOOTSTRAP_WINDOWS = 100` windows (k ∈ [1, 7]) |
 | `BATCH_PROMPT_COOLDOWN_WINDOWS` | 1,000,000 | A winning prompt is effectively one-shot in the OpenMath phase |
@@ -204,10 +229,8 @@ These are the live thresholds the trainer applies on every submission. The same 
 | `TRAINING_QUARANTINE_MAX_SINGLE_COMPLETION_LENGTH` | 7000 | Rollout length that counts as extreme-length telemetry |
 | `TRAINING_QUARANTINE_EXTREME_LENGTH_MIN_ROLLOUTS` | 4 | Minimum long/cap rollouts before length alone can quarantine a window |
 | `TRAINING_QUARANTINE_EXTREME_LENGTH_MIN_GROUPS` | 3 | Minimum groups with long/cap rollouts before length alone can quarantine a window |
-| `SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS` | 4 | Partial-seal threshold for sparse windows with some valid work |
-| `SPARSE_VALID_IDLE_SEAL_SECONDS` | 180 | If at least 4 distinct prompts are valid and no new valid prompt arrives for this long, force-seal partial |
-| `SPARSE_VALID_MAX_WINDOW_SECONDS` | 600 | Force-seal sparse or zero-valid windows once queue/proofs are drained |
-| `WINDOW_TIMEOUT_SECONDS` | 7200 | Safety-net auto-seal if fewer than B submissions arrive in 2 h |
+| `MAX_SEAL_QUEUE_DRAIN_SECONDS` | 60 | Deadline work-drain bound before the auction population freezes |
+| `SPARSE_VALID_*` / `WINDOW_TIMEOUT_SECONDS` | legacy fallback | Used when the auction kill switch restores count/idle-based selection |
 | `EMA_ALPHA` | ≈0.0274 | Weight-update smoothing (`2/(72+1)` — ~25-window half-life) |
 | `REJECTED_LIST_CAP_PER_HOTKEY` | 5 | Max rejected samples retained per hotkey per window archive |
 
@@ -234,28 +257,33 @@ windows, reset reason, and whether a step was attempted.
 Every `/submit` flows through this sequence on the validator. The first rejection short-circuits the rest.
 
 ```
-HTTP enqueue          worker dequeue → verify
-─────────────         ─────────────────────────
-WINDOW_NOT_ACTIVE? → reject     →    WINDOW_MISMATCH? → reject
-envelope/env/root-shadow checks      WRONG_CHECKPOINT? → reject
-registration/rate/drand checks
-queue submission                     BAD_PROMPT_IDX / PROMPT_IN_COOLDOWN? → reject
-return reason="submitted"            PROMPT_FULL? → reject
-                                     BAD_SCHEMA / TOKENS_MISMATCH / BAD_TOKENS? → reject
-                                     PROMPT_MISMATCH / HASH_DUPLICATE? → reject
-                                     validator verifies claimed rollout rewards
-                                     REWARD_MISMATCH / OUT_OF_ZONE? → reject
-                                     BAD_SIGNATURE / WRONG_RANDOMNESS? → reject
-                                     GRAIL_FAIL? → reject
-                                     BAD_TERMINATION / LOGPROB_MISMATCH? → reject
-                                     DISTRIBUTION_SUSPICIOUS? → reject
-                                     ─────────────────
-                                     → batch[] (selected representative rows)
-                                     → runners_up[] (valid pool, not selected)
+HTTP/pre-queue                 environment worker
+--------------                 ------------------
+window/checkpoint/protocol     prompt/token/randomness/signature checks
+envelope/registration          validator-authoritative reward grading
+operator logical claim         zone and cheap authenticity guards
+rate/queue/payload bounds      -> pending auction pool
+-> reason="submitted"          -> first /verdicts lifecycle record
 
-window seals → R2 archive published at reliquary/dataset/window-<N>.json.gz
-             → /set_weights at next epoch boundary
+300 s deadline
+-> stop new admission and drain pre-deadline work (max 60 s)
+-> freeze Math and Code populations independently
+-> fetch post-deadline drand salt
+-> rank by difficulty, drand round, operator/prompt tie hash
+-> prove top-down under attempt/wall/operator-debt bounds
+-> at most 8 distinct prompts and 2 slots/operator/environment
+-> final /verdicts lifecycle records
+-> R2 archive + rewards + balanced training accumulator
 ```
+
+Code grader candidate failures produce legitimate zero rewards. Grader
+infrastructure failures are counted separately: retryable outages return
+`WORKER_DROPPED` and refund quota, while ambiguous worker crashes fail closed as
+`REWARD_MISMATCH` and consume the logical claim.
+
+R2's canonical mechanism payload is `difficulty_auction`; the historical
+`difficulty_auction_shadow` field is retained as an identical compatibility
+alias. In active mode its `mode` is `production`, not a counterfactual shadow.
 
 The wire-v1 root check is validator-only and defaults to shadow mode
 (`RELIQUARY_LEGACY_MERKLE_ROOT_ENFORCE=false`). It recomputes the exact root
@@ -273,11 +301,13 @@ checks, five hotkeys, 24 windows, both active environments, zero compute
 errors, and zero unexplained mismatches. `/health` exposes the cumulative
 counts and the active enforcement flag.
 
-`/health` also reports the forced-seed ratio/CDF runtime policy and persistent
-archive-queue state. A nonzero `archive_queue_depth` is safe during a transient
-R2 failure, but a growing depth or old `archive_queue_oldest_age_seconds`
-requires operator attention. `archive_last_uploaded_window` is the direct
-confirmation that a recent archive left the local retry queue.
+`/health` also reports the auction policy, per-environment queue/proof state,
+operator mapping, forced-seed ratio/CDF policy, Code grader failures, and the
+persistent archive queue. A nonzero `archive_queue_depth` is safe during a
+transient R2 failure, but growing depth or old
+`archive_queue_oldest_age_seconds` requires attention.
+`archive_last_uploaded_window` confirms that a recent archive left the retry
+queue.
 
 Prompt Parquet range reads prefer exact full files already present in the
 persistent Hugging Face cache. If the range backend fails, the validator may
@@ -336,7 +366,9 @@ public checkpoint. The archive field is:
 training_quarantine = {quarantined, reasons, metrics}
 ```
 
-Submissions that get HTTP-accepted but reach the worker after the window seals are **dropped late**. They appear in container logs (`INFO | dropping late submission prompt=N hotkey=...`) but not in any R2-archive bucket. The public dashboard surfaces aggregate queue pressure (batch saturation %) as a proxy; per-hotkey late-drop counts are intentionally not exposed publicly.
+Submissions that get HTTP-accepted but reach the worker after population freeze
+are dropped as `WORKER_DROPPED`. They receive a `/verdicts` record, and aggregate
+per-hotkey/reason late-drop counts are persisted in the window archive.
 
 ---
 
