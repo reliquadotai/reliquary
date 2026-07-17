@@ -8,7 +8,12 @@ from typing import Any
 
 import pytest
 
-from reliquary.constants import B_BATCH, CHALLENGE_K, M_ROLLOUTS
+from reliquary.constants import (
+    B_BATCH,
+    CHALLENGE_K,
+    FORCED_SEED_PROTOCOL_VERSION,
+    M_ROLLOUTS,
+)
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     RejectReason,
@@ -713,6 +718,7 @@ def _request_v21(prompt_idx=42, window_start=500,
         window_start=window_start,
         merkle_root="00" * 32, rollouts=rollouts,
         checkpoint_hash=checkpoint_hash,
+        protocol_version=FORCED_SEED_PROTOCOL_VERSION,
     )
 
 
@@ -732,6 +738,20 @@ def test_accept_matching_checkpoint():
     req = _request_v21(checkpoint_hash="sha256:current")
     resp = b.accept_submission(req)
     assert resp.accepted is True
+
+
+def test_reject_old_forced_seed_protocol_before_auction_admission():
+    b = _make_batcher()
+    b.current_checkpoint_hash = "sha256:current"
+    req = _request_v21(checkpoint_hash="sha256:current")
+    req.protocol_version = FORCED_SEED_PROTOCOL_VERSION - 1
+
+    resp = b.accept_submission(req)
+
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.SEED_MISMATCH
+    assert b.pending_count == 0
+    assert b.proof_grading_attempts == 0
 
 
 def test_empty_checkpoint_hash_disables_gate():

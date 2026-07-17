@@ -53,6 +53,7 @@ from reliquary.constants import (
     FORCED_SEED_CDF_BOUNDARY_EPSILON,
     FORCED_SEED_CDF_ENFORCE,
     FORCED_SEED_ENFORCE,
+    FORCED_SEED_PROTOCOL_VERSION,
     LEGACY_MERKLE_ROOT_ENFORCE,
 )
 from reliquary.environment.base import Environment
@@ -1387,6 +1388,15 @@ class GrpoWindowBatcher:
         # (pre-first-publish or test convenience).
         if self.current_checkpoint_hash and request.checkpoint_hash != self.current_checkpoint_hash:
             return reject(RejectReason.WRONG_CHECKPOINT, "checkpoint")
+        if (
+            FORCED_SEED_ENFORCE
+            and self.current_checkpoint_hash
+            and request.protocol_version != FORCED_SEED_PROTOCOL_VERSION
+        ):
+            return reject(
+                RejectReason.SEED_MISMATCH,
+                "forced_seed_protocol",
+            )
         # NOTE: drand_round is intentionally NOT re-checked here. It's a
         # wall-clock timing gate decided once at HTTP arrival (see
         # ``server.py``'s cheap-reject path → ``validate_drand_round`` with

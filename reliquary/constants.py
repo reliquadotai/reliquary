@@ -915,7 +915,9 @@ FORCED_SEED_ENFORCE = _os.environ.get(
 # track adoption in the shadow window before arming enforcement.
 # v2 drops the hotkey from the forced seed (u_at) to kill multi-hotkey variance
 # farming — a coordinated miner+validator change, so it bumps the version.
-# DEPLOY NOTE: during the adoption window the validator must compute the u-stream
-# per submission's advertised protocol_version (v1 = hotkey-in-seed, v2 =
-# hotkey-free); this branch ships the v2 derivation only.
+# This runtime implements only the v2 stream. With a checkpoint pinned and
+# forced-seed enforcement enabled, the validator rejects every other advertised
+# version before quota, reward grading, or proof admission. Deploy miners and
+# validator as a coordinated hard cutover; FORCED_SEED_ENFORCE=false is the
+# emergency compatibility switch.
 FORCED_SEED_PROTOCOL_VERSION = 2

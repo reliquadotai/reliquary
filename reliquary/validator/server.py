@@ -44,6 +44,7 @@ from reliquary.constants import (
     FORCED_SEED_CDF_ENFORCE,
     FORCED_SEED_CONSISTENCY_FLOOR,
     FORCED_SEED_ENFORCE,
+    FORCED_SEED_PROTOCOL_VERSION,
     FORCED_SEED_ROLLOUT_FLOOR,
     LEGACY_MERKLE_ROOT_ENFORCE,
     MAX_AUCTION_SLOTS_PER_OPERATOR,
@@ -1865,6 +1866,18 @@ class ValidatorServer:
                     accepted_into_pool=False,
                 )
                 raise HTTPException(status_code=409, detail="window_mismatch")
+
+            if (
+                FORCED_SEED_ENFORCE
+                and bool(getattr(batcher, "current_checkpoint_hash", ""))
+                and request.protocol_version != FORCED_SEED_PROTOCOL_VERSION
+            ):
+                return _reject_before_quota(
+                    RejectReason.SEED_MISMATCH,
+                    reject_stage="forced_seed_protocol",
+                    submitted_protocol_version=request.protocol_version,
+                    required_protocol_version=FORCED_SEED_PROTOCOL_VERSION,
+                )
 
             legacy_merkle_status = self._observe_legacy_merkle(
                 request,

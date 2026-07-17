@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from reliquary.constants import (
     CHALLENGE_K,
+    FORCED_SEED_PROTOCOL_VERSION,
     M_ROLLOUTS,
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
 )
@@ -163,7 +164,7 @@ def _request(
         else "00" * 32
     )
     drand_round = 0
-    protocol_version = 1
+    protocol_version = FORCED_SEED_PROTOCOL_VERSION
     nonce = os.urandom(8).hex()
     sig = sign_envelope(
         wallet=_TestWallet,
@@ -210,7 +211,9 @@ def test_legacy_merkle_shadow_accepts_mismatch_and_exposes_telemetry():
     assert health.legacy_merkle_errors == 0
     assert health.legacy_merkle_distinct_hotkeys == 1
     assert health.legacy_merkle_environments == [FakeEnv.name]
-    assert health.legacy_merkle_protocol_versions == {"1": 1}
+    assert health.legacy_merkle_protocol_versions == {
+        str(FORCED_SEED_PROTOCOL_VERSION): 1
+    }
     assert health.legacy_merkle_last_mismatch_ts is not None
 
 
@@ -230,6 +233,31 @@ def test_legacy_merkle_shadow_records_current_miner_match():
     assert health.legacy_merkle_matches == 1
     assert health.legacy_merkle_mismatches == 0
     assert health.legacy_merkle_last_mismatch_ts is None
+
+
+def test_old_forced_seed_protocol_is_rejected_before_quota_or_proof():
+    from reliquary.protocol.submission import WindowState
+
+    server = ValidatorServer()
+    batcher = _batcher(window_start=500)
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    request = _request()
+    request.protocol_version = FORCED_SEED_PROTOCOL_VERSION - 1
+
+    response = TestClient(server.app).post(
+        "/submit",
+        json=request.model_dump(mode="json"),
+    )
+
+    assert response.json() == {
+        "accepted": False,
+        "reason": RejectReason.SEED_MISMATCH.value,
+    }
+    assert server._per_window_counts == {}
+    assert server.submit_queue_depth == 0
+    assert batcher.proof_admission_count == 0
+    assert batcher.proof_grading_attempts == 0
 
 
 def test_legacy_merkle_enforcement_rejects_before_quota(monkeypatch):
