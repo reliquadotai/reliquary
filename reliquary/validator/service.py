@@ -917,9 +917,7 @@ class ValidationService:
             0.0,
             float(REGISTERED_HOTKEY_CACHE_TTL_SECONDS) / 2.0,
         )
-        sleep_seconds = poll_seconds
         while True:
-            await asyncio.sleep(sleep_seconds)
             age = self.server.registration_cache_age()
             if age is None or age >= refresh_threshold:
                 refreshed = await self._refresh_registered_hotkeys(
@@ -932,9 +930,18 @@ class ValidationService:
                         "age=%.1fs",
                         age if age is not None else -1.0,
                     )
-                    sleep_seconds = retry_seconds
+                    await asyncio.sleep(retry_seconds)
                     continue
-            sleep_seconds = poll_seconds
+                await asyncio.sleep(poll_seconds)
+                continue
+
+            # Startup performs the initial chain read before model and prompt
+            # bootstrap. The worker may therefore begin with a nonzero cache
+            # age; sleep to the actual deadline so that bootstrap time cannot
+            # consume the retry runway in whole poll-sized chunks.
+            await asyncio.sleep(
+                min(poll_seconds, refresh_threshold - age)
+            )
 
     async def _refresh_registered_hotkeys(
         self,
