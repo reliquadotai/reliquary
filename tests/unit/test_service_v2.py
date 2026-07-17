@@ -96,10 +96,20 @@ async def test_registration_cache_maintainer_retries_before_ttl(monkeypatch):
     monkeypatch.setattr(
         service_module, "REGISTERED_HOTKEY_REFRESH_MIN_INTERVAL_SECONDS", 0.02,
     )
-    svc.server.set_registered_hotkeys(
-        {"hk-a"},
-        refreshed_at=time.time() - 0.16,
-        operator_by_hotkey={"hk-a": "operator-a"},
+    elapsed = 0.0
+    base_age = 0.10
+    real_sleep = asyncio.sleep
+
+    async def advance_time(seconds: float) -> None:
+        nonlocal elapsed
+        elapsed += seconds
+        await real_sleep(0)
+
+    monkeypatch.setattr(service_module.asyncio, "sleep", advance_time)
+    monkeypatch.setattr(
+        svc.server,
+        "registration_cache_age",
+        lambda: base_age + elapsed,
     )
     call_ages: list[float] = []
     recovered = asyncio.Event()
@@ -111,11 +121,8 @@ async def test_registration_cache_maintainer_retries_before_ttl(monkeypatch):
         call_ages.append(age)
         if len(call_ages) == 1:
             return False
-        svc.server.set_registered_hotkeys(
-            {"hk-a"},
-            operator_by_hotkey={"hk-a": "operator-a"},
-        )
         recovered.set()
+        await real_sleep(0)
         return True
 
     monkeypatch.setattr(svc, "_refresh_registered_hotkeys", refresh)
@@ -129,7 +136,8 @@ async def test_registration_cache_maintainer_retries_before_ttl(monkeypatch):
 
     assert len(call_ages) == 2
     assert all(age < ttl_seconds for age in call_ages)
-    assert call_ages[1] - call_ages[0] < 0.06
+    assert call_ages[0] < 0.20
+    assert call_ages[1] - call_ages[0] == 0.02
 
 
 @pytest.mark.asyncio
