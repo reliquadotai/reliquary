@@ -468,10 +468,9 @@ class GrpoWindowBatcher:
         self._wall_clock = wall_clock_fn or time.time
         self.drand_round_check_enabled = drand_round_check_enabled
         # How many drand rounds backward of the validator's current round
-        # the batcher accepts. Defaults to ``DRAND_ROUND_BACKWARD_TOLERANCE``
-        # from constants (1 round = 3 s grace) so prod stays consistent;
-        # tests that want to pin zero-tolerance v2.3 behaviour can pass
-        # ``drand_round_backward_tolerance=0`` explicitly.
+        # the batcher accepts. Defaults to the operator-configured
+        # ``DRAND_ROUND_BACKWARD_TOLERANCE`` (zero in production); tests may
+        # explicitly widen or pin the tolerance for the case under test.
         self.drand_round_backward_tolerance = (
             drand_round_backward_tolerance
             if drand_round_backward_tolerance is not None
@@ -1363,21 +1362,15 @@ class GrpoWindowBatcher:
         definition), so claiming a future round is unrecoverable cheating
         and always rejected as FUTURE_ROUND.
 
-        Backward direction allows up to
-        ``self.drand_round_backward_tolerance`` rounds (default 1 = 3 s).
-        This absorbs:
-          * HTTP RTT + queue/scheduling jitter that pushes a POST across
-            a drand boundary mid-flight (miner fires at t=2.9 s of round
-            R, validator receives at t=3.0 s of round R+1)
-          * Small wall-clock skew between miner and validator. v2.3's
-            original zero-tolerance was correct in spec but turned every
-            inter-round POST into a STALE_ROUND in prod.
-        The security cost is bounded: an attacker can antedate by at most
-        ``tolerance`` rounds (3 s × tolerance) of chronological priority,
-        which is uniform across honest and malicious miners alike.
-        Combined with arrival-time stamping, the backward tolerance can
-        now be tightened safely (the wide default existed to absorb loop
-        stalls — that's no longer needed on the HTTP path).
+        Backward direction allows only the configured
+        ``self.drand_round_backward_tolerance``. Production sets this to
+        zero: miners use a client-side boundary guard rather than claiming an
+        earlier round after it has rolled. An operator who explicitly widens
+        the tolerance may absorb cross-boundary HTTP RTT or clock skew, but
+        accepts the corresponding economic cost: a submitter can antedate by
+        up to ``tolerance`` rounds (3 s × tolerance) of chronological
+        priority. Arrival-time stamping removes validator queue latency from
+        that tradeoff; it does not make a positive backward tolerance free.
 
         Public so the HTTP /submit handler can run it pre-queue and
         short-circuit the rejection without waiting on the worker.
