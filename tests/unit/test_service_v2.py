@@ -141,6 +141,59 @@ async def test_registration_cache_maintainer_retries_before_ttl(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_registration_cache_maintainer_targets_deadline_after_bootstrap(
+    monkeypatch,
+):
+    """Late task startup must not round the first refresh up to a full poll."""
+    from reliquary.validator import service as service_module
+
+    svc = _build_late_drop_service()
+    ttl_seconds = 0.30
+    monkeypatch.setattr(
+        service_module, "REGISTERED_HOTKEY_CACHE_TTL_SECONDS", ttl_seconds,
+    )
+    monkeypatch.setattr(
+        service_module, "REGISTERED_HOTKEY_REFRESH_MIN_INTERVAL_SECONDS", 0.02,
+    )
+    elapsed = 0.0
+    base_age = 0.11
+    real_sleep = asyncio.sleep
+
+    async def advance_time(seconds: float) -> None:
+        nonlocal elapsed
+        elapsed += seconds
+        await real_sleep(0)
+
+    monkeypatch.setattr(service_module.asyncio, "sleep", advance_time)
+    monkeypatch.setattr(
+        svc.server,
+        "registration_cache_age",
+        lambda: base_age + elapsed,
+    )
+    refreshed = asyncio.Event()
+    call_ages: list[float] = []
+
+    async def refresh(**kwargs):
+        del kwargs
+        call_ages.append(svc.server.registration_cache_age())
+        refreshed.set()
+        await real_sleep(0)
+        return True
+
+    monkeypatch.setattr(svc, "_refresh_registered_hotkeys", refresh)
+    task = asyncio.create_task(svc._maintain_registration_cache())
+    try:
+        await asyncio.wait_for(refreshed.wait(), timeout=1.0)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert len(call_ages) == 1
+    assert abs(call_ages[0] - (ttl_seconds / 2.0)) < 1e-9
+
+
+@pytest.mark.asyncio
 async def test_registration_refresh_uses_fresh_metagraph_and_updates_server():
     svc = _build_late_drop_service()
     subtensor = object()
