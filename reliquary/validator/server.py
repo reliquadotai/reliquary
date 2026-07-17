@@ -548,6 +548,14 @@ class _Health(BaseModel):
     registration_cache_age_seconds: float | None = None
     registration_cache_stale: bool | None = None
     registration_cache_usable: bool | None = None
+    registration_cache_refresh_attempts_total: int = 0
+    registration_cache_refresh_successes_total: int = 0
+    registration_cache_refresh_failures_total: int = 0
+    registration_cache_last_refresh_attempt_ts: float | None = None
+    registration_cache_last_refresh_success_ts: float | None = None
+    registration_cache_last_refresh_failure_ts: float | None = None
+    registration_cache_last_refresh_failure_type: str | None = None
+    registration_cache_last_refresh_reason: str | None = None
     training_accumulator_checkpoint_revision: str | None = None
     training_accumulator_targets: dict[str, int] = Field(default_factory=dict)
     training_accumulator_counts: dict[str, int] = Field(default_factory=dict)
@@ -621,6 +629,14 @@ class ValidatorServer:
         ) = None
         self._registration_refresh_lock = asyncio.Lock()
         self._last_registration_refresh_attempt = 0.0
+        self._registration_cache_refresh_attempts_total = 0
+        self._registration_cache_refresh_successes_total = 0
+        self._registration_cache_refresh_failures_total = 0
+        self._registration_cache_last_refresh_attempt_ts: float | None = None
+        self._registration_cache_last_refresh_success_ts: float | None = None
+        self._registration_cache_last_refresh_failure_ts: float | None = None
+        self._registration_cache_last_refresh_failure_type: str | None = None
+        self._registration_cache_last_refresh_reason: str | None = None
         self._training_accumulator_state: dict[str, Any] = {}
         self._training_publish_state: dict[str, Any] = {}
         self._training_kl_reference_state: dict[str, Any] = {}
@@ -827,6 +843,31 @@ class ValidatorServer:
             return None
         current = time.time() if now is None else float(now)
         return max(0.0, current - self._registration_refreshed_at)
+
+    def record_registration_cache_refresh(
+        self,
+        *,
+        success: bool,
+        reason: str,
+        failure_type: str | None = None,
+    ) -> None:
+        """Record a secret-free result for a real metagraph refresh attempt."""
+        now = time.time()
+        normalized_reason = str(reason).strip() or "unspecified"
+        self._registration_cache_refresh_attempts_total += 1
+        self._registration_cache_last_refresh_attempt_ts = now
+        self._registration_cache_last_refresh_reason = normalized_reason
+        if success:
+            self._registration_cache_refresh_successes_total += 1
+            self._registration_cache_last_refresh_success_ts = now
+            self._registration_cache_last_refresh_failure_type = None
+            return
+
+        self._registration_cache_refresh_failures_total += 1
+        self._registration_cache_last_refresh_failure_ts = now
+        self._registration_cache_last_refresh_failure_type = (
+            str(failure_type).strip() if failure_type else "unknown"
+        )
 
     async def _registration_reject_reason(
         self,
@@ -1464,6 +1505,30 @@ class ValidatorServer:
             registration_cache_age_seconds=registration_age,
             registration_cache_stale=registration_cache_stale,
             registration_cache_usable=registration_cache_usable,
+            registration_cache_refresh_attempts_total=(
+                self._registration_cache_refresh_attempts_total
+            ),
+            registration_cache_refresh_successes_total=(
+                self._registration_cache_refresh_successes_total
+            ),
+            registration_cache_refresh_failures_total=(
+                self._registration_cache_refresh_failures_total
+            ),
+            registration_cache_last_refresh_attempt_ts=(
+                self._registration_cache_last_refresh_attempt_ts
+            ),
+            registration_cache_last_refresh_success_ts=(
+                self._registration_cache_last_refresh_success_ts
+            ),
+            registration_cache_last_refresh_failure_ts=(
+                self._registration_cache_last_refresh_failure_ts
+            ),
+            registration_cache_last_refresh_failure_type=(
+                self._registration_cache_last_refresh_failure_type
+            ),
+            registration_cache_last_refresh_reason=(
+                self._registration_cache_last_refresh_reason
+            ),
             training_accumulator_checkpoint_revision=accumulator.get(
                 "checkpoint_revision"
             ),
