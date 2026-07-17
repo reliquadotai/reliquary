@@ -1,7 +1,9 @@
 """End-to-end: service creates GrpoWindowBatcher per window, seals at window
 close, computes weights v2-flavoured."""
 
+import asyncio
 from dataclasses import dataclass
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -43,6 +45,42 @@ def _build_late_drop_service():
         wallet=_LateDropFakeWallet(), model=MagicMock(), tokenizer=fake_tok,
         env=_LateDropFakeEnv(), netuid=99,
     )
+
+
+@pytest.mark.asyncio
+async def test_registration_cache_maintainer_refreshes_before_ttl(monkeypatch):
+    from reliquary.validator import service as service_module
+
+    svc = _build_late_drop_service()
+    monkeypatch.setattr(
+        service_module, "REGISTERED_HOTKEY_CACHE_TTL_SECONDS", 0.05,
+    )
+    monkeypatch.setattr(
+        service_module, "REGISTERED_HOTKEY_REFRESH_MIN_INTERVAL_SECONDS", 0.01,
+    )
+    svc.server.set_registered_hotkeys(
+        {"hk-a"},
+        refreshed_at=time.time() - 0.04,
+        operator_by_hotkey={"hk-a": "operator-a"},
+    )
+    refreshed = asyncio.Event()
+    refresh_kwargs: dict[str, float | bool] = {}
+
+    async def refresh(**kwargs):
+        refresh_kwargs.update(kwargs)
+        refreshed.set()
+        return True
+
+    monkeypatch.setattr(svc, "_refresh_registered_hotkeys", refresh)
+    task = asyncio.create_task(svc._maintain_registration_cache())
+    try:
+        await asyncio.wait_for(refreshed.wait(), timeout=0.5)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert refresh_kwargs["max_cache_age_seconds"] < 0.05
 
 
 @pytest.mark.asyncio
