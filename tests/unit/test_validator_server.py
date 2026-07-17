@@ -639,6 +639,28 @@ def test_health_reports_registration_gate_state():
     ]
 
 
+def test_health_preserves_registration_refresh_failure_after_recovery():
+    server = ValidatorServer()
+    server.record_registration_cache_refresh(
+        success=False,
+        reason="proactive",
+        failure_type="TimeoutError",
+    )
+    server.record_registration_cache_refresh(
+        success=True,
+        reason="window_boundary",
+    )
+
+    health = TestClient(server.app).get("/health").json()
+
+    assert health["registration_cache_refresh_attempts_total"] == 2
+    assert health["registration_cache_refresh_successes_total"] == 1
+    assert health["registration_cache_refresh_failures_total"] == 1
+    assert health["registration_cache_last_refresh_failure_type"] == "TimeoutError"
+    assert health["registration_cache_last_refresh_failure_reason"] == "proactive"
+    assert health["registration_cache_last_refresh_reason"] == "window_boundary"
+
+
 def test_health_degrades_before_registration_cache_becomes_unusable():
     async def refresh():
         return False

@@ -213,6 +213,7 @@ async def test_registration_refresh_failure_preserves_last_known_good():
     assert health.registration_cache_refresh_successes_total == 0
     assert health.registration_cache_refresh_failures_total == 1
     assert health.registration_cache_last_refresh_failure_type == "ConnectionError"
+    assert health.registration_cache_last_refresh_failure_reason == "unspecified"
     close_subtensor.assert_awaited_once_with(None)
 
 
