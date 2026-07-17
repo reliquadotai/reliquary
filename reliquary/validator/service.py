@@ -984,32 +984,18 @@ class ValidationService:
         async def _load() -> tuple[set[str], dict[str, str]]:
             nonlocal subtensor
             subtensor = await chain.get_subtensor()
-            metagraph = await chain.get_metagraph(subtensor, self.netuid)
-            hotkey_values = getattr(metagraph, "hotkeys", None)
-            raw_hotkeys = list(hotkey_values) if hotkey_values is not None else []
-            coldkey_values = getattr(metagraph, "coldkeys", None)
-            try:
-                raw_coldkeys = (
-                    list(coldkey_values) if coldkey_values is not None else []
-                )
-            except TypeError:
-                # Registration admission may use the hotkey list, but production
-                # auction claims fail closed when ownership is unavailable. A
-                # hotkey is never substituted for the missing operator identity.
-                raw_coldkeys = []
-            hotkeys = {
-                hotkey
-                for value in raw_hotkeys
-                if isinstance(value, str) and (hotkey := value.strip())
-            }
+            neurons = await chain.get_neurons_lite(subtensor, self.netuid)
+            hotkeys: set[str] = set()
             operators: dict[str, str] = {}
             ambiguous_hotkeys: set[str] = set()
-            for index, value in enumerate(raw_hotkeys):
-                if not isinstance(value, str) or not (hotkey := value.strip()):
+            for neuron in neurons:
+                raw_hotkey = getattr(neuron, "hotkey", None)
+                if not isinstance(raw_hotkey, str) or not (
+                    hotkey := raw_hotkey.strip()
+                ):
                     continue
-                if index >= len(raw_coldkeys):
-                    continue
-                raw_operator = raw_coldkeys[index]
+                hotkeys.add(hotkey)
+                raw_operator = getattr(neuron, "coldkey", None)
                 if not isinstance(raw_operator, str):
                     continue
                 operator = raw_operator.strip()
@@ -1030,7 +1016,7 @@ class ValidationService:
             )
             if not hotkeys:
                 raise RuntimeError(
-                    "metagraph refresh returned no registered hotkeys"
+                    "lite neuron refresh returned no registered hotkeys"
                 )
             self.server.set_registered_hotkeys(
                 hotkeys,
