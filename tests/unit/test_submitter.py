@@ -106,6 +106,7 @@ def _v2_request():
         merkle_root="00" * 32,
         rollouts=_rollouts(),
         checkpoint_hash="sha256:test",
+        protocol_version=2,
     )
 
 

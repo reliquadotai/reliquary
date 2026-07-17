@@ -33,6 +33,7 @@ def _request(runtime: RuntimeFingerprint, nonce: str) -> BatchSubmissionRequest:
         merkle_root="00" * 32,
         rollouts=[rollout.model_copy(deep=True) for _ in range(8)],
         checkpoint_hash="sha256:test",
+        protocol_version=2,
         nonce=nonce,
         runtime_fingerprint=runtime,
     )

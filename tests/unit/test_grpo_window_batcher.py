@@ -116,6 +116,7 @@ def _request(
         merkle_root="00" * 32,
         rollouts=rollouts,
         checkpoint_hash="sha256:test",
+        protocol_version=2,
     )
 
 
@@ -536,6 +537,7 @@ def test_reject_reward_mismatch():
         merkle_root="00" * 32,
         rollouts=rollouts,
         checkpoint_hash="sha256:test",
+        protocol_version=2,
     )
     resp = b.accept_submission(req)
     assert resp.accepted is False
@@ -851,6 +853,7 @@ def _request_with_prompt_tokens(
         window_start=500,
         merkle_root="00" * 32, rollouts=rollouts,
         checkpoint_hash="",  # gate disabled for these tests
+        protocol_version=2,
     )
 
 
@@ -1706,6 +1709,7 @@ def test_hash_dup_intra_submission_collision_rejects():
     req = BatchSubmissionRequest(
         miner_hotkey="hk", prompt_idx=42, window_start=500,
         merkle_root="00" * 32, rollouts=rollouts, checkpoint_hash="sha256:test",
+        protocol_version=2,
     )
 
     b = _make_batcher(hash_set=hs)

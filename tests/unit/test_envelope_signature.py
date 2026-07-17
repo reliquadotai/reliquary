@@ -171,6 +171,7 @@ def _signed_request(
         rollouts=rollouts,
         checkpoint_hash=checkpoint_hash,
         drand_round=drand_round,
+        protocol_version=2,
         nonce=nonce,
         envelope_signature=sig,
     )

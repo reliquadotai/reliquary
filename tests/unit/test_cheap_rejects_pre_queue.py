@@ -3,9 +3,8 @@
 Every reject reason that depends only on O(1) batcher state must be
 returned synchronously by the HTTP handler, BEFORE the request hits the
 async worker queue. Without this, a STALE_ROUND or WRONG_CHECKPOINT
-submission has to wait in line behind ~5–25 s GRAIL forward passes of
-honest submissions ahead of it in the queue — minutes of latency on what
-should be a microsecond rejection.
+submission would otherwise wait behind reward grading and admission work that
+cannot change the outcome.
 
 These tests pin the contract: each reject reason returns synchronously
 on /submit, and the submit_queue is NOT populated (the worker never sees
@@ -53,6 +52,7 @@ def _submission(prompt_idx: int = 42, checkpoint_hash: str = "sha256:current",
         "rollouts": [{"tokens": list(range(36)), "reward": 1.0, "commit": commit, "env_name": "openmathinstruct"}] * 8,
         "checkpoint_hash": checkpoint_hash,
         "drand_round": drand_round,
+        "protocol_version": 2,
     }
 
 
