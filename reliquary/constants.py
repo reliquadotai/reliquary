@@ -239,6 +239,11 @@ MAX_PENDING_PROOF_QUEUE_DEPTH = 256
 # next window.
 MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW = 2
 
+# A coldkey may own many hotkeys, so a hotkey-only debt limit does not bound a
+# single operator's seal-time GPU denial of service. Applied independently per
+# environment after ownership is resolved from the window's metagraph snapshot.
+MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW = 4
+
 # Registered-hotkey admission cache. The validator refreshes the metagraph on
 # this cadence and once on a cache miss. A last-known-good snapshot may survive
 # a short chain outage, but admission fails closed after the grace period.

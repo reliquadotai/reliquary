@@ -31,6 +31,7 @@ from reliquary.constants import (
     DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR,
     MAX_AUCTION_SLOTS_PER_OPERATOR,
     MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW,
+    MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
     MIN_EOS_PROBABILITY,
     FORENSIC_SAMPLE_PER_WINDOW,
@@ -674,11 +675,13 @@ class GrpoWindowBatcher:
         self._pending_post_trigger_proof_reservations = 0
         self._post_trigger_proof_admission_count = 0
         self._expensive_proof_failures_by_hotkey: dict[str, int] = {}
+        self._expensive_proof_failures_by_operator: dict[str, int] = {}
         self.proof_wall_elapsed_seconds = 0.0
         self.proof_wall_exhausted = False
         self.forensic_proof_attempts = 0
         self.auction_operator_cap_skips = 0
         self.auction_operator_unmapped_skips = 0
+        self.auction_operator_proof_debt_skips = 0
         self.auction_candidates: list[dict[str, Any]] = []
         self._proof_wall_started_at: float | None = None
         self._seal_snapshot_started = False
@@ -920,6 +923,13 @@ class GrpoWindowBatcher:
 
     def proof_failure_debt(self, hotkey: str) -> int:
         return self._expensive_proof_failures_by_hotkey.get(hotkey, 0)
+
+    @property
+    def expensive_proof_failures_by_operator(self) -> dict[str, int]:
+        return dict(self._expensive_proof_failures_by_operator)
+
+    def operator_proof_failure_debt(self, operator: str) -> int:
+        return self._expensive_proof_failures_by_operator.get(operator, 0)
 
     @property
     def logical_group_reservation_count(self) -> int:
@@ -2715,9 +2725,9 @@ class GrpoWindowBatcher:
         claimed prompt are skipped. A fabricated squatter fails the proof, so it
         never locks a prompt — the honest submission behind it is promoted.
 
-        Bounds (spec §2.3): the per-hotkey failure skip
-        (``MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW``) caps a single
-        griefer, and a global attempt ceiling
+        Bounds (spec §2.3): per-hotkey and per-operator failure skips cap a
+        single identity even when one coldkey owns many hotkeys, and a global
+        attempt ceiling
         (``MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW``, the graded-pool bound) caps a
         multi-hotkey flood so proving can never exceed the graded pool. On
         exhaustion we log, stop, and advance with the shortfall (fewer than
@@ -2744,6 +2754,7 @@ class GrpoWindowBatcher:
         slots_by_operator: dict[str, int] = {}
         self.auction_operator_cap_skips = 0
         self.auction_operator_unmapped_skips = 0
+        self.auction_operator_proof_debt_skips = 0
         self.difficulty_auction_metadata_by_id = {}
         candidate_rows: list[dict[str, Any]] = []
         for rank, (pending_submission, score) in enumerate(ranked, start=1):
@@ -2795,6 +2806,13 @@ class GrpoWindowBatcher:
                 row["status"] = "operator_cap"
                 self.auction_operator_cap_skips += 1
                 continue
+            if (
+                self.operator_proof_failure_debt(operator)
+                >= MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW
+            ):
+                row["status"] = "operator_proof_debt"
+                self.auction_operator_proof_debt_skips += 1
+                continue
             # Global proof budget: proving cannot exceed the graded-pool ceiling
             # (v2 §2.3). This bounds a multi-hotkey fabricated flood that the
             # per-hotkey skip below cannot, since each fake hotkey pays only one
@@ -2836,6 +2854,12 @@ class GrpoWindowBatcher:
             row["status"] = "proof_started"
             sub = self._verify_expensive(p)
             if sub is None:
+                self._expensive_proof_failures_by_operator[operator] = (
+                    self._expensive_proof_failures_by_operator.get(
+                        operator, 0
+                    )
+                    + 1
+                )
                 row["proof_passed"] = False
                 row["status"] = "proof_failed"
                 continue          # rejected; promote the next-ranked for prompt
@@ -3168,6 +3192,15 @@ class GrpoWindowBatcher:
                     "proven_winners": len(self._valid),
                     "operator_cap": MAX_AUCTION_SLOTS_PER_OPERATOR,
                     "operator_cap_skips": self.auction_operator_cap_skips,
+                    "operator_proof_failure_cap": (
+                        MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW
+                    ),
+                    "operator_proof_failure_debt": dict(
+                        self._expensive_proof_failures_by_operator
+                    ),
+                    "operator_proof_debt_skips": (
+                        self.auction_operator_proof_debt_skips
+                    ),
                     "operator_unmapped_skips": (
                         self.auction_operator_unmapped_skips
                     ),

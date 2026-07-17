@@ -252,6 +252,74 @@ def test_failed_proof_does_not_consume_an_operator_slot(monkeypatch):
     assert rows["failed"]["status"] == "proof_failed"
 
 
+def test_operator_failure_debt_blocks_multi_hotkey_proof_exhaustion(
+    monkeypatch,
+):
+    from reliquary.constants import (
+        B_BATCH,
+        MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW,
+    )
+
+    failure_cap = MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW
+    fake_hotkeys = [f"fake-{i}" for i in range(failure_cap + 3)]
+    honest_hotkeys = [f"honest-{i}" for i in range(B_BATCH)]
+    mapping = {
+        **{hotkey: "operator-attacker" for hotkey in fake_hotkeys},
+        **{
+            hotkey: f"operator-honest-{i}"
+            for i, hotkey in enumerate(honest_hotkeys)
+        },
+    }
+    batcher = _batcher(operator_by_hotkey=mapping)
+    for prompt_idx, hotkey in enumerate(fake_hotkeys):
+        assert batcher.accept_submission(
+            _request(
+                prompt_idx=prompt_idx,
+                hotkey=hotkey,
+                rewards=[1.0, 1.0] + [0.0] * 6,
+            )
+        ).accepted
+    for offset, hotkey in enumerate(honest_hotkeys, start=len(fake_hotkeys)):
+        assert batcher.accept_submission(
+            _request(
+                prompt_idx=offset,
+                hotkey=hotkey,
+                rewards=[1.0] * 4 + [0.0] * 4,
+            )
+        ).accepted
+
+    original_verify = batcher._verify_expensive
+    attempted_hotkeys = []
+
+    def verify(pending):
+        attempted_hotkeys.append(pending.hotkey)
+        if pending.hotkey.startswith("fake-"):
+            return None
+        return original_verify(pending)
+
+    monkeypatch.setattr(batcher, "_verify_expensive", verify)
+    batcher.seal_batch()
+
+    assert sum(
+        hotkey.startswith("fake-") for hotkey in attempted_hotkeys
+    ) == failure_cap
+    assert batcher.operator_proof_failure_debt("operator-attacker") == (
+        failure_cap
+    )
+    assert {winner.hotkey for winner in batcher.valid_submissions()} == set(
+        honest_hotkeys
+    )
+    fake_rows = {
+        row["hotkey"]: row for row in batcher.auction_candidates
+        if row["hotkey"].startswith("fake-")
+    }
+    assert sum(
+        row["status"] == "operator_proof_debt"
+        for row in fake_rows.values()
+    ) == 3
+    assert batcher.auction_operator_proof_debt_skips == 3
+
+
 def test_proof_wall_budget_stops_ranked_work_and_archives_shortfall(monkeypatch):
     import reliquary.validator.batcher as batcher_module
 

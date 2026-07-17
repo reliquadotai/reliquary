@@ -720,6 +720,8 @@ def test_health_exposes_each_environment_window_independently():
         "difficulty_auction_proof_wall_elapsed_seconds": 0.0,
         "difficulty_auction_proof_wall_exhausted": False,
         "post_trigger_proof_admission_count": 0,
+        "expensive_proof_failures_by_hotkey": {},
+        "expensive_proof_failures_by_operator": {},
     }
     code_health = health["window_environments"]["opencodeinstruct"]
     assert code_health["valid_submissions_count"] == 8

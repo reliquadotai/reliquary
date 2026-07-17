@@ -49,6 +49,7 @@ from reliquary.constants import (
     LEGACY_MERKLE_ROOT_ENFORCE,
     MAX_AUCTION_SLOTS_PER_OPERATOR,
     MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW,
+    MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
     MAX_PENDING_PROOF_QUEUE_DEPTH,
     MAX_PENDING_SUBMISSION_BYTES_PER_ENV,
@@ -524,6 +525,12 @@ class _Health(BaseModel):
     sparse_valid_max_window_seconds: float = SPARSE_VALID_MAX_WINDOW_SECONDS
     expensive_proof_failures_by_hotkey: dict[str, int] = Field(
         default_factory=dict
+    )
+    expensive_proof_failures_by_operator: dict[str, int] = Field(
+        default_factory=dict
+    )
+    max_expensive_proof_failures_per_operator_per_window: int = (
+        MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW
     )
     checkpoint_repo_id: str | None = None
     checkpoint_revision: str | None = None
@@ -1172,6 +1179,12 @@ class ValidatorServer:
             "post_trigger_proof_admission_count": _integer(
                 getattr(batcher, "post_trigger_proof_admission_count", None)
             ),
+            "expensive_proof_failures_by_hotkey": dict(
+                getattr(batcher, "expensive_proof_failures_by_hotkey", {})
+            ),
+            "expensive_proof_failures_by_operator": dict(
+                getattr(batcher, "expensive_proof_failures_by_operator", {})
+            ),
         }
 
     def _health_payload(self) -> _Health:
@@ -1390,6 +1403,17 @@ class ValidatorServer:
             expensive_proof_failures_by_hotkey=(
                 dict(getattr(batcher, "expensive_proof_failures_by_hotkey", {}))
                 if batcher else {}
+            ),
+            expensive_proof_failures_by_operator=(
+                dict(
+                    getattr(
+                        batcher,
+                        "expensive_proof_failures_by_operator",
+                        {},
+                    )
+                )
+                if batcher
+                else {}
             ),
             checkpoint_repo_id=cp.repo_id if cp else None,
             checkpoint_revision=cp.revision if cp else None,
