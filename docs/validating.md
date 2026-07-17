@@ -210,7 +210,6 @@ These are the live thresholds the trainer applies on every submission. The same 
 | `WINDOW_COLLECTION_SECONDS` | 300 | Fixed collection interval for both Math and Code auction populations |
 | `MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW` | 96 | Started grading/proof ceiling per environment/window |
 | `MAX_PROOF_WALL_SECONDS` | 240 | Seal-time proof wall-clock ceiling per environment |
-| `MAX_AUCTION_SLOTS_PER_OPERATOR` | 2 | Maximum winners per coldkey/operator in each environment |
 | `MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW` | 4 | Operator-wide seal GPU debt limit per environment |
 | `MAX_SUBMISSION_PAYLOAD_BYTES` | 64 MiB | Per-request parsed JSON payload limit |
 | `MAX_PENDING_SUBMISSION_BYTES_PER_HOTKEY` | 128 MiB | Retained pending payload cap per hotkey/environment |
