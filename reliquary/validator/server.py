@@ -555,6 +555,7 @@ class _Health(BaseModel):
     registration_cache_last_refresh_success_ts: float | None = None
     registration_cache_last_refresh_failure_ts: float | None = None
     registration_cache_last_refresh_failure_type: str | None = None
+    registration_cache_last_refresh_failure_reason: str | None = None
     registration_cache_last_refresh_reason: str | None = None
     training_accumulator_checkpoint_revision: str | None = None
     training_accumulator_targets: dict[str, int] = Field(default_factory=dict)
@@ -636,6 +637,7 @@ class ValidatorServer:
         self._registration_cache_last_refresh_success_ts: float | None = None
         self._registration_cache_last_refresh_failure_ts: float | None = None
         self._registration_cache_last_refresh_failure_type: str | None = None
+        self._registration_cache_last_refresh_failure_reason: str | None = None
         self._registration_cache_last_refresh_reason: str | None = None
         self._training_accumulator_state: dict[str, Any] = {}
         self._training_publish_state: dict[str, Any] = {}
@@ -860,7 +862,6 @@ class ValidatorServer:
         if success:
             self._registration_cache_refresh_successes_total += 1
             self._registration_cache_last_refresh_success_ts = now
-            self._registration_cache_last_refresh_failure_type = None
             return
 
         self._registration_cache_refresh_failures_total += 1
@@ -868,6 +869,7 @@ class ValidatorServer:
         self._registration_cache_last_refresh_failure_type = (
             str(failure_type).strip() if failure_type else "unknown"
         )
+        self._registration_cache_last_refresh_failure_reason = normalized_reason
 
     async def _registration_reject_reason(
         self,
@@ -1525,6 +1527,9 @@ class ValidatorServer:
             ),
             registration_cache_last_refresh_failure_type=(
                 self._registration_cache_last_refresh_failure_type
+            ),
+            registration_cache_last_refresh_failure_reason=(
+                self._registration_cache_last_refresh_failure_reason
             ),
             registration_cache_last_refresh_reason=(
                 self._registration_cache_last_refresh_reason
