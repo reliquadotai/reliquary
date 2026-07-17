@@ -208,13 +208,15 @@ class SubmitTelemetry:
         self.seal_trigger_round = getattr(
             batcher, "_seal_trigger_round", self.seal_trigger_round
         )
-        # Proofs run at seal now, so ``valid_count`` is 0 for the whole window;
-        # ride the graded (admitted-but-unproven) pending count instead.
-        pending_count = getattr(batcher, "pending_count", None)
+        count = (
+            getattr(batcher, "pending_count", None)
+            if getattr(batcher, "difficulty_auction_enabled", False)
+            else getattr(batcher, "valid_count", None)
+        )
         if at_decision:
-            self.valid_submissions_at_decision = pending_count
+            self.valid_submissions_at_decision = count
         else:
-            self.valid_submissions_at_arrival = pending_count
+            self.valid_submissions_at_arrival = count
 
     def mark_enqueued(self, ts: float | None = None) -> None:
         self.t_enqueued = ts if ts is not None else time.time()

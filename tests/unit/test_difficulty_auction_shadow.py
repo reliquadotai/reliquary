@@ -48,11 +48,11 @@ def _batcher(
         drand_round_check_enabled=False,
         operator_by_hotkey=operator_by_hotkey,
     )
+    # This suite exercises the observation-only selector over the legacy path.
+    # Armed auction behavior has dedicated deferred-proof/deadline tests.
+    batcher.difficulty_auction_enabled = False
     # These tests inject the proven pool on ``_valid`` directly to exercise the
-    # seal's FCFS selection + difficulty-auction shadow over a controlled set.
-    # Neutralize the deferred ranked-proof pass, which would otherwise rebuild
-    # ``_valid`` from the (empty) ``_pending``. Proving itself is covered by
-    # test_deferred_proof.py.
+    # legacy selection + difficulty-auction shadow over a controlled set.
     batcher._prove_ranked = lambda pool=1.0: batcher._valid
     batcher._prove_forensic_sample = lambda: []
     return batcher

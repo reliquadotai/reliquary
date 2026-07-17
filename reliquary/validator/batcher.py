@@ -22,17 +22,19 @@ from reliquary.constants import (
     B_BATCH,
     BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION,
     DIFFICULTY_AUCTION_DELTA,
+    DIFFICULTY_AUCTION_ENFORCE,
+    DIFFICULTY_AUCTION_ENVIRONMENTS,
     DIFFICULTY_AUCTION_SHADOW_ENABLED,
     DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS,
     DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES,
     DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR,
-    M_ROLLOUTS,
     MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
     MIN_EOS_PROBABILITY,
     FORENSIC_SAMPLE_PER_WINDOW,
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
     MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
+    MAX_SEAL_QUEUE_DRAIN_SECONDS,
     MAX_SUBMISSIONS_PER_PROMPT,
     MAX_TRUNCATED_PER_SUBMISSION,
     PROMPT_RANGE_SIZE,
@@ -61,7 +63,6 @@ from reliquary.protocol.submission import (
 )
 from reliquary.protocol.tokens import verify_tokens
 from reliquary.validator.batch_selection import (
-    _within_slot_key,
     explain_batch_selection,
     select_batch_and_distribute,
 )
@@ -81,6 +82,7 @@ from reliquary.validator.observability import (
     DrandRoundObservation,
     SubmitTelemetry,
     classify_drand_round,
+    log_submission_stage,
 )
 from reliquary.validator.boxed_integrity import has_malformed_final_answer
 from reliquary.validator.auth_forensics import (
@@ -109,6 +111,7 @@ from reliquary.validator.verifier import (
     evaluate_token_authenticity,
     evaluate_token_distribution,
     has_eos_padding,
+    is_in_zone,
     is_cap_truncation,
     is_natural_bft_cap_candidate,
     rewards_std,
@@ -298,6 +301,7 @@ class PendingSubmission:
     # instant the validator decided, not the instant it later proved.
     decision_ts: float | None = None
     telemetry: Any = None
+    reject_response: BatchSubmissionResponse | None = None
     value: float = field(init=False, default=0.0)
 
     def __post_init__(self):
@@ -436,6 +440,10 @@ class GrpoWindowBatcher:
 
         self.window_start = window_start
         self.env = env
+        self.difficulty_auction_enabled = bool(
+            DIFFICULTY_AUCTION_ENFORCE
+            and getattr(env, "name", "") in DIFFICULTY_AUCTION_ENVIRONMENTS
+        )
         self.model = model
         self.tokenizer = tokenizer
         self.bootstrap = bootstrap
@@ -550,7 +558,9 @@ class GrpoWindowBatcher:
         # submit on the same ``prompt_idx`` up to ``MAX_SUBMISSIONS_PER_PROMPT``.
         # Tracked alongside the flat ``_pending`` list because seal_batch needs
         # the grouping but accept-time logic only needs the count.
-        self._submissions_per_prompt: dict[int, list[PendingSubmission]] = {}
+        self._submissions_per_prompt: dict[
+            int, list[PendingSubmission | ValidSubmission]
+        ] = {}
         self.randomness: str = ""
         # Drand beacon fetched at seal (post-deadline) to key the forensic
         # sample so it cannot be predicted at submission time. See
@@ -714,14 +724,15 @@ class GrpoWindowBatcher:
         return self._seal_flag.is_set()
 
     def poll_deadline(self) -> bool:
-        """Seal iff the fixed collection deadline has expired. Idempotent.
+        """Seal an auction environment at its fixed collection deadline.
 
-        The deadline is the window's minimum duration by construction: an early
-        seal would be the speed race being removed, cutting off slow-but-hard
-        submissions still generating.
+        Non-auction environments keep the legacy B-distinct/drand-boundary seal
+        and therefore treat this poll as a no-op.
         """
         if self._seal_flag.is_set():
             return True
+        if not self.difficulty_auction_enabled:
+            return False
         if self._time_fn() - self.window_opened_at >= WINDOW_COLLECTION_SECONDS:
             self._seal_flag.set()
             if self._seal_event is not None:
@@ -1152,6 +1163,15 @@ class GrpoWindowBatcher:
                 **kwargs,
             )
 
+        # Legacy environments stop after the trigger drand tier. Auction
+        # environments intentionally collect for the full fixed deadline.
+        if (
+            not self.difficulty_auction_enabled
+            and self._seal_trigger_round is not None
+            and request.drand_round > self._seal_trigger_round
+        ):
+            return reject(RejectReason.BATCH_FILLED, "seal_extension")
+
         if request.window_start != self.window_start:
             return reject(RejectReason.WINDOW_MISMATCH, "window")
         # v2.1: checkpoint hash gate. Empty string = gate disabled
@@ -1303,14 +1323,12 @@ class GrpoWindowBatcher:
                 )
             )
         sigma = rewards_std(rewards)
-        # The difficulty score v(k) = σ·(1-mean)^δ now gates AND ranks. It is zero
-        # only for a unanimous group (all rollouts agree → σ≈0 → no GRPO signal),
-        # so that is the only thing worth rejecting. This replaces the old σ_min
-        # band (which admitted only k∈[2,6]): a hard k=1 group — the highest-value
-        # frontier — and an easy k=7 group are now admitted, and the score ranks
-        # them (k=1 near the peak, k=7 near the bottom). A reward error, not
-        # cheating; never reaches GRAIL; bounded upstream by the grading ceiling.
-        if sigma < 1e-8:
+        # Keep the calibrated sigma eligibility band even under the auction.
+        # The difficulty score ranks eligible groups, but k=1 remains excluded
+        # until an independent math adjudicator measures the false-negative
+        # floor: under this objective, a correct answer graded wrong can move a
+        # group toward the payout peak. This is a reward error, not cheating.
+        if not is_in_zone(sigma, bootstrap=self.bootstrap):
             return reject(RejectReason.OUT_OF_ZONE, "zone")
 
         # Zone-valid: entering the GRAIL/GPU proof path. Count it for telemetry
@@ -1393,6 +1411,51 @@ class GrpoWindowBatcher:
             decision_ts=self._wall_clock(),
             telemetry=telemetry,
         )
+
+        if not self.difficulty_auction_enabled:
+            proven = self._verify_expensive(pending)
+            if proven is None:
+                return pending.reject_response or BatchSubmissionResponse(
+                    accepted=False,
+                    reason=RejectReason.GRAIL_FAIL,
+                )
+            self._valid.append(proven)
+            self._submissions_per_prompt.setdefault(
+                request.prompt_idx, []
+            ).append(proven)
+            self.last_valid_submission_at = self._time_fn()
+            self.last_valid_submission_wall_ts = self._wall_clock()
+            self.valid_count = len(self._valid)
+
+            distinct_eligible = self.distinct_valid_prompt_count()
+            if distinct_eligible >= B_BATCH and self._seal_trigger_round is None:
+                self._seal_trigger_round = request.drand_round
+                proven.seal_trigger_round = self._seal_trigger_round
+                if telemetry is not None:
+                    telemetry.seal_trigger_round = self._seal_trigger_round
+                    telemetry.valid_submissions_at_decision = len(self._valid)
+                    log_submission_stage(
+                        logger,
+                        logging.INFO,
+                        "seal_triggered",
+                        telemetry,
+                        distinct_eligible=distinct_eligible,
+                        batch_size=B_BATCH,
+                        seal_trigger_round=self._seal_trigger_round,
+                    )
+                if self._loop is not None:
+                    asyncio.run_coroutine_threadsafe(
+                        self._delayed_seal_at_drand_boundary(),
+                        self._loop,
+                    )
+                else:
+                    self._seal_flag.set()
+                    if self._seal_event is not None:
+                        self._seal_event.set()
+            return BatchSubmissionResponse(
+                accepted=True, reason=RejectReason.ACCEPTED
+            )
+
         self._pending.append(pending)
         self._submissions_per_prompt.setdefault(
             request.prompt_idx, []
@@ -1408,6 +1471,40 @@ class GrpoWindowBatcher:
         return BatchSubmissionResponse(
             accepted=True, reason=RejectReason.ACCEPTED
         )
+
+    async def _delayed_seal_at_drand_boundary(self) -> None:
+        """Seal a legacy environment after its trigger round and queue drain."""
+        if self._drand_chain_info is not None:
+            from reliquary.infrastructure.chain import (
+                seconds_until_next_drand_boundary,
+            )
+
+            ci = self._drand_chain_info
+            delay = seconds_until_next_drand_boundary(
+                self._wall_clock(), ci["genesis_time"], ci["period"]
+            )
+            await asyncio.sleep(delay + 0.05)
+
+        if self._queue_drained_predicate is not None:
+            drain_started = self._time_fn()
+            while not self._queue_drained_predicate():
+                waited_s = self._time_fn() - drain_started
+                if waited_s >= MAX_SEAL_QUEUE_DRAIN_SECONDS:
+                    logger.warning(
+                        "seal_drain_timeout window=%d trigger_round=%s "
+                        "waited_s=%.2f proof_admitted=%d post_trigger_admitted=%d",
+                        self.window_start,
+                        self._seal_trigger_round,
+                        waited_s,
+                        self._proof_admission_count,
+                        self.post_trigger_proof_admission_count,
+                    )
+                    break
+                await asyncio.sleep(0.2)
+
+        self._seal_flag.set()
+        if self._seal_event is not None:
+            self._seal_event.set()
 
     def _verify_expensive(
         self, pending: PendingSubmission
@@ -1435,7 +1532,7 @@ class GrpoWindowBatcher:
             stage: str,
             **kwargs: Any,
         ) -> None:
-            self._reject(
+            pending.reject_response = self._reject(
                 reason,
                 hotkey=hk,
                 prompt_idx=pi,
@@ -2259,9 +2356,8 @@ class GrpoWindowBatcher:
             truncated_count=truncated_count,
             reward_shape=reward_shape.to_log_dict(),
         )
-        # Proven. ``_prove_ranked`` is the sole caller; it appends the winner to
-        # ``_valid`` and records the prompt as claimed. The window is time-boxed
-        # (``poll_deadline``), so there is no count-based seal here.
+        # The caller decides whether this is an auction winner or an immediate
+        # legacy admission.
         return new_sub
 
     def _reject(
@@ -2657,8 +2753,9 @@ class GrpoWindowBatcher:
         submission picked for training — because all of them earn emission
         and were therefore "used" by this window.
         """
-        self._prove_ranked(pool)
-        self._prove_forensic_sample()
+        if self.difficulty_auction_enabled:
+            self._prove_ranked(pool)
+            self._prove_forensic_sample()
         with self._lock:
             self.selection_metadata_by_id = explain_batch_selection(
                 submissions=self._valid,
@@ -2674,7 +2771,20 @@ class GrpoWindowBatcher:
                 current_window=self.window_start,
                 pool=pool,
             )
-            self._compute_difficulty_auction_shadow()
+            if self.difficulty_auction_enabled:
+                self.difficulty_auction_shadow = {
+                    "schema_version": 2,
+                    "status": "armed",
+                    "mode": "production",
+                    "environment": str(getattr(self.env, "name", "")),
+                    "production_changed": True,
+                    "delta": DIFFICULTY_AUCTION_DELTA,
+                    "pending_candidates": len(self._pending),
+                    "proof_attempts": self.proof_attempts,
+                    "proven_winners": len(self._valid),
+                }
+            else:
+                self._compute_difficulty_auction_shadow()
             rewarded_submissions: list[ValidSubmission] = []
             rewarded_but_not_selected: dict[str, int] = {}
             for sub in self._valid:
@@ -2708,9 +2818,12 @@ class GrpoWindowBatcher:
                 cooldown_prompts=sorted(
                     self._cooldown.current_cooldown_set(self.window_start)
                 ),
-                # Miners poll this and act on it. Proofs run at seal now, so
-                # ``_valid`` is empty all window — report what was admitted.
-                # The field name is wire contract (extra="forbid"), so it stays.
-                valid_submissions=len(self._pending),
+                # The field name is a strict wire contract. Auction mode reports
+                # admitted candidates; legacy mode reports proven submissions.
+                valid_submissions=(
+                    len(self._pending)
+                    if self.difficulty_auction_enabled
+                    else len(self._valid)
+                ),
                 checkpoint_n=0,
             )

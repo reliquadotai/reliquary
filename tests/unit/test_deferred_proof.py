@@ -474,21 +474,29 @@ def test_forensic_sample_watches_non_winners_keyed_on_seal_randomness():
     assert watched != other
 
 
-def test_score_gate_admits_k1_and_k7_rejects_only_unanimous():
-    """v(k) replaces the sigma gate. A hard k=1 group (1 correct of 8) scores near
-    the peak and must be ADMITTED — the old sigma gate (k in [2,6]) rejected it as
-    out-of-zone. Only unanimous groups (k=0, k=8), which carry no GRPO signal
-    (v=0), are rejected."""
+def test_score_ranks_only_inside_the_calibrated_sigma_band():
+    """The auction ranks eligible groups but does not pay k=1 until an
+    independent grader clears the false-negative floor. The calibrated steady
+    state band remains k=2..6; k=1, k=7, and unanimous groups are out of zone."""
     from reliquary.validator.batcher import RejectReason
     from tests.unit.test_grpo_window_batcher import _make_batcher, _request
 
     b = _make_batcher()
-    assert b.accept_submission(
+    r1 = b.accept_submission(
         _request(prompt_idx=1, hotkey="k1", rewards=[1.0] + [0.0] * 7)
-    ).accepted, "k=1 (hard) must be admitted"
-    assert b.accept_submission(
+    )
+    assert r1.accepted is False and r1.reason == RejectReason.OUT_OF_ZONE
+    r7 = b.accept_submission(
         _request(prompt_idx=2, hotkey="k7", rewards=[1.0] * 7 + [0.0])
-    ).accepted, "k=7 (easy) must be admitted (it just ranks near the bottom)"
+    )
+    assert r7.accepted is False and r7.reason == RejectReason.OUT_OF_ZONE
+
+    assert b.accept_submission(
+        _request(prompt_idx=5, hotkey="k2", rewards=[1.0] * 2 + [0.0] * 6)
+    ).accepted
+    assert b.accept_submission(
+        _request(prompt_idx=6, hotkey="k6", rewards=[1.0] * 6 + [0.0] * 2)
+    ).accepted
     assert len(b.pending_submissions()) == 2
 
     r8 = b.accept_submission(_request(prompt_idx=3, hotkey="k8", rewards=[1.0] * 8))

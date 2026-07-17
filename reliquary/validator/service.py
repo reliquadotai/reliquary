@@ -984,13 +984,32 @@ class ValidationService:
     def _distinct_valid_prompt_count(self, batcher) -> int:
         """Best-effort distinct trainable prompt count for liveness decisions.
 
-        Proofs run at seal now, so ``_valid`` is empty the whole window; the
-        window's fill level is the graded (unproven) PENDING pool.
+        Auction environments use the graded pending pool; legacy environments
+        use the proven valid pool.
         """
-        counter = getattr(batcher, "distinct_pending_prompt_count", None)
+        counter_name = (
+            "distinct_pending_prompt_count"
+            if getattr(batcher, "difficulty_auction_enabled", False)
+            else "distinct_valid_prompt_count"
+        )
+        counter = getattr(batcher, counter_name, None)
         if callable(counter):
             return int(counter())
-        return int(getattr(batcher, "pending_count", 0) or 0)
+        count_name = (
+            "pending_count"
+            if getattr(batcher, "difficulty_auction_enabled", False)
+            else "valid_count"
+        )
+        return int(getattr(batcher, count_name, 0) or 0)
+
+    @staticmethod
+    def _admitted_count(batcher) -> int:
+        count_name = (
+            "pending_count"
+            if getattr(batcher, "difficulty_auction_enabled", False)
+            else "valid_count"
+        )
+        return int(getattr(batcher, count_name, 0) or 0)
 
     def _duplicate_prompt_shortfall_drained(self, batcher) -> bool:
         """True when duplicates filled raw submissions but not trainable slots."""
@@ -998,7 +1017,7 @@ class ValidationService:
             return False
         if getattr(batcher, "_seal_trigger_round", None) is not None:
             return False
-        valid_count = int(getattr(batcher, "pending_count", 0) or 0)
+        valid_count = self._admitted_count(batcher)
         distinct_valid = self._distinct_valid_prompt_count(batcher)
         if valid_count < B_BATCH or distinct_valid >= B_BATCH:
             return False
@@ -1038,7 +1057,7 @@ class ValidationService:
             return None
         if getattr(batcher, "_seal_trigger_round", None) is not None:
             return None
-        valid_count = int(getattr(batcher, "pending_count", 0) or 0)
+        valid_count = self._admitted_count(batcher)
         distinct_valid = self._distinct_valid_prompt_count(batcher)
         if distinct_valid >= B_BATCH:
             return None
@@ -1067,6 +1086,27 @@ class ValidationService:
         Per-env so a fast env never seals a slower one short.
         """
         env = getattr(getattr(batcher, "env", None), "name", "?")
+        if getattr(batcher, "difficulty_auction_enabled", False):
+            # The full population is the auction's input. Duplicate/sparse idle
+            # breakers would let an early burst truncate the fixed collection
+            # period and recreate the speed race. Only an exhausted, fully
+            # drained grading budget is terminal before the deadline.
+            if not self._proof_admission_exhausted_and_drained(batcher):
+                return None
+            reason = "proof_admission_exhausted_drained"
+            logger.warning(
+                "Window %d env=%s force-sealing auction: reason=%s "
+                "admitted=%d/%d distinct=%d/%d",
+                self._window_n,
+                env,
+                reason,
+                self._admitted_count(batcher),
+                B_BATCH,
+                self._distinct_valid_prompt_count(batcher),
+                B_BATCH,
+            )
+            batcher.force_seal(reason)
+            return reason
         if self._proof_admission_exhausted_and_drained(batcher):
             reason = "proof_admission_exhausted_drained"
         elif self._duplicate_prompt_shortfall_drained(batcher):
@@ -1094,12 +1134,10 @@ class ValidationService:
     async def _wait_for_window_seal(self) -> str:
         """Wait until every active env's batcher seals.
 
-        The window is time-boxed: each batcher seals on its own fixed collection
-        deadline (``poll_deadline``). The liveness breakers below stay as
-        early-exit safety valves for degenerate (sparse / fully drained)
-        windows, so a fast env never cuts a slower one short. The window
-        advances only once all are sealed (or the global timeout). Training
-        still requires all envs full (see ``trained``).
+        Auction batchers seal on their fixed collection deadline; legacy
+        batchers retain their B-distinct/drand-boundary seal. Per-environment
+        liveness guards cannot let a fast environment cut a slower one short.
+        The window advances only once all are sealed (or the global timeout).
         """
         batchers = list(self._active_batchers.values())
         if not batchers:

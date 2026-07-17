@@ -18,7 +18,9 @@ from reliquary.validator.batcher import GrpoWindowBatcher
 
 
 class FakeEnv:
-    name = "fake"
+    # Generic batcher tests exercise the production Math lane. Tests for the
+    # legacy Code lane inject ``PrivateRewardFakeEnv`` explicitly.
+    name = "openmathinstruct"
     def __len__(self):
         return 1000
     def get_problem(self, idx):
@@ -174,14 +176,17 @@ def _make_batcher(**overrides) -> GrpoWindowBatcher:
 
 
 def _prove_one(b: GrpoWindowBatcher, req) -> "ValidSubmission | None":
-    """Cheap admission + the seal-time proof for a single request.
+    """Run one request through its environment's configured proof path.
 
-    Proof-dependent gates (GRAIL, termination, token-auth, boxed, forced-seed)
-    now reject inside ``_verify_expensive`` at seal, not at ``accept_submission``.
-    Returns None when the proof phase rejected the submission.
+    Math defers proof to seal; Code retains immediate proof at admission.
+    Returns None when either path rejects the submission.
     """
-    assert b.accept_submission(req).accepted is True, "cheap admission must pass"
-    return b._verify_expensive(b.pending_submissions()[-1])
+    response = b.accept_submission(req)
+    if not response.accepted:
+        return None
+    if b.difficulty_auction_enabled:
+        return b._verify_expensive(b.pending_submissions()[-1])
+    return b.valid_submissions()[-1]
 
 
 def test_constructor_sets_window():
@@ -2876,7 +2881,7 @@ def test_forced_seed_cdf_gate_rejects_sparse_branch_mismatch(monkeypatch):
     assert recorded[0][1]["cdf_enforced"] is True
     assert recorded[0][1]["window_start"] == 500
     assert recorded[0][1]["checkpoint_hash"] == "sha256:test"
-    assert recorded[0][1]["env_name"] == "fake"
+    assert recorded[0][1]["env_name"] == "openmathinstruct"
 
 
 def test_forced_seed_cdf_gate_is_shadow_until_calibrated(monkeypatch):

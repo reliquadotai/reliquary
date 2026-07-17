@@ -277,11 +277,11 @@ def _proof_free_submission_reject(
     )
     if not _is_mock_like(batcher) and not validator_scored_reward:
         rewards = [float(rollout.reward) for rollout in request.rollouts]
-        # Auction v2 admits every non-unanimous reward group and lets the
-        # difficulty score rank it. Keep this cheap preflight identical to the
-        # batcher gate; retaining the legacy sigma threshold here would reject
-        # k=1/k=7 before they ever reach the pending pool.
-        if rewards_std(rewards) < 1e-8:
+        from reliquary.validator.verifier import is_in_zone
+        if not is_in_zone(
+            rewards_std(rewards),
+            bootstrap=bool(getattr(batcher, "bootstrap", False)),
+        ):
             return RejectReason.OUT_OF_ZONE, "zone"
 
     eos_set = _proof_free_eos_set(batcher)
@@ -1878,7 +1878,8 @@ class ValidatorServer:
             # don't sit in the worker queue costing a futile dequeue.
             trigger_round = batcher._seal_trigger_round
             if (
-                trigger_round is not None
+                not getattr(batcher, "difficulty_auction_enabled", False)
+                and trigger_round is not None
                 and request.drand_round > trigger_round
             ):
                 return _cheap_reject(
@@ -2129,11 +2130,10 @@ class ValidatorServer:
                 window_n=batcher.window_start,
                 anchor_block=batcher.window_start,
                 cooldown_prompts=batcher.cooldown_prompts_snapshot,
-                # Proofs run at seal now, so ``valid_count`` is 0 for the whole
-                # window; miners act on this, so report the admitted (graded,
-                # unproven) pending count on the same wire field.
-                valid_submissions=getattr(
-                    batcher, "pending_count", batcher.valid_count
+                valid_submissions=(
+                    getattr(batcher, "pending_count", batcher.valid_count)
+                    if getattr(batcher, "difficulty_auction_enabled", False)
+                    else batcher.valid_count
                 ),
                 checkpoint_n=cp.checkpoint_n if cp else 0,
                 checkpoint_repo_id=cp.repo_id if cp else None,
