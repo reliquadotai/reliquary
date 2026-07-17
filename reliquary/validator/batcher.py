@@ -12,6 +12,7 @@ import logging
 import math
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -1491,14 +1492,42 @@ class GrpoWindowBatcher:
 
         problem = self.env.get_problem(request.prompt_idx)
         validator_scored_reward = _uses_validator_authoritative_reward(self.env)
-        completion_texts = []
-        for rollout in request.rollouts:
-            text = self._completion_text(rollout)
-            completion_texts.append(text)
-            try:
-                computed_reward = float(self.env.compute_reward(problem, text))
-            except Exception:
-                return reject(RejectReason.REWARD_MISMATCH, "reward")
+        completion_texts = [
+            self._completion_text(rollout) for rollout in request.rollouts
+        ]
+        try:
+            if (
+                validator_scored_reward
+                and getattr(self.env, "name", "") == "opencodeinstruct"
+            ):
+                # The production grader owns one sandbox worker per rollout.
+                # Dispatch the group together so a timeout costs one grader
+                # interval instead of eight, while preserving rollout order.
+                with ThreadPoolExecutor(
+                    max_workers=len(completion_texts),
+                    thread_name_prefix="reliquary-code-grade",
+                ) as executor:
+                    computed_rewards = list(
+                        executor.map(
+                            lambda text: float(
+                                self.env.compute_reward(problem, text)
+                            ),
+                            completion_texts,
+                        )
+                    )
+            else:
+                computed_rewards = [
+                    float(self.env.compute_reward(problem, text))
+                    for text in completion_texts
+                ]
+        except Exception:
+            return reject(RejectReason.REWARD_MISMATCH, "reward")
+
+        for rollout, computed_reward in zip(
+            request.rollouts,
+            computed_rewards,
+            strict=True,
+        ):
             if not math.isfinite(computed_reward):
                 logger.error(
                     "non-finite validator reward env=%s prompt=%d hotkey=%s",

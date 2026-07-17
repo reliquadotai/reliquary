@@ -877,6 +877,32 @@ def test_submit_returns_submitted_under_worker_path():
     assert body["reason"] == "submitted"
 
 
+def test_code_submit_routes_to_the_isolated_code_queue():
+    from reliquary.protocol.submission import WindowState
+    from tests.unit.test_grpo_window_batcher import PrivateRewardFakeEnv
+
+    server = ValidatorServer()
+    batcher = _batcher(
+        window_start=500,
+        env=PrivateRewardFakeEnv(),
+    )
+    server.set_active_batchers({"opencodeinstruct": batcher})
+    server.set_current_state(WindowState.OPEN)
+    server._worker_task = object()
+    request = _request()
+    for rollout in request.rollouts:
+        rollout.env_name = "opencodeinstruct"
+
+    response = TestClient(server.app).post(
+        "/submit",
+        json=request.model_dump(mode="json"),
+    )
+
+    assert response.json()["reason"] == RejectReason.SUBMITTED.value
+    assert server._submit_queue.qsize() == 0
+    assert server._code_submit_queue.qsize() == 1
+
+
 def test_full_server_queue_returns_pending_proof_reservation():
     import asyncio
     from reliquary.protocol.submission import WindowState

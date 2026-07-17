@@ -1,6 +1,7 @@
 """Production bounds around deferred-proof auction admission and sealing."""
 
 import asyncio
+import threading
 
 import pytest
 
@@ -311,6 +312,86 @@ def test_transport_body_limits_reject_before_request_validation(monkeypatch):
     assert chunked.request.headers.get("content-length") is None
     assert chunked.status_code == 413
     assert chunked.json() == {"detail": "submission_payload_too_large"}
+
+
+def test_code_rewards_use_all_sandbox_lanes_in_parallel():
+    from reliquary.constants import M_ROLLOUTS
+    from tests.unit.test_grpo_window_batcher import PrivateRewardFakeEnv
+
+    class ConcurrentCodeEnv(PrivateRewardFakeEnv):
+        def __init__(self):
+            self.barrier = threading.Barrier(M_ROLLOUTS, timeout=2.0)
+            self.thread_ids = set()
+            self.thread_ids_lock = threading.Lock()
+
+        def compute_reward(self, problem, completion):
+            with self.thread_ids_lock:
+                self.thread_ids.add(threading.get_ident())
+            self.barrier.wait()
+            return 1.0 if "CORRECT" in completion else 0.0
+
+    env = ConcurrentCodeEnv()
+    batcher = _batcher(env=env)
+    request = _request(env_name="opencodeinstruct")
+
+    response = batcher.accept_submission(request)
+
+    assert response.accepted is True, response.reason
+    assert len(env.thread_ids) == len(request.rollouts)
+
+
+def test_math_and_code_submission_queues_are_independent_and_observable():
+    from reliquary.validator.server import ValidatorServer
+
+    server = ValidatorServer()
+    math_queue = server._submission_queue_for_environment(
+        "openmathinstruct"
+    )
+    code_queue = server._submission_queue_for_environment(
+        "opencodeinstruct"
+    )
+
+    assert math_queue is server._submit_queue
+    assert code_queue is server._code_submit_queue
+    assert code_queue is not math_queue
+
+    math_queue.put_nowait((object(), object()))
+    code_queue.put_nowait((object(), object()))
+    code_queue.put_nowait((object(), object()))
+
+    assert server.submit_queue_depth == 3
+    assert server.submit_queue_depth_by_environment == {
+        "openmathinstruct": 1,
+        "opencodeinstruct": 2,
+    }
+    assert server.proof_verification_inflight_by_environment == {
+        "openmathinstruct": 0,
+        "opencodeinstruct": 0,
+    }
+
+
+def test_health_reports_pending_auction_population_before_seal():
+    from reliquary.validator.server import ValidatorServer
+
+    batcher = _batcher()
+    for prompt_idx in (1, 2):
+        response = batcher.accept_submission(
+            _request(prompt_idx=prompt_idx, hotkey=f"miner-{prompt_idx}")
+        )
+        assert response.accepted is True, response.reason
+
+    server = ValidatorServer()
+    server.set_active_batchers({"openmathinstruct": batcher})
+    health = server._health_payload()
+
+    assert health.valid_submissions_count == 2
+    assert health.distinct_valid_prompt_count == 2
+    assert (
+        health.window_environments["openmathinstruct"][
+            "valid_submissions_count"
+        ]
+        == 2
+    )
 
 
 @pytest.mark.asyncio

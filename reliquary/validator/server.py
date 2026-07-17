@@ -469,7 +469,11 @@ class _Health(BaseModel):
     drand_round_backward_tolerance: int
     batch_size: int
     queue_depth: int | None = None
+    queue_depth_by_environment: dict[str, int] = Field(default_factory=dict)
     proof_verification_inflight: int | None = None
+    proof_verification_inflight_by_environment: dict[str, int] = Field(
+        default_factory=dict
+    )
     valid_submissions_count: int | None = None
     distinct_valid_prompt_count: int | None = None
     last_valid_submission_ts: float | None = None
@@ -642,8 +646,18 @@ class ValidatorServer:
         self._submit_queue: asyncio.Queue = asyncio.Queue(
             maxsize=MAX_PENDING_PROOF_QUEUE_DEPTH,
         )
+        # OpenCode grading may spend the full sandbox timeout while Math
+        # admission remains CPU-cheap. Independent queues and workers prevent
+        # pathological code from head-of-line blocking the Math auction.
+        self._code_submit_queue: asyncio.Queue = asyncio.Queue(
+            maxsize=MAX_PENDING_PROOF_QUEUE_DEPTH,
+        )
         self._worker_task: asyncio.Task[Any] | None = None
+        self._code_worker_task: asyncio.Task[Any] | None = None
         self._inflight_proofs = 0
+        self._inflight_proofs_by_environment: collections.Counter[str] = (
+            collections.Counter()
+        )
         from reliquary.protocol.submission import WindowState
         self._current_state: WindowState = WindowState.READY
         self._current_checkpoint = None  # ManifestEntry | None
@@ -906,11 +920,37 @@ class ValidatorServer:
 
     @property
     def submit_queue_depth(self) -> int:
-        return self._submit_queue.qsize()
+        return sum(self.submit_queue_depth_by_environment.values())
+
+    @property
+    def submit_queue_depth_by_environment(self) -> dict[str, int]:
+        return {
+            "openmathinstruct": self._submit_queue.qsize(),
+            "opencodeinstruct": self._code_submit_queue.qsize(),
+        }
+
+    def _submission_queue_for_environment(
+        self,
+        environment: str,
+    ) -> asyncio.Queue:
+        if environment == "opencodeinstruct":
+            return self._code_submit_queue
+        return self._submit_queue
 
     @property
     def proof_verification_inflight(self) -> int:
         return self._inflight_proofs
+
+    @property
+    def proof_verification_inflight_by_environment(self) -> dict[str, int]:
+        return {
+            "openmathinstruct": self._inflight_proofs_by_environment.get(
+                "openmathinstruct", 0
+            ),
+            "opencodeinstruct": self._inflight_proofs_by_environment.get(
+                "opencodeinstruct", 0
+            ),
+        }
 
     def set_late_drop_callback(
         self, fn: Callable[[str, str], None] | None,
@@ -1170,6 +1210,9 @@ class ValidatorServer:
             str(env_name): self._window_environment_health(env_batcher)
             for env_name, env_batcher in self._active_batchers.items()
         }
+        active_window_health = (
+            self._window_environment_health(batcher) if batcher else {}
+        )
         logical_group_dedup: dict[str, dict[str, int]] = {}
         for env_name, env_batcher in self._active_batchers.items():
             reservations = getattr(
@@ -1251,18 +1294,20 @@ class ValidatorServer:
             ),
             drand_round_backward_tolerance=DRAND_ROUND_BACKWARD_TOLERANCE,
             batch_size=B_BATCH,
-            queue_depth=self._submit_queue.qsize(),
+            queue_depth=self.submit_queue_depth,
+            queue_depth_by_environment=self.submit_queue_depth_by_environment,
             proof_verification_inflight=self._inflight_proofs,
-            valid_submissions_count=(
-                getattr(batcher, "valid_count", None) if batcher else None
+            proof_verification_inflight_by_environment=(
+                self.proof_verification_inflight_by_environment
             ),
-            distinct_valid_prompt_count=(
-                batcher.distinct_valid_prompt_count()
-                if (
-                    batcher is not None
-                    and hasattr(batcher, "distinct_valid_prompt_count")
-                )
-                else None
+            # These legacy scalar fields reflect the first active environment.
+            # During an auction they intentionally report admitted candidates,
+            # not only the winners proven later at seal.
+            valid_submissions_count=active_window_health.get(
+                "valid_submissions_count"
+            ),
+            distinct_valid_prompt_count=active_window_health.get(
+                "distinct_valid_prompt_count"
             ),
             last_valid_submission_ts=(
                 getattr(batcher, "last_valid_submission_wall_ts", None)
@@ -1584,7 +1629,10 @@ class ValidatorServer:
                 logging.INFO,
                 "submit_received",
                 telemetry,
-                queue_depth=self._submit_queue.qsize(),
+                queue_depth=self.submit_queue_depth,
+                queue_depth_by_environment=(
+                    self.submit_queue_depth_by_environment
+                ),
             )
 
             def _reject_before_quota(
@@ -2275,8 +2323,11 @@ class ValidatorServer:
                 return resp
 
             telemetry.mark_enqueued()
+            submit_queue = self._submission_queue_for_environment(
+                submission_env_name
+            )
             try:
-                self._submit_queue.put_nowait((request, batcher, telemetry))
+                submit_queue.put_nowait((request, batcher, telemetry))
             except asyncio.QueueFull:
                 self._cancel_proof_admission(batcher, request)
                 self._cancel_logical_group_reservation(batcher, request)
@@ -2410,13 +2461,17 @@ class ValidatorServer:
         )
         return app
 
-    async def _submit_worker(self) -> None:
+    async def _submit_worker(
+        self,
+        submit_queue: asyncio.Queue | None = None,
+    ) -> None:
         # Lazy import — keeps the module loadable in CPU-only test envs.
         from reliquary.validator.service import _try_empty_cuda_cache
 
+        queue = submit_queue if submit_queue is not None else self._submit_queue
         while True:
             try:
-                item = await self._submit_queue.get()
+                item = await queue.get()
             except asyncio.CancelledError:
                 return
             if len(item) == 3:
@@ -2567,12 +2622,26 @@ class ValidatorServer:
                     reject_reason=None,
                 )
                 self._inflight_proofs += 1
+                env_name = str(
+                    getattr(getattr(batcher, "env", None), "name", "unknown")
+                )
+                self._inflight_proofs_by_environment[env_name] += 1
                 try:
                     response = await asyncio.to_thread(
                         self._call_accept_submission, batcher, request, telemetry
                     )
                 finally:
                     self._inflight_proofs = max(0, self._inflight_proofs - 1)
+                    remaining = max(
+                        0,
+                        self._inflight_proofs_by_environment[env_name] - 1,
+                    )
+                    if remaining:
+                        self._inflight_proofs_by_environment[env_name] = (
+                            remaining
+                        )
+                    else:
+                        self._inflight_proofs_by_environment.pop(env_name, None)
                 telemetry.refresh_from_batcher(batcher, at_decision=True)
                 telemetry.mark_decision(verified=True)
                 log_submission_stage(
@@ -2656,14 +2725,27 @@ class ValidatorServer:
         )
         self._server = uvicorn.Server(config)
         self._task = asyncio.create_task(self._server.serve())
-        self._worker_task = asyncio.create_task(self._submit_worker())
+        self._worker_task = asyncio.create_task(
+            self._submit_worker(self._submit_queue)
+        )
+        self._code_worker_task = asyncio.create_task(
+            self._submit_worker(self._code_submit_queue)
+        )
         await asyncio.sleep(0)
         logger.info("Validator HTTP server listening on %s:%d", self.host, self.port)
 
     async def stop(self) -> None:
-        if self._worker_task is not None:
-            self._worker_task.cancel()
-            self._worker_task = None
+        worker_tasks = [
+            task
+            for task in (self._worker_task, self._code_worker_task)
+            if task is not None
+        ]
+        for task in worker_tasks:
+            task.cancel()
+        if worker_tasks:
+            await asyncio.gather(*worker_tasks, return_exceptions=True)
+        self._worker_task = None
+        self._code_worker_task = None
         if self._server is not None:
             self._server.should_exit = True
         if self._task is not None:
