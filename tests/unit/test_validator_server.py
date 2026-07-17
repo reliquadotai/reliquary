@@ -303,6 +303,7 @@ def test_logical_group_duplicate_is_rejected_quota_neutral_before_proof():
 
     server = ValidatorServer()
     batcher = _batcher(window_start=500)
+    batcher.difficulty_auction_enabled = True
     server.set_active_batcher(batcher)
     server.set_current_state(WindowState.OPEN)
     client = TestClient(server.app)
@@ -683,6 +684,13 @@ def test_health_exposes_each_environment_window_independently():
         "proof_grading_attempts": 4,
         "pending_proof_reservations": 0,
         "inflight_proof_reservations": 0,
+        "reserved_payload_bytes": 0,
+        "pending_payload_bytes": 0,
+        "inflight_payload_bytes": 0,
+        "retained_payload_bytes": 0,
+        "difficulty_auction_enabled": False,
+        "difficulty_auction_proof_wall_elapsed_seconds": 0.0,
+        "difficulty_auction_proof_wall_exhausted": False,
         "post_trigger_proof_admission_count": 0,
     }
     code_health = health["window_environments"]["opencodeinstruct"]
@@ -888,6 +896,7 @@ def test_full_server_queue_returns_pending_proof_reservation():
     assert response.json()["reason"] == RejectReason.BATCH_FILLED.value
     assert batcher.pending_proof_reservations == 0
     assert batcher.proof_grading_attempts == 0
+    assert batcher.reserved_payload_bytes == 0
 
 
 # --- worker drops items whose batcher is no longer active ---

@@ -24,6 +24,7 @@ import time
 from typing import Any, Awaitable, Callable
 
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 import uvicorn
 
@@ -32,6 +33,8 @@ from reliquary.constants import (
     BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION,
     DRAND_ROUND_BACKWARD_TOLERANCE,
     DIFFICULTY_AUCTION_DELTA,
+    DIFFICULTY_AUCTION_ENFORCE,
+    DIFFICULTY_AUCTION_ENVIRONMENTS,
     DIFFICULTY_AUCTION_SHADOW_ENABLED,
     DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS,
     DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES,
@@ -43,10 +46,16 @@ from reliquary.constants import (
     FORCED_SEED_ENFORCE,
     FORCED_SEED_ROLLOUT_FLOOR,
     LEGACY_MERKLE_ROOT_ENFORCE,
+    MAX_AUCTION_SLOTS_PER_OPERATOR,
     MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
     MAX_PENDING_PROOF_QUEUE_DEPTH,
+    MAX_PENDING_SUBMISSION_BYTES_PER_ENV,
+    MAX_PENDING_SUBMISSION_BYTES_PER_HOTKEY,
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
+    MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
+    MAX_PROOF_WALL_SECONDS,
+    MAX_SUBMISSION_PAYLOAD_BYTES,
     MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
     MAX_TRUNCATED_PER_SUBMISSION,
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
@@ -127,6 +136,87 @@ def _is_mock_like(value: Any) -> bool:
     when the object is clearly a mock.
     """
     return type(value).__module__.startswith("unittest.mock")
+
+
+def _serialized_submission_bytes(request: BatchSubmissionRequest) -> int:
+    """Canonical post-parse size used by queue-memory accounting."""
+    return len(request.model_dump_json().encode("utf-8"))
+
+
+class _SubmissionBodyLimitMiddleware:
+    """Reject oversized /submit bodies before FastAPI parses their JSON.
+
+    The content-length fast path handles normal clients. Wrapping ``receive``
+    also covers chunked transfer encoding, where trusting a missing header would
+    otherwise let an attacker allocate an unbounded request before the route's
+    post-parse accounting runs.
+    """
+
+    def __init__(self, app: Any, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    @staticmethod
+    async def _reject(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        response = JSONResponse(
+            status_code=413,
+            content={"detail": "submission_payload_too_large"},
+            headers={"Connection": "close"},
+        )
+        await response(scope, receive, send)
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http" or scope.get("path") != "/submit":
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers", ()))
+        raw_length = headers.get(b"content-length")
+        if raw_length is not None:
+            try:
+                content_length = int(raw_length)
+            except ValueError:
+                content_length = -1
+            if content_length > self.max_bytes:
+                await self._reject(scope, receive, send)
+                return
+
+        received = 0
+        over_limit = False
+        buffered_messages: list[dict[str, Any]] = []
+
+        async def limited_receive():
+            nonlocal received, over_limit
+            message = await receive()
+            if message.get("type") == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_bytes:
+                    over_limit = True
+                    # Complete the downstream body stream without forwarding
+                    # the over-limit chunk. FastAPI may turn that truncated JSON
+                    # into a 400; ``buffered_send`` keeps that response private
+                    # and we replace it with the protocol's explicit 413 below.
+                    return {
+                        "type": "http.request",
+                        "body": b"",
+                        "more_body": False,
+                    }
+            return message
+
+        async def buffered_send(message):
+            buffered_messages.append(message)
+
+        try:
+            await self.app(scope, limited_receive, buffered_send)
+        except Exception:
+            if not over_limit:
+                raise
+
+        if over_limit:
+            await self._reject(scope, receive, send)
+            return
+        for message in buffered_messages:
+            await send(message)
 
 
 def _proof_free_model_config(batcher: Any) -> Any | None:
@@ -388,6 +478,30 @@ class _Health(BaseModel):
     proof_grading_attempts: int | None = None
     pending_proof_reservations: int | None = None
     inflight_proof_reservations: int | None = None
+    reserved_payload_bytes: int | None = None
+    pending_payload_bytes: int | None = None
+    inflight_payload_bytes: int | None = None
+    retained_payload_bytes: int | None = None
+    max_submission_payload_bytes: int = MAX_SUBMISSION_PAYLOAD_BYTES
+    max_pending_submission_bytes_per_hotkey: int = (
+        MAX_PENDING_SUBMISSION_BYTES_PER_HOTKEY
+    )
+    max_pending_submission_bytes_per_env: int = (
+        MAX_PENDING_SUBMISSION_BYTES_PER_ENV
+    )
+    difficulty_auction_enforced: bool = DIFFICULTY_AUCTION_ENFORCE
+    difficulty_auction_environments: list[str] = Field(
+        default_factory=lambda: list(DIFFICULTY_AUCTION_ENVIRONMENTS)
+    )
+    difficulty_auction_max_slots_per_operator: int = (
+        MAX_AUCTION_SLOTS_PER_OPERATOR
+    )
+    difficulty_auction_proof_attempt_limit: int = (
+        MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+    )
+    difficulty_auction_proof_wall_limit_seconds: float = MAX_PROOF_WALL_SECONDS
+    difficulty_auction_proof_wall_elapsed_seconds: float | None = None
+    difficulty_auction_proof_wall_exhausted: bool | None = None
     window_environments: dict[str, dict[str, Any]] = Field(
         default_factory=dict
     )
@@ -937,7 +1051,18 @@ class ValidatorServer:
                 return float(value)
             return None
 
-        distinct_fn = getattr(batcher, "distinct_valid_prompt_count", None)
+        auction_enabled = bool(
+            getattr(batcher, "difficulty_auction_enabled", False)
+        )
+        distinct_fn = getattr(
+            batcher,
+            (
+                "distinct_pending_prompt_count"
+                if auction_enabled
+                else "distinct_valid_prompt_count"
+            ),
+            None,
+        )
         idle_fn = getattr(batcher, "seconds_since_last_valid_submission", None)
         sealed_fn = getattr(batcher, "is_sealed", None)
         try:
@@ -961,7 +1086,11 @@ class ValidatorServer:
                 force_seal_reason if isinstance(force_seal_reason, str) else None
             ),
             "valid_submissions_count": _integer(
-                getattr(batcher, "valid_count", None)
+                getattr(
+                    batcher,
+                    "pending_count" if auction_enabled else "valid_count",
+                    None,
+                )
             ),
             "distinct_valid_prompt_count": _integer(distinct),
             "last_valid_submission_ts": _floating(
@@ -979,6 +1108,25 @@ class ValidatorServer:
             ),
             "inflight_proof_reservations": _integer(
                 getattr(batcher, "inflight_proof_reservations", None)
+            ),
+            "reserved_payload_bytes": _integer(
+                getattr(batcher, "reserved_payload_bytes", None)
+            ),
+            "pending_payload_bytes": _integer(
+                getattr(batcher, "pending_payload_bytes", None)
+            ),
+            "inflight_payload_bytes": _integer(
+                getattr(batcher, "inflight_payload_bytes", None)
+            ),
+            "retained_payload_bytes": _integer(
+                getattr(batcher, "retained_payload_bytes", None)
+            ),
+            "difficulty_auction_enabled": auction_enabled,
+            "difficulty_auction_proof_wall_elapsed_seconds": _floating(
+                getattr(batcher, "proof_wall_elapsed_seconds", None)
+            ),
+            "difficulty_auction_proof_wall_exhausted": bool(
+                getattr(batcher, "proof_wall_exhausted", False)
             ),
             "post_trigger_proof_admission_count": _integer(
                 getattr(batcher, "post_trigger_proof_admission_count", None)
@@ -1141,6 +1289,43 @@ class ValidatorServer:
             ),
             inflight_proof_reservations=(
                 getattr(batcher, "inflight_proof_reservations", None)
+                if batcher else None
+            ),
+            reserved_payload_bytes=(
+                getattr(batcher, "reserved_payload_bytes", None)
+                if batcher else None
+            ),
+            pending_payload_bytes=(
+                getattr(batcher, "pending_payload_bytes", None)
+                if batcher else None
+            ),
+            inflight_payload_bytes=(
+                getattr(batcher, "inflight_payload_bytes", None)
+                if batcher else None
+            ),
+            retained_payload_bytes=(
+                getattr(batcher, "retained_payload_bytes", None)
+                if batcher else None
+            ),
+            difficulty_auction_enforced=DIFFICULTY_AUCTION_ENFORCE,
+            difficulty_auction_environments=list(
+                DIFFICULTY_AUCTION_ENVIRONMENTS
+            ),
+            difficulty_auction_max_slots_per_operator=(
+                MAX_AUCTION_SLOTS_PER_OPERATOR
+            ),
+            difficulty_auction_proof_attempt_limit=(
+                MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+            ),
+            difficulty_auction_proof_wall_limit_seconds=(
+                MAX_PROOF_WALL_SECONDS
+            ),
+            difficulty_auction_proof_wall_elapsed_seconds=(
+                getattr(batcher, "proof_wall_elapsed_seconds", None)
+                if batcher else None
+            ),
+            difficulty_auction_proof_wall_exhausted=(
+                bool(getattr(batcher, "proof_wall_exhausted", False))
                 if batcher else None
             ),
             window_environments=window_environments,
@@ -1379,6 +1564,16 @@ class ValidatorServer:
             t_arrival = getattr(http_request.state, "t_arrival", None)
             if t_arrival is None:
                 t_arrival = time.time()
+            payload_bytes = await asyncio.to_thread(
+                _serialized_submission_bytes,
+                request,
+            )
+            if payload_bytes > MAX_SUBMISSION_PAYLOAD_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail="submission_payload_too_large",
+                )
+            request._payload_bytes = payload_bytes
             hk = request.miner_hotkey
             telemetry = SubmitTelemetry.from_request(
                 request, t_arrival=t_arrival,
@@ -2205,6 +2400,14 @@ class ValidatorServer:
             ]
             return VerdictsResponse(verdicts=out)
 
+        # Add this last so Starlette places it outermost, ahead of the
+        # BaseHTTPMiddleware used by ``stamp_arrival``. Otherwise FastAPI may
+        # translate an over-limit receive exception into a generic 400 before
+        # the limiter can emit the intended 413 for chunked requests.
+        app.add_middleware(
+            _SubmissionBodyLimitMiddleware,
+            max_bytes=MAX_SUBMISSION_PAYLOAD_BYTES,
+        )
         return app
 
     async def _submit_worker(self) -> None:
@@ -2282,7 +2485,10 @@ class ValidatorServer:
             # ~B_BATCH × verify-time instead of letting it grow with raw
             # arrival rate. Same accounting bucket as the HTTP path so a
             # miner inspecting late_drops sees one consistent metric.
-            if batcher.is_sealed():
+            if batcher.is_sealed() and (
+                not getattr(batcher, "difficulty_auction_enabled", False)
+                or getattr(batcher, "seal_snapshot_started", False)
+            ):
                 self._cancel_proof_admission(batcher, request)
                 self._cancel_logical_group_reservation(batcher, request)
                 telemetry.refresh_from_batcher(batcher, at_decision=True)

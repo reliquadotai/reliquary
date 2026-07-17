@@ -1028,7 +1028,67 @@ class ValidationService:
     def _queue_and_proofs_drained(self) -> bool:
         queue_depth = int(getattr(self.server, "submit_queue_depth", 0) or 0)
         inflight = int(getattr(self.server, "proof_verification_inflight", 0) or 0)
-        return queue_depth == 0 and inflight == 0
+        if queue_depth != 0 or inflight != 0:
+            return False
+        # Close the dequeue race where the worker has removed an item from the
+        # asyncio queue but has not yet incremented ``_inflight_proofs``. The
+        # batcher reservation spans that gap and is the authoritative signal.
+        for batcher in self._active_batchers.values():
+            if int(getattr(batcher, "pending_proof_reservations", 0) or 0):
+                return False
+            if int(getattr(batcher, "inflight_proof_reservations", 0) or 0):
+                return False
+        return True
+
+    async def _freeze_auction_populations(self, batchers: list[Any]) -> bool:
+        """Drain pre-deadline work, then freeze each auction pending pool.
+
+        Returns ``True`` when the normal drain budget was exhausted. Pending
+        queue entries are then rejected by ``start_proof_admission``; already
+        started grading is allowed one final bounded interval to finish so seal
+        can never race a mutation of the ranked population.
+        """
+        auction_batchers = [
+            batcher for batcher in batchers
+            if getattr(batcher, "difficulty_auction_enabled", False)
+        ]
+        if not auction_batchers:
+            return False
+
+        loop = asyncio.get_running_loop()
+        drain_deadline = loop.time() + MAX_SEAL_QUEUE_DRAIN_SECONDS
+        while not self._queue_and_proofs_drained():
+            if loop.time() >= drain_deadline:
+                break
+            await asyncio.sleep(PROOF_ADMISSION_STALL_POLL_SECONDS)
+
+        timed_out = not self._queue_and_proofs_drained()
+        for batcher in auction_batchers:
+            begin_snapshot = getattr(batcher, "begin_seal_snapshot", None)
+            if callable(begin_snapshot):
+                begin_snapshot()
+
+        # Once frozen, pending items are cheap drops. A request that already
+        # started may still hold the batcher lock while grading; do not race it.
+        quiesce_deadline = loop.time() + MAX_SEAL_QUEUE_DRAIN_SECONDS
+        while any(
+            int(getattr(batcher, "inflight_proof_reservations", 0) or 0)
+            for batcher in auction_batchers
+        ):
+            if loop.time() >= quiesce_deadline:
+                raise RuntimeError(
+                    "auction admission failed to quiesce before seal"
+                )
+            await asyncio.sleep(PROOF_ADMISSION_STALL_POLL_SECONDS)
+
+        if timed_out:
+            logger.warning(
+                "Window %d auction queue drain reached %.1fs; froze pending "
+                "populations and dropped remaining queued submissions",
+                self._window_n,
+                MAX_SEAL_QUEUE_DRAIN_SECONDS,
+            )
+        return timed_out
 
     def _seconds_since_last_valid_submission(self, batcher) -> float | None:
         counter = getattr(batcher, "seconds_since_last_valid_submission", None)
@@ -1170,6 +1230,9 @@ class ValidationService:
                 return "timeout"
 
             await asyncio.sleep(min(PROOF_ADMISSION_STALL_POLL_SECONDS, remaining))
+
+        if await self._freeze_auction_populations(batchers):
+            reasons["auction"] = "auction_queue_drain_timeout"
 
         if not reasons:
             return "sealed"

@@ -238,6 +238,8 @@ class BatchSubmissionRequest(BaseModel):
     _logical_group_reservation: tuple[str, bytes] | None = PrivateAttr(
         default=None
     )
+    _payload_bytes: int = PrivateAttr(default=0)
+    _retain_payload: bool = PrivateAttr(default=False)
 
     @field_validator("rollouts")
     @classmethod

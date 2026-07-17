@@ -101,6 +101,7 @@ def _setup(*,
     batcher.env = MagicMock()
     batcher.env.__len__.return_value = env_len
     batcher.is_sealed.return_value = False
+    batcher.difficulty_auction_enabled = False
     # MagicMock attribute access auto-creates truthy mocks; pin the seal
     # extension's trigger round attribute to None so the BATCH_FILLED
     # gate at the cheap-reject layer doesn't fire for tests that don't
@@ -615,8 +616,8 @@ def test_claimed_out_of_zone_rejected_before_proof_admission():
     ([1.0] + [0.0] * 7, [1.0] * 7 + [0.0]),
     ids=("k1", "k7"),
 )
-def test_auction_frontier_groups_pass_http_preflight(rewards):
-    """The HTTP path must implement the same gate as deferred admission."""
+def test_auction_frontier_groups_fail_calibrated_http_preflight(rewards):
+    """The HTTP path keeps the same k=2..6 eligibility as admission."""
     s = ValidatorServer()
     s.set_current_state(WindowState.OPEN)
     batcher = _PreflightAdmissionBatcher(eos_token_id=99)
@@ -630,10 +631,10 @@ def test_auction_frontier_groups_pass_http_preflight(rewards):
         response = client.post("/submit", json=payload)
 
     assert response.json() == {
-        "accepted": True,
-        "reason": RejectReason.ACCEPTED.value,
+        "accepted": False,
+        "reason": RejectReason.OUT_OF_ZONE.value,
     }
-    assert batcher.proof_admission_count == 1
+    assert batcher.proof_admission_count == 0
 
 
 def test_private_reward_env_skips_claimed_reward_zone_preflight():

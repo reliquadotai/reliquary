@@ -28,13 +28,18 @@ from reliquary.constants import (
     DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS,
     DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES,
     DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR,
+    MAX_AUCTION_SLOTS_PER_OPERATOR,
     MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
     MIN_EOS_PROBABILITY,
     FORENSIC_SAMPLE_PER_WINDOW,
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
+    MAX_PENDING_SUBMISSION_BYTES_PER_ENV,
+    MAX_PENDING_SUBMISSION_BYTES_PER_HOTKEY,
     MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
+    MAX_PROOF_WALL_SECONDS,
     MAX_SEAL_QUEUE_DRAIN_SECONDS,
+    MAX_SUBMISSION_PAYLOAD_BYTES,
     MAX_SUBMISSIONS_PER_PROMPT,
     MAX_TRUNCATED_PER_SUBMISSION,
     PROMPT_RANGE_SIZE,
@@ -498,6 +503,10 @@ class GrpoWindowBatcher:
             if (normalized_hotkey := str(hotkey).strip())
             and (normalized_operator := str(operator).strip())
         }
+        # ``None`` is reserved for direct/test embedding where no metagraph
+        # exists. Production always passes a snapshot (possibly incomplete),
+        # and therefore fails closed candidate-by-candidate on missing entries.
+        self._operator_mapping_enforced = operator_by_hotkey is not None
 
         # Lock-free snapshot read by the HTTP /state handler. The submit
         # worker holds ``_lock`` for the entire GRAIL verify (~5-25s); a
@@ -648,14 +657,30 @@ class GrpoWindowBatcher:
         # Started attempts are never refunded.
         self._proof_grading_attempts = 0
         self._pending_proof_reservations: dict[
-            int, tuple[BatchSubmissionRequest, str, bool]
+            int, tuple[BatchSubmissionRequest, str, bool, int]
         ] = {}
         self._inflight_proof_reservations: dict[
-            int, tuple[BatchSubmissionRequest, str, bool]
+            int, tuple[BatchSubmissionRequest, str, bool, int]
         ] = {}
+        self._retained_payload_reservations: dict[
+            int, tuple[BatchSubmissionRequest, str, int]
+        ] = {}
+        self._pending_payload_bytes = 0
+        self._inflight_payload_bytes = 0
+        self._retained_payload_bytes = 0
+        self._payload_bytes_by_hotkey: dict[str, int] = {}
         self._pending_post_trigger_proof_reservations = 0
         self._post_trigger_proof_admission_count = 0
         self._expensive_proof_failures_by_hotkey: dict[str, int] = {}
+        self.proof_wall_elapsed_seconds = 0.0
+        self.proof_wall_exhausted = False
+        self.forensic_proof_attempts = 0
+        self.auction_operator_cap_skips = 0
+        self.auction_operator_unmapped_skips = 0
+        self.auction_candidates: list[dict[str, Any]] = []
+        self._proof_wall_started_at: float | None = None
+        self._seal_snapshot_started = False
+        self._seal_completed = False
         # v2.1: checkpoint hash miners must match. Empty string disables
         # the gate (test convenience / pre-first-publish).
         self.current_checkpoint_hash: str = ""
@@ -816,6 +841,51 @@ class GrpoWindowBatcher:
         return len(self._inflight_proof_reservations)
 
     @property
+    def pending_payload_bytes(self) -> int:
+        with self._proof_admission_lock:
+            return self._pending_payload_bytes
+
+    @property
+    def inflight_payload_bytes(self) -> int:
+        with self._proof_admission_lock:
+            return self._inflight_payload_bytes
+
+    @property
+    def retained_payload_bytes(self) -> int:
+        with self._proof_admission_lock:
+            return self._retained_payload_bytes
+
+    @property
+    def reserved_payload_bytes(self) -> int:
+        with self._proof_admission_lock:
+            return (
+                self._pending_payload_bytes
+                + self._inflight_payload_bytes
+                + self._retained_payload_bytes
+            )
+
+    @property
+    def payload_bytes_by_hotkey(self) -> dict[str, int]:
+        with self._proof_admission_lock:
+            return dict(self._payload_bytes_by_hotkey)
+
+    @property
+    def seal_snapshot_started(self) -> bool:
+        with self._proof_admission_lock:
+            return self._seal_snapshot_started
+
+    def begin_seal_snapshot(self) -> None:
+        """Freeze proof admission before the auction reads its pending pool.
+
+        The service first closes HTTP admission at the collection deadline and
+        gives already-queued requests a bounded drain period. This marker then
+        prevents a dequeued straggler from entering ``_accept_locked`` after
+        ``_prove_ranked`` has copied the pending population.
+        """
+        with self._proof_admission_lock:
+            self._seal_snapshot_started = True
+
+    @property
     def proof_grading_capacity_used(self) -> int:
         """Started attempts plus pending reservations used for admission."""
         return self._proof_grading_attempts + len(
@@ -888,6 +958,54 @@ class GrpoWindowBatcher:
         """Make a reservation permanent for the rest of this window."""
         request._logical_group_reservation = None
 
+    @staticmethod
+    def _submission_payload_bytes(request: BatchSubmissionRequest) -> int:
+        size = int(getattr(request, "_payload_bytes", 0) or 0)
+        if size <= 0:
+            size = len(request.model_dump_json().encode("utf-8"))
+            request._payload_bytes = size
+        return size
+
+    def _reserved_payload_bytes_locked(self) -> int:
+        return (
+            self._pending_payload_bytes
+            + self._inflight_payload_bytes
+            + self._retained_payload_bytes
+        )
+
+    def _payload_capacity_reason_locked(
+        self,
+        hotkey: str,
+        payload_bytes: int,
+    ) -> str | None:
+        if payload_bytes > MAX_SUBMISSION_PAYLOAD_BYTES:
+            return "submission_payload_too_large"
+        if (
+            self._reserved_payload_bytes_locked() + payload_bytes
+            > MAX_PENDING_SUBMISSION_BYTES_PER_ENV
+        ):
+            return "pending_payload_bytes_env_full"
+        if (
+            self._payload_bytes_by_hotkey.get(hotkey, 0) + payload_bytes
+            > MAX_PENDING_SUBMISSION_BYTES_PER_HOTKEY
+        ):
+            return "pending_payload_bytes_hotkey_full"
+        return None
+
+    def _release_hotkey_payload_locked(
+        self,
+        hotkey: str,
+        payload_bytes: int,
+    ) -> None:
+        remaining = max(
+            0,
+            self._payload_bytes_by_hotkey.get(hotkey, 0) - payload_bytes,
+        )
+        if remaining:
+            self._payload_bytes_by_hotkey[hotkey] = remaining
+        else:
+            self._payload_bytes_by_hotkey.pop(hotkey, None)
+
     def try_reserve_proof_admission(
         self,
         request: BatchSubmissionRequest,
@@ -903,11 +1021,14 @@ class GrpoWindowBatcher:
         GPU work per window, so a zone-valid submission entering the proof is
         only counted for telemetry, never rejected on a candidate budget.
         """
+        payload_bytes = self._submission_payload_bytes(request)
+        request._retain_payload = False
         with self._proof_admission_lock:
             reservation_id = id(request)
             if (
                 reservation_id in self._pending_proof_reservations
                 or reservation_id in self._inflight_proof_reservations
+                or reservation_id in self._retained_payload_reservations
             ):
                 return False, "proof_reservation_duplicate"
 
@@ -925,6 +1046,13 @@ class GrpoWindowBatcher:
                 >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
             ):
                 return False, "proof_grading_attempts_full"
+
+            payload_reason = self._payload_capacity_reason_locked(
+                request.miner_hotkey,
+                payload_bytes,
+            )
+            if payload_reason is not None:
+                return False, payload_reason
 
             trigger_round = self._seal_trigger_round
             is_post_trigger = (
@@ -944,6 +1072,12 @@ class GrpoWindowBatcher:
                 request,
                 request.miner_hotkey,
                 is_post_trigger,
+                payload_bytes,
+            )
+            self._pending_payload_bytes += payload_bytes
+            self._payload_bytes_by_hotkey[request.miner_hotkey] = (
+                self._payload_bytes_by_hotkey.get(request.miner_hotkey, 0)
+                + payload_bytes
             )
             return True, None
 
@@ -957,6 +1091,20 @@ class GrpoWindowBatcher:
             reservation = self._pending_proof_reservations.pop(
                 reservation_id, None,
             )
+            if self._seal_snapshot_started:
+                if reservation is not None:
+                    _, hotkey, is_post_trigger, payload_bytes = reservation
+                    self._pending_payload_bytes = max(
+                        0,
+                        self._pending_payload_bytes - payload_bytes,
+                    )
+                    if is_post_trigger:
+                        self._pending_post_trigger_proof_reservations = max(
+                            0,
+                            self._pending_post_trigger_proof_reservations - 1,
+                        )
+                    self._release_hotkey_payload_locked(hotkey, payload_bytes)
+                return False, "auction_seal_snapshot_started"
             if reservation is None:
                 # Compatibility for direct/legacy worker injection. Production
                 # requests always reserve in the HTTP path first.
@@ -965,9 +1113,30 @@ class GrpoWindowBatcher:
                     >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
                 ):
                     return False, "proof_grading_attempts_full"
-                reservation = (request, request.miner_hotkey, False)
+                payload_bytes = self._submission_payload_bytes(request)
+                payload_reason = self._payload_capacity_reason_locked(
+                    request.miner_hotkey,
+                    payload_bytes,
+                )
+                if payload_reason is not None:
+                    return False, payload_reason
+                reservation = (
+                    request,
+                    request.miner_hotkey,
+                    False,
+                    payload_bytes,
+                )
+                self._payload_bytes_by_hotkey[request.miner_hotkey] = (
+                    self._payload_bytes_by_hotkey.get(request.miner_hotkey, 0)
+                    + payload_bytes
+                )
+            else:
+                self._pending_payload_bytes = max(
+                    0,
+                    self._pending_payload_bytes - reservation[3],
+                )
 
-            _, hotkey, is_post_trigger = reservation
+            _, hotkey, is_post_trigger, payload_bytes = reservation
             if is_post_trigger:
                 self._pending_post_trigger_proof_reservations = max(
                     0,
@@ -981,12 +1150,14 @@ class GrpoWindowBatcher:
                 self._expensive_proof_failures_by_hotkey.get(hotkey, 0)
                 >= MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
             ):
+                self._release_hotkey_payload_locked(hotkey, payload_bytes)
                 return False, "proof_failure_debt_hotkey"
 
             self._proof_grading_attempts += 1
             if is_post_trigger:
                 self._post_trigger_proof_admission_count += 1
             self._inflight_proof_reservations[reservation_id] = reservation
+            self._inflight_payload_bytes += payload_bytes
             return True, None
 
     def cancel_proof_admission(self, request: BatchSubmissionRequest) -> bool:
@@ -1002,12 +1173,49 @@ class GrpoWindowBatcher:
                     0,
                     self._pending_post_trigger_proof_reservations - 1,
                 )
+            payload_bytes = reservation[3]
+            self._pending_payload_bytes = max(
+                0,
+                self._pending_payload_bytes - payload_bytes,
+            )
+            self._release_hotkey_payload_locked(
+                reservation[1], payload_bytes
+            )
             return True
 
     def finish_proof_admission(self, request: BatchSubmissionRequest) -> None:
-        """Release the in-flight marker; started-attempt debt remains."""
+        """Release work debt, retaining accepted auction payloads until seal."""
         with self._proof_admission_lock:
-            self._inflight_proof_reservations.pop(id(request), None)
+            reservation_id = id(request)
+            reservation = self._inflight_proof_reservations.pop(
+                reservation_id, None
+            )
+            if reservation is None:
+                return
+            _, hotkey, _is_post_trigger, payload_bytes = reservation
+            self._inflight_payload_bytes = max(
+                0,
+                self._inflight_payload_bytes - payload_bytes,
+            )
+            if request._retain_payload and not self._seal_completed:
+                self._retained_payload_reservations[reservation_id] = (
+                    request,
+                    hotkey,
+                    payload_bytes,
+                )
+                self._retained_payload_bytes += payload_bytes
+                return
+            self._release_hotkey_payload_locked(hotkey, payload_bytes)
+
+    def _release_retained_payloads(self) -> None:
+        with self._proof_admission_lock:
+            self._seal_completed = True
+            reservations = list(self._retained_payload_reservations.values())
+            self._retained_payload_reservations.clear()
+            self._retained_payload_bytes = 0
+            for request, hotkey, payload_bytes in reservations:
+                request._retain_payload = False
+                self._release_hotkey_payload_locked(hotkey, payload_bytes)
 
     def _note_grail_candidate(self) -> None:
         """Count a zone-valid submission entering the GRAIL/GPU proof path.
@@ -1456,6 +1664,11 @@ class GrpoWindowBatcher:
                 accepted=True, reason=RejectReason.ACCEPTED
             )
 
+        # The HTTP worker releases its in-flight marker after this returns, but
+        # the request remains reachable from the auction pool until seal. Mark
+        # it so byte accounting transfers to the retained bucket instead of
+        # being refunded prematurely.
+        request._retain_payload = True
         self._pending.append(pending)
         self._submissions_per_prompt.setdefault(
             request.prompt_idx, []
@@ -2478,13 +2691,59 @@ class GrpoWindowBatcher:
         proven: list[ValidSubmission] = []
         claimed: set[int] = set()
         attempted_ids: set[int] = set()
+        slots_by_operator: dict[str, int] = {}
+        self.auction_operator_cap_skips = 0
+        self.auction_operator_unmapped_skips = 0
+        self.difficulty_auction_metadata_by_id = {}
+        candidate_rows: list[dict[str, Any]] = []
+        for rank, (pending_submission, score) in enumerate(ranked, start=1):
+            operator = self._operator_by_hotkey.get(pending_submission.hotkey)
+            if operator is None and not self._operator_mapping_enforced:
+                operator = pending_submission.hotkey
+            row = {
+                "hotkey": pending_submission.hotkey,
+                "prompt_idx": pending_submission.prompt_idx,
+                "selection_digest": pending_submission.selection_digest.hex(),
+                "drand_round": pending_submission.drand_round,
+                "value": score.value,
+                "mean_reward": score.mean_reward,
+                "reward_std": score.reward_std,
+                "reward_count": score.reward_count,
+                "operator_id": operator,
+                "rank": rank,
+                "proof_attempted": False,
+                "proof_passed": None,
+                "selected": False,
+                "status": "ranked",
+            }
+            candidate_rows.append(row)
+            self.difficulty_auction_metadata_by_id[id(pending_submission)] = row
 
-        for p, _score in ranked:
+        self._proof_wall_started_at = self._time_fn()
+        self.proof_wall_exhausted = False
+        stop_reason: str | None = None
+
+        for (p, _score), row in zip(ranked, candidate_rows):
             if len(proven) >= B_BATCH:
+                stop_reason = "batch_filled"
                 break
             if p.prompt_idx in claimed:
+                row["status"] = "same_prompt_superseded"
                 continue          # a higher-ranked submission already won it
             if self._cooldown.is_in_cooldown(p.prompt_idx, self.window_start):
+                row["status"] = "cooldown"
+                continue
+            operator = row["operator_id"]
+            if operator is None:
+                row["status"] = "operator_unmapped"
+                self.auction_operator_unmapped_skips += 1
+                continue
+            if (
+                slots_by_operator.get(operator, 0)
+                >= MAX_AUCTION_SLOTS_PER_OPERATOR
+            ):
+                row["status"] = "operator_cap"
+                self.auction_operator_cap_skips += 1
                 continue
             # Global proof budget: proving cannot exceed the graded-pool ceiling
             # (v2 §2.3). This bounds a multi-hotkey fabricated flood that the
@@ -2496,6 +2755,21 @@ class GrpoWindowBatcher:
                     "pending=%d — advancing with shortfall",
                     self.window_start, attempts, len(proven), len(pending),
                 )
+                stop_reason = "attempt_budget"
+                break
+            elapsed = self._time_fn() - self._proof_wall_started_at
+            if elapsed >= MAX_PROOF_WALL_SECONDS:
+                self.proof_wall_exhausted = True
+                stop_reason = "wall_budget"
+                logger.warning(
+                    "proof wall budget exhausted window=%d elapsed_s=%.2f "
+                    "attempts=%d proven=%d pending=%d — advancing with shortfall",
+                    self.window_start,
+                    elapsed,
+                    attempts,
+                    len(proven),
+                    len(pending),
+                )
                 break
             # Per-hotkey griefer bound. A fabricated group ranks at the top by
             # construction and fails the proof; each hotkey is skipped after its
@@ -2504,19 +2778,41 @@ class GrpoWindowBatcher:
                 self.proof_failure_debt(p.hotkey)
                 >= MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
             ):
+                row["status"] = "hotkey_proof_debt"
                 continue
             attempts += 1
             attempted_ids.add(id(p))
+            row["proof_attempted"] = True
+            row["status"] = "proof_started"
             sub = self._verify_expensive(p)
             if sub is None:
+                row["proof_passed"] = False
+                row["status"] = "proof_failed"
                 continue          # rejected; promote the next-ranked for prompt
+            row["proof_passed"] = True
+            row["selected"] = True
+            row["status"] = "selected"
             proven.append(sub)
             claimed.add(p.prompt_idx)
+            slots_by_operator[operator] = slots_by_operator.get(operator, 0) + 1
+            self.difficulty_auction_metadata_by_id[id(sub)] = row
 
         with self._lock:
             self._valid = proven
             self.valid_count = len(proven)
         self.proof_attempts = attempts
+        self.proof_wall_elapsed_seconds = max(
+            0.0,
+            self._time_fn() - self._proof_wall_started_at,
+        )
+        if stop_reason is not None:
+            for row in candidate_rows:
+                if row["status"] == "ranked":
+                    row["status"] = (
+                        "not_needed" if stop_reason == "batch_filled"
+                        else f"unobserved_{stop_reason}"
+                    )
+        self.auction_candidates = candidate_rows
         # Read by _prove_forensic_sample to find the pool this window never
         # looked at.
         self._attempted_pending_ids = attempted_ids
@@ -2553,14 +2849,36 @@ class GrpoWindowBatcher:
             ).digest()
         )
         sample = remainder[:FORENSIC_SAMPLE_PER_WINDOW]
-        results = [
-            ForensicSampleResult(
-                hotkey=p.hotkey,
-                prompt_idx=p.prompt_idx,
-                passed=self._verify_expensive(p) is not None,
+        results: list[ForensicSampleResult] = []
+        self.forensic_proof_attempts = 0
+        for p in sample:
+            if self.proof_attempts >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW:
+                break
+            if self._proof_wall_started_at is None:
+                break
+            elapsed = self._time_fn() - self._proof_wall_started_at
+            if elapsed >= MAX_PROOF_WALL_SECONDS:
+                self.proof_wall_exhausted = True
+                break
+            passed = self._verify_expensive(p) is not None
+            self.proof_attempts += 1
+            self.forensic_proof_attempts += 1
+            self._attempted_pending_ids.add(id(p))
+            row = self.difficulty_auction_metadata_by_id.get(id(p))
+            if row is not None:
+                row["forensic_sampled"] = True
+                row["forensic_passed"] = passed
+            results.append(
+                ForensicSampleResult(
+                    hotkey=p.hotkey,
+                    prompt_idx=p.prompt_idx,
+                    passed=passed,
+                )
             )
-            for p in sample
-        ]
+        self.proof_wall_elapsed_seconds = max(
+            self.proof_wall_elapsed_seconds,
+            self._time_fn() - self._proof_wall_started_at,
+        )
         self.forensic_sample = results
         return results
 
@@ -2742,6 +3060,15 @@ class GrpoWindowBatcher:
     def seal_batch(
         self, pool: float = 1.0
     ) -> tuple[list[ValidSubmission], dict[str, float]]:
+        """Finalize selection and release every retained payload reservation."""
+        try:
+            return self._seal_batch_inner(pool)
+        finally:
+            self._release_retained_payloads()
+
+    def _seal_batch_inner(
+        self, pool: float = 1.0
+    ) -> tuple[list[ValidSubmission], dict[str, float]]:
         """Pick the training batch and compute the reward distribution.
 
         Proving happens first: ``_prove_ranked`` ranks the pending pool by
@@ -2781,7 +3108,30 @@ class GrpoWindowBatcher:
                     "delta": DIFFICULTY_AUCTION_DELTA,
                     "pending_candidates": len(self._pending),
                     "proof_attempts": self.proof_attempts,
+                    "forensic_proof_attempts": self.forensic_proof_attempts,
+                    "proof_attempt_limit": (
+                        MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+                    ),
+                    "proof_wall_seconds": self.proof_wall_elapsed_seconds,
+                    "proof_wall_limit_seconds": MAX_PROOF_WALL_SECONDS,
+                    "proof_wall_exhausted": self.proof_wall_exhausted,
                     "proven_winners": len(self._valid),
+                    "operator_cap": MAX_AUCTION_SLOTS_PER_OPERATOR,
+                    "operator_cap_skips": self.auction_operator_cap_skips,
+                    "operator_unmapped_skips": (
+                        self.auction_operator_unmapped_skips
+                    ),
+                    "operator_mapping_complete": all(
+                        row.get("operator_id") is not None
+                        for row in self.auction_candidates
+                    ),
+                    "operator_mapping_enforced": (
+                        self._operator_mapping_enforced
+                    ),
+                    "retained_payload_bytes_at_seal": (
+                        self.retained_payload_bytes
+                    ),
+                    "candidates": self.auction_candidates,
                 }
             else:
                 self._compute_difficulty_auction_shadow()

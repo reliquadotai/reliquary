@@ -28,7 +28,7 @@ def _always_true_proof(commit, model, randomness):
 @dataclass
 class _FakeEnv:
     @property
-    def name(self): return "fake"
+    def name(self): return "openmathinstruct"
     def __len__(self): return 1000
     def get_problem(self, i): return {"prompt": f"p{i}", "ground_truth": "", "id": f"p{i}"}
     def compute_reward(self, p, c): return 1.0 if "WIN" in c else 0.0
@@ -167,7 +167,10 @@ def _patch_open_grpo_window(svc):
             hash_set=hash_set,
             bootstrap=bootstrap,
             queue_drained_predicate=queue_drained_predicate,
-            operator_by_hotkey=operator_by_hotkey,
+            # This integration fixture has no metagraph. ``None`` selects the
+            # direct-embedding identity fallback; production always supplies a
+            # complete hotkey-to-operator snapshot.
+            operator_by_hotkey=None,
             # Stub out torch-dependent verifiers.
             verify_commitment_proofs_fn=_always_true_proof,
             verify_signature_fn=lambda c, h: True,
@@ -487,7 +490,9 @@ async def test_timeout_partial_seal_accumulates_without_publishing():
     assert svc._current_window_state == WindowState.READY
     assert svc._checkpoint_n == initial_cn
     svc._checkpoint_store.publish.assert_not_awaited()
-    assert svc._training_accumulator.snapshot()["counts"] == {"fake": 3}
+    assert svc._training_accumulator.snapshot()["counts"] == {
+        "openmathinstruct": 3
+    }
 
 
 @pytest.mark.asyncio
@@ -512,7 +517,9 @@ async def test_sparse_windows_train_once_accumulated_target_is_full():
 
     svc._checkpoint_store.publish.assert_awaited_once()
     assert svc._checkpoint_n == 1
-    assert svc._training_accumulator.snapshot()["counts"] == {"fake": 0}
+    assert svc._training_accumulator.snapshot()["counts"] == {
+        "openmathinstruct": 0
+    }
 
 
 @pytest.mark.asyncio
@@ -531,7 +538,9 @@ async def test_checkpoint_rollover_discards_partial_accumulation():
         ))
         assert response.accepted
     await svc._train_and_publish()
-    assert svc._training_accumulator.snapshot()["counts"] == {"fake": 3}
+    assert svc._training_accumulator.snapshot()["counts"] == {
+        "openmathinstruct": 3
+    }
 
     svc._checkpoint_store.current_manifest.return_value = ManifestEntry(
         checkpoint_n=1,
@@ -553,8 +562,8 @@ async def test_checkpoint_rollover_discards_partial_accumulation():
 
     snapshot = svc._training_accumulator.snapshot()
     assert snapshot["checkpoint_revision"] == "sha256:cpB"
-    assert snapshot["counts"] == {"fake": 2}
-    assert snapshot["source_windows"] == {"fake": [2]}
+    assert snapshot["counts"] == {"openmathinstruct": 2}
+    assert snapshot["source_windows"] == {"openmathinstruct": [2]}
     svc._checkpoint_store.publish.assert_not_awaited()
 
 
@@ -585,7 +594,9 @@ async def test_quarantined_partial_window_is_not_accumulated():
     ):
         await svc._train_and_publish()
 
-    assert svc._training_accumulator.snapshot()["counts"] == {"fake": 0}
+    assert svc._training_accumulator.snapshot()["counts"] == {
+        "openmathinstruct": 0
+    }
     svc._checkpoint_store.publish.assert_not_awaited()
 
 
@@ -621,7 +632,9 @@ async def test_disable_train_retains_ready_batch_until_reenabled(monkeypatch):
         await svc._train_and_publish()
 
     svc._checkpoint_store.publish.assert_awaited_once()
-    assert svc._training_accumulator.snapshot()["counts"] == {"fake": 0}
+    assert svc._training_accumulator.snapshot()["counts"] == {
+        "openmathinstruct": 0
+    }
 
 
 @pytest.mark.asyncio
@@ -706,7 +719,9 @@ async def test_failed_publish_retries_without_an_extra_optimizer_step():
     assert svc._checkpoint_n == 1
     assert svc._trained_windows_since_publish == 0
     assert health.training_trained_windows_since_publish == 0
-    assert svc._training_accumulator.snapshot()["counts"] == {"fake": 0}
+    assert svc._training_accumulator.snapshot()["counts"] == {
+        "openmathinstruct": 0
+    }
 
 
 @pytest.mark.asyncio

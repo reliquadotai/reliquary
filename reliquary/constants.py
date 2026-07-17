@@ -173,6 +173,60 @@ VALIDATOR_HTTP_PORT = 8888
 # gate (e.g. forced-seed) without refund.
 MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW = 96
 
+# Seal-time GRAIL work is serial and an adversarial ranked prefix may fail one
+# candidate after another. The attempt ceiling bounds cardinality; this second
+# bound limits elapsed GPU time. It is checked between groups, so one in-flight
+# group may finish after the budget expires.
+MAX_PROOF_WALL_SECONDS = float(
+    _os.environ.get("RELIQUARY_MAX_PROOF_WALL_SECONDS", "240")
+)
+
+# Retained submission payload bounds. JSON bytes are measured from the parsed
+# Pydantic request before queue insertion. The per-environment ceiling is
+# independent for Math and Code; with the canonical two-env mix the aggregate
+# retained ceiling is 1 GiB. Python object overhead is higher than JSON size,
+# hence the deliberately conservative limits relative to host RAM.
+MAX_SUBMISSION_PAYLOAD_BYTES = int(
+    _os.environ.get(
+        "RELIQUARY_MAX_SUBMISSION_PAYLOAD_BYTES", str(64 * 1024 * 1024)
+    )
+)
+MAX_PENDING_SUBMISSION_BYTES_PER_HOTKEY = int(
+    _os.environ.get(
+        "RELIQUARY_MAX_PENDING_SUBMISSION_BYTES_PER_HOTKEY",
+        str(128 * 1024 * 1024),
+    )
+)
+MAX_PENDING_SUBMISSION_BYTES_PER_ENV = int(
+    _os.environ.get(
+        "RELIQUARY_MAX_PENDING_SUBMISSION_BYTES_PER_ENV",
+        str(512 * 1024 * 1024),
+    )
+)
+
+# Production concentration guard, applied independently in each environment.
+# The mapping is a block-refreshed hotkey->coldkey snapshot. Missing mappings
+# fail closed for the affected candidate; hotkey identity is never a fallback.
+MAX_AUCTION_SLOTS_PER_OPERATOR = int(
+    _os.environ.get("RELIQUARY_MAX_AUCTION_SLOTS_PER_OPERATOR", "2")
+)
+
+if MAX_PROOF_WALL_SECONDS <= 0:
+    raise ValueError("RELIQUARY_MAX_PROOF_WALL_SECONDS must be positive")
+if MAX_SUBMISSION_PAYLOAD_BYTES <= 0:
+    raise ValueError("RELIQUARY_MAX_SUBMISSION_PAYLOAD_BYTES must be positive")
+if MAX_PENDING_SUBMISSION_BYTES_PER_HOTKEY < MAX_SUBMISSION_PAYLOAD_BYTES:
+    raise ValueError(
+        "per-hotkey pending byte cap must allow one maximum-size submission"
+    )
+if (
+    MAX_PENDING_SUBMISSION_BYTES_PER_ENV
+    < MAX_PENDING_SUBMISSION_BYTES_PER_HOTKEY
+):
+    raise ValueError("per-environment pending byte cap must cover hotkey cap")
+if MAX_AUCTION_SLOTS_PER_OPERATOR <= 0:
+    raise ValueError("RELIQUARY_MAX_AUCTION_SLOTS_PER_OPERATOR must be positive")
+
 # Absolute server-side bound across active and draining environment queues.
 # Per-batcher reservation caps remain the primary bound; this is the final
 # backstop during a window swap or prolonged GPU stall.

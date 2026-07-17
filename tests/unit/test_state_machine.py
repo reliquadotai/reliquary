@@ -251,6 +251,57 @@ def test_proof_cap_breaker_waits_for_inflight_or_queued_work():
     assert svc._proof_admission_exhausted_and_drained(batcher) is False
 
 
+def test_queue_drain_observes_batcher_reservation_dequeue_gap():
+    """Queue empty + server inflight zero is not enough during dequeue."""
+    svc = _make_service()
+    svc._open_window()
+    svc._activate_window()
+    batcher = svc._active_batcher
+
+    request = MagicMock()
+    request.miner_hotkey = "miner"
+    request._payload_bytes = 1
+    request.drand_round = 0
+    assert batcher.try_reserve_proof_admission(request) == (True, None)
+    assert svc.server.submit_queue_depth == 0
+    assert svc.server.proof_verification_inflight == 0
+
+    assert svc._queue_and_proofs_drained() is False
+
+
+@pytest.mark.asyncio
+async def test_auction_freeze_marks_population_after_normal_drain():
+    svc = _make_service()
+    batcher = MagicMock()
+    batcher.difficulty_auction_enabled = True
+    batcher.pending_proof_reservations = 0
+    batcher.inflight_proof_reservations = 0
+    svc._active_batchers = {"openmathinstruct": batcher}
+
+    timed_out = await svc._freeze_auction_populations([batcher])
+
+    assert timed_out is False
+    batcher.begin_seal_snapshot.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_auction_freeze_times_out_then_drops_pending_admission(monkeypatch):
+    monkeypatch.setattr(
+        "reliquary.validator.service.MAX_SEAL_QUEUE_DRAIN_SECONDS", 0.0,
+    )
+    svc = _make_service()
+    batcher = MagicMock()
+    batcher.difficulty_auction_enabled = True
+    batcher.pending_proof_reservations = 1
+    batcher.inflight_proof_reservations = 0
+    svc._active_batchers = {"openmathinstruct": batcher}
+
+    timed_out = await svc._freeze_auction_populations([batcher])
+
+    assert timed_out is True
+    batcher.begin_seal_snapshot.assert_called_once_with()
+
+
 def test_proof_cap_breaker_uses_distinct_prompt_count():
     """Raw valid duplicates should not mask an unfillable trainable shortfall."""
     from reliquary.validator.service import MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
@@ -259,6 +310,7 @@ def test_proof_cap_breaker_uses_distinct_prompt_count():
     svc._open_window()
     svc._activate_window()
     batcher = svc._active_batcher
+    batcher.difficulty_auction_enabled = True
     # Proofs run at seal now, so the trainable fill level is the PENDING pool.
     batcher._pending = [
         SimpleNamespace(prompt_idx=i) for i in range(B_BATCH - 1)
@@ -280,10 +332,10 @@ async def test_wait_for_window_seal_force_seals_duplicate_prompt_shortfall(monke
     svc._open_window()
     svc._activate_window()
     batcher = svc._active_batcher
-    batcher._pending = [
+    batcher._valid = [
         SimpleNamespace(prompt_idx=i) for i in range(B_BATCH - 1)
     ] + [SimpleNamespace(prompt_idx=0)]
-    batcher.pending_count = B_BATCH
+    batcher.valid_count = B_BATCH
     batcher._proof_admission_count = B_BATCH + 1
 
     reason = await svc._wait_for_window_seal()
@@ -306,8 +358,8 @@ async def test_wait_for_window_seal_force_seals_sparse_valid_idle(monkeypatch):
     svc._open_window()
     svc._activate_window()
     batcher = svc._active_batcher
-    batcher._pending = [SimpleNamespace(prompt_idx=i) for i in range(4)]
-    batcher.pending_count = 4
+    batcher._valid = [SimpleNamespace(prompt_idx=i) for i in range(4)]
+    batcher.valid_count = 4
     batcher.last_valid_submission_at = batcher._time_fn() - 1.0
     batcher.last_valid_submission_wall_ts = batcher._wall_clock() - 1.0
 
@@ -328,8 +380,8 @@ async def test_wait_for_window_seal_force_seals_sparse_valid_max_age(monkeypatch
     svc._open_window()
     svc._activate_window()
     batcher = svc._active_batcher
-    batcher._pending = [SimpleNamespace(prompt_idx=123)]
-    batcher.pending_count = 1
+    batcher._valid = [SimpleNamespace(prompt_idx=123)]
+    batcher.valid_count = 1
     batcher.last_valid_submission_at = batcher._time_fn()
     batcher.last_valid_submission_wall_ts = batcher._wall_clock()
 
