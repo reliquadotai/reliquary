@@ -137,7 +137,7 @@ async def test_registration_cache_maintainer_retries_before_ttl(monkeypatch):
     assert len(call_ages) == 2
     assert all(age < ttl_seconds for age in call_ages)
     assert call_ages[0] < 0.20
-    assert call_ages[1] - call_ages[0] == 0.02
+    assert abs((call_ages[1] - call_ages[0]) - 0.02) < 1e-9
 
 
 @pytest.mark.asyncio
