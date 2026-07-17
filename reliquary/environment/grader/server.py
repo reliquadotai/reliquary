@@ -351,7 +351,12 @@ class GraderServer:
             for i, case in enumerate(cases):
                 if not self._valid_case(case):
                     self._metrics.inc("grader_case_total", {"status": "bad_case"})
-                    continue
+                    return {
+                        "req_id": req_id,
+                        "passed": 0,
+                        "total": len(cases),
+                        "status": "grader_error",
+                    }
 
                 worker_req = {
                     "req_id": f"{req_id}:{i}",

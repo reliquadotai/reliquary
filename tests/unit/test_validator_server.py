@@ -76,6 +76,23 @@ class _UnavailableEnv(FakeEnv):
         }
 
 
+class _FlakyCodeEnv(FakeEnv):
+    name = "opencodeinstruct"
+    validator_authoritative_reward = True
+
+    def __init__(self):
+        self.unavailable = True
+
+    def compute_reward(self, problem, completion):
+        if self.unavailable:
+            from reliquary.environment.grader_client import (
+                GraderInfrastructureError,
+            )
+
+            raise GraderInfrastructureError("unreachable")
+        return super().compute_reward(problem, completion)
+
+
 def _always_true_proof(commit, model, randomness):
     import torch
     from reliquary.validator.verifier import ProofResult
@@ -419,6 +436,47 @@ def test_auction_missing_operator_mapping_rejects_prequeue_quota_neutral():
     assert batcher.logical_group_reservation_count == 0
 
 
+def test_code_grader_outage_refunds_quota_and_surfaces_health():
+    from reliquary.protocol.submission import WindowState
+
+    env = _FlakyCodeEnv()
+    server = ValidatorServer()
+    batcher = _batcher(
+        window_start=500,
+        env=env,
+        operator_by_hotkey={_TEST_KEYPAIR.ss58_address: "operator-a"},
+    )
+    batcher.difficulty_auction_enabled = True
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    client = TestClient(server.app)
+    request = _request()
+    for rollout in request.rollouts:
+        rollout.env_name = env.name
+
+    outage = client.post("/submit", json=request.model_dump(mode="json"))
+
+    assert outage.json() == {
+        "accepted": False,
+        "reason": RejectReason.WORKER_DROPPED.value,
+    }
+    assert server._per_window_counts == {}
+    assert batcher.logical_group_reservation_count == 0
+    health = client.get("/health").json()
+    assert health["status"] == "degraded"
+    assert health["grader_failures_by_environment"] == {
+        env.name: {"unreachable": 1}
+    }
+
+    env.unavailable = False
+    retry = _request()
+    for rollout in retry.rollouts:
+        rollout.env_name = env.name
+    recovered = client.post("/submit", json=retry.model_dump(mode="json"))
+    assert recovered.json()["accepted"] is True
+    assert server._per_window_counts == {_TEST_KEYPAIR.ss58_address: 1}
+
+
 @pytest.mark.parametrize("fail_at", ["length", "row"])
 def test_prompt_source_outage_is_retryable_quota_neutral_and_visible(fail_at):
     from reliquary.protocol.submission import WindowState
@@ -753,6 +811,7 @@ def test_health_exposes_each_environment_window_independently():
         "post_trigger_proof_admission_count": 0,
         "expensive_proof_failures_by_hotkey": {},
         "expensive_proof_failures_by_operator": {},
+        "grader_failures": {},
     }
     code_health = health["window_environments"]["opencodeinstruct"]
     assert code_health["valid_submissions_count"] == 8

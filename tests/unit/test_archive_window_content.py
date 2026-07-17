@@ -95,6 +95,7 @@ async def test_archive_includes_prompt_and_rollout_content():
     batcher.rewarded_but_not_selected_by_hotkey = {"hk_runner": 1}
     batcher.logical_group_reservation_count = 9
     batcher.logical_group_duplicate_rejects = 4
+    batcher.grader_failures = {"unreachable": 2}
     from reliquary.validator.batcher import RejectedSubmission
     batcher.reject_counts = {"out_of_zone": 3, "logprob_mismatch": 1}
     svc.server._recent_reject_counts.update({
@@ -271,6 +272,10 @@ async def test_archive_includes_prompt_and_rollout_content():
     }
     assert archive["logical_group_dedup"] == {
         "fake": {"reservations": 9, "duplicate_rejects": 4}
+    }
+    assert archive["grader_failures"] == {"unreachable": 2}
+    assert archive["grader_failures_by_environment"] == {
+        "fake": {"unreachable": 2}
     }
 
     # rejected[] persisted from batcher.rejected_submissions.

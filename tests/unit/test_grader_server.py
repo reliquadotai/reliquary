@@ -80,6 +80,18 @@ def test_server_grades_incorrect_code(grader_server):
     assert resp["total"] == 1
 
 
+def test_server_treats_invalid_trusted_case_as_grader_error(grader_server):
+    resp = _request(
+        grader_server.socket_path,
+        code="def add(a,b): return a+b",
+        cases=[{"entry": {"kind": "function", "name": "add"}}],
+    )
+
+    assert resp["status"] == "grader_error"
+    assert resp["passed"] == 0
+    assert resp["total"] == 1
+
+
 def test_server_supports_method_entrypoint(grader_server):
     code = "class Solution:\n    def inc(self, x): return x + 1"
     resp = _request(

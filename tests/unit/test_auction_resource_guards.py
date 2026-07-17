@@ -246,6 +246,90 @@ def test_operator_tiebreak_does_not_change_when_hotkey_changes():
     } == {"seal_drand"}
 
 
+def test_code_grader_outage_never_becomes_an_auction_negative():
+    from reliquary.environment.grader_client import GraderInfrastructureError
+    from reliquary.protocol.submission import RejectReason
+    from tests.unit.test_grpo_window_batcher import PrivateRewardFakeEnv
+
+    class FlakyCodeEnv(PrivateRewardFakeEnv):
+        unavailable = True
+
+        def compute_reward(self, problem, completion):
+            if self.unavailable:
+                raise GraderInfrastructureError("unreachable")
+            return super().compute_reward(problem, completion)
+
+    env = FlakyCodeEnv()
+    batcher = _batcher(
+        env=env,
+        operator_by_hotkey={"miner": "operator-a"},
+    )
+    request = _request(
+        prompt_idx=7,
+        hotkey="miner",
+        env_name="opencodeinstruct",
+    )
+
+    outage = batcher.accept_submission(request)
+
+    assert outage.accepted is False
+    assert outage.reason is RejectReason.WORKER_DROPPED
+    assert batcher.pending_submissions() == []
+    assert batcher.logical_group_reservation_count == 0
+    assert batcher.grader_failures == {"unreachable": 1}
+
+    env.unavailable = False
+    retry = batcher.accept_submission(
+        _request(
+            prompt_idx=7,
+            hotkey="miner",
+            env_name="opencodeinstruct",
+        )
+    )
+    assert retry.accepted is True
+    assert len(batcher.pending_submissions()) == 1
+
+
+def test_code_grader_crash_is_not_a_free_retry():
+    from reliquary.environment.grader_client import GraderInfrastructureError
+    from reliquary.protocol.submission import RejectReason
+    from tests.unit.test_grpo_window_batcher import PrivateRewardFakeEnv
+
+    class CrashingCodeEnv(PrivateRewardFakeEnv):
+        def compute_reward(self, problem, completion):
+            raise GraderInfrastructureError("crash")
+
+    batcher = _batcher(
+        env=CrashingCodeEnv(),
+        operator_by_hotkey={
+            "miner-a": "operator-a",
+            "miner-a-sybil": "operator-a",
+        },
+    )
+
+    crashed = batcher.accept_submission(
+        _request(
+            prompt_idx=7,
+            hotkey="miner-a",
+            env_name="opencodeinstruct",
+        )
+    )
+    retry = batcher.accept_submission(
+        _request(
+            prompt_idx=7,
+            hotkey="miner-a-sybil",
+            env_name="opencodeinstruct",
+        )
+    )
+
+    assert crashed.accepted is False
+    assert crashed.reason is RejectReason.REWARD_MISMATCH
+    assert retry.accepted is False
+    assert retry.reason is RejectReason.HASH_DUPLICATE
+    assert batcher.logical_group_reservation_count == 1
+    assert batcher.grader_failures == {"crash": 1}
+
+
 def test_failed_proof_does_not_consume_an_operator_slot(monkeypatch):
     batcher = _batcher(
         operator_by_hotkey={

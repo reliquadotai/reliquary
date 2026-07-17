@@ -441,7 +441,6 @@ class ValidationService:
             retention_windows=HASH_DEDUP_RETENTION_WINDOWS,
         )
         self._late_drops: dict[str, dict[str, int]] = {}
-        self._grader_failures: dict[str, int] = {}
 
         self.server = ValidatorServer(host=http_host, port=http_port)
         self.server.set_late_drop_callback(self.record_late_drop)
@@ -1979,6 +1978,8 @@ class ValidationService:
         combined_reject_counts: dict[str, int] = {}
         combined_rewarded_not_selected: dict[str, float] = {}
         logical_group_dedup: dict[str, dict[str, int]] = {}
+        grader_failures: dict[str, int] = {}
+        grader_failures_by_environment: dict[str, dict[str, int]] = {}
 
         for env_name, batcher in batcher_dict.items():
             env_obj = self.envs.get(env_name, self.env)
@@ -2136,6 +2137,15 @@ class ValidationService:
                     else 0
                 ),
             }
+            env_grader_failures = {
+                str(reason): int(count)
+                for reason, count in dict(
+                    getattr(batcher, "grader_failures", {})
+                ).items()
+            }
+            grader_failures_by_environment[env_name] = env_grader_failures
+            for reason, count in env_grader_failures.items():
+                grader_failures[reason] = grader_failures.get(reason, 0) + count
 
         server_reject_summary = {
             str(reason): int(count)
@@ -2175,7 +2185,10 @@ class ValidationService:
                 env_name: _difficulty_shadow_payload(env_batcher)
                 for env_name, env_batcher in batcher_dict.items()
             },
-            "grader_failures": dict(getattr(self, "_grader_failures", {})),
+            "grader_failures": grader_failures,
+            "grader_failures_by_environment": (
+                grader_failures_by_environment
+            ),
             "rejected": rejected_entries,
             "training_quarantine": getattr(
                 batcher,

@@ -516,6 +516,9 @@ class _Health(BaseModel):
     logical_group_dedup_by_environment: dict[str, dict[str, int]] = Field(
         default_factory=dict
     )
+    grader_failures_by_environment: dict[str, dict[str, int]] = Field(
+        default_factory=dict
+    )
     post_trigger_proof_admission_count: int | None = None
     post_trigger_proof_admission_limit: int = MAX_POST_TRIGGER_PROOF_CANDIDATES
     sparse_valid_idle_seal_seconds: float = SPARSE_VALID_IDLE_SEAL_SECONDS
@@ -716,6 +719,13 @@ class ValidatorServer:
         else:
             env_name = getattr(getattr(batcher, "env", None), "name", "unknown")
             self.set_active_batchers({env_name: batcher})
+
+    def _refund_submission_quota(self, hotkey: str) -> None:
+        current_count = self._per_window_counts.get(hotkey, 0)
+        if current_count <= 1:
+            self._per_window_counts.pop(hotkey, None)
+        else:
+            self._per_window_counts[hotkey] = current_count - 1
 
     def set_current_state(self, state) -> None:
         self._current_state = state
@@ -1185,6 +1195,9 @@ class ValidatorServer:
             "expensive_proof_failures_by_operator": dict(
                 getattr(batcher, "expensive_proof_failures_by_operator", {})
             ),
+            "grader_failures": dict(
+                getattr(batcher, "grader_failures", {})
+            ),
         }
 
     def _health_payload(self) -> _Health:
@@ -1228,6 +1241,7 @@ class ValidatorServer:
             self._window_environment_health(batcher) if batcher else {}
         )
         logical_group_dedup: dict[str, dict[str, int]] = {}
+        grader_failures_by_environment: dict[str, dict[str, int]] = {}
         for env_name, env_batcher in self._active_batchers.items():
             reservations = getattr(
                 env_batcher, "logical_group_reservation_count", 0
@@ -1249,12 +1263,22 @@ class ValidatorServer:
                     else 0
                 ),
             }
+            grader_failures_by_environment[env_name] = {
+                str(reason): int(count)
+                for reason, count in dict(
+                    getattr(env_batcher, "grader_failures", {})
+                ).items()
+            }
         health_status = (
             "degraded"
             if (
                 any(
                     source.get("status") == "degraded"
                     for source in prompt_sources.values()
+                )
+                or any(
+                    any(count > 0 for count in failures.values())
+                    for failures in grader_failures_by_environment.values()
                 )
                 or (
                     self._candidate_window_n is not None
@@ -1396,6 +1420,7 @@ class ValidatorServer:
                 for item in logical_group_dedup.values()
             ),
             logical_group_dedup_by_environment=logical_group_dedup,
+            grader_failures_by_environment=grader_failures_by_environment,
             post_trigger_proof_admission_count=(
                 getattr(batcher, "post_trigger_proof_admission_count", None)
                 if batcher else None
@@ -1982,11 +2007,7 @@ class ValidatorServer:
             self._per_window_counts[hk] = n + 1
 
             def _refund_current_quota() -> None:
-                current_count = self._per_window_counts.get(hk, 0)
-                if current_count <= 1:
-                    self._per_window_counts.pop(hk, None)
-                else:
-                    self._per_window_counts[hk] = current_count - 1
+                self._refund_submission_quota(hk)
 
             def _prompt_source_unavailable(
                 exc: PromptSourceUnavailable,
@@ -2329,6 +2350,11 @@ class ValidatorServer:
                     self._finish_proof_admission(batcher, request)
                 telemetry.refresh_from_batcher(batcher, at_decision=True)
                 telemetry.mark_decision(verified=True)
+                if (
+                    not resp.accepted
+                    and resp.reason is RejectReason.WORKER_DROPPED
+                ):
+                    self._refund_submission_quota(hk)
                 log_submission_stage(
                     logger,
                     logging.INFO,
@@ -2690,6 +2716,13 @@ class ValidatorServer:
                         self._inflight_proofs_by_environment.pop(env_name, None)
                 telemetry.refresh_from_batcher(batcher, at_decision=True)
                 telemetry.mark_decision(verified=True)
+                quota_refunded = False
+                if (
+                    not response.accepted
+                    and response.reason is RejectReason.WORKER_DROPPED
+                ):
+                    self._refund_submission_quota(request.miner_hotkey)
+                    quota_refunded = True
                 log_submission_stage(
                     logger,
                     logging.INFO,
@@ -2697,6 +2730,7 @@ class ValidatorServer:
                     telemetry,
                     accepted=response.accepted,
                     reason=response.reason.value,
+                    quota_refunded=quota_refunded,
                 )
                 if response.accepted:
                     logger.info(

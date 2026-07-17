@@ -58,6 +58,7 @@ from reliquary.constants import (
     LEGACY_MERKLE_ROOT_ENFORCE,
 )
 from reliquary.environment.base import Environment
+from reliquary.environment.grader_client import GraderInfrastructureError
 from reliquary.shared.prompt_range import window_prompt_range
 from reliquary.protocol.legacy_merkle import legacy_submission_merkle_matches
 from reliquary.protocol.submission import (
@@ -553,6 +554,7 @@ class GrpoWindowBatcher:
             tuple[str, str, int | bytes], BatchSubmissionRequest
         ] = {}
         self._logical_group_duplicate_rejects = 0
+        self.grader_failures: dict[str, int] = {}
         self._valid: list[ValidSubmission] = []
         # Admitted, graded and scored, but NOT yet proven. The auction ranks
         # these at seal; only the candidates that can actually win pay for a GPU
@@ -1545,8 +1547,6 @@ class GrpoWindowBatcher:
                     "operator_mapping",
                 )
             return reject(RejectReason.HASH_DUPLICATE, "logical_dedup")
-        self.confirm_logical_group_reservation(request)
-
         problem = self.env.get_problem(request.prompt_idx)
         validator_scored_reward = _uses_validator_authoritative_reward(self.env)
         completion_texts = [
@@ -1577,6 +1577,33 @@ class GrpoWindowBatcher:
                     float(self.env.compute_reward(problem, text))
                     for text in completion_texts
                 ]
+        except GraderInfrastructureError as exc:
+            reason = exc.reason or "unknown"
+            self.grader_failures[reason] = (
+                self.grader_failures.get(reason, 0) + 1
+            )
+            # A worker crash may be triggered by hostile submitted code. Never
+            # convert it into a zero reward (which could manufacture auction
+            # difficulty), but also do not grant free retries: retain the
+            # operator/prompt claim and consume the normal submission quota.
+            if reason == "crash":
+                self.confirm_logical_group_reservation(request)
+                logger.error(
+                    "code_grader_worker_crash env=%s prompt=%d hotkey=%s",
+                    getattr(self.env, "name", type(self.env).__name__),
+                    request.prompt_idx,
+                    hk,
+                )
+                return reject(RejectReason.REWARD_MISMATCH, "code_grader_crash")
+            self.cancel_logical_group_reservation(request)
+            logger.error(
+                "code_grader_unavailable env=%s prompt=%d hotkey=%s reason=%s",
+                getattr(self.env, "name", type(self.env).__name__),
+                request.prompt_idx,
+                hk,
+                reason,
+            )
+            return reject(RejectReason.WORKER_DROPPED, "code_grader")
         except Exception:
             return reject(RejectReason.REWARD_MISMATCH, "reward")
 
@@ -1707,6 +1734,7 @@ class GrpoWindowBatcher:
         )
 
         if not self.difficulty_auction_enabled:
+            self.confirm_logical_group_reservation(request)
             proven = self._verify_expensive(pending)
             if proven is None:
                 return pending.reject_response or BatchSubmissionResponse(
@@ -1754,6 +1782,7 @@ class GrpoWindowBatcher:
         # the request remains reachable from the auction pool until seal. Mark
         # it so byte accounting transfers to the retained bucket instead of
         # being refunded prematurely.
+        self.confirm_logical_group_reservation(request)
         request._retain_payload = True
         self._pending.append(pending)
         self._submissions_per_prompt.setdefault(
