@@ -4,6 +4,7 @@ close, computes weights v2-flavoured."""
 import asyncio
 from dataclasses import dataclass
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -194,13 +195,15 @@ async def test_registration_cache_maintainer_targets_deadline_after_bootstrap(
 
 
 @pytest.mark.asyncio
-async def test_registration_refresh_uses_fresh_metagraph_and_updates_server():
+async def test_registration_refresh_uses_lite_neurons_and_updates_server():
     svc = _build_late_drop_service()
     subtensor = object()
-    metagraph = MagicMock(
-        hotkeys=[" hk-a ", "hk-b", "", None],
-        coldkeys=[" operator-a ", "operator-b", "ignored", "ignored"],
-    )
+    neurons = [
+        SimpleNamespace(hotkey=" hk-a ", coldkey=" operator-a "),
+        SimpleNamespace(hotkey="hk-b", coldkey="operator-b"),
+        SimpleNamespace(hotkey="", coldkey="ignored"),
+        SimpleNamespace(hotkey=None, coldkey="ignored"),
+    ]
 
     with (
         patch(
@@ -208,9 +211,9 @@ async def test_registration_refresh_uses_fresh_metagraph_and_updates_server():
             new=AsyncMock(return_value=subtensor),
         ) as get_subtensor,
         patch(
-            "reliquary.validator.service.chain.get_metagraph",
-            new=AsyncMock(return_value=metagraph),
-        ) as get_metagraph,
+            "reliquary.validator.service.chain.get_neurons_lite",
+            new=AsyncMock(return_value=neurons),
+        ) as get_neurons_lite,
         patch(
             "reliquary.validator.service.chain.close_subtensor",
             new=AsyncMock(),
@@ -230,7 +233,7 @@ async def test_registration_refresh_uses_fresh_metagraph_and_updates_server():
     assert health.registration_cache_refresh_failures_total == 0
     assert health.registration_cache_last_refresh_reason == "unspecified"
     get_subtensor.assert_awaited_once()
-    get_metagraph.assert_awaited_once_with(subtensor, 99)
+    get_neurons_lite.assert_awaited_once_with(subtensor, 99)
     close_subtensor.assert_awaited_once_with(subtensor)
 
 
@@ -271,7 +274,7 @@ async def test_registration_refresh_failure_preserves_last_known_good():
 
 
 @pytest.mark.asyncio
-async def test_empty_metagraph_refresh_preserves_last_known_good():
+async def test_empty_lite_neuron_refresh_preserves_last_known_good():
     svc = _build_late_drop_service()
     svc.server.set_registered_hotkeys(
         {"hk-a"},
@@ -286,8 +289,8 @@ async def test_empty_metagraph_refresh_preserves_last_known_good():
             new=AsyncMock(return_value=subtensor),
         ),
         patch(
-            "reliquary.validator.service.chain.get_metagraph",
-            new=AsyncMock(return_value=MagicMock(hotkeys=[])),
+            "reliquary.validator.service.chain.get_neurons_lite",
+            new=AsyncMock(return_value=[]),
         ),
         patch(
             "reliquary.validator.service.chain.close_subtensor",
@@ -309,10 +312,10 @@ async def test_empty_metagraph_refresh_preserves_last_known_good():
 async def test_partial_operator_mapping_does_not_break_registration_refresh():
     svc = _build_late_drop_service()
     subtensor = object()
-    metagraph = MagicMock(
-        hotkeys=["hk-a", "hk-b"],
-        coldkeys=["operator-a"],
-    )
+    neurons = [
+        SimpleNamespace(hotkey="hk-a", coldkey="operator-a"),
+        SimpleNamespace(hotkey="hk-b", coldkey=None),
+    ]
 
     with (
         patch(
@@ -320,8 +323,8 @@ async def test_partial_operator_mapping_does_not_break_registration_refresh():
             new=AsyncMock(return_value=subtensor),
         ),
         patch(
-            "reliquary.validator.service.chain.get_metagraph",
-            new=AsyncMock(return_value=metagraph),
+            "reliquary.validator.service.chain.get_neurons_lite",
+            new=AsyncMock(return_value=neurons),
         ),
         patch(
             "reliquary.validator.service.chain.close_subtensor",
@@ -335,6 +338,37 @@ async def test_partial_operator_mapping_does_not_break_registration_refresh():
     assert svc.server.operator_by_hotkey_snapshot() == {
         "hk-a": "operator-a"
     }
+
+
+@pytest.mark.asyncio
+async def test_conflicting_lite_neuron_owners_are_left_unmapped():
+    svc = _build_late_drop_service()
+    subtensor = object()
+    neurons = [
+        SimpleNamespace(hotkey="hk-a", coldkey="operator-a"),
+        SimpleNamespace(hotkey="hk-a", coldkey="operator-b"),
+        SimpleNamespace(hotkey="hk-b", coldkey="operator-b"),
+    ]
+
+    with (
+        patch(
+            "reliquary.validator.service.chain.get_subtensor",
+            new=AsyncMock(return_value=subtensor),
+        ),
+        patch(
+            "reliquary.validator.service.chain.get_neurons_lite",
+            new=AsyncMock(return_value=neurons),
+        ),
+        patch(
+            "reliquary.validator.service.chain.close_subtensor",
+            new=AsyncMock(),
+        ),
+    ):
+        refreshed = await svc._refresh_registered_hotkeys(force=True)
+
+    assert refreshed is True
+    assert svc.server._registered_hotkeys == frozenset({"hk-a", "hk-b"})
+    assert svc.server.operator_by_hotkey_snapshot() == {"hk-b": "operator-b"}
 
 
 def test_service_creates_grpo_window_batcher():

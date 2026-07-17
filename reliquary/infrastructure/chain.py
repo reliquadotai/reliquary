@@ -59,6 +59,18 @@ async def get_metagraph(subtensor, netuid: int = NETUID):
     return await asyncio.wait_for(subtensor.metagraph(netuid), timeout=CHAIN_READ_TIMEOUT)
 
 
+async def get_neurons_lite(subtensor, netuid: int = NETUID):
+    """Fetch the minimal per-neuron chain records for a subnet.
+
+    Registration admission only needs each neuron's hotkey and coldkey.  The
+    full metagraph additionally fetches mechanism and emission metadata, which
+    can make an otherwise healthy registration refresh exceed its RPC budget.
+    """
+    return await asyncio.wait_for(
+        subtensor.neurons_lite(netuid), timeout=CHAIN_READ_TIMEOUT,
+    )
+
+
 async def get_block_hash(subtensor, block_number: int) -> str:
     """Get block hash for a given block number."""
     return await asyncio.wait_for(
