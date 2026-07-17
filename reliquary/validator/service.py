@@ -49,7 +49,6 @@ from reliquary.constants import (
     LR_COSINE_MAX_WINDOWS,
     LR_WARMUP_WINDOWS,
     M_ROLLOUTS,
-    MAX_AUCTION_SLOTS_PER_OPERATOR,
     MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW,
     MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
     MAX_PROOF_WALL_SECONDS,
@@ -2475,9 +2474,6 @@ class ValidationService:
                 ),
                 "difficulty_auction_collection_seconds": (
                     WINDOW_COLLECTION_SECONDS
-                ),
-                "difficulty_auction_max_slots_per_operator": (
-                    MAX_AUCTION_SLOTS_PER_OPERATOR
                 ),
                 "difficulty_auction_proof_attempt_limit": (
                     MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW

@@ -156,7 +156,7 @@ async def test_archive_includes_prompt_and_rollout_content():
             "mean_reward": 0.5,
             "rank": 3,
             "selected": False,
-            "status": "operator_cap",
+            "status": "not_needed",
             "proof_attempted": False,
         },
     }
@@ -263,7 +263,7 @@ async def test_archive_includes_prompt_and_rollout_content():
     assert ru["rollout_hashes"] == [h.hex() for h in runner.rollout_hashes]
     assert ru["difficulty_auction_rank"] == 3
     assert ru["difficulty_auction_selected"] is False
-    assert ru["difficulty_auction_status"] == "operator_cap"
+    assert ru["difficulty_auction_status"] == "not_needed"
     assert ru["difficulty_auction_proof_attempted"] is False
     assert ru["arrival_age_seconds"] is None
     assert archive["rewarded_but_not_selected_by_hotkey"] == {"hk_runner": 1}

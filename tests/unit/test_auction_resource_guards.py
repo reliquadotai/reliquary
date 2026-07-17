@@ -162,8 +162,10 @@ def test_seal_snapshot_rejects_and_refunds_a_queued_reservation():
         ("opencodeinstruct", "code"),
     ],
 )
-def test_operator_cap_is_enforced_for_math_and_code(env_name, env_factory):
-    from reliquary.constants import MAX_AUCTION_SLOTS_PER_OPERATOR
+def test_operator_ownership_does_not_limit_ranked_winners_for_math_and_code(
+    env_name,
+    env_factory,
+):
     from tests.unit.test_grpo_window_batcher import PrivateRewardFakeEnv
 
     hotkeys = ["a1", "a2", "a3", "b1", "b2"]
@@ -194,9 +196,10 @@ def test_operator_cap_is_enforced_for_math_and_code(env_name, env_factory):
         winner for winner in winners if mapping[winner.hotkey] == "operator-a"
     ]
 
-    assert len(operator_a_winners) == MAX_AUCTION_SLOTS_PER_OPERATOR
+    assert {winner.hotkey for winner in winners} == set(hotkeys)
+    assert len(operator_a_winners) == 3
     assert {winner.hotkey for winner in winners} & {"b1", "b2"} == {"b1", "b2"}
-    assert batcher.auction_operator_cap_skips == 1
+    assert all(row["status"] == "selected" for row in batcher.auction_candidates)
 
 
 def test_missing_production_operator_mapping_fails_closed():
