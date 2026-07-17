@@ -256,6 +256,42 @@ def test_runsc_workers_get_unique_container_ids(monkeypatch, tmp_path):
     assert srv.GRADER_CONTAINER_ID_PLACEHOLDER not in container_ids
 
 
+def test_runsc_container_ids_are_unique_across_server_restarts(
+    monkeypatch, tmp_path
+):
+    from reliquary.environment.grader import server as srv
+
+    captured: list[list[str]] = []
+
+    class _FakeProc:
+        pid = 4321
+        stdin = None
+        stdout = None
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(
+        srv.subprocess,
+        "Popen",
+        lambda argv, **_kwargs: captured.append(list(argv)) or _FakeProc(),
+    )
+
+    for index in range(2):
+        server = srv.GraderServer(
+            socket_path=str(tmp_path / f"grader-{index}.sock"),
+            pool_size=1,
+            worker_argv=[
+                "runsc", "run", "--bundle", "/b",
+                srv.GRADER_CONTAINER_ID_PLACEHOLDER,
+            ],
+            metrics_port=0,
+        )
+        server._spawn_worker(0)
+
+    assert len({argv[-1] for argv in captured}) == 2
+
+
 def test_production_runsc_argv_disables_cgroups():
     """Production runsc argv must pass `--ignore-cgroups` as a GLOBAL flag
     (before `run`) so runsc never creates a per-sandbox cgroup — gVisor doesn't
@@ -327,3 +363,21 @@ def test_metrics_endpoint_exposes_eval_and_case_counters(grader_server):
     body = resp.read().decode()
     assert "grader_eval_total" in body
     assert "grader_case_total" in body
+
+
+def test_stop_releases_metrics_listener_for_restart(tmp_path):
+    from reliquary.environment.grader.server import GraderServer
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+
+    for index in range(2):
+        server = GraderServer(
+            socket_path=str(tmp_path / f"grader-{index}.sock"),
+            pool_size=0,
+            metrics_port=port,
+        )
+        server._start_metrics_server()
+        server.stop()

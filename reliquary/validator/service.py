@@ -35,6 +35,7 @@ from reliquary.constants import (
     FORCED_SEED_ENFORCE,
     FORCED_SEED_ROLLOUT_FLOOR,
     GRAD_CLIP_NORM,
+    GRAD_NORM_SKIP_THRESHOLD,
     HASH_DEDUP_RETENTION_WINDOWS,
     KL_BASE_MODEL,
     KL_BETA,
@@ -48,16 +49,21 @@ from reliquary.constants import (
     MIN_EOS_PROBABILITY,
     POLL_INTERVAL_SECONDS,
     PPO_CLIP_EPSILON,
+    PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD,
     MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
     MAX_SEAL_QUEUE_DRAIN_SECONDS,
     PROOF_ADMISSION_STALL_POLL_SECONDS,
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
     REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS,
+    RECOMPUTE_PI_OLD_FROM_VERIFY,
+    SHAPE_LEN_FRAC,
+    SHAPE_PENALTY,
     SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS,
     SPARSE_VALID_IDLE_SEAL_SECONDS,
     SPARSE_VALID_MAX_WINDOW_SECONDS,
     SIGMA_MIN,
     SUBNET_START_BLOCK,
+    TRAIN_UNTIL_CHECKPOINT_N,
     VALIDATOR_HTTP_PORT,
     WANDB_TRAINING_VERSION,
     WINDOW_LENGTH,
@@ -75,7 +81,7 @@ from reliquary.validator.dedup import RolloutHashSet
 from reliquary.validator.observability import log_structured, runtime_revision
 from reliquary.validator.quarantine import assess_training_batch
 from reliquary.validator.server import ValidatorServer
-from reliquary.validator.training import train_step
+from reliquary.validator.training import TrainingStepSkipped, train_step
 from reliquary.validator.training_accumulator import BalancedTrainingAccumulator
 
 logger = logging.getLogger(__name__)
@@ -366,10 +372,10 @@ class ValidationService:
         import copy
         # Two-model architecture (see docs/superpowers/plans/2026-05-13-...).
         # train_model: trainable, mutated by train_step every window.
-        # verify_model: frozen snapshot of the last published checkpoint —
-        # used by batcher.verify_commitment_proofs and as the KL reference
-        # inside train_step. Refreshed in-place after every successful
-        # publish via load_state_dict.
+        # verify_model: frozen snapshot of the last published checkpoint. It
+        # verifies commitment proofs and can independently supply PPO's old
+        # policy. In rolling mode it is also the KL reference; fixed mode uses
+        # a separately pinned base model. Refreshed only after publication.
         self.train_model = model
         if model is not None:
             try:
@@ -451,6 +457,11 @@ class ValidationService:
         self._checkpoint_n: int = 0
         self._publish_every = CHECKPOINT_PUBLISH_INTERVAL_WINDOWS
         self._trained_windows_since_publish = 0
+        self.server.set_training_publish_state({
+            "trained_windows_since_publish": 0,
+            "publish_interval": self._publish_every,
+            "publication_pending": False,
+        })
         self._training_accumulator = BalancedTrainingAccumulator(
             dict(self.env_mix)
         )
@@ -497,6 +508,19 @@ class ValidationService:
             "parameter_count": _model_parameter_count(self.verify_model),
             "storage_bytes": _model_storage_bytes(self.verify_model),
             "beta_explicit": KL_BETA_EXPLICIT,
+            "behavior_logprobs": (
+                "verify_model"
+                if RECOMPUTE_PI_OLD_FROM_VERIFY
+                else "miner_claim"
+            ),
+            "learning_rate": LEARNING_RATE,
+            "grad_norm_skip_threshold": GRAD_NORM_SKIP_THRESHOLD,
+            "ppo_ratio_outside_clip_skip_threshold": (
+                PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD
+            ),
+            "shape_penalty": SHAPE_PENALTY,
+            "shape_len_frac": SHAPE_LEN_FRAC,
+            "train_until_checkpoint_n": TRAIN_UNTIL_CHECKPOINT_N,
         }
         if KL_BASE_MODEL:
             if model is None:
@@ -508,6 +532,12 @@ class ValidationService:
                 raise ValueError(
                     "fixed KL reference requires an explicit RELIQUARY_KL_BETA; "
                     "do not inherit the rolling-reference default"
+                )
+            if not RECOMPUTE_PI_OLD_FROM_VERIFY:
+                raise ValueError(
+                    "fixed KL reference requires "
+                    "RELIQUARY_RECOMPUTE_PI_OLD_FROM_VERIFY=true; the fixed "
+                    "anchor and PPO behavior policy are separate contracts"
                 )
             try:
                 from huggingface_hub import snapshot_download
@@ -567,6 +597,19 @@ class ValidationService:
                 ),
                 "storage_bytes": _model_storage_bytes(self.base_ref_model),
                 "beta_explicit": KL_BETA_EXPLICIT,
+                "behavior_logprobs": (
+                    "verify_model"
+                    if RECOMPUTE_PI_OLD_FROM_VERIFY
+                    else "miner_claim"
+                ),
+                "learning_rate": LEARNING_RATE,
+                "grad_norm_skip_threshold": GRAD_NORM_SKIP_THRESHOLD,
+                "ppo_ratio_outside_clip_skip_threshold": (
+                    PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD
+                ),
+                "shape_penalty": SHAPE_PENALTY,
+                "shape_len_frac": SHAPE_LEN_FRAC,
+                "train_until_checkpoint_n": TRAIN_UNTIL_CHECKPOINT_N,
             }
             logger.info(
                 "GRPO KL reference=fixed repo=%s revision=%s beta=%.6g "
@@ -588,6 +631,15 @@ class ValidationService:
             "kl_reference_storage_bytes": self.kl_reference_state[
                 "storage_bytes"
             ],
+            "pi_old_source": self.kl_reference_state["behavior_logprobs"],
+            "learning_rate": LEARNING_RATE,
+            "grad_norm_skip_threshold": GRAD_NORM_SKIP_THRESHOLD,
+            "ppo_ratio_outside_clip_skip_threshold": (
+                PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD
+            ),
+            "shape_penalty": SHAPE_PENALTY,
+            "shape_len_frac": SHAPE_LEN_FRAC,
+            "train_until_checkpoint_n": TRAIN_UNTIL_CHECKPOINT_N,
         })
 
     @property
@@ -1454,12 +1506,36 @@ class ValidationService:
         # train_step has a known OOM/leak pattern that's poisoning the
         # GPU pool across windows. With this flag set the balanced retained
         # batch stays pending while this window is archived normally.
-        skip_train = os.environ.get("RELIQUARY_DISABLE_TRAIN", "").lower() in {"1", "true", "yes", "on"}
+        emergency_freeze = os.environ.get(
+            "RELIQUARY_DISABLE_TRAIN", ""
+        ).lower() in {"1", "true", "yes", "on"}
+        publication_retry_pending = (
+            self._trained_windows_since_publish >= self._publish_every
+        )
+        checkpoint_ceiling_reached = (
+            TRAIN_UNTIL_CHECKPOINT_N > 0
+            and self._checkpoint_n >= TRAIN_UNTIL_CHECKPOINT_N
+        )
+        skip_train = (
+            emergency_freeze
+            or checkpoint_ceiling_reached
+            or publication_retry_pending
+        )
         if accumulator_ready and skip_train:
+            if emergency_freeze:
+                blocked_reason = "emergency_training_freeze"
+            elif checkpoint_ceiling_reached:
+                blocked_reason = "training_checkpoint_ceiling"
+            else:
+                blocked_reason = "checkpoint_publication_pending"
+            accumulator_meta["blocked_reason"] = blocked_reason
             logger.info(
-                "Window %d: RELIQUARY_DISABLE_TRAIN set — retaining balanced "
-                "batch and skipping train_step + publish",
+                "Window %d: %s — retaining balanced batch and skipping "
+                "train_step + publish (checkpoint=%d ceiling=%d)",
                 self._window_n,
+                blocked_reason,
+                self._checkpoint_n,
+                TRAIN_UNTIL_CHECKPOINT_N,
             )
         elif accumulator_ready:
             accumulator_meta["training_attempted"] = True
@@ -1476,8 +1552,24 @@ class ValidationService:
                         else self.verify_model
                     ),
                     window_index=self._window_n,
+                    **(
+                        {"behavior_model": self.verify_model}
+                        if RECOMPUTE_PI_OLD_FROM_VERIFY
+                        else {}
+                    ),
                 )
                 trained = True
+            except TrainingStepSkipped as exc:
+                logger.warning(
+                    "train_step rejected for window %d: reason=%s "
+                    "grad_norm=%s; archiving without checkpoint publication",
+                    self._window_n,
+                    exc.reason,
+                    exc.grad_norm,
+                )
+                accumulator_meta["reset_reason"] = (
+                    f"training_health_gate:{exc.reason}"
+                )
             except Exception:
                 # Don't let a training failure (e.g. CUDA OOM) skip
                 # _archive_window — miners still need their R2 contribution
@@ -1534,50 +1626,78 @@ class ValidationService:
         self._set_state(WindowState.PUBLISHING)
         if trained:
             self._trained_windows_since_publish += 1
-            # checkpoint_n only advances on publish. Publish cadence is based
-            # on successful trained windows rather than exact window number so
-            # a quarantined boundary window cannot freeze the public checkpoint.
-            next_n = self._checkpoint_n + 1
-            # Push to HF every N trained windows, or immediately if no
-            # checkpoint exists yet.
-            should_publish = (
-                self._trained_windows_since_publish >= self._publish_every
-                or self._checkpoint_store.current_manifest() is None
+        # checkpoint_n only advances on publish. Publish cadence is based on
+        # successful trained windows rather than exact window number so a
+        # quarantined boundary window cannot freeze the public checkpoint. Once
+        # the cadence is reached, retry a failed upload without applying another
+        # optimizer step to the pending candidate.
+        next_n = self._checkpoint_n + 1
+        should_publish = not emergency_freeze and (
+            self._trained_windows_since_publish >= self._publish_every
+            or (
+                trained
+                and self._checkpoint_store.current_manifest() is None
             )
-            if should_publish:
-                try:
-                    entry = await self._checkpoint_store.publish(
-                        checkpoint_n=next_n, model=self.train_model,
-                    )
-                    self._checkpoint_n = next_n
-                    self._trained_windows_since_publish = 0
-                    self.server.set_current_checkpoint(entry)
-                    # Refresh verify_model in-place so the next window's
-                    # batcher verifies miners against the just-published
-                    # checkpoint. In-place copy: no new allocation.
-                    try:
-                        self.verify_model.load_state_dict(
-                            self.train_model.state_dict()
-                        )
-                    except (AttributeError, RuntimeError):
-                        logger.exception(
-                            "verify_model refresh failed; verify_model now "
-                            "stale wrt checkpoint %d", entry.checkpoint_n,
-                        )
-                    logger.info(
-                        "Published checkpoint %d to %s@%s and refreshed verify_model",
-                        entry.checkpoint_n, entry.repo_id, entry.revision[:12],
-                    )
-                except Exception:
-                    logger.exception("HF publish failed; staying on previous checkpoint")
-            else:
-                logger.info(
-                    "Skipping HF publish for window_n=%d "
-                    "(%d/%d trained windows since last publish)",
-                    self._window_n,
-                    self._trained_windows_since_publish,
-                    self._publish_every,
+        )
+        if should_publish:
+            try:
+                entry = await self._checkpoint_store.publish(
+                    checkpoint_n=next_n, model=self.train_model,
                 )
+                self._checkpoint_n = next_n
+                self._trained_windows_since_publish = 0
+                self.server.set_current_checkpoint(entry)
+                # Refresh verify_model in-place so the next window's
+                # batcher verifies miners against the just-published
+                # checkpoint. In-place copy: no new allocation.
+                try:
+                    self.verify_model.load_state_dict(
+                        self.train_model.state_dict()
+                    )
+                except (AttributeError, RuntimeError):
+                    logger.exception(
+                        "verify_model refresh failed; verify_model now "
+                        "stale wrt checkpoint %d", entry.checkpoint_n,
+                    )
+                if publication_retry_pending:
+                    discarded = self._training_accumulator.reset()
+                    post_publish_state = self._training_accumulator.snapshot()
+                    accumulator_meta["post_publish_discarded"] = discarded
+                    accumulator_meta["post_action"] = post_publish_state
+                    self.server.set_training_accumulator_state(
+                        post_publish_state
+                    )
+                    for _b in self._active_batchers.values():
+                        _b.training_accumulator = accumulator_meta
+                    logger.info(
+                        "Published pending checkpoint %d; discarded %d "
+                        "retained groups generated against its parent",
+                        entry.checkpoint_n,
+                        sum(discarded["counts"].values()),
+                    )
+                logger.info(
+                    "Published checkpoint %d to %s@%s and refreshed verify_model",
+                    entry.checkpoint_n, entry.repo_id, entry.revision[:12],
+                )
+            except Exception:
+                logger.exception("HF publish failed; staying on previous checkpoint")
+        elif trained:
+            logger.info(
+                "Skipping HF publish for window_n=%d "
+                "(%d/%d trained windows since last publish)",
+                self._window_n,
+                self._trained_windows_since_publish,
+                self._publish_every,
+            )
+        self.server.set_training_publish_state({
+            "trained_windows_since_publish": (
+                self._trained_windows_since_publish
+            ),
+            "publish_interval": self._publish_every,
+            "publication_pending": (
+                self._trained_windows_since_publish >= self._publish_every
+            ),
+        })
 
         try:
             await self._archive_window(self._active_batchers, sealed)

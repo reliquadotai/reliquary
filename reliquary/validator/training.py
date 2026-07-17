@@ -5,8 +5,9 @@ computed from the rewards in each ValidSubmission, PPO-clipped surrogate
 loss, KL penalty against a frozen reference model (the validator's
 starting checkpoint). Linear warmup + cosine LR schedule.
 
-Uses miner-provided token log-probs (from the GRAIL commit) as π_old —
-saves one forward pass per rollout.
+By default, uses miner-provided token log-probs (from the GRAIL commit) as
+π_old. Production can instead pass the published behavior model and recompute
+π_old independently; the KL reference remains a separate policy.
 """
 
 from __future__ import annotations
@@ -21,8 +22,10 @@ import torch.utils.checkpoint
 
 from reliquary.validator import telemetry
 from reliquary.constants import (
-    GRAD_CLIP_NORM, KL_BETA, LEARNING_RATE, LR_COSINE_MAX_WINDOWS,
-    LR_WARMUP_WINDOWS, MICROBATCH_MAX_PADDED_TOKENS, PPO_CLIP_EPSILON,
+    GRAD_CLIP_NORM, GRAD_NORM_SKIP_THRESHOLD, KL_BETA, LEARNING_RATE,
+    LR_COSINE_MAX_WINDOWS, LR_WARMUP_WINDOWS,
+    MICROBATCH_MAX_PADDED_TOKENS, PPO_CLIP_EPSILON,
+    PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD,
 )
 
 logger = logging.getLogger(__name__)
@@ -36,6 +39,15 @@ _scheduler: Optional[torch.optim.lr_scheduler.LambdaLR] = None
 _optimizer_model_id: Optional[int] = None
 
 
+class TrainingStepSkipped(RuntimeError):
+    """A deliberately rejected optimizer step that must not be published."""
+
+    def __init__(self, reason: str, grad_norm: float) -> None:
+        super().__init__(f"{reason}: grad_norm={grad_norm}")
+        self.reason = reason
+        self.grad_norm = grad_norm
+
+
 def _build_optimizer(params) -> torch.optim.Optimizer:
     """Prefer bitsandbytes PagedAdamW8bit on CUDA — quantised optimiser
     state (~4× smaller than fp32 / ~2× smaller than bf16) plus unified
@@ -43,7 +55,11 @@ def _build_optimizer(params) -> torch.optim.Optimizer:
     plain AdamW when CUDA or bitsandbytes is unavailable (CPU tests, dev
     boxes without a GPU).
     """
-    if torch.cuda.is_available():
+    params = list(params)
+    cuda_parameters = bool(params) and all(
+        parameter.device.type == "cuda" for parameter in params
+    )
+    if torch.cuda.is_available() and cuda_parameters:
         try:
             import bitsandbytes as bnb  # type: ignore[import-not-found]
             logger.info("Using bitsandbytes PagedAdamW8bit")
@@ -165,6 +181,172 @@ def _shape_advantages(rollouts, advantages):
         if clen < early_cap and not correct:
             shaped[i] = -SHAPE_PENALTY          # under-thinking (early + wrong)
     return shaped
+
+
+def _shaping_training_metrics(plan) -> dict[str, float]:
+    """Describe how often length shaping changes the surviving train plan."""
+    from reliquary.constants import (
+        BFT_THINKING_BUDGET,
+        SHAPE_LEN_FRAC,
+        SHAPE_PENALTY,
+    )
+
+    total = 0
+    overlong = 0
+    underthinking = 0
+    forced_exempt = 0
+    changed = 0
+    signed_delta = 0.0
+    absolute_delta = 0.0
+    early_cap = SHAPE_LEN_FRAC * BFT_THINKING_BUDGET
+
+    for group, shaped_advantages, _scale in plan:
+        raw_advantages = _compute_advantages([
+            float(rollout.reward) for rollout in group.rollouts
+        ])
+        for rollout, raw, shaped in zip(
+            group.rollouts, raw_advantages, shaped_advantages
+        ):
+            total += 1
+            meta = (getattr(rollout, "commit", None) or {}).get(
+                "rollout", {}
+            ) or {}
+            if meta.get("truncated"):
+                overlong += 1
+            elif meta.get("forced"):
+                forced_exempt += 1
+            elif (
+                int(meta.get("completion_length", 0)) < early_cap
+                and float(getattr(rollout, "reward", 0.0)) <= 0.5
+            ):
+                underthinking += 1
+            delta = float(shaped) - float(raw)
+            if abs(delta) > 1e-12:
+                changed += 1
+            signed_delta += delta
+            absolute_delta += abs(delta)
+
+    denominator = max(1, total)
+    return {
+        "train/shaping_penalty": SHAPE_PENALTY,
+        "train/shaping_len_frac": SHAPE_LEN_FRAC,
+        "train/shaping_rollout_count": float(total),
+        "train/shaping_overlong_ratio": overlong / denominator,
+        "train/shaping_underthinking_ratio": underthinking / denominator,
+        "train/shaping_forced_exempt_ratio": forced_exempt / denominator,
+        "train/shaping_changed_ratio": changed / denominator,
+        "train/shaping_advantage_delta_mean": signed_delta / denominator,
+        "train/shaping_advantage_abs_delta_mean": absolute_delta / denominator,
+    }
+
+
+def _training_environment_metrics(batches, plan) -> dict[str, float]:
+    """Expose reward and gradient-signal balance for each trusted env."""
+    buckets: dict[str, dict[str, float]] = {}
+
+    def env_key(rollout) -> str:
+        raw_value = getattr(rollout, "env_name", "")
+        raw = (
+            raw_value.lower()
+            if isinstance(raw_value, str) and raw_value
+            else "unknown"
+        )
+        cleaned = "".join(
+            char if char.isalnum() or char == "_" else "_" for char in raw
+        ).strip("_")
+        return cleaned or "unknown"
+
+    def bucket_for(rollout) -> dict[str, float]:
+        return buckets.setdefault(env_key(rollout), {
+            "groups": 0.0,
+            "rollouts": 0.0,
+            "reward_sum": 0.0,
+            "reward_sq_sum": 0.0,
+            "reward_min": math.inf,
+            "reward_max": -math.inf,
+            "reward_nonzero": 0.0,
+            "raw_completion_tokens": 0.0,
+            "trainable_completion_tokens": 0.0,
+            "plan_groups": 0.0,
+            "plan_rollouts": 0.0,
+            "abs_adv_weighted_tokens": 0.0,
+        })
+
+    for batch in batches:
+        for group in batch:
+            if not group.rollouts:
+                continue
+            group_bucket = bucket_for(group.rollouts[0])
+            group_bucket["groups"] += 1.0
+            for rollout in group.rollouts:
+                current = bucket_for(rollout)
+                reward = float(rollout.reward)
+                old = _completion_token_logprobs(rollout)
+                meta = (rollout.commit or {}).get("rollout", {}) or {}
+                prompt_length = int(meta.get("prompt_length", 0) or 0)
+                trainable_tokens = _trainable_completion_count(
+                    rollout, prompt_length, len(old)
+                )
+                current["rollouts"] += 1.0
+                current["reward_sum"] += reward
+                current["reward_sq_sum"] += reward * reward
+                current["reward_min"] = min(current["reward_min"], reward)
+                current["reward_max"] = max(current["reward_max"], reward)
+                current["reward_nonzero"] += float(reward > 0.0)
+                current["raw_completion_tokens"] += len(old)
+                current["trainable_completion_tokens"] += trainable_tokens
+
+    for group, advantages, scale in plan:
+        if not group.rollouts:
+            continue
+        group_bucket = bucket_for(group.rollouts[0])
+        group_bucket["plan_groups"] += 1.0
+        for rollout, advantage in zip(group.rollouts, advantages):
+            current = bucket_for(rollout)
+            old = _completion_token_logprobs(rollout)
+            meta = (rollout.commit or {}).get("rollout", {}) or {}
+            prompt_length = int(meta.get("prompt_length", 0) or 0)
+            trainable_tokens = _trainable_completion_count(
+                rollout, prompt_length, len(old)
+            )
+            current["plan_rollouts"] += 1.0
+            current["abs_adv_weighted_tokens"] += (
+                abs(float(advantage)) * float(scale) * trainable_tokens
+            )
+
+    metrics: dict[str, float] = {}
+    for environment, values in sorted(buckets.items()):
+        prefix = f"train/env/{environment}"
+        rollouts = values["rollouts"]
+        reward_mean = values["reward_sum"] / max(1.0, rollouts)
+        reward_variance = max(
+            0.0,
+            values["reward_sq_sum"] / max(1.0, rollouts)
+            - reward_mean * reward_mean,
+        )
+        metrics.update({
+            f"{prefix}/groups": values["groups"],
+            f"{prefix}/rollouts": rollouts,
+            f"{prefix}/reward_mean": reward_mean,
+            f"{prefix}/reward_std": reward_variance ** 0.5,
+            f"{prefix}/reward_min": values["reward_min"],
+            f"{prefix}/reward_max": values["reward_max"],
+            f"{prefix}/reward_nonzero_ratio": (
+                values["reward_nonzero"] / max(1.0, rollouts)
+            ),
+            f"{prefix}/raw_completion_tokens": values[
+                "raw_completion_tokens"
+            ],
+            f"{prefix}/trainable_completion_tokens": values[
+                "trainable_completion_tokens"
+            ],
+            f"{prefix}/plan_groups": values["plan_groups"],
+            f"{prefix}/plan_rollouts": values["plan_rollouts"],
+            f"{prefix}/abs_adv_weighted_tokens": values[
+                "abs_adv_weighted_tokens"
+            ],
+        })
+    return metrics
 
 
 def _batch_loss_weights(
@@ -533,6 +715,8 @@ def _rollout_loss(
     rollout,
     advantage: float,
     device,
+    *,
+    behavior_model=None,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Compute (ppo_loss, kl_term, n_completion_tokens) for one rollout.
 
@@ -542,8 +726,8 @@ def _rollout_loss(
     per-token sum as ``mean * n``. Forward passes run in bf16 autocast;
     softmax / log-softmax cast back to fp32 for numerical stability.
 
-    π_old comes from the miner's GRAIL commit (rollout.commit["rollout"]
-    ["token_logprobs"]) — saves an extra forward pass.
+    π_old comes from ``behavior_model`` when supplied, otherwise from the
+    miner's GRAIL commit. ``ref_model`` is used only for the KL term.
     """
     tokens_list = rollout.commit["tokens"]
     prompt_length = rollout.commit.get("rollout", {}).get("prompt_length", 0)
@@ -573,6 +757,17 @@ def _rollout_loss(
             ref_logprobs = _selected_logprobs_for_tokens(ref_model, tokens, next_tokens)
     ref_logprobs_c = ref_logprobs[prompt_length - 1:]
 
+    behavior_logprobs_c = None
+    if behavior_model is ref_model:
+        behavior_logprobs_c = ref_logprobs_c
+    elif behavior_model is not None:
+        with torch.no_grad():
+            with dtype_ctx:
+                behavior_logprobs = _selected_logprobs_for_tokens(
+                    behavior_model, tokens, next_tokens
+                )
+        behavior_logprobs_c = behavior_logprobs[prompt_length - 1:]
+
     # π_old from miner (same completion slice)
     old_logprobs = torch.tensor(
         old_logprobs_list, device=device, dtype=new_logprobs_c.dtype,
@@ -582,6 +777,10 @@ def _rollout_loss(
             f"log-prob length mismatch: miner reported {len(old_logprobs)}, "
             f"model predicts {len(new_logprobs_c)} completion tokens"
         )
+    if behavior_logprobs_c is not None:
+        if len(behavior_logprobs_c) != len(new_logprobs_c):
+            raise ValueError("behavior-model completion length mismatch")
+        old_logprobs = behavior_logprobs_c.detach()
 
     # Mask the validator-injected FORCE span out of the loss. Those actions were
     # not sampled by the policy, so policy-gradient on them is invalid and their
@@ -689,6 +888,19 @@ def _new_kl_stats() -> dict[str, float | int]:
         "log_ratio_abs_max": 0.0,
         "weighted_ppo": 0.0,
         "weighted_kl": 0.0,
+        "ppo_token_count": 0,
+        "ppo_clip_active_count": 0,
+        "ppo_ratio_below_clip_count": 0,
+        "ppo_ratio_above_clip_count": 0,
+        "ppo_ratio_nonfinite_count": 0,
+        "ppo_log_ratio_abs_max": 0.0,
+        "ppo_log_ratio_abs_gt_1_count": 0,
+        "ppo_log_ratio_abs_gt_2_count": 0,
+        "ppo_log_ratio_abs_gt_5_count": 0,
+        "pi_old_claim_token_count": 0,
+        "pi_old_claim_abs_error_sum": 0.0,
+        "pi_old_claim_abs_error_max": 0.0,
+        "pi_old_claim_gt_1e_3_count": 0,
     }
 
 
@@ -699,8 +911,13 @@ def _record_kl_stats(
     kl_tok,
     kl_log,
     scale_cat,
+    ppo_ratio,
+    ppo_log_ratio,
+    ppo_clip_active,
+    claimed_old,
+    behavior_old,
 ) -> None:
-    """Accumulate bounded KL-tail telemetry after a micro-batch succeeds."""
+    """Accumulate bounded policy-health telemetry after a micro-batch."""
     if stats is None:
         return
     with torch.no_grad():
@@ -718,6 +935,52 @@ def _record_kl_stats(
         )
         stats["weighted_ppo"] += float((scale_cat * ppo_tok).sum())
         stats["weighted_kl"] += float((scale_cat * kl_tok).sum())
+        stats["ppo_token_count"] += ppo_ratio.numel()
+        stats["ppo_clip_active_count"] += int(ppo_clip_active.sum())
+        stats["ppo_ratio_below_clip_count"] += int(
+            (ppo_ratio < 1.0 - PPO_CLIP_EPSILON).sum()
+        )
+        stats["ppo_ratio_above_clip_count"] += int(
+            (ppo_ratio > 1.0 + PPO_CLIP_EPSILON).sum()
+        )
+        stats["ppo_ratio_nonfinite_count"] += int(
+            (~torch.isfinite(ppo_ratio)).sum()
+        )
+        finite_log_ratio = ppo_log_ratio.detach().float()
+        finite_log_ratio = finite_log_ratio[torch.isfinite(finite_log_ratio)]
+        if finite_log_ratio.numel():
+            abs_log_ratio = finite_log_ratio.abs()
+            stats["ppo_log_ratio_abs_max"] = max(
+                float(stats["ppo_log_ratio_abs_max"]),
+                float(abs_log_ratio.max()),
+            )
+            stats["ppo_log_ratio_abs_gt_1_count"] += int(
+                (abs_log_ratio > 1.0).sum()
+            )
+            stats["ppo_log_ratio_abs_gt_2_count"] += int(
+                (abs_log_ratio > 2.0).sum()
+            )
+            stats["ppo_log_ratio_abs_gt_5_count"] += int(
+                (abs_log_ratio > 5.0).sum()
+            )
+        if behavior_old is not None:
+            claim_error = (
+                behavior_old.detach().float()
+                - claimed_old.detach().float()
+            ).abs()
+            finite_claim_error = claim_error[torch.isfinite(claim_error)]
+            stats["pi_old_claim_token_count"] += claim_error.numel()
+            stats["pi_old_claim_gt_1e_3_count"] += int(
+                (claim_error > 1e-3).sum()
+            )
+            if finite_claim_error.numel():
+                stats["pi_old_claim_abs_error_sum"] += float(
+                    finite_claim_error.sum()
+                )
+                stats["pi_old_claim_abs_error_max"] = max(
+                    float(stats["pi_old_claim_abs_error_max"]),
+                    float(finite_claim_error.max()),
+                )
 
 
 def _kl_telemetry_metrics(stats: dict[str, float | int]) -> dict[str, float]:
@@ -726,6 +989,10 @@ def _kl_telemetry_metrics(stats: dict[str, float | int]) -> dict[str, float]:
     weighted_ppo = float(stats["weighted_ppo"])
     weighted_kl = float(stats["weighted_kl"])
     weighted_penalty = KL_BETA * weighted_kl
+    ppo_token_count = int(stats["ppo_token_count"])
+    ppo_denominator = max(1, ppo_token_count)
+    claim_token_count = int(stats["pi_old_claim_token_count"])
+    claim_denominator = max(1, claim_token_count)
     return {
         "train/kl_beta": KL_BETA,
         "train/ppo_objective_component": weighted_ppo,
@@ -747,10 +1014,60 @@ def _kl_telemetry_metrics(stats: dict[str, float | int]) -> dict[str, float]:
         "train/kl_token_gt_10_ratio": (
             int(stats["gt_10_count"]) / denominator
         ),
+        "train/ppo_clip_active_ratio": (
+            int(stats["ppo_clip_active_count"]) / ppo_denominator
+        ),
+        "train/ppo_ratio_below_clip_ratio": (
+            int(stats["ppo_ratio_below_clip_count"]) / ppo_denominator
+        ),
+        "train/ppo_ratio_above_clip_ratio": (
+            int(stats["ppo_ratio_above_clip_count"]) / ppo_denominator
+        ),
+        "train/ppo_ratio_outside_clip_ratio": (
+            (
+                int(stats["ppo_ratio_below_clip_count"])
+                + int(stats["ppo_ratio_above_clip_count"])
+            )
+            / ppo_denominator
+        ),
+        "train/ppo_ratio_nonfinite_ratio": (
+            int(stats["ppo_ratio_nonfinite_count"]) / ppo_denominator
+        ),
+        "train/ppo_log_ratio_abs_max": float(
+            stats["ppo_log_ratio_abs_max"]
+        ),
+        "train/ppo_log_ratio_abs_gt_1_ratio": (
+            int(stats["ppo_log_ratio_abs_gt_1_count"]) / ppo_denominator
+        ),
+        "train/ppo_log_ratio_abs_gt_2_ratio": (
+            int(stats["ppo_log_ratio_abs_gt_2_count"]) / ppo_denominator
+        ),
+        "train/ppo_log_ratio_abs_gt_5_ratio": (
+            int(stats["ppo_log_ratio_abs_gt_5_count"]) / ppo_denominator
+        ),
+        "train/pi_old_claim_token_count": float(claim_token_count),
+        "train/pi_old_claim_abs_error_mean": (
+            float(stats["pi_old_claim_abs_error_sum"]) / claim_denominator
+        ),
+        "train/pi_old_claim_abs_error_max": float(
+            stats["pi_old_claim_abs_error_max"]
+        ),
+        "train/pi_old_claim_gt_1e_3_ratio": (
+            int(stats["pi_old_claim_gt_1e_3_count"]) / claim_denominator
+        ),
     }
 
 
-def _microbatch_grad(model, ref_model, batch, device, *, atomic, kl_stats=None):
+def _microbatch_grad(
+    model,
+    ref_model,
+    batch,
+    device,
+    *,
+    atomic,
+    kl_stats=None,
+    behavior_model=None,
+):
     """Forward + backward one micro-batch. ``batch`` is a list of
     ``(tokens, prompt_length, old_logprobs, advantage, scale, keep)`` where ``scale``
     is the per-token loss weight ``w_e/N_e`` of the rollout's env. Returns
@@ -783,12 +1100,29 @@ def _microbatch_grad(model, ref_model, batch, device, *, atomic, kl_stats=None):
         new_lp, seg = _batched_completion_logprobs(model, input_ids, attn, plens, lens)
         with torch.no_grad():
             ref_lp, _ = _batched_completion_logprobs(ref_model, input_ids, attn, plens, lens)
+            if behavior_model is ref_model:
+                behavior_lp = ref_lp
+            elif behavior_model is not None:
+                behavior_lp, behavior_seg = _batched_completion_logprobs(
+                    behavior_model, input_ids, attn, plens, lens
+                )
+                if behavior_seg != seg:
+                    raise ValueError("behavior-model completion segments mismatch")
+            else:
+                behavior_lp = None
 
-    old_cat = torch.tensor(
+    claimed_old_cat = torch.tensor(
         [x for old in olds for x in old],
         device=device,
         dtype=new_lp.dtype,
     )
+    old_cat = claimed_old_cat
+    behavior_old_cat = None
+    if behavior_lp is not None:
+        if behavior_lp.shape != new_lp.shape:
+            raise ValueError("behavior-model completion shape mismatch")
+        behavior_old_cat = behavior_lp.detach()
+        old_cat = behavior_old_cat
     adv_cat = torch.tensor(
         [advs[k] for k in range(B) for _ in range(seg[k])],
         device=device,
@@ -807,12 +1141,21 @@ def _microbatch_grad(model, ref_model, batch, device, *, atomic, kl_stats=None):
     new_lp = new_lp[keep_cat]
     ref_lp = ref_lp[keep_cat]
     old_cat = old_cat[keep_cat]
+    claimed_old_cat = claimed_old_cat[keep_cat]
+    if behavior_old_cat is not None:
+        behavior_old_cat = behavior_old_cat[keep_cat]
     adv_cat = adv_cat[keep_cat]
     scale_cat = scale_cat[keep_cat]
     keep_seg = [sum(1 for flag in keep if flag) for keep in keeps]
-    ratio = torch.exp(new_lp - old_cat)
-    surr = torch.min(ratio * adv_cat,
-                     torch.clamp(ratio, 1 - PPO_CLIP_EPSILON, 1 + PPO_CLIP_EPSILON) * adv_cat)
+    ppo_log_ratio = new_lp - old_cat
+    ratio = torch.exp(ppo_log_ratio)
+    unclipped_surr = ratio * adv_cat
+    clipped_surr = (
+        torch.clamp(ratio, 1 - PPO_CLIP_EPSILON, 1 + PPO_CLIP_EPSILON)
+        * adv_cat
+    )
+    surr = torch.min(unclipped_surr, clipped_surr)
+    clip_active = clipped_surr < unclipped_surr
     ppo_tok = -surr
     kl_log = ref_lp - new_lp
     kl_tok = torch.exp(kl_log) - 1 - kl_log
@@ -838,6 +1181,11 @@ def _microbatch_grad(model, ref_model, batch, device, *, atomic, kl_stats=None):
         kl_tok=kl_tok,
         kl_log=kl_log,
         scale_cat=scale_cat,
+        ppo_ratio=ratio,
+        ppo_log_ratio=ppo_log_ratio,
+        ppo_clip_active=clip_active,
+        claimed_old=claimed_old_cat,
+        behavior_old=behavior_old_cat,
     )
 
     sum_ppo = sum_kl = 0.0
@@ -852,17 +1200,20 @@ def _microbatch_grad(model, ref_model, batch, device, *, atomic, kl_stats=None):
 
 def _process_microbatch(
     model, ref_model, batch, device, *, atomic, kl_stats=None,
+    behavior_model=None,
 ):
     """One micro-batch; when atomic, on OOM halve and retry down to a single
     sequence (which, if it still OOMs, is a genuine unrecoverable OOM)."""
     if not atomic:
         return _microbatch_grad(
             model, ref_model, batch, device, atomic=False, kl_stats=kl_stats,
+            behavior_model=behavior_model,
         )
     oom = False
     try:
         return _microbatch_grad(
             model, ref_model, batch, device, atomic=True, kl_stats=kl_stats,
+            behavior_model=behavior_model,
         )
     except torch.cuda.OutOfMemoryError:
         if len(batch) == 1:
@@ -876,11 +1227,11 @@ def _process_microbatch(
         mid = len(batch) // 2
         a = _process_microbatch(
             model, ref_model, batch[:mid], device,
-            atomic=True, kl_stats=kl_stats,
+            atomic=True, kl_stats=kl_stats, behavior_model=behavior_model,
         )
         b = _process_microbatch(
             model, ref_model, batch[mid:], device,
-            atomic=True, kl_stats=kl_stats,
+            atomic=True, kl_stats=kl_stats, behavior_model=behavior_model,
         )
         return a[0] + b[0], a[1] + b[1], a[2] + b[2]
 
@@ -917,6 +1268,7 @@ def _build_microbatch_items(plan):
 
 def _accumulate_grouped_grads(
     model, ref_model, plan, device, *, budget, atomic, kl_stats=None,
+    behavior_model=None,
 ):
     """Pack the plan's rollouts into token-budget micro-batches and accumulate
     gradients. Returns ``(total_ppo, total_kl, n_processed)``."""
@@ -930,6 +1282,7 @@ def _accumulate_grouped_grads(
         sp, sk, n = _process_microbatch(
             model, ref_model, [items[i] for i in idxs], device,
             atomic=atomic, kl_stats=kl_stats,
+            behavior_model=behavior_model,
         )
         total_ppo += sp
         total_kl += sk
@@ -946,6 +1299,7 @@ def train_step(
     batches: list,
     *,
     ref_model,
+    behavior_model=None,
     window_index: int | None = None,
 ) -> Any:
     """Run one GRPO step over the union of *batches*.
@@ -959,6 +1313,9 @@ def train_step(
     owns its lifecycle: production uses either the rolling published
     ``verify_model`` or an explicitly pinned fixed checkpoint.
 
+    *behavior_model*, when supplied, must be the published checkpoint miners
+    generated against. It independently supplies PPO's π_old.
+
     *window_index* is used as the wandb step when telemetry is enabled.
     Safe to omit in tests.
     """
@@ -970,6 +1327,7 @@ def train_step(
         logger.info("train_step: model not initializable (non-torch?), skipping")
         return model
     assert _optimizer is not None and _scheduler is not None
+    lr_applied = float(_optimizer.param_groups[0]["lr"])
 
     model.train()
     device = next(model.parameters()).device
@@ -991,6 +1349,8 @@ def train_step(
     if not plan:
         logger.info("train_step: no trainable groups")
         return model
+    shaping_metrics = _shaping_training_metrics(plan)
+    environment_metrics = _training_environment_metrics(batches, plan)
 
     # Pass 2: micro-batched forward/backward (token-budget packing). The fast
     # path accumulates straight into .grad; if a micro-batch OOMs, discard the
@@ -1002,6 +1362,7 @@ def train_step(
             model, ref_model, plan, device,
             budget=MICROBATCH_MAX_PADDED_TOKENS, atomic=False,
             kl_stats=kl_stats,
+            behavior_model=behavior_model,
         )
     except torch.cuda.OutOfMemoryError:
         logger.warning("train_step: OOM in micro-batch — retrying atomic at halved budget")
@@ -1012,6 +1373,7 @@ def train_step(
             model, ref_model, plan, device,
             budget=max(1, MICROBATCH_MAX_PADDED_TOKENS // 2), atomic=True,
             kl_stats=kl_stats,
+            behavior_model=behavior_model,
         )
 
     if n_processed == 0:
@@ -1019,29 +1381,81 @@ def train_step(
         return model
 
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
-    # Finite-guard: a non-finite grad (e.g. from the BFT carve or any numerical
-    # blowup) must never reach the weights — skip the step rather than poison
-    # the checkpoint.
-    if not bool(torch.isfinite(grad_norm)):
+    grad_norm_value = float(grad_norm)
+    policy_metrics = _kl_telemetry_metrics(kl_stats)
+    nonfinite_gradient = not math.isfinite(grad_norm_value)
+    nonfinite_policy_ratio = (
+        policy_metrics["train/ppo_ratio_nonfinite_ratio"] > 0.0
+    )
+    gradient_spike = (
+        not nonfinite_gradient
+        and grad_norm_value > GRAD_NORM_SKIP_THRESHOLD
+    )
+    policy_ratio_drift = (
+        policy_metrics["train/ppo_ratio_outside_clip_ratio"]
+        > PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD
+    )
+    if (
+        nonfinite_gradient
+        or nonfinite_policy_ratio
+        or gradient_spike
+        or policy_ratio_drift
+    ):
+        if nonfinite_gradient:
+            reason = "nonfinite_gradient"
+        elif nonfinite_policy_ratio:
+            reason = "nonfinite_policy_ratio"
+        elif gradient_spike:
+            reason = "gradient_spike"
+        else:
+            reason = "policy_ratio_drift"
         logger.warning(
-            "train_step: non-finite grad_norm=%s → skipping optimizer step",
-            float(grad_norm),
+            "train_step: rejected %s grad_norm=%s grad_threshold=%s "
+            "ppo_outside_clip=%.6g ppo_threshold=%.6g; "
+            "optimizer and checkpoint cadence unchanged",
+            reason,
+            grad_norm_value,
+            GRAD_NORM_SKIP_THRESHOLD,
+            policy_metrics["train/ppo_ratio_outside_clip_ratio"],
+            PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD,
         )
-        failure_metrics = _kl_telemetry_metrics(kl_stats)
+        failure_metrics = policy_metrics
         failure_metrics.update({
-            "train/grad_norm": float(grad_norm),
-            "train/step_skipped_nonfinite": 1.0,
+            "train/ppo_loss": total_ppo / n_processed,
+            "train/kl": total_kl / n_processed,
+            "train/grad_norm": grad_norm_value,
+            "train/lr_applied": lr_applied,
+            "train/lr_next": lr_applied,
+            "train/step_skipped_nonfinite": float(nonfinite_gradient),
+            "train/step_skipped_nonfinite_policy_ratio": float(
+                nonfinite_policy_ratio
+            ),
+            "train/step_skipped_grad_spike": float(gradient_spike),
+            "train/step_skipped_policy_ratio_drift": float(
+                policy_ratio_drift
+            ),
+            "train/ppo_ratio_outside_clip_skip_threshold": (
+                PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD
+            ),
+            "train/pi_old_recomputed": float(behavior_model is not None),
+            "train/rollouts_processed": n_processed,
+            "train/rollouts_total": n_total_rollouts,
+            "train/valid_rollout_ratio": n_processed / n_total_rollouts,
         })
+        failure_metrics.update(_bft_training_metrics(plan))
+        failure_metrics.update(shaping_metrics)
+        failure_metrics.update(environment_metrics)
         telemetry.log_training_step(failure_metrics, step=window_index)
         _optimizer.zero_grad(set_to_none=True)
-        return model
+        raise TrainingStepSkipped(reason, grad_norm_value)
     _optimizer.step()
     _scheduler.step()
-    lr = _scheduler.get_last_lr()[0]
+    lr_next = float(_scheduler.get_last_lr()[0])
 
     logger.info(
-        "train_step: lr=%.2e ppo=%.4f kl=%.4f grad_norm=%.3f rollouts=%d/%d",
-        lr, total_ppo / n_processed, total_kl / n_processed,
+        "train_step: lr_applied=%.2e lr_next=%.2e ppo=%.4f kl=%.4f "
+        "grad_norm=%.3f rollouts=%d/%d",
+        lr_applied, lr_next, total_ppo / n_processed, total_kl / n_processed,
         float(grad_norm), n_processed, n_total_rollouts,
     )
 
@@ -1053,13 +1467,24 @@ def train_step(
     reward_std = reward_var ** 0.5
     n_groups = sum(len(batch) for batch in batches)
     metrics = {
-        "train/lr": lr,
+        # Keep ``train/lr`` as the historical post-scheduler value while
+        # exposing the rate that actually produced this update explicitly.
+        "train/lr": lr_next,
+        "train/lr_applied": lr_applied,
+        "train/lr_next": lr_next,
         "train/ppo_loss": total_ppo / n_processed,
         "train/kl": total_kl / n_processed,
         "train/grad_norm": float(grad_norm),
         "train/grad_clip_ratio": float(grad_norm) / GRAD_CLIP_NORM,
         "train/grad_was_clipped": float(grad_norm > GRAD_CLIP_NORM),
         "train/step_skipped_nonfinite": 0.0,
+        "train/step_skipped_nonfinite_policy_ratio": 0.0,
+        "train/step_skipped_grad_spike": 0.0,
+        "train/step_skipped_policy_ratio_drift": 0.0,
+        "train/ppo_ratio_outside_clip_skip_threshold": (
+            PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD
+        ),
+        "train/pi_old_recomputed": float(behavior_model is not None),
         "train/rollouts_processed": n_processed,
         "train/rollouts_total": n_total_rollouts,
         "train/valid_rollout_ratio": n_processed / n_total_rollouts,
@@ -1073,6 +1498,8 @@ def train_step(
     }
     metrics.update(_kl_telemetry_metrics(kl_stats))
     metrics.update(_bft_training_metrics(plan))
+    metrics.update(shaping_metrics)
+    metrics.update(environment_metrics)
     telemetry.log_training_step(metrics, step=window_index)
 
     return model

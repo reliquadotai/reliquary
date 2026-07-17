@@ -17,10 +17,10 @@ except Exception:
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 from reliquary.validator.training import (
-    _rollout_loss, _compute_advantages, train_step, reset_training_state,
+    TrainingStepSkipped, _rollout_loss, train_step,
+    reset_training_state,
     _selected_logprobs, _selected_logprobs_for_tokens,
 )
 
@@ -319,10 +319,111 @@ def test_train_step_skips_optimizer_on_nonfinite_grad(tiny_model_and_tokenizer, 
     )
 
     before = next(model.parameters()).detach().clone()
-    result = train_step(model, [[group]], ref_model=_make_ref(model))
-    assert result is model
+    with pytest.raises(TrainingStepSkipped, match="nonfinite_gradient"):
+        train_step(model, [[group]], ref_model=_make_ref(model))
     after = next(model.parameters()).detach().clone()
     assert torch.equal(before, after), "weights must not change on non-finite grad"
+
+
+def test_train_step_skips_optimizer_on_pathological_finite_grad(
+    tiny_model_and_tokenizer, monkeypatch,
+):
+    """A finite pre-clip spike is rejected, not converted into a unit-sized
+    update in an untrustworthy direction."""
+    reset_training_state()
+    model, _ = tiny_model_and_tokenizer
+    rollouts = [
+        _build_rollout([1, 2, 3, 4, 5, 6], r, 2)
+        for r in [1, 1, 0, 0]
+    ]
+    group = _FakeGroup(rollouts=rollouts, prompt_idx=0)
+    captured = {}
+
+    from reliquary.validator import telemetry
+
+    monkeypatch.setattr(
+        telemetry,
+        "log_training_step",
+        lambda metrics, step: captured.update(metrics),
+    )
+
+    monkeypatch.setattr(
+        torch.nn.utils, "clip_grad_norm_",
+        lambda *a, **k: torch.tensor(10_432.0),
+    )
+
+    before = next(model.parameters()).detach().clone()
+    with pytest.raises(TrainingStepSkipped, match="gradient_spike"):
+        train_step(model, [[group]], ref_model=_make_ref(model))
+    after = next(model.parameters()).detach().clone()
+    assert torch.equal(before, after), "weights must not change on a grad spike"
+    assert captured["train/ppo_loss"] is not None
+    assert captured["train/kl"] is not None
+    assert captured["train/rollouts_processed"] == 4
+    assert captured["train/rollouts_total"] == 4
+    assert captured["train/valid_rollout_ratio"] == 1.0
+    assert "bft/forced_rollout_ratio" in captured
+
+
+@pytest.mark.parametrize(
+    ("expected_reason", "outside_count", "nonfinite_count"),
+    [
+        ("policy_ratio_drift", 6, 0),
+        ("nonfinite_policy_ratio", 0, 1),
+    ],
+)
+def test_train_step_skips_optimizer_on_unsafe_policy_ratio(
+    tiny_model_and_tokenizer,
+    monkeypatch,
+    expected_reason,
+    outside_count,
+    nonfinite_count,
+):
+    reset_training_state()
+    model, _ = tiny_model_and_tokenizer
+    rollouts = [
+        _build_rollout([1, 2, 3, 4, 5, 6], reward, 2)
+        for reward in [1, 1, 0, 0]
+    ]
+    group = _FakeGroup(rollouts=rollouts, prompt_idx=0)
+    captured = {}
+
+    import reliquary.validator.training as training_mod
+    from reliquary.validator import telemetry
+
+    def unsafe_ratio_stats(*_args, kl_stats, **_kwargs):
+        kl_stats["ppo_token_count"] = 100
+        kl_stats["ppo_ratio_above_clip_count"] = outside_count
+        kl_stats["ppo_ratio_nonfinite_count"] = nonfinite_count
+        return 0.0, 0.0, 4
+
+    monkeypatch.setattr(
+        training_mod, "PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD", 0.05
+    )
+    monkeypatch.setattr(
+        training_mod, "_accumulate_grouped_grads", unsafe_ratio_stats
+    )
+    monkeypatch.setattr(
+        telemetry,
+        "log_training_step",
+        lambda metrics, step: captured.update(metrics),
+    )
+
+    before = next(model.parameters()).detach().clone()
+    with pytest.raises(TrainingStepSkipped, match=expected_reason):
+        train_step(model, [[group]], ref_model=_make_ref(model))
+    after = next(model.parameters()).detach().clone()
+
+    assert torch.equal(before, after)
+    assert captured["train/ppo_ratio_outside_clip_ratio"] == pytest.approx(
+        outside_count / 100
+    )
+    assert captured["train/ppo_ratio_nonfinite_ratio"] == pytest.approx(
+        nonfinite_count / 100
+    )
+    assert captured[
+        f"train/step_skipped_{expected_reason}"
+    ] == 1.0
 
 
 def test_train_step_token_level_handles_unequal_lengths(tiny_model_and_tokenizer):

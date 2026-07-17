@@ -47,12 +47,6 @@ WORKDIR /opt/reliquary
 COPY . /opt/reliquary
 RUN pip install -e .
 
-# bittensor 10.2.0 ships with async-substrate-interface 2.0 which conflicts
-# with its own scalecodec import path — roll back to the 1.x line that matches.
-RUN pip uninstall -y cyscale \
- && pip install 'async-substrate-interface<2.0.0' \
- && pip install --force-reinstall --no-deps scalecodec==1.2.12
-
 # boto3 for R2 (weight-only mode + trainer archive uploads)
 RUN pip install boto3
 

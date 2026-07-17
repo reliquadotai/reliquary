@@ -7,7 +7,11 @@ import bittensor as bt
 import pytest
 from fastapi.testclient import TestClient
 
-from reliquary.constants import CHALLENGE_K, M_ROLLOUTS
+from reliquary.constants import (
+    CHALLENGE_K,
+    M_ROLLOUTS,
+    REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
+)
 from reliquary.environment.virtual_parquet import PromptSourceUnavailable
 from reliquary.protocol.legacy_merkle import (
     compute_legacy_rollouts_merkle_root,
@@ -509,7 +513,44 @@ def test_health_reports_registration_gate_state():
     assert health["registered_operator_mapping_count"] == 1
     assert health["registered_operator_mapping_complete"] is True
     assert health["registration_cache_stale"] is False
+    assert health["registration_cache_usable"] is True
     assert health["registration_cache_age_seconds"] >= 0
+    assert health["chain_client_fingerprint"]["bittensor_version"]
+    assert health["chain_client_fingerprint"][
+        "async_substrate_interface_version"
+    ]
+
+
+def test_health_degrades_before_registration_cache_becomes_unusable():
+    async def refresh():
+        return False
+
+    server = _registration_server(refresh)
+    server.set_registered_hotkeys(
+        {_TEST_KEYPAIR.ss58_address},
+        refreshed_at=(
+            time.time() - REGISTERED_HOTKEY_CACHE_TTL_SECONDS - 1
+        ),
+    )
+
+    health = TestClient(server.app).get("/health").json()
+
+    assert health["status"] == "degraded"
+    assert health["registration_cache_stale"] is True
+    assert health["registration_cache_usable"] is True
+
+
+def test_health_degrades_when_registration_cache_is_unavailable():
+    async def refresh():
+        return False
+
+    server = _registration_server(refresh)
+
+    health = TestClient(server.app).get("/health").json()
+
+    assert health["status"] == "degraded"
+    assert health["registration_cache_stale"] is None
+    assert health["registration_cache_usable"] is False
 
 
 def test_submit_503_when_no_active_batcher():

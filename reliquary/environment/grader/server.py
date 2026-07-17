@@ -27,6 +27,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -132,10 +133,11 @@ class GraderServer:
             sys.executable, "-m", "reliquary.environment.grader.worker"
         ]
         # Runsc mode: each worker needs a unique container id (see
-        # GRADER_CONTAINER_ID_PLACEHOLDER). IDs include a generation counter
-        # so respawn never blocks on deleting a wedged old sandbox before it
-        # can restore capacity.
+        # GRADER_CONTAINER_ID_PLACEHOLDER). IDs include a per-server nonce and
+        # generation counter so a process restart or rapid in-process restart
+        # never collides with a sandbox that runsc is still tearing down.
         self._uses_runsc = GRADER_CONTAINER_ID_PLACEHOLDER in self.worker_argv
+        self._container_instance_id = uuid.uuid4().hex[:12]
         self._container_generation = 0
         self._container_generation_lock = threading.Lock()
         self.eval_timeout_s = eval_timeout_s
@@ -156,7 +158,9 @@ class GraderServer:
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 if self.path != "/metrics":
-                    self.send_response(404); self.end_headers(); return
+                    self.send_response(404)
+                    self.end_headers()
+                    return
                 body = registry.render().encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain; version=0.0.4")
@@ -206,6 +210,11 @@ class GraderServer:
                 self._metrics_server.shutdown()
             except Exception:
                 pass
+            try:
+                self._metrics_server.server_close()
+            except Exception:
+                pass
+            self._metrics_server = None
         try:
             os.unlink(self.socket_path)
         except FileNotFoundError:
@@ -215,7 +224,9 @@ class GraderServer:
         with self._container_generation_lock:
             self._container_generation += 1
             generation = self._container_generation
-        return f"grader-worker-{slot}-{generation}"
+        return (
+            f"grader-worker-{self._container_instance_id}-{slot}-{generation}"
+        )
 
     def _worker_argv_for_container(self, container_id: str | None) -> list[str]:
         """Per-worker argv. For runsc, substitute the generated container id."""

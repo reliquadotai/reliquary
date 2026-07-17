@@ -218,6 +218,74 @@ async def test_one_window_lap_bumps_counters(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_training_health_gate_blocks_checkpoint_publish(monkeypatch):
+    """An intentionally rejected optimizer step is archived as untrained and
+    cannot advance the public checkpoint."""
+    monkeypatch.setattr("reliquary.validator.service.B_BATCH", 0)
+
+    import reliquary.validator.service as svc_mod
+    from reliquary.validator.training import TrainingStepSkipped
+
+    svc = _make_service()
+
+    def _reject_step(model, batch, *, ref_model, window_index=None):
+        raise TrainingStepSkipped("gradient_spike", 10_432.0)
+
+    monkeypatch.setattr(svc_mod, "train_step", _reject_step)
+
+    with _patch_open_grpo_window(svc):
+        svc._open_window()
+    svc._activate_window()
+    batcher = svc._active_batcher
+    batcher.seal_event.set()
+
+    await svc._train_and_publish()
+
+    svc._checkpoint_store.publish.assert_not_awaited()
+    assert svc._checkpoint_n == 0
+    assert batcher.training_accumulator["training_attempted"] is True
+    assert batcher.training_accumulator["trained"] is False
+    assert batcher.training_accumulator["reset_reason"] == (
+        "training_health_gate:gradient_spike"
+    )
+
+
+@pytest.mark.asyncio
+async def test_training_uses_distinct_behavior_and_fixed_reference(monkeypatch):
+    """Fixed KL must not replace the published behavior policy used for PPO."""
+    monkeypatch.setattr("reliquary.validator.service.B_BATCH", 0)
+    monkeypatch.setattr(
+        "reliquary.validator.service.RECOMPUTE_PI_OLD_FROM_VERIFY", True,
+    )
+
+    import reliquary.validator.service as svc_mod
+
+    svc = _make_service()
+    fixed_ref = MagicMock(name="fixed_kl_reference")
+    svc.base_ref_model = fixed_ref
+    captured = {}
+
+    def _capture_step(
+        model, batch, *, ref_model, behavior_model, window_index=None,
+    ):
+        captured["ref_model"] = ref_model
+        captured["behavior_model"] = behavior_model
+        return model
+
+    monkeypatch.setattr(svc_mod, "train_step", _capture_step)
+
+    with _patch_open_grpo_window(svc):
+        svc._open_window()
+    svc._activate_window()
+    svc._active_batcher.seal_event.set()
+
+    await svc._train_and_publish()
+
+    assert captured["ref_model"] is fixed_ref
+    assert captured["behavior_model"] is svc.verify_model
+
+
+@pytest.mark.asyncio
 async def test_open_window_passes_verify_model_to_batcher(monkeypatch):
     """The batcher must receive verify_model (not train_model) so
     verify_commitment_proofs runs against the published checkpoint."""
@@ -553,6 +621,91 @@ async def test_disable_train_retains_ready_batch_until_reenabled(monkeypatch):
         await svc._train_and_publish()
 
     svc._checkpoint_store.publish.assert_awaited_once()
+    assert svc._training_accumulator.snapshot()["counts"] == {"fake": 0}
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_ceiling_pauses_persistently_until_raised(monkeypatch):
+    svc = _make_service(checkpoint_hash="sha256:cpA")
+    svc._checkpoint_n = 35
+    monkeypatch.setattr(
+        "reliquary.validator.service.TRAIN_UNTIL_CHECKPOINT_N", 35
+    )
+
+    with _patch_open_grpo_window(svc):
+        svc._open_window()
+    svc._activate_window()
+    for i in range(B_BATCH):
+        response = svc._active_batcher.accept_submission(_request(
+            hotkey=f"hk{i}", prompt_idx=i,
+            window_start=svc._active_batcher.window_start,
+            checkpoint_hash="sha256:cpA", seed=i,
+        ))
+        assert response.accepted
+    await svc._train_and_publish()
+
+    assert svc._training_accumulator.snapshot()["ready"] is True
+    svc._checkpoint_store.publish.assert_not_awaited()
+
+    monkeypatch.setattr(
+        "reliquary.validator.service.TRAIN_UNTIL_CHECKPOINT_N", 36
+    )
+    with _patch_open_grpo_window(svc):
+        svc._open_window()
+    svc._activate_window()
+    with patch(
+        "reliquary.validator.service.train_step",
+        side_effect=lambda model, batches, **kwargs: model,
+    ):
+        await svc._train_and_publish()
+
+    svc._checkpoint_store.publish.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_failed_publish_retries_without_an_extra_optimizer_step():
+    from reliquary.validator.checkpoint import ManifestEntry
+
+    svc = _make_service(checkpoint_hash="sha256:cpA")
+    published = ManifestEntry(
+        checkpoint_n=1,
+        repo_id="aivolutionedge/reliquary-sn",
+        revision="sha256:cpB",
+        signature="ed25519:sig1",
+    )
+    svc._checkpoint_store.publish = AsyncMock(
+        side_effect=[RuntimeError("HF unavailable"), published]
+    )
+
+    with patch(
+        "reliquary.validator.service.train_step",
+        side_effect=lambda model, batches, **kwargs: model,
+    ) as train:
+        for window in range(2):
+            with _patch_open_grpo_window(svc):
+                svc._open_window()
+            svc._activate_window()
+            for i in range(B_BATCH):
+                response = svc._active_batcher.accept_submission(_request(
+                    hotkey=f"hk-{window}-{i}",
+                    prompt_idx=window * B_BATCH + i,
+                    window_start=svc._active_batcher.window_start,
+                    checkpoint_hash="sha256:cpA",
+                    seed=window * B_BATCH + i,
+                ))
+                assert response.accepted
+            await svc._train_and_publish()
+            health = svc.server._health_payload()
+            assert health.training_checkpoint_publish_interval == 1
+            assert health.training_checkpoint_publication_pending is (
+                window == 0
+            )
+
+    assert train.call_count == 1
+    assert svc._checkpoint_store.publish.await_count == 2
+    assert svc._checkpoint_n == 1
+    assert svc._trained_windows_since_publish == 0
+    assert health.training_trained_windows_since_publish == 0
     assert svc._training_accumulator.snapshot()["counts"] == {"fake": 0}
 
 

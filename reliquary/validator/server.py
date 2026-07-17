@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import importlib.metadata
 import logging
 import numbers
 import time
@@ -99,6 +100,22 @@ logger = logging.getLogger(__name__)
 # ring buffer can't grow without limit if a misbehaving miner spams.
 # At ~250 B per verdict × 200 entries × ~50 hotkeys ≈ 2.5 MB — cheap.
 VERDICT_CAP_PER_HOTKEY = 200
+
+
+def _chain_client_fingerprint() -> dict[str, str | None]:
+    """Return the chain codec versions that determine SCALE compatibility."""
+    versions: dict[str, str | None] = {}
+    for field, distribution in (
+        ("bittensor_version", "bittensor"),
+        ("async_substrate_interface_version", "async-substrate-interface"),
+        ("cyscale_version", "cyscale"),
+        ("legacy_scalecodec_version", "scalecodec"),
+    ):
+        try:
+            versions[field] = importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            versions[field] = None
+    return versions
 
 
 def _is_mock_like(value: Any) -> bool:
@@ -338,6 +355,9 @@ class _Health(BaseModel):
     active_window: int | None
     image_revision: str | None = None
     runtime_fingerprint: dict[str, Any] = Field(default_factory=dict)
+    chain_client_fingerprint: dict[str, str | None] = Field(
+        default_factory=dict
+    )
     app_started_at: float
     current_validator_state: str
     current_window_n: int | None = None
@@ -398,10 +418,14 @@ class _Health(BaseModel):
     registered_operator_mapping_complete: bool | None = None
     registration_cache_age_seconds: float | None = None
     registration_cache_stale: bool | None = None
+    registration_cache_usable: bool | None = None
     training_accumulator_checkpoint_revision: str | None = None
     training_accumulator_targets: dict[str, int] = Field(default_factory=dict)
     training_accumulator_counts: dict[str, int] = Field(default_factory=dict)
     training_accumulator_ready: bool = False
+    training_trained_windows_since_publish: int = 0
+    training_checkpoint_publish_interval: int = 0
+    training_checkpoint_publication_pending: bool = False
     forced_seed_enforced: bool = FORCED_SEED_ENFORCE
     forced_seed_consistency_floor: float = FORCED_SEED_CONSISTENCY_FLOOR
     forced_seed_rollout_floor: float = FORCED_SEED_ROLLOUT_FLOOR
@@ -452,6 +476,7 @@ class ValidatorServer:
         self._app_started_at = time.time()
         self._image_revision = runtime_revision()
         self._runtime_fingerprint = collect_runtime_fingerprint()
+        self._chain_client_fingerprint = _chain_client_fingerprint()
         # Multi-env: keyed by env_name. ``active_batcher`` (singular) is
         # maintained as a legacy accessor pointing to the first active batcher
         # so existing code paths (/health, /state, the submit worker stale
@@ -468,6 +493,7 @@ class ValidatorServer:
         self._registration_refresh_lock = asyncio.Lock()
         self._last_registration_refresh_attempt = 0.0
         self._training_accumulator_state: dict[str, Any] = {}
+        self._training_publish_state: dict[str, Any] = {}
         self._training_kl_reference_state: dict[str, Any] = {}
         self._last_committed_window_n = 0
         self._candidate_window_n: int | None = None
@@ -561,6 +587,10 @@ class ValidatorServer:
     def set_training_accumulator_state(self, state: dict[str, Any]) -> None:
         """Expose a JSON-safe snapshot through ``/health``."""
         self._training_accumulator_state = dict(state)
+
+    def set_training_publish_state(self, state: dict[str, Any]) -> None:
+        """Expose checkpoint-cadence and pending-publication state."""
+        self._training_publish_state = dict(state)
 
     def set_training_kl_reference_state(self, state: dict[str, Any]) -> None:
         """Expose the effective, resolved KL reference through ``/health``."""
@@ -959,7 +989,20 @@ class ValidatorServer:
         batcher = self.active_batcher
         cp = self._current_checkpoint
         registration_age = self.registration_cache_age()
+        registration_cache_stale = (
+            registration_age > REGISTERED_HOTKEY_CACHE_TTL_SECONDS
+            if registration_age is not None
+            else None
+        )
+        registration_cache_usable = (
+            self._registered_hotkeys is not None
+            and registration_age is not None
+            and registration_age <= REGISTERED_HOTKEY_STALE_GRACE_SECONDS
+            if self._registration_gate_enforced
+            else None
+        )
         accumulator = self._training_accumulator_state
+        training_publish = self._training_publish_state
         try:
             archive_queue = (
                 self._archive_queue_snapshot_callback()
@@ -1012,6 +1055,13 @@ class ValidatorServer:
                     self._candidate_window_n is not None
                     and self._last_window_preparation_failure is not None
                 )
+                or (
+                    self._registration_gate_enforced
+                    and (
+                        registration_cache_stale is not False
+                        or registration_cache_usable is not True
+                    )
+                )
             )
             else "ok"
         )
@@ -1020,6 +1070,7 @@ class ValidatorServer:
             active_window=batcher.window_start if batcher else None,
             image_revision=self._image_revision,
             runtime_fingerprint=dict(self._runtime_fingerprint),
+            chain_client_fingerprint=dict(self._chain_client_fingerprint),
             app_started_at=self._app_started_at,
             current_validator_state=getattr(self._current_state, "value", str(self._current_state)),
             current_window_n=batcher.window_start if batcher else None,
@@ -1129,17 +1180,23 @@ class ValidatorServer:
                 else None
             ),
             registration_cache_age_seconds=registration_age,
-            registration_cache_stale=(
-                registration_age > REGISTERED_HOTKEY_CACHE_TTL_SECONDS
-                if registration_age is not None
-                else None
-            ),
+            registration_cache_stale=registration_cache_stale,
+            registration_cache_usable=registration_cache_usable,
             training_accumulator_checkpoint_revision=accumulator.get(
                 "checkpoint_revision"
             ),
             training_accumulator_targets=dict(accumulator.get("targets", {})),
             training_accumulator_counts=dict(accumulator.get("counts", {})),
             training_accumulator_ready=bool(accumulator.get("ready", False)),
+            training_trained_windows_since_publish=int(
+                training_publish.get("trained_windows_since_publish", 0)
+            ),
+            training_checkpoint_publish_interval=int(
+                training_publish.get("publish_interval", 0)
+            ),
+            training_checkpoint_publication_pending=bool(
+                training_publish.get("publication_pending", False)
+            ),
             forced_seed_enforced=FORCED_SEED_ENFORCE,
             forced_seed_consistency_floor=FORCED_SEED_CONSISTENCY_FLOOR,
             forced_seed_rollout_floor=FORCED_SEED_ROLLOUT_FLOOR,

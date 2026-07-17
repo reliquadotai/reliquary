@@ -183,7 +183,9 @@ docker compose -f docker-compose.trainer.yml stop reliquary-trainer
 
 docker compose -f docker-compose.trainer.yml run --rm --no-deps \
   --entrypoint python reliquary-trainer \
-  /opt/reliquary/scripts/publish_base_reset_checkpoint.py
+  /opt/reliquary/scripts/publish_base_reset_checkpoint.py \
+  --source-model Qwen/Qwen3.5-2B \
+  --source-revision <approved-40-character-base-commit>
 ```
 
 The script prints:
