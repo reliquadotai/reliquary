@@ -203,13 +203,6 @@ MAX_PENDING_SUBMISSION_BYTES_PER_ENV = int(
     )
 )
 
-# Production concentration guard, applied independently in each environment.
-# The mapping is a block-refreshed hotkey->coldkey snapshot. Missing mappings
-# fail closed for the affected candidate; hotkey identity is never a fallback.
-MAX_AUCTION_SLOTS_PER_OPERATOR = int(
-    _os.environ.get("RELIQUARY_MAX_AUCTION_SLOTS_PER_OPERATOR", "2")
-)
-
 if MAX_PROOF_WALL_SECONDS <= 0:
     raise ValueError("RELIQUARY_MAX_PROOF_WALL_SECONDS must be positive")
 if MAX_SUBMISSION_PAYLOAD_BYTES <= 0:
@@ -223,9 +216,6 @@ if (
     < MAX_PENDING_SUBMISSION_BYTES_PER_HOTKEY
 ):
     raise ValueError("per-environment pending byte cap must cover hotkey cap")
-if MAX_AUCTION_SLOTS_PER_OPERATOR <= 0:
-    raise ValueError("RELIQUARY_MAX_AUCTION_SLOTS_PER_OPERATOR must be positive")
-
 # Absolute server-side bound across active and draining environment queues.
 # Per-batcher reservation caps remain the primary bound; this is the final
 # backstop during a window swap or prolonged GPU stall.

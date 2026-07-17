@@ -29,7 +29,6 @@ from reliquary.constants import (
     DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS,
     DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES,
     DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR,
-    MAX_AUCTION_SLOTS_PER_OPERATOR,
     MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW,
     MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
@@ -678,7 +677,6 @@ class GrpoWindowBatcher:
         self.proof_wall_elapsed_seconds = 0.0
         self.proof_wall_exhausted = False
         self.forensic_proof_attempts = 0
-        self.auction_operator_cap_skips = 0
         self.auction_operator_unmapped_skips = 0
         self.auction_operator_proof_debt_skips = 0
         self.auction_candidates: list[dict[str, Any]] = []
@@ -2824,8 +2822,6 @@ class GrpoWindowBatcher:
         proven: list[ValidSubmission] = []
         claimed: set[int] = set()
         attempted_ids: set[int] = set()
-        slots_by_operator: dict[str, int] = {}
-        self.auction_operator_cap_skips = 0
         self.auction_operator_unmapped_skips = 0
         self.auction_operator_proof_debt_skips = 0
         self.difficulty_auction_metadata_by_id = {}
@@ -2873,13 +2869,6 @@ class GrpoWindowBatcher:
             if operator is None:
                 row["status"] = "operator_unmapped"
                 self.auction_operator_unmapped_skips += 1
-                continue
-            if (
-                slots_by_operator.get(operator, 0)
-                >= MAX_AUCTION_SLOTS_PER_OPERATOR
-            ):
-                row["status"] = "operator_cap"
-                self.auction_operator_cap_skips += 1
                 continue
             if (
                 self.operator_proof_failure_debt(operator)
@@ -2943,7 +2932,6 @@ class GrpoWindowBatcher:
             row["status"] = "selected"
             proven.append(sub)
             claimed.add(p.prompt_idx)
-            slots_by_operator[operator] = slots_by_operator.get(operator, 0) + 1
             self.difficulty_auction_metadata_by_id[id(sub)] = row
 
         with self._lock:
@@ -3265,8 +3253,6 @@ class GrpoWindowBatcher:
                     "proof_wall_limit_seconds": MAX_PROOF_WALL_SECONDS,
                     "proof_wall_exhausted": self.proof_wall_exhausted,
                     "proven_winners": len(self._valid),
-                    "operator_cap": MAX_AUCTION_SLOTS_PER_OPERATOR,
-                    "operator_cap_skips": self.auction_operator_cap_skips,
                     "operator_proof_failure_cap": (
                         MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW
                     ),

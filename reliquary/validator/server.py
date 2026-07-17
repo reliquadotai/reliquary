@@ -47,7 +47,6 @@ from reliquary.constants import (
     FORCED_SEED_PROTOCOL_VERSION,
     FORCED_SEED_ROLLOUT_FLOOR,
     LEGACY_MERKLE_ROOT_ENFORCE,
-    MAX_AUCTION_SLOTS_PER_OPERATOR,
     MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW,
     MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
@@ -498,9 +497,6 @@ class _Health(BaseModel):
     difficulty_auction_enforced: bool = DIFFICULTY_AUCTION_ENFORCE
     difficulty_auction_environments: list[str] = Field(
         default_factory=lambda: list(DIFFICULTY_AUCTION_ENVIRONMENTS)
-    )
-    difficulty_auction_max_slots_per_operator: int = (
-        MAX_AUCTION_SLOTS_PER_OPERATOR
     )
     difficulty_auction_proof_attempt_limit: int = (
         MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
@@ -1438,9 +1434,6 @@ class ValidatorServer:
             difficulty_auction_enforced=DIFFICULTY_AUCTION_ENFORCE,
             difficulty_auction_environments=list(
                 DIFFICULTY_AUCTION_ENVIRONMENTS
-            ),
-            difficulty_auction_max_slots_per_operator=(
-                MAX_AUCTION_SLOTS_PER_OPERATOR
             ),
             difficulty_auction_proof_attempt_limit=(
                 MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
