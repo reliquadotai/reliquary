@@ -34,6 +34,7 @@ def _submission(hotkey="hkX", window_start=500) -> dict:
         "merkle_root": "00" * 32,
         "rollouts": [{"tokens": list(range(36)), "reward": 1.0, "commit": commit, "env_name": "openmathinstruct"}] * 8,
         "checkpoint_hash": "sha256:test",
+        "protocol_version": 2,
     }
 
 

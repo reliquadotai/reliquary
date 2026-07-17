@@ -24,6 +24,7 @@ import time
 from typing import Any, Awaitable, Callable
 
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 import uvicorn
 
@@ -32,6 +33,8 @@ from reliquary.constants import (
     BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION,
     DRAND_ROUND_BACKWARD_TOLERANCE,
     DIFFICULTY_AUCTION_DELTA,
+    DIFFICULTY_AUCTION_ENFORCE,
+    DIFFICULTY_AUCTION_ENVIRONMENTS,
     DIFFICULTY_AUCTION_SHADOW_ENABLED,
     DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS,
     DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES,
@@ -41,12 +44,20 @@ from reliquary.constants import (
     FORCED_SEED_CDF_ENFORCE,
     FORCED_SEED_CONSISTENCY_FLOOR,
     FORCED_SEED_ENFORCE,
+    FORCED_SEED_PROTOCOL_VERSION,
     FORCED_SEED_ROLLOUT_FLOOR,
     LEGACY_MERKLE_ROOT_ENFORCE,
+    MAX_AUCTION_SLOTS_PER_OPERATOR,
     MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW,
+    MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
     MAX_PENDING_PROOF_QUEUE_DEPTH,
+    MAX_PENDING_SUBMISSION_BYTES_PER_ENV,
+    MAX_PENDING_SUBMISSION_BYTES_PER_HOTKEY,
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
+    MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
+    MAX_PROOF_WALL_SECONDS,
+    MAX_SUBMISSION_PAYLOAD_BYTES,
     MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
     MAX_TRUNCATED_PER_SUBMISSION,
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
@@ -89,7 +100,6 @@ from reliquary.validator.observability import (
 from reliquary.validator.verifier import (
     is_forced_bft_cap_termination,
     is_natural_bft_cap_candidate,
-    is_in_zone,
     rewards_std,
     validate_force_span,
 )
@@ -128,6 +138,87 @@ def _is_mock_like(value: Any) -> bool:
     when the object is clearly a mock.
     """
     return type(value).__module__.startswith("unittest.mock")
+
+
+def _serialized_submission_bytes(request: BatchSubmissionRequest) -> int:
+    """Canonical post-parse size used by queue-memory accounting."""
+    return len(request.model_dump_json().encode("utf-8"))
+
+
+class _SubmissionBodyLimitMiddleware:
+    """Reject oversized /submit bodies before FastAPI parses their JSON.
+
+    The content-length fast path handles normal clients. Wrapping ``receive``
+    also covers chunked transfer encoding, where trusting a missing header would
+    otherwise let an attacker allocate an unbounded request before the route's
+    post-parse accounting runs.
+    """
+
+    def __init__(self, app: Any, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    @staticmethod
+    async def _reject(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        response = JSONResponse(
+            status_code=413,
+            content={"detail": "submission_payload_too_large"},
+            headers={"Connection": "close"},
+        )
+        await response(scope, receive, send)
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http" or scope.get("path") != "/submit":
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers", ()))
+        raw_length = headers.get(b"content-length")
+        if raw_length is not None:
+            try:
+                content_length = int(raw_length)
+            except ValueError:
+                content_length = -1
+            if content_length > self.max_bytes:
+                await self._reject(scope, receive, send)
+                return
+
+        received = 0
+        over_limit = False
+        buffered_messages: list[dict[str, Any]] = []
+
+        async def limited_receive():
+            nonlocal received, over_limit
+            message = await receive()
+            if message.get("type") == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_bytes:
+                    over_limit = True
+                    # Complete the downstream body stream without forwarding
+                    # the over-limit chunk. FastAPI may turn that truncated JSON
+                    # into a 400; ``buffered_send`` keeps that response private
+                    # and we replace it with the protocol's explicit 413 below.
+                    return {
+                        "type": "http.request",
+                        "body": b"",
+                        "more_body": False,
+                    }
+            return message
+
+        async def buffered_send(message):
+            buffered_messages.append(message)
+
+        try:
+            await self.app(scope, limited_receive, buffered_send)
+        except Exception:
+            if not over_limit:
+                raise
+
+        if over_limit:
+            await self._reject(scope, receive, send)
+            return
+        for message in buffered_messages:
+            await send(message)
 
 
 def _proof_free_model_config(batcher: Any) -> Any | None:
@@ -278,9 +369,10 @@ def _proof_free_submission_reject(
     )
     if not _is_mock_like(batcher) and not validator_scored_reward:
         rewards = [float(rollout.reward) for rollout in request.rollouts]
+        from reliquary.validator.verifier import is_in_zone
         if not is_in_zone(
             rewards_std(rewards),
-            bootstrap=_proof_free_bootstrap(batcher),
+            bootstrap=bool(getattr(batcher, "bootstrap", False)),
         ):
             return RejectReason.OUT_OF_ZONE, "zone"
 
@@ -379,7 +471,11 @@ class _Health(BaseModel):
     drand_round_backward_tolerance: int
     batch_size: int
     queue_depth: int | None = None
+    queue_depth_by_environment: dict[str, int] = Field(default_factory=dict)
     proof_verification_inflight: int | None = None
+    proof_verification_inflight_by_environment: dict[str, int] = Field(
+        default_factory=dict
+    )
     valid_submissions_count: int | None = None
     distinct_valid_prompt_count: int | None = None
     last_valid_submission_ts: float | None = None
@@ -388,12 +484,39 @@ class _Health(BaseModel):
     proof_grading_attempts: int | None = None
     pending_proof_reservations: int | None = None
     inflight_proof_reservations: int | None = None
+    reserved_payload_bytes: int | None = None
+    pending_payload_bytes: int | None = None
+    inflight_payload_bytes: int | None = None
+    retained_payload_bytes: int | None = None
+    max_submission_payload_bytes: int = MAX_SUBMISSION_PAYLOAD_BYTES
+    max_pending_submission_bytes_per_hotkey: int = (
+        MAX_PENDING_SUBMISSION_BYTES_PER_HOTKEY
+    )
+    max_pending_submission_bytes_per_env: int = (
+        MAX_PENDING_SUBMISSION_BYTES_PER_ENV
+    )
+    difficulty_auction_enforced: bool = DIFFICULTY_AUCTION_ENFORCE
+    difficulty_auction_environments: list[str] = Field(
+        default_factory=lambda: list(DIFFICULTY_AUCTION_ENVIRONMENTS)
+    )
+    difficulty_auction_max_slots_per_operator: int = (
+        MAX_AUCTION_SLOTS_PER_OPERATOR
+    )
+    difficulty_auction_proof_attempt_limit: int = (
+        MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+    )
+    difficulty_auction_proof_wall_limit_seconds: float = MAX_PROOF_WALL_SECONDS
+    difficulty_auction_proof_wall_elapsed_seconds: float | None = None
+    difficulty_auction_proof_wall_exhausted: bool | None = None
     window_environments: dict[str, dict[str, Any]] = Field(
         default_factory=dict
     )
     logical_group_reservations: int = 0
     logical_group_duplicate_rejects: int = 0
     logical_group_dedup_by_environment: dict[str, dict[str, int]] = Field(
+        default_factory=dict
+    )
+    grader_failures_by_environment: dict[str, dict[str, int]] = Field(
         default_factory=dict
     )
     post_trigger_proof_admission_count: int | None = None
@@ -405,6 +528,12 @@ class _Health(BaseModel):
     sparse_valid_max_window_seconds: float = SPARSE_VALID_MAX_WINDOW_SECONDS
     expensive_proof_failures_by_hotkey: dict[str, int] = Field(
         default_factory=dict
+    )
+    expensive_proof_failures_by_operator: dict[str, int] = Field(
+        default_factory=dict
+    )
+    max_expensive_proof_failures_per_operator_per_window: int = (
+        MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW
     )
     checkpoint_repo_id: str | None = None
     checkpoint_revision: str | None = None
@@ -528,8 +657,18 @@ class ValidatorServer:
         self._submit_queue: asyncio.Queue = asyncio.Queue(
             maxsize=MAX_PENDING_PROOF_QUEUE_DEPTH,
         )
+        # OpenCode grading may spend the full sandbox timeout while Math
+        # admission remains CPU-cheap. Independent queues and workers prevent
+        # pathological code from head-of-line blocking the Math auction.
+        self._code_submit_queue: asyncio.Queue = asyncio.Queue(
+            maxsize=MAX_PENDING_PROOF_QUEUE_DEPTH,
+        )
         self._worker_task: asyncio.Task[Any] | None = None
+        self._code_worker_task: asyncio.Task[Any] | None = None
         self._inflight_proofs = 0
+        self._inflight_proofs_by_environment: collections.Counter[str] = (
+            collections.Counter()
+        )
         from reliquary.protocol.submission import WindowState
         self._current_state: WindowState = WindowState.READY
         self._current_checkpoint = None  # ManifestEntry | None
@@ -580,6 +719,13 @@ class ValidatorServer:
         else:
             env_name = getattr(getattr(batcher, "env", None), "name", "unknown")
             self.set_active_batchers({env_name: batcher})
+
+    def _refund_submission_quota(self, hotkey: str) -> None:
+        current_count = self._per_window_counts.get(hotkey, 0)
+        if current_count <= 1:
+            self._per_window_counts.pop(hotkey, None)
+        else:
+            self._per_window_counts[hotkey] = current_count - 1
 
     def set_current_state(self, state) -> None:
         self._current_state = state
@@ -792,11 +938,37 @@ class ValidatorServer:
 
     @property
     def submit_queue_depth(self) -> int:
-        return self._submit_queue.qsize()
+        return sum(self.submit_queue_depth_by_environment.values())
+
+    @property
+    def submit_queue_depth_by_environment(self) -> dict[str, int]:
+        return {
+            "openmathinstruct": self._submit_queue.qsize(),
+            "opencodeinstruct": self._code_submit_queue.qsize(),
+        }
+
+    def _submission_queue_for_environment(
+        self,
+        environment: str,
+    ) -> asyncio.Queue:
+        if environment == "opencodeinstruct":
+            return self._code_submit_queue
+        return self._submit_queue
 
     @property
     def proof_verification_inflight(self) -> int:
         return self._inflight_proofs
+
+    @property
+    def proof_verification_inflight_by_environment(self) -> dict[str, int]:
+        return {
+            "openmathinstruct": self._inflight_proofs_by_environment.get(
+                "openmathinstruct", 0
+            ),
+            "opencodeinstruct": self._inflight_proofs_by_environment.get(
+                "opencodeinstruct", 0
+            ),
+        }
 
     def set_late_drop_callback(
         self, fn: Callable[[str, str], None] | None,
@@ -824,16 +996,18 @@ class ValidatorServer:
     ) -> None:
         """Record a per-submission verdict for ``/verdicts/{hotkey}``.
 
-        Called from every code path that decides accept/reject:
+        Called from every code path that decides a lifecycle stage:
 
           * HTTP rate-limit / window-not-active / batch-filled early cutoffs
             in the ``/submit`` handler (before the request even reaches the
             queue worker)
           * ``_submit_worker`` after each ``batcher.accept_submission``
-            returns its real verdict (the path that's currently invisible
-            to miners because /submit returned ``SUBMITTED`` provisionally)
+            returns its pool-admission verdict (the path hidden by the
+            provisional ``SUBMITTED`` response)
           * ``_submit_worker`` late drops for items dequeued after the
             batcher swap or seal (``worker_dropped`` / ``batch_filled``)
+          * ``ValidationService`` after auction seal, with final selection,
+            reward, and deferred-proof outcome fields
 
         The verdict is stored in a per-hotkey ring buffer
         (``VERDICT_CAP_PER_HOTKEY`` entries). Older verdicts roll off
@@ -937,7 +1111,18 @@ class ValidatorServer:
                 return float(value)
             return None
 
-        distinct_fn = getattr(batcher, "distinct_valid_prompt_count", None)
+        auction_enabled = bool(
+            getattr(batcher, "difficulty_auction_enabled", False)
+        )
+        distinct_fn = getattr(
+            batcher,
+            (
+                "distinct_pending_prompt_count"
+                if auction_enabled
+                else "distinct_valid_prompt_count"
+            ),
+            None,
+        )
         idle_fn = getattr(batcher, "seconds_since_last_valid_submission", None)
         sealed_fn = getattr(batcher, "is_sealed", None)
         try:
@@ -961,7 +1146,11 @@ class ValidatorServer:
                 force_seal_reason if isinstance(force_seal_reason, str) else None
             ),
             "valid_submissions_count": _integer(
-                getattr(batcher, "valid_count", None)
+                getattr(
+                    batcher,
+                    "pending_count" if auction_enabled else "valid_count",
+                    None,
+                )
             ),
             "distinct_valid_prompt_count": _integer(distinct),
             "last_valid_submission_ts": _floating(
@@ -980,8 +1169,36 @@ class ValidatorServer:
             "inflight_proof_reservations": _integer(
                 getattr(batcher, "inflight_proof_reservations", None)
             ),
+            "reserved_payload_bytes": _integer(
+                getattr(batcher, "reserved_payload_bytes", None)
+            ),
+            "pending_payload_bytes": _integer(
+                getattr(batcher, "pending_payload_bytes", None)
+            ),
+            "inflight_payload_bytes": _integer(
+                getattr(batcher, "inflight_payload_bytes", None)
+            ),
+            "retained_payload_bytes": _integer(
+                getattr(batcher, "retained_payload_bytes", None)
+            ),
+            "difficulty_auction_enabled": auction_enabled,
+            "difficulty_auction_proof_wall_elapsed_seconds": _floating(
+                getattr(batcher, "proof_wall_elapsed_seconds", None)
+            ),
+            "difficulty_auction_proof_wall_exhausted": bool(
+                getattr(batcher, "proof_wall_exhausted", False)
+            ),
             "post_trigger_proof_admission_count": _integer(
                 getattr(batcher, "post_trigger_proof_admission_count", None)
+            ),
+            "expensive_proof_failures_by_hotkey": dict(
+                getattr(batcher, "expensive_proof_failures_by_hotkey", {})
+            ),
+            "expensive_proof_failures_by_operator": dict(
+                getattr(batcher, "expensive_proof_failures_by_operator", {})
+            ),
+            "grader_failures": dict(
+                getattr(batcher, "grader_failures", {})
             ),
         }
 
@@ -1022,7 +1239,11 @@ class ValidatorServer:
             str(env_name): self._window_environment_health(env_batcher)
             for env_name, env_batcher in self._active_batchers.items()
         }
+        active_window_health = (
+            self._window_environment_health(batcher) if batcher else {}
+        )
         logical_group_dedup: dict[str, dict[str, int]] = {}
+        grader_failures_by_environment: dict[str, dict[str, int]] = {}
         for env_name, env_batcher in self._active_batchers.items():
             reservations = getattr(
                 env_batcher, "logical_group_reservation_count", 0
@@ -1044,12 +1265,22 @@ class ValidatorServer:
                     else 0
                 ),
             }
+            grader_failures_by_environment[env_name] = {
+                str(reason): int(count)
+                for reason, count in dict(
+                    getattr(env_batcher, "grader_failures", {})
+                ).items()
+            }
         health_status = (
             "degraded"
             if (
                 any(
                     source.get("status") == "degraded"
                     for source in prompt_sources.values()
+                )
+                or any(
+                    any(count > 0 for count in failures.values())
+                    for failures in grader_failures_by_environment.values()
                 )
                 or (
                     self._candidate_window_n is not None
@@ -1103,18 +1334,20 @@ class ValidatorServer:
             ),
             drand_round_backward_tolerance=DRAND_ROUND_BACKWARD_TOLERANCE,
             batch_size=B_BATCH,
-            queue_depth=self._submit_queue.qsize(),
+            queue_depth=self.submit_queue_depth,
+            queue_depth_by_environment=self.submit_queue_depth_by_environment,
             proof_verification_inflight=self._inflight_proofs,
-            valid_submissions_count=(
-                getattr(batcher, "valid_count", None) if batcher else None
+            proof_verification_inflight_by_environment=(
+                self.proof_verification_inflight_by_environment
             ),
-            distinct_valid_prompt_count=(
-                batcher.distinct_valid_prompt_count()
-                if (
-                    batcher is not None
-                    and hasattr(batcher, "distinct_valid_prompt_count")
-                )
-                else None
+            # These legacy scalar fields reflect the first active environment.
+            # During an auction they intentionally report admitted candidates,
+            # not only the winners proven later at seal.
+            valid_submissions_count=active_window_health.get(
+                "valid_submissions_count"
+            ),
+            distinct_valid_prompt_count=active_window_health.get(
+                "distinct_valid_prompt_count"
             ),
             last_valid_submission_ts=(
                 getattr(batcher, "last_valid_submission_wall_ts", None)
@@ -1143,6 +1376,43 @@ class ValidatorServer:
                 getattr(batcher, "inflight_proof_reservations", None)
                 if batcher else None
             ),
+            reserved_payload_bytes=(
+                getattr(batcher, "reserved_payload_bytes", None)
+                if batcher else None
+            ),
+            pending_payload_bytes=(
+                getattr(batcher, "pending_payload_bytes", None)
+                if batcher else None
+            ),
+            inflight_payload_bytes=(
+                getattr(batcher, "inflight_payload_bytes", None)
+                if batcher else None
+            ),
+            retained_payload_bytes=(
+                getattr(batcher, "retained_payload_bytes", None)
+                if batcher else None
+            ),
+            difficulty_auction_enforced=DIFFICULTY_AUCTION_ENFORCE,
+            difficulty_auction_environments=list(
+                DIFFICULTY_AUCTION_ENVIRONMENTS
+            ),
+            difficulty_auction_max_slots_per_operator=(
+                MAX_AUCTION_SLOTS_PER_OPERATOR
+            ),
+            difficulty_auction_proof_attempt_limit=(
+                MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+            ),
+            difficulty_auction_proof_wall_limit_seconds=(
+                MAX_PROOF_WALL_SECONDS
+            ),
+            difficulty_auction_proof_wall_elapsed_seconds=(
+                getattr(batcher, "proof_wall_elapsed_seconds", None)
+                if batcher else None
+            ),
+            difficulty_auction_proof_wall_exhausted=(
+                bool(getattr(batcher, "proof_wall_exhausted", False))
+                if batcher else None
+            ),
             window_environments=window_environments,
             logical_group_reservations=sum(
                 item["reservations"] for item in logical_group_dedup.values()
@@ -1152,6 +1422,7 @@ class ValidatorServer:
                 for item in logical_group_dedup.values()
             ),
             logical_group_dedup_by_environment=logical_group_dedup,
+            grader_failures_by_environment=grader_failures_by_environment,
             post_trigger_proof_admission_count=(
                 getattr(batcher, "post_trigger_proof_admission_count", None)
                 if batcher else None
@@ -1159,6 +1430,17 @@ class ValidatorServer:
             expensive_proof_failures_by_hotkey=(
                 dict(getattr(batcher, "expensive_proof_failures_by_hotkey", {}))
                 if batcher else {}
+            ),
+            expensive_proof_failures_by_operator=(
+                dict(
+                    getattr(
+                        batcher,
+                        "expensive_proof_failures_by_operator",
+                        {},
+                    )
+                )
+                if batcher
+                else {}
             ),
             checkpoint_repo_id=cp.repo_id if cp else None,
             checkpoint_revision=cp.revision if cp else None,
@@ -1379,6 +1661,16 @@ class ValidatorServer:
             t_arrival = getattr(http_request.state, "t_arrival", None)
             if t_arrival is None:
                 t_arrival = time.time()
+            payload_bytes = await asyncio.to_thread(
+                _serialized_submission_bytes,
+                request,
+            )
+            if payload_bytes > MAX_SUBMISSION_PAYLOAD_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail="submission_payload_too_large",
+                )
+            request._payload_bytes = payload_bytes
             hk = request.miner_hotkey
             telemetry = SubmitTelemetry.from_request(
                 request, t_arrival=t_arrival,
@@ -1389,7 +1681,10 @@ class ValidatorServer:
                 logging.INFO,
                 "submit_received",
                 telemetry,
-                queue_depth=self._submit_queue.qsize(),
+                queue_depth=self.submit_queue_depth,
+                queue_depth_by_environment=(
+                    self.submit_queue_depth_by_environment
+                ),
             )
 
             def _reject_before_quota(
@@ -1623,6 +1918,18 @@ class ValidatorServer:
                 )
                 raise HTTPException(status_code=409, detail="window_mismatch")
 
+            if (
+                FORCED_SEED_ENFORCE
+                and bool(getattr(batcher, "current_checkpoint_hash", ""))
+                and request.protocol_version != FORCED_SEED_PROTOCOL_VERSION
+            ):
+                return _reject_before_quota(
+                    RejectReason.SEED_MISMATCH,
+                    reject_stage="forced_seed_protocol",
+                    submitted_protocol_version=request.protocol_version,
+                    required_protocol_version=FORCED_SEED_PROTOCOL_VERSION,
+                )
+
             legacy_merkle_status = self._observe_legacy_merkle(
                 request,
                 telemetry,
@@ -1702,11 +2009,7 @@ class ValidatorServer:
             self._per_window_counts[hk] = n + 1
 
             def _refund_current_quota() -> None:
-                current_count = self._per_window_counts.get(hk, 0)
-                if current_count <= 1:
-                    self._per_window_counts.pop(hk, None)
-                else:
-                    self._per_window_counts[hk] = current_count - 1
+                self._refund_submission_quota(hk)
 
             def _prompt_source_unavailable(
                 exc: PromptSourceUnavailable,
@@ -1878,7 +2181,8 @@ class ValidatorServer:
             # don't sit in the worker queue costing a futile dequeue.
             trigger_round = batcher._seal_trigger_round
             if (
-                trigger_round is not None
+                not getattr(batcher, "difficulty_auction_enabled", False)
+                and trigger_round is not None
                 and request.drand_round > trigger_round
             ):
                 return _cheap_reject(
@@ -1963,9 +2267,18 @@ class ValidatorServer:
                         )
                     if not logical_reserved:
                         _refund_current_quota()
+                        reject_reason = (
+                            RejectReason.REGISTRATION_UNAVAILABLE
+                            if logical_reason == "operator_unmapped"
+                            else RejectReason.HASH_DUPLICATE
+                        )
                         return _cheap_reject(
-                            RejectReason.HASH_DUPLICATE,
-                            reject_stage="logical_dedup",
+                            reject_reason,
+                            reject_stage=(
+                                "operator_mapping"
+                                if logical_reason == "operator_unmapped"
+                                else "logical_dedup"
+                            ),
                             logical_group_reason=logical_reason,
                             quota_refunded=True,
                         )
@@ -1998,14 +2311,11 @@ class ValidatorServer:
                         ),
                     )
 
-            # Under TestClient (no worker running) we run synchronously so
-            # tests see the real ``ACCEPTED`` verdict; under uvicorn we enqueue
-            # for the worker and return ``SUBMITTED`` — a distinct sentinel
-            # that tells the miner the request is queued, not yet validated.
-            # The real verdict (accept/reject post-GRAIL) surfaces in the
-            # validator's logs and in the R2 archive. Expensive proof work is
-            # bounded by ``try_reserve_proof_admission`` above; over-budget
-            # submissions are rejected before they can enter this queue.
+            # Under TestClient (no worker running) validation is synchronous;
+            # under uvicorn we enqueue and return ``SUBMITTED``. In auction mode
+            # worker ``ACCEPTED`` means admitted to the pending pool, and the
+            # seal-time /verdicts record reports proof/selection/reward outcome.
+            # Reservation bounds apply before either path enters grading.
             if self._worker_task is None:
                 started, start_reason = self._start_proof_admission(
                     batcher, request,
@@ -2039,6 +2349,11 @@ class ValidatorServer:
                     self._finish_proof_admission(batcher, request)
                 telemetry.refresh_from_batcher(batcher, at_decision=True)
                 telemetry.mark_decision(verified=True)
+                if (
+                    not resp.accepted
+                    and resp.reason is RejectReason.WORKER_DROPPED
+                ):
+                    self._refund_submission_quota(hk)
                 log_submission_stage(
                     logger,
                     logging.INFO,
@@ -2079,8 +2394,11 @@ class ValidatorServer:
                 return resp
 
             telemetry.mark_enqueued()
+            submit_queue = self._submission_queue_for_environment(
+                submission_env_name
+            )
             try:
-                self._submit_queue.put_nowait((request, batcher, telemetry))
+                submit_queue.put_nowait((request, batcher, telemetry))
             except asyncio.QueueFull:
                 self._cancel_proof_admission(batcher, request)
                 self._cancel_logical_group_reservation(batcher, request)
@@ -2129,7 +2447,11 @@ class ValidatorServer:
                 window_n=batcher.window_start,
                 anchor_block=batcher.window_start,
                 cooldown_prompts=batcher.cooldown_prompts_snapshot,
-                valid_submissions=batcher.valid_count,
+                valid_submissions=(
+                    getattr(batcher, "pending_count", batcher.valid_count)
+                    if getattr(batcher, "difficulty_auction_enabled", False)
+                    else batcher.valid_count
+                ),
                 checkpoint_n=cp.checkpoint_n if cp else 0,
                 checkpoint_repo_id=cp.repo_id if cp else None,
                 checkpoint_revision=cp.revision if cp else None,
@@ -2200,15 +2522,27 @@ class ValidatorServer:
             ]
             return VerdictsResponse(verdicts=out)
 
+        # Add this last so Starlette places it outermost, ahead of the
+        # BaseHTTPMiddleware used by ``stamp_arrival``. Otherwise FastAPI may
+        # translate an over-limit receive exception into a generic 400 before
+        # the limiter can emit the intended 413 for chunked requests.
+        app.add_middleware(
+            _SubmissionBodyLimitMiddleware,
+            max_bytes=MAX_SUBMISSION_PAYLOAD_BYTES,
+        )
         return app
 
-    async def _submit_worker(self) -> None:
+    async def _submit_worker(
+        self,
+        submit_queue: asyncio.Queue | None = None,
+    ) -> None:
         # Lazy import — keeps the module loadable in CPU-only test envs.
         from reliquary.validator.service import _try_empty_cuda_cache
 
+        queue = submit_queue if submit_queue is not None else self._submit_queue
         while True:
             try:
-                item = await self._submit_queue.get()
+                item = await queue.get()
             except asyncio.CancelledError:
                 return
             if len(item) == 3:
@@ -2277,7 +2611,10 @@ class ValidatorServer:
             # ~B_BATCH × verify-time instead of letting it grow with raw
             # arrival rate. Same accounting bucket as the HTTP path so a
             # miner inspecting late_drops sees one consistent metric.
-            if batcher.is_sealed():
+            if batcher.is_sealed() and (
+                not getattr(batcher, "difficulty_auction_enabled", False)
+                or getattr(batcher, "seal_snapshot_started", False)
+            ):
                 self._cancel_proof_admission(batcher, request)
                 self._cancel_logical_group_reservation(batcher, request)
                 telemetry.refresh_from_batcher(batcher, at_decision=True)
@@ -2356,14 +2693,35 @@ class ValidatorServer:
                     reject_reason=None,
                 )
                 self._inflight_proofs += 1
+                env_name = str(
+                    getattr(getattr(batcher, "env", None), "name", "unknown")
+                )
+                self._inflight_proofs_by_environment[env_name] += 1
                 try:
                     response = await asyncio.to_thread(
                         self._call_accept_submission, batcher, request, telemetry
                     )
                 finally:
                     self._inflight_proofs = max(0, self._inflight_proofs - 1)
+                    remaining = max(
+                        0,
+                        self._inflight_proofs_by_environment[env_name] - 1,
+                    )
+                    if remaining:
+                        self._inflight_proofs_by_environment[env_name] = (
+                            remaining
+                        )
+                    else:
+                        self._inflight_proofs_by_environment.pop(env_name, None)
                 telemetry.refresh_from_batcher(batcher, at_decision=True)
                 telemetry.mark_decision(verified=True)
+                quota_refunded = False
+                if (
+                    not response.accepted
+                    and response.reason is RejectReason.WORKER_DROPPED
+                ):
+                    self._refund_submission_quota(request.miner_hotkey)
+                    quota_refunded = True
                 log_submission_stage(
                     logger,
                     logging.INFO,
@@ -2371,6 +2729,7 @@ class ValidatorServer:
                     telemetry,
                     accepted=response.accepted,
                     reason=response.reason.value,
+                    quota_refunded=quota_refunded,
                 )
                 if response.accepted:
                     logger.info(
@@ -2404,8 +2763,8 @@ class ValidatorServer:
                         reject_reason=response.reason.value,
                         accepted_into_pool=False,
                     )
-                # The verdict the /submit response *didn't* carry, now
-                # observable to the miner via /verdicts.
+                # Pool-admission verdict hidden by the provisional /submit
+                # response. Auction selection publishes a second verdict at seal.
                 self.record_verdict(
                     request.miner_hotkey, request.merkle_root,
                     response.accepted, response.reason,
@@ -2445,14 +2804,27 @@ class ValidatorServer:
         )
         self._server = uvicorn.Server(config)
         self._task = asyncio.create_task(self._server.serve())
-        self._worker_task = asyncio.create_task(self._submit_worker())
+        self._worker_task = asyncio.create_task(
+            self._submit_worker(self._submit_queue)
+        )
+        self._code_worker_task = asyncio.create_task(
+            self._submit_worker(self._code_submit_queue)
+        )
         await asyncio.sleep(0)
         logger.info("Validator HTTP server listening on %s:%d", self.host, self.port)
 
     async def stop(self) -> None:
-        if self._worker_task is not None:
-            self._worker_task.cancel()
-            self._worker_task = None
+        worker_tasks = [
+            task
+            for task in (self._worker_task, self._code_worker_task)
+            if task is not None
+        ]
+        for task in worker_tasks:
+            task.cancel()
+        if worker_tasks:
+            await asyncio.gather(*worker_tasks, return_exceptions=True)
+        self._worker_task = None
+        self._code_worker_task = None
         if self._server is not None:
             self._server.should_exit = True
         if self._task is not None:

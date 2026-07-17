@@ -8,7 +8,12 @@ from typing import Any
 
 import pytest
 
-from reliquary.constants import B_BATCH, CHALLENGE_K, M_ROLLOUTS
+from reliquary.constants import (
+    B_BATCH,
+    CHALLENGE_K,
+    FORCED_SEED_PROTOCOL_VERSION,
+    M_ROLLOUTS,
+)
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     RejectReason,
@@ -18,7 +23,9 @@ from reliquary.validator.batcher import GrpoWindowBatcher
 
 
 class FakeEnv:
-    name = "fake"
+    # Generic batcher tests exercise the production Math lane. Tests for the
+    # legacy Code lane inject ``PrivateRewardFakeEnv`` explicitly.
+    name = "openmathinstruct"
     def __len__(self):
         return 1000
     def get_problem(self, idx):
@@ -109,6 +116,7 @@ def _request(
         merkle_root="00" * 32,
         rollouts=rollouts,
         checkpoint_hash="sha256:test",
+        protocol_version=2,
     )
 
 
@@ -173,6 +181,20 @@ def _make_batcher(**overrides) -> GrpoWindowBatcher:
     return b
 
 
+def _prove_one(b: GrpoWindowBatcher, req) -> "ValidSubmission | None":
+    """Run one request through its environment's configured proof path.
+
+    Auction-enabled Math and Code both defer proof to seal. Returns None when
+    the configured path rejects the submission.
+    """
+    response = b.accept_submission(req)
+    if not response.accepted:
+        return None
+    if b.difficulty_auction_enabled:
+        return b._verify_expensive(b.pending_submissions()[-1])
+    return b.valid_submissions()[-1]
+
+
 def test_constructor_sets_window():
     b = _make_batcher()
     assert b.window_start == 500
@@ -192,6 +214,8 @@ def test_accept_in_zone_submission():
     resp = b.accept_submission(req)
     assert resp.accepted is True
     assert resp.reason == RejectReason.ACCEPTED
+    assert len(b.pending_submissions()) == 1   # proven at seal, not at admission
+    b.seal_batch()
     assert len(b.valid_submissions()) == 1
 
 
@@ -204,6 +228,7 @@ def test_accepted_submission_uses_validator_computed_selection_digest():
     req = _request(rewards=[1.0] * 4 + [0.0] * 4)
 
     assert b.accept_submission(req).accepted is True
+    b.seal_batch()  # proof runs at seal; selection digest carries to _valid
     accepted = b.valid_submissions()[0]
     assert accepted.selection_digest == compute_rollouts_selection_digest(
         req.rollouts
@@ -264,8 +289,8 @@ def test_grail_verifier_receives_tokenizer_for_sparse_pstop():
 
     b = _make_batcher(verify_commitment_proofs_fn=tokenizer_aware_grail)
     req = _request(rewards=[1.0] * 4 + [0.0] * 4)
-    resp = b.accept_submission(req)
-    assert resp.accepted is True
+    # The GRAIL proof (and thus the tokenizer hand-off) runs at seal now.
+    assert _prove_one(b, req) is not None
     assert seen_tokenizers
     assert all(tok is b.tokenizer for tok in seen_tokenizers)
 
@@ -479,11 +504,12 @@ def test_accept_all_sigma_zone_binary_configs(k):
 
 
 def test_reject_grail_fail():
+    """The GRAIL proof runs at seal now, so admission accepts and the reject
+    lands in _verify_expensive."""
     b = _make_batcher(verify_commitment_proofs_fn=_always_false_grail)
     req = _request()
-    resp = b.accept_submission(req)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.GRAIL_FAIL
+    assert _prove_one(b, req) is None
+    assert b.reject_counts[RejectReason.GRAIL_FAIL.value] == 1
 
 
 def test_reject_reward_mismatch():
@@ -511,6 +537,7 @@ def test_reject_reward_mismatch():
         merkle_root="00" * 32,
         rollouts=rollouts,
         checkpoint_hash="sha256:test",
+        protocol_version=2,
     )
     resp = b.accept_submission(req)
     assert resp.accepted is False
@@ -531,8 +558,10 @@ def test_validator_authoritative_reward_overwrites_placeholder_claims():
     )
 
     resp = b.accept_submission(req)
-
     assert resp.accepted is True, resp.reason
+    b.seal_batch()  # validator-authoritative reward is applied at admission;
+    # the proof at seal promotes it into _valid unchanged.
+
     expected = [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
     assert [r.reward for r in b._valid[0].rollouts] == expected
     assert [
@@ -592,13 +621,13 @@ def test_seal_batch_chronological_by_drand_round():
     # even though round 2 arrived first (insertion order below).
     req_late = _request(prompt_idx=42, hotkey="late")
     req_early = _request(prompt_idx=7, hotkey="early")
+    # Stamp the rounds on the requests (the check is disabled in the helper, so
+    # accept_submission won't re-validate them) — the proof carries drand_round
+    # onto the ValidSubmission, which drives seal-time ordering.
+    req_late.drand_round = 2  # late: round 2
+    req_early.drand_round = 1  # early: round 1
     assert b.accept_submission(req_late).accepted
     assert b.accept_submission(req_early).accepted
-    # Stamp the rounds after acceptance (the test helper accepts with the
-    # check disabled, so drand_round on the request defaults to 0; we set
-    # them here to drive the seal-time ordering deterministically).
-    b._valid[0].drand_round = 2  # late: round 2
-    b._valid[1].drand_round = 1  # early: round 1
     batch, _ = b.seal_batch()
     assert len(batch) == 2
     assert batch[0].hotkey == "early"
@@ -641,8 +670,15 @@ def test_state_endpoint_exposes_cooldown():
 
 
 def test_distinct_prompts_in_batch_only():
-    """One submission per winning prompt enters the training batch, even
-    when multiple miners successfully submitted on the same prompt."""
+    """One submission per winning prompt enters the training batch, even when
+    multiple miners successfully submitted on the same prompt.
+
+    BEHAVIOUR CHANGE (ranked proving): only the top-ranked candidate per prompt
+    is proven, so a prompt's slot now pays ONE miner in full instead of being
+    split K ways. Alice and Bob tie on value and drand round, so the canonical
+    tie-break picks one — expected-value identical to the old 1/16 split, still
+    sybil-neutral (N hotkeys on one prompt win at most that prompt's one slot).
+    """
     b = _make_batcher()
     b.accept_submission(_request(prompt_idx=42, hotkey="alice"))
     b.accept_submission(_request(prompt_idx=42, hotkey="bob"))
@@ -650,10 +686,10 @@ def test_distinct_prompts_in_batch_only():
     batch, rewards = b.seal_batch()
     assert len(batch) == 2
     assert {s.prompt_idx for s in batch} == {42, 7}
-    # Each slot pays pool / B_BATCH = 1/8. Prompt 42 has 2 miners
-    # splitting 1/8 → 1/16 each. Prompt 7 has 1 miner taking 1/8.
-    assert abs(rewards["alice"] - 1 / 16) < 1e-9
-    assert abs(rewards["bob"] - 1 / 16) < 1e-9
+    # Each filled slot pays pool / B_BATCH = 1/8, to the prompt's single winner.
+    prompt_42_winner = {"alice", "bob"} & set(rewards)
+    assert len(prompt_42_winner) == 1
+    assert abs(rewards[prompt_42_winner.pop()] - 1 / 8) < 1e-9
     assert abs(rewards["carol"] - 1 / 8) < 1e-9
 
 
@@ -684,6 +720,7 @@ def _request_v21(prompt_idx=42, window_start=500,
         window_start=window_start,
         merkle_root="00" * 32, rollouts=rollouts,
         checkpoint_hash=checkpoint_hash,
+        protocol_version=FORCED_SEED_PROTOCOL_VERSION,
     )
 
 
@@ -705,6 +742,20 @@ def test_accept_matching_checkpoint():
     assert resp.accepted is True
 
 
+def test_reject_old_forced_seed_protocol_before_auction_admission():
+    b = _make_batcher()
+    b.current_checkpoint_hash = "sha256:current"
+    req = _request_v21(checkpoint_hash="sha256:current")
+    req.protocol_version = FORCED_SEED_PROTOCOL_VERSION - 1
+
+    resp = b.accept_submission(req)
+
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.SEED_MISMATCH
+    assert b.pending_count == 0
+    assert b.proof_grading_attempts == 0
+
+
 def test_empty_checkpoint_hash_disables_gate():
     """When batcher.current_checkpoint_hash is "", any hash is accepted
     (test convenience — simulates pre-first-publish)."""
@@ -713,24 +764,6 @@ def test_empty_checkpoint_hash_disables_gate():
     req = _request_v21(checkpoint_hash="anything")
     resp = b.accept_submission(req)
     assert resp.accepted is True
-
-
-@pytest.mark.asyncio
-async def test_seal_event_set_when_b_valid_distinct_landed():
-    """seal_event fires when the B-th valid distinct-prompt non-cooldown
-    submission is accepted."""
-    b = _make_batcher()
-    b.current_checkpoint_hash = "sha256:hash"
-    assert not b.seal_event.is_set()
-    for i in range(B_BATCH):
-        req = _request_v21(
-            prompt_idx=i, hotkey=f"hk{i}",
-            checkpoint_hash="sha256:hash",
-        )
-        b.accept_submission(req)
-    # Give the event loop a tick to ensure the event is visible.
-    await asyncio.wait_for(b.seal_event.wait(), timeout=0.1)
-    assert b.seal_event.is_set()
 
 
 def test_seal_event_not_set_with_only_duplicate_prompts():
@@ -820,6 +853,7 @@ def _request_with_prompt_tokens(
         window_start=500,
         merkle_root="00" * 32, rollouts=rollouts,
         checkpoint_hash="",  # gate disabled for these tests
+        protocol_version=2,
     )
 
 
@@ -889,8 +923,9 @@ def test_same_prompt_multi_miner_accepted():
     assert b.accept_submission(first).accepted is True
     r2 = b.accept_submission(second)
     assert r2.accepted is True
-    assert len(b._valid) == 2
-    assert len(b._submissions_per_prompt[42]) == 2
+    # Admitted to the pending pool; the same-prompt winner is resolved at seal.
+    assert len(b.pending_submissions()) == 2
+    assert b.prompt_submission_count(42) == 2
 
 
 def test_prompt_full_rejected_at_cap():
@@ -905,8 +940,9 @@ def test_prompt_full_rejected_at_cap():
     resp = b.accept_submission(overflow)
     assert resp.accepted is False
     assert resp.reason == RejectReason.PROMPT_FULL
-    # The PROMPT_FULL reject did not enter _valid.
-    assert len(b._valid) == MAX_SUBMISSIONS_PER_PROMPT
+    # The PROMPT_FULL reject did not enter the pending bucket.
+    assert b.prompt_submission_count(42) == MAX_SUBMISSIONS_PER_PROMPT
+    assert len(b.pending_submissions()) == MAX_SUBMISSIONS_PER_PROMPT
 
 
 def test_different_prompts_tracked_independently():
@@ -921,29 +957,51 @@ def test_different_prompts_tracked_independently():
     ))
     assert r_a.accepted is True
     assert r_b.accepted is True
-    assert len(b._valid) == 2
+    assert len(b.pending_submissions()) == 2
     assert set(b._submissions_per_prompt) == {42, 43}
 
 
 def test_failed_submission_does_not_consume_bucket_slot():
-    """A submission rejected mid-pipeline (GRAIL fail) must not occupy a
-    PROMPT_FULL slot — otherwise dishonest spam could starve honest miners."""
-    b = _make_batcher(verify_commitment_proofs_fn=_always_false_grail)
-    first_fails = _request_v21(
-        prompt_idx=42, hotkey="A", checkpoint_hash="",
+    """v2 (deferred proof): admission is cheap and always buckets, so a
+    submission that later FAILS its seal-time proof still occupied a pending
+    slot (the cap bounds pending, bounding worst-case GPU load). The
+    anti-starvation invariant moved to seal: a squatter that fails the proof
+    does NOT lock the prompt — the honest same-prompt submission behind it is
+    promoted and wins the slot."""
+    import torch
+    from reliquary.validator.verifier import ProofResult
+
+    calls = {"n": 0}
+
+    def grail_fail_first(commit, model, randomness):
+        # The top-ranked candidate (the squatter, admitted first) fails on its
+        # first proved rollout; every later proof call passes.
+        calls["n"] += 1
+        passed = calls["n"] > 1
+        return ProofResult(
+            all_passed=passed, passed=int(passed), checked=1,
+            logits=torch.empty(0),
+        )
+
+    b = _make_batcher(verify_commitment_proofs_fn=grail_fail_first)
+    squatter = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
+    honest = _request_v21(prompt_idx=42, hotkey="B", checkpoint_hash="")
+    assert b.accept_submission(squatter).accepted is True
+    assert b.accept_submission(honest).accepted is True
+    # Both occupy the pending bucket (cheap admission).
+    assert b.prompt_submission_count(42) == 2
+
+    batch, rewards = b.seal_batch()
+    # The squatter failed its proof; the honest miner behind it wins the slot.
+    assert b.reject_counts.get(RejectReason.GRAIL_FAIL.value) == 1
+    failed_hotkey = next(
+        row["hotkey"]
+        for row in b.auction_candidates
+        if row["status"] == "proof_failed"
     )
-    r1 = b.accept_submission(first_fails)
-    assert r1.accepted is False
-    assert r1.reason == RejectReason.GRAIL_FAIL
-    # No bucket entry for prompt 42 — the rejected submission did not count.
-    assert 42 not in b._submissions_per_prompt
-    # A subsequent honest submission for prompt 42 is still accepted.
-    b._verify_commitment = _always_true_grail
-    r2 = b.accept_submission(_request_v21(
-        prompt_idx=42, hotkey="B", checkpoint_hash="",
-    ))
-    assert r2.accepted is True
-    assert len(b._submissions_per_prompt[42]) == 1
+    assert len(batch) == 1
+    assert batch[0].hotkey in {"A", "B"} - {failed_hotkey}
+    assert set(rewards) == {batch[0].hotkey}
 
 
 # ---------------------------------------------------------------------------
@@ -1329,9 +1387,8 @@ def test_reject_bad_termination_when_last_token_not_eos():
     # Last token != 99 (EOS) — sequence ends in seq_len-1
     req.rollouts[0].commit["tokens"] = list(range(seq_len))
     req.rollouts[0].tokens = req.rollouts[0].commit["tokens"]
-    resp = b.accept_submission(req)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.BAD_TERMINATION
+    assert _prove_one(b, req) is None
+    assert b.reject_counts[RejectReason.BAD_TERMINATION.value] == 1
 
 
 class _LongContextModelStub:
@@ -1401,9 +1458,8 @@ def test_reject_cap_path_truncations_over_budget():
         model=_LongContextModelStub(),
         verify_commitment_proofs_fn=_grail_with_logits(seq_len),
     )
-    resp = b.accept_submission(req)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.BAD_TERMINATION
+    assert _prove_one(b, req) is None
+    assert b.reject_counts[RejectReason.BAD_TERMINATION.value] == 1
 
 
 def test_accept_cap_path_truncations_at_budget():
@@ -1414,8 +1470,8 @@ def test_accept_cap_path_truncations_at_budget():
         model=_LongContextModelStub(),
         verify_commitment_proofs_fn=_grail_with_logits(seq_len),
     )
-    resp = b.accept_submission(req)
-    assert resp.reason != RejectReason.BAD_TERMINATION
+    # At-budget truncation is tolerated: the proof passes at seal.
+    assert _prove_one(b, req) is not None
 
 
 def test_cap_path_records_private_termination_shadow(monkeypatch):
@@ -1433,9 +1489,8 @@ def test_cap_path_records_private_termination_shadow(monkeypatch):
         verify_commitment_proofs_fn=_grail_with_logits(seq_len),
     )
 
-    resp = b.accept_submission(req)
-
-    assert resp.reason != RejectReason.BAD_TERMINATION
+    # The private termination shadow is recorded during the seal-time proof.
+    assert _prove_one(b, req) is not None
     assert len(recorded) == 1
     assert recorded[0]["cap_truncated"] is True
     assert recorded[0]["would_exceed_truncation_budget"] is False
@@ -1488,9 +1543,8 @@ def test_reject_eos_padding_after_natural_stop():
     req.rollouts[0].commit = commit
     req.rollouts[0].tokens = commit["tokens"]
 
-    resp = b.accept_submission(req)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.BAD_TERMINATION
+    assert _prove_one(b, req) is None
+    assert b.reject_counts[RejectReason.BAD_TERMINATION.value] == 1
 
 
 def test_termination_skipped_when_grail_returns_empty_logits():
@@ -1559,8 +1613,8 @@ def test_rejected_grail_fail_omits_sketch_diff_max(monkeypatch):
     b._verify_signature = lambda commit, hk: True
 
     req = _build_request(hotkey="hk_grail", prompt_idx=3)  # existing helper
-    resp = b.accept_submission(req)
-    assert resp.reason == RejectReason.GRAIL_FAIL
+    assert _prove_one(b, req) is None
+    assert b.reject_counts[RejectReason.GRAIL_FAIL.value] == 1
 
     assert len(b.rejected_submissions) == 1
     rec = b.rejected_submissions[0]
@@ -1655,6 +1709,7 @@ def test_hash_dup_intra_submission_collision_rejects():
     req = BatchSubmissionRequest(
         miner_hotkey="hk", prompt_idx=42, window_start=500,
         merkle_root="00" * 32, rollouts=rollouts, checkpoint_hash="sha256:test",
+        protocol_version=2,
     )
 
     b = _make_batcher(hash_set=hs)
@@ -1680,7 +1735,7 @@ def test_hash_dup_accept_when_not_in_set():
     req = _request(prompt_idx=42, rewards=[1.0] * 4 + [0.0] * 4)
     resp = b.accept_submission(req)
     assert resp.accepted is True
-    # rollout_hashes populated on the stored ValidSubmission
+    b.seal_batch()  # rollout_hashes are populated when the proof promotes to _valid
     stored = b.valid_submissions()[0]
     assert len(stored.rollout_hashes) == M_ROLLOUTS
     assert all(isinstance(h, bytes) and len(h) == 32 for h in stored.rollout_hashes)
@@ -1703,7 +1758,7 @@ def test_logical_group_duplicate_rejects_same_hotkey_wrapper_grind():
     assert duplicate.reason == RejectReason.HASH_DUPLICATE
     assert b.logical_group_reservation_count == 1
     assert b.logical_group_duplicate_rejects == 1
-    assert len(b.valid_submissions()) == 1
+    assert len(b.pending_submissions()) == 1
 
 
 def test_logical_group_identity_is_scoped_per_hotkey():
@@ -1711,6 +1766,52 @@ def test_logical_group_identity_is_scoped_per_hotkey():
 
     assert b.accept_submission(_request(hotkey="hk-a")).accepted is True
     assert b.accept_submission(_request(hotkey="hk-b")).accepted is True
+    assert b.logical_group_reservation_count == 2
+
+
+def test_auction_logical_claim_is_scoped_per_operator_and_prompt():
+    b = _make_batcher(
+        operator_by_hotkey={
+            "hk-a": "operator-a",
+            "hk-a-sybil": "operator-a",
+        }
+    )
+    first = _request(prompt_idx=7, hotkey="hk-a")
+    second = _request(prompt_idx=7, hotkey="hk-a-sybil")
+    # A different token group must not mint a second ticket for the same
+    # economic identity and prompt.
+    for rollout in second.rollouts:
+        changed = list(rollout.tokens)
+        changed[-1] += 100
+        rollout.tokens = changed
+        rollout.commit["tokens"] = changed
+
+    assert b.accept_submission(first).accepted is True
+    duplicate = b.accept_submission(second)
+
+    assert duplicate.accepted is False
+    assert duplicate.reason == RejectReason.HASH_DUPLICATE
+    assert b.logical_group_reservation_count == 1
+    assert b.logical_group_duplicate_rejects == 1
+    assert b.accept_submission(
+        _request(prompt_idx=8, hotkey="hk-a-sybil")
+    ).accepted is True
+
+
+def test_auction_same_prompt_remains_open_to_distinct_operators():
+    b = _make_batcher(
+        operator_by_hotkey={
+            "hk-a": "operator-a",
+            "hk-b": "operator-b",
+        }
+    )
+
+    assert b.accept_submission(
+        _request(prompt_idx=7, hotkey="hk-a")
+    ).accepted is True
+    assert b.accept_submission(
+        _request(prompt_idx=7, hotkey="hk-b")
+    ).accepted is True
     assert b.logical_group_reservation_count == 2
 
 
@@ -1783,27 +1884,11 @@ def test_seal_batch_with_none_hash_set_is_noop():
     assert len(batch) == 1  # behaviour unchanged
 
 
-# ---------------------------------------------------------------------------
-# v2.3 seal extension: trigger drand round absorbs more submissions
-# ---------------------------------------------------------------------------
-
-def test_seal_trigger_round_recorded_on_b_th_distinct():
-    """When the B-th distinct prompt lands, ``_seal_trigger_round`` is set
-    to that submission's drand_round. The seal flag is NOT yet fired — the
-    delayed coroutine handles that (or a later-drand submission early-fires
-    it via the new ``_accept_locked`` short-circuit)."""
-    b = _make_batcher()
-    b.current_checkpoint_hash = ""
-    assert b._seal_trigger_round is None
-    for i in range(B_BATCH):
-        req = _request_v21(prompt_idx=i, hotkey=f"hk{i}", checkpoint_hash="")
-        req.drand_round = 100
-        b.accept_submission(req)
-    assert b._seal_trigger_round == 100
-
-
-def test_distinct_valid_prompt_count_ignores_duplicate_valid_submissions():
-    """Duplicate prompt submissions can fill raw valid_count before trainable slots."""
+def test_distinct_pending_prompt_count_ignores_duplicate_submissions():
+    """Duplicate-prompt submissions inflate the raw pending count but not the
+    distinct-prompt count that bounds trainable slots. (v2: submissions live in
+    the pending pool until the seal-time proof; the distinct count is taken over
+    pending, not valid.)"""
     b = _make_batcher()
     b.current_checkpoint_hash = ""
 
@@ -1819,102 +1904,8 @@ def test_distinct_valid_prompt_count_ignores_duplicate_valid_submissions():
     duplicate.drand_round = 100
     b.accept_submission(duplicate)
 
-    assert b.valid_count == B_BATCH
-    assert b.distinct_valid_prompt_count() == B_BATCH - 1
-    assert b._seal_trigger_round is None
-
-
-def test_seal_extension_accepts_same_drand_after_bth():
-    """After the B-th distinct prompt lands in drand round R, further
-    submissions IN ROUND R are still accepted. This is the whole point of
-    the extension — it lets the boundary fair-split fire in
-    ``select_batch_and_distribute`` with > B distinct candidate prompts."""
-    b = _make_batcher()
-    b.current_checkpoint_hash = ""
-    # Land 8 distinct prompts in round 100.
-    for i in range(B_BATCH):
-        req = _request_v21(prompt_idx=i, hotkey=f"hk{i}", checkpoint_hash="")
-        req.drand_round = 100
-        b.accept_submission(req)
-    # 9th submission in the SAME drand round → still accepted.
-    extra = _request_v21(prompt_idx=99, hotkey="hk_extra", checkpoint_hash="")
-    extra.drand_round = 100
-    resp = b.accept_submission(extra)
-    assert resp.accepted is True, (
-        f"same-round submission post-Bth distinct should be accepted; "
-        f"got {resp.reason}"
-    )
-    # And it's in self._valid — now 9 distinct prompts.
-    distinct = len({s.prompt_idx for s in b._valid})
-    assert distinct == B_BATCH + 1
-
-
-def test_seal_extension_rejects_later_drand():
-    """A submission with ``drand_round > _seal_trigger_round`` is too late.
-    It must be rejected as BATCH_FILLED — and the seal_flag must fire so
-    the window can close without waiting for the timer-based delayed seal."""
-    b = _make_batcher()
-    b.current_checkpoint_hash = ""
-    # Trigger the seal round at 100.
-    for i in range(B_BATCH):
-        req = _request_v21(prompt_idx=i, hotkey=f"hk{i}", checkpoint_hash="")
-        req.drand_round = 100
-        b.accept_submission(req)
-    assert b._seal_trigger_round == 100
-    # Submission in round 101 — too late.
-    late = _request_v21(prompt_idx=99, hotkey="hk_late", checkpoint_hash="")
-    late.drand_round = 101
-    resp = b.accept_submission(late)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.BATCH_FILLED
-    # Seal flag fired (no need to wait on the delayed coroutine).
-    assert b._seal_flag.is_set()
-
-
-def test_seal_extension_boundary_fair_split_fires_end_to_end():
-    """End-to-end: trigger drand round absorbs extra submissions, then
-    seal_batch's ``select_batch_and_distribute`` boundary branch
-    distributes the slots fairly. Without the seal extension this
-    boundary case was unreachable in production."""
-    b = _make_batcher()
-    b.current_checkpoint_hash = ""
-    # Land 8 distinct prompts in round 100 (fills the batch slots).
-    for i in range(B_BATCH):
-        req = _request_v21(prompt_idx=i, hotkey=f"hk{i}", checkpoint_hash="")
-        req.drand_round = 100
-        b.accept_submission(req)
-    # Pre-seal-extension, the next submission would be rejected as
-    # BATCH_FILLED. Post-extension, same-drand submissions are still
-    # accepted — feed 4 more into the same round on new prompts.
-    for j in range(4):
-        extra = _request_v21(
-            prompt_idx=100 + j, hotkey=f"hk_extra{j}", checkpoint_hash="",
-        )
-        extra.drand_round = 100
-        assert b.accept_submission(extra).accepted is True
-
-    # Now self._valid has 12 distinct prompts, all in round 100. The
-    # boundary branch in select_batch_and_distribute should fire when
-    # seal_batch runs. Force the seal so the test doesn't depend on the
-    # timer-based delayed seal.
-    b._seal_flag.set()
-    batch, rewards = b.seal_batch()
-
-    # Training batch capped at B_BATCH.
-    assert len(batch) == B_BATCH
-    # Reward distribution: 12 miners share total pool/B × B = pool/1 = pool.
-    # Each of the 12 gets pool / 12 = 1/12 (under default pool=1.0).
-    # ``select_batch_and_distribute`` divides ``slot_share`` (= 1/B) by
-    # N_distinct = 12 per prompt, K=1 each: pool/B × B / 12 = 1/12.
-    expected_per_miner = 1.0 / 12
-    for i in range(B_BATCH):
-        assert abs(rewards[f"hk{i}"] - expected_per_miner) < 1e-9, (
-            f"hk{i} should fair-share at boundary, got {rewards.get(f'hk{i}')}"
-        )
-    for j in range(4):
-        assert abs(rewards[f"hk_extra{j}"] - expected_per_miner) < 1e-9
-    # Conservation:
-    assert abs(sum(rewards.values()) - 1.0) < 1e-9
+    assert len(b.pending_submissions()) == B_BATCH
+    assert b.distinct_pending_prompt_count() == B_BATCH - 1
 
 
 def test_admission_gated_by_grading_ceiling_not_grail_budget():
@@ -2097,6 +2088,23 @@ def test_proof_admission_post_trigger_cap_rejects_same_round_tail():
     )
 
 
+def _prove_all_pending(b):
+    """Prove every pending candidate into ``_valid``, bypassing the B_BATCH cap
+    that ``_prove_ranked`` normally enforces, so the seal's boundary fair-split
+    (which needs > B distinct candidate prompts) is reachable in the test."""
+    def _prove(pool=1.0):
+        proven = [
+            s for s in (
+                b._verify_expensive(p) for p in b.pending_submissions()
+            ) if s is not None
+        ]
+        b._valid = proven
+        b.valid_count = len(proven)
+        return proven
+    b._prove_ranked = _prove
+    b._prove_forensic_sample = lambda: []
+
+
 def test_seal_batch_cooldowns_every_rewarded_boundary_prompt():
     """Boundary runners earn emission, so their prompts must enter cooldown."""
     b = _make_batcher()
@@ -2105,7 +2113,7 @@ def test_seal_batch_cooldowns_every_rewarded_boundary_prompt():
         req.drand_round = 100
         assert b.accept_submission(req).accepted is True
 
-    b._seal_flag.set()
+    _prove_all_pending(b)
     batch, rewards = b.seal_batch()
 
     selected_prompts = {s.prompt_idx for s in batch}
@@ -2131,7 +2139,7 @@ def test_seal_batch_hash_dedup_records_rewarded_boundary_runners():
         req.drand_round = 100
         assert b.accept_submission(req).accepted is True
 
-    b._seal_flag.set()
+    _prove_all_pending(b)
     batch, _ = b.seal_batch()
 
     selected_prompts = {s.prompt_idx for s in batch}
@@ -2143,147 +2151,6 @@ def test_seal_batch_hash_dedup_records_rewarded_boundary_runners():
         assert len(sub.rollout_hashes) == M_ROLLOUTS
         for h in sub.rollout_hashes:
             assert h in hs
-
-
-def test_seal_extension_disabled_when_no_chain_info():
-    """When ``_drand_chain_info`` isn't set (synchronous test path with the
-    drand check disabled) the delayed seal coroutine can't compute when
-    the drand round ends, so it fires immediately. This preserves the
-    pre-v2.3 timing for legacy tests that exercise the seal flow without
-    drand setup."""
-    import asyncio
-    b = _make_batcher()
-    # Force loop capture by accessing seal_event from this coroutine
-    # context — _make_batcher itself doesn't access seal_event so _loop
-    # remains None until we touch it here.
-    _ = b.seal_event  # binds _loop
-
-    async def _run():
-        b.current_checkpoint_hash = ""
-        for i in range(B_BATCH):
-            req = _request_v21(prompt_idx=i, hotkey=f"hk{i}", checkpoint_hash="")
-            req.drand_round = 100
-            b.accept_submission(req)
-        # Without chain_info, the delayed coroutine fires seal immediately
-        # on the next loop tick.
-        await asyncio.wait_for(b.seal_event.wait(), timeout=0.5)
-        assert b._seal_flag.is_set()
-
-    asyncio.run(_run())
-
-
-def test_seal_extension_waits_for_queue_drain():
-    """The delayed seal coroutine must wait for the submit queue to
-    finish draining before firing — otherwise GRAIL-pending trigger-
-    round submissions get dropped at the worker's ``is_sealed`` check
-    the instant the seal fires.
-
-    Pin: with a chain_info that puts us 0.05 s past the drand boundary
-    immediately AND a queue_drained_predicate that returns False the
-    first N calls, the seal must NOT fire until the predicate flips to
-    True.
-    """
-    import asyncio
-
-    poll_calls = [0]
-
-    def fake_queue_predicate():
-        poll_calls[0] += 1
-        # Pretend the queue is "draining" for the first 3 polls, then
-        # empty. Each poll happens ~0.2 s apart in the coroutine.
-        return poll_calls[0] > 3
-
-    async def _run():
-        # Use a chain_info whose boundary is essentially now (so phase 1
-        # of _delayed_seal_at_drand_boundary is a no-op): genesis at
-        # wall_clock and period = 1 ms means we're always at a boundary.
-        b = _make_batcher(
-            wall_clock_fn=lambda: 1000.0,  # fixed time
-            drand_chain_info={"genesis_time": 1000, "period": 1},
-            queue_drained_predicate=fake_queue_predicate,
-        )
-        _ = b.seal_event  # bind _loop
-        b.current_checkpoint_hash = ""
-        for i in range(B_BATCH):
-            req = _request_v21(prompt_idx=i, hotkey=f"hk{i}", checkpoint_hash="")
-            req.drand_round = 100
-            b.accept_submission(req)
-        # The coroutine has been scheduled by accept_submission. Now we
-        # wait for the seal — should take ~0.6 s (3 poll calls × 0.2 s
-        # each + a tiny margin).
-        await asyncio.wait_for(b.seal_event.wait(), timeout=2.0)
-        assert b._seal_flag.is_set()
-        # Predicate was actually polled multiple times before flipping.
-        assert poll_calls[0] >= 4
-
-    asyncio.run(_run())
-
-
-def test_seal_extension_queue_drain_timeout(monkeypatch):
-    """A never-empty queue must not keep the seal extension alive forever."""
-    import asyncio
-    import reliquary.validator.batcher as batcher_mod
-
-    now = [0.0]
-
-    def advancing_time():
-        now[0] += 0.01
-        return now[0]
-
-    monkeypatch.setattr(
-        batcher_mod, "MAX_SEAL_QUEUE_DRAIN_SECONDS", 0.0,
-    )
-
-    async def _run():
-        b = _make_batcher(
-            time_fn=advancing_time,
-            queue_drained_predicate=lambda: False,
-        )
-        _ = b.seal_event
-        await asyncio.wait_for(
-            b._delayed_seal_at_drand_boundary(), timeout=0.5,
-        )
-        assert b._seal_flag.is_set()
-
-    asyncio.run(_run())
-
-
-def test_seal_extension_no_early_fire_on_late_drand_submission():
-    """Regression pin: when a submission with drand_round > trigger
-    arrives at ``_accept_locked`` (worker dequeued it before HTTP
-    cheap-reject caught it), it must be rejected as BATCH_FILLED
-    WITHOUT firing the seal. Firing the seal at this point would make
-    the worker drop any remaining trigger-round items still in the
-    queue at its ``is_sealed`` gate, defeating the boundary fair-split.
-    """
-    b = _make_batcher()
-    b.current_checkpoint_hash = ""
-    # Trigger the seal round at 100 (8 distinct).
-    for i in range(B_BATCH):
-        req = _request_v21(prompt_idx=i, hotkey=f"hk{i}", checkpoint_hash="")
-        req.drand_round = 100
-        b.accept_submission(req)
-    assert b._seal_trigger_round == 100
-    # If queue_drained_predicate is None (test default), the seal fires
-    # immediately on the next loop tick — but here we're synchronous
-    # and never started a loop, so _loop is None and the immediate-seal
-    # fallback fired inside accept_submission already. The previous test
-    # covers that path; here we explicitly reset to test the late-drand
-    # case without it being masked by the immediate-seal fallback.
-    b._seal_flag.clear()
-
-    # Now a worker-dequeued submission from round 101 arrives directly
-    # in _accept_locked (bypassing HTTP cheap-reject for the test).
-    late = _request_v21(prompt_idx=99, hotkey="hk_late", checkpoint_hash="")
-    late.drand_round = 101
-    resp = b.accept_submission(late)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.BATCH_FILLED
-    # CRITICAL: seal must NOT have fired from this path.
-    assert not b._seal_flag.is_set(), (
-        "late-drand item in worker path must reject without firing seal; "
-        "otherwise queued trigger-round items get dropped at is_sealed"
-    )
 
 
 def test_batcher_beacon_invalid_defaults_false():
@@ -2375,9 +2242,8 @@ def test_reject_boxed_answer_tampered():
     req.rollouts[0].commit = commit
     req.rollouts[0].tokens = commit["tokens"]
 
-    resp = b.accept_submission(req)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.BOXED_ANSWER_TAMPERED
+    assert _prove_one(b, req) is None
+    assert b.reject_counts[RejectReason.BOXED_ANSWER_TAMPERED.value] == 1
 
 
 def test_reject_forced_rollout_with_noncanonical_force_span(monkeypatch):
@@ -2429,9 +2295,8 @@ def test_reject_forced_rollout_with_noncanonical_force_span(monkeypatch):
     req.rollouts[0].commit = commit
     req.rollouts[0].tokens = commit["tokens"]
 
-    resp = b.accept_submission(req)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.TOKEN_TAMPERED
+    assert _prove_one(b, req) is None
+    assert b.reject_counts[RejectReason.TOKEN_TAMPERED.value] == 1
 
 
 def test_accept_boxed_answer_high_prob():
@@ -2463,8 +2328,8 @@ def test_accept_boxed_answer_high_prob():
         req.rollouts[idx].commit = commit
         req.rollouts[idx].tokens = commit["tokens"]
 
-    resp = b.accept_submission(req)
-    assert resp.reason != RejectReason.BOXED_ANSWER_TAMPERED
+    # High in-box probs → no boxed tamper; the proof passes at seal.
+    assert _prove_one(b, req) is not None
 
 
 def test_all_token_auth_shadow_records_without_rejecting(monkeypatch, tmp_path):
@@ -2530,10 +2395,10 @@ def test_all_token_auth_shadow_records_without_rejecting(monkeypatch, tmp_path):
     )
     req = _request()
 
-    resp = b.accept_submission(req)
-
-    assert resp.accepted is True
-    sub = b.valid_submissions()[0]
+    # The auth shadow is recorded during the seal-time proof; recording does
+    # not reject when enforcement is off.
+    sub = _prove_one(b, req)
+    assert sub is not None
     assert sub.all_token_auth_shadow_findings == M_ROLLOUTS * 2
     assert sub.all_token_auth_shadow_min_prob == pytest.approx(4.0e-7)
     assert sub.all_token_auth_shadow_positive_findings == 4 * 2
@@ -2577,10 +2442,8 @@ def test_all_token_auth_enforce_rejects(monkeypatch):
     )
     req = _request()
 
-    resp = b.accept_submission(req)
-
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.TOKEN_TAMPERED
+    assert _prove_one(b, req) is None
+    assert b.reject_counts[RejectReason.TOKEN_TAMPERED.value] == 1
 
 
 def test_opencode_semantic_auth_shadow_records_without_rejecting(
@@ -2637,10 +2500,9 @@ def test_opencode_semantic_auth_shadow_records_without_rejecting(
         rollout.tokens = commit["tokens"]
         rollout.env_name = "opencodeinstruct"
 
-    resp = b.accept_submission(req)
-
-    assert resp.accepted is True
-    sub = b.valid_submissions()[0]
+    # The code-semantic auth shadow is recorded during the seal-time proof.
+    sub = _prove_one(b, req)
+    assert sub is not None
     assert sub.code_semantic_auth_findings == M_ROLLOUTS
     assert sub.code_semantic_auth_min_prob == pytest.approx(2.0e-4)
     assert sub.code_semantic_auth_positive_findings == 4
@@ -2729,9 +2591,8 @@ def test_opencode_semantic_auth_records_counterfactual_reward_flip(
         rollout.tokens = commit["tokens"]
         rollout.env_name = "opencodeinstruct"
 
-    resp = b.accept_submission(req)
-
-    assert resp.accepted is True
+    # The counterfactual forensics are written during the seal-time proof.
+    assert _prove_one(b, req) is not None
     records = [json.loads(line) for line in forensics_path.read_text().splitlines()]
     assert len(records) == M_ROLLOUTS
     first = records[0]
@@ -2778,10 +2639,10 @@ def test_opencode_semantic_auth_enforce_ignores_zero_reward_rollout(monkeypatch)
             rollout.tokens[0] = 4242
             rollout.commit["tokens"][0] = 4242
 
-    resp = b.accept_submission(req)
-
-    assert resp.accepted is True
-    sub = b.valid_submissions()[0]
+    # Enforcement only rejects on a POSITIVE-reward rollout; the finding here is
+    # on the zero-reward rollout, so the submission survives the seal-time proof.
+    sub = _prove_one(b, req)
+    assert sub is not None
     assert sub.code_semantic_auth_findings == 1
     assert sub.code_semantic_auth_min_prob == pytest.approx(2.0e-4)
     assert sub.code_semantic_auth_positive_findings == 0
@@ -2824,10 +2685,8 @@ def test_opencode_semantic_auth_enforce_rejects_positive_reward_rollout(
     req.rollouts[0].tokens[0] = 4242
     req.rollouts[0].commit["tokens"][0] = 4242
 
-    resp = b.accept_submission(req)
-
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.TOKEN_TAMPERED
+    assert _prove_one(b, req) is None
+    assert b.reject_counts[RejectReason.TOKEN_TAMPERED.value] == 1
 
 
 def test_cap_truncated_rollout_still_runs_behavioural_checks():
@@ -2876,9 +2735,10 @@ def test_cap_truncated_rollout_still_runs_behavioural_checks():
     req.rollouts[0].commit = commit
     req.rollouts[0].tokens = commit["tokens"]
 
-    resp = b.accept_submission(req)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.BOXED_ANSWER_TAMPERED
+    # Cap-truncation is termination-tolerated but the boxed-content check still
+    # runs at seal — the tampered digit must reject.
+    assert _prove_one(b, req) is None
+    assert b.reject_counts[RejectReason.BOXED_ANSWER_TAMPERED.value] == 1
 
 
 def test_reject_malformed_final_answer_before_grail():
@@ -3014,9 +2874,8 @@ def test_forced_seed_group_gate_rejects_below_floor_when_enforcing(monkeypatch):
     )
     b.current_checkpoint_hash = "sha256:test"   # pinned -> seed enforcement active
     req = _request(rewards=[1.0] * 4 + [0.0] * 4)
-    resp = b.accept_submission(req)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.SEED_MISMATCH
+    assert _prove_one(b, req) is None
+    assert b.reject_counts[RejectReason.SEED_MISMATCH.value] == 1
     assert len(b.valid_submissions()) == 0
 
 
@@ -3035,9 +2894,8 @@ def test_forced_seed_gate_abstains_when_checkpoint_hash_unpinned(monkeypatch):
     )
     b.current_checkpoint_hash = ""              # not yet published -> not pinned
     req = _request(rewards=[1.0] * 4 + [0.0] * 4)
-    resp = b.accept_submission(req)
-    assert resp.reason != RejectReason.SEED_MISMATCH
-    assert resp.accepted is True
+    # Unpinned hash -> the gate abstains: the proof passes at seal, not rejected.
+    assert _prove_one(b, req) is not None
 
 
 def test_forced_seed_group_gate_shadow_when_not_enforcing(monkeypatch):
@@ -3051,10 +2909,8 @@ def test_forced_seed_group_gate_shadow_when_not_enforcing(monkeypatch):
         verify_commitment_proofs_fn=_grail_with_seed_counts(n_stoch=10, n_match=1),
     )
     req = _request(rewards=[1.0] * 4 + [0.0] * 4)
-    resp = b.accept_submission(req)
-    assert resp.reason != RejectReason.SEED_MISMATCH
-    assert resp.accepted is True
-    assert len(b.valid_submissions()) == 1
+    # Not enforcing -> shadow only: the proof passes at seal, not rejected.
+    assert _prove_one(b, req) is not None
 
 
 def _grail_with_cdf_hard_mismatch():
@@ -3093,18 +2949,15 @@ def test_forced_seed_cdf_gate_rejects_sparse_branch_mismatch(monkeypatch):
     )
     b.current_checkpoint_hash = "sha256:test"
 
-    response = b.accept_submission(
-        _request(rewards=[1.0] * 4 + [0.0] * 4),
-    )
-
-    assert response.reason == RejectReason.SEED_MISMATCH
-    assert not response.accepted
+    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+    assert _prove_one(b, req) is None
+    assert b.reject_counts[RejectReason.SEED_MISMATCH.value] == 1
     assert len(recorded) == 1
     assert recorded[0][1]["cdf_would_reject"] is True
     assert recorded[0][1]["cdf_enforced"] is True
     assert recorded[0][1]["window_start"] == 500
     assert recorded[0][1]["checkpoint_hash"] == "sha256:test"
-    assert recorded[0][1]["env_name"] == "fake"
+    assert recorded[0][1]["env_name"] == "openmathinstruct"
 
 
 def test_forced_seed_cdf_gate_is_shadow_until_calibrated(monkeypatch):
@@ -3118,8 +2971,6 @@ def test_forced_seed_cdf_gate_is_shadow_until_calibrated(monkeypatch):
     )
     b.current_checkpoint_hash = "sha256:test"
 
-    response = b.accept_submission(
-        _request(rewards=[1.0] * 4 + [0.0] * 4),
-    )
-
-    assert response.accepted
+    # CDF enforcement off -> shadow only: the proof passes at seal.
+    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+    assert _prove_one(b, req) is not None

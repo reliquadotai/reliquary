@@ -28,11 +28,24 @@ def test_warp_topk_topp_masks():
 
 
 def test_u_at_deterministic_and_field_sensitive():
-    a = fs.u_at("cd" * 16, "hk1", 7, "sha:abc", 0, 3)
-    b = fs.u_at("cd" * 16, "hk1", 7, "sha:abc", 0, 3)
+    a = fs.u_at("cd" * 16, 7, "sha:abc", 0, 3)
+    b = fs.u_at("cd" * 16, 7, "sha:abc", 0, 3)
     assert a == b and 0.0 <= a < 1.0
-    assert fs.u_at("cd" * 16, "hk1", 7, "sha:abc", 0, 4) != a   # position changes it
-    assert fs.u_at("cd" * 16, "hk2", 7, "sha:abc", 0, 3) != a   # hotkey changes it
+    assert fs.u_at("cd" * 16, 7, "sha:abc", 0, 4) != a   # position changes it
+    assert fs.u_at("cd" * 16, 8, "sha:abc", 0, 3) != a   # prompt changes it
+    assert fs.u_at("ce" * 16, 7, "sha:abc", 0, 3) != a   # randomness changes it
+    assert fs.u_at("cd" * 16, 7, "sha:xyz", 0, 3) != a   # checkpoint changes it
+    assert fs.u_at("cd" * 16, 7, "sha:abc", 1, 3) != a   # rollout changes it
+
+
+def test_u_at_is_identity_free_to_kill_variance_farming():
+    """v2 anti-farming: the forced stream no longer takes a hotkey, so the group
+    for a prompt is identical for every miner in the window. One operator's N
+    hotkeys therefore get N copies of the SAME draw — there is nothing to farm.
+    Passing a hotkey must be a TypeError, not a silently-ignored argument."""
+    import pytest
+    with pytest.raises(TypeError):
+        fs.u_at("cd" * 16, "hk1", 7, "sha:abc", 0, 3)
 
 
 def test_seed_consistency_perfect_when_tokens_follow_u():
@@ -41,7 +54,7 @@ def test_seed_consistency_perfect_when_tokens_follow_u():
                            [0.2, 0.1, 0.0],       # flat -> stochastic
                            [10.0, 0.0, 0.0],       # argmax token 0
                            [0.1, 0.2, 0.15]])      # flat -> stochastic
-    u = [fs.u_at("r", "h", 0, "c", 0, t) for t in range(4)]
+    u = [fs.u_at("r", 0, "c", 0, t) for t in range(4)]
     # tokens = what the forced u actually picks (honest miner)
     tokens = [fs.pick(fs.warp(logits[i], t=0.6, top_k=20, top_p=0.95), u[i]) for i in range(4)]
     n_stoch, n_match = fs.seed_consistency(
@@ -52,8 +65,8 @@ def test_seed_consistency_perfect_when_tokens_follow_u():
 
 def test_seed_consistency_low_when_tokens_ignore_u():
     logits = torch.tensor([[0.2, 0.1, 0.0], [0.1, 0.2, 0.15], [0.0, 0.1, 0.2]])
-    u = [fs.u_at("r", "h", 0, "c", 0, t) for t in range(3)]
-    wrong = [fs.u_at("OTHER", "h", 0, "c", 0, t) for t in range(3)]
+    u = [fs.u_at("r", 0, "c", 0, t) for t in range(3)]
+    wrong = [fs.u_at("OTHER", 0, "c", 0, t) for t in range(3)]
     tokens = [fs.pick(fs.warp(logits[i], t=0.6, top_k=20, top_p=0.95), wrong[i]) for i in range(3)]
     n_stoch, n_match = fs.seed_consistency(
         logits, tokens, u, t=0.6, top_k=20, top_p=0.95, stochastic_threshold=0.99)
@@ -84,7 +97,7 @@ def test_seed_consistency_matches_per_position_reference_on_batch():
     logits = torch.randn(n, vocab)
     for i in (2, 7, 11):
         logits[i, 0] = 50.0                          # peaked -> not stochastic
-    u = [fs.u_at("rand", "hk", 3, "ckpt", 0, i) for i in range(n)]
+    u = [fs.u_at("rand", 3, "ckpt", 0, i) for i in range(n)]
     tokens = []
     for i in range(n):
         p = fs.pick(fs.warp(logits[i], t=0.6, top_k=20, top_p=0.95), u[i])
@@ -106,7 +119,7 @@ def test_seed_consistency_truncates_to_shortest_input():
     # n = min(len(tokens), len(u), rows); extra logits rows are ignored.
     torch.manual_seed(1)
     logits = torch.randn(6, 32)
-    u = [fs.u_at("z", "h", 0, "c", 0, i) for i in range(4)]
+    u = [fs.u_at("z", 0, "c", 0, i) for i in range(4)]
     tokens = [fs.pick(fs.warp(logits[i], t=0.6, top_k=20, top_p=0.95), u[i])
               for i in range(4)]
     kw = dict(t=0.6, top_k=20, top_p=0.95, stochastic_threshold=0.99)

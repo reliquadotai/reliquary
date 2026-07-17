@@ -63,6 +63,7 @@ def _request_with_randomness(
         merkle_root="00" * 32,
         rollouts=rollouts,
         checkpoint_hash="sha256:test",
+        protocol_version=2,
     )
 
 
@@ -189,6 +190,7 @@ def test_per_rollout_randomness_is_checked() -> None:
         merkle_root="00" * 32,
         rollouts=rollouts,
         checkpoint_hash="sha256:test",
+        protocol_version=2,
     )
     resp = b.accept_submission(req)
     assert resp.accepted is False

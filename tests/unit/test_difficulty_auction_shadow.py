@@ -36,7 +36,7 @@ def _batcher(
     hash_set=None,
     operator_by_hotkey=None,
 ):
-    return GrpoWindowBatcher(
+    batcher = GrpoWindowBatcher(
         window_start=500,
         env=env or MathEnv(),
         model=SimpleNamespace(),
@@ -48,6 +48,14 @@ def _batcher(
         drand_round_check_enabled=False,
         operator_by_hotkey=operator_by_hotkey,
     )
+    # This suite exercises the observation-only selector over the legacy path.
+    # Armed auction behavior has dedicated deferred-proof/deadline tests.
+    batcher.difficulty_auction_enabled = False
+    # These tests inject the proven pool on ``_valid`` directly to exercise the
+    # legacy selection + difficulty-auction shadow over a controlled set.
+    batcher._prove_ranked = lambda pool=1.0: batcher._valid
+    batcher._prove_forensic_sample = lambda: []
+    return batcher
 
 
 def _submission(hotkey, prompt_idx, drand_round, k):

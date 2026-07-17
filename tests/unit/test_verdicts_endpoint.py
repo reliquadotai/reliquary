@@ -11,6 +11,7 @@ outcome. The endpoint here closes that gap to a few seconds.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -22,13 +23,15 @@ from reliquary.constants import (
     MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
 )
 from reliquary.protocol.submission import (
+    BatchSubmissionResponse,
     BatchSubmissionRequest,
     RejectReason,
     RolloutSubmission,
     WindowState,
 )
-from reliquary.validator.batcher import GrpoWindowBatcher
+from reliquary.validator.batcher import GrpoWindowBatcher, PendingSubmission
 from reliquary.validator.server import ValidatorServer, VERDICT_CAP_PER_HOTKEY
+from reliquary.validator.service import ValidationService
 
 
 class _FakeEnv:
@@ -124,6 +127,7 @@ def _request(
         merkle_root=merkle_root,
         rollouts=rollouts,
         checkpoint_hash="sha256:test",
+        protocol_version=2,
     )
 
 
@@ -366,3 +370,72 @@ def test_record_verdict_accepts_str_reason_for_late_drops() -> None:
     client = TestClient(server.app)
     v = client.get("/verdicts/hkK").json()["verdicts"]
     assert v[0]["reason"] == "worker_dropped"
+
+
+def test_auction_seal_publishes_selected_loser_and_proof_failure() -> None:
+    """Auction admission is provisional until seal. The final records must
+    distinguish a paid winner, an accepted non-winner, and a deferred-proof
+    rejection without turning the non-winner into a protocol failure."""
+    requests = [
+        _request(prompt_idx=101 + index, hotkey=f"hk{index}")
+        for index in range(3)
+    ]
+    pending = [
+        PendingSubmission(
+            hotkey=request.miner_hotkey,
+            prompt_idx=request.prompt_idx,
+            request=request,
+            rewards=[1.0, 0.0],
+            drand_round=request.drand_round,
+            merkle_root=bytes.fromhex(request.merkle_root),
+            selection_digest=bytes.fromhex(request.merkle_root),
+        )
+        for request in requests
+    ]
+    pending[2].reject_response = BatchSubmissionResponse(
+        accepted=False,
+        reason=RejectReason.GRAIL_FAIL,
+    )
+    metadata = {
+        id(pending[0]): {"rank": 1, "selected": True, "status": "selected"},
+        id(pending[1]): {"rank": 2, "selected": False, "status": "not_needed"},
+        id(pending[2]): {
+            "rank": 3,
+            "selected": False,
+            "status": "proof_failed",
+        },
+    }
+    batcher = SimpleNamespace(
+        difficulty_auction_enabled=True,
+        difficulty_auction_metadata_by_id=metadata,
+        pending_submissions=lambda: list(pending),
+        window_start=500,
+        env=SimpleNamespace(name="opencodeinstruct"),
+    )
+    server = ValidatorServer()
+    service = ValidationService.__new__(ValidationService)
+    service.server = server
+
+    service._record_auction_final_verdicts(batcher)
+    service._record_auction_final_verdicts(batcher)  # idempotent
+
+    winner = server._verdicts["hk0"][0]
+    assert winner["accepted"] is True
+    assert winner["selected_for_batch"] is True
+    assert winner["rewarded"] is True
+    assert winner["canonical_rank"] == 1
+
+    loser = server._verdicts["hk1"][0]
+    assert loser["accepted"] is True
+    assert loser["reason"] == RejectReason.ACCEPTED.value
+    assert loser["accepted_into_pool"] is True
+    assert loser["selected_for_batch"] is False
+    assert loser["rewarded"] is False
+
+    failed = server._verdicts["hk2"][0]
+    assert failed["accepted"] is False
+    assert failed["reason"] == RejectReason.GRAIL_FAIL.value
+    assert failed["accepted_into_pool"] is True
+    assert failed["selected_for_batch"] is False
+    assert failed["rewarded"] is False
+    assert failed["reject_stage"] == "auction_seal"

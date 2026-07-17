@@ -92,9 +92,11 @@ async def test_archive_includes_prompt_and_rollout_content():
     batcher.randomness = "0xdeadbeef"
     batcher.window_opened_at = 100.0
     batcher.window_opened_wall_ts = 1_000.0
+    batcher.difficulty_auction_enabled = True
     batcher.rewarded_but_not_selected_by_hotkey = {"hk_runner": 1}
     batcher.logical_group_reservation_count = 9
     batcher.logical_group_duplicate_rejects = 4
+    batcher.grader_failures = {"unreachable": 2}
     from reliquary.validator.batcher import RejectedSubmission
     batcher.reject_counts = {"out_of_zone": 3, "logprob_mismatch": 1}
     svc.server._recent_reject_counts.update({
@@ -142,21 +144,27 @@ async def test_archive_includes_prompt_and_rollout_content():
             "reward_count": 8,
             "eligible": True,
             "rank": 2,
-            "shadow_selected": True,
+            "selected": True,
+            "status": "selected",
+            "proof_attempted": True,
+            "proof_passed": True,
+            "rank_entropy_source": "seal_drand",
             "operator_id": "operator-a",
         },
         id(runner): {
             "value": 0.25,
             "mean_reward": 0.5,
             "rank": 3,
-            "shadow_selected": False,
+            "selected": False,
+            "status": "operator_cap",
+            "proof_attempted": False,
         },
     }
     batcher.difficulty_auction_shadow = {
-        "schema_version": 1,
-        "status": "computed",
-        "mode": "observation_only",
-        "production_changed": False,
+        "schema_version": 2,
+        "status": "armed",
+        "mode": "production",
+        "production_changed": True,
     }
 
     captured = {}
@@ -226,6 +234,11 @@ async def test_archive_includes_prompt_and_rollout_content():
     assert entry0["difficulty_auction_eligible"] is True
     assert entry0["difficulty_auction_rank"] == 2
     assert entry0["difficulty_auction_selected"] is True
+    assert entry0["difficulty_auction_mode"] == "production"
+    assert entry0["difficulty_auction_status"] == "selected"
+    assert entry0["difficulty_auction_proof_attempted"] is True
+    assert entry0["difficulty_auction_proof_passed"] is True
+    assert entry0["difficulty_auction_rank_entropy_source"] == "seal_drand"
     assert entry0["difficulty_auction_operator_id"] == "operator-a"
 
     # eos detection: rollout 0 of entry 0 ends with eos_token_id=99 → True.
@@ -250,14 +263,17 @@ async def test_archive_includes_prompt_and_rollout_content():
     assert ru["rollout_hashes"] == [h.hex() for h in runner.rollout_hashes]
     assert ru["difficulty_auction_rank"] == 3
     assert ru["difficulty_auction_selected"] is False
+    assert ru["difficulty_auction_status"] == "operator_cap"
+    assert ru["difficulty_auction_proof_attempted"] is False
     assert ru["arrival_age_seconds"] is None
     assert archive["rewarded_but_not_selected_by_hotkey"] == {"hk_runner": 1}
-    assert archive["difficulty_auction_shadow"]["fake"] == {
-        "schema_version": 1,
-        "status": "computed",
-        "mode": "observation_only",
-        "production_changed": False,
+    assert archive["difficulty_auction"]["fake"] == {
+        "schema_version": 2,
+        "status": "armed",
+        "mode": "production",
+        "production_changed": True,
     }
+    assert archive["difficulty_auction_shadow"] == archive["difficulty_auction"]
 
     # reject_summary persisted from batcher.
     assert archive["reject_summary"] == {
@@ -271,6 +287,10 @@ async def test_archive_includes_prompt_and_rollout_content():
     }
     assert archive["logical_group_dedup"] == {
         "fake": {"reservations": 9, "duplicate_rejects": 4}
+    }
+    assert archive["grader_failures"] == {"unreachable": 2}
+    assert archive["grader_failures_by_environment"] == {
+        "fake": {"unreachable": 2}
     }
 
     # rejected[] persisted from batcher.rejected_submissions.

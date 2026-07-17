@@ -93,6 +93,7 @@ def _submission(*, drand_round: int, hotkey: str = "hkA") -> dict:
         ],
         "checkpoint_hash": "",
         "drand_round": drand_round,
+        "protocol_version": 2,
     }
 
 

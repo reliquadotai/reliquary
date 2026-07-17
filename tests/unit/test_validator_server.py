@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from reliquary.constants import (
     CHALLENGE_K,
+    FORCED_SEED_PROTOCOL_VERSION,
     M_ROLLOUTS,
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
 )
@@ -75,6 +76,23 @@ class _UnavailableEnv(FakeEnv):
         }
 
 
+class _FlakyCodeEnv(FakeEnv):
+    name = "opencodeinstruct"
+    validator_authoritative_reward = True
+
+    def __init__(self):
+        self.unavailable = True
+
+    def compute_reward(self, problem, completion):
+        if self.unavailable:
+            from reliquary.environment.grader_client import (
+                GraderInfrastructureError,
+            )
+
+            raise GraderInfrastructureError("unreachable")
+        return super().compute_reward(problem, completion)
+
+
 def _always_true_proof(commit, model, randomness):
     import torch
     from reliquary.validator.verifier import ProofResult
@@ -112,7 +130,12 @@ class _ModelStub:
         max_position_embeddings = 4096
 
 
-def _batcher(window_start=500, cooldown_map=None, env=None):
+def _batcher(
+    window_start=500,
+    cooldown_map=None,
+    env=None,
+    operator_by_hotkey=None,
+):
     batcher = GrpoWindowBatcher(
         window_start=window_start,
         env=env or FakeEnv(),
@@ -123,6 +146,7 @@ def _batcher(window_start=500, cooldown_map=None, env=None):
         completion_text_fn=lambda r: "CORRECT" if r.reward > 0.5 else "wrong",
         # Server tests post legacy requests without drand_round; disable the gate.
         drand_round_check_enabled=False,
+        operator_by_hotkey=operator_by_hotkey,
     )
     batcher.current_checkpoint_hash = "sha256:test"
     # Match the per-window randomness used by ``_make_commit`` so the
@@ -163,7 +187,7 @@ def _request(
         else "00" * 32
     )
     drand_round = 0
-    protocol_version = 1
+    protocol_version = FORCED_SEED_PROTOCOL_VERSION
     nonce = os.urandom(8).hex()
     sig = sign_envelope(
         wallet=_TestWallet,
@@ -210,7 +234,9 @@ def test_legacy_merkle_shadow_accepts_mismatch_and_exposes_telemetry():
     assert health.legacy_merkle_errors == 0
     assert health.legacy_merkle_distinct_hotkeys == 1
     assert health.legacy_merkle_environments == [FakeEnv.name]
-    assert health.legacy_merkle_protocol_versions == {"1": 1}
+    assert health.legacy_merkle_protocol_versions == {
+        str(FORCED_SEED_PROTOCOL_VERSION): 1
+    }
     assert health.legacy_merkle_last_mismatch_ts is not None
 
 
@@ -230,6 +256,31 @@ def test_legacy_merkle_shadow_records_current_miner_match():
     assert health.legacy_merkle_matches == 1
     assert health.legacy_merkle_mismatches == 0
     assert health.legacy_merkle_last_mismatch_ts is None
+
+
+def test_old_forced_seed_protocol_is_rejected_before_quota_or_proof():
+    from reliquary.protocol.submission import WindowState
+
+    server = ValidatorServer()
+    batcher = _batcher(window_start=500)
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    request = _request()
+    request.protocol_version = FORCED_SEED_PROTOCOL_VERSION - 1
+
+    response = TestClient(server.app).post(
+        "/submit",
+        json=request.model_dump(mode="json"),
+    )
+
+    assert response.json() == {
+        "accepted": False,
+        "reason": RejectReason.SEED_MISMATCH.value,
+    }
+    assert server._per_window_counts == {}
+    assert server.submit_queue_depth == 0
+    assert batcher.proof_admission_count == 0
+    assert batcher.proof_grading_attempts == 0
 
 
 def test_legacy_merkle_enforcement_rejects_before_quota(monkeypatch):
@@ -303,6 +354,7 @@ def test_logical_group_duplicate_is_rejected_quota_neutral_before_proof():
 
     server = ValidatorServer()
     batcher = _batcher(window_start=500)
+    batcher.difficulty_auction_enabled = True
     server.set_active_batcher(batcher)
     server.set_current_state(WindowState.OPEN)
     client = TestClient(server.app)
@@ -321,7 +373,10 @@ def test_logical_group_duplicate_is_rejected_quota_neutral_before_proof():
     assert batcher.proof_grading_attempts == 1
     assert batcher.logical_group_reservation_count == 1
     assert batcher.logical_group_duplicate_rejects == 1
-    assert len(batcher.valid_submissions()) == 1
+    # Deferred-proof mode admits the first candidate into the pending pool;
+    # it does not become valid until the ranked proof pass at seal.
+    assert len(batcher.pending_submissions()) == 1
+    assert len(batcher.valid_submissions()) == 0
     health = client.get("/health").json()
     assert health["logical_group_reservations"] == 1
     assert health["logical_group_duplicate_rejects"] == 1
@@ -354,6 +409,72 @@ def test_logical_group_digest_runs_off_event_loop(monkeypatch):
 
     assert response.json()["accepted"] is True
     assert offloaded == [GrpoWindowBatcher.try_reserve_logical_group]
+
+
+def test_auction_missing_operator_mapping_rejects_prequeue_quota_neutral():
+    from reliquary.protocol.submission import WindowState
+
+    server = ValidatorServer()
+    batcher = _batcher(
+        window_start=500,
+        operator_by_hotkey={"some-other-hotkey": "operator-a"},
+    )
+    batcher.difficulty_auction_enabled = True
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+
+    response = TestClient(server.app).post(
+        "/submit", json=_request().model_dump(mode="json")
+    )
+
+    assert response.json() == {
+        "accepted": False,
+        "reason": RejectReason.REGISTRATION_UNAVAILABLE.value,
+    }
+    assert server._per_window_counts == {}
+    assert batcher.proof_grading_attempts == 0
+    assert batcher.logical_group_reservation_count == 0
+
+
+def test_code_grader_outage_refunds_quota_and_surfaces_health():
+    from reliquary.protocol.submission import WindowState
+
+    env = _FlakyCodeEnv()
+    server = ValidatorServer()
+    batcher = _batcher(
+        window_start=500,
+        env=env,
+        operator_by_hotkey={_TEST_KEYPAIR.ss58_address: "operator-a"},
+    )
+    batcher.difficulty_auction_enabled = True
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    client = TestClient(server.app)
+    request = _request()
+    for rollout in request.rollouts:
+        rollout.env_name = env.name
+
+    outage = client.post("/submit", json=request.model_dump(mode="json"))
+
+    assert outage.json() == {
+        "accepted": False,
+        "reason": RejectReason.WORKER_DROPPED.value,
+    }
+    assert server._per_window_counts == {}
+    assert batcher.logical_group_reservation_count == 0
+    health = client.get("/health").json()
+    assert health["status"] == "degraded"
+    assert health["grader_failures_by_environment"] == {
+        env.name: {"unreachable": 1}
+    }
+
+    env.unavailable = False
+    retry = _request()
+    for rollout in retry.rollouts:
+        rollout.env_name = env.name
+    recovered = client.post("/submit", json=retry.model_dump(mode="json"))
+    assert recovered.json()["accepted"] is True
+    assert server._per_window_counts == {_TEST_KEYPAIR.ss58_address: 1}
 
 
 @pytest.mark.parametrize("fail_at", ["length", "row"])
@@ -680,7 +801,17 @@ def test_health_exposes_each_environment_window_independently():
         "proof_grading_attempts": 4,
         "pending_proof_reservations": 0,
         "inflight_proof_reservations": 0,
+        "reserved_payload_bytes": 0,
+        "pending_payload_bytes": 0,
+        "inflight_payload_bytes": 0,
+        "retained_payload_bytes": 0,
+        "difficulty_auction_enabled": False,
+        "difficulty_auction_proof_wall_elapsed_seconds": 0.0,
+        "difficulty_auction_proof_wall_exhausted": False,
         "post_trigger_proof_admission_count": 0,
+        "expensive_proof_failures_by_hotkey": {},
+        "expensive_proof_failures_by_operator": {},
+        "grader_failures": {},
     }
     code_health = health["window_environments"]["opencodeinstruct"]
     assert code_health["valid_submissions_count"] == 8
@@ -866,6 +997,32 @@ def test_submit_returns_submitted_under_worker_path():
     assert body["reason"] == "submitted"
 
 
+def test_code_submit_routes_to_the_isolated_code_queue():
+    from reliquary.protocol.submission import WindowState
+    from tests.unit.test_grpo_window_batcher import PrivateRewardFakeEnv
+
+    server = ValidatorServer()
+    batcher = _batcher(
+        window_start=500,
+        env=PrivateRewardFakeEnv(),
+    )
+    server.set_active_batchers({"opencodeinstruct": batcher})
+    server.set_current_state(WindowState.OPEN)
+    server._worker_task = object()
+    request = _request()
+    for rollout in request.rollouts:
+        rollout.env_name = "opencodeinstruct"
+
+    response = TestClient(server.app).post(
+        "/submit",
+        json=request.model_dump(mode="json"),
+    )
+
+    assert response.json()["reason"] == RejectReason.SUBMITTED.value
+    assert server._submit_queue.qsize() == 0
+    assert server._code_submit_queue.qsize() == 1
+
+
 def test_full_server_queue_returns_pending_proof_reservation():
     import asyncio
     from reliquary.protocol.submission import WindowState
@@ -885,6 +1042,7 @@ def test_full_server_queue_returns_pending_proof_reservation():
     assert response.json()["reason"] == RejectReason.BATCH_FILLED.value
     assert batcher.pending_proof_reservations == 0
     assert batcher.proof_grading_attempts == 0
+    assert batcher.reserved_payload_bytes == 0
 
 
 # --- worker drops items whose batcher is no longer active ---

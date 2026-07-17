@@ -24,6 +24,8 @@ from reliquary.constants import (
     DEFAULT_HF_REPO_ID,
     DRAND_ROUND_BACKWARD_TOLERANCE,
     DIFFICULTY_AUCTION_DELTA,
+    DIFFICULTY_AUCTION_ENFORCE,
+    DIFFICULTY_AUCTION_ENVIRONMENTS,
     DIFFICULTY_AUCTION_SHADOW_ENABLED,
     DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS,
     DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES,
@@ -33,6 +35,7 @@ from reliquary.constants import (
     FORCED_SEED_CDF_ENFORCE,
     FORCED_SEED_CONSISTENCY_FLOOR,
     FORCED_SEED_ENFORCE,
+    FORCED_SEED_PROTOCOL_VERSION,
     FORCED_SEED_ROLLOUT_FLOOR,
     GRAD_CLIP_NORM,
     GRAD_NORM_SKIP_THRESHOLD,
@@ -46,12 +49,15 @@ from reliquary.constants import (
     LR_COSINE_MAX_WINDOWS,
     LR_WARMUP_WINDOWS,
     M_ROLLOUTS,
+    MAX_AUCTION_SLOTS_PER_OPERATOR,
+    MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW,
+    MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
+    MAX_PROOF_WALL_SECONDS,
+    MAX_SEAL_QUEUE_DRAIN_SECONDS,
     MIN_EOS_PROBABILITY,
     POLL_INTERVAL_SECONDS,
     PPO_CLIP_EPSILON,
     PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD,
-    MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
-    MAX_SEAL_QUEUE_DRAIN_SECONDS,
     PROOF_ADMISSION_STALL_POLL_SECONDS,
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
     REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS,
@@ -67,12 +73,13 @@ from reliquary.constants import (
     VALIDATOR_HTTP_PORT,
     WANDB_TRAINING_VERSION,
     WINDOW_LENGTH,
+    WINDOW_COLLECTION_SECONDS,
     WINDOW_TIMEOUT_SECONDS,
 )
 from reliquary.environment import load_environments
 from reliquary.environment.base import Environment
 from reliquary.infrastructure import chain, storage
-from reliquary.protocol.submission import RolloutSubmission, WindowState
+from reliquary.protocol.submission import RejectReason, RolloutSubmission, WindowState
 from reliquary.validator import telemetry
 from reliquary.validator.batcher import GrpoWindowBatcher
 from reliquary.validator.checkpoint import CheckpointStore
@@ -441,7 +448,6 @@ class ValidationService:
             retention_windows=HASH_DEDUP_RETENTION_WINDOWS,
         )
         self._late_drops: dict[str, dict[str, int]] = {}
-        self._grader_failures: dict[str, int] = {}
 
         self.server = ValidatorServer(host=http_host, port=http_port)
         self.server.set_late_drop_callback(self.record_late_drop)
@@ -861,8 +867,9 @@ class ValidationService:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
-        if loop is not None:
-            for batcher in self._active_batchers.values():
+        for batcher in self._active_batchers.values():
+            batcher.mark_window_opened()
+            if loop is not None:
                 batcher.bind_event_loop(loop)
         self.server.set_active_batchers(self._active_batchers)
         self._window_n = int(self._candidate_window_n)
@@ -896,9 +903,9 @@ class ValidationService:
                     list(coldkey_values) if coldkey_values is not None else []
                 )
             except TypeError:
-                # Registration admission remains available even if an older
-                # metagraph object cannot expose ownership. The shadow cap then
-                # reports incomplete mapping and disables itself.
+                # Registration admission may use the hotkey list, but production
+                # auction claims fail closed when ownership is unavailable. A
+                # hotkey is never substituted for the missing operator identity.
                 raw_coldkeys = []
             hotkeys = {
                 hotkey
@@ -982,11 +989,34 @@ class ValidationService:
         return queue_depth == 0 and inflight == 0
 
     def _distinct_valid_prompt_count(self, batcher) -> int:
-        """Best-effort distinct prompt count for liveness decisions."""
-        counter = getattr(batcher, "distinct_valid_prompt_count", None)
+        """Best-effort distinct trainable prompt count for liveness decisions.
+
+        Auction environments use the graded pending pool; legacy environments
+        use the proven valid pool.
+        """
+        counter_name = (
+            "distinct_pending_prompt_count"
+            if getattr(batcher, "difficulty_auction_enabled", False)
+            else "distinct_valid_prompt_count"
+        )
+        counter = getattr(batcher, counter_name, None)
         if callable(counter):
             return int(counter())
-        return int(getattr(batcher, "valid_count", 0) or 0)
+        count_name = (
+            "pending_count"
+            if getattr(batcher, "difficulty_auction_enabled", False)
+            else "valid_count"
+        )
+        return int(getattr(batcher, count_name, 0) or 0)
+
+    @staticmethod
+    def _admitted_count(batcher) -> int:
+        count_name = (
+            "pending_count"
+            if getattr(batcher, "difficulty_auction_enabled", False)
+            else "valid_count"
+        )
+        return int(getattr(batcher, count_name, 0) or 0)
 
     def _duplicate_prompt_shortfall_drained(self, batcher) -> bool:
         """True when duplicates filled raw submissions but not trainable slots."""
@@ -994,7 +1024,7 @@ class ValidationService:
             return False
         if getattr(batcher, "_seal_trigger_round", None) is not None:
             return False
-        valid_count = int(getattr(batcher, "valid_count", 0) or 0)
+        valid_count = self._admitted_count(batcher)
         distinct_valid = self._distinct_valid_prompt_count(batcher)
         if valid_count < B_BATCH or distinct_valid >= B_BATCH:
             return False
@@ -1005,7 +1035,67 @@ class ValidationService:
     def _queue_and_proofs_drained(self) -> bool:
         queue_depth = int(getattr(self.server, "submit_queue_depth", 0) or 0)
         inflight = int(getattr(self.server, "proof_verification_inflight", 0) or 0)
-        return queue_depth == 0 and inflight == 0
+        if queue_depth != 0 or inflight != 0:
+            return False
+        # Close the dequeue race where the worker has removed an item from the
+        # asyncio queue but has not yet incremented ``_inflight_proofs``. The
+        # batcher reservation spans that gap and is the authoritative signal.
+        for batcher in self._active_batchers.values():
+            if int(getattr(batcher, "pending_proof_reservations", 0) or 0):
+                return False
+            if int(getattr(batcher, "inflight_proof_reservations", 0) or 0):
+                return False
+        return True
+
+    async def _freeze_auction_populations(self, batchers: list[Any]) -> bool:
+        """Drain pre-deadline work, then freeze each auction pending pool.
+
+        Returns ``True`` when the normal drain budget was exhausted. Pending
+        queue entries are then rejected by ``start_proof_admission``; already
+        started grading is allowed one final bounded interval to finish so seal
+        can never race a mutation of the ranked population.
+        """
+        auction_batchers = [
+            batcher for batcher in batchers
+            if getattr(batcher, "difficulty_auction_enabled", False)
+        ]
+        if not auction_batchers:
+            return False
+
+        loop = asyncio.get_running_loop()
+        drain_deadline = loop.time() + MAX_SEAL_QUEUE_DRAIN_SECONDS
+        while not self._queue_and_proofs_drained():
+            if loop.time() >= drain_deadline:
+                break
+            await asyncio.sleep(PROOF_ADMISSION_STALL_POLL_SECONDS)
+
+        timed_out = not self._queue_and_proofs_drained()
+        for batcher in auction_batchers:
+            begin_snapshot = getattr(batcher, "begin_seal_snapshot", None)
+            if callable(begin_snapshot):
+                begin_snapshot()
+
+        # Once frozen, pending items are cheap drops. A request that already
+        # started may still hold the batcher lock while grading; do not race it.
+        quiesce_deadline = loop.time() + MAX_SEAL_QUEUE_DRAIN_SECONDS
+        while any(
+            int(getattr(batcher, "inflight_proof_reservations", 0) or 0)
+            for batcher in auction_batchers
+        ):
+            if loop.time() >= quiesce_deadline:
+                raise RuntimeError(
+                    "auction admission failed to quiesce before seal"
+                )
+            await asyncio.sleep(PROOF_ADMISSION_STALL_POLL_SECONDS)
+
+        if timed_out:
+            logger.warning(
+                "Window %d auction queue drain reached %.1fs; froze pending "
+                "populations and dropped remaining queued submissions",
+                self._window_n,
+                MAX_SEAL_QUEUE_DRAIN_SECONDS,
+            )
+        return timed_out
 
     def _seconds_since_last_valid_submission(self, batcher) -> float | None:
         counter = getattr(batcher, "seconds_since_last_valid_submission", None)
@@ -1034,7 +1124,7 @@ class ValidationService:
             return None
         if getattr(batcher, "_seal_trigger_round", None) is not None:
             return None
-        valid_count = int(getattr(batcher, "valid_count", 0) or 0)
+        valid_count = self._admitted_count(batcher)
         distinct_valid = self._distinct_valid_prompt_count(batcher)
         if distinct_valid >= B_BATCH:
             return None
@@ -1063,6 +1153,27 @@ class ValidationService:
         Per-env so a fast env never seals a slower one short.
         """
         env = getattr(getattr(batcher, "env", None), "name", "?")
+        if getattr(batcher, "difficulty_auction_enabled", False):
+            # The full population is the auction's input. Duplicate/sparse idle
+            # breakers would let an early burst truncate the fixed collection
+            # period and recreate the speed race. Only an exhausted, fully
+            # drained grading budget is terminal before the deadline.
+            if not self._proof_admission_exhausted_and_drained(batcher):
+                return None
+            reason = "proof_admission_exhausted_drained"
+            logger.warning(
+                "Window %d env=%s force-sealing auction: reason=%s "
+                "admitted=%d/%d distinct=%d/%d",
+                self._window_n,
+                env,
+                reason,
+                self._admitted_count(batcher),
+                B_BATCH,
+                self._distinct_valid_prompt_count(batcher),
+                B_BATCH,
+            )
+            batcher.force_seal(reason)
+            return reason
         if self._proof_admission_exhausted_and_drained(batcher):
             reason = "proof_admission_exhausted_drained"
         elif self._duplicate_prompt_shortfall_drained(batcher):
@@ -1090,10 +1201,10 @@ class ValidationService:
     async def _wait_for_window_seal(self) -> str:
         """Wait until every active env's batcher seals.
 
-        Each batcher seals independently — via its own BATCH_FILLED fill or
-        its own liveness breaker — so a fast env never cuts a slower one
-        short. The window advances only once all are sealed (or the global
-        timeout). Training still requires all envs full (see ``trained``).
+        Auction batchers seal on their fixed collection deadline; legacy
+        batchers retain their B-distinct/drand-boundary seal. Per-environment
+        liveness guards cannot let a fast environment cut a slower one short.
+        The window advances only once all are sealed (or the global timeout).
         """
         batchers = list(self._active_batchers.values())
         if not batchers:
@@ -1105,6 +1216,10 @@ class ValidationService:
         reasons: dict[str, str] = {}
         while True:
             for b in batchers:
+                # Normal path: seal on the fixed collection deadline.
+                poll = getattr(b, "poll_deadline", None)
+                if callable(poll):
+                    poll()
                 if b.is_sealed():
                     continue
                 r = self._force_seal_dead_batcher(b, dup_since)
@@ -1122,6 +1237,9 @@ class ValidationService:
                 return "timeout"
 
             await asyncio.sleep(min(PROOF_ADMISSION_STALL_POLL_SECONDS, remaining))
+
+        if await self._freeze_auction_populations(batchers):
+            reasons["auction"] = "auction_queue_drain_timeout"
 
         if not reasons:
             return "sealed"
@@ -1267,6 +1385,84 @@ class ValidationService:
             for b in batcher_list:
                 b.beacon_invalid = True
 
+    def _record_auction_final_verdicts(self, batcher: GrpoWindowBatcher) -> None:
+        """Publish the final lifecycle state of every auction candidate.
+
+        Admission and final selection are deliberately separate in auction mode:
+        the worker first records that a cheap-validated candidate entered the
+        pending pool, then ``seal_batch`` proves only the ranked candidates that
+        can still win. The second record added here is identifiable by the
+        non-null ``selected_for_batch`` and ``rewarded`` fields.
+
+        Non-winners remain accepted candidates with no reward. A candidate that
+        was sampled or selected for deferred proof and failed receives the real
+        proof rejection. Telemetry publication is best-effort and never changes
+        protocol state or rewards.
+        """
+        if not getattr(batcher, "difficulty_auction_enabled", False):
+            return
+        if getattr(batcher, "_auction_final_verdicts_published", False):
+            return
+
+        metadata = getattr(batcher, "difficulty_auction_metadata_by_id", {})
+        for pending in batcher.pending_submissions():
+            row = metadata.get(id(pending), {}) if isinstance(metadata, dict) else {}
+            selected = bool(row.get("selected", False))
+            proof_reject = pending.reject_response
+            accepted = proof_reject is None
+            reason = (
+                RejectReason.ACCEPTED
+                if proof_reject is None
+                else proof_reject.reason
+            )
+            canonical_rank = row.get("rank")
+            if not isinstance(canonical_rank, int) or isinstance(
+                canonical_rank, bool
+            ):
+                canonical_rank = None
+
+            try:
+                self.server.record_verdict(
+                    pending.hotkey,
+                    pending.request.merkle_root,
+                    accepted,
+                    reason,
+                    window_n=batcher.window_start,
+                    telemetry=pending.telemetry,
+                    reject_stage=None if accepted else "auction_seal",
+                    canonical_rank=canonical_rank,
+                    accepted_into_pool=True,
+                    selected_for_batch=selected,
+                    rewarded=selected,
+                )
+                log_structured(
+                    logger,
+                    logging.INFO if accepted else logging.WARNING,
+                    "validator_submit_lifecycle",
+                    {
+                        "stage": "auction_finalized",
+                        "window_n": batcher.window_start,
+                        "env_name": str(getattr(batcher.env, "name", "")),
+                        "prompt_idx": pending.prompt_idx,
+                        "hotkey": pending.hotkey,
+                        "accepted": accepted,
+                        "reason": reason.value,
+                        "canonical_rank": canonical_rank,
+                        "accepted_into_pool": True,
+                        "selected_for_batch": selected,
+                        "rewarded": selected,
+                        "auction_status": row.get("status"),
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "auction final verdict publication failed window=%d prompt=%d",
+                    batcher.window_start,
+                    pending.prompt_idx,
+                )
+
+        batcher._auction_final_verdicts_published = True
+
     async def _train_and_publish(self) -> None:
         """TRAINING + PUBLISHING + READY phases."""
         if not self._active_batchers:
@@ -1300,10 +1496,9 @@ class ValidationService:
             return
 
         self._set_state(WindowState.TRAINING)
-        # v2.3: seal_batch orders by the per-submission drand_round attached
-        # by miners (see design A'). The validator does no post-close drand
-        # fetch — all timing info is already attached to the submissions.
-        # Seal all batchers and collect results.
+        # Seal every environment after its collection deadline. Auction mode
+        # ranks the frozen pending population, proves candidates top-down, and
+        # selects at most B_BATCH winners independently for Math and Code.
         per_env_targets = dict(self.env_mix)
         # Split the window's emission budget (1.0) equally across the active
         # envs so the merged ``combined_rewards`` stays <= 1.0 and the weight
@@ -1316,12 +1511,31 @@ class ValidationService:
         # count, as GRAD_ACCUM_STEPS already does) so every validator uses the
         # same pool and an env a validator does not run burns its share.
         pool_per_env = 1.0 / len(self.env_mix)
-        sealed: dict[str, tuple] = {
-            name: b.seal_batch(pool=pool_per_env)
-            for name, b in self._active_batchers.items()
-        }
+        # Fetch a fresh drand beacon now — AFTER the collection deadline — to key
+        # each batcher's forensic sample and equal-score operator tie-break. Its
+        # randomness did not exist when miners submitted, so neither surface can be
+        # ground in advance. If the fetch fails, the window randomness is the
+        # deterministic ranking fallback and the forensic sample is disabled.
+        seal_randomness = await self._fetch_seal_randomness()
+        for b in self._active_batchers.values():
+            b.seal_randomness = seal_randomness
+        # seal_batch now runs the GRAIL GPU proofs (``_prove_ranked``, up to ~8
+        # forward passes at 5-25s each), so offload each batcher to a thread to
+        # keep the event loop responsive (/state, /health, submit, archive).
+        # Awaited sequentially in dict order so the deterministic fold into
+        # combined rewards / window_batches / archives is byte-for-byte unchanged.
+        sealed: dict[str, tuple] = {}
+        for name, b in self._active_batchers.items():
+            sealed[name] = await asyncio.to_thread(b.seal_batch, pool=pool_per_env)
         for name, (batch, rewards) in sealed.items():
             self._active_batchers[name].rewards_by_hotkey = rewards
+
+        # Worker acceptance means "admitted to the auction pool". Publish a
+        # second, final /verdicts record after seal so miners can distinguish a
+        # selected/rewarded candidate, an honest non-winner, and a deferred-proof
+        # failure. This is observability only and cannot change selection.
+        for batcher in self._active_batchers.values():
+            self._record_auction_final_verdicts(batcher)
 
         # Emit per-submission lifecycle telemetry for every env's accepted
         # pool. Carried over from PR #40 (validator observability) and
@@ -1371,12 +1585,6 @@ class ValidationService:
                         "validator_submit_lifecycle",
                         {"stage": "reward_assigned", **base_fields},
                     )
-
-        # Merge rewards across envs for unified weight scoring.
-        all_rewards: dict[str, float] = {}
-        for _batch, rewards in sealed.values():
-            for hk, r in rewards.items():
-                all_rewards[hk] = all_rewards.get(hk, 0.0) + r
 
         window_batches = {
             name: sealed[name][0] for name, _ in self.env_mix if name in sealed
@@ -1800,17 +2008,41 @@ class ValidationService:
                 "difficulty_auction_reward_count": difficulty_meta.get(
                     "reward_count"
                 ),
-                "difficulty_auction_eligible": difficulty_meta.get("eligible"),
+                "difficulty_auction_mode": (
+                    "production"
+                    if getattr(batcher, "difficulty_auction_enabled", False)
+                    else "observation_only"
+                ),
+                "difficulty_auction_eligible": difficulty_meta.get(
+                    "eligible",
+                    True if "status" in difficulty_meta else None,
+                ),
                 "difficulty_auction_rank": difficulty_meta.get("rank"),
                 "difficulty_auction_selected": difficulty_meta.get(
-                    "shadow_selected"
+                    "selected", difficulty_meta.get("shadow_selected")
+                ),
+                "difficulty_auction_status": difficulty_meta.get("status"),
+                "difficulty_auction_proof_attempted": difficulty_meta.get(
+                    "proof_attempted"
+                ),
+                "difficulty_auction_proof_passed": difficulty_meta.get(
+                    "proof_passed"
+                ),
+                "difficulty_auction_forensic_sampled": difficulty_meta.get(
+                    "forensic_sampled", False
+                ),
+                "difficulty_auction_forensic_passed": difficulty_meta.get(
+                    "forensic_passed"
+                ),
+                "difficulty_auction_rank_entropy_source": difficulty_meta.get(
+                    "rank_entropy_source"
                 ),
                 "difficulty_auction_operator_id": difficulty_meta.get(
                     "operator_id"
                 ),
             }
 
-        def _difficulty_shadow_payload(batcher):
+        def _difficulty_auction_payload(batcher):
             payload = getattr(batcher, "difficulty_auction_shadow", None)
             if isinstance(payload, dict):
                 return payload
@@ -1856,6 +2088,8 @@ class ValidationService:
         combined_reject_counts: dict[str, int] = {}
         combined_rewarded_not_selected: dict[str, float] = {}
         logical_group_dedup: dict[str, dict[str, int]] = {}
+        grader_failures: dict[str, int] = {}
+        grader_failures_by_environment: dict[str, dict[str, int]] = {}
 
         for env_name, batcher in batcher_dict.items():
             env_obj = self.envs.get(env_name, self.env)
@@ -2013,6 +2247,15 @@ class ValidationService:
                     else 0
                 ),
             }
+            env_grader_failures = {
+                str(reason): int(count)
+                for reason, count in dict(
+                    getattr(batcher, "grader_failures", {})
+                ).items()
+            }
+            grader_failures_by_environment[env_name] = env_grader_failures
+            for reason, count in env_grader_failures.items():
+                grader_failures[reason] = grader_failures.get(reason, 0) + count
 
         server_reject_summary = {
             str(reason): int(count)
@@ -2032,6 +2275,10 @@ class ValidationService:
         env_names_list = list(batcher_dict.keys())
         # Backward-compat: keep "environment" (singular) pointing to the first
         # env so older readers that pre-date multi-env don't silently break.
+        difficulty_auction_payload = {
+            env_name: _difficulty_auction_payload(env_batcher)
+            for env_name, env_batcher in batcher_dict.items()
+        }
         archive = {
             "window_start": first_batcher.window_start,
             "validator_hotkey": self.wallet.hotkey.ss58_address,  # provenance
@@ -2048,11 +2295,14 @@ class ValidationService:
             "reject_summary": combined_reject_counts,
             "server_reject_summary": server_reject_summary,
             "logical_group_dedup": logical_group_dedup,
-            "difficulty_auction_shadow": {
-                env_name: _difficulty_shadow_payload(env_batcher)
-                for env_name, env_batcher in batcher_dict.items()
-            },
-            "grader_failures": dict(getattr(self, "_grader_failures", {})),
+            # Canonical production name plus the historical alias consumed by
+            # existing dashboards and replay scripts.
+            "difficulty_auction": difficulty_auction_payload,
+            "difficulty_auction_shadow": difficulty_auction_payload,
+            "grader_failures": grader_failures,
+            "grader_failures_by_environment": (
+                grader_failures_by_environment
+            ),
             "rejected": rejected_entries,
             "training_quarantine": getattr(
                 batcher,
@@ -2124,6 +2374,7 @@ class ValidationService:
                 "bootstrap_sigma_min": BOOTSTRAP_SIGMA_MIN,
                 "min_eos_probability": MIN_EOS_PROBABILITY,
                 "forced_seed_enforce": FORCED_SEED_ENFORCE,
+                "forced_seed_protocol_version": FORCED_SEED_PROTOCOL_VERSION,
                 "forced_seed_consistency_floor": (
                     FORCED_SEED_CONSISTENCY_FLOOR
                 ),
@@ -2133,6 +2384,25 @@ class ValidationService:
                     FORCED_SEED_CDF_BOUNDARY_EPSILON
                 ),
                 "legacy_merkle_root_enforce": LEGACY_MERKLE_ROOT_ENFORCE,
+                "difficulty_auction_enforce": DIFFICULTY_AUCTION_ENFORCE,
+                "difficulty_auction_environments": list(
+                    DIFFICULTY_AUCTION_ENVIRONMENTS
+                ),
+                "difficulty_auction_collection_seconds": (
+                    WINDOW_COLLECTION_SECONDS
+                ),
+                "difficulty_auction_max_slots_per_operator": (
+                    MAX_AUCTION_SLOTS_PER_OPERATOR
+                ),
+                "difficulty_auction_proof_attempt_limit": (
+                    MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+                ),
+                "difficulty_auction_proof_wall_limit_seconds": (
+                    MAX_PROOF_WALL_SECONDS
+                ),
+                "difficulty_auction_operator_proof_failure_cap": (
+                    MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW
+                ),
                 "difficulty_auction_shadow_enabled": (
                     DIFFICULTY_AUCTION_SHADOW_ENABLED
                 ),
@@ -2643,3 +2913,27 @@ class ValidationService:
         # disable drand keep working without a live drand fetch.
         block_hash = await chain.get_block_hash(subtensor, target_window)
         return chain.compute_window_randomness(block_hash), None
+
+    async def _fetch_seal_randomness(self) -> str:
+        """Fetch the drand beacon current at seal (post-deadline) to key the
+        forensic sample. Telemetry only, so any failure returns "" (no sample)
+        rather than blocking the seal. Off-loop: the HTTP fetch must not stall
+        the event loop while the window seals.
+        """
+        if not self.use_drand:
+            return ""
+        try:
+            import time
+            from reliquary.infrastructure.drand import get_beacon, get_current_chain
+
+            chain_info = await asyncio.to_thread(get_current_chain)
+            drand_round = chain.compute_current_drand_round(
+                time.time(), chain_info["genesis_time"], chain_info["period"],
+            )
+            beacon = await asyncio.to_thread(
+                get_beacon, round_id=str(drand_round), use_drand=True,
+            )
+            return str(beacon["randomness"])
+        except Exception:
+            logger.warning("seal-randomness fetch failed; forensic sample skipped")
+            return ""

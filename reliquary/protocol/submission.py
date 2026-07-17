@@ -32,9 +32,10 @@ class RejectReason(str, Enum):
     """Canonical reject codes emitted by the v2 validator.
 
     Two values are success sentinels rather than rejects:
-      - ``ACCEPTED``: validation pipeline ran to completion and the
-        submission is in ``_valid`` (only used on the inline sync path,
-        e.g. TestClient).
+      - ``ACCEPTED``: the validator accepted the submission at its current
+        lifecycle stage. In auction mode the first ACCEPTED verdict means the
+        candidate entered the pending pool; the seal-time verdict carries
+        ``selected_for_batch`` and ``rewarded`` to report the final outcome.
       - ``SUBMITTED``: the request was placed on the worker queue and
         will be validated asynchronously. The miner does NOT yet know
         whether GRAIL will pass — the real verdict surfaces in the
@@ -235,9 +236,11 @@ class BatchSubmissionRequest(BaseModel):
     # Validator-only marker. It is absent from JSON and the public schema, so
     # adding it does not change the miner wire contract.
     _legacy_merkle_verified: bool = PrivateAttr(default=False)
-    _logical_group_reservation: tuple[str, bytes] | None = PrivateAttr(
-        default=None
-    )
+    _logical_group_reservation: tuple[
+        str, str, int | bytes
+    ] | None = PrivateAttr(default=None)
+    _payload_bytes: int = PrivateAttr(default=0)
+    _retain_payload: bool = PrivateAttr(default=False)
 
     @field_validator("rollouts")
     @classmethod
@@ -289,16 +292,15 @@ class GrpoBatchState(BaseModel):
 
 
 class Verdict(BaseModel):
-    """A single recorded verdict for a submission the validator has either
-    accepted or rejected after running the full verification pipeline.
+    """One lifecycle verdict for a submission.
 
     Surfaced via the validator's ``GET /verdicts/{hotkey}`` endpoint so that
-    miners can learn the REAL outcome of each submission within seconds of
-    it being decided, instead of having to wait minutes for the R2 archive
-    upload. The /submit response (``BatchSubmissionResponse``) carries only
-    the provisional ``SUBMITTED`` sentinel under the production worker path
-    — the actual verdict (``ACCEPTED`` / ``GRAIL_FAIL`` / ``WRONG_RANDOMNESS``
-    / etc.) lands here once the worker drains the submission.
+    miners can follow a submission without waiting for the R2 archive. The
+    /submit response carries only ``SUBMITTED`` under the production worker
+    path. Auction candidates then receive an admission verdict and, at seal,
+    a second verdict whose non-null ``selected_for_batch`` and ``rewarded``
+    fields report the final result. Deferred-proof failures are reported by
+    that final record.
     """
 
     model_config = ConfigDict(extra="forbid")

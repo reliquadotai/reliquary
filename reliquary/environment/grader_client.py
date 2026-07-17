@@ -1,9 +1,9 @@
 """Unix-socket IPC client for the grader server.
 
-Used by OpenCodeInstructEnvironment.compute_reward to dispatch
-structured case evaluation requests. Frames JSON-lines over SOCK_STREAM.
-Retries once on transient connection failures, then returns 0.0 — the
-Environment Protocol forbids raising from compute_reward.
+Used by OpenCodeInstructEnvironment.compute_reward to dispatch structured case
+evaluation requests. Frames JSON-lines over SOCK_STREAM. Candidate-caused
+failures score zero; infrastructure failures raise ``GraderInfrastructureError``
+so the auction cannot mistake a flaky grader for a hard negative.
 """
 
 from __future__ import annotations
@@ -27,6 +27,23 @@ logger = logging.getLogger(__name__)
 _SOCKET_TIMEOUT_HEADROOM_S = 5.0
 
 
+class GraderInfrastructureError(RuntimeError):
+    """The trusted grading service failed before producing a valid score."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = str(reason)
+        super().__init__(f"code grader infrastructure failure: {self.reason}")
+
+
+_CANDIDATE_FAILURE_STATUSES = frozenset({
+    "bad_output",
+    "forbidden_import",
+    "runtime_error",
+    "tampered",
+    "timeout",
+})
+
+
 class GraderClient:
     """Thin JSON-over-Unix-socket client.
 
@@ -41,9 +58,9 @@ class GraderClient:
     def evaluate_cases(self, code: str, cases: list[dict[str, Any]], timeout_s: float) -> float:
         """Send (code, structured cases) and return passed/total in [0, 1].
 
-        Returns 0.0 if the grader is unreachable, the response is
-        malformed, the worker timed out, the worker crashed, or
-        total is zero. Never raises.
+        Candidate-caused failures return ``0.0``. Trusted-service failures
+        raise :class:`GraderInfrastructureError`; callers must not turn those
+        into negative training labels.
         """
         if not isinstance(cases, list) or not cases:
             return 0.0
@@ -66,17 +83,22 @@ class GraderClient:
                     time.sleep(0.1)
                     continue
                 logger.warning("grader_client: unreachable after retry: %s", e)
-                return 0.0
+                raise GraderInfrastructureError("unreachable") from e
 
-        if response.get("status") != "ok":
+        status = response.get("status")
+        if status in _CANDIDATE_FAILURE_STATUSES:
             return 0.0
+        if status != "ok":
+            raise GraderInfrastructureError(
+                str(status) if status else "malformed_response"
+            )
         try:
             passed = int(response["passed"])
             total = int(response["total"])
-        except (KeyError, TypeError, ValueError):
-            return 0.0
-        if total <= 0:
-            return 0.0
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GraderInfrastructureError("malformed_response") from exc
+        if total <= 0 or passed < 0 or passed > total:
+            raise GraderInfrastructureError("invalid_score")
         return passed / total
 
     def _round_trip(self, req: dict) -> dict:

@@ -122,6 +122,7 @@ def test_two_windows_with_cooldown():
             merkle_root=_merkle(i),
             rollouts=_rollouts(k=4),
             checkpoint_hash="sha256:test",
+            protocol_version=2,
         )
         resp = b0.accept_submission(req)
         assert resp.accepted, f"unexpected reject for hk{i}: {resp.reason}"
@@ -143,6 +144,7 @@ def test_two_windows_with_cooldown():
             merkle_root=_merkle(100 + prompt_idx),
             rollouts=_rollouts(k=4),
             checkpoint_hash="sha256:test",
+            protocol_version=2,
         )
         resp = b1.accept_submission(req)
         assert resp.accepted is False
@@ -158,6 +160,7 @@ def test_two_windows_with_cooldown():
         merkle_root=_merkle(500),
         rollouts=_rollouts(k=4),
         checkpoint_hash="sha256:test",
+        protocol_version=2,
     )
     resp = b4.accept_submission(req)
     assert resp.accepted is True, f"expected eligibility after cooldown, got {resp.reason}"
@@ -220,6 +223,7 @@ def test_out_of_zone_rejected_end_to_end():
         merkle_root=_merkle(42),
         rollouts=_rollouts(k=0),  # all losses
         checkpoint_hash="sha256:test",
+        protocol_version=2,
     )
     resp = b.accept_submission(req)
     assert resp.accepted is False

@@ -57,11 +57,18 @@ def _lp(b: bytes) -> bytes:
     return len(b).to_bytes(2, "big") + b
 
 
-def u_at(randomness: str, hotkey: str, prompt_idx: int, checkpoint_hash: str,
+def u_at(randomness: str, prompt_idx: int, checkpoint_hash: str,
          rollout_index: int, t: int) -> float:
-    """Public uniform in [0, 1) for rollout `rollout_index`, completion position `t`."""
+    """Public uniform in [0, 1) for rollout `rollout_index`, completion position `t`.
+
+    v2: the hotkey is deliberately NOT hashed. The forced group for a prompt is
+    therefore identical for every miner in the window, so one operator's N hotkeys
+    yield N copies of the same draw — variance farming (best-of-N distinct draws)
+    is impossible. Anti-pregeneration still holds: `randomness` is unknown until
+    the window opens. Keyed on the v2 domain so v1 and v2 streams never collide.
+    """
     msg = (FORCED_SEED_DOMAIN.encode()
-           + _lp(randomness.encode()) + _lp(hotkey.encode())
+           + _lp(randomness.encode())
            + int(prompt_idx).to_bytes(8, "big")
            + _lp(checkpoint_hash.encode())
            + int(rollout_index).to_bytes(4, "big")

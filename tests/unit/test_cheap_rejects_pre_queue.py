@@ -3,9 +3,8 @@
 Every reject reason that depends only on O(1) batcher state must be
 returned synchronously by the HTTP handler, BEFORE the request hits the
 async worker queue. Without this, a STALE_ROUND or WRONG_CHECKPOINT
-submission has to wait in line behind ~5–25 s GRAIL forward passes of
-honest submissions ahead of it in the queue — minutes of latency on what
-should be a microsecond rejection.
+submission would otherwise wait behind reward grading and admission work that
+cannot change the outcome.
 
 These tests pin the contract: each reject reason returns synchronously
 on /submit, and the submit_queue is NOT populated (the worker never sees
@@ -17,6 +16,7 @@ from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 from fastapi.testclient import TestClient
 
 from reliquary.constants import MAX_SUBMISSIONS_PER_PROMPT
@@ -52,6 +52,7 @@ def _submission(prompt_idx: int = 42, checkpoint_hash: str = "sha256:current",
         "rollouts": [{"tokens": list(range(36)), "reward": 1.0, "commit": commit, "env_name": "openmathinstruct"}] * 8,
         "checkpoint_hash": checkpoint_hash,
         "drand_round": drand_round,
+        "protocol_version": 2,
     }
 
 
@@ -100,6 +101,7 @@ def _setup(*,
     batcher.env = MagicMock()
     batcher.env.__len__.return_value = env_len
     batcher.is_sealed.return_value = False
+    batcher.difficulty_auction_enabled = False
     # MagicMock attribute access auto-creates truthy mocks; pin the seal
     # extension's trigger round attribute to None so the BATCH_FILLED
     # gate at the cheap-reject layer doesn't fire for tests that don't
@@ -607,6 +609,32 @@ def test_claimed_out_of_zone_rejected_before_proof_admission():
     assert batcher.proof_admission_count == 0
     verdicts = list(s._verdicts.get("hkA", []))
     assert verdicts[-1]["reject_stage"] == "zone"
+
+
+@pytest.mark.parametrize(
+    "rewards",
+    ([1.0] + [0.0] * 7, [1.0] * 7 + [0.0]),
+    ids=("k1", "k7"),
+)
+def test_auction_frontier_groups_fail_calibrated_http_preflight(rewards):
+    """The HTTP path keeps the same k=2..6 eligibility as admission."""
+    s = ValidatorServer()
+    s.set_current_state(WindowState.OPEN)
+    batcher = _PreflightAdmissionBatcher(eos_token_id=99)
+    s.set_active_batcher(batcher)
+    payload = _submission_with_completion_tokens(
+        list(range(4, 35)) + [99],
+        rewards=rewards,
+    )
+
+    with TestClient(s.app) as client:
+        response = client.post("/submit", json=payload)
+
+    assert response.json() == {
+        "accepted": False,
+        "reason": RejectReason.OUT_OF_ZONE.value,
+    }
+    assert batcher.proof_admission_count == 0
 
 
 def test_private_reward_env_skips_claimed_reward_zone_preflight():

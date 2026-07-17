@@ -103,6 +103,7 @@ def _submission(hotkey: str = "hkX", window_start: int = 500) -> dict:
         "merkle_root": "00" * 32,
         "rollouts": [{"tokens": list(range(36)), "reward": 1.0, "commit": commit, "env_name": "openmathinstruct"}] * 8,
         "checkpoint_hash": "sha256:test",
+        "protocol_version": 2,
     }
 
 
@@ -225,6 +226,7 @@ async def test_worker_drops_post_seal_items_without_grail():
     req = BatchSubmissionRequest(
         miner_hotkey="hkLate", prompt_idx=999, window_start=500,
         merkle_root="00" * 32, rollouts=rollouts, checkpoint_hash="sha256:test",
+        protocol_version=2,
     )
     # Manually flip the seal flag — the queued item is now post-seal.
     batcher._seal_flag.set()
@@ -282,6 +284,7 @@ async def test_worker_processes_normally_when_not_sealed():
     req = BatchSubmissionRequest(
         miner_hotkey="hkEarly", prompt_idx=1, window_start=500,
         merkle_root="00" * 32, rollouts=rollouts, checkpoint_hash="sha256:test",
+        protocol_version=2,
     )
     # Seal flag NOT set — worker must process normally.
     assert not batcher.is_sealed()
@@ -334,6 +337,7 @@ async def test_worker_seal_check_after_batcher_swap_check():
     req = BatchSubmissionRequest(
         miner_hotkey="hkX", prompt_idx=1, window_start=500,
         merkle_root="00" * 32, rollouts=rollouts, checkpoint_hash="sha256:test",
+        protocol_version=2,
     )
     await s._submit_queue.put((req, old_batcher))
 

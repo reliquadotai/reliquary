@@ -90,31 +90,88 @@ def test_evaluate_cases_returns_zero_when_status_not_ok(fake_grader_socket):
     assert client.evaluate_cases("", [_case()], 5.0) == 0.0
 
 
-def test_evaluate_cases_returns_zero_when_grader_unreachable(tmp_path):
-    from reliquary.environment.grader_client import GraderClient
+def test_evaluate_cases_raises_when_grader_unreachable(tmp_path):
+    from reliquary.environment.grader_client import (
+        GraderClient,
+        GraderInfrastructureError,
+    )
 
     client = GraderClient(socket_path=str(tmp_path / "nope.sock"))
-    assert client.evaluate_cases("def f(): pass", [_case()], 5.0) == 0.0
+    with pytest.raises(GraderInfrastructureError, match="unreachable"):
+        client.evaluate_cases("def f(): pass", [_case()], 5.0)
 
 
-def test_evaluate_cases_returns_zero_on_malformed_response(fake_grader_socket):
-    from reliquary.environment.grader_client import GraderClient
+def test_evaluate_cases_raises_on_malformed_response(fake_grader_socket):
+    from reliquary.environment.grader_client import (
+        GraderClient,
+        GraderInfrastructureError,
+    )
 
     sock_path, set_response, _ = fake_grader_socket
     set_response({"garbage": "no required fields"})
 
     client = GraderClient(socket_path=sock_path)
-    assert client.evaluate_cases("x = 1", [_case()], 5.0) == 0.0
+    with pytest.raises(GraderInfrastructureError, match="malformed_response"):
+        client.evaluate_cases("x = 1", [_case()], 5.0)
 
 
-def test_evaluate_cases_handles_zero_total_safely(fake_grader_socket):
-    from reliquary.environment.grader_client import GraderClient
+def test_evaluate_cases_raises_on_zero_total(fake_grader_socket):
+    from reliquary.environment.grader_client import (
+        GraderClient,
+        GraderInfrastructureError,
+    )
 
     sock_path, set_response, _ = fake_grader_socket
     set_response({"req_id": "ignored", "passed": 0, "total": 0, "status": "ok"})
 
     client = GraderClient(socket_path=sock_path)
-    assert client.evaluate_cases("x = 1", [_case()], 5.0) == 0.0
+    with pytest.raises(GraderInfrastructureError, match="invalid_score"):
+        client.evaluate_cases("x = 1", [_case()], 5.0)
+
+
+@pytest.mark.parametrize("status", ["crash", "grader_error", "unknown"])
+def test_evaluate_cases_raises_on_infrastructure_status(
+    fake_grader_socket, status,
+):
+    from reliquary.environment.grader_client import (
+        GraderClient,
+        GraderInfrastructureError,
+    )
+
+    sock_path, set_response, _ = fake_grader_socket
+    set_response({
+        "req_id": "ignored",
+        "passed": 0,
+        "total": 1,
+        "status": status,
+    })
+
+    with pytest.raises(GraderInfrastructureError, match=status):
+        GraderClient(socket_path=sock_path).evaluate_cases(
+            "x = 1", [_case()], 5.0
+        )
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["bad_output", "forbidden_import", "runtime_error", "tampered", "timeout"],
+)
+def test_evaluate_cases_scores_candidate_failures_zero(
+    fake_grader_socket, status,
+):
+    from reliquary.environment.grader_client import GraderClient
+
+    sock_path, set_response, _ = fake_grader_socket
+    set_response({
+        "req_id": "ignored",
+        "passed": 0,
+        "total": 1,
+        "status": status,
+    })
+
+    assert GraderClient(socket_path=sock_path).evaluate_cases(
+        "x = 1", [_case()], 5.0
+    ) == 0.0
 
 
 def test_evaluate_cases_returns_zero_for_empty_cases():

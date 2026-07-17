@@ -36,8 +36,10 @@ def compute_logical_group_hash(request: Any) -> bytes:
     token streams. It intentionally excludes miner-controlled wrappers such as
     nonce, Merkle root, claimed rewards, commitment metadata and signatures:
     changing those fields must not mint another claim on the same generation.
-    Window and hotkey scope are applied by ``GrpoWindowBatcher`` when reserving
-    the digest, so independent miners may still produce the same token group.
+    Reservation scope is applied by ``GrpoWindowBatcher``. Legacy selection
+    scopes this digest per hotkey. Difficulty-auction selection instead allows
+    one economic claim per operator and prompt, independent of token/wrapper
+    variation, so additional hotkeys cannot mint additional auction tickets.
     """
     h = hashlib.sha256()
     h.update(_LOGICAL_GROUP_DOMAIN)

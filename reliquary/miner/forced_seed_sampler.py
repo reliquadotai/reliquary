@@ -82,7 +82,7 @@ class ForcedSeedLogitsProcessor(LogitsProcessor):
         out = torch.full_like(scores, float("-inf"))
         for r in range(scores.shape[0]):
             t = self.base_offsets[r] + s
-            u = u_at(self.randomness, self.hotkey, self.prompt_idx,
+            u = u_at(self.randomness, self.prompt_idx,
                      self.checkpoint_hash, self.rollout_indices[r], t)
             probs = warp(scores[r], t=self.temperature,
                          top_k=self.top_k, top_p=self.top_p)
