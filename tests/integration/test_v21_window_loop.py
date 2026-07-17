@@ -11,7 +11,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from reliquary.constants import B_BATCH, CHALLENGE_K, M_ROLLOUTS
+from reliquary.constants import (
+    B_BATCH,
+    CHALLENGE_K,
+    FORCED_SEED_PROTOCOL_VERSION,
+    M_ROLLOUTS,
+)
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     RolloutSubmission,
@@ -100,6 +105,7 @@ def _request(*, hotkey, prompt_idx, window_start, checkpoint_hash, seed=0):
         merkle_root="00" * 32,
         rollouts=rollouts,
         checkpoint_hash=checkpoint_hash,
+        protocol_version=FORCED_SEED_PROTOCOL_VERSION,
     )
 
 
