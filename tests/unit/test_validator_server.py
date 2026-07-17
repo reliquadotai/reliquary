@@ -113,7 +113,12 @@ class _ModelStub:
         max_position_embeddings = 4096
 
 
-def _batcher(window_start=500, cooldown_map=None, env=None):
+def _batcher(
+    window_start=500,
+    cooldown_map=None,
+    env=None,
+    operator_by_hotkey=None,
+):
     batcher = GrpoWindowBatcher(
         window_start=window_start,
         env=env or FakeEnv(),
@@ -124,6 +129,7 @@ def _batcher(window_start=500, cooldown_map=None, env=None):
         completion_text_fn=lambda r: "CORRECT" if r.reward > 0.5 else "wrong",
         # Server tests post legacy requests without drand_round; disable the gate.
         drand_round_check_enabled=False,
+        operator_by_hotkey=operator_by_hotkey,
     )
     batcher.current_checkpoint_hash = "sha256:test"
     # Match the per-window randomness used by ``_make_commit`` so the
@@ -386,6 +392,31 @@ def test_logical_group_digest_runs_off_event_loop(monkeypatch):
 
     assert response.json()["accepted"] is True
     assert offloaded == [GrpoWindowBatcher.try_reserve_logical_group]
+
+
+def test_auction_missing_operator_mapping_rejects_prequeue_quota_neutral():
+    from reliquary.protocol.submission import WindowState
+
+    server = ValidatorServer()
+    batcher = _batcher(
+        window_start=500,
+        operator_by_hotkey={"some-other-hotkey": "operator-a"},
+    )
+    batcher.difficulty_auction_enabled = True
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+
+    response = TestClient(server.app).post(
+        "/submit", json=_request().model_dump(mode="json")
+    )
+
+    assert response.json() == {
+        "accepted": False,
+        "reason": RejectReason.REGISTRATION_UNAVAILABLE.value,
+    }
+    assert server._per_window_counts == {}
+    assert batcher.proof_grading_attempts == 0
+    assert batcher.logical_group_reservation_count == 0
 
 
 @pytest.mark.parametrize("fail_at", ["length", "row"])

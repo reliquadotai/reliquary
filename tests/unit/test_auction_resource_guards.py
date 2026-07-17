@@ -201,19 +201,49 @@ def test_operator_cap_is_enforced_for_math_and_code(env_name, env_factory):
 
 def test_missing_production_operator_mapping_fails_closed():
     batcher = _batcher(operator_by_hotkey={"mapped": "operator-a"})
-    assert batcher.accept_submission(
+    unmapped = batcher.accept_submission(
         _request(prompt_idx=1, hotkey="unmapped")
-    ).accepted
+    )
     assert batcher.accept_submission(
         _request(prompt_idx=2, hotkey="mapped")
     ).accepted
 
+    assert unmapped.accepted is False
+    assert unmapped.reason.value == "registration_unavailable"
     batcher.seal_batch()
 
     assert [winner.hotkey for winner in batcher.valid_submissions()] == ["mapped"]
-    assert batcher.auction_operator_unmapped_skips == 1
-    rows = {row["hotkey"]: row for row in batcher.auction_candidates}
-    assert rows["unmapped"]["status"] == "operator_unmapped"
+    assert batcher.auction_operator_unmapped_skips == 0
+    assert {row["hotkey"] for row in batcher.auction_candidates} == {"mapped"}
+
+
+def test_operator_tiebreak_does_not_change_when_hotkey_changes():
+    def seal_with(operator_a_hotkey):
+        mapping = {
+            operator_a_hotkey: "operator-a",
+            "operator-b-hotkey": "operator-b",
+        }
+        batcher = _batcher(operator_by_hotkey=mapping)
+        batcher.seal_randomness = "future-drand-beacon"
+        for hotkey in mapping:
+            assert batcher.accept_submission(
+                _request(prompt_idx=7, hotkey=hotkey)
+            ).accepted
+        batcher.seal_batch()
+        winner = batcher.valid_submissions()[0]
+        rows = {mapping[row["hotkey"]]: row for row in batcher.auction_candidates}
+        return mapping[winner.hotkey], rows
+
+    first_winner, first_rows = seal_with("operator-a-hotkey-1")
+    second_winner, second_rows = seal_with("operator-a-hotkey-999")
+
+    assert first_winner == second_winner
+    assert first_rows["operator-a"]["operator_tiebreak"] == (
+        second_rows["operator-a"]["operator_tiebreak"]
+    )
+    assert {
+        row["rank_entropy_source"] for row in first_rows.values()
+    } == {"seal_drand"}
 
 
 def test_failed_proof_does_not_consume_an_operator_slot(monkeypatch):

@@ -183,8 +183,8 @@ def _make_batcher(**overrides) -> GrpoWindowBatcher:
 def _prove_one(b: GrpoWindowBatcher, req) -> "ValidSubmission | None":
     """Run one request through its environment's configured proof path.
 
-    Math defers proof to seal; Code retains immediate proof at admission.
-    Returns None when either path rejects the submission.
+    Auction-enabled Math and Code both defer proof to seal. Returns None when
+    the configured path rejects the submission.
     """
     response = b.accept_submission(req)
     if not response.accepted:
@@ -991,8 +991,14 @@ def test_failed_submission_does_not_consume_bucket_slot():
     batch, rewards = b.seal_batch()
     # The squatter failed its proof; the honest miner behind it wins the slot.
     assert b.reject_counts.get(RejectReason.GRAIL_FAIL.value) == 1
-    assert [s.hotkey for s in batch] == ["B"]
-    assert set(rewards) == {"B"}
+    failed_hotkey = next(
+        row["hotkey"]
+        for row in b.auction_candidates
+        if row["status"] == "proof_failed"
+    )
+    assert len(batch) == 1
+    assert batch[0].hotkey in {"A", "B"} - {failed_hotkey}
+    assert set(rewards) == {batch[0].hotkey}
 
 
 # ---------------------------------------------------------------------------
@@ -1756,6 +1762,52 @@ def test_logical_group_identity_is_scoped_per_hotkey():
 
     assert b.accept_submission(_request(hotkey="hk-a")).accepted is True
     assert b.accept_submission(_request(hotkey="hk-b")).accepted is True
+    assert b.logical_group_reservation_count == 2
+
+
+def test_auction_logical_claim_is_scoped_per_operator_and_prompt():
+    b = _make_batcher(
+        operator_by_hotkey={
+            "hk-a": "operator-a",
+            "hk-a-sybil": "operator-a",
+        }
+    )
+    first = _request(prompt_idx=7, hotkey="hk-a")
+    second = _request(prompt_idx=7, hotkey="hk-a-sybil")
+    # A different token group must not mint a second ticket for the same
+    # economic identity and prompt.
+    for rollout in second.rollouts:
+        changed = list(rollout.tokens)
+        changed[-1] += 100
+        rollout.tokens = changed
+        rollout.commit["tokens"] = changed
+
+    assert b.accept_submission(first).accepted is True
+    duplicate = b.accept_submission(second)
+
+    assert duplicate.accepted is False
+    assert duplicate.reason == RejectReason.HASH_DUPLICATE
+    assert b.logical_group_reservation_count == 1
+    assert b.logical_group_duplicate_rejects == 1
+    assert b.accept_submission(
+        _request(prompt_idx=8, hotkey="hk-a-sybil")
+    ).accepted is True
+
+
+def test_auction_same_prompt_remains_open_to_distinct_operators():
+    b = _make_batcher(
+        operator_by_hotkey={
+            "hk-a": "operator-a",
+            "hk-b": "operator-b",
+        }
+    )
+
+    assert b.accept_submission(
+        _request(prompt_idx=7, hotkey="hk-a")
+    ).accepted is True
+    assert b.accept_submission(
+        _request(prompt_idx=7, hotkey="hk-b")
+    ).accepted is True
     assert b.logical_group_reservation_count == 2
 
 

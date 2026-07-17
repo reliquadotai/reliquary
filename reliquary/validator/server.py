@@ -2244,9 +2244,18 @@ class ValidatorServer:
                         )
                     if not logical_reserved:
                         _refund_current_quota()
+                        reject_reason = (
+                            RejectReason.REGISTRATION_UNAVAILABLE
+                            if logical_reason == "operator_unmapped"
+                            else RejectReason.HASH_DUPLICATE
+                        )
                         return _cheap_reject(
-                            RejectReason.HASH_DUPLICATE,
-                            reject_stage="logical_dedup",
+                            reject_reason,
+                            reject_stage=(
+                                "operator_mapping"
+                                if logical_reason == "operator_unmapped"
+                                else "logical_dedup"
+                            ),
                             logical_group_reason=logical_reason,
                             quota_refunded=True,
                         )

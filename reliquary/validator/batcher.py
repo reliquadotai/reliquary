@@ -82,7 +82,6 @@ from reliquary.validator.dedup import (
 )
 from reliquary.validator.difficulty_auction import (
     ShadowSubmission,
-    _rank_key,
     difficulty_score,
     select_shadow_auction,
 )
@@ -551,7 +550,7 @@ class GrpoWindowBatcher:
         # a group before it enters the potentially long GPU queue.
         self._logical_group_lock = threading.Lock()
         self._logical_group_reservations: dict[
-            tuple[str, bytes], BatchSubmissionRequest
+            tuple[str, str, int | bytes], BatchSubmissionRequest
         ] = {}
         self._logical_group_duplicate_rejects = 0
         self._valid: list[ValidSubmission] = []
@@ -945,9 +944,29 @@ class GrpoWindowBatcher:
         self,
         request: BatchSubmissionRequest,
     ) -> tuple[bool, str | None]:
-        """Atomically reserve one hotkey's logical group for this window."""
-        digest = compute_logical_group_hash(request)
-        key = (request.miner_hotkey, digest)
+        """Atomically reserve one economic claim for this window.
+
+        In auction mode the claim is scoped to ``(operator, prompt)``. The
+        forced-seed stream is hotkey-free, so allowing several hotkeys owned by
+        one operator to reserve the same prompt would turn identical draws into
+        extra tie-break tickets. Binding the reservation to chain ownership also
+        covers small, tolerated runtime divergences that produce different token
+        hashes. Legacy mode keeps its narrower per-hotkey logical-content scope.
+        """
+        if self.difficulty_auction_enabled:
+            operator = self._operator_by_hotkey.get(request.miner_hotkey)
+            if operator is None:
+                if self._operator_mapping_enforced:
+                    return False, "operator_unmapped"
+                operator = request.miner_hotkey
+            key: tuple[str, str, int | bytes] = (
+                "auction_operator_prompt",
+                operator,
+                int(request.prompt_idx),
+            )
+        else:
+            digest = compute_logical_group_hash(request)
+            key = ("logical_group", request.miner_hotkey, digest)
         with self._logical_group_lock:
             owner = self._logical_group_reservations.get(key)
             if owner is request and request._logical_group_reservation == key:
@@ -1514,10 +1533,17 @@ class GrpoWindowBatcher:
                 rollout_hashes.append(h)
 
         try:
-            logical_reserved, _ = self.try_reserve_logical_group(request)
+            logical_reserved, logical_reason = self.try_reserve_logical_group(
+                request
+            )
         except (TypeError, ValueError, OverflowError):
             return reject(RejectReason.BAD_TOKENS, "logical_dedup")
         if not logical_reserved:
+            if logical_reason == "operator_unmapped":
+                return reject(
+                    RejectReason.REGISTRATION_UNAVAILABLE,
+                    "operator_mapping",
+                )
             return reject(RejectReason.HASH_DUPLICATE, "logical_dedup")
         self.confirm_logical_group_reservation(request)
 
@@ -2716,9 +2742,12 @@ class GrpoWindowBatcher:
         """Prove candidates in difficulty-score order until ``B_BATCH`` distinct
         prompts pass. Never prove a loser.
 
-        Ranking is by the difficulty-auction key (``-value``, drand_round asc,
-        canonical within-slot hash) — a pure function of the pending set, never
-        wall-clock or dict/set iteration order, so validators converge.
+        Ranking is by ``-value``, drand round ascending, then an
+        operator-bound hash. The hash deliberately excludes hotkey and miner
+        payload fields: one operator cannot improve an equal-score tie by
+        registering more hotkeys or grinding harmless metadata. A post-deadline
+        drand beacon salts the tie when available; window randomness is the
+        deterministic liveness fallback.
 
         Same-prompt resolution happens HERE (spec §2.2): the first submission for
         a prompt that PASSES the proof claims the slot; later submissions for a
@@ -2739,12 +2768,42 @@ class GrpoWindowBatcher:
         """
         with self._lock:
             pending = list(self._pending)
+        scored = [
+            (p, difficulty_score(p.rewards, delta=DIFFICULTY_AUCTION_DELTA))
+            for p in pending
+        ]
+        operator_by_id: dict[int, str | None] = {}
+        tiebreak_by_id: dict[int, bytes] = {}
+        rank_salt = self.seal_randomness or self.randomness
+        rank_entropy_source = (
+            "seal_drand" if self.seal_randomness else "window_randomness_fallback"
+        )
+        for pending_submission, _score in scored:
+            operator = self._operator_by_hotkey.get(pending_submission.hotkey)
+            if operator is None and not self._operator_mapping_enforced:
+                operator = pending_submission.hotkey
+            operator_by_id[id(pending_submission)] = operator
+            h = hashlib.sha256()
+            h.update(b"reliquary/auction-operator-tiebreak/v1\x00")
+            salt_bytes = rank_salt.encode("utf-8")
+            h.update(len(salt_bytes).to_bytes(4, "big"))
+            h.update(salt_bytes)
+            operator_bytes = (operator or "").encode("utf-8")
+            h.update(len(operator_bytes).to_bytes(4, "big"))
+            h.update(operator_bytes)
+            h.update(
+                int(pending_submission.prompt_idx).to_bytes(
+                    8, "big", signed=False
+                )
+            )
+            tiebreak_by_id[id(pending_submission)] = h.digest()
         ranked = sorted(
-            (
-                (p, difficulty_score(p.rewards, delta=DIFFICULTY_AUCTION_DELTA))
-                for p in pending
+            scored,
+            key=lambda item: (
+                -item[1].value,
+                int(item[0].drand_round),
+                tiebreak_by_id[id(item[0])],
             ),
-            key=_rank_key,
         )
 
         attempts = 0
@@ -2758,9 +2817,7 @@ class GrpoWindowBatcher:
         self.difficulty_auction_metadata_by_id = {}
         candidate_rows: list[dict[str, Any]] = []
         for rank, (pending_submission, score) in enumerate(ranked, start=1):
-            operator = self._operator_by_hotkey.get(pending_submission.hotkey)
-            if operator is None and not self._operator_mapping_enforced:
-                operator = pending_submission.hotkey
+            operator = operator_by_id[id(pending_submission)]
             row = {
                 "hotkey": pending_submission.hotkey,
                 "prompt_idx": pending_submission.prompt_idx,
@@ -2771,6 +2828,10 @@ class GrpoWindowBatcher:
                 "reward_std": score.reward_std,
                 "reward_count": score.reward_count,
                 "operator_id": operator,
+                "operator_tiebreak": tiebreak_by_id[
+                    id(pending_submission)
+                ].hex(),
+                "rank_entropy_source": rank_entropy_source,
                 "rank": rank,
                 "proof_attempted": False,
                 "proof_passed": None,

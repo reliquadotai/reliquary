@@ -235,9 +235,9 @@ class BatchSubmissionRequest(BaseModel):
     # Validator-only marker. It is absent from JSON and the public schema, so
     # adding it does not change the miner wire contract.
     _legacy_merkle_verified: bool = PrivateAttr(default=False)
-    _logical_group_reservation: tuple[str, bytes] | None = PrivateAttr(
-        default=None
-    )
+    _logical_group_reservation: tuple[
+        str, str, int | bytes
+    ] | None = PrivateAttr(default=None)
     _payload_bytes: int = PrivateAttr(default=0)
     _retain_payload: bool = PrivateAttr(default=False)
 
