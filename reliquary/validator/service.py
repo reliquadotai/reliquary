@@ -60,6 +60,7 @@ from reliquary.constants import (
     PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD,
     PROOF_ADMISSION_STALL_POLL_SECONDS,
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
+    REGISTERED_HOTKEY_REFRESH_MIN_INTERVAL_SECONDS,
     REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS,
     RECOMPUTE_PI_OLD_FROM_VERIFY,
     SHAPE_LEN_FRAC,
@@ -491,6 +492,10 @@ class ValidationService:
         # asyncio.Task wrapping _verify_beacon_async; held so the GC
         # doesn't collect a live task between OPEN and TRAINING.
         self._verify_task: asyncio.Task | None = None
+        # Serializes proactive refreshes with the on-demand refresh invoked by
+        # the HTTP registration gate after a cache miss.
+        self._registration_refresh_lock = asyncio.Lock()
+        self._registration_refresh_task: asyncio.Task | None = None
         self._current_window_state: WindowState = WindowState.READY
 
         self._resume_from = resume_from
@@ -879,13 +884,73 @@ class ValidationService:
         self._publish_window_preparation_state()
         self._set_state(WindowState.OPEN)
 
-    async def _refresh_registered_hotkeys(self, *, force: bool = False) -> bool:
+    def _registration_refresh_poll_seconds(self) -> float:
+        """Poll often enough to refresh the registration snapshot before TTL.
+
+        The public health endpoint intentionally degrades when the snapshot is
+        stale. Auction windows can exceed the five-minute cache TTL, so relying
+        only on the next window boundary leaves healthy validators degraded and
+        makes the first late submission pay the chain-refresh latency.
+        """
+        return min(
+            30.0,
+            max(
+                float(REGISTERED_HOTKEY_REFRESH_MIN_INTERVAL_SECONDS),
+                float(REGISTERED_HOTKEY_CACHE_TTL_SECONDS) / 4.0,
+            ),
+        )
+
+    async def _maintain_registration_cache(self) -> None:
+        """Refresh the registered-hotkey snapshot before it becomes stale."""
+        poll_seconds = self._registration_refresh_poll_seconds()
+        refresh_threshold = max(
+            0.0,
+            float(REGISTERED_HOTKEY_CACHE_TTL_SECONDS) - poll_seconds,
+        )
+        while True:
+            await asyncio.sleep(poll_seconds)
+            age = self.server.registration_cache_age()
+            if age is None or age >= refresh_threshold:
+                refreshed = await self._refresh_registered_hotkeys(
+                    max_cache_age_seconds=refresh_threshold,
+                )
+                if not refreshed:
+                    logger.warning(
+                        "Proactive registered-hotkey cache refresh failed; "
+                        "age=%.1fs",
+                        age if age is not None else -1.0,
+                    )
+
+    async def _refresh_registered_hotkeys(
+        self,
+        *,
+        force: bool = False,
+        max_cache_age_seconds: float | None = None,
+    ) -> bool:
+        """Refresh registered subnet identities without concurrent chain reads."""
+        async with self._registration_refresh_lock:
+            return await self._refresh_registered_hotkeys_locked(
+                force=force,
+                max_cache_age_seconds=max_cache_age_seconds,
+            )
+
+    async def _refresh_registered_hotkeys_locked(
+        self,
+        *,
+        force: bool = False,
+        max_cache_age_seconds: float | None = None,
+    ) -> bool:
         """Refresh registered subnet identities from a fresh chain session."""
         age = self.server.registration_cache_age()
+        cache_age_limit = (
+            float(REGISTERED_HOTKEY_CACHE_TTL_SECONDS)
+            if max_cache_age_seconds is None
+            else max(0.0, float(max_cache_age_seconds))
+        )
         if (
             not force
             and age is not None
-            and age <= REGISTERED_HOTKEY_CACHE_TTL_SECONDS
+            and age <= cache_age_limit
         ):
             return True
 
@@ -2451,6 +2516,10 @@ class ValidationService:
             archive_queue.run_forever(),
             name="archive_queue_worker",
         )
+        self._registration_refresh_task = asyncio.create_task(
+            self._maintain_registration_cache(),
+            name="registration_cache_refresh",
+        )
 
         logger.info(
             "Validator started (v2.1): envs=%s, netuid=%d, http=%s:%d",
@@ -2518,6 +2587,13 @@ class ValidationService:
                     self._set_state(WindowState.READY)
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
         finally:
+            registration_task = self._registration_refresh_task
+            if registration_task is not None and not registration_task.done():
+                registration_task.cancel()
+                try:
+                    await asyncio.wait_for(registration_task, timeout=5)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
             # Cancel the archive worker and let it drain in-flight uploads
             # before we tear down the server. The worker survives many
             # window cycles so we shut it down deliberately rather than
