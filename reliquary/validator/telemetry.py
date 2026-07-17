@@ -72,7 +72,10 @@ def log_training_step(metrics: dict, step: int | None) -> None:
         return
     try:
         import wandb  # already imported successfully in init()
-        wandb.log(metrics, step=step)
+        # ``step=`` disables W&B's implicit commit in some client versions.
+        # Commit every optimizer row so the final step remains queryable when
+        # a checkpoint ceiling or emergency freeze prevents a later log call.
+        wandb.log(metrics, step=step, commit=True)
     except Exception as e:  # noqa: BLE001
         if not _log_warned:
             logger.warning("wandb: log failed (%s), suppressing further warnings", e)
