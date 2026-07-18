@@ -25,7 +25,6 @@ from reliquary.constants import (
 )
 from reliquary.shared.prompt_range import window_prompt_range
 from reliquary.infrastructure import chain
-from reliquary.protocol.signatures import sign_envelope
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     RolloutSubmission,
@@ -391,7 +390,6 @@ class MiningEngine:
             BatchSubmissionRequest, RuntimeFingerprint, WindowState,
         )
         from reliquary.shared.runtime_fingerprint import (
-            bind_runtime_profile_nonce,
             collect_runtime_fingerprint,
         )
 
@@ -517,37 +515,7 @@ class MiningEngine:
                 ]
                 merkle_root = _compute_merkle_root(rollout_submissions)
 
-                # v2.3 design A': fetch the drand round just before the POST.
-                # The attached round determines the submission's chronological
-                # slot at seal time. Miss this and the validator rejects with
-                # STALE_ROUND or FUTURE_ROUND.
-                current_round = _current_drand_round_at_send()
-                # Envelope signature (introduced 2026-05 to close the
-                # /submit hotkey-spoof DoS). Sign the canonical binding
-                # over every field the validator routes on, including
-                # the validator-published window randomness — that ties
-                # the signature to this exact validator's view of the
-                # window so a captured signature cannot be replayed
-                # against a different validator instance or a future
-                # window. The nonce is per-submission fresh randomness.
-                import os as _os
-                _nonce = _os.urandom(16).hex()
                 _runtime_fingerprint = runtime_fingerprint
-                if runtime_telemetry_enabled and _runtime_fingerprint is not None:
-                    _nonce = bind_runtime_profile_nonce(
-                        _nonce, _runtime_fingerprint.profile_hash,
-                    )
-                _envelope_sig = sign_envelope(
-                    wallet=self.wallet,
-                    miner_hotkey=self.wallet.hotkey.ss58_address,
-                    window_start=state.window_n,
-                    prompt_idx=prompt_idx,
-                    merkle_root=merkle_root,
-                    checkpoint_hash=local_hash,
-                    drand_round=current_round,
-                    randomness=state.randomness or "",
-                    nonce=_nonce,
-                ).hex()
                 request = BatchSubmissionRequest(
                     miner_hotkey=self.wallet.hotkey.ss58_address,
                     prompt_idx=prompt_idx,
@@ -555,15 +523,19 @@ class MiningEngine:
                     merkle_root=merkle_root,
                     rollouts=rollout_submissions,
                     checkpoint_hash=local_hash,
-                    drand_round=current_round,
-                    nonce=_nonce,
-                    envelope_signature=_envelope_sig,
                     runtime_fingerprint=_runtime_fingerprint,
                     # Rollouts are drawn from the forced-seed stream; advertise it.
                     protocol_version=FORCED_SEED_PROTOCOL_VERSION,
                 )
                 try:
-                    resp = await submit_batch_v2(url, request, client=client)
+                    resp = await submit_batch_v2(
+                        url,
+                        request,
+                        client=client,
+                        wallet=self.wallet,
+                        randomness=state.randomness or "",
+                        drand_round_fn=_current_drand_round_at_send,
+                    )
                     logger.info(
                         "submitted window=%d prompt=%d accepted=%s reason=%s",
                         state.window_n, prompt_idx, resp.accepted,

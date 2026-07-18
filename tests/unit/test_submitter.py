@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -121,7 +122,7 @@ async def test_submit_batch_v2_ok(monkeypatch):
         )
     ]
 
-    async def _post(self, url, json=None, timeout=None):
+    async def _post(self, url, content=None, headers=None, timeout=None):
         return responses.pop(0)
 
     monkeypatch.setattr(httpx.AsyncClient, "post", _post)
@@ -133,8 +134,57 @@ async def test_submit_batch_v2_ok(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_submit_batch_v2_refreshes_round_nonce_and_signature_on_retry(
+    monkeypatch,
+):
+    import reliquary.miner.submitter as submitter
+
+    payloads = []
+    rounds = iter((100, 101))
+
+    def _sign_envelope(**kwargs):
+        return f"{kwargs['drand_round']}:{kwargs['nonce']}".encode()
+
+    async def _post(self, url, content=None, headers=None, timeout=None):
+        assert headers == {"Content-Type": "application/json"}
+        payloads.append(json.loads(content))
+        if len(payloads) == 1:
+            raise httpx.ConnectError(
+                "transient",
+                request=httpx.Request("POST", url),
+            )
+        return httpx.Response(
+            200,
+            json=BatchSubmissionResponse(
+                accepted=True, reason=RejectReason.SUBMITTED
+            ).model_dump(mode="json"),
+        )
+
+    monkeypatch.setattr(submitter, "_RETRY_DELAYS", (0.0, 0.0))
+    monkeypatch.setattr(submitter, "sign_envelope", _sign_envelope)
+    monkeypatch.setattr(httpx.AsyncClient, "post", _post)
+    client = httpx.AsyncClient()
+
+    response = await submit_batch_v2(
+        "http://fake",
+        _v2_request(),
+        client=client,
+        wallet=object(),
+        randomness="ab" * 32,
+        drand_round_fn=lambda: next(rounds),
+    )
+
+    assert response.accepted is True
+    assert [payload["drand_round"] for payload in payloads] == [100, 101]
+    assert payloads[0]["nonce"] != payloads[1]["nonce"]
+    assert payloads[0]["envelope_signature"] != payloads[1]["envelope_signature"]
+    assert all(len(payload["rollouts"]) == 8 for payload in payloads)
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_submit_batch_v2_reject_reason_propagated(monkeypatch):
-    async def _post(self, url, json=None, timeout=None):
+    async def _post(self, url, content=None, headers=None, timeout=None):
         return httpx.Response(
             200,
             json=BatchSubmissionResponse(
@@ -225,7 +275,7 @@ async def test_submit_batch_v2_503_maps_to_window_not_active(monkeypatch):
     """HTTP 503 from /submit short-circuits to WINDOW_NOT_ACTIVE (no retry)."""
     call_count = {"n": 0}
 
-    async def _post(self, url, json=None, timeout=None):
+    async def _post(self, url, content=None, headers=None, timeout=None):
         call_count["n"] += 1
         return httpx.Response(503, json={"detail": "no_active_window"})
 
@@ -241,7 +291,7 @@ async def test_submit_batch_v2_503_maps_to_window_not_active(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_submit_batch_v2_409_maps_to_window_mismatch(monkeypatch):
-    async def _post(self, url, json=None, timeout=None):
+    async def _post(self, url, content=None, headers=None, timeout=None):
         return httpx.Response(409, json={"detail": "window_mismatch"})
 
     monkeypatch.setattr(httpx.AsyncClient, "post", _post)

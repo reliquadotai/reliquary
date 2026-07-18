@@ -9,12 +9,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import time
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import quote
 
 import httpx
 
 from reliquary.constants import VALIDATOR_HTTP_PORT
+from reliquary.protocol.signatures import sign_envelope
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     BatchSubmissionResponse,
@@ -22,6 +26,7 @@ from reliquary.protocol.submission import (
     RejectReason,
     RuntimeContract,
 )
+from reliquary.shared.runtime_fingerprint import bind_runtime_profile_nonce
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +73,7 @@ def discover_validator_url(metagraph: Any, port: int = VALIDATOR_HTTP_PORT) -> s
 
 async def _post_with_retry(
     full_url: str,
-    json_payload: dict,
+    payload_factory: Callable[[int], bytes],
     response_model: type,
     *,
     client: httpx.AsyncClient | None,
@@ -79,8 +84,14 @@ async def _post_with_retry(
     cli = client or httpx.AsyncClient(timeout=timeout)
     try:
         for attempt, delay in enumerate(_RETRY_DELAYS, start=1):
+            payload = payload_factory(attempt)
             try:
-                resp = await cli.post(full_url, json=json_payload, timeout=timeout)
+                resp = await cli.post(
+                    full_url,
+                    content=payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout=timeout,
+                )
             except (httpx.RequestError, httpx.TimeoutException) as e:
                 last_exc = e
                 logger.warning(
@@ -175,11 +186,81 @@ async def submit_batch_v2(
     *,
     client: httpx.AsyncClient | None = None,
     timeout: float = _DEFAULT_TIMEOUT,
+    wallet: Any | None = None,
+    randomness: str = "",
+    drand_round_fn: Callable[[], int] | None = None,
 ) -> BatchSubmissionResponse:
-    """POST a v2 batch submission. Retries network errors; 4xx is final."""
-    payload = request.model_dump(mode="json")
+    """POST a v2 batch submission, refreshing signed freshness per attempt.
+
+    When ``wallet`` is provided, the miner-finalized envelope fields are rebuilt
+    immediately before every network attempt. The large rollout body is encoded
+    exactly once with Pydantic's native JSON serializer, avoiding the old
+    ``model_dump`` plus httpx JSON double pass. A retry never reuses a stale
+    drand round or nonce. Callers that already finalized an envelope can omit
+    ``wallet`` and retain the legacy pre-signed behavior.
+    """
+
+    if wallet is not None and drand_round_fn is None:
+        from reliquary.infrastructure.chain import compute_current_drand_round
+        from reliquary.infrastructure.drand import get_current_chain
+
+        chain_info = get_current_chain()
+
+        def drand_round_fn() -> int:
+            return compute_current_drand_round(
+                time.time(),
+                chain_info["genesis_time"],
+                chain_info["period"],
+            )
+
+    static_payload = request.model_dump_json().encode("utf-8") if wallet is None else None
+
+    def _payload_for_attempt(attempt: int) -> bytes:
+        if wallet is None:
+            assert static_payload is not None
+            return static_payload
+
+        assert drand_round_fn is not None
+        drand_round = int(drand_round_fn())
+        nonce = os.urandom(16).hex()
+        if request.runtime_fingerprint is not None:
+            nonce = bind_runtime_profile_nonce(
+                nonce, request.runtime_fingerprint.profile_hash,
+            )
+        signature = sign_envelope(
+            wallet=wallet,
+            miner_hotkey=request.miner_hotkey,
+            window_start=request.window_start,
+            prompt_idx=request.prompt_idx,
+            merkle_root=request.merkle_root,
+            checkpoint_hash=request.checkpoint_hash,
+            drand_round=drand_round,
+            randomness=randomness,
+            nonce=nonce,
+        ).hex()
+        finalized = request.model_copy(
+            update={
+                "drand_round": drand_round,
+                "nonce": nonce,
+                "envelope_signature": signature,
+            }
+        )
+        started = time.perf_counter()
+        payload = finalized.model_dump_json().encode("utf-8")
+        logger.info(
+            "submission_payload_finalized window=%d prompt=%d attempt=%d "
+            "drand_round=%d payload_bytes=%d serialization_ms=%.3f",
+            request.window_start,
+            request.prompt_idx,
+            attempt,
+            drand_round,
+            len(payload),
+            (time.perf_counter() - started) * 1000.0,
+        )
+        return payload
+
     return await _post_with_retry(
-        f"{url}/submit", payload, BatchSubmissionResponse,
+        f"{url}/submit", _payload_for_attempt, BatchSubmissionResponse,
         client=client, timeout=timeout,
     )
 
@@ -219,4 +300,3 @@ async def get_runtime_contract_v1(
         client=client,
         timeout=timeout,
     )
-
