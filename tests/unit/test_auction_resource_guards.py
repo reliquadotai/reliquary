@@ -280,6 +280,8 @@ def test_code_grader_outage_never_becomes_an_auction_negative():
     assert batcher.pending_submissions() == []
     assert batcher.logical_group_reservation_count == 0
     assert batcher.grader_failures == {"unreachable": 1}
+    assert batcher.expensive_proof_failures_by_hotkey == {}
+    assert batcher.expensive_proof_failures_by_operator == {}
 
     env.unavailable = False
     retry = batcher.accept_submission(
@@ -331,6 +333,122 @@ def test_code_grader_crash_is_not_a_free_retry():
     assert retry.reason is RejectReason.HASH_DUPLICATE
     assert batcher.logical_group_reservation_count == 1
     assert batcher.grader_failures == {"crash": 1}
+    assert batcher.expensive_proof_failures_by_hotkey == {"miner-a": 1}
+    assert batcher.expensive_proof_failures_by_operator == {"operator-a": 1}
+
+
+def test_code_grader_crashes_trip_hotkey_and_operator_circuit_breakers():
+    from reliquary.constants import (
+        MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW,
+        MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW,
+    )
+    from reliquary.environment.grader_client import GraderInfrastructureError
+    from reliquary.protocol.submission import RejectReason
+    from tests.unit.test_grpo_window_batcher import PrivateRewardFakeEnv
+
+    class CrashingCodeEnv(PrivateRewardFakeEnv):
+        def compute_reward(self, problem, completion):
+            raise GraderInfrastructureError("crash")
+
+    operator_hotkeys = {
+        f"operator-a-{index}": "operator-a"
+        for index in range(MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW + 1)
+    }
+    batcher = _batcher(
+        env=CrashingCodeEnv(),
+        operator_by_hotkey=operator_hotkeys,
+    )
+
+    for index in range(MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW):
+        request = _request(
+            prompt_idx=index,
+            hotkey=f"operator-a-{index}",
+            env_name="opencodeinstruct",
+        )
+        response = batcher.accept_submission(request)
+        assert response.accepted is False
+        assert response.reason is RejectReason.WORKER_DROPPED
+
+    blocked = _request(
+        prompt_idx=99,
+        hotkey=f"operator-a-{MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW}",
+        env_name="opencodeinstruct",
+    )
+    assert batcher.try_reserve_proof_admission(blocked) == (
+        False,
+        "proof_failure_debt_operator",
+    )
+    assert batcher.expensive_proof_failures_by_operator == {
+        "operator-a": MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW
+    }
+
+    hotkey = "operator-b"
+    hotkey_batcher = _batcher(
+        env=CrashingCodeEnv(),
+        operator_by_hotkey={hotkey: "operator-b"},
+    )
+    for prompt_idx in range(MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW):
+        response = hotkey_batcher.accept_submission(
+            _request(
+                prompt_idx=prompt_idx,
+                hotkey=hotkey,
+                env_name="opencodeinstruct",
+            )
+        )
+        assert response.reason is RejectReason.WORKER_DROPPED
+    assert hotkey_batcher.try_reserve_proof_admission(
+        _request(
+            prompt_idx=99,
+            hotkey=hotkey,
+            env_name="opencodeinstruct",
+        )
+    ) == (False, "proof_failure_debt_hotkey")
+
+
+def test_pending_burst_rechecks_operator_crash_debt_at_start():
+    from reliquary.constants import (
+        MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW,
+    )
+    from reliquary.environment.grader_client import GraderInfrastructureError
+    from tests.unit.test_grpo_window_batcher import PrivateRewardFakeEnv
+
+    class CrashingCodeEnv(PrivateRewardFakeEnv):
+        def compute_reward(self, problem, completion):
+            raise GraderInfrastructureError("crash")
+
+    pending_hotkey = "pending"
+    crash_hotkeys = [
+        f"crash-{index}"
+        for index in range(MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW)
+    ]
+    batcher = _batcher(
+        env=CrashingCodeEnv(),
+        operator_by_hotkey={
+            pending_hotkey: "operator-a",
+            **{hotkey: "operator-a" for hotkey in crash_hotkeys},
+        },
+    )
+    pending = _request(
+        prompt_idx=99,
+        hotkey=pending_hotkey,
+        env_name="opencodeinstruct",
+    )
+    assert batcher.try_reserve_proof_admission(pending) == (True, None)
+
+    for prompt_idx, hotkey in enumerate(crash_hotkeys):
+        batcher.accept_submission(
+            _request(
+                prompt_idx=prompt_idx,
+                hotkey=hotkey,
+                env_name="opencodeinstruct",
+            )
+        )
+
+    assert batcher.start_proof_admission(pending) == (
+        False,
+        "proof_failure_debt_operator",
+    )
+    assert batcher.reserved_payload_bytes == 0
 
 
 def test_failed_proof_does_not_consume_an_operator_slot(monkeypatch):

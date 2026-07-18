@@ -261,6 +261,7 @@ def _is_missing_kwarg_typeerror(exc: TypeError, kwarg: str) -> bool:
 
 _PROOF_FAILURE_DEBT_STAGES = frozenset(
     {
+        "code_grader_crash",
         "grail",
         "termination",
         "force_span",
@@ -1025,6 +1026,18 @@ class GrpoWindowBatcher:
     def operator_proof_failure_debt(self, operator: str) -> int:
         return self._expensive_proof_failures_by_operator.get(operator, 0)
 
+    def _operator_for_hotkey(self, hotkey: str) -> str | None:
+        operator = self._operator_by_hotkey.get(hotkey)
+        if operator is None and not self._operator_mapping_enforced:
+            return hotkey
+        return operator
+
+    def _operator_proof_failure_debt_for_hotkey(self, hotkey: str) -> int:
+        operator = self._operator_for_hotkey(hotkey)
+        if operator is None:
+            return 0
+        return self._expensive_proof_failures_by_operator.get(operator, 0)
+
     @property
     def logical_group_reservation_count(self) -> int:
         with self._logical_group_lock:
@@ -1150,9 +1163,9 @@ class GrpoWindowBatcher:
         """Reserve a *grading* slot for this window (the anti-DoS bound).
 
         Admission is gated by started work plus pending reservations, the
-        post-trigger straggler cap and per-hotkey proof-failure debt. A pending
-        reservation can be cancelled if the queue item never starts; once
-        started, its grading attempt is never refunded.
+        post-trigger straggler cap and per-hotkey/per-operator proof-failure
+        debt. A pending reservation can be cancelled if the queue item never
+        starts; once started, its grading attempt is never refunded.
         There is no separate GRAIL/GPU candidate budget: the drand-anchored
         seal, this grading ceiling and the seal drain timeout already bound the
         GPU work per window, so a zone-valid submission entering the proof is
@@ -1176,6 +1189,14 @@ class GrpoWindowBatcher:
                 >= MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
             ):
                 return False, "proof_failure_debt_hotkey"
+
+            if (
+                self._operator_proof_failure_debt_for_hotkey(
+                    request.miner_hotkey
+                )
+                >= MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW
+            ):
+                return False, "proof_failure_debt_operator"
 
             if (
                 self._proof_grading_attempts
@@ -1282,13 +1303,20 @@ class GrpoWindowBatcher:
 
             # A burst may have queued several requests before the first two
             # failures established debt. Re-check at dequeue so the remainder
-            # cannot bypass the per-hotkey circuit breaker.
+            # cannot bypass the hotkey or operator circuit breakers.
             if (
                 self._expensive_proof_failures_by_hotkey.get(hotkey, 0)
                 >= MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
             ):
                 self._release_hotkey_payload_locked(hotkey, payload_bytes)
                 return False, "proof_failure_debt_hotkey"
+
+            if (
+                self._operator_proof_failure_debt_for_hotkey(hotkey)
+                >= MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW
+            ):
+                self._release_hotkey_payload_locked(hotkey, payload_bytes)
+                return False, "proof_failure_debt_operator"
 
             self._proof_grading_attempts += 1
             if is_post_trigger:
@@ -2829,6 +2857,15 @@ class GrpoWindowBatcher:
                 self._expensive_proof_failures_by_hotkey[hotkey] = (
                     self._expensive_proof_failures_by_hotkey.get(hotkey, 0) + 1
                 )
+                if reject_stage == "code_grader_crash":
+                    operator = self._operator_for_hotkey(hotkey)
+                    if operator is not None:
+                        self._expensive_proof_failures_by_operator[operator] = (
+                            self._expensive_proof_failures_by_operator.get(
+                                operator, 0
+                            )
+                            + 1
+                        )
 
         if hotkey is not None and prompt_idx is not None:
             already = sum(
