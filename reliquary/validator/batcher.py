@@ -1695,17 +1695,21 @@ class GrpoWindowBatcher:
             )
             # A worker crash may be triggered by hostile submitted code. Never
             # convert it into a zero reward (which could manufacture auction
-            # difficulty), but also do not grant free retries: retain the
-            # operator/prompt claim and consume the normal submission quota.
+            # difficulty), but also do not mislabel it as proof of a false
+            # reward claim: an honest model completion can exhaust or kill its
+            # isolated sandbox too. Retain the operator/prompt claim and mark
+            # the request so the server consumes normal submission quota while
+            # returning the nonfatal, wire-compatible worker_dropped verdict.
             if reason == "crash":
                 self.confirm_logical_group_reservation(request)
+                request._grader_worker_crashed = True
                 logger.error(
                     "code_grader_worker_crash env=%s prompt=%d hotkey=%s",
                     getattr(self.env, "name", type(self.env).__name__),
                     request.prompt_idx,
                     hk,
                 )
-                return reject(RejectReason.REWARD_MISMATCH, "code_grader_crash")
+                return reject(RejectReason.WORKER_DROPPED, "code_grader_crash")
             self.cancel_logical_group_reservation(request)
             logger.error(
                 "code_grader_unavailable env=%s prompt=%d hotkey=%s reason=%s",

@@ -95,6 +95,13 @@ class _FlakyCodeEnv(FakeEnv):
         return super().compute_reward(problem, completion)
 
 
+class _CrashingCodeEnv(_FlakyCodeEnv):
+    def compute_reward(self, problem, completion):
+        from reliquary.environment.grader_client import GraderInfrastructureError
+
+        raise GraderInfrastructureError("crash")
+
+
 def _always_true_proof(commit, model, randomness):
     import torch
     from reliquary.validator.verifier import ProofResult
@@ -676,6 +683,41 @@ def test_code_grader_outage_refunds_quota_and_surfaces_health():
     recovered = client.post("/submit", json=retry.model_dump(mode="json"))
     assert recovered.json()["accepted"] is True
     assert server._per_window_counts == {_TEST_KEYPAIR.ss58_address: 1}
+
+
+@pytest.mark.parametrize("auction_enabled", [False, True])
+def test_code_grader_crash_consumes_quota_without_protocol_fault(
+    auction_enabled,
+):
+    from reliquary.protocol.submission import WindowState
+
+    env = _CrashingCodeEnv()
+    server = ValidatorServer()
+    batcher = _batcher(
+        window_start=500,
+        env=env,
+        operator_by_hotkey={_TEST_KEYPAIR.ss58_address: "operator-a"},
+    )
+    batcher.difficulty_auction_enabled = auction_enabled
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    client = TestClient(server.app)
+    request = _request()
+    for rollout in request.rollouts:
+        rollout.env_name = env.name
+
+    crashed = client.post("/submit", json=request.model_dump(mode="json"))
+
+    assert crashed.json() == {
+        "accepted": False,
+        "reason": RejectReason.WORKER_DROPPED.value,
+    }
+    assert server._per_window_counts == {_TEST_KEYPAIR.ss58_address: 1}
+    assert batcher.logical_group_reservation_count == 1
+    health = client.get("/health").json()
+    assert health["grader_failures_by_environment"] == {
+        env.name: {"crash": 1}
+    }
 
 
 @pytest.mark.parametrize("fail_at", ["length", "row"])

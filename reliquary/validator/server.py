@@ -836,6 +836,11 @@ class ValidatorServer:
         else:
             self._per_window_counts[hotkey] = current_count - 1
 
+    @staticmethod
+    def _worker_drop_refunds_quota(request: BatchSubmissionRequest) -> bool:
+        """Distinguish validator outages from candidate-killed sandboxes."""
+        return not bool(request._grader_worker_crashed)
+
     def _prune_upload_precommits(self, *, now: float | None = None) -> None:
         current = time.time() if now is None else float(now)
         expired = [
@@ -2970,6 +2975,7 @@ class ValidatorServer:
                 if (
                     not resp.accepted
                     and resp.reason is RejectReason.WORKER_DROPPED
+                    and self._worker_drop_refunds_quota(request)
                 ):
                     self._refund_submission_quota(hk)
                 log_submission_stage(
@@ -3378,6 +3384,7 @@ class ValidatorServer:
                 if (
                     not response.accepted
                     and response.reason is RejectReason.WORKER_DROPPED
+                    and self._worker_drop_refunds_quota(request)
                 ):
                     self._refund_submission_quota(request.miner_hotkey)
                     quota_refunded = True

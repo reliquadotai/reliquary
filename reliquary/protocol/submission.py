@@ -244,6 +244,10 @@ class BatchSubmissionRequest(BaseModel):
     ] | None = PrivateAttr(default=None)
     _payload_bytes: int = PrivateAttr(default=0)
     _retain_payload: bool = PrivateAttr(default=False)
+    # Validator-only marker: a submitted Code completion killed its isolated
+    # grader worker.  The response remains the wire-compatible nonfatal
+    # WORKER_DROPPED reason, but the server must not refund the consumed quota.
+    _grader_worker_crashed: bool = PrivateAttr(default=False)
 
     @field_validator("rollouts")
     @classmethod
