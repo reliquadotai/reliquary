@@ -39,10 +39,10 @@ The miner runs exactly `M_ROLLOUTS = 8` completions with the protocol-v2 forced 
 For each rollout the miner runs a bit-identical HuggingFace forward pass on the proof GPU to construct a GRAIL sketch commitment. The sketch binds the completion to the model's hidden-state activations. The miner signs the commit and packages everything into a `BatchSubmissionRequest` that includes `checkpoint_hash` (the HF revision from the last `/state` response). In OpenMath, `rollout.reward` must match the miner's local `env.compute_reward` value; the validator recomputes it and rejects mismatches. In OpenCode, local reward fields are placeholders and the validator computes sandboxed structured-case rewards before applying the zone filter.
 
 **5. Miner submits.**
-`POST /submit` sends the request to the validator. In production, the HTTP response is provisional (`accepted=True, reason="submitted"`) once the request is queued. A background worker runs bounded admission and reward grading. Its later `ACCEPTED` verdict means the group entered the pending auction pool; it is not yet a GRAIL pass or a paid slot.
+The miner serializes and hashes its final signed body, obtains a signed upload receipt from `POST /submit/precommit`, then sends the exact bytes to `POST /submit`. A predeadline receipt grants bounded upload grace without extending generation. In production, the body response is provisional (`accepted=True, reason="submitted"`) once queued. A background worker runs bounded admission and reward grading. Its later `ACCEPTED` verdict means the group entered the pending auction pool; it is not yet a GRAIL pass or a paid slot.
 
 **6. Validator admits, ranks, proves, and selects.**
-Math and Code each collect an independent pending population for 300 seconds. Admission checks the window, checkpoint, protocol, registration/operator mapping, prompt, payload bounds, signatures, randomness, dedup, validator-authoritative rewards, and zone filter (`sigma >= 0.43`) without running the expensive model proof. At the deadline the validator drains pre-deadline work, freezes both populations, and ranks them by `std(rewards) * (1 - mean(rewards))`. It then proves candidates top-down until it has at most eight distinct-prompt winners, subject to a two-slot operator cap and strict proof-attempt/wall-time bounds. A failed high-ranked proof promotes the next candidate; an unproven candidate is never paid.
+Math and Code each collect an independent pending population for 300 seconds. Admission checks the window, checkpoint, protocol, registration/operator mapping, prompt, payload bounds, signatures, randomness, dedup, validator-authoritative rewards, and zone filter (`sigma >= 0.43`) without running the expensive model proof. At the deadline the validator drains pre-deadline work, freezes both populations, and ranks them by `std(rewards) * (1 - mean(rewards))`. It then proves candidates top-down until it has at most eight distinct-prompt winners, under strict proof-attempt/wall-time bounds and with no operator winner cap. A failed high-ranked proof promotes the next candidate; an unproven candidate is never paid.
 
 **7. Validator accumulates clean signal and runs a balanced GRPO step.**
 State transitions to `TRAINING`. Before retention, the validator assesses the selected groups and current reject profile. Quarantined windows remain archived and credited but do not enter training. Clean partial batches are retained across windows under the exact public checkpoint revision, capped at one target batch per environment. Once every active environment is full, the validator assesses the balanced retained batch again and runs `train_step()`. A checkpoint change discards pending samples before any new-revision samples are retained, so one optimizer step never mixes generation policies.
@@ -106,11 +106,11 @@ pattern.
 
 > **Current production design (July 2026).** The auction supersedes the v2.3 same-prompt runner-up split. Full contract: [difficulty-auction-v2-design.md](superpowers/specs/2026-07-15-difficulty-auction-v2-design.md).
 
-Per-window randomness remains drand-derived and exposed by `/state`. Submissions still carry the current drand round, with stale/future rounds rejected, but drand arrival order is now only the second ranking key after difficulty. Equal-score ties use a post-deadline drand salt bound to `(operator, prompt)`, never hotkey or miner-controlled payload metadata.
+Per-window randomness remains drand-derived and exposed by `/state`. Submissions carry the current drand round, with stale/future rounds rejected at signed precommit arrival. Submitted drand is not a ranking key. Candidates rank by difficulty; equal scores use a post-deadline drand salt bound to `(operator, prompt)`, never hotkey or miner-controlled payload metadata.
 
-Multiple distinct operators may enter the same prompt pool, bounded at ten groups, but only the first ranked candidate for that prompt that passes deferred proof can win. One operator may reserve only one logical claim per prompt and may win at most two slots per environment. The active selector does not split a prompt slot among runners-up.
+Multiple distinct operators may enter the same prompt pool, bounded at ten groups, but only the first ranked candidate for that prompt that passes deferred proof can win. One operator may reserve only one logical claim per prompt; there is no per-operator winner cap. The active selector does not split a prompt slot among runners-up.
 
-This removes the old hotkey-count dilution surface: extra hotkeys neither produce different forced draws, reserve additional operator/prompt claims, create additional equal-score tie tickets, nor bypass the operator slot cap.
+This removes the old hotkey-count dilution surface: extra hotkeys neither produce different forced draws, reserve additional operator/prompt claims, nor create additional equal-score tie tickets.
 
 ### EMA scoring — one payment per window, not per submission
 
@@ -144,7 +144,7 @@ The base model is Qwen3.5-2B (~2 billion parameters, sharded safetensors, thinki
 
 1. Submit a protocol-v2, valid, in-zone group on a non-cooldown prompt during the 300-second collection interval.
 2. Rank highly enough by difficulty and pass the validator's deferred proof.
-3. Be the first proven candidate for that prompt while remaining below the two-slot operator cap. Each selected group earns one `pool / B_BATCH` environment slot.
+3. Be the first proven candidate for that prompt. Each selected group earns one `pool / B_BATCH` environment slot.
 4. Once per subnet epoch (~360 blocks), the validator calls `set_weights` on-chain with the current EMA values. All validators submit inside a shared ~20-block window before the epoch boundary so they converge on identical weights. Your emission for the epoch is proportional to your EMA score.
 
 ### Rough expected earnings
@@ -188,7 +188,7 @@ A miner consistently landing two winning prompts in one environment reaches its 
 | Spam the same prompt every window | One-shot cooldown blocks re-entry after the prompt wins | 0 earnings after first winning inclusion |
 | Generate extra rollouts to select favorable reward vectors | Monitoring and training quarantine reduce blast radius; long-term private tasks / commit-first sampling are the durable fix | Some shaping value remains until durable mitigations land |
 | Submit extremely fast | Fixed 300-second collection prevents early count-based seal | Timing matters only for reaching the deadline and queue drain |
-| Register many hotkeys | Hotkey-free seed, operator/prompt dedup, operator-bound ties, and two-slot operator cap | No extra legal draw or payout capacity |
+| Register many hotkeys | Hotkey-free seed, operator/prompt dedup, and operator-bound equal-score ties | No extra legal draw or tie ticket for the same operator/prompt |
 | Run a stale model | `WRONG_CHECKPOINT` rejects before GRAIL | 0 earnings |
 
 ---

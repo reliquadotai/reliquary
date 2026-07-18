@@ -117,7 +117,7 @@ Both validator and miner load the same public curated dataset
 (`R0mAI/opencodeinstruct-curated`, pinned by default) lazily — the
 `structured_cases` ship with it, and the validator runs the grader and
 recomputes the code reward authoritatively. Auction, deferred proof, resource
-caps, and operator caps apply independently to both environments. Do not start
+caps, and operator/prompt dedup apply independently to both environments. Do not start
 the mixed trainer until the image contains the grader rootfs, `runsc` starts
 successfully, and the loopback grader canaries pass.
 
@@ -255,6 +255,14 @@ windows, reset reason, and whether a step was attempted.
 
 Every `/submit` flows through this sequence on the validator. The first rejection short-circuits the rest.
 
+Upgraded miners first send a small signed `/submit/precommit` containing the
+final body's SHA-256, byte count, routing fields, nonce, checkpoint, protocol,
+and current drand round. A receipt accepted before the collection cutoff allows
+only that exact body to finish within `SUBMISSION_UPLOAD_GRACE_SECONDS = 33`.
+It consumes normal hotkey quota but no prompt or auction slot, so abandoned
+precommits cannot squat economic capacity. Direct `/submit` remains valid
+before cutoff for compatibility; after cutoff a matching receipt is required.
+
 ```
 HTTP/pre-queue                 environment worker
 --------------                 ------------------
@@ -268,9 +276,9 @@ rate/queue/payload bounds      -> pending auction pool
 -> stop new admission and drain pre-deadline work (max 60 s)
 -> freeze Math and Code populations independently
 -> fetch post-deadline drand salt
--> rank by difficulty, drand round, operator/prompt tie hash
+-> rank by difficulty, operator/prompt post-deadline tie hash
 -> prove top-down under attempt/wall/operator-debt bounds
--> at most 8 distinct prompts and 2 slots/operator/environment
+-> at most 8 distinct prompts; no operator winner cap
 -> final /verdicts lifecycle records
 -> R2 archive + rewards + balanced training accumulator
 ```

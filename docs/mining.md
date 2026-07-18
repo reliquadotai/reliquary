@@ -22,8 +22,8 @@ Math and Code each collect submissions for a fixed 300-second interval. The
 validator does not close early when eight groups arrive. At the deadline it
 drains pre-deadline work, freezes each environment's pending population, ranks
 groups by difficulty, and runs deferred proof top-down until at most eight
-distinct-prompt winners pass. Each operator may win at most two slots per
-environment. Unfilled slots burn.
+distinct-prompt winners pass. There is no per-operator winner cap. Unfilled
+slots burn.
 
 Clean selected groups are retained in a bounded accumulator tied to the public
 checkpoint. GRPO waits until the accumulator has one target batch from every
@@ -47,16 +47,28 @@ Every miner runs a continuous poll-submit loop:
 
 5. **Builds GRAIL sketches.** Runs the bit-identical HuggingFace forward pass on the proof GPU to construct sketch commitments that bind the completions to the model. The r_vec seed **must** come from `state.randomness` exactly — local re-derivation will diverge from the validator's seed and the binding check rejects with `WRONG_RANDOMNESS`.
 
-6. **Submits.** POSTs a `BatchSubmissionRequest` to `/submit` containing: `miner_hotkey`, `prompt_idx`, `window_start`, 8 rollouts, claimed rewards, GRAIL commits, `merkle_root`, `checkpoint_hash`, `protocol_version=2`, and the drand quicknet round currently in progress at the wall-clock instant of the POST. Compute the round immediately before sending.
-   - The validator gates this field with **zero tolerance**: too old → `STALE_ROUND`, too new → `FUTURE_ROUND`. Network jitter that pushes your POST across a round boundary now costs the submission.
-   - Pre-baking `drand_round` at sketch-build time is **wrong** — gen takes 50-100 s, so by fire time the round is 1-2 buckets stale → guaranteed `STALE_ROUND`. Compute the round just before the POST.
+6. **Commits, then uploads.** Finalize the signed `BatchSubmissionRequest`,
+   serialize it once, and compute its byte length and SHA-256. POST the small
+   signed metadata to `/submit/precommit`, then POST those exact bytes to
+   `/submit` with the returned `X-Reliquary-Precommit` receipt. A precommit
+   received before the 300-second cutoff grants at most 33 seconds for that
+   exact reveal; it does not extend generation or reserve an auction slot.
+   - Compute and sign the current quicknet round immediately before
+     serialization. The validator applies zero backward tolerance and records
+     drand at precommit arrival. Pre-baking the round at sketch-build time is
+     wrong.
+   - Do not rebuild, reformat, or re-sign the body after precommit. The receipt
+     binds its SHA-256, byte count, routing fields, nonce, checkpoint, and
+     protocol version. A same-sized substitution is rejected.
+   - The reference submitter falls back to deadline-sensitive direct `/submit`
+     only when an older validator returns 404 for `/submit/precommit`.
 
 The validator grades submissions during collection, but expensive GRAIL and
 auth proof run at seal only for candidates that can still win. Difficulty is
-the first ranking key, submission drand round the second, and an
-operator/prompt/post-deadline-drand hash the final tie-break. TCP milliseconds,
-hotkey count, Merkle-root grinding, and harmless payload variation do not mint
-extra equal-score tickets.
+the ranking key. Equal scores use an operator/prompt hash salted by
+post-deadline drand. Submitted drand is a freshness check and telemetry field,
+not an economic ordering key. TCP milliseconds, hotkey count, Merkle-root
+grinding, and harmless payload variation do not mint extra equal-score tickets.
 
 ### Prompt competition and payment
 
@@ -66,7 +78,7 @@ seal, the first ranked candidate for a prompt that passes proof wins. If it
 fails, the next candidate is promoted. Runners-up do not split emission.
 
 Each selected group earns `pool / B_BATCH` for its environment. An operator can
-win no more than two such slots per environment. Missing winners are not
+win any number of distinct prompt slots on merit. Missing winners are not
 redistributed; their shares burn to `UID_BURN = 0`.
 
 ### One-shot prompts
@@ -80,7 +92,8 @@ The most common miner question is *"the validator returned `accepted=True`, but 
 ```
 miner                 HTTP/worker admission             300 s seal
 -----                 ---------------------             ----------
-POST submission  ->   reason="submitted"               freeze pending pool
+POST precommit   ->   signed upload receipt             freeze pending pool
+POST exact body  ->   reason="submitted"                rank by difficulty
                       cheap checks + grading            rank by difficulty
                       first ACCEPTED verdict            prove top-down
                       pending pool only                 final verdict + reward
@@ -102,7 +115,7 @@ alias.
 Per submission you have `(window_n, prompt_idx)`. Two lookup paths:
 
 - **Dashboard drawer.** Click your hotkey row on `https://reliqua.ai/dashboard`. The drawer's "last 5w" table shows `sub / acc / soft / hard` counts per window for your hotkey, and when `hard > 0` it lists every rejection with its `prompt_idx`, reason, and the actual GRAIL diagnostic values (`sketch_diff`, `lp_dev`, `dist_q10`) that pushed it over threshold.
-- **Raw archive.** `GET https://reliqua.ai/api/r2/window/<N>` returns the full window archive for any cached window. Search `batch[]`, `rejected[]`, and `difficulty_auction.<environment>.candidates[]` for your prompt and hotkey.
+- **Raw archive.** `GET https://reliqua.ai/api/r2/window/<N>` returns the full window archive for any cached window. Search `batch[]`, `rejected[]`, and `difficulty_auction.<environment>.candidates[]` for your prompt and hotkey. Ingress evidence includes payload/body timing, precommit status, queue wait, reward grading, and admission commit time.
 
 ### Prompt selection strategy
 
@@ -119,7 +132,7 @@ GET /state  →  GrpoBatchState
 **This is a baseline, not a ceiling.** The protocol enforces no further constraint on `prompt_idx`, but the economics strongly reward miners who can predict which prompts will pass the validator's frontier checks for the current checkpoint:
 
 - An `OUT_OF_ZONE` rejection wastes the eight generations, although deferred proof prevents it from consuming seal-time GRAIL.
-- A good picker puts more groups near the `k=2` score peak and high enough in the frozen ranking to justify proof. Coverage still matters, but the two-slot operator cap prevents one operator from taking the full environment.
+- A good picker puts more groups near the `k=2` score peak and high enough in the frozen ranking to justify proof. Coverage matters because only one proven winner can occupy each prompt, but there is no operator winner cap.
 
 Techniques miners are expected to develop (non-exhaustive):
 
@@ -140,14 +153,14 @@ For OpenMath's binary `{0, 1}` rewards, this admits k=2..6 correct out of 8 in s
 Earning is EMA-based, not flat per-submission. After each window the validator computes a per-hotkey reward share for the window, then updates each miner's score:
 
 ```
-# One uniform slot per proven winner, at most two per operator/environment.
+# One uniform slot per proven distinct-prompt winner.
 share_this_window = winning_slots * (pool / B_BATCH)
 score_new = α × share_this_window + (1 − α) × score_old
 ```
 
 where `α ≈ 0.027` (`EMA_ALPHA = 2 / (72 + 1)`). Once per subnet epoch (~360 blocks), the validator calls `set_weights` on-chain with these EMA values. Your emission for the epoch is proportional to your EMA score relative to other miners.
 
-A miner that consistently wins two of eight slots in one environment reaches the operator cap and converges to roughly **25% of that environment's filled-slot budget** before EMA normalization. Unused slots burn; there is no runner-up split or redistribution.
+A miner may win multiple distinct prompt slots in one environment. Unused slots burn; there is no runner-up split or redistribution.
 
 See [docs/concepts.md](concepts.md#economic-model) for the full economic model.
 
@@ -160,11 +173,14 @@ The validator emits one of the following reasons on every failed submission. Eac
 | Reason | Meaning | Action |
 |---|---|---|
 | `WINDOW_NOT_ACTIVE` | Window is in `TRAINING`, `PUBLISHING`, or `READY` — not accepting submissions | Sleep and re-poll `/state` until `state == "open"` |
+| `PRECOMMIT_REQUIRED` | Collection closed and the body has no valid predeadline upload receipt | Upgrade the submitter; precommit the final serialized body before cutoff |
+| `PRECOMMIT_INVALID` | Receipt, body hash/size, nonce, routing fields, or signature do not match | Reuse the exact serialized bytes associated with the receipt; never rebuild the body after precommit |
+| `PRECOMMIT_EXPIRED` | The exact body did not finish inside the bounded reveal grace | Start finalization earlier or improve the upload path; do not increase generation after precommit |
 | `MERKLE_ROOT_MISMATCH` | After the validator operator enables the calibrated gate, the signed wire-v1 root does not equal its byte-compatible recomputation | Use the repository's existing `_compute_merkle_root` output without altering its serialization |
 | `RATE_LIMITED` | You exceeded `MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW = 8` submissions in this window | Throttle locally; the counter resets at every window boundary |
 | `BATCH_FILLED` | The collection population, queue, or resource reservation is closed/full; auction mode does not emit this merely because eight candidates arrived | Re-poll `/state`; if still open, back off and inspect validator capacity telemetry |
 | `WINDOW_MISMATCH` | `window_start` in your request doesn't match the active batcher | Refresh `/state` and retry with the current `window_n` |
-| `STALE_ROUND` | (v2.3) Your `drand_round` field is older than the validator's current drand round at receipt. Zero tolerance — even one round of staleness rejects. | Compute the drand round **immediately before** the POST, never at sketch-build time. `current_drand_round = 1 + (time.time() - genesis_time) // period` with quicknet `period = 3 s`. |
+| `STALE_ROUND` | Your signed `drand_round` is older than the validator round at precommit/direct-body arrival. Backward tolerance is zero. | Compute the drand round immediately before final serialization and precommit, never at sketch-build time. |
 | `FUTURE_ROUND` | (v2.3) Your `drand_round` field is newer than the validator's current round. Implies clock skew. | Ensure miner host is NTP-synced. Drand quicknet rounds advance on a fixed wall-clock schedule; sending a future round means your clock is ahead of UTC. |
 | `PROMPT_FULL` | `MAX_SUBMISSIONS_PER_PROMPT = 10` pending groups already occupy this prompt | Pick a different prompt |
 | `HASH_DUPLICATE` | Your operator already reserved this prompt or your tokens duplicate retained/recent content | Do not rotate hotkeys or replay a forced group; choose another prompt |

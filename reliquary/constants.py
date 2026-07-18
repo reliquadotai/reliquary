@@ -628,17 +628,16 @@ if DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR <= 0:
 #     sides NTP-synced and the miner respecting the safety window, no
 #     honest submission should land in the wrong drand round.
 #
-# Anything > 0 here opens an antedating window: an attacker could claim
-# a slightly-earlier chronological tier than they actually earned. With
-# zero, the only path to a slot is to actually be there in time —
-# matches the original v2.3 design intent. Operators can re-widen via
-# the ``DRAND_ROUND_BACKWARD_TOLERANCE`` env var if their cross-continent
-# RTT profile justifies it (e.g. validators in EU serving miners in AU
-# may need 1-2 to absorb 100-300 ms RTT spillover around a boundary).
+# Submitted drand no longer participates in auction rank, but accepting an old
+# round still weakens the signed freshness contract and makes replay analysis
+# ambiguous. Keep this at zero. Cross-continent body upload is handled by the
+# signed precommit/reveal grace, whose drand observation is fixed when the small
+# precommit reaches the validator; widening this tolerance is not the transport
+# fix.
 # Tests pin specific values explicitly via
 # ``GrpoWindowBatcher(drand_round_backward_tolerance=...)``.
 #
-# Forward direction stays zero (FUTURE_ROUND is unrecoverable: a miner
+# Forward direction is also zero (FUTURE_ROUND is unrecoverable: a miner
 # that attaches round R+1 hasn't seen σ_{R+1} yet, so they're cheating).
 DRAND_ROUND_BACKWARD_TOLERANCE = int(
     _os.environ.get("DRAND_ROUND_BACKWARD_TOLERANCE", "0")

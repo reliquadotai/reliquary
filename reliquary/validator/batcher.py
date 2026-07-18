@@ -1512,14 +1512,11 @@ class GrpoWindowBatcher:
         and always rejected as FUTURE_ROUND.
 
         Backward direction allows only the configured
-        ``self.drand_round_backward_tolerance``. Production sets this to
-        zero: miners use a client-side boundary guard rather than claiming an
-        earlier round after it has rolled. An operator who explicitly widens
-        the tolerance may absorb cross-boundary HTTP RTT or clock skew, but
-        accepts the corresponding economic cost: a submitter can antedate by
-        up to ``tolerance`` rounds (3 s × tolerance) of chronological
-        priority. Arrival-time stamping removes validator queue latency from
-        that tradeoff; it does not make a positive backward tolerance free.
+        ``self.drand_round_backward_tolerance``. Production sets this to zero.
+        Auction ranking does not use the submitted round, and large body
+        transport is handled by signed precommit/reveal: the small precommit's
+        arrival fixes the drand observation before upload. Widening tolerance
+        therefore weakens freshness without solving the transport problem.
 
         Public so the HTTP /submit handler can run it pre-queue and
         short-circuit the rejection without waiting on the worker.
