@@ -403,7 +403,7 @@ class RejectedSubmission:
     seal_trigger_round: int | None = None
     prompt_hash_lead: str | None = None
     reject_stage: str | None = None
-    ingress_observability: dict[str, Any] = field(default_factory=dict)
+    ingress_observability: dict[str, Any] | None = None
 
 
 @dataclass
@@ -2868,7 +2868,7 @@ class GrpoWindowBatcher:
                         ),
                         reject_stage=reject_stage,
                         ingress_observability=(
-                            telemetry.archive_fields() if telemetry else {}
+                            telemetry.archive_fields() if telemetry else None
                         ),
                     )
                 )
