@@ -293,6 +293,16 @@ def test_signed_precommit_extends_only_matching_body_upload():
         assert server._per_window_counts[request.miner_hotkey] == 1
         assert batcher.poll_deadline() is True
 
+        replayed = client.post(
+            "/submit",
+            content=payload,
+            headers={
+                "Content-Type": "application/json",
+                "X-Reliquary-Precommit": receipt["receipt_id"],
+            },
+        )
+        assert replayed.json() == revealed.json()
+
 
 def test_precommit_arrival_is_authoritative_for_drand_reveal(monkeypatch):
     from reliquary.protocol.submission import WindowState

@@ -141,6 +141,7 @@ class _UploadPrecommitReceipt:
     drand_observation: DrandRoundObservation
     batcher: Any
     consumed: bool = False
+    outcome: BatchSubmissionResponse | None = None
 
 
 # How many recent verdicts to remember per hotkey. Bounded so the
@@ -2183,6 +2184,15 @@ class ValidatorServer:
             )
             if http_request.headers.get(PRECOMMIT_HEADER):
                 telemetry.apply_upload_precommit("present")
+            precommit_receipt: _UploadPrecommitReceipt | None = None
+
+            def _record_response(
+                result: BatchSubmissionResponse,
+            ) -> BatchSubmissionResponse:
+                if precommit_receipt is not None:
+                    precommit_receipt.outcome = result
+                return result
+
             telemetry.refresh_from_batcher(self.active_batcher)
             log_submission_stage(
                 logger,
@@ -2222,7 +2232,9 @@ class ValidatorServer:
                     accepted_into_pool=False,
                     **extra,
                 )
-                return BatchSubmissionResponse(accepted=False, reason=reason)
+                return _record_response(
+                    BatchSubmissionResponse(accepted=False, reason=reason)
+                )
 
             # ENVELOPE SIGNATURE CHECK — runs BEFORE rate-limit increment.
             #
@@ -2427,7 +2439,6 @@ class ValidatorServer:
                 raise HTTPException(status_code=409, detail="window_mismatch")
 
             precommit_reserved = False
-            precommit_receipt: _UploadPrecommitReceipt | None = None
             receipt_id = http_request.headers.get(PRECOMMIT_HEADER)
             if receipt_id:
                 precommit_status, receipt = self._claim_upload_precommit(
@@ -2456,9 +2467,8 @@ class ValidatorServer:
                         "replay",
                         arrival_ts=receipt.precommit_arrival_ts,
                     )
-                    return BatchSubmissionResponse(
-                        accepted=True,
-                        reason=RejectReason.SUBMITTED,
+                    return receipt.outcome or BatchSubmissionResponse(
+                        accepted=True, reason=RejectReason.SUBMITTED,
                     )
 
                 precommit_reserved = True
@@ -2552,9 +2562,11 @@ class ValidatorServer:
                     reject_reason=registration_reason.value,
                     accepted_into_pool=False,
                 )
-                return BatchSubmissionResponse(
-                    accepted=False,
-                    reason=registration_reason,
+                return _record_response(
+                    BatchSubmissionResponse(
+                        accepted=False,
+                        reason=registration_reason,
+                    )
                 )
 
             # Rate limit AFTER signature verification and active-window
@@ -2586,8 +2598,10 @@ class ValidatorServer:
                     reject_reason=RejectReason.RATE_LIMITED.value,
                     accepted_into_pool=False,
                 )
-                return BatchSubmissionResponse(
-                    accepted=False, reason=RejectReason.RATE_LIMITED,
+                return _record_response(
+                    BatchSubmissionResponse(
+                        accepted=False, reason=RejectReason.RATE_LIMITED,
+                    )
                 )
             if not precommit_reserved:
                 self._per_window_counts[hk] = n + 1
@@ -2625,6 +2639,12 @@ class ValidatorServer:
                     submitted_environment=submission_env_name,
                     prompt_source_error_type=type(exc).__name__,
                     quota_refunded=True,
+                )
+                _record_response(
+                    BatchSubmissionResponse(
+                        accepted=False,
+                        reason=RejectReason.WORKER_DROPPED,
+                    )
                 )
                 raise HTTPException(
                     status_code=503,
@@ -2665,8 +2685,10 @@ class ValidatorServer:
                     trigger_round=getattr(batcher, "_seal_trigger_round", None),
                     accepted_into_pool=False,
                 )
-                return BatchSubmissionResponse(
-                    accepted=False, reason=RejectReason.BATCH_FILLED,
+                return _record_response(
+                    BatchSubmissionResponse(
+                        accepted=False, reason=RejectReason.BATCH_FILLED,
+                    )
                 )
 
             # Cheap rejects pre-queue: every check below is O(1) against
@@ -2713,7 +2735,9 @@ class ValidatorServer:
                     accepted_into_pool=False,
                     **extra,
                 )
-                return BatchSubmissionResponse(accepted=False, reason=reason)
+                return _record_response(
+                    BatchSubmissionResponse(accepted=False, reason=reason)
+                )
 
             if batcher.current_checkpoint_hash and request.checkpoint_hash != batcher.current_checkpoint_hash:
                 return _cheap_reject(
@@ -2982,7 +3006,7 @@ class ValidatorServer:
                     reject_stage=None if resp.accepted else "proof",
                     accepted_into_pool=resp.accepted,
                 )
-                return resp
+                return _record_response(resp)
 
             submit_queue = self._submission_queue_for_environment(
                 submission_env_name
@@ -3001,8 +3025,10 @@ class ValidatorServer:
                     batch_filled_reason="proof_queue_full",
                     proof_queue_limit=MAX_PENDING_PROOF_QUEUE_DEPTH,
                 )
-            return BatchSubmissionResponse(
-                accepted=True, reason=RejectReason.SUBMITTED,
+            return _record_response(
+                BatchSubmissionResponse(
+                    accepted=True, reason=RejectReason.SUBMITTED,
+                )
             )
 
         @app.get("/state", response_model=GrpoBatchState)
