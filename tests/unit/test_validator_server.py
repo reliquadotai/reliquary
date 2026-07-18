@@ -1,5 +1,6 @@
 """Validator HTTP server — v2 GRPO market endpoints."""
 
+import hashlib
 import os
 import time
 from types import SimpleNamespace
@@ -219,7 +220,11 @@ def _precommit_for(
     request: BatchSubmissionRequest,
     *,
     payload_bytes: int,
+    payload_sha256: str | None = None,
 ) -> SubmissionPrecommitRequest:
+    if payload_sha256 is None:
+        payload = request.model_dump_json().encode("utf-8")
+        payload_sha256 = hashlib.sha256(payload).hexdigest()
     fields = {
         "miner_hotkey": request.miner_hotkey,
         "window_start": request.window_start,
@@ -228,6 +233,7 @@ def _precommit_for(
         "checkpoint_hash": request.checkpoint_hash,
         "environment": FakeEnv.name,
         "payload_bytes": payload_bytes,
+        "payload_sha256": payload_sha256,
         "drand_round": request.drand_round,
         "randomness": "cd" * 16,
         "protocol_version": request.protocol_version,
@@ -288,6 +294,55 @@ def test_signed_precommit_extends_only_matching_body_upload():
         assert batcher.poll_deadline() is True
 
 
+def test_precommit_arrival_is_authoritative_for_drand_reveal(monkeypatch):
+    from reliquary.protocol.submission import WindowState
+    from reliquary.validator.observability import DrandRoundObservation
+
+    server = ValidatorServer()
+    batcher = _batcher(window_start=500)
+    batcher.difficulty_auction_enabled = True
+    batcher.drand_round_check_enabled = True
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    request = _request(valid_merkle=True)
+    payload = request.model_dump_json().encode("utf-8")
+    precommit = _precommit_for(request, payload_bytes=len(payload))
+    observations = []
+
+    def observe(_self, drand_round, *, t_arrival=None):
+        observations.append(t_arrival)
+        return DrandRoundObservation(
+            submitted_drand_round=drand_round,
+            arrival_drand_round=drand_round,
+            drand_delta=0,
+            drand_tolerance=0,
+            drand_status="current",
+            reject_reason=None,
+        )
+
+    monkeypatch.setattr(GrpoWindowBatcher, "observe_drand_round", observe)
+
+    with TestClient(server.app) as client:
+        committed = client.post(
+            "/submit/precommit",
+            content=precommit.model_dump_json(),
+            headers={"Content-Type": "application/json"},
+        ).json()
+        revealed = client.post(
+            "/submit",
+            content=payload,
+            headers={
+                "Content-Type": "application/json",
+                "X-Reliquary-Precommit": committed["receipt_id"],
+            },
+        )
+
+    assert revealed.json()["accepted"] is True
+    # The body reveal reuses the signed receipt's observation instead of
+    # re-reading a potentially newer drand round at upload completion.
+    assert len(observations) == 1
+
+
 def test_precommit_rejects_body_with_different_serialized_size():
     from reliquary.protocol.submission import WindowState
 
@@ -314,6 +369,39 @@ def test_precommit_rejects_body_with_different_serialized_size():
                 "X-Reliquary-Precommit": committed["receipt_id"],
             },
         )
+    assert response.json()["reason"] == RejectReason.PRECOMMIT_INVALID.value
+
+
+def test_precommit_rejects_same_size_body_substitution():
+    from reliquary.protocol.submission import WindowState
+
+    server = ValidatorServer()
+    batcher = _batcher(window_start=500)
+    batcher.difficulty_auction_enabled = True
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    request = _request(valid_merkle=True)
+    payload = request.model_dump_json().encode("utf-8")
+    tampered = payload.replace(b'"reward":1.0', b'"reward":0.0', 1)
+    assert tampered != payload
+    assert len(tampered) == len(payload)
+    precommit = _precommit_for(request, payload_bytes=len(payload))
+
+    with TestClient(server.app) as client:
+        committed = client.post(
+            "/submit/precommit",
+            content=precommit.model_dump_json(),
+            headers={"Content-Type": "application/json"},
+        ).json()
+        response = client.post(
+            "/submit",
+            content=tampered,
+            headers={
+                "Content-Type": "application/json",
+                "X-Reliquary-Precommit": committed["receipt_id"],
+            },
+        )
+
     assert response.json()["reason"] == RejectReason.PRECOMMIT_INVALID.value
 
 

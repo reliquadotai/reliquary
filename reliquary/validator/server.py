@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import hashlib
 import importlib.metadata
 import logging
 import numbers
@@ -131,10 +132,13 @@ class _UploadPrecommitReceipt:
     checkpoint_hash: str
     environment: str
     payload_bytes: int
+    payload_sha256: str
     drand_round: int
     protocol_version: int
     nonce: str
     expires_at_wall: float
+    precommit_arrival_ts: float
+    drand_observation: DrandRoundObservation
     batcher: Any
     consumed: bool = False
 
@@ -226,6 +230,7 @@ class _SubmissionBodyLimitMiddleware:
                 return
 
         received = 0
+        body_hasher = hashlib.sha256()
         over_limit = False
         buffered_messages: list[dict[str, Any]] = []
 
@@ -235,7 +240,9 @@ class _SubmissionBodyLimitMiddleware:
             if message.get("type") == "http.request":
                 state = scope.setdefault("state", {})
                 state.setdefault("body_receive_started_at", time.time())
-                received += len(message.get("body", b""))
+                chunk = message.get("body", b"")
+                received += len(chunk)
+                body_hasher.update(chunk)
                 if received > max_bytes:
                     over_limit = True
                     # Complete the downstream body stream without forwarding
@@ -249,6 +256,7 @@ class _SubmissionBodyLimitMiddleware:
                     }
                 if not message.get("more_body", False):
                     state["body_bytes_received"] = received
+                    state["body_sha256"] = body_hasher.hexdigest()
                     state["body_completed_at"] = time.time()
             return message
 
@@ -852,6 +860,7 @@ class ValidatorServer:
         *,
         environment: str,
         payload_bytes: int,
+        payload_sha256: str,
     ) -> bool:
         return (
             receipt.miner_hotkey == request.miner_hotkey
@@ -861,6 +870,7 @@ class ValidatorServer:
             and receipt.checkpoint_hash == request.checkpoint_hash
             and receipt.environment == environment
             and receipt.payload_bytes == payload_bytes
+            and secrets.compare_digest(receipt.payload_sha256, payload_sha256)
             and receipt.drand_round == request.drand_round
             and receipt.protocol_version == request.protocol_version
             and receipt.nonce == request.nonce
@@ -874,6 +884,7 @@ class ValidatorServer:
         batcher: Any,
         environment: str,
         payload_bytes: int,
+        payload_sha256: str,
         body_completed_at: float,
     ) -> tuple[str, _UploadPrecommitReceipt | None]:
         """Return valid, replay, expired, or invalid for one body reveal."""
@@ -900,6 +911,7 @@ class ValidatorServer:
             request,
             environment=environment,
             payload_bytes=payload_bytes,
+            payload_sha256=payload_sha256,
         ):
             return "invalid", None
         if receipt.consumed:
@@ -1964,6 +1976,7 @@ class ValidatorServer:
                 checkpoint_hash=request.checkpoint_hash,
                 environment=request.environment,
                 payload_bytes=request.payload_bytes,
+                payload_sha256=request.payload_sha256,
                 drand_round=request.drand_round,
                 randomness=batcher.randomness,
                 protocol_version=request.protocol_version,
@@ -1992,12 +2005,25 @@ class ValidatorServer:
                     upload_deadline_ts=existing.expires_at_wall,
                 )
             if batcher.drand_round_check_enabled:
-                round_reject = batcher.validate_drand_round(
-                    request.drand_round,
-                    t_arrival=t_arrival,
+                if hasattr(type(batcher), "observe_drand_round"):
+                    drand_observation = batcher.observe_drand_round(
+                        request.drand_round,
+                        t_arrival=t_arrival,
+                    )
+                else:
+                    round_reject = batcher.validate_drand_round(
+                        request.drand_round,
+                        t_arrival=t_arrival,
+                    )
+                    drand_observation = self._fallback_drand_observation(
+                        request, batcher, round_reject,
+                    )
+                if drand_observation.reject_reason is not None:
+                    return reject(drand_observation.reject_reason)
+            else:
+                drand_observation = self._fallback_drand_observation(
+                    request, batcher, None,
                 )
-                if round_reject is not None:
-                    return reject(round_reject)
             prompt_range = getattr(batcher, "prompt_range", None)
             if prompt_range is not None:
                 lo, hi = prompt_range
@@ -2062,10 +2088,13 @@ class ValidatorServer:
                 checkpoint_hash=request.checkpoint_hash,
                 environment=request.environment,
                 payload_bytes=request.payload_bytes,
+                payload_sha256=request.payload_sha256.lower(),
                 drand_round=request.drand_round,
                 protocol_version=request.protocol_version,
                 nonce=request.nonce,
                 expires_at_wall=expires_at_wall,
+                precommit_arrival_ts=t_arrival,
+                drand_observation=drand_observation,
                 batcher=batcher,
             )
             self._upload_precommit_receipts[receipt_id] = receipt
@@ -2110,6 +2139,12 @@ class ValidatorServer:
                     _serialized_submission_bytes,
                     request,
                 )
+            payload_sha256 = str(
+                getattr(http_request.state, "body_sha256", "") or ""
+            ).lower()
+            if not payload_sha256:
+                canonical_body = request.model_dump_json().encode("utf-8")
+                payload_sha256 = hashlib.sha256(canonical_body).hexdigest()
             body_completed_at = float(
                 getattr(http_request.state, "body_completed_at", time.time())
             )
@@ -2367,6 +2402,7 @@ class ValidatorServer:
                 raise HTTPException(status_code=409, detail="window_mismatch")
 
             precommit_reserved = False
+            precommit_receipt: _UploadPrecommitReceipt | None = None
             receipt_id = http_request.headers.get(PRECOMMIT_HEADER)
             if receipt_id:
                 precommit_status, receipt = self._claim_upload_precommit(
@@ -2375,6 +2411,7 @@ class ValidatorServer:
                     batcher=batcher,
                     environment=submission_env_name,
                     payload_bytes=payload_bytes,
+                    payload_sha256=payload_sha256,
                     body_completed_at=body_completed_at,
                 )
                 if precommit_status == "expired":
@@ -2394,6 +2431,7 @@ class ValidatorServer:
                     )
 
                 precommit_reserved = True
+                precommit_receipt = receipt
                 resolver = getattr(
                     type(batcher), "resolve_upload_precommit", None
                 )
@@ -2648,10 +2686,14 @@ class ValidatorServer:
                     reject_stage="checkpoint",
                 )
             if batcher.drand_round_check_enabled:
-                if hasattr(type(batcher), "observe_drand_round"):
+                if precommit_reserved and precommit_receipt is not None:
+                    drand_observation = precommit_receipt.drand_observation
+                    drand_timing_source = "precommit_arrival"
+                elif hasattr(type(batcher), "observe_drand_round"):
                     drand_observation = batcher.observe_drand_round(
                         request.drand_round, t_arrival=t_arrival,
                     )
+                    drand_timing_source = "body_arrival"
                 else:
                     round_reject = batcher.validate_drand_round(
                         request.drand_round, t_arrival=t_arrival,
@@ -2659,6 +2701,7 @@ class ValidatorServer:
                     drand_observation = self._fallback_drand_observation(
                         request, batcher, round_reject,
                     )
+                    drand_timing_source = "body_arrival"
                 telemetry.apply_drand(drand_observation)
                 log_submission_stage(
                     logger,
@@ -2678,6 +2721,7 @@ class ValidatorServer:
                     drand_tolerance=drand_observation.drand_tolerance,
                     drand_status=drand_observation.drand_status,
                     current_round=drand_observation.arrival_drand_round,
+                    drand_timing_source=drand_timing_source,
                 )
                 round_reject = drand_observation.reject_reason
                 if round_reject is not None:

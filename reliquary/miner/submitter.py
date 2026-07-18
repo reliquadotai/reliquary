@@ -8,6 +8,7 @@ out of scope here — see the GRPO refactor plan.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import time
@@ -265,6 +266,7 @@ async def submit_batch_v2(
             "checkpoint_hash": request.checkpoint_hash,
             "environment": environment,
             "payload_bytes": len(payload),
+            "payload_sha256": hashlib.sha256(payload).hexdigest(),
             "drand_round": drand_round,
             "randomness": randomness,
             "protocol_version": request.protocol_version,

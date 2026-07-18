@@ -29,7 +29,7 @@ COMMIT_DOMAIN = b"grail-commit-v1"
 # clients are expected to construct the envelope with the same byte layout
 # the validator expects.
 ENVELOPE_DOMAIN = b"reliquary-envelope-v1"
-PRECOMMIT_DOMAIN = b"reliquary-upload-precommit-v1"
+PRECOMMIT_DOMAIN = b"reliquary-upload-precommit-v2"
 
 
 def hash_commitments(commitments: list[dict]) -> bytes:
@@ -296,6 +296,7 @@ def build_precommit_binding(
     checkpoint_hash: str,
     environment: str,
     payload_bytes: int,
+    payload_sha256: str,
     drand_round: int,
     randomness: str,
     protocol_version: int,
@@ -304,9 +305,10 @@ def build_precommit_binding(
     """Build the domain-separated upload-precommit message.
 
     This repeats the envelope's routing identity and additionally binds the
-    environment, exact serialized byte count, and protocol version.  The
-    validator can therefore reserve a short reveal grace without trusting an
-    unsigned header or any miner-controlled arrival timestamp.
+    environment, exact serialized byte count and digest, and protocol version.
+    The validator can therefore reserve a short reveal grace without trusting
+    an unsigned header or any miner-controlled arrival timestamp, and the miner
+    cannot replace a committed body with a same-sized reveal.
     """
 
     def _lp(value: bytes) -> bytes:
@@ -326,6 +328,7 @@ def build_precommit_binding(
         (checkpoint_hash or "").encode("utf-8"),
         environment.encode("utf-8"),
         int(payload_bytes).to_bytes(8, "big", signed=False),
+        _hex_bytes(payload_sha256),
         int(drand_round).to_bytes(8, "big", signed=False),
         _hex_bytes(randomness),
         int(protocol_version).to_bytes(8, "big", signed=False),

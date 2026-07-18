@@ -276,10 +276,10 @@ class BatchSubmissionResponse(BaseModel):
 class SubmissionPrecommitRequest(BaseModel):
     """Small signed commitment sent before a potentially large submission.
 
-    The Merkle root commits the rollout content, while ``payload_bytes`` binds
-    the exact serialized reveal size used by ingress accounting.  A successful
-    precommit reserves one normal per-window submission attempt; it does not
-    reserve an auction slot or bypass any body-time validation.
+    ``payload_sha256`` commits the exact serialized reveal and
+    ``payload_bytes`` binds its ingress accounting size. A successful precommit
+    reserves one normal per-window submission attempt; it does not reserve an
+    auction slot or bypass content validation.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -291,6 +291,7 @@ class SubmissionPrecommitRequest(BaseModel):
     checkpoint_hash: str = Field(..., min_length=0, max_length=256)
     environment: str = Field(..., min_length=1, max_length=64)
     payload_bytes: int = Field(..., gt=0)
+    payload_sha256: str = Field(..., pattern=r"^[0-9a-fA-F]{64}$")
     drand_round: int = Field(..., ge=0)
     protocol_version: int = Field(default=0, ge=0)
     nonce: str = Field(..., min_length=1, max_length=128)
