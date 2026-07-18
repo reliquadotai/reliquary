@@ -135,6 +135,15 @@ class SubmitTelemetry:
     t_arrival: float
     prompt_hash_lead: str
     merkle_root_lead: str
+    payload_bytes: int | None = None
+    content_length_bytes: int | None = None
+    payload_sha256_lead: str | None = None
+    t_body_started: float | None = None
+    t_body_completed: float | None = None
+    body_read_ms: float | None = None
+    ingress_ms: float | None = None
+    upload_precommit_status: str = "none"
+    precommit_arrival_ts: float | None = None
     arrival_drand_round: int | None = None
     drand_delta: int | None = None
     drand_tolerance: int | None = None
@@ -144,10 +153,19 @@ class SubmitTelemetry:
     valid_submissions_at_arrival: int | None = None
     valid_submissions_at_decision: int | None = None
     t_enqueued: float | None = None
+    t_dequeued: float | None = None
+    queue_depth_at_arrival: int | None = None
+    queue_depth_at_dequeue: int | None = None
     t_proof_started: float | None = None
+    t_reward_started: float | None = None
+    t_reward_finished: float | None = None
+    t_admission_started: float | None = None
+    t_admission_finished: float | None = None
     t_verified: float | None = None
     t_decision: float | None = None
     queue_wait_ms: float | None = None
+    reward_grading_ms: float | None = None
+    admission_commit_ms: float | None = None
     verify_ms: float | None = None
     total_ms: float | None = None
     legacy_merkle_status: str | None = None
@@ -161,7 +179,23 @@ class SubmitTelemetry:
         request: BatchSubmissionRequest,
         *,
         t_arrival: float,
+        payload_bytes: int | None = None,
+        content_length_bytes: int | None = None,
+        payload_sha256: str | None = None,
+        t_body_started: float | None = None,
+        t_body_completed: float | None = None,
+        queue_depth_at_arrival: int | None = None,
     ) -> "SubmitTelemetry":
+        body_read_ms = None
+        if t_body_started is not None and t_body_completed is not None:
+            body_read_ms = max(
+                0.0, (float(t_body_completed) - float(t_body_started)) * 1000.0
+            )
+        ingress_ms = None
+        if t_body_completed is not None:
+            ingress_ms = max(
+                0.0, (float(t_body_completed) - float(t_arrival)) * 1000.0
+            )
         return cls(
             window_n=request.window_start,
             prompt_idx=request.prompt_idx,
@@ -172,6 +206,14 @@ class SubmitTelemetry:
             t_arrival=t_arrival,
             prompt_hash_lead=canonical_prompt_hash_lead(request.prompt_idx),
             merkle_root_lead=merkle_root_lead(request.merkle_root),
+            payload_bytes=payload_bytes,
+            content_length_bytes=content_length_bytes,
+            payload_sha256_lead=(payload_sha256[:12] if payload_sha256 else None),
+            t_body_started=t_body_started,
+            t_body_completed=t_body_completed,
+            body_read_ms=body_read_ms,
+            ingress_ms=ingress_ms,
+            queue_depth_at_arrival=queue_depth_at_arrival,
         )
 
     def apply_legacy_merkle(
@@ -218,15 +260,76 @@ class SubmitTelemetry:
         else:
             self.valid_submissions_at_arrival = count
 
-    def mark_enqueued(self, ts: float | None = None) -> None:
-        self.t_enqueued = ts if ts is not None else time.time()
+    def apply_upload_precommit(
+        self,
+        status: str,
+        *,
+        arrival_ts: float | None = None,
+    ) -> None:
+        self.upload_precommit_status = status
+        self.precommit_arrival_ts = arrival_ts
 
-    def mark_proof_started(self, ts: float | None = None) -> None:
+    def mark_enqueued(
+        self,
+        ts: float | None = None,
+        *,
+        queue_depth: int | None = None,
+    ) -> None:
+        self.t_enqueued = ts if ts is not None else time.time()
+        if queue_depth is not None:
+            self.queue_depth_at_arrival = int(queue_depth)
+
+    def mark_proof_started(
+        self,
+        ts: float | None = None,
+        *,
+        queue_depth: int | None = None,
+    ) -> None:
         self.t_proof_started = ts if ts is not None else time.time()
+        if self.t_dequeued is None:
+            self.mark_dequeued(self.t_proof_started, queue_depth=queue_depth)
+        elif queue_depth is not None:
+            self.queue_depth_at_dequeue = int(queue_depth)
+
+    def mark_dequeued(
+        self,
+        ts: float | None = None,
+        *,
+        queue_depth: int | None = None,
+    ) -> None:
+        self.t_dequeued = ts if ts is not None else time.time()
+        if queue_depth is not None:
+            self.queue_depth_at_dequeue = int(queue_depth)
         if self.t_enqueued is not None:
-            self.queue_wait_ms = max(0.0, (self.t_proof_started - self.t_enqueued) * 1000.0)
+            self.queue_wait_ms = max(
+                0.0, (self.t_dequeued - self.t_enqueued) * 1000.0
+            )
         else:
-            self.queue_wait_ms = max(0.0, (self.t_proof_started - self.t_arrival) * 1000.0)
+            self.queue_wait_ms = max(
+                0.0, (self.t_dequeued - self.t_arrival) * 1000.0
+            )
+
+    def mark_reward_started(self, ts: float | None = None) -> None:
+        self.t_reward_started = ts if ts is not None else time.time()
+
+    def mark_reward_finished(self, ts: float | None = None) -> None:
+        self.t_reward_finished = ts if ts is not None else time.time()
+        if self.t_reward_started is not None:
+            self.reward_grading_ms = max(
+                0.0,
+                (self.t_reward_finished - self.t_reward_started) * 1000.0,
+            )
+
+    def mark_admission_started(self, ts: float | None = None) -> None:
+        self.t_admission_started = ts if ts is not None else time.time()
+
+    def mark_admission_finished(self, ts: float | None = None) -> None:
+        self.t_admission_finished = ts if ts is not None else time.time()
+        if self.t_admission_started is not None:
+            self.admission_commit_ms = max(
+                0.0,
+                (self.t_admission_finished - self.t_admission_started) * 1000.0,
+            )
 
     def mark_decision(self, ts: float | None = None, *, verified: bool = False) -> None:
         t = ts if ts is not None else time.time()
@@ -243,9 +346,23 @@ class SubmitTelemetry:
             "prompt_idx": self.prompt_idx,
             "hotkey": self.hotkey,
             "t_arrival": self.t_arrival,
+            "t_body_started": self.t_body_started,
+            "t_body_completed": self.t_body_completed,
+            "t_dequeued": self.t_dequeued,
             "t_verified": self.t_verified,
             "t_decision": self.t_decision,
+            "payload_bytes": self.payload_bytes,
+            "content_length_bytes": self.content_length_bytes,
+            "payload_sha256_lead": self.payload_sha256_lead,
+            "body_read_ms": self.body_read_ms,
+            "ingress_ms": self.ingress_ms,
+            "upload_precommit_status": self.upload_precommit_status,
+            "precommit_arrival_ts": self.precommit_arrival_ts,
+            "queue_depth_at_arrival": self.queue_depth_at_arrival,
+            "queue_depth_at_dequeue": self.queue_depth_at_dequeue,
             "queue_wait_ms": self.queue_wait_ms,
+            "reward_grading_ms": self.reward_grading_ms,
+            "admission_commit_ms": self.admission_commit_ms,
             "verify_ms": self.verify_ms,
             "total_ms": self.total_ms,
             "protocol_version": self.protocol_version,
@@ -277,13 +394,38 @@ class SubmitTelemetry:
         return {
             "arrival_ts": self.t_arrival,
             "decision_ts": self.t_decision,
+            "payload_bytes": self.payload_bytes,
+            "body_read_ms": self.body_read_ms,
+            "ingress_ms": self.ingress_ms,
+            "upload_precommit_status": self.upload_precommit_status,
+            "precommit_arrival_ts": self.precommit_arrival_ts,
             "submitted_drand_round": self.submitted_drand_round,
             "arrival_drand_round": self.arrival_drand_round,
             "drand_delta": self.drand_delta,
             "seal_trigger_round": self.seal_trigger_round,
             "prompt_hash_lead": self.prompt_hash_lead,
             "queue_wait_ms": self.queue_wait_ms,
+            "reward_grading_ms": self.reward_grading_ms,
+            "admission_commit_ms": self.admission_commit_ms,
             "verify_ms": self.verify_ms,
+            "total_ms": self.total_ms,
+        }
+
+    def archive_fields(self) -> dict[str, Any]:
+        """Compact ingress/admission evidence persisted with one candidate."""
+        return {
+            "payload_bytes": self.payload_bytes,
+            "content_length_bytes": self.content_length_bytes,
+            "payload_sha256_lead": self.payload_sha256_lead,
+            "body_read_ms": self.body_read_ms,
+            "ingress_ms": self.ingress_ms,
+            "upload_precommit_status": self.upload_precommit_status,
+            "precommit_arrival_ts": self.precommit_arrival_ts,
+            "queue_depth_at_arrival": self.queue_depth_at_arrival,
+            "queue_depth_at_dequeue": self.queue_depth_at_dequeue,
+            "queue_wait_ms": self.queue_wait_ms,
+            "reward_grading_ms": self.reward_grading_ms,
+            "admission_commit_ms": self.admission_commit_ms,
             "total_ms": self.total_ms,
         }
 

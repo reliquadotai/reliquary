@@ -73,6 +73,14 @@ def _valid_submission(prompt_idx, k=4, hotkey="hk", eos_first=False):
         code_semantic_auth_positive_findings=1,
         code_semantic_auth_positive_min_prob=0.0004,
         claimed_checkpoint_hash="sha256:fake",
+        ingress_observability={
+            "payload_bytes": 450_000,
+            "body_read_ms": 4100.0,
+            "upload_precommit_status": "valid",
+            "queue_wait_ms": 125.0,
+            "reward_grading_ms": 80.0,
+            "admission_commit_ms": 1.5,
+        },
     )
 
 
@@ -209,6 +217,12 @@ async def test_archive_includes_prompt_and_rollout_content():
     assert archive["batch"][1]["response_time"] == pytest.approx(7.0)
     assert archive["batch"][1]["arrival_age_seconds"] == pytest.approx(6.5)
     assert archive["window_opened_wall_ts_by_environment"] == {"fake": 1_000.0}
+    assert entry0["payload_bytes"] == 450_000
+    assert entry0["body_read_ms"] == pytest.approx(4100.0)
+    assert entry0["upload_precommit_status"] == "valid"
+    assert entry0["queue_wait_ms"] == pytest.approx(125.0)
+    assert entry0["reward_grading_ms"] == pytest.approx(80.0)
+    assert entry0["admission_commit_ms"] == pytest.approx(1.5)
 
     # filter telemetry passed through verbatim.
     assert entry0["sketch_diff_max"] == 412

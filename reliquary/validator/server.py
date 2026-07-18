@@ -541,6 +541,8 @@ class _Health(BaseModel):
     current_window_open_drand_round: int | None = None
     seal_trigger_round: int | None = None
     drand_round_backward_tolerance: int
+    upload_precommit_enabled: bool = True
+    submission_upload_grace_seconds: float = SUBMISSION_UPLOAD_GRACE_SECONDS
     batch_size: int
     queue_depth: int | None = None
     queue_depth_by_environment: dict[str, int] = Field(default_factory=dict)
@@ -1558,6 +1560,8 @@ class ValidatorServer:
                 getattr(batcher, "_seal_trigger_round", None) if batcher else None
             ),
             drand_round_backward_tolerance=DRAND_ROUND_BACKWARD_TOLERANCE,
+            upload_precommit_enabled=True,
+            submission_upload_grace_seconds=SUBMISSION_UPLOAD_GRACE_SECONDS,
             batch_size=B_BATCH,
             queue_depth=self.submit_queue_depth,
             queue_depth_by_environment=self.submit_queue_depth_by_environment,
@@ -2148,6 +2152,18 @@ class ValidatorServer:
             body_completed_at = float(
                 getattr(http_request.state, "body_completed_at", time.time())
             )
+            body_started_at = getattr(
+                http_request.state, "body_receive_started_at", None
+            )
+            raw_content_length = http_request.headers.get("content-length")
+            try:
+                content_length_bytes = (
+                    int(raw_content_length)
+                    if raw_content_length is not None
+                    else None
+                )
+            except ValueError:
+                content_length_bytes = None
             if payload_bytes > MAX_SUBMISSION_PAYLOAD_BYTES:
                 raise HTTPException(
                     status_code=413,
@@ -2156,8 +2172,17 @@ class ValidatorServer:
             request._payload_bytes = payload_bytes
             hk = request.miner_hotkey
             telemetry = SubmitTelemetry.from_request(
-                request, t_arrival=t_arrival,
+                request,
+                t_arrival=t_arrival,
+                payload_bytes=payload_bytes,
+                content_length_bytes=content_length_bytes,
+                payload_sha256=payload_sha256,
+                t_body_started=body_started_at,
+                t_body_completed=body_completed_at,
+                queue_depth_at_arrival=self.submit_queue_depth,
             )
+            if http_request.headers.get(PRECOMMIT_HEADER):
+                telemetry.apply_upload_precommit("present")
             telemetry.refresh_from_batcher(self.active_batcher)
             log_submission_stage(
                 logger,
@@ -2415,16 +2440,22 @@ class ValidatorServer:
                     body_completed_at=body_completed_at,
                 )
                 if precommit_status == "expired":
+                    telemetry.apply_upload_precommit("expired")
                     return _reject_before_quota(
                         RejectReason.PRECOMMIT_EXPIRED,
                         reject_stage="upload_precommit",
                     )
                 if precommit_status == "invalid" or receipt is None:
+                    telemetry.apply_upload_precommit("invalid")
                     return _reject_before_quota(
                         RejectReason.PRECOMMIT_INVALID,
                         reject_stage="upload_precommit",
                     )
                 if precommit_status == "replay":
+                    telemetry.apply_upload_precommit(
+                        "replay",
+                        arrival_ts=receipt.precommit_arrival_ts,
+                    )
                     return BatchSubmissionResponse(
                         accepted=True,
                         reason=RejectReason.SUBMITTED,
@@ -2432,6 +2463,10 @@ class ValidatorServer:
 
                 precommit_reserved = True
                 precommit_receipt = receipt
+                telemetry.apply_upload_precommit(
+                    "valid",
+                    arrival_ts=receipt.precommit_arrival_ts,
+                )
                 resolver = getattr(
                     type(batcher), "resolve_upload_precommit", None
                 )
@@ -2882,7 +2917,7 @@ class ValidatorServer:
                         reject_stage="proof_admission",
                         batch_filled_reason=start_reason,
                     )
-                telemetry.mark_proof_started()
+                telemetry.mark_proof_started(queue_depth=0)
                 log_submission_stage(
                     logger,
                     logging.INFO,
@@ -2892,12 +2927,15 @@ class ValidatorServer:
                     reject_reason=None,
                 )
                 try:
+                    telemetry.mark_admission_started()
                     try:
                         resp = self._call_accept_submission(
                             batcher, request, telemetry,
                         )
                     except PromptSourceUnavailable as exc:
                         _prompt_source_unavailable(exc)
+                    finally:
+                        telemetry.mark_admission_finished()
                 finally:
                     self._finish_proof_admission(batcher, request)
                 telemetry.refresh_from_batcher(batcher, at_decision=True)
@@ -2946,10 +2984,10 @@ class ValidatorServer:
                 )
                 return resp
 
-            telemetry.mark_enqueued()
             submit_queue = self._submission_queue_for_environment(
                 submission_env_name
             )
+            telemetry.mark_enqueued(queue_depth=submit_queue.qsize())
             try:
                 submit_queue.put_nowait((request, batcher, telemetry))
             except asyncio.QueueFull:
@@ -3105,6 +3143,7 @@ class ValidatorServer:
                 telemetry = SubmitTelemetry.from_request(
                     request, t_arrival=time.time(),
                 )
+            telemetry.mark_dequeued(queue_depth=queue.qsize())
             telemetry.refresh_from_batcher(batcher)
             # Silently drop items whose batcher is no longer the active one.
             # This is what relieves pressure from a saturated window: the
@@ -3256,11 +3295,15 @@ class ValidatorServer:
                         type(batcher), "compute_submission_rewards", None
                     )
                     if precompute_rewards is not None:
-                        reward_computation = await asyncio.to_thread(
-                            precompute_rewards,
-                            batcher,
-                            request,
-                        )
+                        telemetry.mark_reward_started()
+                        try:
+                            reward_computation = await asyncio.to_thread(
+                                precompute_rewards,
+                                batcher,
+                                request,
+                            )
+                        finally:
+                            telemetry.mark_reward_finished()
                         log_submission_stage(
                             logger,
                             logging.INFO,
@@ -3277,13 +3320,17 @@ class ValidatorServer:
                                 else None
                             ),
                         )
-                    response = await asyncio.to_thread(
-                        self._call_accept_submission,
-                        batcher,
-                        request,
-                        telemetry,
-                        reward_computation,
-                    )
+                    telemetry.mark_admission_started()
+                    try:
+                        response = await asyncio.to_thread(
+                            self._call_accept_submission,
+                            batcher,
+                            request,
+                            telemetry,
+                            reward_computation,
+                        )
+                    finally:
+                        telemetry.mark_admission_finished()
                 finally:
                     self._inflight_proofs = max(0, self._inflight_proofs - 1)
                     remaining = max(

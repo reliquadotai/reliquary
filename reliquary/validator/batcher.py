@@ -364,6 +364,7 @@ class ValidSubmission:
     reward_vector: str = ""
     truncated_count: int = 0
     reward_shape: dict[str, Any] = field(default_factory=dict)
+    ingress_observability: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         self.merkle_root = self.merkle_root_bytes
@@ -402,6 +403,7 @@ class RejectedSubmission:
     seal_trigger_round: int | None = None
     prompt_hash_lead: str | None = None
     reject_stage: str | None = None
+    ingress_observability: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -2793,6 +2795,9 @@ class GrpoWindowBatcher:
             reward_vector=reward_shape.reward_vector,
             truncated_count=truncated_count,
             reward_shape=reward_shape.to_log_dict(),
+            ingress_observability=(
+                telemetry.archive_fields() if telemetry else {}
+            ),
         )
         # The caller decides whether this is an auction winner or an immediate
         # legacy admission.
@@ -2862,6 +2867,9 @@ class GrpoWindowBatcher:
                             telemetry.prompt_hash_lead if telemetry else None
                         ),
                         reject_stage=reject_stage,
+                        ingress_observability=(
+                            telemetry.archive_fields() if telemetry else {}
+                        ),
                     )
                 )
         return BatchSubmissionResponse(accepted=False, reason=reason)
@@ -2976,6 +2984,11 @@ class GrpoWindowBatcher:
                 "proof_passed": None,
                 "selected": False,
                 "status": "ranked",
+                **(
+                    pending_submission.telemetry.archive_fields()
+                    if pending_submission.telemetry is not None
+                    else {}
+                ),
             }
             candidate_rows.append(row)
             self.difficulty_auction_metadata_by_id[id(pending_submission)] = row
