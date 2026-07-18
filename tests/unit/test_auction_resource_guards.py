@@ -326,7 +326,7 @@ def test_code_grader_crash_is_not_a_free_retry():
     )
 
     assert crashed.accepted is False
-    assert crashed.reason is RejectReason.REWARD_MISMATCH
+    assert crashed.reason is RejectReason.WORKER_DROPPED
     assert retry.accepted is False
     assert retry.reason is RejectReason.HASH_DUPLICATE
     assert batcher.logical_group_reservation_count == 1
