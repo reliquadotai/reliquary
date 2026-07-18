@@ -73,6 +73,12 @@ NETWORK_UPLOAD_LATENCY = 30
 # Grace period = block variance + upload latency.
 UPLOAD_GRACE_PERIOD = BLOCK_TIME_VARIANCE + NETWORK_UPLOAD_LATENCY
 
+# A miner may commit a completed submission before the auction deadline and
+# finish uploading the matching body during this bounded reveal interval.  The
+# grace never extends generation: only a signed Merkle root and exact body size
+# received before the collection cutoff can arm it.
+SUBMISSION_UPLOAD_GRACE_SECONDS = float(UPLOAD_GRACE_PERIOD)
+
 # Buffer for future drand beacon (seconds).
 DRAND_FUTURE_BUFFER = 30
 
@@ -220,6 +226,21 @@ if (
 # Per-batcher reservation caps remain the primary bound; this is the final
 # backstop during a window swap or prolonged GPU stall.
 MAX_PENDING_PROOF_QUEUE_DEPTH = 256
+
+# Reward admission runs before deferred GRAIL proof.  Math grading benefits from
+# modest CPU parallelism; Code already fans each group over the sandbox pool, so
+# two group workers are enough to keep that pool fed without an unbounded thread
+# explosion.  These are validator-runtime capacities, not miner wire constants.
+MATH_ADMISSION_WORKERS = int(
+    _os.environ.get("RELIQUARY_MATH_ADMISSION_WORKERS", "4")
+)
+CODE_ADMISSION_WORKERS = int(
+    _os.environ.get("RELIQUARY_CODE_ADMISSION_WORKERS", "2")
+)
+if not 1 <= MATH_ADMISSION_WORKERS <= 16:
+    raise ValueError("RELIQUARY_MATH_ADMISSION_WORKERS must be within [1, 16]")
+if not 1 <= CODE_ADMISSION_WORKERS <= 8:
+    raise ValueError("RELIQUARY_CODE_ADMISSION_WORKERS must be within [1, 8]")
 
 # A hotkey that repeatedly reaches the expensive proof path and then fails
 # behavioural/integrity checks should not be allowed to consume the whole
@@ -474,6 +495,12 @@ HASH_DEDUP_RETENTION_WINDOWS = int(
 # — one slot per prompt a hotkey can credibly win in a window.
 MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW = 8
 
+# Signed upload precommits are tiny, but still bounded independently from the
+# large-body proof queue.  A precommit consumes the same per-window hotkey quota
+# as a direct submission, so abandoning an upload cannot create free receipt
+# spam or reserve an unbounded number of deadline extensions.
+MAX_PENDING_UPLOAD_PRECOMMITS_PER_ENV = MAX_PENDING_PROOF_QUEUE_DEPTH
+
 # Per-hotkey cap on BAD_ENVELOPE_SIGNATURE rejects per window. The
 # envelope-signature gate (PR #35) deliberately does NOT bump
 # ``_per_window_counts`` on bad-sig rejects so an anonymous spoofer
@@ -601,17 +628,16 @@ if DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR <= 0:
 #     sides NTP-synced and the miner respecting the safety window, no
 #     honest submission should land in the wrong drand round.
 #
-# Anything > 0 here opens an antedating window: an attacker could claim
-# a slightly-earlier chronological tier than they actually earned. With
-# zero, the only path to a slot is to actually be there in time —
-# matches the original v2.3 design intent. Operators can re-widen via
-# the ``DRAND_ROUND_BACKWARD_TOLERANCE`` env var if their cross-continent
-# RTT profile justifies it (e.g. validators in EU serving miners in AU
-# may need 1-2 to absorb 100-300 ms RTT spillover around a boundary).
+# Submitted drand no longer participates in auction rank, but accepting an old
+# round still weakens the signed freshness contract and makes replay analysis
+# ambiguous. Keep this at zero. Cross-continent body upload is handled by the
+# signed precommit/reveal grace, whose drand observation is fixed when the small
+# precommit reaches the validator; widening this tolerance is not the transport
+# fix.
 # Tests pin specific values explicitly via
 # ``GrpoWindowBatcher(drand_round_backward_tolerance=...)``.
 #
-# Forward direction stays zero (FUTURE_ROUND is unrecoverable: a miner
+# Forward direction is also zero (FUTURE_ROUND is unrecoverable: a miner
 # that attaches round R+1 hasn't seen σ_{R+1} yet, so they're cheating).
 DRAND_ROUND_BACKWARD_TOLERANCE = int(
     _os.environ.get("DRAND_ROUND_BACKWARD_TOLERANCE", "0")

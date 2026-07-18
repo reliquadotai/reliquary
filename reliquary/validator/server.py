@@ -17,10 +17,13 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import hashlib
 import importlib.metadata
 import logging
 import numbers
+import secrets
 import time
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -47,6 +50,7 @@ from reliquary.constants import (
     FORCED_SEED_PROTOCOL_VERSION,
     FORCED_SEED_ROLLOUT_FLOOR,
     LEGACY_MERKLE_ROOT_ENFORCE,
+    MATH_ADMISSION_WORKERS,
     MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW,
     MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
@@ -58,6 +62,7 @@ from reliquary.constants import (
     MAX_PROOF_WALL_SECONDS,
     MAX_SUBMISSION_PAYLOAD_BYTES,
     MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
+    MAX_SUBMISSIONS_PER_PROMPT,
     MAX_TRUNCATED_PER_SUBMISSION,
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
     REGISTERED_HOTKEY_REFRESH_MIN_INTERVAL_SECONDS,
@@ -66,13 +71,18 @@ from reliquary.constants import (
     SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS,
     SPARSE_VALID_IDLE_SEAL_SECONDS,
     SPARSE_VALID_MAX_WINDOW_SECONDS,
+    SUBMISSION_UPLOAD_GRACE_SECONDS,
     VALIDATOR_HTTP_PORT,
+    CODE_ADMISSION_WORKERS,
 )
 from reliquary.environment.virtual_parquet import PromptSourceUnavailable
 from reliquary.protocol.legacy_merkle import (
     legacy_submission_merkle_matches,
 )
-from reliquary.protocol.signatures import verify_envelope_signature
+from reliquary.protocol.signatures import (
+    verify_envelope_signature,
+    verify_precommit_signature,
+)
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     BatchSubmissionResponse,
@@ -81,6 +91,8 @@ from reliquary.protocol.submission import (
     RejectReason,
     RuntimeContract,
     RuntimeFingerprint,
+    SubmissionPrecommitRequest,
+    SubmissionPrecommitResponse,
     Verdict,
     VerdictsResponse,
 )
@@ -104,6 +116,32 @@ from reliquary.validator.verifier import (
 )
 
 logger = logging.getLogger(__name__)
+
+PRECOMMIT_HEADER = "X-Reliquary-Precommit"
+MAX_PRECOMMIT_BODY_BYTES = 16 * 1024
+
+
+@dataclass
+class _UploadPrecommitReceipt:
+    receipt_id: str
+    precommit_signature: str
+    miner_hotkey: str
+    prompt_idx: int
+    window_start: int
+    merkle_root: str
+    checkpoint_hash: str
+    environment: str
+    payload_bytes: int
+    payload_sha256: str
+    drand_round: int
+    protocol_version: int
+    nonce: str
+    expires_at_wall: float
+    precommit_arrival_ts: float
+    drand_observation: DrandRoundObservation
+    batcher: Any
+    consumed: bool = False
+    outcome: BatchSubmissionResponse | None = None
 
 
 # How many recent verdicts to remember per hotkey. Bounded so the
@@ -167,9 +205,19 @@ class _SubmissionBodyLimitMiddleware:
         await response(scope, receive, send)
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
-        if scope.get("type") != "http" or scope.get("path") != "/submit":
+        path = scope.get("path")
+        if scope.get("type") != "http" or path not in {
+            "/submit",
+            "/submit/precommit",
+        }:
             await self.app(scope, receive, send)
             return
+
+        max_bytes = (
+            MAX_PRECOMMIT_BODY_BYTES
+            if path == "/submit/precommit"
+            else self.max_bytes
+        )
 
         headers = dict(scope.get("headers", ()))
         raw_length = headers.get(b"content-length")
@@ -178,11 +226,12 @@ class _SubmissionBodyLimitMiddleware:
                 content_length = int(raw_length)
             except ValueError:
                 content_length = -1
-            if content_length > self.max_bytes:
+            if content_length > max_bytes:
                 await self._reject(scope, receive, send)
                 return
 
         received = 0
+        body_hasher = hashlib.sha256()
         over_limit = False
         buffered_messages: list[dict[str, Any]] = []
 
@@ -190,8 +239,12 @@ class _SubmissionBodyLimitMiddleware:
             nonlocal received, over_limit
             message = await receive()
             if message.get("type") == "http.request":
-                received += len(message.get("body", b""))
-                if received > self.max_bytes:
+                state = scope.setdefault("state", {})
+                state.setdefault("body_receive_started_at", time.time())
+                chunk = message.get("body", b"")
+                received += len(chunk)
+                body_hasher.update(chunk)
+                if received > max_bytes:
                     over_limit = True
                     # Complete the downstream body stream without forwarding
                     # the over-limit chunk. FastAPI may turn that truncated JSON
@@ -202,6 +255,10 @@ class _SubmissionBodyLimitMiddleware:
                         "body": b"",
                         "more_body": False,
                     }
+                if not message.get("more_body", False):
+                    state["body_bytes_received"] = received
+                    state["body_sha256"] = body_hasher.hexdigest()
+                    state["body_completed_at"] = time.time()
             return message
 
         async def buffered_send(message):
@@ -326,6 +383,23 @@ def _proof_free_submission_reject(
             return RejectReason.BAD_SCHEMA, "schema"
         if list(rollout.tokens) != list(rollout.commit["tokens"]):
             return RejectReason.TOKENS_MISMATCH, "token_invariant"
+        verify_signature = getattr(batcher, "_verify_signature", None)
+        if (
+            callable(verify_signature)
+            and not _is_mock_like(verify_signature)
+            and not verify_signature(rollout.commit, request.miner_hotkey)
+        ):
+            return RejectReason.BAD_SIGNATURE, "rollout_signature"
+        claimed_randomness = (
+            (rollout.commit.get("beacon") or {}).get("randomness", "")
+        )
+        expected_randomness = getattr(batcher, "randomness", "")
+        if (
+            not _is_mock_like(expected_randomness)
+            and bool(expected_randomness)
+            and claimed_randomness != expected_randomness
+        ):
+            return RejectReason.WRONG_RANDOMNESS, "randomness"
 
     model_config = _proof_free_model_config(batcher)
     canonical_prompt_tokens: list[int] | None = None
@@ -468,9 +542,17 @@ class _Health(BaseModel):
     current_window_open_drand_round: int | None = None
     seal_trigger_round: int | None = None
     drand_round_backward_tolerance: int
+    upload_precommit_enabled: bool = True
+    submission_upload_grace_seconds: float = SUBMISSION_UPLOAD_GRACE_SECONDS
     batch_size: int
     queue_depth: int | None = None
     queue_depth_by_environment: dict[str, int] = Field(default_factory=dict)
+    admission_workers_by_environment: dict[str, int] = Field(
+        default_factory=lambda: {
+            "openmathinstruct": MATH_ADMISSION_WORKERS,
+            "opencodeinstruct": CODE_ADMISSION_WORKERS,
+        }
+    )
     proof_verification_inflight: int | None = None
     proof_verification_inflight_by_environment: dict[str, int] = Field(
         default_factory=dict
@@ -665,6 +747,10 @@ class ValidatorServer:
         self._archive_queue_snapshot_callback: (
             Callable[[], dict[str, Any]] | None
         ) = None
+        self._upload_precommit_receipts: dict[
+            str, _UploadPrecommitReceipt
+        ] = {}
+        self._upload_precommit_by_signature: dict[str, str] = {}
         self.app: FastAPI = self._build_app()
         self._server: uvicorn.Server | None = None
         self._task: asyncio.Task[Any] | None = None
@@ -679,6 +765,7 @@ class ValidatorServer:
         )
         self._worker_task: asyncio.Task[Any] | None = None
         self._code_worker_task: asyncio.Task[Any] | None = None
+        self._extra_worker_tasks: list[asyncio.Task[Any]] = []
         self._inflight_proofs = 0
         self._inflight_proofs_by_environment: collections.Counter[str] = (
             collections.Counter()
@@ -715,6 +802,14 @@ class ValidatorServer:
         """
         changed = batchers is not self._active_batchers or set(batchers) != set(self._active_batchers)
         if changed:
+            for receipt in self._upload_precommit_receipts.values():
+                resolver = getattr(
+                    type(receipt.batcher), "resolve_upload_precommit", None
+                )
+                if resolver is not None and not receipt.consumed:
+                    resolver(receipt.batcher, receipt.receipt_id)
+            self._upload_precommit_receipts = {}
+            self._upload_precommit_by_signature = {}
             self._per_window_counts = {}
             self._bad_envelope_counts = {}
             self._recent_reject_counts = collections.Counter()
@@ -740,6 +835,92 @@ class ValidatorServer:
             self._per_window_counts.pop(hotkey, None)
         else:
             self._per_window_counts[hotkey] = current_count - 1
+
+    def _prune_upload_precommits(self, *, now: float | None = None) -> None:
+        current = time.time() if now is None else float(now)
+        expired = [
+            receipt_id
+            for receipt_id, receipt in self._upload_precommit_receipts.items()
+            if receipt.expires_at_wall < current
+            or receipt.batcher not in self._active_batchers.values()
+        ]
+        for receipt_id in expired:
+            receipt = self._upload_precommit_receipts.pop(receipt_id)
+            self._upload_precommit_by_signature.pop(
+                receipt.precommit_signature, None
+            )
+            if not receipt.consumed:
+                resolver = getattr(
+                    type(receipt.batcher), "resolve_upload_precommit", None
+                )
+                if resolver is not None:
+                    resolver(receipt.batcher, receipt.receipt_id)
+
+    @staticmethod
+    def _precommit_matches_submission(
+        receipt: _UploadPrecommitReceipt,
+        request: BatchSubmissionRequest,
+        *,
+        environment: str,
+        payload_bytes: int,
+        payload_sha256: str,
+    ) -> bool:
+        return (
+            receipt.miner_hotkey == request.miner_hotkey
+            and receipt.prompt_idx == request.prompt_idx
+            and receipt.window_start == request.window_start
+            and receipt.merkle_root.lower() == request.merkle_root.lower()
+            and receipt.checkpoint_hash == request.checkpoint_hash
+            and receipt.environment == environment
+            and receipt.payload_bytes == payload_bytes
+            and secrets.compare_digest(receipt.payload_sha256, payload_sha256)
+            and receipt.drand_round == request.drand_round
+            and receipt.protocol_version == request.protocol_version
+            and receipt.nonce == request.nonce
+        )
+
+    def _claim_upload_precommit(
+        self,
+        receipt_id: str,
+        request: BatchSubmissionRequest,
+        *,
+        batcher: Any,
+        environment: str,
+        payload_bytes: int,
+        payload_sha256: str,
+        body_completed_at: float,
+    ) -> tuple[str, _UploadPrecommitReceipt | None]:
+        """Return valid, replay, expired, or invalid for one body reveal."""
+        receipt = self._upload_precommit_receipts.get(receipt_id)
+        if receipt is None:
+            self._prune_upload_precommits(now=body_completed_at)
+            return "invalid", None
+        if receipt.batcher is not batcher:
+            return "invalid", None
+        if body_completed_at > receipt.expires_at_wall:
+            self._upload_precommit_receipts.pop(receipt_id, None)
+            self._upload_precommit_by_signature.pop(
+                receipt.precommit_signature, None
+            )
+            if not receipt.consumed:
+                resolver = getattr(
+                    type(receipt.batcher), "resolve_upload_precommit", None
+                )
+                if resolver is not None:
+                    resolver(receipt.batcher, receipt.receipt_id)
+            return "expired", None
+        if not self._precommit_matches_submission(
+            receipt,
+            request,
+            environment=environment,
+            payload_bytes=payload_bytes,
+            payload_sha256=payload_sha256,
+        ):
+            return "invalid", None
+        if receipt.consumed:
+            return "replay", receipt
+        receipt.consumed = True
+        return "valid", receipt
 
     def set_current_state(self, state) -> None:
         self._current_state = state
@@ -1220,6 +1401,14 @@ class ValidatorServer:
             "retained_payload_bytes": _integer(
                 getattr(batcher, "retained_payload_bytes", None)
             ),
+            "pending_upload_precommits": _integer(
+                getattr(batcher, "pending_upload_precommits", None)
+            ),
+            "collection_closed": bool(
+                getattr(type(batcher), "collection_closed", lambda _self: False)(
+                    batcher
+                )
+            ),
             "difficulty_auction_enabled": auction_enabled,
             "difficulty_auction_proof_wall_elapsed_seconds": _floating(
                 getattr(batcher, "proof_wall_elapsed_seconds", None)
@@ -1372,9 +1561,15 @@ class ValidatorServer:
                 getattr(batcher, "_seal_trigger_round", None) if batcher else None
             ),
             drand_round_backward_tolerance=DRAND_ROUND_BACKWARD_TOLERANCE,
+            upload_precommit_enabled=True,
+            submission_upload_grace_seconds=SUBMISSION_UPLOAD_GRACE_SECONDS,
             batch_size=B_BATCH,
             queue_depth=self.submit_queue_depth,
             queue_depth_by_environment=self.submit_queue_depth_by_environment,
+            admission_workers_by_environment={
+                "openmathinstruct": MATH_ADMISSION_WORKERS,
+                "opencodeinstruct": CODE_ADMISSION_WORKERS,
+            },
             proof_verification_inflight=self._inflight_proofs,
             proof_verification_inflight_by_environment=(
                 self.proof_verification_inflight_by_environment
@@ -1615,11 +1810,19 @@ class ValidatorServer:
         batcher: Any,
         request: BatchSubmissionRequest,
         telemetry: SubmitTelemetry,
+        reward_computation: Any | None = None,
     ) -> BatchSubmissionResponse:
         try:
-            return batcher.accept_submission(request, telemetry=telemetry)
+            kwargs: dict[str, Any] = {"telemetry": telemetry}
+            if reward_computation is not None:
+                kwargs["reward_computation"] = reward_computation
+            return batcher.accept_submission(request, **kwargs)
         except TypeError as exc:
-            if "telemetry" not in str(exc):
+            message = str(exc)
+            if "unexpected keyword argument" not in message or not any(
+                name in message
+                for name in ("telemetry", "reward_computation")
+            ):
                 raise
             return batcher.accept_submission(request)
 
@@ -1706,11 +1909,220 @@ class ValidatorServer:
             STALE_ROUND rejections, the bug pre-this-fix).
             """
             request.state.t_arrival = time.time()
-            return await call_next(request)
+            try:
+                return await call_next(request)
+            finally:
+                release = getattr(
+                    request.state, "release_upload_precommit", None
+                )
+                if callable(release):
+                    release()
 
         @app.get("/health", response_model=_Health)
         async def health() -> _Health:
             return self._health_payload()
+
+        @app.post(
+            "/submit/precommit",
+            response_model=SubmissionPrecommitResponse,
+        )
+        async def precommit(
+            request: SubmissionPrecommitRequest,
+            http_request: Request,
+        ) -> SubmissionPrecommitResponse:
+            """Reserve one bounded reveal for a body committed before cutoff."""
+            from reliquary.protocol.submission import WindowState
+
+            t_arrival = float(
+                getattr(http_request.state, "t_arrival", time.time())
+            )
+
+            def reject(reason: RejectReason) -> SubmissionPrecommitResponse:
+                logger.warning(
+                    "upload_precommit_rejected window=%d env=%s prompt=%d "
+                    "hotkey=%s reason=%s payload_bytes=%d",
+                    request.window_start,
+                    request.environment,
+                    request.prompt_idx,
+                    request.miner_hotkey[:12],
+                    reason.value,
+                    request.payload_bytes,
+                )
+                return SubmissionPrecommitResponse(
+                    accepted=False,
+                    reason=reason,
+                )
+
+            if self._current_state != WindowState.OPEN:
+                return reject(RejectReason.WINDOW_NOT_ACTIVE)
+            batcher = self._active_batchers.get(request.environment)
+            if batcher is None:
+                return reject(RejectReason.BAD_SCHEMA)
+            if request.window_start != batcher.window_start:
+                return reject(RejectReason.WINDOW_MISMATCH)
+            if request.payload_bytes > MAX_SUBMISSION_PAYLOAD_BYTES:
+                return reject(RejectReason.BAD_SCHEMA)
+            if (
+                batcher.current_checkpoint_hash
+                and request.checkpoint_hash != batcher.current_checkpoint_hash
+            ):
+                return reject(RejectReason.WRONG_CHECKPOINT)
+            if (
+                FORCED_SEED_ENFORCE
+                and bool(batcher.current_checkpoint_hash)
+                and request.protocol_version != FORCED_SEED_PROTOCOL_VERSION
+            ):
+                return reject(RejectReason.SEED_MISMATCH)
+            if not verify_precommit_signature(
+                miner_hotkey=request.miner_hotkey,
+                window_start=request.window_start,
+                prompt_idx=request.prompt_idx,
+                merkle_root=request.merkle_root,
+                checkpoint_hash=request.checkpoint_hash,
+                environment=request.environment,
+                payload_bytes=request.payload_bytes,
+                payload_sha256=request.payload_sha256,
+                drand_round=request.drand_round,
+                randomness=batcher.randomness,
+                protocol_version=request.protocol_version,
+                nonce=request.nonce,
+                precommit_signature=request.precommit_signature,
+            ):
+                return reject(RejectReason.BAD_ENVELOPE_SIGNATURE)
+
+            # Exact retries are idempotent even if the drand boundary advanced
+            # after the first response was lost.  The original receipt already
+            # passed timing, registration, and quota admission.
+            self._prune_upload_precommits(now=t_arrival)
+            existing_id = self._upload_precommit_by_signature.get(
+                request.precommit_signature
+            )
+            existing = (
+                self._upload_precommit_receipts.get(existing_id)
+                if existing_id is not None
+                else None
+            )
+            if existing is not None:
+                return SubmissionPrecommitResponse(
+                    accepted=True,
+                    reason=RejectReason.ACCEPTED,
+                    receipt_id=existing.receipt_id,
+                    upload_deadline_ts=existing.expires_at_wall,
+                )
+            if batcher.drand_round_check_enabled:
+                if hasattr(type(batcher), "observe_drand_round"):
+                    drand_observation = batcher.observe_drand_round(
+                        request.drand_round,
+                        t_arrival=t_arrival,
+                    )
+                else:
+                    round_reject = batcher.validate_drand_round(
+                        request.drand_round,
+                        t_arrival=t_arrival,
+                    )
+                    drand_observation = self._fallback_drand_observation(
+                        request, batcher, round_reject,
+                    )
+                if drand_observation.reject_reason is not None:
+                    return reject(drand_observation.reject_reason)
+            else:
+                drand_observation = self._fallback_drand_observation(
+                    request, batcher, None,
+                )
+            prompt_range = getattr(batcher, "prompt_range", None)
+            if prompt_range is not None:
+                lo, hi = prompt_range
+                if not (lo <= request.prompt_idx < hi):
+                    return reject(RejectReason.PROMPT_OUT_OF_RANGE)
+            if request.prompt_idx in batcher.cooldown_prompts_snapshot:
+                return reject(RejectReason.PROMPT_IN_COOLDOWN)
+            try:
+                environment_size = await asyncio.to_thread(len, batcher.env)
+            except PromptSourceUnavailable:
+                return reject(RejectReason.WORKER_DROPPED)
+            if request.prompt_idx >= environment_size:
+                return reject(RejectReason.BAD_PROMPT_IDX)
+            if (
+                batcher.prompt_submission_count(request.prompt_idx)
+                >= MAX_SUBMISSIONS_PER_PROMPT
+            ):
+                return reject(RejectReason.PROMPT_FULL)
+
+            registration_reason = await self._registration_reject_reason(
+                request.miner_hotkey
+            )
+            if registration_reason is not None:
+                return reject(registration_reason)
+
+            count = self._per_window_counts.get(request.miner_hotkey, 0)
+            if count >= MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW:
+                return reject(RejectReason.RATE_LIMITED)
+
+            receipt_id = secrets.token_urlsafe(32)
+            register = getattr(
+                type(batcher), "try_register_upload_precommit", None
+            )
+            if register is None:
+                return reject(RejectReason.PRECOMMIT_INVALID)
+            accepted, register_reason, deadline_monotonic = register(
+                batcher,
+                receipt_id,
+                request.miner_hotkey,
+                t_arrival_wall=t_arrival,
+            )
+            if not accepted or deadline_monotonic is None:
+                reason = (
+                    RejectReason.PRECOMMIT_EXPIRED
+                    if register_reason in {"collection_closed", "collection_sealed"}
+                    else RejectReason.BATCH_FILLED
+                )
+                return reject(reason)
+
+            remaining = max(
+                0.0,
+                float(deadline_monotonic) - float(batcher._time_fn()),
+            )
+            expires_at_wall = time.time() + remaining
+            receipt = _UploadPrecommitReceipt(
+                receipt_id=receipt_id,
+                precommit_signature=request.precommit_signature,
+                miner_hotkey=request.miner_hotkey,
+                prompt_idx=request.prompt_idx,
+                window_start=request.window_start,
+                merkle_root=request.merkle_root,
+                checkpoint_hash=request.checkpoint_hash,
+                environment=request.environment,
+                payload_bytes=request.payload_bytes,
+                payload_sha256=request.payload_sha256.lower(),
+                drand_round=request.drand_round,
+                protocol_version=request.protocol_version,
+                nonce=request.nonce,
+                expires_at_wall=expires_at_wall,
+                precommit_arrival_ts=t_arrival,
+                drand_observation=drand_observation,
+                batcher=batcher,
+            )
+            self._upload_precommit_receipts[receipt_id] = receipt
+            self._upload_precommit_by_signature[
+                request.precommit_signature
+            ] = receipt_id
+            self._per_window_counts[request.miner_hotkey] = count + 1
+            logger.info(
+                "upload_precommit_accepted window=%d env=%s prompt=%d "
+                "hotkey=%s payload_bytes=%d grace_s=%.3f",
+                request.window_start,
+                request.environment,
+                request.prompt_idx,
+                request.miner_hotkey[:12],
+                request.payload_bytes,
+                remaining,
+            )
+            return SubmissionPrecommitResponse(
+                accepted=True,
+                reason=RejectReason.ACCEPTED,
+                receipt_id=receipt_id,
+                upload_deadline_ts=expires_at_wall,
+            )
 
         @app.post("/submit", response_model=BatchSubmissionResponse)
         async def submit(
@@ -1724,10 +2136,35 @@ class ValidatorServer:
             t_arrival = getattr(http_request.state, "t_arrival", None)
             if t_arrival is None:
                 t_arrival = time.time()
-            payload_bytes = await asyncio.to_thread(
-                _serialized_submission_bytes,
-                request,
+            payload_bytes = int(
+                getattr(http_request.state, "body_bytes_received", 0) or 0
             )
+            if payload_bytes <= 0:
+                payload_bytes = await asyncio.to_thread(
+                    _serialized_submission_bytes,
+                    request,
+                )
+            payload_sha256 = str(
+                getattr(http_request.state, "body_sha256", "") or ""
+            ).lower()
+            if not payload_sha256:
+                canonical_body = request.model_dump_json().encode("utf-8")
+                payload_sha256 = hashlib.sha256(canonical_body).hexdigest()
+            body_completed_at = float(
+                getattr(http_request.state, "body_completed_at", time.time())
+            )
+            body_started_at = getattr(
+                http_request.state, "body_receive_started_at", None
+            )
+            raw_content_length = http_request.headers.get("content-length")
+            try:
+                content_length_bytes = (
+                    int(raw_content_length)
+                    if raw_content_length is not None
+                    else None
+                )
+            except ValueError:
+                content_length_bytes = None
             if payload_bytes > MAX_SUBMISSION_PAYLOAD_BYTES:
                 raise HTTPException(
                     status_code=413,
@@ -1736,8 +2173,26 @@ class ValidatorServer:
             request._payload_bytes = payload_bytes
             hk = request.miner_hotkey
             telemetry = SubmitTelemetry.from_request(
-                request, t_arrival=t_arrival,
+                request,
+                t_arrival=t_arrival,
+                payload_bytes=payload_bytes,
+                content_length_bytes=content_length_bytes,
+                payload_sha256=payload_sha256,
+                t_body_started=body_started_at,
+                t_body_completed=body_completed_at,
+                queue_depth_at_arrival=self.submit_queue_depth,
             )
+            if http_request.headers.get(PRECOMMIT_HEADER):
+                telemetry.apply_upload_precommit("present")
+            precommit_receipt: _UploadPrecommitReceipt | None = None
+
+            def _record_response(
+                result: BatchSubmissionResponse,
+            ) -> BatchSubmissionResponse:
+                if precommit_receipt is not None:
+                    precommit_receipt.outcome = result
+                return result
+
             telemetry.refresh_from_batcher(self.active_batcher)
             log_submission_stage(
                 logger,
@@ -1777,7 +2232,9 @@ class ValidatorServer:
                     accepted_into_pool=False,
                     **extra,
                 )
-                return BatchSubmissionResponse(accepted=False, reason=reason)
+                return _record_response(
+                    BatchSubmissionResponse(accepted=False, reason=reason)
+                )
 
             # ENVELOPE SIGNATURE CHECK — runs BEFORE rate-limit increment.
             #
@@ -1981,6 +2438,76 @@ class ValidatorServer:
                 )
                 raise HTTPException(status_code=409, detail="window_mismatch")
 
+            precommit_reserved = False
+            receipt_id = http_request.headers.get(PRECOMMIT_HEADER)
+            if receipt_id:
+                precommit_status, receipt = self._claim_upload_precommit(
+                    receipt_id,
+                    request,
+                    batcher=batcher,
+                    environment=submission_env_name,
+                    payload_bytes=payload_bytes,
+                    payload_sha256=payload_sha256,
+                    body_completed_at=body_completed_at,
+                )
+                if precommit_status == "expired":
+                    telemetry.apply_upload_precommit("expired")
+                    return _reject_before_quota(
+                        RejectReason.PRECOMMIT_EXPIRED,
+                        reject_stage="upload_precommit",
+                    )
+                if precommit_status == "invalid" or receipt is None:
+                    telemetry.apply_upload_precommit("invalid")
+                    return _reject_before_quota(
+                        RejectReason.PRECOMMIT_INVALID,
+                        reject_stage="upload_precommit",
+                    )
+                if precommit_status == "replay":
+                    telemetry.apply_upload_precommit(
+                        "replay",
+                        arrival_ts=receipt.precommit_arrival_ts,
+                    )
+                    return receipt.outcome or BatchSubmissionResponse(
+                        accepted=True, reason=RejectReason.SUBMITTED,
+                    )
+
+                precommit_reserved = True
+                precommit_receipt = receipt
+                telemetry.apply_upload_precommit(
+                    "valid",
+                    arrival_ts=receipt.precommit_arrival_ts,
+                )
+                resolver = getattr(
+                    type(batcher), "resolve_upload_precommit", None
+                )
+
+                def _release_upload_precommit() -> None:
+                    if resolver is not None:
+                        resolver(batcher, receipt_id)
+
+                http_request.state.release_upload_precommit = (
+                    _release_upload_precommit
+                )
+                logger.info(
+                    "upload_precommit_revealed window=%d env=%s prompt=%d "
+                    "hotkey=%s payload_bytes=%d upload_ms=%.3f",
+                    request.window_start,
+                    submission_env_name,
+                    request.prompt_idx,
+                    hk[:12],
+                    payload_bytes,
+                    max(0.0, body_completed_at - t_arrival) * 1000.0,
+                )
+            else:
+                collection_closed = getattr(
+                    type(batcher), "collection_closed", None
+                )
+                if collection_closed is not None and collection_closed(batcher):
+                    return _reject_before_quota(
+                        RejectReason.PRECOMMIT_REQUIRED,
+                        reject_stage="upload_precommit",
+                    )
+
             if (
                 FORCED_SEED_ENFORCE
                 and bool(getattr(batcher, "current_checkpoint_hash", ""))
@@ -2035,9 +2562,11 @@ class ValidatorServer:
                     reject_reason=registration_reason.value,
                     accepted_into_pool=False,
                 )
-                return BatchSubmissionResponse(
-                    accepted=False,
-                    reason=registration_reason,
+                return _record_response(
+                    BatchSubmissionResponse(
+                        accepted=False,
+                        reason=registration_reason,
+                    )
                 )
 
             # Rate limit AFTER signature verification and active-window
@@ -2046,7 +2575,10 @@ class ValidatorServer:
             # window. Once the request is known to target this live window,
             # count it before cheap rejects/GRAIL so spam still self-throttles.
             n = self._per_window_counts.get(hk, 0)
-            if n >= MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW:
+            if (
+                not precommit_reserved
+                and n >= MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW
+            ):
                 if self._late_drop_callback is not None:
                     self._late_drop_callback(hk, "rate_limited")
                 telemetry.mark_decision()
@@ -2066,10 +2598,13 @@ class ValidatorServer:
                     reject_reason=RejectReason.RATE_LIMITED.value,
                     accepted_into_pool=False,
                 )
-                return BatchSubmissionResponse(
-                    accepted=False, reason=RejectReason.RATE_LIMITED,
+                return _record_response(
+                    BatchSubmissionResponse(
+                        accepted=False, reason=RejectReason.RATE_LIMITED,
+                    )
                 )
-            self._per_window_counts[hk] = n + 1
+            if not precommit_reserved:
+                self._per_window_counts[hk] = n + 1
 
             def _refund_current_quota() -> None:
                 self._refund_submission_quota(hk)
@@ -2104,6 +2639,12 @@ class ValidatorServer:
                     submitted_environment=submission_env_name,
                     prompt_source_error_type=type(exc).__name__,
                     quota_refunded=True,
+                )
+                _record_response(
+                    BatchSubmissionResponse(
+                        accepted=False,
+                        reason=RejectReason.WORKER_DROPPED,
+                    )
                 )
                 raise HTTPException(
                     status_code=503,
@@ -2144,8 +2685,10 @@ class ValidatorServer:
                     trigger_round=getattr(batcher, "_seal_trigger_round", None),
                     accepted_into_pool=False,
                 )
-                return BatchSubmissionResponse(
-                    accepted=False, reason=RejectReason.BATCH_FILLED,
+                return _record_response(
+                    BatchSubmissionResponse(
+                        accepted=False, reason=RejectReason.BATCH_FILLED,
+                    )
                 )
 
             # Cheap rejects pre-queue: every check below is O(1) against
@@ -2161,8 +2704,6 @@ class ValidatorServer:
             # which path decides. Concurrent batcher mutation between the
             # read here and the worker is benign — the worker re-verifies
             # under the lock.
-            from reliquary.constants import MAX_SUBMISSIONS_PER_PROMPT
-
             def _cheap_reject(
                 reason: RejectReason,
                 *,
@@ -2194,7 +2735,9 @@ class ValidatorServer:
                     accepted_into_pool=False,
                     **extra,
                 )
-                return BatchSubmissionResponse(accepted=False, reason=reason)
+                return _record_response(
+                    BatchSubmissionResponse(accepted=False, reason=reason)
+                )
 
             if batcher.current_checkpoint_hash and request.checkpoint_hash != batcher.current_checkpoint_hash:
                 return _cheap_reject(
@@ -2202,10 +2745,14 @@ class ValidatorServer:
                     reject_stage="checkpoint",
                 )
             if batcher.drand_round_check_enabled:
-                if hasattr(type(batcher), "observe_drand_round"):
+                if precommit_reserved and precommit_receipt is not None:
+                    drand_observation = precommit_receipt.drand_observation
+                    drand_timing_source = "precommit_arrival"
+                elif hasattr(type(batcher), "observe_drand_round"):
                     drand_observation = batcher.observe_drand_round(
                         request.drand_round, t_arrival=t_arrival,
                     )
+                    drand_timing_source = "body_arrival"
                 else:
                     round_reject = batcher.validate_drand_round(
                         request.drand_round, t_arrival=t_arrival,
@@ -2213,6 +2760,7 @@ class ValidatorServer:
                     drand_observation = self._fallback_drand_observation(
                         request, batcher, round_reject,
                     )
+                    drand_timing_source = "body_arrival"
                 telemetry.apply_drand(drand_observation)
                 log_submission_stage(
                     logger,
@@ -2232,6 +2780,7 @@ class ValidatorServer:
                     drand_tolerance=drand_observation.drand_tolerance,
                     drand_status=drand_observation.drand_status,
                     current_round=drand_observation.arrival_drand_round,
+                    drand_timing_source=drand_timing_source,
                 )
                 round_reject = drand_observation.reject_reason
                 if round_reject is not None:
@@ -2392,7 +2941,7 @@ class ValidatorServer:
                         reject_stage="proof_admission",
                         batch_filled_reason=start_reason,
                     )
-                telemetry.mark_proof_started()
+                telemetry.mark_proof_started(queue_depth=0)
                 log_submission_stage(
                     logger,
                     logging.INFO,
@@ -2402,12 +2951,15 @@ class ValidatorServer:
                     reject_reason=None,
                 )
                 try:
+                    telemetry.mark_admission_started()
                     try:
                         resp = self._call_accept_submission(
                             batcher, request, telemetry,
                         )
                     except PromptSourceUnavailable as exc:
                         _prompt_source_unavailable(exc)
+                    finally:
+                        telemetry.mark_admission_finished()
                 finally:
                     self._finish_proof_admission(batcher, request)
                 telemetry.refresh_from_batcher(batcher, at_decision=True)
@@ -2454,12 +3006,12 @@ class ValidatorServer:
                     reject_stage=None if resp.accepted else "proof",
                     accepted_into_pool=resp.accepted,
                 )
-                return resp
+                return _record_response(resp)
 
-            telemetry.mark_enqueued()
             submit_queue = self._submission_queue_for_environment(
                 submission_env_name
             )
+            telemetry.mark_enqueued(queue_depth=submit_queue.qsize())
             try:
                 submit_queue.put_nowait((request, batcher, telemetry))
             except asyncio.QueueFull:
@@ -2473,8 +3025,10 @@ class ValidatorServer:
                     batch_filled_reason="proof_queue_full",
                     proof_queue_limit=MAX_PENDING_PROOF_QUEUE_DEPTH,
                 )
-            return BatchSubmissionResponse(
-                accepted=True, reason=RejectReason.SUBMITTED,
+            return _record_response(
+                BatchSubmissionResponse(
+                    accepted=True, reason=RejectReason.SUBMITTED,
+                )
             )
 
         @app.get("/state", response_model=GrpoBatchState)
@@ -2615,6 +3169,7 @@ class ValidatorServer:
                 telemetry = SubmitTelemetry.from_request(
                     request, t_arrival=time.time(),
                 )
+            telemetry.mark_dequeued(queue_depth=queue.qsize())
             telemetry.refresh_from_batcher(batcher)
             # Silently drop items whose batcher is no longer the active one.
             # This is what relieves pressure from a saturated window: the
@@ -2761,9 +3316,47 @@ class ValidatorServer:
                 )
                 self._inflight_proofs_by_environment[env_name] += 1
                 try:
-                    response = await asyncio.to_thread(
-                        self._call_accept_submission, batcher, request, telemetry
+                    reward_computation = None
+                    precompute_rewards = getattr(
+                        type(batcher), "compute_submission_rewards", None
                     )
+                    if precompute_rewards is not None:
+                        telemetry.mark_reward_started()
+                        try:
+                            reward_computation = await asyncio.to_thread(
+                                precompute_rewards,
+                                batcher,
+                                request,
+                            )
+                        finally:
+                            telemetry.mark_reward_finished()
+                        log_submission_stage(
+                            logger,
+                            logging.INFO,
+                            "reward_graded",
+                            telemetry,
+                            reward_grading_ms=getattr(
+                                reward_computation, "elapsed_ms", None
+                            ),
+                            reward_grading_error=(
+                                type(reward_computation.error).__name__
+                                if getattr(
+                                    reward_computation, "error", None
+                                ) is not None
+                                else None
+                            ),
+                        )
+                    telemetry.mark_admission_started()
+                    try:
+                        response = await asyncio.to_thread(
+                            self._call_accept_submission,
+                            batcher,
+                            request,
+                            telemetry,
+                            reward_computation,
+                        )
+                    finally:
+                        telemetry.mark_admission_finished()
                 finally:
                     self._inflight_proofs = max(0, self._inflight_proofs - 1)
                     remaining = max(
@@ -2851,12 +3444,13 @@ class ValidatorServer:
                     await asyncio.to_thread(_try_empty_cuda_cache)
             finally:
                 self._finish_proof_admission(batcher, request)
-                # Always reclaim activation memory after a forward pass so
-                # back-to-back GRAIL verifies don't accumulate fragmentation.
-                # The helper is a no-op on CPU-only hosts. Cost: ~ms; benefit:
-                # prevents the multi-hour drift that took down the validator
-                # on 2026-05-11.
-                await asyncio.to_thread(_try_empty_cuda_cache)
+                # Legacy admission runs GRAIL inline and must reclaim its
+                # activation cache. Auction admission only grades rewards on
+                # CPU/sandbox workers; emptying CUDA from several concurrent
+                # workers would add a global allocator synchronization and can
+                # interfere with training or seal-time deferred proof.
+                if not getattr(batcher, "difficulty_auction_enabled", False):
+                    await asyncio.to_thread(_try_empty_cuda_cache)
 
     async def start(self) -> None:
         if self._task is not None:
@@ -2868,18 +3462,47 @@ class ValidatorServer:
         self._server = uvicorn.Server(config)
         self._task = asyncio.create_task(self._server.serve())
         self._worker_task = asyncio.create_task(
-            self._submit_worker(self._submit_queue)
+            self._submit_worker(self._submit_queue),
+            name="math_admission_worker_0",
         )
         self._code_worker_task = asyncio.create_task(
-            self._submit_worker(self._code_submit_queue)
+            self._submit_worker(self._code_submit_queue),
+            name="code_admission_worker_0",
         )
+        self._extra_worker_tasks = [
+            *(
+                asyncio.create_task(
+                    self._submit_worker(self._submit_queue),
+                    name=f"math_admission_worker_{index}",
+                )
+                for index in range(1, MATH_ADMISSION_WORKERS)
+            ),
+            *(
+                asyncio.create_task(
+                    self._submit_worker(self._code_submit_queue),
+                    name=f"code_admission_worker_{index}",
+                )
+                for index in range(1, CODE_ADMISSION_WORKERS)
+            ),
+        ]
         await asyncio.sleep(0)
-        logger.info("Validator HTTP server listening on %s:%d", self.host, self.port)
+        logger.info(
+            "Validator HTTP server listening on %s:%d "
+            "(math_admission_workers=%d code_admission_workers=%d)",
+            self.host,
+            self.port,
+            MATH_ADMISSION_WORKERS,
+            CODE_ADMISSION_WORKERS,
+        )
 
     async def stop(self) -> None:
         worker_tasks = [
             task
-            for task in (self._worker_task, self._code_worker_task)
+            for task in (
+                self._worker_task,
+                self._code_worker_task,
+                *self._extra_worker_tasks,
+            )
             if task is not None
         ]
         for task in worker_tasks:
@@ -2888,6 +3511,7 @@ class ValidatorServer:
             await asyncio.gather(*worker_tasks, return_exceptions=True)
         self._worker_task = None
         self._code_worker_task = None
+        self._extra_worker_tasks = []
         if self._server is not None:
             self._server.should_exit = True
         if self._task is not None:

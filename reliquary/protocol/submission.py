@@ -95,6 +95,9 @@ class RejectReason(str, Enum):
     WORKER_DROPPED = "worker_dropped"
     STALE_ROUND = "stale_round"
     FUTURE_ROUND = "future_round"
+    PRECOMMIT_REQUIRED = "precommit_required"
+    PRECOMMIT_INVALID = "precommit_invalid"
+    PRECOMMIT_EXPIRED = "precommit_expired"
 
 
 class WindowState(str, Enum):
@@ -270,6 +273,44 @@ class BatchSubmissionResponse(BaseModel):
     reason: RejectReason
 
 
+class SubmissionPrecommitRequest(BaseModel):
+    """Small signed commitment sent before a potentially large submission.
+
+    ``payload_sha256`` commits the exact serialized reveal and
+    ``payload_bytes`` binds its ingress accounting size. A successful precommit
+    reserves one normal per-window submission attempt; it does not reserve an
+    auction slot or bypass content validation.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    miner_hotkey: str = Field(..., min_length=1)
+    prompt_idx: int = Field(..., ge=0)
+    window_start: int = Field(..., ge=0)
+    merkle_root: str = Field(..., pattern=r"^[0-9a-fA-F]{64}$")
+    checkpoint_hash: str = Field(..., min_length=0, max_length=256)
+    environment: str = Field(..., min_length=1, max_length=64)
+    payload_bytes: int = Field(..., gt=0)
+    payload_sha256: str = Field(..., pattern=r"^[0-9a-fA-F]{64}$")
+    drand_round: int = Field(..., ge=0)
+    protocol_version: int = Field(default=0, ge=0)
+    nonce: str = Field(..., min_length=1, max_length=128)
+    precommit_signature: str = Field(
+        ..., min_length=2, max_length=256, pattern=r"^[0-9a-fA-F]+$"
+    )
+
+
+class SubmissionPrecommitResponse(BaseModel):
+    """Receipt authorizing one matching body reveal during upload grace."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    accepted: bool
+    reason: RejectReason
+    receipt_id: str | None = None
+    upload_deadline_ts: float | None = None
+
+
 class GrpoBatchState(BaseModel):
     """Live window state for miners polling ``/state`` (v2.1)."""
 
@@ -326,7 +367,14 @@ class Verdict(BaseModel):
     rewarded: bool | None = None
     reject_stage: str | None = None
     reject_reason: str | None = None
+    payload_bytes: int | None = None
+    body_read_ms: float | None = None
+    ingress_ms: float | None = None
+    upload_precommit_status: str | None = None
+    precommit_arrival_ts: float | None = None
     queue_wait_ms: float | None = None
+    reward_grading_ms: float | None = None
+    admission_commit_ms: float | None = None
     verify_ms: float | None = None
     total_ms: float | None = None
 

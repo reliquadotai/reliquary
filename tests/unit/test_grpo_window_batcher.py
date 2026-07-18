@@ -2,6 +2,8 @@
 exposes select_batch at window close."""
 
 import json
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
@@ -198,6 +200,43 @@ def _prove_one(b: GrpoWindowBatcher, req) -> "ValidSubmission | None":
 def test_constructor_sets_window():
     b = _make_batcher()
     assert b.window_start == 500
+
+
+def test_reward_precomputation_runs_concurrently_outside_mutation_lock():
+    active = 0
+    max_active = 0
+    counter_lock = threading.Lock()
+
+    class SlowEnv(FakeEnv):
+        def compute_reward(self, problem, completion):
+            nonlocal active, max_active
+            with counter_lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.01)
+                return super().compute_reward(problem, completion)
+            finally:
+                with counter_lock:
+                    active -= 1
+
+    batcher = _make_batcher(env=SlowEnv())
+    requests = [
+        _request(prompt_idx=42, hotkey="hk-a"),
+        _request(prompt_idx=43, hotkey="hk-b"),
+    ]
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        computations = list(
+            executor.map(batcher.compute_submission_rewards, requests)
+        )
+
+    assert max_active >= 2
+    assert all(result.error is None for result in computations)
+    responses = [
+        batcher.accept_submission(request, reward_computation=computation)
+        for request, computation in zip(requests, computations, strict=True)
+    ]
+    assert all(response.accepted for response in responses)
 
 
 def test_reject_window_mismatch():
@@ -613,25 +652,22 @@ def test_seal_batch_empty_pool_returns_empty():
     assert batch == [] and rewards == {}
 
 
-def test_seal_batch_chronological_by_drand_round():
-    """v2.3 (design A'): submissions in earlier drand rounds fill the batch
-    first, regardless of TCP arrival order."""
-    b = _make_batcher()
-    # Both submissions accepted; round 1 must come out first at seal time
-    # even though round 2 arrived first (insertion order below).
-    req_late = _request(prompt_idx=42, hotkey="late")
-    req_early = _request(prompt_idx=7, hotkey="early")
-    # Stamp the rounds on the requests (the check is disabled in the helper, so
-    # accept_submission won't re-validate them) — the proof carries drand_round
-    # onto the ValidSubmission, which drives seal-time ordering.
-    req_late.drand_round = 2  # late: round 2
-    req_early.drand_round = 1  # early: round 1
-    assert b.accept_submission(req_late).accepted
-    assert b.accept_submission(req_early).accepted
-    batch, _ = b.seal_batch()
-    assert len(batch) == 2
-    assert batch[0].hotkey == "early"
-    assert batch[1].hotkey == "late"
+def test_auction_equal_score_order_ignores_submitted_drand_round():
+    """A tolerated older round must not buy priority in an equal-score tie."""
+
+    def seal_with(rounds):
+        b = _make_batcher()
+        b.seal_randomness = "post-deadline-beacon"
+        for prompt_idx, drand_round in enumerate(rounds):
+            hotkey = f"miner-{prompt_idx}"
+            req = _request(prompt_idx=prompt_idx, hotkey=hotkey)
+            req.drand_round = drand_round
+            assert b.accept_submission(req).accepted
+        b.seal_batch()
+        return {submission.hotkey for submission in b.valid_submissions()}
+
+    ascending = tuple(range(1, 10))
+    assert seal_with(ascending) == seal_with(tuple(reversed(ascending)))
 
 
 def test_seal_batch_cooldown_recorded():

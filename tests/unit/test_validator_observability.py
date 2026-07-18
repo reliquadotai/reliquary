@@ -158,8 +158,16 @@ def test_accept_reject_lifecycle_logs_required_fields(caplog):
         "prompt_idx",
         "hotkey",
         "t_arrival",
+        "t_body_started",
+        "t_body_completed",
         "t_decision",
+        "payload_bytes",
+        "body_read_ms",
+        "ingress_ms",
+        "upload_precommit_status",
         "queue_wait_ms",
+        "reward_grading_ms",
+        "admission_commit_ms",
         "verify_ms",
         "total_ms",
         "submitted_drand_round",
@@ -235,6 +243,8 @@ def test_health_endpoint_does_not_leak_secrets(monkeypatch):
 
     assert body["status"] == "ok"
     assert body["batch_size"] > 0
+    assert body["upload_precommit_enabled"] is True
+    assert body["submission_upload_grace_seconds"] == 33.0
     assert body["current_quicknet_drand_round"] == 123
     assert body["distinct_valid_prompt_count"] == 2
     assert body["last_valid_submission_ts"] == 1234.5

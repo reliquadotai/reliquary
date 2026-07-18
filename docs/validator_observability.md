@@ -4,7 +4,8 @@ Validator submit logs use the `validator_submit_lifecycle` event with a
 `stage` field. The important stages are:
 
 - `submit_received`: FastAPI has parsed the request and the middleware
-  arrival timestamp is attached. This is the HTTP arrival clock.
+  arrival timestamp is attached. `payload_bytes`, `body_read_ms`, `ingress_ms`,
+  and `upload_precommit_status` distinguish transport time from queue time.
 - `drand_validated`: the miner's `submitted_drand_round` has been compared
   to the validator's `arrival_drand_round`. `drand_delta =
   submitted_drand_round - arrival_drand_round`; positive is future, zero is
@@ -12,8 +13,9 @@ Validator submit logs use the `validator_submit_lifecycle` event with a
   grace in rounds.
 - `proof_started` / `proof_finished`: historical stage names for async worker
   admission and grading. In auction mode they do not imply GRAIL ran.
-  `queue_wait_ms` is time from enqueue to worker start and `total_ms` is the
-  admission decision latency.
+  `queue_wait_ms` is time from enqueue to dequeue, `reward_grading_ms` measures
+  reward work outside the state lock, `admission_commit_ms` measures the
+  bounded state mutation, and `total_ms` is the end-to-end decision latency.
 - `candidate_accepted`: the submission passed bounded admission and entered
   the pending auction pool. It is not yet proven, selected, or rewarded.
 - `candidate_rejected`: the validator made a final reject decision. Read
@@ -23,7 +25,7 @@ Validator submit logs use the `validator_submit_lifecycle` event with a
   the 300-second collection deadline and bounded queue drain.
 - `auction_finalized`: seal-time result for every pending candidate. Read
   `canonical_rank`, `auction_status`, `selected_for_batch`, and `rewarded`.
-- `final_batch_selected`: final drand/canonical ordering has run. A submission
+- `final_batch_selected`: final auction ordering has run. A submission
   can be `accepted_into_pool=true` but `selected_for_batch=false`.
 - `reward_assigned`: the submission earned emission in the final distribution.
 
@@ -32,9 +34,15 @@ Interpretation guide:
 - Delayed admission logs are normal: production `/submit` returns
   `reason=submitted` after queueing, while `candidate_accepted` appears after
   async grading. Final auction outcome arrives only at seal.
-- `submitted_drand_round` is what the miner attached. `arrival_drand_round`
-  is the validator's drand round at HTTP arrival. `drand_delta=0` means
-  current; `<0` means stale; `>0` means future.
+- `submitted_drand_round` is what the miner attached. For a valid signed upload
+  precommit, `arrival_drand_round` is the validator round at precommit arrival;
+  otherwise it is the body request's arrival round. `drand_delta=0` means
+  current; `<0` means stale; `>0` means future. Submitted drand does not affect
+  auction rank.
+- `upload_precommit_status=valid` means a signed commitment to the exact body
+  hash and byte count arrived before collection cutoff. The reveal may complete
+  during the bounded 33-second upload grace. `present`, `invalid`, `expired`,
+  and `replay` distinguish the other receipt paths.
 - `seal_trigger_round` applies to legacy mode. In auction mode use the
   collection deadline, population-freeze state, and rank entropy source.
 - `batch_filled` does not always mean the same thing. Check
@@ -55,6 +63,11 @@ revision, app start time, checkpoint revision, current window, drand round,
 per-environment pending/queue/proof state, operator mapping, grader failures,
 archive queue, and recent reject counts. It must not include access keys,
 tokens, wallet material, or private keys.
+
+R2 archives persist `force_seal_reason_by_environment`. A non-null
+`auction_queue_drain_timeout` means the fixed collection closed correctly but
+some predeadline admission work exceeded the bounded drain period. Candidate
+rows carry the same ingress and admission timings as live verdicts.
 
 ## Inference runtime and BFT telemetry
 

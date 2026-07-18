@@ -37,16 +37,19 @@ from reliquary.constants import (
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
     MAX_PENDING_SUBMISSION_BYTES_PER_ENV,
     MAX_PENDING_SUBMISSION_BYTES_PER_HOTKEY,
+    MAX_PENDING_UPLOAD_PRECOMMITS_PER_ENV,
     MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
     MAX_PROOF_WALL_SECONDS,
     MAX_SEAL_QUEUE_DRAIN_SECONDS,
     MAX_SUBMISSION_PAYLOAD_BYTES,
+    MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
     MAX_SUBMISSIONS_PER_PROMPT,
     MAX_TRUNCATED_PER_SUBMISSION,
     PROMPT_RANGE_SIZE,
     PROMPT_RANGE_ENFORCE_FROM_WINDOW,
     REJECTED_LIST_CAP_PER_HOTKEY,
     WINDOW_COLLECTION_SECONDS,
+    SUBMISSION_UPLOAD_GRACE_SECONDS,
     CODE_SEMANTIC_AUTH_ENFORCE,
     TOKEN_AUTH_ENFORCE,
     ALL_TOKEN_AUTH_ENFORCE,
@@ -361,6 +364,7 @@ class ValidSubmission:
     reward_vector: str = ""
     truncated_count: int = 0
     reward_shape: dict[str, Any] = field(default_factory=dict)
+    ingress_observability: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         self.merkle_root = self.merkle_root_bytes
@@ -399,6 +403,7 @@ class RejectedSubmission:
     seal_trigger_round: int | None = None
     prompt_hash_lead: str | None = None
     reject_stage: str | None = None
+    ingress_observability: dict[str, Any] | None = None
 
 
 @dataclass
@@ -414,6 +419,17 @@ class ForensicSampleResult:
     hotkey: str
     prompt_idx: int
     passed: bool
+
+
+@dataclass(frozen=True)
+class RewardComputation:
+    """Authoritative reward work completed outside the batcher mutation lock."""
+
+    validator_scored_reward: bool
+    completion_texts: list[str]
+    rewards: list[float] | None
+    error: Exception | None
+    elapsed_ms: float
 
 
 class GrpoWindowBatcher:
@@ -683,6 +699,8 @@ class GrpoWindowBatcher:
         self._proof_wall_started_at: float | None = None
         self._seal_snapshot_started = False
         self._seal_completed = False
+        self._upload_precommit_lock = threading.Lock()
+        self._upload_precommits: dict[str, tuple[str, float]] = {}
         # v2.1: checkpoint hash miners must match. Empty string disables
         # the gate (test convenience / pre-first-publish).
         self.current_checkpoint_hash: str = ""
@@ -761,6 +779,73 @@ class GrpoWindowBatcher:
         """
         return self._seal_flag.is_set()
 
+    def collection_closed(self) -> bool:
+        """Whether the generation/commit phase has reached its fixed cutoff."""
+        return self._time_fn() - self.window_opened_at >= WINDOW_COLLECTION_SECONDS
+
+    def _prune_upload_precommits_locked(self, now: float) -> None:
+        expired = [
+            receipt_id
+            for receipt_id, (_hotkey, deadline) in self._upload_precommits.items()
+            if deadline <= now
+        ]
+        for receipt_id in expired:
+            self._upload_precommits.pop(receipt_id, None)
+
+    def try_register_upload_precommit(
+        self,
+        receipt_id: str,
+        hotkey: str,
+        *,
+        t_arrival_wall: float,
+    ) -> tuple[bool, str | None, float | None]:
+        """Reserve one bounded reveal received before collection closes.
+
+        Returns ``(accepted, reason, monotonic_deadline)``.  This reservation is
+        deliberately separate from economic operator/prompt claims: a miner that
+        never uploads cannot squat an auction prompt.
+        """
+        if not self.difficulty_auction_enabled:
+            return False, "precommit_requires_auction", None
+        if (
+            float(t_arrival_wall)
+            > self.window_opened_wall_ts + WINDOW_COLLECTION_SECONDS
+        ):
+            return False, "collection_closed", None
+        now = self._time_fn()
+        with self._upload_precommit_lock:
+            self._prune_upload_precommits_locked(now)
+            if self._seal_flag.is_set() or self._seal_snapshot_started:
+                return False, "collection_sealed", None
+            if len(self._upload_precommits) >= MAX_PENDING_UPLOAD_PRECOMMITS_PER_ENV:
+                return False, "precommit_capacity_full", None
+            hotkey_count = sum(
+                1 for existing_hotkey, _deadline in self._upload_precommits.values()
+                if existing_hotkey == hotkey
+            )
+            if hotkey_count >= MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW:
+                return False, "precommit_hotkey_full", None
+            deadline = min(
+                now + SUBMISSION_UPLOAD_GRACE_SECONDS,
+                self.window_opened_at
+                + WINDOW_COLLECTION_SECONDS
+                + SUBMISSION_UPLOAD_GRACE_SECONDS,
+            )
+            self._upload_precommits[receipt_id] = (hotkey, deadline)
+            return True, None, deadline
+
+    def resolve_upload_precommit(self, receipt_id: str) -> bool:
+        """Release a receipt once its matching body has completed admission."""
+        with self._upload_precommit_lock:
+            return self._upload_precommits.pop(receipt_id, None) is not None
+
+    @property
+    def pending_upload_precommits(self) -> int:
+        now = self._time_fn()
+        with self._upload_precommit_lock:
+            self._prune_upload_precommits_locked(now)
+            return len(self._upload_precommits)
+
     def poll_deadline(self) -> bool:
         """Seal an auction environment at its fixed collection deadline.
 
@@ -771,7 +856,16 @@ class GrpoWindowBatcher:
             return True
         if not self.difficulty_auction_enabled:
             return False
-        if self._time_fn() - self.window_opened_at >= WINDOW_COLLECTION_SECONDS:
+        now = self._time_fn()
+        if now - self.window_opened_at >= WINDOW_COLLECTION_SECONDS:
+            with self._upload_precommit_lock:
+                self._prune_upload_precommits_locked(now)
+                pending_uploads = bool(self._upload_precommits)
+            if pending_uploads and (
+                now - self.window_opened_at
+                < WINDOW_COLLECTION_SECONDS + SUBMISSION_UPLOAD_GRACE_SECONDS
+            ):
+                return False
             self._seal_flag.set()
             if self._seal_event is not None:
                 self._seal_event.set()
@@ -1275,6 +1369,7 @@ class GrpoWindowBatcher:
         request: BatchSubmissionRequest,
         *,
         telemetry: SubmitTelemetry | None = None,
+        reward_computation: RewardComputation | None = None,
     ) -> BatchSubmissionResponse:
         """Cheaply admit a submission: validate, grade and score it, then append
         a ``PendingSubmission`` to ``_pending``. The GPU proof and every
@@ -1291,7 +1386,63 @@ class GrpoWindowBatcher:
         an arrival-time check, decided once.
         """
         with self._lock:
-            return self._accept_locked(request, telemetry=telemetry)
+            return self._accept_locked(
+                request,
+                telemetry=telemetry,
+                reward_computation=reward_computation,
+            )
+
+    def compute_submission_rewards(
+        self,
+        request: BatchSubmissionRequest,
+    ) -> RewardComputation:
+        """Decode and grade one group without mutating auction state.
+
+        Production workers call this after HTTP proof-free checks and resource
+        reservation, then pass the immutable result into ``accept_submission``.
+        Keeping this work outside ``_lock`` lets independent candidates use the
+        bounded admission pool concurrently.  ``_accept_locked`` still repeats
+        every stateful gate before committing the candidate.
+        """
+        started = time.perf_counter()
+        problem = self.env.get_problem(request.prompt_idx)
+        validator_scored_reward = _uses_validator_authoritative_reward(self.env)
+        completion_texts = [
+            self._completion_text(rollout) for rollout in request.rollouts
+        ]
+        try:
+            if (
+                validator_scored_reward
+                and getattr(self.env, "name", "") == "opencodeinstruct"
+            ):
+                with ThreadPoolExecutor(
+                    max_workers=len(completion_texts),
+                    thread_name_prefix="reliquary-code-grade",
+                ) as executor:
+                    computed_rewards = list(
+                        executor.map(
+                            lambda text: float(
+                                self.env.compute_reward(problem, text)
+                            ),
+                            completion_texts,
+                        )
+                    )
+            else:
+                computed_rewards = [
+                    float(self.env.compute_reward(problem, text))
+                    for text in completion_texts
+                ]
+            error: Exception | None = None
+        except Exception as exc:
+            computed_rewards = None
+            error = exc
+        return RewardComputation(
+            validator_scored_reward=validator_scored_reward,
+            completion_texts=completion_texts,
+            rewards=computed_rewards,
+            error=error,
+            elapsed_ms=(time.perf_counter() - started) * 1000.0,
+        )
 
     def observe_drand_round(
         self,
@@ -1361,14 +1512,11 @@ class GrpoWindowBatcher:
         and always rejected as FUTURE_ROUND.
 
         Backward direction allows only the configured
-        ``self.drand_round_backward_tolerance``. Production sets this to
-        zero: miners use a client-side boundary guard rather than claiming an
-        earlier round after it has rolled. An operator who explicitly widens
-        the tolerance may absorb cross-boundary HTTP RTT or clock skew, but
-        accepts the corresponding economic cost: a submitter can antedate by
-        up to ``tolerance`` rounds (3 s × tolerance) of chronological
-        priority. Arrival-time stamping removes validator queue latency from
-        that tradeoff; it does not make a positive backward tolerance free.
+        ``self.drand_round_backward_tolerance``. Production sets this to zero.
+        Auction ranking does not use the submitted round, and large body
+        transport is handled by signed precommit/reveal: the small precommit's
+        arrival fixes the drand observation before upload. Widening tolerance
+        therefore weakens freshness without solving the transport problem.
 
         Public so the HTTP /submit handler can run it pre-queue and
         short-circuit the rejection without waiting on the worker.
@@ -1382,6 +1530,7 @@ class GrpoWindowBatcher:
         request: BatchSubmissionRequest,
         *,
         telemetry: SubmitTelemetry | None = None,
+        reward_computation: RewardComputation | None = None,
     ) -> BatchSubmissionResponse:
         hk = request.miner_hotkey
         pi = request.prompt_idx
@@ -1530,37 +1679,14 @@ class GrpoWindowBatcher:
                     "operator_mapping",
                 )
             return reject(RejectReason.HASH_DUPLICATE, "logical_dedup")
-        problem = self.env.get_problem(request.prompt_idx)
-        validator_scored_reward = _uses_validator_authoritative_reward(self.env)
-        completion_texts = [
-            self._completion_text(rollout) for rollout in request.rollouts
-        ]
-        try:
-            if (
-                validator_scored_reward
-                and getattr(self.env, "name", "") == "opencodeinstruct"
-            ):
-                # The production grader owns one sandbox worker per rollout.
-                # Dispatch the group together so a timeout costs one grader
-                # interval instead of eight, while preserving rollout order.
-                with ThreadPoolExecutor(
-                    max_workers=len(completion_texts),
-                    thread_name_prefix="reliquary-code-grade",
-                ) as executor:
-                    computed_rewards = list(
-                        executor.map(
-                            lambda text: float(
-                                self.env.compute_reward(problem, text)
-                            ),
-                            completion_texts,
-                        )
-                    )
-            else:
-                computed_rewards = [
-                    float(self.env.compute_reward(problem, text))
-                    for text in completion_texts
-                ]
-        except GraderInfrastructureError as exc:
+        if reward_computation is None:
+            reward_computation = self.compute_submission_rewards(request)
+        validator_scored_reward = reward_computation.validator_scored_reward
+        completion_texts = reward_computation.completion_texts
+        computed_rewards = reward_computation.rewards
+        reward_error = reward_computation.error
+        if isinstance(reward_error, GraderInfrastructureError):
+            exc = reward_error
             reason = exc.reason or "unknown"
             self.grader_failures[reason] = (
                 self.grader_failures.get(reason, 0) + 1
@@ -1587,7 +1713,7 @@ class GrpoWindowBatcher:
                 reason,
             )
             return reject(RejectReason.WORKER_DROPPED, "code_grader")
-        except Exception:
+        if reward_error is not None or computed_rewards is None:
             return reject(RejectReason.REWARD_MISMATCH, "reward")
 
         for rollout, computed_reward in zip(
@@ -2666,6 +2792,9 @@ class GrpoWindowBatcher:
             reward_vector=reward_shape.reward_vector,
             truncated_count=truncated_count,
             reward_shape=reward_shape.to_log_dict(),
+            ingress_observability=(
+                telemetry.archive_fields() if telemetry else {}
+            ),
         )
         # The caller decides whether this is an auction winner or an immediate
         # legacy admission.
@@ -2735,6 +2864,9 @@ class GrpoWindowBatcher:
                             telemetry.prompt_hash_lead if telemetry else None
                         ),
                         reject_stage=reject_stage,
+                        ingress_observability=(
+                            telemetry.archive_fields() if telemetry else None
+                        ),
                     )
                 )
         return BatchSubmissionResponse(accepted=False, reason=reason)
@@ -2754,12 +2886,15 @@ class GrpoWindowBatcher:
         """Prove candidates in difficulty-score order until ``B_BATCH`` distinct
         prompts pass. Never prove a loser.
 
-        Ranking is by ``-value``, drand round ascending, then an
-        operator-bound hash. The hash deliberately excludes hotkey and miner
-        payload fields: one operator cannot improve an equal-score tie by
-        registering more hotkeys or grinding harmless metadata. A post-deadline
-        drand beacon salts the tie when available; window randomness is the
-        deterministic liveness fallback.
+        Ranking is by ``-value`` and then an operator-bound hash. The hash
+        deliberately excludes hotkey and miner payload fields: one operator
+        cannot improve an equal-score tie by registering more hotkeys or
+        grinding harmless metadata. A post-deadline drand beacon salts the tie
+        when available; window randomness is the deterministic liveness
+        fallback. The miner-submitted drand round is a freshness observation,
+        not an economic ordering key: otherwise any non-zero backward tolerance
+        lets a miner antedate an equal-score candidate for a deterministic
+        advantage.
 
         Same-prompt resolution happens HERE (spec §2.2): the first submission for
         a prompt that PASSES the proof claims the slot; later submissions for a
@@ -2813,7 +2948,6 @@ class GrpoWindowBatcher:
             scored,
             key=lambda item: (
                 -item[1].value,
-                int(item[0].drand_round),
                 tiebreak_by_id[id(item[0])],
             ),
         )
@@ -2847,6 +2981,11 @@ class GrpoWindowBatcher:
                 "proof_passed": None,
                 "selected": False,
                 "status": "ranked",
+                **(
+                    pending_submission.telemetry.archive_fields()
+                    if pending_submission.telemetry is not None
+                    else {}
+                ),
             }
             candidate_rows.append(row)
             self.difficulty_auction_metadata_by_id[id(pending_submission)] = row

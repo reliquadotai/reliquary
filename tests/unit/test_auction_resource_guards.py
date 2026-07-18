@@ -622,9 +622,17 @@ async def test_chunked_body_limit_rejects_before_downstream_parsing():
 
 
 @pytest.mark.asyncio
-async def test_worker_drains_predeadline_auction_item_after_collection_closes():
+async def test_worker_drains_predeadline_auction_item_after_collection_closes(
+    monkeypatch,
+):
     from reliquary.protocol.submission import WindowState
     from reliquary.validator.server import ValidatorServer
+
+    cache_clears = []
+    monkeypatch.setattr(
+        "reliquary.validator.service._try_empty_cuda_cache",
+        lambda: cache_clears.append(True),
+    )
 
     server = ValidatorServer()
     batcher = _batcher()
@@ -649,6 +657,7 @@ async def test_worker_drains_predeadline_auction_item_after_collection_closes():
         assert batcher.pending_proof_reservations == 0
         assert batcher.inflight_proof_reservations == 0
         assert batcher.retained_payload_bytes == 999
+        assert cache_clears == []
     finally:
         worker.cancel()
         try:

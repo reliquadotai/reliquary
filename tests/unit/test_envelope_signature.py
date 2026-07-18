@@ -35,8 +35,11 @@ from fastapi.testclient import TestClient
 from reliquary.constants import CHALLENGE_K, M_ROLLOUTS
 from reliquary.protocol.signatures import (
     build_envelope_binding,
+    build_precommit_binding,
     sign_envelope,
+    sign_precommit,
     verify_envelope_signature,
+    verify_precommit_signature,
 )
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
@@ -259,6 +262,59 @@ def test_sign_envelope_round_trips_through_verify():
     )
     sig = sign_envelope(wallet=_W, **common).hex()
     assert verify_envelope_signature(**common, envelope_signature=sig)
+
+
+@pytest.mark.parametrize(
+    "field,bad_value",
+    [
+        ("window_start", 501),
+        ("prompt_idx", 43),
+        ("merkle_root", "00" * 32),
+        ("checkpoint_hash", "sha256:other"),
+        ("environment", "opencodeinstruct"),
+        ("payload_bytes", 654322),
+        ("payload_sha256", "00" * 32),
+        ("drand_round", 12346),
+        ("randomness", "ef" * 16),
+        ("protocol_version", 3),
+        ("nonce", "nonce-2"),
+    ],
+)
+def test_precommit_signature_binds_routing_size_and_freshness(field, bad_value):
+    kp = _new_keypair()
+
+    class _W:
+        class hotkey:
+            ss58_address = kp.ss58_address
+
+            @staticmethod
+            def sign(msg):
+                return kp.sign(msg)
+
+    common = dict(
+        miner_hotkey=kp.ss58_address,
+        window_start=500,
+        prompt_idx=42,
+        merkle_root="ab" * 32,
+        checkpoint_hash="sha256:ckpt",
+        environment="openmathinstruct",
+        payload_bytes=654321,
+        payload_sha256="ab" * 32,
+        drand_round=12345,
+        randomness="cd" * 16,
+        protocol_version=2,
+        nonce="nonce-1",
+    )
+    assert build_precommit_binding(**common) == build_precommit_binding(**common)
+    signature = sign_precommit(wallet=_W, **common).hex()
+    assert verify_precommit_signature(
+        **common,
+        precommit_signature=signature,
+    )
+    assert not verify_precommit_signature(
+        **{**common, field: bad_value},
+        precommit_signature=signature,
+    )
 
 
 # ---------------------------------------------------------------------------

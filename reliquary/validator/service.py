@@ -48,6 +48,7 @@ from reliquary.constants import (
     LEGACY_MERKLE_ROOT_ENFORCE,
     LR_COSINE_MAX_WINDOWS,
     LR_WARMUP_WINDOWS,
+    MATH_ADMISSION_WORKERS,
     M_ROLLOUTS,
     MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW,
     MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
@@ -68,6 +69,7 @@ from reliquary.constants import (
     SPARSE_VALID_IDLE_SEAL_SECONDS,
     SPARSE_VALID_MAX_WINDOW_SECONDS,
     SIGMA_MIN,
+    SUBMISSION_UPLOAD_GRACE_SECONDS,
     SUBNET_START_BLOCK,
     TRAIN_UNTIL_CHECKPOINT_N,
     VALIDATOR_HTTP_PORT,
@@ -75,6 +77,7 @@ from reliquary.constants import (
     WINDOW_LENGTH,
     WINDOW_COLLECTION_SECONDS,
     WINDOW_TIMEOUT_SECONDS,
+    CODE_ADMISSION_WORKERS,
 )
 from reliquary.environment import load_environments
 from reliquary.environment.base import Environment
@@ -1173,6 +1176,10 @@ class ValidationService:
             await asyncio.sleep(PROOF_ADMISSION_STALL_POLL_SECONDS)
 
         if timed_out:
+            for batcher in auction_batchers:
+                existing_reason = getattr(batcher, "force_seal_reason", None)
+                if not isinstance(existing_reason, str) or not existing_reason:
+                    batcher.force_seal_reason = "auction_queue_drain_timeout"
             logger.warning(
                 "Window %d auction queue drain reached %.1fs; froze pending "
                 "populations and dropped remaining queued submissions",
@@ -2054,6 +2061,7 @@ class ValidationService:
                 if math.isfinite(candidate_age) and candidate_age >= 0.0:
                     arrival_age_seconds = candidate_age
             return {
+                **dict(getattr(s, "ingress_observability", {}) or {}),
                 "arrival_ts": arrival_ts,
                 "arrival_age_seconds": arrival_age_seconds,
                 "decision_ts": getattr(s, "decision_ts", None),
@@ -2370,6 +2378,10 @@ class ValidationService:
             "environment": env_names_list[0],   # legacy singular, kept for compat
             "environments": env_names_list,      # multi-env canonical field
             "force_seal_reason": getattr(first_batcher, "force_seal_reason", None),
+            "force_seal_reason_by_environment": {
+                env_name: getattr(env_batcher, "force_seal_reason", None)
+                for env_name, env_batcher in batcher_dict.items()
+            },
             "window_opened_wall_ts_by_environment": {
                 env_name: getattr(env_batcher, "window_opened_wall_ts", None)
                 for env_name, env_batcher in batcher_dict.items()
@@ -2446,6 +2458,12 @@ class ValidationService:
                     drand_chain_info.get("genesis_time") if drand_chain_info else None
                 ),
                 "drand_round_backward_tolerance": DRAND_ROUND_BACKWARD_TOLERANCE,
+                "upload_precommit_enabled": True,
+                "submission_upload_grace_seconds": (
+                    SUBMISSION_UPLOAD_GRACE_SECONDS
+                ),
+                "math_admission_workers": MATH_ADMISSION_WORKERS,
+                "code_admission_workers": CODE_ADMISSION_WORKERS,
                 "checkpoint_repo_id": cp.repo_id if cp else self.hf_repo_id,
                 "checkpoint_revision": cp.revision if cp else None,
                 "checkpoint_n": cp.checkpoint_n if cp else self._checkpoint_n,

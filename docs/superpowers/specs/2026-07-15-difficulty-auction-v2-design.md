@@ -24,7 +24,7 @@ Auction v2 instead:
 2. ranks in-zone groups by expected training value;
 3. proves only candidates that can still win;
 4. pays at most one proven group per prompt;
-5. caps each operator at two slots per environment; and
+5. allows any operator to win multiple distinct prompts on merit; and
 6. burns unfilled slots rather than paying unproven or low-ranked work.
 
 The score selects training examples. It does not scale the value of a selected
@@ -34,8 +34,7 @@ slot: every winner receives one uniform `pool_per_env / B_BATCH` slot.
 
 - Production environments: Math and Code.
 - Each environment has an independent admission queue, grading budget, retained
-  payload budget, pending population, proof accounting, and two-slot operator
-  cap.
+  payload budget, pending population, and proof accounting.
 - The collection deadline is `WINDOW_COLLECTION_SECONDS = 300` seconds after
   the environment is actually activated. Preparation time cannot consume the
   miner's collection interval.
@@ -50,6 +49,14 @@ slot: every winner receives one uniform `pool_per_env / B_BATCH` slot.
 Before queueing, the validator checks the signed envelope, active window,
 checkpoint, environment, registration, operator mapping, protocol version,
 rate limits, logical claim, queue capacity, and serialized payload bounds.
+
+An upgraded miner commits the exact finalized body before upload. The signed
+`/submit/precommit` binds its SHA-256 and byte count alongside routing,
+checkpoint, nonce, protocol, randomness, and drand. A predeadline receipt gives
+that exact reveal at most 33 seconds to complete. It reserves normal hotkey
+quota but no prompt or auction slot. The receipt's precommit-time drand
+observation is authoritative for the reveal; submitted drand never affects
+rank. Direct bodies remain compatible before the collection cutoff.
 
 The worker then performs the bounded non-GPU path:
 
@@ -119,13 +126,14 @@ mode.
 Candidates are ordered by:
 
 ```text
-(-difficulty_value, submitted_drand_round, operator_prompt_tiebreak)
+(-difficulty_value, operator_prompt_tiebreak)
 ```
 
-The final tie-break hashes only the operator, prompt, and post-deadline drand
-salt. It excludes hotkey, Merkle root, and miner-controlled metadata, so an
-operator cannot mint extra equal-score lottery tickets. If seal-time drand is
-temporarily unavailable, window randomness is the deterministic liveness
+`submitted_drand_round` is checked for freshness but never affects economic
+ordering. The tie-break hashes only the operator, prompt, and post-deadline
+drand salt. It excludes hotkey, Merkle root, and miner-controlled metadata, so
+an operator cannot mint extra equal-score lottery tickets. If seal-time drand
+is temporarily unavailable, window randomness is the deterministic liveness
 fallback.
 
 ## 6. Deferred Proof And Selection
@@ -135,10 +143,9 @@ At seal, the validator walks the frozen ranking top-down:
 1. skip a prompt already won by a higher-ranked proven candidate;
 2. skip cooldown prompts;
 3. fail closed on missing operator identity;
-4. skip operators that already won two slots in this environment;
-5. skip identities whose proof-failure debt is exhausted;
-6. run the expensive GRAIL/auth/termination/distribution proof; and
-7. on pass, claim the prompt and one operator slot; on failure, promote the next
+4. skip identities whose proof-failure debt is exhausted;
+5. run the expensive GRAIL/auth/termination/distribution proof; and
+6. on pass, claim the prompt; on failure, promote the next
    candidate.
 
 A fabricated high-scoring group therefore cannot squat a prompt. It must pass
