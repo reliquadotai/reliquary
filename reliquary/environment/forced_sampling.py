@@ -14,6 +14,12 @@ import torch
 from reliquary.constants import FORCED_SEED_DOMAIN
 
 
+# Vocabulary-wide float32 transforms create several temporary tensors per row
+# (softmax, sort values/indices, CDF, and scatter output). Bound the source
+# matrix for each pass so long completions cannot consume the entire GPU.
+_DIAGNOSTIC_FLOAT_WORKSPACE_BYTES = 256 * 1024 * 1024
+
+
 @dataclass(frozen=True)
 class SeedConsistencyDiagnostics:
     n_positions: int = 0
@@ -128,6 +134,7 @@ def seed_consistency_diagnostics(
     stochastic_threshold: float,
     boundary_epsilon: float,
     position_offsets: list[int] | None = None,
+    logit_positions: list[int] | None = None,
 ) -> SeedConsistencyDiagnostics:
     """Classify exact picks and numerical CDF-boundary misses on GPU.
 
@@ -137,70 +144,106 @@ def seed_consistency_diagnostics(
     that interval. This distinguishes numerical drift near a real decision
     boundary from generic percentage forgiveness for arbitrary branch edits.
     """
-    n = min(len(token_ids), len(u_values), int(logits.shape[0]))
+    available_rows = (
+        len(logit_positions)
+        if logit_positions is not None
+        else int(logits.shape[0])
+    )
+    n = min(len(token_ids), len(u_values), available_rows)
     if position_offsets is not None:
         n = min(n, len(position_offsets))
     if n == 0:
         return SeedConsistencyDiagnostics()
     if boundary_epsilon < 0:
         raise ValueError("boundary_epsilon must be non-negative")
+    selected_positions = None
+    if logit_positions is not None:
+        selected_positions = [int(value) for value in logit_positions[:n]]
+        row_count = int(logits.shape[0])
+        if any(value < 0 or value >= row_count for value in selected_positions):
+            raise ValueError("logit_positions contains an out-of-range row")
 
-    probs = _warp_batch(logits[:n], t=t, top_k=top_k, top_p=top_p)
-    max_probs = probs.max(dim=-1).values
-    stochastic = max_probs < stochastic_threshold
-    cdf = torch.cumsum(probs, dim=-1)
-    toks = torch.tensor(
-        [int(x) for x in token_ids[:n]],
-        device=cdf.device,
-        dtype=torch.long,
+    vocab_size = max(1, int(logits.shape[-1]))
+    chunk_rows = max(
+        1,
+        min(n, _DIAGNOSTIC_FLOAT_WORKSPACE_BYTES // (vocab_size * 4)),
     )
-    row = torch.arange(n, device=cdf.device)
-    upper = cdf[row, toks]
-    mass = probs[row, toks]
-    lower = upper - mass
-    u = torch.tensor(
-        [float(x) for x in u_values[:n]],
-        device=cdf.device,
-        dtype=cdf.dtype,
-    )
+    counts = [0] * 8
+    max_cdf_miss = 0.0
+    first_hard_mismatch_offset: int | None = None
+    for start in range(0, n, chunk_rows):
+        end = min(n, start + chunk_rows)
+        if selected_positions is None:
+            chunk_logits = logits[start:end]
+        else:
+            row_indices = torch.tensor(
+                selected_positions[start:end],
+                device=logits.device,
+                dtype=torch.long,
+            )
+            chunk_logits = logits.index_select(0, row_indices)
 
-    exact = (u >= lower) & (u < upper)
-    miss = torch.where(
-        u < lower,
-        lower - u,
-        torch.where(u >= upper, u - upper, torch.zeros_like(u)),
-    )
-    boundary_match = exact | (miss <= float(boundary_epsilon))
-    hard_mismatch = ~boundary_match
-    deterministic_hard = hard_mismatch & ~stochastic
-    offsets = torch.tensor(
-        (
-            [int(value) for value in position_offsets[:n]]
-            if position_offsets is not None
-            else list(range(n))
-        ),
-        device=cdf.device,
-        dtype=torch.long,
-    )
-    first_hard = torch.where(
-        hard_mismatch,
-        offsets,
-        torch.full_like(offsets, -1),
-    )
-    first_hard = first_hard[first_hard >= 0]
-
-    counts = torch.stack(
-        (
-            stochastic.sum(),
-            (stochastic & exact).sum(),
-            boundary_match.sum(),
-            hard_mismatch.sum(),
-            deterministic_hard.sum(),
-            (miss > 0.01).sum(),
-            (miss > 0.05).sum(),
-            (miss > 0.10).sum(),
+        probs = _warp_batch(chunk_logits, t=t, top_k=top_k, top_p=top_p)
+        max_probs = probs.max(dim=-1).values
+        stochastic = max_probs < stochastic_threshold
+        cdf = torch.cumsum(probs, dim=-1)
+        toks = torch.tensor(
+            [int(x) for x in token_ids[start:end]],
+            device=cdf.device,
+            dtype=torch.long,
         )
-    ).tolist()
+        row = torch.arange(end - start, device=cdf.device)
+        upper = cdf[row, toks]
+        mass = probs[row, toks]
+        lower = upper - mass
+        u = torch.tensor(
+            [float(x) for x in u_values[start:end]],
+            device=cdf.device,
+            dtype=cdf.dtype,
+        )
+
+        exact = (u >= lower) & (u < upper)
+        miss = torch.where(
+            u < lower,
+            lower - u,
+            torch.where(u >= upper, u - upper, torch.zeros_like(u)),
+        )
+        boundary_match = exact | (miss <= float(boundary_epsilon))
+        hard_mismatch = ~boundary_match
+        deterministic_hard = hard_mismatch & ~stochastic
+        offsets = torch.tensor(
+            (
+                [int(value) for value in position_offsets[start:end]]
+                if position_offsets is not None
+                else list(range(start, end))
+            ),
+            device=cdf.device,
+            dtype=torch.long,
+        )
+        hard_offsets = offsets[hard_mismatch]
+
+        chunk_counts = torch.stack(
+            (
+                stochastic.sum(),
+                (stochastic & exact).sum(),
+                boundary_match.sum(),
+                hard_mismatch.sum(),
+                deterministic_hard.sum(),
+                (miss > 0.01).sum(),
+                (miss > 0.05).sum(),
+                (miss > 0.10).sum(),
+            )
+        ).tolist()
+        counts = [total + int(value) for total, value in zip(counts, chunk_counts)]
+        max_cdf_miss = max(max_cdf_miss, float(miss.max().item()))
+        if hard_offsets.numel():
+            chunk_first = int(hard_offsets.min().item())
+            first_hard_mismatch_offset = (
+                chunk_first
+                if first_hard_mismatch_offset is None
+                else min(first_hard_mismatch_offset, chunk_first)
+            )
+
     return SeedConsistencyDiagnostics(
         n_positions=n,
         n_stochastic=int(counts[0]),
@@ -211,8 +254,6 @@ def seed_consistency_diagnostics(
         n_miss_gt_0_01=int(counts[5]),
         n_miss_gt_0_05=int(counts[6]),
         n_miss_gt_0_10=int(counts[7]),
-        max_cdf_miss=float(miss.max().item()),
-        first_hard_mismatch_offset=(
-            int(first_hard.min().item()) if first_hard.numel() else None
-        ),
+        max_cdf_miss=max_cdf_miss,
+        first_hard_mismatch_offset=first_hard_mismatch_offset,
     )

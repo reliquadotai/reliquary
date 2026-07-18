@@ -1,4 +1,3 @@
-import hashlib
 import pytest
 import torch
 from reliquary.environment import forced_sampling as fs
@@ -200,3 +199,50 @@ def test_cdf_diagnostics_reports_completion_offset_of_first_hard_mismatch():
 
     assert diagnostics.n_hard_mismatch == 1
     assert diagnostics.first_hard_mismatch_offset == 11
+
+
+def test_cdf_diagnostics_chunks_selected_logit_rows(monkeypatch):
+    torch.manual_seed(7)
+    logits = torch.randn(9, 17)
+    positions = [8, 2, 6, 1, 4]
+    selected = logits[positions]
+    u_values = [0.11, 0.32, 0.53, 0.74, 0.95]
+    token_ids = [
+        fs.pick(fs.warp(row, t=0.6, top_k=8, top_p=0.95), u)
+        for row, u in zip(selected, u_values)
+    ]
+    kwargs = dict(
+        t=0.6,
+        top_k=8,
+        top_p=0.95,
+        stochastic_threshold=0.99,
+        boundary_epsilon=0.001,
+        position_offsets=[10, 20, 30, 40, 50],
+    )
+    expected = fs.seed_consistency_diagnostics(
+        selected, token_ids, u_values, **kwargs,
+    )
+
+    seen_rows = []
+    original_warp_batch = fs._warp_batch
+
+    def _recording_warp_batch(chunk, *args, **inner_kwargs):
+        seen_rows.append(int(chunk.shape[0]))
+        return original_warp_batch(chunk, *args, **inner_kwargs)
+
+    monkeypatch.setattr(fs, "_warp_batch", _recording_warp_batch)
+    monkeypatch.setattr(
+        fs,
+        "_DIAGNOSTIC_FLOAT_WORKSPACE_BYTES",
+        2 * logits.shape[-1] * 4,
+    )
+    actual = fs.seed_consistency_diagnostics(
+        logits,
+        token_ids,
+        u_values,
+        logit_positions=positions,
+        **kwargs,
+    )
+
+    assert actual == expected
+    assert seen_rows == [2, 2, 1]
