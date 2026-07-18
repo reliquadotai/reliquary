@@ -3418,12 +3418,13 @@ class ValidatorServer:
                     await asyncio.to_thread(_try_empty_cuda_cache)
             finally:
                 self._finish_proof_admission(batcher, request)
-                # Always reclaim activation memory after a forward pass so
-                # back-to-back GRAIL verifies don't accumulate fragmentation.
-                # The helper is a no-op on CPU-only hosts. Cost: ~ms; benefit:
-                # prevents the multi-hour drift that took down the validator
-                # on 2026-05-11.
-                await asyncio.to_thread(_try_empty_cuda_cache)
+                # Legacy admission runs GRAIL inline and must reclaim its
+                # activation cache. Auction admission only grades rewards on
+                # CPU/sandbox workers; emptying CUDA from several concurrent
+                # workers would add a global allocator synchronization and can
+                # interfere with training or seal-time deferred proof.
+                if not getattr(batcher, "difficulty_auction_enabled", False):
+                    await asyncio.to_thread(_try_empty_cuda_cache)
 
     async def start(self) -> None:
         if self._task is not None:
