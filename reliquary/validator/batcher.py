@@ -2754,12 +2754,15 @@ class GrpoWindowBatcher:
         """Prove candidates in difficulty-score order until ``B_BATCH`` distinct
         prompts pass. Never prove a loser.
 
-        Ranking is by ``-value``, drand round ascending, then an
-        operator-bound hash. The hash deliberately excludes hotkey and miner
-        payload fields: one operator cannot improve an equal-score tie by
-        registering more hotkeys or grinding harmless metadata. A post-deadline
-        drand beacon salts the tie when available; window randomness is the
-        deterministic liveness fallback.
+        Ranking is by ``-value`` and then an operator-bound hash. The hash
+        deliberately excludes hotkey and miner payload fields: one operator
+        cannot improve an equal-score tie by registering more hotkeys or
+        grinding harmless metadata. A post-deadline drand beacon salts the tie
+        when available; window randomness is the deterministic liveness
+        fallback. The miner-submitted drand round is a freshness observation,
+        not an economic ordering key: otherwise any non-zero backward tolerance
+        lets a miner antedate an equal-score candidate for a deterministic
+        advantage.
 
         Same-prompt resolution happens HERE (spec §2.2): the first submission for
         a prompt that PASSES the proof claims the slot; later submissions for a
@@ -2813,7 +2816,6 @@ class GrpoWindowBatcher:
             scored,
             key=lambda item: (
                 -item[1].value,
-                int(item[0].drand_round),
                 tiebreak_by_id[id(item[0])],
             ),
         )
