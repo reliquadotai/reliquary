@@ -1,8 +1,11 @@
 # Auction Ingress And Deadline Fairness Fix
 
-**Date:** 2026-07-18  
-**Branch:** `fix/auction-ingress-admission`  
-**Scope:** Math and Code difficulty-auction admission  
+**Date:** 2026-07-18
+
+**Branch:** `fix/auction-ingress-admission`
+
+**Scope:** Math and Code difficulty-auction admission
+
 **Decision:** replace stale-round transport tolerance with a signed, exact-body
 precommit/reveal contract and remove submitted drand from economic ordering.
 
@@ -118,6 +121,18 @@ bounded admission drain did not quiesce before population freeze.
 - Queue-drain timeouts are visible per environment in R2.
 - Full local test suite and production smoke checks pass before unpinning the
   previous image digest.
+
+## Verification Result
+
+The complete repository suite passed on the pinned local runtime:
+
+```text
+1369 passed, 13 skipped, 2 third-party deprecation warnings
+```
+
+Focused tests additionally cover exact-body substitution, cross-drand reveal,
+receipt outcome replay, queue-worker overlap, CUDA-cache isolation, archive
+timeout persistence, and GRAIL diagnostic scrubbing.
 
 ## Rollback
 
