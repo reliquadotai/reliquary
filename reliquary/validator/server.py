@@ -49,6 +49,7 @@ from reliquary.constants import (
     FORCED_SEED_PROTOCOL_VERSION,
     FORCED_SEED_ROLLOUT_FLOOR,
     LEGACY_MERKLE_ROOT_ENFORCE,
+    MATH_ADMISSION_WORKERS,
     MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW,
     MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
@@ -71,6 +72,7 @@ from reliquary.constants import (
     SPARSE_VALID_MAX_WINDOW_SECONDS,
     SUBMISSION_UPLOAD_GRACE_SECONDS,
     VALIDATOR_HTTP_PORT,
+    CODE_ADMISSION_WORKERS,
 )
 from reliquary.environment.virtual_parquet import PromptSourceUnavailable
 from reliquary.protocol.legacy_merkle import (
@@ -372,6 +374,23 @@ def _proof_free_submission_reject(
             return RejectReason.BAD_SCHEMA, "schema"
         if list(rollout.tokens) != list(rollout.commit["tokens"]):
             return RejectReason.TOKENS_MISMATCH, "token_invariant"
+        verify_signature = getattr(batcher, "_verify_signature", None)
+        if (
+            callable(verify_signature)
+            and not _is_mock_like(verify_signature)
+            and not verify_signature(rollout.commit, request.miner_hotkey)
+        ):
+            return RejectReason.BAD_SIGNATURE, "rollout_signature"
+        claimed_randomness = (
+            (rollout.commit.get("beacon") or {}).get("randomness", "")
+        )
+        expected_randomness = getattr(batcher, "randomness", "")
+        if (
+            not _is_mock_like(expected_randomness)
+            and bool(expected_randomness)
+            and claimed_randomness != expected_randomness
+        ):
+            return RejectReason.WRONG_RANDOMNESS, "randomness"
 
     model_config = _proof_free_model_config(batcher)
     canonical_prompt_tokens: list[int] | None = None
@@ -517,6 +536,12 @@ class _Health(BaseModel):
     batch_size: int
     queue_depth: int | None = None
     queue_depth_by_environment: dict[str, int] = Field(default_factory=dict)
+    admission_workers_by_environment: dict[str, int] = Field(
+        default_factory=lambda: {
+            "openmathinstruct": MATH_ADMISSION_WORKERS,
+            "opencodeinstruct": CODE_ADMISSION_WORKERS,
+        }
+    )
     proof_verification_inflight: int | None = None
     proof_verification_inflight_by_environment: dict[str, int] = Field(
         default_factory=dict
@@ -729,6 +754,7 @@ class ValidatorServer:
         )
         self._worker_task: asyncio.Task[Any] | None = None
         self._code_worker_task: asyncio.Task[Any] | None = None
+        self._extra_worker_tasks: list[asyncio.Task[Any]] = []
         self._inflight_proofs = 0
         self._inflight_proofs_by_environment: collections.Counter[str] = (
             collections.Counter()
@@ -1360,6 +1386,14 @@ class ValidatorServer:
             "retained_payload_bytes": _integer(
                 getattr(batcher, "retained_payload_bytes", None)
             ),
+            "pending_upload_precommits": _integer(
+                getattr(batcher, "pending_upload_precommits", None)
+            ),
+            "collection_closed": bool(
+                getattr(type(batcher), "collection_closed", lambda _self: False)(
+                    batcher
+                )
+            ),
             "difficulty_auction_enabled": auction_enabled,
             "difficulty_auction_proof_wall_elapsed_seconds": _floating(
                 getattr(batcher, "proof_wall_elapsed_seconds", None)
@@ -1515,6 +1549,10 @@ class ValidatorServer:
             batch_size=B_BATCH,
             queue_depth=self.submit_queue_depth,
             queue_depth_by_environment=self.submit_queue_depth_by_environment,
+            admission_workers_by_environment={
+                "openmathinstruct": MATH_ADMISSION_WORKERS,
+                "opencodeinstruct": CODE_ADMISSION_WORKERS,
+            },
             proof_verification_inflight=self._inflight_proofs,
             proof_verification_inflight_by_environment=(
                 self.proof_verification_inflight_by_environment
@@ -1755,11 +1793,19 @@ class ValidatorServer:
         batcher: Any,
         request: BatchSubmissionRequest,
         telemetry: SubmitTelemetry,
+        reward_computation: Any | None = None,
     ) -> BatchSubmissionResponse:
         try:
-            return batcher.accept_submission(request, telemetry=telemetry)
+            kwargs: dict[str, Any] = {"telemetry": telemetry}
+            if reward_computation is not None:
+                kwargs["reward_computation"] = reward_computation
+            return batcher.accept_submission(request, **kwargs)
         except TypeError as exc:
-            if "telemetry" not in str(exc):
+            message = str(exc)
+            if "unexpected keyword argument" not in message or not any(
+                name in message
+                for name in ("telemetry", "reward_computation")
+            ):
                 raise
             return batcher.accept_submission(request)
 
@@ -3161,8 +3207,38 @@ class ValidatorServer:
                 )
                 self._inflight_proofs_by_environment[env_name] += 1
                 try:
+                    reward_computation = None
+                    precompute_rewards = getattr(
+                        type(batcher), "compute_submission_rewards", None
+                    )
+                    if precompute_rewards is not None:
+                        reward_computation = await asyncio.to_thread(
+                            precompute_rewards,
+                            batcher,
+                            request,
+                        )
+                        log_submission_stage(
+                            logger,
+                            logging.INFO,
+                            "reward_graded",
+                            telemetry,
+                            reward_grading_ms=getattr(
+                                reward_computation, "elapsed_ms", None
+                            ),
+                            reward_grading_error=(
+                                type(reward_computation.error).__name__
+                                if getattr(
+                                    reward_computation, "error", None
+                                ) is not None
+                                else None
+                            ),
+                        )
                     response = await asyncio.to_thread(
-                        self._call_accept_submission, batcher, request, telemetry
+                        self._call_accept_submission,
+                        batcher,
+                        request,
+                        telemetry,
+                        reward_computation,
                     )
                 finally:
                     self._inflight_proofs = max(0, self._inflight_proofs - 1)
@@ -3268,18 +3344,47 @@ class ValidatorServer:
         self._server = uvicorn.Server(config)
         self._task = asyncio.create_task(self._server.serve())
         self._worker_task = asyncio.create_task(
-            self._submit_worker(self._submit_queue)
+            self._submit_worker(self._submit_queue),
+            name="math_admission_worker_0",
         )
         self._code_worker_task = asyncio.create_task(
-            self._submit_worker(self._code_submit_queue)
+            self._submit_worker(self._code_submit_queue),
+            name="code_admission_worker_0",
         )
+        self._extra_worker_tasks = [
+            *(
+                asyncio.create_task(
+                    self._submit_worker(self._submit_queue),
+                    name=f"math_admission_worker_{index}",
+                )
+                for index in range(1, MATH_ADMISSION_WORKERS)
+            ),
+            *(
+                asyncio.create_task(
+                    self._submit_worker(self._code_submit_queue),
+                    name=f"code_admission_worker_{index}",
+                )
+                for index in range(1, CODE_ADMISSION_WORKERS)
+            ),
+        ]
         await asyncio.sleep(0)
-        logger.info("Validator HTTP server listening on %s:%d", self.host, self.port)
+        logger.info(
+            "Validator HTTP server listening on %s:%d "
+            "(math_admission_workers=%d code_admission_workers=%d)",
+            self.host,
+            self.port,
+            MATH_ADMISSION_WORKERS,
+            CODE_ADMISSION_WORKERS,
+        )
 
     async def stop(self) -> None:
         worker_tasks = [
             task
-            for task in (self._worker_task, self._code_worker_task)
+            for task in (
+                self._worker_task,
+                self._code_worker_task,
+                *self._extra_worker_tasks,
+            )
             if task is not None
         ]
         for task in worker_tasks:
@@ -3288,6 +3393,7 @@ class ValidatorServer:
             await asyncio.gather(*worker_tasks, return_exceptions=True)
         self._worker_task = None
         self._code_worker_task = None
+        self._extra_worker_tasks = []
         if self._server is not None:
             self._server.should_exit = True
         if self._task is not None:

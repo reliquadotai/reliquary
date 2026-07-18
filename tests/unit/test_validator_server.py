@@ -930,6 +930,8 @@ def test_health_exposes_each_environment_window_independently():
         "pending_payload_bytes": 0,
         "inflight_payload_bytes": 0,
         "retained_payload_bytes": 0,
+        "pending_upload_precommits": 0,
+        "collection_closed": False,
         "difficulty_auction_enabled": False,
         "difficulty_auction_proof_wall_elapsed_seconds": 0.0,
         "difficulty_auction_proof_wall_exhausted": False,

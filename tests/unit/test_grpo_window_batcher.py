@@ -2,6 +2,8 @@
 exposes select_batch at window close."""
 
 import json
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
@@ -198,6 +200,43 @@ def _prove_one(b: GrpoWindowBatcher, req) -> "ValidSubmission | None":
 def test_constructor_sets_window():
     b = _make_batcher()
     assert b.window_start == 500
+
+
+def test_reward_precomputation_runs_concurrently_outside_mutation_lock():
+    active = 0
+    max_active = 0
+    counter_lock = threading.Lock()
+
+    class SlowEnv(FakeEnv):
+        def compute_reward(self, problem, completion):
+            nonlocal active, max_active
+            with counter_lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.01)
+                return super().compute_reward(problem, completion)
+            finally:
+                with counter_lock:
+                    active -= 1
+
+    batcher = _make_batcher(env=SlowEnv())
+    requests = [
+        _request(prompt_idx=42, hotkey="hk-a"),
+        _request(prompt_idx=43, hotkey="hk-b"),
+    ]
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        computations = list(
+            executor.map(batcher.compute_submission_rewards, requests)
+        )
+
+    assert max_active >= 2
+    assert all(result.error is None for result in computations)
+    responses = [
+        batcher.accept_submission(request, reward_computation=computation)
+        for request, computation in zip(requests, computations, strict=True)
+    ]
+    assert all(response.accepted for response in responses)
 
 
 def test_reject_window_mismatch():

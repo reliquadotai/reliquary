@@ -227,6 +227,21 @@ if (
 # backstop during a window swap or prolonged GPU stall.
 MAX_PENDING_PROOF_QUEUE_DEPTH = 256
 
+# Reward admission runs before deferred GRAIL proof.  Math grading benefits from
+# modest CPU parallelism; Code already fans each group over the sandbox pool, so
+# two group workers are enough to keep that pool fed without an unbounded thread
+# explosion.  These are validator-runtime capacities, not miner wire constants.
+MATH_ADMISSION_WORKERS = int(
+    _os.environ.get("RELIQUARY_MATH_ADMISSION_WORKERS", "4")
+)
+CODE_ADMISSION_WORKERS = int(
+    _os.environ.get("RELIQUARY_CODE_ADMISSION_WORKERS", "2")
+)
+if not 1 <= MATH_ADMISSION_WORKERS <= 16:
+    raise ValueError("RELIQUARY_MATH_ADMISSION_WORKERS must be within [1, 16]")
+if not 1 <= CODE_ADMISSION_WORKERS <= 8:
+    raise ValueError("RELIQUARY_CODE_ADMISSION_WORKERS must be within [1, 8]")
+
 # A hotkey that repeatedly reaches the expensive proof path and then fails
 # behavioural/integrity checks should not be allowed to consume the whole
 # window's scarce proof budget. Allow a small number of misses for honest

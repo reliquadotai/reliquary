@@ -419,6 +419,17 @@ class ForensicSampleResult:
     passed: bool
 
 
+@dataclass(frozen=True)
+class RewardComputation:
+    """Authoritative reward work completed outside the batcher mutation lock."""
+
+    validator_scored_reward: bool
+    completion_texts: list[str]
+    rewards: list[float] | None
+    error: Exception | None
+    elapsed_ms: float
+
+
 class GrpoWindowBatcher:
     """Accepts v2 submissions, runs the full verification pipeline, and
     exposes ``valid_submissions()`` + ``select_batch()`` at window close.
@@ -1356,6 +1367,7 @@ class GrpoWindowBatcher:
         request: BatchSubmissionRequest,
         *,
         telemetry: SubmitTelemetry | None = None,
+        reward_computation: RewardComputation | None = None,
     ) -> BatchSubmissionResponse:
         """Cheaply admit a submission: validate, grade and score it, then append
         a ``PendingSubmission`` to ``_pending``. The GPU proof and every
@@ -1372,7 +1384,63 @@ class GrpoWindowBatcher:
         an arrival-time check, decided once.
         """
         with self._lock:
-            return self._accept_locked(request, telemetry=telemetry)
+            return self._accept_locked(
+                request,
+                telemetry=telemetry,
+                reward_computation=reward_computation,
+            )
+
+    def compute_submission_rewards(
+        self,
+        request: BatchSubmissionRequest,
+    ) -> RewardComputation:
+        """Decode and grade one group without mutating auction state.
+
+        Production workers call this after HTTP proof-free checks and resource
+        reservation, then pass the immutable result into ``accept_submission``.
+        Keeping this work outside ``_lock`` lets independent candidates use the
+        bounded admission pool concurrently.  ``_accept_locked`` still repeats
+        every stateful gate before committing the candidate.
+        """
+        started = time.perf_counter()
+        problem = self.env.get_problem(request.prompt_idx)
+        validator_scored_reward = _uses_validator_authoritative_reward(self.env)
+        completion_texts = [
+            self._completion_text(rollout) for rollout in request.rollouts
+        ]
+        try:
+            if (
+                validator_scored_reward
+                and getattr(self.env, "name", "") == "opencodeinstruct"
+            ):
+                with ThreadPoolExecutor(
+                    max_workers=len(completion_texts),
+                    thread_name_prefix="reliquary-code-grade",
+                ) as executor:
+                    computed_rewards = list(
+                        executor.map(
+                            lambda text: float(
+                                self.env.compute_reward(problem, text)
+                            ),
+                            completion_texts,
+                        )
+                    )
+            else:
+                computed_rewards = [
+                    float(self.env.compute_reward(problem, text))
+                    for text in completion_texts
+                ]
+            error: Exception | None = None
+        except Exception as exc:
+            computed_rewards = None
+            error = exc
+        return RewardComputation(
+            validator_scored_reward=validator_scored_reward,
+            completion_texts=completion_texts,
+            rewards=computed_rewards,
+            error=error,
+            elapsed_ms=(time.perf_counter() - started) * 1000.0,
+        )
 
     def observe_drand_round(
         self,
@@ -1463,6 +1531,7 @@ class GrpoWindowBatcher:
         request: BatchSubmissionRequest,
         *,
         telemetry: SubmitTelemetry | None = None,
+        reward_computation: RewardComputation | None = None,
     ) -> BatchSubmissionResponse:
         hk = request.miner_hotkey
         pi = request.prompt_idx
@@ -1611,37 +1680,14 @@ class GrpoWindowBatcher:
                     "operator_mapping",
                 )
             return reject(RejectReason.HASH_DUPLICATE, "logical_dedup")
-        problem = self.env.get_problem(request.prompt_idx)
-        validator_scored_reward = _uses_validator_authoritative_reward(self.env)
-        completion_texts = [
-            self._completion_text(rollout) for rollout in request.rollouts
-        ]
-        try:
-            if (
-                validator_scored_reward
-                and getattr(self.env, "name", "") == "opencodeinstruct"
-            ):
-                # The production grader owns one sandbox worker per rollout.
-                # Dispatch the group together so a timeout costs one grader
-                # interval instead of eight, while preserving rollout order.
-                with ThreadPoolExecutor(
-                    max_workers=len(completion_texts),
-                    thread_name_prefix="reliquary-code-grade",
-                ) as executor:
-                    computed_rewards = list(
-                        executor.map(
-                            lambda text: float(
-                                self.env.compute_reward(problem, text)
-                            ),
-                            completion_texts,
-                        )
-                    )
-            else:
-                computed_rewards = [
-                    float(self.env.compute_reward(problem, text))
-                    for text in completion_texts
-                ]
-        except GraderInfrastructureError as exc:
+        if reward_computation is None:
+            reward_computation = self.compute_submission_rewards(request)
+        validator_scored_reward = reward_computation.validator_scored_reward
+        completion_texts = reward_computation.completion_texts
+        computed_rewards = reward_computation.rewards
+        reward_error = reward_computation.error
+        if isinstance(reward_error, GraderInfrastructureError):
+            exc = reward_error
             reason = exc.reason or "unknown"
             self.grader_failures[reason] = (
                 self.grader_failures.get(reason, 0) + 1
@@ -1668,7 +1714,7 @@ class GrpoWindowBatcher:
                 reason,
             )
             return reject(RejectReason.WORKER_DROPPED, "code_grader")
-        except Exception:
+        if reward_error is not None or computed_rewards is None:
             return reject(RejectReason.REWARD_MISMATCH, "reward")
 
         for rollout, computed_reward in zip(
