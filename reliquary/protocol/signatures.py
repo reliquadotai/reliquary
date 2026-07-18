@@ -29,6 +29,7 @@ COMMIT_DOMAIN = b"grail-commit-v1"
 # clients are expected to construct the envelope with the same byte layout
 # the validator expects.
 ENVELOPE_DOMAIN = b"reliquary-envelope-v1"
+PRECOMMIT_DOMAIN = b"reliquary-upload-precommit-v1"
 
 
 def hash_commitments(commitments: list[dict]) -> bytes:
@@ -283,6 +284,84 @@ def verify_envelope_signature(
         return bool(keypair.verify(data=msg, signature=sig_bytes))
     except Exception as e:
         logger.debug("envelope signature verify failed: %s", e)
+        return False
+
+
+def build_precommit_binding(
+    *,
+    miner_hotkey: str,
+    window_start: int,
+    prompt_idx: int,
+    merkle_root: str,
+    checkpoint_hash: str,
+    environment: str,
+    payload_bytes: int,
+    drand_round: int,
+    randomness: str,
+    protocol_version: int,
+    nonce: str,
+) -> bytes:
+    """Build the domain-separated upload-precommit message.
+
+    This repeats the envelope's routing identity and additionally binds the
+    environment, exact serialized byte count, and protocol version.  The
+    validator can therefore reserve a short reveal grace without trusting an
+    unsigned header or any miner-controlled arrival timestamp.
+    """
+
+    def _lp(value: bytes) -> bytes:
+        return len(value).to_bytes(4, "big") + value
+
+    def _hex_bytes(value: str) -> bytes:
+        clean = (value or "").strip().replace("0x", "").replace("0X", "")
+        if len(clean) % 2:
+            clean = "0" + clean
+        return bytes.fromhex(clean) if clean else b""
+
+    fields = (
+        miner_hotkey.encode("utf-8"),
+        int(window_start).to_bytes(8, "big", signed=False),
+        int(prompt_idx).to_bytes(8, "big", signed=False),
+        _hex_bytes(merkle_root),
+        (checkpoint_hash or "").encode("utf-8"),
+        environment.encode("utf-8"),
+        int(payload_bytes).to_bytes(8, "big", signed=False),
+        int(drand_round).to_bytes(8, "big", signed=False),
+        _hex_bytes(randomness),
+        int(protocol_version).to_bytes(8, "big", signed=False),
+        nonce.encode("utf-8"),
+    )
+    h = hashlib.sha256()
+    h.update(PRECOMMIT_DOMAIN)
+    for field in fields:
+        h.update(_lp(field))
+    return h.digest()
+
+
+def sign_precommit(*, wallet, **binding_fields) -> bytes:
+    """Sign a canonical upload precommit with the miner hotkey."""
+    if bt is None:
+        raise ImportError("bittensor is required for sign_precommit")
+    if not hasattr(wallet, "hotkey") or not hasattr(wallet.hotkey, "sign"):
+        raise TypeError("Wallet must provide hotkey.sign()")
+    return wallet.hotkey.sign(build_precommit_binding(**binding_fields))
+
+
+def verify_precommit_signature(
+    *, precommit_signature: str, **binding_fields
+) -> bool:
+    """Verify a signed upload precommit, failing closed on malformed input."""
+    if bt is None or not precommit_signature:
+        return False
+    try:
+        signature = bytes.fromhex(precommit_signature)
+        message = build_precommit_binding(**binding_fields)
+        keypair = bt.Keypair(  # type: ignore[union-attr]
+            ss58_address=binding_fields["miner_hotkey"]
+        )
+        return bool(keypair.verify(data=message, signature=signature))
+    except Exception as exc:
+        logger.debug("precommit signature verify failed: %s", exc)
         return False
 
 

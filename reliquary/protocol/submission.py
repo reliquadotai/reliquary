@@ -95,6 +95,9 @@ class RejectReason(str, Enum):
     WORKER_DROPPED = "worker_dropped"
     STALE_ROUND = "stale_round"
     FUTURE_ROUND = "future_round"
+    PRECOMMIT_REQUIRED = "precommit_required"
+    PRECOMMIT_INVALID = "precommit_invalid"
+    PRECOMMIT_EXPIRED = "precommit_expired"
 
 
 class WindowState(str, Enum):
@@ -268,6 +271,43 @@ class BatchSubmissionResponse(BaseModel):
 
     accepted: bool
     reason: RejectReason
+
+
+class SubmissionPrecommitRequest(BaseModel):
+    """Small signed commitment sent before a potentially large submission.
+
+    The Merkle root commits the rollout content, while ``payload_bytes`` binds
+    the exact serialized reveal size used by ingress accounting.  A successful
+    precommit reserves one normal per-window submission attempt; it does not
+    reserve an auction slot or bypass any body-time validation.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    miner_hotkey: str = Field(..., min_length=1)
+    prompt_idx: int = Field(..., ge=0)
+    window_start: int = Field(..., ge=0)
+    merkle_root: str = Field(..., pattern=r"^[0-9a-fA-F]{64}$")
+    checkpoint_hash: str = Field(..., min_length=0, max_length=256)
+    environment: str = Field(..., min_length=1, max_length=64)
+    payload_bytes: int = Field(..., gt=0)
+    drand_round: int = Field(..., ge=0)
+    protocol_version: int = Field(default=0, ge=0)
+    nonce: str = Field(..., min_length=1, max_length=128)
+    precommit_signature: str = Field(
+        ..., min_length=2, max_length=256, pattern=r"^[0-9a-fA-F]+$"
+    )
+
+
+class SubmissionPrecommitResponse(BaseModel):
+    """Receipt authorizing one matching body reveal during upload grace."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    accepted: bool
+    reason: RejectReason
+    receipt_id: str | None = None
+    upload_deadline_ts: float | None = None
 
 
 class GrpoBatchState(BaseModel):

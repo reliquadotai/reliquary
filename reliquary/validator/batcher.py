@@ -37,16 +37,19 @@ from reliquary.constants import (
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
     MAX_PENDING_SUBMISSION_BYTES_PER_ENV,
     MAX_PENDING_SUBMISSION_BYTES_PER_HOTKEY,
+    MAX_PENDING_UPLOAD_PRECOMMITS_PER_ENV,
     MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
     MAX_PROOF_WALL_SECONDS,
     MAX_SEAL_QUEUE_DRAIN_SECONDS,
     MAX_SUBMISSION_PAYLOAD_BYTES,
+    MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
     MAX_SUBMISSIONS_PER_PROMPT,
     MAX_TRUNCATED_PER_SUBMISSION,
     PROMPT_RANGE_SIZE,
     PROMPT_RANGE_ENFORCE_FROM_WINDOW,
     REJECTED_LIST_CAP_PER_HOTKEY,
     WINDOW_COLLECTION_SECONDS,
+    SUBMISSION_UPLOAD_GRACE_SECONDS,
     CODE_SEMANTIC_AUTH_ENFORCE,
     TOKEN_AUTH_ENFORCE,
     ALL_TOKEN_AUTH_ENFORCE,
@@ -683,6 +686,8 @@ class GrpoWindowBatcher:
         self._proof_wall_started_at: float | None = None
         self._seal_snapshot_started = False
         self._seal_completed = False
+        self._upload_precommit_lock = threading.Lock()
+        self._upload_precommits: dict[str, tuple[str, float]] = {}
         # v2.1: checkpoint hash miners must match. Empty string disables
         # the gate (test convenience / pre-first-publish).
         self.current_checkpoint_hash: str = ""
@@ -761,6 +766,73 @@ class GrpoWindowBatcher:
         """
         return self._seal_flag.is_set()
 
+    def collection_closed(self) -> bool:
+        """Whether the generation/commit phase has reached its fixed cutoff."""
+        return self._time_fn() - self.window_opened_at >= WINDOW_COLLECTION_SECONDS
+
+    def _prune_upload_precommits_locked(self, now: float) -> None:
+        expired = [
+            receipt_id
+            for receipt_id, (_hotkey, deadline) in self._upload_precommits.items()
+            if deadline <= now
+        ]
+        for receipt_id in expired:
+            self._upload_precommits.pop(receipt_id, None)
+
+    def try_register_upload_precommit(
+        self,
+        receipt_id: str,
+        hotkey: str,
+        *,
+        t_arrival_wall: float,
+    ) -> tuple[bool, str | None, float | None]:
+        """Reserve one bounded reveal received before collection closes.
+
+        Returns ``(accepted, reason, monotonic_deadline)``.  This reservation is
+        deliberately separate from economic operator/prompt claims: a miner that
+        never uploads cannot squat an auction prompt.
+        """
+        if not self.difficulty_auction_enabled:
+            return False, "precommit_requires_auction", None
+        if (
+            float(t_arrival_wall)
+            > self.window_opened_wall_ts + WINDOW_COLLECTION_SECONDS
+        ):
+            return False, "collection_closed", None
+        now = self._time_fn()
+        with self._upload_precommit_lock:
+            self._prune_upload_precommits_locked(now)
+            if self._seal_flag.is_set() or self._seal_snapshot_started:
+                return False, "collection_sealed", None
+            if len(self._upload_precommits) >= MAX_PENDING_UPLOAD_PRECOMMITS_PER_ENV:
+                return False, "precommit_capacity_full", None
+            hotkey_count = sum(
+                1 for existing_hotkey, _deadline in self._upload_precommits.values()
+                if existing_hotkey == hotkey
+            )
+            if hotkey_count >= MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW:
+                return False, "precommit_hotkey_full", None
+            deadline = min(
+                now + SUBMISSION_UPLOAD_GRACE_SECONDS,
+                self.window_opened_at
+                + WINDOW_COLLECTION_SECONDS
+                + SUBMISSION_UPLOAD_GRACE_SECONDS,
+            )
+            self._upload_precommits[receipt_id] = (hotkey, deadline)
+            return True, None, deadline
+
+    def resolve_upload_precommit(self, receipt_id: str) -> bool:
+        """Release a receipt once its matching body has completed admission."""
+        with self._upload_precommit_lock:
+            return self._upload_precommits.pop(receipt_id, None) is not None
+
+    @property
+    def pending_upload_precommits(self) -> int:
+        now = self._time_fn()
+        with self._upload_precommit_lock:
+            self._prune_upload_precommits_locked(now)
+            return len(self._upload_precommits)
+
     def poll_deadline(self) -> bool:
         """Seal an auction environment at its fixed collection deadline.
 
@@ -771,7 +843,16 @@ class GrpoWindowBatcher:
             return True
         if not self.difficulty_auction_enabled:
             return False
-        if self._time_fn() - self.window_opened_at >= WINDOW_COLLECTION_SECONDS:
+        now = self._time_fn()
+        if now - self.window_opened_at >= WINDOW_COLLECTION_SECONDS:
+            with self._upload_precommit_lock:
+                self._prune_upload_precommits_locked(now)
+                pending_uploads = bool(self._upload_precommits)
+            if pending_uploads and (
+                now - self.window_opened_at
+                < WINDOW_COLLECTION_SECONDS + SUBMISSION_UPLOAD_GRACE_SECONDS
+            ):
+                return False
             self._seal_flag.set()
             if self._seal_event is not None:
                 self._seal_event.set()

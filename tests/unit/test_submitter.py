@@ -134,34 +134,49 @@ async def test_submit_batch_v2_ok(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_submit_batch_v2_refreshes_round_nonce_and_signature_on_retry(
+async def test_submit_batch_v2_retries_one_idempotent_precommit_then_reveals(
     monkeypatch,
 ):
     import reliquary.miner.submitter as submitter
 
-    payloads = []
-    rounds = iter((100, 101))
+    calls = []
+    drand_calls = []
 
     def _sign_envelope(**kwargs):
         return f"{kwargs['drand_round']}:{kwargs['nonce']}".encode()
 
+    def _sign_precommit(**kwargs):
+        return f"precommit:{kwargs['drand_round']}:{kwargs['nonce']}".encode()
+
+    def _drand_round():
+        drand_calls.append(100)
+        return 100
+
     async def _post(self, url, content=None, headers=None, timeout=None):
-        assert headers == {"Content-Type": "application/json"}
-        payloads.append(json.loads(content))
-        if len(payloads) == 1:
+        calls.append((url, json.loads(content), headers))
+        if len(calls) == 1:
             raise httpx.ConnectError(
                 "transient",
                 request=httpx.Request("POST", url),
             )
-        return httpx.Response(
-            200,
-            json=BatchSubmissionResponse(
-                accepted=True, reason=RejectReason.SUBMITTED
-            ).model_dump(mode="json"),
-        )
+        if url.endswith("/submit/precommit"):
+            return httpx.Response(
+                200,
+                json={
+                    "accepted": True,
+                    "reason": RejectReason.ACCEPTED.value,
+                    "receipt_id": "receipt-1",
+                    "upload_deadline_ts": 123.0,
+                },
+            )
+        return httpx.Response(200, json={
+            "accepted": True,
+            "reason": RejectReason.SUBMITTED.value,
+        })
 
     monkeypatch.setattr(submitter, "_RETRY_DELAYS", (0.0, 0.0))
     monkeypatch.setattr(submitter, "sign_envelope", _sign_envelope)
+    monkeypatch.setattr(submitter, "sign_precommit", _sign_precommit)
     monkeypatch.setattr(httpx.AsyncClient, "post", _post)
     client = httpx.AsyncClient()
 
@@ -171,14 +186,18 @@ async def test_submit_batch_v2_refreshes_round_nonce_and_signature_on_retry(
         client=client,
         wallet=object(),
         randomness="ab" * 32,
-        drand_round_fn=lambda: next(rounds),
+        drand_round_fn=_drand_round,
     )
 
     assert response.accepted is True
-    assert [payload["drand_round"] for payload in payloads] == [100, 101]
-    assert payloads[0]["nonce"] != payloads[1]["nonce"]
-    assert payloads[0]["envelope_signature"] != payloads[1]["envelope_signature"]
-    assert all(len(payload["rollouts"]) == 8 for payload in payloads)
+    assert drand_calls == [100]
+    assert calls[0][0].endswith("/submit/precommit")
+    assert calls[1][0].endswith("/submit/precommit")
+    assert calls[0][1] == calls[1][1]
+    assert calls[2][0].endswith("/submit")
+    assert calls[2][1]["drand_round"] == 100
+    assert len(calls[2][1]["rollouts"]) == 8
+    assert calls[2][2]["X-Reliquary-Precommit"] == "receipt-1"
     await client.aclose()
 
 

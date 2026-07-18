@@ -17,12 +17,13 @@ from reliquary.environment.virtual_parquet import PromptSourceUnavailable
 from reliquary.protocol.legacy_merkle import (
     compute_legacy_rollouts_merkle_root,
 )
-from reliquary.protocol.signatures import sign_envelope
+from reliquary.protocol.signatures import sign_envelope, sign_precommit
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     GrpoBatchState,
     RolloutSubmission,
     RejectReason,
+    SubmissionPrecommitRequest,
 )
 from reliquary.validator.batcher import GrpoWindowBatcher
 from reliquary.validator.cooldown import CooldownMap
@@ -212,6 +213,108 @@ def _request(
         nonce=nonce,
         envelope_signature=sig,
     )
+
+
+def _precommit_for(
+    request: BatchSubmissionRequest,
+    *,
+    payload_bytes: int,
+) -> SubmissionPrecommitRequest:
+    fields = {
+        "miner_hotkey": request.miner_hotkey,
+        "window_start": request.window_start,
+        "prompt_idx": request.prompt_idx,
+        "merkle_root": request.merkle_root,
+        "checkpoint_hash": request.checkpoint_hash,
+        "environment": FakeEnv.name,
+        "payload_bytes": payload_bytes,
+        "drand_round": request.drand_round,
+        "randomness": "cd" * 16,
+        "protocol_version": request.protocol_version,
+        "nonce": request.nonce,
+    }
+    signature = sign_precommit(wallet=_TestWallet, **fields).hex()
+    fields.pop("randomness")
+    return SubmissionPrecommitRequest(
+        **fields,
+        precommit_signature=signature,
+    )
+
+
+def test_signed_precommit_extends_only_matching_body_upload():
+    from reliquary.constants import WINDOW_COLLECTION_SECONDS
+    from reliquary.protocol.submission import WindowState
+
+    server = ValidatorServer()
+    batcher = _batcher(window_start=500)
+    batcher.difficulty_auction_enabled = True
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    request = _request(valid_merkle=True)
+    payload = request.model_dump_json().encode("utf-8")
+    precommit = _precommit_for(request, payload_bytes=len(payload))
+
+    with TestClient(server.app) as client:
+        committed = client.post(
+            "/submit/precommit",
+            content=precommit.model_dump_json(),
+            headers={"Content-Type": "application/json"},
+        )
+        assert committed.status_code == 200
+        receipt = committed.json()
+        assert receipt["accepted"] is True
+        assert batcher.pending_upload_precommits == 1
+        assert server._per_window_counts[request.miner_hotkey] == 1
+
+        # Cross the generation cutoff.  The outstanding signed receipt keeps
+        # the auction open only long enough for its exact body to finish.
+        batcher.window_opened_at -= WINDOW_COLLECTION_SECONDS + 1.0
+        batcher.window_opened_wall_ts -= WINDOW_COLLECTION_SECONDS + 1.0
+        assert batcher.collection_closed() is True
+        assert batcher.poll_deadline() is False
+
+        revealed = client.post(
+            "/submit",
+            content=payload,
+            headers={
+                "Content-Type": "application/json",
+                "X-Reliquary-Precommit": receipt["receipt_id"],
+            },
+        )
+        assert revealed.status_code == 200
+        assert revealed.json()["accepted"] is True
+        assert batcher.pending_upload_precommits == 0
+        assert server._per_window_counts[request.miner_hotkey] == 1
+        assert batcher.poll_deadline() is True
+
+
+def test_precommit_rejects_body_with_different_serialized_size():
+    from reliquary.protocol.submission import WindowState
+
+    server = ValidatorServer()
+    batcher = _batcher(window_start=500)
+    batcher.difficulty_auction_enabled = True
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    request = _request(valid_merkle=True)
+    payload = request.model_dump_json().encode("utf-8")
+    precommit = _precommit_for(request, payload_bytes=len(payload) + 1)
+
+    with TestClient(server.app) as client:
+        committed = client.post(
+            "/submit/precommit",
+            content=precommit.model_dump_json(),
+            headers={"Content-Type": "application/json"},
+        ).json()
+        response = client.post(
+            "/submit",
+            content=payload,
+            headers={
+                "Content-Type": "application/json",
+                "X-Reliquary-Precommit": committed["receipt_id"],
+            },
+        )
+    assert response.json()["reason"] == RejectReason.PRECOMMIT_INVALID.value
 
 
 def test_legacy_merkle_shadow_accepts_mismatch_and_exposes_telemetry():
