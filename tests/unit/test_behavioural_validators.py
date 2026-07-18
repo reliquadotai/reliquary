@@ -13,7 +13,7 @@ import math
 import pytest
 import torch
 
-from reliquary.constants import CHALLENGE_K, LOGPROB_IS_EPS, T_PROTO
+from reliquary.constants import CHALLENGE_K, LOGPROB_IS_EPS
 from reliquary.validator import verifier
 from reliquary.validator.verifier import ProofResult
 
@@ -794,3 +794,33 @@ def test_gpu_completion_token_stats_returns_chosen_and_argmax():
     for c, a in zip(chosen, amax_p):
         assert abs(c - a) < 1e-6
         assert a > 0.9
+
+
+def test_gpu_completion_token_stats_chunks_vocab_workspace(monkeypatch):
+    logits = torch.tensor(
+        [
+            [0.0, 5.0, 0.0, 0.0],
+            [0.0, 0.0, 6.0, 0.0],
+            [0.0, 0.0, 0.0, 7.0],
+            [8.0, 0.0, 0.0, 0.0],
+        ]
+    )
+    tokens = [0, 1, 2, 3, 0]
+    monkeypatch.setattr(
+        verifier,
+        "_GPU_VOCAB_FLOAT_WORKSPACE_BYTES",
+        2 * logits.shape[-1] * 4,
+    )
+
+    chosen, amax_p, amax_id = verifier._gpu_completion_token_stats(
+        logits,
+        tokens,
+        prompt_length=1,
+        completion_length=4,
+        seq_len=4,
+        device="cpu",
+    )
+
+    assert len(chosen) == len(amax_p) == len(amax_id) == 4
+    assert amax_id == [1, 2, 3, 0]
+    assert chosen == pytest.approx(amax_p)

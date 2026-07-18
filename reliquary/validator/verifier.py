@@ -23,6 +23,8 @@ from reliquary.shared.modeling import resolve_eos_token_ids
 
 logger = logging.getLogger(__name__)
 
+_GPU_VOCAB_FLOAT_WORKSPACE_BYTES = 256 * 1024 * 1024
+
 
 @dataclass(frozen=True)
 class _CodeSemanticSpan:
@@ -418,9 +420,7 @@ def verify_commitment_proofs(
     counts are computed on GPU the same way. When None (pre-forced-seed
     clients), ``seed_n_stochastic``/``seed_n_match`` stay at 0 — no-op.
     """
-    from reliquary.protocol.crypto import (
-        indices_from_root, indices_from_root_in_range,
-    )
+    from reliquary.protocol.crypto import indices_from_root
     from reliquary.protocol.grail_verifier import GRAILVerifier
     from reliquary.shared.forward import forward_single_layer
     from reliquary.shared.hf_compat import resolve_hidden_size
@@ -513,14 +513,12 @@ def verify_commitment_proofs(
             if t - prompt_length < len(seed_u_values) and not (fs0 <= t < fs1)
         ]
         if seed_t:
-            pos_tensor = torch.tensor(
-                [t - 1 for t in seed_t], device=device, dtype=torch.long,
-            )
             seed_tokens = [tokens[t] for t in seed_t]
             seed_u = [seed_u_values[t - prompt_length] for t in seed_t]
             seed_diagnostics = _gpu_seed_consistency_diagnostics(
-                logits_gpu[pos_tensor], seed_tokens, seed_u,
+                logits_gpu, seed_tokens, seed_u,
                 position_offsets=[t - prompt_length for t in seed_t],
+                logit_positions=[t - 1 for t in seed_t],
             )
             seed_n_stochastic = seed_diagnostics.n_stochastic
             seed_n_match = seed_diagnostics.n_exact_match
@@ -837,17 +835,27 @@ def _gpu_completion_token_stats(
     if not valid_t:
         return [], [], []
 
-    pos_tensor = torch.tensor(
-        [t - 1 for t in valid_t], device=device, dtype=torch.long,
-    )
-    tok_tensor = torch.tensor(
-        [tokens[t] for t in valid_t], device=device, dtype=torch.long,
-    )
-    scaled = logits_gpu[pos_tensor].float() / float(T_PROTO)
-    probs = scaled.softmax(dim=-1)
-    chosen = probs.gather(1, tok_tensor.unsqueeze(1)).squeeze(1)
-    amax_probs, amax_ids = probs.max(dim=-1)
-    return chosen.tolist(), amax_probs.tolist(), amax_ids.tolist()
+    vocab_size = max(1, int(logits_gpu.shape[-1]))
+    chunk_rows = max(1, _GPU_VOCAB_FLOAT_WORKSPACE_BYTES // (vocab_size * 4))
+    chosen_values: list[float] = []
+    argmax_prob_values: list[float] = []
+    argmax_id_values: list[int] = []
+    for start in range(0, len(valid_t), chunk_rows):
+        chunk_t = valid_t[start:start + chunk_rows]
+        pos_tensor = torch.tensor(
+            [t - 1 for t in chunk_t], device=device, dtype=torch.long,
+        )
+        tok_tensor = torch.tensor(
+            [tokens[t] for t in chunk_t], device=device, dtype=torch.long,
+        )
+        scaled = logits_gpu.index_select(0, pos_tensor).float() / float(T_PROTO)
+        probs = scaled.softmax(dim=-1)
+        chosen = probs.gather(1, tok_tensor.unsqueeze(1)).squeeze(1)
+        amax_probs, amax_ids = probs.max(dim=-1)
+        chosen_values.extend(chosen.tolist())
+        argmax_prob_values.extend(amax_probs.tolist())
+        argmax_id_values.extend(amax_ids.tolist())
+    return chosen_values, argmax_prob_values, argmax_id_values
 
 
 def _gpu_seed_consistency(
@@ -875,6 +883,7 @@ def _gpu_seed_consistency_diagnostics(
     u_values: list[float],
     *,
     position_offsets: list[int] | None = None,
+    logit_positions: list[int] | None = None,
 ):
     from reliquary.constants import (
         FORCED_SEED_CDF_BOUNDARY_EPSILON,
@@ -887,7 +896,7 @@ def _gpu_seed_consistency_diagnostics(
     )
 
     return seed_consistency_diagnostics(
-        logits_slice.float(),
+        logits_slice,
         list(token_ids),
         list(u_values),
         t=T_PROTO,
@@ -896,6 +905,7 @@ def _gpu_seed_consistency_diagnostics(
         stochastic_threshold=FORCED_SEED_STOCHASTIC_MAXPROB,
         boundary_epsilon=FORCED_SEED_CDF_BOUNDARY_EPSILON,
         position_offsets=position_offsets,
+        logit_positions=logit_positions,
     )
 
 

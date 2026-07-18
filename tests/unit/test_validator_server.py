@@ -1033,6 +1033,7 @@ def test_health_exposes_each_environment_window_independently():
         "difficulty_auction_enabled": False,
         "difficulty_auction_proof_wall_elapsed_seconds": 0.0,
         "difficulty_auction_proof_wall_exhausted": False,
+        "forensic_proof_errors_by_type": {},
         "post_trigger_proof_admission_count": 0,
         "expensive_proof_failures_by_hotkey": {},
         "expensive_proof_failures_by_operator": {},

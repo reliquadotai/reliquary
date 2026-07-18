@@ -450,7 +450,7 @@ def test_forensic_sample_watches_non_winners_keyed_on_seal_randomness():
     """With post-deadline drand entropy set, FORENSIC_SAMPLE_PER_WINDOW non-winners
     are proven for telemetry, selected by hashing seal_randomness (which did not
     exist at submission time, so a miner cannot grind its root to dodge it)."""
-    from reliquary.constants import FORENSIC_SAMPLE_PER_WINDOW, M_ROLLOUTS
+    from reliquary.constants import FORENSIC_SAMPLE_PER_WINDOW
     from tests.unit.test_grpo_window_batcher import (
         _always_true_grail, _make_batcher, _request,
     )
@@ -472,6 +472,40 @@ def test_forensic_sample_watches_non_winners_keyed_on_seal_randomness():
     # Different post-deadline entropy → different watched set (unpredictable).
     other = {r.hotkey for r in _make("beacon-round-999").forensic_sample}
     assert watched != other
+
+
+def test_forensic_sample_failure_cannot_abort_sealing():
+    """Observational proofs fail open after ranked winners are established."""
+    from reliquary.constants import B_BATCH, FORENSIC_SAMPLE_PER_WINDOW
+    from tests.unit.test_grpo_window_batcher import (
+        _always_true_grail, _make_batcher, _request,
+    )
+
+    b = _make_batcher(verify_commitment_proofs_fn=_always_true_grail)
+    b.seal_randomness = "beacon-round-failure"
+    for i in range(B_BATCH + FORENSIC_SAMPLE_PER_WINDOW + 4):
+        b.accept_submission(_request(prompt_idx=i, hotkey=f"m{i}"))
+
+    original_verify = b._verify_expensive
+    calls = 0
+
+    def _fail_after_ranked_winners(pending):
+        nonlocal calls
+        calls += 1
+        if calls > B_BATCH:
+            raise RuntimeError("synthetic forensic failure")
+        return original_verify(pending)
+
+    b._verify_expensive = _fail_after_ranked_winners
+    batch, _ = b.seal_batch()
+
+    assert len(batch) == B_BATCH
+    assert len(b.valid_submissions()) == B_BATCH
+    assert len(b.forensic_sample) == FORENSIC_SAMPLE_PER_WINDOW
+    assert all(result.passed is None for result in b.forensic_sample)
+    assert b.forensic_proof_errors_by_type == {
+        "RuntimeError": FORENSIC_SAMPLE_PER_WINDOW,
+    }
 
 
 def test_score_ranks_only_inside_the_calibrated_sigma_band():
