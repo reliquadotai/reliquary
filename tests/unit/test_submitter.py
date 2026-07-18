@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import httpx
 import pytest
@@ -12,7 +11,6 @@ import pytest
 from reliquary.constants import VALIDATOR_HTTP_PORT
 from reliquary.miner.submitter import (
     NoValidatorFoundError,
-    SubmissionError,
     discover_validator_url,
     get_runtime_contract_v1,
     get_window_state_v2,
@@ -199,6 +197,81 @@ async def test_submit_batch_v2_retries_one_idempotent_precommit_then_reveals(
     assert len(calls[2][1]["rollouts"]) == 8
     assert calls[2][2]["X-Reliquary-Precommit"] == "receipt-1"
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_submit_batch_v2_refreshes_stale_precommit_after_backoff(
+    monkeypatch,
+):
+    import reliquary.miner.submitter as submitter
+
+    events = []
+    rounds = iter((100, 101))
+
+    def _drand_round():
+        value = next(rounds)
+        events.append(("finalize", value))
+        return value
+
+    async def _sleep(delay):
+        events.append(("sleep", delay))
+
+    async def _post(self, url, content=None, headers=None, timeout=None):
+        body = json.loads(content)
+        if url.endswith("/submit/precommit"):
+            events.append(("precommit", body["drand_round"]))
+            if body["drand_round"] == 100:
+                return httpx.Response(
+                    200,
+                    json={
+                        "accepted": False,
+                        "reason": RejectReason.STALE_ROUND.value,
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "accepted": True,
+                    "reason": RejectReason.ACCEPTED.value,
+                    "receipt_id": "receipt-fresh",
+                    "upload_deadline_ts": 123.0,
+                },
+            )
+        events.append(("reveal", body["drand_round"]))
+        assert headers["X-Reliquary-Precommit"] == "receipt-fresh"
+        return httpx.Response(
+            200,
+            json={
+                "accepted": True,
+                "reason": RejectReason.SUBMITTED.value,
+            },
+        )
+
+    monkeypatch.setattr(submitter, "_RETRY_DELAYS", (1.0, 2.0))
+    monkeypatch.setattr(submitter.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(submitter, "sign_envelope", lambda **kwargs: b"envelope")
+    monkeypatch.setattr(submitter, "sign_precommit", lambda **kwargs: b"precommit")
+    monkeypatch.setattr(httpx.AsyncClient, "post", _post)
+
+    async with httpx.AsyncClient() as client:
+        response = await submit_batch_v2(
+            "http://fake",
+            _v2_request(),
+            client=client,
+            wallet=object(),
+            randomness="ab" * 32,
+            drand_round_fn=_drand_round,
+        )
+
+    assert response.accepted is True
+    assert events == [
+        ("finalize", 100),
+        ("precommit", 100),
+        ("sleep", 1.0),
+        ("finalize", 101),
+        ("precommit", 101),
+        ("reveal", 101),
+    ]
 
 
 @pytest.mark.asyncio

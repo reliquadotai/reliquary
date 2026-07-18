@@ -363,8 +363,8 @@ async def submit_batch_v2(
                         precommit_verdict.reason is RejectReason.STALE_ROUND
                         and attempt < len(_RETRY_DELAYS)
                     ):
-                        payload, precommit = _finalize_attempt(attempt + 1)
                         await asyncio.sleep(delay)
+                        payload, precommit = _finalize_attempt(attempt + 1)
                         continue
                     return BatchSubmissionResponse(
                         accepted=False,
