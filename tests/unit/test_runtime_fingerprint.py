@@ -2,6 +2,7 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+from reliquary.miner.engine import _initial_runtime_bound_nonce
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     RolloutSubmission,
@@ -62,6 +63,19 @@ def test_runtime_profile_must_be_bound_to_signed_nonce():
     request = _request(runtime, nonce)
     assert request.runtime_fingerprint == runtime
     assert len(nonce) <= 128
+
+
+def test_miner_builds_schema_valid_nonce_before_attempt_signing():
+    runtime = _runtime()
+
+    first = _initial_runtime_bound_nonce(runtime)
+    second = _initial_runtime_bound_nonce(runtime)
+
+    assert first != second
+    assert first.endswith(f".{runtime.profile_hash}")
+    assert len(first) <= 128
+    assert _request(runtime, first).runtime_fingerprint == runtime
+    assert _initial_runtime_bound_nonce(None) == ""
 
 
 def test_validator_exposes_runtime_contract_outside_legacy_state():

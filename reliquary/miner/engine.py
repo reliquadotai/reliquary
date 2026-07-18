@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from typing import TYPE_CHECKING
 
@@ -20,20 +21,31 @@ from reliquary.constants import (
     MAX_NEW_TOKENS_PROTOCOL_CAP,
     M_ROLLOUTS,
     PROMPT_RANGE_SIZE,
-    UPLOAD_BUFFER,
-    WINDOW_LENGTH,
 )
 from reliquary.shared.prompt_range import window_prompt_range
 from reliquary.infrastructure import chain
-from reliquary.protocol.submission import (
-    BatchSubmissionRequest,
-    RolloutSubmission,
-)
+from reliquary.protocol.submission import RolloutSubmission
 
 if TYPE_CHECKING:
     from reliquary.environment.base import Environment
 
 logger = logging.getLogger(__name__)
+
+
+def _initial_runtime_bound_nonce(runtime_fingerprint) -> str:
+    """Build a schema-valid placeholder before the submitter signs its attempt.
+
+    ``submit_batch_v2`` replaces this with a fresh signed nonce immediately
+    before each precommit. The request model still enforces the runtime binding
+    at construction time, so the in-memory placeholder must obey that contract.
+    """
+    if runtime_fingerprint is None:
+        return ""
+    from reliquary.shared.runtime_fingerprint import bind_runtime_profile_nonce
+
+    return bind_runtime_profile_nonce(
+        os.urandom(16).hex(), runtime_fingerprint.profile_hash,
+    )
 
 
 async def maybe_pull_checkpoint(
@@ -411,11 +423,9 @@ class MiningEngine:
         local_hash = ""
 
         async with httpx.AsyncClient(timeout=30) as client:
-            runtime_telemetry_enabled = False
             runtime_fingerprint = None
             try:
                 contract = await get_runtime_contract_v1(url, client=client)
-                runtime_telemetry_enabled = contract.telemetry_version >= 1
                 runtime_fingerprint = RuntimeFingerprint.model_validate(
                     collect_runtime_fingerprint(
                         generation_model=self.vllm_model,
@@ -432,7 +442,6 @@ class MiningEngine:
                 # Older validators may omit the capability or expose an older
                 # telemetry schema. Omitting the optional request field keeps
                 # mining wire-compatible in both cases.
-                runtime_telemetry_enabled = False
                 runtime_fingerprint = None
                 logger.info("validator runtime telemetry unavailable")
             while True:
@@ -524,6 +533,7 @@ class MiningEngine:
                     rollouts=rollout_submissions,
                     checkpoint_hash=local_hash,
                     runtime_fingerprint=_runtime_fingerprint,
+                    nonce=_initial_runtime_bound_nonce(_runtime_fingerprint),
                     # Rollouts are drawn from the forced-seed stream; advertise it.
                     protocol_version=FORCED_SEED_PROTOCOL_VERSION,
                 )
