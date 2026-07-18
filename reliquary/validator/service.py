@@ -1176,6 +1176,10 @@ class ValidationService:
             await asyncio.sleep(PROOF_ADMISSION_STALL_POLL_SECONDS)
 
         if timed_out:
+            for batcher in auction_batchers:
+                existing_reason = getattr(batcher, "force_seal_reason", None)
+                if not isinstance(existing_reason, str) or not existing_reason:
+                    batcher.force_seal_reason = "auction_queue_drain_timeout"
             logger.warning(
                 "Window %d auction queue drain reached %.1fs; froze pending "
                 "populations and dropped remaining queued submissions",
@@ -2374,6 +2378,10 @@ class ValidationService:
             "environment": env_names_list[0],   # legacy singular, kept for compat
             "environments": env_names_list,      # multi-env canonical field
             "force_seal_reason": getattr(first_batcher, "force_seal_reason", None),
+            "force_seal_reason_by_environment": {
+                env_name: getattr(env_batcher, "force_seal_reason", None)
+                for env_name, env_batcher in batcher_dict.items()
+            },
             "window_opened_wall_ts_by_environment": {
                 env_name: getattr(env_batcher, "window_opened_wall_ts", None)
                 for env_name, env_batcher in batcher_dict.items()

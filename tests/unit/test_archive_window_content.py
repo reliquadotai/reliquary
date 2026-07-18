@@ -101,6 +101,7 @@ async def test_archive_includes_prompt_and_rollout_content():
     batcher.window_opened_at = 100.0
     batcher.window_opened_wall_ts = 1_000.0
     batcher.difficulty_auction_enabled = True
+    batcher.force_seal_reason = "auction_queue_drain_timeout"
     batcher.rewarded_but_not_selected_by_hotkey = {"hk_runner": 1}
     batcher.logical_group_reservation_count = 9
     batcher.logical_group_duplicate_rejects = 4
@@ -217,6 +218,9 @@ async def test_archive_includes_prompt_and_rollout_content():
     assert archive["batch"][1]["response_time"] == pytest.approx(7.0)
     assert archive["batch"][1]["arrival_age_seconds"] == pytest.approx(6.5)
     assert archive["window_opened_wall_ts_by_environment"] == {"fake": 1_000.0}
+    assert archive["force_seal_reason_by_environment"] == {
+        "fake": "auction_queue_drain_timeout"
+    }
     assert entry0["payload_bytes"] == 450_000
     assert entry0["body_read_ms"] == pytest.approx(4100.0)
     assert entry0["upload_precommit_status"] == "valid"

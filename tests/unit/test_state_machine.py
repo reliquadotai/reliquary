@@ -317,6 +317,7 @@ async def test_auction_freeze_times_out_then_drops_pending_admission(monkeypatch
 
     assert timed_out is True
     batcher.begin_seal_snapshot.assert_called_once_with()
+    assert batcher.force_seal_reason == "auction_queue_drain_timeout"
 
 
 def test_proof_cap_breaker_uses_distinct_prompt_count():
