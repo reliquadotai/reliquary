@@ -1416,6 +1416,9 @@ class ValidatorServer:
             "difficulty_auction_proof_wall_exhausted": bool(
                 getattr(batcher, "proof_wall_exhausted", False)
             ),
+            "forensic_proof_errors_by_type": dict(
+                getattr(batcher, "forensic_proof_errors_by_type", {})
+            ),
             "post_trigger_proof_admission_count": _integer(
                 getattr(batcher, "post_trigger_proof_admission_count", None)
             ),

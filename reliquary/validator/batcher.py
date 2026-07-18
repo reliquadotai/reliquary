@@ -418,7 +418,8 @@ class ForensicSampleResult:
 
     hotkey: str
     prompt_idx: int
-    passed: bool
+    passed: bool | None
+    error_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -693,6 +694,7 @@ class GrpoWindowBatcher:
         self.proof_wall_elapsed_seconds = 0.0
         self.proof_wall_exhausted = False
         self.forensic_proof_attempts = 0
+        self.forensic_proof_errors_by_type: dict[str, int] = {}
         self.auction_operator_unmapped_skips = 0
         self.auction_operator_proof_debt_skips = 0
         self.auction_candidates: list[dict[str, Any]] = []
@@ -3127,6 +3129,7 @@ class GrpoWindowBatcher:
         sample = remainder[:FORENSIC_SAMPLE_PER_WINDOW]
         results: list[ForensicSampleResult] = []
         self.forensic_proof_attempts = 0
+        self.forensic_proof_errors_by_type = {}
         for p in sample:
             if self.proof_attempts >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW:
                 break
@@ -3136,7 +3139,38 @@ class GrpoWindowBatcher:
             if elapsed >= MAX_PROOF_WALL_SECONDS:
                 self.proof_wall_exhausted = True
                 break
-            passed = self._verify_expensive(p) is not None
+            error_type: str | None = None
+            try:
+                passed: bool | None = self._verify_expensive(p) is not None
+            except Exception as exc:
+                # The sample is observational only. A malformed outlier or
+                # exhausted GPU must not discard already-proven winners or
+                # prevent the window from reaching training.
+                passed = None
+                error_type = type(exc).__name__
+                self.forensic_proof_errors_by_type[error_type] = (
+                    self.forensic_proof_errors_by_type.get(error_type, 0) + 1
+                )
+                logger.exception(
+                    "forensic proof failed open window=%s prompt=%s "
+                    "hotkey=%s error=%s",
+                    self.window_start,
+                    p.prompt_idx,
+                    p.hotkey[:12],
+                    error_type,
+                )
+            if error_type in {"OutOfMemoryError", "CUDAOutOfMemoryError"}:
+                # The exception scope has ended, so traceback-held tensors can
+                # be collected before returning allocator cache to CUDA.
+                try:
+                    import gc
+                    import torch
+
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    logger.debug("CUDA OOM cleanup failed", exc_info=True)
             self.proof_attempts += 1
             self.forensic_proof_attempts += 1
             self._attempted_pending_ids.add(id(p))
@@ -3144,11 +3178,13 @@ class GrpoWindowBatcher:
             if row is not None:
                 row["forensic_sampled"] = True
                 row["forensic_passed"] = passed
+                row["forensic_error_type"] = error_type
             results.append(
                 ForensicSampleResult(
                     hotkey=p.hotkey,
                     prompt_idx=p.prompt_idx,
                     passed=passed,
+                    error_type=error_type,
                 )
             )
         self.proof_wall_elapsed_seconds = max(
@@ -3385,6 +3421,9 @@ class GrpoWindowBatcher:
                     "pending_candidates": len(self._pending),
                     "proof_attempts": self.proof_attempts,
                     "forensic_proof_attempts": self.forensic_proof_attempts,
+                    "forensic_proof_errors_by_type": dict(
+                        self.forensic_proof_errors_by_type
+                    ),
                     "proof_attempt_limit": (
                         MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
                     ),
