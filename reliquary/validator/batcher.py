@@ -434,6 +434,15 @@ class RewardComputation:
     elapsed_ms: float
 
 
+@dataclass
+class _UploadPrecommitReservation:
+    hotkey: str
+    deadline: float
+    payload_bytes: int
+    revealed: bool = False
+    payload_transferred: bool = False
+
+
 class GrpoWindowBatcher:
     """Accepts v2 submissions, runs the full verification pipeline, and
     exposes ``valid_submissions()`` + ``select_batch()`` at window close.
@@ -708,7 +717,14 @@ class GrpoWindowBatcher:
         self._seal_snapshot_started = False
         self._seal_completed = False
         self._upload_precommit_lock = threading.Lock()
-        self._upload_precommits: dict[str, tuple[str, float]] = {}
+        self._upload_precommits: dict[
+            str, _UploadPrecommitReservation
+        ] = {}
+        self._upload_precommit_payload_bytes = 0
+        self._upload_precommit_accepted = 0
+        self._upload_precommit_revealed = 0
+        self._upload_precommit_terminal = 0
+        self._upload_precommit_expired = 0
         # v2.1: checkpoint hash miners must match. Empty string disables
         # the gate (test convenience / pre-first-publish).
         self.current_checkpoint_hash: str = ""
@@ -794,11 +810,36 @@ class GrpoWindowBatcher:
     def _prune_upload_precommits_locked(self, now: float) -> None:
         expired = [
             receipt_id
-            for receipt_id, (_hotkey, deadline) in self._upload_precommits.items()
-            if deadline <= now
+            for receipt_id, reservation in self._upload_precommits.items()
+            if reservation.deadline <= now and not reservation.revealed
         ]
         for receipt_id in expired:
-            self._upload_precommits.pop(receipt_id, None)
+            reservation = self._upload_precommits.pop(receipt_id, None)
+            if reservation is not None:
+                self._finish_upload_precommit_locked(
+                    reservation, expired=True
+                )
+
+    def _finish_upload_precommit_locked(
+        self,
+        reservation: _UploadPrecommitReservation,
+        *,
+        expired: bool,
+    ) -> None:
+        if not reservation.payload_transferred:
+            with self._proof_admission_lock:
+                self._upload_precommit_payload_bytes = max(
+                    0,
+                    self._upload_precommit_payload_bytes
+                    - reservation.payload_bytes,
+                )
+                self._release_hotkey_payload_locked(
+                    reservation.hotkey, reservation.payload_bytes
+                )
+        if expired:
+            self._upload_precommit_expired += 1
+        else:
+            self._upload_precommit_terminal += 1
 
     def try_register_upload_precommit(
         self,
@@ -806,6 +847,7 @@ class GrpoWindowBatcher:
         hotkey: str,
         *,
         t_arrival_wall: float,
+        payload_bytes: int,
     ) -> tuple[bool, str | None, float | None]:
         """Reserve one bounded reveal received before collection closes.
 
@@ -825,27 +867,135 @@ class GrpoWindowBatcher:
             self._prune_upload_precommits_locked(now)
             if self._seal_flag.is_set() or self._seal_snapshot_started:
                 return False, "collection_sealed", None
+            if (
+                self._upload_precommit_accepted
+                >= MAX_PENDING_UPLOAD_PRECOMMITS_PER_ENV
+            ):
+                return False, "precommit_capacity_full", None
             if len(self._upload_precommits) >= MAX_PENDING_UPLOAD_PRECOMMITS_PER_ENV:
                 return False, "precommit_capacity_full", None
             hotkey_count = sum(
-                1 for existing_hotkey, _deadline in self._upload_precommits.values()
-                if existing_hotkey == hotkey
+                1
+                for reservation in self._upload_precommits.values()
+                if reservation.hotkey == hotkey
             )
             if hotkey_count >= MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW:
                 return False, "precommit_hotkey_full", None
+            with self._proof_admission_lock:
+                payload_reason = self._payload_capacity_reason_locked(
+                    hotkey, payload_bytes
+                )
+                if payload_reason is not None:
+                    return False, payload_reason, None
+                self._upload_precommit_payload_bytes += payload_bytes
+                self._payload_bytes_by_hotkey[hotkey] = (
+                    self._payload_bytes_by_hotkey.get(hotkey, 0)
+                    + payload_bytes
+                )
             deadline = min(
                 now + SUBMISSION_UPLOAD_GRACE_SECONDS,
                 self.window_opened_at
                 + WINDOW_COLLECTION_SECONDS
                 + SUBMISSION_UPLOAD_GRACE_SECONDS,
             )
-            self._upload_precommits[receipt_id] = (hotkey, deadline)
+            self._upload_precommits[receipt_id] = (
+                _UploadPrecommitReservation(
+                    hotkey=hotkey,
+                    deadline=deadline,
+                    payload_bytes=payload_bytes,
+                )
+            )
+            self._upload_precommit_accepted += 1
             return True, None, deadline
 
-    def resolve_upload_precommit(self, receipt_id: str) -> bool:
-        """Release a receipt once its matching body has completed admission."""
+    def mark_upload_precommit_revealed(self, receipt_id: str) -> bool:
+        """Record one exact body reveal without ending its reservation."""
         with self._upload_precommit_lock:
-            return self._upload_precommits.pop(receipt_id, None) is not None
+            reservation = self._upload_precommits.get(receipt_id)
+            if reservation is None:
+                return False
+            if not reservation.revealed:
+                reservation.revealed = True
+                self._upload_precommit_revealed += 1
+            return True
+
+    def resolve_upload_precommit(
+        self,
+        receipt_id: str,
+        *,
+        expired: bool = False,
+    ) -> bool:
+        """End a receipt as a terminal decision or explicit expiry."""
+        with self._upload_precommit_lock:
+            reservation = self._upload_precommits.pop(receipt_id, None)
+            if reservation is None:
+                return False
+            self._finish_upload_precommit_locked(
+                reservation, expired=expired
+            )
+            return True
+
+    def start_revealed_admission(
+        self,
+        receipt_id: str,
+        request: BatchSubmissionRequest,
+    ) -> tuple[bool, str | None]:
+        """Atomically transfer precommit bytes into one started worker job."""
+        with self._upload_precommit_lock:
+            reservation = self._upload_precommits.get(receipt_id)
+            if reservation is None:
+                return False, "upload_precommit_missing"
+            if reservation.payload_transferred:
+                return False, "proof_reservation_duplicate"
+            if reservation.hotkey != request.miner_hotkey:
+                return False, "upload_precommit_hotkey_mismatch"
+            with self._proof_admission_lock:
+                if self._seal_snapshot_started:
+                    return False, "auction_seal_snapshot_started"
+                if (
+                    self._expensive_proof_failures_by_hotkey.get(
+                        request.miner_hotkey, 0
+                    )
+                    >= MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
+                ):
+                    return False, "proof_failure_debt_hotkey"
+                if (
+                    self._operator_proof_failure_debt_for_hotkey(
+                        request.miner_hotkey
+                    )
+                    >= MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW
+                ):
+                    return False, "proof_failure_debt_operator"
+                if (
+                    self._proof_grading_attempts
+                    >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+                ):
+                    return False, "proof_grading_attempts_full"
+                reservation_id = id(request)
+                if (
+                    reservation_id in self._pending_proof_reservations
+                    or reservation_id in self._inflight_proof_reservations
+                    or reservation_id in self._retained_payload_reservations
+                ):
+                    return False, "proof_reservation_duplicate"
+
+                request._payload_bytes = reservation.payload_bytes
+                request._retain_payload = False
+                reservation.payload_transferred = True
+                self._upload_precommit_payload_bytes = max(
+                    0,
+                    self._upload_precommit_payload_bytes
+                    - reservation.payload_bytes,
+                )
+                self._proof_grading_attempts += 1
+                self._inflight_proof_reservations[reservation_id] = (
+                    request,
+                    request.miner_hotkey,
+                    False,
+                    reservation.payload_bytes,
+                )
+                self._inflight_payload_bytes += reservation.payload_bytes
+                return True, None
 
     @property
     def pending_upload_precommits(self) -> int:
@@ -853,6 +1003,29 @@ class GrpoWindowBatcher:
         with self._upload_precommit_lock:
             self._prune_upload_precommits_locked(now)
             return len(self._upload_precommits)
+
+    @property
+    def upload_precommit_payload_bytes(self) -> int:
+        with self._proof_admission_lock:
+            return self._upload_precommit_payload_bytes
+
+    def upload_precommit_conservation(self) -> dict[str, Any]:
+        now = self._time_fn()
+        with self._upload_precommit_lock:
+            self._prune_upload_precommits_locked(now)
+            pending = len(self._upload_precommits)
+            accepted = self._upload_precommit_accepted
+            terminal = self._upload_precommit_terminal
+            expired = self._upload_precommit_expired
+            return {
+                "accepted_receipts": accepted,
+                "revealed": self._upload_precommit_revealed,
+                "revealed_terminal": terminal,
+                "expired": expired,
+                "terminal_decisions": terminal,
+                "pending": pending,
+                "conserved": accepted == terminal + expired + pending,
+            }
 
     def poll_deadline(self) -> bool:
         """Seal an auction environment at its fixed collection deadline.
@@ -974,11 +1147,7 @@ class GrpoWindowBatcher:
     @property
     def reserved_payload_bytes(self) -> int:
         with self._proof_admission_lock:
-            return (
-                self._pending_payload_bytes
-                + self._inflight_payload_bytes
-                + self._retained_payload_bytes
-            )
+            return self._reserved_payload_bytes_locked()
 
     @property
     def payload_bytes_by_hotkey(self) -> dict[str, int]:
@@ -1136,7 +1305,8 @@ class GrpoWindowBatcher:
 
     def _reserved_payload_bytes_locked(self) -> int:
         return (
-            self._pending_payload_bytes
+            self._upload_precommit_payload_bytes
+            + self._pending_payload_bytes
             + self._inflight_payload_bytes
             + self._retained_payload_bytes
         )
@@ -1502,6 +1672,219 @@ class GrpoWindowBatcher:
             rewards=computed_rewards,
             error=error,
             elapsed_ms=(time.perf_counter() - started) * 1000.0,
+        )
+
+    def materialize_admission_problem(
+        self,
+        prompt_idx: int,
+    ):
+        """Fetch trusted problem data without parsing or decoding miner input."""
+        from reliquary.validator.admission import AdmissionProblemMaterials
+
+        problem = self.env.get_problem(prompt_idx)
+        rendered_prompt = str(problem["prompt"])
+        chat_template = getattr(self.tokenizer, "chat_template", None)
+        if (
+            isinstance(chat_template, str)
+            and chat_template
+            and hasattr(self.tokenizer, "apply_chat_template")
+        ):
+            kwargs: dict[str, Any] = {
+                "add_generation_prompt": True,
+                "tokenize": False,
+            }
+            if "enable_thinking" in chat_template:
+                kwargs["enable_thinking"] = True
+            rendered_prompt = self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": problem["prompt"]}],
+                **kwargs,
+            )
+        code_cases = None
+        cases_loader = getattr(self.env, "admission_reward_cases", None)
+        if callable(cases_loader):
+            code_cases = list(cases_loader(problem))
+        return AdmissionProblemMaterials(
+            problem=dict(problem),
+            rendered_prompt=rendered_prompt,
+            code_cases=code_cases,
+        )
+
+    def reserve_prepared_identity(
+        self,
+        request: BatchSubmissionRequest,
+        rollout_hashes: list[bytes],
+    ) -> tuple[bool, RejectReason | None, str | None]:
+        """Apply mutable identity, hash and prompt gates before final commit."""
+        if request.window_start != self.window_start:
+            return False, RejectReason.WINDOW_MISMATCH, "window"
+        if (
+            self.current_checkpoint_hash
+            and request.checkpoint_hash != self.current_checkpoint_hash
+        ):
+            return False, RejectReason.WRONG_CHECKPOINT, "checkpoint"
+        if (
+            FORCED_SEED_ENFORCE
+            and self.current_checkpoint_hash
+            and request.protocol_version != FORCED_SEED_PROTOCOL_VERSION
+        ):
+            return False, RejectReason.SEED_MISMATCH, "forced_seed_protocol"
+        if request.prompt_idx >= len(self.env):
+            return False, RejectReason.BAD_PROMPT_IDX, "prompt"
+        if self.prompt_range is not None:
+            lo, hi = self.prompt_range
+            if not (lo <= request.prompt_idx < hi):
+                return False, RejectReason.PROMPT_OUT_OF_RANGE, "prompt_range"
+        if self._cooldown.is_in_cooldown(
+            request.prompt_idx, self.window_start
+        ):
+            return False, RejectReason.PROMPT_IN_COOLDOWN, "cooldown"
+        if (
+            self.prompt_submission_count(request.prompt_idx)
+            >= MAX_SUBMISSIONS_PER_PROMPT
+        ):
+            return False, RejectReason.PROMPT_FULL, "prompt_capacity"
+        if self._hash_set is not None:
+            if any(rollout_hash in self._hash_set for rollout_hash in rollout_hashes):
+                return False, RejectReason.HASH_DUPLICATE, "dedup"
+        try:
+            reserved, logical_reason = self.try_reserve_logical_group(request)
+        except (TypeError, ValueError, OverflowError):
+            return False, RejectReason.BAD_TOKENS, "logical_dedup"
+        if not reserved:
+            if logical_reason == "operator_unmapped":
+                return (
+                    False,
+                    RejectReason.REGISTRATION_UNAVAILABLE,
+                    "operator_mapping",
+                )
+            return False, RejectReason.HASH_DUPLICATE, "logical_dedup"
+        return True, None, None
+
+    def reject_prepared_submission(
+        self,
+        request: BatchSubmissionRequest,
+        reason: RejectReason,
+        stage: str,
+        *,
+        telemetry: SubmitTelemetry | None = None,
+        grader_failure_reason: str | None = None,
+    ) -> BatchSubmissionResponse:
+        """Record a process-worker rejection with legacy reservation semantics."""
+        if grader_failure_reason is not None:
+            with self._reject_lock:
+                self.grader_failures[grader_failure_reason] = (
+                    self.grader_failures.get(grader_failure_reason, 0) + 1
+                )
+            if grader_failure_reason == "crash":
+                self.confirm_logical_group_reservation(request)
+                request._grader_worker_crashed = True
+                stage = "code_grader_crash"
+            else:
+                self.cancel_logical_group_reservation(request)
+                stage = "code_grader"
+        return self._reject(
+            reason,
+            hotkey=request.miner_hotkey,
+            prompt_idx=request.prompt_idx,
+            telemetry=telemetry,
+            reject_stage=stage,
+        )
+
+    def accept_prepared_submission(
+        self,
+        prepared,
+        *,
+        telemetry: SubmitTelemetry | None = None,
+    ) -> BatchSubmissionResponse:
+        """Commit an already parsed and graded auction candidate."""
+        request = prepared.request
+        if request is None:
+            raise ValueError("prepared submission has no request")
+        if prepared.reject_reason is not None:
+            return self.reject_prepared_submission(
+                request,
+                prepared.reject_reason,
+                prepared.reject_stage or "admission_worker",
+                telemetry=telemetry,
+                grader_failure_reason=prepared.grader_failure_reason,
+            )
+
+        self._note_grail_candidate()
+        pending = PendingSubmission(
+            hotkey=request.miner_hotkey,
+            prompt_idx=request.prompt_idx,
+            request=request,
+            rewards=list(prepared.rewards),
+            drand_round=request.drand_round,
+            merkle_root=bytes.fromhex(request.merkle_root),
+            selection_digest=prepared.selection_digest
+            or compute_rollouts_selection_digest(request.rollouts),
+            arrived_at=self._time_fn(),
+            decision_ts=self._wall_clock(),
+            telemetry=telemetry,
+        )
+
+        lock_wait_started = time.perf_counter()
+        if telemetry is not None:
+            telemetry.admission_prepare_ms = prepared.preparation_ms
+        self._lock.acquire()
+        commit_started = time.perf_counter()
+        if telemetry is not None:
+            telemetry.commit_lock_wait_ms = max(
+                0.0, (commit_started - lock_wait_started) * 1000.0
+            )
+        try:
+            if self.seal_snapshot_started:
+                self.cancel_logical_group_reservation(request)
+                return self._reject(
+                    RejectReason.BATCH_FILLED,
+                    hotkey=request.miner_hotkey,
+                    prompt_idx=request.prompt_idx,
+                    telemetry=telemetry,
+                    reject_stage="seal_snapshot",
+                )
+            existing = self._submissions_per_prompt.get(
+                request.prompt_idx, []
+            )
+            if len(existing) >= MAX_SUBMISSIONS_PER_PROMPT:
+                self.cancel_logical_group_reservation(request)
+                return self._reject(
+                    RejectReason.PROMPT_FULL,
+                    hotkey=request.miner_hotkey,
+                    prompt_idx=request.prompt_idx,
+                    telemetry=telemetry,
+                    reject_stage="prompt_capacity",
+                )
+            if self._hash_set is not None and any(
+                rollout_hash in self._hash_set
+                for rollout_hash in prepared.rollout_hashes
+            ):
+                self.cancel_logical_group_reservation(request)
+                return self._reject(
+                    RejectReason.HASH_DUPLICATE,
+                    hotkey=request.miner_hotkey,
+                    prompt_idx=request.prompt_idx,
+                    telemetry=telemetry,
+                    reject_stage="dedup",
+                )
+
+            self.confirm_logical_group_reservation(request)
+            request._retain_payload = True
+            self._pending.append(pending)
+            self._submissions_per_prompt.setdefault(
+                request.prompt_idx, []
+            ).append(pending)
+            self.last_valid_submission_at = self._time_fn()
+            self.last_valid_submission_wall_ts = self._wall_clock()
+            self.pending_count = len(self._pending)
+        finally:
+            if telemetry is not None:
+                telemetry.commit_ms = max(
+                    0.0, (time.perf_counter() - commit_started) * 1000.0
+                )
+            self._lock.release()
+        return BatchSubmissionResponse(
+            accepted=True, reason=RejectReason.ACCEPTED
         )
 
     def observe_drand_round(

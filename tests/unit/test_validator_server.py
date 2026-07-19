@@ -1,9 +1,12 @@
 """Validator HTTP server — v2 GRPO market endpoints."""
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import os
 import time
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 import bittensor as bt
 import pytest
 from fastapi.testclient import TestClient
@@ -22,14 +25,22 @@ from reliquary.protocol.legacy_merkle import (
 from reliquary.protocol.signatures import sign_envelope, sign_precommit
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
+    BatchSubmissionResponse,
     GrpoBatchState,
     RolloutSubmission,
     RejectReason,
     SubmissionPrecommitRequest,
 )
+from reliquary.validator.admission import PreparedSubmission
 from reliquary.validator.batcher import GrpoWindowBatcher
 from reliquary.validator.cooldown import CooldownMap
-from reliquary.validator.server import ValidatorServer
+from reliquary.validator.observability import DrandRoundObservation, SubmitTelemetry
+from reliquary.validator.selection_digest import compute_rollouts_selection_digest
+from reliquary.validator.server import (
+    ValidatorServer,
+    _QueuedAuctionSubmission,
+    _UploadPrecommitReceipt,
+)
 
 
 # Persistent test keypair so every ``_request()`` carries a verifiable
@@ -264,6 +275,133 @@ def test_submit_openapi_keeps_batch_submission_request_contract():
     assert submission_schema["title"] == "BatchSubmissionRequest"
     assert "miner_hotkey" in submission_schema["properties"]
     assert "rollouts" in submission_schema["properties"]
+
+
+def test_auction_submit_requires_precommit_before_body_parse(monkeypatch):
+    from reliquary.protocol.submission import WindowState
+
+    batcher = _batcher(window_start=500)
+    batcher.difficulty_auction_enabled = True
+    server = ValidatorServer()
+    server.set_active_batchers({"openmathinstruct": batcher})
+    server.set_current_state(WindowState.OPEN)
+    server._auction_admission_enabled = True
+
+    def _unexpected_parse(*_args, **_kwargs):
+        raise AssertionError("large body parser must not run without receipt")
+
+    monkeypatch.setattr(
+        BatchSubmissionRequest,
+        "model_validate_json",
+        _unexpected_parse,
+    )
+    response = TestClient(server.app).post(
+        "/submit",
+        content=b'{"untrusted":"large body"}',
+        headers={"content-type": "application/json"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "accepted": False,
+        "reason": RejectReason.PRECOMMIT_REQUIRED.value,
+    }
+    assert response.headers["connection"] == "close"
+
+
+@pytest.mark.asyncio
+async def test_grader_crash_prepared_result_retains_operator_prompt_claim():
+    batcher = _batcher(window_start=500)
+    batcher.difficulty_auction_enabled = True
+    server = ValidatorServer()
+    server.set_active_batchers({FakeEnv.name: batcher})
+    request = _request(valid_merkle=True)
+    raw_body = request.model_dump_json().encode()
+    receipt_id = "crash-receipt"
+    accepted, reason, _deadline = batcher.try_register_upload_precommit(
+        receipt_id,
+        request.miner_hotkey,
+        t_arrival_wall=batcher.window_opened_wall_ts,
+        payload_bytes=len(raw_body),
+    )
+    assert accepted is True
+    assert reason is None
+    assert batcher.mark_upload_precommit_revealed(receipt_id) is True
+
+    receipt = _UploadPrecommitReceipt(
+        receipt_id=receipt_id,
+        precommit_signature="signed",
+        miner_hotkey=request.miner_hotkey,
+        prompt_idx=request.prompt_idx,
+        window_start=request.window_start,
+        merkle_root=request.merkle_root,
+        checkpoint_hash=request.checkpoint_hash,
+        environment=FakeEnv.name,
+        payload_bytes=len(raw_body),
+        payload_sha256=hashlib.sha256(raw_body).hexdigest(),
+        drand_round=request.drand_round,
+        protocol_version=request.protocol_version,
+        nonce=request.nonce,
+        expires_at_wall=time.time() + 30.0,
+        precommit_arrival_ts=time.time(),
+        drand_observation=DrandRoundObservation(
+            submitted_drand_round=request.drand_round,
+            arrival_drand_round=request.drand_round,
+            drand_delta=0,
+            drand_tolerance=0,
+            drand_status="current",
+            reject_reason=None,
+        ),
+        batcher=batcher,
+        consumed=True,
+    )
+    telemetry = SubmitTelemetry.from_request(
+        request,
+        t_arrival=time.time(),
+        payload_bytes=len(raw_body),
+        payload_sha256=receipt.payload_sha256,
+    )
+    rollout_hashes = [bytes([index]) * 32 for index in range(M_ROLLOUTS)]
+    prepared = PreparedSubmission(
+        request=request,
+        completion_texts=[],
+        rewards=[],
+        rollout_hashes=rollout_hashes,
+        selection_digest=compute_rollouts_selection_digest(request.rollouts),
+        reject_reason=RejectReason.WORKER_DROPPED,
+        reject_stage="code_grader",
+        grader_failure_reason="crash",
+    )
+    server._admission_materialization_pool = ThreadPoolExecutor(max_workers=1)
+    server._run_admission_process = AsyncMock(return_value=prepared)
+    item = _QueuedAuctionSubmission(
+        raw_body=raw_body,
+        receipt=receipt,
+        batcher=batcher,
+        telemetry=telemetry,
+        enqueued_monotonic=time.monotonic(),
+    )
+
+    try:
+        await server._process_auction_submission(item, asyncio.Queue())
+    finally:
+        server._admission_materialization_pool.shutdown(wait=True)
+
+    assert receipt.terminal is True
+    assert receipt.outcome == BatchSubmissionResponse(
+        accepted=False, reason=RejectReason.WORKER_DROPPED
+    )
+    assert batcher.logical_group_reservation_count == 1
+    assert batcher.grader_failures == {"crash": 1}
+    duplicate = batcher.reserve_prepared_identity(request, rollout_hashes)
+    assert duplicate == (
+        False,
+        RejectReason.HASH_DUPLICATE,
+        "logical_dedup",
+    )
+    conservation = batcher.upload_precommit_conservation()
+    assert conservation["terminal_decisions"] == 1
+    assert conservation["conserved"] is True
 
 
 def test_endpoint_latency_does_not_index_arbitrary_paths():
@@ -1055,6 +1193,16 @@ def test_health_exposes_each_environment_window_independently():
         "inflight_payload_bytes": 0,
         "retained_payload_bytes": 0,
         "pending_upload_precommits": 0,
+        "upload_precommit_payload_bytes": 0,
+        "upload_precommit_conservation": {
+            "accepted_receipts": 0,
+            "revealed": 0,
+            "revealed_terminal": 0,
+            "expired": 0,
+            "terminal_decisions": 0,
+            "pending": 0,
+            "conserved": True,
+        },
         "collection_closed": False,
         "difficulty_auction_enabled": False,
         "difficulty_auction_proof_wall_elapsed_seconds": 0.0,
@@ -1332,9 +1480,10 @@ async def test_worker_drops_late_items_for_stale_batcher():
 
     # Run the worker just long enough to drain both items.
     worker_task = asyncio.create_task(server._submit_worker())
-    # Yield until queue is empty.
+    # Queue emptiness only means the active item was dequeued. Wait until its
+    # mocked accept call completes before cancelling the worker task.
     for _ in range(50):
-        if server._submit_queue.empty():
+        if server._submit_queue.empty() and accept_calls:
             break
         await asyncio.sleep(0.01)
     worker_task.cancel()

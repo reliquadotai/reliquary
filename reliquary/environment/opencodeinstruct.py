@@ -170,6 +170,13 @@ class OpenCodeInstructEnvironment:
         code = _extract_python(completion or "")
         return self._grader.evaluate_cases(code, cases, timeout_s=GRADER_EVAL_TIMEOUT_SECONDS)
 
+    def admission_reward_cases(self, problem: dict) -> list[dict]:
+        """Return an isolated copy of the cases for a materialized problem."""
+        case_id = problem.get("ground_truth", "")
+        if not isinstance(case_id, str):
+            return []
+        return [dict(case) for case in self._cases_by_id.get(case_id, ())]
+
     @staticmethod
     def _row_cases(row) -> list[dict]:
         raw = row.get("structured_cases", [])

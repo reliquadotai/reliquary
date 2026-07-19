@@ -173,10 +173,10 @@ VALIDATOR_HTTP_PORT = 8888
 # grow the bounded submit queue or saturate the grader pool while discarded
 # queue items do not burn work that never ran.
 # There is no smaller per-window GRAIL candidate budget: auction environments
-# freeze at the 300-second deadline, then this ceiling and the seal-time wall
-# budget bound ranked proof work. The old 32-candidate cap starved honest late
-# arrivals when earlier candidates failed after reservation.
-MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW = 96
+# freeze only after collection and upload grace drain, then this ceiling and
+# the seal-time wall budget bound ranked proof work. The old 32-candidate cap
+# starved honest late arrivals when earlier candidates failed after reservation.
+MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW = 64
 
 # Seal-time GRAIL work is serial and an adversarial ranked prefix may fail one
 # candidate after another. The attempt ceiling bounds cardinality; this second
@@ -225,17 +225,17 @@ if (
 # Absolute server-side bound across active and draining environment queues.
 # Per-batcher reservation caps remain the primary bound; this is the final
 # backstop during a window swap or prolonged GPU stall.
-MAX_PENDING_PROOF_QUEUE_DEPTH = 256
+MAX_PENDING_PROOF_QUEUE_DEPTH = 64
 
-# Reward admission runs before deferred GRAIL proof.  Math grading benefits from
-# modest CPU parallelism; Code already fans each group over the sandbox pool, so
-# two group workers are enough to keep that pool fed without an unbounded thread
-# explosion.  These are validator-runtime capacities, not miner wire constants.
+# Reward admission runs before deferred GRAIL proof. Math grading benefits from
+# bounded CPU parallelism; four Code group workers each fan eight rollouts over
+# the 32-slot sandbox pool. These are validator-runtime capacities, not miner
+# wire constants.
 MATH_ADMISSION_WORKERS = int(
-    _os.environ.get("RELIQUARY_MATH_ADMISSION_WORKERS", "4")
+    _os.environ.get("RELIQUARY_MATH_ADMISSION_WORKERS", "8")
 )
 CODE_ADMISSION_WORKERS = int(
-    _os.environ.get("RELIQUARY_CODE_ADMISSION_WORKERS", "2")
+    _os.environ.get("RELIQUARY_CODE_ADMISSION_WORKERS", "4")
 )
 if not 1 <= MATH_ADMISSION_WORKERS <= 16:
     raise ValueError("RELIQUARY_MATH_ADMISSION_WORKERS must be within [1, 16]")
@@ -274,6 +274,12 @@ MAX_POST_TRIGGER_PROOF_CANDIDATES = 8
 # freeze the pending population. Legacy mode uses the same bound after its seal
 # trigger. A stuck queue cannot freeze checkpoints indefinitely.
 MAX_SEAL_QUEUE_DRAIN_SECONDS = 60.0
+
+# Auction reveals are already bounded by 64 receipts and 8/4 isolated workers.
+# After upload grace closes, wait for the complete accepted population. If this
+# emergency wall is ever reached, abort the whole window instead of training a
+# timing-dependent partial snapshot.
+AUCTION_ADMISSION_DRAIN_DEADLINE_SECONDS = 390.0
 
 # Liveness poll interval while an OPEN validator window waits for either a
 # normal seal trigger or an exhausted proof-admission queue. This prevents a
@@ -501,6 +507,13 @@ MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW = 8
 # as a direct submission, so abandoning an upload cannot create free receipt
 # spam or reserve an unbounded number of deadline extensions.
 MAX_PENDING_UPLOAD_PRECOMMITS_PER_ENV = MAX_PENDING_PROOF_QUEUE_DEPTH
+
+# Process-isolated auction preparation. These hard per-candidate walls make the
+# accepted receipt population drainable even when submitted math or code is
+# pathological. They do not control GPU proof time, which has its own budget.
+MATH_ADMISSION_WALL_SECONDS = 45.0
+CODE_ADMISSION_WALL_SECONDS = 20.0
+ADMISSION_PROCESS_MAX_TASKS = 128
 
 # Per-hotkey cap on BAD_ENVELOPE_SIGNATURE rejects per window. The
 # envelope-signature gate (PR #35) deliberately does NOT bump
@@ -839,7 +852,7 @@ GRADER_SOCKET_PATH = "/tmp/reliquary-grader.sock"
 # Number of warm gVisor workers in the grader pool. Sized to handle
 # M_ROLLOUTS in parallel for a single submission with headroom for
 # concurrent submissions. Increase for high-throughput validators.
-GRADER_POOL_SIZE = M_ROLLOUTS
+GRADER_POOL_SIZE = 4 * M_ROLLOUTS
 
 # Wall-clock timeout (seconds) for one structured OpenCode evaluation.
 # Subprocess inside the sandbox is killed if it exceeds this. Tuned
