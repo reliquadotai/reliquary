@@ -49,149 +49,100 @@ def _build_late_drop_service():
 
 
 @pytest.mark.asyncio
-async def test_registration_cache_maintainer_refreshes_before_ttl(monkeypatch):
-    from reliquary.validator import service as service_module
+async def test_registration_refresh_skips_chain_until_epoch_due():
+    svc = _build_late_drop_service()
+    svc.server.set_registered_hotkeys(
+        {"hk-a"}, operator_by_hotkey={"hk-a": "operator-a"}
+    )
+
+    with patch(
+        "reliquary.validator.service.chain.get_subtensor",
+        new=AsyncMock(),
+    ) as get_subtensor:
+        refreshed = await svc._refresh_registered_hotkeys(
+            reason="epoch_boundary"
+        )
+
+    assert refreshed is True
+    get_subtensor.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_registration_refresh_runs_once_snapshot_is_epoch_old():
+    from reliquary.constants import REGISTERED_HOTKEY_CACHE_TTL_SECONDS
 
     svc = _build_late_drop_service()
-    monkeypatch.setattr(
-        service_module, "REGISTERED_HOTKEY_CACHE_TTL_SECONDS", 0.05,
+    svc.server.set_registered_hotkeys(
+        {"hk-old"},
+        refreshed_at=time.time() - REGISTERED_HOTKEY_CACHE_TTL_SECONDS - 1,
+        operator_by_hotkey={"hk-old": "operator-old"},
     )
-    monkeypatch.setattr(
-        service_module, "REGISTERED_HOTKEY_REFRESH_MIN_INTERVAL_SECONDS", 0.01,
-    )
+    subtensor = object()
+    neurons = [SimpleNamespace(hotkey="hk-new", coldkey="operator-new")]
+
+    with (
+        patch(
+            "reliquary.validator.service.chain.get_subtensor",
+            new=AsyncMock(return_value=subtensor),
+        ) as get_subtensor,
+        patch(
+            "reliquary.validator.service.chain.get_neurons_lite",
+            new=AsyncMock(return_value=neurons),
+        ),
+        patch(
+            "reliquary.validator.service.chain.close_subtensor",
+            new=AsyncMock(),
+        ),
+    ):
+        refreshed = await svc._refresh_registered_hotkeys(
+            reason="epoch_boundary"
+        )
+
+    assert refreshed is True
+    assert svc.server._registered_hotkeys == frozenset({"hk-new"})
+    get_subtensor.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_failed_epoch_refresh_retries_at_next_boundary():
+    from reliquary.constants import REGISTERED_HOTKEY_CACHE_TTL_SECONDS
+
+    svc = _build_late_drop_service()
+    old_refreshed_at = time.time() - REGISTERED_HOTKEY_CACHE_TTL_SECONDS - 1
     svc.server.set_registered_hotkeys(
         {"hk-a"},
-        refreshed_at=time.time() - 0.04,
+        refreshed_at=old_refreshed_at,
         operator_by_hotkey={"hk-a": "operator-a"},
     )
-    refreshed = asyncio.Event()
-    refresh_kwargs: dict[str, float | bool] = {}
+    subtensor = object()
 
-    async def refresh(**kwargs):
-        refresh_kwargs.update(kwargs)
-        refreshed.set()
-        return True
+    with (
+        patch(
+            "reliquary.validator.service.chain.get_subtensor",
+            new=AsyncMock(
+                side_effect=[ConnectionError("chain down"), subtensor]
+            ),
+        ) as get_subtensor,
+        patch(
+            "reliquary.validator.service.chain.get_neurons_lite",
+            new=AsyncMock(
+                return_value=[
+                    SimpleNamespace(hotkey="hk-b", coldkey="operator-b")
+                ]
+            ),
+        ),
+        patch(
+            "reliquary.validator.service.chain.close_subtensor",
+            new=AsyncMock(),
+        ),
+    ):
+        first = await svc._refresh_registered_hotkeys(reason="epoch_boundary")
+        second = await svc._refresh_registered_hotkeys(reason="epoch_boundary")
 
-    monkeypatch.setattr(svc, "_refresh_registered_hotkeys", refresh)
-    task = asyncio.create_task(svc._maintain_registration_cache())
-    try:
-        await asyncio.wait_for(refreshed.wait(), timeout=0.5)
-    finally:
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-
-    assert refresh_kwargs["max_cache_age_seconds"] < 0.05
-
-
-@pytest.mark.asyncio
-async def test_registration_cache_maintainer_retries_before_ttl(monkeypatch):
-    """A transient RPC timeout must leave enough runway for a retry."""
-    from reliquary.validator import service as service_module
-
-    svc = _build_late_drop_service()
-    ttl_seconds = 0.30
-    monkeypatch.setattr(
-        service_module, "REGISTERED_HOTKEY_CACHE_TTL_SECONDS", ttl_seconds,
-    )
-    monkeypatch.setattr(
-        service_module, "REGISTERED_HOTKEY_REFRESH_MIN_INTERVAL_SECONDS", 0.02,
-    )
-    elapsed = 0.0
-    base_age = 0.10
-    real_sleep = asyncio.sleep
-
-    async def advance_time(seconds: float) -> None:
-        nonlocal elapsed
-        elapsed += seconds
-        await real_sleep(0)
-
-    monkeypatch.setattr(service_module.asyncio, "sleep", advance_time)
-    monkeypatch.setattr(
-        svc.server,
-        "registration_cache_age",
-        lambda: base_age + elapsed,
-    )
-    call_ages: list[float] = []
-    recovered = asyncio.Event()
-
-    async def refresh(**kwargs):
-        del kwargs
-        age = svc.server.registration_cache_age()
-        assert age is not None
-        call_ages.append(age)
-        if len(call_ages) == 1:
-            return False
-        recovered.set()
-        await real_sleep(0)
-        return True
-
-    monkeypatch.setattr(svc, "_refresh_registered_hotkeys", refresh)
-    task = asyncio.create_task(svc._maintain_registration_cache())
-    try:
-        await asyncio.wait_for(recovered.wait(), timeout=1.0)
-    finally:
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-
-    assert len(call_ages) == 2
-    assert all(age < ttl_seconds for age in call_ages)
-    assert call_ages[0] < 0.20
-    assert abs((call_ages[1] - call_ages[0]) - 0.02) < 1e-9
-
-
-@pytest.mark.asyncio
-async def test_registration_cache_maintainer_targets_deadline_after_bootstrap(
-    monkeypatch,
-):
-    """Late task startup must not round the first refresh up to a full poll."""
-    from reliquary.validator import service as service_module
-
-    svc = _build_late_drop_service()
-    ttl_seconds = 0.30
-    monkeypatch.setattr(
-        service_module, "REGISTERED_HOTKEY_CACHE_TTL_SECONDS", ttl_seconds,
-    )
-    monkeypatch.setattr(
-        service_module, "REGISTERED_HOTKEY_REFRESH_MIN_INTERVAL_SECONDS", 0.02,
-    )
-    elapsed = 0.0
-    base_age = 0.11
-    real_sleep = asyncio.sleep
-
-    async def advance_time(seconds: float) -> None:
-        nonlocal elapsed
-        elapsed += seconds
-        await real_sleep(0)
-
-    monkeypatch.setattr(service_module.asyncio, "sleep", advance_time)
-    monkeypatch.setattr(
-        svc.server,
-        "registration_cache_age",
-        lambda: base_age + elapsed,
-    )
-    refreshed = asyncio.Event()
-    call_ages: list[float] = []
-
-    async def refresh(**kwargs):
-        del kwargs
-        call_ages.append(svc.server.registration_cache_age())
-        refreshed.set()
-        await real_sleep(0)
-        return True
-
-    monkeypatch.setattr(svc, "_refresh_registered_hotkeys", refresh)
-    task = asyncio.create_task(svc._maintain_registration_cache())
-    try:
-        await asyncio.wait_for(refreshed.wait(), timeout=1.0)
-    finally:
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-
-    assert len(call_ages) == 1
-    assert abs(call_ages[0] - (ttl_seconds / 2.0)) < 1e-9
+    assert first is False
+    assert second is True
+    assert get_subtensor.await_count == 2
+    assert svc.server._registered_hotkeys == frozenset({"hk-b"})
 
 
 @pytest.mark.asyncio

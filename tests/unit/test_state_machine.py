@@ -188,6 +188,50 @@ async def test_train_and_publish_bumps_checkpoint_n(monkeypatch):
     svc._checkpoint_store.publish.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_admission_drain_abort_never_ranks_rewards_or_trains(monkeypatch):
+    svc = _make_service()
+    svc._open_window()
+    svc._activate_window()
+    batcher = svc._active_batcher
+    batcher.auction_admission_aborted = True
+    batcher.auction_seal_drain = {
+        "outcome": "aborted",
+        "receipt_conservation": {"conserved": True, "pending": 0},
+    }
+    batcher.force_seal_reason = "auction_admission_drain_abort"
+    batcher.seal_batch = MagicMock(
+        side_effect=AssertionError("aborted population must not be ranked")
+    )
+    svc._window_archive_enqueued = False
+    svc._window_iteration_stage = "seal_train_archive"
+    checkpoint_n = svc._checkpoint_n
+    tombstones = []
+
+    class _StubQueue:
+        def enqueue(self, window_start, archive):
+            tombstones.append((window_start, archive))
+
+    monkeypatch.setattr(
+        "reliquary.infrastructure.archive_queue.get_archive_queue",
+        lambda: _StubQueue(),
+    )
+
+    await svc._train_and_publish()
+
+    batcher.seal_batch.assert_not_called()
+    assert svc._checkpoint_n == checkpoint_n
+    assert svc._current_window_state == WindowState.READY
+    assert svc._active_batchers == {}
+    assert len(tombstones) == 1
+    archive = tombstones[0][1]
+    assert archive["window_status"] == "aborted"
+    assert archive["failure_stage"] == "admission_drain"
+    assert archive["batch"] == []
+    assert archive["rewards_by_hotkey"] == {}
+    assert archive["training_accumulator"]["trained"] is False
+
+
 def test_open_window_wires_checkpoint_hash_into_batcher():
     svc = _make_service()
     from reliquary.validator.checkpoint import ManifestEntry
@@ -293,6 +337,7 @@ async def test_auction_freeze_marks_population_after_normal_drain():
     batcher.difficulty_auction_enabled = True
     batcher.pending_proof_reservations = 0
     batcher.inflight_proof_reservations = 0
+    batcher.pending_upload_precommits = 0
     svc._active_batchers = {"openmathinstruct": batcher}
 
     timed_out = await svc._freeze_auction_populations([batcher])
@@ -304,26 +349,101 @@ async def test_auction_freeze_marks_population_after_normal_drain():
 @pytest.mark.asyncio
 async def test_auction_freeze_times_out_then_drops_pending_admission(monkeypatch):
     monkeypatch.setattr(
-        "reliquary.validator.service.MAX_SEAL_QUEUE_DRAIN_SECONDS", 0.0,
+        "reliquary.validator.service.AUCTION_ADMISSION_DRAIN_DEADLINE_SECONDS",
+        0.0,
     )
     svc = _make_service()
     batcher = MagicMock()
     batcher.difficulty_auction_enabled = True
     batcher.pending_proof_reservations = 1
     batcher.inflight_proof_reservations = 0
+    batcher.pending_upload_precommits = 0
     svc._active_batchers = {"openmathinstruct": batcher}
 
     timed_out = await svc._freeze_auction_populations([batcher])
 
     assert timed_out == {"openmathinstruct": True}
     batcher.begin_seal_snapshot.assert_called_once_with()
-    assert batcher.force_seal_reason == "auction_queue_drain_timeout"
+    assert batcher.force_seal_reason == "auction_admission_drain_abort"
+    assert batcher.auction_admission_aborted is True
+
+
+@pytest.mark.asyncio
+async def test_auction_drain_abort_expires_unrevealed_receipt(monkeypatch):
+    from reliquary.protocol.submission import RejectReason
+    from reliquary.validator.observability import DrandRoundObservation
+    from reliquary.validator.server import _UploadPrecommitReceipt
+
+    monkeypatch.setattr(
+        "reliquary.validator.service.AUCTION_ADMISSION_DRAIN_DEADLINE_SECONDS",
+        0.0,
+    )
+    svc = _make_service()
+    svc._open_window()
+    svc._activate_window()
+    batcher = svc._active_batcher
+    batcher.difficulty_auction_enabled = True
+    receipt_id = "unrevealed-at-abort"
+    accepted, reason, _deadline = batcher.try_register_upload_precommit(
+        receipt_id,
+        "miner",
+        t_arrival_wall=batcher.window_opened_wall_ts,
+        payload_bytes=512,
+    )
+    assert accepted is True
+    assert reason is None
+    receipt = _UploadPrecommitReceipt(
+        receipt_id=receipt_id,
+        precommit_signature="signed",
+        miner_hotkey="miner",
+        prompt_idx=1,
+        window_start=batcher.window_start,
+        merkle_root="00" * 32,
+        checkpoint_hash=batcher.current_checkpoint_hash,
+        environment="fake",
+        payload_bytes=512,
+        payload_sha256="11" * 32,
+        drand_round=1,
+        protocol_version=2,
+        nonce="nonce",
+        expires_at_wall=10**12,
+        precommit_arrival_ts=1.0,
+        drand_observation=DrandRoundObservation(
+            submitted_drand_round=1,
+            arrival_drand_round=1,
+            drand_delta=0,
+            drand_tolerance=0,
+            drand_status="current",
+            reject_reason=None,
+        ),
+        batcher=batcher,
+    )
+    svc.server._upload_precommit_receipts[receipt_id] = receipt
+    svc.server._upload_precommit_by_signature["signed"] = receipt_id
+
+    timed_out = await svc._freeze_auction_populations([batcher])
+
+    assert timed_out == {"fake": True}
+    assert receipt.terminal is True
+    assert receipt.outcome is not None
+    assert receipt.outcome.reason is RejectReason.PRECOMMIT_EXPIRED
+    assert batcher.upload_precommit_conservation() == {
+        "accepted_receipts": 1,
+        "revealed": 0,
+        "revealed_terminal": 0,
+        "expired": 1,
+        "terminal_decisions": 0,
+        "pending": 0,
+        "conserved": True,
+    }
+    assert batcher.auction_seal_drain["outcome"] == "aborted"
 
 
 @pytest.mark.asyncio
 async def test_auction_freeze_never_waits_for_inflight_after_snapshot(monkeypatch):
     monkeypatch.setattr(
-        "reliquary.validator.service.MAX_SEAL_QUEUE_DRAIN_SECONDS", 0.0,
+        "reliquary.validator.service.AUCTION_ADMISSION_DRAIN_DEADLINE_SECONDS",
+        0.0,
     )
     svc = _make_service()
     batcher = MagicMock()
@@ -331,6 +451,7 @@ async def test_auction_freeze_never_waits_for_inflight_after_snapshot(monkeypatc
     batcher.env.name = "openmathinstruct"
     batcher.pending_proof_reservations = 0
     batcher.inflight_proof_reservations = 1
+    batcher.pending_upload_precommits = 0
     svc._active_batchers = {"openmathinstruct": batcher}
     svc.server._inflight_proofs = 1
     svc.server._inflight_proofs_by_environment["openmathinstruct"] = 1

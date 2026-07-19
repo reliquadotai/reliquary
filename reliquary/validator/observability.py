@@ -220,6 +220,57 @@ class SubmitTelemetry:
             queue_depth_at_arrival=queue_depth_at_arrival,
         )
 
+    @classmethod
+    def from_precommit(
+        cls,
+        *,
+        window_n: int,
+        prompt_idx: int,
+        hotkey: str,
+        merkle_root: str,
+        protocol_version: int,
+        submitted_drand_round: int,
+        t_arrival: float,
+        payload_bytes: int,
+        content_length_bytes: int | None,
+        payload_sha256: str,
+        t_body_started: float | None,
+        t_body_completed: float | None,
+        queue_depth_at_arrival: int | None,
+    ) -> "SubmitTelemetry":
+        """Build ingress telemetry before the large body is parsed."""
+        body_read_ms = None
+        if t_body_started is not None and t_body_completed is not None:
+            body_read_ms = max(
+                0.0,
+                (float(t_body_completed) - float(t_body_started)) * 1000.0,
+            )
+        ingress_ms = None
+        if t_body_completed is not None:
+            ingress_ms = max(
+                0.0,
+                (float(t_body_completed) - float(t_arrival)) * 1000.0,
+            )
+        return cls(
+            window_n=window_n,
+            prompt_idx=prompt_idx,
+            hotkey=hotkey,
+            merkle_root=merkle_root,
+            protocol_version=protocol_version,
+            submitted_drand_round=submitted_drand_round,
+            t_arrival=t_arrival,
+            prompt_hash_lead=canonical_prompt_hash_lead(prompt_idx),
+            merkle_root_lead=merkle_root_lead(merkle_root),
+            payload_bytes=payload_bytes,
+            content_length_bytes=content_length_bytes,
+            payload_sha256_lead=payload_sha256[:12],
+            t_body_started=t_body_started,
+            t_body_completed=t_body_completed,
+            body_read_ms=body_read_ms,
+            ingress_ms=ingress_ms,
+            queue_depth_at_arrival=queue_depth_at_arrival,
+        )
+
     def apply_legacy_merkle(
         self,
         *,

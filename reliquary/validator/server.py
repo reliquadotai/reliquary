@@ -20,11 +20,14 @@ import collections
 import hashlib
 import importlib.metadata
 import logging
+import multiprocessing
 import numbers
 import secrets
 import time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any, Callable
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -66,8 +69,6 @@ from reliquary.constants import (
     MAX_SUBMISSIONS_PER_PROMPT,
     MAX_TRUNCATED_PER_SUBMISSION,
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
-    REGISTERED_HOTKEY_REFRESH_MIN_INTERVAL_SECONDS,
-    REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS,
     REGISTERED_HOTKEY_STALE_GRACE_SECONDS,
     SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS,
     SPARSE_VALID_IDLE_SEAL_SECONDS,
@@ -75,6 +76,9 @@ from reliquary.constants import (
     SUBMISSION_UPLOAD_GRACE_SECONDS,
     VALIDATOR_HTTP_PORT,
     CODE_ADMISSION_WORKERS,
+    CODE_ADMISSION_WALL_SECONDS,
+    ADMISSION_PROCESS_MAX_TASKS,
+    MATH_ADMISSION_WALL_SECONDS,
 )
 from reliquary.environment.virtual_parquet import PromptSourceUnavailable
 from reliquary.protocol.legacy_merkle import (
@@ -98,8 +102,24 @@ from reliquary.protocol.submission import (
     VerdictsResponse,
 )
 from reliquary.protocol.tokens import verify_tokens
-from reliquary.shared.modeling import resolve_eos_token_ids
+from reliquary.shared.hf_compat import (
+    resolve_max_context_length,
+    resolve_vocab_size,
+)
+from reliquary.shared.modeling import (
+    force_close_token_ids,
+    resolve_eos_token_ids,
+    think_close_token_ids,
+)
 from reliquary.shared.runtime_fingerprint import collect_runtime_fingerprint
+from reliquary.validator.admission import (
+    AdmissionContext,
+    AdmissionReceiptBinding,
+    PreparedSubmission,
+    admission_worker_ready,
+    initialize_admission_worker,
+    prepare_submission,
+)
 from reliquary.validator.batcher import GrpoWindowBatcher
 from reliquary.validator.dedup import compute_rollout_hash
 from reliquary.validator.observability import (
@@ -143,6 +163,17 @@ class _UploadPrecommitReceipt:
     batcher: Any
     consumed: bool = False
     outcome: BatchSubmissionResponse | None = None
+    terminal: bool = False
+    terminal_recorded: bool = False
+
+
+@dataclass(frozen=True)
+class _QueuedAuctionSubmission:
+    raw_body: bytes
+    receipt: _UploadPrecommitReceipt
+    batcher: Any
+    telemetry: SubmitTelemetry
+    enqueued_monotonic: float
 
 
 # How many recent verdicts to remember per hotkey. Bounded so the
@@ -554,6 +585,9 @@ class _Health(BaseModel):
             "opencodeinstruct": CODE_ADMISSION_WORKERS,
         }
     )
+    admission_pool_state_by_environment: dict[str, dict[str, Any]] = Field(
+        default_factory=dict
+    )
     proof_verification_inflight: int | None = None
     proof_verification_inflight_by_environment: dict[str, int] = Field(
         default_factory=dict
@@ -634,6 +668,7 @@ class _Health(BaseModel):
     registration_cache_age_seconds: float | None = None
     registration_cache_stale: bool | None = None
     registration_cache_usable: bool | None = None
+    registration_cache_next_refresh_ts: float | None = None
     registration_cache_refresh_attempts_total: int = 0
     registration_cache_refresh_successes_total: int = 0
     registration_cache_refresh_failures_total: int = 0
@@ -715,11 +750,6 @@ class ValidatorServer:
         self._registered_hotkeys: frozenset[str] | None = None
         self._operator_by_hotkey: dict[str, str] = {}
         self._registration_refreshed_at: float | None = None
-        self._registration_refresh_callback: (
-            Callable[[], Awaitable[bool]] | None
-        ) = None
-        self._registration_refresh_task: asyncio.Task[None] | None = None
-        self._last_registration_refresh_attempt = 0.0
         self._registration_cache_refresh_attempts_total = 0
         self._registration_cache_refresh_successes_total = 0
         self._registration_cache_refresh_failures_total = 0
@@ -778,6 +808,28 @@ class ValidatorServer:
         self._worker_task: asyncio.Task[Any] | None = None
         self._code_worker_task: asyncio.Task[Any] | None = None
         self._extra_worker_tasks: list[asyncio.Task[Any]] = []
+        self._auction_admission_enabled = False
+        self._admission_process_pools: dict[str, ProcessPoolExecutor] = {}
+        self._admission_tokenizer_hashes: dict[str, str] = {}
+        self._admission_pool_locks: dict[str, asyncio.Lock] = {}
+        self._admission_materialization_pool: ThreadPoolExecutor | None = None
+        self._admission_active_by_environment: collections.Counter[str] = (
+            collections.Counter()
+        )
+        self._admission_worker_restarts: collections.Counter[str] = (
+            collections.Counter()
+        )
+        self._admission_timeouts: collections.Counter[str] = (
+            collections.Counter()
+        )
+        self._admission_enqueued_at: dict[str, tuple[str, float]] = {}
+        self._admission_inflight_items: dict[
+            str, _QueuedAuctionSubmission
+        ] = {}
+        self._admission_inflight_requests: dict[
+            str, BatchSubmissionRequest
+        ] = {}
+        self._admission_contexts: dict[int, AdmissionContext] = {}
         self._inflight_proofs = 0
         self._inflight_proofs_by_environment: collections.Counter[str] = (
             collections.Counter()
@@ -832,10 +884,15 @@ class ValidatorServer:
                 resolver = getattr(
                     type(receipt.batcher), "resolve_upload_precommit", None
                 )
-                if resolver is not None and not receipt.consumed:
-                    resolver(receipt.batcher, receipt.receipt_id)
+                if resolver is not None:
+                    resolver(
+                        receipt.batcher,
+                        receipt.receipt_id,
+                        expired=not receipt.consumed,
+                    )
             self._upload_precommit_receipts = {}
             self._upload_precommit_by_signature = {}
+            self._admission_contexts = {}
             self._per_window_counts = {}
             self._bad_envelope_counts = {}
             self._recent_reject_counts = collections.Counter()
@@ -846,6 +903,15 @@ class ValidatorServer:
             self._runtime_fingerprint = collect_runtime_fingerprint(
                 proof_model=getattr(self.active_batcher, "model", None),
             )
+        if self._auction_admission_enabled:
+            for env_name, env_batcher in batchers.items():
+                if (
+                    getattr(env_batcher, "difficulty_auction_enabled", False)
+                    and env_name not in self._admission_process_pools
+                ):
+                    self._admission_process_pools[env_name] = (
+                        self._new_admission_pool(env_name)
+                    )
 
     def set_active_batcher(self, batcher: GrpoWindowBatcher | None) -> None:
         """Legacy single-env shim. Wraps into a dict and delegates."""
@@ -872,20 +938,25 @@ class ValidatorServer:
         expired = [
             receipt_id
             for receipt_id, receipt in self._upload_precommit_receipts.items()
-            if receipt.expires_at_wall < current
-            or receipt.batcher not in self._active_batchers.values()
+            if (
+                (not receipt.consumed and receipt.expires_at_wall < current)
+                or receipt.batcher not in self._active_batchers.values()
+            )
         ]
         for receipt_id in expired:
             receipt = self._upload_precommit_receipts.pop(receipt_id)
             self._upload_precommit_by_signature.pop(
                 receipt.precommit_signature, None
             )
-            if not receipt.consumed:
-                resolver = getattr(
-                    type(receipt.batcher), "resolve_upload_precommit", None
+            resolver = getattr(
+                type(receipt.batcher), "resolve_upload_precommit", None
+            )
+            if resolver is not None:
+                resolver(
+                    receipt.batcher,
+                    receipt.receipt_id,
+                    expired=not receipt.consumed,
                 )
-                if resolver is not None:
-                    resolver(receipt.batcher, receipt.receipt_id)
 
     @staticmethod
     def _precommit_matches_submission(
@@ -938,7 +1009,11 @@ class ValidatorServer:
                     type(receipt.batcher), "resolve_upload_precommit", None
                 )
                 if resolver is not None:
-                    resolver(receipt.batcher, receipt.receipt_id)
+                    resolver(
+                        receipt.batcher,
+                        receipt.receipt_id,
+                        expired=True,
+                    )
             return "expired", None
         if not self._precommit_matches_submission(
             receipt,
@@ -951,6 +1026,11 @@ class ValidatorServer:
         if receipt.consumed:
             return "replay", receipt
         receipt.consumed = True
+        revealed = getattr(
+            type(receipt.batcher), "mark_upload_precommit_revealed", None
+        )
+        if revealed is not None:
+            revealed(receipt.batcher, receipt.receipt_id)
         return "valid", receipt
 
     def set_current_state(self, state) -> None:
@@ -1013,12 +1093,8 @@ class ValidatorServer:
     def set_current_checkpoint(self, entry) -> None:
         self._current_checkpoint = entry
 
-    def configure_registration_gate(
-        self,
-        refresh_callback: Callable[[], Awaitable[bool]],
-    ) -> None:
-        """Arm registered-hotkey admission for the production service."""
-        self._registration_refresh_callback = refresh_callback
+    def configure_registration_gate(self) -> None:
+        """Arm admission against the service-managed metagraph snapshot."""
         self._registration_gate_enforced = True
 
     def set_registered_hotkeys(
@@ -1088,14 +1164,6 @@ class ValidatorServer:
 
         now = time.time()
         age = self.registration_cache_age(now=now)
-        missing = (
-            self._registered_hotkeys is None
-            or hotkey not in self._registered_hotkeys
-        )
-        refresh_due = age is None or age > REGISTERED_HOTKEY_CACHE_TTL_SECONDS
-        if missing or refresh_due:
-            self._schedule_registration_refresh(now=now)
-
         if (
             self._registered_hotkeys is None
             or age is None
@@ -1103,46 +1171,12 @@ class ValidatorServer:
         ):
             return RejectReason.REGISTRATION_UNAVAILABLE
         if hotkey not in self._registered_hotkeys:
-            # A fresh snapshot is authoritative. A stale snapshot may simply
-            # predate a new registration, so ask the miner to retry while the
-            # singleflight background refresh runs instead of blocking this
-            # request on a chain RPC.
+            # A stale snapshot may predate a new registration. The service will
+            # retry at the next quiescent boundary; requests never trigger RPCs.
             if age > REGISTERED_HOTKEY_CACHE_TTL_SECONDS:
                 return RejectReason.REGISTRATION_UNAVAILABLE
             return RejectReason.HOTKEY_NOT_REGISTERED
         return None
-
-    def _schedule_registration_refresh(self, *, now: float) -> None:
-        callback = self._registration_refresh_callback
-        if callback is None:
-            return
-        if (
-            self._registration_refresh_task is not None
-            and not self._registration_refresh_task.done()
-        ):
-            return
-        if (
-            now - self._last_registration_refresh_attempt
-            < REGISTERED_HOTKEY_REFRESH_MIN_INTERVAL_SECONDS
-        ):
-            return
-
-        self._last_registration_refresh_attempt = now
-
-        async def _refresh() -> None:
-            try:
-                await asyncio.wait_for(
-                    callback(),
-                    timeout=REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("registered-hotkey cache refresh failed")
-
-        self._registration_refresh_task = asyncio.create_task(
-            _refresh(), name="registration_cache_on_demand_refresh"
-        )
 
     def _observe_legacy_merkle(
         self,
@@ -1454,6 +1488,20 @@ class ValidatorServer:
             "pending_upload_precommits": _integer(
                 getattr(batcher, "pending_upload_precommits", None)
             ),
+            "upload_precommit_payload_bytes": _integer(
+                getattr(batcher, "upload_precommit_payload_bytes", None)
+            ),
+            "upload_precommit_conservation": (
+                batcher.upload_precommit_conservation()
+                if callable(
+                    getattr(
+                        type(batcher),
+                        "upload_precommit_conservation",
+                        None,
+                    )
+                )
+                else {}
+            ),
             "collection_closed": bool(
                 getattr(type(batcher), "collection_closed", lambda _self: False)(
                     batcher
@@ -1500,6 +1548,12 @@ class ValidatorServer:
             and registration_age is not None
             and registration_age <= REGISTERED_HOTKEY_STALE_GRACE_SECONDS
             if self._registration_gate_enforced
+            else None
+        )
+        registration_cache_next_refresh_ts = (
+            self._registration_refreshed_at
+            + REGISTERED_HOTKEY_CACHE_TTL_SECONDS
+            if self._registration_refreshed_at is not None
             else None
         )
         accumulator = self._training_accumulator_state
@@ -1646,6 +1700,52 @@ class ValidatorServer:
                 "openmathinstruct": MATH_ADMISSION_WORKERS,
                 "opencodeinstruct": CODE_ADMISSION_WORKERS,
             },
+            admission_pool_state_by_environment={
+                env_name: {
+                    "queued": self._submission_queue_for_environment(
+                        env_name
+                    ).qsize(),
+                    "active": int(
+                        self._admission_active_by_environment.get(
+                            env_name, 0
+                        )
+                    ),
+                    "oldest_job_age_seconds": (
+                        round(
+                            max(
+                                0.0,
+                                time.monotonic()
+                                - min(
+                                    enqueued_at
+                                    for queued_env, enqueued_at
+                                    in self._admission_enqueued_at.values()
+                                    if queued_env == env_name
+                                ),
+                            ),
+                            3,
+                        )
+                        if any(
+                            queued_env == env_name
+                            for queued_env, _enqueued_at
+                            in self._admission_enqueued_at.values()
+                        )
+                        else None
+                    ),
+                    "worker_restarts": int(
+                        self._admission_worker_restarts.get(env_name, 0)
+                    ),
+                    "timeouts": int(
+                        self._admission_timeouts.get(env_name, 0)
+                    ),
+                    "process_pool_started": (
+                        env_name in self._admission_process_pools
+                    ),
+                }
+                for env_name in (
+                    "openmathinstruct",
+                    "opencodeinstruct",
+                )
+            },
             proof_verification_inflight=self._inflight_proofs,
             proof_verification_inflight_by_environment=(
                 self.proof_verification_inflight_by_environment
@@ -1786,6 +1886,9 @@ class ValidatorServer:
             registration_cache_age_seconds=registration_age,
             registration_cache_stale=registration_cache_stale,
             registration_cache_usable=registration_cache_usable,
+            registration_cache_next_refresh_ts=(
+                registration_cache_next_refresh_ts
+            ),
             registration_cache_refresh_attempts_total=(
                 self._registration_cache_refresh_attempts_total
             ),
@@ -1985,6 +2088,613 @@ class ValidatorServer:
             drand_status=classify_drand_round(request.drand_round, None, tolerance),
             reject_reason=reject,
         )
+
+    def _admission_context_for(self, batcher: Any) -> AdmissionContext:
+        cache_key = id(batcher)
+        cached = self._admission_contexts.get(cache_key)
+        if cached is not None:
+            return cached
+
+        model_config = _proof_free_model_config(batcher)
+        tokenizer = getattr(batcher, "tokenizer", None)
+        if _is_mock_like(tokenizer):
+            tokenizer = None
+        vocab_size = (
+            resolve_vocab_size(model_config)
+            if model_config is not None
+            else None
+        )
+        max_sequence_length = (
+            resolve_max_context_length(model_config)
+            if model_config is not None
+            else MAX_NEW_TOKENS_PROTOCOL_CAP
+        )
+        try:
+            canonical_force_ids = tuple(force_close_token_ids(tokenizer))
+            think_close_ids = tuple(think_close_token_ids(tokenizer))
+        except Exception:
+            canonical_force_ids = ()
+            think_close_ids = ()
+        context = AdmissionContext(
+            randomness=str(getattr(batcher, "randomness", "")),
+            environment=str(getattr(batcher.env, "name", "")),
+            vocab_size=vocab_size,
+            max_sequence_length=max_sequence_length,
+            eos_token_ids=tuple(sorted(_proof_free_eos_set(batcher) or ())),
+            canonical_force_ids=canonical_force_ids,
+            think_close_ids=think_close_ids,
+            bootstrap=bool(getattr(batcher, "bootstrap", False)),
+            enforce_envelope_signature=ENFORCE_ENVELOPE_SIGNATURE,
+            enforce_legacy_merkle=LEGACY_MERKLE_ROOT_ENFORCE,
+        )
+        self._admission_contexts[cache_key] = context
+        return context
+
+    @staticmethod
+    def _admission_binding(
+        receipt: _UploadPrecommitReceipt,
+    ) -> AdmissionReceiptBinding:
+        return AdmissionReceiptBinding(
+            miner_hotkey=receipt.miner_hotkey,
+            prompt_idx=receipt.prompt_idx,
+            window_start=receipt.window_start,
+            merkle_root=receipt.merkle_root,
+            checkpoint_hash=receipt.checkpoint_hash,
+            environment=receipt.environment,
+            payload_bytes=receipt.payload_bytes,
+            drand_round=receipt.drand_round,
+            protocol_version=receipt.protocol_version,
+            nonce=receipt.nonce,
+        )
+
+    @staticmethod
+    def _admission_worker_count(environment: str) -> int:
+        if environment == "opencodeinstruct":
+            return CODE_ADMISSION_WORKERS
+        return MATH_ADMISSION_WORKERS
+
+    def _new_admission_pool(self, environment: str) -> ProcessPoolExecutor:
+        batcher = self._active_batchers.get(environment)
+        tokenizer = getattr(batcher, "tokenizer", None)
+        backend = getattr(tokenizer, "backend_tokenizer", None)
+        serializer = getattr(backend, "to_str", None)
+        if not callable(serializer):
+            raise RuntimeError(
+                f"fast tokenizer unavailable for {environment} admission"
+            )
+        tokenizer_json = str(serializer())
+        self._admission_tokenizer_hashes[environment] = hashlib.sha256(
+            tokenizer_json.encode("utf-8")
+        ).hexdigest()
+        worker_count = self._admission_worker_count(environment)
+        pool = ProcessPoolExecutor(
+            max_workers=worker_count,
+            mp_context=multiprocessing.get_context("spawn"),
+            initializer=initialize_admission_worker,
+            initargs=(tokenizer_json,),
+            max_tasks_per_child=ADMISSION_PROCESS_MAX_TASKS,
+        )
+        # ProcessPoolExecutor is lazy. Fully start it at the quiescent boundary
+        # so the first reveal cannot spend its candidate wall budget waiting
+        # for child imports. Short held probes let every child claim work; the
+        # loop handles schedulers that initially assign more than one probe to
+        # the same process.
+        ready_pids: set[int] = set()
+        startup_deadline = time.monotonic() + 120.0
+        try:
+            while len(ready_pids) < worker_count:
+                probes = [
+                    pool.submit(admission_worker_ready, 0.05)
+                    for _ in range(worker_count)
+                ]
+                for probe in probes:
+                    remaining = startup_deadline - time.monotonic()
+                    if remaining <= 0.0:
+                        raise TimeoutError(
+                            f"{environment} admission pool startup timed out"
+                        )
+                    ready_pids.add(int(probe.result(timeout=remaining)))
+        except BaseException:
+            self._terminate_admission_pool(pool)
+            raise
+        return pool
+
+    @staticmethod
+    def _terminate_admission_pool(pool: ProcessPoolExecutor) -> None:
+        """Bound cleanup of a failed pool on Python versions without terminate_workers."""
+        processes = tuple(
+            (getattr(pool, "_processes", None) or {}).values()
+        )
+        terminate = getattr(pool, "terminate_workers", None)
+        if callable(terminate):
+            terminate()
+            return
+
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+        pool.shutdown(wait=False, cancel_futures=True)
+
+        join_deadline = time.monotonic() + 1.0
+        for process in processes:
+            process.join(timeout=max(0.0, join_deadline - time.monotonic()))
+        for process in processes:
+            if process.is_alive():
+                process.kill()
+
+    async def _restart_admission_pool(
+        self,
+        environment: str,
+        failed_pool: ProcessPoolExecutor,
+    ) -> None:
+        lock = self._admission_pool_locks.setdefault(
+            environment, asyncio.Lock()
+        )
+        async with lock:
+            if self._admission_process_pools.get(environment) is not failed_pool:
+                return
+            await asyncio.to_thread(
+                self._terminate_admission_pool, failed_pool
+            )
+            self._admission_process_pools[environment] = await asyncio.to_thread(
+                self._new_admission_pool,
+                environment,
+            )
+            self._admission_worker_restarts[environment] += 1
+
+    async def _run_admission_process(
+        self,
+        environment: str,
+        function: Callable[..., Any],
+        *args: Any,
+        wall_seconds: float,
+    ) -> Any:
+        pool = self._admission_process_pools[environment]
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(pool, function, *args)
+        try:
+            result = await asyncio.wait_for(
+                future, timeout=max(1.0, wall_seconds + 2.0)
+            )
+        except asyncio.TimeoutError:
+            self._admission_timeouts[environment] += 1
+            await self._restart_admission_pool(environment, pool)
+            raise
+        except BrokenProcessPool:
+            await self._restart_admission_pool(environment, pool)
+            raise
+        if bool(getattr(result, "timed_out", False)):
+            self._admission_timeouts[environment] += 1
+        return result
+
+    def _complete_upload_receipt(
+        self,
+        receipt: _UploadPrecommitReceipt,
+        outcome: BatchSubmissionResponse,
+        *,
+        expired: bool = False,
+    ) -> bool:
+        if receipt.terminal:
+            return False
+        receipt.outcome = outcome
+        receipt.terminal = True
+        resolver = getattr(
+            type(receipt.batcher), "resolve_upload_precommit", None
+        )
+        if resolver is not None:
+            resolver(
+                receipt.batcher,
+                receipt.receipt_id,
+                expired=expired,
+            )
+        self._admission_enqueued_at.pop(receipt.receipt_id, None)
+        return True
+
+    def _claim_raw_upload_precommit(
+        self,
+        receipt_id: str,
+        *,
+        payload_bytes: int,
+        payload_sha256: str,
+        body_completed_at: float,
+    ) -> tuple[str, _UploadPrecommitReceipt | None]:
+        receipt = self._upload_precommit_receipts.get(receipt_id)
+        if receipt is None:
+            self._prune_upload_precommits(now=body_completed_at)
+            return "invalid", None
+        if receipt.batcher not in self._active_batchers.values():
+            return "invalid", None
+        if receipt.consumed:
+            return "replay", receipt
+        if body_completed_at > receipt.expires_at_wall:
+            receipt.consumed = True
+            self._complete_upload_receipt(
+                receipt,
+                BatchSubmissionResponse(
+                    accepted=False,
+                    reason=RejectReason.PRECOMMIT_EXPIRED,
+                ),
+                expired=True,
+            )
+            return "expired", receipt
+
+        revealed = getattr(
+            type(receipt.batcher), "mark_upload_precommit_revealed", None
+        )
+        if revealed is not None:
+            revealed(receipt.batcher, receipt.receipt_id)
+        if (
+            payload_bytes != receipt.payload_bytes
+            or not secrets.compare_digest(
+                payload_sha256.lower(), receipt.payload_sha256
+            )
+        ):
+            receipt.consumed = True
+            self._complete_upload_receipt(
+                receipt,
+                BatchSubmissionResponse(
+                    accepted=False,
+                    reason=RejectReason.PRECOMMIT_INVALID,
+                ),
+            )
+            return "invalid", receipt
+        receipt.consumed = True
+        return "valid", receipt
+
+    @staticmethod
+    def _receipt_telemetry(
+        receipt: _UploadPrecommitReceipt,
+        *,
+        t_arrival: float,
+        content_length_bytes: int | None,
+        payload_sha256: str,
+        t_body_started: float | None,
+        t_body_completed: float | None,
+        queue_depth: int,
+    ) -> SubmitTelemetry:
+        telemetry = SubmitTelemetry.from_precommit(
+            window_n=receipt.window_start,
+            prompt_idx=receipt.prompt_idx,
+            hotkey=receipt.miner_hotkey,
+            merkle_root=receipt.merkle_root,
+            protocol_version=receipt.protocol_version,
+            submitted_drand_round=receipt.drand_round,
+            t_arrival=t_arrival,
+            payload_bytes=receipt.payload_bytes,
+            content_length_bytes=content_length_bytes,
+            payload_sha256=payload_sha256,
+            t_body_started=t_body_started,
+            t_body_completed=t_body_completed,
+            queue_depth_at_arrival=queue_depth,
+        )
+        telemetry.apply_upload_precommit(
+            "valid", arrival_ts=receipt.precommit_arrival_ts
+        )
+        telemetry.apply_drand(receipt.drand_observation)
+        telemetry.refresh_from_batcher(receipt.batcher)
+        return telemetry
+
+    def _record_raw_terminal(
+        self,
+        receipt: _UploadPrecommitReceipt,
+        telemetry: SubmitTelemetry,
+        outcome: BatchSubmissionResponse,
+        *,
+        stage: str,
+    ) -> BatchSubmissionResponse:
+        if receipt.terminal_recorded:
+            return outcome
+        receipt.terminal_recorded = True
+        telemetry.refresh_from_batcher(receipt.batcher, at_decision=True)
+        telemetry.mark_decision()
+        self.record_verdict(
+            receipt.miner_hotkey,
+            receipt.merkle_root,
+            outcome.accepted,
+            outcome.reason,
+            window_n=receipt.window_start,
+            telemetry=telemetry,
+            reject_stage=None if outcome.accepted else stage,
+            accepted_into_pool=outcome.accepted,
+        )
+        log_submission_stage(
+            logger,
+            logging.INFO if outcome.accepted else logging.WARNING,
+            "candidate_accepted" if outcome.accepted else "candidate_rejected",
+            telemetry,
+            reject_stage=None if outcome.accepted else stage,
+            reject_reason=None if outcome.accepted else outcome.reason.value,
+            accepted_into_pool=outcome.accepted,
+        )
+        return outcome
+
+    async def _submit_auction_reveal(
+        self,
+        http_request: Request,
+        response: Response,
+    ) -> BatchSubmissionResponse | None:
+        if not self._auction_admission_enabled:
+            return None
+        if not any(
+            bool(getattr(batcher, "difficulty_auction_enabled", False))
+            for batcher in self._active_batchers.values()
+        ):
+            return None
+
+        receipt_id = http_request.headers.get(PRECOMMIT_HEADER)
+        if not receipt_id:
+            response.headers["Connection"] = "close"
+            return BatchSubmissionResponse(
+                accepted=False,
+                reason=RejectReason.PRECOMMIT_REQUIRED,
+            )
+        receipt = self._upload_precommit_receipts.get(receipt_id)
+        if (
+            receipt is None
+            or receipt.batcher not in self._active_batchers.values()
+            or not bool(
+                getattr(receipt.batcher, "difficulty_auction_enabled", False)
+            )
+        ):
+            response.headers["Connection"] = "close"
+            return BatchSubmissionResponse(
+                accepted=False,
+                reason=RejectReason.PRECOMMIT_INVALID,
+            )
+        if receipt.consumed:
+            response.headers["Connection"] = "close"
+            return receipt.outcome or BatchSubmissionResponse(
+                accepted=True, reason=RejectReason.SUBMITTED
+            )
+
+        raw_content_length = http_request.headers.get("content-length")
+        try:
+            content_length_bytes = (
+                int(raw_content_length)
+                if raw_content_length is not None
+                else None
+            )
+        except ValueError:
+            content_length_bytes = None
+        if (
+            content_length_bytes is not None
+            and content_length_bytes != receipt.payload_bytes
+        ):
+            marker = getattr(
+                type(receipt.batcher),
+                "mark_upload_precommit_revealed",
+                None,
+            )
+            if marker is not None:
+                marker(receipt.batcher, receipt.receipt_id)
+            receipt.consumed = True
+            outcome = BatchSubmissionResponse(
+                accepted=False,
+                reason=RejectReason.PRECOMMIT_INVALID,
+            )
+            self._complete_upload_receipt(receipt, outcome)
+            telemetry = self._receipt_telemetry(
+                receipt,
+                t_arrival=float(
+                    getattr(http_request.state, "t_arrival", time.time())
+                ),
+                content_length_bytes=content_length_bytes,
+                payload_sha256=receipt.payload_sha256,
+                t_body_started=None,
+                t_body_completed=None,
+                queue_depth=self.submit_queue_depth,
+            )
+            telemetry.apply_upload_precommit(
+                "invalid", arrival_ts=receipt.precommit_arrival_ts
+            )
+            response.headers["Connection"] = "close"
+            return self._record_raw_terminal(
+                receipt,
+                telemetry,
+                outcome,
+                stage="upload_precommit",
+            )
+
+        raw_body = await http_request.body()
+        t_arrival = float(
+            getattr(http_request.state, "t_arrival", time.time())
+        )
+        body_completed_at = float(
+            getattr(http_request.state, "body_completed_at", time.time())
+        )
+        body_started_at = getattr(
+            http_request.state, "body_receive_started_at", None
+        )
+        payload_bytes = int(
+            getattr(http_request.state, "body_bytes_received", 0) or 0
+        ) or len(raw_body)
+        payload_sha256 = str(
+            getattr(http_request.state, "body_sha256", "") or ""
+        ).lower() or hashlib.sha256(raw_body).hexdigest()
+        status, claimed = self._claim_raw_upload_precommit(
+            receipt_id,
+            payload_bytes=payload_bytes,
+            payload_sha256=payload_sha256,
+            body_completed_at=body_completed_at,
+        )
+        if claimed is None:
+            return BatchSubmissionResponse(
+                accepted=False, reason=RejectReason.PRECOMMIT_INVALID
+            )
+        telemetry = self._receipt_telemetry(
+            claimed,
+            t_arrival=t_arrival,
+            content_length_bytes=content_length_bytes,
+            payload_sha256=payload_sha256,
+            t_body_started=body_started_at,
+            t_body_completed=body_completed_at,
+            queue_depth=self.submit_queue_depth,
+        )
+        if status == "replay":
+            telemetry.apply_upload_precommit(
+                "replay", arrival_ts=claimed.precommit_arrival_ts
+            )
+            return claimed.outcome or BatchSubmissionResponse(
+                accepted=True, reason=RejectReason.SUBMITTED
+            )
+        if status == "expired":
+            telemetry.apply_upload_precommit(
+                "expired", arrival_ts=claimed.precommit_arrival_ts
+            )
+            return self._record_raw_terminal(
+                claimed,
+                telemetry,
+                claimed.outcome
+                or BatchSubmissionResponse(
+                    accepted=False,
+                    reason=RejectReason.PRECOMMIT_EXPIRED,
+                ),
+                stage="upload_precommit",
+            )
+        if status != "valid":
+            telemetry.apply_upload_precommit(
+                "invalid", arrival_ts=claimed.precommit_arrival_ts
+            )
+            return self._record_raw_terminal(
+                claimed,
+                telemetry,
+                claimed.outcome
+                or BatchSubmissionResponse(
+                    accepted=False,
+                    reason=RejectReason.PRECOMMIT_INVALID,
+                ),
+                stage="upload_precommit",
+            )
+
+        queue = self._submission_queue_for_environment(claimed.environment)
+        telemetry.mark_enqueued(queue_depth=queue.qsize())
+        queued = _QueuedAuctionSubmission(
+            raw_body=raw_body,
+            receipt=claimed,
+            batcher=claimed.batcher,
+            telemetry=telemetry,
+            enqueued_monotonic=time.monotonic(),
+        )
+        try:
+            queue.put_nowait(queued)
+        except asyncio.QueueFull:
+            outcome = BatchSubmissionResponse(
+                accepted=False, reason=RejectReason.BATCH_FILLED
+            )
+            self._complete_upload_receipt(claimed, outcome)
+            return self._record_raw_terminal(
+                claimed,
+                telemetry,
+                outcome,
+                stage="admission_queue",
+            )
+        self._admission_enqueued_at[claimed.receipt_id] = (
+            claimed.environment,
+            queued.enqueued_monotonic,
+        )
+        outcome = BatchSubmissionResponse(
+            accepted=True, reason=RejectReason.SUBMITTED
+        )
+        claimed.outcome = outcome
+        log_submission_stage(
+            logger,
+            logging.INFO,
+            "submit_received",
+            telemetry,
+            queue_depth=queue.qsize(),
+            queue_depth_by_environment=self.submit_queue_depth_by_environment,
+        )
+        return outcome
+
+    async def abort_auction_admission(
+        self,
+        batchers: list[Any],
+    ) -> dict[str, int]:
+        """Make every unresolved receipt terminal before aborting a window."""
+        batcher_ids = {id(batcher) for batcher in batchers}
+        stats = {"queued": 0, "inflight": 0, "expired": 0}
+        for queue in (self._submit_queue, self._code_submit_queue):
+            retained: list[Any] = []
+            while True:
+                try:
+                    queued = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if (
+                    not isinstance(queued, _QueuedAuctionSubmission)
+                    or id(queued.batcher) not in batcher_ids
+                ):
+                    retained.append(queued)
+                    continue
+                stats["queued"] += 1
+                outcome = BatchSubmissionResponse(
+                    accepted=False, reason=RejectReason.WORKER_DROPPED
+                )
+                rejector = getattr(type(queued.batcher), "_reject", None)
+                if rejector is not None:
+                    outcome = rejector(
+                        queued.batcher,
+                        RejectReason.WORKER_DROPPED,
+                        hotkey=queued.receipt.miner_hotkey,
+                        prompt_idx=queued.receipt.prompt_idx,
+                        telemetry=queued.telemetry,
+                        reject_stage="admission_drain",
+                    )
+                self._complete_upload_receipt(queued.receipt, outcome)
+                self._record_raw_terminal(
+                    queued.receipt,
+                    queued.telemetry,
+                    outcome,
+                    stage="admission_drain",
+                )
+            for queued in retained:
+                queue.put_nowait(queued)
+
+        for receipt_id, item in list(self._admission_inflight_items.items()):
+            if id(item.batcher) not in batcher_ids:
+                continue
+            stats["inflight"] += 1
+            request = self._admission_inflight_requests.get(receipt_id)
+            if request is not None:
+                item.batcher.cancel_logical_group_reservation(request)
+                item.batcher.finish_proof_admission(request)
+            outcome = BatchSubmissionResponse(
+                accepted=False, reason=RejectReason.WORKER_DROPPED
+            )
+            self._complete_upload_receipt(item.receipt, outcome)
+            self._record_raw_terminal(
+                item.receipt,
+                item.telemetry,
+                outcome,
+                stage="admission_drain",
+            )
+
+        for receipt in self._upload_precommit_receipts.values():
+            if id(receipt.batcher) not in batcher_ids or receipt.terminal:
+                continue
+            expired = not receipt.consumed
+            stats["expired"] += int(expired)
+            outcome = BatchSubmissionResponse(
+                accepted=False,
+                reason=(
+                    RejectReason.PRECOMMIT_EXPIRED
+                    if expired
+                    else RejectReason.WORKER_DROPPED
+                ),
+            )
+            self._complete_upload_receipt(
+                receipt, outcome, expired=expired
+            )
+
+        environments = {
+            str(getattr(getattr(batcher, "env", None), "name", ""))
+            for batcher in batchers
+        }
+        for environment in environments:
+            pool = self._admission_process_pools.get(environment)
+            if pool is not None:
+                await self._restart_admission_pool(environment, pool)
+        return stats
 
     def _build_app(self) -> FastAPI:
         app = FastAPI(title="Reliquary Validator", version="2.0")
@@ -2186,6 +2896,7 @@ class ValidatorServer:
                 receipt_id,
                 request.miner_hotkey,
                 t_arrival_wall=t_arrival,
+                payload_bytes=request.payload_bytes,
             )
             if not accepted or deadline_monotonic is None:
                 reason = (
@@ -2260,6 +2971,11 @@ class ValidatorServer:
             response: Response,
         ) -> BatchSubmissionResponse:
             from reliquary.protocol.submission import WindowState
+            auction_response = await self._submit_auction_reveal(
+                http_request, response
+            )
+            if auction_response is not None:
+                return auction_response
             raw_body = await http_request.body()
             parse_started = time.perf_counter()
             try:
@@ -2676,9 +3392,8 @@ class ValidatorServer:
 
             # Only registered subnet hotkeys may consume submission quota or
             # proof capacity. The signature gate above proves ownership of the
-            # claimed hotkey; this gate binds that identity to the current
-            # metagraph. A cache miss triggers one bounded refresh, while a
-            # short chain outage may use a recent last-known-good snapshot.
+            # claimed hotkey; this local lookup binds that identity to the
+            # last complete metagraph snapshot without request-path RPC.
             registration_reason = await self._registration_reject_reason(hk)
             if registration_reason is not None:
                 telemetry.mark_decision()
@@ -3290,6 +4005,273 @@ class ValidatorServer:
         )
         return app
 
+    async def _process_auction_submission(
+        self,
+        item: _QueuedAuctionSubmission,
+        queue: asyncio.Queue,
+    ) -> None:
+        receipt = item.receipt
+        batcher = item.batcher
+        telemetry = item.telemetry
+        environment = receipt.environment
+        telemetry.mark_dequeued(queue_depth=queue.qsize())
+        telemetry.refresh_from_batcher(batcher)
+        self._admission_active_by_environment[environment] += 1
+        self._admission_inflight_items[receipt.receipt_id] = item
+        self._inflight_proofs += 1
+        self._inflight_proofs_by_environment[environment] += 1
+        response: BatchSubmissionResponse | None = None
+        reject_stage = "admission_worker"
+        request: BatchSubmissionRequest | None = None
+        admission_started = False
+        identity_reserved = False
+        cancel_identity_on_exit = False
+        wall_seconds = (
+            CODE_ADMISSION_WALL_SECONDS
+            if environment == "opencodeinstruct"
+            else MATH_ADMISSION_WALL_SECONDS
+        )
+        deadline = time.monotonic() + wall_seconds
+
+        def reject_without_request(
+            reason: RejectReason,
+            stage: str,
+        ) -> BatchSubmissionResponse:
+            rejector = getattr(type(batcher), "_reject", None)
+            if rejector is not None:
+                return rejector(
+                    batcher,
+                    reason,
+                    hotkey=receipt.miner_hotkey,
+                    prompt_idx=receipt.prompt_idx,
+                    telemetry=telemetry,
+                    reject_stage=stage,
+                )
+            return BatchSubmissionResponse(accepted=False, reason=reason)
+
+        try:
+            if batcher not in self._active_batchers.values():
+                response = reject_without_request(
+                    RejectReason.WORKER_DROPPED, "worker"
+                )
+                reject_stage = "worker"
+                return
+
+            telemetry.mark_proof_started(queue_depth=queue.qsize())
+            telemetry.mark_admission_started()
+            remaining = max(0.001, deadline - time.monotonic())
+            materialization_pool = self._admission_materialization_pool
+            if materialization_pool is None:
+                raise RuntimeError("admission materialization pool unavailable")
+            try:
+                materials = await asyncio.wait_for(
+                    asyncio.get_running_loop().run_in_executor(
+                        materialization_pool,
+                        batcher.materialize_admission_problem,
+                        receipt.prompt_idx,
+                    ),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                self._admission_timeouts[environment] += 1
+                raise
+            prepared: PreparedSubmission = await self._run_admission_process(
+                environment,
+                prepare_submission,
+                item.raw_body,
+                self._admission_binding(receipt),
+                materials,
+                self._admission_context_for(batcher),
+                deadline,
+                wall_seconds=max(0.001, deadline - time.monotonic()),
+            )
+            if prepared.legacy_merkle_status is not None:
+                telemetry.apply_legacy_merkle(
+                    status=prepared.legacy_merkle_status,
+                    computed_root=None,
+                    enforced=LEGACY_MERKLE_ROOT_ENFORCE,
+                )
+            request = prepared.request
+            telemetry.reward_grading_ms = prepared.reward_grading_ms
+            telemetry.body_parse_ms = prepared.body_parse_ms
+            telemetry.admission_prepare_ms = prepared.preparation_ms
+            if request is None:
+                reject_stage = prepared.reject_stage or "admission_worker"
+                response = reject_without_request(
+                    prepared.reject_reason or RejectReason.BAD_SCHEMA,
+                    reject_stage,
+                )
+                return
+            request._payload_bytes = receipt.payload_bytes
+            self._admission_inflight_requests[receipt.receipt_id] = request
+
+            structurally_authenticated = (
+                len(prepared.rollout_hashes) == len(request.rollouts)
+                and prepared.selection_digest is not None
+            )
+            identity_should_be_reserved = structurally_authenticated and (
+                prepared.reject_reason is not RejectReason.WORKER_DROPPED
+                or prepared.grader_failure_reason == "crash"
+            )
+            if identity_should_be_reserved:
+                reserved, identity_reason, identity_stage = (
+                    batcher.reserve_prepared_identity(
+                        request, prepared.rollout_hashes
+                    )
+                )
+                if not reserved:
+                    reject_stage = identity_stage or "admission_identity"
+                    response = batcher.reject_prepared_submission(
+                        request,
+                        identity_reason or RejectReason.WORKER_DROPPED,
+                        reject_stage,
+                        telemetry=telemetry,
+                    )
+                    return
+                identity_reserved = True
+
+            if prepared.reject_reason is not None:
+                reject_stage = prepared.reject_stage or "admission_worker"
+                response = batcher.reject_prepared_submission(
+                    request,
+                    prepared.reject_reason,
+                    reject_stage,
+                    telemetry=telemetry,
+                    grader_failure_reason=prepared.grader_failure_reason,
+                )
+                return
+
+            if not identity_reserved:
+                reject_stage = "admission_identity"
+                response = batcher.reject_prepared_submission(
+                    request,
+                    RejectReason.WORKER_DROPPED,
+                    reject_stage,
+                    telemetry=telemetry,
+                )
+                return
+
+            started, start_reason = batcher.start_revealed_admission(
+                receipt.receipt_id, request
+            )
+            if not started:
+                batcher.cancel_logical_group_reservation(request)
+                reject_stage = "proof_admission"
+                response = batcher.reject_prepared_submission(
+                    request,
+                    RejectReason.BATCH_FILLED,
+                    reject_stage,
+                    telemetry=telemetry,
+                )
+                logger.warning(
+                    "auction_admission_start_rejected window=%d env=%s "
+                    "prompt=%d reason=%s",
+                    receipt.window_start,
+                    environment,
+                    receipt.prompt_idx,
+                    start_reason,
+                )
+                return
+            admission_started = True
+
+            reject_stage = prepared.reject_stage or "proof"
+            response = batcher.accept_prepared_submission(
+                prepared, telemetry=telemetry
+            )
+        except (asyncio.TimeoutError, BrokenProcessPool):
+            cancel_identity_on_exit = identity_reserved and not admission_started
+            reject_stage = "admission_timeout"
+            if request is not None:
+                response = batcher.reject_prepared_submission(
+                    request,
+                    RejectReason.WORKER_DROPPED,
+                    reject_stage,
+                    telemetry=telemetry,
+                )
+            else:
+                response = reject_without_request(
+                    RejectReason.WORKER_DROPPED, reject_stage
+                )
+        except PromptSourceUnavailable:
+            cancel_identity_on_exit = identity_reserved and not admission_started
+            self._prompt_source_unavailable_total += 1
+            reject_stage = "prompt_source"
+            if request is not None:
+                batcher.cancel_logical_group_reservation(request)
+                response = batcher.reject_prepared_submission(
+                    request,
+                    RejectReason.WORKER_DROPPED,
+                    reject_stage,
+                    telemetry=telemetry,
+                )
+            else:
+                response = reject_without_request(
+                    RejectReason.WORKER_DROPPED, reject_stage
+                )
+        except Exception:
+            cancel_identity_on_exit = identity_reserved and not admission_started
+            logger.exception(
+                "auction admission worker failed window=%d env=%s prompt=%d",
+                receipt.window_start,
+                environment,
+                receipt.prompt_idx,
+            )
+            reject_stage = "admission_worker"
+            if request is not None:
+                response = batcher.reject_prepared_submission(
+                    request,
+                    RejectReason.WORKER_DROPPED,
+                    reject_stage,
+                    telemetry=telemetry,
+                )
+            else:
+                response = reject_without_request(
+                    RejectReason.WORKER_DROPPED, reject_stage
+                )
+        finally:
+            if cancel_identity_on_exit and request is not None:
+                batcher.cancel_logical_group_reservation(request)
+            if admission_started and request is not None:
+                batcher.finish_proof_admission(request)
+            if response is None:
+                response = BatchSubmissionResponse(
+                    accepted=False, reason=RejectReason.WORKER_DROPPED
+                )
+            if receipt.terminal and receipt.outcome is not None:
+                response = receipt.outcome
+            else:
+                self._complete_upload_receipt(receipt, response)
+            telemetry.mark_admission_finished()
+            telemetry.refresh_from_batcher(batcher, at_decision=True)
+            telemetry.mark_decision(verified=True)
+            self._record_admission_latency(batcher, telemetry)
+            if (
+                not response.accepted
+                and response.reason is RejectReason.WORKER_DROPPED
+                and (
+                    request is None
+                    or self._worker_drop_refunds_quota(request)
+                )
+            ):
+                self._refund_submission_quota(receipt.miner_hotkey)
+            self._record_raw_terminal(
+                receipt,
+                telemetry,
+                response,
+                stage=reject_stage,
+            )
+            self._admission_active_by_environment[environment] = max(
+                0,
+                self._admission_active_by_environment[environment] - 1,
+            )
+            self._inflight_proofs = max(0, self._inflight_proofs - 1)
+            self._inflight_proofs_by_environment[environment] = max(
+                0,
+                self._inflight_proofs_by_environment[environment] - 1,
+            )
+            self._admission_inflight_items.pop(receipt.receipt_id, None)
+            self._admission_inflight_requests.pop(receipt.receipt_id, None)
+
     async def _submit_worker(
         self,
         submit_queue: asyncio.Queue | None = None,
@@ -3303,6 +4285,9 @@ class ValidatorServer:
                 item = await queue.get()
             except asyncio.CancelledError:
                 return
+            if isinstance(item, _QueuedAuctionSubmission):
+                await self._process_auction_submission(item, queue)
+                continue
             if len(item) == 3:
                 request, batcher, telemetry = item
             else:
@@ -3653,6 +4638,19 @@ class ValidatorServer:
     async def start(self) -> None:
         if self._task is not None:
             return
+        self._admission_materialization_pool = ThreadPoolExecutor(
+            max_workers=MATH_ADMISSION_WORKERS + CODE_ADMISSION_WORKERS,
+            thread_name_prefix="reliquary-problem-load",
+        )
+        self._auction_admission_enabled = True
+        for env_name, batcher in self._active_batchers.items():
+            if (
+                getattr(batcher, "difficulty_auction_enabled", False)
+                and env_name not in self._admission_process_pools
+            ):
+                self._admission_process_pools[env_name] = (
+                    self._new_admission_pool(env_name)
+                )
         config = uvicorn.Config(
             self.app, host=self.host, port=self.port,
             log_level="warning", access_log=False,
@@ -3697,11 +4695,7 @@ class ValidatorServer:
         )
 
     async def stop(self) -> None:
-        registration_task = self._registration_refresh_task
-        if registration_task is not None and not registration_task.done():
-            registration_task.cancel()
-            await asyncio.gather(registration_task, return_exceptions=True)
-        self._registration_refresh_task = None
+        self._auction_admission_enabled = False
         event_loop_task = self._event_loop_monitor_task
         if event_loop_task is not None and not event_loop_task.done():
             event_loop_task.cancel()
@@ -3723,6 +4717,14 @@ class ValidatorServer:
         self._worker_task = None
         self._code_worker_task = None
         self._extra_worker_tasks = []
+        for pool in self._admission_process_pools.values():
+            pool.shutdown(wait=False, cancel_futures=True)
+        self._admission_process_pools = {}
+        self._admission_tokenizer_hashes = {}
+        materialization_pool = self._admission_materialization_pool
+        if materialization_pool is not None:
+            materialization_pool.shutdown(wait=False, cancel_futures=True)
+        self._admission_materialization_pool = None
         if self._server is not None:
             self._server.should_exit = True
         if self._task is not None:
