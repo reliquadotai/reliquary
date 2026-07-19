@@ -3,6 +3,7 @@ from concurrent.futures.process import BrokenProcessPool
 from dataclasses import replace
 import multiprocessing
 import os
+import threading
 import time
 from types import SimpleNamespace
 
@@ -130,6 +131,30 @@ def test_new_admission_pool_prewarms_every_worker(monkeypatch):
         fn is admission_worker_ready for fn, _args in fake_pool.submissions
     )
     assert all(args == (0.05,) for _fn, args in fake_pool.submissions)
+
+
+@pytest.mark.asyncio
+async def test_prepare_admission_pools_runs_outside_event_loop(monkeypatch):
+    environment = "openmathinstruct"
+    batcher = SimpleNamespace(difficulty_auction_enabled=True)
+    server = ValidatorServer()
+    server._auction_admission_enabled = True
+    event_loop_thread = threading.get_ident()
+    calls = []
+    prepared_pool = object()
+
+    def _prepare(env_name, *, batcher=None):
+        calls.append((env_name, batcher, threading.get_ident()))
+        return prepared_pool
+
+    monkeypatch.setattr(server, "_new_admission_pool", _prepare)
+
+    await server.prepare_admission_pools({environment: batcher})
+
+    assert server._admission_process_pools[environment] is prepared_pool
+    assert len(calls) == 1
+    assert calls[0][:2] == (environment, batcher)
+    assert calls[0][2] != event_loop_thread
 
 
 def _request() -> BatchSubmissionRequest:

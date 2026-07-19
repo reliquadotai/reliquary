@@ -2764,6 +2764,11 @@ class ValidationService:
                     )
                     self._window_iteration_stage = "open"
                     self._open_window()
+                    self._window_iteration_stage = "admission_pools"
+                    self._set_window_preparation_stage("admission_pools")
+                    await self.server.prepare_admission_pools(
+                        self._active_batchers
+                    )
                     self._window_iteration_stage = "drand_boundary"
                     await self._wait_for_next_drand_boundary()
                     self._window_iteration_stage = "randomness"

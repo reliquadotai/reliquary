@@ -903,15 +903,6 @@ class ValidatorServer:
             self._runtime_fingerprint = collect_runtime_fingerprint(
                 proof_model=getattr(self.active_batcher, "model", None),
             )
-        if self._auction_admission_enabled:
-            for env_name, env_batcher in batchers.items():
-                if (
-                    getattr(env_batcher, "difficulty_auction_enabled", False)
-                    and env_name not in self._admission_process_pools
-                ):
-                    self._admission_process_pools[env_name] = (
-                        self._new_admission_pool(env_name)
-                    )
 
     def set_active_batcher(self, batcher: GrpoWindowBatcher | None) -> None:
         """Legacy single-env shim. Wraps into a dict and delegates."""
@@ -2153,8 +2144,14 @@ class ValidatorServer:
             return CODE_ADMISSION_WORKERS
         return MATH_ADMISSION_WORKERS
 
-    def _new_admission_pool(self, environment: str) -> ProcessPoolExecutor:
-        batcher = self._active_batchers.get(environment)
+    def _new_admission_pool(
+        self,
+        environment: str,
+        *,
+        batcher: GrpoWindowBatcher | None = None,
+    ) -> ProcessPoolExecutor:
+        if batcher is None:
+            batcher = self._active_batchers.get(environment)
         tokenizer = getattr(batcher, "tokenizer", None)
         backend = getattr(tokenizer, "backend_tokenizer", None)
         serializer = getattr(backend, "to_str", None)
@@ -2198,6 +2195,33 @@ class ValidatorServer:
             self._terminate_admission_pool(pool)
             raise
         return pool
+
+    async def prepare_admission_pools(
+        self,
+        batchers: dict[str, GrpoWindowBatcher],
+    ) -> None:
+        """Prewarm auction workers before a candidate window becomes OPEN."""
+        if not self._auction_admission_enabled:
+            return
+        for environment, batcher in batchers.items():
+            if (
+                not getattr(batcher, "difficulty_auction_enabled", False)
+                or environment in self._admission_process_pools
+            ):
+                continue
+            lock = self._admission_pool_locks.setdefault(
+                environment, asyncio.Lock()
+            )
+            async with lock:
+                if environment in self._admission_process_pools:
+                    continue
+                self._admission_process_pools[environment] = (
+                    await asyncio.to_thread(
+                        self._new_admission_pool,
+                        environment,
+                        batcher=batcher,
+                    )
+                )
 
     @staticmethod
     def _terminate_admission_pool(pool: ProcessPoolExecutor) -> None:
@@ -4643,14 +4667,7 @@ class ValidatorServer:
             thread_name_prefix="reliquary-problem-load",
         )
         self._auction_admission_enabled = True
-        for env_name, batcher in self._active_batchers.items():
-            if (
-                getattr(batcher, "difficulty_auction_enabled", False)
-                and env_name not in self._admission_process_pools
-            ):
-                self._admission_process_pools[env_name] = (
-                    self._new_admission_pool(env_name)
-                )
+        await self.prepare_admission_pools(self._active_batchers)
         config = uvicorn.Config(
             self.app, host=self.host, port=self.port,
             log_level="warning", access_log=False,
