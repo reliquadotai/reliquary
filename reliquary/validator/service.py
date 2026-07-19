@@ -12,6 +12,7 @@ import time
 from typing import Any
 
 from reliquary.constants import (
+    AUCTION_ADMISSION_DRAIN_DEADLINE_SECONDS,
     BATCH_PROMPT_COOLDOWN_WINDOWS,
     COOLDOWN_REBUILD_LOOKBACK,
     COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS,
@@ -1074,18 +1075,14 @@ class ValidationService:
                 return False
             if int(getattr(batcher, "inflight_proof_reservations", 0) or 0):
                 return False
+            if int(getattr(batcher, "pending_upload_precommits", 0) or 0):
+                return False
         return True
 
     async def _freeze_auction_populations(
         self, batchers: list[Any]
     ) -> dict[str, bool]:
-        """Drain pre-deadline work, then freeze each auction pending pool.
-
-        Returns the per-environment drain-timeout state. Once the bounded drain
-        ends, the atomic snapshot marker excludes unfinished preparation from
-        the ranked population. Seal never waits on or races a later commit and
-        an overloaded admission worker can no longer abort the whole window.
-        """
+        """Freeze only a completely drained auction population or abort it."""
         auction_batchers = [
             batcher for batcher in batchers
             if getattr(batcher, "difficulty_auction_enabled", False)
@@ -1095,11 +1092,27 @@ class ValidationService:
 
         loop = asyncio.get_running_loop()
         drain_started = loop.time()
-        drain_deadline = loop.time() + MAX_SEAL_QUEUE_DRAIN_SECONDS
+        drain_deadline = (
+            loop.time() + AUCTION_ADMISSION_DRAIN_DEADLINE_SECONDS
+        )
         while not self._queue_and_proofs_drained():
             if loop.time() >= drain_deadline:
                 break
             await asyncio.sleep(PROOF_ADMISSION_STALL_POLL_SECONDS)
+
+        timed_out = not self._queue_and_proofs_drained()
+        if timed_out:
+            for batcher in auction_batchers:
+                begin_snapshot = getattr(
+                    batcher, "begin_seal_snapshot", None
+                )
+                if callable(begin_snapshot):
+                    begin_snapshot()
+            abort_stats = await self.server.abort_auction_admission(
+                auction_batchers
+            )
+        else:
+            abort_stats = {}
 
         queue_by_env = dict(
             getattr(self.server, "submit_queue_depth_by_environment", {}) or {}
@@ -1127,15 +1140,19 @@ class ValidationService:
 
         for batcher in auction_batchers:
             env_name = _env_name(batcher)
-            timed_out_by_env[env_name] = bool(
-                int(queue_by_env.get(env_name, 0) or 0)
-                or int(inflight_by_env.get(env_name, 0) or 0)
-                or int(getattr(batcher, "pending_proof_reservations", 0) or 0)
-                or int(getattr(batcher, "inflight_proof_reservations", 0) or 0)
+            timed_out_by_env[env_name] = timed_out
+            conservation_fn = getattr(
+                type(batcher), "upload_precommit_conservation", None
+            )
+            conservation = (
+                conservation_fn(batcher)
+                if callable(conservation_fn)
+                else {}
             )
             batcher.auction_seal_drain = {
                 "elapsed_seconds": max(0.0, loop.time() - drain_started),
-                "timed_out": timed_out_by_env[env_name],
+                "timed_out": timed_out,
+                "outcome": "aborted" if timed_out else "complete",
                 "queue_depth_at_snapshot": int(
                     queue_by_env.get(env_name, 0) or 0
                 ),
@@ -1148,24 +1165,34 @@ class ValidationService:
                 "inflight_reservations_at_snapshot": int(
                     getattr(batcher, "inflight_proof_reservations", 0) or 0
                 ),
+                "receipt_conservation": conservation,
+                "abort_terminalization": dict(abort_stats),
             }
-            begin_snapshot = getattr(batcher, "begin_seal_snapshot", None)
-            if callable(begin_snapshot):
-                begin_snapshot()
-
-        if any(timed_out_by_env.values()):
-            for batcher in auction_batchers:
-                env_name = _env_name(batcher)
-                if not timed_out_by_env.get(env_name, False):
-                    continue
+            if timed_out:
+                batcher.auction_admission_aborted = True
                 existing_reason = getattr(batcher, "force_seal_reason", None)
                 if not isinstance(existing_reason, str) or not existing_reason:
-                    batcher.force_seal_reason = "auction_queue_drain_timeout"
+                    batcher.force_seal_reason = "auction_admission_drain_abort"
+            else:
+                if not conservation.get("conserved", True) or conservation.get(
+                    "pending", 0
+                ):
+                    raise RuntimeError(
+                        f"receipt conservation failed for {env_name}: "
+                        f"{conservation}"
+                    )
+                begin_snapshot = getattr(
+                    batcher, "begin_seal_snapshot", None
+                )
+                if callable(begin_snapshot):
+                    begin_snapshot()
+
+        if timed_out:
             logger.warning(
-                "Window %d auction queue drain reached %.1fs; froze pending "
-                "populations and dropped remaining queued submissions",
+                "Window %d auction admission drain reached %.1fs; aborted "
+                "the complete window without ranking or training",
                 self._window_n,
-                MAX_SEAL_QUEUE_DRAIN_SECONDS,
+                AUCTION_ADMISSION_DRAIN_DEADLINE_SECONDS,
             )
         return timed_out_by_env
 
@@ -1313,7 +1340,7 @@ class ValidationService:
         drain_timeouts = await self._freeze_auction_populations(batchers)
         for env_name, timed_out in drain_timeouts.items():
             if timed_out:
-                reasons[env_name] = "auction_queue_drain_timeout"
+                reasons[env_name] = "auction_admission_drain_abort"
 
         if not reasons:
             return "sealed"
@@ -1567,6 +1594,24 @@ class ValidationService:
             self._enqueue_aborted_window(
                 failure_stage="beacon_verification",
                 failure_type="InvalidBeacon",
+            )
+            self.server.set_active_batchers({})
+            self._active_batchers = {}
+            self._set_state(WindowState.READY)
+            return
+
+        if any(
+            bool(getattr(b, "auction_admission_aborted", False))
+            for b in self._active_batchers.values()
+        ):
+            logger.error(
+                "Window %d: admission drain aborted; skipping ranking, "
+                "rewards, training and checkpoint publication",
+                self._window_n,
+            )
+            self._enqueue_aborted_window(
+                failure_stage="admission_drain",
+                failure_type="AdmissionDrainTimeout",
             )
             self.server.set_active_batchers({})
             self._active_batchers = {}
@@ -2407,6 +2452,20 @@ class ValidationService:
                 )
                 for env_name, env_batcher in batcher_dict.items()
             },
+            "upload_precommit_conservation_by_environment": {
+                env_name: (
+                    env_batcher.upload_precommit_conservation()
+                    if callable(
+                        getattr(
+                            type(env_batcher),
+                            "upload_precommit_conservation",
+                            None,
+                        )
+                    )
+                    else {}
+                )
+                for env_name, env_batcher in batcher_dict.items()
+            },
             "window_opened_wall_ts_by_environment": {
                 env_name: getattr(env_batcher, "window_opened_wall_ts", None)
                 for env_name, env_batcher in batcher_dict.items()
@@ -2511,6 +2570,26 @@ class ValidationService:
             ),
             "force_seal_reason_by_environment": {
                 name: getattr(batcher, "force_seal_reason", None)
+                for name, batcher in self._active_batchers.items()
+            },
+            "auction_seal_drain_by_environment": {
+                name: dict(
+                    getattr(batcher, "auction_seal_drain", {}) or {}
+                )
+                for name, batcher in self._active_batchers.items()
+            },
+            "upload_precommit_conservation_by_environment": {
+                name: (
+                    batcher.upload_precommit_conservation()
+                    if callable(
+                        getattr(
+                            type(batcher),
+                            "upload_precommit_conservation",
+                            None,
+                        )
+                    )
+                    else {}
+                )
                 for name, batcher in self._active_batchers.items()
             },
             "batch": [],
