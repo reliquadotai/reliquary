@@ -174,6 +174,8 @@ class WeightOnlyValidator:
         ema: dict[str, float] = {}
         alpha = EMA_ALPHA
         for record in sorted(archives, key=lambda r: int(r["window_start"])):
+            if record.get("window_status", "completed") == "aborted":
+                continue
             rewards: dict[str, float] = record.get("rewards_by_hotkey", {})
             all_hotkeys = set(ema) | set(rewards)
             for hk in all_hotkeys:

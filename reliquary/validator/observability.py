@@ -141,6 +141,7 @@ class SubmitTelemetry:
     t_body_started: float | None = None
     t_body_completed: float | None = None
     body_read_ms: float | None = None
+    body_parse_ms: float | None = None
     ingress_ms: float | None = None
     upload_precommit_status: str = "none"
     precommit_arrival_ts: float | None = None
@@ -166,6 +167,9 @@ class SubmitTelemetry:
     queue_wait_ms: float | None = None
     reward_grading_ms: float | None = None
     admission_commit_ms: float | None = None
+    admission_prepare_ms: float | None = None
+    commit_lock_wait_ms: float | None = None
+    commit_ms: float | None = None
     verify_ms: float | None = None
     total_ms: float | None = None
     legacy_merkle_status: str | None = None
@@ -355,6 +359,7 @@ class SubmitTelemetry:
             "content_length_bytes": self.content_length_bytes,
             "payload_sha256_lead": self.payload_sha256_lead,
             "body_read_ms": self.body_read_ms,
+            "body_parse_ms": self.body_parse_ms,
             "ingress_ms": self.ingress_ms,
             "upload_precommit_status": self.upload_precommit_status,
             "precommit_arrival_ts": self.precommit_arrival_ts,
@@ -363,6 +368,9 @@ class SubmitTelemetry:
             "queue_wait_ms": self.queue_wait_ms,
             "reward_grading_ms": self.reward_grading_ms,
             "admission_commit_ms": self.admission_commit_ms,
+            "admission_prepare_ms": self.admission_prepare_ms,
+            "commit_lock_wait_ms": self.commit_lock_wait_ms,
+            "commit_ms": self.commit_ms,
             "verify_ms": self.verify_ms,
             "total_ms": self.total_ms,
             "protocol_version": self.protocol_version,
@@ -396,6 +404,7 @@ class SubmitTelemetry:
             "decision_ts": self.t_decision,
             "payload_bytes": self.payload_bytes,
             "body_read_ms": self.body_read_ms,
+            "body_parse_ms": self.body_parse_ms,
             "ingress_ms": self.ingress_ms,
             "upload_precommit_status": self.upload_precommit_status,
             "precommit_arrival_ts": self.precommit_arrival_ts,
@@ -407,6 +416,9 @@ class SubmitTelemetry:
             "queue_wait_ms": self.queue_wait_ms,
             "reward_grading_ms": self.reward_grading_ms,
             "admission_commit_ms": self.admission_commit_ms,
+            "admission_prepare_ms": self.admission_prepare_ms,
+            "commit_lock_wait_ms": self.commit_lock_wait_ms,
+            "commit_ms": self.commit_ms,
             "verify_ms": self.verify_ms,
             "total_ms": self.total_ms,
         }
@@ -418,6 +430,7 @@ class SubmitTelemetry:
             "content_length_bytes": self.content_length_bytes,
             "payload_sha256_lead": self.payload_sha256_lead,
             "body_read_ms": self.body_read_ms,
+            "body_parse_ms": self.body_parse_ms,
             "ingress_ms": self.ingress_ms,
             "upload_precommit_status": self.upload_precommit_status,
             "precommit_arrival_ts": self.precommit_arrival_ts,
@@ -426,6 +439,9 @@ class SubmitTelemetry:
             "queue_wait_ms": self.queue_wait_ms,
             "reward_grading_ms": self.reward_grading_ms,
             "admission_commit_ms": self.admission_commit_ms,
+            "admission_prepare_ms": self.admission_prepare_ms,
+            "commit_lock_wait_ms": self.commit_lock_wait_ms,
+            "commit_ms": self.commit_ms,
             "total_ms": self.total_ms,
         }
 

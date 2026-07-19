@@ -40,6 +40,8 @@ _RETRY_DELAYS = (1.0, 2.0, 4.0)
 # Miners running against slow links (Targon port-forward etc.) benefit further.
 _DEFAULT_TIMEOUT = 60.0
 _PRECOMMIT_HEADER = "X-Reliquary-Precommit"
+_DRAND_BOUNDARY_SAFETY_SECONDS = 1.0
+_DRAND_BOUNDARY_SETTLE_SECONDS = 0.05
 
 
 class NoValidatorFoundError(RuntimeError):
@@ -204,18 +206,34 @@ async def submit_batch_v2(
     ``wallet`` and retain the legacy pre-signed behavior.
     """
 
+    drand_chain_info: dict[str, Any] | None = None
     if wallet is not None and drand_round_fn is None:
         from reliquary.infrastructure.chain import compute_current_drand_round
         from reliquary.infrastructure.drand import get_current_chain
 
-        chain_info = get_current_chain()
+        drand_chain_info = get_current_chain()
 
         def drand_round_fn() -> int:
             return compute_current_drand_round(
                 time.time(),
-                chain_info["genesis_time"],
-                chain_info["period"],
+                drand_chain_info["genesis_time"],
+                drand_chain_info["period"],
             )
+
+    async def _wait_for_safe_drand_round() -> None:
+        if drand_chain_info is None:
+            return
+        from reliquary.infrastructure.chain import (
+            seconds_until_next_drand_boundary,
+        )
+
+        remaining = seconds_until_next_drand_boundary(
+            time.time(),
+            drand_chain_info["genesis_time"],
+            drand_chain_info["period"],
+        )
+        if 0.0 < remaining < _DRAND_BOUNDARY_SAFETY_SECONDS:
+            await asyncio.sleep(remaining + _DRAND_BOUNDARY_SETTLE_SECONDS)
 
     static_payload = (
         request.model_dump_json().encode("utf-8")
@@ -313,6 +331,7 @@ async def submit_batch_v2(
 
     own_client = client is None
     cli = client or httpx.AsyncClient(timeout=timeout)
+    await _wait_for_safe_drand_round()
     payload, precommit = _finalize_attempt(1)
     receipt_id: str | None = None
     last_exc: Exception | None = None
@@ -364,6 +383,7 @@ async def submit_batch_v2(
                         and attempt < len(_RETRY_DELAYS)
                     ):
                         await asyncio.sleep(delay)
+                        await _wait_for_safe_drand_round()
                         payload, precommit = _finalize_attempt(attempt + 1)
                         continue
                     return BatchSubmissionResponse(
