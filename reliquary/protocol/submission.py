@@ -373,12 +373,16 @@ class Verdict(BaseModel):
     reject_reason: str | None = None
     payload_bytes: int | None = None
     body_read_ms: float | None = None
+    body_parse_ms: float | None = None
     ingress_ms: float | None = None
     upload_precommit_status: str | None = None
     precommit_arrival_ts: float | None = None
     queue_wait_ms: float | None = None
     reward_grading_ms: float | None = None
     admission_commit_ms: float | None = None
+    admission_prepare_ms: float | None = None
+    commit_lock_wait_ms: float | None = None
+    commit_ms: float | None = None
     verify_ms: float | None = None
     total_ms: float | None = None
 

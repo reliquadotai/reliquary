@@ -75,6 +75,28 @@ async def test_replay_ema_empty_archives():
 
 
 @pytest.mark.asyncio
+async def test_replay_ema_ignores_aborted_window_tombstone():
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    archives = [
+        {
+            "window_start": 10,
+            "window_status": "completed",
+            "rewards_by_hotkey": {"hk": 0.5},
+        },
+        {
+            "window_start": 11,
+            "window_status": "aborted",
+            "rewards_by_hotkey": {},
+        },
+    ]
+
+    assert WeightOnlyValidator._replay_ema(archives) == (
+        WeightOnlyValidator._replay_ema(archives[:1])
+    )
+
+
+@pytest.mark.asyncio
 async def test_submit_weights_maps_hotkeys_to_uids():
     """_submit_weights calls chain.set_weights with correct uid mapping."""
     from reliquary.validator.weight_only import WeightOnlyValidator

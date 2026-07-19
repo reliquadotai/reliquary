@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 import uvicorn
@@ -557,6 +558,13 @@ class _Health(BaseModel):
     proof_verification_inflight_by_environment: dict[str, int] = Field(
         default_factory=dict
     )
+    event_loop_lag_ms: dict[str, float | None] = Field(default_factory=dict)
+    endpoint_latency_ms: dict[str, dict[str, float | None]] = Field(
+        default_factory=dict
+    )
+    admission_latency_ms_by_environment: dict[
+        str, dict[str, dict[str, float | None]]
+    ] = Field(default_factory=dict)
     valid_submissions_count: int | None = None
     distinct_valid_prompt_count: int | None = None
     last_valid_submission_ts: float | None = None
@@ -680,6 +688,10 @@ class _Health(BaseModel):
     archive_last_upload_failure_ts: float | None = None
     archive_last_uploaded_window: int | None = None
     archive_last_failed_window: int | None = None
+    archive_last_enqueued_window: int | None = None
+    archive_archives_enqueued_total: int = 0
+    archive_enqueue_gaps_total: int = 0
+    archive_last_enqueue_gap: dict[str, int] | None = None
     prompt_sources: dict[str, dict[str, Any]] = Field(default_factory=dict)
     prompt_source_unavailable_total: int = 0
     training_kl_reference: dict[str, Any] = Field(default_factory=dict)
@@ -706,7 +718,7 @@ class ValidatorServer:
         self._registration_refresh_callback: (
             Callable[[], Awaitable[bool]] | None
         ) = None
-        self._registration_refresh_lock = asyncio.Lock()
+        self._registration_refresh_task: asyncio.Task[None] | None = None
         self._last_registration_refresh_attempt = 0.0
         self._registration_cache_refresh_attempts_total = 0
         self._registration_cache_refresh_successes_total = 0
@@ -770,6 +782,20 @@ class ValidatorServer:
         self._inflight_proofs_by_environment: collections.Counter[str] = (
             collections.Counter()
         )
+        self._event_loop_lag_samples_ms: collections.deque[float] = (
+            collections.deque(maxlen=600)
+        )
+        self._endpoint_latency_samples_ms: dict[
+            str, collections.deque[float]
+        ] = collections.defaultdict(lambda: collections.deque(maxlen=600))
+        self._admission_latency_samples_ms: dict[
+            str, dict[str, collections.deque[float]]
+        ] = collections.defaultdict(
+            lambda: collections.defaultdict(
+                lambda: collections.deque(maxlen=600)
+            )
+        )
+        self._event_loop_monitor_task: asyncio.Task[None] | None = None
         from reliquary.protocol.submission import WindowState
         self._current_state: WindowState = WindowState.READY
         self._current_checkpoint = None  # ManifestEntry | None
@@ -1067,40 +1093,9 @@ class ValidatorServer:
             or hotkey not in self._registered_hotkeys
         )
         refresh_due = age is None or age > REGISTERED_HOTKEY_CACHE_TTL_SECONDS
-        should_refresh = missing or refresh_due
-        callback = self._registration_refresh_callback
+        if missing or refresh_due:
+            self._schedule_registration_refresh(now=now)
 
-        if (
-            should_refresh
-            and callback is not None
-            and now - self._last_registration_refresh_attempt
-            >= REGISTERED_HOTKEY_REFRESH_MIN_INTERVAL_SECONDS
-        ):
-            async with self._registration_refresh_lock:
-                now = time.time()
-                age = self.registration_cache_age(now=now)
-                missing = (
-                    self._registered_hotkeys is None
-                    or hotkey not in self._registered_hotkeys
-                )
-                refresh_due = (
-                    age is None or age > REGISTERED_HOTKEY_CACHE_TTL_SECONDS
-                )
-                if (
-                    (missing or refresh_due)
-                    and now - self._last_registration_refresh_attempt
-                    >= REGISTERED_HOTKEY_REFRESH_MIN_INTERVAL_SECONDS
-                ):
-                    self._last_registration_refresh_attempt = now
-                    try:
-                        await asyncio.wait_for(
-                            callback(),
-                            timeout=REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS,
-                        )
-                    except Exception:
-                        logger.exception("registered-hotkey cache refresh failed")
-
-        age = self.registration_cache_age()
         if (
             self._registered_hotkeys is None
             or age is None
@@ -1108,8 +1103,46 @@ class ValidatorServer:
         ):
             return RejectReason.REGISTRATION_UNAVAILABLE
         if hotkey not in self._registered_hotkeys:
+            # A fresh snapshot is authoritative. A stale snapshot may simply
+            # predate a new registration, so ask the miner to retry while the
+            # singleflight background refresh runs instead of blocking this
+            # request on a chain RPC.
+            if age > REGISTERED_HOTKEY_CACHE_TTL_SECONDS:
+                return RejectReason.REGISTRATION_UNAVAILABLE
             return RejectReason.HOTKEY_NOT_REGISTERED
         return None
+
+    def _schedule_registration_refresh(self, *, now: float) -> None:
+        callback = self._registration_refresh_callback
+        if callback is None:
+            return
+        if (
+            self._registration_refresh_task is not None
+            and not self._registration_refresh_task.done()
+        ):
+            return
+        if (
+            now - self._last_registration_refresh_attempt
+            < REGISTERED_HOTKEY_REFRESH_MIN_INTERVAL_SECONDS
+        ):
+            return
+
+        self._last_registration_refresh_attempt = now
+
+        async def _refresh() -> None:
+            try:
+                await asyncio.wait_for(
+                    callback(),
+                    timeout=REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("registered-hotkey cache refresh failed")
+
+        self._registration_refresh_task = asyncio.create_task(
+            _refresh(), name="registration_cache_on_demand_refresh"
+        )
 
     def _observe_legacy_merkle(
         self,
@@ -1339,6 +1372,18 @@ class ValidatorServer:
         auction_enabled = bool(
             getattr(batcher, "difficulty_auction_enabled", False)
         )
+        rejection_snapshot_fn = getattr(
+            type(batcher), "rejection_telemetry_snapshot", None
+        )
+        rejection_snapshot = (
+            rejection_snapshot_fn(batcher)
+            if callable(rejection_snapshot_fn)
+            else {
+                "grader_failures": dict(
+                    getattr(batcher, "grader_failures", {})
+                )
+            }
+        )
         distinct_fn = getattr(
             batcher,
             (
@@ -1434,7 +1479,10 @@ class ValidatorServer:
                 getattr(batcher, "expensive_proof_failures_by_operator", {})
             ),
             "grader_failures": dict(
-                getattr(batcher, "grader_failures", {})
+                rejection_snapshot.get("grader_failures", {})
+            ),
+            "auction_seal_drain": dict(
+                getattr(batcher, "auction_seal_drain", {}) or {}
             ),
         }
 
@@ -1468,7 +1516,15 @@ class ValidatorServer:
             archive_queue = {}
         reject_counts: dict[str, int] = dict(self._recent_reject_counts)
         if batcher is not None:
-            for reason, count in getattr(batcher, "reject_counts", {}).items():
+            snapshot_fn = getattr(
+                type(batcher), "rejection_telemetry_snapshot", None
+            )
+            batcher_rejects = (
+                snapshot_fn(batcher).get("reject_counts", {})
+                if callable(snapshot_fn)
+                else getattr(batcher, "reject_counts", {})
+            )
+            for reason, count in batcher_rejects.items():
                 reject_counts[reason] = max(reject_counts.get(reason, 0), count)
         prompt_sources = self._prompt_source_health()
         window_environments = {
@@ -1481,6 +1537,18 @@ class ValidatorServer:
         logical_group_dedup: dict[str, dict[str, int]] = {}
         grader_failures_by_environment: dict[str, dict[str, int]] = {}
         for env_name, env_batcher in self._active_batchers.items():
+            snapshot_fn = getattr(
+                type(env_batcher), "rejection_telemetry_snapshot", None
+            )
+            rejection_snapshot = (
+                snapshot_fn(env_batcher)
+                if callable(snapshot_fn)
+                else {
+                    "grader_failures": dict(
+                        getattr(env_batcher, "grader_failures", {})
+                    )
+                }
+            )
             reservations = getattr(
                 env_batcher, "logical_group_reservation_count", 0
             )
@@ -1504,7 +1572,7 @@ class ValidatorServer:
             grader_failures_by_environment[env_name] = {
                 str(reason): int(count)
                 for reason, count in dict(
-                    getattr(env_batcher, "grader_failures", {})
+                    rejection_snapshot.get("grader_failures", {})
                 ).items()
             }
         health_status = (
@@ -1582,6 +1650,21 @@ class ValidatorServer:
             proof_verification_inflight_by_environment=(
                 self.proof_verification_inflight_by_environment
             ),
+            event_loop_lag_ms=self._latency_summary(
+                self._event_loop_lag_samples_ms
+            ),
+            endpoint_latency_ms={
+                path: self._latency_summary(samples)
+                for path, samples in self._endpoint_latency_samples_ms.items()
+                if path in {"/health", "/state", "/submit/precommit", "/submit"}
+            },
+            admission_latency_ms_by_environment={
+                env_name: {
+                    metric: self._latency_summary(samples)
+                    for metric, samples in metrics.items()
+                }
+                for env_name, metrics in self._admission_latency_samples_ms.items()
+            },
             # These legacy scalar fields reflect the first active environment.
             # During an auction they intentionally report admitted candidates,
             # not only the winners proven later at seal.
@@ -1806,6 +1889,16 @@ class ValidatorServer:
             archive_last_failed_window=archive_queue.get(
                 "last_failed_window"
             ),
+            archive_last_enqueued_window=archive_queue.get(
+                "last_enqueued_window"
+            ),
+            archive_archives_enqueued_total=int(
+                archive_queue.get("archives_enqueued_total", 0) or 0
+            ),
+            archive_enqueue_gaps_total=int(
+                archive_queue.get("enqueue_gaps_total", 0) or 0
+            ),
+            archive_last_enqueue_gap=archive_queue.get("last_enqueue_gap"),
             prompt_sources=prompt_sources,
             training_kl_reference=dict(self._training_kl_reference_state),
             prompt_source_unavailable_total=(
@@ -1917,9 +2010,23 @@ class ValidatorServer:
             STALE_ROUND rejections, the bug pre-this-fix).
             """
             request.state.t_arrival = time.time()
+            request_started = time.perf_counter()
             try:
                 return await call_next(request)
             finally:
+                path = request.url.path
+                if path in {
+                    "/health",
+                    "/state",
+                    "/submit/precommit",
+                    "/submit",
+                }:
+                    self._endpoint_latency_samples_ms[path].append(
+                        max(
+                            0.0,
+                            (time.perf_counter() - request_started) * 1000.0,
+                        )
+                    )
                 release = getattr(
                     request.state, "release_upload_precommit", None
                 )
@@ -1981,7 +2088,8 @@ class ValidatorServer:
                 and request.protocol_version != FORCED_SEED_PROTOCOL_VERSION
             ):
                 return reject(RejectReason.SEED_MISMATCH)
-            if not verify_precommit_signature(
+            precommit_signature_valid = await asyncio.to_thread(
+                verify_precommit_signature,
                 miner_hotkey=request.miner_hotkey,
                 window_start=request.window_start,
                 prompt_idx=request.prompt_idx,
@@ -1995,7 +2103,8 @@ class ValidatorServer:
                 protocol_version=request.protocol_version,
                 nonce=request.nonce,
                 precommit_signature=request.precommit_signature,
-            ):
+            )
+            if not precommit_signature_valid:
                 return reject(RejectReason.BAD_ENVELOPE_SIGNATURE)
 
             # Exact retries are idempotent even if the drand boundary advanced
@@ -2132,13 +2241,35 @@ class ValidatorServer:
                 upload_deadline_ts=expires_at_wall,
             )
 
-        @app.post("/submit", response_model=BatchSubmissionResponse)
+        @app.post(
+            "/submit",
+            response_model=BatchSubmissionResponse,
+            openapi_extra={
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": BatchSubmissionRequest.model_json_schema()
+                        }
+                    },
+                }
+            },
+        )
         async def submit(
-            request: BatchSubmissionRequest,
             http_request: Request,
             response: Response,
         ) -> BatchSubmissionResponse:
             from reliquary.protocol.submission import WindowState
+            raw_body = await http_request.body()
+            parse_started = time.perf_counter()
+            try:
+                request = await asyncio.to_thread(
+                    BatchSubmissionRequest.model_validate_json,
+                    raw_body,
+                )
+            except ValidationError as exc:
+                raise RequestValidationError(exc.errors()) from exc
+            body_parse_ms = (time.perf_counter() - parse_started) * 1000.0
             # ASGI middleware stamped this. Falls back to time.time() if a
             # caller bypasses the middleware (e.g. some test harnesses).
             t_arrival = getattr(http_request.state, "t_arrival", None)
@@ -2148,16 +2279,12 @@ class ValidatorServer:
                 getattr(http_request.state, "body_bytes_received", 0) or 0
             )
             if payload_bytes <= 0:
-                payload_bytes = await asyncio.to_thread(
-                    _serialized_submission_bytes,
-                    request,
-                )
+                payload_bytes = len(raw_body)
             payload_sha256 = str(
                 getattr(http_request.state, "body_sha256", "") or ""
             ).lower()
             if not payload_sha256:
-                canonical_body = request.model_dump_json().encode("utf-8")
-                payload_sha256 = hashlib.sha256(canonical_body).hexdigest()
+                payload_sha256 = hashlib.sha256(raw_body).hexdigest()
             body_completed_at = float(
                 getattr(http_request.state, "body_completed_at", time.time())
             )
@@ -2190,6 +2317,7 @@ class ValidatorServer:
                 t_body_completed=body_completed_at,
                 queue_depth_at_arrival=self.submit_queue_depth,
             )
+            telemetry.body_parse_ms = body_parse_ms
             if http_request.headers.get(PRECOMMIT_HEADER):
                 telemetry.apply_upload_precommit("present")
             precommit_receipt: _UploadPrecommitReceipt | None = None
@@ -2280,7 +2408,8 @@ class ValidatorServer:
                     if self.active_batcher is not None
                     else ""
                 )
-                if not verify_envelope_signature(
+                envelope_signature_valid = await asyncio.to_thread(
+                    verify_envelope_signature,
                     miner_hotkey=hk,
                     window_start=request.window_start,
                     prompt_idx=request.prompt_idx,
@@ -2290,7 +2419,8 @@ class ValidatorServer:
                     randomness=_randomness_for_sig,
                     nonce=request.nonce,
                     envelope_signature=request.envelope_signature,
-                ):
+                )
+                if not envelope_signature_valid:
                     # CONNECTION-PRIMING DEFENCE — force socket teardown.
                     #
                     # Without this header, an HTTP/1.1 keep-alive client
@@ -2528,7 +2658,8 @@ class ValidatorServer:
                     required_protocol_version=FORCED_SEED_PROTOCOL_VERSION,
                 )
 
-            legacy_merkle_status = self._observe_legacy_merkle(
+            legacy_merkle_status = await asyncio.to_thread(
+                self._observe_legacy_merkle,
                 request,
                 telemetry,
                 env_name=submission_env_name,
@@ -2972,6 +3103,7 @@ class ValidatorServer:
                     self._finish_proof_admission(batcher, request)
                 telemetry.refresh_from_batcher(batcher, at_decision=True)
                 telemetry.mark_decision(verified=True)
+                self._record_admission_latency(batcher, telemetry)
                 if (
                     not resp.accepted
                     and resp.reason is RejectReason.WORKER_DROPPED
@@ -3380,6 +3512,7 @@ class ValidatorServer:
                         self._inflight_proofs_by_environment.pop(env_name, None)
                 telemetry.refresh_from_batcher(batcher, at_decision=True)
                 telemetry.mark_decision(verified=True)
+                self._record_admission_latency(batcher, telemetry)
                 quota_refunded = False
                 if (
                     not response.accepted
@@ -3462,6 +3595,61 @@ class ValidatorServer:
                 if not getattr(batcher, "difficulty_auction_enabled", False):
                     await asyncio.to_thread(_try_empty_cuda_cache)
 
+    @staticmethod
+    def _latency_summary(
+        samples: collections.abc.Iterable[float],
+    ) -> dict[str, float | None]:
+        ordered = sorted(float(value) for value in samples)
+        if not ordered:
+            return {"p50": None, "p95": None, "p99": None, "max": None}
+
+        def percentile(fraction: float) -> float:
+            index = min(len(ordered) - 1, int((len(ordered) - 1) * fraction))
+            return round(ordered[index], 3)
+
+        return {
+            "p50": percentile(0.50),
+            "p95": percentile(0.95),
+            "p99": percentile(0.99),
+            "max": round(ordered[-1], 3),
+        }
+
+    def _record_admission_latency(
+        self,
+        batcher: Any,
+        telemetry: SubmitTelemetry,
+    ) -> None:
+        env_name = str(
+            getattr(getattr(batcher, "env", None), "name", "unknown")
+        )
+        metrics = self._admission_latency_samples_ms[env_name]
+        for name in (
+            "queue_wait_ms",
+            "reward_grading_ms",
+            "admission_prepare_ms",
+            "commit_lock_wait_ms",
+            "commit_ms",
+            "total_ms",
+        ):
+            value = getattr(telemetry, name, None)
+            if isinstance(value, numbers.Real) and not isinstance(value, bool):
+                metrics[name].append(float(value))
+
+    async def _monitor_event_loop_lag(self) -> None:
+        interval = 0.25
+        loop = asyncio.get_running_loop()
+        expected = loop.time() + interval
+        while True:
+            try:
+                await asyncio.sleep(max(0.0, expected - loop.time()))
+            except asyncio.CancelledError:
+                return
+            now = loop.time()
+            self._event_loop_lag_samples_ms.append(
+                max(0.0, (now - expected) * 1000.0)
+            )
+            expected = now + interval
+
     async def start(self) -> None:
         if self._task is not None:
             return
@@ -3495,6 +3683,9 @@ class ValidatorServer:
                 for index in range(1, CODE_ADMISSION_WORKERS)
             ),
         ]
+        self._event_loop_monitor_task = asyncio.create_task(
+            self._monitor_event_loop_lag(), name="validator_event_loop_monitor"
+        )
         await asyncio.sleep(0)
         logger.info(
             "Validator HTTP server listening on %s:%d "
@@ -3506,6 +3697,16 @@ class ValidatorServer:
         )
 
     async def stop(self) -> None:
+        registration_task = self._registration_refresh_task
+        if registration_task is not None and not registration_task.done():
+            registration_task.cancel()
+            await asyncio.gather(registration_task, return_exceptions=True)
+        self._registration_refresh_task = None
+        event_loop_task = self._event_loop_monitor_task
+        if event_loop_task is not None and not event_loop_task.done():
+            event_loop_task.cancel()
+            await asyncio.gather(event_loop_task, return_exceptions=True)
+        self._event_loop_monitor_task = None
         worker_tasks = [
             task
             for task in (

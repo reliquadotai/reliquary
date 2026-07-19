@@ -227,14 +227,17 @@ async def test_async_verify_failure_flips_beacon_invalid(monkeypatch):
 @pytest.mark.asyncio
 async def test_train_and_publish_skips_when_beacon_invalid(monkeypatch):
     """End-to-end gate: a window with beacon_invalid=True must NOT
-    seal, train, publish, or archive. Miners' submissions for that
-    window are dropped on the floor — same end-state as a sync-rejected
-    beacon, just delivered late by the background verify.
+    seal, train, publish, or emit a completed archive. It must emit one
+    non-rewarding tombstone so the failed window remains auditable.
     """
     svc = _make_test_service(use_drand=True)
     svc._active_batcher = _make_test_batcher()
+    svc._active_batcher.window_start = 7
+    svc._active_batcher.env = MagicMock(name="openmathinstruct")
     svc._active_batcher.beacon_invalid = True
     svc._window_n = 7
+    svc._window_archive_enqueued = False
+    svc._window_iteration_stage = "seal_train_archive"
 
     # If any of these get called, the gate failed.
     seal_called = MagicMock()
@@ -246,8 +249,22 @@ async def test_train_and_publish_skips_when_beacon_invalid(monkeypatch):
         archive_called()
 
     monkeypatch.setattr(svc, "_archive_window", _no_archive)
+    tombstones = []
+
+    class _StubQueue:
+        def enqueue(self, window_start, archive):
+            tombstones.append((window_start, archive))
+
+    monkeypatch.setattr(
+        "reliquary.infrastructure.archive_queue.get_archive_queue",
+        lambda: _StubQueue(),
+    )
 
     await svc._train_and_publish()
 
     assert seal_called.call_count == 0, "seal_batch should not run for an invalidated window"
     assert archive_called.call_count == 0, "_archive_window should not run for an invalidated window"
+    assert len(tombstones) == 1
+    assert tombstones[0][0] == 7
+    assert tombstones[0][1]["window_status"] == "aborted"
+    assert tombstones[0][1]["failure_stage"] == "beacon_verification"

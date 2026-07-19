@@ -81,6 +81,10 @@ class ArchiveQueue:
         self._last_upload_failure_ts: float | None = None
         self._last_uploaded_window: int | None = None
         self._last_failed_window: int | None = None
+        self._last_enqueued_window: int | None = None
+        self._archives_enqueued_total = 0
+        self._enqueue_gaps_total = 0
+        self._last_enqueue_gap: dict[str, int] | None = None
 
     # ------------------------------------------------------------------
     # Producer API — called from the validator's main loop
@@ -100,6 +104,20 @@ class ArchiveQueue:
         with open(tmp_path, "wb") as f:
             f.write(compressed)
         os.replace(tmp_path, final_path)
+
+        if (
+            self._last_enqueued_window is not None
+            and window_start > self._last_enqueued_window + 1
+        ):
+            self._enqueue_gaps_total += 1
+            self._last_enqueue_gap = {
+                "after": self._last_enqueued_window,
+                "before": int(window_start),
+            }
+        self._last_enqueued_window = max(
+            int(window_start), self._last_enqueued_window or int(window_start)
+        )
+        self._archives_enqueued_total += 1
 
         logger.info(
             "ArchiveQueue: enqueued window %d (%d bytes, path=%s)",
@@ -160,6 +178,12 @@ class ArchiveQueue:
             "last_upload_failure_ts": self._last_upload_failure_ts,
             "last_uploaded_window": self._last_uploaded_window,
             "last_failed_window": self._last_failed_window,
+            "last_enqueued_window": self._last_enqueued_window,
+            "archives_enqueued_total": self._archives_enqueued_total,
+            "enqueue_gaps_total": self._enqueue_gaps_total,
+            "last_enqueue_gap": dict(self._last_enqueue_gap)
+            if self._last_enqueue_gap is not None
+            else None,
         }
 
     async def _try_upload(self, path: Path) -> bool:

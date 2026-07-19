@@ -114,6 +114,8 @@ def _filter_archives_for_env(archives: list[dict], env_name: str) -> list[dict]:
     """
     out = []
     for archive in archives:
+        if archive.get("window_status", "completed") == "aborted":
+            continue
         # Determine the archive's env(s). New shape has "environments" list;
         # old shape has "environment" singular. Both may be present together.
         archive_envs: list[str] = archive.get("environments") or []
@@ -451,6 +453,8 @@ class ValidationService:
             retention_windows=HASH_DEDUP_RETENTION_WINDOWS,
         )
         self._late_drops: dict[str, dict[str, int]] = {}
+        self._window_archive_enqueued = False
+        self._window_iteration_stage = "startup"
 
         self.server = ValidatorServer(host=http_host, port=http_port)
         self.server.set_late_drop_callback(self.record_late_drop)
@@ -1134,49 +1138,88 @@ class ValidationService:
                 return False
         return True
 
-    async def _freeze_auction_populations(self, batchers: list[Any]) -> bool:
+    async def _freeze_auction_populations(
+        self, batchers: list[Any]
+    ) -> dict[str, bool]:
         """Drain pre-deadline work, then freeze each auction pending pool.
 
-        Returns ``True`` when the normal drain budget was exhausted. Pending
-        queue entries are then rejected by ``start_proof_admission``; already
-        started grading is allowed one final bounded interval to finish so seal
-        can never race a mutation of the ranked population.
+        Returns the per-environment drain-timeout state. Once the bounded drain
+        ends, the atomic snapshot marker excludes unfinished preparation from
+        the ranked population. Seal never waits on or races a later commit and
+        an overloaded admission worker can no longer abort the whole window.
         """
         auction_batchers = [
             batcher for batcher in batchers
             if getattr(batcher, "difficulty_auction_enabled", False)
         ]
         if not auction_batchers:
-            return False
+            return {}
 
         loop = asyncio.get_running_loop()
+        drain_started = loop.time()
         drain_deadline = loop.time() + MAX_SEAL_QUEUE_DRAIN_SECONDS
         while not self._queue_and_proofs_drained():
             if loop.time() >= drain_deadline:
                 break
             await asyncio.sleep(PROOF_ADMISSION_STALL_POLL_SECONDS)
 
-        timed_out = not self._queue_and_proofs_drained()
+        queue_by_env = dict(
+            getattr(self.server, "submit_queue_depth_by_environment", {}) or {}
+        )
+        inflight_by_env = dict(
+            getattr(
+                self.server,
+                "proof_verification_inflight_by_environment",
+                {},
+            )
+            or {}
+        )
+        timed_out_by_env: dict[str, bool] = {}
+
+        def _env_name(active_batcher: Any) -> str:
+            candidate = getattr(
+                getattr(active_batcher, "env", None), "name", None
+            )
+            if isinstance(candidate, str):
+                return candidate
+            for configured_name, configured_batcher in self._active_batchers.items():
+                if configured_batcher is active_batcher:
+                    return str(configured_name)
+            return "unknown"
+
         for batcher in auction_batchers:
+            env_name = _env_name(batcher)
+            timed_out_by_env[env_name] = bool(
+                int(queue_by_env.get(env_name, 0) or 0)
+                or int(inflight_by_env.get(env_name, 0) or 0)
+                or int(getattr(batcher, "pending_proof_reservations", 0) or 0)
+                or int(getattr(batcher, "inflight_proof_reservations", 0) or 0)
+            )
+            batcher.auction_seal_drain = {
+                "elapsed_seconds": max(0.0, loop.time() - drain_started),
+                "timed_out": timed_out_by_env[env_name],
+                "queue_depth_at_snapshot": int(
+                    queue_by_env.get(env_name, 0) or 0
+                ),
+                "inflight_workers_at_snapshot": int(
+                    inflight_by_env.get(env_name, 0) or 0
+                ),
+                "pending_reservations_at_snapshot": int(
+                    getattr(batcher, "pending_proof_reservations", 0) or 0
+                ),
+                "inflight_reservations_at_snapshot": int(
+                    getattr(batcher, "inflight_proof_reservations", 0) or 0
+                ),
+            }
             begin_snapshot = getattr(batcher, "begin_seal_snapshot", None)
             if callable(begin_snapshot):
                 begin_snapshot()
 
-        # Once frozen, pending items are cheap drops. A request that already
-        # started may still hold the batcher lock while grading; do not race it.
-        quiesce_deadline = loop.time() + MAX_SEAL_QUEUE_DRAIN_SECONDS
-        while any(
-            int(getattr(batcher, "inflight_proof_reservations", 0) or 0)
-            for batcher in auction_batchers
-        ):
-            if loop.time() >= quiesce_deadline:
-                raise RuntimeError(
-                    "auction admission failed to quiesce before seal"
-                )
-            await asyncio.sleep(PROOF_ADMISSION_STALL_POLL_SECONDS)
-
-        if timed_out:
+        if any(timed_out_by_env.values()):
             for batcher in auction_batchers:
+                env_name = _env_name(batcher)
+                if not timed_out_by_env.get(env_name, False):
+                    continue
                 existing_reason = getattr(batcher, "force_seal_reason", None)
                 if not isinstance(existing_reason, str) or not existing_reason:
                     batcher.force_seal_reason = "auction_queue_drain_timeout"
@@ -1186,7 +1229,7 @@ class ValidationService:
                 self._window_n,
                 MAX_SEAL_QUEUE_DRAIN_SECONDS,
             )
-        return timed_out
+        return timed_out_by_env
 
     def _seconds_since_last_valid_submission(self, batcher) -> float | None:
         counter = getattr(batcher, "seconds_since_last_valid_submission", None)
@@ -1329,8 +1372,10 @@ class ValidationService:
 
             await asyncio.sleep(min(PROOF_ADMISSION_STALL_POLL_SECONDS, remaining))
 
-        if await self._freeze_auction_populations(batchers):
-            reasons["auction"] = "auction_queue_drain_timeout"
+        drain_timeouts = await self._freeze_auction_populations(batchers)
+        for env_name, timed_out in drain_timeouts.items():
+            if timed_out:
+                reasons[env_name] = "auction_queue_drain_timeout"
 
         if not reasons:
             return "sealed"
@@ -1581,6 +1626,10 @@ class ValidationService:
                 "Window %d: dropping seal+train+archive — beacon invalid",
                 self._window_n,
             )
+            self._enqueue_aborted_window(
+                failure_stage="beacon_verification",
+                failure_type="InvalidBeacon",
+            )
             self.server.set_active_batchers({})
             self._active_batchers = {}
             self._set_state(WindowState.READY)
@@ -1685,7 +1734,15 @@ class ValidationService:
         # and archives remain per-window; this gate only protects model state.
         combined_reject_counts: dict[str, int] = {}
         for _b in self._active_batchers.values():
-            for _k, _v in dict(getattr(_b, "reject_counts", {})).items():
+            _snapshot_fn = getattr(
+                type(_b), "rejection_telemetry_snapshot", None
+            )
+            _reject_counts = (
+                _snapshot_fn(_b).get("reject_counts", {})
+                if callable(_snapshot_fn)
+                else getattr(_b, "reject_counts", {})
+            )
+            for _k, _v in dict(_reject_counts).items():
                 combined_reject_counts[_k] = combined_reject_counts.get(_k, 0) + _v
         flat_window_batch = [
             group for env_batch in window_batches.values() for group in env_batch
@@ -1979,8 +2036,12 @@ class ValidationService:
 
         try:
             await self._archive_window(self._active_batchers, sealed)
-        except Exception:
+        except Exception as exc:
             logger.exception("window archive failed")
+            self._enqueue_aborted_window(
+                failure_stage="archive_enqueue",
+                failure_type=type(exc).__name__,
+            )
 
         self.server.set_active_batchers({})
         self._active_batchers = {}
@@ -2184,6 +2245,24 @@ class ValidationService:
         grader_failures_by_environment: dict[str, dict[str, int]] = {}
 
         for env_name, batcher in batcher_dict.items():
+            rejection_snapshot_fn = getattr(
+                type(batcher), "rejection_telemetry_snapshot", None
+            )
+            rejection_snapshot = (
+                rejection_snapshot_fn(batcher)
+                if callable(rejection_snapshot_fn)
+                else {
+                    "reject_counts": dict(
+                        getattr(batcher, "reject_counts", {})
+                    ),
+                    "rejected_submissions": list(
+                        getattr(batcher, "rejected_submissions", [])
+                    ),
+                    "grader_failures": dict(
+                        getattr(batcher, "grader_failures", {})
+                    ),
+                }
+            )
             env_obj = self.envs.get(env_name, self.env)
             env_batch, env_rewards = sealed_dict.get(env_name, ([], {}))
 
@@ -2294,7 +2373,7 @@ class ValidationService:
                     runner_entry["rollout_hashes"] = [h.hex() for h in s.rollout_hashes]
                 runners_up.append(runner_entry)
 
-            for r in getattr(batcher, "rejected_submissions", []):
+            for r in rejection_snapshot["rejected_submissions"]:
                 rejected_entries.append({
                     "hotkey": r.hotkey,
                     "prompt_idx": r.prompt_idx,
@@ -2316,7 +2395,7 @@ class ValidationService:
                     combined_rewarded_not_selected.get(hk, 0.0) + r
                 )
 
-            for k, v in dict(getattr(batcher, "reject_counts", {})).items():
+            for k, v in rejection_snapshot["reject_counts"].items():
                 combined_reject_counts[k] = combined_reject_counts.get(k, 0) + v
 
             reservations = getattr(
@@ -2342,7 +2421,7 @@ class ValidationService:
             env_grader_failures = {
                 str(reason): int(count)
                 for reason, count in dict(
-                    getattr(batcher, "grader_failures", {})
+                    rejection_snapshot["grader_failures"]
                 ).items()
             }
             grader_failures_by_environment[env_name] = env_grader_failures
@@ -2372,6 +2451,8 @@ class ValidationService:
             for env_name, env_batcher in batcher_dict.items()
         }
         archive = {
+            "archive_schema_version": 2,
+            "window_status": "completed",
             "window_start": first_batcher.window_start,
             "validator_hotkey": self.wallet.hotkey.ss58_address,  # provenance
             "randomness": first_batcher.randomness,
@@ -2380,6 +2461,12 @@ class ValidationService:
             "force_seal_reason": getattr(first_batcher, "force_seal_reason", None),
             "force_seal_reason_by_environment": {
                 env_name: getattr(env_batcher, "force_seal_reason", None)
+                for env_name, env_batcher in batcher_dict.items()
+            },
+            "auction_seal_drain_by_environment": {
+                env_name: dict(
+                    getattr(env_batcher, "auction_seal_drain", {}) or {}
+                )
                 for env_name, env_batcher in batcher_dict.items()
             },
             "window_opened_wall_ts_by_environment": {
@@ -2432,6 +2519,95 @@ class ValidationService:
         # hours, and queued payloads survive process restarts.
         from reliquary.infrastructure.archive_queue import get_archive_queue
         get_archive_queue().enqueue(first_batcher.window_start, archive)
+        self._window_archive_enqueued = True
+
+    def _enqueue_aborted_window(
+        self,
+        *,
+        failure_stage: str,
+        failure_type: str,
+    ) -> None:
+        """Durably record an opened window that could not complete.
+
+        Tombstones carry no rewards or training data. They preserve archive
+        continuity and make the failure auditable without exposing exception
+        messages or partially validated miner payloads.
+        """
+        if (
+            getattr(self, "_window_archive_enqueued", False)
+            or not self._active_batchers
+        ):
+            return
+        if getattr(self, "_window_iteration_stage", "seal_train_archive") not in {
+            "open",
+            "drand_boundary",
+            "randomness",
+            "active",
+            "seal_wait",
+            "seal_train_archive",
+            "archive_enqueue",
+        }:
+            return
+        first_batcher = next(iter(self._active_batchers.values()))
+        env_names = list(self._active_batchers)
+        validator_hotkey = str(
+            getattr(getattr(getattr(self, "wallet", None), "hotkey", None),
+                    "ss58_address", "")
+        )
+        try:
+            kl_reference = dict(self.kl_reference_state)
+        except (AttributeError, TypeError, ValueError):
+            kl_reference = {}
+        archive = {
+            "archive_schema_version": 2,
+            "window_status": "aborted",
+            "window_start": int(first_batcher.window_start),
+            "validator_hotkey": validator_hotkey,
+            "randomness": str(getattr(first_batcher, "randomness", "")),
+            "environment": env_names[0] if env_names else "",
+            "environments": env_names,
+            "failure_stage": str(failure_stage),
+            "failure_type": str(failure_type),
+            "force_seal_reason": getattr(
+                first_batcher, "force_seal_reason", None
+            ),
+            "force_seal_reason_by_environment": {
+                name: getattr(batcher, "force_seal_reason", None)
+                for name, batcher in self._active_batchers.items()
+            },
+            "batch": [],
+            "runners_up": [],
+            "rejected": [],
+            "reject_summary": {},
+            "server_reject_summary": {},
+            "rewards_by_hotkey": {},
+            "rewarded_but_not_selected_by_hotkey": {},
+            "training_quarantine": {
+                "quarantined": True,
+                "reasons": ["aborted_window"],
+                "metrics": {},
+            },
+            "training_accumulator": {
+                "schema_version": 1,
+                "trained": False,
+                "blocked_reason": "aborted_window",
+            },
+            "training_kl_reference": kl_reference,
+            "late_drops": {
+                hotkey: dict(counts)
+                for hotkey, counts in getattr(self, "_late_drops", {}).items()
+            },
+        }
+        from reliquary.infrastructure.archive_queue import get_archive_queue
+
+        get_archive_queue().enqueue(first_batcher.window_start, archive)
+        self._window_archive_enqueued = True
+        logger.error(
+            "Window %d archived as aborted stage=%s error_type=%s",
+            first_batcher.window_start,
+            failure_stage,
+            failure_type,
+        )
 
     def _log_startup_config_banner(self) -> None:
         cp = self._checkpoint_store.current_manifest()
@@ -2570,6 +2746,8 @@ class ValidationService:
         try:
             while True:
                 try:
+                    self._window_archive_enqueued = False
+                    self._window_iteration_stage = "registration_refresh"
                     if self._candidate_window_n is not None:
                         self._set_window_preparation_stage(
                             "registration_refresh"
@@ -2577,10 +2755,15 @@ class ValidationService:
                     await self._refresh_registered_hotkeys(
                         reason="window_boundary"
                     )
+                    self._window_iteration_stage = "open"
                     self._open_window()
+                    self._window_iteration_stage = "drand_boundary"
                     await self._wait_for_next_drand_boundary()
+                    self._window_iteration_stage = "randomness"
                     await self._set_window_randomness(subtensor)
                     self._activate_window()
+                    self._window_iteration_stage = "active"
+                    self._window_iteration_stage = "seal_wait"
                     seal_reason = await self._wait_for_window_seal()
                     if seal_reason == "sealed":
                         logger.info(
@@ -2598,6 +2781,7 @@ class ValidationService:
                             self._window_n, seal_reason,
                         )
 
+                    self._window_iteration_stage = "seal_train_archive"
                     await self._train_and_publish()
 
                     # Persist the cooldown on a fixed window cadence, independent
@@ -2619,6 +2803,13 @@ class ValidationService:
                     raise
                 except Exception as exc:
                     logger.exception("Window iteration failed")
+                    try:
+                        self._enqueue_aborted_window(
+                            failure_stage=self._window_iteration_stage,
+                            failure_type=type(exc).__name__,
+                        )
+                    except Exception:
+                        logger.exception("Failed to enqueue aborted-window tombstone")
                     self._rollback_preopen_window(exc)
                     # Reset to READY so the next iteration doesn't spin on error state.
                     self.server.set_active_batchers({})

@@ -206,9 +206,9 @@ def _current_drand_round_at_send() -> int:
     """Drand quicknet round currently in progress at wall-clock now.
 
     Called just before POSTing /submit so the attached round matches what
-    the validator sees at receipt (modulo the 1-round tolerance). Uses
-    chain params cached at process start; one drand period of skew is
-    tolerated by the validator.
+    the validator sees at precommit receipt. Production is zero-tolerance;
+    ``submit_batch_v2`` avoids signing inside the final second before a round
+    boundary so normal scheduling latency cannot stale an honest precommit.
     """
     from reliquary.infrastructure.chain import compute_current_drand_round
     from reliquary.infrastructure.drand import get_current_chain

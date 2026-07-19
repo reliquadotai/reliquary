@@ -562,6 +562,11 @@ class GrpoWindowBatcher:
         self._verify_signature = verify_signature_fn
 
         self._lock = threading.Lock()
+        # Admission preparation is deliberately concurrent in auction mode.
+        # Rejection counters remain shared mutable telemetry, so protect them
+        # independently instead of putting the expensive preparation path back
+        # behind the candidate commit lock.
+        self._reject_lock = threading.Lock()
         # Validator-owned economic identity reservations. This lock is
         # separate from ``_lock`` because HTTP admission must atomically claim
         # a group before it enters the potentially long GPU queue.
@@ -993,8 +998,12 @@ class GrpoWindowBatcher:
         prevents a dequeued straggler from entering ``_accept_locked`` after
         ``_prove_ranked`` has copied the pending population.
         """
-        with self._proof_admission_lock:
-            self._seal_snapshot_started = True
+        # The commit path takes these locks in the same order.  Returning from
+        # this method therefore guarantees that no commit which observed the
+        # old generation is still mutating the auction population.
+        with self._lock:
+            with self._proof_admission_lock:
+                self._seal_snapshot_started = True
 
     @property
     def proof_grading_capacity_used(self) -> int:
@@ -1042,6 +1051,15 @@ class GrpoWindowBatcher:
     def logical_group_reservation_count(self) -> int:
         with self._logical_group_lock:
             return len(self._logical_group_reservations)
+
+    def rejection_telemetry_snapshot(self) -> dict[str, Any]:
+        """Return a thread-safe copy of concurrently updated reject telemetry."""
+        with self._reject_lock:
+            return {
+                "reject_counts": dict(self.reject_counts),
+                "rejected_submissions": list(self.rejected_submissions),
+                "grader_failures": dict(self.grader_failures),
+            }
 
     @property
     def logical_group_duplicate_rejects(self) -> int:
@@ -1415,12 +1433,24 @@ class GrpoWindowBatcher:
         re-do the same check with the same timestamp — both bad. Drand is
         an arrival-time check, decided once.
         """
-        with self._lock:
-            return self._accept_locked(
-                request,
-                telemetry=telemetry,
-                reward_computation=reward_computation,
-            )
+        if not self.difficulty_auction_enabled:
+            # Legacy admission proves inline and retains its historical serial
+            # mutation contract.
+            with self._lock:
+                return self._accept_locked(
+                    request,
+                    telemetry=telemetry,
+                    reward_computation=reward_computation,
+                )
+
+        # Auction preparation is CPU/sandbox work and is safe to run for
+        # independent candidates concurrently.  _accept_locked takes the
+        # commit lock only for the final population mutation.
+        return self._accept_locked(
+            request,
+            telemetry=telemetry,
+            reward_computation=reward_computation,
+        )
 
     def compute_submission_rewards(
         self,
@@ -1564,6 +1594,7 @@ class GrpoWindowBatcher:
     ) -> BatchSubmissionResponse:
         hk = request.miner_hotkey
         pi = request.prompt_idx
+        preparation_started = time.perf_counter()
 
         def reject(
             reason: RejectReason,
@@ -1718,9 +1749,10 @@ class GrpoWindowBatcher:
         if isinstance(reward_error, GraderInfrastructureError):
             exc = reward_error
             reason = exc.reason or "unknown"
-            self.grader_failures[reason] = (
-                self.grader_failures.get(reason, 0) + 1
-            )
+            with self._reject_lock:
+                self.grader_failures[reason] = (
+                    self.grader_failures.get(reason, 0) + 1
+                )
             # A worker crash may be triggered by hostile submitted code. Never
             # convert it into a zero reward (which could manufacture auction
             # difficulty), but also do not mislabel it as proof of a false
@@ -1921,20 +1953,48 @@ class GrpoWindowBatcher:
                 accepted=True, reason=RejectReason.ACCEPTED
             )
 
-        # The HTTP worker releases its in-flight marker after this returns, but
-        # the request remains reachable from the auction pool until seal. Mark
-        # it so byte accounting transfers to the retained bucket instead of
-        # being refunded prematurely.
-        self.confirm_logical_group_reservation(request)
-        request._retain_payload = True
-        self._pending.append(pending)
-        self._submissions_per_prompt.setdefault(
-            request.prompt_idx, []
-        ).append(pending)
-        self.last_valid_submission_at = self._time_fn()
-        self.last_valid_submission_wall_ts = self._wall_clock()
-        # Lock-free read in /state — see ``__init__`` for rationale.
-        self.pending_count = len(self._pending)
+        # Only this short section serializes auction candidates. Re-check every
+        # mutable capacity gate after preparation: several workers may have
+        # passed the optimistic checks above concurrently.
+        lock_wait_started = time.perf_counter()
+        if telemetry is not None:
+            telemetry.admission_prepare_ms = max(
+                0.0, (lock_wait_started - preparation_started) * 1000.0
+            )
+        self._lock.acquire()
+        commit_started = time.perf_counter()
+        if telemetry is not None:
+            telemetry.commit_lock_wait_ms = max(
+                0.0, (commit_started - lock_wait_started) * 1000.0
+            )
+        try:
+            if self.seal_snapshot_started:
+                self.cancel_logical_group_reservation(request)
+                return reject(RejectReason.BATCH_FILLED, "seal_snapshot")
+            existing = self._submissions_per_prompt.get(request.prompt_idx, [])
+            if len(existing) >= MAX_SUBMISSIONS_PER_PROMPT:
+                self.cancel_logical_group_reservation(request)
+                return reject(RejectReason.PROMPT_FULL, "prompt_capacity")
+
+            # The HTTP worker releases its in-flight marker after this returns,
+            # but the request remains reachable from the auction pool until
+            # seal. Transfer its byte accounting to the retained bucket.
+            self.confirm_logical_group_reservation(request)
+            request._retain_payload = True
+            self._pending.append(pending)
+            self._submissions_per_prompt.setdefault(
+                request.prompt_idx, []
+            ).append(pending)
+            self.last_valid_submission_at = self._time_fn()
+            self.last_valid_submission_wall_ts = self._wall_clock()
+            # Lock-free read in /state — see ``__init__`` for rationale.
+            self.pending_count = len(self._pending)
+        finally:
+            if telemetry is not None:
+                telemetry.commit_ms = max(
+                    0.0, (time.perf_counter() - commit_started) * 1000.0
+                )
+            self._lock.release()
 
         # No count-based seal: the window seals only on the collection deadline
         # (``poll_deadline``), so a fast miner on an easy prompt can no longer
@@ -2847,7 +2907,10 @@ class GrpoWindowBatcher:
         reject_stage: str | None = None,
         decision_ts: float | None = None,
     ) -> BatchSubmissionResponse:
-        self.reject_counts[reason.value] = self.reject_counts.get(reason.value, 0) + 1
+        with self._reject_lock:
+            self.reject_counts[reason.value] = (
+                self.reject_counts.get(reason.value, 0) + 1
+            )
 
         if (
             hotkey is not None
@@ -2868,10 +2931,12 @@ class GrpoWindowBatcher:
                         )
 
         if hotkey is not None and prompt_idx is not None:
-            already = sum(
-                1 for r in self.rejected_submissions if r.hotkey == hotkey
-            )
-            if already < REJECTED_LIST_CAP_PER_HOTKEY:
+            with self._reject_lock:
+                already = sum(
+                    1 for r in self.rejected_submissions if r.hotkey == hotkey
+                )
+                should_record = already < REJECTED_LIST_CAP_PER_HOTKEY
+            if should_record:
                 # Anti-tuning: never surface the GRAIL sketch diff to miners.
                 # All other reasons get the diagnostics computed up to the
                 # rejection point. A proof-stage reject passes the admission
@@ -2883,8 +2948,7 @@ class GrpoWindowBatcher:
                     telemetry = None
                     reject_stage = None
                     decision_ts = None
-                self.rejected_submissions.append(
-                    RejectedSubmission(
+                rejected = RejectedSubmission(
                         hotkey=hotkey,
                         prompt_idx=prompt_idx,
                         reason=reason.value,
@@ -2911,7 +2975,16 @@ class GrpoWindowBatcher:
                             telemetry.archive_fields() if telemetry else None
                         ),
                     )
-                )
+                with self._reject_lock:
+                    # Re-check under the lock so concurrent rejects cannot
+                    # exceed the per-hotkey forensic cap.
+                    already = sum(
+                        1
+                        for entry in self.rejected_submissions
+                        if entry.hotkey == hotkey
+                    )
+                    if already < REJECTED_LIST_CAP_PER_HOTKEY:
+                        self.rejected_submissions.append(rejected)
         return BatchSubmissionResponse(accepted=False, reason=reason)
 
     # ----------------------------- accessors -----------------------------
