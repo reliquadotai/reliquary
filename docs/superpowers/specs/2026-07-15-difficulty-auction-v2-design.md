@@ -39,8 +39,9 @@ slot: every winner receives one uniform `pool_per_env / B_BATCH` slot.
   the environment is actually activated. Preparation time cannot consume the
   miner's collection interval.
 - At the deadline, new admission stops. Work received before the deadline is
-  given at most `MAX_SEAL_QUEUE_DRAIN_SECONDS = 60` seconds to quiesce before the
-  pending population is frozen.
+  given at most `MAX_SEAL_QUEUE_DRAIN_SECONDS = 60` seconds to commit before the
+  pending population is atomically frozen. Unfinished preparation is excluded,
+  refunded, and reported as a late `BATCH_FILLED`; it can never abort a window.
 - There is no count-triggered early seal in auction mode. A fast miner cannot
   close the window while slower hard-prompt generations are still running.
 
@@ -58,7 +59,9 @@ quota but no prompt or auction slot. The receipt's precommit-time drand
 observation is authoritative for the reveal; submitted drand never affects
 rank. Direct bodies remain compatible before the collection cutoff.
 
-The worker then performs the bounded non-GPU path:
+The worker then performs the bounded non-GPU path concurrently. CPU/sandbox
+preparation never holds the auction population lock; only the final mutable
+gate recheck and append are serialized:
 
 - canonical prompt and token binding;
 - signature and window-randomness binding;
@@ -78,8 +81,9 @@ never become a zero reward:
 
 - retryable service failures return `WORKER_DROPPED`, cancel the logical claim,
   and refund submission quota;
-- an ambiguous worker crash returns `REWARD_MISMATCH` and consumes the claim,
-  preventing a crash-triggering candidate from obtaining free retries.
+- an ambiguous worker crash returns `WORKER_DROPPED` and consumes the claim and
+  normal quota, preventing a crash-triggering candidate from obtaining free
+  retries without falsely asserting that its reward claim was disproven.
 
 ## 4. Difficulty Score And Eligibility
 
@@ -175,6 +179,11 @@ Reservations are atomic before queue insertion and released on every reject,
 drop, outage, seal, and cancellation path. Math and Code queues are isolated so
 a pathological Code submission cannot head-of-line block Math admission.
 
+Seal is a liveness boundary, not a process-wide quiescence requirement. Once
+the snapshot generation closes, late workers may finish their private
+preparation but cannot mutate the ranked pool. The validator proceeds with the
+frozen population and records drain exhaustion independently per environment.
+
 ## 8. Reward And Training Semantics
 
 Each environment receives half of the window emission pool in the canonical
@@ -219,6 +228,13 @@ older dashboards. Candidate rows include rank, score components, operator,
 proof status, selection status, proof budgets, wall time, cap skips, and entropy
 source. Code grader infrastructure failures are archived separately from
 candidate reward outcomes.
+
+Every activated window produces one durable archive lifecycle record:
+`window_status="completed"` for a normal auction or
+`window_status="aborted"` for an unexpected post-open failure. An aborted
+record is a non-rewarding, non-training tombstone. Consumers skip it for EMA,
+cooldown, dedup, and training while retaining an explicit contiguous audit
+trail.
 
 ## 10. Rollout And Rollback
 
