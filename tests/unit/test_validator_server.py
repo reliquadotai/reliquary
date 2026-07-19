@@ -13,6 +13,7 @@ from reliquary.constants import (
     FORCED_SEED_PROTOCOL_VERSION,
     M_ROLLOUTS,
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
+    REGISTERED_HOTKEY_STALE_GRACE_SECONDS,
 )
 from reliquary.environment.virtual_parquet import PromptSourceUnavailable
 from reliquary.protocol.legacy_merkle import (
@@ -765,25 +766,18 @@ def test_prompt_source_outage_is_retryable_quota_neutral_and_visible(fail_at):
     assert health["prompt_sources"][FakeEnv.name]["status"] == "degraded"
 
 
-def _registration_server(refresh_callback):
+def _registration_server():
     from reliquary.protocol.submission import WindowState
 
     server = ValidatorServer()
     server.set_active_batcher(_batcher(window_start=500))
     server.set_current_state(WindowState.OPEN)
-    server.configure_registration_gate(refresh_callback)
+    server.configure_registration_gate()
     return server
 
 
 def test_registered_hotkey_passes_without_refresh():
-    refresh_calls = 0
-
-    async def refresh():
-        nonlocal refresh_calls
-        refresh_calls += 1
-        return True
-
-    server = _registration_server(refresh)
+    server = _registration_server()
     server.set_registered_hotkeys(
         {_TEST_KEYPAIR.ss58_address},
         operator_by_hotkey={_TEST_KEYPAIR.ss58_address: "operator-a"},
@@ -793,20 +787,10 @@ def test_registered_hotkey_passes_without_refresh():
     )
 
     assert response.json()["accepted"] is True
-    assert refresh_calls == 0
 
 
-def test_registration_cache_miss_schedules_refresh_without_spending_quota():
-    refresh_calls = 0
-    server = None
-
-    async def refresh():
-        nonlocal refresh_calls
-        refresh_calls += 1
-        server.set_registered_hotkeys({_TEST_KEYPAIR.ss58_address})
-        return True
-
-    server = _registration_server(refresh)
+def test_registration_cache_miss_never_schedules_rpc_or_spends_quota():
+    server = _registration_server()
     response = TestClient(server.app).post(
         "/submit", json=_request().model_dump(mode="json"),
     )
@@ -816,10 +800,7 @@ def test_registration_cache_miss_schedules_refresh_without_spending_quota():
 
 
 def test_unregistered_hotkey_is_rejected_without_spending_quota():
-    async def refresh():
-        return True
-
-    server = _registration_server(refresh)
+    server = _registration_server()
     server.set_registered_hotkeys({"some-other-hotkey"})
     response = TestClient(server.app).post(
         "/submit", json=_request().model_dump(mode="json"),
@@ -833,10 +814,7 @@ def test_unregistered_hotkey_is_rejected_without_spending_quota():
 
 
 def test_missing_registration_snapshot_fails_closed():
-    async def refresh():
-        return False
-
-    server = _registration_server(refresh)
+    server = _registration_server()
     response = TestClient(server.app).post(
         "/submit", json=_request().model_dump(mode="json"),
     )
@@ -846,10 +824,7 @@ def test_missing_registration_snapshot_fails_closed():
 
 
 def test_recent_last_known_good_registration_survives_refresh_failure():
-    async def refresh():
-        raise ConnectionError("chain unavailable")
-
-    server = _registration_server(refresh)
+    server = _registration_server()
     server.set_registered_hotkeys(
         {_TEST_KEYPAIR.ss58_address},
         refreshed_at=time.time() - 400,
@@ -862,13 +837,10 @@ def test_recent_last_known_good_registration_survives_refresh_failure():
 
 
 def test_expired_registration_snapshot_fails_closed():
-    async def refresh():
-        return False
-
-    server = _registration_server(refresh)
+    server = _registration_server()
     server.set_registered_hotkeys(
         {_TEST_KEYPAIR.ss58_address},
-        refreshed_at=time.time() - 901,
+        refreshed_at=time.time() - REGISTERED_HOTKEY_STALE_GRACE_SECONDS - 1,
     )
     response = TestClient(server.app).post(
         "/submit", json=_request().model_dump(mode="json"),
@@ -878,10 +850,7 @@ def test_expired_registration_snapshot_fails_closed():
 
 
 def test_health_reports_registration_gate_state():
-    async def refresh():
-        return True
-
-    server = _registration_server(refresh)
+    server = _registration_server()
     server.set_registered_hotkeys(
         {_TEST_KEYPAIR.ss58_address},
         operator_by_hotkey={_TEST_KEYPAIR.ss58_address: "operator-a"},
@@ -896,6 +865,7 @@ def test_health_reports_registration_gate_state():
     assert health["registration_cache_stale"] is False
     assert health["registration_cache_usable"] is True
     assert health["registration_cache_age_seconds"] >= 0
+    assert health["registration_cache_next_refresh_ts"] > time.time()
     assert health["chain_client_fingerprint"]["bittensor_version"]
     assert health["chain_client_fingerprint"][
         "async_substrate_interface_version"
@@ -925,10 +895,7 @@ def test_health_preserves_registration_refresh_failure_after_recovery():
 
 
 def test_health_degrades_before_registration_cache_becomes_unusable():
-    async def refresh():
-        return False
-
-    server = _registration_server(refresh)
+    server = _registration_server()
     server.set_registered_hotkeys(
         {_TEST_KEYPAIR.ss58_address},
         refreshed_at=(
@@ -944,10 +911,7 @@ def test_health_degrades_before_registration_cache_becomes_unusable():
 
 
 def test_health_degrades_when_registration_cache_is_unavailable():
-    async def refresh():
-        return False
-
-    server = _registration_server(refresh)
+    server = _registration_server()
 
     health = TestClient(server.app).get("/health").json()
 

@@ -254,12 +254,13 @@ MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW = 2
 # environment after ownership is resolved from the window's metagraph snapshot.
 MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW = 4
 
-# Registered-hotkey admission cache. The validator refreshes the metagraph on
-# this cadence and once on a cache miss. A last-known-good snapshot may survive
-# a short chain outage, but admission fails closed after the grace period.
-REGISTERED_HOTKEY_CACHE_TTL_SECONDS = 300.0
-REGISTERED_HOTKEY_STALE_GRACE_SECONDS = 900.0
-REGISTERED_HOTKEY_REFRESH_MIN_INTERVAL_SECONDS = 15.0
+# Registered-hotkey admission cache. Registration changes at chain cadence, not
+# submission cadence: refresh once per tempo-equivalent interval at a quiescent
+# pre-window boundary. Request handling only reads the immutable snapshot.
+REGISTERED_HOTKEY_CACHE_TTL_SECONDS = float(360 * BLOCK_TIME_SECONDS)
+REGISTERED_HOTKEY_STALE_GRACE_SECONDS = float(
+    2 * REGISTERED_HOTKEY_CACHE_TTL_SECONDS
+)
 REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS = 20.0
 
 # After the B-th distinct prompt records a seal-trigger drand round, admit only

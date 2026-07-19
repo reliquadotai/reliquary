@@ -24,7 +24,7 @@ import numbers
 import secrets
 import time
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any, Callable
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -66,8 +66,6 @@ from reliquary.constants import (
     MAX_SUBMISSIONS_PER_PROMPT,
     MAX_TRUNCATED_PER_SUBMISSION,
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
-    REGISTERED_HOTKEY_REFRESH_MIN_INTERVAL_SECONDS,
-    REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS,
     REGISTERED_HOTKEY_STALE_GRACE_SECONDS,
     SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS,
     SPARSE_VALID_IDLE_SEAL_SECONDS,
@@ -634,6 +632,7 @@ class _Health(BaseModel):
     registration_cache_age_seconds: float | None = None
     registration_cache_stale: bool | None = None
     registration_cache_usable: bool | None = None
+    registration_cache_next_refresh_ts: float | None = None
     registration_cache_refresh_attempts_total: int = 0
     registration_cache_refresh_successes_total: int = 0
     registration_cache_refresh_failures_total: int = 0
@@ -715,11 +714,6 @@ class ValidatorServer:
         self._registered_hotkeys: frozenset[str] | None = None
         self._operator_by_hotkey: dict[str, str] = {}
         self._registration_refreshed_at: float | None = None
-        self._registration_refresh_callback: (
-            Callable[[], Awaitable[bool]] | None
-        ) = None
-        self._registration_refresh_task: asyncio.Task[None] | None = None
-        self._last_registration_refresh_attempt = 0.0
         self._registration_cache_refresh_attempts_total = 0
         self._registration_cache_refresh_successes_total = 0
         self._registration_cache_refresh_failures_total = 0
@@ -1013,12 +1007,8 @@ class ValidatorServer:
     def set_current_checkpoint(self, entry) -> None:
         self._current_checkpoint = entry
 
-    def configure_registration_gate(
-        self,
-        refresh_callback: Callable[[], Awaitable[bool]],
-    ) -> None:
-        """Arm registered-hotkey admission for the production service."""
-        self._registration_refresh_callback = refresh_callback
+    def configure_registration_gate(self) -> None:
+        """Arm admission against the service-managed metagraph snapshot."""
         self._registration_gate_enforced = True
 
     def set_registered_hotkeys(
@@ -1088,14 +1078,6 @@ class ValidatorServer:
 
         now = time.time()
         age = self.registration_cache_age(now=now)
-        missing = (
-            self._registered_hotkeys is None
-            or hotkey not in self._registered_hotkeys
-        )
-        refresh_due = age is None or age > REGISTERED_HOTKEY_CACHE_TTL_SECONDS
-        if missing or refresh_due:
-            self._schedule_registration_refresh(now=now)
-
         if (
             self._registered_hotkeys is None
             or age is None
@@ -1103,46 +1085,12 @@ class ValidatorServer:
         ):
             return RejectReason.REGISTRATION_UNAVAILABLE
         if hotkey not in self._registered_hotkeys:
-            # A fresh snapshot is authoritative. A stale snapshot may simply
-            # predate a new registration, so ask the miner to retry while the
-            # singleflight background refresh runs instead of blocking this
-            # request on a chain RPC.
+            # A stale snapshot may predate a new registration. The service will
+            # retry at the next quiescent boundary; requests never trigger RPCs.
             if age > REGISTERED_HOTKEY_CACHE_TTL_SECONDS:
                 return RejectReason.REGISTRATION_UNAVAILABLE
             return RejectReason.HOTKEY_NOT_REGISTERED
         return None
-
-    def _schedule_registration_refresh(self, *, now: float) -> None:
-        callback = self._registration_refresh_callback
-        if callback is None:
-            return
-        if (
-            self._registration_refresh_task is not None
-            and not self._registration_refresh_task.done()
-        ):
-            return
-        if (
-            now - self._last_registration_refresh_attempt
-            < REGISTERED_HOTKEY_REFRESH_MIN_INTERVAL_SECONDS
-        ):
-            return
-
-        self._last_registration_refresh_attempt = now
-
-        async def _refresh() -> None:
-            try:
-                await asyncio.wait_for(
-                    callback(),
-                    timeout=REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("registered-hotkey cache refresh failed")
-
-        self._registration_refresh_task = asyncio.create_task(
-            _refresh(), name="registration_cache_on_demand_refresh"
-        )
 
     def _observe_legacy_merkle(
         self,
@@ -1502,6 +1450,12 @@ class ValidatorServer:
             if self._registration_gate_enforced
             else None
         )
+        registration_cache_next_refresh_ts = (
+            self._registration_refreshed_at
+            + REGISTERED_HOTKEY_CACHE_TTL_SECONDS
+            if self._registration_refreshed_at is not None
+            else None
+        )
         accumulator = self._training_accumulator_state
         training_publish = self._training_publish_state
         try:
@@ -1786,6 +1740,9 @@ class ValidatorServer:
             registration_cache_age_seconds=registration_age,
             registration_cache_stale=registration_cache_stale,
             registration_cache_usable=registration_cache_usable,
+            registration_cache_next_refresh_ts=(
+                registration_cache_next_refresh_ts
+            ),
             registration_cache_refresh_attempts_total=(
                 self._registration_cache_refresh_attempts_total
             ),
@@ -3697,11 +3654,6 @@ class ValidatorServer:
         )
 
     async def stop(self) -> None:
-        registration_task = self._registration_refresh_task
-        if registration_task is not None and not registration_task.done():
-            registration_task.cancel()
-            await asyncio.gather(registration_task, return_exceptions=True)
-        self._registration_refresh_task = None
         event_loop_task = self._event_loop_monitor_task
         if event_loop_task is not None and not event_loop_task.done():
             event_loop_task.cancel()

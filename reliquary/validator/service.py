@@ -60,7 +60,6 @@ from reliquary.constants import (
     PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD,
     PROOF_ADMISSION_STALL_POLL_SECONDS,
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
-    REGISTERED_HOTKEY_REFRESH_MIN_INTERVAL_SECONDS,
     REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS,
     RECOMPUTE_PI_OLD_FROM_VERIFY,
     SHAPE_LEN_FRAC,
@@ -498,10 +497,8 @@ class ValidationService:
         # asyncio.Task wrapping _verify_beacon_async; held so the GC
         # doesn't collect a live task between OPEN and TRAINING.
         self._verify_task: asyncio.Task | None = None
-        # Serializes proactive refreshes with the on-demand refresh invoked by
-        # the HTTP registration gate after a cache miss.
+        # Serializes startup and quiescent-boundary registration refreshes.
         self._registration_refresh_lock = asyncio.Lock()
-        self._registration_refresh_task: asyncio.Task | None = None
         self._current_window_state: WindowState = WindowState.READY
 
         self._resume_from = resume_from
@@ -889,65 +886,6 @@ class ValidationService:
         self.server.clear_window_preparation_failure()
         self._publish_window_preparation_state()
         self._set_state(WindowState.OPEN)
-
-    def _registration_refresh_poll_seconds(self) -> float:
-        """Poll often enough to refresh the registration snapshot before TTL.
-
-        The public health endpoint intentionally degrades when the snapshot is
-        stale. Auction windows can exceed the five-minute cache TTL, so relying
-        only on the next window boundary leaves healthy validators degraded and
-        makes the first late submission pay the chain-refresh latency.
-        """
-        return min(
-            30.0,
-            max(
-                float(REGISTERED_HOTKEY_REFRESH_MIN_INTERVAL_SECONDS),
-                float(REGISTERED_HOTKEY_CACHE_TTL_SECONDS) / 4.0,
-            ),
-        )
-
-    async def _maintain_registration_cache(self) -> None:
-        """Refresh the registered-hotkey snapshot before it becomes stale.
-
-        A chain RPC can legitimately consume most of the 20-second refresh
-        timeout. Starting at half the TTL leaves several bounded attempts
-        before admission health degrades, while a failed attempt retries at
-        the existing minimum refresh interval instead of waiting a full poll.
-        """
-        poll_seconds = self._registration_refresh_poll_seconds()
-        retry_seconds = min(
-            poll_seconds,
-            float(REGISTERED_HOTKEY_REFRESH_MIN_INTERVAL_SECONDS),
-        )
-        refresh_threshold = max(
-            0.0,
-            float(REGISTERED_HOTKEY_CACHE_TTL_SECONDS) / 2.0,
-        )
-        while True:
-            age = self.server.registration_cache_age()
-            if age is None or age >= refresh_threshold:
-                refreshed = await self._refresh_registered_hotkeys(
-                    max_cache_age_seconds=refresh_threshold,
-                    reason="proactive",
-                )
-                if not refreshed:
-                    logger.warning(
-                        "Proactive registered-hotkey cache refresh failed; "
-                        "age=%.1fs",
-                        age if age is not None else -1.0,
-                    )
-                    await asyncio.sleep(retry_seconds)
-                    continue
-                await asyncio.sleep(poll_seconds)
-                continue
-
-            # Startup performs the initial chain read before model and prompt
-            # bootstrap. The worker may therefore begin with a nonzero cache
-            # age; sleep to the actual deadline so that bootstrap time cannot
-            # consume the retry runway in whole poll-sized chunks.
-            await asyncio.sleep(
-                min(poll_seconds, refresh_threshold - age)
-            )
 
     async def _refresh_registered_hotkeys(
         self,
@@ -2705,12 +2643,7 @@ class ValidationService:
 
         archive_queue = get_archive_queue()
         self.server.configure_archive_queue_telemetry(archive_queue.snapshot)
-        self.server.configure_registration_gate(
-            lambda: self._refresh_registered_hotkeys(
-                force=True,
-                reason="on_demand",
-            ),
-        )
+        self.server.configure_registration_gate()
         await self._refresh_registered_hotkeys(force=True, reason="startup")
         await self.server.start()
         await self._serve_axon_on_chain(subtensor)
@@ -2729,11 +2662,6 @@ class ValidationService:
             archive_queue.run_forever(),
             name="archive_queue_worker",
         )
-        self._registration_refresh_task = asyncio.create_task(
-            self._maintain_registration_cache(),
-            name="registration_cache_refresh",
-        )
-
         logger.info(
             "Validator started (v2.1): envs=%s, netuid=%d, http=%s:%d",
             list(self.envs.keys()), self.netuid, self.server.host, self.server.port,
@@ -2753,7 +2681,7 @@ class ValidationService:
                             "registration_refresh"
                         )
                     await self._refresh_registered_hotkeys(
-                        reason="window_boundary"
+                        reason="epoch_boundary"
                     )
                     self._window_iteration_stage = "open"
                     self._open_window()
@@ -2817,13 +2745,6 @@ class ValidationService:
                     self._set_state(WindowState.READY)
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
         finally:
-            registration_task = self._registration_refresh_task
-            if registration_task is not None and not registration_task.done():
-                registration_task.cancel()
-                try:
-                    await asyncio.wait_for(registration_task, timeout=5)
-                except (asyncio.CancelledError, asyncio.TimeoutError):
-                    pass
             # Cancel the archive worker and let it drain in-flight uploads
             # before we tear down the server. The worker survives many
             # window cycles so we shut it down deliberately rather than
