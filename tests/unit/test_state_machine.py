@@ -297,7 +297,7 @@ async def test_auction_freeze_marks_population_after_normal_drain():
 
     timed_out = await svc._freeze_auction_populations([batcher])
 
-    assert timed_out is False
+    assert timed_out == {"openmathinstruct": False}
     batcher.begin_seal_snapshot.assert_called_once_with()
 
 
@@ -315,9 +315,30 @@ async def test_auction_freeze_times_out_then_drops_pending_admission(monkeypatch
 
     timed_out = await svc._freeze_auction_populations([batcher])
 
-    assert timed_out is True
+    assert timed_out == {"openmathinstruct": True}
     batcher.begin_seal_snapshot.assert_called_once_with()
     assert batcher.force_seal_reason == "auction_queue_drain_timeout"
+
+
+@pytest.mark.asyncio
+async def test_auction_freeze_never_waits_for_inflight_after_snapshot(monkeypatch):
+    monkeypatch.setattr(
+        "reliquary.validator.service.MAX_SEAL_QUEUE_DRAIN_SECONDS", 0.0,
+    )
+    svc = _make_service()
+    batcher = MagicMock()
+    batcher.difficulty_auction_enabled = True
+    batcher.env.name = "openmathinstruct"
+    batcher.pending_proof_reservations = 0
+    batcher.inflight_proof_reservations = 1
+    svc._active_batchers = {"openmathinstruct": batcher}
+    svc.server._inflight_proofs = 1
+    svc.server._inflight_proofs_by_environment["openmathinstruct"] = 1
+
+    timed_out = await svc._freeze_auction_populations([batcher])
+
+    assert timed_out == {"openmathinstruct": True}
+    batcher.begin_seal_snapshot.assert_called_once_with()
 
 
 def test_proof_cap_breaker_uses_distinct_prompt_count():

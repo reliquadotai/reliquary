@@ -191,6 +191,8 @@ async def test_archive_includes_prompt_and_rollout_content():
 
     assert captured["window_start"] == 42
     archive = captured["data"]
+    assert archive["archive_schema_version"] == 2
+    assert archive["window_status"] == "completed"
     assert archive["window_start"] == 42
     assert archive["environment"] == "fake"
     assert len(archive["batch"]) == 2
@@ -459,3 +461,45 @@ async def test_archive_includes_late_drops_and_clears_counter():
         # Second archive run with no new events must emit an empty dict.
         await svc._archive_window(_FakeBatcher(), [valid_sub])
         assert captured[-1]["late_drops"] == {}
+
+
+@pytest.mark.parametrize(
+    "stage", ["randomness", "seal_wait", "archive_enqueue"]
+)
+def test_aborted_window_enqueues_a_non_rewarding_tombstone(stage):
+    from reliquary.validator.service import ValidationService
+
+    svc = ValidationService(
+        wallet=_FakeWallet(), model=MagicMock(), tokenizer=MagicMock(),
+        env=_FakeEnv(), netuid=99,
+    )
+    batcher = MagicMock()
+    batcher.window_start = 73
+    batcher.randomness = "beacon"
+    batcher.force_seal_reason = "auction_queue_drain_timeout"
+    svc._active_batchers = {"fake": batcher}
+    svc._window_iteration_stage = stage
+    captured = {}
+
+    class _StubQueue:
+        def enqueue(self, window_start, data):
+            captured["window_start"] = window_start
+            captured["data"] = data
+
+    with patch(
+        "reliquary.infrastructure.archive_queue.get_archive_queue",
+        return_value=_StubQueue(),
+    ):
+        svc._enqueue_aborted_window(
+            failure_stage=stage,
+            failure_type="RuntimeError",
+        )
+
+    archive = captured["data"]
+    assert captured["window_start"] == 73
+    assert archive["window_status"] == "aborted"
+    assert archive["failure_stage"] == stage
+    assert archive["failure_type"] == "RuntimeError"
+    assert archive["batch"] == []
+    assert archive["rewards_by_hotkey"] == {}
+    assert archive["training_accumulator"]["trained"] is False

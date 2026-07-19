@@ -275,6 +275,63 @@ async def test_submit_batch_v2_refreshes_stale_precommit_after_backoff(
 
 
 @pytest.mark.asyncio
+async def test_submit_batch_v2_waits_out_unsafe_drand_boundary(monkeypatch):
+    import reliquary.miner.submitter as submitter
+
+    now = [2.5]
+    sleeps = []
+    submitted_rounds = []
+
+    async def _sleep(delay):
+        sleeps.append(delay)
+        now[0] += delay
+
+    async def _post(self, url, content=None, headers=None, timeout=None):
+        body = json.loads(content)
+        submitted_rounds.append(body["drand_round"])
+        if url.endswith("/submit/precommit"):
+            return httpx.Response(
+                200,
+                json={
+                    "accepted": True,
+                    "reason": RejectReason.ACCEPTED.value,
+                    "receipt_id": "receipt-safe-round",
+                    "upload_deadline_ts": 30.0,
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "accepted": True,
+                "reason": RejectReason.SUBMITTED.value,
+            },
+        )
+
+    monkeypatch.setattr(submitter.time, "time", lambda: now[0])
+    monkeypatch.setattr(submitter.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(
+        "reliquary.infrastructure.drand.get_current_chain",
+        lambda: {"genesis_time": 0, "period": 3},
+    )
+    monkeypatch.setattr(submitter, "sign_envelope", lambda **kwargs: b"envelope")
+    monkeypatch.setattr(submitter, "sign_precommit", lambda **kwargs: b"precommit")
+    monkeypatch.setattr(httpx.AsyncClient, "post", _post)
+
+    async with httpx.AsyncClient() as client:
+        response = await submit_batch_v2(
+            "http://fake",
+            _v2_request(),
+            client=client,
+            wallet=object(),
+            randomness="ab" * 32,
+        )
+
+    assert response.accepted is True
+    assert sleeps == [pytest.approx(0.55)]
+    assert submitted_rounds == [2, 2]
+
+
+@pytest.mark.asyncio
 async def test_submit_batch_v2_reject_reason_propagated(monkeypatch):
     async def _post(self, url, content=None, headers=None, timeout=None):
         return httpx.Response(

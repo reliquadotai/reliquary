@@ -14,6 +14,7 @@ from reliquary.constants import (
     B_BATCH,
     CHALLENGE_K,
     FORCED_SEED_PROTOCOL_VERSION,
+    MAX_SUBMISSIONS_PER_PROMPT,
     M_ROLLOUTS,
 )
 from reliquary.protocol.submission import (
@@ -22,6 +23,7 @@ from reliquary.protocol.submission import (
     RolloutSubmission,
 )
 from reliquary.validator.batcher import GrpoWindowBatcher
+from reliquary.validator.observability import SubmitTelemetry
 
 
 class FakeEnv:
@@ -349,6 +351,108 @@ def test_reject_out_of_zone_all_pass():
     resp = b.accept_submission(req)
     assert resp.accepted is False
     assert resp.reason == RejectReason.OUT_OF_ZONE
+
+
+def test_auction_admission_preparation_runs_concurrently():
+    barrier = threading.Barrier(2, timeout=2.0)
+    seen_threads: set[int] = set()
+    seen_lock = threading.Lock()
+
+    class ConcurrentEnv(FakeEnv):
+        def compute_reward(self, problem, completion):
+            ident = threading.get_ident()
+            with seen_lock:
+                first_call = ident not in seen_threads
+                seen_threads.add(ident)
+            if first_call:
+                barrier.wait()
+            return super().compute_reward(problem, completion)
+
+    b = _make_batcher(env=ConcurrentEnv())
+    requests = [
+        _request(prompt_idx=42, hotkey="hk-a"),
+        _request(prompt_idx=43, hotkey="hk-b"),
+    ]
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = list(executor.map(b.accept_submission, requests))
+
+    assert all(response.accepted for response in responses)
+    assert b.pending_count == 2
+    assert len(seen_threads) == 2
+
+
+def test_auction_admission_handles_96_concurrent_candidates():
+    class SlowEnv(FakeEnv):
+        def compute_reward(self, problem, completion):
+            time.sleep(0.002)
+            return super().compute_reward(problem, completion)
+
+    batcher = _make_batcher(env=SlowEnv())
+    requests = [
+        _request(prompt_idx=100 + index, hotkey=f"hk-{index}")
+        for index in range(96)
+    ]
+    telemetry = [
+        SubmitTelemetry.from_request(request, t_arrival=time.time())
+        for request in requests
+    ]
+
+    def admit(index: int):
+        return batcher.accept_submission(
+            requests[index], telemetry=telemetry[index]
+        )
+
+    with ThreadPoolExecutor(max_workers=32) as executor:
+        responses = list(executor.map(admit, range(len(requests))))
+
+    assert all(response.accepted for response in responses)
+    assert batcher.pending_count == 96
+    assert all(item.admission_prepare_ms is not None for item in telemetry)
+    assert all(item.commit_lock_wait_ms is not None for item in telemetry)
+    assert all(item.commit_ms is not None for item in telemetry)
+
+
+def test_auction_concurrent_commit_preserves_prompt_population_cap():
+    batcher = _make_batcher()
+    requests = [
+        _request(prompt_idx=42, hotkey=f"hk-cap-{index}")
+        for index in range(MAX_SUBMISSIONS_PER_PROMPT + 64)
+    ]
+
+    with ThreadPoolExecutor(max_workers=32) as executor:
+        responses = list(executor.map(batcher.accept_submission, requests))
+
+    accepted = [response for response in responses if response.accepted]
+    rejected = [response for response in responses if not response.accepted]
+    assert len(accepted) == MAX_SUBMISSIONS_PER_PROMPT
+    assert all(
+        response.reason is RejectReason.PROMPT_FULL for response in rejected
+    )
+    assert batcher.prompt_submission_count(42) == MAX_SUBMISSIONS_PER_PROMPT
+    snapshot = batcher.rejection_telemetry_snapshot()
+    assert snapshot["reject_counts"][RejectReason.PROMPT_FULL.value] == len(
+        rejected
+    )
+    assert len(snapshot["rejected_submissions"]) == len(rejected)
+
+
+def test_auction_commit_after_seal_snapshot_is_rejected_and_refunded():
+    b = _make_batcher()
+    req = _request(prompt_idx=44, hotkey="hk-late")
+    assert b.try_reserve_logical_group(req) == (True, None)
+    assert b.try_reserve_proof_admission(req) == (True, None)
+    assert b.start_proof_admission(req) == (True, None)
+    b.begin_seal_snapshot()
+
+    try:
+        response = b.accept_submission(req)
+    finally:
+        b.finish_proof_admission(req)
+
+    assert response.reason is RejectReason.BATCH_FILLED
+    assert b.pending_count == 0
+    assert b.logical_group_reservation_count == 0
+    assert b.reserved_payload_bytes == 0
 
 
 def test_out_of_zone_does_not_charge_grail_candidate():

@@ -254,6 +254,27 @@ def _precommit_for(
     )
 
 
+def test_submit_openapi_keeps_batch_submission_request_contract():
+    schema = ValidatorServer().app.openapi()
+    request_body = schema["paths"]["/submit"]["post"]["requestBody"]
+    submission_schema = request_body["content"]["application/json"]["schema"]
+
+    assert request_body["required"] is True
+    assert submission_schema["title"] == "BatchSubmissionRequest"
+    assert "miner_hotkey" in submission_schema["properties"]
+    assert "rollouts" in submission_schema["properties"]
+
+
+def test_endpoint_latency_does_not_index_arbitrary_paths():
+    server = ValidatorServer()
+    client = TestClient(server.app)
+
+    for index in range(10):
+        assert client.get(f"/unknown-{index}").status_code == 404
+
+    assert server._endpoint_latency_samples_ms == {}
+
+
 def test_signed_precommit_extends_only_matching_body_upload():
     from reliquary.constants import WINDOW_COLLECTION_SECONDS
     from reliquary.protocol.submission import WindowState
@@ -775,7 +796,7 @@ def test_registered_hotkey_passes_without_refresh():
     assert refresh_calls == 0
 
 
-def test_registration_cache_miss_refreshes_before_quota():
+def test_registration_cache_miss_schedules_refresh_without_spending_quota():
     refresh_calls = 0
     server = None
 
@@ -790,9 +811,8 @@ def test_registration_cache_miss_refreshes_before_quota():
         "/submit", json=_request().model_dump(mode="json"),
     )
 
-    assert response.json()["accepted"] is True
-    assert refresh_calls == 1
-    assert server._per_window_counts[_TEST_KEYPAIR.ss58_address] == 1
+    assert response.json()["reason"] == RejectReason.REGISTRATION_UNAVAILABLE.value
+    assert _TEST_KEYPAIR.ss58_address not in server._per_window_counts
 
 
 def test_unregistered_hotkey_is_rejected_without_spending_quota():
@@ -1080,6 +1100,7 @@ def test_health_exposes_each_environment_window_independently():
         "expensive_proof_failures_by_hotkey": {},
         "expensive_proof_failures_by_operator": {},
         "grader_failures": {},
+        "auction_seal_drain": {},
     }
     code_health = health["window_environments"]["opencodeinstruct"]
     assert code_health["valid_submissions_count"] == 8

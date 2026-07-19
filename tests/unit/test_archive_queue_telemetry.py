@@ -18,6 +18,20 @@ def test_archive_queue_snapshot_tracks_pending_files(tmp_path):
     assert snapshot["oldest_age_seconds"] == 12.5
     assert snapshot["uploads_succeeded_total"] == 0
     assert snapshot["upload_failures_total"] == 0
+    assert snapshot["last_enqueued_window"] == 42
+    assert snapshot["archives_enqueued_total"] == 2
+    assert snapshot["enqueue_gaps_total"] == 0
+
+
+def test_archive_queue_reports_enqueue_continuity_gap(tmp_path):
+    queue = ArchiveQueue(str(tmp_path))
+    queue.enqueue(50, {"window_start": 50})
+    queue.enqueue(52, {"window_start": 52})
+
+    snapshot = queue.snapshot()
+
+    assert snapshot["enqueue_gaps_total"] == 1
+    assert snapshot["last_enqueue_gap"] == {"after": 50, "before": 52}
 
 
 def test_archive_queue_snapshot_tracks_success(tmp_path, monkeypatch):
