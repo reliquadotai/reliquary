@@ -107,6 +107,13 @@ def test_new_admission_pool_prewarms_every_worker(monkeypatch):
 
         def submit(self, fn, *args):
             self.submissions.append((fn, args))
+            pid = len(self.submissions)
+
+            class _Ready:
+                def result(self, timeout=None):
+                    return pid
+
+            return _Ready()
 
     fake_pool = _FakePool()
     monkeypatch.setattr(
@@ -122,6 +129,7 @@ def test_new_admission_pool_prewarms_every_worker(monkeypatch):
     assert all(
         fn is admission_worker_ready for fn, _args in fake_pool.submissions
     )
+    assert all(args == (0.05,) for _fn, args in fake_pool.submissions)
 
 
 def _request() -> BatchSubmissionRequest:

@@ -147,10 +147,12 @@ def initialize_admission_worker(tokenizer_json: str | None = None) -> None:
         _WORKER_TOKENIZER = Tokenizer.from_str(tokenizer_json)
 
 
-def admission_worker_ready() -> int:
+def admission_worker_ready(hold_seconds: float = 0.0) -> int:
     """Small warm-up task that proves a spawned child ran its initializer."""
     if _WORKER_TOKENIZER is None:
         raise RuntimeError("admission worker tokenizer unavailable")
+    if hold_seconds > 0.0:
+        time.sleep(float(hold_seconds))
     return os.getpid()
 
 

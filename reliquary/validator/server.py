@@ -2166,18 +2166,37 @@ class ValidatorServer:
         self._admission_tokenizer_hashes[environment] = hashlib.sha256(
             tokenizer_json.encode("utf-8")
         ).hexdigest()
+        worker_count = self._admission_worker_count(environment)
         pool = ProcessPoolExecutor(
-            max_workers=self._admission_worker_count(environment),
+            max_workers=worker_count,
             mp_context=multiprocessing.get_context("spawn"),
             initializer=initialize_admission_worker,
             initargs=(tokenizer_json,),
             max_tasks_per_child=ADMISSION_PROCESS_MAX_TASKS,
         )
-        # ProcessPoolExecutor is lazy. Queue one initializer probe per child at
-        # the quiescent window boundary so the first miner reveal never pays
-        # synchronous spawn/import cost on the validator event loop.
-        for _ in range(self._admission_worker_count(environment)):
-            pool.submit(admission_worker_ready)
+        # ProcessPoolExecutor is lazy. Fully start it at the quiescent boundary
+        # so the first reveal cannot spend its candidate wall budget waiting
+        # for child imports. Short held probes let every child claim work; the
+        # loop handles schedulers that initially assign more than one probe to
+        # the same process.
+        ready_pids: set[int] = set()
+        startup_deadline = time.monotonic() + 120.0
+        try:
+            while len(ready_pids) < worker_count:
+                probes = [
+                    pool.submit(admission_worker_ready, 0.05)
+                    for _ in range(worker_count)
+                ]
+                for probe in probes:
+                    remaining = startup_deadline - time.monotonic()
+                    if remaining <= 0.0:
+                        raise TimeoutError(
+                            f"{environment} admission pool startup timed out"
+                        )
+                    ready_pids.add(int(probe.result(timeout=remaining)))
+        except BaseException:
+            self._terminate_admission_pool(pool)
+            raise
         return pool
 
     @staticmethod
@@ -2217,8 +2236,9 @@ class ValidatorServer:
             await asyncio.to_thread(
                 self._terminate_admission_pool, failed_pool
             )
-            self._admission_process_pools[environment] = (
-                self._new_admission_pool(environment)
+            self._admission_process_pools[environment] = await asyncio.to_thread(
+                self._new_admission_pool,
+                environment,
             )
             self._admission_worker_restarts[environment] += 1
 
