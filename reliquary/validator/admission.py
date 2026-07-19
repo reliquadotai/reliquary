@@ -147,6 +147,13 @@ def initialize_admission_worker(tokenizer_json: str | None = None) -> None:
         _WORKER_TOKENIZER = Tokenizer.from_str(tokenizer_json)
 
 
+def admission_worker_ready() -> int:
+    """Small warm-up task that proves a spawned child ran its initializer."""
+    if _WORKER_TOKENIZER is None:
+        raise RuntimeError("admission worker tokenizer unavailable")
+    return os.getpid()
+
+
 @contextmanager
 def _deadline(deadline_monotonic: float) -> Iterator[None]:
     remaining = float(deadline_monotonic) - time.monotonic()

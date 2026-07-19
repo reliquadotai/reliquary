@@ -116,6 +116,7 @@ from reliquary.validator.admission import (
     AdmissionContext,
     AdmissionReceiptBinding,
     PreparedSubmission,
+    admission_worker_ready,
     initialize_admission_worker,
     prepare_submission,
 )
@@ -2165,13 +2166,19 @@ class ValidatorServer:
         self._admission_tokenizer_hashes[environment] = hashlib.sha256(
             tokenizer_json.encode("utf-8")
         ).hexdigest()
-        return ProcessPoolExecutor(
+        pool = ProcessPoolExecutor(
             max_workers=self._admission_worker_count(environment),
             mp_context=multiprocessing.get_context("spawn"),
             initializer=initialize_admission_worker,
             initargs=(tokenizer_json,),
             max_tasks_per_child=ADMISSION_PROCESS_MAX_TASKS,
         )
+        # ProcessPoolExecutor is lazy. Queue one initializer probe per child at
+        # the quiescent window boundary so the first miner reveal never pays
+        # synchronous spawn/import cost on the validator event loop.
+        for _ in range(self._admission_worker_count(environment)):
+            pool.submit(admission_worker_ready)
+        return pool
 
     @staticmethod
     def _terminate_admission_pool(pool: ProcessPoolExecutor) -> None:

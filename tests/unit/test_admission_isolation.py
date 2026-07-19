@@ -22,6 +22,7 @@ from reliquary.validator.admission import (
     AdmissionReceiptBinding,
     AdmissionRuntimeMaterials,
     ParsedSubmission,
+    admission_worker_ready,
     initialize_admission_worker,
     materialize_and_score_submission,
     parse_and_validate_submission,
@@ -85,6 +86,42 @@ def _server_with_admission_pool() -> tuple[ValidatorServer, str]:
         server._new_admission_pool(environment)
     )
     return server, environment
+
+
+def test_new_admission_pool_prewarms_every_worker(monkeypatch):
+    environment = "openmathinstruct"
+    server = ValidatorServer()
+    server._active_batchers = {
+        environment: SimpleNamespace(
+            env=SimpleNamespace(name=environment),
+            tokenizer=SimpleNamespace(
+                backend_tokenizer=Tokenizer.from_str(_tokenizer_json())
+            ),
+        )
+    }
+
+    class _FakePool:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.submissions = []
+
+        def submit(self, fn, *args):
+            self.submissions.append((fn, args))
+
+    fake_pool = _FakePool()
+    monkeypatch.setattr(
+        "reliquary.validator.server.ProcessPoolExecutor",
+        lambda **_kwargs: fake_pool,
+    )
+
+    result = server._new_admission_pool(environment)
+
+    expected = server._admission_worker_count(environment)
+    assert result is fake_pool
+    assert len(fake_pool.submissions) == expected
+    assert all(
+        fn is admission_worker_ready for fn, _args in fake_pool.submissions
+    )
 
 
 def _request() -> BatchSubmissionRequest:
