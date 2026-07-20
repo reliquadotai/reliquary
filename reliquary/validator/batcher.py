@@ -4230,6 +4230,21 @@ class GrpoWindowBatcher:
                     "proof_wall_seconds": self.proof_wall_elapsed_seconds,
                     "proof_wall_limit_seconds": MAX_PROOF_WALL_SECONDS,
                     "proof_wall_exhausted": self.proof_wall_exhausted,
+                    "early_close": (
+                        getattr(self, "force_seal_reason", None)
+                        == "proven_dominance_close"
+                    ),
+                    "early_close_armed_round": self.early_close_armed_round,
+                    "early_close_sealed_round": self.early_close_sealed_round,
+                    "midwindow_proof_attempts": (
+                        self.early_close_proof_attempts
+                    ),
+                    "midwindow_proof_failures": (
+                        self.early_close_proof_failures
+                    ),
+                    "midwindow_proof_wall_seconds": (
+                        self.early_close_proof_wall_seconds
+                    ),
                     "proven_winners": len(self._valid),
                     "operator_proof_failure_cap": (
                         MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW

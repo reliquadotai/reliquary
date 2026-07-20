@@ -280,3 +280,29 @@ def test_worker_exception_is_a_safety_valve_not_a_crash():
     b._verify_expensive = _boom
     b._early_close_worker()                   # safety valve: returns, no raise
     assert not b.is_sealed()                  # deadline path still owns the seal
+
+
+def test_shadow_dict_reports_early_close_telemetry():
+    from reliquary.constants import B_BATCH
+
+    b = _auction_batcher(current_round_fn=lambda: 1000)
+    for i in range(B_BATCH):
+        _accept(b, prompt_idx=i, hotkey=f"hk{i}", drand_round=10 + i)
+    assert _run_worker_inline(b) == "closed"
+    b.seal_batch(pool=1.0)
+    shadow = b.difficulty_auction_shadow
+    assert shadow["early_close"] is True
+    assert shadow["early_close_sealed_round"] == 1000
+    assert shadow["midwindow_proof_attempts"] == B_BATCH
+    assert shadow["midwindow_proof_failures"] == 0
+    assert shadow["midwindow_proof_wall_seconds"] >= 0.0
+
+
+def test_shadow_dict_reports_no_early_close_on_deadline_seal():
+    b = _auction_batcher()
+    _accept(b, prompt_idx=1, hotkey="hk1")
+    b.force_seal("test")
+    b.seal_batch(pool=1.0)
+    shadow = b.difficulty_auction_shadow
+    assert shadow["early_close"] is False
+    assert shadow["midwindow_proof_attempts"] == 0
