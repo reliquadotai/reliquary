@@ -19,6 +19,8 @@ from typing import Any, Callable
 from pydantic import ValidationError
 
 from reliquary.constants import (
+    AUCTION_EARLY_CLOSE_ENFORCE,
+    AUCTION_EARLY_CLOSE_POLL_SECONDS,
     BATCH_PROMPT_COOLDOWN_WINDOWS,
     B_BATCH,
     BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION,
@@ -87,6 +89,7 @@ from reliquary.validator.dedup import (
 from reliquary.validator.difficulty_auction import (
     ShadowSubmission,
     difficulty_score,
+    max_difficulty_value,
     select_shadow_auction,
 )
 from reliquary.validator.observability import (
@@ -598,6 +601,16 @@ class GrpoWindowBatcher:
         # Tier ordinal of each proven winner (id(ValidSubmission) -> int),
         # consumed by _seal_batch_inner as the fair-split slot key.
         self._auction_tier_by_id: dict[int, int] = {}
+        # Mid-window proof results (id(pending) -> ValidSubmission|None),
+        # written by the early-close prover thread under ``_lock`` and consumed
+        # by ``_prove_ranked``; a missing key means never attempted mid-window.
+        self._early_proof_results: dict[int, ValidSubmission | None] = {}
+        self.early_close_proof_attempts = 0
+        self.early_close_proof_failures = 0
+        self.early_close_proof_wall_seconds = 0.0
+        self.early_close_armed_round: int | None = None
+        self.early_close_sealed_round: int | None = None
+        self._early_close_thread: threading.Thread | None = None
         # Non-winners proven purely for telemetry — see FORENSIC_SAMPLE_PER_WINDOW.
         # Never touches ``_valid``; a passing entry here is still unpaid.
         self.forensic_sample: list[ForensicSampleResult] = []
@@ -3465,7 +3478,9 @@ class GrpoWindowBatcher:
             tier_by_id[id(pending_submission)] = len(tier_sizes) - 1
             tier_sizes[-1] += 1
 
-        attempts = 0
+        # Mid-window early-close proofs already spent part of this window's
+        # budget; the counters continue rather than reset.
+        attempts = self.early_close_proof_attempts
         proven: list[ValidSubmission] = []
         claimed: set[int] = set()
         attempted_ids: set[int] = set()
@@ -3495,6 +3510,7 @@ class GrpoWindowBatcher:
                 ],
                 "rank": rank,
                 "proof_attempted": False,
+                "proof_phase": None,
                 "proof_passed": None,
                 "selected": False,
                 "status": "ranked",
@@ -3531,6 +3547,27 @@ class GrpoWindowBatcher:
             if self._cooldown.is_in_cooldown(p.prompt_idx, self.window_start):
                 row["status"] = "cooldown"
                 continue
+            if id(p) in self._early_proof_results:
+                # Proven (or failed) mid-window by the early-close prover.
+                # Debt/budget gates were evaluated when the proof actually
+                # ran, so a cached result bypasses them — sequential
+                # semantics, never a second GPU pass, never double debt.
+                cached = self._early_proof_results[id(p)]
+                row["proof_attempted"] = True
+                row["proof_phase"] = "midwindow"
+                attempted_ids.add(id(p))
+                if cached is None:
+                    row["proof_passed"] = False
+                    row["status"] = "proof_failed"
+                    continue
+                row["proof_passed"] = True
+                row["selected"] = True
+                row["status"] = "selected"
+                proven.append(cached)
+                claimed.add(p.prompt_idx)
+                self._auction_tier_by_id[id(cached)] = tier
+                self.difficulty_auction_metadata_by_id[id(cached)] = row
+                continue
             operator = row["operator_id"]
             if operator is None:
                 row["status"] = "operator_unmapped"
@@ -3555,7 +3592,10 @@ class GrpoWindowBatcher:
                 )
                 stop_reason = "attempt_budget"
                 break
-            elapsed = self._time_fn() - self._proof_wall_started_at
+            elapsed = (
+                self._time_fn() - self._proof_wall_started_at
+                + self.early_close_proof_wall_seconds
+            )
             if elapsed >= MAX_PROOF_WALL_SECONDS:
                 self.proof_wall_exhausted = True
                 stop_reason = "wall_budget"
@@ -3581,6 +3621,7 @@ class GrpoWindowBatcher:
             attempts += 1
             attempted_ids.add(id(p))
             row["proof_attempted"] = True
+            row["proof_phase"] = "post_seal"
             row["status"] = "proof_started"
             sub = self._verify_expensive(p)
             if sub is None:
