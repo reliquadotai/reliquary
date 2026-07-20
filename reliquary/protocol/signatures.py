@@ -366,15 +366,3 @@ def verify_precommit_signature(
     except Exception as exc:
         logger.debug("precommit signature verify failed: %s", exc)
         return False
-
-
-def derive_env_seed(wallet_addr: str, window_hash: str, problem_index: int) -> int:
-    """Derive canonical environment seed for miner/window/problem index."""
-    try:
-        idx = int(problem_index)
-    except Exception:
-        idx = 0
-
-    material = f"{wallet_addr}:{window_hash}:{idx}".encode()
-    seed_hex = hashlib.sha256(b"seed|" + material).hexdigest()
-    return int(seed_hex[:8], 16)

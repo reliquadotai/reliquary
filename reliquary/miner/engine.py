@@ -764,30 +764,6 @@ class MiningEngine:
     # Private helpers
     # ------------------------------------------------------------------
 
-    async def _compute_randomness(
-        self, subtensor, window_start: int, use_drand: bool
-    ) -> str:
-        """Derive window randomness from the drand beacon (v2.3+: drand-only).
-
-        Matches the validator's ``service._derive_randomness``: block_hash is
-        no longer mixed in, so the miner does not need a substrate roundtrip
-        for the GRAIL seed. The legacy ``use_drand=False`` path remains for
-        offline tests and uses block_hash as a single-source seed.
-        """
-        if use_drand:
-            from reliquary.infrastructure.drand import get_beacon, get_current_chain
-
-            chain_info = get_current_chain()
-            drand_round = chain.compute_drand_round_for_window(
-                window_start, chain_info["genesis_time"], chain_info["period"]
-            )
-            beacon = get_beacon(round_id=str(drand_round), use_drand=True)
-            return chain.compute_window_randomness(
-                None, beacon["randomness"], drand_round=beacon["round"]
-            )
-        block_hash = await chain.get_block_hash(subtensor, window_start)
-        return chain.compute_window_randomness(block_hash)
-
     def _build_grail_commit(self, generation: dict, randomness: str) -> dict:
         """Construct a GRAIL proof commit dict from a generation dict.
 

@@ -26,7 +26,7 @@ else:
     except ImportError:
         torch = None  # type: ignore
 
-from reliquary.constants import CHALLENGE_K, PRIME_Q, RNG_LABEL
+from reliquary.constants import RNG_LABEL
 
 logger = logging.getLogger(__name__)
 
@@ -196,29 +196,3 @@ def indices_from_root_in_range(
     k_eff = min(k, length)
     rel = indices_from_root(tokens, rand_hex, length, k_eff)
     return [start + i for i in rel]
-
-
-def dot_mod_q(hidden: torch.Tensor, r_vec: torch.Tensor) -> int:  # type: ignore[misc]
-    """Compute modular inner product of hidden state and random projection vector."""
-    if torch is None:
-        raise ImportError("torch is required for dot_mod_q")
-
-    device = hidden.device
-    r_vec = r_vec.to(device)
-
-    scaled = torch.round(hidden * 1024)
-    prod = torch.dot(scaled, r_vec.float())
-
-    return int(prod.item()) % PRIME_Q
-
-
-def create_proof(
-    tokens: list[int],
-    randomness_hex: str,
-    seq_len: int,
-    k: int = CHALLENGE_K,
-) -> dict:
-    """Generate GRAIL proof package with deterministic indices."""
-    beacon_R1 = {"round": 2, "randomness": randomness_hex}
-    idxs = indices_from_root(tokens, randomness_hex, seq_len, k)
-    return {"round_R1": beacon_R1, "indices": idxs}

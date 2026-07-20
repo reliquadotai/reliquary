@@ -22,10 +22,6 @@ RNG_LABEL = {"sketch": b"sketch", "open": b"open", "sat": b"sat"}
 # Transformer layer index for hidden state extraction (-1 = last layer).
 LAYER_INDEX = -1
 
-# Batch size for proof computation (log-softmax / GRAIL commitments).
-# Fixed: changing causes numerical divergence between miner and validator.
-PROOF_BATCH_SIZE = 16
-
 # Top-K activation selection for sketch computation.
 PROOF_TOPK = 16
 
@@ -78,12 +74,6 @@ UPLOAD_GRACE_PERIOD = BLOCK_TIME_VARIANCE + NETWORK_UPLOAD_LATENCY
 # grace never extends generation: only a signed Merkle root and exact body size
 # received before the collection cutoff can arm it.
 SUBMISSION_UPLOAD_GRACE_SECONDS = float(UPLOAD_GRACE_PERIOD)
-
-# Buffer for future drand beacon (seconds).
-DRAND_FUTURE_BUFFER = 30
-
-# Buffer subtracted from per-window deadline to leave room for final submissions.
-UPLOAD_BUFFER = NETWORK_UPLOAD_LATENCY
 
 # ────────────────  ROLLOUT GENERATION  ────────────────
 
@@ -144,7 +134,6 @@ REWARD_SHAPE_MIN_EXACT_ZERO_ROLLOUTS = 3
 # signatures, while still archiving the window so emissions/forensics remain
 # visible.
 TRAINING_QUARANTINE_ENABLED = True
-TRAINING_QUARANTINE_MAX_HOTKEY_SHARE = 0.75
 TRAINING_QUARANTINE_MAX_REWARD_VECTOR_SHARE = 0.75
 TRAINING_QUARANTINE_REWARD_VECTOR_MIN_GROUPS = 4
 TRAINING_QUARANTINE_MAX_MEAN_COMPLETION_LENGTH = 24576
@@ -312,12 +301,6 @@ FORENSIC_SAMPLE_PER_WINDOW = 2
 # UID that receives unused slot emission budget (the burn address).
 UID_BURN = 0
 
-# ────────────────  VALIDATION RULES  ────────────────
-
-# File size bounds for valid rollout window files.
-MIN_ROLLOUT_FILE_SIZE_BYTES = 200
-MAX_ROLLOUT_FILE_SIZE_BYTES = 350 * 1024 * 1024  # 350 MB
-
 # ────────────────  CONTINUOUS VALIDATION  ────────────────
 
 # How often the validator polls for new state (seconds).
@@ -331,10 +314,6 @@ POLL_INTERVAL_SECONDS = 10
 # to identical weights via the deterministic EMA replay.
 EPOCH_SUBMIT_LEAD_BLOCKS = 20
 
-# ────────────────  STORAGE  ────────────────
-
-CHECKPOINT_PREFIX = "reliquary/checkpoints/"
-
 # ────────────────  HUGGING FACE CHECKPOINT PUBLISHING  ────────────────
 
 # How often to publish the current in-memory model to Hugging Face.
@@ -347,30 +326,6 @@ CHECKPOINT_PUBLISH_INTERVAL_WINDOWS = 10
 # override via --hf-repo-id CLI arg. Must be a writable repo id for
 # the validator's HF token.
 DEFAULT_HF_REPO_ID = "aivolutionedge/reliquary-sn"
-
-# ────────────────  DEPRECATED (GRPO REFACTOR)  ────────────────
-# Kept importable to avoid breaking transitive imports during the rollout.
-# These knobs no longer participate in any runtime decision and will be
-# removed in a follow-up cleanup once no consumer references them.
-
-MINER_SAMPLING_ENABLED = True
-MINER_SAMPLE_RATE = 0.25
-MINER_SAMPLE_MIN = 2
-MINER_SAMPLE_MAX = 35
-
-ROLLOUT_SAMPLE_RATE = 0.10
-ROLLOUT_SAMPLE_MIN = 16
-
-VERIFICATION_BATCH_SIZE = 16
-BATCH_FAILURE_THRESHOLD = 0.30
-
-FAILURE_LOOKBACK_WINDOWS = 14
-USED_INDICES_MAX_AGE_WINDOWS = 100
-
-MAX_ROLLOUTS_PER_FILE = 6000
-
-DATASET_NAME = "karpathy/climbmix-400b-shuffle"
-DATASET_SPLIT = "train"
 
 # ────────────────  GRPO MARKET (v2)  ────────────────
 
@@ -673,9 +628,6 @@ SUBNET_START_BLOCK = 0
 # Set generously — this is a backstop, not the cadence.
 WINDOW_TIMEOUT_SECONDS = 7200
 
-# Local JSON path for validator state (window_n counter + checkpoint_n).
-# Resolved relative to the CWD if not absolute.
-CHECKPOINT_STATE_PATH_DEFAULT = "reliquary/state/checkpoint.json"
 
 # Local directory for staged checkpoint files before R2 upload.
 CHECKPOINT_STAGING_DIR_DEFAULT = "reliquary/state/checkpoints"
@@ -860,9 +812,6 @@ GRADER_POOL_SIZE = 4 * M_ROLLOUTS
 # fails fast without blocking the queue.
 GRADER_EVAL_TIMEOUT_SECONDS = 5
 
-# How often (seconds) the server pings each worker via a no-op eval
-# to detect zombies. Triggers respawn if a worker fails to respond.
-GRADER_HEALTH_CHECK_INTERVAL_SECONDS = 30
 
 # Token authenticity: a completion token whose chosen probability collapses
 # below this while the model's argmax sits at >= TOKEN_AUTH_ARGMAX_CONF was not

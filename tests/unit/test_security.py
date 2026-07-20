@@ -7,9 +7,7 @@ No GPU required — models are mocked where needed.
 """
 
 import hashlib
-import hmac as hmac_mod
 import inspect
-import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -343,8 +341,7 @@ class TestBeaconSignatureVerification:
 
     def test_rejects_wrong_randomness(self):
         from reliquary.infrastructure.drand import verify_beacon_signature
-        with patch("reliquary.infrastructure.drand._fetch_chain_pubkey", return_value=b"\x00" * 48):
-            assert verify_beacon_signature("abc", 1, "bb" * 32, "aa" * 48) is False
+        assert verify_beacon_signature("abc", 1, "bb" * 32, "aa" * 48) is False
 
     def test_no_bls_library_fails_closed(self):
         """Without blst, verification must return False — not fall through
@@ -352,9 +349,9 @@ class TestBeaconSignatureVerification:
         from reliquary.infrastructure.drand import verify_beacon_signature
         sig_bytes = bytes.fromhex("cc" * 48)
         crafted_rand = hashlib.sha256(sig_bytes).hexdigest()
-        with patch("reliquary.infrastructure.drand._fetch_chain_pubkey", return_value=b"\x01" * 48):
-            # Even though SHA256(sig) == randomness, this MUST reject
-            assert verify_beacon_signature("abc", 1, crafted_rand, "cc" * 48) is False
+        # Even though SHA256(sig) == randomness, this MUST reject without a
+        # matching cross-check from the independent bittensor-drand relay.
+        assert verify_beacon_signature("abc", 1, crafted_rand, "cc" * 48) is False
 
     def test_correct_dst_for_quicknet(self):
         """The DST must use BLS12381G1, not BN254G1."""
@@ -362,60 +359,6 @@ class TestBeaconSignatureVerification:
         source = inspect.getsource(drand_mod.verify_beacon_signature)
         assert "BLS12381G1" in source or "BLS_SIG_BLS12381G1" in source
         assert "BN254G1" not in source
-
-
-# ══════════════════════════════════════════════════════════════════════
-# FAILLE #10 — Storage HMAC integrity
-# ══════════════════════════════════════════════════════════════════════
-
-
-class TestStorageHmacIntegrity:
-    """Attack: entity with S3 write access modifies used_indices.json.gz.
-    Fix: HMAC keyed to R2_SECRET_ACCESS_KEY detects tampering.
-    """
-
-    @patch.dict(os.environ, {"R2_SECRET_ACCESS_KEY": "test-secret"})
-    def test_hmac_deterministic(self):
-        from reliquary.infrastructure.storage import _compute_state_hmac
-        assert _compute_state_hmac(b"data") == _compute_state_hmac(b"data")
-
-    @patch.dict(os.environ, {"R2_SECRET_ACCESS_KEY": "test-secret"})
-    def test_hmac_changes_with_data(self):
-        from reliquary.infrastructure.storage import _compute_state_hmac
-        assert _compute_state_hmac(b"data1") != _compute_state_hmac(b"data2")
-
-    def test_hmac_changes_with_secret(self):
-        from reliquary.infrastructure.storage import _compute_state_hmac
-        with patch.dict(os.environ, {"R2_SECRET_ACCESS_KEY": "secret_A"}):
-            a = _compute_state_hmac(b"payload")
-        with patch.dict(os.environ, {"R2_SECRET_ACCESS_KEY": "secret_B"}):
-            b = _compute_state_hmac(b"payload")
-        assert a != b
-
-    @patch.dict(os.environ, {"R2_SECRET_ACCESS_KEY": "known"})
-    def test_key_derivation_uses_domain_separator(self):
-        from reliquary.infrastructure.storage import _state_hmac_key
-        expected = hashlib.sha256(b"reliquary-state-hmac|" + b"known").digest()
-        assert _state_hmac_key() == expected
-
-
-# ══════════════════════════════════════════════════════════════════════
-# FAILLE #12 — Validator state isolation
-# ══════════════════════════════════════════════════════════════════════
-
-
-class TestValidatorStateIsolation:
-    """Attack: multiple validators overwrite each other's state file.
-    Fix: state files are keyed by validator hotkey.
-    """
-
-    def test_load_accepts_validator_id(self):
-        from reliquary.infrastructure.storage import load_used_indices
-        assert "validator_id" in inspect.signature(load_used_indices).parameters
-
-    def test_save_accepts_validator_id(self):
-        from reliquary.infrastructure.storage import save_used_indices
-        assert "validator_id" in inspect.signature(save_used_indices).parameters
 
 
 # ══════════════════════════════════════════════════════════════════════

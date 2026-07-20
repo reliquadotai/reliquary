@@ -4,9 +4,6 @@ import asyncio
 import hashlib
 import logging
 import os
-from typing import Any
-
-from reliquary.constants import BLOCK_TIME_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -155,23 +152,6 @@ async def set_weights(
         "set_weights rejected by chain: %s (error=%r)", msg, err,
     )
     return False
-
-
-def compute_drand_round_for_window(
-    window_start_block: int, genesis_time: int, period: int
-) -> int:
-    """Deterministically compute which drand round to use for a window.
-
-    Both miner and validator call this with the same inputs to agree
-    on a single round — no "latest" fetch needed.
-
-    Returns:
-        The drand round number (>= 1).
-    """
-    window_timestamp = window_start_block * BLOCK_TIME_SECONDS
-    if window_timestamp < genesis_time:
-        return 1  # Clamp: can't go before round 1
-    return 1 + (window_timestamp - genesis_time) // period
 
 
 def compute_window_randomness(

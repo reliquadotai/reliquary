@@ -100,29 +100,6 @@ def _warp_batch(logits: torch.Tensor, t: float, top_k: int, top_p: float) -> tor
     return probs / probs.sum(dim=-1, keepdim=True)
 
 
-def seed_consistency(logits: torch.Tensor, token_ids: list[int], u_values: list[float], *,
-                     t: float, top_k: int, top_p: float,
-                     stochastic_threshold: float) -> tuple[int, int]:
-    """Teacher-forced check. logits is [n, vocab] predicting token_ids[i] at u_values[i].
-    Counts stochastic positions (max_prob < threshold) and how many match the forced pick.
-
-    Fully vectorized: one batched warp + one batched inverse-CDF over all n
-    positions, with a single device sync for the two returned counts (the
-    per-position loop used to force a GPU->CPU sync at every step, on the serial
-    GRAIL-verify hot path)."""
-    diagnostics = seed_consistency_diagnostics(
-        logits,
-        token_ids,
-        u_values,
-        t=t,
-        top_k=top_k,
-        top_p=top_p,
-        stochastic_threshold=stochastic_threshold,
-        boundary_epsilon=0.0,
-    )
-    return diagnostics.n_stochastic, diagnostics.n_exact_match
-
-
 def seed_consistency_diagnostics(
     logits: torch.Tensor,
     token_ids: list[int],

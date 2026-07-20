@@ -16,7 +16,6 @@ import concurrent.futures
 import json
 import logging
 import os
-import random
 import threading
 from threading import Lock
 from typing import Any
@@ -105,33 +104,6 @@ _LOCK = Lock()
 _BEACON_COUNTER = 0
 
 # ─────────────────────────  BEACON SIGNATURE VERIFICATION  ──────────────────
-
-# Cached public keys per chain hash (fetched once from /info).
-_CHAIN_PUBKEYS: dict[str, bytes] = {}
-
-
-def _fetch_chain_pubkey(chain_hash: str) -> bytes | None:
-    """Fetch and cache the BLS public key for a drand chain."""
-    if chain_hash in _CHAIN_PUBKEYS:
-        return _CHAIN_PUBKEYS[chain_hash]
-
-    info = _fetch_chain_info(chain_hash)
-    if not info:
-        return None
-
-    pubkey_hex = info.get("public_key") or info.get("publicKey")
-    if not pubkey_hex:
-        logger.warning("[Drand] chain info has no public_key field")
-        return None
-
-    try:
-        pubkey_bytes = bytes.fromhex(pubkey_hex)
-        _CHAIN_PUBKEYS[chain_hash] = pubkey_bytes
-        return pubkey_bytes
-    except ValueError:
-        logger.warning("[Drand] invalid public key hex: %s", pubkey_hex[:40])
-        return None
-
 
 def verify_beacon_signature(
     chain_hash: str,
@@ -222,12 +194,6 @@ def verify_beacon_signature(
 
 
 # ───────────────────────────────  UTILITIES  ────────────────────────────────
-
-
-def _shuffle_urls() -> list[str]:
-    urls = DRAND_URLS[:]
-    random.shuffle(urls)
-    return urls
 
 
 def _get_chain_record(name: str) -> dict[str, Any]:
@@ -399,24 +365,6 @@ def _ensure_params(refresh: bool = False) -> None:
 # ─────────────────────────────  PUBLIC API  ─────────────────────────────
 
 
-def set_chain(chain_name: str, refresh_info: bool = True) -> None:
-    """
-    Switch the active drand chain. Optionally refresh chain info from relays.
-
-    Args:
-        chain_name: 'quicknet' or 'default'
-        refresh_info: if True, programmatically fetch /info and update period/genesis_time
-    """
-    global _current_chain
-    _get_chain_record(chain_name)  # validate early
-    _current_chain = chain_name
-    with _LOCK:
-        _ensure_params(refresh=refresh_info)
-    logger.info(
-        f"Switched to drand chain '{chain_name}': {DRAND_CHAINS[chain_name]['description']}"
-    )
-
-
 def get_current_chain() -> dict[str, Any]:
     """
     Return details of the active chain, including resolved period/genesis_time if known.
@@ -550,48 +498,6 @@ def get_beacon(
         if use_fallback:
             return get_mock_beacon()
         raise
-
-
-def get_round_at_time(timestamp: int) -> int:
-    """
-    Compute the drand round number for a given UNIX timestamp.
-
-    Spec nuance:
-      * At t == genesis_time, the round is 1.
-      * For t < genesis_time, there is no round yet -> return 0.
-      * For t > genesis_time, round = 1 + floor((t - genesis_time)/period).
-    """
-    _ensure_params(refresh=False)
-    if _DRAND_GENESIS_TIME is None or _DRAND_PERIOD is None:
-        raise RuntimeError("Drand chain parameters not initialized")
-
-    if timestamp < _DRAND_GENESIS_TIME:
-        return 0
-    return 1 + (timestamp - _DRAND_GENESIS_TIME) // _DRAND_PERIOD
-
-
-def get_expected_round() -> int | None:
-    """
-    Query the chain health to get the current/expected round (v2).
-    Useful to clamp future-round requests.
-    """
-    _ensure_params(refresh=False)
-    path = f"/v2/chains/{_DRAND_CHAIN_HASH}/health"
-    payload = _http_get_json([path])
-    if not payload:
-        return None
-    # health payload typically includes fields like "expected_round" or similar
-    for key in ("expected_round", "expectedRound", "expected"):
-        if key in payload:
-            try:
-                return int(payload[key])
-            except Exception:
-                pass
-    # Some relays nest the fields
-    try:
-        return int(payload.get("round", {}).get("expected"))  # be liberal
-    except Exception:
-        return None
 
 
 # ───────────────────────────────  BOOTSTRAP  ───────────────────────────────

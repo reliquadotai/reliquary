@@ -1,7 +1,6 @@
 from reliquary.protocol.signatures import (
     hash_commitments,
     build_commit_binding,
-    derive_env_seed,
 )
 
 
@@ -53,25 +52,3 @@ class TestBuildCommitBinding:
         a = build_commit_binding([1], "0xaabb", "m", -1, comms)
         b = build_commit_binding([1], "aabb", "m", -1, comms)
         assert a == b
-
-
-class TestDeriveEnvSeed:
-    def test_deterministic(self):
-        a = derive_env_seed("5abc", "0xdeadbeef", 0)
-        b = derive_env_seed("5abc", "0xdeadbeef", 0)
-        assert a == b
-
-    def test_different_index(self):
-        a = derive_env_seed("addr", "hash", 0)
-        b = derive_env_seed("addr", "hash", 1)
-        assert a != b
-
-    def test_different_wallet(self):
-        a = derive_env_seed("addr_a", "hash", 0)
-        b = derive_env_seed("addr_b", "hash", 0)
-        assert a != b
-
-    def test_returns_int(self):
-        result = derive_env_seed("addr", "hash", 0)
-        assert isinstance(result, int)
-        assert result >= 0

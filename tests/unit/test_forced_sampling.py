@@ -47,6 +47,15 @@ def test_u_at_is_identity_free_to_kill_variance_farming():
         fs.u_at("cd" * 16, "hk1", 7, "sha:abc", 0, 3)
 
 
+
+def _seed_consistency(logits, token_ids, u_values, *, t, top_k, top_p,
+                      stochastic_threshold):
+    """(n_stochastic, n_exact_match) via the production diagnostics path."""
+    d = fs.seed_consistency_diagnostics(
+        logits, token_ids, u_values, t=t, top_k=top_k, top_p=top_p,
+        stochastic_threshold=stochastic_threshold, boundary_epsilon=0.0)
+    return d.n_stochastic, d.n_exact_match
+
 def test_seed_consistency_perfect_when_tokens_follow_u():
     # two peaked positions (argmax ~1 -> not stochastic) + two flat positions (stochastic)
     logits = torch.tensor([[10.0, 0.0, 0.0],      # argmax token 0
@@ -56,7 +65,7 @@ def test_seed_consistency_perfect_when_tokens_follow_u():
     u = [fs.u_at("r", 0, "c", 0, t) for t in range(4)]
     # tokens = what the forced u actually picks (honest miner)
     tokens = [fs.pick(fs.warp(logits[i], t=0.6, top_k=20, top_p=0.95), u[i]) for i in range(4)]
-    n_stoch, n_match = fs.seed_consistency(
+    n_stoch, n_match = _seed_consistency(
         logits, tokens, u, t=0.6, top_k=20, top_p=0.95, stochastic_threshold=0.99)
     assert n_stoch >= 1
     assert n_match == n_stoch                       # honest -> every stochastic pos matches
@@ -67,7 +76,7 @@ def test_seed_consistency_low_when_tokens_ignore_u():
     u = [fs.u_at("r", 0, "c", 0, t) for t in range(3)]
     wrong = [fs.u_at("OTHER", 0, "c", 0, t) for t in range(3)]
     tokens = [fs.pick(fs.warp(logits[i], t=0.6, top_k=20, top_p=0.95), wrong[i]) for i in range(3)]
-    n_stoch, n_match = fs.seed_consistency(
+    n_stoch, n_match = _seed_consistency(
         logits, tokens, u, t=0.6, top_k=20, top_p=0.95, stochastic_threshold=0.99)
     assert n_stoch >= 1
     assert n_match < n_stoch                         # ignoring u -> mismatches appear
@@ -102,14 +111,14 @@ def test_seed_consistency_matches_per_position_reference_on_batch():
         p = fs.pick(fs.warp(logits[i], t=0.6, top_k=20, top_p=0.95), u[i])
         tokens.append(p if i % 3 else (p + 1) % vocab)   # corrupt ~1/3
     kw = dict(t=0.6, top_k=20, top_p=0.95, stochastic_threshold=0.99)
-    got = fs.seed_consistency(logits, tokens, u, **kw)
+    got = _seed_consistency(logits, tokens, u, **kw)
     ref = _seed_consistency_reference(logits, tokens, u, **kw)
     assert got == ref
     assert ref[0] > 0 and ref[1] < ref[0]            # meaningful: stochastic + mismatches
 
 
 def test_seed_consistency_empty_batch_returns_zeros():
-    assert fs.seed_consistency(
+    assert _seed_consistency(
         torch.zeros(0, 5), [], [], t=0.6, top_k=20, top_p=0.95,
         stochastic_threshold=0.99) == (0, 0)
 
@@ -122,7 +131,7 @@ def test_seed_consistency_truncates_to_shortest_input():
     tokens = [fs.pick(fs.warp(logits[i], t=0.6, top_k=20, top_p=0.95), u[i])
               for i in range(4)]
     kw = dict(t=0.6, top_k=20, top_p=0.95, stochastic_threshold=0.99)
-    assert fs.seed_consistency(logits, tokens, u, **kw) == \
+    assert _seed_consistency(logits, tokens, u, **kw) == \
         _seed_consistency_reference(logits, tokens, u, **kw)
 
 
