@@ -157,7 +157,10 @@ async def test_archive_includes_prompt_and_rollout_content():
             "status": "selected",
             "proof_attempted": True,
             "proof_passed": True,
-            "rank_entropy_source": "seal_drand",
+            "arrival_drand_round": 103,
+            "arrival_round_source": "arrival",
+            "tier": 0,
+            "tier_size": 1,
             "operator_id": "operator-a",
         },
         id(runner): {
@@ -258,7 +261,10 @@ async def test_archive_includes_prompt_and_rollout_content():
     assert entry0["difficulty_auction_status"] == "selected"
     assert entry0["difficulty_auction_proof_attempted"] is True
     assert entry0["difficulty_auction_proof_passed"] is True
-    assert entry0["difficulty_auction_rank_entropy_source"] == "seal_drand"
+    assert entry0["difficulty_auction_arrival_drand_round"] == 103
+    assert entry0["difficulty_auction_arrival_round_source"] == "arrival"
+    assert entry0["difficulty_auction_tier"] == 0
+    assert entry0["difficulty_auction_tier_size"] == 1
     assert entry0["difficulty_auction_operator_id"] == "operator-a"
 
     # eos detection: rollout 0 of entry 0 ends with eos_token_id=99 → True.
