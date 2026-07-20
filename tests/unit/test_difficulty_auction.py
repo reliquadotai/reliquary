@@ -112,3 +112,26 @@ def test_complete_operator_mapping_applies_the_counterfactual_cap():
     assert result.operator_mapping_complete is True
     assert result.operator_cap_applied is True
     assert len(result.selected) == 1
+
+
+def test_rank_key_breaks_score_ties_by_arrival_round():
+    from reliquary.validator.difficulty_auction import (
+        ShadowSubmission, _rank_key, difficulty_score,
+    )
+
+    def _sub(source_id, hotkey, arrival):
+        return ShadowSubmission(
+            source_id=source_id, hotkey=hotkey, prompt_idx=source_id,
+            drand_round=999, merkle_root=b"\x00" * 32,
+            selection_digest=hotkey.encode().ljust(32, b"\x00"),
+            rewards=(1.0, 1.0) + (0.0,) * 6,
+            arrival_drand_round=arrival,
+        )
+
+    slow = _sub(1, "slow", 105)
+    fast = _sub(2, "fast", 103)
+    ranked = sorted(
+        ((s, difficulty_score(s.rewards, delta=1.0)) for s in (slow, fast)),
+        key=_rank_key,
+    )
+    assert [s.hotkey for s, _ in ranked] == ["fast", "slow"]

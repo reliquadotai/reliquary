@@ -28,6 +28,7 @@ class ShadowSubmission:
     selection_digest: bytes
     rewards: tuple[float, ...]
     in_cooldown: bool = False
+    arrival_drand_round: int | None = None
 
 
 @dataclass(frozen=True)
@@ -102,10 +103,17 @@ def submission_score(
 def _rank_key(
     item: tuple[ShadowSubmission, DifficultyScore],
 ) -> tuple[float, int, bytes]:
+    """Mirror of the production ranking: score gates, validator-observed
+    arrival breaks ties (miner-submitted round is the fallback), canonical
+    hash orders within a tier for display only."""
     submission, score = item
+    arrival = getattr(submission, "arrival_drand_round", None)
+    chronological = (
+        arrival if arrival is not None else submission.drand_round
+    )
     return (
         -score.value,
-        int(submission.drand_round),
+        int(chronological),
         _within_slot_key(submission),
     )
 
