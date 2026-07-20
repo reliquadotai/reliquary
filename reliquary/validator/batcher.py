@@ -3923,6 +3923,14 @@ class GrpoWindowBatcher:
         if self.difficulty_auction_enabled:
             self._prove_ranked(pool)
             self._prove_forensic_sample()
+        # Auction mode replaces the chronological slot key with the rank
+        # tier: the v1 machinery then pays full tiers a slot each and
+        # fair-splits the boundary tier. `.get(..., 0)` collapses to one
+        # tier for test doubles that bypass _prove_ranked.
+        slot_round_of = None
+        if self.difficulty_auction_enabled:
+            tier_of = self._auction_tier_by_id
+            slot_round_of = lambda sub: tier_of.get(id(sub), 0)
         with self._lock:
             self.selection_metadata_by_id = explain_batch_selection(
                 submissions=self._valid,
@@ -3930,6 +3938,7 @@ class GrpoWindowBatcher:
                 cooldown_map=self._cooldown,
                 current_window=self.window_start,
                 pool=pool,
+                slot_round_of=slot_round_of,
             )
             batch, rewards = select_batch_and_distribute(
                 submissions=self._valid,
@@ -3937,6 +3946,7 @@ class GrpoWindowBatcher:
                 cooldown_map=self._cooldown,
                 current_window=self.window_start,
                 pool=pool,
+                slot_round_of=slot_round_of,
             )
             if self.difficulty_auction_enabled:
                 self.difficulty_auction_shadow = {

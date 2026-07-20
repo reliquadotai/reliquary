@@ -679,3 +679,56 @@ def test_prompt_falls_to_next_tier_when_winning_tier_fails():
     assert [s.hotkey for s in b.valid_submissions()] == ["honest"]
     assert rewards == {"honest": pytest.approx(1.0 / B_BATCH)}
     assert b.proof_failure_debt("faker") == 1
+
+
+def test_same_prompt_same_tier_splits_the_prompt_share():
+    from tests.unit.test_grpo_window_batcher import _make_batcher, _request
+
+    b = _make_batcher()
+    for hk in ("op-a", "op-b"):
+        _accept(b, _request(prompt_idx=7, hotkey=hk), arrival_round=100)
+    batch, rewards = b.seal_batch()
+
+    share = 1.0 / B_BATCH
+    assert rewards["op-a"] == pytest.approx(share / 2)
+    assert rewards["op-b"] == pytest.approx(share / 2)
+    assert len(b.valid_submissions()) == 2   # both proven, both paid
+    assert len(batch) == 1                   # one training representative
+
+
+def test_same_prompt_split_survivor_takes_full_share():
+    from tests.unit.test_grpo_window_batcher import (
+        _always_false_grail, _always_true_grail, _make_batcher, _request,
+    )
+
+    def _fail_marked(commit, model, randomness):
+        if commit["tokens"][0] >= 1000:
+            return _always_false_grail(commit, model, randomness)
+        return _always_true_grail(commit, model, randomness)
+
+    b = _make_batcher(verify_commitment_proofs_fn=_fail_marked)
+    _accept(b, _request(prompt_idx=7, hotkey="honest"), arrival_round=100)
+    _accept(b, _shift_tokens(_request(prompt_idx=7, hotkey="cheat"), 1000),
+            arrival_round=100)
+    _batch, rewards = b.seal_batch()
+
+    assert rewards == {"honest": pytest.approx(1.0 / B_BATCH)}
+
+
+def test_boundary_tier_fair_split_payout():
+    from tests.unit.test_grpo_window_batcher import _make_batcher, _request
+
+    b = _make_batcher()
+    for i in range(B_BATCH - 2):
+        _accept(b, _request(prompt_idx=i, hotkey=f"a{i}"), arrival_round=100)
+    for j in range(3):
+        _accept(b, _request(prompt_idx=10 + j, hotkey=f"b{j}"), arrival_round=101)
+    batch, rewards = b.seal_batch()
+
+    share = 1.0 / B_BATCH
+    for i in range(B_BATCH - 2):
+        assert rewards[f"a{i}"] == pytest.approx(share)
+    for j in range(3):
+        assert rewards[f"b{j}"] == pytest.approx(2 * share / 3)
+    assert sum(rewards.values()) == pytest.approx(1.0)
+    assert len(batch) == B_BATCH

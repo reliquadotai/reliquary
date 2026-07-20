@@ -757,21 +757,28 @@ def test_seal_batch_empty_pool_returns_empty():
 
 
 def test_auction_equal_score_order_ignores_submitted_drand_round():
-    """A tolerated older round must not buy priority in an equal-score tie."""
+    """A tolerated older SUBMITTED round must not buy priority in an
+    equal-score tie: ordering follows the validator-observed arrival round,
+    which a miner cannot antedate."""
+    from reliquary.validator.observability import SubmitTelemetry
 
-    def seal_with(rounds):
+    def seal_with(submitted_rounds):
         b = _make_batcher()
-        b.seal_randomness = "post-deadline-beacon"
-        for prompt_idx, drand_round in enumerate(rounds):
+        for prompt_idx, submitted in enumerate(submitted_rounds):
             hotkey = f"miner-{prompt_idx}"
             req = _request(prompt_idx=prompt_idx, hotkey=hotkey)
-            req.drand_round = drand_round
-            assert b.accept_submission(req).accepted
+            req.drand_round = submitted
+            tel = SubmitTelemetry.from_request(req, t_arrival=0.0)
+            tel.arrival_drand_round = 200 + prompt_idx  # true arrival order
+            assert b.accept_submission(req, telemetry=tel).accepted
         b.seal_batch()
         return {submission.hotkey for submission in b.valid_submissions()}
 
     ascending = tuple(range(1, 10))
-    assert seal_with(ascending) == seal_with(tuple(reversed(ascending)))
+    winners = seal_with(ascending)
+    assert winners == seal_with(tuple(reversed(ascending)))
+    # Arrival decides: the slowest (9th) arrival is the one excluded.
+    assert winners == {f"miner-{i}" for i in range(8)}
 
 
 def test_seal_batch_cooldown_recorded():
@@ -813,11 +820,10 @@ def test_distinct_prompts_in_batch_only():
     """One submission per winning prompt enters the training batch, even when
     multiple miners successfully submitted on the same prompt.
 
-    BEHAVIOUR CHANGE (ranked proving): only the top-ranked candidate per prompt
-    is proven, so a prompt's slot now pays ONE miner in full instead of being
-    split K ways. Alice and Bob tie on value and drand round, so the canonical
-    tie-break picks one — expected-value identical to the old 1/16 split, still
-    sybil-neutral (N hotkeys on one prompt win at most that prompt's one slot).
+    BEHAVIOUR CHANGE (speed-ranked tiers): alice and bob tie exactly on
+    (score, arrival), so BOTH are proven and split prompt 42's slot share;
+    one canonical representative trains. Still sybil-neutral: the prompt's
+    total payout is one slot share regardless of K.
     """
     b = _make_batcher()
     b.accept_submission(_request(prompt_idx=42, hotkey="alice"))
@@ -826,10 +832,9 @@ def test_distinct_prompts_in_batch_only():
     batch, rewards = b.seal_batch()
     assert len(batch) == 2
     assert {s.prompt_idx for s in batch} == {42, 7}
-    # Each filled slot pays pool / B_BATCH = 1/8, to the prompt's single winner.
-    prompt_42_winner = {"alice", "bob"} & set(rewards)
-    assert len(prompt_42_winner) == 1
-    assert abs(rewards[prompt_42_winner.pop()] - 1 / 8) < 1e-9
+    # Prompt 42's slot share (1/8) splits between its two tied miners.
+    assert abs(rewards["alice"] - 1 / 16) < 1e-9
+    assert abs(rewards["bob"] - 1 / 16) < 1e-9
     assert abs(rewards["carol"] - 1 / 8) < 1e-9
 
 
