@@ -249,7 +249,10 @@ def test_decision_ts_of_a_proof_stage_reject_is_the_admission_instant():
 
 
 def test_proving_stops_once_b_submissions_pass():
-    """The GPU saving. We must not prove candidate 9 when 8 have already passed."""
+    """The GPU saving. Distinct arrival tiers: we must not prove candidate 9
+    when 8 earlier-tier candidates have already passed. (Candidates in ONE
+    tier are all proven — the fair-split pays them all — so this test gives
+    each candidate its own arrival round.)"""
     from reliquary.constants import B_BATCH, M_ROLLOUTS
     from tests.unit.test_grpo_window_batcher import (
         _always_true_grail, _make_batcher, _request,
@@ -263,7 +266,7 @@ def test_proving_stops_once_b_submissions_pass():
 
     b = _make_batcher(verify_commitment_proofs_fn=_counting_proof)
     for i in range(12):
-        b.accept_submission(_request(prompt_idx=i, hotkey=f"m{i}"))
+        _accept(b, _request(prompt_idx=i, hotkey=f"m{i}"), arrival_round=100 + i)
 
     b.seal_batch()
 
@@ -436,8 +439,10 @@ def test_forensic_sample_disabled_without_seal_randomness():
 
     b = _make_batcher(verify_commitment_proofs_fn=_counting)
     assert b.seal_randomness == ""              # unset by default
+    # Distinct arrival tiers, so exactly 8 winners exist (one shared tier
+    # would be boundary-fair-split and proven in full).
     for i in range(20):
-        b.accept_submission(_request(prompt_idx=i, hotkey=f"m{i}"))
+        _accept(b, _request(prompt_idx=i, hotkey=f"m{i}"), arrival_round=100 + i)
 
     b.seal_batch()
 
@@ -459,7 +464,8 @@ def test_forensic_sample_watches_non_winners_keyed_on_seal_randomness():
         b = _make_batcher(verify_commitment_proofs_fn=_always_true_grail)
         b.seal_randomness = seal_rand
         for i in range(20):
-            b.accept_submission(_request(prompt_idx=i, hotkey=f"m{i}"))
+            _accept(b, _request(prompt_idx=i, hotkey=f"m{i}"),
+                    arrival_round=100 + i)
         b.seal_batch()
         return b
 
@@ -484,7 +490,7 @@ def test_forensic_sample_failure_cannot_abort_sealing():
     b = _make_batcher(verify_commitment_proofs_fn=_always_true_grail)
     b.seal_randomness = "beacon-round-failure"
     for i in range(B_BATCH + FORENSIC_SAMPLE_PER_WINDOW + 4):
-        b.accept_submission(_request(prompt_idx=i, hotkey=f"m{i}"))
+        _accept(b, _request(prompt_idx=i, hotkey=f"m{i}"), arrival_round=100 + i)
 
     original_verify = b._verify_expensive
     calls = 0
@@ -537,3 +543,139 @@ def test_score_ranks_only_inside_the_calibrated_sigma_band():
     assert r8.accepted is False and r8.reason == RejectReason.OUT_OF_ZONE
     r0 = b.accept_submission(_request(prompt_idx=4, hotkey="k0", rewards=[0.0] * 8))
     assert r0.accepted is False and r0.reason == RejectReason.OUT_OF_ZONE
+
+
+# ---------------- speed-ranked auction (score, arrival_round) ----------------
+
+import pytest
+
+from reliquary.constants import B_BATCH
+
+
+def _telemetry(prompt_idx, hotkey, arrival_round):
+    from reliquary.validator.observability import SubmitTelemetry
+    return SubmitTelemetry(
+        window_n=500, prompt_idx=prompt_idx, hotkey=hotkey,
+        merkle_root="00" * 32, protocol_version=2,
+        submitted_drand_round=arrival_round, t_arrival=0.0,
+        prompt_hash_lead="", merkle_root_lead="",
+        arrival_drand_round=arrival_round,
+    )
+
+
+def _accept(b, req, arrival_round):
+    resp = b.accept_submission(
+        req, telemetry=_telemetry(req.prompt_idx, req.miner_hotkey, arrival_round)
+    )
+    assert resp.accepted is True
+
+
+def _shift_tokens(req, offset):
+    """Mark a request's rollouts so a test proof fn can target it."""
+    for rollout in req.rollouts:
+        tokens = [t + offset for t in rollout.tokens]
+        rollout.tokens = tokens
+        rollout.commit["tokens"] = tokens
+    return req
+
+
+def test_equal_score_earlier_arrival_ranks_first():
+    from tests.unit.test_grpo_window_batcher import _make_batcher, _request
+
+    b = _make_batcher()
+    _accept(b, _request(prompt_idx=1, hotkey="slow"), arrival_round=105)
+    _accept(b, _request(prompt_idx=2, hotkey="fast"), arrival_round=103)
+    b.seal_batch()
+
+    rows = {r["hotkey"]: r for r in b.auction_candidates}
+    assert rows["fast"]["rank"] < rows["slow"]["rank"]
+    assert rows["fast"]["tier"] < rows["slow"]["tier"]
+    assert rows["fast"]["arrival_round_source"] == "arrival"
+
+
+def test_score_dominates_speed():
+    from tests.unit.test_grpo_window_batcher import _make_batcher, _request
+
+    b = _make_batcher()
+    _accept(b, _request(prompt_idx=1, hotkey="fast-easy",
+                        rewards=[1.0] * 6 + [0.0] * 2), arrival_round=100)
+    _accept(b, _request(prompt_idx=2, hotkey="slow-hard",
+                        rewards=[1.0] * 2 + [0.0] * 6), arrival_round=199)
+    b.seal_batch()
+
+    rows = {r["hotkey"]: r for r in b.auction_candidates}
+    assert rows["slow-hard"]["rank"] == 1
+
+
+def test_speed_decides_the_last_slot_between_equal_scores():
+    from tests.unit.test_grpo_window_batcher import _make_batcher, _request
+
+    b = _make_batcher()
+    for i in range(B_BATCH):
+        _accept(b, _request(prompt_idx=i, hotkey=f"fast{i}"), arrival_round=103)
+    _accept(b, _request(prompt_idx=99, hotkey="slow"), arrival_round=104)
+    _batch, rewards = b.seal_batch()
+
+    assert "slow" not in rewards
+    assert b.proof_attempts == B_BATCH        # the losing tier is never proven
+    rows = {r["hotkey"]: r for r in b.auction_candidates}
+    assert rows["slow"]["status"] == "not_needed"
+    assert rows["slow"]["proof_attempted"] is False
+
+
+def test_no_telemetry_falls_back_to_submitted_round():
+    from tests.unit.test_grpo_window_batcher import _make_batcher, _request
+
+    b = _make_batcher()
+    slow = _request(prompt_idx=1, hotkey="slow")
+    slow.drand_round = 105
+    fast = _request(prompt_idx=2, hotkey="fast")
+    fast.drand_round = 103
+    assert b.accept_submission(slow).accepted
+    assert b.accept_submission(fast).accepted
+    b.seal_batch()
+
+    rows = {r["hotkey"]: r for r in b.auction_candidates}
+    assert rows["fast"]["rank"] < rows["slow"]["rank"]
+    assert rows["fast"]["arrival_round_source"] == "submitted_fallback"
+
+
+def test_boundary_tier_is_fully_proven_and_marked():
+    """2 slots left, boundary tier holds 3 prompts: all 3 proven (they all
+    earn), tiers beyond the boundary never proven."""
+    from tests.unit.test_grpo_window_batcher import _make_batcher, _request
+
+    b = _make_batcher()
+    for i in range(B_BATCH - 2):
+        _accept(b, _request(prompt_idx=i, hotkey=f"a{i}"), arrival_round=100)
+    for j in range(3):
+        _accept(b, _request(prompt_idx=10 + j, hotkey=f"b{j}"), arrival_round=101)
+    _accept(b, _request(prompt_idx=20, hotkey="late"), arrival_round=102)
+    b.seal_batch()
+
+    assert b.proof_attempts == (B_BATCH - 2) + 3
+    rows = {r["hotkey"]: r for r in b.auction_candidates}
+    assert rows["late"]["proof_attempted"] is False
+    for j in range(3):
+        assert rows[f"b{j}"]["proof_passed"] is True
+
+
+def test_prompt_falls_to_next_tier_when_winning_tier_fails():
+    from tests.unit.test_grpo_window_batcher import (
+        _always_false_grail, _always_true_grail, _make_batcher, _request,
+    )
+
+    def _fail_marked(commit, model, randomness):
+        if commit["tokens"][0] >= 1000:
+            return _always_false_grail(commit, model, randomness)
+        return _always_true_grail(commit, model, randomness)
+
+    b = _make_batcher(verify_commitment_proofs_fn=_fail_marked)
+    _accept(b, _shift_tokens(_request(prompt_idx=5, hotkey="faker"), 1000),
+            arrival_round=100)
+    _accept(b, _request(prompt_idx=5, hotkey="honest"), arrival_round=101)
+    _batch, rewards = b.seal_batch()
+
+    assert [s.hotkey for s in b.valid_submissions()] == ["honest"]
+    assert rewards == {"honest": pytest.approx(1.0 / B_BATCH)}
+    assert b.proof_failure_debt("faker") == 1
