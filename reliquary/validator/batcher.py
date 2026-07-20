@@ -473,6 +473,7 @@ class GrpoWindowBatcher:
         drand_round_backward_tolerance: int | None = None,
         queue_drained_predicate: Callable[[], bool] | None = None,
         operator_by_hotkey: dict[str, str] | None = None,
+        current_round_fn: Callable[[], int | None] | None = None,
     ) -> None:
         from reliquary.constants import DRAND_ROUND_BACKWARD_TOLERANCE
 
@@ -693,6 +694,9 @@ class GrpoWindowBatcher:
         # submissions finish GRAIL (queue empty AND no proof in flight)
         # before the batch is sealed.
         self._queue_drained_predicate = queue_drained_predicate
+        # Wall-clock drand round source for the early-close same-round guard;
+        # tests inject, production derives from the drand chain info.
+        self._current_round_fn = current_round_fn
         self.force_seal_reason: str | None = None
         # Proof-admission accounting is separate from ``_lock`` because the
         # submit worker holds ``_lock`` during GRAIL. The HTTP cheap path must
@@ -3471,6 +3475,68 @@ class GrpoWindowBatcher:
         if len(claimed) >= B_BATCH:
             return "close", None, boundary_round
         return "wait", None, None
+
+    def _current_round(self) -> int | None:
+        """Wall-clock drand round, for the same-round close guard. ``None``
+        (mock mode / drand outage) fails safe: the close never fires and the
+        collection deadline seals as today."""
+        if self._current_round_fn is not None:
+            try:
+                return self._current_round_fn()
+            except Exception:
+                return None
+        if not self.drand_round_check_enabled:
+            return None
+        try:
+            if self._drand_chain_info is None:
+                from reliquary.infrastructure.drand import get_current_chain
+                self._drand_chain_info = get_current_chain()
+            from reliquary.infrastructure.chain import (
+                compute_current_drand_round,
+            )
+            ci = self._drand_chain_info
+            return int(compute_current_drand_round(
+                self._wall_clock(), ci["genesis_time"], ci["period"],
+            ))
+        except Exception:
+            return None
+
+    def _try_early_close(self) -> bool:
+        """Seal now iff the auction outcome is proven frozen.
+
+        ``force_seal`` runs under ``_upload_precommit_lock`` so a racing
+        precommit either lands before the emptiness check (blocking the
+        close) or observes the seal flag inside ``try_register_upload_precommit``
+        and is rejected — no reservation can straddle the close. Queue
+        stragglers with earlier arrival stamps are covered downstream: the
+        seal drain admits them and ``_prove_ranked`` re-walks the full
+        population.
+        """
+        with self._lock:
+            action, _target, boundary_round = (
+                self._early_close_next_action_locked()
+            )
+        if action != "close":
+            return self._seal_flag.is_set()
+        current = self._current_round()
+        if (
+            current is None
+            or boundary_round is None
+            or current <= boundary_round
+        ):
+            return self._seal_flag.is_set()
+        if self.early_close_armed_round is None:
+            self.early_close_armed_round = current
+        now = self._time_fn()
+        with self._upload_precommit_lock:
+            if self._seal_flag.is_set():
+                return True
+            self._prune_upload_precommits_locked(now)
+            if self._upload_precommits:
+                return False
+            self.early_close_sealed_round = current
+            self.force_seal("proven_dominance_close")
+        return True
 
     def _arrival_round_of(self, pending: PendingSubmission) -> tuple[int, str]:
         """Validator-observed arrival round; miner-submitted round is the

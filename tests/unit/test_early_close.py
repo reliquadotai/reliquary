@@ -154,3 +154,56 @@ def test_walk_reports_exhausted_budget():
     b.early_close_proof_attempts = MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
     with b._lock:
         assert b._early_close_next_action_locked() == ("exhausted", None, None)
+
+
+def _saturate(b):
+    from reliquary.constants import B_BATCH
+
+    subs = [
+        _accept(b, prompt_idx=i, hotkey=f"hk{i}", drand_round=10 + i)
+        for i in range(B_BATCH)
+    ]
+    for p in subs:
+        b._early_proof_results[id(p)] = b._verify_expensive(p)
+    return subs
+
+
+def test_try_early_close_seals_with_reason_and_round():
+    b = _auction_batcher(current_round_fn=lambda: 100)
+    _saturate(b)
+    assert b._try_early_close() is True
+    assert b.is_sealed() is True
+    assert b.force_seal_reason == "proven_dominance_close"
+    assert b.early_close_sealed_round == 100
+
+
+def test_try_early_close_blocked_by_same_round_arrival_window():
+    """3 s round granularity: while the current round equals the boundary
+    tier's round, an equal-key arrival could still join the fair-split."""
+    from reliquary.constants import B_BATCH
+
+    b = _auction_batcher(current_round_fn=lambda: 10 + B_BATCH - 1)
+    _saturate(b)                                     # boundary round = 17
+    assert b._try_early_close() is False
+    assert b.is_sealed() is False
+
+
+def test_try_early_close_blocked_by_pending_upload_precommit():
+    b = _auction_batcher(current_round_fn=lambda: 100)
+    _saturate(b)
+    accepted, reason, _ = b.try_register_upload_precommit(
+        "receipt-1",
+        "uploader",
+        t_arrival_wall=b.window_opened_wall_ts + 1.0,
+        payload_bytes=10,
+    )
+    assert accepted, reason
+    assert b._try_early_close() is False
+    assert b.is_sealed() is False
+
+
+def test_try_early_close_noop_without_drand():
+    b = _auction_batcher()                           # no current_round_fn
+    _saturate(b)
+    assert b._try_early_close() is False
+    assert b.is_sealed() is False
