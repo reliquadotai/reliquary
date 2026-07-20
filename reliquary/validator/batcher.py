@@ -3385,6 +3385,15 @@ class GrpoWindowBatcher:
         with self._lock:
             return list(self._pending)
 
+    def _arrival_round_of(self, pending: PendingSubmission) -> tuple[int, str]:
+        """Validator-observed arrival round; miner-submitted round is the
+        mock-mode fallback (production stamps every admitted request)."""
+        telemetry = getattr(pending, "telemetry", None)
+        arrival = getattr(telemetry, "arrival_drand_round", None)
+        if arrival is not None:
+            return int(arrival), "arrival"
+        return int(pending.drand_round), "submitted_fallback"
+
     def _prove_ranked(self, pool: float = 1.0) -> list[ValidSubmission]:
         """Prove candidates in (score, arrival) order until ``B_BATCH`` distinct
         prompts pass. Never prove a candidate that cannot earn.
@@ -3433,20 +3442,9 @@ class GrpoWindowBatcher:
             if operator is None and not self._operator_mapping_enforced:
                 operator = pending_submission.hotkey
             operator_by_id[id(pending_submission)] = operator
-            telemetry = getattr(pending_submission, "telemetry", None)
-            arrival = getattr(telemetry, "arrival_drand_round", None)
-            if arrival is not None:
-                arrival_by_id[id(pending_submission)] = int(arrival)
-                arrival_source_by_id[id(pending_submission)] = "arrival"
-            else:
-                # Mock / no-drand mode only: production stamps the arrival
-                # round on every admitted request.
-                arrival_by_id[id(pending_submission)] = int(
-                    pending_submission.drand_round
-                )
-                arrival_source_by_id[id(pending_submission)] = (
-                    "submitted_fallback"
-                )
+            arrival, source = self._arrival_round_of(pending_submission)
+            arrival_by_id[id(pending_submission)] = arrival
+            arrival_source_by_id[id(pending_submission)] = source
         ranked = sorted(
             scored,
             key=lambda item: (
