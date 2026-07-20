@@ -290,7 +290,7 @@ SPARSE_VALID_MAX_WINDOW_SECONDS = 900.0
 # Sized from live data (math gen median ~176s, p75 ~267s; windows already ran
 # ~277s of collection). An early seal would be the speed race we are removing —
 # whoever triggered it would cut off slow-but-hard submissions still generating.
-WINDOW_COLLECTION_SECONDS = 300.0
+WINDOW_COLLECTION_SECONDS = 100.0
 
 # Difficulty-auction v2: number of ranked-pass non-winners proven per window
 # purely for the forensic auth gates (token-auth, distribution, forced-seed),
