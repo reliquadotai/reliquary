@@ -477,3 +477,31 @@ def test_boundary_round_picks_canonical_prompts_for_training():
     trained_boundary = [s.prompt_idx for s in batch if s.drand_round == 2]
     # First 2 by canonical hash order.
     assert trained_boundary == expected_order[:2]
+
+
+def test_slot_round_of_overrides_drand_round_grouping():
+    """The difficulty auction passes a rank-tier ordinal instead of the
+    miner-attached round; the split machinery must group by that override."""
+    cd = CooldownMap(cooldown_windows=50)
+    # Same miner-attached drand_round, but the override puts them in
+    # different chronological slots -> two slots, one full share each.
+    a = _sub("a", prompt_idx=1, drand_round=100)
+    b = _sub("b", prompt_idx=2, drand_round=100)
+    tiers = {id(a): 0, id(b): 1}
+
+    batch, rewards = select_batch_and_distribute(
+        submissions=[a, b], b=2, cooldown_map=cd, current_window=100,
+        pool=1.0, slot_round_of=lambda s: tiers[id(s)],
+    )
+    assert rewards == {"a": 0.5, "b": 0.5}
+    assert [s.hotkey for s in batch] == ["a", "b"]
+
+
+def test_slot_round_of_default_is_drand_round():
+    cd = CooldownMap(cooldown_windows=50)
+    a = _sub("a", prompt_idx=1, drand_round=101)
+    b = _sub("b", prompt_idx=2, drand_round=100)
+    batch, _ = select_batch_and_distribute(
+        submissions=[a, b], b=1, cooldown_map=cd, current_window=100, pool=1.0,
+    )
+    assert [s.hotkey for s in batch] == ["b"]   # earlier round wins the slot

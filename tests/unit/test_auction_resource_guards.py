@@ -220,33 +220,27 @@ def test_missing_production_operator_mapping_fails_closed():
     assert {row["hotkey"] for row in batcher.auction_candidates} == {"mapped"}
 
 
-def test_operator_tiebreak_does_not_change_when_hotkey_changes():
+def test_same_prompt_tie_payout_is_stable_under_hotkey_rename():
+    """Equal-score, equal-arrival candidates on one prompt split its share;
+    renaming an operator's hotkey must not change any operator's payout."""
     def seal_with(operator_a_hotkey):
         mapping = {
             operator_a_hotkey: "operator-a",
             "operator-b-hotkey": "operator-b",
         }
         batcher = _batcher(operator_by_hotkey=mapping)
-        batcher.seal_randomness = "future-drand-beacon"
         for hotkey in mapping:
             assert batcher.accept_submission(
                 _request(prompt_idx=7, hotkey=hotkey)
             ).accepted
-        batcher.seal_batch()
-        winner = batcher.valid_submissions()[0]
-        rows = {mapping[row["hotkey"]]: row for row in batcher.auction_candidates}
-        return mapping[winner.hotkey], rows
+        _batch, rewards = batcher.seal_batch()
+        return {mapping[hk]: amount for hk, amount in rewards.items()}
 
-    first_winner, first_rows = seal_with("operator-a-hotkey-1")
-    second_winner, second_rows = seal_with("operator-a-hotkey-999")
+    first = seal_with("operator-a-hotkey-1")
+    second = seal_with("operator-a-hotkey-999")
 
-    assert first_winner == second_winner
-    assert first_rows["operator-a"]["operator_tiebreak"] == (
-        second_rows["operator-a"]["operator_tiebreak"]
-    )
-    assert {
-        row["rank_entropy_source"] for row in first_rows.values()
-    } == {"seal_drand"}
+    assert first == second
+    assert first["operator-a"] == first["operator-b"]
 
 
 def test_code_grader_outage_never_becomes_an_auction_negative():

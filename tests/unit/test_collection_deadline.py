@@ -64,10 +64,10 @@ def test_late_submission_is_accepted_while_the_window_is_open():
 
 def test_multiple_submissions_per_prompt_are_admitted_and_resolved_at_seal():
     """v2 replaces the PROMPT_CLAIMED admission reject: several hotkeys may submit
-    the same prompt (bounded by MAX_SUBMISSIONS_PER_PROMPT). The same-prompt
-    winner is resolved at SEAL — the first submission that PASSES the proof takes
-    the slot, the rest are dropped — so no wire-level reject is needed and
-    admission never runs the GPU."""
+    the same prompt (bounded by MAX_SUBMISSIONS_PER_PROMPT). Same-prompt
+    resolution happens at SEAL — an exact (score, arrival) tie is proven in
+    full and splits the prompt's share; one representative trains — so no
+    wire-level reject is needed and admission never runs the GPU."""
     from tests.unit.test_grpo_window_batcher import _make_batcher, _request
 
     b = _make_batcher()
@@ -75,10 +75,12 @@ def test_multiple_submissions_per_prompt_are_admitted_and_resolved_at_seal():
     assert b.accept_submission(_request(prompt_idx=7, hotkey="second")).accepted
     assert len(b.pending_submissions()) == 2
 
-    b.seal_batch()
+    batch, rewards = b.seal_batch()
 
     winners = [s for s in b.valid_submissions() if s.prompt_idx == 7]
-    assert len(winners) == 1
+    assert len(winners) == 2                       # exact tie: both proven
+    assert len([s for s in batch if s.prompt_idx == 7]) == 1
+    assert rewards["first"] == rewards["second"]   # split the prompt share
 
 
 def test_code_uses_deferred_proof_and_collection_deadline():

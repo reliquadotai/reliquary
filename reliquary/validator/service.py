@@ -1635,10 +1635,10 @@ class ValidationService:
         # same pool and an env a validator does not run burns its share.
         pool_per_env = 1.0 / len(self.env_mix)
         # Fetch a fresh drand beacon now — AFTER the collection deadline — to key
-        # each batcher's forensic sample and equal-score operator tie-break. Its
-        # randomness did not exist when miners submitted, so neither surface can be
-        # ground in advance. If the fetch fails, the window randomness is the
-        # deterministic ranking fallback and the forensic sample is disabled.
+        # each batcher's forensic sample. Its randomness did not exist when miners
+        # submitted, so the sample cannot be ground in advance. Ranking no longer
+        # consumes it: equal scores are ordered by validator-observed arrival.
+        # If the fetch fails, the forensic sample is disabled for the window.
         seal_randomness = await self._fetch_seal_randomness()
         for b in self._active_batchers.values():
             b.seal_randomness = seal_randomness
@@ -2170,8 +2170,15 @@ class ValidationService:
                 "difficulty_auction_forensic_passed": difficulty_meta.get(
                     "forensic_passed"
                 ),
-                "difficulty_auction_rank_entropy_source": difficulty_meta.get(
-                    "rank_entropy_source"
+                "difficulty_auction_arrival_drand_round": difficulty_meta.get(
+                    "arrival_drand_round"
+                ),
+                "difficulty_auction_arrival_round_source": difficulty_meta.get(
+                    "arrival_round_source"
+                ),
+                "difficulty_auction_tier": difficulty_meta.get("tier"),
+                "difficulty_auction_tier_size": difficulty_meta.get(
+                    "tier_size"
                 ),
                 "difficulty_auction_operator_id": difficulty_meta.get(
                     "operator_id"
