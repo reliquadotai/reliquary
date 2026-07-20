@@ -5,10 +5,7 @@ from reliquary.protocol.crypto import (
     r_vec_from_randomness,
     indices_from_root,
     indices_from_root_in_range,
-    dot_mod_q,
-    create_proof,
 )
-from reliquary.constants import PRIME_Q, CHALLENGE_K
 
 
 class TestPrf:
@@ -154,39 +151,3 @@ class TestIndicesFromRootInRange:
     def test_rejects_negative_start(self):
         with pytest.raises(ValueError):
             indices_from_root_in_range([1], "aa", -1, 5, 2)
-
-
-class TestDotModQ:
-    def test_result_in_range(self):
-        h = torch.randn(128)
-        r = torch.randint(-100, 100, (128,), dtype=torch.int32)
-        result = dot_mod_q(h, r)
-        assert 0 <= result < PRIME_Q
-
-    def test_deterministic(self):
-        torch.manual_seed(42)
-        h = torch.randn(128)
-        r = torch.randint(-100, 100, (128,), dtype=torch.int32)
-        a = dot_mod_q(h, r)
-        b = dot_mod_q(h, r)
-        assert a == b
-
-
-class TestCreateProof:
-    def test_has_indices(self):
-        tokens = list(range(100))
-        proof = create_proof(tokens, "aabbccdd", 100, k=CHALLENGE_K)
-        assert "indices" in proof
-        assert len(proof["indices"]) == CHALLENGE_K
-
-    def test_has_beacon(self):
-        tokens = list(range(100))
-        proof = create_proof(tokens, "aabbccdd", 100)
-        assert "round_R1" in proof
-        assert proof["round_R1"]["randomness"] == "aabbccdd"
-
-    def test_deterministic(self):
-        tokens = list(range(100))
-        a = create_proof(tokens, "aabb", 100)
-        b = create_proof(tokens, "aabb", 100)
-        assert a == b

@@ -12,3 +12,6 @@ wallet_deploy/
 
 # Local Claude Code state
 .claude/
+
+# Session scratch — one-off investigation workspaces, never committed
+.r2_analysis/

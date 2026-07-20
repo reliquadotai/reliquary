@@ -209,11 +209,6 @@ def _is_mock_like(value: Any) -> bool:
     return type(value).__module__.startswith("unittest.mock")
 
 
-def _serialized_submission_bytes(request: BatchSubmissionRequest) -> int:
-    """Canonical post-parse size used by queue-memory accounting."""
-    return len(request.model_dump_json().encode("utf-8"))
-
-
 class _SubmissionBodyLimitMiddleware:
     """Reject oversized /submit bodies before FastAPI parses their JSON.
 
@@ -317,23 +312,6 @@ def _proof_free_model_config(batcher: Any) -> Any | None:
     if config is None or _is_mock_like(config):
         return None
     return config
-
-
-def _coerce_eos_set(eos_ids: Any) -> set[int] | None:
-    if eos_ids is None or _is_mock_like(eos_ids):
-        return None
-    if isinstance(eos_ids, numbers.Integral) and not isinstance(eos_ids, bool):
-        return {int(eos_ids)}
-    if isinstance(eos_ids, (list, tuple, set)):
-        eos_set: set[int] = set()
-        for eos_id in eos_ids:
-            if (
-                isinstance(eos_id, numbers.Integral)
-                and not isinstance(eos_id, bool)
-            ):
-                eos_set.add(int(eos_id))
-        return eos_set or None
-    return None
 
 
 def _proof_free_eos_set(batcher: Any) -> set[int] | None:

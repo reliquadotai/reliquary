@@ -1,4 +1,4 @@
-from reliquary.infrastructure.drand import get_mock_beacon, get_round_at_time, get_beacon
+from reliquary.infrastructure.drand import get_mock_beacon, get_beacon
 
 
 class TestMockBeacon:
@@ -20,21 +20,6 @@ class TestMockBeacon:
     def test_randomness_is_64_chars(self):
         b = get_mock_beacon()
         assert len(b["randomness"]) == 64
-
-
-class TestGetRoundAtTime:
-    def test_genesis(self):
-        # quicknet genesis = 1692803367, period = 3
-        r = get_round_at_time(1692803367)
-        assert r == 1
-
-    def test_after_genesis(self):
-        r = get_round_at_time(1692803367 + 30)
-        assert r == 11  # 1 + 30/3
-
-    def test_before_genesis(self):
-        r = get_round_at_time(0)
-        assert r == 0
 
 
 class TestGetBeacon:

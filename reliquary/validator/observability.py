@@ -547,7 +547,3 @@ def runtime_revision() -> str | None:
         ).strip()
     except Exception:
         return None
-
-
-def current_unix_ts() -> float:
-    return time.time()
