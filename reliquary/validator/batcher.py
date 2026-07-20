@@ -810,6 +810,17 @@ class GrpoWindowBatcher:
         """
         self.window_opened_at = self._time_fn()
         self.window_opened_wall_ts = self._wall_clock()
+        if (
+            self.difficulty_auction_enabled
+            and AUCTION_EARLY_CLOSE_ENFORCE
+            and self._early_close_thread is None
+        ):
+            self._early_close_thread = threading.Thread(
+                target=self._early_close_worker,
+                name=f"early-close-{getattr(self.env, 'name', 'env')}",
+                daemon=True,
+            )
+            self._early_close_thread.start()
 
     def is_sealed(self) -> bool:
         """True once the collection deadline has expired (or a safety-valve
@@ -3538,6 +3549,72 @@ class GrpoWindowBatcher:
             self.force_seal("proven_dominance_close")
         return True
 
+    def _early_close_prove(self, pending: PendingSubmission) -> None:
+        """One serial mid-window proof; budgets and operator debt mirror the
+        ``_prove_ranked`` bookkeeping (hotkey debt is charged inside
+        ``_verify_expensive`` via ``_reject``, exactly as at seal)."""
+        started = self._time_fn()
+        try:
+            sub = self._verify_expensive(pending)
+        finally:
+            elapsed = max(0.0, self._time_fn() - started)
+            with self._lock:
+                self.early_close_proof_attempts += 1
+                self.early_close_proof_wall_seconds += elapsed
+        operator = self._operator_by_hotkey.get(pending.hotkey)
+        if operator is None and not self._operator_mapping_enforced:
+            operator = pending.hotkey
+        with self._lock:
+            self._early_proof_results[id(pending)] = sub
+            if sub is None:
+                self.early_close_proof_failures += 1
+        if sub is None and operator is not None:
+            with self._proof_admission_lock:
+                self._expensive_proof_failures_by_operator[operator] = (
+                    self._expensive_proof_failures_by_operator.get(operator, 0)
+                    + 1
+                )
+
+    def _early_close_step(self) -> str:
+        """One prover decision. Returns ``proved``, ``closed``, ``wait``
+        (nothing provable now, incl. a close blocked by the same-round or
+        precommit guard), ``exhausted`` or ``sealed``."""
+        if self._seal_flag.is_set():
+            return "sealed"
+        with self._lock:
+            action, target, _boundary = self._early_close_next_action_locked()
+        if action == "prove":
+            self._early_close_prove(target)
+            return "proved"
+        if action == "close" and self._try_early_close():
+            return "closed"
+        if action == "exhausted":
+            return "exhausted"
+        return "wait"
+
+    def _early_close_drain(self) -> str:
+        """Step until no immediate progress; the thread sleeps between drains."""
+        while True:
+            outcome = self._early_close_step()
+            if outcome != "proved":
+                return outcome
+
+    def _early_close_worker(self) -> None:
+        """Prove-and-close loop; any exception disables early close for the
+        window (the collection deadline is always the fallback seal)."""
+        try:
+            while True:
+                outcome = self._early_close_drain()
+                if outcome in ("closed", "sealed", "exhausted"):
+                    return
+                time.sleep(AUCTION_EARLY_CLOSE_POLL_SECONDS)
+                if self._seal_flag.is_set():
+                    return
+        except Exception:
+            logger.exception(
+                "early-close prover disabled for window %s", self.window_start,
+            )
+
     def _arrival_round_of(self, pending: PendingSubmission) -> tuple[int, str]:
         """Validator-observed arrival round; miner-submitted round is the
         mock-mode fallback (production stamps every admitted request)."""
@@ -4080,6 +4157,12 @@ class GrpoWindowBatcher:
         self, pool: float = 1.0
     ) -> tuple[list[ValidSubmission], dict[str, float]]:
         """Finalize selection and release every retained payload reservation."""
+        # The early-close prover exits once the seal flag is set; the join
+        # only waits out an in-flight GPU proof, which then lands in the
+        # cache and is reused below instead of re-proven.
+        thread = self._early_close_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=60.0)
         try:
             return self._seal_batch_inner(pool)
         finally:

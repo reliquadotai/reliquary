@@ -207,3 +207,76 @@ def test_try_early_close_noop_without_drand():
     _saturate(b)
     assert b._try_early_close() is False
     assert b.is_sealed() is False
+
+
+def _run_worker_inline(b):
+    """Drive the prover synchronously (no thread) for determinism: keep
+    stepping until nothing is provable right now."""
+    return b._early_close_drain()
+
+
+def test_worker_proves_saturation_and_seals_end_to_end():
+    from reliquary.constants import B_BATCH
+
+    b = _auction_batcher(current_round_fn=lambda: 1000)
+    for i in range(B_BATCH):
+        _accept(b, prompt_idx=i, hotkey=f"hk{i}", drand_round=10 + i)
+    _run_worker_inline(b)
+    assert b.is_sealed()
+    assert b.force_seal_reason == "proven_dominance_close"
+    assert b.early_close_proof_attempts == B_BATCH
+    batch, rewards = b.seal_batch(pool=1.0)
+    assert len(batch) == B_BATCH            # all proven from cache, no re-proof
+    assert sum(rewards.values()) > 0
+    assert b.proof_attempts == B_BATCH      # nothing re-proven at seal
+
+
+def test_worker_failure_then_refill_then_close():
+    from reliquary.constants import B_BATCH
+
+    b = _auction_batcher(current_round_fn=lambda: 1000)
+    real_verify = b._verify_expensive
+
+    def _verify(p):
+        return None if p.hotkey == "hk_bait" else real_verify(p)
+
+    b._verify_expensive = _verify
+    for i in range(B_BATCH - 1):
+        _accept(b, prompt_idx=i, hotkey=f"hk{i}", drand_round=10 + i)
+    _accept(b, prompt_idx=50, hotkey="hk_bait", drand_round=9)  # ranks first
+    _run_worker_inline(b)                    # bait fails, coverage stuck at 7
+    assert not b.is_sealed()
+    assert b.early_close_proof_failures == 1
+    _accept(b, prompt_idx=60, hotkey="hk_fresh", drand_round=30)
+    _run_worker_inline(b)
+    assert b.is_sealed()
+    assert b.force_seal_reason == "proven_dominance_close"
+
+
+def test_worker_thread_lifecycle_and_kill_switch(monkeypatch):
+    import reliquary.validator.batcher as batcher_mod
+
+    b = _auction_batcher(current_round_fn=lambda: 1000)
+    monkeypatch.setattr(batcher_mod, "AUCTION_EARLY_CLOSE_ENFORCE", False)
+    b.mark_window_opened()
+    assert b._early_close_thread is None      # kill switch: no thread
+
+    b2 = _auction_batcher(current_round_fn=lambda: 1000)
+    monkeypatch.setattr(batcher_mod, "AUCTION_EARLY_CLOSE_ENFORCE", True)
+    b2.mark_window_opened()
+    assert b2._early_close_thread is not None
+    b2.force_seal("test")                     # any seal stops the worker
+    b2._early_close_thread.join(timeout=10)
+    assert not b2._early_close_thread.is_alive()
+
+
+def test_worker_exception_is_a_safety_valve_not_a_crash():
+    b = _auction_batcher(current_round_fn=lambda: 1000)
+    _accept(b, prompt_idx=1, hotkey="hk1")
+
+    def _boom(p):
+        raise RuntimeError("gpu on fire")
+
+    b._verify_expensive = _boom
+    b._early_close_worker()                   # safety valve: returns, no raise
+    assert not b.is_sealed()                  # deadline path still owns the seal
