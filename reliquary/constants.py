@@ -529,6 +529,15 @@ DIFFICULTY_AUCTION_ENVIRONMENTS = (
     "opencodeinstruct",
 )
 
+# Proven-dominance early close: seal an auction window before the collection
+# deadline once B_BATCH distinct prompts are covered by GPU-PROVEN candidates
+# at the theoretical difficulty ceiling (no future arrival can change the
+# outcome). OFF restores the deadline-only seal bit-for-bit.
+AUCTION_EARLY_CLOSE_ENFORCE = _os.environ.get(
+    "RELIQUARY_AUCTION_EARLY_CLOSE_ENFORCE", "1"
+).strip().lower() not in ("0", "false", "no", "off", "")
+AUCTION_EARLY_CLOSE_POLL_SECONDS = 1.0
+
 ENFORCE_ENVELOPE_SIGNATURE = _os.environ.get(
     "RELIQUARY_ENFORCE_ENVELOPE_SIGNATURE", "1"
 ).strip().lower() not in ("0", "false", "no", "off", "")
