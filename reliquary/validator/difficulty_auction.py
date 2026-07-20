@@ -8,6 +8,7 @@ quietly changing consensus behavior under a "shadow" label.
 
 from __future__ import annotations
 
+import functools
 import math
 from collections import Counter
 from dataclasses import dataclass
@@ -90,6 +91,25 @@ def difficulty_score(
     reward_std = variance**0.5
     value = reward_std * (1.0 - mean_reward) ** delta
     return DifficultyScore(value, mean_reward, reward_std, count)
+
+
+@functools.lru_cache(maxsize=None)
+def max_difficulty_value(reward_count: int, *, delta: float = 1.0) -> float:
+    """Exact float ceiling of ``difficulty_score`` over achievable rewards.
+
+    For a fixed mean, std is maximized only by extremal (all 0/1) profiles,
+    so the global maximum is attained on a binary profile; enumerating k is
+    exhaustive. Computed through ``difficulty_score`` itself so the value
+    compares bit-for-bit (``==``) with candidate scores.
+    """
+    if reward_count <= 0:
+        return 0.0
+    return max(
+        difficulty_score(
+            [1.0] * k + [0.0] * (reward_count - k), delta=delta
+        ).value
+        for k in range(reward_count + 1)
+    )
 
 
 def submission_score(
