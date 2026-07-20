@@ -3398,6 +3398,80 @@ class GrpoWindowBatcher:
         with self._lock:
             return list(self._pending)
 
+    def _early_close_next_action_locked(
+        self,
+    ) -> tuple[str, PendingSubmission | None, int | None]:
+        """Next early-close step over the paying V_MAX tiers. Under ``_lock``.
+
+        Mirrors ``_prove_ranked``'s tier walk restricted to the V_MAX prefix
+        of the ranking (kept separate because ``_prove_ranked`` interleaves
+        row bookkeeping and budget mutation with the walk; the agreement of
+        the two walks is pinned by tests). Returns one of:
+        ``("prove", candidate, None)`` — next unproven paying member;
+        ``("close", None, boundary_round)`` — coverage proven, outcome frozen;
+        ``("wait", None, None)`` — nothing provable yet;
+        ``("exhausted", None, None)`` — window proof budget spent.
+        """
+        if (
+            self.early_close_proof_attempts
+            >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+            or self.early_close_proof_wall_seconds >= MAX_PROOF_WALL_SECONDS
+        ):
+            return "exhausted", None, None
+        pool = [
+            p for p in self._pending
+            if p.value == max_difficulty_value(
+                len(p.rewards), delta=DIFFICULTY_AUCTION_DELTA
+            )
+        ]
+        if not pool:
+            return "wait", None, None
+        pool.sort(
+            key=lambda p: (self._arrival_round_of(p)[0], _within_slot_key(p))
+        )
+        claimed: set[int] = set()
+        boundary_round: int | None = None
+        tier_round: int | None = None
+        claimed_before_tier: set[int] = set()
+        for p in pool:
+            arrival = self._arrival_round_of(p)[0]
+            if arrival != tier_round:
+                # Tier boundary: stop BEFORE a tier that cannot earn (the
+                # tier that crosses B_BATCH is walked in full — fair-split
+                # pays every one of its prompts).
+                if len(claimed) >= B_BATCH:
+                    break
+                tier_round = arrival
+                claimed_before_tier = set(claimed)
+            boundary_round = tier_round
+            if p.prompt_idx in claimed_before_tier:
+                continue          # same_prompt_superseded
+            if self._cooldown.is_in_cooldown(p.prompt_idx, self.window_start):
+                continue
+            if id(p) in self._early_proof_results:
+                if self._early_proof_results[id(p)] is not None:
+                    claimed.add(p.prompt_idx)
+                continue
+            operator = self._operator_by_hotkey.get(p.hotkey)
+            if operator is None and not self._operator_mapping_enforced:
+                operator = p.hotkey
+            if operator is None:
+                continue          # operator_unmapped
+            if (
+                self.operator_proof_failure_debt(operator)
+                >= MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW
+            ):
+                continue
+            if (
+                self.proof_failure_debt(p.hotkey)
+                >= MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
+            ):
+                continue
+            return "prove", p, None
+        if len(claimed) >= B_BATCH:
+            return "close", None, boundary_round
+        return "wait", None, None
+
     def _arrival_round_of(self, pending: PendingSubmission) -> tuple[int, str]:
         """Validator-observed arrival round; miner-submitted round is the
         mock-mode fallback (production stamps every admitted request)."""

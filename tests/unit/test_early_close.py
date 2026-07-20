@@ -92,3 +92,65 @@ def test_midwindow_wall_seconds_count_into_the_seal_wall_budget():
 
     assert b.proof_wall_exhausted is True
     assert b.valid_submissions() == []
+
+
+def test_walk_waits_without_vmax_candidates():
+    b = _auction_batcher()
+    _accept(b, prompt_idx=1, hotkey="hk1", k=6)   # below the k=2 peak
+    with b._lock:
+        assert b._early_close_next_action_locked() == ("wait", None, None)
+
+
+def test_walk_proves_vmax_candidates_in_arrival_order():
+    b = _auction_batcher()
+    _accept(b, prompt_idx=1, hotkey="late", drand_round=20)
+    early = _accept(b, prompt_idx=2, hotkey="early", drand_round=10)
+    with b._lock:
+        action, target, _ = b._early_close_next_action_locked()
+    assert (action, target) == ("prove", early)
+
+
+def test_walk_skips_cached_and_stops_at_the_boundary():
+    """8 distinct proven V_MAX prompts -> close with the boundary round; a 9th
+    distinct prompt in a later tier is never offered for proving."""
+    from reliquary.constants import B_BATCH
+
+    b = _auction_batcher()
+    subs = [
+        _accept(b, prompt_idx=i, hotkey=f"hk{i}", drand_round=10 + i)
+        for i in range(B_BATCH + 1)
+    ]
+    for p in subs[:B_BATCH]:
+        b._early_proof_results[id(p)] = b._verify_expensive(p)
+    with b._lock:
+        action, target, boundary = b._early_close_next_action_locked()
+    assert action == "close"
+    assert target is None
+    assert boundary == 10 + B_BATCH - 1     # arrival round of the 8th tier
+
+
+def test_walk_offers_failed_slots_replacement():
+    """A mid-window proof failure reopens its slot: the next V_MAX arrival on a
+    new prompt is offered for proving instead of closing."""
+    b = _auction_batcher()
+    subs = [
+        _accept(b, prompt_idx=i, hotkey=f"hk{i}", drand_round=10 + i)
+        for i in range(B_BATCH)
+    ]
+    for p in subs[:-1]:
+        b._early_proof_results[id(p)] = b._verify_expensive(p)
+    b._early_proof_results[id(subs[-1])] = None       # failed mid-window
+    replacement = _accept(b, prompt_idx=99, hotkey="fresh", drand_round=40)
+    with b._lock:
+        action, target, _ = b._early_close_next_action_locked()
+    assert (action, target) == ("prove", replacement)
+
+
+def test_walk_reports_exhausted_budget():
+    from reliquary.constants import MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+
+    b = _auction_batcher()
+    _accept(b, prompt_idx=1, hotkey="hk1")
+    b.early_close_proof_attempts = MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+    with b._lock:
+        assert b._early_close_next_action_locked() == ("exhausted", None, None)
