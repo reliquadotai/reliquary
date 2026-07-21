@@ -819,7 +819,7 @@ class GrpoWindowBatcher:
 
         Batchers are constructed before drand preparation, then exposed to
         miners in a separate activation phase. Starting the deadline in the
-        constructor would silently shorten a 300-second auction whenever
+        constructor would silently shorten the fixed-duration auction whenever
         preparation is slow.
         """
         self.window_opened_at = self._time_fn()

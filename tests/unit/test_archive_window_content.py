@@ -102,7 +102,17 @@ async def test_archive_includes_prompt_and_rollout_content():
     batcher.window_opened_wall_ts = 1_000.0
     batcher.difficulty_auction_enabled = True
     batcher.force_seal_reason = "auction_queue_drain_timeout"
-    batcher.rewarded_but_not_selected_by_hotkey = {"hk_runner": 1}
+    batcher.rewarded_but_not_selected_by_hotkey = {}
+    batcher.reward_alignment = {
+        "selected_groups": 2,
+        "rewarded_groups": 2,
+        "paid_unselected_groups": 0,
+        "selected_unrewarded_groups": 0,
+        "reward_alignment_ok": True,
+        "slot_share": 0.0625,
+        "distributed_reward": 0.125,
+        "expected_distributed_reward": 0.125,
+    }
     batcher.logical_group_reservation_count = 9
     batcher.logical_group_duplicate_rejects = 4
     batcher.grader_failures = {"unreachable": 2}
@@ -141,8 +151,8 @@ async def test_archive_includes_prompt_and_rollout_content():
         id(batch[1]): {"selected_for_batch": True, "rewarded": True},
         id(runner): {
             "selected_for_batch": False,
-            "rewarded": True,
-            "selection_reason": "same_trigger_round_lost_canonical_ordering",
+            "rewarded": False,
+            "selection_reason": "not_reached_before_batch_filled",
         },
     }
     batcher.difficulty_auction_metadata_by_id = {
@@ -162,6 +172,9 @@ async def test_archive_includes_prompt_and_rollout_content():
             "tier": 0,
             "tier_size": 1,
             "operator_id": "operator-a",
+            "operator_tiebreak": "cd" * 32,
+            "rank_entropy_source": "seal_drand",
+            "precommit_arrival_ts": 1_002.0,
         },
         id(runner): {
             "value": 0.25,
@@ -266,6 +279,11 @@ async def test_archive_includes_prompt_and_rollout_content():
     assert entry0["difficulty_auction_tier"] == 0
     assert entry0["difficulty_auction_tier_size"] == 1
     assert entry0["difficulty_auction_operator_id"] == "operator-a"
+    assert entry0["difficulty_auction_operator_tiebreak"] == "cd" * 32
+    assert entry0["difficulty_auction_rank_entropy_source"] == "seal_drand"
+    assert entry0["difficulty_auction_precommit_arrival_ts"] == pytest.approx(
+        1_002.0
+    )
 
     # eos detection: rollout 0 of entry 0 ends with eos_token_id=99 → True.
     assert entry0["rollouts"][0]["eos_terminated"] is True
@@ -286,13 +304,16 @@ async def test_archive_includes_prompt_and_rollout_content():
     assert ru["code_semantic_auth_positive_min_prob"] == pytest.approx(0.0004)
     assert ru["selection_digest"] == "ab" * 32
     assert "rollouts" not in ru and "prompt" not in ru  # metadata only
-    assert ru["rollout_hashes"] == [h.hex() for h in runner.rollout_hashes]
+    assert "rollout_hashes" not in ru
     assert ru["difficulty_auction_rank"] == 3
     assert ru["difficulty_auction_selected"] is False
     assert ru["difficulty_auction_status"] == "not_needed"
     assert ru["difficulty_auction_proof_attempted"] is False
     assert ru["arrival_age_seconds"] is None
-    assert archive["rewarded_but_not_selected_by_hotkey"] == {"hk_runner": 1}
+    assert archive["rewarded_but_not_selected_by_hotkey"] == {}
+    assert archive["reward_alignment_by_environment"] == {
+        "fake": batcher.reward_alignment
+    }
     assert archive["difficulty_auction"]["fake"] == {
         "schema_version": 2,
         "status": "armed",

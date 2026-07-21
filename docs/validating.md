@@ -207,7 +207,7 @@ These are the live thresholds the trainer applies on every submission. The same 
 | `M_ROLLOUTS` | 8 | Required rollout count per submission |
 | `T_PROTO` | 0.9 | Protocol-fixed sampling temperature (validator's recompute uses this) |
 | `FORCED_SEED_PROTOCOL_VERSION` | 2 | Mandatory hotkey-free forced stream while enforcement is active |
-| `WINDOW_COLLECTION_SECONDS` | 300 | Fixed collection interval for both Math and Code auction populations |
+| `WINDOW_COLLECTION_SECONDS` | 100 | Fixed collection interval for both Math and Code auction populations |
 | `MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW` | 96 | Started grading/proof ceiling per environment/window |
 | `MAX_PROOF_WALL_SECONDS` | 240 | Seal-time proof wall-clock ceiling per environment |
 | `MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW` | 4 | Operator-wide seal GPU debt limit per environment |
@@ -272,13 +272,14 @@ operator logical claim         zone and cheap authenticity guards
 rate/queue/payload bounds      -> pending auction pool
 -> reason="submitted"          -> first /verdicts lifecycle record
 
-300 s deadline
+100 s deadline
 -> stop new admission and drain pre-deadline work (max 60 s)
 -> freeze Math and Code populations independently
 -> fetch post-deadline drand salt
--> rank by difficulty, operator/prompt post-deadline tie hash
+-> rank by difficulty, validator arrival round, sealed operator/prompt tie hash
 -> prove top-down under attempt/wall/operator-debt bounds
 -> at most 8 distinct prompts; no operator winner cap
+-> pay exactly the selected training groups; no boundary split
 -> final /verdicts lifecycle records
 -> R2 archive + rewards + balanced training accumulator
 ```
