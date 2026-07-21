@@ -18,7 +18,7 @@ The boot query ensures a miner joining an already-running subnet lands directly 
 
 ## What a miner does (auction v2)
 
-Math and Code each collect submissions for a fixed 300-second interval. The
+Math and Code each collect submissions for a fixed 100-second interval. The
 validator does not close early when eight groups arrive. At the deadline it
 drains pre-deadline work, freezes each environment's pending population, ranks
 groups by difficulty, and runs deferred proof top-down until at most eight
@@ -51,7 +51,7 @@ Every miner runs a continuous poll-submit loop:
    serialize it once, and compute its byte length and SHA-256. POST the small
    signed metadata to `/submit/precommit`, then POST those exact bytes to
    `/submit` with the returned `X-Reliquary-Precommit` receipt. A precommit
-   received before the 300-second cutoff grants at most 33 seconds for that
+   received before the 100-second cutoff grants at most 33 seconds for that
    exact reveal; it does not extend generation or reserve an auction slot.
    - Compute and sign the current quicknet round immediately before
      serialization. The validator applies zero backward tolerance and records
@@ -65,10 +65,12 @@ Every miner runs a continuous poll-submit loop:
 
 The validator grades submissions during collection, but expensive GRAIL and
 auth proof run at seal only for candidates that can still win. Difficulty is
-the ranking key. Equal scores use an operator/prompt hash salted by
-post-deadline drand. Submitted drand is a freshness check and telemetry field,
-not an economic ordering key. TCP milliseconds, hotkey count, Merkle-root
-grinding, and harmless payload variation do not mint extra equal-score tickets.
+the primary ranking key. Equal scores prefer the earlier validator-observed
+precommit drand round; candidates still tied inside that three-second bucket
+use an operator/prompt hash salted by post-deadline drand. Submitted drand is a
+freshness check, not an economic ordering key. TCP milliseconds do not matter
+while seal drand is available, and hotkey count, Merkle-root grinding, or
+harmless payload variation cannot mint extra tickets for one operator/prompt.
 
 ### Prompt competition and payment
 
@@ -90,7 +92,7 @@ redistributed; their shares burn to `UID_BURN = 0`.
 The most common miner question is *"the validator returned `accepted=True`, but I earned no slot — what's going on?"* Auction mode has three lifecycle stages.
 
 ```
-miner                 HTTP/worker admission             300 s seal
+miner                 HTTP/worker admission             100 s seal
 -----                 ---------------------             ----------
 POST precommit   ->   signed upload receipt             freeze pending pool
 POST exact body  ->   reason="submitted"                rank by difficulty
@@ -160,7 +162,7 @@ score_new = α × share_this_window + (1 − α) × score_old
 
 where `α ≈ 0.027` (`EMA_ALPHA = 2 / (72 + 1)`). Once per subnet epoch (~360 blocks), the validator calls `set_weights` on-chain with these EMA values. Your emission for the epoch is proportional to your EMA score relative to other miners.
 
-A miner may win multiple distinct prompt slots in one environment. Unused slots burn; there is no runner-up split or redistribution.
+A miner may win multiple distinct prompt slots in one environment. Unused slots burn; there is no boundary-tier payment, runner-up split, or redistribution. In auction mode `rewarded=true` if and only if `selected_for_batch=true`.
 
 See [docs/concepts.md](concepts.md#economic-model) for the full economic model.
 

@@ -14,7 +14,7 @@ This converts DAPO's reactive Dynamic Sampling filter into an ex-ante prediction
 
 ## What it does
 
-Each training window contributes to a possible GRPO step. Math and Code collect independent candidate populations for 300 seconds, rank in-zone groups by difficulty, and run deferred proof only on candidates that can still win. Selection is capped at eight distinct prompts per environment, with no per-operator winner cap. The live policy is `Qwen/Qwen3.5-2B`. The validator computes rewards authoritatively, quarantines suspicious selected windows from training, and retains clean partial batches in a checkpoint-bound accumulator until both environments reach their configured share. It then runs one PPO-clipped step with validator-recomputed behavior-policy log probabilities and a calibrated KL penalty against an immutable base reference.
+Each training window contributes to a possible GRPO step. Math and Code collect independent candidate populations for 100 seconds, rank in-zone groups by difficulty, validator-observed precommit round, and a post-deadline drand tie-break, then run deferred proof only on candidates that can still win. Selection and payment are the same set of at most eight distinct prompts per environment, with no per-operator winner cap. The live policy is `Qwen/Qwen3.5-2B`. The validator computes rewards authoritatively, quarantines suspicious selected windows from training, and retains clean partial batches in a checkpoint-bound accumulator until both environments reach their configured share. It then runs one PPO-clipped step with validator-recomputed behavior-policy log probabilities and a calibrated KL penalty against an immutable base reference.
 
 The network produces three artefacts: a continuously-trained model (published to HF every ten trained windows), a per-window rollout dataset (archived to R2), and a signed checkpoint manifest (served from `/checkpoint`) that lets anyone verify the chain of custody from a base model through every training step. The audit trail is cryptographic — each rollout carries a GRAIL sketch that lets the validator re-run the forward pass and confirm the generation came from the announced checkpoint.
 
@@ -60,7 +60,7 @@ Miners submit rollout groups to `/submit` and poll `/state` for checkpoint updat
 - **v2.1** — batch-driven windows, HF checkpoint distribution, EMA scoring (shipped)
 - **v2.3** — drand ordering and historical same-prompt emission split (superseded)
 - **v2.4** — Qwen3.5-2B reset and mixed OpenMath/OpenCode training (shipped)
-- **Auction v2** — fixed Math+Code collection, hotkey-free forced seed v2, operator-bound equal-score ties, and deferred proof (current)
+- **Auction v2** — fixed Math+Code collection, hotkey-free forced seed v2, coarse arrival priority, sealed operator/prompt ties, trained-only rewards, and deferred proof (current)
 - **Next direction** — private/generated reward tasks and broader runtime determinism (planned)
 
 ## License
