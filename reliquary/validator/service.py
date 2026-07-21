@@ -1634,11 +1634,10 @@ class ValidationService:
         # count, as GRAD_ACCUM_STEPS already does) so every validator uses the
         # same pool and an env a validator does not run burns its share.
         pool_per_env = 1.0 / len(self.env_mix)
-        # Fetch a fresh drand beacon now — AFTER the collection deadline — to key
-        # each batcher's forensic sample. Its randomness did not exist when miners
-        # submitted, so the sample cannot be ground in advance. Ranking no longer
-        # consumes it: equal scores are ordered by validator-observed arrival.
-        # If the fetch fails, the forensic sample is disabled for the window.
+        # Fetch a fresh drand beacon AFTER the collection deadline. It strictly
+        # orders candidates equal on score and validator-observed arrival round,
+        # and keys the forensic sample. If the bounded fetch fails, exact
+        # validator precommit arrival orders ties and forensics are disabled.
         seal_randomness = await self._fetch_seal_randomness()
         for b in self._active_batchers.values():
             b.seal_randomness = seal_randomness
@@ -3233,25 +3232,55 @@ class ValidationService:
         return chain.compute_window_randomness(block_hash), None
 
     async def _fetch_seal_randomness(self) -> str:
-        """Fetch the drand beacon current at seal (post-deadline) to key the
-        forensic sample. Telemetry only, so any failure returns "" (no sample)
-        rather than blocking the seal. Off-loop: the HTTP fetch must not stall
-        the event loop while the window seals.
+        """Fetch post-deadline drand with a bounded retry budget.
+
+        The beacon strictly orders exact auction ties and keys the forensic
+        sample. A total outage returns ``""`` after six seconds; ranking then
+        falls back to validator-observed precommit arrival rather than known
+        window randomness.
         """
         if not self.use_drand:
             return ""
-        try:
-            import time
-            from reliquary.infrastructure.drand import get_beacon, get_current_chain
+        from reliquary.infrastructure.drand import get_beacon, get_current_chain
 
-            chain_info = await asyncio.to_thread(get_current_chain)
-            drand_round = chain.compute_current_drand_round(
-                time.time(), chain_info["genesis_time"], chain_info["period"],
-            )
-            beacon = await asyncio.to_thread(
-                get_beacon, round_id=str(drand_round), use_drand=True,
-            )
-            return str(beacon["randomness"])
-        except Exception:
-            logger.warning("seal-randomness fetch failed; forensic sample skipped")
-            return ""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 6.0
+        attempts = 0
+        last_error: Exception | None = None
+        while loop.time() < deadline:
+            attempts += 1
+            remaining = deadline - loop.time()
+
+            def _fetch_once() -> str:
+                chain_info = get_current_chain()
+                drand_round = chain.compute_current_drand_round(
+                    time.time(),
+                    chain_info["genesis_time"],
+                    chain_info["period"],
+                )
+                beacon = get_beacon(
+                    round_id=str(drand_round), use_drand=True
+                )
+                return str(beacon["randomness"])
+
+            try:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(_fetch_once),
+                    timeout=max(0.01, remaining),
+                )
+            except Exception as exc:
+                last_error = exc
+                remaining = deadline - loop.time()
+                if remaining <= 0.0:
+                    break
+                await asyncio.sleep(min(0.5, remaining))
+
+        logger.warning(
+            "seal-randomness unavailable after %.1fs attempts=%d; "
+            "auction ties use validator-arrival fallback and forensic sample "
+            "is skipped error=%s",
+            6.0,
+            attempts,
+            type(last_error).__name__ if last_error is not None else "unknown",
+        )
+        return ""

@@ -74,7 +74,6 @@ from reliquary.protocol.submission import (
 )
 from reliquary.protocol.tokens import verify_tokens
 from reliquary.validator.batch_selection import (
-    _within_slot_key,
     explain_batch_selection,
     select_batch_and_distribute,
 )
@@ -132,6 +131,33 @@ from reliquary.validator.verifier import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _auction_operator_tiebreak(
+    *,
+    seal_randomness: str,
+    checkpoint_revision: str,
+    window_start: int,
+    environment: str,
+    operator_id: str,
+    prompt_idx: int,
+) -> bytes:
+    """Return the non-grindable final order for an exact auction tie."""
+    h = hashlib.sha256()
+    h.update(b"reliquary/auction-final-tiebreak/v2\x00")
+
+    def _update_text(value: str) -> None:
+        encoded = value.encode("utf-8")
+        h.update(len(encoded).to_bytes(4, "big", signed=False))
+        h.update(encoded)
+
+    _update_text(seal_randomness)
+    _update_text(checkpoint_revision)
+    h.update(int(window_start).to_bytes(8, "big", signed=False))
+    _update_text(environment)
+    _update_text(operator_id)
+    h.update(int(prompt_idx).to_bytes(8, "big", signed=False))
+    return h.digest()
 
 
 def _int_or_none(value: Any) -> int | None:
@@ -595,8 +621,8 @@ class GrpoWindowBatcher:
         # window (winner or failure). ``_prove_forensic_sample`` reads this to
         # sample only from what was never looked at.
         self._attempted_pending_ids: set[int] = set()
-        # Tier ordinal of each proven winner (id(ValidSubmission) -> int),
-        # consumed by _seal_batch_inner as the fair-split slot key.
+        # Retained until payout finalization for compatibility with the legacy
+        # selector. Strict auction proving never records more than B winners.
         self._auction_tier_by_id: dict[int, int] = {}
         # Non-winners proven purely for telemetry — see FORENSIC_SAMPLE_PER_WINDOW.
         # Never touches ``_valid``; a passing entry here is still unpaid.
@@ -609,9 +635,10 @@ class GrpoWindowBatcher:
             int, list[PendingSubmission | ValidSubmission]
         ] = {}
         self.randomness: str = ""
-        # Drand beacon fetched at seal (post-deadline) to key the forensic
-        # sample so it cannot be predicted at submission time. See
-        # _prove_forensic_sample. Empty in mock/no-drand mode = no sampling.
+        # Drand beacon fetched at seal (post-deadline). It keys exact auction
+        # ties and the forensic sample so neither can be ground before cutoff.
+        # Empty in mock/no-drand mode activates validator-arrival fallback and
+        # disables forensic sampling.
         self.seal_randomness: str = ""
         # Per-window eligible prompt slice [lo, hi). None = no restriction
         # (randomness not yet known, or window is before the enforcement
@@ -3386,26 +3413,19 @@ class GrpoWindowBatcher:
             return list(self._pending)
 
     def _prove_ranked(self, pool: float = 1.0) -> list[ValidSubmission]:
-        """Prove candidates in (score, arrival) order until ``B_BATCH`` distinct
-        prompts pass. Never prove a candidate that cannot earn.
+        """Prove strict auction winners until ``B_BATCH`` distinct prompts pass.
 
-        Ranking is by ``-value``, then the validator-observed arrival drand
-        round: the score gates, submission speed breaks equal-score ties.
-        The arrival round is stamped by the validator at HTTP arrival, so a
-        miner cannot antedate it; the miner-submitted round is only the
-        mock-mode fallback. Candidates exactly equal on BOTH form a tier.
-        Every member of a paying tier is proven, because the v1 fair-split
-        pays all of them (same prompt: k-way split; boundary tier: equal
-        split across its prompts — see ``select_batch_and_distribute``).
-        Tiers past the boundary are never proven. The canonical hash only
-        orders rows inside a tier for display; it has no economic weight.
+        Difficulty remains primary and validator-observed precommit drand round
+        remains secondary. Exact ties use post-deadline drand bound only to the
+        checkpoint, window, environment, operator and prompt. Hotkeys and miner
+        payload fields cannot mint extra tie tickets. If seal drand is
+        unavailable, exact validator-observed precommit arrival is the explicit
+        liveness fallback; known window randomness is never an economic salt.
 
-        Same-prompt resolution (spec §2.2): a prompt claimed by a PASSING
-        submission in an earlier tier supersedes later tiers; a fabricated
-        squatter fails the proof and never locks a prompt — the submission
-        behind it is promoted. Inside one tier, same-prompt candidates
-        (necessarily distinct operators) are all proven and split the
-        prompt's payout.
+        A prompt is claimed only after a submission passes proof. A fabricated
+        leader therefore fails without squatting the prompt, and the next
+        strictly ranked candidate is promoted. Proving stops immediately after
+        eight distinct winners; no boundary tier is expanded for payout.
 
         Bounds (spec §2.3): per-hotkey and per-operator failure skips cap a
         single identity even when one coldkey owns many hotkeys, and a global
@@ -3428,6 +3448,14 @@ class GrpoWindowBatcher:
         operator_by_id: dict[int, str | None] = {}
         arrival_by_id: dict[int, int] = {}
         arrival_source_by_id: dict[int, str] = {}
+        exact_arrival_by_id: dict[int, float] = {}
+        tiebreak_by_id: dict[int, bytes] = {}
+        rank_entropy_source = (
+            "seal_drand"
+            if self.seal_randomness
+            else "validator_arrival_fallback"
+        )
+        environment = str(getattr(self.env, "name", ""))
         for pending_submission, _score in scored:
             operator = self._operator_by_hotkey.get(pending_submission.hotkey)
             if operator is None and not self._operator_mapping_enforced:
@@ -3447,15 +3475,41 @@ class GrpoWindowBatcher:
                 arrival_source_by_id[id(pending_submission)] = (
                     "submitted_fallback"
                 )
+            precommit_arrival = getattr(
+                telemetry, "precommit_arrival_ts", None
+            )
+            if precommit_arrival is None:
+                precommit_arrival = getattr(telemetry, "t_arrival", None)
+            if precommit_arrival is None:
+                precommit_arrival = pending_submission.arrived_at
+            exact_arrival_by_id[id(pending_submission)] = float(
+                precommit_arrival
+            )
+            tiebreak_by_id[id(pending_submission)] = (
+                _auction_operator_tiebreak(
+                    seal_randomness=self.seal_randomness,
+                    checkpoint_revision=self.current_checkpoint_hash,
+                    window_start=self.window_start,
+                    environment=environment,
+                    operator_id=operator or "",
+                    prompt_idx=pending_submission.prompt_idx,
+                )
+            )
         ranked = sorted(
             scored,
             key=lambda item: (
                 -item[1].value,
                 arrival_by_id[id(item[0])],
-                _within_slot_key(item[0]),
+                (
+                    0.0
+                    if self.seal_randomness
+                    else exact_arrival_by_id[id(item[0])]
+                ),
+                tiebreak_by_id[id(item[0])],
             ),
         )
-        # Tier = maximal run of exactly-equal (value, arrival_round).
+        # Tiers remain diagnostic only. The final tiebreak makes the economic
+        # ranking strict, so no tier can expand the selected or rewarded set.
         tier_by_id: dict[int, int] = {}
         tier_sizes: list[int] = []
         last_tier_key: tuple[float, int] | None = None
@@ -3491,6 +3545,13 @@ class GrpoWindowBatcher:
                 "arrival_round_source": arrival_source_by_id[
                     id(pending_submission)
                 ],
+                "precommit_arrival_ts": exact_arrival_by_id[
+                    id(pending_submission)
+                ],
+                "operator_tiebreak": tiebreak_by_id[
+                    id(pending_submission)
+                ].hex(),
+                "rank_entropy_source": rank_entropy_source,
                 "tier": tier_by_id[id(pending_submission)],
                 "tier_size": tier_sizes[
                     tier_by_id[id(pending_submission)]
@@ -3514,22 +3575,13 @@ class GrpoWindowBatcher:
         stop_reason: str | None = None
 
         self._auction_tier_by_id = {}
-        current_tier = -1
-        claimed_before_tier: set[int] = set()
         for (p, _score), row in zip(ranked, candidate_rows):
-            tier = tier_by_id[id(p)]
-            if tier != current_tier:
-                # Tier boundary: stop BEFORE a tier that cannot earn; the
-                # tier that crosses B_BATCH is proven in full (fair-split
-                # pays every one of its prompts).
-                if len(claimed) >= B_BATCH:
-                    stop_reason = "batch_filled"
-                    break
-                current_tier = tier
-                claimed_before_tier = set(claimed)
-            if p.prompt_idx in claimed_before_tier:
+            if len(proven) >= B_BATCH:
+                stop_reason = "batch_filled"
+                break
+            if p.prompt_idx in claimed:
                 row["status"] = "same_prompt_superseded"
-                continue          # an earlier tier already won this prompt
+                continue          # a higher-ranked passing candidate won it
             if self._cooldown.is_in_cooldown(p.prompt_idx, self.window_start):
                 row["status"] = "cooldown"
                 continue
@@ -3600,7 +3652,6 @@ class GrpoWindowBatcher:
             row["status"] = "selected"
             proven.append(sub)
             claimed.add(p.prompt_idx)
-            self._auction_tier_by_id[id(sub)] = tier
             self.difficulty_auction_metadata_by_id[id(sub)] = row
 
         with self._lock:
