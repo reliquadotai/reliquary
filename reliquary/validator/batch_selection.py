@@ -27,7 +27,7 @@ v2.3+: replaces the v2.2 pure-FIFO ``select_batch``.
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from reliquary.validator.cooldown import CooldownMap
 
@@ -72,13 +72,8 @@ def select_batch_and_distribute(
     cooldown_map: CooldownMap,
     current_window: int,
     pool: float = 1.0,
-    slot_round_of: Callable[[Any], int] | None = None,
 ) -> tuple[list[Any], dict[str, float]]:
     """Pick the training batch and the reward distribution.
-
-    ``slot_round_of``: optional override of the chronological slot key; the
-    difficulty auction passes its rank-tier ordinal so the v1 fair-split
-    applies to (score, arrival) tiers.
 
     Args:
         submissions: all GRAIL-validated submissions for the window, in
@@ -141,15 +136,12 @@ def select_batch_and_distribute(
     if b <= 0 or not submissions:
         return [], {}
 
-    round_of = slot_round_of if slot_round_of is not None else (
-        lambda sub: sub.drand_round
-    )
     # Group: slot round → prompt_idx → list[submission]
     by_round: dict[int, dict[int, list[Any]]] = {}
     for sub in submissions:
         if cooldown_map.is_in_cooldown(sub.prompt_idx, current_window):
             continue
-        prompts = by_round.setdefault(round_of(sub), {})
+        prompts = by_round.setdefault(sub.drand_round, {})
         prompts.setdefault(sub.prompt_idx, []).append(sub)
     if not by_round:
         return [], {}
@@ -222,7 +214,6 @@ def explain_batch_selection(
     cooldown_map: CooldownMap,
     current_window: int,
     pool: float = 1.0,
-    slot_round_of: Callable[[Any], int] | None = None,
 ) -> dict[int, dict[str, Any]]:
     """Return per-submission final-selection metadata without mutating state.
 
@@ -244,15 +235,12 @@ def explain_batch_selection(
     if b <= 0 or not submissions:
         return meta
 
-    round_of = slot_round_of if slot_round_of is not None else (
-        lambda sub: sub.drand_round
-    )
     by_round: dict[int, dict[int, list[Any]]] = {}
     for sub in submissions:
         if cooldown_map.is_in_cooldown(sub.prompt_idx, current_window):
             meta[id(sub)]["selection_reason"] = "prompt_in_cooldown_at_selection"
             continue
-        prompts = by_round.setdefault(round_of(sub), {})
+        prompts = by_round.setdefault(sub.drand_round, {})
         prompts.setdefault(sub.prompt_idx, []).append(sub)
     if not by_round:
         return meta

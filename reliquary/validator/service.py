@@ -2182,6 +2182,15 @@ class ValidationService:
                 "difficulty_auction_operator_id": difficulty_meta.get(
                     "operator_id"
                 ),
+                "difficulty_auction_operator_tiebreak": difficulty_meta.get(
+                    "operator_tiebreak"
+                ),
+                "difficulty_auction_rank_entropy_source": difficulty_meta.get(
+                    "rank_entropy_source"
+                ),
+                "difficulty_auction_precommit_arrival_ts": difficulty_meta.get(
+                    "precommit_arrival_ts"
+                ),
             }
 
         def _difficulty_auction_payload(batcher):
@@ -2355,9 +2364,9 @@ class ValidationService:
                     ),
                     **obs,
                 }
-                # Rewarded runners-up carry rollout_hashes (ported from main):
-                # cooldown/EMA rebuild keys off these to credit miners whose
-                # prompt landed in the winning set but weren't selected for training.
+                # Legacy archives may contain paid runners. Auction mode keeps
+                # this path for schema compatibility but its alignment invariant
+                # requires every paid group to be selected for training.
                 if obs.get("rewarded") and s.rollout_hashes:
                     runner_entry["rollout_hashes"] = [h.hex() for h in s.rollout_hashes]
                 runners_up.append(runner_entry)
@@ -2472,6 +2481,12 @@ class ValidationService:
                 )
                 for env_name, env_batcher in batcher_dict.items()
             },
+            "reward_alignment_by_environment": {
+                env_name: dict(
+                    getattr(env_batcher, "reward_alignment", {}) or {}
+                )
+                for env_name, env_batcher in batcher_dict.items()
+            },
             "window_opened_wall_ts_by_environment": {
                 env_name: getattr(env_batcher, "window_opened_wall_ts", None)
                 for env_name, env_batcher in batcher_dict.items()
@@ -2501,9 +2516,8 @@ class ValidationService:
                 {"schema_version": 1, "trained": False},
             ),
             "training_kl_reference": dict(self.kl_reference_state),
-            # v2.3: per-hotkey emission share from select_batch_and_distribute.
-            # All miners whose prompt landed in the winning set appear here,
-            # even if their specific submission wasn't picked for training.
+            # Authoritative per-hotkey emission. In auction mode this is derived
+            # only from the proven groups selected for training.
             "rewards_by_hotkey": combined_rewards,
             "rewarded_but_not_selected_by_hotkey": combined_rewarded_not_selected,
             "late_drops": {
@@ -2596,6 +2610,10 @@ class ValidationService:
                     )
                     else {}
                 )
+                for name, batcher in self._active_batchers.items()
+            },
+            "reward_alignment_by_environment": {
+                name: dict(getattr(batcher, "reward_alignment", {}) or {})
                 for name, batcher in self._active_batchers.items()
             },
             "batch": [],

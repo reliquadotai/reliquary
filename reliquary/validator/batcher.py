@@ -621,9 +621,6 @@ class GrpoWindowBatcher:
         # window (winner or failure). ``_prove_forensic_sample`` reads this to
         # sample only from what was never looked at.
         self._attempted_pending_ids: set[int] = set()
-        # Retained until payout finalization for compatibility with the legacy
-        # selector. Strict auction proving never records more than B winners.
-        self._auction_tier_by_id: dict[int, int] = {}
         # Non-winners proven purely for telemetry — see FORENSIC_SAMPLE_PER_WINDOW.
         # Never touches ``_valid``; a passing entry here is still unpaid.
         self.forensic_sample: list[ForensicSampleResult] = []
@@ -651,6 +648,13 @@ class GrpoWindowBatcher:
         # Legacy compatibility metric. Production auction winners are both
         # selected and rewarded, so this remains empty in auction mode.
         self.rewarded_but_not_selected_by_hotkey: dict[str, int] = {}
+        self.reward_alignment: dict[str, Any] = {
+            "selected_groups": 0,
+            "rewarded_groups": 0,
+            "paid_unselected_groups": 0,
+            "selected_unrewarded_groups": 0,
+            "reward_alignment_ok": True,
+        }
         # Accumulated reject reasons this window (RejectReason.value → count).
         # Persisted in the R2 archive so miners can see which filter is
         # rejecting the most submissions in any given round.
@@ -3574,7 +3578,6 @@ class GrpoWindowBatcher:
         self.proof_wall_exhausted = False
         stop_reason: str | None = None
 
-        self._auction_tier_by_id = {}
         for (p, _score), row in zip(ranked, candidate_rows):
             if len(proven) >= B_BATCH:
                 stop_reason = "batch_filled"
@@ -3674,6 +3677,100 @@ class GrpoWindowBatcher:
         # looked at.
         self._attempted_pending_ids = attempted_ids
         return proven
+
+    def _finalize_auction_winners(
+        self,
+        *,
+        pool: float,
+    ) -> tuple[list[ValidSubmission], dict[str, float]]:
+        """Pay exactly the proven training winners or fail the window closed."""
+        if not math.isfinite(pool) or pool < 0.0:
+            raise RuntimeError("auction reward pool must be finite and non-negative")
+
+        winners = list(self._valid)
+        prompt_ids = [submission.prompt_idx for submission in winners]
+        if len(winners) > B_BATCH:
+            raise RuntimeError(
+                "auction reward alignment failed: winner count exceeds batch size"
+            )
+        if len(prompt_ids) != len(set(prompt_ids)):
+            raise RuntimeError(
+                "auction reward alignment failed: duplicate winning prompt"
+            )
+
+        slot_share = pool / B_BATCH
+        rewards: dict[str, float] = {}
+        metadata: dict[int, dict[str, Any]] = {}
+        for selected_rank, submission in enumerate(winners, start=1):
+            candidate = self.difficulty_auction_metadata_by_id.get(
+                id(submission), {}
+            )
+            canonical_rank = candidate.get("rank")
+            if not isinstance(canonical_rank, int) or isinstance(
+                canonical_rank, bool
+            ):
+                canonical_rank = selected_rank
+            metadata[id(submission)] = {
+                "accepted_into_pool": True,
+                "selected_for_batch": True,
+                "rewarded": True,
+                "reward_amount": slot_share,
+                "canonical_rank": canonical_rank,
+                "selection_reason": "selected_auction_winner",
+            }
+            rewards[submission.hotkey] = (
+                rewards.get(submission.hotkey, 0.0) + slot_share
+            )
+
+        selected_ids = {id(submission) for submission in winners}
+        rewarded_ids = {
+            submission_id
+            for submission_id, entry in metadata.items()
+            if entry.get("rewarded", False)
+        }
+        paid_unselected = rewarded_ids - selected_ids
+        selected_unrewarded = selected_ids - rewarded_ids
+        candidate_selected = sum(
+            bool(row.get("selected", False)) for row in self.auction_candidates
+        )
+        candidate_rows_aligned = (
+            not self.auction_candidates
+            or (
+                candidate_selected == len(winners)
+                and all(
+                    bool(
+                        self.difficulty_auction_metadata_by_id.get(
+                            id(submission), {}
+                        ).get("selected", False)
+                    )
+                    for submission in winners
+                )
+            )
+        )
+        alignment_ok = (
+            not paid_unselected
+            and not selected_unrewarded
+            and candidate_rows_aligned
+        )
+        self.reward_alignment = {
+            "selected_groups": len(selected_ids),
+            "rewarded_groups": len(rewarded_ids),
+            "paid_unselected_groups": len(paid_unselected),
+            "selected_unrewarded_groups": len(selected_unrewarded),
+            "reward_alignment_ok": alignment_ok,
+            "slot_share": slot_share,
+            "distributed_reward": sum(rewards.values()),
+            "expected_distributed_reward": len(winners) * slot_share,
+        }
+        if not alignment_ok:
+            raise RuntimeError(
+                "auction reward alignment failed before payout or training"
+            )
+
+        self.selection_metadata_by_id = metadata
+        self.rewarded_but_not_selected_by_hotkey = {}
+        self.rewards_by_hotkey = dict(rewards)
+        return winners, rewards
 
     def _prove_forensic_sample(self) -> list[ForensicSampleResult]:
         """Prove ``FORENSIC_SAMPLE_PER_WINDOW`` non-winners for telemetry only.
@@ -3966,40 +4063,16 @@ class GrpoWindowBatcher:
         difficulty and fills ``self._valid`` with the proven winners, which
         everything below reads. ``_prove_forensic_sample`` then proves a small
         sample of non-winners for telemetry only — it never touches ``_valid``.
-        Returns (training_batch, rewards_by_hotkey). Cooldown and hash-set
-        bookkeeping is applied to every winning prompt — not just the one
-        submission picked for training — because all of them earn emission
-        and were therefore "used" by this window.
+        Returns (training_batch, rewards_by_hotkey). Auction rewards are derived
+        directly from the proven training winners; legacy mode retains its
+        historical chronological split behavior.
         """
         if self.difficulty_auction_enabled:
             self._prove_ranked(pool)
             self._prove_forensic_sample()
-        # Auction mode replaces the chronological slot key with the rank
-        # tier: the v1 machinery then pays full tiers a slot each and
-        # fair-splits the boundary tier. `.get(..., 0)` collapses to one
-        # tier for test doubles that bypass _prove_ranked.
-        slot_round_of = None
-        if self.difficulty_auction_enabled:
-            tier_of = self._auction_tier_by_id
-            slot_round_of = lambda sub: tier_of.get(id(sub), 0)
         with self._lock:
-            self.selection_metadata_by_id = explain_batch_selection(
-                submissions=self._valid,
-                b=B_BATCH,
-                cooldown_map=self._cooldown,
-                current_window=self.window_start,
-                pool=pool,
-                slot_round_of=slot_round_of,
-            )
-            batch, rewards = select_batch_and_distribute(
-                submissions=self._valid,
-                b=B_BATCH,
-                cooldown_map=self._cooldown,
-                current_window=self.window_start,
-                pool=pool,
-                slot_round_of=slot_round_of,
-            )
             if self.difficulty_auction_enabled:
+                batch, rewards = self._finalize_auction_winners(pool=pool)
                 self.difficulty_auction_shadow = {
                     "schema_version": 2,
                     "status": "armed",
@@ -4042,9 +4115,24 @@ class GrpoWindowBatcher:
                     "retained_payload_bytes_at_seal": (
                         self.retained_payload_bytes
                     ),
+                    "reward_alignment": dict(self.reward_alignment),
                     "candidates": self.auction_candidates,
                 }
             else:
+                self.selection_metadata_by_id = explain_batch_selection(
+                    submissions=self._valid,
+                    b=B_BATCH,
+                    cooldown_map=self._cooldown,
+                    current_window=self.window_start,
+                    pool=pool,
+                )
+                batch, rewards = select_batch_and_distribute(
+                    submissions=self._valid,
+                    b=B_BATCH,
+                    cooldown_map=self._cooldown,
+                    current_window=self.window_start,
+                    pool=pool,
+                )
                 self._compute_difficulty_auction_shadow()
             rewarded_submissions: list[ValidSubmission] = []
             rewarded_but_not_selected: dict[str, int] = {}
@@ -4058,6 +4146,10 @@ class GrpoWindowBatcher:
                         rewarded_but_not_selected.get(sub.hotkey, 0) + 1
                     )
             self.rewarded_but_not_selected_by_hotkey = rewarded_but_not_selected
+            if self.difficulty_auction_enabled and rewarded_but_not_selected:
+                raise RuntimeError(
+                    "auction reward alignment failed: paid unselected group"
+                )
 
             rewarded_prompts = {sub.prompt_idx for sub in rewarded_submissions}
             for p in rewarded_prompts:
