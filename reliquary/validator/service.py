@@ -96,6 +96,7 @@ from reliquary.validator.quarantine import assess_training_batch
 from reliquary.validator.server import ValidatorServer
 from reliquary.validator.training import TrainingStepSkipped, train_step
 from reliquary.validator.training_accumulator import BalancedTrainingAccumulator
+from reliquary.validator.utility_telemetry import UtilityTelemetryWriter
 
 logger = logging.getLogger(__name__)
 
@@ -523,6 +524,7 @@ class ValidationService:
         self._late_drops: dict[str, dict[str, int]] = {}
         self._window_archive_enqueued = False
         self._window_iteration_stage = "startup"
+        self._utility_telemetry = UtilityTelemetryWriter()
 
         self.server = ValidatorServer(host=http_host, port=http_port)
         self.server.set_late_drop_callback(self.record_late_drop)
@@ -531,6 +533,9 @@ class ValidationService:
         )
         self.server.configure_content_cooldown_health(
             self._content_cooldown_health_snapshot
+        )
+        self.server.configure_utility_telemetry_health(
+            self._utility_telemetry.snapshot
         )
 
         # v2.1 state machine infrastructure — in-memory only, bootstrapped at
@@ -2616,6 +2621,18 @@ class ValidationService:
                 hk: dict(counts) for hk, counts in self._late_drops.items()
             },
         }
+        await asyncio.to_thread(
+            self._utility_telemetry.write_window,
+            window=int(first_batcher.window_start),
+            checkpoint_revision=str(
+                getattr(first_batcher, "current_checkpoint_hash", "") or ""
+            ),
+            batchers=batcher_dict,
+            selected_by_environment={
+                env_name: list(sealed_dict.get(env_name, ([], {}))[0])
+                for env_name in batcher_dict
+            },
+        )
         # Reset the in-memory counter for the next window. New events
         # arriving while this window's payload is uploading land in the
         # fresh dict and will appear in the next archive.
@@ -3363,7 +3380,10 @@ class ValidationService:
                 resolved,
                 self._content_cooldown_health["counts_by_environment"],
             )
-            await self._snapshot_content_cooldown()
+            if not await self._snapshot_content_cooldown():
+                raise RuntimeError(
+                    "content cooldown bootstrap was not persisted locally"
+                )
         except Exception as exc:
             self._content_cooldown_health.update({
                 "complete": False,
@@ -3375,8 +3395,13 @@ class ValidationService:
             )
             raise RuntimeError("content cooldown restore incomplete") from exc
 
-    async def _snapshot_content_cooldown(self) -> None:
-        """Persist a complete content snapshot locally, then to R2."""
+    async def _snapshot_content_cooldown(self) -> bool:
+        """Persist locally before the best-effort R2 mirror.
+
+        Returns whether a restart-safe local snapshot exists. The caller uses
+        this as a startup gate; periodic callers may continue from the complete
+        in-memory map while health reports a later disk failure.
+        """
         window = self._window_n
 
         def _build() -> dict[str, Any]:
@@ -3391,19 +3416,30 @@ class ValidationService:
                 },
             }
 
+        snapshot = await asyncio.to_thread(_build)
         try:
-            snapshot = await asyncio.to_thread(_build)
             await asyncio.to_thread(
                 _write_gzip_json_atomic,
                 _content_cooldown_local_path(TRAINING_RUN_ID),
                 snapshot,
             )
+        except Exception as exc:
+            self._content_cooldown_health.update({
+                "last_snapshot_failure_ts": time.time(),
+                "last_error_type": type(exc).__name__,
+            })
+            logger.exception(
+                "Content cooldown local snapshot failed; durability unavailable"
+            )
+            return False
+
+        now = time.time()
+        try:
             uploaded = await storage.upload_json(
                 _content_cooldown_snapshot_key(TRAINING_RUN_ID), snapshot
             )
             if not uploaded:
                 raise RuntimeError("content cooldown upload returned false")
-            now = time.time()
             self._content_cooldown_health.update({
                 "complete": True,
                 "source": "r2_and_local",
@@ -3418,12 +3454,21 @@ class ValidationService:
             })
         except Exception as exc:
             self._content_cooldown_health.update({
+                "complete": True,
+                "source": "local",
+                "snapshot_window": window,
+                "counts_by_environment": {
+                    name: len(content_map)
+                    for name, content_map in self._content_cooldown_per_env.items()
+                },
+                "last_snapshot_success_ts": now,
                 "last_snapshot_failure_ts": time.time(),
                 "last_error_type": type(exc).__name__,
             })
             logger.exception(
-                "Content cooldown snapshot failed; retaining in-memory/local state"
+                "Content cooldown R2 mirror failed; local snapshot is durable"
             )
+        return True
 
     async def _rebuild_hashes_from_history(self) -> None:
         """Rebuild ``self._hash_set`` from the last HASH_DEDUP_RETENTION_WINDOWS

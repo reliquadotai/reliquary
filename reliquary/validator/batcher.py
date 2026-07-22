@@ -402,6 +402,7 @@ class ValidSubmission:
     truncated_count: int = 0
     reward_shape: dict[str, Any] = field(default_factory=dict)
     ingress_observability: dict[str, Any] = field(default_factory=dict)
+    utility_rollouts: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self):
         self.merkle_root = self.merkle_root_bytes
@@ -457,6 +458,7 @@ class ForensicSampleResult:
     prompt_idx: int
     passed: bool | None
     error_type: str | None = None
+    submission: ValidSubmission | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -2647,6 +2649,7 @@ class GrpoWindowBatcher:
         # rollout separately, since the group average hides a partial swap.
         seed_per_rollout: list[tuple[int, int]] = []
         seed_cdf_per_rollout: list[dict[str, Any]] = []
+        utility_rollouts: list[dict[str, Any]] = []
 
         for rollout_idx, rollout in enumerate(request.rollouts):
             # Never carry a validator-derived carve across re-validation of the
@@ -3212,6 +3215,71 @@ class GrpoWindowBatcher:
                             dist_q10_min=dist_q10_min,
                         )
 
+            chosen_probs = list(
+                getattr(proof, "completion_chosen_probs", []) or []
+            )
+            entropies = list(
+                getattr(proof, "completion_entropies", []) or []
+            )
+            chosen_nll = [
+                -math.log(max(float(probability), 1e-45))
+                for probability in chosen_probs
+            ]
+
+            def _summary(values: list[float]) -> dict[str, float | None]:
+                ordered = sorted(
+                    float(value)
+                    for value in values
+                    if math.isfinite(float(value))
+                )
+                if not ordered:
+                    return {"mean": None, "p50": None, "p90": None}
+
+                def _percentile(fraction: float) -> float:
+                    index = round((len(ordered) - 1) * fraction)
+                    return ordered[index]
+
+                return {
+                    "mean": sum(ordered) / len(ordered),
+                    "p50": _percentile(0.5),
+                    "p90": _percentile(0.9),
+                }
+
+            utility_rollouts.append({
+                "rollout_idx": rollout_idx,
+                "reward": float(getattr(rollout, "reward", 0.0) or 0.0),
+                "prompt_length": prompt_len,
+                "completion_length": completion_len,
+                "natural_eos": bool(
+                    rollout.commit.get("tokens")
+                    and int(rollout.commit["tokens"][-1])
+                    in telemetry_eos_ids
+                ),
+                "validated_force_span": (
+                    list(rollout._validated_force_span)
+                    if rollout._validated_force_span is not None
+                    else None
+                ),
+                "termination_path": rollout._validated_termination_path,
+                "chosen_nll": _summary(chosen_nll),
+                "full_policy_entropy": _summary(entropies),
+                "full_policy_entropy_samples": len(entropies),
+                "hidden_start_f16_b64": getattr(
+                    proof, "hidden_start_f16_b64", None
+                ),
+                "hidden_delta_f16_b64": getattr(
+                    proof, "hidden_delta_f16_b64", None
+                ),
+                "hidden_dim": int(getattr(proof, "hidden_dim", 0) or 0),
+                "hidden_end_completion_offset": getattr(
+                    proof, "hidden_end_completion_offset", None
+                ),
+                "representation_shift_l2": getattr(
+                    proof, "representation_shift_l2", None
+                ),
+                "token_degeneracy": dict(rollout_token_metrics),
+            })
+
         # Forced-seed gate. Group verdict = summed counts (catches diffuse
         # deviation); per-rollout verdict catches a single off-stream rollout
         # the group average would dilute. Both shadow (compute + log, never
@@ -3348,6 +3416,7 @@ class GrpoWindowBatcher:
             ingress_observability=(
                 telemetry.archive_fields() if telemetry else {}
             ),
+            utility_rollouts=utility_rollouts,
         )
         # The caller decides whether this is an auction winner or an immediate
         # legacy admission.
@@ -3855,19 +3924,17 @@ class GrpoWindowBatcher:
         return winners, rewards
 
     def _prove_forensic_sample(self) -> list[ForensicSampleResult]:
-        """Prove ``FORENSIC_SAMPLE_PER_WINDOW`` non-winners for telemetry only.
+        """Prove the next-ranked content-unique non-winners for telemetry.
 
         Deferring the proof to seal means the auth gates in ``_verify_expensive``
         only ever run on the ranked winners; sampling a few losers keeps the
-        pre-generation / token-tamper detectors alive. Results never enter
-        ``_valid`` and are never paid.
+        pre-generation / token-tamper detectors alive and provides the most
+        relevant counterfactuals for future utility-ranking research. Results
+        never enter ``_valid`` and are never paid.
 
-        The sample is keyed on ``self.seal_randomness`` — a drand beacon fetched
-        AFTER the collection deadline — so a miner cannot grind its merkle_root to
-        learn whether it will be watched (the entropy did not exist at submission
-        time). This is telemetry only and never feeds weights, so it needs no
-        cross-validator consensus: each validator may watch a different sample.
-        Empty seal_randomness (mock / no-drand) disables sampling.
+        The authoritative auction rank already includes post-deadline seal
+        randomness for exact score/arrival ties. Empty seal randomness means no
+        final rank exists, so sampling remains disabled in that state.
         """
         if FORENSIC_SAMPLE_PER_WINDOW <= 0 or not self.seal_randomness:
             self.forensic_sample = []
@@ -3877,12 +3944,22 @@ class GrpoWindowBatcher:
                 p for p in self._pending
                 if id(p) not in self._attempted_pending_ids
             ]
-        seed = self.seal_randomness.encode()
+        selected_contents = {
+            submission.prompt_content_sha256 for submission in self._valid
+        }
+        remainder = [
+            pending for pending in remainder
+            if pending.prompt_content_sha256 not in selected_contents
+            and not self._content_cooldown.is_in_cooldown(
+                pending.prompt_content_sha256, self.window_start
+            )
+        ]
         remainder.sort(
-            key=lambda p: hashlib.sha256(
-                seed + p.hotkey.encode()
-                + int(p.prompt_idx).to_bytes(8, "big") + p.merkle_root
-            ).digest()
+            key=lambda pending: int(
+                self.difficulty_auction_metadata_by_id.get(
+                    id(pending), {}
+                ).get("rank", 2**63 - 1)
+            )
         )
         sample = remainder[:FORENSIC_SAMPLE_PER_WINDOW]
         results: list[ForensicSampleResult] = []
@@ -3898,8 +3975,10 @@ class GrpoWindowBatcher:
                 self.proof_wall_exhausted = True
                 break
             error_type: str | None = None
+            verified: ValidSubmission | None = None
             try:
-                passed: bool | None = self._verify_expensive(p) is not None
+                verified = self._verify_expensive(p)
+                passed: bool | None = verified is not None
             except Exception as exc:
                 # The sample is observational only. A malformed outlier or
                 # exhausted GPU must not discard already-proven winners or
@@ -3943,6 +4022,7 @@ class GrpoWindowBatcher:
                     prompt_idx=p.prompt_idx,
                     passed=passed,
                     error_type=error_type,
+                    submission=verified,
                 )
             )
         self.proof_wall_elapsed_seconds = max(

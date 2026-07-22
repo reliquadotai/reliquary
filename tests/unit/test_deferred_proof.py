@@ -457,10 +457,8 @@ def test_forensic_sample_disabled_without_seal_randomness():
     assert b.forensic_sample == []
 
 
-def test_forensic_sample_watches_non_winners_keyed_on_seal_randomness():
-    """With post-deadline drand entropy set, FORENSIC_SAMPLE_PER_WINDOW non-winners
-    are proven for telemetry, selected by hashing seal_randomness (which did not
-    exist at submission time, so a miner cannot grind its root to dodge it)."""
+def test_forensic_sample_watches_next_ranked_non_winners():
+    """The next-ranked content-unique groups are the research counterfactuals."""
     from reliquary.constants import FORENSIC_SAMPLE_PER_WINDOW
     from tests.unit.test_grpo_window_batcher import (
         _always_true_grail, _make_batcher, _request,
@@ -481,9 +479,10 @@ def test_forensic_sample_watches_non_winners_keyed_on_seal_randomness():
     watched = {r.hotkey for r in b.forensic_sample}
     assert watched.isdisjoint(winners)          # only non-winners are sampled
 
-    # Different post-deadline entropy → different watched set (unpredictable).
+    # With no exact score/arrival tie in this fixture, different seal entropy
+    # leaves the same next-ranked research shortlist.
     other = {r.hotkey for r in _make("beacon-round-999").forensic_sample}
-    assert watched != other
+    assert watched == other == {"m8", "m9"}
 
 
 def test_forensic_sample_failure_cannot_abort_sealing():
