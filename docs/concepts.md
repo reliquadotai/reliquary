@@ -14,7 +14,7 @@ Reliquary turns this filter problem into a **prediction market**. Every training
 
 Three structural guarantees come with the market:
 
-- **Forced curriculum diversity.** A prompt that enters a winning batch is locked out for `BATCH_PROMPT_COOLDOWN_WINDOWS = 1_000_000` windows in the current OpenMath phase. In practice, prompts are one-shot. This prevents collapse onto a handful of high-variance outliers; R2 cooldown rebuild uses a bounded recent-window lookback so startup stays cheap.
+- **Forced curriculum diversity.** A prompt that enters a winning batch is locked out for `BATCH_PROMPT_COOLDOWN_WINDOWS = 1_000_000` windows in the current OpenMath phase. In practice, prompts are one-shot. The validator enforces this by both dataset index and canonical rendered-prompt digest, so duplicate content at another index cannot win again. The run-keyed snapshots survive restarts.
 - **Cryptographic training-data provenance.** Every rollout carries a GRAIL sketch that binds the generation to the model weights that produced it. The validator re-verifies with its own forward pass. Fabricated data earns zero.
 - **Validator-side reward authority and training quarantine.** For OpenMath, miners submit local reward claims and the validator independently recomputes them. For OpenCode, the curated structured cases are public but the validator alone executes them in its trusted sandbox and overwrites miner reward placeholders. Windows with high-confidence poison signatures are archived and credited but skipped for GRPO/publish.
 
@@ -77,7 +77,7 @@ Bootstrap phase (`BOOTSTRAP_WINDOWS = 100` windows from `SUBNET_START_BLOCK`): t
 
 Once a `prompt_idx` enters the winning batch it is ineligible for `BATCH_PROMPT_COOLDOWN_WINDOWS = 1_000_000` windows. With OpenMathInstruct-2's large prompt pool, this makes prompts effectively one-shot across any realistic run.
 
-The cooldown map is rebuilt from recent R2 archives using `COOLDOWN_REBUILD_LOOKBACK`, not the full one-shot horizon. This preserves recent curriculum state without forcing startup to download a million archives.
+The prompt-index cooldown is restored from its complete run-keyed snapshot and may replay a bounded R2 gap. A separate full-SHA256 canonical-content snapshot closes dataset-alias bypasses. On its first deployment, the validator resolves every selected index in the complete prompt snapshot and refuses to open a window until the derived content map is durable locally.
 
 ### Training quarantine — protect model health during exploit discovery
 
@@ -109,6 +109,8 @@ pattern.
 Per-window randomness remains drand-derived and exposed by `/state`. Submissions carry the current drand round, with stale/future rounds rejected at signed precommit arrival. Submitted drand is not a ranking key. Candidates rank by difficulty, then validator-observed precommit drand round. Exact ties inside that three-second bucket use a post-deadline drand salt bound to checkpoint, window, environment, operator, and prompt, never hotkey or miner-controlled payload metadata. A bounded seal-beacon outage falls back to exact validator-observed precommit arrival, not known window randomness.
 
 Multiple distinct operators may enter the same prompt pool, bounded at ten groups, but only the first ranked candidate for that prompt that passes deferred proof can win. One operator may reserve only one logical claim per prompt; there is no per-operator winner cap. The active selector does not split a prompt slot among runners-up.
+
+Prompt uniqueness is canonical-content based, not index-only. The observation-only foundation for a future validator-authoritative utility tie-break is documented in [Auction v3 Utility Foundation](auction-v3-utility-foundation.md). It does not alter the auction-v2 order or payout.
 
 This removes the old hotkey-count dilution surface: extra hotkeys neither produce different forced draws, reserve additional operator/prompt claims, nor create additional equal-score tie tickets.
 
