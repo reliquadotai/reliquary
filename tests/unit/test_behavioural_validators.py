@@ -861,6 +861,23 @@ def test_gpu_completion_entropy_is_stratified_and_bounded(monkeypatch):
     assert entropy == pytest.approx([math.log(4.0)] * 3)
 
 
+def test_gpu_completion_entropy_can_be_disabled():
+    chosen, amax_p, amax_id, entropy = (
+        verifier._gpu_completion_token_stats(
+            torch.zeros(3, 4),
+            [0, 0, 0],
+            prompt_length=1,
+            completion_length=2,
+            seq_len=3,
+            device="cpu",
+            include_entropy=False,
+        )
+    )
+
+    assert len(chosen) == len(amax_p) == len(amax_id) == 2
+    assert entropy == []
+
+
 def test_hidden_anchor_telemetry_skips_terminal_eos_and_force_span():
     hidden = torch.arange(30, dtype=torch.float32).reshape(6, 5)
     start, delta, dim, end_offset, shift_norm = (

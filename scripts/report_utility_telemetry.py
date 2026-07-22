@@ -164,8 +164,10 @@ def summarize(bundles: list[dict[str, Any]]) -> dict[str, Any]:
             reasons.append(f"checkpoints<{MIN_CHECKPOINTS}")
         if complete_rate is None or complete_rate < MIN_COMPLETE_FIELD_RATE:
             reasons.append(f"complete_field_rate<{MIN_COMPLETE_FIELD_RATE}")
-        if not any(row["role"] == "forensic" for row in groups):
-            reasons.append("no_forensic_counterfactuals")
+        if not any(
+            row["forensic_role"] == "counterfactual" for row in groups
+        ):
+            reasons.append("no_ranked_counterfactuals")
 
         content_counts = Counter(
             row["prompt_content_sha256"]

@@ -436,6 +436,7 @@ def verify_commitment_proofs(
     from reliquary.protocol.grail_verifier import GRAILVerifier
     from reliquary.shared.forward import forward_single_layer
     from reliquary.shared.hf_compat import resolve_hidden_size
+    from reliquary.validator.utility_telemetry import utility_telemetry_enabled
 
     tokens = commit["tokens"]
     commitments = commit["commitments"]
@@ -444,6 +445,7 @@ def verify_commitment_proofs(
     completion_length = int(rollout_meta.get("completion_length", 0))
 
     seq_len = len(tokens)
+    capture_utility = utility_telemetry_enabled()
 
     # SECURITY: Always use the validator's independently-computed randomness.
     # A miner who controls the randomness can predict which positions are
@@ -482,6 +484,7 @@ def verify_commitment_proofs(
         completion_entropies,
     ) = _gpu_completion_token_stats(
         logits_gpu, tokens, prompt_length, completion_length, seq_len, device,
+        include_entropy=capture_utility,
     )
 
     seed_n_stochastic = 0
@@ -564,20 +567,27 @@ def verify_commitment_proofs(
         )
 
     hidden_states = hidden_states_gpu.detach().to("cpu")
-    (
-        hidden_start_f16_b64,
-        hidden_delta_f16_b64,
-        hidden_dim,
-        hidden_end_completion_offset,
-        representation_shift_l2,
-    ) = _hidden_anchor_telemetry(
-        hidden_states,
-        tokens,
-        prompt_length,
-        completion_length,
-        _eos_set_from_model(model, tokenizer),
-        rollout_meta,
-    )
+    if capture_utility:
+        (
+            hidden_start_f16_b64,
+            hidden_delta_f16_b64,
+            hidden_dim,
+            hidden_end_completion_offset,
+            representation_shift_l2,
+        ) = _hidden_anchor_telemetry(
+            hidden_states,
+            tokens,
+            prompt_length,
+            completion_length,
+            _eos_set_from_model(model, tokenizer),
+            rollout_meta,
+        )
+    else:
+        hidden_start_f16_b64 = None
+        hidden_delta_f16_b64 = None
+        hidden_dim = 0
+        hidden_end_completion_offset = None
+        representation_shift_l2 = None
 
     passed = 0
     checked = 0
@@ -858,6 +868,8 @@ def _gpu_completion_token_stats(
     completion_length: int,
     seq_len: int,
     device: Any,
+    *,
+    include_entropy: bool = True,
 ) -> tuple[list[float], list[float], list[int], list[float]]:
     """Per completion-producing position under T_PROTO, on GPU, vectorised:
     chosen-token prob, argmax prob, argmax token id, and full-policy entropy.
@@ -875,9 +887,11 @@ def _gpu_completion_token_stats(
     argmax_prob_values: list[float] = []
     argmax_id_values: list[int] = []
     entropy_values: list[float] = []
-    entropy_rows = set(_stratified_indices(
-        len(valid_t), _UTILITY_ENTROPY_MAX_POSITIONS
-    ))
+    entropy_rows = set(
+        _stratified_indices(len(valid_t), _UTILITY_ENTROPY_MAX_POSITIONS)
+        if include_entropy
+        else []
+    )
     for start in range(0, len(valid_t), chunk_rows):
         chunk_t = valid_t[start:start + chunk_rows]
         pos_tensor = torch.tensor(
