@@ -77,7 +77,7 @@ from reliquary.validator.batch_selection import (
     explain_batch_selection,
     select_batch_and_distribute,
 )
-from reliquary.validator.cooldown import CooldownMap
+from reliquary.validator.cooldown import ContentCooldownMap, CooldownMap
 from reliquary.validator.dedup import (
     RolloutHashSet,
     compute_logical_group_hash,
@@ -93,6 +93,11 @@ from reliquary.validator.observability import (
     SubmitTelemetry,
     classify_drand_round,
     log_submission_stage,
+)
+from reliquary.validator.prompt_content import (
+    prompt_content_sha256,
+    render_canonical_prompt,
+    target_content_sha256,
 )
 from reliquary.validator.boxed_integrity import has_malformed_final_answer
 from reliquary.validator.auth_forensics import (
@@ -487,6 +492,7 @@ class GrpoWindowBatcher:
         *,
         tokenizer: Any = None,
         cooldown_map: CooldownMap | None = None,
+        content_cooldown_map: ContentCooldownMap | None = None,
         hash_set: RolloutHashSet | None = None,
         bootstrap: bool = False,
         completion_text_fn: Callable[[RolloutSubmission], str],
@@ -554,6 +560,13 @@ class GrpoWindowBatcher:
         self._cooldown = (
             cooldown_map if cooldown_map is not None
             else CooldownMap(cooldown_windows=BATCH_PROMPT_COOLDOWN_WINDOWS)
+        )
+        self._content_cooldown = (
+            content_cooldown_map
+            if content_cooldown_map is not None
+            else ContentCooldownMap(
+                cooldown_windows=BATCH_PROMPT_COOLDOWN_WINDOWS
+            )
         )
         self._hash_set: RolloutHashSet | None = hash_set
         self._operator_by_hotkey = {
@@ -658,6 +671,13 @@ class GrpoWindowBatcher:
             "paid_unselected_groups": 0,
             "selected_unrewarded_groups": 0,
             "reward_alignment_ok": True,
+        }
+        self.content_selection: dict[str, Any] = {
+            "identified_candidates": 0,
+            "content_cooldown_skips": 0,
+            "same_content_superseded": 0,
+            "selected_unique_contents": 0,
+            "content_alignment_ok": True,
         }
         # Accumulated reject reasons this window (RejectReason.value → count).
         # Persisted in the R2 archive so miners can see which filter is
@@ -1721,23 +1741,9 @@ class GrpoWindowBatcher:
         from reliquary.validator.admission import AdmissionProblemMaterials
 
         problem = self.env.get_problem(prompt_idx)
-        rendered_prompt = str(problem["prompt"])
-        chat_template = getattr(self.tokenizer, "chat_template", None)
-        if (
-            isinstance(chat_template, str)
-            and chat_template
-            and hasattr(self.tokenizer, "apply_chat_template")
-        ):
-            kwargs: dict[str, Any] = {
-                "add_generation_prompt": True,
-                "tokenize": False,
-            }
-            if "enable_thinking" in chat_template:
-                kwargs["enable_thinking"] = True
-            rendered_prompt = self.tokenizer.apply_chat_template(
-                [{"role": "user", "content": problem["prompt"]}],
-                **kwargs,
-            )
+        rendered_prompt = render_canonical_prompt(
+            self.tokenizer, str(problem["prompt"])
+        )
         code_cases = None
         cases_loader = getattr(self.env, "admission_reward_cases", None)
         if callable(cases_loader):
@@ -1846,6 +1852,19 @@ class GrpoWindowBatcher:
                 prepared.reject_stage or "admission_worker",
                 telemetry=telemetry,
                 grader_failure_reason=prepared.grader_failure_reason,
+            )
+        try:
+            prompt_content_bytes = bytes.fromhex(
+                prepared.prompt_content_sha256
+            )
+        except (TypeError, ValueError):
+            prompt_content_bytes = b""
+        if len(prompt_content_bytes) != 32:
+            return self.reject_prepared_submission(
+                request,
+                RejectReason.WORKER_DROPPED,
+                "content_identity",
+                telemetry=telemetry,
             )
 
         self._note_grail_candidate()
@@ -2319,6 +2338,11 @@ class GrpoWindowBatcher:
             if claimed_rand != self.randomness:
                 return reject(RejectReason.WRONG_RANDOMNESS, "randomness")
 
+        # The process-isolated production path carries these identities in
+        # PreparedSubmission. Direct/legacy callers reach this compatibility
+        # path, so resolve the same trusted problem locally before constructing
+        # their PendingSubmission.
+        problem = self.env.get_problem(request.prompt_idx)
         pending = PendingSubmission(
             hotkey=request.miner_hotkey,
             prompt_idx=request.prompt_idx,
@@ -2327,6 +2351,15 @@ class GrpoWindowBatcher:
             drand_round=request.drand_round,
             merkle_root=bytes.fromhex(request.merkle_root),
             selection_digest=compute_rollouts_selection_digest(request.rollouts),
+            prompt_content_sha256=prompt_content_sha256(
+                str(getattr(self.env, "name", "")),
+                render_canonical_prompt(
+                    self.tokenizer, str(problem["prompt"])
+                ),
+            ),
+            target_content_sha256=target_content_sha256(
+                str(getattr(self.env, "name", "")), problem
+            ),
             arrived_at=self._time_fn(),
             decision_ts=self._wall_clock(),
             telemetry=telemetry,
@@ -3536,6 +3569,7 @@ class GrpoWindowBatcher:
         attempts = 0
         proven: list[ValidSubmission] = []
         claimed: set[int] = set()
+        claimed_contents: set[str] = set()
         attempted_ids: set[int] = set()
         self.auction_operator_unmapped_skips = 0
         self.auction_operator_proof_debt_skips = 0
@@ -3599,8 +3633,17 @@ class GrpoWindowBatcher:
             if p.prompt_idx in claimed:
                 row["status"] = "same_prompt_superseded"
                 continue          # a higher-ranked passing candidate won it
+            content_digest = p.prompt_content_sha256
+            if content_digest in claimed_contents:
+                row["status"] = "same_content_superseded"
+                continue
             if self._cooldown.is_in_cooldown(p.prompt_idx, self.window_start):
                 row["status"] = "cooldown"
+                continue
+            if self._content_cooldown.is_in_cooldown(
+                content_digest, self.window_start
+            ):
+                row["status"] = "content_in_cooldown"
                 continue
             operator = row["operator_id"]
             if operator is None:
@@ -3669,6 +3712,7 @@ class GrpoWindowBatcher:
             row["status"] = "selected"
             proven.append(sub)
             claimed.add(p.prompt_idx)
+            claimed_contents.add(content_digest)
             self.difficulty_auction_metadata_by_id[id(sub)] = row
 
         with self._lock:
@@ -3687,6 +3731,22 @@ class GrpoWindowBatcher:
                         else f"unobserved_{stop_reason}"
                     )
         self.auction_candidates = candidate_rows
+        self.content_selection = {
+            "identified_candidates": sum(
+                bool(row.get("prompt_content_sha256"))
+                for row in candidate_rows
+            ),
+            "content_cooldown_skips": sum(
+                row.get("status") == "content_in_cooldown"
+                for row in candidate_rows
+            ),
+            "same_content_superseded": sum(
+                row.get("status") == "same_content_superseded"
+                for row in candidate_rows
+            ),
+            "selected_unique_contents": len(claimed_contents),
+            "content_alignment_ok": len(claimed_contents) == len(proven),
+        }
         # Read by _prove_forensic_sample to find the pool this window never
         # looked at.
         self._attempted_pending_ids = attempted_ids
@@ -3703,6 +3763,7 @@ class GrpoWindowBatcher:
 
         winners = list(self._valid)
         prompt_ids = [submission.prompt_idx for submission in winners]
+        content_ids = [submission.prompt_content_sha256 for submission in winners]
         if len(winners) > B_BATCH:
             raise RuntimeError(
                 "auction reward alignment failed: winner count exceeds batch size"
@@ -3710,6 +3771,13 @@ class GrpoWindowBatcher:
         if len(prompt_ids) != len(set(prompt_ids)):
             raise RuntimeError(
                 "auction reward alignment failed: duplicate winning prompt"
+            )
+        if (
+            any(len(content_id) != 64 for content_id in content_ids)
+            or len(content_ids) != len(set(content_ids))
+        ):
+            raise RuntimeError(
+                "auction reward alignment failed: duplicate winning content"
             )
 
         slot_share = pool / B_BATCH
@@ -4130,6 +4198,7 @@ class GrpoWindowBatcher:
                         self.retained_payload_bytes
                     ),
                     "reward_alignment": dict(self.reward_alignment),
+                    "content_selection": dict(self.content_selection),
                     "candidates": self.auction_candidates,
                 }
             else:
@@ -4168,6 +4237,18 @@ class GrpoWindowBatcher:
             rewarded_prompts = {sub.prompt_idx for sub in rewarded_submissions}
             for p in rewarded_prompts:
                 self._cooldown.record_batched(p, self.window_start)
+            if self.difficulty_auction_enabled:
+                rewarded_contents = {
+                    sub.prompt_content_sha256 for sub in rewarded_submissions
+                }
+                if any(len(digest) != 64 for digest in rewarded_contents):
+                    raise RuntimeError(
+                        "auction content cooldown update missing canonical identity"
+                    )
+                for digest in rewarded_contents:
+                    self._content_cooldown.record_selected(
+                        digest, self.window_start
+                    )
             if self._hash_set is not None:
                 for sub in rewarded_submissions:
                     for h in sub.rollout_hashes:

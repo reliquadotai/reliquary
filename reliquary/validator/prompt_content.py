@@ -34,6 +34,28 @@ def prompt_content_sha256(environment: str, rendered_prompt: str) -> str:
     )
 
 
+def render_canonical_prompt(tokenizer: Any, prompt: str) -> str:
+    """Render a trusted user prompt exactly as admission will tokenize it."""
+    rendered = str(prompt)
+    chat_template = getattr(tokenizer, "chat_template", None)
+    if (
+        isinstance(chat_template, str)
+        and chat_template
+        and hasattr(tokenizer, "apply_chat_template")
+    ):
+        kwargs: dict[str, Any] = {
+            "add_generation_prompt": True,
+            "tokenize": False,
+        }
+        if "enable_thinking" in chat_template:
+            kwargs["enable_thinking"] = True
+        rendered = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            **kwargs,
+        )
+    return rendered
+
+
 def target_content_sha256(
     environment: str,
     problem: dict[str, Any],

@@ -3,6 +3,8 @@ until it is ranked high enough to win. Scoring + ranking reuse the merged
 ``difficulty_auction`` module (v2), and the same-prompt winner is resolved at
 seal.
 """
+import hashlib
+
 from reliquary.constants import DIFFICULTY_AUCTION_DELTA
 from reliquary.validator.batcher import PendingSubmission
 
@@ -16,6 +18,10 @@ def _pending(hotkey="a", prompt_idx=1, k=2, m=8, drand_round=1):
         drand_round=drand_round,
         merkle_root=hotkey.encode().ljust(32, b"\x00"),
         selection_digest=hotkey.encode().ljust(32, b"\x00"),
+        prompt_content_sha256=hashlib.sha256(
+            f"prompt:{prompt_idx}".encode()
+        ).hexdigest(),
+        target_content_sha256=hashlib.sha256(b"target").hexdigest(),
     )
 
 
@@ -723,6 +729,61 @@ def test_same_prompt_split_survivor_takes_full_share():
     _batch, rewards = b.seal_batch()
 
     assert rewards == {"honest": pytest.approx(1.0 / B_BATCH)}
+
+
+def test_same_content_different_prompt_indices_share_one_slot():
+    from tests.unit.test_grpo_window_batcher import FakeEnv, _make_batcher, _request
+
+    class DuplicateContentEnv(FakeEnv):
+        def get_problem(self, idx):
+            prompt = "same canonical problem" if idx in {7, 8} else f"p{idx}"
+            return {"prompt": prompt, "ground_truth": "a", "id": f"pid-{idx}"}
+
+    b = _make_batcher(env=DuplicateContentEnv())
+    _accept(b, _request(prompt_idx=7, hotkey="first"), arrival_round=100)
+    _accept(b, _request(prompt_idx=8, hotkey="second"), arrival_round=100)
+    batch, rewards = b.seal_batch()
+
+    assert len(batch) == 1
+    assert len(rewards) == 1
+    assert next(iter(rewards.values())) == pytest.approx(1.0 / B_BATCH)
+    rows = {row["hotkey"]: row for row in b.auction_candidates}
+    assert sum(row["selected"] for row in rows.values()) == 1
+    assert sum(
+        row["status"] == "same_content_superseded"
+        for row in rows.values()
+    ) == 1
+    assert b.content_selection["content_alignment_ok"] is True
+
+
+def test_content_cooldown_blocks_duplicate_under_new_prompt_index():
+    from reliquary.validator.cooldown import ContentCooldownMap
+    from tests.unit.test_grpo_window_batcher import FakeEnv, _make_batcher, _request
+
+    class DuplicateContentEnv(FakeEnv):
+        def get_problem(self, idx):
+            return {"prompt": "same canonical problem", "ground_truth": "a"}
+
+    shared = ContentCooldownMap(cooldown_windows=1_000_000)
+    first = _make_batcher(
+        env=DuplicateContentEnv(), content_cooldown_map=shared
+    )
+    _accept(first, _request(prompt_idx=7, hotkey="winner"), arrival_round=100)
+    first.seal_batch()
+
+    second = _make_batcher(
+        env=DuplicateContentEnv(),
+        content_cooldown_map=shared,
+        window_start=501,
+    )
+    _accept(second, _request(
+        prompt_idx=8, hotkey="duplicate", window_start=501
+    ), arrival_round=101)
+    batch, rewards = second.seal_batch()
+
+    assert batch == []
+    assert rewards == {}
+    assert second.auction_candidates[0]["status"] == "content_in_cooldown"
 
 
 def test_boundary_tier_pays_only_selected_training_groups():
