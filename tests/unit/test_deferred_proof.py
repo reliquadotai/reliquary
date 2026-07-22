@@ -457,8 +457,8 @@ def test_forensic_sample_disabled_without_seal_randomness():
     assert b.forensic_sample == []
 
 
-def test_forensic_sample_watches_next_ranked_non_winners():
-    """The next-ranked content-unique groups are the research counterfactuals."""
+def test_forensic_sample_balances_counterfactual_and_random_watch():
+    """Keep one #9 utility sample and one unpredictable security sample."""
     from reliquary.constants import FORENSIC_SAMPLE_PER_WINDOW
     from tests.unit.test_grpo_window_batcher import (
         _always_true_grail, _make_batcher, _request,
@@ -478,11 +478,17 @@ def test_forensic_sample_watches_next_ranked_non_winners():
     assert len(b.forensic_sample) == FORENSIC_SAMPLE_PER_WINDOW
     watched = {r.hotkey for r in b.forensic_sample}
     assert watched.isdisjoint(winners)          # only non-winners are sampled
+    by_role = {result.sample_role: result.hotkey for result in b.forensic_sample}
+    assert by_role["counterfactual"] == "m8"
 
-    # With no exact score/arrival tie in this fixture, different seal entropy
-    # leaves the same next-ranked research shortlist.
-    other = {r.hotkey for r in _make("beacon-round-999").forensic_sample}
-    assert watched == other == {"m8", "m9"}
+    # The #9 counterfactual is stable, while post-deadline entropy changes the
+    # random anti-evasion watch candidate.
+    other = {
+        result.sample_role: result.hotkey
+        for result in _make("beacon-round-999").forensic_sample
+    }
+    assert other["counterfactual"] == "m8"
+    assert by_role["random_watch"] != other["random_watch"]
 
 
 def test_forensic_sample_failure_cannot_abort_sealing():

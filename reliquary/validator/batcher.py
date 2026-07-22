@@ -458,6 +458,7 @@ class ForensicSampleResult:
     prompt_idx: int
     passed: bool | None
     error_type: str | None = None
+    sample_role: str = "random_watch"
     submission: ValidSubmission | None = field(default=None, repr=False)
 
 
@@ -3924,12 +3925,13 @@ class GrpoWindowBatcher:
         return winners, rewards
 
     def _prove_forensic_sample(self) -> list[ForensicSampleResult]:
-        """Prove the next-ranked content-unique non-winners for telemetry.
+        """Prove one utility counterfactual plus unpredictable watch samples.
 
         Deferring the proof to seal means the auth gates in ``_verify_expensive``
         only ever run on the ranked winners; sampling a few losers keeps the
-        pre-generation / token-tamper detectors alive and provides the most
-        relevant counterfactuals for future utility-ranking research. Results
+        pre-generation / token-tamper detectors alive. With the default budget
+        of two, one sample is the next-ranked utility counterfactual and one is
+        selected unpredictably from the rest using post-deadline drand. Results
         never enter ``_valid`` and are never paid.
 
         The authoritative auction rank already includes post-deadline seal
@@ -3954,18 +3956,37 @@ class GrpoWindowBatcher:
                 pending.prompt_content_sha256, self.window_start
             )
         ]
-        remainder.sort(
+        ranked = sorted(
+            remainder,
             key=lambda pending: int(
                 self.difficulty_auction_metadata_by_id.get(
                     id(pending), {}
                 ).get("rank", 2**63 - 1)
             )
         )
-        sample = remainder[:FORENSIC_SAMPLE_PER_WINDOW]
+        sample: list[tuple[PendingSubmission, str]] = []
+        random_pool = list(ranked)
+        if FORENSIC_SAMPLE_PER_WINDOW >= 2 and random_pool:
+            counterfactual = random_pool.pop(0)
+            sample.append((counterfactual, "counterfactual"))
+        random_seed = self.seal_randomness.encode("utf-8")
+        random_pool.sort(
+            key=lambda pending: hashlib.sha256(
+                b"reliquary/forensic-watch/v1\0"
+                + random_seed
+                + pending.hotkey.encode("utf-8")
+                + int(pending.prompt_idx).to_bytes(8, "big")
+                + pending.merkle_root
+            ).digest()
+        )
+        remaining = FORENSIC_SAMPLE_PER_WINDOW - len(sample)
+        sample.extend(
+            (pending, "random_watch") for pending in random_pool[:remaining]
+        )
         results: list[ForensicSampleResult] = []
         self.forensic_proof_attempts = 0
         self.forensic_proof_errors_by_type = {}
-        for p in sample:
+        for p, sample_role in sample:
             if self.proof_attempts >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW:
                 break
             if self._proof_wall_started_at is None:
@@ -4014,6 +4035,7 @@ class GrpoWindowBatcher:
             row = self.difficulty_auction_metadata_by_id.get(id(p))
             if row is not None:
                 row["forensic_sampled"] = True
+                row["forensic_sample_role"] = sample_role
                 row["forensic_passed"] = passed
                 row["forensic_error_type"] = error_type
             results.append(
@@ -4022,6 +4044,7 @@ class GrpoWindowBatcher:
                     prompt_idx=p.prompt_idx,
                     passed=passed,
                     error_type=error_type,
+                    sample_role=sample_role,
                     submission=verified,
                 )
             )

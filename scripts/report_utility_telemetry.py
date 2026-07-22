@@ -103,6 +103,7 @@ def _group_features(group: dict[str, Any]) -> dict[str, Any]:
         "operator_pseudonym": str(group.get("operator_pseudonym", "")),
         "prompt_content_sha256": str(group.get("prompt_content_sha256", "")),
         "role": str(group.get("role", "unknown")),
+        "forensic_role": group.get("forensic_role"),
         "rollouts": len(rollouts),
         "complete_rollouts": complete_rollouts,
         "positive_reward_count": sum(
@@ -192,6 +193,12 @@ def summarize(bundles: list[dict[str, Any]]) -> dict[str, Any]:
             "winner_groups": sum(row["role"] == "winner" for row in groups),
             "forensic_groups": sum(
                 row["role"] == "forensic" for row in groups
+            ),
+            "counterfactual_groups": sum(
+                row["forensic_role"] == "counterfactual" for row in groups
+            ),
+            "random_watch_groups": sum(
+                row["forensic_role"] == "random_watch" for row in groups
             ),
             "operators": len({
                 row["operator_pseudonym"]

@@ -53,9 +53,12 @@ For each completed window, the validator writes a local gzip bundle at:
 ${RELIQUARY_STATE_DIR:-/root/reliquary/state}/utility_telemetry/window-N.json.gz
 ```
 
-Each bundle contains the selected winners and the next-ranked, content-unique
-forensic candidates that passed the same expensive proof. The latter are the
-closest counterfactuals to positions 9 and 10. They remain unpaid and untrained.
+Each bundle contains the selected winners plus a bounded hybrid forensic sample
+that passed the same expensive proof. With the default budget of two, one is
+the next-ranked, content-unique counterfactual to position 9 and one is chosen
+unpredictably from the remainder using post-deadline drand. This preserves the
+anti-evasion monitor while gathering the closest utility counterfactual. Both
+remain unpaid and untrained.
 
 Per group, the bundle records:
 

@@ -188,6 +188,7 @@ class UtilityTelemetryWriter:
         env_name: str,
         checkpoint_revision: str,
         role: str,
+        forensic_role: str | None,
         submission: Any,
         operator_by_hotkey: Mapping[str, str],
     ) -> dict[str, Any]:
@@ -206,6 +207,7 @@ class UtilityTelemetryWriter:
             ),
             "operator_pseudonym": operator_pseudonym,
             "role": role,
+            "forensic_role": forensic_role,
             "environment": env_name,
             "checkpoint_revision": checkpoint_revision,
             "prompt_idx": int(submission.prompt_idx),
@@ -252,6 +254,7 @@ class UtilityTelemetryWriter:
                         env_name=env_name,
                         checkpoint_revision=checkpoint_revision,
                         role="winner",
+                        forensic_role=None,
                         submission=submission,
                         operator_by_hotkey=operator_by_hotkey,
                     )
@@ -269,6 +272,9 @@ class UtilityTelemetryWriter:
                         env_name=env_name,
                         checkpoint_revision=checkpoint_revision,
                         role="forensic",
+                        forensic_role=getattr(
+                            forensic, "sample_role", "random_watch"
+                        ),
                         submission=submission,
                         operator_by_hotkey=operator_by_hotkey,
                     ))

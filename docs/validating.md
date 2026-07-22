@@ -223,7 +223,7 @@ These are the live thresholds the trainer applies on every submission. The same 
 | `SIGMA_MIN` (steady) | 0.43 | Zone filter: groups below this are rejected `OUT_OF_ZONE` (binary equivalent: k ∈ [2, 6] for M=8) |
 | `BOOTSTRAP_SIGMA_MIN` | 0.33 | Relaxed zone filter during first `BOOTSTRAP_WINDOWS = 100` windows (k ∈ [1, 7]) |
 | `BATCH_PROMPT_COOLDOWN_WINDOWS` | 1,000,000 | A winning prompt is effectively one-shot in the OpenMath phase |
-| `COOLDOWN_REBUILD_LOOKBACK` | 300 | Bounded R2 gap replay for legacy/fallback prompt-index cooldown recovery; canonical content uses its run-keyed snapshot |
+| `COOLDOWN_REBUILD_LOOKBACK` | 2000 | Bounded R2 gap replay for legacy/fallback prompt-index cooldown recovery; canonical content uses its run-keyed snapshot |
 | `PROOF_SKETCH_TOLERANCE_BASE` | 5000 | GRAIL sketch tolerance — actual threshold = `5000 + 5 × √position` |
 | `PROOF_SKETCH_TOLERANCE_GROWTH` | 5.0 | Per-position sqrt growth |
 | `LOGPROB_IS_EPS` | 0.10 | Per-token log-prob deviation max — exceeding triggers `LOGPROB_MISMATCH` |

@@ -71,7 +71,10 @@ def test_private_bundle_contains_winner_and_forensic_without_raw_identity(
             "winner-hotkey": "operator-one",
             "forensic-hotkey": "operator-two",
         },
-        forensic_sample=[SimpleNamespace(submission=forensic)],
+        forensic_sample=[SimpleNamespace(
+            submission=forensic,
+            sample_role="counterfactual",
+        )],
     )
     writer = UtilityTelemetryWriter(tmp_path)
 
@@ -86,6 +89,8 @@ def test_private_bundle_contains_winner_and_forensic_without_raw_identity(
     payload = _read(destination)
     groups = payload["environments"]["openmathinstruct"]
     assert [group["role"] for group in groups] == ["winner", "forensic"]
+    assert groups[0]["forensic_role"] is None
+    assert groups[1]["forensic_role"] == "counterfactual"
     assert groups[0]["rollouts"][0]["tokens"] == [10, 11, 20, 99]
     assert groups[0]["group_summary"] == {
         "rollout_count": 2,
