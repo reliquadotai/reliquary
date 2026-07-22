@@ -3653,9 +3653,6 @@ class GrpoWindowBatcher:
                 "prompt_content_sha256": (
                     pending_submission.prompt_content_sha256 or None
                 ),
-                "target_content_sha256": (
-                    pending_submission.target_content_sha256 or None
-                ),
                 "selection_digest": pending_submission.selection_digest.hex(),
                 "drand_round": pending_submission.drand_round,
                 "value": score.value,

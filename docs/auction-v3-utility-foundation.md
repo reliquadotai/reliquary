@@ -42,7 +42,8 @@ prompt-index snapshot using the pinned environment and tokenizer. Startup does
 not open a window until derivation succeeds and a restart-safe local snapshot
 exists. An R2 outage is nonblocking after local persistence.
 
-`target_content_sha256` is retained for offline diagnostics only. It never
+`target_content_sha256` is retained only in the private utility bundle for
+offline diagnostics. It is excluded from public archives and never
 participates in admission, rank, or cooldown.
 
 ## Private Utility Dataset
