@@ -77,7 +77,7 @@ from reliquary.validator.batch_selection import (
     explain_batch_selection,
     select_batch_and_distribute,
 )
-from reliquary.validator.cooldown import CooldownMap
+from reliquary.validator.cooldown import ContentCooldownMap, CooldownMap
 from reliquary.validator.dedup import (
     RolloutHashSet,
     compute_logical_group_hash,
@@ -93,6 +93,11 @@ from reliquary.validator.observability import (
     SubmitTelemetry,
     classify_drand_round,
     log_submission_stage,
+)
+from reliquary.validator.prompt_content import (
+    prompt_content_sha256,
+    render_canonical_prompt,
+    target_content_sha256,
 )
 from reliquary.validator.boxed_integrity import has_malformed_final_answer
 from reliquary.validator.auth_forensics import (
@@ -333,6 +338,8 @@ class PendingSubmission:
     drand_round: int
     merkle_root: bytes
     selection_digest: bytes
+    prompt_content_sha256: str = ""
+    target_content_sha256: str = ""
     arrived_at: float = 0.0
     # Wall clock of the CHEAP admission decision. The pre-generation forensic
     # metric is arrival_ts - (decision_ts - response_time), so it must be the
@@ -361,6 +368,8 @@ class ValidSubmission:
     sigma: float = 0.0
     rollouts: list[RolloutSubmission] = field(default_factory=list)
     completion_texts: list[str] = field(default_factory=list)
+    prompt_content_sha256: str = ""
+    target_content_sha256: str = ""
     arrived_at: float = 0.0
     # Filter telemetry (worst-case across this submission's rollouts).
     # Captured for post-hoc threshold calibration without re-running tests.
@@ -393,6 +402,7 @@ class ValidSubmission:
     truncated_count: int = 0
     reward_shape: dict[str, Any] = field(default_factory=dict)
     ingress_observability: dict[str, Any] = field(default_factory=dict)
+    utility_rollouts: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self):
         self.merkle_root = self.merkle_root_bytes
@@ -448,6 +458,8 @@ class ForensicSampleResult:
     prompt_idx: int
     passed: bool | None
     error_type: str | None = None
+    sample_role: str = "random_watch"
+    submission: ValidSubmission | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -483,6 +495,7 @@ class GrpoWindowBatcher:
         *,
         tokenizer: Any = None,
         cooldown_map: CooldownMap | None = None,
+        content_cooldown_map: ContentCooldownMap | None = None,
         hash_set: RolloutHashSet | None = None,
         bootstrap: bool = False,
         completion_text_fn: Callable[[RolloutSubmission], str],
@@ -550,6 +563,13 @@ class GrpoWindowBatcher:
         self._cooldown = (
             cooldown_map if cooldown_map is not None
             else CooldownMap(cooldown_windows=BATCH_PROMPT_COOLDOWN_WINDOWS)
+        )
+        self._content_cooldown = (
+            content_cooldown_map
+            if content_cooldown_map is not None
+            else ContentCooldownMap(
+                cooldown_windows=BATCH_PROMPT_COOLDOWN_WINDOWS
+            )
         )
         self._hash_set: RolloutHashSet | None = hash_set
         self._operator_by_hotkey = {
@@ -654,6 +674,13 @@ class GrpoWindowBatcher:
             "paid_unselected_groups": 0,
             "selected_unrewarded_groups": 0,
             "reward_alignment_ok": True,
+        }
+        self.content_selection: dict[str, Any] = {
+            "identified_candidates": 0,
+            "content_cooldown_skips": 0,
+            "same_content_superseded": 0,
+            "selected_unique_contents": 0,
+            "content_alignment_ok": True,
         }
         # Accumulated reject reasons this window (RejectReason.value → count).
         # Persisted in the R2 archive so miners can see which filter is
@@ -1717,23 +1744,9 @@ class GrpoWindowBatcher:
         from reliquary.validator.admission import AdmissionProblemMaterials
 
         problem = self.env.get_problem(prompt_idx)
-        rendered_prompt = str(problem["prompt"])
-        chat_template = getattr(self.tokenizer, "chat_template", None)
-        if (
-            isinstance(chat_template, str)
-            and chat_template
-            and hasattr(self.tokenizer, "apply_chat_template")
-        ):
-            kwargs: dict[str, Any] = {
-                "add_generation_prompt": True,
-                "tokenize": False,
-            }
-            if "enable_thinking" in chat_template:
-                kwargs["enable_thinking"] = True
-            rendered_prompt = self.tokenizer.apply_chat_template(
-                [{"role": "user", "content": problem["prompt"]}],
-                **kwargs,
-            )
+        rendered_prompt = render_canonical_prompt(
+            self.tokenizer, str(problem["prompt"])
+        )
         code_cases = None
         cases_loader = getattr(self.env, "admission_reward_cases", None)
         if callable(cases_loader):
@@ -1843,6 +1856,19 @@ class GrpoWindowBatcher:
                 telemetry=telemetry,
                 grader_failure_reason=prepared.grader_failure_reason,
             )
+        try:
+            prompt_content_bytes = bytes.fromhex(
+                prepared.prompt_content_sha256
+            )
+        except (TypeError, ValueError):
+            prompt_content_bytes = b""
+        if len(prompt_content_bytes) != 32:
+            return self.reject_prepared_submission(
+                request,
+                RejectReason.WORKER_DROPPED,
+                "content_identity",
+                telemetry=telemetry,
+            )
 
         self._note_grail_candidate()
         pending = PendingSubmission(
@@ -1854,6 +1880,8 @@ class GrpoWindowBatcher:
             merkle_root=bytes.fromhex(request.merkle_root),
             selection_digest=prepared.selection_digest
             or compute_rollouts_selection_digest(request.rollouts),
+            prompt_content_sha256=prepared.prompt_content_sha256,
+            target_content_sha256=prepared.target_content_sha256,
             arrived_at=self._time_fn(),
             decision_ts=self._wall_clock(),
             telemetry=telemetry,
@@ -2313,6 +2341,11 @@ class GrpoWindowBatcher:
             if claimed_rand != self.randomness:
                 return reject(RejectReason.WRONG_RANDOMNESS, "randomness")
 
+        # The process-isolated production path carries these identities in
+        # PreparedSubmission. Direct/legacy callers reach this compatibility
+        # path, so resolve the same trusted problem locally before constructing
+        # their PendingSubmission.
+        problem = self.env.get_problem(request.prompt_idx)
         pending = PendingSubmission(
             hotkey=request.miner_hotkey,
             prompt_idx=request.prompt_idx,
@@ -2321,6 +2354,15 @@ class GrpoWindowBatcher:
             drand_round=request.drand_round,
             merkle_root=bytes.fromhex(request.merkle_root),
             selection_digest=compute_rollouts_selection_digest(request.rollouts),
+            prompt_content_sha256=prompt_content_sha256(
+                str(getattr(self.env, "name", "")),
+                render_canonical_prompt(
+                    self.tokenizer, str(problem["prompt"])
+                ),
+            ),
+            target_content_sha256=target_content_sha256(
+                str(getattr(self.env, "name", "")), problem
+            ),
             arrived_at=self._time_fn(),
             decision_ts=self._wall_clock(),
             telemetry=telemetry,
@@ -2608,6 +2650,7 @@ class GrpoWindowBatcher:
         # rollout separately, since the group average hides a partial swap.
         seed_per_rollout: list[tuple[int, int]] = []
         seed_cdf_per_rollout: list[dict[str, Any]] = []
+        utility_rollouts: list[dict[str, Any]] = []
 
         for rollout_idx, rollout in enumerate(request.rollouts):
             # Never carry a validator-derived carve across re-validation of the
@@ -3173,6 +3216,71 @@ class GrpoWindowBatcher:
                             dist_q10_min=dist_q10_min,
                         )
 
+            chosen_probs = list(
+                getattr(proof, "completion_chosen_probs", []) or []
+            )
+            entropies = list(
+                getattr(proof, "completion_entropies", []) or []
+            )
+            chosen_nll = [
+                -math.log(max(float(probability), 1e-45))
+                for probability in chosen_probs
+            ]
+
+            def _summary(values: list[float]) -> dict[str, float | None]:
+                ordered = sorted(
+                    float(value)
+                    for value in values
+                    if math.isfinite(float(value))
+                )
+                if not ordered:
+                    return {"mean": None, "p50": None, "p90": None}
+
+                def _percentile(fraction: float) -> float:
+                    index = round((len(ordered) - 1) * fraction)
+                    return ordered[index]
+
+                return {
+                    "mean": sum(ordered) / len(ordered),
+                    "p50": _percentile(0.5),
+                    "p90": _percentile(0.9),
+                }
+
+            utility_rollouts.append({
+                "rollout_idx": rollout_idx,
+                "reward": float(getattr(rollout, "reward", 0.0) or 0.0),
+                "prompt_length": prompt_len,
+                "completion_length": completion_len,
+                "natural_eos": bool(
+                    rollout.commit.get("tokens")
+                    and int(rollout.commit["tokens"][-1])
+                    in telemetry_eos_ids
+                ),
+                "validated_force_span": (
+                    list(rollout._validated_force_span)
+                    if rollout._validated_force_span is not None
+                    else None
+                ),
+                "termination_path": rollout._validated_termination_path,
+                "chosen_nll": _summary(chosen_nll),
+                "full_policy_entropy": _summary(entropies),
+                "full_policy_entropy_samples": len(entropies),
+                "hidden_start_f16_b64": getattr(
+                    proof, "hidden_start_f16_b64", None
+                ),
+                "hidden_delta_f16_b64": getattr(
+                    proof, "hidden_delta_f16_b64", None
+                ),
+                "hidden_dim": int(getattr(proof, "hidden_dim", 0) or 0),
+                "hidden_end_completion_offset": getattr(
+                    proof, "hidden_end_completion_offset", None
+                ),
+                "representation_shift_l2": getattr(
+                    proof, "representation_shift_l2", None
+                ),
+                "token_degeneracy": dict(rollout_token_metrics),
+            })
+
         # Forced-seed gate. Group verdict = summed counts (catches diffuse
         # deviation); per-rollout verdict catches a single off-stream rollout
         # the group average would dilute. Both shadow (compute + log, never
@@ -3269,6 +3377,8 @@ class GrpoWindowBatcher:
             sigma=sigma,
             rollouts=list(request.rollouts),
             completion_texts=completion_texts,
+            prompt_content_sha256=pending.prompt_content_sha256,
+            target_content_sha256=pending.target_content_sha256,
             arrived_at=pending.arrived_at,
             sketch_diff_max=sketch_diff_max,
             lp_dev_max=lp_dev_max,
@@ -3307,6 +3417,7 @@ class GrpoWindowBatcher:
             ingress_observability=(
                 telemetry.archive_fields() if telemetry else {}
             ),
+            utility_rollouts=utility_rollouts,
         )
         # The caller decides whether this is an auction winner or an immediate
         # legacy admission.
@@ -3528,6 +3639,7 @@ class GrpoWindowBatcher:
         attempts = 0
         proven: list[ValidSubmission] = []
         claimed: set[int] = set()
+        claimed_contents: set[str] = set()
         attempted_ids: set[int] = set()
         self.auction_operator_unmapped_skips = 0
         self.auction_operator_proof_debt_skips = 0
@@ -3538,6 +3650,9 @@ class GrpoWindowBatcher:
             row = {
                 "hotkey": pending_submission.hotkey,
                 "prompt_idx": pending_submission.prompt_idx,
+                "prompt_content_sha256": (
+                    pending_submission.prompt_content_sha256 or None
+                ),
                 "selection_digest": pending_submission.selection_digest.hex(),
                 "drand_round": pending_submission.drand_round,
                 "value": score.value,
@@ -3585,8 +3700,17 @@ class GrpoWindowBatcher:
             if p.prompt_idx in claimed:
                 row["status"] = "same_prompt_superseded"
                 continue          # a higher-ranked passing candidate won it
+            content_digest = p.prompt_content_sha256
+            if content_digest in claimed_contents:
+                row["status"] = "same_content_superseded"
+                continue
             if self._cooldown.is_in_cooldown(p.prompt_idx, self.window_start):
                 row["status"] = "cooldown"
+                continue
+            if self._content_cooldown.is_in_cooldown(
+                content_digest, self.window_start
+            ):
+                row["status"] = "content_in_cooldown"
                 continue
             operator = row["operator_id"]
             if operator is None:
@@ -3655,6 +3779,7 @@ class GrpoWindowBatcher:
             row["status"] = "selected"
             proven.append(sub)
             claimed.add(p.prompt_idx)
+            claimed_contents.add(content_digest)
             self.difficulty_auction_metadata_by_id[id(sub)] = row
 
         with self._lock:
@@ -3673,6 +3798,22 @@ class GrpoWindowBatcher:
                         else f"unobserved_{stop_reason}"
                     )
         self.auction_candidates = candidate_rows
+        self.content_selection = {
+            "identified_candidates": sum(
+                bool(row.get("prompt_content_sha256"))
+                for row in candidate_rows
+            ),
+            "content_cooldown_skips": sum(
+                row.get("status") == "content_in_cooldown"
+                for row in candidate_rows
+            ),
+            "same_content_superseded": sum(
+                row.get("status") == "same_content_superseded"
+                for row in candidate_rows
+            ),
+            "selected_unique_contents": len(claimed_contents),
+            "content_alignment_ok": len(claimed_contents) == len(proven),
+        }
         # Read by _prove_forensic_sample to find the pool this window never
         # looked at.
         self._attempted_pending_ids = attempted_ids
@@ -3689,6 +3830,7 @@ class GrpoWindowBatcher:
 
         winners = list(self._valid)
         prompt_ids = [submission.prompt_idx for submission in winners]
+        content_ids = [submission.prompt_content_sha256 for submission in winners]
         if len(winners) > B_BATCH:
             raise RuntimeError(
                 "auction reward alignment failed: winner count exceeds batch size"
@@ -3696,6 +3838,13 @@ class GrpoWindowBatcher:
         if len(prompt_ids) != len(set(prompt_ids)):
             raise RuntimeError(
                 "auction reward alignment failed: duplicate winning prompt"
+            )
+        if (
+            any(len(content_id) != 64 for content_id in content_ids)
+            or len(content_ids) != len(set(content_ids))
+        ):
+            raise RuntimeError(
+                "auction reward alignment failed: duplicate winning content"
             )
 
         slot_share = pool / B_BATCH
@@ -3773,19 +3922,18 @@ class GrpoWindowBatcher:
         return winners, rewards
 
     def _prove_forensic_sample(self) -> list[ForensicSampleResult]:
-        """Prove ``FORENSIC_SAMPLE_PER_WINDOW`` non-winners for telemetry only.
+        """Prove one utility counterfactual plus unpredictable watch samples.
 
         Deferring the proof to seal means the auth gates in ``_verify_expensive``
         only ever run on the ranked winners; sampling a few losers keeps the
-        pre-generation / token-tamper detectors alive. Results never enter
-        ``_valid`` and are never paid.
+        pre-generation / token-tamper detectors alive. With the default budget
+        of two, one sample is the next-ranked utility counterfactual and one is
+        selected unpredictably from the rest using post-deadline drand. Results
+        never enter ``_valid`` and are never paid.
 
-        The sample is keyed on ``self.seal_randomness`` — a drand beacon fetched
-        AFTER the collection deadline — so a miner cannot grind its merkle_root to
-        learn whether it will be watched (the entropy did not exist at submission
-        time). This is telemetry only and never feeds weights, so it needs no
-        cross-validator consensus: each validator may watch a different sample.
-        Empty seal_randomness (mock / no-drand) disables sampling.
+        The authoritative auction rank already includes post-deadline seal
+        randomness for exact score/arrival ties. Empty seal randomness means no
+        final rank exists, so sampling remains disabled in that state.
         """
         if FORENSIC_SAMPLE_PER_WINDOW <= 0 or not self.seal_randomness:
             self.forensic_sample = []
@@ -3795,18 +3943,47 @@ class GrpoWindowBatcher:
                 p for p in self._pending
                 if id(p) not in self._attempted_pending_ids
             ]
-        seed = self.seal_randomness.encode()
-        remainder.sort(
-            key=lambda p: hashlib.sha256(
-                seed + p.hotkey.encode()
-                + int(p.prompt_idx).to_bytes(8, "big") + p.merkle_root
+        selected_contents = {
+            submission.prompt_content_sha256 for submission in self._valid
+        }
+        remainder = [
+            pending for pending in remainder
+            if pending.prompt_content_sha256 not in selected_contents
+            and not self._content_cooldown.is_in_cooldown(
+                pending.prompt_content_sha256, self.window_start
+            )
+        ]
+        ranked = sorted(
+            remainder,
+            key=lambda pending: int(
+                self.difficulty_auction_metadata_by_id.get(
+                    id(pending), {}
+                ).get("rank", 2**63 - 1)
+            )
+        )
+        sample: list[tuple[PendingSubmission, str]] = []
+        random_pool = list(ranked)
+        if FORENSIC_SAMPLE_PER_WINDOW >= 2 and random_pool:
+            counterfactual = random_pool.pop(0)
+            sample.append((counterfactual, "counterfactual"))
+        random_seed = self.seal_randomness.encode("utf-8")
+        random_pool.sort(
+            key=lambda pending: hashlib.sha256(
+                b"reliquary/forensic-watch/v1\0"
+                + random_seed
+                + pending.hotkey.encode("utf-8")
+                + int(pending.prompt_idx).to_bytes(8, "big")
+                + pending.merkle_root
             ).digest()
         )
-        sample = remainder[:FORENSIC_SAMPLE_PER_WINDOW]
+        remaining = FORENSIC_SAMPLE_PER_WINDOW - len(sample)
+        sample.extend(
+            (pending, "random_watch") for pending in random_pool[:remaining]
+        )
         results: list[ForensicSampleResult] = []
         self.forensic_proof_attempts = 0
         self.forensic_proof_errors_by_type = {}
-        for p in sample:
+        for p, sample_role in sample:
             if self.proof_attempts >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW:
                 break
             if self._proof_wall_started_at is None:
@@ -3816,8 +3993,10 @@ class GrpoWindowBatcher:
                 self.proof_wall_exhausted = True
                 break
             error_type: str | None = None
+            verified: ValidSubmission | None = None
             try:
-                passed: bool | None = self._verify_expensive(p) is not None
+                verified = self._verify_expensive(p)
+                passed: bool | None = verified is not None
             except Exception as exc:
                 # The sample is observational only. A malformed outlier or
                 # exhausted GPU must not discard already-proven winners or
@@ -3853,6 +4032,7 @@ class GrpoWindowBatcher:
             row = self.difficulty_auction_metadata_by_id.get(id(p))
             if row is not None:
                 row["forensic_sampled"] = True
+                row["forensic_sample_role"] = sample_role
                 row["forensic_passed"] = passed
                 row["forensic_error_type"] = error_type
             results.append(
@@ -3861,6 +4041,8 @@ class GrpoWindowBatcher:
                     prompt_idx=p.prompt_idx,
                     passed=passed,
                     error_type=error_type,
+                    sample_role=sample_role,
+                    submission=verified,
                 )
             )
         self.proof_wall_elapsed_seconds = max(
@@ -4116,6 +4298,7 @@ class GrpoWindowBatcher:
                         self.retained_payload_bytes
                     ),
                     "reward_alignment": dict(self.reward_alignment),
+                    "content_selection": dict(self.content_selection),
                     "candidates": self.auction_candidates,
                 }
             else:
@@ -4154,6 +4337,18 @@ class GrpoWindowBatcher:
             rewarded_prompts = {sub.prompt_idx for sub in rewarded_submissions}
             for p in rewarded_prompts:
                 self._cooldown.record_batched(p, self.window_start)
+            if self.difficulty_auction_enabled:
+                rewarded_contents = {
+                    sub.prompt_content_sha256 for sub in rewarded_submissions
+                }
+                if any(len(digest) != 64 for digest in rewarded_contents):
+                    raise RuntimeError(
+                        "auction content cooldown update missing canonical identity"
+                    )
+                for digest in rewarded_contents:
+                    self._content_cooldown.record_selected(
+                        digest, self.window_start
+                    )
             if self._hash_set is not None:
                 for sub in rewarded_submissions:
                     for h in sub.rollout_hashes:

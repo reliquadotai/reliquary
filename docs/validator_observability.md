@@ -92,3 +92,16 @@ Training telemetry under the `bft/` prefix reports forced-rollout share,
 masked injected-token share, trainable-token share, and absolute-advantage
 weighted exposure by validated termination path. These are review signals and
 do not alter acceptance, reward, or gradient computation.
+
+## Auction utility research
+
+`/health.content_cooldown` reports whether the run-keyed canonical-prompt map is
+complete and restart-safe. A validator must not open windows after an incomplete
+bootstrap. An R2 mirror error is nonblocking when `source=local` and the local
+snapshot is current.
+
+`/health.utility_telemetry` reports the private writer status. Its mode-0600
+window bundles live under `RELIQUARY_STATE_DIR/utility_telemetry`; they are not
+part of public R2 archives. Failures are observation-only and do not degrade the
+protocol health status. The signal contract and activation gates are in
+[Auction v3 Utility Foundation](auction-v3-utility-foundation.md).

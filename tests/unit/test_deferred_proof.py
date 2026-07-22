@@ -3,6 +3,8 @@ until it is ranked high enough to win. Scoring + ranking reuse the merged
 ``difficulty_auction`` module (v2), and the same-prompt winner is resolved at
 seal.
 """
+import hashlib
+
 from reliquary.constants import DIFFICULTY_AUCTION_DELTA
 from reliquary.validator.batcher import PendingSubmission
 
@@ -16,6 +18,10 @@ def _pending(hotkey="a", prompt_idx=1, k=2, m=8, drand_round=1):
         drand_round=drand_round,
         merkle_root=hotkey.encode().ljust(32, b"\x00"),
         selection_digest=hotkey.encode().ljust(32, b"\x00"),
+        prompt_content_sha256=hashlib.sha256(
+            f"prompt:{prompt_idx}".encode()
+        ).hexdigest(),
+        target_content_sha256=hashlib.sha256(b"target").hexdigest(),
     )
 
 
@@ -451,10 +457,8 @@ def test_forensic_sample_disabled_without_seal_randomness():
     assert b.forensic_sample == []
 
 
-def test_forensic_sample_watches_non_winners_keyed_on_seal_randomness():
-    """With post-deadline drand entropy set, FORENSIC_SAMPLE_PER_WINDOW non-winners
-    are proven for telemetry, selected by hashing seal_randomness (which did not
-    exist at submission time, so a miner cannot grind its root to dodge it)."""
+def test_forensic_sample_balances_counterfactual_and_random_watch():
+    """Keep one #9 utility sample and one unpredictable security sample."""
     from reliquary.constants import FORENSIC_SAMPLE_PER_WINDOW
     from tests.unit.test_grpo_window_batcher import (
         _always_true_grail, _make_batcher, _request,
@@ -474,10 +478,17 @@ def test_forensic_sample_watches_non_winners_keyed_on_seal_randomness():
     assert len(b.forensic_sample) == FORENSIC_SAMPLE_PER_WINDOW
     watched = {r.hotkey for r in b.forensic_sample}
     assert watched.isdisjoint(winners)          # only non-winners are sampled
+    by_role = {result.sample_role: result.hotkey for result in b.forensic_sample}
+    assert by_role["counterfactual"] == "m8"
 
-    # Different post-deadline entropy → different watched set (unpredictable).
-    other = {r.hotkey for r in _make("beacon-round-999").forensic_sample}
-    assert watched != other
+    # The #9 counterfactual is stable, while post-deadline entropy changes the
+    # random anti-evasion watch candidate.
+    other = {
+        result.sample_role: result.hotkey
+        for result in _make("beacon-round-999").forensic_sample
+    }
+    assert other["counterfactual"] == "m8"
+    assert by_role["random_watch"] != other["random_watch"]
 
 
 def test_forensic_sample_failure_cannot_abort_sealing():
@@ -723,6 +734,61 @@ def test_same_prompt_split_survivor_takes_full_share():
     _batch, rewards = b.seal_batch()
 
     assert rewards == {"honest": pytest.approx(1.0 / B_BATCH)}
+
+
+def test_same_content_different_prompt_indices_share_one_slot():
+    from tests.unit.test_grpo_window_batcher import FakeEnv, _make_batcher, _request
+
+    class DuplicateContentEnv(FakeEnv):
+        def get_problem(self, idx):
+            prompt = "same canonical problem" if idx in {7, 8} else f"p{idx}"
+            return {"prompt": prompt, "ground_truth": "a", "id": f"pid-{idx}"}
+
+    b = _make_batcher(env=DuplicateContentEnv())
+    _accept(b, _request(prompt_idx=7, hotkey="first"), arrival_round=100)
+    _accept(b, _request(prompt_idx=8, hotkey="second"), arrival_round=100)
+    batch, rewards = b.seal_batch()
+
+    assert len(batch) == 1
+    assert len(rewards) == 1
+    assert next(iter(rewards.values())) == pytest.approx(1.0 / B_BATCH)
+    rows = {row["hotkey"]: row for row in b.auction_candidates}
+    assert sum(row["selected"] for row in rows.values()) == 1
+    assert sum(
+        row["status"] == "same_content_superseded"
+        for row in rows.values()
+    ) == 1
+    assert b.content_selection["content_alignment_ok"] is True
+
+
+def test_content_cooldown_blocks_duplicate_under_new_prompt_index():
+    from reliquary.validator.cooldown import ContentCooldownMap
+    from tests.unit.test_grpo_window_batcher import FakeEnv, _make_batcher, _request
+
+    class DuplicateContentEnv(FakeEnv):
+        def get_problem(self, idx):
+            return {"prompt": "same canonical problem", "ground_truth": "a"}
+
+    shared = ContentCooldownMap(cooldown_windows=1_000_000)
+    first = _make_batcher(
+        env=DuplicateContentEnv(), content_cooldown_map=shared
+    )
+    _accept(first, _request(prompt_idx=7, hotkey="winner"), arrival_round=100)
+    first.seal_batch()
+
+    second = _make_batcher(
+        env=DuplicateContentEnv(),
+        content_cooldown_map=shared,
+        window_start=501,
+    )
+    _accept(second, _request(
+        prompt_idx=8, hotkey="duplicate", window_start=501
+    ), arrival_round=101)
+    batch, rewards = second.seal_batch()
+
+    assert batch == []
+    assert rewards == {}
+    assert second.auction_candidates[0]["status"] == "content_in_cooldown"
 
 
 def test_boundary_tier_pays_only_selected_training_groups():

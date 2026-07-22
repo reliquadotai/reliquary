@@ -139,3 +139,112 @@ async def test_corrupt_snapshot_does_not_crash_and_falls_back():
     ):
         await svc._rebuild_cooldown_from_history()  # must not raise
     assert len(svc._cooldown_per_env["fake"]) == 0  # partial restore discarded
+
+
+@pytest.mark.asyncio
+async def test_content_cooldown_first_restore_backfills_prompt_state(tmp_path):
+    svc = _service(77)
+    svc._cooldown_per_env["fake"].record_batched(7, 70)
+    uploads = []
+
+    async def fake_upload(key, data):
+        uploads.append((key, data))
+        return True
+
+    with patch.dict(
+        "os.environ", {"RELIQUARY_STATE_DIR": str(tmp_path)}
+    ), patch(
+        "reliquary.infrastructure.storage.download_json",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "reliquary.infrastructure.storage.upload_json", new=fake_upload,
+    ):
+        await svc._restore_content_cooldown()
+
+    content = svc._content_cooldown_per_env["fake"]
+    assert len(content) == 1
+    assert svc._content_cooldown_health["complete"] is True
+    assert uploads[0][0] == "content_cooldown_snapshots/default.json.gz"
+    assert uploads[0][1]["complete"] is True
+    assert (tmp_path / "content_cooldown" / "default.json.gz").exists()
+
+
+@pytest.mark.asyncio
+async def test_content_snapshot_restores_and_resolves_only_new_prompt_state(
+    tmp_path,
+):
+    from reliquary.validator.prompt_content import prompt_content_sha256
+
+    svc = _service(80)
+    old_digest = prompt_content_sha256("fake", "old")
+    snapshot = {
+        "schema_version": 1,
+        "run_id": "default",
+        "snapshot_window": 70,
+        "complete": True,
+        "envs": {"fake": {old_digest: 60}},
+    }
+    svc._cooldown_per_env["fake"].record_batched(7, 75)
+
+    with patch.dict(
+        "os.environ", {"RELIQUARY_STATE_DIR": str(tmp_path)}
+    ), patch(
+        "reliquary.infrastructure.storage.download_json",
+        new=AsyncMock(return_value=snapshot),
+    ), patch(
+        "reliquary.infrastructure.storage.upload_json",
+        new=AsyncMock(return_value=True),
+    ):
+        await svc._restore_content_cooldown()
+
+    restored = svc._content_cooldown_per_env["fake"].export_state()
+    assert restored[old_digest] == 60
+    assert len(restored) == 2
+    assert max(restored.values()) == 75
+
+
+@pytest.mark.asyncio
+async def test_content_restore_allows_r2_outage_after_local_persist(tmp_path):
+    svc = _service(77)
+    svc._cooldown_per_env["fake"].record_batched(7, 70)
+
+    with patch.dict(
+        "os.environ", {"RELIQUARY_STATE_DIR": str(tmp_path)}
+    ), patch(
+        "reliquary.infrastructure.storage.download_json",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "reliquary.infrastructure.storage.upload_json",
+        new=AsyncMock(side_effect=OSError("R2 unavailable")),
+    ):
+        await svc._restore_content_cooldown()
+
+    assert svc._content_cooldown_health["complete"] is True
+    assert svc._content_cooldown_health["source"] == "local"
+    assert svc._content_cooldown_health["last_error_type"] == "OSError"
+    assert (tmp_path / "content_cooldown" / "default.json.gz").exists()
+
+
+@pytest.mark.asyncio
+async def test_content_restore_refuses_memory_only_bootstrap(tmp_path):
+    svc = _service(77)
+    svc._cooldown_per_env["fake"].record_batched(7, 70)
+
+    with patch.dict(
+        "os.environ", {"RELIQUARY_STATE_DIR": str(tmp_path)}
+    ), patch(
+        "reliquary.infrastructure.storage.download_json",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "reliquary.validator.service._write_gzip_json_atomic",
+        side_effect=OSError("disk unavailable"),
+    ), patch(
+        "reliquary.infrastructure.storage.upload_json",
+        new=AsyncMock(return_value=True),
+    ) as upload:
+        with pytest.raises(RuntimeError, match="restore incomplete"):
+            await svc._restore_content_cooldown()
+
+    upload.assert_not_awaited()
+    assert svc._content_cooldown_health["complete"] is False
+    assert svc._content_cooldown_health["last_error_type"] == "RuntimeError"

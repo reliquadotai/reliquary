@@ -115,6 +115,8 @@ class PreparedSubmission:
     rewards: list[float]
     rollout_hashes: list[bytes]
     selection_digest: bytes | None
+    prompt_content_sha256: str = ""
+    target_content_sha256: str = ""
     reject_reason: RejectReason | None = None
     reject_stage: str | None = None
     grader_failure_reason: str | None = None
@@ -927,6 +929,20 @@ def prepare_submission(
         materials,
         context,
         deadline_monotonic,
+    )
+    from reliquary.validator.prompt_content import (
+        prompt_content_sha256,
+        target_content_sha256,
+    )
+
+    prepared.prompt_content_sha256 = prompt_content_sha256(
+        context.environment,
+        materials.rendered_prompt,
+    )
+    prepared.target_content_sha256 = target_content_sha256(
+        context.environment,
+        materials.problem,
+        code_cases=materials.code_cases,
     )
     prepared.legacy_merkle_status = parsed.legacy_merkle_status
     return prepared

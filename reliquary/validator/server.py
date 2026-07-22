@@ -707,6 +707,8 @@ class _Health(BaseModel):
     archive_last_enqueue_gap: dict[str, int] | None = None
     prompt_sources: dict[str, dict[str, Any]] = Field(default_factory=dict)
     prompt_source_unavailable_total: int = 0
+    content_cooldown: dict[str, Any] = Field(default_factory=dict)
+    utility_telemetry: dict[str, Any] = Field(default_factory=dict)
     training_kl_reference: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -753,6 +755,12 @@ class ValidatorServer:
         )
         self._prompt_source_health_callback: (
             Callable[[], dict[str, dict[str, Any]]] | None
+        ) = None
+        self._content_cooldown_health_callback: (
+            Callable[[], dict[str, Any]] | None
+        ) = None
+        self._utility_telemetry_health_callback: (
+            Callable[[], dict[str, Any]] | None
         ) = None
         self._prompt_source_unavailable_total = 0
         self._legacy_merkle_stats: collections.Counter[str] = (
@@ -1052,6 +1060,18 @@ class ValidatorServer:
     ) -> None:
         """Keep source health visible even when no batcher is active yet."""
         self._prompt_source_health_callback = snapshot_callback
+
+    def configure_content_cooldown_health(
+        self,
+        snapshot_callback: Callable[[], dict[str, Any]],
+    ) -> None:
+        self._content_cooldown_health_callback = snapshot_callback
+
+    def configure_utility_telemetry_health(
+        self,
+        snapshot_callback: Callable[[], dict[str, Any]],
+    ) -> None:
+        self._utility_telemetry_health_callback = snapshot_callback
 
     def configure_archive_queue_telemetry(
         self,
@@ -1550,6 +1570,28 @@ class ValidatorServer:
             for reason, count in batcher_rejects.items():
                 reject_counts[reason] = max(reject_counts.get(reason, 0), count)
         prompt_sources = self._prompt_source_health()
+        try:
+            content_cooldown = (
+                dict(self._content_cooldown_health_callback())
+                if self._content_cooldown_health_callback is not None
+                else {}
+            )
+        except Exception as exc:
+            content_cooldown = {
+                "complete": False,
+                "last_error_type": type(exc).__name__,
+            }
+        try:
+            utility_telemetry = (
+                dict(self._utility_telemetry_health_callback())
+                if self._utility_telemetry_health_callback is not None
+                else {}
+            )
+        except Exception as exc:
+            utility_telemetry = {
+                "enabled": True,
+                "last_error_type": type(exc).__name__,
+            }
         window_environments = {
             str(env_name): self._window_environment_health(env_batcher)
             for env_name, env_batcher in self._active_batchers.items()
@@ -1620,6 +1662,7 @@ class ValidatorServer:
                         or registration_cache_usable is not True
                     )
                 )
+                or content_cooldown.get("complete") is False
             )
             else "ok"
         )
@@ -1972,6 +2015,8 @@ class ValidatorServer:
             ),
             archive_last_enqueue_gap=archive_queue.get("last_enqueue_gap"),
             prompt_sources=prompt_sources,
+            content_cooldown=content_cooldown,
+            utility_telemetry=utility_telemetry,
             training_kl_reference=dict(self._training_kl_reference_state),
             prompt_source_unavailable_total=(
                 self._prompt_source_unavailable_total

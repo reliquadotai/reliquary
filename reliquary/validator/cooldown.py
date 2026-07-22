@@ -8,6 +8,11 @@ prompt.
 
 from __future__ import annotations
 
+import re
+
+
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
 
 class CooldownMap:
     """Per-prompt "last rewarded at window N" store + eligibility predicate.
@@ -146,3 +151,52 @@ class CooldownMap:
         """
         self._last_batched.clear()
         self.apply_history(archived_windows, current_window)
+
+
+class ContentCooldownMap:
+    """Last-selected window keyed by a full canonical content digest."""
+
+    def __init__(self, cooldown_windows: int) -> None:
+        if cooldown_windows < 0:
+            raise ValueError("cooldown_windows must be non-negative")
+        self._cooldown_windows = cooldown_windows
+        self._last_selected: dict[str, int] = {}
+
+    @staticmethod
+    def _digest(value: str) -> str:
+        digest = str(value).strip().lower()
+        if not _SHA256_HEX_RE.fullmatch(digest):
+            raise ValueError("content digest must be 64 lowercase hex characters")
+        return digest
+
+    def record_selected(self, digest: str, window: int) -> None:
+        if window < 0:
+            raise ValueError("window must be non-negative")
+        self._last_selected[self._digest(digest)] = int(window)
+
+    def is_in_cooldown(self, digest: str, current_window: int) -> bool:
+        if self._cooldown_windows == 0:
+            return False
+        last = self._last_selected.get(self._digest(digest))
+        return last is not None and current_window - last < self._cooldown_windows
+
+    def current_cooldown_set(self, current_window: int) -> set[str]:
+        if self._cooldown_windows == 0:
+            return set()
+        return {
+            digest
+            for digest, last in self._last_selected.items()
+            if current_window - last < self._cooldown_windows
+        }
+
+    def export_state(self) -> dict[str, int]:
+        return dict(self._last_selected)
+
+    def import_state(self, last_selected: dict) -> None:
+        restored: dict[str, int] = {}
+        for digest, window in last_selected.items():
+            restored[self._digest(str(digest))] = int(window)
+        self._last_selected = restored
+
+    def __len__(self) -> int:
+        return len(self._last_selected)

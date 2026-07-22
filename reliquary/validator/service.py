@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
+import json
 import logging
 import math
 import os
 from pathlib import Path
 import re
+import tempfile
 import time
 from typing import Any
 
@@ -86,13 +89,14 @@ from reliquary.protocol.submission import RejectReason, RolloutSubmission, Windo
 from reliquary.validator import telemetry
 from reliquary.validator.batcher import GrpoWindowBatcher
 from reliquary.validator.checkpoint import CheckpointStore
-from reliquary.validator.cooldown import CooldownMap
+from reliquary.validator.cooldown import ContentCooldownMap, CooldownMap
 from reliquary.validator.dedup import RolloutHashSet
 from reliquary.validator.observability import log_structured, runtime_revision
 from reliquary.validator.quarantine import assess_training_batch
 from reliquary.validator.server import ValidatorServer
 from reliquary.validator.training import TrainingStepSkipped, train_step
 from reliquary.validator.training_accumulator import BalancedTrainingAccumulator
+from reliquary.validator.utility_telemetry import UtilityTelemetryWriter
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +106,52 @@ _HF_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 def _cooldown_snapshot_key(run_id: str) -> str:
     """R2 key for the run-keyed cooldown snapshot."""
     return f"cooldown_snapshots/{run_id}.json"
+
+
+def _content_cooldown_snapshot_key(run_id: str) -> str:
+    return f"content_cooldown_snapshots/{run_id}.json.gz"
+
+
+def _content_cooldown_local_path(run_id: str) -> Path:
+    state_dir = Path(
+        os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")
+    )
+    safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id)
+    return state_dir / "content_cooldown" / f"{safe_run_id}.json.gz"
+
+
+def _read_gzip_json(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    with gzip.open(path, "rt", encoding="utf-8") as handle:
+        value = json.load(handle)
+    if not isinstance(value, dict):
+        raise ValueError("content cooldown snapshot must be a JSON object")
+    return value
+
+
+def _write_gzip_json_atomic(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=".content-cooldown.", suffix=".json.gz", dir=path.parent
+    )
+    try:
+        with os.fdopen(fd, "wb") as raw:
+            with gzip.GzipFile(fileobj=raw, mode="wb") as compressed:
+                compressed.write(
+                    json.dumps(
+                        value, separators=(",", ":"), sort_keys=True
+                    ).encode("utf-8")
+                )
+            raw.flush()
+            os.fsync(raw.fileno())
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _filter_archives_for_env(archives: list[dict], env_name: str) -> list[dict]:
@@ -198,6 +248,7 @@ def open_grpo_window(
     model,
     *,
     cooldown_map: CooldownMap,
+    content_cooldown_map: ContentCooldownMap | None = None,
     hash_set: RolloutHashSet | None,
     tokenizer,
     bootstrap: bool = False,
@@ -233,6 +284,7 @@ def open_grpo_window(
         model=model,
         tokenizer=tokenizer,
         cooldown_map=cooldown_map,
+        content_cooldown_map=content_cooldown_map,
         hash_set=hash_set,
         bootstrap=bootstrap,
         completion_text_fn=_completion_text,
@@ -445,6 +497,23 @@ class ValidationService:
             name: CooldownMap(cooldown_windows=BATCH_PROMPT_COOLDOWN_WINDOWS)
             for name in self.envs
         }
+        self._content_cooldown_per_env: dict[str, ContentCooldownMap] = {
+            name: ContentCooldownMap(
+                cooldown_windows=BATCH_PROMPT_COOLDOWN_WINDOWS
+            )
+            for name in self.envs
+        }
+        self._content_cooldown_health: dict[str, Any] = {
+            "complete": False,
+            "source": "not_restored",
+            "snapshot_window": None,
+            "counts_by_environment": {
+                name: 0 for name in self.envs
+            },
+            "last_error_type": None,
+            "last_snapshot_success_ts": None,
+            "last_snapshot_failure_ts": None,
+        }
         # Legacy accessor pointing to the first env's map.  Kept so
         # ``_rebuild_cooldown_from_history`` and tests that read ``_cooldown_map``
         # still work without change.
@@ -455,11 +524,18 @@ class ValidationService:
         self._late_drops: dict[str, dict[str, int]] = {}
         self._window_archive_enqueued = False
         self._window_iteration_stage = "startup"
+        self._utility_telemetry = UtilityTelemetryWriter()
 
         self.server = ValidatorServer(host=http_host, port=http_port)
         self.server.set_late_drop_callback(self.record_late_drop)
         self.server.configure_prompt_source_health(
             self._prompt_source_health_snapshot
+        )
+        self.server.configure_content_cooldown_health(
+            self._content_cooldown_health_snapshot
+        )
+        self.server.configure_utility_telemetry_health(
+            self._utility_telemetry.snapshot
         )
 
         # v2.1 state machine infrastructure — in-memory only, bootstrapped at
@@ -701,6 +777,14 @@ class ValidationService:
                 }
         return snapshots
 
+    def _content_cooldown_health_snapshot(self) -> dict[str, Any]:
+        snapshot = dict(self._content_cooldown_health)
+        snapshot["counts_by_environment"] = {
+            name: len(content_map)
+            for name, content_map in self._content_cooldown_per_env.items()
+        }
+        return snapshot
+
     def _publish_window_preparation_state(self) -> None:
         self.server.set_window_preparation_state(
             last_committed_window_n=self._window_n,
@@ -839,6 +923,7 @@ class ValidationService:
                 window_start=target_window,
                 env=env, model=self.verify_model,
                 cooldown_map=self._cooldown_per_env[env_name],
+                content_cooldown_map=self._content_cooldown_per_env[env_name],
                 hash_set=self._hash_set,
                 tokenizer=self.tokenizer,
                 bootstrap=bootstrap,
@@ -2119,6 +2204,9 @@ class ValidationService:
                     getattr(batcher, "_seal_trigger_round", None),
                 ),
                 "prompt_hash_lead": getattr(s, "prompt_hash_lead", None),
+                "prompt_content_sha256": getattr(
+                    s, "prompt_content_sha256", None
+                ) or difficulty_meta.get("prompt_content_sha256"),
                 "canonical_rank": meta.get("canonical_rank"),
                 "accepted_into_pool": not rejected,
                 "selected_for_batch": bool(meta.get("selected_for_batch", False)),
@@ -2487,6 +2575,12 @@ class ValidationService:
                 )
                 for env_name, env_batcher in batcher_dict.items()
             },
+            "content_selection_by_environment": {
+                env_name: dict(
+                    getattr(env_batcher, "content_selection", {}) or {}
+                )
+                for env_name, env_batcher in batcher_dict.items()
+            },
             "window_opened_wall_ts_by_environment": {
                 env_name: getattr(env_batcher, "window_opened_wall_ts", None)
                 for env_name, env_batcher in batcher_dict.items()
@@ -2524,6 +2618,18 @@ class ValidationService:
                 hk: dict(counts) for hk, counts in self._late_drops.items()
             },
         }
+        await asyncio.to_thread(
+            self._utility_telemetry.write_window,
+            window=int(first_batcher.window_start),
+            checkpoint_revision=str(
+                getattr(first_batcher, "current_checkpoint_hash", "") or ""
+            ),
+            batchers=batcher_dict,
+            selected_by_environment={
+                env_name: list(sealed_dict.get(env_name, ([], {}))[0])
+                for env_name in batcher_dict
+            },
+        )
         # Reset the in-memory counter for the next window. New events
         # arriving while this window's payload is uploading land in the
         # fresh dict and will appear in the next archive.
@@ -2754,6 +2860,7 @@ class ValidationService:
         await self._bootstrap_state_from_external()
         self._publish_window_preparation_state()
         await self._rebuild_cooldown_from_history()
+        await self._restore_content_cooldown()
         await self._rebuild_hashes_from_history()
         self._log_startup_config_banner()
 
@@ -2830,6 +2937,7 @@ class ValidationService:
                         >= COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS
                     ):
                         await self._snapshot_cooldown()
+                        await self._snapshot_content_cooldown()
                         self._windows_since_cooldown_snapshot = 0
 
                     # set_weights is owned by a concurrent WeightOnlyValidator
@@ -3154,6 +3262,210 @@ class ValidationService:
                 )
         except Exception:
             logger.exception("Cooldown snapshot failed (non-fatal)")
+
+    @staticmethod
+    def _validate_content_snapshot(
+        snapshot: dict[str, Any],
+        env_names: set[str],
+    ) -> int:
+        if snapshot.get("run_id") != TRAINING_RUN_ID:
+            raise ValueError("content cooldown run id mismatch")
+        if snapshot.get("complete") is not True:
+            raise ValueError("content cooldown snapshot is incomplete")
+        envs = snapshot.get("envs")
+        if not isinstance(envs, dict) or set(envs) != env_names:
+            raise ValueError("content cooldown environments are incomplete")
+        return int(snapshot.get("snapshot_window", -1))
+
+    def _top_up_content_cooldown_from_prompt_state(
+        self,
+        snapshot_window: int,
+    ) -> int:
+        """Resolve prompt-index cooldown entries newer than a content snapshot."""
+        from reliquary.validator.prompt_content import (
+            prompt_content_sha256,
+            render_canonical_prompt,
+        )
+
+        resolved = 0
+        for env_name, prompt_map in self._cooldown_per_env.items():
+            env = self.envs[env_name]
+            content_map = self._content_cooldown_per_env[env_name]
+            content_state = content_map.export_state()
+            for prompt_idx, selected_window in prompt_map.export_state().items():
+                if int(selected_window) <= snapshot_window:
+                    continue
+                problem = env.get_problem(int(prompt_idx))
+                rendered = render_canonical_prompt(
+                    self.tokenizer, str(problem["prompt"])
+                )
+                digest = prompt_content_sha256(env_name, rendered)
+                prior = content_state.get(digest, -1)
+                if int(selected_window) > prior:
+                    content_map.record_selected(digest, int(selected_window))
+                    content_state[digest] = int(selected_window)
+                resolved += 1
+        return resolved
+
+    async def _restore_content_cooldown(self) -> None:
+        """Restore exact-content cooldown, deriving the first snapshot safely.
+
+        The existing prompt-index snapshot is the complete source of selected
+        prompts for a training run. On the first deployment, resolve every one
+        through the pinned environment and tokenizer. Later restarts load the
+        content snapshot and resolve only prompt entries newer than it.
+        """
+        env_names = set(self.envs)
+        snapshot: dict[str, Any] | None = None
+        source = "none"
+        try:
+            candidate = await storage.download_json(
+                _content_cooldown_snapshot_key(TRAINING_RUN_ID)
+            )
+            if candidate is not None:
+                self._validate_content_snapshot(candidate, env_names)
+                snapshot = candidate
+                source = "r2"
+        except Exception:
+            logger.exception("Failed to restore R2 content cooldown snapshot")
+
+        if snapshot is None:
+            try:
+                candidate = await asyncio.to_thread(
+                    _read_gzip_json,
+                    _content_cooldown_local_path(TRAINING_RUN_ID),
+                )
+                if candidate is not None:
+                    self._validate_content_snapshot(candidate, env_names)
+                    snapshot = candidate
+                    source = "local"
+            except Exception:
+                logger.exception("Failed to restore local content cooldown snapshot")
+
+        snapshot_window = -1
+        try:
+            if snapshot is not None:
+                snapshot_window = self._validate_content_snapshot(
+                    snapshot, env_names
+                )
+                envs = snapshot["envs"]
+                for env_name, content_map in self._content_cooldown_per_env.items():
+                    content_map.import_state(envs[env_name])
+            else:
+                for content_map in self._content_cooldown_per_env.values():
+                    content_map.import_state({})
+
+            resolved = await asyncio.to_thread(
+                self._top_up_content_cooldown_from_prompt_state,
+                snapshot_window,
+            )
+            self._content_cooldown_health.update({
+                "complete": True,
+                "source": source if snapshot is not None else "prompt_backfill",
+                "snapshot_window": max(snapshot_window, self._window_n),
+                "counts_by_environment": {
+                    name: len(content_map)
+                    for name, content_map in self._content_cooldown_per_env.items()
+                },
+                "last_error_type": None,
+            })
+            logger.info(
+                "Restored content cooldown source=%s snapshot_window=%d "
+                "resolved=%d counts=%s",
+                self._content_cooldown_health["source"],
+                snapshot_window,
+                resolved,
+                self._content_cooldown_health["counts_by_environment"],
+            )
+            if not await self._snapshot_content_cooldown():
+                raise RuntimeError(
+                    "content cooldown bootstrap was not persisted locally"
+                )
+        except Exception as exc:
+            self._content_cooldown_health.update({
+                "complete": False,
+                "source": source,
+                "last_error_type": type(exc).__name__,
+            })
+            logger.exception(
+                "Content cooldown restore incomplete; refusing to open windows"
+            )
+            raise RuntimeError("content cooldown restore incomplete") from exc
+
+    async def _snapshot_content_cooldown(self) -> bool:
+        """Persist locally before the best-effort R2 mirror.
+
+        Returns whether a restart-safe local snapshot exists. The caller uses
+        this as a startup gate; periodic callers may continue from the complete
+        in-memory map while health reports a later disk failure.
+        """
+        window = self._window_n
+
+        def _build() -> dict[str, Any]:
+            return {
+                "schema_version": 1,
+                "run_id": TRAINING_RUN_ID,
+                "snapshot_window": window,
+                "complete": True,
+                "envs": {
+                    name: content_map.export_state()
+                    for name, content_map in self._content_cooldown_per_env.items()
+                },
+            }
+
+        snapshot = await asyncio.to_thread(_build)
+        try:
+            await asyncio.to_thread(
+                _write_gzip_json_atomic,
+                _content_cooldown_local_path(TRAINING_RUN_ID),
+                snapshot,
+            )
+        except Exception as exc:
+            self._content_cooldown_health.update({
+                "last_snapshot_failure_ts": time.time(),
+                "last_error_type": type(exc).__name__,
+            })
+            logger.exception(
+                "Content cooldown local snapshot failed; durability unavailable"
+            )
+            return False
+
+        now = time.time()
+        try:
+            uploaded = await storage.upload_json(
+                _content_cooldown_snapshot_key(TRAINING_RUN_ID), snapshot
+            )
+            if not uploaded:
+                raise RuntimeError("content cooldown upload returned false")
+            self._content_cooldown_health.update({
+                "complete": True,
+                "source": "r2_and_local",
+                "snapshot_window": window,
+                "counts_by_environment": {
+                    name: len(content_map)
+                    for name, content_map in self._content_cooldown_per_env.items()
+                },
+                "last_snapshot_success_ts": now,
+                "last_snapshot_failure_ts": None,
+                "last_error_type": None,
+            })
+        except Exception as exc:
+            self._content_cooldown_health.update({
+                "complete": True,
+                "source": "local",
+                "snapshot_window": window,
+                "counts_by_environment": {
+                    name: len(content_map)
+                    for name, content_map in self._content_cooldown_per_env.items()
+                },
+                "last_snapshot_success_ts": now,
+                "last_snapshot_failure_ts": time.time(),
+                "last_error_type": type(exc).__name__,
+            })
+            logger.exception(
+                "Content cooldown R2 mirror failed; local snapshot is durable"
+            )
+        return True
 
     async def _rebuild_hashes_from_history(self) -> None:
         """Rebuild ``self._hash_set`` from the last HASH_DEDUP_RETENTION_WINDOWS

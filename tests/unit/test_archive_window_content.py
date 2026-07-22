@@ -140,6 +140,8 @@ async def test_archive_includes_prompt_and_rollout_content():
     batch[1].arrived_at = 107.0  # 7.0 s after window open
     batch[0].arrival_ts = 1_002.0
     batch[1].arrival_ts = 1_006.5
+    batch[0].prompt_content_sha256 = "11" * 32
+    batch[0].target_content_sha256 = "22" * 32
 
     runner = _valid_submission(prompt_idx=99, k=4, hotkey="hk_runner")
     runner.arrived_at = 110.0
@@ -216,6 +218,8 @@ async def test_archive_includes_prompt_and_rollout_content():
     import math
     entry0 = archive["batch"][0]
     assert entry0["prompt_idx"] == 7
+    assert entry0["prompt_content_sha256"] == "11" * 32
+    assert "target_content_sha256" not in entry0
     assert entry0["prompt"] == "question 7"
     assert entry0["ground_truth"] == "answer 7"
     expected_sigma = math.sqrt((4 / 8) * (1 - 4 / 8))  # Bernoulli(p=0.5) → 0.5
