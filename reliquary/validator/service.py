@@ -2119,6 +2119,12 @@ class ValidationService:
                     getattr(batcher, "_seal_trigger_round", None),
                 ),
                 "prompt_hash_lead": getattr(s, "prompt_hash_lead", None),
+                "prompt_content_sha256": getattr(
+                    s, "prompt_content_sha256", None
+                ) or difficulty_meta.get("prompt_content_sha256"),
+                "target_content_sha256": getattr(
+                    s, "target_content_sha256", None
+                ) or difficulty_meta.get("target_content_sha256"),
                 "canonical_rank": meta.get("canonical_rank"),
                 "accepted_into_pool": not rejected,
                 "selected_for_batch": bool(meta.get("selected_for_batch", False)),

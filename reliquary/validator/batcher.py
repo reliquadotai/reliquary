@@ -333,6 +333,8 @@ class PendingSubmission:
     drand_round: int
     merkle_root: bytes
     selection_digest: bytes
+    prompt_content_sha256: str = ""
+    target_content_sha256: str = ""
     arrived_at: float = 0.0
     # Wall clock of the CHEAP admission decision. The pre-generation forensic
     # metric is arrival_ts - (decision_ts - response_time), so it must be the
@@ -361,6 +363,8 @@ class ValidSubmission:
     sigma: float = 0.0
     rollouts: list[RolloutSubmission] = field(default_factory=list)
     completion_texts: list[str] = field(default_factory=list)
+    prompt_content_sha256: str = ""
+    target_content_sha256: str = ""
     arrived_at: float = 0.0
     # Filter telemetry (worst-case across this submission's rollouts).
     # Captured for post-hoc threshold calibration without re-running tests.
@@ -1854,6 +1858,8 @@ class GrpoWindowBatcher:
             merkle_root=bytes.fromhex(request.merkle_root),
             selection_digest=prepared.selection_digest
             or compute_rollouts_selection_digest(request.rollouts),
+            prompt_content_sha256=prepared.prompt_content_sha256,
+            target_content_sha256=prepared.target_content_sha256,
             arrived_at=self._time_fn(),
             decision_ts=self._wall_clock(),
             telemetry=telemetry,
@@ -3269,6 +3275,8 @@ class GrpoWindowBatcher:
             sigma=sigma,
             rollouts=list(request.rollouts),
             completion_texts=completion_texts,
+            prompt_content_sha256=pending.prompt_content_sha256,
+            target_content_sha256=pending.target_content_sha256,
             arrived_at=pending.arrived_at,
             sketch_diff_max=sketch_diff_max,
             lp_dev_max=lp_dev_max,
@@ -3538,6 +3546,12 @@ class GrpoWindowBatcher:
             row = {
                 "hotkey": pending_submission.hotkey,
                 "prompt_idx": pending_submission.prompt_idx,
+                "prompt_content_sha256": (
+                    pending_submission.prompt_content_sha256 or None
+                ),
+                "target_content_sha256": (
+                    pending_submission.target_content_sha256 or None
+                ),
                 "selection_digest": pending_submission.selection_digest.hex(),
                 "drand_round": pending_submission.drand_round,
                 "value": score.value,
