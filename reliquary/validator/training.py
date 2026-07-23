@@ -42,10 +42,17 @@ _optimizer_model_id: Optional[int] = None
 class TrainingStepSkipped(RuntimeError):
     """A deliberately rejected optimizer step that must not be published."""
 
-    def __init__(self, reason: str, grad_norm: float) -> None:
+    def __init__(
+        self,
+        reason: str,
+        grad_norm: float,
+        *,
+        metrics: dict[str, float] | None = None,
+    ) -> None:
         super().__init__(f"{reason}: grad_norm={grad_norm}")
         self.reason = reason
         self.grad_norm = grad_norm
+        self.metrics = dict(metrics or {})
 
 
 def _build_optimizer(params) -> torch.optim.Optimizer:
@@ -1447,7 +1454,11 @@ def train_step(
         failure_metrics.update(environment_metrics)
         telemetry.log_training_step(failure_metrics, step=window_index)
         _optimizer.zero_grad(set_to_none=True)
-        raise TrainingStepSkipped(reason, grad_norm_value)
+        raise TrainingStepSkipped(
+            reason,
+            grad_norm_value,
+            metrics=failure_metrics,
+        )
     _optimizer.step()
     _scheduler.step()
     lr_next = float(_scheduler.get_last_lr()[0])

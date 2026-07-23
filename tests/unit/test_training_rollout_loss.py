@@ -410,7 +410,7 @@ def test_train_step_skips_optimizer_on_unsafe_policy_ratio(
     )
 
     before = next(model.parameters()).detach().clone()
-    with pytest.raises(TrainingStepSkipped, match=expected_reason):
+    with pytest.raises(TrainingStepSkipped, match=expected_reason) as skipped:
         train_step(model, [[group]], ref_model=_make_ref(model))
     after = next(model.parameters()).detach().clone()
 
@@ -424,6 +424,12 @@ def test_train_step_skips_optimizer_on_unsafe_policy_ratio(
     assert captured[
         f"train/step_skipped_{expected_reason}"
     ] == 1.0
+    assert skipped.value.metrics["train/ppo_ratio_outside_clip_ratio"] == (
+        pytest.approx(outside_count / 100)
+    )
+    assert skipped.value.metrics["train/ppo_ratio_nonfinite_ratio"] == (
+        pytest.approx(nonfinite_count / 100)
+    )
 
 
 def test_train_step_token_level_handles_unequal_lengths(tiny_model_and_tokenizer):

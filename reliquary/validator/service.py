@@ -546,10 +546,14 @@ class ValidationService:
         self._checkpoint_n: int = 0
         self._publish_every = CHECKPOINT_PUBLISH_INTERVAL_WINDOWS
         self._trained_windows_since_publish = 0
+        self._adaptive_publication_pending = False
+        self._adaptive_publication_reason: str | None = None
         self.server.set_training_publish_state({
             "trained_windows_since_publish": 0,
             "publish_interval": self._publish_every,
             "publication_pending": False,
+            "adaptive_publication_pending": False,
+            "adaptive_publication_reason": None,
         })
         self._training_accumulator = BalancedTrainingAccumulator(
             dict(self.env_mix)
@@ -1911,8 +1915,12 @@ class ValidationService:
         emergency_freeze = os.environ.get(
             "RELIQUARY_DISABLE_TRAIN", ""
         ).lower() in {"1", "true", "yes", "on"}
-        publication_retry_pending = (
+        cadence_publication_pending = (
             self._trained_windows_since_publish >= self._publish_every
+        )
+        publication_retry_pending = (
+            cadence_publication_pending
+            or self._adaptive_publication_pending
         )
         checkpoint_ceiling_reached = (
             TRAIN_UNTIL_CHECKPOINT_N > 0
@@ -1962,16 +1970,39 @@ class ValidationService:
                 )
                 trained = True
             except TrainingStepSkipped as exc:
+                outside_clip_ratio = exc.metrics.get(
+                    "train/ppo_ratio_outside_clip_ratio"
+                )
                 logger.warning(
                     "train_step rejected for window %d: reason=%s "
-                    "grad_norm=%s; archiving without checkpoint publication",
+                    "grad_norm=%s ppo_outside_clip=%s",
                     self._window_n,
                     exc.reason,
                     exc.grad_norm,
+                    outside_clip_ratio,
                 )
                 accumulator_meta["reset_reason"] = (
                     f"training_health_gate:{exc.reason}"
                 )
+                accumulator_meta["training_skip"] = {
+                    "reason": exc.reason,
+                    "grad_norm": exc.grad_norm,
+                    "metrics": exc.metrics,
+                }
+                if (
+                    exc.reason == "policy_ratio_drift"
+                    and self._trained_windows_since_publish > 0
+                ):
+                    self._adaptive_publication_pending = True
+                    self._adaptive_publication_reason = exc.reason
+                    accumulator_meta["adaptive_publication_triggered"] = True
+                    logger.warning(
+                        "Window %d detected stale behavior-policy drift after "
+                        "%d safe updates; publishing the accumulated model "
+                        "without the rejected step",
+                        self._window_n,
+                        self._trained_windows_since_publish,
+                    )
             except Exception:
                 # Don't let a training failure (e.g. CUDA OOM) skip
                 # _archive_window — miners still need their R2 contribution
@@ -2034,20 +2065,33 @@ class ValidationService:
         # the cadence is reached, retry a failed upload without applying another
         # optimizer step to the pending candidate.
         next_n = self._checkpoint_n + 1
-        should_publish = not emergency_freeze and (
-            self._trained_windows_since_publish >= self._publish_every
-            or (
-                trained
-                and self._checkpoint_store.current_manifest() is None
+        should_publish = (
+            not emergency_freeze
+            and not checkpoint_ceiling_reached
+            and (
+                self._trained_windows_since_publish >= self._publish_every
+                or self._adaptive_publication_pending
+                or (
+                    trained
+                    and self._checkpoint_store.current_manifest() is None
+                )
             )
         )
         if should_publish:
+            if self._adaptive_publication_pending:
+                publication_reason = "adaptive_policy_ratio_drift"
+            elif self._trained_windows_since_publish >= self._publish_every:
+                publication_reason = "cadence"
+            else:
+                publication_reason = "bootstrap"
             try:
                 entry = await self._checkpoint_store.publish(
                     checkpoint_n=next_n, model=self.train_model,
                 )
                 self._checkpoint_n = next_n
                 self._trained_windows_since_publish = 0
+                self._adaptive_publication_pending = False
+                self._adaptive_publication_reason = None
                 self.server.set_current_checkpoint(entry)
                 # Refresh verify_model in-place so the next window's
                 # batcher verifies miners against the just-published
@@ -2078,8 +2122,12 @@ class ValidationService:
                         sum(discarded["counts"].values()),
                     )
                 logger.info(
-                    "Published checkpoint %d to %s@%s and refreshed verify_model",
-                    entry.checkpoint_n, entry.repo_id, entry.revision[:12],
+                    "Published checkpoint %d to %s@%s and refreshed "
+                    "verify_model (reason=%s)",
+                    entry.checkpoint_n,
+                    entry.repo_id,
+                    entry.revision[:12],
+                    publication_reason,
                 )
             except Exception:
                 logger.exception("HF publish failed; staying on previous checkpoint")
@@ -2098,6 +2146,13 @@ class ValidationService:
             "publish_interval": self._publish_every,
             "publication_pending": (
                 self._trained_windows_since_publish >= self._publish_every
+                or self._adaptive_publication_pending
+            ),
+            "adaptive_publication_pending": (
+                self._adaptive_publication_pending
+            ),
+            "adaptive_publication_reason": (
+                self._adaptive_publication_reason
             ),
         })
 

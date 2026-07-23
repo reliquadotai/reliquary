@@ -663,6 +663,8 @@ class _Health(BaseModel):
     training_trained_windows_since_publish: int = 0
     training_checkpoint_publish_interval: int = 0
     training_checkpoint_publication_pending: bool = False
+    training_adaptive_publication_pending: bool = False
+    training_adaptive_publication_reason: str | None = None
     forced_seed_enforced: bool = FORCED_SEED_ENFORCE
     forced_seed_consistency_floor: float = FORCED_SEED_CONSISTENCY_FLOOR
     forced_seed_rollout_floor: float = FORCED_SEED_ROLLOUT_FLOOR
@@ -1942,6 +1944,12 @@ class ValidatorServer:
             ),
             training_checkpoint_publication_pending=bool(
                 training_publish.get("publication_pending", False)
+            ),
+            training_adaptive_publication_pending=bool(
+                training_publish.get("adaptive_publication_pending", False)
+            ),
+            training_adaptive_publication_reason=training_publish.get(
+                "adaptive_publication_reason"
             ),
             forced_seed_enforced=FORCED_SEED_ENFORCE,
             forced_seed_consistency_floor=FORCED_SEED_CONSISTENCY_FLOOR,
