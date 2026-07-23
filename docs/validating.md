@@ -130,8 +130,14 @@ RELIQUARY_LEARNING_RATE=0.000003
 RELIQUARY_RECOMPUTE_PI_OLD_FROM_VERIFY=true
 RELIQUARY_GRAD_NORM_SKIP_THRESHOLD=50
 RELIQUARY_PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD=0.1
+RELIQUARY_CHECKPOINT_PUBLISH_INTERVAL_WINDOWS=4
 RELIQUARY_SHAPE_PENALTY=0
 ```
+
+The four-step checkpoint cadence limits behavior-policy staleness. If the ratio
+gate still trips before cadence, the rejected update is excluded and the
+validator publishes only the previously accepted in-memory steps before
+resuming against the refreshed behavior policy.
 
 ### Cooldown on training restart
 

@@ -105,6 +105,23 @@ def test_policy_ratio_skip_threshold_env_override():
         importlib.reload(C)
 
 
+def test_checkpoint_publish_interval_defaults_and_env_override():
+    env_name = "RELIQUARY_CHECKPOINT_PUBLISH_INTERVAL_WINDOWS"
+    prior = os.environ.pop(env_name, None)
+    try:
+        importlib.reload(C)
+        assert C.CHECKPOINT_PUBLISH_INTERVAL_WINDOWS == 4
+        os.environ[env_name] = "7"
+        importlib.reload(C)
+        assert C.CHECKPOINT_PUBLISH_INTERVAL_WINDOWS == 7
+    finally:
+        if prior is None:
+            os.environ.pop(env_name, None)
+        else:
+            os.environ[env_name] = prior
+        importlib.reload(C)
+
+
 def test_shaping_defaults_disabled():
     env_name = "RELIQUARY_SHAPE_PENALTY"
     prior = os.environ.pop(env_name, None)

@@ -316,11 +316,16 @@ EPOCH_SUBMIT_LEAD_BLOCKS = 20
 
 # ────────────────  HUGGING FACE CHECKPOINT PUBLISHING  ────────────────
 
-# How often to publish the current in-memory model to Hugging Face.
-# Training happens every window (stub in v2.1, real GRPO in follow-up),
-# but HF uploads are slow for large models, so we publish only every
-# N windows. Between publishes, miners stay on the last pushed revision.
-CHECKPOINT_PUBLISH_INTERVAL_WINDOWS = 10
+# How often to publish the current in-memory model to Hugging Face. Keep the
+# serving behavior policy close enough to the training policy that PPO's ratio
+# contract remains meaningful, while avoiding a multi-GB upload on every step.
+CHECKPOINT_PUBLISH_INTERVAL_WINDOWS = int(_os.environ.get(
+    "RELIQUARY_CHECKPOINT_PUBLISH_INTERVAL_WINDOWS", "4"
+))
+if CHECKPOINT_PUBLISH_INTERVAL_WINDOWS <= 0:
+    raise ValueError(
+        "RELIQUARY_CHECKPOINT_PUBLISH_INTERVAL_WINDOWS must be positive"
+    )
 
 # Default HF repo target for published checkpoints. Operator may
 # override via --hf-repo-id CLI arg. Must be a writable repo id for
