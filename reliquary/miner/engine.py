@@ -649,6 +649,7 @@ class MiningEngine:
         from reliquary.constants import (
             BFT_ANSWER_BUDGET,
             BFT_ENABLED,
+            BFT_FORCE_ANSWER,
             BFT_THINKING_BUDGET,
         )
         from reliquary.miner.forced_seed_sampler import (
@@ -708,9 +709,12 @@ class MiningEngine:
                 **forced_seed_generate_kwargs(base_kwargs, phase1_proc),
             )
 
-            if bft_applicable:
+            if bft_applicable and BFT_FORCE_ANSWER:
                 # Phase-2 answer generation continues on the same forced stream
-                # (identity threaded so it resumes at each row's offset).
+                # (identity threaded so it resumes at each row's offset). Skipped
+                # under clean-cap (BFT_FORCE_ANSWER=False): a rollout that did not
+                # close </think> within the phase-1 budget is left truncated and
+                # grades as bad_termination instead of being force-answered.
                 phase2_kwargs = {"pad_token_id": pad_token_id}
                 if eos_ids:
                     phase2_kwargs["eos_token_id"] = sorted(eos_ids)

@@ -45,6 +45,9 @@ from reliquary.constants import (
     MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
     MAX_SUBMISSIONS_PER_PROMPT,
     MAX_TRUNCATED_PER_SUBMISSION,
+    THROUGHPUT_BUCKET_TOKENS_PER_ROUND,
+    THROUGHPUT_TIEBREAK_ENABLED,
+    THROUGHPUT_TOKEN_CAP,
     PROMPT_RANGE_SIZE,
     PROMPT_RANGE_ENFORCE_FROM_WINDOW,
     REJECTED_LIST_CAP_PER_HOTKEY,
@@ -76,6 +79,7 @@ from reliquary.protocol.tokens import verify_tokens
 from reliquary.validator.batch_selection import (
     _within_slot_key,
     explain_batch_selection,
+    make_throughput_slot_key,
     select_batch_and_distribute,
 )
 from reliquary.validator.cooldown import CooldownMap
@@ -3931,6 +3935,17 @@ class GrpoWindowBatcher:
         if self.difficulty_auction_enabled:
             tier_of = self._auction_tier_by_id
             slot_round_of = lambda sub: tier_of.get(id(sub), 0)
+        elif THROUGHPUT_TIEBREAK_ENABLED:
+            # Order draws by throughput (tokens/round) instead of raw arrival so
+            # long-but-efficient generation is not penalized. Validator-only; the
+            # difficulty auction (when on) owns the slot key, so this only applies
+            # to the default arrival ordering. Composition of throughput as a
+            # secondary key WITHIN difficulty tiers is left for a follow-up.
+            slot_round_of = make_throughput_slot_key(
+                int(getattr(self, "window_open_drand_round", 0) or 0),
+                token_cap=THROUGHPUT_TOKEN_CAP,
+                bucket_tokens_per_round=THROUGHPUT_BUCKET_TOKENS_PER_ROUND,
+            )
         with self._lock:
             self.selection_metadata_by_id = explain_batch_selection(
                 submissions=self._valid,

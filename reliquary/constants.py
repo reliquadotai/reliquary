@@ -90,9 +90,27 @@ MAX_NEW_TOKENS_PROTOCOL_CAP = 32768
 # on real OpenMathInstruct prompts found 2048/512 to match 2048/256 reward
 # (5/6) with better EOS rate, while 4096/256 was slower and lower reward.
 BFT_ENABLED = True
-BFT_THINKING_BUDGET = 2048
+# 2026-07 Qwen3.5-4B behavior study (held-out OMI, vLLM): the 4B thinks a median
+# of 3766 / p90 11297 tokens before </think>; a 2048 budget would force-cut ~45%
+# of its *productive* reasoning. A 32768-budget probe on the rollouts that don't
+# finish at 16384 found only 23% just needed more room (62% of those correct)
+# while 77% never conclude even at 32k (43% detectable loops). So the answer is a
+# HIGH cap (not unbounded): 16000 captures ~95% of productive reasoning while
+# bounding looper compute. WIRE CONSTANT — miner generates to it and the verifier
+# checks against it, so both sides must ship the same value (coordinated deploy).
+BFT_THINKING_BUDGET = 16000
 BFT_ANSWER_BUDGET = 512
 BFT_FORCE_TEMPLATE = "</think>\n\nFinal Answer: \\boxed{"
+# Clean-cap vs forced-answer at the budget. True (legacy): an unterminated rollout
+# is force-closed with BFT_FORCE_TEMPLATE + a sampled answer. False (clean-cap):
+# it is left truncated and grades as bad_termination (an honest failure — the
+# verifier already rejects an unterminated, non-forced, sub-protocol-cap rollout).
+# On the 2B the forced answer was a coin-flip that dominated reward variance; the
+# 4B is capable enough that within-group variance exists without it, so clean-cap
+# is the less-polluted signal. Kept True for a STAGED rollout: bump the budget to
+# 16k first (contract-consistent), then flip this to False once miners ship it.
+# WIRE-AFFECTING — flipping requires a coordinated miner+validator deploy.
+BFT_FORCE_ANSWER = True
 
 # Two-sided length reward shaping (applied to ADVANTAGES, not the σ-gate).
 # Under-thinking side: a non-forced rollout that finished early
@@ -111,6 +129,26 @@ if not _math.isfinite(SHAPE_LEN_FRAC) or not 0.0 < SHAPE_LEN_FRAC <= 1.0:
     raise ValueError(
         "RELIQUARY_SHAPE_LEN_FRAC must be finite and within (0, 1]"
     )
+
+# Draw tie-break: throughput (tokens/round) instead of raw arrival speed.
+# The chronological (drand-round) slot key rewards whoever submits earliest,
+# which penalizes long generation — a miner reasoning 16k tokens arrives after
+# one that answers in 500, and loses the draw. With a model that must reason
+# long (the 4B), that is exactly the wrong incentive. Ranking draws by
+# throughput = min(tokens, cap) / elapsed_rounds is length-NEUTRAL (same
+# hardware ⇒ same tok/round regardless of length), rewards serving efficiency,
+# and has no padding incentive (a rate; the cap kills beyond-cap padding). This
+# is a VALIDATOR-ONLY objective control — miners already attach drand_round and
+# completion_length, so it needs no miner change and can be toggled per validator.
+THROUGHPUT_TIEBREAK_ENABLED = (
+    _os.environ.get("RELIQUARY_THROUGHPUT_TIEBREAK", "0") not in ("0", "false", "False")
+)
+# Token cap for the throughput numerator (align with BFT_THINKING_BUDGET so
+# padding past the useful budget earns no rank).
+THROUGHPUT_TOKEN_CAP = 16000
+# Bucket width in tokens/round: throughput is quantized to this before ranking so
+# hairline differences don't decide slots; arrival breaks within-bucket ties.
+THROUGHPUT_BUCKET_TOKENS_PER_ROUND = 50
 
 # Cap/non-EOS truncation budget per submission. A single missing-EOS rollout
 # can be an honest local max-token accident; repeated missing-EOS rollouts in

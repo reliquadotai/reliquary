@@ -65,6 +65,51 @@ def _prompt_canonical_key(prompt_idx: int) -> bytes:
     return hashlib.sha256(prompt_idx.to_bytes(8, "big", signed=False)).digest()
 
 
+def make_throughput_slot_key(
+    window_open_round: int,
+    *,
+    token_cap: int,
+    bucket_tokens_per_round: int,
+) -> Callable[[Any], tuple[int, int]]:
+    """Build a ``slot_round_of`` that orders draws by THROUGHPUT, not raw arrival.
+
+    The default slot key is ``sub.drand_round`` — pure arrival speed — which
+    penalizes long generation: a 16k-token rollout arrives at a later drand round
+    than a 500-token one and loses the slot even at equal hardware. This ranks
+    instead by tokens-per-round::
+
+        throughput = min(completion_length, token_cap) / max(arrival - open, 1)
+
+    quantized into ``bucket_tokens_per_round`` buckets (higher throughput fills
+    the batch first). Properties:
+
+    * **Length-neutral** — same hardware ⇒ same throughput regardless of how many
+      tokens were generated, so long reasoning is no longer penalized.
+    * **Rewards serving efficiency** — faster tok/round wins.
+    * **No padding incentive** — throughput is a *rate* (padding adds tokens and
+      time in step), and ``min(.., token_cap)`` gives zero rank past the cap.
+
+    Returns a ``(-bucket, arrival_round)`` tuple so higher throughput sorts first
+    and arrival deterministically breaks within-bucket ties. A submission missing
+    ``completion_length`` degrades to throughput 0 (last bucket, arrival-ordered)
+    rather than raising — so the ordering never crashes on an unexpected shape.
+    """
+    def slot_key(sub: Any) -> tuple[int, int]:
+        try:
+            arrival = int(sub.drand_round)
+        except (AttributeError, TypeError, ValueError):
+            arrival = window_open_round
+        try:
+            tokens = min(int(getattr(sub, "completion_length", 0) or 0), token_cap)
+        except (TypeError, ValueError):
+            tokens = 0
+        elapsed = max(arrival - window_open_round, 1)
+        bucket = int((tokens / elapsed) / bucket_tokens_per_round)
+        return (-bucket, arrival)
+
+    return slot_key
+
+
 def select_batch_and_distribute(
     submissions: list[Any],
     *,
