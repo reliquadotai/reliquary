@@ -202,7 +202,7 @@ The validator emits one of the following reasons on every failed submission. Eac
 | `GRAIL_FAIL` | At seal, a ranked or forensic-sampled sketch differs from the validator forward pass beyond tolerance | Match checkpoint, tokenizer, attention/runtime stack, and proof construction exactly |
 | `LOGPROB_MISMATCH` | Per-token log-prob deviation from validator's recompute exceeds `LOGPROB_IS_EPS = 0.10` | Same root cause as `GRAIL_FAIL` — quantization, attention kernel, or precision drift |
 | `BAD_TERMINATION` | A rollout did not terminate naturally, hit the cap without EOS, or contains EOS padding/repeated stop-token tails | Confirm generation config matches protocol. Do not force `min_new_tokens`, suppress EOS, ride the 8192 cap, or append tokens after first EOS |
-| `DISTRIBUTION_SUSPICIOUS` | Token probability distribution heuristics flagged low-entropy / cheater-like generation | Submit natural rollouts at `T_PROTO = 0.9`; avoid forced prefixes or constrained fillers |
+| `DISTRIBUTION_SUSPICIOUS` | Legacy/forensic label; the current auction does not emit it as an active rejection | No operator action for current runtime; inspect the archived runtime revision before interpreting historical records |
 | `WRONG_ROLLOUT_COUNT` | Group has fewer or more than `M_ROLLOUTS = 8` rollouts | Always submit exactly 8 |
 | `BAD_SCHEMA` / `BAD_TOKENS` | Submission payload malformed | Validate against the protocol schema |
 | `PROMPT_MISMATCH` | Canonical prompt tokens for `prompt_idx` don't match the request | Re-derive prompt tokens from the env's deterministic mapping |

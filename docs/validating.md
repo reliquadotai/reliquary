@@ -217,10 +217,10 @@ These are the live thresholds the trainer applies on every submission. The same 
 |---|---|---|
 | `B_BATCH` | 8 | Maximum proven winners and uniform reward slots per active environment |
 | `M_ROLLOUTS` | 8 | Required rollout count per submission |
-| `T_PROTO` | 0.9 | Protocol-fixed sampling temperature (validator's recompute uses this) |
+| `T_PROTO` | 0.6 | Protocol-fixed sampling temperature (validator's recompute uses this) |
 | `FORCED_SEED_PROTOCOL_VERSION` | 2 | Mandatory hotkey-free forced stream while enforcement is active |
 | `WINDOW_COLLECTION_SECONDS` | 100 | Fixed collection interval for both Math and Code auction populations |
-| `MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW` | 96 | Started grading/proof ceiling per environment/window |
+| `MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW` | 64 | Started grading/proof ceiling per environment/window |
 | `MAX_PROOF_WALL_SECONDS` | 240 | Seal-time proof wall-clock ceiling per environment |
 | `MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW` | 4 | Operator-wide seal GPU debt limit per environment |
 | `MAX_SUBMISSION_PAYLOAD_BYTES` | 64 MiB | Per-request parsed JSON payload limit |
@@ -237,7 +237,7 @@ These are the live thresholds the trainer applies on every submission. The same 
 | `MAX_TRUNCATED_PER_SUBMISSION` | 1 | Steady-state cap/non-EOS truncation allowance; accepted cap hits still pass GRAIL/logprob/distribution/boxed checks |
 | `BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION` | 1 | Bootstrap truncation allowance |
 | `TRAINING_QUARANTINE_ENABLED` | true | Suspicious selected windows skip GRPO/publish but remain archived/credited |
-| `TRAINING_QUARANTINE_MAX_SINGLE_COMPLETION_LENGTH` | 7000 | Rollout length that counts as extreme-length telemetry |
+| `TRAINING_QUARANTINE_MAX_SINGLE_COMPLETION_LENGTH` | 32768 | Rollout length that counts as extreme-length telemetry |
 | `TRAINING_QUARANTINE_EXTREME_LENGTH_MIN_ROLLOUTS` | 4 | Minimum long/cap rollouts before length alone can quarantine a window |
 | `TRAINING_QUARANTINE_EXTREME_LENGTH_MIN_GROUPS` | 3 | Minimum groups with long/cap rollouts before length alone can quarantine a window |
 | `MAX_SEAL_QUEUE_DRAIN_SECONDS` | 60 | Deadline work-drain bound before the auction population freezes |
