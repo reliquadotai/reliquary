@@ -380,6 +380,19 @@ class ValidSubmission:
             else self.merkle_root_bytes
         )
 
+    @property
+    def completion_length(self) -> int:
+        """Total generated tokens across this submission's rollouts — the 'work'
+        numerator for the throughput draw tie-break (make_throughput_slot_key).
+
+        Sums ``len(tokens)`` (prompt + completion) over rollouts: always present
+        (``tokens`` is a required, non-empty field), dependency-free, and
+        deterministic across validators. The shared prompt is a small constant
+        offset versus the completions and is immaterial at the throughput bucket
+        granularity.
+        """
+        return sum(len(r.tokens) for r in self.rollouts)
+
 
 @dataclass
 class RejectedSubmission:
@@ -797,6 +810,21 @@ class GrpoWindowBatcher:
         """
         self.window_opened_at = self._time_fn()
         self.window_opened_wall_ts = self._wall_clock()
+        # Anchor the throughput draw tie-break: the drand round at window open is
+        # the reference from which each submission's elapsed (= its attached
+        # drand_round − this) is measured. Best-effort — on any drand hiccup the
+        # throughput key sees None and cleanly degrades to arrival ordering.
+        try:
+            if self._drand_chain_info is None:
+                from reliquary.infrastructure.drand import get_current_chain
+                self._drand_chain_info = get_current_chain()
+            from reliquary.infrastructure.chain import compute_current_drand_round
+            ci = self._drand_chain_info
+            self.window_open_drand_round = compute_current_drand_round(
+                self.window_opened_wall_ts, ci["genesis_time"], ci["period"],
+            )
+        except Exception:
+            self.window_open_drand_round = None
 
     def is_sealed(self) -> bool:
         """True once the collection deadline has expired (or a safety-valve
@@ -3931,21 +3959,28 @@ class GrpoWindowBatcher:
         # tier: the v1 machinery then pays full tiers a slot each and
         # fair-splits the boundary tier. `.get(..., 0)` collapses to one
         # tier for test doubles that bypass _prove_ranked.
-        slot_round_of = None
-        if self.difficulty_auction_enabled:
-            tier_of = self._auction_tier_by_id
-            slot_round_of = lambda sub: tier_of.get(id(sub), 0)
-        elif THROUGHPUT_TIEBREAK_ENABLED:
-            # Order draws by throughput (tokens/round) instead of raw arrival so
-            # long-but-efficient generation is not penalized. Validator-only; the
-            # difficulty auction (when on) owns the slot key, so this only applies
-            # to the default arrival ordering. Composition of throughput as a
-            # secondary key WITHIN difficulty tiers is left for a follow-up.
-            slot_round_of = make_throughput_slot_key(
-                int(getattr(self, "window_open_drand_round", 0) or 0),
+        # Throughput draw tie-break (tokens/round instead of raw arrival, so
+        # long-but-efficient generation is not penalized). Built only when
+        # enabled AND anchored on a valid window-open round — otherwise elapsed
+        # would be misread, so it stays off and the default arrival order holds.
+        throughput_key = None
+        if THROUGHPUT_TIEBREAK_ENABLED and self.window_open_drand_round is not None:
+            throughput_key = make_throughput_slot_key(
+                int(self.window_open_drand_round),
                 token_cap=THROUGHPUT_TOKEN_CAP,
                 bucket_tokens_per_round=THROUGHPUT_BUCKET_TOKENS_PER_ROUND,
             )
+        slot_round_of = None
+        if self.difficulty_auction_enabled:
+            tier_of = self._auction_tier_by_id
+            if throughput_key is not None:
+                # (value tier, −throughput bucket, arrival): throughput orders
+                # draws WITHIN a value tier; value still dominates.
+                slot_round_of = lambda sub: (tier_of.get(id(sub), 0), *throughput_key(sub))
+            else:
+                slot_round_of = lambda sub: tier_of.get(id(sub), 0)
+        elif throughput_key is not None:
+            slot_round_of = throughput_key
         with self._lock:
             self.selection_metadata_by_id = explain_batch_selection(
                 submissions=self._valid,

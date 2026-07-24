@@ -143,9 +143,11 @@ if not _math.isfinite(SHAPE_LEN_FRAC) or not 0.0 < SHAPE_LEN_FRAC <= 1.0:
 THROUGHPUT_TIEBREAK_ENABLED = (
     _os.environ.get("RELIQUARY_THROUGHPUT_TIEBREAK", "0") not in ("0", "false", "False")
 )
-# Token cap for the throughput numerator (align with BFT_THINKING_BUDGET so
-# padding past the useful budget earns no rank).
-THROUGHPUT_TOKEN_CAP = 16000
+# Token cap for the throughput numerator. A submission is a GROUP of M_ROLLOUTS
+# rollouts and the numerator sums their generated tokens, so the cap is group-
+# scale: M_ROLLOUTS × 16000 useful tokens/rollout. Padding a rollout past ~16k
+# earns no extra rank (throughput is already a rate; this is the safety belt).
+THROUGHPUT_TOKEN_CAP = 8 * 16000  # M_ROLLOUTS × BFT budget
 # Bucket width in tokens/round: throughput is quantized to this before ranking so
 # hairline differences don't decide slots; arrival breaks within-bucket ties.
 THROUGHPUT_BUCKET_TOKENS_PER_ROUND = 50

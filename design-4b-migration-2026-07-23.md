@@ -151,9 +151,16 @@ All changes ship with defaults that preserve current behavior — nothing activa
 3. Flip `BFT_FORCE_ANSWER=False` (clean cap) once miners ship it — coordinated + client version bump.
 4. Model swap (fresh training run).
 
-**Open items for review:**
-- `make_throughput_slot_key` reads `sub.completion_length`; confirm `self._valid` submissions expose it as an attribute at seal time (getattr degrades to arrival-ordering if absent, so it fails safe, but the feature is a no-op until the attr is present).
-- Composition with the difficulty auction: throughput currently only replaces the *default arrival* ordering; using it as a secondary key *within* difficulty tiers is deferred.
+**Wiring audit — the throughput feature was a prod no-op on first pass; fixed:**
+- ✅ *Difficulty auction owned the slot key* (`DIFFICULTY_AUCTION_ENFORCE` defaults on for openmathinstruct, so the old `elif` never fired for math). Now composed: `slot_round_of = (value_tier, −throughput_bucket, arrival)` — throughput orders draws *within* a value tier; value still dominates.
+- ✅ *`ValidSubmission` had no `completion_length`* → added as a property = sum of the group's rollout token counts (the work numerator; `THROUGHPUT_TOKEN_CAP` is now group-scale, `M_ROLLOUTS × 16000`).
+- ✅ *`window_open_drand_round` was never populated* → set in `mark_window_opened` from the drand chain (best-effort; None ⇒ throughput cleanly disables, arrival ordering holds).
+- Tests: composition (value dominates; throughput breaks within-tier draws) + summed-length property.
+
+**Still open for review / before deploy:**
+- **Verify cost (BFT 16k):** a 16k budget makes forced/long rollouts up to ~16.5k tokens, so the GRAIL verify forward runs on ~6.5× longer sequences. Load-test verify latency/memory before deploy (the verifier warns about memory ceilings) — this can gate window cadence or OOM.
+- **Clean-cap path untested:** `BFT_FORCE_ANSWER=False` has no test yet, and its premise (an unterminated rollout stays a reward-0 member of the group, not dropped) must be confirmed before flipping the flag.
+- **Consensus determinism (minor):** the throughput key uses float division; IEEE-754 is deterministic but consider integer arithmetic if a multi-validator set is ever assumed (currently single-validator).
 - Coordinate the BFT wire changes with 0xgrizz (active on the validator — PR #160).
 
 ## Appendix — the numbers

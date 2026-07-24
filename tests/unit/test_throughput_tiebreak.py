@@ -83,6 +83,58 @@ def test_missing_completion_length_degrades_to_last_tier():
     assert k[0] == 0          # bucket 0 (highest tier value → sorts last)
 
 
+def test_key_reads_summed_completion_length():
+    """ValidSubmission derives completion_length as the sum of its rollouts' token
+    counts; the throughput key reads that aggregate (group-level work)."""
+    key = _key()
+
+    class Roll:
+        def __init__(self, n):
+            self.tokens = [0] * n
+
+    class GroupSub:
+        drand_round = 16
+        rollouts = [Roll(2000), Roll(2000), Roll(2000), Roll(2000)]  # sum 8000
+
+        @property
+        def completion_length(self):
+            return sum(len(r.tokens) for r in self.rollouts)
+
+    # 8000 tokens / 16 rounds = 500/round -> bucket 10
+    assert key(GroupSub())[0] == -int((8000 / 16) / BUCKET)
+
+
+def test_composes_with_difficulty_tiers_value_dominates():
+    """Composite key (value tier, -throughput bucket, arrival): across value
+    tiers the better value wins even with lower throughput."""
+    cd = CooldownMap(cooldown_windows=50)
+    thr = _key()
+    high_val = _sub("hv", 1, drand_round=40, completion_length=400)     # tier 0, ~10/r
+    low_val = _sub("lv", 2, drand_round=16, completion_length=16000)    # tier 1, 1000/r
+    tier = {id(high_val): 0, id(low_val): 1}
+    compose = lambda s: (tier.get(id(s), 0), *thr(s))
+    batch, _ = select_batch_and_distribute(
+        [low_val, high_val], b=1, cooldown_map=cd, current_window=100,
+        slot_round_of=compose,
+    )
+    assert batch[0].hotkey == "hv"       # value dominates throughput
+
+
+def test_throughput_breaks_draw_within_same_tier():
+    """Same value tier (a draw): the higher-throughput submission wins the slot."""
+    cd = CooldownMap(cooldown_windows=50)
+    thr = _key()
+    slow = _sub("slow", 1, drand_round=32, completion_length=16000)   # 500/r
+    fast = _sub("fast", 2, drand_round=16, completion_length=16000)   # 1000/r
+    tier = {id(slow): 0, id(fast): 0}                                  # same value tier
+    compose = lambda s: (tier.get(id(s), 0), *thr(s))
+    batch, _ = select_batch_and_distribute(
+        [slow, fast], b=1, cooldown_map=cd, current_window=100,
+        slot_round_of=compose,
+    )
+    assert batch[0].hotkey == "fast"
+
+
 def test_long_efficient_beats_short_inefficient_for_scarce_slot():
     """End-to-end: with one slot, the long-but-efficient miner wins the draw the
     old arrival ordering would have handed to the early, low-throughput miner."""
