@@ -11,7 +11,9 @@ Auction v2 remains the production mechanism:
 2. Rank equal scores by validator-observed precommit drand round.
 3. Resolve the remaining tie with post-deadline drand.
 4. Prove candidates top-down until at most eight distinct groups win.
-5. Train and pay exactly those winners, one uniform slot each.
+5. Select and reward exactly those winners, one uniform slot each. Clean
+   checkpoint-consistent groups may enter the balanced training accumulator;
+   quarantine can archive and credit a winner without training it.
 
 This is the correct production design while `k=2` groups share the same
 difficulty plateau. Rank-weighted payout would amplify timing rather than

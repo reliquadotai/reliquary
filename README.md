@@ -1,68 +1,170 @@
-# Reliquary
+<p align="center">
+  <a href="https://www.reliqua.ai">
+    <img
+      src="docs/assets/readme/reliquary-hero.svg"
+      alt="Reliquary — verified frontier search for decentralized model training"
+      width="100%"
+    />
+  </a>
+</p>
 
-Decentralized GRPO training for large language models on Bittensor subnet 81.
+<p align="center">
+  <strong>Verified frontier search for decentralized language-model training.</strong><br />
+  Eight trajectories per prompt. Validator-authoritative rewards. Public evidence at every boundary.
+</p>
 
-Reliquary is a coordination protocol that turns a set of independent GPU operators into a single distributed RLHF pipeline. Miners generate cryptographically-proven rollouts; the validator aggregates them into a GRPO training batch, updates a live LLM checkpoint, and publishes the result to Hugging Face — all without trusting any single participant.
+<p align="center">
+  <a href="https://github.com/reliquadotai/reliquary/actions/workflows/validator-tests.yml">
+    <img alt="Validator tests" src="https://github.com/reliquadotai/reliquary/actions/workflows/validator-tests.yml/badge.svg?branch=main" />
+  </a>
+  <a href="https://github.com/reliquadotai/reliquary/actions/workflows/cross-box-determinism.yml">
+    <img alt="Grader determinism" src="https://github.com/reliquadotai/reliquary/actions/workflows/cross-box-determinism.yml/badge.svg?branch=main" />
+  </a>
+  <a href="https://github.com/reliquadotai/reliquary/actions/workflows/docker-image.yml">
+    <img alt="Validator image" src="https://github.com/reliquadotai/reliquary/actions/workflows/docker-image.yml/badge.svg?branch=main" />
+  </a>
+  <a href="LICENSE.md">
+    <img alt="MIT License" src="https://img.shields.io/badge/license-MIT-e87a3e" />
+  </a>
+</p>
 
-## The incentive shift, in one line
+<p align="center">
+  <a href="https://www.reliqua.ai/dashboard">Live dashboard</a>
+  ·
+  <a href="https://www.reliqua.ai/research">Research</a>
+  ·
+  <a href="https://huggingface.co/ReliquaryForge/qwen3.5-2b-reliquary-v3">Model</a>
+  ·
+  <a href="https://github.com/orgs/reliquadotai/packages/container/package/reliquary-validator">Container</a>
+  ·
+  <a href="docs/mining.md">Mine</a>
+  ·
+  <a href="docs/validating.md">Validate</a>
+</p>
 
-**Old subnets:** miners are paid per rollout. The competition is "do as many rollouts as you can."
+---
 
-**Reliquary:** miners are paid for useful verified contributions to the trainer. The competition is "find the rollouts I need to train on" — i.e. predict which prompts sit at the policy's current learning frontier (group-σ in the trainable band, not yet in cooldown). A miner who picks well lands on winning prompts and earns emission; a miner who picks poorly burns their own rollouts on rejects such as `OUT_OF_ZONE` or `REWARD_DISTRIBUTION`.
+Reliquary is the open protocol and reference implementation for decentralized
+GRPO training on Bittensor subnet 81. Independent miners spend their own GPU
+compute searching for prompts at the policy's learning frontier. The trainer
+admits, ranks, verifies, rewards, and—when the safety gates permit—trains on the
+best groups.
 
-This converts DAPO's reactive Dynamic Sampling filter into an ex-ante prediction market: the generate-then-discard cost is pushed out of the validator and onto the miner who guessed wrong. As the policy matures and the learning frontier narrows, selection intelligence becomes more valuable, not less. See [docs/concepts.md](docs/concepts.md#the-thesis) for the full argument.
+The key incentive shift is simple: miners are not paid for producing the most
+rollouts. They compete to contribute verified rollout groups the trainer can
+use.
 
-## What it does
+## The production loop
 
-Each training window contributes to a possible GRPO step. Math and Code collect independent candidate populations for 100 seconds, rank in-zone groups by difficulty, validator-observed precommit round, and a post-deadline drand tie-break, then run deferred proof only on candidates that can still win. Selection and payment are the same set of at most eight distinct prompts per environment, with no per-operator winner cap. The live policy is `Qwen/Qwen3.5-2B`. The validator computes rewards authoritatively, quarantines suspicious selected windows from training, and retains clean partial batches in a checkpoint-bound accumulator until both environments reach their configured share. It then runs one PPO-clipped step with validator-recomputed behavior-policy log probabilities and a calibrated KL penalty against an immutable base reference.
+<p align="center">
+  <img
+    src="docs/assets/readme/protocol-loop.svg"
+    alt="Reliquary protocol loop: mine, grade, rank, prove, accumulate, train, and publish"
+    width="100%"
+  />
+</p>
 
-The network produces three artefacts: a continuously-trained model (published to HF every ten trained windows), a per-window rollout dataset (archived to R2), and a signed checkpoint manifest (served from `/checkpoint`) that lets anyone verify the chain of custody from a base model through every training step. The audit trail is cryptographic — each rollout carries a GRAIL sketch that lets the validator re-run the forward pass and confirm the generation came from the announced checkpoint.
+1. **Collect.** Math and Code each accept candidates for a fixed 100-second
+   interval. Every group contains exactly eight rollouts.
+2. **Grade.** The validator recomputes Math rewards and executes Code cases in
+   its sandbox. Groups below the reward-variance gate are rejected.
+3. **Rank.** In-zone groups rank by
+   `std(rewards) × (1 − mean(rewards))`, then validator-observed precommit
+   round, then a post-deadline drand tie-break.
+4. **Prove.** Economic proof runs top-down only for candidates that can still
+   win. A bounded, unpaid non-winner sample is also proven for forensic
+   telemetry and cannot affect the auction.
+5. **Select and reward.** At most eight content-distinct groups win per
+   environment. Each winner receives one uniform slot. There is no active
+   runner-up split or per-operator winner cap; unfilled slots burn.
+6. **Retain and train.** Clean winners accumulate under one exact public
+   checkpoint until both environment targets are full. Quarantined selections
+   remain archived and credited but never enter the optimizer.
+7. **Publish.** Accepted optimizer steps produce a Hugging Face checkpoint. The
+   default cadence is four trained steps, with an earlier safe publication when
+   the behavior-policy drift gate requires it.
 
-Validators hold stake and run the training loop. Miners hold hotkeys, run GPU inference, and earn emission proportional to their smoothed share of selected prompt rewards over a rolling 72-window EMA; the main optimization surface for a miner is predicting which prompts sit at the policy's learning frontier while producing clean, verifiable, naturally terminated rollouts. Downstream consumers — researchers, fine-tuning pipelines — pull the published HF checkpoint or the R2 rollout dataset directly.
+The normative mechanism and rejection semantics live in
+[Concepts](docs/concepts.md). Historical design documents are evidence of how
+the protocol evolved; they are not the production contract.
 
-## Quickstart
+## What is live
 
-- To mine: see [docs/mining.md](docs/mining.md)
-- To validate: see [docs/validating.md](docs/validating.md)
-- To understand the mechanism: see [docs/concepts.md](docs/concepts.md)
+| Layer | State |
+| --- | --- |
+| Auction v2, forced-sampling protocol v2, GRAIL verification | **Live** |
+| Mixed OpenMath + OpenCode collection and validator-authoritative rewards | **Live** |
+| Canonical prompt-content identity and one-shot cooldown | **Live** |
+| Utility telemetry | **Live, observation only** |
+| Behavior descriptors and a novelty archive | **Not deployed** |
+| Novelty-shaped ranking, rewards, or training loss | **0% influence** |
 
-## Architecture at a glance
+The observation-only utility foundation does not alter admission, ranking,
+selection, payout, or training. Its activation gates are documented in
+[Auction v3 Utility Foundation](docs/auction-v3-utility-foundation.md).
 
+## Trust and verification boundaries
+
+Reliquary is auditable, but it is not currently trustless:
+
+- The production trainer owns checkpoint publication and is authoritative for
+  reward computation, selection, quarantine, and optimizer execution.
+- GRAIL sketches, signed submissions, and validator recomputation provide
+  evidence that selected rollouts match their announced checkpoint. They do
+  not prove that the optimizer or the validator's policy is correct.
+- A signed checkpoint manifest binds a checkpoint number to an immutable
+  Hugging Face revision. It is an authenticated announcement, not a proof of
+  every training transition.
+- Weight-only validators replay the public archive into the scoring signal.
+  Multi-trainer checkpoint consensus is not implemented.
+
+These boundaries are intentional and explicit while the network bootstraps.
+The dashboard, model revisions, window archives, and security reports expose
+the evidence needed to evaluate them.
+
+## Local development
+
+The following matches the CPU environment used by the validator test workflow:
+
+```bash
+git clone https://github.com/reliquadotai/reliquary.git
+cd reliquary
+
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install torch==2.7.0 \
+  --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -e ".[dev]"
+
+pytest -q \
+  --ignore=tests/gpu \
+  --ignore=tests/integration/test_grader_e2e.py \
+  --disable-warnings
 ```
-┌─────────────┐    HTTP    ┌─────────────┐   HF push   ┌──────────────┐
-│   Miners    │ ─────────▶ │  Validator  │ ──────────▶ │   HF Hub     │
-│  (N nodes)  │ ◀───────── │  (1 node)   │             │ (model repo) │
-└─────────────┘ /submit    └──────┬──────┘             └──────┬───────┘
-     ▲         /state             │                            │
-     │         /checkpoint        │ weights                    │ pull
-     │                            ▼                            │
-     │                   ┌──────────────┐                      │
-     │                   │  Bittensor   │                      │
-     │                   │  chain       │                      │
-     │                   │  (set_weights│                      │
-     │                   │   every 360  │                      │
-     │                   │   blocks)    │                      │
-     │                   └──────────────┘                      │
-     │                                                         │
-     │                   ┌──────────────┐                      │
-     └───────────────────│     R2       │◀────── archive ──────┘
-                         │ (rollouts +  │         (per window)
-                         │  dataset)    │
-                         └──────────────┘
-```
 
-Miners submit rollout groups to `/submit` and poll `/state` for checkpoint updates. The validator trains healthy windows, publishes to HF, and broadcasts weights on-chain once per subnet epoch (~360 blocks on netuid 81), aligned to the epoch boundary so all validators converge on identical weights. Miners pull new weights via `/state` → HF `snapshot_download`. R2 stores the per-window rollout archive, including reject summaries and training-quarantine metadata; the validator reads it at startup to rebuild cooldown/hash state.
+Mining and training require the pinned inference stack and suitable NVIDIA
+hardware; the CPU setup above is for development and tests. Start with the
+[miner guide](docs/mining.md) or [validator guide](docs/validating.md) before
+running an operator workload.
 
-## Status
+## Documentation
 
-- **v1** — verifiable-inference dataset production (shipped, deprecated)
-- **v2** — GRPO market with in-subnet training (shipped)
-- **v2.1** — batch-driven windows, HF checkpoint distribution, EMA scoring (shipped)
-- **v2.3** — drand ordering and historical same-prompt emission split (superseded)
-- **v2.4** — Qwen3.5-2B reset and mixed OpenMath/OpenCode training (shipped)
-- **Auction v2** — fixed Math+Code collection, hotkey-free forced seed v2, coarse arrival priority, sealed operator/prompt ties, trained-only rewards, and deferred proof (current)
-- **Next direction** — private/generated reward tasks and broader runtime determinism (planned)
+| Guide | Purpose |
+| --- | --- |
+| [Concepts](docs/concepts.md) | Current mechanism, incentives, verification, and economics |
+| [Mining](docs/mining.md) | Reference miner, submission lifecycle, hardware, and troubleshooting |
+| [Validating](docs/validating.md) | Weight-only and trainer deployment |
+| [Validator observability](docs/validator_observability.md) | Health, verdict, archive, and runtime evidence |
+| [Auction v2 production contract](docs/superpowers/specs/2026-07-15-difficulty-auction-v2-design.md) | Detailed selector and payout contract |
+| [Utility foundation](docs/auction-v3-utility-foundation.md) | Observation-only research surface and activation gates |
+| [Security reports](docs/security/) | Incident chronology, hardening decisions, and operator evidence |
+
+Project-wide policies:
+[Contributing](https://github.com/reliquadotai/.github/blob/main/CONTRIBUTING.md)
+· [Security](https://github.com/reliquadotai/.github/blob/main/SECURITY.md)
+· [Support](https://github.com/reliquadotai/.github/blob/main/SUPPORT.md)
 
 ## License
 
-MIT — see `LICENSE`.
+Reliquary is available under the [MIT License](LICENSE.md).
