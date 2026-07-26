@@ -79,16 +79,15 @@ The 4B is different: at pass@1 0.68 it produces plenty of genuine correct answer
 - `BFT_THINKING_BUDGET`: 2048 → 16000.
 - New flag to **disable the forced-answer** and treat cap-hits as `bad_termination` (keep the old forced behavior behind a kill-switch for clean revert).
 
-### Aligned token budget (both envs)
-The old `MAX_NEW_TOKENS_PROTOCOL_CAP = 32768` is dead headroom once BFT caps math at 16k. Unify it into a clean three-tier budget that applies to **both** envs:
+### Token budget — the two envs are deliberately DIFFERENT (do not unify)
+It is tempting to shrink `MAX_NEW_TOKENS_PROTOCOL_CAP` (32768) toward the BFT budget so the number "looks aligned". **Don't** — it strands honest code miners for no math benefit:
 
-| tier | value | role |
-|---|---|---|
-| BFT thinking budget | `BFT_THINKING_BUDGET = 16000` | thinking cap (math: BFT forces here; code: just the reasoning share) |
-| answer budget | `BFT_ANSWER_BUDGET = 512` | the forced/answer phase |
-| **global cap** | `MAX_NEW_TOKENS_PROTOCOL_CAP = 17408` | overall generation ceiling, both envs |
+- **Math** is already capped at 16000 by BFT (`min(max_new_tokens, BFT_THINKING_BUDGET)`), independent of the global cap. So lowering the global cap does nothing for math.
+- **Code has no BFT** to force termination. A code rollout that hasn't emitted EOS by the global cap counts as *truncated*, and `MAX_TRUNCATED_PER_SUBMISSION = 1` **rejects the whole submission when more than one rollout is truncated** (`admission.py::_termination_reject`). Lowering the cap makes more code rollouts truncate → more honest submissions rejected (at the 4B's ~10% code-truncation rate, ≥2-of-8 lands ~19% of groups in the reject bucket).
 
-The global cap is `16000 + 512 + 896` margin — the margin covers the **force-template span** (a forced completion is thinking + force_span + answer ≈ 16.5k, so the cap must *exceed* thinking+answer; a `constants.py` assertion guards this) plus a little code headroom. Effect: math caps at 16000 (BFT) + forced answer; code (no BFT) caps at 17408. Lowering from 32768 also **bounds the worst-case GRAIL verify length** (helps the verify-cost item). WIRE constant — coordinated deploy.
+So the caps are legitimately split: **math 16k (BFT), code up to the 32768 global cap.** Keep the global cap high so honest code has room to terminate. `MAX_NEW_TOKENS_PROTOCOL_CAP > BFT_THINKING_BUDGET + BFT_ANSWER_BUDGET` is asserted in `constants.py` (a forced completion is thinking + force_span + answer ≈ 16.5k, so the cap must exceed thinking+answer).
+
+**Separate, real problem this surfaced (needs a decision):** even at 32768, a 4B that loops on code (~8% never terminate) will land ~1-in-8 groups with ≥2 truncated rollouts → rejected by `MAX_TRUNCATED_PER_SUBMISSION = 1`. That check was tuned against manufactured losers on the 2B; it is strict for an honestly-rambling 4B. Options: raise the per-submission truncated allowance for code, or a check that separates honest loops from manufactured ones. Do NOT just raise it blindly — it guards the reward-shape exploit.
 
 ---
 
@@ -185,7 +184,7 @@ All changes ship with defaults that preserve current behavior — nothing activa
 **Still open for review / before deploy:**
 - **Verify cost (BFT 16k):** a 16k budget makes forced/long rollouts up to ~16.5k tokens, so the GRAIL verify forward runs on ~6.5× longer sequences. Load-test verify latency/memory before deploy (the verifier warns about memory ceilings) — this can gate window cadence or OOM.
 - **Clean-cap path untested:** `BFT_FORCE_ANSWER=False` has no test yet, and its premise (an unterminated rollout stays a reward-0 member of the group, not dropped) must be confirmed before flipping the flag.
-- **Code headroom (global cap 32768 → 17408):** code has no BFT, so this caps code generation at 17408. The 4B terminates ~90% of code within 16384 (behavior study), so most code fits, but the long-code tail (complex problems that legitimately needed 17k–32k) now truncates → `bad_termination`. If that tail matters, raise the global cap (e.g. 20k) — it only needs to stay above the BFT forced total. 17408 is a tunable choice, not a hard requirement.
+- **`MAX_TRUNCATED_PER_SUBMISSION = 1` vs an honestly-rambling 4B (code):** a code group with ≥2 rollouts that hit the cap without EOS is rejected wholesale. The 4B loops on ~8-10% of code, so ~1-in-8 honest code groups get rejected even at the 32768 cap. The check guards the manufactured-loser exploit, so don't just raise it — decide between a higher code allowance or a smarter honest-loop-vs-manufactured check. (Kept the global cap at 32768 to not make this worse.)
 - **Consensus determinism (minor):** the throughput key uses float division; IEEE-754 is deterministic but consider integer arithmetic if a multi-validator set is ever assumed (currently single-validator).
 - Coordinate the BFT wire changes with 0xgrizz (active on the validator — PR #160).
 

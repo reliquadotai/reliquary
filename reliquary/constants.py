@@ -77,16 +77,15 @@ SUBMISSION_UPLOAD_GRACE_SECONDS = float(UPLOAD_GRACE_PERIOD)
 
 # ────────────────  ROLLOUT GENERATION  ────────────────
 
-# Global generation cap for BOTH envs, aligned to the BFT budget (was 32768,
-# now unused headroom once BFT caps math at 16k). Math: BFT caps thinking at
-# BFT_THINKING_BUDGET, then the force-template span + BFT_ANSWER_BUDGET. Code
-# (no BFT): a single stream capped here. Set to the BFT thinking+answer budget
-# plus a small margin for the force-template span and modest code headroom — so
-# the global cap reads as "16k thinking + answer" for both envs. A forced
-# completion is thinking + force_span + answer (≈16.5k), so the cap MUST exceed
-# BFT_THINKING_BUDGET + BFT_ANSWER_BUDGET (asserted below). Lower cap also bounds
-# worst-case GRAIL verify length. WIRE CONSTANT — miner and verifier must agree.
-MAX_NEW_TOKENS_PROTOCOL_CAP = 17408  # 16000 thinking + 512 answer + 896 margin
+# Global generation cap. Math is capped tighter by BFT anyway
+# (min(max_new_tokens, BFT_THINKING_BUDGET) = 16k), so this headroom is really the
+# CODE cap: code has no BFT to force termination, so a rollout that hasn't emitted
+# EOS by this cap counts as "truncated", and MAX_TRUNCATED_PER_SUBMISSION rejects
+# a whole submission with more than one such rollout. Keep it high so honest code
+# rollouts have room to terminate and are not rejected — lowering it toward the
+# BFT budget looks tidy but strands the code tail and rejects honest miners for no
+# math benefit (BFT already caps math). WIRE CONSTANT — miner and verifier agree.
+MAX_NEW_TOKENS_PROTOCOL_CAP = 32768
 
 # Budget-Forced Termination (BFT): if a rollout has not emitted </think> by
 # BFT_THINKING_BUDGET tokens, the miner appends BFT_FORCE_TEMPLATE and samples
