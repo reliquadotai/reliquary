@@ -77,11 +77,16 @@ SUBMISSION_UPLOAD_GRACE_SECONDS = float(UPLOAD_GRACE_PERIOD)
 
 # ────────────────  ROLLOUT GENERATION  ────────────────
 
-# Network-wide hard schema cap on completion length. BFT math rollouts use a
-# lower measured local cap (thinking + FORCE + answer) that the validator
-# recognizes separately for forced rows; keep this global cap high enough for
-# non-BFT / opt-in code rollouts without revisiting verifier memory ceilings.
-MAX_NEW_TOKENS_PROTOCOL_CAP = 32768
+# Global generation cap for BOTH envs, aligned to the BFT budget (was 32768,
+# now unused headroom once BFT caps math at 16k). Math: BFT caps thinking at
+# BFT_THINKING_BUDGET, then the force-template span + BFT_ANSWER_BUDGET. Code
+# (no BFT): a single stream capped here. Set to the BFT thinking+answer budget
+# plus a small margin for the force-template span and modest code headroom — so
+# the global cap reads as "16k thinking + answer" for both envs. A forced
+# completion is thinking + force_span + answer (≈16.5k), so the cap MUST exceed
+# BFT_THINKING_BUDGET + BFT_ANSWER_BUDGET (asserted below). Lower cap also bounds
+# worst-case GRAIL verify length. WIRE CONSTANT — miner and verifier must agree.
+MAX_NEW_TOKENS_PROTOCOL_CAP = 17408  # 16000 thinking + 512 answer + 896 margin
 
 # Budget-Forced Termination (BFT): if a rollout has not emitted </think> by
 # BFT_THINKING_BUDGET tokens, the miner appends BFT_FORCE_TEMPLATE and samples
@@ -125,6 +130,14 @@ BFT_FORCE_ANSWER = True
 BFT_MASK_FORCED_FROM_LOSS = (
     _os.environ.get("RELIQUARY_BFT_MASK_FORCED_FROM_LOSS", "0")
     not in ("0", "false", "False")
+)
+
+# The global cap must leave room for a forced completion (thinking + force-span +
+# answer). Guard against a future budget bump that would make forced rollouts
+# exceed the schema cap and get rejected.
+assert MAX_NEW_TOKENS_PROTOCOL_CAP > BFT_THINKING_BUDGET + BFT_ANSWER_BUDGET, (
+    "MAX_NEW_TOKENS_PROTOCOL_CAP must exceed BFT_THINKING_BUDGET + "
+    "BFT_ANSWER_BUDGET to fit the forced answer's force-template span"
 )
 
 # Two-sided length reward shaping (applied to ADVANTAGES, not the σ-gate).

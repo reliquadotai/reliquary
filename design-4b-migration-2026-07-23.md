@@ -79,6 +79,17 @@ The 4B is different: at pass@1 0.68 it produces plenty of genuine correct answer
 - `BFT_THINKING_BUDGET`: 2048 → 16000.
 - New flag to **disable the forced-answer** and treat cap-hits as `bad_termination` (keep the old forced behavior behind a kill-switch for clean revert).
 
+### Aligned token budget (both envs)
+The old `MAX_NEW_TOKENS_PROTOCOL_CAP = 32768` is dead headroom once BFT caps math at 16k. Unify it into a clean three-tier budget that applies to **both** envs:
+
+| tier | value | role |
+|---|---|---|
+| BFT thinking budget | `BFT_THINKING_BUDGET = 16000` | thinking cap (math: BFT forces here; code: just the reasoning share) |
+| answer budget | `BFT_ANSWER_BUDGET = 512` | the forced/answer phase |
+| **global cap** | `MAX_NEW_TOKENS_PROTOCOL_CAP = 17408` | overall generation ceiling, both envs |
+
+The global cap is `16000 + 512 + 896` margin — the margin covers the **force-template span** (a forced completion is thinking + force_span + answer ≈ 16.5k, so the cap must *exceed* thinking+answer; a `constants.py` assertion guards this) plus a little code headroom. Effect: math caps at 16000 (BFT) + forced answer; code (no BFT) caps at 17408. Lowering from 32768 also **bounds the worst-case GRAIL verify length** (helps the verify-cost item). WIRE constant — coordinated deploy.
+
 ---
 
 ## Part 2b — Forced rollouts: mask from the loss (DAPO overlong filtering, adapted)
@@ -174,6 +185,7 @@ All changes ship with defaults that preserve current behavior — nothing activa
 **Still open for review / before deploy:**
 - **Verify cost (BFT 16k):** a 16k budget makes forced/long rollouts up to ~16.5k tokens, so the GRAIL verify forward runs on ~6.5× longer sequences. Load-test verify latency/memory before deploy (the verifier warns about memory ceilings) — this can gate window cadence or OOM.
 - **Clean-cap path untested:** `BFT_FORCE_ANSWER=False` has no test yet, and its premise (an unterminated rollout stays a reward-0 member of the group, not dropped) must be confirmed before flipping the flag.
+- **Code headroom (global cap 32768 → 17408):** code has no BFT, so this caps code generation at 17408. The 4B terminates ~90% of code within 16384 (behavior study), so most code fits, but the long-code tail (complex problems that legitimately needed 17k–32k) now truncates → `bad_termination`. If that tail matters, raise the global cap (e.g. 20k) — it only needs to stay above the BFT forced total. 17408 is a tunable choice, not a hard requirement.
 - **Consensus determinism (minor):** the throughput key uses float division; IEEE-754 is deterministic but consider integer arithmetic if a multi-validator set is ever assumed (currently single-validator).
 - Coordinate the BFT wire changes with 0xgrizz (active on the validator — PR #160).
 
