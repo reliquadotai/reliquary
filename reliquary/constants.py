@@ -111,6 +111,21 @@ BFT_FORCE_TEMPLATE = "</think>\n\nFinal Answer: \\boxed{"
 # 16k first (contract-consistent), then flip this to False once miners ship it.
 # WIRE-AFFECTING — flipping requires a coordinated miner+validator deploy.
 BFT_FORCE_ANSWER = True
+# DAPO-style overlong filtering, adapted to our economic layer. First-run BFT
+# taught the model to SHORTEN its math reasoning: hitting the budget forces a
+# (usually wrong) answer → negative advantage → the gradient learns "avoid
+# generating long". DAPO fixes the analogous truncation case by masking the loss
+# of overlong samples (keeping them in the group mean/std). When this is set we do
+# the same to FORCED rollouts: their advantage is zeroed (no policy gradient), so
+# the model is not taught to shorten — while they STAY in the group mean/std
+# (baseline unchanged, exactly as DAPO's Eq. 9) AND in the σ-gate/auction/emission
+# (economic layer keeps scoring them, so a miner cannot dodge a wrong answer by
+# not terminating). Validator-only TRAINING control — no miner/wire change.
+# Default off (forced rollouts train as they do today). Pairs with BFT_16k.
+BFT_MASK_FORCED_FROM_LOSS = (
+    _os.environ.get("RELIQUARY_BFT_MASK_FORCED_FROM_LOSS", "0")
+    not in ("0", "false", "False")
+)
 
 # Two-sided length reward shaping (applied to ADVANTAGES, not the σ-gate).
 # Under-thinking side: a non-forced rollout that finished early

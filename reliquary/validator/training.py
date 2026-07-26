@@ -158,24 +158,36 @@ def _shape_advantages(rollouts, advantages):
         (completion_length < SHAPE_LEN_FRAC·BFT_THINKING_BUDGET) and is wrong.
     All inputs are validator-determined (reward re-graded, completion_length
     schema-checked, forced/truncated validator-set). SHAPE_PENALTY == 0 disables
-    it."""
+    it.
+
+    Separately, when BFT_MASK_FORCED_FROM_LOSS is set, a forced (BFT-hit)
+    rollout's advantage is zeroed — masked from the policy gradient (DAPO overlong
+    filtering) so the model is not taught to shorten its reasoning to dodge the
+    forced-answer penalty. This is independent of SHAPE_PENALTY; the group
+    mean/std (computed in _compute_advantages over the full group) and the σ-gate
+    are untouched, so only the gradient changes, not the baseline or the reward."""
     from reliquary.constants import (
+        BFT_MASK_FORCED_FROM_LOSS,
         BFT_THINKING_BUDGET,
         SHAPE_LEN_FRAC,
         SHAPE_PENALTY,
     )
 
-    if SHAPE_PENALTY <= 0:
+    if SHAPE_PENALTY <= 0 and not BFT_MASK_FORCED_FROM_LOSS:
         return advantages
     early_cap = SHAPE_LEN_FRAC * BFT_THINKING_BUDGET
     shaped = list(advantages)
     for i, r in enumerate(rollouts):
         meta = (getattr(r, "commit", None) or {}).get("rollout", {}) or {}
+        if meta.get("forced"):
+            if BFT_MASK_FORCED_FROM_LOSS:
+                shaped[i] = 0.0                 # masked from the gradient (DAPO)
+            continue                            # else legacy: forced untouched
+        if SHAPE_PENALTY <= 0:
+            continue                            # length shaping off
         if meta.get("truncated"):
             shaped[i] = -SHAPE_PENALTY          # overlong (cap-truncated)
             continue
-        if meta.get("forced"):
-            continue                            # forced rollouts untouched
         correct = float(getattr(r, "reward", 0.0)) > 0.5
         clen = int(meta.get("completion_length", 0))
         if clen < early_cap and not correct:

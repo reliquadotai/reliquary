@@ -81,6 +81,20 @@ The 4B is different: at pass@1 0.68 it produces plenty of genuine correct answer
 
 ---
 
+## Part 2b — Forced rollouts: mask from the loss (DAPO overlong filtering, adapted)
+
+**The bug the first run exposed.** BFT taught the 2B to *shorten* its math reasoning. Mechanism: hitting the budget forces a (usually wrong) answer → negative group-relative advantage → the policy gradient learns *"generating long leads to a penalty, so don't"*. That is a length bias with nothing to do with correctness.
+
+**DAPO's fix, verified.** DAPO ([arXiv 2503.14476](https://arxiv.org/abs/2503.14476), *Overlong Reward Shaping*) hits the analogous case with truncated samples and **"masks the loss of truncated samples"** — they get no policy gradient — while the advantage `Â = (R − mean{R})/std{R}` (Eq. 9) is still computed **over the full group**, i.e. the masked sample stays in the mean/std. So DAPO masks the *loss*, not the *baseline*.
+
+**Why we can't copy it verbatim.** DAPO has one layer (training). We have two: training **and** an economic layer (σ-gate / auction / emission). If we simply let rollouts truncate and drop them (the naive port), a miner can **suppress EOS to route a would-be-wrong rollout into truncation and dodge the reward-0**, and the σ-gate/emission math breaks. So we keep BFT (a forced answer → the economic layer scores every rollout, un-gameable) and apply DAPO's masking to the **forced** rollouts:
+
+> `BFT_MASK_FORCED_FROM_LOSS` (default off, validator-only training control): a forced rollout's advantage is zeroed — **no policy gradient** — while it stays in `_compute_advantages`'s group mean/std (baseline unchanged, exactly DAPO Eq. 9) **and** in the σ-gate/auction/emission (economic layer still scores it).
+
+This settles the internal debate (does masking change the mean?): **no — the baseline is over the full group; only the gradient is masked.** It also removes the forced-guess *pollution* we measured earlier (~75% of production reward variance was the forced coin-flip) from the gradient, while keeping it in the scoring. Implemented in `training.py::_shape_advantages`; the existing `test_rollout_loss_zero_advantage_gives_zero_ppo_loss` confirms advantage 0 ⇒ zero PPO loss. Pairs with the 16k budget (Part 2): the model reasons up to 16k, forced beyond that, and the forced tail no longer biases length.
+
+---
+
 ## Part 3 — Draw tie-break: pure speed → throughput (tokens/second)
 
 ### The problem — and why it is coupled to the 4B

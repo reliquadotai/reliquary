@@ -64,6 +64,53 @@ def test_shaping_penalizes_truncated_overlong(shaping_enabled):
     assert out[0] == -C.SHAPE_PENALTY
 
 
+def test_mask_forced_zeroes_gradient_even_with_shaping_off(monkeypatch):
+    # DAPO overlong filtering: a forced rollout's advantage is masked to 0,
+    # independent of SHAPE_PENALTY; non-forced rollouts are left alone.
+    monkeypatch.setattr(C, "SHAPE_PENALTY", 0.0)
+    monkeypatch.setattr(C, "BFT_MASK_FORCED_FROM_LOSS", True)
+    out = _shape_advantages(
+        [_roll(1.0, 100, forced=True), _roll(0.0, 100)], [0.7, -0.7]
+    )
+    assert out[0] == 0.0        # forced → masked from the gradient
+    assert out[1] == -0.7       # non-forced untouched (shaping off)
+
+
+def test_mask_forced_keeps_baseline_over_full_group(monkeypatch):
+    # The forced 0 stays in the group mean/std (baseline unchanged, per DAPO Eq.9);
+    # only its own gradient is masked. The correct rollouts keep the advantages
+    # that were computed WITH the forced sample in the mean.
+    monkeypatch.setattr(C, "SHAPE_PENALTY", 0.0)
+    monkeypatch.setattr(C, "BFT_MASK_FORCED_FROM_LOSS", True)
+    adv = _compute_advantages([1.0, 1.0, 0.0])          # mean over all 3
+    rollouts = [_roll(1.0, 100), _roll(1.0, 100), _roll(0.0, 100, forced=True)]
+    out = _shape_advantages(rollouts, adv)
+    assert out[0] == adv[0] and out[1] == adv[1]        # correct advantages intact
+    assert out[2] == 0.0                                 # forced masked
+
+
+def test_forced_untouched_when_masking_off(monkeypatch):
+    monkeypatch.setattr(C, "SHAPE_PENALTY", 0.0)
+    monkeypatch.setattr(C, "BFT_MASK_FORCED_FROM_LOSS", False)
+    out = _shape_advantages([_roll(0.0, 100, forced=True)], [0.5])
+    assert out[0] == 0.5        # legacy default: forced contributes its gradient
+
+
+def test_mask_forced_composes_with_length_shaping(monkeypatch):
+    monkeypatch.setattr(C, "SHAPE_PENALTY", 0.5)
+    monkeypatch.setattr(C, "BFT_MASK_FORCED_FROM_LOSS", True)
+    early = int(C.SHAPE_LEN_FRAC * C.BFT_THINKING_BUDGET) - 1
+    rollouts = [
+        _roll(0.0, 100, forced=True),                        # forced → masked 0
+        _roll(1.0, C.BFT_THINKING_BUDGET, truncated=True),   # overlong → −penalty
+        _roll(0.0, early),                                   # under-thinking → −penalty
+    ]
+    out = _shape_advantages(rollouts, [0.3, 0.3, 0.3])
+    assert out[0] == 0.0
+    assert out[1] == -C.SHAPE_PENALTY
+    assert out[2] == -C.SHAPE_PENALTY
+
+
 def test_shaping_off_when_penalty_zero(monkeypatch):
     monkeypatch.setattr(C, "SHAPE_PENALTY", 0.0)
     early = int(C.SHAPE_LEN_FRAC * C.BFT_THINKING_BUDGET) - 1
