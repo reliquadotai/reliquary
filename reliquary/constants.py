@@ -77,15 +77,16 @@ SUBMISSION_UPLOAD_GRACE_SECONDS = float(UPLOAD_GRACE_PERIOD)
 
 # ────────────────  ROLLOUT GENERATION  ────────────────
 
-# Global generation cap. Math is capped tighter by BFT anyway
-# (min(max_new_tokens, BFT_THINKING_BUDGET) = 16k), so this headroom is really the
-# CODE cap: code has no BFT to force termination, so a rollout that hasn't emitted
-# EOS by this cap counts as "truncated", and MAX_TRUNCATED_PER_SUBMISSION rejects
-# a whole submission with more than one such rollout. Keep it high so honest code
-# rollouts have room to terminate and are not rejected — lowering it toward the
-# BFT budget looks tidy but strands the code tail and rejects honest miners for no
-# math benefit (BFT already caps math). WIRE CONSTANT — miner and verifier agree.
-MAX_NEW_TOKENS_PROTOCOL_CAP = 32768
+# Global generation cap — one uniform ~16k ceiling for BOTH envs.
+# Math is capped tighter by BFT (min(max_new_tokens, BFT_THINKING_BUDGET)); a
+# forced completion is thinking + force-span + answer, so this must stay above
+# BFT_THINKING_BUDGET + BFT_ANSWER_BUDGET (asserted below) — hence 15616 + 512
+# with 256 of margin. Code has no BFT: a code rollout that hasn't emitted EOS by
+# this cap is "truncated", which is admissible (see the per-env truncation
+# allowance) and valued conservatively rather than rejected. Lowering this from
+# 32768 only became safe once truncated rollouts stopped being rejected outright.
+# WIRE CONSTANT — miner and verifier must agree.
+MAX_NEW_TOKENS_PROTOCOL_CAP = 16384
 
 # Budget-Forced Termination (BFT): if a rollout has not emitted </think> by
 # BFT_THINKING_BUDGET tokens, the miner appends BFT_FORCE_TEMPLATE and samples
@@ -99,10 +100,11 @@ BFT_ENABLED = True
 # of its *productive* reasoning. A 32768-budget probe on the rollouts that don't
 # finish at 16384 found only 23% just needed more room (62% of those correct)
 # while 77% never conclude even at 32k (43% detectable loops). So the answer is a
-# HIGH cap (not unbounded): 16000 captures ~95% of productive reasoning while
-# bounding looper compute. WIRE CONSTANT — miner generates to it and the verifier
+# HIGH cap (not unbounded): ~15.6k captures ~95% of productive reasoning while
+# bounding looper compute. Sized so thinking + answer + a force-span margin
+# lands exactly on MAX_NEW_TOKENS_PROTOCOL_CAP (16384). WIRE CONSTANT — miner generates to it and the verifier
 # checks against it, so both sides must ship the same value (coordinated deploy).
-BFT_THINKING_BUDGET = 16000
+BFT_THINKING_BUDGET = 15616
 BFT_ANSWER_BUDGET = 512
 BFT_FORCE_TEMPLATE = "</think>\n\nFinal Answer: \\boxed{"
 # Clean-cap vs forced-answer at the budget. True (legacy): an unterminated rollout
@@ -185,6 +187,19 @@ THROUGHPUT_BUCKET_TOKENS_PER_ROUND = 50
 # the main manufactured-loser path.
 MAX_TRUNCATED_PER_SUBMISSION = 1
 BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION = 1
+# Per-environment override. Math keeps 1: with BFT every math rollout terminates
+# through an accepted path (EOS / forced cap / natural cap), so a truncated math
+# rollout means a non-compliant client — but a zero-tolerance gate has burned
+# honest miners here before (drand_tolerance=0 rejected honest `stale_round`
+# submissions), and the "one free truncation" is no longer an exploit now that
+# manufacturing is priced out by CONSERVATIVE_TRUNCATION_VALUE, so the buffer is
+# free. Code has no BFT and the 4B loops on ~10% of code rollouts, so at 8
+# rollouts ~19% of HONEST code groups carry 2+ truncations and were being
+# rejected wholesale; 3 admits them, and their value is discounted conservatively
+# instead. Tighten once live telemetry shows the real per-env truncation rates.
+MAX_TRUNCATED_PER_SUBMISSION_BY_ENV = {
+    "opencodeinstruct": 3,
+}
 
 # Group-level reward-shape guard. The live attack manufactures binary reward
 # vectors such as 11110000 while cutting every zero-reward rollout to the same

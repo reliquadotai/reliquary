@@ -157,3 +157,24 @@ def test_more_truncations_never_score_higher():
         if prev is not None:
             assert value <= prev + 1e-12
         prev = value
+
+
+def test_token_budget_is_internally_consistent():
+    """One uniform ~16k ceiling: a forced completion (thinking + force span +
+    answer) must fit under the global cap, with margin for the template."""
+    from reliquary import constants as C
+
+    assert C.MAX_NEW_TOKENS_PROTOCOL_CAP == 16384
+    forced_total = C.BFT_THINKING_BUDGET + C.BFT_ANSWER_BUDGET
+    assert forced_total < C.MAX_NEW_TOKENS_PROTOCOL_CAP
+    assert C.MAX_NEW_TOKENS_PROTOCOL_CAP - forced_total >= 256   # force-span room
+
+
+def test_truncation_allowance_is_per_env():
+    """Math keeps the strict allowance (BFT terminates every rollout); code gets
+    room for the 4B's honest looping, which conservative valuation prices."""
+    from reliquary import constants as C
+
+    by_env = C.MAX_TRUNCATED_PER_SUBMISSION_BY_ENV
+    assert by_env.get("openmathinstruct", C.MAX_TRUNCATED_PER_SUBMISSION) == 1
+    assert by_env["opencodeinstruct"] >= 2

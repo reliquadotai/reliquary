@@ -26,6 +26,7 @@ from reliquary.constants import (
     GRADER_EVAL_TIMEOUT_SECONDS,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
     MAX_TRUNCATED_PER_SUBMISSION,
+    MAX_TRUNCATED_PER_SUBMISSION_BY_ENV,
     SIGMA_MIN,
 )
 from reliquary.environment.grader_client import (
@@ -380,7 +381,9 @@ def _termination_reject(
     max_truncated = (
         BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION
         if context.bootstrap
-        else MAX_TRUNCATED_PER_SUBMISSION
+        else MAX_TRUNCATED_PER_SUBMISSION_BY_ENV.get(
+            context.environment, MAX_TRUNCATED_PER_SUBMISSION
+        )
     )
     truncated = 0
     for rollout in request.rollouts:

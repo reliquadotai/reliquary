@@ -79,7 +79,25 @@ The 4B is different: at pass@1 0.68 it produces plenty of genuine correct answer
 - `BFT_THINKING_BUDGET`: 2048 → 16000.
 - New flag to **disable the forced-answer** and treat cap-hits as `bad_termination` (keep the old forced behavior behind a kill-switch for clean revert).
 
-### Token budget — the two envs are deliberately DIFFERENT (do not unify)
+### Token budget — one uniform ~16k ceiling (final)
+
+| tier | value | role |
+|---|---|---|
+| BFT thinking budget | `BFT_THINKING_BUDGET = 15616` | math thinking cap (BFT forces here) |
+| answer budget | `BFT_ANSWER_BUDGET = 512` | the forced answer phase |
+| **global cap** | `MAX_NEW_TOKENS_PROTOCOL_CAP = 16384` | generation ceiling, **both envs** |
+
+Sized so a forced completion (thinking + force-span + answer = 16128 + template) fits under 16384 with 256 of margin — asserted in `constants.py`.
+
+**Per-env truncation allowance** (`MAX_TRUNCATED_PER_SUBMISSION_BY_ENV`): math **1**, code **3**.
+- *Math stays 1* because BFT terminates every rollout through an accepted path (EOS / forced cap / natural cap), so a truncated math rollout means a non-compliant client. It is **not** set to 0: a zero-tolerance gate has burned honest miners here before (`drand_tolerance=0` rejecting honest `stale_round`), and the "one free truncation" is no longer an exploit now that manufacturing is priced out — so the buffer is free.
+- *Code gets 3* because it has no BFT and the 4B loops on ~10% of code rollouts: at 8 rollouts, ~19% of **honest** code groups carry 2+ truncations and were being rejected wholesale. They are now admitted and discounted conservatively instead.
+
+Lowering the global cap from 32768 only became safe once truncated rollouts stopped being rejected outright — the earlier attempt was reverted for exactly that reason.
+
+**Why BFT is kept for math (and not removed):** without BFT the 4B truncates ~35% of math rollouts, so an honest math group carries ~3 truncations and conservative valuation would discount **every** group by ~64% (measured), plus 83% of honest math groups would exceed any sane truncation allowance. BFT converts "unknown" into "known" (a scored answer), which is precisely what the conservative rule penalises — so the two mechanisms are **complementary**: BFT removes the unknown where it can be forced (math), conservative valuation prices the unknown where it cannot (code).
+
+### (superseded) Earlier reasoning: the two envs are deliberately DIFFERENT
 It is tempting to shrink `MAX_NEW_TOKENS_PROTOCOL_CAP` (32768) toward the BFT budget so the number "looks aligned". **Don't** — it strands honest code miners for no math benefit:
 
 - **Math** is already capped at 16000 by BFT (`min(max_new_tokens, BFT_THINKING_BUDGET)`), independent of the global cap. So lowering the global cap does nothing for math.
