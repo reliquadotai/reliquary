@@ -117,6 +117,25 @@ BFT_FORCE_TEMPLATE = "</think>\n\nFinal Answer: \\boxed{"
 # 16k first (contract-consistent), then flip this to False once miners ship it.
 # WIRE-AFFECTING — flipping requires a coordinated miner+validator deploy.
 BFT_FORCE_ANSWER = True
+# DAPO-style overlong filtering, adapted to our economic layer. First-run BFT
+# taught the model to SHORTEN its math reasoning: hitting the budget forces a
+# (usually wrong) answer → negative advantage → the gradient learns "avoid
+# generating long". DAPO fixes the analogous truncation case by masking the loss
+# of overlong samples while keeping them in the group mean/std. When this is set
+# a FORCED rollout is masked out of the policy update entirely — no PPO and no
+# KL, and its forward is skipped (which is also what keeps a 16k forced rollout
+# from blowing the training memory budget) — while it STAYS in the group mean/std
+# (baseline unchanged, exactly DAPO Eq. 9) AND in the σ-gate/auction/emission
+# (the economic layer keeps scoring it, so a miner cannot dodge a wrong answer by
+# not terminating). Validator-only TRAINING control — no miner/wire change.
+# Default off so the branch stays inert on merge; whether a rollout is masked is
+# read from its metadata via training._is_masked_from_loss, NEVER inferred from
+# an advantage of 0.0 (a legitimate advantage is exactly 0 when a reward equals
+# its group mean).
+BFT_MASK_FORCED_FROM_LOSS = (
+    _os.environ.get("RELIQUARY_BFT_MASK_FORCED_FROM_LOSS", "0")
+    not in ("0", "false", "False")
+)
 # The global cap must leave room for a forced completion (thinking + force-span +
 # answer). Guard against a future budget bump that would make forced rollouts
 # exceed the schema cap and get rejected.

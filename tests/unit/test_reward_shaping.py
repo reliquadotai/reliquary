@@ -51,7 +51,8 @@ def test_shaping_penalizes_under_thinking_only(shaping_enabled):
     assert out[2] == 0.3
 
 
-def test_shaping_masks_forced_instead_of_penalising_it(shaping_enabled):
+def test_shaping_masks_forced_instead_of_penalising_it(shaping_enabled, monkeypatch):
+    monkeypatch.setattr(C, "BFT_MASK_FORCED_FROM_LOSS", True)
     early = int(C.SHAPE_LEN_FRAC * C.BFT_THINKING_BUDGET) - 1
     # forced + finished-early + wrong: never length-penalised (its length is a
     # budget artefact) — it is masked out of the loss entirely instead.
@@ -69,6 +70,7 @@ def test_mask_forced_zeroes_gradient_even_with_shaping_off(monkeypatch):
     # DAPO overlong filtering (now unconditional): a forced rollout's advantage
     # is masked to 0, independent of SHAPE_PENALTY; others are left alone.
     monkeypatch.setattr(C, "SHAPE_PENALTY", 0.0)
+    monkeypatch.setattr(C, "BFT_MASK_FORCED_FROM_LOSS", True)
     out = _shape_advantages(
         [_roll(1.0, 100, forced=True), _roll(0.0, 100)], [0.7, -0.7]
     )
@@ -81,11 +83,23 @@ def test_mask_forced_keeps_baseline_over_full_group(monkeypatch):
     # only its own gradient is masked. The correct rollouts keep the advantages
     # that were computed WITH the forced sample in the mean.
     monkeypatch.setattr(C, "SHAPE_PENALTY", 0.0)
+    monkeypatch.setattr(C, "BFT_MASK_FORCED_FROM_LOSS", True)
     adv = _compute_advantages([1.0, 1.0, 0.0])          # mean over all 3
     rollouts = [_roll(1.0, 100), _roll(1.0, 100), _roll(0.0, 100, forced=True)]
     out = _shape_advantages(rollouts, adv)
     assert out[0] == adv[0] and out[1] == adv[1]        # correct advantages intact
     assert out[2] == 0.0                                 # forced masked
+
+
+def test_forced_untouched_when_masking_off(monkeypatch):
+    """Flag off (default) = legacy: a forced rollout keeps its gradient."""
+    monkeypatch.setattr(C, "SHAPE_PENALTY", 0.0)
+    monkeypatch.setattr(C, "BFT_MASK_FORCED_FROM_LOSS", False)
+    from reliquary.validator.training import _is_masked_from_loss
+
+    out = _shape_advantages([_roll(0.0, 100, forced=True)], [0.5])
+    assert out[0] == 0.5
+    assert _is_masked_from_loss(_roll(0.0, 100, forced=True)) is False
 
 
 def test_natural_zero_advantage_is_not_treated_as_masked(monkeypatch):
@@ -96,6 +110,7 @@ def test_natural_zero_advantage_is_not_treated_as_masked(monkeypatch):
     from reliquary.validator.training import _is_masked_from_loss
 
     monkeypatch.setattr(C, "SHAPE_PENALTY", 0.0)
+    monkeypatch.setattr(C, "BFT_MASK_FORCED_FROM_LOSS", True)   # masking ON…
     rewards = [1.0, 0.5, 0.0]
     advantages = _compute_advantages(rewards)
     assert advantages[1] == 0.0                      # exactly zero, legitimately
@@ -106,6 +121,7 @@ def test_natural_zero_advantage_is_not_treated_as_masked(monkeypatch):
 
 def test_mask_forced_composes_with_length_shaping(monkeypatch):
     monkeypatch.setattr(C, "SHAPE_PENALTY", 0.5)
+    monkeypatch.setattr(C, "BFT_MASK_FORCED_FROM_LOSS", True)
     early = int(C.SHAPE_LEN_FRAC * C.BFT_THINKING_BUDGET) - 1
     rollouts = [
         _roll(0.0, 100, forced=True),                        # forced → masked 0
@@ -165,7 +181,7 @@ def test_shaping_metrics_separate_overlong_underthinking_and_forced(
     assert metrics["train/shaping_overlong_ratio"] == 0.25
     assert metrics["train/shaping_underthinking_ratio"] == 0.25
     assert metrics["train/shaping_forced_exempt_ratio"] == 0.25
-    assert metrics["train/shaping_changed_ratio"] == 0.75   # forced now masked too
+    assert metrics["train/shaping_changed_ratio"] == 0.5    # flag off: forced untouched
 
 
 def test_training_environment_metrics_separate_domains_and_plan_signal():

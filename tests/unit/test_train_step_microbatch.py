@@ -163,7 +163,8 @@ def test_microbatch_normalizes_protocol_full_sequence_logprobs():
 # memory-cheap instead of OOMing.
 # ---------------------------------------------------------------------------
 
-def test_masked_rollout_skipped_from_microbatch_forward():
+def test_masked_rollout_skipped_from_microbatch_forward(monkeypatch):
+    monkeypatch.setattr("reliquary.constants.BFT_MASK_FORCED_FROM_LOSS", True)
     real = _build_rollout([1, 2, 3, 4, 5, 6], 1.0, 2)
     masked = _build_rollout([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.0, 2)  # the "16k" analogue
     masked.commit["rollout"]["forced"] = True
@@ -187,6 +188,7 @@ def test_natural_zero_advantage_rollout_is_still_forwarded():
 
 def test_masked_forced_rollout_masked_and_skipped_end_to_end(monkeypatch):
     monkeypatch.setattr("reliquary.constants.SHAPE_PENALTY", 0.0)
+    monkeypatch.setattr("reliquary.constants.BFT_MASK_FORCED_FROM_LOSS", True)
     correct = _build_rollout([1, 2, 3, 4, 5], 1.0, 2)
     wrong = _build_rollout([1, 2, 3, 6, 7], 0.0, 2)             # wrong, terminated
     forced = _build_rollout([1, 2, 3, 8, 9, 10, 11], 0.0, 2)    # wrong, forced (long/masked)
@@ -204,6 +206,7 @@ def test_masked_rollout_excluded_from_Ne(monkeypatch):
     # N_e must drop the masked rollout's tokens; same group with vs without the
     # would-be-masked forced rollout yields the same per-token scale.
     monkeypatch.setattr("reliquary.constants.SHAPE_PENALTY", 0.0)
+    monkeypatch.setattr("reliquary.constants.BFT_MASK_FORCED_FROM_LOSS", True)
 
     def grp(with_forced):
         rs = [_build_rollout([1, 2, 3, 4, 5], 1.0, 2),
@@ -326,7 +329,10 @@ def test_microbatch_behavior_recompute_is_claim_invariant():
     assert _rel_l2(grads_a, grads_b) < 1e-7
 
 
-def test_batched_grads_mask_bft_force_span_like_per_rollout():
+def test_batched_grads_mask_bft_force_span_like_per_rollout(monkeypatch):
+    # Flag off (default): the forced rollout still trains, with its force span
+    # masked at token level — the batched path must match per-rollout.
+    monkeypatch.setattr("reliquary.constants.BFT_MASK_FORCED_FROM_LOSS", False)
     import copy
 
     torch.manual_seed(3)
@@ -346,7 +352,7 @@ def test_batched_grads_mask_bft_force_span_like_per_rollout():
     plan, skipped = _plan_from_batches([[group]])
     assert skipped == 0
     assert len(plan) == 1
-    assert plan[0][1][0] == 0.0          # forced masked
+    assert plan[0][1][0] != 0.0          # flag off: the forced rollout still trains
     # One present env: scale is 1 / surviving trainable completion tokens.
     n_total = round(1.0 / plan[0][2])
 
