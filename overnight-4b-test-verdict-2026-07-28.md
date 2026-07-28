@@ -49,7 +49,21 @@ Fits up to ~14.5k; **a 16k rollout OOMs.** Two models are resident (17 GB weight
 - (b) an honest-loop-vs-manufactured check (reuse the `reward_shape` entropy signal) — robust, more work;
 - (c) accept 10%. Recommend (b) or (a); do not ship blind.
 
-**Blocker 2 — training 16k memory.**
+**Blocker 2 — training 16k memory. ✅ RESOLVED 2026-07-28: THE BLOCKER DID NOT EXIST.**
+
+Measured with the REAL `train_step()` (prod `PagedAdamW8bit`, gradient checkpointing, frozen KL reference, `MICROBATCH_MAX_PADDED_TOKENS` packing) on an H100 80GB, torch fallback (no fast kernels — the pessimistic case):
+
+| scenario (cap 16384) | peak | rollouts forwarded |
+|---|---|---|
+| worst case — all 8 rollouts terminated AT the cap | **40.3 GB** | 16 |
+| realistic (terminated ~p90 11k, 3 forced) mask off | 40.4 GB | 16 |
+| realistic, mask **on** | 40.4 GB | **10** |
+
+**~40 GB of 80 — roughly 2× headroom, in every scenario.** The earlier "85.7 GB → OOM" figure was an artefact of the synthetic probe, which called `model(ids, labels=ids)` and therefore materialised full logits over a 248k vocab; the real path (`_batched_completion_logprobs`) gathers only the selected token logprobs. The lesson: measure the function that production calls, not a stand-in for it.
+
+**Correction to the mask's rationale.** The masked-rollout skip *does* take effect (16 → 10 rollouts forwarded — verified, not assumed), but it saves **compute, not peak memory**: peak is set by the longest single sequence in a micro-batch, which is a terminated rollout either way. The skip remains correct as DAPO fidelity (a masked rollout owes no PPO or KL gradient) — the memory justification in commit `1412a8b` is superseded by this measurement.
+
+**Original analysis (superseded), kept for the record:**
 - ✅ **DONE (commit `1412a8b`): skip masked (0-advantage) rollouts from the training forward.** The DAPO mask now skips the forced rollouts' forward entirely (not just zeroes the PPO advantage), so a forced ~16k rollout is never materialised — the longest trained sequence is the longest *kept* (terminated) rollout (~11-14k) → fits 80GB. Also excludes them from the N_e denominator, and is more DAPO-faithful (whole loss masked, incl. KL). 3 tests, 244 passed. **Must be re-verified with the real `train_step` + prod config on a kernel-enabled card** (the deferred test).
 - Complementary: **install the GatedDeltaNet kernels on the validator** (fla + causal-conv1d; needs the CUDA toolkit) — also ~3.3× speed, and further cuts memory.
 
