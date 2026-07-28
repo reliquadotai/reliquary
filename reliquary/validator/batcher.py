@@ -90,6 +90,8 @@ from reliquary.validator.dedup import (
 )
 from reliquary.validator.difficulty_auction import (
     ShadowSubmission,
+    auction_value,
+    conservative_difficulty_score,
     difficulty_score,
     select_shadow_auction,
 )
@@ -289,6 +291,26 @@ _PROOF_FAILURE_DEBT_STAGES = frozenset(
 # PROMPT_CLAIMED reject is needed.
 
 
+def _pending_difficulty_score(pending):
+    """Auction score for a pending candidate, conservative about truncation.
+
+    A truncated rollout has no gradeable answer and a miner can create one on
+    purpose (suppress EOS -> runs to the cap -> grades 0 -> the prompt looks
+    harder and pays more), so under CONSERVATIVE_TRUNCATION_VALUE the group is
+    scored under the least favourable interpretation of its truncated rollouts.
+    """
+    from reliquary.constants import CONSERVATIVE_TRUNCATION_VALUE
+
+    truncated = int(getattr(pending, "truncated_count", 0) or 0)
+    if CONSERVATIVE_TRUNCATION_VALUE and truncated > 0:
+        return conservative_difficulty_score(
+            pending.rewards,
+            truncated_count=truncated,
+            delta=DIFFICULTY_AUCTION_DELTA,
+        )
+    return difficulty_score(pending.rewards, delta=DIFFICULTY_AUCTION_DELTA)
+
+
 @dataclass
 class PendingSubmission:
     """A submission that passed every CHEAP check and has been graded + scored,
@@ -318,12 +340,14 @@ class PendingSubmission:
     decision_ts: float | None = None
     telemetry: Any = None
     reject_response: BatchSubmissionResponse | None = None
+    # Rollouts that ran to the cap without terminating (no gradeable answer).
+    truncated_count: int = 0
     value: float = field(init=False, default=0.0)
 
     def __post_init__(self):
-        self.value = difficulty_score(
-            self.rewards, delta=DIFFICULTY_AUCTION_DELTA
-        ).value
+        self.value = auction_value(
+            self.rewards, truncated_count=self.truncated_count
+        )
 
 
 @dataclass
@@ -1851,6 +1875,7 @@ class GrpoWindowBatcher:
             prompt_idx=request.prompt_idx,
             request=request,
             rewards=list(prepared.rewards),
+            truncated_count=int(getattr(prepared, "truncated_count", 0) or 0),
             drand_round=request.drand_round,
             merkle_root=bytes.fromhex(request.merkle_root),
             selection_digest=prepared.selection_digest
@@ -3453,10 +3478,7 @@ class GrpoWindowBatcher:
         """
         with self._lock:
             pending = list(self._pending)
-        scored = [
-            (p, difficulty_score(p.rewards, delta=DIFFICULTY_AUCTION_DELTA))
-            for p in pending
-        ]
+        scored = [(p, _pending_difficulty_score(p)) for p in pending]
         operator_by_id: dict[int, str | None] = {}
         arrival_by_id: dict[int, int] = {}
         arrival_source_by_id: dict[int, str] = {}

@@ -105,6 +105,34 @@ This settles the internal debate (does masking change the mean?): **no — the b
 
 ---
 
+## Part 2c — Manufactured zeros: price truncation instead of policing it
+
+**A pre-existing hole, found while testing the 16k change.** The auction pays more for hard prompts (value peaks at low k), so a miner can inflate a prompt's value by **breaking one of its own correct rollouts**: suppress EOS → it runs to `max_tokens` → grades 0 → the prompt looks harder. On the live value function `std(r)·(1−mean(r))`, **one manufactured zero at k=6 is worth +68%** (0.1083 → 0.1816). This exists today, independent of the 4B/16k work, and `MAX_TRUNCATED_PER_SUBMISSION = 1` already permits exactly one.
+
+**Detection was tried and rejected (GPU-measured).** Simulating a cheating miner (ban EOS, run to the cap) through every content filter:
+- forced-seed consistency: **12/12 cheaters pass** (~97% agreement vs a 0.75 floor — the manipulation's 2-4% footprint is an order of magnitude under the HW tolerance);
+- token distribution: 12/12 pass;
+- token-auth (`chosen<1e-5 & argmax≥0.99`): catches 9/12 — misses *soft* terminations;
+- a purpose-built **EOS-suppression filter** (count positions where the forced-seed pick is EOS but the token isn't) and an **EOS-survival test** (`S = Σ p_eos`, aggregate and HW-robust, 0% false positives): catch 78% of real fake attempts, miss the rest.
+
+Decisive objection: **any detector is farmable** — a miner retries prompts until one evades, so residual detection failure converges to "always evades". Detection cannot be the primary defence here, and the underlying cause (forced-seed's wide HW tolerance) is not fixable without a HW-invariant fingerprint.
+
+**The fix — conservative valuation.** A truncated rollout has no gradeable answer, and the validator cannot know whether it would have been correct. So score the group under the interpretation **least favourable to the miner**:
+
+```
+value = min over j∈[0..t] of  difficulty_score(rewards with j of the t truncated raised to 1.0)
+```
+
+Because the group's true outcome is always one of the interpretations and we take the minimum, **a manipulated group can never score above the honest group it came from — the gain is exactly zero, by construction**, for any value function, with no threshold to tune and no detection. Verified exhaustively over every `(k, truncated-correct, truncated-wrong)` combination: **0 profitable cases out of 156**.
+
+*Why not simply exclude truncated rollouts from the ratio (`c/n_terminated`)?* Because that shifts the denominator: at k=1, truncating a **wrong** rollout moves 1/8 → 1/7 and gains +3.6%, and an honest rollout that rambles is punished far harder (−54% before any discount) since removing a genuine failure makes the prompt look easier. Keep the denominator at M and take the min.
+
+**Cost.** An honestly-rambling group is also valued down — worst at high k (k=6: −62%, but those easy prompts were already worth ~3× less than the peak and don't win auctions) and mildest exactly where the auction competes (k=2: **−7%**, k=1: **0%**). The 4B rambles most on prompts it cannot solve, i.e. the low-k region where the penalty is smallest. And it is **strictly better than today for the worst-hit honest miners**: a group with 2+ truncations is currently rejected outright (**earns zero**) — under conservative valuation it is admissible and earns a real value, which is what lets `MAX_TRUNCATED_PER_SUBMISSION` be relaxed for code (blocker 1).
+
+**Implementation.** `conservative_difficulty_score()` / `auction_value()` in `difficulty_auction.py`; `count_truncated_rollouts()` in `admission.py` (sharing `_classify_termination` with the admission gate, so both read one predicate); `truncated_count` threaded `PreparedSubmission → PendingSubmission →` the auction value and `_prove_ranked` ranking. Behind `RELIQUARY_CONSERVATIVE_TRUNCATION_VALUE` (**default off**). Auction/emission only — training keeps the real reward vector. 11 tests incl. the exhaustive proof; 466 passed on affected suites.
+
+---
+
 ## Part 3 — Draw tie-break: pure speed → throughput (tokens/second)
 
 ### The problem — and why it is coupled to the 4B

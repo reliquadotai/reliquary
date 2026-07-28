@@ -624,6 +624,33 @@ DIFFICULTY_AUCTION_SHADOW_ENABLED = _os.environ.get(
 ).strip().lower() not in ("0", "false", "no", "off", "")
 DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS = ("openmathinstruct",)
 DIFFICULTY_AUCTION_DELTA = 1.0
+
+# Conservative valuation of truncated rollouts (closes the manufactured-zero
+# hole). The auction pays more for HARD prompts (value peaks at low k), so a
+# miner can inflate a prompt's value by breaking one of its own correct
+# rollouts: suppressing EOS runs it to max_tokens, where it grades 0 and the
+# prompt looks harder. Measured on the live value function, one manufactured
+# zero at k=6 is worth +68%. GPU tests showed this is NOT reliably detectable —
+# an EOS-suppressed rollout looks like honest rambling, and any detector is
+# farmable (a miner retries prompts until one evades).
+#
+# So price it instead of policing it: a truncated rollout has no gradeable
+# answer, and the validator cannot know whether it would have been correct, so
+# the group is valued under the interpretation LEAST favourable to the miner
+# (min over "j of the truncated were actually correct", j = 0..t). The true
+# outcome is always one of those interpretations, so a manipulated group can
+# never score above its honest value — verified exhaustively over every
+# (k, truncated-correct, truncated-wrong) combination: 0 profitable cases.
+# Cost: an honestly-rambling group is also valued down, worst at high k (easy
+# prompts, already near-worthless) and mildest at low k (−7% at k=2), which is
+# where the auction competition actually happens. It also lets
+# MAX_TRUNCATED_PER_SUBMISSION be relaxed: groups that are rejected outright
+# today (earning zero) become admissible and earn a conservative value instead.
+# Auction/emission only — training keeps the real reward vector.
+CONSERVATIVE_TRUNCATION_VALUE = (
+    _os.environ.get("RELIQUARY_CONSERVATIVE_TRUNCATION_VALUE", "0")
+    not in ("0", "false", "False")
+)
 # The live proof budget currently caps each environment at 96 grading attempts.
 # Keep an independent ceiling so a future admission change cannot turn passive
 # telemetry into unbounded seal-time CPU or archive growth.

@@ -123,6 +123,10 @@ class PreparedSubmission:
     preparation_ms: float = 0.0
     reward_grading_ms: float = 0.0
     timed_out: bool = False
+    # Rollouts that ran to the protocol cap without terminating. Carried to the
+    # auction so the group can be valued conservatively (a truncated rollout has
+    # no gradeable answer, and a miner can create one on purpose).
+    truncated_count: int = 0
 
 
 class _AdmissionTimeout(TimeoutError):
@@ -302,6 +306,70 @@ def _natural_cap_termination(
     return any(int(token) in think_close for token in phase_one)
 
 
+def _classify_termination(rollout, context: AdmissionContext) -> str:
+    """Classify one rollout's termination.
+
+    Returns ``"ok"`` (terminated, or an accepted BFT/natural cap shape),
+    ``"truncated"`` (no EOS, ran to the protocol cap), or a reject reason name
+    (``"bad_schema"`` / ``"tampered"`` / ``"bad_termination"``). Shared by the
+    admission gate and the truncated-rollout count so both read the same
+    predicate.
+    """
+    eos_ids = set(context.eos_token_ids)
+    commit = rollout.commit
+    tokens = list(commit.get("tokens") or [])
+    meta = commit.get("rollout", {}) or {}
+    try:
+        prompt_length = int(meta.get("prompt_length", 0))
+        completion_length = int(meta.get("completion_length", 0))
+    except (TypeError, ValueError, OverflowError):
+        return "bad_schema"
+    completion = tokens[prompt_length: prompt_length + completion_length]
+    if not completion:
+        return "bad_schema"
+    eos_positions = [
+        index
+        for index, token in enumerate(completion)
+        if int(token) in eos_ids
+    ]
+    if eos_positions:
+        if len(eos_positions) > 1 or eos_positions[0] != len(completion) - 1:
+            return "bad_termination"
+        return "ok"
+    if (
+        context.environment == "openmathinstruct"
+        and _forced_cap_termination(meta)
+    ):
+        if not _force_span_valid(tokens, meta, context):
+            return "tampered"
+        return "ok"
+    if _natural_cap_termination(tokens, meta, context):
+        return "ok"
+    if prompt_length + completion_length < MAX_NEW_TOKENS_PROTOCOL_CAP:
+        return "bad_termination"
+    return "truncated"
+
+
+def count_truncated_rollouts(
+    request: BatchSubmissionRequest,
+    context: AdmissionContext,
+) -> int:
+    """How many rollouts ran to the protocol cap without terminating.
+
+    Feeds the auction's conservative valuation: a truncated rollout has no
+    gradeable answer, so the group is scored under the interpretation least
+    favourable to the miner (see ``conservative_difficulty_score``). Counting
+    only — admission acceptance is decided by ``_termination_reject``.
+    """
+    if not context.eos_token_ids:
+        return 0
+    return sum(
+        1
+        for rollout in request.rollouts
+        if _classify_termination(rollout, context) == "truncated"
+    )
+
+
 def _termination_reject(
     request: BatchSubmissionRequest,
     context: AdmissionContext,
@@ -316,40 +384,17 @@ def _termination_reject(
     )
     truncated = 0
     for rollout in request.rollouts:
-        commit = rollout.commit
-        tokens = list(commit.get("tokens") or [])
-        meta = commit.get("rollout", {}) or {}
-        try:
-            prompt_length = int(meta.get("prompt_length", 0))
-            completion_length = int(meta.get("completion_length", 0))
-        except (TypeError, ValueError, OverflowError):
+        kind = _classify_termination(rollout, context)
+        if kind == "bad_schema":
             return RejectReason.BAD_SCHEMA
-        completion = tokens[prompt_length: prompt_length + completion_length]
-        if not completion:
-            return RejectReason.BAD_SCHEMA
-        eos_positions = [
-            index
-            for index, token in enumerate(completion)
-            if int(token) in eos_ids
-        ]
-        if eos_positions:
-            if len(eos_positions) > 1 or eos_positions[0] != len(completion) - 1:
+        if kind == "tampered":
+            return RejectReason.TOKEN_TAMPERED
+        if kind == "bad_termination":
+            return RejectReason.BAD_TERMINATION
+        if kind == "truncated":
+            truncated += 1
+            if truncated > max_truncated:
                 return RejectReason.BAD_TERMINATION
-            continue
-        if (
-            context.environment == "openmathinstruct"
-            and _forced_cap_termination(meta)
-        ):
-            if not _force_span_valid(tokens, meta, context):
-                return RejectReason.TOKEN_TAMPERED
-            continue
-        if _natural_cap_termination(tokens, meta, context):
-            continue
-        if prompt_length + completion_length < MAX_NEW_TOKENS_PROTOCOL_CAP:
-            return RejectReason.BAD_TERMINATION
-        truncated += 1
-        if truncated > max_truncated:
-            return RejectReason.BAD_TERMINATION
     return None
 
 
@@ -780,6 +825,9 @@ def score_and_finalize_submission(
                 rewards=rewards,
                 rollout_hashes=parsed.rollout_hashes,
                 selection_digest=parsed.selection_digest,
+                # Derived from the token stream, so it is unaffected by the
+                # meta["truncated"] reset above.
+                truncated_count=count_truncated_rollouts(request, context),
                 body_parse_ms=parsed.body_parse_ms,
                 preparation_ms=(
                     parsed.preparation_ms
