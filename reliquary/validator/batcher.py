@@ -90,8 +90,8 @@ from reliquary.validator.dedup import (
 )
 from reliquary.validator.difficulty_auction import (
     ShadowSubmission,
+    auction_difficulty_score,
     auction_value,
-    conservative_difficulty_score,
     difficulty_score,
     select_shadow_auction,
 )
@@ -292,23 +292,16 @@ _PROOF_FAILURE_DEBT_STAGES = frozenset(
 
 
 def _pending_difficulty_score(pending):
-    """Auction score for a pending candidate, conservative about truncation.
+    """Auction score for a pending candidate (conservative about truncation).
 
-    A truncated rollout has no gradeable answer and a miner can create one on
-    purpose (suppress EOS -> runs to the cap -> grades 0 -> the prompt looks
-    harder and pays more), so under CONSERVATIVE_TRUNCATION_VALUE the group is
-    scored under the least favourable interpretation of its truncated rollouts.
+    Thin adapter over ``auction_difficulty_score`` so ranking here and the value
+    stored on the candidate cannot drift apart.
     """
-    from reliquary.constants import CONSERVATIVE_TRUNCATION_VALUE
-
-    truncated = int(getattr(pending, "truncated_count", 0) or 0)
-    if CONSERVATIVE_TRUNCATION_VALUE and truncated > 0:
-        return conservative_difficulty_score(
-            pending.rewards,
-            truncated_count=truncated,
-            delta=DIFFICULTY_AUCTION_DELTA,
-        )
-    return difficulty_score(pending.rewards, delta=DIFFICULTY_AUCTION_DELTA)
+    return auction_difficulty_score(
+        pending.rewards,
+        truncated_count=int(getattr(pending, "truncated_count", 0) or 0),
+        delta=DIFFICULTY_AUCTION_DELTA,
+    )
 
 
 @dataclass

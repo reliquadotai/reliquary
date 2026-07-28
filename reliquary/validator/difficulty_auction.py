@@ -135,13 +135,13 @@ def conservative_difficulty_score(
     return best if best is not None else difficulty_score(values, delta=delta)
 
 
-def auction_value(
+def auction_difficulty_score(
     rewards: Iterable[float],
     *,
     truncated_count: int = 0,
     delta: float | None = None,
-) -> float:
-    """The value the auction ranks and pays on.
+) -> DifficultyScore:
+    """The score the auction ranks and pays on — single source of truth.
 
     Plain difficulty score, except that when ``CONSERVATIVE_TRUNCATION_VALUE``
     is set a group carrying truncated rollouts is valued under the least
@@ -157,8 +157,20 @@ def auction_value(
     if CONSERVATIVE_TRUNCATION_VALUE and truncated_count > 0:
         return conservative_difficulty_score(
             rewards, truncated_count=truncated_count, delta=resolved_delta
-        ).value
-    return difficulty_score(rewards, delta=resolved_delta).value
+        )
+    return difficulty_score(rewards, delta=resolved_delta)
+
+
+def auction_value(
+    rewards: Iterable[float],
+    *,
+    truncated_count: int = 0,
+    delta: float | None = None,
+) -> float:
+    """``auction_difficulty_score`` reduced to the ranked/paid scalar."""
+    return auction_difficulty_score(
+        rewards, truncated_count=truncated_count, delta=delta
+    ).value
 
 
 def submission_score(

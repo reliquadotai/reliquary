@@ -113,7 +113,11 @@ def make_throughput_slot_key(
         except (TypeError, ValueError):
             tokens = 0
         elapsed = max(arrival - window_open_round, 1)
-        bucket = int((tokens / elapsed) / bucket_tokens_per_round)
+        # Integer arithmetic on purpose: this key orders emission, so it must be
+        # bit-identical across validators. floor(tokens / (elapsed * width)) is
+        # exactly the float form for non-negative inputs, without the rounding.
+        width = max(1, int(bucket_tokens_per_round))
+        bucket = tokens // (elapsed * width)
         return (-bucket, arrival)
 
     return slot_key

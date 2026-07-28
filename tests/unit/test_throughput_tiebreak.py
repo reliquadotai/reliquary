@@ -83,9 +83,10 @@ def test_missing_completion_length_degrades_to_last_tier():
     assert k[0] == 0          # bucket 0 (highest tier value → sorts last)
 
 
-def test_key_reads_summed_completion_length():
-    """ValidSubmission derives completion_length as the sum of its rollouts' token
-    counts; the throughput key reads that aggregate (group-level work)."""
+def test_key_reads_the_group_level_completion_length():
+    """The key reads whatever ``completion_length`` the submission exposes — a
+    group-level aggregate of GENERATED tokens (see the ValidSubmission test
+    below for how that aggregate excludes the prompt)."""
     key = _key()
 
     class Roll:
@@ -154,3 +155,73 @@ def test_long_efficient_beats_short_inefficient_for_scarce_slot():
         subs, b=1, cooldown_map=cd, current_window=100, slot_round_of=_key(),
     )
     assert thr_batch[0].hotkey == "long"
+
+
+def test_bucket_uses_integer_arithmetic():
+    """The slot key orders emission, so it must be bit-identical across
+    validators: floor division, never a float divide."""
+    key = _key()
+    sub = _sub("m", 1, drand_round=33, completion_length=16000)
+    bucket = -key(sub)[0]
+    assert bucket == 16000 // (33 * BUCKET)      # exact integer form
+    assert isinstance(bucket, int)
+
+
+def test_arrival_prefers_validator_observed_round():
+    """Arrival is the throughput DENOMINATOR, so the miner-submitted round must
+    not win over the validator-observed one."""
+    key = _key()
+    sub = _sub("m", 1, drand_round=2, completion_length=16000)   # miner claims early
+    sub.arrival_drand_round = 32                                 # validator saw late
+    assert key(sub)[1] == 32
+    assert -key(sub)[0] == 16000 // (32 * BUCKET)
+
+
+def test_pending_and_ranking_share_one_scorer(monkeypatch):
+    """PendingSubmission.value and the _prove_ranked ranking must come from the
+    same scorer, or they can drift apart."""
+    monkeypatch.setattr("reliquary.constants.CONSERVATIVE_TRUNCATION_VALUE", True)
+    from reliquary.validator.batcher import PendingSubmission, _pending_difficulty_score
+
+    p = PendingSubmission(
+        hotkey="hk", prompt_idx=1, request=None,
+        rewards=[1.0] * 6 + [0.0] * 2, drand_round=1,
+        merkle_root=b"\x00" * 32, selection_digest=b"\x00" * 32,
+        truncated_count=1,
+    )
+    assert _pending_difficulty_score(p).value == p.value
+
+
+def test_valid_submission_completion_length_excludes_the_prompt():
+    """The throughput numerator must count GENERATED tokens only: len(tokens)
+    carries the prompt once per rollout, and the miner picks the prompt, so a
+    long prompt would inflate throughput for free."""
+    from reliquary.validator.batcher import ValidSubmission
+
+    class Roll:
+        def __init__(self, prompt_len, gen):
+            self.tokens = [0] * (prompt_len + gen)
+            self.commit = {"rollout": {
+                "prompt_length": prompt_len, "completion_length": gen,
+            }}
+
+    sub = ValidSubmission(
+        hotkey="hk", prompt_idx=1, merkle_root_bytes=b"\x00" * 32,
+        rollouts=[Roll(500, 1000), Roll(500, 1000)],
+    )
+    assert sub.completion_length == 2000          # not 3000 (prompt excluded)
+
+
+def test_valid_submission_completion_length_falls_back_without_meta():
+    """Unexpected shape degrades to tokens-minus-prompt, never raises."""
+    from reliquary.validator.batcher import ValidSubmission
+
+    class Roll:
+        tokens = [0] * 1500
+        commit = {"rollout": {"prompt_length": 500}}       # no completion_length
+
+    sub = ValidSubmission(
+        hotkey="hk", prompt_idx=1, merkle_root_bytes=b"\x00" * 32,
+        rollouts=[Roll()],
+    )
+    assert sub.completion_length == 1000
