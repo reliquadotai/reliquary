@@ -468,7 +468,15 @@ def _plan_from_batches(batches, env_weights: Optional[dict] = None):
                              getattr(group, "prompt_idx", "?"))
                 continue
             surviving.append((group, advantages, b_idx))
-            for rollout in group.rollouts:
+            for rollout, adv in zip(group.rollouts, advantages):
+                # DAPO overlong filtering: a masked (advantage 0) rollout is
+                # skipped from the forward (_build_microbatch_items), so it must
+                # also be excluded from the N_e denominator here — otherwise the
+                # surviving tokens are under-normalised. In a surviving (non-
+                # degenerate) group with binary rewards, advantage == 0 only
+                # happens via the BFT forced-rollout mask.
+                if adv == 0.0:
+                    continue
                 meta = (rollout.commit or {}).get("rollout", {}) or {}
                 old = _completion_token_logprobs(rollout)
                 prompt_length = int(meta.get("prompt_length", 0) or 0)
@@ -1256,6 +1264,13 @@ def _build_microbatch_items(plan):
     items = []
     for group, advantages, scale in plan:
         for rollout, adv in zip(group.rollouts, advantages):
+            if adv == 0.0:
+                # DAPO overlong filtering: a masked rollout contributes no PPO or
+                # KL gradient, so skip its forward entirely. This is what makes
+                # the mask memory-cheap — a forced (up to 16k) rollout is never
+                # materialised. Its tokens are also excluded from N_e in
+                # _plan_from_batches so the surviving loss stays normalised.
+                continue
             commit = rollout.commit or {}
             tokens = commit.get("tokens")
             meta = commit.get("rollout", {}) or {}

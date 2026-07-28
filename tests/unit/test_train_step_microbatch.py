@@ -154,6 +154,58 @@ def test_microbatch_normalizes_protocol_full_sequence_logprobs():
 
 
 # ---------------------------------------------------------------------------
+# DAPO overlong filtering: a masked (advantage-0) rollout is skipped from the
+# forward AND the N_e denominator — this is what makes the forced 16k rollouts
+# memory-cheap instead of OOMing.
+# ---------------------------------------------------------------------------
+
+def test_masked_rollout_skipped_from_microbatch_forward():
+    real = _build_rollout([1, 2, 3, 4, 5, 6], 1.0, 2)
+    masked = _build_rollout([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.0, 2)  # the "16k" analogue
+    plan = [(_FakeGroup([real, masked]), [1.0, 0.0], 1.0)]
+    items = _build_microbatch_items(plan)
+    assert len(items) == 1                       # advantage-0 rollout not forwarded
+    assert items[0][3] == 1.0                    # kept item is the real one (adv field)
+    assert tuple(items[0][0]) == tuple(real.tokens)
+
+
+def test_masked_forced_rollout_masked_and_skipped_end_to_end(monkeypatch):
+    monkeypatch.setattr("reliquary.constants.BFT_MASK_FORCED_FROM_LOSS", True)
+    monkeypatch.setattr("reliquary.constants.SHAPE_PENALTY", 0.0)
+    correct = _build_rollout([1, 2, 3, 4, 5], 1.0, 2)
+    wrong = _build_rollout([1, 2, 3, 6, 7], 0.0, 2)             # wrong, terminated
+    forced = _build_rollout([1, 2, 3, 8, 9, 10, 11], 0.0, 2)    # wrong, forced (long/masked)
+    forced.commit["rollout"]["forced"] = True
+    plan, _ = _plan_from_batches([[_FakeGroup([correct, wrong, forced])]])
+    advs = plan[0][1]
+    assert advs[2] == 0.0                         # forced rollout masked to 0
+    assert advs[0] != 0.0 and advs[1] != 0.0
+    items = _build_microbatch_items(plan)
+    assert len(items) == 2                        # forced (16k analogue) skipped
+    assert all(tuple(it[0]) != tuple(forced.tokens) for it in items)
+
+
+def test_masked_rollout_excluded_from_Ne(monkeypatch):
+    # N_e must drop the masked rollout's tokens; same group with vs without the
+    # would-be-masked forced rollout yields the same per-token scale.
+    monkeypatch.setattr("reliquary.constants.BFT_MASK_FORCED_FROM_LOSS", True)
+    monkeypatch.setattr("reliquary.constants.SHAPE_PENALTY", 0.0)
+
+    def grp(with_forced):
+        rs = [_build_rollout([1, 2, 3, 4, 5], 1.0, 2),
+              _build_rollout([1, 2, 3, 6, 7], 0.0, 2)]
+        if with_forced:
+            f = _build_rollout([1, 2, 3, 8, 9, 10, 11], 0.0, 2)
+            f.commit["rollout"]["forced"] = True
+            rs.append(f)
+        return _FakeGroup(rs)
+
+    plan_with, _ = _plan_from_batches([[grp(True)]])
+    plan_without, _ = _plan_from_batches([[grp(False)]])
+    assert plan_with[0][2] == pytest.approx(plan_without[0][2])
+
+
+# ---------------------------------------------------------------------------
 # Equivalence (the Embedding base makes batched == per-rollout up to bf16 head)
 # ---------------------------------------------------------------------------
 
