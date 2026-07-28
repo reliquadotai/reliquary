@@ -406,16 +406,33 @@ class ValidSubmission:
 
     @property
     def completion_length(self) -> int:
-        """Total generated tokens across this submission's rollouts — the 'work'
+        """GENERATED tokens across this submission's rollouts — the 'work'
         numerator for the throughput draw tie-break (make_throughput_slot_key).
 
-        Sums ``len(tokens)`` (prompt + completion) over rollouts: always present
-        (``tokens`` is a required, non-empty field), dependency-free, and
-        deterministic across validators. The shared prompt is a small constant
-        offset versus the completions and is immaterial at the throughput bucket
-        granularity.
+        Sums each rollout's validator-checked ``completion_length`` rather than
+        ``len(tokens)``: the latter includes the prompt once PER ROLLOUT, and the
+        miner picks which prompt it submits, so a long prompt would inflate the
+        throughput numerator for free. Falls back to the token count minus the
+        prompt length, then to 0, so an unexpected shape degrades instead of
+        raising.
         """
-        return sum(len(r.tokens) for r in self.rollouts)
+        total = 0
+        for rollout in self.rollouts:
+            meta = (getattr(rollout, "commit", None) or {}).get("rollout", {}) or {}
+            try:
+                generated = int(meta.get("completion_length", 0) or 0)
+            except (TypeError, ValueError):
+                generated = 0
+            if generated <= 0:
+                try:
+                    generated = max(
+                        0,
+                        len(rollout.tokens) - int(meta.get("prompt_length", 0) or 0),
+                    )
+                except (TypeError, ValueError, AttributeError):
+                    generated = 0
+            total += generated
+        return total
 
 
 @dataclass

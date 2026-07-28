@@ -150,6 +150,22 @@ def _compute_advantages(rewards: list[float]) -> list[float]:
     return [(r - mean) / std for r in rewards]
 
 
+def _is_masked_from_loss(rollout) -> bool:
+    """Whether this rollout is masked out of the policy update (DAPO overlong
+    filtering): a forced (BFT-hit) rollout's answer is a budget artefact, not the
+    model's reasoning, so it contributes no PPO or KL gradient and its forward is
+    skipped entirely (which is also what keeps a 16k forced rollout from blowing
+    the training memory budget).
+
+    Read from the rollout's validator-set metadata, NEVER inferred from its
+    advantage being 0.0: a legitimate advantage is exactly 0 whenever a reward
+    equals its group mean (common with fractional code rewards), and skipping
+    those would silently drop their KL term and skew the N_e normalisation.
+    """
+    meta = (getattr(rollout, "commit", None) or {}).get("rollout", {}) or {}
+    return bool(meta.get("forced"))
+
+
 def _shape_advantages(rollouts, advantages):
     """Two-sided length shaping, on ADVANTAGES only (the σ-gate stays on raw
     correctness). Overrides an advantage to −SHAPE_PENALTY when:
@@ -160,29 +176,28 @@ def _shape_advantages(rollouts, advantages):
     schema-checked, forced/truncated validator-set). SHAPE_PENALTY == 0 disables
     it.
 
-    Separately, when BFT_MASK_FORCED_FROM_LOSS is set, a forced (BFT-hit)
-    rollout's advantage is zeroed — masked from the policy gradient (DAPO overlong
-    filtering) so the model is not taught to shorten its reasoning to dodge the
-    forced-answer penalty. This is independent of SHAPE_PENALTY; the group
-    mean/std (computed in _compute_advantages over the full group) and the σ-gate
-    are untouched, so only the gradient changes, not the baseline or the reward."""
+    Separately and unconditionally, a forced (BFT-hit) rollout's advantage is
+    zeroed — masked from the policy update (DAPO overlong filtering) so the model
+    is not taught to shorten its reasoning to dodge the forced-answer penalty.
+    Independent of SHAPE_PENALTY. The group mean/std (computed in
+    _compute_advantages over the FULL group) and the σ-gate are untouched, so
+    only the gradient changes, not the baseline or the reward. The actual skip is
+    driven by ``_is_masked_from_loss`` reading the rollout's metadata, not by this
+    zero — a legitimate advantage is exactly 0 whenever a reward equals its group
+    mean."""
     from reliquary.constants import (
-        BFT_MASK_FORCED_FROM_LOSS,
         BFT_THINKING_BUDGET,
         SHAPE_LEN_FRAC,
         SHAPE_PENALTY,
     )
 
-    if SHAPE_PENALTY <= 0 and not BFT_MASK_FORCED_FROM_LOSS:
-        return advantages
     early_cap = SHAPE_LEN_FRAC * BFT_THINKING_BUDGET
     shaped = list(advantages)
     for i, r in enumerate(rollouts):
         meta = (getattr(r, "commit", None) or {}).get("rollout", {}) or {}
         if meta.get("forced"):
-            if BFT_MASK_FORCED_FROM_LOSS:
-                shaped[i] = 0.0                 # masked from the gradient (DAPO)
-            continue                            # else legacy: forced untouched
+            shaped[i] = 0.0                     # masked from the loss (DAPO)
+            continue
         if SHAPE_PENALTY <= 0:
             continue                            # length shaping off
         if meta.get("truncated"):
@@ -468,14 +483,11 @@ def _plan_from_batches(batches, env_weights: Optional[dict] = None):
                              getattr(group, "prompt_idx", "?"))
                 continue
             surviving.append((group, advantages, b_idx))
-            for rollout, adv in zip(group.rollouts, advantages):
-                # DAPO overlong filtering: a masked (advantage 0) rollout is
-                # skipped from the forward (_build_microbatch_items), so it must
-                # also be excluded from the N_e denominator here — otherwise the
-                # surviving tokens are under-normalised. In a surviving (non-
-                # degenerate) group with binary rewards, advantage == 0 only
-                # happens via the BFT forced-rollout mask.
-                if adv == 0.0:
+            for rollout in group.rollouts:
+                # A masked rollout is skipped from the forward
+                # (_build_microbatch_items), so it must also leave the N_e
+                # denominator here or the surviving tokens are under-normalised.
+                if _is_masked_from_loss(rollout):
                     continue
                 meta = (rollout.commit or {}).get("rollout", {}) or {}
                 old = _completion_token_logprobs(rollout)
@@ -1264,12 +1276,10 @@ def _build_microbatch_items(plan):
     items = []
     for group, advantages, scale in plan:
         for rollout, adv in zip(group.rollouts, advantages):
-            if adv == 0.0:
-                # DAPO overlong filtering: a masked rollout contributes no PPO or
-                # KL gradient, so skip its forward entirely. This is what makes
-                # the mask memory-cheap — a forced (up to 16k) rollout is never
-                # materialised. Its tokens are also excluded from N_e in
-                # _plan_from_batches so the surviving loss stays normalised.
+            if _is_masked_from_loss(rollout):
+                # No PPO or KL gradient, so skip the forward entirely — this is
+                # what keeps a 16k forced rollout from being materialised. Its
+                # tokens also leave N_e in _plan_from_batches.
                 continue
             commit = rollout.commit or {}
             tokens = commit.get("tokens")

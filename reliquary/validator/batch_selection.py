@@ -93,10 +93,19 @@ def make_throughput_slot_key(
     and arrival deterministically breaks within-bucket ties. A submission missing
     ``completion_length`` degrades to throughput 0 (last bucket, arrival-ordered)
     rather than raising — so the ordering never crashes on an unexpected shape.
+
+    Arrival is read from the validator-OBSERVED ``arrival_drand_round`` when
+    present (same precedence as the auction's ``_rank_key``), falling back to the
+    miner-submitted ``drand_round``. That matters here because arrival is the
+    *denominator*: a miner shading its own round downward would inflate its
+    throughput, so the miner-controlled field must not be preferred.
     """
     def slot_key(sub: Any) -> tuple[int, int]:
+        observed = getattr(sub, "arrival_drand_round", None)
         try:
-            arrival = int(sub.drand_round)
+            arrival = int(
+                observed if observed is not None else sub.drand_round
+            )
         except (AttributeError, TypeError, ValueError):
             arrival = window_open_round
         try:
