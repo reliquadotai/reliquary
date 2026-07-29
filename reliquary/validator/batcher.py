@@ -19,6 +19,8 @@ from typing import Any, Callable
 from pydantic import ValidationError
 
 from reliquary.constants import (
+    AUCTION_EARLY_CLOSE_ENFORCE,
+    AUCTION_EARLY_CLOSE_POLL_SECONDS,
     BATCH_PROMPT_COOLDOWN_WINDOWS,
     B_BATCH,
     BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION,
@@ -93,6 +95,7 @@ from reliquary.validator.difficulty_auction import (
     auction_difficulty_score,
     auction_value,
     difficulty_score,
+    max_difficulty_value,
     select_shadow_auction,
 )
 from reliquary.validator.observability import (
@@ -521,6 +524,7 @@ class GrpoWindowBatcher:
         drand_round_backward_tolerance: int | None = None,
         queue_drained_predicate: Callable[[], bool] | None = None,
         operator_by_hotkey: dict[str, str] | None = None,
+        current_round_fn: Callable[[], int | None] | None = None,
     ) -> None:
         from reliquary.constants import DRAND_ROUND_BACKWARD_TOLERANCE
 
@@ -649,6 +653,16 @@ class GrpoWindowBatcher:
         # Tier ordinal of each proven winner (id(ValidSubmission) -> int),
         # consumed by _seal_batch_inner as the fair-split slot key.
         self._auction_tier_by_id: dict[int, int] = {}
+        # Mid-window proof results (id(pending) -> ValidSubmission|None),
+        # written by the early-close prover thread under ``_lock`` and consumed
+        # by ``_prove_ranked``; a missing key means never attempted mid-window.
+        self._early_proof_results: dict[int, ValidSubmission | None] = {}
+        self.early_close_proof_attempts = 0
+        self.early_close_proof_failures = 0
+        self.early_close_proof_wall_seconds = 0.0
+        self.early_close_armed_round: int | None = None
+        self.early_close_sealed_round: int | None = None
+        self._early_close_thread: threading.Thread | None = None
         # Non-winners proven purely for telemetry — see FORENSIC_SAMPLE_PER_WINDOW.
         # Never touches ``_valid``; a passing entry here is still unpaid.
         self.forensic_sample: list[ForensicSampleResult] = []
@@ -731,6 +745,9 @@ class GrpoWindowBatcher:
         # submissions finish GRAIL (queue empty AND no proof in flight)
         # before the batch is sealed.
         self._queue_drained_predicate = queue_drained_predicate
+        # Wall-clock drand round source for the early-close same-round guard;
+        # tests inject, production derives from the drand chain info.
+        self._current_round_fn = current_round_fn
         self.force_seal_reason: str | None = None
         # Proof-admission accounting is separate from ``_lock`` because the
         # submit worker holds ``_lock`` during GRAIL. The HTTP cheap path must
@@ -859,6 +876,17 @@ class GrpoWindowBatcher:
             )
         except Exception:
             self.window_open_drand_round = None
+        if (
+            self.difficulty_auction_enabled
+            and AUCTION_EARLY_CLOSE_ENFORCE
+            and self._early_close_thread is None
+        ):
+            self._early_close_thread = threading.Thread(
+                target=self._early_close_worker,
+                name=f"early-close-{getattr(self.env, 'name', 'env')}",
+                daemon=True,
+            )
+            self._early_close_thread.start()
 
     def is_sealed(self) -> bool:
         """True once the collection deadline has expired (or a safety-valve
@@ -3452,6 +3480,217 @@ class GrpoWindowBatcher:
         with self._lock:
             return list(self._pending)
 
+    def _early_close_next_action_locked(
+        self,
+    ) -> tuple[str, PendingSubmission | None, int | None]:
+        """Next early-close step over the paying V_MAX tiers. Under ``_lock``.
+
+        Mirrors ``_prove_ranked``'s tier walk restricted to the V_MAX prefix
+        of the ranking (kept separate because ``_prove_ranked`` interleaves
+        row bookkeeping and budget mutation with the walk; the agreement of
+        the two walks is pinned by tests). Returns one of:
+        ``("prove", candidate, None)`` — next unproven paying member;
+        ``("close", None, boundary_round)`` — coverage proven, outcome frozen;
+        ``("wait", None, None)`` — nothing provable yet;
+        ``("exhausted", None, None)`` — window proof budget spent.
+        """
+        if (
+            self.early_close_proof_attempts
+            >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+            or self.early_close_proof_wall_seconds >= MAX_PROOF_WALL_SECONDS
+        ):
+            return "exhausted", None, None
+        pool = [
+            p for p in self._pending
+            if p.value == max_difficulty_value(
+                len(p.rewards), delta=DIFFICULTY_AUCTION_DELTA
+            )
+        ]
+        if not pool:
+            return "wait", None, None
+        pool.sort(
+            key=lambda p: (self._arrival_round_of(p)[0], _within_slot_key(p))
+        )
+        claimed: set[int] = set()
+        boundary_round: int | None = None
+        tier_round: int | None = None
+        claimed_before_tier: set[int] = set()
+        for p in pool:
+            arrival = self._arrival_round_of(p)[0]
+            if arrival != tier_round:
+                # Tier boundary: stop BEFORE a tier that cannot earn (the
+                # tier that crosses B_BATCH is walked in full — fair-split
+                # pays every one of its prompts).
+                if len(claimed) >= B_BATCH:
+                    break
+                tier_round = arrival
+                claimed_before_tier = set(claimed)
+            boundary_round = tier_round
+            if p.prompt_idx in claimed_before_tier:
+                continue          # same_prompt_superseded
+            if self._cooldown.is_in_cooldown(p.prompt_idx, self.window_start):
+                continue
+            if id(p) in self._early_proof_results:
+                if self._early_proof_results[id(p)] is not None:
+                    claimed.add(p.prompt_idx)
+                continue
+            operator = self._operator_by_hotkey.get(p.hotkey)
+            if operator is None and not self._operator_mapping_enforced:
+                operator = p.hotkey
+            if operator is None:
+                continue          # operator_unmapped
+            if (
+                self.operator_proof_failure_debt(operator)
+                >= MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW
+            ):
+                continue
+            if (
+                self.proof_failure_debt(p.hotkey)
+                >= MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
+            ):
+                continue
+            return "prove", p, None
+        if len(claimed) >= B_BATCH:
+            return "close", None, boundary_round
+        return "wait", None, None
+
+    def _current_round(self) -> int | None:
+        """Wall-clock drand round, for the same-round close guard. ``None``
+        (mock mode / drand outage) fails safe: the close never fires and the
+        collection deadline seals as today."""
+        if self._current_round_fn is not None:
+            try:
+                return self._current_round_fn()
+            except Exception:
+                return None
+        if not self.drand_round_check_enabled:
+            return None
+        try:
+            if self._drand_chain_info is None:
+                from reliquary.infrastructure.drand import get_current_chain
+                self._drand_chain_info = get_current_chain()
+            from reliquary.infrastructure.chain import (
+                compute_current_drand_round,
+            )
+            ci = self._drand_chain_info
+            return int(compute_current_drand_round(
+                self._wall_clock(), ci["genesis_time"], ci["period"],
+            ))
+        except Exception:
+            return None
+
+    def _try_early_close(self) -> bool:
+        """Seal now iff the auction outcome is proven frozen.
+
+        ``force_seal`` runs under ``_upload_precommit_lock`` so a racing
+        precommit either lands before the emptiness check (blocking the
+        close) or observes the seal flag inside ``try_register_upload_precommit``
+        and is rejected — no reservation can straddle the close. Queue
+        stragglers with earlier arrival stamps are covered downstream: the
+        seal drain admits them and ``_prove_ranked`` re-walks the full
+        population.
+        """
+        with self._lock:
+            action, _target, boundary_round = (
+                self._early_close_next_action_locked()
+            )
+        if action != "close":
+            return self._seal_flag.is_set()
+        current = self._current_round()
+        if (
+            current is None
+            or boundary_round is None
+            or current <= boundary_round
+        ):
+            return self._seal_flag.is_set()
+        if self.early_close_armed_round is None:
+            self.early_close_armed_round = current
+        now = self._time_fn()
+        with self._upload_precommit_lock:
+            if self._seal_flag.is_set():
+                return True
+            self._prune_upload_precommits_locked(now)
+            if self._upload_precommits:
+                return False
+            self.early_close_sealed_round = current
+            self.force_seal("proven_dominance_close")
+        return True
+
+    def _early_close_prove(self, pending: PendingSubmission) -> None:
+        """One serial mid-window proof; budgets and operator debt mirror the
+        ``_prove_ranked`` bookkeeping (hotkey debt is charged inside
+        ``_verify_expensive`` via ``_reject``, exactly as at seal)."""
+        started = self._time_fn()
+        try:
+            sub = self._verify_expensive(pending)
+        finally:
+            elapsed = max(0.0, self._time_fn() - started)
+            with self._lock:
+                self.early_close_proof_attempts += 1
+                self.early_close_proof_wall_seconds += elapsed
+        operator = self._operator_by_hotkey.get(pending.hotkey)
+        if operator is None and not self._operator_mapping_enforced:
+            operator = pending.hotkey
+        with self._lock:
+            self._early_proof_results[id(pending)] = sub
+            if sub is None:
+                self.early_close_proof_failures += 1
+        if sub is None and operator is not None:
+            with self._proof_admission_lock:
+                self._expensive_proof_failures_by_operator[operator] = (
+                    self._expensive_proof_failures_by_operator.get(operator, 0)
+                    + 1
+                )
+
+    def _early_close_step(self) -> str:
+        """One prover decision. Returns ``proved``, ``closed``, ``wait``
+        (nothing provable now, incl. a close blocked by the same-round or
+        precommit guard), ``exhausted`` or ``sealed``."""
+        if self._seal_flag.is_set():
+            return "sealed"
+        with self._lock:
+            action, target, _boundary = self._early_close_next_action_locked()
+        if action == "prove":
+            self._early_close_prove(target)
+            return "proved"
+        if action == "close" and self._try_early_close():
+            return "closed"
+        if action == "exhausted":
+            return "exhausted"
+        return "wait"
+
+    def _early_close_drain(self) -> str:
+        """Step until no immediate progress; the thread sleeps between drains."""
+        while True:
+            outcome = self._early_close_step()
+            if outcome != "proved":
+                return outcome
+
+    def _early_close_worker(self) -> None:
+        """Prove-and-close loop; any exception disables early close for the
+        window (the collection deadline is always the fallback seal)."""
+        try:
+            while True:
+                outcome = self._early_close_drain()
+                if outcome in ("closed", "sealed", "exhausted"):
+                    return
+                time.sleep(AUCTION_EARLY_CLOSE_POLL_SECONDS)
+                if self._seal_flag.is_set():
+                    return
+        except Exception:
+            logger.exception(
+                "early-close prover disabled for window %s", self.window_start,
+            )
+
+    def _arrival_round_of(self, pending: PendingSubmission) -> tuple[int, str]:
+        """Validator-observed arrival round; miner-submitted round is the
+        mock-mode fallback (production stamps every admitted request)."""
+        telemetry = getattr(pending, "telemetry", None)
+        arrival = getattr(telemetry, "arrival_drand_round", None)
+        if arrival is not None:
+            return int(arrival), "arrival"
+        return int(pending.drand_round), "submitted_fallback"
+
     def _prove_ranked(self, pool: float = 1.0) -> list[ValidSubmission]:
         """Prove candidates in (score, arrival) order until ``B_BATCH`` distinct
         prompts pass. Never prove a candidate that cannot earn.
@@ -3497,20 +3736,9 @@ class GrpoWindowBatcher:
             if operator is None and not self._operator_mapping_enforced:
                 operator = pending_submission.hotkey
             operator_by_id[id(pending_submission)] = operator
-            telemetry = getattr(pending_submission, "telemetry", None)
-            arrival = getattr(telemetry, "arrival_drand_round", None)
-            if arrival is not None:
-                arrival_by_id[id(pending_submission)] = int(arrival)
-                arrival_source_by_id[id(pending_submission)] = "arrival"
-            else:
-                # Mock / no-drand mode only: production stamps the arrival
-                # round on every admitted request.
-                arrival_by_id[id(pending_submission)] = int(
-                    pending_submission.drand_round
-                )
-                arrival_source_by_id[id(pending_submission)] = (
-                    "submitted_fallback"
-                )
+            arrival, source = self._arrival_round_of(pending_submission)
+            arrival_by_id[id(pending_submission)] = arrival
+            arrival_source_by_id[id(pending_submission)] = source
         ranked = sorted(
             scored,
             key=lambda item: (
@@ -3531,7 +3759,9 @@ class GrpoWindowBatcher:
             tier_by_id[id(pending_submission)] = len(tier_sizes) - 1
             tier_sizes[-1] += 1
 
-        attempts = 0
+        # Mid-window early-close proofs already spent part of this window's
+        # budget; the counters continue rather than reset.
+        attempts = self.early_close_proof_attempts
         proven: list[ValidSubmission] = []
         claimed: set[int] = set()
         attempted_ids: set[int] = set()
@@ -3561,6 +3791,7 @@ class GrpoWindowBatcher:
                 ],
                 "rank": rank,
                 "proof_attempted": False,
+                "proof_phase": None,
                 "proof_passed": None,
                 "selected": False,
                 "status": "ranked",
@@ -3597,6 +3828,27 @@ class GrpoWindowBatcher:
             if self._cooldown.is_in_cooldown(p.prompt_idx, self.window_start):
                 row["status"] = "cooldown"
                 continue
+            if id(p) in self._early_proof_results:
+                # Proven (or failed) mid-window by the early-close prover.
+                # Debt/budget gates were evaluated when the proof actually
+                # ran, so a cached result bypasses them — sequential
+                # semantics, never a second GPU pass, never double debt.
+                cached = self._early_proof_results[id(p)]
+                row["proof_attempted"] = True
+                row["proof_phase"] = "midwindow"
+                attempted_ids.add(id(p))
+                if cached is None:
+                    row["proof_passed"] = False
+                    row["status"] = "proof_failed"
+                    continue
+                row["proof_passed"] = True
+                row["selected"] = True
+                row["status"] = "selected"
+                proven.append(cached)
+                claimed.add(p.prompt_idx)
+                self._auction_tier_by_id[id(cached)] = tier
+                self.difficulty_auction_metadata_by_id[id(cached)] = row
+                continue
             operator = row["operator_id"]
             if operator is None:
                 row["status"] = "operator_unmapped"
@@ -3621,7 +3873,10 @@ class GrpoWindowBatcher:
                 )
                 stop_reason = "attempt_budget"
                 break
-            elapsed = self._time_fn() - self._proof_wall_started_at
+            elapsed = (
+                self._time_fn() - self._proof_wall_started_at
+                + self.early_close_proof_wall_seconds
+            )
             if elapsed >= MAX_PROOF_WALL_SECONDS:
                 self.proof_wall_exhausted = True
                 stop_reason = "wall_budget"
@@ -3647,6 +3902,7 @@ class GrpoWindowBatcher:
             attempts += 1
             attempted_ids.add(id(p))
             row["proof_attempted"] = True
+            row["proof_phase"] = "post_seal"
             row["status"] = "proof_started"
             sub = self._verify_expensive(p)
             if sub is None:
@@ -3965,6 +4221,12 @@ class GrpoWindowBatcher:
         self, pool: float = 1.0
     ) -> tuple[list[ValidSubmission], dict[str, float]]:
         """Finalize selection and release every retained payload reservation."""
+        # The early-close prover exits once the seal flag is set; the join
+        # only waits out an in-flight GPU proof, which then lands in the
+        # cache and is reused below instead of re-proven.
+        thread = self._early_close_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=60.0)
         try:
             return self._seal_batch_inner(pool)
         finally:
@@ -4050,6 +4312,21 @@ class GrpoWindowBatcher:
                     "proof_wall_seconds": self.proof_wall_elapsed_seconds,
                     "proof_wall_limit_seconds": MAX_PROOF_WALL_SECONDS,
                     "proof_wall_exhausted": self.proof_wall_exhausted,
+                    "early_close": (
+                        getattr(self, "force_seal_reason", None)
+                        == "proven_dominance_close"
+                    ),
+                    "early_close_armed_round": self.early_close_armed_round,
+                    "early_close_sealed_round": self.early_close_sealed_round,
+                    "midwindow_proof_attempts": (
+                        self.early_close_proof_attempts
+                    ),
+                    "midwindow_proof_failures": (
+                        self.early_close_proof_failures
+                    ),
+                    "midwindow_proof_wall_seconds": (
+                        self.early_close_proof_wall_seconds
+                    ),
                     "proven_winners": len(self._valid),
                     "operator_proof_failure_cap": (
                         MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW
