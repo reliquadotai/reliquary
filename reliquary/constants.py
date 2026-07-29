@@ -172,9 +172,10 @@ if not _math.isfinite(SHAPE_LEN_FRAC) or not 0.0 < SHAPE_LEN_FRAC <= 1.0:
 # and has no padding incentive (a rate; the cap kills beyond-cap padding). This
 # is a VALIDATOR-ONLY objective control — miners already attach drand_round and
 # completion_length, so it needs no miner change and can be toggled per validator.
-THROUGHPUT_TIEBREAK_ENABLED = (
-    _os.environ.get("RELIQUARY_THROUGHPUT_TIEBREAK", "0") not in ("0", "false", "False")
-)
+# Declared in code, not by environment — same reason as
+# CONSERVATIVE_TRUNCATION_VALUE: this decides how draws are RANKED, i.e. who
+# gets paid. Miners must be able to read the rule they are competing under.
+THROUGHPUT_TIEBREAK_ENABLED = False
 # Token cap for the throughput numerator. A submission is a GROUP of M_ROLLOUTS
 # rollouts and the numerator sums their generated tokens, so the cap is group-
 # scale: M_ROLLOUTS × 16000 useful tokens/rollout. Padding a rollout past ~16k
@@ -692,10 +693,13 @@ DIFFICULTY_AUCTION_DELTA = 1.0
 # MAX_TRUNCATED_PER_SUBMISSION be relaxed: groups that are rejected outright
 # today (earning zero) become admissible and earn a conservative value instead.
 # Auction/emission only — training keeps the real reward vector.
-CONSERVATIVE_TRUNCATION_VALUE = (
-    _os.environ.get("RELIQUARY_CONSERVATIVE_TRUNCATION_VALUE", "0")
-    not in ("0", "false", "False")
-)
+# Declared in code, not by environment: this decides HOW MUCH a submission is
+# worth, and a miner cannot read the validator's environment. An env-only
+# scoring rule is invisible to the people it prices — and it silently reverts on
+# a clean redeploy (see DRAND_ROUND_BACKWARD_TOLERANCE, which rejected honest
+# miners for exactly that reason). Turning this on is a one-line PR: reviewable,
+# versioned, announced.
+CONSERVATIVE_TRUNCATION_VALUE = False
 # The live proof budget currently caps each environment at 96 grading attempts.
 # Keep an independent ceiling so a future admission change cannot turn passive
 # telemetry into unbounded seal-time CPU or archive growth.
