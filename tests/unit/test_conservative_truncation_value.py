@@ -178,3 +178,23 @@ def test_truncation_allowance_is_per_env():
     by_env = C.MAX_TRUNCATED_PER_SUBMISSION_BY_ENV
     assert by_env.get("openmathinstruct", C.MAX_TRUNCATED_PER_SUBMISSION) == 1
     assert by_env["opencodeinstruct"] >= 2
+
+
+def test_collection_window_can_absorb_a_full_budget_generation():
+    """The collection deadline must track BFT_THINKING_BUDGET.
+
+    A miner generates its M_ROLLOUTS in one batch, so a group's generation time
+    is set by its LONGEST rollout — and with the 4B a long rollout lands in ~96%
+    of groups, so essentially every submission takes budget / per-seq-rate. If
+    the window is too short for that, honest miners are cut off precisely on the
+    hard prompts that reason longest. The live 2B fleet ran ~130 tok/s/seq and a
+    4B decodes roughly half as fast, so the window must clear ~65 tok/s/seq.
+    """
+    from reliquary import constants as C
+
+    required_rate = C.BFT_THINKING_BUDGET / C.WINDOW_COLLECTION_SECONDS
+    assert required_rate <= 65.0, (
+        f"window {C.WINDOW_COLLECTION_SECONDS}s demands "
+        f"{required_rate:.0f} tok/s/seq to generate {C.BFT_THINKING_BUDGET} "
+        "tokens; the expected 4B fleet rate is ~65 tok/s/seq"
+    )

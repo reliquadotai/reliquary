@@ -79,6 +79,22 @@ The 4B is different: at pass@1 0.68 it produces plenty of genuine correct answer
 - `BFT_THINKING_BUDGET`: 2048 → 16000.
 - New flag to **disable the forced-answer** and treat cap-hits as `bad_termination` (keep the old forced behavior behind a kill-switch for clean revert).
 
+### The collection deadline must track the budget (`WINDOW_COLLECTION_SECONDS` 100 → 300)
+
+A miner generates its 8 rollouts **in one batch**, so a group's generation time is set by its **longest** rollout, not its average. With the 4B, 34% of rollouts run to the budget — which puts a long rollout in **~96% of groups**. So essentially *every* submission takes `BFT_THINKING_BUDGET / per-sequence-rate` to produce:
+
+| window | required rate | verdict for a 4B fleet |
+|---|---|---|
+| 100 s (current stopgap) | 156 tok/s/seq | ❌ far out of reach |
+| 200 s | 78 tok/s/seq | ❌ still short |
+| **300 s** | **52 tok/s/seq** | ✅ clears with margin |
+
+The live **2B** fleet ran ~130 tok/s/seq; a 4B decodes roughly half as fast, so **~65 tok/s/seq** is the launch expectation. The 100 s value was a cadence stopgap sized for the old 2048 budget (its own comment still described a 300 s-era sizing). Leaving it would cut off honest miners **precisely on the hard prompts that reason longest** — the ones the auction exists to buy — and would select for fast hardware over useful work.
+
+**Cost:** cadence ~5.5 → ~8.8 min/window (10.9 → 6.8 steps/h). **The proper fix is early close** (seal as soon as the batch is provably full, `feat/auction-v2-proven-dominance-close`), which decouples the safety deadline from cadence: keep 300 s as the floor for slow-but-honest miners while still sealing early when everyone has submitted. Tighten back toward 200 s once live 4B throughput is known. A test asserts the window/budget coupling so a future budget bump cannot silently break the deadline.
+
+*Synergy:* the throughput tie-break (Part 3) rewards exactly the serving-speed investment that would let this window come back down.
+
 ### Token budget — one uniform ~16k ceiling (final)
 
 | tier | value | role |

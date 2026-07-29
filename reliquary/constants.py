@@ -372,10 +372,28 @@ SPARSE_VALID_MAX_WINDOW_SECONDS = 900.0
 # for exactly this many seconds and accepts everything valid, then seals on the
 # deadline (see ``GrpoWindowBatcher.poll_deadline``) instead of on the
 # 8-distinct count. Environments outside the auction retain the legacy seal.
-# Sized from live data (math gen median ~176s, p75 ~267s; windows already ran
-# ~277s of collection). An early seal would be the speed race we are removing —
-# whoever triggered it would cut off slow-but-hard submissions still generating.
-WINDOW_COLLECTION_SECONDS = 100.0
+# An early seal would be the speed race we are removing — whoever triggered it
+# would cut off slow-but-hard submissions still generating.
+#
+# THIS MUST TRACK BFT_THINKING_BUDGET. A miner generates its M_ROLLOUTS in one
+# batch, so a group's generation time is set by its LONGEST rollout, not its
+# average — and with the 4B, 34% of rollouts run to the budget, which puts a
+# long rollout in ~96% of groups. So essentially every submission takes
+# BFT_THINKING_BUDGET / per-sequence-rate to produce:
+#
+#   required rate = BFT_THINKING_BUDGET / WINDOW_COLLECTION_SECONDS
+#     100 s -> 156 tok/s/seq     200 s -> 78 tok/s/seq     300 s -> 52 tok/s/seq
+#
+# The live 2B fleet ran ~130 tok/s/seq; a 4B decodes roughly half as fast, so
+# ~65 tok/s/seq is the expectation at launch. 100 s (a cadence stopgap sized for
+# the old 2048 budget) and even 200 s would cut off honest miners — and would cut
+# them off precisely on the HARD prompts that reason longest, i.e. the ones the
+# auction exists to buy. 300 s clears the current fleet with margin.
+#
+# Cost: cadence ~5.5 -> ~8.8 min/window. The proper fix is early close (seal as
+# soon as the batch is provably full), which decouples the safety deadline from
+# cadence; tighten back toward 200 s once live 4B throughput is known.
+WINDOW_COLLECTION_SECONDS = 300.0
 
 # Difficulty-auction v2: number of ranked-pass non-winners proven per window
 # purely for the forensic auth gates (token-auth, distribution, forced-seed),
