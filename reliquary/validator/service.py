@@ -1522,6 +1522,8 @@ class ValidationService:
             ):
                 canonical_rank = None
 
+            from reliquary.validator.verifier import rewards_std
+
             try:
                 self.server.record_verdict(
                     pending.hotkey,
@@ -1535,6 +1537,7 @@ class ValidationService:
                     accepted_into_pool=True,
                     selected_for_batch=selected,
                     rewarded=selected,
+                    sigma=rewards_std(list(pending.rewards or ())),
                 )
                 log_structured(
                     logger,

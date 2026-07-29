@@ -358,6 +358,11 @@ class Verdict(BaseModel):
     # Optional observability fields. Older verdict records omit these; the
     # endpoint excludes nulls so legacy consumers keep seeing the compact shape
     # for entries that lack lifecycle metadata.
+    # Group reward std — the same value the sigma gate compares against
+    # SIGMA_MIN, and the `std` factor of the auction value std·(1-mean)^delta.
+    # Without it a miner can see that a submission lost but not that its own
+    # rollouts were too uniform to be worth anything.
+    sigma: float | None = None
     arrival_ts: float | None = None
     decision_ts: float | None = None
     submitted_drand_round: int | None = None

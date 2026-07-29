@@ -439,3 +439,47 @@ def test_auction_seal_publishes_selected_loser_and_proof_failure() -> None:
     assert failed["selected_for_batch"] is False
     assert failed["rewarded"] is False
     assert failed["reject_stage"] == "auction_seal"
+
+
+def test_verdict_carries_sigma_and_stays_backward_compatible():
+    """Sigma is what decides a submission's fate — it is the σ-gate's comparand
+    and the `std` factor of the auction value — so a miner should be able to see
+    it. Older records omit it, and null fields are excluded from the response,
+    so the legacy shape is unchanged for them."""
+    from reliquary.protocol.submission import Verdict
+    from reliquary.validator.verifier import rewards_std
+
+    root = "a" * 64
+    legacy = Verdict(merkle_root=root, accepted=True, reason="accepted", ts=1.0)
+    assert legacy.sigma is None
+    assert "sigma" not in legacy.model_dump(exclude_none=True)
+
+    rewards = [1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+    with_sigma = Verdict(
+        merkle_root=root, accepted=True, reason="accepted", ts=1.0,
+        sigma=rewards_std(rewards),
+    )
+    assert with_sigma.sigma == pytest.approx(rewards_std(rewards))
+    assert "sigma" in with_sigma.model_dump(exclude_none=True)
+
+
+def test_record_verdict_stores_and_serves_sigma() -> None:
+    """End-to-end: recorded on the server ring and served by the endpoint."""
+    server, client = _make_server_open()
+    server.record_verdict(
+        "hk", "b" * 64, True, "accepted", window_n=1, sigma=0.4841,
+    )
+
+    body = client.get("/verdicts/hk").json()
+
+    assert body["verdicts"][-1]["sigma"] == pytest.approx(0.4841)
+
+
+def test_verdict_without_sigma_omits_the_field() -> None:
+    """Legacy/compact shape is unchanged when sigma was never recorded."""
+    server, client = _make_server_open()
+    server.record_verdict("hk", "c" * 64, True, "accepted", window_n=1)
+
+    body = client.get("/verdicts/hk").json()
+
+    assert "sigma" not in body["verdicts"][-1]

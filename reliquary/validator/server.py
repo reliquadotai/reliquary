@@ -1254,6 +1254,7 @@ class ValidatorServer:
         accepted_into_pool: bool | None = None,
         selected_for_batch: bool | None = None,
         rewarded: bool | None = None,
+        sigma: float | None = None,
     ) -> None:
         """Record a per-submission verdict for ``/verdicts/{hotkey}``.
 
@@ -1306,6 +1307,8 @@ class ValidatorServer:
             entry["selected_for_batch"] = selected_for_batch
         if rewarded is not None:
             entry["rewarded"] = rewarded
+        if sigma is not None:
+            entry["sigma"] = float(sigma)
         self._verdicts[hotkey].append(entry)
 
     def _current_drand_round_best_effort(self) -> int | None:
