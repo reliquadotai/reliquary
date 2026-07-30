@@ -232,7 +232,8 @@ constants are explained from the miner's perspective in
 | `T_PROTO` | 0.6 | Protocol-fixed sampling temperature (validator's recompute uses this) |
 | `FORCED_SEED_PROTOCOL_VERSION` | 2 | Mandatory hotkey-free forced stream while enforcement is active |
 | `WINDOW_COLLECTION_SECONDS` | 100 | Fixed collection interval for both Math and Code auction populations |
-| `MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW` | 64 (v2), 16 (v3) | Started grading/proof ceiling per environment/window |
+| `MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW` | 64 | Started admission-grading ceiling per environment/window |
+| `MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW` | 64 (v2), 16 (v3) | Ranked seal-time GPU proof ceiling per environment/window |
 | `MAX_PROOF_WALL_SECONDS` | 240 | Seal-time proof wall-clock ceiling per environment |
 | `MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW` | 4 | Operator-wide seal GPU debt limit per environment |
 | `MAX_SUBMISSION_PAYLOAD_BYTES` | 64 MiB | Per-request parsed JSON payload limit |

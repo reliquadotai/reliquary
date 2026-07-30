@@ -26,6 +26,9 @@ The final v3 design is:
   lottery third.
 - At most eight distinct, proven, uniformly paid winners per environment.
   `rewarded` must equal `selected_for_batch`.
+- Admission retains 64 started grading jobs per environment; only the ranked
+  seal-time GRAIL prefix is capped at 16, followed by two independent forensic
+  proofs. Forged commitments cannot reduce admission to a two-hotkey ceiling.
 - Math BFT-forced rows stay in economic scoring and the group baseline but are
   masked from PPO and KL loss. Code truncations remain in the loss until an
   adversarial ablation justifies masking them.
@@ -67,9 +70,10 @@ identity are serialized until the earlier result is applied.
 
 Winner plans have priority over observational forensics. The scheduler starts
 only enough concurrent work to fill the remaining winner count. Sparse honest
-populations complete with empty slots burned. Deadline, device, attempt, or
-checkpoint-lifecycle exhaustion aborts the entire window before rewards,
-training, or checkpoint advancement; partial winner sets are never trained.
+populations and ranked prefixes exhausted by invalid miner proofs complete with
+empty slots burned. Infrastructure deadline, device, or checkpoint-lifecycle
+failures abort the entire window before rewards, training, or checkpoint
+advancement; capacity-truncated winner sets are never trained.
 Verifier exceptions and active CUDA calls that cross the proof deadline fault
 the proof plane, archive an aborted window, and terminate the validator for a
 supervisor restart. They are infrastructure failures and never accrue miner
@@ -87,16 +91,21 @@ Capacity is a release property, not a guessed environment variable. V3 refuses
 to start without a SHA-256-pinned manifest matching all of:
 
 - Protocol profile and base-model revision.
-- Exact full 40-character validator software revision.
+- Exact full 40-character validator software revision read from the image-baked
+  `/opt/reliquary/.build-revision` file.
 - Benchmark checkpoint revision and SHA-256 of the raw evidence file.
+- Exact runtime fingerprint hash, including Python, Torch, CUDA, attention
+  implementation, and installed Qwen3.5 kernel paths.
 - GPU hardware class, physical GPU UUID set, and exact fleet size.
 - Configured proof-wall duration.
 - All 16 possible ranked proof attempts plus two forensic proofs for both Math
   and Code.
 - Measured p95 end-to-end proof latency and 20% headroom.
-- At least 20 successful worst-case group proofs per environment, with all
-  eight completion lengths at or above 90% of that environment's protocol cap.
-- Every benchmark GPU exercised in both environments.
+- At least 20 successful worst-case group proofs per GPU per environment, with
+  all eight completion lengths at or above 90% of that environment's protocol
+  cap.
+- Per-device p95 measurements, with fleet sizing based on the slowest GPU p95
+  in each environment.
 
 For p95 group-proof latencies `M` and `C`, the minimum homogeneous device count
 under the current 240-second wall is:
@@ -132,6 +141,7 @@ python scripts/qualify_proof_capacity.py staging-proofs.jsonl \
   --output proof-capacity.json \
   --software-revision <full-release-commit> \
   --checkpoint-revision <full-benchmark-checkpoint-commit> \
+  --runtime-fingerprint-hash <health-runtime-profile-hash> \
   --hardware-class "NVIDIA H100 80GB HBM3" \
   --benchmark-device-count <count> \
   --measured-at 2026-07-31T00:00:00Z
@@ -140,12 +150,12 @@ python scripts/qualify_proof_capacity.py staging-proofs.jsonl \
 Each JSONL row has the form:
 
 ```json
-{"environment":"openmathinstruct","seconds":61.2,"proof_passed":true,"profile_id":"qwen35-4b-auction-v3","model_revision":"851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a","software_revision":"0123456789abcdef0123456789abcdef01234567","checkpoint_revision":"89abcdef0123456789abcdef0123456789abcdef","hardware_class":"NVIDIA H100 80GB HBM3","device_uuid":"GPU-EXAMPLE","rollout_count":8,"completion_token_lengths":[14746,14746,14746,14746,14746,14746,14746,14746]}
+{"environment":"openmathinstruct","seconds":61.2,"proof_passed":true,"profile_id":"qwen35-4b-auction-v3","model_revision":"851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a","software_revision":"0123456789abcdef0123456789abcdef01234567","checkpoint_revision":"89abcdef0123456789abcdef0123456789abcdef","runtime_fingerprint_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","hardware_class":"NVIDIA H100 80GB HBM3","device_uuid":"GPU-EXAMPLE","rollout_count":8,"completion_token_lengths":[14746,14746,14746,14746,14746,14746,14746,14746]}
 ```
 
 Math samples require every completion to contain at least 14,746 tokens; Code
-requires at least 29,492. Use at least 20 samples per environment and exercise
-every manifest GPU in each environment. Synthetic single-sequence forwards,
+requires at least 29,492. Use at least 20 samples on every manifest GPU in each
+environment. Synthetic single-sequence forwards,
 failed proofs, partial groups, extrapolation from 2B windows, and evidence from
 a different release SHA are rejected.
 
@@ -197,13 +207,18 @@ bare `cuda` and a merely larger unbenchmarked fleet fail closed. Under v2 this
 environment variable is ignored so a stale deployment value cannot activate
 the scheduler accidentally. Keep drand backward tolerance at zero.
 
+V3 rejects any other `RELIQUARY_CHECKPOINT`, a local-path resume, or a capacity
+manifest whose checkpoint SHA differs from `RELIQUARY_RESUME_FROM`. The stamped
+checkpoint lineage is validated again after loading, before replicas can run.
+
 Before opening to miners, require:
 
 1. `/state` advertises protocol 3, the v3 profile and contract, and the stamped
    4B checkpoint revision.
 2. `/health.proof_scheduler.state == "running"`.
-3. Capacity qualification reports `qualified=true`, 18 proofs per environment,
-   and an exact runtime UUID/count match.
+3. Capacity qualification schema 3 reports `qualified=true`, 18 proofs per
+   environment, worst-device p95, and exact build/checkpoint/runtime/UUID
+   matches.
 4. Every proof device reports the active checkpoint revision.
 5. A loaded staging window completes both environments with eight winners,
    two forensic samples, no partial payout, no capacity abort, and no pending
