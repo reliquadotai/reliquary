@@ -2,6 +2,11 @@
 
 **Date:** 2026-07-28 (run on a rented H100 80GB; base **Qwen3.5-4B**, real branch params)
 
+> Historical experiment record. Several conclusions below were superseded by
+> production-path measurements and the final scheduler/capacity design. Use
+> [docs/4b-auction-v3-production-runbook.md](docs/4b-auction-v3-production-runbook.md)
+> for merge and deployment decisions.
+
 ## Verdict: the branch code is correct and tested, but it is **NOT deploy-ready** — two operational blockers the 4B+16k surfaces must be resolved first.
 
 | | result | merge impact |

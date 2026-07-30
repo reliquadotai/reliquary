@@ -1,8 +1,13 @@
-# Design: migrate to Qwen3.5-4B — 16k budget cap + throughput-based draw tie-break
+# Historical Research: Qwen3.5-4B Migration
 
 **Date:** 2026-07-23
-**Status:** proposal (backed by GPU behavior study, this doc's appendix)
+**Status:** superseded by the final production design
 **Author:** training/incentives
+
+> This file preserves the experiments and proposal history. Its throughput
+> ranking, speculative early-close, clean-cap, and rollout instructions are not
+> the final design. The authoritative decision and activation procedure are in
+> [docs/4b-auction-v3-production-runbook.md](docs/4b-auction-v3-production-runbook.md).
 
 ## Summary
 

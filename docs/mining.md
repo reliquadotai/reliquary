@@ -16,6 +16,12 @@ Operational guide for running a miner on Bittensor subnet 81. For conceptual bac
 
 The boot query ensures a miner joining an already-running subnet lands directly on the current model, skipping an initial reject cycle.
 
+`/state.generation_profile_id` and `/state.generation_contract` are
+authoritative. Current production uses `qwen35-2b-auction-v2`. The dormant 4B
+profile is a protocol-v3 hard cutover, not an optional local max-token change:
+the reference miner refuses to generate unless its active profile exactly
+matches the validator contract.
+
 ## What a miner does (auction v2)
 
 Math and Code each collect submissions for a fixed 100-second interval. The

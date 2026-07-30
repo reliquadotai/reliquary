@@ -147,28 +147,22 @@ BFT_FORCE_TEMPLATE = "</think>\n\nFinal Answer: \\boxed{"
 BFT_FORCE_ANSWER = bool(
     _MATH_BFT_PROFILE and _MATH_BFT_PROFILE.force_answer
 )
-# DAPO-style overlong filtering. A rollout whose ending is a BUDGET ARTEFACT
-# rather than the model's own choice is masked out of the policy update: no PPO
-# and no KL, and its forward is skipped entirely. Two shapes qualify:
-#   * math — BFT fired, so the answer is an injected force-template guess;
-#   * code — the rollout ran to the cap without emitting EOS, so there is no
-#     usable code block.
-# Both grade ~0, so both hand the gradient a negative advantage and teach the
-# model that generating long gets punished. That is precisely how the first 2B
-# run learned to SHORTEN its math reasoning instead of improving it, and the same
-# mechanism applies to code at the measured ~10% truncation rate. DAPO's overlong
-# filtering targets the truncated case literally; covering both is what makes
-# this faithful rather than half-applied.
+# DAPO-style overlong filtering. A Math rollout whose ending is a BFT budget
+# artefact rather than the model's own choice is masked out of the policy
+# update: no PPO or KL, and its forward is skipped entirely. V3 enables this for
+# Math. Code truncation is a miner-influenceable event, so it remains in the
+# loss until an adversarial ablation shows masking cannot reward deliberate
+# non-termination.
 #
 # Masked rollouts STAY in the group mean/std (baseline unchanged, DAPO Eq. 9) and
 # in the sigma gate / auction / emission — the economic layer keeps scoring them,
 # so a miner cannot dodge a wrong answer by not terminating. Because the zeros
 # stay in the mean, the surviving terminated-and-correct rollouts get LARGER
 # advantages: the pressure is toward finishing correctly, not toward rambling.
-# Validator-only TRAINING control — no miner/wire change. Default off so the
-# branch stays inert on merge. Whether a rollout is masked is read from its
-# metadata via training._is_masked_from_loss, NEVER inferred from an advantage of
-# 0.0 (a legitimate advantage is exactly 0 when a reward equals its group mean).
+# Validator-only TRAINING controls — no miner/wire change. The aggregate flag
+# remains an explicit experiment switch for both environments. Whether a rollout
+# is masked is read from validator metadata via training._is_masked_from_loss,
+# never inferred from an advantage of 0.0.
 MASK_BUDGET_ENDED_FROM_LOSS = (
     _os.environ.get("RELIQUARY_MASK_BUDGET_ENDED_FROM_LOSS", "0")
     not in ("0", "false", "False")
