@@ -164,7 +164,7 @@ def test_microbatch_normalizes_protocol_full_sequence_logprobs():
 # ---------------------------------------------------------------------------
 
 def test_masked_rollout_skipped_from_microbatch_forward(monkeypatch):
-    monkeypatch.setattr("reliquary.constants.BFT_MASK_FORCED_FROM_LOSS", True)
+    monkeypatch.setattr("reliquary.constants.MASK_BUDGET_ENDED_FROM_LOSS", True)
     real = _build_rollout([1, 2, 3, 4, 5, 6], 1.0, 2)
     masked = _build_rollout([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.0, 2)  # the "16k" analogue
     masked.commit["rollout"]["forced"] = True
@@ -188,7 +188,7 @@ def test_natural_zero_advantage_rollout_is_still_forwarded():
 
 def test_masked_forced_rollout_masked_and_skipped_end_to_end(monkeypatch):
     monkeypatch.setattr("reliquary.constants.SHAPE_PENALTY", 0.0)
-    monkeypatch.setattr("reliquary.constants.BFT_MASK_FORCED_FROM_LOSS", True)
+    monkeypatch.setattr("reliquary.constants.MASK_BUDGET_ENDED_FROM_LOSS", True)
     correct = _build_rollout([1, 2, 3, 4, 5], 1.0, 2)
     wrong = _build_rollout([1, 2, 3, 6, 7], 0.0, 2)             # wrong, terminated
     forced = _build_rollout([1, 2, 3, 8, 9, 10, 11], 0.0, 2)    # wrong, forced (long/masked)
@@ -206,7 +206,7 @@ def test_masked_rollout_excluded_from_Ne(monkeypatch):
     # N_e must drop the masked rollout's tokens; same group with vs without the
     # would-be-masked forced rollout yields the same per-token scale.
     monkeypatch.setattr("reliquary.constants.SHAPE_PENALTY", 0.0)
-    monkeypatch.setattr("reliquary.constants.BFT_MASK_FORCED_FROM_LOSS", True)
+    monkeypatch.setattr("reliquary.constants.MASK_BUDGET_ENDED_FROM_LOSS", True)
 
     def grp(with_forced):
         rs = [_build_rollout([1, 2, 3, 4, 5], 1.0, 2),
@@ -332,7 +332,7 @@ def test_microbatch_behavior_recompute_is_claim_invariant():
 def test_batched_grads_mask_bft_force_span_like_per_rollout(monkeypatch):
     # Flag off (default): the forced rollout still trains, with its force span
     # masked at token level — the batched path must match per-rollout.
-    monkeypatch.setattr("reliquary.constants.BFT_MASK_FORCED_FROM_LOSS", False)
+    monkeypatch.setattr("reliquary.constants.MASK_BUDGET_ENDED_FROM_LOSS", False)
     import copy
 
     torch.manual_seed(3)

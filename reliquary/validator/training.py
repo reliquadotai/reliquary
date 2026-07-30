@@ -159,25 +159,33 @@ def _compute_advantages(rewards: list[float]) -> list[float]:
 
 def _is_masked_from_loss(rollout) -> bool:
     """Whether this rollout is masked out of the policy update (DAPO overlong
-    filtering): a forced (BFT-hit) rollout's answer is a budget artefact, not the
-    model's reasoning, so it contributes no PPO or KL gradient and its forward is
-    skipped entirely (which is also what keeps a 16k forced rollout from blowing
-    the training memory budget).
+    filtering). Its ending is a BUDGET ARTEFACT, not the model's choice, so it
+    contributes no PPO or KL gradient and its forward is skipped entirely. Two
+    shapes qualify:
+
+      * ``forced``   — math: BFT fired, the answer is an injected guess;
+      * ``truncated`` — code: ran to the cap without EOS, so no usable code block.
+
+    Both grade ~0 and therefore hand the gradient a negative advantage that
+    teaches "generating long is punished" — the exact mechanism by which the
+    first 2B run learned to shorten its math reasoning. Masking only the forced
+    case would leave that pathology in place for code, where truncation runs at
+    ~10%.
 
     Read from the rollout's validator-set metadata, NEVER inferred from its
     advantage being 0.0: a legitimate advantage is exactly 0 whenever a reward
     equals its group mean (common with fractional code rewards), and skipping
     those would silently drop their KL term and skew the N_e normalisation.
 
-    Gated on ``BFT_MASK_FORCED_FROM_LOSS`` (default off), so with the flag unset
+    Gated on ``MASK_BUDGET_ENDED_FROM_LOSS`` (default off), so with the flag unset
     nothing is masked and the training path is unchanged.
     """
-    from reliquary.constants import BFT_MASK_FORCED_FROM_LOSS
+    from reliquary.constants import MASK_BUDGET_ENDED_FROM_LOSS
 
-    if not BFT_MASK_FORCED_FROM_LOSS:
+    if not MASK_BUDGET_ENDED_FROM_LOSS:
         return False
     meta = (getattr(rollout, "commit", None) or {}).get("rollout", {}) or {}
-    return bool(meta.get("forced"))
+    return bool(meta.get("forced")) or bool(meta.get("truncated"))
 
 
 def _shape_advantages(rollouts, advantages):
@@ -190,7 +198,7 @@ def _shape_advantages(rollouts, advantages):
     schema-checked, forced/truncated validator-set). SHAPE_PENALTY == 0 disables
     it.
 
-    Separately, when ``BFT_MASK_FORCED_FROM_LOSS`` is set, a forced (BFT-hit)
+    Separately, when ``MASK_BUDGET_ENDED_FROM_LOSS`` is set, a forced (BFT-hit)
     rollout's advantage is zeroed — masked from the policy update so the model
     is not taught to shorten its reasoning to dodge the forced-answer penalty.
     Independent of SHAPE_PENALTY. The group mean/std (computed in
@@ -200,22 +208,23 @@ def _shape_advantages(rollouts, advantages):
     zero — a legitimate advantage is exactly 0 whenever a reward equals its group
     mean."""
     from reliquary.constants import (
-        BFT_MASK_FORCED_FROM_LOSS,
+        MASK_BUDGET_ENDED_FROM_LOSS,
         BFT_THINKING_BUDGET,
         SHAPE_LEN_FRAC,
         SHAPE_PENALTY,
     )
 
-    if SHAPE_PENALTY <= 0 and not BFT_MASK_FORCED_FROM_LOSS:
+    if SHAPE_PENALTY <= 0 and not MASK_BUDGET_ENDED_FROM_LOSS:
         return advantages
     early_cap = SHAPE_LEN_FRAC * BFT_THINKING_BUDGET
     shaped = list(advantages)
     for i, r in enumerate(rollouts):
         meta = (getattr(r, "commit", None) or {}).get("rollout", {}) or {}
+        if _is_masked_from_loss(r):
+            shaped[i] = 0.0                     # masked from the loss (DAPO)
+            continue                            # and never length-shaped
         if meta.get("forced"):
-            if _is_masked_from_loss(r):
-                shaped[i] = 0.0                 # masked from the loss (DAPO)
-            continue                            # never length-shaped either way
+            continue                            # legacy: forced not length-shaped
         if SHAPE_PENALTY <= 0:
             continue                            # length shaping off
         if meta.get("truncated"):

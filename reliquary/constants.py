@@ -117,23 +117,30 @@ BFT_FORCE_TEMPLATE = "</think>\n\nFinal Answer: \\boxed{"
 # 16k first (contract-consistent), then flip this to False once miners ship it.
 # WIRE-AFFECTING — flipping requires a coordinated miner+validator deploy.
 BFT_FORCE_ANSWER = True
-# DAPO-style overlong filtering, adapted to our economic layer. First-run BFT
-# taught the model to SHORTEN its math reasoning: hitting the budget forces a
-# (usually wrong) answer → negative advantage → the gradient learns "avoid
-# generating long". DAPO fixes the analogous truncation case by masking the loss
-# of overlong samples while keeping them in the group mean/std. When this is set
-# a FORCED rollout is masked out of the policy update entirely — no PPO and no
-# KL, and its forward is skipped (which is also what keeps a 16k forced rollout
-# from blowing the training memory budget) — while it STAYS in the group mean/std
-# (baseline unchanged, exactly DAPO Eq. 9) AND in the σ-gate/auction/emission
-# (the economic layer keeps scoring it, so a miner cannot dodge a wrong answer by
-# not terminating). Validator-only TRAINING control — no miner/wire change.
-# Default off so the branch stays inert on merge; whether a rollout is masked is
-# read from its metadata via training._is_masked_from_loss, NEVER inferred from
-# an advantage of 0.0 (a legitimate advantage is exactly 0 when a reward equals
-# its group mean).
-BFT_MASK_FORCED_FROM_LOSS = (
-    _os.environ.get("RELIQUARY_BFT_MASK_FORCED_FROM_LOSS", "0")
+# DAPO-style overlong filtering. A rollout whose ending is a BUDGET ARTEFACT
+# rather than the model's own choice is masked out of the policy update: no PPO
+# and no KL, and its forward is skipped entirely. Two shapes qualify:
+#   * math — BFT fired, so the answer is an injected force-template guess;
+#   * code — the rollout ran to the cap without emitting EOS, so there is no
+#     usable code block.
+# Both grade ~0, so both hand the gradient a negative advantage and teach the
+# model that generating long gets punished. That is precisely how the first 2B
+# run learned to SHORTEN its math reasoning instead of improving it, and the same
+# mechanism applies to code at the measured ~10% truncation rate. DAPO's overlong
+# filtering targets the truncated case literally; covering both is what makes
+# this faithful rather than half-applied.
+#
+# Masked rollouts STAY in the group mean/std (baseline unchanged, DAPO Eq. 9) and
+# in the sigma gate / auction / emission — the economic layer keeps scoring them,
+# so a miner cannot dodge a wrong answer by not terminating. Because the zeros
+# stay in the mean, the surviving terminated-and-correct rollouts get LARGER
+# advantages: the pressure is toward finishing correctly, not toward rambling.
+# Validator-only TRAINING control — no miner/wire change. Default off so the
+# branch stays inert on merge. Whether a rollout is masked is read from its
+# metadata via training._is_masked_from_loss, NEVER inferred from an advantage of
+# 0.0 (a legitimate advantage is exactly 0 when a reward equals its group mean).
+MASK_BUDGET_ENDED_FROM_LOSS = (
+    _os.environ.get("RELIQUARY_MASK_BUDGET_ENDED_FROM_LOSS", "0")
     not in ("0", "false", "False")
 )
 # The global cap must leave room for a forced completion (thinking + force-span +
