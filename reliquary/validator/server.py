@@ -37,7 +37,6 @@ import uvicorn
 
 from reliquary.constants import (
     B_BATCH,
-    BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION,
     DRAND_ROUND_BACKWARD_TOLERANCE,
     DIFFICULTY_AUCTION_DELTA,
     DIFFICULTY_AUCTION_ENFORCE,
@@ -67,7 +66,6 @@ from reliquary.constants import (
     MAX_SUBMISSION_PAYLOAD_BYTES,
     MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
     MAX_SUBMISSIONS_PER_PROMPT,
-    MAX_TRUNCATED_PER_SUBMISSION,
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
     REGISTERED_HOTKEY_STALE_GRACE_SECONDS,
     SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS,
@@ -79,6 +77,11 @@ from reliquary.constants import (
     CODE_ADMISSION_WALL_SECONDS,
     ADMISSION_PROCESS_MAX_TASKS,
     MATH_ADMISSION_WALL_SECONDS,
+    PROTOCOL_GENERATION_CONTRACT,
+    PROTOCOL_PROFILE_ID,
+    PROTOCOL_VERSION,
+    max_new_tokens_for_environment,
+    max_truncated_for_environment,
 )
 from reliquary.environment.virtual_parquet import PromptSourceUnavailable
 from reliquary.infrastructure.process_health import collect_process_health
@@ -209,6 +212,28 @@ def _is_mock_like(value: Any) -> bool:
     when the object is clearly a mock.
     """
     return type(value).__module__.startswith("unittest.mock")
+
+
+def _protocol_contract_reject_reason(
+    *,
+    protocol_version: int,
+    generation_profile_id: str,
+    checkpoint_bound: bool,
+) -> RejectReason | None:
+    if not FORCED_SEED_ENFORCE or not checkpoint_bound:
+        return None
+    if protocol_version != FORCED_SEED_PROTOCOL_VERSION:
+        return (
+            RejectReason.PROTOCOL_MISMATCH
+            if PROTOCOL_VERSION >= 3
+            else RejectReason.SEED_MISMATCH
+        )
+    if (
+        PROTOCOL_VERSION >= 3
+        and generation_profile_id != PROTOCOL_PROFILE_ID
+    ):
+        return RejectReason.GENERATION_CONTRACT_MISMATCH
+    return None
 
 
 class _SubmissionBodyLimitMiddleware:
@@ -449,6 +474,7 @@ def _proof_free_submission_reject(
             local_seen.add(rollout_hash)
 
     env = getattr(batcher, "env", None)
+    environment = str(getattr(env, "name", ""))
     validator_scored_reward = bool(
         getattr(env, "validator_authoritative_reward", False)
     )
@@ -465,11 +491,11 @@ def _proof_free_submission_reject(
     if not eos_set:
         return None, None
 
-    max_truncated_per_submission = (
-        BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION
-        if _proof_free_bootstrap(batcher)
-        else MAX_TRUNCATED_PER_SUBMISSION
+    max_truncated_per_submission = max_truncated_for_environment(
+        environment,
+        bootstrap=_proof_free_bootstrap(batcher),
     )
+    protocol_cap = max_new_tokens_for_environment(environment)
     truncated_count = 0
     validate_forced_span = _proof_free_force_span_validator(batcher)
 
@@ -517,7 +543,7 @@ def _proof_free_submission_reject(
             env_name=rollout.env_name,
         ):
             continue
-        if total_length < MAX_NEW_TOKENS_PROTOCOL_CAP:
+        if total_length < protocol_cap:
             return RejectReason.BAD_TERMINATION, "termination_preflight"
 
         truncated_count += 1
@@ -531,6 +557,11 @@ class _Health(BaseModel):
     status: str
     active_window: int | None
     image_revision: str | None = None
+    protocol_version: int = PROTOCOL_VERSION
+    generation_profile_id: str = PROTOCOL_PROFILE_ID
+    generation_contract: dict[str, Any] = Field(
+        default_factory=lambda: dict(PROTOCOL_GENERATION_CONTRACT)
+    )
     runtime_fingerprint: dict[str, Any] = Field(default_factory=dict)
     chain_client_fingerprint: dict[str, str | None] = Field(
         default_factory=dict
@@ -1686,6 +1717,9 @@ class ValidatorServer:
             status=health_status,
             active_window=batcher.window_start if batcher else None,
             image_revision=self._image_revision,
+            protocol_version=PROTOCOL_VERSION,
+            generation_profile_id=PROTOCOL_PROFILE_ID,
+            generation_contract=dict(PROTOCOL_GENERATION_CONTRACT),
             runtime_fingerprint=dict(self._runtime_fingerprint),
             chain_client_fingerprint=dict(self._chain_client_fingerprint),
             app_started_at=self._app_started_at,
@@ -2865,12 +2899,13 @@ class ValidatorServer:
                 and request.checkpoint_hash != batcher.current_checkpoint_hash
             ):
                 return reject(RejectReason.WRONG_CHECKPOINT)
-            if (
-                FORCED_SEED_ENFORCE
-                and bool(batcher.current_checkpoint_hash)
-                and request.protocol_version != FORCED_SEED_PROTOCOL_VERSION
-            ):
-                return reject(RejectReason.SEED_MISMATCH)
+            protocol_reject = _protocol_contract_reject_reason(
+                protocol_version=request.protocol_version,
+                generation_profile_id=request.generation_profile_id,
+                checkpoint_bound=bool(batcher.current_checkpoint_hash),
+            )
+            if protocol_reject is not None:
+                return reject(protocol_reject)
             precommit_signature_valid = await asyncio.to_thread(
                 verify_precommit_signature,
                 miner_hotkey=request.miner_hotkey,
@@ -3437,16 +3472,23 @@ class ValidatorServer:
                         reject_stage="upload_precommit",
                     )
 
-            if (
-                FORCED_SEED_ENFORCE
-                and bool(getattr(batcher, "current_checkpoint_hash", ""))
-                and request.protocol_version != FORCED_SEED_PROTOCOL_VERSION
-            ):
+            protocol_reject = _protocol_contract_reject_reason(
+                protocol_version=request.protocol_version,
+                generation_profile_id=request.generation_profile_id,
+                checkpoint_bound=bool(
+                    getattr(batcher, "current_checkpoint_hash", "")
+                ),
+            )
+            if protocol_reject is not None:
                 return _reject_before_quota(
-                    RejectReason.SEED_MISMATCH,
-                    reject_stage="forced_seed_protocol",
+                    protocol_reject,
+                    reject_stage="protocol_contract",
                     submitted_protocol_version=request.protocol_version,
                     required_protocol_version=FORCED_SEED_PROTOCOL_VERSION,
+                    submitted_generation_profile_id=(
+                        request.generation_profile_id
+                    ),
+                    required_generation_profile_id=PROTOCOL_PROFILE_ID,
                 )
 
             legacy_merkle_status = await asyncio.to_thread(
@@ -3962,7 +4004,19 @@ class ValidatorServer:
                 )
             )
 
-        @app.get("/state", response_model=GrpoBatchState)
+        @app.get(
+            "/state",
+            response_model=GrpoBatchState,
+            response_model_exclude=(
+                {
+                    "protocol_version",
+                    "generation_profile_id",
+                    "generation_contract",
+                }
+                if PROTOCOL_VERSION < 3
+                else None
+            ),
+        )
         async def state(env: str | None = None) -> GrpoBatchState:
             """Current window + checkpoint state. Lock-free: reads only the
             batcher's snapshot fields (set at construction) and the atomic
@@ -4003,6 +4057,17 @@ class ValidatorServer:
                 checkpoint_n=cp.checkpoint_n if cp else 0,
                 checkpoint_repo_id=cp.repo_id if cp else None,
                 checkpoint_revision=cp.revision if cp else None,
+                protocol_version=(
+                    PROTOCOL_VERSION if PROTOCOL_VERSION >= 3 else None
+                ),
+                generation_profile_id=(
+                    PROTOCOL_PROFILE_ID if PROTOCOL_VERSION >= 3 else None
+                ),
+                generation_contract=(
+                    dict(PROTOCOL_GENERATION_CONTRACT)
+                    if PROTOCOL_VERSION >= 3
+                    else None
+                ),
                 randomness=batcher.randomness,
             )
 

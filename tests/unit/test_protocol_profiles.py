@@ -1,5 +1,8 @@
 import importlib
 import json
+import os
+import subprocess
+import sys
 from dataclasses import FrozenInstanceError, is_dataclass
 
 import pytest
@@ -167,3 +170,64 @@ def test_profiles_are_frozen_slotted_and_recursively_immutable():
         profile.environments["new"] = math
     with pytest.raises(TypeError):
         profiles.PROFILES["new"] = profile
+
+
+@pytest.mark.parametrize(
+    "profile_id,expected",
+    [
+        (
+            "qwen35-2b-auction-v2",
+            {
+                "version": 2,
+                "math_cap": 32768,
+                "code_cap": 32768,
+                "thinking": 2048,
+                "window": 100.0,
+                "domain": "reliquary-forced-seed-v2",
+                "lr": 5e-6,
+                "kl": 0.04,
+                "mask_math": False,
+            },
+        ),
+        (
+            "qwen35-4b-auction-v3",
+            {
+                "version": 3,
+                "math_cap": 16384,
+                "code_cap": 32768,
+                "thinking": 15616,
+                "window": 300.0,
+                "domain": "reliquary-forced-seed-v3",
+                "lr": 1e-6,
+                "kl": 0.01,
+                "mask_math": True,
+            },
+        ),
+    ],
+)
+def test_profile_atomically_drives_runtime_constants(profile_id, expected):
+    script = """
+import json
+from reliquary import constants as c
+print(json.dumps({
+    "version": c.PROTOCOL_VERSION,
+    "math_cap": c.max_new_tokens_for_environment("openmathinstruct"),
+    "code_cap": c.max_new_tokens_for_environment("opencodeinstruct"),
+    "thinking": c.BFT_THINKING_BUDGET,
+    "window": c.WINDOW_COLLECTION_SECONDS,
+    "domain": c.FORCED_SEED_DOMAIN,
+    "lr": c.LEARNING_RATE,
+    "kl": c.KL_BETA,
+    "mask_math": c.MASK_MATH_FORCED_FROM_LOSS,
+}))
+"""
+    env = dict(os.environ)
+    env["RELIQUARY_PROTOCOL_PROFILE"] = profile_id
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert json.loads(completed.stdout) == expected

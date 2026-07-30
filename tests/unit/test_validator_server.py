@@ -1114,9 +1114,71 @@ def test_state_endpoint_returns_grpo_batch_state():
     client = TestClient(server.app)
     resp = client.get("/state")
     assert resp.status_code == 200
-    state = GrpoBatchState(**resp.json())
+    payload = resp.json()
+    assert "protocol_version" not in payload
+    assert "generation_profile_id" not in payload
+    assert "generation_contract" not in payload
+    state = GrpoBatchState(**payload)
     assert state.window_n == 500
     assert 42 in state.cooldown_prompts
+
+
+def test_v3_state_advertises_exact_generation_contract(monkeypatch):
+    import reliquary.validator.server as server_module
+    from reliquary.protocol.profiles import PROFILES
+    from reliquary.protocol.submission import WindowState
+
+    profile = PROFILES["qwen35-4b-auction-v3"]
+    contract = profile.to_generation_contract()
+    monkeypatch.setattr(server_module, "PROTOCOL_VERSION", 3)
+    monkeypatch.setattr(
+        server_module,
+        "PROTOCOL_PROFILE_ID",
+        profile.profile_id,
+    )
+    monkeypatch.setattr(
+        server_module,
+        "PROTOCOL_GENERATION_CONTRACT",
+        contract,
+    )
+    server = ValidatorServer()
+    server.set_active_batcher(_batcher(window_start=500))
+    server.set_current_state(WindowState.OPEN)
+
+    payload = TestClient(server.app).get("/state").json()
+
+    assert payload["protocol_version"] == 3
+    assert payload["generation_profile_id"] == profile.profile_id
+    assert payload["generation_contract"] == contract
+
+
+def test_v3_protocol_contract_rejects_wrong_version_or_profile(monkeypatch):
+    import reliquary.validator.server as server_module
+
+    monkeypatch.setattr(server_module, "PROTOCOL_VERSION", 3)
+    monkeypatch.setattr(server_module, "FORCED_SEED_PROTOCOL_VERSION", 3)
+    monkeypatch.setattr(
+        server_module,
+        "PROTOCOL_PROFILE_ID",
+        "qwen35-4b-auction-v3",
+    )
+    check = server_module._protocol_contract_reject_reason
+
+    assert check(
+        protocol_version=2,
+        generation_profile_id="",
+        checkpoint_bound=True,
+    ) is RejectReason.PROTOCOL_MISMATCH
+    assert check(
+        protocol_version=3,
+        generation_profile_id="",
+        checkpoint_bound=True,
+    ) is RejectReason.GENERATION_CONTRACT_MISMATCH
+    assert check(
+        protocol_version=3,
+        generation_profile_id="qwen35-4b-auction-v3",
+        checkpoint_bound=True,
+    ) is None
 
 
 def test_state_endpoint_503_when_no_active_batcher():

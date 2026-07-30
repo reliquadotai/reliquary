@@ -47,7 +47,18 @@ PROOF_SKETCH_TOLERANCE_GROWTH = 5.0
 # because sketch commitments are bit-sensitive to attention kernel variance.
 import math as _math
 import os as _os
+
+from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE
+
 ATTN_IMPLEMENTATION = _os.environ.get("GRAIL_ATTN_IMPL", "flash_attention_2")
+
+PROTOCOL_PROFILE_ID = ACTIVE_PROTOCOL_PROFILE.profile_id
+PROTOCOL_MODEL_ID = ACTIVE_PROTOCOL_PROFILE.model_id
+PROTOCOL_MODEL_REVISION = ACTIVE_PROTOCOL_PROFILE.model_revision
+PROTOCOL_VERSION = ACTIVE_PROTOCOL_PROFILE.protocol_version
+PROTOCOL_GENERATION_CONTRACT = (
+    ACTIVE_PROTOCOL_PROFILE.to_generation_contract()
+)
 
 # ────────────────  TIMING (CONSENSUS)  ────────────────
 
@@ -66,8 +77,10 @@ BLOCK_TIME_VARIANCE = 3
 # Network latency allowance for file uploads (seconds).
 NETWORK_UPLOAD_LATENCY = 30
 
-# Grace period = block variance + upload latency.
-UPLOAD_GRACE_PERIOD = BLOCK_TIME_VARIANCE + NETWORK_UPLOAD_LATENCY
+# Grace period = block variance + upload latency. Profiles pin this explicitly
+# so a miner and validator cannot silently disagree after a timing change.
+UPLOAD_GRACE_PERIOD = ACTIVE_PROTOCOL_PROFILE.upload_grace_seconds
+assert UPLOAD_GRACE_PERIOD == BLOCK_TIME_VARIANCE + NETWORK_UPLOAD_LATENCY
 
 # A miner may commit a completed submission before the auction deadline and
 # finish uploading the matching body during this bounded reveal interval.  The
@@ -77,16 +90,25 @@ SUBMISSION_UPLOAD_GRACE_SECONDS = float(UPLOAD_GRACE_PERIOD)
 
 # ────────────────  ROLLOUT GENERATION  ────────────────
 
-# Global generation cap — one uniform ~16k ceiling for BOTH envs.
-# Math is capped tighter by BFT (min(max_new_tokens, BFT_THINKING_BUDGET)); a
-# forced completion is thinking + force-span + answer, so this must stay above
-# BFT_THINKING_BUDGET + BFT_ANSWER_BUDGET (asserted below) — hence 15616 + 512
-# with 256 of margin. Code has no BFT: a code rollout that hasn't emitted EOS by
-# this cap is "truncated", which is admissible (see the per-env truncation
-# allowance) and valued conservatively rather than rejected. Lowering this from
-# 32768 only became safe once truncated rollouts stopped being rejected outright.
-# WIRE CONSTANT — miner and verifier must agree.
-MAX_NEW_TOKENS_PROTOCOL_CAP = 16384
+# Per-environment generation ceilings are part of the signed profile contract.
+# The schema ceiling remains the maximum across environments; every
+# environment-aware termination path must use ``max_new_tokens_for_environment``.
+MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV = {
+    environment: profile.max_new_tokens
+    for environment, profile in ACTIVE_PROTOCOL_PROFILE.environments.items()
+}
+MAX_NEW_TOKENS_PROTOCOL_CAP = max(
+    MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV.values()
+)
+
+
+def max_new_tokens_for_environment(environment: str) -> int:
+    """Return the active cap; custom legacy/test environments use schema max."""
+
+    return MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV.get(
+        environment,
+        MAX_NEW_TOKENS_PROTOCOL_CAP,
+    )
 
 # Budget-Forced Termination (BFT): if a rollout has not emitted </think> by
 # BFT_THINKING_BUDGET tokens, the miner appends BFT_FORCE_TEMPLATE and samples
@@ -94,7 +116,9 @@ MAX_NEW_TOKENS_PROTOCOL_CAP = 16384
 # (gradeable) answer instead of an unparseable thinking truncation. H200 sweeps
 # on real OpenMathInstruct prompts found 2048/512 to match 2048/256 reward
 # (5/6) with better EOS rate, while 4096/256 was slower and lower reward.
-BFT_ENABLED = True
+_MATH_PROFILE = ACTIVE_PROTOCOL_PROFILE.environments["openmathinstruct"]
+_MATH_BFT_PROFILE = _MATH_PROFILE.bft
+BFT_ENABLED = _MATH_BFT_PROFILE is not None
 # 2026-07 Qwen3.5-4B behavior study (held-out OMI, vLLM): the 4B thinks a median
 # of 3766 / p90 11297 tokens before </think>; a 2048 budget would force-cut ~45%
 # of its *productive* reasoning. A 32768-budget probe on the rollouts that don't
@@ -104,8 +128,12 @@ BFT_ENABLED = True
 # bounding looper compute. Sized so thinking + answer + a force-span margin
 # lands exactly on MAX_NEW_TOKENS_PROTOCOL_CAP (16384). WIRE CONSTANT — miner generates to it and the verifier
 # checks against it, so both sides must ship the same value (coordinated deploy).
-BFT_THINKING_BUDGET = 15616
-BFT_ANSWER_BUDGET = 512
+BFT_THINKING_BUDGET = (
+    _MATH_BFT_PROFILE.thinking_budget if _MATH_BFT_PROFILE else 0
+)
+BFT_ANSWER_BUDGET = (
+    _MATH_BFT_PROFILE.answer_budget if _MATH_BFT_PROFILE else 0
+)
 BFT_FORCE_TEMPLATE = "</think>\n\nFinal Answer: \\boxed{"
 # Clean-cap vs forced-answer at the budget. True (legacy): an unterminated rollout
 # is force-closed with BFT_FORCE_TEMPLATE + a sampled answer. False (clean-cap):
@@ -116,7 +144,9 @@ BFT_FORCE_TEMPLATE = "</think>\n\nFinal Answer: \\boxed{"
 # is the less-polluted signal. Kept True for a STAGED rollout: bump the budget to
 # 16k first (contract-consistent), then flip this to False once miners ship it.
 # WIRE-AFFECTING — flipping requires a coordinated miner+validator deploy.
-BFT_FORCE_ANSWER = True
+BFT_FORCE_ANSWER = bool(
+    _MATH_BFT_PROFILE and _MATH_BFT_PROFILE.force_answer
+)
 # DAPO-style overlong filtering. A rollout whose ending is a BUDGET ARTEFACT
 # rather than the model's own choice is masked out of the policy update: no PPO
 # and no KL, and its forward is skipped entirely. Two shapes qualify:
@@ -143,11 +173,25 @@ MASK_BUDGET_ENDED_FROM_LOSS = (
     _os.environ.get("RELIQUARY_MASK_BUDGET_ENDED_FROM_LOSS", "0")
     not in ("0", "false", "False")
 )
+MASK_MATH_FORCED_FROM_LOSS = (
+    _os.environ.get(
+        "RELIQUARY_MASK_MATH_FORCED_FROM_LOSS",
+        "1" if PROTOCOL_VERSION >= 3 else "0",
+    )
+    not in ("0", "false", "False")
+)
+MASK_CODE_TRUNCATED_FROM_LOSS = (
+    _os.environ.get("RELIQUARY_MASK_CODE_TRUNCATED_FROM_LOSS", "0")
+    not in ("0", "false", "False")
+)
 # The global cap must leave room for a forced completion (thinking + force-span +
 # answer). Guard against a future budget bump that would make forced rollouts
 # exceed the schema cap and get rejected.
-assert MAX_NEW_TOKENS_PROTOCOL_CAP > BFT_THINKING_BUDGET + BFT_ANSWER_BUDGET, (
-    "MAX_NEW_TOKENS_PROTOCOL_CAP must exceed BFT_THINKING_BUDGET + "
+assert (
+    max_new_tokens_for_environment("openmathinstruct")
+    > BFT_THINKING_BUDGET + BFT_ANSWER_BUDGET
+), (
+    "the Math protocol cap must exceed BFT_THINKING_BUDGET + "
     "BFT_ANSWER_BUDGET to fit the forced answer's force-template span"
 )
 
@@ -175,19 +219,24 @@ if not _math.isfinite(SHAPE_LEN_FRAC) or not 0.0 < SHAPE_LEN_FRAC <= 1.0:
 # the main manufactured-loser path.
 MAX_TRUNCATED_PER_SUBMISSION = 1
 BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION = 1
-# Per-environment override. Math keeps 1: with BFT every math rollout terminates
-# through an accepted path (EOS / forced cap / natural cap), so a truncated math
-# rollout means a non-compliant client — but a zero-tolerance gate has burned
-# honest miners here before (drand_tolerance=0 rejected honest `stale_round`
-# submissions), and the "one free truncation" is no longer an exploit now that
-# manufacturing is priced out by CONSERVATIVE_TRUNCATION_VALUE, so the buffer is
-# free. Code has no BFT and the 4B loops on ~10% of code rollouts, so at 8
-# rollouts ~19% of HONEST code groups carry 2+ truncations and were being
-# rejected wholesale; 3 admits them, and their value is discounted conservatively
-# instead. Tighten once live telemetry shows the real per-env truncation rates.
-MAX_TRUNCATED_PER_SUBMISSION_BY_ENV = {
-    "opencodeinstruct": 3,
-}
+# Both environments keep the single-truncation ceiling. The former Code
+# allowance of three was inconsistent across admission paths and was not safe
+# under fractional rewards. V3 prices the one unknown outcome over the exact
+# validator-known reward lattice.
+MAX_TRUNCATED_PER_SUBMISSION_BY_ENV: dict[str, int] = {}
+
+
+def max_truncated_for_environment(
+    environment: str,
+    *,
+    bootstrap: bool = False,
+) -> int:
+    if bootstrap:
+        return BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION
+    return MAX_TRUNCATED_PER_SUBMISSION_BY_ENV.get(
+        environment,
+        MAX_TRUNCATED_PER_SUBMISSION,
+    )
 
 # Group-level reward-shape guard. The live attack manufactures binary reward
 # vectors such as 11110000 while cutting every zero-reward rollout to the same
@@ -353,32 +402,12 @@ SPARSE_VALID_IDLE_SEAL_SECONDS = 300.0
 SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS = 4
 SPARSE_VALID_MAX_WINDOW_SECONDS = 900.0
 
-# Difficulty-auction v2: an enabled environment is time-boxed. It stays open
-# for exactly this many seconds and accepts everything valid, then seals on the
-# deadline (see ``GrpoWindowBatcher.poll_deadline``) instead of on the
-# 8-distinct count. Environments outside the auction retain the legacy seal.
-# An early seal would be the speed race we are removing — whoever triggered it
-# would cut off slow-but-hard submissions still generating.
-#
-# THIS MUST TRACK BFT_THINKING_BUDGET. A miner generates its M_ROLLOUTS in one
-# batch, so a group's generation time is set by its LONGEST rollout, not its
-# average — and with the 4B, 34% of rollouts run to the budget, which puts a
-# long rollout in ~96% of groups. So essentially every submission takes
-# BFT_THINKING_BUDGET / per-sequence-rate to produce:
-#
-#   required rate = BFT_THINKING_BUDGET / WINDOW_COLLECTION_SECONDS
-#     100 s -> 156 tok/s/seq     200 s -> 78 tok/s/seq     300 s -> 52 tok/s/seq
-#
-# The live 2B fleet ran ~130 tok/s/seq; a 4B decodes roughly half as fast, so
-# ~65 tok/s/seq is the expectation at launch. 100 s (a cadence stopgap sized for
-# the old 2048 budget) and even 200 s would cut off honest miners — and would cut
-# them off precisely on the HARD prompts that reason longest, i.e. the ones the
-# auction exists to buy. 300 s clears the current fleet with margin.
-#
-# Cost: cadence ~5.5 -> ~8.8 min/window. The proper fix is early close (seal as
-# soon as the batch is provably full), which decouples the safety deadline from
-# cadence; tighten back toward 200 s once live 4B throughput is known.
-WINDOW_COLLECTION_SECONDS = 300.0
+# Fixed collection timing is versioned with the generation budget. We do not
+# early-close: doing so would reward arrival rather than let the complete
+# auction population compete under the advertised deadline.
+WINDOW_COLLECTION_SECONDS = float(
+    ACTIVE_PROTOCOL_PROFILE.collection_seconds
+)
 
 # Difficulty-auction v2: number of ranked-pass non-winners proven per window
 # purely for the forensic auth gates (token-auth, distribution, forced-seed),
@@ -430,7 +459,7 @@ SIGMA_MIN = 0.43
 BOOTSTRAP_SIGMA_MIN = 0.33
 
 # Number of rollouts per submission (= size of each GRPO group).
-M_ROLLOUTS = 8
+M_ROLLOUTS = ACTIVE_PROTOCOL_PROFILE.sampling.rollouts
 
 # Maximum proven winners and uniform reward slots per active environment.
 # Distinct prompt representatives feed GRPO.
@@ -466,11 +495,12 @@ ENV_LOSS_WEIGHTS: dict[str, float] = {}
 # samples from a different distribution -> biased GRPO gradient. Keep these
 # values exactly mirrored by the miner generation path and the validator's
 # chosen-token probability checks.
-T_PROTO = 0.6
+T_PROTO = ACTIVE_PROTOCOL_PROFILE.sampling.temperature
 
 # Top-p and top-k for sampling (fixed alongside T_PROTO).
-TOP_P_PROTO = 0.95
-TOP_K_PROTO = 20
+TOP_P_PROTO = ACTIVE_PROTOCOL_PROFILE.sampling.top_p
+TOP_K_PROTO = ACTIVE_PROTOCOL_PROFILE.sampling.top_k
+DO_SAMPLE_PROTO = ACTIVE_PROTOCOL_PROFILE.sampling.do_sample
 
 # Do not add miner-only logits processors here. A presence/repetition penalty
 # changes the sampling policy; unless the validator also recomputes and verifies
@@ -680,6 +710,10 @@ DIFFICULTY_AUCTION_DELTA = 1.0
 # miners for exactly that reason). Turning this on is a one-line PR: reviewable,
 # versioned, announced.
 CONSERVATIVE_TRUNCATION_VALUE = False
+# V3 uses the exact reward lattice and includes sigma eligibility in the
+# minimization. The older endpoint-only scorer remains available solely for
+# historical replay tests and must never be activated as the v3 defense.
+ROBUST_TRUNCATION_UTILITY_ENABLED = PROTOCOL_VERSION >= 3
 # The live proof budget currently caps each environment at 96 grading attempts.
 # Keep an independent ceiling so a future admission change cannot turn passive
 # telemetry into unbounded seal-time CPU or archive growth.
@@ -770,7 +804,10 @@ EMA_ALPHA = 2.0 / (72 + 1)  # ≈ 0.0274
 # tolerance) over 50 training steps — effectively indistinguishable from the
 # base model, which also means stale-model cheaters pass GRAIL. Matched
 # DAPO / R1-Zero-scale literature (1e-6 to 5e-6) by bumping to 5e-6.
-LEARNING_RATE = float(_os.environ.get("RELIQUARY_LEARNING_RATE", "5e-6"))
+_PROFILE_LEARNING_RATE = "1e-6" if PROTOCOL_VERSION >= 3 else "5e-6"
+LEARNING_RATE = float(
+    _os.environ.get("RELIQUARY_LEARNING_RATE", _PROFILE_LEARNING_RATE)
+)
 if not _math.isfinite(LEARNING_RATE) or not 0.0 < LEARNING_RATE <= 1e-3:
     raise ValueError(
         "RELIQUARY_LEARNING_RATE must be finite and within (0, 1e-3]"
@@ -802,7 +839,8 @@ if (
 # run. Keep the current value as the compatibility default, but make it
 # operator-configurable so fixed-reference recovery can be calibrated without
 # another code release.
-KL_BETA = float(_os.environ.get("RELIQUARY_KL_BETA", "0.04"))
+_PROFILE_KL_BETA = "0.01" if PROTOCOL_VERSION >= 3 else "0.04"
+KL_BETA = float(_os.environ.get("RELIQUARY_KL_BETA", _PROFILE_KL_BETA))
 if not 0.0 <= KL_BETA <= 1.0:
     raise ValueError("RELIQUARY_KL_BETA must be finite and within [0, 1]")
 KL_BETA_EXPLICIT = "RELIQUARY_KL_BETA" in _os.environ
@@ -864,7 +902,8 @@ LR_COSINE_MAX_WINDOWS = 10_000
 
 # Default base model (HF repo id). Served as the reference for KL and the
 # cold-start checkpoint.
-DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-2B"
+DEFAULT_BASE_MODEL = PROTOCOL_MODEL_ID
+DEFAULT_BASE_MODEL_REVISION = PROTOCOL_MODEL_REVISION
 
 # ────────────────  WANDB TELEMETRY (opt-in, validator-only)  ────────────────
 
@@ -966,7 +1005,7 @@ CODE_SEMANTIC_AUTH_ENFORCE = False
 
 # ──────────────── FORCED-SEED SAMPLING ────────────────
 # Domain separation for the per-position public uniform u_{i,t}.
-FORCED_SEED_DOMAIN = "reliquary-forced-seed-v2"
+FORCED_SEED_DOMAIN = f"reliquary-forced-seed-v{PROTOCOL_VERSION}"
 # A position counts toward the seed-consistency check only if its warped max
 # probability is below this (i.e. the forced draw actually chooses the token).
 FORCED_SEED_STOCHASTIC_MAXPROB = 0.99
@@ -1019,4 +1058,4 @@ FORCED_SEED_ENFORCE = _os.environ.get(
 # version before quota, reward grading, or proof admission. Deploy miners and
 # validator as a coordinated hard cutover; FORCED_SEED_ENFORCE=false is the
 # emergency compatibility switch.
-FORCED_SEED_PROTOCOL_VERSION = 2
+FORCED_SEED_PROTOCOL_VERSION = PROTOCOL_VERSION

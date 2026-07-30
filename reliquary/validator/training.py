@@ -177,15 +177,29 @@ def _is_masked_from_loss(rollout) -> bool:
     equals its group mean (common with fractional code rewards), and skipping
     those would silently drop their KL term and skew the N_e normalisation.
 
-    Gated on ``MASK_BUDGET_ENDED_FROM_LOSS`` (default off), so with the flag unset
-    nothing is masked and the training path is unchanged.
+    V3 enables the Math forced-row mask only. Code truncations remain in the
+    loss until an adversarial ablation shows that removing their negative
+    gradient cannot reward deliberate non-termination. The legacy aggregate
+    flag remains an emergency experiment switch for both shapes.
     """
-    from reliquary.constants import MASK_BUDGET_ENDED_FROM_LOSS
+    from reliquary.constants import (
+        MASK_BUDGET_ENDED_FROM_LOSS,
+        MASK_CODE_TRUNCATED_FROM_LOSS,
+        MASK_MATH_FORCED_FROM_LOSS,
+    )
 
-    if not MASK_BUDGET_ENDED_FROM_LOSS:
-        return False
     meta = (getattr(rollout, "commit", None) or {}).get("rollout", {}) or {}
-    return bool(meta.get("forced")) or bool(meta.get("truncated"))
+    if bool(meta.get("forced")):
+        return (
+            MASK_BUDGET_ENDED_FROM_LOSS
+            or MASK_MATH_FORCED_FROM_LOSS
+        )
+    if bool(meta.get("truncated")):
+        return (
+            MASK_BUDGET_ENDED_FROM_LOSS
+            or MASK_CODE_TRUNCATED_FROM_LOSS
+        )
+    return False
 
 
 def _shape_advantages(rollouts, advantages):
@@ -209,12 +223,19 @@ def _shape_advantages(rollouts, advantages):
     mean."""
     from reliquary.constants import (
         MASK_BUDGET_ENDED_FROM_LOSS,
+        MASK_CODE_TRUNCATED_FROM_LOSS,
+        MASK_MATH_FORCED_FROM_LOSS,
         BFT_THINKING_BUDGET,
         SHAPE_LEN_FRAC,
         SHAPE_PENALTY,
     )
 
-    if SHAPE_PENALTY <= 0 and not MASK_BUDGET_ENDED_FROM_LOSS:
+    if (
+        SHAPE_PENALTY <= 0
+        and not MASK_BUDGET_ENDED_FROM_LOSS
+        and not MASK_MATH_FORCED_FROM_LOSS
+        and not MASK_CODE_TRUNCATED_FROM_LOSS
+    ):
         return advantages
     early_cap = SHAPE_LEN_FRAC * BFT_THINKING_BUDGET
     shaped = list(advantages)

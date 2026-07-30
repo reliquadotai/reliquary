@@ -16,6 +16,7 @@ import typer
 
 from reliquary.constants import (
     DEFAULT_BASE_MODEL,
+    DEFAULT_BASE_MODEL_REVISION,
     DEFAULT_ENVIRONMENTS,
     DEFAULT_HF_REPO_ID,
     ENVIRONMENT_MIX,
@@ -261,7 +262,12 @@ def mine(
 
         # --- Load models from resolved path ---
         logger.info("Loading models from %s...", initial_path)
-        tokenizer = load_tokenizer(initial_path)
+        base_load_kwargs = (
+            {"revision": DEFAULT_BASE_MODEL_REVISION}
+            if initial_path == DEFAULT_BASE_MODEL
+            else {}
+        )
+        tokenizer = load_tokenizer(initial_path, **base_load_kwargs)
 
         # Use 2 GPUs when available (vllm on 0, HF proof on 1). Fall back to
         # sharing GPU 0 for test boxes that only expose one device.
@@ -271,12 +277,14 @@ def mine(
             initial_path,
             torch_dtype=torch.bfloat16,
             attn_implementation=ATTN_IMPLEMENTATION,
+            **base_load_kwargs,
         ).to("cuda:0").eval()
 
         hf_model = load_text_generation_model(
             initial_path,
             torch_dtype=torch.bfloat16,
             attn_implementation=ATTN_IMPLEMENTATION,
+            **base_load_kwargs,
         ).to(proof_device).eval()
 
         envs = load_environments(env_names)
@@ -402,12 +410,18 @@ def validate(
             from reliquary.validator.service import ValidationService
 
             logger.info("Loading model from %s...", checkpoint)
-            tokenizer = load_tokenizer(checkpoint)
+            base_load_kwargs = (
+                {"revision": DEFAULT_BASE_MODEL_REVISION}
+                if checkpoint == DEFAULT_BASE_MODEL
+                else {}
+            )
+            tokenizer = load_tokenizer(checkpoint, **base_load_kwargs)
 
             model = load_text_generation_model(
                 checkpoint,
                 torch_dtype=torch.bfloat16,
                 attn_implementation=ATTN_IMPLEMENTATION,
+                **base_load_kwargs,
             ).to("cuda:0").eval()
 
             mix = [(n, w) for n, w in ENVIRONMENT_MIX if n in env_names]
