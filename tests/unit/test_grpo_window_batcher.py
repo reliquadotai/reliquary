@@ -24,6 +24,10 @@ from reliquary.protocol.submission import (
 )
 from reliquary.validator.batcher import GrpoWindowBatcher
 from reliquary.validator.observability import SubmitTelemetry
+from reliquary.validator.proof_scheduler import (
+    GlobalProofScheduler,
+    ProofExecution,
+)
 
 
 class FakeEnv:
@@ -1147,6 +1151,88 @@ def test_failed_submission_does_not_consume_bucket_slot():
     assert len(batch) == 1
     assert batch[0].hotkey in {"A", "B"} - {failed_hotkey}
     assert set(rewards) == {batch[0].hotkey}
+
+
+def _execute_scheduler_payload(invocation):
+    payload = invocation.candidate.payload
+    submission = payload.execute(payload.batcher.model)
+    return ProofExecution(
+        passed=submission is not None,
+        value=submission,
+    )
+
+
+def test_scheduled_auction_preserves_ranked_winner_and_payout_contract():
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0", "gpu-1"),
+        environments=("openmathinstruct", "opencodeinstruct"),
+        proof_callable=_execute_scheduler_payload,
+        checkpoint_revision="",
+    )
+    try:
+        batcher = _make_batcher(proof_scheduler=scheduler)
+        for prompt_idx in range(B_BATCH + 3):
+            assert batcher.accept_submission(
+                _request(
+                    prompt_idx=prompt_idx,
+                    hotkey=f"hk-{prompt_idx}",
+                )
+            ).accepted
+
+        batch, rewards = batcher.seal_batch()
+
+        assert len(batch) == B_BATCH
+        assert len(rewards) == B_BATCH
+        assert all(
+            row["selected"] == (row["status"] == "selected")
+            for row in batcher.auction_candidates
+        )
+        assert batcher.reward_alignment["reward_alignment_ok"] is True
+        assert batcher.proof_capacity_aborted is False
+        snapshot = scheduler.snapshot()
+        assert snapshot["dispatches_by_environment"][
+            "openmathinstruct"
+        ] == B_BATCH
+    finally:
+        assert scheduler.close()
+
+
+def test_scheduled_proof_deadline_aborts_without_partial_rewards(monkeypatch):
+    import reliquary.validator.batcher as batcher_module
+
+    monkeypatch.setattr(
+        batcher_module,
+        "MAX_PROOF_WALL_SECONDS",
+        0.01,
+    )
+
+    def slow_proof(invocation):
+        time.sleep(0.03)
+        return _execute_scheduler_payload(invocation)
+
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0",),
+        environments=("openmathinstruct", "opencodeinstruct"),
+        proof_callable=slow_proof,
+        checkpoint_revision="",
+        deadline_poll_seconds=0.001,
+    )
+    try:
+        batcher = _make_batcher(proof_scheduler=scheduler)
+        assert batcher.accept_submission(
+            _request(prompt_idx=1, hotkey="hk-deadline")
+        ).accepted
+
+        batch, rewards = batcher.seal_batch()
+
+        assert batch == []
+        assert rewards == {}
+        assert batcher.valid_submissions() == []
+        assert batcher.proof_capacity_aborted is True
+        assert batcher.proof_capacity_abort_reason == "deadline_exceeded"
+        assert batcher.reward_alignment["reward_alignment_ok"] is False
+    finally:
+        assert scheduler.close()
 
 
 # ---------------------------------------------------------------------------

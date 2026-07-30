@@ -9,9 +9,11 @@ rank order even when proofs finish out of order.
 from __future__ import annotations
 
 from collections import defaultdict
+from collections import deque
 from collections.abc import Callable, Hashable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
+import math
 import threading
 import time
 from typing import Any
@@ -89,6 +91,9 @@ class ProofPlan:
     required_passes: int
     deadline_at: float
     max_attempts: int | None = None
+    # Lower values dispatch first. Winner plans use zero; observational
+    # forensics use a larger value and consume only otherwise-idle capacity.
+    priority: int = 0
     # Winner selection normally stops at ``required_passes``. Forensic plans
     # instead prove every supplied candidate and ignore pass count.
     complete_all: bool = False
@@ -290,6 +295,10 @@ class GlobalProofScheduler:
         self._totals: dict[str, int] = defaultdict(int)
         self._dispatches_by_environment: dict[str, int] = defaultdict(int)
         self._proof_seconds_by_device: dict[str, float] = defaultdict(float)
+        self._proof_durations_by_environment: dict[str, deque[float]] = {
+            environment: deque(maxlen=1000)
+            for environment in self._environments
+        }
 
         self._workers = [
             threading.Thread(
@@ -481,6 +490,28 @@ class GlobalProofScheduler:
                 )
                 for device, entry in self._active_by_device.items()
             }
+
+            def _latency_summary(values: deque[float]) -> dict[str, Any]:
+                if not values:
+                    return {
+                        "count": 0,
+                        "p50": None,
+                        "p95": None,
+                        "max": None,
+                    }
+                ordered = sorted(values)
+
+                def _percentile(fraction: float) -> float:
+                    index = math.ceil(fraction * len(ordered)) - 1
+                    return ordered[max(0, min(index, len(ordered) - 1))]
+
+                return {
+                    "count": len(ordered),
+                    "p50": _percentile(0.50),
+                    "p95": _percentile(0.95),
+                    "max": ordered[-1],
+                }
+
             return {
                 "state": self._state.value,
                 "active_checkpoint_revision": (
@@ -503,6 +534,12 @@ class GlobalProofScheduler:
                 "proof_seconds_by_device": {
                     device: self._proof_seconds_by_device[device]
                     for device in self._devices
+                },
+                "proof_latency_seconds_by_environment": {
+                    environment: _latency_summary(
+                        self._proof_durations_by_environment[environment]
+                    )
+                    for environment in self._environments
                 },
                 "totals": dict(self._totals),
             }
@@ -574,6 +611,8 @@ class GlobalProofScheduler:
             )
         if plan.max_attempts is not None and plan.max_attempts <= 0:
             raise ValueError("max_attempts must be positive")
+        if plan.priority < 0:
+            raise ValueError("priority cannot be negative")
         ranks: set[int] = set()
         job_ids: set[str] = set()
         for candidate in plan.candidates:
@@ -717,6 +756,9 @@ class GlobalProofScheduler:
                 self._proof_seconds_by_device[device_id] += max(
                     0.0, finished_at - started_at
                 )
+                self._proof_durations_by_environment[
+                    state.plan.environment
+                ].append(max(0.0, finished_at - started_at))
                 if error is not None:
                     self._totals["proof_errors"] += 1
                 if (
@@ -747,18 +789,24 @@ class GlobalProofScheduler:
             SchedulerState.DRAINING,
         ):
             return None
+        priorities = sorted({
+            state.plan.priority
+            for state in self._active_plan_by_environment.values()
+            if state is not None
+        })
         count = len(self._environments)
-        for offset in range(count):
-            index = (self._environment_cursor + offset) % count
-            environment = self._environments[index]
-            state = self._active_plan_by_environment[environment]
-            if state is None:
-                continue
-            candidate = self._next_candidate_locked(state)
-            if candidate is None:
-                continue
-            self._environment_cursor = (index + 1) % count
-            return state, candidate
+        for priority in priorities:
+            for offset in range(count):
+                index = (self._environment_cursor + offset) % count
+                environment = self._environments[index]
+                state = self._active_plan_by_environment[environment]
+                if state is None or state.plan.priority != priority:
+                    continue
+                candidate = self._next_candidate_locked(state)
+                if candidate is None:
+                    continue
+                self._environment_cursor = (index + 1) % count
+                return state, candidate
         return None
 
     def _next_candidate_locked(
@@ -770,6 +818,16 @@ class GlobalProofScheduler:
             or state.attempts_started >= state.max_attempts
         ):
             return None
+        if not state.plan.complete_all:
+            outstanding = sum(
+                phase in (_JobPhase.ACTIVE, _JobPhase.RAW)
+                for phase in state.phases.values()
+            )
+            if (
+                state.passed + outstanding
+                >= state.plan.required_passes
+            ):
+                return None
         eligible: list[RankedProof] = []
         for prompt, chain in state.prompt_chains.items():
             if prompt in state.claimed_prompts:

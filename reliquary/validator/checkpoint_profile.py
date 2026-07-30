@@ -1,0 +1,92 @@
+"""Protocol-lineage metadata embedded in every validator checkpoint."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any, Mapping
+
+from reliquary.constants import (
+    PROTOCOL_MODEL_ID,
+    PROTOCOL_MODEL_REVISION,
+    PROTOCOL_PROFILE_ID,
+    PROTOCOL_VERSION,
+)
+
+
+CHECKPOINT_PROFILE_NAME = "reliquary_protocol_profile.json"
+
+
+class CheckpointProfileMismatch(RuntimeError):
+    pass
+
+
+def active_checkpoint_profile() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "profile_id": PROTOCOL_PROFILE_ID,
+        "protocol_version": PROTOCOL_VERSION,
+        "base_model_id": PROTOCOL_MODEL_ID,
+        "base_model_revision": PROTOCOL_MODEL_REVISION,
+    }
+
+
+def write_checkpoint_profile(path: str | Path) -> Path:
+    destination = Path(path) / CHECKPOINT_PROFILE_NAME
+    destination.write_text(
+        json.dumps(
+            active_checkpoint_profile(),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return destination
+
+
+def validate_checkpoint_profile(
+    path: str | Path,
+    *,
+    required: bool,
+    expected: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    profile_path = Path(path) / CHECKPOINT_PROFILE_NAME
+    if not profile_path.exists():
+        if required:
+            raise CheckpointProfileMismatch(
+                "checkpoint has no protocol-lineage metadata"
+            )
+        return None
+    try:
+        value = json.loads(profile_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CheckpointProfileMismatch(
+            "checkpoint protocol-lineage metadata is unreadable"
+        ) from exc
+    if not isinstance(value, dict):
+        raise CheckpointProfileMismatch(
+            "checkpoint protocol-lineage metadata must be an object"
+        )
+    expected_value = dict(expected or active_checkpoint_profile())
+    for key in (
+        "schema_version",
+        "profile_id",
+        "protocol_version",
+        "base_model_id",
+        "base_model_revision",
+    ):
+        if value.get(key) != expected_value.get(key):
+            raise CheckpointProfileMismatch(
+                f"checkpoint protocol-lineage mismatch for {key}"
+            )
+    return value
+
+
+__all__ = [
+    "CHECKPOINT_PROFILE_NAME",
+    "CheckpointProfileMismatch",
+    "active_checkpoint_profile",
+    "validate_checkpoint_profile",
+    "write_checkpoint_profile",
+]

@@ -258,6 +258,62 @@ def test_round_robin_dispatch_is_fair_between_environments():
     assert dispatch_order == [MATH, CODE, MATH, CODE]
 
 
+def test_winner_plan_dispatches_before_lower_priority_forensics():
+    dispatch_order = []
+    blocker_started = threading.Event()
+    release_blocker = threading.Event()
+
+    def prove(invocation):
+        dispatch_order.append(invocation.plan_id)
+        if invocation.plan_id == "math-winner":
+            blocker_started.set()
+            assert release_blocker.wait(2)
+        return True
+
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0",),
+        environments=(MATH, CODE),
+        proof_callable=prove,
+        checkpoint_revision="rev-a",
+    )
+    try:
+        winner = replace(
+            _plan(
+                "math-winner",
+                MATH,
+                [_candidate(1, prefix="winner")],
+                required=1,
+            ),
+            priority=0,
+        )
+        forensic = replace(
+            _plan(
+                "code-forensic",
+                CODE,
+                [_candidate(1, prefix="forensic")],
+                required=0,
+            ),
+            priority=10,
+            complete_all=True,
+        )
+        winner_handle, forensic_handle = scheduler.submit_many(
+            (winner, forensic)
+        )
+        assert blocker_started.wait(2)
+        release_blocker.set()
+        assert winner_handle.result(2).outcome is (
+            ProofPlanOutcome.COMPLETED
+        )
+        assert forensic_handle.result(2).outcome is (
+            ProofPlanOutcome.COMPLETED
+        )
+    finally:
+        release_blocker.set()
+        assert scheduler.close()
+
+    assert dispatch_order == ["math-winner", "code-forensic"]
+
+
 def test_decisions_apply_in_rank_order_not_completion_order():
     rank_one_release = threading.Event()
     rank_two_finished = threading.Event()

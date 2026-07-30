@@ -15,11 +15,17 @@ from pathlib import Path
 import typer
 
 from reliquary.constants import (
+    B_BATCH,
     DEFAULT_BASE_MODEL,
     DEFAULT_BASE_MODEL_REVISION,
     DEFAULT_ENVIRONMENTS,
     DEFAULT_HF_REPO_ID,
     ENVIRONMENT_MIX,
+    FORENSIC_SAMPLE_PER_WINDOW,
+    MAX_PROOF_WALL_SECONDS,
+    PROTOCOL_MODEL_REVISION,
+    PROTOCOL_PROFILE_ID,
+    PROTOCOL_VERSION,
     VALIDATOR_HTTP_PORT,
 )
 
@@ -424,6 +430,81 @@ def validate(
                 **base_load_kwargs,
             ).to("cuda:0").eval()
 
+            raw_proof_devices = os.environ.get(
+                "RELIQUARY_PROOF_DEVICES", ""
+            )
+            proof_devices = tuple(
+                device.strip()
+                for device in raw_proof_devices.split(",")
+                if device.strip()
+            )
+            if len(set(proof_devices)) != len(proof_devices):
+                raise RuntimeError(
+                    "RELIQUARY_PROOF_DEVICES contains duplicates"
+                )
+            if PROTOCOL_VERSION >= 3 and not proof_devices:
+                raise RuntimeError(
+                    f"{PROTOCOL_PROFILE_ID} requires explicit proof replicas; "
+                    "set RELIQUARY_PROOF_DEVICES after capacity qualification"
+                )
+            proof_capacity_qualification = None
+            if PROTOCOL_VERSION >= 3:
+                from reliquary.validator.observability import (
+                    runtime_revision,
+                )
+                from reliquary.validator.proof_capacity import (
+                    load_proof_capacity_qualification,
+                )
+
+                manifest_path = os.environ.get(
+                    "RELIQUARY_PROOF_CAPACITY_MANIFEST", ""
+                ).strip()
+                manifest_sha256 = os.environ.get(
+                    "RELIQUARY_PROOF_CAPACITY_MANIFEST_SHA256", ""
+                ).strip()
+                if not manifest_path or not manifest_sha256:
+                    raise RuntimeError(
+                        "auction-v3 requires a pinned proof-capacity manifest"
+                    )
+                qualification = load_proof_capacity_qualification(
+                    manifest_path,
+                    expected_sha256=manifest_sha256,
+                )
+                hardware = tuple(
+                    torch.cuda.get_device_name(torch.device(device))
+                    for device in proof_devices
+                )
+                proof_capacity_qualification = qualification.validate(
+                    profile_id=PROTOCOL_PROFILE_ID,
+                    model_revision=PROTOCOL_MODEL_REVISION,
+                    software_revision=runtime_revision(),
+                    configured_devices=proof_devices,
+                    configured_hardware=hardware,
+                    proof_wall_seconds=MAX_PROOF_WALL_SECONDS,
+                    minimum_proofs_per_environment=(
+                        B_BATCH + FORENSIC_SAMPLE_PER_WINDOW
+                    ),
+                )
+                logger.info(
+                    "Proof capacity qualified: %s",
+                    proof_capacity_qualification,
+                )
+            proof_models = {}
+            for device in proof_devices:
+                if device == "cuda:0":
+                    continue
+                logger.info(
+                    "Loading frozen proof replica on %s from %s",
+                    device,
+                    checkpoint,
+                )
+                proof_models[device] = load_text_generation_model(
+                    checkpoint,
+                    torch_dtype=torch.bfloat16,
+                    attn_implementation=ATTN_IMPLEMENTATION,
+                    **base_load_kwargs,
+                ).to(device).eval()
+
             mix = [(n, w) for n, w in ENVIRONMENT_MIX if n in env_names]
             service = ValidationService(
                 wallet,
@@ -438,6 +519,11 @@ def validate(
                 hf_repo_id=hf_repo_id,
                 resume_from=resume_from or None,
                 env_mix=mix if mix else None,
+                proof_devices=proof_devices or None,
+                proof_models=proof_models or None,
+                proof_capacity_qualification=(
+                    proof_capacity_qualification
+                ),
             )
             # Run the weight setter in a dedicated OS thread with its own
             # event loop. asyncio is single-threaded, so any sync blocking

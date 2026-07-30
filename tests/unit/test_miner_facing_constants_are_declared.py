@@ -13,7 +13,7 @@ validator MORE permissive (disable a gate in an emergency). An env var that
 differently than the published rule, so those must be declared constants.
 """
 
-import re
+import ast
 
 import pytest
 
@@ -46,26 +46,35 @@ MINER_FACING = [
 
 
 def _assignments(source: str) -> dict[str, str]:
-    """Map CONSTANT -> its right-hand side, including parenthesised multi-line
-    forms (a naive line match misses those, which is how an env-backed constant
-    can hide)."""
+    """Map module constants to their exact right-hand-side source."""
     out: dict[str, str] = {}
-    for match in re.finditer(r"^([A-Z][A-Z0-9_]{2,}) *= *", source, re.M):
-        name = match.group(1)
-        start = match.end()
-        if source[start] in "({[":
-            opener = source[start]
-            closer = {"(": ")", "{": "}", "[": "]"}[opener]
-            depth = 0
-            end = start
-            for i in range(start, len(source)):
-                depth += (source[i] == opener) - (source[i] == closer)
-                if depth == 0:
-                    end = i + 1
-                    break
-            out[name] = source[start:end]
-        else:
-            out[name] = source[start: source.index("\n", start)]
+    tree = ast.parse(source)
+    for node in tree.body:
+        name = None
+        value = None
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            name = node.targets[0].id
+            value = node.value
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+        ):
+            name = node.target.id
+            value = node.value
+        if (
+            name is None
+            or value is None
+            or not name.isupper()
+            or len(name) < 3
+        ):
+            continue
+        segment = ast.get_source_segment(source, value)
+        if segment is not None:
+            out[name] = segment
     return out
 
 

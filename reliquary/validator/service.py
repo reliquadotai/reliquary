@@ -62,6 +62,9 @@ from reliquary.constants import (
     POLL_INTERVAL_SECONDS,
     PPO_CLIP_EPSILON,
     PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD,
+    PROTOCOL_MODEL_REVISION,
+    PROTOCOL_PROFILE_ID,
+    PROTOCOL_VERSION,
     PROOF_ADMISSION_STALL_POLL_SECONDS,
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
     REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS,
@@ -92,6 +95,12 @@ from reliquary.validator.checkpoint import CheckpointStore
 from reliquary.validator.cooldown import ContentCooldownMap, CooldownMap
 from reliquary.validator.dedup import RolloutHashSet
 from reliquary.validator.observability import log_structured, runtime_revision
+from reliquary.validator.proof_scheduler import (
+    GlobalProofScheduler,
+    ProofExecution,
+    ProofInvocation,
+    SchedulerState,
+)
 from reliquary.validator.quarantine import assess_training_batch
 from reliquary.validator.server import ValidatorServer
 from reliquary.validator.training import TrainingStepSkipped, train_step
@@ -254,6 +263,7 @@ def open_grpo_window(
     bootstrap: bool = False,
     queue_drained_predicate=None,
     operator_by_hotkey: dict[str, str] | None = None,
+    proof_scheduler=None,
 ) -> GrpoWindowBatcher:
     """Instantiate a GrpoWindowBatcher for this window.
 
@@ -291,6 +301,7 @@ def open_grpo_window(
         canonical_prompt_tokens_fn=_canonical_prompt_tokens,
         queue_drained_predicate=queue_drained_predicate,
         operator_by_hotkey=operator_by_hotkey,
+        proof_scheduler=proof_scheduler,
     )
 
 
@@ -409,6 +420,9 @@ class ValidationService:
         resume_from: str | None = None,
         load_model_fn: Any | None = None,
         env_mix: list[tuple[str, int]] | None = None,
+        proof_devices: tuple[str, ...] | None = None,
+        proof_models: dict[str, Any] | None = None,
+        proof_capacity_qualification: dict[str, Any] | None = None,
     ) -> None:
         self.wallet = wallet
         import importlib.metadata as _im
@@ -488,6 +502,38 @@ class ValidationService:
         # iterate ``self.envs``.
         first_env_name = self.env_mix[0][0]
         self.env: Environment = self.envs[first_env_name]
+        self._proof_models: dict[str, Any] = {}
+        self.proof_capacity_qualification = dict(
+            proof_capacity_qualification or {}
+        )
+        self.proof_scheduler: GlobalProofScheduler | None = None
+        if proof_devices:
+            normalized_devices = tuple(
+                str(device).strip() for device in proof_devices
+            )
+            if (
+                any(not device for device in normalized_devices)
+                or len(set(normalized_devices)) != len(normalized_devices)
+            ):
+                raise ValueError(
+                    "proof devices must be non-empty and unique"
+                )
+            supplied_models = dict(proof_models or {})
+            verify_device = _model_device(self.verify_model)
+            for device in normalized_devices:
+                candidate = supplied_models.get(device)
+                if candidate is None and verify_device == device:
+                    candidate = self.verify_model
+                if candidate is None:
+                    raise RuntimeError(
+                        f"proof device {device!r} has no model replica"
+                    )
+                self._proof_models[device] = candidate
+            self.proof_scheduler = GlobalProofScheduler(
+                devices=normalized_devices,
+                environments=tuple(self.envs),
+                proof_callable=self._execute_scheduled_proof,
+            )
 
         self._last_processed_window: int = -1
         self._windows_in_interval: int = 0
@@ -536,6 +582,9 @@ class ValidationService:
         )
         self.server.configure_utility_telemetry_health(
             self._utility_telemetry.snapshot
+        )
+        self.server.configure_proof_scheduler_health(
+            self._proof_scheduler_health_snapshot
         )
 
         # v2.1 state machine infrastructure — in-memory only, bootstrapped at
@@ -737,6 +786,95 @@ class ValidationService:
             "train_until_checkpoint_n": TRAIN_UNTIL_CHECKPOINT_N,
         })
 
+    def _execute_scheduled_proof(
+        self,
+        invocation: ProofInvocation,
+    ) -> ProofExecution:
+        model = self._proof_models[invocation.device_id]
+        payload = invocation.candidate.payload
+        execute = getattr(payload, "execute", None)
+        if not callable(execute):
+            raise TypeError("scheduled proof payload is not executable")
+        submission = execute(model)
+        return ProofExecution(
+            passed=submission is not None,
+            value=submission,
+            reason=None if submission is not None else "proof_rejected",
+        )
+
+    def _proof_scheduler_health_snapshot(self) -> dict[str, Any]:
+        scheduler = getattr(self, "proof_scheduler", None)
+        if scheduler is None:
+            return {
+                "state": "disabled",
+                "required": PROTOCOL_VERSION >= 3,
+                "profile_id": PROTOCOL_PROFILE_ID,
+                "configured_devices": [],
+            }
+        snapshot = scheduler.snapshot()
+        snapshot.update({
+            "required": PROTOCOL_VERSION >= 3,
+            "profile_id": PROTOCOL_PROFILE_ID,
+            "configured_devices": list(
+                getattr(self, "_proof_models", {})
+            ),
+            "capacity_qualification": dict(
+                getattr(self, "proof_capacity_qualification", {})
+            ),
+        })
+        return snapshot
+
+    def _synchronize_proof_models(self, checkpoint_revision: str) -> None:
+        """Quiesce, refresh every replica, then atomically resume proving."""
+
+        scheduler = self.proof_scheduler
+        if scheduler is None:
+            return
+        if not checkpoint_revision:
+            raise RuntimeError(
+                "proof scheduler requires a published checkpoint revision"
+            )
+        if scheduler.checkpoint_ready(checkpoint_revision):
+            return
+        if scheduler.state is SchedulerState.RUNNING:
+            if not scheduler.drain(
+                timeout=MAX_PROOF_WALL_SECONDS + 60.0
+            ):
+                raise RuntimeError(
+                    "proof scheduler did not drain before checkpoint refresh"
+                )
+        elif scheduler.state in {
+            SchedulerState.DRAINING,
+            SchedulerState.QUIESCING,
+        }:
+            if not scheduler.quiesce(
+                timeout=MAX_PROOF_WALL_SECONDS + 60.0
+            ):
+                raise RuntimeError(
+                    "proof scheduler did not quiesce before checkpoint refresh"
+                )
+        if scheduler.state is not SchedulerState.QUIESCED:
+            raise RuntimeError(
+                "proof scheduler is not quiesced for checkpoint refresh"
+            )
+
+        for device in self._proof_models:
+            scheduler.mark_device_not_ready(device)
+        reference_state = self.verify_model.state_dict()
+        for device, model in self._proof_models.items():
+            if model is not self.verify_model:
+                model.load_state_dict(reference_state)
+            model.eval()
+            for parameter in model.parameters():
+                parameter.requires_grad = False
+            actual_device = _model_device(model)
+            if actual_device is not None and actual_device != device:
+                raise RuntimeError(
+                    f"proof replica {device!r} is on {actual_device!r}"
+                )
+            scheduler.mark_device_ready(device, checkpoint_revision)
+        scheduler.resume(checkpoint_revision)
+
     @property
     def _active_batcher(self):
         """Legacy scalar accessor: first active batcher, or None.
@@ -854,6 +992,16 @@ class ValidationService:
             download_fn=_download,
             commit_title_fn=_commit_title,
         )
+        from reliquary.validator.checkpoint_profile import (
+            validate_checkpoint_profile,
+        )
+
+        # Historical auction-v2 checkpoints predate lineage metadata and remain
+        # loadable. Auction-v3 must never silently resume those 2B weights.
+        validate_checkpoint_profile(
+            local_path,
+            required=PROTOCOL_VERSION >= 3,
+        )
         # Load weights — this replaces both models loaded at __init__.
         # verify_model gets the resumed weights too (so the batcher
         # verifies miners against the resumed checkpoint, which is what
@@ -920,22 +1068,37 @@ class ValidationService:
         )
         cp = self._checkpoint_store.current_manifest()
         cp_hash = cp.revision if cp else ""
+        if self.proof_scheduler is not None and not (
+            cp_hash
+            and self.proof_scheduler.state is SchedulerState.RUNNING
+            and self.proof_scheduler.checkpoint_ready(cp_hash)
+        ):
+            raise RuntimeError(
+                "proof scheduler is not ready for the active checkpoint"
+            )
         operator_by_hotkey = self.server.operator_by_hotkey_snapshot()
         self._active_batchers = {}
         for env_name, env in self.envs.items():
+            open_kwargs = {
+                "window_start": target_window,
+                "env": env,
+                "model": self.verify_model,
+                "cooldown_map": self._cooldown_per_env[env_name],
+                "content_cooldown_map": (
+                    self._content_cooldown_per_env[env_name]
+                ),
+                "hash_set": self._hash_set,
+                "tokenizer": self.tokenizer,
+                "bootstrap": bootstrap,
+                "queue_drained_predicate": (
+                    self._queue_and_proofs_drained
+                ),
+                "operator_by_hotkey": operator_by_hotkey,
+            }
+            if self.proof_scheduler is not None:
+                open_kwargs["proof_scheduler"] = self.proof_scheduler
             batcher = open_grpo_window(
-                window_start=target_window,
-                env=env, model=self.verify_model,
-                cooldown_map=self._cooldown_per_env[env_name],
-                content_cooldown_map=self._content_cooldown_per_env[env_name],
-                hash_set=self._hash_set,
-                tokenizer=self.tokenizer,
-                bootstrap=bootstrap,
-                # Seal extension waits until the submit queue AND in-flight
-                # GRAIL proofs have both drained — concurrent verification
-                # empties the queue while proofs are still running.
-                queue_drained_predicate=self._queue_and_proofs_drained,
-                operator_by_hotkey=operator_by_hotkey,
+                **open_kwargs,
             )
             batcher.current_checkpoint_hash = cp_hash
             self._active_batchers[env_name] = batcher
@@ -1733,14 +1896,57 @@ class ValidationService:
         seal_randomness = await self._fetch_seal_randomness()
         for b in self._active_batchers.values():
             b.seal_randomness = seal_randomness
-        # seal_batch now runs the GRAIL GPU proofs (``_prove_ranked``, up to ~8
-        # forward passes at 5-25s each), so offload each batcher to a thread to
-        # keep the event loop responsive (/state, /health, submit, archive).
-        # Awaited sequentially in dict order so the deterministic fold into
-        # combined rewards / window_batches / archives is byte-for-byte unchanged.
-        sealed: dict[str, tuple] = {}
-        for name, b in self._active_batchers.items():
-            sealed[name] = await asyncio.to_thread(b.seal_batch, pool=pool_per_env)
+        # Both environments submit their strict rank order to one global,
+        # device-owning scheduler. The scheduler applies decisions in rank
+        # order even when distinct replicas finish out of order.
+        seal_items = tuple(self._active_batchers.items())
+        if self.proof_scheduler is None:
+            # Exact v2 compatibility: both batchers share one verify model.
+            seal_results = []
+            for _name, batcher in seal_items:
+                seal_results.append(
+                    await asyncio.to_thread(
+                        batcher.seal_batch,
+                        pool=pool_per_env,
+                    )
+                )
+        else:
+            seal_results = await asyncio.gather(*(
+                asyncio.to_thread(batcher.seal_batch, pool=pool_per_env)
+                for _name, batcher in seal_items
+            ))
+        sealed: dict[str, tuple] = {
+            name: result
+            for (name, _batcher), result in zip(
+                seal_items, seal_results
+            )
+        }
+        proof_capacity_aborts = {
+            name: getattr(
+                batcher,
+                "proof_capacity_abort_reason",
+                None,
+            )
+            for name, batcher in self._active_batchers.items()
+            if bool(
+                getattr(batcher, "proof_capacity_aborted", False)
+            )
+        }
+        if proof_capacity_aborts:
+            logger.error(
+                "Window %d: proof capacity aborted %s; skipping rewards, "
+                "training and checkpoint publication",
+                self._window_n,
+                proof_capacity_aborts,
+            )
+            self._enqueue_aborted_window(
+                failure_stage="proof_capacity",
+                failure_type="ProofCapacityAbort",
+            )
+            self.server.set_active_batchers({})
+            self._active_batchers = {}
+            self._set_state(WindowState.READY)
+            return
         for name, (batch, rewards) in sealed.items():
             self._active_batchers[name].rewards_by_hotkey = rewards
 
@@ -2108,6 +2314,12 @@ class ValidationService:
                         "verify_model refresh failed; verify_model now "
                         "stale wrt checkpoint %d", entry.checkpoint_n,
                     )
+                    raise
+                if self.proof_scheduler is not None:
+                    await asyncio.to_thread(
+                        self._synchronize_proof_models,
+                        entry.revision,
+                    )
                 if publication_retry_pending:
                     discarded = self._training_accumulator.reset()
                     post_publish_state = self._training_accumulator.snapshot()
@@ -2133,7 +2345,10 @@ class ValidationService:
                     publication_reason,
                 )
             except Exception:
-                logger.exception("HF publish failed; staying on previous checkpoint")
+                logger.exception(
+                    "checkpoint publish or proof-replica refresh failed; "
+                    "validator will remain closed until replicas are coherent"
+                )
         elif trained:
             logger.info(
                 "Skipping HF publish for window_n=%d "
@@ -2308,6 +2523,12 @@ class ValidationService:
                 ),
                 "difficulty_auction_proof_passed": difficulty_meta.get(
                     "proof_passed"
+                ),
+                "difficulty_auction_proof_device": difficulty_meta.get(
+                    "proof_device"
+                ),
+                "difficulty_auction_proof_duration_seconds": (
+                    difficulty_meta.get("proof_duration_seconds")
                 ),
                 "difficulty_auction_forensic_sampled": difficulty_meta.get(
                     "forensic_sampled", False
@@ -2639,6 +2860,7 @@ class ValidationService:
                 )
                 for env_name, env_batcher in batcher_dict.items()
             },
+            "proof_scheduler": self._proof_scheduler_health_snapshot(),
             "window_opened_wall_ts_by_environment": {
                 env_name: getattr(env_batcher, "window_opened_wall_ts", None)
                 for env_name, env_batcher in batcher_dict.items()
@@ -2756,6 +2978,24 @@ class ValidationService:
                 name: getattr(batcher, "force_seal_reason", None)
                 for name, batcher in self._active_batchers.items()
             },
+            "proof_capacity_abort_by_environment": {
+                name: {
+                    "aborted": bool(
+                        getattr(
+                            batcher,
+                            "proof_capacity_aborted",
+                            False,
+                        )
+                    ),
+                    "reason": getattr(
+                        batcher,
+                        "proof_capacity_abort_reason",
+                        None,
+                    ),
+                }
+                for name, batcher in self._active_batchers.items()
+            },
+            "proof_scheduler": self._proof_scheduler_health_snapshot(),
             "auction_seal_drain_by_environment": {
                 name: dict(
                     getattr(batcher, "auction_seal_drain", {}) or {}
@@ -2916,6 +3156,28 @@ class ValidationService:
         await self._serve_axon_on_chain(subtensor)
         await self._apply_resume_from()                  # ← resume before bootstrap
         await self._bootstrap_state_from_external()
+        if PROTOCOL_VERSION >= 3 and self.proof_scheduler is None:
+            raise RuntimeError(
+                "auction-v3 requires configured proof replicas; set "
+                "RELIQUARY_PROOF_DEVICES and qualify capacity before launch"
+            )
+        if (
+            PROTOCOL_VERSION >= 3
+            and self.proof_capacity_qualification.get("qualified") is not True
+        ):
+            raise RuntimeError(
+                "auction-v3 proof capacity is not qualified"
+            )
+        if self.proof_scheduler is not None:
+            checkpoint = self._checkpoint_store.current_manifest()
+            if checkpoint is None:
+                raise RuntimeError(
+                    "scheduled proving requires a published checkpoint"
+                )
+            await asyncio.to_thread(
+                self._synchronize_proof_models,
+                checkpoint.revision,
+            )
         self._publish_window_preparation_state()
         await self._rebuild_cooldown_from_history()
         await self._restore_content_cooldown()
@@ -3030,6 +3292,11 @@ class ValidationService:
                     await asyncio.wait_for(task, timeout=5)
                 except (asyncio.CancelledError, asyncio.TimeoutError):
                     pass
+            if self.proof_scheduler is not None:
+                await asyncio.to_thread(
+                    self.proof_scheduler.close,
+                    MAX_PROOF_WALL_SECONDS + 60.0,
+                )
             await self.server.stop()
             telemetry.finish()
 
@@ -3178,7 +3445,13 @@ class ValidationService:
                 )
             self._resume_from = f"sha:{latest_sha}"
             await self._apply_resume_from()
-        except Exception:
+        except Exception as exc:
+            from reliquary.validator.checkpoint_profile import (
+                CheckpointProfileMismatch,
+            )
+
+            if isinstance(exc, CheckpointProfileMismatch):
+                raise
             logger.exception(
                 "Failed to auto-discover latest HF checkpoint; "
                 "validator stays on whatever --resume-from gave us"

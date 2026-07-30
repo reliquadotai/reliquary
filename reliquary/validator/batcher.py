@@ -101,6 +101,15 @@ from reliquary.validator.prompt_content import (
     render_canonical_prompt,
     target_content_sha256,
 )
+from reliquary.validator.proof_scheduler import (
+    CapacityAbortReason,
+    GlobalProofScheduler,
+    ProofDecisionStatus,
+    ProofExecution,
+    ProofPlan,
+    ProofPlanOutcome,
+    RankedProof,
+)
 from reliquary.validator.boxed_integrity import has_malformed_final_answer
 from reliquary.validator.auth_forensics import (
     auth_forensics_context_chars,
@@ -514,6 +523,20 @@ class _UploadPrecommitReservation:
     payload_transferred: bool = False
 
 
+@dataclass(frozen=True)
+class _ScheduledProofPayload:
+    batcher: Any = field(repr=False)
+    pending: PendingSubmission = field(repr=False)
+    count_operator_debt: bool = True
+
+    def execute(self, model: Any) -> ValidSubmission | None:
+        return self.batcher._execute_scheduled_proof(
+            self.pending,
+            model=model,
+            count_operator_debt=self.count_operator_debt,
+        )
+
+
 class GrpoWindowBatcher:
     """Accepts v2 submissions, runs the full verification pipeline, and
     exposes ``valid_submissions()`` + ``select_batch()`` at window close.
@@ -542,6 +565,7 @@ class GrpoWindowBatcher:
         queue_drained_predicate: Callable[[], bool] | None = None,
         operator_by_hotkey: dict[str, str] | None = None,
         current_round_fn: Callable[[], int | None] | None = None,
+        proof_scheduler: GlobalProofScheduler | None = None,
     ) -> None:
         from reliquary.constants import DRAND_ROUND_BACKWARD_TOLERANCE
 
@@ -552,6 +576,7 @@ class GrpoWindowBatcher:
             and getattr(env, "name", "") in DIFFICULTY_AUCTION_ENVIRONMENTS
         )
         self.model = model
+        self._proof_scheduler = proof_scheduler
         self.tokenizer = tokenizer
         self.bootstrap = bootstrap
         # Set True by the validator's background drand-verify task
@@ -806,6 +831,8 @@ class GrpoWindowBatcher:
         self._expensive_proof_failures_by_operator: dict[str, int] = {}
         self.proof_wall_elapsed_seconds = 0.0
         self.proof_wall_exhausted = False
+        self.proof_capacity_aborted = False
+        self.proof_capacity_abort_reason: str | None = None
         self.forensic_proof_attempts = 0
         self.forensic_proof_errors_by_type: dict[str, int] = {}
         self.auction_operator_unmapped_skips = 0
@@ -2558,7 +2585,10 @@ class GrpoWindowBatcher:
             self._seal_event.set()
 
     def _verify_expensive(
-        self, pending: PendingSubmission
+        self,
+        pending: PendingSubmission,
+        *,
+        model: Any | None = None,
     ) -> ValidSubmission | None:
         """Prove one graded candidate on the GPU and run every proof-dependent
         gate. Returns the ``ValidSubmission`` on success, ``None`` on rejection.
@@ -2568,11 +2598,12 @@ class GrpoWindowBatcher:
         it calls ``self._reject`` exactly as the inline pipeline did, so
         per-hotkey proof-failure debt and the R2 archive entries are unchanged.
 
-        NOT state-free — via ``self._reject`` it mutates
-        ``reject_counts``/``rejected_submissions`` and flips
-        ``rollout.commit["rollout"]["truncated"]``. It MUST be called serially
-        (``_prove_ranked`` runs a top-down loop, never in parallel).
+        Calls for different candidates may run concurrently only when each call
+        receives a distinct model replica. Candidate-local rollout mutation is
+        isolated, while shared reject/debt accounting is protected by the
+        batcher's existing locks.
         """
+        proof_model = self.model if model is None else model
         request = pending.request
         telemetry = pending.telemetry
         hk = request.miner_hotkey
@@ -2668,7 +2699,7 @@ class GrpoWindowBatcher:
         force_think_close_ids: set[int] = set()
         try:
             telemetry_eos_ids = set(
-                resolve_eos_token_ids(self.model, self.tokenizer)
+                resolve_eos_token_ids(proof_model, self.tokenizer)
             )
         except Exception:
             telemetry_eos_ids = set()
@@ -2746,7 +2777,7 @@ class GrpoWindowBatcher:
             try:
                 proof = self._verify_commitment(
                     rollout.commit,
-                    self.model,
+                    proof_model,
                     self.randomness,
                     tokenizer=self.tokenizer,
                     seed_u_values=seed_u,
@@ -2763,18 +2794,18 @@ class GrpoWindowBatcher:
                 if _is_missing_kwarg_typeerror(exc, "seed_u_values"):
                     try:
                         proof = self._verify_commitment(
-                            rollout.commit, self.model, self.randomness,
+                            rollout.commit, proof_model, self.randomness,
                             tokenizer=self.tokenizer,
                         )
                     except TypeError as exc2:
                         if not _is_missing_kwarg_typeerror(exc2, "tokenizer"):
                             raise
                         proof = self._verify_commitment(
-                            rollout.commit, self.model, self.randomness,
+                            rollout.commit, proof_model, self.randomness,
                         )
                 elif _is_missing_kwarg_typeerror(exc, "tokenizer"):
                     proof = self._verify_commitment(
-                        rollout.commit, self.model, self.randomness,
+                        rollout.commit, proof_model, self.randomness,
                     )
                 else:
                     raise
@@ -2873,7 +2904,11 @@ class GrpoWindowBatcher:
             # Skipped when the stub didn't populate sparse outputs (legacy
             # test fixtures that opted out of behavioural enforcement).
             if proof.has_sparse_outputs:
-                if has_eos_padding(rollout.commit, self.tokenizer, self.model):
+                if has_eos_padding(
+                    rollout.commit,
+                    self.tokenizer,
+                    proof_model,
+                ):
                     return reject(
                         RejectReason.BAD_TERMINATION,
                         "termination",
@@ -2883,14 +2918,14 @@ class GrpoWindowBatcher:
                     rollout.commit,
                     self.tokenizer,
                     proof,
-                    self.model,
+                    proof_model,
                     env_name=getattr(self.env, "name", ""),
                 )
                 cap_truncated = is_cap_truncation(
                     rollout.commit,
                     self.tokenizer,
                     proof,
-                    self.model,
+                    proof_model,
                     env_name=getattr(self.env, "name", ""),
                 )
                 terminal_pick_ok = getattr(proof, "terminal_pick_ok", None)
@@ -3482,6 +3517,52 @@ class GrpoWindowBatcher:
         # legacy admission.
         return new_sub
 
+    def _execute_scheduled_proof(
+        self,
+        pending: PendingSubmission,
+        *,
+        model: Any,
+        count_operator_debt: bool,
+    ) -> ValidSubmission | None:
+        """Run one scheduler-owned proof and atomically apply failure debt."""
+
+        operator = self._operator_for_hotkey(pending.hotkey)
+        try:
+            verified = self._verify_expensive(pending, model=model)
+        except Exception:
+            if count_operator_debt:
+                with self._proof_admission_lock:
+                    self._expensive_proof_failures_by_hotkey[
+                        pending.hotkey
+                    ] = (
+                        self._expensive_proof_failures_by_hotkey.get(
+                            pending.hotkey, 0
+                        )
+                        + 1
+                    )
+                    if operator is not None:
+                        self._expensive_proof_failures_by_operator[
+                            operator
+                        ] = (
+                            self._expensive_proof_failures_by_operator.get(
+                                operator, 0
+                            )
+                            + 1
+                        )
+            raise
+        if verified is None and count_operator_debt and operator is not None:
+            # Proof-stage rejects already add hotkey debt in ``_reject``.
+            # Auction selection has historically charged one operator failure
+            # for every failed expensive proof as a second Sybil bound.
+            with self._proof_admission_lock:
+                self._expensive_proof_failures_by_operator[operator] = (
+                    self._expensive_proof_failures_by_operator.get(
+                        operator, 0
+                    )
+                    + 1
+                )
+        return verified
+
     def _reject(
         self,
         reason: RejectReason,
@@ -3608,6 +3689,235 @@ class GrpoWindowBatcher:
             if candidate is not None:
                 return float(candidate)
         return 0.0
+
+    def _prove_ranked_scheduled(
+        self,
+        *,
+        ranked: list[tuple[PendingSubmission, Any]],
+        candidate_rows: list[dict[str, Any]],
+        operator_by_id: dict[int, str | None],
+    ) -> tuple[
+        int,
+        list[ValidSubmission],
+        set[int],
+        set[str],
+        set[int],
+        str | None,
+    ]:
+        """Submit the strict economic order to the global proof scheduler."""
+
+        scheduler = self._proof_scheduler
+        if scheduler is None:
+            raise RuntimeError("scheduled proof path requires a scheduler")
+        environment = str(getattr(self.env, "name", ""))
+        candidates: list[RankedProof] = []
+        row_by_job: dict[str, dict[str, Any]] = {}
+        pending_by_job: dict[str, PendingSubmission] = {}
+
+        for (pending, _score), row in zip(ranked, candidate_rows):
+            content_digest = pending.prompt_content_sha256
+            if self._cooldown.is_in_cooldown(
+                pending.prompt_idx, self.window_start
+            ):
+                row["status"] = "cooldown"
+                continue
+            if self._content_cooldown.is_in_cooldown(
+                content_digest, self.window_start
+            ):
+                row["status"] = "content_in_cooldown"
+                continue
+            operator = operator_by_id[id(pending)]
+            if operator is None:
+                row["status"] = "operator_unmapped"
+                self.auction_operator_unmapped_skips += 1
+                continue
+
+            operator_remaining = (
+                MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW
+                - self.operator_proof_failure_debt(operator)
+            )
+            if operator_remaining <= 0:
+                row["status"] = "operator_proof_debt"
+                self.auction_operator_proof_debt_skips += 1
+                continue
+            hotkey_remaining = (
+                MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
+                - self.proof_failure_debt(pending.hotkey)
+            )
+            if hotkey_remaining <= 0:
+                row["status"] = "hotkey_proof_debt"
+                continue
+
+            rank = int(row["rank"])
+            job_id = (
+                f"{self.window_start}:{environment}:winner:{rank}"
+            )
+            prompt_key: Any = (
+                ("content", content_digest)
+                if content_digest
+                else ("prompt", pending.prompt_idx)
+            )
+            candidate = RankedProof(
+                job_id=job_id,
+                rank=rank,
+                prompt_key=prompt_key,
+                payload=_ScheduledProofPayload(
+                    batcher=self,
+                    pending=pending,
+                ),
+                resources=(
+                    (
+                        (environment, "operator", operator),
+                        operator_remaining,
+                    ),
+                    (
+                        (environment, "hotkey", pending.hotkey),
+                        hotkey_remaining,
+                    ),
+                ),
+            )
+            candidates.append(candidate)
+            row_by_job[job_id] = row
+            pending_by_job[job_id] = pending
+
+        deadline_at = (
+            float(self._proof_wall_started_at)
+            + MAX_PROOF_WALL_SECONDS
+        )
+        result = scheduler.submit(
+            ProofPlan(
+                plan_id=(
+                    f"{self.window_start}:{environment}:auction-winners"
+                ),
+                environment=environment,
+                checkpoint_revision=self.current_checkpoint_hash,
+                candidates=tuple(candidates),
+                required_passes=B_BATCH,
+                deadline_at=deadline_at,
+                max_attempts=MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
+                priority=0,
+                allow_shortfall=True,
+            )
+        ).result()
+
+        attempted_ids: set[int] = set()
+        proven: list[ValidSubmission] = []
+        claimed: set[int] = set()
+        claimed_contents: set[str] = set()
+        for decision in result.decisions:
+            row = row_by_job[decision.job_id]
+            pending = pending_by_job[decision.job_id]
+            if decision.started_at is not None:
+                attempted_ids.add(id(pending))
+                row["proof_attempted"] = True
+                row["proof_phase"] = "scheduled_post_seal"
+                row["proof_device"] = decision.device_id
+                row["proof_started_at"] = decision.started_at
+                row["proof_finished_at"] = decision.finished_at
+                row["proof_duration_seconds"] = (
+                    max(
+                        0.0,
+                        float(decision.finished_at)
+                        - float(decision.started_at),
+                    )
+                    if decision.finished_at is not None
+                    else None
+                )
+
+            if decision.status is ProofDecisionStatus.PASSED:
+                submission = decision.value
+                if not isinstance(submission, ValidSubmission):
+                    raise RuntimeError(
+                        "proof scheduler returned a non-submission winner"
+                    )
+                row["proof_passed"] = True
+                row["selected"] = True
+                row["status"] = "selected"
+                proven.append(submission)
+                claimed.add(pending.prompt_idx)
+                claimed_contents.add(pending.prompt_content_sha256)
+                self.difficulty_auction_metadata_by_id[
+                    id(submission)
+                ] = row
+            elif decision.status is ProofDecisionStatus.REJECTED:
+                row["proof_passed"] = False
+                row["status"] = "proof_failed"
+                row["proof_error"] = decision.reason
+            elif decision.status is ProofDecisionStatus.ERROR:
+                row["proof_passed"] = False
+                row["status"] = "proof_error"
+                row["proof_error"] = decision.reason
+            elif decision.status is (
+                ProofDecisionStatus.SKIPPED_PROMPT_CLAIMED
+            ):
+                row["status"] = (
+                    "same_prompt_superseded"
+                    if pending.prompt_idx in claimed
+                    else "same_content_superseded"
+                )
+            elif decision.status is (
+                ProofDecisionStatus.SKIPPED_RESOURCE_LIMIT
+            ):
+                operator = operator_by_id[id(pending)]
+                if (
+                    operator is not None
+                    and self.operator_proof_failure_debt(operator)
+                    >= MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW
+                ):
+                    row["status"] = "operator_proof_debt"
+                    self.auction_operator_proof_debt_skips += 1
+                else:
+                    row["status"] = "hotkey_proof_debt"
+            elif decision.status is ProofDecisionStatus.NOT_NEEDED:
+                row["status"] = "not_needed"
+            else:
+                row["status"] = (
+                    "unobserved_"
+                    + (
+                        decision.reason
+                        or CapacityAbortReason.DEADLINE_EXCEEDED.value
+                    )
+                )
+
+        stop_reason: str | None = None
+        if result.outcome is ProofPlanOutcome.CAPACITY_ABORTED:
+            self.proof_capacity_aborted = True
+            self.proof_capacity_abort_reason = (
+                result.abort_reason.value
+                if result.abort_reason is not None
+                else "unknown"
+            )
+            self.proof_wall_exhausted = (
+                result.abort_reason
+                is CapacityAbortReason.DEADLINE_EXCEEDED
+            )
+            stop_reason = (
+                f"proof_capacity_{self.proof_capacity_abort_reason}"
+            )
+            # No partial winner set may flow into payout or training.
+            for row in candidate_rows:
+                if row.get("selected"):
+                    row["selected"] = False
+                    row["status"] = (
+                        "unobserved_"
+                        + stop_reason
+                    )
+            proven = []
+            claimed.clear()
+            claimed_contents.clear()
+        elif len(proven) >= B_BATCH:
+            stop_reason = "batch_filled"
+        else:
+            stop_reason = "eligible_shortfall"
+
+        return (
+            result.attempts_started,
+            proven,
+            claimed,
+            claimed_contents,
+            attempted_ids,
+            stop_reason,
+        )
 
     def _prove_ranked(self, pool: float = 1.0) -> list[ValidSubmission]:
         """Prove strict auction winners until ``B_BATCH`` distinct prompts pass.
@@ -3759,95 +4069,108 @@ class GrpoWindowBatcher:
         self.proof_wall_exhausted = False
         stop_reason: str | None = None
 
-        for (p, _score), row in zip(ranked, candidate_rows):
-            if len(proven) >= B_BATCH:
-                stop_reason = "batch_filled"
-                break
-            if p.prompt_idx in claimed:
-                row["status"] = "same_prompt_superseded"
-                continue          # a higher-ranked passing candidate won it
-            content_digest = p.prompt_content_sha256
-            if content_digest in claimed_contents:
-                row["status"] = "same_content_superseded"
-                continue
-            if self._cooldown.is_in_cooldown(p.prompt_idx, self.window_start):
-                row["status"] = "cooldown"
-                continue
-            if self._content_cooldown.is_in_cooldown(
-                content_digest, self.window_start
-            ):
-                row["status"] = "content_in_cooldown"
-                continue
-            operator = row["operator_id"]
-            if operator is None:
-                row["status"] = "operator_unmapped"
-                self.auction_operator_unmapped_skips += 1
-                continue
-            if (
-                self.operator_proof_failure_debt(operator)
-                >= MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW
-            ):
-                row["status"] = "operator_proof_debt"
-                self.auction_operator_proof_debt_skips += 1
-                continue
-            # Global proof budget: proving cannot exceed the graded-pool ceiling
-            # (v2 §2.3). This bounds a multi-hotkey fabricated flood that the
-            # per-hotkey skip below cannot, since each fake hotkey pays only one
-            # registration. On exhaustion we stop and advance short.
-            if attempts >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW:
-                logger.warning(
-                    "proof budget exhausted window=%d attempts=%d proven=%d "
-                    "pending=%d — advancing with shortfall",
-                    self.window_start, attempts, len(proven), len(pending),
-                )
-                stop_reason = "attempt_budget"
-                break
-            elapsed = self._time_fn() - self._proof_wall_started_at
-            if elapsed >= MAX_PROOF_WALL_SECONDS:
-                self.proof_wall_exhausted = True
-                stop_reason = "wall_budget"
-                logger.warning(
-                    "proof wall budget exhausted window=%d elapsed_s=%.2f "
-                    "attempts=%d proven=%d pending=%d — advancing with shortfall",
-                    self.window_start,
-                    elapsed,
-                    attempts,
-                    len(proven),
-                    len(pending),
-                )
-                break
-            # Per-hotkey griefer bound. A fabricated group ranks at the top by
-            # construction and fails the proof; each hotkey is skipped after its
-            # failure cap so honest fill below the fakes always proceeds.
-            if (
-                self.proof_failure_debt(p.hotkey)
-                >= MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
-            ):
-                row["status"] = "hotkey_proof_debt"
-                continue
-            attempts += 1
-            attempted_ids.add(id(p))
-            row["proof_attempted"] = True
-            row["proof_phase"] = "post_seal"
-            row["status"] = "proof_started"
-            sub = self._verify_expensive(p)
-            if sub is None:
-                self._expensive_proof_failures_by_operator[operator] = (
-                    self._expensive_proof_failures_by_operator.get(
-                        operator, 0
+        if self._proof_scheduler is not None:
+            (
+                attempts,
+                proven,
+                claimed,
+                claimed_contents,
+                attempted_ids,
+                stop_reason,
+            ) = self._prove_ranked_scheduled(
+                ranked=ranked,
+                candidate_rows=candidate_rows,
+                operator_by_id=operator_by_id,
+            )
+        else:
+            for (p, _score), row in zip(ranked, candidate_rows):
+                if len(proven) >= B_BATCH:
+                    stop_reason = "batch_filled"
+                    break
+                if p.prompt_idx in claimed:
+                    row["status"] = "same_prompt_superseded"
+                    continue
+                content_digest = p.prompt_content_sha256
+                if content_digest in claimed_contents:
+                    row["status"] = "same_content_superseded"
+                    continue
+                if self._cooldown.is_in_cooldown(
+                    p.prompt_idx, self.window_start
+                ):
+                    row["status"] = "cooldown"
+                    continue
+                if self._content_cooldown.is_in_cooldown(
+                    content_digest, self.window_start
+                ):
+                    row["status"] = "content_in_cooldown"
+                    continue
+                operator = row["operator_id"]
+                if operator is None:
+                    row["status"] = "operator_unmapped"
+                    self.auction_operator_unmapped_skips += 1
+                    continue
+                if (
+                    self.operator_proof_failure_debt(operator)
+                    >= MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW
+                ):
+                    row["status"] = "operator_proof_debt"
+                    self.auction_operator_proof_debt_skips += 1
+                    continue
+                if attempts >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW:
+                    logger.warning(
+                        "proof budget exhausted window=%d attempts=%d "
+                        "proven=%d pending=%d — advancing with shortfall",
+                        self.window_start,
+                        attempts,
+                        len(proven),
+                        len(pending),
                     )
-                    + 1
-                )
-                row["proof_passed"] = False
-                row["status"] = "proof_failed"
-                continue          # rejected; promote the next-ranked for prompt
-            row["proof_passed"] = True
-            row["selected"] = True
-            row["status"] = "selected"
-            proven.append(sub)
-            claimed.add(p.prompt_idx)
-            claimed_contents.add(content_digest)
-            self.difficulty_auction_metadata_by_id[id(sub)] = row
+                    stop_reason = "attempt_budget"
+                    break
+                elapsed = self._time_fn() - self._proof_wall_started_at
+                if elapsed >= MAX_PROOF_WALL_SECONDS:
+                    self.proof_wall_exhausted = True
+                    stop_reason = "wall_budget"
+                    logger.warning(
+                        "proof wall budget exhausted window=%d elapsed_s=%.2f "
+                        "attempts=%d proven=%d pending=%d — advancing with "
+                        "shortfall",
+                        self.window_start,
+                        elapsed,
+                        attempts,
+                        len(proven),
+                        len(pending),
+                    )
+                    break
+                if (
+                    self.proof_failure_debt(p.hotkey)
+                    >= MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
+                ):
+                    row["status"] = "hotkey_proof_debt"
+                    continue
+                attempts += 1
+                attempted_ids.add(id(p))
+                row["proof_attempted"] = True
+                row["proof_phase"] = "post_seal"
+                row["status"] = "proof_started"
+                sub = self._verify_expensive(p)
+                if sub is None:
+                    self._expensive_proof_failures_by_operator[operator] = (
+                        self._expensive_proof_failures_by_operator.get(
+                            operator, 0
+                        )
+                        + 1
+                    )
+                    row["proof_passed"] = False
+                    row["status"] = "proof_failed"
+                    continue
+                row["proof_passed"] = True
+                row["selected"] = True
+                row["status"] = "selected"
+                proven.append(sub)
+                claimed.add(p.prompt_idx)
+                claimed_contents.add(content_digest)
+                self.difficulty_auction_metadata_by_id[id(sub)] = row
 
         with self._lock:
             self._valid = proven
@@ -3988,6 +4311,132 @@ class GrpoWindowBatcher:
         self.rewards_by_hotkey = dict(rewards)
         return winners, rewards
 
+    def _prove_forensic_scheduled(
+        self,
+        sample: list[tuple[PendingSubmission, str]],
+    ) -> list[ForensicSampleResult]:
+        """Run observational proofs through idle scheduler capacity."""
+
+        scheduler = self._proof_scheduler
+        if scheduler is None:
+            raise RuntimeError("scheduled forensic path requires a scheduler")
+        if self._proof_wall_started_at is None:
+            return []
+        available_attempts = max(
+            0,
+            MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW - self.proof_attempts,
+        )
+        selected = sample[:available_attempts]
+        if not selected:
+            return []
+
+        environment = str(getattr(self.env, "name", ""))
+        candidates: list[RankedProof] = []
+        pending_by_job: dict[str, PendingSubmission] = {}
+        role_by_job: dict[str, str] = {}
+        for rank, (pending, sample_role) in enumerate(selected, start=1):
+            job_id = (
+                f"{self.window_start}:{environment}:forensic:{rank}"
+            )
+            candidates.append(
+                RankedProof(
+                    job_id=job_id,
+                    rank=rank,
+                    prompt_key=(
+                        ("content", pending.prompt_content_sha256)
+                        if pending.prompt_content_sha256
+                        else ("prompt", pending.prompt_idx)
+                    ),
+                    payload=_ScheduledProofPayload(
+                        batcher=self,
+                        pending=pending,
+                        count_operator_debt=False,
+                    ),
+                )
+            )
+            pending_by_job[job_id] = pending
+            role_by_job[job_id] = sample_role
+
+        result = scheduler.submit(
+            ProofPlan(
+                plan_id=(
+                    f"{self.window_start}:{environment}:auction-forensic"
+                ),
+                environment=environment,
+                checkpoint_revision=self.current_checkpoint_hash,
+                candidates=tuple(candidates),
+                required_passes=0,
+                deadline_at=(
+                    self._proof_wall_started_at + MAX_PROOF_WALL_SECONDS
+                ),
+                max_attempts=available_attempts,
+                priority=10,
+                complete_all=True,
+                allow_shortfall=True,
+            )
+        ).result()
+
+        results: list[ForensicSampleResult] = []
+        for decision in result.decisions:
+            pending = pending_by_job[decision.job_id]
+            sample_role = role_by_job[decision.job_id]
+            if decision.started_at is not None:
+                self._attempted_pending_ids.add(id(pending))
+            error_type: str | None = None
+            verified: ValidSubmission | None = None
+            passed: bool | None
+            if decision.status is ProofDecisionStatus.PASSED:
+                verified = (
+                    decision.value
+                    if isinstance(decision.value, ValidSubmission)
+                    else None
+                )
+                passed = verified is not None
+                if verified is None:
+                    error_type = "InvalidSchedulerResult"
+            elif decision.status is ProofDecisionStatus.REJECTED:
+                passed = False
+            elif decision.status is ProofDecisionStatus.ERROR:
+                passed = None
+                error_type = str(
+                    decision.reason or "ProofSchedulerError"
+                ).split(":", 1)[0]
+            elif decision.status is ProofDecisionStatus.CAPACITY_ABORTED:
+                passed = None
+                error_type = "ProofCapacityAbort"
+            else:
+                passed = None
+                error_type = decision.status.value
+
+            if error_type is not None:
+                self.forensic_proof_errors_by_type[error_type] = (
+                    self.forensic_proof_errors_by_type.get(error_type, 0)
+                    + 1
+                )
+            row = self.difficulty_auction_metadata_by_id.get(id(pending))
+            if row is not None:
+                row["forensic_sampled"] = (
+                    decision.started_at is not None
+                )
+                row["forensic_sample_role"] = sample_role
+                row["forensic_passed"] = passed
+                row["forensic_error_type"] = error_type
+                row["forensic_device"] = decision.device_id
+            results.append(
+                ForensicSampleResult(
+                    hotkey=pending.hotkey,
+                    prompt_idx=pending.prompt_idx,
+                    passed=passed,
+                    error_type=error_type,
+                    sample_role=sample_role,
+                    submission=verified,
+                )
+            )
+
+        self.proof_attempts += result.attempts_started
+        self.forensic_proof_attempts += result.attempts_started
+        return results
+
     def _prove_forensic_sample(self) -> list[ForensicSampleResult]:
         """Prove one utility counterfactual plus unpredictable watch samples.
 
@@ -4050,6 +4499,14 @@ class GrpoWindowBatcher:
         results: list[ForensicSampleResult] = []
         self.forensic_proof_attempts = 0
         self.forensic_proof_errors_by_type = {}
+        if self._proof_scheduler is not None:
+            results = self._prove_forensic_scheduled(sample)
+            self.proof_wall_elapsed_seconds = max(
+                self.proof_wall_elapsed_seconds,
+                self._time_fn() - self._proof_wall_started_at,
+            )
+            self.forensic_sample = results
+            return results
         for p, sample_role in sample:
             if self.proof_attempts >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW:
                 break
@@ -4318,6 +4775,32 @@ class GrpoWindowBatcher:
         """
         if self.difficulty_auction_enabled:
             self._prove_ranked(pool)
+            if self.proof_capacity_aborted:
+                self.forensic_sample = []
+                self.selection_metadata_by_id = {}
+                self.rewards_by_hotkey = {}
+                self.reward_alignment = {
+                    "selected_groups": 0,
+                    "rewarded_groups": 0,
+                    "paid_unselected_groups": 0,
+                    "selected_unrewarded_groups": 0,
+                    "reward_alignment_ok": False,
+                    "abort_reason": self.proof_capacity_abort_reason,
+                }
+                self.difficulty_auction_shadow = {
+                    "schema_version": 2,
+                    "status": "aborted",
+                    "mode": "production",
+                    "environment": str(getattr(self.env, "name", "")),
+                    "proof_capacity_aborted": True,
+                    "proof_capacity_abort_reason": (
+                        self.proof_capacity_abort_reason
+                    ),
+                    "proof_attempts": self.proof_attempts,
+                    "proof_wall_seconds": self.proof_wall_elapsed_seconds,
+                    "candidates": self.auction_candidates,
+                }
+                return [], {}
             self._prove_forensic_sample()
         with self._lock:
             if self.difficulty_auction_enabled:
@@ -4341,6 +4824,12 @@ class GrpoWindowBatcher:
                     "proof_wall_seconds": self.proof_wall_elapsed_seconds,
                     "proof_wall_limit_seconds": MAX_PROOF_WALL_SECONDS,
                     "proof_wall_exhausted": self.proof_wall_exhausted,
+                    "proof_capacity_aborted": (
+                        self.proof_capacity_aborted
+                    ),
+                    "proof_capacity_abort_reason": (
+                        self.proof_capacity_abort_reason
+                    ),
                     "proven_winners": len(self._valid),
                     "operator_proof_failure_cap": (
                         MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW

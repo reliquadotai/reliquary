@@ -611,6 +611,7 @@ class _Health(BaseModel):
     admission_latency_ms_by_environment: dict[
         str, dict[str, dict[str, float | None]]
     ] = Field(default_factory=dict)
+    proof_scheduler: dict[str, Any] = Field(default_factory=dict)
     valid_submissions_count: int | None = None
     distinct_valid_prompt_count: int | None = None
     last_valid_submission_ts: float | None = None
@@ -796,6 +797,9 @@ class ValidatorServer:
             Callable[[], dict[str, Any]] | None
         ) = None
         self._utility_telemetry_health_callback: (
+            Callable[[], dict[str, Any]] | None
+        ) = None
+        self._proof_scheduler_health_callback: (
             Callable[[], dict[str, Any]] | None
         ) = None
         self._prompt_source_unavailable_total = 0
@@ -1114,6 +1118,12 @@ class ValidatorServer:
         snapshot_callback: Callable[[], dict[str, Any]],
     ) -> None:
         self._utility_telemetry_health_callback = snapshot_callback
+
+    def configure_proof_scheduler_health(
+        self,
+        snapshot_callback: Callable[[], dict[str, Any]],
+    ) -> None:
+        self._proof_scheduler_health_callback = snapshot_callback
 
     def configure_archive_queue_telemetry(
         self,
@@ -1637,6 +1647,18 @@ class ValidatorServer:
                 "enabled": True,
                 "last_error_type": type(exc).__name__,
             }
+        try:
+            proof_scheduler = (
+                dict(self._proof_scheduler_health_callback())
+                if self._proof_scheduler_health_callback is not None
+                else {}
+            )
+        except Exception as exc:
+            proof_scheduler = {
+                "state": "error",
+                "required": PROTOCOL_VERSION >= 3,
+                "last_error_type": type(exc).__name__,
+            }
         window_environments = {
             str(env_name): self._window_environment_health(env_batcher)
             for env_name, env_batcher in self._active_batchers.items()
@@ -1708,6 +1730,10 @@ class ValidatorServer:
                     )
                 )
                 or content_cooldown.get("complete") is False
+                or (
+                    proof_scheduler.get("required") is True
+                    and proof_scheduler.get("state") != "running"
+                )
                 or self._process_health_snapshot.get("status")
                 in {"warning", "critical"}
             )
@@ -1828,6 +1854,7 @@ class ValidatorServer:
                 }
                 for env_name, metrics in self._admission_latency_samples_ms.items()
             },
+            proof_scheduler=proof_scheduler,
             # These legacy scalar fields reflect the first active environment.
             # During an auction they intentionally report admitted candidates,
             # not only the winners proven later at seal.

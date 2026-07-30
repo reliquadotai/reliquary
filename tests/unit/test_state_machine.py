@@ -719,3 +719,41 @@ async def test_resume_from_load_failure_aborts():
         )
         with pytest.raises(RuntimeError, match="corrupt checkpoint"):
             await svc._apply_resume_from()
+
+
+@pytest.mark.asyncio
+async def test_v3_resume_rejects_checkpoint_without_lineage_before_load(
+    tmp_path,
+    monkeypatch,
+):
+    from unittest.mock import MagicMock
+
+    from reliquary.validator.checkpoint_profile import CheckpointProfileMismatch
+    from reliquary.validator.service import ValidationService
+    import reliquary.validator.service as service_module
+
+    ckpt_dir = tmp_path / "ckpt_3"
+    ckpt_dir.mkdir()
+    load_calls = []
+
+    def fake_load(path):
+        load_calls.append(path)
+        return MagicMock(name="resumed_model")
+
+    monkeypatch.setattr(service_module, "PROTOCOL_VERSION", 3)
+    svc = ValidationService(
+        wallet=_FakeWallet(),
+        model=MagicMock(name="base_model"),
+        tokenizer=MagicMock(),
+        env=_FakeEnv(),
+        netuid=99,
+        resume_from=f"path:{ckpt_dir}",
+        load_model_fn=fake_load,
+    )
+
+    with pytest.raises(
+        CheckpointProfileMismatch,
+        match="no protocol-lineage metadata",
+    ):
+        await svc._apply_resume_from()
+    assert load_calls == []
