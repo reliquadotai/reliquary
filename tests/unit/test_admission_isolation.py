@@ -3,6 +3,7 @@ from concurrent.futures.process import BrokenProcessPool
 from dataclasses import replace
 import multiprocessing
 import os
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -23,6 +24,7 @@ from reliquary.validator.admission import (
     AdmissionReceiptBinding,
     AdmissionRuntimeMaterials,
     ParsedSubmission,
+    _guard_bittensor_queue_listener_eof_in_child,
     admission_worker_ready,
     initialize_admission_worker,
     materialize_and_score_submission,
@@ -87,6 +89,25 @@ def _server_with_admission_pool() -> tuple[ValidatorServer, str]:
         server._new_admission_pool(environment)
     )
     return server, environment
+
+
+def test_admission_child_queue_listener_treats_eof_as_stop(monkeypatch):
+    class _Listener:
+        def dequeue(self, _block):
+            raise EOFError
+
+    listener = _Listener()
+    fake_bt = SimpleNamespace(
+        logging=SimpleNamespace(_listener=listener)
+    )
+    monkeypatch.setitem(sys.modules, "bittensor", fake_bt)
+    monkeypatch.setattr(
+        multiprocessing, "parent_process", lambda: object()
+    )
+
+    assert _guard_bittensor_queue_listener_eof_in_child() is True
+    assert listener.dequeue(True) is None
+    assert listener._reliquary_eof_guarded is True
 
 
 def test_new_admission_pool_prewarms_every_worker(monkeypatch):

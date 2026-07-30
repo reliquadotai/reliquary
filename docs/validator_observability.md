@@ -64,6 +64,35 @@ per-environment pending/queue/proof state, operator mapping, grader failures,
 archive queue, and recent reject counts. It must not include access keys,
 tokens, wallet material, or private keys.
 
+`/health.process_lifecycle` is the long-lived sandbox leak stop-line:
+
+- `init_subreaper_present` must be true. The trainer compose file uses
+  `init: true`, making Docker's init PID 1 so orphaned runsc/gofer descendants
+  are reaped instead of accumulating under validator Python.
+- `zombie_processes`, `cgroup_pids_current`, `cgroup_pids_max`, and
+  `cgroup_pids_utilization` are sampled off the event loop every 30 seconds.
+- PID utilization at 40% marks process health warning; 50% sets
+  `restart_recommended=true` and is the planned quiescent-restart threshold.
+- `grader` reports worker spawns, recycle/restart reasons, terminations, direct
+  child reaps, reap failures, and runsc container cleanup failures.
+
+Before promoting a validator image, exercise worker retirement locally and in
+the privileged candidate container:
+
+```bash
+python scripts/stress_grader_recycling.py \
+  --evaluations 1000 --parallel 8 --pool-size 4 --recycle-after 16
+
+python scripts/stress_grader_recycling.py \
+  --use-runsc --evaluations 10000 --parallel 32 \
+  --pool-size 32 --recycle-after 64 --max-zombie-delta 32
+```
+
+The harness fails if evaluations fail, direct worker spawn/reap conservation
+breaks, or zombie growth exceeds the declared bound. Production rollout must
+recreate only `reliquary-trainer` at a quiescent boundary and preserve the
+checkpoint, archive queue, registration snapshot, and immutable image digest.
+
 R2 archives persist `force_seal_reason_by_environment` and
 `reward_alignment_by_environment`. Completed auction windows require zero
 paid-unselected and selected-unrewarded groups. A non-null

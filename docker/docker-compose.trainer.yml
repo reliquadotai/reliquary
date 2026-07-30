@@ -5,6 +5,12 @@ services:
     image: ghcr.io/reliquadotai/reliquary-validator:latest
     container_name: reliquary-trainer
     restart: unless-stopped
+    stop_grace_period: 60s
+    # Docker's injected init is PID 1 and a Linux child subreaper. This is
+    # required for runsc/gofer descendants that outlive a recycled grader
+    # worker: without it they reparent to the validator Python process and
+    # remain zombies for the lifetime of the container.
+    init: true
     # Required for the OpenCodeInstruct grader's gVisor (runsc) sandbox to
     # start: an unprivileged container fails ("cannot create gofer process /
     # cannot create sandbox"). Verified on the prod host — only --privileged

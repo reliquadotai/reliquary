@@ -8,6 +8,7 @@ only the compact validated result in the trainer process.
 from __future__ import annotations
 
 import math
+import multiprocessing
 import os
 import signal
 import time
@@ -139,11 +140,55 @@ class _AdmissionTimeout(TimeoutError):
 _WORKER_TOKENIZER: Any | None = None
 
 
+def _guard_bittensor_queue_listener_eof_in_child() -> bool:
+    """Make bittensor's admission-child QueueListener exit cleanly on EOF.
+
+    Importing the signature verifier imports bittensor, whose global logger
+    starts a multiprocessing queue listener.  ``ProcessPoolExecutor`` retires
+    admission children after a bounded number of tasks; Python's process
+    teardown can close the queue pipe before that listener stops, producing a
+    noisy ``QueueListener ... EOFError`` thread traceback.
+
+    Do not close or join bittensor's queue here: doing so in a spawn initializer
+    can stall process-pool startup.  QueueListener treats ``None`` as its stop
+    sentinel, so translating teardown-only EOF/OSError to ``None`` preserves
+    normal logging while making retirement graceful.  The parent validator
+    logger is untouched.
+    """
+
+    if multiprocessing.parent_process() is None:
+        return False
+    try:
+        import bittensor as bt
+
+        logging_machine = getattr(bt, "logging", None)
+        listener = getattr(logging_machine, "_listener", None)
+        dequeue = getattr(listener, "dequeue", None)
+        if listener is None or not callable(dequeue):
+            return False
+        if getattr(listener, "_reliquary_eof_guarded", False):
+            return True
+
+        def _safe_dequeue(block: bool) -> Any:
+            try:
+                return dequeue(block)
+            except (EOFError, OSError):
+                return None
+
+        listener.dequeue = _safe_dequeue
+        listener._reliquary_eof_guarded = True
+        return True
+    except Exception:
+        # Logging cleanup must never prevent an admission worker from starting.
+        return False
+
+
 def initialize_admission_worker(tokenizer_json: str | None = None) -> None:
     """Keep spawned admission children CPU-only and below control-plane priority."""
     global _WORKER_TOKENIZER
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     os.environ["NVIDIA_VISIBLE_DEVICES"] = "void"
+    _guard_bittensor_queue_listener_eof_in_child()
     try:
         os.nice(5)
     except OSError:

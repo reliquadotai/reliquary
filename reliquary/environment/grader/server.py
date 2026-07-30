@@ -22,6 +22,7 @@ import logging
 import math
 import os
 import queue
+import signal
 import socket
 import subprocess
 import sys
@@ -36,6 +37,9 @@ from reliquary.constants import (
     GRADER_EVAL_TIMEOUT_SECONDS,
     GRADER_POOL_SIZE,
     GRADER_SOCKET_PATH,
+)
+from reliquary.infrastructure.process_health import (
+    DEFAULT_GRADER_HEALTH_PATH,
 )
 
 logger = logging.getLogger(__name__)
@@ -111,6 +115,8 @@ class Worker:
     container_id: str | None = None
     in_use: bool = False
     retired: bool = False
+    reaped: bool = False
+    termination_recorded: bool = False
     eval_count: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -126,6 +132,7 @@ class GraderServer:
         eval_timeout_s: float = GRADER_EVAL_TIMEOUT_SECONDS,
         recycle_after_evals: int = 64,
         metrics_port: int = 9876,
+        health_path: str = DEFAULT_GRADER_HEALTH_PATH,
     ) -> None:
         self.socket_path = socket_path
         self.pool_size = pool_size
@@ -143,14 +150,28 @@ class GraderServer:
         self.eval_timeout_s = eval_timeout_s
         self.recycle_after_evals = recycle_after_evals
         self.metrics_port = metrics_port
+        self.health_path = health_path
         self._metrics = _MetricsRegistry()
         self._metrics_server: Optional[http.server.HTTPServer] = None
 
         self._workers: list[Worker] = []
+        self._workers_lock = threading.Lock()
         self._idle: queue.Queue[Worker] = queue.Queue()
         self._listen_sock: Optional[socket.socket] = None
         self._accept_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        self._started_at = time.time()
+        self._lifecycle_lock = threading.Lock()
+        self._workers_spawned_total = 0
+        self._worker_restarts: defaultdict[str, int] = defaultdict(int)
+        self._worker_recycles_total = 0
+        self._worker_terminations_total = 0
+        self._worker_reaped_total = 0
+        self._worker_reap_failures_total = 0
+        self._container_deletes_total = 0
+        self._container_delete_failures_total = 0
+        self._shutdown_complete = False
+        self._health_publish_lock = threading.Lock()
 
     def _start_metrics_server(self) -> None:
         registry = self._metrics
@@ -195,6 +216,7 @@ class GraderServer:
         self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
         self._accept_thread.start()
         self._start_metrics_server()
+        self._publish_health()
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -203,7 +225,9 @@ class GraderServer:
                 self._listen_sock.close()
             except Exception:
                 pass
-        for w in self._workers:
+        with self._workers_lock:
+            workers = tuple(self._workers)
+        for w in workers:
             self._terminate_worker(w)
         if self._metrics_server is not None:
             try:
@@ -219,6 +243,73 @@ class GraderServer:
             os.unlink(self.socket_path)
         except FileNotFoundError:
             pass
+        with self._lifecycle_lock:
+            self._shutdown_complete = True
+        self._publish_health()
+
+    def health_snapshot(self) -> dict[str, Any]:
+        """Return the secret-free worker lifecycle snapshot exported to disk."""
+        with self._workers_lock:
+            workers = tuple(self._workers)
+        alive = sum(
+            1
+            for worker in workers
+            if not worker.retired and worker.proc.poll() is None
+        )
+        busy = sum(
+            1
+            for worker in workers
+            if worker.in_use and not worker.retired
+        )
+        with self._lifecycle_lock:
+            return {
+                "server_pid": os.getpid(),
+                "started_at": self._started_at,
+                "updated_at": time.time(),
+                "shutdown_complete": self._shutdown_complete,
+                "pool_size": self.pool_size,
+                "workers_alive": alive,
+                "workers_idle": max(0, alive - busy),
+                "workers_busy": busy,
+                "workers_spawned_total": self._workers_spawned_total,
+                "worker_restarts_total": dict(self._worker_restarts),
+                "worker_recycles_total": self._worker_recycles_total,
+                "worker_terminations_total": self._worker_terminations_total,
+                "worker_reaped_total": self._worker_reaped_total,
+                "worker_reap_failures_total": self._worker_reap_failures_total,
+                "container_deletes_total": self._container_deletes_total,
+                "container_delete_failures_total": (
+                    self._container_delete_failures_total
+                ),
+            }
+
+    def _publish_health(self) -> None:
+        if not self.health_path:
+            return
+        destination = os.path.abspath(self.health_path)
+        temporary = (
+            f"{destination}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            with self._health_publish_lock:
+                os.makedirs(os.path.dirname(destination), exist_ok=True)
+                with open(temporary, "w", encoding="utf-8") as handle:
+                    json.dump(
+                        self.health_snapshot(),
+                        handle,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.chmod(temporary, 0o644)
+                os.replace(temporary, destination)
+        except OSError:
+            logger.exception("grader: failed to publish process health")
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
 
     def _next_container_id_for_slot(self, slot: int) -> str:
         with self._container_generation_lock:
@@ -250,15 +341,23 @@ class GraderServer:
         )
         w = Worker(proc=proc, slot=slot, container_id=container_id)
         # Insert or replace at slot.
-        while len(self._workers) <= slot:
-            self._workers.append(w)
-        self._workers[slot] = w
+        with self._workers_lock:
+            while len(self._workers) <= slot:
+                self._workers.append(w)
+            self._workers[slot] = w
+        with self._lifecycle_lock:
+            self._workers_spawned_total += 1
+        self._metrics.inc("grader_worker_spawns_total")
         self._idle.put(w)
         logger.info("grader: spawned worker slot=%d pid=%d", slot, proc.pid)
+        self._publish_health()
         return w
 
     def _respawn_async(self, w: Worker, reason: str) -> None:
-        w.retired = True
+        with w.lock:
+            if w.retired:
+                return
+            w.retired = True
         if self._stop_event.is_set():
             return
         threading.Thread(target=self._respawn, args=(w, reason), daemon=True).start()
@@ -465,13 +564,20 @@ class GraderServer:
         if not self._uses_runsc or not container_id:
             return
         try:
-            subprocess.run(
+            completed = subprocess.run(
                 [self.worker_argv[0], "delete", "--force", container_id],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 timeout=timeout,
             )
+            with self._lifecycle_lock:
+                if completed.returncode == 0:
+                    self._container_deletes_total += 1
+                else:
+                    self._container_delete_failures_total += 1
         except Exception:
-            pass
+            with self._lifecycle_lock:
+                self._container_delete_failures_total += 1
+        self._publish_health()
 
     def _delete_container_async(self, container_id: str | None) -> None:
         if not self._uses_runsc or not container_id or self._stop_event.is_set():
@@ -483,31 +589,55 @@ class GraderServer:
         ).start()
 
     def _terminate_worker(self, w: Worker, *, delete_container: bool = True) -> None:
+        with w.lock:
+            first_termination = not w.termination_recorded
+            w.termination_recorded = True
+        if first_termination:
+            with self._lifecycle_lock:
+                self._worker_terminations_total += 1
+        reaped = False
         try:
             if w.proc.poll() is None:
                 w.proc.kill()
+            else:
+                reaped = True
         except Exception:
             pass
         try:
             w.proc.wait(timeout=2.0)
+            reaped = True
         except subprocess.TimeoutExpired:
             try:
                 w.proc.kill()
                 w.proc.wait(timeout=2.0)
+                reaped = True
             except Exception:
                 # Best effort: the supervisor will still try to replace the
                 # worker, and runsc delete below cleans up stale containers.
                 pass
         except Exception:
             pass
+        with self._lifecycle_lock:
+            if reaped and not w.reaped:
+                w.reaped = True
+                self._worker_reaped_total += 1
+            elif not reaped and first_termination:
+                self._worker_reap_failures_total += 1
         if delete_container:
             self._delete_container(w.container_id)
+        self._publish_health()
 
     def _respawn(self, w: Worker, reason: str = "death") -> None:
         old_container_id = w.container_id
         self._terminate_worker(w, delete_container=False)
         self._metrics.inc("grader_worker_restarts_total", {"reason": reason})
+        with self._lifecycle_lock:
+            self._worker_restarts[reason] += 1
+            if reason == "recycle":
+                self._worker_recycles_total += 1
         if self._stop_event.is_set():
+            self._delete_container(old_container_id)
+            self._publish_health()
             return
         try:
             self._spawn_worker(w.slot)
@@ -519,6 +649,7 @@ class GraderServer:
             logger.exception(
                 "grader: respawn failed for slot=%d — pool degraded", w.slot,
             )
+        self._publish_health()
 
     def _needs_recycle(self, w: Worker) -> bool:
         if w.eval_count >= self.recycle_after_evals:
@@ -617,6 +748,13 @@ def main() -> None:
         default=int(os.environ.get("GRADER_METRICS_PORT", "9876")),
         help="Loopback Prometheus metrics port; use 0 for an ephemeral port.",
     )
+    parser.add_argument(
+        "--health-path",
+        default=os.environ.get(
+            "GRADER_HEALTH_PATH", DEFAULT_GRADER_HEALTH_PATH
+        ),
+        help="Atomic JSON worker lifecycle snapshot consumed by /health.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
@@ -637,16 +775,32 @@ def main() -> None:
         worker_argv=worker_argv,
         eval_timeout_s=args.timeout,
         metrics_port=args.metrics_port,
+        health_path=args.health_path,
     )
-    server.start()
-    logger.info("grader server listening on %s (pool=%d)", args.socket, args.pool_size)
+    shutdown = threading.Event()
 
+    def _request_shutdown(signum: int, _frame: Any) -> None:
+        logger.info("grader: received signal %d; shutting down", signum)
+        shutdown.set()
+
+    previous_handlers = {
+        signum: signal.signal(signum, _request_shutdown)
+        for signum in (signal.SIGTERM, signal.SIGINT)
+    }
     try:
-        while True:
-            time.sleep(60)
+        server.start()
+        logger.info(
+            "grader server listening on %s (pool=%d)",
+            args.socket,
+            args.pool_size,
+        )
+        while not shutdown.wait(60.0):
+            pass
     except KeyboardInterrupt:
         pass
     finally:
+        for signum, previous in previous_handlers.items():
+            signal.signal(signum, previous)
         server.stop()
 
 

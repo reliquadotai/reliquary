@@ -81,6 +81,7 @@ from reliquary.constants import (
     MATH_ADMISSION_WALL_SECONDS,
 )
 from reliquary.environment.virtual_parquet import PromptSourceUnavailable
+from reliquary.infrastructure.process_health import collect_process_health
 from reliquary.protocol.legacy_merkle import (
     legacy_submission_merkle_matches,
 )
@@ -534,6 +535,7 @@ class _Health(BaseModel):
         default_factory=dict
     )
     app_started_at: float
+    process_lifecycle: dict[str, Any] = Field(default_factory=dict)
     current_validator_state: str
     current_window_n: int | None = None
     last_committed_window_n: int = 0
@@ -836,6 +838,11 @@ class ValidatorServer:
             )
         )
         self._event_loop_monitor_task: asyncio.Task[None] | None = None
+        self._process_health_monitor_task: asyncio.Task[None] | None = None
+        self._process_health_snapshot: dict[str, Any] = {
+            "status": "pending",
+            "collected_at": None,
+        }
         from reliquary.protocol.submission import WindowState
         self._current_state: WindowState = WindowState.READY
         self._current_checkpoint = None  # ManifestEntry | None
@@ -1668,6 +1675,8 @@ class ValidatorServer:
                     )
                 )
                 or content_cooldown.get("complete") is False
+                or self._process_health_snapshot.get("status")
+                in {"warning", "critical"}
             )
             else "ok"
         )
@@ -1678,6 +1687,7 @@ class ValidatorServer:
             runtime_fingerprint=dict(self._runtime_fingerprint),
             chain_client_fingerprint=dict(self._chain_client_fingerprint),
             app_started_at=self._app_started_at,
+            process_lifecycle=dict(self._process_health_snapshot),
             current_validator_state=getattr(self._current_state, "value", str(self._current_state)),
             current_window_n=batcher.window_start if batcher else None,
             last_committed_window_n=self._last_committed_window_n,
@@ -2279,6 +2289,8 @@ class ValidatorServer:
         for process in processes:
             if process.is_alive():
                 process.kill()
+        for process in processes:
+            process.join(timeout=0.5)
 
     async def _restart_admission_pool(
         self,
@@ -4693,6 +4705,27 @@ class ValidatorServer:
             )
             expected = now + interval
 
+    async def _monitor_process_health(self, interval: float = 30.0) -> None:
+        """Refresh expensive /proc and cgroup telemetry off the event loop."""
+        while True:
+            try:
+                self._process_health_snapshot = await asyncio.to_thread(
+                    collect_process_health
+                )
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                # Operator telemetry must never interrupt window execution.
+                self._process_health_snapshot = {
+                    "status": "unknown",
+                    "collected_at": time.time(),
+                    "collector_error_type": type(exc).__name__,
+                }
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                return
+
     async def start(self) -> None:
         if self._task is not None:
             return
@@ -4735,6 +4768,10 @@ class ValidatorServer:
         self._event_loop_monitor_task = asyncio.create_task(
             self._monitor_event_loop_lag(), name="validator_event_loop_monitor"
         )
+        self._process_health_monitor_task = asyncio.create_task(
+            self._monitor_process_health(),
+            name="validator_process_health_monitor",
+        )
         await asyncio.sleep(0)
         logger.info(
             "Validator HTTP server listening on %s:%d "
@@ -4752,6 +4789,11 @@ class ValidatorServer:
             event_loop_task.cancel()
             await asyncio.gather(event_loop_task, return_exceptions=True)
         self._event_loop_monitor_task = None
+        process_health_task = self._process_health_monitor_task
+        if process_health_task is not None and not process_health_task.done():
+            process_health_task.cancel()
+            await asyncio.gather(process_health_task, return_exceptions=True)
+        self._process_health_monitor_task = None
         worker_tasks = [
             task
             for task in (
@@ -4769,7 +4811,7 @@ class ValidatorServer:
         self._code_worker_task = None
         self._extra_worker_tasks = []
         for pool in self._admission_process_pools.values():
-            pool.shutdown(wait=False, cancel_futures=True)
+            await asyncio.to_thread(self._terminate_admission_pool, pool)
         self._admission_process_pools = {}
         self._admission_tokenizer_hashes = {}
         materialization_pool = self._admission_materialization_pool

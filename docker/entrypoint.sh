@@ -9,6 +9,34 @@ set -euo pipefail
 : "${BT_WALLET_NAME:?BT_WALLET_NAME is required}"
 : "${BT_HOTKEY:?BT_HOTKEY is required}"
 
+GRADER_PID=""
+VALIDATOR_PID=""
+
+terminate_children() {
+  local pid
+  for pid in "${VALIDATOR_PID}" "${GRADER_PID}"; do
+    if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+      kill -TERM "${pid}" 2>/dev/null || true
+    fi
+  done
+}
+
+cleanup() {
+  local status=$?
+  local pid
+  trap - EXIT TERM INT
+  terminate_children
+  for pid in "${VALIDATOR_PID}" "${GRADER_PID}"; do
+    if [[ -n "${pid}" ]]; then
+      wait "${pid}" 2>/dev/null || true
+    fi
+  done
+  exit "${status}"
+}
+
+trap terminate_children TERM INT
+trap cleanup EXIT
+
 # ── Credential permissions ────────────────────────────────────────────────
 DEFAULT_WALLET_PATH="/opt/reliquary/wallets"
 LEGACY_WALLET_PATH="/root/.bittensor/wallets"
@@ -59,7 +87,6 @@ if [[ "${RELIQUARY_TRAIN:-0}" == "1" && ",${ENVIRONMENTS}," == *",opencodeinstru
       GRADER_BUNDLE_PATH="/opt/reliquary/reliquary/environment/grader/bundle" \
     python -m reliquary.environment.grader.server --use-runsc &
   GRADER_PID=$!
-  trap 'kill ${GRADER_PID} 2>/dev/null || true' EXIT
 
   # Wait briefly for the grader socket to appear. Hard-fail if it doesn't.
   for _ in $(seq 1 30); do
@@ -103,7 +130,28 @@ fi
 # ── Launch validator ─────────────────────────────────────────────────────
 echo "[entrypoint] Launching: reliquary validate ${args[*]}"
 if [[ "${RELIQUARY_DROP_VALIDATOR_PRIVILEGES:-0}" == "1" ]]; then
-  exec setpriv --reuid=1000 --regid=1000 --clear-groups --inh-caps=-all \
+  validator_command=(
+    setpriv --reuid=1000 --regid=1000 --clear-groups --inh-caps=-all
     reliquary validate "${args[@]}"
+  )
+else
+  validator_command=(reliquary validate "${args[@]}")
 fi
-exec reliquary validate "${args[@]}"
+
+"${validator_command[@]}" &
+VALIDATOR_PID=$!
+
+set +e
+if [[ -n "${GRADER_PID}" ]]; then
+  wait -n "${VALIDATOR_PID}" "${GRADER_PID}"
+  status=$?
+  if kill -0 "${VALIDATOR_PID}" 2>/dev/null; then
+    echo "[entrypoint] FATAL: grader server exited while validator was running" >&2
+    [[ "${status}" -ne 0 ]] || status=1
+  fi
+else
+  wait "${VALIDATOR_PID}"
+  status=$?
+fi
+set -e
+exit "${status}"
