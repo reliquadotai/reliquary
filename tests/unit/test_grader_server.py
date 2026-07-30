@@ -3,10 +3,12 @@
 import json
 import os
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -23,6 +25,7 @@ def grader_server():
         worker_argv=[sys.executable, "-m", "reliquary.environment.grader.worker"],
         eval_timeout_s=5.0,
         metrics_port=0,
+        health_path=os.path.join(tmp.name, "health.json"),
     )
     server.start()
     deadline = time.time() + 5.0
@@ -393,3 +396,90 @@ def test_stop_releases_metrics_listener_for_restart(tmp_path):
         )
         server._start_metrics_server()
         server.stop()
+
+
+def test_recycle_and_shutdown_publish_reaped_worker_counts():
+    from reliquary.environment.grader.server import GraderServer
+
+    short_tmp = tempfile.TemporaryDirectory(prefix="gr-", dir="/tmp")
+    socket_path = os.path.join(short_tmp.name, "grader.sock")
+    health_path = Path(short_tmp.name) / "grader-health.json"
+    server = GraderServer(
+        socket_path=socket_path,
+        pool_size=1,
+        worker_argv=[
+            sys.executable,
+            "-m",
+            "reliquary.environment.grader.worker",
+        ],
+        eval_timeout_s=5.0,
+        recycle_after_evals=1,
+        metrics_port=0,
+        health_path=str(health_path),
+    )
+    server.start()
+    try:
+        response = _request(
+            socket_path,
+            code="def f(): return 7",
+            cases=[_case({"kind": "function", "name": "f"}, [], 7)],
+        )
+        assert response["passed"] == 1
+        deadline = time.time() + 5.0
+        while (
+            server.health_snapshot()["worker_recycles_total"] < 1
+            and time.time() < deadline
+        ):
+            time.sleep(0.05)
+    finally:
+        server.stop()
+
+    snapshot = json.loads(health_path.read_text(encoding="utf-8"))
+    assert snapshot["shutdown_complete"] is True
+    assert snapshot["workers_alive"] == 0
+    assert snapshot["workers_spawned_total"] >= 2
+    assert snapshot["worker_recycles_total"] >= 1
+    assert snapshot["worker_reaped_total"] == snapshot[
+        "worker_terminations_total"
+    ]
+    assert snapshot["worker_reap_failures_total"] == 0
+    short_tmp.cleanup()
+
+
+def test_grader_sigterm_publishes_clean_shutdown():
+    short_tmp = tempfile.TemporaryDirectory(prefix="gr-signal-", dir="/tmp")
+    socket_path = os.path.join(short_tmp.name, "grader.sock")
+    health_path = Path(short_tmp.name) / "grader-health.json"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "reliquary.environment.grader.server",
+            "--socket",
+            socket_path,
+            "--pool-size",
+            "0",
+            "--metrics-port",
+            "0",
+            "--health-path",
+            str(health_path),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.time() + 5.0
+        while not os.path.exists(socket_path) and time.time() < deadline:
+            time.sleep(0.05)
+        assert os.path.exists(socket_path)
+
+        process.terminate()
+        assert process.wait(timeout=5.0) == 0
+        snapshot = json.loads(health_path.read_text(encoding="utf-8"))
+        assert snapshot["shutdown_complete"] is True
+        assert snapshot["workers_alive"] == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5.0)
+        short_tmp.cleanup()

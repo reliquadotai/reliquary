@@ -1010,6 +1010,32 @@ def test_health_reports_registration_gate_state():
     ]
 
 
+def test_health_surfaces_process_lifecycle_and_degrades_on_pid_pressure():
+    server = ValidatorServer()
+    server._process_health_snapshot = {
+        "status": "critical",
+        "collected_at": 1234.0,
+        "zombie_processes": 900,
+        "cgroup_pids_current": 600,
+        "cgroup_pids_max": 1000,
+        "restart_recommended": True,
+        "grader": {
+            "workers_spawned_total": 128,
+            "worker_recycles_total": 96,
+            "worker_reaped_total": 96,
+        },
+    }
+
+    body = TestClient(server.app).get("/health").json()
+
+    assert body["status"] == "degraded"
+    assert body["process_lifecycle"]["zombie_processes"] == 900
+    assert body["process_lifecycle"]["restart_recommended"] is True
+    assert body["process_lifecycle"]["grader"][
+        "worker_reaped_total"
+    ] == 96
+
+
 def test_health_preserves_registration_refresh_failure_after_recovery():
     server = ValidatorServer()
     server.record_registration_cache_refresh(
