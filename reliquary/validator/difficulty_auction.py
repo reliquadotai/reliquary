@@ -93,6 +93,98 @@ def difficulty_score(
     return DifficultyScore(value, mean_reward, reward_std, count)
 
 
+def gated_difficulty_utility(
+    rewards: Iterable[float],
+    *,
+    sigma_min: float,
+    delta: float = 1.0,
+) -> float:
+    """Return auction difficulty only when the reward vector passes its gate.
+
+    This mirrors the validator's population-sigma eligibility boundary without
+    importing environment or bootstrap constants. Callers must supply the
+    threshold that applies to the candidate being valued.
+    """
+    if not math.isfinite(sigma_min) or sigma_min < 0.0:
+        raise ValueError("sigma minimum must be finite and non-negative")
+
+    score = difficulty_score(rewards, delta=delta)
+    if score.reward_std < 1e-8 or score.reward_std < sigma_min:
+        return 0.0
+    return score.value
+
+
+def fractional_reward_lattice(total_tests: int) -> tuple[float, ...]:
+    """Return every attainable ``passed / total_tests`` reward.
+
+    ``total_tests=1`` is the Math lattice ``{0, 1}``; larger denominators model
+    the fractional rewards emitted by the Code grader.
+    """
+    if (
+        isinstance(total_tests, bool)
+        or not isinstance(total_tests, int)
+        or total_tests <= 0
+    ):
+        raise ValueError("total tests must be a positive integer")
+    return tuple(passed / total_tests for passed in range(total_tests + 1))
+
+
+def robust_truncation_utility(
+    rewards: Iterable[float],
+    *,
+    sigma_min: float,
+    truncated_index: int | None = None,
+    attainable_rewards: Iterable[float] = (),
+    delta: float = 1.0,
+) -> float:
+    """Return the least utility across all outcomes of one truncated rollout.
+
+    A truncated rollout has an unknown reward. Replacing it with every value in
+    its exact environment-specific lattice and minimizing the *gated* utility
+    prevents a manufactured truncation from improving either sigma eligibility
+    or auction difficulty. At most one rollout is unknown by construction.
+    """
+    values = tuple(float(reward) for reward in rewards)
+    if truncated_index is None:
+        return gated_difficulty_utility(
+            values,
+            sigma_min=sigma_min,
+            delta=delta,
+        )
+    if (
+        isinstance(truncated_index, bool)
+        or not isinstance(truncated_index, int)
+        or truncated_index < 0
+        or truncated_index >= len(values)
+    ):
+        raise ValueError("truncated index must identify one reward")
+
+    lattice = tuple(dict.fromkeys(float(reward) for reward in attainable_rewards))
+    if not lattice:
+        raise ValueError("attainable rewards must not be empty")
+    if any(not math.isfinite(reward) for reward in lattice):
+        raise ValueError("attainable rewards must be finite")
+    if any(reward < 0.0 or reward > 1.0 for reward in lattice):
+        raise ValueError("attainable rewards must be in [0, 1]")
+
+    # Validate the observed vector too, even though the unknown position will be
+    # replaced below. A malformed validator reward should never be hidden.
+    difficulty_score(values, delta=delta)
+
+    utilities: list[float] = []
+    for attainable_reward in lattice:
+        outcome = list(values)
+        outcome[truncated_index] = attainable_reward
+        utilities.append(
+            gated_difficulty_utility(
+                outcome,
+                sigma_min=sigma_min,
+                delta=delta,
+            )
+        )
+    return min(utilities)
+
+
 def conservative_difficulty_score(
     rewards: Iterable[float],
     *,
