@@ -86,7 +86,8 @@ def test_seal_exception_still_releases_retained_payload(monkeypatch):
     request._retain_payload = True
     batcher.finish_proof_admission(request)
 
-    def fail(_pool):
+    def fail(_pool, *, commit_side_effects=True):
+        assert commit_side_effects is True
         raise RuntimeError("seal failed")
 
     monkeypatch.setattr(batcher, "_seal_batch_inner", fail)

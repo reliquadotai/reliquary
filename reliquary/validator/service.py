@@ -56,6 +56,7 @@ from reliquary.constants import (
     M_ROLLOUTS,
     MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW,
     MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
+    MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW,
     MAX_PROOF_WALL_SECONDS,
     MAX_SEAL_QUEUE_DRAIN_SECONDS,
     MIN_EOS_PROBABILITY,
@@ -471,6 +472,9 @@ class ValidationService:
                 self.verify_model = model
         else:
             self.verify_model = None
+        # This label is advanced only after a complete train -> verify state
+        # copy. A checkpoint manifest alone never certifies in-memory weights.
+        self._verify_model_checkpoint_revision: str | None = None
 
         # Enable gradient checkpointing on the train model only.
         try:
@@ -852,6 +856,25 @@ class ValidationService:
             is not True
         ):
             degraded_reasons.append("capacity_not_qualified")
+        published_revision: str | None = None
+        checkpoint_store = getattr(self, "_checkpoint_store", None)
+        if checkpoint_store is not None:
+            try:
+                manifest = checkpoint_store.current_manifest()
+            except Exception:
+                degraded_reasons.append("checkpoint_manifest_unavailable")
+            else:
+                if manifest is not None:
+                    published_revision = manifest.revision
+        verify_revision = getattr(
+            self,
+            "_verify_model_checkpoint_revision",
+            None,
+        )
+        if published_revision and verify_revision != published_revision:
+            degraded_reasons.append("verify_checkpoint_mismatch")
+        if published_revision and active_revision != published_revision:
+            degraded_reasons.append("scheduler_checkpoint_mismatch")
         snapshot.update({
             "required": PROTOCOL_VERSION >= 3,
             "profile_id": PROTOCOL_PROFILE_ID,
@@ -861,9 +884,28 @@ class ValidationService:
             "capacity_qualification": dict(
                 getattr(self, "proof_capacity_qualification", {})
             ),
+            "published_checkpoint_revision": published_revision,
+            "verify_checkpoint_revision": verify_revision,
             "degraded_reasons": degraded_reasons,
         })
         return snapshot
+
+    def _refresh_verify_model_from_train(
+        self,
+        checkpoint_revision: str,
+    ) -> None:
+        """Install one complete frozen verifier snapshot and then label it."""
+
+        if not checkpoint_revision:
+            raise RuntimeError(
+                "verify model refresh requires a checkpoint revision"
+            )
+        self._verify_model_checkpoint_revision = None
+        self.verify_model.load_state_dict(self.train_model.state_dict())
+        self.verify_model.eval()
+        for parameter in self.verify_model.parameters():
+            parameter.requires_grad = False
+        self._verify_model_checkpoint_revision = checkpoint_revision
 
     def _synchronize_proof_models(self, checkpoint_revision: str) -> None:
         """Quiesce, refresh every replica, then atomically resume proving."""
@@ -874,6 +916,10 @@ class ValidationService:
         if not checkpoint_revision:
             raise RuntimeError(
                 "proof scheduler requires a published checkpoint revision"
+            )
+        if self._verify_model_checkpoint_revision != checkpoint_revision:
+            raise RuntimeError(
+                "verify model weights are not certified for the checkpoint"
             )
         if (
             scheduler.state is SchedulerState.RUNNING
@@ -938,6 +984,11 @@ class ValidationService:
             raise RuntimeError(
                 "scheduled proving requires a published checkpoint"
             )
+        if self._verify_model_checkpoint_revision != checkpoint.revision:
+            await asyncio.to_thread(
+                self._refresh_verify_model_from_train,
+                checkpoint.revision,
+            )
         if (
             scheduler.state is SchedulerState.RUNNING
             and scheduler.checkpoint_ready(checkpoint.revision)
@@ -953,6 +1004,23 @@ class ValidationService:
         ):
             raise RuntimeError(
                 "proof scheduler replica recovery did not become ready"
+            )
+
+    async def _close_proof_scheduler(self) -> None:
+        scheduler = self.proof_scheduler
+        if scheduler is None:
+            return
+        timeout = (
+            5.0
+            if scheduler.state is SchedulerState.FAULTED
+            else MAX_PROOF_WALL_SECONDS + 60.0
+        )
+        closed = await asyncio.to_thread(scheduler.close, timeout)
+        if not closed:
+            logger.error(
+                "Proof scheduler did not close within %.1fs; process exit "
+                "will retire daemon proof workers",
+                timeout,
             )
 
     @property
@@ -1110,6 +1178,7 @@ class ValidationService:
             revision_str = source.sha
         else:
             revision_str = source.path
+        self._verify_model_checkpoint_revision = revision_str
         # Reconstruct manifest so miners see the resumed checkpoint via /state.
         sig_payload = f"{checkpoint_n}|{revision_str}".encode()
         sig_bytes = self.wallet.hotkey.sign(sig_payload)
@@ -2016,6 +2085,18 @@ class ValidationService:
                 getattr(batcher, "proof_capacity_aborted", False)
             )
         }
+        if (
+            self.proof_scheduler is not None
+            and self.proof_scheduler.state is SchedulerState.FAULTED
+        ):
+            snapshot_fn = getattr(self.proof_scheduler, "snapshot", None)
+            scheduler_snapshot = (
+                snapshot_fn() if callable(snapshot_fn) else {}
+            )
+            proof_capacity_aborts["proof_scheduler"] = (
+                scheduler_snapshot.get("fault_reason")
+                or "faulted"
+            )
         if proof_capacity_aborts:
             for batcher in self._active_batchers.values():
                 batcher.discard_seal_side_effects()
@@ -2405,9 +2486,7 @@ class ValidationService:
                 # batcher verifies miners against the just-published
                 # checkpoint. In-place copy: no new allocation.
                 try:
-                    self.verify_model.load_state_dict(
-                        self.train_model.state_dict()
-                    )
+                    self._refresh_verify_model_from_train(entry.revision)
                 except (AttributeError, RuntimeError):
                     logger.exception(
                         "verify_model refresh failed; verify_model now "
@@ -2443,6 +2522,8 @@ class ValidationService:
                     entry.revision[:12],
                     publication_reason,
                 )
+            except FatalProofPlaneError:
+                raise
             except Exception:
                 logger.exception(
                     "checkpoint publish or proof-replica refresh failed; "
@@ -3214,7 +3295,7 @@ class ValidationService:
                     WINDOW_COLLECTION_SECONDS
                 ),
                 "difficulty_auction_proof_attempt_limit": (
-                    MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+                    MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW
                 ),
                 "difficulty_auction_proof_wall_limit_seconds": (
                     MAX_PROOF_WALL_SECONDS
@@ -3407,11 +3488,7 @@ class ValidationService:
                     await asyncio.wait_for(task, timeout=5)
                 except (asyncio.CancelledError, asyncio.TimeoutError):
                     pass
-            if self.proof_scheduler is not None:
-                await asyncio.to_thread(
-                    self.proof_scheduler.close,
-                    MAX_PROOF_WALL_SECONDS + 60.0,
-                )
+            await self._close_proof_scheduler()
             await self.server.stop()
             telemetry.finish()
 
