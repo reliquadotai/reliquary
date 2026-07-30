@@ -1681,6 +1681,69 @@ def _set_eos_completion_lengths(req: BatchSubmissionRequest, lengths: list[int])
         req.rollouts[idx].tokens = commit["tokens"]
 
 
+def _grail_with_terminal_pick(
+    *,
+    p_stop: float,
+    terminal_pick_ok: bool,
+):
+    def _fn(commit, model, randomness):
+        prompt_length = int(commit["rollout"]["prompt_length"])
+        challenge_idxs = list(
+            range(prompt_length, prompt_length + CHALLENGE_K)
+        )
+        return ProofResult(
+            all_passed=True,
+            passed=1,
+            checked=1,
+            sketch_diff_max=0,
+            has_sparse_outputs=True,
+            p_stop=p_stop,
+            terminal_pick_ok=terminal_pick_ok,
+            challenge_lp_indices=challenge_idxs,
+            challenge_lp_values=[0.0] * CHALLENGE_K,
+        )
+
+    return _fn
+
+
+def test_rejects_low_probability_eos_that_forced_seed_did_not_pick():
+    req = _request()
+    _set_eos_completion_lengths(req, [CHALLENGE_K] * M_ROLLOUTS)
+    batcher = _make_batcher(
+        verify_commitment_proofs_fn=_grail_with_terminal_pick(
+            p_stop=1e-9,
+            terminal_pick_ok=False,
+        ),
+    )
+
+    assert batcher.accept_submission(req).accepted is True
+    assert (
+        batcher._verify_expensive(batcher.pending_submissions()[-1])
+        is None
+    )
+    assert (
+        batcher.reject_counts[RejectReason.BAD_TERMINATION.value]
+        == 1
+    )
+
+
+def test_accepts_low_probability_eos_when_forced_seed_picked_it():
+    req = _request()
+    _set_eos_completion_lengths(req, [CHALLENGE_K] * M_ROLLOUTS)
+    batcher = _make_batcher(
+        verify_commitment_proofs_fn=_grail_with_terminal_pick(
+            p_stop=1e-9,
+            terminal_pick_ok=True,
+        ),
+    )
+
+    assert batcher.accept_submission(req).accepted is True
+    assert (
+        batcher._verify_expensive(batcher.pending_submissions()[-1])
+        is not None
+    )
+
+
 def test_reject_cap_path_truncations_over_budget():
     from reliquary.constants import MAX_TRUNCATED_PER_SUBMISSION
 

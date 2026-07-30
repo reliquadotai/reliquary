@@ -2949,9 +2949,16 @@ class GrpoWindowBatcher:
                     and p_stop is not None
                     and float(p_stop) < MIN_EOS_PROBABILITY
                 )
-                increments_truncation = not termination_ok or cap_truncated
+                # The truncation allowance is exclusively for a genuine
+                # protocol-cap hit without an authenticated EOS.  Treating an
+                # arbitrary bad termination as a truncation lets a miner append
+                # a low-probability EOS, pass cheap admission as "natural", and
+                # retain the unadjusted auction score after proof discovers the
+                # forgery.
+                increments_truncation = cap_truncated
                 if private_auth_forensics_enabled and (
-                    increments_truncation
+                    not termination_ok
+                    or increments_truncation
                     or low_probability_terminal
                     or natural_cap_candidate
                 ):
@@ -2990,7 +2997,13 @@ class GrpoWindowBatcher:
                         ),
                         token_metrics=rollout_token_metrics,
                     )
-                if not termination_ok or cap_truncated:
+                if not termination_ok and not cap_truncated:
+                    return reject(
+                        RejectReason.BAD_TERMINATION,
+                        "termination",
+                        sketch_diff_max=sketch_diff_max,
+                    )
+                if cap_truncated:
                     truncated_flags[rollout_idx] = True
                     truncated_count += 1
                     # Validator-set flag for the overlong side of reward shaping.
