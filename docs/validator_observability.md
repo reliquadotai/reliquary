@@ -22,7 +22,7 @@ Validator submit logs use the `validator_submit_lifecycle` event with a
   `reject_stage` and `reject_reason` together; for `batch_filled`, also read
   `batch_filled_reason`, `current_valid_count`, and `trigger_round`.
 - `seal_triggered`: legacy-selector stage only. Auction environments seal on
-  the 300-second collection deadline and bounded queue drain.
+  the 100-second collection deadline and bounded queue drain.
 - `auction_finalized`: seal-time result for every pending candidate. Read
   `canonical_rank`, `auction_status`, `selected_for_batch`, and `rewarded`.
 - `final_batch_selected`: final auction ordering has run. A submission
@@ -52,8 +52,8 @@ Interpretation guide:
 - Accepted into pool, final selected, and rewarded are separate outcomes:
   `accepted_into_pool` means bounded admission passed; `selected_for_batch`
   means deferred proof passed and the candidate won; `rewarded` means it
-  received one uniform auction slot. A non-winner is accepted but unselected,
-  not rejected.
+  received one uniform auction slot. In auction mode the final two fields must
+  be identical. A non-winner is accepted but unselected, not rejected.
 - Training and emission are also separate. A window can be rewarded/archived
   but have `training_quarantine.quarantined=true`; in that case the validator
   skipped GRPO and checkpoint publishing for model-health reasons.
@@ -64,7 +64,9 @@ per-environment pending/queue/proof state, operator mapping, grader failures,
 archive queue, and recent reject counts. It must not include access keys,
 tokens, wallet material, or private keys.
 
-R2 archives persist `force_seal_reason_by_environment`. A non-null
+R2 archives persist `force_seal_reason_by_environment` and
+`reward_alignment_by_environment`. Completed auction windows require zero
+paid-unselected and selected-unrewarded groups. A non-null
 `auction_queue_drain_timeout` means the fixed collection closed correctly but
 some predeadline admission work exceeded the bounded drain period. Candidate
 rows carry the same ingress and admission timings as live verdicts.
@@ -90,3 +92,16 @@ Training telemetry under the `bft/` prefix reports forced-rollout share,
 masked injected-token share, trainable-token share, and absolute-advantage
 weighted exposure by validated termination path. These are review signals and
 do not alter acceptance, reward, or gradient computation.
+
+## Auction utility research
+
+`/health.content_cooldown` reports whether the run-keyed canonical-prompt map is
+complete and restart-safe. A validator must not open windows after an incomplete
+bootstrap. An R2 mirror error is nonblocking when `source=local` and the local
+snapshot is current.
+
+`/health.utility_telemetry` reports the private writer status. Its mode-0600
+window bundles live under `RELIQUARY_STATE_DIR/utility_telemetry`; they are not
+part of public R2 archives. Failures are observation-only and do not degrade the
+protocol health status. The signal contract and activation gates are in
+[Auction v3 Utility Foundation](auction-v3-utility-foundation.md).

@@ -38,6 +38,9 @@ def _make_service():
         env=_FakeEnv(),
         netuid=99,
     )
+    # These unit tests call _open_window directly and intentionally bypass the
+    # startup restore that makes canonical cooldown state durable.
+    svc._content_cooldown_health["complete"] = True
     return svc
 
 

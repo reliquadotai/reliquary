@@ -102,6 +102,44 @@ async def test_derive_randomness_returns_none_beacon_in_mock_mode(monkeypatch):
     assert beacon is None
 
 
+@pytest.mark.asyncio
+async def test_seal_randomness_retries_then_returns_verified_beacon(monkeypatch):
+    calls = 0
+
+    def _get_beacon(*, round_id, use_drand):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("transient outage")
+        assert round_id == "999"
+        assert use_drand is True
+        return {"randomness": "sealed-randomness"}
+
+    async def _no_delay(_seconds):
+        return None
+
+    monkeypatch.setattr(
+        "reliquary.infrastructure.drand.get_current_chain",
+        lambda: {"genesis_time": 0, "period": 3},
+    )
+    monkeypatch.setattr(
+        "reliquary.infrastructure.drand.get_beacon", _get_beacon
+    )
+    monkeypatch.setattr(
+        "reliquary.infrastructure.chain.compute_current_drand_round",
+        lambda *_args, **_kwargs: 999,
+    )
+    monkeypatch.setattr(
+        "reliquary.validator.service.asyncio.sleep", _no_delay
+    )
+
+    service = _make_test_service(use_drand=True)
+    result = await service._fetch_seal_randomness()
+
+    assert result == "sealed-randomness"
+    assert calls == 2
+
+
 # ---------------------------------------------------------------------------
 # Task 5 — background _verify_beacon_async + _train_and_publish gate
 # ---------------------------------------------------------------------------

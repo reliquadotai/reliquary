@@ -5,6 +5,7 @@ exposes the per-commit checks that touch the model or the signature scheme.
 """
 
 import ast
+import base64
 import logging
 import math
 import re
@@ -24,6 +25,7 @@ from reliquary.shared.modeling import resolve_eos_token_ids
 logger = logging.getLogger(__name__)
 
 _GPU_VOCAB_FLOAT_WORKSPACE_BYTES = 256 * 1024 * 1024
+_UTILITY_ENTROPY_MAX_POSITIONS = 64
 
 
 @dataclass(frozen=True)
@@ -84,6 +86,16 @@ class ProofResult:
     # aligned 1:1 with completion_chosen_probs (same surviving steps).
     completion_argmax_probs: list[float] = field(default_factory=list)
     completion_argmax_ids: list[int] = field(default_factory=list)
+    # Research-only utility telemetry computed from the same proof forward.
+    # Entropy is full-policy entropy before top-k/top-p at T_PROTO, sampled at
+    # up to 64 evenly spaced completion positions. Hidden vectors are
+    # float16/base64 to keep private window bundles compact.
+    completion_entropies: list[float] = field(default_factory=list)
+    hidden_start_f16_b64: str | None = None
+    hidden_delta_f16_b64: str | None = None
+    hidden_dim: int = 0
+    hidden_end_completion_offset: int | None = None
+    representation_shift_l2: float | None = None
     # Forced-seed consistency: how many completion positions were stochastic
     # under T_PROTO (argmax prob < FORCED_SEED_STOCHASTIC_MAXPROB) and how
     # many of those matched the forced inverse-CDF pick. Both 0 when the
@@ -424,6 +436,7 @@ def verify_commitment_proofs(
     from reliquary.protocol.grail_verifier import GRAILVerifier
     from reliquary.shared.forward import forward_single_layer
     from reliquary.shared.hf_compat import resolve_hidden_size
+    from reliquary.validator.utility_telemetry import utility_telemetry_enabled
 
     tokens = commit["tokens"]
     commitments = commit["commitments"]
@@ -432,6 +445,7 @@ def verify_commitment_proofs(
     completion_length = int(rollout_meta.get("completion_length", 0))
 
     seq_len = len(tokens)
+    capture_utility = utility_telemetry_enabled()
 
     # SECURITY: Always use the validator's independently-computed randomness.
     # A miner who controls the randomness can predict which positions are
@@ -467,8 +481,10 @@ def verify_commitment_proofs(
         completion_chosen_probs,
         completion_argmax_probs,
         completion_argmax_ids,
+        completion_entropies,
     ) = _gpu_completion_token_stats(
         logits_gpu, tokens, prompt_length, completion_length, seq_len, device,
+        include_entropy=capture_utility,
     )
 
     seed_n_stochastic = 0
@@ -551,6 +567,27 @@ def verify_commitment_proofs(
         )
 
     hidden_states = hidden_states_gpu.detach().to("cpu")
+    if capture_utility:
+        (
+            hidden_start_f16_b64,
+            hidden_delta_f16_b64,
+            hidden_dim,
+            hidden_end_completion_offset,
+            representation_shift_l2,
+        ) = _hidden_anchor_telemetry(
+            hidden_states,
+            tokens,
+            prompt_length,
+            completion_length,
+            _eos_set_from_model(model, tokenizer),
+            rollout_meta,
+        )
+    else:
+        hidden_start_f16_b64 = None
+        hidden_delta_f16_b64 = None
+        hidden_dim = 0
+        hidden_end_completion_offset = None
+        representation_shift_l2 = None
 
     passed = 0
     checked = 0
@@ -585,6 +622,12 @@ def verify_commitment_proofs(
         completion_chosen_probs=completion_chosen_probs,
         completion_argmax_probs=completion_argmax_probs,
         completion_argmax_ids=completion_argmax_ids,
+        completion_entropies=completion_entropies,
+        hidden_start_f16_b64=hidden_start_f16_b64,
+        hidden_delta_f16_b64=hidden_delta_f16_b64,
+        hidden_dim=hidden_dim,
+        hidden_end_completion_offset=hidden_end_completion_offset,
+        representation_shift_l2=representation_shift_l2,
         seed_n_stochastic=seed_n_stochastic,
         seed_n_match=seed_n_match,
         seed_n_positions=seed_n_positions,
@@ -825,21 +868,30 @@ def _gpu_completion_token_stats(
     completion_length: int,
     seq_len: int,
     device: Any,
-) -> tuple[list[float], list[float], list[int]]:
+    *,
+    include_entropy: bool = True,
+) -> tuple[list[float], list[float], list[int], list[float]]:
     """Per completion-producing position under T_PROTO, on GPU, vectorised:
-    chosen-token prob, argmax prob, argmax token id. The three lists are
-    aligned 1:1. Boundary positions (t == 0, t - 1 >= seq_len, t >= len(tokens))
-    are skipped identically across all three.
+    chosen-token prob, argmax prob, argmax token id, and full-policy entropy.
+    The four lists are aligned 1:1. Boundary positions (t == 0,
+    t - 1 >= seq_len, t >= len(tokens)) are skipped identically across all
+    four.
     """
     valid_t = _completion_valid_t(tokens, prompt_length, completion_length, seq_len)
     if not valid_t:
-        return [], [], []
+        return [], [], [], []
 
     vocab_size = max(1, int(logits_gpu.shape[-1]))
     chunk_rows = max(1, _GPU_VOCAB_FLOAT_WORKSPACE_BYTES // (vocab_size * 4))
     chosen_values: list[float] = []
     argmax_prob_values: list[float] = []
     argmax_id_values: list[int] = []
+    entropy_values: list[float] = []
+    entropy_rows = set(
+        _stratified_indices(len(valid_t), _UTILITY_ENTROPY_MAX_POSITIONS)
+        if include_entropy
+        else []
+    )
     for start in range(0, len(valid_t), chunk_rows):
         chunk_t = valid_t[start:start + chunk_rows]
         pos_tensor = torch.tensor(
@@ -852,10 +904,104 @@ def _gpu_completion_token_stats(
         probs = scaled.softmax(dim=-1)
         chosen = probs.gather(1, tok_tensor.unsqueeze(1)).squeeze(1)
         amax_probs, amax_ids = probs.max(dim=-1)
+        entropy_local_rows = [
+            index - start
+            for index in range(start, start + len(chunk_t))
+            if index in entropy_rows
+        ]
+        if entropy_local_rows:
+            entropy_positions = torch.tensor(
+                entropy_local_rows, device=device, dtype=torch.long
+            )
+            entropy_scaled = scaled.index_select(0, entropy_positions)
+            entropy_probs = probs.index_select(0, entropy_positions)
+            # H(p) = logsumexp(z) - sum(p * z). The full vocabulary is used at
+            # every sampled position; only the number of trajectory positions
+            # is bounded so telemetry cannot dominate proof verification.
+            entropy = torch.logsumexp(
+                entropy_scaled, dim=-1
+            ) - entropy_probs.mul_(entropy_scaled).sum(dim=-1)
+            entropy_values.extend(entropy.tolist())
         chosen_values.extend(chosen.tolist())
         argmax_prob_values.extend(amax_probs.tolist())
         argmax_id_values.extend(amax_ids.tolist())
-    return chosen_values, argmax_prob_values, argmax_id_values
+    return (
+        chosen_values,
+        argmax_prob_values,
+        argmax_id_values,
+        entropy_values,
+    )
+
+
+def _stratified_indices(count: int, limit: int) -> list[int]:
+    """Return deterministic, endpoint-inclusive positions across a sequence."""
+    count = max(0, int(count))
+    limit = max(0, int(limit))
+    if not count or not limit:
+        return []
+    if count <= limit:
+        return list(range(count))
+    if limit == 1:
+        return [count // 2]
+    return sorted({
+        round(index * (count - 1) / (limit - 1))
+        for index in range(limit)
+    })
+
+
+def _hidden_anchor_telemetry(
+    hidden_states: torch.Tensor,
+    tokens: list[int],
+    prompt_length: int,
+    completion_length: int,
+    eos_ids: set[int],
+    rollout_meta: dict[str, Any],
+) -> tuple[str | None, str | None, int, int | None, float | None]:
+    """Extract compact SHIFT-style start and reasoning-delta anchors."""
+    if hidden_states.ndim != 2 or prompt_length <= 0 or completion_length <= 0:
+        return None, None, 0, None, None
+    seq_len = min(len(tokens), int(hidden_states.shape[0]))
+    start_idx = prompt_length - 1
+    if start_idx < 0 or start_idx >= seq_len:
+        return None, None, 0, None, None
+
+    force_start = force_end = -1
+    force_span = rollout_meta.get("force_span")
+    if (
+        rollout_meta.get("forced")
+        and isinstance(force_span, (list, tuple))
+        and len(force_span) == 2
+    ):
+        try:
+            force_start, force_end = int(force_span[0]), int(force_span[1])
+        except (TypeError, ValueError, OverflowError):
+            force_start = force_end = -1
+
+    completion_end = min(prompt_length + completion_length, seq_len)
+    end_idx: int | None = None
+    for candidate in range(completion_end - 1, prompt_length - 1, -1):
+        if force_start <= candidate < force_end:
+            continue
+        if int(tokens[candidate]) in eos_ids:
+            continue
+        end_idx = candidate
+        break
+    if end_idx is None:
+        return None, None, 0, None, None
+
+    start = hidden_states[start_idx].detach().float().contiguous()
+    delta = (
+        hidden_states[end_idx].detach().float() - start
+    ).contiguous()
+    start_f16 = start.to(dtype=torch.float16).numpy().tobytes()
+    delta_f16 = delta.to(dtype=torch.float16).numpy().tobytes()
+    return (
+        base64.b64encode(start_f16).decode("ascii"),
+        base64.b64encode(delta_f16).decode("ascii"),
+        int(start.numel()),
+        int(end_idx - prompt_length),
+        float(torch.linalg.vector_norm(delta).item()),
+    )
 
 
 def _gpu_seed_consistency(

@@ -1,0 +1,151 @@
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  width="1200"
+  height="630"
+  viewBox="0 0 1200 630"
+  role="img"
+  aria-labelledby="reliquary-social-title reliquary-social-description"
+  focusable="false"
+>
+  <title id="reliquary-social-title">Reliquary — the learning frontier, as a market</title>
+  <desc id="reliquary-social-description">
+    A social preview for Reliquary, decentralized GRPO training on Bittensor Subnet 81,
+    showing the path from mining and verification to training and publication.
+  </desc>
+
+  <defs>
+    <pattern id="reliquary-social-grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M 32 0 L 0 0 0 32" fill="none" stroke="#202024" stroke-width="1" />
+    </pattern>
+  </defs>
+
+  <rect width="1200" height="630" fill="#0a0a0b" />
+  <rect width="1200" height="630" fill="url(#reliquary-social-grid)" opacity="0.55" />
+  <rect x="24" y="24" width="1152" height="582" fill="none" stroke="#2b2b2f" />
+  <line x1="770" y1="24" x2="770" y2="606" stroke="#2b2b2f" />
+
+  <g transform="translate(62 50) scale(0.46)">
+    <line
+      x1="8"
+      y1="60"
+      x2="112"
+      y2="60"
+      stroke="#e87a3e"
+      stroke-width="1.2"
+      opacity="0.55"
+    />
+    <path
+      d="M 60 12 L 108 60 L 60 108 L 12 60 Z"
+      fill="none"
+      stroke="#e87a3e"
+      stroke-width="2.4"
+      stroke-linejoin="miter"
+    />
+    <path d="M 60 36 L 84 60 L 60 84 L 36 60 Z" fill="#e87a3e" />
+    <circle cx="60" cy="60" r="3.2" fill="#0a0a0b" />
+  </g>
+  <text
+    x="132"
+    y="92"
+    fill="#f5f1ea"
+    font-family="Georgia, 'Times New Roman', serif"
+    font-size="38"
+  >Reliquary</text>
+  <circle cx="300" cy="78" r="4" fill="#e87a3e" />
+
+  <text
+    x="62"
+    y="176"
+    fill="#e87a3e"
+    font-family="'Courier New', Courier, monospace"
+    font-size="18"
+    font-weight="700"
+    letter-spacing="4"
+  >BITTENSOR · SUBNET 81 · GRPO</text>
+  <text
+    x="62"
+    y="280"
+    fill="#f5f1ea"
+    font-family="Georgia, 'Times New Roman', serif"
+    font-size="70"
+  >The learning frontier,</text>
+  <text
+    x="62"
+    y="354"
+    fill="#e87a3e"
+    font-family="Georgia, 'Times New Roman', serif"
+    font-size="76"
+    font-style="italic"
+  >as a market.</text>
+  <text
+    x="62"
+    y="420"
+    fill="#bfbab1"
+    font-family="Arial, Helvetica, sans-serif"
+    font-size="25"
+  >Find the signal. Prove it. Train.</text>
+
+  <line x1="62" y1="490" x2="706" y2="490" stroke="#2b2b2f" />
+  <text
+    x="62"
+    y="530"
+    fill="#8c887f"
+    font-family="'Courier New', Courier, monospace"
+    font-size="17"
+    font-weight="700"
+    letter-spacing="2.5"
+  >MINE · GRADE · RANK · PROVE</text>
+  <text
+    x="62"
+    y="565"
+    fill="#8c887f"
+    font-family="'Courier New', Courier, monospace"
+    font-size="17"
+    font-weight="700"
+    letter-spacing="2.5"
+  >ACCUMULATE · GRPO · PUBLISH</text>
+
+  <g transform="translate(834 124) scale(2.15)">
+    <line
+      x1="8"
+      y1="60"
+      x2="112"
+      y2="60"
+      stroke="#e87a3e"
+      stroke-width="1.2"
+      opacity="0.55"
+    />
+    <path
+      d="M 60 12 L 108 60 L 60 108 L 12 60 Z"
+      fill="none"
+      stroke="#e87a3e"
+      stroke-width="2.4"
+      stroke-linejoin="miter"
+    />
+    <path d="M 60 36 L 84 60 L 60 84 L 36 60 Z" fill="#e87a3e" />
+    <circle cx="60" cy="60" r="3.2" fill="#0a0a0b" />
+  </g>
+
+  <line x1="812" y1="442" x2="1128" y2="442" stroke="#2b2b2f" />
+  <circle cx="812" cy="442" r="5" fill="#e87a3e" />
+  <circle cx="970" cy="442" r="5" fill="#4fb8e0" />
+  <circle cx="1128" cy="442" r="5" fill="#d44d7a" />
+  <text
+    x="970"
+    y="500"
+    text-anchor="middle"
+    fill="#f5f1ea"
+    font-family="Georgia, 'Times New Roman', serif"
+    font-size="31"
+  >reliqua.ai</text>
+  <text
+    x="970"
+    y="540"
+    text-anchor="middle"
+    fill="#8c887f"
+    font-family="'Courier New', Courier, monospace"
+    font-size="16"
+    font-weight="700"
+    letter-spacing="3"
+  >VERIFIABLE · REPLAYABLE</text>
+</svg>

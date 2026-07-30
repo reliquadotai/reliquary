@@ -1,0 +1,161 @@
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  width="1200"
+  height="760"
+  viewBox="0 0 1200 760"
+  role="img"
+  aria-labelledby="reliquary-core-loop-title reliquary-core-loop-description"
+  focusable="false"
+>
+  <title id="reliquary-core-loop-title">The Reliquary protocol loop</title>
+  <desc id="reliquary-core-loop-description">
+    Six ordered stages: miners generate candidate rollouts, validators grade rewards,
+    the auction ranks candidates, GRAIL verifies candidates that can still win, clean
+    groups accumulate into a checkpoint-bound batch, and eligible batches run a GRPO
+    step before publishing a checkpoint, archive, and on-chain weights.
+  </desc>
+
+  <defs>
+    <pattern id="reliquary-core-loop-grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M 32 0 L 0 0 0 32" fill="none" stroke="#202024" stroke-width="1" />
+    </pattern>
+    <marker
+      id="reliquary-core-loop-arrow"
+      markerWidth="12"
+      markerHeight="12"
+      refX="10"
+      refY="6"
+      orient="auto"
+      markerUnits="userSpaceOnUse"
+    >
+      <path d="M 0 0 L 12 6 L 0 12 Z" fill="#e87a3e" />
+    </marker>
+  </defs>
+
+  <rect width="1200" height="760" fill="#0a0a0b" />
+  <rect width="1200" height="760" fill="url(#reliquary-core-loop-grid)" opacity="0.55" />
+  <rect x="24" y="24" width="1152" height="712" fill="none" stroke="#2b2b2f" />
+
+  <g transform="translate(62 50) scale(0.42)">
+    <line
+      x1="8"
+      y1="60"
+      x2="112"
+      y2="60"
+      stroke="#e87a3e"
+      stroke-width="1.2"
+      opacity="0.55"
+    />
+    <path
+      d="M 60 12 L 108 60 L 60 108 L 12 60 Z"
+      fill="none"
+      stroke="#e87a3e"
+      stroke-width="2.4"
+      stroke-linejoin="miter"
+    />
+    <path d="M 60 36 L 84 60 L 60 84 L 36 60 Z" fill="#e87a3e" />
+    <circle cx="60" cy="60" r="3.2" fill="#0a0a0b" />
+  </g>
+  <text
+    x="128"
+    y="82"
+    fill="#8c887f"
+    font-family="'Courier New', Courier, monospace"
+    font-size="19"
+    font-weight="700"
+    letter-spacing="4"
+  >THE PROTOCOL LOOP</text>
+  <text
+    x="62"
+    y="132"
+    fill="#f5f1ea"
+    font-family="Georgia, 'Times New Roman', serif"
+    font-size="46"
+  >Signal becomes a checkpoint.</text>
+
+  <path
+    d="M 554 238 H 646"
+    fill="none"
+    stroke="#e87a3e"
+    stroke-width="3"
+    marker-end="url(#reliquary-core-loop-arrow)"
+  />
+  <path
+    d="M 900 314 V 342 H 300 V 380"
+    fill="none"
+    stroke="#e87a3e"
+    stroke-width="3"
+    marker-end="url(#reliquary-core-loop-arrow)"
+  />
+  <path
+    d="M 554 456 H 646"
+    fill="none"
+    stroke="#e87a3e"
+    stroke-width="3"
+    marker-end="url(#reliquary-core-loop-arrow)"
+  />
+  <path
+    d="M 900 532 V 560 H 300 V 598"
+    fill="none"
+    stroke="#e87a3e"
+    stroke-width="3"
+    marker-end="url(#reliquary-core-loop-arrow)"
+  />
+  <path
+    d="M 554 674 H 646"
+    fill="none"
+    stroke="#e87a3e"
+    stroke-width="3"
+    marker-end="url(#reliquary-core-loop-arrow)"
+  />
+
+  <g>
+    <rect x="62" y="168" width="492" height="146" fill="#111113" stroke="#2b2b2f" />
+    <text x="88" y="205" fill="#e87a3e" font-family="'Courier New', Courier, monospace" font-size="18" font-weight="700" letter-spacing="3">01 · MINE</text>
+    <text x="88" y="254" fill="#f5f1ea" font-family="Georgia, 'Times New Roman', serif" font-size="38">Mine candidates.</text>
+    <text x="88" y="288" fill="#bfbab1" font-family="Arial, Helvetica, sans-serif" font-size="19">Miners spend compute on frontier prompts.</text>
+  </g>
+
+  <g>
+    <rect x="646" y="168" width="492" height="146" fill="#111113" stroke="#2b2b2f" />
+    <text x="672" y="205" fill="#e87a3e" font-family="'Courier New', Courier, monospace" font-size="18" font-weight="700" letter-spacing="3">02 · GRADE</text>
+    <text x="672" y="254" fill="#f5f1ea" font-family="Georgia, 'Times New Roman', serif" font-size="38">Grade rewards.</text>
+    <text x="672" y="288" fill="#bfbab1" font-family="Arial, Helvetica, sans-serif" font-size="19">The validator is the reward authority.</text>
+  </g>
+
+  <g>
+    <rect x="62" y="386" width="492" height="146" fill="#111113" stroke="#2b2b2f" />
+    <text x="88" y="423" fill="#e87a3e" font-family="'Courier New', Courier, monospace" font-size="18" font-weight="700" letter-spacing="3">03 · RANK</text>
+    <text x="88" y="472" fill="#f5f1ea" font-family="Georgia, 'Times New Roman', serif" font-size="38">Rank the frontier.</text>
+    <text x="88" y="506" fill="#bfbab1" font-family="Arial, Helvetica, sans-serif" font-size="19">Auction rules order candidates that can still win.</text>
+  </g>
+
+  <g>
+    <rect x="646" y="386" width="492" height="146" fill="#111113" stroke="#2b2b2f" />
+    <text x="672" y="423" fill="#e87a3e" font-family="'Courier New', Courier, monospace" font-size="18" font-weight="700" letter-spacing="3">04 · DEFERRED PROOF</text>
+    <text x="672" y="472" fill="#f5f1ea" font-family="Georgia, 'Times New Roman', serif" font-size="38">Deferred proof.</text>
+    <text x="672" y="506" fill="#bfbab1" font-family="Arial, Helvetica, sans-serif" font-size="19">GRAIL checks only candidates still in contention.</text>
+  </g>
+
+  <g>
+    <rect x="62" y="604" width="492" height="130" fill="#111113" stroke="#4fb8e0" />
+    <text x="88" y="641" fill="#4fb8e0" font-family="'Courier New', Courier, monospace" font-size="18" font-weight="700" letter-spacing="3">05 · ACCUMULATE</text>
+    <text x="88" y="690" fill="#f5f1ea" font-family="Georgia, 'Times New Roman', serif" font-size="38">Accumulate signal.</text>
+    <text x="88" y="718" fill="#bfbab1" font-family="Arial, Helvetica, sans-serif" font-size="18">Retain clean, checkpoint-bound groups.</text>
+  </g>
+
+  <g>
+    <rect x="646" y="604" width="492" height="130" fill="#111113" stroke="#d44d7a" />
+    <text x="672" y="641" fill="#d44d7a" font-family="'Courier New', Courier, monospace" font-size="18" font-weight="700" letter-spacing="3">06 · GRPO / PUBLISH</text>
+    <text x="672" y="690" fill="#f5f1ea" font-family="Georgia, 'Times New Roman', serif" font-size="38">GRPO, then publish.</text>
+    <text x="672" y="718" fill="#bfbab1" font-family="Arial, Helvetica, sans-serif" font-size="18">Checkpoint · archive · on-chain weights.</text>
+  </g>
+
+  <g fill="#e87a3e" aria-hidden="true">
+    <path d="M 630 230 L 646 238 L 630 246 Z" />
+    <path d="M 292 364 L 300 380 L 308 364 Z" />
+    <path d="M 630 448 L 646 456 L 630 464 Z" />
+    <path d="M 292 582 L 300 598 L 308 582 Z" />
+    <path d="M 630 666 L 646 674 L 630 682 Z" />
+  </g>
+</svg>

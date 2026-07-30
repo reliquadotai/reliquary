@@ -84,24 +84,24 @@ def test_window_open_round_degrades_to_none_on_drand_failure(monkeypatch):
 
 def test_anchor_makes_elapsed_meaningful_for_the_tiebreak():
     """End-to-end intent: with the anchor set, a submission arriving N rounds
-    after open measures elapsed = N, which is what the throughput key divides by."""
-    from reliquary.validator.batch_selection import make_throughput_slot_key
+    after open measures elapsed = N, which is what the throughput rank divides
+    by."""
+    from reliquary.validator.batch_selection import throughput_rank
 
     opened_at = GENESIS + 3000 * PERIOD
     b = _batcher(opened_at)
     b.mark_window_opened()
 
-    key = make_throughput_slot_key(
-        int(b.window_open_drand_round), token_cap=16000,
+    arrival = b.window_open_drand_round + 32
+    rank = throughput_rank(
+        16000,
+        arrival_round=arrival,
+        window_open_round=int(b.window_open_drand_round),
+        token_cap=16000,
         bucket_tokens_per_round=50,
     )
-    arrival = b.window_open_drand_round + 32
-    sub = SimpleNamespace(
-        drand_round=arrival, arrival_drand_round=arrival,
-        completion_length=16000,
-    )
     # 32 rounds elapsed -> 500 tok/round
-    assert -key(sub)[0] == 16000 // (32 * 50)
+    assert -rank == 16000 // (32 * 50)
 
 
 def test_seal_builds_the_throughput_key_only_when_anchored(monkeypatch):

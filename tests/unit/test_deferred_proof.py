@@ -3,6 +3,8 @@ until it is ranked high enough to win. Scoring + ranking reuse the merged
 ``difficulty_auction`` module (v2), and the same-prompt winner is resolved at
 seal.
 """
+import hashlib
+
 from reliquary.constants import DIFFICULTY_AUCTION_DELTA
 from reliquary.validator.batcher import PendingSubmission
 
@@ -16,6 +18,10 @@ def _pending(hotkey="a", prompt_idx=1, k=2, m=8, drand_round=1):
         drand_round=drand_round,
         merkle_root=hotkey.encode().ljust(32, b"\x00"),
         selection_digest=hotkey.encode().ljust(32, b"\x00"),
+        prompt_content_sha256=hashlib.sha256(
+            f"prompt:{prompt_idx}".encode()
+        ).hexdigest(),
+        target_content_sha256=hashlib.sha256(b"target").hexdigest(),
     )
 
 
@@ -451,10 +457,8 @@ def test_forensic_sample_disabled_without_seal_randomness():
     assert b.forensic_sample == []
 
 
-def test_forensic_sample_watches_non_winners_keyed_on_seal_randomness():
-    """With post-deadline drand entropy set, FORENSIC_SAMPLE_PER_WINDOW non-winners
-    are proven for telemetry, selected by hashing seal_randomness (which did not
-    exist at submission time, so a miner cannot grind its root to dodge it)."""
+def test_forensic_sample_balances_counterfactual_and_random_watch():
+    """Keep one #9 utility sample and one unpredictable security sample."""
     from reliquary.constants import FORENSIC_SAMPLE_PER_WINDOW
     from tests.unit.test_grpo_window_batcher import (
         _always_true_grail, _make_batcher, _request,
@@ -474,10 +478,17 @@ def test_forensic_sample_watches_non_winners_keyed_on_seal_randomness():
     assert len(b.forensic_sample) == FORENSIC_SAMPLE_PER_WINDOW
     watched = {r.hotkey for r in b.forensic_sample}
     assert watched.isdisjoint(winners)          # only non-winners are sampled
+    by_role = {result.sample_role: result.hotkey for result in b.forensic_sample}
+    assert by_role["counterfactual"] == "m8"
 
-    # Different post-deadline entropy → different watched set (unpredictable).
-    other = {r.hotkey for r in _make("beacon-round-999").forensic_sample}
-    assert watched != other
+    # The #9 counterfactual is stable, while post-deadline entropy changes the
+    # random anti-evasion watch candidate.
+    other = {
+        result.sample_role: result.hotkey
+        for result in _make("beacon-round-999").forensic_sample
+    }
+    assert other["counterfactual"] == "m8"
+    assert by_role["random_watch"] != other["random_watch"]
 
 
 def test_forensic_sample_failure_cannot_abort_sealing():
@@ -552,20 +563,24 @@ import pytest
 from reliquary.constants import B_BATCH
 
 
-def _telemetry(prompt_idx, hotkey, arrival_round):
+def _telemetry(prompt_idx, hotkey, arrival_round, arrival_ts=0.0):
     from reliquary.validator.observability import SubmitTelemetry
     return SubmitTelemetry(
         window_n=500, prompt_idx=prompt_idx, hotkey=hotkey,
         merkle_root="00" * 32, protocol_version=2,
-        submitted_drand_round=arrival_round, t_arrival=0.0,
+        submitted_drand_round=arrival_round, t_arrival=arrival_ts,
         prompt_hash_lead="", merkle_root_lead="",
+        precommit_arrival_ts=arrival_ts,
         arrival_drand_round=arrival_round,
     )
 
 
-def _accept(b, req, arrival_round):
+def _accept(b, req, arrival_round, arrival_ts=0.0):
     resp = b.accept_submission(
-        req, telemetry=_telemetry(req.prompt_idx, req.miner_hotkey, arrival_round)
+        req,
+        telemetry=_telemetry(
+            req.prompt_idx, req.miner_hotkey, arrival_round, arrival_ts
+        ),
     )
     assert resp.accepted is True
 
@@ -640,9 +655,8 @@ def test_no_telemetry_falls_back_to_submitted_round():
     assert rows["fast"]["arrival_round_source"] == "submitted_fallback"
 
 
-def test_boundary_tier_is_fully_proven_and_marked():
-    """2 slots left, boundary tier holds 3 prompts: all 3 proven (they all
-    earn), tiers beyond the boundary never proven."""
+def test_boundary_tier_proves_only_candidates_that_can_win():
+    """Two remaining slots in a three-candidate tier produce two winners."""
     from tests.unit.test_grpo_window_batcher import _make_batcher, _request
 
     b = _make_batcher()
@@ -653,11 +667,13 @@ def test_boundary_tier_is_fully_proven_and_marked():
     _accept(b, _request(prompt_idx=20, hotkey="late"), arrival_round=102)
     b.seal_batch()
 
-    assert b.proof_attempts == (B_BATCH - 2) + 3
+    assert b.proof_attempts == B_BATCH
     rows = {r["hotkey"]: r for r in b.auction_candidates}
     assert rows["late"]["proof_attempted"] is False
-    for j in range(3):
-        assert rows[f"b{j}"]["proof_passed"] is True
+    boundary = [rows[f"b{j}"] for j in range(3)]
+    assert sum(row["selected"] for row in boundary) == 2
+    assert sum(row["proof_attempted"] for row in boundary) == 2
+    assert sum(row["status"] == "not_needed" for row in boundary) == 1
 
 
 def test_prompt_falls_to_next_tier_when_winning_tier_fails():
@@ -681,7 +697,7 @@ def test_prompt_falls_to_next_tier_when_winning_tier_fails():
     assert b.proof_failure_debt("faker") == 1
 
 
-def test_same_prompt_same_tier_splits_the_prompt_share():
+def test_same_prompt_same_tier_has_one_full_slot_winner():
     from tests.unit.test_grpo_window_batcher import _make_batcher, _request
 
     b = _make_batcher()
@@ -690,10 +706,15 @@ def test_same_prompt_same_tier_splits_the_prompt_share():
     batch, rewards = b.seal_batch()
 
     share = 1.0 / B_BATCH
-    assert rewards["op-a"] == pytest.approx(share / 2)
-    assert rewards["op-b"] == pytest.approx(share / 2)
-    assert len(b.valid_submissions()) == 2   # both proven, both paid
-    assert len(batch) == 1                   # one training representative
+    assert len(rewards) == 1
+    assert next(iter(rewards.values())) == pytest.approx(share)
+    assert len(b.valid_submissions()) == 1
+    assert len(batch) == 1
+    rows = {row["hotkey"]: row for row in b.auction_candidates}
+    assert sum(row["selected"] for row in rows.values()) == 1
+    assert sum(
+        row["status"] == "same_prompt_superseded" for row in rows.values()
+    ) == 1
 
 
 def test_same_prompt_split_survivor_takes_full_share():
@@ -715,7 +736,62 @@ def test_same_prompt_split_survivor_takes_full_share():
     assert rewards == {"honest": pytest.approx(1.0 / B_BATCH)}
 
 
-def test_boundary_tier_fair_split_payout():
+def test_same_content_different_prompt_indices_share_one_slot():
+    from tests.unit.test_grpo_window_batcher import FakeEnv, _make_batcher, _request
+
+    class DuplicateContentEnv(FakeEnv):
+        def get_problem(self, idx):
+            prompt = "same canonical problem" if idx in {7, 8} else f"p{idx}"
+            return {"prompt": prompt, "ground_truth": "a", "id": f"pid-{idx}"}
+
+    b = _make_batcher(env=DuplicateContentEnv())
+    _accept(b, _request(prompt_idx=7, hotkey="first"), arrival_round=100)
+    _accept(b, _request(prompt_idx=8, hotkey="second"), arrival_round=100)
+    batch, rewards = b.seal_batch()
+
+    assert len(batch) == 1
+    assert len(rewards) == 1
+    assert next(iter(rewards.values())) == pytest.approx(1.0 / B_BATCH)
+    rows = {row["hotkey"]: row for row in b.auction_candidates}
+    assert sum(row["selected"] for row in rows.values()) == 1
+    assert sum(
+        row["status"] == "same_content_superseded"
+        for row in rows.values()
+    ) == 1
+    assert b.content_selection["content_alignment_ok"] is True
+
+
+def test_content_cooldown_blocks_duplicate_under_new_prompt_index():
+    from reliquary.validator.cooldown import ContentCooldownMap
+    from tests.unit.test_grpo_window_batcher import FakeEnv, _make_batcher, _request
+
+    class DuplicateContentEnv(FakeEnv):
+        def get_problem(self, idx):
+            return {"prompt": "same canonical problem", "ground_truth": "a"}
+
+    shared = ContentCooldownMap(cooldown_windows=1_000_000)
+    first = _make_batcher(
+        env=DuplicateContentEnv(), content_cooldown_map=shared
+    )
+    _accept(first, _request(prompt_idx=7, hotkey="winner"), arrival_round=100)
+    first.seal_batch()
+
+    second = _make_batcher(
+        env=DuplicateContentEnv(),
+        content_cooldown_map=shared,
+        window_start=501,
+    )
+    _accept(second, _request(
+        prompt_idx=8, hotkey="duplicate", window_start=501
+    ), arrival_round=101)
+    batch, rewards = second.seal_batch()
+
+    assert batch == []
+    assert rewards == {}
+    assert second.auction_candidates[0]["status"] == "content_in_cooldown"
+
+
+def test_boundary_tier_pays_only_selected_training_groups():
     from tests.unit.test_grpo_window_batcher import _make_batcher, _request
 
     b = _make_batcher()
@@ -728,7 +804,111 @@ def test_boundary_tier_fair_split_payout():
     share = 1.0 / B_BATCH
     for i in range(B_BATCH - 2):
         assert rewards[f"a{i}"] == pytest.approx(share)
-    for j in range(3):
-        assert rewards[f"b{j}"] == pytest.approx(2 * share / 3)
+    boundary_rewards = {
+        hotkey: amount
+        for hotkey, amount in rewards.items()
+        if hotkey.startswith("b")
+    }
+    assert len(boundary_rewards) == 2
+    assert all(amount == pytest.approx(share) for amount in boundary_rewards.values())
     assert sum(rewards.values()) == pytest.approx(1.0)
     assert len(batch) == B_BATCH
+    assert b.rewarded_but_not_selected_by_hotkey == {}
+    assert b.reward_alignment == {
+        "selected_groups": B_BATCH,
+        "rewarded_groups": B_BATCH,
+        "paid_unselected_groups": 0,
+        "selected_unrewarded_groups": 0,
+        "reward_alignment_ok": True,
+        "slot_share": pytest.approx(share),
+        "distributed_reward": pytest.approx(1.0),
+        "expected_distributed_reward": pytest.approx(1.0),
+    }
+
+
+def _sealed_equal_score_winners(order, *, seal_randomness, hotkey_prefix):
+    from tests.unit.test_grpo_window_batcher import _make_batcher, _request
+
+    operators = {
+        f"{hotkey_prefix}{i}": f"operator-{i}" for i in range(20)
+    }
+    batcher = _make_batcher(operator_by_hotkey=operators)
+    exact_k2 = [1.0, 1.0] + [0.0] * 6
+    for i in order:
+        _accept(
+            batcher,
+            _request(
+                prompt_idx=i,
+                hotkey=f"{hotkey_prefix}{i}",
+                rewards=exact_k2,
+            ),
+            arrival_round=100,
+            arrival_ts=1_000.0,
+        )
+    batcher.current_checkpoint_hash = "a" * 40
+    batcher.seal_randomness = seal_randomness
+    batch, rewards = batcher.seal_batch()
+    ranked_prompts = [
+        row["prompt_idx"]
+        for row in sorted(batcher.auction_candidates, key=lambda row: row["rank"])
+    ]
+    return batcher, [submission.prompt_idx for submission in batch], ranked_prompts, rewards
+
+
+def test_sealed_tiebreak_is_order_independent_and_not_hotkey_bound():
+    forward = _sealed_equal_score_winners(
+        range(20), seal_randomness="beacon-a", hotkey_prefix="alpha-"
+    )
+    reversed_input = _sealed_equal_score_winners(
+        reversed(range(20)),
+        seal_randomness="beacon-a",
+        hotkey_prefix="alpha-",
+    )
+    renamed_hotkeys = _sealed_equal_score_winners(
+        range(20), seal_randomness="beacon-a", hotkey_prefix="beta-"
+    )
+
+    assert forward[1] == reversed_input[1] == renamed_hotkeys[1]
+    assert forward[2] == reversed_input[2] == renamed_hotkeys[2]
+    assert len(forward[1]) == B_BATCH
+    assert len(forward[3]) <= B_BATCH
+    assert all(
+        row["rank_entropy_source"] == "seal_drand"
+        for row in forward[0].auction_candidates
+    )
+
+
+def test_changing_seal_randomness_changes_exact_tie_winners():
+    first = _sealed_equal_score_winners(
+        range(20), seal_randomness="beacon-a", hotkey_prefix="alpha-"
+    )
+    second = _sealed_equal_score_winners(
+        range(20), seal_randomness="beacon-b", hotkey_prefix="alpha-"
+    )
+
+    assert set(first[1]) != set(second[1])
+
+
+def test_missing_seal_randomness_uses_validator_precommit_arrival():
+    from tests.unit.test_grpo_window_batcher import _make_batcher, _request
+
+    batcher = _make_batcher()
+    _accept(
+        batcher,
+        _request(prompt_idx=1, hotkey="later"),
+        arrival_round=100,
+        arrival_ts=1_000.2,
+    )
+    _accept(
+        batcher,
+        _request(prompt_idx=2, hotkey="earlier"),
+        arrival_round=100,
+        arrival_ts=1_000.1,
+    )
+    batcher.seal_batch()
+
+    rows = {row["hotkey"]: row for row in batcher.auction_candidates}
+    assert rows["earlier"]["rank"] < rows["later"]["rank"]
+    assert rows["earlier"]["rank_entropy_source"] == (
+        "validator_arrival_fallback"
+    )

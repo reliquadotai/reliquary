@@ -32,7 +32,7 @@ seal. The archived `force_seal_reason` remained null, masking the failure mode.
 4. It signs and sends `/submit/precommit`, binding hotkey, window, prompt,
    Merkle root, checkpoint, environment, exact size and digest, drand,
    randomness, protocol version, and nonce.
-5. A validator receipt accepted before the 300-second collection cutoff grants
+5. A validator receipt accepted before the 100-second collection cutoff grants
    up to 33 seconds for only that exact reveal.
 6. The body is sent with `X-Reliquary-Precommit`. Its actual ASGI-stream digest
    and byte count must match. The receipt's precommit-time drand observation is
@@ -50,13 +50,16 @@ validator accepts only a valid predeadline receipt. An old validator's 404 on
 Candidates now rank by:
 
 ```text
-(-difficulty_value, operator_prompt_tiebreak)
+(-difficulty_value, arrival_drand_round, operator_prompt_tiebreak)
 ```
 
-The tie-break uses operator, prompt, and post-deadline drand entropy. It excludes
-hotkey, Merkle root, miner metadata, and submitted drand. Submitted drand remains
-a zero-tolerance freshness gate and telemetry field only. There is no
-per-operator winner cap; one operator may win multiple distinct prompts.
+The validator stamps `arrival_drand_round` at precommit arrival. Candidates
+still tied in that three-second bucket use checkpoint-, window-, environment-,
+operator-, and prompt-bound post-deadline drand entropy. The hash excludes
+hotkey, Merkle root, selection digest, miner metadata, and submitted drand.
+Submitted drand remains a zero-tolerance freshness gate and telemetry field
+only. There is no per-operator winner cap; one operator may win multiple
+distinct prompts, but only selected training winners receive emission.
 
 ## Admission Throughput
 

@@ -130,8 +130,14 @@ RELIQUARY_LEARNING_RATE=0.000003
 RELIQUARY_RECOMPUTE_PI_OLD_FROM_VERIFY=true
 RELIQUARY_GRAD_NORM_SKIP_THRESHOLD=50
 RELIQUARY_PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD=0.1
+RELIQUARY_CHECKPOINT_PUBLISH_INTERVAL_WINDOWS=4
 RELIQUARY_SHAPE_PENALTY=0
 ```
+
+The four-step checkpoint cadence limits behavior-policy staleness. If the ratio
+gate still trips before cadence, the rejected update is excluded and the
+validator publishes only the previously accepted in-memory steps before
+resuming against the refreshed behavior policy.
 
 ### Cooldown on training restart
 
@@ -140,6 +146,12 @@ the full cooldown survives a restart. Key it with `RELIQUARY_TRAINING_RUN_ID`
 (default `default`): keep it stable while a training run continues, and **bump
 it to a fresh value when you start a new training from scratch** so the cooldown
 resets to zero — a fresh model must be allowed to re-see every prompt.
+
+The validator also maintains a canonical rendered-prompt cooldown under the
+same run id. Its local gzip snapshot is startup-critical: windows remain closed
+until the map is complete and restart-safe. The R2 copy may lag during an
+outage, but `/health.content_cooldown` must show `complete=true` and a current
+local or mirrored snapshot before serving miners.
 
 
 ## Sanity checks (both modes)
@@ -205,10 +217,10 @@ These are the live thresholds the trainer applies on every submission. The same 
 |---|---|---|
 | `B_BATCH` | 8 | Maximum proven winners and uniform reward slots per active environment |
 | `M_ROLLOUTS` | 8 | Required rollout count per submission |
-| `T_PROTO` | 0.9 | Protocol-fixed sampling temperature (validator's recompute uses this) |
+| `T_PROTO` | 0.6 | Protocol-fixed sampling temperature (validator's recompute uses this) |
 | `FORCED_SEED_PROTOCOL_VERSION` | 2 | Mandatory hotkey-free forced stream while enforcement is active |
-| `WINDOW_COLLECTION_SECONDS` | 300 | Fixed collection interval for both Math and Code auction populations |
-| `MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW` | 96 | Started grading/proof ceiling per environment/window |
+| `WINDOW_COLLECTION_SECONDS` | 100 | Fixed collection interval for both Math and Code auction populations |
+| `MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW` | 64 | Started grading/proof ceiling per environment/window |
 | `MAX_PROOF_WALL_SECONDS` | 240 | Seal-time proof wall-clock ceiling per environment |
 | `MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW` | 4 | Operator-wide seal GPU debt limit per environment |
 | `MAX_SUBMISSION_PAYLOAD_BYTES` | 64 MiB | Per-request parsed JSON payload limit |
@@ -217,7 +229,7 @@ These are the live thresholds the trainer applies on every submission. The same 
 | `SIGMA_MIN` (steady) | 0.43 | Zone filter: groups below this are rejected `OUT_OF_ZONE` (binary equivalent: k ∈ [2, 6] for M=8) |
 | `BOOTSTRAP_SIGMA_MIN` | 0.33 | Relaxed zone filter during first `BOOTSTRAP_WINDOWS = 100` windows (k ∈ [1, 7]) |
 | `BATCH_PROMPT_COOLDOWN_WINDOWS` | 1,000,000 | A winning prompt is effectively one-shot in the OpenMath phase |
-| `COOLDOWN_REBUILD_LOOKBACK` | 300 | R2 windows replayed at startup to rebuild cooldown without scanning the whole one-shot horizon |
+| `COOLDOWN_REBUILD_LOOKBACK` | 2000 | Bounded R2 gap replay for legacy/fallback prompt-index cooldown recovery; canonical content uses its run-keyed snapshot |
 | `PROOF_SKETCH_TOLERANCE_BASE` | 5000 | GRAIL sketch tolerance — actual threshold = `5000 + 5 × √position` |
 | `PROOF_SKETCH_TOLERANCE_GROWTH` | 5.0 | Per-position sqrt growth |
 | `LOGPROB_IS_EPS` | 0.10 | Per-token log-prob deviation max — exceeding triggers `LOGPROB_MISMATCH` |
@@ -225,7 +237,7 @@ These are the live thresholds the trainer applies on every submission. The same 
 | `MAX_TRUNCATED_PER_SUBMISSION` | 1 | Steady-state cap/non-EOS truncation allowance; accepted cap hits still pass GRAIL/logprob/distribution/boxed checks |
 | `BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION` | 1 | Bootstrap truncation allowance |
 | `TRAINING_QUARANTINE_ENABLED` | true | Suspicious selected windows skip GRPO/publish but remain archived/credited |
-| `TRAINING_QUARANTINE_MAX_SINGLE_COMPLETION_LENGTH` | 7000 | Rollout length that counts as extreme-length telemetry |
+| `TRAINING_QUARANTINE_MAX_SINGLE_COMPLETION_LENGTH` | 32768 | Rollout length that counts as extreme-length telemetry |
 | `TRAINING_QUARANTINE_EXTREME_LENGTH_MIN_ROLLOUTS` | 4 | Minimum long/cap rollouts before length alone can quarantine a window |
 | `TRAINING_QUARANTINE_EXTREME_LENGTH_MIN_GROUPS` | 3 | Minimum groups with long/cap rollouts before length alone can quarantine a window |
 | `MAX_SEAL_QUEUE_DRAIN_SECONDS` | 60 | Deadline work-drain bound before the auction population freezes |
@@ -272,13 +284,14 @@ operator logical claim         zone and cheap authenticity guards
 rate/queue/payload bounds      -> pending auction pool
 -> reason="submitted"          -> first /verdicts lifecycle record
 
-300 s deadline
+100 s deadline
 -> stop new admission and drain pre-deadline work (max 60 s)
 -> freeze Math and Code populations independently
 -> fetch post-deadline drand salt
--> rank by difficulty, operator/prompt post-deadline tie hash
+-> rank by difficulty, validator arrival round, sealed operator/prompt tie hash
 -> prove top-down under attempt/wall/operator-debt bounds
 -> at most 8 distinct prompts; no operator winner cap
+-> pay exactly the selected training groups; no boundary split
 -> final /verdicts lifecycle records
 -> R2 archive + rewards + balanced training accumulator
 ```

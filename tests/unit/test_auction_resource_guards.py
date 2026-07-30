@@ -221,8 +221,9 @@ def test_missing_production_operator_mapping_fails_closed():
 
 
 def test_same_prompt_tie_payout_is_stable_under_hotkey_rename():
-    """Equal-score, equal-arrival candidates on one prompt split its share;
-    renaming an operator's hotkey must not change any operator's payout."""
+    """The sealed operator tie is stable when a hotkey is renamed."""
+    from reliquary.constants import B_BATCH
+
     def seal_with(operator_a_hotkey):
         mapping = {
             operator_a_hotkey: "operator-a",
@@ -233,6 +234,7 @@ def test_same_prompt_tie_payout_is_stable_under_hotkey_rename():
             assert batcher.accept_submission(
                 _request(prompt_idx=7, hotkey=hotkey)
             ).accepted
+        batcher.seal_randomness = "sealed-tie"
         _batch, rewards = batcher.seal_batch()
         return {mapping[hk]: amount for hk, amount in rewards.items()}
 
@@ -240,7 +242,8 @@ def test_same_prompt_tie_payout_is_stable_under_hotkey_rename():
     second = seal_with("operator-a-hotkey-999")
 
     assert first == second
-    assert first["operator-a"] == first["operator-b"]
+    assert len(first) == 1
+    assert next(iter(first.values())) == pytest.approx(1.0 / B_BATCH)
 
 
 def test_code_grader_outage_never_becomes_an_auction_negative():

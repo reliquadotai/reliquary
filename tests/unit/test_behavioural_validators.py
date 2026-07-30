@@ -8,6 +8,7 @@ precomputes. The legacy logits-based path is gone; production never
 materialises a CPU logits tensor for these checks.
 """
 
+import base64
 import math
 
 import pytest
@@ -785,11 +786,11 @@ def test_gpu_completion_token_stats_returns_chosen_and_argmax():
     logits[1] = torch.tensor([0.0, 0.0, 0.0, 9.0])   # predicts token at idx2
     tokens = [0, 1, 3]  # idx1 token=1 (the argmax), idx2 token=3 (the argmax)
 
-    chosen, amax_p, amax_id = verifier._gpu_completion_token_stats(
+    chosen, amax_p, amax_id, entropy = verifier._gpu_completion_token_stats(
         logits, tokens, prompt_length=1, completion_length=2,
         seq_len=seq_len, device="cpu",
     )
-    assert len(chosen) == len(amax_p) == len(amax_id) == 2
+    assert len(chosen) == len(amax_p) == len(amax_id) == len(entropy) == 2
     assert amax_id == [1, 3]
     for c, a in zip(chosen, amax_p):
         assert abs(c - a) < 1e-6
@@ -812,7 +813,7 @@ def test_gpu_completion_token_stats_chunks_vocab_workspace(monkeypatch):
         2 * logits.shape[-1] * 4,
     )
 
-    chosen, amax_p, amax_id = verifier._gpu_completion_token_stats(
+    chosen, amax_p, amax_id, entropy = verifier._gpu_completion_token_stats(
         logits,
         tokens,
         prompt_length=1,
@@ -821,6 +822,79 @@ def test_gpu_completion_token_stats_chunks_vocab_workspace(monkeypatch):
         device="cpu",
     )
 
-    assert len(chosen) == len(amax_p) == len(amax_id) == 4
+    assert len(chosen) == len(amax_p) == len(amax_id) == len(entropy) == 4
     assert amax_id == [1, 2, 3, 0]
     assert chosen == pytest.approx(amax_p)
+
+
+def test_gpu_completion_entropy_matches_uniform_distribution():
+    logits = torch.zeros(2, 4)
+    _chosen, _amax_p, _amax_id, entropy = (
+        verifier._gpu_completion_token_stats(
+            logits,
+            [0, 1],
+            prompt_length=1,
+            completion_length=1,
+            seq_len=2,
+            device="cpu",
+        )
+    )
+
+    assert entropy == pytest.approx([math.log(4.0)])
+
+
+def test_gpu_completion_entropy_is_stratified_and_bounded(monkeypatch):
+    monkeypatch.setattr(verifier, "_UTILITY_ENTROPY_MAX_POSITIONS", 3)
+    logits = torch.zeros(11, 4)
+    chosen, amax_p, amax_id, entropy = (
+        verifier._gpu_completion_token_stats(
+            logits,
+            [0] * 11,
+            prompt_length=1,
+            completion_length=10,
+            seq_len=11,
+            device="cpu",
+        )
+    )
+
+    assert len(chosen) == len(amax_p) == len(amax_id) == 10
+    assert entropy == pytest.approx([math.log(4.0)] * 3)
+
+
+def test_gpu_completion_entropy_can_be_disabled():
+    chosen, amax_p, amax_id, entropy = (
+        verifier._gpu_completion_token_stats(
+            torch.zeros(3, 4),
+            [0, 0, 0],
+            prompt_length=1,
+            completion_length=2,
+            seq_len=3,
+            device="cpu",
+            include_entropy=False,
+        )
+    )
+
+    assert len(chosen) == len(amax_p) == len(amax_id) == 2
+    assert entropy == []
+
+
+def test_hidden_anchor_telemetry_skips_terminal_eos_and_force_span():
+    hidden = torch.arange(30, dtype=torch.float32).reshape(6, 5)
+    start, delta, dim, end_offset, shift_norm = (
+        verifier._hidden_anchor_telemetry(
+            hidden,
+            tokens=[1, 2, 10, 11, 12, 99],
+            prompt_length=2,
+            completion_length=4,
+            eos_ids={99},
+            rollout_meta={"forced": True, "force_span": [3, 5]},
+        )
+    )
+
+    assert len(base64.b64decode(start)) == 5 * 2
+    assert len(base64.b64decode(delta)) == 5 * 2
+    assert dim == 5
+    assert end_offset == 0
+    assert shift_norm == pytest.approx(
+        torch.linalg.vector_norm(hidden[2] - hidden[1]).item()
+    )

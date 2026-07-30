@@ -14,7 +14,7 @@ Reliquary turns this filter problem into a **prediction market**. Every training
 
 Three structural guarantees come with the market:
 
-- **Forced curriculum diversity.** A prompt that enters a winning batch is locked out for `BATCH_PROMPT_COOLDOWN_WINDOWS = 1_000_000` windows in the current OpenMath phase. In practice, prompts are one-shot. This prevents collapse onto a handful of high-variance outliers; R2 cooldown rebuild uses a bounded recent-window lookback so startup stays cheap.
+- **Forced curriculum diversity.** A prompt that enters a winning batch is locked out for `BATCH_PROMPT_COOLDOWN_WINDOWS = 1_000_000` windows in the current OpenMath phase. In practice, prompts are one-shot. The validator enforces this by both dataset index and canonical rendered-prompt digest, so duplicate content at another index cannot win again. The run-keyed snapshots survive restarts.
 - **Cryptographic training-data provenance.** Every rollout carries a GRAIL sketch that binds the generation to the model weights that produced it. The validator re-verifies with its own forward pass. Fabricated data earns zero.
 - **Validator-side reward authority and training quarantine.** For OpenMath, miners submit local reward claims and the validator independently recomputes them. For OpenCode, the curated structured cases are public but the validator alone executes them in its trusted sandbox and overwrites miner reward placeholders. Windows with high-confidence poison signatures are archived and credited but skipped for GRPO/publish.
 
@@ -42,18 +42,18 @@ For each rollout the miner runs a bit-identical HuggingFace forward pass on the 
 The miner serializes and hashes its final signed body, obtains a signed upload receipt from `POST /submit/precommit`, then sends the exact bytes to `POST /submit`. A predeadline receipt grants bounded upload grace without extending generation. In production, the body response is provisional (`accepted=True, reason="submitted"`) once queued. A background worker runs bounded admission and reward grading. Its later `ACCEPTED` verdict means the group entered the pending auction pool; it is not yet a GRAIL pass or a paid slot.
 
 **6. Validator admits, ranks, proves, and selects.**
-Math and Code each collect an independent pending population for 300 seconds. Admission checks the window, checkpoint, protocol, registration/operator mapping, prompt, payload bounds, signatures, randomness, dedup, validator-authoritative rewards, and zone filter (`sigma >= 0.43`) without running the expensive model proof. At the deadline the validator drains pre-deadline work, freezes both populations, and ranks them by `std(rewards) * (1 - mean(rewards))`. It then proves candidates top-down until it has at most eight distinct-prompt winners, under strict proof-attempt/wall-time bounds and with no operator winner cap. A failed high-ranked proof promotes the next candidate; an unproven candidate is never paid.
+Math and Code each collect an independent pending population for 100 seconds. Admission checks the window, checkpoint, protocol, registration/operator mapping, prompt, payload bounds, signatures, randomness, dedup, validator-authoritative rewards, and zone filter (`sigma >= 0.43`) without running the expensive model proof. At the deadline the validator drains pre-deadline work, freezes both populations, and ranks them by `std(rewards) * (1 - mean(rewards))`, validator-observed precommit drand round, then a post-deadline drand tie-break. It proves candidates top-down until it has at most eight distinct-prompt winners, under strict proof-attempt/wall-time bounds and with no operator winner cap. A failed high-ranked proof promotes the next candidate; an unselected candidate is never paid.
 
 **7. Validator accumulates clean signal and runs a balanced GRPO step.**
 State transitions to `TRAINING`. Before retention, the validator assesses the selected groups and current reject profile. Quarantined windows remain archived and credited but do not enter training. Clean partial batches are retained across windows under the exact public checkpoint revision, capped at one target batch per environment. Once every active environment is full, the validator assesses the balanced retained batch again and runs `train_step()`. A checkpoint change discards pending samples before any new-revision samples are retained, so one optimizer step never mixes generation policies.
 
 **8. Validator publishes a new checkpoint.**
-State transitions to `PUBLISHING`. Every `CHECKPOINT_PUBLISH_INTERVAL_WINDOWS = 10` trained windows the model is saved locally, pushed to HF Hub, and signed: `ed25519(checkpoint_n || revision)`. The signed manifest is installed in `/checkpoint`. Between publishes the miners stay on the last-published revision (enforced by the checkpoint hash gate). The window dataset is archived to R2, including quarantine metadata when present.
+State transitions to `PUBLISHING`. Every `CHECKPOINT_PUBLISH_INTERVAL_WINDOWS = 4` trained windows the model is saved locally, pushed to HF Hub, and signed: `ed25519(checkpoint_n || revision)`. If the PPO ratio gate detects behavior-policy drift sooner, the rejected step is excluded and the previously accepted in-memory updates are published immediately. The signed manifest is installed in `/checkpoint`. Between publishes the miners stay on the last-published revision (enforced by the checkpoint hash gate). The window dataset is archived to R2, including quarantine metadata when present.
 
 **9. State → READY → OPEN.**
 The next window opens immediately. Winning prompts enter one-shot cooldown. Once per subnet epoch the validator calls `set_weights` on-chain with the current EMA snapshot.
 
-**Safety net.** Auction windows seal on their fixed 300-second collection deadline, not on candidate count. Queue drain is bounded at 60 seconds, ranked proof work at 96 attempts and 240 seconds per environment, and incomplete batches advance with unpaid slots burned. The legacy sparse-window breakers remain relevant only when the auction kill switch restores the old selector. Clean partial winners may complete a later checkpoint-consistent balanced training batch.
+**Safety net.** Auction windows seal on their fixed 100-second collection deadline, not on candidate count. Queue drain and ranked proof work are bounded independently, and incomplete batches advance with unpaid slots burned. The legacy sparse-window breakers remain relevant only when the auction kill switch restores the old selector. Clean partial winners may complete a later checkpoint-consistent balanced training batch.
 
 ---
 
@@ -77,7 +77,7 @@ Bootstrap phase (`BOOTSTRAP_WINDOWS = 100` windows from `SUBNET_START_BLOCK`): t
 
 Once a `prompt_idx` enters the winning batch it is ineligible for `BATCH_PROMPT_COOLDOWN_WINDOWS = 1_000_000` windows. With OpenMathInstruct-2's large prompt pool, this makes prompts effectively one-shot across any realistic run.
 
-The cooldown map is rebuilt from recent R2 archives using `COOLDOWN_REBUILD_LOOKBACK`, not the full one-shot horizon. This preserves recent curriculum state without forcing startup to download a million archives.
+The prompt-index cooldown is restored from its complete run-keyed snapshot and may replay a bounded R2 gap. A separate full-SHA256 canonical-content snapshot closes dataset-alias bypasses. On its first deployment, the validator resolves every selected index in the complete prompt snapshot and refuses to open a window until the derived content map is durable locally.
 
 ### Training quarantine — protect model health during exploit discovery
 
@@ -106,9 +106,11 @@ pattern.
 
 > **Current production design (July 2026).** The auction supersedes the v2.3 same-prompt runner-up split. Full contract: [difficulty-auction-v2-design.md](superpowers/specs/2026-07-15-difficulty-auction-v2-design.md).
 
-Per-window randomness remains drand-derived and exposed by `/state`. Submissions carry the current drand round, with stale/future rounds rejected at signed precommit arrival. Submitted drand is not a ranking key. Candidates rank by difficulty; equal scores use a post-deadline drand salt bound to `(operator, prompt)`, never hotkey or miner-controlled payload metadata.
+Per-window randomness remains drand-derived and exposed by `/state`. Submissions carry the current drand round, with stale/future rounds rejected at signed precommit arrival. Submitted drand is not a ranking key. Candidates rank by difficulty, then validator-observed precommit drand round. Exact ties inside that three-second bucket use a post-deadline drand salt bound to checkpoint, window, environment, operator, and prompt, never hotkey or miner-controlled payload metadata. A bounded seal-beacon outage falls back to exact validator-observed precommit arrival, not known window randomness.
 
 Multiple distinct operators may enter the same prompt pool, bounded at ten groups, but only the first ranked candidate for that prompt that passes deferred proof can win. One operator may reserve only one logical claim per prompt; there is no per-operator winner cap. The active selector does not split a prompt slot among runners-up.
+
+Prompt uniqueness is canonical-content based, not index-only. The observation-only foundation for a future validator-authoritative utility tie-break is documented in [Auction v3 Utility Foundation](auction-v3-utility-foundation.md). It does not alter the auction-v2 order or payout.
 
 This removes the old hotkey-count dilution surface: extra hotkeys neither produce different forced draws, reserve additional operator/prompt claims, nor create additional equal-score tie tickets.
 
@@ -134,7 +136,7 @@ This guarantees that training data always reflects the currently-published polic
 
 ### Publish every N trained windows — HF cannot keep up with per-step pushes
 
-The base model is Qwen3.5-2B (~2 billion parameters, sharded safetensors, thinking chat template). Pushing a new safetensors snapshot to HF Hub on every window (roughly every 60 seconds under load) is infeasible due to Git LFS latency and HF rate limits. The validator publishes to HF every `CHECKPOINT_PUBLISH_INTERVAL_WINDOWS = 10` successful balanced optimizer steps. A partial window may contribute retained samples but does not increment the cadence by itself. Quarantined windows are archived/credited but excluded from the accumulator. Between publishes, miners stay on the last-published revision — the hash gate keeps them there. `checkpoint_n` only increments on a successful publish, so the gate remains stable across the publish gap.
+The base model is Qwen3.5-2B (~2 billion parameters, sharded safetensors, thinking chat template). Pushing a new safetensors snapshot to HF Hub on every window is infeasible due to Git LFS latency and HF rate limits. The validator therefore publishes after four successful balanced optimizer steps by default; operators can set `RELIQUARY_CHECKPOINT_PUBLISH_INTERVAL_WINDOWS` explicitly. A partial window may contribute retained samples but does not increment the cadence by itself. Quarantined windows are archived/credited but excluded from the accumulator. If `policy_ratio_drift` rejects a later step, that rejected step never reaches the optimizer and the validator publishes the preceding safe updates, refreshes the serving behavior policy, and retries a failed upload without training again. Between publishes, miners stay on the last-published revision — the hash gate keeps them there. `checkpoint_n` only increments on a successful publish, so the gate remains stable across the publish gap.
 
 ---
 
@@ -142,7 +144,7 @@ The base model is Qwen3.5-2B (~2 billion parameters, sharded safetensors, thinki
 
 ### How a miner earns
 
-1. Submit a protocol-v2, valid, in-zone group on a non-cooldown prompt during the 300-second collection interval.
+1. Submit a protocol-v2, valid, in-zone group on a non-cooldown prompt during the 100-second collection interval.
 2. Rank highly enough by difficulty and pass the validator's deferred proof.
 3. Be the first proven candidate for that prompt. Each selected group earns one `pool / B_BATCH` environment slot.
 4. Once per subnet epoch (~360 blocks), the validator calls `set_weights` on-chain with the current EMA values. All validators submit inside a shared ~20-block window before the epoch boundary so they converge on identical weights. Your emission for the epoch is proportional to your EMA score.
@@ -187,7 +189,7 @@ A miner consistently landing two winning prompts in one environment reaches its 
 | Cherry-pick only easy prompts | σ ≈ 0 → `OUT_OF_ZONE` | 0 earnings |
 | Spam the same prompt every window | One-shot cooldown blocks re-entry after the prompt wins | 0 earnings after first winning inclusion |
 | Generate extra rollouts to select favorable reward vectors | Monitoring and training quarantine reduce blast radius; long-term private tasks / commit-first sampling are the durable fix | Some shaping value remains until durable mitigations land |
-| Submit extremely fast | Fixed 300-second collection prevents early count-based seal | Timing matters only for reaching the deadline and queue drain |
+| Submit extremely fast | Fixed 100-second collection prevents early count-based seal | Arrival round breaks exact score ties; sub-round milliseconds matter only during a seal-beacon outage |
 | Register many hotkeys | Hotkey-free seed, operator/prompt dedup, and operator-bound equal-score ties | No extra legal draw or tie ticket for the same operator/prompt |
 | Run a stale model | `WRONG_CHECKPOINT` rejects before GRAIL | 0 earnings |
 

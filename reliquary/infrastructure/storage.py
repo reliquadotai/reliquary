@@ -79,6 +79,8 @@ def get_s3_client(
 async def upload_json(key: str, data: Any, **client_kwargs) -> bool:
     """Upload JSON data to S3."""
     payload = json.dumps(data, separators=(",", ":")).encode()
+    if key.endswith(".gz"):
+        payload = gzip.compress(payload)
     async with get_s3_client(**client_kwargs) as client:
         bucket = client_kwargs.get("bucket_name") or os.getenv("R2_BUCKET_ID", "reliquary")
         await client.put_object(Bucket=bucket, Key=key, Body=payload)

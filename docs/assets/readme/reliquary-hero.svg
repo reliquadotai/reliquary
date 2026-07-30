@@ -1,0 +1,98 @@
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  width="1440"
+  height="480"
+  viewBox="0 0 1440 480"
+  role="img"
+  aria-labelledby="reliquary-core-hero-title reliquary-core-hero-description"
+  focusable="false"
+>
+  <title id="reliquary-core-hero-title">Reliquary validator and miner runtime</title>
+  <desc id="reliquary-core-hero-description">
+    The core Reliquary runtime for decentralized GRPO training on Bittensor Subnet 81:
+    mine the frontier, prove the rollout, and train the checkpoint.
+  </desc>
+
+  <defs>
+    <pattern id="reliquary-core-grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M 32 0 L 0 0 0 32" fill="none" stroke="#202024" stroke-width="1" />
+    </pattern>
+  </defs>
+
+  <rect width="1440" height="480" fill="#0a0a0b" />
+  <rect width="1440" height="480" fill="url(#reliquary-core-grid)" opacity="0.6" />
+  <rect x="24" y="24" width="1392" height="432" fill="none" stroke="#2b2b2f" />
+  <line x1="416" y1="24" x2="416" y2="456" stroke="#2b2b2f" />
+
+  <g transform="translate(104 136) scale(1.75)">
+    <line
+      x1="8"
+      y1="60"
+      x2="112"
+      y2="60"
+      stroke="#e87a3e"
+      stroke-width="1.2"
+      opacity="0.55"
+    />
+    <path
+      d="M 60 12 L 108 60 L 60 108 L 12 60 Z"
+      fill="none"
+      stroke="#e87a3e"
+      stroke-width="2.4"
+      stroke-linejoin="miter"
+    />
+    <path d="M 60 36 L 84 60 L 60 84 L 36 60 Z" fill="#e87a3e" />
+    <circle cx="60" cy="60" r="3.2" fill="#0a0a0b" />
+  </g>
+
+  <text
+    x="464"
+    y="100"
+    fill="#8c887f"
+    font-family="'Courier New', Courier, monospace"
+    font-size="24"
+    font-weight="700"
+    letter-spacing="5"
+  >CORE RUNTIME · BITTENSOR SUBNET 81</text>
+
+  <text
+    x="458"
+    y="218"
+    fill="#f5f1ea"
+    font-family="Georgia, 'Times New Roman', serif"
+    font-size="98"
+    letter-spacing="-3"
+  >Reliquary</text>
+  <circle cx="905" cy="179" r="8" fill="#e87a3e" />
+
+  <text
+    x="464"
+    y="300"
+    fill="#f5f1ea"
+    font-family="Georgia, 'Times New Roman', serif"
+    font-size="49"
+    font-style="italic"
+  >Find the signal. Prove it. Train.</text>
+
+  <text
+    x="464"
+    y="354"
+    fill="#bfbab1"
+    font-family="Arial, Helvetica, sans-serif"
+    font-size="27"
+  >Auction selection · deferred GRAIL verification · checkpoint-bound GRPO</text>
+
+  <line x1="464" y1="402" x2="1320" y2="402" stroke="#2b2b2f" />
+  <circle cx="464" cy="402" r="5" fill="#e87a3e" />
+  <circle cx="838" cy="402" r="5" fill="#4fb8e0" />
+  <circle cx="1320" cy="402" r="5" fill="#d44d7a" />
+  <text
+    x="464"
+    y="435"
+    fill="#8c887f"
+    font-family="'Courier New', Courier, monospace"
+    font-size="20"
+    font-weight="700"
+    letter-spacing="3"
+  >VALIDATOR · MINER · GRAIL · GRPO · ARCHIVE · CHAIN</text>
+</svg>

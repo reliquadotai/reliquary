@@ -238,16 +238,17 @@ All changes ship with defaults that preserve current behavior — nothing activa
 4. Model swap (fresh training run).
 
 **Wiring audit — the throughput feature was a prod no-op on first pass; fixed:**
-- ✅ *Difficulty auction owned the slot key* (`DIFFICULTY_AUCTION_ENFORCE` defaults on for openmathinstruct, so the old `elif` never fired for math). Now composed: `slot_round_of = (value_tier, −throughput_bucket, arrival)` — throughput orders draws *within* a value tier; value still dominates.
+- ✅ *Difficulty auction owned the slot key* (`DIFFICULTY_AUCTION_ENFORCE` defaults on for openmathinstruct, so the old `elif` never fired for math). Now a component of the auction rank itself: `(−value, −throughput_bucket, arrival, …)` — throughput orders draws of equal value; value still dominates. (Re-wired on the auction-v3 merge: v3 pays exactly the eight strictly ranked winners, so `select_batch_and_distribute`'s slot key — where the tie-break used to live — no longer decides emission at all.)
 - ✅ *`ValidSubmission` had no `completion_length`* → added as a property = sum of the group's rollout token counts (the work numerator; `THROUGHPUT_TOKEN_CAP` is now group-scale, `M_ROLLOUTS × 16000`).
 - ✅ *`window_open_drand_round` was never populated* → set in `mark_window_opened` from the drand chain (best-effort; None ⇒ throughput cleanly disables, arrival ordering holds).
-- Tests: composition (value dominates; throughput breaks within-tier draws) + summed-length property.
+- Tests: composition (value dominates; throughput wins the draw over an earlier arrival; disabled ⇒ arrival order bit-for-bit) + summed-length property.
 
 **Still open for review / before deploy:**
 - **Verify cost (BFT 16k):** a 16k budget makes forced/long rollouts up to ~16.5k tokens, so the GRAIL verify forward runs on ~6.5× longer sequences. Load-test verify latency/memory before deploy (the verifier warns about memory ceilings) — this can gate window cadence or OOM.
 - **Clean-cap path untested:** `BFT_FORCE_ANSWER=False` has no test yet, and its premise (an unterminated rollout stays a reward-0 member of the group, not dropped) must be confirmed before flipping the flag.
 - **`MAX_TRUNCATED_PER_SUBMISSION = 1` vs an honestly-rambling 4B (code):** a code group with ≥2 rollouts that hit the cap without EOS is rejected wholesale. The 4B loops on ~8-10% of code, so ~1-in-8 honest code groups get rejected even at the 32768 cap. The check guards the manufactured-loser exploit, so don't just raise it — decide between a higher code allowance or a smarter honest-loop-vs-manufactured check. (Kept the global cap at 32768 to not make this worse.)
-- **Consensus determinism (minor):** the throughput key uses float division; IEEE-754 is deterministic but consider integer arithmetic if a multi-validator set is ever assumed (currently single-validator).
+- **Consensus determinism:** resolved — the throughput rank is integer floor division, so it is bit-identical across validators.
+- **Throughput vs proven-dominance early close (mutually exclusive today):** the early close proves the outcome frozen from arrival *monotonicity* (a later arrival can never outrank an equal-value candidate already proven). The throughput rank breaks that: a later arrival with a higher tokens/round bucket does outrank. So `mark_window_opened` does not start the prover while `THROUGHPUT_TIEBREAK_ENABLED` is set, and the collection deadline seals. Since early close is exactly what buys back the 300 s cadence cost, this needs a follow-up: let the close carry a bound on the best throughput any *future* arrival could still reach — `bucket ≤ token_cap // ((current_round − window_open) × width)` — and close only when every proven winner already meets it.
 - Coordinate the BFT wire changes with 0xgrizz (active on the validator — PR #160).
 
 ## Appendix — the numbers

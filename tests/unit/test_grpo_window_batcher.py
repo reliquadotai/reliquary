@@ -818,12 +818,8 @@ def test_state_endpoint_exposes_cooldown():
 
 def test_distinct_prompts_in_batch_only():
     """One submission per winning prompt enters the training batch, even when
-    multiple miners successfully submitted on the same prompt.
-
-    BEHAVIOUR CHANGE (speed-ranked tiers): alice and bob tie exactly on
-    (score, arrival), so BOTH are proven and split prompt 42's slot share;
-    one canonical representative trains. Still sybil-neutral: the prompt's
-    total payout is one slot share regardless of K.
+    multiple miners successfully submitted on the same prompt. A strict tie
+    order chooses one full-slot winner; the other is unpaid.
     """
     b = _make_batcher()
     b.accept_submission(_request(prompt_idx=42, hotkey="alice"))
@@ -832,9 +828,13 @@ def test_distinct_prompts_in_batch_only():
     batch, rewards = b.seal_batch()
     assert len(batch) == 2
     assert {s.prompt_idx for s in batch} == {42, 7}
-    # Prompt 42's slot share (1/8) splits between its two tied miners.
-    assert abs(rewards["alice"] - 1 / 16) < 1e-9
-    assert abs(rewards["bob"] - 1 / 16) < 1e-9
+    prompt_42_rewards = {
+        hotkey: reward
+        for hotkey, reward in rewards.items()
+        if hotkey in {"alice", "bob"}
+    }
+    assert len(prompt_42_rewards) == 1
+    assert next(iter(prompt_42_rewards.values())) == pytest.approx(1 / 8)
     assert abs(rewards["carol"] - 1 / 8) < 1e-9
 
 
@@ -2233,48 +2233,28 @@ def test_proof_admission_post_trigger_cap_rejects_same_round_tail():
     )
 
 
-def _prove_all_pending(b):
-    """Prove every pending candidate into ``_valid``, bypassing the B_BATCH cap
-    that ``_prove_ranked`` normally enforces, so the seal's boundary fair-split
-    (which needs > B distinct candidate prompts) is reachable in the test."""
-    def _prove(pool=1.0):
-        proven = [
-            s for s in (
-                b._verify_expensive(p) for p in b.pending_submissions()
-            ) if s is not None
-        ]
-        b._valid = proven
-        b.valid_count = len(proven)
-        return proven
-    b._prove_ranked = _prove
-    b._prove_forensic_sample = lambda: []
-
-
-def test_seal_batch_cooldowns_every_rewarded_boundary_prompt():
-    """Boundary runners earn emission, so their prompts must enter cooldown."""
+def test_seal_batch_cooldowns_only_selected_auction_prompts():
     b = _make_batcher()
     for i in range(B_BATCH + 4):
         req = _request(prompt_idx=i, hotkey=f"hk{i}")
         req.drand_round = 100
         assert b.accept_submission(req).accepted is True
 
-    _prove_all_pending(b)
     batch, rewards = b.seal_batch()
 
     selected_prompts = {s.prompt_idx for s in batch}
-    runner_prompts = set(range(B_BATCH + 4)) - selected_prompts
+    losing_prompts = set(range(B_BATCH + 4)) - selected_prompts
     assert len(batch) == B_BATCH
-    assert set(rewards) == {f"hk{i}" for i in range(B_BATCH + 4)}
-    assert runner_prompts
-    for prompt_idx in range(B_BATCH + 4):
+    assert len(rewards) == B_BATCH
+    assert losing_prompts
+    for prompt_idx in selected_prompts:
         assert b._cooldown.is_in_cooldown(prompt_idx, b.window_start + 1)
-    assert b.rewarded_but_not_selected_by_hotkey == {
-        f"hk{prompt_idx}": 1 for prompt_idx in runner_prompts
-    }
+    for prompt_idx in losing_prompts:
+        assert not b._cooldown.is_in_cooldown(prompt_idx, b.window_start + 1)
+    assert b.rewarded_but_not_selected_by_hotkey == {}
 
 
-def test_seal_batch_hash_dedup_records_rewarded_boundary_runners():
-    """Rollout hashes for paid runners must be blocked in later windows."""
+def test_seal_batch_hash_dedup_records_only_selected_winners():
     from reliquary.validator.dedup import RolloutHashSet
 
     hs = RolloutHashSet(retention_windows=50)
@@ -2284,18 +2264,45 @@ def test_seal_batch_hash_dedup_records_rewarded_boundary_runners():
         req.drand_round = 100
         assert b.accept_submission(req).accepted is True
 
-    _prove_all_pending(b)
-    batch, _ = b.seal_batch()
+    batch, rewards = b.seal_batch()
 
-    selected_prompts = {s.prompt_idx for s in batch}
-    runner_submissions = [
-        s for s in b.valid_submissions() if s.prompt_idx not in selected_prompts
-    ]
-    assert runner_submissions
-    for sub in runner_submissions:
+    assert len(batch) == B_BATCH
+    assert len(rewards) == B_BATCH
+    assert len(hs) == B_BATCH * M_ROLLOUTS
+    for sub in batch:
         assert len(sub.rollout_hashes) == M_ROLLOUTS
         for h in sub.rollout_hashes:
             assert h in hs
+
+
+def test_auction_reward_alignment_fails_closed_on_oversized_winner_set():
+    b = _make_batcher()
+    for i in range(B_BATCH + 1):
+        assert b.accept_submission(
+            _request(prompt_idx=i, hotkey=f"hk{i}")
+        ).accepted
+
+    proven = [
+        submission
+        for submission in (
+            b._verify_expensive(pending)
+            for pending in b.pending_submissions()
+        )
+        if submission is not None
+    ]
+    b._valid = proven
+    b.valid_count = len(proven)
+    b._prove_ranked = lambda pool=1.0: proven
+    b._prove_forensic_sample = lambda: []
+
+    with pytest.raises(RuntimeError, match="winner count exceeds batch size"):
+        b.seal_batch()
+
+    assert b.rewards_by_hotkey == {}
+    assert all(
+        not b._cooldown.is_in_cooldown(prompt_idx, b.window_start + 1)
+        for prompt_idx in range(B_BATCH + 1)
+    )
 
 
 def test_batcher_beacon_invalid_defaults_false():

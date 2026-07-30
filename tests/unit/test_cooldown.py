@@ -2,7 +2,7 @@
 
 import pytest
 
-from reliquary.validator.cooldown import CooldownMap
+from reliquary.validator.cooldown import ContentCooldownMap, CooldownMap
 
 
 def test_empty_map_never_in_cooldown():
@@ -64,6 +64,25 @@ def test_negative_prompt_idx_rejected():
     m = CooldownMap(cooldown_windows=50)
     with pytest.raises(ValueError):
         m.record_batched(prompt_idx=-1, window=100)
+
+
+def test_content_cooldown_roundtrip_and_expiry():
+    digest = "ab" * 32
+    content = ContentCooldownMap(cooldown_windows=50)
+    content.record_selected(digest, window=100)
+
+    assert content.is_in_cooldown(digest.upper(), 149) is True
+    assert content.is_in_cooldown(digest, 150) is False
+
+    restored = ContentCooldownMap(cooldown_windows=50)
+    restored.import_state(content.export_state())
+    assert restored.export_state() == {digest: 100}
+
+
+def test_content_cooldown_rejects_truncated_digest():
+    content = ContentCooldownMap(cooldown_windows=50)
+    with pytest.raises(ValueError, match="64 lowercase hex"):
+        content.record_selected("ab", window=100)
 
 
 import json

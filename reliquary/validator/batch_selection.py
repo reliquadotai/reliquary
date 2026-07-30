@@ -27,7 +27,7 @@ v2.3+: replaces the v2.2 pure-FIFO ``select_batch``.
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from reliquary.validator.cooldown import CooldownMap
 
@@ -65,23 +65,24 @@ def _prompt_canonical_key(prompt_idx: int) -> bytes:
     return hashlib.sha256(prompt_idx.to_bytes(8, "big", signed=False)).digest()
 
 
-def make_throughput_slot_key(
-    window_open_round: int,
+def throughput_rank(
+    tokens: int,
     *,
+    arrival_round: int,
+    window_open_round: int,
     token_cap: int,
     bucket_tokens_per_round: int,
-) -> Callable[[Any], tuple[int, int]]:
-    """Build a ``slot_round_of`` that orders draws by THROUGHPUT, not raw arrival.
+) -> int:
+    """Draw-ordering component for THROUGHPUT instead of raw arrival speed.
 
-    The default slot key is ``sub.drand_round`` — pure arrival speed — which
-    penalizes long generation: a 16k-token rollout arrives at a later drand round
-    than a 500-token one and loses the slot even at equal hardware. This ranks
-    instead by tokens-per-round::
+    The auction ranks equal-value candidates by arrival drand round — pure speed
+    — which penalizes long generation: a 16k-token rollout arrives at a later
+    round than a 500-token one and loses the draw even at equal hardware. This
+    ranks instead by tokens-per-round::
 
-        throughput = min(completion_length, token_cap) / max(arrival - open, 1)
+        throughput = min(tokens, token_cap) / max(arrival - open, 1)
 
-    quantized into ``bucket_tokens_per_round`` buckets (higher throughput fills
-    the batch first). Properties:
+    quantized into ``bucket_tokens_per_round`` buckets. Properties:
 
     * **Length-neutral** — same hardware ⇒ same throughput regardless of how many
       tokens were generated, so long reasoning is no longer penalized.
@@ -89,38 +90,25 @@ def make_throughput_slot_key(
     * **No padding incentive** — throughput is a *rate* (padding adds tokens and
       time in step), and ``min(.., token_cap)`` gives zero rank past the cap.
 
-    Returns a ``(-bucket, arrival_round)`` tuple so higher throughput sorts first
-    and arrival deterministically breaks within-bucket ties. A submission missing
-    ``completion_length`` degrades to throughput 0 (last bucket, arrival-ordered)
-    rather than raising — so the ordering never crashes on an unexpected shape.
+    Returns ``-bucket`` so that higher throughput sorts FIRST inside a value
+    tier; the arrival round that follows it in the auction rank key breaks
+    within-bucket ties deterministically. Non-numeric or missing token counts
+    degrade to throughput 0 (last bucket, arrival-ordered) rather than raising.
 
-    Arrival is read from the validator-OBSERVED ``arrival_drand_round`` when
-    present (same precedence as the auction's ``_rank_key``), falling back to the
-    miner-submitted ``drand_round``. That matters here because arrival is the
-    *denominator*: a miner shading its own round downward would inflate its
-    throughput, so the miner-controlled field must not be preferred.
+    ``arrival_round`` must be the validator-OBSERVED round: it is the throughput
+    *denominator*, so a miner shading its own submitted round downward would
+    inflate its throughput for free.
     """
-    def slot_key(sub: Any) -> tuple[int, int]:
-        observed = getattr(sub, "arrival_drand_round", None)
-        try:
-            arrival = int(
-                observed if observed is not None else sub.drand_round
-            )
-        except (AttributeError, TypeError, ValueError):
-            arrival = window_open_round
-        try:
-            tokens = min(int(getattr(sub, "completion_length", 0) or 0), token_cap)
-        except (TypeError, ValueError):
-            tokens = 0
-        elapsed = max(arrival - window_open_round, 1)
-        # Integer arithmetic on purpose: this key orders emission, so it must be
-        # bit-identical across validators. floor(tokens / (elapsed * width)) is
-        # exactly the float form for non-negative inputs, without the rounding.
-        width = max(1, int(bucket_tokens_per_round))
-        bucket = tokens // (elapsed * width)
-        return (-bucket, arrival)
-
-    return slot_key
+    try:
+        capped = min(int(tokens or 0), int(token_cap))
+    except (TypeError, ValueError):
+        capped = 0
+    elapsed = max(int(arrival_round) - int(window_open_round), 1)
+    # Integer arithmetic on purpose: this key orders emission, so it must be
+    # bit-identical across validators. floor(tokens / (elapsed * width)) is
+    # exactly the float form for non-negative inputs, without the rounding.
+    width = max(1, int(bucket_tokens_per_round))
+    return -(max(0, capped) // (elapsed * width))
 
 
 def select_batch_and_distribute(
@@ -130,13 +118,8 @@ def select_batch_and_distribute(
     cooldown_map: CooldownMap,
     current_window: int,
     pool: float = 1.0,
-    slot_round_of: Callable[[Any], int] | None = None,
 ) -> tuple[list[Any], dict[str, float]]:
     """Pick the training batch and the reward distribution.
-
-    ``slot_round_of``: optional override of the chronological slot key; the
-    difficulty auction passes its rank-tier ordinal so the v1 fair-split
-    applies to (score, arrival) tiers.
 
     Args:
         submissions: all GRAIL-validated submissions for the window, in
@@ -199,15 +182,12 @@ def select_batch_and_distribute(
     if b <= 0 or not submissions:
         return [], {}
 
-    round_of = slot_round_of if slot_round_of is not None else (
-        lambda sub: sub.drand_round
-    )
     # Group: slot round → prompt_idx → list[submission]
     by_round: dict[int, dict[int, list[Any]]] = {}
     for sub in submissions:
         if cooldown_map.is_in_cooldown(sub.prompt_idx, current_window):
             continue
-        prompts = by_round.setdefault(round_of(sub), {})
+        prompts = by_round.setdefault(sub.drand_round, {})
         prompts.setdefault(sub.prompt_idx, []).append(sub)
     if not by_round:
         return [], {}
@@ -280,7 +260,6 @@ def explain_batch_selection(
     cooldown_map: CooldownMap,
     current_window: int,
     pool: float = 1.0,
-    slot_round_of: Callable[[Any], int] | None = None,
 ) -> dict[int, dict[str, Any]]:
     """Return per-submission final-selection metadata without mutating state.
 
@@ -302,15 +281,12 @@ def explain_batch_selection(
     if b <= 0 or not submissions:
         return meta
 
-    round_of = slot_round_of if slot_round_of is not None else (
-        lambda sub: sub.drand_round
-    )
     by_round: dict[int, dict[int, list[Any]]] = {}
     for sub in submissions:
         if cooldown_map.is_in_cooldown(sub.prompt_idx, current_window):
             meta[id(sub)]["selection_reason"] = "prompt_in_cooldown_at_selection"
             continue
-        prompts = by_round.setdefault(round_of(sub), {})
+        prompts = by_round.setdefault(sub.drand_round, {})
         prompts.setdefault(sub.prompt_idx, []).append(sub)
     if not by_round:
         return meta

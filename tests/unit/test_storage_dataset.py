@@ -8,7 +8,41 @@ from unittest.mock import patch
 
 import pytest
 
-from reliquary.infrastructure.storage import upload_window_dataset
+from reliquary.infrastructure.storage import (
+    download_json,
+    upload_json,
+    upload_window_dataset,
+)
+
+
+class _AsyncBody:
+    def __init__(self, value: bytes) -> None:
+        self.value = value
+
+    async def read(self) -> bytes:
+        return self.value
+
+
+class _JsonClient:
+    def __init__(self, captured: dict[str, object]) -> None:
+        self.captured = captured
+
+    async def put_object(self, **kwargs) -> None:
+        self.captured.update(kwargs)
+
+    async def get_object(self, **_kwargs):
+        return {"Body": _AsyncBody(self.captured["Body"])}
+
+
+class _ClientContext:
+    def __init__(self, client) -> None:
+        self.client = client
+
+    async def __aenter__(self):
+        return self.client
+
+    async def __aexit__(self, *_args) -> None:
+        return None
 
 
 @pytest.mark.asyncio
@@ -86,3 +120,27 @@ async def test_upload_window_dataset_always_uses_flat_key() -> None:
         )
 
     assert captured["key"] == "reliquary/dataset/window-7987940.json.gz"
+
+
+@pytest.mark.asyncio
+async def test_upload_and_download_json_gzip_by_key_suffix() -> None:
+    captured: dict[str, object] = {}
+    client = _JsonClient(captured)
+
+    with patch(
+        "reliquary.infrastructure.storage.get_s3_client",
+        side_effect=lambda **_kwargs: _ClientContext(client),
+    ):
+        assert await upload_json(
+            "content_cooldown_snapshots/run.json.gz",
+            {"complete": True, "items": [1, 2, 3]},
+            bucket_name="testbucket",
+        )
+        restored = await download_json(
+            "content_cooldown_snapshots/run.json.gz",
+            bucket_name="testbucket",
+        )
+
+    assert captured["Bucket"] == "testbucket"
+    assert gzip.decompress(captured["Body"]).startswith(b'{"complete":true')
+    assert restored == {"complete": True, "items": [1, 2, 3]}

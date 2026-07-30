@@ -35,7 +35,7 @@ slot: every winner receives one uniform `pool_per_env / B_BATCH` slot.
 - Production environments: Math and Code.
 - Each environment has an independent admission queue, grading budget, retained
   payload budget, pending population, and proof accounting.
-- The collection deadline is `WINDOW_COLLECTION_SECONDS = 300` seconds after
+- The collection deadline is `WINDOW_COLLECTION_SECONDS = 100` seconds after
   the environment is actually activated. Preparation time cannot consume the
   miner's collection interval.
 - At the deadline, new admission stops. Work received before the deadline is
@@ -130,15 +130,17 @@ mode.
 Candidates are ordered by:
 
 ```text
-(-difficulty_value, operator_prompt_tiebreak)
+(-difficulty_value, arrival_drand_round, operator_prompt_tiebreak)
 ```
 
-`submitted_drand_round` is checked for freshness but never affects economic
-ordering. The tie-break hashes only the operator, prompt, and post-deadline
-drand salt. It excludes hotkey, Merkle root, and miner-controlled metadata, so
-an operator cannot mint extra equal-score lottery tickets. If seal-time drand
-is temporarily unavailable, window randomness is the deterministic liveness
-fallback.
+`arrival_drand_round` is stamped by the validator at signed-precommit arrival;
+the miner cannot antedate it. `submitted_drand_round` is checked for freshness
+but never affects economic ordering. Candidates still tied inside the same
+three-second arrival bucket use a post-deadline drand hash bound to checkpoint,
+window, environment, operator, and prompt. It excludes hotkey, Merkle root,
+selection digest, and miner-controlled metadata. If seal-time drand remains
+unavailable after bounded retries, exact validator-observed precommit arrival
+is the liveness fallback; known window randomness is never an economic salt.
 
 ## 6. Deferred Proof And Selection
 
@@ -189,7 +191,8 @@ frozen population and records drain exhaustion independently per environment.
 Each environment receives half of the window emission pool in the canonical
 two-environment deployment. Every selected winner receives one of eight equal
 slots from its environment. There is no active same-prompt runner-up split.
-Unfilled slots remain unpaid and contribute to burn.
+There is no boundary-tier split: `rewarded` is identical to
+`selected_for_batch`. Unfilled slots remain unpaid and contribute to burn.
 
 Selected prompts enter cooldown and selected rollout hashes enter replay dedup.
 Only proven selected groups can enter the balanced Math+Code training
@@ -263,7 +266,7 @@ The release is acceptable only when:
 - both environment queues and grader health are green;
 - the startup banner reports auction enabled for both environments;
 - operator mapping is complete;
-- one full live 300-second window seals without queue/proof-wall exhaustion;
+- one full live 100-second window seals without queue/proof-wall exhaustion;
 - both environment archives land in R2 under the same window;
 - final verdict records appear for winners, non-winners, and proof failures;
 - rewards sum to no more than the window pool; and
