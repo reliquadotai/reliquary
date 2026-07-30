@@ -19,8 +19,6 @@ from typing import Any, Callable
 from pydantic import ValidationError
 
 from reliquary.constants import (
-    AUCTION_EARLY_CLOSE_ENFORCE,
-    AUCTION_EARLY_CLOSE_POLL_SECONDS,
     BATCH_PROMPT_COOLDOWN_WINDOWS,
     B_BATCH,
     BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION,
@@ -47,9 +45,6 @@ from reliquary.constants import (
     MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
     MAX_SUBMISSIONS_PER_PROMPT,
     MAX_TRUNCATED_PER_SUBMISSION,
-    THROUGHPUT_BUCKET_TOKENS_PER_ROUND,
-    THROUGHPUT_TIEBREAK_ENABLED,
-    THROUGHPUT_TOKEN_CAP,
     PROMPT_RANGE_SIZE,
     PROMPT_RANGE_ENFORCE_FROM_WINDOW,
     REJECTED_LIST_CAP_PER_HOTKEY,
@@ -82,7 +77,6 @@ from reliquary.validator.batch_selection import (
     _within_slot_key,
     explain_batch_selection,
     select_batch_and_distribute,
-    throughput_rank,
 )
 from reliquary.validator.cooldown import ContentCooldownMap, CooldownMap
 from reliquary.validator.dedup import (
@@ -95,7 +89,6 @@ from reliquary.validator.difficulty_auction import (
     auction_difficulty_score,
     auction_value,
     difficulty_score,
-    max_difficulty_value,
     select_shadow_auction,
 )
 from reliquary.validator.observability import (
@@ -326,35 +319,6 @@ _PROOF_FAILURE_DEBT_STAGES = frozenset(
 # PROMPT_CLAIMED reject is needed.
 
 
-def _generated_token_total(rollouts) -> int:
-    """GENERATED tokens across a submission's rollouts — the 'work' numerator of
-    the throughput draw tie-break (``throughput_rank``).
-
-    Sums each rollout's ``completion_length`` rather than ``len(tokens)``: the
-    latter includes the prompt once PER ROLLOUT, and the miner picks which prompt
-    it submits, so a long prompt would inflate the throughput numerator for free.
-    Falls back to the token count minus the prompt length, then to 0, so an
-    unexpected shape degrades instead of raising.
-    """
-    total = 0
-    for rollout in rollouts or ():
-        meta = (getattr(rollout, "commit", None) or {}).get("rollout", {}) or {}
-        try:
-            generated = int(meta.get("completion_length", 0) or 0)
-        except (TypeError, ValueError):
-            generated = 0
-        if generated <= 0:
-            try:
-                generated = max(
-                    0,
-                    len(rollout.tokens) - int(meta.get("prompt_length", 0) or 0),
-                )
-            except (TypeError, ValueError, AttributeError):
-                generated = 0
-        total += generated
-    return total
-
-
 def _pending_difficulty_score(pending):
     """Auction score for a pending candidate (conservative about truncation).
 
@@ -407,20 +371,6 @@ class PendingSubmission:
         self.value = auction_value(
             self.rewards, truncated_count=self.truncated_count
         )
-
-    @property
-    def completion_length(self) -> int:
-        """Generated tokens in this candidate's submitted payload — the
-        throughput numerator at RANKING time, i.e. before the proof runs.
-
-        Miner-declared at this stage (like ``rewards``), which is safe for the
-        same reason: ranking high only buys a GPU proof, and the proof re-derives
-        every token before anyone is paid.
-        """
-        return _generated_token_total(
-            getattr(self.request, "rollouts", None)
-        )
-
 
 @dataclass
 class ValidSubmission:
@@ -478,13 +428,6 @@ class ValidSubmission:
             if self.selection_digest_bytes is not None
             else self.merkle_root_bytes
         )
-
-    @property
-    def completion_length(self) -> int:
-        """Validator-checked generated tokens across this submission's rollouts —
-        the throughput numerator once the proof has run."""
-        return _generated_token_total(self.rollouts)
-
 
 @dataclass
 class RejectedSubmission:
@@ -715,16 +658,6 @@ class GrpoWindowBatcher:
         # window (winner or failure). ``_prove_forensic_sample`` reads this to
         # sample only from what was never looked at.
         self._attempted_pending_ids: set[int] = set()
-        # Mid-window proof results (id(pending) -> ValidSubmission|None),
-        # written by the early-close prover thread under ``_lock`` and consumed
-        # by ``_prove_ranked``; a missing key means never attempted mid-window.
-        self._early_proof_results: dict[int, ValidSubmission | None] = {}
-        self.early_close_proof_attempts = 0
-        self.early_close_proof_failures = 0
-        self.early_close_proof_wall_seconds = 0.0
-        self.early_close_armed_round: int | None = None
-        self.early_close_sealed_round: int | None = None
-        self._early_close_thread: threading.Thread | None = None
         # Non-winners proven purely for telemetry — see FORENSIC_SAMPLE_PER_WINDOW.
         # Never touches ``_valid``; a passing entry here is still unpaid.
         self.forensic_sample: list[ForensicSampleResult] = []
@@ -953,25 +886,6 @@ class GrpoWindowBatcher:
             )
         except Exception:
             self.window_open_drand_round = None
-        # Early close proves DOMINANCE from arrival monotonicity: a candidate
-        # that arrives later can never outrank an equal-value one already
-        # proven, so B_BATCH proven V_MAX prompts freeze the outcome. The
-        # throughput tie-break breaks that monotonicity (a later arrival with a
-        # higher tokens/round bucket does outrank), so the two are mutually
-        # exclusive until the close carries its own bound on the best possible
-        # future throughput. Whichever is off, the other behaves as before.
-        if (
-            self.difficulty_auction_enabled
-            and AUCTION_EARLY_CLOSE_ENFORCE
-            and not THROUGHPUT_TIEBREAK_ENABLED
-            and self._early_close_thread is None
-        ):
-            self._early_close_thread = threading.Thread(
-                target=self._early_close_worker,
-                name=f"early-close-{getattr(self.env, 'name', 'env')}",
-                daemon=True,
-            )
-            self._early_close_thread.start()
 
     def is_sealed(self) -> bool:
         """True once the collection deadline has expired (or a safety-valve
@@ -3649,227 +3563,6 @@ class GrpoWindowBatcher:
         with self._lock:
             return list(self._pending)
 
-    def _early_close_next_action_locked(
-        self,
-    ) -> tuple[str, PendingSubmission | None, int | None]:
-        """Next early-close step over the paying V_MAX candidates. Under ``_lock``.
-
-        Mirrors ``_prove_ranked``'s walk restricted to the V_MAX prefix of the
-        ranking (kept separate because ``_prove_ranked`` interleaves row
-        bookkeeping and budget mutation with the walk; the agreement of the two
-        walks is pinned by tests). Returns one of:
-        ``("prove", candidate, None)`` — next unproven paying member;
-        ``("close", None, boundary_round)`` — coverage proven, outcome frozen;
-        ``boundary_round`` is the LAST arrival round that contributed a winner,
-        which the caller requires to be strictly in the past before sealing;
-        ``("wait", None, None)`` — nothing provable yet;
-        ``("exhausted", None, None)`` — window proof budget spent.
-        """
-        if (
-            self.early_close_proof_attempts
-            >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
-            or self.early_close_proof_wall_seconds >= MAX_PROOF_WALL_SECONDS
-        ):
-            return "exhausted", None, None
-        pool = [
-            p for p in self._pending
-            if p.value == max_difficulty_value(
-                len(p.rewards), delta=DIFFICULTY_AUCTION_DELTA
-            )
-        ]
-        if not pool:
-            return "wait", None, None
-        # Same ordering as ``_prove_ranked`` minus the exact-tie component it can
-        # only compute at seal (post-deadline drand is unknowable here), so the
-        # canonical within-slot hash stands in. It orders PROOFS only: the seal
-        # walk re-ranks the full population and decides who is actually paid.
-        pool.sort(
-            key=lambda p: (
-                self._throughput_rank_of(p, self._arrival_round_of(p)[0]),
-                self._arrival_round_of(p)[0],
-                self._precommit_arrival_of(p),
-                _within_slot_key(p),
-            )
-        )
-        claimed: set[int] = set()
-        claimed_contents: set[str] = set()
-        boundary_round: int | None = None
-        for p in pool:
-            if len(claimed) >= B_BATCH:
-                break
-            arrival = self._arrival_round_of(p)[0]
-            # The ranking is strict (one winner per prompt AND per content, no
-            # boundary tier expanded for payout), so claiming is immediate here
-            # too — a tier-scoped claim would count a same-prompt runner-up and
-            # close on a batch the seal walk cannot actually fill.
-            if p.prompt_idx in claimed:
-                continue          # same_prompt_superseded
-            content_digest = p.prompt_content_sha256
-            if content_digest in claimed_contents:
-                continue          # same_content_superseded
-            if self._cooldown.is_in_cooldown(p.prompt_idx, self.window_start):
-                continue
-            if self._content_cooldown.is_in_cooldown(
-                content_digest, self.window_start
-            ):
-                continue
-            if id(p) in self._early_proof_results:
-                if self._early_proof_results[id(p)] is not None:
-                    claimed.add(p.prompt_idx)
-                    claimed_contents.add(content_digest)
-                    boundary_round = (
-                        arrival if boundary_round is None
-                        else max(boundary_round, arrival)
-                    )
-                continue
-            operator = self._operator_by_hotkey.get(p.hotkey)
-            if operator is None and not self._operator_mapping_enforced:
-                operator = p.hotkey
-            if operator is None:
-                continue          # operator_unmapped
-            if (
-                self.operator_proof_failure_debt(operator)
-                >= MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW
-            ):
-                continue
-            if (
-                self.proof_failure_debt(p.hotkey)
-                >= MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
-            ):
-                continue
-            return "prove", p, None
-        if len(claimed) >= B_BATCH:
-            return "close", None, boundary_round
-        return "wait", None, None
-
-    def _current_round(self) -> int | None:
-        """Wall-clock drand round, for the same-round close guard. ``None``
-        (mock mode / drand outage) fails safe: the close never fires and the
-        collection deadline seals as today."""
-        if self._current_round_fn is not None:
-            try:
-                return self._current_round_fn()
-            except Exception:
-                return None
-        if not self.drand_round_check_enabled:
-            return None
-        try:
-            if self._drand_chain_info is None:
-                from reliquary.infrastructure.drand import get_current_chain
-                self._drand_chain_info = get_current_chain()
-            from reliquary.infrastructure.chain import (
-                compute_current_drand_round,
-            )
-            ci = self._drand_chain_info
-            return int(compute_current_drand_round(
-                self._wall_clock(), ci["genesis_time"], ci["period"],
-            ))
-        except Exception:
-            return None
-
-    def _try_early_close(self) -> bool:
-        """Seal now iff the auction outcome is proven frozen.
-
-        ``force_seal`` runs under ``_upload_precommit_lock`` so a racing
-        precommit either lands before the emptiness check (blocking the
-        close) or observes the seal flag inside ``try_register_upload_precommit``
-        and is rejected — no reservation can straddle the close. Queue
-        stragglers with earlier arrival stamps are covered downstream: the
-        seal drain admits them and ``_prove_ranked`` re-walks the full
-        population.
-        """
-        with self._lock:
-            action, _target, boundary_round = (
-                self._early_close_next_action_locked()
-            )
-        if action != "close":
-            return self._seal_flag.is_set()
-        current = self._current_round()
-        if (
-            current is None
-            or boundary_round is None
-            or current <= boundary_round
-        ):
-            return self._seal_flag.is_set()
-        if self.early_close_armed_round is None:
-            self.early_close_armed_round = current
-        now = self._time_fn()
-        with self._upload_precommit_lock:
-            if self._seal_flag.is_set():
-                return True
-            self._prune_upload_precommits_locked(now)
-            if self._upload_precommits:
-                return False
-            self.early_close_sealed_round = current
-            self.force_seal("proven_dominance_close")
-        return True
-
-    def _early_close_prove(self, pending: PendingSubmission) -> None:
-        """One serial mid-window proof; budgets and operator debt mirror the
-        ``_prove_ranked`` bookkeeping (hotkey debt is charged inside
-        ``_verify_expensive`` via ``_reject``, exactly as at seal)."""
-        started = self._time_fn()
-        try:
-            sub = self._verify_expensive(pending)
-        finally:
-            elapsed = max(0.0, self._time_fn() - started)
-            with self._lock:
-                self.early_close_proof_attempts += 1
-                self.early_close_proof_wall_seconds += elapsed
-        operator = self._operator_by_hotkey.get(pending.hotkey)
-        if operator is None and not self._operator_mapping_enforced:
-            operator = pending.hotkey
-        with self._lock:
-            self._early_proof_results[id(pending)] = sub
-            if sub is None:
-                self.early_close_proof_failures += 1
-        if sub is None and operator is not None:
-            with self._proof_admission_lock:
-                self._expensive_proof_failures_by_operator[operator] = (
-                    self._expensive_proof_failures_by_operator.get(operator, 0)
-                    + 1
-                )
-
-    def _early_close_step(self) -> str:
-        """One prover decision. Returns ``proved``, ``closed``, ``wait``
-        (nothing provable now, incl. a close blocked by the same-round or
-        precommit guard), ``exhausted`` or ``sealed``."""
-        if self._seal_flag.is_set():
-            return "sealed"
-        with self._lock:
-            action, target, _boundary = self._early_close_next_action_locked()
-        if action == "prove":
-            self._early_close_prove(target)
-            return "proved"
-        if action == "close" and self._try_early_close():
-            return "closed"
-        if action == "exhausted":
-            return "exhausted"
-        return "wait"
-
-    def _early_close_drain(self) -> str:
-        """Step until no immediate progress; the thread sleeps between drains."""
-        while True:
-            outcome = self._early_close_step()
-            if outcome != "proved":
-                return outcome
-
-    def _early_close_worker(self) -> None:
-        """Prove-and-close loop; any exception disables early close for the
-        window (the collection deadline is always the fallback seal)."""
-        try:
-            while True:
-                outcome = self._early_close_drain()
-                if outcome in ("closed", "sealed", "exhausted"):
-                    return
-                time.sleep(AUCTION_EARLY_CLOSE_POLL_SECONDS)
-                if self._seal_flag.is_set():
-                    return
-        except Exception:
-            logger.exception(
-                "early-close prover disabled for window %s", self.window_start,
-            )
-
     def _arrival_round_of(self, pending: PendingSubmission) -> tuple[int, str]:
         """Validator-observed arrival round; miner-submitted round is the
         mock-mode fallback (production stamps every admitted request)."""
@@ -3892,25 +3585,6 @@ class GrpoWindowBatcher:
             if candidate is not None:
                 return float(candidate)
         return 0.0
-
-    def _throughput_rank_of(
-        self, pending: PendingSubmission, arrival_round: int
-    ) -> int:
-        """Throughput component of the auction rank (``-bucket``, lower first).
-
-        ``0`` — i.e. no effect on the ordering — when the tie-break is disabled
-        or the window-open round is unknown, because ``elapsed`` would then be
-        meaningless: the ranking cleanly degrades to pure arrival order.
-        """
-        if not THROUGHPUT_TIEBREAK_ENABLED or self.window_open_drand_round is None:
-            return 0
-        return throughput_rank(
-            _generated_token_total(getattr(pending.request, "rollouts", None)),
-            arrival_round=arrival_round,
-            window_open_round=int(self.window_open_drand_round),
-            token_cap=THROUGHPUT_TOKEN_CAP,
-            bucket_tokens_per_round=THROUGHPUT_BUCKET_TOKENS_PER_ROUND,
-        )
 
     def _prove_ranked(self, pool: float = 1.0) -> list[ValidSubmission]:
         """Prove strict auction winners until ``B_BATCH`` distinct prompts pass.
@@ -3945,7 +3619,6 @@ class GrpoWindowBatcher:
         operator_by_id: dict[int, str | None] = {}
         arrival_by_id: dict[int, int] = {}
         arrival_source_by_id: dict[int, str] = {}
-        throughput_rank_by_id: dict[int, int] = {}
         exact_arrival_by_id: dict[int, float] = {}
         tiebreak_by_id: dict[int, bytes] = {}
         rank_entropy_source = (
@@ -3962,9 +3635,6 @@ class GrpoWindowBatcher:
             arrival, source = self._arrival_round_of(pending_submission)
             arrival_by_id[id(pending_submission)] = arrival
             arrival_source_by_id[id(pending_submission)] = source
-            throughput_rank_by_id[id(pending_submission)] = (
-                self._throughput_rank_of(pending_submission, arrival)
-            )
             exact_arrival_by_id[id(pending_submission)] = (
                 self._precommit_arrival_of(pending_submission)
             )
@@ -3978,14 +3648,11 @@ class GrpoWindowBatcher:
                     prompt_idx=pending_submission.prompt_idx,
                 )
             )
-        # Difficulty first, then the throughput draw tie-break (0 for every
-        # candidate while THROUGHPUT_TIEBREAK_ENABLED is off, so the ranking
-        # collapses to the arrival order bit-for-bit), then arrival.
+        # Miner-controlled payload size never affects economic rank.
         ranked = sorted(
             scored,
             key=lambda item: (
                 -item[1].value,
-                throughput_rank_by_id[id(item[0])],
                 arrival_by_id[id(item[0])],
                 (
                     0.0
@@ -3999,11 +3666,10 @@ class GrpoWindowBatcher:
         # ranking strict, so no tier can expand the selected or rewarded set.
         tier_by_id: dict[int, int] = {}
         tier_sizes: list[int] = []
-        last_tier_key: tuple[float, int, int] | None = None
+        last_tier_key: tuple[float, int] | None = None
         for pending_submission, score in ranked:
             tier_key = (
                 score.value,
-                throughput_rank_by_id[id(pending_submission)],
                 arrival_by_id[id(pending_submission)],
             )
             if tier_key != last_tier_key:
@@ -4012,9 +3678,7 @@ class GrpoWindowBatcher:
             tier_by_id[id(pending_submission)] = len(tier_sizes) - 1
             tier_sizes[-1] += 1
 
-        # Mid-window early-close proofs already spent part of this window's
-        # budget; the counters continue rather than reset.
-        attempts = self.early_close_proof_attempts
+        attempts = 0
         proven: list[ValidSubmission] = []
         claimed: set[int] = set()
         claimed_contents: set[str] = set()
@@ -4091,29 +3755,6 @@ class GrpoWindowBatcher:
             ):
                 row["status"] = "content_in_cooldown"
                 continue
-            if id(p) in self._early_proof_results:
-                # Proven (or failed) mid-window by the early-close prover.
-                # Debt/budget gates were evaluated when the proof actually
-                # ran, so a cached result bypasses them — sequential
-                # semantics, never a second GPU pass, never double debt.
-                # The cooldown gates above still apply: they can flip between
-                # the mid-window proof and the seal.
-                cached = self._early_proof_results[id(p)]
-                row["proof_attempted"] = True
-                row["proof_phase"] = "midwindow"
-                attempted_ids.add(id(p))
-                if cached is None:
-                    row["proof_passed"] = False
-                    row["status"] = "proof_failed"
-                    continue
-                row["proof_passed"] = True
-                row["selected"] = True
-                row["status"] = "selected"
-                proven.append(cached)
-                claimed.add(p.prompt_idx)
-                claimed_contents.add(content_digest)
-                self.difficulty_auction_metadata_by_id[id(cached)] = row
-                continue
             operator = row["operator_id"]
             if operator is None:
                 row["status"] = "operator_unmapped"
@@ -4138,10 +3779,7 @@ class GrpoWindowBatcher:
                 )
                 stop_reason = "attempt_budget"
                 break
-            elapsed = (
-                self._time_fn() - self._proof_wall_started_at
-                + self.early_close_proof_wall_seconds
-            )
+            elapsed = self._time_fn() - self._proof_wall_started_at
             if elapsed >= MAX_PROOF_WALL_SECONDS:
                 self.proof_wall_exhausted = True
                 stop_reason = "wall_budget"
@@ -4637,12 +4275,6 @@ class GrpoWindowBatcher:
         self, pool: float = 1.0
     ) -> tuple[list[ValidSubmission], dict[str, float]]:
         """Finalize selection and release every retained payload reservation."""
-        # The early-close prover exits once the seal flag is set; the join
-        # only waits out an in-flight GPU proof, which then lands in the
-        # cache and is reused below instead of re-proven.
-        thread = self._early_close_thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=60.0)
         try:
             return self._seal_batch_inner(pool)
         finally:
@@ -4686,21 +4318,6 @@ class GrpoWindowBatcher:
                     "proof_wall_seconds": self.proof_wall_elapsed_seconds,
                     "proof_wall_limit_seconds": MAX_PROOF_WALL_SECONDS,
                     "proof_wall_exhausted": self.proof_wall_exhausted,
-                    "early_close": (
-                        getattr(self, "force_seal_reason", None)
-                        == "proven_dominance_close"
-                    ),
-                    "early_close_armed_round": self.early_close_armed_round,
-                    "early_close_sealed_round": self.early_close_sealed_round,
-                    "midwindow_proof_attempts": (
-                        self.early_close_proof_attempts
-                    ),
-                    "midwindow_proof_failures": (
-                        self.early_close_proof_failures
-                    ),
-                    "midwindow_proof_wall_seconds": (
-                        self.early_close_proof_wall_seconds
-                    ),
                     "proven_winners": len(self._valid),
                     "operator_proof_failure_cap": (
                         MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW

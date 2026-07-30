@@ -169,29 +169,6 @@ if not _math.isfinite(SHAPE_LEN_FRAC) or not 0.0 < SHAPE_LEN_FRAC <= 1.0:
         "RELIQUARY_SHAPE_LEN_FRAC must be finite and within (0, 1]"
     )
 
-# Draw tie-break: throughput (tokens/round) instead of raw arrival speed.
-# The chronological (drand-round) slot key rewards whoever submits earliest,
-# which penalizes long generation — a miner reasoning 16k tokens arrives after
-# one that answers in 500, and loses the draw. With a model that must reason
-# long (the 4B), that is exactly the wrong incentive. Ranking draws by
-# throughput = min(tokens, cap) / elapsed_rounds is length-NEUTRAL (same
-# hardware ⇒ same tok/round regardless of length), rewards serving efficiency,
-# and has no padding incentive (a rate; the cap kills beyond-cap padding). This
-# is a VALIDATOR-ONLY objective control — miners already attach drand_round and
-# completion_length, so it needs no miner change and can be toggled per validator.
-# Declared in code, not by environment — same reason as
-# CONSERVATIVE_TRUNCATION_VALUE: this decides how draws are RANKED, i.e. who
-# gets paid. Miners must be able to read the rule they are competing under.
-THROUGHPUT_TIEBREAK_ENABLED = False
-# Token cap for the throughput numerator. A submission is a GROUP of M_ROLLOUTS
-# rollouts and the numerator sums their generated tokens, so the cap is group-
-# scale: M_ROLLOUTS × 16000 useful tokens/rollout. Padding a rollout past ~16k
-# earns no extra rank (throughput is already a rate; this is the safety belt).
-THROUGHPUT_TOKEN_CAP = 8 * 16000  # M_ROLLOUTS × BFT budget
-# Bucket width in tokens/round: throughput is quantized to this before ranking so
-# hairline differences don't decide slots; arrival breaks within-bucket ties.
-THROUGHPUT_BUCKET_TOKENS_PER_ROUND = 50
-
 # Cap/non-EOS truncation budget per submission. A single missing-EOS rollout
 # can be an honest local max-token accident; repeated missing-EOS rollouts in
 # one GRPO group are a sampling policy, not a rare exception, and have become
@@ -644,15 +621,6 @@ DIFFICULTY_AUCTION_ENVIRONMENTS = (
     "openmathinstruct",
     "opencodeinstruct",
 )
-
-# Proven-dominance early close: seal an auction window before the collection
-# deadline once B_BATCH distinct prompts are covered by GPU-PROVEN candidates
-# at the theoretical difficulty ceiling (no future arrival can change the
-# outcome). OFF restores the deadline-only seal bit-for-bit.
-AUCTION_EARLY_CLOSE_ENFORCE = _os.environ.get(
-    "RELIQUARY_AUCTION_EARLY_CLOSE_ENFORCE", "1"
-).strip().lower() not in ("0", "false", "no", "off", "")
-AUCTION_EARLY_CLOSE_POLL_SECONDS = 1.0
 
 ENFORCE_ENVELOPE_SIGNATURE = _os.environ.get(
     "RELIQUARY_ENFORCE_ENVELOPE_SIGNATURE", "1"

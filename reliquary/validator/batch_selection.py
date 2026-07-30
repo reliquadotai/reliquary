@@ -65,52 +65,6 @@ def _prompt_canonical_key(prompt_idx: int) -> bytes:
     return hashlib.sha256(prompt_idx.to_bytes(8, "big", signed=False)).digest()
 
 
-def throughput_rank(
-    tokens: int,
-    *,
-    arrival_round: int,
-    window_open_round: int,
-    token_cap: int,
-    bucket_tokens_per_round: int,
-) -> int:
-    """Draw-ordering component for THROUGHPUT instead of raw arrival speed.
-
-    The auction ranks equal-value candidates by arrival drand round — pure speed
-    — which penalizes long generation: a 16k-token rollout arrives at a later
-    round than a 500-token one and loses the draw even at equal hardware. This
-    ranks instead by tokens-per-round::
-
-        throughput = min(tokens, token_cap) / max(arrival - open, 1)
-
-    quantized into ``bucket_tokens_per_round`` buckets. Properties:
-
-    * **Length-neutral** — same hardware ⇒ same throughput regardless of how many
-      tokens were generated, so long reasoning is no longer penalized.
-    * **Rewards serving efficiency** — faster tok/round wins.
-    * **No padding incentive** — throughput is a *rate* (padding adds tokens and
-      time in step), and ``min(.., token_cap)`` gives zero rank past the cap.
-
-    Returns ``-bucket`` so that higher throughput sorts FIRST inside a value
-    tier; the arrival round that follows it in the auction rank key breaks
-    within-bucket ties deterministically. Non-numeric or missing token counts
-    degrade to throughput 0 (last bucket, arrival-ordered) rather than raising.
-
-    ``arrival_round`` must be the validator-OBSERVED round: it is the throughput
-    *denominator*, so a miner shading its own submitted round downward would
-    inflate its throughput for free.
-    """
-    try:
-        capped = min(int(tokens or 0), int(token_cap))
-    except (TypeError, ValueError):
-        capped = 0
-    elapsed = max(int(arrival_round) - int(window_open_round), 1)
-    # Integer arithmetic on purpose: this key orders emission, so it must be
-    # bit-identical across validators. floor(tokens / (elapsed * width)) is
-    # exactly the float form for non-negative inputs, without the rounding.
-    width = max(1, int(bucket_tokens_per_round))
-    return -(max(0, capped) // (elapsed * width))
-
-
 def select_batch_and_distribute(
     submissions: list[Any],
     *,

@@ -1,10 +1,4 @@
-"""``window_open_drand_round`` must actually be populated at window open.
-
-The throughput draw tie-break measures each submission's elapsed time from this
-anchor. If it stays None the tie-break silently disables itself and falls back to
-arrival ordering — a no-op that no unit test of the key itself would catch, since
-the key is only ever built when the anchor exists.
-"""
+"""``window_open_drand_round`` observability must match the window wall clock."""
 
 from types import SimpleNamespace
 
@@ -68,8 +62,7 @@ def test_window_open_round_tracks_wall_clock():
 
 
 def test_window_open_round_degrades_to_none_on_drand_failure(monkeypatch):
-    """Any drand hiccup must leave the anchor None so the tie-break disables
-    itself rather than measuring elapsed against a bogus reference."""
+    """Any drand hiccup leaves the optional observability anchor unset."""
     b = _batcher(GENESIS + 3000 * PERIOD, chain=None)
 
     def _boom():
@@ -80,41 +73,3 @@ def test_window_open_round_degrades_to_none_on_drand_failure(monkeypatch):
     )
     b.mark_window_opened()
     assert b.window_open_drand_round is None
-
-
-def test_anchor_makes_elapsed_meaningful_for_the_tiebreak():
-    """End-to-end intent: with the anchor set, a submission arriving N rounds
-    after open measures elapsed = N, which is what the throughput rank divides
-    by."""
-    from reliquary.validator.batch_selection import throughput_rank
-
-    opened_at = GENESIS + 3000 * PERIOD
-    b = _batcher(opened_at)
-    b.mark_window_opened()
-
-    arrival = b.window_open_drand_round + 32
-    rank = throughput_rank(
-        16000,
-        arrival_round=arrival,
-        window_open_round=int(b.window_open_drand_round),
-        token_cap=16000,
-        bucket_tokens_per_round=50,
-    )
-    # 32 rounds elapsed -> 500 tok/round
-    assert -rank == 16000 // (32 * 50)
-
-
-def test_seal_builds_the_throughput_key_only_when_anchored(monkeypatch):
-    """Guard the wiring: flag on but no anchor => no throughput key (safe no-op);
-    flag on with an anchor => the key is used."""
-    from reliquary.validator import batcher as batcher_mod
-
-    monkeypatch.setattr(batcher_mod, "THROUGHPUT_TIEBREAK_ENABLED", True)
-    b = _batcher(GENESIS + 3000 * PERIOD)
-
-    assert b.window_open_drand_round is None          # not opened yet
-    b.mark_window_opened()
-    assert b.window_open_drand_round is not None      # anchored -> key buildable
-    assert b.window_open_drand_round == compute_current_drand_round(
-        GENESIS + 3000 * PERIOD, GENESIS, PERIOD
-    )
