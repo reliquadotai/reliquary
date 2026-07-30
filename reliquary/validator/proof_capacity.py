@@ -91,6 +91,7 @@ class ProofCapacityQualification:
     software_revision: str
     checkpoint_revision: str
     samples_sha256: str
+    runtime_fingerprint_hash: str
     hardware_class: str
     benchmark_device_count: int
     benchmark_device_uuids: tuple[str, ...]
@@ -98,7 +99,16 @@ class ProofCapacityQualification:
     headroom_fraction: float
     proofs_per_environment: Mapping[str, int]
     p95_seconds_per_proof: Mapping[str, float]
+    p95_seconds_per_proof_by_environment_and_device: Mapping[
+        str,
+        Mapping[str, float],
+    ]
     sample_count_by_environment: Mapping[str, int]
+    sample_count_by_environment_and_device: Mapping[
+        str,
+        Mapping[str, int],
+    ]
+    minimum_samples_per_device_per_environment: int
     minimum_completion_tokens_by_environment: Mapping[str, int]
     measured_at: str
     qualified: bool
@@ -109,6 +119,9 @@ class ProofCapacityQualification:
         value: Mapping[str, Any],
     ) -> "ProofCapacityQualification":
         try:
+            qualified = value["qualified"]
+            if not isinstance(qualified, bool):
+                raise TypeError("qualified must be a boolean")
             return cls(
                 schema_version=int(value["schema_version"]),
                 profile_id=str(value["profile_id"]),
@@ -116,6 +129,9 @@ class ProofCapacityQualification:
                 software_revision=str(value["software_revision"]),
                 checkpoint_revision=str(value["checkpoint_revision"]),
                 samples_sha256=str(value["samples_sha256"]),
+                runtime_fingerprint_hash=str(
+                    value["runtime_fingerprint_hash"]
+                ),
                 hardware_class=str(value["hardware_class"]),
                 benchmark_device_count=int(
                     value["benchmark_device_count"]
@@ -138,12 +154,37 @@ class ProofCapacityQualification:
                         value["p95_seconds_per_proof"]
                     ).items()
                 },
+                p95_seconds_per_proof_by_environment_and_device={
+                    str(environment): {
+                        str(device_uuid).strip().casefold(): float(seconds)
+                        for device_uuid, seconds in dict(device_values).items()
+                    }
+                    for environment, device_values in dict(
+                        value[
+                            "p95_seconds_per_proof_by_environment_and_device"
+                        ]
+                    ).items()
+                },
                 sample_count_by_environment={
                     str(name): int(count)
                     for name, count in dict(
                         value["sample_count_by_environment"]
                     ).items()
                 },
+                sample_count_by_environment_and_device={
+                    str(environment): {
+                        str(device_uuid).strip().casefold(): int(count)
+                        for device_uuid, count in dict(device_values).items()
+                    }
+                    for environment, device_values in dict(
+                        value[
+                            "sample_count_by_environment_and_device"
+                        ]
+                    ).items()
+                },
+                minimum_samples_per_device_per_environment=int(
+                    value["minimum_samples_per_device_per_environment"]
+                ),
                 minimum_completion_tokens_by_environment={
                     str(name): int(count)
                     for name, count in dict(
@@ -151,7 +192,7 @@ class ProofCapacityQualification:
                     ).items()
                 },
                 measured_at=str(value["measured_at"]),
-                qualified=bool(value["qualified"]),
+                qualified=qualified,
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ProofCapacityQualificationError(
@@ -164,6 +205,8 @@ class ProofCapacityQualification:
         profile_id: str,
         model_revision: str,
         software_revision: str | None,
+        checkpoint_revision: str,
+        runtime_fingerprint_hash: str,
         configured_devices: Sequence[str],
         configured_hardware: Sequence[str],
         configured_device_uuids: Sequence[str],
@@ -171,7 +214,7 @@ class ProofCapacityQualification:
         minimum_proofs_per_environment: int,
         minimum_completion_tokens_per_environment: Mapping[str, int],
     ) -> dict[str, Any]:
-        if self.schema_version != 2:
+        if self.schema_version != 3:
             raise ProofCapacityQualificationError(
                 "unsupported proof-capacity manifest schema"
             )
@@ -196,13 +239,25 @@ class ProofCapacityQualification:
             raise ProofCapacityQualificationError(
                 "proof-capacity software revision mismatch"
             )
-        if _COMMIT_SHA_RE.fullmatch(self.checkpoint_revision) is None:
+        if (
+            _COMMIT_SHA_RE.fullmatch(checkpoint_revision) is None
+            or _COMMIT_SHA_RE.fullmatch(self.checkpoint_revision) is None
+            or self.checkpoint_revision != checkpoint_revision
+        ):
             raise ProofCapacityQualificationError(
-                "proof-capacity checkpoint revision must be a full commit SHA"
+                "proof-capacity checkpoint revision mismatch"
             )
         if _SHA256_RE.fullmatch(self.samples_sha256) is None:
             raise ProofCapacityQualificationError(
                 "proof-capacity sample digest must be lowercase SHA-256"
+            )
+        if (
+            _SHA256_RE.fullmatch(runtime_fingerprint_hash) is None
+            or _SHA256_RE.fullmatch(self.runtime_fingerprint_hash) is None
+            or self.runtime_fingerprint_hash != runtime_fingerprint_hash
+        ):
+            raise ProofCapacityQualificationError(
+                "proof-capacity runtime fingerprint mismatch"
             )
         if self.benchmark_device_count <= 0:
             raise ProofCapacityQualificationError(
@@ -280,6 +335,10 @@ class ProofCapacityQualification:
             )
 
         required_device_seconds = 0.0
+        if self.minimum_samples_per_device_per_environment < 20:
+            raise ProofCapacityQualificationError(
+                "proof-capacity benchmark needs 20 samples per GPU and environment"
+            )
         for environment in _ENVIRONMENTS:
             proof_count = self.proofs_per_environment.get(environment)
             p95_seconds = self.p95_seconds_per_proof.get(environment)
@@ -291,9 +350,53 @@ class ProofCapacityQualification:
                     f"{environment} benchmark does not reserve enough proofs"
                 )
             sample_count = self.sample_count_by_environment.get(environment)
-            if sample_count is None or sample_count < 20:
+            minimum_sample_count = (
+                self.minimum_samples_per_device_per_environment
+                * self.benchmark_device_count
+            )
+            if sample_count is None or sample_count < minimum_sample_count:
                 raise ProofCapacityQualificationError(
                     f"{environment} benchmark has too few proof samples"
+                )
+            per_device_sample_count = (
+                self.sample_count_by_environment_and_device.get(
+                    environment,
+                    {},
+                )
+            )
+            if set(per_device_sample_count) != set(benchmark_uuids):
+                raise ProofCapacityQualificationError(
+                    f"{environment} sample counts do not cover every GPU"
+                )
+            if any(
+                count < self.minimum_samples_per_device_per_environment
+                for count in per_device_sample_count.values()
+            ):
+                raise ProofCapacityQualificationError(
+                    f"{environment} benchmark has too few per-GPU samples"
+                )
+            if sample_count != sum(per_device_sample_count.values()):
+                raise ProofCapacityQualificationError(
+                    f"{environment} sample counts do not conserve"
+                )
+            per_device_p95 = (
+                self.p95_seconds_per_proof_by_environment_and_device.get(
+                    environment,
+                    {},
+                )
+            )
+            if set(per_device_p95) != set(benchmark_uuids):
+                raise ProofCapacityQualificationError(
+                    f"{environment} benchmark does not cover every GPU"
+                )
+            if any(
+                not math.isfinite(seconds)
+                or seconds <= 0
+                or seconds >= proof_wall_seconds
+                for seconds in per_device_p95.values()
+            ):
+                raise ProofCapacityQualificationError(
+                    f"{environment} per-GPU p95 proof latency is invalid"
                 )
             required_completion_tokens = (
                 minimum_completion_tokens_per_environment.get(environment)
@@ -319,6 +422,15 @@ class ProofCapacityQualification:
                 raise ProofCapacityQualificationError(
                     f"{environment} p95 proof latency is invalid"
                 )
+            if not math.isclose(
+                p95_seconds,
+                max(per_device_p95.values()),
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ):
+                raise ProofCapacityQualificationError(
+                    f"{environment} aggregate p95 is not the worst GPU p95"
+                )
             required_device_seconds += proof_count * p95_seconds
 
         usable_seconds_per_device = proof_wall_seconds * (
@@ -340,6 +452,7 @@ class ProofCapacityQualification:
             "software_revision": self.software_revision,
             "checkpoint_revision": self.checkpoint_revision,
             "samples_sha256": self.samples_sha256,
+            "runtime_fingerprint_hash": self.runtime_fingerprint_hash,
             "hardware_class": self.hardware_class,
             "configured_device_count": len(configured_devices),
             "configured_device_uuids": sorted(runtime_uuids),
@@ -350,8 +463,23 @@ class ProofCapacityQualification:
             ),
             "headroom_fraction": self.headroom_fraction,
             "proofs_per_environment": dict(self.proofs_per_environment),
+            "p95_seconds_per_proof_by_environment_and_device": {
+                environment: dict(values)
+                for environment, values in (
+                    self.p95_seconds_per_proof_by_environment_and_device.items()
+                )
+            },
             "sample_count_by_environment": dict(
                 self.sample_count_by_environment
+            ),
+            "sample_count_by_environment_and_device": {
+                environment: dict(values)
+                for environment, values in (
+                    self.sample_count_by_environment_and_device.items()
+                )
+            },
+            "minimum_samples_per_device_per_environment": (
+                self.minimum_samples_per_device_per_environment
             ),
             "minimum_completion_tokens_by_environment": dict(
                 self.minimum_completion_tokens_by_environment

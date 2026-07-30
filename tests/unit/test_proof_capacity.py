@@ -63,6 +63,7 @@ def test_capacity_qualifier_binds_full_representative_evidence(
                 ),
                 "software_revision": software_revision,
                 "checkpoint_revision": checkpoint_revision,
+                "runtime_fingerprint_hash": "e" * 64,
                 "hardware_class": "NVIDIA H100 80GB HBM3",
                 "device_uuid": "GPU-EXACT",
                 "rollout_count": 8,
@@ -88,6 +89,8 @@ def test_capacity_qualifier_binds_full_representative_evidence(
             software_revision,
             "--checkpoint-revision",
             checkpoint_revision,
+            "--runtime-fingerprint-hash",
+            "e" * 64,
             "--hardware-class",
             "NVIDIA H100 80GB HBM3",
             "--benchmark-device-count",
@@ -104,7 +107,7 @@ def test_capacity_qualifier_binds_full_representative_evidence(
 
     assert completed.returncode == 0, completed.stderr
     manifest = json.loads(output_path.read_text())
-    assert manifest["schema_version"] == 2
+    assert manifest["schema_version"] == 3
     assert manifest["benchmark_device_uuids"] == ["gpu-exact"]
     assert manifest["samples_sha256"] == hashlib.sha256(payload).hexdigest()
     assert manifest["proofs_per_environment"] == {
@@ -116,12 +119,13 @@ def test_capacity_qualifier_binds_full_representative_evidence(
 def _manifest(**overrides):
     device_count = int(overrides.pop("benchmark_device_count", 9))
     value = {
-        "schema_version": 2,
+        "schema_version": 3,
         "profile_id": "qwen35-4b-auction-v3",
         "model_revision": "a" * 40,
         "software_revision": "b" * 40,
         "checkpoint_revision": "c" * 40,
         "samples_sha256": "d" * 64,
+        "runtime_fingerprint_hash": "e" * 64,
         "hardware_class": "NVIDIA H100 80GB HBM3",
         "benchmark_device_count": device_count,
         "benchmark_device_uuids": [
@@ -137,10 +141,27 @@ def _manifest(**overrides):
             "openmathinstruct": 60.0,
             "opencodeinstruct": 30.0,
         },
-        "sample_count_by_environment": {
-            "openmathinstruct": 20,
-            "opencodeinstruct": 20,
+        "p95_seconds_per_proof_by_environment_and_device": {
+            "openmathinstruct": {
+                f"gpu-{index}": 60.0 for index in range(device_count)
+            },
+            "opencodeinstruct": {
+                f"gpu-{index}": 30.0 for index in range(device_count)
+            },
         },
+        "sample_count_by_environment": {
+            "openmathinstruct": 20 * device_count,
+            "opencodeinstruct": 20 * device_count,
+        },
+        "sample_count_by_environment_and_device": {
+            "openmathinstruct": {
+                f"gpu-{index}": 20 for index in range(device_count)
+            },
+            "opencodeinstruct": {
+                f"gpu-{index}": 20 for index in range(device_count)
+            },
+        },
+        "minimum_samples_per_device_per_environment": 20,
         "minimum_completion_tokens_by_environment": {
             "openmathinstruct": 14_746,
             "opencodeinstruct": 29_492,
@@ -163,6 +184,8 @@ def _validate(
         profile_id="qwen35-4b-auction-v3",
         model_revision="a" * 40,
         software_revision=software_revision,
+        checkpoint_revision="c" * 40,
+        runtime_fingerprint_hash="e" * 64,
         configured_devices=tuple(f"cuda:{i}" for i in range(devices)),
         configured_hardware=tuple(
             "NVIDIA H100 80GB HBM3" for _ in range(devices)
@@ -235,6 +258,40 @@ def test_capacity_rejects_a_smaller_fleet():
             },
             "too few proof samples",
         ),
+        (
+            {"minimum_samples_per_device_per_environment": 19},
+            "20 samples per GPU",
+        ),
+        (
+            {
+                "sample_count_by_environment_and_device": {
+                    "openmathinstruct": {
+                        **{
+                            f"gpu-{index}": 20
+                            for index in range(1, 9)
+                        },
+                        "gpu-0": 19,
+                    },
+                    "opencodeinstruct": {
+                        f"gpu-{index}": 20 for index in range(9)
+                    },
+                }
+            },
+            "too few per-GPU samples",
+        ),
+        (
+            {"runtime_fingerprint_hash": "f" * 64},
+            "runtime fingerprint mismatch",
+        ),
+        (
+            {
+                "p95_seconds_per_proof": {
+                    "openmathinstruct": 59.0,
+                    "opencodeinstruct": 30.0,
+                }
+            },
+            "worst GPU p95",
+        ),
     ],
 )
 def test_capacity_contract_mismatches_fail_closed(override, message):
@@ -251,12 +308,24 @@ def test_capacity_rejects_partial_or_missing_runtime_revision():
             _validate(_manifest(), software_revision=revision)
 
 
+def test_capacity_rejects_non_boolean_qualification():
+    with pytest.raises(
+        ProofCapacityQualificationError,
+        match="invalid proof-capacity manifest",
+    ):
+        ProofCapacityQualification.from_mapping(
+            _manifest(qualified="false")
+        )
+
+
 def test_capacity_rejects_runtime_topology_or_gpu_uuid_mismatch():
     qualification = ProofCapacityQualification.from_mapping(_manifest())
     kwargs = {
         "profile_id": "qwen35-4b-auction-v3",
         "model_revision": "a" * 40,
         "software_revision": "b" * 40,
+        "checkpoint_revision": "c" * 40,
+        "runtime_fingerprint_hash": "e" * 64,
         "configured_devices": tuple(f"cuda:{i}" for i in range(9)),
         "configured_hardware": tuple(
             "NVIDIA H100 80GB HBM3" for _ in range(9)

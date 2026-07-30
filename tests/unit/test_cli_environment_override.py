@@ -137,6 +137,36 @@ def test_v3_requires_and_resolves_explicit_physical_proof_devices(monkeypatch):
         cli._configured_proof_device_identities(_FakeTorch())
 
 
+def test_v3_activation_requires_pinned_model_and_stamped_resume(monkeypatch):
+    cli = _reload_cli_main()
+    monkeypatch.setattr(cli, "PROTOCOL_VERSION", 3)
+    monkeypatch.setattr(cli, "PROTOCOL_MODEL_ID", "Qwen/Qwen3.5-4B")
+    monkeypatch.setattr(
+        cli,
+        "PROTOCOL_MODEL_REVISION",
+        "a" * 40,
+    )
+
+    assert (
+        cli._v3_activation_checkpoint_revision(
+            "Qwen/Qwen3.5-4B",
+            "sha:" + "b" * 40,
+        )
+        == "b" * 40
+    )
+
+    with pytest.raises(RuntimeError, match="must bootstrap"):
+        cli._v3_activation_checkpoint_revision(
+            "Qwen/Qwen3.5-2B",
+            "sha:" + "b" * 40,
+        )
+    with pytest.raises(RuntimeError, match="stamped-40-char-checkpoint"):
+        cli._v3_activation_checkpoint_revision(
+            "Qwen/Qwen3.5-4B",
+            "",
+        )
+
+
 @pytest.fixture(autouse=True)
 def _cleanup_module_cache():
     """Make sure each test re-imports cleanly — leaving a side-effecting

@@ -1,4 +1,7 @@
-from reliquary.validator.observability import runtime_revision
+from reliquary.validator.observability import (
+    immutable_build_revision,
+    runtime_revision,
+)
 
 
 def test_runtime_revision_prefers_image_baked_revision(monkeypatch):
@@ -31,3 +34,21 @@ def test_runtime_revision_truncates_build_revision(monkeypatch):
         assert runtime_revision() == "d" * 40
     finally:
         runtime_revision.cache_clear()
+
+
+def test_immutable_build_revision_uses_baked_file_not_runtime_env(
+    monkeypatch,
+    tmp_path,
+):
+    import reliquary.validator.observability as observability
+
+    revision_file = tmp_path / ".build-revision"
+    revision_file.write_text("e" * 40)
+    monkeypatch.setattr(
+        observability,
+        "_IMMUTABLE_BUILD_REVISION_PATH",
+        revision_file,
+    )
+    monkeypatch.setenv("RELIQUARY_BUILD_REVISION", "f" * 40)
+
+    assert immutable_build_revision() == "e" * 40

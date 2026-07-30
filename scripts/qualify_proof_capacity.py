@@ -39,7 +39,7 @@ if str(REPO_ROOT) not in sys.path:
 from reliquary.constants import (  # noqa: E402
     FORENSIC_SAMPLE_PER_WINDOW,
     MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV,
-    MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
+    MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW,
     MAX_PROOF_WALL_SECONDS,
     PROTOCOL_MODEL_REVISION,
     PROTOCOL_PROFILE_ID,
@@ -53,11 +53,14 @@ from reliquary.validator.proof_capacity import (  # noqa: E402
 ENVIRONMENTS = ("openmathinstruct", "opencodeinstruct")
 ROLLOUTS_PER_PROOF = 8
 MINIMUM_CAP_FRACTION = 0.9
+MINIMUM_SAMPLES_PER_DEVICE_PER_ENVIRONMENT = 20
 
 
 def _p95(values: list[float]) -> float:
-    if len(values) < 20:
-        raise ValueError("at least 20 proof samples are required per environment")
+    if len(values) < MINIMUM_SAMPLES_PER_DEVICE_PER_ENVIRONMENT:
+        raise ValueError(
+            "at least 20 proof samples are required per GPU and environment"
+        )
     return float(quantiles(values, n=100, method="inclusive")[94])
 
 
@@ -66,16 +69,16 @@ def _load_samples(
     *,
     software_revision: str,
     checkpoint_revision: str,
+    runtime_fingerprint_hash: str,
     hardware_class: str,
     benchmark_device_count: int,
 ) -> tuple[
-    dict[str, list[float]],
+    dict[str, dict[str, list[float]]],
     tuple[str, ...],
     dict[str, int],
 ]:
-    samples = {environment: [] for environment in ENVIRONMENTS}
-    devices_by_environment = {
-        environment: set() for environment in ENVIRONMENTS
+    samples = {
+        environment: {} for environment in ENVIRONMENTS
     }
     minimum_completion_tokens = {
         environment: math.ceil(
@@ -115,6 +118,7 @@ def _load_samples(
             "model_revision": PROTOCOL_MODEL_REVISION,
             "software_revision": software_revision,
             "checkpoint_revision": checkpoint_revision,
+            "runtime_fingerprint_hash": runtime_fingerprint_hash,
             "hardware_class": hardware_class,
         }
         for field, expected in expected_fields.items():
@@ -148,19 +152,25 @@ def _load_samples(
             raise ValueError(
                 f"missing device_uuid at line {line_number}"
             )
-        samples[environment].append(seconds)
-        devices_by_environment[environment].add(device_uuid)
+        samples[environment].setdefault(device_uuid, []).append(seconds)
 
-    benchmark_devices = set().union(*devices_by_environment.values())
+    benchmark_devices = set().union(
+        *(set(device_samples) for device_samples in samples.values())
+    )
     if len(benchmark_devices) != benchmark_device_count:
         raise ValueError(
             "observed GPU UUID count differs from --benchmark-device-count"
         )
-    for environment, devices in devices_by_environment.items():
-        if devices != benchmark_devices:
+    for environment, device_samples in samples.items():
+        if set(device_samples) != benchmark_devices:
             raise ValueError(
                 f"{environment} did not exercise every benchmark GPU"
             )
+        for device_uuid, values in device_samples.items():
+            if len(values) < MINIMUM_SAMPLES_PER_DEVICE_PER_ENVIRONMENT:
+                raise ValueError(
+                    f"{environment} GPU {device_uuid} has fewer than 20 samples"
+                )
     return (
         samples,
         tuple(sorted(benchmark_devices)),
@@ -174,6 +184,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--software-revision", required=True)
     parser.add_argument("--checkpoint-revision", required=True)
+    parser.add_argument("--runtime-fingerprint-hash", required=True)
     parser.add_argument("--hardware-class", required=True)
     parser.add_argument("--benchmark-device-count", type=int, required=True)
     parser.add_argument("--measured-at", required=True)
@@ -196,33 +207,69 @@ def main() -> int:
             parser.error(f"{label} revision must be a full lowercase commit SHA")
     if args.benchmark_device_count <= 0:
         parser.error("--benchmark-device-count must be positive")
+    if (
+        len(args.runtime_fingerprint_hash) != 64
+        or args.runtime_fingerprint_hash
+        != args.runtime_fingerprint_hash.lower()
+        or any(
+            character not in "0123456789abcdef"
+            for character in args.runtime_fingerprint_hash
+        )
+    ):
+        parser.error(
+            "--runtime-fingerprint-hash must be lowercase SHA-256"
+        )
 
     source_payload = args.samples.read_bytes()
     samples, benchmark_device_uuids, minimum_completion_tokens = _load_samples(
         args.samples,
         software_revision=args.software_revision,
         checkpoint_revision=args.checkpoint_revision,
+        runtime_fingerprint_hash=args.runtime_fingerprint_hash,
         hardware_class=args.hardware_class,
         benchmark_device_count=args.benchmark_device_count,
     )
+    p95_by_environment_and_device = {
+        environment: {
+            device_uuid: _p95(values)
+            for device_uuid, values in device_samples.items()
+        }
+        for environment, device_samples in samples.items()
+    }
     p95_by_environment = {
-        environment: _p95(samples[environment])
+        environment: max(device_p95.values())
+        for environment, device_p95 in (
+            p95_by_environment_and_device.items()
+        )
+    }
+    sample_count_by_environment = {
+        environment: sum(
+            len(values) for values in samples[environment].values()
+        )
         for environment in ENVIRONMENTS
+    }
+    sample_count_by_environment_and_device = {
+        environment: {
+            device_uuid: len(values)
+            for device_uuid, values in device_samples.items()
+        }
+        for environment, device_samples in samples.items()
     }
     proofs_per_environment = {
         environment: (
-            MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+            MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW
             + FORENSIC_SAMPLE_PER_WINDOW
         )
         for environment in ENVIRONMENTS
     }
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "profile_id": PROTOCOL_PROFILE_ID,
         "model_revision": PROTOCOL_MODEL_REVISION,
         "software_revision": args.software_revision,
         "checkpoint_revision": args.checkpoint_revision,
         "samples_sha256": hashlib.sha256(source_payload).hexdigest(),
+        "runtime_fingerprint_hash": args.runtime_fingerprint_hash,
         "hardware_class": args.hardware_class,
         "benchmark_device_count": args.benchmark_device_count,
         "benchmark_device_uuids": list(benchmark_device_uuids),
@@ -230,10 +277,16 @@ def main() -> int:
         "headroom_fraction": args.headroom,
         "proofs_per_environment": proofs_per_environment,
         "p95_seconds_per_proof": p95_by_environment,
-        "sample_count_by_environment": {
-            environment: len(samples[environment])
-            for environment in ENVIRONMENTS
-        },
+        "p95_seconds_per_proof_by_environment_and_device": (
+            p95_by_environment_and_device
+        ),
+        "sample_count_by_environment": sample_count_by_environment,
+        "sample_count_by_environment_and_device": (
+            sample_count_by_environment_and_device
+        ),
+        "minimum_samples_per_device_per_environment": (
+            MINIMUM_SAMPLES_PER_DEVICE_PER_ENVIRONMENT
+        ),
         "minimum_completion_tokens_by_environment": (
             minimum_completion_tokens
         ),
@@ -247,6 +300,8 @@ def main() -> int:
         profile_id=PROTOCOL_PROFILE_ID,
         model_revision=PROTOCOL_MODEL_REVISION,
         software_revision=args.software_revision,
+        checkpoint_revision=args.checkpoint_revision,
+        runtime_fingerprint_hash=args.runtime_fingerprint_hash,
         configured_devices=tuple(
             f"cuda:{index}"
             for index in range(args.benchmark_device_count)
@@ -258,7 +313,7 @@ def main() -> int:
         configured_device_uuids=benchmark_device_uuids,
         proof_wall_seconds=MAX_PROOF_WALL_SECONDS,
         minimum_proofs_per_environment=(
-            MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+            MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW
             + FORENSIC_SAMPLE_PER_WINDOW
         ),
         minimum_completion_tokens_per_environment=minimum_completion_tokens,
