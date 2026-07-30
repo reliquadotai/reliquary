@@ -24,14 +24,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from reliquary.constants import (
+from reliquary.constants import (  # noqa: E402
     B_BATCH,
     FORENSIC_SAMPLE_PER_WINDOW,
     MAX_PROOF_WALL_SECONDS,
     PROTOCOL_MODEL_REVISION,
     PROTOCOL_PROFILE_ID,
 )
-from reliquary.validator.proof_capacity import (
+from reliquary.validator.proof_capacity import (  # noqa: E402
     ProofCapacityQualification,
 )
 

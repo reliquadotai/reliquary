@@ -28,11 +28,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from reliquary.constants import (
+from reliquary.constants import (  # noqa: E402
     DEFAULT_BASE_MODEL,
     DEFAULT_BASE_MODEL_REVISION,
 )
-from reliquary.validator.checkpoint_profile import (
+from reliquary.validator.checkpoint_profile import (  # noqa: E402
     active_checkpoint_profile,
     write_checkpoint_profile,
 )
