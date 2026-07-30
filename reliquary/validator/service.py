@@ -62,7 +62,6 @@ from reliquary.constants import (
     POLL_INTERVAL_SECONDS,
     PPO_CLIP_EPSILON,
     PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD,
-    PROTOCOL_MODEL_REVISION,
     PROTOCOL_PROFILE_ID,
     PROTOCOL_VERSION,
     PROOF_ADMISSION_STALL_POLL_SECONDS,
@@ -110,6 +109,10 @@ from reliquary.validator.utility_telemetry import UtilityTelemetryWriter
 logger = logging.getLogger(__name__)
 
 _HF_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+
+
+class FatalProofPlaneError(RuntimeError):
+    """Proof infrastructure is unsafe to reuse without a process restart."""
 
 
 def _cooldown_snapshot_key(run_id: str) -> str:
@@ -1912,7 +1915,11 @@ class ValidationService:
                 )
         else:
             seal_results = await asyncio.gather(*(
-                asyncio.to_thread(batcher.seal_batch, pool=pool_per_env)
+                asyncio.to_thread(
+                    batcher.seal_batch,
+                    pool=pool_per_env,
+                    commit_side_effects=False,
+                )
                 for _name, batcher in seal_items
             ))
         sealed: dict[str, tuple] = {
@@ -1933,6 +1940,8 @@ class ValidationService:
             )
         }
         if proof_capacity_aborts:
+            for batcher in self._active_batchers.values():
+                batcher.discard_seal_side_effects()
             logger.error(
                 "Window %d: proof capacity aborted %s; skipping rewards, "
                 "training and checkpoint publication",
@@ -1946,7 +1955,20 @@ class ValidationService:
             self.server.set_active_batchers({})
             self._active_batchers = {}
             self._set_state(WindowState.READY)
+            if (
+                self.proof_scheduler is not None
+                and self.proof_scheduler.state is SchedulerState.FAULTED
+            ):
+                raise FatalProofPlaneError(
+                    "proof scheduler faulted; restart required before "
+                    "another window"
+                )
             return
+        if self.proof_scheduler is not None:
+            # Cooldowns and rollout-hash reservations are committed only after
+            # every environment has sealed successfully.
+            for batcher in self._active_batchers.values():
+                batcher.commit_seal_side_effects()
         for name, (batch, rewards) in sealed.items():
             self._active_batchers[name].rewards_by_hotkey = rewards
 
@@ -3264,6 +3286,25 @@ class ValidationService:
                     # task running off the same R2 archives; no need to do it
                     # here. The trainer is purely about training + uploads.
                 except asyncio.CancelledError:
+                    raise
+                except FatalProofPlaneError:
+                    logger.exception(
+                        "Fatal proof-plane failure; terminating for "
+                        "supervisor restart"
+                    )
+                    if not self._window_archive_enqueued:
+                        try:
+                            self._enqueue_aborted_window(
+                                failure_stage=self._window_iteration_stage,
+                                failure_type="FatalProofPlaneError",
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to enqueue fatal proof tombstone"
+                            )
+                    self.server.set_active_batchers({})
+                    self._active_batchers = {}
+                    self._set_state(WindowState.READY)
                     raise
                 except Exception as exc:
                     logger.exception("Window iteration failed")

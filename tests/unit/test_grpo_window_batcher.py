@@ -1197,6 +1197,34 @@ def test_scheduled_auction_preserves_ranked_winner_and_payout_contract():
         assert scheduler.close()
 
 
+def test_seal_side_effects_wait_for_explicit_global_commit():
+    from reliquary.validator.dedup import RolloutHashSet
+
+    hash_set = RolloutHashSet(retention_windows=50)
+    batcher = _make_batcher(hash_set=hash_set)
+    request = _request(prompt_idx=17, hotkey="hk-transaction")
+    assert batcher.accept_submission(request).accepted
+
+    batch, rewards = batcher.seal_batch(commit_side_effects=False)
+
+    assert len(batch) == 1
+    assert rewards
+    assert not batcher._cooldown.is_in_cooldown(17, batcher.window_start + 1)
+    assert all(
+        rollout_hash not in hash_set
+        for rollout_hash in batch[0].rollout_hashes
+    )
+
+    batcher.commit_seal_side_effects()
+
+    assert batcher._cooldown.is_in_cooldown(17, batcher.window_start + 1)
+    assert all(
+        rollout_hash in hash_set
+        for rollout_hash in batch[0].rollout_hashes
+    )
+    batcher.commit_seal_side_effects()
+
+
 def test_scheduled_proof_deadline_aborts_without_partial_rewards(monkeypatch):
     import reliquary.validator.batcher as batcher_module
 
@@ -1229,8 +1257,42 @@ def test_scheduled_proof_deadline_aborts_without_partial_rewards(monkeypatch):
         assert rewards == {}
         assert batcher.valid_submissions() == []
         assert batcher.proof_capacity_aborted is True
-        assert batcher.proof_capacity_abort_reason == "deadline_exceeded"
+        assert (
+            batcher.proof_capacity_abort_reason
+            == "active_proof_timeout"
+        )
         assert batcher.reward_alignment["reward_alignment_ok"] is False
+    finally:
+        assert scheduler.close()
+
+
+def test_scheduled_infrastructure_error_aborts_without_miner_debt():
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0",),
+        environments=("openmathinstruct", "opencodeinstruct"),
+        proof_callable=_execute_scheduler_payload,
+        checkpoint_revision="",
+    )
+    try:
+        batcher = _make_batcher(proof_scheduler=scheduler)
+        request = _request(prompt_idx=1, hotkey="hk-infra")
+        assert batcher.accept_submission(request).accepted
+
+        def fail_infrastructure(*_args, **_kwargs):
+            raise RuntimeError("validator model failed")
+
+        batcher._verify_expensive = fail_infrastructure
+        batch, rewards = batcher.seal_batch()
+
+        assert batch == []
+        assert rewards == {}
+        assert batcher.proof_capacity_aborted is True
+        assert (
+            batcher.proof_capacity_abort_reason
+            == "proof_execution_error"
+        )
+        assert batcher.proof_failure_debt("hk-infra") == 0
+        assert scheduler.state.value == "faulted"
     finally:
         assert scheduler.close()
 

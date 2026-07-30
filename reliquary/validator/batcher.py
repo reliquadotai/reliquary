@@ -537,6 +537,13 @@ class _ScheduledProofPayload:
         )
 
 
+@dataclass(frozen=True)
+class _SealSideEffects:
+    rewarded_prompts: tuple[int, ...]
+    rewarded_contents: tuple[str, ...]
+    rollout_hashes: tuple[bytes, ...]
+
+
 class GrpoWindowBatcher:
     """Accepts v2 submissions, runs the full verification pipeline, and
     exposes ``valid_submissions()`` + ``select_batch()`` at window close.
@@ -726,6 +733,8 @@ class GrpoWindowBatcher:
         # Legacy compatibility metric. Production auction winners are both
         # selected and rewarded, so this remains empty in auction mode.
         self.rewarded_but_not_selected_by_hotkey: dict[str, int] = {}
+        self._pending_seal_side_effects: _SealSideEffects | None = None
+        self._seal_side_effects_committed = False
         self.reward_alignment: dict[str, Any] = {
             "selected_groups": 0,
             "rewarded_groups": 0,
@@ -3540,29 +3549,10 @@ class GrpoWindowBatcher:
         """Run one scheduler-owned proof and atomically apply failure debt."""
 
         operator = self._operator_for_hotkey(pending.hotkey)
-        try:
-            verified = self._verify_expensive(pending, model=model)
-        except Exception:
-            if count_operator_debt:
-                with self._proof_admission_lock:
-                    self._expensive_proof_failures_by_hotkey[
-                        pending.hotkey
-                    ] = (
-                        self._expensive_proof_failures_by_hotkey.get(
-                            pending.hotkey, 0
-                        )
-                        + 1
-                    )
-                    if operator is not None:
-                        self._expensive_proof_failures_by_operator[
-                            operator
-                        ] = (
-                            self._expensive_proof_failures_by_operator.get(
-                                operator, 0
-                            )
-                            + 1
-                        )
-            raise
+        # A returned rejection is miner-attributable and may accrue proof debt.
+        # An exception is validator infrastructure failure; let the scheduler
+        # abort the whole proof plane without blaming or displacing the miner.
+        verified = self._verify_expensive(pending, model=model)
         if verified is None and count_operator_debt and operator is not None:
             # Proof-stage rejects already add hotkey debt in ``_reject``.
             # Auction selection has historically charged one operator failure
@@ -4765,16 +4755,25 @@ class GrpoWindowBatcher:
             }
 
     def seal_batch(
-        self, pool: float = 1.0
+        self,
+        pool: float = 1.0,
+        *,
+        commit_side_effects: bool = True,
     ) -> tuple[list[ValidSubmission], dict[str, float]]:
         """Finalize selection and release every retained payload reservation."""
         try:
-            return self._seal_batch_inner(pool)
+            return self._seal_batch_inner(
+                pool,
+                commit_side_effects=commit_side_effects,
+            )
         finally:
             self._release_retained_payloads()
 
     def _seal_batch_inner(
-        self, pool: float = 1.0
+        self,
+        pool: float = 1.0,
+        *,
+        commit_side_effects: bool = True,
     ) -> tuple[list[ValidSubmission], dict[str, float]]:
         """Pick the training batch and compute the reward distribution.
 
@@ -4903,28 +4902,70 @@ class GrpoWindowBatcher:
                     "auction reward alignment failed: paid unselected group"
                 )
 
-            rewarded_prompts = {sub.prompt_idx for sub in rewarded_submissions}
-            for p in rewarded_prompts:
-                self._cooldown.record_batched(p, self.window_start)
-            if self.difficulty_auction_enabled:
-                rewarded_contents = {
-                    sub.prompt_content_sha256 for sub in rewarded_submissions
-                }
-                if any(len(digest) != 64 for digest in rewarded_contents):
-                    raise RuntimeError(
-                        "auction content cooldown update missing canonical identity"
-                    )
-                for digest in rewarded_contents:
-                    self._content_cooldown.record_selected(
-                        digest, self.window_start
-                    )
-            if self._hash_set is not None:
-                for sub in rewarded_submissions:
-                    for h in sub.rollout_hashes:
-                        self._hash_set.add(h, self.window_start)
-            if self._hash_set is not None:
-                self._hash_set.prune(self.window_start)
+            rewarded_prompts = tuple(sorted({
+                sub.prompt_idx for sub in rewarded_submissions
+            }))
+            rewarded_contents = (
+                tuple(sorted({
+                    sub.prompt_content_sha256
+                    for sub in rewarded_submissions
+                }))
+                if self.difficulty_auction_enabled
+                else ()
+            )
+            if any(len(digest) != 64 for digest in rewarded_contents):
+                raise RuntimeError(
+                    "auction content cooldown update missing canonical identity"
+                )
+            rollout_hashes = tuple(
+                rollout_hash
+                for sub in rewarded_submissions
+                for rollout_hash in sub.rollout_hashes
+            )
+            self._pending_seal_side_effects = _SealSideEffects(
+                rewarded_prompts=rewarded_prompts,
+                rewarded_contents=rewarded_contents,
+                rollout_hashes=rollout_hashes,
+            )
+            if commit_side_effects:
+                self._commit_seal_side_effects_locked()
             return batch, rewards
+
+    def _commit_seal_side_effects_locked(self) -> None:
+        if self._seal_side_effects_committed:
+            return
+        effects = self._pending_seal_side_effects
+        if effects is None:
+            raise RuntimeError("seal side effects were not prepared")
+        for prompt_idx in effects.rewarded_prompts:
+            self._cooldown.record_batched(prompt_idx, self.window_start)
+        for digest in effects.rewarded_contents:
+            self._content_cooldown.record_selected(
+                digest,
+                self.window_start,
+            )
+        if self._hash_set is not None:
+            for rollout_hash in effects.rollout_hashes:
+                self._hash_set.add(rollout_hash, self.window_start)
+            self._hash_set.prune(self.window_start)
+        self._seal_side_effects_committed = True
+        self._pending_seal_side_effects = None
+
+    def commit_seal_side_effects(self) -> None:
+        """Commit cooldown and dedup state after every environment seals."""
+
+        with self._lock:
+            self._commit_seal_side_effects_locked()
+
+    def discard_seal_side_effects(self) -> None:
+        """Discard a prepared commit when any environment aborts the window."""
+
+        with self._lock:
+            if self._seal_side_effects_committed:
+                raise RuntimeError(
+                    "cannot discard seal side effects after commit"
+                )
+            self._pending_seal_side_effects = None
 
     def get_state(self) -> GrpoBatchState:
         with self._lock:

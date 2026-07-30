@@ -49,6 +49,50 @@ def test_service_initial_state_is_ready():
     assert svc._current_window_state == WindowState.READY
 
 
+@pytest.mark.asyncio
+async def test_cross_environment_abort_discards_all_seal_side_effects():
+    from reliquary.validator.proof_scheduler import SchedulerState
+
+    svc = _make_service()
+    math = MagicMock()
+    code = MagicMock()
+    for batcher in (math, code):
+        batcher.beacon_invalid = False
+        batcher.auction_admission_aborted = False
+        batcher.proof_capacity_aborted = False
+        batcher.proof_capacity_abort_reason = None
+    math.seal_batch.return_value = ([MagicMock()], {"math-hotkey": 0.1})
+    code.seal_batch.return_value = ([], {})
+    code.proof_capacity_aborted = True
+    code.proof_capacity_abort_reason = "attempt_limit"
+
+    svc.env_mix = (
+        ("openmathinstruct", 1.0),
+        ("opencodeinstruct", 1.0),
+    )
+    svc._active_batchers = {
+        "openmathinstruct": math,
+        "opencodeinstruct": code,
+    }
+    svc.proof_scheduler = SimpleNamespace(state=SchedulerState.RUNNING)
+    svc._fetch_seal_randomness = AsyncMock(return_value="ab" * 32)
+    svc._enqueue_aborted_window = MagicMock()
+
+    await svc._train_and_publish()
+
+    for batcher in (math, code):
+        batcher.seal_batch.assert_called_once_with(
+            pool=0.5,
+            commit_side_effects=False,
+        )
+        batcher.discard_seal_side_effects.assert_called_once_with()
+        batcher.commit_seal_side_effects.assert_not_called()
+    svc._enqueue_aborted_window.assert_called_once_with(
+        failure_stage="proof_capacity",
+        failure_type="ProofCapacityAbort",
+    )
+
+
 def test_open_window_sets_state_to_open():
     svc = _make_service()
     svc._open_window()

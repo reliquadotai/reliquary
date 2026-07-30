@@ -24,6 +24,7 @@ class SchedulerState(str, Enum):
     DRAINING = "draining"
     QUIESCING = "quiescing"
     QUIESCED = "quiesced"
+    FAULTED = "faulted"
     CLOSED = "closed"
 
 
@@ -44,6 +45,8 @@ class ProofPlanOutcome(str, Enum):
 
 class CapacityAbortReason(str, Enum):
     DEADLINE_EXCEEDED = "deadline_exceeded"
+    ACTIVE_PROOF_TIMEOUT = "active_proof_timeout"
+    PROOF_EXECUTION_ERROR = "proof_execution_error"
     INSUFFICIENT_DISTINCT_PROMPTS = "insufficient_distinct_prompts"
     ATTEMPT_LIMIT = "attempt_limit"
     QUIESCED = "quiesced"
@@ -299,6 +302,9 @@ class GlobalProofScheduler:
             environment: deque(maxlen=1000)
             for environment in self._environments
         }
+        self._fault_reason: CapacityAbortReason | None = None
+        self._faulted_at: float | None = None
+        self._last_capacity_abort_at: float | None = None
 
         self._workers = [
             threading.Thread(
@@ -386,6 +392,8 @@ class GlobalProofScheduler:
         with self._condition:
             if self._state is SchedulerState.CLOSED:
                 return True
+            if self._state is SchedulerState.FAULTED:
+                return False
             if self._state is SchedulerState.RUNNING:
                 self._state = SchedulerState.DRAINING
                 self._totals["drains"] += 1
@@ -405,6 +413,8 @@ class GlobalProofScheduler:
         with self._condition:
             if self._state is SchedulerState.CLOSED:
                 return True
+            if self._state is SchedulerState.FAULTED:
+                return False
             if self._state is SchedulerState.QUIESCED:
                 return True
             self._state = SchedulerState.QUIESCING
@@ -514,6 +524,17 @@ class GlobalProofScheduler:
 
             return {
                 "state": self._state.value,
+                "fault_reason": (
+                    None
+                    if self._fault_reason is None
+                    else self._fault_reason.value
+                ),
+                "faulted_at": self._faulted_at,
+                "last_capacity_abort_age_seconds": (
+                    None
+                    if self._last_capacity_abort_at is None
+                    else max(0.0, now - self._last_capacity_abort_at)
+                ),
                 "active_checkpoint_revision": (
                     self._active_checkpoint_revision
                 ),
@@ -547,7 +568,9 @@ class GlobalProofScheduler:
     def close(self, timeout: float | None = 5.0) -> bool:
         """Abort pending work, stop workers, and join scheduler threads."""
         started = time.monotonic()
-        quiesced = self.quiesce(timeout=timeout)
+        with self._condition:
+            faulted = self._state is SchedulerState.FAULTED
+        quiesced = faulted or self.quiesce(timeout=timeout)
         remaining = None
         if timeout is not None:
             remaining = max(0.0, timeout - (time.monotonic() - started))
@@ -687,7 +710,7 @@ class GlobalProofScheduler:
                 invocation = None
                 state = None
                 while invocation is None:
-                    if self._shutdown:
+                    if self._shutdown or self._state is SchedulerState.FAULTED:
                         return
                     self._expire_deadlines_locked()
                     selected = self._take_next_job_locked(device_id)
@@ -743,15 +766,6 @@ class GlobalProofScheduler:
                 assert state is not None
                 job_id = invocation.candidate.job_id
                 self._active_by_device[device_id] = None
-                state.active_job_ids.discard(job_id)
-                state.raw[job_id] = _RawCompletion(
-                    execution=execution,
-                    device_id=device_id,
-                    started_at=started_at,
-                    finished_at=finished_at,
-                    error=error,
-                )
-                state.phases[job_id] = _JobPhase.RAW
                 self._totals["jobs_completed"] += 1
                 self._proof_seconds_by_device[device_id] += max(
                     0.0, finished_at - started_at
@@ -761,6 +775,28 @@ class GlobalProofScheduler:
                 ].append(max(0.0, finished_at - started_at))
                 if error is not None:
                     self._totals["proof_errors"] += 1
+                if state.final_result is not None:
+                    self._totals["late_results"] += 1
+                    self._condition.notify_all()
+                    continue
+
+                state.active_job_ids.discard(job_id)
+                state.raw[job_id] = _RawCompletion(
+                    execution=execution,
+                    device_id=device_id,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    error=error,
+                )
+                state.phases[job_id] = _JobPhase.RAW
+                if error is not None:
+                    self._fault_scheduler_locked(
+                        CapacityAbortReason.PROOF_EXECUTION_ERROR
+                    )
+                elif finished_at > state.plan.deadline_at:
+                    self._fault_scheduler_locked(
+                        CapacityAbortReason.ACTIVE_PROOF_TIMEOUT
+                    )
                 if (
                     state.abort_reason is not None
                     or (
@@ -769,7 +805,8 @@ class GlobalProofScheduler:
                     )
                 ):
                     self._totals["late_results"] += 1
-                self._reevaluate_plan_locked(state)
+                if state.final_result is None:
+                    self._reevaluate_plan_locked(state)
                 self._maybe_finish_lifecycle_locked()
                 self._condition.notify_all()
 
@@ -1033,7 +1070,6 @@ class GlobalProofScheduler:
                 self._skip_prompt_tail_locked(state, candidate.prompt_key)
             elif decision.status in (
                 ProofDecisionStatus.REJECTED,
-                ProofDecisionStatus.ERROR,
             ):
                 for resource_key, _failure_limit in candidate.resources:
                     state.resource_failures[resource_key] += 1
@@ -1078,6 +1114,7 @@ class GlobalProofScheduler:
             return
         state.abort_reason = reason
         state.stop_dispatch = True
+        self._last_capacity_abort_at = self._clock()
         self._totals["capacity_aborts"] += 1
         self._totals[f"capacity_aborts_{reason.value}"] += 1
         for job_id, phase in state.phases.items():
@@ -1088,6 +1125,42 @@ class GlobalProofScheduler:
             ):
                 state.phases[job_id] = _JobPhase.ABORTED
         self._apply_ready_locked(state)
+
+    def _fault_scheduler_locked(self, reason: CapacityAbortReason) -> None:
+        """Abort every plan immediately and retire the proof plane.
+
+        Python cannot safely cancel a synchronous CUDA call in another thread.
+        A verifier exception or an active proof crossing its deadline therefore
+        faults the whole scheduler. Plan handles become terminal immediately;
+        the service can archive the aborted window and let its supervisor
+        restart the process. A worker that eventually returns is forensic-only.
+        """
+
+        if self._state is SchedulerState.FAULTED:
+            return
+        self._state = SchedulerState.FAULTED
+        self._fault_reason = reason
+        self._faulted_at = self._clock()
+        self._totals["scheduler_faults"] += 1
+        self._totals[f"scheduler_faults_{reason.value}"] += 1
+
+        for state in self._unfinished_plans_locked():
+            state.abort_reason = reason
+            state.stop_dispatch = True
+            self._last_capacity_abort_at = self._clock()
+            self._totals["capacity_aborts"] += 1
+            self._totals[f"capacity_aborts_{reason.value}"] += 1
+            for candidate in state.candidates:
+                phase = state.phases[candidate.job_id]
+                if phase is _JobPhase.APPLIED:
+                    continue
+                for resource_key, _failure_limit in candidate.resources:
+                    self._active_resource_keys.discard(resource_key)
+                state.phases[candidate.job_id] = _JobPhase.ABORTED
+            state.raw.clear()
+            state.active_job_ids.clear()
+            self._apply_ready_locked(state)
+        self._condition.notify_all()
 
     def _finalize_if_terminal_locked(self, state: _PlanState) -> None:
         if (
@@ -1126,7 +1199,10 @@ class GlobalProofScheduler:
             winner_job_ids=tuple(
                 decision.job_id
                 for decision in state.decisions
-                if decision.status is ProofDecisionStatus.PASSED
+                if (
+                    outcome is ProofPlanOutcome.COMPLETED
+                    and decision.status is ProofDecisionStatus.PASSED
+                )
             ),
             attempts_started=state.attempts_started,
             submitted_at=state.submitted_at,
@@ -1162,6 +1238,14 @@ class GlobalProofScheduler:
         now = self._clock()
         for state in self._unfinished_plans_locked():
             if now >= state.plan.deadline_at:
+                self._apply_ready_locked(state)
+                if state.final_result is not None:
+                    continue
+                if state.active_job_ids:
+                    self._fault_scheduler_locked(
+                        CapacityAbortReason.ACTIVE_PROOF_TIMEOUT
+                    )
+                    break
                 self._abort_plan_locked(
                     state, CapacityAbortReason.DEADLINE_EXCEEDED
                 )

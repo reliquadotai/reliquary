@@ -568,7 +568,7 @@ def test_quiesce_aborts_pending_work_and_waits_for_active_call():
         assert scheduler.close()
 
 
-def test_deadline_expiry_is_an_explicit_capacity_abort():
+def test_active_proof_deadline_faults_without_waiting_for_cuda_return():
     class ManualClock:
         now = 0.0
 
@@ -604,13 +604,25 @@ def test_deadline_expiry_is_an_explicit_capacity_abort():
         assert started.wait(2)
         clock.now = 11.0
         scheduler.expire_deadlines()
-        release.set()
 
         result = handle.result(2)
         assert result.outcome is ProofPlanOutcome.CAPACITY_ABORTED
-        assert result.abort_reason is CapacityAbortReason.DEADLINE_EXCEEDED
+        assert result.abort_reason is (
+            CapacityAbortReason.ACTIVE_PROOF_TIMEOUT
+        )
         assert result.decisions[0].status is (
             ProofDecisionStatus.CAPACITY_ABORTED
+        )
+        assert scheduler.state is SchedulerState.FAULTED
+        assert scheduler.snapshot()["fault_reason"] == (
+            CapacityAbortReason.ACTIVE_PROOF_TIMEOUT.value
+        )
+
+        release.set()
+        _wait_until(
+            lambda: (
+                scheduler.snapshot()["active_by_device"]["gpu-0"] is None
+            )
         )
         assert scheduler.snapshot()["totals"]["late_results"] == 1
     finally:
@@ -722,12 +734,15 @@ def test_attempt_limit_aborts_partial_success_explicitly():
 
     assert result.outcome is ProofPlanOutcome.CAPACITY_ABORTED
     assert result.abort_reason is CapacityAbortReason.ATTEMPT_LIMIT
-    assert result.winner_job_ids == ("job-1",)
+    assert result.winner_job_ids == ()
     assert result.attempts_started == 1
 
 
-def test_proof_exception_is_terminal_and_worker_survives():
+def test_proof_exception_faults_scheduler_without_promoting_lower_rank():
+    invoked = []
+
     def prove(invocation):
+        invoked.append(invocation.candidate.job_id)
         if invocation.candidate.rank == 1:
             raise RuntimeError("bad proof")
         return ProofExecution(True, value="verified")
@@ -749,10 +764,16 @@ def test_proof_exception_is_terminal_and_worker_survives():
         snapshot = scheduler.snapshot()
 
     assert [decision.status for decision in result.decisions] == [
-        ProofDecisionStatus.ERROR,
-        ProofDecisionStatus.PASSED,
+        ProofDecisionStatus.CAPACITY_ABORTED,
+        ProofDecisionStatus.CAPACITY_ABORTED,
     ]
-    assert result.decisions[1].value == "verified"
+    assert invoked == ["job-1"]
+    assert result.outcome is ProofPlanOutcome.CAPACITY_ABORTED
+    assert result.abort_reason is (
+        CapacityAbortReason.PROOF_EXECUTION_ERROR
+    )
+    assert result.winner_job_ids == ()
+    assert snapshot["state"] == SchedulerState.FAULTED.value
     assert snapshot["totals"]["proof_errors"] == 1
-    assert snapshot["totals"]["jobs_completed"] == 2
-    assert snapshot["dispatches_by_environment"][MATH] == 2
+    assert snapshot["totals"]["jobs_completed"] == 1
+    assert snapshot["dispatches_by_environment"][MATH] == 1
