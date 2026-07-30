@@ -274,11 +274,14 @@ VALIDATOR_HTTP_PORT = 8888
 # Pending work reserves capacity separately, so a degenerate-reward flood cannot
 # grow the bounded submit queue or saturate the grader pool while discarded
 # queue items do not burn work that never ran.
-# There is no smaller per-window GRAIL candidate budget: auction environments
-# freeze only after collection and upload grace drain, then this ceiling and
-# the seal-time wall budget bound ranked proof work. The old 32-candidate cap
-# starved honest late arrivals when earlier candidates failed after reservation.
-MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW = 64
+# Auction-v2 retains its deployed ceiling. Auction-v3 deliberately narrows the
+# ranked proof prefix to a capacity-qualified maximum: eight winners plus eight
+# possible failed candidates per environment. A v3 fleet must qualify this full
+# ceiling (plus forensics), so its declared proof wall cannot silently certify
+# only the happy path.
+MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW = (
+    16 if PROTOCOL_VERSION >= 3 else 64
+)
 
 # Seal-time GRAIL work is serial and an adversarial ranked prefix may fail one
 # candidate after another. The attempt ceiling bounds cardinality; this second

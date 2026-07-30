@@ -3,6 +3,7 @@
 import asyncio
 import atexit
 import logging
+import math
 import os
 import shutil
 import socket as _socket
@@ -15,13 +16,14 @@ from pathlib import Path
 import typer
 
 from reliquary.constants import (
-    B_BATCH,
     DEFAULT_BASE_MODEL,
     DEFAULT_BASE_MODEL_REVISION,
     DEFAULT_ENVIRONMENTS,
     DEFAULT_HF_REPO_ID,
     ENVIRONMENT_MIX,
     FORENSIC_SAMPLE_PER_WINDOW,
+    MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV,
+    MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
     MAX_PROOF_WALL_SECONDS,
     PROTOCOL_MODEL_REVISION,
     PROTOCOL_PROFILE_ID,
@@ -36,6 +38,34 @@ app = typer.Typer(name="reliquary", help="Reliquary — Verifiable Inference Sub
 logger = logging.getLogger(__name__)
 
 _grader_proc: "subprocess.Popen | None" = None
+
+
+def _configured_proof_device_identities(torch_module):
+    raw = os.environ.get("RELIQUARY_PROOF_DEVICES", "")
+    requested = tuple(
+        device.strip() for device in raw.split(",") if device.strip()
+    )
+    if PROTOCOL_VERSION < 3:
+        if requested:
+            logger.warning(
+                "Ignoring RELIQUARY_PROOF_DEVICES under protocol profile %s",
+                PROTOCOL_PROFILE_ID,
+            )
+        return ()
+    if not requested:
+        raise RuntimeError(
+            f"{PROTOCOL_PROFILE_ID} requires explicit proof replicas; "
+            "set RELIQUARY_PROOF_DEVICES after capacity qualification"
+        )
+
+    from reliquary.validator.proof_capacity import (
+        resolve_cuda_proof_devices,
+    )
+
+    return resolve_cuda_proof_devices(
+        requested,
+        cuda=torch_module.cuda,
+    )
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -430,23 +460,12 @@ def validate(
                 **base_load_kwargs,
             ).to("cuda:0").eval()
 
-            raw_proof_devices = os.environ.get(
-                "RELIQUARY_PROOF_DEVICES", ""
+            proof_device_identities = _configured_proof_device_identities(
+                torch
             )
             proof_devices = tuple(
-                device.strip()
-                for device in raw_proof_devices.split(",")
-                if device.strip()
+                identity.device_id for identity in proof_device_identities
             )
-            if len(set(proof_devices)) != len(proof_devices):
-                raise RuntimeError(
-                    "RELIQUARY_PROOF_DEVICES contains duplicates"
-                )
-            if PROTOCOL_VERSION >= 3 and not proof_devices:
-                raise RuntimeError(
-                    f"{PROTOCOL_PROFILE_ID} requires explicit proof replicas; "
-                    "set RELIQUARY_PROOF_DEVICES after capacity qualification"
-                )
             proof_capacity_qualification = None
             if PROTOCOL_VERSION >= 3:
                 from reliquary.validator.observability import (
@@ -471,8 +490,12 @@ def validate(
                     expected_sha256=manifest_sha256,
                 )
                 hardware = tuple(
-                    torch.cuda.get_device_name(torch.device(device))
-                    for device in proof_devices
+                    identity.hardware_class
+                    for identity in proof_device_identities
+                )
+                device_uuids = tuple(
+                    identity.device_uuid
+                    for identity in proof_device_identities
                 )
                 proof_capacity_qualification = qualification.validate(
                     profile_id=PROTOCOL_PROFILE_ID,
@@ -480,10 +503,18 @@ def validate(
                     software_revision=runtime_revision(),
                     configured_devices=proof_devices,
                     configured_hardware=hardware,
+                    configured_device_uuids=device_uuids,
                     proof_wall_seconds=MAX_PROOF_WALL_SECONDS,
                     minimum_proofs_per_environment=(
-                        B_BATCH + FORENSIC_SAMPLE_PER_WINDOW
+                        MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+                        + FORENSIC_SAMPLE_PER_WINDOW
                     ),
+                    minimum_completion_tokens_per_environment={
+                        environment: math.ceil(cap * 0.9)
+                        for environment, cap in (
+                            MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV.items()
+                        )
+                    },
                 )
                 logger.info(
                     "Proof capacity qualified: %s",

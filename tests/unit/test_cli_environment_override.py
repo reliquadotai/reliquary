@@ -16,6 +16,26 @@ import sys
 import pytest
 
 
+class _FakeCuda:
+    @staticmethod
+    def device_count():
+        return 1
+
+    @staticmethod
+    def get_device_name(index):
+        assert index == 0
+        return "NVIDIA H100 80GB HBM3"
+
+    @staticmethod
+    def get_device_properties(index):
+        assert index == 0
+        return type("Properties", (), {"uuid": "GPU-EXACT"})()
+
+
+class _FakeTorch:
+    cuda = _FakeCuda()
+
+
 def _reload_cli_main():
     """Reload the CLI module so typer.Option defaults are re-evaluated
     against the current process environment. The Option default value
@@ -91,6 +111,30 @@ def test_miner_never_requires_grader(monkeypatch):
     assert cli._miner_requires_grader(["opencodeinstruct"]) is False
     assert cli._miner_requires_grader(["openmathinstruct"]) is False
     assert cli._miner_requires_grader(["openmathinstruct", "opencodeinstruct"]) is False
+
+
+def test_v2_ignores_stale_proof_device_configuration(monkeypatch):
+    monkeypatch.setenv("RELIQUARY_PROOF_DEVICES", "cuda:0")
+    cli = _reload_cli_main()
+    monkeypatch.setattr(cli, "PROTOCOL_VERSION", 2)
+
+    assert cli._configured_proof_device_identities(_FakeTorch()) == ()
+
+
+def test_v3_requires_and_resolves_explicit_physical_proof_devices(monkeypatch):
+    cli = _reload_cli_main()
+    monkeypatch.setattr(cli, "PROTOCOL_VERSION", 3)
+    monkeypatch.setenv("RELIQUARY_PROOF_DEVICES", "cuda:00")
+
+    identities = cli._configured_proof_device_identities(_FakeTorch())
+
+    assert len(identities) == 1
+    assert identities[0].device_id == "cuda:0"
+    assert identities[0].device_uuid == "gpu-exact"
+
+    monkeypatch.delenv("RELIQUARY_PROOF_DEVICES")
+    with pytest.raises(RuntimeError, match="requires explicit proof replicas"):
+        cli._configured_proof_device_identities(_FakeTorch())
 
 
 @pytest.fixture(autouse=True)

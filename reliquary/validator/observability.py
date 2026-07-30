@@ -539,7 +539,7 @@ def runtime_revision() -> str | None:
     repo_root = Path(__file__).resolve().parents[2]
     try:
         return subprocess.check_output(
-            ["git", "rev-parse", "--short=12", "HEAD"],
+            ["git", "rev-parse", "HEAD"],
             cwd=repo_root,
             stderr=subprocess.DEVNULL,
             text=True,

@@ -187,6 +187,7 @@ def test_profiles_are_frozen_slotted_and_recursively_immutable():
                 "lr": 5e-6,
                 "kl": 0.04,
                 "mask_math": False,
+                "proof_attempts": 64,
             },
         ),
         (
@@ -201,6 +202,7 @@ def test_profiles_are_frozen_slotted_and_recursively_immutable():
                 "lr": 1e-6,
                 "kl": 0.01,
                 "mask_math": True,
+                "proof_attempts": 16,
             },
         ),
     ],
@@ -219,6 +221,7 @@ print(json.dumps({
     "lr": c.LEARNING_RATE,
     "kl": c.KL_BETA,
     "mask_math": c.MASK_MATH_FORCED_FROM_LOSS,
+    "proof_attempts": c.MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
 }))
 """
     env = dict(os.environ)
