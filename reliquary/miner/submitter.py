@@ -235,8 +235,13 @@ async def submit_batch_v2(
         if 0.0 < remaining < _DRAND_BOUNDARY_SAFETY_SECONDS:
             await asyncio.sleep(remaining + _DRAND_BOUNDARY_SETTLE_SECONDS)
 
+    wire_exclude = (
+        {"generation_profile_id"}
+        if not request.generation_profile_id
+        else None
+    )
     static_payload = (
-        request.model_dump_json().encode("utf-8")
+        request.model_dump_json(exclude=wire_exclude).encode("utf-8")
         if wallet is None
         else None
     )
@@ -266,6 +271,8 @@ async def submit_batch_v2(
             drand_round=drand_round,
             randomness=randomness,
             nonce=nonce,
+            protocol_version=request.protocol_version,
+            generation_profile_id=request.generation_profile_id,
         ).hex()
         finalized = request.model_copy(
             update={
@@ -275,7 +282,7 @@ async def submit_batch_v2(
             }
         )
         started = time.perf_counter()
-        payload = finalized.model_dump_json().encode("utf-8")
+        payload = finalized.model_dump_json(exclude=wire_exclude).encode("utf-8")
         precommit_fields = {
             "miner_hotkey": request.miner_hotkey,
             "window_start": request.window_start,
@@ -288,6 +295,7 @@ async def submit_batch_v2(
             "drand_round": drand_round,
             "randomness": randomness,
             "protocol_version": request.protocol_version,
+            "generation_profile_id": request.generation_profile_id,
             "nonce": nonce,
         }
         precommit_signature = sign_precommit(
@@ -341,7 +349,13 @@ async def submit_batch_v2(
                 try:
                     precommit_response = await cli.post(
                         f"{url}/submit/precommit",
-                        content=precommit.model_dump_json().encode("utf-8"),
+                        content=precommit.model_dump_json(
+                            exclude=(
+                                {"generation_profile_id"}
+                                if not precommit.generation_profile_id
+                                else None
+                            )
+                        ).encode("utf-8"),
                         headers={"Content-Type": "application/json"},
                         timeout=timeout,
                     )

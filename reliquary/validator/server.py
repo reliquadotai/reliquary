@@ -162,6 +162,7 @@ class _UploadPrecommitReceipt:
     precommit_arrival_ts: float
     drand_observation: DrandRoundObservation
     batcher: Any
+    generation_profile_id: str = ""
     consumed: bool = False
     outcome: BatchSubmissionResponse | None = None
     terminal: bool = False
@@ -964,6 +965,7 @@ class ValidatorServer:
             and secrets.compare_digest(receipt.payload_sha256, payload_sha256)
             and receipt.drand_round == request.drand_round
             and receipt.protocol_version == request.protocol_version
+            and receipt.generation_profile_id == request.generation_profile_id
             and receipt.nonce == request.nonce
         )
 
@@ -2179,6 +2181,7 @@ class ValidatorServer:
             payload_bytes=receipt.payload_bytes,
             drand_round=receipt.drand_round,
             protocol_version=receipt.protocol_version,
+            generation_profile_id=receipt.generation_profile_id,
             nonce=receipt.nonce,
         )
 
@@ -2881,6 +2884,7 @@ class ValidatorServer:
                 drand_round=request.drand_round,
                 randomness=batcher.randomness,
                 protocol_version=request.protocol_version,
+                generation_profile_id=request.generation_profile_id,
                 nonce=request.nonce,
                 precommit_signature=request.precommit_signature,
             )
@@ -2994,6 +2998,7 @@ class ValidatorServer:
                 payload_sha256=request.payload_sha256.lower(),
                 drand_round=request.drand_round,
                 protocol_version=request.protocol_version,
+                generation_profile_id=request.generation_profile_id,
                 nonce=request.nonce,
                 expires_at_wall=expires_at_wall,
                 precommit_arrival_ts=t_arrival,

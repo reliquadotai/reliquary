@@ -66,6 +66,7 @@ class AdmissionReceiptBinding:
     drand_round: int
     protocol_version: int
     nonce: str
+    generation_profile_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -267,6 +268,7 @@ def _binding_matches(
         and environments == {binding.environment}
         and request.drand_round == binding.drand_round
         and request.protocol_version == binding.protocol_version
+        and request.generation_profile_id == binding.generation_profile_id
         and request.nonce == binding.nonce
     )
 
@@ -489,6 +491,8 @@ def parse_and_validate_submission(
                 drand_round=request.drand_round,
                 randomness=context.randomness,
                 nonce=request.nonce,
+                protocol_version=request.protocol_version,
+                generation_profile_id=request.generation_profile_id,
                 envelope_signature=request.envelope_signature,
             ):
                 return _reject_parsed(

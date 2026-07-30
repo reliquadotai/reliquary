@@ -98,6 +98,9 @@ class RejectReason(str, Enum):
     PRECOMMIT_REQUIRED = "precommit_required"
     PRECOMMIT_INVALID = "precommit_invalid"
     PRECOMMIT_EXPIRED = "precommit_expired"
+    PROTOCOL_MISMATCH = "protocol_mismatch"
+    GENERATION_CONTRACT_MISMATCH = "generation_contract_mismatch"
+    PROOF_CAPACITY_ABORT = "proof_capacity_abort"
 
 
 class WindowState(str, Enum):
@@ -219,6 +222,9 @@ class BatchSubmissionRequest(BaseModel):
     # pre-forced-seed client; newer clients set this to indicate support
     # for seed-based randomness derivation.
     protocol_version: int = Field(default=0, ge=0)
+    # v3 binds every submission to the exact advertised generation contract.
+    # Empty preserves the byte-for-byte v2 signature and payload shape.
+    generation_profile_id: str = Field(default="", max_length=64)
     # Caller-chosen freshness nonce. Bound into the envelope signature
     # so a precomputed signature cannot be reused for a different
     # logical submission. The validator does not (currently) dedupe on
@@ -298,6 +304,7 @@ class SubmissionPrecommitRequest(BaseModel):
     payload_sha256: str = Field(..., pattern=r"^[0-9a-fA-F]{64}$")
     drand_round: int = Field(..., ge=0)
     protocol_version: int = Field(default=0, ge=0)
+    generation_profile_id: str = Field(default="", max_length=64)
     nonce: str = Field(..., min_length=1, max_length=128)
     precommit_signature: str = Field(
         ..., min_length=2, max_length=256, pattern=r"^[0-9a-fA-F]+$"
@@ -328,6 +335,9 @@ class GrpoBatchState(BaseModel):
     checkpoint_n: int = Field(..., ge=0)
     checkpoint_repo_id: str | None = None
     checkpoint_revision: str | None = None
+    protocol_version: int | None = Field(default=None, ge=0)
+    generation_profile_id: str | None = Field(default=None, max_length=64)
+    generation_contract: dict[str, Any] | None = None
     # v2.3: drand beacon randomness for this window. Empty string between
     # OPEN and the first successful _set_window_randomness; miners loop on
     # empty until populated. Miners derive GRAIL commitments off this

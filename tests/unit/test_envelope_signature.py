@@ -264,6 +264,59 @@ def test_sign_envelope_round_trips_through_verify():
     assert verify_envelope_signature(**common, envelope_signature=sig)
 
 
+def test_v3_envelope_binds_protocol_and_generation_profile():
+    kp = _new_keypair()
+
+    class _W:
+        class hotkey:
+            ss58_address = kp.ss58_address
+
+            @staticmethod
+            def sign(msg):
+                return kp.sign(msg)
+
+    common = dict(
+        miner_hotkey=kp.ss58_address,
+        window_start=500,
+        prompt_idx=42,
+        merkle_root="ab" * 32,
+        checkpoint_hash="sha256:ckpt",
+        drand_round=12345,
+        randomness="cd" * 16,
+        nonce="nonce-v3",
+        protocol_version=3,
+        generation_profile_id="qwen35-4b-auction-v3",
+    )
+    sig = sign_envelope(wallet=_W, **common).hex()
+    assert verify_envelope_signature(**common, envelope_signature=sig)
+    assert not verify_envelope_signature(
+        **{**common, "protocol_version": 2},
+        envelope_signature=sig,
+    )
+    assert not verify_envelope_signature(
+        **{**common, "generation_profile_id": "qwen35-2b-auction-v2"},
+        envelope_signature=sig,
+    )
+
+
+def test_v2_envelope_binding_is_unchanged_when_profile_is_empty():
+    common = dict(
+        miner_hotkey="5HotKey",
+        window_start=10,
+        prompt_idx=42,
+        merkle_root="ab" * 32,
+        checkpoint_hash="sha256:ckpt",
+        drand_round=12345,
+        randomness="cd" * 16,
+        nonce="abcd1234",
+    )
+    assert build_envelope_binding(**common) == build_envelope_binding(
+        **common,
+        protocol_version=2,
+        generation_profile_id="",
+    )
+
+
 @pytest.mark.parametrize(
     "field,bad_value",
     [
@@ -313,6 +366,43 @@ def test_precommit_signature_binds_routing_size_and_freshness(field, bad_value):
     )
     assert not verify_precommit_signature(
         **{**common, field: bad_value},
+        precommit_signature=signature,
+    )
+
+
+def test_v3_precommit_binds_generation_profile():
+    kp = _new_keypair()
+
+    class _W:
+        class hotkey:
+            ss58_address = kp.ss58_address
+
+            @staticmethod
+            def sign(msg):
+                return kp.sign(msg)
+
+    common = dict(
+        miner_hotkey=kp.ss58_address,
+        window_start=500,
+        prompt_idx=42,
+        merkle_root="ab" * 32,
+        checkpoint_hash="sha256:ckpt",
+        environment="openmathinstruct",
+        payload_bytes=654321,
+        payload_sha256="ab" * 32,
+        drand_round=12345,
+        randomness="cd" * 16,
+        protocol_version=3,
+        generation_profile_id="qwen35-4b-auction-v3",
+        nonce="nonce-v3",
+    )
+    signature = sign_precommit(wallet=_W, **common).hex()
+    assert verify_precommit_signature(
+        **common,
+        precommit_signature=signature,
+    )
+    assert not verify_precommit_signature(
+        **{**common, "generation_profile_id": "qwen35-2b-auction-v2"},
         precommit_signature=signature,
     )
 
