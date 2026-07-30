@@ -3271,6 +3271,8 @@ class ValidatorServer:
                     drand_round=request.drand_round,
                     randomness=_randomness_for_sig,
                     nonce=request.nonce,
+                    protocol_version=request.protocol_version,
+                    generation_profile_id=request.generation_profile_id,
                     envelope_signature=request.envelope_signature,
                 )
                 if not envelope_signature_valid:

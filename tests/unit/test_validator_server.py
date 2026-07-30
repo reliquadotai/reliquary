@@ -15,6 +15,8 @@ from reliquary.constants import (
     CHALLENGE_K,
     FORCED_SEED_PROTOCOL_VERSION,
     M_ROLLOUTS,
+    PROTOCOL_PROFILE_ID,
+    PROTOCOL_VERSION,
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
     REGISTERED_HOTKEY_STALE_GRACE_SECONDS,
 )
@@ -208,7 +210,10 @@ def _request(
         else "00" * 32
     )
     drand_round = 0
-    protocol_version = FORCED_SEED_PROTOCOL_VERSION
+    protocol_version = PROTOCOL_VERSION
+    generation_profile_id = (
+        PROTOCOL_PROFILE_ID if protocol_version >= 3 else ""
+    )
     nonce = os.urandom(8).hex()
     sig = sign_envelope(
         wallet=_TestWallet,
@@ -220,6 +225,8 @@ def _request(
         drand_round=drand_round,
         randomness=randomness,
         nonce=nonce,
+        protocol_version=protocol_version,
+        generation_profile_id=generation_profile_id,
     ).hex()
     return BatchSubmissionRequest(
         miner_hotkey=_TEST_KEYPAIR.ss58_address,
@@ -230,6 +237,7 @@ def _request(
         checkpoint_hash=checkpoint_hash,
         drand_round=drand_round,
         protocol_version=protocol_version,
+        generation_profile_id=generation_profile_id,
         nonce=nonce,
         envelope_signature=sig,
     )
@@ -256,6 +264,7 @@ def _precommit_for(
         "drand_round": request.drand_round,
         "randomness": "cd" * 16,
         "protocol_version": request.protocol_version,
+        "generation_profile_id": request.generation_profile_id,
         "nonce": request.nonce,
     }
     signature = sign_precommit(wallet=_TestWallet, **fields).hex()

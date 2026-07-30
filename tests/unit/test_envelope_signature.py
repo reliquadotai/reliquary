@@ -32,7 +32,12 @@ import bittensor as bt
 import pytest
 from fastapi.testclient import TestClient
 
-from reliquary.constants import CHALLENGE_K, M_ROLLOUTS
+from reliquary.constants import (
+    CHALLENGE_K,
+    M_ROLLOUTS,
+    PROTOCOL_PROFILE_ID,
+    PROTOCOL_VERSION,
+)
 from reliquary.protocol.signatures import (
     build_envelope_binding,
     build_precommit_binding,
@@ -165,6 +170,10 @@ def _signed_request(
         drand_round=drand_round,
         randomness=randomness,
         nonce=nonce,
+        protocol_version=PROTOCOL_VERSION,
+        generation_profile_id=(
+            PROTOCOL_PROFILE_ID if PROTOCOL_VERSION >= 3 else ""
+        ),
     ).hex()
     return BatchSubmissionRequest(
         miner_hotkey=keypair.ss58_address,
@@ -174,7 +183,10 @@ def _signed_request(
         rollouts=rollouts,
         checkpoint_hash=checkpoint_hash,
         drand_round=drand_round,
-        protocol_version=2,
+        protocol_version=PROTOCOL_VERSION,
+        generation_profile_id=(
+            PROTOCOL_PROFILE_ID if PROTOCOL_VERSION >= 3 else ""
+        ),
         nonce=nonce,
         envelope_signature=sig,
     )
