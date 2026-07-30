@@ -14,7 +14,7 @@ from reliquary.constants import (
     B_BATCH,
     CHALLENGE_K,
     FORCED_SEED_PROTOCOL_VERSION,
-    MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
+    MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW,
     MAX_SUBMISSIONS_PER_PROMPT,
     M_ROLLOUTS,
 )
@@ -1215,7 +1215,7 @@ def test_scheduled_forensics_have_capacity_beyond_winner_attempt_ceiling():
                 )
             ).accepted
         pending = batcher.pending_submissions()
-        batcher.proof_attempts = MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+        batcher.proof_attempts = MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW
         batcher._proof_wall_started_at = time.monotonic()
 
         results = batcher._prove_forensic_scheduled([
@@ -1227,8 +1227,40 @@ def test_scheduled_forensics_have_capacity_beyond_winner_attempt_ceiling():
         assert batcher.forensic_proof_attempts == 2
         assert (
             batcher.proof_attempts
-            == MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW + 2
+            == MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW + 2
         )
+    finally:
+        assert scheduler.close()
+
+
+def test_scheduled_forensic_infrastructure_fault_aborts_window():
+    def fail_proof(_invocation):
+        raise RuntimeError("proof device failed")
+
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0",),
+        environments=("openmathinstruct", "opencodeinstruct"),
+        proof_callable=fail_proof,
+        checkpoint_revision="",
+    )
+    try:
+        batcher = _make_batcher(proof_scheduler=scheduler)
+        assert batcher.accept_submission(
+            _request(prompt_idx=1, hotkey="forensic-fault")
+        ).accepted
+        pending = batcher.pending_submissions()[0]
+        batcher._proof_wall_started_at = time.monotonic()
+
+        batcher._prove_forensic_scheduled([
+            (pending, "random_watch"),
+        ])
+
+        assert batcher.proof_capacity_aborted is True
+        assert (
+            batcher.proof_capacity_abort_reason
+            == "proof_execution_error"
+        )
+        assert scheduler.state.value == "faulted"
     finally:
         assert scheduler.close()
 
@@ -3310,6 +3342,35 @@ def test_forced_seed_group_gate_shadow_when_not_enforcing(monkeypatch):
     req = _request(rewards=[1.0] * 4 + [0.0] * 4)
     # Not enforcing -> shadow only: the proof passes at seal, not rejected.
     assert _prove_one(b, req) is not None
+
+
+def test_v3_profile_contract_survives_forced_seed_kill_switch(monkeypatch):
+    import reliquary.validator.batcher as batcher_mod
+
+    monkeypatch.setattr(batcher_mod, "FORCED_SEED_ENFORCE", False)
+    monkeypatch.setattr(batcher_mod, "PROTOCOL_VERSION", 3)
+    monkeypatch.setattr(batcher_mod, "FORCED_SEED_PROTOCOL_VERSION", 3)
+    monkeypatch.setattr(
+        batcher_mod,
+        "PROTOCOL_PROFILE_ID",
+        "qwen35-4b-auction-v3",
+    )
+    batcher = _make_batcher()
+    batcher.current_checkpoint_hash = "checkpoint-v3"
+    request = _request()
+    request.checkpoint_hash = "checkpoint-v3"
+    request.protocol_version = 2
+    request.generation_profile_id = "qwen35-2b-auction-v2"
+
+    response = batcher.accept_submission(request)
+
+    assert response.accepted is False
+    assert response.reason is RejectReason.PROTOCOL_MISMATCH
+
+    request.protocol_version = 3
+    response = batcher.accept_submission(request)
+    assert response.accepted is False
+    assert response.reason is RejectReason.GENERATION_CONTRACT_MISMATCH
 
 
 def _grail_with_cdf_hard_mismatch():

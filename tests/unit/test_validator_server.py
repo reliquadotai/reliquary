@@ -1187,6 +1187,7 @@ def test_v3_protocol_contract_rejects_wrong_version_or_profile(monkeypatch):
         "PROTOCOL_PROFILE_ID",
         "qwen35-4b-auction-v3",
     )
+    monkeypatch.setattr(server_module, "FORCED_SEED_ENFORCE", False)
     check = server_module._protocol_contract_reject_reason
 
     assert check(

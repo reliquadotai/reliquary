@@ -37,6 +37,7 @@ from reliquary.constants import (
     MAX_PENDING_SUBMISSION_BYTES_PER_HOTKEY,
     MAX_PENDING_UPLOAD_PRECOMMITS_PER_ENV,
     MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
+    MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW,
     MAX_PROOF_WALL_SECONDS,
     MAX_SEAL_QUEUE_DRAIN_SECONDS,
     MAX_SUBMISSION_PAYLOAD_BYTES,
@@ -44,6 +45,8 @@ from reliquary.constants import (
     MAX_SUBMISSIONS_PER_PROMPT,
     PROMPT_RANGE_SIZE,
     PROMPT_RANGE_ENFORCE_FROM_WINDOW,
+    PROTOCOL_PROFILE_ID,
+    PROTOCOL_VERSION,
     REJECTED_LIST_CAP_PER_HOTKEY,
     WINDOW_COLLECTION_SECONDS,
     SUBMISSION_UPLOAD_GRACE_SECONDS,
@@ -1858,11 +1861,25 @@ class GrpoWindowBatcher:
         ):
             return False, RejectReason.WRONG_CHECKPOINT, "checkpoint"
         if (
-            FORCED_SEED_ENFORCE
-            and self.current_checkpoint_hash
+            self.current_checkpoint_hash
             and request.protocol_version != FORCED_SEED_PROTOCOL_VERSION
         ):
-            return False, RejectReason.SEED_MISMATCH, "forced_seed_protocol"
+            reason = (
+                RejectReason.PROTOCOL_MISMATCH
+                if PROTOCOL_VERSION >= 3
+                else RejectReason.SEED_MISMATCH
+            )
+            return False, reason, "protocol_contract"
+        if (
+            PROTOCOL_VERSION >= 3
+            and self.current_checkpoint_hash
+            and request.generation_profile_id != PROTOCOL_PROFILE_ID
+        ):
+            return (
+                False,
+                RejectReason.GENERATION_CONTRACT_MISMATCH,
+                "generation_contract",
+            )
         if request.prompt_idx >= len(self.env):
             return False, RejectReason.BAD_PROMPT_IDX, "prompt"
         if self.prompt_range is not None:
@@ -2165,13 +2182,26 @@ class GrpoWindowBatcher:
         if self.current_checkpoint_hash and request.checkpoint_hash != self.current_checkpoint_hash:
             return reject(RejectReason.WRONG_CHECKPOINT, "checkpoint")
         if (
-            FORCED_SEED_ENFORCE
-            and self.current_checkpoint_hash
+            self.current_checkpoint_hash
             and request.protocol_version != FORCED_SEED_PROTOCOL_VERSION
         ):
+            reason = (
+                RejectReason.PROTOCOL_MISMATCH
+                if PROTOCOL_VERSION >= 3
+                else RejectReason.SEED_MISMATCH
+            )
             return reject(
-                RejectReason.SEED_MISMATCH,
-                "forced_seed_protocol",
+                reason,
+                "protocol_contract",
+            )
+        if (
+            PROTOCOL_VERSION >= 3
+            and self.current_checkpoint_hash
+            and request.generation_profile_id != PROTOCOL_PROFILE_ID
+        ):
+            return reject(
+                RejectReason.GENERATION_CONTRACT_MISMATCH,
+                "generation_contract",
             )
         # NOTE: drand_round is intentionally NOT re-checked here. It's a
         # wall-clock timing gate decided once at HTTP arrival (see
@@ -3797,12 +3827,11 @@ class GrpoWindowBatcher:
                 candidates=tuple(candidates),
                 required_passes=B_BATCH,
                 deadline_at=deadline_at,
-                max_attempts=MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
+                max_attempts=MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW,
                 priority=0,
                 allow_shortfall=True,
             )
         ).result()
-
         attempted_ids: set[int] = set()
         proven: list[ValidSubmission] = []
         claimed: set[int] = set()
@@ -3940,7 +3969,7 @@ class GrpoWindowBatcher:
         Bounds (spec §2.3): per-hotkey and per-operator failure skips cap a
         single identity even when one coldkey owns many hotkeys, and a global
         attempt ceiling
-        (``MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW``, the graded-pool bound) caps a
+        (``MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW``) caps a
         multi-hotkey flood so proving can never exceed the graded pool. On
         exhaustion we log, stop, and advance with the shortfall (fewer than
         ``B_BATCH`` in ``_valid``); the training path already burns unpaid slots.
@@ -4119,7 +4148,7 @@ class GrpoWindowBatcher:
                     row["status"] = "operator_proof_debt"
                     self.auction_operator_proof_debt_skips += 1
                     continue
-                if attempts >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW:
+                if attempts >= MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW:
                     logger.warning(
                         "proof budget exhausted window=%d attempts=%d "
                         "proven=%d pending=%d — advancing with shortfall",
@@ -4378,6 +4407,17 @@ class GrpoWindowBatcher:
                 allow_shortfall=True,
             )
         ).result()
+        if result.outcome is ProofPlanOutcome.CAPACITY_ABORTED:
+            self.proof_capacity_aborted = True
+            self.proof_capacity_abort_reason = (
+                result.abort_reason.value
+                if result.abort_reason is not None
+                else "forensic_unknown"
+            )
+            self.proof_wall_exhausted = result.abort_reason in {
+                CapacityAbortReason.DEADLINE_EXCEEDED,
+                CapacityAbortReason.ACTIVE_PROOF_TIMEOUT,
+            }
 
         results: list[ForensicSampleResult] = []
         for decision in result.decisions:
@@ -4769,6 +4809,35 @@ class GrpoWindowBatcher:
         finally:
             self._release_retained_payloads()
 
+    def _abort_auction_for_proof_capacity(
+        self,
+    ) -> tuple[list[ValidSubmission], dict[str, float]]:
+        self.forensic_sample = []
+        self.selection_metadata_by_id = {}
+        self.rewards_by_hotkey = {}
+        self.reward_alignment = {
+            "selected_groups": 0,
+            "rewarded_groups": 0,
+            "paid_unselected_groups": 0,
+            "selected_unrewarded_groups": 0,
+            "reward_alignment_ok": False,
+            "abort_reason": self.proof_capacity_abort_reason,
+        }
+        self.difficulty_auction_shadow = {
+            "schema_version": 2,
+            "status": "aborted",
+            "mode": "production",
+            "environment": str(getattr(self.env, "name", "")),
+            "proof_capacity_aborted": True,
+            "proof_capacity_abort_reason": (
+                self.proof_capacity_abort_reason
+            ),
+            "proof_attempts": self.proof_attempts,
+            "proof_wall_seconds": self.proof_wall_elapsed_seconds,
+            "candidates": self.auction_candidates,
+        }
+        return [], {}
+
     def _seal_batch_inner(
         self,
         pool: float = 1.0,
@@ -4788,32 +4857,10 @@ class GrpoWindowBatcher:
         if self.difficulty_auction_enabled:
             self._prove_ranked(pool)
             if self.proof_capacity_aborted:
-                self.forensic_sample = []
-                self.selection_metadata_by_id = {}
-                self.rewards_by_hotkey = {}
-                self.reward_alignment = {
-                    "selected_groups": 0,
-                    "rewarded_groups": 0,
-                    "paid_unselected_groups": 0,
-                    "selected_unrewarded_groups": 0,
-                    "reward_alignment_ok": False,
-                    "abort_reason": self.proof_capacity_abort_reason,
-                }
-                self.difficulty_auction_shadow = {
-                    "schema_version": 2,
-                    "status": "aborted",
-                    "mode": "production",
-                    "environment": str(getattr(self.env, "name", "")),
-                    "proof_capacity_aborted": True,
-                    "proof_capacity_abort_reason": (
-                        self.proof_capacity_abort_reason
-                    ),
-                    "proof_attempts": self.proof_attempts,
-                    "proof_wall_seconds": self.proof_wall_elapsed_seconds,
-                    "candidates": self.auction_candidates,
-                }
-                return [], {}
+                return self._abort_auction_for_proof_capacity()
             self._prove_forensic_sample()
+            if self.proof_capacity_aborted:
+                return self._abort_auction_for_proof_capacity()
         with self._lock:
             if self.difficulty_auction_enabled:
                 batch, rewards = self._finalize_auction_winners(pool=pool)
@@ -4831,7 +4878,7 @@ class GrpoWindowBatcher:
                         self.forensic_proof_errors_by_type
                     ),
                     "proof_attempt_limit": (
-                        MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+                        MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW
                     ),
                     "proof_wall_seconds": self.proof_wall_elapsed_seconds,
                     "proof_wall_limit_seconds": MAX_PROOF_WALL_SECONDS,

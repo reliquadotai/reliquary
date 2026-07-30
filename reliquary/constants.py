@@ -274,12 +274,16 @@ VALIDATOR_HTTP_PORT = 8888
 # Pending work reserves capacity separately, so a degenerate-reward flood cannot
 # grow the bounded submit queue or saturate the grader pool while discarded
 # queue items do not burn work that never ran.
-# Auction-v2 retains its deployed ceiling. Auction-v3 deliberately narrows the
-# ranked proof prefix to a capacity-qualified maximum: eight winners plus eight
-# possible failed candidates per environment. A v3 fleet must qualify this full
-# ceiling (plus forensics), so its declared proof wall cannot silently certify
-# only the happy path.
-MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW = (
+# Admission remains at 64 started grading jobs per environment. It is consumed
+# before deferred GRAIL proof, so coupling it to the smaller seal-time proof
+# prefix would let two eight-submission hotkeys fill a v3 environment with
+# forged commitments before any GPU authentication runs.
+MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW = 64
+
+# Auction-v3 deliberately narrows only the ranked GPU proof prefix: eight
+# winners plus eight possible failed candidates per environment. A v3 fleet
+# qualifies this full ceiling plus the independent forensic budget.
+MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW = (
     16 if PROTOCOL_VERSION >= 3 else 64
 )
 

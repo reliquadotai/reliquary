@@ -61,7 +61,7 @@ from reliquary.constants import (
     MAX_PENDING_SUBMISSION_BYTES_PER_ENV,
     MAX_PENDING_SUBMISSION_BYTES_PER_HOTKEY,
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
-    MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
+    MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW,
     MAX_PROOF_WALL_SECONDS,
     MAX_SUBMISSION_PAYLOAD_BYTES,
     MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
@@ -220,7 +220,7 @@ def _protocol_contract_reject_reason(
     generation_profile_id: str,
     checkpoint_bound: bool,
 ) -> RejectReason | None:
-    if not FORCED_SEED_ENFORCE or not checkpoint_bound:
+    if not checkpoint_bound:
         return None
     if protocol_version != FORCED_SEED_PROTOCOL_VERSION:
         return (
@@ -636,7 +636,7 @@ class _Health(BaseModel):
         default_factory=lambda: list(DIFFICULTY_AUCTION_ENVIRONMENTS)
     )
     difficulty_auction_proof_attempt_limit: int = (
-        MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+        MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW
     )
     difficulty_auction_proof_wall_limit_seconds: float = MAX_PROOF_WALL_SECONDS
     difficulty_auction_proof_wall_elapsed_seconds: float | None = None
@@ -1913,7 +1913,7 @@ class ValidatorServer:
                 DIFFICULTY_AUCTION_ENVIRONMENTS
             ),
             difficulty_auction_proof_attempt_limit=(
-                MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+                MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW
             ),
             difficulty_auction_proof_wall_limit_seconds=(
                 MAX_PROOF_WALL_SECONDS
