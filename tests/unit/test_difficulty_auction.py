@@ -135,3 +135,43 @@ def test_rank_key_breaks_score_ties_by_arrival_round():
         key=_rank_key,
     )
     assert [s.hotkey for s, _ in ranked] == ["fast", "slow"]
+
+
+def test_max_difficulty_value_is_the_binary_k2_peak_for_8_rollouts():
+    """delta=1: v(p)=sqrt(p(1-p))*(1-p) peaks at p=1/4 -> k=2 of 8; the
+    constant must be the exact float difficulty_score emits for that profile
+    (ranking compares with ==, no epsilon)."""
+    from reliquary.validator.difficulty_auction import (
+        difficulty_score, max_difficulty_value,
+    )
+
+    expected = difficulty_score([1.0, 1.0] + [0.0] * 6, delta=1.0).value
+    assert max_difficulty_value(8, delta=1.0) == expected
+    assert all(
+        difficulty_score([1.0] * k + [0.0] * (8 - k), delta=1.0).value
+        <= max_difficulty_value(8, delta=1.0)
+        for k in range(9)
+    )
+
+
+def test_no_fractional_profile_exceeds_the_binary_maximum():
+    """For fixed mean, std is maximized only by extremal (0/1) rewards, so no
+    in-[0,1] profile can beat the binary max. Grid-check 4-rollout profiles
+    exhaustively on a 0/0.25/0.5/0.75/1 lattice."""
+    from itertools import product
+
+    from reliquary.validator.difficulty_auction import (
+        difficulty_score, max_difficulty_value,
+    )
+
+    cap = max_difficulty_value(4, delta=1.0)
+    lattice = (0.0, 0.25, 0.5, 0.75, 1.0)
+    for profile in product(lattice, repeat=4):
+        assert difficulty_score(list(profile), delta=1.0).value <= cap
+
+
+def test_max_difficulty_value_zero_and_one_rollout_degenerate_to_zero():
+    from reliquary.validator.difficulty_auction import max_difficulty_value
+
+    assert max_difficulty_value(0, delta=1.0) == 0.0
+    assert max_difficulty_value(1, delta=1.0) == 0.0

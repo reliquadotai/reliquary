@@ -417,12 +417,12 @@ def test_global_proof_budget_bounds_a_multi_hotkey_flood():
     for i in range(20):
         b.accept_submission(_request(prompt_idx=i, hotkey=f"fake{i}"))
 
-    original = batcher_mod.MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
-    batcher_mod.MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW = 5
+    original = batcher_mod.MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW
+    batcher_mod.MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW = 5
     try:
         b.seal_batch()
     finally:
-        batcher_mod.MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW = original
+        batcher_mod.MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW = original
 
     assert b.valid_submissions() == []
     assert b.proof_attempts == 5           # stopped at the global ceiling

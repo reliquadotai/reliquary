@@ -15,6 +15,8 @@ from reliquary.constants import (
     CHALLENGE_K,
     FORCED_SEED_PROTOCOL_VERSION,
     M_ROLLOUTS,
+    PROTOCOL_PROFILE_ID,
+    PROTOCOL_VERSION,
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
     REGISTERED_HOTKEY_STALE_GRACE_SECONDS,
 )
@@ -208,7 +210,10 @@ def _request(
         else "00" * 32
     )
     drand_round = 0
-    protocol_version = FORCED_SEED_PROTOCOL_VERSION
+    protocol_version = PROTOCOL_VERSION
+    generation_profile_id = (
+        PROTOCOL_PROFILE_ID if protocol_version >= 3 else ""
+    )
     nonce = os.urandom(8).hex()
     sig = sign_envelope(
         wallet=_TestWallet,
@@ -220,6 +225,8 @@ def _request(
         drand_round=drand_round,
         randomness=randomness,
         nonce=nonce,
+        protocol_version=protocol_version,
+        generation_profile_id=generation_profile_id,
     ).hex()
     return BatchSubmissionRequest(
         miner_hotkey=_TEST_KEYPAIR.ss58_address,
@@ -230,6 +237,7 @@ def _request(
         checkpoint_hash=checkpoint_hash,
         drand_round=drand_round,
         protocol_version=protocol_version,
+        generation_profile_id=generation_profile_id,
         nonce=nonce,
         envelope_signature=sig,
     )
@@ -256,6 +264,7 @@ def _precommit_for(
         "drand_round": request.drand_round,
         "randomness": "cd" * 16,
         "protocol_version": request.protocol_version,
+        "generation_profile_id": request.generation_profile_id,
         "nonce": request.nonce,
     }
     signature = sign_precommit(wallet=_TestWallet, **fields).hex()
@@ -1084,6 +1093,22 @@ def test_health_degrades_when_registration_cache_is_unavailable():
     assert health["registration_cache_usable"] is False
 
 
+def test_health_degrades_on_proof_plane_runtime_signal():
+    server = ValidatorServer()
+    server.configure_proof_scheduler_health(lambda: {
+        "required": True,
+        "state": "running",
+        "degraded_reasons": ["active_proof_over_wall"],
+    })
+
+    health = TestClient(server.app).get("/health").json()
+
+    assert health["status"] == "degraded"
+    assert health["proof_scheduler"]["degraded_reasons"] == [
+        "active_proof_over_wall"
+    ]
+
+
 def test_submit_503_when_no_active_batcher():
     from reliquary.protocol.submission import WindowState
     server = ValidatorServer()
@@ -1114,9 +1139,72 @@ def test_state_endpoint_returns_grpo_batch_state():
     client = TestClient(server.app)
     resp = client.get("/state")
     assert resp.status_code == 200
-    state = GrpoBatchState(**resp.json())
+    payload = resp.json()
+    assert "protocol_version" not in payload
+    assert "generation_profile_id" not in payload
+    assert "generation_contract" not in payload
+    state = GrpoBatchState(**payload)
     assert state.window_n == 500
     assert 42 in state.cooldown_prompts
+
+
+def test_v3_state_advertises_exact_generation_contract(monkeypatch):
+    import reliquary.validator.server as server_module
+    from reliquary.protocol.profiles import PROFILES
+    from reliquary.protocol.submission import WindowState
+
+    profile = PROFILES["qwen35-4b-auction-v3"]
+    contract = profile.to_generation_contract()
+    monkeypatch.setattr(server_module, "PROTOCOL_VERSION", 3)
+    monkeypatch.setattr(
+        server_module,
+        "PROTOCOL_PROFILE_ID",
+        profile.profile_id,
+    )
+    monkeypatch.setattr(
+        server_module,
+        "PROTOCOL_GENERATION_CONTRACT",
+        contract,
+    )
+    server = ValidatorServer()
+    server.set_active_batcher(_batcher(window_start=500))
+    server.set_current_state(WindowState.OPEN)
+
+    payload = TestClient(server.app).get("/state").json()
+
+    assert payload["protocol_version"] == 3
+    assert payload["generation_profile_id"] == profile.profile_id
+    assert payload["generation_contract"] == contract
+
+
+def test_v3_protocol_contract_rejects_wrong_version_or_profile(monkeypatch):
+    import reliquary.validator.server as server_module
+
+    monkeypatch.setattr(server_module, "PROTOCOL_VERSION", 3)
+    monkeypatch.setattr(server_module, "FORCED_SEED_PROTOCOL_VERSION", 3)
+    monkeypatch.setattr(
+        server_module,
+        "PROTOCOL_PROFILE_ID",
+        "qwen35-4b-auction-v3",
+    )
+    monkeypatch.setattr(server_module, "FORCED_SEED_ENFORCE", False)
+    check = server_module._protocol_contract_reject_reason
+
+    assert check(
+        protocol_version=2,
+        generation_profile_id="",
+        checkpoint_bound=True,
+    ) is RejectReason.PROTOCOL_MISMATCH
+    assert check(
+        protocol_version=3,
+        generation_profile_id="",
+        checkpoint_bound=True,
+    ) is RejectReason.GENERATION_CONTRACT_MISMATCH
+    assert check(
+        protocol_version=3,
+        generation_profile_id="qwen35-4b-auction-v3",
+        checkpoint_bound=True,
+    ) is None
 
 
 def test_state_endpoint_503_when_no_active_batcher():

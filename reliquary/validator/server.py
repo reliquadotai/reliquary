@@ -37,7 +37,6 @@ import uvicorn
 
 from reliquary.constants import (
     B_BATCH,
-    BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION,
     DRAND_ROUND_BACKWARD_TOLERANCE,
     DIFFICULTY_AUCTION_DELTA,
     DIFFICULTY_AUCTION_ENFORCE,
@@ -62,12 +61,11 @@ from reliquary.constants import (
     MAX_PENDING_SUBMISSION_BYTES_PER_ENV,
     MAX_PENDING_SUBMISSION_BYTES_PER_HOTKEY,
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
-    MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
+    MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW,
     MAX_PROOF_WALL_SECONDS,
     MAX_SUBMISSION_PAYLOAD_BYTES,
     MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
     MAX_SUBMISSIONS_PER_PROMPT,
-    MAX_TRUNCATED_PER_SUBMISSION,
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
     REGISTERED_HOTKEY_STALE_GRACE_SECONDS,
     SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS,
@@ -79,6 +77,11 @@ from reliquary.constants import (
     CODE_ADMISSION_WALL_SECONDS,
     ADMISSION_PROCESS_MAX_TASKS,
     MATH_ADMISSION_WALL_SECONDS,
+    PROTOCOL_GENERATION_CONTRACT,
+    PROTOCOL_PROFILE_ID,
+    PROTOCOL_VERSION,
+    max_new_tokens_for_environment,
+    max_truncated_for_environment,
 )
 from reliquary.environment.virtual_parquet import PromptSourceUnavailable
 from reliquary.infrastructure.process_health import collect_process_health
@@ -162,6 +165,7 @@ class _UploadPrecommitReceipt:
     precommit_arrival_ts: float
     drand_observation: DrandRoundObservation
     batcher: Any
+    generation_profile_id: str = ""
     consumed: bool = False
     outcome: BatchSubmissionResponse | None = None
     terminal: bool = False
@@ -208,6 +212,28 @@ def _is_mock_like(value: Any) -> bool:
     when the object is clearly a mock.
     """
     return type(value).__module__.startswith("unittest.mock")
+
+
+def _protocol_contract_reject_reason(
+    *,
+    protocol_version: int,
+    generation_profile_id: str,
+    checkpoint_bound: bool,
+) -> RejectReason | None:
+    if not checkpoint_bound:
+        return None
+    if protocol_version != FORCED_SEED_PROTOCOL_VERSION:
+        return (
+            RejectReason.PROTOCOL_MISMATCH
+            if PROTOCOL_VERSION >= 3
+            else RejectReason.SEED_MISMATCH
+        )
+    if (
+        PROTOCOL_VERSION >= 3
+        and generation_profile_id != PROTOCOL_PROFILE_ID
+    ):
+        return RejectReason.GENERATION_CONTRACT_MISMATCH
+    return None
 
 
 class _SubmissionBodyLimitMiddleware:
@@ -448,6 +474,7 @@ def _proof_free_submission_reject(
             local_seen.add(rollout_hash)
 
     env = getattr(batcher, "env", None)
+    environment = str(getattr(env, "name", ""))
     validator_scored_reward = bool(
         getattr(env, "validator_authoritative_reward", False)
     )
@@ -464,11 +491,11 @@ def _proof_free_submission_reject(
     if not eos_set:
         return None, None
 
-    max_truncated_per_submission = (
-        BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION
-        if _proof_free_bootstrap(batcher)
-        else MAX_TRUNCATED_PER_SUBMISSION
+    max_truncated_per_submission = max_truncated_for_environment(
+        environment,
+        bootstrap=_proof_free_bootstrap(batcher),
     )
+    protocol_cap = max_new_tokens_for_environment(environment)
     truncated_count = 0
     validate_forced_span = _proof_free_force_span_validator(batcher)
 
@@ -516,7 +543,7 @@ def _proof_free_submission_reject(
             env_name=rollout.env_name,
         ):
             continue
-        if total_length < MAX_NEW_TOKENS_PROTOCOL_CAP:
+        if total_length < protocol_cap:
             return RejectReason.BAD_TERMINATION, "termination_preflight"
 
         truncated_count += 1
@@ -530,6 +557,11 @@ class _Health(BaseModel):
     status: str
     active_window: int | None
     image_revision: str | None = None
+    protocol_version: int = PROTOCOL_VERSION
+    generation_profile_id: str = PROTOCOL_PROFILE_ID
+    generation_contract: dict[str, Any] = Field(
+        default_factory=lambda: dict(PROTOCOL_GENERATION_CONTRACT)
+    )
     runtime_fingerprint: dict[str, Any] = Field(default_factory=dict)
     chain_client_fingerprint: dict[str, str | None] = Field(
         default_factory=dict
@@ -579,6 +611,7 @@ class _Health(BaseModel):
     admission_latency_ms_by_environment: dict[
         str, dict[str, dict[str, float | None]]
     ] = Field(default_factory=dict)
+    proof_scheduler: dict[str, Any] = Field(default_factory=dict)
     valid_submissions_count: int | None = None
     distinct_valid_prompt_count: int | None = None
     last_valid_submission_ts: float | None = None
@@ -603,7 +636,7 @@ class _Health(BaseModel):
         default_factory=lambda: list(DIFFICULTY_AUCTION_ENVIRONMENTS)
     )
     difficulty_auction_proof_attempt_limit: int = (
-        MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+        MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW
     )
     difficulty_auction_proof_wall_limit_seconds: float = MAX_PROOF_WALL_SECONDS
     difficulty_auction_proof_wall_elapsed_seconds: float | None = None
@@ -764,6 +797,9 @@ class ValidatorServer:
             Callable[[], dict[str, Any]] | None
         ) = None
         self._utility_telemetry_health_callback: (
+            Callable[[], dict[str, Any]] | None
+        ) = None
+        self._proof_scheduler_health_callback: (
             Callable[[], dict[str, Any]] | None
         ) = None
         self._prompt_source_unavailable_total = 0
@@ -964,6 +1000,7 @@ class ValidatorServer:
             and secrets.compare_digest(receipt.payload_sha256, payload_sha256)
             and receipt.drand_round == request.drand_round
             and receipt.protocol_version == request.protocol_version
+            and receipt.generation_profile_id == request.generation_profile_id
             and receipt.nonce == request.nonce
         )
 
@@ -1081,6 +1118,12 @@ class ValidatorServer:
         snapshot_callback: Callable[[], dict[str, Any]],
     ) -> None:
         self._utility_telemetry_health_callback = snapshot_callback
+
+    def configure_proof_scheduler_health(
+        self,
+        snapshot_callback: Callable[[], dict[str, Any]],
+    ) -> None:
+        self._proof_scheduler_health_callback = snapshot_callback
 
     def configure_archive_queue_telemetry(
         self,
@@ -1283,6 +1326,7 @@ class ValidatorServer:
         accepted_into_pool: bool | None = None,
         selected_for_batch: bool | None = None,
         rewarded: bool | None = None,
+        sigma: float | None = None,
     ) -> None:
         """Record a per-submission verdict for ``/verdicts/{hotkey}``.
 
@@ -1335,6 +1379,8 @@ class ValidatorServer:
             entry["selected_for_batch"] = selected_for_batch
         if rewarded is not None:
             entry["rewarded"] = rewarded
+        if sigma is not None:
+            entry["sigma"] = float(sigma)
         self._verdicts[hotkey].append(entry)
 
     def _current_drand_round_best_effort(self) -> int | None:
@@ -1601,6 +1647,18 @@ class ValidatorServer:
                 "enabled": True,
                 "last_error_type": type(exc).__name__,
             }
+        try:
+            proof_scheduler = (
+                dict(self._proof_scheduler_health_callback())
+                if self._proof_scheduler_health_callback is not None
+                else {}
+            )
+        except Exception as exc:
+            proof_scheduler = {
+                "state": "error",
+                "required": PROTOCOL_VERSION >= 3,
+                "last_error_type": type(exc).__name__,
+            }
         window_environments = {
             str(env_name): self._window_environment_health(env_batcher)
             for env_name, env_batcher in self._active_batchers.items()
@@ -1672,6 +1730,11 @@ class ValidatorServer:
                     )
                 )
                 or content_cooldown.get("complete") is False
+                or (
+                    proof_scheduler.get("required") is True
+                    and proof_scheduler.get("state") != "running"
+                )
+                or bool(proof_scheduler.get("degraded_reasons"))
                 or self._process_health_snapshot.get("status")
                 in {"warning", "critical"}
             )
@@ -1681,6 +1744,9 @@ class ValidatorServer:
             status=health_status,
             active_window=batcher.window_start if batcher else None,
             image_revision=self._image_revision,
+            protocol_version=PROTOCOL_VERSION,
+            generation_profile_id=PROTOCOL_PROFILE_ID,
+            generation_contract=dict(PROTOCOL_GENERATION_CONTRACT),
             runtime_fingerprint=dict(self._runtime_fingerprint),
             chain_client_fingerprint=dict(self._chain_client_fingerprint),
             app_started_at=self._app_started_at,
@@ -1789,6 +1855,7 @@ class ValidatorServer:
                 }
                 for env_name, metrics in self._admission_latency_samples_ms.items()
             },
+            proof_scheduler=proof_scheduler,
             # These legacy scalar fields reflect the first active environment.
             # During an auction they intentionally report admitted candidates,
             # not only the winners proven later at seal.
@@ -1846,7 +1913,7 @@ class ValidatorServer:
                 DIFFICULTY_AUCTION_ENVIRONMENTS
             ),
             difficulty_auction_proof_attempt_limit=(
-                MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+                MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW
             ),
             difficulty_auction_proof_wall_limit_seconds=(
                 MAX_PROOF_WALL_SECONDS
@@ -2176,6 +2243,7 @@ class ValidatorServer:
             payload_bytes=receipt.payload_bytes,
             drand_round=receipt.drand_round,
             protocol_version=receipt.protocol_version,
+            generation_profile_id=receipt.generation_profile_id,
             nonce=receipt.nonce,
         )
 
@@ -2859,12 +2927,13 @@ class ValidatorServer:
                 and request.checkpoint_hash != batcher.current_checkpoint_hash
             ):
                 return reject(RejectReason.WRONG_CHECKPOINT)
-            if (
-                FORCED_SEED_ENFORCE
-                and bool(batcher.current_checkpoint_hash)
-                and request.protocol_version != FORCED_SEED_PROTOCOL_VERSION
-            ):
-                return reject(RejectReason.SEED_MISMATCH)
+            protocol_reject = _protocol_contract_reject_reason(
+                protocol_version=request.protocol_version,
+                generation_profile_id=request.generation_profile_id,
+                checkpoint_bound=bool(batcher.current_checkpoint_hash),
+            )
+            if protocol_reject is not None:
+                return reject(protocol_reject)
             precommit_signature_valid = await asyncio.to_thread(
                 verify_precommit_signature,
                 miner_hotkey=request.miner_hotkey,
@@ -2878,6 +2947,7 @@ class ValidatorServer:
                 drand_round=request.drand_round,
                 randomness=batcher.randomness,
                 protocol_version=request.protocol_version,
+                generation_profile_id=request.generation_profile_id,
                 nonce=request.nonce,
                 precommit_signature=request.precommit_signature,
             )
@@ -2991,6 +3061,7 @@ class ValidatorServer:
                 payload_sha256=request.payload_sha256.lower(),
                 drand_round=request.drand_round,
                 protocol_version=request.protocol_version,
+                generation_profile_id=request.generation_profile_id,
                 nonce=request.nonce,
                 expires_at_wall=expires_at_wall,
                 precommit_arrival_ts=t_arrival,
@@ -3201,6 +3272,8 @@ class ValidatorServer:
                     drand_round=request.drand_round,
                     randomness=_randomness_for_sig,
                     nonce=request.nonce,
+                    protocol_version=request.protocol_version,
+                    generation_profile_id=request.generation_profile_id,
                     envelope_signature=request.envelope_signature,
                 )
                 if not envelope_signature_valid:
@@ -3429,16 +3502,23 @@ class ValidatorServer:
                         reject_stage="upload_precommit",
                     )
 
-            if (
-                FORCED_SEED_ENFORCE
-                and bool(getattr(batcher, "current_checkpoint_hash", ""))
-                and request.protocol_version != FORCED_SEED_PROTOCOL_VERSION
-            ):
+            protocol_reject = _protocol_contract_reject_reason(
+                protocol_version=request.protocol_version,
+                generation_profile_id=request.generation_profile_id,
+                checkpoint_bound=bool(
+                    getattr(batcher, "current_checkpoint_hash", "")
+                ),
+            )
+            if protocol_reject is not None:
                 return _reject_before_quota(
-                    RejectReason.SEED_MISMATCH,
-                    reject_stage="forced_seed_protocol",
+                    protocol_reject,
+                    reject_stage="protocol_contract",
                     submitted_protocol_version=request.protocol_version,
                     required_protocol_version=FORCED_SEED_PROTOCOL_VERSION,
+                    submitted_generation_profile_id=(
+                        request.generation_profile_id
+                    ),
+                    required_generation_profile_id=PROTOCOL_PROFILE_ID,
                 )
 
             legacy_merkle_status = await asyncio.to_thread(
@@ -3954,7 +4034,19 @@ class ValidatorServer:
                 )
             )
 
-        @app.get("/state", response_model=GrpoBatchState)
+        @app.get(
+            "/state",
+            response_model=GrpoBatchState,
+            response_model_exclude=(
+                {
+                    "protocol_version",
+                    "generation_profile_id",
+                    "generation_contract",
+                }
+                if PROTOCOL_VERSION < 3
+                else None
+            ),
+        )
         async def state(env: str | None = None) -> GrpoBatchState:
             """Current window + checkpoint state. Lock-free: reads only the
             batcher's snapshot fields (set at construction) and the atomic
@@ -3995,6 +4087,17 @@ class ValidatorServer:
                 checkpoint_n=cp.checkpoint_n if cp else 0,
                 checkpoint_repo_id=cp.repo_id if cp else None,
                 checkpoint_revision=cp.revision if cp else None,
+                protocol_version=(
+                    PROTOCOL_VERSION if PROTOCOL_VERSION >= 3 else None
+                ),
+                generation_profile_id=(
+                    PROTOCOL_PROFILE_ID if PROTOCOL_VERSION >= 3 else None
+                ),
+                generation_contract=(
+                    dict(PROTOCOL_GENERATION_CONTRACT)
+                    if PROTOCOL_VERSION >= 3
+                    else None
+                ),
                 randomness=batcher.randomness,
             )
 

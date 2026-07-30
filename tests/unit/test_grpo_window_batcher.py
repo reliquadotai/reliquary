@@ -14,6 +14,7 @@ from reliquary.constants import (
     B_BATCH,
     CHALLENGE_K,
     FORCED_SEED_PROTOCOL_VERSION,
+    MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW,
     MAX_SUBMISSIONS_PER_PROMPT,
     M_ROLLOUTS,
 )
@@ -24,6 +25,10 @@ from reliquary.protocol.submission import (
 )
 from reliquary.validator.batcher import GrpoWindowBatcher
 from reliquary.validator.observability import SubmitTelemetry
+from reliquary.validator.proof_scheduler import (
+    GlobalProofScheduler,
+    ProofExecution,
+)
 
 
 class FakeEnv:
@@ -1149,6 +1154,217 @@ def test_failed_submission_does_not_consume_bucket_slot():
     assert set(rewards) == {batch[0].hotkey}
 
 
+def _execute_scheduler_payload(invocation):
+    payload = invocation.candidate.payload
+    submission = payload.execute(payload.batcher.model)
+    return ProofExecution(
+        passed=submission is not None,
+        value=submission,
+    )
+
+
+def test_scheduled_auction_preserves_ranked_winner_and_payout_contract():
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0", "gpu-1"),
+        environments=("openmathinstruct", "opencodeinstruct"),
+        proof_callable=_execute_scheduler_payload,
+        checkpoint_revision="",
+    )
+    try:
+        batcher = _make_batcher(proof_scheduler=scheduler)
+        for prompt_idx in range(B_BATCH + 3):
+            assert batcher.accept_submission(
+                _request(
+                    prompt_idx=prompt_idx,
+                    hotkey=f"hk-{prompt_idx}",
+                )
+            ).accepted
+
+        batch, rewards = batcher.seal_batch()
+
+        assert len(batch) == B_BATCH
+        assert len(rewards) == B_BATCH
+        assert all(
+            row["selected"] == (row["status"] == "selected")
+            for row in batcher.auction_candidates
+        )
+        assert batcher.reward_alignment["reward_alignment_ok"] is True
+        assert batcher.proof_capacity_aborted is False
+        snapshot = scheduler.snapshot()
+        assert snapshot["dispatches_by_environment"][
+            "openmathinstruct"
+        ] == B_BATCH
+    finally:
+        assert scheduler.close()
+
+
+def test_scheduled_forensics_have_capacity_beyond_winner_attempt_ceiling():
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0", "gpu-1"),
+        environments=("openmathinstruct", "opencodeinstruct"),
+        proof_callable=_execute_scheduler_payload,
+        checkpoint_revision="",
+    )
+    try:
+        batcher = _make_batcher(proof_scheduler=scheduler)
+        for prompt_idx in range(2):
+            assert batcher.accept_submission(
+                _request(
+                    prompt_idx=prompt_idx,
+                    hotkey=f"forensic-{prompt_idx}",
+                )
+            ).accepted
+        pending = batcher.pending_submissions()
+        batcher.proof_attempts = MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW
+        batcher._proof_wall_started_at = time.monotonic()
+
+        results = batcher._prove_forensic_scheduled([
+            (pending[0], "utility_counterfactual"),
+            (pending[1], "random_watch"),
+        ])
+
+        assert len(results) == 2
+        assert batcher.forensic_proof_attempts == 2
+        assert (
+            batcher.proof_attempts
+            == MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW + 2
+        )
+    finally:
+        assert scheduler.close()
+
+
+def test_scheduled_forensic_infrastructure_fault_aborts_window():
+    def fail_proof(_invocation):
+        raise RuntimeError("proof device failed")
+
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0",),
+        environments=("openmathinstruct", "opencodeinstruct"),
+        proof_callable=fail_proof,
+        checkpoint_revision="",
+    )
+    try:
+        batcher = _make_batcher(proof_scheduler=scheduler)
+        assert batcher.accept_submission(
+            _request(prompt_idx=1, hotkey="forensic-fault")
+        ).accepted
+        pending = batcher.pending_submissions()[0]
+        batcher._proof_wall_started_at = time.monotonic()
+
+        batcher._prove_forensic_scheduled([
+            (pending, "random_watch"),
+        ])
+
+        assert batcher.proof_capacity_aborted is True
+        assert (
+            batcher.proof_capacity_abort_reason
+            == "proof_execution_error"
+        )
+        assert scheduler.state.value == "faulted"
+    finally:
+        assert scheduler.close()
+
+
+def test_seal_side_effects_wait_for_explicit_global_commit():
+    from reliquary.validator.dedup import RolloutHashSet
+
+    hash_set = RolloutHashSet(retention_windows=50)
+    batcher = _make_batcher(hash_set=hash_set)
+    request = _request(prompt_idx=17, hotkey="hk-transaction")
+    assert batcher.accept_submission(request).accepted
+
+    batch, rewards = batcher.seal_batch(commit_side_effects=False)
+
+    assert len(batch) == 1
+    assert rewards
+    assert not batcher._cooldown.is_in_cooldown(17, batcher.window_start + 1)
+    assert all(
+        rollout_hash not in hash_set
+        for rollout_hash in batch[0].rollout_hashes
+    )
+
+    batcher.commit_seal_side_effects()
+
+    assert batcher._cooldown.is_in_cooldown(17, batcher.window_start + 1)
+    assert all(
+        rollout_hash in hash_set
+        for rollout_hash in batch[0].rollout_hashes
+    )
+    batcher.commit_seal_side_effects()
+
+
+def test_scheduled_proof_deadline_aborts_without_partial_rewards(monkeypatch):
+    import reliquary.validator.batcher as batcher_module
+
+    monkeypatch.setattr(
+        batcher_module,
+        "MAX_PROOF_WALL_SECONDS",
+        0.01,
+    )
+
+    def slow_proof(invocation):
+        time.sleep(0.03)
+        return _execute_scheduler_payload(invocation)
+
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0",),
+        environments=("openmathinstruct", "opencodeinstruct"),
+        proof_callable=slow_proof,
+        checkpoint_revision="",
+        deadline_poll_seconds=0.001,
+    )
+    try:
+        batcher = _make_batcher(proof_scheduler=scheduler)
+        assert batcher.accept_submission(
+            _request(prompt_idx=1, hotkey="hk-deadline")
+        ).accepted
+
+        batch, rewards = batcher.seal_batch()
+
+        assert batch == []
+        assert rewards == {}
+        assert batcher.valid_submissions() == []
+        assert batcher.proof_capacity_aborted is True
+        assert (
+            batcher.proof_capacity_abort_reason
+            == "active_proof_timeout"
+        )
+        assert batcher.reward_alignment["reward_alignment_ok"] is False
+    finally:
+        assert scheduler.close()
+
+
+def test_scheduled_infrastructure_error_aborts_without_miner_debt():
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0",),
+        environments=("openmathinstruct", "opencodeinstruct"),
+        proof_callable=_execute_scheduler_payload,
+        checkpoint_revision="",
+    )
+    try:
+        batcher = _make_batcher(proof_scheduler=scheduler)
+        request = _request(prompt_idx=1, hotkey="hk-infra")
+        assert batcher.accept_submission(request).accepted
+
+        def fail_infrastructure(*_args, **_kwargs):
+            raise RuntimeError("validator model failed")
+
+        batcher._verify_expensive = fail_infrastructure
+        batch, rewards = batcher.seal_batch()
+
+        assert batch == []
+        assert rewards == {}
+        assert batcher.proof_capacity_aborted is True
+        assert (
+            batcher.proof_capacity_abort_reason
+            == "proof_execution_error"
+        )
+        assert batcher.proof_failure_debt("hk-infra") == 0
+        assert scheduler.state.value == "faulted"
+    finally:
+        assert scheduler.close()
+
+
 # ---------------------------------------------------------------------------
 # Drand-round timing gate (v2.3 design A')
 # ---------------------------------------------------------------------------
@@ -1593,6 +1809,69 @@ def _set_eos_completion_lengths(req: BatchSubmissionRequest, lengths: list[int])
         )
         req.rollouts[idx].commit = commit
         req.rollouts[idx].tokens = commit["tokens"]
+
+
+def _grail_with_terminal_pick(
+    *,
+    p_stop: float,
+    terminal_pick_ok: bool,
+):
+    def _fn(commit, model, randomness):
+        prompt_length = int(commit["rollout"]["prompt_length"])
+        challenge_idxs = list(
+            range(prompt_length, prompt_length + CHALLENGE_K)
+        )
+        return ProofResult(
+            all_passed=True,
+            passed=1,
+            checked=1,
+            sketch_diff_max=0,
+            has_sparse_outputs=True,
+            p_stop=p_stop,
+            terminal_pick_ok=terminal_pick_ok,
+            challenge_lp_indices=challenge_idxs,
+            challenge_lp_values=[0.0] * CHALLENGE_K,
+        )
+
+    return _fn
+
+
+def test_rejects_low_probability_eos_that_forced_seed_did_not_pick():
+    req = _request()
+    _set_eos_completion_lengths(req, [CHALLENGE_K] * M_ROLLOUTS)
+    batcher = _make_batcher(
+        verify_commitment_proofs_fn=_grail_with_terminal_pick(
+            p_stop=1e-9,
+            terminal_pick_ok=False,
+        ),
+    )
+
+    assert batcher.accept_submission(req).accepted is True
+    assert (
+        batcher._verify_expensive(batcher.pending_submissions()[-1])
+        is None
+    )
+    assert (
+        batcher.reject_counts[RejectReason.BAD_TERMINATION.value]
+        == 1
+    )
+
+
+def test_accepts_low_probability_eos_when_forced_seed_picked_it():
+    req = _request()
+    _set_eos_completion_lengths(req, [CHALLENGE_K] * M_ROLLOUTS)
+    batcher = _make_batcher(
+        verify_commitment_proofs_fn=_grail_with_terminal_pick(
+            p_stop=1e-9,
+            terminal_pick_ok=True,
+        ),
+    )
+
+    assert batcher.accept_submission(req).accepted is True
+    assert (
+        batcher._verify_expensive(batcher.pending_submissions()[-1])
+        is not None
+    )
 
 
 def test_reject_cap_path_truncations_over_budget():
@@ -3063,6 +3342,35 @@ def test_forced_seed_group_gate_shadow_when_not_enforcing(monkeypatch):
     req = _request(rewards=[1.0] * 4 + [0.0] * 4)
     # Not enforcing -> shadow only: the proof passes at seal, not rejected.
     assert _prove_one(b, req) is not None
+
+
+def test_v3_profile_contract_survives_forced_seed_kill_switch(monkeypatch):
+    import reliquary.validator.batcher as batcher_mod
+
+    monkeypatch.setattr(batcher_mod, "FORCED_SEED_ENFORCE", False)
+    monkeypatch.setattr(batcher_mod, "PROTOCOL_VERSION", 3)
+    monkeypatch.setattr(batcher_mod, "FORCED_SEED_PROTOCOL_VERSION", 3)
+    monkeypatch.setattr(
+        batcher_mod,
+        "PROTOCOL_PROFILE_ID",
+        "qwen35-4b-auction-v3",
+    )
+    batcher = _make_batcher()
+    batcher.current_checkpoint_hash = "checkpoint-v3"
+    request = _request()
+    request.checkpoint_hash = "checkpoint-v3"
+    request.protocol_version = 2
+    request.generation_profile_id = "qwen35-2b-auction-v2"
+
+    response = batcher.accept_submission(request)
+
+    assert response.accepted is False
+    assert response.reason is RejectReason.PROTOCOL_MISMATCH
+
+    request.protocol_version = 3
+    response = batcher.accept_submission(request)
+    assert response.accepted is False
+    assert response.reason is RejectReason.GENERATION_CONTRACT_MISMATCH
 
 
 def _grail_with_cdf_hard_mismatch():

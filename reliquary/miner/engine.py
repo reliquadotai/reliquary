@@ -22,6 +22,10 @@ from reliquary.constants import (
     M_ROLLOUTS,
     PROMPT_RANGE_SIZE,
 )
+from reliquary.protocol.profiles import (
+    ACTIVE_PROTOCOL_PROFILE,
+    to_generation_contract,
+)
 from reliquary.shared.prompt_range import window_prompt_range
 from reliquary.infrastructure import chain
 from reliquary.protocol.submission import RolloutSubmission
@@ -30,6 +34,22 @@ if TYPE_CHECKING:
     from reliquary.environment.base import Environment
 
 logger = logging.getLogger(__name__)
+
+
+def _state_matches_active_protocol(state) -> bool:
+    """Fail closed on v3; retain compatibility with strict legacy v2 state."""
+
+    if ACTIVE_PROTOCOL_PROFILE.protocol_version < 3:
+        return state.protocol_version in (
+            None,
+            ACTIVE_PROTOCOL_PROFILE.protocol_version,
+        )
+    return (
+        state.protocol_version == ACTIVE_PROTOCOL_PROFILE.protocol_version
+        and state.generation_profile_id == ACTIVE_PROTOCOL_PROFILE.profile_id
+        and state.generation_contract
+        == to_generation_contract(ACTIVE_PROTOCOL_PROFILE)
+    )
 
 
 def _initial_runtime_bound_nonce(runtime_fingerprint) -> str:
@@ -470,6 +490,17 @@ class MiningEngine:
                 if state.state != WindowState.OPEN:
                     await asyncio.sleep(1)
                     continue
+                if not _state_matches_active_protocol(state):
+                    logger.error(
+                        "validator generation contract mismatch: local=%s/v%d "
+                        "remote=%s/v%s",
+                        ACTIVE_PROTOCOL_PROFILE.profile_id,
+                        ACTIVE_PROTOCOL_PROFILE.protocol_version,
+                        state.generation_profile_id,
+                        state.protocol_version,
+                    )
+                    await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                    continue
 
                 # v2.3: trust the validator's per-window randomness rather
                 # than recomputing locally. Empty string means the validator
@@ -536,6 +567,11 @@ class MiningEngine:
                     nonce=_initial_runtime_bound_nonce(_runtime_fingerprint),
                     # Rollouts are drawn from the forced-seed stream; advertise it.
                     protocol_version=FORCED_SEED_PROTOCOL_VERSION,
+                    generation_profile_id=(
+                        ACTIVE_PROTOCOL_PROFILE.profile_id
+                        if ACTIVE_PROTOCOL_PROFILE.protocol_version >= 3
+                        else ""
+                    ),
                 )
                 try:
                     resp = await submit_batch_v2(
@@ -649,6 +685,7 @@ class MiningEngine:
         from reliquary.constants import (
             BFT_ANSWER_BUDGET,
             BFT_ENABLED,
+            BFT_FORCE_ANSWER,
             BFT_THINKING_BUDGET,
         )
         from reliquary.miner.forced_seed_sampler import (
@@ -708,9 +745,12 @@ class MiningEngine:
                 **forced_seed_generate_kwargs(base_kwargs, phase1_proc),
             )
 
-            if bft_applicable:
+            if bft_applicable and BFT_FORCE_ANSWER:
                 # Phase-2 answer generation continues on the same forced stream
-                # (identity threaded so it resumes at each row's offset).
+                # (identity threaded so it resumes at each row's offset). Skipped
+                # under clean-cap (BFT_FORCE_ANSWER=False): a rollout that did not
+                # close </think> within the phase-1 budget is left truncated and
+                # grades as bad_termination instead of being force-answered.
                 phase2_kwargs = {"pad_token_id": pad_token_id}
                 if eos_ids:
                     phase2_kwargs["eos_token_id"] = sorted(eos_ids)

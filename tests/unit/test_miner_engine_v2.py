@@ -1,6 +1,7 @@
 """Miner prompt-picking strategy: pull random in-range, skip cooldown."""
 
 import random
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -54,6 +55,53 @@ def test_engine_default_max_new_tokens_is_protocol_cap():
     # `int(os.environ.get("RELIQUARY_MAX_NEW_TOKENS", ...))` default.
     src = inspect.getsource(MiningEngine.__init__)
     assert "RELIQUARY_MAX_NEW_TOKENS" not in src
+
+
+def test_v2_state_contract_accepts_legacy_state_shape():
+    from reliquary.miner.engine import _state_matches_active_protocol
+
+    assert _state_matches_active_protocol(
+        SimpleNamespace(
+            protocol_version=None,
+            generation_profile_id=None,
+            generation_contract=None,
+        )
+    )
+
+
+def test_v3_state_contract_fails_closed(monkeypatch):
+    import reliquary.miner.engine as engine_module
+    from reliquary.protocol.profiles import PROFILES
+
+    profile = PROFILES["qwen35-4b-auction-v3"]
+    monkeypatch.setattr(
+        engine_module,
+        "ACTIVE_PROTOCOL_PROFILE",
+        profile,
+    )
+    exact = SimpleNamespace(
+        protocol_version=3,
+        generation_profile_id=profile.profile_id,
+        generation_contract=profile.to_generation_contract(),
+    )
+    assert engine_module._state_matches_active_protocol(exact)
+    assert not engine_module._state_matches_active_protocol(
+        SimpleNamespace(
+            protocol_version=2,
+            generation_profile_id="",
+            generation_contract=None,
+        )
+    )
+    assert not engine_module._state_matches_active_protocol(
+        SimpleNamespace(
+            protocol_version=3,
+            generation_profile_id=profile.profile_id,
+            generation_contract={
+                **profile.to_generation_contract(),
+                "collection_seconds": 100,
+            },
+        )
+    )
 
 
 @pytest.mark.asyncio

@@ -22,6 +22,7 @@ from typing import Any
 from reliquary.protocol.submission import BatchSubmissionRequest, RejectReason
 
 
+_IMMUTABLE_BUILD_REVISION_PATH = Path("/opt/reliquary/.build-revision")
 _SECRET_KEY_PARTS = (
     "access_key",
     "api_key",
@@ -510,12 +511,35 @@ def log_submission_stage(
     log_structured(logger, level, "validator_submit_lifecycle", fields)
 
 
+def immutable_build_revision() -> str | None:
+    """Return only an exact revision baked into the validator image."""
+
+    try:
+        normalized = (
+            _IMMUTABLE_BUILD_REVISION_PATH.read_text(encoding="ascii")
+            .strip()
+            .lower()
+        )
+    except (OSError, UnicodeError):
+        return None
+    if (
+        len(normalized) == 40
+        and all(character in "0123456789abcdef" for character in normalized)
+    ):
+        return normalized
+    return None
+
+
 @lru_cache(maxsize=1)
 def runtime_revision() -> str | None:
     """Best-effort deployed revision without reading any secret env vars."""
     # Prefer the immutable image-baked revision over deployment env overrides:
     # watchtower preserves container env across image updates, so old compose
     # values like RELIQUARY_IMAGE_REVISION can become stale.
+    baked_revision = immutable_build_revision()
+    if baked_revision is not None:
+        return baked_revision
+
     for name in (
         "RELIQUARY_BUILD_REVISION",
         "RELIQUARY_IMAGE_BUILD_REVISION",
@@ -539,7 +563,7 @@ def runtime_revision() -> str | None:
     repo_root = Path(__file__).resolve().parents[2]
     try:
         return subprocess.check_output(
-            ["git", "rev-parse", "--short=12", "HEAD"],
+            ["git", "rev-parse", "HEAD"],
             cwd=repo_root,
             stderr=subprocess.DEVNULL,
             text=True,

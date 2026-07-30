@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from reliquary.validator.checkpoint import CheckpointStore, ManifestEntry
+from reliquary.validator.checkpoint_profile import CHECKPOINT_PROFILE_NAME
 
 
 class FakeWallet:
@@ -93,6 +94,9 @@ async def test_upload_fn_receives_folder_and_kwargs(tmp_path):
         captured["is_dir_at_upload"] = _P(folder_path).is_dir()
         captured["has_safetensors"] = (_P(folder_path) / "model.safetensors").exists()
         captured["has_config"] = (_P(folder_path) / "config.json").exists()
+        captured["has_profile"] = (
+            _P(folder_path) / CHECKPOINT_PROFILE_NAME
+        ).exists()
         return "captured_revision_sha"
 
     store = CheckpointStore(
@@ -109,6 +113,7 @@ async def test_upload_fn_receives_folder_and_kwargs(tmp_path):
     assert captured["is_dir_at_upload"] is True
     assert captured["has_safetensors"] is True
     assert captured["has_config"] is True
+    assert captured["has_profile"] is True
     assert "5" in captured["commit_message"]
     assert entry.revision == "captured_revision_sha"
 

@@ -134,6 +134,14 @@ RELIQUARY_CHECKPOINT_PUBLISH_INTERVAL_WINDOWS=4
 RELIQUARY_SHAPE_PENALTY=0
 ```
 
+Those values describe the current 2B run. PR #162 carries a dormant,
+versioned 4B contract; do not assemble it from independent environment
+overrides. Its proof fleet, append-only base reset, coordinated miner cutover,
+and rollback procedure are defined in the
+[Qwen3.5-4B auction-v3 production runbook](4b-auction-v3-production-runbook.md).
+Auction-v3 refuses to start without a release-bound capacity manifest and
+profile-stamped checkpoint.
+
 The four-step checkpoint cadence limits behavior-policy staleness. If the ratio
 gate still trips before cadence, the rejected update is excluded and the
 validator publishes only the previously accepted in-memory steps before
@@ -211,7 +219,11 @@ For deeper protocol-level issues (high `GRAIL_FAIL`, batches not sealing, EMA dr
 
 ## What the validator actually enforces
 
-These are the live thresholds the trainer applies on every submission. The same constants are explained from the miner's perspective in [mining.md](mining.md#rejection-reasons).
+These are the current auction-v2 thresholds. Auction-v3 values are an atomic
+protocol profile and are listed in the
+[4B production runbook](4b-auction-v3-production-runbook.md). The same current
+constants are explained from the miner's perspective in
+[mining.md](mining.md#rejection-reasons).
 
 | Constant | Value | Effect |
 |---|---|---|
@@ -220,7 +232,8 @@ These are the live thresholds the trainer applies on every submission. The same 
 | `T_PROTO` | 0.6 | Protocol-fixed sampling temperature (validator's recompute uses this) |
 | `FORCED_SEED_PROTOCOL_VERSION` | 2 | Mandatory hotkey-free forced stream while enforcement is active |
 | `WINDOW_COLLECTION_SECONDS` | 100 | Fixed collection interval for both Math and Code auction populations |
-| `MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW` | 64 | Started grading/proof ceiling per environment/window |
+| `MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW` | 64 | Started admission-grading ceiling per environment/window |
+| `MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW` | 64 (v2), 16 (v3) | Ranked seal-time GPU proof ceiling per environment/window |
 | `MAX_PROOF_WALL_SECONDS` | 240 | Seal-time proof wall-clock ceiling per environment |
 | `MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW` | 4 | Operator-wide seal GPU debt limit per environment |
 | `MAX_SUBMISSION_PAYLOAD_BYTES` | 64 MiB | Per-request parsed JSON payload limit |
@@ -328,6 +341,12 @@ transient R2 failure, but growing depth or old
 `archive_queue_oldest_age_seconds` requires attention.
 `archive_last_uploaded_window` confirms that a recent archive left the retry
 queue.
+
+Auction-v3 additionally reports the global proof scheduler state, queue and
+active work by device, checkpoint readiness, per-environment proof latency,
+capacity qualification, and capacity abort totals. A required scheduler in any
+state other than `running` makes health degraded and prevents a new window from
+opening.
 
 Prompt Parquet range reads prefer exact full files already present in the
 persistent Hugging Face cache. If the range backend fails, the validator may

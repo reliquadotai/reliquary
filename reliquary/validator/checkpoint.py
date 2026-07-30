@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
 
+from reliquary.validator.checkpoint_profile import write_checkpoint_profile
+
 logger = logging.getLogger(__name__)
 
 
@@ -93,6 +95,9 @@ class CheckpointStore:
             # heavy; run it off the event loop so the HTTP server stays
             # responsive while a checkpoint is being written.
             await asyncio.to_thread(self._save, model, self.tokenizer, snapshot_dir)
+            # Bind every published snapshot to the active model/protocol
+            # lineage, including snapshots produced by injected save functions.
+            write_checkpoint_profile(snapshot_dir)
 
             # 2. Upload the whole folder to HF — one commit per checkpoint.
             revision = await self._upload(

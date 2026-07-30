@@ -262,15 +262,23 @@ def verify_termination(
     ``verify_commitment_proofs`` and carried on ``proof`` — there's no
     per-call softmax on a CPU logits tensor.
     """
-    from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
+    from reliquary.constants import (
+        MAX_NEW_TOKENS_PROTOCOL_CAP,
+        max_new_tokens_for_environment,
+    )
 
     tokens = commit["tokens"]
     rollout_meta = commit.get("rollout", {}) or {}
     completion_length = int(rollout_meta.get("completion_length", 0))
     prompt_length = int(rollout_meta.get("prompt_length", 0))
+    protocol_cap = (
+        max_new_tokens_for_environment(env_name)
+        if env_name is not None
+        else MAX_NEW_TOKENS_PROTOCOL_CAP
+    )
 
     if (
-        prompt_length + completion_length >= MAX_NEW_TOKENS_PROTOCOL_CAP
+        prompt_length + completion_length >= protocol_cap
         or (
             env_name == "openmathinstruct"
             and is_forced_bft_cap_termination(commit)
@@ -291,7 +299,7 @@ def verify_termination(
             "termination_fail reason=no_eos_set prompt_length=%d "
             "completion_length=%d total=%d cap=%d",
             prompt_length, completion_length, total_length,
-            MAX_NEW_TOKENS_PROTOCOL_CAP,
+            protocol_cap,
         )
         return False
 
@@ -304,7 +312,7 @@ def verify_termination(
             "termination_fail reason=no_p_stop prompt_length=%d "
             "completion_length=%d total=%d cap=%d last_token=%d",
             prompt_length, completion_length, total_length,
-            MAX_NEW_TOKENS_PROTOCOL_CAP, last_tok,
+            protocol_cap, last_tok,
         )
         return False
 
@@ -315,7 +323,7 @@ def verify_termination(
             "total=%d cap=%d last_token=%d in_eos=%s p_stop=%.5f "
             "min_p=%.3f forced_pick=%s eos_set=%s",
             prompt_length, completion_length, total_length,
-            MAX_NEW_TOKENS_PROTOCOL_CAP,
+            protocol_cap,
             last_tok, in_eos, p_stop, MIN_EOS_PROBABILITY, forced_pick,
             sorted(eos_set),
         )
@@ -338,11 +346,19 @@ def is_cap_truncation(
     miner can force every rollout to max length and bypass the existing
     per-submission truncation budget.
     """
-    from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
+    from reliquary.constants import (
+        MAX_NEW_TOKENS_PROTOCOL_CAP,
+        max_new_tokens_for_environment,
+    )
 
     rollout_meta = commit.get("rollout", {}) or {}
     completion_length = int(rollout_meta.get("completion_length", 0))
     prompt_length = int(rollout_meta.get("prompt_length", 0))
+    protocol_cap = (
+        max_new_tokens_for_environment(env_name)
+        if env_name is not None
+        else MAX_NEW_TOKENS_PROTOCOL_CAP
+    )
     if (
         env_name == "openmathinstruct"
         and is_forced_bft_cap_termination(commit)
@@ -355,7 +371,7 @@ def is_cap_truncation(
     ):
         return False
 
-    if prompt_length + completion_length < MAX_NEW_TOKENS_PROTOCOL_CAP:
+    if prompt_length + completion_length < protocol_cap:
         return False
 
     eos_set = _eos_set_from_model(model, tokenizer)

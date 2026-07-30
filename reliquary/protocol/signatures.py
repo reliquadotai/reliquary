@@ -29,7 +29,9 @@ COMMIT_DOMAIN = b"grail-commit-v1"
 # clients are expected to construct the envelope with the same byte layout
 # the validator expects.
 ENVELOPE_DOMAIN = b"reliquary-envelope-v1"
+ENVELOPE_DOMAIN_V3 = b"reliquary-envelope-v3"
 PRECOMMIT_DOMAIN = b"reliquary-upload-precommit-v2"
+PRECOMMIT_DOMAIN_V3 = b"reliquary-upload-precommit-v3"
 
 
 def hash_commitments(commitments: list[dict]) -> bytes:
@@ -135,6 +137,8 @@ def build_envelope_binding(
     drand_round: int,
     randomness: str,
     nonce: str,
+    protocol_version: int = 0,
+    generation_profile_id: str = "",
 ) -> bytes:
     """Build the canonical message bytes signed by the miner over the
     ``BatchSubmissionRequest`` envelope.
@@ -194,9 +198,26 @@ def build_envelope_binding(
     rand_b = _hex_bytes(randomness)
     nonce_b = (nonce or "").encode("utf-8")
 
+    profile_b = generation_profile_id.encode("utf-8")
+    protocol_b = int(protocol_version).to_bytes(8, "big", signed=False)
+    parts = (
+        hotkey_b,
+        window_b,
+        prompt_b,
+        merkle_b,
+        ckpt_b,
+        round_b,
+        rand_b,
+        nonce_b,
+    )
     h = hashlib.sha256()
-    h.update(ENVELOPE_DOMAIN)
-    for part in (hotkey_b, window_b, prompt_b, merkle_b, ckpt_b, round_b, rand_b, nonce_b):
+    if profile_b:
+        h.update(ENVELOPE_DOMAIN_V3)
+        parts = (*parts, protocol_b, profile_b)
+    else:
+        # Exact legacy binding: existing v2 signatures remain valid.
+        h.update(ENVELOPE_DOMAIN)
+    for part in parts:
         h.update(_len_bytes(part))
         h.update(part)
     return h.digest()
@@ -213,6 +234,8 @@ def sign_envelope(
     drand_round: int,
     randomness: str,
     nonce: str,
+    protocol_version: int = 0,
+    generation_profile_id: str = "",
 ) -> bytes:
     """Sign the canonical envelope binding with the miner's hotkey keypair.
 
@@ -234,6 +257,8 @@ def sign_envelope(
         drand_round=drand_round,
         randomness=randomness,
         nonce=nonce,
+        protocol_version=protocol_version,
+        generation_profile_id=generation_profile_id,
     )
     return wallet.hotkey.sign(msg)  # type: ignore[union-attr]
 
@@ -249,6 +274,8 @@ def verify_envelope_signature(
     randomness: str,
     nonce: str,
     envelope_signature: str,
+    protocol_version: int = 0,
+    generation_profile_id: str = "",
 ) -> bool:
     """Verify ``envelope_signature`` is a valid sr25519 sig of the canonical
     binding under the ``miner_hotkey`` public key.
@@ -279,6 +306,8 @@ def verify_envelope_signature(
             drand_round=drand_round,
             randomness=randomness,
             nonce=nonce,
+            protocol_version=protocol_version,
+            generation_profile_id=generation_profile_id,
         )
         keypair = bt.Keypair(ss58_address=miner_hotkey)  # type: ignore[union-attr]
         return bool(keypair.verify(data=msg, signature=sig_bytes))
@@ -301,6 +330,7 @@ def build_precommit_binding(
     randomness: str,
     protocol_version: int,
     nonce: str,
+    generation_profile_id: str = "",
 ) -> bytes:
     """Build the domain-separated upload-precommit message.
 
@@ -335,7 +365,12 @@ def build_precommit_binding(
         nonce.encode("utf-8"),
     )
     h = hashlib.sha256()
-    h.update(PRECOMMIT_DOMAIN)
+    if generation_profile_id:
+        h.update(PRECOMMIT_DOMAIN_V3)
+        fields = (*fields, generation_profile_id.encode("utf-8"))
+    else:
+        # Exact legacy binding: existing v2 precommit signatures remain valid.
+        h.update(PRECOMMIT_DOMAIN)
     for field in fields:
         h.update(_lp(field))
     return h.digest()

@@ -20,11 +20,23 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-2B"
+from reliquary.constants import (  # noqa: E402
+    DEFAULT_BASE_MODEL,
+    DEFAULT_BASE_MODEL_REVISION,
+)
+from reliquary.validator.checkpoint_profile import (  # noqa: E402
+    active_checkpoint_profile,
+    write_checkpoint_profile,
+)
+
 CHECKPOINT_TITLE = re.compile(r"^checkpoint\s+(\d+)\s*$", re.IGNORECASE)
 IMMUTABLE_REVISION = re.compile(r"^[0-9a-f]{40}$")
 RECOVERY_MANIFEST_NAME = "reliquary_recovery_manifest.json"
@@ -93,6 +105,7 @@ def _build_recovery_manifest(
         "checkpoint_n": checkpoint_n,
         "target_repo": repo_id,
         "parent_commit": parent_commit,
+        "protocol_profile": active_checkpoint_profile(),
         "source": {
             "kind": "local" if local_source else "hub",
             # Do not publish an operator's absolute local filesystem path.
@@ -192,10 +205,18 @@ def main() -> None:
         or os.environ.get("RELIQUARY_CHECKPOINT")
         or DEFAULT_BASE_MODEL
     )
+    source_was_default = not (
+        args.source_model
+        or args.base_model
+        or os.environ.get("RELIQUARY_CHECKPOINT")
+    )
+    source_revision = args.source_revision
+    if source_was_default and source_revision is None:
+        source_revision = DEFAULT_BASE_MODEL_REVISION
     token = _env_or_arg(None, "HF_TOKEN", "HF token")
     source_kwargs = _source_load_kwargs(
         source_model,
-        args.source_revision,
+        source_revision,
         token,
     )
 
@@ -212,7 +233,7 @@ def main() -> None:
 
     print(f"HF repo: {repo_id}")
     print(f"Source model: {source_model}")
-    print(f"Source revision: {args.source_revision or 'local/default'}")
+    print(f"Source revision: {source_revision or 'local'}")
     print(f"Latest checkpoint: {latest_n}")
     print(f"Parent commit: {parent_commit or 'empty-repository'}")
     print(f"Publishing reset as: checkpoint {next_n}")
@@ -244,13 +265,14 @@ def main() -> None:
             max_shard_size=args.max_shard_size,
         )
         tokenizer.save_pretrained(snapshot_dir)
+        write_checkpoint_profile(snapshot_dir)
 
         manifest = _build_recovery_manifest(
             snapshot_dir,
             checkpoint_n=next_n,
             repo_id=repo_id,
             source_model=source_model,
-            source_revision=args.source_revision,
+            source_revision=source_revision,
             parent_commit=parent_commit,
             created_at=datetime.now(timezone.utc).isoformat(),
         )

@@ -20,14 +20,14 @@ from typing import Any, Iterator
 from pydantic import ValidationError
 
 from reliquary.constants import (
-    BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION,
     BOOTSTRAP_SIGMA_MIN,
     BFT_ANSWER_BUDGET,
     BFT_THINKING_BUDGET,
     GRADER_EVAL_TIMEOUT_SECONDS,
-    MAX_NEW_TOKENS_PROTOCOL_CAP,
-    MAX_TRUNCATED_PER_SUBMISSION,
+    ROBUST_TRUNCATION_UTILITY_ENABLED,
     SIGMA_MIN,
+    max_new_tokens_for_environment,
+    max_truncated_for_environment,
 )
 from reliquary.environment.grader_client import (
     GraderClient,
@@ -65,6 +65,7 @@ class AdmissionReceiptBinding:
     drand_round: int
     protocol_version: int
     nonce: str
+    generation_profile_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -126,6 +127,13 @@ class PreparedSubmission:
     preparation_ms: float = 0.0
     reward_grading_ms: float = 0.0
     timed_out: bool = False
+    # Rollouts that ran to the protocol cap without terminating. Carried to the
+    # auction so the group can be valued conservatively (a truncated rollout has
+    # no gradeable answer, and a miner can create one on purpose).
+    truncated_count: int = 0
+    truncated_index: int | None = None
+    attainable_rewards: tuple[float, ...] = ()
+    robust_utility: float | None = None
 
 
 class _AdmissionTimeout(TimeoutError):
@@ -262,6 +270,7 @@ def _binding_matches(
         and environments == {binding.environment}
         and request.drand_round == binding.drand_round
         and request.protocol_version == binding.protocol_version
+        and request.generation_profile_id == binding.generation_profile_id
         and request.nonce == binding.nonce
     )
 
@@ -349,6 +358,86 @@ def _natural_cap_termination(
     return any(int(token) in think_close for token in phase_one)
 
 
+def _classify_termination(rollout, context: AdmissionContext) -> str:
+    """Classify one rollout's termination.
+
+    Returns ``"ok"`` (terminated, or an accepted BFT/natural cap shape),
+    ``"truncated"`` (no EOS, ran to the protocol cap), or a reject reason name
+    (``"bad_schema"`` / ``"tampered"`` / ``"bad_termination"``). Shared by the
+    admission gate and the truncated-rollout count so both read the same
+    predicate.
+    """
+    eos_ids = set(context.eos_token_ids)
+    commit = rollout.commit
+    tokens = list(commit.get("tokens") or [])
+    meta = commit.get("rollout", {}) or {}
+    try:
+        prompt_length = int(meta.get("prompt_length", 0))
+        completion_length = int(meta.get("completion_length", 0))
+    except (TypeError, ValueError, OverflowError):
+        return "bad_schema"
+    completion = tokens[prompt_length: prompt_length + completion_length]
+    if not completion:
+        return "bad_schema"
+    eos_positions = [
+        index
+        for index, token in enumerate(completion)
+        if int(token) in eos_ids
+    ]
+    if eos_positions:
+        if len(eos_positions) > 1 or eos_positions[0] != len(completion) - 1:
+            return "bad_termination"
+        return "ok"
+    if (
+        context.environment == "openmathinstruct"
+        and _forced_cap_termination(meta)
+    ):
+        if not _force_span_valid(tokens, meta, context):
+            return "tampered"
+        return "ok"
+    if _natural_cap_termination(tokens, meta, context):
+        return "ok"
+    if (
+        prompt_length + completion_length
+        < max_new_tokens_for_environment(context.environment)
+    ):
+        return "bad_termination"
+    return "truncated"
+
+
+def count_truncated_rollouts(
+    request: BatchSubmissionRequest,
+    context: AdmissionContext,
+) -> int:
+    """How many rollouts ran to the protocol cap without terminating.
+
+    Feeds the auction's conservative valuation: a truncated rollout has no
+    gradeable answer, so the group is scored under the interpretation least
+    favourable to the miner (see ``conservative_difficulty_score``). Counting
+    only — admission acceptance is decided by ``_termination_reject``.
+    """
+    if not context.eos_token_ids:
+        return 0
+    return sum(
+        1
+        for rollout in request.rollouts
+        if _classify_termination(rollout, context) == "truncated"
+    )
+
+
+def truncated_rollout_indices(
+    request: BatchSubmissionRequest,
+    context: AdmissionContext,
+) -> tuple[int, ...]:
+    if not context.eos_token_ids:
+        return ()
+    return tuple(
+        index
+        for index, rollout in enumerate(request.rollouts)
+        if _classify_termination(rollout, context) == "truncated"
+    )
+
+
 def _termination_reject(
     request: BatchSubmissionRequest,
     context: AdmissionContext,
@@ -356,47 +445,23 @@ def _termination_reject(
     eos_ids = set(context.eos_token_ids)
     if not eos_ids:
         return None
-    max_truncated = (
-        BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION
-        if context.bootstrap
-        else MAX_TRUNCATED_PER_SUBMISSION
+    max_truncated = max_truncated_for_environment(
+        context.environment,
+        bootstrap=context.bootstrap,
     )
     truncated = 0
     for rollout in request.rollouts:
-        commit = rollout.commit
-        tokens = list(commit.get("tokens") or [])
-        meta = commit.get("rollout", {}) or {}
-        try:
-            prompt_length = int(meta.get("prompt_length", 0))
-            completion_length = int(meta.get("completion_length", 0))
-        except (TypeError, ValueError, OverflowError):
+        kind = _classify_termination(rollout, context)
+        if kind == "bad_schema":
             return RejectReason.BAD_SCHEMA
-        completion = tokens[prompt_length: prompt_length + completion_length]
-        if not completion:
-            return RejectReason.BAD_SCHEMA
-        eos_positions = [
-            index
-            for index, token in enumerate(completion)
-            if int(token) in eos_ids
-        ]
-        if eos_positions:
-            if len(eos_positions) > 1 or eos_positions[0] != len(completion) - 1:
+        if kind == "tampered":
+            return RejectReason.TOKEN_TAMPERED
+        if kind == "bad_termination":
+            return RejectReason.BAD_TERMINATION
+        if kind == "truncated":
+            truncated += 1
+            if truncated > max_truncated:
                 return RejectReason.BAD_TERMINATION
-            continue
-        if (
-            context.environment == "openmathinstruct"
-            and _forced_cap_termination(meta)
-        ):
-            if not _force_span_valid(tokens, meta, context):
-                return RejectReason.TOKEN_TAMPERED
-            continue
-        if _natural_cap_termination(tokens, meta, context):
-            continue
-        if prompt_length + completion_length < MAX_NEW_TOKENS_PROTOCOL_CAP:
-            return RejectReason.BAD_TERMINATION
-        truncated += 1
-        if truncated > max_truncated:
-            return RejectReason.BAD_TERMINATION
     return None
 
 
@@ -441,6 +506,8 @@ def parse_and_validate_submission(
                 drand_round=request.drand_round,
                 randomness=context.randomness,
                 nonce=request.nonce,
+                protocol_version=request.protocol_version,
+                generation_profile_id=request.generation_profile_id,
                 envelope_signature=request.envelope_signature,
             ):
                 return _reject_parsed(
@@ -761,7 +828,40 @@ def score_and_finalize_submission(
                     )
 
             rewards = [float(rollout.reward) for rollout in request.rollouts]
-            if not _in_zone(rewards, bootstrap=context.bootstrap):
+            truncated_indices = truncated_rollout_indices(request, context)
+            robust_utility: float | None = None
+            attainable_rewards: tuple[float, ...] = ()
+            if (
+                ROBUST_TRUNCATION_UTILITY_ENABLED
+                and truncated_indices
+            ):
+                from reliquary.validator.difficulty_auction import (
+                    fractional_reward_lattice,
+                    robust_truncation_utility,
+                )
+
+                total_tests = (
+                    max(1, len(materials.code_cases or ()))
+                    if context.environment == "opencodeinstruct"
+                    else 1
+                )
+                attainable_rewards = fractional_reward_lattice(total_tests)
+                robust_utility = robust_truncation_utility(
+                    rewards,
+                    sigma_min=(
+                        BOOTSTRAP_SIGMA_MIN
+                        if context.bootstrap
+                        else SIGMA_MIN
+                    ),
+                    truncated_index=truncated_indices[0],
+                    attainable_rewards=attainable_rewards,
+                )
+            in_zone = (
+                robust_utility > 0.0
+                if robust_utility is not None
+                else _in_zone(rewards, bootstrap=context.bootstrap)
+            )
+            if not in_zone:
                 return PreparedSubmission(
                     request=request,
                     completion_texts=materials.completion_texts,
@@ -781,7 +881,9 @@ def score_and_finalize_submission(
                     rewards[index],
                     text,
                     completion_length=int(meta.get("completion_length", 0)),
-                    cap=MAX_NEW_TOKENS_PROTOCOL_CAP,
+                    cap=max_new_tokens_for_environment(
+                        context.environment
+                    ),
                 )
                 if malformed:
                     return PreparedSubmission(
@@ -827,6 +929,14 @@ def score_and_finalize_submission(
                 rewards=rewards,
                 rollout_hashes=parsed.rollout_hashes,
                 selection_digest=parsed.selection_digest,
+                # Derived from the token stream, so it is unaffected by the
+                # meta["truncated"] reset above.
+                truncated_count=len(truncated_indices),
+                truncated_index=(
+                    truncated_indices[0] if truncated_indices else None
+                ),
+                attainable_rewards=attainable_rewards,
+                robust_utility=robust_utility,
                 body_parse_ms=parsed.body_parse_ms,
                 preparation_ms=(
                     parsed.preparation_ms

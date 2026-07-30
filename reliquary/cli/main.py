@@ -3,6 +3,7 @@
 import asyncio
 import atexit
 import logging
+import math
 import os
 import shutil
 import socket as _socket
@@ -16,9 +17,18 @@ import typer
 
 from reliquary.constants import (
     DEFAULT_BASE_MODEL,
+    DEFAULT_BASE_MODEL_REVISION,
     DEFAULT_ENVIRONMENTS,
     DEFAULT_HF_REPO_ID,
     ENVIRONMENT_MIX,
+    FORENSIC_SAMPLE_PER_WINDOW,
+    MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV,
+    MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW,
+    MAX_PROOF_WALL_SECONDS,
+    PROTOCOL_MODEL_ID,
+    PROTOCOL_MODEL_REVISION,
+    PROTOCOL_PROFILE_ID,
+    PROTOCOL_VERSION,
     VALIDATOR_HTTP_PORT,
 )
 
@@ -29,6 +39,62 @@ app = typer.Typer(name="reliquary", help="Reliquary — Verifiable Inference Sub
 logger = logging.getLogger(__name__)
 
 _grader_proc: "subprocess.Popen | None" = None
+
+
+def _configured_proof_device_identities(torch_module):
+    raw = os.environ.get("RELIQUARY_PROOF_DEVICES", "")
+    requested = tuple(
+        device.strip() for device in raw.split(",") if device.strip()
+    )
+    if PROTOCOL_VERSION < 3:
+        if requested:
+            logger.warning(
+                "Ignoring RELIQUARY_PROOF_DEVICES under protocol profile %s",
+                PROTOCOL_PROFILE_ID,
+            )
+        return ()
+    if not requested:
+        raise RuntimeError(
+            f"{PROTOCOL_PROFILE_ID} requires explicit proof replicas; "
+            "set RELIQUARY_PROOF_DEVICES after capacity qualification"
+        )
+
+    from reliquary.validator.proof_capacity import (
+        resolve_cuda_proof_devices,
+    )
+
+    return resolve_cuda_proof_devices(
+        requested,
+        cuda=torch_module.cuda,
+    )
+
+
+def _v3_activation_checkpoint_revision(
+    checkpoint: str,
+    resume_from: str,
+) -> str | None:
+    if PROTOCOL_VERSION < 3:
+        return None
+    if checkpoint != PROTOCOL_MODEL_ID:
+        raise RuntimeError(
+            f"{PROTOCOL_PROFILE_ID} must bootstrap from "
+            f"{PROTOCOL_MODEL_ID}@{PROTOCOL_MODEL_REVISION}"
+        )
+    prefix = "sha:"
+    revision = (
+        resume_from[len(prefix):].strip().lower()
+        if resume_from.startswith(prefix)
+        else ""
+    )
+    if (
+        len(revision) != 40
+        or any(character not in "0123456789abcdef" for character in revision)
+    ):
+        raise RuntimeError(
+            f"{PROTOCOL_PROFILE_ID} requires "
+            "RELIQUARY_RESUME_FROM=sha:<stamped-40-char-checkpoint>"
+        )
+    return revision
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -261,7 +327,12 @@ def mine(
 
         # --- Load models from resolved path ---
         logger.info("Loading models from %s...", initial_path)
-        tokenizer = load_tokenizer(initial_path)
+        base_load_kwargs = (
+            {"revision": DEFAULT_BASE_MODEL_REVISION}
+            if initial_path == DEFAULT_BASE_MODEL
+            else {}
+        )
+        tokenizer = load_tokenizer(initial_path, **base_load_kwargs)
 
         # Use 2 GPUs when available (vllm on 0, HF proof on 1). Fall back to
         # sharing GPU 0 for test boxes that only expose one device.
@@ -271,12 +342,14 @@ def mine(
             initial_path,
             torch_dtype=torch.bfloat16,
             attn_implementation=ATTN_IMPLEMENTATION,
+            **base_load_kwargs,
         ).to("cuda:0").eval()
 
         hf_model = load_text_generation_model(
             initial_path,
             torch_dtype=torch.bfloat16,
             attn_implementation=ATTN_IMPLEMENTATION,
+            **base_load_kwargs,
         ).to(proof_device).eval()
 
         envs = load_environments(env_names)
@@ -401,14 +474,110 @@ def validate(
             from reliquary.shared.modeling import load_text_generation_model, load_tokenizer
             from reliquary.validator.service import ValidationService
 
+            activation_checkpoint_revision = (
+                _v3_activation_checkpoint_revision(checkpoint, resume_from)
+            )
             logger.info("Loading model from %s...", checkpoint)
-            tokenizer = load_tokenizer(checkpoint)
+            base_load_kwargs = (
+                {"revision": DEFAULT_BASE_MODEL_REVISION}
+                if checkpoint == DEFAULT_BASE_MODEL
+                else {}
+            )
+            tokenizer = load_tokenizer(checkpoint, **base_load_kwargs)
 
             model = load_text_generation_model(
                 checkpoint,
                 torch_dtype=torch.bfloat16,
                 attn_implementation=ATTN_IMPLEMENTATION,
+                **base_load_kwargs,
             ).to("cuda:0").eval()
+
+            proof_device_identities = _configured_proof_device_identities(
+                torch
+            )
+            proof_devices = tuple(
+                identity.device_id for identity in proof_device_identities
+            )
+            proof_capacity_qualification = None
+            if PROTOCOL_VERSION >= 3:
+                from reliquary.shared.runtime_fingerprint import (
+                    collect_runtime_fingerprint,
+                )
+                from reliquary.validator.observability import (
+                    immutable_build_revision,
+                )
+                from reliquary.validator.proof_capacity import (
+                    load_proof_capacity_qualification,
+                )
+
+                manifest_path = os.environ.get(
+                    "RELIQUARY_PROOF_CAPACITY_MANIFEST", ""
+                ).strip()
+                manifest_sha256 = os.environ.get(
+                    "RELIQUARY_PROOF_CAPACITY_MANIFEST_SHA256", ""
+                ).strip()
+                if not manifest_path or not manifest_sha256:
+                    raise RuntimeError(
+                        "auction-v3 requires a pinned proof-capacity manifest"
+                    )
+                qualification = load_proof_capacity_qualification(
+                    manifest_path,
+                    expected_sha256=manifest_sha256,
+                )
+                hardware = tuple(
+                    identity.hardware_class
+                    for identity in proof_device_identities
+                )
+                device_uuids = tuple(
+                    identity.device_uuid
+                    for identity in proof_device_identities
+                )
+                runtime_fingerprint_hash = collect_runtime_fingerprint(
+                    generation_model=model,
+                    proof_model=model,
+                )["profile_hash"]
+                proof_capacity_qualification = qualification.validate(
+                    profile_id=PROTOCOL_PROFILE_ID,
+                    model_revision=PROTOCOL_MODEL_REVISION,
+                    software_revision=immutable_build_revision(),
+                    checkpoint_revision=(
+                        activation_checkpoint_revision or ""
+                    ),
+                    runtime_fingerprint_hash=runtime_fingerprint_hash,
+                    configured_devices=proof_devices,
+                    configured_hardware=hardware,
+                    configured_device_uuids=device_uuids,
+                    proof_wall_seconds=MAX_PROOF_WALL_SECONDS,
+                    minimum_proofs_per_environment=(
+                        MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW
+                        + FORENSIC_SAMPLE_PER_WINDOW
+                    ),
+                    minimum_completion_tokens_per_environment={
+                        environment: math.ceil(cap * 0.9)
+                        for environment, cap in (
+                            MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV.items()
+                        )
+                    },
+                )
+                logger.info(
+                    "Proof capacity qualified: %s",
+                    proof_capacity_qualification,
+                )
+            proof_models = {}
+            for device in proof_devices:
+                if device == "cuda:0":
+                    continue
+                logger.info(
+                    "Loading frozen proof replica on %s from %s",
+                    device,
+                    checkpoint,
+                )
+                proof_models[device] = load_text_generation_model(
+                    checkpoint,
+                    torch_dtype=torch.bfloat16,
+                    attn_implementation=ATTN_IMPLEMENTATION,
+                    **base_load_kwargs,
+                ).to(device).eval()
 
             mix = [(n, w) for n, w in ENVIRONMENT_MIX if n in env_names]
             service = ValidationService(
@@ -424,6 +593,11 @@ def validate(
                 hf_repo_id=hf_repo_id,
                 resume_from=resume_from or None,
                 env_mix=mix if mix else None,
+                proof_devices=proof_devices or None,
+                proof_models=proof_models or None,
+                proof_capacity_qualification=(
+                    proof_capacity_qualification
+                ),
             )
             # Run the weight setter in a dedicated OS thread with its own
             # event loop. asyncio is single-threaded, so any sync blocking

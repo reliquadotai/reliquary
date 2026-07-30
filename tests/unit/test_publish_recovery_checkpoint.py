@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +14,25 @@ from scripts.publish_base_reset_checkpoint import (
     _repo_checkpoint_state,
     _source_load_kwargs,
 )
+from reliquary.validator.checkpoint_profile import active_checkpoint_profile
+
+
+def test_recovery_publisher_help_runs_from_source_checkout(tmp_path):
+    script = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "publish_base_reset_checkpoint.py"
+    )
+    completed = subprocess.run(
+        [sys.executable, str(script), "--help"],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "append-only Reliquary HF checkpoint" in completed.stdout
 
 
 def test_remote_recovery_source_requires_full_immutable_revision():
@@ -76,6 +98,7 @@ def test_recovery_manifest_hashes_snapshot_and_redacts_local_path(tmp_path):
         "repo": None,
         "revision": None,
     }
+    assert manifest["protocol_profile"] == active_checkpoint_profile()
     assert [row["path"] for row in manifest["artifacts"]] == [
         "config.json",
         "model.safetensors",

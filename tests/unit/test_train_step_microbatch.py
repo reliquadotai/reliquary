@@ -92,10 +92,14 @@ def _make_plan(groups):
 
 
 def _reference_grads(model, ref, plan, n_total, device):
+    from reliquary.validator.training import _is_masked_from_loss
+
     for p in model.parameters():
         p.grad = None
     for grp, advs, _scale in plan:
         for r, adv in zip(grp.rollouts, advs):
+            if _is_masked_from_loss(r):
+                continue        # mirrors production: no PPO/KL, no forward
             ppo, kl, n = _rollout_loss(model, ref, r, adv, device=device)
             ((ppo + KL_BETA * kl) * n / n_total).backward()
     return [p.grad.detach().clone() for p in model.parameters() if p.grad is not None]
@@ -151,6 +155,71 @@ def test_microbatch_normalizes_protocol_full_sequence_logprobs():
     assert len(items) == 1
     assert len(items[0][2]) == 4
     assert len(items[0][5]) == 4
+
+
+# ---------------------------------------------------------------------------
+# DAPO overlong filtering: a masked (advantage-0) rollout is skipped from the
+# forward AND the N_e denominator — this is what makes the forced 16k rollouts
+# memory-cheap instead of OOMing.
+# ---------------------------------------------------------------------------
+
+def test_masked_rollout_skipped_from_microbatch_forward(monkeypatch):
+    monkeypatch.setattr("reliquary.constants.MASK_BUDGET_ENDED_FROM_LOSS", True)
+    real = _build_rollout([1, 2, 3, 4, 5, 6], 1.0, 2)
+    masked = _build_rollout([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.0, 2)  # the "16k" analogue
+    masked.commit["rollout"]["forced"] = True
+    plan = [(_FakeGroup([real, masked]), [1.0, 0.0], 1.0)]
+    items = _build_microbatch_items(plan)
+    assert len(items) == 1                       # forced rollout not forwarded
+    assert tuple(items[0][0]) == tuple(real.tokens)
+
+
+def test_natural_zero_advantage_rollout_is_still_forwarded():
+    """REGRESSION: a non-forced rollout whose advantage is exactly 0 (its reward
+    equals the group mean) must still be forwarded — it owes its KL term."""
+    a = _build_rollout([1, 2, 3, 4, 5, 6], 1.0, 2)
+    b = _build_rollout([1, 2, 3, 7, 8, 9], 0.5, 2)      # reward == group mean
+    c = _build_rollout([1, 2, 3, 4, 5, 7], 0.0, 2)
+    advs = _compute_advantages([1.0, 0.5, 0.0])
+    assert advs[1] == 0.0
+    items = _build_microbatch_items([(_FakeGroup([a, b, c]), advs, 1.0)])
+    assert len(items) == 3                             # none dropped
+
+
+def test_masked_forced_rollout_masked_and_skipped_end_to_end(monkeypatch):
+    monkeypatch.setattr("reliquary.constants.SHAPE_PENALTY", 0.0)
+    monkeypatch.setattr("reliquary.constants.MASK_BUDGET_ENDED_FROM_LOSS", True)
+    correct = _build_rollout([1, 2, 3, 4, 5], 1.0, 2)
+    wrong = _build_rollout([1, 2, 3, 6, 7], 0.0, 2)             # wrong, terminated
+    forced = _build_rollout([1, 2, 3, 8, 9, 10, 11], 0.0, 2)    # wrong, forced (long/masked)
+    forced.commit["rollout"]["forced"] = True
+    plan, _ = _plan_from_batches([[_FakeGroup([correct, wrong, forced])]])
+    advs = plan[0][1]
+    assert advs[2] == 0.0                         # forced rollout masked to 0
+    assert advs[0] != 0.0 and advs[1] != 0.0
+    items = _build_microbatch_items(plan)
+    assert len(items) == 2                        # forced (16k analogue) skipped
+    assert all(tuple(it[0]) != tuple(forced.tokens) for it in items)
+
+
+def test_masked_rollout_excluded_from_Ne(monkeypatch):
+    # N_e must drop the masked rollout's tokens; same group with vs without the
+    # would-be-masked forced rollout yields the same per-token scale.
+    monkeypatch.setattr("reliquary.constants.SHAPE_PENALTY", 0.0)
+    monkeypatch.setattr("reliquary.constants.MASK_BUDGET_ENDED_FROM_LOSS", True)
+
+    def grp(with_forced):
+        rs = [_build_rollout([1, 2, 3, 4, 5], 1.0, 2),
+              _build_rollout([1, 2, 3, 6, 7], 0.0, 2)]
+        if with_forced:
+            f = _build_rollout([1, 2, 3, 8, 9, 10, 11], 0.0, 2)
+            f.commit["rollout"]["forced"] = True
+            rs.append(f)
+        return _FakeGroup(rs)
+
+    plan_with, _ = _plan_from_batches([[grp(True)]])
+    plan_without, _ = _plan_from_batches([[grp(False)]])
+    assert plan_with[0][2] == pytest.approx(plan_without[0][2])
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +329,10 @@ def test_microbatch_behavior_recompute_is_claim_invariant():
     assert _rel_l2(grads_a, grads_b) < 1e-7
 
 
-def test_batched_grads_mask_bft_force_span_like_per_rollout():
+def test_batched_grads_mask_bft_force_span_like_per_rollout(monkeypatch):
+    # Flag off (default): the forced rollout still trains, with its force span
+    # masked at token level — the batched path must match per-rollout.
+    monkeypatch.setattr("reliquary.constants.MASK_BUDGET_ENDED_FROM_LOSS", False)
     import copy
 
     torch.manual_seed(3)
@@ -271,11 +343,16 @@ def test_batched_grads_mask_bft_force_span_like_per_rollout():
     # Absolute span [5, 7) -> completion-relative positions 2 and 3.
     forced.commit["rollout"]["force_span"] = [5, 7]
     forced._validated_force_span = (5, 7)
+    # A forced rollout is now masked out of the loss entirely, so the surviving
+    # rollouts must carry the signal — otherwise both paths trivially produce
+    # zero gradients and the comparison is vacuous.
+    winner = _build_rollout([1, 2, 3, 12, 13, 14], 1.0, 3)
     loser = _build_rollout([1, 2, 3, 9, 10, 11], 0.0, 3)
-    group = _FakeGroup([forced, loser])
+    group = _FakeGroup([forced, winner, loser])
     plan, skipped = _plan_from_batches([[group]])
     assert skipped == 0
     assert len(plan) == 1
+    assert plan[0][1][0] != 0.0          # flag off: the forced rollout still trains
     # One present env: scale is 1 / surviving trainable completion tokens.
     n_total = round(1.0 / plan[0][2])
 
@@ -284,6 +361,7 @@ def test_batched_grads_mask_bft_force_span_like_per_rollout():
     m_bat = copy.deepcopy(base)
     bat_grads = _grads_after(m_bat, lambda: _accumulate_grouped_grads(
         m_bat, _frozen(m_bat), plan, device, budget=64, atomic=False))
+    assert sum(float((g ** 2).sum()) for g in ref_grads) > 0.0   # non-vacuous
     assert _rel_l2(bat_grads, ref_grads) < 5e-2
 
 

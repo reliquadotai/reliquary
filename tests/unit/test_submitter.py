@@ -192,11 +192,66 @@ async def test_submit_batch_v2_retries_one_idempotent_precommit_then_reveals(
     assert calls[0][0].endswith("/submit/precommit")
     assert calls[1][0].endswith("/submit/precommit")
     assert calls[0][1] == calls[1][1]
+    assert "generation_profile_id" not in calls[0][1]
     assert calls[2][0].endswith("/submit")
     assert calls[2][1]["drand_round"] == 100
+    assert "generation_profile_id" not in calls[2][1]
     assert len(calls[2][1]["rollouts"]) == 8
     assert calls[2][2]["X-Reliquary-Precommit"] == "receipt-1"
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_submit_batch_v3_serializes_profile_in_precommit_and_reveal(
+    monkeypatch,
+):
+    import reliquary.miner.submitter as submitter
+
+    calls = []
+
+    async def _post(self, url, content=None, headers=None, timeout=None):
+        calls.append((url, json.loads(content), headers))
+        if url.endswith("/submit/precommit"):
+            return httpx.Response(
+                200,
+                json={
+                    "accepted": True,
+                    "reason": RejectReason.ACCEPTED.value,
+                    "receipt_id": "receipt-v3",
+                    "upload_deadline_ts": 123.0,
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "accepted": True,
+                "reason": RejectReason.SUBMITTED.value,
+            },
+        )
+
+    request = _v2_request().model_copy(
+        update={
+            "protocol_version": 3,
+            "generation_profile_id": "qwen35-4b-auction-v3",
+        }
+    )
+    monkeypatch.setattr(submitter, "sign_envelope", lambda **kwargs: b"envelope")
+    monkeypatch.setattr(submitter, "sign_precommit", lambda **kwargs: b"precommit")
+    monkeypatch.setattr(httpx.AsyncClient, "post", _post)
+
+    async with httpx.AsyncClient() as client:
+        response = await submit_batch_v2(
+            "http://fake",
+            request,
+            client=client,
+            wallet=object(),
+            randomness="ab" * 32,
+            drand_round_fn=lambda: 100,
+        )
+
+    assert response.accepted is True
+    assert calls[0][1]["generation_profile_id"] == "qwen35-4b-auction-v3"
+    assert calls[1][1]["generation_profile_id"] == "qwen35-4b-auction-v3"
 
 
 @pytest.mark.asyncio

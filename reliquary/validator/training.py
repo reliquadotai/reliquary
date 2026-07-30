@@ -157,6 +157,51 @@ def _compute_advantages(rewards: list[float]) -> list[float]:
     return [(r - mean) / std for r in rewards]
 
 
+def _is_masked_from_loss(rollout) -> bool:
+    """Whether this rollout is masked out of the policy update (DAPO overlong
+    filtering). Its ending is a BUDGET ARTEFACT, not the model's choice, so it
+    contributes no PPO or KL gradient and its forward is skipped entirely. Two
+    shapes qualify:
+
+      * ``forced``   — math: BFT fired, the answer is an injected guess;
+      * ``truncated`` — code: ran to the cap without EOS, so no usable code block.
+
+    Both grade ~0 and therefore hand the gradient a negative advantage that
+    teaches "generating long is punished" — the exact mechanism by which the
+    first 2B run learned to shorten its math reasoning. Masking only the forced
+    case would leave that pathology in place for code, where truncation runs at
+    ~10%.
+
+    Read from the rollout's validator-set metadata, NEVER inferred from its
+    advantage being 0.0: a legitimate advantage is exactly 0 whenever a reward
+    equals its group mean (common with fractional code rewards), and skipping
+    those would silently drop their KL term and skew the N_e normalisation.
+
+    V3 enables the Math forced-row mask only. Code truncations remain in the
+    loss until an adversarial ablation shows that removing their negative
+    gradient cannot reward deliberate non-termination. The legacy aggregate
+    flag remains an emergency experiment switch for both shapes.
+    """
+    from reliquary.constants import (
+        MASK_BUDGET_ENDED_FROM_LOSS,
+        MASK_CODE_TRUNCATED_FROM_LOSS,
+        MASK_MATH_FORCED_FROM_LOSS,
+    )
+
+    meta = (getattr(rollout, "commit", None) or {}).get("rollout", {}) or {}
+    if bool(meta.get("forced")):
+        return (
+            MASK_BUDGET_ENDED_FROM_LOSS
+            or MASK_MATH_FORCED_FROM_LOSS
+        )
+    if bool(meta.get("truncated")):
+        return (
+            MASK_BUDGET_ENDED_FROM_LOSS
+            or MASK_CODE_TRUNCATED_FROM_LOSS
+        )
+    return False
+
+
 def _shape_advantages(rollouts, advantages):
     """Two-sided length shaping, on ADVANTAGES only (the σ-gate stays on raw
     correctness). Overrides an advantage to −SHAPE_PENALTY when:
@@ -165,24 +210,47 @@ def _shape_advantages(rollouts, advantages):
         (completion_length < SHAPE_LEN_FRAC·BFT_THINKING_BUDGET) and is wrong.
     All inputs are validator-determined (reward re-graded, completion_length
     schema-checked, forced/truncated validator-set). SHAPE_PENALTY == 0 disables
-    it."""
+    it.
+
+    Separately, when ``MASK_BUDGET_ENDED_FROM_LOSS`` is set, a forced (BFT-hit)
+    rollout's advantage is zeroed — masked from the policy update so the model
+    is not taught to shorten its reasoning to dodge the forced-answer penalty.
+    Independent of SHAPE_PENALTY. The group mean/std (computed in
+    _compute_advantages over the FULL group) and the σ-gate are untouched, so
+    only the gradient changes, not the baseline or the reward. The actual skip is
+    driven by ``_is_masked_from_loss`` reading the rollout's metadata, not by this
+    zero — a legitimate advantage is exactly 0 whenever a reward equals its group
+    mean."""
     from reliquary.constants import (
+        MASK_BUDGET_ENDED_FROM_LOSS,
+        MASK_CODE_TRUNCATED_FROM_LOSS,
+        MASK_MATH_FORCED_FROM_LOSS,
         BFT_THINKING_BUDGET,
         SHAPE_LEN_FRAC,
         SHAPE_PENALTY,
     )
 
-    if SHAPE_PENALTY <= 0:
+    if (
+        SHAPE_PENALTY <= 0
+        and not MASK_BUDGET_ENDED_FROM_LOSS
+        and not MASK_MATH_FORCED_FROM_LOSS
+        and not MASK_CODE_TRUNCATED_FROM_LOSS
+    ):
         return advantages
     early_cap = SHAPE_LEN_FRAC * BFT_THINKING_BUDGET
     shaped = list(advantages)
     for i, r in enumerate(rollouts):
         meta = (getattr(r, "commit", None) or {}).get("rollout", {}) or {}
+        if _is_masked_from_loss(r):
+            shaped[i] = 0.0                     # masked from the loss (DAPO)
+            continue                            # and never length-shaped
+        if meta.get("forced"):
+            continue                            # legacy: forced not length-shaped
+        if SHAPE_PENALTY <= 0:
+            continue                            # length shaping off
         if meta.get("truncated"):
             shaped[i] = -SHAPE_PENALTY          # overlong (cap-truncated)
             continue
-        if meta.get("forced"):
-            continue                            # forced rollouts untouched
         correct = float(getattr(r, "reward", 0.0)) > 0.5
         clen = int(meta.get("completion_length", 0))
         if clen < early_cap and not correct:
@@ -464,6 +532,11 @@ def _plan_from_batches(batches, env_weights: Optional[dict] = None):
                 continue
             surviving.append((group, advantages, b_idx))
             for rollout in group.rollouts:
+                # A masked rollout is skipped from the forward
+                # (_build_microbatch_items), so it must also leave the N_e
+                # denominator here or the surviving tokens are under-normalised.
+                if _is_masked_from_loss(rollout):
+                    continue
                 meta = (rollout.commit or {}).get("rollout", {}) or {}
                 old = _completion_token_logprobs(rollout)
                 prompt_length = int(meta.get("prompt_length", 0) or 0)
@@ -1251,6 +1324,11 @@ def _build_microbatch_items(plan):
     items = []
     for group, advantages, scale in plan:
         for rollout, adv in zip(group.rollouts, advantages):
+            if _is_masked_from_loss(rollout):
+                # No PPO or KL gradient, so skip the forward entirely — this is
+                # what keeps a 16k forced rollout from being materialised. Its
+                # tokens also leave N_e in _plan_from_batches.
+                continue
             commit = rollout.commit or {}
             tokens = commit.get("tokens")
             meta = commit.get("rollout", {}) or {}
