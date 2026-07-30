@@ -4325,10 +4325,10 @@ class GrpoWindowBatcher:
             raise RuntimeError("scheduled forensic path requires a scheduler")
         if self._proof_wall_started_at is None:
             return []
-        available_attempts = max(
-            0,
-            MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW - self.proof_attempts,
-        )
+        # V3 capacity qualification reserves the full ranked winner ceiling
+        # plus this independent observational budget. Forensics must not vanish
+        # when an adversarial ranked prefix consumes all winner attempts.
+        available_attempts = FORENSIC_SAMPLE_PER_WINDOW
         selected = sample[:available_attempts]
         if not selected:
             return []

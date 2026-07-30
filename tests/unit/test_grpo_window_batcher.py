@@ -14,6 +14,7 @@ from reliquary.constants import (
     B_BATCH,
     CHALLENGE_K,
     FORCED_SEED_PROTOCOL_VERSION,
+    MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
     MAX_SUBMISSIONS_PER_PROMPT,
     M_ROLLOUTS,
 )
@@ -1193,6 +1194,41 @@ def test_scheduled_auction_preserves_ranked_winner_and_payout_contract():
         assert snapshot["dispatches_by_environment"][
             "openmathinstruct"
         ] == B_BATCH
+    finally:
+        assert scheduler.close()
+
+
+def test_scheduled_forensics_have_capacity_beyond_winner_attempt_ceiling():
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0", "gpu-1"),
+        environments=("openmathinstruct", "opencodeinstruct"),
+        proof_callable=_execute_scheduler_payload,
+        checkpoint_revision="",
+    )
+    try:
+        batcher = _make_batcher(proof_scheduler=scheduler)
+        for prompt_idx in range(2):
+            assert batcher.accept_submission(
+                _request(
+                    prompt_idx=prompt_idx,
+                    hotkey=f"forensic-{prompt_idx}",
+                )
+            ).accepted
+        pending = batcher.pending_submissions()
+        batcher.proof_attempts = MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+        batcher._proof_wall_started_at = time.monotonic()
+
+        results = batcher._prove_forensic_scheduled([
+            (pending[0], "utility_counterfactual"),
+            (pending[1], "random_watch"),
+        ])
+
+        assert len(results) == 2
+        assert batcher.forensic_proof_attempts == 2
+        assert (
+            batcher.proof_attempts
+            == MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW + 2
+        )
     finally:
         assert scheduler.close()
 
