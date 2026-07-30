@@ -30,6 +30,7 @@ class ProofDecisionStatus(str, Enum):
     REJECTED = "rejected"
     ERROR = "error"
     SKIPPED_PROMPT_CLAIMED = "skipped_prompt_claimed"
+    SKIPPED_RESOURCE_LIMIT = "skipped_resource_limit"
     NOT_NEEDED = "not_needed"
     CAPACITY_ABORTED = "capacity_aborted"
 
@@ -70,6 +71,11 @@ class RankedProof:
     rank: int
     prompt_key: Hashable
     payload: Any = field(repr=False)
+    # A proof may consume several failure-debt identities (for example one
+    # hotkey and one operator). Each pair is ``(identity, failure_limit)``.
+    # The scheduler serializes active proofs sharing any identity so a failed
+    # proof is applied before another candidate can bypass the same limit.
+    resources: tuple[tuple[Hashable, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -83,6 +89,12 @@ class ProofPlan:
     required_passes: int
     deadline_at: float
     max_attempts: int | None = None
+    # Winner selection normally stops at ``required_passes``. Forensic plans
+    # instead prove every supplied candidate and ignore pass count.
+    complete_all: bool = False
+    # A genuinely sparse eligible population is not a capacity incident:
+    # empty slots burn. Callers that require exact capacity can leave this off.
+    allow_shortfall: bool = False
 
 
 @dataclass(frozen=True)
@@ -140,6 +152,7 @@ class _JobPhase(str, Enum):
     ACTIVE = "active"
     RAW = "raw"
     SKIPPED = "skipped"
+    RESOURCE_LIMIT = "resource_limit"
     NOT_NEEDED = "not_needed"
     ABORTED = "aborted"
     APPLIED = "applied"
@@ -167,11 +180,15 @@ class _PlanState:
     raw: dict[str, _RawCompletion] = field(default_factory=dict)
     decisions: list[ProofDecision] = field(default_factory=list)
     claimed_prompts: set[Hashable] = field(default_factory=set)
+    resource_failures: dict[Hashable, int] = field(
+        default_factory=lambda: defaultdict(int)
+    )
     active_job_ids: set[str] = field(default_factory=set)
     next_apply_index: int = 0
     attempts_started: int = 0
     passed: int = 0
     stop_dispatch: bool = False
+    completion_reason: str | None = None
     abort_reason: CapacityAbortReason | None = None
     final_result: ProofPlanResult | None = None
 
@@ -264,6 +281,7 @@ class GlobalProofScheduler:
         self._active_by_device: dict[
             str, tuple[_PlanState, str, float] | None
         ] = {device: None for device in self._devices}
+        self._active_resource_keys: set[Hashable] = set()
         self._plans: dict[str, _PlanState] = {}
         self._active_plan_by_environment: dict[
             str, _PlanState | None
@@ -472,6 +490,7 @@ class GlobalProofScheduler:
                 "queue_depth_by_environment": queue_depth,
                 "buffered_results_by_environment": buffered,
                 "active_by_device": active,
+                "active_resource_count": len(self._active_resource_keys),
                 "oldest_queued_age_seconds": (
                     None
                     if oldest_submitted is None
@@ -549,6 +568,10 @@ class GlobalProofScheduler:
     def _validate_plan(plan: ProofPlan) -> None:
         if plan.required_passes < 0:
             raise ValueError("required_passes cannot be negative")
+        if plan.complete_all and plan.required_passes != 0:
+            raise ValueError(
+                "complete_all plans must set required_passes to zero"
+            )
         if plan.max_attempts is not None and plan.max_attempts <= 0:
             raise ValueError("max_attempts must be positive")
         ranks: set[int] = set()
@@ -570,6 +593,23 @@ class GlobalProofScheduler:
                 hash(candidate.prompt_key)
             except TypeError as exc:
                 raise ValueError("prompt_key must be hashable") from exc
+            resource_keys: set[Hashable] = set()
+            for resource_key, failure_limit in candidate.resources:
+                try:
+                    hash(resource_key)
+                except TypeError as exc:
+                    raise ValueError(
+                        "proof resource identity must be hashable"
+                    ) from exc
+                if resource_key in resource_keys:
+                    raise ValueError(
+                        "proof resource identities must be unique per candidate"
+                    )
+                resource_keys.add(resource_key)
+                if failure_limit <= 0:
+                    raise ValueError(
+                        "proof resource failure limits must be positive"
+                    )
 
     @staticmethod
     def _build_plan_state(plan: ProofPlan, now: float) -> _PlanState:
@@ -617,6 +657,9 @@ class GlobalProofScheduler:
                         started_at = self._clock()
                         state.phases[candidate.job_id] = _JobPhase.ACTIVE
                         state.active_job_ids.add(candidate.job_id)
+                        self._active_resource_keys.update(
+                            key for key, _limit in candidate.resources
+                        )
                         state.attempts_started += 1
                         self._active_by_device[device_id] = (
                             state,
@@ -678,7 +721,10 @@ class GlobalProofScheduler:
                     self._totals["proof_errors"] += 1
                 if (
                     state.abort_reason is not None
-                    or state.passed >= state.plan.required_passes
+                    or (
+                        not state.plan.complete_all
+                        and state.passed >= state.plan.required_passes
+                    )
                 ):
                     self._totals["late_results"] += 1
                 self._reevaluate_plan_locked(state)
@@ -732,8 +778,29 @@ class GlobalProofScheduler:
             if position >= len(chain):
                 continue
             job_id = chain[position]
-            if state.phases[job_id] is _JobPhase.PENDING:
-                eligible.append(state.candidate_by_id[job_id])
+            if state.phases[job_id] is not _JobPhase.PENDING:
+                continue
+            candidate = state.candidate_by_id[job_id]
+            exhausted = any(
+                state.resource_failures[resource_key] >= failure_limit
+                for resource_key, failure_limit in candidate.resources
+            )
+            if exhausted:
+                state.phases[job_id] = _JobPhase.RESOURCE_LIMIT
+                continue
+            if any(
+                resource_key in self._active_resource_keys
+                for resource_key, _failure_limit in candidate.resources
+            ):
+                continue
+            eligible.append(candidate)
+        if any(
+            phase is _JobPhase.RESOURCE_LIMIT
+            for phase in state.phases.values()
+        ):
+            self._apply_ready_locked(state)
+            if state.final_result is None:
+                return self._next_candidate_locked(state)
         return min(eligible, key=lambda item: item.rank) if eligible else None
 
     def _reevaluate_plan_locked(self, state: _PlanState) -> None:
@@ -750,9 +817,29 @@ class GlobalProofScheduler:
         if state.abort_reason is not None:
             self._apply_ready_locked(state)
             return
-        if state.passed >= state.plan.required_passes:
+        if (
+            not state.plan.complete_all
+            and state.passed >= state.plan.required_passes
+        ):
             self._stop_after_target_locked(state)
             self._apply_ready_locked(state)
+            return
+
+        if state.plan.complete_all:
+            self._finalize_if_terminal_locked(state)
+            if state.final_result is not None:
+                return
+            if (
+                state.attempts_started >= state.max_attempts
+                and not state.active_job_ids
+                and not any(
+                    phase is _JobPhase.RAW
+                    for phase in state.phases.values()
+                )
+            ):
+                self._abort_plan_locked(
+                    state, CapacityAbortReason.ATTEMPT_LIMIT
+                )
             return
 
         possible_prompts = 0
@@ -766,6 +853,11 @@ class GlobalProofScheduler:
             ):
                 possible_prompts += 1
         if state.passed + possible_prompts < state.plan.required_passes:
+            if state.plan.allow_shortfall:
+                if possible_prompts == 0:
+                    self._stop_with_shortfall_locked(state)
+                    self._apply_ready_locked(state)
+                return
             self._abort_plan_locked(
                 state, CapacityAbortReason.INSUFFICIENT_DISTINCT_PROMPTS
             )
@@ -796,7 +888,10 @@ class GlobalProofScheduler:
                         reason=state.abort_reason.value,
                         raw=raw,
                     )
-                elif state.passed >= state.plan.required_passes:
+                elif (
+                    not state.plan.complete_all
+                    and state.passed >= state.plan.required_passes
+                ):
                     decision = self._synthetic_decision(
                         candidate,
                         ProofDecisionStatus.NOT_NEEDED,
@@ -840,11 +935,17 @@ class GlobalProofScheduler:
                     ProofDecisionStatus.SKIPPED_PROMPT_CLAIMED,
                     reason="higher_ranked_candidate_passed",
                 )
+            elif phase is _JobPhase.RESOURCE_LIMIT:
+                decision = self._synthetic_decision(
+                    candidate,
+                    ProofDecisionStatus.SKIPPED_RESOURCE_LIMIT,
+                    reason="proof_failure_debt",
+                )
             elif phase is _JobPhase.NOT_NEEDED:
                 decision = self._synthetic_decision(
                     candidate,
                     ProofDecisionStatus.NOT_NEEDED,
-                    reason="target_reached",
+                    reason=state.completion_reason or "target_reached",
                 )
             elif phase is _JobPhase.ABORTED:
                 decision = self._synthetic_decision(
@@ -863,6 +964,9 @@ class GlobalProofScheduler:
             state.decisions.append(decision)
             state.phases[candidate.job_id] = _JobPhase.APPLIED
             state.next_apply_index += 1
+            if phase is _JobPhase.RAW:
+                for resource_key, _failure_limit in candidate.resources:
+                    self._active_resource_keys.discard(resource_key)
             self._totals[f"decisions_{decision.status.value}"] += 1
 
             if decision.status is ProofDecisionStatus.PASSED:
@@ -873,10 +977,15 @@ class GlobalProofScheduler:
                 ProofDecisionStatus.REJECTED,
                 ProofDecisionStatus.ERROR,
             ):
+                for resource_key, _failure_limit in candidate.resources:
+                    state.resource_failures[resource_key] += 1
+                state.prompt_positions[candidate.prompt_key] += 1
+            elif decision.status is ProofDecisionStatus.SKIPPED_RESOURCE_LIMIT:
                 state.prompt_positions[candidate.prompt_key] += 1
 
             if (
                 state.abort_reason is None
+                and not state.plan.complete_all
                 and state.passed >= state.plan.required_passes
             ):
                 self._stop_after_target_locked(state)
@@ -892,6 +1001,14 @@ class GlobalProofScheduler:
 
     def _stop_after_target_locked(self, state: _PlanState) -> None:
         state.stop_dispatch = True
+        state.completion_reason = "target_reached"
+        for job_id, phase in state.phases.items():
+            if phase is _JobPhase.PENDING:
+                state.phases[job_id] = _JobPhase.NOT_NEEDED
+
+    def _stop_with_shortfall_locked(self, state: _PlanState) -> None:
+        state.stop_dispatch = True
+        state.completion_reason = "insufficient_distinct_prompts"
         for job_id, phase in state.phases.items():
             if phase is _JobPhase.PENDING:
                 state.phases[job_id] = _JobPhase.NOT_NEEDED
@@ -921,6 +1038,21 @@ class GlobalProofScheduler:
             or state.active_job_ids
         ):
             return
+        if (
+            state.abort_reason is None
+            and not state.plan.complete_all
+            and state.passed < state.plan.required_passes
+        ):
+            if state.plan.allow_shortfall:
+                state.completion_reason = "insufficient_distinct_prompts"
+            else:
+                state.abort_reason = (
+                    CapacityAbortReason.INSUFFICIENT_DISTINCT_PROMPTS
+                )
+                self._totals["capacity_aborts"] += 1
+                self._totals[
+                    "capacity_aborts_insufficient_distinct_prompts"
+                ] += 1
         outcome = (
             ProofPlanOutcome.CAPACITY_ABORTED
             if state.abort_reason is not None

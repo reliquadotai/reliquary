@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import replace
 import threading
 import time
 
@@ -30,12 +31,14 @@ def _candidate(
     *,
     prompt: str | None = None,
     prefix: str = "job",
+    resources: tuple[tuple[str, int], ...] = (),
 ) -> RankedProof:
     return RankedProof(
         job_id=f"{prefix}-{rank}",
         rank=rank,
         prompt_key=prompt or f"prompt-{rank}",
         payload={"rank": rank},
+        resources=resources,
     )
 
 
@@ -120,6 +123,104 @@ def test_one_worker_per_device_prevents_same_device_overlap():
     finally:
         release.set()
         assert scheduler.close()
+
+
+def test_shared_resource_is_serialized_across_devices():
+    release_first = threading.Event()
+    second_started = threading.Event()
+    unrelated_started = threading.Event()
+
+    def prove(invocation):
+        rank = invocation.candidate.rank
+        if rank == 1:
+            assert release_first.wait(2)
+        elif rank == 2:
+            second_started.set()
+        else:
+            unrelated_started.set()
+        return True
+
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0", "gpu-1"),
+        environments=(MATH, CODE),
+        proof_callable=prove,
+        checkpoint_revision="rev-a",
+    )
+    try:
+        handle = scheduler.submit(
+            _plan(
+                "math-window",
+                MATH,
+                [
+                    _candidate(
+                        1,
+                        resources=(("operator-a", 4),),
+                    ),
+                    _candidate(
+                        2,
+                        resources=(("operator-a", 4),),
+                    ),
+                    _candidate(
+                        3,
+                        resources=(("operator-b", 4),),
+                    ),
+                ],
+                required=3,
+            )
+        )
+        assert unrelated_started.wait(2)
+        assert not second_started.is_set()
+        release_first.set()
+        assert second_started.wait(2)
+        assert handle.result(2).outcome is ProofPlanOutcome.COMPLETED
+    finally:
+        release_first.set()
+        assert scheduler.close()
+
+
+def test_resource_failure_limit_skips_identity_and_promotes_other_operator():
+    invoked = []
+
+    def prove(invocation):
+        invoked.append(invocation.candidate.job_id)
+        return invocation.candidate.job_id != "job-1"
+
+    with GlobalProofScheduler(
+        devices=("gpu-0",),
+        environments=(MATH, CODE),
+        proof_callable=prove,
+        checkpoint_revision="rev-a",
+    ) as scheduler:
+        result = scheduler.submit(
+            _plan(
+                "math-window",
+                MATH,
+                [
+                    _candidate(
+                        1,
+                        prompt="first",
+                        resources=(("operator-a", 1),),
+                    ),
+                    _candidate(
+                        2,
+                        prompt="second",
+                        resources=(("operator-a", 1),),
+                    ),
+                    _candidate(
+                        3,
+                        prompt="second",
+                        resources=(("operator-b", 1),),
+                    ),
+                ],
+                required=1,
+            )
+        ).result(2)
+
+    assert invoked == ["job-1", "job-3"]
+    assert result.decisions[1].status is (
+        ProofDecisionStatus.SKIPPED_RESOURCE_LIMIT
+    )
+    assert result.winner_job_ids == ("job-3",)
 
 
 def test_round_robin_dispatch_is_fair_between_environments():
@@ -493,6 +594,57 @@ def test_impossible_distinct_prompt_capacity_aborts_without_proving():
         CapacityAbortReason.INSUFFICIENT_DISTINCT_PROMPTS
     )
     assert result.attempts_started == 0
+
+
+def test_sparse_population_can_complete_with_an_explicit_shortfall():
+    with GlobalProofScheduler(
+        devices=("gpu-0",),
+        environments=(MATH, CODE),
+        proof_callable=lambda _invocation: True,
+        checkpoint_revision="rev-a",
+    ) as scheduler:
+        plan = _plan(
+            "math-window",
+            MATH,
+            [_candidate(1)],
+            required=2,
+        )
+        plan = replace(plan, allow_shortfall=True)
+        result = scheduler.submit(plan).result(2)
+
+    assert result.outcome is ProofPlanOutcome.COMPLETED
+    assert result.abort_reason is None
+    assert result.winner_job_ids == ("job-1",)
+
+
+def test_complete_all_plan_runs_rejected_and_passing_forensic_jobs():
+    invoked = []
+
+    def prove(invocation):
+        invoked.append(invocation.candidate.job_id)
+        return invocation.candidate.rank == 2
+
+    with GlobalProofScheduler(
+        devices=("gpu-0",),
+        environments=(MATH, CODE),
+        proof_callable=prove,
+        checkpoint_revision="rev-a",
+    ) as scheduler:
+        plan = _plan(
+            "math-forensic",
+            MATH,
+            [_candidate(1), _candidate(2)],
+            required=0,
+        )
+        plan = replace(plan, complete_all=True)
+        result = scheduler.submit(plan).result(2)
+
+    assert invoked == ["job-1", "job-2"]
+    assert result.outcome is ProofPlanOutcome.COMPLETED
+    assert [decision.status for decision in result.decisions] == [
+        ProofDecisionStatus.REJECTED,
+        ProofDecisionStatus.PASSED,
+    ]
 
 
 def test_attempt_limit_aborts_partial_success_explicitly():
