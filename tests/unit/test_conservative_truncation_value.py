@@ -146,6 +146,29 @@ def test_pending_submission_uses_conservative_value(monkeypatch):
     assert _pending(1).value < _honest(6)          # manufactured zero gains nothing
 
 
+def test_pending_submission_prefers_exact_robust_utility():
+    from reliquary.validator.batcher import (
+        PendingSubmission,
+        _pending_difficulty_score,
+    )
+
+    pending = PendingSubmission(
+        hotkey="hk",
+        prompt_idx=1,
+        request=None,
+        rewards=_vec(2),
+        drand_round=1,
+        merkle_root=b"\x00" * 32,
+        selection_digest=b"\x00" * 32,
+        truncated_count=1,
+        truncated_index=7,
+        attainable_rewards=(0.0, 1.0),
+        robust_utility=0.123,
+    )
+    assert pending.value == pytest.approx(0.123)
+    assert _pending_difficulty_score(pending).value == pytest.approx(0.123)
+
+
 def test_more_truncations_never_score_higher():
     """Monotone: adding truncations can only widen the interpretation set, so
     the minimum can only fall."""
@@ -160,24 +183,26 @@ def test_more_truncations_never_score_higher():
 
 
 def test_token_budget_is_internally_consistent():
-    """One uniform ~16k ceiling: a forced completion (thinking + force span +
-    answer) must fit under the global cap, with margin for the template."""
-    from reliquary import constants as C
+    """The v3 Math budget fits its cap while Code retains the 32k ceiling."""
+    from reliquary.protocol.profiles import PROFILES
 
-    assert C.MAX_NEW_TOKENS_PROTOCOL_CAP == 16384
-    forced_total = C.BFT_THINKING_BUDGET + C.BFT_ANSWER_BUDGET
-    assert forced_total < C.MAX_NEW_TOKENS_PROTOCOL_CAP
-    assert C.MAX_NEW_TOKENS_PROTOCOL_CAP - forced_total >= 256   # force-span room
+    profile = PROFILES["qwen35-4b-auction-v3"]
+    math = profile.environments["openmathinstruct"]
+    code = profile.environments["opencodeinstruct"]
+    assert math.max_new_tokens == 16384
+    assert code.max_new_tokens == 32768
+    assert math.bft is not None
+    forced_total = math.bft.thinking_budget + math.bft.answer_budget
+    assert forced_total < math.max_new_tokens
+    assert math.max_new_tokens - forced_total >= 256
 
 
 def test_truncation_allowance_is_per_env():
-    """Math keeps the strict allowance (BFT terminates every rollout); code gets
-    room for the 4B's honest looping, which conservative valuation prices."""
+    """Both lanes retain the single-unknown contract."""
     from reliquary import constants as C
 
-    by_env = C.MAX_TRUNCATED_PER_SUBMISSION_BY_ENV
-    assert by_env.get("openmathinstruct", C.MAX_TRUNCATED_PER_SUBMISSION) == 1
-    assert by_env["opencodeinstruct"] >= 2
+    assert C.max_truncated_for_environment("openmathinstruct") == 1
+    assert C.max_truncated_for_environment("opencodeinstruct") == 1
 
 
 def test_collection_window_can_absorb_a_full_budget_generation():

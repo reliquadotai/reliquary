@@ -356,6 +356,100 @@ def test_spawned_worker_deadline_is_terminal():
     assert prepared.timed_out is True
 
 
+def test_robust_code_utility_includes_fractional_sigma_eligibility(
+    monkeypatch,
+):
+    """A fractional unknown that can make sigma ineligible has zero utility."""
+    import reliquary.validator.admission as admission
+
+    initialize_admission_worker(_tokenizer_json())
+    request = _request()
+    for rollout in request.rollouts:
+        rollout.env_name = "opencodeinstruct"
+    parsed = ParsedSubmission(
+        request=request,
+        rollout_hashes=[],
+        selection_digest=compute_rollouts_selection_digest(request.rollouts),
+    )
+    materials = AdmissionProblemMaterials(
+        problem={"prompt": "prompt", "ground_truth": "cases", "id": "p"},
+        rendered_prompt="prompt",
+        code_cases=[{"input": 1}, {"input": 2}],
+    )
+    rewards = [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0]
+    monkeypatch.setattr(admission, "ROBUST_TRUNCATION_UTILITY_ENABLED", True)
+    monkeypatch.setattr(
+        admission,
+        "truncated_rollout_indices",
+        lambda *_args: (7,),
+    )
+    monkeypatch.setattr(
+        admission,
+        "_compute_code_rewards",
+        lambda *_args: list(rewards),
+    )
+
+    prepared = materialize_and_score_submission(
+        parsed,
+        materials,
+        replace(_context(), environment="opencodeinstruct"),
+        time.monotonic() + 5.0,
+    )
+
+    assert prepared.reject_reason is RejectReason.OUT_OF_ZONE
+    assert prepared.reject_stage == "zone"
+
+
+def test_robust_code_utility_is_carried_out_of_preparation(monkeypatch):
+    import reliquary.validator.admission as admission
+
+    initialize_admission_worker(_tokenizer_json())
+    request = _request()
+    for rollout in request.rollouts:
+        rollout.env_name = "opencodeinstruct"
+    parsed = ParsedSubmission(
+        request=request,
+        rollout_hashes=[],
+        selection_digest=compute_rollouts_selection_digest(request.rollouts),
+    )
+    materials = AdmissionProblemMaterials(
+        problem={"prompt": "prompt", "ground_truth": "cases", "id": "p"},
+        rendered_prompt="prompt",
+        code_cases=[{"input": 1}],
+    )
+    rewards = [1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    monkeypatch.setattr(admission, "ROBUST_TRUNCATION_UTILITY_ENABLED", True)
+    monkeypatch.setattr(
+        admission,
+        "truncated_rollout_indices",
+        lambda *_args: (7,),
+    )
+    monkeypatch.setattr(
+        admission,
+        "_compute_code_rewards",
+        lambda *_args: list(rewards),
+    )
+    monkeypatch.setattr(
+        admission,
+        "detect_opposite_reward_clones",
+        lambda *_args: SimpleNamespace(suspicious=False),
+    )
+
+    prepared = materialize_and_score_submission(
+        parsed,
+        materials,
+        replace(_context(), environment="opencodeinstruct"),
+        time.monotonic() + 5.0,
+    )
+
+    assert prepared.reject_reason is None
+    assert prepared.truncated_count == 1
+    assert prepared.truncated_index == 7
+    assert prepared.attainable_rewards == (0.0, 1.0)
+    assert prepared.robust_utility is not None
+    assert prepared.robust_utility > 0.0
+
+
 def test_authenticated_termination_reject_keeps_identity_artifacts():
     request = _request()
     raw_body = request.model_dump_json().encode()

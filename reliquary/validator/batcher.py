@@ -21,7 +21,6 @@ from pydantic import ValidationError
 from reliquary.constants import (
     BATCH_PROMPT_COOLDOWN_WINDOWS,
     B_BATCH,
-    BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION,
     DIFFICULTY_AUCTION_DELTA,
     DIFFICULTY_AUCTION_ENFORCE,
     DIFFICULTY_AUCTION_ENVIRONMENTS,
@@ -31,7 +30,6 @@ from reliquary.constants import (
     DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR,
     MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW,
     MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW,
-    MAX_NEW_TOKENS_PROTOCOL_CAP,
     MIN_EOS_PROBABILITY,
     FORENSIC_SAMPLE_PER_WINDOW,
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
@@ -44,7 +42,6 @@ from reliquary.constants import (
     MAX_SUBMISSION_PAYLOAD_BYTES,
     MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
     MAX_SUBMISSIONS_PER_PROMPT,
-    MAX_TRUNCATED_PER_SUBMISSION,
     PROMPT_RANGE_SIZE,
     PROMPT_RANGE_ENFORCE_FROM_WINDOW,
     REJECTED_LIST_CAP_PER_HOTKEY,
@@ -58,6 +55,8 @@ from reliquary.constants import (
     FORCED_SEED_ENFORCE,
     FORCED_SEED_PROTOCOL_VERSION,
     LEGACY_MERKLE_ROOT_ENFORCE,
+    max_new_tokens_for_environment,
+    max_truncated_for_environment,
 )
 from reliquary.environment.base import Environment
 from reliquary.environment.grader_client import GraderInfrastructureError
@@ -325,10 +324,19 @@ def _pending_difficulty_score(pending):
     Thin adapter over ``auction_difficulty_score`` so ranking here and the value
     stored on the candidate cannot drift apart.
     """
-    return auction_difficulty_score(
+    score = auction_difficulty_score(
         pending.rewards,
         truncated_count=int(getattr(pending, "truncated_count", 0) or 0),
         delta=DIFFICULTY_AUCTION_DELTA,
+    )
+    robust_utility = getattr(pending, "robust_utility", None)
+    if robust_utility is None:
+        return score
+    return type(score)(
+        value=float(robust_utility),
+        mean_reward=score.mean_reward,
+        reward_std=score.reward_std,
+        reward_count=score.reward_count,
     )
 
 
@@ -365,11 +373,19 @@ class PendingSubmission:
     reject_response: BatchSubmissionResponse | None = None
     # Rollouts that ran to the cap without terminating (no gradeable answer).
     truncated_count: int = 0
+    truncated_index: int | None = None
+    attainable_rewards: tuple[float, ...] = ()
+    robust_utility: float | None = None
     value: float = field(init=False, default=0.0)
 
     def __post_init__(self):
-        self.value = auction_value(
-            self.rewards, truncated_count=self.truncated_count
+        self.value = (
+            float(self.robust_utility)
+            if self.robust_utility is not None
+            else auction_value(
+                self.rewards,
+                truncated_count=self.truncated_count,
+            )
         )
 
 @dataclass
@@ -1912,6 +1928,11 @@ class GrpoWindowBatcher:
             request=request,
             rewards=list(prepared.rewards),
             truncated_count=int(getattr(prepared, "truncated_count", 0) or 0),
+            truncated_index=getattr(prepared, "truncated_index", None),
+            attainable_rewards=tuple(
+                getattr(prepared, "attainable_rewards", ()) or ()
+            ),
+            robust_utility=getattr(prepared, "robust_utility", None),
             drand_round=request.drand_round,
             merkle_root=bytes.fromhex(request.merkle_root),
             selection_digest=prepared.selection_digest
@@ -2326,7 +2347,10 @@ class GrpoWindowBatcher:
             _clen = int(_rmeta.get("completion_length", 0))
             _bad, _bad_reason = has_malformed_final_answer(
                 rewards[_ri], _text,
-                completion_length=_clen, cap=MAX_NEW_TOKENS_PROTOCOL_CAP,
+                completion_length=_clen,
+                cap=max_new_tokens_for_environment(
+                    str(getattr(self.env, "name", ""))
+                ),
             )
             if _bad:
                 logger.info(
@@ -2627,10 +2651,9 @@ class GrpoWindowBatcher:
         # Cap/non-EOS truncation is tolerated only as a rare one-rollout
         # accident. Multiple missing-EOS rollouts in the same group are a
         # sampling policy and make weak loser slots too easy to manufacture.
-        max_truncated_per_submission = (
-            BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION
-            if self.bootstrap
-            else MAX_TRUNCATED_PER_SUBMISSION
+        max_truncated_per_submission = max_truncated_for_environment(
+            str(getattr(self.env, "name", "")),
+            bootstrap=self.bootstrap,
         )
         truncated_count = 0
         truncated_flags = [False] * len(request.rollouts)

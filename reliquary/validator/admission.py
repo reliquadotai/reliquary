@@ -20,15 +20,14 @@ from typing import Any, Iterator
 from pydantic import ValidationError
 
 from reliquary.constants import (
-    BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION,
     BOOTSTRAP_SIGMA_MIN,
     BFT_ANSWER_BUDGET,
     BFT_THINKING_BUDGET,
     GRADER_EVAL_TIMEOUT_SECONDS,
-    MAX_NEW_TOKENS_PROTOCOL_CAP,
-    MAX_TRUNCATED_PER_SUBMISSION,
-    MAX_TRUNCATED_PER_SUBMISSION_BY_ENV,
+    ROBUST_TRUNCATION_UTILITY_ENABLED,
     SIGMA_MIN,
+    max_new_tokens_for_environment,
+    max_truncated_for_environment,
 )
 from reliquary.environment.grader_client import (
     GraderClient,
@@ -132,6 +131,9 @@ class PreparedSubmission:
     # auction so the group can be valued conservatively (a truncated rollout has
     # no gradeable answer, and a miner can create one on purpose).
     truncated_count: int = 0
+    truncated_index: int | None = None
+    attainable_rewards: tuple[float, ...] = ()
+    robust_utility: float | None = None
 
 
 class _AdmissionTimeout(TimeoutError):
@@ -395,7 +397,10 @@ def _classify_termination(rollout, context: AdmissionContext) -> str:
         return "ok"
     if _natural_cap_termination(tokens, meta, context):
         return "ok"
-    if prompt_length + completion_length < MAX_NEW_TOKENS_PROTOCOL_CAP:
+    if (
+        prompt_length + completion_length
+        < max_new_tokens_for_environment(context.environment)
+    ):
         return "bad_termination"
     return "truncated"
 
@@ -420,6 +425,19 @@ def count_truncated_rollouts(
     )
 
 
+def truncated_rollout_indices(
+    request: BatchSubmissionRequest,
+    context: AdmissionContext,
+) -> tuple[int, ...]:
+    if not context.eos_token_ids:
+        return ()
+    return tuple(
+        index
+        for index, rollout in enumerate(request.rollouts)
+        if _classify_termination(rollout, context) == "truncated"
+    )
+
+
 def _termination_reject(
     request: BatchSubmissionRequest,
     context: AdmissionContext,
@@ -427,12 +445,9 @@ def _termination_reject(
     eos_ids = set(context.eos_token_ids)
     if not eos_ids:
         return None
-    max_truncated = (
-        BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION
-        if context.bootstrap
-        else MAX_TRUNCATED_PER_SUBMISSION_BY_ENV.get(
-            context.environment, MAX_TRUNCATED_PER_SUBMISSION
-        )
+    max_truncated = max_truncated_for_environment(
+        context.environment,
+        bootstrap=context.bootstrap,
     )
     truncated = 0
     for rollout in request.rollouts:
@@ -813,7 +828,40 @@ def score_and_finalize_submission(
                     )
 
             rewards = [float(rollout.reward) for rollout in request.rollouts]
-            if not _in_zone(rewards, bootstrap=context.bootstrap):
+            truncated_indices = truncated_rollout_indices(request, context)
+            robust_utility: float | None = None
+            attainable_rewards: tuple[float, ...] = ()
+            if (
+                ROBUST_TRUNCATION_UTILITY_ENABLED
+                and truncated_indices
+            ):
+                from reliquary.validator.difficulty_auction import (
+                    fractional_reward_lattice,
+                    robust_truncation_utility,
+                )
+
+                total_tests = (
+                    max(1, len(materials.code_cases or ()))
+                    if context.environment == "opencodeinstruct"
+                    else 1
+                )
+                attainable_rewards = fractional_reward_lattice(total_tests)
+                robust_utility = robust_truncation_utility(
+                    rewards,
+                    sigma_min=(
+                        BOOTSTRAP_SIGMA_MIN
+                        if context.bootstrap
+                        else SIGMA_MIN
+                    ),
+                    truncated_index=truncated_indices[0],
+                    attainable_rewards=attainable_rewards,
+                )
+            in_zone = (
+                robust_utility > 0.0
+                if robust_utility is not None
+                else _in_zone(rewards, bootstrap=context.bootstrap)
+            )
+            if not in_zone:
                 return PreparedSubmission(
                     request=request,
                     completion_texts=materials.completion_texts,
@@ -833,7 +881,9 @@ def score_and_finalize_submission(
                     rewards[index],
                     text,
                     completion_length=int(meta.get("completion_length", 0)),
-                    cap=MAX_NEW_TOKENS_PROTOCOL_CAP,
+                    cap=max_new_tokens_for_environment(
+                        context.environment
+                    ),
                 )
                 if malformed:
                     return PreparedSubmission(
@@ -881,7 +931,12 @@ def score_and_finalize_submission(
                 selection_digest=parsed.selection_digest,
                 # Derived from the token stream, so it is unaffected by the
                 # meta["truncated"] reset above.
-                truncated_count=count_truncated_rollouts(request, context),
+                truncated_count=len(truncated_indices),
+                truncated_index=(
+                    truncated_indices[0] if truncated_indices else None
+                ),
+                attainable_rewards=attainable_rewards,
+                robust_utility=robust_utility,
                 body_parse_ms=parsed.body_parse_ms,
                 preparation_ms=(
                     parsed.preparation_ms
