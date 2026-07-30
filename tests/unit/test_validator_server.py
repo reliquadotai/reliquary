@@ -1093,6 +1093,22 @@ def test_health_degrades_when_registration_cache_is_unavailable():
     assert health["registration_cache_usable"] is False
 
 
+def test_health_degrades_on_proof_plane_runtime_signal():
+    server = ValidatorServer()
+    server.configure_proof_scheduler_health(lambda: {
+        "required": True,
+        "state": "running",
+        "degraded_reasons": ["active_proof_over_wall"],
+    })
+
+    health = TestClient(server.app).get("/health").json()
+
+    assert health["status"] == "degraded"
+    assert health["proof_scheduler"]["degraded_reasons"] == [
+        "active_proof_over_wall"
+    ]
+
+
 def test_submit_503_when_no_active_batcher():
     from reliquary.protocol.submission import WindowState
     server = ValidatorServer()

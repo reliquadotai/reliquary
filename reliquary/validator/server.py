@@ -1734,6 +1734,7 @@ class ValidatorServer:
                     proof_scheduler.get("required") is True
                     and proof_scheduler.get("state") != "running"
                 )
+                or bool(proof_scheduler.get("degraded_reasons"))
                 or self._process_health_snapshot.get("status")
                 in {"warning", "critical"}
             )

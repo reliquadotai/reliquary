@@ -93,6 +93,114 @@ async def test_cross_environment_abort_discards_all_seal_side_effects():
     )
 
 
+@pytest.mark.asyncio
+async def test_faulted_proof_scheduler_archives_then_requires_restart():
+    from reliquary.validator.proof_scheduler import SchedulerState
+    from reliquary.validator.service import FatalProofPlaneError
+
+    svc = _make_service()
+    batcher = MagicMock()
+    batcher.beacon_invalid = False
+    batcher.auction_admission_aborted = False
+    batcher.proof_capacity_aborted = True
+    batcher.proof_capacity_abort_reason = "active_proof_timeout"
+    batcher.seal_batch.return_value = ([], {})
+    svc._active_batchers = {"openmathinstruct": batcher}
+    svc.proof_scheduler = SimpleNamespace(state=SchedulerState.FAULTED)
+    svc._fetch_seal_randomness = AsyncMock(return_value="ab" * 32)
+    svc._enqueue_aborted_window = MagicMock()
+
+    with pytest.raises(FatalProofPlaneError, match="restart required"):
+        await svc._train_and_publish()
+
+    batcher.discard_seal_side_effects.assert_called_once_with()
+    svc._enqueue_aborted_window.assert_called_once_with(
+        failure_stage="proof_capacity",
+        failure_type="ProofCapacityAbort",
+    )
+
+
+@pytest.mark.asyncio
+async def test_quiesced_replica_refresh_retries_at_next_boundary():
+    from reliquary.validator.proof_scheduler import SchedulerState
+
+    svc = _make_service()
+
+    class _Scheduler:
+        state = SchedulerState.QUIESCED
+        revision = None
+
+        def checkpoint_ready(self, revision):
+            return (
+                self.state is SchedulerState.RUNNING
+                and self.revision == revision
+            )
+
+    scheduler = _Scheduler()
+    svc.proof_scheduler = scheduler
+    svc._checkpoint_store = MagicMock()
+    svc._checkpoint_store.current_manifest.return_value = SimpleNamespace(
+        revision="checkpoint-a"
+    )
+    calls = []
+
+    def _refresh(revision):
+        calls.append(revision)
+        if len(calls) == 1:
+            raise RuntimeError("transient replica load failure")
+        scheduler.revision = revision
+        scheduler.state = SchedulerState.RUNNING
+
+    svc._synchronize_proof_models = MagicMock(side_effect=_refresh)
+
+    with pytest.raises(RuntimeError, match="transient replica load failure"):
+        await svc._ensure_proof_scheduler_ready()
+    assert scheduler.state is SchedulerState.QUIESCED
+
+    await svc._ensure_proof_scheduler_ready()
+
+    assert calls == ["checkpoint-a", "checkpoint-a"]
+    assert scheduler.checkpoint_ready("checkpoint-a")
+
+
+@pytest.mark.asyncio
+async def test_faulted_scheduler_cannot_reach_window_open():
+    from reliquary.validator.proof_scheduler import SchedulerState
+    from reliquary.validator.service import FatalProofPlaneError
+
+    svc = _make_service()
+    svc.proof_scheduler = SimpleNamespace(state=SchedulerState.FAULTED)
+
+    with pytest.raises(FatalProofPlaneError, match="process restart"):
+        await svc._ensure_proof_scheduler_ready()
+
+
+def test_proof_scheduler_health_flags_hung_and_recent_abort(monkeypatch):
+    import reliquary.validator.service as service_module
+
+    svc = _make_service()
+    monkeypatch.setattr(service_module, "PROTOCOL_VERSION", 3)
+    svc.proof_capacity_qualification = {"qualified": True}
+    svc.proof_scheduler = SimpleNamespace(
+        snapshot=lambda: {
+            "state": "running",
+            "active_checkpoint_revision": "checkpoint-a",
+            "device_revisions": {"cuda:0": "checkpoint-a"},
+            "active_by_device": {
+                "cuda:0": {"age_seconds": 241.0},
+            },
+            "last_capacity_abort_age_seconds": 10.0,
+        }
+    )
+
+    snapshot = svc._proof_scheduler_health_snapshot()
+
+    assert snapshot["degraded_reasons"] == [
+        "active_proof_over_wall",
+        "recent_capacity_abort",
+    ]
+
+
 def test_open_window_sets_state_to_open():
     svc = _make_service()
     svc._open_window()

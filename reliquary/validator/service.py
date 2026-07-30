@@ -813,8 +813,45 @@ class ValidationService:
                 "required": PROTOCOL_VERSION >= 3,
                 "profile_id": PROTOCOL_PROFILE_ID,
                 "configured_devices": [],
+                "degraded_reasons": (
+                    ["required_scheduler_missing"]
+                    if PROTOCOL_VERSION >= 3
+                    else []
+                ),
             }
         snapshot = scheduler.snapshot()
+        degraded_reasons: list[str] = []
+        state = snapshot.get("state")
+        if PROTOCOL_VERSION >= 3 and state != SchedulerState.RUNNING.value:
+            degraded_reasons.append("scheduler_not_running")
+        active_revision = snapshot.get("active_checkpoint_revision")
+        device_revisions = snapshot.get("device_revisions", {})
+        if active_revision and any(
+            revision != active_revision
+            for revision in device_revisions.values()
+        ):
+            degraded_reasons.append("checkpoint_replica_mismatch")
+        active_ages = [
+            float(active["age_seconds"])
+            for active in snapshot.get("active_by_device", {}).values()
+            if active is not None and active.get("age_seconds") is not None
+        ]
+        if active_ages and max(active_ages) > MAX_PROOF_WALL_SECONDS:
+            degraded_reasons.append("active_proof_over_wall")
+        abort_age = snapshot.get("last_capacity_abort_age_seconds")
+        if (
+            abort_age is not None
+            and float(abort_age) <= MAX_PROOF_WALL_SECONDS * 2.0
+        ):
+            degraded_reasons.append("recent_capacity_abort")
+        if (
+            PROTOCOL_VERSION >= 3
+            and getattr(self, "proof_capacity_qualification", {}).get(
+                "qualified"
+            )
+            is not True
+        ):
+            degraded_reasons.append("capacity_not_qualified")
         snapshot.update({
             "required": PROTOCOL_VERSION >= 3,
             "profile_id": PROTOCOL_PROFILE_ID,
@@ -824,6 +861,7 @@ class ValidationService:
             "capacity_qualification": dict(
                 getattr(self, "proof_capacity_qualification", {})
             ),
+            "degraded_reasons": degraded_reasons,
         })
         return snapshot
 
@@ -837,8 +875,15 @@ class ValidationService:
             raise RuntimeError(
                 "proof scheduler requires a published checkpoint revision"
             )
-        if scheduler.checkpoint_ready(checkpoint_revision):
+        if (
+            scheduler.state is SchedulerState.RUNNING
+            and scheduler.checkpoint_ready(checkpoint_revision)
+        ):
             return
+        if scheduler.state is SchedulerState.FAULTED:
+            raise FatalProofPlaneError(
+                "proof scheduler is faulted and requires process restart"
+            )
         if scheduler.state is SchedulerState.RUNNING:
             if not scheduler.drain(
                 timeout=MAX_PROOF_WALL_SECONDS + 60.0
@@ -877,6 +922,38 @@ class ValidationService:
                 )
             scheduler.mark_device_ready(device, checkpoint_revision)
         scheduler.resume(checkpoint_revision)
+
+    async def _ensure_proof_scheduler_ready(self) -> None:
+        """Recover replicas at a quiescent boundary before opening a window."""
+
+        scheduler = self.proof_scheduler
+        if scheduler is None:
+            return
+        if scheduler.state is SchedulerState.FAULTED:
+            raise FatalProofPlaneError(
+                "proof scheduler is faulted and requires process restart"
+            )
+        checkpoint = self._checkpoint_store.current_manifest()
+        if checkpoint is None or not checkpoint.revision:
+            raise RuntimeError(
+                "scheduled proving requires a published checkpoint"
+            )
+        if (
+            scheduler.state is SchedulerState.RUNNING
+            and scheduler.checkpoint_ready(checkpoint.revision)
+        ):
+            return
+        await asyncio.to_thread(
+            self._synchronize_proof_models,
+            checkpoint.revision,
+        )
+        if not (
+            scheduler.state is SchedulerState.RUNNING
+            and scheduler.checkpoint_ready(checkpoint.revision)
+        ):
+            raise RuntimeError(
+                "proof scheduler replica recovery did not become ready"
+            )
 
     @property
     def _active_batcher(self):
@@ -3190,16 +3267,7 @@ class ValidationService:
             raise RuntimeError(
                 "auction-v3 proof capacity is not qualified"
             )
-        if self.proof_scheduler is not None:
-            checkpoint = self._checkpoint_store.current_manifest()
-            if checkpoint is None:
-                raise RuntimeError(
-                    "scheduled proving requires a published checkpoint"
-                )
-            await asyncio.to_thread(
-                self._synchronize_proof_models,
-                checkpoint.revision,
-            )
+        await self._ensure_proof_scheduler_ready()
         self._publish_window_preparation_state()
         await self._rebuild_cooldown_from_history()
         await self._restore_content_cooldown()
@@ -3235,6 +3303,12 @@ class ValidationService:
                     await self._refresh_registered_hotkeys(
                         reason="epoch_boundary"
                     )
+                    self._window_iteration_stage = "proof_replica_refresh"
+                    if self._candidate_window_n is not None:
+                        self._set_window_preparation_stage(
+                            "proof_replica_refresh"
+                        )
+                    await self._ensure_proof_scheduler_ready()
                     self._window_iteration_stage = "open"
                     self._open_window()
                     self._window_iteration_stage = "admission_pools"
