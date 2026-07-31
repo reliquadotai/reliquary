@@ -190,7 +190,9 @@ def test_token_budget_is_internally_consistent():
     math = profile.environments["openmathinstruct"]
     code = profile.environments["opencodeinstruct"]
     assert math.max_new_tokens == 16384
-    assert code.max_new_tokens == 32768
+    # One uniform ceiling: Code has no BFT, so a higher cap only lets a group
+    # run past the collection window and lose every rollout.
+    assert code.max_new_tokens == 16384
     assert math.bft is not None
     forced_total = math.bft.thinking_budget + math.bft.answer_budget
     assert forced_total < math.max_new_tokens
@@ -201,8 +203,11 @@ def test_truncation_allowance_is_per_env():
     """Both lanes retain the single-unknown contract."""
     from reliquary import constants as C
 
+    # Math keeps one: BFT terminates every rollout, so a truncated math rollout
+    # means a non-compliant client. Code has no BFT and the 4B loops on ~10% of
+    # its rollouts, where a ceiling of one rejects ~19% of HONEST groups whole.
     assert C.max_truncated_for_environment("openmathinstruct") == 1
-    assert C.max_truncated_for_environment("opencodeinstruct") == 1
+    assert C.max_truncated_for_environment("opencodeinstruct") == 3
 
 
 def test_collection_window_can_absorb_a_full_budget_generation():

@@ -188,7 +188,7 @@ _PROFILE_VALUES = (
                 ),
             ),
             "opencodeinstruct": EnvironmentProfile(
-                max_new_tokens=32768,
+                max_new_tokens=16384,
                 bft=None,
             ),
         },
