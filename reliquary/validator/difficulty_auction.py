@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import functools
 import math
+from math import comb
 from collections import Counter
 from dataclasses import dataclass
 from typing import Callable, Iterable
@@ -129,11 +130,15 @@ def fractional_reward_lattice(total_tests: int) -> tuple[float, ...]:
     return tuple(passed / total_tests for passed in range(total_tests + 1))
 
 
+ROBUST_UTILITY_MAX_OUTCOMES = 200_000
+
+
 def robust_truncation_utility(
     rewards: Iterable[float],
     *,
     sigma_min: float,
     truncated_index: int | None = None,
+    truncated_indices: Iterable[int] = (),
     attainable_rewards: Iterable[float] = (),
     delta: float = 1.0,
 ) -> float:
@@ -142,22 +147,29 @@ def robust_truncation_utility(
     A truncated rollout has an unknown reward. Replacing it with every value in
     its exact environment-specific lattice and minimizing the *gated* utility
     prevents a manufactured truncation from improving either sigma eligibility
-    or auction difficulty. At most one rollout is unknown by construction.
+    or auction difficulty. Several rollouts may be unknown; every joint
+    assignment is priced, so the guarantee does not weaken as the per-
+    environment truncation allowance rises.
     """
     values = tuple(float(reward) for reward in rewards)
-    if truncated_index is None:
+    indices = tuple(truncated_indices)
+    if truncated_index is not None:
+        indices = (truncated_index, *indices)
+    indices = tuple(dict.fromkeys(indices))
+    if not indices:
         return gated_difficulty_utility(
             values,
             sigma_min=sigma_min,
             delta=delta,
         )
-    if (
-        isinstance(truncated_index, bool)
-        or not isinstance(truncated_index, int)
-        or truncated_index < 0
-        or truncated_index >= len(values)
-    ):
-        raise ValueError("truncated index must identify one reward")
+    for index in indices:
+        if (
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or index < 0
+            or index >= len(values)
+        ):
+            raise ValueError("truncated index must identify one reward")
 
     lattice = tuple(dict.fromkeys(float(reward) for reward in attainable_rewards))
     if not lattice:
@@ -171,10 +183,23 @@ def robust_truncation_utility(
     # replaced below. A malformed validator reward should never be hidden.
     difficulty_score(values, delta=delta)
 
+    # The score is symmetric in the rewards, so distinct OUTCOMES are multisets
+    # of assignments, not ordered tuples: enumerate combinations with
+    # replacement rather than the full product.
+    from itertools import combinations_with_replacement
+
+    outcome_count = comb(len(lattice) + len(indices) - 1, len(indices))
+    if outcome_count > ROBUST_UTILITY_MAX_OUTCOMES:
+        # Refuse to guess. Returning 0 makes the candidate ineligible, which is
+        # the SAFE direction: a miner can never widen its own lattice to buy a
+        # pass, only to be rejected.
+        return 0.0
+
     utilities: list[float] = []
-    for attainable_reward in lattice:
+    for assignment in combinations_with_replacement(lattice, len(indices)):
         outcome = list(values)
-        outcome[truncated_index] = attainable_reward
+        for index, attainable_reward in zip(indices, assignment):
+            outcome[index] = attainable_reward
         utilities.append(
             gated_difficulty_utility(
                 outcome,
