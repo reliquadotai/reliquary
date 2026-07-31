@@ -50,7 +50,7 @@ def test_capacity_qualifier_binds_full_representative_evidence(
     rows = []
     for environment, length in (
         ("openmathinstruct", 14_746),
-        ("opencodeinstruct", 29_492),
+        ("opencodeinstruct", 14_746),
     ):
         for _index in range(20):
             rows.append({

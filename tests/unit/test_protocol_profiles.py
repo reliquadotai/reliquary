@@ -18,6 +18,7 @@ from reliquary.protocol import profiles
         "protocol_version",
         "collection_seconds",
         "math_cap",
+        "code_cap",
         "thinking_budget",
     ),
     [
@@ -28,6 +29,7 @@ from reliquary.protocol import profiles
             2,
             100,
             32768,
+            32768,
             2048,
         ),
         (
@@ -36,6 +38,7 @@ from reliquary.protocol import profiles
             "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
             3,
             300,
+            16384,
             16384,
             15616,
         ),
@@ -48,6 +51,7 @@ def test_versioned_profile_contracts(
     protocol_version,
     collection_seconds,
     math_cap,
+    code_cap,
     thinking_budget,
 ):
     profile = profiles.PROFILES[profile_id]
@@ -75,7 +79,7 @@ def test_versioned_profile_contracts(
     )
 
     code = profile.environments["opencodeinstruct"]
-    assert code.max_new_tokens == 32768
+    assert code.max_new_tokens == code_cap
     assert code.bft is None
 
 
@@ -196,7 +200,7 @@ def test_profiles_are_frozen_slotted_and_recursively_immutable():
             {
                 "version": 3,
                 "math_cap": 16384,
-                "code_cap": 32768,
+                "code_cap": 16384,
                 "thinking": 15616,
                 "window": 300.0,
                 "domain": "reliquary-forced-seed-v3",

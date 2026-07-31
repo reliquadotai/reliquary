@@ -853,7 +853,7 @@ def score_and_finalize_submission(
                         if context.bootstrap
                         else SIGMA_MIN
                     ),
-                    truncated_index=truncated_indices[0],
+                    truncated_indices=truncated_indices,
                     attainable_rewards=attainable_rewards,
                 )
             in_zone = (

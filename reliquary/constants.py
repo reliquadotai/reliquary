@@ -56,6 +56,9 @@ PROTOCOL_PROFILE_ID = ACTIVE_PROTOCOL_PROFILE.profile_id
 PROTOCOL_MODEL_ID = ACTIVE_PROTOCOL_PROFILE.model_id
 PROTOCOL_MODEL_REVISION = ACTIVE_PROTOCOL_PROFILE.model_revision
 PROTOCOL_VERSION = ACTIVE_PROTOCOL_PROFILE.protocol_version
+# Draw ordering among equal-difficulty candidates. Part of the signed profile
+# contract, so a miner reads the rule it competes under; None on v2.
+PROTOCOL_THROUGHPUT_TIEBREAK = ACTIVE_PROTOCOL_PROFILE.throughput_tiebreak
 PROTOCOL_GENERATION_CONTRACT = (
     ACTIVE_PROTOCOL_PROFILE.to_generation_contract()
 )
@@ -217,7 +220,17 @@ BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION = 1
 # allowance of three was inconsistent across admission paths and was not safe
 # under fractional rewards. V3 prices the one unknown outcome over the exact
 # validator-known reward lattice.
-MAX_TRUNCATED_PER_SUBMISSION_BY_ENV: dict[str, int] = {}
+# Code has no BFT to force termination, so the 4B loops to the cap on ~10% of
+# code rollouts; at eight rollouts that puts two or more truncations in ~19% of
+# HONEST groups, which a ceiling of one rejects wholesale. Three brings that to
+# ~0.5%. The exactness objection to a larger allowance is answered by
+# robust_truncation_utility pricing every JOINT assignment of the unknowns, so
+# the manufactured-truncation guarantee does not weaken as this rises. Math
+# stays at one: BFT terminates every rollout, so a truncated math rollout means
+# a non-compliant client.
+MAX_TRUNCATED_PER_SUBMISSION_BY_ENV: dict[str, int] = {
+    "opencodeinstruct": 3,
+}
 
 
 def max_truncated_for_environment(
