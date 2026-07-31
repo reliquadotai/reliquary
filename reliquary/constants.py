@@ -56,6 +56,9 @@ PROTOCOL_PROFILE_ID = ACTIVE_PROTOCOL_PROFILE.profile_id
 PROTOCOL_MODEL_ID = ACTIVE_PROTOCOL_PROFILE.model_id
 PROTOCOL_MODEL_REVISION = ACTIVE_PROTOCOL_PROFILE.model_revision
 PROTOCOL_VERSION = ACTIVE_PROTOCOL_PROFILE.protocol_version
+# Draw ordering among equal-difficulty candidates. Part of the signed profile
+# contract, so a miner reads the rule it competes under; None on v2.
+PROTOCOL_THROUGHPUT_TIEBREAK = ACTIVE_PROTOCOL_PROFILE.throughput_tiebreak
 PROTOCOL_GENERATION_CONTRACT = (
     ACTIVE_PROTOCOL_PROFILE.to_generation_contract()
 )

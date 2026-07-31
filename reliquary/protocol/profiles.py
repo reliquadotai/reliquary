@@ -37,6 +37,28 @@ class EnvironmentProfile:
 
 
 @dataclass(frozen=True, slots=True)
+class ThroughputTiebreakProfile:
+    """Draw ordering among candidates of EQUAL difficulty.
+
+    A tie-break never trades against training utility — difficulty ranks first,
+    so this only orders submissions already judged equally useful. The question
+    is which tie-break does least harm, and ordering by arrival round actively
+    penalises long generation: a 16k-token rollout arrives later than a 500-token
+    one and loses the slot at identical hardware. With binary rewards the
+    difficulty score takes only nine values, so equal-difficulty ties are common,
+    not marginal — the penalty applies broadly.
+
+    Ordering by tokens-per-round is length-NEUTRAL: at equal hardware a long
+    completion ranks the same as a short one. ``token_cap`` bounds the numerator
+    so generating past the useful budget earns no rank, and because throughput is
+    a rate rather than a total, padding adds tokens and time in step.
+    """
+
+    token_cap: int
+    bucket_tokens_per_round: int
+
+
+@dataclass(frozen=True, slots=True)
 class ProtocolProfile:
     profile_id: str
     model_id: str
@@ -46,6 +68,7 @@ class ProtocolProfile:
     upload_grace_seconds: int
     sampling: SamplingProfile
     environments: Mapping[str, EnvironmentProfile]
+    throughput_tiebreak: ThroughputTiebreakProfile | None = None
 
     def __post_init__(self) -> None:
         # Copy before wrapping so caller-owned dictionaries cannot mutate a
@@ -80,6 +103,16 @@ class ProtocolProfile:
             "model_id": self.model_id,
             "model_revision": self.model_revision,
             "protocol_version": self.protocol_version,
+            "throughput_tiebreak": (
+                None
+                if self.throughput_tiebreak is None
+                else {
+                    "token_cap": self.throughput_tiebreak.token_cap,
+                    "bucket_tokens_per_round": (
+                        self.throughput_tiebreak.bucket_tokens_per_round
+                    ),
+                }
+            ),
             "collection_seconds": self.collection_seconds,
             "upload_grace_seconds": self.upload_grace_seconds,
             "sampling": {
@@ -147,6 +180,10 @@ _PROFILE_VALUES = (
                 bft=None,
             ),
         },
+        throughput_tiebreak=ThroughputTiebreakProfile(
+            token_cap=15616,
+            bucket_tokens_per_round=50,
+        ),
     ),
 )
 
