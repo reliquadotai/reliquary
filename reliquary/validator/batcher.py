@@ -20,6 +20,7 @@ from pydantic import ValidationError
 
 from reliquary.constants import (
     BATCH_PROMPT_COOLDOWN_WINDOWS,
+    PROTOCOL_THROUGHPUT_TIEBREAK,
     B_BATCH,
     DIFFICULTY_AUCTION_DELTA,
     DIFFICULTY_AUCTION_ENFORCE,
@@ -76,6 +77,7 @@ from reliquary.protocol.submission import (
 )
 from reliquary.protocol.tokens import verify_tokens
 from reliquary.validator.batch_selection import (
+    throughput_rank,
     _within_slot_key,
     explain_batch_selection,
     select_batch_and_distribute,
@@ -328,6 +330,26 @@ _PROOF_FAILURE_DEBT_STAGES = frozenset(
 # same-prompt winner is resolved at SEAL (the first submission for a prompt that
 # PASSES the proof takes the slot), not at admission, so no wire-level
 # PROMPT_CLAIMED reject is needed.
+
+
+def _generated_tokens_of(pending) -> int:
+    """Generated tokens across a candidate's rollouts, for the throughput rank.
+
+    Sums each rollout's ``completion_length`` rather than ``len(tokens)``: the
+    latter carries the prompt once per rollout, and the miner picks which prompt
+    it submits, so a long prompt would inflate the rank for free. Degrades to 0
+    on any unexpected shape, which lands the candidate in the last bucket and
+    leaves arrival to order it — never raises inside the seal path.
+    """
+    request = getattr(pending, "request", None)
+    total = 0
+    for rollout in (getattr(request, "rollouts", None) or ()):
+        meta = (getattr(rollout, "commit", None) or {}).get("rollout", {}) or {}
+        try:
+            total += max(0, int(meta.get("completion_length", 0) or 0))
+        except (TypeError, ValueError):
+            continue
+    return total
 
 
 def _pending_difficulty_score(pending):
@@ -4013,11 +4035,36 @@ class GrpoWindowBatcher:
                     prompt_idx=pending_submission.prompt_idx,
                 )
             )
-        # Miner-controlled payload size never affects economic rank.
+        # Difficulty still ranks first, so throughput never trades against
+        # training utility — it only orders candidates already judged equally
+        # useful. Among those, ordering by arrival penalises long generation
+        # (a 16k rollout arrives after a 500-token one at identical hardware),
+        # and with binary rewards the difficulty score takes only nine values,
+        # so those ties are common rather than marginal. Tokens-per-round is
+        # length-neutral instead. Absent from the v2 profile, so the deployed
+        # 2B ordering is untouched.
+        throughput_profile = PROTOCOL_THROUGHPUT_TIEBREAK
+        window_open = self.window_open_drand_round
+        throughput_by_id: dict[int, int] = {}
+        for pending_submission, _score in scored:
+            throughput_by_id[id(pending_submission)] = (
+                throughput_rank(
+                    _generated_tokens_of(pending_submission),
+                    arrival_round=arrival_by_id[id(pending_submission)],
+                    window_open_round=int(window_open),
+                    token_cap=throughput_profile.token_cap,
+                    bucket_tokens_per_round=(
+                        throughput_profile.bucket_tokens_per_round
+                    ),
+                )
+                if throughput_profile is not None and window_open is not None
+                else 0
+            )
         ranked = sorted(
             scored,
             key=lambda item: (
                 -item[1].value,
+                throughput_by_id[id(item[0])],
                 arrival_by_id[id(item[0])],
                 (
                     0.0
