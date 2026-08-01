@@ -21,8 +21,10 @@ import hashlib
 import importlib.metadata
 import logging
 import multiprocessing
+import os
 import numbers
 import secrets
+import urllib.parse
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
@@ -234,6 +236,61 @@ def _protocol_contract_reject_reason(
     ):
         return RejectReason.GENERATION_CONTRACT_MISMATCH
     return None
+
+
+class _StateFastPathMiddleware:
+    """Answer cached ``GET /state`` polls before the FastAPI stack runs.
+
+    The 2026-08-01 py-spy profile of the live v3 validator showed the event
+    loop ~90% busy on PER-REQUEST framework machinery (routing dispatch,
+    BaseHTTPMiddleware anyio plumbing, pydantic serialization) under
+    continuous miner polling — and the byte cache alone only removed the
+    serialization slice (~20%). A cache hit is answered here in
+    microseconds; anything unusual (cold cache, no window, unknown env,
+    non-GET) falls through to the normal route, which owns error semantics
+    and cache fills. The served bytes come from ``_cached_state_response``,
+    whose key covers everything the payload depends on — a hit is
+    byte-identical to what the route would produce.
+    """
+
+    def __init__(self, app: Any, server: "ValidatorServer") -> None:
+        self.app = app
+        self._server = server
+
+    async def __call__(
+        self, scope: dict[str, Any], receive: Any, send: Any
+    ) -> None:
+        if (
+            scope.get("type") != "http"
+            or scope.get("path") != "/state"
+            or scope.get("method") != "GET"
+        ):
+            await self.app(scope, receive, send)
+            return
+        env: str | None = None
+        query = scope.get("query_string") or b""
+        if query:
+            values = urllib.parse.parse_qs(query.decode("latin-1")).get("env")
+            if values:
+                env = values[0]
+        started = time.perf_counter()
+        body = self._server._cached_state_response(env)
+        if body is None:
+            await self.app(scope, receive, send)
+            return
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode("ascii")),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
+        # Keep /health's endpoint-latency observability honest on hits too.
+        self._server._endpoint_latency_samples_ms["/state"].append(
+            max(0.0, (time.perf_counter() - started) * 1000.0)
+        )
 
 
 class _SubmissionBodyLimitMiddleware:
@@ -763,6 +820,13 @@ class ValidatorServer:
         # check) keep working without change.
         self._active_batchers: dict[str, GrpoWindowBatcher] = {}
         self.active_batcher: GrpoWindowBatcher | None = None
+        # /state responses cached as serialized bytes, one slot per env query.
+        # Miners poll /state continuously; re-serializing GrpoBatchState (with
+        # its cooldown list) per request kept the event loop ~90% busy and
+        # starved the proof worker's Python sections of the GIL. The key holds
+        # everything that can change the payload, so a hit is byte-identical
+        # to a rebuild and staleness is structurally zero.
+        self._state_response_cache: dict[str, tuple[tuple, bytes]] = {}
         self._registration_gate_enforced = False
         self._registered_hotkeys: frozenset[str] | None = None
         self._operator_by_hotkey: dict[str, str] = {}
@@ -902,6 +966,45 @@ class ValidatorServer:
         # site runs on the event loop.
         self._verdicts: dict[str, collections.deque[dict]] = {}
         self._recent_reject_counts: collections.Counter[str] = collections.Counter()
+
+    def _state_cache_key(self, batcher) -> tuple:
+        """Everything the /state payload depends on, for one batcher."""
+        cp = self._current_checkpoint
+        submission_count = (
+            getattr(batcher, "pending_count", batcher.valid_count)
+            if getattr(batcher, "difficulty_auction_enabled", False)
+            else batcher.valid_count
+        )
+        return (
+            id(batcher),
+            batcher.window_start,
+            self._current_state,
+            submission_count,
+            cp.checkpoint_n if cp else -1,
+            cp.revision if cp else None,
+        )
+
+    def _cached_state_response(self, env: str | None) -> bytes | None:
+        """Cached /state bytes for ``env`` if still valid, else None.
+
+        Called from the ASGI fast path, outside the FastAPI stack — must stay
+        lock-free and never raise: any unusual condition (no window, unknown
+        env, cold cache) returns None and the request falls through to the
+        normal route, which owns error semantics and cache fills.
+        """
+        try:
+            if env is not None:
+                batcher = self._active_batchers.get(env)
+            else:
+                batcher = self.active_batcher
+            if batcher is None:
+                return None
+            cached = self._state_response_cache.get(env or "")
+            if cached is None or cached[0] != self._state_cache_key(batcher):
+                return None
+            return cached[1]
+        except Exception:
+            return None
 
     def set_active_batchers(self, batchers: dict[str, GrpoWindowBatcher]) -> None:
         """Register multi-env batchers and update the legacy scalar accessor.
@@ -4074,16 +4177,30 @@ class ValidatorServer:
                 if batcher is None:
                     raise HTTPException(status_code=503, detail="no_active_window")
             cp = self._current_checkpoint
-            return GrpoBatchState(
+            submission_count = (
+                getattr(batcher, "pending_count", batcher.valid_count)
+                if getattr(batcher, "difficulty_auction_enabled", False)
+                else batcher.valid_count
+            )
+            # Serialized-bytes cache: everything the payload depends on is in
+            # the key, so a hit is byte-identical to a rebuild. ``id(batcher)``
+            # covers a same-window batcher swap (fresh cooldown snapshot).
+            # Hits are normally answered by ``_StateFastPathMiddleware`` before
+            # the FastAPI stack; this in-handler check only serves requests
+            # that raced a cache fill.
+            cache_slot = env or ""
+            cache_key = self._state_cache_key(batcher)
+            cached = self._state_response_cache.get(cache_slot)
+            if cached is not None and cached[0] == cache_key:
+                return Response(
+                    content=cached[1], media_type="application/json"
+                )
+            payload = GrpoBatchState(
                 state=self._current_state,
                 window_n=batcher.window_start,
                 anchor_block=batcher.window_start,
                 cooldown_prompts=batcher.cooldown_prompts_snapshot,
-                valid_submissions=(
-                    getattr(batcher, "pending_count", batcher.valid_count)
-                    if getattr(batcher, "difficulty_auction_enabled", False)
-                    else batcher.valid_count
-                ),
+                valid_submissions=submission_count,
                 checkpoint_n=cp.checkpoint_n if cp else 0,
                 checkpoint_repo_id=cp.repo_id if cp else None,
                 checkpoint_revision=cp.revision if cp else None,
@@ -4100,6 +4217,19 @@ class ValidatorServer:
                 ),
                 randomness=batcher.randomness,
             )
+            body = payload.model_dump_json(
+                exclude=(
+                    {
+                        "protocol_version",
+                        "generation_profile_id",
+                        "generation_contract",
+                    }
+                    if PROTOCOL_VERSION < 3
+                    else None
+                ),
+            ).encode("utf-8")
+            self._state_response_cache[cache_slot] = (cache_key, body)
+            return Response(content=body, media_type="application/json")
 
         @app.get("/runtime-contract", response_model=RuntimeContract)
         async def runtime_contract() -> RuntimeContract:
@@ -4173,6 +4303,16 @@ class ValidatorServer:
             _SubmissionBodyLimitMiddleware,
             max_bytes=MAX_SUBMISSION_PAYLOAD_BYTES,
         )
+        # Outermost: cached GET /state polls never enter the stack below.
+        # Operational kill switch (validator-side only, not miner-facing):
+        # disabling it changes nothing on the wire, every request just pays
+        # the full stack again.
+        if os.environ.get("RELIQUARY_STATE_FASTPATH", "1") not in (
+            "0",
+            "false",
+            "False",
+        ):
+            app.add_middleware(_StateFastPathMiddleware, server=self)
         return app
 
     async def _process_auction_submission(
