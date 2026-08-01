@@ -536,6 +536,10 @@ def validate(
                     generation_model=model,
                     proof_model=model,
                 )["profile_hash"]
+                from reliquary.validator.proof_capacity import (
+                    compute_proof_path_hash,
+                )
+
                 proof_capacity_qualification = qualification.validate(
                     profile_id=PROTOCOL_PROFILE_ID,
                     model_revision=PROTOCOL_MODEL_REVISION,
@@ -544,6 +548,7 @@ def validate(
                         activation_checkpoint_revision or ""
                     ),
                     runtime_fingerprint_hash=runtime_fingerprint_hash,
+                    proof_path_hash=compute_proof_path_hash(),
                     configured_devices=proof_devices,
                     configured_hardware=hardware,
                     configured_device_uuids=device_uuids,
@@ -559,6 +564,15 @@ def validate(
                         )
                     },
                 )
+                carried_from = proof_capacity_qualification.get(
+                    "qualification_carried_over_from"
+                )
+                if carried_from:
+                    logger.info(
+                        "Proof capacity qualification carried over from "
+                        "image %s: this image's proof path is byte-identical",
+                        carried_from,
+                    )
                 logger.info(
                     "Proof capacity qualified: %s",
                     proof_capacity_qualification,

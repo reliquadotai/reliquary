@@ -21,6 +21,73 @@ class ProofCapacityQualificationError(RuntimeError):
     pass
 
 
+# The files whose bytes determine what one proof costs on the GPU. Pinning
+# these (plus the parameter values below) lets a qualification legitimately
+# survive an image deploy that does not touch the proof path — the full
+# ``software_revision`` pin turned EVERY deploy into a re-benchmark, including
+# HTTP-only ones. Anything imported by these files that changes proof cost
+# must either live in this list or be captured as a parameter value; when in
+# doubt, add the file — a false invalidation costs a 15-minute benchmark, a
+# false carry-over costs a mis-sized fleet.
+PROOF_PATH_FILES = (
+    "reliquary/validator/verifier.py",
+    "reliquary/validator/proof_scheduler.py",
+    "reliquary/shared/forward.py",
+    "reliquary/protocol/grail_verifier.py",
+    "reliquary/protocol/crypto.py",
+    "reliquary/environment/forced_sampling.py",
+)
+
+
+def _live_proof_parameters() -> Mapping[str, Any]:
+    from reliquary import constants
+
+    return {
+        "CHALLENGE_K": constants.CHALLENGE_K,
+        "LAYER_INDEX": constants.LAYER_INDEX,
+        "M_ROLLOUTS": constants.M_ROLLOUTS,
+        "T_PROTO": constants.T_PROTO,
+        "TOP_K_PROTO": constants.TOP_K_PROTO,
+        "TOP_P_PROTO": constants.TOP_P_PROTO,
+        "MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV": dict(
+            constants.MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV
+        ),
+    }
+
+
+def compute_proof_path_hash(
+    *,
+    repo_root: str | Path | None = None,
+    parameters: Mapping[str, Any] | None = None,
+) -> str:
+    """SHA-256 over the proof-path files' bytes and proof parameter values.
+
+    ``repo_root``/``parameters`` are injectable for tests; production callers
+    use the installed tree and the live protocol constants.
+    """
+    root = (
+        Path(repo_root)
+        if repo_root is not None
+        else Path(__file__).resolve().parents[2]
+    )
+    digest = hashlib.sha256()
+    for relative in PROOF_PATH_FILES:
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\x00")
+        try:
+            digest.update((root / relative).read_bytes())
+        except OSError as exc:
+            raise ProofCapacityQualificationError(
+                f"proof-path file unreadable: {relative}"
+            ) from exc
+        digest.update(b"\x00")
+    values = parameters if parameters is not None else _live_proof_parameters()
+    digest.update(
+        json.dumps(values, sort_keys=True, default=str).encode("utf-8")
+    )
+    return digest.hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class ProofDeviceIdentity:
     device_id: str
@@ -112,6 +179,9 @@ class ProofCapacityQualification:
     minimum_completion_tokens_by_environment: Mapping[str, int]
     measured_at: str
     qualified: bool
+    # Optional: content hash of the proof path at benchmark time. Absent on
+    # legacy manifests, which keep the strict same-image behavior.
+    proof_path_hash: str | None = None
 
     @classmethod
     def from_mapping(
@@ -193,6 +263,11 @@ class ProofCapacityQualification:
                 },
                 measured_at=str(value["measured_at"]),
                 qualified=qualified,
+                proof_path_hash=(
+                    str(value["proof_path_hash"])
+                    if value.get("proof_path_hash") is not None
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ProofCapacityQualificationError(
@@ -207,6 +282,7 @@ class ProofCapacityQualification:
         software_revision: str | None,
         checkpoint_revision: str,
         runtime_fingerprint_hash: str,
+        proof_path_hash: str | None = None,
         configured_devices: Sequence[str],
         configured_hardware: Sequence[str],
         configured_device_uuids: Sequence[str],
@@ -234,11 +310,27 @@ class ProofCapacityQualification:
             software_revision is None
             or _COMMIT_SHA_RE.fullmatch(software_revision) is None
             or _COMMIT_SHA_RE.fullmatch(self.software_revision) is None
-            or self.software_revision != software_revision
         ):
             raise ProofCapacityQualificationError(
                 "proof-capacity software revision mismatch"
             )
+        qualification_carried_over_from: str | None = None
+        if self.software_revision != software_revision:
+            # Carry-over: a different image is acceptable iff the proof path
+            # it ships is byte-identical to the one benchmarked. Legacy
+            # manifests (no stored hash) and callers that cannot compute
+            # their own hash keep the strict fail-closed behavior.
+            if (
+                self.proof_path_hash is None
+                or proof_path_hash is None
+                or _SHA256_RE.fullmatch(self.proof_path_hash) is None
+                or _SHA256_RE.fullmatch(proof_path_hash) is None
+                or self.proof_path_hash != proof_path_hash
+            ):
+                raise ProofCapacityQualificationError(
+                    "proof-capacity software revision mismatch"
+                )
+            qualification_carried_over_from = self.software_revision
         if (
             _COMMIT_SHA_RE.fullmatch(checkpoint_revision) is None
             or _COMMIT_SHA_RE.fullmatch(self.checkpoint_revision) is None
@@ -447,6 +539,7 @@ class ProofCapacityQualification:
 
         return {
             "qualified": True,
+            "qualification_carried_over_from": qualification_carried_over_from,
             "profile_id": self.profile_id,
             "model_revision": self.model_revision,
             "software_revision": self.software_revision,
@@ -522,6 +615,8 @@ def load_proof_capacity_qualification(
 
 
 __all__ = [
+    "PROOF_PATH_FILES",
+    "compute_proof_path_hash",
     "ProofCapacityQualification",
     "ProofCapacityQualificationError",
     "ProofDeviceIdentity",

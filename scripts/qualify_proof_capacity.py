@@ -47,6 +47,7 @@ from reliquary.constants import (  # noqa: E402
 )
 from reliquary.validator.proof_capacity import (  # noqa: E402
     ProofCapacityQualification,
+    compute_proof_path_hash,
 )
 
 
@@ -292,6 +293,10 @@ def main() -> int:
         ),
         "measured_at": args.measured_at,
         "qualified": True,
+        # Content hash of the proof path at benchmark time: lets a later
+        # image deploy that does not touch the proof path carry this
+        # qualification over instead of re-benchmarking.
+        "proof_path_hash": compute_proof_path_hash(),
     }
     qualification = ProofCapacityQualification.from_mapping(manifest)
     # Validate the benchmark fleet itself. A manifest that already needs more
