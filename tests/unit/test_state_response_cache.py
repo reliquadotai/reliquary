@@ -209,6 +209,22 @@ def test_fast_path_records_latency_sample():
     assert len(server._endpoint_latency_samples_ms["/state"]) == before + 1
 
 
+def test_fastpath_kill_switch(monkeypatch):
+    """RELIQUARY_STATE_FASTPATH=0 removes the middleware; the route still
+    works (and still serves its own in-handler cache)."""
+    monkeypatch.setenv("RELIQUARY_STATE_FASTPATH", "0")
+    server = _server()
+    client = TestClient(server.app)
+    client.get("/state")  # populate
+
+    sentinel = b'{"sentinel": true}'
+    monkeypatch.setattr(server, "_cached_state_response", lambda env: sentinel)
+    resp = client.get("/state")
+    assert resp.status_code == 200
+    assert resp.content != sentinel, "fast path must be absent when disabled"
+    assert resp.json()["window_n"] == 500
+
+
 def test_error_paths_unchanged():
     server = ValidatorServer()
     client = TestClient(server.app)

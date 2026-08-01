@@ -21,6 +21,7 @@ import hashlib
 import importlib.metadata
 import logging
 import multiprocessing
+import os
 import numbers
 import secrets
 import urllib.parse
@@ -4303,7 +4304,15 @@ class ValidatorServer:
             max_bytes=MAX_SUBMISSION_PAYLOAD_BYTES,
         )
         # Outermost: cached GET /state polls never enter the stack below.
-        app.add_middleware(_StateFastPathMiddleware, server=self)
+        # Operational kill switch (validator-side only, not miner-facing):
+        # disabling it changes nothing on the wire, every request just pays
+        # the full stack again.
+        if os.environ.get("RELIQUARY_STATE_FASTPATH", "1") not in (
+            "0",
+            "false",
+            "False",
+        ):
+            app.add_middleware(_StateFastPathMiddleware, server=self)
         return app
 
     async def _process_auction_submission(
