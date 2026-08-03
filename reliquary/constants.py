@@ -150,12 +150,11 @@ BFT_FORCE_TEMPLATE = "</think>\n\nFinal Answer: \\boxed{"
 BFT_FORCE_ANSWER = bool(
     _MATH_BFT_PROFILE and _MATH_BFT_PROFILE.force_answer
 )
-# DAPO-style overlong filtering. A Math rollout whose ending is a BFT budget
-# artefact rather than the model's own choice is masked out of the policy
-# update: no PPO or KL, and its forward is skipped entirely. V3 enables this for
-# Math. Code truncation is a miner-influenceable event, so it remains in the
-# loss until an adversarial ablation shows masking cannot reward deliberate
-# non-termination.
+# DAPO-style overlong filtering, now OFF by default on every profile. Masking
+# made non-termination gradient-free while terminated-and-wrong stayed punished
+# in proportion to length — the inverted incentive behind the ckpt84 rumination
+# collapse (hard-prompt EOS 84%→50%). Superseded by the soft overlong
+# punishment below; these flags remain as emergency kill switches.
 #
 # Masked rollouts STAY in the group mean/std (baseline unchanged, DAPO Eq. 9) and
 # in the sigma gate / auction / emission — the economic layer keeps scoring them,
@@ -171,10 +170,7 @@ MASK_BUDGET_ENDED_FROM_LOSS = (
     not in ("0", "false", "False")
 )
 MASK_MATH_FORCED_FROM_LOSS = (
-    _os.environ.get(
-        "RELIQUARY_MASK_MATH_FORCED_FROM_LOSS",
-        "1" if PROTOCOL_VERSION >= 3 else "0",
-    )
+    _os.environ.get("RELIQUARY_MASK_MATH_FORCED_FROM_LOSS", "0")
     not in ("0", "false", "False")
 )
 MASK_CODE_TRUNCATED_FROM_LOSS = (
@@ -209,6 +205,46 @@ if not _math.isfinite(SHAPE_LEN_FRAC) or not 0.0 < SHAPE_LEN_FRAC <= 1.0:
     raise ValueError(
         "RELIQUARY_SHAPE_LEN_FRAC must be finite and within (0, 1]"
     )
+
+# Soft overlong punishment (DAPO Eq. 13), applied to TRAINING rewards only in
+# training._training_rewards — the graded reward that drives the σ-gate, the
+# auction and emission is untouched, so miner economics cannot move. A rollout
+# that runs into the last OVERLONG_PENALTY_CACHE_TOKENS before its env cap pays
+# a linear penalty reaching −factor at the cap, correct or not. 0 disables.
+# 0.5 matches DAPO's penalty-to-correctness ratio: they use 1.0 on the 2-wide
+# {−1,+1} reward scale, ours is [0,1].
+OVERLONG_PENALTY_FACTOR = float(_os.environ.get(
+    "RELIQUARY_OVERLONG_PENALTY_FACTOR",
+    "0.5" if PROTOCOL_VERSION >= 3 else "0",
+))
+if (
+    not _math.isfinite(OVERLONG_PENALTY_FACTOR)
+    or not 0.0 <= OVERLONG_PENALTY_FACTOR <= 10.0
+):
+    raise ValueError(
+        "RELIQUARY_OVERLONG_PENALTY_FACTOR must be finite and within [0, 10]"
+    )
+OVERLONG_PENALTY_CACHE_TOKENS = int(_os.environ.get(
+    "RELIQUARY_OVERLONG_PENALTY_CACHE_TOKENS", "4096"
+))
+if OVERLONG_PENALTY_CACHE_TOKENS <= 0:
+    raise ValueError(
+        "RELIQUARY_OVERLONG_PENALTY_CACHE_TOKENS must be positive"
+    )
+# A BFT-forced rollout's grade comes from validator-injected tokens the policy
+# never sampled — a coin flip that lands correct ~43% of the time (R2, v3 era).
+# Crediting the policy for that flip is what kept rumination reinforced, so the
+# forced rollout's base TRAINING reward is zeroed and it pays the full overlong
+# penalty flat (its length is a protocol constant, not a choice). This is
+# clean-cap semantics without the BFT_FORCE_ANSWER wire change; the miner is
+# still paid for a lucky forced answer.
+TRAIN_FORCED_REWARD_ZERO = (
+    _os.environ.get(
+        "RELIQUARY_TRAIN_FORCED_REWARD_ZERO",
+        "1" if PROTOCOL_VERSION >= 3 else "0",
+    )
+    not in ("0", "false", "False")
+)
 
 # Cap/non-EOS truncation budget per submission. A single missing-EOS rollout
 # can be an honest local max-token accident; repeated missing-EOS rollouts in
