@@ -177,10 +177,10 @@ def _is_masked_from_loss(rollout) -> bool:
     equals its group mean (common with fractional code rewards), and skipping
     those would silently drop their KL term and skew the N_e normalisation.
 
-    V3 enables the Math forced-row mask only. Code truncations remain in the
-    loss until an adversarial ablation shows that removing their negative
-    gradient cannot reward deliberate non-termination. The legacy aggregate
-    flag remains an emergency experiment switch for both shapes.
+    All mask flags now default off: filtering was superseded by the soft
+    overlong punishment in ``_training_rewards`` (masking made non-termination
+    gradient-free — the ckpt84 rumination collapse). The flags remain as
+    emergency kill switches.
     """
     from reliquary.constants import (
         MASK_BUDGET_ENDED_FROM_LOSS,
@@ -256,6 +256,101 @@ def _shape_advantages(rollouts, advantages):
         if clen < early_cap and not correct:
             shaped[i] = -SHAPE_PENALTY          # under-thinking (early + wrong)
     return shaped
+
+
+def _overlong_penalty(length: int, soft: int, hard: int) -> float:
+    """DAPO Eq. 13: 0 up to *soft*, linear down to −1 at *hard*, floored at −1."""
+    if length <= soft:
+        return 0.0
+    if length >= hard or hard <= soft:
+        return -1.0
+    return -(length - soft) / float(hard - soft)
+
+
+def _overlong_bounds(env_name: str) -> tuple[int, int]:
+    """Penalty ramp bounds for an env: the last CACHE tokens before its cap."""
+    from reliquary.constants import (
+        OVERLONG_PENALTY_CACHE_TOKENS,
+        max_new_tokens_for_environment,
+    )
+
+    hard = int(max_new_tokens_for_environment(env_name or ""))
+    return max(0, hard - OVERLONG_PENALTY_CACHE_TOKENS), hard
+
+
+def _training_rewards(rollouts) -> list[float]:
+    """Rewards used for advantage computation only. ``rollout.reward`` — the
+    graded reward driving the σ-gate, auction and emission — is never modified,
+    so nothing miner-facing moves.
+
+    Two validator-only corrections (DAPO §3.4 soft overlong punishment):
+
+      * a BFT-forced rollout's grade comes from injected tokens the policy never
+        sampled (~43% lucky-correct), so its base reward is zeroed and it pays
+        the full penalty — flat, because its length is a protocol constant, and
+        a length ramp would let group normalization blow tiny sampled-answer
+        length differences up into full-size advantages;
+      * a rollout that ran into the last CACHE tokens before the env cap pays a
+        linear ramp to −factor, correct or not — being right in 15k tokens must
+        score below being right in 5k, or convergence is never taught.
+    """
+    from reliquary.constants import (
+        OVERLONG_PENALTY_FACTOR,
+        TRAIN_FORCED_REWARD_ZERO,
+    )
+
+    shaped = []
+    for rollout in rollouts:
+        meta = (getattr(rollout, "commit", None) or {}).get("rollout", {}) or {}
+        reward = float(getattr(rollout, "reward", 0.0))
+        if bool(meta.get("forced")):
+            base = 0.0 if TRAIN_FORCED_REWARD_ZERO else reward
+            shaped.append(base - OVERLONG_PENALTY_FACTOR)
+            continue
+        penalty = 0.0
+        if OVERLONG_PENALTY_FACTOR > 0.0:
+            soft, hard = _overlong_bounds(getattr(rollout, "env_name", ""))
+            length = len(_completion_token_logprobs(rollout))
+            penalty = OVERLONG_PENALTY_FACTOR * _overlong_penalty(
+                length, soft, hard,
+            )
+        shaped.append(reward + penalty)
+    return shaped
+
+
+def _overlong_training_metrics(plan) -> dict[str, float]:
+    """Describe how the soft overlong punishment reshaped training rewards."""
+    from reliquary.constants import (
+        OVERLONG_PENALTY_FACTOR,
+        TRAIN_FORCED_REWARD_ZERO,
+    )
+
+    total = 0
+    forced_zeroed = 0
+    changed = 0
+    delta_sum = 0.0
+    for group, _advantages, _scale in plan:
+        shaped = _training_rewards(group.rollouts)
+        for rollout, value in zip(group.rollouts, shaped):
+            total += 1
+            raw = float(getattr(rollout, "reward", 0.0))
+            meta = (
+                (getattr(rollout, "commit", None) or {}).get("rollout", {})
+                or {}
+            )
+            if meta.get("forced") and TRAIN_FORCED_REWARD_ZERO:
+                forced_zeroed += 1
+            if value != raw:
+                changed += 1
+            delta_sum += value - raw
+    denominator = max(1, total)
+    return {
+        "train/overlong_penalty_factor": OVERLONG_PENALTY_FACTOR,
+        "train/overlong_rollout_count": float(total),
+        "train/overlong_forced_zeroed_ratio": forced_zeroed / denominator,
+        "train/overlong_changed_ratio": changed / denominator,
+        "train/overlong_reward_delta_mean": delta_sum / denominator,
+    }
 
 
 def _shaping_training_metrics(plan) -> dict[str, float]:
@@ -523,7 +618,7 @@ def _plan_from_batches(batches, env_weights: Optional[dict] = None):
         for group in batch:
             advantages = _shape_advantages(
                 group.rollouts,
-                _compute_advantages([r.reward for r in group.rollouts]),
+                _compute_advantages(_training_rewards(group.rollouts)),
             )
             if all(a == 0.0 for a in advantages):
                 n_skipped += 1
@@ -1435,6 +1530,7 @@ def train_step(
         logger.info("train_step: no trainable groups")
         return model
     shaping_metrics = _shaping_training_metrics(plan)
+    overlong_metrics = _overlong_training_metrics(plan)
     environment_metrics = _training_environment_metrics(batches, plan)
 
     # Pass 2: micro-batched forward/backward (token-budget packing). The fast
@@ -1529,6 +1625,7 @@ def train_step(
         })
         failure_metrics.update(_bft_training_metrics(plan))
         failure_metrics.update(shaping_metrics)
+        failure_metrics.update(overlong_metrics)
         failure_metrics.update(environment_metrics)
         telemetry.log_training_step(failure_metrics, step=window_index)
         _optimizer.zero_grad(set_to_none=True)
@@ -1588,6 +1685,7 @@ def train_step(
     metrics.update(_kl_telemetry_metrics(kl_stats))
     metrics.update(_bft_training_metrics(plan))
     metrics.update(shaping_metrics)
+    metrics.update(overlong_metrics)
     metrics.update(environment_metrics)
     telemetry.log_training_step(metrics, step=window_index)
 
