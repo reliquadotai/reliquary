@@ -36,11 +36,16 @@ RUN wget -q "${FA_URL}" -P /tmp/ \
  && pip install /tmp/flash_attn-*.whl \
  && rm /tmp/flash_attn-*.whl
 
-# flash-linear-attention: fast triton kernel for Qwen3.5's GatedDeltaNet layers.
-# Without it they fall back to the slow torch_chunk_gated_delta_rule scan (~3x
-# slower GRAIL verify). causal-conv1d is skipped on purpose: it needs an nvcc
-# compile and only swaps a cheap conv -- the gated-delta scan is the real cost.
+# flash-linear-attention + causal-conv1d: transformers enables Qwen3.5's fast
+# GatedDeltaNet path only when BOTH are importable — with either one missing it
+# silently falls back to the torch scan for the whole layer (measured 3.77x
+# slower forward at 15.7k tokens; the old "fla alone is enough" assumption ran
+# production on the fallback for weeks). Prebuilt wheel: no nvcc needed.
 RUN pip install flash-linear-attention==0.5.0
+ARG CC1D_URL=https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.5.2/causal_conv1d-1.5.2+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+RUN wget -q "${CC1D_URL}" -P /tmp/ \
+ && pip install /tmp/causal_conv1d-*.whl \
+ && rm /tmp/causal_conv1d-*.whl
 
 # Source + install
 WORKDIR /opt/reliquary

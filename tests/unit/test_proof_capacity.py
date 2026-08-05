@@ -414,3 +414,34 @@ def test_manifest_loader_requires_exact_digest(tmp_path):
             path,
             expected_sha256="0" * 64,
         )
+
+
+def test_runtime_fingerprint_mismatch_fails_closed_by_default():
+    with pytest.raises(
+        ProofCapacityQualificationError, match="runtime fingerprint"
+    ):
+        _validate(_manifest(runtime_fingerprint_hash="f" * 64))
+
+
+def test_faster_runtime_switch_carries_qualification_over(monkeypatch):
+    from reliquary import constants as C
+
+    monkeypatch.setattr(C, "PROOF_CAPACITY_ACCEPT_FASTER_RUNTIME", True)
+    report = _validate(_manifest(runtime_fingerprint_hash="f" * 64))
+    assert report["qualified"] is True
+    assert report["runtime_fingerprint_carried_over_from"] == "f" * 64
+
+
+def test_faster_runtime_switch_keeps_malformed_hash_fail_closed(monkeypatch):
+    from reliquary import constants as C
+
+    monkeypatch.setattr(C, "PROOF_CAPACITY_ACCEPT_FASTER_RUNTIME", True)
+    with pytest.raises(
+        ProofCapacityQualificationError, match="runtime fingerprint"
+    ):
+        _validate(_manifest(runtime_fingerprint_hash="not-a-sha"))
+
+
+def test_matching_fingerprint_reports_no_carryover():
+    report = _validate(_manifest())
+    assert report["runtime_fingerprint_carried_over_from"] is None
