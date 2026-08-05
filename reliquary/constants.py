@@ -934,8 +934,14 @@ if (
 # PPO's old policy is the published checkpoint miners generated against. When
 # enabled, recompute those log-probabilities with verify_model rather than
 # trusting the miner-provided vector. A fixed KL anchor remains a separate model.
+#
+# Default ON: with the rolling KL reference, ref_model IS verify_model and the
+# trainer aliases the forward (behavior_lp = ref_lp), so the exact pi_old costs
+# zero extra forwards — while removing miner-fidelity noise (quantization,
+# kernels, hardware) from the PPO ratio and activating the pi_old_claim_*
+# telemetry that separates that noise from genuine checkpoint staleness.
 RECOMPUTE_PI_OLD_FROM_VERIFY = _os.environ.get(
-    "RELIQUARY_RECOMPUTE_PI_OLD_FROM_VERIFY", "false"
+    "RELIQUARY_RECOMPUTE_PI_OLD_FROM_VERIFY", "true"
 ).strip().lower() in ("1", "true", "yes", "on")
 
 # Optional persistent canary ceiling. When non-zero, a validator whose current
