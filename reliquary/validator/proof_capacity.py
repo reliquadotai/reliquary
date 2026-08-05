@@ -325,11 +325,22 @@ class ProofCapacityQualification:
                 or proof_path_hash is None
                 or _SHA256_RE.fullmatch(self.proof_path_hash) is None
                 or _SHA256_RE.fullmatch(proof_path_hash) is None
-                or self.proof_path_hash != proof_path_hash
             ):
                 raise ProofCapacityQualificationError(
                     "proof-capacity software revision mismatch"
                 )
+            if self.proof_path_hash != proof_path_hash:
+                from reliquary.constants import (
+                    PROOF_CAPACITY_ACCEPT_FASTER_RUNTIME,
+                )
+
+                # Same lower-bound argument as the runtime-fingerprint switch:
+                # an operator-asserted faster proof path keeps the stored
+                # capacity valid as a floor. Fail-closed without the switch.
+                if not PROOF_CAPACITY_ACCEPT_FASTER_RUNTIME:
+                    raise ProofCapacityQualificationError(
+                        "proof-capacity software revision mismatch"
+                    )
             qualification_carried_over_from = self.software_revision
         if (
             _COMMIT_SHA_RE.fullmatch(checkpoint_revision) is None

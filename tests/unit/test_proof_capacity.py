@@ -178,12 +178,14 @@ def _validate(
     *,
     devices: int = 9,
     software_revision: str | None = "b" * 40,
+    proof_path_hash: str | None = None,
 ):
     qualification = ProofCapacityQualification.from_mapping(manifest)
     return qualification.validate(
         profile_id="qwen35-4b-auction-v3",
         model_revision="a" * 40,
         software_revision=software_revision,
+        proof_path_hash=proof_path_hash,
         checkpoint_revision="c" * 40,
         runtime_fingerprint_hash="e" * 64,
         configured_devices=tuple(f"cuda:{i}" for i in range(devices)),
@@ -445,3 +447,26 @@ def test_faster_runtime_switch_keeps_malformed_hash_fail_closed(monkeypatch):
 def test_matching_fingerprint_reports_no_carryover():
     report = _validate(_manifest())
     assert report["runtime_fingerprint_carried_over_from"] is None
+
+
+def test_faster_runtime_switch_covers_proof_path_change(monkeypatch):
+    from reliquary import constants as C
+
+    # Different image AND different proof path: fail-closed by default...
+    with pytest.raises(
+        ProofCapacityQualificationError, match="software revision"
+    ):
+        _validate(
+            _manifest(software_revision="a" * 40, proof_path_hash="1" * 64),
+            software_revision="b" * 40,
+            proof_path_hash="2" * 64,
+        )
+    # ...carried over as a lower bound with the operator switch.
+    monkeypatch.setattr(C, "PROOF_CAPACITY_ACCEPT_FASTER_RUNTIME", True)
+    report = _validate(
+        _manifest(software_revision="a" * 40, proof_path_hash="1" * 64),
+        software_revision="b" * 40,
+        proof_path_hash="2" * 64,
+    )
+    assert report["qualified"] is True
+    assert report["qualification_carried_over_from"] == "a" * 40
