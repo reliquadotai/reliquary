@@ -1109,3 +1109,15 @@ FORCED_SEED_ENFORCE = _os.environ.get(
 # validator as a coordinated hard cutover; FORCED_SEED_ENFORCE=false is the
 # emergency compatibility switch.
 FORCED_SEED_PROTOCOL_VERSION = PROTOCOL_VERSION
+
+# Operator assertion that the CURRENT runtime is at least as fast on the proof
+# path as the one the proof-capacity manifest benchmarked (e.g. right after a
+# kernel upgrade such as installing causal-conv1d). Lets the stored
+# qualification carry over as a conservative lower bound instead of
+# crash-looping the weight-setter on the runtime-fingerprint check. Fail-closed
+# by default. NEVER assert this for a change that could slow proofs down —
+# re-run the capacity benchmark instead.
+PROOF_CAPACITY_ACCEPT_FASTER_RUNTIME = (
+    _os.environ.get("RELIQUARY_PROOF_CAPACITY_ACCEPT_FASTER_RUNTIME", "0")
+    not in ("0", "false", "False")
+)

@@ -346,10 +346,28 @@ class ProofCapacityQualification:
         if (
             _SHA256_RE.fullmatch(runtime_fingerprint_hash) is None
             or _SHA256_RE.fullmatch(self.runtime_fingerprint_hash) is None
-            or self.runtime_fingerprint_hash != runtime_fingerprint_hash
         ):
             raise ProofCapacityQualificationError(
                 "proof-capacity runtime fingerprint mismatch"
+            )
+        runtime_fingerprint_carried_over_from: str | None = None
+        if self.runtime_fingerprint_hash != runtime_fingerprint_hash:
+            from reliquary.constants import (
+                PROOF_CAPACITY_ACCEPT_FASTER_RUNTIME,
+            )
+
+            # A runtime change (kernel upgrade, dependency bump) invalidates
+            # the benchmark fingerprint. With the operator switch asserting
+            # the new runtime is AT LEAST AS FAST on the proof path, the
+            # stored capacity stays valid as a conservative lower bound — it
+            # was measured under the slower runtime, so it can only
+            # under-promise. Anything else stays fail-closed.
+            if not PROOF_CAPACITY_ACCEPT_FASTER_RUNTIME:
+                raise ProofCapacityQualificationError(
+                    "proof-capacity runtime fingerprint mismatch"
+                )
+            runtime_fingerprint_carried_over_from = (
+                self.runtime_fingerprint_hash
             )
         if self.benchmark_device_count <= 0:
             raise ProofCapacityQualificationError(
@@ -546,6 +564,9 @@ class ProofCapacityQualification:
             "checkpoint_revision": self.checkpoint_revision,
             "samples_sha256": self.samples_sha256,
             "runtime_fingerprint_hash": self.runtime_fingerprint_hash,
+            "runtime_fingerprint_carried_over_from": (
+                runtime_fingerprint_carried_over_from
+            ),
             "hardware_class": self.hardware_class,
             "configured_device_count": len(configured_devices),
             "configured_device_uuids": sorted(runtime_uuids),
