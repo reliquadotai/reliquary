@@ -731,6 +731,18 @@ DIFFICULTY_AUCTION_SHADOW_ENABLED = _os.environ.get(
 DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS = ("openmathinstruct",)
 DIFFICULTY_AUCTION_DELTA = 1.0
 
+# Flat auction valuation: every in-zone group ranks (and records) the same
+# value, so slot selection reduces to the sigma gate plus the throughput /
+# arrival tie-breaks. Removes the k=2 value peak (the Sybil duel target), the
+# manufactured-zero premium (+68% at k=6 under the peaked value function), and
+# the difficulty-hunting incentive: the batch k-distribution becomes the
+# natural corpus-times-model distribution, DAPO-style uniform + filter.
+# Per-slot payment is already flat (pool / B_BATCH), so this changes which
+# groups win slots, never how much a slot pays. Default off.
+DIFFICULTY_AUCTION_FLAT_VALUE = _os.environ.get(
+    "RELIQUARY_DIFFICULTY_AUCTION_FLAT_VALUE", "0"
+).strip().lower() not in ("0", "false", "no", "off", "")
+
 # Conservative valuation of truncated rollouts (closes the manufactured-zero
 # hole). The auction pays more for HARD prompts (value peaks at low k), so a
 # miner can inflate a prompt's value by breaking one of its own correct
