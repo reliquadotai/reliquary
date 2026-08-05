@@ -92,6 +92,7 @@ from reliquary.validator.difficulty_auction import (
     ShadowSubmission,
     auction_difficulty_score,
     auction_value,
+    flat_auction_value,
     difficulty_score,
     select_shadow_auction,
 )
@@ -367,7 +368,7 @@ def _pending_difficulty_score(pending):
     if robust_utility is None:
         return score
     return type(score)(
-        value=float(robust_utility),
+        value=flat_auction_value(float(robust_utility)),
         mean_reward=score.mean_reward,
         reward_std=score.reward_std,
         reward_count=score.reward_count,
@@ -413,7 +414,10 @@ class PendingSubmission:
     value: float = field(init=False, default=0.0)
 
     def __post_init__(self):
-        self.value = (
+        # flat_auction_value: identity unless flat valuation is on; the
+        # robust_utility branch bypasses auction_value, so it must be
+        # flattened here too or truncated groups would rank on magnitude.
+        self.value = flat_auction_value(
             float(self.robust_utility)
             if self.robust_utility is not None
             else auction_value(

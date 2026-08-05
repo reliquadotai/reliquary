@@ -253,6 +253,19 @@ def conservative_difficulty_score(
     return best if best is not None else difficulty_score(values, delta=delta)
 
 
+def flat_auction_value(value: float) -> float:
+    """Collapse a positive auction value to 1.0 under flat valuation.
+
+    Zero stays zero: degenerate / out-of-zone groups must keep ranking last.
+    Identity when ``DIFFICULTY_AUCTION_FLAT_VALUE`` is off.
+    """
+    from reliquary.constants import DIFFICULTY_AUCTION_FLAT_VALUE
+
+    if DIFFICULTY_AUCTION_FLAT_VALUE and value > 0.0:
+        return 1.0
+    return value
+
+
 def auction_difficulty_score(
     rewards: Iterable[float],
     *,
@@ -265,6 +278,10 @@ def auction_difficulty_score(
     is set a group carrying truncated rollouts is valued under the least
     favourable interpretation of them (see ``conservative_difficulty_score``),
     which removes any gain from manufacturing a truncated rollout.
+
+    Under ``DIFFICULTY_AUCTION_FLAT_VALUE`` the ranked scalar collapses to
+    the in-zone indicator (mean/std telemetry stays real); tie-breaks then
+    order the equally-valued candidates.
     """
     from reliquary.constants import (
         CONSERVATIVE_TRUNCATION_VALUE,
@@ -273,10 +290,17 @@ def auction_difficulty_score(
 
     resolved_delta = DIFFICULTY_AUCTION_DELTA if delta is None else delta
     if CONSERVATIVE_TRUNCATION_VALUE and truncated_count > 0:
-        return conservative_difficulty_score(
+        score = conservative_difficulty_score(
             rewards, truncated_count=truncated_count, delta=resolved_delta
         )
-    return difficulty_score(rewards, delta=resolved_delta)
+    else:
+        score = difficulty_score(rewards, delta=resolved_delta)
+    flat = flat_auction_value(score.value)
+    if flat != score.value:
+        return DifficultyScore(
+            flat, score.mean_reward, score.reward_std, score.reward_count
+        )
+    return score
 
 
 def auction_value(
