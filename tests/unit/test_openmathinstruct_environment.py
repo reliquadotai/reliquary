@@ -460,3 +460,82 @@ def test_load_dataset_keeps_the_whole_listing_pre_v4(monkeypatch):
     _load_dataset("nvidia/OpenMathInstruct-2", "rev")
 
     assert seen["filename_prefix"] is None
+
+
+# ---------------------------------------------------------------------------
+# Extraction fixes: inline LaTeX delimiters and Answer:-line completions.
+# Both are measured false-negative sources (3/32 verdicts flipped in one cell
+# of the 2026-08-03 headroom study).
+
+
+def test_normalize_strips_inline_latex_delimiters():
+    from reliquary.environment.openmathinstruct import (
+        _compute_omi_reward,
+        _normalize_answer,
+    )
+
+    assert _normalize_answer(r"\(\frac{14}{3}\)") == _normalize_answer(
+        r"\frac{14}{3}"
+    )
+    assert _normalize_answer(r"\[p - q\]") == _normalize_answer("p - q")
+
+
+def test_answer_line_extraction_plain():
+    from reliquary.environment.openmathinstruct import (
+        _compute_omi_reward,
+        _normalize_answer,
+    )
+
+    problem = {"ground_truth": "42"}
+    assert _compute_omi_reward(problem, "Step 1: compute.\nAnswer: 42") == 1.0
+
+
+def test_answer_line_extraction_markdown_emphasis():
+    from reliquary.environment.openmathinstruct import (
+        _compute_omi_reward,
+        _normalize_answer,
+    )
+
+    problem = {"ground_truth": "0"}
+    assert _compute_omi_reward(problem, "reasoning...\n**Answer:** 0") == 1.0
+
+
+def test_answer_line_takes_last_occurrence():
+    from reliquary.environment.openmathinstruct import (
+        _compute_omi_reward,
+        _normalize_answer,
+    )
+
+    problem = {"ground_truth": "7"}
+    text = "Answer: 3\nWait, recompute.\nAnswer: 7"
+    assert _compute_omi_reward(problem, text) == 1.0
+
+
+def test_boxed_still_wins_over_answer_line():
+    from reliquary.environment.openmathinstruct import (
+        _compute_omi_reward,
+        _normalize_answer,
+    )
+
+    problem = {"ground_truth": "5"}
+    text = "Answer: 3\nActually \\boxed{5}"
+    assert _compute_omi_reward(problem, text) == 1.0
+
+
+def test_answer_line_with_inline_latex_value():
+    from reliquary.environment.openmathinstruct import (
+        _compute_omi_reward,
+        _normalize_answer,
+    )
+
+    problem = {"ground_truth": r"\frac{14}{3}"}
+    assert _compute_omi_reward(problem, r"Answer: \(\frac{14}{3}\)") == 1.0
+
+
+def test_no_answer_still_zero():
+    from reliquary.environment.openmathinstruct import (
+        _compute_omi_reward,
+        _normalize_answer,
+    )
+
+    assert _compute_omi_reward({"ground_truth": "1"}, "I cannot solve this.") == 0.0
