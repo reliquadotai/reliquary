@@ -100,6 +100,80 @@ def _warp_batch(logits: torch.Tensor, t: float, top_k: int, top_p: float) -> tor
     return probs / probs.sum(dim=-1, keepdim=True)
 
 
+def _interval_stats_dense(
+    chunk_logits: torch.Tensor,
+    toks: torch.Tensor,
+    *,
+    t: float,
+    top_k: int,
+    top_p: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reference path: full-vocab warp + CDF. Returns (max_prob, lower, upper, mass)."""
+    probs = _warp_batch(chunk_logits, t=t, top_k=top_k, top_p=top_p)
+    cdf = torch.cumsum(probs, dim=-1)
+    row = torch.arange(chunk_logits.shape[0], device=cdf.device)
+    upper = cdf[row, toks]
+    mass = probs[row, toks]
+    return probs.max(dim=-1).values, upper - mass, upper, mass
+
+
+# Extra topk slots beyond top_k so boundary ties at the kth value stay inside
+# the window. Rows whose ties might extend past the window fall back to the
+# dense path, so the sparse result is never a guess.
+_SPARSE_TIE_MARGIN = 32
+
+
+def _interval_stats_sparse(
+    chunk_logits: torch.Tensor,
+    toks: torch.Tensor,
+    *,
+    t: float,
+    top_k: int,
+    top_p: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Same math as ``_interval_stats_dense`` restricted to the top-k window.
+
+    Only ≤ ``top_k`` tokens (plus kth-value ties) survive the warp, so the
+    per-position CDF interval needs a ~52-value window, not a 248k-vocab sort
+    and cumsum. Candidate selection runs on the raw logits (bf16→fp32 and /t
+    are monotone, so the survivor set is identical); all arithmetic then runs
+    in fp32 on the gathered window, mirroring the dense path. Rows whose kth
+    value still ties at the window edge are recomputed densely by the caller.
+    """
+    vocab = int(chunk_logits.shape[-1])
+    window = min(vocab, max(1, int(top_k)) + _SPARSE_TIE_MARGIN)
+    vals, idx = torch.topk(chunk_logits, window, dim=-1)
+    lg = vals.float() / float(t)
+    if top_k and top_k > 0 and top_k < vocab:
+        kth = lg[:, min(top_k, window) - 1 : min(top_k, window)]
+        tie_overflow = lg[:, -1:] >= kth
+        lg = torch.where(lg < kth, torch.full_like(lg, float("-inf")), lg)
+    else:
+        tie_overflow = torch.zeros_like(lg[:, -1:], dtype=torch.bool)
+    probs = torch.softmax(lg, dim=-1)
+    if top_p and top_p < 1.0:
+        # vals are already sorted descending, so probs are too — the top-p
+        # walk needs no extra sort.
+        cum = torch.cumsum(probs, dim=-1)
+        probs = torch.where(
+            (cum - probs) < top_p, probs, torch.zeros_like(probs)
+        )
+    probs = probs / probs.sum(dim=-1, keepdim=True)
+    tok_col = toks.unsqueeze(1)
+    mass = (probs * (idx == tok_col)).sum(dim=-1)
+    upper = (probs * (idx <= tok_col)).sum(dim=-1)
+    max_probs = probs.max(dim=-1).values
+    # Poison overflow rows so the caller can spot and recompute them densely.
+    overflow = tie_overflow.squeeze(1)
+    nan = torch.full_like(mass, float("nan"))
+    return (
+        torch.where(overflow, nan, max_probs),
+        torch.where(overflow, nan, upper - mass),
+        torch.where(overflow, nan, upper),
+        torch.where(overflow, nan, mass),
+    )
+
+
 def seed_consistency_diagnostics(
     logits: torch.Tensor,
     token_ids: list[int],
@@ -160,23 +234,31 @@ def seed_consistency_diagnostics(
             )
             chunk_logits = logits.index_select(0, row_indices)
 
-        probs = _warp_batch(chunk_logits, t=t, top_k=top_k, top_p=top_p)
-        max_probs = probs.max(dim=-1).values
-        stochastic = max_probs < stochastic_threshold
-        cdf = torch.cumsum(probs, dim=-1)
         toks = torch.tensor(
             [int(x) for x in token_ids[start:end]],
-            device=cdf.device,
+            device=chunk_logits.device,
             dtype=torch.long,
         )
-        row = torch.arange(end - start, device=cdf.device)
-        upper = cdf[row, toks]
-        mass = probs[row, toks]
-        lower = upper - mass
+        max_probs, lower, upper, mass = _interval_stats_sparse(
+            chunk_logits, toks, t=t, top_k=top_k, top_p=top_p,
+        )
+        fallback = torch.isnan(mass)
+        if bool(fallback.any()):
+            # kth-value ties reached the window edge: recompute those rows on
+            # the full vocab so the sparse path never changes a verdict.
+            d_max, d_lower, d_upper, d_mass = _interval_stats_dense(
+                chunk_logits[fallback], toks[fallback],
+                t=t, top_k=top_k, top_p=top_p,
+            )
+            max_probs = max_probs.masked_scatter(fallback, d_max)
+            lower = lower.masked_scatter(fallback, d_lower)
+            upper = upper.masked_scatter(fallback, d_upper)
+            mass = mass.masked_scatter(fallback, d_mass)
+        stochastic = max_probs < stochastic_threshold
         u = torch.tensor(
             [float(x) for x in u_values[start:end]],
-            device=cdf.device,
-            dtype=cdf.dtype,
+            device=upper.device,
+            dtype=upper.dtype,
         )
 
         exact = (u >= lower) & (u < upper)
@@ -194,7 +276,7 @@ def seed_consistency_diagnostics(
                 if position_offsets is not None
                 else list(range(start, end))
             ),
-            device=cdf.device,
+            device=upper.device,
             dtype=torch.long,
         )
         hard_offsets = offsets[hard_mismatch]

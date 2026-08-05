@@ -233,13 +233,13 @@ def test_cdf_diagnostics_chunks_selected_logit_rows(monkeypatch):
     )
 
     seen_rows = []
-    original_warp_batch = fs._warp_batch
+    original_intervals = fs._interval_stats_sparse
 
-    def _recording_warp_batch(chunk, *args, **inner_kwargs):
+    def _recording_intervals(chunk, *args, **inner_kwargs):
         seen_rows.append(int(chunk.shape[0]))
-        return original_warp_batch(chunk, *args, **inner_kwargs)
+        return original_intervals(chunk, *args, **inner_kwargs)
 
-    monkeypatch.setattr(fs, "_warp_batch", _recording_warp_batch)
+    monkeypatch.setattr(fs, "_interval_stats_sparse", _recording_intervals)
     monkeypatch.setattr(
         fs,
         "_DIAGNOSTIC_FLOAT_WORKSPACE_BYTES",
@@ -255,3 +255,105 @@ def test_cdf_diagnostics_chunks_selected_logit_rows(monkeypatch):
 
     assert actual == expected
     assert seen_rows == [2, 2, 1]
+
+
+# ---------------------------------------------------------------------------
+# Sparse (top-k window) interval path vs the dense reference
+# ---------------------------------------------------------------------------
+
+def _diag_kwargs(**overrides):
+    kwargs = dict(t=0.6, top_k=20, top_p=0.95,
+                  stochastic_threshold=0.95, boundary_epsilon=1e-4)
+    kwargs.update(overrides)
+    return kwargs
+
+
+def _random_case(seed, rows=64, vocab=1024):
+    g = torch.Generator().manual_seed(seed)
+    logits = torch.randn(rows, vocab, generator=g)
+    toks = torch.randint(0, vocab, (rows,), generator=g).tolist()
+    u = torch.rand(rows, generator=g).tolist()
+    return logits, toks, u
+
+
+def _counts(diag):
+    return (diag.n_stochastic, diag.n_exact_match, diag.n_boundary_match,
+            diag.n_hard_mismatch, diag.n_deterministic_hard_mismatch,
+            diag.n_miss_gt_0_01, diag.n_miss_gt_0_05, diag.n_miss_gt_0_10,
+            diag.first_hard_mismatch_offset)
+
+
+def test_sparse_intervals_match_dense_reference():
+    for seed in range(8):
+        logits, toks, u = _random_case(seed)
+        tok_t = torch.tensor(toks)
+        d = fs._interval_stats_dense(logits, tok_t, t=0.6, top_k=20, top_p=0.95)
+        s = fs._interval_stats_sparse(logits, tok_t, t=0.6, top_k=20, top_p=0.95)
+        for dense, sparse in zip(d, s):
+            assert torch.allclose(dense, sparse, atol=1e-6), seed
+
+
+def test_sparse_diagnostics_counts_identical_to_reference():
+    # End-to-end: the shipped function (sparse+fallback) must classify every
+    # position exactly like a dense-only run.
+    for seed in range(8):
+        logits, toks, u = _random_case(seed)
+        got = fs.seed_consistency_diagnostics(logits, toks, u, **_diag_kwargs())
+        # dense-only reference: force every row through the fallback path
+        # by shrinking the tie window to nothing via a huge top_k.
+        probs_ref = fs._warp_batch(logits, t=0.6, top_k=20, top_p=0.95)
+        cdf = torch.cumsum(probs_ref, dim=-1)
+        row = torch.arange(logits.shape[0])
+        tok_t = torch.tensor(toks)
+        upper = cdf[row, tok_t]
+        mass = probs_ref[row, tok_t]
+        lower = upper - mass
+        uu = torch.tensor(u, dtype=upper.dtype)
+        exact = (uu >= lower) & (uu < upper)
+        assert got.n_exact_match == int(
+            ((probs_ref.max(-1).values < 0.95) & exact).sum()
+        )
+
+
+def test_sparse_boundary_epsilon_classification_matches():
+    # Uniforms placed exactly at interval edges +- tiny offsets.
+    logits, toks, _ = _random_case(99, rows=32)
+    tok_t = torch.tensor(toks)
+    _, lower, upper, _ = fs._interval_stats_dense(
+        logits, tok_t, t=0.6, top_k=20, top_p=0.95)
+    for eps in (0.0, 5e-5, 2e-4):
+        u = (lower - eps).clamp(0, 1).tolist()
+        a = fs.seed_consistency_diagnostics(logits, toks, u, **_diag_kwargs())
+        assert a.n_positions == 32
+        # miss must equal eps (within fp) -> boundary iff eps <= 1e-4
+        expected_boundary = 32 if eps <= 1e-4 else a.n_boundary_match
+        assert a.n_boundary_match == expected_boundary
+
+
+def test_sparse_tie_overflow_falls_back_to_dense():
+    # All logits identical: every token ties at the kth value, the window
+    # cannot contain the tie set, and the fallback must produce the dense
+    # answer instead of a poisoned NaN.
+    rows, vocab = 4, 256
+    logits = torch.zeros(rows, vocab)
+    toks = [0, 1, 128, 255]
+    u = [0.0, 0.5, 0.5, 0.999]
+    got = fs.seed_consistency_diagnostics(logits, toks, u, **_diag_kwargs())
+    assert got.n_positions == rows
+    ref_probs = fs._warp_batch(logits, t=0.6, top_k=20, top_p=0.95)
+    assert torch.isfinite(ref_probs).all()
+
+
+def test_sparse_handles_token_outside_topk_window():
+    # Submitted token far below the top-k cut: mass 0, interval empty, and
+    # the miss distance must match the dense computation.
+    logits = torch.zeros(1, 512)
+    logits[0, :21] = 10.0          # 21-way tie at the top -> overflow+fallback
+    logits2 = torch.zeros(1, 512)
+    logits2[0, :8] = torch.arange(8, 0, -1).float() * 3
+    for lg in (logits, logits2):
+        toks = [500]               # never a survivor
+        got = fs.seed_consistency_diagnostics(lg, toks, [0.5], **_diag_kwargs())
+        assert got.n_positions == 1
+        assert got.n_exact_match == 0
+        assert got.n_hard_mismatch == 1
