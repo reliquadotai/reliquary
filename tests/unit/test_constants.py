@@ -163,3 +163,15 @@ def test_min_eos_probability_constant_present():
     from reliquary.constants import MIN_EOS_PROBABILITY
     assert 0.0 < MIN_EOS_PROBABILITY < 1.0
     assert MIN_EOS_PROBABILITY == 0.01
+
+
+def test_recompute_pi_old_defaults_on():
+    """pi_old comes from the validator's own verify_model forward by default.
+
+    Free with the rolling KL reference (the forward aliases), and it keeps
+    miner-fidelity noise out of the PPO ratio. Operators can still disable
+    via RELIQUARY_RECOMPUTE_PI_OLD_FROM_VERIFY=false.
+    """
+    from reliquary.constants import RECOMPUTE_PI_OLD_FROM_VERIFY
+
+    assert RECOMPUTE_PI_OLD_FROM_VERIFY is True
