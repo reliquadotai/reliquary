@@ -70,11 +70,19 @@ def _strip_boxed_wrapper(s: str) -> str:
 _TEXT_RE = re.compile(r"\\text\{([^}]*)\}")
 _MBOX_RE = re.compile(r"\\mbox\{([^}]*)\}")
 
+# "Answer: X" line, tolerating markdown emphasis around the cue
+# ("**Answer:** 0"). Boxed extraction still takes precedence.
+_ANSWER_LINE_RE = re.compile(r"^[\s*_]*Answer[\s*_]*:[\s*_]*(.+?)\s*$", re.MULTILINE)
+
 
 def _normalize_answer(s: str) -> str:
     if s is None:
         return ""
     s = str(s)
+    # Inline/display LaTeX delimiters: models emit "\(x\)" / "\[x\]" around
+    # unboxed answers; the delimiters never carry meaning.
+    for delim in (r"\(", r"\)", r"\[", r"\]"):
+        s = s.replace(delim, "")
     # Drop LaTeX spacing macros first
     for macro in (r"\!", r"\,", r"\ ", r"\;", r"\:"):
         s = s.replace(macro, "")
@@ -376,17 +384,20 @@ def _compute_omi_reward(problem: dict, completion: str) -> float:
     """
     try:
         boxed = _last_boxed_only_string(completion)
-        if boxed is None:
-            # Fallback: try to find a trailing number / fraction at end of text
-            # (some models output the answer without boxing)
-            tail = completion.strip().split("\n")[-1].strip()
-            # Match a leading number/fraction at start of last line
-            m = re.match(r"^([\-\+]?\d+(?:\.\d+)?(?:/\d+)?)", tail)
-            if m is None:
-                return 0.0
-            candidate = _normalize_answer(m.group(1))
-        else:
+        if boxed is not None:
             candidate = _normalize_answer(_strip_boxed_wrapper(boxed))
+        else:
+            answer_lines = _ANSWER_LINE_RE.findall(completion)
+            if answer_lines:
+                candidate = _normalize_answer(answer_lines[-1])
+            else:
+                # Fallback: trailing number / fraction at end of text
+                # (some models output the answer without boxing)
+                tail = completion.strip().split("\n")[-1].strip()
+                m = re.match(r"^([\-\+]?\d+(?:\.\d+)?(?:/\d+)?)", tail)
+                if m is None:
+                    return 0.0
+                candidate = _normalize_answer(m.group(1))
         gt = _normalize_answer(problem.get("ground_truth", ""))
         if gt == "":
             return 0.0
