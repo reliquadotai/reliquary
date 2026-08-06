@@ -737,6 +737,14 @@ DIFFICULTY_AUCTION_DELTA = 1.0
 # manufactured-zero premium (+68% at k=6 under the peaked value function), and
 # the difficulty-hunting incentive: the batch k-distribution becomes the
 # natural corpus-times-model distribution, DAPO-style uniform + filter.
+#
+# Measured on production winners (.r2_analysis/_kcost.py, windows 27410-27494,
+# math): median generation cost is flat across k — 127.6k/127.6k/127.1k/
+# 127.0k/126.5k tokens for k=2..6 — while value-per-token under delta=1 pays
+# k=2 three times k=6 (2.55 vs 0.86 per Mtok). Same cost, 3x the pay: the
+# peak is pure incentive distortion, and the trained pool sits at mode k=2
+# (39% math, 65-88% code). Flat pay-per-token is ~7.87/Mtok for every k.
+#
 # Per-slot payment is already flat (pool / B_BATCH), so this changes which
 # groups win slots, never how much a slot pays. Default off.
 DIFFICULTY_AUCTION_FLAT_VALUE = _os.environ.get(
