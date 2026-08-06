@@ -741,7 +741,7 @@ DIFFICULTY_AUCTION_DELTA = 1.0
 # groups win slots, never how much a slot pays. Default off.
 DIFFICULTY_AUCTION_FLAT_VALUE = _os.environ.get(
     "RELIQUARY_DIFFICULTY_AUCTION_FLAT_VALUE", "0"
-).strip().lower() not in ("0", "false", "no", "off", "")
+).strip().lower() in ("1", "true", "yes", "on")
 
 # Conservative valuation of truncated rollouts (closes the manufactured-zero
 # hole). The auction pays more for HARD prompts (value peaks at low k), so a
