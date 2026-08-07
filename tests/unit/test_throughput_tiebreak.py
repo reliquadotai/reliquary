@@ -84,3 +84,48 @@ def test_generated_tokens_degrade_instead_of_raising():
     assert _generated_tokens_of(
         SimpleNamespace(request=SimpleNamespace(rollouts=[bad]))
     ) == 0
+
+
+def test_generated_tokens_cap_each_rollout():
+    from types import SimpleNamespace
+    from reliquary.validator.batcher import _generated_tokens_of
+
+    long_roll = SimpleNamespace(
+        commit={"rollout": {"completion_length": 16384}}
+    )
+    pending = SimpleNamespace(
+        request=SimpleNamespace(rollouts=[long_roll] * 8)
+    )
+    assert _generated_tokens_of(pending, per_rollout_cap=15616) == 15616 * 8
+    assert _generated_tokens_of(pending) == 16384 * 8  # uncapped by default
+
+
+def test_group_totals_stay_discriminant_under_group_scale_cap():
+    """Regression: token_cap=15616 (a single-rollout scale) applied to the
+    8-rollout SUM clamped 53% of production groups onto one constant, so the
+    throughput tie-break degenerated into raw arrival speed — the exact
+    behavior it was designed to replace. At group scale (M_ROLLOUTS x cap),
+    real measured totals (3k-129k) must map to distinct ranks again."""
+    same_arrival = dict(
+        arrival_round=1060,
+        window_open_round=1000,
+        bucket_tokens_per_round=50,
+    )
+    # old group cap: both real-world totals collapse onto the same bucket
+    assert throughput_rank(
+        47_572, token_cap=15616, **same_arrival
+    ) == throughput_rank(20_000, token_cap=15616, **same_arrival)
+    # group-scale cap: they are discriminant again
+    assert throughput_rank(
+        47_572, token_cap=15616 * 8, **same_arrival
+    ) != throughput_rank(20_000, token_cap=15616 * 8, **same_arrival)
+
+
+def test_batcher_wires_the_group_scale_cap():
+    import inspect
+
+    import reliquary.validator.batcher as B
+
+    src = inspect.getsource(B)
+    assert "per_rollout_cap=throughput_profile.token_cap" in src
+    assert "token_cap=throughput_profile.token_cap * M_ROLLOUTS" in src
