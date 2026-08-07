@@ -866,36 +866,48 @@ class GlobalProofScheduler:
             ):
                 return None
         eligible: list[RankedProof] = []
-        for prompt, chain in state.prompt_chains.items():
-            if prompt in state.claimed_prompts:
-                continue
-            position = state.prompt_positions[prompt]
-            if position >= len(chain):
-                continue
-            job_id = chain[position]
-            if state.phases[job_id] is not _JobPhase.PENDING:
-                continue
-            candidate = state.candidate_by_id[job_id]
-            exhausted = any(
-                state.resource_failures[resource_key] >= failure_limit
-                for resource_key, failure_limit in candidate.resources
-            )
-            if exhausted:
-                state.phases[job_id] = _JobPhase.RESOURCE_LIMIT
-                continue
-            if any(
-                resource_key in self._active_resource_keys
-                for resource_key, _failure_limit in candidate.resources
-            ):
-                continue
-            eligible.append(candidate)
-        if any(
-            phase is _JobPhase.RESOURCE_LIMIT
-            for phase in state.phases.values()
-        ):
-            self._apply_ready_locked(state)
-            if state.final_result is None:
-                return self._next_candidate_locked(state)
+        newly_limited = True
+        while newly_limited:
+            eligible = []
+            newly_limited = False
+            for prompt, chain in state.prompt_chains.items():
+                if prompt in state.claimed_prompts:
+                    continue
+                position = state.prompt_positions[prompt]
+                if position >= len(chain):
+                    continue
+                job_id = chain[position]
+                if state.phases[job_id] is not _JobPhase.PENDING:
+                    continue
+                candidate = state.candidate_by_id[job_id]
+                exhausted = any(
+                    state.resource_failures[resource_key] >= failure_limit
+                    for resource_key, failure_limit in candidate.resources
+                )
+                if exhausted:
+                    # Only PENDING jobs are examined, so every mark made here
+                    # is new. Keying the re-derive on *new* marks (not on any
+                    # RESOURCE_LIMIT phase existing) is what bounds the loop:
+                    # a mark ranked behind a still-pending job survives
+                    # _apply_ready_locked, and treating its mere existence as
+                    # "re-derive" livelocked candidate selection until the
+                    # recursion blew the stack (2026-08-07 incident).
+                    state.phases[job_id] = _JobPhase.RESOURCE_LIMIT
+                    newly_limited = True
+                    continue
+                if any(
+                    resource_key in self._active_resource_keys
+                    for resource_key, _failure_limit in candidate.resources
+                ):
+                    continue
+                eligible.append(candidate)
+            if newly_limited:
+                # New marks may unlock synthetic decisions (and can complete
+                # the plan): apply, then re-derive eligibility from the
+                # updated positions unless the plan just went terminal.
+                self._apply_ready_locked(state)
+                if state.final_result is not None:
+                    break
         return min(eligible, key=lambda item: item.rank) if eligible else None
 
     def _reevaluate_plan_locked(self, state: _PlanState) -> None:

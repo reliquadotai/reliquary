@@ -777,3 +777,54 @@ def test_proof_exception_faults_scheduler_without_promoting_lower_rank():
     assert snapshot["totals"]["proof_errors"] == 1
     assert snapshot["totals"]["jobs_completed"] == 1
     assert snapshot["dispatches_by_environment"][MATH] == 1
+
+
+def test_resource_limit_mark_behind_pending_job_does_not_livelock():
+    """Regression for the 2026-08-07 production incident (windows 28006+).
+
+    When an exhausted operator's candidate is ranked AFTER a still-pending
+    eligible job, the apply cursor cannot consume the RESOURCE_LIMIT phase
+    (it stops at the pending job). ``_next_candidate_locked`` then saw a
+    sticky ``any(phase is RESOURCE_LIMIT)`` and recursed unboundedly:
+    RecursionError killed the proof worker thread and every subsequent
+    window aborted with deadline_exceeded.
+    """
+
+    def prove(invocation):
+        return invocation.candidate.job_id != "job-1"
+
+    with GlobalProofScheduler(
+        devices=("gpu-0",),
+        environments=(MATH, CODE),
+        proof_callable=prove,
+        checkpoint_revision="rev-a",
+    ) as scheduler:
+        result = scheduler.submit(
+            _plan(
+                "math-window",
+                MATH,
+                [
+                    # rank 1: operator-a burns its whole failure budget
+                    _candidate(
+                        1,
+                        prompt="first",
+                        resources=(("operator-a", 1),),
+                    ),
+                    # rank 2: unrelated pending job -> blocks the apply cursor
+                    _candidate(2, prompt="second"),
+                    # rank 3: operator-a again -> marked RESOURCE_LIMIT while
+                    # ranked behind the pending job-2
+                    _candidate(
+                        3,
+                        prompt="third",
+                        resources=(("operator-a", 1),),
+                    ),
+                ],
+                required=1,
+            )
+        ).result(5)
+
+    statuses = {d.job_id: d.status for d in result.decisions}
+    assert statuses["job-1"] is ProofDecisionStatus.REJECTED
+    assert statuses["job-3"] is ProofDecisionStatus.SKIPPED_RESOURCE_LIMIT
+    assert result.winner_job_ids == ("job-2",)
