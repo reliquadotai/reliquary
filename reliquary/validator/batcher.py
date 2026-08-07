@@ -19,6 +19,7 @@ from typing import Any, Callable
 from pydantic import ValidationError
 
 from reliquary.constants import (
+    M_ROLLOUTS,
     BATCH_PROMPT_COOLDOWN_WINDOWS,
     PROTOCOL_THROUGHPUT_TIEBREAK,
     B_BATCH,
@@ -333,7 +334,7 @@ _PROOF_FAILURE_DEBT_STAGES = frozenset(
 # PROMPT_CLAIMED reject is needed.
 
 
-def _generated_tokens_of(pending) -> int:
+def _generated_tokens_of(pending, *, per_rollout_cap: int | None = None) -> int:
     """Generated tokens across a candidate's rollouts, for the throughput rank.
 
     Sums each rollout's ``completion_length`` rather than ``len(tokens)``: the
@@ -341,15 +342,24 @@ def _generated_tokens_of(pending) -> int:
     it submits, so a long prompt would inflate the rank for free. Degrades to 0
     on any unexpected shape, which lands the candidate in the last bucket and
     leaves arrival to order it — never raises inside the seal path.
+
+    ``per_rollout_cap`` bounds each rollout's contribution: the anti-padding
+    cap belongs at the level where padding exists (one rollout), while the
+    caller applies the group ceiling at ``M_ROLLOUTS x cap``. Applying the
+    single-rollout cap to this 8-rollout SUM clamped 53% of production groups
+    onto one constant and degenerated the tie-break into raw arrival speed.
     """
     request = getattr(pending, "request", None)
     total = 0
     for rollout in (getattr(request, "rollouts", None) or ()):
         meta = (getattr(rollout, "commit", None) or {}).get("rollout", {}) or {}
         try:
-            total += max(0, int(meta.get("completion_length", 0) or 0))
+            generated = max(0, int(meta.get("completion_length", 0) or 0))
         except (TypeError, ValueError):
             continue
+        if per_rollout_cap is not None:
+            generated = min(generated, int(per_rollout_cap))
+        total += generated
     return total
 
 
@@ -4053,10 +4063,17 @@ class GrpoWindowBatcher:
         for pending_submission, _score in scored:
             throughput_by_id[id(pending_submission)] = (
                 throughput_rank(
-                    _generated_tokens_of(pending_submission),
+                    # Anti-padding cap per rollout; the group ceiling below is
+                    # M_ROLLOUTS x cap so real 8-rollout totals stay
+                    # discriminant (the single-rollout cap on the sum clamped
+                    # 53% of groups onto one constant = raw arrival ordering).
+                    _generated_tokens_of(
+                        pending_submission,
+                        per_rollout_cap=throughput_profile.token_cap,
+                    ),
                     arrival_round=arrival_by_id[id(pending_submission)],
                     window_open_round=int(window_open),
-                    token_cap=throughput_profile.token_cap,
+                    token_cap=throughput_profile.token_cap * M_ROLLOUTS,
                     bucket_tokens_per_round=(
                         throughput_profile.bucket_tokens_per_round
                     ),
