@@ -731,6 +731,26 @@ DIFFICULTY_AUCTION_SHADOW_ENABLED = _os.environ.get(
 DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS = ("openmathinstruct",)
 DIFFICULTY_AUCTION_DELTA = 1.0
 
+# Flat auction valuation: every in-zone group ranks (and records) the same
+# value, so slot selection reduces to the sigma gate plus the throughput /
+# arrival tie-breaks. Removes the k=2 value peak (the Sybil duel target), the
+# manufactured-zero premium (+68% at k=6 under the peaked value function), and
+# the difficulty-hunting incentive: the batch k-distribution becomes the
+# natural corpus-times-model distribution, DAPO-style uniform + filter.
+#
+# Measured on production winners (.r2_analysis/_kcost.py, windows 27410-27494,
+# math): median generation cost is flat across k — 127.6k/127.6k/127.1k/
+# 127.0k/126.5k tokens for k=2..6 — while value-per-token under delta=1 pays
+# k=2 three times k=6 (2.55 vs 0.86 per Mtok). Same cost, 3x the pay: the
+# peak is pure incentive distortion, and the trained pool sits at mode k=2
+# (39% math, 65-88% code). Flat pay-per-token is ~7.87/Mtok for every k.
+#
+# Per-slot payment is already flat (pool / B_BATCH), so this changes which
+# groups win slots, never how much a slot pays. Default off.
+DIFFICULTY_AUCTION_FLAT_VALUE = _os.environ.get(
+    "RELIQUARY_DIFFICULTY_AUCTION_FLAT_VALUE", "0"
+).strip().lower() in ("1", "true", "yes", "on")
+
 # Conservative valuation of truncated rollouts (closes the manufactured-zero
 # hole). The auction pays more for HARD prompts (value peaks at low k), so a
 # miner can inflate a prompt's value by breaking one of its own correct
@@ -922,8 +942,14 @@ if (
 # PPO's old policy is the published checkpoint miners generated against. When
 # enabled, recompute those log-probabilities with verify_model rather than
 # trusting the miner-provided vector. A fixed KL anchor remains a separate model.
+#
+# Default ON: with the rolling KL reference, ref_model IS verify_model and the
+# trainer aliases the forward (behavior_lp = ref_lp), so the exact pi_old costs
+# zero extra forwards — while removing miner-fidelity noise (quantization,
+# kernels, hardware) from the PPO ratio and activating the pi_old_claim_*
+# telemetry that separates that noise from genuine checkpoint staleness.
 RECOMPUTE_PI_OLD_FROM_VERIFY = _os.environ.get(
-    "RELIQUARY_RECOMPUTE_PI_OLD_FROM_VERIFY", "false"
+    "RELIQUARY_RECOMPUTE_PI_OLD_FROM_VERIFY", "true"
 ).strip().lower() in ("1", "true", "yes", "on")
 
 # Optional persistent canary ceiling. When non-zero, a validator whose current

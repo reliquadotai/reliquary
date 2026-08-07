@@ -163,3 +163,49 @@ def test_min_eos_probability_constant_present():
     from reliquary.constants import MIN_EOS_PROBABILITY
     assert 0.0 < MIN_EOS_PROBABILITY < 1.0
     assert MIN_EOS_PROBABILITY == 0.01
+
+
+def test_flat_auction_value_unrecognized_env_value_stays_off():
+    """A default-off economic switch must fail closed: a typo ("ture",
+    "enable", ...) must disable flat valuation, not silently enforce it."""
+    env_name = "RELIQUARY_DIFFICULTY_AUCTION_FLAT_VALUE"
+    prior = os.environ.get(env_name)
+    os.environ[env_name] = "ture"
+    try:
+        importlib.reload(C)
+        assert C.DIFFICULTY_AUCTION_FLAT_VALUE is False
+    finally:
+        if prior is None:
+            os.environ.pop(env_name, None)
+        else:
+            os.environ[env_name] = prior
+        importlib.reload(C)
+
+
+def test_flat_auction_value_default_off_and_explicit_enable():
+    env_name = "RELIQUARY_DIFFICULTY_AUCTION_FLAT_VALUE"
+    prior = os.environ.pop(env_name, None)
+    try:
+        importlib.reload(C)
+        assert C.DIFFICULTY_AUCTION_FLAT_VALUE is False
+        os.environ[env_name] = "true"
+        importlib.reload(C)
+        assert C.DIFFICULTY_AUCTION_FLAT_VALUE is True
+    finally:
+        if prior is None:
+            os.environ.pop(env_name, None)
+        else:
+            os.environ[env_name] = prior
+        importlib.reload(C)
+
+
+def test_recompute_pi_old_defaults_on():
+    """pi_old comes from the validator's own verify_model forward by default.
+
+    Free with the rolling KL reference (the forward aliases), and it keeps
+    miner-fidelity noise out of the PPO ratio. Operators can still disable
+    via RELIQUARY_RECOMPUTE_PI_OLD_FROM_VERIFY=false.
+    """
+    from reliquary.constants import RECOMPUTE_PI_OLD_FROM_VERIFY
+
+    assert RECOMPUTE_PI_OLD_FROM_VERIFY is True
