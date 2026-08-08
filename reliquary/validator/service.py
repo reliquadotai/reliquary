@@ -94,6 +94,7 @@ from reliquary.validator.batcher import GrpoWindowBatcher
 from reliquary.validator.checkpoint import CheckpointStore
 from reliquary.validator.cooldown import ContentCooldownMap, CooldownMap
 from reliquary.validator.dedup import RolloutHashSet
+from reliquary.validator.errors import FatalProofPlaneError
 from reliquary.validator.observability import log_structured, runtime_revision
 from reliquary.validator.proof_scheduler import (
     GlobalProofScheduler,
@@ -110,10 +111,6 @@ from reliquary.validator.utility_telemetry import UtilityTelemetryWriter
 logger = logging.getLogger(__name__)
 
 _HF_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
-
-
-class FatalProofPlaneError(RuntimeError):
-    """Proof infrastructure is unsafe to reuse without a process restart."""
 
 
 def _cooldown_snapshot_key(run_id: str) -> str:
