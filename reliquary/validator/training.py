@@ -55,6 +55,27 @@ class TrainingStepSkipped(RuntimeError):
         self.metrics = dict(metrics or {})
 
 
+def _use_8bit_optimizer(params) -> bool:
+    """Whether to build the bitsandbytes paged 8-bit optimizer.
+
+    All three conditions must hold: the profile asks for it, CUDA is present,
+    and the parameters themselves live there — GPU availability alone must not
+    select a CUDA-only optimizer for host-resident parameters.
+
+    Lazy import so tests can monkeypatch reliquary.constants.
+    """
+    from reliquary.constants import OPTIMIZER_STATE_8BIT
+
+    params = list(params)
+    if not OPTIMIZER_STATE_8BIT:
+        return False
+    return (
+        torch.cuda.is_available()
+        and bool(params)
+        and all(parameter.device.type == "cuda" for parameter in params)
+    )
+
+
 def _build_optimizer(params) -> torch.optim.Optimizer:
     """Prefer bitsandbytes PagedAdamW8bit on CUDA — quantised optimiser
     state (~4× smaller than fp32 / ~2× smaller than bf16) plus unified
@@ -63,10 +84,7 @@ def _build_optimizer(params) -> torch.optim.Optimizer:
     boxes without a GPU).
     """
     params = list(params)
-    cuda_parameters = bool(params) and all(
-        parameter.device.type == "cuda" for parameter in params
-    )
-    if torch.cuda.is_available() and cuda_parameters:
+    if _use_8bit_optimizer(params):
         try:
             import bitsandbytes as bnb  # type: ignore[import-not-found]
             logger.info("Using bitsandbytes PagedAdamW8bit")

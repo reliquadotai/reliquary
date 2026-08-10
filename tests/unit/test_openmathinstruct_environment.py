@@ -416,3 +416,47 @@ def test_reward_numeric_and_structured_not_regressed():
     assert _compute_omi_reward({"ground_truth": "1/2"}, r"\boxed{0.5}") == 1.0
     assert _compute_omi_reward({"ground_truth": "82.50"}, r"\boxed{82.5}") == 1.0
     assert _compute_omi_reward({"ground_truth": "43"}, r"\boxed{42}") == 0.0
+
+
+def test_load_dataset_restricts_to_canonical_shards_on_v4(monkeypatch):
+    """v4 must ask the parquet view for the `train-` shards only.
+
+    Without it the manifest also lists train_1M/2M/5M, which are curated subsets
+    OF train: 8,000,000 duplicate rows, 36.4% of the index space, drawn 2-4x too
+    often by a uniform pick_prompt_idx.
+    """
+    import reliquary.constants as C
+    import reliquary.environment.virtual_parquet as VP
+    from reliquary.environment.openmathinstruct import _load_dataset
+
+    monkeypatch.setattr(C, "OMI_TRAIN_SHARDS_ONLY", True)
+    seen = {}
+
+    class _Spy:
+        def __init__(self, repo, revision, **kwargs):
+            seen.update(kwargs)
+
+    monkeypatch.setattr(VP, "VirtualParquetDataset", _Spy)
+
+    _load_dataset("nvidia/OpenMathInstruct-2", "rev")
+
+    assert seen["filename_prefix"] == "train-"
+
+
+def test_load_dataset_keeps_the_whole_listing_pre_v4(monkeypatch):
+    import reliquary.constants as C
+    import reliquary.environment.virtual_parquet as VP
+    from reliquary.environment.openmathinstruct import _load_dataset
+
+    monkeypatch.setattr(C, "OMI_TRAIN_SHARDS_ONLY", False)
+    seen = {}
+
+    class _Spy:
+        def __init__(self, repo, revision, **kwargs):
+            seen.update(kwargs)
+
+    monkeypatch.setattr(VP, "VirtualParquetDataset", _Spy)
+
+    _load_dataset("nvidia/OpenMathInstruct-2", "rev")
+
+    assert seen["filename_prefix"] is None

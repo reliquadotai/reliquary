@@ -7,6 +7,7 @@ test_training_grpo.py and test_training_rollout_loss.py.
 """
 
 import logging
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
@@ -184,3 +185,46 @@ def test_train_step_counts_degenerate_groups(monkeypatch):
 
     # No successful step → no metrics emitted.
     assert called == []
+
+
+# ── Optimizer-state precision. DAPO §4.1 trains with full-precision AdamW;
+# 8-bit paged state saves VRAM but its quantisation noise is a non-trivial
+# fraction of a 1e-6 update. v4 defaults to full precision, pre-v4 keeps 8-bit.
+
+class _FakeParam:
+    def __init__(self, device_type):
+        self.device = SimpleNamespace(type=device_type)
+
+
+def test_eight_bit_optimizer_declined_when_disabled(monkeypatch):
+    """The flag must win over CUDA availability, not merely add to it."""
+    import reliquary.constants as C
+    from reliquary.validator.training import _use_8bit_optimizer
+
+    monkeypatch.setattr(C, "OPTIMIZER_STATE_8BIT", False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    assert _use_8bit_optimizer([_FakeParam("cuda"), _FakeParam("cuda")]) is False
+
+
+def test_eight_bit_optimizer_selected_on_cuda_parameters_when_enabled(monkeypatch):
+    import reliquary.constants as C
+    from reliquary.validator.training import _use_8bit_optimizer
+
+    monkeypatch.setattr(C, "OPTIMIZER_STATE_8BIT", True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    assert _use_8bit_optimizer([_FakeParam("cuda")]) is True
+
+
+def test_eight_bit_optimizer_declined_for_cpu_parameters(monkeypatch):
+    """Pre-existing guard: GPU availability alone must not select a CUDA-only
+    optimizer when the parameters themselves live on the host."""
+    import reliquary.constants as C
+    from reliquary.validator.training import _use_8bit_optimizer
+
+    monkeypatch.setattr(C, "OPTIMIZER_STATE_8BIT", True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    assert _use_8bit_optimizer([_FakeParam("cpu")]) is False
+    assert _use_8bit_optimizer([]) is False

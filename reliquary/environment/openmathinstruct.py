@@ -418,8 +418,18 @@ def _load_dataset(repo: str, revision: str):
     if path.exists() and (path / "dataset_info.json").exists():
         import datasets as hf
         return hf.load_from_disk(str(path))
-    from reliquary.environment.virtual_parquet import VirtualParquetDataset
-    return VirtualParquetDataset(repo, revision, columns=["problem", "expected_answer"])
+    from reliquary.constants import OMI_TRAIN_SHARDS_ONLY
+    from reliquary.environment import virtual_parquet as _vp
+
+    return _vp.VirtualParquetDataset(
+        repo,
+        revision,
+        columns=["problem", "expected_answer"],
+        # v4+: canonical corpus only. train_1M/2M/5M are curated subsets OF
+        # train, so listing them duplicates 8,000,000 rows. This changes
+        # len(env), which is prompt-range consensus — cutover-only.
+        filename_prefix="train-" if OMI_TRAIN_SHARDS_ONLY else None,
+    )
 
 
 class OpenMathInstructEnvironment:
