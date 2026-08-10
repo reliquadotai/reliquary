@@ -297,6 +297,12 @@ def _force_span_valid(
 ) -> bool:
     if not meta.get("forced"):
         return True
+    # Mirror of verifier.validate_force_span: without BFT there is no
+    # profile-sanctioned force span, so a forced claim is tampering.
+    from reliquary.constants import BFT_ENABLED
+
+    if not BFT_ENABLED:
+        return False
     span = meta.get("force_span")
     if not isinstance(span, (list, tuple)) or len(span) != 2:
         return False
