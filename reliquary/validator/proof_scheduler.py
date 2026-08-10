@@ -816,6 +816,7 @@ class GlobalProofScheduler:
                 if self._shutdown:
                     return
                 self._expire_deadlines_locked()
+                self._reevaluate_idle_plans_locked()
                 self._condition.wait(self._deadline_poll_seconds)
 
     def _take_next_job_locked(
@@ -1269,6 +1270,18 @@ class GlobalProofScheduler:
             for state in self._plans.values()
             if state.final_result is None
         ]
+
+    def _reevaluate_idle_plans_locked(self) -> None:
+        """Repair terminal plan state after the last worker notification.
+
+        A plan can have no active or queued proof after its final completion
+        while its coordinator-side terminal reevaluation was missed.  The
+        deadline monitor is already a bounded scheduler heartbeat, so use it
+        to re-run the idempotent terminal checks and wake synchronous handles.
+        """
+        for state in self._unfinished_plans_locked():
+            if not state.active_job_ids:
+                self._reevaluate_plan_locked(state)
 
     def _maybe_finish_lifecycle_locked(self) -> None:
         if self._state not in (
