@@ -36,6 +36,15 @@ def prompt_content_sha256(environment: str, rendered_prompt: str) -> str:
 
 def render_canonical_prompt(tokenizer: Any, prompt: str) -> str:
     """Render a trusted user prompt exactly as admission will tokenize it."""
+    # Mirror of encode_prompt's guard. Both must switch on the same constant:
+    # this render feeds prompt_content_sha256 while encode_prompt feeds the
+    # generated tokens, and a disagreement between them is dropped silently at
+    # seal rather than rejected.
+    from reliquary.constants import RAW_COMPLETION_PROMPTS
+
+    if RAW_COMPLETION_PROMPTS:
+        return str(prompt)
+
     rendered = str(prompt)
     chat_template = getattr(tokenizer, "chat_template", None)
     if (

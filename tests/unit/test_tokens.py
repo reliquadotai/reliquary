@@ -184,3 +184,19 @@ def test_golden_encoding_matches_production_tokenizer():
         pytest.skip(f"production tokenizer unavailable: {e}")
 
     assert encode_prompt(tok, _GOLDEN_PROMPT) == _GOLDEN_TOKENS_QWEN35_2B
+
+
+def test_raw_completion_mode_bypasses_declared_chat_template(monkeypatch):
+    """v4 encodes the prompt verbatim even when the tokenizer declares a template.
+
+    The trap this guards: a "-Base" repo ships the family tokenizer config, chat
+    template included, so Qwen3-4B-Base *declares* one it was never trained on.
+    Branching on `tokenizer.chat_template` alone would silently take the chat
+    path and wrap the problem in role markers the base model cannot read.
+    """
+    import reliquary.constants as C
+
+    monkeypatch.setattr(C, "RAW_COMPLETION_PROMPTS", True)
+
+    tok = _ChatTokenizer()
+    assert encode_prompt(tok, "Solve: 1+1") == list("Solve: 1+1".encode("utf-8"))

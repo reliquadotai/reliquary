@@ -42,6 +42,16 @@ def encode_prompt(tokenizer: Any, prompt_text: str) -> list[int]:
     fakes). Both sides MUST go through this helper — any divergence in
     prompt tokenisation trips PROMPT_MISMATCH before GRAIL even runs.
     """
+    # v4+ raw-completion protocol: never apply a chat template, even when the
+    # tokenizer declares one. Declaring is not training -- a "-Base" repo ships
+    # the family tokenizer config, template included, so auto-detection would
+    # silently wrap a base model's prompt in role markers it never learned.
+    # Lazy import so tests can monkeypatch reliquary.constants.
+    from reliquary.constants import RAW_COMPLETION_PROMPTS
+
+    if RAW_COMPLETION_PROMPTS:
+        return list(tokenizer.encode(prompt_text, add_special_tokens=False))
+
     # Require chat_template to be a non-empty string so MagicMock-based test
     # stubs (which return a MagicMock for any attribute) fall through to the
     # plain encode() path they already declare.
