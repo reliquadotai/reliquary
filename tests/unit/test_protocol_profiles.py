@@ -195,6 +195,13 @@ def test_profiles_are_frozen_slotted_and_recursively_immutable():
                 "forced_zero": False,
                 "proof_attempts": 64,
                 "ranked_proof_attempts": 64,
+                "model": "Qwen/Qwen3.5-2B",
+                "t": 0.6,
+                "top_p": 0.95,
+                "top_k": 20,
+                "bft_enabled": True,
+                "raw_prompts": False,
+                "omi_train_only": False,
             },
         ),
         (
@@ -213,6 +220,46 @@ def test_profiles_are_frozen_slotted_and_recursively_immutable():
                 "forced_zero": True,
                 "proof_attempts": 64,
                 "ranked_proof_attempts": 16,
+                "model": "Qwen/Qwen3.5-4B",
+                "t": 0.6,
+                "top_p": 0.95,
+                "top_k": 20,
+                "bft_enabled": True,
+                "raw_prompts": False,
+                "omi_train_only": False,
+            },
+        ),
+        (
+            # v4: DAPO-faithful restart from a true base model. No BFT (the base
+            # emits no <think>), DAPO/verl rollout sampling (which also makes
+            # warp() the identity, so the PPO ratio lives in the space the
+            # samples came from), KL removed, raw-completion prompts, and the
+            # OMI corpus restricted to its canonical shards.
+            "qwen3-4b-base-dapo-v4",
+            {
+                "version": 4,
+                "math_cap": 16384,
+                "code_cap": 16384,
+                "thinking": 0,
+                "window": 300.0,
+                "domain": "reliquary-forced-seed-v4",
+                "lr": 1e-6,
+                "kl": 0.0,
+                "mask_math": False,
+                "overlong_factor": 0.5,
+                "forced_zero": True,
+                "proof_attempts": 64,
+                "ranked_proof_attempts": 16,
+                "model": "Qwen/Qwen3-4B-Base",
+                "t": 1.0,
+                "top_p": 1.0,
+                # 0, not None: warp() guards on `top_k and top_k > 0` but the
+                # miner's ForcedSeedLogitsProcessor coerces with int(top_k),
+                # which raises on None.
+                "top_k": 0,
+                "bft_enabled": False,
+                "raw_prompts": True,
+                "omi_train_only": True,
             },
         ),
     ],
@@ -235,6 +282,13 @@ print(json.dumps({
     "forced_zero": c.TRAIN_FORCED_REWARD_ZERO,
     "proof_attempts": c.MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
     "ranked_proof_attempts": c.MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW,
+    "model": c.PROTOCOL_MODEL_ID,
+    "t": c.T_PROTO,
+    "top_p": c.TOP_P_PROTO,
+    "top_k": c.TOP_K_PROTO,
+    "bft_enabled": c.BFT_ENABLED,
+    "raw_prompts": c.RAW_COMPLETION_PROMPTS,
+    "omi_train_only": c.OMI_TRAIN_SHARDS_ONLY,
 }))
 """
     env = dict(os.environ)

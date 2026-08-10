@@ -146,6 +146,21 @@ _SAMPLING = SamplingProfile(
     do_sample=False,
 )
 
+# DAPO/verl reference rollout sampling: full temperature, full support. Beyond
+# matching the recipe, this is what makes warp() the identity softmax, so the
+# PPO importance ratio is formed in the distribution the samples actually came
+# from (the v3 values leave it distorted by r_raw^(1/T) and truncated to a
+# 20-token nucleus). top_k is 0, not None: warp() guards on `top_k and
+# top_k > 0`, but the miner's ForcedSeedLogitsProcessor coerces with int(top_k)
+# and raises on None.
+_SAMPLING_DAPO = SamplingProfile(
+    rollouts=8,
+    temperature=1.0,
+    top_p=1.0,
+    top_k=0,
+    do_sample=False,
+)
+
 _PROFILE_VALUES = (
     ProtocolProfile(
         profile_id="qwen35-2b-auction-v2",
@@ -194,6 +209,37 @@ _PROFILE_VALUES = (
         },
         throughput_tiebreak=ThroughputTiebreakProfile(
             token_cap=15616,
+            bucket_tokens_per_round=50,
+        ),
+    ),
+    ProtocolProfile(
+        profile_id="qwen3-4b-base-dapo-v4",
+        # True base model: 0/32 spontaneous <think> under a raw prompt, against
+        # 27/32 for Qwen3.5-4B-Base. Recent "-Base" releases are mid-trained on
+        # reasoning traces, which spends the dispersion RL exists to convert.
+        model_id="Qwen/Qwen3-4B-Base",
+        model_revision="906bfd4b4dc7f14ee4320094d8b41684abff8539",
+        protocol_version=4,
+        collection_seconds=300,
+        upload_grace_seconds=33,
+        sampling=_SAMPLING_DAPO,
+        environments={
+            # No BFT anywhere: the base model emits no <think>, so there is no
+            # block to force closed. Termination is trained by the soft overlong
+            # punishment (Eq. 13) instead of forced by a budget.
+            "openmathinstruct": EnvironmentProfile(
+                max_new_tokens=16384,
+                bft=None,
+            ),
+            "opencodeinstruct": EnvironmentProfile(
+                max_new_tokens=16384,
+                bft=None,
+            ),
+        },
+        throughput_tiebreak=ThroughputTiebreakProfile(
+            # Without BFT the per-rollout generation budget is the env cap
+            # itself, where v3 had to use its thinking budget.
+            token_cap=16384,
             bucket_tokens_per_round=50,
         ),
     ),

@@ -188,6 +188,25 @@ assert (
     "BFT_ANSWER_BUDGET to fit the forced answer's force-template span"
 )
 
+# v4+ ships a raw-completion protocol: prompts are encoded with no chat template
+# at all. This cannot be inferred from the tokenizer, which is the trap — a
+# "-Base" repo ships the family tokenizer config, chat template included, so
+# Qwen3-4B-Base DECLARES one it was never trained on. Left to auto-detection the
+# v4 prompt would silently take the chat path, wrapping the problem in role
+# markers the base model has no learned behaviour for and (because the template
+# mentions enable_thinking) opening a <think> block on a model chosen precisely
+# because it never opens one. One switch drives both encode_prompt and
+# render_canonical_prompt so the encoded tokens and prompt_content_sha256 can
+# never describe different prompts.
+RAW_COMPLETION_PROMPTS = PROTOCOL_VERSION >= 4
+
+# v4+ restricts the OMI manifest to the canonical `train-*` shards. The
+# train_1M/2M/5M shards are curated subsets OF train, so including them
+# duplicates 8,000,000 rows (36.4% of the index space) and draws the curated
+# rows 2-4x too often. Changing this changes len(env), which is prompt-range
+# consensus, so it is only safe at a profile cutover.
+OMI_TRAIN_SHARDS_ONLY = PROTOCOL_VERSION >= 4
+
 # Two-sided length reward shaping (applied to ADVANTAGES, not the σ-gate).
 # Under-thinking side: a non-forced rollout that finished early
 # (completion_length < SHAPE_LEN_FRAC · BFT_THINKING_BUDGET) and is wrong gets its
@@ -909,7 +928,17 @@ if (
 # run. Keep the current value as the compatibility default, but make it
 # operator-configurable so fixed-reference recovery can be calibrated without
 # another code release.
-_PROFILE_KL_BETA = "0.01" if PROTOCOL_VERSION >= 3 else "0.04"
+# v4 follows DAPO §2.3 and removes the KL term outright: over a long-CoT run the
+# policy diverges from the initial model anyway, so the restriction buys nothing
+# while costing the exploration Clip-Higher exists to protect. β=0 leaves the
+# circuit breakers as the collapse guard; the calibrated fallback is a PINNED
+# KL_BASE_MODEL (the run's own ck0) plus an explicit β, never the rolling
+# reference, which anchors nothing beyond ~4 windows.
+_PROFILE_KL_BETA = (
+    "0.0" if PROTOCOL_VERSION >= 4
+    else "0.01" if PROTOCOL_VERSION >= 3
+    else "0.04"
+)
 KL_BETA = float(_os.environ.get("RELIQUARY_KL_BETA", _PROFILE_KL_BETA))
 if not 0.0 <= KL_BETA <= 1.0:
     raise ValueError("RELIQUARY_KL_BETA must be finite and within [0, 1]")
