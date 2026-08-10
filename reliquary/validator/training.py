@@ -24,7 +24,7 @@ from reliquary.validator import telemetry
 from reliquary.constants import (
     GRAD_CLIP_NORM, GRAD_NORM_SKIP_THRESHOLD, KL_BETA, LEARNING_RATE,
     LR_COSINE_MAX_WINDOWS, LR_WARMUP_WINDOWS,
-    MICROBATCH_MAX_PADDED_TOKENS, PPO_CLIP_EPSILON,
+    MICROBATCH_MAX_PADDED_TOKENS, PPO_CLIP_EPSILON_HIGH, PPO_CLIP_EPSILON_LOW,
     PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD,
 )
 
@@ -884,6 +884,20 @@ def _completion_keep_mask(rollout, prompt_length, n_completion, device):
     return torch.tensor(keep, dtype=torch.bool, device=device)
 
 
+def _clipped_surrogate(ratio, advantage):
+    """PPO surrogate with DAPO's decoupled clip band (Eq. 10).
+
+    Returns ``(surrogate, clip_active)``. Both the per-rollout and the
+    micro-batched path call this, so the band is structurally the same in both
+    — the two used to carry independent copies of the clamp expression.
+    """
+    unclipped = ratio * advantage
+    clipped = torch.clamp(
+        ratio, 1 - PPO_CLIP_EPSILON_LOW, 1 + PPO_CLIP_EPSILON_HIGH
+    ) * advantage
+    return torch.min(unclipped, clipped), clipped < unclipped
+
+
 def _rollout_loss(
     model,
     ref_model,
@@ -970,9 +984,8 @@ def _rollout_loss(
     # PPO clipped surrogate
     log_ratio = new_logprobs_c - old_logprobs
     ratio = torch.exp(log_ratio)
-    surr1 = ratio * advantage
-    surr2 = torch.clamp(ratio, 1 - PPO_CLIP_EPSILON, 1 + PPO_CLIP_EPSILON) * advantage
-    ppo_per_token = -torch.min(surr1, surr2)
+    surr, _clip_active = _clipped_surrogate(ratio, advantage)
+    ppo_per_token = -surr
 
     # KL(π_new || π_ref) — Schulman's k3 estimator:
     #   kl ≈ exp(ref - new) - 1 - (ref - new)
@@ -1113,10 +1126,10 @@ def _record_kl_stats(
         stats["ppo_token_count"] += ppo_ratio.numel()
         stats["ppo_clip_active_count"] += int(ppo_clip_active.sum())
         stats["ppo_ratio_below_clip_count"] += int(
-            (ppo_ratio < 1.0 - PPO_CLIP_EPSILON).sum()
+            (ppo_ratio < 1.0 - PPO_CLIP_EPSILON_LOW).sum()
         )
         stats["ppo_ratio_above_clip_count"] += int(
-            (ppo_ratio > 1.0 + PPO_CLIP_EPSILON).sum()
+            (ppo_ratio > 1.0 + PPO_CLIP_EPSILON_HIGH).sum()
         )
         stats["ppo_ratio_nonfinite_count"] += int(
             (~torch.isfinite(ppo_ratio)).sum()
@@ -1324,13 +1337,7 @@ def _microbatch_grad(
     keep_seg = [sum(1 for flag in keep if flag) for keep in keeps]
     ppo_log_ratio = new_lp - old_cat
     ratio = torch.exp(ppo_log_ratio)
-    unclipped_surr = ratio * adv_cat
-    clipped_surr = (
-        torch.clamp(ratio, 1 - PPO_CLIP_EPSILON, 1 + PPO_CLIP_EPSILON)
-        * adv_cat
-    )
-    surr = torch.min(unclipped_surr, clipped_surr)
-    clip_active = clipped_surr < unclipped_surr
+    surr, clip_active = _clipped_surrogate(ratio, adv_cat)
     ppo_tok = -surr
     kl_log = ref_lp - new_lp
     kl_tok = torch.exp(kl_log) - 1 - kl_log

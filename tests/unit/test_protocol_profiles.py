@@ -202,6 +202,8 @@ def test_profiles_are_frozen_slotted_and_recursively_immutable():
                 "bft_enabled": True,
                 "raw_prompts": False,
                 "omi_train_only": False,
+                "clip_low": 0.2,
+                "clip_high": 0.2,
             },
         ),
         (
@@ -227,6 +229,8 @@ def test_profiles_are_frozen_slotted_and_recursively_immutable():
                 "bft_enabled": True,
                 "raw_prompts": False,
                 "omi_train_only": False,
+                "clip_low": 0.2,
+                "clip_high": 0.2,
             },
         ),
         (
@@ -260,6 +264,8 @@ def test_profiles_are_frozen_slotted_and_recursively_immutable():
                 "bft_enabled": False,
                 "raw_prompts": True,
                 "omi_train_only": True,
+                "clip_low": 0.2,
+                "clip_high": 0.28,
             },
         ),
     ],
@@ -289,6 +295,8 @@ print(json.dumps({
     "bft_enabled": c.BFT_ENABLED,
     "raw_prompts": c.RAW_COMPLETION_PROMPTS,
     "omi_train_only": c.OMI_TRAIN_SHARDS_ONLY,
+    "clip_low": c.PPO_CLIP_EPSILON_LOW,
+    "clip_high": c.PPO_CLIP_EPSILON_HIGH,
 }))
 """
     env = dict(os.environ)

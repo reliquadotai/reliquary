@@ -903,7 +903,18 @@ if not _math.isfinite(LEARNING_RATE) or not 0.0 < LEARNING_RATE <= 1e-3:
     )
 
 # PPO clip range. Standard in GRPO/RLHF literature.
-PPO_CLIP_EPSILON = 0.2
+# PPO clip band, decoupled per DAPO §3.1 (Clip-Higher). The UPPER clip is what
+# bounds how fast a low-probability token can grow: at a symmetric 0.2, a token
+# at p=0.01 can reach at most 0.012 while one at p=0.9 reaches 1.08, so
+# exploitation tokens grow freely and exploration tokens cannot. Raising only
+# eps_high reopens exploration without loosening the downside.
+#
+# These read as true ratio bounds only from v4 on, because v4 sampling makes
+# warp() the identity so the trainer's ratio lives in the space the samples came
+# from. Pre-v4 the two spaces differ by a token-dependent factor, so the band is
+# left symmetric there rather than nominally "tuned" against a moving target.
+PPO_CLIP_EPSILON_LOW = 0.2
+PPO_CLIP_EPSILON_HIGH = 0.28 if PROTOCOL_VERSION >= 4 else 0.2
 
 # Optional pre-step trust-region circuit breaker. A value of 1.0 is the
 # compatibility default and cannot trigger because the observed fraction is at
