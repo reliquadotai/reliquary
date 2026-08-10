@@ -12,6 +12,7 @@ from reliquary.validator.proof_scheduler import (
     CheckpointNotReady,
     DeviceNotReady,
     GlobalProofScheduler,
+    ProofPlanHandle,
     ProofDecisionStatus,
     ProofExecution,
     ProofPlan,
@@ -683,6 +684,33 @@ def test_sparse_population_can_complete_with_an_explicit_shortfall():
     assert result.outcome is ProofPlanOutcome.COMPLETED
     assert result.abort_reason is None
     assert result.winner_job_ids == ("job-1",)
+
+
+def test_idle_sealed_plan_is_rechecked_and_notified():
+    """A missed final reevaluation must not strand a synchronous handle."""
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0",),
+        environments=(MATH, CODE),
+        proof_callable=lambda _invocation: True,
+        checkpoint_revision="rev-a",
+        deadline_poll_seconds=0.01,
+    )
+    plan = _plan("sealed-idle", MATH, [], required=1)
+    with scheduler._condition:
+        state = scheduler._build_plan_state(plan, scheduler._clock())
+        scheduler._plans[plan.plan_id] = state
+        scheduler._active_plan_by_environment[plan.environment] = state
+        handle = ProofPlanHandle(scheduler, state)
+
+    try:
+        result = handle.result(1)
+    finally:
+        assert scheduler.close()
+
+    assert result.outcome is ProofPlanOutcome.CAPACITY_ABORTED
+    assert result.abort_reason is (
+        CapacityAbortReason.INSUFFICIENT_DISTINCT_PROMPTS
+    )
 
 
 def test_complete_all_plan_runs_rejected_and_passing_forensic_jobs():
