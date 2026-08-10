@@ -348,13 +348,6 @@ VALIDATOR_HTTP_PORT = 8888
 # forged commitments before any GPU authentication runs.
 MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW = 64
 
-# Auction-v3 deliberately narrows only the ranked GPU proof prefix: eight
-# winners plus eight possible failed candidates per environment. A v3 fleet
-# qualifies this full ceiling plus the independent forensic budget.
-MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW = (
-    16 if PROTOCOL_VERSION >= 3 else 64
-)
-
 # Seal-time GRAIL work is serial and an adversarial ranked prefix may fail one
 # candidate after another. The attempt ceiling bounds cardinality; this second
 # bound limits elapsed GPU time. It is checked between groups, so one in-flight
@@ -532,15 +525,32 @@ M_ROLLOUTS = ACTIVE_PROTOCOL_PROFILE.sampling.rollouts
 
 # Maximum proven winners and uniform reward slots per active environment.
 # Distinct prompt representatives feed GRPO.
-B_BATCH = 8
+#
+# v4 doubles it alongside G. The two fix different errors: G shrinks the
+# per-group advantage bias, B_BATCH shrinks the across-prompt gradient
+# variance. Affordable because v4 rollouts are ~500 tokens against v3's 16,220
+# — 4x the sequences at an eighth of the token budget. The break-even against
+# today's load is a ~4,000-token median, which is roughly where DAPO's own
+# length curve lands by end of run (their Fig. 7a), so this is the number to
+# watch as training lengthens responses, NOT the slot count.
+B_BATCH = 16 if PROTOCOL_VERSION >= 4 else 8
 
 # (env_name, prompts_per_batch). Sum across entries = total prompts
-# processed per optimizer step. With 2 envs at B_BATCH each, we train
-# on 16 prompts × M_ROLLOUTS = 128 sequences per step.
+# processed per optimizer step: 2 × B_BATCH prompts × M_ROLLOUTS sequences.
+# v3: 16 × 8 = 128. v4: 32 × 16 = 512.
 ENVIRONMENT_MIX: list[tuple[str, int]] = [
     ("openmathinstruct", B_BATCH),
     ("opencodeinstruct", B_BATCH),
 ]
+
+# Auction-v3 deliberately narrows only the ranked GPU proof prefix: B_BATCH
+# winners plus B_BATCH possible failed candidates per environment. Derived from
+# B_BATCH rather than written as a literal, so a batch-size change cannot leave
+# the ranked prefix unable to prove the slots it must fill. A v3 fleet
+# qualifies this full ceiling plus the independent forensic budget.
+MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW = (
+    2 * B_BATCH if PROTOCOL_VERSION >= 3 else 64
+)
 
 # Runtime default for CLI/Docker operators. OpenCode remains available through
 # ENVIRONMENT_MIX, but code execution is opt-in until the runsc canary and
@@ -645,9 +655,11 @@ HASH_DEDUP_RETENTION_WINDOWS = int(
 
 # Max submissions any single hotkey can send per window. Counter resets at
 # every new window (on batcher swap). Excess submissions are HTTP-rejected
-# as RATE_LIMITED before touching the validation pipeline. 8 matches B_BATCH
-# — one slot per prompt a hotkey can credibly win in a window.
-MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW = 8
+# as RATE_LIMITED before touching the validation pipeline. It tracks B_BATCH
+# — one slot per prompt a hotkey can credibly win in a window — so raising the
+# batch without raising this would rate-limit honest miners out of the slots
+# the batch just created.
+MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW = B_BATCH
 
 # Signed upload precommits are tiny, but still bounded independently from the
 # large-body proof queue.  A precommit consumes the same per-window hotkey quota

@@ -154,7 +154,13 @@ _SAMPLING = SamplingProfile(
 # top_k > 0`, but the miner's ForcedSeedLogitsProcessor coerces with int(top_k)
 # and raises on None.
 _SAMPLING_DAPO = SamplingProfile(
-    rollouts=8,
+    # G=16, DAPO §4.1. With binary rewards the group mean and std are exact
+    # functions of k, so the estimator's error lives entirely in k/G as a
+    # binomial estimate of p — and the advantage √((1−p̂)/p̂) is non-linear in
+    # it, so that error is a BIAS, which more prompts cannot average away.
+    # Dynamic sampling makes this sharper: it admits k=1 and k=G−1 precisely
+    # where small-G bias is worst.
+    rollouts=16,
     temperature=1.0,
     top_p=1.0,
     top_k=0,

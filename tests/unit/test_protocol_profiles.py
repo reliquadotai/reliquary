@@ -205,6 +205,9 @@ def test_profiles_are_frozen_slotted_and_recursively_immutable():
                 "clip_low": 0.2,
                 "clip_high": 0.2,
                 "opt_8bit": True,
+                "rollouts": 8,
+                "b_batch": 8,
+                "max_submissions": 8,
             },
         ),
         (
@@ -233,6 +236,9 @@ def test_profiles_are_frozen_slotted_and_recursively_immutable():
                 "clip_low": 0.2,
                 "clip_high": 0.2,
                 "opt_8bit": True,
+                "rollouts": 8,
+                "b_batch": 8,
+                "max_submissions": 8,
             },
         ),
         (
@@ -255,7 +261,7 @@ def test_profiles_are_frozen_slotted_and_recursively_immutable():
                 "overlong_factor": 0.5,
                 "forced_zero": True,
                 "proof_attempts": 64,
-                "ranked_proof_attempts": 16,
+                "ranked_proof_attempts": 32,
                 "model": "Qwen/Qwen3-4B-Base",
                 "t": 1.0,
                 "top_p": 1.0,
@@ -269,6 +275,9 @@ def test_profiles_are_frozen_slotted_and_recursively_immutable():
                 "clip_low": 0.2,
                 "clip_high": 0.28,
                 "opt_8bit": False,
+                "rollouts": 16,
+                "b_batch": 16,
+                "max_submissions": 16,
             },
         ),
     ],
@@ -301,6 +310,9 @@ print(json.dumps({
     "clip_low": c.PPO_CLIP_EPSILON_LOW,
     "clip_high": c.PPO_CLIP_EPSILON_HIGH,
     "opt_8bit": c.OPTIMIZER_STATE_8BIT,
+    "rollouts": c.M_ROLLOUTS,
+    "b_batch": c.B_BATCH,
+    "max_submissions": c.MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
 }))
 """
     env = dict(os.environ)
