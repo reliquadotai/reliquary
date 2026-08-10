@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
+import sys
+import time
 from pathlib import Path
+
+import pytest
 
 from reliquary.infrastructure.process_health import collect_process_health
 
@@ -133,3 +139,84 @@ def test_validator_entrypoint_is_valid_supervisor_script():
     assert "wait -n" in script
     assert "terminate_children" in script
     assert "exec reliquary validate" not in script
+
+
+def test_validator_entrypoint_kills_child_that_ignores_term(tmp_path):
+    entrypoint = REPO_ROOT / "docker" / "entrypoint.sh"
+    wallet_path = tmp_path / "wallets"
+    wallet_path.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    validator_pid_path = tmp_path / "validator.pid"
+    fake_validator = fake_bin / "reliquary"
+    fake_validator.write_text(
+        "\n".join(
+            (
+                f"#!{sys.executable}",
+                "import os",
+                "from pathlib import Path",
+                "import signal",
+                "import time",
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+                "os.close(1)",
+                "os.close(2)",
+                "Path(os.environ['FAKE_VALIDATOR_PID_PATH']).write_text(",
+                "    str(os.getpid()), encoding='utf-8'",
+                ")",
+                "while True:",
+                "    time.sleep(60)",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    fake_validator.chmod(0o755)
+    env = os.environ.copy()
+    env.update(
+        {
+            "BT_WALLET_NAME": "test-wallet",
+            "BT_HOTKEY": "test-hotkey",
+            "BT_WALLET_PATH": str(wallet_path),
+            "RELIQUARY_TRAIN": "0",
+            "RELIQUARY_ENVIRONMENTS": "openmathinstruct",
+            "RELIQUARY_CHILD_TERM_GRACE_SECONDS": "1",
+            "FAKE_VALIDATOR_PID_PATH": str(validator_pid_path),
+            "PATH": os.pathsep.join((str(fake_bin), env.get("PATH", ""))),
+        }
+    )
+    supervisor = subprocess.Popen(
+        ["bash", str(entrypoint)],
+        cwd=REPO_ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    validator_pid = None
+    try:
+        deadline = time.monotonic() + 5.0
+        while not validator_pid_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert validator_pid_path.exists()
+        validator_pid = int(validator_pid_path.read_text(encoding="utf-8"))
+
+        supervisor.terminate()
+        stdout, stderr = supervisor.communicate(timeout=5.0)
+
+        assert supervisor.returncode != 0, stdout
+        assert "sending SIGKILL" in stderr
+        with pytest.raises(ProcessLookupError):
+            os.kill(validator_pid, 0)
+    finally:
+        if supervisor.poll() is None:
+            supervisor.kill()
+            supervisor.communicate(timeout=5.0)
+        if validator_pid is not None:
+            command = subprocess.run(
+                ["ps", "-p", str(validator_pid), "-o", "command="],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout
+            if str(fake_validator) in command:
+                os.kill(validator_pid, signal.SIGKILL)

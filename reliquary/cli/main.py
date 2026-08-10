@@ -31,6 +31,7 @@ from reliquary.constants import (
     PROTOCOL_VERSION,
     VALIDATOR_HTTP_PORT,
 )
+from reliquary.validator.errors import FatalProofPlaneError
 
 _DEFAULT_ENVS = DEFAULT_ENVIRONMENTS
 
@@ -39,6 +40,34 @@ app = typer.Typer(name="reliquary", help="Reliquary — Verifiable Inference Sub
 logger = logging.getLogger(__name__)
 
 _grader_proc: "subprocess.Popen | None" = None
+
+
+def _run_validator_event_loop(coroutine) -> None:
+    """Run the validator and hard-exit after an unrecoverable proof fault.
+
+    ``FatalProofPlaneError`` is raised only after ``ValidationService.run`` has
+    executed its best-effort cleanup.  A faulted proof worker can still be
+    blocked inside a synchronous CUDA call, though, so normal interpreter and
+    extension teardown is not safe to rely on.  ``os._exit`` gives the shell
+    supervisor an actual child exit and lets Docker apply its restart policy.
+    """
+
+    try:
+        asyncio.run(coroutine)
+    except FatalProofPlaneError:
+        logger.critical(
+            "Fatal proof-plane cleanup completed; forcing process exit for "
+            "supervisor restart",
+            exc_info=True,
+        )
+        # Logging handlers flush each record, but flush the standard streams
+        # explicitly because os._exit deliberately skips interpreter cleanup.
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:
+                pass
+        os._exit(1)
 
 
 def _configured_proof_device_identities(torch_module):
@@ -640,7 +669,7 @@ def validate(
             validator = WeightOnlyValidator(wallet=wallet, netuid=netuid)
             await validator.run()
 
-    asyncio.run(_run())
+    _run_validator_event_loop(_run())
 
 
 if __name__ == "__main__":

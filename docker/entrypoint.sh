@@ -11,26 +11,58 @@ set -euo pipefail
 
 GRADER_PID=""
 VALIDATOR_PID=""
+CHILD_TERM_GRACE_SECONDS="${RELIQUARY_CHILD_TERM_GRACE_SECONDS:-15}"
+if [[ ! "${CHILD_TERM_GRACE_SECONDS}" =~ ^[0-9]+$ ]]; then
+  echo "[entrypoint] FATAL: RELIQUARY_CHILD_TERM_GRACE_SECONDS must be a non-negative integer" >&2
+  exit 1
+fi
 
-terminate_children() {
+signal_children() {
+  local signal_name=$1
   local pid
   for pid in "${VALIDATOR_PID}" "${GRADER_PID}"; do
     if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
-      kill -TERM "${pid}" 2>/dev/null || true
+      kill "-${signal_name}" "${pid}" 2>/dev/null || true
+    fi
+  done
+}
+
+terminate_children() {
+  signal_children TERM
+}
+
+children_alive() {
+  local pid
+  for pid in "${VALIDATOR_PID}" "${GRADER_PID}"; do
+    if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+wait_for_children() {
+  local deadline=$((SECONDS + CHILD_TERM_GRACE_SECONDS))
+  local pid
+  while children_alive && (( SECONDS < deadline )); do
+    sleep 0.1
+  done
+  if children_alive; then
+    echo "[entrypoint] Child shutdown exceeded ${CHILD_TERM_GRACE_SECONDS}s; sending SIGKILL" >&2
+    signal_children KILL
+  fi
+  for pid in "${VALIDATOR_PID}" "${GRADER_PID}"; do
+    if [[ -n "${pid}" ]]; then
+      wait "${pid}" 2>/dev/null || true
     fi
   done
 }
 
 cleanup() {
   local status=$?
-  local pid
   trap - EXIT TERM INT
   terminate_children
-  for pid in "${VALIDATOR_PID}" "${GRADER_PID}"; do
-    if [[ -n "${pid}" ]]; then
-      wait "${pid}" 2>/dev/null || true
-    fi
-  done
+  wait_for_children
   exit "${status}"
 }
 
