@@ -421,6 +421,67 @@ def has_eos_padding(
     return len(eos_positions) > 1 or eos_positions[0] != len(completion) - 1
 
 
+class _LazyLogitRows:
+    """Read-only row view of ``lm_head(hidden)`` that never builds the block.
+
+    The full [seq_len, vocab] tensor is 8.2 GB at production scale (16.5k
+    tokens x 248k vocab), allocated once per rollout and 8 times per proof on
+    a GPU already past its allocator cliff. Every consumer below only ever
+    reads rows out of it, so this computes lm_head on the rows asked for and
+    nothing else — including skipping the prompt rows, which nothing reads.
+
+    Duck-types the read-only tensor surface those consumers use (integer,
+    slice and tensor indexing, ``index_select``, ``shape``, ``size``,
+    ``device``) so the shared ``forced_sampling`` chunk loop works unchanged.
+
+    Rows are NOT bit-identical to indexing a materialised ``lm_head(hidden)``:
+    projecting [n, hidden] and [seq_len, hidden] selects different kernels and
+    accumulation orders, which measures at 1-2 ulps. That matters because the
+    forced-seed gate enforces *exact* inverse-CDF picks, so the drift is what
+    could flip an honest miner's verdict. It moves the CDF by ~6e-8 against a
+    FORCED_SEED_CDF_BOUNDARY_EPSILON of 2e-3; the bound is asserted in
+    tests/unit/test_verifier_fused_lm_head.py.
+    """
+
+    def __init__(self, hidden: torch.Tensor, lm_head: Any, vocab_size: int) -> None:
+        self._hidden = hidden
+        self._lm_head = lm_head
+        self.shape = torch.Size((int(hidden.shape[0]), int(vocab_size)))
+
+    @property
+    def device(self) -> Any:
+        return self._hidden.device
+
+    def size(self, dim: int | None = None) -> Any:
+        return self.shape if dim is None else self.shape[dim]
+
+    def _project(self, rows: torch.Tensor) -> torch.Tensor:
+        # The rows are projected after the caller's no_grad forward has
+        # returned, so guard here too: a graph held on lm_head weights would
+        # retain exactly the memory this class exists to free.
+        with torch.no_grad():
+            return self._lm_head(rows)
+
+    def index_select(self, dim: int, index: torch.Tensor) -> torch.Tensor:
+        if dim != 0:
+            raise ValueError("_LazyLogitRows only selects along rows")
+        return self._project(self._hidden.index_select(0, index))
+
+    def __getitem__(self, key: Any) -> torch.Tensor:
+        return self._project(self._hidden[key])
+
+
+def _lm_head_vocab_size(lm_head: Any) -> int | None:
+    """Vocabulary width of an lm_head without projecting anything through it."""
+    out_features = getattr(lm_head, "out_features", None)
+    if isinstance(out_features, int) and out_features > 0:
+        return out_features
+    weight = getattr(lm_head, "weight", None)
+    if weight is not None and getattr(weight, "ndim", 0) == 2:
+        return int(weight.shape[0])
+    return None
+
+
 def verify_commitment_proofs(
     commit: dict,
     model: Any,
@@ -479,13 +540,22 @@ def verify_commitment_proofs(
 
     device = next(model.parameters()).device
     input_ids = torch.tensor([tokens], device=device)
+    lm_head = getattr(model, "lm_head", None)
+    # Row-wise projection needs a separable head whose width we can read
+    # without projecting; anything else keeps the old materialised block.
+    vocab_size = _lm_head_vocab_size(lm_head)
+    can_project_rows = vocab_size is not None
     with torch.no_grad():
         hidden_states_gpu, logits_batch = forward_single_layer(
-            model, input_ids, None, LAYER_INDEX
+            model, input_ids, None, LAYER_INDEX,
+            materialize_logits=not can_project_rows,
         )
 
     hidden_states_gpu = hidden_states_gpu[0]  # [seq_len, hidden_dim]
-    logits_gpu = logits_batch[0]  # [seq_len, vocab_size], kept on GPU
+    if logits_batch is None:
+        logits_gpu: Any = _LazyLogitRows(hidden_states_gpu, lm_head, vocab_size)
+    else:
+        logits_gpu = logits_batch[0]  # [seq_len, vocab_size], kept on GPU
 
     p_stop = _gpu_p_stop(
         logits_gpu, seq_len, _eos_set_from_model(model, tokenizer), device,
