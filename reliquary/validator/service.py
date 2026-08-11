@@ -112,6 +112,7 @@ from reliquary.validator.utility_telemetry import UtilityTelemetryWriter
 logger = logging.getLogger(__name__)
 
 _HF_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+_STARTUP_HASH_REBUILD_TIMEOUT_SECONDS = 30.0
 
 
 def _cooldown_snapshot_key(run_id: str) -> str:
@@ -3997,9 +3998,12 @@ class ValidationService:
         """
         try:
             current_window = self._window_n
-            archives = await storage.list_recent_datasets(
-                current_window=current_window + 1,
-                n=HASH_DEDUP_RETENTION_WINDOWS,
+            archives = await asyncio.wait_for(
+                storage.list_recent_datasets(
+                    current_window=current_window + 1,
+                    n=HASH_DEDUP_RETENTION_WINDOWS,
+                ),
+                timeout=_STARTUP_HASH_REBUILD_TIMEOUT_SECONDS,
             )
             self._hash_set.rebuild_from_history(
                 archives, current_window=current_window,
@@ -4009,6 +4013,12 @@ class ValidationService:
                 "(current=%d, size=%d)",
                 len(archives), HASH_DEDUP_RETENTION_WINDOWS,
                 current_window, len(self._hash_set),
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Hash-set rebuild from history timed out after %.1fs; "
+                "starting empty",
+                _STARTUP_HASH_REBUILD_TIMEOUT_SECONDS,
             )
         except Exception:
             logger.exception(
