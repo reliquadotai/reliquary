@@ -208,6 +208,7 @@ def test_profiles_are_frozen_slotted_and_recursively_immutable():
                 "rollouts": 8,
                 "b_batch": 8,
                 "max_submissions": 8,
+                "publish_interval": 4,
             },
         ),
         (
@@ -239,6 +240,7 @@ def test_profiles_are_frozen_slotted_and_recursively_immutable():
                 "rollouts": 8,
                 "b_batch": 8,
                 "max_submissions": 8,
+                "publish_interval": 4,
             },
         ),
         (
@@ -278,6 +280,7 @@ def test_profiles_are_frozen_slotted_and_recursively_immutable():
                 "rollouts": 16,
                 "b_batch": 16,
                 "max_submissions": 16,
+                "publish_interval": 16,
             },
         ),
     ],
@@ -313,6 +316,7 @@ print(json.dumps({
     "rollouts": c.M_ROLLOUTS,
     "b_batch": c.B_BATCH,
     "max_submissions": c.MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
+    "publish_interval": c.CHECKPOINT_PUBLISH_INTERVAL_WINDOWS,
 }))
 """
     env = dict(os.environ)

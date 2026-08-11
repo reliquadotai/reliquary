@@ -498,8 +498,24 @@ EPOCH_SUBMIT_LEAD_BLOCKS = 20
 # How often to publish the current in-memory model to Hugging Face. Keep the
 # serving behavior policy close enough to the training policy that PPO's ratio
 # contract remains meaningful, while avoiding a multi-GB upload on every step.
+# This also sets how many optimizer steps share one pi_old: verify_model is a
+# frozen snapshot of the last published checkpoint, and miners generate from it,
+# so publication IS the pi_old refresh.
+#
+# DAPO §4.1 samples a rollout batch of 512 prompts x 16 responses = 8,192
+# sequences and consumes it in 16 gradient updates at mini-batch 512. v4's
+# per-window batch is already exactly that mini-batch (2 envs x 16 prompts x 16
+# rollouts = 512), so publishing every 16 windows reproduces their structure:
+# 16 steps over 8,192 sequences from one pi_old. At 4 it is 4 steps over 2,048.
+#
+# The cost is drift: pi_theta moves 16 steps from pi_old instead of 4, so the
+# clip does more work. That is what eps_high=0.28 is for, but the guard that
+# would STOP a run drifting too far — PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD —
+# defaults to 1.0, which cannot fire. Watch train/ppo_ratio_outside_clip_ratio
+# and arm that threshold before relying on this at full interval.
 CHECKPOINT_PUBLISH_INTERVAL_WINDOWS = int(_os.environ.get(
-    "RELIQUARY_CHECKPOINT_PUBLISH_INTERVAL_WINDOWS", "4"
+    "RELIQUARY_CHECKPOINT_PUBLISH_INTERVAL_WINDOWS",
+    "16" if PROTOCOL_VERSION >= 4 else "4",
 ))
 if CHECKPOINT_PUBLISH_INTERVAL_WINDOWS <= 0:
     raise ValueError(
