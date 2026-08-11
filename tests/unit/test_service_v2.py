@@ -549,6 +549,50 @@ async def test_rebuild_hashes_from_history_populates_set():
     assert compute_rollout_hash([40, 50, 60]) in svc._hash_set
 
 
+@pytest.mark.asyncio
+async def test_rebuild_hashes_from_history_timeout_fails_open():
+    """A slow best-effort archive replay cannot block validator startup."""
+    from unittest.mock import MagicMock, patch
+
+    from reliquary.validator.service import ValidationService
+
+    class _FakeEnv:
+        name = "fake"
+        def __len__(self): return 100
+        def get_problem(self, i): return {"prompt": "p", "ground_truth": "a"}
+        def compute_reward(self, p, c): return 0.0
+
+    class _FakeWallet:
+        class _Hk:
+            ss58_address = "5FHk"
+            @staticmethod
+            def sign(d): return b"sig"
+        hotkey = _Hk()
+
+    svc = ValidationService(
+        wallet=_FakeWallet(), model=MagicMock(), tokenizer=MagicMock(),
+        env=_FakeEnv(), netuid=99,
+    )
+    svc._window_n = 110
+
+    async def _never_returns(*_args, **_kwargs):
+        await asyncio.sleep(60)
+
+    with (
+        patch(
+            "reliquary.infrastructure.storage.list_recent_datasets",
+            new=_never_returns,
+        ),
+        patch(
+            "reliquary.validator.service._STARTUP_HASH_REBUILD_TIMEOUT_SECONDS",
+            0.01,
+        ),
+    ):
+        await asyncio.wait_for(svc._rebuild_hashes_from_history(), 1)
+
+    assert len(svc._hash_set) == 0
+
+
 def test_record_late_drop_aggregates_per_hotkey_and_reason():
     """record_late_drop bumps counters keyed by (hotkey, reason), starting
     from empty, isolating different hotkeys."""
