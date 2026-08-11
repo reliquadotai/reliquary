@@ -239,7 +239,9 @@ async def test_training_health_gate_blocks_checkpoint_publish(monkeypatch):
 
     svc = _make_service()
 
-    def _reject_step(model, batch, *, ref_model, window_index=None):
+    def _reject_step(
+        model, batch, *, ref_model, behavior_model=None, window_index=None,
+    ):
         raise TrainingStepSkipped("gradient_spike", 10_432.0)
 
     monkeypatch.setattr(svc_mod, "train_step", _reject_step)
@@ -361,7 +363,15 @@ async def test_verify_model_refreshed_only_after_publish(monkeypatch):
     svc.verify_model = verify
 
     # Stub train_step to mutate train_model (simulate a real grad step).
-    def _fake_train_step(model, batch, *, ref_model, window_index=None):
+    # `calls` is what stops this passing vacuously: if the stub's signature
+    # drifts from train_step's, the service swallows the TypeError, nothing
+    # mutates, and the equality below holds for the wrong reason.
+    calls: list[int] = []
+
+    def _fake_train_step(
+        model, batch, *, ref_model, behavior_model=None, window_index=None,
+    ):
+        calls.append(1)
         with torch.no_grad():
             for p in model.parameters():
                 p.add_(1.0)
@@ -380,6 +390,7 @@ async def test_verify_model_refreshed_only_after_publish(monkeypatch):
 
     await svc._train_and_publish()
 
+    assert calls, "train_step never ran — the assertion below would be vacuous"
     # After publish, verify_model should equal the mutated train_model.
     for p_t, p_v in zip(train.parameters(), verify.parameters()):
         assert torch.equal(p_t, p_v), "verify_model not refreshed after publish"
@@ -404,7 +415,12 @@ async def test_verify_model_NOT_refreshed_when_publish_skipped(monkeypatch):
     svc.verify_model = verify
     verify_snapshot = {k: v.detach().clone() for k, v in verify.state_dict().items()}
 
-    def _fake_train_step(model, batch, *, ref_model, window_index=None):
+    calls: list[int] = []
+
+    def _fake_train_step(
+        model, batch, *, ref_model, behavior_model=None, window_index=None,
+    ):
+        calls.append(1)
         with torch.no_grad():
             for p in model.parameters():
                 p.add_(1.0)
@@ -421,6 +437,7 @@ async def test_verify_model_NOT_refreshed_when_publish_skipped(monkeypatch):
 
     await svc._train_and_publish()
 
+    assert calls, "train_step never ran — the assertion below would be vacuous"
     # verify_model must be unchanged
     for k, before in verify_snapshot.items():
         assert torch.equal(verify.state_dict()[k], before), \
