@@ -1193,11 +1193,15 @@ FORCED_SEED_STOCHASTIC_MAXPROB = 0.99
 # rollout. Live 2026-07-14 data supports a future 0.90 candidate, but changing
 # acceptance policy belongs to the announced miner/protocol cutover after the
 # exact-CDF shadow gate has been calibrated across implementations.
-# v4: same-box honest exact ratios bottom out at 0.78 (numeric drift between
-# incremental decode and the verify forward crosses full-support interval
-# boundaries); 0.70 leaves cross-stack margin while pregenerated rollouts
-# still score near zero.
-FORCED_SEED_CONSISTENCY_FLOOR = 0.70 if PROTOCOL_VERSION >= 4 else 0.80
+# Group-aggregate floor: _forced_seed_verdict sums (n_stoch, n_match) over ALL
+# rollouts of a prompt, so this gates the GROUP mean — ~0.95 for honest miners
+# at every sampling envelope (measured: v4 short groups 0.948-0.981, the 16k
+# aggregate 0.9495, v3 unchanged) while a pregenerated group scores 0.59-0.67
+# (H100 red-team 2026-08-12). 0.80 sits mid-gap, ~13pt margin on both sides.
+# It never needed a v4 value: only the per-ROLLOUT floor below had to drop for
+# v4's tail-heavy single-rollout drift. The 08-12 calibration briefly set this
+# to 0.70, which left only 3pt over pregeneration — reverted.
+FORCED_SEED_CONSISTENCY_FLOOR = 0.80
 # Below this many stochastic positions in a group, the gate abstains (accepts)
 # rather than risk a false reject on thin signal.
 FORCED_SEED_MIN_STOCH_POSITIONS = 30
@@ -1208,7 +1212,12 @@ FORCED_SEED_MIN_STOCH_POSITIONS = 30
 # per-rollout floor. Set lower than the group floor to absorb the higher
 # single-rollout variance (empirical single-rollout: honest 0.94-1.0, non-forced
 # 0.52-0.65); shadow-only until calibrated on the live floor.
-FORCED_SEED_ROLLOUT_FLOOR = 0.65 if PROTOCOL_VERSION >= 4 else 0.75
+# Per-rollout floor: catches a partial swap hidden in a single rollout that the
+# group mean would dilute. v4 lowers it because full-support single-rollout
+# honest match bottoms at 0.78 (16k, same-box) against v3's tighter envelope;
+# 0.70 stays 8pt under that while still catching a 10%-swapped rollout (0.59-
+# 0.66 measured, 08-12). Reconfirm against cross-stack drift during shadow.
+FORCED_SEED_ROLLOUT_FLOOR = 0.70 if PROTOCOL_VERSION >= 4 else 0.75
 # A single rollout is judged only if it carries at least this many stochastic
 # positions; below it the per-rollout check abstains (never false-reject a
 # short / peaked honest rollout).

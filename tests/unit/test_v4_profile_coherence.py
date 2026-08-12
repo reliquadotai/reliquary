@@ -101,8 +101,10 @@ def test_v4_profile_is_internally_coherent():
         "opt_8bit": False,
         # Behavioural-validator thresholds recalibrated for the full-support
         # envelope (H100, 2026-08-12, 40 honest 16k-cap OMI rollouts).
-        "seed_floor": 0.70,
-        "seed_rollout_floor": 0.65,
+        # Group floor stays at 0.80 (gates the ~0.95 honest group aggregate);
+        # only the per-rollout floor drops for v4 single-rollout tail drift.
+        "seed_floor": 0.80,
+        "seed_rollout_floor": 0.70,
         "min_eos_prob": 0.001,
         "sampling_median_max": 0.05,
         "sampling_q10_max": 0.0002,
