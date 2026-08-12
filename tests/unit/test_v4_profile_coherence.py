@@ -45,6 +45,8 @@ print(json.dumps({
     "raw_prompts": c.RAW_COMPLETION_PROMPTS,
     "omi_train_only": c.OMI_TRAIN_SHARDS_ONLY,
     "opt_8bit": c.OPTIMIZER_STATE_8BIT,
+    "dual_clip_c": c.PPO_DUAL_CLIP_C,
+    "ratio_skip_threshold": c.PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD,
     "seed_floor": c.FORCED_SEED_CONSISTENCY_FLOOR,
     "seed_rollout_floor": c.FORCED_SEED_ROLLOUT_FLOOR,
     "min_eos_prob": c.MIN_EOS_PROBABILITY,
@@ -58,7 +60,13 @@ print(json.dumps({
 
 
 def _boot(profile_id):
-    env = dict(os.environ)
+    # Drop inherited RELIQUARY_* overrides: the locked dicts pin env-overridable
+    # constants, so a leaked override would fail spuriously — or worse, mask a
+    # real profile regression by matching the expected value.
+    env = {
+        k: v for k, v in os.environ.items()
+        if not k.startswith("RELIQUARY_")
+    }
     env["RELIQUARY_PROTOCOL_PROFILE"] = profile_id
     done = subprocess.run(
         [sys.executable, "-c", _SCRIPT],
@@ -87,6 +95,9 @@ def test_v4_profile_is_internally_coherent():
         "kl_beta": 0.0,
         "clip_low": 0.2,
         "clip_high": 0.28,
+        # verl parity: dual clip bound + armed drift backstop for interval 16.
+        "dual_clip_c": 10.0,
+        "ratio_skip_threshold": 0.5,
         "opt_8bit": False,
         # Behavioural-validator thresholds recalibrated for the full-support
         # envelope (H100, 2026-08-12, 40 honest 16k-cap OMI rollouts).
@@ -113,6 +124,8 @@ def test_v3_profile_keeps_its_own_coherent_shape():
     assert got["raw_prompts"] is False
     assert got["omi_train_only"] is False
     assert got["opt_8bit"] is True
+    assert got["dual_clip_c"] == float("inf")
+    assert got["ratio_skip_threshold"] == 1.0
     # v3 behavioural-validator thresholds stay at their calibrated values.
     assert got["seed_floor"] == 0.80
     assert got["seed_rollout_floor"] == 0.75

@@ -319,7 +319,12 @@ print(json.dumps({
     "publish_interval": c.CHECKPOINT_PUBLISH_INTERVAL_WINDOWS,
 }))
 """
-    env = dict(os.environ)
+    # Drop inherited RELIQUARY_* overrides — several pinned constants are
+    # env-overridable and a leaked override would flip them.
+    env = {
+        k: v for k, v in os.environ.items()
+        if not k.startswith("RELIQUARY_")
+    }
     env["RELIQUARY_PROTOCOL_PROFILE"] = profile_id
     completed = subprocess.run(
         [sys.executable, "-c", script],
