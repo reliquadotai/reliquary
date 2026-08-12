@@ -25,6 +25,7 @@ from reliquary.constants import (
     GRAD_CLIP_NORM, GRAD_NORM_SKIP_THRESHOLD, KL_BETA, LEARNING_RATE,
     LR_COSINE_MAX_WINDOWS, LR_WARMUP_WINDOWS,
     MICROBATCH_MAX_PADDED_TOKENS, PPO_CLIP_EPSILON_HIGH, PPO_CLIP_EPSILON_LOW,
+    PPO_DUAL_CLIP_C,
     PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD,
 )
 
@@ -913,7 +914,16 @@ def _clipped_surrogate(ratio, advantage):
     clipped = torch.clamp(
         ratio, 1 - PPO_CLIP_EPSILON_LOW, 1 + PPO_CLIP_EPSILON_HIGH
     ) * advantage
-    return torch.min(unclipped, clipped), clipped < unclipped
+    surrogate = torch.min(unclipped, clipped)
+    if math.isfinite(PPO_DUAL_CLIP_C):
+        # Dual clip (Eq. 10 code path in verl): floor negative-advantage
+        # surrogates at c·A so an exploding ratio cannot dominate the step.
+        surrogate = torch.where(
+            advantage < 0,
+            torch.maximum(surrogate, PPO_DUAL_CLIP_C * advantage),
+            surrogate,
+        )
+    return surrogate, clipped < unclipped
 
 
 def _rollout_loss(

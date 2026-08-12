@@ -509,10 +509,10 @@ EPOCH_SUBMIT_LEAD_BLOCKS = 20
 # 16 steps over 8,192 sequences from one pi_old. At 4 it is 4 steps over 2,048.
 #
 # The cost is drift: pi_theta moves 16 steps from pi_old instead of 4, so the
-# clip does more work. That is what eps_high=0.28 is for, but the guard that
-# would STOP a run drifting too far — PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD —
-# defaults to 1.0, which cannot fire. Watch train/ppo_ratio_outside_clip_ratio
-# and arm that threshold before relying on this at full interval.
+# clip does more work. That is what eps_high=0.28 is for; the backstop that
+# STOPS a run drifting too far — PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD — is
+# armed at 0.5 on v4. Watch train/ppo_ratio_outside_clip_ratio and tighten it
+# from real telemetry once the run's normal late-interval level is known.
 CHECKPOINT_PUBLISH_INTERVAL_WINDOWS = int(_os.environ.get(
     "RELIQUARY_CHECKPOINT_PUBLISH_INTERVAL_WINDOWS",
     "16" if PROTOCOL_VERSION >= 4 else "4",
@@ -958,13 +958,23 @@ OPTIMIZER_STATE_8BIT = (
 PPO_CLIP_EPSILON_LOW = 0.2
 PPO_CLIP_EPSILON_HIGH = 0.28 if PROTOCOL_VERSION >= 4 else 0.2
 
+# Dual clip (verl's clip_ratio_c, set to 10.0 in the DAPO reference script):
+# with a negative advantage min(r·A, clip·A) follows r·A unbounded, so one
+# exploding-ratio token can dominate a step; floor the surrogate at c·A.
+# inf pre-v4 keeps live training byte-identical.
+PPO_DUAL_CLIP_C = 10.0 if PROTOCOL_VERSION >= 4 else float("inf")
+
 # Optional pre-step trust-region circuit breaker. A value of 1.0 is the
 # compatibility default and cannot trigger because the observed fraction is at
 # most 1. Recovery runs can set a lower calibrated ceiling so an unpublished
 # policy that has drifted too far from the serving behavior policy is never
 # stepped or published.
+# v4 arms it at 0.5: a coarse backstop for the 16-window pi_old interval with
+# KL off — only catastrophic drift trips it, and a trip triggers the adaptive
+# early publication (fresh pi_old), not a livelock. Tighten from telemetry.
 PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD = float(_os.environ.get(
-    "RELIQUARY_PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD", "1.0"
+    "RELIQUARY_PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD",
+    "0.5" if PROTOCOL_VERSION >= 4 else "1.0",
 ))
 if (
     not _math.isfinite(PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD)

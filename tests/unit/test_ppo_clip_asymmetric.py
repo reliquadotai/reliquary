@@ -83,3 +83,52 @@ def test_a_ratio_between_the_two_epsilons_is_clipped_only_when_symmetric(monkeyp
     assert symmetric.item() == torch.tensor(1.2).item()
     assert bool(higher_clipped.item()) is False
     assert higher.item() == torch.tensor(1.24).item()
+
+
+def test_dual_clip_bounds_negative_advantage_loss(monkeypatch):
+    """verl parity (clip_ratio_c=10): with A<0 the standard surrogate is
+    UNBOUNDED as the ratio grows — min(r·A, clip·A) follows r·A to -inf. The
+    dual clip floors the surrogate at c·A, capping per-token loss at c·|A|."""
+    monkeypatch.setattr(T, "PPO_CLIP_EPSILON_LOW", 0.2)
+    monkeypatch.setattr(T, "PPO_CLIP_EPSILON_HIGH", 0.28)
+    monkeypatch.setattr(T, "PPO_DUAL_CLIP_C", 10.0)
+
+    surr, _ = T._clipped_surrogate(torch.tensor([50.0]), torch.tensor([-1.0]))
+
+    assert surr.item() == torch.tensor(-10.0).item()
+
+
+def test_dual_clip_inactive_below_c_and_for_positive_advantages(monkeypatch):
+    monkeypatch.setattr(T, "PPO_CLIP_EPSILON_LOW", 0.2)
+    monkeypatch.setattr(T, "PPO_CLIP_EPSILON_HIGH", 0.28)
+    monkeypatch.setattr(T, "PPO_DUAL_CLIP_C", 10.0)
+
+    # ratio below c: the standard band is tighter, dual clip must not act
+    surr, _ = T._clipped_surrogate(torch.tensor([5.0]), torch.tensor([-1.0]))
+    assert surr.item() == torch.tensor(-5.0).item()
+    # positive advantage: never dual-clipped, upside already capped at 1+eps_h
+    surr, _ = T._clipped_surrogate(torch.tensor([50.0]), torch.tensor([1.0]))
+    assert surr.item() == torch.tensor(1.28).item()
+
+
+def test_dual_clip_disabled_pre_v4_keeps_unbounded_surrogate(monkeypatch):
+    """inf sentinel = pre-v4 behaviour byte-identical (no bound)."""
+    monkeypatch.setattr(T, "PPO_CLIP_EPSILON_LOW", 0.2)
+    monkeypatch.setattr(T, "PPO_CLIP_EPSILON_HIGH", 0.2)
+    monkeypatch.setattr(T, "PPO_DUAL_CLIP_C", float("inf"))
+
+    surr, _ = T._clipped_surrogate(torch.tensor([50.0]), torch.tensor([-1.0]))
+
+    assert surr.item() == torch.tensor(-50.0).item()
+
+
+def test_dual_clip_keeps_gradients_finite_at_zero_advantage(monkeypatch):
+    """inf·0 = nan must never leak through the inactive branch."""
+    monkeypatch.setattr(T, "PPO_DUAL_CLIP_C", float("inf"))
+    ratio = torch.tensor([2.0], requires_grad=True)
+
+    surr, _ = T._clipped_surrogate(ratio, torch.tensor([0.0]))
+    surr.sum().backward()
+
+    assert torch.isfinite(surr).all()
+    assert torch.isfinite(ratio.grad).all()
