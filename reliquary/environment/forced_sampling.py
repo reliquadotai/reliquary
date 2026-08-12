@@ -215,6 +215,11 @@ def seed_consistency_diagnostics(
             raise ValueError("logit_positions contains an out-of-range row")
 
     vocab_size = max(1, int(logits.shape[-1]))
+    # Full-support sampling (v4: top_k=0; verl uses -1) has no top-k window to
+    # restrict to: the sparse path would renormalise a 33-token slice and its
+    # tie-overflow fallback is unreachable at top_k<=0, so honest full-support
+    # picks would be misclassified. Route straight to the dense intervals.
+    full_support = not (top_k and 0 < int(top_k) < vocab_size)
     chunk_rows = max(
         1,
         min(n, _DIAGNOSTIC_FLOAT_WORKSPACE_BYTES // (vocab_size * 4)),
@@ -239,10 +244,16 @@ def seed_consistency_diagnostics(
             device=chunk_logits.device,
             dtype=torch.long,
         )
-        max_probs, lower, upper, mass = _interval_stats_sparse(
-            chunk_logits, toks, t=t, top_k=top_k, top_p=top_p,
-        )
-        fallback = torch.isnan(mass)
+        if full_support:
+            max_probs, lower, upper, mass = _interval_stats_dense(
+                chunk_logits, toks, t=t, top_k=top_k, top_p=top_p,
+            )
+            fallback = torch.zeros_like(mass, dtype=torch.bool)
+        else:
+            max_probs, lower, upper, mass = _interval_stats_sparse(
+                chunk_logits, toks, t=t, top_k=top_k, top_p=top_p,
+            )
+            fallback = torch.isnan(mass)
         if bool(fallback.any()):
             # kth-value ties reached the window edge: recompute those rows on
             # the full vocab so the sparse path never changes a verdict.

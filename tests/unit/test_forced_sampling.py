@@ -359,6 +359,52 @@ def test_sparse_handles_token_outside_topk_window():
         assert got.n_hard_mismatch == 1
 
 
+def test_full_support_diagnostics_verify_honest_picks_exactly():
+    """v4 sampling (top_k=0): every honest pick must verify, wherever it lands.
+
+    The sparse window is sized by top_k; at 0 it degenerates to 33 tokens with
+    the dense fallback unreachable, so honest full-support picks outside the
+    window (or in-window picks whose interval misses the tail mass) would be
+    misclassified. Full support must route to the full-vocab intervals.
+    """
+    g = torch.Generator().manual_seed(5)
+    rows, vocab = 48, 4096
+    logits = torch.randn(rows, vocab, generator=g)   # flat: honest picks spread
+    u = torch.rand(rows, generator=g).tolist()
+    for top_k in (0, -1):                            # profile and verl sentinels
+        kw = dict(t=1.0, top_k=top_k, top_p=1.0)
+        toks = [fs.pick(fs.warp(logits[i], **kw), u[i]) for i in range(rows)]
+        got = fs.seed_consistency_diagnostics(
+            logits, toks, u, **kw,
+            stochastic_threshold=0.99, boundary_epsilon=1e-6,
+        )
+        assert got.n_positions == rows
+        assert got.n_stochastic == rows              # randn(4096) is never peaked
+        assert got.n_exact_match == rows, "honest full-support pick rejected"
+        assert got.n_hard_mismatch == 0
+
+
+def test_full_support_diagnostics_match_dense_reference_counts():
+    # Same contract as test_sparse_diagnostics_counts_identical_to_reference,
+    # at the v4 envelope: ~1/3 corrupted tokens must classify exactly as a
+    # dense-only computation says, no more and no fewer.
+    logits, toks, u = _random_case(11, rows=64, vocab=2048)
+    kw = dict(t=1.0, top_k=0, top_p=1.0)
+    got = fs.seed_consistency_diagnostics(
+        logits, toks, u, **kw, stochastic_threshold=0.99, boundary_epsilon=1e-6)
+    probs_ref = fs._warp_batch(logits, **kw)
+    cdf = torch.cumsum(probs_ref, dim=-1)
+    row = torch.arange(logits.shape[0])
+    tok_t = torch.tensor(toks)
+    upper = cdf[row, tok_t]
+    lower = upper - probs_ref[row, tok_t]
+    uu = torch.tensor(u, dtype=upper.dtype)
+    exact = (uu >= lower) & (uu < upper)
+    assert got.n_exact_match == int(
+        ((probs_ref.max(-1).values < 0.99) & exact).sum()
+    )
+
+
 # ── v4 sampling: warp() is the identity, so the PPO ratio lives in the space
 # the samples actually came from. Task 7 (clip-higher) is only interpretable
 # because of this. These are regression pins, not change drivers: they pass on
