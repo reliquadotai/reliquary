@@ -78,18 +78,27 @@ def _use_8bit_optimizer(params) -> bool:
 
 
 def _build_optimizer(params) -> torch.optim.Optimizer:
-    """Prefer bitsandbytes PagedAdamW8bit on CUDA — quantised optimiser
-    state (~4× smaller than fp32 / ~2× smaller than bf16) plus unified
-    memory paging that spills to host RAM under pressure. Falls back to
-    plain AdamW when CUDA or bitsandbytes is unavailable (CPU tests, dev
-    boxes without a GPU).
+    """CUDA parameters get a bitsandbytes paged optimizer: PagedAdamW8bit
+    when OPTIMIZER_STATE_8BIT, else 32-bit PagedAdamW — full-precision
+    moments the profile asks for, host-paged so they cost ~nothing resident.
+    torch.optim.AdamW is only the no-CUDA / no-bitsandbytes fallback: on
+    bf16 params its moments silently inherit bf16 (measured H100 08-12:
+    bf16 state, +15.1 GB resident, 37.9 GB step peak vs 16.7 GB paged), so
+    it is neither the small nor the precise option.
     """
     params = list(params)
-    if _use_8bit_optimizer(params):
+    cuda_params = (
+        torch.cuda.is_available()
+        and bool(params)
+        and all(parameter.device.type == "cuda" for parameter in params)
+    )
+    if cuda_params:
+        use_8bit = _use_8bit_optimizer(params)
         try:
             import bitsandbytes as bnb  # type: ignore[import-not-found]
-            logger.info("Using bitsandbytes PagedAdamW8bit")
-            return bnb.optim.PagedAdamW8bit(
+            cls = bnb.optim.PagedAdamW8bit if use_8bit else bnb.optim.PagedAdamW
+            logger.info("Using bitsandbytes %s", cls.__name__)
+            return cls(
                 params,
                 lr=LEARNING_RATE,
                 betas=(0.9, 0.999),
@@ -97,7 +106,10 @@ def _build_optimizer(params) -> torch.optim.Optimizer:
                 weight_decay=0.01,
             )
         except ImportError:
-            logger.warning("bitsandbytes not available — falling back to torch.optim.AdamW")
+            logger.warning(
+                "bitsandbytes not available — falling back to torch.optim."
+                "AdamW (moments inherit the params' dtype)"
+            )
     return torch.optim.AdamW(
         params,
         lr=LEARNING_RATE,

@@ -228,3 +228,50 @@ def test_eight_bit_optimizer_declined_for_cpu_parameters(monkeypatch):
 
     assert _use_8bit_optimizer([_FakeParam("cpu")]) is False
     assert _use_8bit_optimizer([]) is False
+
+
+def _fake_bnb(record):
+    import types as _types
+
+    fake = _types.ModuleType("bitsandbytes")
+    fake.optim = SimpleNamespace(
+        PagedAdamW8bit=lambda ps, **kw: record.setdefault("choice", "8bit"),
+        PagedAdamW=lambda ps, **kw: record.setdefault("choice", "paged32"),
+    )
+    return fake
+
+
+def test_optimizer_uses_paged_fp32_when_8bit_disabled_on_cuda(monkeypatch):
+    """OPTIMIZER_STATE_8BIT=0 means FULL-precision state, and torch AdamW on
+    bf16 params silently keeps bf16 state (measured H100 08-12: bf16 moments,
+    +15.1GB resident, 37.9GB step peak). The faithful path is bnb's 32-bit
+    PagedAdamW: true fp32 state, host-paged, 16.7GB step peak."""
+    import sys
+
+    import reliquary.constants as C
+
+    monkeypatch.setattr(C, "OPTIMIZER_STATE_8BIT", False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    record = {}
+    monkeypatch.setitem(sys.modules, "bitsandbytes", _fake_bnb(record))
+    param = SimpleNamespace(device=SimpleNamespace(type="cuda"))
+
+    _build_optimizer([param])
+
+    assert record["choice"] == "paged32"
+
+
+def test_optimizer_keeps_paged_8bit_when_enabled_on_cuda(monkeypatch):
+    import sys
+
+    import reliquary.constants as C
+
+    monkeypatch.setattr(C, "OPTIMIZER_STATE_8BIT", True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    record = {}
+    monkeypatch.setitem(sys.modules, "bitsandbytes", _fake_bnb(record))
+    param = SimpleNamespace(device=SimpleNamespace(type="cuda"))
+
+    _build_optimizer([param])
+
+    assert record["choice"] == "8bit"
