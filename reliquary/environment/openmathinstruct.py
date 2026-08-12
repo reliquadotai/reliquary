@@ -427,6 +427,18 @@ def _load_dataset(repo: str, revision: str):
     """
     path = Path(repo).expanduser()
     if path.exists() and (path / "dataset_info.json").exists():
+        from reliquary.constants import OMI_TRAIN_SHARDS_ONLY as _train_only
+
+        # A snapshot embeds whatever shard listing built it — it cannot honour
+        # the v4 train- filter, and a diverging len(env) forks prompt-range
+        # consensus silently (every submission dies on PROMPT_MISMATCH).
+        if _train_only:
+            raise RuntimeError(
+                "local OMI save_to_disk snapshots are unsupported on v4+: "
+                "the snapshot's row set predates the train- shard filter and "
+                "len(env) is prompt-range consensus; configure the hub repo "
+                "id so the filtered VirtualParquetDataset view is used"
+            )
         import datasets as hf
         return hf.load_from_disk(str(path))
     from reliquary.constants import OMI_TRAIN_SHARDS_ONLY

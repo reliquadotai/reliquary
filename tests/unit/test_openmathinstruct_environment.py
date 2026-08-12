@@ -539,3 +539,34 @@ def test_no_answer_still_zero():
     )
 
     assert _compute_omi_reward({"ground_truth": "1"}, "I cannot solve this.") == 0.0
+
+
+def test_local_snapshot_refused_when_train_shards_only(monkeypatch, tmp_path):
+    """A save_to_disk snapshot embeds whatever shard listing built it, so on
+    v4 it cannot honour the train- filter and would fork len(env) — which is
+    prompt-range consensus. Fail closed instead of silently diverging."""
+    import pytest as _pytest
+
+    import reliquary.constants as C
+    from reliquary.environment.openmathinstruct import _load_dataset
+
+    (tmp_path / "dataset_info.json").write_text("{}")
+    monkeypatch.setattr(C, "OMI_TRAIN_SHARDS_ONLY", True)
+    with _pytest.raises(RuntimeError, match="consensus"):
+        _load_dataset(str(tmp_path), "rev")
+
+
+def test_local_snapshot_still_loads_pre_v4(monkeypatch, tmp_path):
+    import sys
+    import types
+
+    import reliquary.constants as C
+    from reliquary.environment.openmathinstruct import _load_dataset
+
+    (tmp_path / "dataset_info.json").write_text("{}")
+    monkeypatch.setattr(C, "OMI_TRAIN_SHARDS_ONLY", False)
+    fake = types.ModuleType("datasets")
+    fake.load_from_disk = lambda p: ("loaded", p)
+    monkeypatch.setitem(sys.modules, "datasets", fake)
+
+    assert _load_dataset(str(tmp_path), "rev") == ("loaded", str(tmp_path))
