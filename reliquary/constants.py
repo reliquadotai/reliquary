@@ -1085,7 +1085,11 @@ WANDB_TRAINING_VERSION = _os.environ.get("RELIQUARY_WANDB_VERSION", "v1")
 # favourable partial output). Upstream grail uses 0.02; we lowered to 0.01
 # after Qwen-family + T_PROTO=0.9 prod logs showed honest EOS clustering just
 # below 0.02. Mid-reasoning forgery still fails (p_stop typically < 0.001).
-MIN_EOS_PROBABILITY = 0.01
+# v4 (full-support T=1.0) values below were calibrated on H100 2026-08-12:
+# 40 honest Qwen3-4B-Base rollouts, real OMI prompts, 16384 cap, generation
+# through the miner's forced-seed path and verification through this repo's
+# validator functions, same box (a LOWER bound on cross-stack drift).
+MIN_EOS_PROBABILITY = 0.001 if PROTOCOL_VERSION >= 4 else 0.01
 
 # LogprobValidator: max allowed median importance-sampling deviation
 # across K=CHALLENGE_K positions. dev_i = exp(|model_lp - miner_lp|) - 1.
@@ -1105,8 +1109,15 @@ LOGPROB_IS_EPS = 0.10
 SAMPLING_MIN_STEPS = 30         # completion must be at least this long
 SAMPLING_LOW_P = 0.10           # prob <= this → "low" chosen token
 SAMPLING_HIGH_P = 0.90           # prob >= this → "high" chosen token
-SAMPLING_MEDIAN_LOW_MAX = 0.30  # median chosen prob must be above
-SAMPLING_LOW_Q10_MAX = 0.025    # 10th-percentile must be above
+# v4: honest full-support sampling legitimately visits the tail, so both
+# floors drop to sit under the calibrated honest minima (median 0.121,
+# q10 0.00064) while staying far above forged-token mass (~1/vocab ≈ 7e-6).
+SAMPLING_MEDIAN_LOW_MAX = (
+    0.05 if PROTOCOL_VERSION >= 4 else 0.30
+)                               # median chosen prob must be above
+SAMPLING_LOW_Q10_MAX = (
+    0.0002 if PROTOCOL_VERSION >= 4 else 0.025
+)                               # 10th-percentile must be above
 
 # OpenMath final-answer tamper guard. The reward parser keys off the last
 # \boxed{...} content; swapping a few tokens there flips the reward without
@@ -1172,7 +1183,11 @@ FORCED_SEED_STOCHASTIC_MAXPROB = 0.99
 # rollout. Live 2026-07-14 data supports a future 0.90 candidate, but changing
 # acceptance policy belongs to the announced miner/protocol cutover after the
 # exact-CDF shadow gate has been calibrated across implementations.
-FORCED_SEED_CONSISTENCY_FLOOR = 0.80
+# v4: same-box honest exact ratios bottom out at 0.78 (numeric drift between
+# incremental decode and the verify forward crosses full-support interval
+# boundaries); 0.70 leaves cross-stack margin while pregenerated rollouts
+# still score near zero.
+FORCED_SEED_CONSISTENCY_FLOOR = 0.70 if PROTOCOL_VERSION >= 4 else 0.80
 # Below this many stochastic positions in a group, the gate abstains (accepts)
 # rather than risk a false reject on thin signal.
 FORCED_SEED_MIN_STOCH_POSITIONS = 30
@@ -1183,7 +1198,7 @@ FORCED_SEED_MIN_STOCH_POSITIONS = 30
 # per-rollout floor. Set lower than the group floor to absorb the higher
 # single-rollout variance (empirical single-rollout: honest 0.94-1.0, non-forced
 # 0.52-0.65); shadow-only until calibrated on the live floor.
-FORCED_SEED_ROLLOUT_FLOOR = 0.75
+FORCED_SEED_ROLLOUT_FLOOR = 0.65 if PROTOCOL_VERSION >= 4 else 0.75
 # A single rollout is judged only if it carries at least this many stochastic
 # positions; below it the per-rollout check abstains (never false-reject a
 # short / peaked honest rollout).

@@ -45,6 +45,11 @@ print(json.dumps({
     "raw_prompts": c.RAW_COMPLETION_PROMPTS,
     "omi_train_only": c.OMI_TRAIN_SHARDS_ONLY,
     "opt_8bit": c.OPTIMIZER_STATE_8BIT,
+    "seed_floor": c.FORCED_SEED_CONSISTENCY_FLOOR,
+    "seed_rollout_floor": c.FORCED_SEED_ROLLOUT_FLOOR,
+    "min_eos_prob": c.MIN_EOS_PROBABILITY,
+    "sampling_median_max": c.SAMPLING_MEDIAN_LOW_MAX,
+    "sampling_q10_max": c.SAMPLING_LOW_Q10_MAX,
     # Cross-module: is the sampling the profile declares actually the identity?
     "warp_is_identity": bool(torch.allclose(warped, plain, atol=1e-6)),
     "warp_full_support": bool(torch.all(warped > 0)),
@@ -83,6 +88,13 @@ def test_v4_profile_is_internally_coherent():
         "clip_low": 0.2,
         "clip_high": 0.28,
         "opt_8bit": False,
+        # Behavioural-validator thresholds recalibrated for the full-support
+        # envelope (H100, 2026-08-12, 40 honest 16k-cap OMI rollouts).
+        "seed_floor": 0.70,
+        "seed_rollout_floor": 0.65,
+        "min_eos_prob": 0.001,
+        "sampling_median_max": 0.05,
+        "sampling_q10_max": 0.0002,
         "raw_prompts": True,
         "omi_train_only": True,
         # The premise clip-higher rests on.
@@ -101,6 +113,12 @@ def test_v3_profile_keeps_its_own_coherent_shape():
     assert got["raw_prompts"] is False
     assert got["omi_train_only"] is False
     assert got["opt_8bit"] is True
+    # v3 behavioural-validator thresholds stay at their calibrated values.
+    assert got["seed_floor"] == 0.80
+    assert got["seed_rollout_floor"] == 0.75
+    assert got["min_eos_prob"] == 0.01
+    assert got["sampling_median_max"] == 0.30
+    assert got["sampling_q10_max"] == 0.025
     # v3 samples at T=0.6 / top_k=20, so warp() truncates and rescales.
     assert got["warp_is_identity"] is False
     assert got["warp_full_support"] is False
