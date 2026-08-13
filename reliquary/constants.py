@@ -534,19 +534,26 @@ DEFAULT_HF_REPO_ID = "aivolutionedge/reliquary-sn"
 # (σ at k=2/6 ≈ 0.433); for continuous rewards it drops groups whose rollouts
 # clustered too tight to carry meaningful GRPO signal.
 #
-# v4 adopts DAPO's dynamic-sampling criterion: admit ANY group that is not
-# all-same. The `sigma < 1e-8` guard in is_in_zone / _in_zone still drops the
-# degenerate k=0 and k=M groups, so a 0.0 threshold lets every k ∈ [1, M-1]
-# into the auction. The hard 0.43 floor rejected k ∈ {1,2,3,13,14,15} at M=16,
-# starving the trainer of exactly the hard (rare-correct) and easy prompts DAPO
-# learns from. Economic ranking is delegated to the auction value
-# std·(1-mean)^δ, whose (1-mean)^δ factor already favours the rare-correct
-# groups; the zone gate is no longer the anti-uniform economic defense.
-# NOTE: this widens what is admitted and PAID, and softens the manufactured-
-# variance surface the hard gate covered — deliberate, see the v4 cutover plan.
-# v3 keeps 0.43/0.33 so live economics are byte-identical.
-SIGMA_MIN = 0.0 if PROTOCOL_VERSION >= 4 else 0.43
-BOOTSTRAP_SIGMA_MIN = 0.0 if PROTOCOL_VERSION >= 4 else 0.33
+# v4 lowers the gate to DAPO's dynamic-sampling intent: admit any group with a
+# spread of correctness. For M=16 binary rewards the extreme non-degenerate
+# groups k=1 and k=15 have σ = √(1/16·15/16) = 0.2421, so a 0.24 floor admits
+# every k ∈ [1, 15] while the degenerate k=0 / k=16 (σ=0) stay rejected. The
+# old 0.43 floor rejected k ∈ {1,2,3,13,14,15}, starving the trainer of exactly
+# the rare-correct (hard) and near-all-correct (easy) prompts DAPO learns from.
+#
+# 0.24, not 0.0: a 0.0 floor would also admit near-degenerate CONTINUOUS (code)
+# groups — fractional test-pass rewards clustered at e.g. 0.48-0.52 have a tiny
+# but > 1e-8 σ — which carry no usable GRPO gradient. 0.24 keeps filtering
+# those while passing every binary variance group. This is the pragmatic
+# binary-faithful port; the fully faithful `metric=acc` (binarise correctness,
+# drop all-same) is deferred.
+#
+# NOTE: the gate also governs admission/payment, so this widens what is PAID and
+# softens the manufactured-variance surface — deliberate, see the v4 cutover
+# plan; the auction value σ-weighting and forced-seed / distribution layers are
+# the remaining defense. v3 keeps 0.43/0.33 so live economics are byte-identical.
+SIGMA_MIN = 0.24 if PROTOCOL_VERSION >= 4 else 0.43
+BOOTSTRAP_SIGMA_MIN = 0.22 if PROTOCOL_VERSION >= 4 else 0.33
 
 # Number of rollouts per submission (= size of each GRPO group).
 M_ROLLOUTS = ACTIVE_PROTOCOL_PROFILE.sampling.rollouts

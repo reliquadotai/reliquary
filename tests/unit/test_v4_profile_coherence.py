@@ -97,9 +97,10 @@ def test_v4_profile_is_internally_coherent():
         "kl_beta": 0.0,
         "clip_low": 0.2,
         "clip_high": 0.28,
-        # DAPO dynamic-sampling criterion: zone gate admits any k in [1, M-1].
-        "sigma_min": 0.0,
-        "bootstrap_sigma_min": 0.0,
+        # DAPO dynamic-sampling intent: 0.24 admits binary k in [1, 15] at M=16
+        # (σ_k1=0.2421) while still filtering near-degenerate continuous groups.
+        "sigma_min": 0.24,
+        "bootstrap_sigma_min": 0.22,
         # verl parity: dual clip bound + armed drift backstop for interval 16.
         "dual_clip_c": 10.0,
         "ratio_skip_threshold": 0.5,

@@ -70,27 +70,29 @@ def test_rewards_std_continuous():
 
 
 
-# ── v4: DAPO dynamic-sampling criterion — admit any group with variance.
+# ── v4: DAPO dynamic-sampling intent — admit any binary variance group (k=1..15
+# at M=16) via a 0.24 floor, still filtering near-degenerate continuous clusters.
 
 def test_v4_admits_k1_and_k15_of_16(monkeypatch):
-    """At SIGMA_MIN=0.0 every non-degenerate group passes. For M=16 binary the
-    extremes k=1 and k=15 have σ=√(1/16·15/16)=0.2421 — rejected by the 0.43
-    gate, admitted under v4."""
+    """For M=16 binary the extremes k=1 and k=15 have σ=√(1/16·15/16)=0.2421 —
+    rejected by the 0.43 gate, admitted by the v4 0.24 floor."""
     import reliquary.constants as C
-    monkeypatch.setattr(C, "SIGMA_MIN", 0.0)
-    monkeypatch.setattr(C, "BOOTSTRAP_SIGMA_MIN", 0.0)
+    monkeypatch.setattr(C, "SIGMA_MIN", 0.24)
+    monkeypatch.setattr(C, "BOOTSTRAP_SIGMA_MIN", 0.22)
 
     sigma_k1 = math.sqrt((1 / 16) * (15 / 16))
     assert round(sigma_k1, 4) == 0.2421
     assert is_in_zone(sigma_k1) is True            # k=1 (and by symmetry k=15)
-    assert is_in_zone(0.05) is True                # any small nonzero variance
+    assert is_in_zone(0.5) is True                 # k=8, always fine
 
 
-def test_v4_still_rejects_all_same_group(monkeypatch):
-    """The 1e-8 degenerate guard is what remains — k=0 and k=M stay out."""
+def test_v4_still_filters_near_degenerate_continuous_clusters(monkeypatch):
+    """0.24, not 0.0: a tight continuous (code) cluster with tiny σ carries no
+    GRPO gradient and must still be rejected — this is why the floor isn't 0."""
     import reliquary.constants as C
-    monkeypatch.setattr(C, "SIGMA_MIN", 0.0)
-    monkeypatch.setattr(C, "BOOTSTRAP_SIGMA_MIN", 0.0)
+    monkeypatch.setattr(C, "SIGMA_MIN", 0.24)
+    monkeypatch.setattr(C, "BOOTSTRAP_SIGMA_MIN", 0.22)
 
-    assert is_in_zone(0.0) is False
-    assert is_in_zone(1e-9) is False
+    assert is_in_zone(0.0) is False                # all-same
+    assert is_in_zone(0.1) is False                # tight cluster, below 0.24
+    assert is_in_zone(0.1, bootstrap=True) is False  # 0.1 < 0.22 too
