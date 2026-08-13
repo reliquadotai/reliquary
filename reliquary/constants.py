@@ -530,11 +530,23 @@ DEFAULT_HF_REPO_ID = "aivolutionedge/reliquary-sn"
 # ────────────────  GRPO MARKET (v2)  ────────────────
 
 # Minimum reward-std for a group to pass the zone filter. For binary
-# Bernoulli rewards this admits k ∈ [2, 6] for M=8 (σ at k=2/6 ≈ 0.433).
-# For continuous rewards it filters groups whose rollouts clustered too
-# tight to carry meaningful GRPO signal.
-SIGMA_MIN = 0.43
-BOOTSTRAP_SIGMA_MIN = 0.33
+# Bernoulli rewards the 0.43 steady-state gate admits k ∈ [2, 6] for M=8
+# (σ at k=2/6 ≈ 0.433); for continuous rewards it drops groups whose rollouts
+# clustered too tight to carry meaningful GRPO signal.
+#
+# v4 adopts DAPO's dynamic-sampling criterion: admit ANY group that is not
+# all-same. The `sigma < 1e-8` guard in is_in_zone / _in_zone still drops the
+# degenerate k=0 and k=M groups, so a 0.0 threshold lets every k ∈ [1, M-1]
+# into the auction. The hard 0.43 floor rejected k ∈ {1,2,3,13,14,15} at M=16,
+# starving the trainer of exactly the hard (rare-correct) and easy prompts DAPO
+# learns from. Economic ranking is delegated to the auction value
+# std·(1-mean)^δ, whose (1-mean)^δ factor already favours the rare-correct
+# groups; the zone gate is no longer the anti-uniform economic defense.
+# NOTE: this widens what is admitted and PAID, and softens the manufactured-
+# variance surface the hard gate covered — deliberate, see the v4 cutover plan.
+# v3 keeps 0.43/0.33 so live economics are byte-identical.
+SIGMA_MIN = 0.0 if PROTOCOL_VERSION >= 4 else 0.43
+BOOTSTRAP_SIGMA_MIN = 0.0 if PROTOCOL_VERSION >= 4 else 0.33
 
 # Number of rollouts per submission (= size of each GRPO group).
 M_ROLLOUTS = ACTIVE_PROTOCOL_PROFILE.sampling.rollouts

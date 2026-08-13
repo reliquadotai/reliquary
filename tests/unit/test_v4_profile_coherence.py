@@ -45,6 +45,8 @@ print(json.dumps({
     "raw_prompts": c.RAW_COMPLETION_PROMPTS,
     "omi_train_only": c.OMI_TRAIN_SHARDS_ONLY,
     "opt_8bit": c.OPTIMIZER_STATE_8BIT,
+    "sigma_min": c.SIGMA_MIN,
+    "bootstrap_sigma_min": c.BOOTSTRAP_SIGMA_MIN,
     "dual_clip_c": c.PPO_DUAL_CLIP_C,
     "ratio_skip_threshold": c.PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD,
     "seed_floor": c.FORCED_SEED_CONSISTENCY_FLOOR,
@@ -95,6 +97,9 @@ def test_v4_profile_is_internally_coherent():
         "kl_beta": 0.0,
         "clip_low": 0.2,
         "clip_high": 0.28,
+        # DAPO dynamic-sampling criterion: zone gate admits any k in [1, M-1].
+        "sigma_min": 0.0,
+        "bootstrap_sigma_min": 0.0,
         # verl parity: dual clip bound + armed drift backstop for interval 16.
         "dual_clip_c": 10.0,
         "ratio_skip_threshold": 0.5,
@@ -126,6 +131,8 @@ def test_v3_profile_keeps_its_own_coherent_shape():
     assert got["raw_prompts"] is False
     assert got["omi_train_only"] is False
     assert got["opt_8bit"] is True
+    assert got["sigma_min"] == 0.43
+    assert got["bootstrap_sigma_min"] == 0.33
     assert got["dual_clip_c"] == float("inf")
     assert got["ratio_skip_threshold"] == 1.0
     # v3 behavioural-validator thresholds stay at their calibrated values.
