@@ -226,7 +226,16 @@ _PROFILE_VALUES = (
         model_id="Qwen/Qwen3-4B-Base",
         model_revision="906bfd4b4dc7f14ee4320094d8b41684abff8539",
         protocol_version=4,
-        collection_seconds=300,
+        # Length curriculum, start point. ck0 Qwen3-4B-Base terminates well
+        # short of 16384 (measured on real OMI: median ~500, max ~1392 / 40
+        # rollouts), so sizing the window for a 16384 worst case burns wall-clock
+        # and seal-verify time from day one. Start the cap at 8192 (≈6× the
+        # observed ck0 max, and above OVERLONG_PENALTY_CACHE_TOKENS=4096 so the
+        # soft-overlong zone [cap-4096, cap] still sits ABOVE the natural length)
+        # and the window at 150s (~half the near-cap generation time). Both are
+        # meant to ramp up with the policy's growing reasoning length; watch the
+        # cap-hit rate as the thermostat before raising them.
+        collection_seconds=150,
         upload_grace_seconds=33,
         sampling=_SAMPLING_DAPO,
         environments={
@@ -234,18 +243,18 @@ _PROFILE_VALUES = (
             # block to force closed. Termination is trained by the soft overlong
             # punishment (Eq. 13) instead of forced by a budget.
             "openmathinstruct": EnvironmentProfile(
-                max_new_tokens=16384,
+                max_new_tokens=8192,
                 bft=None,
             ),
             "opencodeinstruct": EnvironmentProfile(
-                max_new_tokens=16384,
+                max_new_tokens=8192,
                 bft=None,
             ),
         },
         throughput_tiebreak=ThroughputTiebreakProfile(
             # Without BFT the per-rollout generation budget is the env cap
-            # itself, where v3 had to use its thinking budget.
-            token_cap=16384,
+            # itself, where v3 had to use its thinking budget. Tracks the cap.
+            token_cap=8192,
             bucket_tokens_per_round=50,
         ),
     ),

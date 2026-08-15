@@ -252,10 +252,12 @@ def test_profiles_are_frozen_slotted_and_recursively_immutable():
             "qwen3-4b-base-dapo-v4",
             {
                 "version": 4,
-                "math_cap": 16384,
-                "code_cap": 16384,
+                # Length-curriculum start point: half of v3's 16384 cap / 300s
+                # window, sized to ck0's short reasoning, ramps up with it.
+                "math_cap": 8192,
+                "code_cap": 8192,
                 "thinking": 0,
-                "window": 300.0,
+                "window": 150.0,
                 "domain": "reliquary-forced-seed-v4",
                 "lr": 1e-6,
                 "kl": 0.0,
