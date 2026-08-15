@@ -132,3 +132,19 @@ def test_dual_clip_keeps_gradients_finite_at_zero_advantage(monkeypatch):
 
     assert torch.isfinite(surr).all()
     assert torch.isfinite(ratio.grad).all()
+
+
+def test_dual_clip_accepts_scalar_float_advantage(monkeypatch):
+    """The per-rollout _rollout_loss path passes advantage as a Python float.
+    The dual-clip branch must handle that, not only tensor advantages —
+    torch.maximum(tensor, float) and torch.where(python_bool, ...) both raise."""
+    monkeypatch.setattr(T, "PPO_DUAL_CLIP_C", 10.0)
+
+    # negative float advantage, exploding ratio: must floor at c*A = -10.0
+    surr, _ = T._clipped_surrogate(torch.tensor([50.0]), -1.0)
+    assert surr.item() == torch.tensor(-10.0).item()
+
+    # positive float advantage: dual clip inactive, upside capped at 1+eps_high
+    monkeypatch.setattr(T, "PPO_CLIP_EPSILON_HIGH", 0.28)
+    surr, _ = T._clipped_surrogate(torch.tensor([50.0]), 1.0)
+    assert surr.item() == torch.tensor(1.28).item()

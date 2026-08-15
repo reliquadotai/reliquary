@@ -79,10 +79,14 @@ def _normalize_answer(s: str) -> str:
     if s is None:
         return ""
     s = str(s)
-    # Inline/display LaTeX delimiters: models emit "\(x\)" / "\[x\]" around
-    # unboxed answers; the delimiters never carry meaning.
-    for delim in (r"\(", r"\)", r"\[", r"\]"):
-        s = s.replace(delim, "")
+    # v4 raw-completion answers come wrapped in inline/display LaTeX ("\(x\)" /
+    # "\[x\]"); the delimiters never carry meaning. Gated so v3 grading (which
+    # never saw these — the chat-template model boxes) stays byte-identical.
+    # Lazy import so tests can monkeypatch reliquary.constants.
+    from reliquary.constants import RAW_COMPLETION_PROMPTS
+    if RAW_COMPLETION_PROMPTS:
+        for delim in (r"\(", r"\)", r"\[", r"\]"):
+            s = s.replace(delim, "")
     # Drop LaTeX spacing macros first
     for macro in (r"\!", r"\,", r"\ ", r"\;", r"\:"):
         s = s.replace(macro, "")
@@ -387,7 +391,15 @@ def _compute_omi_reward(problem: dict, completion: str) -> float:
         if boxed is not None:
             candidate = _normalize_answer(_strip_boxed_wrapper(boxed))
         else:
-            answer_lines = _ANSWER_LINE_RE.findall(completion)
+            # v4 raw-completion outputs answer via an "Answer:" line; v3
+            # (chat-template) boxes, so this branch is v4-only to keep v3
+            # reward — the PAID quantity — byte-identical. Lazy import so tests
+            # can monkeypatch reliquary.constants.
+            from reliquary.constants import RAW_COMPLETION_PROMPTS
+            answer_lines = (
+                _ANSWER_LINE_RE.findall(completion)
+                if RAW_COMPLETION_PROMPTS else []
+            )
             if answer_lines:
                 candidate = _normalize_answer(answer_lines[-1])
             else:
@@ -425,14 +437,16 @@ def _load_dataset(repo: str, revision: str):
     the row-groups a window touches are fetched — no bulk shard download, and
     the whole ~14M-row index space stays addressable.
     """
+    # Lazy import so tests can monkeypatch reliquary.constants; read once for
+    # both the snapshot guard and the virtual-parquet filter below.
+    from reliquary.constants import OMI_TRAIN_SHARDS_ONLY
+
     path = Path(repo).expanduser()
     if path.exists() and (path / "dataset_info.json").exists():
-        from reliquary.constants import OMI_TRAIN_SHARDS_ONLY as _train_only
-
         # A snapshot embeds whatever shard listing built it — it cannot honour
         # the v4 train- filter, and a diverging len(env) forks prompt-range
         # consensus silently (every submission dies on PROMPT_MISMATCH).
-        if _train_only:
+        if OMI_TRAIN_SHARDS_ONLY:
             raise RuntimeError(
                 "local OMI save_to_disk snapshots are unsupported on v4+: "
                 "the snapshot's row set predates the train- shard filter and "
@@ -441,7 +455,6 @@ def _load_dataset(repo: str, revision: str):
             )
         import datasets as hf
         return hf.load_from_disk(str(path))
-    from reliquary.constants import OMI_TRAIN_SHARDS_ONLY
     from reliquary.environment import virtual_parquet as _vp
 
     return _vp.VirtualParquetDataset(

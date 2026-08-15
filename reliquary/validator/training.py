@@ -930,9 +930,14 @@ def _clipped_surrogate(ratio, advantage):
     if math.isfinite(PPO_DUAL_CLIP_C):
         # Dual clip (Eq. 10 code path in verl): floor negative-advantage
         # surrogates at c·A so an exploding ratio cannot dominate the step.
+        # advantage may be a Python float (per-rollout _rollout_loss path) or a
+        # tensor (micro-batch); coerce so torch.where/maximum get tensor args.
+        adv = torch.as_tensor(
+            advantage, dtype=surrogate.dtype, device=surrogate.device
+        )
         surrogate = torch.where(
-            advantage < 0,
-            torch.maximum(surrogate, PPO_DUAL_CLIP_C * advantage),
+            adv < 0,
+            torch.maximum(surrogate, PPO_DUAL_CLIP_C * adv),
             surrogate,
         )
     return surrogate, clipped < unclipped

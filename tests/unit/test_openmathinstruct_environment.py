@@ -465,14 +465,18 @@ def test_load_dataset_keeps_the_whole_listing_pre_v4(monkeypatch):
 # ---------------------------------------------------------------------------
 # Extraction fixes: inline LaTeX delimiters and Answer:-line completions.
 # Both are measured false-negative sources (3/32 verdicts flipped in one cell
-# of the 2026-08-03 headroom study).
+# of the 2026-08-03 headroom study). v4-only (RAW_COMPLETION_PROMPTS): v3 boxes
+# and its reward is the paid quantity, so it must stay byte-identical.
 
 
-def test_normalize_strips_inline_latex_delimiters():
-    from reliquary.environment.openmathinstruct import (
-        _compute_omi_reward,
-        _normalize_answer,
-    )
+@pytest.fixture
+def _v4_grader(monkeypatch):
+    import reliquary.constants as C
+    monkeypatch.setattr(C, "RAW_COMPLETION_PROMPTS", True)
+
+
+def test_normalize_strips_inline_latex_delimiters(_v4_grader):
+    from reliquary.environment.openmathinstruct import _normalize_answer
 
     assert _normalize_answer(r"\(\frac{14}{3}\)") == _normalize_answer(
         r"\frac{14}{3}"
@@ -480,65 +484,65 @@ def test_normalize_strips_inline_latex_delimiters():
     assert _normalize_answer(r"\[p - q\]") == _normalize_answer("p - q")
 
 
-def test_answer_line_extraction_plain():
-    from reliquary.environment.openmathinstruct import (
-        _compute_omi_reward,
-        _normalize_answer,
-    )
+def test_answer_line_extraction_plain(_v4_grader):
+    from reliquary.environment.openmathinstruct import _compute_omi_reward
 
     problem = {"ground_truth": "42"}
     assert _compute_omi_reward(problem, "Step 1: compute.\nAnswer: 42") == 1.0
 
 
-def test_answer_line_extraction_markdown_emphasis():
-    from reliquary.environment.openmathinstruct import (
-        _compute_omi_reward,
-        _normalize_answer,
-    )
+def test_answer_line_extraction_markdown_emphasis(_v4_grader):
+    from reliquary.environment.openmathinstruct import _compute_omi_reward
 
     problem = {"ground_truth": "0"}
     assert _compute_omi_reward(problem, "reasoning...\n**Answer:** 0") == 1.0
 
 
-def test_answer_line_takes_last_occurrence():
-    from reliquary.environment.openmathinstruct import (
-        _compute_omi_reward,
-        _normalize_answer,
-    )
+def test_answer_line_takes_last_occurrence(_v4_grader):
+    from reliquary.environment.openmathinstruct import _compute_omi_reward
 
     problem = {"ground_truth": "7"}
     text = "Answer: 3\nWait, recompute.\nAnswer: 7"
     assert _compute_omi_reward(problem, text) == 1.0
 
 
-def test_boxed_still_wins_over_answer_line():
-    from reliquary.environment.openmathinstruct import (
-        _compute_omi_reward,
-        _normalize_answer,
-    )
+def test_boxed_still_wins_over_answer_line(_v4_grader):
+    from reliquary.environment.openmathinstruct import _compute_omi_reward
 
     problem = {"ground_truth": "5"}
     text = "Answer: 3\nActually \\boxed{5}"
     assert _compute_omi_reward(problem, text) == 1.0
 
 
-def test_answer_line_with_inline_latex_value():
-    from reliquary.environment.openmathinstruct import (
-        _compute_omi_reward,
-        _normalize_answer,
-    )
+def test_answer_line_with_inline_latex_value(_v4_grader):
+    from reliquary.environment.openmathinstruct import _compute_omi_reward
 
     problem = {"ground_truth": r"\frac{14}{3}"}
     assert _compute_omi_reward(problem, r"Answer: \(\frac{14}{3}\)") == 1.0
 
 
-def test_no_answer_still_zero():
+def test_no_answer_still_zero(_v4_grader):
+    from reliquary.environment.openmathinstruct import _compute_omi_reward
+
+    assert _compute_omi_reward({"ground_truth": "1"}, "I cannot solve this.") == 0.0
+
+
+def test_v3_grader_ignores_answer_line_and_delimiters(monkeypatch):
+    """RAW_COMPLETION_PROMPTS off (v3): no Answer:-line branch, no delimiter
+    strip — byte-identical to pre-fix behavior, so v3 payment is unchanged."""
+    import reliquary.constants as C
     from reliquary.environment.openmathinstruct import (
         _compute_omi_reward,
         _normalize_answer,
     )
+    monkeypatch.setattr(C, "RAW_COMPLETION_PROMPTS", False)
 
-    assert _compute_omi_reward({"ground_truth": "1"}, "I cannot solve this.") == 0.0
+    # "Answer: 42" with no box → old trailing-number fallback (last line starts
+    # with "A", no match) → 0.0, exactly as before the fix.
+    assert _compute_omi_reward({"ground_truth": "42"},
+                               "Step 1.\nAnswer: 42") == 0.0
+    # delimiters are NOT stripped on v3 — left intact
+    assert _normalize_answer(r"\(x\)") == r"\(x\)"
 
 
 def test_local_snapshot_refused_when_train_shards_only(monkeypatch, tmp_path):
