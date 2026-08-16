@@ -281,7 +281,8 @@ def test_profiles_are_frozen_slotted_and_recursively_immutable():
                 "opt_8bit": False,
                 "rollouts": 16,
                 "b_batch": 16,
-                "max_submissions": 16,
+                # 2·B_BATCH: cover every slot + one retry/improvement margin.
+                "max_submissions": 32,
                 "publish_interval": 16,
             },
         ),

@@ -688,13 +688,22 @@ HASH_DEDUP_RETENTION_WINDOWS = int(
     _os.environ.get("HASH_DEDUP_RETENTION_WINDOWS", "300")
 )
 
-# Max submissions any single hotkey can send per window. Counter resets at
-# every new window (on batcher swap). Excess submissions are HTTP-rejected
-# as RATE_LIMITED before touching the validation pipeline. It tracks B_BATCH
-# — one slot per prompt a hotkey can credibly win in a window — so raising the
-# batch without raising this would rate-limit honest miners out of the slots
-# the batch just created.
-MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW = B_BATCH
+# Max submissions any single hotkey can send per window (per-env: one batcher
+# per environment). Counter resets at every new window. Excess submissions are
+# HTTP-rejected as RATE_LIMITED before touching the validation pipeline; a
+# precommit reserves one unit and its reveal does not re-consume, so it is one
+# unit per prompt either way.
+#
+# At exactly B_BATCH a hotkey can cover every prompt slot but has ZERO headroom:
+# a single retry (dropped packet, transient reject) is the (B_BATCH+1)th and is
+# rate-limited out. v4 doubles it to 2·B_BATCH for one full re-coverage of
+# retry/improvement margin. Safe to widen because the EXPENSIVE seal-time GRAIL
+# work is capped independently (MAX_RANKED_PROOF_ATTEMPTS = 2·B_BATCH, grading =
+# MAX_PROOF_GRADING_ATTEMPTS), so this only widens cheap admission bandwidth,
+# not GPU proof load. v3 stays at B_BATCH so live economics are byte-identical.
+MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW = (
+    2 * B_BATCH if PROTOCOL_VERSION >= 4 else B_BATCH
+)
 
 # Signed upload precommits are tiny, but still bounded independently from the
 # large-body proof queue.  A precommit consumes the same per-window hotkey quota
