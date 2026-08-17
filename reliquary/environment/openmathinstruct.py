@@ -70,10 +70,6 @@ def _strip_boxed_wrapper(s: str) -> str:
 _TEXT_RE = re.compile(r"\\text\{([^}]*)\}")
 _MBOX_RE = re.compile(r"\\mbox\{([^}]*)\}")
 
-# "Answer: X" line, tolerating markdown emphasis around the cue
-# ("**Answer:** 0"). Boxed extraction still takes precedence.
-_ANSWER_LINE_RE = re.compile(r"^[\s*_]*Answer[\s*_]*:[\s*_]*(.+?)\s*$", re.MULTILINE)
-
 
 def _normalize_answer(s: str) -> str:
     if s is None:
@@ -391,25 +387,18 @@ def _compute_omi_reward(problem: dict, completion: str) -> float:
         if boxed is not None:
             candidate = _normalize_answer(_strip_boxed_wrapper(boxed))
         else:
-            # v4 raw-completion outputs answer via an "Answer:" line; v3
-            # (chat-template) boxes, so this branch is v4-only to keep v3
-            # reward — the PAID quantity — byte-identical. Lazy import so tests
-            # can monkeypatch reliquary.constants.
-            from reliquary.constants import RAW_COMPLETION_PROMPTS
-            answer_lines = (
-                _ANSWER_LINE_RE.findall(completion)
-                if RAW_COMPLETION_PROMPTS else []
-            )
-            if answer_lines:
-                candidate = _normalize_answer(answer_lines[-1])
-            else:
-                # Fallback: trailing number / fraction at end of text
-                # (some models output the answer without boxing)
-                tail = completion.strip().split("\n")[-1].strip()
-                m = re.match(r"^([\-\+]?\d+(?:\.\d+)?(?:/\d+)?)", tail)
-                if m is None:
-                    return 0.0
-                candidate = _normalize_answer(m.group(1))
+            # No "Answer:"-line channel on purpose: \boxed{} is the only span
+            # verify_boxed_answer_integrity can inspect (it returns True when no
+            # boxed range exists), so any other rewarded answer format would be
+            # an answer channel with no tamper guard — the one attack the
+            # forced-seed and distribution checks structurally cannot see.
+            # Fallback: trailing number / fraction at end of text
+            # (some models output the answer without boxing)
+            tail = completion.strip().split("\n")[-1].strip()
+            m = re.match(r"^([\-\+]?\d+(?:\.\d+)?(?:/\d+)?)", tail)
+            if m is None:
+                return 0.0
+            candidate = _normalize_answer(m.group(1))
         gt = _normalize_answer(problem.get("ground_truth", ""))
         if gt == "":
             return 0.0
