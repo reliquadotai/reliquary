@@ -24,7 +24,8 @@ from reliquary.validator import telemetry
 from reliquary.constants import (
     GRAD_CLIP_NORM, GRAD_NORM_SKIP_THRESHOLD, KL_BETA, LEARNING_RATE,
     LR_COSINE_MAX_WINDOWS, LR_WARMUP_WINDOWS,
-    MICROBATCH_MAX_PADDED_TOKENS, PPO_CLIP_EPSILON,
+    MICROBATCH_MAX_PADDED_TOKENS, PPO_CLIP_EPSILON_HIGH, PPO_CLIP_EPSILON_LOW,
+    PPO_DUAL_CLIP_C,
     PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD,
 )
 
@@ -55,22 +56,49 @@ class TrainingStepSkipped(RuntimeError):
         self.metrics = dict(metrics or {})
 
 
+def _use_8bit_optimizer(params) -> bool:
+    """Whether to build the bitsandbytes paged 8-bit optimizer.
+
+    All three conditions must hold: the profile asks for it, CUDA is present,
+    and the parameters themselves live there — GPU availability alone must not
+    select a CUDA-only optimizer for host-resident parameters.
+
+    Lazy import so tests can monkeypatch reliquary.constants.
+    """
+    from reliquary.constants import OPTIMIZER_STATE_8BIT
+
+    params = list(params)
+    if not OPTIMIZER_STATE_8BIT:
+        return False
+    return (
+        torch.cuda.is_available()
+        and bool(params)
+        and all(parameter.device.type == "cuda" for parameter in params)
+    )
+
+
 def _build_optimizer(params) -> torch.optim.Optimizer:
-    """Prefer bitsandbytes PagedAdamW8bit on CUDA — quantised optimiser
-    state (~4× smaller than fp32 / ~2× smaller than bf16) plus unified
-    memory paging that spills to host RAM under pressure. Falls back to
-    plain AdamW when CUDA or bitsandbytes is unavailable (CPU tests, dev
-    boxes without a GPU).
+    """CUDA parameters get a bitsandbytes paged optimizer: PagedAdamW8bit
+    when OPTIMIZER_STATE_8BIT, else 32-bit PagedAdamW — full-precision
+    moments the profile asks for, host-paged so they cost ~nothing resident.
+    torch.optim.AdamW is only the no-CUDA / no-bitsandbytes fallback: on
+    bf16 params its moments silently inherit bf16 (measured H100 08-12:
+    bf16 state, +15.1 GB resident, 37.9 GB step peak vs 16.7 GB paged), so
+    it is neither the small nor the precise option.
     """
     params = list(params)
-    cuda_parameters = bool(params) and all(
-        parameter.device.type == "cuda" for parameter in params
+    cuda_params = (
+        torch.cuda.is_available()
+        and bool(params)
+        and all(parameter.device.type == "cuda" for parameter in params)
     )
-    if torch.cuda.is_available() and cuda_parameters:
+    if cuda_params:
+        use_8bit = _use_8bit_optimizer(params)
         try:
             import bitsandbytes as bnb  # type: ignore[import-not-found]
-            logger.info("Using bitsandbytes PagedAdamW8bit")
-            return bnb.optim.PagedAdamW8bit(
+            cls = bnb.optim.PagedAdamW8bit if use_8bit else bnb.optim.PagedAdamW
+            logger.info("Using bitsandbytes %s", cls.__name__)
+            return cls(
                 params,
                 lr=LEARNING_RATE,
                 betas=(0.9, 0.999),
@@ -78,7 +106,10 @@ def _build_optimizer(params) -> torch.optim.Optimizer:
                 weight_decay=0.01,
             )
         except ImportError:
-            logger.warning("bitsandbytes not available — falling back to torch.optim.AdamW")
+            logger.warning(
+                "bitsandbytes not available — falling back to torch.optim."
+                "AdamW (moments inherit the params' dtype)"
+            )
     return torch.optim.AdamW(
         params,
         lr=LEARNING_RATE,
@@ -884,6 +915,34 @@ def _completion_keep_mask(rollout, prompt_length, n_completion, device):
     return torch.tensor(keep, dtype=torch.bool, device=device)
 
 
+def _clipped_surrogate(ratio, advantage):
+    """PPO surrogate with DAPO's decoupled clip band (Eq. 10).
+
+    Returns ``(surrogate, clip_active)``. Both the per-rollout and the
+    micro-batched path call this, so the band is structurally the same in both
+    — the two used to carry independent copies of the clamp expression.
+    """
+    unclipped = ratio * advantage
+    clipped = torch.clamp(
+        ratio, 1 - PPO_CLIP_EPSILON_LOW, 1 + PPO_CLIP_EPSILON_HIGH
+    ) * advantage
+    surrogate = torch.min(unclipped, clipped)
+    if math.isfinite(PPO_DUAL_CLIP_C):
+        # Dual clip (Eq. 10 code path in verl): floor negative-advantage
+        # surrogates at c·A so an exploding ratio cannot dominate the step.
+        # advantage may be a Python float (per-rollout _rollout_loss path) or a
+        # tensor (micro-batch); coerce so torch.where/maximum get tensor args.
+        adv = torch.as_tensor(
+            advantage, dtype=surrogate.dtype, device=surrogate.device
+        )
+        surrogate = torch.where(
+            adv < 0,
+            torch.maximum(surrogate, PPO_DUAL_CLIP_C * adv),
+            surrogate,
+        )
+    return surrogate, clipped < unclipped
+
+
 def _rollout_loss(
     model,
     ref_model,
@@ -970,9 +1029,8 @@ def _rollout_loss(
     # PPO clipped surrogate
     log_ratio = new_logprobs_c - old_logprobs
     ratio = torch.exp(log_ratio)
-    surr1 = ratio * advantage
-    surr2 = torch.clamp(ratio, 1 - PPO_CLIP_EPSILON, 1 + PPO_CLIP_EPSILON) * advantage
-    ppo_per_token = -torch.min(surr1, surr2)
+    surr, _clip_active = _clipped_surrogate(ratio, advantage)
+    ppo_per_token = -surr
 
     # KL(π_new || π_ref) — Schulman's k3 estimator:
     #   kl ≈ exp(ref - new) - 1 - (ref - new)
@@ -1113,10 +1171,10 @@ def _record_kl_stats(
         stats["ppo_token_count"] += ppo_ratio.numel()
         stats["ppo_clip_active_count"] += int(ppo_clip_active.sum())
         stats["ppo_ratio_below_clip_count"] += int(
-            (ppo_ratio < 1.0 - PPO_CLIP_EPSILON).sum()
+            (ppo_ratio < 1.0 - PPO_CLIP_EPSILON_LOW).sum()
         )
         stats["ppo_ratio_above_clip_count"] += int(
-            (ppo_ratio > 1.0 + PPO_CLIP_EPSILON).sum()
+            (ppo_ratio > 1.0 + PPO_CLIP_EPSILON_HIGH).sum()
         )
         stats["ppo_ratio_nonfinite_count"] += int(
             (~torch.isfinite(ppo_ratio)).sum()
@@ -1324,13 +1382,7 @@ def _microbatch_grad(
     keep_seg = [sum(1 for flag in keep if flag) for keep in keeps]
     ppo_log_ratio = new_lp - old_cat
     ratio = torch.exp(ppo_log_ratio)
-    unclipped_surr = ratio * adv_cat
-    clipped_surr = (
-        torch.clamp(ratio, 1 - PPO_CLIP_EPSILON, 1 + PPO_CLIP_EPSILON)
-        * adv_cat
-    )
-    surr = torch.min(unclipped_surr, clipped_surr)
-    clip_active = clipped_surr < unclipped_surr
+    surr, clip_active = _clipped_surrogate(ratio, adv_cat)
     ppo_tok = -surr
     kl_log = ref_lp - new_lp
     kl_tok = torch.exp(kl_log) - 1 - kl_log

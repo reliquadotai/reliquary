@@ -77,6 +77,21 @@ def extract_boxed_spans(text: str) -> list[BoxedSpan]:
     return spans
 
 
+def is_missing_final_answer_box(text: str) -> bool:
+    r"""True when the completion contains no ``\boxed``/``\fbox`` marker.
+
+    Under the v4 boxed-only reward contract this is an off-format answer. It
+    still receives reward zero, but its outcome must be valued as uncertain by
+    the auction: otherwise deleting a naturally sampled box could manufacture
+    a useful zero and move a degenerate group into the sigma zone.
+
+    A present-but-malformed final marker is deliberately not classified as
+    missing; ``has_malformed_final_answer`` rejects that stronger condition.
+    """
+
+    return not extract_boxed_spans(text)
+
+
 def has_malformed_final_answer(
     reward: float,
     text: str,

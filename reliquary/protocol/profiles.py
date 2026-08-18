@@ -34,6 +34,7 @@ class BFTProfile:
 class EnvironmentProfile:
     max_new_tokens: int
     bft: BFTProfile | None
+    answer_format: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +79,7 @@ class ProtocolProfile:
     protocol_version: int
     collection_seconds: int
     upload_grace_seconds: int
+    prompt_encoding: str
     sampling: SamplingProfile
     environments: Mapping[str, EnvironmentProfile]
     throughput_tiebreak: ThroughputTiebreakProfile | None = None
@@ -99,6 +101,7 @@ class ProtocolProfile:
             bft = environment.bft
             environments[name] = {
                 "max_new_tokens": environment.max_new_tokens,
+                "answer_format": environment.answer_format,
                 "bft": (
                     None
                     if bft is None
@@ -115,6 +118,7 @@ class ProtocolProfile:
             "model_id": self.model_id,
             "model_revision": self.model_revision,
             "protocol_version": self.protocol_version,
+            "prompt_encoding": self.prompt_encoding,
             "throughput_tiebreak": (
                 None
                 if self.throughput_tiebreak is None
@@ -146,6 +150,27 @@ _SAMPLING = SamplingProfile(
     do_sample=False,
 )
 
+# DAPO/verl reference rollout sampling: full temperature, full support. Beyond
+# matching the recipe, this is what makes warp() the identity softmax, so the
+# PPO importance ratio is formed in the distribution the samples actually came
+# from (the v3 values leave it distorted by r_raw^(1/T) and truncated to a
+# 20-token nucleus). top_k is 0, not None: warp() guards on `top_k and
+# top_k > 0`, but the miner's ForcedSeedLogitsProcessor coerces with int(top_k)
+# and raises on None.
+_SAMPLING_DAPO = SamplingProfile(
+    # G=16, DAPO §4.1. With binary rewards the group mean and std are exact
+    # functions of k, so the estimator's error lives entirely in k/G as a
+    # binomial estimate of p — and the advantage √((1−p̂)/p̂) is non-linear in
+    # it, so that error is a BIAS, which more prompts cannot average away.
+    # Dynamic sampling makes this sharper: it admits k=1 and k=G−1 precisely
+    # where small-G bias is worst.
+    rollouts=16,
+    temperature=1.0,
+    top_p=1.0,
+    top_k=0,
+    do_sample=False,
+)
+
 _PROFILE_VALUES = (
     ProtocolProfile(
         profile_id="qwen35-2b-auction-v2",
@@ -154,10 +179,12 @@ _PROFILE_VALUES = (
         protocol_version=2,
         collection_seconds=100,
         upload_grace_seconds=33,
+        prompt_encoding="chat_template",
         sampling=_SAMPLING,
         environments={
             "openmathinstruct": EnvironmentProfile(
                 max_new_tokens=32768,
+                answer_format="boxed_or_trailing_number",
                 bft=BFTProfile(
                     thinking_budget=2048,
                     answer_budget=512,
@@ -177,10 +204,12 @@ _PROFILE_VALUES = (
         protocol_version=3,
         collection_seconds=300,
         upload_grace_seconds=33,
+        prompt_encoding="chat_template",
         sampling=_SAMPLING,
         environments={
             "openmathinstruct": EnvironmentProfile(
                 max_new_tokens=16384,
+                answer_format="boxed_or_trailing_number",
                 bft=BFTProfile(
                     thinking_budget=15616,
                     answer_budget=512,
@@ -194,6 +223,48 @@ _PROFILE_VALUES = (
         },
         throughput_tiebreak=ThroughputTiebreakProfile(
             token_cap=15616,
+            bucket_tokens_per_round=50,
+        ),
+    ),
+    ProtocolProfile(
+        profile_id="qwen3-4b-base-dapo-v4",
+        # True base model: 0/32 spontaneous <think> under a raw prompt, against
+        # 27/32 for Qwen3.5-4B-Base. Recent "-Base" releases are mid-trained on
+        # reasoning traces, which spends the dispersion RL exists to convert.
+        model_id="Qwen/Qwen3-4B-Base",
+        model_revision="906bfd4b4dc7f14ee4320094d8b41684abff8539",
+        protocol_version=4,
+        # Length curriculum, start point. ck0 Qwen3-4B-Base terminates well
+        # short of 16384 (measured on real OMI: median ~500, max ~1392 / 40
+        # rollouts), so sizing the window for a 16384 worst case burns wall-clock
+        # and seal-verify time from day one. Start the cap at 8192 (≈6× the
+        # observed ck0 max, and above OVERLONG_PENALTY_CACHE_TOKENS=4096 so the
+        # soft-overlong zone [cap-4096, cap] still sits ABOVE the natural length)
+        # and the window at 150s (~half the near-cap generation time). Both are
+        # meant to ramp up with the policy's growing reasoning length; watch the
+        # cap-hit rate as the thermostat before raising them.
+        collection_seconds=150,
+        upload_grace_seconds=33,
+        prompt_encoding="raw",
+        sampling=_SAMPLING_DAPO,
+        environments={
+            # No BFT anywhere: the base model emits no <think>, so there is no
+            # block to force closed. Termination is trained by the soft overlong
+            # punishment (Eq. 13) instead of forced by a budget.
+            "openmathinstruct": EnvironmentProfile(
+                max_new_tokens=8192,
+                bft=None,
+                answer_format="boxed",
+            ),
+            "opencodeinstruct": EnvironmentProfile(
+                max_new_tokens=8192,
+                bft=None,
+            ),
+        },
+        throughput_tiebreak=ThroughputTiebreakProfile(
+            # Without BFT the per-rollout generation budget is the env cap
+            # itself, where v3 had to use its thinking budget. Tracks the cap.
+            token_cap=8192,
             bucket_tokens_per_round=50,
         ),
     ),

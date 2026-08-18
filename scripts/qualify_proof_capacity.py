@@ -13,8 +13,8 @@ Input is JSONL with one completed proof per row:
       "checkpoint_revision":"<40-char SHA>",
       "hardware_class":"NVIDIA H100 80GB HBM3",
       "device_uuid":"GPU-...",
-      "rollout_count":8,
-      "completion_token_lengths":[... eight values ...]
+      "rollout_count":"<active profile rollout count>",
+      "completion_token_lengths":[... one value per rollout ...]
     }
 
 Use only end-to-end validator proofs generated against the exact release
@@ -41,6 +41,7 @@ from reliquary.constants import (  # noqa: E402
     MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV,
     MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW,
     MAX_PROOF_WALL_SECONDS,
+    M_ROLLOUTS,
     PROTOCOL_MODEL_REVISION,
     PROTOCOL_PROFILE_ID,
     PROTOCOL_VERSION,
@@ -52,7 +53,7 @@ from reliquary.validator.proof_capacity import (  # noqa: E402
 
 
 ENVIRONMENTS = ("openmathinstruct", "opencodeinstruct")
-ROLLOUTS_PER_PROOF = 8
+ROLLOUTS_PER_PROOF = M_ROLLOUTS
 MINIMUM_CAP_FRACTION = 0.9
 MINIMUM_SAMPLES_PER_DEVICE_PER_ENVIRONMENT = 20
 
@@ -194,7 +195,7 @@ def main() -> int:
 
     if PROTOCOL_VERSION < 3:
         parser.error(
-            "set RELIQUARY_PROTOCOL_PROFILE=qwen35-4b-auction-v3"
+            "select a protocol profile with proof-capacity qualification"
         )
     for label, revision in (
         ("software", args.software_revision),

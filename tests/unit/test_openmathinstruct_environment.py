@@ -118,7 +118,7 @@ def test_normalize_handles_none():
 
 
 # ---------------------------------------------------------------------------
-# Reward function — exercises both \boxed{} and plain-tail fallback paths.
+# Reward function — legacy profiles accept both \boxed{} and a plain tail.
 # ---------------------------------------------------------------------------
 
 def test_reward_correct_boxed():
@@ -416,3 +416,162 @@ def test_reward_numeric_and_structured_not_regressed():
     assert _compute_omi_reward({"ground_truth": "1/2"}, r"\boxed{0.5}") == 1.0
     assert _compute_omi_reward({"ground_truth": "82.50"}, r"\boxed{82.5}") == 1.0
     assert _compute_omi_reward({"ground_truth": "43"}, r"\boxed{42}") == 0.0
+
+
+def test_load_dataset_restricts_to_canonical_shards_on_v4(monkeypatch):
+    """v4 must ask the parquet view for the `train-` shards only.
+
+    Without it the manifest also lists train_1M/2M/5M, which are curated subsets
+    OF train: 8,000,000 duplicate rows, 36.4% of the index space, drawn 2-4x too
+    often by a uniform pick_prompt_idx.
+    """
+    import reliquary.constants as C
+    import reliquary.environment.virtual_parquet as VP
+    from reliquary.environment.openmathinstruct import _load_dataset
+
+    monkeypatch.setattr(C, "OMI_TRAIN_SHARDS_ONLY", True)
+    seen = {}
+
+    class _Spy:
+        def __init__(self, repo, revision, **kwargs):
+            seen.update(kwargs)
+
+    monkeypatch.setattr(VP, "VirtualParquetDataset", _Spy)
+
+    _load_dataset("nvidia/OpenMathInstruct-2", "rev")
+
+    assert seen["filename_prefix"] == "train-"
+
+
+def test_load_dataset_keeps_the_whole_listing_pre_v4(monkeypatch):
+    import reliquary.constants as C
+    import reliquary.environment.virtual_parquet as VP
+    from reliquary.environment.openmathinstruct import _load_dataset
+
+    monkeypatch.setattr(C, "OMI_TRAIN_SHARDS_ONLY", False)
+    seen = {}
+
+    class _Spy:
+        def __init__(self, repo, revision, **kwargs):
+            seen.update(kwargs)
+
+    monkeypatch.setattr(VP, "VirtualParquetDataset", _Spy)
+
+    _load_dataset("nvidia/OpenMathInstruct-2", "rev")
+
+    assert seen["filename_prefix"] is None
+
+
+# ---------------------------------------------------------------------------
+# v4 extraction: inline LaTeX delimiters only. The prompt asks for \boxed{},
+# and \boxed{} is the ONLY span the answer-tamper guard
+# (verify_boxed_answer_integrity / BOXED_ANSWER_MIN_PROB) can inspect — it
+# returns True when no boxed range exists. Any other rewarded answer channel
+# would therefore be an unguarded one, so an off-format answer scores 0.
+
+
+@pytest.fixture
+def _v4_grader(monkeypatch):
+    import reliquary.constants as C
+    monkeypatch.setattr(C, "RAW_COMPLETION_PROMPTS", True)
+    monkeypatch.setattr(C, "MATH_ANSWER_FORMAT", "boxed")
+
+
+def test_normalize_strips_inline_latex_delimiters(_v4_grader):
+    from reliquary.environment.openmathinstruct import _normalize_answer
+
+    assert _normalize_answer(r"\(\frac{14}{3}\)") == _normalize_answer(
+        r"\frac{14}{3}"
+    )
+    assert _normalize_answer(r"\[p - q\]") == _normalize_answer("p - q")
+
+
+def test_answer_line_without_box_scores_zero(_v4_grader):
+    """An "Answer:" line is not the protocol format: rewarding it would create
+    an answer channel the boxed-span tamper guard cannot see."""
+    from reliquary.environment.openmathinstruct import _compute_omi_reward
+
+    assert _compute_omi_reward({"ground_truth": "42"},
+                               "Step 1: compute.\nAnswer: 42") == 0.0
+    assert _compute_omi_reward({"ground_truth": "0"},
+                               "reasoning...\n**Answer:** 0") == 0.0
+    assert _compute_omi_reward({"ground_truth": r"\frac{14}{3}"},
+                               r"Answer: \(\frac{14}{3}\)") == 0.0
+
+
+def test_plain_trailing_answer_without_box_scores_zero(_v4_grader):
+    """Removing the Answer: cue must not reopen the unguarded channel."""
+    from reliquary.environment.openmathinstruct import _compute_omi_reward
+
+    assert _compute_omi_reward(
+        {"ground_truth": "42"}, "Step 1: compute.\n42"
+    ) == 0.0
+    assert _compute_omi_reward(
+        {"ground_truth": "3/4"}, "Therefore the result is\n3/4"
+    ) == 0.0
+
+
+def test_boxed_answer_still_scores(_v4_grader):
+    """The protocol format keeps working, including past an Answer: decoy."""
+    from reliquary.environment.openmathinstruct import _compute_omi_reward
+
+    assert _compute_omi_reward({"ground_truth": "5"},
+                               "Answer: 3\nActually \\boxed{5}") == 1.0
+    assert _compute_omi_reward({"ground_truth": r"\frac{14}{3}"},
+                               r"So \boxed{\(\frac{14}{3}\)}") == 1.0
+
+
+def test_no_answer_still_zero(_v4_grader):
+    from reliquary.environment.openmathinstruct import _compute_omi_reward
+
+    assert _compute_omi_reward({"ground_truth": "1"}, "I cannot solve this.") == 0.0
+
+
+def test_v3_grader_unchanged_by_v4_extraction(monkeypatch):
+    """RAW_COMPLETION_PROMPTS off (v3): no delimiter strip — byte-identical to
+    pre-change behavior, so v3 reward (the paid quantity) is unchanged."""
+    import reliquary.constants as C
+    from reliquary.environment.openmathinstruct import (
+        _compute_omi_reward,
+        _normalize_answer,
+    )
+    monkeypatch.setattr(C, "RAW_COMPLETION_PROMPTS", False)
+    monkeypatch.setattr(C, "MATH_ANSWER_FORMAT", "boxed_or_trailing_number")
+
+    assert _compute_omi_reward({"ground_truth": "42"},
+                               "Step 1.\nAnswer: 42") == 0.0
+    assert _compute_omi_reward({"ground_truth": "42"},
+                               "Step 1.\n42") == 1.0
+    # delimiters are NOT stripped on v3 — left intact
+    assert _normalize_answer(r"\(x\)") == r"\(x\)"
+
+
+def test_local_snapshot_refused_when_train_shards_only(monkeypatch, tmp_path):
+    """A save_to_disk snapshot embeds whatever shard listing built it, so on
+    v4 it cannot honour the train- filter and would fork len(env) — which is
+    prompt-range consensus. Fail closed instead of silently diverging."""
+    import pytest as _pytest
+
+    import reliquary.constants as C
+    from reliquary.environment.openmathinstruct import _load_dataset
+
+    (tmp_path / "dataset_info.json").write_text("{}")
+    monkeypatch.setattr(C, "OMI_TRAIN_SHARDS_ONLY", True)
+    with _pytest.raises(RuntimeError, match="consensus"):
+        _load_dataset(str(tmp_path), "rev")
+
+
+def test_local_snapshot_still_loads_pre_v4(monkeypatch, tmp_path):
+    import sys
+    import types
+
+    import reliquary.constants as C
+    from reliquary.environment.openmathinstruct import _load_dataset
+
+    (tmp_path / "dataset_info.json").write_text("{}")
+    monkeypatch.setattr(C, "OMI_TRAIN_SHARDS_ONLY", False)
+    fake = types.ModuleType("datasets")
+    fake.load_from_disk = lambda p: ("loaded", p)
+    monkeypatch.setitem(sys.modules, "datasets", fake)
+
+    assert _load_dataset(str(tmp_path), "rev") == ("loaded", str(tmp_path))

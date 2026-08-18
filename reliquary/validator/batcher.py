@@ -19,8 +19,9 @@ from typing import Any, Callable
 from pydantic import ValidationError
 
 from reliquary.constants import (
-    M_ROLLOUTS,
+    BOOTSTRAP_SIGMA_MIN,
     BATCH_PROMPT_COOLDOWN_WINDOWS,
+    M_ROLLOUTS,
     PROTOCOL_THROUGHPUT_TIEBREAK,
     B_BATCH,
     DIFFICULTY_AUCTION_DELTA,
@@ -33,6 +34,7 @@ from reliquary.constants import (
     MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW,
     MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW,
     MIN_EOS_PROBABILITY,
+    MATH_ANSWER_FORMAT,
     FORENSIC_SAMPLE_PER_WINDOW,
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
     MAX_PENDING_SUBMISSION_BYTES_PER_ENV,
@@ -49,6 +51,8 @@ from reliquary.constants import (
     PROMPT_RANGE_ENFORCE_FROM_WINDOW,
     PROTOCOL_PROFILE_ID,
     PROTOCOL_VERSION,
+    ROBUST_TRUNCATION_UTILITY_ENABLED,
+    SIGMA_MIN,
     REJECTED_LIST_CAP_PER_HOTKEY,
     WINDOW_COLLECTION_SECONDS,
     SUBMISSION_UPLOAD_GRACE_SECONDS,
@@ -95,6 +99,8 @@ from reliquary.validator.difficulty_auction import (
     auction_value,
     flat_auction_value,
     difficulty_score,
+    fractional_reward_lattice,
+    robust_uncertain_reward_utility,
     select_shadow_auction,
 )
 from reliquary.validator.observability import (
@@ -117,7 +123,10 @@ from reliquary.validator.proof_scheduler import (
     ProofPlanOutcome,
     RankedProof,
 )
-from reliquary.validator.boxed_integrity import has_malformed_final_answer
+from reliquary.validator.boxed_integrity import (
+    has_malformed_final_answer,
+    is_missing_final_answer_box,
+)
 from reliquary.validator.auth_forensics import (
     auth_forensics_context_chars,
     auth_forensics_enabled,
@@ -419,6 +428,7 @@ class PendingSubmission:
     # Rollouts that ran to the cap without terminating (no gradeable answer).
     truncated_count: int = 0
     truncated_index: int | None = None
+    unboxed_count: int = 0
     attainable_rewards: tuple[float, ...] = ()
     robust_utility: float | None = None
     value: float = field(init=False, default=0.0)
@@ -481,6 +491,7 @@ class ValidSubmission:
     prompt_hash_lead: str | None = None
     reward_vector: str = ""
     truncated_count: int = 0
+    unboxed_count: int = 0
     reward_shape: dict[str, Any] = field(default_factory=dict)
     ingress_observability: dict[str, Any] = field(default_factory=dict)
     utility_rollouts: list[dict[str, Any]] = field(default_factory=list)
@@ -2018,6 +2029,7 @@ class GrpoWindowBatcher:
             rewards=list(prepared.rewards),
             truncated_count=int(getattr(prepared, "truncated_count", 0) or 0),
             truncated_index=getattr(prepared, "truncated_index", None),
+            unboxed_count=int(getattr(prepared, "unboxed_count", 0) or 0),
             attainable_rewards=tuple(
                 getattr(prepared, "attainable_rewards", ()) or ()
             ),
@@ -2423,13 +2435,41 @@ class GrpoWindowBatcher:
                     or 0
                 )
             )
+        unboxed_indices = (
+            tuple(
+                index
+                for index, text in enumerate(completion_texts)
+                if is_missing_final_answer_box(text)
+            )
+            if (
+                getattr(self.env, "name", "") == "openmathinstruct"
+                and MATH_ANSWER_FORMAT == "boxed"
+            )
+            else ()
+        )
+        robust_utility = None
+        attainable_rewards: tuple[float, ...] = ()
+        if ROBUST_TRUNCATION_UTILITY_ENABLED and unboxed_indices:
+            attainable_rewards = fractional_reward_lattice(1)
+            robust_utility = robust_uncertain_reward_utility(
+                rewards,
+                sigma_min=(
+                    BOOTSTRAP_SIGMA_MIN if self.bootstrap else SIGMA_MIN
+                ),
+                uncertain_indices=unboxed_indices,
+                attainable_rewards=attainable_rewards,
+            )
         sigma = rewards_std(rewards)
         # Keep the calibrated sigma eligibility band even under the auction.
-        # The difficulty score ranks eligible groups, but k=1 remains excluded
-        # until an independent math adjudicator measures the false-negative
-        # floor: under this objective, a correct answer graded wrong can move a
-        # group toward the payout peak. This is a reward error, not cheating.
-        if not is_in_zone(sigma, bootstrap=self.bootstrap):
+        # For uncertain off-format math outcomes, require every possible binary
+        # interpretation to remain eligible; this prevents a missing box from
+        # manufacturing either admission or auction value.
+        in_zone = (
+            robust_utility > 0.0
+            if robust_utility is not None
+            else is_in_zone(sigma, bootstrap=self.bootstrap)
+        )
+        if not in_zone:
             return reject(RejectReason.OUT_OF_ZONE, "zone")
 
         # Zone-valid: entering the GRAIL/GPU proof path. Count it for telemetry
@@ -2513,6 +2553,9 @@ class GrpoWindowBatcher:
             prompt_idx=request.prompt_idx,
             request=request,
             rewards=list(rewards),
+            unboxed_count=len(unboxed_indices),
+            attainable_rewards=attainable_rewards,
+            robust_utility=robust_utility,
             drand_round=request.drand_round,
             merkle_root=bytes.fromhex(request.merkle_root),
             selection_digest=compute_rollouts_selection_digest(request.rollouts),
@@ -3595,6 +3638,7 @@ class GrpoWindowBatcher:
             prompt_hash_lead=telemetry.prompt_hash_lead if telemetry else None,
             reward_vector=reward_shape.reward_vector,
             truncated_count=truncated_count,
+            unboxed_count=int(getattr(pending, "unboxed_count", 0) or 0),
             reward_shape=reward_shape.to_log_dict(),
             ingress_observability=(
                 telemetry.archive_fields() if telemetry else {}

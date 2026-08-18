@@ -62,6 +62,7 @@ def test_versioned_profile_contracts(
     assert profile.protocol_version == protocol_version
     assert profile.collection_seconds == collection_seconds
     assert profile.upload_grace_seconds == 33
+    assert profile.prompt_encoding == "chat_template"
     assert profile.sampling == profiles.SamplingProfile(
         rollouts=8,
         temperature=0.6,
@@ -72,6 +73,7 @@ def test_versioned_profile_contracts(
 
     math = profile.environments["openmathinstruct"]
     assert math.max_new_tokens == math_cap
+    assert math.answer_format == "boxed_or_trailing_number"
     assert math.bft == profiles.BFTProfile(
         thinking_budget=thinking_budget,
         answer_budget=512,
@@ -81,6 +83,7 @@ def test_versioned_profile_contracts(
     code = profile.environments["opencodeinstruct"]
     assert code.max_new_tokens == code_cap
     assert code.bft is None
+    assert code.answer_format is None
 
 
 def test_default_resolver_and_environment_override(monkeypatch):
@@ -143,6 +146,11 @@ def test_generation_contract_is_json_safe_and_detached():
     assert json.loads(json.dumps(contract)) == contract
     assert profiles.to_generation_contract(profile) == contract
     assert profiles.to_generation_contract(profile.profile_id) == contract
+    assert contract["prompt_encoding"] == "chat_template"
+    assert (
+        contract["environments"]["openmathinstruct"]["answer_format"]
+        == "boxed_or_trailing_number"
+    )
 
     contract["sampling"]["rollouts"] = 999
     contract["environments"]["openmathinstruct"]["bft"][
@@ -164,6 +172,8 @@ def test_profiles_are_frozen_slotted_and_recursively_immutable():
 
     with pytest.raises(FrozenInstanceError):
         profile.protocol_version = 99
+    with pytest.raises(FrozenInstanceError):
+        profile.prompt_encoding = "raw"
     with pytest.raises(FrozenInstanceError):
         profile.sampling.temperature = 1.0
     with pytest.raises(FrozenInstanceError):
@@ -195,6 +205,22 @@ def test_profiles_are_frozen_slotted_and_recursively_immutable():
                 "forced_zero": False,
                 "proof_attempts": 64,
                 "ranked_proof_attempts": 64,
+                "model": "Qwen/Qwen3.5-2B",
+                "t": 0.6,
+                "top_p": 0.95,
+                "top_k": 20,
+                "bft_enabled": True,
+                "raw_prompts": False,
+                "omi_train_only": False,
+                "clip_low": 0.2,
+                "clip_high": 0.2,
+                "opt_8bit": True,
+                "rollouts": 8,
+                "b_batch": 8,
+                "max_submissions": 8,
+                "publish_interval": 4,
+                "prompt_encoding": "chat_template",
+                "answer_format": "boxed_or_trailing_number",
             },
         ),
         (
@@ -213,6 +239,67 @@ def test_profiles_are_frozen_slotted_and_recursively_immutable():
                 "forced_zero": True,
                 "proof_attempts": 64,
                 "ranked_proof_attempts": 16,
+                "model": "Qwen/Qwen3.5-4B",
+                "t": 0.6,
+                "top_p": 0.95,
+                "top_k": 20,
+                "bft_enabled": True,
+                "raw_prompts": False,
+                "omi_train_only": False,
+                "clip_low": 0.2,
+                "clip_high": 0.2,
+                "opt_8bit": True,
+                "rollouts": 8,
+                "b_batch": 8,
+                "max_submissions": 8,
+                "publish_interval": 4,
+                "prompt_encoding": "chat_template",
+                "answer_format": "boxed_or_trailing_number",
+            },
+        ),
+        (
+            # v4: DAPO-faithful restart from a true base model. No BFT (the base
+            # emits no <think>), DAPO/verl rollout sampling (which also makes
+            # warp() the identity, so the PPO ratio lives in the space the
+            # samples came from), KL removed, raw-completion prompts, and the
+            # OMI corpus restricted to its canonical shards.
+            "qwen3-4b-base-dapo-v4",
+            {
+                "version": 4,
+                # Length-curriculum start point: half of v3's 16384 cap / 300s
+                # window, sized to ck0's short reasoning, ramps up with it.
+                "math_cap": 8192,
+                "code_cap": 8192,
+                "thinking": 0,
+                "window": 150.0,
+                "domain": "reliquary-forced-seed-v4",
+                "lr": 1e-6,
+                "kl": 0.0,
+                "mask_math": False,
+                "overlong_factor": 0.5,
+                "forced_zero": True,
+                "proof_attempts": 64,
+                "ranked_proof_attempts": 32,
+                "model": "Qwen/Qwen3-4B-Base",
+                "t": 1.0,
+                "top_p": 1.0,
+                # 0, not None: warp() guards on `top_k and top_k > 0` but the
+                # miner's ForcedSeedLogitsProcessor coerces with int(top_k),
+                # which raises on None.
+                "top_k": 0,
+                "bft_enabled": False,
+                "raw_prompts": True,
+                "omi_train_only": True,
+                "clip_low": 0.2,
+                "clip_high": 0.28,
+                "opt_8bit": False,
+                "rollouts": 16,
+                "b_batch": 16,
+                # 2·B_BATCH: cover every slot + one retry/improvement margin.
+                "max_submissions": 32,
+                "publish_interval": 16,
+                "prompt_encoding": "raw",
+                "answer_format": "boxed",
             },
         ),
     ],
@@ -235,9 +322,30 @@ print(json.dumps({
     "forced_zero": c.TRAIN_FORCED_REWARD_ZERO,
     "proof_attempts": c.MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
     "ranked_proof_attempts": c.MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW,
+    "model": c.PROTOCOL_MODEL_ID,
+    "t": c.T_PROTO,
+    "top_p": c.TOP_P_PROTO,
+    "top_k": c.TOP_K_PROTO,
+    "bft_enabled": c.BFT_ENABLED,
+    "raw_prompts": c.RAW_COMPLETION_PROMPTS,
+    "omi_train_only": c.OMI_TRAIN_SHARDS_ONLY,
+    "clip_low": c.PPO_CLIP_EPSILON_LOW,
+    "clip_high": c.PPO_CLIP_EPSILON_HIGH,
+    "opt_8bit": c.OPTIMIZER_STATE_8BIT,
+    "rollouts": c.M_ROLLOUTS,
+    "b_batch": c.B_BATCH,
+    "max_submissions": c.MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
+    "publish_interval": c.CHECKPOINT_PUBLISH_INTERVAL_WINDOWS,
+    "prompt_encoding": c.ACTIVE_PROTOCOL_PROFILE.prompt_encoding,
+    "answer_format": c.MATH_ANSWER_FORMAT,
 }))
 """
-    env = dict(os.environ)
+    # Drop inherited RELIQUARY_* overrides — several pinned constants are
+    # env-overridable and a leaked override would flip them.
+    env = {
+        k: v for k, v in os.environ.items()
+        if not k.startswith("RELIQUARY_")
+    }
     env["RELIQUARY_PROTOCOL_PROFILE"] = profile_id
     completed = subprocess.run(
         [sys.executable, "-c", script],

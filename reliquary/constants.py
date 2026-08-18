@@ -121,6 +121,9 @@ def max_new_tokens_for_environment(environment: str) -> int:
 # (5/6) with better EOS rate, while 4096/256 was slower and lower reward.
 _MATH_PROFILE = ACTIVE_PROTOCOL_PROFILE.environments["openmathinstruct"]
 _MATH_BFT_PROFILE = _MATH_PROFILE.bft
+MATH_ANSWER_FORMAT = _MATH_PROFILE.answer_format
+if MATH_ANSWER_FORMAT not in ("boxed", "boxed_or_trailing_number"):
+    raise ValueError("openmathinstruct profile must declare an answer format")
 BFT_ENABLED = _MATH_BFT_PROFILE is not None
 # 2026-07 Qwen3.5-4B behavior study (held-out OMI, vLLM): the 4B thinks a median
 # of 3766 / p90 11297 tokens before </think>; a 2048 budget would force-cut ~45%
@@ -187,6 +190,27 @@ assert (
     "the Math protocol cap must exceed BFT_THINKING_BUDGET + "
     "BFT_ANSWER_BUDGET to fit the forced answer's force-template span"
 )
+
+# v4+ ships a raw-completion protocol: prompts are encoded with no chat template
+# at all. This cannot be inferred from the tokenizer, which is the trap — a
+# "-Base" repo ships the family tokenizer config, chat template included, so
+# Qwen3-4B-Base DECLARES one it was never trained on. Left to auto-detection the
+# v4 prompt would silently take the chat path, wrapping the problem in role
+# markers the base model has no learned behaviour for and (because the template
+# mentions enable_thinking) opening a <think> block on a model chosen precisely
+# because it never opens one. One switch drives both encode_prompt and
+# render_canonical_prompt so the encoded tokens and prompt_content_sha256 can
+# never describe different prompts.
+RAW_COMPLETION_PROMPTS = ACTIVE_PROTOCOL_PROFILE.prompt_encoding == "raw"
+if ACTIVE_PROTOCOL_PROFILE.prompt_encoding not in ("raw", "chat_template"):
+    raise ValueError("protocol profile declares an unknown prompt encoding")
+
+# v4+ restricts the OMI manifest to the canonical `train-*` shards. The
+# train_1M/2M/5M shards are curated subsets OF train, so including them
+# duplicates 8,000,000 rows (36.4% of the index space) and draws the curated
+# rows 2-4x too often. Changing this changes len(env), which is prompt-range
+# consensus, so it is only safe at a profile cutover.
+OMI_TRAIN_SHARDS_ONLY = PROTOCOL_VERSION >= 4
 
 # Two-sided length reward shaping (applied to ADVANTAGES, not the σ-gate).
 # Under-thinking side: a non-forced rollout that finished early
@@ -328,13 +352,6 @@ VALIDATOR_HTTP_PORT = 8888
 # prefix would let two eight-submission hotkeys fill a v3 environment with
 # forged commitments before any GPU authentication runs.
 MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW = 64
-
-# Auction-v3 deliberately narrows only the ranked GPU proof prefix: eight
-# winners plus eight possible failed candidates per environment. A v3 fleet
-# qualifies this full ceiling plus the independent forensic budget.
-MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW = (
-    16 if PROTOCOL_VERSION >= 3 else 64
-)
 
 # Seal-time GRAIL work is serial and an adversarial ranked prefix may fail one
 # candidate after another. The attempt ceiling bounds cardinality; this second
@@ -486,8 +503,24 @@ EPOCH_SUBMIT_LEAD_BLOCKS = 20
 # How often to publish the current in-memory model to Hugging Face. Keep the
 # serving behavior policy close enough to the training policy that PPO's ratio
 # contract remains meaningful, while avoiding a multi-GB upload on every step.
+# This also sets how many optimizer steps share one pi_old: verify_model is a
+# frozen snapshot of the last published checkpoint, and miners generate from it,
+# so publication IS the pi_old refresh.
+#
+# DAPO §4.1 samples a rollout batch of 512 prompts x 16 responses = 8,192
+# sequences and consumes it in 16 gradient updates at mini-batch 512. v4's
+# per-window batch is already exactly that mini-batch (2 envs x 16 prompts x 16
+# rollouts = 512), so publishing every 16 windows reproduces their structure:
+# 16 steps over 8,192 sequences from one pi_old. At 4 it is 4 steps over 2,048.
+#
+# The cost is drift: pi_theta moves 16 steps from pi_old instead of 4, so the
+# clip does more work. That is what eps_high=0.28 is for; the backstop that
+# STOPS a run drifting too far — PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD — is
+# armed at 0.5 on v4. Watch train/ppo_ratio_outside_clip_ratio and tighten it
+# from real telemetry once the run's normal late-interval level is known.
 CHECKPOINT_PUBLISH_INTERVAL_WINDOWS = int(_os.environ.get(
-    "RELIQUARY_CHECKPOINT_PUBLISH_INTERVAL_WINDOWS", "4"
+    "RELIQUARY_CHECKPOINT_PUBLISH_INTERVAL_WINDOWS",
+    "16" if PROTOCOL_VERSION >= 4 else "4",
 ))
 if CHECKPOINT_PUBLISH_INTERVAL_WINDOWS <= 0:
     raise ValueError(
@@ -502,26 +535,62 @@ DEFAULT_HF_REPO_ID = "aivolutionedge/reliquary-sn"
 # ────────────────  GRPO MARKET (v2)  ────────────────
 
 # Minimum reward-std for a group to pass the zone filter. For binary
-# Bernoulli rewards this admits k ∈ [2, 6] for M=8 (σ at k=2/6 ≈ 0.433).
-# For continuous rewards it filters groups whose rollouts clustered too
-# tight to carry meaningful GRPO signal.
-SIGMA_MIN = 0.43
-BOOTSTRAP_SIGMA_MIN = 0.33
+# Bernoulli rewards the 0.43 steady-state gate admits k ∈ [2, 6] for M=8
+# (σ at k=2/6 ≈ 0.433); for continuous rewards it drops groups whose rollouts
+# clustered too tight to carry meaningful GRPO signal.
+#
+# v4 lowers the gate to DAPO's dynamic-sampling intent: admit any group with a
+# spread of correctness. For M=16 binary rewards the extreme non-degenerate
+# groups k=1 and k=15 have σ = √(1/16·15/16) = 0.2421, so a 0.24 floor admits
+# every k ∈ [1, 15] while the degenerate k=0 / k=16 (σ=0) stay rejected. The
+# old 0.43 floor rejected k ∈ {1,2,3,13,14,15}, starving the trainer of exactly
+# the rare-correct (hard) and near-all-correct (easy) prompts DAPO learns from.
+#
+# 0.24, not 0.0: a 0.0 floor would also admit near-degenerate CONTINUOUS (code)
+# groups — fractional test-pass rewards clustered at e.g. 0.48-0.52 have a tiny
+# but > 1e-8 σ — which carry no usable GRPO gradient. 0.24 keeps filtering
+# those while passing every binary variance group. This is the pragmatic
+# binary-faithful port; the fully faithful `metric=acc` (binarise correctness,
+# drop all-same) is deferred.
+#
+# NOTE: the gate also governs admission/payment, so this widens what is PAID and
+# softens the manufactured-variance surface — deliberate, see the v4 cutover
+# plan; the auction value σ-weighting and forced-seed / distribution layers are
+# the remaining defense. v3 keeps 0.43/0.33 so live economics are byte-identical.
+SIGMA_MIN = 0.24 if PROTOCOL_VERSION >= 4 else 0.43
+BOOTSTRAP_SIGMA_MIN = 0.22 if PROTOCOL_VERSION >= 4 else 0.33
 
 # Number of rollouts per submission (= size of each GRPO group).
 M_ROLLOUTS = ACTIVE_PROTOCOL_PROFILE.sampling.rollouts
 
 # Maximum proven winners and uniform reward slots per active environment.
 # Distinct prompt representatives feed GRPO.
-B_BATCH = 8
+#
+# v4 doubles it alongside G. The two fix different errors: G shrinks the
+# per-group advantage bias, B_BATCH shrinks the across-prompt gradient
+# variance. Affordable because v4 rollouts are ~500 tokens against v3's 16,220
+# — 4x the sequences at an eighth of the token budget. The break-even against
+# today's load is a ~4,000-token median, which is roughly where DAPO's own
+# length curve lands by end of run (their Fig. 7a), so this is the number to
+# watch as training lengthens responses, NOT the slot count.
+B_BATCH = 16 if PROTOCOL_VERSION >= 4 else 8
 
 # (env_name, prompts_per_batch). Sum across entries = total prompts
-# processed per optimizer step. With 2 envs at B_BATCH each, we train
-# on 16 prompts × M_ROLLOUTS = 128 sequences per step.
+# processed per optimizer step: 2 × B_BATCH prompts × M_ROLLOUTS sequences.
+# v3: 16 × 8 = 128. v4: 32 × 16 = 512.
 ENVIRONMENT_MIX: list[tuple[str, int]] = [
     ("openmathinstruct", B_BATCH),
     ("opencodeinstruct", B_BATCH),
 ]
+
+# Auction-v3 deliberately narrows only the ranked GPU proof prefix: B_BATCH
+# winners plus B_BATCH possible failed candidates per environment. Derived from
+# B_BATCH rather than written as a literal, so a batch-size change cannot leave
+# the ranked prefix unable to prove the slots it must fill. A v3 fleet
+# qualifies this full ceiling plus the independent forensic budget.
+MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW = (
+    2 * B_BATCH if PROTOCOL_VERSION >= 3 else 64
+)
 
 # Runtime default for CLI/Docker operators. OpenCode remains available through
 # ENVIRONMENT_MIX, but code execution is opt-in until the runsc canary and
@@ -624,11 +693,22 @@ HASH_DEDUP_RETENTION_WINDOWS = int(
     _os.environ.get("HASH_DEDUP_RETENTION_WINDOWS", "300")
 )
 
-# Max submissions any single hotkey can send per window. Counter resets at
-# every new window (on batcher swap). Excess submissions are HTTP-rejected
-# as RATE_LIMITED before touching the validation pipeline. 8 matches B_BATCH
-# — one slot per prompt a hotkey can credibly win in a window.
-MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW = 8
+# Max submissions any single hotkey can send per window (per-env: one batcher
+# per environment). Counter resets at every new window. Excess submissions are
+# HTTP-rejected as RATE_LIMITED before touching the validation pipeline; a
+# precommit reserves one unit and its reveal does not re-consume, so it is one
+# unit per prompt either way.
+#
+# At exactly B_BATCH a hotkey can cover every prompt slot but has ZERO headroom:
+# a single retry (dropped packet, transient reject) is the (B_BATCH+1)th and is
+# rate-limited out. v4 doubles it to 2·B_BATCH for one full re-coverage of
+# retry/improvement margin. Safe to widen because the EXPENSIVE seal-time GRAIL
+# work is capped independently (MAX_RANKED_PROOF_ATTEMPTS = 2·B_BATCH, grading =
+# MAX_PROOF_GRADING_ATTEMPTS), so this only widens cheap admission bandwidth,
+# not GPU proof load. v3 stays at B_BATCH so live economics are byte-identical.
+MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW = (
+    2 * B_BATCH if PROTOCOL_VERSION >= 4 else B_BATCH
+)
 
 # Signed upload precommits are tiny, but still bounded independently from the
 # large-body proof queue.  A precommit consumes the same per-window hotkey quota
@@ -884,15 +964,50 @@ if not _math.isfinite(LEARNING_RATE) or not 0.0 < LEARNING_RATE <= 1e-3:
     )
 
 # PPO clip range. Standard in GRPO/RLHF literature.
-PPO_CLIP_EPSILON = 0.2
+# PPO clip band, decoupled per DAPO §3.1 (Clip-Higher). The UPPER clip is what
+# bounds how fast a low-probability token can grow: at a symmetric 0.2, a token
+# at p=0.01 can reach at most 0.012 while one at p=0.9 reaches 1.08, so
+# exploitation tokens grow freely and exploration tokens cannot. Raising only
+# eps_high reopens exploration without loosening the downside.
+#
+# These read as true ratio bounds only from v4 on, because v4 sampling makes
+# warp() the identity so the trainer's ratio lives in the space the samples came
+# from. Pre-v4 the two spaces differ by a token-dependent factor, so the band is
+# left symmetric there rather than nominally "tuned" against a moving target.
+# Optimizer-state precision. bitsandbytes PagedAdamW8bit saves VRAM, but its
+# quantisation noise is a non-trivial fraction of a 1e-6 update, and DAPO §4.1
+# trains with plain AdamW. v4 therefore defaults to full precision; pre-v4 keeps
+# the 8-bit paged optimizer. Env-overridable in both directions, because whether
+# fp32 optimizer state fits alongside train_model + verify_model is a property
+# of the box, not of the profile.
+OPTIMIZER_STATE_8BIT = (
+    _os.environ.get(
+        "RELIQUARY_OPTIMIZER_STATE_8BIT",
+        "0" if PROTOCOL_VERSION >= 4 else "1",
+    )
+    not in ("0", "false", "False")
+)
+
+PPO_CLIP_EPSILON_LOW = 0.2
+PPO_CLIP_EPSILON_HIGH = 0.28 if PROTOCOL_VERSION >= 4 else 0.2
+
+# Dual clip (verl's clip_ratio_c, set to 10.0 in the DAPO reference script):
+# with a negative advantage min(r·A, clip·A) follows r·A unbounded, so one
+# exploding-ratio token can dominate a step; floor the surrogate at c·A.
+# inf pre-v4 keeps live training byte-identical.
+PPO_DUAL_CLIP_C = 10.0 if PROTOCOL_VERSION >= 4 else float("inf")
 
 # Optional pre-step trust-region circuit breaker. A value of 1.0 is the
 # compatibility default and cannot trigger because the observed fraction is at
 # most 1. Recovery runs can set a lower calibrated ceiling so an unpublished
 # policy that has drifted too far from the serving behavior policy is never
 # stepped or published.
+# v4 arms it at 0.5: a coarse backstop for the 16-window pi_old interval with
+# KL off — only catastrophic drift trips it, and a trip triggers the adaptive
+# early publication (fresh pi_old), not a livelock. Tighten from telemetry.
 PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD = float(_os.environ.get(
-    "RELIQUARY_PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD", "1.0"
+    "RELIQUARY_PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD",
+    "0.5" if PROTOCOL_VERSION >= 4 else "1.0",
 ))
 if (
     not _math.isfinite(PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD)
@@ -909,7 +1024,17 @@ if (
 # run. Keep the current value as the compatibility default, but make it
 # operator-configurable so fixed-reference recovery can be calibrated without
 # another code release.
-_PROFILE_KL_BETA = "0.01" if PROTOCOL_VERSION >= 3 else "0.04"
+# v4 follows DAPO §2.3 and removes the KL term outright: over a long-CoT run the
+# policy diverges from the initial model anyway, so the restriction buys nothing
+# while costing the exploration Clip-Higher exists to protect. β=0 leaves the
+# circuit breakers as the collapse guard; the calibrated fallback is a PINNED
+# KL_BASE_MODEL (the run's own ck0) plus an explicit β, never the rolling
+# reference, which anchors nothing beyond ~4 windows.
+_PROFILE_KL_BETA = (
+    "0.0" if PROTOCOL_VERSION >= 4
+    else "0.01" if PROTOCOL_VERSION >= 3
+    else "0.04"
+)
 KL_BETA = float(_os.environ.get("RELIQUARY_KL_BETA", _PROFILE_KL_BETA))
 if not 0.0 <= KL_BETA <= 1.0:
     raise ValueError("RELIQUARY_KL_BETA must be finite and within [0, 1]")
@@ -1003,7 +1128,11 @@ WANDB_TRAINING_VERSION = _os.environ.get("RELIQUARY_WANDB_VERSION", "v1")
 # favourable partial output). Upstream grail uses 0.02; we lowered to 0.01
 # after Qwen-family + T_PROTO=0.9 prod logs showed honest EOS clustering just
 # below 0.02. Mid-reasoning forgery still fails (p_stop typically < 0.001).
-MIN_EOS_PROBABILITY = 0.01
+# v4 (full-support T=1.0) values below were calibrated on H100 2026-08-12:
+# 40 honest Qwen3-4B-Base rollouts, real OMI prompts, 16384 cap, generation
+# through the miner's forced-seed path and verification through this repo's
+# validator functions, same box (a LOWER bound on cross-stack drift).
+MIN_EOS_PROBABILITY = 0.001 if PROTOCOL_VERSION >= 4 else 0.01
 
 # LogprobValidator: max allowed median importance-sampling deviation
 # across K=CHALLENGE_K positions. dev_i = exp(|model_lp - miner_lp|) - 1.
@@ -1023,8 +1152,15 @@ LOGPROB_IS_EPS = 0.10
 SAMPLING_MIN_STEPS = 30         # completion must be at least this long
 SAMPLING_LOW_P = 0.10           # prob <= this → "low" chosen token
 SAMPLING_HIGH_P = 0.90           # prob >= this → "high" chosen token
-SAMPLING_MEDIAN_LOW_MAX = 0.30  # median chosen prob must be above
-SAMPLING_LOW_Q10_MAX = 0.025    # 10th-percentile must be above
+# v4: honest full-support sampling legitimately visits the tail, so both
+# floors drop to sit under the calibrated honest minima (median 0.121,
+# q10 0.00064) while staying far above forged-token mass (~1/vocab ≈ 7e-6).
+SAMPLING_MEDIAN_LOW_MAX = (
+    0.05 if PROTOCOL_VERSION >= 4 else 0.30
+)                               # median chosen prob must be above
+SAMPLING_LOW_Q10_MAX = (
+    0.0002 if PROTOCOL_VERSION >= 4 else 0.025
+)                               # 10th-percentile must be above
 
 # OpenMath final-answer tamper guard. The reward parser keys off the last
 # \boxed{...} content; swapping a few tokens there flips the reward without
@@ -1090,6 +1226,14 @@ FORCED_SEED_STOCHASTIC_MAXPROB = 0.99
 # rollout. Live 2026-07-14 data supports a future 0.90 candidate, but changing
 # acceptance policy belongs to the announced miner/protocol cutover after the
 # exact-CDF shadow gate has been calibrated across implementations.
+# Group-aggregate floor: _forced_seed_verdict sums (n_stoch, n_match) over ALL
+# rollouts of a prompt, so this gates the GROUP mean — ~0.95 for honest miners
+# at every sampling envelope (measured: v4 short groups 0.948-0.981, the 16k
+# aggregate 0.9495, v3 unchanged) while a pregenerated group scores 0.59-0.67
+# (H100 red-team 2026-08-12). 0.80 sits mid-gap, ~13pt margin on both sides.
+# It never needed a v4 value: only the per-ROLLOUT floor below had to drop for
+# v4's tail-heavy single-rollout drift. The 08-12 calibration briefly set this
+# to 0.70, which left only 3pt over pregeneration — reverted.
 FORCED_SEED_CONSISTENCY_FLOOR = 0.80
 # Below this many stochastic positions in a group, the gate abstains (accepts)
 # rather than risk a false reject on thin signal.
@@ -1101,7 +1245,12 @@ FORCED_SEED_MIN_STOCH_POSITIONS = 30
 # per-rollout floor. Set lower than the group floor to absorb the higher
 # single-rollout variance (empirical single-rollout: honest 0.94-1.0, non-forced
 # 0.52-0.65); shadow-only until calibrated on the live floor.
-FORCED_SEED_ROLLOUT_FLOOR = 0.75
+# Per-rollout floor: catches a partial swap hidden in a single rollout that the
+# group mean would dilute. v4 lowers it because full-support single-rollout
+# honest match bottoms at 0.78 (16k, same-box) against v3's tighter envelope;
+# 0.70 stays 8pt under that while still catching a 10%-swapped rollout (0.59-
+# 0.66 measured, 08-12). Reconfirm against cross-stack drift during shadow.
+FORCED_SEED_ROLLOUT_FLOOR = 0.70 if PROTOCOL_VERSION >= 4 else 0.75
 # A single rollout is judged only if it carries at least this many stochastic
 # positions; below it the per-rollout check abstains (never false-reject a
 # short / peaked honest rollout).

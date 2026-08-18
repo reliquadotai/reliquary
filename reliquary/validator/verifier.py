@@ -1345,6 +1345,16 @@ def validate_force_span(
     """
     if not rollout_meta.get("forced"):
         return True, set()
+    # Profiles without BFT (v4+) never produce an honest forced rollout, so any
+    # forced claim is tampering. Fail closed here rather than relying on the
+    # budget arithmetic below staying rejective at thinking_budget == 0 — a
+    # valid span EXEMPTS its positions from the per-token authenticity and
+    # distribution checks, so this is a carve-out an attacker would want.
+    # Lazy import so tests can monkeypatch reliquary.constants.
+    from reliquary.constants import BFT_ENABLED
+
+    if not BFT_ENABLED:
+        return False, set()
     span = rollout_meta.get("force_span")
     if not isinstance(span, (list, tuple)) or len(span) != 2:
         return False, set()

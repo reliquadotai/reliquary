@@ -79,7 +79,7 @@ docker logs watchtower | tail -20
 You need:
 
 - A GPU host with NVIDIA driver, CUDA 12.8+, and the NVIDIA Container Toolkit.
-- 1× A100 40 GB minimum, 64 GB RAM, 150 GB disk.
+- A capacity-qualified GPU fleet for the active profile, 64 GB RAM, and 150 GB disk. Protocol v4 qualification must cover 16-rollout, near-8192-token proofs and all 34 ranked-plus-forensic attempts per environment.
 - A public IP and an open inbound TCP port (default 8080) — miners must reach you.
 - HF Hub token with **write** access to your checkpoint repo.
 - R2 **write** credentials.
@@ -98,12 +98,17 @@ Trainer-specific `.env` keys (full list in `.env.example.trainer`):
 
 ```bash
 RELIQUARY_TRAIN=1
+RELIQUARY_PROTOCOL_PROFILE=qwen3-4b-base-dapo-v4
+RELIQUARY_CHECKPOINT=Qwen/Qwen3-4B-Base
 RELIQUARY_HF_REPO_ID=your-org/reliquary-sn   # HF repo to push checkpoints to
 HF_TOKEN=hf_xxx                              # write access to that repo
 RELIQUARY_EXTERNAL_IP=<your-public-ip>       # advertised on-chain
 RELIQUARY_EXTERNAL_PORT=8080
-# Optional — resume after a restart so miners don't reset to base:
-# RELIQUARY_RESUME_FROM=sha:<40-hex-hf-commit>
+# Required stamped activation/resume checkpoint for protocol v4:
+RELIQUARY_RESUME_FROM=sha:<40-hex-hf-commit>
+RELIQUARY_PROOF_DEVICES=<qualified-canonical-device-list>
+RELIQUARY_PROOF_CAPACITY_MANIFEST=/root/reliquary/state/proof-capacity.json
+RELIQUARY_PROOF_CAPACITY_MANIFEST_SHA256=<64-lowercase-hex>
 ```
 
 The CLI compatibility default remains `openmathinstruct`, but the production
@@ -121,28 +126,25 @@ caps, and operator/prompt dedup apply independently to both environments. Do not
 the mixed trainer until the image contains the grader rootfs, `runsc` starts
 successfully, and the loopback grader canaries pass.
 
-Training recovery also requires the complete pinned policy contract:
+Protocol v4 uses these pinned training defaults:
 
 ```bash
-RELIQUARY_KL_BASE_MODEL=Qwen/Qwen3.5-2B@15852e8c16360a2fea060d615a32b45270f8a8fc
-RELIQUARY_KL_BETA=0.01
-RELIQUARY_LEARNING_RATE=0.000003
+RELIQUARY_KL_BETA=0
+RELIQUARY_LEARNING_RATE=0.000001
 RELIQUARY_RECOMPUTE_PI_OLD_FROM_VERIFY=true
-RELIQUARY_GRAD_NORM_SKIP_THRESHOLD=50
-RELIQUARY_PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD=0.1
-RELIQUARY_CHECKPOINT_PUBLISH_INTERVAL_WINDOWS=4
+RELIQUARY_GRAD_NORM_SKIP_THRESHOLD=100
+RELIQUARY_PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD=0.5
+RELIQUARY_CHECKPOINT_PUBLISH_INTERVAL_WINDOWS=16
 RELIQUARY_SHAPE_PENALTY=0
 ```
 
-Those values describe the current 2B run. PR #162 carries a dormant,
-versioned 4B contract; do not assemble it from independent environment
-overrides. Its proof fleet, append-only base reset, coordinated miner cutover,
-and rollback procedure are defined in the
-[Qwen3.5-4B auction-v3 production runbook](4b-auction-v3-production-runbook.md).
-Auction-v3 refuses to start without a release-bound capacity manifest and
-profile-stamped checkpoint.
+Do not assemble v4 from independent environment overrides. The trainer refuses
+to start unless the selected checkpoint matches the profile, the activation
+checkpoint carries the v4 lineage stamp, and the exact proof fleet/runtime has
+a release-bound capacity manifest. Re-run qualification whenever the proof
+path, runtime fingerprint, checkpoint, or hardware identity changes.
 
-The four-step checkpoint cadence limits behavior-policy staleness. If the ratio
+The 16-step checkpoint cadence limits behavior-policy staleness. If the ratio
 gate still trips before cadence, the rejected update is excluded and the
 validator publishes only the previously accepted in-memory steps before
 resuming against the refreshed behavior policy.
@@ -219,34 +221,42 @@ For deeper protocol-level issues (high `GRAIL_FAIL`, batches not sealing, EMA dr
 
 ## What the validator actually enforces
 
-These are the current auction-v2 thresholds. Auction-v3 values are an atomic
-protocol profile and are listed in the
-[4B production runbook](4b-auction-v3-production-runbook.md). The same current
-constants are explained from the miner's perspective in
+These are the protocol-v4 release-candidate values. They are one atomic
+generation profile; do not assemble them from independent overrides. The same
+current constants are explained from the miner's perspective in
 [mining.md](mining.md#rejection-reasons).
 
 | Constant | Value | Effect |
 |---|---|---|
-| `B_BATCH` | 8 | Maximum proven winners and uniform reward slots per active environment |
-| `M_ROLLOUTS` | 8 | Required rollout count per submission |
-| `T_PROTO` | 0.6 | Protocol-fixed sampling temperature (validator's recompute uses this) |
-| `FORCED_SEED_PROTOCOL_VERSION` | 2 | Mandatory hotkey-free forced stream while enforcement is active |
-| `WINDOW_COLLECTION_SECONDS` | 100 | Fixed collection interval for both Math and Code auction populations |
+| `PROTOCOL_PROFILE_ID` | `qwen3-4b-base-dapo-v4` | Signed generation profile required from miners and validators |
+| `PROTOCOL_MODEL_ID` | `Qwen/Qwen3-4B-Base` | Base model; revision `906bfd4b4dc7f14ee4320094d8b41684abff8539` |
+| `B_BATCH` | 16 | Maximum proven winners and uniform reward slots per active environment |
+| `M_ROLLOUTS` | 16 | Required rollout count per submission |
+| `prompt_encoding` | `raw` | Tokenize the canonical prompt directly; applying a chat template is a mismatch |
+| `T_PROTO` / `TOP_P_PROTO` / `TOP_K_PROTO` | `1.0` / `1.0` / `0` | Full-support profile sampling reproduced by the validator |
+| Math `answer_format` | `boxed` | Only a valid final `\boxed{...}` or `\fbox{...}` can earn positive Math reward |
+| Code `answer_format` | `null` | Code grading is validator-authoritative and has no boxed-answer contract |
+| Math / Code `max_new_tokens` | `8192` / `8192` | Per-rollout generation cap for both environments |
+| Math / Code `bft` | `null` / `null` | Budget-forced termination is disabled in v4 |
+| `FORCED_SEED_PROTOCOL_VERSION` | 4 | Mandatory hotkey-free forced stream while enforcement is active |
+| `WINDOW_COLLECTION_SECONDS` | 150 | Fixed collection interval for both Math and Code auction populations |
+| `SUBMISSION_UPLOAD_GRACE_SECONDS` | 33 | Reveal grace for an exact body precommitted before collection cutoff |
 | `MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW` | 64 | Started admission-grading ceiling per environment/window |
-| `MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW` | 64 (v2), 16 (v3) | Ranked seal-time GPU proof ceiling per environment/window |
+| `MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW` | 32 | Ranked seal-time GPU proof ceiling per environment/window |
+| `FORENSIC_SAMPLE_PER_WINDOW` | 2 | Unpaid non-winner proof sample; cannot affect auction selection |
 | `MAX_PROOF_WALL_SECONDS` | 240 | Seal-time proof wall-clock ceiling per environment |
 | `MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW` | 4 | Operator-wide seal GPU debt limit per environment |
 | `MAX_SUBMISSION_PAYLOAD_BYTES` | 64 MiB | Per-request parsed JSON payload limit |
 | `MAX_PENDING_SUBMISSION_BYTES_PER_HOTKEY` | 128 MiB | Retained pending payload cap per hotkey/environment |
 | `MAX_PENDING_SUBMISSION_BYTES_PER_ENV` | 512 MiB | Retained pending payload cap per environment |
-| `SIGMA_MIN` (steady) | 0.43 | Zone filter: groups below this are rejected `OUT_OF_ZONE` (binary equivalent: k ∈ [2, 6] for M=8) |
-| `BOOTSTRAP_SIGMA_MIN` | 0.33 | Relaxed zone filter during first `BOOTSTRAP_WINDOWS = 100` windows (k ∈ [1, 7]) |
+| `SIGMA_MIN` (steady) | 0.24 | Zone filter: groups below this are rejected `OUT_OF_ZONE` (binary equivalent: k ∈ [1, 15] for M=16) |
+| `BOOTSTRAP_SIGMA_MIN` | 0.22 | Relaxed zone filter during first `BOOTSTRAP_WINDOWS = 100` windows; binary Math still admits k ∈ [1, 15] |
 | `BATCH_PROMPT_COOLDOWN_WINDOWS` | 1,000,000 | A winning prompt is effectively one-shot in the OpenMath phase |
 | `COOLDOWN_REBUILD_LOOKBACK` | 2000 | Bounded R2 gap replay for legacy/fallback prompt-index cooldown recovery; canonical content uses its run-keyed snapshot |
 | `PROOF_SKETCH_TOLERANCE_BASE` | 5000 | GRAIL sketch tolerance — actual threshold = `5000 + 5 × √position` |
 | `PROOF_SKETCH_TOLERANCE_GROWTH` | 5.0 | Per-position sqrt growth |
 | `LOGPROB_IS_EPS` | 0.10 | Per-token log-prob deviation max — exceeding triggers `LOGPROB_MISMATCH` |
-| `MIN_EOS_PROBABILITY` | 0.01 | Required EOS token probability for proper termination |
+| `MIN_EOS_PROBABILITY` | 0.001 | Required EOS token probability for proper termination |
 | `MAX_TRUNCATED_PER_SUBMISSION` | 1 | Steady-state cap/non-EOS truncation allowance; accepted cap hits still pass GRAIL/logprob/distribution/boxed checks |
 | `BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION` | 1 | Bootstrap truncation allowance |
 | `TRAINING_QUARANTINE_ENABLED` | true | Suspicious selected windows skip GRPO/publish but remain archived/credited |
@@ -297,13 +307,14 @@ operator logical claim         zone and cheap authenticity guards
 rate/queue/payload bounds      -> pending auction pool
 -> reason="submitted"          -> first /verdicts lifecycle record
 
-100 s deadline
+150 s deadline
 -> stop new admission and drain pre-deadline work (max 60 s)
 -> freeze Math and Code populations independently
 -> fetch post-deadline drand salt
--> rank by difficulty, validator arrival round, sealed operator/prompt tie hash
+-> rank by difficulty, capped throughput bucket, validator arrival round,
+   sealed operator/prompt tie hash
 -> prove top-down under attempt/wall/operator-debt bounds
--> at most 8 distinct prompts; no operator winner cap
+-> at most 16 distinct prompts; no operator winner cap
 -> pay exactly the selected training groups; no boundary split
 -> final /verdicts lifecycle records
 -> R2 archive + rewards + balanced training accumulator
@@ -342,7 +353,7 @@ transient R2 failure, but growing depth or old
 `archive_last_uploaded_window` confirms that a recent archive left the retry
 queue.
 
-Auction-v3 additionally reports the global proof scheduler state, queue and
+Protocol v4 additionally reports the global proof scheduler state, queue and
 active work by device, checkpoint readiness, per-environment proof latency,
 capacity qualification, and capacity abort totals. A required scheduler in any
 state other than `running` makes health degraded and prevents a new window from

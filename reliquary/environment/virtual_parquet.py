@@ -45,12 +45,17 @@ class VirtualParquetDataset:
         cache_row_groups: int = 64,
         fs: Any = None,
         full_file_fallback: Optional[bool] = None,
+        filename_prefix: Optional[str] = None,
     ) -> None:
         self._repo = repo
         self._revision = revision
         self._columns = columns
         self._data_dir = data_dir
         self._cache_cap = cache_row_groups
+        # When set, only parquet files whose BASENAME starts with this enter
+        # the manifest. Applied in both listing paths: len() is prompt-range
+        # consensus, so a filter on only one would fork it on cache fallback.
+        self._filename_prefix = filename_prefix
         self._fs = fs  # injectable for tests; HfFileSystem when None
         if full_file_fallback is None:
             full_file_fallback = (
@@ -140,6 +145,12 @@ class VirtualParquetDataset:
             repo_type="dataset",
         )
 
+    def _shard_included(self, path: str) -> bool:
+        if self._filename_prefix is None:
+            return True
+        name = str(path).replace("\\", "/").rsplit("/", 1)[-1]
+        return name.startswith(self._filename_prefix)
+
     def _local_manifest_files(self) -> list[str]:
         """Discover exact pinned parquet files from the persistent HF cache."""
         from huggingface_hub import snapshot_download
@@ -149,13 +160,17 @@ class VirtualParquetDataset:
                 repo_id=self._repo,
                 revision=self._revision,
                 repo_type="dataset",
-                allow_patterns=[f"{self._data_dir}/*.parquet"],
+                allow_patterns=[
+                    f"{self._data_dir}/{self._filename_prefix or ''}*.parquet"
+                ],
                 local_files_only=True,
             )
         )
         data_root = snapshot_root / self._data_dir
         local_files = sorted(
-            path for path in data_root.glob("*.parquet") if path.is_file()
+            path
+            for path in data_root.glob("*.parquet")
+            if path.is_file() and self._shard_included(str(path))
         )
         if not local_files:
             raise RuntimeError(
@@ -274,7 +289,7 @@ class VirtualParquetDataset:
                 files = sorted(
                     str(p)
                     for p in fs.ls(base, detail=False)
-                    if str(p).endswith(".parquet")
+                    if str(p).endswith(".parquet") and self._shard_included(str(p))
                 )
             except Exception as exc:
                 files = []

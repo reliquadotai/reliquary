@@ -75,6 +75,14 @@ def _normalize_answer(s: str) -> str:
     if s is None:
         return ""
     s = str(s)
+    # v4 raw-completion answers come wrapped in inline/display LaTeX ("\(x\)" /
+    # "\[x\]"); the delimiters never carry meaning. Gated so v3 grading (which
+    # never saw these — the chat-template model boxes) stays byte-identical.
+    # Lazy import so tests can monkeypatch reliquary.constants.
+    from reliquary.constants import RAW_COMPLETION_PROMPTS
+    if RAW_COMPLETION_PROMPTS:
+        for delim in (r"\(", r"\)", r"\[", r"\]"):
+            s = s.replace(delim, "")
     # Drop LaTeX spacing macros first
     for macro in (r"\!", r"\,", r"\ ", r"\;", r"\:"):
         s = s.replace(macro, "")
@@ -376,17 +384,24 @@ def _compute_omi_reward(problem: dict, completion: str) -> float:
     """
     try:
         boxed = _last_boxed_only_string(completion)
-        if boxed is None:
-            # Fallback: try to find a trailing number / fraction at end of text
-            # (some models output the answer without boxing)
+        if boxed is not None:
+            candidate = _normalize_answer(_strip_boxed_wrapper(boxed))
+        else:
+            # v4 requires the format requested by the canonical prompt. The
+            # boxed span is the only reward-bearing region the validator's
+            # answer-integrity proof can authenticate, so every unboxed form
+            # scores zero. Older profiles retain their paid trailing-number
+            # behavior byte-for-byte through the explicit profile contract.
+            from reliquary.constants import MATH_ANSWER_FORMAT
+
+            if MATH_ANSWER_FORMAT == "boxed":
+                return 0.0
+            # Legacy fallback: trailing number / fraction at end of text.
             tail = completion.strip().split("\n")[-1].strip()
-            # Match a leading number/fraction at start of last line
             m = re.match(r"^([\-\+]?\d+(?:\.\d+)?(?:/\d+)?)", tail)
             if m is None:
                 return 0.0
             candidate = _normalize_answer(m.group(1))
-        else:
-            candidate = _normalize_answer(_strip_boxed_wrapper(boxed))
         gt = _normalize_answer(problem.get("ground_truth", ""))
         if gt == "":
             return 0.0
@@ -414,12 +429,35 @@ def _load_dataset(repo: str, revision: str):
     the row-groups a window touches are fetched — no bulk shard download, and
     the whole ~14M-row index space stays addressable.
     """
+    # Lazy import so tests can monkeypatch reliquary.constants; read once for
+    # both the snapshot guard and the virtual-parquet filter below.
+    from reliquary.constants import OMI_TRAIN_SHARDS_ONLY
+
     path = Path(repo).expanduser()
     if path.exists() and (path / "dataset_info.json").exists():
+        # A snapshot embeds whatever shard listing built it — it cannot honour
+        # the v4 train- filter, and a diverging len(env) forks prompt-range
+        # consensus silently (every submission dies on PROMPT_MISMATCH).
+        if OMI_TRAIN_SHARDS_ONLY:
+            raise RuntimeError(
+                "local OMI save_to_disk snapshots are unsupported on v4+: "
+                "the snapshot's row set predates the train- shard filter and "
+                "len(env) is prompt-range consensus; configure the hub repo "
+                "id so the filtered VirtualParquetDataset view is used"
+            )
         import datasets as hf
         return hf.load_from_disk(str(path))
-    from reliquary.environment.virtual_parquet import VirtualParquetDataset
-    return VirtualParquetDataset(repo, revision, columns=["problem", "expected_answer"])
+    from reliquary.environment import virtual_parquet as _vp
+
+    return _vp.VirtualParquetDataset(
+        repo,
+        revision,
+        columns=["problem", "expected_answer"],
+        # v4+: canonical corpus only. train_1M/2M/5M are curated subsets OF
+        # train, so listing them duplicates 8,000,000 rows. This changes
+        # len(env), which is prompt-range consensus — cutover-only.
+        filename_prefix="train-" if OMI_TRAIN_SHARDS_ONLY else None,
+    )
 
 
 class OpenMathInstructEnvironment:

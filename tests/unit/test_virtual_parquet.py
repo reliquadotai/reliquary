@@ -251,3 +251,79 @@ def test_cached_manifest_fallback_is_deterministic(tmp_path, monkeypatch):
     assert health["source_failures_total"] == 1
     assert health["local_manifest_fallbacks_total"] == 1
     assert health["local_full_file_hits_total"] >= 2
+
+
+# ── OMI corpus filter: the manifest must be restricted to the canonical shards.
+# nvidia/OpenMathInstruct-2 ships train-*.parquet (the corpus) alongside
+# train_1M/2M/5M-*.parquet, which are curated subsets OF train. Listing every
+# parquet under data/ therefore addresses 8,000,000 rows twice — 36.4% of the
+# index space — and pick_prompt_idx draws uniformly over it, so a curated row is
+# selected 2-4x more often than an ordinary one.
+
+def _make_shard_layout(tmp_path):
+    """The real OMI shape: canonical `train-` shards plus curated subsets."""
+    _make_parquet(tmp_path / "train-00000-of-00002.parquet", [0, 1, 2], rg_size=2)
+    _make_parquet(tmp_path / "train-00001-of-00002.parquet", [3, 4], rg_size=2)
+    _make_parquet(tmp_path / "train_1M-00000-of-00001.parquet", [90, 91], rg_size=2)
+    _make_parquet(tmp_path / "train_5M-00000-of-00001.parquet", [95], rg_size=2)
+    return _LocalFS([
+        tmp_path / "train-00000-of-00002.parquet",
+        tmp_path / "train-00001-of-00002.parquet",
+        tmp_path / "train_1M-00000-of-00001.parquet",
+        tmp_path / "train_5M-00000-of-00001.parquet",
+    ])
+
+
+def test_filename_prefix_filters_the_remote_listing(tmp_path):
+    ds = VirtualParquetDataset(
+        "owner/repo", "rev", columns=["v"],
+        fs=_make_shard_layout(tmp_path), filename_prefix="train-",
+    )
+
+    assert len(ds) == 5
+    assert [ds.get_row(i)["v"] for i in range(5)] == [0, 1, 2, 3, 4]
+
+
+def test_no_filename_prefix_keeps_every_shard(tmp_path):
+    """Default is unchanged: pre-v4 profiles must see the corpus they always saw."""
+    ds = VirtualParquetDataset(
+        "owner/repo", "rev", columns=["v"], fs=_make_shard_layout(tmp_path),
+    )
+
+    assert len(ds) == 8
+
+
+def test_filename_prefix_filters_the_cached_manifest_fallback(tmp_path, monkeypatch):
+    """The offline path must filter identically to the remote one.
+
+    len(env) is prompt-range consensus — both sides must resolve the same total.
+    A filter applied to only one listing path would fork it whenever a validator
+    fell back to its local cache.
+    """
+    import huggingface_hub
+
+    snapshot = tmp_path / "snapshot"
+    data_dir = snapshot / "data"
+    data_dir.mkdir(parents=True)
+    _make_parquet(data_dir / "train-00000-of-00002.parquet", [0, 1], rg_size=1)
+    _make_parquet(data_dir / "train-00001-of-00002.parquet", [2, 3], rg_size=1)
+    _make_parquet(data_dir / "train_1M-00000-of-00001.parquet", [90], rg_size=1)
+
+    def _snapshot_download(**kwargs):
+        assert kwargs["allow_patterns"] == ["data/train-*.parquet"]
+        return str(snapshot)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", _snapshot_download)
+    monkeypatch.setattr(
+        huggingface_hub, "try_to_load_from_cache",
+        lambda *, filename, **kw: str(snapshot / filename),
+    )
+
+    ds = VirtualParquetDataset(
+        "owner/repo", "rev", columns=["v"],
+        fs=_FailingListingFS(), full_file_fallback=True,
+        filename_prefix="train-",
+    )
+
+    assert len(ds) == 4
+    assert [ds.get_row(i)["v"] for i in range(4)] == [0, 1, 2, 3]

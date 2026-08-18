@@ -357,3 +357,141 @@ def test_sparse_handles_token_outside_topk_window():
         assert got.n_positions == 1
         assert got.n_exact_match == 0
         assert got.n_hard_mismatch == 1
+
+
+def test_full_support_diagnostics_verify_honest_picks_exactly():
+    """v4 sampling (top_k=0): every honest pick must verify, wherever it lands.
+
+    The sparse window is sized by top_k; at 0 it degenerates to 33 tokens with
+    the dense fallback unreachable, so honest full-support picks outside the
+    window (or in-window picks whose interval misses the tail mass) would be
+    misclassified. Full support must route to the full-vocab intervals.
+    """
+    g = torch.Generator().manual_seed(5)
+    rows, vocab = 48, 4096
+    logits = torch.randn(rows, vocab, generator=g)   # flat: honest picks spread
+    u = torch.rand(rows, generator=g).tolist()
+    for top_k in (0, -1):                            # profile and verl sentinels
+        kw = dict(t=1.0, top_k=top_k, top_p=1.0)
+        toks = [fs.pick(fs.warp(logits[i], **kw), u[i]) for i in range(rows)]
+        got = fs.seed_consistency_diagnostics(
+            logits, toks, u, **kw,
+            stochastic_threshold=0.99, boundary_epsilon=1e-6,
+        )
+        assert got.n_positions == rows
+        assert got.n_stochastic == rows              # randn(4096) is never peaked
+        assert got.n_exact_match == rows, "honest full-support pick rejected"
+        assert got.n_hard_mismatch == 0
+
+
+def test_full_support_diagnostics_match_dense_reference_counts():
+    # Same contract as test_sparse_diagnostics_counts_identical_to_reference,
+    # at the v4 envelope: ~1/3 corrupted tokens must classify exactly as a
+    # dense-only computation says, no more and no fewer.
+    logits, toks, u = _random_case(11, rows=64, vocab=2048)
+    kw = dict(t=1.0, top_k=0, top_p=1.0)
+    got = fs.seed_consistency_diagnostics(
+        logits, toks, u, **kw, stochastic_threshold=0.99, boundary_epsilon=1e-6)
+    probs_ref = fs._warp_batch(logits, **kw)
+    cdf = torch.cumsum(probs_ref, dim=-1)
+    row = torch.arange(logits.shape[0])
+    tok_t = torch.tensor(toks)
+    upper = cdf[row, tok_t]
+    lower = upper - probs_ref[row, tok_t]
+    uu = torch.tensor(u, dtype=upper.dtype)
+    exact = (uu >= lower) & (uu < upper)
+    assert got.n_exact_match == int(
+        ((probs_ref.max(-1).values < 0.99) & exact).sum()
+    )
+
+
+# ── v4 sampling: warp() is the identity, so the PPO ratio lives in the space
+# the samples actually came from. Task 7 (clip-higher) is only interpretable
+# because of this. These are regression pins, not change drivers: they pass on
+# the current code and must fail before the trainer can silently drift.
+
+_V4 = dict(t=1.0, top_k=0, top_p=1.0)
+_V3 = dict(t=0.6, top_k=20, top_p=0.95)
+
+
+def test_warp_is_plain_softmax_at_v4_sampling_values():
+    torch.manual_seed(0)
+    logits = torch.randn(1000) * 5.0
+
+    out = fs.warp(logits, **_V4)
+
+    assert torch.allclose(out, torch.softmax(logits.float(), dim=-1), atol=1e-6)
+    assert torch.all(out > 0), "full support: v4 must not mask any token to zero"
+
+
+def test_warp_top_k_zero_and_minus_one_both_disable():
+    """0 is the profile's disable sentinel; -1 is verl's. They must agree."""
+    torch.manual_seed(1)
+    logits = torch.randn(50)
+
+    assert torch.allclose(
+        fs.warp(logits, t=1.0, top_k=0, top_p=1.0),
+        fs.warp(logits, t=1.0, top_k=-1, top_p=1.0),
+    )
+
+
+def _log_ratio(z_new, z_old, token, **warp_kwargs):
+    """log π_new(token) − log π_old(token), measured through warp()."""
+    new = fs.warp(z_new, **warp_kwargs)[token]
+    old = fs.warp(z_old, **warp_kwargs)[token]
+    return float(torch.log(new) - torch.log(old))
+
+
+def test_v4_sampling_makes_ppo_ratio_space_match_sampling_space():
+    """The importance ratio on raw log-probs IS the ratio the samples came from.
+
+    The trainer forms r = π_θ/π_old from raw log-softmax values while the miner
+    samples through warp(). At v4 values those coincide exactly, which is what
+    makes an epsilon of 0.28 mean 0.28.
+    """
+    torch.manual_seed(2)
+    z_old = torch.randn(500) * 3.0
+    z_new = z_old + torch.randn(500) * 0.01  # one small optimiser step apart
+    token = int(torch.argmax(z_old))
+
+    raw = float(
+        torch.log_softmax(z_new.float(), -1)[token]
+        - torch.log_softmax(z_old.float(), -1)[token]
+    )
+
+    assert _log_ratio(z_new, z_old, token, **_V4) == pytest.approx(raw, abs=1e-6)
+
+
+def test_v3_sampling_distorts_the_ppo_ratio_unevenly_across_tokens():
+    """The contrast that makes the pin above meaningful.
+
+    Under v3 the trainer forms the ratio on raw log-probs while the miner
+    samples through a temperature-0.6, top-20 warp, so the two spaces disagree.
+    The disagreement is NOT the clean r_raw^(1/T) rescaling the 08-03 divergence
+    audit assumed: that approximation needs Z_old/Z_new ~= 1, which fails on a
+    peaked distribution because logsumexp(z/T) tracks the top logit. Measured
+    here, the per-token factor between the two spaces ranges from negative to
+    well above 1/T — it can even flip the ratio's direction.
+
+    That is worse than a mis-scaled band, and it is why the sampling change has
+    to land before clip-higher: epsilon would be tuned against a factor that
+    varies token by token rather than a constant exponent.
+    """
+    torch.manual_seed(3)
+    z_old = torch.randn(500) * 3.0
+    z_new = z_old + torch.randn(500) * 0.01
+    nucleus = torch.topk(z_old, _V3["top_k"]).indices.tolist()
+
+    factors = []
+    for token in nucleus:
+        raw = float(
+            torch.log_softmax(z_new.float(), -1)[token]
+            - torch.log_softmax(z_old.float(), -1)[token]
+        )
+        if abs(raw) < 1e-4:  # ratio undefined against numerical noise
+            continue
+        factors.append(_log_ratio(z_new, z_old, token, **_V3) / raw)
+
+    assert len(factors) >= 5
+    # A clean exponent would put every factor at 1/T. Instead they spread.
+    assert max(factors) - min(factors) > 1.0
