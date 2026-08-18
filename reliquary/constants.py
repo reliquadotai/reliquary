@@ -483,7 +483,17 @@ WINDOW_COLLECTION_SECONDS = float(
 FORENSIC_SAMPLE_PER_WINDOW = 2
 
 # UID that receives unused slot emission budget (the burn address).
-UID_BURN = 0
+#
+# Unset (the default) means "this validator's own uid", resolved from the
+# metagraph by its own hotkey at weight-submission time. The historical hard 0
+# was the SUBNET OWNER's uid, which is not a stable address: subnet ownership
+# changes, and a uid can move on re-registration — a stale literal silently
+# pays the wrong account every epoch. Set RELIQUARY_UID_BURN=<n> to pin an
+# explicit target (0 restores the legacy owner-burn) without a code release.
+_UID_BURN_RAW = _os.environ.get("RELIQUARY_UID_BURN", "").strip()
+UID_BURN: int | None = int(_UID_BURN_RAW) if _UID_BURN_RAW else None
+if UID_BURN is not None and UID_BURN < 0:
+    raise ValueError("RELIQUARY_UID_BURN must be a non-negative uid")
 
 # ────────────────  CONTINUOUS VALIDATION  ────────────────
 

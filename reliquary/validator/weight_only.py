@@ -15,7 +15,6 @@ from reliquary.constants import (
     EMA_ALPHA,
     EPOCH_SUBMIT_LEAD_BLOCKS,
     POLL_INTERVAL_SECONDS,
-    UID_BURN,
 )
 from reliquary.infrastructure import chain, storage
 
@@ -184,6 +183,30 @@ class WeightOnlyValidator:
             ema = {hk: v for hk, v in ema.items() if v > 1e-6}
         return ema
 
+    def _resolve_burn_uid(self, hotkey_to_uid: dict) -> int:
+        """Where the unpayable share goes.
+
+        ``UID_BURN`` unset means this validator's own uid, looked up from the
+        metagraph by its hotkey, so the target follows re-registration and
+        survives a subnet-ownership change. Falls back to 0 when this
+        validator is absent from the metagraph: the burn MUST land somewhere,
+        because a weight vector summing below one lets chain-side
+        normalization redistribute that mass among the remaining miners.
+        """
+        # Lazy import so tests (and a redeploy-free env change) can rebind it.
+        from reliquary.constants import UID_BURN as _uid_burn
+
+        if _uid_burn is not None:
+            return int(_uid_burn)
+        own_uid = hotkey_to_uid.get(self.wallet.hotkey.ss58_address)
+        if own_uid is None:
+            logger.warning(
+                "burn uid: this validator's hotkey is absent from the "
+                "metagraph; falling back to uid 0 to conserve weight mass"
+            )
+            return 0
+        return int(own_uid)
+
     async def _submit_weights(
         self, subtensor, miner_weights: dict[str, float],
     ) -> bool:
@@ -211,8 +234,9 @@ class WeightOnlyValidator:
         # normalization redistribute that mass among remaining miners.
         burn_weight = max(0.0, 1.0 - registered_total)
         if burn_weight > 0:
-            weights_by_uid[UID_BURN] = (
-                weights_by_uid.get(UID_BURN, 0.0) + burn_weight
+            burn_uid = self._resolve_burn_uid(hotkey_to_uid)
+            weights_by_uid[burn_uid] = (
+                weights_by_uid.get(burn_uid, 0.0) + burn_weight
             )
         if not weights_by_uid:
             logger.info("No non-zero weights to submit; nothing to do.")
