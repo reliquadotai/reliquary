@@ -129,17 +129,17 @@ async def test_submit_weights_maps_hotkeys_to_uids():
         wov_mod.chain.get_metagraph = original_get_meta
         wov_mod.chain.set_weights = original_set_weights
 
-    from reliquary.constants import UID_BURN
     assert 10 in captured["uids"]   # alice → uid 10
     assert 20 in captured["uids"]   # bob → uid 20
-    assert UID_BURN in captured["uids"]
+    # This validator is absent from the fake metagraph, so the burn falls back
+    # to uid 0 (mass must stay conserved).
+    assert 0 in captured["uids"]
     assert sum(captured["weights"]) == pytest.approx(1.0)
 
 
 @pytest.mark.asyncio
 async def test_deregistered_ema_mass_is_conserved_as_burn():
     """Metagraph filtering must not redistribute vanished miner weight."""
-    from reliquary.constants import UID_BURN
     from reliquary.validator.weight_only import WeightOnlyValidator
 
     wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
@@ -166,17 +166,18 @@ async def test_deregistered_ema_mass_is_conserved_as_burn():
 
     assert submitted is True
     assert captured[10] == pytest.approx(0.4)
-    assert captured[UID_BURN] == pytest.approx(0.6)
+    # Validator not in this metagraph → burn falls back to uid 0.
+    assert captured[0] == pytest.approx(0.6)
     assert sum(captured.values()) == pytest.approx(1.0)
 
 
 @pytest.mark.asyncio
 async def test_uid_burn_earned_weight_is_aggregated_without_duplicate_uid():
-    from reliquary.constants import UID_BURN
+    """A burn target that ALSO earned weight must appear once, summed."""
     from reliquary.validator.weight_only import WeightOnlyValidator
 
     wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
-    fake_meta = MagicMock(hotkeys=["owner", "alice"], uids=[UID_BURN, 10])
+    fake_meta = MagicMock(hotkeys=["owner", "alice"], uids=[0, 10])
     captured = {}
 
     async def capture(_subtensor, _wallet, _netuid, uids, weights):
@@ -198,9 +199,9 @@ async def test_uid_burn_earned_weight_is_aggregated_without_duplicate_uid():
             MagicMock(), {"owner": 0.1, "alice": 0.4},
         )
 
-    assert captured["uids"].count(UID_BURN) == 1
+    assert captured["uids"].count(0) == 1
     by_uid = dict(zip(captured["uids"], captured["weights"]))
-    assert by_uid[UID_BURN] == pytest.approx(0.6)
+    assert by_uid[0] == pytest.approx(0.6)
     assert sum(captured["weights"]) == pytest.approx(1.0)
 
 
@@ -609,3 +610,95 @@ async def test_replay_ema_conservation_bound():
     ema = WeightOnlyValidator._replay_ema([archive])
     expected_total = EMA_ALPHA * sum(rewards.values())
     assert abs(sum(ema.values()) - expected_total) < 1e-9
+
+
+@pytest.mark.asyncio
+async def test_burn_defaults_to_the_validators_own_uid():
+    """Unset RELIQUARY_UID_BURN burns to THIS validator's uid, resolved from
+    the metagraph by its own hotkey. Hardcoding 0 pointed at the subnet
+    owner's uid, which is not stable across ownership changes."""
+    import reliquary.constants as C
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    with patch.object(C, "UID_BURN", None):
+        wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+        # "5FReader" is this validator; it sits at uid 237, not 0.
+        fake_meta = MagicMock(hotkeys=["alice", "5FReader"], uids=[10, 237])
+        captured = {}
+
+        async def capture(_subtensor, _wallet, _netuid, uids, weights):
+            captured.update(zip(uids, weights))
+            return True
+
+        with (
+            patch(
+                "reliquary.validator.weight_only.chain.get_metagraph",
+                new=AsyncMock(return_value=fake_meta),
+            ),
+            patch("reliquary.validator.weight_only.chain.set_weights", new=capture),
+        ):
+            assert await wov._submit_weights(
+                MagicMock(), {"alice": 0.4, "deregistered": 0.3},
+            ) is True
+
+    assert captured[10] == pytest.approx(0.4)
+    assert captured[237] == pytest.approx(0.6)   # burn to self, not uid 0
+    assert 0 not in captured
+    assert sum(captured.values()) == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_explicit_burn_uid_overrides_self_resolution():
+    """An operator can still pin the burn target without a code release."""
+    import reliquary.constants as C
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    with patch.object(C, "UID_BURN", 0):
+        wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+        fake_meta = MagicMock(hotkeys=["alice", "5FReader"], uids=[10, 237])
+        captured = {}
+
+        async def capture(_subtensor, _wallet, _netuid, uids, weights):
+            captured.update(zip(uids, weights))
+            return True
+
+        with (
+            patch(
+                "reliquary.validator.weight_only.chain.get_metagraph",
+                new=AsyncMock(return_value=fake_meta),
+            ),
+            patch("reliquary.validator.weight_only.chain.set_weights", new=capture),
+        ):
+            await wov._submit_weights(MagicMock(), {"alice": 0.4})
+
+    assert captured[0] == pytest.approx(0.6)
+
+
+@pytest.mark.asyncio
+async def test_burn_falls_back_to_uid_zero_when_self_is_not_registered():
+    """Mass MUST stay conserved: if this validator is absent from the
+    metagraph the burn cannot go to self, and dropping it would let chain-side
+    normalization redistribute that mass to miners."""
+    import reliquary.constants as C
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    with patch.object(C, "UID_BURN", None):
+        wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+        fake_meta = MagicMock(hotkeys=["alice"], uids=[10])   # no "5FReader"
+        captured = {}
+
+        async def capture(_subtensor, _wallet, _netuid, uids, weights):
+            captured.update(zip(uids, weights))
+            return True
+
+        with (
+            patch(
+                "reliquary.validator.weight_only.chain.get_metagraph",
+                new=AsyncMock(return_value=fake_meta),
+            ),
+            patch("reliquary.validator.weight_only.chain.set_weights", new=capture),
+        ):
+            await wov._submit_weights(MagicMock(), {"alice": 0.4})
+
+    assert captured[0] == pytest.approx(0.6)
+    assert sum(captured.values()) == pytest.approx(1.0)
