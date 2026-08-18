@@ -63,6 +63,21 @@ def _request(sock_path: str, code: str, cases: list[dict], timeout_s: float = 5.
         return json.loads(buf.split(b"\n", 1)[0])
 
 
+def _wait_for_health_update(
+    health_path: Path,
+    previous_updated_at: float,
+    *,
+    timeout_s: float = 2.0,
+) -> dict:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        snapshot = json.loads(health_path.read_text(encoding="utf-8"))
+        if snapshot["updated_at"] > previous_updated_at:
+            return snapshot
+        time.sleep(0.01)
+    raise AssertionError("grader health heartbeat did not advance updated_at")
+
+
 def test_server_grades_correct_code(grader_server):
     resp = _request(
         grader_server.socket_path,
@@ -396,6 +411,73 @@ def test_stop_releases_metrics_listener_for_restart(tmp_path):
         )
         server._start_metrics_server()
         server.stop()
+
+
+def test_idle_health_heartbeat_refreshes_process_telemetry():
+    from reliquary.environment.grader.server import GraderServer
+    from reliquary.infrastructure.process_health import (
+        GRADER_HEALTH_STALE_SECONDS,
+        collect_process_health,
+    )
+
+    with tempfile.TemporaryDirectory(prefix="ghb-", dir="/tmp") as tmp:
+        root = Path(tmp)
+        health_path = root / "grader-health.json"
+        server = GraderServer(
+            socket_path=str(root / "grader.sock"),
+            pool_size=0,
+            metrics_port=0,
+            health_path=str(health_path),
+            health_heartbeat_s=0.05,
+        )
+        server.start()
+        try:
+            initial = json.loads(health_path.read_text(encoding="utf-8"))
+            refreshed = _wait_for_health_update(
+                health_path,
+                initial["updated_at"],
+            )
+            telemetry = collect_process_health(grader_health_path=health_path)
+
+            assert GRADER_HEALTH_STALE_SECONDS == 120.0
+            assert refreshed["workers_alive"] == 0
+            assert refreshed["workers_busy"] == 0
+            assert refreshed["shutdown_complete"] is False
+            assert telemetry["grader"]["updated_at"] >= refreshed["updated_at"]
+            assert telemetry["grader"]["age_seconds"] < 1.0
+            assert telemetry["grader"]["stale"] is False
+            assert "grader_health_stale" not in telemetry["warning_reasons"]
+        finally:
+            server.stop()
+
+
+def test_shutdown_joins_health_heartbeat_and_publishes_completion():
+    from reliquary.environment.grader.server import GraderServer
+
+    with tempfile.TemporaryDirectory(prefix="ghb-", dir="/tmp") as tmp:
+        root = Path(tmp)
+        health_path = root / "grader-health.json"
+        server = GraderServer(
+            socket_path=str(root / "grader.sock"),
+            pool_size=0,
+            metrics_port=0,
+            health_path=str(health_path),
+            health_heartbeat_s=0.05,
+        )
+        server.start()
+        heartbeat = server._health_heartbeat_thread
+        assert heartbeat is not None and heartbeat.is_alive()
+
+        server.stop()
+
+        assert not heartbeat.is_alive()
+        assert server._health_heartbeat_thread is None
+        shutdown = json.loads(health_path.read_text(encoding="utf-8"))
+        assert shutdown["shutdown_complete"] is True
+        final_updated_at = shutdown["updated_at"]
+        time.sleep(0.15)
+        after_wait = json.loads(health_path.read_text(encoding="utf-8"))
+        assert after_wait["updated_at"] == final_updated_at
 
 
 def test_recycle_and_shutdown_publish_reaped_worker_counts():

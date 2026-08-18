@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 # unique per-slot container id at spawn time. ``runsc run <id>`` refuses a
 # duplicate id, so every pool worker needs its own.
 GRADER_CONTAINER_ID_PLACEHOLDER = "{container_id}"
+GRADER_HEALTH_HEARTBEAT_SECONDS = 30.0
 
 
 def runsc_worker_argv(bundle: str) -> list[str]:
@@ -133,6 +134,7 @@ class GraderServer:
         recycle_after_evals: int = 64,
         metrics_port: int = 9876,
         health_path: str = DEFAULT_GRADER_HEALTH_PATH,
+        health_heartbeat_s: float = GRADER_HEALTH_HEARTBEAT_SECONDS,
     ) -> None:
         self.socket_path = socket_path
         self.pool_size = pool_size
@@ -151,6 +153,12 @@ class GraderServer:
         self.recycle_after_evals = recycle_after_evals
         self.metrics_port = metrics_port
         self.health_path = health_path
+        if not 0.0 < health_heartbeat_s <= GRADER_HEALTH_HEARTBEAT_SECONDS:
+            raise ValueError(
+                "health_heartbeat_s must be greater than 0 and at most "
+                f"{GRADER_HEALTH_HEARTBEAT_SECONDS} seconds"
+            )
+        self.health_heartbeat_s = health_heartbeat_s
         self._metrics = _MetricsRegistry()
         self._metrics_server: Optional[http.server.HTTPServer] = None
 
@@ -160,6 +168,8 @@ class GraderServer:
         self._listen_sock: Optional[socket.socket] = None
         self._accept_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        self._health_heartbeat_stop_event = threading.Event()
+        self._health_heartbeat_thread: Optional[threading.Thread] = None
         self._started_at = time.time()
         self._lifecycle_lock = threading.Lock()
         self._workers_spawned_total = 0
@@ -217,6 +227,7 @@ class GraderServer:
         self._accept_thread.start()
         self._start_metrics_server()
         self._publish_health()
+        self._start_health_heartbeat()
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -243,6 +254,7 @@ class GraderServer:
             os.unlink(self.socket_path)
         except FileNotFoundError:
             pass
+        self._stop_health_heartbeat()
         with self._lifecycle_lock:
             self._shutdown_complete = True
         self._publish_health()
@@ -310,6 +322,34 @@ class GraderServer:
                 os.unlink(temporary)
             except OSError:
                 pass
+
+    def _health_heartbeat_loop(self) -> None:
+        next_publish = time.monotonic() + self.health_heartbeat_s
+        while True:
+            remaining = max(0.0, next_publish - time.monotonic())
+            if self._health_heartbeat_stop_event.wait(remaining):
+                return
+            self._publish_health()
+            next_publish += self.health_heartbeat_s
+            if next_publish <= time.monotonic():
+                next_publish = time.monotonic() + self.health_heartbeat_s
+
+    def _start_health_heartbeat(self) -> None:
+        self._health_heartbeat_stop_event.clear()
+        thread = threading.Thread(
+            target=self._health_heartbeat_loop,
+            name="grader-health-heartbeat",
+            daemon=True,
+        )
+        self._health_heartbeat_thread = thread
+        thread.start()
+
+    def _stop_health_heartbeat(self) -> None:
+        self._health_heartbeat_stop_event.set()
+        thread = self._health_heartbeat_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
+        self._health_heartbeat_thread = None
 
     def _next_container_id_for_slot(self, slot: int) -> str:
         with self._container_generation_lock:
