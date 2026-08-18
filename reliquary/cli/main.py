@@ -547,7 +547,8 @@ def validate(
                 ).strip()
                 if not manifest_path or not manifest_sha256:
                     raise RuntimeError(
-                        "auction-v3 requires a pinned proof-capacity manifest"
+                        f"{PROTOCOL_PROFILE_ID} requires a pinned "
+                        "proof-capacity manifest"
                     )
                 qualification = load_proof_capacity_qualification(
                     manifest_path,

@@ -133,29 +133,25 @@ def fractional_reward_lattice(total_tests: int) -> tuple[float, ...]:
 ROBUST_UTILITY_MAX_OUTCOMES = 200_000
 
 
-def robust_truncation_utility(
+def robust_uncertain_reward_utility(
     rewards: Iterable[float],
     *,
     sigma_min: float,
-    truncated_index: int | None = None,
-    truncated_indices: Iterable[int] = (),
+    uncertain_indices: Iterable[int] = (),
     attainable_rewards: Iterable[float] = (),
     delta: float = 1.0,
 ) -> float:
-    """Return the least utility across all outcomes of one truncated rollout.
+    """Return the least utility across all outcomes of uncertain rollouts.
 
-    A truncated rollout has an unknown reward. Replacing it with every value in
-    its exact environment-specific lattice and minimizing the *gated* utility
-    prevents a manufactured truncation from improving either sigma eligibility
-    or auction difficulty. Several rollouts may be unknown; every joint
-    assignment is priced, so the guarantee does not weaken as the per-
-    environment truncation allowance rises.
+    A truncated or off-format rollout has an untrusted observed reward.
+    Replacing it with every value in its exact environment-specific lattice and
+    minimizing the *gated* utility prevents the uncertainty from improving
+    either sigma eligibility or auction difficulty. Several rollouts may be
+    unknown; every joint assignment is priced, so the guarantee does not weaken
+    as the uncertain set grows.
     """
     values = tuple(float(reward) for reward in rewards)
-    indices = tuple(truncated_indices)
-    if truncated_index is not None:
-        indices = (truncated_index, *indices)
-    indices = tuple(dict.fromkeys(indices))
+    indices = tuple(dict.fromkeys(uncertain_indices))
     if not indices:
         return gated_difficulty_utility(
             values,
@@ -169,7 +165,7 @@ def robust_truncation_utility(
             or index < 0
             or index >= len(values)
         ):
-            raise ValueError("truncated index must identify one reward")
+            raise ValueError("uncertain index must identify one reward")
 
     lattice = tuple(dict.fromkeys(float(reward) for reward in attainable_rewards))
     if not lattice:
@@ -208,6 +204,29 @@ def robust_truncation_utility(
             )
         )
     return min(utilities)
+
+
+def robust_truncation_utility(
+    rewards: Iterable[float],
+    *,
+    sigma_min: float,
+    truncated_index: int | None = None,
+    truncated_indices: Iterable[int] = (),
+    attainable_rewards: Iterable[float] = (),
+    delta: float = 1.0,
+) -> float:
+    """Backward-compatible wrapper for truncation-specific callers."""
+
+    indices = tuple(truncated_indices)
+    if truncated_index is not None:
+        indices = (truncated_index, *indices)
+    return robust_uncertain_reward_utility(
+        rewards,
+        sigma_min=sigma_min,
+        uncertain_indices=indices,
+        attainable_rewards=attainable_rewards,
+        delta=delta,
+    )
 
 
 def conservative_difficulty_score(

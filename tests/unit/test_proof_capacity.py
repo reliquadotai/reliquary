@@ -35,8 +35,38 @@ def test_capacity_qualifier_help_runs_from_source_checkout(tmp_path):
     assert "--benchmark-device-count" in completed.stdout
 
 
+@pytest.mark.parametrize(
+    (
+        "profile_id",
+        "model_revision",
+        "rollout_count",
+        "representative_length",
+        "expected_proofs",
+    ),
+    (
+        (
+            "qwen35-4b-auction-v3",
+            "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+            8,
+            14_746,
+            18,
+        ),
+        (
+            "qwen3-4b-base-dapo-v4",
+            "906bfd4b4dc7f14ee4320094d8b41684abff8539",
+            16,
+            7_373,
+            34,
+        ),
+    ),
+)
 def test_capacity_qualifier_binds_full_representative_evidence(
     tmp_path,
+    profile_id,
+    model_revision,
+    rollout_count,
+    representative_length,
+    expected_proofs,
 ):
     script = (
         Path(__file__).resolve().parents[2]
@@ -48,26 +78,23 @@ def test_capacity_qualifier_binds_full_representative_evidence(
     software_revision = "b" * 40
     checkpoint_revision = "c" * 40
     rows = []
-    for environment, length in (
-        ("openmathinstruct", 14_746),
-        ("opencodeinstruct", 14_746),
-    ):
+    for environment in ("openmathinstruct", "opencodeinstruct"):
         for _index in range(20):
             rows.append({
                 "environment": environment,
                 "seconds": 1.0,
                 "proof_passed": True,
-                "profile_id": "qwen35-4b-auction-v3",
-                "model_revision": (
-                    "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
-                ),
+                "profile_id": profile_id,
+                "model_revision": model_revision,
                 "software_revision": software_revision,
                 "checkpoint_revision": checkpoint_revision,
                 "runtime_fingerprint_hash": "e" * 64,
                 "hardware_class": "NVIDIA H100 80GB HBM3",
                 "device_uuid": "GPU-EXACT",
-                "rollout_count": 8,
-                "completion_token_lengths": [length] * 8,
+                "rollout_count": rollout_count,
+                "completion_token_lengths": (
+                    [representative_length] * rollout_count
+                ),
             })
     payload = (
         "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n"
@@ -75,7 +102,7 @@ def test_capacity_qualifier_binds_full_representative_evidence(
     samples_path.write_bytes(payload)
     env = {
         **dict(os.environ),
-        "RELIQUARY_PROTOCOL_PROFILE": "qwen35-4b-auction-v3",
+        "RELIQUARY_PROTOCOL_PROFILE": profile_id,
     }
 
     completed = subprocess.run(
@@ -111,8 +138,8 @@ def test_capacity_qualifier_binds_full_representative_evidence(
     assert manifest["benchmark_device_uuids"] == ["gpu-exact"]
     assert manifest["samples_sha256"] == hashlib.sha256(payload).hexdigest()
     assert manifest["proofs_per_environment"] == {
-        "openmathinstruct": 18,
-        "opencodeinstruct": 18,
+        "openmathinstruct": expected_proofs,
+        "opencodeinstruct": expected_proofs,
     }
 
 

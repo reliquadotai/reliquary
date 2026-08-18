@@ -1,6 +1,7 @@
 from reliquary.validator.boxed_integrity import (
     extract_boxed_spans,
     has_malformed_final_answer,
+    is_missing_final_answer_box,
 )
 
 
@@ -36,9 +37,15 @@ def test_rewarded_rollout_never_flagged():
 
 
 def test_honest_no_box_not_flagged():
-    # No boxed at all = clean give-up (env falls back to trailing number).
+    # No boxed at all = off-format, but not structurally malformed.
     flagged, _ = has_malformed_final_answer(0.0, "I am not sure, maybe 7")
     assert flagged is False
+
+
+def test_missing_box_is_distinct_from_malformed_box():
+    assert is_missing_final_answer_box("I am not sure, maybe 7") is True
+    assert is_missing_final_answer_box(r"answer \boxed{7}") is False
+    assert is_missing_final_answer_box(r"answer \boxed{") is False
 
 
 def test_genuine_wrong_wellformed_box_not_flagged():

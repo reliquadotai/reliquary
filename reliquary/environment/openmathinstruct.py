@@ -387,13 +387,16 @@ def _compute_omi_reward(problem: dict, completion: str) -> float:
         if boxed is not None:
             candidate = _normalize_answer(_strip_boxed_wrapper(boxed))
         else:
-            # No "Answer:"-line channel on purpose: \boxed{} is the only span
-            # verify_boxed_answer_integrity can inspect (it returns True when no
-            # boxed range exists), so any other rewarded answer format would be
-            # an answer channel with no tamper guard — the one attack the
-            # forced-seed and distribution checks structurally cannot see.
-            # Fallback: trailing number / fraction at end of text
-            # (some models output the answer without boxing)
+            # v4 requires the format requested by the canonical prompt. The
+            # boxed span is the only reward-bearing region the validator's
+            # answer-integrity proof can authenticate, so every unboxed form
+            # scores zero. Older profiles retain their paid trailing-number
+            # behavior byte-for-byte through the explicit profile contract.
+            from reliquary.constants import MATH_ANSWER_FORMAT
+
+            if MATH_ANSWER_FORMAT == "boxed":
+                return 0.0
+            # Legacy fallback: trailing number / fraction at end of text.
             tail = completion.strip().split("\n")[-1].strip()
             m = re.match(r"^([\-\+]?\d+(?:\.\d+)?(?:/\d+)?)", tail)
             if m is None:

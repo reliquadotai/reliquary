@@ -121,6 +121,9 @@ def max_new_tokens_for_environment(environment: str) -> int:
 # (5/6) with better EOS rate, while 4096/256 was slower and lower reward.
 _MATH_PROFILE = ACTIVE_PROTOCOL_PROFILE.environments["openmathinstruct"]
 _MATH_BFT_PROFILE = _MATH_PROFILE.bft
+MATH_ANSWER_FORMAT = _MATH_PROFILE.answer_format
+if MATH_ANSWER_FORMAT not in ("boxed", "boxed_or_trailing_number"):
+    raise ValueError("openmathinstruct profile must declare an answer format")
 BFT_ENABLED = _MATH_BFT_PROFILE is not None
 # 2026-07 Qwen3.5-4B behavior study (held-out OMI, vLLM): the 4B thinks a median
 # of 3766 / p90 11297 tokens before </think>; a 2048 budget would force-cut ~45%
@@ -198,7 +201,9 @@ assert (
 # because it never opens one. One switch drives both encode_prompt and
 # render_canonical_prompt so the encoded tokens and prompt_content_sha256 can
 # never describe different prompts.
-RAW_COMPLETION_PROMPTS = PROTOCOL_VERSION >= 4
+RAW_COMPLETION_PROMPTS = ACTIVE_PROTOCOL_PROFILE.prompt_encoding == "raw"
+if ACTIVE_PROTOCOL_PROFILE.prompt_encoding not in ("raw", "chat_template"):
+    raise ValueError("protocol profile declares an unknown prompt encoding")
 
 # v4+ restricts the OMI manifest to the canonical `train-*` shards. The
 # train_1M/2M/5M shards are curated subsets OF train, so including them

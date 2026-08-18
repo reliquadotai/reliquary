@@ -79,7 +79,7 @@ docker logs watchtower | tail -20
 You need:
 
 - A GPU host with NVIDIA driver, CUDA 12.8+, and the NVIDIA Container Toolkit.
-- 1× A100 40 GB minimum, 64 GB RAM, 150 GB disk.
+- A capacity-qualified GPU fleet for the active profile, 64 GB RAM, and 150 GB disk. Protocol v4 qualification must cover 16-rollout, near-8192-token proofs and all 34 ranked-plus-forensic attempts per environment.
 - A public IP and an open inbound TCP port (default 8080) — miners must reach you.
 - HF Hub token with **write** access to your checkpoint repo.
 - R2 **write** credentials.
@@ -98,12 +98,17 @@ Trainer-specific `.env` keys (full list in `.env.example.trainer`):
 
 ```bash
 RELIQUARY_TRAIN=1
+RELIQUARY_PROTOCOL_PROFILE=qwen3-4b-base-dapo-v4
+RELIQUARY_CHECKPOINT=Qwen/Qwen3-4B-Base
 RELIQUARY_HF_REPO_ID=your-org/reliquary-sn   # HF repo to push checkpoints to
 HF_TOKEN=hf_xxx                              # write access to that repo
 RELIQUARY_EXTERNAL_IP=<your-public-ip>       # advertised on-chain
 RELIQUARY_EXTERNAL_PORT=8080
-# Optional — resume after a restart so miners don't reset to base:
-# RELIQUARY_RESUME_FROM=sha:<40-hex-hf-commit>
+# Required stamped activation/resume checkpoint for protocol v4:
+RELIQUARY_RESUME_FROM=sha:<40-hex-hf-commit>
+RELIQUARY_PROOF_DEVICES=<qualified-canonical-device-list>
+RELIQUARY_PROOF_CAPACITY_MANIFEST=/root/reliquary/state/proof-capacity.json
+RELIQUARY_PROOF_CAPACITY_MANIFEST_SHA256=<64-lowercase-hex>
 ```
 
 The CLI compatibility default remains `openmathinstruct`, but the production
@@ -121,28 +126,25 @@ caps, and operator/prompt dedup apply independently to both environments. Do not
 the mixed trainer until the image contains the grader rootfs, `runsc` starts
 successfully, and the loopback grader canaries pass.
 
-Training recovery also requires the complete pinned policy contract:
+Protocol v4 uses these pinned training defaults:
 
 ```bash
-RELIQUARY_KL_BASE_MODEL=Qwen/Qwen3.5-2B@15852e8c16360a2fea060d615a32b45270f8a8fc
-RELIQUARY_KL_BETA=0.01
-RELIQUARY_LEARNING_RATE=0.000003
+RELIQUARY_KL_BETA=0
+RELIQUARY_LEARNING_RATE=0.000001
 RELIQUARY_RECOMPUTE_PI_OLD_FROM_VERIFY=true
-RELIQUARY_GRAD_NORM_SKIP_THRESHOLD=50
-RELIQUARY_PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD=0.1
-RELIQUARY_CHECKPOINT_PUBLISH_INTERVAL_WINDOWS=4
+RELIQUARY_GRAD_NORM_SKIP_THRESHOLD=100
+RELIQUARY_PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD=0.5
+RELIQUARY_CHECKPOINT_PUBLISH_INTERVAL_WINDOWS=16
 RELIQUARY_SHAPE_PENALTY=0
 ```
 
-Those values describe the current 2B run. PR #162 carries a dormant,
-versioned 4B contract; do not assemble it from independent environment
-overrides. Its proof fleet, append-only base reset, coordinated miner cutover,
-and rollback procedure are defined in the
-[Qwen3.5-4B auction-v3 production runbook](4b-auction-v3-production-runbook.md).
-Auction-v3 refuses to start without a release-bound capacity manifest and
-profile-stamped checkpoint.
+Do not assemble v4 from independent environment overrides. The trainer refuses
+to start unless the selected checkpoint matches the profile, the activation
+checkpoint carries the v4 lineage stamp, and the exact proof fleet/runtime has
+a release-bound capacity manifest. Re-run qualification whenever the proof
+path, runtime fingerprint, checkpoint, or hardware identity changes.
 
-The four-step checkpoint cadence limits behavior-policy staleness. If the ratio
+The 16-step checkpoint cadence limits behavior-policy staleness. If the ratio
 gate still trips before cadence, the rejected update is excluded and the
 validator publishes only the previously accepted in-memory steps before
 resuming against the refreshed behavior policy.

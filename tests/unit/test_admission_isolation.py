@@ -450,6 +450,84 @@ def test_robust_code_utility_is_carried_out_of_preparation(monkeypatch):
     assert prepared.robust_utility > 0.0
 
 
+def test_unboxed_math_zero_cannot_manufacture_zone(monkeypatch):
+    """Deleting one final box cannot turn an all-correct group into an
+    economically eligible mixed-reward group."""
+    import reliquary.constants as constants
+    import reliquary.validator.admission as admission
+
+    request = _request()
+    rewards = [1.0] * 7 + [0.0]
+    for rollout, reward in zip(request.rollouts, rewards, strict=True):
+        rollout.reward = reward
+        rollout.commit["rollout"]["success"] = reward > 0.5
+        rollout.commit["rollout"]["total_reward"] = reward
+    parsed = ParsedSubmission(
+        request=request,
+        rollout_hashes=[],
+        selection_digest=compute_rollouts_selection_digest(request.rollouts),
+    )
+    monkeypatch.setattr(admission, "MATH_ANSWER_FORMAT", "boxed")
+    monkeypatch.setattr(constants, "MATH_ANSWER_FORMAT", "boxed")
+    monkeypatch.setattr(admission, "ROBUST_TRUNCATION_UTILITY_ENABLED", True)
+    # k=7/8 has sigma ~= 0.331: it passes the observed gate but the possible
+    # all-correct interpretation is degenerate and must force robust utility 0.
+    monkeypatch.setattr(admission, "SIGMA_MIN", 0.30)
+
+    prepared = score_and_finalize_submission(
+        parsed,
+        AdmissionRuntimeMaterials(
+            canonical_prompt_tokens=[1],
+            problem={"prompt": "prompt", "ground_truth": "4", "id": "p"},
+            completion_texts=[r"\boxed{4}"] * 7 + ["4"],
+        ),
+        _context(),
+        time.monotonic() + 5.0,
+    )
+
+    assert prepared.reject_reason is RejectReason.OUT_OF_ZONE
+    assert prepared.reject_stage == "zone"
+
+
+def test_unboxed_math_outcome_is_carried_as_auction_uncertainty(monkeypatch):
+    import reliquary.constants as constants
+    import reliquary.validator.admission as admission
+
+    request = _request()
+    parsed = ParsedSubmission(
+        request=request,
+        rollout_hashes=[],
+        selection_digest=compute_rollouts_selection_digest(request.rollouts),
+    )
+    monkeypatch.setattr(admission, "MATH_ANSWER_FORMAT", "boxed")
+    monkeypatch.setattr(constants, "MATH_ANSWER_FORMAT", "boxed")
+    monkeypatch.setattr(admission, "ROBUST_TRUNCATION_UTILITY_ENABLED", True)
+    monkeypatch.setattr(
+        admission,
+        "detect_opposite_reward_clones",
+        lambda *_args: SimpleNamespace(suspicious=False),
+    )
+
+    prepared = score_and_finalize_submission(
+        parsed,
+        AdmissionRuntimeMaterials(
+            canonical_prompt_tokens=[1],
+            problem={"prompt": "prompt", "ground_truth": "4", "id": "p"},
+            completion_texts=(
+                [r"\boxed{4}"] * 4 + [r"\boxed{5}"] * 3 + ["5"]
+            ),
+        ),
+        _context(),
+        time.monotonic() + 5.0,
+    )
+
+    assert prepared.reject_reason is None
+    assert prepared.unboxed_count == 1
+    assert prepared.attainable_rewards == (0.0, 1.0)
+    assert prepared.robust_utility is not None
+    assert prepared.robust_utility > 0.0
+
+
 def test_authenticated_termination_reject_keeps_identity_artifacts():
     request = _request()
     raw_body = request.model_dump_json().encode()
