@@ -1,9 +1,14 @@
 # Difficulty Auction v2 - Final Production Contract
 
+> **Historical design record.** Protocol v4 retains this document's
+> fixed-window, deferred-proof, uniform-slot mechanism, but its model, rollout
+> count, timing, thresholds, proof limits, and tie-break values are superseded.
+> The normative current description is [Concepts](../../concepts.md).
+
 - **Initial design:** 2026-07-15
 - **Finalized:** 2026-07-17
 - **Implementation branch:** `design/difficulty-auction-v2`
-- **Status:** production mechanism, enabled by default
+- **Status:** historical mechanism design; profile-specific values superseded by v4
 **Environment scope:** `openmathinstruct` and `opencodeinstruct`
 
 This document supersedes the rollout assumptions in the earlier auction plans

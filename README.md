@@ -88,11 +88,11 @@ The normative mechanism and rejection semantics live in
 [Concepts](docs/concepts.md). Historical design documents are evidence of how
 the protocol evolved; they are not the production contract.
 
-## What is live
+## Deployment status
 
 | Layer | State |
 | --- | --- |
-| Qwen3-4B Base DAPO v4 profile, deferred-proof auction, and GRAIL verification | **Live** |
+| Qwen3-4B Base DAPO v4 profile, deferred-proof auction, and GRAIL verification | **Release candidate — runtime gates pending** |
 | Mixed OpenMath + OpenCode collection and validator-authoritative rewards | **Live** |
 | Canonical prompt-content identity and one-shot cooldown | **Live** |
 | Utility telemetry | **Live, observation only** |
@@ -102,6 +102,7 @@ the protocol evolved; they are not the production contract.
 The observation-only utility foundation does not alter admission, ranking,
 selection, payout, or training. Its activation gates are documented in
 [Auction v3 Utility Foundation](docs/auction-v3-utility-foundation.md).
+Change the v4 row to **Live** only at the coordinated runtime activation.
 
 ## Trust and verification boundaries
 
@@ -156,7 +157,7 @@ running an operator workload.
 | [Mining](docs/mining.md) | Reference miner, submission lifecycle, hardware, and troubleshooting |
 | [Validating](docs/validating.md) | Weight-only and trainer deployment |
 | [Validator observability](docs/validator_observability.md) | Health, verdict, archive, and runtime evidence |
-| [Auction v2 production contract](docs/superpowers/specs/2026-07-15-difficulty-auction-v2-design.md) | Detailed selector and payout contract |
+| [Historical auction-v2 design](docs/superpowers/specs/2026-07-15-difficulty-auction-v2-design.md) | Origin of the fixed-window selector and payout mechanism; superseded values are non-normative |
 | [Utility foundation](docs/auction-v3-utility-foundation.md) | Observation-only research surface and activation gates |
 | [Security reports](docs/security/) | Incident chronology, hardening decisions, and operator evidence |
 
