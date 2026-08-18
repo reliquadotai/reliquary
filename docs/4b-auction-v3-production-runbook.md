@@ -1,7 +1,12 @@
 # Qwen3.5-4B Auction-v3 Production Runbook
 
+> **Historical and superseded.** This runbook records the protocol-v3 cutover
+> design for `qwen35-4b-auction-v3`; it is not an activation guide for the
+> Qwen3-4B Base DAPO v4 release candidate. Use [Validating](validating.md) and
+> [Mining](mining.md) for the current profile and runtime contract.
+
 **Date:** 2026-07-31
-**Status:** final design and activation contract for PR #162
+**Status:** superseded protocol-v3 design and activation record for PR #162
 
 ## Decision
 

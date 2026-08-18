@@ -112,7 +112,7 @@ Per-window randomness remains drand-derived and exposed by `/state`. Submissions
 
 Multiple distinct operators may enter the same prompt pool, bounded at ten groups, but only the first ranked candidate for that prompt that passes deferred proof can win. One operator may reserve only one logical claim per prompt; there is no per-operator winner cap. The active selector does not split a prompt slot among runners-up.
 
-Prompt uniqueness is canonical-content based, not index-only. The observation-only foundation for a future validator-authoritative utility tie-break is documented in [Auction v3 Utility Foundation](auction-v3-utility-foundation.md). It does not alter the auction-v2 order or payout.
+Prompt uniqueness is canonical-content based, not index-only. The observation-only foundation for a future validator-authoritative utility tie-break is documented in [Auction v3 Utility Foundation](auction-v3-utility-foundation.md). It does not alter the active v4 difficulty-auction order or payout.
 
 This removes the old hotkey-count dilution surface: extra hotkeys neither produce different forced draws, reserve additional operator/prompt claims, nor create additional equal-score tie tickets.
 

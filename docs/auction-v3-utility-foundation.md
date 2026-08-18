@@ -1,24 +1,26 @@
 # Auction v3 Utility Foundation
 
-Status: observation only. This foundation does not change auction-v2 ranking,
-selection, rewards, miner payloads, or training loss.
+Status: observation only. This foundation does not change the active protocol-v4
+difficulty-auction ranking, selection, rewards, miner payloads, or training loss.
 
 ## Decision
 
-Auction v2 remains the production mechanism:
+Protocol v4 retains the difficulty-auction mechanism:
 
 1. Rank by validator-computed difficulty.
-2. Rank equal scores by validator-observed precommit drand round.
+2. Rank equal scores by capped generated tokens per validator-observed elapsed
+   round, then validator-observed precommit arrival round.
 3. Resolve the remaining tie with post-deadline drand.
-4. Prove candidates top-down until at most eight distinct groups win.
+4. Prove candidates top-down until at most 16 distinct groups win.
 5. Select and reward exactly those winners, one uniform slot each. Clean
    checkpoint-consistent groups may enter the balanced training accumulator;
    quarantine can archive and credit a winner without training it.
 
-This is the correct production design while `k=2` groups share the same
-difficulty plateau. Rank-weighted payout would amplify timing rather than
-training value. Auction v3 should first produce a validator-authoritative
-utility ordering inside that plateau, then reconsider payout shape separately.
+This is the correct production design while binary groups with the same reward
+count share an exact difficulty plateau. Rank-weighted payout would amplify
+tie-break effects rather than training value. A future utility activation must
+first produce a validator-authoritative ordering inside that plateau, then
+reconsider payout shape separately.
 
 ## Canonical Content Identity
 
@@ -139,7 +141,7 @@ Run Math and Code independently. Do not pool their calibration.
 4. Fit a transparent regularized model first. Inputs may include NLL, entropy,
    natural termination, completion cost, degeneracy, content novelty, hidden
    shift, and reward-conditioned hidden shift.
-5. Evaluate top-eight utility uplift, rank correlation, held-out probe-loss
+5. Evaluate top-16 utility uplift, rank correlation, held-out probe-loss
    improvement, content diversity, operator concentration, and compute cost.
 6. Replay complete historical populations, including failed proofs and unfilled
    slots. Never evaluate only historical winners.
@@ -153,7 +155,7 @@ Minimum evidence before a utility tie-break can activate:
   utility fields below 1% on proven groups.
 - Proof-path p95 overhead below 5% and no admission, seal, or checkpoint
   regression.
-- Positive top-eight `U_step` uplift over all baselines with a block-bootstrap
+- Positive top-16 `U_step` uplift over all baselines with a block-bootstrap
   95% confidence interval above zero.
 - Stable effect direction across held-out checkpoints and separately for Math
   and Code.
@@ -167,9 +169,12 @@ forward benchmark could not be used because the older staging FLA/Triton image
 does not compile its kernel for Blackwell; production activation still requires
 the end-to-end p95 gate above on a supported runtime.
 
-## Proposed Auction v3 Order
+## Historical Proposed Utility Order
 
-The first activation should be deliberately narrow:
+This sketch predates the protocol-v4 throughput tie-break and is not an
+activation contract. Any future proposal must explicitly place a utility bucket
+relative to that throughput bucket and pass a fresh deterministic replay. The
+historical proposal was deliberately narrow:
 
 ```text
 difficulty descending
@@ -183,7 +188,7 @@ computed only from validator-derived inputs. The online score should initially
 reorder equal difficulty values only. It must not let a lower-difficulty group
 overtake a higher-difficulty group.
 
-Keep trained-only uniform payment for the eight selected winners. Consider a
+Keep trained-only uniform payment for the 16 selected winners. Consider a
 rank-weighted payout only after utility ranking has remained causally useful and
 economically stable through a separate replay and shadow proposal.
 
@@ -193,7 +198,8 @@ The future utility tie-break requires its own disabled-by-default flag, score
 version in `/health` and archives, deterministic replay fixture, and immutable
 image. It can activate at a window boundary without a miner wire update.
 
-Rollback immediately to auction v2 ordering for reward/training divergence,
+Rollback immediately to the active v4 difficulty-auction ordering for
+reward/training divergence,
 checkpoint interruption, proof-budget regression, unexplained concentration,
 or loss of deterministic replay. Canonical content identity and private
 observation remain useful and should not be rolled back with an experimental
