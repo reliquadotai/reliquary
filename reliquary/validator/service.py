@@ -2673,6 +2673,7 @@ class ValidationService:
                 "reject_reason": getattr(s, "reason", None) if rejected else None,
                 "reward_vector": getattr(s, "reward_vector", None),
                 "truncated_count": getattr(s, "truncated_count", None),
+                "unboxed_count": getattr(s, "unboxed_count", None),
                 "reward_shape": getattr(s, "reward_shape", None),
                 "difficulty_auction_value": difficulty_meta.get("value"),
                 "difficulty_auction_mean_reward": difficulty_meta.get(

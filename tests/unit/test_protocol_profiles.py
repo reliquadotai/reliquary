@@ -62,6 +62,7 @@ def test_versioned_profile_contracts(
     assert profile.protocol_version == protocol_version
     assert profile.collection_seconds == collection_seconds
     assert profile.upload_grace_seconds == 33
+    assert profile.prompt_encoding == "chat_template"
     assert profile.sampling == profiles.SamplingProfile(
         rollouts=8,
         temperature=0.6,
@@ -72,6 +73,7 @@ def test_versioned_profile_contracts(
 
     math = profile.environments["openmathinstruct"]
     assert math.max_new_tokens == math_cap
+    assert math.answer_format == "boxed_or_trailing_number"
     assert math.bft == profiles.BFTProfile(
         thinking_budget=thinking_budget,
         answer_budget=512,
@@ -81,6 +83,7 @@ def test_versioned_profile_contracts(
     code = profile.environments["opencodeinstruct"]
     assert code.max_new_tokens == code_cap
     assert code.bft is None
+    assert code.answer_format is None
 
 
 def test_default_resolver_and_environment_override(monkeypatch):
@@ -143,6 +146,11 @@ def test_generation_contract_is_json_safe_and_detached():
     assert json.loads(json.dumps(contract)) == contract
     assert profiles.to_generation_contract(profile) == contract
     assert profiles.to_generation_contract(profile.profile_id) == contract
+    assert contract["prompt_encoding"] == "chat_template"
+    assert (
+        contract["environments"]["openmathinstruct"]["answer_format"]
+        == "boxed_or_trailing_number"
+    )
 
     contract["sampling"]["rollouts"] = 999
     contract["environments"]["openmathinstruct"]["bft"][
@@ -164,6 +172,8 @@ def test_profiles_are_frozen_slotted_and_recursively_immutable():
 
     with pytest.raises(FrozenInstanceError):
         profile.protocol_version = 99
+    with pytest.raises(FrozenInstanceError):
+        profile.prompt_encoding = "raw"
     with pytest.raises(FrozenInstanceError):
         profile.sampling.temperature = 1.0
     with pytest.raises(FrozenInstanceError):
@@ -209,6 +219,8 @@ def test_profiles_are_frozen_slotted_and_recursively_immutable():
                 "b_batch": 8,
                 "max_submissions": 8,
                 "publish_interval": 4,
+                "prompt_encoding": "chat_template",
+                "answer_format": "boxed_or_trailing_number",
             },
         ),
         (
@@ -241,6 +253,8 @@ def test_profiles_are_frozen_slotted_and_recursively_immutable():
                 "b_batch": 8,
                 "max_submissions": 8,
                 "publish_interval": 4,
+                "prompt_encoding": "chat_template",
+                "answer_format": "boxed_or_trailing_number",
             },
         ),
         (
@@ -284,6 +298,8 @@ def test_profiles_are_frozen_slotted_and_recursively_immutable():
                 # 2·B_BATCH: cover every slot + one retry/improvement margin.
                 "max_submissions": 32,
                 "publish_interval": 16,
+                "prompt_encoding": "raw",
+                "answer_format": "boxed",
             },
         ),
     ],
@@ -320,6 +336,8 @@ print(json.dumps({
     "b_batch": c.B_BATCH,
     "max_submissions": c.MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
     "publish_interval": c.CHECKPOINT_PUBLISH_INTERVAL_WINDOWS,
+    "prompt_encoding": c.ACTIVE_PROTOCOL_PROFILE.prompt_encoding,
+    "answer_format": c.MATH_ANSWER_FORMAT,
 }))
 """
     # Drop inherited RELIQUARY_* overrides — several pinned constants are

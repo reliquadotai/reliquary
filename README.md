@@ -10,7 +10,7 @@
 
 <p align="center">
   <strong>Verified frontier search for decentralized language-model training.</strong><br />
-  Eight trajectories per prompt. Validator-authoritative rewards. Public evidence at every boundary.
+  Sixteen trajectories per prompt. Validator-authoritative rewards. Public evidence at every boundary.
 </p>
 
 <p align="center">
@@ -33,7 +33,7 @@
   ·
   <a href="https://www.reliqua.ai/research">Research</a>
   ·
-  <a href="https://huggingface.co/ReliquaryForge/qwen3.5-2b-reliquary-v3">Model</a>
+  <a href="https://huggingface.co/Qwen/Qwen3-4B-Base">Base model</a>
   ·
   <a href="https://github.com/orgs/reliquadotai/packages/container/package/reliquary-validator">Container</a>
   ·
@@ -64,24 +64,24 @@ use.
   />
 </p>
 
-1. **Collect.** Math and Code each accept candidates for a fixed 100-second
-   interval. Every group contains exactly eight rollouts.
+1. **Collect.** Math and Code each accept candidates for a fixed 150-second
+   interval. Every group contains exactly 16 rollouts.
 2. **Grade.** The validator recomputes Math rewards and executes Code cases in
    its sandbox. Groups below the reward-variance gate are rejected.
 3. **Rank.** In-zone groups rank by
-   `std(rewards) × (1 − mean(rewards))`, then validator-observed precommit
-   round, then a post-deadline drand tie-break.
+   `std(rewards) × (1 − mean(rewards))`; equal values use a capped throughput
+   bucket, validator-observed arrival round, then a post-deadline drand tie-break.
 4. **Prove.** Economic proof runs top-down only for candidates that can still
    win. A bounded, unpaid non-winner sample is also proven for forensic
    telemetry and cannot affect the auction.
-5. **Select and reward.** At most eight content-distinct groups win per
+5. **Select and reward.** At most 16 content-distinct groups win per
    environment. Each winner receives one uniform slot. There is no active
    runner-up split or per-operator winner cap; unfilled slots burn.
 6. **Retain and train.** Clean winners accumulate under one exact public
    checkpoint until both environment targets are full. Quarantined selections
    remain archived and credited but never enter the optimizer.
 7. **Publish.** Accepted optimizer steps produce a Hugging Face checkpoint. The
-   default cadence is four trained steps, with an earlier safe publication when
+   default cadence is 16 trained steps, with an earlier safe publication when
    the behavior-policy drift gate requires it.
 
 The normative mechanism and rejection semantics live in
@@ -92,7 +92,7 @@ the protocol evolved; they are not the production contract.
 
 | Layer | State |
 | --- | --- |
-| Auction v2, forced-sampling protocol v2, GRAIL verification | **Live** |
+| Qwen3-4B Base DAPO v4 profile, deferred-proof auction, and GRAIL verification | **Live** |
 | Mixed OpenMath + OpenCode collection and validator-authoritative rewards | **Live** |
 | Canonical prompt-content identity and one-shot cooldown | **Live** |
 | Utility telemetry | **Live, observation only** |

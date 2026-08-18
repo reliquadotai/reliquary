@@ -147,11 +147,14 @@ if [[ "${RELIQUARY_TRAIN:-0}" == "1" ]]; then
   : "${RELIQUARY_HF_REPO_ID:?RELIQUARY_HF_REPO_ID required in trainer mode}"
   args+=(
     --train
-    --checkpoint   "${RELIQUARY_CHECKPOINT:-Qwen/Qwen3.5-2B}"
     --hf-repo-id   "${RELIQUARY_HF_REPO_ID}"
     --http-host    "${RELIQUARY_HTTP_HOST:-0.0.0.0}"
     --http-port    "${RELIQUARY_HTTP_PORT:-8080}"
   )
+  # When unset, let the CLI derive the checkpoint from the active immutable
+  # protocol profile. A hard-coded fallback here silently paired v4 with the
+  # old Qwen3.5 checkpoint.
+  [[ -n "${RELIQUARY_CHECKPOINT:-}" ]] && args+=(--checkpoint "${RELIQUARY_CHECKPOINT}")
   [[ -n "${RELIQUARY_EXTERNAL_IP:-}" ]]   && args+=(--external-ip   "${RELIQUARY_EXTERNAL_IP}")
   [[ -n "${RELIQUARY_EXTERNAL_PORT:-}" ]] && args+=(--external-port "${RELIQUARY_EXTERNAL_PORT}")
   [[ -n "${RELIQUARY_RESUME_FROM:-}" ]]   && args+=(--resume-from   "${RELIQUARY_RESUME_FROM}")

@@ -21,8 +21,8 @@ Validator submit logs use the `validator_submit_lifecycle` event with a
 - `candidate_rejected`: the validator made a final reject decision. Read
   `reject_stage` and `reject_reason` together; for `batch_filled`, also read
   `batch_filled_reason`, `current_valid_count`, and `trigger_round`.
-- `seal_triggered`: legacy-selector stage only. Auction environments seal on
-  the 100-second collection deadline and bounded queue drain.
+- `seal_triggered`: legacy-selector stage only. Protocol-v4 auction environments
+  seal on the 150-second collection deadline and bounded queue drain.
 - `auction_finalized`: seal-time result for every pending candidate. Read
   `canonical_rank`, `auction_status`, `selected_for_batch`, and `rewarded`.
 - `final_batch_selected`: final auction ordering has run. A submission

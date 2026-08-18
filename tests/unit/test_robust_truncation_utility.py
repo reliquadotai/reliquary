@@ -1,4 +1,4 @@
-"""Exact robust valuation of one truncated rollout."""
+"""Exact robust valuation of uncertain rollout outcomes."""
 
 from itertools import permutations, product
 
@@ -9,6 +9,7 @@ from reliquary.validator.difficulty_auction import (
     fractional_reward_lattice,
     gated_difficulty_utility,
     robust_truncation_utility,
+    robust_uncertain_reward_utility,
 )
 
 
@@ -167,6 +168,29 @@ def test_no_truncation_is_the_plain_gated_utility():
         rewards,
         sigma_min=0.43,
     ) == gated_difficulty_utility(rewards, sigma_min=0.43)
+
+
+def test_v4_missing_box_cannot_manufacture_a_non_degenerate_group():
+    rewards = [1.0] * 15 + [0.0]
+
+    assert gated_difficulty_utility(rewards, sigma_min=0.24) > 0.0
+    assert robust_uncertain_reward_utility(
+        rewards,
+        sigma_min=0.24,
+        uncertain_indices=(15,),
+        attainable_rewards=(0.0, 1.0),
+    ) == 0.0
+
+
+def test_v4_genuine_frontier_group_survives_one_off_format_outcome():
+    rewards = [1.0] * 4 + [0.0] * 12
+
+    assert robust_uncertain_reward_utility(
+        rewards,
+        sigma_min=0.24,
+        uncertain_indices=(15,),
+        attainable_rewards=(0.0, 1.0),
+    ) > 0.0
 
 
 @pytest.mark.parametrize("total_tests", (0, -1, 1.5, True))

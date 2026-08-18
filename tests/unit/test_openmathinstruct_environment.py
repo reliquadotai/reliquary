@@ -118,7 +118,7 @@ def test_normalize_handles_none():
 
 
 # ---------------------------------------------------------------------------
-# Reward function — exercises both \boxed{} and plain-tail fallback paths.
+# Reward function — legacy profiles accept both \boxed{} and a plain tail.
 # ---------------------------------------------------------------------------
 
 def test_reward_correct_boxed():
@@ -474,6 +474,7 @@ def test_load_dataset_keeps_the_whole_listing_pre_v4(monkeypatch):
 def _v4_grader(monkeypatch):
     import reliquary.constants as C
     monkeypatch.setattr(C, "RAW_COMPLETION_PROMPTS", True)
+    monkeypatch.setattr(C, "MATH_ANSWER_FORMAT", "boxed")
 
 
 def test_normalize_strips_inline_latex_delimiters(_v4_grader):
@@ -496,6 +497,18 @@ def test_answer_line_without_box_scores_zero(_v4_grader):
                                "reasoning...\n**Answer:** 0") == 0.0
     assert _compute_omi_reward({"ground_truth": r"\frac{14}{3}"},
                                r"Answer: \(\frac{14}{3}\)") == 0.0
+
+
+def test_plain_trailing_answer_without_box_scores_zero(_v4_grader):
+    """Removing the Answer: cue must not reopen the unguarded channel."""
+    from reliquary.environment.openmathinstruct import _compute_omi_reward
+
+    assert _compute_omi_reward(
+        {"ground_truth": "42"}, "Step 1: compute.\n42"
+    ) == 0.0
+    assert _compute_omi_reward(
+        {"ground_truth": "3/4"}, "Therefore the result is\n3/4"
+    ) == 0.0
 
 
 def test_boxed_answer_still_scores(_v4_grader):
@@ -523,9 +536,12 @@ def test_v3_grader_unchanged_by_v4_extraction(monkeypatch):
         _normalize_answer,
     )
     monkeypatch.setattr(C, "RAW_COMPLETION_PROMPTS", False)
+    monkeypatch.setattr(C, "MATH_ANSWER_FORMAT", "boxed_or_trailing_number")
 
     assert _compute_omi_reward({"ground_truth": "42"},
                                "Step 1.\nAnswer: 42") == 0.0
+    assert _compute_omi_reward({"ground_truth": "42"},
+                               "Step 1.\n42") == 1.0
     # delimiters are NOT stripped on v3 — left intact
     assert _normalize_answer(r"\(x\)") == r"\(x\)"
 

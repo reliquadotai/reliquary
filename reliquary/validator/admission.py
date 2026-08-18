@@ -24,6 +24,7 @@ from reliquary.constants import (
     BFT_ANSWER_BUDGET,
     BFT_THINKING_BUDGET,
     GRADER_EVAL_TIMEOUT_SECONDS,
+    MATH_ANSWER_FORMAT,
     ROBUST_TRUNCATION_UTILITY_ENABLED,
     SIGMA_MIN,
     max_new_tokens_for_environment,
@@ -45,7 +46,10 @@ from reliquary.protocol.submission import (
     CommitModel,
     RejectReason,
 )
-from reliquary.validator.boxed_integrity import has_malformed_final_answer
+from reliquary.validator.boxed_integrity import (
+    has_malformed_final_answer,
+    is_missing_final_answer_box,
+)
 from reliquary.validator.dedup import compute_rollout_hash
 from reliquary.validator.rollout_patterns import detect_opposite_reward_clones
 from reliquary.validator.selection_digest import (
@@ -132,6 +136,9 @@ class PreparedSubmission:
     # no gradeable answer, and a miner can create one on purpose).
     truncated_count: int = 0
     truncated_index: int | None = None
+    # Math completions with no box score zero, but are uncertain for auction
+    # eligibility so deleting a box cannot manufacture useful variance.
+    unboxed_count: int = 0
     attainable_rewards: tuple[float, ...] = ()
     robust_utility: float | None = None
 
@@ -835,15 +842,30 @@ def score_and_finalize_submission(
 
             rewards = [float(rollout.reward) for rollout in request.rollouts]
             truncated_indices = truncated_rollout_indices(request, context)
+            unboxed_indices = (
+                tuple(
+                    index
+                    for index, text in enumerate(materials.completion_texts)
+                    if is_missing_final_answer_box(text)
+                )
+                if (
+                    context.environment == "openmathinstruct"
+                    and MATH_ANSWER_FORMAT == "boxed"
+                )
+                else ()
+            )
+            uncertain_indices = tuple(
+                dict.fromkeys((*truncated_indices, *unboxed_indices))
+            )
             robust_utility: float | None = None
             attainable_rewards: tuple[float, ...] = ()
             if (
                 ROBUST_TRUNCATION_UTILITY_ENABLED
-                and truncated_indices
+                and uncertain_indices
             ):
                 from reliquary.validator.difficulty_auction import (
                     fractional_reward_lattice,
-                    robust_truncation_utility,
+                    robust_uncertain_reward_utility,
                 )
 
                 total_tests = (
@@ -852,14 +874,14 @@ def score_and_finalize_submission(
                     else 1
                 )
                 attainable_rewards = fractional_reward_lattice(total_tests)
-                robust_utility = robust_truncation_utility(
+                robust_utility = robust_uncertain_reward_utility(
                     rewards,
                     sigma_min=(
                         BOOTSTRAP_SIGMA_MIN
                         if context.bootstrap
                         else SIGMA_MIN
                     ),
-                    truncated_indices=truncated_indices,
+                    uncertain_indices=uncertain_indices,
                     attainable_rewards=attainable_rewards,
                 )
             in_zone = (
@@ -941,6 +963,7 @@ def score_and_finalize_submission(
                 truncated_index=(
                     truncated_indices[0] if truncated_indices else None
                 ),
+                unboxed_count=len(unboxed_indices),
                 attainable_rewards=attainable_rewards,
                 robust_utility=robust_utility,
                 body_parse_ms=parsed.body_parse_ms,

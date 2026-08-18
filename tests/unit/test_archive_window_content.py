@@ -445,6 +445,80 @@ async def test_archive_includes_per_rollout_hash():
 
 
 @pytest.mark.asyncio
+async def test_unboxed_zero_stays_in_archive_and_trainer_input():
+    from reliquary.validator.service import ValidationService
+    from reliquary.validator.training import _training_rewards
+    from reliquary.validator.training_accumulator import (
+        BalancedTrainingAccumulator,
+    )
+
+    fake_tok = MagicMock()
+    fake_tok.eos_token_id = 99
+    svc = ValidationService(
+        wallet=_FakeWallet(), model=MagicMock(), tokenizer=fake_tok,
+        env=_FakeEnv(), netuid=99,
+    )
+
+    selected = _valid_submission(prompt_idx=43, k=4)
+    selected.unboxed_count = 1
+    selected.completion_texts[-1] = "off-format final answer: 5"
+
+    accumulator = BalancedTrainingAccumulator({"openmathinstruct": 1})
+    accumulator.add_window(
+        {"openmathinstruct": [selected]},
+        window_n=500,
+        checkpoint_revision="checkpoint",
+    )
+    trainer_group = accumulator.training_batches(
+        ["openmathinstruct"]
+    )[0][0]
+
+    assert trainer_group is selected
+    assert trainer_group.rollouts[-1].reward == 0.0
+    assert _training_rewards(trainer_group.rollouts)[-1] == 0.0
+
+    class _FakeBatcher:
+        window_start = 500
+        randomness = "abcd"
+        window_opened_at = 0.0
+        window_opened_wall_ts = 1_000.0
+        difficulty_auction_enabled = True
+        reject_counts: dict = {}
+        rejected_submissions: list = []
+
+        def valid_submissions(self):
+            return [selected]
+
+    batcher = _FakeBatcher()
+    batcher.selection_metadata_by_id = {
+        id(selected): {"selected_for_batch": True, "rewarded": True}
+    }
+    # This is the conservative value used for ranking, deliberately distinct
+    # from the canonical zero carried by the off-format rollout.
+    batcher.difficulty_auction_metadata_by_id = {
+        id(selected): {"value": 0.123, "eligible": True}
+    }
+
+    captured = {}
+
+    class _StubQueue:
+        def enqueue(self, _window, archive):
+            captured["archive"] = archive
+
+    with patch(
+        "reliquary.infrastructure.archive_queue.get_archive_queue",
+        return_value=_StubQueue(),
+    ):
+        await svc._archive_window(batcher, [selected])
+
+    entry = captured["archive"]["batch"][0]
+    assert entry["rollouts"][-1]["reward"] == 0.0
+    assert entry["unboxed_count"] == 1
+    assert entry["difficulty_auction_value"] == pytest.approx(0.123)
+    assert selected.rollouts[-1].reward == 0.0
+
+
+@pytest.mark.asyncio
 async def test_archive_includes_late_drops_and_clears_counter():
     """First archive snapshot captures recorded late drops and resets the
     counter; a subsequent archive with no events emits an empty dict."""

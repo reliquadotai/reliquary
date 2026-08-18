@@ -43,6 +43,8 @@ print(json.dumps({
     "overlong_factor": c.OVERLONG_PENALTY_FACTOR,
     "overlong_cache": c.OVERLONG_PENALTY_CACHE_TOKENS,
     "raw_prompts": c.RAW_COMPLETION_PROMPTS,
+    "prompt_encoding": c.ACTIVE_PROTOCOL_PROFILE.prompt_encoding,
+    "answer_format": c.MATH_ANSWER_FORMAT,
     "omi_train_only": c.OMI_TRAIN_SHARDS_ONLY,
     "opt_8bit": c.OPTIMIZER_STATE_8BIT,
     "sigma_min": c.SIGMA_MIN,
@@ -115,6 +117,8 @@ def test_v4_profile_is_internally_coherent():
         "sampling_median_max": 0.05,
         "sampling_q10_max": 0.0002,
         "raw_prompts": True,
+        "prompt_encoding": "raw",
+        "answer_format": "boxed",
         "omi_train_only": True,
         # The premise clip-higher rests on.
         "warp_is_identity": True,
@@ -130,6 +134,8 @@ def test_v3_profile_keeps_its_own_coherent_shape():
     assert got["kl_beta"] == 0.01
     assert got["clip_high"] == 0.2
     assert got["raw_prompts"] is False
+    assert got["prompt_encoding"] == "chat_template"
+    assert got["answer_format"] == "boxed_or_trailing_number"
     assert got["omi_train_only"] is False
     assert got["opt_8bit"] is True
     assert got["sigma_min"] == 0.43

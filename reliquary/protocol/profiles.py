@@ -34,6 +34,7 @@ class BFTProfile:
 class EnvironmentProfile:
     max_new_tokens: int
     bft: BFTProfile | None
+    answer_format: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +79,7 @@ class ProtocolProfile:
     protocol_version: int
     collection_seconds: int
     upload_grace_seconds: int
+    prompt_encoding: str
     sampling: SamplingProfile
     environments: Mapping[str, EnvironmentProfile]
     throughput_tiebreak: ThroughputTiebreakProfile | None = None
@@ -99,6 +101,7 @@ class ProtocolProfile:
             bft = environment.bft
             environments[name] = {
                 "max_new_tokens": environment.max_new_tokens,
+                "answer_format": environment.answer_format,
                 "bft": (
                     None
                     if bft is None
@@ -115,6 +118,7 @@ class ProtocolProfile:
             "model_id": self.model_id,
             "model_revision": self.model_revision,
             "protocol_version": self.protocol_version,
+            "prompt_encoding": self.prompt_encoding,
             "throughput_tiebreak": (
                 None
                 if self.throughput_tiebreak is None
@@ -175,10 +179,12 @@ _PROFILE_VALUES = (
         protocol_version=2,
         collection_seconds=100,
         upload_grace_seconds=33,
+        prompt_encoding="chat_template",
         sampling=_SAMPLING,
         environments={
             "openmathinstruct": EnvironmentProfile(
                 max_new_tokens=32768,
+                answer_format="boxed_or_trailing_number",
                 bft=BFTProfile(
                     thinking_budget=2048,
                     answer_budget=512,
@@ -198,10 +204,12 @@ _PROFILE_VALUES = (
         protocol_version=3,
         collection_seconds=300,
         upload_grace_seconds=33,
+        prompt_encoding="chat_template",
         sampling=_SAMPLING,
         environments={
             "openmathinstruct": EnvironmentProfile(
                 max_new_tokens=16384,
+                answer_format="boxed_or_trailing_number",
                 bft=BFTProfile(
                     thinking_budget=15616,
                     answer_budget=512,
@@ -237,6 +245,7 @@ _PROFILE_VALUES = (
         # cap-hit rate as the thermostat before raising them.
         collection_seconds=150,
         upload_grace_seconds=33,
+        prompt_encoding="raw",
         sampling=_SAMPLING_DAPO,
         environments={
             # No BFT anywhere: the base model emits no <think>, so there is no
@@ -245,6 +254,7 @@ _PROFILE_VALUES = (
             "openmathinstruct": EnvironmentProfile(
                 max_new_tokens=8192,
                 bft=None,
+                answer_format="boxed",
             ),
             "opencodeinstruct": EnvironmentProfile(
                 max_new_tokens=8192,
