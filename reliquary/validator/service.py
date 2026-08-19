@@ -1281,7 +1281,7 @@ class ValidationService:
                 **open_kwargs,
             )
             batcher.current_checkpoint_hash = cp_hash
-            if self._gpu_backlog is not None:
+            if getattr(self, "_gpu_backlog", None) is not None:
                 # Pipelined: the stashed window's side effects have not
                 # committed yet. Project its admitted prompts into this
                 # window's cooldown snapshot so /state advertises them and
@@ -3214,6 +3214,7 @@ class ValidationService:
         failure_stage: str,
         failure_type: str,
         batchers: dict | None = None,
+        late_drops: dict | None = None,
     ) -> None:
         """Durably record an opened window that could not complete.
 
@@ -3333,7 +3334,11 @@ class ValidationService:
             "training_kl_reference": kl_reference,
             "late_drops": {
                 hotkey: dict(counts)
-                for hotkey, counts in getattr(self, "_late_drops", {}).items()
+                for hotkey, counts in (
+                    late_drops
+                    if late_drops is not None
+                    else getattr(self, "_late_drops", {})
+                ).items()
             },
         }
         from reliquary.infrastructure.archive_queue import get_archive_queue
@@ -3553,6 +3558,7 @@ class ValidationService:
                                     failure_stage="pipelined_train_archive",
                                     failure_type="FatalProofPlaneError",
                                     batchers=stashed_batchers,
+                                    late_drops=stashed_drops,
                                 )
                             except Exception:
                                 logger.exception(
@@ -3579,6 +3585,7 @@ class ValidationService:
                                     failure_stage="pipelined_train_archive",
                                     failure_type="PipelinedTrainFailure",
                                     batchers=stashed_batchers,
+                                    late_drops=stashed_drops,
                                 )
                             except Exception:
                                 logger.exception(
@@ -3726,6 +3733,7 @@ class ValidationService:
                                     failure_stage="pipelined_train_archive",
                                     failure_type="PipelinedSalvageFailure",
                                     batchers=_sb,
+                                    late_drops=_sd,
                                 )
                             except Exception:
                                 logger.exception(
