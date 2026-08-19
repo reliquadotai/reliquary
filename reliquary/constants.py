@@ -1087,6 +1087,19 @@ RECOMPUTE_PI_OLD_FROM_VERIFY = _os.environ.get(
     "RELIQUARY_RECOMPUTE_PI_OLD_FROM_VERIFY", "true"
 ).strip().lower() in ("1", "true", "yes", "on")
 
+# Reuse the seal-time verify-pass logprobs as pi_old instead of re-running the
+# behavior forward in train_step. The verifier already computes, on the SAME
+# frozen verify_model and the same tokens, the raw (T=1) log-softmax of every
+# completion token during GRAIL proofs; recomputing it at train time is a
+# second identical no-grad forward. Definitionally equal to the behavior
+# forward for any profile (both are raw log-softmax of verify_model); the only
+# delta is bf16 batch-shape noise (~1e-2 logprob), far inside the clip band.
+# Rollouts lacking attached verify logprobs fall back to the behavior forward
+# (never to miner-claimed values). Kill-switch, no redeploy: set to 0.
+PI_OLD_FROM_VERIFY_LOGPROBS = _os.environ.get(
+    "RELIQUARY_PI_OLD_FROM_VERIFY_LOGPROBS", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+
 # Optional persistent canary ceiling. When non-zero, a validator whose current
 # published checkpoint is already at or above this number keeps serving and
 # accumulating but performs no further optimizer steps. Unlike an in-process

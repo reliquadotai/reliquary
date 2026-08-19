@@ -276,6 +276,15 @@ def _reward_matches_claim(actual: float, claimed: float, *, tolerance: float = 1
     )
 
 
+def _verify_logprobs_for_training(proof, completion_length: int):
+    """The proof's raw chosen-token logprobs, iff they cover every completion
+    token; otherwise None so training falls back to the behavior forward."""
+    values = list(getattr(proof, "completion_chosen_logprobs_raw", []) or [])
+    if completion_length <= 0 or len(values) != completion_length:
+        return None
+    return values
+
+
 def _forced_seed_verdict(n_stoch: int, n_match: int, enforce: bool) -> bool:
     """True => reject the group for seed mismatch. Abstains on thin signal;
     shadow (never rejects) when enforcement is off."""
@@ -2868,6 +2877,7 @@ class GrpoWindowBatcher:
             # ran in the cheap admission phase — see ``_accept_locked``.)
             rollout._validated_force_span = None
             rollout._validated_termination_path = None
+            rollout._validated_completion_logprobs = None
             # Per-position forced-seed uniforms for this rollout's teacher-forced
             # consistency check. Read completion_length here (ahead of the
             # ``completion_len`` computed later at the sparse-outputs section)
@@ -2927,6 +2937,9 @@ class GrpoWindowBatcher:
                     )
                 else:
                     raise
+            rollout._validated_completion_logprobs = (
+                _verify_logprobs_for_training(proof, _seed_completion_len)
+            )
             grp_stoch += proof.seed_n_stochastic
             grp_match += proof.seed_n_match
             seed_per_rollout.append((proof.seed_n_stochastic, proof.seed_n_match))
