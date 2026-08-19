@@ -645,6 +645,11 @@ class ValidationService:
         # training control, so it is immutable and fail-closed. Empty config keeps
         # the legacy rolling reference (verify_model) exactly as before.
         self.base_ref_model = None
+        # Pipelined window collection: the sealed-window GPU work stashed for
+        # the next loop iteration, and the verify-model swap deferred until
+        # the last window generated under the previous checkpoint is proven.
+        self._gpu_backlog: tuple[dict, int] | None = None
+        self._pending_verify_swap = None
         self.kl_reference_state: dict[str, Any] = {
             "schema_version": 1,
             "mode": "rolling",
@@ -906,6 +911,30 @@ class ValidationService:
         for parameter in self.verify_model.parameters():
             parameter.requires_grad = False
         self._verify_model_checkpoint_revision = checkpoint_revision
+
+    async def _apply_deferred_verify_swap(self, revision: str) -> None:
+        """Certify the pending published checkpoint on the verify plane.
+
+        Called from the pipelined GPU half once no window generated under the
+        previous checkpoint remains unproven. In-place weight copy plus proof
+        replica synchronisation — the same sequence the serial path runs
+        inline at publish.
+        """
+        try:
+            self._refresh_verify_model_from_train(revision)
+        except (AttributeError, RuntimeError):
+            logger.exception(
+                "deferred verify_model refresh failed; verify plane is stale "
+                "wrt published revision %s", revision[:12],
+            )
+            raise
+        if self.proof_scheduler is not None:
+            await asyncio.to_thread(self._synchronize_proof_models, revision)
+        self._pending_verify_swap = None
+        self._pending_verify_swap_age = 0
+        logger.info(
+            "Deferred verify swap applied: revision %s", revision[:12],
+        )
 
     def _synchronize_proof_models(self, checkpoint_revision: str) -> None:
         """Quiesce, refresh every replica, then atomically resume proving."""
@@ -1968,9 +1997,35 @@ class ValidationService:
 
         batcher._auction_final_verdicts_published = True
 
-    async def _train_and_publish(self) -> None:
-        """TRAINING + PUBLISHING + READY phases."""
-        if not self._active_batchers:
+    async def _train_and_publish(
+        self,
+        batchers: dict | None = None,
+        window_n: int | None = None,
+    ) -> None:
+        """TRAINING + PUBLISHING + READY phases for one sealed window."""
+        # Pipelined mode passes the SEALED window's batchers explicitly while
+        # self._active_batchers already points at the next, collecting window.
+        # owns_routing gates every mutation of the live routing state: the GPU
+        # half of a stashed window must never clear the collecting window's
+        # batchers out from under the HTTP server.
+        owns_routing = batchers is None
+        if batchers is None:
+            batchers = self._active_batchers
+        if window_n is None:
+            window_n = self._window_n
+        pending_swap_due = getattr(self, "_pending_verify_swap", None)
+        if pending_swap_due is not None:
+            self._pending_verify_swap_age = (
+                getattr(self, "_pending_verify_swap_age", 0) + 1
+            )
+            if self._pending_verify_swap_age >= 2:
+                # The back-half that should have applied this swap aborted:
+                # every window generated under the old checkpoint is gone, and
+                # THIS window needs the new revision. Certify before proving.
+                await self._apply_deferred_verify_swap(pending_swap_due)
+                pending_swap_due = None
+
+        if not batchers:
             logger.warning("_train_and_publish called with no active batchers")
             return
 
@@ -1986,39 +2041,41 @@ class ValidationService:
                 logger.warning(
                     "Window %d: drand verify still running at train-time; "
                     "proceeding without final verdict (will check flag below)",
-                    self._window_n,
+                    window_n,
                 )
         # Check if any batcher has been invalidated (beacon_invalid propagated
         # to all batchers by _verify_beacon_async, so checking any one suffices).
-        if any(b.beacon_invalid for b in self._active_batchers.values()):
+        if any(b.beacon_invalid for b in batchers.values()):
             logger.error(
                 "Window %d: dropping seal+train+archive — beacon invalid",
-                self._window_n,
+                window_n,
             )
             self._enqueue_aborted_window(
                 failure_stage="beacon_verification",
                 failure_type="InvalidBeacon",
             )
-            self.server.set_active_batchers({})
-            self._active_batchers = {}
+            if owns_routing:
+                self.server.set_active_batchers({})
+                self._active_batchers = {}
             self._set_state(WindowState.READY)
             return
 
         if any(
             bool(getattr(b, "auction_admission_aborted", False))
-            for b in self._active_batchers.values()
+            for b in batchers.values()
         ):
             logger.error(
                 "Window %d: admission drain aborted; skipping ranking, "
                 "rewards, training and checkpoint publication",
-                self._window_n,
+                window_n,
             )
             self._enqueue_aborted_window(
                 failure_stage="admission_drain",
                 failure_type="AdmissionDrainTimeout",
             )
-            self.server.set_active_batchers({})
-            self._active_batchers = {}
+            if owns_routing:
+                self.server.set_active_batchers({})
+                self._active_batchers = {}
             self._set_state(WindowState.READY)
             return
 
@@ -2043,12 +2100,12 @@ class ValidationService:
         # and keys the forensic sample. If the bounded fetch fails, exact
         # validator precommit arrival orders ties and forensics are disabled.
         seal_randomness = await self._fetch_seal_randomness()
-        for b in self._active_batchers.values():
+        for b in batchers.values():
             b.seal_randomness = seal_randomness
         # Both environments submit their strict rank order to one global,
         # device-owning scheduler. The scheduler applies decisions in rank
         # order even when distinct replicas finish out of order.
-        seal_items = tuple(self._active_batchers.items())
+        seal_items = tuple(batchers.items())
         if self.proof_scheduler is None:
             # Exact v2 compatibility: both batchers share one verify model.
             seal_results = []
@@ -2080,7 +2137,7 @@ class ValidationService:
                 "proof_capacity_abort_reason",
                 None,
             )
-            for name, batcher in self._active_batchers.items()
+            for name, batcher in batchers.items()
             if bool(
                 getattr(batcher, "proof_capacity_aborted", False)
             )
@@ -2098,20 +2155,21 @@ class ValidationService:
                 or "faulted"
             )
         if proof_capacity_aborts:
-            for batcher in self._active_batchers.values():
+            for batcher in batchers.values():
                 batcher.discard_seal_side_effects()
             logger.error(
                 "Window %d: proof capacity aborted %s; skipping rewards, "
                 "training and checkpoint publication",
-                self._window_n,
+                window_n,
                 proof_capacity_aborts,
             )
             self._enqueue_aborted_window(
                 failure_stage="proof_capacity",
                 failure_type="ProofCapacityAbort",
             )
-            self.server.set_active_batchers({})
-            self._active_batchers = {}
+            if owns_routing:
+                self.server.set_active_batchers({})
+                self._active_batchers = {}
             self._set_state(WindowState.READY)
             if (
                 self.proof_scheduler is not None
@@ -2125,22 +2183,22 @@ class ValidationService:
         if self.proof_scheduler is not None:
             # Cooldowns and rollout-hash reservations are committed only after
             # every environment has sealed successfully.
-            for batcher in self._active_batchers.values():
+            for batcher in batchers.values():
                 batcher.commit_seal_side_effects()
         for name, (batch, rewards) in sealed.items():
-            self._active_batchers[name].rewards_by_hotkey = rewards
+            batchers[name].rewards_by_hotkey = rewards
 
         # Worker acceptance means "admitted to the auction pool". Publish a
         # second, final /verdicts record after seal so miners can distinguish a
         # selected/rewarded candidate, an honest non-winner, and a deferred-proof
         # failure. This is observability only and cannot change selection.
-        for batcher in self._active_batchers.values():
+        for batcher in batchers.values():
             self._record_auction_final_verdicts(batcher)
 
         # Emit per-submission lifecycle telemetry for every env's accepted
         # pool. Carried over from PR #40 (validator observability) and
         # extended with env_name so downstream consumers can split by env.
-        for env_name, batcher in self._active_batchers.items():
+        for env_name, batcher in batchers.items():
             selection_meta = getattr(batcher, "selection_metadata_by_id", {})
             for sub in batcher.valid_submissions():
                 meta = selection_meta.get(id(sub), {})
@@ -2193,7 +2251,7 @@ class ValidationService:
         # Quarantine each window before retaining any of its groups. Rewards
         # and archives remain per-window; this gate only protects model state.
         combined_reject_counts: dict[str, int] = {}
-        for _b in self._active_batchers.values():
+        for _b in batchers.values():
             _snapshot_fn = getattr(
                 type(_b), "rejection_telemetry_snapshot", None
             )
@@ -2212,17 +2270,17 @@ class ValidationService:
             reject_counts=combined_reject_counts,
         )
         _quarantine_archive = window_quarantine.to_archive()
-        for _b in self._active_batchers.values():
+        for _b in batchers.values():
             _b.training_quarantine = _quarantine_archive
 
         checkpoint_revisions = {
             str(getattr(b, "current_checkpoint_hash", ""))
-            for b in self._active_batchers.values()
+            for b in batchers.values()
         }
         if len(checkpoint_revisions) != 1:
             logger.error(
                 "Window %d has inconsistent checkpoint revisions across envs: %s",
-                self._window_n, sorted(checkpoint_revisions),
+                window_n, sorted(checkpoint_revisions),
             )
             discarded = self._training_accumulator.reset()
             accumulator_update = {
@@ -2240,7 +2298,7 @@ class ValidationService:
             checkpoint_revision = next(iter(checkpoint_revisions))
             accumulator_update = self._training_accumulator.add_window(
                 {} if window_quarantine.quarantined else window_batches,
-                window_n=self._window_n,
+                window_n=window_n,
                 checkpoint_revision=checkpoint_revision,
             )
             if window_quarantine.quarantined:
@@ -2285,7 +2343,7 @@ class ValidationService:
             logger.warning(
                 "Window %d accumulated batch quarantined from training: "
                 "reasons=%s metrics=%s",
-                self._window_n,
+                window_n,
                 accumulated_quarantine.reasons,
                 accumulated_quarantine.metrics,
             )
@@ -2331,7 +2389,7 @@ class ValidationService:
             logger.info(
                 "Window %d: %s — retaining balanced batch and skipping "
                 "train_step + publish (checkpoint=%d ceiling=%d)",
-                self._window_n,
+                window_n,
                 blocked_reason,
                 self._checkpoint_n,
                 TRAIN_UNTIL_CHECKPOINT_N,
@@ -2350,7 +2408,7 @@ class ValidationService:
                         if self.base_ref_model is not None
                         else self.verify_model
                     ),
-                    window_index=self._window_n,
+                    window_index=window_n,
                     **(
                         {"behavior_model": self.verify_model}
                         if RECOMPUTE_PI_OLD_FROM_VERIFY
@@ -2365,7 +2423,7 @@ class ValidationService:
                 logger.warning(
                     "train_step rejected for window %d: reason=%s "
                     "grad_norm=%s ppo_outside_clip=%s",
-                    self._window_n,
+                    window_n,
                     exc.reason,
                     exc.grad_norm,
                     outside_clip_ratio,
@@ -2389,7 +2447,7 @@ class ValidationService:
                         "Window %d detected stale behavior-policy drift after "
                         "%d safe updates; publishing the accumulated model "
                         "without the rejected step",
-                        self._window_n,
+                        window_n,
                         self._trained_windows_since_publish,
                     )
             except Exception:
@@ -2398,7 +2456,7 @@ class ValidationService:
                 # recorded so the EMA / on-chain weights reflect this window.
                 logger.exception(
                     "train_step failed for window %d; archiving anyway and "
-                    "skipping publish", self._window_n,
+                    "skipping publish", window_n,
                 )
                 accumulator_meta["reset_reason"] = "train_step_failed"
             finally:
@@ -2418,7 +2476,7 @@ class ValidationService:
             logger.info(
                 "Window %d sealed with %d/%d submissions; retained=%s — "
                 "waiting for balanced training batch",
-                self._window_n, total_subs, total_target, retained,
+                window_n, total_subs, total_target, retained,
             )
 
         accumulator_meta["trained"] = trained
@@ -2429,7 +2487,7 @@ class ValidationService:
             logging.INFO,
             "validator_training_accumulator",
             {
-                "window_n": self._window_n,
+                "window_n": window_n,
                 "window_groups": accumulator_meta["window_groups"],
                 "added": accumulator_meta["added"],
                 "not_accumulated": accumulator_meta["not_accumulated"],
@@ -2442,7 +2500,7 @@ class ValidationService:
                 "post_action_counts": accumulator_meta["post_action"]["counts"],
             },
         )
-        for _b in self._active_batchers.values():
+        for _b in batchers.values():
             _b.training_accumulator = accumulator_meta
 
         self._set_state(WindowState.PUBLISHING)
@@ -2482,22 +2540,35 @@ class ValidationService:
                 self._adaptive_publication_pending = False
                 self._adaptive_publication_reason = None
                 self.server.set_current_checkpoint(entry)
-                # Refresh verify_model in-place so the next window's
-                # batcher verifies miners against the just-published
-                # checkpoint. In-place copy: no new allocation.
-                try:
-                    self._refresh_verify_model_from_train(entry.revision)
-                except (AttributeError, RuntimeError):
-                    logger.exception(
-                        "verify_model refresh failed; verify_model now "
-                        "stale wrt checkpoint %d", entry.checkpoint_n,
-                    )
-                    raise
-                if self.proof_scheduler is not None:
-                    await asyncio.to_thread(
-                        self._synchronize_proof_models,
-                        entry.revision,
-                    )
+                from reliquary.constants import PIPELINED_WINDOWS as _pipelined
+
+                if _pipelined:
+                    # Deferred swap: the currently-collecting window opened
+                    # under the PREVIOUS checkpoint and its proofs must run
+                    # against it. Windows opened from now on pin the new
+                    # revision (set_current_checkpoint above); the in-place
+                    # verify refresh + proof-replica sync happen at the END of
+                    # the next GPU half, after that last old-checkpoint
+                    # window has been proven and trained.
+                    self._pending_verify_swap = entry.revision
+                    self._pending_verify_swap_age = 0
+                else:
+                    # Refresh verify_model in-place so the next window's
+                    # batcher verifies miners against the just-published
+                    # checkpoint. In-place copy: no new allocation.
+                    try:
+                        self._refresh_verify_model_from_train(entry.revision)
+                    except (AttributeError, RuntimeError):
+                        logger.exception(
+                            "verify_model refresh failed; verify_model now "
+                            "stale wrt checkpoint %d", entry.checkpoint_n,
+                        )
+                        raise
+                    if self.proof_scheduler is not None:
+                        await asyncio.to_thread(
+                            self._synchronize_proof_models,
+                            entry.revision,
+                        )
                 if publication_retry_pending:
                     discarded = self._training_accumulator.reset()
                     post_publish_state = self._training_accumulator.snapshot()
@@ -2506,7 +2577,7 @@ class ValidationService:
                     self.server.set_training_accumulator_state(
                         post_publish_state
                     )
-                    for _b in self._active_batchers.values():
+                    for _b in batchers.values():
                         _b.training_accumulator = accumulator_meta
                     logger.info(
                         "Published pending checkpoint %d; discarded %d "
@@ -2533,7 +2604,7 @@ class ValidationService:
             logger.info(
                 "Skipping HF publish for window_n=%d "
                 "(%d/%d trained windows since last publish)",
-                self._window_n,
+                window_n,
                 self._trained_windows_since_publish,
                 self._publish_every,
             )
@@ -2555,7 +2626,7 @@ class ValidationService:
         })
 
         try:
-            await self._archive_window(self._active_batchers, sealed)
+            await self._archive_window(batchers, sealed)
         except Exception as exc:
             logger.exception("window archive failed")
             self._enqueue_aborted_window(
@@ -2563,8 +2634,20 @@ class ValidationService:
                 failure_type=type(exc).__name__,
             )
 
-        self.server.set_active_batchers({})
-        self._active_batchers = {}
+        if owns_routing:
+            self.server.set_active_batchers({})
+            self._active_batchers = {}
+        if (
+            pending_swap_due is not None
+            and self._pending_verify_swap == pending_swap_due
+        ):
+            # This GPU half just proved and trained the LAST window generated
+            # under the pre-publish checkpoint (the publish that queued this
+            # swap ran in the PREVIOUS GPU half, after which exactly one
+            # old-checkpoint window — this one — was still in flight). The
+            # verify plane can now certify the new revision; every later
+            # window pinned it at open.
+            await self._apply_deferred_verify_swap(pending_swap_due)
         self._set_state(WindowState.READY)
 
     async def _archive_window(self, batchers, sealed) -> None:
@@ -3404,6 +3487,18 @@ class ValidationService:
                     await self._set_window_randomness(subtensor)
                     self._activate_window()
                     self._window_iteration_stage = "active"
+                    if self._gpu_backlog is not None:
+                        # Pipelined mode: the previous window sealed last
+                        # iteration; its GPU half (proofs + train + archive)
+                        # runs NOW, hidden under the collection of the window
+                        # we just activated. Nothing in it is speculative —
+                        # the stashed window's ranking froze at its seal.
+                        stashed_batchers, stashed_n = self._gpu_backlog
+                        self._gpu_backlog = None
+                        self._window_iteration_stage = "pipelined_train_archive"
+                        await self._train_and_publish(
+                            batchers=stashed_batchers, window_n=stashed_n,
+                        )
                     self._window_iteration_stage = "seal_wait"
                     seal_reason = await self._wait_for_window_seal()
                     if seal_reason == "sealed":
@@ -3422,8 +3517,20 @@ class ValidationService:
                             self._window_n, seal_reason,
                         )
 
-                    self._window_iteration_stage = "seal_train_archive"
-                    await self._train_and_publish()
+                    from reliquary.constants import PIPELINED_WINDOWS
+
+                    if PIPELINED_WINDOWS:
+                        # Stash the sealed window; its GPU half runs at the
+                        # top of the next iteration, after the next window's
+                        # collection has opened. State is frozen at seal, so
+                        # waiting costs nothing but latency.
+                        self._window_iteration_stage = "pipelined_stash"
+                        self._gpu_backlog = (
+                            dict(self._active_batchers), self._window_n,
+                        )
+                    else:
+                        self._window_iteration_stage = "seal_train_archive"
+                        await self._train_and_publish()
 
                     # Persist the cooldown on a fixed window cadence, independent
                     # of the publish cadence (which can stall): keeps the snapshot
@@ -3458,6 +3565,14 @@ class ValidationService:
                             logger.exception(
                                 "Failed to enqueue fatal proof tombstone"
                             )
+                    if self._gpu_backlog is not None:
+                        logger.error(
+                            "Dropping pipelined backlog window %d on fatal "
+                            "proof-plane failure (unpaid; replayed after "
+                            "restart, matching crash-window semantics)",
+                            self._gpu_backlog[1],
+                        )
+                        self._gpu_backlog = None
                     self.server.set_active_batchers({})
                     self._active_batchers = {}
                     self._set_state(WindowState.READY)
@@ -3473,6 +3588,14 @@ class ValidationService:
                         logger.exception("Failed to enqueue aborted-window tombstone")
                     self._rollback_preopen_window(exc)
                     # Reset to READY so the next iteration doesn't spin on error state.
+                    if self._gpu_backlog is not None:
+                        logger.error(
+                            "Dropping pipelined backlog window %d after "
+                            "iteration failure (unpaid; window semantics "
+                            "match a crash at the same stage)",
+                            self._gpu_backlog[1],
+                        )
+                        self._gpu_backlog = None
                     self.server.set_active_batchers({})
                     self._active_batchers = {}
                     self._set_state(WindowState.READY)

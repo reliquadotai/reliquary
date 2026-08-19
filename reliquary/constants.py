@@ -1100,6 +1100,19 @@ PI_OLD_FROM_VERIFY_LOGPROBS = _os.environ.get(
     "RELIQUARY_PI_OLD_FROM_VERIFY_LOGPROBS", "true"
 ).strip().lower() in ("1", "true", "yes", "on")
 
+# Pipelined window collection (design: docs/superpowers/specs/
+# 2026-08-19-pipelined-window-collection-design.md). When on, the next
+# window's collection opens BEFORE the previous window's GPU half (proofs +
+# train) runs, hiding the collection deadline entirely under GPU work:
+# cycle -> max(GPU, collection) ~= P+T. Nothing is proven before its own
+# deadline, the GPU stays strictly serial, and the verify-model swap at
+# publish is deferred until the last window generated under the old
+# checkpoint has been proven. Default OFF: flipped per-deploy in the compose
+# overlay after a soak of the serial path on the same image.
+PIPELINED_WINDOWS = _os.environ.get(
+    "RELIQUARY_PIPELINED_WINDOWS", "0"
+).strip().lower() in ("1", "true", "yes", "on")
+
 # Optional persistent canary ceiling. When non-zero, a validator whose current
 # published checkpoint is already at or above this number keeps serving and
 # accumulating but performs no further optimizer steps. Unlike an in-process
