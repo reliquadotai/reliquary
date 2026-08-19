@@ -943,6 +943,42 @@ def _clipped_surrogate(ratio, advantage):
     return surrogate, clipped < unclipped
 
 
+def _validator_completion_logprobs(rollout, n_completion: int):
+    """Seal-time verify-pass logprobs for this rollout, or None.
+
+    The batcher attaches ``_validated_completion_logprobs`` — the verifier's
+    raw (T=1) log-softmax of each completion token, computed on the frozen
+    verify_model during GRAIL proofs. Definitionally the same quantity as the
+    behavior forward, so reusing it removes one no-grad forward per token.
+    Absent / wrong-length / non-finite values return None (callers fall back
+    to the behavior forward, never to miner-claimed values). Lazy import so
+    tests can monkeypatch reliquary.constants.
+    """
+    from reliquary.constants import (
+        PI_OLD_FROM_VERIFY_LOGPROBS,
+        RECOMPUTE_PI_OLD_FROM_VERIFY,
+    )
+
+    # RECOMPUTE_PI_OLD_FROM_VERIFY=0 is the incident switch meaning "pi_old
+    # comes from the miner claim"; seal-time verify values are a recompute
+    # too, so they must honor it — otherwise the switch silently stops
+    # restoring the legacy behavior and incident bisection is confounded.
+    if not (PI_OLD_FROM_VERIFY_LOGPROBS and RECOMPUTE_PI_OLD_FROM_VERIFY):
+        return None
+    values = getattr(rollout, "_validated_completion_logprobs", None)
+    if not isinstance(values, list) or len(values) != n_completion:
+        return None
+    if n_completion == 0:
+        return None
+    try:
+        floats = [float(v) for v in values]
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(v) for v in floats):
+        return None
+    return floats
+
+
 def _rollout_loss(
     model,
     ref_model,
@@ -985,36 +1021,56 @@ def _rollout_loss(
     # tokens[prompt_length] (first completion token).
     new_logprobs_c = new_logprobs[prompt_length - 1:]
 
-    # Reference model forward pass (no grad)
-    with torch.no_grad():
-        with dtype_ctx:
-            ref_logprobs = _selected_logprobs_for_tokens(ref_model, tokens, next_tokens)
-    ref_logprobs_c = ref_logprobs[prompt_length - 1:]
+    # pi_old from the seal-time verify pass when attached; the no-grad
+    # forwards below only run when something still needs them.
+    validator_old = _validator_completion_logprobs(
+        rollout, int(new_logprobs_c.shape[0])
+    )
+    need_pi_forward = behavior_model is not None and validator_old is None
+    share = behavior_model is ref_model
+    need_ref_forward = KL_BETA > 0 or (need_pi_forward and share)
 
-    behavior_logprobs_c = None
-    if behavior_model is ref_model:
-        behavior_logprobs_c = ref_logprobs_c
-    elif behavior_model is not None:
+    ref_logprobs_c = None
+    if need_ref_forward:
         with torch.no_grad():
             with dtype_ctx:
-                behavior_logprobs = _selected_logprobs_for_tokens(
-                    behavior_model, tokens, next_tokens
+                ref_logprobs = _selected_logprobs_for_tokens(
+                    ref_model, tokens, next_tokens
                 )
-        behavior_logprobs_c = behavior_logprobs[prompt_length - 1:]
+        ref_logprobs_c = ref_logprobs[prompt_length - 1:]
 
-    # π_old from miner (same completion slice)
-    old_logprobs = torch.tensor(
-        old_logprobs_list, device=device, dtype=new_logprobs_c.dtype,
-    )
-    if len(old_logprobs) != len(new_logprobs_c):
+    behavior_logprobs_c = None
+    if need_pi_forward:
+        if share:
+            behavior_logprobs_c = ref_logprobs_c
+        else:
+            with torch.no_grad():
+                with dtype_ctx:
+                    behavior_logprobs = _selected_logprobs_for_tokens(
+                        behavior_model, tokens, next_tokens
+                    )
+            behavior_logprobs_c = behavior_logprobs[prompt_length - 1:]
+
+    # π_old source: validator > behavior forward > miner claim. The miner
+    # length check stays unconditional (protocol invariant), but its tensor
+    # is only materialised on the fallback path.
+    if len(old_logprobs_list) != len(new_logprobs_c):
         raise ValueError(
-            f"log-prob length mismatch: miner reported {len(old_logprobs)}, "
+            f"log-prob length mismatch: miner reported {len(old_logprobs_list)}, "
             f"model predicts {len(new_logprobs_c)} completion tokens"
         )
-    if behavior_logprobs_c is not None:
+    if validator_old is not None:
+        old_logprobs = torch.tensor(
+            validator_old, device=device, dtype=new_logprobs_c.dtype,
+        )
+    elif behavior_logprobs_c is not None:
         if len(behavior_logprobs_c) != len(new_logprobs_c):
             raise ValueError("behavior-model completion length mismatch")
         old_logprobs = behavior_logprobs_c.detach()
+    else:
+        old_logprobs = torch.tensor(
+            old_logprobs_list, device=device, dtype=new_logprobs_c.dtype,
+        )
 
     # Mask the validator-injected FORCE span out of the loss. Those actions were
     # not sampled by the policy, so policy-gradient on them is invalid and their
@@ -1035,8 +1091,13 @@ def _rollout_loss(
     # KL(π_new || π_ref) — Schulman's k3 estimator:
     #   kl ≈ exp(ref - new) - 1 - (ref - new)
     # Unbiased, low-variance, always ≥ 0.
-    kl_log_ratio = ref_logprobs_c - new_logprobs_c
-    kl_per_token = torch.exp(kl_log_ratio) - 1 - kl_log_ratio
+    if ref_logprobs_c is not None:
+        kl_log_ratio = ref_logprobs_c - new_logprobs_c
+        kl_per_token = torch.exp(kl_log_ratio) - 1 - kl_log_ratio
+    else:
+        # KL_BETA == 0 and pi_old did not need the ref forward: the KL term
+        # is identically zero rather than merely zero-weighted.
+        kl_per_token = torch.zeros_like(new_logprobs_c)
 
     if keep is not None:
         ppo_per_token = ppo_per_token[keep]
@@ -1122,6 +1183,8 @@ def _new_kl_stats() -> dict[str, float | int]:
         "weighted_ppo": 0.0,
         "weighted_kl": 0.0,
         "ppo_token_count": 0,
+        "pi_old_validator_token_count": 0,
+        "kl_term_computed_token_count": 0,
         "ppo_clip_active_count": 0,
         "ppo_ratio_below_clip_count": 0,
         "ppo_ratio_above_clip_count": 0,
@@ -1149,6 +1212,8 @@ def _record_kl_stats(
     ppo_clip_active,
     claimed_old,
     behavior_old,
+    pi_old_from_validator: bool = False,
+    kl_term_computed: bool = True,
 ) -> None:
     """Accumulate bounded policy-health telemetry after a micro-batch."""
     if stats is None:
@@ -1169,6 +1234,10 @@ def _record_kl_stats(
         stats["weighted_ppo"] += float((scale_cat * ppo_tok).sum())
         stats["weighted_kl"] += float((scale_cat * kl_tok).sum())
         stats["ppo_token_count"] += ppo_ratio.numel()
+        if pi_old_from_validator:
+            stats["pi_old_validator_token_count"] += ppo_ratio.numel()
+        if kl_term_computed:
+            stats["kl_term_computed_token_count"] += ppo_ratio.numel()
         stats["ppo_clip_active_count"] += int(ppo_clip_active.sum())
         stats["ppo_ratio_below_clip_count"] += int(
             (ppo_ratio < 1.0 - PPO_CLIP_EPSILON_LOW).sum()
@@ -1266,6 +1335,17 @@ def _kl_telemetry_metrics(stats: dict[str, float | int]) -> dict[str, float]:
         "train/ppo_ratio_nonfinite_ratio": (
             int(stats["ppo_ratio_nonfinite_count"]) / ppo_denominator
         ),
+        # Fraction of trained tokens whose pi_old came from the seal-time
+        # verify pass (1.0 = full reuse, falling values = silent fallback to
+        # the behavior forward — the perf win evaporating visibly).
+        "train/pi_old_from_verify_ratio": (
+            int(stats["pi_old_validator_token_count"]) / ppo_denominator
+        ),
+        # 0.0 means the KL term was skipped (KL_BETA==0, ref forward not
+        # needed): train/kl reads 0 by construction there, not by measurement.
+        "train/kl_term_computed_ratio": (
+            int(stats["kl_term_computed_token_count"]) / ppo_denominator
+        ),
         "train/ppo_log_ratio_abs_max": float(
             stats["ppo_log_ratio_abs_max"]
         ),
@@ -1316,8 +1396,8 @@ def _microbatch_grad(
     T = max(len(it[0]) for it in batch)
     input_ids = torch.zeros(B, T, dtype=torch.long, device=device)
     attn = torch.zeros(B, T, dtype=torch.long, device=device)
-    plens, lens, olds, advs, scales, keeps = [], [], [], [], [], []
-    for j, (tokens, p, old, adv, scale, keep) in enumerate(batch):
+    plens, lens, olds, advs, scales, keeps, volds = [], [], [], [], [], [], []
+    for j, (tokens, p, old, adv, scale, keep, vold) in enumerate(batch):
         L = len(tokens)
         input_ids[j, :L] = torch.tensor(tokens, device=device)
         attn[j, :L] = 1
@@ -1327,22 +1407,36 @@ def _microbatch_grad(
         advs.append(adv)
         scales.append(scale)
         keeps.append(keep)
+        volds.append(vold)
+
+    # pi_old from the seal-time verify pass when EVERY row carries it; the
+    # no-grad forwards below only run when something still needs them.
+    use_validator_old = all(v is not None for v in volds)
+    need_pi_forward = behavior_model is not None and not use_validator_old
+    share = behavior_model is ref_model
+    need_ref_forward = KL_BETA > 0 or (need_pi_forward and share)
 
     with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
                         enabled=device.type in ("cuda", "cpu")):
         new_lp, seg = _batched_completion_logprobs(model, input_ids, attn, plens, lens)
         with torch.no_grad():
-            ref_lp, _ = _batched_completion_logprobs(ref_model, input_ids, attn, plens, lens)
-            if behavior_model is ref_model:
-                behavior_lp = ref_lp
-            elif behavior_model is not None:
-                behavior_lp, behavior_seg = _batched_completion_logprobs(
-                    behavior_model, input_ids, attn, plens, lens
+            ref_lp = None
+            behavior_lp = None
+            if need_ref_forward:
+                ref_lp, _ = _batched_completion_logprobs(
+                    ref_model, input_ids, attn, plens, lens
                 )
-                if behavior_seg != seg:
-                    raise ValueError("behavior-model completion segments mismatch")
-            else:
-                behavior_lp = None
+            if need_pi_forward:
+                if share:
+                    behavior_lp = ref_lp
+                else:
+                    behavior_lp, behavior_seg = _batched_completion_logprobs(
+                        behavior_model, input_ids, attn, plens, lens
+                    )
+                    if behavior_seg != seg:
+                        raise ValueError(
+                            "behavior-model completion segments mismatch"
+                        )
 
     claimed_old_cat = torch.tensor(
         [x for old in olds for x in old],
@@ -1351,7 +1445,16 @@ def _microbatch_grad(
     )
     old_cat = claimed_old_cat
     behavior_old_cat = None
-    if behavior_lp is not None:
+    if use_validator_old:
+        behavior_old_cat = torch.tensor(
+            [x for vold in volds for x in vold],
+            device=device,
+            dtype=new_lp.dtype,
+        )
+        if behavior_old_cat.shape != new_lp.shape:
+            raise ValueError("validator pi_old shape mismatch")
+        old_cat = behavior_old_cat
+    elif behavior_lp is not None:
         if behavior_lp.shape != new_lp.shape:
             raise ValueError("behavior-model completion shape mismatch")
         behavior_old_cat = behavior_lp.detach()
@@ -1372,7 +1475,8 @@ def _microbatch_grad(
         dtype=torch.bool,
     )
     new_lp = new_lp[keep_cat]
-    ref_lp = ref_lp[keep_cat]
+    if ref_lp is not None:
+        ref_lp = ref_lp[keep_cat]
     old_cat = old_cat[keep_cat]
     claimed_old_cat = claimed_old_cat[keep_cat]
     if behavior_old_cat is not None:
@@ -1384,8 +1488,14 @@ def _microbatch_grad(
     ratio = torch.exp(ppo_log_ratio)
     surr, clip_active = _clipped_surrogate(ratio, adv_cat)
     ppo_tok = -surr
-    kl_log = ref_lp - new_lp
-    kl_tok = torch.exp(kl_log) - 1 - kl_log
+    if ref_lp is not None:
+        kl_log = ref_lp - new_lp
+        kl_tok = torch.exp(kl_log) - 1 - kl_log
+    else:
+        # KL_BETA == 0 and pi_old did not need the ref forward: identically
+        # zero KL rather than a zero-weighted computed one.
+        kl_log = torch.zeros_like(new_lp)
+        kl_tok = torch.zeros_like(new_lp)
     # Token-level (DAPO) normalisation, weighted per-env: scale_cat carries each
     # token's w_e/N_e, so the loss is Σ_e w_e·(token-mean over env e) — no env's
     # raw token mass dominates the shared step.
@@ -1413,6 +1523,8 @@ def _microbatch_grad(
         ppo_clip_active=clip_active,
         claimed_old=claimed_old_cat,
         behavior_old=behavior_old_cat,
+        pi_old_from_validator=use_validator_old,
+        kl_term_computed=ref_lp is not None,
     )
 
     sum_ppo = sum_kl = 0.0
@@ -1465,7 +1577,7 @@ def _process_microbatch(
 
 def _build_microbatch_items(plan):
     """Flatten plan -> list of (tokens, prompt_length, old_logprobs, advantage,
-    scale, keep), dropping rollouts the per-rollout path would have skipped (missing
+    scale, keep, validator_old_logprobs), dropping rollouts the per-rollout path would have skipped (missing
     prompt_length/token_logprobs, or a miner/model completion-length mismatch).
     ``scale`` is the per-token loss weight w_e/N_e carried from the plan entry."""
     items = []
@@ -1494,7 +1606,10 @@ def _build_microbatch_items(plan):
             if not any(keep):
                 logger.warning("rollout skipped: force span masks all tokens")
                 continue
-            items.append((tokens, p, old, adv, scale, keep))
+            items.append((
+                tokens, p, old, adv, scale, keep,
+                _validator_completion_logprobs(rollout, n_completion),
+            ))
     return items
 
 
