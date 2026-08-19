@@ -1,7 +1,7 @@
 # Pipelined Window Collection — Design
 
 Date: 2026-08-19
-Status: DRAFT — awaiting owner review
+Status: v2 — revised after the 2026-08-19 high review of the v1 implementation (10 verified findings; serial-path identity held)
 Scope: validator only; zero wire/protocol change; zero miner-visible rule change.
 
 ## Problem
@@ -81,7 +81,28 @@ This is the most delicate part of the refactor; the existing
 HASH_DEDUP_RETENTION_WINDOWS machinery already spans windows in TIME — the
 change is making the live-batcher lookups hit the shared store.
 
-### Checkpoint publication (deferred verify-swap)
+### Checkpoint publication (SERIAL BEAT — v2, replaces the deferred swap)
+
+v1's deferred verify-swap was refuted by review: (a) _ensure_proof_scheduler_
+ready re-syncs the verify plane at iteration top, defeating the deferral;
+(b) refreshing verify_model FROM train_model after train_step installs
+revision+delta weights labeled as the published revision; (c) publishing
+mid-collection flips /state under miners pinned to the old hash.
+
+v2 rule: A PUBLISH NEVER PIPELINES. When the stashed window's train will
+trigger a publication (cadence counter reaching threshold, or the adaptive
+flag already set — both knowable before opening the next window), that
+iteration runs in SERIAL order: GPU half first, publish (upload + verify
+refresh + replica sync, exactly the serial-path sequence, with
+train_model == published weights), THEN open the next window. Consequences:
+no publish lands mid-collection; no old-revision window is ever in flight
+when the verify plane swaps; the deferred-swap machinery is DELETED, not
+fixed. Cost: one un-overlapped beat per publish (~100s / 16 windows, ~3% of
+the gain). If a publish fires in a pipelined iteration anyway (unexpected
+path), fail loudly and fall back to serial for that iteration.
+
+### (v1 section kept for history — superseded)
+
 
 A window is pinned to the checkpoint it was opened under (checkpoint_hash is
 a forced-seed derivation input; proofs must verify against the generation
@@ -101,6 +122,22 @@ windows (~3% of the gain), trivial to implement.
 Note: pi_old-from-verify values attached at proof time are computed on the
 window's generation checkpoint (correct by construction under the deferred
 swap — proofs(N+1) still run on K).
+
+## v2 phase plan (from the v1 review findings)
+
+1. Seal the GPU half hermetically: guard _set_state with owns_routing
+   (finding 1 — fatal: TRAINING state was rejecting the collecting window's
+   submissions); capture the beacon verify task in the stash and await the
+   stashed window's own task (5); snapshot late-drops at seal (10);
+   tombstones carry explicit window metadata and allow the pipelined stages
+   (4).
+2. Commit seal side effects (prompt/content cooldown, rollout-hash dedup) at
+   STASH time, before the next window computes its prompt range (7). Check
+   first whether the commit depends on winners (proof results); if so, the
+   next window must instead exclude in-flight sealed prompts.
+3. Serial beat at publish (above) — deletes the deferred swap (2, 3, 8, 9).
+4. Failure paths: one incident costs at most ONE window, never two (6);
+   an open-phase failure must not drop a sealed backlog unpaid+untombstoned.
 
 ## Edge cases
 
