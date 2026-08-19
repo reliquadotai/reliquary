@@ -1,15 +1,13 @@
-"""Pipelined window collection — orchestration units.
+"""Pipelined window collection (v2) — orchestration units.
 
 The loop itself is integration-scale; these tests pin the load-bearing
-pieces: the flag default, the routing-ownership guard of the parameterized
-GPU half, and the deferred verify-swap lifecycle (normal application at the
-end of the capturing GPU half, and the abort safety net that certifies the
-new revision before proving a post-publish window).
+pieces: the flag default, routing/state ownership of the parameterized GPU
+half (a stashed window's half must not touch the collecting window's
+routing or FSM state), the serial-beat publication forecast, and the
+tombstone helper's explicit-batchers + per-window dedup semantics.
 """
 import asyncio
 from types import SimpleNamespace
-
-import pytest
 
 from reliquary.validator.service import ValidationService
 
@@ -19,64 +17,159 @@ def test_flag_defaults_off():
     assert PIPELINED_WINDOWS is False
 
 
-class _Stub:
-    """Minimal host for the real unbound coroutines."""
-
-    # bind the real implementations so internal self.* calls resolve
-    _apply_deferred_verify_swap = ValidationService._apply_deferred_verify_swap
-
-    def __init__(self):
-        self._pending_verify_swap = None
-        self._pending_verify_swap_age = 0
-        self._active_batchers = {"env": "SENTINEL"}
-        self._window_n = 999
-        self.proof_scheduler = None
-        self.refreshed = []
-
-    def _refresh_verify_model_from_train(self, revision):
-        self.refreshed.append(revision)
-
-    def _synchronize_proof_models(self, revision):
-        raise AssertionError("no scheduler -> must not be called")
-
-
 def _run(coro):
     return asyncio.run(coro)
 
 
-def test_gpu_half_with_explicit_batchers_never_touches_routing():
-    stub = _Stub()
-    _run(ValidationService._train_and_publish(stub, batchers={}, window_n=42))
-    # early return on empty batchers; the collecting window's routing state
-    # must be untouched (owns_routing is False).
+class _RoutingStub:
+    """Host for the real _train_and_publish, wired to fail on any routing
+    or FSM mutation (those belong to the collecting window)."""
+
+    def __init__(self, batcher):
+        self._active_batchers = {"env": "SENTINEL"}
+        self._window_n = 999
+        self._verify_task = None
+        self.server = SimpleNamespace(
+            set_active_batchers=lambda *_: (_ for _ in ()).throw(
+                AssertionError("routing cleared by non-owning GPU half")
+            )
+        )
+        self.tombstones = []
+        self._batcher = batcher
+
+    def _set_state(self, state):
+        raise AssertionError(f"FSM mutated by non-owning GPU half: {state}")
+
+    def _enqueue_aborted_window(self, **kwargs):
+        self.tombstones.append(kwargs)
+
+
+def test_beacon_invalid_pipelined_half_owns_nothing():
+    """A stashed window's half hitting beacon-invalid must tombstone WITH
+    its own batchers and leave routing + FSM state untouched."""
+    bad = SimpleNamespace(beacon_invalid=True, window_start=123)
+    stub = _RoutingStub(bad)
+    _run(ValidationService._train_and_publish(
+        stub, batchers={"math": bad}, window_n=123,
+    ))
     assert stub._active_batchers == {"env": "SENTINEL"}
+    assert len(stub.tombstones) == 1
+    t = stub.tombstones[0]
+    assert t["failure_stage"] == "beacon_verification"
+    assert t["batchers"] == {"math": bad}
 
 
-def test_deferred_swap_helper_applies_and_clears():
-    stub = _Stub()
-    stub._pending_verify_swap = "a" * 40
-    stub._pending_verify_swap_age = 1
-    _run(ValidationService._apply_deferred_verify_swap(stub, "a" * 40))
-    assert stub.refreshed == ["a" * 40]
-    assert stub._pending_verify_swap is None
-    assert stub._pending_verify_swap_age == 0
+def test_pipelined_half_ignores_collecting_windows_verify_task():
+    """verify_task=None + owns_routing=False must NOT fall back to
+    self._verify_task (that task belongs to the collecting window)."""
+    bad = SimpleNamespace(beacon_invalid=True, window_start=124)
+    stub = _RoutingStub(bad)
+
+    async def _boom():
+        raise AssertionError("collecting window's verify task was awaited")
+
+    async def _main():
+        task = asyncio.get_running_loop().create_task(_boom())
+        stub._verify_task = task
+        await ValidationService._train_and_publish(
+            stub, batchers={"math": bad}, window_n=124,
+        )
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, AssertionError):
+            pass
+
+    _run(_main())
+    assert len(stub.tombstones) == 1
 
 
-def test_abort_safety_net_certifies_before_proving():
-    """If the GPU half that captured the swap aborted, the NEXT one must
-    apply it BEFORE its proofs (its window pinned the new revision)."""
-    stub = _Stub()
-    stub._pending_verify_swap = "b" * 40
+class _ForecastStub:
+    _publication_due_next_half = ValidationService._publication_due_next_half
 
-    # first call captures (age 1), early-returns on empty batchers, applies
-    # at its end because pending_swap_due was captured.
-    _run(ValidationService._train_and_publish(stub, batchers={}, window_n=1))
-    # NOTE: the empty-batchers early return exits BEFORE the end-of-half
-    # application, mimicking an aborted half — pending must survive it.
-    assert stub._pending_verify_swap == "b" * 40
-    assert stub._pending_verify_swap_age == 1
+    def __init__(self, since=0, every=16, adaptive=False, manifest=object()):
+        self._trained_windows_since_publish = since
+        self._publish_every = every
+        self._adaptive_publication_pending = adaptive
+        self._checkpoint_store = SimpleNamespace(
+            current_manifest=lambda: manifest
+        )
 
-    # second call: age reaches 2 -> safety net applies the swap up front.
-    _run(ValidationService._train_and_publish(stub, batchers={}, window_n=2))
-    assert stub.refreshed == ["b" * 40]
-    assert stub._pending_verify_swap is None
+
+def test_publication_forecast_serial_beat():
+    assert _ForecastStub(since=14)._publication_due_next_half() is False
+    # counter+1 reaches the interval -> this half may publish -> serial beat
+    assert _ForecastStub(since=15)._publication_due_next_half() is True
+    assert _ForecastStub(since=0, adaptive=True)._publication_due_next_half() is True
+    # bootstrap: no manifest yet -> first publish must be serial
+    assert _ForecastStub(since=0, manifest=None)._publication_due_next_half() is True
+
+
+class _TombstoneStub:
+    _enqueue_aborted_window = ValidationService._enqueue_aborted_window
+
+    def __init__(self):
+        self._active_batchers = {}
+        self._archive_enqueued_windows = set()
+        self._window_iteration_stage = "pipelined_train_archive"
+        self.wallet = None
+        self.kl_reference_state = {}
+        self._late_drops = {}
+
+    def _proof_scheduler_health_snapshot(self):
+        return {}
+
+
+def _fake_batcher(window_start):
+    return SimpleNamespace(
+        window_start=window_start,
+        randomness="r" * 64,
+        force_seal_reason=None,
+        auction_seal_drain={},
+        reward_alignment={},
+    )
+
+
+def test_tombstone_explicit_batchers_and_per_window_dedup(monkeypatch):
+    enqueued = []
+
+    class _StubQueue:
+        def enqueue(self, window_start, archive):
+            enqueued.append((window_start, archive))
+
+    monkeypatch.setattr(
+        "reliquary.infrastructure.archive_queue.get_archive_queue",
+        lambda: _StubQueue(),
+    )
+    stub = _TombstoneStub()
+    stashed = {"math": _fake_batcher(200)}
+
+    # explicit batchers: tombstone carries the STASHED window's metadata even
+    # though _active_batchers is empty (or points elsewhere).
+    stub._enqueue_aborted_window(
+        failure_stage="pipelined_train_archive",
+        failure_type="PipelinedTrainFailure",
+        batchers=stashed,
+    )
+    assert len(enqueued) == 1
+    assert enqueued[0][0] == 200
+    assert enqueued[0][1]["window_status"] == "aborted"
+
+    # per-window dedup: same window again -> suppressed
+    stub._enqueue_aborted_window(
+        failure_stage="pipelined_train_archive",
+        failure_type="PipelinedTrainFailure",
+        batchers=stashed,
+    )
+    assert len(enqueued) == 1
+
+    # a DIFFERENT window is not suppressed by the first one's archive
+    # (this is the shared-boolean bug the per-window set fixes).
+    other = {"math": _fake_batcher(300)}
+    stub._enqueue_aborted_window(
+        failure_stage="pipelined_train_archive",
+        failure_type="PipelinedTrainFailure",
+        batchers=other,
+    )
+    assert len(enqueued) == 2
+    assert enqueued[1][0] == 300

@@ -131,13 +131,27 @@ swap — proofs(N+1) still run on K).
    stashed window's own task (5); snapshot late-drops at seal (10);
    tombstones carry explicit window metadata and allow the pipelined stages
    (4).
-2. Commit seal side effects (prompt/content cooldown, rollout-hash dedup) at
-   STASH time, before the next window computes its prompt range (7). Check
-   first whether the commit depends on winners (proof results); if so, the
-   next window must instead exclude in-flight sealed prompts.
+2. Seal side effects (7) — RESOLVED by analysis, lighter than planned. The
+   commit DOES depend on winners (rewarded_submissions exist only after
+   seal_batch = ranking + proofs, which runs in the GPU half), so it cannot
+   move to stash time. But no enforcement gap actually exists: cooldown and
+   content-cooldown are re-checked at seal-time RANKING, and GPU halves are
+   strictly serialized, so window N's commit always lands before window
+   N+1's ranking. Rollout-hash replay across windows dies at forced-seed
+   proof (rollouts are bound to the window randomness). The only real gap
+   was ADVISORY: N+1's cooldown_prompts_snapshot (drives /state and arrival
+   rejects) misses N's pending cooldowns, so miners would waste generation
+   effort on prompts silently dropped at seal. Fix shipped: at open with a
+   backlog, N+1's snapshot is augmented with the stashed window's
+   admitted_prompt_idxs() — a safe over-approximation, cleared naturally at
+   the next window.
 3. Serial beat at publish (above) — deletes the deferred swap (2, 3, 8, 9).
-4. Failure paths: one incident costs at most ONE window, never two (6);
-   an open-phase failure must not drop a sealed backlog unpaid+untombstoned.
+4. Failure paths (6) — shipped: a stashed-half failure tombstones ONLY the
+   stashed window and the collecting window continues (fatal proof-plane
+   errors still restart the process — crash semantics, backlog replayed);
+   an open-phase failure salvages the sealed backlog by running its GPU
+   half serially before resetting, so it is paid+trained, or tombstoned as
+   PipelinedSalvageFailure if the salvage itself fails.
 
 ## Edge cases
 
