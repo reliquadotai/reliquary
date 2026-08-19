@@ -277,12 +277,34 @@ def _reward_matches_claim(actual: float, claimed: float, *, tolerance: float = 1
 
 
 def _verify_logprobs_for_training(proof, completion_length: int):
-    """The proof's raw chosen-token logprobs, iff they cover every completion
-    token; otherwise None so training falls back to the behavior forward."""
-    values = list(getattr(proof, "completion_chosen_logprobs_raw", []) or [])
+    """pi_old for train_step, derived from the proof's chosen-token probs.
+
+    ``completion_chosen_probs`` is softmax(logits/T_PROTO)[token] on the
+    frozen verify model. At T_PROTO == 1.0 — the identity-warp premise the v4
+    PPO objective already rests on (pinned by test_v4_profile_coherence's
+    ``warp_is_identity``) — ``log(p)`` IS the raw logprob the train-time
+    behavior forward would recompute, so no proof-path file needs to change.
+    Any other temperature, partial coverage, or a non-positive prob returns
+    None and training falls back to the behavior forward. Lazy import so
+    tests can monkeypatch reliquary.constants.
+    """
+    from reliquary.constants import T_PROTO
+
+    if float(T_PROTO) != 1.0:
+        return None
+    values = list(getattr(proof, "completion_chosen_probs", []) or [])
     if completion_length <= 0 or len(values) != completion_length:
         return None
-    return values
+    out = []
+    for prob in values:
+        try:
+            prob = float(prob)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(prob) or prob <= 0.0:
+            return None
+        out.append(math.log(prob))
+    return out
 
 
 def _forced_seed_verdict(n_stoch: int, n_match: int, enforce: bool) -> bool:

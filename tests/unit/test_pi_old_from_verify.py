@@ -200,44 +200,40 @@ def test_rollout_loss_uses_validator_values_and_skips_forwards(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# producer side: verifier stats and batcher attachment
+# producer side: batcher derivation from the proof's existing chosen probs
 # ---------------------------------------------------------------------------
 
-def test_verifier_emits_raw_chosen_logprobs_aligned():
-    from reliquary.validator.verifier import _gpu_completion_token_stats
-
-    torch.manual_seed(3)
-    seq_len, vocab = 9, 32
-    logits = torch.randn(seq_len, vocab)
-    tokens = list(torch.randint(0, vocab, (seq_len + 1,)).tolist())
-    prompt_length, completion_length = 3, 6
-
-    chosen, chosen_logp, amax_p, amax_i, _ = _gpu_completion_token_stats(
-        logits, tokens, prompt_length, completion_length, seq_len,
-        torch.device("cpu"), include_entropy=False,
-    )
-    assert len(chosen_logp) == len(chosen) == completion_length
-    # raw T=1 log-softmax, independent of T_PROTO
-    for i, t in enumerate(range(prompt_length, prompt_length + completion_length)):
-        expected = float(
-            torch.log_softmax(logits[t - 1].float(), dim=-1)[tokens[t]]
-        )
-        assert chosen_logp[i] == pytest.approx(expected, abs=1e-5)
-
-
-def test_proof_result_carries_raw_logprob_field():
-    from reliquary.validator.verifier import ProofResult
-
-    proof = ProofResult(all_passed=True, passed=1, checked=1)
-    assert proof.completion_chosen_logprobs_raw == []
-
-
-def test_batcher_attaches_only_full_coverage():
+def test_batcher_derives_logprobs_at_unit_temperature(monkeypatch):
+    import reliquary.constants as C
     from reliquary.validator.batcher import _verify_logprobs_for_training
 
-    proof = SimpleNamespace(completion_chosen_logprobs_raw=[-0.1, -0.2, -0.3])
-    assert _verify_logprobs_for_training(proof, 3) == [-0.1, -0.2, -0.3]
+    monkeypatch.setattr(C, "T_PROTO", 1.0)
+    proof = SimpleNamespace(completion_chosen_probs=[0.5, 0.25, 1.0])
+    got = _verify_logprobs_for_training(proof, 3)
+    assert got == pytest.approx([math.log(0.5), math.log(0.25), 0.0])
+
+
+def test_batcher_refuses_non_unit_temperature(monkeypatch):
+    """log(chosen_prob) is pi_old ONLY when warp() is the identity: at any
+    other T_PROTO the probs are temperature-scaled and reusing them would put
+    the ratio in the wrong space — the exact v3 bug the v4 sampling fixed."""
+    import reliquary.constants as C
+    from reliquary.validator.batcher import _verify_logprobs_for_training
+
+    monkeypatch.setattr(C, "T_PROTO", 0.6)
+    proof = SimpleNamespace(completion_chosen_probs=[0.5, 0.25, 1.0])
+    assert _verify_logprobs_for_training(proof, 3) is None
+
+
+def test_batcher_refuses_partial_or_degenerate_coverage(monkeypatch):
+    import reliquary.constants as C
+    from reliquary.validator.batcher import _verify_logprobs_for_training
+
+    monkeypatch.setattr(C, "T_PROTO", 1.0)
+    proof = SimpleNamespace(completion_chosen_probs=[0.5, 0.25, 1.0])
     assert _verify_logprobs_for_training(proof, 4) is None    # partial coverage
     assert _verify_logprobs_for_training(proof, 0) is None
-    legacy = SimpleNamespace()                                 # old ProofResult
+    zero = SimpleNamespace(completion_chosen_probs=[0.5, 0.0, 1.0])
+    assert _verify_logprobs_for_training(zero, 3) is None     # log(0) undefined
+    legacy = SimpleNamespace()                                # no field at all
     assert _verify_logprobs_for_training(legacy, 3) is None

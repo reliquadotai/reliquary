@@ -786,7 +786,7 @@ def test_gpu_completion_token_stats_returns_chosen_and_argmax():
     logits[1] = torch.tensor([0.0, 0.0, 0.0, 9.0])   # predicts token at idx2
     tokens = [0, 1, 3]  # idx1 token=1 (the argmax), idx2 token=3 (the argmax)
 
-    chosen, _chosen_logp, amax_p, amax_id, entropy = verifier._gpu_completion_token_stats(
+    chosen, amax_p, amax_id, entropy = verifier._gpu_completion_token_stats(
         logits, tokens, prompt_length=1, completion_length=2,
         seq_len=seq_len, device="cpu",
     )
@@ -813,7 +813,7 @@ def test_gpu_completion_token_stats_chunks_vocab_workspace(monkeypatch):
         2 * logits.shape[-1] * 4,
     )
 
-    chosen, _chosen_logp, amax_p, amax_id, entropy = verifier._gpu_completion_token_stats(
+    chosen, amax_p, amax_id, entropy = verifier._gpu_completion_token_stats(
         logits,
         tokens,
         prompt_length=1,
@@ -829,7 +829,7 @@ def test_gpu_completion_token_stats_chunks_vocab_workspace(monkeypatch):
 
 def test_gpu_completion_entropy_matches_uniform_distribution():
     logits = torch.zeros(2, 4)
-    _chosen, _chosen_logp, _amax_p, _amax_id, entropy = (
+    _chosen, _amax_p, _amax_id, entropy = (
         verifier._gpu_completion_token_stats(
             logits,
             [0, 1],
@@ -846,7 +846,7 @@ def test_gpu_completion_entropy_matches_uniform_distribution():
 def test_gpu_completion_entropy_is_stratified_and_bounded(monkeypatch):
     monkeypatch.setattr(verifier, "_UTILITY_ENTROPY_MAX_POSITIONS", 3)
     logits = torch.zeros(11, 4)
-    chosen, _chosen_logp, amax_p, amax_id, entropy = (
+    chosen, amax_p, amax_id, entropy = (
         verifier._gpu_completion_token_stats(
             logits,
             [0] * 11,
@@ -862,7 +862,7 @@ def test_gpu_completion_entropy_is_stratified_and_bounded(monkeypatch):
 
 
 def test_gpu_completion_entropy_can_be_disabled():
-    chosen, _chosen_logp, amax_p, amax_id, entropy = (
+    chosen, amax_p, amax_id, entropy = (
         verifier._gpu_completion_token_stats(
             torch.zeros(3, 4),
             [0, 0, 0],

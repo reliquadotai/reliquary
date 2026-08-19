@@ -82,10 +82,6 @@ class ProofResult:
     # be shorter than completion_length when boundary positions are
     # skipped (t == 0, t - 1 >= seq_len, t >= len(tokens)).
     completion_chosen_probs: list[float] = field(default_factory=list)
-    # Raw (T=1) log-softmax of each chosen completion token, fp32, aligned
-    # 1:1 with completion_chosen_probs. This IS pi_old on the verify model:
-    # train_step reuses it instead of re-running the behavior forward.
-    completion_chosen_logprobs_raw: list[float] = field(default_factory=list)
     # Token authenticity: argmax probability and argmax token id under T_PROTO,
     # aligned 1:1 with completion_chosen_probs (same surviving steps).
     completion_argmax_probs: list[float] = field(default_factory=list)
@@ -569,7 +565,6 @@ def verify_commitment_proofs(
     )
     (
         completion_chosen_probs,
-        completion_chosen_logprobs_raw,
         completion_argmax_probs,
         completion_argmax_ids,
         completion_entropies,
@@ -711,7 +706,6 @@ def verify_commitment_proofs(
         challenge_lp_indices=challenge_lp_indices,
         challenge_lp_values=challenge_lp_values,
         completion_chosen_probs=completion_chosen_probs,
-        completion_chosen_logprobs_raw=completion_chosen_logprobs_raw,
         completion_argmax_probs=completion_argmax_probs,
         completion_argmax_ids=completion_argmax_ids,
         completion_entropies=completion_entropies,
@@ -971,12 +965,11 @@ def _gpu_completion_token_stats(
     """
     valid_t = _completion_valid_t(tokens, prompt_length, completion_length, seq_len)
     if not valid_t:
-        return [], [], [], [], []
+        return [], [], [], []
 
     vocab_size = max(1, int(logits_gpu.shape[-1]))
     chunk_rows = max(1, _GPU_VOCAB_FLOAT_WORKSPACE_BYTES // (vocab_size * 4))
     chosen_values: list[float] = []
-    chosen_logprob_values: list[float] = []
     argmax_prob_values: list[float] = []
     argmax_id_values: list[int] = []
     entropy_values: list[float] = []
@@ -993,14 +986,9 @@ def _gpu_completion_token_stats(
         tok_tensor = torch.tensor(
             [tokens[t] for t in chunk_t], device=device, dtype=torch.long,
         )
-        selected = logits_gpu.index_select(0, pos_tensor).float()
-        scaled = selected / float(T_PROTO)
+        scaled = logits_gpu.index_select(0, pos_tensor).float() / float(T_PROTO)
         probs = scaled.softmax(dim=-1)
         chosen = probs.gather(1, tok_tensor.unsqueeze(1)).squeeze(1)
-        # Raw T=1 log-softmax: pi_old for train_step, independent of T_PROTO.
-        chosen_logprob = torch.log_softmax(selected, dim=-1).gather(
-            1, tok_tensor.unsqueeze(1)
-        ).squeeze(1)
         amax_probs, amax_ids = probs.max(dim=-1)
         entropy_local_rows = [
             index - start
@@ -1021,12 +1009,10 @@ def _gpu_completion_token_stats(
             ) - entropy_probs.mul_(entropy_scaled).sum(dim=-1)
             entropy_values.extend(entropy.tolist())
         chosen_values.extend(chosen.tolist())
-        chosen_logprob_values.extend(chosen_logprob.tolist())
         argmax_prob_values.extend(amax_probs.tolist())
         argmax_id_values.extend(amax_ids.tolist())
     return (
         chosen_values,
-        chosen_logprob_values,
         argmax_prob_values,
         argmax_id_values,
         entropy_values,
