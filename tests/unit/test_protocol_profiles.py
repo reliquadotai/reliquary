@@ -271,7 +271,7 @@ def test_profiles_are_frozen_slotted_and_recursively_immutable():
                 "math_cap": 8192,
                 "code_cap": 8192,
                 "thinking": 0,
-                "window": 150.0,
+                "window": 100.0,
                 "domain": "reliquary-forced-seed-v4",
                 "lr": 1e-6,
                 "kl": 0.0,
