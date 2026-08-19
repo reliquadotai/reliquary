@@ -2163,10 +2163,13 @@ class ValidationService:
                     )
                 )
         else:
-            # return_exceptions so BOTH env threads are joined before any
-            # propagation: without it, one env's raise leaves the other's
-            # seal_batch proving on the GPU while (pipelined mode) the loop
-            # continues into the next window's half on the same device.
+            # Pipelined mode joins BOTH env threads before any propagation:
+            # without it, one env's raise leaves the other's seal_batch
+            # proving on the GPU while the loop continues into the next
+            # window's half on the same device. Serial mode keeps main's
+            # immediate propagation (flag-off parity).
+            from reliquary.constants import PIPELINED_WINDOWS as _pipelined
+
             seal_results = await asyncio.gather(*(
                 asyncio.to_thread(
                     batcher.seal_batch,
@@ -2174,7 +2177,7 @@ class ValidationService:
                     commit_side_effects=False,
                 )
                 for _name, batcher in seal_items
-            ), return_exceptions=True)
+            ), return_exceptions=bool(_pipelined))
             for _res in seal_results:
                 if isinstance(_res, BaseException):
                     raise _res
@@ -3610,6 +3613,18 @@ class ValidationService:
                             )
                         except asyncio.CancelledError:
                             seal_wait_task.cancel()
+                            try:
+                                # Retrieve the outcome so a real seal-path
+                                # error stored in the task is not silently
+                                # dropped at GC during shutdown.
+                                await seal_wait_task
+                            except asyncio.CancelledError:
+                                pass
+                            except Exception:
+                                logger.exception(
+                                    "seal-wait task failed during "
+                                    "cancellation"
+                                )
                             raise
                         except FatalProofPlaneError:
                             # Proof plane is unrecoverable in-process; the
@@ -3632,8 +3647,18 @@ class ValidationService:
                             seal_wait_task.cancel()
                             try:
                                 await seal_wait_task
-                            except (asyncio.CancelledError, Exception):
-                                pass
+                            except asyncio.CancelledError:
+                                if not seal_wait_task.cancelled():
+                                    # The CancelledError hit OUR await (an
+                                    # external shutdown racing the fatal),
+                                    # not the task we cancelled — propagate
+                                    # the cancellation, not the fatal.
+                                    raise
+                            except Exception:
+                                logger.exception(
+                                    "seal-wait task failed during fatal "
+                                    "teardown"
+                                )
                             raise
                         except Exception:
                             # One incident, one window: the stashed window is
@@ -3661,6 +3686,11 @@ class ValidationService:
                                     "Failed to tombstone stashed window %d",
                                     stashed_n,
                                 )
+                        except BaseException:
+                            # SystemExit/KeyboardInterrupt: don't orphan the
+                            # seal-wait task on the way out.
+                            seal_wait_task.cancel()
+                            raise
                     self._window_iteration_stage = "seal_wait"
                     if seal_wait_task is not None:
                         seal_reason = await seal_wait_task

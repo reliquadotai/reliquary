@@ -152,7 +152,13 @@ swap — proofs(N+1) still run on K).
    proof-gated and randomness-bound. (c) server-side _recent_reject_counts
    are snapshotted into the stash so N's archive keeps N's counters; the
    upload-precommit conservation shift at activation is accepted
-   (telemetry-only).
+   (telemetry-only). (d) a pipelined window's post-seal auction verdict
+   rejects (record_verdict during the GPU half) land in the NEXT window's
+   reject counter/archive — telemetry-only, accepted. (e) window N's
+   cooldown commit lands mid-collection of N+1: up to B_BATCH prompts/env
+   flip to PROMPT_IN_COOLDOWN at arrival while /state's frozen snapshot
+   still advertises them as free — bounded, explicit reject (not a silent
+   drop), accepted.
 3. Serial beat at publish (above) — deletes the deferred swap (2, 3, 8, 9).
 4. Failure paths (6) — shipped: a stashed-half failure tombstones ONLY the
    stashed window and the collecting window continues; an open-phase
