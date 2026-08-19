@@ -137,21 +137,44 @@ swap — proofs(N+1) still run on K).
    move to stash time. But no enforcement gap actually exists: cooldown and
    content-cooldown are re-checked at seal-time RANKING, and GPU halves are
    strictly serialized, so window N's commit always lands before window
-   N+1's ranking. Rollout-hash replay across windows dies at forced-seed
-   proof (rollouts are bound to the window randomness). The only real gap
-   was ADVISORY: N+1's cooldown_prompts_snapshot (drives /state and arrival
-   rejects) misses N's pending cooldowns, so miners would waste generation
-   effort on prompts silently dropped at seal. Fix shipped: at open with a
-   backlog, N+1's snapshot is augmented with the stashed window's
-   admitted_prompt_idxs() — a safe over-approximation, cleared naturally at
-   the next window.
+   N+1's ranking. Rollout-hash replay across windows dies at ARRIVAL
+   (claimed randomness must equal the window randomness) and at forced-seed
+   proof. Residual, ACCEPTED costs of one-window-late commits (v2 review):
+   (a) advisory staleness — a prompt rewarded in N is not advertised as
+   cooled during N+1's collection, so a miner re-picking it wastes one
+   generation (bounded: ≤B_BATCH prompts/env, one window). A projection of
+   the stashed pool into N+1's snapshot was BUILT AND REVERTED: since the
+   snapshot also drives arrival rejects, unioning the whole admitted pool
+   turned a losing bid into a cheap one-window prompt-denial primitive
+   against competitors (review MAJOR) and changed admission rules (design
+   non-goal). (b) the arrival hash-dedup set misses N's rewarded hashes
+   during N+1's collection — defense-in-depth only; every paying path is
+   proof-gated and randomness-bound. (c) server-side _recent_reject_counts
+   are snapshotted into the stash so N's archive keeps N's counters; the
+   upload-precommit conservation shift at activation is accepted
+   (telemetry-only).
 3. Serial beat at publish (above) — deletes the deferred swap (2, 3, 8, 9).
 4. Failure paths (6) — shipped: a stashed-half failure tombstones ONLY the
-   stashed window and the collecting window continues (fatal proof-plane
-   errors still restart the process — crash semantics, backlog replayed);
-   an open-phase failure salvages the sealed backlog by running its GPU
-   half serially before resetting, so it is paid+trained, or tombstoned as
-   PipelinedSalvageFailure if the salvage itself fails.
+   stashed window and the collecting window continues; an open-phase
+   failure salvages the sealed backlog by running its GPU half serially
+   before resetting, so it is paid+trained, or tombstoned as
+   PipelinedSalvageFailure if the salvage itself fails. Fatal proof-plane
+   errors always tombstone the backlog before terminating (no silent
+   archive gap, no same-number replay) and are never downgraded by the
+   salvage path. ACCEPTED structural cost: any hard process death (SIGKILL,
+   OOM) while a backlog is stashed loses that sealed window unpaid — one
+   more window per crash than serial mode; acceptable at the current
+   crash rate, revisit if fatal restarts climb again.
+
+5. Miner-visible timing (v2 review FATAL, fixed): poll_deadline is only
+   driven by _wait_for_window_seal, so running the GPU half first would
+   seal the collecting window ~a GPU half late and pin /state to OPEN for
+   the entire cycle — out-of-phase miners would never re-sync. Fix: the
+   collecting window's seal-wait runs as a CONCURRENT task
+   (_seal_wait_and_close) alongside the stashed GPU half; it seals on the
+   deadline and flips the FSM to READY at that moment, restoring the
+   serial-mode OPEN -> not-OPEN edge. The stash also releases routing and
+   FSM state exactly like the serial end-of-window path.
 
 ## Edge cases
 

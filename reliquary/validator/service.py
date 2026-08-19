@@ -916,6 +916,21 @@ class ValidationService:
             parameter.requires_grad = False
         self._verify_model_checkpoint_revision = checkpoint_revision
 
+    async def _seal_wait_and_close(self) -> str:
+        """Seal-wait as a concurrent task during a pipelined GPU half.
+
+        poll_deadline() is only driven by _wait_for_window_seal; if the loop
+        only reached it AFTER the stashed GPU half (~2 GPU-half durations
+        into a 100 s collection), the collecting window would seal late and
+        /state would show OPEN for the entire cycle — out-of-phase miners
+        would then never see an OPEN -> not-OPEN edge and never re-sync.
+        Running it concurrently seals ON the deadline and flips the FSM to
+        READY at that moment, restoring the serial-mode miner-visible edge.
+        """
+        reason = await self._wait_for_window_seal()
+        self._set_state(WindowState.READY)
+        return reason
+
     def _publication_due_next_half(self) -> bool:
         """Forecast, at seal time, whether this window's GPU half may publish.
 
@@ -928,6 +943,18 @@ class ValidationService:
         publication to the next — serial — window. Cost of a false positive:
         one serial window (~100 s), at most once per publish interval.
         """
+        emergency_freeze = os.environ.get(
+            "RELIQUARY_DISABLE_TRAIN", ""
+        ).lower() in {"1", "true", "yes", "on"}
+        ceiling_reached = (
+            TRAIN_UNTIL_CHECKPOINT_N > 0
+            and self._checkpoint_n >= TRAIN_UNTIL_CHECKPOINT_N
+        )
+        if emergency_freeze or ceiling_reached:
+            # should_publish is permanently False in these regimes; without
+            # this gate a counter frozen at publish_every-1 would pin the
+            # loop to the serial path forever.
+            return False
         try:
             bootstrap = self._checkpoint_store.current_manifest() is None
         except Exception:
@@ -1016,6 +1043,19 @@ class ValidationService:
                 "scheduled proving requires a published checkpoint"
             )
         if self._verify_model_checkpoint_revision != checkpoint.revision:
+            if getattr(self, "_gpu_backlog", None) is not None:
+                # Should be unreachable: publishes are serial-only, so the
+                # revisions can only diverge in an iteration with no backlog.
+                # If it fires anyway, the stashed window's proofs would run
+                # against the wrong weights — loud is better than silent.
+                logger.error(
+                    "verify model revision diverged (%s != %s) while a "
+                    "pipelined backlog is stashed; refreshing anyway — "
+                    "stashed window %s proofs may be mis-verified",
+                    self._verify_model_checkpoint_revision,
+                    checkpoint.revision,
+                    self._gpu_backlog[1],
+                )
             await asyncio.to_thread(
                 self._refresh_verify_model_from_train,
                 checkpoint.revision,
@@ -1281,19 +1321,6 @@ class ValidationService:
                 **open_kwargs,
             )
             batcher.current_checkpoint_hash = cp_hash
-            if getattr(self, "_gpu_backlog", None) is not None:
-                # Pipelined: the stashed window's side effects have not
-                # committed yet. Project its admitted prompts into this
-                # window's cooldown snapshot so /state advertises them and
-                # arrival gating rejects them, instead of admitting
-                # submissions that seal-time ranking (which runs after the
-                # stashed window's commit) would silently drop as cooled.
-                stashed_env_batcher = self._gpu_backlog[0].get(env_name)
-                if stashed_env_batcher is not None:
-                    batcher.cooldown_prompts_snapshot = sorted(
-                        set(batcher.cooldown_prompts_snapshot)
-                        | set(stashed_env_batcher.admitted_prompt_idxs())
-                    )
             self._active_batchers[env_name] = batcher
 
     def _activate_window(self) -> None:
@@ -2018,6 +2045,7 @@ class ValidationService:
         window_n: int | None = None,
         verify_task=None,
         late_drops: dict | None = None,
+        server_reject_counts: dict | None = None,
     ) -> None:
         """TRAINING + PUBLISHING + READY phases for one sealed window."""
         # Pipelined mode passes the SEALED window's batchers explicitly while
@@ -2065,6 +2093,7 @@ class ValidationService:
                 failure_stage="beacon_verification",
                 failure_type="InvalidBeacon",
                 batchers=batchers,
+                late_drops=late_drops,
             )
             if owns_routing:
                 self.server.set_active_batchers({})
@@ -2086,6 +2115,7 @@ class ValidationService:
                 failure_stage="admission_drain",
                 failure_type="AdmissionDrainTimeout",
                 batchers=batchers,
+                late_drops=late_drops,
             )
             if owns_routing:
                 self.server.set_active_batchers({})
@@ -2133,6 +2163,10 @@ class ValidationService:
                     )
                 )
         else:
+            # return_exceptions so BOTH env threads are joined before any
+            # propagation: without it, one env's raise leaves the other's
+            # seal_batch proving on the GPU while (pipelined mode) the loop
+            # continues into the next window's half on the same device.
             seal_results = await asyncio.gather(*(
                 asyncio.to_thread(
                     batcher.seal_batch,
@@ -2140,7 +2174,10 @@ class ValidationService:
                     commit_side_effects=False,
                 )
                 for _name, batcher in seal_items
-            ))
+            ), return_exceptions=True)
+            for _res in seal_results:
+                if isinstance(_res, BaseException):
+                    raise _res
         sealed: dict[str, tuple] = {
             name: result
             for (name, _batcher), result in zip(
@@ -2183,6 +2220,7 @@ class ValidationService:
                 failure_stage="proof_capacity",
                 failure_type="ProofCapacityAbort",
                 batchers=batchers,
+                late_drops=late_drops,
             )
             if owns_routing:
                 self.server.set_active_batchers({})
@@ -2649,13 +2687,19 @@ class ValidationService:
         })
 
         try:
-            await self._archive_window(batchers, sealed, late_drops=late_drops)
+            await self._archive_window(
+                batchers,
+                sealed,
+                late_drops=late_drops,
+                server_reject_counts=server_reject_counts,
+            )
         except Exception as exc:
             logger.exception("window archive failed")
             self._enqueue_aborted_window(
                 failure_stage="archive_enqueue",
                 failure_type=type(exc).__name__,
                 batchers=batchers,
+                late_drops=late_drops,
             )
 
         if owns_routing:
@@ -2664,7 +2708,9 @@ class ValidationService:
         if owns_routing:
             self._set_state(WindowState.READY)
 
-    async def _archive_window(self, batchers, sealed, late_drops=None) -> None:
+    async def _archive_window(
+        self, batchers, sealed, late_drops=None, server_reject_counts=None,
+    ) -> None:
         """Assemble and enqueue the per-window archive payload.
 
         ``batchers`` is either:
@@ -3071,10 +3117,15 @@ class ValidationService:
             for reason, count in env_grader_failures.items():
                 grader_failures[reason] = grader_failures.get(reason, 0) + count
 
+        # Pipelined mode passes a stash-time snapshot: the live counter was
+        # reset at the NEXT window's activation and holds its rejects, not
+        # this window's.
         server_reject_summary = {
             str(reason): int(count)
             for reason, count in dict(
-                getattr(self.server, "_recent_reject_counts", {})
+                server_reject_counts
+                if server_reject_counts is not None
+                else getattr(self.server, "_recent_reject_counts", {})
             ).items()
             if isinstance(count, int) and not isinstance(count, bool)
         }
@@ -3524,28 +3575,41 @@ class ValidationService:
                     await self._set_window_randomness(subtensor)
                     self._activate_window()
                     self._window_iteration_stage = "active"
+                    seal_wait_task = None
                     if self._gpu_backlog is not None:
                         # Pipelined mode: the previous window sealed last
                         # iteration; its GPU half (proofs + train + archive)
                         # runs NOW, hidden under the collection of the window
                         # we just activated. Nothing in it is speculative —
                         # the stashed window's ranking froze at its seal.
+                        # The collecting window's seal-wait runs CONCURRENTLY
+                        # so poll_deadline fires on the deadline and miners
+                        # get their OPEN edge on time (see
+                        # _seal_wait_and_close).
                         (
                             stashed_batchers,
                             stashed_n,
                             stashed_verify_task,
                             stashed_drops,
+                            stashed_reject_counts,
                         ) = self._gpu_backlog
                         self._gpu_backlog = None
-                        self._window_iteration_stage = "pipelined_train_archive"
+                        seal_wait_task = asyncio.create_task(
+                            self._seal_wait_and_close()
+                        )
+                        self._window_iteration_stage = (
+                            "pipelined_train_archive"
+                        )
                         try:
                             await self._train_and_publish(
                                 batchers=stashed_batchers,
                                 window_n=stashed_n,
                                 verify_task=stashed_verify_task,
                                 late_drops=stashed_drops,
+                                server_reject_counts=stashed_reject_counts,
                             )
                         except asyncio.CancelledError:
+                            seal_wait_task.cancel()
                             raise
                         except FatalProofPlaneError:
                             # Proof plane is unrecoverable in-process; the
@@ -3565,6 +3629,11 @@ class ValidationService:
                                     "Failed to tombstone stashed window %d",
                                     stashed_n,
                                 )
+                            seal_wait_task.cancel()
+                            try:
+                                await seal_wait_task
+                            except (asyncio.CancelledError, Exception):
+                                pass
                             raise
                         except Exception:
                             # One incident, one window: the stashed window is
@@ -3593,7 +3662,10 @@ class ValidationService:
                                     stashed_n,
                                 )
                     self._window_iteration_stage = "seal_wait"
-                    seal_reason = await self._wait_for_window_seal()
+                    if seal_wait_task is not None:
+                        seal_reason = await seal_wait_task
+                    else:
+                        seal_reason = await self._wait_for_window_seal()
                     if seal_reason == "sealed":
                         logger.info(
                             "Window %d: all %d batcher(s) sealed",
@@ -3612,6 +3684,12 @@ class ValidationService:
 
                     from reliquary.constants import PIPELINED_WINDOWS
 
+                    if PIPELINED_WINDOWS and self._publication_due_next_half():
+                        logger.info(
+                            "Window %d: publication due next half — running "
+                            "this window on the SERIAL path",
+                            self._window_n,
+                        )
                     if PIPELINED_WINDOWS and not self._publication_due_next_half():
                         # Stash the sealed window; its GPU half runs at the
                         # top of the next iteration, after the next window's
@@ -3631,8 +3709,21 @@ class ValidationService:
                             self._window_n,
                             self._verify_task,
                             stashed_drops,
+                            dict(getattr(
+                                self.server, "_recent_reject_counts", {},
+                            )),
                         )
                         self._verify_task = None
+                        # Release routing and FSM exactly as the serial path
+                        # does at end-of-window: the window is sealed (server
+                        # hard-rejects arrivals), miners polling /state see
+                        # READY instead of a stale OPEN, and the loop
+                        # handlers' default-batchers tombstone can no longer
+                        # alias the stashed window (which the salvage path
+                        # owns from here).
+                        self.server.set_active_batchers({})
+                        self._active_batchers = {}
+                        self._set_state(WindowState.READY)
                     else:
                         self._window_iteration_stage = "seal_train_archive"
                         await self._train_and_publish()
@@ -3671,13 +3762,37 @@ class ValidationService:
                             "Failed to enqueue fatal proof tombstone"
                         )
                     if self._gpu_backlog is not None:
-                        logger.error(
-                            "Dropping pipelined backlog window %d on fatal "
-                            "proof-plane failure (unpaid; replayed after "
-                            "restart, matching crash-window semantics)",
-                            self._gpu_backlog[1],
-                        )
+                        # The proof plane is unrecoverable, so the sealed
+                        # backlog cannot be salvaged — but it MUST leave a
+                        # tombstone: without one, restart's max(R2 windows)
+                        # can advance past it (silent permanent archive gap)
+                        # or re-collect under the same number.
+                        (
+                            _fb, _fn, _fvt, _fd, _frc,
+                        ) = self._gpu_backlog
                         self._gpu_backlog = None
+                        logger.error(
+                            "Tombstoning pipelined backlog window %d on "
+                            "fatal proof-plane failure (unpaid)",
+                            _fn,
+                        )
+                        # The fatal may fire in a non-allowlisted stage
+                        # (e.g. proof_replica_refresh); set the truthful
+                        # pipelined stage so the tombstone is not skipped.
+                        self._window_iteration_stage = (
+                            "pipelined_train_archive"
+                        )
+                        try:
+                            self._enqueue_aborted_window(
+                                failure_stage="pipelined_train_archive",
+                                failure_type="FatalProofPlaneError",
+                                batchers=_fb,
+                                late_drops=_fd,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to tombstone backlog window %d", _fn,
+                            )
                     self.server.set_active_batchers({})
                     self._active_batchers = {}
                     self._set_state(WindowState.READY)
@@ -3700,7 +3815,7 @@ class ValidationService:
                         # sealed backlog is intact and its miners are owed
                         # payment. Salvage it serially before resetting.
                         (
-                            _sb, _sn, _svt, _sd,
+                            _sb, _sn, _svt, _sd, _src,
                         ) = self._gpu_backlog
                         self._gpu_backlog = None
                         logger.error(
@@ -3721,8 +3836,31 @@ class ValidationService:
                                 window_n=_sn,
                                 verify_task=_svt,
                                 late_drops=_sd,
+                                server_reject_counts=_src,
                             )
                         except asyncio.CancelledError:
+                            raise
+                        except FatalProofPlaneError:
+                            # Do NOT downgrade a fatal to a salvage failure:
+                            # the proof plane needs a supervisor restart, and
+                            # opening another window against it would burn it
+                            # too. Tombstone, then let the fatal escape.
+                            logger.exception(
+                                "Fatal proof-plane failure during salvage "
+                                "of window %d; terminating for restart", _sn,
+                            )
+                            try:
+                                self._enqueue_aborted_window(
+                                    failure_stage="pipelined_train_archive",
+                                    failure_type="FatalProofPlaneError",
+                                    batchers=_sb,
+                                    late_drops=_sd,
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Failed to tombstone stashed window %d",
+                                    _sn,
+                                )
                             raise
                         except Exception:
                             logger.exception(

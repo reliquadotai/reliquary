@@ -92,6 +92,7 @@ async def test_cross_environment_abort_discards_all_seal_side_effects():
         failure_stage="proof_capacity",
         failure_type="ProofCapacityAbort",
         batchers=expected_batchers,
+        late_drops=None,
     )
 
 
@@ -121,6 +122,7 @@ async def test_faulted_proof_scheduler_archives_then_requires_restart():
         failure_stage="proof_capacity",
         failure_type="ProofCapacityAbort",
         batchers=expected_batchers,
+        late_drops=None,
     )
 
 

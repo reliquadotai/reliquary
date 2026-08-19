@@ -5145,23 +5145,6 @@ class GrpoWindowBatcher:
         self._seal_side_effects_committed = True
         self._pending_seal_side_effects = None
 
-    def admitted_prompt_idxs(self) -> list[int]:
-        """Prompt indices of every admitted (pending or proven) submission.
-
-        Pipelined mode uses this as the sealed window's PROJECTED cooldown
-        superset: any of these prompts may enter cooldown once this window's
-        side effects commit, so the next, concurrently-collecting window
-        advertises and arrival-gates them as cooled. Over-approximation is
-        safe (a non-rewarded prompt is blocked for one window); the
-        authoritative check stays in seal-time ranking, which runs strictly
-        after this window's commit.
-        """
-        with self._lock:
-            return sorted(
-                {p.prompt_idx for p in self._pending}
-                | {v.prompt_idx for v in self._valid}
-            )
-
     def commit_seal_side_effects(self) -> None:
         """Commit cooldown and dedup state after every environment seals."""
 

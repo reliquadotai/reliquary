@@ -88,6 +88,7 @@ class _ForecastStub:
     _publication_due_next_half = ValidationService._publication_due_next_half
 
     def __init__(self, since=0, every=16, adaptive=False, manifest=object()):
+        self._checkpoint_n = 0
         self._trained_windows_since_publish = since
         self._publish_every = every
         self._adaptive_publication_pending = adaptive
@@ -173,3 +174,46 @@ def test_tombstone_explicit_batchers_and_per_window_dedup(monkeypatch):
     )
     assert len(enqueued) == 2
     assert enqueued[1][0] == 300
+
+
+class _SealCloseStub:
+    _seal_wait_and_close = ValidationService._seal_wait_and_close
+
+    def __init__(self):
+        self.states = []
+
+    async def _wait_for_window_seal(self):
+        return "sealed"
+
+    def _set_state(self, state):
+        self.states.append(state)
+
+
+def test_seal_wait_and_close_flips_fsm_at_deadline():
+    """Miners need the OPEN -> not-OPEN edge ON the collection deadline,
+    not when the concurrent GPU half joins ~a half later."""
+    from reliquary.protocol.submission import WindowState
+
+    stub = _SealCloseStub()
+    reason = _run(_SealCloseStub._seal_wait_and_close(stub))
+    assert reason == "sealed"
+    assert stub.states == [WindowState.READY]
+
+
+def test_publication_forecast_false_under_freeze(monkeypatch):
+    """RELIQUARY_DISABLE_TRAIN freezes the counter; without the gate a
+    counter stuck at publish_every-1 would pin the loop serial forever."""
+    monkeypatch.setenv("RELIQUARY_DISABLE_TRAIN", "1")
+    stub = _ForecastStub(since=15)
+    stub._checkpoint_n = 0
+    assert stub._publication_due_next_half() is False
+
+
+def test_publication_forecast_false_at_checkpoint_ceiling(monkeypatch):
+    import reliquary.validator.service as service_mod
+
+    monkeypatch.delenv("RELIQUARY_DISABLE_TRAIN", raising=False)
+    monkeypatch.setattr(service_mod, "TRAIN_UNTIL_CHECKPOINT_N", 5)
+    stub = _ForecastStub(since=15)
+    stub._checkpoint_n = 5
+    assert stub._publication_due_next_half() is False
