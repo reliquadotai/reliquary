@@ -954,9 +954,16 @@ def _validator_completion_logprobs(rollout, n_completion: int):
     to the behavior forward, never to miner-claimed values). Lazy import so
     tests can monkeypatch reliquary.constants.
     """
-    from reliquary.constants import PI_OLD_FROM_VERIFY_LOGPROBS
+    from reliquary.constants import (
+        PI_OLD_FROM_VERIFY_LOGPROBS,
+        RECOMPUTE_PI_OLD_FROM_VERIFY,
+    )
 
-    if not PI_OLD_FROM_VERIFY_LOGPROBS:
+    # RECOMPUTE_PI_OLD_FROM_VERIFY=0 is the incident switch meaning "pi_old
+    # comes from the miner claim"; seal-time verify values are a recompute
+    # too, so they must honor it — otherwise the switch silently stops
+    # restoring the legacy behavior and incident bisection is confounded.
+    if not (PI_OLD_FROM_VERIFY_LOGPROBS and RECOMPUTE_PI_OLD_FROM_VERIFY):
         return None
     values = getattr(rollout, "_validated_completion_logprobs", None)
     if not isinstance(values, list) or len(values) != n_completion:
@@ -1044,13 +1051,12 @@ def _rollout_loss(
                     )
             behavior_logprobs_c = behavior_logprobs[prompt_length - 1:]
 
-    # π_old from miner (same completion slice)
-    old_logprobs = torch.tensor(
-        old_logprobs_list, device=device, dtype=new_logprobs_c.dtype,
-    )
-    if len(old_logprobs) != len(new_logprobs_c):
+    # π_old source: validator > behavior forward > miner claim. The miner
+    # length check stays unconditional (protocol invariant), but its tensor
+    # is only materialised on the fallback path.
+    if len(old_logprobs_list) != len(new_logprobs_c):
         raise ValueError(
-            f"log-prob length mismatch: miner reported {len(old_logprobs)}, "
+            f"log-prob length mismatch: miner reported {len(old_logprobs_list)}, "
             f"model predicts {len(new_logprobs_c)} completion tokens"
         )
     if validator_old is not None:
@@ -1061,6 +1067,10 @@ def _rollout_loss(
         if len(behavior_logprobs_c) != len(new_logprobs_c):
             raise ValueError("behavior-model completion length mismatch")
         old_logprobs = behavior_logprobs_c.detach()
+    else:
+        old_logprobs = torch.tensor(
+            old_logprobs_list, device=device, dtype=new_logprobs_c.dtype,
+        )
 
     # Mask the validator-injected FORCE span out of the loss. Those actions were
     # not sampled by the policy, so policy-gradient on them is invalid and their
@@ -1173,6 +1183,8 @@ def _new_kl_stats() -> dict[str, float | int]:
         "weighted_ppo": 0.0,
         "weighted_kl": 0.0,
         "ppo_token_count": 0,
+        "pi_old_validator_token_count": 0,
+        "kl_term_computed_token_count": 0,
         "ppo_clip_active_count": 0,
         "ppo_ratio_below_clip_count": 0,
         "ppo_ratio_above_clip_count": 0,
@@ -1200,6 +1212,8 @@ def _record_kl_stats(
     ppo_clip_active,
     claimed_old,
     behavior_old,
+    pi_old_from_validator: bool = False,
+    kl_term_computed: bool = True,
 ) -> None:
     """Accumulate bounded policy-health telemetry after a micro-batch."""
     if stats is None:
@@ -1220,6 +1234,10 @@ def _record_kl_stats(
         stats["weighted_ppo"] += float((scale_cat * ppo_tok).sum())
         stats["weighted_kl"] += float((scale_cat * kl_tok).sum())
         stats["ppo_token_count"] += ppo_ratio.numel()
+        if pi_old_from_validator:
+            stats["pi_old_validator_token_count"] += ppo_ratio.numel()
+        if kl_term_computed:
+            stats["kl_term_computed_token_count"] += ppo_ratio.numel()
         stats["ppo_clip_active_count"] += int(ppo_clip_active.sum())
         stats["ppo_ratio_below_clip_count"] += int(
             (ppo_ratio < 1.0 - PPO_CLIP_EPSILON_LOW).sum()
@@ -1316,6 +1334,17 @@ def _kl_telemetry_metrics(stats: dict[str, float | int]) -> dict[str, float]:
         ),
         "train/ppo_ratio_nonfinite_ratio": (
             int(stats["ppo_ratio_nonfinite_count"]) / ppo_denominator
+        ),
+        # Fraction of trained tokens whose pi_old came from the seal-time
+        # verify pass (1.0 = full reuse, falling values = silent fallback to
+        # the behavior forward — the perf win evaporating visibly).
+        "train/pi_old_from_verify_ratio": (
+            int(stats["pi_old_validator_token_count"]) / ppo_denominator
+        ),
+        # 0.0 means the KL term was skipped (KL_BETA==0, ref forward not
+        # needed): train/kl reads 0 by construction there, not by measurement.
+        "train/kl_term_computed_ratio": (
+            int(stats["kl_term_computed_token_count"]) / ppo_denominator
         ),
         "train/ppo_log_ratio_abs_max": float(
             stats["ppo_log_ratio_abs_max"]
@@ -1494,6 +1523,8 @@ def _microbatch_grad(
         ppo_clip_active=clip_active,
         claimed_old=claimed_old_cat,
         behavior_old=behavior_old_cat,
+        pi_old_from_validator=use_validator_old,
+        kl_term_computed=ref_lp is not None,
     )
 
     sum_ppo = sum_kl = 0.0

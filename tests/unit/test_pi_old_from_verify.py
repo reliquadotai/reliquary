@@ -237,3 +237,38 @@ def test_batcher_refuses_partial_or_degenerate_coverage(monkeypatch):
     assert _verify_logprobs_for_training(zero, 3) is None     # log(0) undefined
     legacy = SimpleNamespace()                                # no field at all
     assert _verify_logprobs_for_training(legacy, 3) is None
+
+
+def test_helper_honors_recompute_kill_switch(monkeypatch):
+    """RECOMPUTE_PI_OLD_FROM_VERIFY=0 is the incident switch meaning
+    'pi_old = miner claim'; verify-derived values must honor it too."""
+    import reliquary.constants as C
+    monkeypatch.setattr(C, "RECOMPUTE_PI_OLD_FROM_VERIFY", False)
+    r = _mk_rollout([1, 2, 3, 4, 5], 2, vold=[-0.1, -0.2, -0.3])
+    assert _validator_completion_logprobs(r, 3) is None
+
+
+def test_verifier_chosen_probs_are_pre_warp():
+    """The batcher's log(p)==raw-logprob equivalence needs the verifier's
+    chosen probs to be a FULL-VOCAB softmax (no top-k/top-p truncation).
+    Pin it: a token far outside any nucleus must keep its full-softmax mass."""
+    from reliquary.validator import verifier
+
+    torch.manual_seed(4)
+    seq_len, vocab = 5, 64
+    logits = torch.zeros(seq_len, vocab)
+    logits[:, :4] = 8.0                       # a 4-token nucleus dominates
+    deep_tail = 40                            # far outside any top-k window
+    tokens = [0, deep_tail, deep_tail, deep_tail, deep_tail, deep_tail]
+
+    chosen, _amax_p, _amax_id, _entropy = verifier._gpu_completion_token_stats(
+        logits, tokens, prompt_length=1, completion_length=4, seq_len=seq_len,
+        device=torch.device("cpu"), include_entropy=False,
+    )
+
+    expected = float(
+        torch.softmax(logits[0].float() / float(verifier.T_PROTO), dim=-1)[deep_tail]
+    )
+    assert expected > 0.0
+    for value in chosen:
+        assert value == pytest.approx(expected, rel=1e-5)
