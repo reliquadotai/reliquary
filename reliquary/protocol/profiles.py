@@ -240,10 +240,20 @@ _PROFILE_VALUES = (
         # and seal-verify time from day one. Start the cap at 8192 (≈6× the
         # observed ck0 max, and above OVERLONG_PENALTY_CACHE_TOKENS=4096 so the
         # soft-overlong zone [cap-4096, cap] still sits ABOVE the natural length)
-        # and the window at 150s (~half the near-cap generation time). Both are
-        # meant to ramp up with the policy's growing reasoning length; watch the
-        # cap-hit rate as the thermostat before raising them.
-        collection_seconds=150,
+        # The cap is meant to ramp up with the policy's growing reasoning
+        # length; watch the cap-hit rate as the thermostat before raising it.
+        #
+        # The window is now sized from measured arrivals rather than from the
+        # cap. Over w29400-29440 (2175 submissions, R2 archives) submissions
+        # land at median 25s / p95 67s / p99 93s / max 126s for math and
+        # median 16s / p99 76s for code — nothing at all arrives between 126s
+        # and the old 150s deadline, so that tail was pure dead air. 100s sits
+        # just above the p99 and drops 0.7% of math submissions (0% of code),
+        # spread thinly: per-hotkey medians all fall in 16-35s and the highest
+        # -volume miners lose 0-1.5%, so no hardware class is excluded. The
+        # measured window cycle is 385s median (collection 39%, seal proofs
+        # 22%, train+archive 40%), so this returns ~15% more windows per hour.
+        collection_seconds=100,
         upload_grace_seconds=33,
         prompt_encoding="raw",
         sampling=_SAMPLING_DAPO,
