@@ -70,10 +70,11 @@ async def test_cross_environment_abort_discards_all_seal_side_effects():
         ("openmathinstruct", 1.0),
         ("opencodeinstruct", 1.0),
     )
-    svc._active_batchers = {
+    expected_batchers = {
         "openmathinstruct": math,
         "opencodeinstruct": code,
     }
+    svc._active_batchers = expected_batchers
     svc.proof_scheduler = SimpleNamespace(state=SchedulerState.RUNNING)
     svc._fetch_seal_randomness = AsyncMock(return_value="ab" * 32)
     svc._enqueue_aborted_window = MagicMock()
@@ -90,6 +91,8 @@ async def test_cross_environment_abort_discards_all_seal_side_effects():
     svc._enqueue_aborted_window.assert_called_once_with(
         failure_stage="proof_capacity",
         failure_type="ProofCapacityAbort",
+        batchers=expected_batchers,
+        late_drops=None,
     )
 
 
@@ -105,7 +108,8 @@ async def test_faulted_proof_scheduler_archives_then_requires_restart():
     batcher.proof_capacity_aborted = True
     batcher.proof_capacity_abort_reason = "active_proof_timeout"
     batcher.seal_batch.return_value = ([], {})
-    svc._active_batchers = {"openmathinstruct": batcher}
+    expected_batchers = {"openmathinstruct": batcher}
+    svc._active_batchers = expected_batchers
     svc.proof_scheduler = SimpleNamespace(state=SchedulerState.FAULTED)
     svc._fetch_seal_randomness = AsyncMock(return_value="ab" * 32)
     svc._enqueue_aborted_window = MagicMock()
@@ -117,6 +121,8 @@ async def test_faulted_proof_scheduler_archives_then_requires_restart():
     svc._enqueue_aborted_window.assert_called_once_with(
         failure_stage="proof_capacity",
         failure_type="ProofCapacityAbort",
+        batchers=expected_batchers,
+        late_drops=None,
     )
 
 
@@ -532,7 +538,7 @@ async def test_admission_drain_abort_never_ranks_rewards_or_trains(monkeypatch):
     batcher.seal_batch = MagicMock(
         side_effect=AssertionError("aborted population must not be ranked")
     )
-    svc._window_archive_enqueued = False
+    svc._archive_enqueued_windows = set()
     svc._window_iteration_stage = "seal_train_archive"
     checkpoint_n = svc._checkpoint_n
     tombstones = []

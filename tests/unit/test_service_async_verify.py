@@ -274,7 +274,7 @@ async def test_train_and_publish_skips_when_beacon_invalid(monkeypatch):
     svc._active_batcher.env = MagicMock(name="openmathinstruct")
     svc._active_batcher.beacon_invalid = True
     svc._window_n = 7
-    svc._window_archive_enqueued = False
+    svc._archive_enqueued_windows = set()
     svc._window_iteration_stage = "seal_train_archive"
 
     # If any of these get called, the gate failed.
