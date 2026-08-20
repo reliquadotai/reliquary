@@ -649,6 +649,9 @@ class ValidationService:
         # training control, so it is immutable and fail-closed. Empty config keeps
         # the legacy rolling reference (verify_model) exactly as before.
         self.base_ref_model = None
+        # Run id read from the resumed checkpoint's profile (None until
+        # _apply_resume_from runs, or when resuming pre-field checkpoints).
+        self._resumed_training_run_id: str | None = None
         # Pipelined window collection: the sealed-window GPU work stashed for
         # the next loop iteration, and the verify-model swap deferred until
         # the last window generated under the previous checkpoint is proven.
@@ -1217,9 +1220,15 @@ class ValidationService:
 
         # Historical auction-v2 checkpoints predate lineage metadata and remain
         # loadable. Auction-v3 must never silently resume those 2B weights.
-        validate_checkpoint_profile(
+        resumed_profile = validate_checkpoint_profile(
             local_path,
             required=PROTOCOL_VERSION >= 3,
+        )
+        # Run identity of the resumed checkpoint. None on checkpoints
+        # published before the field existed — treated as "same run" (true
+        # for the run in flight; the guard hardens at the next publish).
+        self._resumed_training_run_id = (resumed_profile or {}).get(
+            "training_run_id"
         )
         # Load weights — this replaces both models loaded at __init__.
         # verify_model gets the resumed weights too (so the batcher
@@ -2039,6 +2048,26 @@ class ValidationService:
 
         batcher._auction_final_verdicts_published = True
 
+    def _lr_global_step_hint(self) -> int:
+        """Reconstructed LR-schedule position for a same-run restart.
+
+        Derived from state that already survives restarts: the published
+        checkpoint count (bootstrapped from HF at startup) times the publish
+        interval, plus the windows trained since the last publish. Returns 0
+        — full warmup — when this is a genuinely new run: fresh repo
+        (checkpoint_n == 0) or a resumed checkpoint published under a
+        DIFFERENT training run id (new run id on old weights).
+        """
+        resumed = getattr(self, "_resumed_training_run_id", None)
+        if resumed is not None and resumed != TRAINING_RUN_ID:
+            return 0
+        if self._checkpoint_n <= 0:
+            return 0
+        return (
+            self._checkpoint_n * self._publish_every
+            + self._trained_windows_since_publish
+        )
+
     async def _train_and_publish(
         self,
         batchers: dict | None = None,
@@ -2468,6 +2497,7 @@ class ValidationService:
                         else self.verify_model
                     ),
                     window_index=window_n,
+                    global_step_hint=self._lr_global_step_hint(),
                     **(
                         {"behavior_model": self.verify_model}
                         if RECOMPUTE_PI_OLD_FROM_VERIFY

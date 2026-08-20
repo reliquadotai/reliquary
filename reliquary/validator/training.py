@@ -27,6 +27,7 @@ from reliquary.constants import (
     LR_COSINE_MAX_WINDOWS, LR_WARMUP_WINDOWS,
     MICROBATCH_MAX_PADDED_TOKENS, PPO_CLIP_EPSILON_HIGH, PPO_CLIP_EPSILON_LOW,
     PPO_DUAL_CLIP_C,
+    LR_RESTART_REWARMUP_WINDOWS,
     PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD,
     UNPAD_SYNC_CACHE,
 )
@@ -219,7 +220,7 @@ def _build_optimizer(params) -> torch.optim.Optimizer:
     )
 
 
-def _lazy_init(model) -> bool:
+def _lazy_init(model, global_step_hint: int | None = None) -> bool:
     """Create optimizer + scheduler on first call for a given model. No-op
     on subsequent calls with the same model. The reference model used for
     KL is no longer built here — it's passed in by the caller (typically
@@ -241,15 +242,36 @@ def _lazy_init(model) -> bool:
 
     _optimizer = _build_optimizer(params)
 
+    hint = max(0, int(global_step_hint or 0))
+    rewarmup = LR_RESTART_REWARMUP_WINDOWS if hint > 0 else 0
+
     def _lr_lambda(step: int) -> float:
         if step < LR_WARMUP_WINDOWS:
-            return (step + 1) / LR_WARMUP_WINDOWS
-        progress = (step - LR_WARMUP_WINDOWS) / max(
-            1, LR_COSINE_MAX_WINDOWS - LR_WARMUP_WINDOWS
-        )
-        return 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
+            base = (step + 1) / LR_WARMUP_WINDOWS
+        else:
+            progress = (step - LR_WARMUP_WINDOWS) / max(
+                1, LR_COSINE_MAX_WINDOWS - LR_WARMUP_WINDOWS
+            )
+            base = 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
+        if rewarmup > 0 and step >= hint:
+            # Same-run restart: schedule position was reconstructed, but the
+            # Adam moments were not persisted — a short ramp over the first
+            # windows after boot lets them re-estimate before full LR.
+            base *= min(1.0, (step - hint + 1) / rewarmup)
+        return base
 
     _scheduler = torch.optim.lr_scheduler.LambdaLR(_optimizer, _lr_lambda)
+    if hint > 0:
+        # Reconstructed position: the run already trained ~hint windows
+        # (published checkpoints x publish interval), so the warmup phase is
+        # long over — replaying it on every restart threw away ~10 windows
+        # of full-LR updates per crash.
+        for _ in range(hint):
+            _scheduler.step()
+        logger.info(
+            "LR schedule fast-forwarded to step %d (same-run restart; "
+            "re-warmup over %d windows)", hint, rewarmup,
+        )
     _optimizer_model_id = id(model)
     logger.info("Training state initialised (optimizer, scheduler)")
     return True
@@ -1748,6 +1770,7 @@ def train_step(
     ref_model,
     behavior_model=None,
     window_index: int | None = None,
+    global_step_hint: int | None = None,
 ) -> Any:
     """Run one GRPO step over the union of *batches*.
 
@@ -1770,7 +1793,7 @@ def train_step(
         logger.info("train_step: empty batch, skipping")
         return model
 
-    if not _lazy_init(model):
+    if not _lazy_init(model, global_step_hint):
         logger.info("train_step: model not initializable (non-torch?), skipping")
         return model
     assert _optimizer is not None and _scheduler is not None

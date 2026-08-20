@@ -11,6 +11,7 @@ from reliquary.constants import (
     PROTOCOL_MODEL_REVISION,
     PROTOCOL_PROFILE_ID,
     PROTOCOL_VERSION,
+    TRAINING_RUN_ID,
 )
 
 
@@ -28,6 +29,11 @@ def active_checkpoint_profile() -> dict[str, Any]:
         "protocol_version": PROTOCOL_VERSION,
         "base_model_id": PROTOCOL_MODEL_ID,
         "base_model_revision": PROTOCOL_MODEL_REVISION,
+        # Run identity, NOT validated as lineage (absent on historical
+        # checkpoints): read at resume to decide whether the LR schedule
+        # position may be reconstructed (same run) or the full warmup must
+        # replay (new run id on old weights).
+        "training_run_id": TRAINING_RUN_ID,
     }
 
 

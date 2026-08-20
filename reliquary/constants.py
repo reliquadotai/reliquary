@@ -1144,6 +1144,16 @@ MICROBATCH_MAX_PADDED_TOKENS = 32768
 # Linear LR warmup for the first N training steps (= N windows sealed).
 LR_WARMUP_WINDOWS = 10
 
+# Short LR re-ramp applied after a process restart WITHIN the same training
+# run: the schedule position is reconstructed from the published checkpoint
+# count (so the full warmup no longer replays on every restart), but Adam
+# moments are not persisted — this many windows of ramp lets them re-estimate
+# before full LR. A NEW run (fresh repo, or a checkpoint published under a
+# different RELIQUARY_TRAINING_RUN_ID) still gets the full warmup.
+LR_RESTART_REWARMUP_WINDOWS = int(
+    _os.environ.get("RELIQUARY_LR_RESTART_REWARMUP_WINDOWS", "2")
+)
+
 # Cosine schedule end target (in windows). Chosen large so LR never
 # actually reaches zero at normal cadence — effectively a slow decay.
 LR_COSINE_MAX_WINDOWS = 10_000
