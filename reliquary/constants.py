@@ -1113,6 +1113,17 @@ PIPELINED_WINDOWS = _os.environ.get(
     "RELIQUARY_PIPELINED_WINDOWS", "0"
 ).strip().lower() in ("1", "true", "yes", "on")
 
+# Memoize transformers' flash-attention unpad metadata per attention mask.
+# The stock helper runs once per decoder layer per pass on the SAME mask
+# tensor and contains torch.nonzero — an implicit host<->device sync — so one
+# train_step pays on the order of a thousand pipeline stalls for identical
+# results (py-spy 2026-08-20: 12% self time; the live A/B is authoritative).
+# Bit-identical memoization. Kill-switch read at import: flipping it
+# requires a validator restart.
+UNPAD_SYNC_CACHE = _os.environ.get(
+    "RELIQUARY_UNPAD_SYNC_CACHE", "1"
+).strip().lower() in ("1", "true", "yes", "on")
+
 # Optional persistent canary ceiling. When non-zero, a validator whose current
 # published checkpoint is already at or above this number keeps serving and
 # accumulating but performs no further optimizer steps. Unlike an in-process

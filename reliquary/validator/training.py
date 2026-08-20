@@ -15,6 +15,7 @@ from __future__ import annotations
 import gc
 import logging
 import math
+import threading
 from typing import Any, Optional
 
 import torch
@@ -27,9 +28,108 @@ from reliquary.constants import (
     MICROBATCH_MAX_PADDED_TOKENS, PPO_CLIP_EPSILON_HIGH, PPO_CLIP_EPSILON_LOW,
     PPO_DUAL_CLIP_C,
     PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD,
+    UNPAD_SYNC_CACHE,
 )
 
 logger = logging.getLogger(__name__)
+
+
+_UNPAD_MISSING = object()
+
+
+def _install_unpad_sync_cache() -> bool:
+    """Memoize transformers' ``_get_unpad_data`` per (mask tensor, version).
+
+    Every flash-attention decoder layer calls the helper on the SAME mask
+    tensor once per pass (36 layers, in the forward and again in the
+    gradient-checkpoint recompute), and each call pays an implicit
+    host<->device sync inside ``torch.nonzero`` — on the order of a thousand
+    pipeline stalls per train_step for identical results (py-spy profile
+    2026-08-20: 12% self time; the live A/B after deploy is the
+    authoritative number). A single-slot, thread-local cache keyed on tensor
+    identity + ``_version`` returns the SAME tensors (bit-identical, pure
+    memoization); ``max_seqlen`` is materialized to a Python int once so
+    downstream flash-attn kernels stop re-syncing on the 0-dim tensor at
+    every layer. Thread-local: the CUDA autograd worker running the
+    recompute gets its own slot (1 miss + 35 hits per replay). In-place
+    mask mutation bumps ``_version`` and invalidates. Returns True if
+    installed.
+    """
+    if not UNPAD_SYNC_CACHE:
+        return False
+    try:
+        import transformers.modeling_flash_attention_utils as mfa
+    except Exception:  # transformers absent in some test envs
+        return False
+    original = getattr(mfa, "_get_unpad_data", None)
+    if original is None or getattr(original, "_reliquary_unpad_cache", False):
+        return original is not None
+    try:
+        # Arity self-test: if a transformers upgrade ever changes the return
+        # shape, stay on stock behavior instead of crashing mid-train_step.
+        probe = original(torch.tensor([[1, 1, 0]]))
+        if len(probe) != 3:
+            raise TypeError(f"expected 3-tuple, got {len(probe)}")
+    except Exception:
+        logger.exception(
+            "unpad sync cache NOT installed: _get_unpad_data contract "
+            "changed; running stock (slower, correct)"
+        )
+        return False
+    slot = threading.local()
+
+    def _cached_get_unpad_data(attention_mask):
+        version = attention_mask._version
+        if (
+            getattr(slot, "mask", _UNPAD_MISSING) is attention_mask
+            and slot.version == version
+        ):
+            return slot.result
+        # version snapshotted BEFORE the compute: a mutation racing the
+        # compute leaves a version mismatch -> fail-closed (recompute).
+        indices, cu_seqlens, max_seqlen = original(attention_mask)
+        if isinstance(max_seqlen, torch.Tensor):
+            # One sync now instead of one per layer at kernel launch; the
+            # value is identical (the helper's contract is an int anyway).
+            max_seqlen = int(max_seqlen)
+        result = (indices, cu_seqlens, max_seqlen)
+        # Strong reference pins the tensor so identity cannot be recycled
+        # while the entry is live; replaced wholesale on the next new mask.
+        slot.mask = attention_mask
+        slot.version = version
+        slot.result = result
+        return result
+
+    def _clear():
+        # Drop the slot's pinned tensors (mask + indices ~1 MB GPU per
+        # thread). Called at the end of train_step so the memory returns
+        # to an allocator already living at the fragmentation cliff.
+        for attr in ("mask", "version", "result"):
+            if hasattr(slot, attr):
+                delattr(slot, attr)
+
+    _cached_get_unpad_data._reliquary_unpad_cache = True
+    _cached_get_unpad_data._reliquary_original = original
+    _cached_get_unpad_data._reliquary_clear = _clear
+    mfa._get_unpad_data = _cached_get_unpad_data
+    logger.info("unpad sync cache installed on transformers flash-attention")
+    return True
+
+
+def _clear_unpad_sync_cache() -> None:
+    """Release the calling thread's cached unpad slot, if the cache is on."""
+    try:
+        import transformers.modeling_flash_attention_utils as mfa
+    except Exception:
+        return
+    clear = getattr(
+        getattr(mfa, "_get_unpad_data", None), "_reliquary_clear", None
+    )
+    if callable(clear):
+        clear()
+
+
+_UNPAD_CACHE_INSTALLED = _install_unpad_sync_cache()
 
 # ---------------------------------------------------------------------------
 # Module-global state — persists across train_step calls for the same model
@@ -1803,6 +1903,9 @@ def train_step(
         )
     _optimizer.step()
     _scheduler.step()
+    # Backward (and its checkpoint recomputes) are done: release this
+    # thread's pinned unpad slot so the ~1 MB goes back to the allocator.
+    _clear_unpad_sync_cache()
     lr_next = float(_scheduler.get_last_lr()[0])
 
     logger.info(
