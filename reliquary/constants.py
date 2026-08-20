@@ -1153,6 +1153,8 @@ LR_WARMUP_WINDOWS = 10
 LR_RESTART_REWARMUP_WINDOWS = int(
     _os.environ.get("RELIQUARY_LR_RESTART_REWARMUP_WINDOWS", "2")
 )
+if LR_RESTART_REWARMUP_WINDOWS < 0:
+    raise ValueError("RELIQUARY_LR_RESTART_REWARMUP_WINDOWS must be >= 0")
 
 # Cosine schedule end target (in windows). Chosen large so LR never
 # actually reaches zero at normal cadence — effectively a slow decay.

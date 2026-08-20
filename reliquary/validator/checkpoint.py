@@ -78,7 +78,12 @@ class CheckpointStore:
     def current_manifest(self) -> ManifestEntry | None:
         return self._current
 
-    async def publish(self, checkpoint_n: int, model: Any) -> ManifestEntry:
+    async def publish(
+        self,
+        checkpoint_n: int,
+        model: Any,
+        profile_extra: dict | None = None,
+    ) -> ManifestEntry:
         """Save locally → upload to HF → sign (n || revision) → install manifest.
 
         The local ``ckpt_<N>`` directory is removed after a successful
@@ -97,7 +102,7 @@ class CheckpointStore:
             await asyncio.to_thread(self._save, model, self.tokenizer, snapshot_dir)
             # Bind every published snapshot to the active model/protocol
             # lineage, including snapshots produced by injected save functions.
-            write_checkpoint_profile(snapshot_dir)
+            write_checkpoint_profile(snapshot_dir, extra=profile_extra)
 
             # 2. Upload the whole folder to HF — one commit per checkpoint.
             revision = await self._upload(

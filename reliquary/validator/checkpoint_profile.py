@@ -37,11 +37,22 @@ def active_checkpoint_profile() -> dict[str, Any]:
     }
 
 
-def write_checkpoint_profile(path: str | Path) -> Path:
+def write_checkpoint_profile(
+    path: str | Path, extra: Mapping[str, Any] | None = None
+) -> Path:
+    """Write the lineage profile, optionally with run-state fields.
+
+    ``extra`` keys (e.g. ``lr_schedule_step``) are informational run state,
+    never part of lineage validation — the validated key list is fixed, so
+    old and new code stay mutually compatible in both directions.
+    """
     destination = Path(path) / CHECKPOINT_PROFILE_NAME
+    payload = active_checkpoint_profile()
+    if extra:
+        payload.update(dict(extra))
     destination.write_text(
         json.dumps(
-            active_checkpoint_profile(),
+            payload,
             sort_keys=True,
             separators=(",", ":"),
         )

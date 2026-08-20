@@ -254,27 +254,51 @@ def _lazy_init(model, global_step_hint: int | None = None) -> bool:
             )
             base = 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
         if rewarmup > 0 and step >= hint:
-            # Same-run restart: schedule position was reconstructed, but the
+            # Same-run restart: schedule position was restored, but the
             # Adam moments were not persisted — a short ramp over the first
-            # windows after boot lets them re-estimate before full LR.
-            base *= min(1.0, (step - hint + 1) / rewarmup)
+            # ``rewarmup`` windows after boot lets them re-estimate before
+            # full LR ((r+1)-denominator: exactly r windows run reduced).
+            base *= min(1.0, (step - hint + 1) / (rewarmup + 1))
         return base
 
     _scheduler = torch.optim.lr_scheduler.LambdaLR(_optimizer, _lr_lambda)
     if hint > 0:
-        # Reconstructed position: the run already trained ~hint windows
-        # (published checkpoints x publish interval), so the warmup phase is
-        # long over — replaying it on every restart threw away ~10 windows
-        # of full-LR updates per crash.
+        # Restored position: ``hint`` is the EXACT scheduler step count the
+        # published checkpoint carried in its profile (never derived from
+        # checkpoint numbers — this run's counter was inherited across a
+        # weight reset, so checkpoint_n is not a step count). Replaying the
+        # warmup on every restart threw away ~10 windows of full-LR updates
+        # per crash.
         for _ in range(hint):
             _scheduler.step()
+        restored_factor = _lr_lambda(hint)
         logger.info(
-            "LR schedule fast-forwarded to step %d (same-run restart; "
-            "re-warmup over %d windows)", hint, rewarmup,
+            "LR schedule restored to step %d (same-run restart; re-warmup "
+            "over %d windows; lr factor %.4f)", hint, rewarmup,
+            restored_factor,
         )
+        if restored_factor <= 0.25:
+            logger.warning(
+                "Restored LR schedule position %d puts the cosine factor at "
+                "%.4f — the decay horizon (LR_COSINE_MAX_WINDOWS=%d) is no "
+                "longer masked by restart resets; revisit the schedule if "
+                "this is not intended",
+                hint, restored_factor, LR_COSINE_MAX_WINDOWS,
+            )
     _optimizer_model_id = id(model)
     logger.info("Training state initialised (optimizer, scheduler)")
     return True
+
+
+def current_lr_schedule_step() -> int | None:
+    """Exact scheduler position (steps taken), or None before first init.
+
+    Written into the checkpoint profile at publish and restored verbatim at
+    resume — the ONLY safe source for the schedule position (checkpoint
+    numbers are not step counts: this run inherited its counter across a
+    weight reset, and publish cadence has changed across protocol versions).
+    """
+    return int(_scheduler.last_epoch) if _scheduler is not None else None
 
 
 def reset_training_state() -> None:
