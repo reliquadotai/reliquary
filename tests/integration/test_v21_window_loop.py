@@ -135,7 +135,7 @@ def _make_service(checkpoint_hash="sha256:cp"):
         revision=checkpoint_hash,
         signature="ed25519:sig0",
     ))
-    svc._checkpoint_store.publish = AsyncMock(side_effect=lambda checkpoint_n, model: ManifestEntry(
+    svc._checkpoint_store.publish = AsyncMock(side_effect=lambda checkpoint_n, model, profile_extra=None: ManifestEntry(
         checkpoint_n=checkpoint_n,
         repo_id="aivolutionedge/reliquary-sn",
         revision=f"rev_sha_{checkpoint_n:03d}",
@@ -241,6 +241,7 @@ async def test_training_health_gate_blocks_checkpoint_publish(monkeypatch):
 
     def _reject_step(
         model, batch, *, ref_model, behavior_model=None, window_index=None,
+        global_step_hint=None,
     ):
         raise TrainingStepSkipped("gradient_spike", 10_432.0)
 
@@ -280,6 +281,7 @@ async def test_training_uses_distinct_behavior_and_fixed_reference(monkeypatch):
 
     def _capture_step(
         model, batch, *, ref_model, behavior_model, window_index=None,
+        global_step_hint=None,
     ):
         captured["ref_model"] = ref_model
         captured["behavior_model"] = behavior_model
@@ -369,8 +371,7 @@ async def test_verify_model_refreshed_only_after_publish(monkeypatch):
     calls: list[int] = []
 
     def _fake_train_step(
-        model, batch, *, ref_model, behavior_model=None, window_index=None,
-    ):
+        model, batch, *, ref_model, behavior_model=None, window_index=None, global_step_hint=None,):
         calls.append(1)
         with torch.no_grad():
             for p in model.parameters():
@@ -418,8 +419,7 @@ async def test_verify_model_NOT_refreshed_when_publish_skipped(monkeypatch):
     calls: list[int] = []
 
     def _fake_train_step(
-        model, batch, *, ref_model, behavior_model=None, window_index=None,
-    ):
+        model, batch, *, ref_model, behavior_model=None, window_index=None, global_step_hint=None,):
         calls.append(1)
         with torch.no_grad():
             for p in model.parameters():
