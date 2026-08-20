@@ -1113,6 +1113,17 @@ PIPELINED_WINDOWS = _os.environ.get(
     "RELIQUARY_PIPELINED_WINDOWS", "0"
 ).strip().lower() in ("1", "true", "yes", "on")
 
+# Memoize transformers' flash-attention unpad metadata per attention mask.
+# The stock helper runs once per decoder layer per pass on the SAME mask
+# tensor and contains torch.nonzero — an implicit host<->device sync — so one
+# train_step pays on the order of a thousand pipeline stalls for identical
+# results (py-spy 2026-08-20: 12% self time; the live A/B is authoritative).
+# Bit-identical memoization. Kill-switch read at import: flipping it
+# requires a validator restart.
+UNPAD_SYNC_CACHE = _os.environ.get(
+    "RELIQUARY_UNPAD_SYNC_CACHE", "1"
+).strip().lower() in ("1", "true", "yes", "on")
+
 # Optional persistent canary ceiling. When non-zero, a validator whose current
 # published checkpoint is already at or above this number keeps serving and
 # accumulating but performs no further optimizer steps. Unlike an in-process
@@ -1132,6 +1143,18 @@ MICROBATCH_MAX_PADDED_TOKENS = 32768
 
 # Linear LR warmup for the first N training steps (= N windows sealed).
 LR_WARMUP_WINDOWS = 10
+
+# Short LR re-ramp applied after a process restart WITHIN the same training
+# run: the schedule position is reconstructed from the published checkpoint
+# count (so the full warmup no longer replays on every restart), but Adam
+# moments are not persisted — this many windows of ramp lets them re-estimate
+# before full LR. A NEW run (fresh repo, or a checkpoint published under a
+# different RELIQUARY_TRAINING_RUN_ID) still gets the full warmup.
+LR_RESTART_REWARMUP_WINDOWS = int(
+    _os.environ.get("RELIQUARY_LR_RESTART_REWARMUP_WINDOWS", "2")
+)
+if LR_RESTART_REWARMUP_WINDOWS < 0:
+    raise ValueError("RELIQUARY_LR_RESTART_REWARMUP_WINDOWS must be >= 0")
 
 # Cosine schedule end target (in windows). Chosen large so LR never
 # actually reaches zero at normal cadence — effectively a slow decay.

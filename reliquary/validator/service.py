@@ -405,6 +405,15 @@ def _validate_fixed_kl_reference(train_model: Any, ref_model: Any) -> None:
             )
 
 
+def _coerce_lr_schedule_step(raw) -> int | None:
+    """Profile values are external data: accept only non-negative real ints
+    (bool is an int subclass; floats/strings from a hand-edited profile are
+    rejected -> full warmup, the fail-closed direction)."""
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None
+    return raw if raw >= 0 else None
+
+
 class ValidationService:
     def __init__(
         self,
@@ -649,6 +658,11 @@ class ValidationService:
         # training control, so it is immutable and fail-closed. Empty config keeps
         # the legacy rolling reference (verify_model) exactly as before.
         self.base_ref_model = None
+        # Run id + exact LR schedule step read from the resumed checkpoint's
+        # profile (None until _apply_resume_from runs, or when resuming
+        # pre-field checkpoints — then the LR schedule warms up in full).
+        self._resumed_training_run_id: str | None = None
+        self._resumed_lr_schedule_step: int | None = None
         # Pipelined window collection: the sealed-window GPU work stashed for
         # the next loop iteration, and the verify-model swap deferred until
         # the last window generated under the previous checkpoint is proven.
@@ -1217,9 +1231,19 @@ class ValidationService:
 
         # Historical auction-v2 checkpoints predate lineage metadata and remain
         # loadable. Auction-v3 must never silently resume those 2B weights.
-        validate_checkpoint_profile(
+        resumed_profile = validate_checkpoint_profile(
             local_path,
             required=PROTOCOL_VERSION >= 3,
+        )
+        # Run identity + exact LR schedule position of the resumed
+        # checkpoint. Both None on checkpoints published before the fields
+        # existed — in that case the LR schedule falls back to the full
+        # warmup (fail-closed), and the guard hardens at the next publish.
+        self._resumed_training_run_id = (resumed_profile or {}).get(
+            "training_run_id"
+        )
+        self._resumed_lr_schedule_step = _coerce_lr_schedule_step(
+            (resumed_profile or {}).get("lr_schedule_step")
         )
         # Load weights — this replaces both models loaded at __init__.
         # verify_model gets the resumed weights too (so the batcher
@@ -2039,6 +2063,26 @@ class ValidationService:
 
         batcher._auction_final_verdicts_published = True
 
+    def _lr_global_step_hint(self) -> int:
+        """Restored LR-schedule position for a same-run restart.
+
+        The EXACT scheduler step count the resumed checkpoint recorded in
+        its profile at publish — never derived from checkpoint numbers
+        (this run inherited its counter across a weight reset, and the
+        publish cadence has changed across protocol versions, so
+        checkpoint_n x interval is not a step count). Returns 0 — full
+        warmup — fail-closed: missing field (all pre-field checkpoints),
+        or a checkpoint published under a DIFFERENT training run id
+        (new run id on old weights => new run => warmup).
+        """
+        resumed = getattr(self, "_resumed_training_run_id", None)
+        if resumed is not None and resumed != TRAINING_RUN_ID:
+            return 0
+        step = getattr(self, "_resumed_lr_schedule_step", None)
+        if step is None:
+            return 0
+        return max(0, int(step))
+
     async def _train_and_publish(
         self,
         batchers: dict | None = None,
@@ -2468,6 +2512,7 @@ class ValidationService:
                         else self.verify_model
                     ),
                     window_index=window_n,
+                    global_step_hint=self._lr_global_step_hint(),
                     **(
                         {"behavior_model": self.verify_model}
                         if RECOMPUTE_PI_OLD_FROM_VERIFY
@@ -2606,8 +2651,19 @@ class ValidationService:
             else:
                 publication_reason = "bootstrap"
             try:
+                from reliquary.validator.training import (
+                    current_lr_schedule_step,
+                )
+
+                lr_step = current_lr_schedule_step()
                 entry = await self._checkpoint_store.publish(
-                    checkpoint_n=next_n, model=self.train_model,
+                    checkpoint_n=next_n,
+                    model=self.train_model,
+                    profile_extra=(
+                        {"lr_schedule_step": int(lr_step)}
+                        if lr_step is not None
+                        else None
+                    ),
                 )
                 self._checkpoint_n = next_n
                 self._trained_windows_since_publish = 0

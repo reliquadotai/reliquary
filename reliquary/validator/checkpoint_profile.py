@@ -11,6 +11,7 @@ from reliquary.constants import (
     PROTOCOL_MODEL_REVISION,
     PROTOCOL_PROFILE_ID,
     PROTOCOL_VERSION,
+    TRAINING_RUN_ID,
 )
 
 
@@ -28,14 +29,30 @@ def active_checkpoint_profile() -> dict[str, Any]:
         "protocol_version": PROTOCOL_VERSION,
         "base_model_id": PROTOCOL_MODEL_ID,
         "base_model_revision": PROTOCOL_MODEL_REVISION,
+        # Run identity, NOT validated as lineage (absent on historical
+        # checkpoints): read at resume to decide whether the LR schedule
+        # position may be reconstructed (same run) or the full warmup must
+        # replay (new run id on old weights).
+        "training_run_id": TRAINING_RUN_ID,
     }
 
 
-def write_checkpoint_profile(path: str | Path) -> Path:
+def write_checkpoint_profile(
+    path: str | Path, extra: Mapping[str, Any] | None = None
+) -> Path:
+    """Write the lineage profile, optionally with run-state fields.
+
+    ``extra`` keys (e.g. ``lr_schedule_step``) are informational run state,
+    never part of lineage validation — the validated key list is fixed, so
+    old and new code stay mutually compatible in both directions.
+    """
     destination = Path(path) / CHECKPOINT_PROFILE_NAME
+    payload = active_checkpoint_profile()
+    if extra:
+        payload.update(dict(extra))
     destination.write_text(
         json.dumps(
-            active_checkpoint_profile(),
+            payload,
             sort_keys=True,
             separators=(",", ":"),
         )

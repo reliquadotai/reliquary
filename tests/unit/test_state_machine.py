@@ -939,7 +939,7 @@ async def test_publish_every_n_trained_windows(monkeypatch):
 
     published_entries = []
 
-    async def _fake_publish(checkpoint_n, model):
+    async def _fake_publish(checkpoint_n, model, profile_extra=None):
         entry = ManifestEntry(
             checkpoint_n=checkpoint_n,
             repo_id="aivolutionedge/reliquary-sn",

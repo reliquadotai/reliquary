@@ -15,6 +15,7 @@ from __future__ import annotations
 import gc
 import logging
 import math
+import threading
 from typing import Any, Optional
 
 import torch
@@ -26,10 +27,110 @@ from reliquary.constants import (
     LR_COSINE_MAX_WINDOWS, LR_WARMUP_WINDOWS,
     MICROBATCH_MAX_PADDED_TOKENS, PPO_CLIP_EPSILON_HIGH, PPO_CLIP_EPSILON_LOW,
     PPO_DUAL_CLIP_C,
+    LR_RESTART_REWARMUP_WINDOWS,
     PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD,
+    UNPAD_SYNC_CACHE,
 )
 
 logger = logging.getLogger(__name__)
+
+
+_UNPAD_MISSING = object()
+
+
+def _install_unpad_sync_cache() -> bool:
+    """Memoize transformers' ``_get_unpad_data`` per (mask tensor, version).
+
+    Every flash-attention decoder layer calls the helper on the SAME mask
+    tensor once per pass (36 layers, in the forward and again in the
+    gradient-checkpoint recompute), and each call pays an implicit
+    host<->device sync inside ``torch.nonzero`` — on the order of a thousand
+    pipeline stalls per train_step for identical results (py-spy profile
+    2026-08-20: 12% self time; the live A/B after deploy is the
+    authoritative number). A single-slot, thread-local cache keyed on tensor
+    identity + ``_version`` returns the SAME tensors (bit-identical, pure
+    memoization); ``max_seqlen`` is materialized to a Python int once so
+    downstream flash-attn kernels stop re-syncing on the 0-dim tensor at
+    every layer. Thread-local: the CUDA autograd worker running the
+    recompute gets its own slot (1 miss + 35 hits per replay). In-place
+    mask mutation bumps ``_version`` and invalidates. Returns True if
+    installed.
+    """
+    if not UNPAD_SYNC_CACHE:
+        return False
+    try:
+        import transformers.modeling_flash_attention_utils as mfa
+    except Exception:  # transformers absent in some test envs
+        return False
+    original = getattr(mfa, "_get_unpad_data", None)
+    if original is None or getattr(original, "_reliquary_unpad_cache", False):
+        return original is not None
+    try:
+        # Arity self-test: if a transformers upgrade ever changes the return
+        # shape, stay on stock behavior instead of crashing mid-train_step.
+        probe = original(torch.tensor([[1, 1, 0]]))
+        if len(probe) != 3:
+            raise TypeError(f"expected 3-tuple, got {len(probe)}")
+    except Exception:
+        logger.exception(
+            "unpad sync cache NOT installed: _get_unpad_data contract "
+            "changed; running stock (slower, correct)"
+        )
+        return False
+    slot = threading.local()
+
+    def _cached_get_unpad_data(attention_mask):
+        version = attention_mask._version
+        if (
+            getattr(slot, "mask", _UNPAD_MISSING) is attention_mask
+            and slot.version == version
+        ):
+            return slot.result
+        # version snapshotted BEFORE the compute: a mutation racing the
+        # compute leaves a version mismatch -> fail-closed (recompute).
+        indices, cu_seqlens, max_seqlen = original(attention_mask)
+        if isinstance(max_seqlen, torch.Tensor):
+            # One sync now instead of one per layer at kernel launch; the
+            # value is identical (the helper's contract is an int anyway).
+            max_seqlen = int(max_seqlen)
+        result = (indices, cu_seqlens, max_seqlen)
+        # Strong reference pins the tensor so identity cannot be recycled
+        # while the entry is live; replaced wholesale on the next new mask.
+        slot.mask = attention_mask
+        slot.version = version
+        slot.result = result
+        return result
+
+    def _clear():
+        # Drop the slot's pinned tensors (mask + indices ~1 MB GPU per
+        # thread). Called at the end of train_step so the memory returns
+        # to an allocator already living at the fragmentation cliff.
+        for attr in ("mask", "version", "result"):
+            if hasattr(slot, attr):
+                delattr(slot, attr)
+
+    _cached_get_unpad_data._reliquary_unpad_cache = True
+    _cached_get_unpad_data._reliquary_original = original
+    _cached_get_unpad_data._reliquary_clear = _clear
+    mfa._get_unpad_data = _cached_get_unpad_data
+    logger.info("unpad sync cache installed on transformers flash-attention")
+    return True
+
+
+def _clear_unpad_sync_cache() -> None:
+    """Release the calling thread's cached unpad slot, if the cache is on."""
+    try:
+        import transformers.modeling_flash_attention_utils as mfa
+    except Exception:
+        return
+    clear = getattr(
+        getattr(mfa, "_get_unpad_data", None), "_reliquary_clear", None
+    )
+    if callable(clear):
+        clear()
+
+
+_UNPAD_CACHE_INSTALLED = _install_unpad_sync_cache()
 
 # ---------------------------------------------------------------------------
 # Module-global state — persists across train_step calls for the same model
@@ -119,7 +220,7 @@ def _build_optimizer(params) -> torch.optim.Optimizer:
     )
 
 
-def _lazy_init(model) -> bool:
+def _lazy_init(model, global_step_hint: int | None = None) -> bool:
     """Create optimizer + scheduler on first call for a given model. No-op
     on subsequent calls with the same model. The reference model used for
     KL is no longer built here — it's passed in by the caller (typically
@@ -141,18 +242,63 @@ def _lazy_init(model) -> bool:
 
     _optimizer = _build_optimizer(params)
 
+    hint = max(0, int(global_step_hint or 0))
+    rewarmup = LR_RESTART_REWARMUP_WINDOWS if hint > 0 else 0
+
     def _lr_lambda(step: int) -> float:
         if step < LR_WARMUP_WINDOWS:
-            return (step + 1) / LR_WARMUP_WINDOWS
-        progress = (step - LR_WARMUP_WINDOWS) / max(
-            1, LR_COSINE_MAX_WINDOWS - LR_WARMUP_WINDOWS
-        )
-        return 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
+            base = (step + 1) / LR_WARMUP_WINDOWS
+        else:
+            progress = (step - LR_WARMUP_WINDOWS) / max(
+                1, LR_COSINE_MAX_WINDOWS - LR_WARMUP_WINDOWS
+            )
+            base = 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
+        if rewarmup > 0 and step >= hint:
+            # Same-run restart: schedule position was restored, but the
+            # Adam moments were not persisted — a short ramp over the first
+            # ``rewarmup`` windows after boot lets them re-estimate before
+            # full LR ((r+1)-denominator: exactly r windows run reduced).
+            base *= min(1.0, (step - hint + 1) / (rewarmup + 1))
+        return base
 
     _scheduler = torch.optim.lr_scheduler.LambdaLR(_optimizer, _lr_lambda)
+    if hint > 0:
+        # Restored position: ``hint`` is the EXACT scheduler step count the
+        # published checkpoint carried in its profile (never derived from
+        # checkpoint numbers — this run's counter was inherited across a
+        # weight reset, so checkpoint_n is not a step count). Replaying the
+        # warmup on every restart threw away ~10 windows of full-LR updates
+        # per crash.
+        for _ in range(hint):
+            _scheduler.step()
+        restored_factor = _lr_lambda(hint)
+        logger.info(
+            "LR schedule restored to step %d (same-run restart; re-warmup "
+            "over %d windows; lr factor %.4f)", hint, rewarmup,
+            restored_factor,
+        )
+        if restored_factor <= 0.25:
+            logger.warning(
+                "Restored LR schedule position %d puts the cosine factor at "
+                "%.4f — the decay horizon (LR_COSINE_MAX_WINDOWS=%d) is no "
+                "longer masked by restart resets; revisit the schedule if "
+                "this is not intended",
+                hint, restored_factor, LR_COSINE_MAX_WINDOWS,
+            )
     _optimizer_model_id = id(model)
     logger.info("Training state initialised (optimizer, scheduler)")
     return True
+
+
+def current_lr_schedule_step() -> int | None:
+    """Exact scheduler position (steps taken), or None before first init.
+
+    Written into the checkpoint profile at publish and restored verbatim at
+    resume — the ONLY safe source for the schedule position (checkpoint
+    numbers are not step counts: this run inherited its counter across a
+    weight reset, and publish cadence has changed across protocol versions).
+    """
+    return int(_scheduler.last_epoch) if _scheduler is not None else None
 
 
 def reset_training_state() -> None:
@@ -1648,6 +1794,7 @@ def train_step(
     ref_model,
     behavior_model=None,
     window_index: int | None = None,
+    global_step_hint: int | None = None,
 ) -> Any:
     """Run one GRPO step over the union of *batches*.
 
@@ -1670,7 +1817,7 @@ def train_step(
         logger.info("train_step: empty batch, skipping")
         return model
 
-    if not _lazy_init(model):
+    if not _lazy_init(model, global_step_hint):
         logger.info("train_step: model not initializable (non-torch?), skipping")
         return model
     assert _optimizer is not None and _scheduler is not None
@@ -1803,6 +1950,9 @@ def train_step(
         )
     _optimizer.step()
     _scheduler.step()
+    # Backward (and its checkpoint recomputes) are done: release this
+    # thread's pinned unpad slot so the ~1 MB goes back to the allocator.
+    _clear_unpad_sync_cache()
     lr_next = float(_scheduler.get_last_lr()[0])
 
     logger.info(
