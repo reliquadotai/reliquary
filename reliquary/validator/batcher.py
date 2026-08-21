@@ -21,6 +21,7 @@ from pydantic import ValidationError
 from reliquary.constants import (
     BOOTSTRAP_SIGMA_MIN,
     BATCH_PROMPT_COOLDOWN_WINDOWS,
+    CHALLENGE_K,
     M_ROLLOUTS,
     PROTOCOL_THROUGHPUT_TIEBREAK,
     B_BATCH,
@@ -305,6 +306,67 @@ def _verify_logprobs_for_training(proof, completion_length: int):
             return None
         out.append(math.log(prob))
     return out
+
+
+def _verify_short_logprob_claim(
+    validator_lps,
+    tokens,
+    prompt_length: int,
+    completion_length: int,
+    claimed_logprobs,
+):
+    """Full-coverage logprob-claim check for completions shorter than
+    CHALLENGE_K, where the sampled-challenge check cannot run (it returns a
+    deterministic fail — in 24h of production, 100% of logprob_mismatch
+    rejections were this case and none were real mismatches).
+
+    ``validator_lps`` is ``_verify_logprobs_for_training(proof, L)`` —
+    log(chosen-token prob) at EVERY completion position on the frozen
+    verify model, the same quantity the sampled challenge reads (valid at
+    T_PROTO == 1.0). Checking all L positions is strictly stronger coverage
+    than sampling K of many.
+
+    Returns (ok, median_dev):
+      - (None, None)  — cannot verify (no validator coverage: T != 1, or a
+        degenerate position). The CALLER treats this as "unverified" and
+        keeps the original reject — a short rollout is admitted ONLY on a
+        positive verdict here, never on absence of one.
+      - (False, dev)  — claim malformed or the median deviates: reject.
+      - (True, dev)   — claim consistent with the validator's own forward.
+
+    Pass rule is the SAME as the sampled path (``verify_logprobs_claim``):
+    ``median(dev_i) <= LOGPROB_IS_EPS`` with ``dev_i = exp(|Δ|) - 1``,
+    just over all L positions instead of K sampled — median is robust to
+    the occasional bf16 cross-GPU outlier. ``exp`` is overflow-guarded so a
+    crafted ``-1e30`` claim yields inf (reject), never a proof-plane fault.
+    """
+    import statistics
+
+    from reliquary.constants import LOGPROB_IS_EPS
+
+    if validator_lps is None or len(validator_lps) != completion_length:
+        return None, None
+    claimed = list(claimed_logprobs or [])
+    if len(claimed) == len(tokens):
+        offset = prompt_length
+    elif len(claimed) == completion_length:
+        offset = 0
+    else:
+        return False, float("inf")
+    devs = []
+    for j in range(completion_length):
+        try:
+            miner_lp = float(claimed[offset + j])
+        except (TypeError, ValueError, IndexError):
+            return False, float("inf")
+        if not math.isfinite(miner_lp):
+            return False, float("inf")
+        delta = abs(validator_lps[j] - miner_lp)
+        # exp overflows ~709; clamp to inf so a malformed claim rejects
+        # instead of faulting the proof plane (matches the >EPS outcome).
+        devs.append(math.expm1(delta) if delta < 700.0 else float("inf"))
+    median_dev = float(statistics.median(devs))
+    return median_dev <= LOGPROB_IS_EPS, median_dev
 
 
 def _forced_seed_verdict(n_stoch: int, n_match: int, enforce: bool) -> bool:
@@ -925,6 +987,11 @@ class GrpoWindowBatcher:
         self.proof_capacity_abort_reason: str | None = None
         self.forensic_proof_attempts = 0
         self.forensic_proof_errors_by_type: dict[str, int] = {}
+        # Short-completion (<CHALLENGE_K) logprob claims re-verified at full
+        # coverage, and the subset that stayed rejected because they could
+        # not be positively verified (no validator coverage).
+        self.logprob_short_full_coverage_checks = 0
+        self.logprob_short_unverifiable = 0
         self.auction_operator_unmapped_skips = 0
         self.auction_operator_proof_debt_skips = 0
         self.auction_candidates: list[dict[str, Any]] = []
@@ -3237,6 +3304,30 @@ class GrpoWindowBatcher:
                 claimed_logprobs=claimed_lp,
                 proof=proof,
             )
+            if not lp_ok and completion_len < CHALLENGE_K:
+                # The sampled-challenge check is a deterministic fail below
+                # CHALLENGE_K tokens (measured: 100% of its rejections, on
+                # naturally short honest answers the model must be allowed
+                # to learn from). Re-verify the claim at FULL coverage via
+                # the same chosen-token probs already derived for training
+                # (reused, not recomputed) — strictly stronger than sampling.
+                # A short rollout is admitted ONLY on a POSITIVE verdict:
+                # an unverifiable one (T != 1, degenerate coverage) keeps the
+                # original reject, so a rollback to v2/v3 (T=0.6) or a
+                # coverage hole can never flip this into an accept.
+                short_ok, short_dev = _verify_short_logprob_claim(
+                    rollout._validated_completion_logprobs,
+                    rollout.commit["tokens"],
+                    prompt_len,
+                    completion_len,
+                    claimed_lp,
+                )
+                with self._proof_admission_lock:
+                    self.logprob_short_full_coverage_checks += 1
+                    if short_ok is None:
+                        self.logprob_short_unverifiable += 1
+                if short_ok is True:
+                    lp_ok, lp_dev = True, short_dev
             if lp_dev is not None and lp_dev != float("inf"):
                 if lp_dev_max is None or lp_dev > lp_dev_max:
                     lp_dev_max = float(lp_dev)
@@ -5023,6 +5114,12 @@ class GrpoWindowBatcher:
                     "forensic_proof_attempts": self.forensic_proof_attempts,
                     "forensic_proof_errors_by_type": dict(
                         self.forensic_proof_errors_by_type
+                    ),
+                    "logprob_short_full_coverage_checks": (
+                        self.logprob_short_full_coverage_checks
+                    ),
+                    "logprob_short_unverifiable": (
+                        self.logprob_short_unverifiable
                     ),
                     "proof_attempt_limit": (
                         MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW

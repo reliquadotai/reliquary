@@ -3434,3 +3434,112 @@ def test_forced_seed_cdf_gate_is_shadow_until_calibrated(monkeypatch):
     # CDF enforcement off -> shadow only: the proof passes at seal.
     req = _request(rewards=[1.0] * 4 + [0.0] * 4)
     assert _prove_one(b, req) is not None
+
+
+def _short_boxed_completion(n_extra: int = 4):
+    """A completion SHORTER than CHALLENGE_K: '\\boxed{4}' plus a little pad."""
+    text = "x" * n_extra + "\\boxed{4}"
+    completion = [ord(c) for c in text] + [99]
+    assert len(completion) < CHALLENGE_K
+    return text, completion
+
+
+class _ShortCtxModel:
+    class config:
+        vocab_size = 1000
+        max_position_embeddings = 4096
+
+
+def test_short_rollout_rejected_at_non_identity_temperature():
+    """Rollback safety (T_PROTO != 1, i.e. the v2/v3 default): a short rollout
+    cannot be positively verified (no validator coverage), so the ORIGINAL
+    logprob reject stands — the short path never flips into an accept."""
+    prompt = list(range(20, 50))  # long enough that total >= 32 (schema min)
+    _, completion = _short_boxed_completion()
+    tokens = prompt + completion
+    seq_len = len(tokens)
+    assert len(completion) < CHALLENGE_K <= seq_len
+    probs = [1.0] * len(completion)  # log = 0 == miner's claimed [0.0]
+
+    b = _make_batcher(
+        model=_ShortCtxModel(),
+        tokenizer=_CharTokenizerWithEos(),
+        verify_commitment_proofs_fn=_grail_with_chosen_probs(
+            seq_len, probs, prompt_length=len(prompt),
+        ),
+    )
+    req = _request()
+    commit = _make_commit(
+        tokens=tokens, prompt_length=len(prompt), success=True,
+        total_reward=1.0,
+    )
+    req.rollouts[0].commit = commit
+    req.rollouts[0].tokens = commit["tokens"]
+
+    assert _prove_one(b, req) is None
+    assert b.reject_counts[RejectReason.LOGPROB_MISMATCH.value] == 1
+
+
+def test_short_honest_rollout_accepted_at_identity_temperature(monkeypatch):
+    """v4 (T_PROTO == 1): a short honest rollout is positively verified at
+    full coverage and clears the logprob gate — the 304/day burned groups."""
+    monkeypatch.setattr("reliquary.constants.T_PROTO", 1.0)
+    prompt = list(range(20, 50))
+    _, completion = _short_boxed_completion()
+    tokens = prompt + completion
+    seq_len = len(tokens)
+    probs = [1.0] * len(completion)
+
+    b = _make_batcher(
+        model=_ShortCtxModel(),
+        tokenizer=_CharTokenizerWithEos(),
+        verify_commitment_proofs_fn=_grail_with_chosen_probs(
+            seq_len, probs, prompt_length=len(prompt),
+        ),
+    )
+    req = _request()
+    commit = _make_commit(
+        tokens=tokens, prompt_length=len(prompt), success=True,
+        total_reward=1.0,
+    )
+    req.rollouts[0].commit = commit
+    req.rollouts[0].tokens = commit["tokens"]
+
+    _prove_one(b, req)
+    # This test isolates the LOGPROB gate: the short path ran, positively
+    # verified the claim at full coverage, and did NOT reject for logprob
+    # (downstream gates like clean-termination are out of scope here).
+    assert b.reject_counts.get(RejectReason.LOGPROB_MISMATCH.value, 0) == 0
+    assert b.logprob_short_full_coverage_checks == 1
+    assert b.logprob_short_unverifiable == 0
+
+
+def test_short_forged_rollout_rejected_at_identity_temperature(monkeypatch):
+    """v4: a short rollout whose claimed logprobs disagree with the
+    validator's own forward on the majority of positions is rejected."""
+    monkeypatch.setattr("reliquary.constants.T_PROTO", 1.0)
+    prompt = list(range(20, 50))
+    _, completion = _short_boxed_completion()
+    tokens = prompt + completion
+    seq_len = len(tokens)
+    # validator sees prob ~0.5 everywhere (log -0.69) but the miner claimed
+    # all-zero logprobs (_make_commit) -> median dev >> eps.
+    probs = [0.5] * len(completion)
+
+    b = _make_batcher(
+        model=_ShortCtxModel(),
+        tokenizer=_CharTokenizerWithEos(),
+        verify_commitment_proofs_fn=_grail_with_chosen_probs(
+            seq_len, probs, prompt_length=len(prompt),
+        ),
+    )
+    req = _request()
+    commit = _make_commit(
+        tokens=tokens, prompt_length=len(prompt), success=True,
+        total_reward=1.0,
+    )
+    req.rollouts[0].commit = commit
+    req.rollouts[0].tokens = commit["tokens"]
+
+    assert _prove_one(b, req) is None
+    assert b.reject_counts[RejectReason.LOGPROB_MISMATCH.value] == 1

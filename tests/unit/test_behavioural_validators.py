@@ -93,7 +93,10 @@ def test_verify_logprobs_claim_cheater_fails():
 
 
 def test_verify_logprobs_claim_too_short_rejects():
-    """Completion shorter than CHALLENGE_K can't be challenged → reject."""
+    """The SAMPLED check still hard-fails below CHALLENGE_K (verifier.py is
+    unchanged). The batcher call site rescues this via a full-coverage
+    re-check — see test_short_honest_rollout_accepted_at_identity_temperature
+    in test_grpo_window_batcher.py."""
     tokens = list(range(20))
     proof = _proof_with_challenges([], [])
 
