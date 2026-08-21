@@ -594,6 +594,10 @@ class ValidationService:
         # Detached-trainer payload worker handle; the queue itself is a
         # lazy process-wide singleton (same pattern as get_archive_queue).
         self._training_payload_worker_task: asyncio.Task | None = None
+        # Detached-trainer checkpoint intake (lazy; DETACHED_TRAINER only).
+        self._checkpoint_intake = None
+        self._intake_stage_task: asyncio.Task | None = None
+        self._windows_since_checkpoint_swap = 0
 
         self.server = ValidatorServer(host=http_host, port=http_port)
         self.server.set_late_drop_callback(self.record_late_drop)
@@ -933,6 +937,128 @@ class ValidationService:
             parameter.requires_grad = False
         self._verify_model_checkpoint_revision = checkpoint_revision
 
+    def _detached_intake_ref(self):
+        """Lazy CheckpointIntake (DETACHED_TRAINER mode only)."""
+        if self._checkpoint_intake is None:
+            import os as _os
+
+            from reliquary.validator.checkpoint_intake import (
+                CheckpointIntake,
+                default_r2_client,
+            )
+
+            current = self._checkpoint_store.current_manifest()
+            self._checkpoint_intake = CheckpointIntake(
+                r2_client=default_r2_client(),
+                bucket=_os.getenv("R2_BUCKET_ID", "reliquary"),
+                staging_dir=_os.path.join(
+                    _os.environ.get(
+                        "RELIQUARY_STATE_DIR", "/root/reliquary/state",
+                    ),
+                    "checkpoint_intake",
+                ),
+                installed_revision=(
+                    current.revision if current is not None else None
+                ),
+            )
+        return self._checkpoint_intake
+
+    def _refresh_verify_model_from_dir(
+        self, snapshot_dir, checkpoint_revision: str,
+    ) -> None:
+        """Install a trainer-published snapshot into the verify plane.
+
+        The full state dict is assembled on CPU BEFORE any device copy so
+        a read failure cannot leave verify_model half-updated."""
+        if not checkpoint_revision:
+            raise RuntimeError(
+                "verify model refresh requires a checkpoint revision"
+            )
+        from pathlib import Path as _Path
+
+        from safetensors.torch import load_file
+
+        state: dict = {}
+        for path in sorted(_Path(snapshot_dir).glob("*.safetensors")):
+            state.update(load_file(str(path), device="cpu"))
+        if not state:
+            raise RuntimeError(f"no safetensors under {snapshot_dir}")
+        self._verify_model_checkpoint_revision = None
+        self.verify_model.load_state_dict(state)
+        self.verify_model.eval()
+        for parameter in self.verify_model.parameters():
+            parameter.requires_grad = False
+        self._verify_model_checkpoint_revision = checkpoint_revision
+
+    async def _swap_staged_checkpoint(self, window_n: int) -> None:
+        """Serial-beat swap: verify plane first, manifest install LAST.
+
+        On any failure the current manifest still names the old revision,
+        the staged copy is dropped, and the next poll re-stages the same
+        candidate — degradation is staleness, never a wrong-weights proof.
+        """
+        import shutil as _shutil
+
+        intake = self._checkpoint_intake
+        manifest, staged_dir = intake.take_staged()
+        revision = str(manifest["revision"])
+        try:
+            await asyncio.to_thread(
+                self._refresh_verify_model_from_dir, staged_dir, revision,
+            )
+            if self.proof_scheduler is not None:
+                await asyncio.to_thread(
+                    self._synchronize_proof_models, revision,
+                )
+            entry = self._checkpoint_store.install_external(
+                int(manifest["checkpoint_n"]), revision,
+            )
+            self._checkpoint_n = int(manifest["checkpoint_n"])
+            self.server.set_current_checkpoint(entry)
+            intake.mark_installed(revision, staged_dir)
+            self._windows_since_checkpoint_swap = 0
+            # Retained groups were generated against the parent revision;
+            # parity with the in-process post-publish discard.
+            self._training_accumulator.reset()
+            logger.info(
+                "Window %d: swapped verify plane to trainer checkpoint "
+                "%d (%s)", window_n, entry.checkpoint_n, revision[:12],
+            )
+        except FatalProofPlaneError:
+            raise
+        except Exception:
+            logger.exception(
+                "staged checkpoint swap failed for %s; staying on the "
+                "current revision", revision[:12],
+            )
+            _shutil.rmtree(staged_dir, ignore_errors=True)
+
+    async def _detached_checkpoint_tick(
+        self, *, owns_routing: bool, window_n: int,
+    ) -> None:
+        """Per-window intake driver (DETACHED_TRAINER mode): poll the
+        candidate manifest, stage in the background, swap on the serial
+        beat only."""
+        intake = self._detached_intake_ref()
+        self._windows_since_checkpoint_swap += 1
+        task = self._intake_stage_task
+        if task is None or task.done():
+            manifest = await asyncio.to_thread(intake.poll)
+            if manifest is not None:
+                self._intake_stage_task = asyncio.create_task(
+                    asyncio.to_thread(intake.stage, manifest),
+                    name="checkpoint_intake_stage",
+                )
+        if intake.staged_ready:
+            if owns_routing:
+                await self._swap_staged_checkpoint(window_n)
+            else:
+                logger.info(
+                    "Window %d: staged checkpoint ready but this half is "
+                    "pipelined; deferring swap to the serial beat",
+                    window_n,
+                )
+
     async def _seal_wait_and_close(self) -> str:
         """Seal-wait as a concurrent task during a pipelined GPU half.
 
@@ -960,6 +1086,13 @@ class ValidationService:
         publication to the next — serial — window. Cost of a false positive:
         one serial window (~100 s), at most once per publish interval.
         """
+        from reliquary.constants import DETACHED_TRAINER as _detached
+
+        if _detached:
+            # Detached mode: the serial beat exists for the SWAP, which
+            # is due exactly when a staged candidate is ready.
+            intake = self._checkpoint_intake
+            return bool(intake is not None and intake.staged_ready)
         emergency_freeze = os.environ.get(
             "RELIQUARY_DISABLE_TRAIN", ""
         ).lower() in {"1", "true", "yes", "on"}
@@ -1060,6 +1193,19 @@ class ValidationService:
                 "scheduled proving requires a published checkpoint"
             )
         if self._verify_model_checkpoint_revision != checkpoint.revision:
+            from reliquary.constants import DETACHED_TRAINER as _detached
+
+            if _detached:
+                # Detached mode: train_model no longer tracks the
+                # published checkpoint, so a refresh-from-train would
+                # label STALE weights with the new revision and every
+                # proof would run against the wrong model. Restart and
+                # reload from the published revision instead.
+                raise FatalProofPlaneError(
+                    "verify model revision diverged under detached "
+                    "trainer; restart required to reload the published "
+                    "checkpoint"
+                )
             if getattr(self, "_gpu_backlog", None) is not None:
                 # Should be unreachable: publishes are serial-only, so the
                 # revisions can only diverge in an iteration with no backlog.
@@ -2477,6 +2623,9 @@ class ValidationService:
         emergency_freeze = os.environ.get(
             "RELIQUARY_DISABLE_TRAIN", ""
         ).lower() in {"1", "true", "yes", "on"}
+        from reliquary.constants import DETACHED_TRAINER as _detached
+
+        detached_trainer = bool(_detached)
         cadence_publication_pending = (
             self._trained_windows_since_publish >= self._publish_every
         )
@@ -2490,12 +2639,15 @@ class ValidationService:
         )
         skip_train = (
             emergency_freeze
+            or detached_trainer
             or checkpoint_ceiling_reached
             or publication_retry_pending
         )
         if accumulator_ready and skip_train:
             if emergency_freeze:
                 blocked_reason = "emergency_training_freeze"
+            elif detached_trainer:
+                blocked_reason = "detached_trainer"
             elif checkpoint_ceiling_reached:
                 blocked_reason = "training_checkpoint_ceiling"
             else:
@@ -2631,6 +2783,7 @@ class ValidationService:
         next_n = self._checkpoint_n + 1
         should_publish = (
             not emergency_freeze
+            and not detached_trainer
             and not checkpoint_ceiling_reached
             and (
                 self._trained_windows_since_publish >= self._publish_every
@@ -2740,9 +2893,31 @@ class ValidationService:
                 self._trained_windows_since_publish,
                 self._publish_every,
             )
+        if detached_trainer:
+            try:
+                await self._detached_checkpoint_tick(
+                    owns_routing=owns_routing, window_n=window_n,
+                )
+            except FatalProofPlaneError:
+                raise
+            except Exception:
+                logger.exception(
+                    "detached checkpoint tick failed for window %d",
+                    window_n,
+                )
         self.server.set_training_publish_state({
             "trained_windows_since_publish": (
                 self._trained_windows_since_publish
+            ),
+            "detached_trainer": detached_trainer,
+            "windows_since_checkpoint_swap": (
+                self._windows_since_checkpoint_swap
+                if detached_trainer else None
+            ),
+            "checkpoint_intake": (
+                self._checkpoint_intake.snapshot()
+                if detached_trainer and self._checkpoint_intake is not None
+                else None
             ),
             "publish_interval": self._publish_every,
             "publication_pending": (
