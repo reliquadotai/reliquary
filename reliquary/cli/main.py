@@ -673,5 +673,30 @@ def validate(
     _run_validator_event_loop(_run())
 
 
+@app.command("train-worker")
+def train_worker(
+    shadow: bool = typer.Option(
+        False,
+        "--shadow",
+        help=(
+            "Consume payloads and train but never publish — for the "
+            "pre-cutover comparison against the in-process trainer."
+        ),
+    ),
+) -> None:
+    """Detached trainer: consume R2 training payloads, publish checkpoints.
+
+    See docs/superpowers/specs/2026-08-21-detached-trainer-r2-design.md.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(threadName)s | %(name)s | "
+               "%(levelname)s | %(message)s",
+    )
+    from reliquary.trainer.cli import run_train_worker
+
+    run_train_worker(shadow=shadow)
+
+
 if __name__ == "__main__":
     app()
