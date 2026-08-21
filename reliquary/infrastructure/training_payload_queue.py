@@ -218,3 +218,14 @@ class TrainingPayloadQueue:
             except Exception:
                 logger.exception("TrainingPayloadQueue drain crashed")
             await asyncio.sleep(2.0)
+
+
+_QUEUE: TrainingPayloadQueue | None = None
+
+
+def get_training_payload_queue() -> TrainingPayloadQueue:
+    """Return the process-wide TrainingPayloadQueue (created lazily)."""
+    global _QUEUE
+    if _QUEUE is None:
+        _QUEUE = TrainingPayloadQueue()
+    return _QUEUE

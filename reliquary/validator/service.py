@@ -591,6 +591,9 @@ class ValidationService:
         self._archive_enqueued_windows: set[int] = set()
         self._window_iteration_stage = "startup"
         self._utility_telemetry = UtilityTelemetryWriter()
+        # Detached-trainer payload worker handle; the queue itself is a
+        # lazy process-wide singleton (same pattern as get_archive_queue).
+        self._training_payload_worker_task: asyncio.Task | None = None
 
         self.server = ValidatorServer(host=http_host, port=http_port)
         self.server.set_late_drop_callback(self.record_late_drop)
@@ -2397,8 +2400,17 @@ class ValidationService:
                 "snapshot": self._training_accumulator.snapshot(),
             }
             accumulator_update["blocked_reason"] = "inconsistent_checkpoint"
+            # No single behavior revision exists — the trainer cannot use
+            # this window. Tombstone instead so its journal stays gapless.
+            self._write_training_tombstone(
+                window_n, "inconsistent_checkpoint", "InconsistentCheckpoint",
+            )
         else:
             checkpoint_revision = next(iter(checkpoint_revisions))
+            self._write_training_payload(
+                window_batches, window_n, checkpoint_revision,
+                _quarantine_archive,
+            )
             accumulator_update = self._training_accumulator.add_window(
                 {} if window_quarantine.quarantined else window_batches,
                 window_n=window_n,
@@ -3318,6 +3330,74 @@ class ValidationService:
         get_archive_queue().enqueue(first_batcher.window_start, archive)
         self._archive_enqueued_windows.add(int(first_batcher.window_start))
 
+    def _write_training_payload(
+        self,
+        window_batches,
+        window_n,
+        checkpoint_revision,
+        window_quarantine,
+    ) -> None:
+        """Enqueue this sealed window's detached-trainer payload (spec
+        2026-08-21-detached-trainer-r2). Independent of in-process
+        training so a shadow trainer can consume live data. Best-effort:
+        a write failure degrades the trainer, never the window."""
+        from reliquary.constants import WRITE_TRAINING_PAYLOADS
+
+        if not WRITE_TRAINING_PAYLOADS:
+            return
+        from reliquary.shared.training_payload import encode_training_payload
+
+        try:
+            data = encode_training_payload(
+                window_batches,
+                window_start=int(window_n),
+                checkpoint_revision=str(checkpoint_revision),
+                env_order=[name for name, _ in self.env_mix],
+                window_quarantine=dict(window_quarantine or {}),
+            )
+            self._training_payload_queue_ref().enqueue_payload(
+                int(window_n), data,
+            )
+        except Exception:
+            logger.exception(
+                "training payload write failed for window %s", window_n,
+            )
+
+    def _write_training_tombstone(
+        self, window_start: int, failure_stage: str, failure_type: str,
+    ) -> None:
+        """Tombstone keeps the trainer's journal gapless: the trainer
+        never advances on absence, only on an explicit marker."""
+        from reliquary.constants import WRITE_TRAINING_PAYLOADS
+
+        if not WRITE_TRAINING_PAYLOADS:
+            return
+        from reliquary.shared.training_payload import encode_tombstone
+
+        try:
+            self._training_payload_queue_ref().enqueue_tombstone(
+                int(window_start),
+                encode_tombstone(
+                    window_start=int(window_start),
+                    failure_stage=str(failure_stage),
+                    failure_type=str(failure_type),
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "training tombstone write failed for window %s", window_start,
+            )
+
+    def _training_payload_queue_ref(self):
+        """Injected queue for tests; process singleton in production."""
+        queue = getattr(self, "_training_payload_queue", None)
+        if queue is not None:
+            return queue
+        from reliquary.infrastructure.training_payload_queue import (
+            get_training_payload_queue,
+        )
+        return get_training_payload_queue()
+
     def _enqueue_aborted_window(
         self,
         *,
@@ -3356,6 +3436,11 @@ class ValidationService:
             "pipelined_train_archive",
         }:
             return
+        # The archive-dedup guard above also dedups this tombstone: one
+        # marker per aborted window, matching the trainer's journal.
+        self._write_training_tombstone(
+            window_start, failure_stage, failure_type,
+        )
         env_names = list(batchers)
         validator_hotkey = str(
             getattr(getattr(getattr(self, "wallet", None), "hotkey", None),
@@ -3591,6 +3676,13 @@ class ValidationService:
             archive_queue.run_forever(),
             name="archive_queue_worker",
         )
+        from reliquary.constants import WRITE_TRAINING_PAYLOADS
+
+        if WRITE_TRAINING_PAYLOADS:
+            self._training_payload_worker_task = asyncio.create_task(
+                self._training_payload_queue_ref().run_forever(),
+                name="training_payload_queue_worker",
+            )
         logger.info(
             "Validator started (v2.1): envs=%s, netuid=%d, http=%s:%d",
             list(self.envs.keys()), self.netuid, self.server.host, self.server.port,
