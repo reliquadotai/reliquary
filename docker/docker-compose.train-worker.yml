@@ -4,14 +4,13 @@
 # the bootstrap cursor + revision. See docs/detached-trainer.md.
 services:
   reliquary-train-worker:
-    image: ghcr.io/reliquadotai/reliquary-validator:latest
+    image: ${TRAIN_WORKER_IMAGE:-ghcr.io/reliquadotai/reliquary-validator:latest}
     container_name: reliquary-train-worker
     restart: unless-stopped
     stop_grace_period: 60s
     init: true
-    command: ["reliquary", "train-worker"]
-    # Shadow mode (trains, never publishes):
-    #   command: ["reliquary", "train-worker", "--shadow"]
+    # TRAIN_WORKER_FLAGS="--shadow" in .env for the pre-cutover phase.
+    command: reliquary train-worker ${TRAIN_WORKER_FLAGS:-}
     env_file: .env
     environment:
       # Which GPU the trainer owns on this box.
