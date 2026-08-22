@@ -134,6 +134,26 @@ def run_train_worker(*, shadow: bool = False) -> None:
         raw_n = os.environ.get("RELIQUARY_TRAINER_CHECKPOINT_N", "")
         checkpoint_n = int(raw_n) if raw_n.strip() else 0
 
+    # Telemetry: train_step's emit_metrics is a silent no-op unless
+    # telemetry.init ran. The trainer has no wallet; the run identity
+    # comes from env so the shadow run is distinguishable from prod
+    # (set RELIQUARY_WANDB_VERSION, e.g. "detached-shadow").
+    from reliquary import constants as _C
+    from reliquary.validator import telemetry as _telemetry
+
+    _telemetry.init(
+        hotkey_ss58=os.environ.get(
+            "RELIQUARY_TRAINER_WANDB_IDENTITY", "trainer0",
+        ),
+        config={
+            "role": "train-worker",
+            "shadow": bool(shadow),
+            "learning_rate": _C.LEARNING_RATE,
+            "kl_beta": _C.KL_BETA,
+            "publish_interval": CHECKPOINT_PUBLISH_INTERVAL_WINDOWS,
+        },
+    )
+
     logger.info("loading model from %s", model_path)
     model = load_text_generation_model(
         model_path,
