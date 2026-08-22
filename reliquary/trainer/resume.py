@@ -40,4 +40,10 @@ def resolve_resume_point(
             "the journal start"
         )
         raise SystemExit(2)
-    return None, int(bootstrap)
+    # Mid-run bootstrap (shadow start, cutover from in-process training):
+    # begin from the validator's last PUBLISHED checkpoint, not the base
+    # model, so the shadow comparison and the cutover are seamless.
+    revision = str(
+        env.get("RELIQUARY_TRAINER_BOOTSTRAP_REVISION", "")
+    ).strip() or None
+    return revision, int(bootstrap)

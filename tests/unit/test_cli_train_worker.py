@@ -42,3 +42,17 @@ def test_no_manifest_falls_back_to_env_cursor():
 def test_no_manifest_no_env_refuses_to_guess():
     with pytest.raises(SystemExit):
         resolve_resume_point(lambda key: None, env={})
+
+
+def test_bootstrap_revision_for_shadow_and_cutover():
+    # Mid-run start (shadow / cutover): begin from the validator's last
+    # published checkpoint instead of the base model.
+    revision, cursor = resolve_resume_point(
+        lambda key: None,
+        env={
+            "RELIQUARY_TRAINER_BOOTSTRAP_CURSOR": "30110",
+            "RELIQUARY_TRAINER_BOOTSTRAP_REVISION": "2463086760b7",
+        },
+    )
+    assert revision == "2463086760b7"
+    assert cursor == 30110

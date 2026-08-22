@@ -18,6 +18,7 @@ its verify plane on the serial publication beat.
 | `RELIQUARY_WRITE_TRAINING_PAYLOADS=1` | validator | write payloads + tombstones and start the upload worker. Independent of the cutover — required for shadow mode. |
 | `RELIQUARY_DETACHED_TRAINER=1` | validator | skip in-process train/publish; poll + stage + swap trainer checkpoints. Requires the writer flag too. |
 | `RELIQUARY_TRAINER_BOOTSTRAP_CURSOR=<window_n>` | trainer | first-run journal start (refused to guess). Only read when no candidate manifest exists yet. |
+| `RELIQUARY_TRAINER_BOOTSTRAP_REVISION=<hf_sha>` | trainer | mid-run bootstrap weights: start from this published checkpoint instead of the base model. REQUIRED for shadow starts and for the cutover (set it to the validator's last published revision). |
 | `RELIQUARY_TRAINER_STATE_DIR` | trainer | staging + resume directory (default `/root/reliquary/trainer`). |
 | `RELIQUARY_TRAINER_WINDOW_STRIDE` | trainer | journal stride (default 1, matching live window numbering). |
 | `RELIQUARY_HF_REPO_ID` + R2 env (`R2_*`) | trainer | checkpoint repo and payload bucket — same names as the validator. |
@@ -46,7 +47,10 @@ the prod box (single-stream is ~20 MB/s: per-connection window, do not
    queue stays shallow (`/state` publish block).
 2. Start the trainer on its box in shadow:
    `reliquary train-worker --shadow` with
-   `RELIQUARY_TRAINER_BOOTSTRAP_CURSOR=<current window>`. It trains but
+   `RELIQUARY_TRAINER_BOOTSTRAP_CURSOR=<window of the last publish>` and
+   `RELIQUARY_TRAINER_BOOTSTRAP_REVISION=<last published HF sha>` (from
+   `/state`). Same starting weights as prod's train model, same
+   payloads, same order — the curves are comparable. It trains but
    never publishes.
 3. Compare wandb telemetry (loss, grad-norm, `train/ppo_ratio_*`)
    between the in-process run and the shadow trainer over ≥16 windows.
