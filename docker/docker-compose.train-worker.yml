@@ -9,8 +9,12 @@ services:
     restart: unless-stopped
     stop_grace_period: 60s
     init: true
-    # TRAIN_WORKER_FLAGS="--shadow" in .env for the pre-cutover phase.
-    command: reliquary train-worker ${TRAIN_WORKER_FLAGS:-}
+    # The image's default entrypoint is the VALIDATOR launcher (wallet
+    # checks, grader server) — override it entirely: the trainer has no
+    # wallet and no grader. TRAIN_WORKER_FLAGS="--shadow" in .env for
+    # the pre-cutover phase.
+    entrypoint: ["/bin/bash", "-c", "exec reliquary train-worker ${TRAIN_WORKER_FLAGS:-}"]
+    command: []
     env_file: .env
     environment:
       # Which GPU the trainer owns on this box.
