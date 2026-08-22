@@ -78,6 +78,7 @@ class CheckpointIntake:
         staging_dir: str,
         installed_revision: str | None = None,
         validate_fn: Callable[[Path], dict[str, Any]] = _default_validate,
+        expected_identity: dict[str, Any] | None = None,
     ) -> None:
         self._r2 = r2_client
         self._bucket = bucket
@@ -85,6 +86,7 @@ class CheckpointIntake:
         self.staging_dir.mkdir(parents=True, exist_ok=True)
         self.installed_revision = installed_revision
         self._validate = validate_fn
+        self._expected_identity = dict(expected_identity or {})
         self._staged: tuple[dict[str, Any], Path] | None = None
         self._staging_revision: str | None = None
         self.last_error: str | None = None
@@ -110,6 +112,17 @@ class CheckpointIntake:
             revision = str(manifest["revision"])
         except (ValueError, KeyError, TypeError):
             logger.warning("malformed candidate manifest; ignoring")
+            return None
+        mismatches = {
+            key: (manifest.get(key), expected)
+            for key, expected in self._expected_identity.items()
+            if manifest.get(key) != expected
+        }
+        if mismatches:
+            self.last_error = (
+                "candidate manifest identity mismatch: "
+                + ", ".join(sorted(mismatches))
+            )
             return None
         if revision in {
             self.installed_revision,

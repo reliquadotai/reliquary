@@ -80,6 +80,7 @@ def run_train_worker(*, shadow: bool = False) -> None:
         DEFAULT_BASE_MODEL,
         DEFAULT_BASE_MODEL_REVISION,
         ENVIRONMENT_MIX,
+        PROTOCOL_VERSION,
     )
     from reliquary.shared.modeling import (
         load_text_generation_model,
@@ -90,6 +91,7 @@ def run_train_worker(*, shadow: bool = False) -> None:
     from reliquary.trainer.resume import resolve_resume_point
     from reliquary.trainer.train_runner import TrainRunner
     from reliquary.trainer.worker import TrainerLockLost, TrainerWorker
+    from reliquary.shared.training_payload import active_training_identity
     from reliquary.validator.checkpoint_profile import (
         validate_checkpoint_profile,
     )
@@ -105,8 +107,13 @@ def run_train_worker(*, shadow: bool = False) -> None:
     client = _r2_client()
     fetch = r2_fetch_fn(client, bucket)
 
+    expected_identity = (
+        active_training_identity() if PROTOCOL_VERSION >= 5 else None
+    )
     revision, cursor, checkpoint_n = resolve_resume_point(
-        fetch, env=os.environ,
+        fetch,
+        env=os.environ,
+        expected_identity=expected_identity,
     )
     lr_schedule_step: int | None = None
 
@@ -240,7 +247,10 @@ def run_train_worker(*, shadow: bool = False) -> None:
         return None
 
     worker = TrainerWorker(
-        journal=WindowJournal(fetch_fn=fetch),
+        journal=WindowJournal(
+            fetch_fn=fetch,
+            expected_identity=expected_identity,
+        ),
         train_fn=runner.step,
         publish_fn=publish_fn,
         head_revision_fn=head_revision_fn,

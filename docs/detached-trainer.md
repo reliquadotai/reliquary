@@ -44,6 +44,10 @@ the prod box (single-stream is ~20 MB/s: per-connection window, do not
 
 ## Cutover procedure (shadow first)
 
+This procedure is for a same-profile infrastructure move that continues the
+current weights. A reasoning-prompt v5 reset uses the dedicated procedure below
+instead of bootstrapping from the last v4-trained revision.
+
 1. Deploy with `RELIQUARY_WRITE_TRAINING_PAYLOADS=1` only. Verify
    `reliquary/training/window-*.npz` objects appear each window and the
    queue stays shallow (`/state` publish block).
@@ -65,6 +69,32 @@ the prod box (single-stream is ~20 MB/s: per-connection window, do not
    headline degradation metric; alert at 3× the publish interval),
    `train/ppo_ratio_outside_clip_ratio` (drift breaker backstop at 0.5),
    payload queue depth, trainer backlog (cursor vs live window).
+
+## Reasoning-prompt v5 fresh reset
+
+V5 changes the canonical miner prompt and starts a new training run. Do not use
+the generic mid-run bootstrap above with the last v4-trained checkpoint.
+
+1. Finish and archive the final v4 window. Record that window as the v5 trainer
+   bootstrap cursor; no payload at or below it may enter the v5 run.
+2. Publish the pinned Qwen3-4B-Base weights as the next append-only checkpoint
+   under `qwen3-4b-base-dapo-reasoning-v5`. Record its HF revision and checkpoint
+   number.
+3. Set the same `RELIQUARY_PROTOCOL_PROFILE` and new
+   `RELIQUARY_TRAINING_RUN_ID` on validator and train-worker. On the worker set
+   the explicit bootstrap revision to the v5 base reset, the cursor to the final
+   v4 window, and the checkpoint number to the base reset number.
+4. Restart the validator from that same v5 base-reset revision with payload
+   writing enabled. Start the H100 worker with `--shadow` first. Protocol-v5
+   payload identity prevents it from consuming legacy v4 journal objects.
+5. Compare the shadow step, memory, loss, ratio, and termination telemetry. Then
+   restart the worker without `--shadow` and enable detached intake on the
+   validator. The first v5 publish replaces the old candidate manifest.
+
+Candidate manifests and payloads now carry profile ID, protocol version,
+training-run ID, and generation-contract hash. A stale v4 manifest is ignored
+in favor of the explicit v5 bootstrap; a mismatched payload fails closed rather
+than advancing the journal cursor.
 
 ## Recovery
 

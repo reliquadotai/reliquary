@@ -55,6 +55,30 @@ def test_poll_none_when_no_manifest(tmp_path):
     assert intake.poll() is None
 
 
+def test_poll_ignores_manifest_from_another_protocol_run(tmp_path):
+    manifest = {
+        **_manifest(),
+        "protocol_profile_id": "v4",
+        "protocol_version": 4,
+        "training_run_id": "old-run",
+        "generation_contract_sha256": "a" * 64,
+    }
+    intake = CheckpointIntake(
+        r2_client=_R2(manifest=manifest),
+        bucket="b",
+        staging_dir=str(tmp_path),
+        expected_identity={
+            "protocol_profile_id": "v5",
+            "protocol_version": 5,
+            "training_run_id": "new-run",
+            "generation_contract_sha256": "b" * 64,
+        },
+    )
+
+    assert intake.poll() is None
+    assert "identity mismatch" in (intake.last_error or "")
+
+
 def test_stage_downloads_validates_and_flags_ready(tmp_path):
     r2 = _R2(
         manifest=_manifest(),

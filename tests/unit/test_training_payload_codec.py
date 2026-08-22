@@ -14,6 +14,9 @@ import pytest
 
 from reliquary import constants as C
 from reliquary.shared.training_payload import (
+    PAYLOAD_SCHEMA_VERSION,
+    TOMBSTONE_SCHEMA_VERSION,
+    active_training_identity,
     decode_tombstone,
     decode_training_payload,
     encode_tombstone,
@@ -79,6 +82,8 @@ def _encode_decode(batches):
 
 def test_header_round_trip():
     decoded = _encode_decode(_window_batches())
+    assert decoded.schema_version == PAYLOAD_SCHEMA_VERSION
+    assert decoded.training_identity == active_training_identity()
     assert decoded.window_start == 30100
     assert decoded.checkpoint_revision == "rev-abc"
     assert decoded.env_order == ["openmathinstruct", "opencodeinstruct"]
@@ -171,6 +176,9 @@ def test_tombstone_round_trip():
         window_start=30105, failure_stage="proof_capacity",
         failure_type="ProofCapacityAbort",
     ))
+    assert doc["schema_version"] == TOMBSTONE_SCHEMA_VERSION
+    for key, value in active_training_identity().items():
+        assert doc[key] == value
     assert doc["window_start"] == 30105
     assert doc["failure_stage"] == "proof_capacity"
     assert doc["failure_type"] == "ProofCapacityAbort"

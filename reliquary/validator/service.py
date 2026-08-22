@@ -946,6 +946,9 @@ class ValidationService:
                 CheckpointIntake,
                 default_r2_client,
             )
+            from reliquary.shared.training_payload import (
+                active_training_identity,
+            )
 
             current = self._checkpoint_store.current_manifest()
             self._checkpoint_intake = CheckpointIntake(
@@ -959,6 +962,11 @@ class ValidationService:
                 ),
                 installed_revision=(
                     current.revision if current is not None else None
+                ),
+                expected_identity=(
+                    active_training_identity()
+                    if PROTOCOL_VERSION >= 5
+                    else None
                 ),
             )
         return self._checkpoint_intake

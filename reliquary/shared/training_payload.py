@@ -9,6 +9,7 @@ T_PROTO == 1.0 exactly like _verify_logprobs_for_training.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import math
@@ -17,8 +18,63 @@ from typing import Any
 
 import numpy as np
 
-PAYLOAD_SCHEMA_VERSION = 1
-TOMBSTONE_SCHEMA_VERSION = 1
+PAYLOAD_SCHEMA_VERSION = 2
+TOMBSTONE_SCHEMA_VERSION = 2
+_SUPPORTED_PAYLOAD_SCHEMA_VERSIONS = {1, PAYLOAD_SCHEMA_VERSION}
+_SUPPORTED_TOMBSTONE_SCHEMA_VERSIONS = {1, TOMBSTONE_SCHEMA_VERSION}
+_TRAINING_IDENTITY_KEYS = (
+    "protocol_profile_id",
+    "protocol_version",
+    "training_run_id",
+    "generation_contract_sha256",
+)
+
+
+class TrainingPayloadProtocolMismatch(RuntimeError):
+    """A detached-training artifact belongs to another protocol/run."""
+
+
+def active_training_identity() -> dict[str, Any]:
+    """Return the protocol identity shared by payloads and manifests.
+
+    Imports are lazy because this codec is also used by tooling that selects a
+    protocol profile before importing ``reliquary.constants``.
+    """
+
+    from reliquary.constants import (
+        PROTOCOL_GENERATION_CONTRACT,
+        PROTOCOL_PROFILE_ID,
+        PROTOCOL_VERSION,
+        TRAINING_RUN_ID,
+    )
+
+    contract = json.dumps(
+        PROTOCOL_GENERATION_CONTRACT,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "protocol_profile_id": PROTOCOL_PROFILE_ID,
+        "protocol_version": int(PROTOCOL_VERSION),
+        "training_run_id": TRAINING_RUN_ID,
+        "generation_contract_sha256": hashlib.sha256(contract).hexdigest(),
+    }
+
+
+def validate_training_identity(
+    actual: dict[str, Any],
+    expected: dict[str, Any],
+    *,
+    artifact: str,
+) -> None:
+    """Fail closed when a detached artifact crosses a run boundary."""
+
+    for key, expected_value in expected.items():
+        if actual.get(key) != expected_value:
+            raise TrainingPayloadProtocolMismatch(
+                f"{artifact} identity mismatch for {key}: "
+                f"expected {expected_value!r}, got {actual.get(key)!r}"
+            )
 
 
 def _pi_old_for_encode(rollout: Any, completion_length: int) -> list[float] | None:
@@ -103,6 +159,7 @@ def encode_training_payload(
 
     header = {
         "schema_version": PAYLOAD_SCHEMA_VERSION,
+        **active_training_identity(),
         "window_start": int(window_start),
         "checkpoint_revision": str(checkpoint_revision),
         "env_order": list(env_order),
@@ -134,11 +191,15 @@ def encode_training_payload(
 class DecodedPayload:
     def __init__(self, arrays: dict[str, np.ndarray]) -> None:
         header = json.loads(bytes(arrays["header"]).decode("utf-8"))
-        if header["schema_version"] != PAYLOAD_SCHEMA_VERSION:
+        if header["schema_version"] not in _SUPPORTED_PAYLOAD_SCHEMA_VERSIONS:
             raise ValueError(
                 f"unsupported payload schema {header['schema_version']}"
             )
         self.schema_version = header["schema_version"]
+        self.training_identity = {
+            key: header.get(key)
+            for key in _TRAINING_IDENTITY_KEYS
+        }
         self.window_start = int(header["window_start"])
         self.checkpoint_revision = str(header["checkpoint_revision"])
         self.env_order = list(header["env_order"])
@@ -204,6 +265,7 @@ def encode_tombstone(
 ) -> bytes:
     return json.dumps({
         "schema_version": TOMBSTONE_SCHEMA_VERSION,
+        **active_training_identity(),
         "window_start": int(window_start),
         "failure_stage": str(failure_stage),
         "failure_type": str(failure_type),
@@ -212,6 +274,6 @@ def encode_tombstone(
 
 def decode_tombstone(data: bytes) -> dict[str, Any]:
     doc = json.loads(data.decode("utf-8"))
-    if doc.get("schema_version") != TOMBSTONE_SCHEMA_VERSION:
+    if doc.get("schema_version") not in _SUPPORTED_TOMBSTONE_SCHEMA_VERSIONS:
         raise ValueError("unsupported tombstone schema")
     return doc

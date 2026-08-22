@@ -157,6 +157,21 @@ and quality screens must be regenerated and labelled with their full profile.
    RELIQUARY_PROOF_CAPACITY_MANIFEST_SHA256=<sha256>
    ```
 
+   With the detached H100 train-worker, also configure:
+
+   ```bash
+   RELIQUARY_PROTOCOL_PROFILE=qwen3-4b-base-dapo-reasoning-v5
+   RELIQUARY_TRAINING_RUN_ID=<same-new-v5-run-id-as-validator>
+   RELIQUARY_TRAINER_BOOTSTRAP_CURSOR=<final-sealed-v4-window>
+   RELIQUARY_TRAINER_BOOTSTRAP_REVISION=<v5-stamped-base-reset-sha>
+   RELIQUARY_TRAINER_CHECKPOINT_N=<base-reset-checkpoint-number>
+   TRAIN_WORKER_FLAGS=--shadow
+   ```
+
+   Do not point the detached worker at the last v4-trained revision. Its v5
+   manifest/payload identity checks intentionally ignore the existing v4
+   candidate manifest and use this explicit clean bootstrap.
+
 4. Deploy miner and validator code together. Confirm `/state` advertises
    protocol `5`, the v5 profile ID, raw encoding, both exact prompt templates,
    16 rollouts, full-support sampling, an 8192-token cap, and `bft: null`.
