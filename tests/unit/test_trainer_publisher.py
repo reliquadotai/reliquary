@@ -14,13 +14,31 @@ class _R2:
     def __init__(self):
         self.uploads = []      # (key, path) via upload_file
         self.objects = {}      # key -> bytes via put_object
+        self.deleted = []      # keys via delete_object
 
     def upload_file(self, path, bucket, key, Config=None):
         assert Config is not None  # multipart config is mandatory
         self.uploads.append((key, path))
+        self.objects[key] = b"<file>"
 
     def put_object(self, Bucket, Key, Body, **kw):
         self.objects[Key] = Body
+
+    def list_objects_v2(self, Bucket, Prefix, Delimiter=None):
+        if Delimiter:
+            prefixes = sorted({
+                k[: k.index(Delimiter, len(Prefix)) + 1]
+                for k in self.objects
+                if k.startswith(Prefix) and Delimiter in k[len(Prefix):]
+            })
+            return {"CommonPrefixes": [{"Prefix": p} for p in prefixes]}
+        return {"Contents": [
+            {"Key": k} for k in sorted(self.objects) if k.startswith(Prefix)
+        ]}
+
+    def delete_object(self, Bucket, Key):
+        self.objects.pop(Key, None)
+        self.deleted.append(Key)
 
 
 def _publisher(tmp_path, r2, order, *, hf_fails=False):
@@ -101,6 +119,37 @@ def test_profile_extra_written(tmp_path):
     ]
     assert profiles and profiles[0]["lr_schedule_step"] == 99
     assert profiles[0]["trained_window_cursor"] == 30200
+
+
+def test_mirror_keeps_only_last_two_revisions(tmp_path):
+    r2, order = _R2(), []
+    # A stale revision from before a restart must be cleaned too.
+    r2.objects["reliquary/checkpoints/rev-old/model.safetensors"] = b"x"
+
+    def save_fn(model, tokenizer, path):
+        (path / "model.safetensors").write_bytes(b"w")
+
+    revs = iter(["rev-1", "rev-2", "rev-3"])
+
+    async def hf_upload(folder_path, repo_id, commit_message):
+        return next(revs)
+
+    pub = TrainerPublisher(
+        repo_id="org/repo", staging_dir=str(tmp_path), tokenizer=None,
+        save_fn=save_fn, hf_upload_fn=hf_upload, r2_client=r2,
+        bucket="reliquary",
+    )
+    for n in (1, 2, 3):
+        asyncio.run(pub.publish(
+            object(), checkpoint_n=n, lr_schedule_step=None,
+            trained_window_cursor=30100 + n, reason="cadence",
+        ))
+    live_revs = {
+        k.split("/")[2] for k in r2.objects
+        if k.startswith("reliquary/checkpoints/")
+    }
+    assert live_revs == {"rev-2", "rev-3"}
+    assert "reliquary/checkpoints/rev-old/model.safetensors" in r2.deleted
 
 
 def test_staging_cleaned_on_failure(tmp_path):

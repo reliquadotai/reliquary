@@ -62,6 +62,7 @@ class TrainerPublisher:
         self._bucket = bucket
         self._save = save_fn or _default_save_hf_format
         self._hf_upload = hf_upload_fn or _default_upload
+        self._previous_mirror_revision: str | None = None
 
     async def publish(
         self,
@@ -127,9 +128,44 @@ class TrainerPublisher:
         finally:
             shutil.rmtree(snapshot_dir, ignore_errors=True)
 
+        # Bound the mirror: keep the current + previous revision only
+        # (previous eliminates any race with a validator mid-download).
+        # HF is the durable archive of every revision; without cleanup
+        # the mirror grows ~8 GB per publish forever.
+        await asyncio.to_thread(
+            self._prune_mirror,
+            keep={str(revision), self._previous_mirror_revision},
+        )
+        self._previous_mirror_revision = str(revision)
+
         logger.info(
             "Published checkpoint %d to %s@%s (cursor=%d, reason=%s)",
             checkpoint_n, self.repo_id, str(revision)[:12],
             trained_window_cursor, reason,
         )
         return str(revision)
+
+    def _prune_mirror(self, *, keep: set[str | None]) -> None:
+        """Best-effort deletion of mirror revisions outside ``keep`` —
+        including strays from before a restart. Never fails a publish."""
+        try:
+            listed = self._r2.list_objects_v2(
+                Bucket=self._bucket,
+                Prefix=f"{R2_CHECKPOINT_PREFIX}/",
+                Delimiter="/",
+            )
+            for entry in listed.get("CommonPrefixes", []):
+                prefix = entry["Prefix"]
+                rev = prefix[len(R2_CHECKPOINT_PREFIX) + 1:].rstrip("/")
+                if rev in keep:
+                    continue
+                objs = self._r2.list_objects_v2(
+                    Bucket=self._bucket, Prefix=prefix,
+                )
+                for obj in objs.get("Contents", []):
+                    self._r2.delete_object(
+                        Bucket=self._bucket, Key=obj["Key"],
+                    )
+                logger.info("pruned mirror revision %s", rev[:12])
+        except Exception:
+            logger.exception("mirror prune failed (non-fatal)")
