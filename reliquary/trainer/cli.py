@@ -105,9 +105,10 @@ def run_train_worker(*, shadow: bool = False) -> None:
     client = _r2_client()
     fetch = r2_fetch_fn(client, bucket)
 
-    revision, cursor = resolve_resume_point(fetch, env=os.environ)
+    revision, cursor, checkpoint_n = resolve_resume_point(
+        fetch, env=os.environ,
+    )
     lr_schedule_step: int | None = None
-    checkpoint_n = 0
 
     if revision is None:
         logger.info(
@@ -131,8 +132,6 @@ def run_train_worker(*, shadow: bool = False) -> None:
         model_path = str(snapshot_dir)
         load_kwargs = {}
         tokenizer = load_tokenizer(model_path)
-        raw_n = os.environ.get("RELIQUARY_TRAINER_CHECKPOINT_N", "")
-        checkpoint_n = int(raw_n) if raw_n.strip() else 0
 
     # Telemetry: train_step's emit_metrics is a silent no-op unless
     # telemetry.init ran. The trainer has no wallet; the run identity
@@ -204,6 +203,42 @@ def run_train_worker(*, shadow: bool = False) -> None:
             logger.exception("HF HEAD lookup failed; skipping guard")
             return None
 
+    # Startup reconciliation: a crash between the HF upload and the
+    # manifest PUT leaves an orphaned HEAD that would trip the
+    # single-writer guard on every publish forever. Adopt the observed
+    # HEAD as "ours" at startup (loudly): our weights/cursor still come
+    # from the manifest, and the next publish supersedes the orphan. A
+    # REAL foreign publisher keeps moving HEAD and still trips the guard
+    # on the next in-run publish.
+    startup_head = head_revision_fn()
+    last_revision = revision
+    if (
+        startup_head is not None
+        and revision is not None
+        and startup_head != revision
+    ):
+        logger.warning(
+            "HF HEAD %s != manifest revision %s at startup — adopting "
+            "HEAD (orphaned half-publish or foreign publisher; the "
+            "single-writer guard stays armed for the rest of the run)",
+            startup_head[:12], revision[:12],
+        )
+        last_revision = startup_head
+
+    def freeze_fn() -> str | None:
+        from reliquary.constants import TRAIN_UNTIL_CHECKPOINT_N
+
+        if os.environ.get("RELIQUARY_DISABLE_TRAIN", "").lower() in {
+            "1", "true", "yes", "on",
+        }:
+            return "emergency_training_freeze"
+        if (
+            TRAIN_UNTIL_CHECKPOINT_N > 0
+            and publish_state["checkpoint_n"] >= TRAIN_UNTIL_CHECKPOINT_N
+        ):
+            return "training_checkpoint_ceiling"
+        return None
+
     worker = TrainerWorker(
         journal=WindowJournal(fetch_fn=fetch),
         train_fn=runner.step,
@@ -212,21 +247,38 @@ def run_train_worker(*, shadow: bool = False) -> None:
         cursor=cursor,
         stride=int(os.environ.get("RELIQUARY_TRAINER_WINDOW_STRIDE", "1")),
         publish_every=CHECKPOINT_PUBLISH_INTERVAL_WINDOWS,
-        last_published_revision=revision,
+        last_published_revision=last_revision,
         shadow=shadow,
+        freeze_fn=freeze_fn,
     )
 
     logger.info(
         "train-worker starting: cursor=%d, revision=%s, shadow=%s",
         worker.cursor, revision, shadow,
     )
+    transient_failures = 0
     while True:
         try:
             outcome = worker.run_once()
         except TrainerLockLost:
             logger.critical("trainer lock lost; exiting", exc_info=True)
             raise SystemExit(3)
+        except Exception:
+            # Transient R2/HF error mid-poll or mid-publish: the cursor
+            # never advanced, so retrying is always safe. Backoff, don't
+            # die — a process exit costs the optimizer moments.
+            transient_failures += 1
+            delay = min(60.0, 5.0 * transient_failures)
+            logger.exception(
+                "worker iteration failed (attempt %d); retrying in %.0fs",
+                transient_failures, delay,
+            )
+            time.sleep(delay)
+            continue
+        transient_failures = 0
         if outcome == "waited":
             time.sleep(5.0)
+        elif outcome == "frozen":
+            time.sleep(30.0)
         elif outcome in {"tombstone", "quarantined", "published"}:
             logger.info("%s (cursor=%d)", outcome, worker.cursor)

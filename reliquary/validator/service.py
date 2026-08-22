@@ -984,7 +984,26 @@ class ValidationService:
         if not state:
             raise RuntimeError(f"no safetensors under {snapshot_dir}")
         self._verify_model_checkpoint_revision = None
-        self.verify_model.load_state_dict(state)
+        # save_pretrained(safe_serialization=True) omits tied weights
+        # (lm_head.weight on every protocol Qwen model), so a strict load
+        # raises. Allow EXACTLY the model's declared tied keys, nothing
+        # else, then re-tie.
+        tied = set(
+            getattr(self.verify_model, "_tied_weights_keys", None) or []
+        )
+        result = self.verify_model.load_state_dict(state, strict=False)
+        unexpected = list(getattr(result, "unexpected_keys", []) or [])
+        missing = [
+            k for k in getattr(result, "missing_keys", []) or []
+            if k not in tied
+        ]
+        if unexpected or missing:
+            raise RuntimeError(
+                "staged checkpoint state mismatch: "
+                f"missing={missing[:5]} unexpected={unexpected[:5]}"
+            )
+        if tied:
+            self.verify_model.tie_weights()
         self.verify_model.eval()
         for parameter in self.verify_model.parameters():
             parameter.requires_grad = False
@@ -1041,6 +1060,16 @@ class ValidationService:
         beat only."""
         intake = self._detached_intake_ref()
         self._windows_since_checkpoint_swap += 1
+        # The emergency freeze must also stop ADOPTING checkpoints, or a
+        # collapsing model keeps rolling out to miners mid-incident.
+        if os.environ.get("RELIQUARY_DISABLE_TRAIN", "").lower() in {
+            "1", "true", "yes", "on",
+        }:
+            logger.warning(
+                "Window %d: emergency freeze active; not polling or "
+                "swapping trainer checkpoints", window_n,
+            )
+            return
         task = self._intake_stage_task
         if task is None or task.done():
             manifest = await asyncio.to_thread(intake.poll)
@@ -2553,7 +2582,11 @@ class ValidationService:
             )
         else:
             checkpoint_revision = next(iter(checkpoint_revisions))
-            self._write_training_payload(
+            # Off the event loop: the encode walks every token of the
+            # window (np.savez_compressed included) — seconds of CPU that
+            # would otherwise freeze /state and the drain workers.
+            await asyncio.to_thread(
+                self._write_training_payload,
                 window_batches, window_n, checkpoint_revision,
                 _quarantine_archive,
             )
@@ -3536,6 +3569,12 @@ class ValidationService:
         except Exception:
             logger.exception(
                 "training payload write failed for window %s", window_n,
+            )
+            # The journal contract is "never advance on absence": a hole
+            # with neither payload nor tombstone stalls the trainer
+            # forever. A failed encode must still produce a marker.
+            self._write_training_tombstone(
+                window_n, "payload_encode", "PayloadEncodeError",
             )
 
     def _write_training_tombstone(

@@ -33,6 +33,7 @@ class TrainerWorker:
         publish_every: int,
         last_published_revision: str | None,
         shadow: bool = False,
+        freeze_fn: Callable[[], str | None] | None = None,
     ) -> None:
         self._journal = journal
         self._train_fn = train_fn
@@ -43,6 +44,7 @@ class TrainerWorker:
         self.publish_every = int(publish_every)
         self.last_published_revision = last_published_revision
         self.shadow = bool(shadow)
+        self._freeze_fn = freeze_fn
         self.trained_since_publish = 0
         self.adaptive_publication_pending = False
         self.tombstones_seen = 0
@@ -82,6 +84,14 @@ class TrainerWorker:
         return "published"
 
     def run_once(self) -> str:
+        # Incident kill-switches (emergency freeze / checkpoint ceiling)
+        # must work in the detached path too: frozen means no consuming,
+        # no training, no publishing — the journal simply backs up.
+        if self._freeze_fn is not None:
+            reason = self._freeze_fn()
+            if reason:
+                logger.warning("trainer frozen: %s", reason)
+                return "frozen"
         if self._publication_due():
             return self._publish()
         entry = self._journal.next_entry(self.cursor, stride=self.stride)

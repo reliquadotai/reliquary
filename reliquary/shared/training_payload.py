@@ -53,6 +53,11 @@ def encode_training_payload(
 ) -> bytes:
     groups_meta: list[dict[str, Any]] = []
     rollout_meta: list[dict[str, Any]] = []
+    # Validator-DERIVED per-rollout state (never wire metadata): the BFT
+    # force span and termination path drive loss masking (PR #167) and
+    # must survive the hop as the private attrs training reads.
+    validated_spans: list[list[int] | None] = []
+    termination_paths: list[str | None] = []
     rewards: list[float] = []
     env_names: list[str] = []
     tokens_flat: list[int] = []
@@ -76,6 +81,12 @@ def encode_training_payload(
                 miner_lp = list(meta.pop("token_logprobs", []) or [])
                 completion_length = int(meta.get("completion_length", 0) or 0)
                 rollout_meta.append(meta)
+                span = getattr(rollout, "_validated_force_span", None)
+                validated_spans.append(
+                    [int(span[0]), int(span[1])] if span else None
+                )
+                term = getattr(rollout, "_validated_termination_path", None)
+                termination_paths.append(str(term) if term else None)
                 rewards.append(float(getattr(rollout, "reward", 0.0)))
                 env_names.append(str(getattr(rollout, "env_name", env)))
                 tokens_flat.extend(int(t) for t in commit.get("tokens", []))
@@ -98,6 +109,8 @@ def encode_training_payload(
         "window_quarantine": window_quarantine,
         "groups": groups_meta,
         "rollout_meta": rollout_meta,
+        "validated_spans": validated_spans,
+        "termination_paths": termination_paths,
     }
     buf = io.BytesIO()
     np.savez_compressed(
@@ -132,6 +145,8 @@ class DecodedPayload:
         self.window_quarantine = dict(header["window_quarantine"])
         self._groups_meta = header["groups"]
         self._rollout_meta = header["rollout_meta"]
+        self._validated_spans = header.get("validated_spans") or []
+        self._termination_paths = header.get("termination_paths") or []
         self._arrays = arrays
 
     def batches(self) -> dict[str, list]:
@@ -161,6 +176,15 @@ class DecodedPayload:
                     rollout._validated_completion_logprobs = [
                         float(v) for v in a["pi_old_flat"][p0:p1]
                     ]
+                if i < len(self._validated_spans):
+                    span = self._validated_spans[i]
+                    if span:
+                        rollout._validated_force_span = (
+                            int(span[0]), int(span[1]),
+                        )
+                    term = self._termination_paths[i]
+                    if term:
+                        rollout._validated_termination_path = str(term)
                 rollouts.append(rollout)
                 cursor += 1
             out[gm["env"]].append(

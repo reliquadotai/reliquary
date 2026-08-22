@@ -25,13 +25,20 @@ class _RecordingQueue:
 
 
 def _stub_service(queue):
-    return SimpleNamespace(
+    stub = SimpleNamespace(
         _training_payload_queue=queue,
         env_mix=[("openmathinstruct", 8), ("opencodeinstruct", 8)],
         _training_payload_queue_ref=(
             lambda self=None, q=queue: q
         ),
     )
+    # The payload writer's failure path emits a tombstone via self.
+    stub._write_training_tombstone = (
+        lambda *a, **k: ValidationService._write_training_tombstone(
+            stub, *a, **k,
+        )
+    )
+    return stub
 
 
 def test_writer_noop_when_flag_off(monkeypatch):

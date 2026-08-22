@@ -146,6 +146,26 @@ def test_t_proto_gate_drops_pi_old(monkeypatch):
                 assert getattr(r, "_validated_completion_logprobs", None) is None
 
 
+def test_force_span_and_termination_path_round_trip():
+    from reliquary.validator.training import _completion_keep_list
+
+    original = _window_batches()
+    forced = original["openmathinstruct"][0].rollouts[1]
+    forced._validated_force_span = (9, 12)
+    forced._validated_termination_path = "bft_forced"
+    decoded = _encode_decode(original).batches()
+    d = decoded["openmathinstruct"][0].rollouts[1]
+    assert d._validated_force_span == (9, 12)
+    assert d._validated_termination_path == "bft_forced"
+    # The consumer this exists for: BFT tokens masked from the loss.
+    keep0 = _completion_keep_list(forced, 7, 6)
+    keep1 = _completion_keep_list(d, 7, 6)
+    assert keep1 == keep0 and keep1 is not None and False in keep1
+    # Rollouts without a span stay span-free (no fabricated masking).
+    other = decoded["openmathinstruct"][0].rollouts[0]
+    assert getattr(other, "_validated_force_span", None) is None
+
+
 def test_tombstone_round_trip():
     doc = decode_tombstone(encode_tombstone(
         window_start=30105, failure_stage="proof_capacity",

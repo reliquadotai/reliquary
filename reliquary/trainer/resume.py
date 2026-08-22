@@ -21,16 +21,18 @@ def resolve_resume_point(
     fetch_fn: Callable[[str], bytes | None],
     *,
     env: Mapping[str, str],
-) -> tuple[str | None, int]:
-    """Return ``(revision, cursor)``: the checkpoint revision to load
-    (None = bootstrap from the pinned base model) and the journal cursor
-    to resume after."""
+) -> tuple[str | None, int, int]:
+    """Return ``(revision, cursor, checkpoint_n)``: the checkpoint
+    revision to load (None = bootstrap), the journal cursor to resume
+    after, and the last published checkpoint number (0 = none yet —
+    checkpoint numbering must never regress across restarts)."""
     raw = fetch_fn(CANDIDATE_MANIFEST_KEY)
     if raw is not None:
         manifest = json.loads(raw.decode("utf-8"))
         return (
             str(manifest["revision"]),
             int(manifest["trained_window_cursor"]),
+            int(manifest.get("checkpoint_n", 0)),
         )
     bootstrap = str(env.get("RELIQUARY_TRAINER_BOOTSTRAP_CURSOR", "")).strip()
     if not bootstrap:
@@ -46,4 +48,5 @@ def resolve_resume_point(
     revision = str(
         env.get("RELIQUARY_TRAINER_BOOTSTRAP_REVISION", "")
     ).strip() or None
-    return revision, int(bootstrap)
+    raw_n = str(env.get("RELIQUARY_TRAINER_CHECKPOINT_N", "")).strip()
+    return revision, int(bootstrap), int(raw_n) if raw_n else 0

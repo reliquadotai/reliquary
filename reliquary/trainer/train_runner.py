@@ -9,7 +9,10 @@ import logging
 from typing import Any, Callable
 
 from reliquary.validator.quarantine import assess_training_batch
-from reliquary.validator.training import train_step as _default_train_step
+from reliquary.validator.training import (
+    TrainingStepSkipped,
+    train_step as _default_train_step,
+)
 from reliquary.validator.training_accumulator import (
     BalancedTrainingAccumulator,
 )
@@ -46,6 +49,48 @@ class TrainRunner:
         # _lr_global_step_hint (the schedule advances internally after
         # _lazy_init consumes it once).
         self.global_step_hint = global_step_hint
+        self.groups_dropped_missing_pi_old = 0
+
+    def _filter_missing_pi_old(self, batches: dict) -> dict:
+        """Drop whole groups lacking validator pi_old on any rollout.
+
+        The in-process ladder falls back to a behavior-model forward; the
+        detached trainer has no frozen replica, and the next rung down is
+        the MINER-CLAIMED logprobs — exactly the trust RECOMPUTE was
+        deployed to remove. Dropping the full group (not the rollout)
+        keeps group-relative advantages intact for everything trained.
+        """
+        from reliquary.constants import (
+            PI_OLD_FROM_VERIFY_LOGPROBS,
+            RECOMPUTE_PI_OLD_FROM_VERIFY,
+            T_PROTO,
+        )
+
+        if float(T_PROTO) != 1.0:
+            # Shipped pi_old cannot exist off the identity-warp profile;
+            # the gate mirrors the encoder's.
+            return batches
+        if not (PI_OLD_FROM_VERIFY_LOGPROBS and RECOMPUTE_PI_OLD_FROM_VERIFY):
+            return batches
+        out: dict = {}
+        for env, groups in batches.items():
+            kept = []
+            for group in groups:
+                if all(
+                    getattr(r, "_validated_completion_logprobs", None)
+                    is not None
+                    for r in group.rollouts
+                ):
+                    kept.append(group)
+                else:
+                    self.groups_dropped_missing_pi_old += 1
+                    logger.warning(
+                        "dropping group prompt_idx=%s (%s): missing "
+                        "validator pi_old; refusing miner-claim fallback",
+                        getattr(group, "prompt_idx", "?"), env,
+                    )
+            out[env] = kept
+        return out
 
     def step(self, decoded: Any) -> bool:
         """Feed one decoded window; returns True when a train step ran.
@@ -55,7 +100,7 @@ class TrainRunner:
         accumulator is reset first, matching the validator's finally.
         """
         self._accumulator.add_window(
-            decoded.batches(),
+            self._filter_missing_pi_old(decoded.batches()),
             window_n=decoded.window_start,
             checkpoint_revision=decoded.checkpoint_revision,
         )
@@ -80,6 +125,17 @@ class TrainRunner:
                 window_index=decoded.window_start,
                 global_step_hint=self.global_step_hint,
             )
+        except TrainingStepSkipped:
+            raise  # worker handles health gates (adaptive publication)
+        except Exception:
+            # Parity with the in-process path (service.py: "train_step
+            # failed; archiving anyway"): a CUDA OOM or kernel fault on
+            # one window must not become a crash loop replaying it.
+            logger.exception(
+                "train_step failed for window %s; skipping this batch",
+                decoded.window_start,
+            )
+            return False
         finally:
             self._accumulator.reset()
         return True

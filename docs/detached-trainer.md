@@ -19,6 +19,8 @@ its verify plane on the serial publication beat.
 | `RELIQUARY_DETACHED_TRAINER=1` | validator | skip in-process train/publish; poll + stage + swap trainer checkpoints. Requires the writer flag too. |
 | `RELIQUARY_TRAINER_BOOTSTRAP_CURSOR=<window_n>` | trainer | first-run journal start (refused to guess). Only read when no candidate manifest exists yet. |
 | `RELIQUARY_TRAINER_BOOTSTRAP_REVISION=<hf_sha>` | trainer | mid-run bootstrap weights: start from this published checkpoint instead of the base model. REQUIRED for shadow starts and for the cutover (set it to the validator's last published revision). |
+| `RELIQUARY_TRAINER_CHECKPOINT_N=<n>` | trainer | bootstrap-only checkpoint number (cutover: set to the validator's current `checkpoint_n` so numbering never regresses). After the first publish the manifest carries it. |
+| `RELIQUARY_DISABLE_TRAIN=1` | both | emergency freeze works in the detached path too: the trainer stops consuming/publishing ("frozen"), the validator stops polling/swapping checkpoints. |
 | `RELIQUARY_TRAINER_STATE_DIR` | trainer | staging + resume directory (default `/root/reliquary/trainer`). |
 | `RELIQUARY_TRAINER_WINDOW_STRIDE` | trainer | journal stride (default 1, matching live window numbering). |
 | `RELIQUARY_HF_REPO_ID` + R2 env (`R2_*`) | trainer | checkpoint repo and payload bucket — same names as the validator. |

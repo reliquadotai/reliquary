@@ -64,6 +64,30 @@ def _default_upload(key: str, body: bytes) -> None:
     )
 
 
+def _default_delete(key: str) -> None:
+    """Best-effort sync boto3 DeleteObject (tombstone superseded by a
+    replayed payload). Runs inside to_thread."""
+    import boto3
+    from botocore.config import Config
+
+    account_id = os.getenv("R2_ACCOUNT_ID", "")
+    endpoint = (
+        os.getenv("R2_ENDPOINT_URL")
+        or f"https://{account_id}.r2.cloudflarestorage.com"
+    )
+    client = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=os.getenv("R2_ACCESS_KEY_ID", ""),
+        aws_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY", ""),
+        region_name=os.getenv("R2_REGION", "us-east-1"),
+        config=Config(retries={"max_attempts": 2, "mode": "standard"}),
+    )
+    client.delete_object(
+        Bucket=os.getenv("R2_BUCKET_ID", "reliquary"), Key=key,
+    )
+
+
 class TrainingPayloadQueue:
     """Durable producer/consumer queue for training payloads + tombstones."""
 
@@ -88,6 +112,16 @@ class TrainingPayloadQueue:
         return final_path
 
     def enqueue_payload(self, window_start: int, data: bytes) -> Path:
+        # A window replayed under the same number after a fatal restart
+        # supersedes its tombstone (journal readers prefer the payload;
+        # this removes a not-yet-uploaded local marker too).
+        stale = self.queue_dir / (
+            f"window-{int(window_start)}{_TOMBSTONE_SUFFIX}"
+        )
+        try:
+            stale.unlink()
+        except OSError:
+            pass
         path = self._enqueue(
             f"window-{int(window_start)}{_PAYLOAD_SUFFIX}", data,
         )
@@ -141,7 +175,10 @@ class TrainingPayloadQueue:
         }
 
     async def _try_upload(
-        self, path: Path, upload_fn: Callable[[str, bytes], None],
+        self,
+        path: Path,
+        upload_fn: Callable[[str, bytes], None],
+        delete_fn: Callable[[str], None] | None = None,
     ) -> bool:
         key = self._key_for(path)
         if key is None:
@@ -178,6 +215,16 @@ class TrainingPayloadQueue:
         self._next_attempt_at.pop(str(path), None)
         self._uploads_succeeded_total += 1
         self._last_upload_success_ts = time.time()
+        if delete_fn is not None and key.endswith(_PAYLOAD_SUFFIX):
+            # Best-effort: remove a previously uploaded tombstone for the
+            # same window so a late journal read prefers the payload.
+            sibling = key[: -len(_PAYLOAD_SUFFIX)] + _TOMBSTONE_SUFFIX
+            try:
+                await asyncio.to_thread(delete_fn, sibling)
+            except Exception:
+                logger.debug(
+                    "tombstone cleanup failed for %s (non-fatal)", sibling,
+                )
         try:
             path.unlink()
         except OSError as e:
@@ -188,23 +235,29 @@ class TrainingPayloadQueue:
         return True
 
     async def drain_once(
-        self, upload_fn: Callable[[str, bytes], None] | None = None,
+        self,
+        upload_fn: Callable[[str, bytes], None] | None = None,
+        delete_fn: Callable[[str], None] | None = None,
     ) -> int:
         """Attempt every pending file once (honoring backoff). Returns the
         number of successful uploads."""
         fn = upload_fn or _default_upload
+        if delete_fn is None and upload_fn is None:
+            delete_fn = _default_delete
         now = asyncio.get_running_loop().time()
         uploaded = 0
         for path in self._pending():
             next_at = self._next_attempt_at.get(str(path), 0.0)
             if next_at > now:
                 continue
-            if await self._try_upload(path, fn):
+            if await self._try_upload(path, fn, delete_fn):
                 uploaded += 1
         return uploaded
 
     async def run_forever(
-        self, upload_fn: Callable[[str, bytes], None] | None = None,
+        self,
+        upload_fn: Callable[[str, bytes], None] | None = None,
+        delete_fn: Callable[[str], None] | None = None,
     ) -> None:
         logger.info(
             "TrainingPayloadQueue worker starting. queue_dir=%s",
@@ -212,7 +265,7 @@ class TrainingPayloadQueue:
         )
         while True:
             try:
-                await self.drain_once(upload_fn=upload_fn)
+                await self.drain_once(upload_fn=upload_fn, delete_fn=delete_fn)
             except asyncio.CancelledError:
                 raise
             except Exception:
