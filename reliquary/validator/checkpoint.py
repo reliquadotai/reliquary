@@ -136,6 +136,28 @@ class CheckpointStore:
         )
         return entry
 
+    def install_external(
+        self, checkpoint_n: int, revision: str
+    ) -> ManifestEntry:
+        """Install a manifest for a checkpoint published by the detached
+        trainer. The wallet signs at INSTALL time — the attestation
+        "this is my current checkpoint" only becomes true once the
+        verify plane holds these weights, which is the caller's swap."""
+        sig_payload = f"{int(checkpoint_n)}|{revision}".encode()
+        sig_bytes = self.wallet.hotkey.sign(sig_payload)
+        entry = ManifestEntry(
+            checkpoint_n=int(checkpoint_n),
+            repo_id=self.repo_id,
+            revision=str(revision),
+            signature="ed25519:" + sig_bytes.hex(),
+        )
+        self._current = entry
+        logger.info(
+            "Installed external checkpoint %d (%s@%s)",
+            checkpoint_n, self.repo_id, str(revision)[:12],
+        )
+        return entry
+
 
 # ---- production defaults (lazy-imported so tests don't drag torch/HF in) ----
 

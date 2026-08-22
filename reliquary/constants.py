@@ -1113,6 +1113,19 @@ PIPELINED_WINDOWS = _os.environ.get(
     "RELIQUARY_PIPELINED_WINDOWS", "0"
 ).strip().lower() in ("1", "true", "yes", "on")
 
+# Detached-trainer plumbing (spec 2026-08-21-detached-trainer-r2).
+# WRITE_TRAINING_PAYLOADS turns on the per-window R2 training payload
+# (and tombstone) writer; it is independent from the trainer cutover so
+# a shadow trainer can consume live payloads while in-process training
+# still runs. DETACHED_TRAINER removes the in-process train/publish and
+# swaps checkpoints from the trainer's R2 candidate manifest instead.
+WRITE_TRAINING_PAYLOADS = _os.environ.get(
+    "RELIQUARY_WRITE_TRAINING_PAYLOADS", "0"
+).strip().lower() in ("1", "true", "yes", "on")
+DETACHED_TRAINER = _os.environ.get(
+    "RELIQUARY_DETACHED_TRAINER", "0"
+).strip().lower() in ("1", "true", "yes", "on")
+
 # Memoize transformers' flash-attention unpad metadata per attention mask.
 # The stock helper runs once per decoder layer per pass on the SAME mask
 # tensor and contains torch.nonzero — an implicit host<->device sync — so one
