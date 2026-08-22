@@ -126,6 +126,19 @@ def test_v4_profile_is_internally_coherent():
     }
 
 
+def test_v5_keeps_v4_generation_and_objective_shape():
+    """The v5 protocol delta is the prompt, not a hidden training-knob fork."""
+
+    v4 = _boot("qwen3-4b-base-dapo-v4")
+    v5 = _boot("qwen3-4b-base-dapo-reasoning-v5")
+
+    assert v5.pop("profile_id") == "qwen3-4b-base-dapo-reasoning-v5"
+    assert v5.pop("version") == 5
+    v4.pop("profile_id")
+    v4.pop("version")
+    assert v5 == v4
+
+
 def test_v3_profile_keeps_its_own_coherent_shape():
     """The live deployment must be untouched by everything above."""
     got = _boot("qwen35-4b-auction-v3")

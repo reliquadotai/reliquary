@@ -64,7 +64,7 @@ use.
   />
 </p>
 
-1. **Collect.** Math and Code each accept candidates for a fixed 150-second
+1. **Collect.** Math and Code each accept candidates for a fixed 100-second
    interval. Every group contains exactly 16 rollouts.
 2. **Grade.** The validator recomputes Math rewards and executes Code cases in
    its sandbox. Groups below the reward-variance gate are rejected.
@@ -92,7 +92,7 @@ the protocol evolved; they are not the production contract.
 
 | Layer | State |
 | --- | --- |
-| Qwen3-4B Base DAPO v4 profile, deferred-proof auction, and GRAIL verification | **Release candidate — runtime gates pending** |
+| Qwen3-4B Base DAPO reasoning-v5 profile, deferred-proof auction, and GRAIL verification | **Release candidate — runtime gates pending** |
 | Mixed OpenMath + OpenCode collection and validator-authoritative rewards | **Live** |
 | Canonical prompt-content identity and one-shot cooldown | **Live** |
 | Utility telemetry | **Live, observation only** |
@@ -102,7 +102,9 @@ the protocol evolved; they are not the production contract.
 The observation-only utility foundation does not alter admission, ranking,
 selection, payout, or training. Its activation gates are documented in
 [Auction v3 Utility Foundation](docs/auction-v3-utility-foundation.md).
-Change the v4 row to **Live** only at the coordinated runtime activation.
+Change the v5 row to **Live** only at the coordinated runtime activation. See
+the [reasoning-prompt v5 cutover](docs/reasoning-prompt-v5-cutover.md) for the
+fresh-baseline and deployment gates.
 
 ## Trust and verification boundaries
 

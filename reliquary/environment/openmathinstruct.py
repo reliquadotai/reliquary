@@ -514,8 +514,20 @@ class OpenMathInstructEnvironment:
         question: str = row["problem"]
         expected: str = str(row.get("expected_answer", ""))
         problem_id = hashlib.sha256(question.encode()).hexdigest()[:16]
+        # v5 makes the reasoning cue an exact, signed profile field. Legacy
+        # profiles intentionally keep their original byte-for-byte suffix path.
+        from reliquary.protocol.profiles import render_active_prompt
+
+        rendered_prompt = render_active_prompt(
+            self.name,
+            problem=question,
+        )
         return {
-            "prompt": question + _ANSWER_FORMAT_INSTRUCTION,
+            "prompt": (
+                question + _ANSWER_FORMAT_INSTRUCTION
+                if rendered_prompt is None
+                else rendered_prompt
+            ),
             "ground_truth": expected,
             "id": problem_id,
         }

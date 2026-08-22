@@ -146,9 +146,17 @@ class OpenCodeInstructEnvironment:
         row = self._dataset[idx]
         prompt: str = row["input"]
         cases = self._row_cases(row)
+        contract = _contract_instruction(cases)
         # Pin the grader's function-call contract onto the prompt. Changes prompt
         # tokens (GRAIL-bound), so a release shipping this must reach miners too.
-        prompt = prompt + _contract_instruction(cases)
+        from reliquary.protocol.profiles import render_active_prompt
+
+        rendered_prompt = render_active_prompt(
+            self.name,
+            problem=prompt,
+            contract=contract,
+        )
+        prompt = prompt + contract if rendered_prompt is None else rendered_prompt
         problem_id = hashlib.sha256(prompt.encode()).hexdigest()[:16]
         case_id = hashlib.sha256(
             (problem_id + json.dumps(cases, sort_keys=True, separators=(",", ":"))).encode()

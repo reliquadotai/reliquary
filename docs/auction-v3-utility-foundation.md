@@ -1,11 +1,11 @@
 # Auction v3 Utility Foundation
 
-Status: observation only. This foundation does not change the active protocol-v4
+Status: observation only. This foundation does not change the active protocol-v5
 difficulty-auction ranking, selection, rewards, miner payloads, or training loss.
 
 ## Decision
 
-Protocol v4 retains the difficulty-auction mechanism:
+Protocol v5 retains the protocol-v4 difficulty-auction mechanism:
 
 1. Rank by validator-computed difficulty.
 2. Rank equal scores by capped generated tokens per validator-observed elapsed

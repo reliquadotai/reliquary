@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Protocol-parity recovery screen for immutable checkpoints.
 
-The screen uses common forced inverse-CDF draws across models, the production
-2048/512 BFT path, and Reliquary's authoritative environment grader. It is a
-paired recovery benchmark, not a replacement for the sealed private
-evaluation dashboard.
+The screen uses the selected production generation profile, its exact canonical
+prompts, and Reliquary's authoritative environment grader. It can optionally
+hold forced inverse-CDF draws common across profiles for an explicitly labelled
+offline ablation. It is not a replacement for the sealed private evaluation
+dashboard.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ import time
 from typing import Any
 
 
-ANSWER_INSTRUCTION = "\n\nPut your final answer within \\boxed{}."
+LEGACY_ANSWER_INSTRUCTION = "\n\nPut your final answer within \\boxed{}."
 _IMMUTABLE_REVISION = re.compile(r"^[0-9a-f]{40}$")
 
 _RUNTIME_PACKAGES = {
@@ -210,6 +211,18 @@ def select_code_tasks(
     return tasks
 
 
+def render_math_task_prompt(profile: Any, problem: str) -> str:
+    """Render the screen prompt through the selected generation contract."""
+
+    environment = profile.environments["openmathinstruct"]
+    template = environment.prompt_template
+    if template is None:
+        # Historical v2-v4 screen compatibility. The production v5 profile
+        # takes the explicit-template branch above.
+        return problem + LEGACY_ANSWER_INSTRUCTION
+    return template.render(problem=problem)
+
+
 def _quantile(values: list[float], q: float) -> float | None:
     if not values:
         return None
@@ -360,10 +373,18 @@ def _parser() -> argparse.ArgumentParser:
         choices=("openmathinstruct", "opencodeinstruct"),
         default="openmathinstruct",
     )
-    parser.add_argument("--tokenizer-repo", default="Qwen/Qwen3.5-2B")
+    parser.add_argument(
+        "--protocol-profile",
+        default=None,
+        help=(
+            "Exact generation profile to screen. May instead be supplied via "
+            "RELIQUARY_PROTOCOL_PROFILE; one of the two is required."
+        ),
+    )
+    parser.add_argument("--tokenizer-repo", default=None)
     parser.add_argument(
         "--tokenizer-revision",
-        default="15852e8c16360a2fea060d615a32b45270f8a8fc",
+        default=None,
     )
     parser.add_argument("--math-jsonl", type=Path)
     parser.add_argument("--dataset-revision", required=True)
@@ -377,16 +398,27 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-prompts", type=int, default=16)
     parser.add_argument("--prompt-offset", type=int, default=0)
     parser.add_argument("--samples-per-prompt", type=int, default=4)
-    parser.add_argument("--thinking-budget", type=int, default=2048)
-    parser.add_argument("--answer-budget", type=int, default=512)
+    parser.add_argument("--thinking-budget", type=int, default=None)
+    parser.add_argument("--answer-budget", type=int, default=None)
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=32768,
-        help="Single-phase generation cap used by the code environment.",
+        default=None,
+        help=(
+            "Optional assertion of the selected profile's environment cap; "
+            "a different value is rejected."
+        ),
     )
     parser.add_argument(
         "--seed-domain", default="reliquary-recovery-common-draws-v1"
+    )
+    parser.add_argument(
+        "--forced-stream-domain",
+        default=None,
+        help=(
+            "Offline paired-ablation override for the protocol's internal "
+            "forced-seed domain. Omit for a deployment-parity screen."
+        ),
     )
     parser.add_argument(
         "--attention-implementation", default="flash_attention_2"
@@ -399,6 +431,73 @@ def main() -> int:
     args = _parser().parse_args()
     if args.samples_per_prompt <= 0:
         raise ValueError("samples_per_prompt must be positive")
+    if args.forced_stream_domain is not None and not args.forced_stream_domain:
+        raise ValueError("--forced-stream-domain must not be empty")
+    profile_id = args.protocol_profile or os.environ.get(
+        "RELIQUARY_PROTOCOL_PROFILE", ""
+    ).strip()
+    if not profile_id:
+        raise ValueError(
+            "--protocol-profile or RELIQUARY_PROTOCOL_PROFILE is required"
+        )
+    inherited_profile = os.environ.get("RELIQUARY_PROTOCOL_PROFILE", "").strip()
+    if inherited_profile and inherited_profile != profile_id:
+        raise ValueError(
+            "--protocol-profile disagrees with RELIQUARY_PROTOCOL_PROFILE"
+        )
+    # Select before importing any module that snapshots protocol constants.
+    os.environ["RELIQUARY_PROTOCOL_PROFILE"] = profile_id
+    from reliquary.protocol.profiles import (
+        ACTIVE_PROTOCOL_PROFILE,
+        to_generation_contract,
+    )
+
+    if ACTIVE_PROTOCOL_PROFILE.profile_id != profile_id:
+        raise RuntimeError(
+            "protocol modules were imported before the screen profile was "
+            "selected"
+        )
+    try:
+        environment_profile = ACTIVE_PROTOCOL_PROFILE.environments[
+            args.environment
+        ]
+    except KeyError as exc:
+        raise ValueError(
+            f"profile {profile_id!r} does not support {args.environment!r}"
+        ) from exc
+    tokenizer_repo = args.tokenizer_repo or ACTIVE_PROTOCOL_PROFILE.model_id
+    tokenizer_revision = (
+        args.tokenizer_revision or ACTIVE_PROTOCOL_PROFILE.model_revision
+    )
+    if tokenizer_repo != ACTIVE_PROTOCOL_PROFILE.model_id:
+        raise ValueError(
+            "--tokenizer-repo must match the selected protocol model"
+        )
+    if tokenizer_revision != ACTIVE_PROTOCOL_PROFILE.model_revision:
+        raise ValueError(
+            "--tokenizer-revision must match the selected protocol revision"
+        )
+    max_new_tokens = (
+        environment_profile.max_new_tokens
+        if args.max_new_tokens is None
+        else args.max_new_tokens
+    )
+    if max_new_tokens != environment_profile.max_new_tokens:
+        raise ValueError(
+            "--max-new-tokens must match the selected environment profile"
+        )
+    bft_profile = environment_profile.bft
+    bft_applicable = bft_profile is not None
+    thinking_budget = bft_profile.thinking_budget if bft_profile else 0
+    answer_budget = bft_profile.answer_budget if bft_profile else 0
+    if args.thinking_budget is not None and args.thinking_budget != thinking_budget:
+        raise ValueError(
+            "--thinking-budget must match the selected environment profile"
+        )
+    if args.answer_budget is not None and args.answer_budget != answer_budget:
+        raise ValueError(
+            "--answer-budget must match the selected environment profile"
+        )
     # Capture provenance before any long-running model work. The checkout may be
     # fast-forwarded while a screen is running; late resolution would mislabel
     # already-imported code with the newer revision.
@@ -423,6 +522,7 @@ def main() -> int:
         ForcedSeedLogitsProcessor,
         forced_seed_generate_kwargs,
     )
+    from reliquary.environment import forced_sampling as forced_sampling_module
     from reliquary.protocol.tokens import encode_prompt
     from reliquary.shared.modeling import (
         first_eos_index,
@@ -432,6 +532,13 @@ def main() -> int:
         resolve_eos_token_ids,
         think_close_token_ids,
     )
+
+    protocol_forced_stream_domain = forced_sampling_module.FORCED_SEED_DOMAIN
+    forced_stream_domain = (
+        args.forced_stream_domain or protocol_forced_stream_domain
+    )
+    if args.forced_stream_domain is not None:
+        forced_sampling_module.FORCED_SEED_DOMAIN = args.forced_stream_domain
 
     if args.environment == "openmathinstruct":
         if args.math_jsonl is None:
@@ -449,7 +556,11 @@ def main() -> int:
         reward_fn = lambda task, completion: _compute_omi_reward(  # noqa: E731
             {"ground_truth": task["ground_truth"]}, completion
         )
-        answer_instruction = ANSWER_INSTRUCTION
+        for task in tasks:
+            task["prompt"] = render_math_task_prompt(
+                ACTIVE_PROTOCOL_PROFILE,
+                task["prompt"],
+            )
         dataset_identity = {
             "path": str(args.math_jsonl.resolve()),
             "sha256": _sha256(args.math_jsonl),
@@ -483,7 +594,6 @@ def main() -> int:
             prompt_offset=args.prompt_offset,
         )
         reward_fn = code_environment.compute_reward
-        answer_instruction = ""
         dataset_identity = {
             "path": None,
             "sha256": None,
@@ -491,8 +601,8 @@ def main() -> int:
             "revision": args.code_revision,
         }
     tokenizer = load_tokenizer(
-        args.tokenizer_repo,
-        revision=args.tokenizer_revision,
+        tokenizer_repo,
+        revision=tokenizer_revision,
     )
     model = load_text_generation_model(
         model_source,
@@ -516,7 +626,7 @@ def main() -> int:
     torch.cuda.reset_peak_memory_stats()
 
     for task_number, task in enumerate(tasks, start=1):
-        prompt = task["prompt"] + answer_instruction
+        prompt = task["prompt"]
         prompt_tokens = encode_prompt(tokenizer, prompt)
         prompt_length = len(prompt_tokens)
         input_tensor = torch.tensor(
@@ -529,11 +639,10 @@ def main() -> int:
             hashlib.sha256(task["task_id"].encode("utf-8")).digest()[:8],
             "big",
         )
-        bft_applicable = args.environment == "openmathinstruct"
         phase1_kwargs: dict[str, Any] = {
             "max_new_tokens": (
-                args.thinking_budget if bft_applicable
-                else args.max_new_tokens
+                thinking_budget if bft_applicable
+                else max_new_tokens
             ),
             "pad_token_id": pad_token_id,
             "attention_mask": attention_mask,
@@ -567,7 +676,7 @@ def main() -> int:
                     think_close_ids=think_close_ids,
                     force_ids=force_ids,
                     eos_ids=eos_ids,
-                    answer_budget=args.answer_budget,
+                    answer_budget=answer_budget,
                     randomness=randomness,
                     hotkey="reliquary-recovery-eval",
                     prompt_idx=prompt_idx,
@@ -594,6 +703,10 @@ def main() -> int:
                 "subject": task["subject"],
                 "level": task["level"],
                 "sample_index": sample_index,
+                "prompt_sha256": hashlib.sha256(
+                    prompt.encode("utf-8")
+                ).hexdigest(),
+                "prompt_length": prompt_length,
                 "reward": float(reward_fn(task, completion_text)),
                 "completion_length": len(completion_tokens),
                 "terminated": terminated,
@@ -622,7 +735,7 @@ def main() -> int:
         )
 
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "checkpoint_label": args.checkpoint_label,
         "environment": args.environment,
         "model_repo": args.model_repo,
@@ -630,8 +743,13 @@ def main() -> int:
         "model_path": model_identity["path"],
         "model_snapshot_sha256": model_identity["snapshot_sha256"],
         "model_source_kind": model_identity["kind"],
-        "tokenizer_repo": args.tokenizer_repo,
-        "tokenizer_revision": args.tokenizer_revision,
+        "protocol_profile_id": ACTIVE_PROTOCOL_PROFILE.profile_id,
+        "protocol_version": ACTIVE_PROTOCOL_PROFILE.protocol_version,
+        "generation_contract": to_generation_contract(
+            ACTIVE_PROTOCOL_PROFILE
+        ),
+        "tokenizer_repo": tokenizer_repo,
+        "tokenizer_revision": tokenizer_revision,
         "dataset_path": dataset_identity["path"],
         "dataset_sha256": dataset_identity["sha256"],
         "dataset_repo": dataset_identity["repo"],
@@ -639,14 +757,16 @@ def main() -> int:
         "n_prompts": args.n_prompts,
         "prompt_offset": args.prompt_offset,
         "samples_per_prompt": args.samples_per_prompt,
-        "thinking_budget": args.thinking_budget,
-        "answer_budget": args.answer_budget,
+        "thinking_budget": thinking_budget,
+        "answer_budget": answer_budget,
         "generation_mode": (
-            "bft_math" if args.environment == "openmathinstruct"
-            else "single_phase_code"
+            "bft" if bft_applicable else "single_phase"
         ),
-        "max_new_tokens": args.max_new_tokens,
+        "max_new_tokens": max_new_tokens,
         "seed_domain": args.seed_domain,
+        "forced_stream_domain": forced_stream_domain,
+        "protocol_forced_stream_domain": protocol_forced_stream_domain,
+        "deployment_parity": args.forced_stream_domain is None,
         "attention_implementation": args.attention_implementation,
         "reliquary_revision": reliquary_revision,
         "reliquary_revision_source": reliquary_revision_source,

@@ -8,7 +8,7 @@ Operational guide for running a miner on Bittensor subnet 81. For conceptual bac
 2. Discovers the validator's HTTP URL via the Bittensor metagraph (or uses `--validator-url` override).
 3. Calls `GET /state` to read `checkpoint_repo_id` and `checkpoint_revision`.
 4. If the validator has a published checkpoint, downloads it from Hugging Face and loads those weights.
-5. Falls back to the required `--checkpoint` value (`Qwen/Qwen3-4B-Base` for v4) if no checkpoint is published yet.
+5. Falls back to the required `--checkpoint` value (`Qwen/Qwen3-4B-Base` for v5) if no checkpoint is published yet.
 6. Enters the main loop in `MiningEngine.mine_window()`:
    - Poll `/state` every tick.
    - If `state.checkpoint_n > local_n`, download the new HF revision and reload both model copies.
@@ -17,15 +17,16 @@ Operational guide for running a miner on Bittensor subnet 81. For conceptual bac
 The boot query ensures a miner joining an already-running subnet lands directly on the current model, skipping an initial reject cycle.
 
 `/state.generation_profile_id` and `/state.generation_contract` are
-authoritative. Protocol v4 uses `qwen3-4b-base-dapo-v4`. This is a coordinated
+authoritative. Protocol v5 uses `qwen3-4b-base-dapo-reasoning-v5`. This is a coordinated
 hard cutover, not an optional local model or token-cap change: the reference
 miner refuses to generate unless its active profile exactly matches the
 validator contract. Custom miners should read `prompt_encoding`, `sampling`,
-and each environment's `answer_format`, `max_new_tokens`, and `bft` fields.
+and each environment's `prompt_template`, `answer_format`, `max_new_tokens`,
+and `bft` fields.
 
-## What a miner does (protocol v4)
+## What a miner does (protocol v5)
 
-Math and Code each collect submissions for a fixed 150-second interval. The
+Math and Code each collect submissions for a fixed 100-second interval. The
 validator does not close early when 16 groups arrive. At the deadline it
 drains pre-deadline work, freezes each environment's pending population, ranks
 groups by difficulty, and runs deferred proof top-down until at most 16
@@ -37,8 +38,8 @@ checkpoint. GRPO waits until the accumulator has one target batch from every
 active environment; extra groups from one environment do not overweight it.
 
 > **Hard cutover:** auction and deferred proof intentionally apply to both
-> `openmathinstruct` and `opencodeinstruct`. Forced-seed protocol v4 is
-> mandatory. BFT is disabled for both environments under the v4 profile.
+> `openmathinstruct` and `opencodeinstruct`. Forced-seed protocol v5 is
+> mandatory. BFT is disabled for both environments under the v5 profile.
 
 Every miner runs a continuous poll-submit loop:
 
@@ -48,9 +49,9 @@ Every miner runs a continuous poll-submit loop:
 
 2. **Picks a prompt.** Selects a `prompt_idx` from one active environment. OpenMath uses **OpenMathInstruct-2** ([`nvidia/OpenMathInstruct-2`](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2), ~14 million problems, math-reasoning style) and local reward computation. OpenCode uses the public curated dataset (`R0mAI/opencodeinstruct-curated`) with validator-authoritative grading. In both cases, skip prompts in `cooldown_prompts`. The reference engine uses uniform-random sampling with rejection against the cooldown set. (v2.3 switched OpenMath from Hendrycks MATH because the 12 500-prompt env exhausted under one-shot cooldown — see "One-shot prompts" below.)
 
-3. **Generates M=16 rollouts.** Runs exactly 16 completions with the repository's forced-seed sampler. The deterministic stream excludes hotkey identity and is derived from window randomness, prompt, checkpoint, rollout index, and token position. Set `protocol_version=4`, encode the canonical prompt as raw text (do not apply a chat template), use `temperature=1.0`, `top_p=1.0`, and `top_k=0`, terminate at the first configured EOS, and do not add a presence/repetition processor that the validator does not reproduce.
+3. **Generates M=16 rollouts.** Runs exactly 16 completions with the repository's forced-seed sampler. The deterministic stream excludes hotkey identity and is derived from window randomness, prompt, checkpoint, rollout index, and token position. Set `protocol_version=5`, render the generation contract's exact step-by-step environment template, encode that canonical prompt as raw text (do not apply a chat template), use `temperature=1.0`, `top_p=1.0`, and `top_k=0`, terminate at the first configured EOS, and do not add a presence/repetition processor that the validator does not reproduce.
 
-4. **Provides rollout rewards.** OpenMath miners compute `env.compute_reward(problem, completion_text)` locally and send that value as `rollout.reward`; the validator recomputes it and rejects mismatches. The v4 Math contract requires a valid final `\boxed{...}`/`\fbox{...}` answer. A completion without one scores zero, and the validator conservatively treats that outcome as uncertain when deciding zone eligibility and auction value, so removing a box cannot create useful variance. OpenCode is validator-authoritative: miners send placeholder rewards if the client shape requires them, and the validator recomputes the real code reward and overwrites local claims before the zone filter. Miners never run the grader.
+4. **Provides rollout rewards.** OpenMath miners compute `env.compute_reward(problem, completion_text)` locally and send that value as `rollout.reward`; the validator recomputes it and rejects mismatches. The v5 Math contract requires a valid final `\boxed{...}`/`\fbox{...}` answer. A completion without one scores zero, and the validator conservatively treats that outcome as uncertain when deciding zone eligibility and auction value, so removing a box cannot create useful variance. OpenCode is validator-authoritative: miners send placeholder rewards if the client shape requires them, and the validator recomputes the real code reward and overwrites local claims before the zone filter. Miners never run the grader.
 
 5. **Builds GRAIL sketches.** Runs the bit-identical HuggingFace forward pass on the proof GPU to construct sketch commitments that bind the completions to the model. The r_vec seed **must** come from `state.randomness` exactly — local re-derivation will diverge from the validator's seed and the binding check rejects with `WRONG_RANDOMNESS`.
 
@@ -58,7 +59,7 @@ Every miner runs a continuous poll-submit loop:
    serialize it once, and compute its byte length and SHA-256. POST the small
    signed metadata to `/submit/precommit`, then POST those exact bytes to
    `/submit` with the returned `X-Reliquary-Precommit` receipt. A precommit
-   received before the 150-second cutoff grants at most 33 seconds for that
+   received before the 100-second cutoff grants at most 33 seconds for that
    exact reveal; it does not extend generation or reserve an auction slot.
    - Compute and sign the current quicknet round immediately before
      serialization. The validator applies zero backward tolerance and records
@@ -72,7 +73,7 @@ Every miner runs a continuous poll-submit loop:
 
 The validator grades submissions during collection, but expensive GRAIL and
 auth proof run at seal only for candidates that can still win. Difficulty is
-the primary ranking key. Among equal-difficulty v4 candidates, a capped,
+the primary ranking key. Among equal-difficulty v5 candidates, a capped,
 bucketed tokens-per-validator-observed-round score removes the systematic
 penalty on longer reasoning; arrival round and then the post-deadline
 operator/prompt hash break remaining ties. Submitted drand is a freshness
@@ -99,7 +100,7 @@ redistributed; their shares burn to `UID_BURN = 0`.
 The most common miner question is *"the validator returned `accepted=True`, but I earned no slot — what's going on?"* Auction mode has three lifecycle stages.
 
 ```
-miner                 HTTP/worker admission             150 s seal
+miner                 HTTP/worker admission             100 s seal
 -----                 ---------------------             ----------
 POST precommit   ->   signed upload receipt             freeze pending pool
 POST exact body  ->   reason="submitted"                rank by difficulty
@@ -193,7 +194,7 @@ The validator emits one of the following reasons on every failed submission. Eac
 | `FUTURE_ROUND` | (v2.3) Your `drand_round` field is newer than the validator's current round. Implies clock skew. | Ensure miner host is NTP-synced. Drand quicknet rounds advance on a fixed wall-clock schedule; sending a future round means your clock is ahead of UTC. |
 | `PROMPT_FULL` | `MAX_SUBMISSIONS_PER_PROMPT = 10` pending groups already occupy this prompt | Pick a different prompt |
 | `HASH_DUPLICATE` | Your operator already reserved this prompt or your tokens duplicate retained/recent content | Do not rotate hotkeys or replay a forced group; choose another prompt |
-| `SEED_MISMATCH` / `PROTOCOL_MISMATCH` | The client does not advertise the active forced-seed protocol | Pull the current miner, rebuild, and confirm `protocol_version=4` and `generation_profile_id=qwen3-4b-base-dapo-v4` |
+| `SEED_MISMATCH` / `PROTOCOL_MISMATCH` | The client does not advertise the active forced-seed protocol | Pull the current miner, rebuild, and confirm `protocol_version=5` and `generation_profile_id=qwen3-4b-base-dapo-reasoning-v5` |
 
 **Rejected asynchronously by the worker (look up via `GET /verdicts/{hotkey}` or the R2 archive):**
 
@@ -368,7 +369,7 @@ Confirm your hotkey appears in `btcli subnet metagraph --netuid 81` with a valid
 > Cross-check the axon IP advertised on-chain for this hotkey in `btcli subnet metagraph --netuid 81` before passing it to `--validator-url` — that confirms you are connecting to the real owner validator and not a look-alike.
 
 ```bash
-export RELIQUARY_PROTOCOL_PROFILE=qwen3-4b-base-dapo-v4
+export RELIQUARY_PROTOCOL_PROFILE=qwen3-4b-base-dapo-reasoning-v5
 
 reliquary mine \
     --network finney \
@@ -385,15 +386,18 @@ Once the owner validator earns `validator_permit`, you can drop `--validator-url
 
 The miner queries the validator at boot and downloads the current HF checkpoint automatically. You do not need to find or pin the checkpoint hash manually.
 
-### Qwen3-4B Base / DAPO v4 cutover
+### Qwen3-4B Base / DAPO reasoning-v5 cutover
 
-The v4 model is `Qwen/Qwen3-4B-Base` at the revision advertised in the generation contract. It is a hard model and generation reset:
+The v5 model is `Qwen/Qwen3-4B-Base` at the revision advertised in the generation contract. It is a hard prompt-protocol and training-lineage reset. Protocol v4 is retained as the no-reasoning-cue control:
 
-- Tokenize the canonical prompt as raw text. Activating the chat template changes the prompt tokens and causes `PROMPT_MISMATCH`; do not add system, user, assistant, or `<think>` wrappers.
+- Render the exact per-environment `prompt_template` advertised in `/state`, then tokenize it as raw text. Activating the chat template changes the prompt tokens and causes `PROMPT_MISMATCH`; do not add system, user, assistant, or `<think>` wrappers.
 - Generate exactly 16 forced-seed rollouts at `temperature=1.0`, `top_p=1.0`, and `top_k=0`, with an 8192-token per-rollout cap and no BFT phase.
 - Resolve the full EOS set from the pinned model/tokenizer generation configuration and stop at the first EOS.
 - For OpenMath, retain the prompt's boxed-answer instruction and ensure the final reward-bearing answer is in a well-formed `\boxed{...}` or `\fbox{...}` span. Plain trailing numbers and `Answer:` lines score zero.
 - Checkpoint downloads are sharded safetensors. Custom miners must download the complete pinned model and tokenizer snapshot rather than mixing files from another Qwen revision.
+
+See [reasoning-prompt-v5-cutover.md](reasoning-prompt-v5-cutover.md) for the
+exact prompts, fresh-base requirement, evaluation matrix, and activation gates.
 
 ### OpenCode mode
 

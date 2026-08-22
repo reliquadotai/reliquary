@@ -200,3 +200,45 @@ def test_raw_completion_mode_bypasses_declared_chat_template(monkeypatch):
 
     tok = _ChatTokenizer()
     assert encode_prompt(tok, "Solve: 1+1") == list("Solve: 1+1".encode("utf-8"))
+
+
+_GOLDEN_V5_REASONING_PROMPT = (
+    "Solve the following math problem step by step.\n\n"
+    "What is 2 + 2?\n\n"
+    "Put your final answer within \\boxed{}."
+)
+_GOLDEN_TOKENS_QWEN3_4B_BASE_V5 = [
+    50, 3948, 279, 2701, 6888, 3491, 3019, 553, 3019, 382, 3838, 374,
+    220, 17, 488, 220, 17, 1939, 19103, 697, 1590, 4226, 2878, 1124,
+    79075, 46391,
+]
+
+
+def test_golden_v5_reasoning_prompt_encoding(monkeypatch):
+    """Pin the corrected raw prompt under the v5 model/tokenizer revision."""
+
+    import pytest
+
+    pytest.importorskip("transformers")
+    from transformers import AutoTokenizer
+
+    import reliquary.constants as constants
+    from reliquary.protocol.profiles import PROFILES
+
+    profile = PROFILES["qwen3-4b-base-dapo-reasoning-v5"]
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            profile.model_id,
+            revision=profile.model_revision,
+        )
+    except Exception as exc:
+        pytest.skip(f"v5 tokenizer unavailable: {exc}")
+    monkeypatch.setattr(constants, "RAW_COMPLETION_PROMPTS", True)
+    template = profile.environments["openmathinstruct"].prompt_template
+    assert template is not None
+    prompt = template.render(problem="What is 2 + 2?")
+    assert prompt == _GOLDEN_V5_REASONING_PROMPT
+
+    assert encode_prompt(tokenizer, prompt) == (
+        _GOLDEN_TOKENS_QWEN3_4B_BASE_V5
+    )
