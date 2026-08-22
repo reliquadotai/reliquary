@@ -108,6 +108,9 @@ def test_publication_forecast_serial_beat():
 
 class _TombstoneStub:
     _enqueue_aborted_window = ValidationService._enqueue_aborted_window
+    # Bound so the aborted path can emit the detached-trainer tombstone;
+    # WRITE_TRAINING_PAYLOADS is off in tests, so it early-returns.
+    _write_training_tombstone = ValidationService._write_training_tombstone
 
     def __init__(self):
         self._active_batchers = {}
