@@ -1364,6 +1364,50 @@ FORCED_SEED_PROTOCOL_VERSION = PROTOCOL_VERSION
 # crash-looping the weight-setter on the runtime-fingerprint check. Fail-closed
 # by default. NEVER assert this for a change that could slow proofs down —
 # re-run the capacity benchmark instead.
+# Run the GRAIL proof plane in a dedicated process, one per proof device.
+#
+# The proof thread releases and re-acquires the GIL on every CUDA op — hundreds
+# of times per forward. Sharing an interpreter with the event loop, which holds
+# the GIL in long blocks to parse submission bodies and spawn admission
+# workers, convoys it off the lock. Measured 2026-08-23 on an H100: the same
+# forward costs 28.7 ms alone and 29.6 s against one CPU-bound python thread;
+# in production the partial convoy showed up as 161 ms of wall time per
+# forward, and 75% of a 139 s seal half.
+#
+# This is ISOLATION, not parallelism: two workers on one GPU measure x1.04
+# because the CUDA contexts time-slice. The replica MOVES to the worker, so
+# device memory is unchanged and every kernel, shape and dtype is identical —
+# no accept/reject decision can shift.
+#
+# Off by default; the isolated plane requires the detached-trainer checkpoint
+# intake, which is what stages a snapshot directory the worker can reload from.
+PROOF_PROCESS_ISOLATION = (
+    _os.environ.get("RELIQUARY_PROOF_PROCESS_ISOLATION", "0")
+    .strip().lower() in {"1", "true", "yes", "on"}
+)
+
+# Hard bound on one request to a proof worker. Generous next to the measured
+# p95 (9.8 s at the qualified worst case) because the wall the plane really
+# cares about is MAX_PROOF_WALL_SECONDS; this only stops a wedged child from
+# parking the scheduler's device thread in a blocking read forever.
+PROOF_WORKER_REQUEST_TIMEOUT_SECONDS = float(
+    _os.environ.get("RELIQUARY_PROOF_WORKER_REQUEST_TIMEOUT_SECONDS", "300")
+)
+if PROOF_WORKER_REQUEST_TIMEOUT_SECONDS <= 0:
+    raise ValueError(
+        "RELIQUARY_PROOF_WORKER_REQUEST_TIMEOUT_SECONDS must be positive"
+    )
+
+# Loading an 8 GB replica from a staged snapshot is slower than a proof.
+PROOF_WORKER_RELOAD_TIMEOUT_SECONDS = float(
+    _os.environ.get("RELIQUARY_PROOF_WORKER_RELOAD_TIMEOUT_SECONDS", "900")
+)
+if PROOF_WORKER_RELOAD_TIMEOUT_SECONDS <= 0:
+    raise ValueError(
+        "RELIQUARY_PROOF_WORKER_RELOAD_TIMEOUT_SECONDS must be positive"
+    )
+
+
 PROOF_CAPACITY_ACCEPT_FASTER_RUNTIME = (
     _os.environ.get("RELIQUARY_PROOF_CAPACITY_ACCEPT_FASTER_RUNTIME", "0")
     not in ("0", "false", "False")

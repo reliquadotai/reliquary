@@ -16,6 +16,7 @@ from pathlib import Path
 import typer
 
 from reliquary.constants import (
+    PROOF_PROCESS_ISOLATION,
     DEFAULT_BASE_MODEL,
     DEFAULT_BASE_MODEL_REVISION,
     DEFAULT_ENVIRONMENTS,
@@ -608,20 +609,57 @@ def validate(
                     proof_capacity_qualification,
                 )
             proof_models = {}
-            for device in proof_devices:
-                if device == "cuda:0":
-                    continue
-                logger.info(
-                    "Loading frozen proof replica on %s from %s",
-                    device,
-                    checkpoint,
+            proof_worker_pool = None
+            from reliquary.constants import DETACHED_TRAINER
+            from reliquary.validator.proof_worker import (
+                assert_isolation_supported,
+            )
+
+            assert_isolation_supported(
+                isolation=PROOF_PROCESS_ISOLATION,
+                detached_trainer=DETACHED_TRAINER,
+            )
+            if PROOF_PROCESS_ISOLATION and proof_devices:
+                # The proof plane moves out of this interpreter: the replica
+                # is loaded by the worker, not here, so device memory is
+                # unchanged and the validator's event loop can no longer
+                # convoy the proof thread off the GIL.
+                from reliquary.validator.proof_worker import (
+                    build_isolated_proof_plane,
                 )
-                proof_models[device] = load_text_generation_model(
-                    checkpoint,
-                    torch_dtype=torch.bfloat16,
-                    attn_implementation=ATTN_IMPLEMENTATION,
-                    **base_load_kwargs,
-                ).to(device).eval()
+
+                logger.info(
+                    "Starting isolated proof plane on %s (one process per "
+                    "device; replicas load in the workers)",
+                    ", ".join(proof_devices),
+                )
+                proof_worker_pool, proof_models = build_isolated_proof_plane(
+                    devices=proof_devices,
+                    checkpoint=checkpoint,
+                    load_kwargs=base_load_kwargs,
+                    revision=activation_checkpoint_revision,
+                    reference_model=model,
+                )
+                proof_worker_pool.start()
+                logger.info(
+                    "Isolated proof plane ready on %s",
+                    ", ".join(proof_devices),
+                )
+            else:
+                for device in proof_devices:
+                    if device == "cuda:0":
+                        continue
+                    logger.info(
+                        "Loading frozen proof replica on %s from %s",
+                        device,
+                        checkpoint,
+                    )
+                    proof_models[device] = load_text_generation_model(
+                        checkpoint,
+                        torch_dtype=torch.bfloat16,
+                        attn_implementation=ATTN_IMPLEMENTATION,
+                        **base_load_kwargs,
+                    ).to(device).eval()
 
             mix = [(n, w) for n, w in ENVIRONMENT_MIX if n in env_names]
             service = ValidationService(
@@ -642,6 +680,7 @@ def validate(
                 proof_capacity_qualification=(
                     proof_capacity_qualification
                 ),
+                proof_worker_pool=proof_worker_pool,
             )
             # Run the weight setter in a dedicated OS thread with its own
             # event loop. asyncio is single-threaded, so any sync blocking
