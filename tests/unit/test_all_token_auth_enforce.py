@@ -54,12 +54,13 @@ def test_forced_span_is_exempt():
     assert metrics["findings"] == 0
 
 
-def test_enforce_flag_env_override(monkeypatch):
+def test_enforce_flag_cannot_be_disabled_by_env(monkeypatch):
     import reliquary.constants as constants
+
     monkeypatch.setenv("RELIQUARY_ALL_TOKEN_AUTH_ENFORCE", "0")
     reloaded = importlib.reload(constants)
     try:
-        assert reloaded.ALL_TOKEN_AUTH_ENFORCE is False
+        assert reloaded.ALL_TOKEN_AUTH_ENFORCE is True
     finally:
         monkeypatch.delenv("RELIQUARY_ALL_TOKEN_AUTH_ENFORCE", raising=False)
         importlib.reload(constants)
