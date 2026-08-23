@@ -61,6 +61,24 @@ def active_training_identity() -> dict[str, Any]:
     }
 
 
+def _artifact_protocol_header(*, latest_schema_version: int) -> dict[str, Any]:
+    """Return a wire header that remains readable by deployed v2-v4 workers.
+
+    Protocol v5 is the first version that requires detached artifacts to carry
+    run identity.  Older workers only accept schema 1, so legacy profiles keep
+    emitting the original schema and header shape during a rolling image
+    upgrade.  V5 emits the latest schema and fails closed on missing identity.
+    """
+
+    identity = active_training_identity()
+    if int(identity["protocol_version"]) < 5:
+        return {"schema_version": 1}
+    return {
+        "schema_version": int(latest_schema_version),
+        **identity,
+    }
+
+
 def validate_training_identity(
     actual: dict[str, Any],
     expected: dict[str, Any],
@@ -158,8 +176,9 @@ def encode_training_payload(
                 pi_old_off.append(len(pi_old_flat))
 
     header = {
-        "schema_version": PAYLOAD_SCHEMA_VERSION,
-        **active_training_identity(),
+        **_artifact_protocol_header(
+            latest_schema_version=PAYLOAD_SCHEMA_VERSION,
+        ),
         "window_start": int(window_start),
         "checkpoint_revision": str(checkpoint_revision),
         "env_order": list(env_order),
@@ -264,8 +283,9 @@ def encode_tombstone(
     *, window_start: int, failure_stage: str, failure_type: str
 ) -> bytes:
     return json.dumps({
-        "schema_version": TOMBSTONE_SCHEMA_VERSION,
-        **active_training_identity(),
+        **_artifact_protocol_header(
+            latest_schema_version=TOMBSTONE_SCHEMA_VERSION,
+        ),
         "window_start": int(window_start),
         "failure_stage": str(failure_stage),
         "failure_type": str(failure_type),

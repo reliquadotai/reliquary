@@ -82,8 +82,6 @@ def _encode_decode(batches):
 
 def test_header_round_trip():
     decoded = _encode_decode(_window_batches())
-    assert decoded.schema_version == PAYLOAD_SCHEMA_VERSION
-    assert decoded.training_identity == active_training_identity()
     assert decoded.window_start == 30100
     assert decoded.checkpoint_revision == "rev-abc"
     assert decoded.env_order == ["openmathinstruct", "opencodeinstruct"]
@@ -176,9 +174,42 @@ def test_tombstone_round_trip():
         window_start=30105, failure_stage="proof_capacity",
         failure_type="ProofCapacityAbort",
     ))
-    assert doc["schema_version"] == TOMBSTONE_SCHEMA_VERSION
-    for key, value in active_training_identity().items():
-        assert doc[key] == value
     assert doc["window_start"] == 30105
     assert doc["failure_stage"] == "proof_capacity"
     assert doc["failure_type"] == "ProofCapacityAbort"
+
+
+@pytest.mark.parametrize(
+    ("protocol_version", "payload_schema", "tombstone_schema"),
+    [
+        (4, 1, 1),
+        (5, PAYLOAD_SCHEMA_VERSION, TOMBSTONE_SCHEMA_VERSION),
+    ],
+)
+def test_artifact_schema_preserves_legacy_worker_compatibility(
+    monkeypatch,
+    protocol_version,
+    payload_schema,
+    tombstone_schema,
+):
+    monkeypatch.setattr(C, "PROTOCOL_VERSION", protocol_version)
+
+    decoded = _encode_decode(_window_batches())
+    tombstone = decode_tombstone(encode_tombstone(
+        window_start=30105,
+        failure_stage="proof_capacity",
+        failure_type="ProofCapacityAbort",
+    ))
+
+    assert decoded.schema_version == payload_schema
+    assert tombstone["schema_version"] == tombstone_schema
+    if protocol_version >= 5:
+        expected = active_training_identity()
+        assert decoded.training_identity == expected
+        for key, value in expected.items():
+            assert tombstone[key] == value
+    else:
+        assert all(
+            value is None for value in decoded.training_identity.values()
+        )
+        assert not set(active_training_identity()).intersection(tombstone)
