@@ -21,6 +21,7 @@ def resolve_resume_point(
     fetch_fn: Callable[[str], bytes | None],
     *,
     env: Mapping[str, str],
+    expected_identity: Mapping[str, object] | None = None,
 ) -> tuple[str | None, int, int]:
     """Return ``(revision, cursor, checkpoint_n)``: the checkpoint
     revision to load (None = bootstrap), the journal cursor to resume
@@ -29,10 +30,21 @@ def resolve_resume_point(
     raw = fetch_fn(CANDIDATE_MANIFEST_KEY)
     if raw is not None:
         manifest = json.loads(raw.decode("utf-8"))
-        return (
-            str(manifest["revision"]),
-            int(manifest["trained_window_cursor"]),
-            int(manifest.get("checkpoint_n", 0)),
+        mismatches = {
+            key: (manifest.get(key), expected)
+            for key, expected in (expected_identity or {}).items()
+            if manifest.get(key) != expected
+        }
+        if not mismatches:
+            return (
+                str(manifest["revision"]),
+                int(manifest["trained_window_cursor"]),
+                int(manifest.get("checkpoint_n", 0)),
+            )
+        logger.warning(
+            "candidate manifest belongs to another protocol/run (%s); "
+            "using the explicit bootstrap configuration",
+            ", ".join(sorted(mismatches)),
         )
     bootstrap = str(env.get("RELIQUARY_TRAINER_BOOTSTRAP_CURSOR", "")).strip()
     if not bootstrap:

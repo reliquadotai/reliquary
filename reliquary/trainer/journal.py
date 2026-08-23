@@ -16,6 +16,7 @@ from reliquary.infrastructure.training_payload_queue import (
 from reliquary.shared.training_payload import (
     decode_tombstone,
     decode_training_payload,
+    validate_training_identity,
 )
 
 
@@ -26,8 +27,14 @@ class WindowJournal:
     tests use ``dict.get``.
     """
 
-    def __init__(self, fetch_fn: Callable[[str], bytes | None]) -> None:
+    def __init__(
+        self,
+        fetch_fn: Callable[[str], bytes | None],
+        *,
+        expected_identity: dict[str, Any] | None = None,
+    ) -> None:
         self._fetch = fetch_fn
+        self._expected_identity = dict(expected_identity or {})
 
     def next_entry(
         self, cursor: int, *, stride: int
@@ -35,10 +42,24 @@ class WindowJournal:
         target = int(cursor) + int(stride)
         data = self._fetch(payload_key(target))
         if data is not None:
-            return "payload", decode_training_payload(data)
+            decoded = decode_training_payload(data)
+            if self._expected_identity:
+                validate_training_identity(
+                    decoded.training_identity,
+                    self._expected_identity,
+                    artifact=f"training payload for window {target}",
+                )
+            return "payload", decoded
         data = self._fetch(tombstone_key(target))
         if data is not None:
-            return "tombstone", decode_tombstone(data)
+            tombstone = decode_tombstone(data)
+            if self._expected_identity:
+                validate_training_identity(
+                    tombstone,
+                    self._expected_identity,
+                    artifact=f"training tombstone for window {target}",
+                )
+            return "tombstone", tombstone
         return None
 
 

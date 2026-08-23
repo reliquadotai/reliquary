@@ -68,3 +68,35 @@ def test_checkpoint_profile_rejects_unreadable_metadata(tmp_path):
 
     with pytest.raises(CheckpointProfileMismatch, match="unreadable"):
         validate_checkpoint_profile(tmp_path, required=True)
+
+
+def test_checkpoint_profile_rejects_run_state_collision(tmp_path):
+    with pytest.raises(ValueError, match="cannot replace lineage fields"):
+        write_checkpoint_profile(
+            tmp_path,
+            extra={"profile_id": "replacement"},
+        )
+
+
+def test_schema_v2_validates_generation_contract_hash(tmp_path):
+    expected = active_checkpoint_profile()
+    expected.update({
+        "schema_version": 2,
+        "generation_contract_sha256": "a" * 64,
+    })
+    checkpoint = dict(expected)
+    checkpoint["generation_contract_sha256"] = "b" * 64
+    (tmp_path / CHECKPOINT_PROFILE_NAME).write_text(
+        json.dumps(checkpoint),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        CheckpointProfileMismatch,
+        match="generation_contract_sha256",
+    ):
+        validate_checkpoint_profile(
+            tmp_path,
+            required=True,
+            expected=expected,
+        )

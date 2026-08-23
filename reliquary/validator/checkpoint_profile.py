@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Mapping
@@ -9,6 +10,7 @@ from typing import Any, Mapping
 from reliquary.constants import (
     PROTOCOL_MODEL_ID,
     PROTOCOL_MODEL_REVISION,
+    PROTOCOL_GENERATION_CONTRACT,
     PROTOCOL_PROFILE_ID,
     PROTOCOL_VERSION,
     TRAINING_RUN_ID,
@@ -23,8 +25,8 @@ class CheckpointProfileMismatch(RuntimeError):
 
 
 def active_checkpoint_profile() -> dict[str, Any]:
-    return {
-        "schema_version": 1,
+    profile = {
+        "schema_version": 2 if PROTOCOL_VERSION >= 5 else 1,
         "profile_id": PROTOCOL_PROFILE_ID,
         "protocol_version": PROTOCOL_VERSION,
         "base_model_id": PROTOCOL_MODEL_ID,
@@ -35,6 +37,18 @@ def active_checkpoint_profile() -> dict[str, Any]:
         # replay (new run id on old weights).
         "training_run_id": TRAINING_RUN_ID,
     }
+    if PROTOCOL_VERSION >= 5:
+        # Profile IDs are immutable by convention; the canonical contract hash
+        # makes that convention fail-closed for v5 prompt text and every other
+        # generation field even if an ID were accidentally reused.
+        profile["generation_contract_sha256"] = hashlib.sha256(
+            json.dumps(
+                PROTOCOL_GENERATION_CONTRACT,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    return profile
 
 
 def write_checkpoint_profile(
@@ -49,6 +63,12 @@ def write_checkpoint_profile(
     destination = Path(path) / CHECKPOINT_PROFILE_NAME
     payload = active_checkpoint_profile()
     if extra:
+        collisions = set(payload).intersection(extra)
+        if collisions:
+            raise ValueError(
+                "checkpoint run-state fields cannot replace lineage fields: "
+                + ", ".join(sorted(collisions))
+            )
         payload.update(dict(extra))
     destination.write_text(
         json.dumps(
@@ -86,13 +106,16 @@ def validate_checkpoint_profile(
             "checkpoint protocol-lineage metadata must be an object"
         )
     expected_value = dict(expected or active_checkpoint_profile())
-    for key in (
+    lineage_keys = [
         "schema_version",
         "profile_id",
         "protocol_version",
         "base_model_id",
         "base_model_revision",
-    ):
+    ]
+    if int(expected_value.get("schema_version", 1)) >= 2:
+        lineage_keys.append("generation_contract_sha256")
+    for key in lineage_keys:
         if value.get(key) != expected_value.get(key):
             raise CheckpointProfileMismatch(
                 f"checkpoint protocol-lineage mismatch for {key}"

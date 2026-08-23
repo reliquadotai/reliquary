@@ -1,6 +1,10 @@
 """Strictly-ordered journal consumption: payload, tombstone, or wait."""
 
+import pytest
+
 from reliquary.shared.training_payload import (
+    TrainingPayloadProtocolMismatch,
+    active_training_identity,
     encode_tombstone,
     encode_training_payload,
 )
@@ -53,3 +57,19 @@ def test_stride_respected():
     j = WindowJournal(fetch_fn=store.get)
     kind, decoded = j.next_entry(100, stride=5)
     assert kind == "payload" and decoded.window_start == 105
+
+
+def test_v5_identity_mismatch_fails_closed():
+    store = {"reliquary/training/window-101.npz": _payload_bytes(101)}
+    expected = active_training_identity()
+    expected["protocol_profile_id"] = "another-profile"
+    journal = WindowJournal(
+        fetch_fn=store.get,
+        expected_identity=expected,
+    )
+
+    with pytest.raises(
+        TrainingPayloadProtocolMismatch,
+        match="protocol_profile_id",
+    ):
+        journal.next_entry(100, stride=1)

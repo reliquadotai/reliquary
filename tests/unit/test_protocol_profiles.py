@@ -302,6 +302,43 @@ def test_profiles_are_frozen_slotted_and_recursively_immutable():
                 "answer_format": "boxed",
             },
         ),
+        (
+            # v5 is a prompt-only protocol fork: every generation/training knob
+            # remains at its v4 value while the signed environment templates
+            # restore the missing step-by-step reasoning cue.
+            "qwen3-4b-base-dapo-reasoning-v5",
+            {
+                "version": 5,
+                "math_cap": 8192,
+                "code_cap": 8192,
+                "thinking": 0,
+                "window": 100.0,
+                "domain": "reliquary-forced-seed-v5",
+                "lr": 1e-6,
+                "kl": 0.0,
+                "mask_math": False,
+                "overlong_factor": 0.5,
+                "forced_zero": True,
+                "proof_attempts": 64,
+                "ranked_proof_attempts": 32,
+                "model": "Qwen/Qwen3-4B-Base",
+                "t": 1.0,
+                "top_p": 1.0,
+                "top_k": 0,
+                "bft_enabled": False,
+                "raw_prompts": True,
+                "omi_train_only": True,
+                "clip_low": 0.2,
+                "clip_high": 0.28,
+                "opt_8bit": False,
+                "rollouts": 16,
+                "b_batch": 16,
+                "max_submissions": 32,
+                "publish_interval": 16,
+                "prompt_encoding": "raw",
+                "answer_format": "boxed",
+            },
+        ),
     ],
 )
 def test_profile_atomically_drives_runtime_constants(profile_id, expected):

@@ -14,6 +14,9 @@ import pytest
 
 from reliquary import constants as C
 from reliquary.shared.training_payload import (
+    PAYLOAD_SCHEMA_VERSION,
+    TOMBSTONE_SCHEMA_VERSION,
+    active_training_identity,
     decode_tombstone,
     decode_training_payload,
     encode_tombstone,
@@ -174,3 +177,39 @@ def test_tombstone_round_trip():
     assert doc["window_start"] == 30105
     assert doc["failure_stage"] == "proof_capacity"
     assert doc["failure_type"] == "ProofCapacityAbort"
+
+
+@pytest.mark.parametrize(
+    ("protocol_version", "payload_schema", "tombstone_schema"),
+    [
+        (4, 1, 1),
+        (5, PAYLOAD_SCHEMA_VERSION, TOMBSTONE_SCHEMA_VERSION),
+    ],
+)
+def test_artifact_schema_preserves_legacy_worker_compatibility(
+    monkeypatch,
+    protocol_version,
+    payload_schema,
+    tombstone_schema,
+):
+    monkeypatch.setattr(C, "PROTOCOL_VERSION", protocol_version)
+
+    decoded = _encode_decode(_window_batches())
+    tombstone = decode_tombstone(encode_tombstone(
+        window_start=30105,
+        failure_stage="proof_capacity",
+        failure_type="ProofCapacityAbort",
+    ))
+
+    assert decoded.schema_version == payload_schema
+    assert tombstone["schema_version"] == tombstone_schema
+    if protocol_version >= 5:
+        expected = active_training_identity()
+        assert decoded.training_identity == expected
+        for key, value in expected.items():
+            assert tombstone[key] == value
+    else:
+        assert all(
+            value is None for value in decoded.training_identity.values()
+        )
+        assert not set(active_training_identity()).intersection(tombstone)

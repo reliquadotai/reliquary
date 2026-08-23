@@ -58,6 +58,13 @@ def test_capacity_qualifier_help_runs_from_source_checkout(tmp_path):
             7_373,
             34,
         ),
+        (
+            "qwen3-4b-base-dapo-reasoning-v5",
+            "906bfd4b4dc7f14ee4320094d8b41684abff8539",
+            16,
+            7_373,
+            34,
+        ),
     ),
 )
 def test_capacity_qualifier_binds_full_representative_evidence(

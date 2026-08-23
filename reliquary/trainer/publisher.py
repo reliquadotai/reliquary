@@ -112,7 +112,12 @@ class TrainerPublisher:
                 )
 
             # Commit point: the candidate manifest the validator polls.
+            from reliquary.shared.training_payload import (
+                active_training_identity,
+            )
+
             manifest = {
+                **active_training_identity(),
                 "checkpoint_n": int(checkpoint_n),
                 "repo_id": self.repo_id,
                 "revision": str(revision),

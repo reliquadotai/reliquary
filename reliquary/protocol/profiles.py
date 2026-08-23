@@ -7,9 +7,11 @@ currently deployed constants.
 
 from __future__ import annotations
 
+import hashlib
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
+from string import Template
 from types import MappingProxyType
 from typing import Any
 
@@ -31,10 +33,63 @@ class BFTProfile:
 
 
 @dataclass(frozen=True, slots=True)
+class PromptTemplateProfile:
+    """Exact prompt text and rendering rule for a protocol environment.
+
+    The template uses ``string.Template`` dollar placeholders so literal
+    mathematical braces (for example ``\\boxed{}``) cannot be interpreted as
+    formatting fields. Only ``$problem`` and ``$contract`` are legal, and the
+    problem placeholder is mandatory.
+    """
+
+    template_id: str
+    template: str
+
+    def __post_init__(self) -> None:
+        parsed = Template(self.template)
+        if not self.template_id:
+            raise ValueError("prompt template id must not be empty")
+        if not parsed.is_valid():
+            raise ValueError(
+                f"prompt template {self.template_id!r} is not valid"
+            )
+        identifiers = set(parsed.get_identifiers())
+        unknown = identifiers - {"problem", "contract"}
+        if unknown:
+            raise ValueError(
+                f"prompt template {self.template_id!r} has unknown "
+                f"placeholders: {', '.join(sorted(unknown))}"
+            )
+        if "problem" not in identifiers:
+            raise ValueError(
+                f"prompt template {self.template_id!r} must contain $problem"
+            )
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.template.encode("utf-8")).hexdigest()
+
+    def render(self, *, problem: str, contract: str = "") -> str:
+        return Template(self.template).substitute(
+            problem=problem,
+            contract=contract,
+        )
+
+    def to_generation_contract(self) -> dict[str, str]:
+        return {
+            "id": self.template_id,
+            "renderer": "dollar-substitution-v1",
+            "template": self.template,
+            "sha256": self.sha256,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class EnvironmentProfile:
     max_new_tokens: int
     bft: BFTProfile | None
     answer_format: str | None = None
+    prompt_template: PromptTemplateProfile | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,7 +154,7 @@ class ProtocolProfile:
         environments: dict[str, dict[str, Any]] = {}
         for name, environment in self.environments.items():
             bft = environment.bft
-            environments[name] = {
+            environment_contract: dict[str, Any] = {
                 "max_new_tokens": environment.max_new_tokens,
                 "answer_format": environment.answer_format,
                 "bft": (
@@ -112,6 +167,14 @@ class ProtocolProfile:
                     }
                 ),
             }
+            # Older generation contracts stay byte-for-byte unchanged. Prompt
+            # text becomes an explicit signed field only on profiles that opt
+            # into a versioned template (v5+).
+            if environment.prompt_template is not None:
+                environment_contract["prompt_template"] = (
+                    environment.prompt_template.to_generation_contract()
+                )
+            environments[name] = environment_contract
 
         return {
             "profile_id": self.profile_id,
@@ -169,6 +232,30 @@ _SAMPLING_DAPO = SamplingProfile(
     top_p=1.0,
     top_k=0,
     do_sample=False,
+)
+
+
+# The v4 base-model rollout accidentally omitted the semantic reasoning cue.
+# Keep v4 immutable as the no-cue control and introduce the corrected prompts
+# only through a new profile. The Math wording deliberately mirrors DAPO's
+# released prompt prefix while retaining Reliquary's boxed reward channel.
+_MATH_REASONING_PROMPT = PromptTemplateProfile(
+    template_id="openmathinstruct-step-by-step-v1",
+    template=(
+        "Solve the following math problem step by step.\n\n"
+        "$problem\n\n"
+        "Put your final answer within \\boxed{}."
+    ),
+)
+
+_CODE_REASONING_PROMPT = PromptTemplateProfile(
+    template_id="opencodeinstruct-step-by-step-v1",
+    template=(
+        "Solve the following programming problem step by step.\n\n"
+        "$problem$contract\n\n"
+        "After your reasoning, provide the final implementation in the last "
+        "fenced Python code block."
+    ),
 )
 
 _PROFILE_VALUES = (
@@ -278,6 +365,37 @@ _PROFILE_VALUES = (
             bucket_tokens_per_round=50,
         ),
     ),
+    ProtocolProfile(
+        profile_id="qwen3-4b-base-dapo-reasoning-v5",
+        # Clean protocol fork from v4: the model, raw encoding, sampling,
+        # budgets, and objective controls stay fixed. Only the canonical prompt
+        # now asks the base model to reason step by step and, for Code, pins the
+        # final implementation to the parser's last-fenced-block channel.
+        model_id="Qwen/Qwen3-4B-Base",
+        model_revision="906bfd4b4dc7f14ee4320094d8b41684abff8539",
+        protocol_version=5,
+        collection_seconds=100,
+        upload_grace_seconds=33,
+        prompt_encoding="raw",
+        sampling=_SAMPLING_DAPO,
+        environments={
+            "openmathinstruct": EnvironmentProfile(
+                max_new_tokens=8192,
+                bft=None,
+                answer_format="boxed",
+                prompt_template=_MATH_REASONING_PROMPT,
+            ),
+            "opencodeinstruct": EnvironmentProfile(
+                max_new_tokens=8192,
+                bft=None,
+                prompt_template=_CODE_REASONING_PROMPT,
+            ),
+        },
+        throughput_tiebreak=ThroughputTiebreakProfile(
+            token_cap=8192,
+            bucket_tokens_per_round=50,
+        ),
+    ),
 )
 
 PROFILES: Mapping[str, ProtocolProfile] = MappingProxyType(
@@ -312,6 +430,30 @@ def resolve_protocol_profile(profile_id: str | None = None) -> ProtocolProfile:
 ACTIVE_PROTOCOL_PROFILE = resolve_protocol_profile()
 
 
+def render_active_prompt(
+    environment: str,
+    *,
+    problem: str,
+    contract: str = "",
+) -> str | None:
+    """Render the active profile's explicit prompt, if it declares one.
+
+    ``None`` is an intentional legacy signal: v2-v4 continue through their
+    original environment-local concatenation paths without changing a byte.
+    """
+
+    try:
+        environment_profile = ACTIVE_PROTOCOL_PROFILE.environments[environment]
+    except KeyError as exc:
+        raise ValueError(
+            f"active protocol profile has no environment {environment!r}"
+        ) from exc
+    prompt_template = environment_profile.prompt_template
+    if prompt_template is None:
+        return None
+    return prompt_template.render(problem=problem, contract=contract)
+
+
 def to_generation_contract(
     profile: ProtocolProfile | str | None = None,
 ) -> dict[str, Any]:
@@ -331,9 +473,11 @@ __all__ = [
     "BFTProfile",
     "DEFAULT_PROFILE_ID",
     "EnvironmentProfile",
+    "PromptTemplateProfile",
     "PROFILES",
     "ProtocolProfile",
     "SamplingProfile",
     "resolve_protocol_profile",
+    "render_active_prompt",
     "to_generation_contract",
 ]

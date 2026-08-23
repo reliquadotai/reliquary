@@ -9,11 +9,28 @@ from scripts.screen_recovery_checkpoints import (
     _single_phase_rollouts,
     _source_revision,
     _token_repetition,
+    render_math_task_prompt,
     resolve_model_source,
     select_code_tasks,
     select_tasks,
     summarize,
 )
+
+
+def test_math_screen_uses_selected_profile_prompt():
+    from reliquary.protocol.profiles import PROFILES
+
+    v4 = PROFILES["qwen3-4b-base-dapo-v4"]
+    v5 = PROFILES["qwen3-4b-base-dapo-reasoning-v5"]
+
+    assert render_math_task_prompt(v4, "What is 2+2?") == (
+        "What is 2+2?\n\nPut your final answer within \\boxed{}."
+    )
+    assert render_math_task_prompt(v5, "What is 2+2?") == (
+        "Solve the following math problem step by step.\n\n"
+        "What is 2+2?\n\n"
+        "Put your final answer within \\boxed{}."
+    )
 
 
 def test_single_phase_code_rollouts_trim_at_first_eos_without_forcing():

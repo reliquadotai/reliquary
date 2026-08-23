@@ -8,6 +8,7 @@ from reliquary.trainer.publisher import (
     TrainerPublisher,
     checkpoint_key,
 )
+from reliquary.shared.training_payload import active_training_identity
 
 
 class _R2:
@@ -84,6 +85,7 @@ def test_publish_order_manifest_and_cleanup(tmp_path):
                "profile" in k for k in uploaded_keys) or len(uploaded_keys) >= 2
     manifest = json.loads(r2.objects[CANDIDATE_MANIFEST_KEY])
     assert manifest == {
+        **active_training_identity(),
         "checkpoint_n": 5, "repo_id": "org/repo", "revision": "rev-123",
         "trained_window_cursor": 30110, "reason": "cadence",
     }
