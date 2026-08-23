@@ -501,3 +501,81 @@ def test_isolation_requires_a_snapshot_source_for_the_swap():
 
     with pytest.raises(RuntimeError, match="RELIQUARY_DETACHED_TRAINER"):
         assert_isolation_supported(isolation=True, detached_trainer=False)
+
+
+def test_real_worker_loads_a_model_and_proves_across_the_process_boundary(tmp_path):
+    """End-to-end on the production dotted paths, with a tiny CPU model.
+
+    Everything above this test uses cheap doubles for the worker body. This
+    one drives the real chain — build_proof_context loading a checkpoint,
+    run_commitment_proof calling verify_commitment_proofs, a populated
+    ProofResult coming back over the pipe — so a break in the glue between
+    them cannot reach production disguised as a green suite.
+    """
+    import os
+
+    import torch
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    from reliquary.validator.proof_worker import (
+        ProofModelProxy,
+        ProofWorkerPool,
+        PROOF_CONTEXT_FACTORY,
+        PROOF_HANDLER,
+        PROOF_RELOAD_HANDLER,
+        remote_commitment_verifier,
+    )
+
+    config = AutoConfig.for_model(
+        "qwen3", vocab_size=256, hidden_size=64, intermediate_size=128,
+        num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+        max_position_embeddings=128, eos_token_id=2, tie_word_embeddings=True,
+    )
+    checkpoint = tmp_path / "tiny"
+    model = AutoModelForCausalLM.from_config(config).to(torch.float32).eval()
+    model.save_pretrained(str(checkpoint))
+    config.save_pretrained(str(checkpoint))
+
+    # The worker re-imports constants, so the child picks this up on spawn.
+    os.environ["GRAIL_ATTN_IMPL"] = "eager"
+    pool = ProofWorkerPool(
+        devices=("cpu",),
+        context_factory=PROOF_CONTEXT_FACTORY,
+        handler=PROOF_HANDLER,
+        reload_handler=PROOF_RELOAD_HANDLER,
+        factory_kwargs={"checkpoint": str(checkpoint), "revision": "tiny-rev",
+                        "load_kwargs": {}},
+        initial_revision="tiny-rev",
+        request_timeout_seconds=300.0,
+    )
+    pool.start()
+    try:
+        tokens = [1, 5, 9, 13, 17, 21, 25, 29]
+        commit = {
+            "tokens": tokens,
+            "commitments": [{"sketch": 0} for _ in tokens],
+            "rollout": {"prompt_length": 4, "completion_length": 4},
+        }
+        verify = remote_commitment_verifier(pool)
+        result = verify(
+            commit,
+            ProofModelProxy(device_id="cpu"),
+            "a" * 64,
+            seed_u_values=[0.1, 0.2, 0.3, 0.4],
+        )
+    finally:
+        pool.close()
+        os.environ.pop("GRAIL_ATTN_IMPL", None)
+
+    # A real forward ran in the worker: the validator computed its own
+    # sketches (non-zero diff against the planted zeros) and the sparse
+    # outputs the behavioural gates read came back whole.
+    # (all_passed is not asserted here: the v7 sketch tolerance is 5000+,
+    # so planted zeros still pass it — a known property of the gate, not of
+    # this transport.)
+    assert result.checked == len(tokens)
+    assert result.sketch_diff_max > 0
+    assert result.has_sparse_outputs is True
+    assert len(result.completion_chosen_probs) > 0
+    assert all(0.0 <= p <= 1.0 for p in result.completion_chosen_probs)
+    assert result.p_stop is not None
