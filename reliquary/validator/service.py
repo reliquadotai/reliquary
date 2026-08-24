@@ -254,6 +254,26 @@ def is_bootstrap_window(window_start: int, subnet_start: int) -> bool:
     return window_start - subnet_start < BOOTSTRAP_WINDOWS
 
 
+_CHECKPOINT_COMMIT_TITLE = re.compile(
+    r"^checkpoint\s+(\d+)\s*(?:\(.*\))?\s*$", re.IGNORECASE
+)
+
+
+def checkpoint_n_from_commit_title(title: str | None) -> int | None:
+    """Checkpoint number a publication commit announces, or None.
+
+    Two publishers write here and they do not agree on the title. The
+    in-process path writes ``checkpoint N`` (checkpoint.py); the detached
+    trainer appends the reason, ``checkpoint N (cadence)``
+    (trainer/publisher.py). Matching only the first form made the startup
+    bootstrap blind to every detached publication, so it resolved "HF latest"
+    as the last hand-titled checkpoint and its anti-regression guard — the one
+    that overrides a stale operator pin — could never fire.
+    """
+    match = _CHECKPOINT_COMMIT_TITLE.match((title or "").strip())
+    return int(match.group(1)) if match else None
+
+
 def open_grpo_window(
     window_start: int,
     env,
@@ -4489,21 +4509,18 @@ class ValidationService:
         #   * env var set, ENV ckpt <  HF latest: warn and override with
         #     HF latest (the env is stale; HF has progressed past it)
         try:
-            import re as _re
             from huggingface_hub import HfApi
             repo_id = self._checkpoint_store.repo_id
             api = HfApi()
             commits = api.list_repo_commits(repo_id=repo_id)
-            ckpt_title = _re.compile(r"^checkpoint\s+(\d+)\s*$", _re.IGNORECASE)
             latest_n = -1
             latest_sha: str | None = None
             count = 0
             for c in commits:
-                m = ckpt_title.match(c.title or "")
-                if not m:
+                n = checkpoint_n_from_commit_title(getattr(c, "title", None))
+                if n is None:
                     continue
                 count += 1
-                n = int(m.group(1))
                 if n > latest_n:
                     latest_n = n
                     latest_sha = c.commit_id
