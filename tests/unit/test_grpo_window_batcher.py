@@ -490,33 +490,40 @@ def test_out_of_zone_does_not_charge_grail_candidate():
     assert b.proof_grading_attempts == 1     # grading ceiling unaffected
 
 
-def test_grading_attempts_ceiling_blocks_admission(monkeypatch):
-    """The grading-attempts ceiling bounds total grading work and gates
-    admission — even when no submission ever charges the GRAIL budget (here all
-    are out_of_zone). Otherwise a degenerate-reward flood would grow the
-    unbounded submit queue without limit."""
+def test_out_of_zone_flood_is_bounded_by_the_backstop_not_the_slot_budget(
+    monkeypatch,
+):
+    """An out-of-zone reward is a natural outcome of honest prompt prospecting,
+    so it refunds the productive admission budget rather than holding a receipt
+    the rest of the fleet needs. Total grading work stays bounded by the
+    never-refunded backstop, which is what stops a degenerate-reward flood from
+    growing the submit queue without limit."""
     import reliquary.validator.batcher as batcher_mod
 
     monkeypatch.setattr(batcher_mod, "MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW", 3)
+    monkeypatch.setattr(batcher_mod, "MAX_GRADING_STARTS_PER_WINDOW", 5)
     b = _make_batcher()
-    for i in range(3):
-        req = _request(rewards=[1.0] * 8, hotkey=f"hk{i}")
-        ok, _ = b.try_reserve_proof_admission(req)
-        assert ok
+
+    def flood(hotkey):
+        req = _request(rewards=[1.0] * 8, hotkey=hotkey)
+        ok, reason = b.try_reserve_proof_admission(req)
+        if not ok:
+            return reason
         assert b.start_proof_admission(req) == (True, None)
         try:
-            b.accept_submission(req)  # out_of_zone -> never charges GRAIL budget
+            b.accept_submission(req)  # out_of_zone
         finally:
             b.finish_proof_admission(req)
+        return None
 
-    assert b.proof_admission_count == 0          # GRAIL budget never charged
-    assert b.proof_grading_attempts == 3         # ceiling reached, not refunded
+    for i in range(5):
+        assert flood(f"hk{i}") is None
 
-    ok, reason = b.try_reserve_proof_admission(
-        _request(rewards=[1.0] * 8, hotkey="hkX")
-    )
-    assert ok is False
-    assert reason == "proof_grading_attempts_full"
+    assert b.proof_admission_count == 0        # GRAIL budget never charged
+    assert b.proof_grading_charged == 0        # refunded, slots stay available
+    assert b.proof_grading_attempts == 5       # backstop reached, not refunded
+
+    assert flood("hkX") == "grading_starts_full"
 
 
 def test_cancelled_pending_reservation_returns_unused_capacity(monkeypatch):

@@ -41,6 +41,7 @@ from reliquary.constants import (
     MAX_PENDING_SUBMISSION_BYTES_PER_ENV,
     MAX_PENDING_SUBMISSION_BYTES_PER_HOTKEY,
     MAX_PENDING_UPLOAD_PRECOMMITS_PER_ENV,
+    MAX_GRADING_STARTS_PER_WINDOW,
     MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
     MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW,
     MAX_PROOF_WALL_SECONDS,
@@ -410,6 +411,37 @@ def _is_missing_kwarg_typeerror(exc: TypeError, kwarg: str) -> bool:
     msg = str(exc)
     return "unexpected keyword argument" in msg and kwarg in msg
 
+
+# Admission stages that consume no grading work and produce no candidate, so
+# they must not hold one of the MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW receipts
+# the rest of the fleet needs to fill the window.
+#
+# Everything up to "logical_dedup" is decided before the grader runs: these are
+# protocol-conformance failures a correctly configured miner never produces.
+# "zone" is the deliberate exception that DID grade — a reward landing outside
+# the difficulty band is a natural outcome of honest prompt prospecting, not a
+# fault, so it is not charged either. Post-grading stages that are
+# miner-attributable ("reward", "code_grader*") stay charged: they consumed
+# real work and the submission was not honest about it.
+_NON_PRODUCTIVE_ADMISSION_STAGES = frozenset(
+    {
+        "seal_extension",
+        "window",
+        "checkpoint",
+        "prompt",
+        "prompt_range",
+        "cooldown",
+        "prompt_capacity",
+        "schema",
+        "token_invariant",
+        "legacy_merkle",
+        "tokens",
+        "prompt_binding",
+        "dedup",
+        "logical_dedup",
+        "zone",
+    }
+)
 
 _PROOF_FAILURE_DEBT_STAGES = frozenset(
     {
@@ -962,8 +994,14 @@ class GrpoWindowBatcher:
         # Total grading attempts that actually started this window. Pending
         # queue reservations are tracked separately so a request discarded on
         # seal/window swap does not permanently consume work that never ran.
-        # Started attempts are never refunded.
+        # Started attempts are never refunded: this is the denial-of-service
+        # backstop, bounded by MAX_GRADING_STARTS_PER_WINDOW.
         self._proof_grading_attempts = 0
+        # Productive admission budget, bounded by
+        # MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW. Refunded when a submission
+        # consumed no grading and produced no candidate, so an always-invalid
+        # flood cannot hold receipts the rest of the fleet needs.
+        self._proof_grading_charged = 0
         self._pending_proof_reservations: dict[
             int, tuple[BatchSubmissionRequest, str, bool, int]
         ] = {}
@@ -1264,10 +1302,15 @@ class GrpoWindowBatcher:
                 ):
                     return False, "proof_failure_debt_operator"
                 if (
-                    self._proof_grading_attempts
+                    self._proof_grading_charged
                     >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
                 ):
                     return False, "proof_grading_attempts_full"
+                if (
+                    self._proof_grading_attempts
+                    >= MAX_GRADING_STARTS_PER_WINDOW
+                ):
+                    return False, "grading_starts_full"
                 reservation_id = id(request)
                 if (
                     reservation_id in self._pending_proof_reservations
@@ -1285,6 +1328,7 @@ class GrpoWindowBatcher:
                     - reservation.payload_bytes,
                 )
                 self._proof_grading_attempts += 1
+                self._proof_grading_charged += 1
                 self._inflight_proof_reservations[reservation_id] = (
                     request,
                     request.miner_hotkey,
@@ -1419,6 +1463,24 @@ class GrpoWindowBatcher:
         return self._proof_grading_attempts
 
     @property
+    def proof_grading_charged(self) -> int:
+        """Productive admission budget in use (refunded on non-productive rejects)."""
+        return self._proof_grading_charged
+
+    @staticmethod
+    def _mark_grading_refundable(
+        request: BatchSubmissionRequest,
+        stage: str | None,
+    ) -> None:
+        """Flag a reject that owes its admission receipt back at finish.
+
+        Both reject paths must call this: the in-process accept path and the
+        isolated admission worker, which is the one production actually uses.
+        """
+        if stage in _NON_PRODUCTIVE_ADMISSION_STAGES:
+            request._grading_refundable = True
+
+    @property
     def pending_proof_reservations(self) -> int:
         return len(self._pending_proof_reservations)
 
@@ -1473,8 +1535,8 @@ class GrpoWindowBatcher:
 
     @property
     def proof_grading_capacity_used(self) -> int:
-        """Started attempts plus pending reservations used for admission."""
-        return self._proof_grading_attempts + len(
+        """Charged attempts plus pending reservations used for admission."""
+        return self._proof_grading_charged + len(
             self._pending_proof_reservations
         )
 
@@ -1684,11 +1746,16 @@ class GrpoWindowBatcher:
                 return False, "proof_failure_debt_operator"
 
             if (
-                self._proof_grading_attempts
+                self._proof_grading_charged
                 + len(self._pending_proof_reservations)
                 >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
             ):
                 return False, "proof_grading_attempts_full"
+            if (
+                self._proof_grading_attempts
+                >= MAX_GRADING_STARTS_PER_WINDOW
+            ):
+                return False, "grading_starts_full"
 
             payload_reason = self._payload_capacity_reason_locked(
                 request.miner_hotkey,
@@ -1752,10 +1819,15 @@ class GrpoWindowBatcher:
                 # Compatibility for direct/legacy worker injection. Production
                 # requests always reserve in the HTTP path first.
                 if (
-                    self._proof_grading_attempts
+                    self._proof_grading_charged
                     >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
                 ):
                     return False, "proof_grading_attempts_full"
+                if (
+                    self._proof_grading_attempts
+                    >= MAX_GRADING_STARTS_PER_WINDOW
+                ):
+                    return False, "grading_starts_full"
                 payload_bytes = self._submission_payload_bytes(request)
                 payload_reason = self._payload_capacity_reason_locked(
                     request.miner_hotkey,
@@ -1804,6 +1876,7 @@ class GrpoWindowBatcher:
                 return False, "proof_failure_debt_operator"
 
             self._proof_grading_attempts += 1
+            self._proof_grading_charged += 1
             if is_post_trigger:
                 self._post_trigger_proof_admission_count += 1
             self._inflight_proof_reservations[reservation_id] = reservation
@@ -1847,6 +1920,10 @@ class GrpoWindowBatcher:
                 0,
                 self._inflight_payload_bytes - payload_bytes,
             )
+            if getattr(request, "_grading_refundable", False):
+                self._proof_grading_charged = max(
+                    0, self._proof_grading_charged - 1
+                )
             if request._retain_payload and not self._seal_completed:
                 self._retained_payload_reservations[reservation_id] = (
                     request,
@@ -2079,6 +2156,7 @@ class GrpoWindowBatcher:
             else:
                 self.cancel_logical_group_reservation(request)
                 stage = "code_grader"
+        self._mark_grading_refundable(request, stage)
         return self._reject(
             reason,
             hotkey=request.miner_hotkey,
@@ -2303,6 +2381,7 @@ class GrpoWindowBatcher:
             stage: str,
             **kwargs: Any,
         ) -> BatchSubmissionResponse:
+            self._mark_grading_refundable(request, stage)
             return self._reject(
                 reason,
                 hotkey=hk,

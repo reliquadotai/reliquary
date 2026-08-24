@@ -1276,6 +1276,7 @@ def test_health_exposes_each_environment_window_independently():
     math._valid = [SimpleNamespace(prompt_idx=i) for i in range(4)]
     math._proof_admission_count = 4
     math._proof_grading_attempts = 4
+    math._proof_grading_charged = 3
     code.valid_count = 8
     code._valid = [SimpleNamespace(prompt_idx=i) for i in range(8)]
     code._proof_admission_count = 8
@@ -1300,6 +1301,7 @@ def test_health_exposes_each_environment_window_independently():
         "seconds_since_last_valid_submission": None,
         "proof_admission_count": 4,
         "proof_grading_attempts": 4,
+        "proof_grading_charged": 3,
         "pending_proof_reservations": 0,
         "inflight_proof_reservations": 0,
         "reserved_payload_bytes": 0,
