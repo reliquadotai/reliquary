@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import importlib
 import multiprocessing
+import threading
 from typing import Any, Callable, Mapping, MutableMapping, Sequence
 
 __all__ = [
@@ -29,6 +30,7 @@ __all__ = [
     "build_isolated_proof_plane",
     "build_proof_context",
     "reload_proof_context",
+    "proof_error_type",
     "remote_commitment_verifier",
     "run_commitment_proof",
 ]
@@ -40,7 +42,16 @@ class ProofWorkerUnavailable(RuntimeError):
     Raised — never returned as a rejection. A dead or unreachable worker is
     validator infrastructure failure: the scheduler must abort the proof plane
     rather than blame the miner whose candidate happened to be in flight.
+
+    ``remote_error_type`` carries the class name the child actually raised.
+    Callers discriminate on it — the forensic sampler keys its CUDA-OOM
+    recovery (``gc.collect`` / ``empty_cache``) on that name, and collapsing
+    every child failure into one opaque type would silently disable it.
     """
+
+    def __init__(self, message: str, *, remote_error_type: str | None = None) -> None:
+        super().__init__(message)
+        self.remote_error_type = remote_error_type
 
 
 @dataclass(frozen=True)
@@ -86,6 +97,16 @@ def remote_commitment_verifier(
     return verify
 
 
+def proof_error_type(exc: BaseException) -> str:
+    """Class name to record and branch on for a failed proof.
+
+    With an isolated plane the real failure happened in the child, so the
+    transport wrapper's own type says nothing useful — callers that key
+    recovery on the name (CUDA OOM cleanup) need what the child raised.
+    """
+    return getattr(exc, "remote_error_type", None) or type(exc).__name__
+
+
 def _resolve(dotted: str) -> Callable[..., Any]:
     """Resolve ``package.module:attribute`` inside whichever process asks."""
     module_name, _, attribute = dotted.partition(":")
@@ -106,10 +127,20 @@ def _worker_main(
     device: str,
 ) -> None:
     """Child entrypoint: build the heavy context once, then serve requests."""
-    context = _resolve(context_factory)(device=device, **dict(factory_kwargs))
-    handler_fn = _resolve(handler)
-    reload_fn = _resolve(reload_handler) if reload_handler else None
-    connection.send(("ready", None))
+    try:
+        context = _resolve(context_factory)(device=device, **dict(factory_kwargs))
+        handler_fn = _resolve(handler)
+        reload_fn = _resolve(reload_handler) if reload_handler else None
+    except BaseException as exc:  # noqa: BLE001 - reported, then the child exits
+        try:
+            connection.send(("start_failed", (type(exc).__name__, str(exc))))
+        except Exception:
+            pass
+        return
+    # The revision travels back from the worker: it is the only party that
+    # knows which weights it loaded. A parent-asserted label silently skips
+    # the reload and proves against the wrong checkpoint.
+    connection.send(("ready", context.get("revision")))
 
     while True:
         request = connection.recv()
@@ -134,6 +165,11 @@ class _Worker:
     device_id: str
     process: Any = None
     connection: Any = None
+    # One request at a time per pipe. The scheduler gives one thread per
+    # device, but every device-less proof path (forensic sample, legacy
+    # non-auction admission) routes to the first device from concurrent
+    # HTTP threads; unserialized send/recv pairs interleave pickle frames.
+    lock: Any = field(default_factory=threading.Lock)
 
 
 class ProofWorkerPool:
@@ -153,7 +189,8 @@ class ProofWorkerPool:
         reload_handler: str | None = None,
         factory_kwargs: Mapping[str, Any] | None = None,
         request_timeout_seconds: float | None = None,
-        initial_revision: str | None = None,
+        reload_timeout_seconds: float | None = None,
+        start_timeout_seconds: float = 900.0,
     ) -> None:
         if not devices:
             raise ValueError("ProofWorkerPool requires at least one device")
@@ -168,9 +205,16 @@ class ProofWorkerPool:
             None if request_timeout_seconds is None
             else float(request_timeout_seconds)
         )
-        self._initial_revision = initial_revision
+        self._reload_timeout_seconds = (
+            None if reload_timeout_seconds is None
+            else float(reload_timeout_seconds)
+        )
+        self._start_timeout_seconds = float(start_timeout_seconds)
         self._revisions: dict[str, str | None] = {}
         self._workers: dict[str, _Worker] = {}
+        # Guards the workers map itself, so two threads racing a respawn do
+        # not each start a process for the same device.
+        self._spawn_lock = threading.Lock()
         self._context = multiprocessing.get_context("spawn")
 
     @property
@@ -192,9 +236,6 @@ class ProofWorkerPool:
         if worker is None:
             worker = self._spawn(device_id)
             self._workers[device_id] = worker
-            # A replacement is only certified for what its factory installed.
-            # Anything published since must be re-sent before it proves again.
-            self._revisions.setdefault(device_id, self._initial_revision)
         return worker
 
     def _retire(self, device_id: str) -> None:
@@ -227,14 +268,53 @@ class ProofWorkerPool:
         )
         process.start()
         child_conn.close()
-        parent_conn.recv()
+
+        def _abandon(reason: str, remote_type: str | None = None):
+            try:
+                parent_conn.close()
+            except OSError:
+                pass
+            if process.is_alive():
+                process.kill()
+            process.join(timeout=5.0)
+            self._revisions[device_id] = None
+            return ProofWorkerUnavailable(reason, remote_error_type=remote_type)
+
+        # A replica load is slow; a hung one must not park the caller forever.
+        if not parent_conn.poll(self._start_timeout_seconds):
+            raise _abandon(
+                f"proof worker {device_id} did not come up within "
+                f"{self._start_timeout_seconds:g}s"
+            )
+        try:
+            status, payload = parent_conn.recv()
+        except (EOFError, OSError) as exc:
+            raise _abandon(
+                f"proof worker {device_id} died before it was ready: {exc!r}",
+                type(exc).__name__,
+            ) from exc
+        if status != "ready":
+            raise _abandon(
+                f"proof worker {device_id} failed to start: "
+                f"{payload[0]}: {payload[1]}",
+                payload[0],
+            )
+        self._revisions[device_id] = payload
         return _Worker(device_id=device_id, process=process, connection=parent_conn)
 
     def _request(self, device_id: str, operation: str, args, kwargs) -> Any:
-        worker = self._worker_for(device_id)
+        with self._spawn_lock:
+            worker = self._worker_for(device_id)
+        with worker.lock:
+            return self._exchange(worker, device_id, operation, args, kwargs)
+
+    def _exchange(self, worker, device_id: str, operation: str, args, kwargs) -> Any:
         try:
             worker.connection.send((operation, args, kwargs))
-            timeout = self._request_timeout_seconds
+            timeout = (
+                self._reload_timeout_seconds if operation == "reload"
+                else self._request_timeout_seconds
+            )
             if timeout is not None and not worker.connection.poll(timeout):
                 self._retire(device_id)
                 raise ProofWorkerUnavailable(
@@ -247,24 +327,31 @@ class ProofWorkerPool:
             # rather than turn our fault into a miner's rejection.
             self._retire(device_id)
             raise ProofWorkerUnavailable(
-                f"proof worker {device_id} died mid-request: {exc!r}"
+                f"proof worker {device_id} died mid-request: {exc!r}",
+                remote_error_type=type(exc).__name__,
             ) from exc
         if status == "ok":
             return payload
         raise ProofWorkerUnavailable(
-            f"proof worker {device_id} failed: {payload[0]}: {payload[1]}"
+            f"proof worker {device_id} failed: {payload[0]}: {payload[1]}",
+            remote_error_type=payload[0],
         )
 
     def call(self, device_id: str, *args: Any, **kwargs: Any) -> Any:
         return self._request(device_id, "call", args, kwargs)
 
     def reload(
-        self, device_id: str, snapshot_dir: str, checkpoint_revision: str,
+        self,
+        device_id: str,
+        snapshot_dir: str | None,
+        checkpoint_revision: str,
+        repo_id: str | None = None,
     ) -> None:
         """Install new weights in the worker (checkpoint publication)."""
         self._revisions[device_id] = None
         self._request(
-            device_id, "reload", (snapshot_dir, checkpoint_revision), {},
+            device_id, "reload",
+            (snapshot_dir, checkpoint_revision, repo_id), {},
         )
         self._revisions[device_id] = checkpoint_revision
 
@@ -272,12 +359,22 @@ class ProofWorkerPool:
         """Revision this worker is certified for, or None when unknown."""
         return self._revisions.get(device_id)
 
-    def close(self) -> None:
+    def close(self, force: bool = False) -> None:
+        """Retire every worker.
+
+        ``force`` skips the polite shutdown frame: when a device thread may
+        still be mid-request, writing into its pipe corrupts the exchange it
+        is reading. Kill the child instead and let the caller fail loudly.
+        """
         for worker in self._workers.values():
-            try:
-                worker.connection.send(("shutdown", (), {}))
-            except (OSError, BrokenPipeError, ValueError):
-                pass
+            if not force:
+                try:
+                    worker.connection.send(("shutdown", (), {}))
+                except (OSError, BrokenPipeError, ValueError):
+                    pass
+            else:
+                if worker.process.is_alive():
+                    worker.process.kill()
             worker.process.join(timeout=10.0)
             if worker.process.is_alive():
                 worker.process.kill()
@@ -314,15 +411,22 @@ def run_commitment_proof(
 
 def reload_proof_context(
     context: MutableMapping[str, Any],
-    snapshot_dir: str,
+    snapshot_dir: str | None,
     checkpoint_revision: str,
+    repo_id: str | None = None,
 ) -> None:
-    """Install a published snapshot into the worker's replica.
+    """Install a published checkpoint into the worker's replica.
 
     Mirrors ``_ValidatorService._refresh_verify_model_from_dir``: assemble the
     whole state dict on CPU first, allow exactly the model's declared tied
     keys, and record the revision only once the load succeeded. A partial
     install must surface as a raise, never as a worker that keeps proving.
+
+    ``repo_id`` is the durable fallback. ``CheckpointIntake.mark_installed``
+    rmtree's the staged directory after every swap, so a worker respawned
+    later has no local source; without this the plane would stay down until an
+    operator restarted the validator. HF is where the checkpoint durably
+    lives — the same place miners pull it from.
     """
     from pathlib import Path
 
@@ -332,10 +436,20 @@ def reload_proof_context(
         raise RuntimeError("proof worker reload requires a checkpoint revision")
 
     state: dict[str, Any] = {}
-    for path in sorted(Path(snapshot_dir).glob("*.safetensors")):
-        state.update(load_file(str(path), device="cpu"))
+    if snapshot_dir and Path(snapshot_dir).is_dir():
+        for path in sorted(Path(snapshot_dir).glob("*.safetensors")):
+            state.update(load_file(str(path), device="cpu"))
+        if not state and not repo_id:
+            raise RuntimeError(f"no safetensors under {snapshot_dir}")
+
     if not state:
-        raise RuntimeError(f"no safetensors under {snapshot_dir}")
+        if not repo_id:
+            raise RuntimeError(
+                "proof worker reload has no source: snapshot dir "
+                f"{snapshot_dir!r} is unusable and no repo_id was given"
+            )
+        _install_from_hub(context, repo_id, checkpoint_revision)
+        return
 
     model = context["model"]
     tied = set(getattr(model, "_tied_weights_keys", None) or [])
@@ -358,18 +472,51 @@ def reload_proof_context(
     context["revision"] = checkpoint_revision
 
 
+def _install_from_hub(
+    context: MutableMapping[str, Any],
+    repo_id: str,
+    checkpoint_revision: str,
+) -> None:
+    """Rebuild the replica straight from the durable checkpoint repo."""
+    import torch
+
+    from reliquary.constants import ATTN_IMPLEMENTATION
+    from reliquary.shared import modeling
+
+    model = modeling.load_text_generation_model(
+        repo_id,
+        torch_dtype=torch.bfloat16,
+        attn_implementation=ATTN_IMPLEMENTATION,
+        revision=checkpoint_revision,
+    )
+    device = context.get("device")
+    if device is not None and hasattr(model, "to"):
+        model = model.to(device)
+    model = model.eval()
+    for parameter in getattr(model, "parameters", list)():
+        parameter.requires_grad = False
+    context["model"] = model
+    context["revision"] = checkpoint_revision
+
+
 def build_proof_context(
     *,
     checkpoint: str,
     device: str,
-    revision: str | None = None,
     load_kwargs: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Load this worker's replica, exactly as the in-process path did.
+    """Load this worker's bootstrap replica, exactly as the in-process path did.
 
     Same dtype, same attention implementation, same pinned revision: the
     isolated plane must not change a single kernel, only which interpreter
     drives it.
+
+    The returned ``revision`` is deliberately ``None``. Under auction-v3+ the
+    validator bootstraps from the BASE model and only then resumes to the
+    trained checkpoint, so this worker holds weights no checkpoint certifies.
+    Reporting ``None`` forces ``_synchronize_proof_workers`` to install the
+    resumed snapshot before the device is ever marked ready — claiming the
+    caller's sha here is what made every proof run against base weights.
     """
     import torch
 
@@ -390,7 +537,7 @@ def build_proof_context(
         "model": model,
         "tokenizer": tokenizer,
         "device": device,
-        "revision": revision,
+        "revision": None,
     }
 
 
@@ -404,7 +551,6 @@ def build_isolated_proof_plane(
     devices: Sequence[str],
     checkpoint: str,
     load_kwargs: Mapping[str, Any] | None = None,
-    revision: str | None = None,
     reference_model: Any = None,
 ) -> tuple["ProofWorkerPool", dict[str, ProofModelProxy]]:
     """Assemble the isolated plane: one worker per device, one proxy each.
@@ -413,7 +559,10 @@ def build_isolated_proof_plane(
     model load. Proxies carry only the EOS metadata the proof-dependent gates
     read; the weights live in the workers.
     """
-    from reliquary.constants import PROOF_WORKER_REQUEST_TIMEOUT_SECONDS
+    from reliquary.constants import (
+        PROOF_WORKER_RELOAD_TIMEOUT_SECONDS,
+        PROOF_WORKER_REQUEST_TIMEOUT_SECONDS,
+    )
 
     pool = ProofWorkerPool(
         devices=tuple(devices),
@@ -422,11 +571,11 @@ def build_isolated_proof_plane(
         reload_handler=PROOF_RELOAD_HANDLER,
         factory_kwargs={
             "checkpoint": checkpoint,
-            "revision": revision,
             "load_kwargs": dict(load_kwargs or {}),
         },
         request_timeout_seconds=PROOF_WORKER_REQUEST_TIMEOUT_SECONDS,
-        initial_revision=revision,
+        reload_timeout_seconds=PROOF_WORKER_RELOAD_TIMEOUT_SECONDS,
+        start_timeout_seconds=PROOF_WORKER_RELOAD_TIMEOUT_SECONDS,
     )
     proxies = {
         device: ProofModelProxy(

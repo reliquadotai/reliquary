@@ -523,6 +523,10 @@ class ValidationService:
         self.env: Environment = self.envs[first_env_name]
         self._proof_models: dict[str, Any] = {}
         self._proof_worker_pool = proof_worker_pool
+        # Directory the weights now in verify_model were read from. The
+        # isolated proof workers reload from it, so it must track every
+        # install: the resume at boot and each staged-checkpoint swap.
+        self._verify_model_snapshot_dir: str | None = None
         self._remote_commitment_verifier = None
         if proof_worker_pool is not None:
             from reliquary.validator.proof_worker import (
@@ -871,19 +875,31 @@ class ValidationService:
         assert pool is not None
         scheduler = self.proof_scheduler
         assert scheduler is not None
+        # At boot the workers hold the BOOTSTRAP replica and report no
+        # revision, so this installs the resumed snapshot before any device is
+        # marked ready. Never mark ready on an uninstalled revision.
+        snapshot_dir = snapshot_dir or self._verify_model_snapshot_dir
+        if snapshot_dir and not Path(snapshot_dir).is_dir():
+            # ``CheckpointIntake.mark_installed`` rmtree's the staged dir after
+            # each swap, so this path goes stale between publications.
+            snapshot_dir = None
+        repo_id = getattr(self._checkpoint_store, "repo_id", None)
         for device in self._proof_models:
             if pool.revision(device) != checkpoint_revision:
-                if not snapshot_dir:
+                if not snapshot_dir and not repo_id:
                     raise RuntimeError(
                         f"isolated proof worker {device!r} holds "
-                        f"{pool.revision(device)!r} and no staged snapshot is "
+                        f"{pool.revision(device)!r} and no source is "
                         f"available for {checkpoint_revision!r}"
                     )
                 logger.info(
-                    "Reloading isolated proof worker %s to %s",
+                    "Reloading isolated proof worker %s to %s (source=%s)",
                     device, checkpoint_revision[:12],
+                    snapshot_dir or f"hub:{repo_id}",
                 )
-                pool.reload(device, snapshot_dir, checkpoint_revision)
+                pool.reload(
+                    device, snapshot_dir, checkpoint_revision, repo_id,
+                )
             scheduler.mark_device_ready(device, checkpoint_revision)
 
     def _proof_scheduler_health_snapshot(self) -> dict[str, Any]:
@@ -1059,6 +1075,7 @@ class ValidationService:
             )
         if tied:
             self.verify_model.tie_weights()
+        self._verify_model_snapshot_dir = str(snapshot_dir)
         self.verify_model.eval()
         for parameter in self.verify_model.parameters():
             parameter.requires_grad = False
@@ -1358,12 +1375,13 @@ class ValidationService:
                 "will retire daemon proof workers",
                 timeout,
             )
-        # Retire the isolated workers only after the scheduler stopped
-        # dispatching, so no device thread is parked on a pipe we just closed.
+        # Retire the isolated workers. A polite shutdown writes into the very
+        # pipe a device thread may still be reading, so when the scheduler
+        # did NOT close (a worker thread is still in flight) kill instead.
         pool = self._proof_worker_pool
         if pool is not None:
             try:
-                await asyncio.to_thread(pool.close)
+                await asyncio.to_thread(pool.close, not closed)
             except Exception:
                 logger.exception("isolated proof workers did not close cleanly")
 
@@ -1509,6 +1527,7 @@ class ValidationService:
         # verifies miners against the resumed checkpoint, which is what
         # they have access to via HF).
         self.train_model = self._load_model_fn(local_path)
+        self._verify_model_snapshot_dir = str(local_path)
         try:
             self.train_model.gradient_checkpointing_enable()
         except (AttributeError, NotImplementedError):

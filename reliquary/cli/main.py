@@ -637,7 +637,6 @@ def validate(
                     devices=proof_devices,
                     checkpoint=checkpoint,
                     load_kwargs=base_load_kwargs,
-                    revision=activation_checkpoint_revision,
                     reference_model=model,
                 )
                 proof_worker_pool.start()
