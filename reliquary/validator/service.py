@@ -267,6 +267,7 @@ def open_grpo_window(
     queue_drained_predicate=None,
     operator_by_hotkey: dict[str, str] | None = None,
     proof_scheduler=None,
+    verify_commitment_proofs_fn=None,
 ) -> GrpoWindowBatcher:
     """Instantiate a GrpoWindowBatcher for this window.
 
@@ -305,6 +306,7 @@ def open_grpo_window(
         queue_drained_predicate=queue_drained_predicate,
         operator_by_hotkey=operator_by_hotkey,
         proof_scheduler=proof_scheduler,
+        verify_commitment_proofs_fn=verify_commitment_proofs_fn,
     )
 
 
@@ -435,6 +437,7 @@ class ValidationService:
         proof_devices: tuple[str, ...] | None = None,
         proof_models: dict[str, Any] | None = None,
         proof_capacity_qualification: dict[str, Any] | None = None,
+        proof_worker_pool: Any = None,
     ) -> None:
         self.wallet = wallet
         import importlib.metadata as _im
@@ -519,6 +522,16 @@ class ValidationService:
         first_env_name = self.env_mix[0][0]
         self.env: Environment = self.envs[first_env_name]
         self._proof_models: dict[str, Any] = {}
+        self._proof_worker_pool = proof_worker_pool
+        self._remote_commitment_verifier = None
+        if proof_worker_pool is not None:
+            from reliquary.validator.proof_worker import (
+                remote_commitment_verifier,
+            )
+
+            self._remote_commitment_verifier = remote_commitment_verifier(
+                proof_worker_pool
+            )
         self.proof_capacity_qualification = dict(
             proof_capacity_qualification or {}
         )
@@ -839,6 +852,40 @@ class ValidationService:
             reason=None if submission is not None else "proof_rejected",
         )
 
+    def _default_proof_proxy(self) -> Any:
+        """Proxy used when a proof path does not name a device.
+
+        Any configured device serves: these paths are single-shot and the
+        scheduler is not choosing between replicas for them.
+        """
+        for proxy in self._proof_models.values():
+            return proxy
+        raise RuntimeError("isolated proof plane has no device proxy")
+
+    def _synchronize_proof_workers(
+        self,
+        checkpoint_revision: str,
+        snapshot_dir: str | None,
+    ) -> None:
+        pool = self._proof_worker_pool
+        assert pool is not None
+        scheduler = self.proof_scheduler
+        assert scheduler is not None
+        for device in self._proof_models:
+            if pool.revision(device) != checkpoint_revision:
+                if not snapshot_dir:
+                    raise RuntimeError(
+                        f"isolated proof worker {device!r} holds "
+                        f"{pool.revision(device)!r} and no staged snapshot is "
+                        f"available for {checkpoint_revision!r}"
+                    )
+                logger.info(
+                    "Reloading isolated proof worker %s to %s",
+                    device, checkpoint_revision[:12],
+                )
+                pool.reload(device, snapshot_dir, checkpoint_revision)
+            scheduler.mark_device_ready(device, checkpoint_revision)
+
     def _proof_scheduler_health_snapshot(self) -> dict[str, Any]:
         scheduler = getattr(self, "proof_scheduler", None)
         if scheduler is None:
@@ -1035,7 +1082,7 @@ class ValidationService:
             )
             if self.proof_scheduler is not None:
                 await asyncio.to_thread(
-                    self._synchronize_proof_models, revision,
+                    self._synchronize_proof_models, revision, str(staged_dir),
                 )
             entry = self._checkpoint_store.install_external(
                 int(manifest["checkpoint_n"]), revision,
@@ -1152,8 +1199,20 @@ class ValidationService:
             or bootstrap
         )
 
-    def _synchronize_proof_models(self, checkpoint_revision: str) -> None:
-        """Quiesce, refresh every replica, then atomically resume proving."""
+    def _synchronize_proof_models(
+        self,
+        checkpoint_revision: str,
+        snapshot_dir: str | None = None,
+    ) -> None:
+        """Quiesce, refresh every replica, then atomically resume proving.
+
+        With an isolated proof plane the validator no longer holds the
+        replicas, so the refresh is a reload inside each worker. It needs the
+        staged snapshot directory: a worker already certified for this
+        revision is simply marked ready, and one that is not — a replacement
+        spawned after a crash, or a publication we have no snapshot for —
+        must fail loudly rather than keep proving on unknown weights.
+        """
 
         scheduler = self.proof_scheduler
         if scheduler is None:
@@ -1199,6 +1258,12 @@ class ValidationService:
 
         for device in self._proof_models:
             scheduler.mark_device_not_ready(device)
+        if self._proof_worker_pool is not None:
+            self._synchronize_proof_workers(
+                checkpoint_revision, snapshot_dir,
+            )
+            scheduler.resume(checkpoint_revision)
+            return
         reference_state = self.verify_model.state_dict()
         for device, model in self._proof_models.items():
             if model is not self.verify_model:
@@ -1293,6 +1358,14 @@ class ValidationService:
                 "will retire daemon proof workers",
                 timeout,
             )
+        # Retire the isolated workers only after the scheduler stopped
+        # dispatching, so no device thread is parked on a pipe we just closed.
+        pool = self._proof_worker_pool
+        if pool is not None:
+            try:
+                await asyncio.to_thread(pool.close)
+            except Exception:
+                logger.exception("isolated proof workers did not close cleanly")
 
     @property
     def _active_batcher(self):
@@ -1527,6 +1600,16 @@ class ValidationService:
             }
             if self.proof_scheduler is not None:
                 open_kwargs["proof_scheduler"] = self.proof_scheduler
+            if self._proof_worker_pool is not None:
+                open_kwargs["verify_commitment_proofs_fn"] = (
+                    self._remote_commitment_verifier
+                )
+                # Paths that prove without naming a device — the forensic
+                # sample, and the legacy non-auction admission — fall back to
+                # the batcher's own model. In isolated mode that has to be a
+                # proxy too, or they would hand the remote verifier a real
+                # model and abort the plane.
+                open_kwargs["model"] = self._default_proof_proxy()
             batcher = open_grpo_window(
                 **open_kwargs,
             )
