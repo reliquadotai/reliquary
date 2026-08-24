@@ -15,7 +15,7 @@
       "bounding": [], "effective": [], "inheritable": [], "permitted": [], "ambient": []
     },
     "rlimits": [
-      {"type": "RLIMIT_CPU", "hard": 5, "soft": 5},
+      {"type": "RLIMIT_CPU", "hard": 480, "soft": 480},
       {"type": "RLIMIT_NPROC", "hard": 16, "soft": 16},
       {"type": "RLIMIT_FSIZE", "hard": 0, "soft": 0},
       {"type": "RLIMIT_AS", "hard": 268435456, "soft": 268435456}

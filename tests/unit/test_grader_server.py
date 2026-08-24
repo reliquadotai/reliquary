@@ -565,3 +565,114 @@ def test_grader_sigterm_publishes_clean_shutdown():
             process.kill()
             process.wait(timeout=5.0)
         short_tmp.cleanup()
+
+
+def test_bundle_cpu_rlimit_covers_a_whole_worker_lifetime():
+    """``RLIMIT_CPU`` is per-process CUMULATIVE, but a pool worker serves
+    ``recycle_after_evals`` requests before it is recycled.
+
+    Sizing it as if it were a per-request timeout kills healthy workers
+    mid-request once their *accumulated* CPU crosses the limit. The miner whose
+    case happened to be running is then blamed for a sandbox crash it did not
+    cause. The per-request bound is the server's wall-clock reader deadline,
+    not this rlimit.
+    """
+    from reliquary.environment.grader import server as srv
+
+    config = json.loads(
+        (Path(srv.__file__).parent / "bundle" / "config.json").read_text()
+    )
+    rlimits = {entry["type"]: entry for entry in config["process"]["rlimits"]}
+    cpu = rlimits["RLIMIT_CPU"]
+    required = srv.worker_lifetime_cpu_budget_seconds()
+
+    assert cpu["soft"] >= required
+    assert cpu["hard"] >= required
+
+
+def test_worker_death_records_the_exit_signal(grader_server):
+    """The exit status is the only evidence of *why* a worker died.
+
+    Without it a SIGKILL from an exhausted rlimit is indistinguishable from a
+    segfault in miner code, and the pool's failure mode cannot be diagnosed
+    from telemetry at all.
+    """
+    worker = grader_server._workers[0]
+    worker.proc.kill()
+    worker.proc.wait(timeout=5.0)
+
+    grader_server._respawn(worker, reason="death")
+
+    body = grader_server._metrics.render()
+    assert 'grader_worker_restarts_total{exit="SIGKILL",reason="death"}' in body
+
+
+def test_worker_stderr_is_surfaced_when_it_dies(tmp_path, caplog):
+    """A dying worker's stderr carries the interpreter-level cause (fault
+    handler traceback, allocator abort). Discarding it leaves the death
+    unexplainable."""
+    import logging
+
+    from reliquary.environment.grader.server import GraderServer
+
+    server = GraderServer(
+        socket_path=str(tmp_path / "g.sock"),
+        pool_size=1,
+        worker_argv=[
+            sys.executable,
+            "-c",
+            "import sys, time; sys.stderr.write('worker-death-marker\\n');"
+            " sys.stderr.flush(); time.sleep(30)",
+        ],
+        eval_timeout_s=1.0,
+        metrics_port=0,
+        health_path=str(tmp_path / "health.json"),
+    )
+    server.start()
+    try:
+        worker = server._workers[0]
+        deadline = time.time() + 5.0
+        while worker.proc.poll() is None and time.time() < deadline:
+            time.sleep(0.05)
+        worker.proc.kill()
+        worker.proc.wait(timeout=5.0)
+
+        with caplog.at_level(
+            logging.WARNING, logger="reliquary.environment.grader.server"
+        ):
+            server._respawn(worker, reason="death")
+    finally:
+        server.stop()
+
+    assert "worker-death-marker" in caplog.text
+
+
+def test_worker_stderr_capture_survives_an_ungraceful_server_kill(tmp_path):
+    """The validator is SIGKILLed in production (OOM). A per-worker stderr
+    file that only gets cleaned up on the graceful path would accumulate a
+    whole pool's worth of files on every such kill."""
+    import glob
+
+    before = set(glob.glob("/tmp/grader-worker-*"))
+    script = (
+        "import time\n"
+        "from reliquary.environment.grader.server import GraderServer\n"
+        "s = GraderServer(socket_path=%r, pool_size=3,\n"
+        "                 worker_argv=[%r, '-m', 'reliquary.environment.grader.worker'],\n"
+        "                 eval_timeout_s=1.0, metrics_port=0, health_path=%r)\n"
+        "s.start()\n"
+        "print('up', flush=True)\n"
+        "time.sleep(60)\n"
+    ) % (str(tmp_path / "g.sock"), sys.executable, str(tmp_path / "health.json"))
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script], stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        assert proc.stdout.readline().strip() == "up"
+        time.sleep(0.5)
+    finally:
+        proc.kill()
+        proc.wait(timeout=10.0)
+
+    assert set(glob.glob("/tmp/grader-worker-*")) == before
