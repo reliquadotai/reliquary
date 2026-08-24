@@ -26,7 +26,10 @@ def echo_handler(context: dict[str, Any], payload: Any) -> dict[str, Any]:
     }
 
 
-def reload_handler(context: dict[str, Any], snapshot_dir: str, revision: str) -> None:
+def reload_handler(
+    context: dict[str, Any], snapshot_dir: str | None, revision: str,
+    repo_id: str | None = None,
+) -> None:
     context["revision"] = revision
 
 
@@ -85,3 +88,25 @@ def build_device_context(*, device: str, tag: str = "") -> dict[str, Any]:
 def device_handler(context: dict[str, Any], payload: Any) -> dict[str, Any]:
     context["calls"] += 1
     return {"device": context["device"], "tag": context["tag"], "payload": payload}
+
+
+def build_context_installing(*, device: str, revision: str | None = None) -> dict[str, Any]:
+    """Factory that reports the revision it actually installed."""
+    return {"pid": os.getpid(), "calls": 0, "device": device, "revision": revision}
+
+
+def build_context_installing_dispatch(*, device: str, revision: str | None = None) -> dict[str, Any]:
+    """Same as build_context_installing, for the crash/dispatch handler."""
+    return {"pid": os.getpid(), "calls": 0, "device": device, "revision": revision}
+
+
+def slow_reload_handler(
+    context: dict[str, Any], seconds: str, revision: str,
+    repo_id: str | None = None,
+) -> None:
+    time.sleep(float(seconds))
+    context["revision"] = revision
+
+
+def build_context_that_dies(*, device: str) -> dict[str, Any]:
+    raise RuntimeError(f"cannot build a replica on {device}")
