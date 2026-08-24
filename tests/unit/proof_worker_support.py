@@ -26,7 +26,10 @@ def echo_handler(context: dict[str, Any], payload: Any) -> dict[str, Any]:
     }
 
 
-def reload_handler(context: dict[str, Any], snapshot_dir: str, revision: str) -> None:
+def reload_handler(
+    context: dict[str, Any], snapshot_dir: str | None, revision: str,
+    repo_id: str | None = None,
+) -> None:
     context["revision"] = revision
 
 
@@ -97,7 +100,10 @@ def build_context_installing_dispatch(*, device: str, revision: str | None = Non
     return {"pid": os.getpid(), "calls": 0, "device": device, "revision": revision}
 
 
-def slow_reload_handler(context: dict[str, Any], seconds: str, revision: str) -> None:
+def slow_reload_handler(
+    context: dict[str, Any], seconds: str, revision: str,
+    repo_id: str | None = None,
+) -> None:
     time.sleep(float(seconds))
     context["revision"] = revision
 

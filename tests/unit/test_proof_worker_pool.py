@@ -741,3 +741,50 @@ def test_a_worker_that_dies_while_building_raises_the_documented_error():
     with pytest.raises(ProofWorkerUnavailable, match="cuda:0"):
         pool.start()
     pool.close()
+
+
+def test_reload_falls_back_to_the_hub_when_the_snapshot_is_gone(tmp_path, monkeypatch):
+    """`mark_installed` rmtree's the staged directory after every swap.
+
+    A worker that dies later then respawns with no weights and no local
+    source. Without a durable fallback the plane stays down until an
+    operator restarts the validator — a recoverable crash turned into an
+    outage. HF is where the checkpoint durably lives; it is the same place
+    miners pull it from.
+    """
+    import torch
+
+    import reliquary.shared.modeling as modeling
+    from reliquary.validator.proof_worker import reload_proof_context
+
+    class Tiny(torch.nn.Module):
+        def __init__(self, value):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.full((2, 2), float(value)))
+
+        def eval(self):
+            return self
+
+    monkeypatch.setattr(
+        modeling, "load_text_generation_model",
+        lambda source, **kw: Tiny(7.0) if kw.get("revision") == "rev-hub" else Tiny(0.0),
+    )
+    context = {"model": Tiny(0.0), "tokenizer": None, "device": "cpu",
+               "revision": "old-rev"}
+
+    reload_proof_context(
+        context, str(tmp_path / "deleted-by-mark-installed"), "rev-hub",
+        repo_id="ReliquaryForge/qwen3-4b-base-dapo-v4",
+    )
+
+    assert torch.equal(context["model"].weight.detach(), torch.full((2, 2), 7.0))
+    assert context["revision"] == "rev-hub"
+
+
+def test_reload_without_snapshot_or_repo_refuses(tmp_path):
+    from reliquary.validator.proof_worker import reload_proof_context
+
+    context = {"model": None, "tokenizer": None, "revision": "old-rev"}
+    with pytest.raises(RuntimeError, match="no source"):
+        reload_proof_context(context, None, "rev-x")
+    assert context["revision"] == "old-rev"

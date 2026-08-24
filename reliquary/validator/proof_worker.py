@@ -341,12 +341,17 @@ class ProofWorkerPool:
         return self._request(device_id, "call", args, kwargs)
 
     def reload(
-        self, device_id: str, snapshot_dir: str, checkpoint_revision: str,
+        self,
+        device_id: str,
+        snapshot_dir: str | None,
+        checkpoint_revision: str,
+        repo_id: str | None = None,
     ) -> None:
         """Install new weights in the worker (checkpoint publication)."""
         self._revisions[device_id] = None
         self._request(
-            device_id, "reload", (snapshot_dir, checkpoint_revision), {},
+            device_id, "reload",
+            (snapshot_dir, checkpoint_revision, repo_id), {},
         )
         self._revisions[device_id] = checkpoint_revision
 
@@ -406,15 +411,22 @@ def run_commitment_proof(
 
 def reload_proof_context(
     context: MutableMapping[str, Any],
-    snapshot_dir: str,
+    snapshot_dir: str | None,
     checkpoint_revision: str,
+    repo_id: str | None = None,
 ) -> None:
-    """Install a published snapshot into the worker's replica.
+    """Install a published checkpoint into the worker's replica.
 
     Mirrors ``_ValidatorService._refresh_verify_model_from_dir``: assemble the
     whole state dict on CPU first, allow exactly the model's declared tied
     keys, and record the revision only once the load succeeded. A partial
     install must surface as a raise, never as a worker that keeps proving.
+
+    ``repo_id`` is the durable fallback. ``CheckpointIntake.mark_installed``
+    rmtree's the staged directory after every swap, so a worker respawned
+    later has no local source; without this the plane would stay down until an
+    operator restarted the validator. HF is where the checkpoint durably
+    lives — the same place miners pull it from.
     """
     from pathlib import Path
 
@@ -424,10 +436,20 @@ def reload_proof_context(
         raise RuntimeError("proof worker reload requires a checkpoint revision")
 
     state: dict[str, Any] = {}
-    for path in sorted(Path(snapshot_dir).glob("*.safetensors")):
-        state.update(load_file(str(path), device="cpu"))
+    if snapshot_dir and Path(snapshot_dir).is_dir():
+        for path in sorted(Path(snapshot_dir).glob("*.safetensors")):
+            state.update(load_file(str(path), device="cpu"))
+        if not state and not repo_id:
+            raise RuntimeError(f"no safetensors under {snapshot_dir}")
+
     if not state:
-        raise RuntimeError(f"no safetensors under {snapshot_dir}")
+        if not repo_id:
+            raise RuntimeError(
+                "proof worker reload has no source: snapshot dir "
+                f"{snapshot_dir!r} is unusable and no repo_id was given"
+            )
+        _install_from_hub(context, repo_id, checkpoint_revision)
+        return
 
     model = context["model"]
     tied = set(getattr(model, "_tied_weights_keys", None) or [])
@@ -447,6 +469,33 @@ def reload_proof_context(
     model.eval()
     for parameter in model.parameters():
         parameter.requires_grad = False
+    context["revision"] = checkpoint_revision
+
+
+def _install_from_hub(
+    context: MutableMapping[str, Any],
+    repo_id: str,
+    checkpoint_revision: str,
+) -> None:
+    """Rebuild the replica straight from the durable checkpoint repo."""
+    import torch
+
+    from reliquary.constants import ATTN_IMPLEMENTATION
+    from reliquary.shared import modeling
+
+    model = modeling.load_text_generation_model(
+        repo_id,
+        torch_dtype=torch.bfloat16,
+        attn_implementation=ATTN_IMPLEMENTATION,
+        revision=checkpoint_revision,
+    )
+    device = context.get("device")
+    if device is not None and hasattr(model, "to"):
+        model = model.to(device)
+    model = model.eval()
+    for parameter in getattr(model, "parameters", list)():
+        parameter.requires_grad = False
+    context["model"] = model
     context["revision"] = checkpoint_revision
 
 
