@@ -55,7 +55,7 @@ from reliquary.constants import (
     MATH_ADMISSION_WORKERS,
     M_ROLLOUTS,
     MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW,
-    MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
+    MAX_GRADING_STARTS_PER_WINDOW,
     MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW,
     MAX_PROOF_WALL_SECONDS,
     MAX_SEAL_QUEUE_DRAIN_SECONDS,
@@ -1783,10 +1783,11 @@ class ValidationService:
     def _proof_admission_exhausted_and_drained(self, batcher) -> bool:
         """True when bounded proof admission cannot fill this window anymore.
 
-        Gated on the grading-attempts ceiling, not the GRAIL candidate budget:
-        out_of_zone rejects refund the latter, so for a degenerate-reward env
-        it never reaches its cap — the real "can't fill anymore" signal is the
-        never-refunded grading ceiling.
+        Gated on the never-refunded grading-starts backstop, not on the
+        productive admission budget: non-productive rejects (protocol
+        conformance and out-of-zone) refund the latter, so for a
+        degenerate-reward env it never reaches its cap. Only the ceiling that
+        nothing gives back is a real "can't fill anymore" signal.
         """
         if batcher is None or batcher.is_sealed():
             return False
@@ -1795,7 +1796,7 @@ class ValidationService:
             return False
         if (
             getattr(batcher, "proof_grading_attempts", 0)
-            < MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+            < MAX_GRADING_STARTS_PER_WINDOW
         ):
             return False
         queue_depth = int(getattr(self.server, "submit_queue_depth", 0) or 0)

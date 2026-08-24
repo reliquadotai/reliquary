@@ -1614,6 +1614,9 @@ class ValidatorServer:
             "proof_grading_attempts": _integer(
                 getattr(batcher, "proof_grading_attempts", None)
             ),
+            "proof_grading_charged": _integer(
+                getattr(batcher, "proof_grading_charged", None)
+            ),
             "pending_proof_reservations": _integer(
                 getattr(batcher, "pending_proof_reservations", None)
             ),

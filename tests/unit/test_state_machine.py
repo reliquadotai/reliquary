@@ -609,16 +609,17 @@ async def test_activate_window_binds_batcher_loop_for_delayed_seal():
 @pytest.mark.asyncio
 async def test_wait_for_window_seal_force_seals_drained_proof_cap():
     """A full proof cap with no queued/in-flight work cannot fill later."""
-    from reliquary.validator.service import MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+    from reliquary.validator.service import MAX_GRADING_STARTS_PER_WINDOW
 
     svc = _make_service()
     svc._open_window()
     svc._activate_window()
     batcher = svc._active_batcher
 
-    # Exhaustion is now gated on the never-refunded grading-attempts ceiling,
-    # since out_of_zone refunds the GRAIL candidate budget.
-    batcher._proof_grading_attempts = MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+    # Exhaustion is gated on the never-refunded grading-starts backstop:
+    # non-productive rejects refund the productive admission budget, so only
+    # the ceiling nothing gives back means "cannot fill later".
+    batcher._proof_grading_attempts = MAX_GRADING_STARTS_PER_WINDOW
     assert batcher.valid_count == 0
     assert svc.server.submit_queue_depth == 0
     assert svc.server.proof_verification_inflight == 0
@@ -631,13 +632,13 @@ async def test_wait_for_window_seal_force_seals_drained_proof_cap():
 
 
 def test_proof_cap_breaker_waits_for_inflight_or_queued_work():
-    from reliquary.validator.service import MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+    from reliquary.validator.service import MAX_GRADING_STARTS_PER_WINDOW
 
     svc = _make_service()
     svc._open_window()
     svc._activate_window()
     batcher = svc._active_batcher
-    batcher._proof_grading_attempts = MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+    batcher._proof_grading_attempts = MAX_GRADING_STARTS_PER_WINDOW
 
     svc.server._inflight_proofs = 1
     assert svc._proof_admission_exhausted_and_drained(batcher) is False
@@ -799,7 +800,7 @@ async def test_auction_freeze_never_waits_for_inflight_after_snapshot(monkeypatc
 
 def test_proof_cap_breaker_uses_distinct_prompt_count():
     """Raw valid duplicates should not mask an unfillable trainable shortfall."""
-    from reliquary.validator.service import MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+    from reliquary.validator.service import MAX_GRADING_STARTS_PER_WINDOW
 
     svc = _make_service()
     svc._open_window()
@@ -811,7 +812,7 @@ def test_proof_cap_breaker_uses_distinct_prompt_count():
         SimpleNamespace(prompt_idx=i) for i in range(B_BATCH - 1)
     ] + [SimpleNamespace(prompt_idx=0)]
     batcher.pending_count = B_BATCH
-    batcher._proof_grading_attempts = MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+    batcher._proof_grading_attempts = MAX_GRADING_STARTS_PER_WINDOW
 
     assert batcher.distinct_pending_prompt_count() == B_BATCH - 1
     assert svc._proof_admission_exhausted_and_drained(batcher) is True

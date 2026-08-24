@@ -353,6 +353,16 @@ VALIDATOR_HTTP_PORT = 8888
 # forged commitments before any GPU authentication runs.
 MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW = 64
 
+# The ceiling above bounds PRODUCTIVE admission: a submission that never
+# reached the grader (protocol conformance) or whose reward simply landed
+# outside the difficulty band is refunded, so one miner's always-invalid
+# flood cannot hold receipts the rest of the fleet needs to fill the window.
+# Refunding alone would leave grading work bounded only by the per-hotkey
+# quota times the fleet size, so this second, never-refunded ceiling caps the
+# total grading starts a window can be made to run. Deliberately well above
+# the productive budget: it is a denial-of-service backstop, not a slot budget.
+MAX_GRADING_STARTS_PER_WINDOW = 4 * MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+
 # Seal-time GRAIL work is serial and an adversarial ranked prefix may fail one
 # candidate after another. The attempt ceiling bounds cardinality; this second
 # bound limits elapsed GPU time. It is checked between groups, so one in-flight
