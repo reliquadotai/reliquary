@@ -788,3 +788,97 @@ def test_reload_without_snapshot_or_repo_refuses(tmp_path):
     with pytest.raises(RuntimeError, match="no source"):
         reload_proof_context(context, None, "rev-x")
     assert context["revision"] == "old-rev"
+
+
+def test_isolated_and_in_process_proofs_return_identical_results(tmp_path):
+    """The whole justification for the change: decisions must not move.
+
+    Same weights, same commit, same batch=1 — run the proof both ways and
+    compare every field the batcher's gates read. A drift here would show up
+    as accepted/rejected miners changing for no reason anyone could explain.
+    """
+    import dataclasses
+    import os
+
+    import torch
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    from reliquary.validator.proof_worker import (
+        ProofModelProxy,
+        ProofWorkerPool,
+        PROOF_CONTEXT_FACTORY,
+        PROOF_HANDLER,
+        remote_commitment_verifier,
+    )
+
+    config = AutoConfig.for_model(
+        "qwen3", vocab_size=256, hidden_size=64, intermediate_size=128,
+        num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+        max_position_embeddings=256, eos_token_id=2, tie_word_embeddings=True,
+    )
+    checkpoint = tmp_path / "tiny"
+    torch.manual_seed(1234)
+    AutoModelForCausalLM.from_config(config).to(torch.float32).eval().save_pretrained(
+        str(checkpoint)
+    )
+    config.save_pretrained(str(checkpoint))
+
+    tokens = [1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45]
+    commit = {
+        "tokens": tokens,
+        "commitments": [{"sketch": 0} for _ in tokens],
+        "rollout": {"prompt_length": 4, "completion_length": 8},
+    }
+    seed_u = [0.05 * i for i in range(8)]
+    randomness = "b" * 64
+
+    os.environ["GRAIL_ATTN_IMPL"] = "eager"
+    try:
+        # ---- isolated: the proof runs in a worker process
+        pool = ProofWorkerPool(
+            devices=("cpu",),
+            context_factory=PROOF_CONTEXT_FACTORY,
+            handler=PROOF_HANDLER,
+            factory_kwargs={"checkpoint": str(checkpoint), "load_kwargs": {}},
+            request_timeout_seconds=300.0,
+        )
+        pool.start()
+        try:
+            isolated = remote_commitment_verifier(pool)(
+                commit, ProofModelProxy(device_id="cpu"), randomness,
+                seed_u_values=seed_u,
+            )
+        finally:
+            pool.close()
+
+        # ---- in-process: the path production uses today
+        from reliquary.shared import modeling
+        from reliquary.validator.verifier import verify_commitment_proofs
+
+        # bfloat16 like build_proof_context: production loads both replicas
+        # the same way, and a dtype split alone moves p_stop by ~0.2%.
+        model = modeling.load_text_generation_model(
+            str(checkpoint), torch_dtype=torch.bfloat16,
+            attn_implementation="eager",
+        ).eval()
+        # Same tokenizer on both sides: production loads it from the same
+        # checkpoint in both processes, and a divergence there would move
+        # p_stop and every termination verdict with it.
+        tokenizer = modeling.load_tokenizer(str(checkpoint))
+        with torch.no_grad():
+            in_process = verify_commitment_proofs(
+                commit, model, randomness, tokenizer=tokenizer,
+                seed_u_values=seed_u,
+            )
+    finally:
+        os.environ.pop("GRAIL_ATTN_IMPL", None)
+
+    compared = 0
+    for f in dataclasses.fields(isolated):
+        if f.name == "logits":          # never populated in production
+            continue
+        left, right = getattr(isolated, f.name), getattr(in_process, f.name)
+        assert left == right, f"{f.name}: isolated={left!r} in_process={right!r}"
+        compared += 1
+    assert compared >= 20, f"only compared {compared} fields"
+    assert isolated.has_sparse_outputs and isolated.checked == len(tokens)
