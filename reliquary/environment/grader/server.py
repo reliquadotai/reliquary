@@ -26,6 +26,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -65,6 +66,46 @@ def runsc_worker_argv(bundle: str) -> list[str]:
     """
     return ["runsc", "--network=none", "--ignore-cgroups", "run",
             "--bundle", bundle, GRADER_CONTAINER_ID_PLACEHOLDER]
+
+
+# How many requests one warm worker serves before it is recycled.
+GRADER_WORKER_RECYCLE_AFTER_EVALS = 64
+
+# Wall-clock cushion added to a request's ``timeout_s`` before the server gives
+# up on the worker's reply and respawns it. This — not the sandbox's
+# ``RLIMIT_CPU`` — is the per-request bound.
+GRADER_EVAL_WALL_CUSHION_SECONDS = 2.0
+
+# Bytes of a dead worker's stderr kept for the death log.
+GRADER_WORKER_STDERR_TAIL_BYTES = 4096
+
+
+def worker_lifetime_cpu_budget_seconds(
+    recycle_after_evals: int = GRADER_WORKER_RECYCLE_AFTER_EVALS,
+    eval_timeout_s: float = GRADER_EVAL_TIMEOUT_SECONDS,
+) -> float:
+    """CPU seconds one worker may legitimately burn before it is recycled.
+
+    ``RLIMIT_CPU`` is per-process and CUMULATIVE, so the sandbox bundle must
+    cover a whole worker lifetime, not one request. Sizing it per-request
+    SIGKILLs healthy workers partway through their eval budget and charges the
+    death to whichever miner's case happened to be running.
+    """
+    return recycle_after_evals * (
+        eval_timeout_s + GRADER_EVAL_WALL_CUSHION_SECONDS
+    )
+
+
+def _exit_label(returncode: int | None) -> str:
+    """Prometheus-safe label for how a worker process ended."""
+    if returncode is None:
+        return "running"
+    if returncode < 0:
+        try:
+            return signal.Signals(-returncode).name
+        except ValueError:
+            return f"signal{-returncode}"
+    return f"exit{returncode}"
 
 
 class _MetricsRegistry:
@@ -119,6 +160,8 @@ class Worker:
     reaped: bool = False
     termination_recorded: bool = False
     eval_count: int = 0
+    stderr_file: Any = None
+    stderr_tail: str = ""
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -131,7 +174,7 @@ class GraderServer:
         pool_size: int = GRADER_POOL_SIZE,
         worker_argv: Optional[list[str]] = None,
         eval_timeout_s: float = GRADER_EVAL_TIMEOUT_SECONDS,
-        recycle_after_evals: int = 64,
+        recycle_after_evals: int = GRADER_WORKER_RECYCLE_AFTER_EVALS,
         metrics_port: int = 9876,
         health_path: str = DEFAULT_GRADER_HEALTH_PATH,
         health_heartbeat_s: float = GRADER_HEALTH_HEARTBEAT_SECONDS,
@@ -371,15 +414,26 @@ class GraderServer:
 
     def _spawn_worker(self, slot: int) -> Worker:
         container_id = self._next_container_id_for_slot(slot) if self._uses_runsc else None
+        # Keep stderr: it carries the interpreter-level cause of a death
+        # (fault handler traceback, allocator abort, sandbox error). A file
+        # rather than a pipe — nothing drains a pipe until the worker dies and
+        # a full pipe would wedge it. Unnamed, so an ungraceful kill of this
+        # process (OOM) cannot strand a pool's worth of files in /tmp.
+        stderr_file = tempfile.TemporaryFile(prefix=f"grader-worker-{slot}-")
         proc = subprocess.Popen(
             self._worker_argv_for_container(container_id),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=stderr_file,
             text=True,
             bufsize=1,
         )
-        w = Worker(proc=proc, slot=slot, container_id=container_id)
+        w = Worker(
+            proc=proc,
+            slot=slot,
+            container_id=container_id,
+            stderr_file=stderr_file,
+        )
         # Insert or replace at slot.
         with self._workers_lock:
             while len(self._workers) <= slot:
@@ -542,7 +596,9 @@ class GraderServer:
 
     def _evaluate_on_worker(self, w: Worker, req: dict) -> dict:
         timeout_s = float(req.get("timeout_s", self.eval_timeout_s))
-        deadline = time.time() + timeout_s + 2.0  # outer wall-clock cushion
+        # The per-request bound. RLIMIT_CPU in the sandbox bundle is a
+        # per-lifetime backstop and must never be the binding constraint.
+        deadline = time.time() + timeout_s + GRADER_EVAL_WALL_CUSHION_SECONDS
 
         try:
             assert w.proc.stdin is not None and w.proc.stdout is not None
@@ -628,6 +684,26 @@ class GraderServer:
             daemon=True,
         ).start()
 
+    def _drain_worker_stderr(self, w: Worker) -> str:
+        """Read and release a worker's stderr, keeping only the tail."""
+        handle = w.stderr_file
+        w.stderr_file = None
+        tail = ""
+        if handle is not None:
+            try:
+                size = handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, size - GRADER_WORKER_STDERR_TAIL_BYTES))
+                tail = handle.read().decode("utf-8", "replace").strip()
+            except Exception:
+                pass
+            finally:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+        w.stderr_tail = tail
+        return tail
+
     def _terminate_worker(self, w: Worker, *, delete_container: bool = True) -> None:
         with w.lock:
             first_termination = not w.termination_recorded
@@ -663,14 +739,26 @@ class GraderServer:
                 self._worker_reaped_total += 1
             elif not reaped and first_termination:
                 self._worker_reap_failures_total += 1
+        self._drain_worker_stderr(w)
         if delete_container:
             self._delete_container(w.container_id)
         self._publish_health()
 
     def _respawn(self, w: Worker, reason: str = "death") -> None:
         old_container_id = w.container_id
+        # Read the exit status BEFORE terminating: _terminate_worker kills a
+        # still-running worker, which would overwrite how it originally ended.
+        exit_label = _exit_label(w.proc.poll())
         self._terminate_worker(w, delete_container=False)
-        self._metrics.inc("grader_worker_restarts_total", {"reason": reason})
+        if reason != "recycle":
+            logger.warning(
+                "grader: worker slot=%d ended reason=%s exit=%s stderr=%s",
+                w.slot, reason, exit_label, w.stderr_tail or "<empty>",
+            )
+        self._metrics.inc(
+            "grader_worker_restarts_total",
+            {"reason": reason, "exit": exit_label},
+        )
         with self._lifecycle_lock:
             self._worker_restarts[reason] += 1
             if reason == "recycle":

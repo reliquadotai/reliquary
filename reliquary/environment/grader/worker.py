@@ -11,12 +11,19 @@ from __future__ import annotations
 import ast
 import builtins
 import contextlib
+import faulthandler
 import inspect
 import io
 import json
 import math
 import sys
 from typing import Any
+
+# Armed before anything redirects sys.stderr, so a hard death (SIGSEGV,
+# SIGABRT) still writes a Python traceback to the real fd 2, which the server
+# keeps and reports. Without it such a worker dies silently and the crash is
+# unattributable.
+faulthandler.enable()
 
 
 _CRITICAL_BUILTINS = {

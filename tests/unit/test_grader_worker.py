@@ -271,3 +271,25 @@ def f(): return 1
     )
     assert status == "forbidden_import"
     assert output is None
+
+
+def test_worker_arms_faulthandler_for_fatal_signals():
+    """A worker killed by SIGSEGV/SIGABRT leaves no Python-level evidence
+    unless faulthandler is armed at import. That traceback on stderr is the
+    only way to attribute a hard sandbox death to the code that caused it."""
+    import subprocess
+    import sys
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import reliquary.environment.grader.worker;"
+            " import faulthandler; print(faulthandler.is_enabled())",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert proc.stdout.strip() == "True", proc.stderr
