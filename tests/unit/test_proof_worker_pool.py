@@ -350,7 +350,6 @@ def test_build_proof_context_loads_the_replica_exactly_as_the_validator_did(monk
     context = build_proof_context(
         checkpoint="ReliquaryForge/some-checkpoint",
         device="cuda:0",
-        revision="rev-9",
         load_kwargs={"revision": "pinned-rev"},
     )
 
@@ -362,8 +361,10 @@ def test_build_proof_context_loads_the_replica_exactly_as_the_validator_did(monk
     assert context["model"].evaled is True
     assert context["model"]._param.requires_grad is False
     assert context["tokenizer"] == "tokenizer::ReliquaryForge/some-checkpoint"
-    assert context["revision"] == "rev-9"
     assert context["device"] == "cuda:0"
+    # The bootstrap replica is certified by nothing: the resumed snapshot has
+    # not been installed yet, and the sync must be forced to install it.
+    assert context["revision"] is None
 
 
 def test_pool_tracks_the_revision_each_worker_holds():
@@ -374,10 +375,10 @@ def test_pool_tracks_the_revision_each_worker_holds():
     """
     pool = ProofWorkerPool(
         devices=("cuda:0",),
-        context_factory=f"{SUPPORT}:build_counter_context",
+        context_factory=f"{SUPPORT}:build_context_installing",
         handler=f"{SUPPORT}:echo_handler",
         reload_handler=f"{SUPPORT}:reload_handler",
-        initial_revision="rev-boot",
+        factory_kwargs={"revision": "rev-boot"},
     )
     pool.start()
     try:
@@ -396,10 +397,10 @@ def test_a_respawned_worker_reports_the_revision_it_was_rebuilt_with():
     """
     pool = ProofWorkerPool(
         devices=("cuda:0",),
-        context_factory=f"{SUPPORT}:build_counter_context",
+        context_factory=f"{SUPPORT}:build_context_installing_dispatch",
         handler=f"{SUPPORT}:dispatch_handler",
         reload_handler=f"{SUPPORT}:reload_handler",
-        initial_revision="rev-boot",
+        factory_kwargs={"revision": "rev-boot"},
     )
     pool.start()
     try:
@@ -472,7 +473,6 @@ def test_isolated_plane_hands_the_validator_one_proxy_per_device():
         devices=("cuda:0", "cuda:1"),
         checkpoint="ReliquaryForge/whatever",
         load_kwargs={"revision": "pinned"},
-        revision="rev-boot",
         reference_model=reference,
     )
 
@@ -543,9 +543,7 @@ def test_real_worker_loads_a_model_and_proves_across_the_process_boundary(tmp_pa
         context_factory=PROOF_CONTEXT_FACTORY,
         handler=PROOF_HANDLER,
         reload_handler=PROOF_RELOAD_HANDLER,
-        factory_kwargs={"checkpoint": str(checkpoint), "revision": "tiny-rev",
-                        "load_kwargs": {}},
-        initial_revision="tiny-rev",
+        factory_kwargs={"checkpoint": str(checkpoint), "load_kwargs": {}},
         request_timeout_seconds=300.0,
     )
     pool.start()
@@ -579,3 +577,167 @@ def test_real_worker_loads_a_model_and_proves_across_the_process_boundary(tmp_pa
     assert len(result.completion_chosen_probs) > 0
     assert all(0.0 <= p <= 1.0 for p in result.completion_chosen_probs)
     assert result.p_stop is not None
+
+
+def test_pool_learns_the_revision_from_the_worker_not_from_the_caller():
+    """The parent must never assert weights on the worker's behalf.
+
+    Production bootstraps the worker from the base model while the caller
+    holds the resumed checkpoint's sha. Seeding the pool with the caller's
+    sha made `_synchronize_proof_workers` find a match, skip the reload and
+    mark the device ready — so every GRAIL proof ran against base weights and
+    every honest miner was rejected. The revision has to travel back from the
+    worker, which is the only party that knows what it loaded.
+    """
+    installed = ProofWorkerPool(
+        devices=("cuda:0",),
+        context_factory=f"{SUPPORT}:build_context_installing",
+        handler=f"{SUPPORT}:echo_handler",
+        factory_kwargs={"revision": "installed-by-the-worker"},
+    )
+    installed.start()
+    try:
+        assert installed.revision("cuda:0") == "installed-by-the-worker"
+    finally:
+        installed.close()
+
+    nothing = ProofWorkerPool(
+        devices=("cuda:0",),
+        context_factory=f"{SUPPORT}:build_context_installing",
+        handler=f"{SUPPORT}:echo_handler",
+    )
+    nothing.start()
+    try:
+        assert nothing.revision("cuda:0") is None, (
+            "a worker that installed no checkpoint must not be marked certified"
+        )
+    finally:
+        nothing.close()
+
+
+def test_concurrent_calls_on_one_device_do_not_interleave():
+    """Device-less proof paths all route to the first device.
+
+    `_default_proof_proxy` sends the forensic sample and the legacy
+    non-auction admission to the same worker, and those run on concurrent
+    HTTP threads. Two unserialized send/recv pairs on one pipe interleave
+    pickle frames — at best the child dies, at worst one miner receives
+    another miner's ProofResult.
+    """
+    import threading
+
+    pool = _pool()
+    pool.start()
+    results, errors = {}, []
+
+    def hammer(tag):
+        try:
+            for _ in range(15):
+                got = pool.call("cuda:0", tag)
+                if got["payload"] != tag:
+                    errors.append(f"{tag} received {got['payload']!r}")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{tag}: {type(exc).__name__}: {exc}")
+        results[tag] = True
+
+    threads = [threading.Thread(target=hammer, args=(f"caller-{i}",)) for i in range(4)]
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+    finally:
+        pool.close()
+
+    assert not errors, errors
+    assert len(results) == 4
+
+
+def test_worker_errors_keep_their_original_class_name():
+    """`batcher.py` keys its CUDA-OOM recovery on the exception CLASS name.
+
+    Collapsing everything into ProofWorkerUnavailable silently disables the
+    gc.collect() / empty_cache() branch, and the fragmented allocator state
+    now lives in a child the parent cannot clean up either.
+    """
+    pool = ProofWorkerPool(
+        devices=("cuda:0",),
+        context_factory=f"{SUPPORT}:build_counter_context",
+        handler=f"{SUPPORT}:boom_handler",
+    )
+    pool.start()
+    try:
+        with pytest.raises(ProofWorkerUnavailable) as excinfo:
+            pool.call("cuda:0", "candidate-7")
+    finally:
+        pool.close()
+
+    assert excinfo.value.remote_error_type == "ValueError"
+    assert "handler refused" in str(excinfo.value)
+
+
+def test_proof_error_type_prefers_the_childs_class_over_the_wrapper():
+    """What the forensic sampler records and branches on.
+
+    An OOM raised inside the worker must still be recorded as
+    "OutOfMemoryError", not as the transport's wrapper type, or the
+    allocator-cleanup branch never runs.
+    """
+    from reliquary.validator.proof_worker import (
+        ProofWorkerUnavailable,
+        proof_error_type,
+    )
+
+    wrapped = ProofWorkerUnavailable(
+        "proof worker cuda:0 failed", remote_error_type="OutOfMemoryError",
+    )
+    assert proof_error_type(wrapped) == "OutOfMemoryError"
+    assert proof_error_type(ProofWorkerUnavailable("no remote type")) == (
+        "ProofWorkerUnavailable"
+    )
+    assert proof_error_type(ValueError("local")) == "ValueError"
+
+
+def test_reload_gets_its_own_longer_deadline():
+    """An 8 GB safetensors load is slower than a proof by design.
+
+    Running it under the proof request timeout kills a healthy worker
+    mid-reload, and `_swap_staged_checkpoint` then rmtree's the staged
+    directory while verify_model has already advanced — recoverable only by
+    a restart and a burned window.
+    """
+    pool = ProofWorkerPool(
+        devices=("cuda:0",),
+        context_factory=f"{SUPPORT}:build_counter_context",
+        handler=f"{SUPPORT}:dispatch_handler",
+        reload_handler=f"{SUPPORT}:slow_reload_handler",
+        request_timeout_seconds=0.5,
+        reload_timeout_seconds=20.0,
+    )
+    pool.start()
+    try:
+        # Slower than the proof timeout, well inside the reload one.
+        pool.reload("cuda:0", "2.0", "rev-slow")
+        assert pool.revision("cuda:0") == "rev-slow"
+        # The proof timeout still applies to proofs.
+        with pytest.raises(ProofWorkerUnavailable, match="timed out"):
+            pool.call("cuda:0", "sleep", 5.0)
+    finally:
+        pool.close()
+
+
+def test_a_worker_that_dies_while_building_raises_the_documented_error():
+    """A child that OOMs or hits a bad snapshot dies during its factory.
+
+    The handshake `recv()` then raises a raw EOFError — not the
+    ProofWorkerUnavailable every caller and the class docstring promise —
+    and the half-created worker is never retired.
+    """
+    pool = ProofWorkerPool(
+        devices=("cuda:0",),
+        context_factory=f"{SUPPORT}:build_context_that_dies",
+        handler=f"{SUPPORT}:echo_handler",
+    )
+    with pytest.raises(ProofWorkerUnavailable, match="cuda:0"):
+        pool.start()
+    pool.close()

@@ -1364,6 +1364,12 @@ FORCED_SEED_PROTOCOL_VERSION = PROTOCOL_VERSION
 # crash-looping the weight-setter on the runtime-fingerprint check. Fail-closed
 # by default. NEVER assert this for a change that could slow proofs down —
 # re-run the capacity benchmark instead.
+PROOF_CAPACITY_ACCEPT_FASTER_RUNTIME = (
+    _os.environ.get("RELIQUARY_PROOF_CAPACITY_ACCEPT_FASTER_RUNTIME", "0")
+    not in ("0", "false", "False")
+)
+
+
 # Run the GRAIL proof plane in a dedicated process, one per proof device.
 #
 # The proof thread releases and re-acquires the GIL on every CUDA op — hundreds
@@ -1406,9 +1412,3 @@ if PROOF_WORKER_RELOAD_TIMEOUT_SECONDS <= 0:
     raise ValueError(
         "RELIQUARY_PROOF_WORKER_RELOAD_TIMEOUT_SECONDS must be positive"
     )
-
-
-PROOF_CAPACITY_ACCEPT_FASTER_RUNTIME = (
-    _os.environ.get("RELIQUARY_PROOF_CAPACITY_ACCEPT_FASTER_RUNTIME", "0")
-    not in ("0", "false", "False")
-)

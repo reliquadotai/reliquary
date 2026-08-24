@@ -4807,7 +4807,12 @@ class GrpoWindowBatcher:
                 # exhausted GPU must not discard already-proven winners or
                 # prevent the window from reaching training.
                 passed = None
-                error_type = type(exc).__name__
+                # With an isolated proof plane the real failure happened in
+                # the worker; the transport wrapper's own type would hide a
+                # CUDA OOM from the cleanup branch below.
+                from reliquary.validator.proof_worker import proof_error_type
+
+                error_type = proof_error_type(exc)
                 self.forensic_proof_errors_by_type[error_type] = (
                     self.forensic_proof_errors_by_type.get(error_type, 0) + 1
                 )
