@@ -61,6 +61,18 @@ span on one side alone rejects honest miners as dishonest. The gate keeps the
 new rule inert until the profile flips, which makes the deploy two-phase: ship
 the code everywhere, then switch the profile.
 
+> **Coordination with PR #198 (checkpoint-epoch scheduling).** The two-phase
+> deploy above is the standalone path, and it has a real weakness: between
+> shipping the code and flipping the profile there is a window where miners and
+> validator can disagree about which profile is active. #198 introduces an epoch
+> manifest whose `protocol` block carries exactly
+> `{profile_id, protocol_version, generation_contract_sha256}` — the same triplet
+> a v6 fork changes — alongside `activation_not_before_round`. If that lands,
+> **activate v6 through the manifest rather than by flipping an env var**: the
+> cutover becomes atomic at an agreed round instead of a redeploy race. This
+> change does not depend on #198 and does not block it; only the activation
+> mechanism below would be superseded.
+
 The Code prompt loses its position clause, which only ever existed to
 compensate `matches[-1]`:
 
