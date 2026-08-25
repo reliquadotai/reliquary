@@ -37,20 +37,75 @@ _FENCE_RE = re.compile(
 )
 
 
-def _extract_python(completion: str) -> str:
+def _entry_function_name(cases: list[dict]) -> str | None:
+    """The contract's graded entry function, or None when it isn't a function.
+
+    Same source as ``_contract_instruction``: the cases carry the exact name the
+    grader will call, so the extractor can pin the graded block to a definition
+    rather than to a position. Method entries define no top-level ``def``, so
+    they pin nothing.
+    """
+    for case in cases or ():
+        entry = case.get("entry") or {}
+        name = entry.get("name")
+        if entry.get("kind") == "function" and name:
+            return str(name)
+    return None
+
+
+def _extract_python(completion: str, entry_name: str | None = None) -> str:
     """Extract Python code from a model completion.
 
     Strategy: find all fenced code blocks (``` or ~~~ with optional
-    'python' tag), return the last one's contents. Falls back to the
-    raw completion string if no fence is present — exec will reject
-    obviously-non-code, scoring zero.
+    'python' tag). From protocol v5 on, return the last block that *defines*
+    ``entry_name``; otherwise return the last block.
+
+    With no fence at all, v2-v4 return the raw completion and let exec reject
+    obviously-non-code; from v5 the fenced block is the only answer channel, so
+    nothing is graded. That fallback fired 762 times across 30 768 production
+    rollouts without ever producing a positive reward — a rollout holding code
+    always fences it — so it only ever ran ``exec`` on reasoning prose.
+
+    Why the definition beats the position: "last block wins" assumed the
+    model closes with its final implementation, which held for the v2-v4 chat
+    model. Under the v5 reasoning prompt the model routinely closes with a usage
+    demo, an expected-output listing, or a test block — 13.1% of code rollouts
+    at the v5 cutover — and grading that span scores a correct answer zero.
+    Because the group-relative advantage is what trains the policy, those zeros
+    read as "never open a second block", which the model generalised into "never
+    reason".
+
+    The gate stops at v5 so v2-v4 stay byte-exact as historical controls: their
+    archived runs must stay reproducible. That is the ONLY thing it guards.
+
+    Changing the graded span is not wire-affecting for Code. This environment
+    sets ``validator_authoritative_reward = True``, so the validator overwrites
+    the miner's declared reward instead of comparing it (admission.py sets
+    ``authoritative = True`` for opencodeinstruct; the 1e-6 ``reward_mismatch``
+    branch is never reached). A miner on older code is not rejected — it merely
+    pre-filters its own submissions against a stale local reward, so it may skip
+    groups the validator would have paid. Math keeps the strict comparison, and
+    is untouched by this function.
     """
     if not completion:
         return ""
+    from reliquary.constants import PROTOCOL_VERSION
+
+    entry_rule = PROTOCOL_VERSION >= 5
     matches = _FENCE_RE.findall(completion)
-    if matches:
-        return matches[-1][1]
-    return completion
+    if not matches:
+        # From v5 the fenced block is the single answer channel. The raw
+        # fallback fired 762 times across 30 768 production rollouts and never
+        # produced a positive reward — a rollout holding code always fences it,
+        # so the fallback only ever ran `exec` on reasoning prose. Those zeros
+        # were deserved and stay zeros; executing prose as Python does not.
+        return "" if entry_rule else completion
+    if entry_name and entry_rule:
+        needle = f"def {entry_name}"
+        for _fence, body in reversed(matches):
+            if needle in body:
+                return body
+    return matches[-1][1]
 
 
 def _load_dataset(repo: str, revision: str):
@@ -175,7 +230,7 @@ class OpenCodeInstructEnvironment:
         cases = self._cases_by_id.get(case_id)
         if not cases:
             return 0.0
-        code = _extract_python(completion or "")
+        code = _extract_python(completion or "", entry_name=_entry_function_name(cases))
         return self._grader.evaluate_cases(code, cases, timeout_s=GRADER_EVAL_TIMEOUT_SECONDS)
 
     def admission_reward_cases(self, problem: dict) -> list[dict]:
