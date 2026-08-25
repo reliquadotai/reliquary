@@ -118,6 +118,32 @@ def test_an_accidental_duplicate_device_is_still_refused():
         resolve_cuda_proof_devices(("cuda:0", "cuda:0"), cuda=_FakeCuda())
 
 
+def test_slots_with_no_proof_device_are_flagged(caplog):
+    """isolation on + slots > 1 + no resolved device = the slots are dropped.
+
+    A protocol profile below v3 resolves no proof device at all, so
+    ``expand_proof_slots((), 4)`` is empty, no plane is built, and the
+    operator's RELIQUARY_PROOF_SLOTS_PER_DEVICE is discarded in silence. Say
+    so rather than let the box run at one process while the config claims four.
+    """
+    import logging
+
+    from reliquary.validator.proof_worker import assert_proof_slots_supported
+
+    with caplog.at_level(logging.WARNING):
+        assert_proof_slots_supported(
+            slots_per_device=4, isolation=True, proof_devices=(),
+        )
+    assert "no proof device" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        assert_proof_slots_supported(
+            slots_per_device=4, isolation=True, proof_devices=("cuda:0",),
+        )
+    assert caplog.text == ""
+
+
 def test_extra_slots_require_an_isolated_plane():
     """Slots only buy anything as separate interpreters.
 
@@ -207,6 +233,81 @@ def test_hub_reload_frees_the_old_replica_before_the_new_one_lands(monkeypatch):
         "the old replica was still on the card when the new one landed"
     )
     assert context["revision"] == "a" * 40
+
+
+def test_reload_rebuilds_a_slot_whose_replica_was_dropped(tmp_path, monkeypatch):
+    """A hub install that fails after releasing the old replica leaves the slot
+    with no model. The next staged-snapshot reload takes the in-place branch,
+    so it must rebuild rather than die on ``None.load_state_dict`` — otherwise
+    every later swap fails, ``_swap_staged_checkpoint`` rmtree's the staged dir
+    and the revision never advances.
+    """
+    import torch
+    from safetensors.torch import save_file
+
+    import reliquary.shared.modeling as modeling
+    from reliquary.validator import proof_worker
+
+    save_file({"w": torch.zeros(2)}, str(tmp_path / "model.safetensors"))
+
+    class _Replica:
+        def to(self, device):
+            return self
+
+        def eval(self):
+            return self
+
+        def parameters(self):
+            return iter(())
+
+    monkeypatch.setattr(
+        modeling, "load_text_generation_model", lambda *a, **k: _Replica()
+    )
+    context: dict = {"model": None, "device": "cuda:0#1", "revision": None}
+    proof_worker.reload_proof_context(
+        context, str(tmp_path), "a" * 40, "owner/repo",
+    )
+
+    assert context["model"] is not None
+    assert context["revision"] == "a" * 40
+
+
+def test_close_retires_every_slot_even_if_the_map_moves(monkeypatch):
+    """``close`` must not be derailed by a concurrent slot mutation.
+
+    It iterated ``self._workers.values()`` unlocked. With the pool-wide spawn
+    lock that never mattered; with per-slot locks another dispatch thread can
+    insert or pop mid-iteration, and the resulting "dictionary changed size
+    during iteration" aborts the loop before the remaining slots are killed —
+    exactly in the ``force=True`` path, which runs when the scheduler failed
+    to quiesce and threads are still in flight.
+    """
+    from reliquary.validator.proof_worker import ProofWorkerPool
+
+    support = "tests.unit.proof_worker_support"
+    slots = expand_proof_slots(("cuda:0",), 3)
+    pool = ProofWorkerPool(
+        devices=slots,
+        context_factory=f"{support}:build_counter_context",
+        handler=f"{support}:echo_handler",
+    )
+    pool.start()
+    joined: list[str] = []
+    workers = dict(pool._workers)
+    for device_id, worker in workers.items():
+        original = worker.process.join
+
+        def _join(timeout=None, _d=device_id, _o=original):
+            joined.append(_d)
+            # Stand in for another dispatch thread respawning a sibling slot.
+            pool._workers[f"{_d}-late"] = worker
+            return _o(timeout)
+
+        monkeypatch.setattr(worker.process, "join", _join)
+
+    pool.close()
+
+    assert sorted(joined) == sorted(slots)
 
 
 def test_each_slot_of_one_gpu_gets_its_own_process():

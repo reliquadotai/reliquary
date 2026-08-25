@@ -181,3 +181,28 @@ def test_in_process_plane_still_refuses_a_device_with_no_replica():
     """Fail closed: a CPU-only replica cannot serve a cuda proof device."""
     with pytest.raises(RuntimeError, match="no model replica"):
         _service(nn.Linear(4, 4), proof_devices=("cuda:0",))
+
+
+def test_the_device_less_proof_path_spreads_across_slots():
+    """The forensic sample and legacy admission name no device.
+
+    They fall back to a single proxy, which with slots was always slot 0: those
+    proofs then serialise behind slot 0's scheduled work on the worker's pipe
+    lock while the other slots idle, inflating slot 0's active-job age — which
+    feeds the over-wall degradation signal and, at the plan deadline, the
+    active-proof timeout that faults the plane.
+    """
+    proxies = {
+        "cuda:0#0": ProofModelProxy(device_id="cuda:0#0"),
+        "cuda:0#1": ProofModelProxy(device_id="cuda:0#1"),
+    }
+    svc = _service(
+        nn.Linear(4, 4),
+        proof_devices=tuple(proxies),
+        proof_models=proxies,
+        proof_worker_pool=MagicMock(),
+    )
+
+    picked = [svc._default_proof_proxy().device_id for _ in range(4)]
+
+    assert picked == ["cuda:0#0", "cuda:0#1", "cuda:0#0", "cuda:0#1"]

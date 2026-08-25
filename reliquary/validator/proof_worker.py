@@ -17,10 +17,14 @@ the child, so nothing heavy is pickled across the boundary.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import gc
 import importlib
+import logging
 import multiprocessing
 import threading
 from typing import Any, Callable, Mapping, MutableMapping, Sequence
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "ProofModelProxy",
@@ -384,7 +388,13 @@ class ProofWorkerPool:
         still be mid-request, writing into its pipe corrupts the exchange it
         is reading. Kill the child instead and let the caller fail loudly.
         """
-        for worker in self._workers.values():
+        # Snapshot first: with per-slot spawn locks another dispatch thread can
+        # insert or pop while this runs, and iterating the live map would abort
+        # here and leave the remaining slots alive.
+        with self._spawn_lock:
+            workers = list(self._workers.values())
+            self._workers.clear()
+        for worker in workers:
             if not force:
                 try:
                     worker.connection.send(("shutdown", (), {}))
@@ -469,7 +479,19 @@ def reload_proof_context(
         _install_from_hub(context, repo_id, checkpoint_revision)
         return
 
-    model = context["model"]
+    model = context.get("model")
+    if model is None:
+        # A hub install that failed after releasing the old replica leaves the
+        # slot empty. The in-place path has nothing to load into, so rebuild
+        # rather than fail every swap from here on.
+        if not repo_id:
+            raise RuntimeError(
+                "proof worker holds no replica and no repo_id is available "
+                f"to rebuild it for {checkpoint_revision!r}"
+            )
+        _install_from_hub(context, repo_id, checkpoint_revision)
+        return
+
     tied = set(getattr(model, "_tied_weights_keys", None) or [])
     result = model.load_state_dict(state, strict=False)
     unexpected = list(getattr(result, "unexpected_keys", []) or [])
@@ -513,11 +535,15 @@ def _install_from_hub(
         revision=checkpoint_revision,
     )
     device = context.get("device")
-    # A failed move leaves no model, so the next proof raises and the worker is
-    # retired and respawned — the same fail-closed path a dead worker takes,
-    # and better than an OOM that takes every other slot down with it.
+    # A failed move leaves the slot with no model: the next proof raises
+    # ProofWorkerUnavailable, the scheduler capacity-aborts, and the following
+    # reload rebuilds through this same function (see the None guard in
+    # reload_proof_context). Better than an OOM that takes the other slots too.
+    # gc.collect first: a reference cycle in the module graph would defer the
+    # free past empty_cache and leave the old 10.2 GB resident under the move.
     context["model"] = None
     context["revision"] = None
+    gc.collect()
     if getattr(torch, "cuda", None) is not None and torch.cuda.is_available():
         torch.cuda.empty_cache()
     if device is not None and hasattr(model, "to"):
@@ -625,21 +651,35 @@ def build_isolated_proof_plane(
 
 
 def assert_proof_slots_supported(
-    *, slots_per_device: int, isolation: bool,
+    *,
+    slots_per_device: int,
+    isolation: bool,
+    proof_devices: Sequence[str] = (),
 ) -> None:
-    """Extra slots only mean anything as separate interpreters.
+    """Extra slots only mean anything as separate interpreters on real cards.
 
     In-process they would be threads of the validator's own interpreter, i.e.
     the GIL convoy the isolated plane exists to escape (the same forward
     measured 28.7 ms alone and 29.6 s against one CPU-bound python thread).
     Refuse the combination instead of serving the convoy under a name that
     promises parallelism.
+
+    With no card resolved there is no plane at all and the slot count is simply
+    dropped — a warning, not a refusal, because a protocol profile below v3
+    legitimately configures no proof device.
     """
     if int(slots_per_device) > 1 and not isolation:
         raise RuntimeError(
             "RELIQUARY_PROOF_SLOTS_PER_DEVICE > 1 requires "
             "RELIQUARY_PROOF_PROCESS_ISOLATION: in-process slots would share "
             "this interpreter's GIL, which is what isolation exists to avoid"
+        )
+    if int(slots_per_device) > 1 and not proof_devices:
+        logger.warning(
+            "RELIQUARY_PROOF_SLOTS_PER_DEVICE=%d ignored: no proof device is "
+            "configured, so no isolated plane is built and proving stays "
+            "in-process",
+            int(slots_per_device),
         )
 
 

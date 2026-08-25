@@ -657,6 +657,7 @@ class ValidationService:
         first_env_name = self.env_mix[0][0]
         self.env: Environment = self.envs[first_env_name]
         self._proof_models: dict[str, Any] = {}
+        self._default_proof_proxy_cursor = 0
         self._proof_worker_pool = proof_worker_pool
         # Directory the weights now in verify_model were read from. The
         # isolated proof workers reload from it, so it must track every
@@ -1023,12 +1024,18 @@ class ValidationService:
     def _default_proof_proxy(self) -> Any:
         """Proxy used when a proof path does not name a device.
 
-        Any configured device serves: these paths are single-shot and the
-        scheduler is not choosing between replicas for them.
+        Any configured slot serves — these paths are single-shot and the
+        scheduler is not choosing between replicas for them — but always
+        answering with the first would queue them behind slot 0's scheduled
+        work on its pipe lock while the other slots idle, inflating slot 0's
+        active-job age. Round-robin instead.
         """
-        for proxy in self._proof_models.values():
-            return proxy
-        raise RuntimeError("isolated proof plane has no device proxy")
+        proxies = list(self._proof_models.values())
+        if not proxies:
+            raise RuntimeError("isolated proof plane has no device proxy")
+        proxy = proxies[self._default_proof_proxy_cursor % len(proxies)]
+        self._default_proof_proxy_cursor += 1
+        return proxy
 
     def _synchronize_proof_workers(
         self,

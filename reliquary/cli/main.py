@@ -534,15 +534,16 @@ def validate(
                 isolation=PROOF_PROCESS_ISOLATION,
                 detached_trainer=DETACHED_TRAINER,
             )
-            assert_proof_slots_supported(
-                slots_per_device=PROOF_SLOTS_PER_DEVICE,
-                isolation=PROOF_PROCESS_ISOLATION,
-            )
             proof_device_identities = _configured_proof_device_identities(
                 torch
             )
             proof_devices = tuple(
                 identity.device_id for identity in proof_device_identities
+            )
+            assert_proof_slots_supported(
+                slots_per_device=PROOF_SLOTS_PER_DEVICE,
+                isolation=PROOF_PROCESS_ISOLATION,
+                proof_devices=proof_devices,
             )
             # Capacity is validated against the PHYSICAL devices below and must
             # stay that way — it is a claim about cards, not processes. Only
