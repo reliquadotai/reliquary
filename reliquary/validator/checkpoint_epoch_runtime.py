@@ -1,0 +1,379 @@
+"""Small durable runtime for checkpoint-epoch plans."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import hashlib
+import json
+import os
+from pathlib import Path
+from typing import Any, Mapping
+
+from reliquary.shared.checkpoint_epoch import (
+    BeaconBinding,
+    CheckpointBinding,
+    EpochPlan,
+    ProtocolBinding,
+    WindowSchedule,
+    build_epoch_plan,
+    canonical_json_bytes,
+    canonical_manifest_bytes,
+    parse_epoch_plan,
+)
+
+
+class EpochStoreError(RuntimeError):
+    pass
+
+
+class EpochEquivocationError(EpochStoreError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class EpochCommitIntent:
+    protocol: ProtocolBinding
+    checkpoint: CheckpointBinding
+    first_window: int
+    window_count: int
+    beacon_source: str
+    beacon_chain: str
+    beacon_chain_hash: str
+    beacon_target_round: int
+    warmup_rounds: int
+    window_schedule: WindowSchedule
+    prompt_range_size: int
+    environment_universes: tuple[tuple[str, int], ...]
+
+    @property
+    def intent_id(self) -> str:
+        return hashlib.sha256(canonical_intent_bytes(self)).hexdigest()
+
+
+def _intent_dict(intent: EpochCommitIntent) -> dict[str, Any]:
+    return {
+        "protocol": {
+            "profile_id": intent.protocol.profile_id,
+            "protocol_version": intent.protocol.protocol_version,
+            "generation_contract_sha256": (
+                intent.protocol.generation_contract_sha256
+            ),
+        },
+        "checkpoint": {
+            "number": intent.checkpoint.number,
+            "repo_id": intent.checkpoint.repo_id,
+            "revision": intent.checkpoint.revision,
+            "commit_observed_round": (
+                intent.checkpoint.commit_observed_round
+            ),
+        },
+        "first_window": intent.first_window,
+        "window_count": intent.window_count,
+        "beacon_target": {
+            "source": intent.beacon_source,
+            "chain": intent.beacon_chain,
+            "chain_hash": intent.beacon_chain_hash,
+            "round": intent.beacon_target_round,
+        },
+        "warmup_rounds": intent.warmup_rounds,
+        "window_schedule": {
+            "mode": intent.window_schedule.mode,
+            "collection_seconds": intent.window_schedule.collection_seconds,
+            "timeout_seconds": intent.window_schedule.timeout_seconds,
+        },
+        "prompt_range_size": intent.prompt_range_size,
+        "environment_universes": {
+            name: size for name, size in intent.environment_universes
+        },
+    }
+
+
+def canonical_intent_bytes(intent: EpochCommitIntent) -> bytes:
+    return canonical_json_bytes(_intent_dict(intent))
+
+
+def build_epoch_intent(
+    *,
+    protocol: ProtocolBinding,
+    checkpoint_number: int,
+    checkpoint_repo_id: str,
+    checkpoint_revision: str,
+    commit_observed_round: int,
+    first_window: int,
+    window_count: int,
+    beacon_chain: str,
+    beacon_chain_hash: str,
+    warmup_rounds: int,
+    window_schedule: WindowSchedule,
+    prompt_range_size: int,
+    environment_universes: Mapping[str, int],
+) -> EpochCommitIntent:
+    if isinstance(commit_observed_round, bool) or commit_observed_round < 1:
+        raise ValueError("commit_observed_round must be positive")
+    checkpoint = CheckpointBinding(
+        number=int(checkpoint_number),
+        repo_id=str(checkpoint_repo_id),
+        revision=str(checkpoint_revision),
+        commit_observed_round=int(commit_observed_round),
+    )
+    universes = tuple(
+        (str(name), int(environment_universes[name]))
+        for name in sorted(environment_universes)
+    )
+    if not universes or any(not name or size < 1 for name, size in universes):
+        raise ValueError("environment universes must be non-empty and positive")
+    intent = EpochCommitIntent(
+        protocol=protocol,
+        checkpoint=checkpoint,
+        first_window=int(first_window),
+        window_count=int(window_count),
+        beacon_source="drand",
+        beacon_chain=str(beacon_chain),
+        beacon_chain_hash=str(beacon_chain_hash),
+        beacon_target_round=int(commit_observed_round) + 1,
+        warmup_rounds=int(warmup_rounds),
+        window_schedule=window_schedule,
+        prompt_range_size=int(prompt_range_size),
+        environment_universes=universes,
+    )
+    if intent.first_window < 0 or intent.window_count < 1:
+        raise ValueError("invalid checkpoint epoch window range")
+    if intent.warmup_rounds < 1 or intent.prompt_range_size < 1:
+        raise ValueError("invalid checkpoint epoch warm-up or prompt range")
+    return intent
+
+
+def parse_epoch_intent(raw: bytes) -> EpochCommitIntent:
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid checkpoint epoch intent") from exc
+    if not isinstance(value, dict):
+        raise ValueError("checkpoint epoch intent must be an object")
+    if set(value) != {
+        "protocol",
+        "checkpoint",
+        "first_window",
+        "window_count",
+        "beacon_target",
+        "warmup_rounds",
+        "window_schedule",
+        "prompt_range_size",
+        "environment_universes",
+    }:
+        raise ValueError("checkpoint epoch intent keys differ")
+    protocol = value["protocol"]
+    checkpoint = value["checkpoint"]
+    beacon = value["beacon_target"]
+    schedule = value["window_schedule"]
+    universes = value["environment_universes"]
+    if not all(
+        isinstance(item, dict)
+        for item in (protocol, checkpoint, beacon, schedule, universes)
+    ):
+        raise ValueError("checkpoint epoch intent objects are malformed")
+    intent = EpochCommitIntent(
+        protocol=ProtocolBinding(**protocol),
+        checkpoint=CheckpointBinding(**checkpoint),
+        first_window=value["first_window"],
+        window_count=value["window_count"],
+        beacon_source=beacon["source"],
+        beacon_chain=beacon["chain"],
+        beacon_chain_hash=beacon["chain_hash"],
+        beacon_target_round=beacon["round"],
+        warmup_rounds=value["warmup_rounds"],
+        window_schedule=WindowSchedule(**schedule),
+        prompt_range_size=value["prompt_range_size"],
+        environment_universes=tuple(
+            (str(name), int(size)) for name, size in sorted(universes.items())
+        ),
+    )
+    if raw != canonical_intent_bytes(intent):
+        raise ValueError("checkpoint epoch intent is not canonical")
+    if intent.beacon_target_round != intent.checkpoint.commit_observed_round + 1:
+        raise ValueError("intent does not target the first post-commit beacon")
+    return intent
+
+
+def plan_from_intent(
+    intent: EpochCommitIntent,
+    *,
+    beacon: BeaconBinding,
+) -> EpochPlan:
+    if (
+        beacon.source != intent.beacon_source
+        or beacon.chain != intent.beacon_chain
+        or beacon.chain_hash != intent.beacon_chain_hash
+        or beacon.round != intent.beacon_target_round
+    ):
+        raise ValueError("beacon does not match checkpoint epoch intent")
+    return build_epoch_plan(
+        protocol=intent.protocol,
+        checkpoint=intent.checkpoint,
+        first_window=intent.first_window,
+        window_count=intent.window_count,
+        epoch_beacon=beacon,
+        beacon_delay_rounds=1,
+        warmup_rounds=intent.warmup_rounds,
+        window_schedule=intent.window_schedule,
+        prompt_range_size=intent.prompt_range_size,
+        environment_universes=dict(intent.environment_universes),
+    )
+
+
+class EpochStore:
+    """Create-only intent and manifest persistence with current pointers."""
+
+    def __init__(self, root: str | os.PathLike[str]) -> None:
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def install_intent(self, intent: EpochCommitIntent) -> bytes:
+        raw = canonical_intent_bytes(intent)
+        self._install_create_only(
+            self.root / f"intent-{intent.intent_id}.json",
+            raw,
+            "intent",
+        )
+        self._write_pointer("current-intent", intent.intent_id)
+        return raw
+
+    def load_current_intent(self) -> EpochCommitIntent | None:
+        identifier = self._read_pointer("current-intent")
+        if identifier is None:
+            return None
+        path = self.root / f"intent-{identifier}.json"
+        intent = parse_epoch_intent(path.read_bytes())
+        if intent.intent_id != identifier:
+            raise EpochStoreError("intent pointer/hash mismatch")
+        return intent
+
+    def confirm_before_beacon(
+        self,
+        intent: EpochCommitIntent,
+        *,
+        observed_round: int,
+    ) -> None:
+        if (
+            isinstance(observed_round, bool)
+            or observed_round < 1
+            or observed_round >= intent.beacon_target_round
+        ):
+            raise EpochStoreError(
+                "intent was not durably confirmed before beacon availability"
+            )
+        raw = canonical_json_bytes(
+            {
+                "intent_id": intent.intent_id,
+                "observed_round": int(observed_round),
+                "beacon_target_round": intent.beacon_target_round,
+            }
+        )
+        self._install_create_only(
+            self.root / f"confirmed-{intent.intent_id}.json",
+            raw,
+            "intent confirmation",
+        )
+
+    def is_confirmed(self, intent: EpochCommitIntent) -> bool:
+        path = self.root / f"confirmed-{intent.intent_id}.json"
+        if not path.exists():
+            return False
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            return (
+                value["intent_id"] == intent.intent_id
+                and value["beacon_target_round"] == intent.beacon_target_round
+                and 1 <= int(value["observed_round"])
+                < intent.beacon_target_round
+            )
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            return False
+
+    def install_plan(
+        self,
+        intent: EpochCommitIntent,
+        plan: EpochPlan,
+    ) -> bytes:
+        if not self.is_confirmed(intent):
+            raise EpochStoreError("checkpoint epoch intent is not confirmed")
+        if plan.epoch_beacon.round != intent.beacon_target_round:
+            raise EpochStoreError("plan does not match confirmed intent")
+        expected = plan_from_intent(intent, beacon=plan.epoch_beacon)
+        if plan != expected:
+            raise EpochStoreError("plan differs from confirmed intent")
+        raw = canonical_manifest_bytes(plan)
+        self._install_create_only(
+            self.root / f"plan-{plan.epoch_id}.json",
+            raw,
+            "manifest",
+        )
+        self._write_pointer("current-plan", plan.epoch_id)
+        return raw
+
+    def load_current_plan(self) -> EpochPlan | None:
+        identifier = self._read_pointer("current-plan")
+        if identifier is None:
+            return None
+        path = self.root / f"plan-{identifier}.json"
+        plan = parse_epoch_plan(path.read_bytes())
+        if plan.epoch_id != identifier:
+            raise EpochStoreError("plan pointer/epoch mismatch")
+        return plan
+
+    def _install_create_only(
+        self,
+        path: Path,
+        raw: bytes,
+        label: str,
+    ) -> None:
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            if path.read_bytes() != raw:
+                raise EpochEquivocationError(
+                    f"{label} already exists with different bytes"
+                )
+            return
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        self._fsync_directory()
+
+    def _write_pointer(self, name: str, identifier: str) -> None:
+        temporary = self.root / f".{name}.{os.getpid()}.tmp"
+        with temporary.open("w", encoding="ascii") as handle:
+            handle.write(identifier + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, self.root / name)
+        self._fsync_directory()
+
+    def _read_pointer(self, name: str) -> str | None:
+        path = self.root / name
+        if not path.exists():
+            return None
+        value = path.read_text(encoding="ascii").strip()
+        if len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+            raise EpochStoreError(f"invalid {name} pointer")
+        return value
+
+    def _fsync_directory(self) -> None:
+        descriptor = os.open(self.root, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
+__all__ = [
+    "EpochCommitIntent",
+    "EpochEquivocationError",
+    "EpochStore",
+    "EpochStoreError",
+    "build_epoch_intent",
+    "canonical_intent_bytes",
+    "parse_epoch_intent",
+    "plan_from_intent",
+]

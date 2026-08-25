@@ -338,6 +338,13 @@ class GrpoBatchState(BaseModel):
     protocol_version: int | None = Field(default=None, ge=0)
     generation_profile_id: str | None = Field(default=None, max_length=64)
     generation_contract: dict[str, Any] | None = None
+    # Present only while the disabled-by-default checkpoint-epoch capability
+    # has an active immutable manifest. Legacy responses omit both fields.
+    checkpoint_epoch_id: str | None = Field(default=None, max_length=128)
+    checkpoint_epoch_manifest_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     # v2.3: drand beacon randomness for this window. Empty string between
     # OPEN and the first successful _set_window_randomness; miners loop on
     # empty until populated. Miners derive GRAIL commitments off this

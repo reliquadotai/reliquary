@@ -568,6 +568,20 @@ if CHECKPOINT_PUBLISH_INTERVAL_WINDOWS <= 0:
         "RELIQUARY_CHECKPOINT_PUBLISH_INTERVAL_WINDOWS must be positive"
     )
 
+# Experimental checkpoint-epoch scheduling.  This capability deliberately
+# lives outside the canonical production profiles: enabling it changes when
+# generation randomness is revealed and needs a future coordinated profile.
+EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED = _os.environ.get(
+    "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED", "0"
+).lower() in {"1", "true", "yes", "on"}
+EXPERIMENTAL_CHECKPOINT_EPOCH_WARMUP_ROUNDS = int(_os.environ.get(
+    "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_WARMUP_ROUNDS", "20",
+))
+if EXPERIMENTAL_CHECKPOINT_EPOCH_WARMUP_ROUNDS <= 0:
+    raise ValueError(
+        "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_WARMUP_ROUNDS must be positive"
+    )
+
 # Default HF repo target for published checkpoints. Operator may
 # override via --hf-repo-id CLI arg. Must be a writable repo id for
 # the validator's HF token.
