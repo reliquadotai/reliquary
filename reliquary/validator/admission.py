@@ -131,6 +131,11 @@ class PreparedSubmission:
     preparation_ms: float = 0.0
     reward_grading_ms: float = 0.0
     timed_out: bool = False
+    # True only after every rollout prefix matched the validator-rendered
+    # canonical prompt.  The parent process uses this authenticated signal to
+    # clear prompt-mismatch compatibility strikes even when a later, unrelated
+    # admission check rejects the group.
+    prompt_binding_verified: bool = False
     # Rollouts that ran to the protocol cap without terminating. Carried to the
     # auction so the group can be valued conservatively (a truncated rollout has
     # no gradeable answer, and a miner can create one on purpose).
@@ -724,8 +729,16 @@ def score_and_finalize_submission(
     """Bind the canonical prompt, grade rewards and validate group structure."""
     started = time.perf_counter()
     request = parsed.request
-    if parsed.reject_reason is not None or request is None:
+    prompt_binding_verified = False
+
+    def result(**kwargs: Any) -> PreparedSubmission:
         return PreparedSubmission(
+            prompt_binding_verified=prompt_binding_verified,
+            **kwargs,
+        )
+
+    if parsed.reject_reason is not None or request is None:
+        return result(
             request=request,
             completion_texts=[],
             rewards=[],
@@ -749,7 +762,7 @@ def score_and_finalize_submission(
                     if list(rollout.commit.get("tokens", []))[
                         :prompt_length
                     ] != list(canonical):
-                        return PreparedSubmission(
+                        return result(
                             request=request,
                             completion_texts=materials.completion_texts,
                             rewards=[],
@@ -763,6 +776,8 @@ def score_and_finalize_submission(
                                 + (time.perf_counter() - started) * 1000.0
                             ),
                         )
+
+                prompt_binding_verified = True
 
             reward_started = time.perf_counter()
             try:
@@ -779,7 +794,7 @@ def score_and_finalize_submission(
                     )
                     authoritative = True
                 else:
-                    return PreparedSubmission(
+                    return result(
                         request=request,
                         completion_texts=materials.completion_texts,
                         rewards=[],
@@ -793,7 +808,7 @@ def score_and_finalize_submission(
             except GraderInfrastructureError:
                 raise
             except Exception:
-                return PreparedSubmission(
+                return result(
                     request=request,
                     completion_texts=materials.completion_texts,
                     rewards=[],
@@ -808,7 +823,7 @@ def score_and_finalize_submission(
 
             for rollout, reward in zip(request.rollouts, computed, strict=True):
                 if not math.isfinite(reward):
-                    return PreparedSubmission(
+                    return result(
                         request=request,
                         completion_texts=materials.completion_texts,
                         rewards=[],
@@ -827,7 +842,7 @@ def score_and_finalize_submission(
                         meta["success"] = reward > 0.5
                         meta["total_reward"] = reward
                 elif not _reward_matches(reward, rollout.reward):
-                    return PreparedSubmission(
+                    return result(
                         request=request,
                         completion_texts=materials.completion_texts,
                         rewards=[],
@@ -890,7 +905,7 @@ def score_and_finalize_submission(
                 else _in_zone(rewards, bootstrap=context.bootstrap)
             )
             if not in_zone:
-                return PreparedSubmission(
+                return result(
                     request=request,
                     completion_texts=materials.completion_texts,
                     rewards=rewards,
@@ -914,7 +929,7 @@ def score_and_finalize_submission(
                     ),
                 )
                 if malformed:
-                    return PreparedSubmission(
+                    return result(
                         request=request,
                         completion_texts=materials.completion_texts,
                         rewards=rewards,
@@ -931,7 +946,7 @@ def score_and_finalize_submission(
                 materials.completion_texts, rewards
             )
             if clone_metrics.suspicious:
-                return PreparedSubmission(
+                return result(
                     request=request,
                     completion_texts=materials.completion_texts,
                     rewards=rewards,
@@ -951,7 +966,7 @@ def score_and_finalize_submission(
                     if context.environment != "openmathinstruct":
                         meta["forced"] = False
 
-            return PreparedSubmission(
+            return result(
                 request=request,
                 completion_texts=materials.completion_texts,
                 rewards=rewards,
@@ -974,7 +989,7 @@ def score_and_finalize_submission(
                 reward_grading_ms=reward_ms,
             )
     except _AdmissionTimeout:
-        return PreparedSubmission(
+        return result(
             request=request,
             completion_texts=materials.completion_texts,
             rewards=[],
@@ -988,7 +1003,7 @@ def score_and_finalize_submission(
             timed_out=True,
         )
     except GraderInfrastructureError as exc:
-        return PreparedSubmission(
+        return result(
             request=request,
             completion_texts=materials.completion_texts,
             rewards=[],
@@ -1002,7 +1017,7 @@ def score_and_finalize_submission(
             reward_grading_ms=reward_ms,
         )
     except Exception:
-        return PreparedSubmission(
+        return result(
             request=request,
             completion_texts=materials.completion_texts,
             rewards=[],

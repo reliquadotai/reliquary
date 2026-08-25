@@ -520,6 +520,11 @@ async def test_prepared_prompt_mismatch_recycles_precommit_capacity(monkeypatch)
     assert conservation["capacity_reserved"] == 0
     assert conservation["productive_capacity_used"] == 0
     assert conservation["capacity_conserved"] is True
+    circuit_health = server._prompt_mismatch_circuit.health_snapshot(
+        current_window=request.window_start
+    )
+    assert circuit_health["mismatches_total"] == 1
+    assert circuit_health["partial_strike_entries"] == 1
 
     accepted, reason, _deadline = batcher.try_register_upload_precommit(
         "honest-replacement",
@@ -530,6 +535,54 @@ async def test_prepared_prompt_mismatch_recycles_precommit_capacity(monkeypatch)
     assert accepted is True
     assert reason is None
     assert batcher.upload_precommit_conservation()["accepted_receipts"] == 2
+
+
+def test_prompt_mismatch_circuit_rejects_before_receipt_registration():
+    from reliquary.protocol.submission import WindowState
+
+    server = ValidatorServer()
+    batcher = _batcher(window_start=500)
+    batcher.difficulty_auction_enabled = True
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    request = _request(valid_merkle=True)
+    operator = "operator-coldkey"
+    server.set_registered_hotkeys(
+        {request.miner_hotkey},
+        operator_by_hotkey={request.miner_hotkey: operator},
+    )
+    identities = {
+        "hotkey": request.miner_hotkey,
+        "operator": operator,
+    }
+    for index in range(3):
+        server._prompt_mismatch_circuit.record_mismatch(
+            environment=FakeEnv.name,
+            generation_profile_id=request.generation_profile_id,
+            identities=identities,
+            window=request.window_start,
+            precommit_signature=f"terminal-mismatch-{index}",
+        )
+
+    payload = request.model_dump_json().encode("utf-8")
+    precommit = _precommit_for(request, payload_bytes=len(payload))
+    with TestClient(server.app) as client:
+        response = client.post(
+            "/submit/precommit",
+            content=precommit.model_dump_json(),
+            headers={"Content-Type": "application/json"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "accepted": False,
+        "reason": RejectReason.RATE_LIMITED.value,
+        "receipt_id": None,
+        "upload_deadline_ts": None,
+    }
+    assert server._upload_precommit_receipts == {}
+    assert server._per_window_counts.get(request.miner_hotkey, 0) == 0
+    assert batcher.pending_upload_precommits == 0
 
 
 def test_endpoint_latency_does_not_index_arbitrary_paths():

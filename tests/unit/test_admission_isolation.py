@@ -320,6 +320,7 @@ def test_spawned_worker_decodes_scores_and_returns_picklable_request():
         ).result(timeout=15.0)
 
     assert prepared.reject_reason is None
+    assert prepared.prompt_binding_verified is True
     assert prepared.rewards == [1.0] * 4 + [0.0] * 4
     assert prepared.request is not None
     assert prepared.request.prompt_idx == request.prompt_idx
@@ -606,6 +607,7 @@ def test_prepared_reason_parity_for_prompt_mismatch():
 
     assert result.reject_reason is RejectReason.PROMPT_MISMATCH
     assert result.reject_stage == "prompt_binding"
+    assert result.prompt_binding_verified is False
 
 
 def test_prepared_reason_parity_for_nonfinite_reward(monkeypatch):

@@ -133,6 +133,13 @@ def _content_cooldown_local_path(run_id: str) -> Path:
     return state_dir / "content_cooldown" / f"{safe_run_id}.json.gz"
 
 
+def _prompt_mismatch_circuit_local_path() -> Path:
+    state_dir = Path(
+        os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")
+    )
+    return state_dir / "prompt_mismatch_circuit.json"
+
+
 def _read_gzip_json(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
@@ -617,7 +624,11 @@ class ValidationService:
         self._intake_stage_task: asyncio.Task | None = None
         self._windows_since_checkpoint_swap = 0
 
-        self.server = ValidatorServer(host=http_host, port=http_port)
+        self.server = ValidatorServer(
+            host=http_host,
+            port=http_port,
+            prompt_mismatch_state_path=_prompt_mismatch_circuit_local_path(),
+        )
         self.server.set_late_drop_callback(self.record_late_drop)
         self.server.configure_prompt_source_health(
             self._prompt_source_health_snapshot
