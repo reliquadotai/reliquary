@@ -75,12 +75,17 @@ def _extract_python(completion: str, entry_name: str | None = None) -> str:
     read as "never open a second block", which the model generalised into "never
     reason".
 
-    The gate stops at v5 so v2-v4 stay byte-exact as historical controls. It is
-    NOT a coordinated-cutover gate: v5 is the live profile, so this redefines the
-    reward in place. The graded span is wire-affecting — miners declare the
-    reward they computed and the validator re-runs this function, rejecting a
-    mismatch beyond 1e-6 for the whole group — so a miner on older code keeps
-    mining but loses every group holding a divergent rollout until it updates.
+    The gate stops at v5 so v2-v4 stay byte-exact as historical controls: their
+    archived runs must stay reproducible. That is the ONLY thing it guards.
+
+    Changing the graded span is not wire-affecting for Code. This environment
+    sets ``validator_authoritative_reward = True``, so the validator overwrites
+    the miner's declared reward instead of comparing it (admission.py sets
+    ``authoritative = True`` for opencodeinstruct; the 1e-6 ``reward_mismatch``
+    branch is never reached). A miner on older code is not rejected — it merely
+    pre-filters its own submissions against a stale local reward, so it may skip
+    groups the validator would have paid. Math keeps the strict comparison, and
+    is untouched by this function.
     """
     if not completion:
         return ""

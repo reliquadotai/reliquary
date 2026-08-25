@@ -7,16 +7,20 @@ Nothing else moves: same model, tokenizer path, sampling distribution, rollout
 count, token cap, BFT policy, DAPO objective controls, and **both prompts
 unchanged**. v2-v4 keep the old rule byte-exact as historical controls.
 
-> **This redefines the reward in place on the live profile.** It is not a
-> coordinated cutover, and that is a deliberate trade. The `/state` generation
-> contract does not change, so miners on older code keep passing
-> `_state_matches_active_protocol` and keep mining — but their reward diverges on
-> multi-block rollouts, and `reward_mismatch` rejects the **whole group of 16**.
-> At the measured 0.47% divergent-rollout rate that is roughly **7% of groups
-> lost per non-updated miner**, silently, until they update. Two nodes can also
-> both claim profile v5 with the same `generation_contract_sha256` and grade
-> differently; checkpoint lineage will not distinguish a checkpoint trained
-> before the fix from one trained after. Announce the update to miners.
+> **This redefines the Code reward in place on the live v5 profile** — no
+> protocol fork, no coordinated cutover. That is safe for miners: the Code
+> environment sets `validator_authoritative_reward = True`, so the validator
+> overwrites the miner's declared reward instead of comparing it, and the 1e-6
+> `reward_mismatch` branch is never reached (Math keeps the strict comparison
+> and is untouched here). A miner on older code is **not rejected**; it only
+> pre-filters its own submissions against a stale local reward, so it may skip
+> groups the validator would have paid. Announcing the update still pays for
+> itself, but nothing breaks without it.
+>
+> The real cost is bookkeeping: `/state` and `generation_contract_sha256` do not
+> change, so two nodes can both claim v5 and grade differently, and checkpoint
+> lineage will not record that the reward function moved. **Note the deploy
+> window somewhere durable.**
 
 ## Diagnosis
 
@@ -75,7 +79,8 @@ practice it only stops the sandbox from running `exec` on reasoning prose.
 
 Both call sites — `OpenCodeInstructEnvironment.compute_reward` and
 `admission._compute_code_rewards` — are pinned by a test to grade the same span.
-A divergence between them would reject honest miners on `reward_mismatch`.
+They must agree because admission's reward is the one written into the batch;
+a divergence would score the same rollout two different ways inside one window.
 
 **Neither prompt moves.** Rewording the Code prompt was measured and rejected: on
 the production checkpoint (650, pinned revision, 2 560 rollouts, real grader) it
@@ -150,8 +155,10 @@ profile alone. Note the window number of the deploy somewhere durable.
 Over the first ~200 windows (≈6 h):
 
 - artefact zeros (multi-block whose last block lacks `def <entry>`) below 0,2 %;
-- `reward_mismatch` rejections: expect a spike from non-updated miners, and
-  watch it decay as they upgrade. A flat spike means someone is stuck.
+- multi-block Code rollouts whose graded span changed: they should now score
+  like their single-block twins (~0.65) instead of ~0.00;
+- `reward_mismatch` should stay flat — Code rewards are validator-authoritative,
+  so a spike here would mean the assumption above is wrong.
 
 ## Known gaps, not addressed here
 

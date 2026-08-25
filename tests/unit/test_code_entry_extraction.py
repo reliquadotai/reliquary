@@ -9,11 +9,12 @@ span is not the implementation and the rollout scores zero despite being right.
 From v5 on, the graded block is the last one that *defines the contract's entry
 function*, falling back to ``matches[-1]`` when no block defines it.
 
-The gate stops at v5 rather than applying everywhere: v2-v4 stay byte-exact as
-historical controls. It is NOT a coordinated-cutover gate — v5 is the live
-profile, so this redefines the reward in place. Miners recompute the same reward
-and the validator rejects a mismatch beyond 1e-6, group-wide, so a miner running
-older code loses whole groups until it updates.
+The gate stops at v5 rather than applying everywhere so that v2-v4 stay
+byte-exact as historical controls — their archived runs must stay reproducible.
+That is the only thing it guards: Code rewards are validator-authoritative
+(``validator_authoritative_reward = True``), so the validator overwrites the
+miner's claim rather than comparing it, and no ``reward_mismatch`` can arise
+from this change.
 """
 
 import pytest
@@ -224,8 +225,9 @@ def test_compute_reward_grades_the_implementation_not_the_trailing_demo(v5, monk
 # ---------------------------------------------------------------------------
 
 def test_admission_grades_the_implementation_not_the_trailing_demo(v5, monkeypatch):
-    """Admission recomputes the reward to check the miner's claim. If it graded a
-    different span than compute_reward, honest miners would fail reward_mismatch."""
+    """Admission's reward is the one written into the batch. If it graded a
+    different span than compute_reward, one rollout would be scored two ways
+    inside a single window."""
     from reliquary.validator import admission
 
     graded: list[str] = []
