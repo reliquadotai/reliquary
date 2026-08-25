@@ -135,6 +135,9 @@ from reliquary.validator.observability import (
     log_submission_stage,
     runtime_revision,
 )
+from reliquary.validator.prompt_mismatch_circuit import (
+    PromptMismatchCircuitBreaker,
+)
 from reliquary.validator.verifier import (
     is_forced_bft_cap_termination,
     is_natural_bft_cap_candidate,
@@ -168,6 +171,7 @@ class _UploadPrecommitReceipt:
     drand_observation: DrandRoundObservation
     batcher: Any
     generation_profile_id: str = ""
+    operator: str | None = None
     consumed: bool = False
     outcome: BatchSubmissionResponse | None = None
     terminal: bool = False
@@ -644,6 +648,9 @@ class _Health(BaseModel):
     seal_trigger_round: int | None = None
     drand_round_backward_tolerance: int
     upload_precommit_enabled: bool = True
+    prompt_mismatch_circuit_breaker: dict[str, Any] = Field(
+        default_factory=dict
+    )
     submission_upload_grace_seconds: float = SUBMISSION_UPLOAD_GRACE_SECONDS
     batch_size: int
     queue_depth: int | None = None
@@ -807,7 +814,13 @@ class _Health(BaseModel):
 
 
 class ValidatorServer:
-    def __init__(self, host: str = "0.0.0.0", port: int = VALIDATOR_HTTP_PORT) -> None:
+    def __init__(
+        self,
+        host: str = "0.0.0.0",
+        port: int = VALIDATOR_HTTP_PORT,
+        *,
+        prompt_mismatch_state_path: str | os.PathLike[str] | None = None,
+    ) -> None:
         self.host = host
         self.port = port
         self._app_started_at = time.time()
@@ -883,6 +896,9 @@ class ValidatorServer:
             str, _UploadPrecommitReceipt
         ] = {}
         self._upload_precommit_by_signature: dict[str, str] = {}
+        self._prompt_mismatch_circuit = PromptMismatchCircuitBreaker(
+            prompt_mismatch_state_path
+        )
         self.app: FastAPI = self._build_app()
         self._server: uvicorn.Server | None = None
         self._task: asyncio.Task[Any] | None = None
@@ -1267,6 +1283,18 @@ class ValidatorServer:
     def operator_by_hotkey_snapshot(self) -> dict[str, str]:
         """Return the chain ownership map associated with the registration cache."""
         return dict(self._operator_by_hotkey)
+
+    def _prompt_mismatch_identities(
+        self,
+        hotkey: str,
+        *,
+        operator: str | None = None,
+    ) -> dict[str, str]:
+        identities = {"hotkey": str(hotkey)}
+        resolved_operator = operator or self._operator_by_hotkey.get(hotkey)
+        if resolved_operator:
+            identities["operator"] = str(resolved_operator)
+        return identities
 
     def registration_cache_age(self, *, now: float | None = None) -> float | None:
         if self._registration_refreshed_at is None:
@@ -1888,6 +1916,11 @@ class ValidatorServer:
             ),
             drand_round_backward_tolerance=DRAND_ROUND_BACKWARD_TOLERANCE,
             upload_precommit_enabled=True,
+            prompt_mismatch_circuit_breaker=(
+                self._prompt_mismatch_circuit.health_snapshot(
+                    current_window=(batcher.window_start if batcher else None)
+                )
+            ),
             submission_upload_grace_seconds=SUBMISSION_UPLOAD_GRACE_SECONDS,
             batch_size=B_BATCH,
             queue_depth=self.submit_queue_depth,
@@ -3154,20 +3187,72 @@ class ValidatorServer:
             if count >= MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW:
                 return reject(RejectReason.RATE_LIMITED)
 
+            operator = self._operator_by_hotkey.get(request.miner_hotkey)
+            circuit_identities = self._prompt_mismatch_identities(
+                request.miner_hotkey,
+                operator=operator,
+            )
+            circuit_decision = self._prompt_mismatch_circuit.admit_precommit(
+                environment=request.environment,
+                generation_profile_id=request.generation_profile_id,
+                identities=circuit_identities,
+                window=request.window_start,
+                precommit_signature=request.precommit_signature,
+            )
+            if not circuit_decision.allowed:
+                logger.warning(
+                    "prompt_mismatch_circuit_rejected window=%d env=%s "
+                    "hotkey=%s scopes=%s status=%s retry_after_window=%s",
+                    request.window_start,
+                    request.environment,
+                    request.miner_hotkey[:12],
+                    ",".join(circuit_decision.blocked_scopes),
+                    circuit_decision.status,
+                    circuit_decision.retry_after_window,
+                )
+                return reject(RejectReason.RATE_LIMITED)
+
             receipt_id = secrets.token_urlsafe(32)
             register = getattr(
                 type(batcher), "try_register_upload_precommit", None
             )
             if register is None:
+                if circuit_decision.canary:
+                    self._prompt_mismatch_circuit.cancel_canary(
+                        environment=request.environment,
+                        generation_profile_id=request.generation_profile_id,
+                        identities=circuit_identities,
+                        window=request.window_start,
+                        precommit_signature=request.precommit_signature,
+                    )
                 return reject(RejectReason.PRECOMMIT_INVALID)
-            accepted, register_reason, deadline_monotonic = register(
-                batcher,
-                receipt_id,
-                request.miner_hotkey,
-                t_arrival_wall=t_arrival,
-                payload_bytes=request.payload_bytes,
-            )
+            try:
+                accepted, register_reason, deadline_monotonic = register(
+                    batcher,
+                    receipt_id,
+                    request.miner_hotkey,
+                    t_arrival_wall=t_arrival,
+                    payload_bytes=request.payload_bytes,
+                )
+            except Exception:
+                if circuit_decision.canary:
+                    self._prompt_mismatch_circuit.cancel_canary(
+                        environment=request.environment,
+                        generation_profile_id=request.generation_profile_id,
+                        identities=circuit_identities,
+                        window=request.window_start,
+                        precommit_signature=request.precommit_signature,
+                    )
+                raise
             if not accepted or deadline_monotonic is None:
+                if circuit_decision.canary:
+                    self._prompt_mismatch_circuit.cancel_canary(
+                        environment=request.environment,
+                        generation_profile_id=request.generation_profile_id,
+                        identities=circuit_identities,
+                        window=request.window_start,
+                        precommit_signature=request.precommit_signature,
+                    )
                 logger.warning(
                     "upload_precommit_register_rejected window=%d env=%s "
                     "prompt=%d hotkey=%s internal_reason=%s",
@@ -3208,6 +3293,7 @@ class ValidatorServer:
                 precommit_arrival_ts=t_arrival,
                 drand_observation=drand_observation,
                 batcher=batcher,
+                operator=operator,
             )
             self._upload_precommit_receipts[receipt_id] = receipt
             self._upload_precommit_by_signature[
@@ -4452,6 +4538,52 @@ class ValidatorServer:
                 return
             request._payload_bytes = receipt.payload_bytes
             self._admission_inflight_requests[receipt.receipt_id] = request
+
+            circuit_identities = self._prompt_mismatch_identities(
+                receipt.miner_hotkey,
+                operator=receipt.operator,
+            )
+            if prepared.prompt_binding_verified:
+                circuit_update = (
+                    self._prompt_mismatch_circuit.record_binding_success(
+                        environment=receipt.environment,
+                        generation_profile_id=receipt.generation_profile_id,
+                        identities=circuit_identities,
+                        window=receipt.window_start,
+                    )
+                )
+                if circuit_update.cleared_scopes:
+                    logger.info(
+                        "prompt_mismatch_circuit_recovered window=%d env=%s "
+                        "hotkey=%s scopes=%s",
+                        receipt.window_start,
+                        receipt.environment,
+                        receipt.miner_hotkey[:12],
+                        ",".join(circuit_update.cleared_scopes),
+                    )
+            elif prepared.reject_reason is RejectReason.PROMPT_MISMATCH:
+                circuit_update = self._prompt_mismatch_circuit.record_mismatch(
+                    environment=receipt.environment,
+                    generation_profile_id=receipt.generation_profile_id,
+                    identities=circuit_identities,
+                    window=receipt.window_start,
+                    precommit_signature=receipt.precommit_signature,
+                )
+                if (
+                    circuit_update.activated_scopes
+                    or circuit_update.escalated_scopes
+                ):
+                    logger.warning(
+                        "prompt_mismatch_circuit_armed window=%d env=%s "
+                        "hotkey=%s activated_scopes=%s escalated_scopes=%s "
+                        "cooldown_until_window=%s",
+                        receipt.window_start,
+                        receipt.environment,
+                        receipt.miner_hotkey[:12],
+                        ",".join(circuit_update.activated_scopes),
+                        ",".join(circuit_update.escalated_scopes),
+                        circuit_update.cooldown_until_window,
+                    )
 
             structurally_authenticated = (
                 len(prepared.rollout_hashes) == len(request.rollouts)
