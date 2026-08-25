@@ -81,6 +81,32 @@ def test_resolve_sha_downloads_and_extracts_n():
     assert calls["revision"] == "a" * 40
 
 
+@pytest.mark.parametrize(
+    "title, expected",
+    [
+        ("checkpoint 623 (cadence)", 623),
+        ("checkpoint 624 (adaptive_policy_ratio_drift)", 624),
+    ],
+)
+def test_resolve_sha_accepts_detached_trainer_titles(title, expected):
+    """A revision discovered from a detached publication must also load.
+
+    Production previously discovered checkpoint 623 correctly, then rejected
+    that same SHA here because the resolver still required ``checkpoint N``.
+    """
+    from reliquary.validator.resume import ShaSource, resolve_resume_source
+
+    local_path, checkpoint_n = resolve_resume_source(
+        source=ShaSource(sha="c" * 40),
+        hf_repo_id="myorg/repo",
+        download_fn=lambda **kwargs: "/tmp/checkpoint-623",
+        commit_title_fn=lambda **kwargs: title,
+    )
+
+    assert local_path == "/tmp/checkpoint-623"
+    assert checkpoint_n == expected
+
+
 def test_resolve_sha_rejects_unparseable_title():
     """If the commit title isn't 'checkpoint N', refuse (don't silently
     pick a wrong N)."""
