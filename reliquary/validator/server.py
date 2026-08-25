@@ -820,6 +820,7 @@ class ValidatorServer:
         port: int = VALIDATOR_HTTP_PORT,
         *,
         prompt_mismatch_state_path: str | os.PathLike[str] | None = None,
+        prompt_mismatch_namespace: str = PROTOCOL_PROFILE_ID,
     ) -> None:
         self.host = host
         self.port = port
@@ -897,7 +898,8 @@ class ValidatorServer:
         ] = {}
         self._upload_precommit_by_signature: dict[str, str] = {}
         self._prompt_mismatch_circuit = PromptMismatchCircuitBreaker(
-            prompt_mismatch_state_path
+            prompt_mismatch_state_path,
+            namespace=prompt_mismatch_namespace,
         )
         self.app: FastAPI = self._build_app()
         self._server: uvicorn.Server | None = None
@@ -1800,6 +1802,11 @@ class ValidatorServer:
         active_window_health = (
             self._window_environment_health(batcher) if batcher else {}
         )
+        prompt_mismatch_circuit = (
+            self._prompt_mismatch_circuit.health_snapshot(
+                current_window=(batcher.window_start if batcher else None)
+            )
+        )
         logical_group_dedup: dict[str, dict[str, int]] = {}
         grader_failures_by_environment: dict[str, dict[str, int]] = {}
         for env_name, env_batcher in self._active_batchers.items():
@@ -1869,6 +1876,7 @@ class ValidatorServer:
                     and proof_scheduler.get("state") != "running"
                 )
                 or bool(proof_scheduler.get("degraded_reasons"))
+                or prompt_mismatch_circuit.get("status") == "degraded"
                 or self._process_health_snapshot.get("status")
                 in {"warning", "critical"}
             )
@@ -1916,11 +1924,7 @@ class ValidatorServer:
             ),
             drand_round_backward_tolerance=DRAND_ROUND_BACKWARD_TOLERANCE,
             upload_precommit_enabled=True,
-            prompt_mismatch_circuit_breaker=(
-                self._prompt_mismatch_circuit.health_snapshot(
-                    current_window=(batcher.window_start if batcher else None)
-                )
-            ),
+            prompt_mismatch_circuit_breaker=prompt_mismatch_circuit,
             submission_upload_grace_seconds=SUBMISSION_UPLOAD_GRACE_SECONDS,
             batch_size=B_BATCH,
             queue_depth=self.submit_queue_depth,
@@ -3194,7 +3198,6 @@ class ValidatorServer:
             )
             circuit_decision = self._prompt_mismatch_circuit.admit_precommit(
                 environment=request.environment,
-                generation_profile_id=request.generation_profile_id,
                 identities=circuit_identities,
                 window=request.window_start,
                 precommit_signature=request.precommit_signature,
@@ -3220,7 +3223,6 @@ class ValidatorServer:
                 if circuit_decision.canary:
                     self._prompt_mismatch_circuit.cancel_canary(
                         environment=request.environment,
-                        generation_profile_id=request.generation_profile_id,
                         identities=circuit_identities,
                         window=request.window_start,
                         precommit_signature=request.precommit_signature,
@@ -3238,7 +3240,6 @@ class ValidatorServer:
                 if circuit_decision.canary:
                     self._prompt_mismatch_circuit.cancel_canary(
                         environment=request.environment,
-                        generation_profile_id=request.generation_profile_id,
                         identities=circuit_identities,
                         window=request.window_start,
                         precommit_signature=request.precommit_signature,
@@ -3248,7 +3249,6 @@ class ValidatorServer:
                 if circuit_decision.canary:
                     self._prompt_mismatch_circuit.cancel_canary(
                         environment=request.environment,
-                        generation_profile_id=request.generation_profile_id,
                         identities=circuit_identities,
                         window=request.window_start,
                         precommit_signature=request.precommit_signature,
@@ -4547,9 +4547,10 @@ class ValidatorServer:
                 circuit_update = (
                     self._prompt_mismatch_circuit.record_binding_success(
                         environment=receipt.environment,
-                        generation_profile_id=receipt.generation_profile_id,
                         identities=circuit_identities,
                         window=receipt.window_start,
+                        precommit_signature=receipt.precommit_signature,
+                        precommit_arrival_ts=receipt.precommit_arrival_ts,
                     )
                 )
                 if circuit_update.cleared_scopes:
@@ -4564,10 +4565,10 @@ class ValidatorServer:
             elif prepared.reject_reason is RejectReason.PROMPT_MISMATCH:
                 circuit_update = self._prompt_mismatch_circuit.record_mismatch(
                     environment=receipt.environment,
-                    generation_profile_id=receipt.generation_profile_id,
                     identities=circuit_identities,
                     window=receipt.window_start,
                     precommit_signature=receipt.precommit_signature,
+                    precommit_arrival_ts=receipt.precommit_arrival_ts,
                 )
                 if (
                     circuit_update.activated_scopes
@@ -5237,3 +5238,4 @@ class ValidatorServer:
                 self._task.cancel()
             self._task = None
             self._server = None
+        await asyncio.to_thread(self._prompt_mismatch_circuit.close)

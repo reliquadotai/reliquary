@@ -753,11 +753,11 @@ MAX_PENDING_UPLOAD_PRECOMMITS_PER_OPERATOR = B_BATCH
 MAX_UPLOAD_PRECOMMITS_PER_ENV_PER_WINDOW = MAX_GRADING_STARTS_PER_WINDOW
 
 # Repeated canonical prompt-binding failures identify an incompatible miner
-# client before any useful grading/proof work can happen.  Three consecutive
-# mismatches arm a persistent circuit breaker for both the hotkey and its
-# metagraph operator.  Once a cooldown elapses, exactly one signed precommit is
-# admitted as a compatibility canary; another mismatch escalates the cooldown.
-# A prompt-binding success clears the identity immediately.
+# client before any useful grading/proof work can happen.  Three mismatches in
+# a bounded rolling window arm a persistent circuit breaker for both the hotkey
+# and its metagraph operator.  Once a cooldown elapses, exactly one signed
+# precommit is admitted as a compatibility canary; another mismatch escalates
+# the cooldown.  Only that exact canary can clear an armed identity.
 #
 # This is validator-local admission policy (no wire/protocol change).  Keep an
 # operational kill switch so a deployment can be rolled back without an image
@@ -766,6 +766,7 @@ PROMPT_MISMATCH_CIRCUIT_ENABLED = _os.environ.get(
     "RELIQUARY_PROMPT_MISMATCH_CIRCUIT_ENABLED", "1"
 ).strip().lower() not in {"0", "false", "no", "off"}
 PROMPT_MISMATCH_CIRCUIT_FAILURE_THRESHOLD = 3
+PROMPT_MISMATCH_CIRCUIT_FAILURE_WINDOW_WINDOWS = 10
 PROMPT_MISMATCH_CIRCUIT_COOLDOWN_WINDOWS = (10, 50, 250)
 
 # Process-isolated auction preparation. These hard per-candidate walls make the

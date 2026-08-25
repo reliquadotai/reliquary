@@ -542,10 +542,16 @@ def test_prompt_mismatch_circuit_rejects_before_receipt_registration():
 
     server = ValidatorServer()
     batcher = _batcher(window_start=500)
+    # Bootstrap intentionally relaxes the request generation-profile gate. The
+    # circuit namespace must still be validator-owned so rotating this signed,
+    # miner-controlled field cannot bypass an armed identity.
+    batcher.current_checkpoint_hash = ""
     batcher.difficulty_auction_enabled = True
     server.set_active_batcher(batcher)
     server.set_current_state(WindowState.OPEN)
-    request = _request(valid_merkle=True)
+    request = _request(valid_merkle=True).model_copy(
+        update={"generation_profile_id": "attacker-rotated-profile"}
+    )
     operator = "operator-coldkey"
     server.set_registered_hotkeys(
         {request.miner_hotkey},
@@ -558,10 +564,10 @@ def test_prompt_mismatch_circuit_rejects_before_receipt_registration():
     for index in range(3):
         server._prompt_mismatch_circuit.record_mismatch(
             environment=FakeEnv.name,
-            generation_profile_id=request.generation_profile_id,
             identities=identities,
             window=request.window_start,
             precommit_signature=f"terminal-mismatch-{index}",
+            precommit_arrival_ts=float(index + 1),
         )
 
     payload = request.model_dump_json().encode("utf-8")
@@ -583,6 +589,20 @@ def test_prompt_mismatch_circuit_rejects_before_receipt_registration():
     assert server._upload_precommit_receipts == {}
     assert server._per_window_counts.get(request.miner_hotkey, 0) == 0
     assert batcher.pending_upload_precommits == 0
+
+
+def test_prompt_mismatch_persistence_error_degrades_validator_health(tmp_path):
+    server = ValidatorServer(
+        prompt_mismatch_state_path=tmp_path / "prompt-mismatch.json"
+    )
+    server._prompt_mismatch_circuit._last_persistence_error = (
+        "OSError: disk unavailable"
+    )
+
+    health = server._health_payload()
+
+    assert health.status == "degraded"
+    assert health.prompt_mismatch_circuit_breaker["status"] == "degraded"
 
 
 def test_endpoint_latency_does_not_index_arbitrary_paths():

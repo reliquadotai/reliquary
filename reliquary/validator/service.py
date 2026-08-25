@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import gzip
+import hashlib
 import json
 import logging
 import math
@@ -64,6 +65,7 @@ from reliquary.constants import (
     PPO_CLIP_EPSILON_HIGH,
     PPO_CLIP_EPSILON_LOW,
     PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD,
+    PROTOCOL_GENERATION_CONTRACT,
     PROTOCOL_PROFILE_ID,
     PROTOCOL_VERSION,
     PROOF_ADMISSION_STALL_POLL_SECONDS,
@@ -133,11 +135,83 @@ def _content_cooldown_local_path(run_id: str) -> Path:
     return state_dir / "content_cooldown" / f"{safe_run_id}.json.gz"
 
 
-def _prompt_mismatch_circuit_local_path() -> Path:
+def _prompt_mismatch_circuit_local_path(
+    run_id: str,
+    *,
+    netuid: int,
+    validator_hotkey: str,
+) -> Path:
     state_dir = Path(
         os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")
     )
-    return state_dir / "prompt_mismatch_circuit.json"
+    safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id)
+    validator_tag = hashlib.sha256(
+        str(validator_hotkey).encode("utf-8")
+    ).hexdigest()[:12]
+    return (
+        state_dir
+        / "prompt_mismatch_circuit"
+        / f"{safe_run_id}.netuid-{int(netuid)}.{validator_tag}.json"
+    )
+
+
+def _prompt_source_identity(environment: Environment) -> dict[str, str]:
+    """Return the immutable, secret-free identity of one prompt source."""
+    snapshot: dict[str, Any] = {}
+    source_health = getattr(environment, "source_health", None)
+    if callable(source_health):
+        try:
+            candidate = source_health()
+            if isinstance(candidate, dict):
+                snapshot = candidate
+        except Exception as exc:  # noqa: BLE001 - optional third-party health hook
+            # Namespace construction must not make validator startup depend on
+            # an optional health implementation. Concrete environments expose
+            # the same values on their lazy dataset below.
+            logger.debug(
+                "prompt source identity health unavailable environment=%s error=%s",
+                getattr(environment, "name", type(environment).__name__),
+                type(exc).__name__,
+            )
+    dataset = getattr(environment, "_dataset", None)
+    repo = snapshot.get("repo") or getattr(dataset, "_repo", None)
+    revision = snapshot.get("revision") or getattr(dataset, "_revision", None)
+    implementation = (
+        f"{type(environment).__module__}.{type(environment).__qualname__}"
+    )
+    return {
+        "implementation": implementation,
+        "repo": str(repo).strip() if repo is not None else "<unreported>",
+        "revision": (
+            str(revision).strip() if revision is not None else "<unreported>"
+        ),
+    }
+
+
+def _prompt_mismatch_circuit_namespace(
+    *,
+    run_id: str,
+    netuid: int,
+    validator_hotkey: str,
+    environments: dict[str, Environment],
+) -> str:
+    """Fingerprint every validator-owned input that defines prompt binding."""
+    payload = {
+        "schema": 2,
+        "run_id": str(run_id),
+        "network": os.environ.get("BT_NETWORK", "").strip(),
+        "netuid": int(netuid),
+        "validator_hotkey": str(validator_hotkey).strip(),
+        "generation_contract": dict(PROTOCOL_GENERATION_CONTRACT),
+        "prompt_sources": {
+            name: _prompt_source_identity(environment)
+            for name, environment in sorted(environments.items())
+        },
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return f"prompt-binding-v2:{digest}"
 
 
 def _read_gzip_json(path: Path) -> dict[str, Any] | None:
@@ -624,10 +698,22 @@ class ValidationService:
         self._intake_stage_task: asyncio.Task | None = None
         self._windows_since_checkpoint_swap = 0
 
+        validator_hotkey = str(wallet.hotkey.ss58_address)
+        prompt_mismatch_namespace = _prompt_mismatch_circuit_namespace(
+            run_id=TRAINING_RUN_ID,
+            netuid=self.netuid,
+            validator_hotkey=validator_hotkey,
+            environments=self.envs,
+        )
         self.server = ValidatorServer(
             host=http_host,
             port=http_port,
-            prompt_mismatch_state_path=_prompt_mismatch_circuit_local_path(),
+            prompt_mismatch_state_path=_prompt_mismatch_circuit_local_path(
+                TRAINING_RUN_ID,
+                netuid=self.netuid,
+                validator_hotkey=validator_hotkey,
+            ),
+            prompt_mismatch_namespace=prompt_mismatch_namespace,
         )
         self.server.set_late_drop_callback(self.record_late_drop)
         self.server.configure_prompt_source_health(
