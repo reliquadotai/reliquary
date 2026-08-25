@@ -71,6 +71,15 @@ compensate `matches[-1]`:
 
 `complete` targets the rollouts that call helpers they never wrote.
 
+v6 also drops the raw-completion fallback: with no fence, the graded span is
+empty rather than the whole rollout. This changes no observed reward — the
+fallback fired 762 times across 30 768 production rollouts and never once
+produced a positive one, because a rollout holding code always fences it — so
+in practice it only stops the sandbox from running `exec` on reasoning prose.
+It rides the same gate anyway: a rollout of bare valid Python would score
+differently, and a staggered miner/validator deploy would surface that as
+`reward_mismatch`.
+
 **The Math prompt is byte-identical to v5, deliberately.** Math has no
 extraction defect — its median length rises 376 → 561 under v5 and its reward
 rises with it. Re-rendering its prompt would only re-inflict the transient the
@@ -149,9 +158,10 @@ Over the first ~200 windows (≈6 h):
   `random`, `textwrap`, and `__future__`. A reflexive
   `from __future__ import annotations` zeroes the whole rollout. 0,16 % of
   rollouts: worth noting, not worth prioritising.
-- **Rollouts with no fence at all.** 762 triggers of the raw-completion
-  fallback across 30 768 production rollouts, **zero positive rewards, ever** —
-  the fallback is dead code. Those zeros are deserved, though: the model
-  produced no code and emitted EOS on its own. Recovering them would mean
-  scraping `def` out of unstructured prose, which reintroduces exactly the class
-  of ambiguity this change removes, for at most 0,75 % upside.
+- **Rollouts with no fence at all** keep scoring zero, and that zero is
+  deserved: the model produced no code and emitted EOS on its own. Recovering
+  them would mean scraping `def` out of unstructured prose, which reintroduces
+  exactly the class of ambiguity this change removes, for at most 0,75 % upside
+  (231 of 762 such rollouts hold a self-contained definition, and the two
+  candidate rules — last definition, or all definitions concatenated — differ by
+  17 rollouts).

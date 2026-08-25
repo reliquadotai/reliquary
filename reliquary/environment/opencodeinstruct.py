@@ -58,9 +58,13 @@ def _extract_python(completion: str, entry_name: str | None = None) -> str:
 
     Strategy: find all fenced code blocks (``` or ~~~ with optional
     'python' tag). From protocol v6 on, return the last block that *defines*
-    ``entry_name``; otherwise return the last block. Falls back to the raw
-    completion string if no fence is present — exec will reject
-    obviously-non-code, scoring zero.
+    ``entry_name``; otherwise return the last block.
+
+    With no fence at all, v4/v5 return the raw completion and let exec reject
+    obviously-non-code; v6 returns nothing, because the fenced block is the only
+    answer channel. That fallback fired 762 times across 30 768 production
+    rollouts without ever producing a positive reward — a rollout holding code
+    always fences it — so it only ever ran ``exec`` on reasoning prose.
 
     Why the definition beats the position (v6): "last block wins" assumed the
     model closes with its final implementation, which held for the v2-v4 chat
@@ -78,17 +82,22 @@ def _extract_python(completion: str, entry_name: str | None = None) -> str:
     """
     if not completion:
         return ""
+    from reliquary.constants import PROTOCOL_VERSION
+
+    v6 = PROTOCOL_VERSION >= 6
     matches = _FENCE_RE.findall(completion)
     if not matches:
-        return completion
-    if entry_name:
-        from reliquary.constants import PROTOCOL_VERSION
-
-        if PROTOCOL_VERSION >= 6:
-            needle = f"def {entry_name}"
-            for _fence, body in reversed(matches):
-                if needle in body:
-                    return body
+        # v6 has a single answer channel: what is between the fences. The raw
+        # fallback fired 762 times across 30 768 production rollouts and never
+        # produced a positive reward — a rollout holding code always fences it,
+        # so the fallback only ever ran `exec` on reasoning prose. Those zeros
+        # were deserved and stay zeros; executing prose as Python does not.
+        return "" if v6 else completion
+    if entry_name and v6:
+        needle = f"def {entry_name}"
+        for _fence, body in reversed(matches):
+            if needle in body:
+                return body
     return matches[-1][1]
 
 

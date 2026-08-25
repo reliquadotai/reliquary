@@ -147,10 +147,19 @@ def test_extract_python_requires_a_definition_not_a_mention(v6):
     assert _extract_python(text, entry_name=ENTRY) == IMPLEMENTATION
 
 
-def test_extract_python_no_fence_still_returns_the_raw_completion(v6):
+def test_extract_python_grades_nothing_when_the_completion_has_no_fence(v6):
+    """v6 has a single answer channel: what is between the fences, nothing else.
+
+    The raw-completion fallback fired 762 times across 30 768 production
+    rollouts and never once produced a positive reward — a rollout that contains
+    code always fences it, so the fallback only ever ran `exec` on prose. Its
+    zeros were deserved (no code was produced) and stay zeros; what goes away is
+    executing model prose as Python.
+    """
     from reliquary.environment.opencodeinstruct import _extract_python
 
-    assert _extract_python(IMPLEMENTATION, entry_name=ENTRY) == IMPLEMENTATION
+    assert _extract_python("Step 1: initialise a counter.", entry_name=ENTRY) == ""
+    assert _extract_python(IMPLEMENTATION, entry_name=ENTRY) == ""
 
 
 def test_extract_python_empty_completion_is_empty(v6):
@@ -172,6 +181,16 @@ def test_extract_python_ignores_the_entry_name_below_protocol_v6(monkeypatch):
     monkeypatch.setattr(constants, "PROTOCOL_VERSION", 5, raising=False)
     text = _fence(IMPLEMENTATION) + "\n\n" + _fence("True\nTrue\nFalse")
     assert _extract_python(text, entry_name=ENTRY) == "True\nTrue\nFalse"
+
+
+def test_extract_python_keeps_the_raw_fallback_below_protocol_v6(monkeypatch):
+    """Dropping the fallback changes no reward in practice, but a rollout with
+    bare valid Python would score differently — so it moves at the cutover too."""
+    import reliquary.constants as constants
+    from reliquary.environment.opencodeinstruct import _extract_python
+
+    monkeypatch.setattr(constants, "PROTOCOL_VERSION", 5, raising=False)
+    assert _extract_python(IMPLEMENTATION, entry_name=ENTRY) == IMPLEMENTATION
 
 
 # ---------------------------------------------------------------------------
