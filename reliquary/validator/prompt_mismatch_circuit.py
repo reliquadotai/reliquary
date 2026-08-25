@@ -425,9 +425,11 @@ class PromptMismatchCircuitBreaker:
 
     def _load(self) -> None:
         path = self.state_path
-        if path is None or not path.exists():
+        if path is None:
             return
         try:
+            if not path.exists():
+                return
             with path.open("r", encoding="utf-8") as handle:
                 payload = json.load(handle)
             if not isinstance(payload, dict):

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from reliquary.validator.prompt_mismatch_circuit import (
     PromptMismatchCircuitBreaker,
 )
@@ -231,3 +233,18 @@ def test_state_survives_restart_and_failed_registration_releases_canary(
     pending = _admit(restored_again, "other", window=110)
     assert pending.allowed is False
     assert pending.status == "canary_pending"
+
+
+def test_unreadable_state_path_fails_open(monkeypatch, tmp_path):
+    path = tmp_path / "unreadable" / "prompt-mismatch-circuit.json"
+
+    def deny_access(_path):
+        raise PermissionError("state directory is not readable")
+
+    monkeypatch.setattr(Path, "exists", deny_access)
+    circuit = PromptMismatchCircuitBreaker(path, enabled=True)
+
+    health = circuit.health_snapshot(current_window=100)
+    assert health["entries"] == 0
+    assert health["last_load_error"].startswith("PermissionError:")
+    assert _admit(circuit, "allowed-fail-open", window=100).allowed is True
