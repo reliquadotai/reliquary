@@ -37,20 +37,59 @@ _FENCE_RE = re.compile(
 )
 
 
-def _extract_python(completion: str) -> str:
+def _entry_function_name(cases: list[dict]) -> str | None:
+    """The contract's graded entry function, or None when it isn't a function.
+
+    Same source as ``_contract_instruction``: the cases carry the exact name the
+    grader will call, so the extractor can pin the graded block to a definition
+    rather than to a position. Method entries define no top-level ``def``, so
+    they pin nothing.
+    """
+    for case in cases or ():
+        entry = case.get("entry") or {}
+        name = entry.get("name")
+        if entry.get("kind") == "function" and name:
+            return str(name)
+    return None
+
+
+def _extract_python(completion: str, entry_name: str | None = None) -> str:
     """Extract Python code from a model completion.
 
     Strategy: find all fenced code blocks (``` or ~~~ with optional
-    'python' tag), return the last one's contents. Falls back to the
-    raw completion string if no fence is present — exec will reject
+    'python' tag). From protocol v6 on, return the last block that *defines*
+    ``entry_name``; otherwise return the last block. Falls back to the raw
+    completion string if no fence is present — exec will reject
     obviously-non-code, scoring zero.
+
+    Why the definition beats the position (v6): "last block wins" assumed the
+    model closes with its final implementation, which held for the v2-v4 chat
+    model. Under the v5 reasoning prompt the model routinely closes with a usage
+    demo, an expected-output listing, or a test block — 13.1% of code rollouts
+    at the v5 cutover — and grading that span scores a correct answer zero.
+    Because the group-relative advantage is what trains the policy, those zeros
+    read as "never open a second block", which the model generalised into "never
+    reason".
+
+    The graded span is wire-affecting: miners declare the reward they computed
+    and the validator re-runs this function, rejecting a mismatch beyond 1e-6.
+    Changing it before a coordinated cutover would reject honest miners, hence
+    the PROTOCOL_VERSION gate — the new rule is inert on v4/v5 profiles.
     """
     if not completion:
         return ""
     matches = _FENCE_RE.findall(completion)
-    if matches:
-        return matches[-1][1]
-    return completion
+    if not matches:
+        return completion
+    if entry_name:
+        from reliquary.constants import PROTOCOL_VERSION
+
+        if PROTOCOL_VERSION >= 6:
+            needle = f"def {entry_name}"
+            for _fence, body in reversed(matches):
+                if needle in body:
+                    return body
+    return matches[-1][1]
 
 
 def _load_dataset(repo: str, revision: str):
@@ -175,7 +214,7 @@ class OpenCodeInstructEnvironment:
         cases = self._cases_by_id.get(case_id)
         if not cases:
             return 0.0
-        code = _extract_python(completion or "")
+        code = _extract_python(completion or "", entry_name=_entry_function_name(cases))
         return self._grader.evaluate_cases(code, cases, timeout_s=GRADER_EVAL_TIMEOUT_SECONDS)
 
     def admission_reward_cases(self, problem: dict) -> list[dict]:

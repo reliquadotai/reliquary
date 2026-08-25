@@ -258,6 +258,22 @@ _CODE_REASONING_PROMPT = PromptTemplateProfile(
     ),
 )
 
+# v6 grades the last block that DEFINES the contract function, so the prompt no
+# longer has to pin the answer to the last fence. That clause existed only to
+# compensate ``matches[-1]``; it was the constraint the model met roughly half
+# the time when it reasoned, at −1.2σ of group-relative advantage per miss.
+# "complete" targets the rollouts that call helpers they never wrote.
+_CODE_REASONING_PROMPT_V6 = PromptTemplateProfile(
+    template_id="opencodeinstruct-reasoning-v2",
+    template=(
+        "Solve the following programming problem step by step.\n\n"
+        "$problem$contract\n\n"
+        "Work through your reasoning first, then give the complete "
+        "implementation in a Python code block."
+    ),
+)
+
+
 _PROFILE_VALUES = (
     ProtocolProfile(
         profile_id="qwen35-2b-auction-v2",
@@ -389,6 +405,42 @@ _PROFILE_VALUES = (
                 max_new_tokens=8192,
                 bft=None,
                 prompt_template=_CODE_REASONING_PROMPT,
+            ),
+        },
+        throughput_tiebreak=ThroughputTiebreakProfile(
+            token_cap=8192,
+            bucket_tokens_per_round=50,
+        ),
+    ),
+    ProtocolProfile(
+        profile_id="qwen3-4b-base-dapo-reasoning-v6",
+        # Clean protocol fork from v5. The model, raw encoding, sampling,
+        # budgets, and objective controls stay fixed, and the Math prompt is
+        # byte-identical: Math has no extraction defect and re-rendering its
+        # prompt would only re-inflict the v5 cutover's transient reward dip.
+        # What moves is the graded span — the Code grader now extracts the last
+        # fenced block that DEFINES the contract's entry function instead of the
+        # last fenced block outright (see opencodeinstruct._extract_python) —
+        # and the Code prompt, which no longer needs to pin the answer's
+        # position. v5 remains immutable as the last-fence control.
+        model_id="Qwen/Qwen3-4B-Base",
+        model_revision="906bfd4b4dc7f14ee4320094d8b41684abff8539",
+        protocol_version=6,
+        collection_seconds=100,
+        upload_grace_seconds=33,
+        prompt_encoding="raw",
+        sampling=_SAMPLING_DAPO,
+        environments={
+            "openmathinstruct": EnvironmentProfile(
+                max_new_tokens=8192,
+                bft=None,
+                answer_format="boxed",
+                prompt_template=_MATH_REASONING_PROMPT,
+            ),
+            "opencodeinstruct": EnvironmentProfile(
+                max_new_tokens=8192,
+                bft=None,
+                prompt_template=_CODE_REASONING_PROMPT_V6,
             ),
         },
         throughput_tiebreak=ThroughputTiebreakProfile(

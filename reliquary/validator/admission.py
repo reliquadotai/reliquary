@@ -34,7 +34,7 @@ from reliquary.environment.grader_client import (
     GraderClient,
     GraderInfrastructureError,
 )
-from reliquary.environment.opencodeinstruct import _extract_python
+from reliquary.environment.opencodeinstruct import _entry_function_name, _extract_python
 from reliquary.environment.openmathinstruct import _compute_omi_reward
 from reliquary.protocol.legacy_merkle import legacy_submission_merkle_matches
 from reliquary.protocol.signatures import (
@@ -701,11 +701,14 @@ def _compute_code_rewards(
     cases: list[dict[str, Any]],
 ) -> list[float]:
     client = GraderClient()
+    # Must grade the same span as OpenCodeInstructEnvironment.compute_reward:
+    # a divergence here rejects honest miners on reward_mismatch.
+    entry_name = _entry_function_name(cases)
 
     def _grade(text: str) -> float:
         return float(
             client.evaluate_cases(
-                _extract_python(text),
+                _extract_python(text, entry_name=entry_name),
                 cases,
                 timeout_s=GRADER_EVAL_TIMEOUT_SECONDS,
             )
