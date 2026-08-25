@@ -3124,6 +3124,32 @@ class ValidatorServer:
             if registration_reason is not None:
                 return reject(registration_reason)
 
+            # Signature verification, prompt materialisation and registration
+            # all await.  Re-check the mutable window and idempotency state
+            # after the last await, then keep register + receipt publication in
+            # one event-loop turn.  Concurrent retries cannot create two
+            # reservations or publish a receipt into a replaced batcher.
+            if self._current_state != WindowState.OPEN:
+                return reject(RejectReason.WINDOW_NOT_ACTIVE)
+            if self._active_batchers.get(request.environment) is not batcher:
+                return reject(RejectReason.WINDOW_MISMATCH)
+            self._prune_upload_precommits()
+            existing_id = self._upload_precommit_by_signature.get(
+                request.precommit_signature
+            )
+            existing = (
+                self._upload_precommit_receipts.get(existing_id)
+                if existing_id is not None
+                else None
+            )
+            if existing is not None:
+                return SubmissionPrecommitResponse(
+                    accepted=True,
+                    reason=RejectReason.ACCEPTED,
+                    receipt_id=existing.receipt_id,
+                    upload_deadline_ts=existing.expires_at_wall,
+                )
+
             count = self._per_window_counts.get(request.miner_hotkey, 0)
             if count >= MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW:
                 return reject(RejectReason.RATE_LIMITED)
@@ -3142,6 +3168,15 @@ class ValidatorServer:
                 payload_bytes=request.payload_bytes,
             )
             if not accepted or deadline_monotonic is None:
+                logger.warning(
+                    "upload_precommit_register_rejected window=%d env=%s "
+                    "prompt=%d hotkey=%s internal_reason=%s",
+                    request.window_start,
+                    request.environment,
+                    request.prompt_idx,
+                    request.miner_hotkey[:12],
+                    register_reason,
+                )
                 reason = (
                     RejectReason.PRECOMMIT_EXPIRED
                     if register_reason in {"collection_closed", "collection_sealed"}

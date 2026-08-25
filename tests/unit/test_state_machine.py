@@ -719,6 +719,9 @@ async def test_auction_drain_abort_expires_unrevealed_receipt(monkeypatch):
     svc._activate_window()
     batcher = svc._active_batcher
     batcher.difficulty_auction_enabled = True
+    # Production batchers receive this immutable ownership snapshot from the
+    # metagraph; direct unit registration must model the same precondition.
+    batcher._operator_by_hotkey["miner"] = "operator"
     receipt_id = "unrevealed-at-abort"
     accepted, reason, _deadline = batcher.try_register_upload_precommit(
         receipt_id,
@@ -763,15 +766,15 @@ async def test_auction_drain_abort_expires_unrevealed_receipt(monkeypatch):
     assert receipt.terminal is True
     assert receipt.outcome is not None
     assert receipt.outcome.reason is RejectReason.PRECOMMIT_EXPIRED
-    assert batcher.upload_precommit_conservation() == {
-        "accepted_receipts": 1,
-        "revealed": 0,
-        "revealed_terminal": 0,
-        "expired": 1,
-        "terminal_decisions": 0,
-        "pending": 0,
-        "conserved": True,
-    }
+    conservation = batcher.upload_precommit_conservation()
+    assert conservation["accepted_receipts"] == 1
+    assert conservation["revealed"] == 0
+    assert conservation["expired"] == 1
+    assert conservation["terminal_decisions"] == 0
+    assert conservation["pending"] == 0
+    assert conservation["capacity_reserved"] == 0
+    assert conservation["conserved"] is True
+    assert conservation["capacity_conserved"] is True
     assert batcher.auction_seal_drain["outcome"] == "aborted"
 
 

@@ -155,24 +155,30 @@ def test_precommit_bytes_transfer_and_conserve_at_terminal_decision():
     assert accepted is True
     assert reason is None
     assert b.reserved_payload_bytes == 1234
-    assert b.upload_precommit_conservation()["pending"] == 1
+    conservation = b.upload_precommit_conservation()
+    assert conservation["pending"] == 1
+    assert conservation["capacity_reserved"] == 1
+    assert conservation["productive_capacity_used"] == 1
     assert b.mark_upload_precommit_revealed("receipt") is True
     assert b.start_revealed_admission("receipt", request) == (True, None)
     assert b.upload_precommit_payload_bytes == 0
     assert b.inflight_payload_bytes == 1234
+    conservation = b.upload_precommit_conservation()
+    assert conservation["capacity_reserved"] == 0
+    assert conservation["productive_capacity_used"] == 1
 
     b.finish_proof_admission(request)
     assert b.resolve_upload_precommit("receipt") is True
     assert b.reserved_payload_bytes == 0
-    assert b.upload_precommit_conservation() == {
-        "accepted_receipts": 1,
-        "revealed": 1,
-        "revealed_terminal": 1,
-        "expired": 0,
-        "terminal_decisions": 1,
-        "pending": 0,
-        "conserved": True,
-    }
+    conservation = b.upload_precommit_conservation()
+    assert conservation["accepted_receipts"] == 1
+    assert conservation["revealed"] == 1
+    assert conservation["terminal_decisions"] == 1
+    assert conservation["pending"] == 0
+    assert conservation["capacity_reserved"] == 0
+    assert conservation["productive_capacity_used"] == 1
+    assert conservation["conserved"] is True
+    assert conservation["capacity_conserved"] is True
 
 
 def test_unrevealed_precommit_expires_and_releases_exact_bytes():
@@ -201,12 +207,18 @@ def test_unrevealed_precommit_expires_and_releases_exact_bytes():
     assert conservation["conserved"] is True
 
 
-def test_precommit_capacity_is_a_per_window_accepted_total(monkeypatch):
+def test_terminal_precommit_recycles_live_capacity(monkeypatch):
     import reliquary.validator.batcher as batcher_module
     from tests.unit.test_grpo_window_batcher import _make_batcher
 
     monkeypatch.setattr(
         batcher_module, "MAX_PENDING_UPLOAD_PRECOMMITS_PER_ENV", 2
+    )
+    monkeypatch.setattr(
+        batcher_module, "MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW", 2
+    )
+    monkeypatch.setattr(
+        batcher_module, "MAX_UPLOAD_PRECOMMITS_PER_ENV_PER_WINDOW", 4
     )
     batcher = _make_batcher()
     for index in range(2):
@@ -218,7 +230,6 @@ def test_precommit_capacity_is_a_per_window_accepted_total(monkeypatch):
         )
         assert accepted is True
         assert reason is None
-        assert batcher.resolve_upload_precommit(f"receipt-{index}") is True
 
     accepted, reason, _deadline = batcher.try_register_upload_precommit(
         "receipt-over-cap",
@@ -228,5 +239,161 @@ def test_precommit_capacity_is_a_per_window_accepted_total(monkeypatch):
     )
 
     assert accepted is False
-    assert reason == "precommit_capacity_full"
-    assert batcher.upload_precommit_conservation()["accepted_receipts"] == 2
+    assert reason == "precommit_active_capacity_full"
+
+    assert batcher.resolve_upload_precommit("receipt-0") is True
+    accepted, reason, _deadline = batcher.try_register_upload_precommit(
+        "receipt-replacement",
+        "miner-replacement",
+        t_arrival_wall=batcher.window_opened_wall_ts,
+        payload_bytes=100,
+    )
+
+    assert accepted is True
+    assert reason is None
+    conservation = batcher.upload_precommit_conservation()
+    assert conservation["accepted_receipts"] == 3
+    assert conservation["pending"] == 2
+    assert conservation["capacity_reserved"] == 2
+    assert conservation["peak_pending"] == 2
+    assert conservation["capacity_rejections"] == {
+        "precommit_active_capacity_full": 1,
+    }
+    assert conservation["conserved"] is True
+    assert conservation["capacity_conserved"] is True
+
+
+def test_precommit_window_budget_is_cumulative_and_never_refunded(monkeypatch):
+    import reliquary.validator.batcher as batcher_module
+    from tests.unit.test_grpo_window_batcher import _make_batcher
+
+    monkeypatch.setattr(
+        batcher_module, "MAX_UPLOAD_PRECOMMITS_PER_ENV_PER_WINDOW", 3
+    )
+    batcher = _make_batcher()
+
+    for index in range(3):
+        receipt_id = f"receipt-{index}"
+        accepted, reason, _deadline = batcher.try_register_upload_precommit(
+            receipt_id,
+            f"miner-{index}",
+            t_arrival_wall=batcher.window_opened_wall_ts,
+            payload_bytes=100,
+        )
+        assert accepted is True
+        assert reason is None
+        assert batcher.resolve_upload_precommit(receipt_id) is True
+
+    accepted, reason, _deadline = batcher.try_register_upload_precommit(
+        "receipt-over-total",
+        "miner-over-total",
+        t_arrival_wall=batcher.window_opened_wall_ts,
+        payload_bytes=100,
+    )
+
+    assert accepted is False
+    assert reason == "precommit_window_budget_full"
+    conservation = batcher.upload_precommit_conservation()
+    assert conservation["accepted_receipts"] == 3
+    assert conservation["pending"] == 0
+    assert conservation["total_limit"] == 3
+    assert conservation["capacity_rejections"] == {
+        "precommit_window_budget_full": 1,
+    }
+    assert conservation["conserved"] is True
+
+
+def test_precommit_active_fairness_is_scoped_to_hotkey_and_operator(monkeypatch):
+    import reliquary.validator.batcher as batcher_module
+    from tests.unit.test_grpo_window_batcher import _make_batcher
+
+    monkeypatch.setattr(
+        batcher_module, "MAX_PENDING_UPLOAD_PRECOMMITS_PER_HOTKEY", 1
+    )
+    monkeypatch.setattr(
+        batcher_module, "MAX_PENDING_UPLOAD_PRECOMMITS_PER_OPERATOR", 1
+    )
+    batcher = _make_batcher(
+        operator_by_hotkey={
+            "miner-a": "operator-a",
+            "miner-a-second": "operator-a",
+            "miner-b": "operator-b",
+        }
+    )
+
+    accepted, reason, _deadline = batcher.try_register_upload_precommit(
+        "receipt-a",
+        "miner-a",
+        t_arrival_wall=batcher.window_opened_wall_ts,
+        payload_bytes=100,
+    )
+    assert accepted is True
+    assert reason is None
+
+    accepted, reason, _deadline = batcher.try_register_upload_precommit(
+        "receipt-hotkey-full",
+        "miner-a",
+        t_arrival_wall=batcher.window_opened_wall_ts,
+        payload_bytes=100,
+    )
+    assert accepted is False
+    assert reason == "precommit_hotkey_active_full"
+
+    accepted, reason, _deadline = batcher.try_register_upload_precommit(
+        "receipt-operator-full",
+        "miner-a-second",
+        t_arrival_wall=batcher.window_opened_wall_ts,
+        payload_bytes=100,
+    )
+    assert accepted is False
+    assert reason == "precommit_operator_active_full"
+
+    accepted, reason, _deadline = batcher.try_register_upload_precommit(
+        "receipt-b",
+        "miner-b",
+        t_arrival_wall=batcher.window_opened_wall_ts,
+        payload_bytes=100,
+    )
+    assert accepted is True
+    assert reason is None
+
+    assert batcher.resolve_upload_precommit("receipt-a") is True
+    accepted, reason, _deadline = batcher.try_register_upload_precommit(
+        "receipt-a-replacement",
+        "miner-a-second",
+        t_arrival_wall=batcher.window_opened_wall_ts,
+        payload_bytes=100,
+    )
+    assert accepted is True
+    assert reason is None
+
+
+def test_upload_and_direct_submissions_share_productive_capacity(monkeypatch):
+    import reliquary.validator.batcher as batcher_module
+    from tests.unit.test_grpo_window_batcher import _make_batcher, _request
+
+    monkeypatch.setattr(
+        batcher_module, "MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW", 2
+    )
+    batcher = _make_batcher()
+    accepted, reason, _deadline = batcher.try_register_upload_precommit(
+        "receipt-upload",
+        "upload-miner",
+        t_arrival_wall=batcher.window_opened_wall_ts,
+        payload_bytes=100,
+    )
+    assert accepted is True
+    assert reason is None
+
+    direct = _request(prompt_idx=1, hotkey="direct-miner")
+    assert batcher.try_reserve_proof_admission(direct) == (True, None)
+
+    accepted, reason, _deadline = batcher.try_register_upload_precommit(
+        "receipt-over-productive-capacity",
+        "other-miner",
+        t_arrival_wall=batcher.window_opened_wall_ts,
+        payload_bytes=100,
+    )
+    assert accepted is False
+    assert reason == "precommit_productive_capacity_full"
+    assert batcher.proof_grading_capacity_used == 2

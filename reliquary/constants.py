@@ -731,10 +731,26 @@ MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW = (
 )
 
 # Signed upload precommits are tiny, but still bounded independently from the
-# large-body proof queue.  A precommit consumes the same per-window hotkey quota
-# as a direct submission, so abandoning an upload cannot create free receipt
-# spam or reserve an unbounded number of deadline extensions.
+# large-body proof queue.  This is a LIVE/concurrent cap: a terminal decision or
+# expiry releases the reservation so cheap pre-grading rejects cannot burn the
+# rest of the window.  The separate cumulative ceiling below keeps that refund
+# from permitting unbounded receipt/preparation churn.
 MAX_PENDING_UPLOAD_PRECOMMITS_PER_ENV = MAX_PENDING_PROOF_QUEUE_DEPTH
+
+# A single identity may cover every target prompt concurrently, but may not
+# occupy a disproportionate share of the global receipt pool.  The operator cap
+# closes the same-coldkey/multiple-hotkey bypass using the immutable metagraph
+# ownership snapshot already used by auction identity and proof-debt checks.
+MAX_PENDING_UPLOAD_PRECOMMITS_PER_HOTKEY = B_BATCH
+MAX_PENDING_UPLOAD_PRECOMMITS_PER_OPERATOR = B_BATCH
+
+# Never-refunded per-environment/window backstop.  Prompt binding and other
+# isolated-admission rejects happen before ``start_revealed_admission`` and are
+# therefore invisible to ``MAX_GRADING_STARTS_PER_WINDOW``; counting accepted
+# signed receipts here bounds that pre-grading work as well.  Four times the
+# productive capacity leaves ample replacement headroom without making receipt
+# issuance unbounded.
+MAX_UPLOAD_PRECOMMITS_PER_ENV_PER_WINDOW = MAX_GRADING_STARTS_PER_WINDOW
 
 # Process-isolated auction preparation. These hard per-candidate walls make the
 # accepted receipt population drainable even when submitted math or code is
