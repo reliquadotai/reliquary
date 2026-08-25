@@ -66,7 +66,7 @@ def _extract_python(completion: str, entry_name: str | None = None) -> str:
     rollouts without ever producing a positive reward — a rollout holding code
     always fences it — so it only ever ran ``exec`` on reasoning prose.
 
-    Why the definition beats the position (v6): "last block wins" assumed the
+    Why the definition beats the position: "last block wins" assumed the
     model closes with its final implementation, which held for the v2-v4 chat
     model. Under the v5 reasoning prompt the model routinely closes with a usage
     demo, an expected-output listing, or a test block — 13.1% of code rollouts
