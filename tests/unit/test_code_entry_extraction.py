@@ -151,6 +151,48 @@ def test_extract_python_requires_a_definition_not_a_mention(v5):
     assert _extract_python(text, entry_name=ENTRY) == IMPLEMENTATION
 
 
+@pytest.mark.parametrize(
+    "trailing",
+    [
+        "def is_balanced_parentheses_helper(s):\n    return True",
+        "# def is_balanced_parentheses(s):\nresult = True",
+        'example = "def is_balanced_parentheses(s): return True"',
+        (
+            "def wrapper():\n"
+            "    def is_balanced_parentheses(s):\n"
+            "        return True\n"
+            "    return is_balanced_parentheses"
+        ),
+    ],
+)
+def test_extract_python_rejects_false_definition_matches(v5, trailing):
+    """Prefixes, comments, strings and nested defs are not the graded global."""
+    from reliquary.environment.opencodeinstruct import _extract_python
+
+    text = _fence(IMPLEMENTATION) + "\n\nTrailing example:\n\n" + _fence(trailing)
+    assert _extract_python(text, entry_name=ENTRY) == IMPLEMENTATION
+
+
+def test_extract_python_accepts_exact_async_definition(v5):
+    from reliquary.environment.opencodeinstruct import _extract_python
+
+    implementation = f"async def {ENTRY}(s):\n    return True"
+    text = _fence(implementation) + "\n\n" + _fence("print('demo')")
+    assert _extract_python(text, entry_name=ENTRY) == implementation
+
+
+def test_selected_span_offsets_cover_the_graded_block(v5):
+    from reliquary.environment.opencodeinstruct import _select_python_span
+
+    text = "Reasoning.\n" + _fence(IMPLEMENTATION) + "\n" + _fence("True")
+    selected = _select_python_span(text, entry_name=ENTRY)
+
+    assert selected is not None
+    code, start, end = selected
+    assert code == IMPLEMENTATION
+    assert text[start:end] == IMPLEMENTATION
+
+
 def test_extract_python_grades_nothing_when_the_completion_has_no_fence(v5):
     """From v5 on there is a single answer channel: what is between the fences, nothing else.
 

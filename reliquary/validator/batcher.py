@@ -73,6 +73,7 @@ from reliquary.constants import (
 )
 from reliquary.environment.base import Environment
 from reliquary.environment.grader_client import GraderInfrastructureError
+from reliquary.environment.opencodeinstruct import _entry_function_name
 from reliquary.shared.prompt_range import window_prompt_range
 from reliquary.protocol.legacy_merkle import legacy_submission_merkle_matches
 from reliquary.protocol.submission import (
@@ -3042,6 +3043,11 @@ class GrpoWindowBatcher:
         # Re-derive the cheap locals the moved gates read. Each is a pure
         # function of the request, so they are identical to what admission saw.
         problem = self.env.get_problem(pi)
+        code_entry_name: str | None = None
+        if getattr(self.env, "name", "") == "opencodeinstruct":
+            reward_cases = getattr(self.env, "admission_reward_cases", None)
+            if callable(reward_cases):
+                code_entry_name = _entry_function_name(reward_cases(problem))
         completion_texts = [
             self._completion_text(rollout) for rollout in request.rollouts
         ]
@@ -3691,6 +3697,7 @@ class GrpoWindowBatcher:
                         include_findings=private_auth_forensics_enabled,
                         max_findings=private_auth_forensics_max_findings,
                         context_chars=private_auth_forensics_context_chars,
+                        entry_name=code_entry_name,
                     )
                 )
                 if code_auth_metrics:
