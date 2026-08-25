@@ -524,11 +524,19 @@ async def test_get_window_state_v2_passes_env_query_param(monkeypatch):
 
     monkeypatch.setattr(httpx.AsyncClient, "get", _get)
     client = httpx.AsyncClient()
-    await get_window_state_v2("http://fake", env="opencode", client=client)
+    await get_window_state_v2(
+        "http://fake",
+        env="opencode",
+        window=116,
+        client=client,
+    )
     assert "env=opencode" in seen["url"]
+    assert "window=116" in seen["url"]
     # No env → no query param (backward compatible).
     await get_window_state_v2("http://fake", client=client)
     assert "?" not in seen["url"]
+    with pytest.raises(ValueError, match="window requires env"):
+        await get_window_state_v2("http://fake", window=116, client=client)
     await client.aclose()
 
 
@@ -583,10 +591,11 @@ def _checkpoint_epoch_plan_fixture():
         window_count=2,
         warmup_rounds=3,
         window_schedule=WindowSchedule(
-            mode="ordinary_window_state_machine",
+            mode="concurrent_checkpoint_epoch",
             collection_seconds=60.0,
             timeout_seconds=7200,
         ),
+        training_mode="sequential_steps",
         environment_universes={"math": 100},
         prompt_range_size=8,
     )

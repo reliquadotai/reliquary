@@ -11,6 +11,10 @@ from typing import Any, Mapping
 
 from reliquary.shared.checkpoint_epoch import (
     BeaconBinding,
+    CHECKPOINT_EPOCH_CAPABILITY_ID,
+    CHECKPOINT_EPOCH_SCHEDULE_MODE,
+    CHECKPOINT_EPOCH_SCHEMA_VERSION,
+    CHECKPOINT_EPOCH_TRAINING_MODES,
     CheckpointBinding,
     EpochPlan,
     ProtocolBinding,
@@ -42,6 +46,7 @@ class EpochCommitIntent:
     beacon_target_round: int
     warmup_rounds: int
     window_schedule: WindowSchedule
+    training_mode: str
     prompt_range_size: int
     environment_universes: tuple[tuple[str, int], ...]
 
@@ -52,6 +57,8 @@ class EpochCommitIntent:
 
 def _intent_dict(intent: EpochCommitIntent) -> dict[str, Any]:
     return {
+        "schema_version": CHECKPOINT_EPOCH_SCHEMA_VERSION,
+        "experimental_capability_id": CHECKPOINT_EPOCH_CAPABILITY_ID,
         "protocol": {
             "profile_id": intent.protocol.profile_id,
             "protocol_version": intent.protocol.protocol_version,
@@ -81,6 +88,7 @@ def _intent_dict(intent: EpochCommitIntent) -> dict[str, Any]:
             "collection_seconds": intent.window_schedule.collection_seconds,
             "timeout_seconds": intent.window_schedule.timeout_seconds,
         },
+        "training_mode": intent.training_mode,
         "prompt_range_size": intent.prompt_range_size,
         "environment_universes": {
             name: size for name, size in intent.environment_universes
@@ -105,6 +113,7 @@ def build_epoch_intent(
     beacon_chain_hash: str,
     warmup_rounds: int,
     window_schedule: WindowSchedule,
+    training_mode: str,
     prompt_range_size: int,
     environment_universes: Mapping[str, int],
 ) -> EpochCommitIntent:
@@ -122,6 +131,10 @@ def build_epoch_intent(
     )
     if not universes or any(not name or size < 1 for name, size in universes):
         raise ValueError("environment universes must be non-empty and positive")
+    if window_schedule.mode != CHECKPOINT_EPOCH_SCHEDULE_MODE:
+        raise ValueError("unsupported checkpoint epoch window schedule")
+    if training_mode not in CHECKPOINT_EPOCH_TRAINING_MODES:
+        raise ValueError("unsupported checkpoint epoch training mode")
     intent = EpochCommitIntent(
         protocol=protocol,
         checkpoint=checkpoint,
@@ -133,6 +146,7 @@ def build_epoch_intent(
         beacon_target_round=int(commit_observed_round) + 1,
         warmup_rounds=int(warmup_rounds),
         window_schedule=window_schedule,
+        training_mode=str(training_mode),
         prompt_range_size=int(prompt_range_size),
         environment_universes=universes,
     )
@@ -151,6 +165,8 @@ def parse_epoch_intent(raw: bytes) -> EpochCommitIntent:
     if not isinstance(value, dict):
         raise ValueError("checkpoint epoch intent must be an object")
     if set(value) != {
+        "schema_version",
+        "experimental_capability_id",
         "protocol",
         "checkpoint",
         "first_window",
@@ -158,10 +174,17 @@ def parse_epoch_intent(raw: bytes) -> EpochCommitIntent:
         "beacon_target",
         "warmup_rounds",
         "window_schedule",
+        "training_mode",
         "prompt_range_size",
         "environment_universes",
     }:
         raise ValueError("checkpoint epoch intent keys differ")
+    if (
+        value["schema_version"] != CHECKPOINT_EPOCH_SCHEMA_VERSION
+        or value["experimental_capability_id"]
+        != CHECKPOINT_EPOCH_CAPABILITY_ID
+    ):
+        raise ValueError("checkpoint epoch intent version differs")
     protocol = value["protocol"]
     checkpoint = value["checkpoint"]
     beacon = value["beacon_target"]
@@ -183,6 +206,7 @@ def parse_epoch_intent(raw: bytes) -> EpochCommitIntent:
         beacon_target_round=beacon["round"],
         warmup_rounds=value["warmup_rounds"],
         window_schedule=WindowSchedule(**schedule),
+        training_mode=value["training_mode"],
         prompt_range_size=value["prompt_range_size"],
         environment_universes=tuple(
             (str(name), int(size)) for name, size in sorted(universes.items())
@@ -190,6 +214,10 @@ def parse_epoch_intent(raw: bytes) -> EpochCommitIntent:
     )
     if raw != canonical_intent_bytes(intent):
         raise ValueError("checkpoint epoch intent is not canonical")
+    if intent.window_schedule.mode != CHECKPOINT_EPOCH_SCHEDULE_MODE:
+        raise ValueError("unsupported checkpoint epoch window schedule")
+    if intent.training_mode not in CHECKPOINT_EPOCH_TRAINING_MODES:
+        raise ValueError("unsupported checkpoint epoch training mode")
     if intent.beacon_target_round != intent.checkpoint.commit_observed_round + 1:
         raise ValueError("intent does not target the first post-commit beacon")
     return intent
@@ -216,6 +244,7 @@ def plan_from_intent(
         beacon_delay_rounds=1,
         warmup_rounds=intent.warmup_rounds,
         window_schedule=intent.window_schedule,
+        training_mode=intent.training_mode,
         prompt_range_size=intent.prompt_range_size,
         environment_universes=dict(intent.environment_universes),
     )

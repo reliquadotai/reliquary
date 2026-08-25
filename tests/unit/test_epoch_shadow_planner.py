@@ -52,10 +52,11 @@ def _plan(*, checkpoint_revision: str = "a" * 40):
         window_count=3,
         warmup_rounds=3,
         window_schedule=WindowSchedule(
-            mode="ordinary_window_state_machine",
+            mode="concurrent_checkpoint_epoch",
             collection_seconds=60.0,
             timeout_seconds=7200,
         ),
+        training_mode="sequential_steps",
         environment_universes={"code": 100, "math": 100},
         prompt_range_size=8,
     )
@@ -202,6 +203,38 @@ def test_exact_open_release_is_local_and_fully_bound(tmp_path):
     assert planner.records() == []
     assert planner.records("released")[0].status == "released"
     assert planner.metrics()["network_send_capable"] is False
+
+
+def test_concurrent_epoch_release_polls_each_exact_lane(tmp_path):
+    plan = _plan()
+    planner = _planner(tmp_path)
+    planner.enqueue(
+        plan,
+        expected_manifest_sha256=manifest_sha256(plan),
+        specs=[_spec(plan, 0), _spec(plan, 1)],
+    )
+    first = planner.prepare_next(
+        lambda record: PreparedGroup(payload=_payload(record), gpu_seconds=1.0)
+    )
+    second = planner.prepare_next(
+        lambda record: PreparedGroup(payload=_payload(record), gpu_seconds=1.0)
+    )
+    assert first is not None and second is not None
+
+    states = {
+        (record.binding.environment, record.binding.window_number): {
+            **_state(plan, window=record.binding.window_number),
+            "cooldown_prompts": [],
+        }
+        for record in (first, second)
+    }
+    released = planner.release_epoch_ready(
+        live_states=states,
+        prompt_sha256=_prompt_digest,
+    )
+
+    assert len(released) == 2
+    assert planner.records() == []
 
 
 def test_checkpoint_or_manifest_change_invalidates_without_replay(tmp_path):

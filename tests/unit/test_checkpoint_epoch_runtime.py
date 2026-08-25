@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 
 import pytest
 
@@ -8,6 +9,7 @@ from reliquary.shared.checkpoint_epoch import (
     BeaconBinding,
     ProtocolBinding,
     WindowSchedule,
+    canonical_json_bytes,
     canonical_manifest_bytes,
 )
 from reliquary.validator.checkpoint_epoch_runtime import (
@@ -38,10 +40,11 @@ def _intent(**overrides):
         "beacon_chain_hash": "c" * 64,
         "warmup_rounds": 5,
         "window_schedule": WindowSchedule(
-            mode="ordinary_window_state_machine",
+            mode="concurrent_checkpoint_epoch",
             collection_seconds=60.0,
             timeout_seconds=7200,
         ),
+        "training_mode": "sequential_steps",
         "prompt_range_size": 5_000,
         "environment_universes": {"code": 80_000, "math": 100_000},
     }
@@ -64,6 +67,25 @@ def test_intent_is_canonical_and_targets_exactly_the_next_round():
 
     assert intent.beacon_target_round == intent.checkpoint.commit_observed_round + 1
     assert parse_epoch_intent(canonical_intent_bytes(intent)) == intent
+
+
+def test_intent_rejects_unknown_schedule_and_training_modes():
+    with pytest.raises(ValueError, match="window schedule"):
+        _intent(window_schedule=WindowSchedule(
+            mode="sequential_windows",
+            collection_seconds=60.0,
+            timeout_seconds=7200,
+        ))
+    with pytest.raises(ValueError, match="training mode"):
+        _intent(training_mode="unknown")
+
+
+def test_intent_rejects_a_schema_version_mutation():
+    value = json.loads(canonical_intent_bytes(_intent()))
+    value["schema_version"] += 1
+
+    with pytest.raises(ValueError, match="version differs"):
+        parse_epoch_intent(canonical_json_bytes(value))
 
 
 def test_store_enforces_commit_before_beacon(tmp_path):
@@ -126,3 +148,6 @@ def test_plan_cannot_change_checkpoint_contract_or_beacon():
 
     changed_checkpoint = _intent(checkpoint_revision="0" * 40)
     assert changed_checkpoint.intent_id != intent.intent_id
+
+    changed_training = _intent(training_mode="aggregate_one_step")
+    assert changed_training.intent_id != intent.intent_id

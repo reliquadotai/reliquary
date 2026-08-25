@@ -131,6 +131,7 @@ class EpochWorkBinding:
     profile_id: str
     protocol_version: int
     generation_contract_sha256: str
+    training_mode: str
     checkpoint_number: int
     checkpoint_repo_id: str
     checkpoint_revision: str
@@ -458,6 +459,7 @@ class EpochShadowPlanner:
                 generation_contract_sha256=(
                     plan.protocol.generation_contract_sha256
                 ),
+                training_mode=plan.training_mode,
                 checkpoint_number=plan.checkpoint.number,
                 checkpoint_repo_id=plan.checkpoint.repo_id,
                 checkpoint_revision=plan.checkpoint.revision,
@@ -682,9 +684,6 @@ class EpochShadowPlanner:
         released: list[Path] = []
         for path, record in self._records(self.queue_dir):
             binding = record.binding
-            if live_window > binding.window_number:
-                self._quarantine(path, record, "missed_window")
-                continue
             if record.status != "prepared":
                 continue
             if live_window != binding.window_number or not live_open:
@@ -737,6 +736,37 @@ class EpochShadowPlanner:
                 ),
             )
             released.append(destination)
+        return released
+
+    def release_epoch_ready(
+        self,
+        *,
+        live_states: Mapping[tuple[str, int], Mapping[str, Any] | Any],
+        prompt_sha256: Callable[[str, int], str],
+    ) -> list[Path]:
+        """Release work after polling each exact concurrently open lane."""
+        self._require_enabled()
+        released: list[Path] = []
+        for (environment, window_number), state in sorted(
+            live_states.items(),
+            key=lambda item: (item[0][1], item[0][0]),
+        ):
+            try:
+                state_window = int(_get(state, "window_n"))
+            except (TypeError, ValueError):
+                continue
+            if state_window != int(window_number):
+                continue
+            cooldown = _get(state, "cooldown_prompts", ())
+            if not isinstance(cooldown, Collection) or isinstance(
+                cooldown, (str, bytes)
+            ):
+                continue
+            released.extend(self.release_ready(
+                live_state=state,
+                cooldown_prompts_by_environment={environment: cooldown},
+                prompt_sha256=prompt_sha256,
+            ))
         return released
 
     def records(

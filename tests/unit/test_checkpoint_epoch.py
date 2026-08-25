@@ -38,7 +38,7 @@ BEACON = BeaconBinding(
     randomness="3" * 64,
 )
 SCHEDULE = WindowSchedule(
-    mode="ordinary_window_state_machine",
+    mode="concurrent_checkpoint_epoch",
     collection_seconds=60.0,
     timeout_seconds=7200,
 )
@@ -55,6 +55,7 @@ def _plan(*, count: int = 16, **overrides):
         "beacon_delay_rounds": 1,
         "warmup_rounds": 20,
         "window_schedule": SCHEDULE,
+        "training_mode": "sequential_steps",
         "prompt_range_size": 5_000,
         "environment_universes": UNIVERSES,
     }
@@ -72,8 +73,10 @@ def test_manifest_is_canonical_deterministic_and_stable():
     assert canonical_manifest_bytes(first) == canonical_manifest_bytes(second)
     assert parse_epoch_plan(canonical_manifest_bytes(first)) == first
     assert manifest_sha256(first) == (
-        "54b00df08420fa642bc149d6f0a6f276e8ee75054a9ca791d3324226d3b242b2"
+        "c1b66e6015b444d937876c783d2954e943681bfbe7be3c60a5ec03ea5a0671a5"
     )
+    assert first.window_schedule.mode == "concurrent_checkpoint_epoch"
+    assert first.training_mode == "sequential_steps"
 
 
 def test_production_horizon_has_sixteen_unique_domain_separated_seeds():
@@ -143,6 +146,7 @@ def test_overlap_fallback_is_explicit_and_deterministic():
                 collection_seconds=61.0,
             )
         },
+        {"training_mode": "aggregate_one_step"},
     ],
 )
 def test_manifest_bindings_change_hash(change):
@@ -171,6 +175,16 @@ def test_manifest_never_contains_seal_randomness():
     assert "seal_randomness" not in encoded
     assert "selection_randomness" not in encoded
     assert "auction_randomness" not in encoded
+
+
+def test_training_mode_is_strict_and_bound_before_beacon():
+    sequential = _plan(training_mode="sequential_steps")
+    aggregate = _plan(training_mode="aggregate_one_step")
+
+    assert sequential.epoch_id != aggregate.epoch_id
+    assert manifest_sha256(sequential) != manifest_sha256(aggregate)
+    with pytest.raises(ValueError, match="training mode"):
+        _plan(training_mode="unknown")
 
 
 def test_manifest_is_immutable_and_rejects_noncanonical_json():

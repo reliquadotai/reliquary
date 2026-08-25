@@ -530,18 +530,26 @@ async def get_window_state_v2(
     url: str,
     *,
     env: str | None = None,
+    window: int | None = None,
     client: httpx.AsyncClient | None = None,
     timeout: float = _DEFAULT_TIMEOUT,
 ) -> GrpoBatchState:
     """GET the validator's current v2 GrpoBatchState.
 
     ``cooldown_prompts`` is per-env; pass ``env`` to read a specific env's
-    cooldown set. Omitting it returns the validator's first active env
-    (legacy single-env behavior).
+    cooldown set. Experimental concurrent epochs also require ``window`` for
+    exact lane revalidation. Omitting both preserves legacy behavior.
     """
+    if window is not None and env is None:
+        raise ValueError("window requires env")
     state_url = f"{url}/state"
+    query: list[str] = []
     if env is not None:
-        state_url = f"{state_url}?env={quote(env, safe='')}"
+        query.append(f"env={quote(env, safe='')}")
+    if window is not None:
+        query.append(f"window={int(window)}")
+    if query:
+        state_url = f"{state_url}?{'&'.join(query)}"
     return await _get_with_retry(
         state_url, GrpoBatchState,
         client=client, timeout=timeout,

@@ -581,6 +581,18 @@ if EXPERIMENTAL_CHECKPOINT_EPOCH_WARMUP_ROUNDS <= 0:
     raise ValueError(
         "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_WARMUP_ROUNDS must be positive"
     )
+EXPERIMENTAL_CHECKPOINT_EPOCH_TRAINING_MODE = _os.environ.get(
+    "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_TRAINING_MODE",
+    "sequential_steps",
+).strip().lower()
+if EXPERIMENTAL_CHECKPOINT_EPOCH_TRAINING_MODE not in {
+    "aggregate_one_step",
+    "sequential_steps",
+}:
+    raise ValueError(
+        "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_TRAINING_MODE must be "
+        "aggregate_one_step or sequential_steps"
+    )
 
 # Default HF repo target for published checkpoints. Operator may
 # override via --hf-repo-id CLI arg. Must be a writable repo id for

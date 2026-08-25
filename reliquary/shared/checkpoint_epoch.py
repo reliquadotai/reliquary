@@ -14,8 +14,14 @@ import math
 from typing import Any, Mapping, Sequence
 
 
-CHECKPOINT_EPOCH_SCHEMA_VERSION = 1
-CHECKPOINT_EPOCH_CAPABILITY_ID = "checkpoint-epoch-scheduling-v1"
+CHECKPOINT_EPOCH_SCHEMA_VERSION = 2
+CHECKPOINT_EPOCH_CAPABILITY_ID = "checkpoint-epoch-scheduling-v2"
+CHECKPOINT_EPOCH_REQUIRED_WINDOW_COUNT = 16
+CHECKPOINT_EPOCH_SCHEDULE_MODE = "concurrent_checkpoint_epoch"
+CHECKPOINT_EPOCH_TRAINING_MODES = frozenset({
+    "aggregate_one_step",
+    "sequential_steps",
+})
 
 _ID_DOMAIN = b"reliquary/checkpoint-epoch/id/v1"
 _ROOT_DOMAIN = b"reliquary/checkpoint-epoch/root/v1"
@@ -85,6 +91,7 @@ class EpochPlan:
     warmup_rounds: int
     activation_not_before_round: int
     window_schedule: WindowSchedule
+    training_mode: str
     prompt_range_size: int
     epoch_id: str
     epoch_seed: str
@@ -180,6 +187,7 @@ def _intent_dict(
     epoch_beacon: BeaconBinding,
     warmup_rounds: int,
     window_schedule: WindowSchedule,
+    training_mode: str,
     prompt_range_size: int,
     environment_universes: Mapping[str, int],
 ) -> dict[str, Any]:
@@ -200,6 +208,7 @@ def _intent_dict(
         "warmup_rounds": warmup_rounds,
         "activation_not_before_round": epoch_beacon.round + warmup_rounds,
         "window_schedule": _schedule_dict(window_schedule),
+        "training_mode": training_mode,
         "prompt_range_size": prompt_range_size,
         "environment_universes": {
             name: int(environment_universes[name])
@@ -219,6 +228,7 @@ def derive_epoch_id(
     epoch_beacon: BeaconBinding,
     warmup_rounds: int,
     window_schedule: WindowSchedule,
+    training_mode: str,
     prompt_range_size: int,
     environment_universes: Mapping[str, int],
 ) -> str:
@@ -232,6 +242,7 @@ def derive_epoch_id(
         epoch_beacon=epoch_beacon,
         warmup_rounds=warmup_rounds,
         window_schedule=window_schedule,
+        training_mode=training_mode,
         prompt_range_size=prompt_range_size,
         environment_universes=environment_universes,
     )
@@ -356,6 +367,7 @@ def build_epoch_plan(
     beacon_delay_rounds: int,
     warmup_rounds: int,
     window_schedule: WindowSchedule,
+    training_mode: str,
     prompt_range_size: int,
     environment_universes: Mapping[str, int],
     experimental_capability_id: str = CHECKPOINT_EPOCH_CAPABILITY_ID,
@@ -377,6 +389,7 @@ def build_epoch_plan(
         )
     warmup_rounds = _require_int("warmup_rounds", warmup_rounds, minimum=1)
     _validate_window_schedule(window_schedule)
+    _validate_training_mode(training_mode)
     prompt_range_size = _require_int(
         "prompt_range_size", prompt_range_size, minimum=1
     )
@@ -392,6 +405,7 @@ def build_epoch_plan(
         epoch_beacon=epoch_beacon,
         warmup_rounds=warmup_rounds,
         window_schedule=window_schedule,
+        training_mode=training_mode,
         prompt_range_size=prompt_range_size,
         environment_universes=universes,
     )
@@ -433,6 +447,7 @@ def build_epoch_plan(
         warmup_rounds=warmup_rounds,
         activation_not_before_round=epoch_beacon.round + warmup_rounds,
         window_schedule=window_schedule,
+        training_mode=training_mode,
         prompt_range_size=prompt_range_size,
         epoch_id=epoch_id,
         epoch_seed=epoch_seed,
@@ -453,6 +468,7 @@ def epoch_plan_to_dict(plan: EpochPlan) -> dict[str, Any]:
         "warmup_rounds": plan.warmup_rounds,
         "activation_not_before_round": plan.activation_not_before_round,
         "window_schedule": _schedule_dict(plan.window_schedule),
+        "training_mode": plan.training_mode,
         "prompt_range_size": plan.prompt_range_size,
         "epoch_id": plan.epoch_id,
         "epoch_seed": plan.epoch_seed,
@@ -513,6 +529,7 @@ def parse_epoch_plan(
             "warmup_rounds",
             "activation_not_before_round",
             "window_schedule",
+            "training_mode",
             "prompt_range_size",
             "epoch_id",
             "epoch_seed",
@@ -615,6 +632,7 @@ def parse_epoch_plan(
         warmup_rounds=obj["warmup_rounds"],
         activation_not_before_round=obj["activation_not_before_round"],
         window_schedule=WindowSchedule(**schedule_obj),
+        training_mode=obj["training_mode"],
         prompt_range_size=obj["prompt_range_size"],
         epoch_id=obj["epoch_id"],
         epoch_seed=obj["epoch_seed"],
@@ -654,6 +672,7 @@ def validate_epoch_plan(
         beacon_delay_rounds=plan.beacon_delay_rounds,
         warmup_rounds=plan.warmup_rounds,
         window_schedule=plan.window_schedule,
+        training_mode=plan.training_mode,
         prompt_range_size=plan.prompt_range_size,
         environment_universes=environment_universes,
         experimental_capability_id=plan.experimental_capability_id,
@@ -781,7 +800,7 @@ def _validate_beacon(value: BeaconBinding) -> None:
 def _validate_window_schedule(value: WindowSchedule) -> None:
     if not isinstance(value, WindowSchedule):
         raise ValueError("window_schedule must be a WindowSchedule")
-    if value.mode != "ordinary_window_state_machine":
+    if value.mode != CHECKPOINT_EPOCH_SCHEDULE_MODE:
         raise ValueError("unsupported checkpoint epoch window schedule")
     collection = _require_number(
         "window_schedule.collection_seconds",
@@ -795,6 +814,11 @@ def _validate_window_schedule(value: WindowSchedule) -> None:
     )
     if timeout < collection:
         raise ValueError("window timeout must not precede collection close")
+
+
+def _validate_training_mode(value: str) -> None:
+    if value not in CHECKPOINT_EPOCH_TRAINING_MODES:
+        raise ValueError("unsupported checkpoint epoch training mode")
 
 
 def _validate_environment_universes(
@@ -816,7 +840,10 @@ def _validate_environment_universes(
 __all__ = [
     "BeaconBinding",
     "CHECKPOINT_EPOCH_CAPABILITY_ID",
+    "CHECKPOINT_EPOCH_REQUIRED_WINDOW_COUNT",
+    "CHECKPOINT_EPOCH_SCHEDULE_MODE",
     "CHECKPOINT_EPOCH_SCHEMA_VERSION",
+    "CHECKPOINT_EPOCH_TRAINING_MODES",
     "CheckpointBinding",
     "EpochPlan",
     "EpochWindow",

@@ -78,3 +78,20 @@ def test_zero_targets_are_ready_for_mocked_empty_batch_paths():
     acc.add_window({}, window_n=1, checkpoint_revision="rev-a")
     assert acc.ready is True
     assert acc.training_batches(["fake"]) == [[]]
+
+
+def test_epoch_finalize_can_consume_a_partial_but_balanced_reservoir():
+    acc = BalancedTrainingAccumulator({"math": 16, "code": 16})
+    math_groups = [object() for _ in range(12)]
+    code_groups = [object() for _ in range(9)]
+    acc.add_window(
+        {"math": math_groups, "code": code_groups},
+        window_n=10,
+        checkpoint_revision="checkpoint",
+    )
+
+    assert acc.ready is False
+    assert acc.has_groups_for_all_targets is True
+    assert acc.training_batches(
+        ["math", "code"], allow_partial=True
+    ) == [math_groups, code_groups]

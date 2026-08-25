@@ -1155,7 +1155,12 @@ class GrpoWindowBatcher:
         """
         self._loop = loop
 
-    def mark_window_opened(self) -> None:
+    def mark_window_opened(
+        self,
+        *,
+        monotonic_time: float | None = None,
+        wall_time: float | None = None,
+    ) -> None:
         """Anchor collection and response-time telemetry at actual activation.
 
         Batchers are constructed before drand preparation, then exposed to
@@ -1163,8 +1168,12 @@ class GrpoWindowBatcher:
         constructor would silently shorten the fixed-duration auction whenever
         preparation is slow.
         """
-        self.window_opened_at = self._time_fn()
-        self.window_opened_wall_ts = self._wall_clock()
+        self.window_opened_at = (
+            self._time_fn() if monotonic_time is None else float(monotonic_time)
+        )
+        self.window_opened_wall_ts = (
+            self._wall_clock() if wall_time is None else float(wall_time)
+        )
         # Anchor the throughput draw tie-break: the drand round at window open is
         # the reference from which each submission's elapsed (= its attached
         # drand_round − this) is measured. Best-effort — on any drand hiccup the

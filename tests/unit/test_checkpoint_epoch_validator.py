@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 from fastapi.testclient import TestClient
 import pytest
@@ -21,7 +22,12 @@ from tests.unit.test_grpo_window_batcher import _make_batcher, _request
 from tests.unit.test_validator_server import _batcher as _server_batcher
 
 
-def _plan(*, randomness: str = "4" * 64):
+def _plan(
+    *,
+    randomness: str = "4" * 64,
+    window_count: int = 2,
+    environments: dict[str, int] | None = None,
+):
     return build_epoch_plan(
         protocol=ProtocolBinding(
             profile_id="checkpoint-epoch-test-only",
@@ -43,14 +49,15 @@ def _plan(*, randomness: str = "4" * 64):
         ),
         beacon_delay_rounds=1,
         first_window=500,
-        window_count=2,
+        window_count=window_count,
         warmup_rounds=2,
         window_schedule=WindowSchedule(
-            mode="ordinary_window_state_machine",
+            mode="concurrent_checkpoint_epoch",
             collection_seconds=60.0,
             timeout_seconds=7200,
         ),
-        environment_universes={"math": 1_000},
+        training_mode="sequential_steps",
+        environment_universes=environments or {"math": 1_000},
         prompt_range_size=50,
     )
 
@@ -121,6 +128,183 @@ def test_server_rejects_same_epoch_id_with_another_beacon_result():
 
     with pytest.raises(ValueError, match="equivocation"):
         server.set_checkpoint_epoch_plan(second)
+
+
+def test_concurrent_state_routes_exact_environment_and_window():
+    plan = _plan()
+    first = _server_batcher(window_start=500)
+    second = _server_batcher(window_start=501)
+    environment = str(first.env.name)
+    first.randomness = plan.windows[0].generation_randomness
+    second.randomness = plan.windows[1].generation_randomness
+    server = ValidatorServer()
+    server.set_current_checkpoint(_checkpoint(plan))
+    server.set_checkpoint_epoch_plan(plan)
+    server.set_active_epoch_batchers({
+        (environment, 500): first,
+        (environment, 501): second,
+    })
+    server.set_current_state(WindowState.OPEN)
+    client = TestClient(server.app)
+
+    first_state = client.get(f"/state?env={environment}&window=500")
+    second_state = client.get(f"/state?env={environment}&window=501")
+
+    assert first_state.status_code == second_state.status_code == 200
+    assert first_state.json()["window_n"] == 500
+    assert second_state.json()["window_n"] == 501
+    assert first_state.json()["randomness"] != second_state.json()["randomness"]
+    assert client.get(
+        f"/state?env={environment}&window=999"
+    ).status_code == 404
+
+
+def test_concurrent_lanes_share_one_admission_policy_window():
+    plan = _plan(window_count=16)
+    first = _server_batcher(window_start=plan.first_window)
+    last = _server_batcher(
+        window_start=plan.first_window + plan.window_count - 1
+    )
+    environment = str(first.env.name)
+    server = ValidatorServer()
+    server.set_checkpoint_epoch_plan(plan)
+    server.set_active_epoch_batchers({
+        (environment, first.window_start): first,
+        (environment, last.window_start): last,
+    })
+
+    assert server._admission_policy_window(first.window_start) == plan.first_window
+    assert server._admission_policy_window(last.window_start) == plan.first_window
+
+    server.set_active_epoch_batchers({})
+    assert server._admission_policy_window(last.window_start) == last.window_start
+
+
+class _EpochLaneBatcher:
+    def __init__(self, window: int, randomness: str) -> None:
+        self.window_start = window
+        self.randomness = ""
+        self.checkpoint_epoch_generation_randomness = randomness
+        self.env = SimpleNamespace(name="fake")
+        self.model = None
+        self.opened_at = None
+        self.opened_wall = None
+
+    def set_prompt_range(self) -> None:
+        pass
+
+    def mark_window_opened(self, *, monotonic_time, wall_time) -> None:
+        self.opened_at = monotonic_time
+        self.opened_wall = wall_time
+
+    def bind_event_loop(self, _loop) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_epoch_runner_opens_sixteen_lanes_together_then_consumes_in_order(
+    monkeypatch,
+):
+    from tests.unit.test_service_v2 import _build_late_drop_service
+
+    plan = _plan(window_count=16, environments={"fake": 1_000})
+    service = _build_late_drop_service()
+    service._checkpoint_epoch_plan = plan
+    service._window_n = plan.first_window - 1
+    monkeypatch.setattr(
+        "reliquary.infrastructure.drand.get_current_chain",
+        lambda: {
+            "name": plan.epoch_beacon.chain,
+            "hash": plan.epoch_beacon.chain_hash,
+            "genesis_time": 0,
+            "period": 30,
+        },
+    )
+    built: list[_EpochLaneBatcher] = []
+
+    def build(window_number: int):
+        epoch_window = plan.windows[window_number - plan.first_window]
+        batcher = _EpochLaneBatcher(
+            window_number,
+            epoch_window.generation_randomness,
+        )
+        built.append(batcher)
+        return {"fake": batcher}
+
+    service._build_window_batchers = build
+    service._wait_for_window_seal = AsyncMock(return_value="sealed")
+    service._fetch_checkpoint_epoch_seal_beacon = AsyncMock(
+        return_value=(200, plan.epoch_beacon)
+    )
+    service._train_and_publish = AsyncMock()
+
+    await service._run_checkpoint_epoch()
+
+    assert len(built) == 16
+    assert len({batcher.opened_at for batcher in built}) == 1
+    assert len({batcher.opened_wall for batcher in built}) == 1
+    service._wait_for_window_seal.assert_awaited_once_with(
+        fixed_deadline_only=True
+    )
+    assert [
+        call.kwargs["window_n"]
+        for call in service._train_and_publish.await_args_list
+    ] == list(range(plan.first_window, plan.first_window + 16))
+    assert [
+        call.kwargs["epoch_finalize"]
+        for call in service._train_and_publish.await_args_list
+    ] == [False] * 15 + [True]
+    assert service.server._active_batcher_values() == ()
+    assert service._current_window_state is WindowState.READY
+
+
+@pytest.mark.asyncio
+async def test_epoch_failure_closes_all_routes_and_tombstones_every_lane(
+    monkeypatch,
+):
+    from reliquary.validator.service import CheckpointEpochExecutionError
+    from tests.unit.test_service_v2 import _build_late_drop_service
+
+    plan = _plan(window_count=16, environments={"fake": 1_000})
+    service = _build_late_drop_service()
+    service._checkpoint_epoch_plan = plan
+    service._window_n = plan.first_window - 1
+    monkeypatch.setattr(
+        "reliquary.infrastructure.drand.get_current_chain",
+        lambda: {
+            "name": plan.epoch_beacon.chain,
+            "hash": plan.epoch_beacon.chain_hash,
+            "genesis_time": 0,
+            "period": 30,
+        },
+    )
+
+    def build(window_number: int):
+        epoch_window = plan.windows[window_number - plan.first_window]
+        return {
+            "fake": _EpochLaneBatcher(
+                window_number,
+                epoch_window.generation_randomness,
+            )
+        }
+
+    service._build_window_batchers = build
+    service._wait_for_window_seal = AsyncMock(return_value="sealed")
+    service._fetch_checkpoint_epoch_seal_beacon = AsyncMock(
+        return_value=(200, plan.epoch_beacon)
+    )
+    service._train_and_publish = AsyncMock(
+        side_effect=[None, RuntimeError("stop")]
+    )
+    service._enqueue_aborted_window = Mock()
+
+    with pytest.raises(CheckpointEpochExecutionError):
+        await service._run_checkpoint_epoch()
+
+    assert service._enqueue_aborted_window.call_count == 16
+    assert service.server._active_batcher_values() == ()
+    assert service._active_batchers == {}
+    assert service._current_window_state is WindowState.READY
 
 
 def _accept_with_arrival(batcher, request, round_number: int) -> None:
