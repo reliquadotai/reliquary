@@ -155,6 +155,26 @@ def _prompt_mismatch_circuit_local_path(
     )
 
 
+def _no_reveal_circuit_local_path(
+    run_id: str,
+    *,
+    netuid: int,
+    validator_hotkey: str,
+) -> Path:
+    state_dir = Path(
+        os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")
+    )
+    safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id)
+    validator_tag = hashlib.sha256(
+        str(validator_hotkey).encode("utf-8")
+    ).hexdigest()[:12]
+    return (
+        state_dir
+        / "no_reveal_circuit"
+        / f"{safe_run_id}.netuid-{int(netuid)}.{validator_tag}.json"
+    )
+
+
 def _prompt_source_identity(environment: Environment) -> dict[str, str]:
     """Return the immutable, secret-free identity of one prompt source."""
     snapshot: dict[str, Any] = {}
@@ -714,6 +734,12 @@ class ValidationService:
                 validator_hotkey=validator_hotkey,
             ),
             prompt_mismatch_namespace=prompt_mismatch_namespace,
+            no_reveal_state_path=_no_reveal_circuit_local_path(
+                TRAINING_RUN_ID,
+                netuid=self.netuid,
+                validator_hotkey=validator_hotkey,
+            ),
+            no_reveal_namespace=f"no-reveal-v1:{prompt_mismatch_namespace}",
         )
         self.server.set_late_drop_callback(self.record_late_drop)
         self.server.configure_prompt_source_health(

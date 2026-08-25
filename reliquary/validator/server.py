@@ -75,6 +75,7 @@ from reliquary.constants import (
     SPARSE_VALID_MAX_WINDOW_SECONDS,
     SUBMISSION_UPLOAD_GRACE_SECONDS,
     VALIDATOR_HTTP_PORT,
+    WINDOW_COLLECTION_SECONDS,
     CODE_ADMISSION_WORKERS,
     CODE_ADMISSION_WALL_SECONDS,
     ADMISSION_PROCESS_MAX_TASKS,
@@ -135,6 +136,7 @@ from reliquary.validator.observability import (
     log_submission_stage,
     runtime_revision,
 )
+from reliquary.validator.no_reveal_circuit import NoRevealCircuitBreaker
 from reliquary.validator.prompt_mismatch_circuit import (
     PromptMismatchCircuitBreaker,
 )
@@ -172,6 +174,7 @@ class _UploadPrecommitReceipt:
     batcher: Any
     generation_profile_id: str = ""
     operator: str | None = None
+    upload_started_at_wall: float | None = None
     consumed: bool = False
     outcome: BatchSubmissionResponse | None = None
     terminal: bool = False
@@ -355,8 +358,13 @@ class _SubmissionBodyLimitMiddleware:
             message = await receive()
             if message.get("type") == "http.request":
                 state = scope.setdefault("state", {})
-                state.setdefault("body_receive_started_at", time.time())
                 chunk = message.get("body", b"")
+                if chunk and "body_receive_started_at" not in state:
+                    started_at = time.time()
+                    state["body_receive_started_at"] = started_at
+                    callback = state.pop("upload_start_callback", None)
+                    if callable(callback):
+                        state["upload_start_result"] = callback(started_at)
                 received += len(chunk)
                 body_hasher.update(chunk)
                 if received > max_bytes:
@@ -651,6 +659,7 @@ class _Health(BaseModel):
     prompt_mismatch_circuit_breaker: dict[str, Any] = Field(
         default_factory=dict
     )
+    no_reveal_circuit_breaker: dict[str, Any] = Field(default_factory=dict)
     submission_upload_grace_seconds: float = SUBMISSION_UPLOAD_GRACE_SECONDS
     batch_size: int
     queue_depth: int | None = None
@@ -821,6 +830,8 @@ class ValidatorServer:
         *,
         prompt_mismatch_state_path: str | os.PathLike[str] | None = None,
         prompt_mismatch_namespace: str = PROTOCOL_PROFILE_ID,
+        no_reveal_state_path: str | os.PathLike[str] | None = None,
+        no_reveal_namespace: str = PROTOCOL_PROFILE_ID,
     ) -> None:
         self.host = host
         self.port = port
@@ -900,6 +911,10 @@ class ValidatorServer:
         self._prompt_mismatch_circuit = PromptMismatchCircuitBreaker(
             prompt_mismatch_state_path,
             namespace=prompt_mismatch_namespace,
+        )
+        self._no_reveal_circuit = NoRevealCircuitBreaker(
+            no_reveal_state_path,
+            namespace=no_reveal_namespace,
         )
         self.app: FastAPI = self._build_app()
         self._server: uvicorn.Server | None = None
@@ -1032,7 +1047,18 @@ class ValidatorServer:
         """
         changed = batchers is not self._active_batchers or set(batchers) != set(self._active_batchers)
         if changed:
+            transition_ts = time.time()
             for receipt in self._upload_precommit_receipts.values():
+                if (
+                    not receipt.consumed
+                    and receipt.upload_started_at_wall is None
+                    and (
+                        receipt.expires_at_wall < transition_ts
+                        or self._receipt_collection_deadline(receipt)
+                        <= transition_ts
+                    )
+                ):
+                    self._record_no_reveal(receipt)
                 resolver = getattr(
                     type(receipt.batcher), "resolve_upload_precommit", None
                 )
@@ -1076,13 +1102,87 @@ class ValidatorServer:
         """Distinguish validator outages from candidate-killed sandboxes."""
         return not bool(request._grader_worker_crashed)
 
+    @staticmethod
+    def _receipt_collection_deadline(receipt: _UploadPrecommitReceipt) -> float:
+        return float(receipt.batcher.window_opened_wall_ts) + float(
+            WINDOW_COLLECTION_SECONDS
+        )
+
+    def _record_no_reveal(self, receipt: _UploadPrecommitReceipt) -> None:
+        update = self._no_reveal_circuit.record_no_reveal(
+            environment=receipt.environment,
+            operator=receipt.operator,
+            window=receipt.window_start,
+            precommit_signature=receipt.precommit_signature,
+            precommit_arrival_ts=receipt.precommit_arrival_ts,
+        )
+        if update.activated_scopes or update.escalated_scopes:
+            logger.warning(
+                "no_reveal_circuit_armed window=%d env=%s operator=%s "
+                "activated=%s escalated=%s cooldown_until_window=%s",
+                receipt.window_start,
+                receipt.environment,
+                str(receipt.operator or "")[:12],
+                ",".join(update.activated_scopes),
+                ",".join(update.escalated_scopes),
+                update.cooldown_until_window,
+            )
+
+    def _record_valid_reveal(self, receipt: _UploadPrecommitReceipt) -> None:
+        update = self._no_reveal_circuit.record_reveal(
+            environment=receipt.environment,
+            operator=receipt.operator,
+            window=receipt.window_start,
+            precommit_signature=receipt.precommit_signature,
+            precommit_arrival_ts=receipt.precommit_arrival_ts,
+        )
+        if update.cleared_scopes:
+            logger.info(
+                "no_reveal_circuit_recovered window=%d env=%s operator=%s",
+                receipt.window_start,
+                receipt.environment,
+                str(receipt.operator or "")[:12],
+            )
+
+    def _mark_upload_started(
+        self,
+        receipt: _UploadPrecommitReceipt,
+        *,
+        t_arrival: float,
+    ) -> tuple[bool, str | None]:
+        if float(t_arrival) > self._receipt_collection_deadline(receipt):
+            return False, "upload_started_after_collection"
+        marker = getattr(
+            type(receipt.batcher), "mark_upload_precommit_started", None
+        )
+        if marker is None:
+            return False, "upload_start_unsupported"
+        started, reason = marker(
+            receipt.batcher,
+            receipt.receipt_id,
+            t_arrival_wall=float(t_arrival),
+        )
+        if started and receipt.upload_started_at_wall is None:
+            receipt.upload_started_at_wall = float(t_arrival)
+        return bool(started), reason
+
     def _prune_upload_precommits(self, *, now: float | None = None) -> None:
         current = time.time() if now is None else float(now)
         expired = [
             receipt_id
             for receipt_id, receipt in self._upload_precommit_receipts.items()
             if (
-                (not receipt.consumed and receipt.expires_at_wall < current)
+                (
+                    not receipt.consumed
+                    and (
+                        receipt.expires_at_wall < current
+                        or (
+                            receipt.upload_started_at_wall is None
+                            and self._receipt_collection_deadline(receipt)
+                            <= current
+                        )
+                    )
+                )
                 or receipt.batcher not in self._active_batchers.values()
             )
         ]
@@ -1091,6 +1191,15 @@ class ValidatorServer:
             self._upload_precommit_by_signature.pop(
                 receipt.precommit_signature, None
             )
+            if (
+                not receipt.consumed
+                and receipt.upload_started_at_wall is None
+                and (
+                    receipt.expires_at_wall < current
+                    or self._receipt_collection_deadline(receipt) <= current
+                )
+            ):
+                self._record_no_reveal(receipt)
             resolver = getattr(
                 type(receipt.batcher), "resolve_upload_precommit", None
             )
@@ -1134,6 +1243,7 @@ class ValidatorServer:
         environment: str,
         payload_bytes: int,
         payload_sha256: str,
+        upload_started_at: float,
         body_completed_at: float,
     ) -> tuple[str, _UploadPrecommitReceipt | None]:
         """Return valid, replay, expired, or invalid for one body reveal."""
@@ -1143,6 +1253,23 @@ class ValidatorServer:
             return "invalid", None
         if receipt.batcher is not batcher:
             return "invalid", None
+        started, _start_reason = self._mark_upload_started(
+            receipt,
+            t_arrival=upload_started_at,
+        )
+        if not started:
+            if receipt.upload_started_at_wall is None:
+                self._record_no_reveal(receipt)
+            self._upload_precommit_receipts.pop(receipt_id, None)
+            self._upload_precommit_by_signature.pop(
+                receipt.precommit_signature, None
+            )
+            resolver = getattr(
+                type(receipt.batcher), "resolve_upload_precommit", None
+            )
+            if resolver is not None:
+                resolver(receipt.batcher, receipt.receipt_id, expired=True)
+            return "expired", None
         if body_completed_at > receipt.expires_at_wall:
             self._upload_precommit_receipts.pop(receipt_id, None)
             self._upload_precommit_by_signature.pop(
@@ -1175,6 +1302,7 @@ class ValidatorServer:
         )
         if revealed is not None:
             revealed(receipt.batcher, receipt.receipt_id)
+        self._record_valid_reveal(receipt)
         return "valid", receipt
 
     def set_current_state(self, state) -> None:
@@ -1807,6 +1935,9 @@ class ValidatorServer:
                 current_window=(batcher.window_start if batcher else None)
             )
         )
+        no_reveal_circuit = self._no_reveal_circuit.health_snapshot(
+            current_window=(batcher.window_start if batcher else None)
+        )
         logical_group_dedup: dict[str, dict[str, int]] = {}
         grader_failures_by_environment: dict[str, dict[str, int]] = {}
         for env_name, env_batcher in self._active_batchers.items():
@@ -1877,6 +2008,7 @@ class ValidatorServer:
                 )
                 or bool(proof_scheduler.get("degraded_reasons"))
                 or prompt_mismatch_circuit.get("status") == "degraded"
+                or no_reveal_circuit.get("status") == "degraded"
                 or self._process_health_snapshot.get("status")
                 in {"warning", "critical"}
             )
@@ -1925,6 +2057,7 @@ class ValidatorServer:
             drand_round_backward_tolerance=DRAND_ROUND_BACKWARD_TOLERANCE,
             upload_precommit_enabled=True,
             prompt_mismatch_circuit_breaker=prompt_mismatch_circuit,
+            no_reveal_circuit_breaker=no_reveal_circuit,
             submission_upload_grace_seconds=SUBMISSION_UPLOAD_GRACE_SECONDS,
             batch_size=B_BATCH,
             queue_depth=self.submit_queue_depth,
@@ -2596,11 +2729,6 @@ class ValidatorServer:
             )
             return "expired", receipt
 
-        revealed = getattr(
-            type(receipt.batcher), "mark_upload_precommit_revealed", None
-        )
-        if revealed is not None:
-            revealed(receipt.batcher, receipt.receipt_id)
         if (
             payload_bytes != receipt.payload_bytes
             or not secrets.compare_digest(
@@ -2616,6 +2744,12 @@ class ValidatorServer:
                 ),
             )
             return "invalid", receipt
+        revealed = getattr(
+            type(receipt.batcher), "mark_upload_precommit_revealed", None
+        )
+        if revealed is not None:
+            revealed(receipt.batcher, receipt.receipt_id)
+        self._record_valid_reveal(receipt)
         receipt.consumed = True
         return "valid", receipt
 
@@ -2725,6 +2859,36 @@ class ValidatorServer:
                 accepted=True, reason=RejectReason.SUBMITTED
             )
 
+        t_arrival = float(
+            getattr(http_request.state, "t_arrival", time.time())
+        )
+        if t_arrival > self._receipt_collection_deadline(receipt):
+            if receipt.upload_started_at_wall is None:
+                self._record_no_reveal(receipt)
+            receipt.consumed = True
+            outcome = BatchSubmissionResponse(
+                accepted=False,
+                reason=RejectReason.PRECOMMIT_EXPIRED,
+            )
+            self._complete_upload_receipt(receipt, outcome, expired=True)
+            logger.warning(
+                "upload_precommit_start_rejected window=%d env=%s "
+                "hotkey=%s reason=%s",
+                receipt.window_start,
+                receipt.environment,
+                receipt.miner_hotkey[:12],
+                "upload_started_after_collection",
+            )
+            response.headers["Connection"] = "close"
+            return outcome
+
+        http_request.state.upload_start_callback = (
+            lambda started_at: self._mark_upload_started(
+                receipt,
+                t_arrival=started_at,
+            )
+        )
+
         raw_content_length = http_request.headers.get("content-length")
         try:
             content_length_bytes = (
@@ -2738,13 +2902,6 @@ class ValidatorServer:
             content_length_bytes is not None
             and content_length_bytes != receipt.payload_bytes
         ):
-            marker = getattr(
-                type(receipt.batcher),
-                "mark_upload_precommit_revealed",
-                None,
-            )
-            if marker is not None:
-                marker(receipt.batcher, receipt.receipt_id)
             receipt.consumed = True
             outcome = BatchSubmissionResponse(
                 accepted=False,
@@ -2774,9 +2931,30 @@ class ValidatorServer:
             )
 
         raw_body = await http_request.body()
-        t_arrival = float(
-            getattr(http_request.state, "t_arrival", time.time())
+        upload_started, start_reason = getattr(
+            http_request.state,
+            "upload_start_result",
+            (False, "upload_body_empty"),
         )
+        if not upload_started:
+            if receipt.upload_started_at_wall is None:
+                self._record_no_reveal(receipt)
+            receipt.consumed = True
+            outcome = BatchSubmissionResponse(
+                accepted=False,
+                reason=RejectReason.PRECOMMIT_EXPIRED,
+            )
+            self._complete_upload_receipt(receipt, outcome, expired=True)
+            logger.warning(
+                "upload_precommit_start_rejected window=%d env=%s "
+                "hotkey=%s reason=%s",
+                receipt.window_start,
+                receipt.environment,
+                receipt.miner_hotkey[:12],
+                start_reason,
+            )
+            response.headers["Connection"] = "close"
+            return outcome
         body_completed_at = float(
             getattr(http_request.state, "body_completed_at", time.time())
         )
@@ -3215,11 +3393,23 @@ class ValidatorServer:
                 )
                 return reject(RejectReason.RATE_LIMITED)
 
-            receipt_id = secrets.token_urlsafe(32)
-            register = getattr(
-                type(batcher), "try_register_upload_precommit", None
+            no_reveal_decision = self._no_reveal_circuit.admit_precommit(
+                environment=request.environment,
+                operator=operator,
+                window=request.window_start,
+                precommit_signature=request.precommit_signature,
             )
-            if register is None:
+            if not no_reveal_decision.allowed:
+                logger.warning(
+                    "no_reveal_circuit_rejected window=%d env=%s "
+                    "hotkey=%s operator=%s status=%s retry_after_window=%s",
+                    request.window_start,
+                    request.environment,
+                    request.miner_hotkey[:12],
+                    str(operator or "")[:12],
+                    no_reveal_decision.status,
+                    no_reveal_decision.retry_after_window,
+                )
                 if circuit_decision.canary:
                     self._prompt_mismatch_circuit.cancel_canary(
                         environment=request.environment,
@@ -3227,6 +3417,30 @@ class ValidatorServer:
                         window=request.window_start,
                         precommit_signature=request.precommit_signature,
                     )
+                return reject(RejectReason.RATE_LIMITED)
+
+            def cancel_circuit_canaries() -> None:
+                if circuit_decision.canary:
+                    self._prompt_mismatch_circuit.cancel_canary(
+                        environment=request.environment,
+                        identities=circuit_identities,
+                        window=request.window_start,
+                        precommit_signature=request.precommit_signature,
+                    )
+                if no_reveal_decision.canary:
+                    self._no_reveal_circuit.cancel_canary(
+                        environment=request.environment,
+                        operator=operator,
+                        window=request.window_start,
+                        precommit_signature=request.precommit_signature,
+                    )
+
+            receipt_id = secrets.token_urlsafe(32)
+            register = getattr(
+                type(batcher), "try_register_upload_precommit", None
+            )
+            if register is None:
+                cancel_circuit_canaries()
                 return reject(RejectReason.PRECOMMIT_INVALID)
             try:
                 accepted, register_reason, deadline_monotonic = register(
@@ -3237,22 +3451,10 @@ class ValidatorServer:
                     payload_bytes=request.payload_bytes,
                 )
             except Exception:
-                if circuit_decision.canary:
-                    self._prompt_mismatch_circuit.cancel_canary(
-                        environment=request.environment,
-                        identities=circuit_identities,
-                        window=request.window_start,
-                        precommit_signature=request.precommit_signature,
-                    )
+                cancel_circuit_canaries()
                 raise
             if not accepted or deadline_monotonic is None:
-                if circuit_decision.canary:
-                    self._prompt_mismatch_circuit.cancel_canary(
-                        environment=request.environment,
-                        identities=circuit_identities,
-                        window=request.window_start,
-                        precommit_signature=request.precommit_signature,
-                    )
+                cancel_circuit_canaries()
                 logger.warning(
                     "upload_precommit_register_rejected window=%d env=%s "
                     "prompt=%d hotkey=%s internal_reason=%s",
@@ -3669,6 +3871,7 @@ class ValidatorServer:
                     environment=submission_env_name,
                     payload_bytes=payload_bytes,
                     payload_sha256=payload_sha256,
+                    upload_started_at=float(t_arrival),
                     body_completed_at=body_completed_at,
                 )
                 if precommit_status == "expired":
@@ -5239,3 +5442,4 @@ class ValidatorServer:
             self._task = None
             self._server = None
         await asyncio.to_thread(self._prompt_mismatch_circuit.close)
+        await asyncio.to_thread(self._no_reveal_circuit.close)

@@ -86,9 +86,9 @@ UPLOAD_GRACE_PERIOD = ACTIVE_PROTOCOL_PROFILE.upload_grace_seconds
 assert UPLOAD_GRACE_PERIOD == BLOCK_TIME_VARIANCE + NETWORK_UPLOAD_LATENCY
 
 # A miner may commit a completed submission before the auction deadline and
-# finish uploading the matching body during this bounded reveal interval.  The
-# grace never extends generation: only a signed Merkle root and exact body size
-# received before the collection cutoff can arm it.
+# finish uploading the matching body during this bounded reveal interval. The
+# grace never extends generation: the matching body must actually start
+# arriving before the collection cutoff to arm it.
 SUBMISSION_UPLOAD_GRACE_SECONDS = float(UPLOAD_GRACE_PERIOD)
 
 # ────────────────  ROLLOUT GENERATION  ────────────────
@@ -768,6 +768,18 @@ PROMPT_MISMATCH_CIRCUIT_ENABLED = _os.environ.get(
 PROMPT_MISMATCH_CIRCUIT_FAILURE_THRESHOLD = 3
 PROMPT_MISMATCH_CIRCUIT_FAILURE_WINDOW_WINDOWS = 10
 PROMPT_MISMATCH_CIRCUIT_COOLDOWN_WINDOWS = (10, 50, 250)
+
+# A signed upload receipt is only a network grace token: until its exact body
+# starts arriving it must neither consume productive grading capacity nor keep
+# a window open past collection. Repeated receipts that never start an upload
+# are tracked at the immutable metagraph-operator scope so rotating hotkeys
+# cannot recreate the squatting channel.
+NO_REVEAL_CIRCUIT_ENABLED = _os.environ.get(
+    "RELIQUARY_NO_REVEAL_CIRCUIT_ENABLED", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+NO_REVEAL_CIRCUIT_FAILURE_THRESHOLD = 4
+NO_REVEAL_CIRCUIT_FAILURE_WINDOW_WINDOWS = 10
+NO_REVEAL_CIRCUIT_COOLDOWN_WINDOWS = (10, 50, 250)
 
 # Process-isolated auction preparation. These hard per-candidate walls make the
 # accepted receipt population drainable even when submitted math or code is
