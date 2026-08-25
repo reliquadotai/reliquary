@@ -217,9 +217,15 @@ class ProofWorkerPool:
         self._start_timeout_seconds = float(start_timeout_seconds)
         self._revisions: dict[str, str | None] = {}
         self._workers: dict[str, _Worker] = {}
-        # Guards the workers map itself, so two threads racing a respawn do
-        # not each start a process for the same device.
+        # Guards the maps themselves. Held only for dict access — never
+        # across a spawn, which can block for start_timeout_seconds while a
+        # replica loads. With one slot that was invisible; with N it would
+        # park every other slot's dispatch thread behind one respawn, past
+        # MAX_PROOF_WALL_SECONDS, and fault the plane.
         self._spawn_lock = threading.Lock()
+        # One lock per slot, so two threads racing a respawn still do not
+        # each start a process for the SAME slot.
+        self._device_spawn_locks: dict[str, threading.Lock] = {}
         self._context = multiprocessing.get_context("spawn")
 
     @property
@@ -307,8 +313,15 @@ class ProofWorkerPool:
         self._revisions[device_id] = payload
         return _Worker(device_id=device_id, process=process, connection=parent_conn)
 
-    def _request(self, device_id: str, operation: str, args, kwargs) -> Any:
+    def _device_spawn_lock(self, device_id: str) -> Any:
         with self._spawn_lock:
+            lock = self._device_spawn_locks.get(device_id)
+            if lock is None:
+                lock = self._device_spawn_locks[device_id] = threading.Lock()
+            return lock
+
+    def _request(self, device_id: str, operation: str, args, kwargs) -> Any:
+        with self._device_spawn_lock(device_id):
             worker = self._worker_for(device_id)
         with worker.lock:
             return self._exchange(worker, device_id, operation, args, kwargs)
@@ -488,15 +501,25 @@ def _install_from_hub(
     from reliquary.constants import ATTN_IMPLEMENTATION
     from reliquary.shared import modeling
 
+    from reliquary.validator.proof_capacity import physical_proof_device
+
+    # Assembled on the host first, then the old replica is released before the
+    # replacement touches the card: holding both is 20.4 GB on one GPU, and
+    # with several slots that spike lands on a card that is already full.
     model = modeling.load_text_generation_model(
         repo_id,
         torch_dtype=torch.bfloat16,
         attn_implementation=ATTN_IMPLEMENTATION,
         revision=checkpoint_revision,
     )
-    from reliquary.validator.proof_capacity import physical_proof_device
-
     device = context.get("device")
+    # A failed move leaves no model, so the next proof raises and the worker is
+    # retired and respawned — the same fail-closed path a dead worker takes,
+    # and better than an OOM that takes every other slot down with it.
+    context["model"] = None
+    context["revision"] = None
+    if getattr(torch, "cuda", None) is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
     if device is not None and hasattr(model, "to"):
         model = model.to(physical_proof_device(device))
     model = model.eval()
@@ -621,7 +644,7 @@ def assert_proof_slots_supported(
 
 
 def validator_replica_device(
-    *, isolation: bool | None = None, gpu_device: str = "cuda:0",
+    *, isolated_plane: bool, gpu_device: str = "cuda:0",
 ) -> str:
     """Device for the validator's OWN train/verify replicas.
 
@@ -632,13 +655,13 @@ def validator_replica_device(
     ``nvidia-smi pmon`` reported ``sm = 0`` across a full proof burst. Keeping
     the pair on the CPU hands that budget to the workers instead.
 
-    ``isolation`` is injectable for tests; production reads the live flag.
+    ``isolated_plane`` is whether a plane was actually BUILT, not whether the
+    flag is set: RELIQUARY_PROOF_PROCESS_ISOLATION can be on while no proof
+    device resolves (a protocol profile below v3), and then the batcher still
+    proves in-process against this replica. Deciding on the flag alone would
+    leave a flash-attention-2 model on the CPU and prove there, silently.
     """
-    if isolation is None:
-        from reliquary.constants import PROOF_PROCESS_ISOLATION
-
-        isolation = bool(PROOF_PROCESS_ISOLATION)
-    return "cpu" if isolation else gpu_device
+    return "cpu" if isolated_plane else gpu_device
 
 
 def assert_isolation_supported(

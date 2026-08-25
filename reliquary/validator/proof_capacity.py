@@ -14,7 +14,7 @@ from typing import Any, Mapping, Sequence
 _ENVIRONMENTS = ("openmathinstruct", "opencodeinstruct")
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_CUDA_DEVICE_RE = re.compile(r"^cuda:(\d+)(?:#(\d+))?$")
+_CUDA_DEVICE_RE = re.compile(r"^cuda:(\d+)$")
 
 
 class ProofCapacityQualificationError(RuntimeError):
@@ -103,7 +103,7 @@ def _is_canonical_cuda_index(device: Any) -> bool:
     can never inflate a qualified budget.
     """
     match = _CUDA_DEVICE_RE.fullmatch(str(device))
-    if match is None or match.group(2) is not None:
+    if match is None:
         return False
     return str(device) == f"cuda:{int(match.group(1))}"
 
@@ -143,36 +143,36 @@ def resolve_cuda_proof_devices(
     *,
     cuda: Any,
 ) -> tuple[ProofDeviceIdentity, ...]:
-    """Resolve explicit CUDA slots to canonical physical identities.
+    """Resolve explicit CUDA indices to canonical physical identities.
 
-    Slots of one card deliberately share a ``device_uuid``: that is what makes
-    them slots. The physical-GPU guard therefore fires only when two *distinct
-    CUDA indices* resolve to the same card, which is the aliasing accident it
-    was written for.
+    Deliberately physical-only, slot syntax refused: what this returns is
+    handed to ``ProofCapacityQualification.validate``, which counts cards. Ask
+    for more processes with ``RELIQUARY_PROOF_SLOTS_PER_DEVICE``, which widens
+    the plane *after* this resolution and leaves capacity alone.
     """
 
     available = int(cuda.device_count())
     resolved: list[ProofDeviceIdentity] = []
     device_ids: set[str] = set()
-    index_by_uuid: dict[str, int] = {}
+    device_uuids: set[str] = set()
     for raw_device in raw_devices:
         value = str(raw_device).strip()
         match = _CUDA_DEVICE_RE.fullmatch(value)
         if match is None:
             raise ProofCapacityQualificationError(
-                "proof devices must use explicit cuda:<index>[#<slot>] syntax"
+                "proof devices must use explicit cuda:<index> syntax "
+                "(for several processes per card set "
+                "RELIQUARY_PROOF_SLOTS_PER_DEVICE)"
             )
         index = int(match.group(1))
         if index < 0 or index >= available:
             raise ProofCapacityQualificationError(
                 f"proof device {value!r} is outside the visible CUDA fleet"
             )
-        slot = match.group(2)
-        device_id = f"cuda:{index}" if slot is None else f"cuda:{index}#{int(slot)}"
+        device_id = f"cuda:{index}"
         if device_id in device_ids:
             raise ProofCapacityQualificationError(
-                "configured proof devices resolve to duplicate CUDA indices "
-                "or slots"
+                "configured proof devices resolve to duplicate CUDA indices"
             )
         hardware_class = str(cuda.get_device_name(index)).strip()
         properties = cuda.get_device_properties(index)
@@ -185,11 +185,12 @@ def resolve_cuda_proof_devices(
             raise ProofCapacityQualificationError(
                 f"proof device {device_id!r} has no stable GPU UUID"
             )
-        if index_by_uuid.setdefault(device_uuid, index) != index:
+        if device_uuid in device_uuids:
             raise ProofCapacityQualificationError(
                 "configured proof devices resolve to the same physical GPU"
             )
         device_ids.add(device_id)
+        device_uuids.add(device_uuid)
         resolved.append(
             ProofDeviceIdentity(
                 device_id=device_id,

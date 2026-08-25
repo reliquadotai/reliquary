@@ -519,17 +519,45 @@ def validate(
             )
             tokenizer = load_tokenizer(checkpoint, **base_load_kwargs)
 
-            # Device decision lives in load_validator_replica: with an
-            # isolated proof plane this process neither trains nor proves, so
-            # its pair stays on the CPU and the GPU budget goes to the workers.
-            model = load_validator_replica(checkpoint, **base_load_kwargs)
+            # Resolve the proof plane's topology BEFORE loading this process's
+            # replica: whether the plane is isolated decides which device that
+            # replica belongs on, and "isolated" means a plane was actually
+            # built, not merely that the flag is set.
+            from reliquary.constants import DETACHED_TRAINER
+            from reliquary.validator.proof_capacity import expand_proof_slots
+            from reliquary.validator.proof_worker import (
+                assert_isolation_supported,
+                assert_proof_slots_supported,
+            )
 
+            assert_isolation_supported(
+                isolation=PROOF_PROCESS_ISOLATION,
+                detached_trainer=DETACHED_TRAINER,
+            )
+            assert_proof_slots_supported(
+                slots_per_device=PROOF_SLOTS_PER_DEVICE,
+                isolation=PROOF_PROCESS_ISOLATION,
+            )
             proof_device_identities = _configured_proof_device_identities(
                 torch
             )
             proof_devices = tuple(
                 identity.device_id for identity in proof_device_identities
             )
+            # Capacity is validated against the PHYSICAL devices below and must
+            # stay that way — it is a claim about cards, not processes. Only
+            # the plane is widened to one entry per proof slot.
+            proof_slots = expand_proof_slots(
+                proof_devices, PROOF_SLOTS_PER_DEVICE
+            )
+            isolated_plane = bool(PROOF_PROCESS_ISOLATION and proof_slots)
+
+            model = load_validator_replica(
+                checkpoint,
+                isolated_plane=isolated_plane,
+                **base_load_kwargs,
+            )
+
             proof_capacity_qualification = None
             if PROTOCOL_VERSION >= 3:
                 from reliquary.shared.runtime_fingerprint import (
@@ -612,28 +640,7 @@ def validate(
                 )
             proof_models = {}
             proof_worker_pool = None
-            from reliquary.constants import DETACHED_TRAINER
-            from reliquary.validator.proof_capacity import expand_proof_slots
-            from reliquary.validator.proof_worker import (
-                assert_isolation_supported,
-                assert_proof_slots_supported,
-            )
-
-            assert_isolation_supported(
-                isolation=PROOF_PROCESS_ISOLATION,
-                detached_trainer=DETACHED_TRAINER,
-            )
-            assert_proof_slots_supported(
-                slots_per_device=PROOF_SLOTS_PER_DEVICE,
-                isolation=PROOF_PROCESS_ISOLATION,
-            )
-            # Capacity was validated against the PHYSICAL devices above and
-            # must stay that way — it is a claim about cards, not processes.
-            # Only the plane below is widened to one entry per proof slot.
-            proof_slots = expand_proof_slots(
-                proof_devices, PROOF_SLOTS_PER_DEVICE
-            )
-            if PROOF_PROCESS_ISOLATION and proof_slots:
+            if isolated_plane:
                 # The proof plane leaves this interpreter: every replica is
                 # loaded by a worker, this process keeps its own pair on the
                 # CPU, and the event loop can no longer convoy a proof thread

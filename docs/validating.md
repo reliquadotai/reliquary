@@ -157,7 +157,9 @@ never slots.
 With an isolated plane the validator's own train/verify pair no longer needs a
 GPU — it neither trains (the detached trainer owns that) nor proves (each
 worker holds its own replica) — so it loads on the CPU and the card is left to
-the proof workers. Expect ~16 GB of host RAM for that pair.
+the proof workers. Budget **~24 GB of host RAM**: the pair is ~16 GB steady,
+but `RELIQUARY_RESUME_FROM` rebinds `train_model` only after the replacement
+has loaded, so three replicas are alive for a moment at every boot.
 
 The CLI compatibility default remains `openmathinstruct`, but the production
 auction contract is mixed Math+Code. Configure the trainer explicitly:

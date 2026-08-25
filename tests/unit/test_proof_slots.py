@@ -96,33 +96,26 @@ def test_a_slot_resolves_to_its_physical_device():
     assert physical_proof_device("cuda:1") == "cuda:1"
 
 
-def test_slots_of_one_gpu_resolve_without_a_duplicate_gpu_error():
-    """The duplicate-GPU guard exists to catch two ids pointing at one card by
-    accident. Slots say so on purpose, so they must resolve — while keeping
-    their distinct ids, which is what gives the pool one process each."""
-    resolved = resolve_cuda_proof_devices(
-        ("cuda:0#0", "cuda:0#1"), cuda=_FakeCuda()
-    )
+def test_proof_devices_names_cards_and_never_slots():
+    """RELIQUARY_PROOF_DEVICES is the physical fleet; slots come from the count.
 
-    assert [identity.device_id for identity in resolved] == [
-        "cuda:0#0", "cuda:0#1",
-    ]
-    assert {identity.device_uuid for identity in resolved} == {"gpu-0"}
+    Slot ids resolved here would flow straight into
+    ``ProofCapacityQualification.validate``, which refuses non-canonical
+    indices and duplicate GPU uuids — so an operator who wrote them would get
+    a boot crash-loop. Refuse them at the point they are read, and keep the
+    error message pointing at the one syntax that works.
+    """
+    with pytest.raises(
+        ProofCapacityQualificationError, match="explicit cuda:<index>"
+    ):
+        resolve_cuda_proof_devices(("cuda:0#0", "cuda:0#1"), cuda=_FakeCuda())
 
 
 def test_an_accidental_duplicate_device_is_still_refused():
     with pytest.raises(
-        ProofCapacityQualificationError, match="duplicate CUDA"
+        ProofCapacityQualificationError, match="duplicate CUDA indices"
     ):
         resolve_cuda_proof_devices(("cuda:0", "cuda:0"), cuda=_FakeCuda())
-
-
-def test_two_slots_naming_the_same_index_twice_are_refused():
-    """``cuda:0#0`` twice is a config bug, not a request for two processes."""
-    with pytest.raises(
-        ProofCapacityQualificationError, match="duplicate CUDA"
-    ):
-        resolve_cuda_proof_devices(("cuda:0#0", "cuda:0#0"), cuda=_FakeCuda())
 
 
 def test_extra_slots_require_an_isolated_plane():
@@ -176,6 +169,46 @@ def test_a_slot_loads_onto_its_physical_device(monkeypatch):
     assert context["device"] == "cuda:0#1"
 
 
+def test_hub_reload_frees_the_old_replica_before_the_new_one_lands(monkeypatch):
+    """Two replicas on one card at once is 20.4 GB.
+
+    ``_install_from_hub`` is the durable fallback taken whenever the staged
+    snapshot has been rmtree'd — i.e. after any worker respawn. Holding the old
+    replica while the replacement lands doubles that slot's footprint, and with
+    four slots sized at 10.2 GB each the spike crosses the ~88% occupancy where
+    the allocator cliff starts.
+    """
+    import reliquary.shared.modeling as modeling
+    from reliquary.validator import proof_worker
+
+    events: list[tuple[str, bool]] = []
+
+    class _Replica:
+        def eval(self):
+            return self
+
+        def parameters(self):
+            return iter(())
+
+    old = _Replica()
+    context: dict = {"model": old, "device": "cuda:0#1", "revision": None}
+
+    class _New(_Replica):
+        def to(self, device):
+            events.append(("landed", context.get("model") is old))
+            return self
+
+    monkeypatch.setattr(
+        modeling, "load_text_generation_model", lambda *a, **k: _New()
+    )
+    proof_worker._install_from_hub(context, "owner/repo", "a" * 40)
+
+    assert events == [("landed", False)], (
+        "the old replica was still on the card when the new one landed"
+    )
+    assert context["revision"] == "a" * 40
+
+
 def test_each_slot_of_one_gpu_gets_its_own_process():
     """The pool keys on the slot, not on the card.
 
@@ -198,6 +231,52 @@ def test_each_slot_of_one_gpu_gets_its_own_process():
         pool.close()
 
     assert first["pid"] != second["pid"]
+
+
+def test_a_slow_respawn_does_not_block_the_other_slots():
+    """A replica load must not park every other slot behind it.
+
+    ``_request`` used to take the pool-wide spawn lock around ``_worker_for``,
+    which can block for ``start_timeout_seconds`` (wired to 900 s) while a
+    replacement worker loads its replica. With one slot there was one dispatch
+    thread and it never showed. With N slots one dead worker would stall every
+    other slot far past MAX_PROOF_WALL_SECONDS, whose jobs then trip the
+    active-proof deadline and fault the whole plane.
+    """
+    from reliquary.validator.proof_worker import ProofWorkerPool
+
+    support = "tests.unit.proof_worker_support"
+    slots = expand_proof_slots(("cuda:0",), 2)
+    pool = ProofWorkerPool(
+        devices=slots,
+        context_factory=f"{support}:build_slow_context",
+        handler=f"{support}:echo_handler",
+        factory_kwargs={"slow_device": slots[0], "seconds": "5"},
+    )
+    # Deliberately not started: the first request spawns the worker, which is
+    # the respawn path a mid-window worker death takes.
+    done = threading.Event()
+
+    def call_slow():
+        try:
+            pool.call(slots[0], "slow")
+        finally:
+            done.set()
+
+    slow = threading.Thread(target=call_slow, daemon=True)
+    slow.start()
+    time.sleep(0.5)  # let the slow spawn get under way
+    try:
+        started = time.monotonic()
+        pool.call(slots[1], "fast")
+        elapsed = time.monotonic() - started
+    finally:
+        done.wait(30)
+        pool.close()
+
+    assert elapsed < 4.0, (
+        f"the second slot waited {elapsed:.1f}s behind the first slot's spawn"
+    )
 
 
 def test_slots_of_one_gpu_prove_concurrently():
