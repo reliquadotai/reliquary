@@ -393,6 +393,17 @@ async def submit_batch_v2(
                 )
                 if not precommit_verdict.accepted:
                     if (
+                        precommit_verdict.reason is RejectReason.BATCH_FILLED
+                        and attempt < len(_RETRY_DELAYS)
+                    ):
+                        # Upload capacity is a live reservation pool: cheap
+                        # terminal rejects may return a slot immediately.  Keep
+                        # the exact signed precommit and retry with the existing
+                        # bounded backoff rather than turning a transient burst
+                        # into a permanent missed window.
+                        await asyncio.sleep(delay)
+                        continue
+                    if (
                         precommit_verdict.reason is RejectReason.STALE_ROUND
                         and attempt < len(_RETRY_DELAYS)
                     ):

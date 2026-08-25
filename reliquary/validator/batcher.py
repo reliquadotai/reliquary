@@ -41,14 +41,16 @@ from reliquary.constants import (
     MAX_PENDING_SUBMISSION_BYTES_PER_ENV,
     MAX_PENDING_SUBMISSION_BYTES_PER_HOTKEY,
     MAX_PENDING_UPLOAD_PRECOMMITS_PER_ENV,
+    MAX_PENDING_UPLOAD_PRECOMMITS_PER_HOTKEY,
+    MAX_PENDING_UPLOAD_PRECOMMITS_PER_OPERATOR,
     MAX_GRADING_STARTS_PER_WINDOW,
     MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
     MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW,
     MAX_PROOF_WALL_SECONDS,
     MAX_SEAL_QUEUE_DRAIN_SECONDS,
     MAX_SUBMISSION_PAYLOAD_BYTES,
-    MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
     MAX_SUBMISSIONS_PER_PROMPT,
+    MAX_UPLOAD_PRECOMMITS_PER_ENV_PER_WINDOW,
     PROMPT_RANGE_SIZE,
     PROMPT_RANGE_ENFORCE_FROM_WINDOW,
     PROTOCOL_PROFILE_ID,
@@ -692,6 +694,7 @@ class RewardComputation:
 @dataclass
 class _UploadPrecommitReservation:
     hotkey: str
+    operator: str
     deadline: float
     payload_bytes: int
     revealed: bool = False
@@ -1041,10 +1044,16 @@ class GrpoWindowBatcher:
             str, _UploadPrecommitReservation
         ] = {}
         self._upload_precommit_payload_bytes = 0
+        # Precommits reserve the same productive capacity that a clean reveal
+        # later consumes.  The token is transferred atomically into
+        # ``_proof_grading_charged``; terminal pre-grading rejects release it.
+        self._upload_precommit_capacity_reserved = 0
         self._upload_precommit_accepted = 0
         self._upload_precommit_revealed = 0
         self._upload_precommit_terminal = 0
         self._upload_precommit_expired = 0
+        self._upload_precommit_peak_pending = 0
+        self._upload_precommit_rejections: dict[str, int] = {}
         # v2.1: checkpoint hash miners must match. Empty string disables
         # the gate (test convenience / pre-first-publish).
         self.current_checkpoint_hash: str = ""
@@ -1142,6 +1151,24 @@ class GrpoWindowBatcher:
         """Whether the generation/commit phase has reached its fixed cutoff."""
         return self._time_fn() - self.window_opened_at >= WINDOW_COLLECTION_SECONDS
 
+    def _record_upload_precommit_rejection_locked(self, reason: str) -> None:
+        self._upload_precommit_rejections[reason] = (
+            self._upload_precommit_rejections.get(reason, 0) + 1
+        )
+
+    def _productive_capacity_used_locked(self) -> int:
+        """Capacity owned by uploads, direct queue items and started work.
+
+        Callers hold ``_upload_precommit_lock`` then
+        ``_proof_admission_lock``.  A revealed upload transfers one unit from
+        the first term to the last without opening an oversubscription race.
+        """
+        return (
+            self._upload_precommit_capacity_reserved
+            + len(self._pending_proof_reservations)
+            + self._proof_grading_charged
+        )
+
     def _prune_upload_precommits_locked(self, now: float) -> None:
         expired = [
             receipt_id
@@ -1163,6 +1190,10 @@ class GrpoWindowBatcher:
     ) -> None:
         if not reservation.payload_transferred:
             with self._proof_admission_lock:
+                self._upload_precommit_capacity_reserved = max(
+                    0,
+                    self._upload_precommit_capacity_reserved - 1,
+                )
                 self._upload_precommit_payload_bytes = max(
                     0,
                     self._upload_precommit_payload_bytes
@@ -1204,24 +1235,52 @@ class GrpoWindowBatcher:
                 return False, "collection_sealed", None
             if (
                 self._upload_precommit_accepted
-                >= MAX_PENDING_UPLOAD_PRECOMMITS_PER_ENV
+                >= MAX_UPLOAD_PRECOMMITS_PER_ENV_PER_WINDOW
             ):
-                return False, "precommit_capacity_full", None
+                reason = "precommit_window_budget_full"
+                self._record_upload_precommit_rejection_locked(reason)
+                return False, reason, None
             if len(self._upload_precommits) >= MAX_PENDING_UPLOAD_PRECOMMITS_PER_ENV:
-                return False, "precommit_capacity_full", None
+                reason = "precommit_active_capacity_full"
+                self._record_upload_precommit_rejection_locked(reason)
+                return False, reason, None
+            operator = self._operator_for_hotkey(hotkey)
+            if operator is None:
+                reason = "precommit_operator_unmapped"
+                self._record_upload_precommit_rejection_locked(reason)
+                return False, reason, None
             hotkey_count = sum(
                 1
                 for reservation in self._upload_precommits.values()
                 if reservation.hotkey == hotkey
             )
-            if hotkey_count >= MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW:
-                return False, "precommit_hotkey_full", None
+            if hotkey_count >= MAX_PENDING_UPLOAD_PRECOMMITS_PER_HOTKEY:
+                reason = "precommit_hotkey_active_full"
+                self._record_upload_precommit_rejection_locked(reason)
+                return False, reason, None
+            operator_count = sum(
+                1
+                for reservation in self._upload_precommits.values()
+                if reservation.operator == operator
+            )
+            if operator_count >= MAX_PENDING_UPLOAD_PRECOMMITS_PER_OPERATOR:
+                reason = "precommit_operator_active_full"
+                self._record_upload_precommit_rejection_locked(reason)
+                return False, reason, None
             with self._proof_admission_lock:
+                if (
+                    self._productive_capacity_used_locked()
+                    >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+                ):
+                    reason = "precommit_productive_capacity_full"
+                    self._record_upload_precommit_rejection_locked(reason)
+                    return False, reason, None
                 payload_reason = self._payload_capacity_reason_locked(
                     hotkey, payload_bytes
                 )
                 if payload_reason is not None:
                     return False, payload_reason, None
+                self._upload_precommit_capacity_reserved += 1
                 self._upload_precommit_payload_bytes += payload_bytes
                 self._payload_bytes_by_hotkey[hotkey] = (
                     self._payload_bytes_by_hotkey.get(hotkey, 0)
@@ -1236,11 +1295,16 @@ class GrpoWindowBatcher:
             self._upload_precommits[receipt_id] = (
                 _UploadPrecommitReservation(
                     hotkey=hotkey,
+                    operator=operator,
                     deadline=deadline,
                     payload_bytes=payload_bytes,
                 )
             )
             self._upload_precommit_accepted += 1
+            self._upload_precommit_peak_pending = max(
+                self._upload_precommit_peak_pending,
+                len(self._upload_precommits),
+            )
             return True, None, deadline
 
     def mark_upload_precommit_revealed(self, receipt_id: str) -> bool:
@@ -1282,6 +1346,8 @@ class GrpoWindowBatcher:
                 return False, "upload_precommit_missing"
             if reservation.payload_transferred:
                 return False, "proof_reservation_duplicate"
+            if not reservation.revealed:
+                return False, "upload_precommit_not_revealed"
             if reservation.hotkey != request.miner_hotkey:
                 return False, "upload_precommit_hotkey_mismatch"
             with self._proof_admission_lock:
@@ -1322,6 +1388,10 @@ class GrpoWindowBatcher:
                 request._payload_bytes = reservation.payload_bytes
                 request._retain_payload = False
                 reservation.payload_transferred = True
+                self._upload_precommit_capacity_reserved = max(
+                    0,
+                    self._upload_precommit_capacity_reserved - 1,
+                )
                 self._upload_precommit_payload_bytes = max(
                     0,
                     self._upload_precommit_payload_bytes
@@ -1358,6 +1428,16 @@ class GrpoWindowBatcher:
             accepted = self._upload_precommit_accepted
             terminal = self._upload_precommit_terminal
             expired = self._upload_precommit_expired
+            active_untransferred = sum(
+                1
+                for reservation in self._upload_precommits.values()
+                if not reservation.payload_transferred
+            )
+            with self._proof_admission_lock:
+                capacity_reserved = self._upload_precommit_capacity_reserved
+                productive_capacity_used = (
+                    self._productive_capacity_used_locked()
+                )
             return {
                 "accepted_receipts": accepted,
                 "revealed": self._upload_precommit_revealed,
@@ -1366,6 +1446,22 @@ class GrpoWindowBatcher:
                 "terminal_decisions": terminal,
                 "pending": pending,
                 "conserved": accepted == terminal + expired + pending,
+                "pending_limit": MAX_PENDING_UPLOAD_PRECOMMITS_PER_ENV,
+                "total_limit": MAX_UPLOAD_PRECOMMITS_PER_ENV_PER_WINDOW,
+                "peak_pending": self._upload_precommit_peak_pending,
+                "capacity_reserved": capacity_reserved,
+                "productive_capacity_used": productive_capacity_used,
+                "productive_capacity_limit": (
+                    MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+                ),
+                "capacity_conserved": (
+                    capacity_reserved == active_untransferred
+                    and productive_capacity_used
+                    <= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+                ),
+                "capacity_rejections": dict(
+                    self._upload_precommit_rejections
+                ),
             }
 
     def poll_deadline(self) -> bool:
@@ -1383,12 +1479,16 @@ class GrpoWindowBatcher:
             with self._upload_precommit_lock:
                 self._prune_upload_precommits_locked(now)
                 pending_uploads = bool(self._upload_precommits)
-            if pending_uploads and (
-                now - self.window_opened_at
-                < WINDOW_COLLECTION_SECONDS + SUBMISSION_UPLOAD_GRACE_SECONDS
-            ):
-                return False
-            self._seal_flag.set()
+                if pending_uploads and (
+                    now - self.window_opened_at
+                    < WINDOW_COLLECTION_SECONDS
+                    + SUBMISSION_UPLOAD_GRACE_SECONDS
+                ):
+                    return False
+                # Set while holding the same lock used by register: a new
+                # receipt is therefore entirely before the seal or rejected
+                # after it, never stranded between the final drain and flag.
+                self._seal_flag.set()
             if self._seal_event is not None:
                 self._seal_event.set()
             return True
@@ -1402,10 +1502,11 @@ class GrpoWindowBatcher:
         invalidated beacon or a sparse-window liveness breaker; the downstream
         training path already skips partial batches.
         """
-        if self._seal_flag.is_set():
-            return
-        self.force_seal_reason = reason
-        self._seal_flag.set()
+        with self._upload_precommit_lock:
+            if self._seal_flag.is_set():
+                return
+            self.force_seal_reason = reason
+            self._seal_flag.set()
         if self._seal_event is not None:
             self._seal_event.set()
 
@@ -1529,16 +1630,21 @@ class GrpoWindowBatcher:
         # The commit path takes these locks in the same order.  Returning from
         # this method therefore guarantees that no commit which observed the
         # old generation is still mutating the auction population.
-        with self._lock:
-            with self._proof_admission_lock:
-                self._seal_snapshot_started = True
+        with (
+            self._upload_precommit_lock,
+            self._lock,
+            self._proof_admission_lock,
+        ):
+            self._seal_snapshot_started = True
 
     @property
     def proof_grading_capacity_used(self) -> int:
-        """Charged attempts plus pending reservations used for admission."""
-        return self._proof_grading_charged + len(
-            self._pending_proof_reservations
-        )
+        """Upload, direct-pending and charged productive capacity in use."""
+        now = self._time_fn()
+        with self._upload_precommit_lock:
+            self._prune_upload_precommits_locked(now)
+            with self._proof_admission_lock:
+                return self._productive_capacity_used_locked()
 
     @property
     def post_trigger_proof_admission_count(self) -> int:
@@ -1707,6 +1813,16 @@ class GrpoWindowBatcher:
         self,
         request: BatchSubmissionRequest,
     ) -> tuple[bool, str | None]:
+        """Reserve direct work without oversubscribing upload reservations."""
+        now = self._time_fn()
+        with self._upload_precommit_lock:
+            self._prune_upload_precommits_locked(now)
+            return self._try_reserve_proof_admission_locked(request)
+
+    def _try_reserve_proof_admission_locked(
+        self,
+        request: BatchSubmissionRequest,
+    ) -> tuple[bool, str | None]:
         """Reserve a *grading* slot for this window (the anti-DoS bound).
 
         Admission is gated by started work plus pending reservations, the
@@ -1748,6 +1864,7 @@ class GrpoWindowBatcher:
             if (
                 self._proof_grading_charged
                 + len(self._pending_proof_reservations)
+                + self._upload_precommit_capacity_reserved
                 >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
             ):
                 return False, "proof_grading_attempts_full"

@@ -330,6 +330,75 @@ async def test_submit_batch_v2_refreshes_stale_precommit_after_backoff(
 
 
 @pytest.mark.asyncio
+async def test_submit_batch_v2_retries_transient_precommit_capacity(
+    monkeypatch,
+):
+    import reliquary.miner.submitter as submitter
+
+    events = []
+    precommit_bodies = []
+
+    async def _sleep(delay):
+        events.append(("sleep", delay))
+
+    async def _post(self, url, content=None, headers=None, timeout=None):
+        body = json.loads(content)
+        if url.endswith("/submit/precommit"):
+            precommit_bodies.append(body)
+            events.append(("precommit", len(precommit_bodies)))
+            if len(precommit_bodies) == 1:
+                return httpx.Response(
+                    200,
+                    json={
+                        "accepted": False,
+                        "reason": RejectReason.BATCH_FILLED.value,
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "accepted": True,
+                    "reason": RejectReason.ACCEPTED.value,
+                    "receipt_id": "receipt-after-capacity-recycled",
+                    "upload_deadline_ts": 123.0,
+                },
+            )
+        events.append(("reveal", headers["X-Reliquary-Precommit"]))
+        return httpx.Response(
+            200,
+            json={
+                "accepted": True,
+                "reason": RejectReason.SUBMITTED.value,
+            },
+        )
+
+    monkeypatch.setattr(submitter, "_RETRY_DELAYS", (1.0, 2.0))
+    monkeypatch.setattr(submitter.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(submitter, "sign_envelope", lambda **kwargs: b"envelope")
+    monkeypatch.setattr(submitter, "sign_precommit", lambda **kwargs: b"precommit")
+    monkeypatch.setattr(httpx.AsyncClient, "post", _post)
+
+    async with httpx.AsyncClient() as client:
+        response = await submit_batch_v2(
+            "http://fake",
+            _v2_request(),
+            client=client,
+            wallet=object(),
+            randomness="ab" * 32,
+            drand_round_fn=lambda: 100,
+        )
+
+    assert response.accepted is True
+    assert events == [
+        ("precommit", 1),
+        ("sleep", 1.0),
+        ("precommit", 2),
+        ("reveal", "receipt-after-capacity-recycled"),
+    ]
+    assert precommit_bodies[0] == precommit_bodies[1]
+
+
+@pytest.mark.asyncio
 async def test_submit_batch_v2_waits_out_unsafe_drand_boundary(monkeypatch):
     import reliquary.miner.submitter as submitter
 
