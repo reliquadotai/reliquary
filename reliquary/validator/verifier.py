@@ -1587,36 +1587,12 @@ def _completion_context_for_position(
     return f"{left[-chars:]}{token}{right[:chars]}"
 
 
-_CODE_FENCE_RE = re.compile(
-    r"(```|~~~)(?:python3?|py)?\s*\n(.*?)\n\1",
-    re.DOTALL,
-)
 _COMPARE_OP_RE = re.compile(
     r"\bnot\s+in\b|\bis\s+not\b|==|!=|<=|>=|<|>|\bis\b|\bin\b"
 )
 _BINOP_RE = re.compile(r"\*\*|//|<<|>>|[@+\-*/%&|^]")
 _BOOLOP_RE = re.compile(r"\b(?:and|or)\b")
 _UNARYOP_RE = re.compile(r"\bnot\b|[+\-~]")
-
-
-def _extract_python_span(completion: str) -> tuple[str, int, int] | None:
-    """Return ``(code, start, end)`` for the last Python code block.
-
-    Falls back to the raw completion only when it parses as Python. OpenCode
-    completions normally fence the answer, but accepting raw code keeps this
-    shadow check useful for simpler local tests and miner outputs.
-    """
-    if not completion:
-        return None
-    matches = list(_CODE_FENCE_RE.finditer(completion))
-    if matches:
-        m = matches[-1]
-        return m.group(2), m.start(2), m.end(2)
-    try:
-        ast.parse(completion)
-    except SyntaxError:
-        return None
-    return completion, 0, len(completion)
 
 
 def _line_offsets(source: str) -> list[int]:
@@ -1810,6 +1786,7 @@ def evaluate_code_semantic_token_authenticity(
     include_findings: bool = False,
     max_findings: int | None = None,
     context_chars: int = 80,
+    entry_name: str | None = None,
 ) -> tuple[bool, dict]:
     """Shadow check for post-hoc edits to OpenCode semantic tokens.
 
@@ -1841,7 +1818,12 @@ def evaluate_code_semantic_token_authenticity(
 
     completion_tokens = list(tokens[prompt_length: prompt_length + completion_length])
     completion_text, offsets = _completion_token_offsets(completion_tokens, tokenizer)
-    extracted = _extract_python_span(completion_text)
+    from reliquary.environment.opencodeinstruct import _select_python_span
+
+    extracted = _select_python_span(
+        completion_text,
+        entry_name=entry_name,
+    )
     if extracted is None:
         return True, {}
     code, code_start, _code_end = extracted

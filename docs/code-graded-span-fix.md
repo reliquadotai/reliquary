@@ -64,12 +64,13 @@ would hollow out the middle of that distribution.
 
 ## The change
 
-`_extract_python(completion, entry_name)` returns the last fenced block that
-contains `def <entry_name>`, falling back to `matches[-1]` when no block defines
-it. `entry_name` comes from the structured cases — the same source that already
-writes *"Write your solution as a Python function named …"* into the prompt — so
-nothing is inferred from the completion text. Single-block rollouts (83%) are
-untouched.
+`_extract_python(completion, entry_name)` returns the last fenced block whose
+parsed top-level AST contains an exact `FunctionDef` or `AsyncFunctionDef` for
+`entry_name`, falling back to `matches[-1]` when no block defines it.
+`entry_name` comes from the structured cases — the same source that already
+writes *"Write your solution as a Python function named …"* into the prompt.
+Prefix names, comments, strings and nested helper definitions cannot select the
+wrong block. Single-block rollouts (83%) are untouched.
 
 It also drops the raw-completion fallback: with no fence, the graded span is
 empty rather than the whole rollout. That changes no observed reward — the
@@ -162,12 +163,6 @@ Over the first ~200 windows (≈6 h):
 
 ## Known gaps, not addressed here
 
-- **`_extract_python_span` in `verifier.py` still uses `matches[-1]`.** It feeds
-  the `code_semantic_auth` shadow detector, which needs character offsets into
-  the completion rather than the code string. Under the entry rule the graded span and the
-  authenticated span can therefore differ. The detector reports zero findings in
-  production and is not reward-bearing, but aligning it is a genuine follow-up —
-  it touches the proof path, so it needs its own change and its own review.
 - **The sandbox import allowlist.** `_ALLOWED_IMPORT_ROOTS` holds 17 modules; 33
   of 2 560 rollouts died on it, 15 legitimately (`numpy`, `nltk`) and 14 on
   sensitive stdlib. Four died only on harmless stdlib outside the list — `json`,

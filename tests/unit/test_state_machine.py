@@ -10,6 +10,13 @@ from reliquary.constants import B_BATCH
 from reliquary.protocol.submission import WindowState
 
 
+@pytest.fixture(autouse=True)
+def _isolated_validator_state(tmp_path, monkeypatch):
+    """Unit services must never read or write the host's production state."""
+
+    monkeypatch.setenv("RELIQUARY_STATE_DIR", str(tmp_path))
+
+
 @dataclass
 class _FakeEnv:
     def __len__(self): return 100

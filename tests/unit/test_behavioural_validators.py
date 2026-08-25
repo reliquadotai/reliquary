@@ -705,6 +705,38 @@ def test_code_semantic_auth_can_return_private_finding_details():
     assert "reverse=False" in detail["completion_context"]
 
 
+def test_code_semantic_auth_uses_the_same_entry_block_as_the_grader(monkeypatch):
+    import reliquary.constants as constants
+
+    monkeypatch.setattr(constants, "PROTOCOL_VERSION", 5, raising=False)
+    implementation = (
+        "def second_largest(nums):\n"
+        "    return sorted(set(nums), reverse=False)[-2]"
+    )
+    completion = (
+        f"```python\n{implementation}\n```\n\n"
+        "Example output:\n```python\nTrue\n```"
+    )
+    prompt_len = 5
+    tokens = [0] * prompt_len + _ords(completion)
+    false_pos = completion.index("False")
+    proof = _code_semantic_proof(completion, {false_pos: 2.0e-4})
+
+    ok, metrics = verifier.evaluate_code_semantic_token_authenticity(
+        tokens=tokens,
+        prompt_length=prompt_len,
+        completion_length=len(completion),
+        proof=proof,
+        tokenizer=_CharTokenizer(),
+        threshold=0.001,
+        entry_name="second_largest",
+    )
+
+    assert ok is False
+    assert metrics["findings"] == 1
+    assert metrics["first_label"] == "keyword:reverse"
+
+
 def test_code_semantic_auth_flags_compare_operator_edit():
     completion = (
         "```python\n"

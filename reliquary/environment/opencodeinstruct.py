@@ -14,6 +14,7 @@ testable without the sandbox infrastructure (see tests/unit/).
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -53,6 +54,53 @@ def _entry_function_name(cases: list[dict]) -> str | None:
     return None
 
 
+def _defines_top_level_entry(source: str, entry_name: str) -> bool:
+    """Whether *source* defines the exact callable the grader will resolve."""
+
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, TypeError):
+        return False
+    return any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == entry_name
+        for node in tree.body
+    )
+
+
+def _select_python_span(
+    completion: str,
+    entry_name: str | None = None,
+    *,
+    protocol_version: int | None = None,
+) -> tuple[str, int, int] | None:
+    """Return the exact fenced code span selected for execution.
+
+    Offsets are completion-relative so semantic checks inspect the same bytes.
+    v2-v4 retain their legacy last-fence/raw-completion behavior; v5 keeps its
+    prompt and generation unchanged while selecting the intended fenced block.
+    """
+
+    if not completion:
+        return None
+    if protocol_version is None:
+        from reliquary.constants import PROTOCOL_VERSION
+
+        protocol_version = PROTOCOL_VERSION
+
+    entry_rule = int(protocol_version) >= 5
+    matches = list(_FENCE_RE.finditer(completion))
+    if not matches:
+        return None if entry_rule else (completion, 0, len(completion))
+    if entry_name and entry_rule:
+        for match in reversed(matches):
+            body = match.group(2)
+            if _defines_top_level_entry(body, entry_name):
+                return body, match.start(2), match.end(2)
+    match = matches[-1]
+    return match.group(2), match.start(2), match.end(2)
+
+
 def _extract_python(completion: str, entry_name: str | None = None) -> str:
     """Extract Python code from a model completion.
 
@@ -87,25 +135,8 @@ def _extract_python(completion: str, entry_name: str | None = None) -> str:
     groups the validator would have paid. Math keeps the strict comparison, and
     is untouched by this function.
     """
-    if not completion:
-        return ""
-    from reliquary.constants import PROTOCOL_VERSION
-
-    entry_rule = PROTOCOL_VERSION >= 5
-    matches = _FENCE_RE.findall(completion)
-    if not matches:
-        # From v5 the fenced block is the single answer channel. The raw
-        # fallback fired 762 times across 30 768 production rollouts and never
-        # produced a positive reward — a rollout holding code always fences it,
-        # so the fallback only ever ran `exec` on reasoning prose. Those zeros
-        # were deserved and stay zeros; executing prose as Python does not.
-        return "" if entry_rule else completion
-    if entry_name and entry_rule:
-        needle = f"def {entry_name}"
-        for _fence, body in reversed(matches):
-            if needle in body:
-                return body
-    return matches[-1][1]
+    selected = _select_python_span(completion, entry_name=entry_name)
+    return selected[0] if selected is not None else ""
 
 
 def _load_dataset(repo: str, revision: str):
