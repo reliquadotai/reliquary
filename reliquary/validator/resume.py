@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Optional
 
 
 @dataclass(frozen=True)
@@ -29,6 +31,22 @@ class PathSource:
 
 
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
+_CHECKPOINT_COMMIT_TITLE = re.compile(
+    r"^checkpoint\s+(\d+)\s*(?:\(.*\))?\s*$", re.IGNORECASE
+)
+_CHECKPOINT_DIRNAME = re.compile(r"^ckpt_(\d+)$")
+
+
+def checkpoint_n_from_commit_title(title: str | None) -> int | None:
+    """Return the checkpoint number announced by a publisher commit.
+
+    The in-process publisher writes ``checkpoint N`` while the detached
+    trainer writes ``checkpoint N (reason)``.  Startup discovery and SHA
+    resolution must use this same parser or discovery can select a revision
+    that the loader then rejects.
+    """
+    match = _CHECKPOINT_COMMIT_TITLE.match((title or "").strip())
+    return int(match.group(1)) if match else None
 
 
 def parse_resume_source(raw: str) -> ShaSource | PathSource:
@@ -53,15 +71,6 @@ def parse_resume_source(raw: str) -> ShaSource | PathSource:
     )
 
 
-import re as _re
-from pathlib import Path
-from typing import Callable, Optional
-
-
-_CKPT_TITLE = _re.compile(r"^checkpoint\s+(\d+)\s*$", _re.IGNORECASE)
-_CKPT_DIRNAME = _re.compile(r"^ckpt_(\d+)$")
-
-
 def resolve_resume_source(
     source: ShaSource | PathSource,
     hf_repo_id: str,
@@ -76,7 +85,7 @@ def resolve_resume_source(
     """
     if isinstance(source, PathSource):
         dirname = Path(source.path).name
-        m = _CKPT_DIRNAME.match(dirname)
+        m = _CHECKPOINT_DIRNAME.match(dirname)
         if not m:
             raise ValueError(
                 f"resume path {source.path!r}: could not derive "
@@ -91,11 +100,12 @@ def resolve_resume_source(
             "are required for SHA mode"
         )
     title = commit_title_fn(repo_id=hf_repo_id, revision=source.sha)
-    m = _CKPT_TITLE.match(title or "")
-    if not m:
+    checkpoint_n = checkpoint_n_from_commit_title(title)
+    if checkpoint_n is None:
         raise ValueError(
             f"resume sha:{source.sha}: could not parse checkpoint_n from "
-            f"commit title {title!r} (expected 'checkpoint N')"
+            f"commit title {title!r} (expected 'checkpoint N' or "
+            "'checkpoint N (reason)')"
         )
     local_path = download_fn(repo_id=hf_repo_id, revision=source.sha)
-    return local_path, int(m.group(1))
+    return local_path, checkpoint_n

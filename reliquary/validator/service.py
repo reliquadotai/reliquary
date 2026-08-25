@@ -104,6 +104,7 @@ from reliquary.validator.proof_scheduler import (
     SchedulerState,
 )
 from reliquary.validator.quarantine import assess_training_batch
+from reliquary.validator.resume import checkpoint_n_from_commit_title
 from reliquary.validator.server import ValidatorServer
 from reliquary.validator.training import TrainingStepSkipped, train_step
 from reliquary.validator.training_accumulator import BalancedTrainingAccumulator
@@ -252,26 +253,6 @@ def is_bootstrap_window(window_start: int, subnet_start: int) -> bool:
     if window_start < subnet_start:
         return False
     return window_start - subnet_start < BOOTSTRAP_WINDOWS
-
-
-_CHECKPOINT_COMMIT_TITLE = re.compile(
-    r"^checkpoint\s+(\d+)\s*(?:\(.*\))?\s*$", re.IGNORECASE
-)
-
-
-def checkpoint_n_from_commit_title(title: str | None) -> int | None:
-    """Checkpoint number a publication commit announces, or None.
-
-    Two publishers write here and they do not agree on the title. The
-    in-process path writes ``checkpoint N`` (checkpoint.py); the detached
-    trainer appends the reason, ``checkpoint N (cadence)``
-    (trainer/publisher.py). Matching only the first form made the startup
-    bootstrap blind to every detached publication, so it resolved "HF latest"
-    as the last hand-titled checkpoint and its anti-regression guard — the one
-    that overrides a stale operator pin — could never fire.
-    """
-    match = _CHECKPOINT_COMMIT_TITLE.match((title or "").strip())
-    return int(match.group(1)) if match else None
 
 
 def open_grpo_window(
