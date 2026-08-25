@@ -227,9 +227,16 @@ class ProofWorkerPool:
         # park every other slot's dispatch thread behind one respawn, past
         # MAX_PROOF_WALL_SECONDS, and fault the plane.
         self._spawn_lock = threading.Lock()
+        self._closed = False
         # One lock per slot, so two threads racing a respawn still do not
         # each start a process for the SAME slot.
         self._device_spawn_locks: dict[str, threading.Lock] = {}
+        # ...but bound how many load a replica AT ONCE across slots: _spawn
+        # materialises the whole ~8 GB model on the host before moving it to
+        # the card, and this process already carries a ~24 GB floor. Two, not
+        # one: at one, a single slow spawn parks every other slot again, which
+        # is the regression the per-slot locks exist to fix.
+        self._replica_load_slots = threading.Semaphore(2)
         self._context = multiprocessing.get_context("spawn")
 
     @property
@@ -249,11 +256,26 @@ class ProofWorkerPool:
             )
         worker = self._workers.get(device_id)
         if worker is None:
+            if self._closed:
+                # close() already took its snapshot; a replica started now
+                # would land on a card being torn down and never be retired.
+                raise ProofWorkerUnavailable(
+                    f"proof worker pool is closed, refusing to spawn "
+                    f"{device_id}"
+                )
             worker = self._spawn(device_id)
             self._workers[device_id] = worker
         return worker
 
-    def _retire(self, device_id: str) -> None:
+    def _retire(self, device_id: str, worker: "_Worker | None" = None) -> None:
+        """Kill the worker on ``device_id``.
+
+        ``worker`` names WHICH one: a thread that failed an exchange may reach
+        here long after another thread respawned the slot, and retiring by id
+        alone would kill the healthy replacement out from under it.
+        """
+        if worker is not None and self._workers.get(device_id) is not worker:
+            return
         self._revisions[device_id] = None
         worker = self._workers.pop(device_id, None)
         if worker is None:
@@ -267,6 +289,10 @@ class ProofWorkerPool:
         worker.process.join(timeout=5.0)
 
     def _spawn(self, device_id: str) -> _Worker:
+        with self._replica_load_slots:
+            return self._spawn_locked(device_id)
+
+    def _spawn_locked(self, device_id: str) -> _Worker:
         parent_conn, child_conn = self._context.Pipe(duplex=True)
         process = self._context.Process(
             target=_worker_main,
@@ -338,7 +364,7 @@ class ProofWorkerPool:
                 else self._request_timeout_seconds
             )
             if timeout is not None and not worker.connection.poll(timeout):
-                self._retire(device_id)
+                self._retire(device_id, worker=worker)
                 raise ProofWorkerUnavailable(
                     f"proof worker {device_id} timed out after {timeout:g}s"
                 )
@@ -347,7 +373,7 @@ class ProofWorkerPool:
             # The child died mid-request. Retire it so the NEXT window finds a
             # live worker, and raise: the scheduler must abort this plane
             # rather than turn our fault into a miner's rejection.
-            self._retire(device_id)
+            self._retire(device_id, worker=worker)
             raise ProofWorkerUnavailable(
                 f"proof worker {device_id} died mid-request: {exc!r}",
                 remote_error_type=type(exc).__name__,
@@ -392,6 +418,7 @@ class ProofWorkerPool:
         # insert or pop while this runs, and iterating the live map would abort
         # here and leave the remaining slots alive.
         with self._spawn_lock:
+            self._closed = True
             workers = list(self._workers.values())
             self._workers.clear()
         for worker in workers:
@@ -535,10 +562,12 @@ def _install_from_hub(
         revision=checkpoint_revision,
     )
     device = context.get("device")
-    # A failed move leaves the slot with no model: the next proof raises
-    # ProofWorkerUnavailable, the scheduler capacity-aborts, and the following
-    # reload rebuilds through this same function (see the None guard in
-    # reload_proof_context). Better than an OOM that takes the other slots too.
+    # A failed move leaves the slot with no model. A reload reaching it next
+    # rebuilds here (see the None guard in reload_proof_context); a PROOF
+    # reaching it first raises, and the scheduler turns any proof error into a
+    # FAULTED plane, i.e. a validator restart with an unpaid window. That cost
+    # is why the concurrent-load bound above matters: the trade is only worth
+    # it against an OOM, which takes every other slot down as well.
     # gc.collect first: a reference cycle in the module graph would defer the
     # free past empty_cache and leave the old 10.2 GB resident under the move.
     context["model"] = None

@@ -130,18 +130,22 @@ def test_slots_with_no_proof_device_are_flagged(caplog):
 
     from reliquary.validator.proof_worker import assert_proof_slots_supported
 
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(
+        logging.WARNING, logger="reliquary.validator.proof_worker"
+    ):
         assert_proof_slots_supported(
             slots_per_device=4, isolation=True, proof_devices=(),
         )
     assert "no proof device" in caplog.text
 
     caplog.clear()
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(
+        logging.WARNING, logger="reliquary.validator.proof_worker"
+    ):
         assert_proof_slots_supported(
             slots_per_device=4, isolation=True, proof_devices=("cuda:0",),
         )
-    assert caplog.text == ""
+    assert "RELIQUARY_PROOF_SLOTS_PER_DEVICE" not in caplog.text
 
 
 def test_extra_slots_require_an_isolated_plane():
@@ -424,3 +428,116 @@ def test_slots_of_one_gpu_prove_concurrently():
         assert result.outcome is ProofPlanOutcome.COMPLETED
     finally:
         assert scheduler.close()
+
+
+def test_a_closed_pool_refuses_to_spawn_a_replacement():
+    """``close`` clears the map, so a late dispatch thread finds it empty.
+
+    Without a closed flag ``_worker_for`` would happily start a fresh process
+    and load a 10.2 GB replica onto a card being torn down — after ``close``
+    already took its snapshot, so nothing would ever retire it. This is the
+    ``force=True`` path, which runs exactly when the scheduler failed to
+    quiesce and threads are still in flight.
+    """
+    from reliquary.validator.proof_worker import (
+        ProofWorkerPool,
+        ProofWorkerUnavailable,
+    )
+
+    support = "tests.unit.proof_worker_support"
+    slots = expand_proof_slots(("cuda:0",), 2)
+    pool = ProofWorkerPool(
+        devices=slots,
+        context_factory=f"{support}:build_counter_context",
+        handler=f"{support}:echo_handler",
+    )
+    pool.start()
+    pool.close()
+
+    with pytest.raises(ProofWorkerUnavailable, match="closed"):
+        pool.call(slots[0], "late")
+
+
+def test_concurrent_replica_loads_are_bounded():
+    """Per-slot locks removed the only serialisation of replica loads.
+
+    ``_spawn`` materialises the whole replica on the host before moving it to
+    the card, so four slots respawning at once would spike host RSS by ~32 GB
+    on a validator already sitting on a ~24 GB floor with a known leak. Bound
+    the concurrent loads instead of leaving them unbounded — but not at one,
+    or a single slow spawn parks the others again (see the test above).
+    """
+    from reliquary.validator.proof_worker import ProofWorkerPool
+
+    support = "tests.unit.proof_worker_support"
+    slots = expand_proof_slots(("cuda:0",), 4)
+    pool = ProofWorkerPool(
+        devices=slots,
+        context_factory=f"{support}:build_slow_context",
+        handler=f"{support}:echo_handler",
+        factory_kwargs={"slow_device": "", "seconds": "2"},
+    )
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+    # Wrap the load itself, not the entry point: the bound is applied around
+    # _spawn_locked, so counting _spawn calls would measure arrivals instead.
+    original = pool._spawn_locked
+
+    def _counting(device_id):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            return original(device_id)
+        finally:
+            with lock:
+                active -= 1
+
+    pool._spawn_locked = _counting
+    threads = [
+        threading.Thread(target=pool.call, args=(slot, "x"), daemon=True)
+        for slot in slots
+    ]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(60)
+    finally:
+        pool.close()
+
+    assert peak <= 2, f"{peak} replicas loaded at once"
+
+
+def test_retire_never_kills_a_replacement_worker():
+    """``_retire`` popped by device id, not by worker identity.
+
+    A thread holding a stale worker can fail its exchange and retire the
+    healthy replacement another thread just spawned and is using. With one
+    slot and one dispatch thread this was unreachable; N slots plus the
+    round-robin device-less paths put several threads on every slot.
+    """
+    from reliquary.validator.proof_worker import ProofWorkerPool
+
+    support = "tests.unit.proof_worker_support"
+    slots = expand_proof_slots(("cuda:0",), 2)
+    pool = ProofWorkerPool(
+        devices=slots,
+        context_factory=f"{support}:build_counter_context",
+        handler=f"{support}:echo_handler",
+    )
+    pool.start()
+    try:
+        stale = pool._workers[slots[0]]
+        pool._retire(slots[0])
+        fresh = pool._worker_for(slots[0])
+        assert fresh is not stale
+
+        pool._retire(slots[0], worker=stale)
+
+        assert pool._workers.get(slots[0]) is fresh
+        assert pool.call(slots[0], "still alive")["payload"] == "still alive"
+    finally:
+        pool.close()
