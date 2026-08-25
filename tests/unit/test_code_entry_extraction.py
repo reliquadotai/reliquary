@@ -1,16 +1,19 @@
-"""Extraction of the graded Python block by contract entry point (protocol v6).
+"""Extraction of the graded Python block by contract entry point.
 
-Protocol v4/v5 grade ``matches[-1]`` — the last fenced block. That rule was
+Protocol v2-v4 grade ``matches[-1]`` — the last fenced block. That rule was
 written when the environment ran a chat model that always closed with its final
 implementation. Under the v5 reasoning prompt the model often closes with a
 usage demo, an expected-output listing, or a test block instead, so the graded
 span is not the implementation and the rollout scores zero despite being right.
 
-v6 grades the last block that *defines the contract's entry function*, falling
-back to ``matches[-1]`` when no block defines it. The change is wire-affecting
-(miner and validator both recompute the reward and compare within 1e-6), so it
-is gated on ``PROTOCOL_VERSION >= 6`` and only takes effect at the profile
-cutover.
+From v5 on, the graded block is the last one that *defines the contract's entry
+function*, falling back to ``matches[-1]`` when no block defines it.
+
+The gate stops at v5 rather than applying everywhere: v2-v4 stay byte-exact as
+historical controls. It is NOT a coordinated-cutover gate — v5 is the live
+profile, so this redefines the reward in place. Miners recompute the same reward
+and the validator rejects a mismatch beyond 1e-6, group-wide, so a miner running
+older code loses whole groups until it updates.
 """
 
 import pytest
@@ -37,11 +40,11 @@ def _fence(body: str) -> str:
 
 
 @pytest.fixture
-def v6(monkeypatch):
-    """Activate the v6 extraction rule without switching the whole profile."""
+def v5(monkeypatch):
+    """Pin the live protocol version; the entry rule applies from v5 on."""
     import reliquary.constants as constants
 
-    monkeypatch.setattr(constants, "PROTOCOL_VERSION", 6, raising=False)
+    monkeypatch.setattr(constants, "PROTOCOL_VERSION", 5, raising=False)
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +76,7 @@ def test_entry_function_name_is_none_for_empty_cases():
 # _extract_python under v6.
 # ---------------------------------------------------------------------------
 
-def test_extract_python_skips_a_trailing_usage_demo(v6):
+def test_extract_python_skips_a_trailing_usage_demo(v5):
     """The observed production failure: implementation first, `print(...)` last."""
     from reliquary.environment.opencodeinstruct import _extract_python
 
@@ -86,7 +89,7 @@ def test_extract_python_skips_a_trailing_usage_demo(v6):
     assert _extract_python(text, entry_name=ENTRY) == IMPLEMENTATION
 
 
-def test_extract_python_skips_a_trailing_expected_output_listing(v6):
+def test_extract_python_skips_a_trailing_expected_output_listing(v5):
     """A fenced block holding the program's *output*, which defines nothing."""
     from reliquary.environment.opencodeinstruct import _extract_python
 
@@ -94,7 +97,7 @@ def test_extract_python_skips_a_trailing_expected_output_listing(v6):
     assert _extract_python(text, entry_name=ENTRY) == IMPLEMENTATION
 
 
-def test_extract_python_skips_a_trailing_test_block(v6):
+def test_extract_python_skips_a_trailing_test_block(v5):
     from reliquary.environment.opencodeinstruct import _extract_python
 
     text = _fence(IMPLEMENTATION) + "\n\nTests:\n\n" + _fence(
@@ -103,7 +106,7 @@ def test_extract_python_skips_a_trailing_test_block(v6):
     assert _extract_python(text, entry_name=ENTRY) == IMPLEMENTATION
 
 
-def test_extract_python_keeps_the_last_block_that_defines_the_entry(v6):
+def test_extract_python_keeps_the_last_block_that_defines_the_entry(v5):
     """Self-correction must still win: a later rewrite supersedes an earlier draft."""
     from reliquary.environment.opencodeinstruct import _extract_python
 
@@ -112,7 +115,7 @@ def test_extract_python_keeps_the_last_block_that_defines_the_entry(v6):
     assert _extract_python(text, entry_name=ENTRY) == IMPLEMENTATION
 
 
-def test_extract_python_falls_back_to_last_block_when_none_defines_the_entry(v6):
+def test_extract_python_falls_back_to_last_block_when_none_defines_the_entry(v5):
     """No block defines the contract function — behave exactly as v5 did."""
     from reliquary.environment.opencodeinstruct import _extract_python
 
@@ -120,7 +123,7 @@ def test_extract_python_falls_back_to_last_block_when_none_defines_the_entry(v6)
     assert _extract_python(text, entry_name=ENTRY) == "other = 2"
 
 
-def test_extract_python_single_block_is_unaffected_by_the_entry_name(v6):
+def test_extract_python_single_block_is_unaffected_by_the_entry_name(v5):
     """83% of rollouts emit exactly one block; the rule must not touch them."""
     from reliquary.environment.opencodeinstruct import _extract_python
 
@@ -129,7 +132,7 @@ def test_extract_python_single_block_is_unaffected_by_the_entry_name(v6):
     assert _extract_python(text, entry_name=None) == IMPLEMENTATION
 
 
-def test_extract_python_without_an_entry_name_keeps_last_block_wins(v6):
+def test_extract_python_without_an_entry_name_keeps_last_block_wins(v5):
     """A method-entry problem pins no function name; the old rule still applies."""
     from reliquary.environment.opencodeinstruct import _extract_python
 
@@ -137,7 +140,7 @@ def test_extract_python_without_an_entry_name_keeps_last_block_wins(v6):
     assert _extract_python(text, entry_name=None) == "print('demo')"
 
 
-def test_extract_python_requires_a_definition_not_a_mention(v6):
+def test_extract_python_requires_a_definition_not_a_mention(v5):
     """A block merely *calling* the function must not be mistaken for the impl."""
     from reliquary.environment.opencodeinstruct import _extract_python
 
@@ -147,8 +150,8 @@ def test_extract_python_requires_a_definition_not_a_mention(v6):
     assert _extract_python(text, entry_name=ENTRY) == IMPLEMENTATION
 
 
-def test_extract_python_grades_nothing_when_the_completion_has_no_fence(v6):
-    """v6 has a single answer channel: what is between the fences, nothing else.
+def test_extract_python_grades_nothing_when_the_completion_has_no_fence(v5):
+    """From v5 on there is a single answer channel: what is between the fences, nothing else.
 
     The raw-completion fallback fired 762 times across 30 768 production
     rollouts and never once produced a positive reward — a rollout that contains
@@ -162,34 +165,32 @@ def test_extract_python_grades_nothing_when_the_completion_has_no_fence(v6):
     assert _extract_python(IMPLEMENTATION, entry_name=ENTRY) == ""
 
 
-def test_extract_python_empty_completion_is_empty(v6):
+def test_extract_python_empty_completion_is_empty(v5):
     from reliquary.environment.opencodeinstruct import _extract_python
 
     assert _extract_python("", entry_name=ENTRY) == ""
 
 
 # ---------------------------------------------------------------------------
-# Wire compatibility: the rule must stay inert before the v6 cutover.
+# v2-v4 stay byte-exact: they are the historical controls.
 # ---------------------------------------------------------------------------
 
-def test_extract_python_ignores_the_entry_name_below_protocol_v6(monkeypatch):
-    """Miner and validator compare rewards within 1e-6. Changing the graded span
-    before the coordinated cutover would reject honest miners as dishonest."""
+def test_extract_python_ignores_the_entry_name_below_protocol_v5(monkeypatch):
+    """v4 is the immutable no-cue control; its rewards must stay reproducible."""
     import reliquary.constants as constants
     from reliquary.environment.opencodeinstruct import _extract_python
 
-    monkeypatch.setattr(constants, "PROTOCOL_VERSION", 5, raising=False)
+    monkeypatch.setattr(constants, "PROTOCOL_VERSION", 4, raising=False)
     text = _fence(IMPLEMENTATION) + "\n\n" + _fence("True\nTrue\nFalse")
     assert _extract_python(text, entry_name=ENTRY) == "True\nTrue\nFalse"
 
 
-def test_extract_python_keeps_the_raw_fallback_below_protocol_v6(monkeypatch):
-    """Dropping the fallback changes no reward in practice, but a rollout with
-    bare valid Python would score differently — so it moves at the cutover too."""
+def test_extract_python_keeps_the_raw_fallback_below_protocol_v5(monkeypatch):
+    """v2-v4 keep the raw fallback so their historical rewards stay reproducible."""
     import reliquary.constants as constants
     from reliquary.environment.opencodeinstruct import _extract_python
 
-    monkeypatch.setattr(constants, "PROTOCOL_VERSION", 5, raising=False)
+    monkeypatch.setattr(constants, "PROTOCOL_VERSION", 4, raising=False)
     assert _extract_python(IMPLEMENTATION, entry_name=ENTRY) == IMPLEMENTATION
 
 
@@ -197,7 +198,7 @@ def test_extract_python_keeps_the_raw_fallback_below_protocol_v6(monkeypatch):
 # compute_reward wires the contract through to the extractor.
 # ---------------------------------------------------------------------------
 
-def test_compute_reward_grades_the_implementation_not_the_trailing_demo(v6, monkeypatch):
+def test_compute_reward_grades_the_implementation_not_the_trailing_demo(v5, monkeypatch):
     from reliquary.environment import opencodeinstruct as mod
 
     graded: list[str] = []
@@ -222,7 +223,7 @@ def test_compute_reward_grades_the_implementation_not_the_trailing_demo(v6, monk
 # The admission path grades the same span as compute_reward.
 # ---------------------------------------------------------------------------
 
-def test_admission_grades_the_implementation_not_the_trailing_demo(v6, monkeypatch):
+def test_admission_grades_the_implementation_not_the_trailing_demo(v5, monkeypatch):
     """Admission recomputes the reward to check the miner's claim. If it graded a
     different span than compute_reward, honest miners would fail reward_mismatch."""
     from reliquary.validator import admission

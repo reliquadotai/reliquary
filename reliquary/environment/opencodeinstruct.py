@@ -57,12 +57,12 @@ def _extract_python(completion: str, entry_name: str | None = None) -> str:
     """Extract Python code from a model completion.
 
     Strategy: find all fenced code blocks (``` or ~~~ with optional
-    'python' tag). From protocol v6 on, return the last block that *defines*
+    'python' tag). From protocol v5 on, return the last block that *defines*
     ``entry_name``; otherwise return the last block.
 
-    With no fence at all, v4/v5 return the raw completion and let exec reject
-    obviously-non-code; v6 returns nothing, because the fenced block is the only
-    answer channel. That fallback fired 762 times across 30 768 production
+    With no fence at all, v2-v4 return the raw completion and let exec reject
+    obviously-non-code; from v5 the fenced block is the only answer channel, so
+    nothing is graded. That fallback fired 762 times across 30 768 production
     rollouts without ever producing a positive reward — a rollout holding code
     always fences it — so it only ever ran ``exec`` on reasoning prose.
 
@@ -75,25 +75,27 @@ def _extract_python(completion: str, entry_name: str | None = None) -> str:
     read as "never open a second block", which the model generalised into "never
     reason".
 
-    The graded span is wire-affecting: miners declare the reward they computed
-    and the validator re-runs this function, rejecting a mismatch beyond 1e-6.
-    Changing it before a coordinated cutover would reject honest miners, hence
-    the PROTOCOL_VERSION gate — the new rule is inert on v4/v5 profiles.
+    The gate stops at v5 so v2-v4 stay byte-exact as historical controls. It is
+    NOT a coordinated-cutover gate: v5 is the live profile, so this redefines the
+    reward in place. The graded span is wire-affecting — miners declare the
+    reward they computed and the validator re-runs this function, rejecting a
+    mismatch beyond 1e-6 for the whole group — so a miner on older code keeps
+    mining but loses every group holding a divergent rollout until it updates.
     """
     if not completion:
         return ""
     from reliquary.constants import PROTOCOL_VERSION
 
-    v6 = PROTOCOL_VERSION >= 6
+    entry_rule = PROTOCOL_VERSION >= 5
     matches = _FENCE_RE.findall(completion)
     if not matches:
-        # v6 has a single answer channel: what is between the fences. The raw
+        # From v5 the fenced block is the single answer channel. The raw
         # fallback fired 762 times across 30 768 production rollouts and never
         # produced a positive reward — a rollout holding code always fences it,
         # so the fallback only ever ran `exec` on reasoning prose. Those zeros
         # were deserved and stay zeros; executing prose as Python does not.
-        return "" if v6 else completion
-    if entry_name and v6:
+        return "" if entry_rule else completion
+    if entry_name and entry_rule:
         needle = f"def {entry_name}"
         for _fence, body in reversed(matches):
             if needle in body:

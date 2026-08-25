@@ -1,9 +1,22 @@
-# Graded-span v6 cutover
+# Code graded-span fix
 
-Protocol v6 changes which fenced block the Code grader executes. The model,
-tokenizer path, sampling distribution, rollout count, token cap, BFT policy,
-DAPO objective controls, and the **Math prompt** are all unchanged. Protocol v5
-remains immutable as the historical last-fence control.
+The Code grader executes the last fenced block. From protocol v5 on it executes
+the last fenced block that *defines the contract's entry function* instead.
+
+Nothing else moves: same model, tokenizer path, sampling distribution, rollout
+count, token cap, BFT policy, DAPO objective controls, and **both prompts
+unchanged**. v2-v4 keep the old rule byte-exact as historical controls.
+
+> **This redefines the reward in place on the live profile.** It is not a
+> coordinated cutover, and that is a deliberate trade. The `/state` generation
+> contract does not change, so miners on older code keep passing
+> `_state_matches_active_protocol` and keep mining — but their reward diverges on
+> multi-block rollouts, and `reward_mismatch` rejects the **whole group of 16**.
+> At the measured 0.47% divergent-rollout rate that is roughly **7% of groups
+> lost per non-updated miner**, silently, until they update. Two nodes can also
+> both claim profile v5 with the same `generation_contract_sha256` and grade
+> differently; checkpoint lineage will not distinguish a checkpoint trained
+> before the fix from one trained after. Announce the update to miners.
 
 ## Diagnosis
 
@@ -51,76 +64,55 @@ would hollow out the middle of that distribution.
 contains `def <entry_name>`, falling back to `matches[-1]` when no block defines
 it. `entry_name` comes from the structured cases — the same source that already
 writes *"Write your solution as a Python function named …"* into the prompt — so
-nothing is inferred from the completion text.
+nothing is inferred from the completion text. Single-block rollouts (83%) are
+untouched.
 
-Gated on `PROTOCOL_VERSION >= 6`. **This is wire-affecting.** Miners compute
-their own reward (`miner/engine.py`) and the validator re-runs
-`env.compute_reward` and rejects a mismatch beyond `1e-6` (`verifier.py`,
-`reward_mismatch`). Both sides import the same extractor, so changing the graded
-span on one side alone rejects honest miners as dishonest. The gate keeps the
-new rule inert until the profile flips, which makes the deploy two-phase: ship
-the code everywhere, then switch the profile.
+It also drops the raw-completion fallback: with no fence, the graded span is
+empty rather than the whole rollout. That changes no observed reward — the
+fallback fired 762 times across 30 768 production rollouts and never once
+produced a positive one, because a rollout holding code always fences it — so in
+practice it only stops the sandbox from running `exec` on reasoning prose.
 
-> **Coordination with PR #198 (checkpoint-epoch scheduling).** The two-phase
-> deploy above is the standalone path, and it has a real weakness: between
-> shipping the code and flipping the profile there is a window where miners and
-> validator can disagree about which profile is active. #198 introduces an epoch
-> manifest whose `protocol` block carries exactly
-> `{profile_id, protocol_version, generation_contract_sha256}` — the same triplet
-> a v6 fork changes — alongside `activation_not_before_round`. If that lands,
-> **activate v6 through the manifest rather than by flipping an env var**: the
-> cutover becomes atomic at an agreed round instead of a redeploy race. This
-> change does not depend on #198 and does not block it; only the activation
-> mechanism below would be superseded.
+Both call sites — `OpenCodeInstructEnvironment.compute_reward` and
+`admission._compute_code_rewards` — are pinned by a test to grade the same span.
+A divergence between them would reject honest miners on `reward_mismatch`.
 
-**Neither prompt moves.** Both templates are byte-identical to v5, so v6
-changes exactly one thing: which block is graded.
-
-The Code prompt keeps its "in the last fenced Python code block" clause even
-though the extractor no longer needs it — the clause becomes redundant rather
-than load-bearing. Rewriting it was measured and rejected: on the production
-checkpoint (650, pinned revision, 2 560 rollouts, real grader) a reworded prompt
+**Neither prompt moves.** Rewording the Code prompt was measured and rejected: on
+the production checkpoint (650, pinned revision, 2 560 rollouts, real grader) it
 raises prose from 10.2% to 52.7%, but its reward effect is **not significant on
 any stratum with headroom** (base model: +0.039 at t=1.14 on hard problems,
 +0.024 at t=1.29 on medium) and is **significantly negative at ceiling** (−0.081
-at t=−2.66). Against that, moving a prompt costs a real distribution transient:
+at t=−2.66). Against that, moving a prompt costs a real distribution transient —
 the v5 cutover dropped Math reward 0.622 → 0.275 for ~70 windows.
 
-Freezing both prompts also keeps this change reviewable as one thing, and
-keeps the miner update to a code bump with no behavioural shift.
-
-**Known consequence.** With the prompt frozen, reasoning does not come back on
+**Known consequence.** With the prompt unchanged, reasoning does not come back on
 its own. On the production checkpoint with the fixed extractor the paired
 reasoning effect is −0.009 (ns) — neutral, and DAPO learns only from a
 differential, so there is no pull back toward prose. Code rollouts stay near 10%
-prose. The fix stops the mechanism from punishing reasoning; it does not restore
+prose. This fix stops the mechanism from punishing reasoning; it does not restore
 it. Restoring it needs a prompt change, which should wait for a
 headroom-enriched measurement rather than ride along here.
 
-v6 also drops the raw-completion fallback: with no fence, the graded span is
-empty rather than the whole rollout. This changes no observed reward — the
-fallback fired 762 times across 30 768 production rollouts and never once
-produced a positive one, because a rollout holding code always fences it — so
-in practice it only stops the sandbox from running `exec` on reasoning prose.
-It rides the same gate anyway: a rollout of bare valid Python would score
-differently, and a staggered miner/validator deploy would surface that as
-`reward_mismatch`.
+## Evidence
 
-Math is doubly unaffected: it has no extraction defect (its median length rises
-376 → 561 under v5 and its reward rises with it) and its prompt does not move.
-`tests/unit/test_reasoning_prompt_v6_profile.py` pins both templates.
+Two H100 runs — the pinned base model, and the **live production checkpoint 650**
+at its current revision — 2 560 rollouts each under the exact v5 sampling
+contract, every rollout graded twice by the real grader worker. On base the
+harness reproduces production closely (prose 77,6 % vs 77,1 %, multi-block
+31,9 % vs 26,7 %, no-fence 4,5 % vs 4,31 %).
 
-## Pre-activation evidence
-
-2 560 rollouts generated on an H100 from `Qwen3-4B-Base` at the pinned revision
-under the exact v5 sampling contract, each graded twice by the real grader
-worker. The harness reproduces production closely (prose 77,6 % vs 77,1 %,
-multi-block 31,9 % vs 26,7 %, no-fence 4,5 % vs 4,31 %).
-
-| prompt | reward, `matches[-1]` | reward, entry rule | improved | **degraded** |
+| model / prompt | reward, `matches[-1]` | reward, entry rule | improved | **degraded** |
 |---|---|---|---|---|
-| v5 | 0,5707 | 0,6785 | 152 | **0** |
-| v6 | 0,5356 | 0,6933 | 222 | **0** |
+| base, current prompt | 0,5707 | 0,6785 | 152 | **0** |
+| base, reworded prompt | 0,5356 | 0,6933 | 222 | **0** |
+| ckpt650, current prompt | 0,8634 | 0,8672 | 5 | **0** |
+| ckpt650, reworded prompt | 0,7838 | 0,8334 | 66 | **0** |
+
+Zero regressions in all four configurations. On the *current* policy the
+immediate gain is small — +0.37 points, 5 rollouts in 1 280 — because the model
+has already adapted around the defect by not opening a second block (1.8% of
+rollouts, against 31.9% for the base). This fix is prophylactic: it removes the
+mechanism, it does not recover much that is still being lost today.
 
 Of 442 rollouts where the two rules extract a different block, 374 improve, 68
 are unchanged, none regress. Recovered rollouts go from 0,00 to 0,91.
@@ -144,35 +136,28 @@ onto the length axis, because the long rollouts are the reasoning ones.
 
 ## Checkpoint decision
 
-**Warm-start, do not reset.** Changing the reward does not invalidate the
-weights; `validate_checkpoint_profile` rejects a v5-stamped checkpoint under v6
-on `profile_id`, `protocol_version`, and `generation_contract_sha256`, but that
-is a metadata guard, not a mathematical necessity. Re-stamp the checkpoint for
-v6 as an explicitly labelled warm start.
+**Nothing to do.** With no profile fork, `validate_checkpoint_profile` sees no
+lineage change and the run continues uninterrupted — no re-stamp, no new
+`RELIQUARY_TRAINING_RUN_ID`, no LR warmup replay.
 
-Set a **new `RELIQUARY_TRAINING_RUN_ID`**. `training_run_id` is deliberately
-outside the validated lineage keys precisely so that a new id on old weights
-replays the full LR warmup — which is what you want after a reward change.
+That convenience is the flip side of the trade in the banner above: the lineage
+metadata will not record that the reward function changed, so a checkpoint
+trained before the fix and one trained after are indistinguishable from their
+profile alone. Note the window number of the deploy somewhere durable.
 
-A fresh base reset is only justified if a publishable "v6 from base" baseline is
-the goal. Otherwise it discards 648 checkpoints and the Math gains to solve a
-problem the prompt solves in eight minutes: at the v5 cutover, prose in Code
-rollouts went from 36,3 % (w31033) to 83,3 % (w31038) at essentially constant
-weights.
-
-## Post-cutover checks
+## Post-deploy checks
 
 Over the first ~200 windows (≈6 h):
 
-- prose in Code rollouts above 70 % within the first 10 windows;
 - artefact zeros (multi-block whose last block lacks `def <entry>`) below 0,2 %;
-- paired within-prompt reasoning effect positive on single-block rollouts.
+- `reward_mismatch` rejections: expect a spike from non-updated miners, and
+  watch it decay as they upgrade. A flat spike means someone is stuck.
 
 ## Known gaps, not addressed here
 
 - **`_extract_python_span` in `verifier.py` still uses `matches[-1]`.** It feeds
   the `code_semantic_auth` shadow detector, which needs character offsets into
-  the completion rather than the code string. Under v6 the graded span and the
+  the completion rather than the code string. Under the entry rule the graded span and the
   authenticated span can therefore differ. The detector reports zero findings in
   production and is not reward-bearing, but aligning it is a genuine follow-up —
   it touches the proof path, so it needs its own change and its own review.

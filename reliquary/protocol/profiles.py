@@ -396,49 +396,6 @@ _PROFILE_VALUES = (
             bucket_tokens_per_round=50,
         ),
     ),
-    ProtocolProfile(
-        profile_id="qwen3-4b-base-dapo-reasoning-v6",
-        # Clean protocol fork from v5 that moves ONE thing: the graded span.
-        # The Code grader now extracts the last fenced block that DEFINES the
-        # contract's entry function instead of the last fenced block outright
-        # (see opencodeinstruct._extract_python). Model, raw encoding, sampling,
-        # budgets, objective controls, and BOTH prompt templates are byte-
-        # identical to v5.
-        #
-        # The Code prompt keeps its "last fenced Python code block" clause even
-        # though the extractor no longer needs it. Rewriting it raises prose from
-        # 10.2% to 52.7% on the production checkpoint, but its reward effect is
-        # not significant on any stratum with headroom and is significantly
-        # negative at ceiling — while moving a prompt costs a real transient (the
-        # v5 cutover dropped Math reward 0.622 -> 0.275 for ~70 windows). The
-        # clause is now redundant rather than load-bearing; a later profile can
-        # drop it once the reasoning question is settled on a headroom-enriched
-        # sample. v5 remains immutable as the last-fence control.
-        model_id="Qwen/Qwen3-4B-Base",
-        model_revision="906bfd4b4dc7f14ee4320094d8b41684abff8539",
-        protocol_version=6,
-        collection_seconds=100,
-        upload_grace_seconds=33,
-        prompt_encoding="raw",
-        sampling=_SAMPLING_DAPO,
-        environments={
-            "openmathinstruct": EnvironmentProfile(
-                max_new_tokens=8192,
-                bft=None,
-                answer_format="boxed",
-                prompt_template=_MATH_REASONING_PROMPT,
-            ),
-            "opencodeinstruct": EnvironmentProfile(
-                max_new_tokens=8192,
-                bft=None,
-                prompt_template=_CODE_REASONING_PROMPT,
-            ),
-        },
-        throughput_tiebreak=ThroughputTiebreakProfile(
-            token_cap=8192,
-            bucket_tokens_per_round=50,
-        ),
-    ),
 )
 
 PROFILES: Mapping[str, ProtocolProfile] = MappingProxyType(
