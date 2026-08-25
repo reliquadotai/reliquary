@@ -70,6 +70,7 @@ from reliquary.constants import (
     MAX_SUBMISSIONS_PER_PROMPT,
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
     REGISTERED_HOTKEY_STALE_GRACE_SECONDS,
+    PRECOMMIT_BODY_READ_TIMEOUT_SECONDS,
     SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS,
     SPARSE_VALID_IDLE_SEAL_SECONDS,
     SPARSE_VALID_MAX_WINDOW_SECONDS,
@@ -301,7 +302,7 @@ class _StateFastPathMiddleware:
 
 
 class _SubmissionBodyLimitMiddleware:
-    """Reject oversized /submit bodies before FastAPI parses their JSON.
+    """Reject oversized or overdue submission bodies before JSON parsing.
 
     The content-length fast path handles normal clients. Wrapping ``receive``
     also covers chunked transfer encoding, where trusting a missing header would
@@ -309,15 +310,40 @@ class _SubmissionBodyLimitMiddleware:
     post-parse accounting runs.
     """
 
-    def __init__(self, app: Any, max_bytes: int) -> None:
+    def __init__(
+        self,
+        app: Any,
+        max_bytes: int,
+        *,
+        deadline_resolver: Callable[
+            [dict[str, Any], str, float], float | None
+        ]
+        | None = None,
+        precommit_timeout_seconds: float = (
+            PRECOMMIT_BODY_READ_TIMEOUT_SECONDS
+        ),
+    ) -> None:
         self.app = app
         self.max_bytes = max_bytes
+        self.deadline_resolver = deadline_resolver
+        self.precommit_timeout_seconds = float(precommit_timeout_seconds)
 
     @staticmethod
     async def _reject(scope: dict[str, Any], receive: Any, send: Any) -> None:
         response = JSONResponse(
             status_code=413,
             content={"detail": "submission_payload_too_large"},
+            headers={"Connection": "close"},
+        )
+        await response(scope, receive, send)
+
+    @staticmethod
+    async def _reject_timeout(
+        scope: dict[str, Any], receive: Any, send: Any
+    ) -> None:
+        response = JSONResponse(
+            status_code=408,
+            content={"detail": "submission_body_timeout"},
             headers={"Connection": "close"},
         )
         await response(scope, receive, send)
@@ -336,6 +362,22 @@ class _SubmissionBodyLimitMiddleware:
             if path == "/submit/precommit"
             else self.max_bytes
         )
+        request_started_at = time.time()
+        body_deadline = (
+            request_started_at + self.precommit_timeout_seconds
+            if path == "/submit/precommit"
+            else None
+        )
+        if self.deadline_resolver is not None:
+            resolved_deadline = self.deadline_resolver(
+                scope, path, request_started_at
+            )
+            if resolved_deadline is not None:
+                body_deadline = (
+                    float(resolved_deadline)
+                    if body_deadline is None
+                    else min(body_deadline, float(resolved_deadline))
+                )
 
         headers = dict(scope.get("headers", ()))
         raw_length = headers.get(b"content-length")
@@ -351,11 +393,36 @@ class _SubmissionBodyLimitMiddleware:
         received = 0
         body_hasher = hashlib.sha256()
         over_limit = False
+        timed_out = False
+        body_start_rejected = False
         buffered_messages: list[dict[str, Any]] = []
 
         async def limited_receive():
-            nonlocal received, over_limit
-            message = await receive()
+            nonlocal received, over_limit, timed_out, body_start_rejected
+            if timed_out or body_start_rejected:
+                return {
+                    "type": "http.request",
+                    "body": b"",
+                    "more_body": False,
+                }
+            try:
+                if body_deadline is None:
+                    message = await receive()
+                else:
+                    remaining = float(body_deadline) - time.time()
+                    if remaining <= 0.0:
+                        raise asyncio.TimeoutError
+                    message = await asyncio.wait_for(
+                        receive(), timeout=remaining
+                    )
+            except asyncio.TimeoutError:
+                timed_out = True
+                scope.setdefault("state", {})["body_read_timed_out"] = True
+                return {
+                    "type": "http.request",
+                    "body": b"",
+                    "more_body": False,
+                }
             if message.get("type") == "http.request":
                 state = scope.setdefault("state", {})
                 chunk = message.get("body", b"")
@@ -364,7 +431,15 @@ class _SubmissionBodyLimitMiddleware:
                     state["body_receive_started_at"] = started_at
                     callback = state.pop("upload_start_callback", None)
                     if callable(callback):
-                        state["upload_start_result"] = callback(started_at)
+                        start_result = callback(started_at)
+                        state["upload_start_result"] = start_result
+                        if not start_result[0]:
+                            body_start_rejected = True
+                            return {
+                                "type": "http.request",
+                                "body": b"",
+                                "more_body": False,
+                            }
                 received += len(chunk)
                 body_hasher.update(chunk)
                 if received > max_bytes:
@@ -390,11 +465,14 @@ class _SubmissionBodyLimitMiddleware:
         try:
             await self.app(scope, limited_receive, buffered_send)
         except Exception:
-            if not over_limit:
+            if not over_limit and not timed_out:
                 raise
 
         if over_limit:
             await self._reject(scope, receive, send)
+            return
+        if timed_out:
+            await self._reject_timeout(scope, receive, send)
             return
         for message in buffered_messages:
             await send(message)
@@ -1107,6 +1185,43 @@ class ValidatorServer:
         return float(receipt.batcher.window_opened_wall_ts) + float(
             WINDOW_COLLECTION_SECONDS
         )
+
+    def _submission_body_read_deadline(
+        self,
+        scope: dict[str, Any],
+        path: str,
+        request_started_at: float,
+    ) -> float | None:
+        """Return the protocol wall deadline for an incomplete HTTP body."""
+        if path == "/submit/precommit":
+            cutoffs = []
+            for batcher in self._active_batchers.values():
+                opened_at = getattr(batcher, "window_opened_wall_ts", None)
+                if opened_at is None or _is_mock_like(opened_at):
+                    continue
+                cutoffs.append(
+                    float(opened_at) + float(WINDOW_COLLECTION_SECONDS)
+                )
+            return max(cutoffs) if cutoffs else None
+        if path == "/submit":
+            headers = dict(scope.get("headers", ()))
+            receipt_id = headers.get(PRECOMMIT_HEADER.lower().encode("ascii"))
+            if receipt_id:
+                try:
+                    receipt_key = receipt_id.decode("ascii")
+                except UnicodeDecodeError:
+                    return (
+                        request_started_at
+                        + PRECOMMIT_BODY_READ_TIMEOUT_SECONDS
+                    )
+                receipt = self._upload_precommit_receipts.get(receipt_key)
+                if receipt is not None:
+                    return float(receipt.expires_at_wall)
+                return request_started_at + SUBMISSION_UPLOAD_GRACE_SECONDS
+
+        # Legacy direct submissions do not carry a receipt-specific deadline.
+        # Keep them bounded without shortening the established upload grace.
+        return request_started_at + SUBMISSION_UPLOAD_GRACE_SECONDS
 
     def _record_no_reveal(self, receipt: _UploadPrecommitReceipt) -> None:
         update = self._no_reveal_circuit.record_no_reveal(
@@ -3214,8 +3329,8 @@ class ValidatorServer:
             """Reserve one bounded reveal for a body committed before cutoff."""
             from reliquary.protocol.submission import WindowState
 
-            t_arrival = float(
-                getattr(http_request.state, "t_arrival", time.time())
+            commit_received_at = float(
+                getattr(http_request.state, "body_completed_at", time.time())
             )
 
             def reject(reason: RejectReason) -> SubmissionPrecommitResponse:
@@ -3278,7 +3393,7 @@ class ValidatorServer:
             # Exact retries are idempotent even if the drand boundary advanced
             # after the first response was lost.  The original receipt already
             # passed timing, registration, and quota admission.
-            self._prune_upload_precommits(now=t_arrival)
+            self._prune_upload_precommits(now=commit_received_at)
             existing_id = self._upload_precommit_by_signature.get(
                 request.precommit_signature
             )
@@ -3294,16 +3409,23 @@ class ValidatorServer:
                     receipt_id=existing.receipt_id,
                     upload_deadline_ts=existing.expires_at_wall,
                 )
+            if commit_received_at < float(batcher.window_opened_wall_ts):
+                return reject(RejectReason.WINDOW_NOT_ACTIVE)
+            if commit_received_at > (
+                float(batcher.window_opened_wall_ts)
+                + float(WINDOW_COLLECTION_SECONDS)
+            ):
+                return reject(RejectReason.PRECOMMIT_EXPIRED)
             if batcher.drand_round_check_enabled:
                 if hasattr(type(batcher), "observe_drand_round"):
                     drand_observation = batcher.observe_drand_round(
                         request.drand_round,
-                        t_arrival=t_arrival,
+                        t_arrival=commit_received_at,
                     )
                 else:
                     round_reject = batcher.validate_drand_round(
                         request.drand_round,
-                        t_arrival=t_arrival,
+                        t_arrival=commit_received_at,
                     )
                     drand_observation = self._fallback_drand_observation(
                         request, batcher, round_reject,
@@ -3447,7 +3569,7 @@ class ValidatorServer:
                     batcher,
                     receipt_id,
                     request.miner_hotkey,
-                    t_arrival_wall=t_arrival,
+                    t_arrival_wall=commit_received_at,
                     payload_bytes=request.payload_bytes,
                 )
             except Exception:
@@ -3464,11 +3586,15 @@ class ValidatorServer:
                     request.miner_hotkey[:12],
                     register_reason,
                 )
-                reason = (
-                    RejectReason.PRECOMMIT_EXPIRED
-                    if register_reason in {"collection_closed", "collection_sealed"}
-                    else RejectReason.BATCH_FILLED
-                )
+                if register_reason == "collection_not_open":
+                    reason = RejectReason.WINDOW_NOT_ACTIVE
+                elif register_reason in {
+                    "collection_closed",
+                    "collection_sealed",
+                }:
+                    reason = RejectReason.PRECOMMIT_EXPIRED
+                else:
+                    reason = RejectReason.BATCH_FILLED
                 return reject(reason)
 
             remaining = max(
@@ -3492,7 +3618,7 @@ class ValidatorServer:
                 generation_profile_id=request.generation_profile_id,
                 nonce=request.nonce,
                 expires_at_wall=expires_at_wall,
-                precommit_arrival_ts=t_arrival,
+                precommit_arrival_ts=commit_received_at,
                 drand_observation=drand_observation,
                 batcher=batcher,
                 operator=operator,
@@ -4629,6 +4755,7 @@ class ValidatorServer:
         app.add_middleware(
             _SubmissionBodyLimitMiddleware,
             max_bytes=MAX_SUBMISSION_PAYLOAD_BYTES,
+            deadline_resolver=self._submission_body_read_deadline,
         )
         # Outermost: cached GET /state polls never enter the stack below.
         # Operational kill switch (validator-side only, not miner-facing):

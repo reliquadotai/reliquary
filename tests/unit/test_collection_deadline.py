@@ -184,6 +184,24 @@ def test_precommit_bytes_transfer_and_conserve_at_terminal_decision():
     assert conservation["capacity_conserved"] is True
 
 
+def test_precommit_completed_before_window_open_is_rejected():
+    from tests.unit.test_grpo_window_batcher import _make_batcher
+
+    b = _make_batcher()
+
+    accepted, reason, deadline = b.try_register_upload_precommit(
+        "receipt",
+        "miner",
+        t_arrival_wall=b.window_opened_wall_ts - 0.001,
+        payload_bytes=1234,
+    )
+
+    assert accepted is False
+    assert reason == "collection_not_open"
+    assert deadline is None
+    assert b.pending_upload_precommits == 0
+
+
 def test_unrevealed_precommit_expires_and_releases_exact_bytes():
     from reliquary.constants import SUBMISSION_UPLOAD_GRACE_SECONDS
     from tests.unit.test_grpo_window_batcher import _make_batcher

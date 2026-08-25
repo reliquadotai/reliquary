@@ -1218,10 +1218,10 @@ class GrpoWindowBatcher:
         """
         if not self.difficulty_auction_enabled:
             return False, "precommit_requires_auction", None
-        if (
-            float(t_arrival_wall)
-            > self.window_opened_wall_ts + WINDOW_COLLECTION_SECONDS
-        ):
+        received_at = float(t_arrival_wall)
+        if received_at < self.window_opened_wall_ts:
+            return False, "collection_not_open", None
+        if received_at > self.window_opened_wall_ts + WINDOW_COLLECTION_SECONDS:
             return False, "collection_closed", None
         now = self._time_fn()
         with self._upload_precommit_lock:
