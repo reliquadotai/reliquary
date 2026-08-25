@@ -1,15 +1,18 @@
-"""Protocol v6: the Code prompt stops pinning the answer to the *last* fence.
+"""Protocol v6 changes the graded span only. Both prompts are frozen at v5.
 
-v6 exists because the graded span changes (see
-tests/unit/test_code_entry_extraction.py). Two things travel with that change:
+v6 exists because the Code grader extracts a different block (see
+tests/unit/test_code_entry_extraction.py). Neither prompt moves with it.
 
-* the Code prompt drops "in the last fenced Python code block" — that clause
-  only ever existed to compensate ``matches[-1]``, and it is the constraint the
-  model obeyed roughly half the time at −1.2σ per miss;
-* the Math prompt does NOT move. Math has no extraction defect (its length and
-  reward both rise under v5), and re-rendering its prompt would hand it the same
-  transient reward dip the v5 cutover cost — 0.622 → 0.275, recovered over ~70
-  windows — for no benefit.
+Measured on the production checkpoint (650) at the pinned revision, 2 560
+rollouts, real grader: rewriting the Code prompt to drop the last-fence clause
+raises prose from 10.2% to 52.7%, but its reward effect is not significant on
+any problem stratum with headroom (base: +0.039 at t=1.14 on hard problems,
++0.024 at t=1.29 on medium) and is significantly negative at ceiling (−0.081 at
+t=−2.66). Against that, moving a prompt costs a real distribution transient —
+the v5 cutover dropped Math reward 0.622 → 0.275 for ~70 windows.
+
+So v6 ships the extraction fix alone. Both prompt templates stay byte-identical
+to v5, which also keeps the change reviewable as one thing.
 """
 
 import pytest
@@ -39,35 +42,15 @@ def test_v6_math_prompt_is_byte_identical_to_v5():
     assert v6_math.template_id == v5_math.template_id
 
 
-def test_v6_code_prompt_drops_the_last_fenced_block_clause():
-    """The clause compensated matches[-1]; v6 grades by definition, not position."""
-    v6_code = _profile(V6).environments["opencodeinstruct"].prompt_template
-
-    assert "last fenced" not in v6_code.template
-    assert "Python code block" in v6_code.template
-
-
-def test_v6_code_prompt_asks_for_a_complete_implementation():
-    """Targets the rollouts that call helpers they never wrote."""
-    v6_code = _profile(V6).environments["opencodeinstruct"].prompt_template
-
-    assert "complete implementation" in v6_code.template
-
-
-def test_v6_code_prompt_keeps_the_reasoning_cue():
-    v6_code = _profile(V6).environments["opencodeinstruct"].prompt_template
-
-    assert "step by step" in v6_code.template
-    assert "reasoning" in v6_code.template
-
-
-def test_v6_code_template_id_is_distinct_from_v5():
-    """Template IDs are immutable by convention; a changed body needs a new ID."""
+def test_v6_code_prompt_is_byte_identical_to_v5():
+    """v6 moves the graded span, not the prompt. A prompt change would add a
+    distribution transient for an effect that is not significant where it
+    matters."""
     v5_code = _profile(V5).environments["opencodeinstruct"].prompt_template
     v6_code = _profile(V6).environments["opencodeinstruct"].prompt_template
 
-    assert v6_code.template_id != v5_code.template_id
-    assert v6_code.template != v5_code.template
+    assert v6_code.template == v5_code.template
+    assert v6_code.template_id == v5_code.template_id
 
 
 def test_v6_carries_the_v5_substrate_unchanged():

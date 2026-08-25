@@ -258,22 +258,6 @@ _CODE_REASONING_PROMPT = PromptTemplateProfile(
     ),
 )
 
-# v6 grades the last block that DEFINES the contract function, so the prompt no
-# longer has to pin the answer to the last fence. That clause existed only to
-# compensate ``matches[-1]``; it was the constraint the model met roughly half
-# the time when it reasoned, at −1.2σ of group-relative advantage per miss.
-# "complete" targets the rollouts that call helpers they never wrote.
-_CODE_REASONING_PROMPT_V6 = PromptTemplateProfile(
-    template_id="opencodeinstruct-reasoning-v2",
-    template=(
-        "Solve the following programming problem step by step.\n\n"
-        "$problem$contract\n\n"
-        "Work through your reasoning first, then give the complete "
-        "implementation in a Python code block."
-    ),
-)
-
-
 _PROFILE_VALUES = (
     ProtocolProfile(
         profile_id="qwen35-2b-auction-v2",
@@ -414,15 +398,22 @@ _PROFILE_VALUES = (
     ),
     ProtocolProfile(
         profile_id="qwen3-4b-base-dapo-reasoning-v6",
-        # Clean protocol fork from v5. The model, raw encoding, sampling,
-        # budgets, and objective controls stay fixed, and the Math prompt is
-        # byte-identical: Math has no extraction defect and re-rendering its
-        # prompt would only re-inflict the v5 cutover's transient reward dip.
-        # What moves is the graded span — the Code grader now extracts the last
-        # fenced block that DEFINES the contract's entry function instead of the
-        # last fenced block outright (see opencodeinstruct._extract_python) —
-        # and the Code prompt, which no longer needs to pin the answer's
-        # position. v5 remains immutable as the last-fence control.
+        # Clean protocol fork from v5 that moves ONE thing: the graded span.
+        # The Code grader now extracts the last fenced block that DEFINES the
+        # contract's entry function instead of the last fenced block outright
+        # (see opencodeinstruct._extract_python). Model, raw encoding, sampling,
+        # budgets, objective controls, and BOTH prompt templates are byte-
+        # identical to v5.
+        #
+        # The Code prompt keeps its "last fenced Python code block" clause even
+        # though the extractor no longer needs it. Rewriting it raises prose from
+        # 10.2% to 52.7% on the production checkpoint, but its reward effect is
+        # not significant on any stratum with headroom and is significantly
+        # negative at ceiling — while moving a prompt costs a real transient (the
+        # v5 cutover dropped Math reward 0.622 -> 0.275 for ~70 windows). The
+        # clause is now redundant rather than load-bearing; a later profile can
+        # drop it once the reasoning question is settled on a headroom-enriched
+        # sample. v5 remains immutable as the last-fence control.
         model_id="Qwen/Qwen3-4B-Base",
         model_revision="906bfd4b4dc7f14ee4320094d8b41684abff8539",
         protocol_version=6,
@@ -440,7 +431,7 @@ _PROFILE_VALUES = (
             "opencodeinstruct": EnvironmentProfile(
                 max_new_tokens=8192,
                 bft=None,
-                prompt_template=_CODE_REASONING_PROMPT_V6,
+                prompt_template=_CODE_REASONING_PROMPT,
             ),
         },
         throughput_tiebreak=ThroughputTiebreakProfile(

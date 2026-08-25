@@ -73,15 +73,29 @@ the code everywhere, then switch the profile.
 > change does not depend on #198 and does not block it; only the activation
 > mechanism below would be superseded.
 
-The Code prompt loses its position clause, which only ever existed to
-compensate `matches[-1]`:
+**Neither prompt moves.** Both templates are byte-identical to v5, so v6
+changes exactly one thing: which block is graded.
 
-```diff
-- After your reasoning, provide the final implementation in the last fenced Python code block.
-+ Work through your reasoning first, then give the complete implementation in a Python code block.
-```
+The Code prompt keeps its "in the last fenced Python code block" clause even
+though the extractor no longer needs it — the clause becomes redundant rather
+than load-bearing. Rewriting it was measured and rejected: on the production
+checkpoint (650, pinned revision, 2 560 rollouts, real grader) a reworded prompt
+raises prose from 10.2% to 52.7%, but its reward effect is **not significant on
+any stratum with headroom** (base model: +0.039 at t=1.14 on hard problems,
++0.024 at t=1.29 on medium) and is **significantly negative at ceiling** (−0.081
+at t=−2.66). Against that, moving a prompt costs a real distribution transient:
+the v5 cutover dropped Math reward 0.622 → 0.275 for ~70 windows.
 
-`complete` targets the rollouts that call helpers they never wrote.
+Freezing both prompts also keeps this change reviewable as one thing, and
+keeps the miner update to a code bump with no behavioural shift.
+
+**Known consequence.** With the prompt frozen, reasoning does not come back on
+its own. On the production checkpoint with the fixed extractor the paired
+reasoning effect is −0.009 (ns) — neutral, and DAPO learns only from a
+differential, so there is no pull back toward prose. Code rollouts stay near 10%
+prose. The fix stops the mechanism from punishing reasoning; it does not restore
+it. Restoring it needs a prompt change, which should wait for a
+headroom-enriched measurement rather than ride along here.
 
 v6 also drops the raw-completion fallback: with no fence, the graded span is
 empty rather than the whole rollout. This changes no observed reward — the
@@ -92,11 +106,9 @@ It rides the same gate anyway: a rollout of bare valid Python would score
 differently, and a staggered miner/validator deploy would surface that as
 `reward_mismatch`.
 
-**The Math prompt is byte-identical to v5, deliberately.** Math has no
-extraction defect — its median length rises 376 → 561 under v5 and its reward
-rises with it. Re-rendering its prompt would only re-inflict the transient the
-v5 cutover cost Math (reward 0,622 → 0,275, recovered over ~70 windows) for no
-benefit. `tests/unit/test_reasoning_prompt_v6_profile.py` pins this.
+Math is doubly unaffected: it has no extraction defect (its median length rises
+376 → 561 under v5 and its reward rises with it) and its prompt does not move.
+`tests/unit/test_reasoning_prompt_v6_profile.py` pins both templates.
 
 ## Pre-activation evidence
 
