@@ -39,6 +39,7 @@ from reliquary.validator.cooldown import CooldownMap
 from reliquary.validator.observability import DrandRoundObservation, SubmitTelemetry
 from reliquary.validator.selection_digest import compute_rollouts_selection_digest
 from reliquary.validator.server import (
+    _SubmissionBodyLimitMiddleware,
     ValidatorServer,
     _QueuedAuctionSubmission,
     _UploadPrecommitReceipt,
@@ -591,6 +592,81 @@ def test_prompt_mismatch_circuit_rejects_before_receipt_registration():
     assert batcher.pending_upload_precommits == 0
 
 
+def test_no_reveal_circuit_rejects_operator_before_receipt_registration():
+    from reliquary.protocol.submission import WindowState
+
+    server = ValidatorServer()
+    batcher = _batcher(window_start=500)
+    batcher.current_checkpoint_hash = ""
+    batcher.difficulty_auction_enabled = True
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    request = _request(valid_merkle=True)
+    operator = "operator-coldkey"
+    server.set_registered_hotkeys(
+        {request.miner_hotkey},
+        operator_by_hotkey={request.miner_hotkey: operator},
+    )
+    for index in range(4):
+        server._no_reveal_circuit.record_no_reveal(
+            environment=FakeEnv.name,
+            operator=operator,
+            window=request.window_start,
+            precommit_signature=f"expired-receipt-{index}",
+            precommit_arrival_ts=float(index + 1),
+        )
+
+    payload = request.model_dump_json().encode("utf-8")
+    precommit = _precommit_for(request, payload_bytes=len(payload))
+    with TestClient(server.app) as client:
+        response = client.post(
+            "/submit/precommit",
+            content=precommit.model_dump_json(),
+            headers={"Content-Type": "application/json"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["reason"] == RejectReason.RATE_LIMITED.value
+    assert server._upload_precommit_receipts == {}
+    assert server._per_window_counts.get(request.miner_hotkey, 0) == 0
+    assert batcher.pending_upload_precommits == 0
+
+
+@pytest.mark.asyncio
+async def test_upload_start_is_stamped_on_first_body_byte():
+    starts = []
+
+    async def downstream(scope, receive, _send):
+        state = scope.setdefault("state", {})
+        state["upload_start_callback"] = lambda started_at: (
+            starts.append(started_at) or (True, None)
+        )
+        assert (await receive())["body"] == b""
+        assert starts == []
+        assert (await receive())["body"] == b"payload"
+
+    app = _SubmissionBodyLimitMiddleware(downstream, max_bytes=100)
+    chunks = [
+        {"type": "http.request", "body": b"", "more_body": True},
+        {"type": "http.request", "body": b"payload", "more_body": False},
+    ]
+
+    async def receive():
+        return chunks.pop(0)
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/submit",
+        "headers": [],
+    }
+    await app(scope, receive, lambda _message: None)
+
+    assert len(starts) == 1
+    assert scope["state"]["body_receive_started_at"] == starts[0]
+    assert scope["state"]["upload_start_result"] == (True, None)
+
+
 def test_prompt_mismatch_persistence_error_degrades_validator_health(tmp_path):
     server = ValidatorServer(
         prompt_mismatch_state_path=tmp_path / "prompt-mismatch.json"
@@ -615,7 +691,7 @@ def test_endpoint_latency_does_not_index_arbitrary_paths():
     assert server._endpoint_latency_samples_ms == {}
 
 
-def test_signed_precommit_extends_only_matching_body_upload():
+def test_inactive_signed_precommit_does_not_extend_collection():
     from reliquary.constants import WINDOW_COLLECTION_SECONDS
     from reliquary.protocol.submission import WindowState
 
@@ -625,6 +701,10 @@ def test_signed_precommit_extends_only_matching_body_upload():
     server.set_active_batcher(batcher)
     server.set_current_state(WindowState.OPEN)
     request = _request(valid_merkle=True)
+    server.set_registered_hotkeys(
+        {request.miner_hotkey},
+        operator_by_hotkey={request.miner_hotkey: "operator-coldkey"},
+    )
     payload = request.model_dump_json().encode("utf-8")
     precommit = _precommit_for(request, payload_bytes=len(payload))
 
@@ -640,12 +720,12 @@ def test_signed_precommit_extends_only_matching_body_upload():
         assert batcher.pending_upload_precommits == 1
         assert server._per_window_counts[request.miner_hotkey] == 1
 
-        # Cross the generation cutoff.  The outstanding signed receipt keeps
-        # the auction open only long enough for its exact body to finish.
+        # A receipt without a body request in progress cannot keep the auction
+        # open after the generation cutoff.
         batcher.window_opened_at -= WINDOW_COLLECTION_SECONDS + 1.0
         batcher.window_opened_wall_ts -= WINDOW_COLLECTION_SECONDS + 1.0
         assert batcher.collection_closed() is True
-        assert batcher.poll_deadline() is False
+        assert batcher.poll_deadline() is True
 
         revealed = client.post(
             "/submit",
@@ -656,7 +736,10 @@ def test_signed_precommit_extends_only_matching_body_upload():
             },
         )
         assert revealed.status_code == 200
-        assert revealed.json()["accepted"] is True
+        assert revealed.json() == {
+            "accepted": False,
+            "reason": RejectReason.PRECOMMIT_EXPIRED.value,
+        }
         assert batcher.pending_upload_precommits == 0
         assert server._per_window_counts[request.miner_hotkey] == 1
         assert batcher.poll_deadline() is True
@@ -669,7 +752,14 @@ def test_signed_precommit_extends_only_matching_body_upload():
                 "X-Reliquary-Precommit": receipt["receipt_id"],
             },
         )
-        assert replayed.json() == revealed.json()
+        assert replayed.json() == {
+            "accepted": False,
+            "reason": RejectReason.PRECOMMIT_INVALID.value,
+        }
+
+    circuit = server._no_reveal_circuit.health_snapshot(current_window=500)
+    assert circuit["no_reveals_total"] == 1
+    assert circuit["partial_strike_entries"] == 1
 
 
 @pytest.mark.asyncio
@@ -723,7 +813,7 @@ async def test_concurrent_identical_precommits_publish_one_receipt():
     conservation = batcher.upload_precommit_conservation()
     assert conservation["accepted_receipts"] == 1
     assert conservation["pending"] == 1
-    assert conservation["capacity_reserved"] == 1
+    assert conservation["capacity_reserved"] == 0
     assert conservation["conserved"] is True
 
 
@@ -1572,6 +1662,7 @@ def test_health_exposes_each_environment_window_independently():
             "productive_capacity_used": 3,
             "productive_capacity_limit": 64,
             "capacity_conserved": True,
+            "inactive_receipts": 0,
             "capacity_rejections": {},
         },
         "collection_closed": False,

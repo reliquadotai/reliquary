@@ -698,6 +698,7 @@ class _UploadPrecommitReservation:
     operator: str
     deadline: float
     payload_bytes: int
+    upload_started_at_wall: float | None = None
     revealed: bool = False
     payload_transferred: bool = False
 
@@ -1045,10 +1046,8 @@ class GrpoWindowBatcher:
             str, _UploadPrecommitReservation
         ] = {}
         self._upload_precommit_payload_bytes = 0
-        # Precommits reserve the same productive capacity that a clean reveal
-        # later consumes.  The token is transferred atomically into
-        # ``_proof_grading_charged``; terminal pre-grading rejects release it.
-        self._upload_precommit_capacity_reserved = 0
+        # Receipts reserve only bounded upload bytes. Productive grading
+        # capacity is charged atomically after the exact body is revealed.
         self._upload_precommit_accepted = 0
         self._upload_precommit_revealed = 0
         self._upload_precommit_terminal = 0
@@ -1158,15 +1157,14 @@ class GrpoWindowBatcher:
         )
 
     def _productive_capacity_used_locked(self) -> int:
-        """Capacity owned by uploads, direct queue items and started work.
+        """Capacity owned by revealed queue items and started work.
 
-        Callers hold ``_upload_precommit_lock`` then
-        ``_proof_admission_lock``.  A revealed upload transfers one unit from
-        the first term to the last without opening an oversubscription race.
+        A signed receipt is deliberately absent: it only grants bounded upload
+        grace and cannot consume productive capacity before its exact body has
+        been revealed.
         """
         return (
-            self._upload_precommit_capacity_reserved
-            + len(self._pending_proof_reservations)
+            len(self._pending_proof_reservations)
             + self._proof_grading_charged
         )
 
@@ -1191,10 +1189,6 @@ class GrpoWindowBatcher:
     ) -> None:
         if not reservation.payload_transferred:
             with self._proof_admission_lock:
-                self._upload_precommit_capacity_reserved = max(
-                    0,
-                    self._upload_precommit_capacity_reserved - 1,
-                )
                 self._upload_precommit_payload_bytes = max(
                     0,
                     self._upload_precommit_payload_bytes
@@ -1269,19 +1263,11 @@ class GrpoWindowBatcher:
                 self._record_upload_precommit_rejection_locked(reason)
                 return False, reason, None
             with self._proof_admission_lock:
-                if (
-                    self._productive_capacity_used_locked()
-                    >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
-                ):
-                    reason = "precommit_productive_capacity_full"
-                    self._record_upload_precommit_rejection_locked(reason)
-                    return False, reason, None
                 payload_reason = self._payload_capacity_reason_locked(
                     hotkey, payload_bytes
                 )
                 if payload_reason is not None:
                     return False, payload_reason, None
-                self._upload_precommit_capacity_reserved += 1
                 self._upload_precommit_payload_bytes += payload_bytes
                 self._payload_bytes_by_hotkey[hotkey] = (
                     self._payload_bytes_by_hotkey.get(hotkey, 0)
@@ -1307,6 +1293,26 @@ class GrpoWindowBatcher:
                 len(self._upload_precommits),
             )
             return True, None, deadline
+
+    def mark_upload_precommit_started(
+        self,
+        receipt_id: str,
+        *,
+        t_arrival_wall: float,
+    ) -> tuple[bool, str | None]:
+        """Arm upload grace only for a body request arriving before cutoff."""
+        with self._upload_precommit_lock:
+            reservation = self._upload_precommits.get(receipt_id)
+            if reservation is None:
+                return False, "upload_precommit_missing"
+            if (
+                float(t_arrival_wall)
+                > self.window_opened_wall_ts + WINDOW_COLLECTION_SECONDS
+            ):
+                return False, "upload_started_after_collection"
+            if reservation.upload_started_at_wall is None:
+                reservation.upload_started_at_wall = float(t_arrival_wall)
+            return True, None
 
     def mark_upload_precommit_revealed(self, receipt_id: str) -> bool:
         """Record one exact body reveal without ending its reservation."""
@@ -1369,7 +1375,7 @@ class GrpoWindowBatcher:
                 ):
                     return False, "proof_failure_debt_operator"
                 if (
-                    self._proof_grading_charged
+                    self._productive_capacity_used_locked()
                     >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
                 ):
                     return False, "proof_grading_attempts_full"
@@ -1389,10 +1395,6 @@ class GrpoWindowBatcher:
                 request._payload_bytes = reservation.payload_bytes
                 request._retain_payload = False
                 reservation.payload_transferred = True
-                self._upload_precommit_capacity_reserved = max(
-                    0,
-                    self._upload_precommit_capacity_reserved - 1,
-                )
                 self._upload_precommit_payload_bytes = max(
                     0,
                     self._upload_precommit_payload_bytes
@@ -1429,13 +1431,7 @@ class GrpoWindowBatcher:
             accepted = self._upload_precommit_accepted
             terminal = self._upload_precommit_terminal
             expired = self._upload_precommit_expired
-            active_untransferred = sum(
-                1
-                for reservation in self._upload_precommits.values()
-                if not reservation.payload_transferred
-            )
             with self._proof_admission_lock:
-                capacity_reserved = self._upload_precommit_capacity_reserved
                 productive_capacity_used = (
                     self._productive_capacity_used_locked()
                 )
@@ -1450,15 +1446,19 @@ class GrpoWindowBatcher:
                 "pending_limit": MAX_PENDING_UPLOAD_PRECOMMITS_PER_ENV,
                 "total_limit": MAX_UPLOAD_PRECOMMITS_PER_ENV_PER_WINDOW,
                 "peak_pending": self._upload_precommit_peak_pending,
-                "capacity_reserved": capacity_reserved,
+                "capacity_reserved": 0,
                 "productive_capacity_used": productive_capacity_used,
                 "productive_capacity_limit": (
                     MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
                 ),
                 "capacity_conserved": (
-                    capacity_reserved == active_untransferred
-                    and productive_capacity_used
+                    productive_capacity_used
                     <= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+                ),
+                "inactive_receipts": sum(
+                    1
+                    for reservation in self._upload_precommits.values()
+                    if reservation.upload_started_at_wall is None
                 ),
                 "capacity_rejections": dict(
                     self._upload_precommit_rejections
@@ -1479,7 +1479,20 @@ class GrpoWindowBatcher:
         if now - self.window_opened_at >= WINDOW_COLLECTION_SECONDS:
             with self._upload_precommit_lock:
                 self._prune_upload_precommits_locked(now)
-                pending_uploads = bool(self._upload_precommits)
+                inactive = [
+                    receipt_id
+                    for receipt_id, reservation in self._upload_precommits.items()
+                    if reservation.upload_started_at_wall is None
+                ]
+                for receipt_id in inactive:
+                    reservation = self._upload_precommits.pop(receipt_id)
+                    self._finish_upload_precommit_locked(
+                        reservation, expired=True
+                    )
+                pending_uploads = any(
+                    reservation.upload_started_at_wall is not None
+                    for reservation in self._upload_precommits.values()
+                )
                 if pending_uploads and (
                     now - self.window_opened_at
                     < WINDOW_COLLECTION_SECONDS
@@ -1865,7 +1878,6 @@ class GrpoWindowBatcher:
             if (
                 self._proof_grading_charged
                 + len(self._pending_proof_reservations)
-                + self._upload_precommit_capacity_reserved
                 >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
             ):
                 return False, "proof_grading_attempts_full"

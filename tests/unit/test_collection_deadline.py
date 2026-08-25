@@ -157,8 +157,11 @@ def test_precommit_bytes_transfer_and_conserve_at_terminal_decision():
     assert b.reserved_payload_bytes == 1234
     conservation = b.upload_precommit_conservation()
     assert conservation["pending"] == 1
-    assert conservation["capacity_reserved"] == 1
-    assert conservation["productive_capacity_used"] == 1
+    assert conservation["capacity_reserved"] == 0
+    assert conservation["productive_capacity_used"] == 0
+    assert b.mark_upload_precommit_started(
+        "receipt", t_arrival_wall=b.window_opened_wall_ts
+    ) == (True, None)
     assert b.mark_upload_precommit_revealed("receipt") is True
     assert b.start_revealed_admission("receipt", request) == (True, None)
     assert b.upload_precommit_payload_bytes == 0
@@ -205,6 +208,37 @@ def test_unrevealed_precommit_expires_and_releases_exact_bytes():
     conservation = b.upload_precommit_conservation()
     assert conservation["expired"] == 1
     assert conservation["conserved"] is True
+
+
+def test_only_upload_started_before_cutoff_extends_seal():
+    from reliquary.constants import WINDOW_COLLECTION_SECONDS
+    from tests.unit.test_grpo_window_batcher import _make_batcher
+
+    now = [1000.0]
+    wall = [10_000.0]
+    b = _make_batcher(
+        time_fn=lambda: now[0],
+        wall_clock_fn=lambda: wall[0],
+    )
+    now[0] += WINDOW_COLLECTION_SECONDS - 10.0
+    wall[0] += WINDOW_COLLECTION_SECONDS - 10.0
+    accepted, _reason, _deadline = b.try_register_upload_precommit(
+        "receipt",
+        "miner",
+        t_arrival_wall=wall[0],
+        payload_bytes=2048,
+    )
+    assert accepted is True
+    assert b.mark_upload_precommit_started(
+        "receipt", t_arrival_wall=wall[0]
+    ) == (True, None)
+
+    now[0] += 11.0
+    wall[0] += 11.0
+    assert b.poll_deadline() is False
+
+    assert b.resolve_upload_precommit("receipt") is True
+    assert b.poll_deadline() is True
 
 
 def test_terminal_precommit_recycles_live_capacity(monkeypatch):
@@ -254,7 +288,7 @@ def test_terminal_precommit_recycles_live_capacity(monkeypatch):
     conservation = batcher.upload_precommit_conservation()
     assert conservation["accepted_receipts"] == 3
     assert conservation["pending"] == 2
-    assert conservation["capacity_reserved"] == 2
+    assert conservation["capacity_reserved"] == 0
     assert conservation["peak_pending"] == 2
     assert conservation["capacity_rejections"] == {
         "precommit_active_capacity_full": 1,
@@ -368,7 +402,7 @@ def test_precommit_active_fairness_is_scoped_to_hotkey_and_operator(monkeypatch)
     assert reason is None
 
 
-def test_upload_and_direct_submissions_share_productive_capacity(monkeypatch):
+def test_only_revealed_uploads_share_productive_capacity(monkeypatch):
     import reliquary.validator.batcher as batcher_module
     from tests.unit.test_grpo_window_batcher import _make_batcher, _request
 
@@ -394,6 +428,28 @@ def test_upload_and_direct_submissions_share_productive_capacity(monkeypatch):
         t_arrival_wall=batcher.window_opened_wall_ts,
         payload_bytes=100,
     )
-    assert accepted is False
-    assert reason == "precommit_productive_capacity_full"
+    assert accepted is True
+    assert reason is None
+    assert batcher.proof_grading_capacity_used == 1
+
+    upload = _request(prompt_idx=2, hotkey="upload-miner")
+    assert batcher.mark_upload_precommit_started(
+        "receipt-upload", t_arrival_wall=batcher.window_opened_wall_ts
+    ) == (True, None)
+    assert batcher.mark_upload_precommit_revealed("receipt-upload") is True
+    assert batcher.start_revealed_admission(
+        "receipt-upload", upload
+    ) == (True, None)
     assert batcher.proof_grading_capacity_used == 2
+
+    other = _request(prompt_idx=3, hotkey="other-miner")
+    assert batcher.mark_upload_precommit_started(
+        "receipt-over-productive-capacity",
+        t_arrival_wall=batcher.window_opened_wall_ts,
+    ) == (True, None)
+    assert batcher.mark_upload_precommit_revealed(
+        "receipt-over-productive-capacity"
+    ) is True
+    assert batcher.start_revealed_admission(
+        "receipt-over-productive-capacity", other
+    ) == (False, "proof_grading_attempts_full")
