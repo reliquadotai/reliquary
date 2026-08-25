@@ -37,6 +37,8 @@ from reliquary.constants import (
     DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES,
     DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR,
     ENVIRONMENT_MIX,
+    EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED,
+    EXPERIMENTAL_CHECKPOINT_EPOCH_WARMUP_ROUNDS,
     FORCED_SEED_CDF_BOUNDARY_EPSILON,
     FORCED_SEED_CDF_ENFORCE,
     FORCED_SEED_CONSISTENCY_FLOOR,
@@ -66,6 +68,7 @@ from reliquary.constants import (
     PPO_CLIP_EPSILON_HIGH,
     PPO_CLIP_EPSILON_LOW,
     PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD,
+    PROMPT_RANGE_SIZE,
     PROTOCOL_GENERATION_CONTRACT,
     PROTOCOL_PROFILE_ID,
     PROTOCOL_VERSION,
@@ -93,9 +96,24 @@ from reliquary.environment import load_environments
 from reliquary.environment.base import Environment
 from reliquary.infrastructure import chain, storage
 from reliquary.protocol.submission import RejectReason, RolloutSubmission, WindowState
+from reliquary.shared.checkpoint_epoch import (
+    BeaconBinding,
+    EpochPlan,
+    EpochWindow,
+    ProtocolBinding,
+    WindowSchedule,
+    generation_contract_sha256,
+    manifest_sha256,
+)
 from reliquary.validator import telemetry
 from reliquary.validator.batcher import GrpoWindowBatcher
 from reliquary.validator.checkpoint import CheckpointStore
+from reliquary.validator.checkpoint_epoch_runtime import (
+    EpochCommitIntent,
+    EpochStore,
+    build_epoch_intent,
+    plan_from_intent,
+)
 from reliquary.validator.cooldown import ContentCooldownMap, CooldownMap
 from reliquary.validator.dedup import RolloutHashSet
 from reliquary.validator.errors import FatalProofPlaneError
@@ -392,6 +410,8 @@ def open_grpo_window(
     operator_by_hotkey: dict[str, str] | None = None,
     proof_scheduler=None,
     verify_commitment_proofs_fn=None,
+    experimental_epoch_ranking: bool = False,
+    experimental_prompt_range: tuple[int, int] | None = None,
 ) -> GrpoWindowBatcher:
     """Instantiate a GrpoWindowBatcher for this window.
 
@@ -431,6 +451,8 @@ def open_grpo_window(
         operator_by_hotkey=operator_by_hotkey,
         proof_scheduler=proof_scheduler,
         verify_commitment_proofs_fn=verify_commitment_proofs_fn,
+        experimental_epoch_ranking=experimental_epoch_ranking,
+        experimental_prompt_range=experimental_prompt_range,
     )
 
 
@@ -821,6 +843,15 @@ class ValidationService:
             staging_dir_path=CHECKPOINT_STAGING_DIR_DEFAULT,
             tokenizer=tokenizer,
         )
+        self._checkpoint_epoch_plan: EpochPlan | None = None
+        self._checkpoint_epoch_store: EpochStore | None = None
+        if EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED:
+            state_root = Path(
+                os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")
+            )
+            self._checkpoint_epoch_store = EpochStore(
+                state_root / "checkpoint_epochs"
+            )
         # Multi-batcher: one GrpoWindowBatcher per active env.
         self._active_batchers: dict[str, GrpoWindowBatcher] = {}
         # Stashed by ``_set_window_randomness`` after the drand fetch
@@ -1740,6 +1771,266 @@ class ValidationService:
             self._resume_from, checkpoint_n,
         )
 
+    @staticmethod
+    def _checkpoint_epoch_protocol_binding() -> ProtocolBinding:
+        return ProtocolBinding(
+            profile_id=PROTOCOL_PROFILE_ID,
+            protocol_version=PROTOCOL_VERSION,
+            generation_contract_sha256=generation_contract_sha256(
+                PROTOCOL_GENERATION_CONTRACT
+            ),
+        )
+
+    @staticmethod
+    def _checkpoint_epoch_matches(plan: EpochPlan, checkpoint) -> bool:
+        return bool(
+            checkpoint is not None
+            and plan.checkpoint.number == int(checkpoint.checkpoint_n)
+            and plan.checkpoint.repo_id == str(checkpoint.repo_id)
+            and plan.checkpoint.revision == str(checkpoint.revision)
+        )
+
+    def _checkpoint_epoch_window(
+        self,
+        window_number: int,
+    ) -> EpochWindow | None:
+        plan = getattr(self, "_checkpoint_epoch_plan", None)
+        if plan is None:
+            return None
+        offset = int(window_number) - plan.first_window
+        if offset < 0 or offset >= plan.window_count:
+            return None
+        window = plan.windows[offset]
+        if window.offset != offset or window.window_number != window_number:
+            raise RuntimeError("checkpoint epoch window mapping is invalid")
+        return window
+
+    async def _checkpoint_epoch_drand_snapshot(self) -> tuple[dict, int]:
+        from reliquary.infrastructure.drand import get_current_chain
+
+        chain_info = await asyncio.to_thread(get_current_chain)
+        current_round = chain.compute_current_drand_round(
+            time.time(),
+            chain_info["genesis_time"],
+            chain_info["period"],
+        )
+        return chain_info, int(current_round)
+
+    async def _verify_checkpoint_epoch_beacon(
+        self,
+        beacon: BeaconBinding,
+    ) -> None:
+        from reliquary.infrastructure.drand import verify_beacon_signature
+
+        from reliquary.infrastructure.drand import get_beacon
+
+        fetched = await asyncio.to_thread(
+            get_beacon,
+            round_id=str(beacon.round),
+            use_drand=True,
+            use_fallback=False,
+        )
+        signature = fetched.get("signature")
+        if (
+            str(fetched.get("source")) != beacon.source
+            or str(fetched.get("chain")) != beacon.chain
+            or str(fetched.get("chain_hash")) != beacon.chain_hash
+            or int(fetched.get("round", -1)) != beacon.round
+            or str(fetched.get("randomness")) != beacon.randomness
+            or not signature
+        ):
+            raise RuntimeError("checkpoint epoch beacon does not match drand")
+        verified = await asyncio.to_thread(
+            verify_beacon_signature,
+            beacon.chain_hash,
+            beacon.round,
+            beacon.randomness,
+            str(signature),
+        )
+        if verified is not True:
+            raise RuntimeError("checkpoint epoch beacon verification failed")
+
+    async def _checkpoint_epoch_intent(
+        self,
+        checkpoint,
+        *,
+        next_window: int,
+    ) -> EpochCommitIntent:
+        store = self._checkpoint_epoch_store
+        if store is None:
+            raise RuntimeError("checkpoint epoch store is unavailable")
+        protocol = self._checkpoint_epoch_protocol_binding()
+        existing = store.load_current_intent()
+        if (
+            existing is not None
+            and existing.protocol == protocol
+            and existing.checkpoint.number == int(checkpoint.checkpoint_n)
+            and existing.checkpoint.repo_id == str(checkpoint.repo_id)
+            and existing.checkpoint.revision == str(checkpoint.revision)
+            and existing.first_window <= next_window
+            < existing.first_window + existing.window_count
+            and store.is_confirmed(existing)
+        ):
+            return existing
+
+        for _attempt in range(4):
+            chain_info, observed_round = (
+                await self._checkpoint_epoch_drand_snapshot()
+            )
+            intent = build_epoch_intent(
+                protocol=protocol,
+                checkpoint_number=int(checkpoint.checkpoint_n),
+                checkpoint_repo_id=str(checkpoint.repo_id),
+                checkpoint_revision=str(checkpoint.revision),
+                commit_observed_round=observed_round,
+                first_window=next_window,
+                window_count=CHECKPOINT_PUBLISH_INTERVAL_WINDOWS,
+                beacon_chain=str(chain_info["name"]),
+                beacon_chain_hash=str(chain_info["hash"]),
+                warmup_rounds=EXPERIMENTAL_CHECKPOINT_EPOCH_WARMUP_ROUNDS,
+                window_schedule=WindowSchedule(
+                    mode="ordinary_window_state_machine",
+                    collection_seconds=WINDOW_COLLECTION_SECONDS,
+                    timeout_seconds=WINDOW_TIMEOUT_SECONDS,
+                ),
+                prompt_range_size=PROMPT_RANGE_SIZE,
+                environment_universes={
+                    name: len(environment)
+                    for name, environment in self.envs.items()
+                },
+            )
+            store.install_intent(intent)
+            _, confirmed_round = await self._checkpoint_epoch_drand_snapshot()
+            if confirmed_round < intent.beacon_target_round:
+                store.confirm_before_beacon(
+                    intent,
+                    observed_round=confirmed_round,
+                )
+                return intent
+        raise RuntimeError(
+            "could not persist checkpoint epoch intent before its beacon"
+        )
+
+    async def _plan_from_checkpoint_epoch_intent(
+        self,
+        intent: EpochCommitIntent,
+    ) -> EpochPlan:
+        store = self._checkpoint_epoch_store
+        if store is None or not store.is_confirmed(intent):
+            raise RuntimeError("checkpoint epoch intent is not confirmed")
+
+        while True:
+            _, current_round = await self._checkpoint_epoch_drand_snapshot()
+            if current_round >= intent.beacon_target_round:
+                break
+            await asyncio.sleep(0.25)
+
+        from reliquary.infrastructure.drand import get_beacon
+
+        fetched = await asyncio.to_thread(
+            get_beacon,
+            round_id=str(intent.beacon_target_round),
+            use_drand=True,
+            use_fallback=False,
+        )
+        beacon = BeaconBinding(
+            source=str(fetched["source"]),
+            chain=str(fetched["chain"]),
+            chain_hash=str(fetched["chain_hash"]),
+            round=int(fetched["round"]),
+            randomness=str(fetched["randomness"]),
+        )
+        await self._verify_checkpoint_epoch_beacon(beacon)
+        plan = plan_from_intent(intent, beacon=beacon)
+        store.install_plan(intent, plan)
+        return plan
+
+    async def _ensure_checkpoint_epoch_plan(self) -> EpochPlan | None:
+        if not EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED:
+            return None
+        if not self.use_drand:
+            raise RuntimeError("checkpoint epoch requires verified drand")
+        checkpoint = self._checkpoint_store.current_manifest()
+        if checkpoint is None:
+            self._checkpoint_epoch_plan = None
+            self.server.set_checkpoint_epoch_plan(None)
+            return None
+
+        next_window = (
+            self._candidate_window_n
+            if self._candidate_window_n is not None
+            else self._window_n + 1
+        )
+        active = self._checkpoint_epoch_plan
+        if active is not None and not self._checkpoint_epoch_matches(
+            active, checkpoint
+        ):
+            self._checkpoint_epoch_plan = None
+            self.server.set_checkpoint_epoch_plan(None)
+            active = None
+        if active is not None:
+            if self._checkpoint_epoch_window(next_window) is None:
+                raise RuntimeError(
+                    "checkpoint epoch exhausted before checkpoint publication"
+                )
+            return active
+
+        store = self._checkpoint_epoch_store
+        if store is None:
+            raise RuntimeError("checkpoint epoch store is unavailable")
+        restored = store.load_current_plan()
+        if restored is not None and self._checkpoint_epoch_matches(
+            restored, checkpoint
+        ):
+            if restored.protocol != self._checkpoint_epoch_protocol_binding():
+                raise RuntimeError("stored checkpoint epoch protocol changed")
+            if not (
+                restored.first_window <= next_window
+                < restored.first_window + restored.window_count
+            ):
+                raise RuntimeError(
+                    "stored checkpoint epoch does not contain the next window"
+                )
+            await self._verify_checkpoint_epoch_beacon(restored.epoch_beacon)
+            plan = restored
+        else:
+            intent = await self._checkpoint_epoch_intent(
+                checkpoint,
+                next_window=next_window,
+            )
+            plan = await self._plan_from_checkpoint_epoch_intent(intent)
+            latest = self._checkpoint_store.current_manifest()
+            if not self._checkpoint_epoch_matches(plan, latest):
+                raise RuntimeError(
+                    "checkpoint changed while constructing epoch plan"
+                )
+
+        self._checkpoint_epoch_plan = plan
+        self.server.set_checkpoint_epoch_plan(plan)
+        logger.info(
+            "Checkpoint epoch active id=%s manifest=%s windows=%d..%d",
+            plan.epoch_id[:12],
+            manifest_sha256(plan)[:12],
+            plan.first_window,
+            plan.first_window + plan.window_count - 1,
+        )
+        return plan
+
+    async def _wait_for_checkpoint_epoch_activation(self) -> None:
+        plan = self._checkpoint_epoch_plan
+        next_window = (
+            self._candidate_window_n
+            if self._candidate_window_n is not None
+            else self._window_n + 1
+        )
+        if plan is None or next_window != plan.first_window:
+            return
+        while True:
+            _, current_round = await self._checkpoint_epoch_drand_snapshot()
+            if current_round >= plan.activation_not_before_round:
+                return
+            await asyncio.sleep(0.5)
+
     def _open_window(self) -> None:
         """Create GrpoWindowBatchers (one per env) in a non-active state.
 
@@ -1756,6 +2047,7 @@ class ValidationService:
         if self._candidate_activation_nonce is None:
             self._candidate_activation_nonce = os.urandom(32)
         target_window = self._candidate_window_n
+        epoch_window = self._checkpoint_epoch_window(target_window)
         self._set_window_preparation_stage("batcher_construction")
         bootstrap = is_bootstrap_window(
             window_start=target_window,
@@ -1790,6 +2082,23 @@ class ValidationService:
                 ),
                 "operator_by_hotkey": operator_by_hotkey,
             }
+            if epoch_window is not None:
+                slices = [
+                    item
+                    for item in epoch_window.prompt_slices
+                    if item.environment == env_name
+                ]
+                if len(slices) != 1:
+                    raise RuntimeError(
+                        "checkpoint epoch has no unique environment slice"
+                    )
+                open_kwargs.update({
+                    "experimental_epoch_ranking": True,
+                    "experimental_prompt_range": (
+                        slices[0].start,
+                        slices[0].stop,
+                    ),
+                })
             if self.proof_scheduler is not None:
                 open_kwargs["proof_scheduler"] = self.proof_scheduler
             if self._proof_worker_pool is not None:
@@ -1806,6 +2115,16 @@ class ValidationService:
                 **open_kwargs,
             )
             batcher.current_checkpoint_hash = cp_hash
+            if epoch_window is not None:
+                plan = self._checkpoint_epoch_plan
+                if plan is None:
+                    raise RuntimeError("checkpoint epoch plan disappeared")
+                batcher.checkpoint_epoch_id = plan.epoch_id
+                batcher.checkpoint_epoch_manifest_sha256 = manifest_sha256(plan)
+                batcher.checkpoint_epoch_window_offset = epoch_window.offset
+                batcher.checkpoint_epoch_generation_randomness = (
+                    epoch_window.generation_randomness
+                )
             self._active_batchers[env_name] = batcher
 
     def _activate_window(self) -> None:
@@ -2333,6 +2652,21 @@ class ValidationService:
                 else self._window_n
             )
         self._set_window_preparation_stage("randomness")
+        epoch_window = self._checkpoint_epoch_window(target_window)
+        if epoch_window is not None:
+            for batcher in self._active_batchers.values():
+                if (
+                    getattr(batcher, "checkpoint_epoch_generation_randomness", None)
+                    != epoch_window.generation_randomness
+                ):
+                    raise RuntimeError(
+                        "prepared batcher does not match checkpoint epoch"
+                    )
+                batcher.randomness = epoch_window.generation_randomness
+                batcher.set_prompt_range()
+            self._last_beacon = None
+            self._verify_task = None
+            return
         # 3 attempts total: original + 2 retries. Backoff is 0.5s then 1.0s,
         # so worst-case added latency is 1.5s — well inside the 60s window
         # budget. Sustained outages still bubble after attempt 3.
@@ -2661,9 +2995,25 @@ class ValidationService:
         # orders candidates equal on score and validator-observed arrival round,
         # and keys the forensic sample. If the bounded fetch fails, exact
         # validator precommit arrival orders ties and forensics are disabled.
-        seal_randomness = await self._fetch_seal_randomness()
-        for b in batchers.values():
-            b.seal_randomness = seal_randomness
+        epoch_batchers = [
+            batcher
+            for batcher in batchers.values()
+            if getattr(batcher, "experimental_epoch_ranking", False) is True
+        ]
+        if epoch_batchers:
+            if len(epoch_batchers) != len(batchers):
+                raise RuntimeError("mixed epoch and production ranking window")
+            close_round, seal_beacon = (
+                await self._fetch_checkpoint_epoch_seal_beacon()
+            )
+            for batcher in epoch_batchers:
+                batcher.collection_close_drand_round = close_round
+                batcher.seal_randomness = seal_beacon.randomness
+                batcher.seal_beacon_round = seal_beacon.round
+        else:
+            seal_randomness = await self._fetch_seal_randomness()
+            for batcher in batchers.values():
+                batcher.seal_randomness = seal_randomness
         # Both environments submit their strict rank order to one global,
         # device-owning scheduler. The scheduler applies decisions in rank
         # order even when distinct replicas finish out of order.
@@ -4221,6 +4571,9 @@ class ValidationService:
                             "proof_replica_refresh"
                         )
                     await self._ensure_proof_scheduler_ready()
+                    self._window_iteration_stage = "checkpoint_epoch"
+                    await self._ensure_checkpoint_epoch_plan()
+                    await self._wait_for_checkpoint_epoch_activation()
                     self._window_iteration_stage = "open"
                     self._open_window()
                     self._window_iteration_stage = "admission_pools"
@@ -5179,6 +5532,46 @@ class ValidationService:
         # disable drand keep working without a live drand fetch.
         block_hash = await chain.get_block_hash(subtensor, target_window)
         return chain.compute_window_randomness(block_hash), None
+
+    async def _fetch_checkpoint_epoch_seal_beacon(
+        self,
+    ) -> tuple[int, BeaconBinding]:
+        """Return a verified beacon first available after close observation."""
+        plan = self._checkpoint_epoch_plan
+        if plan is None or not self.use_drand:
+            raise RuntimeError("checkpoint epoch seal requires drand")
+        chain_info, close_round = await self._checkpoint_epoch_drand_snapshot()
+        if (
+            str(chain_info["name"]) != plan.epoch_beacon.chain
+            or str(chain_info["hash"]) != plan.epoch_beacon.chain_hash
+        ):
+            raise RuntimeError("drand chain changed during checkpoint epoch")
+        target_round = close_round + 1
+        while True:
+            _, current_round = await self._checkpoint_epoch_drand_snapshot()
+            if current_round >= target_round:
+                break
+            await asyncio.sleep(0.25)
+
+        from reliquary.infrastructure.drand import get_beacon
+
+        fetched = await asyncio.to_thread(
+            get_beacon,
+            round_id=str(target_round),
+            use_drand=True,
+            use_fallback=False,
+        )
+        beacon = BeaconBinding(
+            source=str(fetched["source"]),
+            chain=str(fetched["chain"]),
+            chain_hash=str(fetched["chain_hash"]),
+            round=int(fetched["round"]),
+            randomness=str(fetched["randomness"]),
+        )
+        await self._verify_checkpoint_epoch_beacon(beacon)
+        if beacon.round <= close_round:
+            raise RuntimeError("checkpoint epoch seal beacon is not post-close")
+        return close_round, beacon
 
     async def _fetch_seal_randomness(self) -> str:
         """Fetch post-deadline drand with a bounded retry budget.

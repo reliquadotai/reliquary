@@ -195,6 +195,33 @@ def _auction_operator_tiebreak(
     return h.digest()
 
 
+def _epoch_candidate_tiebreak(
+    *,
+    seal_randomness: str,
+    checkpoint_revision: str,
+    window_start: int,
+    environment: str,
+    operator_id: str,
+    prompt_idx: int,
+) -> bytes:
+    """Order an equal-utility epoch candidate with post-close entropy only."""
+    digest = hashlib.sha256()
+    digest.update(b"reliquary/checkpoint-epoch/final-tiebreak/v1\x00")
+
+    def update_text(value: str) -> None:
+        encoded = value.encode("utf-8")
+        digest.update(len(encoded).to_bytes(4, "big"))
+        digest.update(encoded)
+
+    update_text(seal_randomness)
+    update_text(checkpoint_revision)
+    digest.update(int(window_start).to_bytes(8, "big"))
+    update_text(environment)
+    update_text(operator_id)
+    digest.update(int(prompt_idx).to_bytes(8, "big"))
+    return digest.digest()
+
+
 def _int_or_none(value: Any) -> int | None:
     if value is None:
         return None
@@ -753,6 +780,8 @@ class GrpoWindowBatcher:
         operator_by_hotkey: dict[str, str] | None = None,
         current_round_fn: Callable[[], int | None] | None = None,
         proof_scheduler: GlobalProofScheduler | None = None,
+        experimental_epoch_ranking: bool = False,
+        experimental_prompt_range: tuple[int, int] | None = None,
     ) -> None:
         from reliquary.constants import DRAND_ROUND_BACKWARD_TOLERANCE
 
@@ -766,6 +795,8 @@ class GrpoWindowBatcher:
         self._proof_scheduler = proof_scheduler
         self.tokenizer = tokenizer
         self.bootstrap = bootstrap
+        self.experimental_epoch_ranking = bool(experimental_epoch_ranking)
+        self._experimental_prompt_range = experimental_prompt_range
         # Set True by the validator's background drand-verify task
         # if the cross-check against bittensor_drand fails post-OPEN.
         # ``_train_and_publish`` checks this before sealing and drops
@@ -827,6 +858,13 @@ class GrpoWindowBatcher:
         # exists. Production always passes a snapshot (possibly incomplete),
         # and therefore fails closed candidate-by-candidate on missing entries.
         self._operator_mapping_enforced = operator_by_hotkey is not None
+        if self.experimental_epoch_ranking and (
+            not self.difficulty_auction_enabled
+            or not self._operator_mapping_enforced
+        ):
+            raise ValueError(
+                "experimental epoch ranking requires the operator auction"
+            )
 
         # Lock-free snapshot read by the HTTP /state handler. The submit
         # worker holds ``_lock`` for the entire GRAIL verify (~5-25s); a
@@ -902,6 +940,8 @@ class GrpoWindowBatcher:
         # Empty in mock/no-drand mode activates validator-arrival fallback and
         # disables forensic sampling.
         self.seal_randomness: str = ""
+        self.seal_beacon_round: int | None = None
+        self.collection_close_drand_round: int | None = None
         # Per-window eligible prompt slice [lo, hi). None = no restriction
         # (randomness not yet known, or window is before the enforcement
         # cutover). Set by set_prompt_range() once randomness is assigned.
@@ -1066,6 +1106,12 @@ class GrpoWindowBatcher:
         until randomness is known AND ``window_start`` has reached
         ``PROMPT_RANGE_ENFORCE_FROM_WINDOW``. Call after assigning randomness.
         """
+        if self._experimental_prompt_range is not None:
+            lo, hi = self._experimental_prompt_range
+            if lo < 0 or hi <= lo or hi > len(self.env):
+                raise ValueError("invalid experimental prompt range")
+            self.prompt_range = (int(lo), int(hi))
+            return
         if (
             not self.randomness
             or self.window_start < PROMPT_RANGE_ENFORCE_FROM_WINDOW
@@ -4435,11 +4481,26 @@ class GrpoWindowBatcher:
         arrival_source_by_id: dict[int, str] = {}
         exact_arrival_by_id: dict[int, float] = {}
         tiebreak_by_id: dict[int, bytes] = {}
-        rank_entropy_source = (
-            "seal_drand"
-            if self.seal_randomness
-            else "validator_arrival_fallback"
-        )
+        if self.experimental_epoch_ranking:
+            if not self.seal_randomness or self.seal_beacon_round is None:
+                raise RuntimeError(
+                    "experimental epoch ranking requires a seal beacon"
+                )
+            if (
+                self.collection_close_drand_round is None
+                or self.seal_beacon_round
+                <= self.collection_close_drand_round
+            ):
+                raise RuntimeError(
+                    "experimental epoch seal beacon must follow collection"
+                )
+            rank_entropy_source = "post_collection_drand_epoch"
+        else:
+            rank_entropy_source = (
+                "seal_drand"
+                if self.seal_randomness
+                else "validator_arrival_fallback"
+            )
         environment = str(getattr(self.env, "name", ""))
         for pending_submission, _score in scored:
             operator = self._operator_by_hotkey.get(pending_submission.hotkey)
@@ -4452,8 +4513,8 @@ class GrpoWindowBatcher:
             exact_arrival_by_id[id(pending_submission)] = (
                 self._precommit_arrival_of(pending_submission)
             )
-            tiebreak_by_id[id(pending_submission)] = (
-                _auction_operator_tiebreak(
+            if self.experimental_epoch_ranking:
+                tiebreak = _epoch_candidate_tiebreak(
                     seal_randomness=self.seal_randomness,
                     checkpoint_revision=self.current_checkpoint_hash,
                     window_start=self.window_start,
@@ -4461,62 +4522,76 @@ class GrpoWindowBatcher:
                     operator_id=operator or "",
                     prompt_idx=pending_submission.prompt_idx,
                 )
-            )
-        # Difficulty still ranks first, so throughput never trades against
-        # training utility — it only orders candidates already judged equally
-        # useful. Among those, ordering by arrival penalises long generation
-        # (a 16k rollout arrives after a 500-token one at identical hardware),
-        # and with binary rewards the difficulty score takes only nine values,
-        # so those ties are common rather than marginal. Tokens-per-round is
-        # length-neutral instead. Absent from the v2 profile, so the deployed
-        # 2B ordering is untouched.
-        throughput_profile = PROTOCOL_THROUGHPUT_TIEBREAK
-        window_open = self.window_open_drand_round
-        throughput_by_id: dict[int, int] = {}
-        for pending_submission, _score in scored:
-            throughput_by_id[id(pending_submission)] = (
-                throughput_rank(
-                    # Anti-padding cap per rollout; the group ceiling below is
-                    # M_ROLLOUTS x cap so real 8-rollout totals stay
-                    # discriminant (the single-rollout cap on the sum clamped
-                    # 53% of groups onto one constant = raw arrival ordering).
-                    _generated_tokens_of(
-                        pending_submission,
-                        per_rollout_cap=throughput_profile.token_cap,
-                    ),
-                    arrival_round=arrival_by_id[id(pending_submission)],
-                    window_open_round=int(window_open),
-                    token_cap=throughput_profile.token_cap * M_ROLLOUTS,
-                    bucket_tokens_per_round=(
-                        throughput_profile.bucket_tokens_per_round
-                    ),
+            else:
+                tiebreak = _auction_operator_tiebreak(
+                    seal_randomness=self.seal_randomness,
+                    checkpoint_revision=self.current_checkpoint_hash,
+                    window_start=self.window_start,
+                    environment=environment,
+                    operator_id=operator or "",
+                    prompt_idx=pending_submission.prompt_idx,
                 )
-                if throughput_profile is not None and window_open is not None
-                else 0
-            )
-        ranked = sorted(
-            scored,
-            key=lambda item: (
-                -item[1].value,
-                throughput_by_id[id(item[0])],
-                arrival_by_id[id(item[0])],
-                (
-                    0.0
-                    if self.seal_randomness
-                    else exact_arrival_by_id[id(item[0])]
+            tiebreak_by_id[id(pending_submission)] = tiebreak
+
+        if self.experimental_epoch_ranking:
+            # Advance work makes arrival and throughput meaningless. Equal
+            # utility is ordered only by entropy first available after close.
+            ranked = sorted(
+                scored,
+                key=lambda item: (
+                    -item[1].value,
+                    tiebreak_by_id[id(item[0])],
                 ),
-                tiebreak_by_id[id(item[0])],
-            ),
-        )
-        # Tiers remain diagnostic only. The final tiebreak makes the economic
-        # ranking strict, so no tier can expand the selected or rewarded set.
+            )
+        else:
+            # Keep the production profile's ranking byte-for-byte equivalent.
+            throughput_profile = PROTOCOL_THROUGHPUT_TIEBREAK
+            window_open = self.window_open_drand_round
+            throughput_by_id: dict[int, int] = {}
+            for pending_submission, _score in scored:
+                throughput_by_id[id(pending_submission)] = (
+                    throughput_rank(
+                        _generated_tokens_of(
+                            pending_submission,
+                            per_rollout_cap=throughput_profile.token_cap,
+                        ),
+                        arrival_round=arrival_by_id[id(pending_submission)],
+                        window_open_round=int(window_open),
+                        token_cap=throughput_profile.token_cap * M_ROLLOUTS,
+                        bucket_tokens_per_round=(
+                            throughput_profile.bucket_tokens_per_round
+                        ),
+                    )
+                    if throughput_profile is not None
+                    and window_open is not None
+                    else 0
+                )
+            ranked = sorted(
+                scored,
+                key=lambda item: (
+                    -item[1].value,
+                    throughput_by_id[id(item[0])],
+                    arrival_by_id[id(item[0])],
+                    (
+                        0.0
+                        if self.seal_randomness
+                        else exact_arrival_by_id[id(item[0])]
+                    ),
+                    tiebreak_by_id[id(item[0])],
+                ),
+            )
+
         tier_by_id: dict[int, int] = {}
         tier_sizes: list[int] = []
-        last_tier_key: tuple[float, int] | None = None
+        last_tier_key: tuple[float, ...] | None = None
         for pending_submission, score in ranked:
             tier_key = (
-                score.value,
-                arrival_by_id[id(pending_submission)],
+                (score.value,)
+                if self.experimental_epoch_ranking
+                else (
+                    score.value,
+                    arrival_by_id[id(pending_submission)],
+                )
             )
             if tier_key != last_tier_key:
                 tier_sizes.append(0)
@@ -4569,6 +4644,16 @@ class GrpoWindowBatcher:
                 "proof_passed": None,
                 "selected": False,
                 "status": "ranked",
+                **(
+                    {
+                        "collection_close_drand_round": (
+                            self.collection_close_drand_round
+                        ),
+                        "seal_beacon_round": self.seal_beacon_round,
+                    }
+                    if self.experimental_epoch_ranking
+                    else {}
+                ),
                 **(
                     pending_submission.telemetry.archive_fields()
                     if pending_submission.telemetry is not None

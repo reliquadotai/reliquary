@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from types import SimpleNamespace
 
@@ -11,7 +12,9 @@ import pytest
 from reliquary.constants import VALIDATOR_HTTP_PORT
 from reliquary.miner.submitter import (
     NoValidatorFoundError,
+    SubmissionError,
     discover_validator_url,
+    get_checkpoint_epoch_plan_v1,
     get_runtime_contract_v1,
     get_window_state_v2,
     submit_batch_v2,
@@ -25,6 +28,16 @@ from reliquary.protocol.submission import (
     RuntimeContract,
     RuntimeFingerprint,
     WindowState,
+)
+from reliquary.shared.checkpoint_epoch import (
+    BeaconBinding,
+    CheckpointBinding,
+    ProtocolBinding,
+    WindowSchedule,
+    build_epoch_plan,
+    canonical_manifest_bytes,
+    generation_contract_sha256,
+    manifest_sha256,
 )
 from reliquary.shared.runtime_fingerprint import collect_runtime_fingerprint
 
@@ -540,6 +553,220 @@ async def test_get_runtime_contract_v1_uses_separate_capability_endpoint(
 
     assert seen["url"] == "http://fake/runtime-contract"
     assert result.telemetry_version == 2
+    await client.aclose()
+
+
+def _checkpoint_epoch_plan_fixture():
+    return build_epoch_plan(
+        protocol=ProtocolBinding(
+            profile_id="experimental-fixture",
+            protocol_version=600,
+            generation_contract_sha256=generation_contract_sha256(
+                {"fixture": True}
+            ),
+        ),
+        checkpoint=CheckpointBinding(
+            number=4,
+            repo_id="example/checkpoint",
+            revision="a" * 40,
+            commit_observed_round=100,
+        ),
+        epoch_beacon=BeaconBinding(
+            source="drand",
+            chain="quicknet",
+            chain_hash="b" * 64,
+            round=101,
+            randomness="c" * 64,
+        ),
+        beacon_delay_rounds=1,
+        first_window=80,
+        window_count=2,
+        warmup_rounds=3,
+        window_schedule=WindowSchedule(
+            mode="ordinary_window_state_machine",
+            collection_seconds=60.0,
+            timeout_seconds=7200,
+        ),
+        environment_universes={"math": 100},
+        prompt_range_size=8,
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_checkpoint_epoch_plan_binds_etag_state_and_canonical_body(
+    monkeypatch,
+):
+    import reliquary.miner.submitter as submitter_module
+
+    plan = _checkpoint_epoch_plan_fixture()
+    digest = manifest_sha256(plan)
+    seen = {}
+
+    async def _get(self, url, timeout=None):
+        seen["url"] = url
+        return httpx.Response(
+            200,
+            content=canonical_manifest_bytes(plan),
+            headers={"ETag": f'"{digest}"'},
+        )
+
+    async def _verify_public_beacon(fetched_plan):
+        assert fetched_plan == plan
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", _get)
+    monkeypatch.setattr(
+        submitter_module,
+        "_verify_checkpoint_epoch_public_beacon",
+        _verify_public_beacon,
+    )
+    client = httpx.AsyncClient()
+    fetched = await get_checkpoint_epoch_plan_v1(
+        "http://fake",
+        expected_manifest_sha256=digest,
+        client=client,
+    )
+
+    assert seen["url"] == "http://fake/checkpoint-epoch"
+    assert fetched == plan
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_get_checkpoint_epoch_plan_can_discover_during_warmup(monkeypatch):
+    import reliquary.miner.submitter as submitter_module
+
+    plan = _checkpoint_epoch_plan_fixture()
+    digest = manifest_sha256(plan)
+
+    async def _get(self, url, timeout=None):
+        return httpx.Response(
+            200,
+            content=canonical_manifest_bytes(plan),
+            headers={"ETag": f'"{digest}"'},
+        )
+
+    async def _verify_public_beacon(_plan):
+        return None
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", _get)
+    monkeypatch.setattr(
+        submitter_module,
+        "_verify_checkpoint_epoch_public_beacon",
+        _verify_public_beacon,
+    )
+    client = httpx.AsyncClient()
+
+    assert await get_checkpoint_epoch_plan_v1(
+        "http://fake",
+        client=client,
+    ) == plan
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_epoch_public_beacon_must_match_independent_drand(
+    monkeypatch,
+):
+    import reliquary.infrastructure.drand as drand
+    import reliquary.miner.submitter as submitter_module
+
+    plan = _checkpoint_epoch_plan_fixture()
+    monkeypatch.setattr(
+        drand,
+        "get_current_chain",
+        lambda: {
+            "name": plan.epoch_beacon.chain,
+            "hash": plan.epoch_beacon.chain_hash,
+        },
+    )
+    monkeypatch.setattr(
+        drand,
+        "get_beacon",
+        lambda **_kwargs: {
+            "source": "drand",
+            "chain": plan.epoch_beacon.chain,
+            "chain_hash": plan.epoch_beacon.chain_hash,
+            "round": plan.epoch_beacon.round,
+            "randomness": "d" * 64,
+            "signature": "e" * 192,
+        },
+    )
+
+    with pytest.raises(SubmissionError, match="public beacon"):
+        await submitter_module._verify_checkpoint_epoch_public_beacon(plan)
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_epoch_public_beacon_verifier_is_time_bounded(
+    monkeypatch,
+):
+    import hashlib
+    import time
+
+    import reliquary.infrastructure.drand as drand
+    import reliquary.miner.submitter as submitter_module
+
+    plan = _checkpoint_epoch_plan_fixture()
+    signature = "aa"
+    randomness = hashlib.sha256(bytes.fromhex(signature)).hexdigest()
+    plan = replace(
+        plan,
+        epoch_beacon=replace(plan.epoch_beacon, randomness=randomness),
+    )
+    monkeypatch.setattr(
+        drand,
+        "get_current_chain",
+        lambda: {
+            "name": plan.epoch_beacon.chain,
+            "hash": plan.epoch_beacon.chain_hash,
+        },
+    )
+    monkeypatch.setattr(
+        drand,
+        "get_beacon",
+        lambda **_kwargs: {
+            "source": "drand",
+            "chain": plan.epoch_beacon.chain,
+            "chain_hash": plan.epoch_beacon.chain_hash,
+            "round": plan.epoch_beacon.round,
+            "randomness": randomness,
+            "signature": signature,
+        },
+    )
+    monkeypatch.setattr(
+        drand,
+        "verify_beacon_signature",
+        lambda *_args: time.sleep(0.1) or True,
+    )
+    monkeypatch.setattr(
+        submitter_module,
+        "_CHECKPOINT_EPOCH_BEACON_VERIFY_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    with pytest.raises(SubmissionError, match="public beacon"):
+        await submitter_module._verify_checkpoint_epoch_public_beacon(plan)
+
+
+@pytest.mark.asyncio
+async def test_get_checkpoint_epoch_plan_rejects_etag_equivocation(monkeypatch):
+    plan = _checkpoint_epoch_plan_fixture()
+
+    async def _get(self, url, timeout=None):
+        return httpx.Response(
+            200,
+            content=canonical_manifest_bytes(plan),
+            headers={"ETag": f'"{"d" * 64}"'},
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", _get)
+    client = httpx.AsyncClient()
+    with pytest.raises(SubmissionError, match="ETag"):
+        await get_checkpoint_epoch_plan_v1(
+            "http://fake",
+            expected_manifest_sha256=manifest_sha256(plan),
+            client=client,
+        )
     await client.aclose()
 
 

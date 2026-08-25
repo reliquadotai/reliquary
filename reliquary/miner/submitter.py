@@ -29,12 +29,18 @@ from reliquary.protocol.submission import (
     SubmissionPrecommitRequest,
     SubmissionPrecommitResponse,
 )
+from reliquary.shared.checkpoint_epoch import (
+    CHECKPOINT_EPOCH_CAPABILITY_ID,
+    EpochPlan,
+    parse_epoch_plan,
+)
 from reliquary.shared.runtime_fingerprint import bind_runtime_profile_nonce
 
 logger = logging.getLogger(__name__)
 
 # Retry configuration: 3 attempts, exponential backoff 1s / 2s / 4s.
 _RETRY_DELAYS = (1.0, 2.0, 4.0)
+_CHECKPOINT_EPOCH_BEACON_VERIFY_TIMEOUT_SECONDS = 12.0
 # Default timeout is generous: the validator may need several seconds to verify
 # a submission even in the async-queue path (the queue can back up under load).
 # Miners running against slow links (Targon port-forward etc.) benefit further.
@@ -184,6 +190,68 @@ def _safe_detail(resp: httpx.Response) -> str:
         return str(body)[:200]
     except Exception:
         return resp.text[:200]
+
+
+async def _verify_checkpoint_epoch_public_beacon(plan: EpochPlan) -> None:
+    """Independently verify the exact public drand output in a plan."""
+    from reliquary.infrastructure.drand import (
+        get_beacon,
+        get_current_chain,
+        verify_beacon_signature,
+    )
+
+    loop = asyncio.get_running_loop()
+    deadline = (
+        loop.time() + _CHECKPOINT_EPOCH_BEACON_VERIFY_TIMEOUT_SECONDS
+    )
+
+    async def bounded(callback, *args, **kwargs):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise TimeoutError("checkpoint epoch beacon verification timed out")
+        return await asyncio.wait_for(
+            asyncio.to_thread(callback, *args, **kwargs),
+            timeout=remaining,
+        )
+
+    try:
+        chain_info = await bounded(get_current_chain)
+        expected = plan.epoch_beacon
+        if (
+            str(chain_info["name"]) != expected.chain
+            or str(chain_info["hash"]) != expected.chain_hash
+        ):
+            raise ValueError("configured drand chain differs from manifest")
+        beacon = await bounded(
+            get_beacon,
+            round_id=str(expected.round),
+            use_drand=True,
+            use_fallback=False,
+        )
+        if (
+            str(beacon.get("source")) != "drand"
+            or str(beacon.get("chain")) != expected.chain
+            or str(beacon.get("chain_hash")) != expected.chain_hash
+            or int(beacon.get("round", -1)) != expected.round
+            or str(beacon.get("randomness")) != expected.randomness
+            or not beacon.get("signature")
+        ):
+            raise ValueError("public drand output differs from manifest")
+        verified = await bounded(
+            verify_beacon_signature,
+            expected.chain_hash,
+            expected.round,
+            expected.randomness,
+            str(beacon["signature"]),
+        )
+        if verified is not True:
+            raise ValueError("public drand signature verification failed")
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        raise SubmissionError(
+            "checkpoint epoch public beacon validation failed"
+        ) from exc
 
 
 async def submit_batch_v2(
@@ -493,3 +561,98 @@ async def get_runtime_contract_v1(
         client=client,
         timeout=timeout,
     )
+
+
+async def get_checkpoint_epoch_plan_v1(
+    url: str,
+    *,
+    expected_manifest_sha256: str | None = None,
+    client: httpx.AsyncClient | None = None,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> EpochPlan:
+    """Fetch canonical plan bytes, using live state or the endpoint ETag.
+
+    Omitting ``expected_manifest_sha256`` is useful during the advertised
+    warm-up, before an ordinary window exists. Local release must still match
+    the same digest in the later exact-OPEN state.
+    """
+    if expected_manifest_sha256 is not None and (
+        len(expected_manifest_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in expected_manifest_sha256
+        )
+    ):
+        raise ValueError("expected manifest hash must be lowercase SHA-256")
+
+    own_client = client is None
+    http = client or httpx.AsyncClient(timeout=timeout)
+    last_error: Exception | None = None
+    try:
+        for attempt, delay in enumerate(_RETRY_DELAYS, start=1):
+            try:
+                response = await http.get(
+                    f"{url}/checkpoint-epoch",
+                    timeout=timeout,
+                )
+            except (httpx.RequestError, httpx.TimeoutException) as exc:
+                last_error = exc
+                if attempt < len(_RETRY_DELAYS):
+                    await asyncio.sleep(delay)
+                continue
+            if response.status_code == 404:
+                raise SubmissionError("checkpoint epoch capability is disabled")
+            if 400 <= response.status_code < 500:
+                raise SubmissionError(
+                    f"HTTP {response.status_code}: {_safe_detail(response)}"
+                )
+            if response.status_code >= 500:
+                last_error = SubmissionError(f"HTTP {response.status_code}")
+                if attempt < len(_RETRY_DELAYS):
+                    await asyncio.sleep(delay)
+                continue
+
+            etag = response.headers.get("ETag", "")
+            advertised_digest = etag[1:-1] if (
+                len(etag) == 66 and etag.startswith('"') and etag.endswith('"')
+            ) else ""
+            if expected_manifest_sha256 is None:
+                if (
+                    len(advertised_digest) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in advertised_digest
+                    )
+                ):
+                    raise SubmissionError(
+                        "checkpoint epoch endpoint omitted a valid ETag"
+                    )
+                expected_digest = advertised_digest
+            else:
+                expected_digest = expected_manifest_sha256
+            if advertised_digest != expected_digest:
+                raise SubmissionError(
+                    "checkpoint epoch ETag does not match live state"
+                )
+            try:
+                plan = parse_epoch_plan(
+                    response.content,
+                    expected_manifest_sha256=expected_digest,
+                )
+            except (TypeError, ValueError) as exc:
+                raise SubmissionError(
+                    "checkpoint epoch manifest validation failed"
+                ) from exc
+            if (
+                plan.experimental_capability_id
+                != CHECKPOINT_EPOCH_CAPABILITY_ID
+            ):
+                raise SubmissionError(
+                    "unsupported checkpoint epoch capability"
+                )
+            await _verify_checkpoint_epoch_public_beacon(plan)
+            return plan
+        raise SubmissionError(f"all retries failed: {last_error}")
+    finally:
+        if own_client:
+            await http.aclose()

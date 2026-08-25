@@ -113,6 +113,12 @@ from reliquary.protocol.submission import (
     VerdictsResponse,
 )
 from reliquary.protocol.tokens import verify_tokens
+from reliquary.shared.checkpoint_epoch import (
+    EpochPlan,
+    canonical_manifest_bytes,
+    manifest_sha256,
+    parse_epoch_plan,
+)
 from reliquary.shared.hf_compat import (
     resolve_max_context_length,
     resolve_vocab_size,
@@ -1199,6 +1205,10 @@ class ValidatorServer:
             no_reveal_state_path,
             namespace=no_reveal_namespace,
         )
+        self._checkpoint_epoch_plan: EpochPlan | None = None
+        self._checkpoint_epoch_manifest_bytes: bytes | None = None
+        self._checkpoint_epoch_manifest_sha256: str | None = None
+        self._checkpoint_epoch_manifests_by_id: dict[str, bytes] = {}
         self.app: FastAPI = self._build_app()
         self._server: uvicorn.Server | None = None
         self._task: asyncio.Task[Any] | None = None
@@ -1288,6 +1298,7 @@ class ValidatorServer:
     def _state_cache_key(self, batcher) -> tuple:
         """Everything the /state payload depends on, for one batcher."""
         cp = self._current_checkpoint
+        epoch = self._checkpoint_epoch_plan
         submission_count = (
             getattr(batcher, "pending_count", batcher.valid_count)
             if getattr(batcher, "difficulty_auction_enabled", False)
@@ -1300,6 +1311,8 @@ class ValidatorServer:
             submission_count,
             cp.checkpoint_n if cp else -1,
             cp.revision if cp else None,
+            epoch.epoch_id if epoch is not None else None,
+            self._checkpoint_epoch_manifest_sha256,
         )
 
     def _cached_state_response(self, env: str | None) -> bytes | None:
@@ -1807,7 +1820,48 @@ class ValidatorServer:
         self._archive_queue_snapshot_callback = snapshot_callback
 
     def set_current_checkpoint(self, entry) -> None:
+        plan = self._checkpoint_epoch_plan
+        if plan is not None and (
+            entry is None
+            or int(entry.checkpoint_n) != plan.checkpoint.number
+            or str(entry.repo_id) != plan.checkpoint.repo_id
+            or str(entry.revision) != plan.checkpoint.revision
+        ):
+            self.set_checkpoint_epoch_plan(None)
         self._current_checkpoint = entry
+
+    def set_checkpoint_epoch_plan(self, plan: EpochPlan | None) -> None:
+        """Install one immutable experimental plan, or withdraw the surface."""
+        if plan is None:
+            self._checkpoint_epoch_plan = None
+            self._checkpoint_epoch_manifest_bytes = None
+            self._checkpoint_epoch_manifest_sha256 = None
+            self._state_response_cache.clear()
+            return
+
+        raw = canonical_manifest_bytes(plan)
+        digest = manifest_sha256(plan)
+        existing = self._checkpoint_epoch_manifests_by_id.get(plan.epoch_id)
+        if existing is not None and existing != raw:
+            raise ValueError("checkpoint epoch equivocation rejected")
+        parsed = parse_epoch_plan(
+            raw,
+            expected_manifest_sha256=digest,
+        )
+        checkpoint = self._current_checkpoint
+        if checkpoint is not None and (
+            int(checkpoint.checkpoint_n) != parsed.checkpoint.number
+            or str(checkpoint.repo_id) != parsed.checkpoint.repo_id
+            or str(checkpoint.revision) != parsed.checkpoint.revision
+        ):
+            raise ValueError(
+                "checkpoint epoch plan does not bind the current checkpoint"
+            )
+        self._checkpoint_epoch_manifests_by_id.setdefault(parsed.epoch_id, raw)
+        self._checkpoint_epoch_plan = parsed
+        self._checkpoint_epoch_manifest_bytes = raw
+        self._checkpoint_epoch_manifest_sha256 = digest
+        self._state_response_cache.clear()
 
     def configure_registration_gate(self) -> None:
         """Arm admission against the service-managed metagraph snapshot."""
@@ -5004,6 +5058,7 @@ class ValidatorServer:
                 if batcher is None:
                     raise HTTPException(status_code=503, detail="no_active_window")
             cp = self._current_checkpoint
+            epoch = self._checkpoint_epoch_plan
             submission_count = (
                 getattr(batcher, "pending_count", batcher.valid_count)
                 if getattr(batcher, "difficulty_auction_enabled", False)
@@ -5032,28 +5087,48 @@ class ValidatorServer:
                 checkpoint_repo_id=cp.repo_id if cp else None,
                 checkpoint_revision=cp.revision if cp else None,
                 protocol_version=(
-                    PROTOCOL_VERSION if PROTOCOL_VERSION >= 3 else None
+                    PROTOCOL_VERSION
+                    if PROTOCOL_VERSION >= 3 or epoch is not None
+                    else None
                 ),
                 generation_profile_id=(
-                    PROTOCOL_PROFILE_ID if PROTOCOL_VERSION >= 3 else None
+                    PROTOCOL_PROFILE_ID
+                    if PROTOCOL_VERSION >= 3 or epoch is not None
+                    else None
                 ),
                 generation_contract=(
                     dict(PROTOCOL_GENERATION_CONTRACT)
-                    if PROTOCOL_VERSION >= 3
+                    if PROTOCOL_VERSION >= 3 or epoch is not None
+                    else None
+                ),
+                checkpoint_epoch_id=(
+                    epoch.epoch_id if epoch is not None else None
+                ),
+                checkpoint_epoch_manifest_sha256=(
+                    self._checkpoint_epoch_manifest_sha256
+                    if epoch is not None
                     else None
                 ),
                 randomness=batcher.randomness,
             )
-            body = payload.model_dump_json(
-                exclude=(
+            excluded_fields: set[str] = set()
+            if PROTOCOL_VERSION < 3 and epoch is None:
+                excluded_fields.update(
                     {
                         "protocol_version",
                         "generation_profile_id",
                         "generation_contract",
                     }
-                    if PROTOCOL_VERSION < 3
-                    else None
-                ),
+                )
+            if epoch is None:
+                excluded_fields.update(
+                    {
+                        "checkpoint_epoch_id",
+                        "checkpoint_epoch_manifest_sha256",
+                    }
+                )
+            body = payload.model_dump_json(
+                exclude=excluded_fields or None,
             ).encode("utf-8")
             self._state_response_cache[cache_slot] = (cache_key, body)
             return Response(content=body, media_type="application/json")
@@ -5082,6 +5157,25 @@ class ValidatorServer:
                 "revision": cp.revision,
                 "signature": cp.signature,
             }
+
+        @app.get("/checkpoint-epoch")
+        async def checkpoint_epoch():
+            """Return the exact bytes advertised by the live state digest."""
+            raw = self._checkpoint_epoch_manifest_bytes
+            digest = self._checkpoint_epoch_manifest_sha256
+            if raw is None or digest is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="checkpoint_epoch_disabled",
+                )
+            return Response(
+                content=raw,
+                media_type="application/json",
+                headers={
+                    "ETag": f'"{digest}"',
+                    "Cache-Control": "no-cache, must-revalidate",
+                },
+            )
 
         @app.get(
             "/verdicts/{hotkey}",
