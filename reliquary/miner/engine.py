@@ -398,6 +398,57 @@ class MiningEngine:
     # Public API
     # ------------------------------------------------------------------
 
+    def build_batch_request_from_generations(
+        self,
+        *,
+        generations: list[dict],
+        problem: dict,
+        environment: "Environment",
+        randomness: str,
+        prompt_idx: int,
+        window_number: int,
+        checkpoint_revision: str,
+        runtime_fingerprint=None,
+    ):
+        """Turn backend-produced token sequences into a protocol request.
+
+        Generation backends only need to return the same small generation
+        dictionaries as the built-in path. Proof construction, token
+        log-probabilities, rewards, signatures, and request formatting remain
+        on the existing canonical implementation.
+        """
+        from reliquary.protocol.submission import BatchSubmissionRequest
+
+        if len(generations) != M_ROLLOUTS:
+            raise ValueError(
+                f"expected {M_ROLLOUTS} generations, got {len(generations)}"
+            )
+        rollouts = [
+            self._build_rollout_submission(
+                generation,
+                problem,
+                randomness,
+                env=environment,
+            )
+            for generation in generations
+        ]
+        return BatchSubmissionRequest(
+            miner_hotkey=self.wallet.hotkey.ss58_address,
+            prompt_idx=prompt_idx,
+            window_start=window_number,
+            merkle_root=_compute_merkle_root(rollouts),
+            rollouts=rollouts,
+            checkpoint_hash=checkpoint_revision,
+            runtime_fingerprint=runtime_fingerprint,
+            nonce=_initial_runtime_bound_nonce(runtime_fingerprint),
+            protocol_version=FORCED_SEED_PROTOCOL_VERSION,
+            generation_profile_id=(
+                ACTIVE_PROTOCOL_PROFILE.profile_id
+                if ACTIVE_PROTOCOL_PROFILE.protocol_version >= 3
+                else ""
+            ),
+        )
+
     async def mine_window(
         self,
         subtensor,
@@ -419,7 +470,7 @@ class MiningEngine:
             get_runtime_contract_v1, get_window_state_v2, submit_batch_v2,
         )
         from reliquary.protocol.submission import (
-            BatchSubmissionRequest, RuntimeFingerprint, WindowState,
+            RuntimeFingerprint, WindowState,
         )
         from reliquary.shared.runtime_fingerprint import (
             collect_runtime_fingerprint,
@@ -549,29 +600,15 @@ class MiningEngine:
                     )
                     continue
 
-                rollout_submissions = [
-                    self._build_rollout_submission(gen, problem, randomness, env=env)
-                    for gen in generations
-                ]
-                merkle_root = _compute_merkle_root(rollout_submissions)
-
-                _runtime_fingerprint = runtime_fingerprint
-                request = BatchSubmissionRequest(
-                    miner_hotkey=self.wallet.hotkey.ss58_address,
+                request = self.build_batch_request_from_generations(
+                    generations=generations,
+                    problem=problem,
+                    environment=env,
+                    randomness=randomness,
                     prompt_idx=prompt_idx,
-                    window_start=state.window_n,
-                    merkle_root=merkle_root,
-                    rollouts=rollout_submissions,
-                    checkpoint_hash=local_hash,
-                    runtime_fingerprint=_runtime_fingerprint,
-                    nonce=_initial_runtime_bound_nonce(_runtime_fingerprint),
-                    # Rollouts are drawn from the forced-seed stream; advertise it.
-                    protocol_version=FORCED_SEED_PROTOCOL_VERSION,
-                    generation_profile_id=(
-                        ACTIVE_PROTOCOL_PROFILE.profile_id
-                        if ACTIVE_PROTOCOL_PROFILE.protocol_version >= 3
-                        else ""
-                    ),
+                    window_number=state.window_n,
+                    checkpoint_revision=local_hash,
+                    runtime_fingerprint=runtime_fingerprint,
                 )
                 try:
                     resp = await submit_batch_v2(
