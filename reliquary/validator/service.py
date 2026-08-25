@@ -434,18 +434,26 @@ def open_grpo_window(
 
 
 
-def _default_load_model(local_path: str):
-    """Default: load a HF checkpoint onto cuda:0 in bfloat16 with the
-    configured attention implementation."""
+def load_validator_replica(local_path: str, **load_kwargs):
+    """Default: load a HF checkpoint in bfloat16 with the configured attention
+    implementation, onto whichever device this process's replicas belong to
+    (the CPU once the proof plane is isolated).
+
+    ``load_kwargs`` carries the CLI's pinned base-model revision. Both the boot
+    load and the resume load come through here so the device decision cannot
+    drift between them.
+    """
     import torch
     from reliquary.constants import ATTN_IMPLEMENTATION
     from reliquary.shared.modeling import load_text_generation_model
+    from reliquary.validator.proof_worker import validator_replica_device
 
     return load_text_generation_model(
         local_path,
         torch_dtype=torch.bfloat16,
         attn_implementation=ATTN_IMPLEMENTATION,
-    ).to("cuda:0").eval()
+        **load_kwargs,
+    ).to(validator_replica_device()).eval()
 
 
 def _parse_pinned_kl_reference(spec: str) -> tuple[str, str]:
@@ -822,7 +830,7 @@ class ValidationService:
         self._current_window_state: WindowState = WindowState.READY
 
         self._resume_from = resume_from
-        self._load_model_fn = load_model_fn or _default_load_model
+        self._load_model_fn = load_model_fn or load_validator_replica
 
         # Fixed mode is opt-in. An explicit fixed reference is a load-bearing
         # training control, so it is immutable and fail-closed. Empty config keeps

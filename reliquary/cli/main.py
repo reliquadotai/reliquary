@@ -26,6 +26,7 @@ from reliquary.constants import (
     MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV,
     MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW,
     MAX_PROOF_WALL_SECONDS,
+    PROOF_SLOTS_PER_DEVICE,
     PROTOCOL_MODEL_ID,
     PROTOCOL_MODEL_REVISION,
     PROTOCOL_PROFILE_ID,
@@ -502,7 +503,10 @@ def validate(
             import torch
             from reliquary.constants import ATTN_IMPLEMENTATION
             from reliquary.shared.modeling import load_text_generation_model, load_tokenizer
-            from reliquary.validator.service import ValidationService
+            from reliquary.validator.service import (
+                ValidationService,
+                load_validator_replica,
+            )
 
             activation_checkpoint_revision = (
                 _v3_activation_checkpoint_revision(checkpoint, resume_from)
@@ -515,12 +519,10 @@ def validate(
             )
             tokenizer = load_tokenizer(checkpoint, **base_load_kwargs)
 
-            model = load_text_generation_model(
-                checkpoint,
-                torch_dtype=torch.bfloat16,
-                attn_implementation=ATTN_IMPLEMENTATION,
-                **base_load_kwargs,
-            ).to("cuda:0").eval()
+            # Device decision lives in load_validator_replica: with an
+            # isolated proof plane this process neither trains nor proves, so
+            # its pair stays on the CPU and the GPU budget goes to the workers.
+            model = load_validator_replica(checkpoint, **base_load_kwargs)
 
             proof_device_identities = _configured_proof_device_identities(
                 torch
@@ -611,30 +613,44 @@ def validate(
             proof_models = {}
             proof_worker_pool = None
             from reliquary.constants import DETACHED_TRAINER
+            from reliquary.validator.proof_capacity import expand_proof_slots
             from reliquary.validator.proof_worker import (
                 assert_isolation_supported,
+                assert_proof_slots_supported,
             )
 
             assert_isolation_supported(
                 isolation=PROOF_PROCESS_ISOLATION,
                 detached_trainer=DETACHED_TRAINER,
             )
-            if PROOF_PROCESS_ISOLATION and proof_devices:
-                # The proof plane moves out of this interpreter: the replica
-                # is loaded by the worker, not here, so device memory is
-                # unchanged and the validator's event loop can no longer
-                # convoy the proof thread off the GIL.
+            assert_proof_slots_supported(
+                slots_per_device=PROOF_SLOTS_PER_DEVICE,
+                isolation=PROOF_PROCESS_ISOLATION,
+            )
+            # Capacity was validated against the PHYSICAL devices above and
+            # must stay that way — it is a claim about cards, not processes.
+            # Only the plane below is widened to one entry per proof slot.
+            proof_slots = expand_proof_slots(
+                proof_devices, PROOF_SLOTS_PER_DEVICE
+            )
+            if PROOF_PROCESS_ISOLATION and proof_slots:
+                # The proof plane leaves this interpreter: every replica is
+                # loaded by a worker, this process keeps its own pair on the
+                # CPU, and the event loop can no longer convoy a proof thread
+                # off the GIL. Several slots may share one card.
                 from reliquary.validator.proof_worker import (
                     build_isolated_proof_plane,
                 )
 
                 logger.info(
-                    "Starting isolated proof plane on %s (one process per "
-                    "device; replicas load in the workers)",
-                    ", ".join(proof_devices),
+                    "Starting isolated proof plane: %d slot(s) over %d GPU(s) "
+                    "(%s); replicas load in the workers",
+                    len(proof_slots),
+                    len(proof_devices),
+                    ", ".join(proof_slots),
                 )
                 proof_worker_pool, proof_models = build_isolated_proof_plane(
-                    devices=proof_devices,
+                    devices=proof_slots,
                     checkpoint=checkpoint,
                     load_kwargs=base_load_kwargs,
                     reference_model=model,
@@ -642,7 +658,7 @@ def validate(
                 proof_worker_pool.start()
                 logger.info(
                     "Isolated proof plane ready on %s",
-                    ", ".join(proof_devices),
+                    ", ".join(proof_slots),
                 )
             else:
                 for device in proof_devices:
@@ -674,7 +690,7 @@ def validate(
                 hf_repo_id=hf_repo_id,
                 resume_from=resume_from or None,
                 env_mix=mix if mix else None,
-                proof_devices=proof_devices or None,
+                proof_devices=proof_slots or None,
                 proof_models=proof_models or None,
                 proof_capacity_qualification=(
                     proof_capacity_qualification

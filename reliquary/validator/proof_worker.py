@@ -27,6 +27,8 @@ __all__ = [
     "ProofWorkerPool",
     "ProofWorkerUnavailable",
     "assert_isolation_supported",
+    "assert_proof_slots_supported",
+    "validator_replica_device",
     "build_isolated_proof_plane",
     "build_proof_context",
     "reload_proof_context",
@@ -173,11 +175,14 @@ class _Worker:
 
 
 class ProofWorkerPool:
-    """One dedicated process per proof device.
+    """One dedicated process per proof slot.
 
-    Not a parallelism device: two workers on one GPU measure x1.04 because the
-    CUDA contexts time-slice. The point is that each proof interpreter has no
-    competing python thread.
+    Each proof interpreter has no competing python thread. Several slots may
+    name the same card (``cuda:0#0``, ``cuda:0#1``, ...): without an MPS server
+    their CUDA contexts time-slice and a second slot buys almost nothing —
+    which is what the original x1.04 measurement here recorded — but with one
+    they overlap, and four slots measure x2.19 (see PROOF_SLOTS_PER_DEVICE).
+    Every slot runs the same batch=1 path, so no verdict can shift.
     """
 
     def __init__(
@@ -489,9 +494,11 @@ def _install_from_hub(
         attn_implementation=ATTN_IMPLEMENTATION,
         revision=checkpoint_revision,
     )
+    from reliquary.validator.proof_capacity import physical_proof_device
+
     device = context.get("device")
     if device is not None and hasattr(model, "to"):
-        model = model.to(device)
+        model = model.to(physical_proof_device(device))
     model = model.eval()
     for parameter in getattr(model, "parameters", list)():
         parameter.requires_grad = False
@@ -522,15 +529,19 @@ def build_proof_context(
 
     from reliquary.constants import ATTN_IMPLEMENTATION
     from reliquary.shared import modeling
+    from reliquary.validator.proof_capacity import physical_proof_device
 
     kwargs = dict(load_kwargs or {})
     tokenizer = modeling.load_tokenizer(checkpoint, **kwargs)
+    # ``device`` is a proof SLOT id: several slots can share one card, and
+    # torch does not understand the ``cuda:0#1`` form. The slot id stays in the
+    # context because that is this worker's identity to the pool and scheduler.
     model = modeling.load_text_generation_model(
         checkpoint,
         torch_dtype=torch.bfloat16,
         attn_implementation=ATTN_IMPLEMENTATION,
         **kwargs,
-    ).to(device).eval()
+    ).to(physical_proof_device(device)).eval()
     for parameter in model.parameters():
         parameter.requires_grad = False
     return {
@@ -553,7 +564,7 @@ def build_isolated_proof_plane(
     load_kwargs: Mapping[str, Any] | None = None,
     reference_model: Any = None,
 ) -> tuple["ProofWorkerPool", dict[str, ProofModelProxy]]:
-    """Assemble the isolated plane: one worker per device, one proxy each.
+    """Assemble the isolated plane: one worker per proof slot, one proxy each.
 
     The returned pool is NOT started — the caller decides when to pay the
     model load. Proxies carry only the EOS metadata the proof-dependent gates
@@ -588,6 +599,46 @@ def build_isolated_proof_plane(
         for device in devices
     }
     return pool, proxies
+
+
+def assert_proof_slots_supported(
+    *, slots_per_device: int, isolation: bool,
+) -> None:
+    """Extra slots only mean anything as separate interpreters.
+
+    In-process they would be threads of the validator's own interpreter, i.e.
+    the GIL convoy the isolated plane exists to escape (the same forward
+    measured 28.7 ms alone and 29.6 s against one CPU-bound python thread).
+    Refuse the combination instead of serving the convoy under a name that
+    promises parallelism.
+    """
+    if int(slots_per_device) > 1 and not isolation:
+        raise RuntimeError(
+            "RELIQUARY_PROOF_SLOTS_PER_DEVICE > 1 requires "
+            "RELIQUARY_PROOF_PROCESS_ISOLATION: in-process slots would share "
+            "this interpreter's GIL, which is what isolation exists to avoid"
+        )
+
+
+def validator_replica_device(
+    *, isolation: bool | None = None, gpu_device: str = "cuda:0",
+) -> str:
+    """Device for the validator's OWN train/verify replicas.
+
+    With an isolated plane this process neither trains (the detached trainer
+    owns that, and isolation requires it — see ``assert_isolation_supported``)
+    nor proves (every proof runs in a worker holding its own replica). Measured
+    on the live validator 2026-08-25: the main process held 31.4 GB while
+    ``nvidia-smi pmon`` reported ``sm = 0`` across a full proof burst. Keeping
+    the pair on the CPU hands that budget to the workers instead.
+
+    ``isolation`` is injectable for tests; production reads the live flag.
+    """
+    if isolation is None:
+        from reliquary.constants import PROOF_PROCESS_ISOLATION
+
+        isolation = bool(PROOF_PROCESS_ISOLATION)
+    return "cpu" if isolation else gpu_device
 
 
 def assert_isolation_supported(

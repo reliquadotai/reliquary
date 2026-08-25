@@ -111,6 +111,54 @@ RELIQUARY_PROOF_CAPACITY_MANIFEST=/root/reliquary/state/proof-capacity.json
 RELIQUARY_PROOF_CAPACITY_MANIFEST_SHA256=<64-lowercase-hex>
 ```
 
+### Proof slots (several proof processes per GPU)
+
+`RELIQUARY_PROOF_SLOTS_PER_DEVICE` (default `1`) runs more than one proof
+process on each configured GPU. One proof costs roughly
+`60 ms + 0.0145 ms/token`, so at v5 rollout lengths it is ~87% fixed dispatch
+and a single process leaves the card at 39% utilisation. Measured on an H100
+PCIe over 192 archived rollouts:
+
+| slots | no MPS | with MPS |
+|---|---|---|
+| 1 | 12.5 s | 12.1 s |
+| 2 | 9.1 s | 6.3 s |
+| 4 | 8.3 s | **5.7 s** |
+| 8 | – | 5.8 s (plateau) |
+
+Two rules follow from that table:
+
+- **Start the CUDA MPS daemon**, or most of the gain stays on the table —
+  without it the CUDA contexts time-slice instead of overlapping:
+  ```bash
+  export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-mps-log
+  mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
+  nvidia-cuda-mps-control -d
+  ```
+  The container needs the same `CUDA_MPS_PIPE_DIRECTORY`. MPS changes no
+  verdict: on/off at 1 and 4 slots returned 192/192 identical proof results.
+- **Budget 10.2 GB of VRAM per slot.** That figure is flat in rollout length
+  (512 → 8959 tokens moves peak allocation by 0.20 GB), so size the fleet
+  against free VRAM, not against how long completions may grow. Stay clear of
+  ~88% card occupancy, where the allocator cliff starts.
+
+Two costs scale with the slot count, both measured and both small: boot loads
+the replicas serially (26 s for 4 slots against ~7 s for 1), and a checkpoint
+swap reloads each slot in turn (1.5 s each, so 5.9 s for 4 against 1.5 s
+today). The swap lands on the serial publication beat, which already runs
+longer than a normal window.
+
+Slots require `RELIQUARY_PROOF_PROCESS_ISOLATION=1` — in-process they would
+share this interpreter's GIL, which is exactly what isolation exists to avoid,
+and startup refuses the combination. Capacity qualification is unaffected: it
+is a claim about physical cards and keeps counting `RELIQUARY_PROOF_DEVICES`,
+never slots.
+
+With an isolated plane the validator's own train/verify pair no longer needs a
+GPU — it neither trains (the detached trainer owns that) nor proves (each
+worker holds its own replica) — so it loads on the CPU and the card is left to
+the proof workers. Expect ~16 GB of host RAM for that pair.
+
 The CLI compatibility default remains `openmathinstruct`, but the production
 auction contract is mixed Math+Code. Configure the trainer explicitly:
 
