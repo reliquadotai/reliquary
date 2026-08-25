@@ -91,6 +91,17 @@ assert UPLOAD_GRACE_PERIOD == BLOCK_TIME_VARIANCE + NETWORK_UPLOAD_LATENCY
 # arriving before the collection cutoff to arm it.
 SUBMISSION_UPLOAD_GRACE_SECONDS = float(UPLOAD_GRACE_PERIOD)
 
+# A signed precommit is at most 16 KiB and has no reason to remain partially
+# uploaded. Bound its transport lifetime independently from the collection
+# interval so header-only and slow-body requests cannot retain HTTP tasks.
+PRECOMMIT_BODY_READ_TIMEOUT_SECONDS = float(
+    _os.environ.get("RELIQUARY_PRECOMMIT_BODY_READ_TIMEOUT_SECONDS", "10")
+)
+if PRECOMMIT_BODY_READ_TIMEOUT_SECONDS <= 0:
+    raise ValueError(
+        "RELIQUARY_PRECOMMIT_BODY_READ_TIMEOUT_SECONDS must be positive"
+    )
+
 # ────────────────  ROLLOUT GENERATION  ────────────────
 
 # Per-environment generation ceilings are part of the signed profile contract.

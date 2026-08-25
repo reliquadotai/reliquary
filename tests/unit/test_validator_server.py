@@ -667,6 +667,49 @@ async def test_upload_start_is_stamped_on_first_body_byte():
     assert scope["state"]["upload_start_result"] == (True, None)
 
 
+@pytest.mark.asyncio
+async def test_incomplete_precommit_body_times_out_and_closes_connection():
+    async def downstream(_scope, receive, send):
+        await receive()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [],
+            }
+        )
+        await send(
+            {"type": "http.response.body", "body": b"", "more_body": False}
+        )
+
+    app = _SubmissionBodyLimitMiddleware(
+        downstream,
+        max_bytes=100,
+        precommit_timeout_seconds=0.02,
+    )
+    sent = []
+
+    async def stalled_receive():
+        await asyncio.sleep(1.0)
+        return {"type": "http.request", "body": b"late", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/submit/precommit",
+        "headers": [],
+    }
+    await app(scope, stalled_receive, send)
+
+    assert sent[0]["type"] == "http.response.start"
+    assert sent[0]["status"] == 408
+    assert (b"connection", b"close") in sent[0]["headers"]
+    assert scope["state"]["body_read_timed_out"] is True
+
+
 def test_prompt_mismatch_persistence_error_degrades_validator_health(tmp_path):
     server = ValidatorServer(
         prompt_mismatch_state_path=tmp_path / "prompt-mismatch.json"
@@ -817,7 +860,12 @@ async def test_concurrent_identical_precommits_publish_one_receipt():
     assert conservation["conserved"] is True
 
 
-def test_precommit_arrival_is_authoritative_for_drand_reveal(monkeypatch):
+@pytest.mark.asyncio
+async def test_complete_precommit_body_time_is_authoritative_for_drand_reveal(
+    monkeypatch,
+):
+    import httpx
+
     from reliquary.protocol.submission import WindowState
     from reliquary.validator.observability import DrandRoundObservation
 
@@ -830,7 +878,9 @@ def test_precommit_arrival_is_authoritative_for_drand_reveal(monkeypatch):
     request = _request(valid_merkle=True)
     payload = request.model_dump_json().encode("utf-8")
     precommit = _precommit_for(request, payload_bytes=len(payload))
+    precommit_body = precommit.model_dump_json().encode("utf-8")
     observations = []
+    final_chunk_sent_at = []
 
     def observe(_self, drand_round, *, t_arrival=None):
         observations.append(t_arrival)
@@ -845,13 +895,26 @@ def test_precommit_arrival_is_authoritative_for_drand_reveal(monkeypatch):
 
     monkeypatch.setattr(GrpoWindowBatcher, "observe_drand_round", observe)
 
-    with TestClient(server.app) as client:
-        committed = client.post(
+    async def delayed_precommit_body():
+        midpoint = len(precommit_body) // 2
+        yield precommit_body[:midpoint]
+        await asyncio.sleep(0.03)
+        final_chunk_sent_at.append(time.time())
+        yield precommit_body[midpoint:]
+
+    header_arrival_started = time.time()
+    transport = httpx.ASGITransport(app=server.app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://validator.test",
+    ) as client:
+        committed_response = await client.post(
             "/submit/precommit",
-            content=precommit.model_dump_json(),
+            content=delayed_precommit_body(),
             headers={"Content-Type": "application/json"},
-        ).json()
-        revealed = client.post(
+        )
+        committed = committed_response.json()
+        revealed = await client.post(
             "/submit",
             content=payload,
             headers={
@@ -861,9 +924,173 @@ def test_precommit_arrival_is_authoritative_for_drand_reveal(monkeypatch):
         )
 
     assert revealed.json()["accepted"] is True
-    # The body reveal reuses the signed receipt's observation instead of
-    # re-reading a potentially newer drand round at upload completion.
     assert len(observations) == 1
+    assert observations[0] >= final_chunk_sent_at[0]
+    assert observations[0] - header_arrival_started >= 0.02
+    receipt = server._upload_precommit_receipts[committed["receipt_id"]]
+    assert receipt.precommit_arrival_ts == observations[0]
+
+
+@pytest.mark.asyncio
+async def test_precommit_body_crossing_collection_cutoff_is_rejected():
+    import httpx
+
+    from reliquary.constants import WINDOW_COLLECTION_SECONDS
+    from reliquary.protocol.submission import WindowState
+
+    server = ValidatorServer()
+    batcher = _batcher(window_start=500)
+    batcher.difficulty_auction_enabled = True
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    request = _request(valid_merkle=True)
+    payload = request.model_dump_json().encode("utf-8")
+    precommit = _precommit_for(request, payload_bytes=len(payload))
+    precommit_body = precommit.model_dump_json().encode("utf-8")
+    batcher.window_opened_wall_ts = (
+        time.time() - WINDOW_COLLECTION_SECONDS + 0.03
+    )
+
+    async def late_body():
+        await asyncio.sleep(0.08)
+        yield precommit_body
+
+    transport = httpx.ASGITransport(app=server.app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://validator.test",
+    ) as client:
+        response = await client.post(
+            "/submit/precommit",
+            content=late_body(),
+            headers={"Content-Type": "application/json"},
+        )
+
+    assert response.status_code == 408
+    assert response.json() == {"detail": "submission_body_timeout"}
+    assert response.headers["connection"] == "close"
+    assert server._upload_precommit_receipts == {}
+    assert batcher.pending_upload_precommits == 0
+
+
+@pytest.mark.asyncio
+async def test_started_reveal_body_is_closed_at_receipt_deadline():
+    import httpx
+
+    from reliquary.protocol.submission import WindowState
+
+    server = ValidatorServer()
+    server._auction_admission_enabled = True
+    batcher = _batcher(window_start=500)
+    batcher.difficulty_auction_enabled = True
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    request = _request(valid_merkle=True)
+    server.set_registered_hotkeys(
+        {request.miner_hotkey},
+        operator_by_hotkey={request.miner_hotkey: "operator-coldkey"},
+    )
+    payload = request.model_dump_json().encode("utf-8")
+    precommit = _precommit_for(request, payload_bytes=len(payload))
+    transport = httpx.ASGITransport(app=server.app)
+
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://validator.test",
+    ) as client:
+        committed = (
+            await client.post(
+                "/submit/precommit",
+                content=precommit.model_dump_json(),
+                headers={"Content-Type": "application/json"},
+            )
+        ).json()
+        receipt = server._upload_precommit_receipts[committed["receipt_id"]]
+        receipt.expires_at_wall = time.time() + 0.05
+
+        async def stalled_reveal():
+            yield payload[:1]
+            await asyncio.sleep(1.0)
+            yield payload[1:]
+
+        started = time.monotonic()
+        response = await client.post(
+            "/submit",
+            content=stalled_reveal(),
+            headers={
+                "Content-Type": "application/json",
+                "X-Reliquary-Precommit": committed["receipt_id"],
+            },
+        )
+
+    assert time.monotonic() - started < 0.5
+    assert response.status_code == 408
+    assert response.json() == {"detail": "submission_body_timeout"}
+    assert response.headers["connection"] == "close"
+    assert batcher.pending_upload_precommits == 0
+
+
+@pytest.mark.asyncio
+async def test_first_reveal_byte_after_cutoff_aborts_remaining_body():
+    import httpx
+
+    from reliquary.constants import WINDOW_COLLECTION_SECONDS
+    from reliquary.protocol.submission import WindowState
+
+    server = ValidatorServer()
+    server._auction_admission_enabled = True
+    batcher = _batcher(window_start=500)
+    batcher.difficulty_auction_enabled = True
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    request = _request(valid_merkle=True)
+    server.set_registered_hotkeys(
+        {request.miner_hotkey},
+        operator_by_hotkey={request.miner_hotkey: "operator-coldkey"},
+    )
+    payload = request.model_dump_json().encode("utf-8")
+    precommit = _precommit_for(request, payload_bytes=len(payload))
+    transport = httpx.ASGITransport(app=server.app)
+
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://validator.test",
+    ) as client:
+        committed = (
+            await client.post(
+                "/submit/precommit",
+                content=precommit.model_dump_json(),
+                headers={"Content-Type": "application/json"},
+            )
+        ).json()
+        batcher.window_opened_wall_ts = (
+            time.time() - WINDOW_COLLECTION_SECONDS + 0.05
+        )
+
+        async def late_reveal():
+            await asyncio.sleep(0.08)
+            yield payload[:1]
+            await asyncio.sleep(1.0)
+            yield payload[1:]
+
+        started = time.monotonic()
+        response = await client.post(
+            "/submit",
+            content=late_reveal(),
+            headers={
+                "Content-Type": "application/json",
+                "X-Reliquary-Precommit": committed["receipt_id"],
+            },
+        )
+
+    assert time.monotonic() - started < 0.5
+    assert response.status_code == 200
+    assert response.json() == {
+        "accepted": False,
+        "reason": RejectReason.PRECOMMIT_EXPIRED.value,
+    }
+    assert response.headers["connection"] == "close"
+    assert batcher.pending_upload_precommits == 0
 
 
 def test_precommit_rejects_body_with_different_serialized_size():
