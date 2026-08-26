@@ -427,6 +427,9 @@ def test_failed_preopen_reuses_candidate_until_activation():
     initial = svc._window_n
 
     svc._open_window()
+    activation_nonce = svc._candidate_activation_nonce
+    assert isinstance(activation_nonce, bytes)
+    assert len(activation_nonce) == 32
     svc._set_window_preparation_stage("prompt_manifest")
     svc._rollback_preopen_window(RuntimeError("source unavailable"))
 
@@ -449,11 +452,13 @@ def test_failed_preopen_reuses_candidate_until_activation():
 
     svc._open_window()
     assert svc._active_batcher.window_start == initial + 1
+    assert svc._candidate_activation_nonce == activation_nonce
     svc._activate_window()
 
     health = svc.server._health_payload()
     assert svc._window_n == initial + 1
     assert svc._candidate_window_n is None
+    assert svc._candidate_activation_nonce is None
     assert health.status == "ok"
     assert health.last_committed_window_n == initial + 1
     assert health.candidate_window_n is None

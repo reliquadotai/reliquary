@@ -32,7 +32,7 @@ dependencies = [
     "tenacity>=8.0.0",
     "pyarrow>=14.0.0",
     "fastapi>=0.110",
-    "uvicorn[standard]>=0.27",
+    "uvicorn[standard]>=0.52,<0.53",
     "bitsandbytes>=0.43.0",
 ]
 

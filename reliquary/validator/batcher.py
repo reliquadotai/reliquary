@@ -40,7 +40,6 @@ from reliquary.constants import (
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
     MAX_PENDING_SUBMISSION_BYTES_PER_ENV,
     MAX_PENDING_SUBMISSION_BYTES_PER_HOTKEY,
-    MAX_PENDING_UPLOAD_PRECOMMITS_PER_ENV,
     MAX_PENDING_UPLOAD_PRECOMMITS_PER_HOTKEY,
     MAX_PENDING_UPLOAD_PRECOMMITS_PER_OPERATOR,
     MAX_GRADING_STARTS_PER_WINDOW,
@@ -50,7 +49,6 @@ from reliquary.constants import (
     MAX_SEAL_QUEUE_DRAIN_SECONDS,
     MAX_SUBMISSION_PAYLOAD_BYTES,
     MAX_SUBMISSIONS_PER_PROMPT,
-    MAX_UPLOAD_PRECOMMITS_PER_ENV_PER_WINDOW,
     PROMPT_RANGE_SIZE,
     PROMPT_RANGE_ENFORCE_FROM_WINDOW,
     PROTOCOL_PROFILE_ID,
@@ -699,6 +697,8 @@ class _UploadPrecommitReservation:
     deadline: float
     payload_bytes: int
     upload_started_at_wall: float | None = None
+    body_completed_at_wall: float | None = None
+    accounted_payload_bytes: int = 0
     revealed: bool = False
     payload_transferred: bool = False
 
@@ -1046,8 +1046,9 @@ class GrpoWindowBatcher:
             str, _UploadPrecommitReservation
         ] = {}
         self._upload_precommit_payload_bytes = 0
-        # Receipts reserve only bounded upload bytes. Productive grading
-        # capacity is charged atomically after the exact body is revealed.
+        # Receipts reserve no productive or byte capacity.  Actual network
+        # chunks are accounted incrementally once upload starts; productive
+        # capacity is charged only after an exact, structurally valid reveal.
         self._upload_precommit_accepted = 0
         self._upload_precommit_revealed = 0
         self._upload_precommit_terminal = 0
@@ -1172,7 +1173,11 @@ class GrpoWindowBatcher:
         expired = [
             receipt_id
             for receipt_id, reservation in self._upload_precommits.items()
-            if reservation.deadline <= now and not reservation.revealed
+            if (
+                reservation.deadline <= now
+                and reservation.body_completed_at_wall is None
+                and not reservation.revealed
+            )
         ]
         for receipt_id in expired:
             reservation = self._upload_precommits.pop(receipt_id, None)
@@ -1192,10 +1197,11 @@ class GrpoWindowBatcher:
                 self._upload_precommit_payload_bytes = max(
                     0,
                     self._upload_precommit_payload_bytes
-                    - reservation.payload_bytes,
+                    - reservation.accounted_payload_bytes,
                 )
                 self._release_hotkey_payload_locked(
-                    reservation.hotkey, reservation.payload_bytes
+                    reservation.hotkey,
+                    reservation.accounted_payload_bytes,
                 )
         if expired:
             self._upload_precommit_expired += 1
@@ -1228,17 +1234,6 @@ class GrpoWindowBatcher:
             self._prune_upload_precommits_locked(now)
             if self._seal_flag.is_set() or self._seal_snapshot_started:
                 return False, "collection_sealed", None
-            if (
-                self._upload_precommit_accepted
-                >= MAX_UPLOAD_PRECOMMITS_PER_ENV_PER_WINDOW
-            ):
-                reason = "precommit_window_budget_full"
-                self._record_upload_precommit_rejection_locked(reason)
-                return False, reason, None
-            if len(self._upload_precommits) >= MAX_PENDING_UPLOAD_PRECOMMITS_PER_ENV:
-                reason = "precommit_active_capacity_full"
-                self._record_upload_precommit_rejection_locked(reason)
-                return False, reason, None
             operator = self._operator_for_hotkey(hotkey)
             if operator is None:
                 reason = "precommit_operator_unmapped"
@@ -1262,17 +1257,6 @@ class GrpoWindowBatcher:
                 reason = "precommit_operator_active_full"
                 self._record_upload_precommit_rejection_locked(reason)
                 return False, reason, None
-            with self._proof_admission_lock:
-                payload_reason = self._payload_capacity_reason_locked(
-                    hotkey, payload_bytes
-                )
-                if payload_reason is not None:
-                    return False, payload_reason, None
-                self._upload_precommit_payload_bytes += payload_bytes
-                self._payload_bytes_by_hotkey[hotkey] = (
-                    self._payload_bytes_by_hotkey.get(hotkey, 0)
-                    + payload_bytes
-                )
             deadline = min(
                 now + SUBMISSION_UPLOAD_GRACE_SECONDS,
                 self.window_opened_at
@@ -1294,24 +1278,64 @@ class GrpoWindowBatcher:
             )
             return True, None, deadline
 
-    def mark_upload_precommit_started(
+    def account_upload_precommit_bytes(
         self,
         receipt_id: str,
         *,
         t_arrival_wall: float,
+        chunk_bytes: int,
     ) -> tuple[bool, str | None]:
-        """Arm upload grace only for a body request arriving before cutoff."""
+        """Atomically account one real network chunk for a reveal.
+
+        A signed receipt never reserves its declared payload size.  This method
+        is called from the HTTP protocol before ASGI scheduling, so deadline
+        state and actual buffered bytes advance in the same event-loop turn as
+        the socket read.
+        """
+        added = int(chunk_bytes)
+        if added <= 0:
+            return False, "upload_chunk_invalid"
         with self._upload_precommit_lock:
             reservation = self._upload_precommits.get(receipt_id)
             if reservation is None:
                 return False, "upload_precommit_missing"
-            if (
-                float(t_arrival_wall)
-                > self.window_opened_wall_ts + WINDOW_COLLECTION_SECONDS
-            ):
-                return False, "upload_started_after_collection"
             if reservation.upload_started_at_wall is None:
+                if (
+                    float(t_arrival_wall)
+                    > self.window_opened_wall_ts + WINDOW_COLLECTION_SECONDS
+                ):
+                    return False, "upload_started_after_collection"
                 reservation.upload_started_at_wall = float(t_arrival_wall)
+            if reservation.accounted_payload_bytes + added > reservation.payload_bytes:
+                return False, "upload_payload_exceeded"
+            if added:
+                with self._proof_admission_lock:
+                    payload_reason = self._payload_capacity_reason_locked(
+                        reservation.hotkey, added
+                    )
+                    if payload_reason is not None:
+                        return False, payload_reason
+                    self._upload_precommit_payload_bytes += added
+                    self._payload_bytes_by_hotkey[reservation.hotkey] = (
+                        self._payload_bytes_by_hotkey.get(reservation.hotkey, 0) + added
+                    )
+                reservation.accounted_payload_bytes += added
+            return True, None
+
+    def mark_upload_precommit_transport_complete(
+        self,
+        receipt_id: str,
+        *,
+        completed_at_wall: float,
+    ) -> tuple[bool, str | None]:
+        """Record completion only when the exact declared byte count arrived."""
+        with self._upload_precommit_lock:
+            reservation = self._upload_precommits.get(receipt_id)
+            if reservation is None:
+                return False, "upload_precommit_missing"
+            if reservation.accounted_payload_bytes != reservation.payload_bytes:
+                return False, "upload_payload_incomplete"
+            reservation.body_completed_at_wall = float(completed_at_wall)
             return True, None
 
     def mark_upload_precommit_revealed(self, receipt_id: str) -> bool:
@@ -1355,6 +1379,10 @@ class GrpoWindowBatcher:
                 return False, "proof_reservation_duplicate"
             if not reservation.revealed:
                 return False, "upload_precommit_not_revealed"
+            if reservation.body_completed_at_wall is None:
+                return False, "upload_transport_incomplete"
+            if reservation.accounted_payload_bytes != reservation.payload_bytes:
+                return False, "upload_payload_incomplete"
             if reservation.hotkey != request.miner_hotkey:
                 return False, "upload_precommit_hotkey_mismatch"
             with self._proof_admission_lock:
@@ -1398,7 +1426,7 @@ class GrpoWindowBatcher:
                 self._upload_precommit_payload_bytes = max(
                     0,
                     self._upload_precommit_payload_bytes
-                    - reservation.payload_bytes,
+                    - reservation.accounted_payload_bytes,
                 )
                 self._proof_grading_attempts += 1
                 self._proof_grading_charged += 1
@@ -1406,9 +1434,9 @@ class GrpoWindowBatcher:
                     request,
                     request.miner_hotkey,
                     False,
-                    reservation.payload_bytes,
+                    reservation.accounted_payload_bytes,
                 )
-                self._inflight_payload_bytes += reservation.payload_bytes
+                self._inflight_payload_bytes += reservation.accounted_payload_bytes
                 return True, None
 
     @property
@@ -1443,8 +1471,8 @@ class GrpoWindowBatcher:
                 "terminal_decisions": terminal,
                 "pending": pending,
                 "conserved": accepted == terminal + expired + pending,
-                "pending_limit": MAX_PENDING_UPLOAD_PRECOMMITS_PER_ENV,
-                "total_limit": MAX_UPLOAD_PRECOMMITS_PER_ENV_PER_WINDOW,
+                "pending_limit": None,
+                "total_limit": None,
                 "peak_pending": self._upload_precommit_peak_pending,
                 "capacity_reserved": 0,
                 "productive_capacity_used": productive_capacity_used,

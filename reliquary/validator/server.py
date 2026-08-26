@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import functools
 import hashlib
 import importlib.metadata
 import logging
@@ -36,6 +37,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 import uvicorn
+from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
 
 from reliquary.constants import (
     B_BATCH,
@@ -71,6 +73,7 @@ from reliquary.constants import (
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
     REGISTERED_HOTKEY_STALE_GRACE_SECONDS,
     PRECOMMIT_BODY_READ_TIMEOUT_SECONDS,
+    SUBMISSION_HEADER_READ_TIMEOUT_SECONDS,
     SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS,
     SPARSE_VALID_IDLE_SEAL_SECONDS,
     SPARSE_VALID_MAX_WINDOW_SECONDS,
@@ -176,10 +179,13 @@ class _UploadPrecommitReceipt:
     generation_profile_id: str = ""
     operator: str | None = None
     upload_started_at_wall: float | None = None
+    body_completed_at_wall: float | None = None
     consumed: bool = False
     outcome: BatchSubmissionResponse | None = None
     terminal: bool = False
     terminal_recorded: bool = False
+    reveal_success_recorded: bool = False
+    reveal_failure_recorded: bool = False
 
 
 @dataclass(frozen=True)
@@ -301,6 +307,150 @@ class _StateFastPathMiddleware:
         )
 
 
+class _SubmissionHttpProtocol(HttpToolsProtocol):
+    """Stamp wire ingress and bound incomplete submission requests."""
+
+    wire_event_handler: (
+        Callable[[str, dict[str, Any], float, int], tuple[bool, str | None]] | None
+    ) = None
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._header_read_timeout_handle: asyncio.TimerHandle | None = None
+        self._body_read_timeout_handle: asyncio.TimerHandle | None = None
+
+    @staticmethod
+    def _cancel_timer(handle: asyncio.TimerHandle | None) -> None:
+        if handle is not None:
+            handle.cancel()
+
+    def _arm_header_timeout(self) -> None:
+        self._cancel_timer(self._header_read_timeout_handle)
+        self._header_read_timeout_handle = self.loop.call_later(
+            SUBMISSION_HEADER_READ_TIMEOUT_SECONDS,
+            self._header_read_timed_out,
+        )
+
+    def _arm_body_timeout(self) -> None:
+        path = self.scope.get("path") if self.scope is not None else None
+        if path == "/submit/precommit":
+            timeout = PRECOMMIT_BODY_READ_TIMEOUT_SECONDS
+        elif path == "/submit":
+            timeout = SUBMISSION_UPLOAD_GRACE_SECONDS
+        else:
+            return
+        self._cancel_timer(self._body_read_timeout_handle)
+        self._body_read_timeout_handle = self.loop.call_later(
+            timeout + 1.0,
+            self._body_read_timed_out,
+        )
+
+    def _notify_wire_event(
+        self,
+        event: str,
+        *,
+        at: float,
+        chunk_bytes: int = 0,
+    ) -> tuple[bool, str | None]:
+        handler = self.wire_event_handler
+        if handler is None or self.scope is None:
+            return True, None
+        try:
+            return handler(event, self.scope, float(at), int(chunk_bytes))
+        except Exception:
+            self.logger.exception("submission wire event failed")
+            return False, "wire_event_failed"
+
+    def _header_read_timed_out(self) -> None:
+        self._header_read_timeout_handle = None
+        if not self.transport.is_closing():
+            self.transport.close()
+
+    def _body_read_timed_out(self) -> None:
+        self._body_read_timeout_handle = None
+        if self.scope is not None:
+            self.scope.setdefault("state", {})["wire_body_timed_out"] = True
+            self._notify_wire_event("aborted", at=time.time())
+        if not self.transport.is_closing():
+            self.transport.close()
+
+    def connection_made(self, transport: asyncio.Transport) -> None:
+        super().connection_made(transport)
+        self._arm_header_timeout()
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        self._cancel_timer(self._header_read_timeout_handle)
+        self._cancel_timer(self._body_read_timeout_handle)
+        self._header_read_timeout_handle = None
+        self._body_read_timeout_handle = None
+        if self.scope is not None:
+            state = self.scope.setdefault("state", {})
+            if (
+                state.get("wire_body_started_at") is not None
+                and state.get("wire_body_completed_at") is None
+            ):
+                self._notify_wire_event("aborted", at=time.time())
+        super().connection_lost(exc)
+
+    def on_message_begin(self) -> None:
+        super().on_message_begin()
+        self._arm_header_timeout()
+
+    def on_headers_complete(self) -> None:
+        completed_at = time.time()
+        self._cancel_timer(self._header_read_timeout_handle)
+        self._header_read_timeout_handle = None
+        super().on_headers_complete()
+        state = self.scope.setdefault("state", {})
+        state["wire_headers_completed_at"] = completed_at
+        if self.scope.get("path") == "/submit":
+            receipt_header = PRECOMMIT_HEADER.lower().encode("ascii")
+            receipt_values = [
+                value
+                for name, value in self.scope.get("headers", ())
+                if name.lower() == receipt_header
+            ]
+            if len(receipt_values) == 1:
+                try:
+                    state["wire_receipt_id"] = receipt_values[0].decode("ascii")
+                    state["wire_upload_managed"] = self.wire_event_handler is not None
+                except UnicodeDecodeError:
+                    pass
+        self._arm_body_timeout()
+
+    def on_body(self, body: bytes) -> None:
+        if body:
+            state = self.scope.setdefault("state", {})
+            received_at = time.time()
+            started_at = state.setdefault("wire_body_started_at", received_at)
+            if state.get("wire_receipt_id") and not state.get(
+                "wire_upload_rejected", False
+            ):
+                result = self._notify_wire_event(
+                    "chunk",
+                    at=float(started_at),
+                    chunk_bytes=len(body),
+                )
+                state["wire_upload_result"] = result
+                state["upload_start_result"] = result
+                if not result[0]:
+                    state["wire_upload_rejected"] = True
+        super().on_body(body)
+
+    def on_message_complete(self) -> None:
+        completed_at = time.time()
+        state = self.scope.setdefault("state", {})
+        state["wire_body_completed_at"] = completed_at
+        if state.get("wire_receipt_id") and not state.get(
+            "wire_upload_rejected", False
+        ):
+            result = self._notify_wire_event("complete", at=completed_at)
+            state["wire_upload_complete_result"] = result
+        self._cancel_timer(self._body_read_timeout_handle)
+        self._body_read_timeout_handle = None
+        super().on_message_complete()
+
+
 class _SubmissionBodyLimitMiddleware:
     """Reject oversized or overdue submission bodies before JSON parsing.
 
@@ -348,6 +498,17 @@ class _SubmissionBodyLimitMiddleware:
         )
         await response(scope, receive, send)
 
+    @staticmethod
+    async def _reject_ambiguous_receipt(
+        scope: dict[str, Any], receive: Any, send: Any
+    ) -> None:
+        response = JSONResponse(
+            status_code=400,
+            content={"detail": "ambiguous_precommit_header"},
+            headers={"Connection": "close"},
+        )
+        await response(scope, receive, send)
+
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         path = scope.get("path")
         if scope.get("type") != "http" or path not in {
@@ -362,7 +523,10 @@ class _SubmissionBodyLimitMiddleware:
             if path == "/submit/precommit"
             else self.max_bytes
         )
-        request_started_at = time.time()
+        request_state = scope.setdefault("state", {})
+        request_started_at = float(
+            request_state.get("wire_headers_completed_at", time.time())
+        )
         body_deadline = (
             request_started_at + self.precommit_timeout_seconds
             if path == "/submit/precommit"
@@ -379,7 +543,13 @@ class _SubmissionBodyLimitMiddleware:
                     else min(body_deadline, float(resolved_deadline))
                 )
 
-        headers = dict(scope.get("headers", ()))
+        raw_headers = scope.get("headers", ())
+        if path == "/submit":
+            receipt_header = PRECOMMIT_HEADER.lower().encode("ascii")
+            if sum(name.lower() == receipt_header for name, _ in raw_headers) > 1:
+                await self._reject_ambiguous_receipt(scope, receive, send)
+                return
+        headers = dict(raw_headers)
         raw_length = headers.get(b"content-length")
         if raw_length is not None:
             try:
@@ -399,6 +569,9 @@ class _SubmissionBodyLimitMiddleware:
 
         async def limited_receive():
             nonlocal received, over_limit, timed_out, body_start_rejected
+            wire_result = request_state.get("wire_upload_result")
+            if isinstance(wire_result, tuple) and wire_result and not wire_result[0]:
+                body_start_rejected = True
             if timed_out or body_start_rejected:
                 return {
                     "type": "http.request",
@@ -410,29 +583,51 @@ class _SubmissionBodyLimitMiddleware:
                     message = await receive()
                 else:
                     remaining = float(body_deadline) - time.time()
-                    if remaining <= 0.0:
+                    wire_completed_at = request_state.get("wire_body_completed_at")
+                    completed_in_time = wire_completed_at is not None and float(
+                        wire_completed_at
+                    ) <= float(body_deadline)
+                    if remaining <= 0.0 and not completed_in_time:
                         raise asyncio.TimeoutError
-                    message = await asyncio.wait_for(
-                        receive(), timeout=remaining
-                    )
+                    if completed_in_time:
+                        message = await receive()
+                    else:
+                        message = await asyncio.wait_for(receive(), timeout=remaining)
             except asyncio.TimeoutError:
                 timed_out = True
-                scope.setdefault("state", {})["body_read_timed_out"] = True
+                request_state["body_read_timed_out"] = True
                 return {
                     "type": "http.request",
                     "body": b"",
                     "more_body": False,
                 }
             if message.get("type") == "http.request":
-                state = scope.setdefault("state", {})
                 chunk = message.get("body", b"")
-                if chunk and "body_receive_started_at" not in state:
-                    started_at = time.time()
-                    state["body_receive_started_at"] = started_at
-                    callback = state.pop("upload_start_callback", None)
-                    if callable(callback):
-                        start_result = callback(started_at)
-                        state["upload_start_result"] = start_result
+                if chunk:
+                    started_at = float(
+                        request_state.get("wire_body_started_at", time.time())
+                    )
+                    request_state.setdefault("body_receive_started_at", started_at)
+                    callback = request_state.get("upload_progress_callback")
+                    legacy_callback = request_state.get("upload_start_callback")
+                    if callable(callback) and not request_state.get(
+                        "wire_upload_managed", False
+                    ):
+                        progress_result = callback(started_at, len(chunk))
+                        request_state["upload_start_result"] = progress_result
+                        if not progress_result[0]:
+                            body_start_rejected = True
+                            return {
+                                "type": "http.request",
+                                "body": b"",
+                                "more_body": False,
+                            }
+                    elif (
+                        callable(legacy_callback)
+                        and "upload_start_result" not in request_state
+                    ):
+                        start_result = legacy_callback(started_at)
+                        request_state["upload_start_result"] = start_result
                         if not start_result[0]:
                             body_start_rejected = True
                             return {
@@ -454,9 +649,19 @@ class _SubmissionBodyLimitMiddleware:
                         "more_body": False,
                     }
                 if not message.get("more_body", False):
-                    state["body_bytes_received"] = received
-                    state["body_sha256"] = body_hasher.hexdigest()
-                    state["body_completed_at"] = time.time()
+                    request_state["body_bytes_received"] = received
+                    request_state["body_sha256"] = body_hasher.hexdigest()
+                    request_state["body_completed_at"] = float(
+                        request_state.get("wire_body_completed_at", time.time())
+                    )
+                    complete_callback = request_state.get("upload_complete_callback")
+                    if callable(complete_callback) and not request_state.get(
+                        "wire_upload_managed", False
+                    ):
+                        complete_result = complete_callback(
+                            request_state["body_completed_at"]
+                        )
+                        request_state["wire_upload_complete_result"] = complete_result
             return message
 
         async def buffered_send(message):
@@ -1014,6 +1219,8 @@ class ValidatorServer:
         self._admission_tokenizer_hashes: dict[str, str] = {}
         self._admission_pool_locks: dict[str, asyncio.Lock] = {}
         self._admission_materialization_pool: ThreadPoolExecutor | None = None
+        self._precommit_signature_pool: ThreadPoolExecutor | None = None
+        self._precommit_signature_inflight = 0
         self._admission_active_by_environment: collections.Counter[str] = (
             collections.Counter()
         )
@@ -1127,13 +1334,19 @@ class ValidatorServer:
         if changed:
             transition_ts = time.time()
             for receipt in self._upload_precommit_receipts.values():
-                if (
-                    not receipt.consumed
-                    and receipt.upload_started_at_wall is None
-                    and (
-                        receipt.expires_at_wall < transition_ts
-                        or self._receipt_collection_deadline(receipt)
-                        <= transition_ts
+                if not receipt.consumed and (
+                    (
+                        receipt.body_completed_at_wall is None
+                        and (
+                            receipt.expires_at_wall < transition_ts
+                            or self._receipt_collection_deadline(receipt)
+                            <= transition_ts
+                        )
+                    )
+                    or (
+                        receipt.body_completed_at_wall is not None
+                        and receipt.body_completed_at_wall
+                        > receipt.expires_at_wall
                     )
                 ):
                     self._record_no_reveal(receipt)
@@ -1224,6 +1437,9 @@ class ValidatorServer:
         return request_started_at + SUBMISSION_UPLOAD_GRACE_SECONDS
 
     def _record_no_reveal(self, receipt: _UploadPrecommitReceipt) -> None:
+        if receipt.reveal_success_recorded or receipt.reveal_failure_recorded:
+            return
+        receipt.reveal_failure_recorded = True
         update = self._no_reveal_circuit.record_no_reveal(
             environment=receipt.environment,
             operator=receipt.operator,
@@ -1244,6 +1460,9 @@ class ValidatorServer:
             )
 
     def _record_valid_reveal(self, receipt: _UploadPrecommitReceipt) -> None:
+        if receipt.reveal_success_recorded or receipt.reveal_failure_recorded:
+            return
+        receipt.reveal_success_recorded = True
         update = self._no_reveal_circuit.record_reveal(
             environment=receipt.environment,
             operator=receipt.operator,
@@ -1259,27 +1478,93 @@ class ValidatorServer:
                 str(receipt.operator or "")[:12],
             )
 
-    def _mark_upload_started(
+    def _account_upload_chunk(
         self,
         receipt: _UploadPrecommitReceipt,
         *,
         t_arrival: float,
+        chunk_bytes: int,
     ) -> tuple[bool, str | None]:
-        if float(t_arrival) > self._receipt_collection_deadline(receipt):
-            return False, "upload_started_after_collection"
-        marker = getattr(
-            type(receipt.batcher), "mark_upload_precommit_started", None
-        )
-        if marker is None:
-            return False, "upload_start_unsupported"
-        started, reason = marker(
+        account = getattr(type(receipt.batcher), "account_upload_precommit_bytes", None)
+        if account is None:
+            return False, "upload_accounting_unsupported"
+        accepted, reason = account(
             receipt.batcher,
             receipt.receipt_id,
             t_arrival_wall=float(t_arrival),
+            chunk_bytes=int(chunk_bytes),
         )
-        if started and receipt.upload_started_at_wall is None:
+        if accepted and receipt.upload_started_at_wall is None:
             receipt.upload_started_at_wall = float(t_arrival)
-        return bool(started), reason
+        return bool(accepted), reason
+
+    def _fail_upload_receipt(
+        self,
+        receipt: _UploadPrecommitReceipt,
+        *,
+        reason: RejectReason = RejectReason.PRECOMMIT_INVALID,
+        expired: bool = False,
+    ) -> None:
+        if receipt.terminal:
+            return
+        self._record_no_reveal(receipt)
+        receipt.consumed = True
+        self._complete_upload_receipt(
+            receipt,
+            BatchSubmissionResponse(accepted=False, reason=reason),
+            expired=expired,
+        )
+
+    def _wire_upload_event(
+        self,
+        event: str,
+        scope: dict[str, Any],
+        at: float,
+        chunk_bytes: int,
+    ) -> tuple[bool, str | None]:
+        state = scope.setdefault("state", {})
+        receipt_id = state.get("wire_receipt_id")
+        if not isinstance(receipt_id, str):
+            return True, None
+        receipt = self._upload_precommit_receipts.get(receipt_id)
+        if receipt is None or receipt.batcher not in self._active_batchers.values():
+            return False, "upload_precommit_missing"
+        if receipt.terminal:
+            return False, "upload_precommit_terminal"
+        if event == "chunk":
+            accepted, reason = self._account_upload_chunk(
+                receipt,
+                t_arrival=float(at),
+                chunk_bytes=int(chunk_bytes),
+            )
+            if not accepted:
+                self._fail_upload_receipt(receipt)
+            return accepted, reason
+        if event == "complete":
+            marker = getattr(
+                type(receipt.batcher),
+                "mark_upload_precommit_transport_complete",
+                None,
+            )
+            if marker is None:
+                receipt.body_completed_at_wall = float(at)
+                return True, None
+            accepted, reason = marker(
+                receipt.batcher,
+                receipt.receipt_id,
+                completed_at_wall=float(at),
+            )
+            if accepted:
+                receipt.body_completed_at_wall = float(at)
+            else:
+                self._fail_upload_receipt(receipt)
+            return bool(accepted), reason
+        if event == "aborted":
+            if state.get("wire_body_completed_at") is None:
+                self._fail_upload_receipt(receipt)
+                return False, "upload_body_incomplete"
+            return True, None
+        return False, "wire_event_invalid"
 
     def _prune_upload_precommits(self, *, now: float | None = None) -> None:
         current = time.time() if now is None else float(now)
@@ -1290,7 +1575,14 @@ class ValidatorServer:
                 (
                     not receipt.consumed
                     and (
-                        receipt.expires_at_wall < current
+                        (
+                            receipt.expires_at_wall < current
+                            and (
+                                receipt.body_completed_at_wall is None
+                                or receipt.body_completed_at_wall
+                                > receipt.expires_at_wall
+                            )
+                        )
                         or (
                             receipt.upload_started_at_wall is None
                             and self._receipt_collection_deadline(receipt)
@@ -1303,15 +1595,18 @@ class ValidatorServer:
         ]
         for receipt_id in expired:
             receipt = self._upload_precommit_receipts.pop(receipt_id)
-            self._upload_precommit_by_signature.pop(
-                receipt.precommit_signature, None
-            )
-            if (
-                not receipt.consumed
-                and receipt.upload_started_at_wall is None
-                and (
-                    receipt.expires_at_wall < current
-                    or self._receipt_collection_deadline(receipt) <= current
+            self._upload_precommit_by_signature.pop(receipt.precommit_signature, None)
+            if not receipt.consumed and (
+                (
+                    receipt.body_completed_at_wall is None
+                    and (
+                        receipt.expires_at_wall < current
+                        or self._receipt_collection_deadline(receipt) <= current
+                    )
+                )
+                or (
+                    receipt.body_completed_at_wall is not None
+                    and receipt.body_completed_at_wall > receipt.expires_at_wall
                 )
             ):
                 self._record_no_reveal(receipt)
@@ -1368,39 +1663,54 @@ class ValidatorServer:
             return "invalid", None
         if receipt.batcher is not batcher:
             return "invalid", None
-        started, _start_reason = self._mark_upload_started(
-            receipt,
-            t_arrival=upload_started_at,
-        )
-        if not started:
-            if receipt.upload_started_at_wall is None:
-                self._record_no_reveal(receipt)
-            self._upload_precommit_receipts.pop(receipt_id, None)
-            self._upload_precommit_by_signature.pop(
-                receipt.precommit_signature, None
+        if receipt.body_completed_at_wall is None:
+            started, _start_reason = self._account_upload_chunk(
+                receipt,
+                t_arrival=upload_started_at,
+                chunk_bytes=payload_bytes,
             )
-            resolver = getattr(
-                type(receipt.batcher), "resolve_upload_precommit", None
-            )
-            if resolver is not None:
-                resolver(receipt.batcher, receipt.receipt_id, expired=True)
-            return "expired", None
-        if body_completed_at > receipt.expires_at_wall:
-            self._upload_precommit_receipts.pop(receipt_id, None)
-            self._upload_precommit_by_signature.pop(
-                receipt.precommit_signature, None
-            )
-            if not receipt.consumed:
-                resolver = getattr(
-                    type(receipt.batcher), "resolve_upload_precommit", None
+            if started:
+                completed, _complete_reason = self._wire_upload_event(
+                    "complete",
+                    {
+                        "state": {
+                            "wire_receipt_id": receipt_id,
+                            "wire_body_completed_at": body_completed_at,
+                        }
+                    },
+                    body_completed_at,
+                    0,
                 )
-                if resolver is not None:
-                    resolver(
-                        receipt.batcher,
-                        receipt.receipt_id,
-                        expired=True,
+                started = bool(completed)
+                if receipt.terminal:
+                    reason = (
+                        receipt.outcome.reason
+                        if receipt.outcome is not None
+                        else RejectReason.PRECOMMIT_INVALID
                     )
-            return "expired", None
+                    return (
+                        "expired"
+                        if reason is RejectReason.PRECOMMIT_EXPIRED
+                        else "invalid",
+                        receipt,
+                    )
+        else:
+            started = True
+            _start_reason = None
+        if not started:
+            self._fail_upload_receipt(
+                receipt,
+                reason=RejectReason.PRECOMMIT_EXPIRED,
+                expired=True,
+            )
+            return "expired", receipt
+        if body_completed_at > receipt.expires_at_wall:
+            self._fail_upload_receipt(
+                receipt,
+                reason=RejectReason.PRECOMMIT_EXPIRED,
+                expired=True,
+            )
+            return "expired", receipt
         if not self._precommit_matches_submission(
             receipt,
             request,
@@ -1408,7 +1718,8 @@ class ValidatorServer:
             payload_bytes=payload_bytes,
             payload_sha256=payload_sha256,
         ):
-            return "invalid", None
+            self._fail_upload_receipt(receipt)
+            return "invalid", receipt
         if receipt.consumed:
             return "replay", receipt
         receipt.consumed = True
@@ -2833,6 +3144,7 @@ class ValidatorServer:
         if receipt.consumed:
             return "replay", receipt
         if body_completed_at > receipt.expires_at_wall:
+            self._record_no_reveal(receipt)
             receipt.consumed = True
             self._complete_upload_receipt(
                 receipt,
@@ -2850,6 +3162,7 @@ class ValidatorServer:
                 payload_sha256.lower(), receipt.payload_sha256
             )
         ):
+            self._record_no_reveal(receipt)
             receipt.consumed = True
             self._complete_upload_receipt(
                 receipt,
@@ -2864,7 +3177,6 @@ class ValidatorServer:
         )
         if revealed is not None:
             revealed(receipt.batcher, receipt.receipt_id)
-        self._record_valid_reveal(receipt)
         receipt.consumed = True
         return "valid", receipt
 
@@ -2974,18 +3286,20 @@ class ValidatorServer:
                 accepted=True, reason=RejectReason.SUBMITTED
             )
 
-        t_arrival = float(
-            getattr(http_request.state, "t_arrival", time.time())
+        task_arrival = float(getattr(http_request.state, "t_arrival", time.time()))
+        wire_started_at = getattr(http_request.state, "wire_body_started_at", None)
+        eligibility_at = (
+            float(wire_started_at) if wire_started_at is not None else task_arrival
         )
-        if t_arrival > self._receipt_collection_deadline(receipt):
-            if receipt.upload_started_at_wall is None:
-                self._record_no_reveal(receipt)
-            receipt.consumed = True
-            outcome = BatchSubmissionResponse(
-                accepted=False,
+        if eligibility_at > self._receipt_collection_deadline(receipt):
+            self._fail_upload_receipt(
+                receipt,
                 reason=RejectReason.PRECOMMIT_EXPIRED,
+                expired=True,
             )
-            self._complete_upload_receipt(receipt, outcome, expired=True)
+            outcome = receipt.outcome or BatchSubmissionResponse(
+                accepted=False, reason=RejectReason.PRECOMMIT_EXPIRED
+            )
             logger.warning(
                 "upload_precommit_start_rejected window=%d env=%s "
                 "hotkey=%s reason=%s",
@@ -2997,10 +3311,20 @@ class ValidatorServer:
             response.headers["Connection"] = "close"
             return outcome
 
-        http_request.state.upload_start_callback = (
-            lambda started_at: self._mark_upload_started(
+        http_request.state.wire_receipt_id = receipt_id
+        http_request.state.upload_progress_callback = lambda started_at, chunk_bytes: (
+            self._account_upload_chunk(
                 receipt,
                 t_arrival=started_at,
+                chunk_bytes=chunk_bytes,
+            )
+        )
+        http_request.state.upload_complete_callback = lambda completed_at: (
+            self._wire_upload_event(
+                "complete",
+                http_request.scope,
+                completed_at,
+                0,
             )
         )
 
@@ -3017,12 +3341,10 @@ class ValidatorServer:
             content_length_bytes is not None
             and content_length_bytes != receipt.payload_bytes
         ):
-            receipt.consumed = True
-            outcome = BatchSubmissionResponse(
-                accepted=False,
-                reason=RejectReason.PRECOMMIT_INVALID,
+            self._fail_upload_receipt(receipt)
+            outcome = receipt.outcome or BatchSubmissionResponse(
+                accepted=False, reason=RejectReason.PRECOMMIT_INVALID
             )
-            self._complete_upload_receipt(receipt, outcome)
             telemetry = self._receipt_telemetry(
                 receipt,
                 t_arrival=float(
@@ -3052,14 +3374,14 @@ class ValidatorServer:
             (False, "upload_body_empty"),
         )
         if not upload_started:
-            if receipt.upload_started_at_wall is None:
-                self._record_no_reveal(receipt)
-            receipt.consumed = True
-            outcome = BatchSubmissionResponse(
-                accepted=False,
+            self._fail_upload_receipt(
+                receipt,
                 reason=RejectReason.PRECOMMIT_EXPIRED,
+                expired=True,
             )
-            self._complete_upload_receipt(receipt, outcome, expired=True)
+            outcome = receipt.outcome or BatchSubmissionResponse(
+                accepted=False, reason=RejectReason.PRECOMMIT_EXPIRED
+            )
             logger.warning(
                 "upload_precommit_start_rejected window=%d env=%s "
                 "hotkey=%s reason=%s",
@@ -3073,8 +3395,9 @@ class ValidatorServer:
         body_completed_at = float(
             getattr(http_request.state, "body_completed_at", time.time())
         )
-        body_started_at = getattr(
-            http_request.state, "body_receive_started_at", None
+        body_started_at = getattr(http_request.state, "body_receive_started_at", None)
+        t_arrival = float(
+            body_started_at if body_started_at is not None else eligibility_at
         )
         payload_bytes = int(
             getattr(http_request.state, "body_bytes_received", 0) or 0
@@ -3272,25 +3595,19 @@ class ValidatorServer:
 
         @app.middleware("http")
         async def stamp_arrival(request: Request, call_next):
-            """Stamp the wall-clock arrival time on every request.
+            """Stamp transport ingress for latency observability.
 
-            Runs before pydantic body validation and before the route
-            handler, so ``request.state.t_arrival`` reflects when the
-            asyncio loop first picked the request up — not when the
-            handler eventually executes. The /submit cheap-reject path
-            consumes this attribute and forwards it to
-            ``validate_drand_round`` so the drand timing gate is decided
-            against the actual arrival instant, not against the moment
-            the handler eventually runs (which can lag by tens of ms
-            under load even for fast handlers).
-
-            The drand check happens EXCLUSIVELY here on the arrival path —
-            there's no worker-side re-check that would otherwise re-read
-            ``time.time()`` minutes later when GRAIL queue backpressure
-            delays dequeue (which would turn on-time submissions into
-            STALE_ROUND rejections, the bug pre-this-fix).
+            Admission timing is assigned separately: complete precommit body
+            for receipts, first wire body byte for reveal eligibility, and
+            complete signed body for the legacy direct path.
             """
-            request.state.t_arrival = time.time()
+            request.state.t_arrival = float(
+                getattr(
+                    request.state,
+                    "wire_headers_completed_at",
+                    time.time(),
+                )
+            )
             request_started = time.perf_counter()
             try:
                 return await call_next(request)
@@ -3356,6 +3673,15 @@ class ValidatorServer:
                 return reject(RejectReason.BAD_SCHEMA)
             if request.window_start != batcher.window_start:
                 return reject(RejectReason.WINDOW_MISMATCH)
+            headers_completed_at = float(
+                getattr(
+                    http_request.state,
+                    "wire_headers_completed_at",
+                    commit_received_at,
+                )
+            )
+            if headers_completed_at < float(batcher.window_opened_wall_ts):
+                return reject(RejectReason.WINDOW_NOT_ACTIVE)
             if request.payload_bytes > MAX_SUBMISSION_PAYLOAD_BYTES:
                 return reject(RejectReason.BAD_SCHEMA)
             if (
@@ -3370,23 +3696,43 @@ class ValidatorServer:
             )
             if protocol_reject is not None:
                 return reject(protocol_reject)
-            precommit_signature_valid = await asyncio.to_thread(
-                verify_precommit_signature,
-                miner_hotkey=request.miner_hotkey,
-                window_start=request.window_start,
-                prompt_idx=request.prompt_idx,
-                merkle_root=request.merkle_root,
-                checkpoint_hash=request.checkpoint_hash,
-                environment=request.environment,
-                payload_bytes=request.payload_bytes,
-                payload_sha256=request.payload_sha256,
-                drand_round=request.drand_round,
-                randomness=batcher.randomness,
-                protocol_version=request.protocol_version,
-                generation_profile_id=request.generation_profile_id,
-                nonce=request.nonce,
-                precommit_signature=request.precommit_signature,
-            )
+            if (
+                self._precommit_signature_pool is not None
+                and self._precommit_signature_inflight >= MAX_PENDING_PROOF_QUEUE_DEPTH
+            ):
+                return reject(RejectReason.BATCH_FILLED)
+            self._precommit_signature_inflight += 1
+            try:
+                signature_call = functools.partial(
+                    verify_precommit_signature,
+                    miner_hotkey=request.miner_hotkey,
+                    window_start=request.window_start,
+                    prompt_idx=request.prompt_idx,
+                    merkle_root=request.merkle_root,
+                    checkpoint_hash=request.checkpoint_hash,
+                    environment=request.environment,
+                    payload_bytes=request.payload_bytes,
+                    payload_sha256=request.payload_sha256,
+                    drand_round=request.drand_round,
+                    randomness=batcher.randomness,
+                    protocol_version=request.protocol_version,
+                    generation_profile_id=request.generation_profile_id,
+                    nonce=request.nonce,
+                    precommit_signature=request.precommit_signature,
+                )
+                if self._precommit_signature_pool is None:
+                    precommit_signature_valid = await asyncio.to_thread(signature_call)
+                else:
+                    precommit_signature_valid = await (
+                        asyncio.get_running_loop().run_in_executor(
+                            self._precommit_signature_pool,
+                            signature_call,
+                        )
+                    )
+            finally:
+                self._precommit_signature_inflight = max(
+                    0, self._precommit_signature_inflight - 1
+                )
             if not precommit_signature_valid:
                 return reject(RejectReason.BAD_ENVELOPE_SIGNATURE)
 
@@ -3679,11 +4025,9 @@ class ValidatorServer:
             except ValidationError as exc:
                 raise RequestValidationError(exc.errors()) from exc
             body_parse_ms = (time.perf_counter() - parse_started) * 1000.0
-            # ASGI middleware stamped this. Falls back to time.time() if a
-            # caller bypasses the middleware (e.g. some test harnesses).
-            t_arrival = getattr(http_request.state, "t_arrival", None)
-            if t_arrival is None:
-                t_arrival = time.time()
+            transport_arrival = float(
+                getattr(http_request.state, "t_arrival", time.time())
+            )
             payload_bytes = int(
                 getattr(http_request.state, "body_bytes_received", 0) or 0
             )
@@ -3697,6 +4041,10 @@ class ValidatorServer:
             body_completed_at = float(
                 getattr(http_request.state, "body_completed_at", time.time())
             )
+            # A direct submission becomes economically complete only once its
+            # full signed payload has arrived. Header time remains transport
+            # telemetry and cannot reserve an earlier drand/ranking position.
+            t_arrival = body_completed_at
             body_started_at = getattr(
                 http_request.state, "body_receive_started_at", None
             )
@@ -3724,6 +4072,7 @@ class ValidatorServer:
                 payload_sha256=payload_sha256,
                 t_body_started=body_started_at,
                 t_body_completed=body_completed_at,
+                t_ingress_started=transport_arrival,
                 queue_depth_at_arrival=self.submit_queue_depth,
             )
             telemetry.body_parse_ms = body_parse_ms
@@ -3974,6 +4323,27 @@ class ValidatorServer:
                     submitted_environment=submission_env_name,
                 )
             telemetry.refresh_from_batcher(batcher)
+            raw_window_opened_wall_ts = getattr(
+                batcher, "window_opened_wall_ts", None
+            )
+            window_timing_invalid = False
+            if (
+                raw_window_opened_wall_ts is not None
+                and not _is_mock_like(raw_window_opened_wall_ts)
+            ):
+                window_opened_wall_ts = float(raw_window_opened_wall_ts)
+                window_timing_invalid = (
+                    transport_arrival < window_opened_wall_ts
+                    or body_completed_at < window_opened_wall_ts
+                )
+            if (
+                not http_request.headers.get(PRECOMMIT_HEADER)
+                and window_timing_invalid
+            ):
+                return _reject_before_quota(
+                    RejectReason.WINDOW_NOT_ACTIVE,
+                    reject_stage="window_timing",
+                )
             if request.window_start != batcher.window_start:
                 telemetry.mark_decision()
                 log_submission_stage(
@@ -3997,7 +4367,11 @@ class ValidatorServer:
                     environment=submission_env_name,
                     payload_bytes=payload_bytes,
                     payload_sha256=payload_sha256,
-                    upload_started_at=float(t_arrival),
+                    upload_started_at=float(
+                        body_started_at
+                        if body_started_at is not None
+                        else body_completed_at
+                    ),
                     body_completed_at=body_completed_at,
                 )
                 if precommit_status == "expired":
@@ -4860,12 +5234,14 @@ class ValidatorServer:
             telemetry.body_parse_ms = prepared.body_parse_ms
             telemetry.admission_prepare_ms = prepared.preparation_ms
             if request is None:
+                self._record_no_reveal(receipt)
                 reject_stage = prepared.reject_stage or "admission_worker"
                 response = reject_without_request(
                     prepared.reject_reason or RejectReason.BAD_SCHEMA,
                     reject_stage,
                 )
                 return
+            self._record_valid_reveal(receipt)
             request._payload_bytes = receipt.payload_bytes
             self._admission_inflight_requests[receipt.receipt_id] = request
 
@@ -5474,11 +5850,26 @@ class ValidatorServer:
             max_workers=MATH_ADMISSION_WORKERS + CODE_ADMISSION_WORKERS,
             thread_name_prefix="reliquary-problem-load",
         )
+        self._precommit_signature_pool = ThreadPoolExecutor(
+            max_workers=B_BATCH,
+            thread_name_prefix="reliquary-precommit-signature",
+        )
         self._auction_admission_enabled = True
         await self.prepare_admission_pools(self._active_batchers)
+        protocol_class = type(
+            "SubmissionHttpProtocol",
+            (_SubmissionHttpProtocol,),
+            {
+                "wire_event_handler": staticmethod(self._wire_upload_event),
+            },
+        )
         config = uvicorn.Config(
-            self.app, host=self.host, port=self.port,
-            log_level="warning", access_log=False,
+            self.app,
+            host=self.host,
+            port=self.port,
+            log_level="warning",
+            access_log=False,
+            http=protocol_class,
         )
         self._server = uvicorn.Server(config)
         self._task = asyncio.create_task(self._server.serve())
@@ -5559,6 +5950,11 @@ class ValidatorServer:
         if materialization_pool is not None:
             materialization_pool.shutdown(wait=False, cancel_futures=True)
         self._admission_materialization_pool = None
+        signature_pool = self._precommit_signature_pool
+        if signature_pool is not None:
+            signature_pool.shutdown(wait=False, cancel_futures=True)
+        self._precommit_signature_pool = None
+        self._precommit_signature_inflight = 0
         if self._server is not None:
             self._server.should_exit = True
         if self._task is not None:
