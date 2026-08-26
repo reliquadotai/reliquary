@@ -155,6 +155,11 @@ class ProofPlanResult:
     finished_at: float
 
 
+# How many finished plan ids stay known to the anti-replay guard. At one plan
+# per environment per window this is days of history for a few hundred KB.
+RETIRED_PLAN_ID_MEMORY = 4096
+
+
 class _JobPhase(str, Enum):
     PENDING = "pending"
     ACTIVE = "active"
@@ -291,6 +296,14 @@ class GlobalProofScheduler:
         ] = {device: None for device in self._devices}
         self._active_resource_keys: set[Hashable] = set()
         self._plans: dict[str, _PlanState] = {}
+        # Plan ids of retired plans, for the anti-replay guard only. Bounded:
+        # a set that grows forever is the same bug in a cheaper suit. The guard
+        # catches a plan_id generator bug (it raises ValueError), not a miner,
+        # so a rolling window of ids is the right amount of memory.
+        self._retired_plan_ids: deque[str] = deque(
+            maxlen=RETIRED_PLAN_ID_MEMORY
+        )
+        self._retired_plan_id_set: set[str] = set()
         self._active_plan_by_environment: dict[
             str, _PlanState | None
         ] = {environment: None for environment in self._environments}
@@ -595,7 +608,11 @@ class GlobalProofScheduler:
         for plan in plans:
             if not plan.plan_id:
                 raise ValueError("plan_id must be non-empty")
-            if plan.plan_id in plan_ids or plan.plan_id in self._plans:
+            if (
+                plan.plan_id in plan_ids
+                or plan.plan_id in self._plans
+                or plan.plan_id in self._retired_plan_id_set
+            ):
                 raise ValueError(f"duplicate plan_id {plan.plan_id!r}")
             plan_ids.add(plan.plan_id)
             if plan.environment not in self._environment_set:
@@ -1224,12 +1241,11 @@ class GlobalProofScheduler:
         self._active_plan_by_environment[state.plan.environment] = None
         self._totals["plans_completed"] += 1
         self._totals[f"plans_{outcome.value}"] += 1
-        self._release_plan_payloads(state)
+        self._retire_plan_locked(state)
         self._condition.notify_all()
 
-    @staticmethod
-    def _release_plan_payloads(state: _PlanState) -> None:
-        """Drop what a finished plan still points at.
+    def _retire_plan_locked(self, state: _PlanState) -> None:
+        """Take a finished plan out of the live map, and drop what it held.
 
         ``_plans`` is never pruned — the entry is the anti-replay guard for its
         plan_id (``_validate_plan_batch_locked``) and must stay. What it may not
@@ -1251,6 +1267,17 @@ class GlobalProofScheduler:
         state.candidate_by_id = {}
         state.raw = {}
         state.plan = replace(state.plan, candidates=())
+        # ...and let the entry go. Clearing named fields only reclaims the
+        # fields someone thought to list: final_result keeps its decisions by
+        # design, and ProofDecision.value is the verifier's opaque output.
+        # The caller loses nothing — ProofPlanHandle holds its own reference to
+        # this state, so a result stays readable exactly as long as the caller
+        # keeps its handle, which is the correct owner.
+        self._plans.pop(state.plan.plan_id, None)
+        if len(self._retired_plan_ids) == self._retired_plan_ids.maxlen:
+            self._retired_plan_id_set.discard(self._retired_plan_ids[0])
+        self._retired_plan_ids.append(state.plan.plan_id)
+        self._retired_plan_id_set.add(state.plan.plan_id)
 
     @staticmethod
     def _synthetic_decision(
