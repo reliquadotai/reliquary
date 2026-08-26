@@ -2402,6 +2402,12 @@ def test_health_exposes_each_environment_window_independently():
         "pending_upload_precommits": 0,
         "upload_precommit_payload_bytes": 0,
         "upload_precommit_conservation": {
+            "early_close": {
+                "mode": "shadow",
+                "eligible_offset_seconds": None,
+                "sealed_early": False,
+                "refusing_precommits": False,
+            },
             "accepted_receipts": 0,
             "revealed": 0,
             "revealed_terminal": 0,
