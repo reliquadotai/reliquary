@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections import deque
 from collections.abc import Callable, Hashable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 import math
 import threading
@@ -1224,7 +1224,33 @@ class GlobalProofScheduler:
         self._active_plan_by_environment[state.plan.environment] = None
         self._totals["plans_completed"] += 1
         self._totals[f"plans_{outcome.value}"] += 1
+        self._release_plan_payloads(state)
         self._condition.notify_all()
+
+    @staticmethod
+    def _release_plan_payloads(state: _PlanState) -> None:
+        """Drop what a finished plan still points at.
+
+        ``_plans`` is never pruned — the entry is the anti-replay guard for its
+        plan_id (``_validate_plan_batch_locked``) and must stay. What it may not
+        keep is ``RankedProof.payload``, which is the miner's submission body:
+        two plans per window at ~64 candidates measured ~500 MB per window on
+        the live validator, i.e. a 200 GB heap in ten hours. That heap is what
+        produced 33 s GC pauses, and the pause is what expired whole batches of
+        upload receipts and banned honest operators.
+
+        Safe because nothing reads these on a terminal plan: every dispatch
+        path runs against ``_unfinished_plans_locked``, which filters on
+        ``final_result``; the caller's whole surface is ``ProofPlanHandle``,
+        which exposes ``plan_id``, ``done``, ``decisions`` and ``result``; and
+        ``ProofDecision.value`` is the verifier's value, never the payload.
+        ``state.plan`` is frozen and carries its OWN ``candidates`` sequence, so
+        clearing the state's copy alone would free nothing.
+        """
+        state.candidates = ()
+        state.candidate_by_id = {}
+        state.raw = {}
+        state.plan = replace(state.plan, candidates=())
 
     @staticmethod
     def _synthetic_decision(

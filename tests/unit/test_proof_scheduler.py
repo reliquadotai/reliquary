@@ -856,3 +856,160 @@ def test_resource_limit_mark_behind_pending_job_does_not_livelock():
     assert statuses["job-1"] is ProofDecisionStatus.REJECTED
     assert statuses["job-3"] is ProofDecisionStatus.SKIPPED_RESOURCE_LIMIT
     assert result.winner_job_ids == ("job-2",)
+
+
+class _Payload:
+    """Weak-referenceable stand-in for a miner submission body.
+
+    A dict is not weak-referenceable, and these tests assert the payload is
+    actually COLLECTED — not merely that a field was set to None. Clearing a
+    field that another structure still references frees nothing, and
+    ``ProofPlan`` holds its own ``candidates`` sequence.
+    """
+
+    __slots__ = ("rank", "__weakref__")
+
+    def __init__(self, rank: int) -> None:
+        self.rank = rank
+
+
+def _payload_candidates(count: int) -> list[RankedProof]:
+    return [
+        RankedProof(
+            job_id=f"job-{rank}",
+            rank=rank,
+            prompt_key=f"prompt-{rank}",
+            payload=_Payload(rank),
+        )
+        for rank in range(count)
+    ]
+
+
+def _submit_and_finish(scheduler, plan_id, candidates, *, required):
+    plan = _plan(plan_id, MATH, candidates, required=required)
+    handle = scheduler.submit(plan)
+    result = handle.result(2)
+    return handle, result
+
+
+def test_a_finished_plan_does_not_survive_the_next_one():
+    """``_plans`` is never pruned, so whatever a finished plan still points at
+    is retained for the life of the process.
+
+    ``RankedProof.payload`` is the miner's submission body. Two plans per
+    window at ~64 candidates measured ~500 MB per window on the live validator
+    2026-08-26 — a 200 GB heap in ten hours. That heap is what produced 33 s GC
+    pauses, and the pause is what expired whole batches of upload receipts and
+    banned honest operators for a clock that had stopped.
+
+    Asserted across TWO plans on purpose. A worker thread keeps its last
+    invocation in a local until the next dispatch overwrites it, which is one
+    candidate per device and bounded; the property that matters is that
+    window N is gone once window N+1 has run.
+    """
+    import gc
+    import weakref
+
+    first = _payload_candidates(4)
+    alive = [weakref.ref(candidate.payload) for candidate in first]
+
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0",),
+        environments=(MATH, CODE),
+        proof_callable=lambda invocation: True,
+        checkpoint_revision="rev-a",
+    )
+    try:
+        _, result = _submit_and_finish(
+            scheduler, "window-1", first, required=4,
+        )
+        assert result.outcome is ProofPlanOutcome.COMPLETED
+        del first, result
+        _submit_and_finish(
+            scheduler, "window-2", _payload_candidates(4), required=4,
+        )
+        gc.collect()
+        assert [ref() for ref in alive] == [None, None, None, None]
+    finally:
+        assert scheduler.close()
+
+
+def test_a_completed_plan_id_still_rejects_a_duplicate():
+    """The release must not weaken the anti-replay guard.
+
+    ``_validate_plan_batch_locked`` rejects a plan_id already in ``_plans``.
+    Dropping the entry to reclaim its payloads would let a replayed plan_id
+    through, so the entry stays and only what it points at is released.
+    """
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0",),
+        environments=(MATH, CODE),
+        proof_callable=lambda invocation: True,
+        checkpoint_revision="rev-a",
+    )
+    try:
+        _submit_and_finish(
+            scheduler, "math-window", _payload_candidates(2), required=2,
+        )
+        with pytest.raises(ValueError, match="duplicate plan_id"):
+            scheduler.submit(
+                _plan("math-window", MATH, _payload_candidates(2), required=2)
+            )
+    finally:
+        assert scheduler.close()
+
+
+def test_the_handle_still_answers_after_the_release():
+    """``result()`` and ``decisions()`` are the handle's whole surface, and the
+    caller reads them after completion — the release must leave both intact."""
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0",),
+        environments=(MATH, CODE),
+        proof_callable=lambda invocation: True,
+        checkpoint_revision="rev-a",
+    )
+    try:
+        handle, result = _submit_and_finish(
+            scheduler, "math-window", _payload_candidates(3), required=3,
+        )
+        assert handle.done()
+        assert handle.plan_id == "math-window"
+        assert len(handle.decisions()) == 3
+        assert result is handle.result(2)
+        assert len(result.decisions) == 3
+        assert result.winner_job_ids == ("job-0", "job-1", "job-2")
+    finally:
+        assert scheduler.close()
+
+
+def test_an_aborted_plan_does_not_survive_the_next_one():
+    """A capacity abort is terminal like any completion.
+
+    Aborts are the case that matters most: they cluster when the plane is
+    already under pressure, which is exactly when the heap must not grow.
+    """
+    import gc
+    import weakref
+
+    first = _payload_candidates(2)
+    alive = [weakref.ref(candidate.payload) for candidate in first]
+
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0",),
+        environments=(MATH, CODE),
+        proof_callable=lambda invocation: False,
+        checkpoint_revision="rev-a",
+    )
+    try:
+        _, result = _submit_and_finish(
+            scheduler, "window-1", first, required=2,
+        )
+        assert result.outcome is ProofPlanOutcome.CAPACITY_ABORTED
+        del first, result
+        _submit_and_finish(
+            scheduler, "window-2", _payload_candidates(2), required=2,
+        )
+        gc.collect()
+        assert [ref() for ref in alive] == [None, None]
+    finally:
+        assert scheduler.close()
