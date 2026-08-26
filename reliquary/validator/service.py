@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import gzip
 import hashlib
 import json
@@ -434,18 +435,29 @@ def open_grpo_window(
 
 
 
-def _default_load_model(local_path: str):
-    """Default: load a HF checkpoint onto cuda:0 in bfloat16 with the
-    configured attention implementation."""
+def load_validator_replica(
+    local_path: str, *, isolated_plane: bool, **load_kwargs,
+):
+    """Default: load a HF checkpoint in bfloat16 with the configured attention
+    implementation, onto whichever device this process's replicas belong to
+    (the CPU once an isolated proof plane holds the working replicas).
+
+    ``isolated_plane`` must say whether a plane was BUILT, not whether the flag
+    is set — see ``validator_replica_device``. ``load_kwargs`` carries the
+    CLI's pinned base-model revision. Both the boot load and the resume load
+    come through here so the device decision cannot drift between them.
+    """
     import torch
     from reliquary.constants import ATTN_IMPLEMENTATION
     from reliquary.shared.modeling import load_text_generation_model
+    from reliquary.validator.proof_worker import validator_replica_device
 
     return load_text_generation_model(
         local_path,
         torch_dtype=torch.bfloat16,
         attn_implementation=ATTN_IMPLEMENTATION,
-    ).to("cuda:0").eval()
+        **load_kwargs,
+    ).to(validator_replica_device(isolated_plane=isolated_plane)).eval()
 
 
 def _parse_pinned_kl_reference(spec: str) -> tuple[str, str]:
@@ -645,6 +657,7 @@ class ValidationService:
         first_env_name = self.env_mix[0][0]
         self.env: Environment = self.envs[first_env_name]
         self._proof_models: dict[str, Any] = {}
+        self._default_proof_proxy_cursor = 0
         self._proof_worker_pool = proof_worker_pool
         # Directory the weights now in verify_model were read from. The
         # isolated proof workers reload from it, so it must track every
@@ -822,7 +835,13 @@ class ValidationService:
         self._current_window_state: WindowState = WindowState.READY
 
         self._resume_from = resume_from
-        self._load_model_fn = load_model_fn or _default_load_model
+        # The resume load must land where the boot load did. A pool means the
+        # working replicas live in the workers, so this process's pair stays
+        # on the CPU; no pool means it still proves in-process.
+        self._load_model_fn = load_model_fn or functools.partial(
+            load_validator_replica,
+            isolated_plane=self._proof_worker_pool is not None,
+        )
 
         # Fixed mode is opt-in. An explicit fixed reference is a load-bearing
         # training control, so it is immutable and fail-closed. Empty config keeps
@@ -1005,12 +1024,18 @@ class ValidationService:
     def _default_proof_proxy(self) -> Any:
         """Proxy used when a proof path does not name a device.
 
-        Any configured device serves: these paths are single-shot and the
-        scheduler is not choosing between replicas for them.
+        Any configured slot serves — these paths are single-shot and the
+        scheduler is not choosing between replicas for them — but always
+        answering with the first would queue them behind slot 0's scheduled
+        work on its pipe lock while the other slots idle, inflating slot 0's
+        active-job age. Round-robin instead.
         """
-        for proxy in self._proof_models.values():
-            return proxy
-        raise RuntimeError("isolated proof plane has no device proxy")
+        proxies = list(self._proof_models.values())
+        if not proxies:
+            raise RuntimeError("isolated proof plane has no device proxy")
+        proxy = proxies[self._default_proof_proxy_cursor % len(proxies)]
+        self._default_proof_proxy_cursor += 1
+        return proxy
 
     def _synchronize_proof_workers(
         self,

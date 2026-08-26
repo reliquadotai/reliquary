@@ -110,3 +110,11 @@ def slow_reload_handler(
 
 def build_context_that_dies(*, device: str) -> dict[str, Any]:
     raise RuntimeError(f"cannot build a replica on {device}")
+
+
+def build_slow_context(*, device: str, slow_device: str = "", seconds: str = "0"):
+    """Factory that stalls only for one device, to expose cross-slot blocking."""
+    if slow_device in ("", device):
+        time.sleep(float(seconds))
+    return {"pid": os.getpid(), "calls": 0, "value": 0,
+            "device": device, "revision": None}

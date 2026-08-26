@@ -111,6 +111,97 @@ RELIQUARY_PROOF_CAPACITY_MANIFEST=/root/reliquary/state/proof-capacity.json
 RELIQUARY_PROOF_CAPACITY_MANIFEST_SHA256=<64-lowercase-hex>
 ```
 
+### Proof slots (several proof processes per GPU)
+
+`RELIQUARY_PROOF_SLOTS_PER_DEVICE` (default `1`) runs more than one proof
+process on each configured GPU. One proof costs roughly
+`60 ms + 0.0145 ms/token`, so at v5 rollout lengths it is ~87% fixed dispatch
+and a single process leaves the card at 39% utilisation. Measured on an H100
+PCIe over 192 archived rollouts:
+
+| slots | no MPS | with MPS |
+|---|---|---|
+| 1 | 12.5 s | 12.1 s |
+| 2 | 9.1 s | 6.3 s |
+| 4 | 8.3 s | **5.7 s** |
+| 8 | – | 5.8 s (plateau) |
+
+Two rules follow from that table:
+
+- **Start the CUDA MPS daemon** (`scripts/setup_cuda_mps.sh`, on the host),
+  or most of the gain stays on the table — without it the CUDA contexts
+  time-slice instead of overlapping. MPS changes no verdict: on/off at 1 and 4
+  slots returned 192/192 identical proof results.
+- **Budget 10.2 GB of VRAM per slot.** That figure is flat in rollout length
+  (512 → 8959 tokens moves peak allocation by 0.20 GB), so size the fleet
+  against free VRAM, not against how long completions may grow. Stay clear of
+  ~88% card occupancy, where the allocator cliff starts.
+
+Two costs scale with the slot count, both measured and both small: boot loads
+the replicas serially (26 s for 4 slots against ~7 s for 1), and a checkpoint
+swap reloads each slot in turn (1.5 s each, so 5.9 s for 4 against 1.5 s
+today). The swap lands on the serial publication beat, which already runs
+longer than a normal window.
+
+Slots require `RELIQUARY_PROOF_PROCESS_ISOLATION=1` — in-process they would
+share this interpreter's GIL, which is exactly what isolation exists to avoid,
+and startup refuses the combination. Capacity qualification is unaffected: it
+is a claim about physical cards and keeps counting `RELIQUARY_PROOF_DEVICES`,
+never slots.
+
+With an isolated plane the validator's own train/verify pair no longer needs a
+GPU — it neither trains (the detached trainer owns that) nor proves (each
+worker holds its own replica) — so it loads on the CPU and the card is left to
+the proof workers. Budget **~24 GB of host RAM**: the pair is ~16 GB steady,
+but `RELIQUARY_RESUME_FROM` rebinds `train_model` only after the replacement
+has loaded, so three replicas are alive for a moment at every boot (a fourth,
++8 GB, if `RELIQUARY_KL_BASE_MODEL` is set). That is a permanent floor on host
+RSS, so check free host RAM before enabling — this validator has a known RSS
+leak and has OOM-restarted before, and a fixed floor shortens time-to-OOM
+proportionally.
+
+#### Setting this up on a fresh box
+
+Nothing here is discoverable from a running validator, so follow the list
+rather than memory. Every value below must be identical in all three places it
+appears (host daemon, `.env`, compose bind).
+
+1. **Host** — start the MPS daemon. Idempotent, safe to re-run:
+   ```bash
+   bash scripts/setup_cuda_mps.sh
+   ```
+   It refuses rather than continuing if `nvidia-cuda-mps-control` is missing:
+   on a host that cannot run it, stay at one slot. It also installs a systemd
+   unit, because the container restarts after a host reboot and the daemon
+   would not — the box would come back at ~1.45× with nothing but a boot
+   warning to say so. `--no-service` skips that.
+2. **`docker/.env`** — the four keys that move together, all documented in
+   `docker/.env.example.trainer`:
+   ```bash
+   RELIQUARY_PROOF_PROCESS_ISOLATION=1
+   RELIQUARY_DETACHED_TRAINER=1          # required by isolation
+   RELIQUARY_PROOF_SLOTS_PER_DEVICE=2    # raise once you have watched a day
+   CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
+   RELIQUARY_IPC_MODE=host               # slots only; see step 3
+   ```
+3. **Compose** — `docker-compose.trainer.yml` binds the pipe directory
+   unconditionally and takes its IPC mode from `RELIQUARY_IPC_MODE`, which
+   defaults to `private`. Both the bind and the host IPC namespace are needed:
+   MPS reaches its server over shared memory as well as the pipe. The IPC
+   namespace is opt-in on purpose — it hands the host's SysV IPC and
+   `/dev/shm` to a container that runs untrusted submissions (gVisor, not the
+   IPC namespace, is the boundary for miner code), and a one-slot deployment
+   gains nothing from it.
+4. **Confirm** — start the validator and read the boot log. It warns when the
+   control pipe is not reachable:
+   ```
+   4 proof slots per GPU, but no CUDA MPS control pipe at /tmp/nvidia-mps/control
+   ```
+   No warning means the pipe is there. It does **not** mean the contexts
+   actually overlap — a broken IPC namespace fails silently, and CUDA reports
+   nothing either way. The only real confirmation is the clock: time a window
+   at one slot against N.
+
 The CLI compatibility default remains `openmathinstruct`, but the production
 auction contract is mixed Math+Code. Configure the trainer explicitly:
 

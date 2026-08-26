@@ -427,6 +427,41 @@ def test_cuda_device_resolution_canonicalizes_and_rejects_aliases():
         )
 
 
+def test_slot_ids_are_never_counted_as_capacity():
+    """Capacity is a claim about physical cards, not about processes.
+
+    ``available_device_seconds`` is ``wall x len(configured_devices)``. Four
+    slots on one H100 measure ~2x, not 4x, so letting slot ids reach this
+    call would inflate the qualified budget — the one direction a fail-closed
+    gate must never move. The CLI passes the physical devices here and the
+    slots only to the pool and the scheduler; this pins the guard that makes
+    a wiring mistake loud instead of generous.
+    """
+    qualification = ProofCapacityQualification.from_mapping(_manifest())
+    kwargs = dict(
+        profile_id="qwen35-4b-auction-v3",
+        model_revision="a" * 40,
+        software_revision="b" * 40,
+        proof_path_hash=None,
+        checkpoint_revision="c" * 40,
+        runtime_fingerprint_hash="e" * 64,
+        configured_devices=tuple(f"cuda:{i}#0" for i in range(9)),
+        configured_hardware=tuple("NVIDIA H100 80GB HBM3" for _ in range(9)),
+        configured_device_uuids=tuple(f"gpu-{i}" for i in range(9)),
+        proof_wall_seconds=240.0,
+        minimum_proofs_per_environment=18,
+        minimum_completion_tokens_per_environment={
+            "openmathinstruct": 14_746,
+            "opencodeinstruct": 29_492,
+        },
+    )
+
+    with pytest.raises(
+        ProofCapacityQualificationError, match="canonical CUDA indices"
+    ):
+        qualification.validate(**kwargs)
+
+
 def test_manifest_loader_requires_exact_digest(tmp_path):
     payload = json.dumps(
         _manifest(),

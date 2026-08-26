@@ -1441,10 +1441,18 @@ PROOF_CAPACITY_ACCEPT_FASTER_RUNTIME = (
 # in production the partial convoy showed up as 161 ms of wall time per
 # forward, and 75% of a 139 s seal half.
 #
-# This is ISOLATION, not parallelism: two workers on one GPU measure x1.04
-# because the CUDA contexts time-slice. The replica MOVES to the worker, so
-# device memory is unchanged and every kernel, shape and dtype is identical —
-# no accept/reject decision can shift.
+# Every kernel, shape and dtype is identical to the in-process path, so no
+# accept/reject decision can shift.
+#
+# The earlier note here said a second worker on one GPU measures x1.04 because
+# the CUDA contexts time-slice, and that the replica MOVES so device memory is
+# unchanged. The time-slicing is real — see PROOF_SLOTS_PER_DEVICE, which is
+# what an MPS server fixes — but the move is not: nothing frees this process's
+# pair, so isolation ADDS a replica. Measured on the live validator
+# 2026-08-25: 31.4 GB in the main process (two replicas plus their allocator
+# blocks, sm=0 across a full proof burst) beside 10.3 GB in the worker. See
+# proof_worker.validator_replica_device, which now keeps this process's pair
+# on the CPU whenever the plane is isolated.
 #
 # Off by default; the isolated plane requires the detached-trainer checkpoint
 # intake, which is what stages a snapshot directory the worker can reload from.
@@ -1452,6 +1460,40 @@ PROOF_PROCESS_ISOLATION = (
     _os.environ.get("RELIQUARY_PROOF_PROCESS_ISOLATION", "0")
     .strip().lower() in {"1", "true", "yes", "on"}
 )
+
+# Proof processes per GPU. Isolation gave the proof interpreter its own GIL;
+# slots give the card more than one interpreter feeding it.
+#
+# One proof costs 60 ms + 0.0145 ms/token — 87% fixed dispatch at the median
+# v5 rollout — and the card idles at 39% utilisation while a single slot runs.
+# Measured 2026-08-25 on an H100 PCIe over 192 real archived rollouts, the
+# production stack and the production checkpoint:
+#
+#   slots      no MPS    with MPS
+#       1      12.5 s      12.1 s
+#       2       9.1 s       6.3 s
+#       4       8.3 s       5.7 s
+#       8           -       5.8 s   (plateau: the GPU is the limit here)
+#
+# Reproduced on a second H100 PCIe after three review rounds: 11.7 / 6.9 / 5.9
+# at 1 / 2 / 4 slots, i.e. ~2x. Quote the range, not a third digit — the
+# baseline moves a few percent between cards.
+#
+# Without an MPS server the CUDA contexts time-slice, which is the x1.04 the
+# original isolation note recorded; with one they genuinely overlap. Every
+# slot runs the same batch=1 path, and the whole matrix returned 192/192
+# rollouts bit-identical on all_passed, sketch diff, p_stop, the seed
+# counters, argmax ids and chosen probabilities — MPS included.
+#
+# Each slot holds its own replica: 10.2 GB, flat in rollout length (512 ->
+# 8959 tokens moves peak allocation by 0.20 GB, because the proof path never
+# materialises the [seq, vocab] block and chunks every vocabulary pass).
+# Budget slots against free VRAM, not against the length distribution.
+PROOF_SLOTS_PER_DEVICE = int(
+    _os.environ.get("RELIQUARY_PROOF_SLOTS_PER_DEVICE", "1")
+)
+if PROOF_SLOTS_PER_DEVICE < 1:
+    raise ValueError("RELIQUARY_PROOF_SLOTS_PER_DEVICE must be at least 1")
 
 # Hard bound on one request to a proof worker. Generous next to the measured
 # p95 (9.8 s at the qualified worst case) because the wall the plane really

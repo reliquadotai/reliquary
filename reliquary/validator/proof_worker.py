@@ -17,16 +17,24 @@ the child, so nothing heavy is pickled across the boundary.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import gc
 import importlib
+import logging
 import multiprocessing
 import threading
 from typing import Any, Callable, Mapping, MutableMapping, Sequence
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "ProofModelProxy",
     "ProofWorkerPool",
     "ProofWorkerUnavailable",
     "assert_isolation_supported",
+    "assert_proof_slots_supported",
+    "mps_control_pipe_path",
+    "assert_host_memory_for_cpu_replicas",
+    "validator_replica_device",
     "build_isolated_proof_plane",
     "build_proof_context",
     "reload_proof_context",
@@ -173,11 +181,14 @@ class _Worker:
 
 
 class ProofWorkerPool:
-    """One dedicated process per proof device.
+    """One dedicated process per proof slot.
 
-    Not a parallelism device: two workers on one GPU measure x1.04 because the
-    CUDA contexts time-slice. The point is that each proof interpreter has no
-    competing python thread.
+    Each proof interpreter has no competing python thread. Several slots may
+    name the same card (``cuda:0#0``, ``cuda:0#1``, ...): without an MPS server
+    their CUDA contexts time-slice and a second slot buys almost nothing —
+    which is what the original x1.04 measurement here recorded — but with one
+    they overlap, and four slots measure ~x2 (see PROOF_SLOTS_PER_DEVICE).
+    Every slot runs the same batch=1 path, so no verdict can shift.
     """
 
     def __init__(
@@ -212,9 +223,22 @@ class ProofWorkerPool:
         self._start_timeout_seconds = float(start_timeout_seconds)
         self._revisions: dict[str, str | None] = {}
         self._workers: dict[str, _Worker] = {}
-        # Guards the workers map itself, so two threads racing a respawn do
-        # not each start a process for the same device.
+        # Guards the maps themselves. Held only for dict access — never
+        # across a spawn, which can block for start_timeout_seconds while a
+        # replica loads. With one slot that was invisible; with N it would
+        # park every other slot's dispatch thread behind one respawn, past
+        # MAX_PROOF_WALL_SECONDS, and fault the plane.
         self._spawn_lock = threading.Lock()
+        self._closed = False
+        # One lock per slot, so two threads racing a respawn still do not
+        # each start a process for the SAME slot.
+        self._device_spawn_locks: dict[str, threading.Lock] = {}
+        # ...but bound how many load a replica AT ONCE across slots: _spawn
+        # materialises the whole ~8 GB model on the host before moving it to
+        # the card, and this process already carries a ~24 GB floor. Two, not
+        # one: at one, a single slow spawn parks every other slot again, which
+        # is the regression the per-slot locks exist to fix.
+        self._replica_load_slots = threading.Semaphore(2)
         self._context = multiprocessing.get_context("spawn")
 
     @property
@@ -223,7 +247,12 @@ class ProofWorkerPool:
 
     def start(self) -> None:
         for device_id in self._devices:
-            self._worker_for(device_id)
+            # Same lock _request takes. Nothing calls into the pool during
+            # startup today, but leaving the spawn invariant resting on that
+            # call order lets a future caller spawn a slot twice and drop one
+            # child, still holding a full replica, out of the map.
+            with self._device_spawn_lock(device_id):
+                self._worker_for(device_id)
 
     def _worker_for(self, device_id: str) -> _Worker:
         """Return the live worker, replacing one that died since last use."""
@@ -234,15 +263,44 @@ class ProofWorkerPool:
             )
         worker = self._workers.get(device_id)
         if worker is None:
+            if self._closed:
+                # close() already took its snapshot; a replica started now
+                # would land on a card being torn down and never be retired.
+                raise ProofWorkerUnavailable(
+                    f"proof worker pool is closed, refusing to spawn "
+                    f"{device_id}"
+                )
             worker = self._spawn(device_id)
+            if self._closed:
+                # close() holds no lock across a spawn and a spawn can block
+                # for start_timeout_seconds, so its snapshot cannot contain
+                # this child. Publishing it now would leak a replica and an
+                # open pipe past the shutdown meant to reap them.
+                self._kill(worker)
+                raise ProofWorkerUnavailable(
+                    f"proof worker pool closed while {device_id} was starting"
+                )
             self._workers[device_id] = worker
         return worker
 
-    def _retire(self, device_id: str) -> None:
+    def _retire(self, device_id: str, worker: "_Worker | None" = None) -> None:
+        """Kill the worker on ``device_id``.
+
+        ``worker`` names WHICH one: a thread that failed an exchange may reach
+        here long after another thread respawned the slot, and retiring by id
+        alone would kill the healthy replacement out from under it.
+        """
+        if worker is not None and self._workers.get(device_id) is not worker:
+            return
         self._revisions[device_id] = None
         worker = self._workers.pop(device_id, None)
         if worker is None:
             return
+        self._kill(worker)
+
+    @staticmethod
+    def _kill(worker: "_Worker") -> None:
+        """Reap one child, whether or not it ever reached ``_workers``."""
         try:
             worker.connection.close()
         except OSError:
@@ -252,6 +310,10 @@ class ProofWorkerPool:
         worker.process.join(timeout=5.0)
 
     def _spawn(self, device_id: str) -> _Worker:
+        with self._replica_load_slots:
+            return self._spawn_locked(device_id)
+
+    def _spawn_locked(self, device_id: str) -> _Worker:
         parent_conn, child_conn = self._context.Pipe(duplex=True)
         process = self._context.Process(
             target=_worker_main,
@@ -302,8 +364,15 @@ class ProofWorkerPool:
         self._revisions[device_id] = payload
         return _Worker(device_id=device_id, process=process, connection=parent_conn)
 
-    def _request(self, device_id: str, operation: str, args, kwargs) -> Any:
+    def _device_spawn_lock(self, device_id: str) -> Any:
         with self._spawn_lock:
+            lock = self._device_spawn_locks.get(device_id)
+            if lock is None:
+                lock = self._device_spawn_locks[device_id] = threading.Lock()
+            return lock
+
+    def _request(self, device_id: str, operation: str, args, kwargs) -> Any:
+        with self._device_spawn_lock(device_id):
             worker = self._worker_for(device_id)
         with worker.lock:
             return self._exchange(worker, device_id, operation, args, kwargs)
@@ -316,7 +385,7 @@ class ProofWorkerPool:
                 else self._request_timeout_seconds
             )
             if timeout is not None and not worker.connection.poll(timeout):
-                self._retire(device_id)
+                self._retire(device_id, worker=worker)
                 raise ProofWorkerUnavailable(
                     f"proof worker {device_id} timed out after {timeout:g}s"
                 )
@@ -325,7 +394,7 @@ class ProofWorkerPool:
             # The child died mid-request. Retire it so the NEXT window finds a
             # live worker, and raise: the scheduler must abort this plane
             # rather than turn our fault into a miner's rejection.
-            self._retire(device_id)
+            self._retire(device_id, worker=worker)
             raise ProofWorkerUnavailable(
                 f"proof worker {device_id} died mid-request: {exc!r}",
                 remote_error_type=type(exc).__name__,
@@ -366,7 +435,14 @@ class ProofWorkerPool:
         still be mid-request, writing into its pipe corrupts the exchange it
         is reading. Kill the child instead and let the caller fail loudly.
         """
-        for worker in self._workers.values():
+        # Snapshot first: with per-slot spawn locks another dispatch thread can
+        # insert or pop while this runs, and iterating the live map would abort
+        # here and leave the remaining slots alive.
+        with self._spawn_lock:
+            self._closed = True
+            workers = list(self._workers.values())
+            self._workers.clear()
+        for worker in workers:
             if not force:
                 try:
                     worker.connection.send(("shutdown", (), {}))
@@ -451,7 +527,19 @@ def reload_proof_context(
         _install_from_hub(context, repo_id, checkpoint_revision)
         return
 
-    model = context["model"]
+    model = context.get("model")
+    if model is None:
+        # A hub install that failed after releasing the old replica leaves the
+        # slot empty. The in-place path has nothing to load into, so rebuild
+        # rather than fail every swap from here on.
+        if not repo_id:
+            raise RuntimeError(
+                "proof worker holds no replica and no repo_id is available "
+                f"to rebuild it for {checkpoint_revision!r}"
+            )
+        _install_from_hub(context, repo_id, checkpoint_revision)
+        return
+
     tied = set(getattr(model, "_tied_weights_keys", None) or [])
     result = model.load_state_dict(state, strict=False)
     unexpected = list(getattr(result, "unexpected_keys", []) or [])
@@ -483,6 +571,11 @@ def _install_from_hub(
     from reliquary.constants import ATTN_IMPLEMENTATION
     from reliquary.shared import modeling
 
+    from reliquary.validator.proof_capacity import physical_proof_device
+
+    # Assembled on the host first, then the old replica is released before the
+    # replacement touches the card: holding both is 20.4 GB on one GPU, and
+    # with several slots that spike lands on a card that is already full.
     model = modeling.load_text_generation_model(
         repo_id,
         torch_dtype=torch.bfloat16,
@@ -490,8 +583,21 @@ def _install_from_hub(
         revision=checkpoint_revision,
     )
     device = context.get("device")
+    # A failed move leaves the slot with no model. A reload reaching it next
+    # rebuilds here (see the None guard in reload_proof_context); a PROOF
+    # reaching it first raises, and the scheduler turns any proof error into a
+    # FAULTED plane, i.e. a validator restart with an unpaid window. That cost
+    # is why the concurrent-load bound above matters: the trade is only worth
+    # it against an OOM, which takes every other slot down as well.
+    # gc.collect first: a reference cycle in the module graph would defer the
+    # free past empty_cache and leave the old 10.2 GB resident under the move.
+    context["model"] = None
+    context["revision"] = None
+    gc.collect()
+    if getattr(torch, "cuda", None) is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
     if device is not None and hasattr(model, "to"):
-        model = model.to(device)
+        model = model.to(physical_proof_device(device))
     model = model.eval()
     for parameter in getattr(model, "parameters", list)():
         parameter.requires_grad = False
@@ -522,15 +628,19 @@ def build_proof_context(
 
     from reliquary.constants import ATTN_IMPLEMENTATION
     from reliquary.shared import modeling
+    from reliquary.validator.proof_capacity import physical_proof_device
 
     kwargs = dict(load_kwargs or {})
     tokenizer = modeling.load_tokenizer(checkpoint, **kwargs)
+    # ``device`` is a proof SLOT id: several slots can share one card, and
+    # torch does not understand the ``cuda:0#1`` form. The slot id stays in the
+    # context because that is this worker's identity to the pool and scheduler.
     model = modeling.load_text_generation_model(
         checkpoint,
         torch_dtype=torch.bfloat16,
         attn_implementation=ATTN_IMPLEMENTATION,
         **kwargs,
-    ).to(device).eval()
+    ).to(physical_proof_device(device)).eval()
     for parameter in model.parameters():
         parameter.requires_grad = False
     return {
@@ -553,7 +663,7 @@ def build_isolated_proof_plane(
     load_kwargs: Mapping[str, Any] | None = None,
     reference_model: Any = None,
 ) -> tuple["ProofWorkerPool", dict[str, ProofModelProxy]]:
-    """Assemble the isolated plane: one worker per device, one proxy each.
+    """Assemble the isolated plane: one worker per proof slot, one proxy each.
 
     The returned pool is NOT started — the caller decides when to pay the
     model load. Proxies carry only the EOS metadata the proof-dependent gates
@@ -588,6 +698,154 @@ def build_isolated_proof_plane(
         for device in devices
     }
     return pool, proxies
+
+
+# CUDA's own default when CUDA_MPS_PIPE_DIRECTORY is unset. A box running the
+# daemon on the default path sets nothing, so reading the variable alone would
+# report "no MPS" for the common case.
+_DEFAULT_MPS_PIPE_DIRECTORY = "/tmp/nvidia-mps"
+
+
+def mps_control_pipe_path() -> str:
+    """The named pipe ``nvidia-cuda-mps-control -d`` creates when it starts."""
+    import os
+
+    directory = (
+        os.environ.get("CUDA_MPS_PIPE_DIRECTORY", "").strip()
+        or _DEFAULT_MPS_PIPE_DIRECTORY
+    )
+    return os.path.join(directory, "control")
+
+
+def assert_proof_slots_supported(
+    *,
+    slots_per_device: int,
+    isolation: bool,
+    proof_devices: Sequence[str] = (),
+) -> None:
+    """Extra slots only mean anything as separate interpreters on real cards.
+
+    In-process they would be threads of the validator's own interpreter, i.e.
+    the GIL convoy the isolated plane exists to escape (the same forward
+    measured 28.7 ms alone and 29.6 s against one CPU-bound python thread).
+    Refuse the combination instead of serving the convoy under a name that
+    promises parallelism.
+
+    With no card resolved there is no plane at all and the slot count is simply
+    dropped — a warning, not a refusal, because a protocol profile below v3
+    legitimately configures no proof device.
+    """
+    if int(slots_per_device) > 1 and not isolation:
+        raise RuntimeError(
+            "RELIQUARY_PROOF_SLOTS_PER_DEVICE > 1 requires "
+            "RELIQUARY_PROOF_PROCESS_ISOLATION: in-process slots would share "
+            "this interpreter's GIL, which is what isolation exists to avoid"
+        )
+    if int(slots_per_device) > 1 and not proof_devices:
+        logger.warning(
+            "RELIQUARY_PROOF_SLOTS_PER_DEVICE=%d ignored: no proof device is "
+            "configured, so no isolated plane is built and proving stays "
+            "in-process",
+            int(slots_per_device),
+        )
+        return
+    if int(slots_per_device) > 1:
+        import os
+
+        pipe = mps_control_pipe_path()
+        if not os.path.exists(pipe):
+            logger.warning(
+                "%d proof slots per GPU, but no CUDA MPS control pipe at %s. "
+                "Without an MPS server the slots' CUDA contexts time-slice "
+                "instead of overlapping: 4 slots measured 8.3 s against 5.7 s "
+                "with one. Start it with nvidia-cuda-mps-control -d and give "
+                "the container the same CUDA_MPS_PIPE_DIRECTORY. Nothing else "
+                "reports this — the proofs stay correct, only slower.",
+                int(slots_per_device),
+                pipe,
+            )
+
+
+def validator_replica_device(
+    *, isolated_plane: bool, gpu_device: str = "cuda:0",
+) -> str:
+    """Device for the validator's OWN train/verify replicas.
+
+    With an isolated plane this process neither trains (the detached trainer
+    owns that, and isolation requires it — see ``assert_isolation_supported``)
+    nor proves (every proof runs in a worker holding its own replica). Measured
+    on the live validator 2026-08-25: the main process held 31.4 GB while
+    ``nvidia-smi pmon`` reported ``sm = 0`` across a full proof burst. Keeping
+    the pair on the CPU hands that budget to the workers instead.
+
+    ``isolated_plane`` is whether a plane was actually BUILT, not whether the
+    flag is set: RELIQUARY_PROOF_PROCESS_ISOLATION can be on while no proof
+    device resolves (a protocol profile below v3), and then the batcher still
+    proves in-process against this replica. Deciding on the flag alone would
+    leave a flash-attention-2 model on the CPU and prove there, silently.
+    """
+    return "cpu" if isolated_plane else gpu_device
+
+
+# What the validator's own replicas cost in host RAM once they leave the card.
+# The train/verify pair is ~16 GB steady, but RELIQUARY_RESUME_FROM rebinds
+# train_model only after the replacement has loaded, so three are alive for a
+# moment at every boot. A pinned KL reference is a fourth.
+VALIDATOR_REPLICA_HOST_MEMORY_FLOOR_GB = 24.0
+VALIDATOR_KL_REFERENCE_HOST_MEMORY_GB = 8.0
+
+
+def _available_host_memory_gb() -> float | None:
+    """``MemAvailable`` in GB, or None where /proc/meminfo is not readable."""
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / (1024.0 * 1024.0)
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def assert_host_memory_for_cpu_replicas(
+    *,
+    isolated_plane: bool,
+    kl_base_model: bool = False,
+    available_gb: float | None = None,
+) -> None:
+    """Warn when the host cannot carry the replicas the CPU move puts on it.
+
+    An isolated plane hands this process's train/verify pair to host RAM,
+    converting VRAM into a PERMANENT RSS floor. This validator has a known
+    ~11 GB/h RSS leak and has been OOM-killed before, so the floor shortens
+    time-to-OOM proportionally — and the OOM lands mid-window: an aborted,
+    unpaid window plus a lost LR warmup.
+
+    Warn, never refuse. A validator running with a tight host still earns; one
+    that will not boot does not. This exists so the regression is a decision at
+    startup rather than a restart hours later.
+    """
+    if not isolated_plane:
+        return
+    floor = VALIDATOR_REPLICA_HOST_MEMORY_FLOOR_GB
+    if kl_base_model:
+        floor += VALIDATOR_KL_REFERENCE_HOST_MEMORY_GB
+    available = (
+        _available_host_memory_gb() if available_gb is None
+        else float(available_gb)
+    )
+    if available is None or available >= floor:
+        return
+    logger.warning(
+        "Isolated proof plane: this process's replicas load on the CPU and "
+        "need ~%.0f GB of host RAM, but only %.1f GB is available. They are a "
+        "permanent RSS floor, not a transient — with the known RSS leak this "
+        "box will reach OOM sooner, and an OOM mid-window costs an unpaid "
+        "window and the LR warmup. Free host RAM, or run without "
+        "RELIQUARY_PROOF_PROCESS_ISOLATION.",
+        floor,
+        available,
+    )
 
 
 def assert_isolation_supported(

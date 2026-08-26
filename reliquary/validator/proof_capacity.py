@@ -95,12 +95,61 @@ class ProofDeviceIdentity:
     device_uuid: str
 
 
+def _is_canonical_cuda_index(device: Any) -> bool:
+    """A bare, canonical ``cuda:<index>`` — never a slot.
+
+    Capacity is a claim about physical cards: ``available_device_seconds`` is
+    the wall clock times this count. Slot ids must fail here so extra processes
+    can never inflate a qualified budget.
+    """
+    match = _CUDA_DEVICE_RE.fullmatch(str(device))
+    if match is None:
+        return False
+    return str(device) == f"cuda:{int(match.group(1))}"
+
+
+def physical_proof_device(slot_id: str) -> str:
+    """The CUDA device a proof slot runs on: ``cuda:0#2`` -> ``cuda:0``.
+
+    Slot ids exist so the pool can hold one process per slot and the scheduler
+    one dispatch thread per slot; every kernel still lands on the physical
+    device named before the ``#``.
+    """
+    return str(slot_id).strip().split("#", 1)[0]
+
+
+def expand_proof_slots(
+    devices: Sequence[str], slots_per_device: int,
+) -> tuple[str, ...]:
+    """One id per proof process.
+
+    ``slots_per_device == 1`` returns the bare device ids, so a deployment
+    that does not opt in sees byte-identical identifiers everywhere they are
+    recorded (scheduler telemetry, capacity manifests, archives).
+    """
+    count = int(slots_per_device)
+    if count < 1:
+        raise ValueError("a proof device needs at least one proof slot")
+    cleaned = tuple(str(device).strip() for device in devices)
+    if count == 1:
+        return cleaned
+    return tuple(
+        f"{device}#{slot}" for device in cleaned for slot in range(count)
+    )
+
+
 def resolve_cuda_proof_devices(
     raw_devices: Sequence[str],
     *,
     cuda: Any,
 ) -> tuple[ProofDeviceIdentity, ...]:
-    """Resolve explicit CUDA indices to canonical physical identities."""
+    """Resolve explicit CUDA indices to canonical physical identities.
+
+    Deliberately physical-only, slot syntax refused: what this returns is
+    handed to ``ProofCapacityQualification.validate``, which counts cards. Ask
+    for more processes with ``RELIQUARY_PROOF_SLOTS_PER_DEVICE``, which widens
+    the plane *after* this resolution and leaves capacity alone.
+    """
 
     available = int(cuda.device_count())
     resolved: list[ProofDeviceIdentity] = []
@@ -111,7 +160,9 @@ def resolve_cuda_proof_devices(
         match = _CUDA_DEVICE_RE.fullmatch(value)
         if match is None:
             raise ProofCapacityQualificationError(
-                "proof devices must use explicit cuda:<index> syntax"
+                "proof devices must use explicit cuda:<index> syntax "
+                "(for several processes per card set "
+                "RELIQUARY_PROOF_SLOTS_PER_DEVICE)"
             )
         index = int(match.group(1))
         if index < 0 or index >= available:
@@ -411,8 +462,7 @@ class ProofCapacityQualification:
                 "configured proof devices must be non-empty and unique"
             )
         if any(
-            _CUDA_DEVICE_RE.fullmatch(str(device)) is None
-            or str(device) != f"cuda:{int(str(device).split(':')[1])}"
+            not _is_canonical_cuda_index(device)
             for device in configured_devices
         ):
             raise ProofCapacityQualificationError(

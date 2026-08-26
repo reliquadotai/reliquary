@@ -51,4 +51,22 @@ echo "[setup] verify torch sees CUDA"
 
 mkdir -p "$BT_WALLET_PATH"
 
+# Proof slots need an MPS server to overlap on one card; without it they
+# time-slice and buy almost nothing. Read the slot count from docker/.env when
+# it exists — on a first run this script clones the repo and that file does not
+# exist yet, so the shell environment is the only source. A failure here is
+# fatal: N slots without MPS waste 10.2 GB of VRAM each for a few percent.
+SLOTS="${RELIQUARY_PROOF_SLOTS_PER_DEVICE:-}"
+if [ -z "$SLOTS" ] && [ -f "$INSTALL_DIR/docker/.env" ]; then
+  SLOTS=$(grep -E '^[[:space:]]*RELIQUARY_PROOF_SLOTS_PER_DEVICE=' \
+    "$INSTALL_DIR/docker/.env" | tail -1 | sed 's/.*=//' | tr -cd '0-9')
+fi
+if [ "${SLOTS:-1}" -gt 1 ] 2>/dev/null; then
+  echo "[setup] proof slots = $SLOTS -> starting CUDA MPS"
+  bash "$INSTALL_DIR/scripts/setup_cuda_mps.sh"
+else
+  echo "[setup] one proof slot (or unset) -> skipping CUDA MPS"
+fi
+
 echo "[setup] done. Next: copy your validator signing credentials to BT_WALLET_PATH, then source scripts/.env and run scripts/launch_validator.sh (or launch_miner.sh)."
+echo "[setup] Running more than one proof process per GPU? See docs/validating.md \"Proof slots\" and run scripts/setup_cuda_mps.sh on this host."
