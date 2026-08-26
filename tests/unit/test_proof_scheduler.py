@@ -179,6 +179,178 @@ def test_shared_resource_is_serialized_across_devices():
         assert scheduler.close()
 
 
+def test_hidden_higher_ranked_resource_candidate_cannot_deadlock_raw_result():
+    """A prompt fallback must reserve its resource rank before it is eligible.
+
+    Rank 2 is hidden behind rank 1's prompt.  The historical scheduler let
+    rank 3 finish and retain ``operator-b`` as RAW; after rank 1 rejected,
+    rank 2 became PENDING but could not dispatch, and rank 3 could not apply
+    past it.  Both devices were then idle until the plan deadline.
+    """
+
+    leader_release = threading.Event()
+    hidden_started = threading.Event()
+    lower_shared_started = threading.Event()
+    unrelated_finished = threading.Event()
+    active_by_resource = defaultdict(int)
+    max_active_by_resource = defaultdict(int)
+    lock = threading.Lock()
+
+    def prove(invocation):
+        resources = tuple(
+            resource for resource, _limit in invocation.candidate.resources
+        )
+        with lock:
+            for resource in resources:
+                active_by_resource[resource] += 1
+                max_active_by_resource[resource] = max(
+                    max_active_by_resource[resource],
+                    active_by_resource[resource],
+                )
+        try:
+            rank = invocation.candidate.rank
+            if rank == 1:
+                assert leader_release.wait(2)
+                return False
+            if rank == 2:
+                hidden_started.set()
+                return False
+            if rank == 3:
+                lower_shared_started.set()
+                return True
+            unrelated_finished.set()
+            return True
+        finally:
+            with lock:
+                for resource in resources:
+                    active_by_resource[resource] -= 1
+
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0", "gpu-1"),
+        environments=(MATH, CODE),
+        proof_callable=prove,
+        checkpoint_revision="rev-a",
+    )
+    try:
+        plan = _plan(
+            "math-window",
+            MATH,
+            [
+                _candidate(1, prompt="same"),
+                _candidate(
+                    2,
+                    prompt="same",
+                    resources=(("operator-b", 2),),
+                ),
+                _candidate(
+                    3,
+                    prompt="other-shared",
+                    resources=(("operator-b", 2),),
+                ),
+                _candidate(
+                    4,
+                    prompt="other-free",
+                    resources=(("operator-c", 2),),
+                ),
+            ],
+            required=0,
+        )
+        handle = scheduler.submit(replace(plan, complete_all=True))
+
+        # The other slot remains productive, but it cannot overtake the hidden
+        # higher-ranked use of operator-b.
+        assert unrelated_finished.wait(2)
+        assert not lower_shared_started.is_set()
+
+        leader_release.set()
+        assert hidden_started.wait(2)
+        assert lower_shared_started.wait(2)
+        result = handle.result(2)
+
+        assert result.outcome is ProofPlanOutcome.COMPLETED
+        assert [decision.rank for decision in result.decisions] == [1, 2, 3, 4]
+        assert [decision.status for decision in result.decisions] == [
+            ProofDecisionStatus.REJECTED,
+            ProofDecisionStatus.REJECTED,
+            ProofDecisionStatus.PASSED,
+            ProofDecisionStatus.PASSED,
+        ]
+        assert max_active_by_resource["operator-b"] == 1
+    finally:
+        leader_release.set()
+        assert scheduler.close()
+
+
+def test_hidden_resource_failure_is_applied_before_lower_rank_dispatch():
+    """The deadlock fix must not weaken expensive failure-debt enforcement."""
+
+    leader_release = threading.Event()
+    lower_shared_started = threading.Event()
+    unrelated_finished = threading.Event()
+    invoked: list[str] = []
+
+    def prove(invocation):
+        invoked.append(invocation.candidate.job_id)
+        if invocation.candidate.rank == 1:
+            assert leader_release.wait(2)
+        if invocation.candidate.rank == 3:
+            lower_shared_started.set()
+        if invocation.candidate.rank == 4:
+            unrelated_finished.set()
+            return True
+        return False
+
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0", "gpu-1"),
+        environments=(MATH, CODE),
+        proof_callable=prove,
+        checkpoint_revision="rev-a",
+    )
+    try:
+        plan = _plan(
+            "math-window",
+            MATH,
+            [
+                _candidate(1, prompt="same"),
+                _candidate(
+                    2,
+                    prompt="same",
+                    resources=(("operator-b", 1),),
+                ),
+                _candidate(
+                    3,
+                    prompt="other",
+                    resources=(("operator-b", 1),),
+                ),
+                _candidate(
+                    4,
+                    prompt="other-free",
+                    resources=(("operator-c", 1),),
+                ),
+            ],
+            required=2,
+        )
+        handle = scheduler.submit(replace(plan, allow_shortfall=True))
+        # This proves the second worker has inspected the queue.  On the broken
+        # scheduler it dispatches rank 3 before rank 4, so the negative
+        # assertion below fails without relying on a timing-only sleep.
+        assert unrelated_finished.wait(2)
+        assert not lower_shared_started.is_set()
+        leader_release.set()
+        result = handle.result(2)
+
+        assert set(invoked) == {"job-1", "job-2", "job-4"}
+        assert not lower_shared_started.is_set()
+        assert result.decisions[2].status is (
+            ProofDecisionStatus.SKIPPED_RESOURCE_LIMIT
+        )
+        assert result.outcome is ProofPlanOutcome.COMPLETED
+        assert result.winner_job_ids == ("job-4",)
+    finally:
+        leader_release.set()
+        assert scheduler.close()
+
+
 def test_resource_failure_limit_skips_identity_and_promotes_other_operator():
     invoked = []
 
