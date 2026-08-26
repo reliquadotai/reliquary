@@ -1,8 +1,10 @@
 # Checkpoint-epoch scheduling prototype
 
-Status: experimental, disabled by default, and not production-ready. This
-prototype changes no current production profile or canonical contract. A future
-coordinated protocol/profile revision is required before activation.
+Status: experimental and disabled by default. The implementation is intended
+to be mergeable as an inactive capability, but it is not an activation-ready
+production protocol. This prototype changes no current production profile or
+canonical contract. A future coordinated protocol/profile revision is required
+before activation.
 
 ## Goals and non-goals
 
@@ -45,6 +47,10 @@ before OPEN, or add a production submission transport to the reference planner.
 availability. The common OPEN edge occurs once the validator is ready at or
 after that round.
 
+Generation preparation begins from the public manifest. Submission does not:
+all 16 lanes become OPEN in the same atomic routing change, and none is a
+future live window after that point.
+
 ## Canonical manifest and derivation
 
 The strict canonical JSON manifest and its SHA-256 bind:
@@ -55,6 +61,7 @@ The strict canonical JSON manifest and its SHA-256 bind:
 - drand source, chain, chain hash, exact round, and verified randomness;
 - first logical window and exact configured horizon;
 - common activation/warm-up and collection/timeout policy;
+- target groups and maximum admitted candidates per environment/lane;
 - `sequential_steps` or `aggregate_one_step` training mode;
 - every environment and dataset-universe size;
 - prompt-range width and explicit overlap policy;
@@ -103,6 +110,21 @@ state. Prepared payloads remain local until that check passes. Replaced, stale,
 or ambiguous work is quarantined and never replayed under another binding. The
 existing precommit/upload boundary, formatting, authenticity, grading, proof,
 duplicate, checkpoint, and forced-stream checks remain in force.
+
+Every lane targets `B_BATCH` selected groups. The experimental default admits
+at most `B_BATCH + B_BATCH / 2` productive candidates per environment/lane:
+16 targets plus an 8-candidate proof-failure reserve with the production value
+of `B_BATCH`. Both numbers are manifest-bound. This path therefore does not
+copy the current 64-candidate admission ceiling into each concurrent lane.
+The reserve is configurable for controlled qualification and must not be
+silently changed inside an epoch.
+
+The common collection defaults to the existing per-window collection duration
+multiplied by the checkpoint horizon. It never closes early. State advertises
+the exact duration, target, candidate limit, and best-effort remaining
+candidate capacity so planners can stop preparing a lane that no longer has
+validator demand. These bounds reduce admitted-but-unselected work; they do
+not claim that uncoordinated preparation can have zero discarded work.
 
 The local reference planner is bounded and has no submission transport. A
 backend-neutral callback may prepare token sequences, after which the existing
@@ -167,10 +189,14 @@ and proof-debt controls. This prototype introduces no epoch-wide cap and makes
 no claim that a per-hotkey quota is Sybil-resistant.
 
 Durable experimental state is deliberately small: one create-only intent, one
-create-only canonical manifest, one current pointer, and bounded local prepared
-work plus quarantine records. A checkpoint, profile, contract, epoch, or
-manifest change invalidates all unreleased work. Window-scoped counters remain
-separate for concurrent lanes.
+create-only canonical manifest, one current pointer, an activation marker, one
+terminal outcome, and bounded local prepared work plus quarantine records. An
+activated epoch is never reopened after restart. An interrupted epoch is
+retired and its unconsumed training journal entries are tombstoned; the
+validator requires a successor checkpoint before it can schedule another
+epoch. A checkpoint, profile, contract, epoch, or manifest change invalidates
+all unreleased work. Admission safety circuits share the one physical OPEN
+phase while prompt and duplicate accounting remains bound to exact lanes.
 
 ## Threat model and measurements
 
@@ -189,6 +215,23 @@ burned share, generated compute per selected group, accepted tokens per
 compute-hour, warm-up loss, operator concentration, prompt difficulty and
 diversity, common-OPEN ingress, and stale/discarded work.
 
+The configured capacity envelope has one deterministic property: at the
+default 24-candidate limit, at most eight admitted valid candidates can remain
+outside a full 16-group selection, versus 48 at a 64-candidate limit. This is a
+bound on validator-admitted candidates, not a measured claim about generation
+cost, profitability, or participation. The reserve should be reduced or
+increased only from observed proof-failure and underfill data.
+
+Reviewers can exercise the deterministic synthetic shape comparison with:
+
+```bash
+python3.12 scripts/simulate_checkpoint_epoch.py
+```
+
+Its JSON output states its assumptions and marks every field that requires
+authenticated operational telemetry. It is a capacity regression fixture, not
+an economic forecast.
+
 ## Rollout and rollback
 
 Rollout starts only in an isolated environment with the explicit capability
@@ -200,4 +243,7 @@ Rollback disables the capability, withdraws the read-only plan surface, and
 quarantines unreleased local work. Current profiles continue through their
 unchanged ordinary window path. Production activation additionally requires
 public intent consistency, recovery validation, capacity qualification, an
-explicit cutover, and an explicit rollback procedure.
+independent protocol and mechanism review, an explicit cutover, and an explicit
+rollback procedure. Review must confirm the common-OPEN admission behavior
+under representative load; merge of this inactive capability is not that
+confirmation.
