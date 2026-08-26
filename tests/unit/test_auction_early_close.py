@@ -374,3 +374,38 @@ def test_conservation_snapshot_does_not_deadlock_in_enforce(monkeypatch):
     thread.start()
     assert done.wait(5.0), "upload_precommit_conservation deadlocked"
     assert result[0]["early_close"]["refusing_precommits"] is True
+
+
+def test_the_close_waits_for_the_receipts_not_for_the_grace(monkeypatch):
+    """The grace is a ceiling, not a delay.
+
+    Measured on 5425 production receipts: a receipt resolves in 0.22 s at the
+    median, 5.5 s at p99, 12.0 s at the observed maximum — while the grace is
+    33 s. Waiting the grace out unconditionally would throw away most of the
+    saving for a bound that, in healthy operation, never binds. The seal must
+    fire the moment the last armed receipt resolves.
+    """
+    from reliquary.constants import SUBMISSION_UPLOAD_GRACE_SECONDS
+
+    b, advance = _clock_batcher("enforce", monkeypatch)
+    advance(25.0)
+    accepted, _reason, _ = b.try_register_upload_precommit(
+        "receipt-quick", "miner-quick",
+        t_arrival_wall=b.window_opened_wall_ts + 25.0,
+        payload_bytes=100,
+    )
+    assert accepted is True
+
+    _dominant(b)
+    assert b.poll_deadline() is False          # one receipt still armed
+    sealed_at_offset = None
+
+    # It resolves 2 s later — far inside a 33 s grace.
+    advance(2.0)
+    b._upload_precommits.pop("receipt-quick")
+    if b.poll_deadline():
+        sealed_at_offset = b._time_fn() - b.window_opened_at
+
+    assert sealed_at_offset == pytest.approx(27.0)
+    assert sealed_at_offset < 25.0 + SUBMISSION_UPLOAD_GRACE_SECONDS
+    assert b.early_close_sealed is True
