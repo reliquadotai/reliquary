@@ -821,10 +821,10 @@ class GrpoWindowBatcher:
                 else max_grading_starts
             )
         )
-        self.max_ranked_proof_attempts = int(
-            MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW
+        self._max_ranked_proof_attempts_override = (
+            None
             if max_ranked_proof_attempts is None
-            else max_ranked_proof_attempts
+            else int(max_ranked_proof_attempts)
         )
         if (
             not math.isfinite(self.collection_seconds)
@@ -1715,6 +1715,16 @@ class GrpoWindowBatcher:
     def candidate_capacity_used(self) -> int:
         """Started and reserved productive candidates for live demand telemetry."""
         return self._productive_capacity_used_locked()
+
+    @property
+    def max_ranked_proof_attempts(self) -> int:
+        """Use the profile global unless an epoch commits an explicit bound."""
+        override = self._max_ranked_proof_attempts_override
+        return (
+            MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW
+            if override is None
+            else override
+        )
 
     @staticmethod
     def _mark_grading_refundable(
