@@ -1001,11 +1001,9 @@ class GlobalProofScheduler:
                 return
             if (
                 state.attempts_started >= state.max_attempts
+                # RAW work may sit behind a PENDING prompt fallback. Once no
+                # calls remain active, the cap makes that blocker permanent.
                 and not state.active_job_ids
-                and not any(
-                    phase is _JobPhase.RAW
-                    for phase in state.phases.values()
-                )
             ):
                 self._abort_plan_locked(
                     state, CapacityAbortReason.ATTEMPT_LIMIT
@@ -1034,10 +1032,9 @@ class GlobalProofScheduler:
             return
         if (
             state.attempts_started >= state.max_attempts
+            # Do not wait for RAW to drain: rank-ordered application itself
+            # may be waiting on a PENDING job that the cap forbids dispatching.
             and not state.active_job_ids
-            and not any(
-                phase is _JobPhase.RAW for phase in state.phases.values()
-            )
         ):
             self._abort_plan_locked(
                 state, CapacityAbortReason.ATTEMPT_LIMIT

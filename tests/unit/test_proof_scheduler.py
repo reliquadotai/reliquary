@@ -938,6 +938,90 @@ def test_attempt_limit_aborts_partial_success_explicitly():
     assert result.attempts_started == 1
 
 
+@pytest.mark.parametrize("complete_all", [False, True])
+def test_attempt_limit_aborts_raw_behind_hidden_prompt_fallback(
+    complete_all: bool,
+):
+    leader_release = threading.Event()
+    leader_started = threading.Event()
+    invoked: list[str] = []
+
+    def prove(invocation):
+        invoked.append(invocation.candidate.job_id)
+        if invocation.candidate.rank == 1:
+            leader_started.set()
+            assert leader_release.wait(2)
+            return False
+        return True
+
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0", "gpu-1"),
+        environments=(MATH, CODE),
+        proof_callable=prove,
+        checkpoint_revision="rev-a",
+    )
+    try:
+        plan = _plan(
+            "math-window",
+            MATH,
+            [
+                _candidate(
+                    1,
+                    prompt="same",
+                    resources=(("operator-a", 2),),
+                ),
+                _candidate(
+                    2,
+                    prompt="same",
+                    resources=(("operator-b", 2),),
+                ),
+                _candidate(
+                    3,
+                    prompt="other",
+                    resources=(("operator-c", 2),),
+                ),
+            ],
+            required=0 if complete_all else 2,
+            max_attempts=2,
+        )
+        handle = scheduler.submit(
+            replace(plan, complete_all=complete_all)
+        )
+
+        # Rank 3 consumes the second attempt and settles out of order while
+        # rank 2 remains hidden behind the active same-prompt leader.
+        assert leader_started.wait(2)
+        _wait_until(
+            lambda: (
+                scheduler.snapshot()[
+                    "buffered_results_by_environment"
+                ][MATH]
+                == 1
+                and scheduler.snapshot()["active_resource_count"] == 2
+            )
+        )
+        leader_release.set()
+        result = handle.result(2)
+
+        assert set(invoked) == {"job-1", "job-3"}
+        assert result.outcome is ProofPlanOutcome.CAPACITY_ABORTED
+        assert result.abort_reason is CapacityAbortReason.ATTEMPT_LIMIT
+        assert result.attempts_started == 2
+        assert [decision.status for decision in result.decisions] == [
+            ProofDecisionStatus.REJECTED,
+            ProofDecisionStatus.CAPACITY_ABORTED,
+            ProofDecisionStatus.CAPACITY_ABORTED,
+        ]
+        assert result.decisions[1].device_id is None
+        assert result.decisions[2].device_id in {"gpu-0", "gpu-1"}
+        assert result.decisions[1].reason == "attempt_limit"
+        assert result.decisions[2].reason == "attempt_limit"
+        assert scheduler.snapshot()["active_resource_count"] == 0
+    finally:
+        leader_release.set()
+        assert scheduler.close()
+
+
 def test_proof_exception_faults_scheduler_without_promoting_lower_rank():
     invoked = []
 
