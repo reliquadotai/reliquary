@@ -8,6 +8,7 @@ import pytest
 from reliquary.shared.checkpoint_epoch import (
     BeaconBinding,
     CheckpointBinding,
+    EpochAdmissionCommitment,
     ProtocolBinding,
     WindowSchedule,
     build_epoch_plan,
@@ -16,6 +17,7 @@ from reliquary.shared.checkpoint_epoch import (
     derive_window_seed,
     manifest_sha256,
     parse_epoch_plan,
+    select_epoch_reveals,
 )
 
 
@@ -75,7 +77,7 @@ def test_manifest_is_canonical_deterministic_and_stable():
     assert canonical_manifest_bytes(first) == canonical_manifest_bytes(second)
     assert parse_epoch_plan(canonical_manifest_bytes(first)) == first
     assert manifest_sha256(first) == (
-        "4ffdaf7f0019c1e1cdc89010351de69ad2d196f0430d948aacff229383fe1f7f"
+        "40b49c6970a1df9d1fd77200112c7cce60bc914c1b4f9b01d1e5bf37d6156c50"
     )
     assert first.window_schedule.mode == "concurrent_checkpoint_epoch"
     assert first.training_mode == "sequential_steps"
@@ -150,6 +152,8 @@ def test_overlap_fallback_is_explicit_and_deterministic():
         },
         {"training_mode": "aggregate_one_step"},
         {"candidate_limit_per_environment_lane": 25},
+        {"commitments_per_operator_per_environment_lane": 17},
+        {"reveal_seconds": 61.0},
     ],
 )
 def test_manifest_bindings_change_hash(change):
@@ -178,6 +182,145 @@ def test_manifest_never_contains_seal_randomness():
     assert "seal_randomness" not in encoded
     assert "selection_randomness" not in encoded
     assert "auction_randomness" not in encoded
+    assert "admission_beacon" not in encoded
+
+
+def test_post_commit_selection_is_arrival_neutral_and_operator_rounded():
+    plan = _plan()
+    digest = manifest_sha256(plan)
+    commitments = [
+        EpochAdmissionCommitment(
+            commitment_id=f"commit-{operator}-{index}",
+            operator_id=operator,
+            window_number=plan.first_window,
+            environment="math",
+            prompt_idx=index,
+            payload_sha256=f"{index + 1:064x}",
+        )
+        for operator in ("alice", "bob", "carol")
+        for index in range(4)
+    ]
+    selected = select_epoch_reveals(
+        commitments,
+        admission_randomness="9" * 64,
+        epoch_id=plan.epoch_id,
+        manifest_sha256_hex=digest,
+        limit=6,
+        per_prompt_limit=10,
+    )
+    reversed_selected = select_epoch_reveals(
+        list(reversed(commitments)),
+        admission_randomness="9" * 64,
+        epoch_id=plan.epoch_id,
+        manifest_sha256_hex=digest,
+        limit=6,
+        per_prompt_limit=10,
+    )
+
+    assert selected == reversed_selected
+    assert len(selected) == 6
+    assert {
+        operator: sum(item.startswith(f"commit-{operator}-") for item in selected)
+        for operator in ("alice", "bob", "carol")
+    } == {"alice": 2, "bob": 2, "carol": 2}
+
+
+def test_post_commit_selection_applies_prompt_cap_deterministically():
+    plan = _plan()
+    commitments = [
+        EpochAdmissionCommitment(
+            commitment_id=f"commit-{index}",
+            operator_id=f"operator-{index}",
+            window_number=plan.first_window,
+            environment="math",
+            prompt_idx=7,
+            payload_sha256=f"{index + 1:064x}",
+        )
+        for index in range(8)
+    ]
+    selected = select_epoch_reveals(
+        commitments,
+        admission_randomness="8" * 64,
+        epoch_id=plan.epoch_id,
+        manifest_sha256_hex=manifest_sha256(plan),
+        limit=8,
+        per_prompt_limit=2,
+    )
+
+    assert len(selected) == 2
+
+
+def test_post_commit_selection_gives_one_ticket_per_operator_prompt():
+    plan = _plan()
+    commitments = [
+        EpochAdmissionCommitment(
+            commitment_id=f"commit-{index}",
+            operator_id="operator",
+            window_number=plan.first_window,
+            environment="math",
+            prompt_idx=7,
+            payload_sha256=f"{index + 1:064x}",
+        )
+        for index in range(4)
+    ]
+
+    selected = select_epoch_reveals(
+        commitments,
+        admission_randomness="8" * 64,
+        epoch_id=plan.epoch_id,
+        manifest_sha256_hex=manifest_sha256(plan),
+        limit=4,
+        per_prompt_limit=10,
+    )
+
+    assert len(selected) == 1
+
+
+def test_post_commit_selection_binds_operator_order_to_one_lane():
+    plan = _plan()
+    commitments = [
+        EpochAdmissionCommitment(
+            commitment_id=f"commit-{index}",
+            operator_id=f"operator-{index}",
+            window_number=plan.first_window,
+            environment="math",
+            prompt_idx=index,
+            payload_sha256=f"{index + 1:064x}",
+        )
+        for index in range(8)
+    ]
+    digest = manifest_sha256(plan)
+    selected = select_epoch_reveals(
+        commitments,
+        admission_randomness="7" * 64,
+        epoch_id=plan.epoch_id,
+        manifest_sha256_hex=digest,
+        limit=4,
+        per_prompt_limit=10,
+    )
+    next_lane = [
+        replace(item, window_number=plan.first_window + 1)
+        for item in commitments
+    ]
+    next_selected = select_epoch_reveals(
+        next_lane,
+        admission_randomness="7" * 64,
+        epoch_id=plan.epoch_id,
+        manifest_sha256_hex=digest,
+        limit=4,
+        per_prompt_limit=10,
+    )
+
+    assert selected != next_selected
+    with pytest.raises(ValueError, match="share one lane"):
+        select_epoch_reveals(
+            [commitments[0], next_lane[1]],
+            admission_randomness="7" * 64,
+            epoch_id=plan.epoch_id,
+            manifest_sha256_hex=digest,
+            limit=2,
+            per_prompt_limit=10,
+        )
 
 
 def test_training_mode_is_strict_and_bound_before_beacon():

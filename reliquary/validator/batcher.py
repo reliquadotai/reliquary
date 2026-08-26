@@ -723,6 +723,7 @@ class _UploadPrecommitReservation:
     operator: str
     deadline: float
     payload_bytes: int
+    upload_start_deadline_wall: float | None = None
     upload_started_at_wall: float | None = None
     body_completed_at_wall: float | None = None
     accounted_payload_bytes: int = 0
@@ -1379,6 +1380,53 @@ class GrpoWindowBatcher:
             )
             return True, None, deadline
 
+    def try_register_selected_epoch_reveal(
+        self,
+        receipt_id: str,
+        hotkey: str,
+        *,
+        payload_bytes: int,
+        reveal_deadline_wall: float,
+    ) -> tuple[bool, str | None, float | None]:
+        """Reserve upload capacity for a post-commit selected epoch reveal."""
+        if not self.experimental_epoch_ranking:
+            return False, "epoch_reveal_requires_experiment", None
+        now = self._time_fn()
+        remaining = float(reveal_deadline_wall) - time.time()
+        if remaining <= 0:
+            return False, "epoch_reveal_closed", None
+        with self._upload_precommit_lock:
+            self._prune_upload_precommits_locked(now)
+            if self._seal_flag.is_set() or self._seal_snapshot_started:
+                return False, "collection_sealed", None
+            operator = self._operator_for_hotkey(hotkey)
+            if operator is None:
+                return False, "precommit_operator_unmapped", None
+            if sum(
+                reservation.hotkey == hotkey
+                for reservation in self._upload_precommits.values()
+            ) >= MAX_PENDING_UPLOAD_PRECOMMITS_PER_HOTKEY:
+                return False, "precommit_hotkey_active_full", None
+            if sum(
+                reservation.operator == operator
+                for reservation in self._upload_precommits.values()
+            ) >= MAX_PENDING_UPLOAD_PRECOMMITS_PER_OPERATOR:
+                return False, "precommit_operator_active_full", None
+            deadline = now + remaining
+            self._upload_precommits[receipt_id] = _UploadPrecommitReservation(
+                hotkey=hotkey,
+                operator=operator,
+                deadline=deadline,
+                payload_bytes=payload_bytes,
+                upload_start_deadline_wall=float(reveal_deadline_wall),
+            )
+            self._upload_precommit_accepted += 1
+            self._upload_precommit_peak_pending = max(
+                self._upload_precommit_peak_pending,
+                len(self._upload_precommits),
+            )
+            return True, None, deadline
+
     def account_upload_precommit_bytes(
         self,
         receipt_id: str,
@@ -1401,10 +1449,12 @@ class GrpoWindowBatcher:
             if reservation is None:
                 return False, "upload_precommit_missing"
             if reservation.upload_started_at_wall is None:
-                if (
-                    float(t_arrival_wall)
-                    > self.window_opened_wall_ts + self.collection_seconds
-                ):
+                upload_start_deadline = (
+                    reservation.upload_start_deadline_wall
+                    if reservation.upload_start_deadline_wall is not None
+                    else self.window_opened_wall_ts + self.collection_seconds
+                )
+                if float(t_arrival_wall) > upload_start_deadline:
                     return False, "upload_started_after_collection"
                 reservation.upload_started_at_wall = float(t_arrival_wall)
             if reservation.accounted_payload_bytes + added > reservation.payload_bytes:

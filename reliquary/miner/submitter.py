@@ -23,6 +23,7 @@ from reliquary.protocol.signatures import sign_envelope, sign_precommit
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     BatchSubmissionResponse,
+    EpochCommitmentStatus,
     GrpoBatchState,
     RejectReason,
     RuntimeContract,
@@ -32,6 +33,8 @@ from reliquary.protocol.submission import (
 from reliquary.shared.checkpoint_epoch import (
     CHECKPOINT_EPOCH_CAPABILITY_ID,
     EpochPlan,
+    generation_contract_sha256,
+    manifest_sha256,
     parse_epoch_plan,
 )
 from reliquary.shared.runtime_fingerprint import bind_runtime_profile_nonce
@@ -554,6 +557,136 @@ async def get_window_state_v2(
         state_url, GrpoBatchState,
         client=client, timeout=timeout,
     )
+
+
+async def post_checkpoint_epoch_commitment_v1(
+    url: str,
+    commitment: SubmissionPrecommitRequest,
+    *,
+    client: httpx.AsyncClient | None = None,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> SubmissionPrecommitResponse:
+    """Post only the compact signed commitment; never upload its payload."""
+    own_client = client is None
+    http = client or httpx.AsyncClient(timeout=timeout)
+    try:
+        response = await http.post(
+            f"{url}/submit/precommit",
+            content=commitment.model_dump_json().encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            timeout=timeout,
+        )
+        if response.status_code >= 400:
+            raise SubmissionError(
+                f"commitment HTTP {response.status_code}: {_safe_detail(response)}"
+            )
+        result = SubmissionPrecommitResponse.model_validate(response.json())
+        if result.accepted and not result.receipt_id:
+            raise SubmissionError("accepted commitment omitted receipt_id")
+        return result
+    finally:
+        if own_client:
+            await http.aclose()
+
+
+async def get_checkpoint_epoch_commitment_status_v1(
+    url: str,
+    receipt_id: str,
+    *,
+    client: httpx.AsyncClient | None = None,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> EpochCommitmentStatus:
+    return await _get_with_retry(
+        f"{url}/checkpoint-epoch/commitments/{quote(receipt_id, safe='')}",
+        EpochCommitmentStatus,
+        client=client,
+        timeout=timeout,
+    )
+
+
+async def reveal_checkpoint_epoch_payload_v1(
+    url: str,
+    *,
+    receipt_id: str,
+    payload: bytes,
+    plan: EpochPlan,
+    client: httpx.AsyncClient | None = None,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> BatchSubmissionResponse:
+    """Reveal one locally retained payload after selection authorizes it."""
+    own_client = client is None
+    http = client or httpx.AsyncClient(timeout=timeout)
+    try:
+        request = BatchSubmissionRequest.model_validate_json(payload)
+        environments = {rollout.env_name for rollout in request.rollouts}
+        if len(environments) != 1:
+            raise SubmissionError("epoch reveal payload has mixed environments")
+        environment = next(iter(environments))
+        state = await get_window_state_v2(
+            url,
+            env=environment,
+            window=request.window_start,
+            client=http,
+            timeout=timeout,
+        )
+        offset = request.window_start - plan.first_window
+        if offset < 0 or offset >= plan.window_count:
+            raise SubmissionError("epoch reveal window is outside the plan")
+        epoch_window = plan.windows[offset]
+        slices = {
+            item.environment: item for item in epoch_window.prompt_slices
+        }
+        prompt_slice = slices.get(environment)
+        state_contract = state.generation_contract or {}
+        exact_state = (
+            state.state.value == "open"
+            and state.checkpoint_epoch_phase == "reveal"
+            and state.checkpoint_epoch_id == plan.epoch_id
+            and state.checkpoint_epoch_manifest_sha256 == manifest_sha256(plan)
+            and state.window_n == request.window_start
+            and state.checkpoint_n == plan.checkpoint.number
+            and state.checkpoint_repo_id == plan.checkpoint.repo_id
+            and state.checkpoint_revision == request.checkpoint_hash
+            == plan.checkpoint.revision
+            and state.protocol_version == plan.protocol.protocol_version
+            and state.generation_profile_id == plan.protocol.profile_id
+            and generation_contract_sha256(state_contract)
+            == plan.protocol.generation_contract_sha256
+            and state.randomness == epoch_window.generation_randomness
+            and request.prompt_idx not in state.cooldown_prompts
+            and prompt_slice is not None
+            and prompt_slice.start <= request.prompt_idx < prompt_slice.stop
+        )
+        if not exact_state:
+            raise SubmissionError("live state no longer matches epoch reveal binding")
+        status = await get_checkpoint_epoch_commitment_status_v1(
+            url,
+            receipt_id,
+            client=http,
+            timeout=timeout,
+        )
+        if status.status != "selected":
+            return BatchSubmissionResponse(
+                accepted=False,
+                reason=RejectReason.REVEAL_NOT_SELECTED,
+            )
+        response = await http.post(
+            f"{url}/submit",
+            content=payload,
+            headers={
+                "Content-Type": "application/json",
+                _PRECOMMIT_HEADER: receipt_id,
+            },
+            timeout=timeout,
+        )
+        if response.status_code >= 400:
+            raise SubmissionError(
+                f"reveal HTTP {response.status_code}: {_safe_detail(response)}"
+            )
+        return BatchSubmissionResponse.model_validate(response.json())
+    finally:
+        if own_client:
+            await http.aclose()
 
 
 async def get_runtime_contract_v1(

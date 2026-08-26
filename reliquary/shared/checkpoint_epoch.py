@@ -14,10 +14,11 @@ import math
 from typing import Any, Mapping, Sequence
 
 
-CHECKPOINT_EPOCH_SCHEMA_VERSION = 3
-CHECKPOINT_EPOCH_CAPABILITY_ID = "checkpoint-epoch-scheduling-v3"
+CHECKPOINT_EPOCH_SCHEMA_VERSION = 4
+CHECKPOINT_EPOCH_CAPABILITY_ID = "checkpoint-epoch-scheduling-v4"
 CHECKPOINT_EPOCH_REQUIRED_WINDOW_COUNT = 16
 CHECKPOINT_EPOCH_SCHEDULE_MODE = "concurrent_checkpoint_epoch"
+CHECKPOINT_EPOCH_ADMISSION_POLICY = "post_commit_operator_rounds_v1"
 CHECKPOINT_EPOCH_TRAINING_MODES = frozenset({
     "aggregate_one_step",
     "sequential_steps",
@@ -27,6 +28,8 @@ _ID_DOMAIN = b"reliquary/checkpoint-epoch/id/v1"
 _ROOT_DOMAIN = b"reliquary/checkpoint-epoch/root/v1"
 _WINDOW_DOMAIN = b"reliquary/checkpoint-epoch/window/v1"
 _SLICE_DOMAIN = b"reliquary/checkpoint-epoch/slice/v1"
+_ADMISSION_OPERATOR_DOMAIN = b"reliquary/checkpoint-epoch/admission-operator/v1"
+_ADMISSION_COMMITMENT_DOMAIN = b"reliquary/checkpoint-epoch/admission-commitment/v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,9 +98,149 @@ class EpochPlan:
     prompt_range_size: int
     target_groups_per_environment_lane: int
     candidate_limit_per_environment_lane: int
+    admission_policy: str
+    commitments_per_operator_per_environment_lane: int
+    reveal_seconds: float
     epoch_id: str
     epoch_seed: str
     windows: tuple[EpochWindow, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class EpochAdmissionCommitment:
+    """Public, compact input to post-commit reveal selection."""
+
+    commitment_id: str
+    operator_id: str
+    window_number: int
+    environment: str
+    prompt_idx: int
+    payload_sha256: str
+
+
+def select_epoch_reveals(
+    commitments: Sequence[EpochAdmissionCommitment],
+    *,
+    admission_randomness: str,
+    epoch_id: str,
+    manifest_sha256_hex: str,
+    limit: int,
+    per_prompt_limit: int,
+) -> tuple[str, ...]:
+    """Select a bounded reveal cohort without using commitment arrival time.
+
+    Operators are shuffled from the post-commit beacon, then visited in rounds.
+    Each round can contribute at most one commitment per operator. Commitments
+    within an operator are independently shuffled from the same beacon.
+    """
+    _require_hex64("admission_randomness", admission_randomness)
+    _require_hex64("epoch_id", epoch_id)
+    _require_hex64("manifest_sha256_hex", manifest_sha256_hex)
+    limit = _require_int("limit", limit, minimum=1)
+    per_prompt_limit = _require_int(
+        "per_prompt_limit", per_prompt_limit, minimum=1
+    )
+    by_operator: dict[str, list[EpochAdmissionCommitment]] = {}
+    seen: set[str] = set()
+    lane: tuple[int, str] | None = None
+    for commitment in commitments:
+        if not isinstance(commitment, EpochAdmissionCommitment):
+            raise TypeError("commitments must contain EpochAdmissionCommitment")
+        _require_text("commitment_id", commitment.commitment_id)
+        _require_text("operator_id", commitment.operator_id)
+        _require_int("window_number", commitment.window_number, minimum=0)
+        _require_text("environment", commitment.environment)
+        _require_int("prompt_idx", commitment.prompt_idx, minimum=0)
+        _require_hex64("payload_sha256", commitment.payload_sha256)
+        if commitment.commitment_id in seen:
+            raise ValueError("duplicate epoch admission commitment")
+        commitment_lane = (commitment.window_number, commitment.environment)
+        if lane is None:
+            lane = commitment_lane
+        elif commitment_lane != lane:
+            raise ValueError("epoch admission commitments must share one lane")
+        seen.add(commitment.commitment_id)
+        by_operator.setdefault(commitment.operator_id, []).append(commitment)
+
+    beacon = bytes.fromhex(admission_randomness)
+    epoch = bytes.fromhex(epoch_id)
+    manifest = bytes.fromhex(manifest_sha256_hex)
+
+    def operator_key(operator_id: str) -> str:
+        if lane is None:
+            raise AssertionError("operator key requires a lane")
+        return _frame_hash(
+            _ADMISSION_OPERATOR_DOMAIN,
+            beacon,
+            epoch,
+            manifest,
+            canonical_json_bytes({
+                "environment": lane[1],
+                "window_number": lane[0],
+            }),
+            operator_id.encode("utf-8"),
+        )
+
+    def commitment_key(commitment: EpochAdmissionCommitment) -> str:
+        return _frame_hash(
+            _ADMISSION_COMMITMENT_DOMAIN,
+            beacon,
+            epoch,
+            manifest,
+            canonical_json_bytes({
+                "commitment_id": commitment.commitment_id,
+                "environment": commitment.environment,
+                "operator_id": commitment.operator_id,
+                "payload_sha256": commitment.payload_sha256,
+                "prompt_idx": commitment.prompt_idx,
+                "window_number": commitment.window_number,
+            }),
+        )
+
+    operators = sorted(by_operator, key=lambda value: (operator_key(value), value))
+    queues = {
+        operator: sorted(
+            by_operator[operator],
+            key=lambda value: (commitment_key(value), value.commitment_id),
+        )
+        for operator in operators
+    }
+    selected: list[str] = []
+    prompt_counts: dict[tuple[int, str, int], int] = {}
+    selected_operator_prompts: set[tuple[str, int]] = set()
+    round_index = 0
+    while len(selected) < limit:
+        added = False
+        for operator in operators:
+            queue = queues[operator]
+            while round_index < len(queue):
+                candidate = queue[round_index]
+                prompt_key = (
+                    candidate.window_number,
+                    candidate.environment,
+                    candidate.prompt_idx,
+                )
+                operator_prompt = (
+                    candidate.operator_id,
+                    candidate.prompt_idx,
+                )
+                if (
+                    prompt_counts.get(prompt_key, 0) >= per_prompt_limit
+                    or operator_prompt in selected_operator_prompts
+                ):
+                    queue.pop(round_index)
+                    continue
+                selected.append(candidate.commitment_id)
+                prompt_counts[prompt_key] = prompt_counts.get(prompt_key, 0) + 1
+                selected_operator_prompts.add(operator_prompt)
+                added = True
+                break
+            if len(selected) >= limit:
+                break
+        if not added:
+            break
+        round_index += 1
+    return tuple(selected)
 
 
 def _json_native(value: Any) -> Any:
@@ -193,6 +336,9 @@ def _intent_dict(
     prompt_range_size: int,
     target_groups_per_environment_lane: int,
     candidate_limit_per_environment_lane: int,
+    admission_policy: str,
+    commitments_per_operator_per_environment_lane: int,
+    reveal_seconds: float,
     environment_universes: Mapping[str, int],
 ) -> dict[str, Any]:
     return {
@@ -220,6 +366,11 @@ def _intent_dict(
         "candidate_limit_per_environment_lane": (
             candidate_limit_per_environment_lane
         ),
+        "admission_policy": admission_policy,
+        "commitments_per_operator_per_environment_lane": (
+            commitments_per_operator_per_environment_lane
+        ),
+        "reveal_seconds": reveal_seconds,
         "environment_universes": {
             name: int(environment_universes[name])
             for name in sorted(environment_universes)
@@ -242,6 +393,9 @@ def derive_epoch_id(
     prompt_range_size: int,
     target_groups_per_environment_lane: int,
     candidate_limit_per_environment_lane: int,
+    admission_policy: str = CHECKPOINT_EPOCH_ADMISSION_POLICY,
+    commitments_per_operator_per_environment_lane: int = 16,
+    reveal_seconds: float = 60.0,
     environment_universes: Mapping[str, int],
 ) -> str:
     intent = _intent_dict(
@@ -262,6 +416,11 @@ def derive_epoch_id(
         candidate_limit_per_environment_lane=(
             candidate_limit_per_environment_lane
         ),
+        admission_policy=admission_policy,
+        commitments_per_operator_per_environment_lane=(
+            commitments_per_operator_per_environment_lane
+        ),
+        reveal_seconds=reveal_seconds,
         environment_universes=environment_universes,
     )
     return _frame_hash(_ID_DOMAIN, canonical_json_bytes(intent))
@@ -390,6 +549,9 @@ def build_epoch_plan(
     target_groups_per_environment_lane: int,
     candidate_limit_per_environment_lane: int,
     environment_universes: Mapping[str, int],
+    admission_policy: str = CHECKPOINT_EPOCH_ADMISSION_POLICY,
+    commitments_per_operator_per_environment_lane: int = 16,
+    reveal_seconds: float = 60.0,
     experimental_capability_id: str = CHECKPOINT_EPOCH_CAPABILITY_ID,
 ) -> EpochPlan:
     _validate_protocol(protocol)
@@ -423,6 +585,16 @@ def build_epoch_plan(
         candidate_limit_per_environment_lane,
         minimum=target_groups_per_environment_lane,
     )
+    if admission_policy != CHECKPOINT_EPOCH_ADMISSION_POLICY:
+        raise ValueError("unsupported checkpoint epoch admission policy")
+    commitments_per_operator_per_environment_lane = _require_int(
+        "commitments_per_operator_per_environment_lane",
+        commitments_per_operator_per_environment_lane,
+        minimum=1,
+    )
+    reveal_seconds = _require_number(
+        "reveal_seconds", reveal_seconds, minimum=0.001
+    )
     universes = _validate_environment_universes(environment_universes)
 
     epoch_id = derive_epoch_id(
@@ -443,6 +615,11 @@ def build_epoch_plan(
         candidate_limit_per_environment_lane=(
             candidate_limit_per_environment_lane
         ),
+        admission_policy=admission_policy,
+        commitments_per_operator_per_environment_lane=(
+            commitments_per_operator_per_environment_lane
+        ),
+        reveal_seconds=reveal_seconds,
         environment_universes=universes,
     )
     epoch_seed = derive_epoch_seed(epoch_id=epoch_id, epoch_beacon=epoch_beacon)
@@ -491,6 +668,11 @@ def build_epoch_plan(
         candidate_limit_per_environment_lane=(
             candidate_limit_per_environment_lane
         ),
+        admission_policy=admission_policy,
+        commitments_per_operator_per_environment_lane=(
+            commitments_per_operator_per_environment_lane
+        ),
+        reveal_seconds=reveal_seconds,
         epoch_id=epoch_id,
         epoch_seed=epoch_seed,
         windows=windows,
@@ -518,6 +700,11 @@ def epoch_plan_to_dict(plan: EpochPlan) -> dict[str, Any]:
         "candidate_limit_per_environment_lane": (
             plan.candidate_limit_per_environment_lane
         ),
+        "admission_policy": plan.admission_policy,
+        "commitments_per_operator_per_environment_lane": (
+            plan.commitments_per_operator_per_environment_lane
+        ),
+        "reveal_seconds": plan.reveal_seconds,
         "epoch_id": plan.epoch_id,
         "epoch_seed": plan.epoch_seed,
         "windows": [
@@ -581,6 +768,9 @@ def parse_epoch_plan(
             "prompt_range_size",
             "target_groups_per_environment_lane",
             "candidate_limit_per_environment_lane",
+            "admission_policy",
+            "commitments_per_operator_per_environment_lane",
+            "reveal_seconds",
             "epoch_id",
             "epoch_seed",
             "windows",
@@ -690,6 +880,11 @@ def parse_epoch_plan(
         candidate_limit_per_environment_lane=(
             obj["candidate_limit_per_environment_lane"]
         ),
+        admission_policy=obj["admission_policy"],
+        commitments_per_operator_per_environment_lane=(
+            obj["commitments_per_operator_per_environment_lane"]
+        ),
+        reveal_seconds=obj["reveal_seconds"],
         epoch_id=obj["epoch_id"],
         epoch_seed=obj["epoch_seed"],
         windows=tuple(windows),
@@ -736,6 +931,11 @@ def validate_epoch_plan(
         candidate_limit_per_environment_lane=(
             plan.candidate_limit_per_environment_lane
         ),
+        admission_policy=plan.admission_policy,
+        commitments_per_operator_per_environment_lane=(
+            plan.commitments_per_operator_per_environment_lane
+        ),
+        reveal_seconds=plan.reveal_seconds,
         environment_universes=environment_universes,
         experimental_capability_id=plan.experimental_capability_id,
     )
@@ -902,11 +1102,13 @@ def _validate_environment_universes(
 __all__ = [
     "BeaconBinding",
     "CHECKPOINT_EPOCH_CAPABILITY_ID",
+    "CHECKPOINT_EPOCH_ADMISSION_POLICY",
     "CHECKPOINT_EPOCH_REQUIRED_WINDOW_COUNT",
     "CHECKPOINT_EPOCH_SCHEDULE_MODE",
     "CHECKPOINT_EPOCH_SCHEMA_VERSION",
     "CHECKPOINT_EPOCH_TRAINING_MODES",
     "CheckpointBinding",
+    "EpochAdmissionCommitment",
     "EpochPlan",
     "EpochWindow",
     "PromptSlice",
@@ -923,5 +1125,6 @@ __all__ = [
     "generation_contract_sha256",
     "manifest_sha256",
     "parse_epoch_plan",
+    "select_epoch_reveals",
     "validate_epoch_plan",
 ]

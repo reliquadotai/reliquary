@@ -14,15 +14,19 @@ from reliquary.miner.submitter import (
     NoValidatorFoundError,
     SubmissionError,
     discover_validator_url,
+    get_checkpoint_epoch_commitment_status_v1,
     get_checkpoint_epoch_plan_v1,
     get_runtime_contract_v1,
     get_window_state_v2,
+    post_checkpoint_epoch_commitment_v1,
+    reveal_checkpoint_epoch_payload_v1,
     submit_batch_v2,
 )
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     BatchSubmissionResponse,
     GrpoBatchState,
+    SubmissionPrecommitRequest,
     RejectReason,
     RolloutSubmission,
     RuntimeContract,
@@ -564,7 +568,7 @@ async def test_get_runtime_contract_v1_uses_separate_capability_endpoint(
     await client.aclose()
 
 
-def _checkpoint_epoch_plan_fixture():
+def _checkpoint_epoch_plan_fixture(environment: str = "math"):
     return build_epoch_plan(
         protocol=ProtocolBinding(
             profile_id="experimental-fixture",
@@ -598,9 +602,117 @@ def _checkpoint_epoch_plan_fixture():
         training_mode="sequential_steps",
         target_groups_per_environment_lane=16,
         candidate_limit_per_environment_lane=24,
-        environment_universes={"math": 100},
+        environment_universes={environment: 100},
         prompt_range_size=8,
     )
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_epoch_commitment_client_never_uploads_payload(
+    monkeypatch,
+):
+    calls = []
+    commitment = SubmissionPrecommitRequest(
+        miner_hotkey="hotkey",
+        prompt_idx=3,
+        window_start=80,
+        merkle_root="0" * 64,
+        checkpoint_hash="a" * 40,
+        environment="math",
+        payload_bytes=123,
+        payload_sha256="1" * 64,
+        drand_round=7,
+        protocol_version=600,
+        generation_profile_id="experimental-fixture",
+        nonce="nonce",
+        precommit_signature="aa",
+    )
+
+    async def _post(self, url, content=None, headers=None, timeout=None):
+        calls.append(url)
+        return httpx.Response(200, json={
+            "accepted": True,
+            "reason": RejectReason.ACCEPTED.value,
+            "receipt_id": "receipt",
+            "upload_deadline_ts": None,
+        })
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _post)
+    client = httpx.AsyncClient()
+    response = await post_checkpoint_epoch_commitment_v1(
+        "http://fake", commitment, client=client
+    )
+
+    assert response.receipt_id == "receipt"
+    assert calls == ["http://fake/submit/precommit"]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_epoch_reveal_client_refuses_unselected_payload(monkeypatch):
+    plan = _checkpoint_epoch_plan_fixture("openmathinstruct")
+    prompt_idx = plan.windows[0].prompt_slices[0].start
+    request = BatchSubmissionRequest(
+        miner_hotkey="hotkey",
+        prompt_idx=prompt_idx,
+        window_start=plan.first_window,
+        merkle_root="0" * 64,
+        rollouts=_rollouts(),
+        checkpoint_hash=plan.checkpoint.revision,
+        protocol_version=plan.protocol.protocol_version,
+        generation_profile_id=plan.protocol.profile_id,
+    )
+    state = GrpoBatchState(
+        state=WindowState.OPEN,
+        window_n=plan.first_window,
+        anchor_block=plan.first_window,
+        cooldown_prompts=[],
+        valid_submissions=0,
+        checkpoint_n=plan.checkpoint.number,
+        checkpoint_repo_id=plan.checkpoint.repo_id,
+        checkpoint_revision=plan.checkpoint.revision,
+        protocol_version=plan.protocol.protocol_version,
+        generation_profile_id=plan.protocol.profile_id,
+        generation_contract={"fixture": True},
+        checkpoint_epoch_id=plan.epoch_id,
+        checkpoint_epoch_manifest_sha256=manifest_sha256(plan),
+        checkpoint_epoch_phase="reveal",
+        randomness=plan.windows[0].generation_randomness,
+    )
+    posts = []
+
+    async def _get(self, url, timeout=None):
+        if "/state?" in url:
+            return httpx.Response(200, json=state.model_dump(mode="json"))
+        return httpx.Response(200, json={
+            "receipt_id": "receipt",
+            "status": "not_selected",
+            "admission_beacon_round": 120,
+            "reveal_deadline_ts": None,
+        })
+
+    async def _post(self, url, **kwargs):
+        posts.append(url)
+        raise AssertionError("unselected payload must not be posted")
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", _get)
+    monkeypatch.setattr(httpx.AsyncClient, "post", _post)
+    client = httpx.AsyncClient()
+    response = await reveal_checkpoint_epoch_payload_v1(
+        "http://fake",
+        receipt_id="receipt",
+        payload=request.model_dump_json().encode("utf-8"),
+        plan=plan,
+        client=client,
+    )
+
+    assert response.reason is RejectReason.REVEAL_NOT_SELECTED
+    assert posts == []
+    status = await get_checkpoint_epoch_commitment_status_v1(
+        "http://fake", "receipt", client=client
+    )
+    assert status.status == "not_selected"
+    await client.aclose()
 
 
 @pytest.mark.asyncio

@@ -36,12 +36,21 @@ before OPEN, or add a production submission transport to the reference planner.
    warm-up.
 6. At activation, every `(environment, logical window)` lane is installed in
    one routing swap. Every batcher receives the same exact monotonic and wall
-   clock OPEN timestamp and therefore the same collection deadline.
-7. The routes close together. One fresh public beacon obtained only after the
-   common deadline supplies final equal-value ordering.
-8. Lanes seal in deterministic offset order into the usable-group reservoir.
-9. The manifest-bound training mode consumes the reservoir. Only after that
-   may the next checkpoint be published.
+   clock OPEN timestamp and therefore the same commitment deadline.
+7. Miners retain generated payloads locally and send only their signed compact
+   commitments during the common commitment phase.
+8. After that phase closes, the validator drains the bounded compact requests
+   already at ingress before obtaining fresh public beacon A. That beacon
+   deterministically selects a bounded reveal cohort without using commitment
+   arrival time. Selection visits the canonical operator identities in
+   deterministic rounds.
+9. Only selected commitments may upload their exact committed payload during
+   the manifest-bound reveal interval. The validator then freezes and drains
+   those reveals.
+10. Fresh public beacon B is obtained only after the reveal interval. It is
+    distinct from beacon A and supplies final equal-value ordering.
+11. Lanes seal in deterministic offset order into the usable-group reservoir,
+    which the manifest-bound training mode then consumes.
 
 `activation_not_before_round` is a lower bound, not a prediction of local
 availability. The common OPEN edge occurs once the validator is ready at or
@@ -61,7 +70,9 @@ The strict canonical JSON manifest and its SHA-256 bind:
 - drand source, chain, chain hash, exact round, and verified randomness;
 - first logical window and exact configured horizon;
 - common activation/warm-up and collection/timeout policy;
-- target groups and maximum admitted candidates per environment/lane;
+- target groups and maximum selected reveals per environment/lane;
+- compact-commitment operator bound, arrival-neutral selection policy, and
+  reveal duration;
 - `sequential_steps` or `aggregate_one_step` training mode;
 - every environment and dataset-universe size;
 - prompt-range width and explicit overlap policy;
@@ -98,33 +109,41 @@ is the strongest locally verifiable commit-before-beacon rule available here;
 it is not a public proof of prior commitment. Public signed intent publication
 and consistency observation remain production gates.
 
-## Concurrent collection and miner release
+## Concurrent commitment, selection, and reveal
 
 The 16 entries are logical lanes inside one physical OPEN phase; they do not
 open one after another. A miner queries
 `/state?env=<name>&window=<number>` for each lane it intends to release.
 
-Release requires exact agreement on checkpoint, epoch ID, manifest hash,
-profile, contract, logical window, generation seed, prompt slice, and OPEN
-state. Prepared payloads remain local until that check passes. Replaced, stale,
+Preparing work does not send its payload. During the commitment phase the miner
+submits the existing signed precommit envelope, which binds the exact serialized
+payload hash, size, prompt, lane, checkpoint, profile, and generation inputs.
+The validator stores that compact object without reserving proof or grading
+capacity. A payload sent before selection is refused.
+
+After beacon A, miners poll the narrow commitment-status endpoint. A selected
+commitment receives one bounded reveal deadline; a non-selected commitment
+cannot upload. Immediately before reveal, the miner rechecks exact OPEN and
+reveal phase plus checkpoint, epoch ID, manifest hash, profile, contract,
+logical window, generation seed, prompt slice, and cooldown. Replaced, stale,
 or ambiguous work is quarantined and never replayed under another binding. The
-existing precommit/upload boundary, formatting, authenticity, grading, proof,
-duplicate, checkpoint, and forced-stream checks remain in force.
+existing formatting, authenticity, grading, proof, duplicate, checkpoint, and
+forced-stream checks remain in force.
 
-Every lane targets `B_BATCH` selected groups. The experimental default admits
-at most `B_BATCH + B_BATCH / 2` productive candidates per environment/lane:
-16 targets plus an 8-candidate proof-failure reserve with the production value
-of `B_BATCH`. Both numbers are manifest-bound. This path therefore does not
-copy the current 64-candidate admission ceiling into each concurrent lane.
-The reserve is configurable for controlled qualification and must not be
-silently changed inside an epoch.
+Every lane targets `B_BATCH` selected groups. The experimental default chooses
+at most `B_BATCH + B_BATCH / 2` payload reveals per environment/lane: 16 targets
+plus an 8-candidate proof-failure reserve with the production value of
+`B_BATCH`. The limit is applied only after the commitment phase and therefore
+does not create a first-arrival pool. The reveal bound and compact-commitment
+bound are manifest-bound and cannot change within an epoch.
 
-The common collection defaults to the existing per-window collection duration
+The common commitment phase defaults to the existing per-window duration
 multiplied by the checkpoint horizon. It never closes early. State advertises
-the exact duration, target, candidate limit, and best-effort remaining
-candidate capacity so planners can stop preparing a lane that no longer has
-validator demand. These bounds reduce admitted-but-unselected work; they do
-not claim that uncoordinated preparation can have zero discarded work.
+the exact phase, durations, target, and selected reveal limit. Compact
+commitments are bounded per canonical operator and lane. This controls validator
+work without claiming that uncoordinated local preparation has zero discarded
+work. Selection also grants at most one reveal ticket per operator and prompt
+inside a lane.
 
 The local reference planner is bounded and has no submission transport. A
 backend-neutral callback may prepare token sequences, after which the existing
@@ -173,20 +192,24 @@ whole epoch and publish at most one successor checkpoint after completion.
 The advance plan contains generation randomness only. It never contains or
 derives seal, auction, or final tie-break randomness.
 
-After the common collection deadline, a fresh verified beacon orders candidates
-that are equal on validator-authoritative utility/difficulty. Experimental
-epoch ranking does not use generation completion, throughput, upload, or
-arrival time. The production ranking path is unchanged when the experiment is
-disabled.
+Beacon A is obtained after compact commitments are frozen and controls only
+which bounded cohort may reveal. Beacon B is obtained after reveals are frozen
+and orders candidates that are equal on validator-authoritative
+utility/difficulty. Neither selection uses generation completion, throughput,
+upload, or arrival time. The production ranking path is unchanged when the
+experiment is disabled.
 
 The prototype retains the current selected-slot reward model and burn
 accounting. It does not introduce payment for unselected work.
 
 ## Identity, quotas, persistence, and invalidation
 
-Existing canonical operator identity remains available to existing duplicate
-and proof-debt controls. This prototype introduces no epoch-wide cap and makes
-no claim that a per-hotkey quota is Sybil-resistant.
+The commitment bound and round-based reveal selection reuse the repository's
+canonical operator mapping; they do not invent an identity from hotkeys. This
+prototype does not claim that the mapping makes participation Sybil-resistant.
+The compact commitment set remains validator-local in this vertical slice.
+Selection is reproducible from that set and beacon A, while cross-observer
+completeness requires a future public consistency surface.
 
 Durable experimental state is deliberately small: one create-only intent, one
 create-only canonical manifest, one current pointer, an activation marker, one
@@ -204,7 +227,7 @@ Production review must cover checkpoint grinding, advance cherry-picking,
 prompt-distribution bias, multi-identity flooding, common-OPEN request bursts,
 stale work, and manifest equivocation. The prototype addresses these at the
 protocol boundary through commit-before-beacon ordering, canonical immutable
-bindings, distinct generation and post-close selection randomness, exact-lane
+bindings, distinct generation, admission, and final-order beacons, exact-lane
 routing, bounded local queues, final cooldown checks, and create-only storage.
 It does not claim that those controls replace public consistency or operational
 capacity validation.
@@ -216,11 +239,11 @@ compute-hour, warm-up loss, operator concentration, prompt difficulty and
 diversity, common-OPEN ingress, and stale/discarded work.
 
 The configured capacity envelope has one deterministic property: at the
-default 24-candidate limit, at most eight admitted valid candidates can remain
-outside a full 16-group selection, versus 48 at a 64-candidate limit. This is a
-bound on validator-admitted candidates, not a measured claim about generation
-cost, profitability, or participation. The reserve should be reduced or
-increased only from observed proof-failure and underfill data.
+default 24-reveal limit, at most eight fully valid revealed candidates can
+remain outside a full 16-group selection. This is a bound on validator-processed
+payloads, not a measured claim about generation cost, profitability, or
+participation. The reserve should be reduced or increased only from observed
+proof-failure and underfill data.
 
 Reviewers can exercise the deterministic synthetic shape comparison with:
 

@@ -5,12 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Mapping
 
 from reliquary.shared.checkpoint_epoch import (
     BeaconBinding,
+    CHECKPOINT_EPOCH_ADMISSION_POLICY,
     CHECKPOINT_EPOCH_CAPABILITY_ID,
     CHECKPOINT_EPOCH_SCHEDULE_MODE,
     CHECKPOINT_EPOCH_SCHEMA_VERSION,
@@ -51,6 +53,9 @@ class EpochCommitIntent:
     prompt_range_size: int
     target_groups_per_environment_lane: int
     candidate_limit_per_environment_lane: int
+    admission_policy: str
+    commitments_per_operator_per_environment_lane: int
+    reveal_seconds: float
     environment_universes: tuple[tuple[str, int], ...]
 
     @property
@@ -99,6 +104,11 @@ def _intent_dict(intent: EpochCommitIntent) -> dict[str, Any]:
         "candidate_limit_per_environment_lane": (
             intent.candidate_limit_per_environment_lane
         ),
+        "admission_policy": intent.admission_policy,
+        "commitments_per_operator_per_environment_lane": (
+            intent.commitments_per_operator_per_environment_lane
+        ),
+        "reveal_seconds": intent.reveal_seconds,
         "environment_universes": {
             name: size for name, size in intent.environment_universes
         },
@@ -126,6 +136,9 @@ def build_epoch_intent(
     prompt_range_size: int,
     target_groups_per_environment_lane: int,
     candidate_limit_per_environment_lane: int,
+    admission_policy: str = CHECKPOINT_EPOCH_ADMISSION_POLICY,
+    commitments_per_operator_per_environment_lane: int = 16,
+    reveal_seconds: float = 60.0,
     environment_universes: Mapping[str, int],
 ) -> EpochCommitIntent:
     if isinstance(commit_observed_round, bool) or commit_observed_round < 1:
@@ -165,6 +178,11 @@ def build_epoch_intent(
         candidate_limit_per_environment_lane=int(
             candidate_limit_per_environment_lane
         ),
+        admission_policy=str(admission_policy),
+        commitments_per_operator_per_environment_lane=int(
+            commitments_per_operator_per_environment_lane
+        ),
+        reveal_seconds=float(reveal_seconds),
         environment_universes=universes,
     )
     if intent.first_window < 0 or intent.window_count < 1:
@@ -175,6 +193,10 @@ def build_epoch_intent(
         intent.target_groups_per_environment_lane < 1
         or intent.candidate_limit_per_environment_lane
         < intent.target_groups_per_environment_lane
+        or intent.admission_policy != CHECKPOINT_EPOCH_ADMISSION_POLICY
+        or intent.commitments_per_operator_per_environment_lane < 1
+        or not math.isfinite(intent.reveal_seconds)
+        or intent.reveal_seconds <= 0
     ):
         raise ValueError("invalid checkpoint epoch admission bounds")
     return intent
@@ -201,6 +223,9 @@ def parse_epoch_intent(raw: bytes) -> EpochCommitIntent:
         "prompt_range_size",
         "target_groups_per_environment_lane",
         "candidate_limit_per_environment_lane",
+        "admission_policy",
+        "commitments_per_operator_per_environment_lane",
+        "reveal_seconds",
         "environment_universes",
     }:
         raise ValueError("checkpoint epoch intent keys differ")
@@ -239,6 +264,11 @@ def parse_epoch_intent(raw: bytes) -> EpochCommitIntent:
         candidate_limit_per_environment_lane=(
             value["candidate_limit_per_environment_lane"]
         ),
+        admission_policy=value["admission_policy"],
+        commitments_per_operator_per_environment_lane=(
+            value["commitments_per_operator_per_environment_lane"]
+        ),
+        reveal_seconds=value["reveal_seconds"],
         environment_universes=tuple(
             (str(name), int(size)) for name, size in sorted(universes.items())
         ),
@@ -253,6 +283,10 @@ def parse_epoch_intent(raw: bytes) -> EpochCommitIntent:
         intent.target_groups_per_environment_lane < 1
         or intent.candidate_limit_per_environment_lane
         < intent.target_groups_per_environment_lane
+        or intent.admission_policy != CHECKPOINT_EPOCH_ADMISSION_POLICY
+        or intent.commitments_per_operator_per_environment_lane < 1
+        or not math.isfinite(intent.reveal_seconds)
+        or intent.reveal_seconds <= 0
     ):
         raise ValueError("invalid checkpoint epoch admission bounds")
     if intent.beacon_target_round != intent.checkpoint.commit_observed_round + 1:
@@ -289,6 +323,11 @@ def plan_from_intent(
         candidate_limit_per_environment_lane=(
             intent.candidate_limit_per_environment_lane
         ),
+        admission_policy=intent.admission_policy,
+        commitments_per_operator_per_environment_lane=(
+            intent.commitments_per_operator_per_environment_lane
+        ),
+        reveal_seconds=intent.reveal_seconds,
         environment_universes=dict(intent.environment_universes),
     )
 

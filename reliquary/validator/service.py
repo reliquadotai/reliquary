@@ -39,7 +39,9 @@ from reliquary.constants import (
     ENVIRONMENT_MIX,
     EXPERIMENTAL_CHECKPOINT_EPOCH_CANDIDATES_PER_LANE,
     EXPERIMENTAL_CHECKPOINT_EPOCH_COLLECTION_SECONDS,
+    EXPERIMENTAL_CHECKPOINT_EPOCH_COMMITMENTS_PER_OPERATOR_PER_LANE,
     EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED,
+    EXPERIMENTAL_CHECKPOINT_EPOCH_REVEAL_SECONDS,
     EXPERIMENTAL_CHECKPOINT_EPOCH_TRAINING_MODE,
     EXPERIMENTAL_CHECKPOINT_EPOCH_WARMUP_ROUNDS,
     FORCED_SEED_CDF_BOUNDARY_EPSILON,
@@ -1843,6 +1845,10 @@ class ValidationService:
             or plan.target_groups_per_environment_lane != B_BATCH
             or plan.candidate_limit_per_environment_lane
             != EXPERIMENTAL_CHECKPOINT_EPOCH_CANDIDATES_PER_LANE
+            or plan.commitments_per_operator_per_environment_lane
+            != EXPERIMENTAL_CHECKPOINT_EPOCH_COMMITMENTS_PER_OPERATOR_PER_LANE
+            or plan.reveal_seconds
+            != EXPERIMENTAL_CHECKPOINT_EPOCH_REVEAL_SECONDS
             or plan.candidate_limit_per_environment_lane
             > MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW
             or plan_universes != expected_universes
@@ -1960,6 +1966,10 @@ class ValidationService:
                 candidate_limit_per_environment_lane=(
                     EXPERIMENTAL_CHECKPOINT_EPOCH_CANDIDATES_PER_LANE
                 ),
+                commitments_per_operator_per_environment_lane=(
+                    EXPERIMENTAL_CHECKPOINT_EPOCH_COMMITMENTS_PER_OPERATOR_PER_LANE
+                ),
+                reveal_seconds=EXPERIMENTAL_CHECKPOINT_EPOCH_REVEAL_SECONDS,
                 environment_universes={
                     name: len(environment)
                     for name, environment in self.envs.items()
@@ -2290,6 +2300,39 @@ class ValidationService:
         self._publish_window_preparation_state()
         self._set_state(WindowState.OPEN)
 
+    async def _wait_for_checkpoint_epoch_phase_deadline(
+        self,
+        *,
+        seconds_from_open: float | None = None,
+        duration_seconds: float | None = None,
+    ) -> None:
+        """Wait for an epoch phase without sealing any logical lane."""
+        loop = asyncio.get_running_loop()
+        if seconds_from_open is not None:
+            batchers = list(self._active_batchers.values())
+            if not batchers:
+                raise RuntimeError("checkpoint epoch lanes are unavailable")
+            opened = {
+                float(
+                    getattr(batcher, "window_opened_at")
+                    if hasattr(batcher, "window_opened_at")
+                    else getattr(batcher, "opened_at")
+                )
+                for batcher in batchers
+            }
+            if len(opened) != 1:
+                raise RuntimeError("checkpoint epoch lanes did not open together")
+            deadline = next(iter(opened)) + float(seconds_from_open)
+        elif duration_seconds is not None:
+            deadline = loop.time() + float(duration_seconds)
+        else:
+            raise ValueError("checkpoint epoch phase deadline is missing")
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(0.25, remaining))
+
     def _open_checkpoint_epoch(self) -> None:
         """Prepare every logical lane in one checkpoint-wide collection."""
         plan = self._checkpoint_epoch_plan
@@ -2373,6 +2416,7 @@ class ValidationService:
         self._window_preparation_stage = None
         self.server.clear_window_preparation_failure()
         self._publish_window_preparation_state()
+        self.server.set_checkpoint_epoch_phase("commitment")
         self._set_state(WindowState.OPEN)
 
     async def _run_checkpoint_epoch(self) -> None:
@@ -2440,26 +2484,53 @@ class ValidationService:
             self._activate_checkpoint_epoch(activation_chain_info)
             activated = True
 
-            self._window_iteration_stage = "checkpoint_epoch_collection"
-            seal_reason = await self._wait_for_window_seal(
-                fixed_deadline_only=True
+            self._window_iteration_stage = "checkpoint_epoch_commitment"
+            await self._wait_for_checkpoint_epoch_phase_deadline(
+                seconds_from_open=plan.window_schedule.collection_seconds
+            )
+            await self.server.drain_checkpoint_epoch_commitments()
+            commitment_close_round, admission_beacon = (
+                await self._fetch_checkpoint_epoch_admission_beacon()
+            )
+            reveal_deadline_ts = time.time() + plan.reveal_seconds
+            selected_counts = self.server.select_checkpoint_epoch_reveals(
+                commitment_close_round=commitment_close_round,
+                admission_beacon=admission_beacon,
+                reveal_deadline_ts=reveal_deadline_ts,
             )
             logger.info(
-                "Checkpoint epoch %s collection closed lanes=%d reason=%s",
+                "Checkpoint epoch %s commitments closed lanes=%d "
+                "commit_round=%d admission_round=%d selected=%d",
                 plan.epoch_id[:12],
                 plan.window_count,
-                seal_reason,
+                commitment_close_round,
+                admission_beacon.round,
+                sum(selected_counts.values()),
             )
+
+            self._window_iteration_stage = "checkpoint_epoch_reveal"
+            await self._wait_for_checkpoint_epoch_phase_deadline(
+                duration_seconds=plan.reveal_seconds
+            )
+            self._set_state(WindowState.TRAINING)
+            for batcher in self._active_batchers.values():
+                batcher.force_seal("checkpoint_epoch_reveal_closed")
+            drain_timeouts = await self._freeze_auction_populations(
+                list(self._active_batchers.values())
+            )
+            if any(drain_timeouts.values()):
+                raise RuntimeError("checkpoint epoch reveal drain timed out")
 
             late_drops = dict(self._late_drops)
             self._late_drops.clear()
             reject_counts = dict(
                 getattr(self.server, "_recent_reject_counts", {})
             )
-            # Close every route before proof selection or training starts.
+            epoch_seal = await self._fetch_checkpoint_epoch_seal_beacon(
+                after_round=admission_beacon.round
+            )
+            # Close every route after selected reveals are frozen.
             self.server.set_active_epoch_batchers({})
-            self._set_state(WindowState.TRAINING)
-            epoch_seal = await self._fetch_checkpoint_epoch_seal_beacon()
 
             for index, window in enumerate(plan.windows):
                 final_lane = index == plan.window_count - 1
@@ -5935,10 +6006,12 @@ class ValidationService:
         block_hash = await chain.get_block_hash(subtensor, target_window)
         return chain.compute_window_randomness(block_hash), None
 
-    async def _fetch_checkpoint_epoch_seal_beacon(
+    async def _fetch_checkpoint_epoch_post_phase_beacon(
         self,
+        *,
+        after_round: int = 0,
     ) -> tuple[int, BeaconBinding]:
-        """Return a verified beacon first available after close observation."""
+        """Return the first verified beacon after a locally observed phase end."""
         plan = self._checkpoint_epoch_plan
         if plan is None or not self.use_drand:
             raise RuntimeError("checkpoint epoch seal requires drand")
@@ -5948,7 +6021,7 @@ class ValidationService:
             or str(chain_info["hash"]) != plan.epoch_beacon.chain_hash
         ):
             raise RuntimeError("drand chain changed during checkpoint epoch")
-        target_round = close_round + 1
+        target_round = max(close_round, int(after_round)) + 1
         while True:
             _, current_round = await self._checkpoint_epoch_drand_snapshot()
             if current_round >= target_round:
@@ -5972,8 +6045,27 @@ class ValidationService:
         )
         await self._verify_checkpoint_epoch_beacon(beacon)
         if beacon.round <= close_round:
-            raise RuntimeError("checkpoint epoch seal beacon is not post-close")
+            raise RuntimeError("checkpoint epoch phase beacon is not post-close")
         return close_round, beacon
+
+    async def _fetch_checkpoint_epoch_admission_beacon(
+        self,
+    ) -> tuple[int, BeaconBinding]:
+        plan = self._checkpoint_epoch_plan
+        if plan is None:
+            raise RuntimeError("checkpoint epoch plan is unavailable")
+        return await self._fetch_checkpoint_epoch_post_phase_beacon(
+            after_round=plan.epoch_beacon.round
+        )
+
+    async def _fetch_checkpoint_epoch_seal_beacon(
+        self,
+        *,
+        after_round: int = 0,
+    ) -> tuple[int, BeaconBinding]:
+        return await self._fetch_checkpoint_epoch_post_phase_beacon(
+            after_round=after_round
+        )
 
     async def _fetch_seal_randomness(self) -> str:
         """Fetch post-deadline drand with a bounded retry budget.

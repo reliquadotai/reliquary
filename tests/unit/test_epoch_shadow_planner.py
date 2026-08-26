@@ -131,6 +131,7 @@ def _state(plan, *, window=50, state="OPEN", **overrides):
         "checkpoint_epoch_collection_seconds": (
             plan.window_schedule.collection_seconds
         ),
+        "checkpoint_epoch_phase": "commitment",
         "generation_profile_id": plan.protocol.profile_id,
         "protocol_version": plan.protocol.protocol_version,
         "generation_contract": CONTRACT,
@@ -251,7 +252,7 @@ def test_concurrent_epoch_release_polls_each_exact_lane(tmp_path):
     assert planner.records() == []
 
 
-def test_release_respects_live_lane_candidate_demand(tmp_path):
+def test_commitment_release_is_not_limited_by_reveal_cohort_size(tmp_path):
     plan = _plan()
     planner = _planner(tmp_path)
     specs = [
@@ -285,8 +286,8 @@ def test_release_respects_live_lane_candidate_demand(tmp_path):
         prompt_sha256=_prompt_digest,
     )
 
-    assert len(released) == 1
-    assert len(planner.records()) == 1
+    assert len(released) == 2
+    assert len(planner.records()) == 0
 
 
 def test_checkpoint_or_manifest_change_invalidates_without_replay(tmp_path):

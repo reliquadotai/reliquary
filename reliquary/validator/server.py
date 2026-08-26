@@ -103,6 +103,7 @@ from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     BatchSubmissionResponse,
     CommitModel,
+    EpochCommitmentStatus,
     GrpoBatchState,
     RejectReason,
     RuntimeContract,
@@ -114,10 +115,13 @@ from reliquary.protocol.submission import (
 )
 from reliquary.protocol.tokens import verify_tokens
 from reliquary.shared.checkpoint_epoch import (
+    BeaconBinding,
+    EpochAdmissionCommitment,
     EpochPlan,
     canonical_manifest_bytes,
     manifest_sha256,
     parse_epoch_plan,
+    select_epoch_reveals,
 )
 from reliquary.shared.hf_compat import (
     resolve_max_context_length,
@@ -193,6 +197,10 @@ class _UploadPrecommitReceipt:
     terminal_recorded: bool = False
     reveal_success_recorded: bool = False
     reveal_failure_recorded: bool = False
+    epoch_commitment: bool = False
+    epoch_selected: bool = False
+    epoch_selection_rank: int | None = None
+    admission_beacon_round: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1228,6 +1236,8 @@ class ValidatorServer:
         self._checkpoint_epoch_manifest_bytes: bytes | None = None
         self._checkpoint_epoch_manifest_sha256: str | None = None
         self._checkpoint_epoch_manifests_by_id: dict[str, bytes] = {}
+        self._checkpoint_epoch_phase: str | None = None
+        self._checkpoint_epoch_admission_beacon: BeaconBinding | None = None
         self.app: FastAPI = self._build_app()
         self._server: uvicorn.Server | None = None
         self._task: asyncio.Task[Any] | None = None
@@ -1250,6 +1260,7 @@ class ValidatorServer:
         self._admission_materialization_pool: ThreadPoolExecutor | None = None
         self._precommit_signature_pool: ThreadPoolExecutor | None = None
         self._precommit_signature_inflight = 0
+        self._precommit_http_inflight = 0
         self._admission_active_by_environment: collections.Counter[str] = (
             collections.Counter()
         )
@@ -1334,6 +1345,12 @@ class ValidatorServer:
             cp.revision if cp else None,
             epoch.epoch_id if epoch is not None else None,
             self._checkpoint_epoch_manifest_sha256,
+            self._checkpoint_epoch_phase,
+            (
+                self._checkpoint_epoch_admission_beacon.round
+                if self._checkpoint_epoch_admission_beacon is not None
+                else None
+            ),
         )
 
     def _active_batcher_values(self) -> tuple[GrpoWindowBatcher, ...]:
@@ -1388,25 +1405,32 @@ class ValidatorServer:
     def _reset_window_scoped_state(self) -> None:
         transition_ts = time.time()
         for receipt in self._upload_precommit_receipts.values():
-            if not receipt.consumed and (
-                (
-                    receipt.body_completed_at_wall is None
-                    and (
-                        receipt.expires_at_wall < transition_ts
-                        or self._receipt_collection_deadline(receipt)
-                        <= transition_ts
+            if (
+                not receipt.consumed
+                and (not receipt.epoch_commitment or receipt.epoch_selected)
+                and (
+                    (
+                        receipt.body_completed_at_wall is None
+                        and (
+                            receipt.expires_at_wall < transition_ts
+                            or self._receipt_collection_deadline(receipt)
+                            <= transition_ts
+                        )
                     )
-                )
-                or (
-                    receipt.body_completed_at_wall is not None
-                    and receipt.body_completed_at_wall > receipt.expires_at_wall
+                    or (
+                        receipt.body_completed_at_wall is not None
+                        and receipt.body_completed_at_wall
+                        > receipt.expires_at_wall
+                    )
                 )
             ):
                 self._record_no_reveal(receipt)
             resolver = getattr(
                 type(receipt.batcher), "resolve_upload_precommit", None
             )
-            if resolver is not None:
+            if resolver is not None and (
+                not receipt.epoch_commitment or receipt.epoch_selected
+            ):
                 resolver(
                     receipt.batcher,
                     receipt.receipt_id,
@@ -1419,6 +1443,8 @@ class ValidatorServer:
         self._bad_envelope_counts = {}
         self._recent_reject_counts = collections.Counter()
         self._state_response_cache = {}
+        self._checkpoint_epoch_phase = None
+        self._checkpoint_epoch_admission_beacon = None
 
     def _cached_state_response(
         self,
@@ -1555,6 +1581,12 @@ class ValidatorServer:
                 WINDOW_COLLECTION_SECONDS,
             )
         )
+
+    @staticmethod
+    def _receipt_upload_start_deadline(receipt: _UploadPrecommitReceipt) -> float:
+        if receipt.epoch_commitment:
+            return float(receipt.expires_at_wall)
+        return ValidatorServer._receipt_collection_deadline(receipt)
 
     def _submission_body_read_deadline(
         self,
@@ -1747,6 +1779,10 @@ class ValidatorServer:
                 (
                     not receipt.consumed
                     and (
+                        not receipt.epoch_commitment
+                        or receipt.epoch_selected
+                    )
+                    and (
                         (
                             receipt.expires_at_wall < current
                             and (
@@ -1757,7 +1793,7 @@ class ValidatorServer:
                         )
                         or (
                             receipt.upload_started_at_wall is None
-                            and self._receipt_collection_deadline(receipt)
+                            and self._receipt_upload_start_deadline(receipt)
                             <= current
                         )
                     )
@@ -1773,7 +1809,7 @@ class ValidatorServer:
                     receipt.body_completed_at_wall is None
                     and (
                         receipt.expires_at_wall < current
-                        or self._receipt_collection_deadline(receipt) <= current
+                        or self._receipt_upload_start_deadline(receipt) <= current
                     )
                 )
                 or (
@@ -1995,6 +2031,8 @@ class ValidatorServer:
             self._checkpoint_epoch_plan = None
             self._checkpoint_epoch_manifest_bytes = None
             self._checkpoint_epoch_manifest_sha256 = None
+            self._checkpoint_epoch_phase = None
+            self._checkpoint_epoch_admission_beacon = None
             self._state_response_cache.clear()
             return
 
@@ -2021,6 +2059,178 @@ class ValidatorServer:
         self._checkpoint_epoch_manifest_bytes = raw
         self._checkpoint_epoch_manifest_sha256 = digest
         self._state_response_cache.clear()
+
+    def set_checkpoint_epoch_phase(self, phase: str | None) -> None:
+        if phase not in {None, "commitment", "reveal"}:
+            raise ValueError("invalid checkpoint epoch phase")
+        if phase is not None and self._checkpoint_epoch_plan is None:
+            raise RuntimeError("checkpoint epoch plan is unavailable")
+        self._checkpoint_epoch_phase = phase
+        self._state_response_cache.clear()
+
+    async def drain_checkpoint_epoch_commitments(
+        self,
+        *,
+        timeout_seconds: float = 30.0,
+    ) -> None:
+        """Wait for compact requests already at ingress to finish admission."""
+        if self._checkpoint_epoch_phase != "commitment":
+            raise RuntimeError("checkpoint epoch commitment phase is not active")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + float(timeout_seconds)
+        while self._precommit_http_inflight:
+            if loop.time() >= deadline:
+                raise RuntimeError("checkpoint epoch commitment drain timed out")
+            await asyncio.sleep(0.01)
+
+    def select_checkpoint_epoch_reveals(
+        self,
+        *,
+        commitment_close_round: int,
+        admission_beacon: BeaconBinding,
+        reveal_deadline_ts: float,
+    ) -> dict[tuple[str, int], int]:
+        """Turn compact commitments into a bounded, arrival-neutral cohort."""
+        plan = self._checkpoint_epoch_plan
+        manifest = self._checkpoint_epoch_manifest_sha256
+        if (
+            plan is None
+            or manifest is None
+            or self._checkpoint_epoch_phase != "commitment"
+        ):
+            raise RuntimeError("checkpoint epoch commitment phase is not active")
+        if (
+            isinstance(commitment_close_round, bool)
+            or int(commitment_close_round) < plan.epoch_beacon.round
+            or admission_beacon.round <= int(commitment_close_round)
+        ):
+            raise ValueError("admission beacon must follow commitment close")
+        if (
+            admission_beacon.source != plan.epoch_beacon.source
+            or admission_beacon.chain != plan.epoch_beacon.chain
+            or admission_beacon.chain_hash != plan.epoch_beacon.chain_hash
+        ):
+            raise ValueError("admission beacon chain differs from the epoch")
+        if time.time() >= float(reveal_deadline_ts):
+            raise ValueError("reveal deadline must be in the future")
+
+        selected_counts: dict[tuple[str, int], int] = {}
+        for (environment, window), batcher in sorted(
+            self._active_epoch_batchers.items(),
+            key=lambda item: (item[0][1], item[0][0]),
+        ):
+            receipts = [
+                receipt
+                for receipt in self._upload_precommit_receipts.values()
+                if receipt.epoch_commitment
+                and not receipt.consumed
+                and receipt.batcher is batcher
+                and receipt.admission_beacon_round is None
+                and receipt.operator is not None
+            ]
+            ordered_ids = (
+                select_epoch_reveals(
+                    [
+                        EpochAdmissionCommitment(
+                            commitment_id=receipt.precommit_signature,
+                            operator_id=str(receipt.operator),
+                            window_number=receipt.window_start,
+                            environment=receipt.environment,
+                            prompt_idx=receipt.prompt_idx,
+                            payload_sha256=receipt.payload_sha256,
+                        )
+                        for receipt in receipts
+                    ],
+                    admission_randomness=admission_beacon.randomness,
+                    epoch_id=plan.epoch_id,
+                    manifest_sha256_hex=manifest,
+                    limit=max(1, len(receipts)),
+                    per_prompt_limit=MAX_SUBMISSIONS_PER_PROMPT,
+                )
+                if receipts
+                else ()
+            )
+            by_commitment = {
+                receipt.precommit_signature: receipt for receipt in receipts
+            }
+            for receipt in receipts:
+                receipt.admission_beacon_round = admission_beacon.round
+
+            selected = 0
+            for commitment_id in ordered_ids:
+                if selected >= plan.candidate_limit_per_environment_lane:
+                    break
+                receipt = by_commitment[commitment_id]
+                identities = self._prompt_mismatch_identities(
+                    receipt.miner_hotkey,
+                    operator=receipt.operator,
+                )
+                policy_window = (
+                    receipt.admission_policy_window
+                    if receipt.admission_policy_window is not None
+                    else receipt.window_start
+                )
+                prompt_decision = self._prompt_mismatch_circuit.admit_precommit(
+                    environment=receipt.environment,
+                    identities=identities,
+                    window=policy_window,
+                    precommit_signature=receipt.precommit_signature,
+                )
+                if not prompt_decision.allowed:
+                    continue
+                reveal_decision = self._no_reveal_circuit.admit_precommit(
+                    environment=receipt.environment,
+                    operator=receipt.operator,
+                    window=policy_window,
+                    precommit_signature=receipt.precommit_signature,
+                )
+                if not reveal_decision.allowed:
+                    if prompt_decision.canary:
+                        self._prompt_mismatch_circuit.cancel_canary(
+                            environment=receipt.environment,
+                            identities=identities,
+                            window=policy_window,
+                            precommit_signature=receipt.precommit_signature,
+                        )
+                    continue
+                register = getattr(
+                    type(batcher), "try_register_selected_epoch_reveal", None
+                )
+                accepted = False
+                if register is not None:
+                    accepted, _, _ = register(
+                        batcher,
+                        receipt.receipt_id,
+                        receipt.miner_hotkey,
+                        payload_bytes=receipt.payload_bytes,
+                        reveal_deadline_wall=float(reveal_deadline_ts),
+                    )
+                if not accepted:
+                    if prompt_decision.canary:
+                        self._prompt_mismatch_circuit.cancel_canary(
+                            environment=receipt.environment,
+                            identities=identities,
+                            window=policy_window,
+                            precommit_signature=receipt.precommit_signature,
+                        )
+                    if reveal_decision.canary:
+                        self._no_reveal_circuit.cancel_canary(
+                            environment=receipt.environment,
+                            operator=receipt.operator,
+                            window=policy_window,
+                            precommit_signature=receipt.precommit_signature,
+                        )
+                    continue
+                receipt.epoch_selected = True
+                receipt.epoch_selection_rank = selected
+                receipt.expires_at_wall = float(reveal_deadline_ts)
+                selected += 1
+            selected_counts[(environment, window)] = selected
+
+        self._checkpoint_epoch_admission_beacon = admission_beacon
+        self._checkpoint_epoch_phase = "reveal"
+        self._state_response_cache.clear()
+        return selected_counts
 
     def configure_registration_gate(self) -> None:
         """Arm admission against the service-managed metagraph snapshot."""
@@ -3516,7 +3726,13 @@ class ValidatorServer:
         eligibility_at = (
             float(wire_started_at) if wire_started_at is not None else task_arrival
         )
-        if eligibility_at > self._receipt_collection_deadline(receipt):
+        if receipt.epoch_commitment and not receipt.epoch_selected:
+            response.headers["Connection"] = "close"
+            return BatchSubmissionResponse(
+                accepted=False,
+                reason=RejectReason.REVEAL_NOT_SELECTED,
+            )
+        if eligibility_at > self._receipt_upload_start_deadline(receipt):
             self._fail_upload_receipt(
                 receipt,
                 reason=RejectReason.PRECOMMIT_EXPIRED,
@@ -3834,9 +4050,17 @@ class ValidatorServer:
                 )
             )
             request_started = time.perf_counter()
+            is_precommit = request.url.path == "/submit/precommit"
+            if is_precommit:
+                self._precommit_http_inflight += 1
             try:
                 return await call_next(request)
             finally:
+                if is_precommit:
+                    self._precommit_http_inflight = max(
+                        0,
+                        self._precommit_http_inflight - 1,
+                    )
                 path = request.url.path
                 if path in {
                     "/health",
@@ -3899,6 +4123,11 @@ class ValidatorServer:
             )
             if batcher is None:
                 return reject(RejectReason.BAD_SCHEMA)
+            epoch_commitment = bool(
+                getattr(batcher, "experimental_epoch_ranking", False)
+            )
+            if epoch_commitment and self._checkpoint_epoch_phase != "commitment":
+                return reject(RejectReason.PRECOMMIT_EXPIRED)
             if request.window_start != batcher.window_start:
                 return reject(RejectReason.WINDOW_MISMATCH)
             headers_completed_at = float(
@@ -3910,6 +4139,18 @@ class ValidatorServer:
             )
             if headers_completed_at < float(batcher.window_opened_wall_ts):
                 return reject(RejectReason.WINDOW_NOT_ACTIVE)
+            collection_close = (
+                float(batcher.window_opened_wall_ts)
+                + float(
+                    getattr(
+                        batcher,
+                        "collection_seconds",
+                        WINDOW_COLLECTION_SECONDS,
+                    )
+                )
+            )
+            if commit_received_at > collection_close:
+                return reject(RejectReason.PRECOMMIT_EXPIRED)
             if request.payload_bytes > MAX_SUBMISSION_PAYLOAD_BYTES:
                 return reject(RejectReason.BAD_SCHEMA)
             if (
@@ -3981,21 +4222,15 @@ class ValidatorServer:
                     accepted=True,
                     reason=RejectReason.ACCEPTED,
                     receipt_id=existing.receipt_id,
-                    upload_deadline_ts=existing.expires_at_wall,
+                    upload_deadline_ts=(
+                        existing.expires_at_wall
+                        if not existing.epoch_commitment
+                        or existing.epoch_selected
+                        else None
+                    ),
                 )
             if commit_received_at < float(batcher.window_opened_wall_ts):
                 return reject(RejectReason.WINDOW_NOT_ACTIVE)
-            if commit_received_at > (
-                float(batcher.window_opened_wall_ts)
-                + float(
-                    getattr(
-                        batcher,
-                        "collection_seconds",
-                        WINDOW_COLLECTION_SECONDS,
-                    )
-                )
-            ):
-                return reject(RejectReason.PRECOMMIT_EXPIRED)
             if batcher.drand_round_check_enabled:
                 if hasattr(type(batcher), "observe_drand_round"):
                     drand_observation = batcher.observe_drand_round(
@@ -4067,7 +4302,12 @@ class ValidatorServer:
                     accepted=True,
                     reason=RejectReason.ACCEPTED,
                     receipt_id=existing.receipt_id,
-                    upload_deadline_ts=existing.expires_at_wall,
+                    upload_deadline_ts=(
+                        existing.expires_at_wall
+                        if not existing.epoch_commitment
+                        or existing.epoch_selected
+                        else None
+                    ),
                 )
 
             quota_key = self._window_counter_key(
@@ -4082,6 +4322,59 @@ class ValidatorServer:
             admission_policy_window = self._admission_policy_window(
                 request.window_start
             )
+            if epoch_commitment:
+                plan = self._checkpoint_epoch_plan
+                if plan is None or operator is None:
+                    return reject(RejectReason.RATE_LIMITED)
+                operator_commitments = sum(
+                    receipt.epoch_commitment
+                    and not receipt.consumed
+                    and receipt.batcher is batcher
+                    and receipt.operator == operator
+                    for receipt in self._upload_precommit_receipts.values()
+                )
+                if (
+                    operator_commitments
+                    >= plan.commitments_per_operator_per_environment_lane
+                ):
+                    return reject(RejectReason.RATE_LIMITED)
+                receipt_id = secrets.token_urlsafe(32)
+                receipt = _UploadPrecommitReceipt(
+                    receipt_id=receipt_id,
+                    precommit_signature=request.precommit_signature,
+                    miner_hotkey=request.miner_hotkey,
+                    prompt_idx=request.prompt_idx,
+                    window_start=request.window_start,
+                    merkle_root=request.merkle_root,
+                    checkpoint_hash=request.checkpoint_hash,
+                    environment=request.environment,
+                    payload_bytes=request.payload_bytes,
+                    payload_sha256=request.payload_sha256.lower(),
+                    drand_round=request.drand_round,
+                    protocol_version=request.protocol_version,
+                    generation_profile_id=request.generation_profile_id,
+                    nonce=request.nonce,
+                    expires_at_wall=collection_close,
+                    precommit_arrival_ts=commit_received_at,
+                    drand_observation=drand_observation,
+                    batcher=batcher,
+                    operator=operator,
+                    admission_policy_window=admission_policy_window,
+                    epoch_commitment=True,
+                )
+                self._upload_precommit_receipts[receipt_id] = receipt
+                self._upload_precommit_by_signature[
+                    request.precommit_signature
+                ] = receipt_id
+                self._per_window_counts[quota_key] = count + 1
+                self._state_response_cache.clear()
+                return SubmissionPrecommitResponse(
+                    accepted=True,
+                    reason=RejectReason.ACCEPTED,
+                    receipt_id=receipt_id,
+                    upload_deadline_ts=None,
+                )
+
             circuit_identities = self._prompt_mismatch_identities(
                 request.miner_hotkey,
                 operator=operator,
@@ -5352,11 +5645,24 @@ class ValidatorServer:
                         ),
                     )
                     if epoch is not None
+                    and self._checkpoint_epoch_phase == "reveal"
                     else None
                 ),
                 checkpoint_epoch_collection_seconds=(
                     epoch.window_schedule.collection_seconds
                     if epoch is not None
+                    else None
+                ),
+                checkpoint_epoch_phase=(
+                    self._checkpoint_epoch_phase if epoch is not None else None
+                ),
+                checkpoint_epoch_reveal_seconds=(
+                    epoch.reveal_seconds if epoch is not None else None
+                ),
+                checkpoint_epoch_admission_beacon_round=(
+                    self._checkpoint_epoch_admission_beacon.round
+                    if epoch is not None
+                    and self._checkpoint_epoch_admission_beacon is not None
                     else None
                 ),
                 randomness=batcher.randomness,
@@ -5379,6 +5685,9 @@ class ValidatorServer:
                         "checkpoint_epoch_candidate_limit",
                         "checkpoint_epoch_candidate_remaining",
                         "checkpoint_epoch_collection_seconds",
+                        "checkpoint_epoch_phase",
+                        "checkpoint_epoch_reveal_seconds",
+                        "checkpoint_epoch_admission_beacon_round",
                     }
                 )
             body = payload.model_dump_json(
@@ -5429,6 +5738,37 @@ class ValidatorServer:
                     "ETag": f'"{digest}"',
                     "Cache-Control": "no-cache, must-revalidate",
                 },
+            )
+
+        @app.get(
+            "/checkpoint-epoch/commitments/{receipt_id}",
+            response_model=EpochCommitmentStatus,
+        )
+        async def checkpoint_epoch_commitment_status(
+            receipt_id: str,
+        ) -> EpochCommitmentStatus:
+            receipt = self._upload_precommit_receipts.get(receipt_id)
+            if receipt is None or not receipt.epoch_commitment:
+                raise HTTPException(status_code=404, detail="commitment_not_found")
+            if receipt.consumed and receipt.outcome is not None:
+                status = "revealed" if receipt.outcome.accepted else "expired"
+            elif receipt.epoch_selected:
+                status = (
+                    "expired"
+                    if time.time() > receipt.expires_at_wall
+                    else "selected"
+                )
+            elif receipt.admission_beacon_round is not None:
+                status = "not_selected"
+            else:
+                status = "pending_selection"
+            return EpochCommitmentStatus(
+                receipt_id=receipt.receipt_id,
+                status=status,
+                admission_beacon_round=receipt.admission_beacon_round,
+                reveal_deadline_ts=(
+                    receipt.expires_at_wall if receipt.epoch_selected else None
+                ),
             )
 
         @app.get(

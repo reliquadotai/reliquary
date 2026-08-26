@@ -16,6 +16,11 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Iterable
 
+from reliquary.shared.checkpoint_epoch import (
+    EpochAdmissionCommitment,
+    select_epoch_reveals,
+)
+
 
 @dataclass(frozen=True)
 class Candidate:
@@ -84,13 +89,14 @@ def _run_policy(
     seed: int,
     horizon: int,
     target: int,
-    candidate_limit: int,
+    candidate_supply: int,
+    reveal_limit: int,
     epoch_mode: bool,
 ) -> dict[str, object]:
     population = _population(
         rng=random.Random(seed),
         horizon=horizon,
-        candidate_limit=candidate_limit,
+        candidate_limit=candidate_supply,
         epoch_mode=epoch_mode,
     )
     selected: list[Candidate] = []
@@ -103,10 +109,39 @@ def _run_policy(
                 for candidate in population
                 if candidate.environment == environment
                 and candidate.lane == lane
-                and candidate.valid
-                and not candidate.stale
             ]
             if epoch_mode:
+                commitments = [
+                    EpochAdmissionCommitment(
+                        commitment_id=(
+                            f"{candidate.environment}:{candidate.lane}:"
+                            f"{candidate.operator}:{candidate.prompt}"
+                        ),
+                        operator_id=str(candidate.operator),
+                        window_number=candidate.lane,
+                        environment=candidate.environment,
+                        prompt_idx=candidate.prompt,
+                        payload_sha256=hashlib.sha256(
+                            repr(candidate).encode("utf-8")
+                        ).hexdigest(),
+                    )
+                    for candidate in lane_candidates
+                ]
+                selected_ids = set(select_epoch_reveals(
+                    commitments,
+                    admission_randomness=f"{seed:064x}",
+                    epoch_id=hashlib.sha256(b"synthetic-epoch").hexdigest(),
+                    manifest_sha256_hex=hashlib.sha256(
+                        b"synthetic-manifest"
+                    ).hexdigest(),
+                    limit=reveal_limit,
+                    per_prompt_limit=10,
+                ))
+                lane_candidates = [
+                    candidate
+                    for candidate, commitment in zip(lane_candidates, commitments)
+                    if commitment.commitment_id in selected_ids
+                ]
                 lane_candidates.sort(key=lambda candidate: (
                     -candidate.difficulty,
                     _tiebreak(seed, candidate),
@@ -118,6 +153,11 @@ def _run_policy(
                     candidate.arrival_seconds,
                     _tiebreak(seed, candidate),
                 ))
+            lane_candidates = [
+                candidate
+                for candidate in lane_candidates
+                if candidate.valid and not candidate.stale
+            ]
             winners = lane_candidates[:target]
             selected.extend(winners)
             missing = target - len(winners)
@@ -131,7 +171,8 @@ def _run_policy(
     shares = [count / max(len(selected), 1) for count in operator_counts.values()]
     return {
         "policy": name,
-        "candidate_limit_per_environment_lane": candidate_limit,
+        "candidate_supply_per_environment_lane": candidate_supply,
+        "selected_reveal_limit_per_environment_lane": reveal_limit,
         "generated_candidates": len(population),
         "valid_candidates_available": sum(
             candidate.valid and not candidate.stale for candidate in population
@@ -171,6 +212,14 @@ def _run_policy(
         "open_edge_submission_burst": sum(
             candidate.arrival_seconds == 0.0 for candidate in population
         ),
+        "open_edge_payload_burst": (
+            0 if epoch_mode else sum(
+                candidate.arrival_seconds == 0.0 for candidate in population
+            )
+        ),
+        "post_selection_payload_burst_upper_bound": (
+            2 * horizon * reveal_limit if epoch_mode else 0
+        ),
         "stale_discarded_work": sum(candidate.stale for candidate in population),
     }
 
@@ -182,16 +231,20 @@ def main() -> None:
     parser.add_argument("--target", type=int, default=16)
     parser.add_argument("--current-candidates", type=int, default=64)
     parser.add_argument("--epoch-candidates", type=int, default=24)
+    parser.add_argument("--epoch-commitments", type=int, default=64)
     args = parser.parse_args()
     if min(
         args.horizon,
         args.target,
         args.current_candidates,
         args.epoch_candidates,
+        args.epoch_commitments,
     ) < 1:
         parser.error("all sizing arguments must be positive")
     if min(args.current_candidates, args.epoch_candidates) < args.target:
         parser.error("candidate limits must be at least the target")
+    if args.epoch_commitments < args.epoch_candidates:
+        parser.error("epoch commitments must cover the reveal cohort")
 
     report = {
         "scope": "synthetic capacity-envelope replay; not production telemetry",
@@ -199,7 +252,7 @@ def main() -> None:
             "environments": ["math", "code"],
             "operators": 12,
             "epoch_prepared_at_open_probability": 0.75,
-            "candidate_supply_equals_each_policy_limit": True,
+            "epoch_commitments_are_selected_before_payload_reveal": True,
             "reward_or_profit_claim": False,
         },
         "seed": args.seed,
@@ -208,7 +261,8 @@ def main() -> None:
             seed=args.seed,
             horizon=args.horizon,
             target=args.target,
-            candidate_limit=args.current_candidates,
+            candidate_supply=args.current_candidates,
+            reveal_limit=args.current_candidates,
             epoch_mode=False,
         ),
         "checkpoint_epoch": _run_policy(
@@ -216,7 +270,8 @@ def main() -> None:
             seed=args.seed,
             horizon=args.horizon,
             target=args.target,
-            candidate_limit=args.epoch_candidates,
+            candidate_supply=args.epoch_commitments,
+            reveal_limit=args.epoch_candidates,
             epoch_mode=True,
         ),
         "unmeasurable_without_authenticated_telemetry": [

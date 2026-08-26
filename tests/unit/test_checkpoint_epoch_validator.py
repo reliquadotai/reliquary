@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+import time
 
 from fastapi.testclient import TestClient
 import pytest
 
-from reliquary.protocol.submission import WindowState
+from reliquary.protocol.submission import RejectReason, WindowState
 from reliquary.shared.checkpoint_epoch import (
     BeaconBinding,
     CheckpointBinding,
@@ -20,6 +22,7 @@ from reliquary.validator.observability import SubmitTelemetry
 from reliquary.validator.server import ValidatorServer
 from tests.unit.test_grpo_window_batcher import _make_batcher, _request
 from tests.unit.test_validator_server import _batcher as _server_batcher
+from tests.unit.test_validator_server import _precommit_for, _request as _server_request
 
 
 def _plan(
@@ -112,8 +115,9 @@ def test_active_surface_serves_exact_immutable_manifest():
     assert "seal_randomness" not in endpoint.text
     assert state["checkpoint_epoch_target_groups"] == 16
     assert state["checkpoint_epoch_candidate_limit"] == 24
-    assert state["checkpoint_epoch_candidate_remaining"] == 24
+    assert state["checkpoint_epoch_candidate_remaining"] is None
     assert state["checkpoint_epoch_collection_seconds"] == 60.0
+    assert state["checkpoint_epoch_reveal_seconds"] == 60.0
 
 
 def test_checkpoint_transition_withdraws_old_plan():
@@ -209,6 +213,152 @@ class _EpochLaneBatcher:
     def bind_event_loop(self, _loop) -> None:
         pass
 
+    def force_seal(self, _reason) -> None:
+        pass
+
+
+def test_epoch_commitment_cannot_upload_until_post_commit_selection():
+    plan = _plan(environments={"fake": 1_000})
+    batcher = _server_batcher(window_start=plan.first_window)
+    batcher.experimental_epoch_ranking = True
+    batcher.difficulty_auction_enabled = True
+    batcher.collection_seconds = plan.window_schedule.collection_seconds
+    batcher.current_checkpoint_hash = plan.checkpoint.revision
+    prompt_idx = plan.windows[0].prompt_slices[0].start
+    request = _server_request(
+        prompt_idx=prompt_idx,
+        window_start=plan.first_window,
+        checkpoint_hash=plan.checkpoint.revision,
+        valid_merkle=True,
+    )
+    batcher._operator_by_hotkey = {request.miner_hotkey: "operator-a"}
+    payload = request.model_dump_json().encode("utf-8")
+    precommit = _precommit_for(request, payload_bytes=len(payload))
+
+    server = ValidatorServer()
+    server._auction_admission_enabled = True
+    server.set_current_checkpoint(_checkpoint(plan))
+    server.set_checkpoint_epoch_plan(plan)
+    server.set_active_epoch_batchers({
+        ("fake", plan.first_window): batcher,
+    })
+    server.set_registered_hotkeys(
+        {request.miner_hotkey},
+        operator_by_hotkey={request.miner_hotkey: "operator-a"},
+    )
+    server.set_checkpoint_epoch_phase("commitment")
+    server.set_current_state(WindowState.OPEN)
+
+    with TestClient(server.app) as client:
+        committed = client.post(
+            "/submit/precommit",
+            content=precommit.model_dump_json(),
+            headers={"Content-Type": "application/json"},
+        ).json()
+        assert committed["accepted"] is True
+        assert committed["upload_deadline_ts"] is None
+        assert batcher.pending_upload_precommits == 0
+        early = client.post(
+            "/submit",
+            content=payload,
+            headers={
+                "Content-Type": "application/json",
+                "X-Reliquary-Precommit": committed["receipt_id"],
+            },
+        )
+
+    assert early.json()["reason"] == RejectReason.REVEAL_NOT_SELECTED.value
+    assert batcher.proof_grading_attempts == 0
+
+
+def test_selected_epoch_commitment_gets_bounded_reveal_right():
+    plan = _plan(environments={"fake": 1_000})
+    batcher = _server_batcher(window_start=plan.first_window)
+    batcher.experimental_epoch_ranking = True
+    batcher.difficulty_auction_enabled = True
+    batcher.collection_seconds = plan.window_schedule.collection_seconds
+    batcher.current_checkpoint_hash = plan.checkpoint.revision
+    prompt_idx = plan.windows[0].prompt_slices[0].start
+    request = _server_request(
+        prompt_idx=prompt_idx,
+        window_start=plan.first_window,
+        checkpoint_hash=plan.checkpoint.revision,
+        valid_merkle=True,
+    )
+    batcher._operator_by_hotkey = {request.miner_hotkey: "operator-a"}
+    payload = request.model_dump_json().encode("utf-8")
+    precommit = _precommit_for(request, payload_bytes=len(payload))
+    server = ValidatorServer()
+    server._auction_admission_enabled = True
+    server.set_current_checkpoint(_checkpoint(plan))
+    server.set_checkpoint_epoch_plan(plan)
+    server.set_active_epoch_batchers({("fake", plan.first_window): batcher})
+    server.set_registered_hotkeys(
+        {request.miner_hotkey},
+        operator_by_hotkey={request.miner_hotkey: "operator-a"},
+    )
+    server.set_checkpoint_epoch_phase("commitment")
+    server.set_current_state(WindowState.OPEN)
+
+    with TestClient(server.app) as client:
+        committed = client.post(
+            "/submit/precommit",
+            content=precommit.model_dump_json(),
+            headers={"Content-Type": "application/json"},
+        ).json()
+        with pytest.raises(ValueError, match="follow commitment close"):
+            server.select_checkpoint_epoch_reveals(
+                commitment_close_round=plan.epoch_beacon.round + 10,
+                admission_beacon=BeaconBinding(
+                    source="drand",
+                    chain=plan.epoch_beacon.chain,
+                    chain_hash=plan.epoch_beacon.chain_hash,
+                    round=plan.epoch_beacon.round + 10,
+                    randomness="e" * 64,
+                ),
+                reveal_deadline_ts=time.time() + 60.0,
+            )
+        counts = server.select_checkpoint_epoch_reveals(
+            commitment_close_round=plan.epoch_beacon.round + 9,
+            admission_beacon=BeaconBinding(
+                source="drand",
+                chain=plan.epoch_beacon.chain,
+                chain_hash=plan.epoch_beacon.chain_hash,
+                round=plan.epoch_beacon.round + 10,
+                randomness="e" * 64,
+            ),
+            reveal_deadline_ts=time.time() + 60.0,
+        )
+        status = client.get(
+            f"/checkpoint-epoch/commitments/{committed['receipt_id']}"
+        ).json()
+        state = client.get(
+            f"/state?env=fake&window={plan.first_window}"
+        ).json()
+        batcher.window_opened_wall_ts = (
+            time.time() - plan.window_schedule.collection_seconds - 1.0
+        )
+        revealed = client.post(
+            "/submit",
+            content=payload,
+            headers={
+                "Content-Type": "application/json",
+                "X-Reliquary-Precommit": committed["receipt_id"],
+            },
+        ).json()
+
+    assert counts == {("fake", plan.first_window): 1}
+    assert status["status"] == "selected"
+    assert status["admission_beacon_round"] == plan.epoch_beacon.round + 10
+    assert state["checkpoint_epoch_phase"] == "reveal"
+    assert state["checkpoint_epoch_admission_beacon_round"] == (
+        plan.epoch_beacon.round + 10
+    )
+    assert revealed["reason"] not in {
+        RejectReason.REVEAL_NOT_SELECTED.value,
+        RejectReason.PRECOMMIT_EXPIRED.value,
+    }
+
 
 def test_real_epoch_batcher_builder_honors_each_requested_logical_window(
     monkeypatch,
@@ -249,6 +399,7 @@ async def test_epoch_runner_opens_sixteen_lanes_together_then_consumes_in_order(
     plan = _plan(window_count=16, environments={"fake": 1_000})
     service = _build_late_drop_service()
     service._checkpoint_epoch_plan = plan
+    service.server.set_checkpoint_epoch_plan(plan)
     service._checkpoint_epoch_store = EpochStore(tmp_path)
     service._window_n = plan.first_window - 1
     monkeypatch.setattr(
@@ -272,10 +423,22 @@ async def test_epoch_runner_opens_sixteen_lanes_together_then_consumes_in_order(
         return {"fake": batcher}
 
     service._build_window_batchers = build
-    service._wait_for_window_seal = AsyncMock(return_value="sealed")
-    service._fetch_checkpoint_epoch_seal_beacon = AsyncMock(
-        return_value=(200, plan.epoch_beacon)
+    service._wait_for_checkpoint_epoch_phase_deadline = AsyncMock()
+    service.server.drain_checkpoint_epoch_commitments = AsyncMock()
+    admission_beacon = BeaconBinding(
+        source="drand",
+        chain=plan.epoch_beacon.chain,
+        chain_hash=plan.epoch_beacon.chain_hash,
+        round=150,
+        randomness="a" * 64,
     )
+    service._fetch_checkpoint_epoch_admission_beacon = AsyncMock(
+        return_value=(149, admission_beacon)
+    )
+    service._fetch_checkpoint_epoch_seal_beacon = AsyncMock(
+        return_value=(200, replace(plan.epoch_beacon, round=201))
+    )
+    service._freeze_auction_populations = AsyncMock(return_value={})
     service._train_and_publish = AsyncMock()
 
     await service._run_checkpoint_epoch()
@@ -283,8 +446,10 @@ async def test_epoch_runner_opens_sixteen_lanes_together_then_consumes_in_order(
     assert len(built) == 16
     assert len({batcher.opened_at for batcher in built}) == 1
     assert len({batcher.opened_wall for batcher in built}) == 1
-    service._wait_for_window_seal.assert_awaited_once_with(
-        fixed_deadline_only=True
+    assert service._wait_for_checkpoint_epoch_phase_deadline.await_count == 2
+    service.server.drain_checkpoint_epoch_commitments.assert_awaited_once_with()
+    service._fetch_checkpoint_epoch_seal_beacon.assert_awaited_once_with(
+        after_round=admission_beacon.round
     )
     assert [
         call.kwargs["window_n"]
@@ -311,6 +476,7 @@ async def test_epoch_failure_closes_routes_and_tombstones_unconsumed_lanes(
     plan = _plan(window_count=16, environments={"fake": 1_000})
     service = _build_late_drop_service()
     service._checkpoint_epoch_plan = plan
+    service.server.set_checkpoint_epoch_plan(plan)
     service._checkpoint_epoch_store = EpochStore(tmp_path)
     service._window_n = plan.first_window - 1
     monkeypatch.setattr(
@@ -333,10 +499,21 @@ async def test_epoch_failure_closes_routes_and_tombstones_unconsumed_lanes(
         }
 
     service._build_window_batchers = build
-    service._wait_for_window_seal = AsyncMock(return_value="sealed")
-    service._fetch_checkpoint_epoch_seal_beacon = AsyncMock(
-        return_value=(200, plan.epoch_beacon)
+    service._wait_for_checkpoint_epoch_phase_deadline = AsyncMock()
+    admission_beacon = BeaconBinding(
+        source="drand",
+        chain=plan.epoch_beacon.chain,
+        chain_hash=plan.epoch_beacon.chain_hash,
+        round=150,
+        randomness="a" * 64,
     )
+    service._fetch_checkpoint_epoch_admission_beacon = AsyncMock(
+        return_value=(149, admission_beacon)
+    )
+    service._fetch_checkpoint_epoch_seal_beacon = AsyncMock(
+        return_value=(200, replace(plan.epoch_beacon, round=201))
+    )
+    service._freeze_auction_populations = AsyncMock(return_value={})
     service._train_and_publish = AsyncMock(
         side_effect=[None, RuntimeError("stop")]
     )

@@ -98,6 +98,7 @@ class RejectReason(str, Enum):
     PRECOMMIT_REQUIRED = "precommit_required"
     PRECOMMIT_INVALID = "precommit_invalid"
     PRECOMMIT_EXPIRED = "precommit_expired"
+    REVEAL_NOT_SELECTED = "reveal_not_selected"
     PROTOCOL_MISMATCH = "protocol_mismatch"
     GENERATION_CONTRACT_MISMATCH = "generation_contract_mismatch"
     PROOF_CAPACITY_ABORT = "proof_capacity_abort"
@@ -322,6 +323,19 @@ class SubmissionPrecommitResponse(BaseModel):
     upload_deadline_ts: float | None = None
 
 
+class EpochCommitmentStatus(BaseModel):
+    """Status of an experimental compact commitment and its reveal right."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    receipt_id: str = Field(..., min_length=1, max_length=128)
+    status: Literal[
+        "pending_selection", "selected", "not_selected", "revealed", "expired"
+    ]
+    admission_beacon_round: int | None = Field(default=None, ge=1)
+    reveal_deadline_ts: float | None = None
+
+
 class GrpoBatchState(BaseModel):
     """Live window state for miners polling ``/state`` (v2.1)."""
 
@@ -351,6 +365,11 @@ class GrpoBatchState(BaseModel):
     checkpoint_epoch_collection_seconds: float | None = Field(
         default=None,
         gt=0,
+    )
+    checkpoint_epoch_phase: Literal["commitment", "reveal"] | None = None
+    checkpoint_epoch_reveal_seconds: float | None = Field(default=None, gt=0)
+    checkpoint_epoch_admission_beacon_round: int | None = Field(
+        default=None, ge=1
     )
     # v2.3: drand beacon randomness for this window. Empty string between
     # OPEN and the first successful _set_window_randomness; miners loop on

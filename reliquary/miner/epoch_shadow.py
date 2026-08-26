@@ -134,7 +134,10 @@ class EpochWorkBinding:
     training_mode: str
     target_groups_per_environment_lane: int
     candidate_limit_per_environment_lane: int
+    admission_policy: str
+    commitments_per_operator_per_environment_lane: int
     collection_seconds: float
+    reveal_seconds: float
     checkpoint_number: int
     checkpoint_repo_id: str
     checkpoint_revision: str
@@ -469,7 +472,12 @@ class EpochShadowPlanner:
                 candidate_limit_per_environment_lane=(
                     plan.candidate_limit_per_environment_lane
                 ),
+                admission_policy=plan.admission_policy,
+                commitments_per_operator_per_environment_lane=(
+                    plan.commitments_per_operator_per_environment_lane
+                ),
                 collection_seconds=plan.window_schedule.collection_seconds,
+                reveal_seconds=plan.reveal_seconds,
                 checkpoint_number=plan.checkpoint.number,
                 checkpoint_repo_id=plan.checkpoint.repo_id,
                 checkpoint_revision=plan.checkpoint.revision,
@@ -706,27 +714,21 @@ class EpochShadowPlanner:
         except (TypeError, ValueError):
             return []
         live_open = _state_text(_get(live_state, "state", "")) == "open"
-        advertised_remaining = _get(
-            live_state,
-            "checkpoint_epoch_candidate_remaining",
+        commitment_open = (
+            _state_text(_get(live_state, "checkpoint_epoch_phase", ""))
+            == "commitment"
         )
-        try:
-            release_budget = (
-                max(0, int(advertised_remaining))
-                if advertised_remaining is not None
-                else None
-            )
-        except (TypeError, ValueError):
-            return []
         released: list[Path] = []
         for path, record in self._records(self.queue_dir):
             binding = record.binding
             if record.status != "prepared":
                 continue
-            if live_window != binding.window_number or not live_open:
+            if (
+                live_window != binding.window_number
+                or not live_open
+                or not commitment_open
+            ):
                 continue
-            if release_budget is not None and len(released) >= release_budget:
-                break
             if _get(live_state, "randomness") != binding.generation_randomness:
                 self.invalidate_all("generation_randomness_mismatch")
                 return []
