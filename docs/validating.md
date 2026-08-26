@@ -257,8 +257,13 @@ resuming against the refreshed behavior policy.
 - `enforce` — seal a window once its outcome is provably fixed: productive
   capacity fully charged by terminal work, nothing in flight that could refund
   a slot, and **every accepted upload receipt resolved to its own grace
-  deadline**. New precommits are refused with `batch_filled` from the moment
-  dominance holds (the miner learns ~30 s earlier and saves a doomed upload).
+  deadline**, bounded at one grace past dominance — a body that completes
+  transport and then dies is unprunable, and an unbounded wait would latch the
+  refusal without ever sealing. New precommits are refused from the moment
+  dominance holds, with the same reason a sealed window gives
+  (`PRECOMMIT_EXPIRED` on the wire): terminal for the reference miner, which
+  retries `batch_filled`. The miner learns ~30 s earlier and skips a doomed
+  upload.
 
 Measured 2026-08-26: environments fill at +19-45 s and then reject everything
 for a median 79 s of the 102 s cycle. Enforce closes around fill+grace

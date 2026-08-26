@@ -165,6 +165,61 @@ def test_enforce_honours_receipt_graces_before_sealing(monkeypatch):
     assert b.early_close_sealed is True
 
 
+def test_refusal_is_derived_at_register_time_not_polled(monkeypatch):
+    """Dominance flips the instant a worker releases the last reservation.
+
+    poll_deadline runs every 0.5 s (service.py:2281). A precommit landing in
+    that gap must not be accepted: its 33 s grace would then hold the seal for
+    a third of the window, and its reveal is doomed anyway
+    (proof_grading_attempts_full). Register time must ask the same question the
+    poll asks, not read a cached answer.
+    """
+    b, advance = _clock_batcher("enforce", monkeypatch)
+    advance(25.0)
+    _dominant(b)
+    # No poll_deadline() call: the flag, if any, was never set.
+    accepted, reason, _ = b.try_register_upload_precommit(
+        "receipt-gap", "miner-gap",
+        t_arrival_wall=b.window_opened_wall_ts + 25.0,
+        payload_bytes=100,
+    )
+    assert accepted is False
+    assert reason == "collection_sealed"
+
+
+def test_enforce_seals_despite_an_unprunable_receipt(monkeypatch):
+    """A receipt that finished transport but never terminalised is unprunable.
+
+    ``_prune_upload_precommits_locked`` only expires reservations whose body
+    never arrived (``body_completed_at_wall is None and not revealed``). A raw
+    upload that reaches transport-complete and then dies — client disconnect,
+    handler cancellation — can never be pruned. Without a time bound the
+    enforce path would refuse every new precommit from dominance onward and
+    still never seal: strictly worse than off. The wait is bounded at
+    dominance + one grace, which is what the docstring promises.
+    """
+    from reliquary.constants import SUBMISSION_UPLOAD_GRACE_SECONDS
+
+    b, advance = _clock_batcher("enforce", monkeypatch)
+    advance(20.0)
+    accepted, _reason, _ = b.try_register_upload_precommit(
+        "receipt-wedged", "miner-wedged",
+        t_arrival_wall=b.window_opened_wall_ts + 20.0,
+        payload_bytes=100,
+    )
+    assert accepted is True
+    # Transport completed, terminalisation never happened: prune cannot touch it.
+    reservation = b._upload_precommits["receipt-wedged"]
+    reservation.body_completed_at_wall = b.window_opened_wall_ts + 21.0
+    reservation.revealed = True
+
+    _dominant(b)
+    assert b.poll_deadline() is False          # still inside the grace
+    advance(SUBMISSION_UPLOAD_GRACE_SECONDS + 1.0)
+    assert b.poll_deadline() is True           # bounded: seals anyway
+    assert b.early_close_sealed is True
+
+
 def test_enforce_refuses_new_receipts_once_dominant(monkeypatch):
     """Dominance closes the door to NEW receipts so the close converges.
 
@@ -182,7 +237,18 @@ def test_enforce_refuses_new_receipts_once_dominant(monkeypatch):
     assert b.is_sealed() is True
 
 
-def test_enforce_refusal_reason_is_batch_filled(monkeypatch):
+def test_enforce_refusal_reason_is_terminal_for_the_miner(monkeypatch):
+    """The refusal must not be one the reference miner retries.
+
+    ``submitter.py:395`` retries BATCH_FILLED through _RETRY_DELAYS
+    (1+2+4 s, four attempts) because upload capacity is normally a live pool
+    that can free a slot. Under dominance the refusal is PERMANENT for the
+    window, so BATCH_FILLED would quadruple refused-precommit traffic for the
+    whole refusal period and never deliver the early heads-up this feature
+    promises. ``collection_sealed`` is the existing internal reason for a
+    closed window and the server already maps it to PRECOMMIT_EXPIRED, which
+    the miner treats as terminal.
+    """
     b, advance = _clock_batcher("enforce", monkeypatch)
     advance(25.0)
 
@@ -202,7 +268,7 @@ def test_enforce_refusal_reason_is_batch_filled(monkeypatch):
         payload_bytes=100,
     )
     assert accepted is False
-    assert reason == "batch_filled"
+    assert reason == "collection_sealed"
 
 
 def test_shadow_does_not_refuse_receipts(monkeypatch):
@@ -243,3 +309,39 @@ def test_conservation_snapshot_reports_early_close(monkeypatch):
     assert early["mode"] == "shadow"
     assert early["eligible_offset_seconds"] == pytest.approx(25.0)
     assert early["sealed_early"] is False
+
+
+def test_empty_mode_falls_back_to_the_safe_default(monkeypatch):
+    """``RELIQUARY_AUCTION_EARLY_CLOSE_MODE=`` is a bare line in an env file.
+
+    os.environ.get's default only applies when the key is ABSENT. Raising on
+    "" would crash-loop the validator at import on a knob whose whole point is
+    to be safe by default — and .env files ship bare-empty lines. The file's
+    own convention (DIFFICULTY_AUCTION_ENFORCE, ENFORCE_ENVELOPE_SIGNATURE)
+    accepts "" explicitly.
+    """
+    import importlib
+
+    monkeypatch.setenv("RELIQUARY_AUCTION_EARLY_CLOSE_MODE", "")
+    import reliquary.constants as constants
+
+    reloaded = importlib.reload(constants)
+    try:
+        assert reloaded.AUCTION_EARLY_CLOSE_MODE == "shadow"
+    finally:
+        monkeypatch.delenv("RELIQUARY_AUCTION_EARLY_CLOSE_MODE", raising=False)
+        importlib.reload(constants)
+
+
+def test_a_wrong_mode_still_fails_loudly(monkeypatch):
+    import importlib
+
+    monkeypatch.setenv("RELIQUARY_AUCTION_EARLY_CLOSE_MODE", "sometimes")
+    import reliquary.constants as constants
+
+    try:
+        with pytest.raises(ValueError, match="EARLY_CLOSE_MODE"):
+            importlib.reload(constants)
+    finally:
+        monkeypatch.delenv("RELIQUARY_AUCTION_EARLY_CLOSE_MODE", raising=False)
+        importlib.reload(constants)
