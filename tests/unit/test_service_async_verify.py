@@ -169,6 +169,8 @@ def _make_test_service(use_drand: bool):
     svc.use_drand = use_drand
     svc._active_batcher = None
     svc._window_n = 0
+    svc._candidate_window_n = 42
+    svc._candidate_activation_nonce = b"\x01" * 32
     svc._verify_task = None
     svc._last_beacon = None
     svc.server = MagicMock()
@@ -221,11 +223,45 @@ async def test_set_window_randomness_does_not_block_on_verify(monkeypatch):
         f"_set_window_randomness took {elapsed:.2f}s — the verify is "
         f"blocking the hot path instead of running in background."
     )
-    assert svc._active_batcher.randomness == "computed_randomness"
+    assert svc._active_batcher.randomness == (
+        svc_mod._bind_window_activation_randomness(
+            "computed_randomness",
+            target_window=42,
+            activation_nonce=b"\x01" * 32,
+        )
+    )
     # Verify task should be scheduled — assert it exists then cancel
     # so the slow sleep doesn't hang the test.
     assert svc._verify_task is not None
     svc._verify_task.cancel()
+
+
+def test_activation_binding_is_window_and_nonce_specific():
+    from reliquary.validator.service import (
+        _bind_window_activation_randomness,
+    )
+
+    first = _bind_window_activation_randomness(
+        "public-beacon",
+        target_window=42,
+        activation_nonce=b"\x01" * 32,
+    )
+
+    assert first == _bind_window_activation_randomness(
+        "public-beacon",
+        target_window=42,
+        activation_nonce=b"\x01" * 32,
+    )
+    assert first != _bind_window_activation_randomness(
+        "public-beacon",
+        target_window=43,
+        activation_nonce=b"\x01" * 32,
+    )
+    assert first != _bind_window_activation_randomness(
+        "public-beacon",
+        target_window=42,
+        activation_nonce=b"\x02" * 32,
+    )
 
 
 @pytest.mark.asyncio

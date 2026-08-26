@@ -40,6 +40,7 @@ from reliquary.validator.observability import DrandRoundObservation, SubmitTelem
 from reliquary.validator.selection_digest import compute_rollouts_selection_digest
 from reliquary.validator.server import (
     _SubmissionBodyLimitMiddleware,
+    _SubmissionHttpProtocol,
     ValidatorServer,
     _QueuedAuctionSubmission,
     _UploadPrecommitReceipt,
@@ -415,7 +416,7 @@ async def test_grader_crash_prepared_result_retains_operator_prompt_claim():
 
 
 @pytest.mark.asyncio
-async def test_prepared_prompt_mismatch_recycles_precommit_capacity(monkeypatch):
+async def test_prepared_prompt_mismatch_releases_received_bytes(monkeypatch):
     """Reproduce the production ordering missed by the grading-refund tests.
 
     Prompt binding rejects in the isolated worker before
@@ -424,15 +425,7 @@ async def test_prepared_prompt_mismatch_recycles_precommit_capacity(monkeypatch)
     """
     import reliquary.validator.batcher as batcher_module
 
-    monkeypatch.setattr(
-        batcher_module, "MAX_PENDING_UPLOAD_PRECOMMITS_PER_ENV", 1
-    )
-    monkeypatch.setattr(
-        batcher_module, "MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW", 1
-    )
-    monkeypatch.setattr(
-        batcher_module, "MAX_UPLOAD_PRECOMMITS_PER_ENV_PER_WINDOW", 2
-    )
+    monkeypatch.setattr(batcher_module, "MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW", 1)
 
     batcher = _batcher(window_start=500)
     batcher.difficulty_auction_enabled = True
@@ -449,6 +442,15 @@ async def test_prepared_prompt_mismatch_recycles_precommit_capacity(monkeypatch)
     )
     assert accepted is True
     assert reason is None
+    assert batcher.account_upload_precommit_bytes(
+        receipt_id,
+        t_arrival_wall=batcher.window_opened_wall_ts,
+        chunk_bytes=len(raw_body),
+    ) == (True, None)
+    assert batcher.mark_upload_precommit_transport_complete(
+        receipt_id,
+        completed_at_wall=batcher.window_opened_wall_ts,
+    ) == (True, None)
     assert batcher.mark_upload_precommit_revealed(receipt_id) is True
 
     receipt = _UploadPrecommitReceipt(
@@ -668,6 +670,253 @@ async def test_upload_start_is_stamped_on_first_body_byte():
 
 
 @pytest.mark.asyncio
+async def test_wire_timestamps_override_delayed_application_receive():
+    wire_started_at = time.time() - 2.0
+    wire_completed_at = time.time() - 1.0
+    starts = []
+
+    async def downstream(scope, receive, _send):
+        state = scope.setdefault("state", {})
+        state["upload_start_callback"] = lambda started_at: (
+            starts.append(started_at) or (True, None)
+        )
+        assert (await receive())["body"] == b"payload"
+
+    app = _SubmissionBodyLimitMiddleware(downstream, max_bytes=100)
+
+    async def receive():
+        return {
+            "type": "http.request",
+            "body": b"payload",
+            "more_body": False,
+        }
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/submit",
+        "headers": [],
+        "state": {
+            "wire_body_started_at": wire_started_at,
+            "wire_body_completed_at": wire_completed_at,
+        },
+    }
+    await app(scope, receive, lambda _message: None)
+
+    assert starts == [wire_started_at]
+    assert scope["state"]["body_receive_started_at"] == wire_started_at
+    assert scope["state"]["body_completed_at"] == wire_completed_at
+
+
+@pytest.mark.asyncio
+async def test_body_completed_on_wire_before_deadline_survives_app_delay():
+    wire_completed_at = time.time() - 1.0
+    deadline = wire_completed_at + 0.1
+    sent = []
+
+    async def downstream(_scope, receive, send):
+        assert (await receive())["body"] == b"payload"
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    app = _SubmissionBodyLimitMiddleware(
+        downstream,
+        max_bytes=100,
+        deadline_resolver=lambda _scope, _path, _started: deadline,
+    )
+
+    async def receive():
+        return {
+            "type": "http.request",
+            "body": b"payload",
+            "more_body": False,
+        }
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/submit",
+        "headers": [],
+        "state": {"wire_body_completed_at": wire_completed_at},
+    }
+    await app(scope, receive, send)
+
+    assert sent[0]["status"] == 200
+    assert scope["state"].get("body_read_timed_out") is None
+
+
+@pytest.mark.asyncio
+async def test_duplicate_receipt_headers_are_rejected_before_body_read():
+    downstream_called = False
+
+    async def downstream(_scope, _receive, _send):
+        nonlocal downstream_called
+        downstream_called = True
+
+    app = _SubmissionBodyLimitMiddleware(downstream, max_bytes=100)
+    sent = []
+
+    async def receive():
+        raise AssertionError("ambiguous request body must not be read")
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/submit",
+        "headers": [
+            (b"x-reliquary-precommit", b"first"),
+            (b"x-reliquary-precommit", b"second"),
+        ],
+    }
+    await app(scope, receive, send)
+
+    assert downstream_called is False
+    assert sent[0]["status"] == 400
+    assert (b"connection", b"close") in sent[0]["headers"]
+
+
+def test_submission_protocol_closes_incomplete_headers_and_bodies():
+    closed = []
+    protocol = object.__new__(_SubmissionHttpProtocol)
+    protocol.transport = SimpleNamespace(
+        is_closing=lambda: False,
+        close=lambda: closed.append(True),
+    )
+    protocol.scope = {"state": {}}
+    protocol._header_read_timeout_handle = None
+    protocol._body_read_timeout_handle = None
+
+    protocol._header_read_timed_out()
+    protocol._body_read_timed_out()
+
+    assert closed == [True, True]
+    assert protocol.scope["state"]["wire_body_timed_out"] is True
+
+
+@pytest.mark.asyncio
+async def test_submission_protocol_stamps_wire_ingress():
+    import uvicorn
+    from uvicorn.server import ServerState
+
+    observed = {}
+
+    async def app(scope, receive, send):
+        body = b""
+        while True:
+            message = await receive()
+            body += message.get("body", b"")
+            if not message.get("more_body", False):
+                break
+        observed.update(scope["state"])
+        observed["body"] = body
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-length", b"2")],
+            }
+        )
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    config = uvicorn.Config(
+        app,
+        lifespan="off",
+        access_log=False,
+        log_level="error",
+        http=_SubmissionHttpProtocol,
+    )
+    config.load()
+    loop = asyncio.get_running_loop()
+    server_state = ServerState()
+    transport_server = await loop.create_server(
+        lambda: _SubmissionHttpProtocol(
+            config,
+            server_state,
+            {},
+            loop,
+        ),
+        "127.0.0.1",
+        0,
+    )
+    try:
+        port = transport_server.sockets[0].getsockname()[1]
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            b"POST /submit HTTP/1.1\r\n"
+            b"Host: validator.test\r\n"
+            b"Content-Length: 7\r\n"
+            b"Connection: close\r\n\r\n"
+            b"payload"
+        )
+        await writer.drain()
+        response = await reader.read()
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        transport_server.close()
+        await transport_server.wait_closed()
+
+    assert response.startswith(b"HTTP/1.1 200 OK")
+    assert observed["body"] == b"payload"
+    assert observed["wire_headers_completed_at"] <= observed["wire_body_started_at"]
+    assert observed["wire_body_started_at"] <= observed["wire_body_completed_at"]
+
+
+@pytest.mark.asyncio
+async def test_submission_protocol_closes_stalled_fresh_connection(monkeypatch):
+    import uvicorn
+    from uvicorn.server import ServerState
+    from reliquary.validator import server as server_module
+
+    monkeypatch.setattr(
+        server_module,
+        "SUBMISSION_HEADER_READ_TIMEOUT_SECONDS",
+        0.02,
+    )
+
+    async def app(_scope, _receive, _send):
+        raise AssertionError("incomplete headers must not reach ASGI")
+
+    config = uvicorn.Config(
+        app,
+        lifespan="off",
+        access_log=False,
+        log_level="error",
+        http=_SubmissionHttpProtocol,
+    )
+    config.load()
+    loop = asyncio.get_running_loop()
+    server_state = ServerState()
+    transport_server = await loop.create_server(
+        lambda: _SubmissionHttpProtocol(
+            config,
+            server_state,
+            {},
+            loop,
+        ),
+        "127.0.0.1",
+        0,
+    )
+    try:
+        port = transport_server.sockets[0].getsockname()[1]
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        closed = await asyncio.wait_for(reader.read(), timeout=0.5)
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        transport_server.close()
+        await transport_server.wait_closed()
+
+    assert closed == b""
+
+
+@pytest.mark.asyncio
 async def test_incomplete_precommit_body_times_out_and_closes_connection():
     async def downstream(_scope, receive, send):
         await receive()
@@ -797,12 +1046,237 @@ def test_inactive_signed_precommit_does_not_extend_collection():
         )
         assert replayed.json() == {
             "accepted": False,
-            "reason": RejectReason.PRECOMMIT_INVALID.value,
+            "reason": RejectReason.PRECOMMIT_EXPIRED.value,
         }
 
     circuit = server._no_reveal_circuit.health_snapshot(current_window=500)
     assert circuit["no_reveals_total"] == 1
     assert circuit["partial_strike_entries"] == 1
+
+
+def test_abandoned_started_upload_is_terminal_and_releases_bytes():
+    from reliquary.protocol.submission import WindowState
+
+    server = ValidatorServer()
+    batcher = _batcher(window_start=500)
+    batcher.difficulty_auction_enabled = True
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    request = _request(valid_merkle=True)
+    operator = "operator-coldkey"
+    server.set_registered_hotkeys(
+        {request.miner_hotkey},
+        operator_by_hotkey={request.miner_hotkey: operator},
+    )
+    payload = request.model_dump_json().encode("utf-8")
+    precommit = _precommit_for(request, payload_bytes=len(payload))
+
+    committed = (
+        TestClient(server.app)
+        .post(
+            "/submit/precommit",
+            content=precommit.model_dump_json(),
+            headers={"Content-Type": "application/json"},
+        )
+        .json()
+    )
+    receipt_id = committed["receipt_id"]
+    scope = {"state": {"wire_receipt_id": receipt_id}}
+    started_at = time.time()
+
+    assert server._wire_upload_event("chunk", scope, started_at, 1) == (
+        True,
+        None,
+    )
+    assert batcher.upload_precommit_payload_bytes == 1
+    assert server._wire_upload_event("aborted", scope, started_at + 0.1, 0) == (
+        False,
+        "upload_body_incomplete",
+    )
+
+    receipt = server._upload_precommit_receipts[receipt_id]
+    assert receipt.terminal is True
+    assert receipt.outcome == BatchSubmissionResponse(
+        accepted=False,
+        reason=RejectReason.PRECOMMIT_INVALID,
+    )
+    assert batcher.pending_upload_precommits == 0
+    assert batcher.upload_precommit_payload_bytes == 0
+    circuit = server._no_reveal_circuit.health_snapshot(current_window=500)
+    assert circuit["no_reveals_total"] == 1
+    assert circuit["valid_reveals_total"] == 0
+
+
+def test_wire_complete_reveal_is_not_expired_during_application_delay():
+    from reliquary.protocol.submission import WindowState
+
+    server = ValidatorServer()
+    batcher = _batcher(window_start=500)
+    batcher.difficulty_auction_enabled = True
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    request = _request(valid_merkle=True)
+    payload = request.model_dump_json().encode("utf-8")
+    precommit = _precommit_for(request, payload_bytes=len(payload))
+    committed = TestClient(server.app).post(
+        "/submit/precommit",
+        content=precommit.model_dump_json(),
+        headers={"Content-Type": "application/json"},
+    ).json()
+    receipt_id = committed["receipt_id"]
+    receipt = server._upload_precommit_receipts[receipt_id]
+    scope = {"state": {"wire_receipt_id": receipt_id}}
+
+    assert server._wire_upload_event(
+        "chunk",
+        scope,
+        receipt.expires_at_wall - 2.0,
+        len(payload),
+    ) == (True, None)
+    assert server._wire_upload_event(
+        "complete",
+        scope,
+        receipt.expires_at_wall - 1.0,
+        0,
+    ) == (True, None)
+
+    server._prune_upload_precommits(now=receipt.expires_at_wall + 1.0)
+
+    assert server._upload_precommit_receipts[receipt_id] is receipt
+    assert batcher.pending_upload_precommits == 1
+    circuit = server._no_reveal_circuit.health_snapshot(current_window=500)
+    assert circuit["no_reveals_total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_exact_malformed_body_is_not_counted_as_valid_reveal():
+    from reliquary.protocol.submission import WindowState
+
+    server = ValidatorServer()
+    server._auction_admission_enabled = True
+    batcher = _batcher(window_start=500)
+    batcher.difficulty_auction_enabled = True
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    request = _request(valid_merkle=True)
+    operator = "operator-coldkey"
+    server.set_registered_hotkeys(
+        {request.miner_hotkey},
+        operator_by_hotkey={request.miner_hotkey: operator},
+    )
+    malformed = b"x"
+    precommit = _precommit_for(
+        request,
+        payload_bytes=len(malformed),
+        payload_sha256=hashlib.sha256(malformed).hexdigest(),
+    )
+
+    with TestClient(server.app) as client:
+        committed = client.post(
+            "/submit/precommit",
+            content=precommit.model_dump_json(),
+            headers={"Content-Type": "application/json"},
+        ).json()
+        submitted = client.post(
+            "/submit",
+            content=malformed,
+            headers={
+                "Content-Type": "application/json",
+                "X-Reliquary-Precommit": committed["receipt_id"],
+            },
+        )
+
+    assert submitted.json() == {
+        "accepted": True,
+        "reason": RejectReason.SUBMITTED.value,
+    }
+    queued = server._submit_queue.get_nowait()
+    prepared = PreparedSubmission(
+        request=None,
+        completion_texts=[],
+        rewards=[],
+        rollout_hashes=[],
+        selection_digest=None,
+        reject_reason=RejectReason.BAD_SCHEMA,
+        reject_stage="body_parse",
+    )
+    server._admission_materialization_pool = ThreadPoolExecutor(max_workers=1)
+    server._run_admission_process = AsyncMock(return_value=prepared)
+    try:
+        await server._process_auction_submission(
+            queued,
+            server._submit_queue,
+        )
+    finally:
+        server._admission_materialization_pool.shutdown(wait=True)
+
+    receipt = server._upload_precommit_receipts[committed["receipt_id"]]
+    assert receipt.terminal is True
+    assert receipt.outcome == BatchSubmissionResponse(
+        accepted=False,
+        reason=RejectReason.BAD_SCHEMA,
+    )
+    circuit = server._no_reveal_circuit.health_snapshot(current_window=500)
+    assert circuit["no_reveals_total"] == 1
+    assert circuit["valid_reveals_total"] == 0
+
+
+def test_precommit_headers_cannot_prime_before_window_open():
+    from reliquary.protocol.submission import WindowState
+
+    server = ValidatorServer()
+    batcher = _batcher(window_start=500)
+    batcher.difficulty_auction_enabled = True
+    batcher.window_opened_wall_ts = time.time() + 10.0
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    request = _request(valid_merkle=True)
+    payload = request.model_dump_json().encode("utf-8")
+    precommit = _precommit_for(request, payload_bytes=len(payload))
+
+    response = TestClient(server.app).post(
+        "/submit/precommit",
+        content=precommit.model_dump_json(),
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "accepted": False,
+        "reason": RejectReason.WINDOW_NOT_ACTIVE.value,
+        "receipt_id": None,
+        "upload_deadline_ts": None,
+    }
+    assert batcher.pending_upload_precommits == 0
+
+
+def test_precommit_signature_saturation_fails_before_executor():
+    from reliquary.constants import MAX_PENDING_PROOF_QUEUE_DEPTH
+    from reliquary.protocol.submission import WindowState
+
+    server = ValidatorServer()
+    batcher = _batcher(window_start=500)
+    batcher.difficulty_auction_enabled = True
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    request = _request(valid_merkle=True)
+    payload = request.model_dump_json().encode("utf-8")
+    precommit = _precommit_for(request, payload_bytes=len(payload))
+    server._precommit_signature_pool = object()
+    server._precommit_signature_inflight = MAX_PENDING_PROOF_QUEUE_DEPTH
+
+    try:
+        response = TestClient(server.app).post(
+            "/submit/precommit",
+            content=precommit.model_dump_json(),
+            headers={"Content-Type": "application/json"},
+        )
+    finally:
+        server._precommit_signature_pool = None
+
+    assert response.status_code == 200
+    assert response.json()["reason"] == RejectReason.BATCH_FILLED.value
+    assert batcher.pending_upload_precommits == 0
 
 
 @pytest.mark.asyncio
@@ -929,6 +1403,59 @@ async def test_complete_precommit_body_time_is_authoritative_for_drand_reveal(
     assert observations[0] - header_arrival_started >= 0.02
     receipt = server._upload_precommit_receipts[committed["receipt_id"]]
     assert receipt.precommit_arrival_ts == observations[0]
+
+
+@pytest.mark.asyncio
+async def test_complete_direct_body_time_is_authoritative_for_drand(monkeypatch):
+    import httpx
+
+    from reliquary.protocol.submission import WindowState
+    from reliquary.validator.observability import DrandRoundObservation
+
+    server = ValidatorServer()
+    batcher = _batcher(window_start=500)
+    batcher.drand_round_check_enabled = True
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    request = _request(valid_merkle=True)
+    body = request.model_dump_json().encode("utf-8")
+    observations = []
+    final_chunk_sent_at = []
+
+    def observe(_self, drand_round, *, t_arrival=None):
+        observations.append(t_arrival)
+        return DrandRoundObservation(
+            submitted_drand_round=drand_round,
+            arrival_drand_round=drand_round,
+            drand_delta=0,
+            drand_tolerance=0,
+            drand_status="current",
+            reject_reason=None,
+        )
+
+    monkeypatch.setattr(GrpoWindowBatcher, "observe_drand_round", observe)
+
+    async def delayed_body():
+        midpoint = len(body) // 2
+        yield body[:midpoint]
+        await asyncio.sleep(0.03)
+        final_chunk_sent_at.append(time.time())
+        yield body[midpoint:]
+
+    transport = httpx.ASGITransport(app=server.app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://validator.test",
+    ) as client:
+        response = await client.post(
+            "/submit",
+            content=delayed_body(),
+            headers={"Content-Type": "application/json"},
+        )
+
+    assert response.status_code == 200
+    assert len(observations) == 1
+    assert observations[0] >= final_chunk_sent_at[0]
 
 
 @pytest.mark.asyncio
@@ -1882,8 +2409,8 @@ def test_health_exposes_each_environment_window_independently():
             "terminal_decisions": 0,
             "pending": 0,
             "conserved": True,
-            "pending_limit": 64,
-            "total_limit": 256,
+            "pending_limit": None,
+            "total_limit": None,
             "peak_pending": 0,
             "capacity_reserved": 0,
             "productive_capacity_used": 3,

@@ -112,6 +112,27 @@ from reliquary.validator.training import TrainingStepSkipped, train_step
 from reliquary.validator.training_accumulator import BalancedTrainingAccumulator
 from reliquary.validator.utility_telemetry import UtilityTelemetryWriter
 
+
+_WINDOW_ACTIVATION_RANDOMNESS_DOMAIN = b"reliquary/window-activation/v1\x00"
+
+
+def _bind_window_activation_randomness(
+    beacon_randomness: str,
+    *,
+    target_window: int,
+    activation_nonce: bytes,
+) -> str:
+    """Bind public beacon material to a nonce fixed before publication."""
+    digest = hashlib.sha256()
+    digest.update(_WINDOW_ACTIVATION_RANDOMNESS_DOMAIN)
+    digest.update(int(target_window).to_bytes(8, "big", signed=False))
+    encoded_randomness = str(beacon_randomness).encode("utf-8")
+    digest.update(len(encoded_randomness).to_bytes(4, "big"))
+    digest.update(encoded_randomness)
+    digest.update(bytes(activation_nonce))
+    return digest.hexdigest()
+
+
 logger = logging.getLogger(__name__)
 
 _HF_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
@@ -759,6 +780,7 @@ class ValidationService:
         # startup from R2 + HF (no local JSON state file).
         self._window_n: int = 0
         self._candidate_window_n: int | None = None
+        self._candidate_activation_nonce: bytes | None = None
         self._window_preparation_stage: str | None = None
         self._checkpoint_n: int = 0
         self._publish_every = CHECKPOINT_PUBLISH_INTERVAL_WINDOWS
@@ -1706,6 +1728,8 @@ class ValidationService:
         """
         if self._candidate_window_n is None:
             self._candidate_window_n = self._window_n + 1
+        if self._candidate_activation_nonce is None:
+            self._candidate_activation_nonce = os.urandom(32)
         target_window = self._candidate_window_n
         self._set_window_preparation_stage("batcher_construction")
         bootstrap = is_bootstrap_window(
@@ -1791,6 +1815,7 @@ class ValidationService:
         self.server.set_active_batchers(self._active_batchers)
         self._window_n = int(self._candidate_window_n)
         self._candidate_window_n = None
+        self._candidate_activation_nonce = None
         self._window_preparation_stage = None
         self.server.clear_window_preparation_failure()
         self._publish_window_preparation_state()
@@ -2261,9 +2286,8 @@ class ValidationService:
         """Populate all active batchers' per-window randomness seed.
 
         GRAIL sketch verification re-derives challenge indices from this
-        seed; miner and validator must agree. The miner derives it from
-        the same block hash + drand round, so the values match bit-for-bit.
-        All batchers share the same randomness for a given window.
+        seed; miner and validator must agree on the value published by
+        ``/state``. All batchers share the same randomness for a given window.
 
         Retries on transient substrate failures (finney returning HTTP 503
         or WebSocket handshake errors) before bubbling. Without retries,
@@ -2315,6 +2339,16 @@ class ValidationService:
         if randomness is None:
             assert last_exc is not None
             raise last_exc
+
+        if self.use_drand:
+            activation_nonce = getattr(self, "_candidate_activation_nonce", None)
+            if activation_nonce is None:
+                raise RuntimeError("window activation nonce is unavailable")
+            randomness = _bind_window_activation_randomness(
+                randomness,
+                target_window=int(target_window),
+                activation_nonce=activation_nonce,
+            )
 
         for batcher in self._active_batchers.values():
             batcher.randomness = randomness
@@ -5088,7 +5122,7 @@ class ValidationService:
     async def _derive_randomness(
         self, subtensor, target_window: int,
     ) -> tuple[str, dict | None]:
-        """v2.3+: drand-only seed bound to the round publishing AT window OPEN.
+        """Fetch public drand material for the next window seed.
 
         Returns ``(window_randomness, beacon_or_None)``. ``beacon`` is the
         raw drand beacon dict (``{round, randomness, signature, ...}``)
@@ -5096,10 +5130,8 @@ class ValidationService:
         background bittensor_drand cross-check. ``None`` on the legacy
         mock path (no cross-check possible).
 
-        Called after ``_wait_for_next_drand_boundary`` so the wall-clock-
-        current drand round corresponds to the one whose σ just became
-        publicly available. Miners cannot pre-fetch this σ because it
-        didn't exist a few seconds ago.
+        The caller binds this public value to the candidate's preselected
+        activation nonce before exposing the final seed at OPEN.
         """
         if self.use_drand:
             import time

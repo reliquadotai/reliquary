@@ -91,6 +91,16 @@ assert UPLOAD_GRACE_PERIOD == BLOCK_TIME_VARIANCE + NETWORK_UPLOAD_LATENCY
 # arriving before the collection cutoff to arm it.
 SUBMISSION_UPLOAD_GRACE_SECONDS = float(UPLOAD_GRACE_PERIOD)
 
+# Bound request headers before an ASGI scope exists. Uvicorn's keep-alive
+# timeout does not cover a fresh connection that is still sending headers.
+SUBMISSION_HEADER_READ_TIMEOUT_SECONDS = float(
+    _os.environ.get("RELIQUARY_SUBMISSION_HEADER_READ_TIMEOUT_SECONDS", "5")
+)
+if SUBMISSION_HEADER_READ_TIMEOUT_SECONDS <= 0:
+    raise ValueError(
+        "RELIQUARY_SUBMISSION_HEADER_READ_TIMEOUT_SECONDS must be positive"
+    )
+
 # A signed precommit is at most 16 KiB and has no reason to remain partially
 # uploaded. Bound its transport lifetime independently from the collection
 # interval so header-only and slow-body requests cannot retain HTTP tasks.
@@ -741,27 +751,12 @@ MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW = (
     2 * B_BATCH if PROTOCOL_VERSION >= 4 else B_BATCH
 )
 
-# Signed upload precommits are tiny, but still bounded independently from the
-# large-body proof queue.  This is a LIVE/concurrent cap: a terminal decision or
-# expiry releases the reservation so cheap pre-grading rejects cannot burn the
-# rest of the window.  The separate cumulative ceiling below keeps that refund
-# from permitting unbounded receipt/preparation churn.
-MAX_PENDING_UPLOAD_PRECOMMITS_PER_ENV = MAX_PENDING_PROOF_QUEUE_DEPTH
-
-# A single identity may cover every target prompt concurrently, but may not
-# occupy a disproportionate share of the global receipt pool.  The operator cap
-# closes the same-coldkey/multiple-hotkey bypass using the immutable metagraph
-# ownership snapshot already used by auction identity and proof-debt checks.
+# A signed upload precommit grants only a bounded right to upload.  There is no
+# global receipt ceiling: any global counter can be deliberately burned before
+# honest bodies arrive.  Per-identity active bounds keep receipt memory finite
+# while actual chunks remain subject to the existing byte caps.
 MAX_PENDING_UPLOAD_PRECOMMITS_PER_HOTKEY = B_BATCH
 MAX_PENDING_UPLOAD_PRECOMMITS_PER_OPERATOR = B_BATCH
-
-# Never-refunded per-environment/window backstop.  Prompt binding and other
-# isolated-admission rejects happen before ``start_revealed_admission`` and are
-# therefore invisible to ``MAX_GRADING_STARTS_PER_WINDOW``; counting accepted
-# signed receipts here bounds that pre-grading work as well.  Four times the
-# productive capacity leaves ample replacement headroom without making receipt
-# issuance unbounded.
-MAX_UPLOAD_PRECOMMITS_PER_ENV_PER_WINDOW = MAX_GRADING_STARTS_PER_WINDOW
 
 # Repeated canonical prompt-binding failures identify an incompatible miner
 # client before any useful grading/proof work can happen.  Three mismatches in

@@ -189,6 +189,7 @@ class SubmitTelemetry:
         payload_sha256: str | None = None,
         t_body_started: float | None = None,
         t_body_completed: float | None = None,
+        t_ingress_started: float | None = None,
         queue_depth_at_arrival: int | None = None,
     ) -> "SubmitTelemetry":
         body_read_ms = None
@@ -198,8 +199,12 @@ class SubmitTelemetry:
             )
         ingress_ms = None
         if t_body_completed is not None:
+            ingress_started = (
+                t_arrival if t_ingress_started is None else float(t_ingress_started)
+            )
             ingress_ms = max(
-                0.0, (float(t_body_completed) - float(t_arrival)) * 1000.0
+                0.0,
+                (float(t_body_completed) - ingress_started) * 1000.0,
             )
         return cls(
             window_n=request.window_start,

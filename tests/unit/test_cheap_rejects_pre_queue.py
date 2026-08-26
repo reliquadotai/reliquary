@@ -807,11 +807,10 @@ def test_cheap_reject_log_includes_drand_round():
 
 
 def test_validate_drand_round_called_with_arrival_timestamp():
-    """The HTTP cheap-reject must forward the middleware-stamped
-    ``t_arrival`` into ``batcher.validate_drand_round``. Without this,
-    the drand check uses ``time.time()`` at handler-execution time and
-    becomes vulnerable to event-loop stalls — the prod failure mode the
-    arrival-time stamping was added to fix.
+    """The HTTP cheap-reject must forward the completed-body timestamp.
+
+    The worker must not re-read wall time after queueing, and request headers
+    must not antedate an incomplete signed body.
     """
     import time
 
@@ -831,13 +830,11 @@ def test_validate_drand_round_called_with_arrival_timestamp():
     )
     _args, kwargs = batcher.validate_drand_round.call_args
     assert "t_arrival" in kwargs, (
-        "/submit must pass t_arrival kwarg (middleware-stamped wall clock) "
-        "into validate_drand_round — the bug this regression test pins is "
-        "the handler reading time.time() too late, after a stall"
+        "/submit must pass the completed-body t_arrival into validate_drand_round"
     )
     t_arrival = kwargs["t_arrival"]
     # The stamp must land between t_before and t_after — i.e. the
-    # middleware ran in real time on this request, not some cached value.
+    # body completed in real time on this request, not some cached value.
     assert t_before <= t_arrival <= t_after, (
         f"t_arrival={t_arrival} outside [{t_before}, {t_after}] — "
         "middleware is stamping the wrong instant"
@@ -845,15 +842,10 @@ def test_validate_drand_round_called_with_arrival_timestamp():
 
 
 def test_stalled_handler_does_not_reject_round_inside_arrival_window():
-    """Simulate the v2.3 prod failure mode: the asyncio loop stalls for
-    >30 s after the middleware ran, so by the time ``batcher.validate_drand_round``
-    executes the wall clock is many drand rounds ahead of the timestamp
-    the middleware recorded.
+    """The drand gate uses fixed ingress time, never worker dequeue time.
 
-    With arrival-time stamping, the check uses the middleware timestamp,
-    not the (stalled) wall clock. The submission lands inside its round
-    and must be accepted, even though a wall-clock-based check would
-    reject it as STALE_ROUND.
+    Once the complete body is stamped, later handler or queue latency cannot
+    turn an on-time request into a stale one.
     """
     import time
 
