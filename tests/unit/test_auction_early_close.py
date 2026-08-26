@@ -345,3 +345,32 @@ def test_a_wrong_mode_still_fails_loudly(monkeypatch):
     finally:
         monkeypatch.delenv("RELIQUARY_AUCTION_EARLY_CLOSE_MODE", raising=False)
         importlib.reload(constants)
+
+
+def test_conservation_snapshot_does_not_deadlock_in_enforce(monkeypatch):
+    """``_proof_admission_lock`` is a plain Lock, and this caller holds it.
+
+    ``upload_precommit_conservation`` takes the precommit lock and then the
+    admission lock before reading the early-close block. A helper that
+    re-acquires the admission lock self-deadlocks the calling thread — and the
+    caller is the event loop, reached from /state, so the validator freezes
+    outright. Shadow mode returns before the lock and hides this entirely,
+    which is why the mode matters in this test.
+    """
+    import threading
+
+    b, advance = _clock_batcher("enforce", monkeypatch)
+    advance(25.0)
+    _dominant(b)
+
+    done = threading.Event()
+    result: list = []
+
+    def _call() -> None:
+        result.append(b.upload_precommit_conservation())
+        done.set()
+
+    thread = threading.Thread(target=_call, daemon=True)
+    thread.start()
+    assert done.wait(5.0), "upload_precommit_conservation deadlocked"
+    assert result[0]["early_close"]["refusing_precommits"] is True
