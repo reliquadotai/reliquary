@@ -1013,3 +1013,79 @@ def test_an_aborted_plan_does_not_survive_the_next_one():
         assert [ref() for ref in alive] == [None, None]
     finally:
         assert scheduler.close()
+
+
+def test_a_finished_plan_leaves_the_live_map():
+    """The whole plan must go, not just its payloads.
+
+    Clearing fields one by one only reclaims the fields someone thought to
+    list. ``final_result`` and its ``decisions`` stay by design — and
+    ``ProofDecision.value`` is the verifier's opaque output, which is not
+    small. Retiring the entry reclaims the class of problem instead of one
+    member of it, and the caller keeps its result because ``ProofPlanHandle``
+    holds its own reference to the state.
+    """
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0",),
+        environments=(MATH, CODE),
+        proof_callable=lambda invocation: True,
+        checkpoint_revision="rev-a",
+    )
+    try:
+        handle, result = _submit_and_finish(
+            scheduler, "window-1", _payload_candidates(2), required=2,
+        )
+        assert "window-1" not in scheduler._plans
+        # The caller still holds everything it was promised.
+        assert handle.done()
+        assert len(handle.decisions()) == 2
+        assert result is handle.result(2)
+    finally:
+        assert scheduler.close()
+
+
+def test_a_retired_plan_id_is_still_rejected():
+    """Anti-replay survives the retirement, through a bounded id set."""
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0",),
+        environments=(MATH, CODE),
+        proof_callable=lambda invocation: True,
+        checkpoint_revision="rev-a",
+    )
+    try:
+        _submit_and_finish(
+            scheduler, "window-1", _payload_candidates(2), required=2,
+        )
+        with pytest.raises(ValueError, match="duplicate plan_id"):
+            scheduler.submit(
+                _plan("window-1", MATH, _payload_candidates(2), required=2)
+            )
+    finally:
+        assert scheduler.close()
+
+
+def test_the_retired_id_memory_is_bounded():
+    """A set of ids that grows forever is the same bug in a cheaper suit."""
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0",),
+        environments=(MATH, CODE),
+        proof_callable=lambda invocation: True,
+        checkpoint_revision="rev-a",
+    )
+    try:
+        cap = scheduler._retired_plan_ids.maxlen
+        assert cap is not None and cap > 0
+        for index in range(cap + 5):
+            _submit_and_finish(
+                scheduler,
+                f"window-{index}",
+                _payload_candidates(1),
+                required=1,
+            )
+        assert len(scheduler._retired_plan_ids) == cap
+        assert len(scheduler._retired_plan_id_set) == cap
+        # The oldest ids rolled off, so they are submittable again — which is
+        # correct: this guard catches a plan_id generator bug, not a miner.
+        assert "window-0" not in scheduler._retired_plan_id_set
+    finally:
+        assert scheduler.close()
