@@ -351,6 +351,145 @@ def test_hidden_resource_failure_is_applied_before_lower_rank_dispatch():
         assert scheduler.close()
 
 
+def test_buffered_target_does_not_strand_an_earlier_rank_gap():
+    """A later RAW result cannot reserve a winner through a PENDING gap.
+
+    Ranks 1 and 2 reject.  Rank 3 then passes while rank 6 finishes out of
+    order.  Rank 5 was correctly held behind rank 4's unresolved resource
+    claim, but becomes the next applicable candidate when rank 3 claims that
+    prompt and skips rank 4.  Counting rank 6 as an outstanding winner at that
+    point must not leave rank 5 pending with both devices idle.
+    """
+
+    leaders_started = threading.Barrier(3)
+    release_leaders = threading.Event()
+    rank_three_started = threading.Event()
+    release_rank_three = threading.Event()
+    rank_six_finished = threading.Event()
+    rank_five_started = threading.Event()
+
+    def prove(invocation):
+        rank = invocation.candidate.rank
+        if rank in {1, 2}:
+            leaders_started.wait(timeout=2)
+            assert release_leaders.wait(2)
+            return False
+        if rank == 3:
+            rank_three_started.set()
+            assert release_rank_three.wait(2)
+            return True
+        if rank == 5:
+            rank_five_started.set()
+            return True
+        if rank == 6:
+            rank_six_finished.set()
+            return True
+        raise AssertionError(f"unexpected proof rank {rank}")
+
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0", "gpu-1"),
+        environments=(MATH, CODE),
+        proof_callable=prove,
+        checkpoint_revision="rev-a",
+    )
+    try:
+        handle = scheduler.submit(
+            replace(
+                _plan(
+                    "code-window",
+                    CODE,
+                    [
+                        _candidate(1, prompt="leader-one"),
+                        _candidate(2, prompt="leader-two"),
+                        _candidate(3, prompt="winner"),
+                        _candidate(
+                            4,
+                            prompt="winner",
+                            resources=(("operator-gap", 4),),
+                        ),
+                        _candidate(
+                            5,
+                            prompt="rank-gap",
+                            resources=(("operator-gap", 4),),
+                        ),
+                        _candidate(6, prompt="leader-two"),
+                    ],
+                    required=2,
+                ),
+                allow_shortfall=True,
+            )
+        )
+
+        leaders_started.wait(timeout=2)
+        release_leaders.set()
+        assert rank_three_started.wait(2)
+        assert rank_six_finished.wait(2)
+        release_rank_three.set()
+
+        assert rank_five_started.wait(2)
+        result = handle.result(2)
+
+        assert result.outcome is ProofPlanOutcome.COMPLETED
+        assert result.abort_reason is None
+        assert result.winner_job_ids == ("job-3", "job-5")
+        assert [decision.status for decision in result.decisions] == [
+            ProofDecisionStatus.REJECTED,
+            ProofDecisionStatus.REJECTED,
+            ProofDecisionStatus.PASSED,
+            ProofDecisionStatus.SKIPPED_PROMPT_CLAIMED,
+            ProofDecisionStatus.PASSED,
+            ProofDecisionStatus.NOT_NEEDED,
+        ]
+        snapshot = scheduler.snapshot()
+        assert snapshot["active_resource_count"] == 0
+        assert snapshot["queue_depth_by_environment"][CODE] == 0
+        assert snapshot["buffered_results_by_environment"][CODE] == 0
+    finally:
+        release_leaders.set()
+        release_rank_three.set()
+        assert scheduler.close()
+
+
+def test_applicable_outstanding_work_still_reserves_the_target():
+    release_leader = threading.Event()
+    leader_started = threading.Event()
+    lower_started = threading.Event()
+
+    def prove(invocation):
+        if invocation.candidate.rank == 1:
+            leader_started.set()
+            assert release_leader.wait(2)
+        else:
+            lower_started.set()
+        return True
+
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0", "gpu-1"),
+        environments=(MATH, CODE),
+        proof_callable=prove,
+        checkpoint_revision="rev-a",
+    )
+    try:
+        handle = scheduler.submit(
+            _plan(
+                "math-window",
+                MATH,
+                [_candidate(1), _candidate(2)],
+                required=1,
+            )
+        )
+        assert leader_started.wait(2)
+        assert not lower_started.wait(0.1)
+        release_leader.set()
+
+        result = handle.result(2)
+        assert result.winner_job_ids == ("job-1",)
+        assert result.attempts_started == 1
+    finally:
+        release_leader.set()
+        assert scheduler.close()
+
+
 def test_resource_failure_limit_skips_identity_and_promotes_other_operator():
     invoked = []
 

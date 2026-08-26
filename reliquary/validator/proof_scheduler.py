@@ -874,12 +874,20 @@ class GlobalProofScheduler:
         ):
             return None
         if not state.plan.complete_all:
-            outstanding = sum(
-                phase in (_JobPhase.ACTIVE, _JobPhase.RAW)
-                for phase in state.phases.values()
-            )
+            # Only work in the contiguous applicable prefix can reserve a
+            # potential winner.  A RAW result behind a PENDING rank gap cannot
+            # be applied yet; counting it here can idle every device forever:
+            # the gap is not dispatched because the target appears covered,
+            # while strict rank order prevents the RAW result from advancing.
+            applicable_outstanding = 0
+            for candidate in state.candidates[state.next_apply_index:]:
+                phase = state.phases[candidate.job_id]
+                if phase is _JobPhase.PENDING:
+                    break
+                if phase in (_JobPhase.ACTIVE, _JobPhase.RAW):
+                    applicable_outstanding += 1
             if (
-                state.passed + outstanding
+                state.passed + applicable_outstanding
                 >= state.plan.required_passes
             ):
                 return None
