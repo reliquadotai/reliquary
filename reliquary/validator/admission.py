@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import multiprocessing
+import multiprocessing.util
 import os
 import signal
 import time
@@ -153,22 +154,52 @@ class _AdmissionTimeout(TimeoutError):
 
 
 _WORKER_TOKENIZER: Any | None = None
+# multiprocessing.Queue closes its feeder at exit priority 10. This listener
+# owner must run first so QueueListener._monitor is no longer reading the pipe.
+_BITTENSOR_LISTENER_EXIT_PRIORITY = 20
+
+
+def _shutdown_bittensor_queue_logging(
+    listener: Any,
+    logging_queue: Any,
+) -> None:
+    """Stop a child-local listener before multiprocessing closes its queue."""
+    thread = getattr(listener, "_thread", None)
+    if thread is not None:
+        try:
+            listener.stop()
+        except (EOFError, OSError, ValueError):
+            # The dequeue guard below also turns an already-closing queue into
+            # a stop sentinel.  Do not turn best-effort process teardown into
+            # a worker failure if the queue won that race.
+            pass
+    if logging_queue is None:
+        return
+    try:
+        logging_queue.close()
+    except (OSError, ValueError):
+        pass
+    try:
+        logging_queue.join_thread()
+    except (AssertionError, OSError, ValueError):
+        pass
 
 
 def _guard_bittensor_queue_listener_eof_in_child() -> bool:
-    """Make bittensor's admission-child QueueListener exit cleanly on EOF.
+    """Own bittensor queue logging for the admission-child lifetime.
 
     Importing the signature verifier imports bittensor, whose global logger
     starts a multiprocessing queue listener.  ``ProcessPoolExecutor`` retires
-    admission children after a bounded number of tasks; Python's process
-    teardown can close the queue pipe before that listener stops, producing a
-    noisy ``QueueListener ... EOFError`` thread traceback.
+    admission children after a bounded number of tasks. Multiprocessing runs
+    its own finalizers before normal ``atexit`` callbacks, so its queue feeder
+    closes the pipe while bittensor's listener is still blocked in ``get()``.
+    That races every natural worker recycle and produces a background
+    ``QueueListener ... EOFError`` traceback.
 
-    Do not close or join bittensor's queue here: doing so in a spawn initializer
-    can stall process-pool startup.  QueueListener treats ``None`` as its stop
-    sentinel, so translating teardown-only EOF/OSError to ``None`` preserves
-    normal logging while making retirement graceful.  The parent validator
-    logger is untouched.
+    Register a higher-priority multiprocessing finalizer in the child so the
+    listener consumes its sentinel before the queue is closed and joined. The
+    dequeue guard remains a last-resort stop for an already-closing pipe. The
+    parent validator logger is untouched.
     """
 
     if multiprocessing.parent_process() is None:
@@ -178,8 +209,13 @@ def _guard_bittensor_queue_listener_eof_in_child() -> bool:
 
         logging_machine = getattr(bt, "logging", None)
         listener = getattr(logging_machine, "_listener", None)
+        logging_queue = getattr(logging_machine, "_queue", None)
         dequeue = getattr(listener, "dequeue", None)
-        if listener is None or not callable(dequeue):
+        if (
+            listener is None
+            or logging_queue is None
+            or not callable(dequeue)
+        ):
             return False
         if getattr(listener, "_reliquary_eof_guarded", False):
             return True
@@ -187,10 +223,22 @@ def _guard_bittensor_queue_listener_eof_in_child() -> bool:
         def _safe_dequeue(block: bool) -> Any:
             try:
                 return dequeue(block)
-            except (EOFError, OSError):
+            except (EOFError, OSError, ValueError):
                 return None
 
         listener.dequeue = _safe_dequeue
+        # Bittensor registers listener.stop with regular atexit. A spawned
+        # multiprocessing child runs multiprocessing finalizers first, after
+        # which that callback is too late (and would be a duplicate stop).
+        import atexit
+
+        atexit.unregister(listener.stop)
+        listener._reliquary_queue_finalizer = multiprocessing.util.Finalize(
+            None,
+            _shutdown_bittensor_queue_logging,
+            args=(listener, logging_queue),
+            exitpriority=_BITTENSOR_LISTENER_EXIT_PRIORITY,
+        )
         listener._reliquary_eof_guarded = True
         return True
     except Exception:

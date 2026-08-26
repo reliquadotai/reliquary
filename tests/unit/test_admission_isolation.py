@@ -74,6 +74,40 @@ def _echo_worker(value: str) -> str:
     return value
 
 
+def _probe_admission_listener(marker: str) -> tuple[int, bool, bool]:
+    """Prove one recycled child can still deliver through its bt listener."""
+    import logging
+
+    listener = bt.logging._listener
+    delivered = threading.Event()
+
+    class _ProbeHandler(logging.Handler):
+        def emit(self, record):
+            if record.getMessage() == marker:
+                delivered.set()
+
+    handler = _ProbeHandler()
+    original_handlers = listener.handlers
+    listener.handlers = (*original_handlers, handler)
+    try:
+        bt.logging.get_queue().put_nowait(
+            logging.LogRecord(
+                "reliquary.admission.listener.probe",
+                logging.INFO,
+                __file__,
+                0,
+                marker,
+                (),
+                None,
+            )
+        )
+        observed = delivered.wait(timeout=2.0)
+    finally:
+        listener.handlers = original_handlers
+    finalizer = getattr(listener, "_reliquary_queue_finalizer", None)
+    return os.getpid(), observed, bool(finalizer and finalizer.still_active())
+
+
 def _server_with_admission_pool() -> tuple[ValidatorServer, str]:
     environment = "openmathinstruct"
     server = ValidatorServer()
@@ -93,12 +127,15 @@ def _server_with_admission_pool() -> tuple[ValidatorServer, str]:
 
 def test_admission_child_queue_listener_treats_eof_as_stop(monkeypatch):
     class _Listener:
+        def stop(self):
+            pass
+
         def dequeue(self, _block):
             raise EOFError
 
     listener = _Listener()
     fake_bt = SimpleNamespace(
-        logging=SimpleNamespace(_listener=listener)
+        logging=SimpleNamespace(_listener=listener, _queue=object())
     )
     monkeypatch.setitem(sys.modules, "bittensor", fake_bt)
     monkeypatch.setattr(
@@ -108,6 +145,31 @@ def test_admission_child_queue_listener_treats_eof_as_stop(monkeypatch):
     assert _guard_bittensor_queue_listener_eof_in_child() is True
     assert listener.dequeue(True) is None
     assert listener._reliquary_eof_guarded is True
+    listener._reliquary_queue_finalizer.cancel()
+
+
+def test_recycled_admission_workers_keep_listener_and_exit_without_trace(capfd):
+    markers = [f"listener-recycle-{index}" for index in range(2)]
+    with ProcessPoolExecutor(
+        max_workers=1,
+        mp_context=multiprocessing.get_context("spawn"),
+        initializer=initialize_admission_worker,
+        max_tasks_per_child=1,
+    ) as executor:
+        probes = [
+            executor.submit(_probe_admission_listener, marker).result(
+                timeout=15.0
+            )
+            for marker in markers
+        ]
+
+    captured = capfd.readouterr()
+    assert len({pid for pid, _observed, _finalizer in probes}) == len(markers)
+    assert all(observed for _pid, observed, _finalizer in probes)
+    assert all(finalizer for _pid, _observed, finalizer in probes)
+    assert "Exception in thread" not in captured.err
+    assert "QueueListener._monitor" not in captured.err
+    assert "EOFError" not in captured.err
 
 
 def test_new_admission_pool_prewarms_every_worker(monkeypatch):
