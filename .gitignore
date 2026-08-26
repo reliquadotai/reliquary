@@ -9,6 +9,8 @@ __pycache__/
 # Secrets — hotkey private keys must never be committed
 wallet_deploy/
 .env
+docker/.env.cpu-executor
+docker/pki/
 
 # Local Claude Code state
 .claude/

@@ -31,6 +31,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -38,6 +39,18 @@ from reliquary.constants import (
     GRADER_EVAL_TIMEOUT_SECONDS,
     GRADER_POOL_SIZE,
     GRADER_SOCKET_PATH,
+)
+from reliquary.environment.grader.executor import (
+    MAX_EXECUTOR_RESPONSE_BYTES,
+    SandboxBatchRequest,
+    SandboxBatchResult,
+    SandboxCaseResult,
+    SandboxExecutor,
+    SandboxExecutorError,
+    grader_runtime_id,
+    make_sandbox_batch_request,
+    remote_executor_from_env,
+    remote_executor_mode_from_env,
 )
 from reliquary.infrastructure.process_health import (
     DEFAULT_GRADER_HEALTH_PATH,
@@ -178,6 +191,13 @@ class GraderServer:
         metrics_port: int = 9876,
         health_path: str = DEFAULT_GRADER_HEALTH_PATH,
         health_heartbeat_s: float = GRADER_HEALTH_HEARTBEAT_SECONDS,
+        sandbox_executor: SandboxExecutor | None = None,
+        shadow_executor: SandboxExecutor | None = None,
+        shadow_workers: int = 4,
+        retire_worker_after_batch: bool = False,
+        worker_acquire_timeout_s: float = 30.0,
+        listen_unix_socket: bool = True,
+        runtime_id: str | None = None,
     ) -> None:
         self.socket_path = socket_path
         self.pool_size = pool_size
@@ -196,6 +216,33 @@ class GraderServer:
         self.recycle_after_evals = recycle_after_evals
         self.metrics_port = metrics_port
         self.health_path = health_path
+        if sandbox_executor is not None and shadow_executor is not None:
+            raise ValueError("authoritative and shadow executors are mutually exclusive")
+        if shadow_workers <= 0:
+            raise ValueError("shadow_workers must be positive")
+        if worker_acquire_timeout_s <= 0:
+            raise ValueError("worker_acquire_timeout_s must be positive")
+        self.sandbox_executor = sandbox_executor
+        self.shadow_executor = shadow_executor
+        self.retire_worker_after_batch = retire_worker_after_batch
+        self.worker_acquire_timeout_s = worker_acquire_timeout_s
+        self._shadow_pool = (
+            ThreadPoolExecutor(
+                max_workers=shadow_workers,
+                thread_name_prefix="grader-shadow",
+            )
+            if shadow_executor is not None
+            else None
+        )
+        self._shadow_lock = threading.Lock()
+        self._shadow_capacity = threading.BoundedSemaphore(shadow_workers * 2)
+        self._shadow_inflight = 0
+        self._shadow_matches_total = 0
+        self._shadow_mismatches_total = 0
+        self._shadow_failures_total = 0
+        self._shadow_dropped_total = 0
+        self.listen_unix_socket = listen_unix_socket
+        self.runtime_id = runtime_id or grader_runtime_id()
         if not 0.0 < health_heartbeat_s <= GRADER_HEALTH_HEARTBEAT_SECONDS:
             raise ValueError(
                 "health_heartbeat_s must be greater than 0 and at most "
@@ -250,24 +297,34 @@ class GraderServer:
         self.metrics_port = self._metrics_server.server_port
         threading.Thread(target=self._metrics_server.serve_forever, daemon=True).start()
 
+    def metrics_text(self) -> str:
+        """Return secret-free Prometheus metrics for local or remote export."""
+        return self._metrics.render()
+
     def start(self) -> None:
-        # Prep socket.
-        try:
-            os.unlink(self.socket_path)
-        except FileNotFoundError:
-            pass
-        self._listen_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._listen_sock.bind(self.socket_path)
-        os.chmod(self.socket_path, 0o660)
-        self._listen_sock.listen(self.pool_size * 4)
+        if self.listen_unix_socket:
+            # Prep the trusted local coordinator socket.
+            try:
+                os.unlink(self.socket_path)
+            except FileNotFoundError:
+                pass
+            self._listen_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self._listen_sock.bind(self.socket_path)
+            os.chmod(self.socket_path, 0o660)
+            self._listen_sock.listen(max(1, self.pool_size * 4))
 
-        # Spawn workers.
-        for i in range(self.pool_size):
-            self._spawn_worker(i)
+        # A remote coordinator owns no local hostile workers.  The CPU agent
+        # starts this same class without a Unix listener and with local workers.
+        if self.sandbox_executor is None:
+            for i in range(self.pool_size):
+                self._spawn_worker(i)
 
-        # Accept loop in a background thread.
-        self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
-        self._accept_thread.start()
+        if self.listen_unix_socket:
+            self._accept_thread = threading.Thread(
+                target=self._accept_loop,
+                daemon=True,
+            )
+            self._accept_thread.start()
         self._start_metrics_server()
         self._publish_health()
         self._start_health_heartbeat()
@@ -293,10 +350,21 @@ class GraderServer:
             except Exception:
                 pass
             self._metrics_server = None
-        try:
-            os.unlink(self.socket_path)
-        except FileNotFoundError:
-            pass
+        if self.listen_unix_socket:
+            try:
+                os.unlink(self.socket_path)
+            except FileNotFoundError:
+                pass
+        if self._shadow_pool is not None:
+            self._shadow_pool.shutdown(wait=True, cancel_futures=True)
+            self._shadow_pool = None
+        for executor in (self.sandbox_executor, self.shadow_executor):
+            if executor is None:
+                continue
+            try:
+                executor.close()
+            except Exception:
+                logger.exception("grader: failed to close sandbox executor")
         self._stop_health_heartbeat()
         with self._lifecycle_lock:
             self._shutdown_complete = True
@@ -317,7 +385,7 @@ class GraderServer:
             if worker.in_use and not worker.retired
         )
         with self._lifecycle_lock:
-            return {
+            snapshot = {
                 "server_pid": os.getpid(),
                 "started_at": self._started_at,
                 "updated_at": time.time(),
@@ -336,7 +404,45 @@ class GraderServer:
                 "container_delete_failures_total": (
                     self._container_delete_failures_total
                 ),
+                "execution_backend": self.execution_backend,
+                "runtime_id": self.runtime_id,
+                "retire_worker_after_batch": self.retire_worker_after_batch,
             }
+        if self.sandbox_executor is not None:
+            try:
+                snapshot["executor"] = self.sandbox_executor.health_snapshot()
+            except Exception:
+                snapshot["executor"] = {
+                    "backend": "remote",
+                    "health_error": True,
+                }
+        if self.shadow_executor is not None:
+            with self._shadow_lock:
+                snapshot["shadow"] = {
+                    "inflight": self._shadow_inflight,
+                    "matches_total": self._shadow_matches_total,
+                    "mismatches_total": self._shadow_mismatches_total,
+                    "failures_total": self._shadow_failures_total,
+                    "dropped_total": self._shadow_dropped_total,
+                }
+            try:
+                snapshot["shadow"]["executor"] = (
+                    self.shadow_executor.health_snapshot()
+                )
+            except Exception:
+                snapshot["shadow"]["executor"] = {
+                    "backend": "remote",
+                    "health_error": True,
+                }
+        return snapshot
+
+    @property
+    def execution_backend(self) -> str:
+        if self.sandbox_executor is not None:
+            return "remote"
+        if self.shadow_executor is not None:
+            return "local-shadow"
+        return "local"
 
     def _publish_health(self) -> None:
         if not self.health_path:
@@ -530,69 +636,275 @@ class GraderServer:
                 "total": 0,
                 "status": "grader_error",
             }
-
-        # Acquire a worker (blocks if all busy).
-        w = self._acquire_worker(timeout=30.0)
-        if w is None:
+        if not all(self._valid_case(case) for case in cases):
+            self._metrics.inc("grader_case_total", {"status": "bad_case"})
             return {
                 "req_id": req_id,
-                "passed": 0, "total": len(cases), "status": "grader_error",
-            }
-        try:
-            passed = 0
-            w.in_use = True
-            for i, case in enumerate(cases):
-                if not self._valid_case(case):
-                    self._metrics.inc("grader_case_total", {"status": "bad_case"})
-                    return {
-                        "req_id": req_id,
-                        "passed": 0,
-                        "total": len(cases),
-                        "status": "grader_error",
-                    }
-
-                worker_req = {
-                    "req_id": f"{req_id}:{i}",
-                    "code": req.get("code", ""),
-                    "entry": case["entry"],
-                    "args": case.get("args", []),
-                    "kwargs": case.get("kwargs", {}),
-                    "timeout_s": req.get("timeout_s", self.eval_timeout_s),
-                }
-                resp = self._evaluate_on_worker(w, worker_req)
-                status = resp.get("status", "grader_error")
-                if status == "ok":
-                    if self._outputs_match(resp.get("output"), case.get("expected"), case.get("compare", "exact")):
-                        passed += 1
-                        self._metrics.inc("grader_case_total", {"status": "passed"})
-                    else:
-                        self._metrics.inc("grader_case_total", {"status": "failed"})
-                    continue
-                if status == "bad_output":
-                    self._metrics.inc("grader_bad_output_total")
-                    self._metrics.inc("grader_case_total", {"status": "bad_output"})
-                    continue
-                if status == "forbidden_import":
-                    self._metrics.inc("grader_forbidden_import_total")
-                self._metrics.inc("grader_case_total", {"status": status})
-                return {
-                    "req_id": req_id,
-                    "passed": 0,
-                    "total": len(cases),
-                    "status": status,
-                }
-            return {
-                "req_id": req_id,
-                "passed": passed,
+                "passed": 0,
                 "total": len(cases),
-                "status": "ok",
+                "status": "grader_error",
             }
+
+        try:
+            execution_request = make_sandbox_batch_request(
+                runtime_id=self.runtime_id,
+                code=str(req.get("code", "")),
+                cases=cases,
+                timeout_s=float(req.get("timeout_s", self.eval_timeout_s)),
+            )
+            execution_result = self.execute_sandbox_batch(execution_request)
+        except (SandboxExecutorError, TypeError, ValueError) as exc:
+            reason = getattr(exc, "reason", type(exc).__name__)
+            logger.warning(
+                "grader: sandbox executor failed req_id=%s reason=%s",
+                req_id,
+                reason,
+            )
+            self._metrics.inc(
+                "grader_executor_failures_total",
+                {"reason": str(reason)},
+            )
+            return {
+                "req_id": req_id,
+                "passed": 0,
+                "total": len(cases),
+                "status": "grader_error",
+            }
+
+        passed = 0
+        for result in execution_result.results:
+            case = cases[result.case_id]
+            status = result.status
+            if status == "ok":
+                if self._outputs_match(
+                    result.output,
+                    case.get("expected"),
+                    case.get("compare", "exact"),
+                ):
+                    passed += 1
+                    self._metrics.inc("grader_case_total", {"status": "passed"})
+                else:
+                    self._metrics.inc("grader_case_total", {"status": "failed"})
+                continue
+            if status == "bad_output":
+                self._metrics.inc("grader_bad_output_total")
+                self._metrics.inc("grader_case_total", {"status": "bad_output"})
+                continue
+            if status == "forbidden_import":
+                self._metrics.inc("grader_forbidden_import_total")
+            self._metrics.inc("grader_case_total", {"status": status})
+            return {
+                "req_id": req_id,
+                "passed": 0,
+                "total": len(cases),
+                "status": status,
+            }
+        if len(execution_result.results) != len(cases):
+            self._metrics.inc(
+                "grader_executor_failures_total",
+                {"reason": "short_result"},
+            )
+            return {
+                "req_id": req_id,
+                "passed": 0,
+                "total": len(cases),
+                "status": "grader_error",
+            }
+        return {
+            "req_id": req_id,
+            "passed": passed,
+            "total": len(cases),
+            "status": "ok",
+        }
+
+    def execute_sandbox_batch(
+        self,
+        request: SandboxBatchRequest,
+    ) -> SandboxBatchResult:
+        """Execute without trusted expected values or reward comparison."""
+        backend = "remote" if self.sandbox_executor is not None else "local"
+        started = time.perf_counter()
+        try:
+            result = (
+                self.sandbox_executor.execute(request)
+                if self.sandbox_executor is not None
+                else self._execute_local_sandbox_batch(request)
+            )
+        except SandboxExecutorError:
+            self._metrics.inc(
+                "grader_executor_requests_total",
+                {"backend": backend, "status": "error"},
+            )
+            raise
+        self._metrics.inc(
+            "grader_executor_requests_total",
+            {"backend": backend, "status": "ok"},
+        )
+        self._metrics.gauge_set(
+            "grader_executor_last_duration_seconds",
+            time.perf_counter() - started,
+        )
+        if self.shadow_executor is not None:
+            self._submit_shadow_execution(request, result)
+        return result
+
+    @staticmethod
+    def _shadow_signature(result: SandboxBatchResult) -> tuple[Any, ...]:
+        return (
+            result.protocol_version,
+            result.job_id,
+            result.attempt,
+            result.runtime_id,
+            tuple(
+                (case.case_id, case.status, case.output)
+                for case in result.results
+            ),
+        )
+
+    def _submit_shadow_execution(
+        self,
+        request: SandboxBatchRequest,
+        authoritative: SandboxBatchResult,
+    ) -> None:
+        """Mirror work without adding latency or authority to the new host."""
+        pool = self._shadow_pool
+        executor = self.shadow_executor
+        if pool is None or executor is None:
+            return
+        if not self._shadow_capacity.acquire(blocking=False):
+            with self._shadow_lock:
+                self._shadow_dropped_total += 1
+            self._metrics.inc(
+                "grader_shadow_requests_total",
+                {"status": "dropped"},
+            )
+            return
+        with self._shadow_lock:
+            self._shadow_inflight += 1
+        try:
+            future = pool.submit(executor.execute, request)
+        except RuntimeError:
+            self._shadow_capacity.release()
+            with self._shadow_lock:
+                self._shadow_inflight -= 1
+                self._shadow_failures_total += 1
+            self._metrics.inc(
+                "grader_shadow_requests_total",
+                {"status": "submit_error"},
+            )
+            return
+
+        def _completed(completed: Future[SandboxBatchResult]) -> None:
+            status = "match"
+            try:
+                shadow = completed.result()
+                if self._shadow_signature(shadow) != self._shadow_signature(
+                    authoritative
+                ):
+                    status = "mismatch"
+            except Exception as exc:
+                status = "error"
+                logger.warning(
+                    "grader: shadow executor failed job=%s reason=%s",
+                    request.job_id,
+                    getattr(exc, "reason", type(exc).__name__),
+                )
+            with self._shadow_lock:
+                self._shadow_inflight -= 1
+                if status == "match":
+                    self._shadow_matches_total += 1
+                elif status == "mismatch":
+                    self._shadow_mismatches_total += 1
+                else:
+                    self._shadow_failures_total += 1
+            self._shadow_capacity.release()
+            self._metrics.inc(
+                "grader_shadow_requests_total",
+                {"status": status},
+            )
+            if status == "mismatch":
+                logger.warning(
+                    "grader: shadow result mismatch job=%s",
+                    request.job_id,
+                )
+
+        future.add_done_callback(_completed)
+
+    def _execute_local_sandbox_batch(
+        self,
+        request: SandboxBatchRequest,
+    ) -> SandboxBatchResult:
+        started = time.perf_counter()
+        worker = self._acquire_worker(timeout=self.worker_acquire_timeout_s)
+        if worker is None:
+            raise SandboxExecutorError("capacity_unavailable")
+        results: list[SandboxCaseResult] = []
+        result_payload_bytes = 0
+        try:
+            worker.in_use = True
+            for case in request.cases:
+                worker_request = {
+                    "req_id": f"{request.job_id}:{case.case_id}",
+                    "code": request.code,
+                    "entry": case.entry,
+                    "args": case.args,
+                    "kwargs": case.kwargs,
+                    "timeout_s": request.timeout_s,
+                }
+                response = self._evaluate_on_worker(worker, worker_request)
+                status = str(response.get("status", "grader_error"))
+                output = response.get("output")
+                try:
+                    result_payload_bytes += len(
+                        json.dumps(
+                            output,
+                            allow_nan=False,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ) + 128
+                except (TypeError, ValueError) as exc:
+                    raise SandboxExecutorError(
+                        "malformed_worker_result"
+                    ) from exc
+                if result_payload_bytes > MAX_EXECUTOR_RESPONSE_BYTES:
+                    raise SandboxExecutorError("worker_output_too_large")
+                results.append(
+                    SandboxCaseResult(
+                        case_id=case.case_id,
+                        status=status,
+                        output=output,
+                    )
+                )
+                if status not in {"ok", "bad_output"}:
+                    break
+        except (TypeError, ValueError) as exc:
+            raise SandboxExecutorError("malformed_worker_result") from exc
         finally:
-            # If worker was respawned (timeout/crash), the new one is already in
-            # the idle queue. Otherwise return this one.
-            w.in_use = False
-            if not w.retired and w.proc.poll() is None and not self._needs_recycle(w):
-                self._idle.put(w)
+            # If the worker was respawned, its replacement is already idle.
+            worker.in_use = False
+            if (
+                self.retire_worker_after_batch
+                and not worker.retired
+                and worker.proc.poll() is None
+            ):
+                # The remote execution tier treats each batch as one hostile
+                # job. Never hand its interpreter or sandbox to another miner.
+                self._respawn_async(worker, reason="batch_isolation")
+            elif (
+                not worker.retired
+                and worker.proc.poll() is None
+                and not self._needs_recycle(worker)
+            ):
+                self._idle.put(worker)
+        return SandboxBatchResult(
+            protocol_version=request.protocol_version,
+            job_id=request.job_id,
+            attempt=request.attempt,
+            runtime_id=request.runtime_id,
+            executor_id="local",
+            results=results,
+            wall_ms=(time.perf_counter() - started) * 1000.0,
+        )
 
     def _evaluate_on_worker(self, w: Worker, req: dict) -> dict:
         timeout_s = float(req.get("timeout_s", self.eval_timeout_s))
@@ -750,7 +1062,7 @@ class GraderServer:
         # still-running worker, which would overwrite how it originally ended.
         exit_label = _exit_label(w.proc.poll())
         self._terminate_worker(w, delete_container=False)
-        if reason != "recycle":
+        if reason not in {"recycle", "batch_isolation"}:
             logger.warning(
                 "grader: worker slot=%d ended reason=%s exit=%s stderr=%s",
                 w.slot, reason, exit_label, w.stderr_tail or "<empty>",
@@ -886,8 +1198,24 @@ def main() -> None:
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
+    remote_executor = remote_executor_from_env()
+    remote_mode = (
+        remote_executor_mode_from_env()
+        if remote_executor is not None
+        else "local"
+    )
+    if remote_mode == "remote" and args.use_runsc:
+        parser.error(
+            "--use-runsc cannot be combined with an authoritative remote executor"
+        )
 
-    if args.use_runsc:
+    if remote_mode == "remote":
+        worker_argv = [
+            sys.executable,
+            "-m",
+            "reliquary.environment.grader.worker",
+        ]
+    elif args.use_runsc:
         # Production: runsc loads the OCI bundle which already invokes worker.py.
         bundle = os.environ.get(
             "GRADER_BUNDLE_PATH",
@@ -904,6 +1232,9 @@ def main() -> None:
         eval_timeout_s=args.timeout,
         metrics_port=args.metrics_port,
         health_path=args.health_path,
+        sandbox_executor=(remote_executor if remote_mode == "remote" else None),
+        shadow_executor=(remote_executor if remote_mode == "shadow" else None),
+        runtime_id=(remote_executor.runtime_id if remote_executor else None),
     )
     shutdown = threading.Event()
 
@@ -918,8 +1249,9 @@ def main() -> None:
     try:
         server.start()
         logger.info(
-            "grader server listening on %s (pool=%d)",
+            "grader server listening on %s (backend=%s pool=%d)",
             args.socket,
+            server.execution_backend,
             args.pool_size,
         )
         while not shutdown.wait(60.0):

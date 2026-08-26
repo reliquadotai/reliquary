@@ -1,0 +1,35 @@
+# Zero-secret Code sandbox host. This compose file belongs on cpu-exec-01,
+# never on the wallet/control machine.
+services:
+  reliquary-cpu-executor:
+    image: ${CPU_EXECUTOR_IMAGE:-reliquary-cpu-executor:prototype}
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.cpu-executor
+      args:
+        RELIQUARY_BUILD_REVISION: ${RELIQUARY_BUILD_REVISION:-prototype}
+    container_name: reliquary-cpu-executor
+    restart: unless-stopped
+    stop_grace_period: 30s
+    init: true
+
+    # runsc needs the same host-level privileges as the current local grader.
+    # This is acceptable only because this dedicated host has no wallet or
+    # control credentials. The sandbox, not this container, is the hostile-code
+    # boundary.
+    privileged: true
+    cgroup: host
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=2g
+      - /run:rw,nosuid,nodev,size=512m
+    pids_limit: 8192
+
+    env_file: .env.cpu-executor
+    ports:
+      - "${RELIQUARY_CPU_EXECUTOR_BIND_IP:?set private bind IP}:${RELIQUARY_CPU_EXECUTOR_PORT:-8443}:${RELIQUARY_CPU_EXECUTOR_PORT:-8443}"
+    volumes:
+      - type: bind
+        source: ${RELIQUARY_CPU_EXECUTOR_PKI_DIR:-./pki/cpu-executor}
+        target: /etc/reliquary/pki
+        read_only: true

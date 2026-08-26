@@ -20,11 +20,13 @@ services:
     # that once before the grader image rolls out. Watchtower preserves it
     # afterwards. The miner-code isolation boundary is gVisor, not the
     # container privilege.
-    privileged: true
+    # Local and shadow grader modes remain privileged. Set false only after
+    # the remote CPU executor is qualified and MODE=remote is authoritative.
+    privileged: ${RELIQUARY_GRADER_PRIVILEGED:-true}
     # runsc needs write access to the host cgroup namespace on cgroup v2
     # hosts. Without this the grader workers can fail at startup with
     # "cannot set up cgroup for root".
-    cgroup: host
+    cgroup: ${RELIQUARY_CGROUP_MODE:-host}
     env_file: .env
     environment:
       # Proof slots overlap on one card only through the host's CUDA MPS
@@ -60,6 +62,12 @@ services:
       - type: bind
         source: ${BT_WALLETS_DIR:?set BT_WALLETS_DIR to the host path of your wallets/}
         target: ${BT_WALLET_PATH:-/opt/reliquary/wallets}
+        read_only: true
+      # Remote CPU-executor client identity. Empty/missing files are harmless
+      # while local runsc remains selected.
+      - type: bind
+        source: ${RELIQUARY_GRADER_CLIENT_PKI_DIR:-./pki/grader-client}
+        target: /etc/reliquary/grader-client-pki
         read_only: true
       # CUDA MPS control pipe, created on the host by nvidia-cuda-mps-control.
       # create_host_path keeps the container startable on a box with no MPS.

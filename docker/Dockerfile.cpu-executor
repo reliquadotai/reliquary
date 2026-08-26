@@ -1,0 +1,52 @@
+# syntax=docker/dockerfile:1.6
+ARG PYTHON_IMAGE=python:3.12-slim@sha256:090ba77e2958f6af52a5341f788b50b032dd4ca28377d2893dcf1ecbdfdfe203
+FROM ${PYTHON_IMAGE} AS grader-rootfs
+
+FROM ${PYTHON_IMAGE}
+
+ARG RELIQUARY_BUILD_REVISION=unknown
+ARG RUNSC_RELEASE=20260525
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONPATH=/opt/reliquary \
+    RELIQUARY_BUILD_REVISION=${RELIQUARY_BUILD_REVISION}
+
+RUN apt-get update -qq \
+ && apt-get install -y -qq ca-certificates wget \
+ && rm -rf /var/lib/apt/lists/*
+
+# Only the CPU agent's transport/runtime dependencies. The validator's torch,
+# CUDA, Bittensor, datasets, R2, HF, and wallet stack are intentionally absent.
+RUN pip install \
+      'pydantic==2.13.4' \
+      'httpx==0.28.1' \
+      'fastapi==0.141.1' \
+      'uvicorn==0.52.4'
+
+# Pin the same gVisor release as the validator image. The checksum supplied by
+# the release is verified before installation.
+RUN ARCH="$(uname -m)" \
+ && BASE="https://storage.googleapis.com/gvisor/releases/release/${RUNSC_RELEASE}/${ARCH}" \
+ && wget -q "${BASE}/runsc" "${BASE}/runsc.sha512" \
+ && sha512sum -c runsc.sha512 \
+ && install -m 0755 runsc /usr/local/bin/runsc \
+ && rm -f runsc runsc.sha512
+
+WORKDIR /opt/reliquary
+COPY reliquary /opt/reliquary/reliquary
+RUN printf '%s\n' "${RELIQUARY_BUILD_REVISION}" > /opt/reliquary/.build-revision
+
+# Immutable Python rootfs and policy used by runsc workers.
+COPY --from=grader-rootfs / /opt/reliquary/reliquary/environment/grader/bundle/rootfs/
+RUN install -m 0644 \
+      /opt/reliquary/reliquary/environment/grader/worker.py \
+      /opt/reliquary/reliquary/environment/grader/bundle/rootfs/opt/worker.py \
+ && test -x /opt/reliquary/reliquary/environment/grader/bundle/rootfs/usr/local/bin/python3
+
+EXPOSE 8443
+
+ENTRYPOINT ["python", "-m", "reliquary.environment.grader.remote"]

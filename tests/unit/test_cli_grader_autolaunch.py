@@ -53,3 +53,54 @@ def test_ensure_grader_refuses_unsandboxed_by_default(monkeypatch, tmp_path):
 
     with pytest.raises(RuntimeError, match="requires the gVisor/runsc grader sandbox"):
         main._ensure_grader_running()
+
+
+@pytest.mark.parametrize(
+    ("mode", "expects_runsc"),
+    [("shadow", True), ("remote", False)],
+)
+def test_ensure_grader_launches_safe_remote_rollout_mode(
+    monkeypatch,
+    tmp_path,
+    mode,
+    expects_runsc,
+):
+    from reliquary.cli import main
+
+    calls = []
+    reachability = iter([False, True])
+
+    class _Process:
+        def poll(self):
+            return 1
+
+    def _popen(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return _Process()
+
+    bundle_python = tmp_path / "rootfs" / "usr" / "local" / "bin" / "python3"
+    bundle_python.parent.mkdir(parents=True)
+    bundle_python.touch()
+    monkeypatch.setattr(
+        main,
+        "_grader_is_running",
+        lambda *args, **kwargs: next(reachability),
+    )
+    monkeypatch.setattr(main.shutil, "which", lambda name: "/usr/bin/runsc")
+    monkeypatch.setattr(main.subprocess, "Popen", _popen)
+    monkeypatch.setattr(main.atexit, "register", lambda callback: None)
+    monkeypatch.setenv("GRADER_BUNDLE_PATH", os.fspath(tmp_path))
+    monkeypatch.setenv(
+        "RELIQUARY_GRADER_EXECUTOR_URL",
+        "https://cpu-exec.internal:8443",
+    )
+    monkeypatch.setenv("RELIQUARY_GRADER_EXECUTOR_MODE", mode)
+    main._grader_proc = None
+
+    main._ensure_grader_running()
+
+    assert len(calls) == 1
+    cmd, kwargs = calls[0]
+    assert ("--use-runsc" in cmd) is expects_runsc
+    assert kwargs["env"]["RELIQUARY_GRADER_EXECUTOR_MODE"] == mode
+    assert kwargs["env"]["RELIQUARY_GRADER_EXECUTOR_URL"].startswith("https://")
