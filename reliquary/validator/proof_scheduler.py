@@ -913,6 +913,10 @@ class GlobalProofScheduler:
                     state.phases[job_id] = _JobPhase.RESOURCE_LIMIT
                     newly_limited = True
                     continue
+                if self._has_earlier_unresolved_resource_candidate_locked(
+                    state, candidate
+                ):
+                    continue
                 if any(
                     resource_key in self._active_resource_keys
                     for resource_key, _failure_limit in candidate.resources
@@ -927,6 +931,47 @@ class GlobalProofScheduler:
                 if state.final_result is not None:
                     break
         return min(eligible, key=lambda item: item.rank) if eligible else None
+
+    @staticmethod
+    def _has_earlier_unresolved_resource_candidate_locked(
+        state: _PlanState,
+        candidate: RankedProof,
+    ) -> bool:
+        """Keep every failure-debt resource in economic rank order.
+
+        A higher-ranked candidate can be temporarily ineligible because it is
+        the fallback for an active prompt leader.  Without this guard, a lower
+        ranked candidate sharing its operator or hotkey may finish first and
+        retain that resource as a RAW result.  If the leader then rejects, the
+        newly eligible fallback cannot dispatch, while rank-ordered application
+        cannot consume the lower-ranked RAW result: no device is active, but
+        neither side can advance.
+
+        Only unresolved proof phases participate.  Synthetic terminal phases
+        consume no proof resource and therefore cannot block useful work.  The
+        dependency always points to a lower rank, so these waits are acyclic.
+        """
+
+        resource_keys = {
+            resource_key for resource_key, _failure_limit in candidate.resources
+        }
+        if not resource_keys:
+            return False
+        for earlier in state.candidates:
+            if earlier.rank >= candidate.rank:
+                break
+            if state.phases[earlier.job_id] not in {
+                _JobPhase.PENDING,
+                _JobPhase.ACTIVE,
+                _JobPhase.RAW,
+            }:
+                continue
+            if any(
+                resource_key in resource_keys
+                for resource_key, _failure_limit in earlier.resources
+            ):
+                return True
+        return False
 
     def _reevaluate_plan_locked(self, state: _PlanState) -> None:
         if state.final_result is not None:
@@ -956,11 +1001,9 @@ class GlobalProofScheduler:
                 return
             if (
                 state.attempts_started >= state.max_attempts
+                # RAW work may sit behind a PENDING prompt fallback. Once no
+                # calls remain active, the cap makes that blocker permanent.
                 and not state.active_job_ids
-                and not any(
-                    phase is _JobPhase.RAW
-                    for phase in state.phases.values()
-                )
             ):
                 self._abort_plan_locked(
                     state, CapacityAbortReason.ATTEMPT_LIMIT
@@ -989,10 +1032,9 @@ class GlobalProofScheduler:
             return
         if (
             state.attempts_started >= state.max_attempts
+            # Do not wait for RAW to drain: rank-ordered application itself
+            # may be waiting on a PENDING job that the cap forbids dispatching.
             and not state.active_job_ids
-            and not any(
-                phase is _JobPhase.RAW for phase in state.phases.values()
-            )
         ):
             self._abort_plan_locked(
                 state, CapacityAbortReason.ATTEMPT_LIMIT
