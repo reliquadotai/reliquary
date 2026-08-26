@@ -57,6 +57,8 @@ def _plan(
             timeout_seconds=7200,
         ),
         training_mode="sequential_steps",
+        target_groups_per_environment_lane=16,
+        candidate_limit_per_environment_lane=24,
         environment_universes=environments or {"math": 1_000},
         prompt_range_size=50,
     )
@@ -89,6 +91,9 @@ def test_disabled_surface_keeps_legacy_state_compatible():
     assert state.status_code == 200
     assert "checkpoint_epoch_id" not in state.json()
     assert "checkpoint_epoch_manifest_sha256" not in state.json()
+    assert "checkpoint_epoch_candidate_limit" not in state.json()
+    assert "checkpoint_epoch_candidate_remaining" not in state.json()
+    assert "checkpoint_epoch_collection_seconds" not in state.json()
     assert client.get("/checkpoint-epoch").status_code == 404
 
 
@@ -105,6 +110,10 @@ def test_active_surface_serves_exact_immutable_manifest():
     assert endpoint.content == canonical_manifest_bytes(plan)
     assert endpoint.headers["etag"] == f'"{manifest_sha256(plan)}"'
     assert "seal_randomness" not in endpoint.text
+    assert state["checkpoint_epoch_target_groups"] == 16
+    assert state["checkpoint_epoch_candidate_limit"] == 24
+    assert state["checkpoint_epoch_candidate_remaining"] == 24
+    assert state["checkpoint_epoch_collection_seconds"] == 60.0
 
 
 def test_checkpoint_transition_withdraws_old_plan():
@@ -201,15 +210,46 @@ class _EpochLaneBatcher:
         pass
 
 
+def test_real_epoch_batcher_builder_honors_each_requested_logical_window(
+    monkeypatch,
+):
+    import reliquary.validator.batcher as batcher_module
+    from tests.unit.test_service_v2 import _build_late_drop_service
+
+    monkeypatch.setattr(
+        batcher_module,
+        "DIFFICULTY_AUCTION_ENVIRONMENTS",
+        frozenset({"fake"}),
+    )
+    plan = _plan(window_count=2, environments={"fake": 1_000})
+    service = _build_late_drop_service()
+    service._checkpoint_epoch_plan = plan
+    service._candidate_window_n = plan.first_window
+
+    first = service._build_window_batchers(plan.first_window)["fake"]
+    second = service._build_window_batchers(plan.first_window + 1)["fake"]
+
+    assert first.window_start == plan.first_window
+    assert second.window_start == plan.first_window + 1
+    assert first.randomness == ""
+    assert second.randomness == ""
+    assert first.collection_seconds == second.collection_seconds == 60.0
+    assert first.max_productive_candidates == 24
+    assert second.max_ranked_proof_attempts == 24
+
+
 @pytest.mark.asyncio
 async def test_epoch_runner_opens_sixteen_lanes_together_then_consumes_in_order(
     monkeypatch,
+    tmp_path,
 ):
+    from reliquary.validator.checkpoint_epoch_runtime import EpochStore
     from tests.unit.test_service_v2 import _build_late_drop_service
 
     plan = _plan(window_count=16, environments={"fake": 1_000})
     service = _build_late_drop_service()
     service._checkpoint_epoch_plan = plan
+    service._checkpoint_epoch_store = EpochStore(tmp_path)
     service._window_n = plan.first_window - 1
     monkeypatch.setattr(
         "reliquary.infrastructure.drand.get_current_chain",
@@ -256,18 +296,22 @@ async def test_epoch_runner_opens_sixteen_lanes_together_then_consumes_in_order(
     ] == [False] * 15 + [True]
     assert service.server._active_batcher_values() == ()
     assert service._current_window_state is WindowState.READY
+    assert service._checkpoint_epoch_store.terminal_status(plan) == "completed"
 
 
 @pytest.mark.asyncio
-async def test_epoch_failure_closes_all_routes_and_tombstones_every_lane(
+async def test_epoch_failure_closes_routes_and_tombstones_unconsumed_lanes(
     monkeypatch,
+    tmp_path,
 ):
+    from reliquary.validator.checkpoint_epoch_runtime import EpochStore
     from reliquary.validator.service import CheckpointEpochExecutionError
     from tests.unit.test_service_v2 import _build_late_drop_service
 
     plan = _plan(window_count=16, environments={"fake": 1_000})
     service = _build_late_drop_service()
     service._checkpoint_epoch_plan = plan
+    service._checkpoint_epoch_store = EpochStore(tmp_path)
     service._window_n = plan.first_window - 1
     monkeypatch.setattr(
         "reliquary.infrastructure.drand.get_current_chain",
@@ -301,10 +345,92 @@ async def test_epoch_failure_closes_all_routes_and_tombstones_every_lane(
     with pytest.raises(CheckpointEpochExecutionError):
         await service._run_checkpoint_epoch()
 
-    assert service._enqueue_aborted_window.call_count == 16
+    assert service._enqueue_aborted_window.call_count == 15
     assert service.server._active_batcher_values() == ()
     assert service._active_batchers == {}
+    assert service._window_n == plan.first_window + plan.window_count - 1
+    assert service._checkpoint_epoch_store.terminal_status(plan) == "aborted"
     assert service._current_window_state is WindowState.READY
+
+
+@pytest.mark.asyncio
+async def test_completed_epoch_cannot_reopen_without_successor_checkpoint(
+    monkeypatch,
+):
+    import reliquary.validator.service as service_module
+    from reliquary.validator.service import CheckpointEpochExecutionError
+    from tests.unit.test_service_v2 import _build_late_drop_service
+
+    plan = _plan(window_count=16, environments={"fake": 1_000})
+    service = _build_late_drop_service()
+    monkeypatch.setattr(
+        service_module,
+        "EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED",
+        True,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "CHECKPOINT_PUBLISH_INTERVAL_WINDOWS",
+        16,
+    )
+    service.use_drand = True
+    service._checkpoint_epoch_plan = plan
+    service._window_n = plan.first_window + plan.window_count - 1
+    service._checkpoint_store.current_manifest = Mock(
+        return_value=_checkpoint(plan)
+    )
+    service._validate_checkpoint_epoch_runtime_config = Mock()
+
+    with pytest.raises(
+        CheckpointEpochExecutionError,
+        match="without a successor checkpoint",
+    ):
+        await service._ensure_checkpoint_epoch_plan()
+
+
+@pytest.mark.asyncio
+async def test_restart_retires_activated_epoch_without_reopening_it(
+    monkeypatch,
+    tmp_path,
+):
+    import reliquary.validator.service as service_module
+    from reliquary.validator.checkpoint_epoch_runtime import EpochStore
+    from reliquary.validator.service import CheckpointEpochExecutionError
+    from tests.unit.test_service_v2 import _build_late_drop_service
+
+    plan = _plan(window_count=16, environments={"fake": 1_000})
+    store = EpochStore(tmp_path)
+    store.mark_activated(plan)
+    store.load_current_plan = Mock(return_value=plan)
+    service = _build_late_drop_service()
+    monkeypatch.setattr(
+        service_module,
+        "EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED",
+        True,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "CHECKPOINT_PUBLISH_INTERVAL_WINDOWS",
+        16,
+    )
+    service.use_drand = True
+    service._window_n = plan.first_window - 1
+    service._checkpoint_epoch_store = store
+    service._checkpoint_store.current_manifest = Mock(
+        return_value=_checkpoint(plan)
+    )
+    service._write_training_tombstone = Mock()
+
+    with pytest.raises(
+        CheckpointEpochExecutionError,
+        match="requires a successor checkpoint",
+    ):
+        await service._ensure_checkpoint_epoch_plan()
+
+    assert store.terminal_status(plan) == "aborted"
+    assert service._write_training_tombstone.call_count == plan.window_count
+    assert service._window_n == plan.first_window + plan.window_count - 1
+    assert service._checkpoint_epoch_plan is None
 
 
 def _accept_with_arrival(batcher, request, round_number: int) -> None:
@@ -439,3 +565,31 @@ def test_epoch_prompt_slice_is_enforced_even_before_production_cutover():
     assert not batcher.accept_submission(
         _request(prompt_idx=9, hotkey="miner")
     ).accepted
+
+
+def test_epoch_collection_and_candidate_limit_are_instance_bound():
+    now = [0.0]
+    operators = {f"miner-{index}": f"operator-{index}" for index in range(25)}
+    batcher = _make_batcher(
+        operator_by_hotkey=operators,
+        experimental_epoch_ranking=True,
+        collection_seconds=1_600.0,
+        max_productive_candidates=24,
+        max_ranked_proof_attempts=24,
+        time_fn=lambda: now[0],
+        wall_clock_fn=lambda: now[0],
+    )
+    batcher.mark_window_opened(monotonic_time=0.0, wall_time=0.0)
+
+    now[0] = 100.0
+    assert batcher.poll_deadline() is False
+    for index in range(24):
+        assert batcher.try_reserve_proof_admission(
+            _request(prompt_idx=index, hotkey=f"miner-{index}")
+        ) == (True, None)
+    assert batcher.try_reserve_proof_admission(
+        _request(prompt_idx=24, hotkey="miner-24")
+    ) == (False, "proof_grading_attempts_full")
+
+    now[0] = 1_601.0
+    assert batcher.poll_deadline() is True

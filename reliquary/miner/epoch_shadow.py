@@ -132,6 +132,9 @@ class EpochWorkBinding:
     protocol_version: int
     generation_contract_sha256: str
     training_mode: str
+    target_groups_per_environment_lane: int
+    candidate_limit_per_environment_lane: int
+    collection_seconds: float
     checkpoint_number: int
     checkpoint_repo_id: str
     checkpoint_revision: str
@@ -460,6 +463,13 @@ class EpochShadowPlanner:
                     plan.protocol.generation_contract_sha256
                 ),
                 training_mode=plan.training_mode,
+                target_groups_per_environment_lane=(
+                    plan.target_groups_per_environment_lane
+                ),
+                candidate_limit_per_environment_lane=(
+                    plan.candidate_limit_per_environment_lane
+                ),
+                collection_seconds=plan.window_schedule.collection_seconds,
                 checkpoint_number=plan.checkpoint.number,
                 checkpoint_repo_id=plan.checkpoint.repo_id,
                 checkpoint_revision=plan.checkpoint.revision,
@@ -639,6 +649,21 @@ class EpochShadowPlanner:
             ),
             ("generation_profile_id", binding.profile_id, "profile_changed"),
             ("protocol_version", binding.protocol_version, "protocol_changed"),
+            (
+                "checkpoint_epoch_target_groups",
+                binding.target_groups_per_environment_lane,
+                "admission_policy_changed",
+            ),
+            (
+                "checkpoint_epoch_candidate_limit",
+                binding.candidate_limit_per_environment_lane,
+                "admission_policy_changed",
+            ),
+            (
+                "checkpoint_epoch_collection_seconds",
+                binding.collection_seconds,
+                "admission_policy_changed",
+            ),
             ("checkpoint_n", binding.checkpoint_number, "checkpoint_changed"),
             (
                 "checkpoint_repo_id",
@@ -681,6 +706,18 @@ class EpochShadowPlanner:
         except (TypeError, ValueError):
             return []
         live_open = _state_text(_get(live_state, "state", "")) == "open"
+        advertised_remaining = _get(
+            live_state,
+            "checkpoint_epoch_candidate_remaining",
+        )
+        try:
+            release_budget = (
+                max(0, int(advertised_remaining))
+                if advertised_remaining is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            return []
         released: list[Path] = []
         for path, record in self._records(self.queue_dir):
             binding = record.binding
@@ -688,6 +725,8 @@ class EpochShadowPlanner:
                 continue
             if live_window != binding.window_number or not live_open:
                 continue
+            if release_budget is not None and len(released) >= release_budget:
+                break
             if _get(live_state, "randomness") != binding.generation_randomness:
                 self.invalidate_all("generation_randomness_mismatch")
                 return []

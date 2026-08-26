@@ -37,6 +37,8 @@ from reliquary.constants import (
     DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES,
     DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR,
     ENVIRONMENT_MIX,
+    EXPERIMENTAL_CHECKPOINT_EPOCH_CANDIDATES_PER_LANE,
+    EXPERIMENTAL_CHECKPOINT_EPOCH_COLLECTION_SECONDS,
     EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED,
     EXPERIMENTAL_CHECKPOINT_EPOCH_TRAINING_MODE,
     EXPERIMENTAL_CHECKPOINT_EPOCH_WARMUP_ROUNDS,
@@ -419,6 +421,9 @@ def open_grpo_window(
     verify_commitment_proofs_fn=None,
     experimental_epoch_ranking: bool = False,
     experimental_prompt_range: tuple[int, int] | None = None,
+    collection_seconds: float | None = None,
+    max_productive_candidates: int | None = None,
+    max_ranked_proof_attempts: int | None = None,
 ) -> GrpoWindowBatcher:
     """Instantiate a GrpoWindowBatcher for this window.
 
@@ -460,6 +465,9 @@ def open_grpo_window(
         verify_commitment_proofs_fn=verify_commitment_proofs_fn,
         experimental_epoch_ranking=experimental_epoch_ranking,
         experimental_prompt_range=experimental_prompt_range,
+        collection_seconds=collection_seconds,
+        max_productive_candidates=max_productive_candidates,
+        max_ranked_proof_attempts=max_ranked_proof_attempts,
     )
 
 
@@ -1810,7 +1818,9 @@ class ValidationService:
     def _validate_checkpoint_epoch_runtime_config(self, plan: EpochPlan) -> None:
         expected_schedule = WindowSchedule(
             mode=CHECKPOINT_EPOCH_SCHEDULE_MODE,
-            collection_seconds=WINDOW_COLLECTION_SECONDS,
+            collection_seconds=(
+                EXPERIMENTAL_CHECKPOINT_EPOCH_COLLECTION_SECONDS
+            ),
             timeout_seconds=WINDOW_TIMEOUT_SECONDS,
         )
         expected_universes = {
@@ -1830,6 +1840,11 @@ class ValidationService:
             or plan.warmup_rounds
             != EXPERIMENTAL_CHECKPOINT_EPOCH_WARMUP_ROUNDS
             or plan.prompt_range_size != PROMPT_RANGE_SIZE
+            or plan.target_groups_per_environment_lane != B_BATCH
+            or plan.candidate_limit_per_environment_lane
+            != EXPERIMENTAL_CHECKPOINT_EPOCH_CANDIDATES_PER_LANE
+            or plan.candidate_limit_per_environment_lane
+            > MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW
             or plan_universes != expected_universes
         ):
             raise RuntimeError("checkpoint epoch runtime configuration changed")
@@ -1934,11 +1949,17 @@ class ValidationService:
                 warmup_rounds=EXPERIMENTAL_CHECKPOINT_EPOCH_WARMUP_ROUNDS,
                 window_schedule=WindowSchedule(
                     mode=CHECKPOINT_EPOCH_SCHEDULE_MODE,
-                    collection_seconds=WINDOW_COLLECTION_SECONDS,
+                    collection_seconds=(
+                        EXPERIMENTAL_CHECKPOINT_EPOCH_COLLECTION_SECONDS
+                    ),
                     timeout_seconds=WINDOW_TIMEOUT_SECONDS,
                 ),
                 training_mode=EXPERIMENTAL_CHECKPOINT_EPOCH_TRAINING_MODE,
                 prompt_range_size=PROMPT_RANGE_SIZE,
+                target_groups_per_environment_lane=B_BATCH,
+                candidate_limit_per_environment_lane=(
+                    EXPERIMENTAL_CHECKPOINT_EPOCH_CANDIDATES_PER_LANE
+                ),
                 environment_universes={
                     name: len(environment)
                     for name, environment in self.envs.items()
@@ -2025,18 +2046,49 @@ class ValidationService:
             self._validate_checkpoint_epoch_runtime_config(active)
             if self._checkpoint_epoch_window(next_window) is not None:
                 return active
-            logger.warning(
-                "Checkpoint epoch %s ended without a successor checkpoint; "
-                "creating another immutable horizon from the same checkpoint",
-                active.epoch_id[:12],
+            raise CheckpointEpochExecutionError(
+                "checkpoint epoch ended without a successor checkpoint"
             )
-            self._checkpoint_epoch_plan = None
-            self.server.set_checkpoint_epoch_plan(None)
 
         store = self._checkpoint_epoch_store
         if store is None:
             raise RuntimeError("checkpoint epoch store is unavailable")
         restored = store.load_current_plan()
+        if (
+            restored is not None
+            and self._checkpoint_epoch_matches(restored, checkpoint)
+            and store.is_activated(restored)
+        ):
+            terminal_status = store.terminal_status(restored)
+            if terminal_status is None:
+                terminal_status = "aborted"
+                store.mark_terminal(restored, status=terminal_status)
+            if terminal_status == "aborted":
+                for window_number in range(
+                    max(next_window, restored.first_window),
+                    restored.first_window + restored.window_count,
+                ):
+                    self._write_training_tombstone(
+                        window_number,
+                        "checkpoint_epoch_restart",
+                        "InterruptedCheckpointEpoch",
+                    )
+            self._window_n = max(
+                self._window_n,
+                restored.first_window + restored.window_count - 1,
+            )
+            self._candidate_window_n = None
+            next_window = self._window_n + 1
+            logger.warning(
+                "Retired previously activated checkpoint epoch %s status=%s",
+                restored.epoch_id[:12],
+                terminal_status,
+            )
+            self._checkpoint_epoch_plan = None
+            self.server.set_checkpoint_epoch_plan(None)
+            raise CheckpointEpochExecutionError(
+                "activated checkpoint epoch requires a successor checkpoint"
+            )
         if (
             restored is not None
             and self._checkpoint_epoch_matches(restored, checkpoint)
@@ -2106,11 +2158,9 @@ class ValidationService:
         verification in ``indices_from_root`` if the chain call that fills
         randomness fails (e.g. finney WebSocket returns 503).
         """
-        if self._candidate_window_n is None:
-            self._candidate_window_n = self._window_n + 1
         if self._candidate_activation_nonce is None:
             self._candidate_activation_nonce = os.urandom(32)
-        target_window = self._candidate_window_n
+        target_window = int(target_window)
         epoch_window = self._checkpoint_epoch_window(target_window)
         self._set_window_preparation_stage("batcher_construction")
         bootstrap = is_bootstrap_window(
@@ -2147,6 +2197,9 @@ class ValidationService:
                 "operator_by_hotkey": operator_by_hotkey,
             }
             if epoch_window is not None:
+                plan = self._checkpoint_epoch_plan
+                if plan is None:
+                    raise RuntimeError("checkpoint epoch plan disappeared")
                 slices = [
                     item
                     for item in epoch_window.prompt_slices
@@ -2161,6 +2214,13 @@ class ValidationService:
                     "experimental_prompt_range": (
                         slices[0].start,
                         slices[0].stop,
+                    ),
+                    "collection_seconds": plan.window_schedule.collection_seconds,
+                    "max_productive_candidates": (
+                        plan.candidate_limit_per_environment_lane
+                    ),
+                    "max_ranked_proof_attempts": (
+                        plan.candidate_limit_per_environment_lane
                     ),
                 })
             if self.proof_scheduler is not None:
@@ -2303,6 +2363,10 @@ class ValidationService:
                 raise RuntimeError("duplicate checkpoint epoch lane")
             routes[route] = batcher
 
+        store = self._checkpoint_epoch_store
+        if store is None:
+            raise RuntimeError("checkpoint epoch store is unavailable")
+        store.mark_activated(plan)
         self.server.set_active_epoch_batchers(routes)
         self._window_n = plan.first_window
         self._candidate_window_n = None
@@ -2318,6 +2382,7 @@ class ValidationService:
             raise RuntimeError("checkpoint epoch plan is unavailable")
         activated = False
         late_drops: dict | None = None
+        completed_windows: set[int] = set()
         lane_batchers: dict[int, dict[str, GrpoWindowBatcher]] = {
             window.window_number: {} for window in plan.windows
         }
@@ -2327,6 +2392,8 @@ class ValidationService:
             if activated:
                 failure_stage = self._window_iteration_stage
                 for window in plan.windows:
+                    if window.window_number in completed_windows:
+                        continue
                     lane = lane_batchers[window.window_number]
                     if not lane:
                         continue
@@ -2343,6 +2410,11 @@ class ValidationService:
                             window.window_number,
                         )
             self._active_batchers = {}
+            if activated:
+                self._window_n = plan.first_window + plan.window_count - 1
+                store = self._checkpoint_epoch_store
+                if store is not None:
+                    store.mark_terminal(plan, status="aborted")
             self._set_state(WindowState.READY)
 
         try:
@@ -2410,6 +2482,7 @@ class ValidationService:
                     epoch_seal=epoch_seal,
                     epoch_finalize=final_lane,
                 )
+                completed_windows.add(window.window_number)
         except asyncio.CancelledError:
             close_failed_epoch("CancelledError")
             raise
@@ -2426,6 +2499,10 @@ class ValidationService:
 
         self._active_batchers = {}
         self._window_n = plan.first_window + plan.window_count - 1
+        store = self._checkpoint_epoch_store
+        if store is None:
+            raise RuntimeError("checkpoint epoch store is unavailable")
+        store.mark_terminal(plan, status="completed")
         self._set_state(WindowState.READY)
 
     async def _refresh_registered_hotkeys(
@@ -2552,7 +2629,11 @@ class ValidationService:
             return False
         if (
             getattr(batcher, "proof_grading_attempts", 0)
-            < MAX_GRADING_STARTS_PER_WINDOW
+            < getattr(
+                batcher,
+                "max_grading_starts",
+                MAX_GRADING_STARTS_PER_WINDOW,
+            )
         ):
             return False
         queue_depth = int(getattr(self.server, "submit_queue_depth", 0) or 0)

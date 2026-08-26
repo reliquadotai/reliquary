@@ -1323,11 +1323,13 @@ class ValidatorServer:
             if getattr(batcher, "difficulty_auction_enabled", False)
             else batcher.valid_count
         )
+        capacity_used = getattr(batcher, "candidate_capacity_used", 0)
         return (
             id(batcher),
             batcher.window_start,
             self._current_state,
             submission_count,
+            capacity_used,
             cp.checkpoint_n if cp else -1,
             cp.revision if cp else None,
             epoch.epoch_id if epoch is not None else None,
@@ -1547,7 +1549,11 @@ class ValidatorServer:
     @staticmethod
     def _receipt_collection_deadline(receipt: _UploadPrecommitReceipt) -> float:
         return float(receipt.batcher.window_opened_wall_ts) + float(
-            WINDOW_COLLECTION_SECONDS
+            getattr(
+                receipt.batcher,
+                "collection_seconds",
+                WINDOW_COLLECTION_SECONDS,
+            )
         )
 
     def _submission_body_read_deadline(
@@ -1559,12 +1565,19 @@ class ValidatorServer:
         """Return the protocol wall deadline for an incomplete HTTP body."""
         if path == "/submit/precommit":
             cutoffs = []
-            for batcher in self._active_batchers.values():
+            for batcher in self._active_batcher_values():
                 opened_at = getattr(batcher, "window_opened_wall_ts", None)
                 if opened_at is None or _is_mock_like(opened_at):
                     continue
                 cutoffs.append(
-                    float(opened_at) + float(WINDOW_COLLECTION_SECONDS)
+                    float(opened_at)
+                    + float(
+                        getattr(
+                            batcher,
+                            "collection_seconds",
+                            WINDOW_COLLECTION_SECONDS,
+                        )
+                    )
                 )
             return max(cutoffs) if cutoffs else None
         if path == "/submit":
@@ -1594,7 +1607,11 @@ class ValidatorServer:
         update = self._no_reveal_circuit.record_no_reveal(
             environment=receipt.environment,
             operator=receipt.operator,
-            window=receipt.window_start,
+            window=(
+                receipt.admission_policy_window
+                if receipt.admission_policy_window is not None
+                else receipt.window_start
+            ),
             precommit_signature=receipt.precommit_signature,
             precommit_arrival_ts=receipt.precommit_arrival_ts,
         )
@@ -1617,7 +1634,11 @@ class ValidatorServer:
         update = self._no_reveal_circuit.record_reveal(
             environment=receipt.environment,
             operator=receipt.operator,
-            window=receipt.window_start,
+            window=(
+                receipt.admission_policy_window
+                if receipt.admission_policy_window is not None
+                else receipt.window_start
+            ),
             precommit_signature=receipt.precommit_signature,
             precommit_arrival_ts=receipt.precommit_arrival_ts,
         )
@@ -3966,7 +3987,13 @@ class ValidatorServer:
                 return reject(RejectReason.WINDOW_NOT_ACTIVE)
             if commit_received_at > (
                 float(batcher.window_opened_wall_ts)
-                + float(WINDOW_COLLECTION_SECONDS)
+                + float(
+                    getattr(
+                        batcher,
+                        "collection_seconds",
+                        WINDOW_COLLECTION_SECONDS,
+                    )
+                )
             ):
                 return reject(RejectReason.PRECOMMIT_EXPIRED)
             if batcher.drand_round_check_enabled:
@@ -4081,7 +4108,7 @@ class ValidatorServer:
             no_reveal_decision = self._no_reveal_circuit.admit_precommit(
                 environment=request.environment,
                 operator=operator,
-                window=request.window_start,
+                window=admission_policy_window,
                 precommit_signature=request.precommit_signature,
             )
             if not no_reveal_decision.allowed:
@@ -4099,7 +4126,7 @@ class ValidatorServer:
                     self._prompt_mismatch_circuit.cancel_canary(
                         environment=request.environment,
                         identities=circuit_identities,
-                        window=request.window_start,
+                        window=admission_policy_window,
                         precommit_signature=request.precommit_signature,
                     )
                 return reject(RejectReason.RATE_LIMITED)
@@ -4109,14 +4136,14 @@ class ValidatorServer:
                     self._prompt_mismatch_circuit.cancel_canary(
                         environment=request.environment,
                         identities=circuit_identities,
-                        window=request.window_start,
+                        window=admission_policy_window,
                         precommit_signature=request.precommit_signature,
                     )
                 if no_reveal_decision.canary:
                     self._no_reveal_circuit.cancel_canary(
                         environment=request.environment,
                         operator=operator,
-                        window=request.window_start,
+                        window=admission_policy_window,
                         precommit_signature=request.precommit_signature,
                     )
 
@@ -5302,6 +5329,36 @@ class ValidatorServer:
                     if epoch is not None
                     else None
                 ),
+                checkpoint_epoch_target_groups=(
+                    epoch.target_groups_per_environment_lane
+                    if epoch is not None
+                    else None
+                ),
+                checkpoint_epoch_candidate_limit=(
+                    epoch.candidate_limit_per_environment_lane
+                    if epoch is not None
+                    else None
+                ),
+                checkpoint_epoch_candidate_remaining=(
+                    max(
+                        0,
+                        epoch.candidate_limit_per_environment_lane
+                        - int(
+                            getattr(
+                                batcher,
+                                "candidate_capacity_used",
+                                submission_count,
+                            )
+                        ),
+                    )
+                    if epoch is not None
+                    else None
+                ),
+                checkpoint_epoch_collection_seconds=(
+                    epoch.window_schedule.collection_seconds
+                    if epoch is not None
+                    else None
+                ),
                 randomness=batcher.randomness,
             )
             excluded_fields: set[str] = set()
@@ -5318,6 +5375,10 @@ class ValidatorServer:
                     {
                         "checkpoint_epoch_id",
                         "checkpoint_epoch_manifest_sha256",
+                        "checkpoint_epoch_target_groups",
+                        "checkpoint_epoch_candidate_limit",
+                        "checkpoint_epoch_candidate_remaining",
+                        "checkpoint_epoch_collection_seconds",
                     }
                 )
             body = payload.model_dump_json(

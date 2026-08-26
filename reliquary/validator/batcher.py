@@ -782,6 +782,10 @@ class GrpoWindowBatcher:
         proof_scheduler: GlobalProofScheduler | None = None,
         experimental_epoch_ranking: bool = False,
         experimental_prompt_range: tuple[int, int] | None = None,
+        collection_seconds: float | None = None,
+        max_productive_candidates: int | None = None,
+        max_grading_starts: int | None = None,
+        max_ranked_proof_attempts: int | None = None,
     ) -> None:
         from reliquary.constants import DRAND_ROUND_BACKWARD_TOLERANCE
 
@@ -797,6 +801,48 @@ class GrpoWindowBatcher:
         self.bootstrap = bootstrap
         self.experimental_epoch_ranking = bool(experimental_epoch_ranking)
         self._experimental_prompt_range = experimental_prompt_range
+        self.collection_seconds = float(
+            WINDOW_COLLECTION_SECONDS
+            if collection_seconds is None
+            else collection_seconds
+        )
+        self.max_productive_candidates = int(
+            MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+            if max_productive_candidates is None
+            else max_productive_candidates
+        )
+        self.max_grading_starts = int(
+            MAX_GRADING_STARTS_PER_WINDOW
+            if max_grading_starts is None
+            and max_productive_candidates is None
+            else (
+                4 * self.max_productive_candidates
+                if max_grading_starts is None
+                else max_grading_starts
+            )
+        )
+        self.max_ranked_proof_attempts = int(
+            MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW
+            if max_ranked_proof_attempts is None
+            else max_ranked_proof_attempts
+        )
+        if (
+            not math.isfinite(self.collection_seconds)
+            or self.collection_seconds <= 0
+            or self.max_productive_candidates < 1
+            or self.max_grading_starts < self.max_productive_candidates
+            or self.max_ranked_proof_attempts < 1
+            or (
+                self.experimental_epoch_ranking
+                and (
+                    self.max_productive_candidates < B_BATCH
+                    or self.max_ranked_proof_attempts < B_BATCH
+                    or self.max_ranked_proof_attempts
+                    > self.max_productive_candidates
+                )
+            )
+        ):
+            raise ValueError("invalid batcher collection or admission bounds")
         # Set True by the validator's background drand-verify task
         # if the cross-check against bittensor_drand fails post-OPEN.
         # ``_train_and_publish`` checks this before sealing and drops
@@ -1196,16 +1242,16 @@ class GrpoWindowBatcher:
         underlying ``threading.Event``, never touches the lazy
         ``asyncio.Event``).
 
-        The window stays open the full ``WINDOW_COLLECTION_SECONDS`` and accepts
-        everything; only after this returns True does further work for the
-        window short-circuit. Callers (the HTTP /submit handler and the submit
-        worker) use it to drop post-deadline submissions.
+        The window stays open for its configured collection duration. Only
+        after this returns True does further work for the window short-circuit.
+        Callers (the HTTP /submit handler and the submit worker) use it to drop
+        post-deadline submissions.
         """
         return self._seal_flag.is_set()
 
     def collection_closed(self) -> bool:
         """Whether the generation/commit phase has reached its fixed cutoff."""
-        return self._time_fn() - self.window_opened_at >= WINDOW_COLLECTION_SECONDS
+        return self._time_fn() - self.window_opened_at >= self.collection_seconds
 
     def _record_upload_precommit_rejection_locked(self, reason: str) -> None:
         self._upload_precommit_rejections[reason] = (
@@ -1282,7 +1328,7 @@ class GrpoWindowBatcher:
         received_at = float(t_arrival_wall)
         if received_at < self.window_opened_wall_ts:
             return False, "collection_not_open", None
-        if received_at > self.window_opened_wall_ts + WINDOW_COLLECTION_SECONDS:
+        if received_at > self.window_opened_wall_ts + self.collection_seconds:
             return False, "collection_closed", None
         now = self._time_fn()
         with self._upload_precommit_lock:
@@ -1315,7 +1361,7 @@ class GrpoWindowBatcher:
             deadline = min(
                 now + SUBMISSION_UPLOAD_GRACE_SECONDS,
                 self.window_opened_at
-                + WINDOW_COLLECTION_SECONDS
+                + self.collection_seconds
                 + SUBMISSION_UPLOAD_GRACE_SECONDS,
             )
             self._upload_precommits[receipt_id] = (
@@ -1357,7 +1403,7 @@ class GrpoWindowBatcher:
             if reservation.upload_started_at_wall is None:
                 if (
                     float(t_arrival_wall)
-                    > self.window_opened_wall_ts + WINDOW_COLLECTION_SECONDS
+                    > self.window_opened_wall_ts + self.collection_seconds
                 ):
                     return False, "upload_started_after_collection"
                 reservation.upload_started_at_wall = float(t_arrival_wall)
@@ -1459,12 +1505,12 @@ class GrpoWindowBatcher:
                     return False, "proof_failure_debt_operator"
                 if (
                     self._productive_capacity_used_locked()
-                    >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+                    >= self.max_productive_candidates
                 ):
                     return False, "proof_grading_attempts_full"
                 if (
                     self._proof_grading_attempts
-                    >= MAX_GRADING_STARTS_PER_WINDOW
+                    >= self.max_grading_starts
                 ):
                     return False, "grading_starts_full"
                 reservation_id = id(request)
@@ -1532,11 +1578,11 @@ class GrpoWindowBatcher:
                 "capacity_reserved": 0,
                 "productive_capacity_used": productive_capacity_used,
                 "productive_capacity_limit": (
-                    MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+                    self.max_productive_candidates
                 ),
                 "capacity_conserved": (
                     productive_capacity_used
-                    <= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+                    <= self.max_productive_candidates
                 ),
                 "inactive_receipts": sum(
                     1
@@ -1559,7 +1605,7 @@ class GrpoWindowBatcher:
         if not self.difficulty_auction_enabled:
             return False
         now = self._time_fn()
-        if now - self.window_opened_at >= WINDOW_COLLECTION_SECONDS:
+        if now - self.window_opened_at >= self.collection_seconds:
             with self._upload_precommit_lock:
                 self._prune_upload_precommits_locked(now)
                 inactive = [
@@ -1578,7 +1624,7 @@ class GrpoWindowBatcher:
                 )
                 if pending_uploads and (
                     now - self.window_opened_at
-                    < WINDOW_COLLECTION_SECONDS
+                    < self.collection_seconds
                     + SUBMISSION_UPLOAD_GRACE_SECONDS
                 ):
                     return False
@@ -1664,6 +1710,11 @@ class GrpoWindowBatcher:
     def proof_grading_charged(self) -> int:
         """Productive admission budget in use (refunded on non-productive rejects)."""
         return self._proof_grading_charged
+
+    @property
+    def candidate_capacity_used(self) -> int:
+        """Started and reserved productive candidates for live demand telemetry."""
+        return self._productive_capacity_used_locked()
 
     @staticmethod
     def _mark_grading_refundable(
@@ -1961,12 +2012,12 @@ class GrpoWindowBatcher:
             if (
                 self._proof_grading_charged
                 + len(self._pending_proof_reservations)
-                >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+                >= self.max_productive_candidates
             ):
                 return False, "proof_grading_attempts_full"
             if (
                 self._proof_grading_attempts
-                >= MAX_GRADING_STARTS_PER_WINDOW
+                >= self.max_grading_starts
             ):
                 return False, "grading_starts_full"
 
@@ -2033,12 +2084,12 @@ class GrpoWindowBatcher:
                 # requests always reserve in the HTTP path first.
                 if (
                     self._proof_grading_charged
-                    >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+                    >= self.max_productive_candidates
                 ):
                     return False, "proof_grading_attempts_full"
                 if (
                     self._proof_grading_attempts
-                    >= MAX_GRADING_STARTS_PER_WINDOW
+                    >= self.max_grading_starts
                 ):
                     return False, "grading_starts_full"
                 payload_bytes = self._submission_payload_bytes(request)
@@ -4331,7 +4382,7 @@ class GrpoWindowBatcher:
                 candidates=tuple(candidates),
                 required_passes=B_BATCH,
                 deadline_at=deadline_at,
-                max_attempts=MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW,
+                max_attempts=self.max_ranked_proof_attempts,
                 priority=0,
                 allow_shortfall=True,
             )
@@ -4723,7 +4774,7 @@ class GrpoWindowBatcher:
                     row["status"] = "operator_proof_debt"
                     self.auction_operator_proof_debt_skips += 1
                     continue
-                if attempts >= MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW:
+                if attempts >= self.max_ranked_proof_attempts:
                     logger.warning(
                         "proof budget exhausted window=%d attempts=%d "
                         "proven=%d pending=%d — advancing with shortfall",
@@ -5126,7 +5177,7 @@ class GrpoWindowBatcher:
             self.forensic_sample = results
             return results
         for p, sample_role in sample:
-            if self.proof_attempts >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW:
+            if self.proof_attempts >= self.max_productive_candidates:
                 break
             if self._proof_wall_started_at is None:
                 break
@@ -5464,7 +5515,7 @@ class GrpoWindowBatcher:
                         self.logprob_short_unverifiable
                     ),
                     "proof_attempt_limit": (
-                        MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW
+                        self.max_ranked_proof_attempts
                     ),
                     "proof_wall_seconds": self.proof_wall_elapsed_seconds,
                     "proof_wall_limit_seconds": MAX_PROOF_WALL_SECONDS,

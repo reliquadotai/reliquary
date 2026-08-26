@@ -57,6 +57,8 @@ def _plan(*, count: int = 16, **overrides):
         "window_schedule": SCHEDULE,
         "training_mode": "sequential_steps",
         "prompt_range_size": 5_000,
+        "target_groups_per_environment_lane": 16,
+        "candidate_limit_per_environment_lane": 24,
         "environment_universes": UNIVERSES,
     }
     values.update(overrides)
@@ -73,7 +75,7 @@ def test_manifest_is_canonical_deterministic_and_stable():
     assert canonical_manifest_bytes(first) == canonical_manifest_bytes(second)
     assert parse_epoch_plan(canonical_manifest_bytes(first)) == first
     assert manifest_sha256(first) == (
-        "c1b66e6015b444d937876c783d2954e943681bfbe7be3c60a5ec03ea5a0671a5"
+        "4ffdaf7f0019c1e1cdc89010351de69ad2d196f0430d948aacff229383fe1f7f"
     )
     assert first.window_schedule.mode == "concurrent_checkpoint_epoch"
     assert first.training_mode == "sequential_steps"
@@ -147,6 +149,7 @@ def test_overlap_fallback_is_explicit_and_deterministic():
             )
         },
         {"training_mode": "aggregate_one_step"},
+        {"candidate_limit_per_environment_lane": 25},
     ],
 )
 def test_manifest_bindings_change_hash(change):
@@ -185,6 +188,14 @@ def test_training_mode_is_strict_and_bound_before_beacon():
     assert manifest_sha256(sequential) != manifest_sha256(aggregate)
     with pytest.raises(ValueError, match="training mode"):
         _plan(training_mode="unknown")
+
+
+def test_candidate_limit_cannot_be_smaller_than_useful_target():
+    with pytest.raises(ValueError, match="candidate_limit"):
+        _plan(
+            target_groups_per_environment_lane=16,
+            candidate_limit_per_environment_lane=15,
+        )
 
 
 def test_manifest_is_immutable_and_rejects_noncanonical_json():

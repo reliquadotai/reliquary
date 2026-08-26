@@ -57,6 +57,8 @@ def _plan(*, checkpoint_revision: str = "a" * 40):
             timeout_seconds=7200,
         ),
         training_mode="sequential_steps",
+        target_groups_per_environment_lane=16,
+        candidate_limit_per_environment_lane=24,
         environment_universes={"code": 100, "math": 100},
         prompt_range_size=8,
     )
@@ -117,6 +119,18 @@ def _state(plan, *, window=50, state="OPEN", **overrides):
         "window_n": window,
         "checkpoint_epoch_id": plan.epoch_id,
         "checkpoint_epoch_manifest_sha256": manifest_sha256(plan),
+        "checkpoint_epoch_target_groups": (
+            plan.target_groups_per_environment_lane
+        ),
+        "checkpoint_epoch_candidate_limit": (
+            plan.candidate_limit_per_environment_lane
+        ),
+        "checkpoint_epoch_candidate_remaining": (
+            plan.candidate_limit_per_environment_lane
+        ),
+        "checkpoint_epoch_collection_seconds": (
+            plan.window_schedule.collection_seconds
+        ),
         "generation_profile_id": plan.protocol.profile_id,
         "protocol_version": plan.protocol.protocol_version,
         "generation_contract": CONTRACT,
@@ -235,6 +249,44 @@ def test_concurrent_epoch_release_polls_each_exact_lane(tmp_path):
 
     assert len(released) == 2
     assert planner.records() == []
+
+
+def test_release_respects_live_lane_candidate_demand(tmp_path):
+    plan = _plan()
+    planner = _planner(tmp_path)
+    specs = [
+        replace(
+            _spec(plan),
+            prompt_idx=_spec(plan).prompt_idx + offset,
+            prompt_content_sha256=_prompt_digest(
+                "math", _spec(plan).prompt_idx + offset
+            ),
+        )
+        for offset in range(2)
+    ]
+    planner.enqueue(
+        plan,
+        expected_manifest_sha256=manifest_sha256(plan),
+        specs=specs,
+    )
+    for _ in specs:
+        assert planner.prepare_next(
+            lambda record: PreparedGroup(
+                payload=_payload(record), gpu_seconds=1.0
+            )
+        ) is not None
+
+    released = planner.release_ready(
+        live_state=_state(
+            plan,
+            checkpoint_epoch_candidate_remaining=1,
+        ),
+        cooldown_prompts_by_environment={"math": set()},
+        prompt_sha256=_prompt_digest,
+    )
+
+    assert len(released) == 1
+    assert len(planner.records()) == 1
 
 
 def test_checkpoint_or_manifest_change_invalidates_without_replay(tmp_path):

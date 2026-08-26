@@ -581,6 +581,21 @@ if EXPERIMENTAL_CHECKPOINT_EPOCH_WARMUP_ROUNDS <= 0:
     raise ValueError(
         "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_WARMUP_ROUNDS must be positive"
     )
+# Every logical lane opens together.  Give the shared collection the same
+# aggregate wall budget as the production horizon it replaces, instead of
+# compressing sixteen windows into one production-window deadline.
+EXPERIMENTAL_CHECKPOINT_EPOCH_COLLECTION_SECONDS = float(_os.environ.get(
+    "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_COLLECTION_SECONDS",
+    str(WINDOW_COLLECTION_SECONDS * CHECKPOINT_PUBLISH_INTERVAL_WINDOWS),
+))
+if (
+    not _math.isfinite(EXPERIMENTAL_CHECKPOINT_EPOCH_COLLECTION_SECONDS)
+    or EXPERIMENTAL_CHECKPOINT_EPOCH_COLLECTION_SECONDS <= 0
+):
+    raise ValueError(
+        "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_COLLECTION_SECONDS must be "
+        "finite and positive"
+    )
 EXPERIMENTAL_CHECKPOINT_EPOCH_TRAINING_MODE = _os.environ.get(
     "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_TRAINING_MODE",
     "sequential_steps",
@@ -642,6 +657,22 @@ M_ROLLOUTS = ACTIVE_PROTOCOL_PROFILE.sampling.rollouts
 # watch as training lengthens responses, NOT the slot count.
 B_BATCH = 16 if PROTOCOL_VERSION >= 4 else 8
 
+# Epoch admission keeps a small proof-failure reserve instead of copying the
+# production auction's 64 productive candidates into every concurrent lane.
+# The value is explicit, configurable and committed in the epoch manifest.
+EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_CANDIDATES_PER_LANE = int(_os.environ.get(
+    "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_CANDIDATES_PER_LANE",
+    str(max(1, B_BATCH // 2)),
+))
+if EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_CANDIDATES_PER_LANE < 0:
+    raise ValueError(
+        "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_CANDIDATES_PER_LANE "
+        "must be non-negative"
+    )
+EXPERIMENTAL_CHECKPOINT_EPOCH_CANDIDATES_PER_LANE = (
+    B_BATCH + EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_CANDIDATES_PER_LANE
+)
+
 # (env_name, prompts_per_batch). Sum across entries = total prompts
 # processed per optimizer step: 2 × B_BATCH prompts × M_ROLLOUTS sequences.
 # v3: 16 × 8 = 128. v4: 32 × 16 = 512.
@@ -658,6 +689,14 @@ ENVIRONMENT_MIX: list[tuple[str, int]] = [
 MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW = (
     2 * B_BATCH if PROTOCOL_VERSION >= 3 else 64
 )
+if (
+    EXPERIMENTAL_CHECKPOINT_EPOCH_CANDIDATES_PER_LANE
+    > MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW
+):
+    raise ValueError(
+        "checkpoint epoch candidates per lane cannot exceed the ranked proof "
+        "attempt limit"
+    )
 
 # Runtime default for CLI/Docker operators. OpenCode remains available through
 # ENVIRONMENT_MIX, but code execution is opt-in until the runsc canary and

@@ -14,8 +14,8 @@ import math
 from typing import Any, Mapping, Sequence
 
 
-CHECKPOINT_EPOCH_SCHEMA_VERSION = 2
-CHECKPOINT_EPOCH_CAPABILITY_ID = "checkpoint-epoch-scheduling-v2"
+CHECKPOINT_EPOCH_SCHEMA_VERSION = 3
+CHECKPOINT_EPOCH_CAPABILITY_ID = "checkpoint-epoch-scheduling-v3"
 CHECKPOINT_EPOCH_REQUIRED_WINDOW_COUNT = 16
 CHECKPOINT_EPOCH_SCHEDULE_MODE = "concurrent_checkpoint_epoch"
 CHECKPOINT_EPOCH_TRAINING_MODES = frozenset({
@@ -93,6 +93,8 @@ class EpochPlan:
     window_schedule: WindowSchedule
     training_mode: str
     prompt_range_size: int
+    target_groups_per_environment_lane: int
+    candidate_limit_per_environment_lane: int
     epoch_id: str
     epoch_seed: str
     windows: tuple[EpochWindow, ...]
@@ -189,6 +191,8 @@ def _intent_dict(
     window_schedule: WindowSchedule,
     training_mode: str,
     prompt_range_size: int,
+    target_groups_per_environment_lane: int,
+    candidate_limit_per_environment_lane: int,
     environment_universes: Mapping[str, int],
 ) -> dict[str, Any]:
     return {
@@ -210,6 +214,12 @@ def _intent_dict(
         "window_schedule": _schedule_dict(window_schedule),
         "training_mode": training_mode,
         "prompt_range_size": prompt_range_size,
+        "target_groups_per_environment_lane": (
+            target_groups_per_environment_lane
+        ),
+        "candidate_limit_per_environment_lane": (
+            candidate_limit_per_environment_lane
+        ),
         "environment_universes": {
             name: int(environment_universes[name])
             for name in sorted(environment_universes)
@@ -230,6 +240,8 @@ def derive_epoch_id(
     window_schedule: WindowSchedule,
     training_mode: str,
     prompt_range_size: int,
+    target_groups_per_environment_lane: int,
+    candidate_limit_per_environment_lane: int,
     environment_universes: Mapping[str, int],
 ) -> str:
     intent = _intent_dict(
@@ -244,6 +256,12 @@ def derive_epoch_id(
         window_schedule=window_schedule,
         training_mode=training_mode,
         prompt_range_size=prompt_range_size,
+        target_groups_per_environment_lane=(
+            target_groups_per_environment_lane
+        ),
+        candidate_limit_per_environment_lane=(
+            candidate_limit_per_environment_lane
+        ),
         environment_universes=environment_universes,
     )
     return _frame_hash(_ID_DOMAIN, canonical_json_bytes(intent))
@@ -369,6 +387,8 @@ def build_epoch_plan(
     window_schedule: WindowSchedule,
     training_mode: str,
     prompt_range_size: int,
+    target_groups_per_environment_lane: int,
+    candidate_limit_per_environment_lane: int,
     environment_universes: Mapping[str, int],
     experimental_capability_id: str = CHECKPOINT_EPOCH_CAPABILITY_ID,
 ) -> EpochPlan:
@@ -393,6 +413,16 @@ def build_epoch_plan(
     prompt_range_size = _require_int(
         "prompt_range_size", prompt_range_size, minimum=1
     )
+    target_groups_per_environment_lane = _require_int(
+        "target_groups_per_environment_lane",
+        target_groups_per_environment_lane,
+        minimum=1,
+    )
+    candidate_limit_per_environment_lane = _require_int(
+        "candidate_limit_per_environment_lane",
+        candidate_limit_per_environment_lane,
+        minimum=target_groups_per_environment_lane,
+    )
     universes = _validate_environment_universes(environment_universes)
 
     epoch_id = derive_epoch_id(
@@ -407,6 +437,12 @@ def build_epoch_plan(
         window_schedule=window_schedule,
         training_mode=training_mode,
         prompt_range_size=prompt_range_size,
+        target_groups_per_environment_lane=(
+            target_groups_per_environment_lane
+        ),
+        candidate_limit_per_environment_lane=(
+            candidate_limit_per_environment_lane
+        ),
         environment_universes=universes,
     )
     epoch_seed = derive_epoch_seed(epoch_id=epoch_id, epoch_beacon=epoch_beacon)
@@ -449,6 +485,12 @@ def build_epoch_plan(
         window_schedule=window_schedule,
         training_mode=training_mode,
         prompt_range_size=prompt_range_size,
+        target_groups_per_environment_lane=(
+            target_groups_per_environment_lane
+        ),
+        candidate_limit_per_environment_lane=(
+            candidate_limit_per_environment_lane
+        ),
         epoch_id=epoch_id,
         epoch_seed=epoch_seed,
         windows=windows,
@@ -470,6 +512,12 @@ def epoch_plan_to_dict(plan: EpochPlan) -> dict[str, Any]:
         "window_schedule": _schedule_dict(plan.window_schedule),
         "training_mode": plan.training_mode,
         "prompt_range_size": plan.prompt_range_size,
+        "target_groups_per_environment_lane": (
+            plan.target_groups_per_environment_lane
+        ),
+        "candidate_limit_per_environment_lane": (
+            plan.candidate_limit_per_environment_lane
+        ),
         "epoch_id": plan.epoch_id,
         "epoch_seed": plan.epoch_seed,
         "windows": [
@@ -531,6 +579,8 @@ def parse_epoch_plan(
             "window_schedule",
             "training_mode",
             "prompt_range_size",
+            "target_groups_per_environment_lane",
+            "candidate_limit_per_environment_lane",
             "epoch_id",
             "epoch_seed",
             "windows",
@@ -634,6 +684,12 @@ def parse_epoch_plan(
         window_schedule=WindowSchedule(**schedule_obj),
         training_mode=obj["training_mode"],
         prompt_range_size=obj["prompt_range_size"],
+        target_groups_per_environment_lane=(
+            obj["target_groups_per_environment_lane"]
+        ),
+        candidate_limit_per_environment_lane=(
+            obj["candidate_limit_per_environment_lane"]
+        ),
         epoch_id=obj["epoch_id"],
         epoch_seed=obj["epoch_seed"],
         windows=tuple(windows),
@@ -674,6 +730,12 @@ def validate_epoch_plan(
         window_schedule=plan.window_schedule,
         training_mode=plan.training_mode,
         prompt_range_size=plan.prompt_range_size,
+        target_groups_per_environment_lane=(
+            plan.target_groups_per_environment_lane
+        ),
+        candidate_limit_per_environment_lane=(
+            plan.candidate_limit_per_environment_lane
+        ),
         environment_universes=environment_universes,
         experimental_capability_id=plan.experimental_capability_id,
     )

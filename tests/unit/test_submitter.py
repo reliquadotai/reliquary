@@ -596,6 +596,8 @@ def _checkpoint_epoch_plan_fixture():
             timeout_seconds=7200,
         ),
         training_mode="sequential_steps",
+        target_groups_per_environment_lane=16,
+        candidate_limit_per_environment_lane=24,
         environment_universes={"math": 100},
         prompt_range_size=8,
     )

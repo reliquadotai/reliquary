@@ -22,6 +22,7 @@ from reliquary.shared.checkpoint_epoch import (
     build_epoch_plan,
     canonical_json_bytes,
     canonical_manifest_bytes,
+    manifest_sha256,
     parse_epoch_plan,
 )
 
@@ -48,6 +49,8 @@ class EpochCommitIntent:
     window_schedule: WindowSchedule
     training_mode: str
     prompt_range_size: int
+    target_groups_per_environment_lane: int
+    candidate_limit_per_environment_lane: int
     environment_universes: tuple[tuple[str, int], ...]
 
     @property
@@ -90,6 +93,12 @@ def _intent_dict(intent: EpochCommitIntent) -> dict[str, Any]:
         },
         "training_mode": intent.training_mode,
         "prompt_range_size": intent.prompt_range_size,
+        "target_groups_per_environment_lane": (
+            intent.target_groups_per_environment_lane
+        ),
+        "candidate_limit_per_environment_lane": (
+            intent.candidate_limit_per_environment_lane
+        ),
         "environment_universes": {
             name: size for name, size in intent.environment_universes
         },
@@ -115,6 +124,8 @@ def build_epoch_intent(
     window_schedule: WindowSchedule,
     training_mode: str,
     prompt_range_size: int,
+    target_groups_per_environment_lane: int,
+    candidate_limit_per_environment_lane: int,
     environment_universes: Mapping[str, int],
 ) -> EpochCommitIntent:
     if isinstance(commit_observed_round, bool) or commit_observed_round < 1:
@@ -148,12 +159,24 @@ def build_epoch_intent(
         window_schedule=window_schedule,
         training_mode=str(training_mode),
         prompt_range_size=int(prompt_range_size),
+        target_groups_per_environment_lane=int(
+            target_groups_per_environment_lane
+        ),
+        candidate_limit_per_environment_lane=int(
+            candidate_limit_per_environment_lane
+        ),
         environment_universes=universes,
     )
     if intent.first_window < 0 or intent.window_count < 1:
         raise ValueError("invalid checkpoint epoch window range")
     if intent.warmup_rounds < 1 or intent.prompt_range_size < 1:
         raise ValueError("invalid checkpoint epoch warm-up or prompt range")
+    if (
+        intent.target_groups_per_environment_lane < 1
+        or intent.candidate_limit_per_environment_lane
+        < intent.target_groups_per_environment_lane
+    ):
+        raise ValueError("invalid checkpoint epoch admission bounds")
     return intent
 
 
@@ -176,6 +199,8 @@ def parse_epoch_intent(raw: bytes) -> EpochCommitIntent:
         "window_schedule",
         "training_mode",
         "prompt_range_size",
+        "target_groups_per_environment_lane",
+        "candidate_limit_per_environment_lane",
         "environment_universes",
     }:
         raise ValueError("checkpoint epoch intent keys differ")
@@ -208,6 +233,12 @@ def parse_epoch_intent(raw: bytes) -> EpochCommitIntent:
         window_schedule=WindowSchedule(**schedule),
         training_mode=value["training_mode"],
         prompt_range_size=value["prompt_range_size"],
+        target_groups_per_environment_lane=(
+            value["target_groups_per_environment_lane"]
+        ),
+        candidate_limit_per_environment_lane=(
+            value["candidate_limit_per_environment_lane"]
+        ),
         environment_universes=tuple(
             (str(name), int(size)) for name, size in sorted(universes.items())
         ),
@@ -218,6 +249,12 @@ def parse_epoch_intent(raw: bytes) -> EpochCommitIntent:
         raise ValueError("unsupported checkpoint epoch window schedule")
     if intent.training_mode not in CHECKPOINT_EPOCH_TRAINING_MODES:
         raise ValueError("unsupported checkpoint epoch training mode")
+    if (
+        intent.target_groups_per_environment_lane < 1
+        or intent.candidate_limit_per_environment_lane
+        < intent.target_groups_per_environment_lane
+    ):
+        raise ValueError("invalid checkpoint epoch admission bounds")
     if intent.beacon_target_round != intent.checkpoint.commit_observed_round + 1:
         raise ValueError("intent does not target the first post-commit beacon")
     return intent
@@ -246,6 +283,12 @@ def plan_from_intent(
         window_schedule=intent.window_schedule,
         training_mode=intent.training_mode,
         prompt_range_size=intent.prompt_range_size,
+        target_groups_per_environment_lane=(
+            intent.target_groups_per_environment_lane
+        ),
+        candidate_limit_per_environment_lane=(
+            intent.candidate_limit_per_environment_lane
+        ),
         environment_universes=dict(intent.environment_universes),
     )
 
@@ -349,6 +392,67 @@ class EpochStore:
         if plan.epoch_id != identifier:
             raise EpochStoreError("plan pointer/epoch mismatch")
         return plan
+
+    def mark_activated(self, plan: EpochPlan) -> None:
+        """Durably forbid reopening a collection after its routes are exposed."""
+        self._install_create_only(
+            self.root / f"activated-{plan.epoch_id}.json",
+            canonical_json_bytes({
+                "epoch_id": plan.epoch_id,
+                "manifest_sha256": manifest_sha256(plan),
+            }),
+            "epoch activation",
+        )
+
+    def is_activated(self, plan: EpochPlan) -> bool:
+        path = self.root / f"activated-{plan.epoch_id}.json"
+        if not path.exists():
+            return False
+        expected = canonical_json_bytes({
+            "epoch_id": plan.epoch_id,
+            "manifest_sha256": manifest_sha256(plan),
+        })
+        try:
+            actual = path.read_bytes()
+        except OSError as exc:
+            raise EpochStoreError("cannot read epoch activation") from exc
+        if actual != expected:
+            raise EpochStoreError("epoch activation does not match plan")
+        return True
+
+    def mark_terminal(self, plan: EpochPlan, *, status: str) -> None:
+        """Commit the one terminal outcome for an activated epoch."""
+        if status not in {"completed", "aborted"}:
+            raise ValueError("epoch terminal status must be completed or aborted")
+        if not self.is_activated(plan):
+            raise EpochStoreError("checkpoint epoch was not activated")
+        self._install_create_only(
+            self.root / f"terminal-{plan.epoch_id}.json",
+            canonical_json_bytes({
+                "epoch_id": plan.epoch_id,
+                "manifest_sha256": manifest_sha256(plan),
+                "status": status,
+            }),
+            "epoch terminal outcome",
+        )
+
+    def terminal_status(self, plan: EpochPlan) -> str | None:
+        path = self.root / f"terminal-{plan.epoch_id}.json"
+        if not path.exists():
+            return None
+        try:
+            raw = path.read_bytes()
+            value = json.loads(raw)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise EpochStoreError("invalid epoch terminal outcome") from exc
+        if (
+            value.get("epoch_id") != plan.epoch_id
+            or value.get("manifest_sha256") != manifest_sha256(plan)
+            or value.get("status") not in {"completed", "aborted"}
+            or raw != canonical_json_bytes(value)
+        ):
+            raise EpochStoreError("epoch terminal outcome does not match plan")
+        return str(value["status"])
 
     def _install_create_only(
         self,

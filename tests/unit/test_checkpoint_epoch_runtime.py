@@ -46,6 +46,8 @@ def _intent(**overrides):
         ),
         "training_mode": "sequential_steps",
         "prompt_range_size": 5_000,
+        "target_groups_per_environment_lane": 16,
+        "candidate_limit_per_environment_lane": 24,
         "environment_universes": {"code": 80_000, "math": 100_000},
     }
     values.update(overrides)
@@ -117,6 +119,42 @@ def test_restart_reload_is_byte_identical(tmp_path):
 
     assert restored == plan
     assert canonical_manifest_bytes(restored) == expected
+
+
+def test_activation_and_terminal_outcome_are_create_only(tmp_path):
+    store = EpochStore(tmp_path)
+    intent = _intent()
+    store.install_intent(intent)
+    store.confirm_before_beacon(intent, observed_round=1_000)
+    plan = plan_from_intent(intent, beacon=_beacon())
+    store.install_plan(intent, plan)
+
+    assert store.is_activated(plan) is False
+    store.mark_activated(plan)
+    store.mark_activated(plan)
+    assert store.is_activated(plan) is True
+    assert store.terminal_status(plan) is None
+
+    store.mark_terminal(plan, status="completed")
+    store.mark_terminal(plan, status="completed")
+    assert store.terminal_status(plan) == "completed"
+    with pytest.raises(EpochEquivocationError, match="different bytes"):
+        store.mark_terminal(plan, status="aborted")
+
+
+def test_corrupt_activation_marker_is_rejected(tmp_path):
+    store = EpochStore(tmp_path)
+    intent = _intent()
+    store.install_intent(intent)
+    store.confirm_before_beacon(intent, observed_round=1_000)
+    plan = plan_from_intent(intent, beacon=_beacon())
+    store.install_plan(intent, plan)
+    store.mark_activated(plan)
+    marker = tmp_path / f"activated-{plan.epoch_id}.json"
+    marker.write_bytes(b"{}")
+
+    with pytest.raises(EpochStoreError, match="activation does not match"):
+        store.is_activated(plan)
 
 
 def test_manifest_equivocation_is_rejected(tmp_path):

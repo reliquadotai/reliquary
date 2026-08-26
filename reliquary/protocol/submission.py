@@ -345,6 +345,13 @@ class GrpoBatchState(BaseModel):
         default=None,
         pattern=r"^[0-9a-f]{64}$",
     )
+    checkpoint_epoch_target_groups: int | None = Field(default=None, ge=1)
+    checkpoint_epoch_candidate_limit: int | None = Field(default=None, ge=1)
+    checkpoint_epoch_candidate_remaining: int | None = Field(default=None, ge=0)
+    checkpoint_epoch_collection_seconds: float | None = Field(
+        default=None,
+        gt=0,
+    )
     # v2.3: drand beacon randomness for this window. Empty string between
     # OPEN and the first successful _set_window_randomness; miners loop on
     # empty until populated. Miners derive GRAIL commitments off this
