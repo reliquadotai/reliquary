@@ -541,3 +541,263 @@ def test_retire_never_kills_a_replacement_worker():
         assert pool.call(slots[0], "still alive")["payload"] == "still alive"
     finally:
         pool.close()
+
+
+def test_slots_without_an_mps_server_are_flagged(tmp_path, monkeypatch, caplog):
+    """Slots without MPS work — they just lose most of the speed-up.
+
+    Four slots measure 8.3 s without an MPS server against 5.7 s with one, and
+    nothing in the CUDA API reports the difference: the contexts time-slice
+    quietly. An operator who forgets ``nvidia-cuda-mps-control -d``, or whose
+    container cannot reach the host's pipe directory, gets a third of the gain
+    and no signal. This is the check that survives a rebuilt box, so it warns
+    rather than refuses: MPS is a performance choice, not a correctness one.
+    """
+    import logging
+
+    from reliquary.validator.proof_worker import assert_proof_slots_supported
+
+    monkeypatch.setenv("CUDA_MPS_PIPE_DIRECTORY", str(tmp_path))
+
+    with caplog.at_level(
+        logging.WARNING, logger="reliquary.validator.proof_worker"
+    ):
+        assert_proof_slots_supported(
+            slots_per_device=4, isolation=True, proof_devices=("cuda:0",),
+        )
+    assert "MPS" in caplog.text
+
+    # The control pipe is what nvidia-cuda-mps-control creates when it starts.
+    (tmp_path / "control").touch()
+    caplog.clear()
+    with caplog.at_level(
+        logging.WARNING, logger="reliquary.validator.proof_worker"
+    ):
+        assert_proof_slots_supported(
+            slots_per_device=4, isolation=True, proof_devices=("cuda:0",),
+        )
+    assert caplog.text == ""
+
+
+def test_one_slot_never_mentions_mps(tmp_path, monkeypatch, caplog):
+    """A single slot has nothing to overlap, so MPS is irrelevant to it.
+
+    Warning anyway would train every default deployment to ignore the line.
+    """
+    import logging
+
+    from reliquary.validator.proof_worker import assert_proof_slots_supported
+
+    monkeypatch.setenv("CUDA_MPS_PIPE_DIRECTORY", str(tmp_path))
+    with caplog.at_level(
+        logging.WARNING, logger="reliquary.validator.proof_worker"
+    ):
+        assert_proof_slots_supported(
+            slots_per_device=1, isolation=True, proof_devices=("cuda:0",),
+        )
+    assert caplog.text == ""
+
+
+def test_the_mps_pipe_directory_defaults_to_the_cuda_default(monkeypatch):
+    """Unset ``CUDA_MPS_PIPE_DIRECTORY`` means ``/tmp/nvidia-mps`` to CUDA.
+
+    Reading the variable alone would report "no MPS" on a box where the daemon
+    runs on its default path, which is the common case.
+    """
+    from reliquary.validator.proof_worker import mps_control_pipe_path
+
+    monkeypatch.delenv("CUDA_MPS_PIPE_DIRECTORY", raising=False)
+    assert mps_control_pipe_path() == "/tmp/nvidia-mps/control"
+
+    monkeypatch.setenv("CUDA_MPS_PIPE_DIRECTORY", "/var/run/mps")
+    assert mps_control_pipe_path() == "/var/run/mps/control"
+
+
+def test_a_spawn_that_finishes_after_close_is_not_published():
+    """``close()`` can run while ``_spawn`` is blocked, and holds no lock.
+
+    ``_worker_for`` reads ``_closed`` BEFORE spawning, and a spawn waits up to
+    ``start_timeout_seconds`` (900 s in production) for a replica to load. A
+    force-close in that window — the shutdown taken when the scheduler did not
+    quiesce and dispatch threads are still in flight — snapshots and clears the
+    map without this child, which the spawning thread then writes back into the
+    cleared map. Nothing retires it: a 10.2 GB replica and an open pipe survive
+    the shutdown meant to reap them.
+    """
+    from reliquary.validator.proof_worker import (
+        ProofWorkerPool,
+        ProofWorkerUnavailable,
+    )
+
+    support = "tests.unit.proof_worker_support"
+    pool = ProofWorkerPool(
+        devices=("cuda:0",),
+        context_factory=f"{support}:build_counter_context",
+        handler=f"{support}:echo_handler",
+    )
+    spawn_entered = threading.Event()
+    release_spawn = threading.Event()
+    spawned: list[object] = []
+
+    class _FakeProcess:
+        def __init__(self) -> None:
+            self.killed = False
+            self._alive = True
+
+        def is_alive(self) -> bool:
+            return self._alive
+
+        def kill(self) -> None:
+            self.killed = True
+            self._alive = False
+
+        def join(self, timeout=None) -> None:
+            pass
+
+    class _FakeConnection:
+        def close(self) -> None:
+            pass
+
+    def _fake_spawn(device_id: str):
+        from reliquary.validator.proof_worker import _Worker
+
+        spawn_entered.set()
+        release_spawn.wait(5.0)
+        worker = _Worker(
+            device_id=device_id,
+            process=_FakeProcess(),
+            connection=_FakeConnection(),
+        )
+        spawned.append(worker)
+        return worker
+
+    pool._spawn = _fake_spawn
+    outcome: list[object] = []
+
+    def _start() -> None:
+        try:
+            outcome.append(pool._worker_for("cuda:0"))
+        except ProofWorkerUnavailable as exc:
+            outcome.append(exc)
+
+    thread = threading.Thread(target=_start)
+    thread.start()
+    assert spawn_entered.wait(5.0)
+    pool.close(force=True)
+    release_spawn.set()
+    thread.join(5.0)
+
+    assert spawned, "the spawn under test never produced a worker"
+    assert spawned[0].process.killed, "the late child outlived close()"
+    assert pool._workers == {}
+    assert isinstance(outcome[0], ProofWorkerUnavailable)
+
+
+def test_start_takes_the_same_per_slot_lock_as_a_request():
+    """``start()`` reached ``_worker_for`` with no lock at all.
+
+    ``_request`` serialises spawns per slot; ``start()`` did not, so a call
+    racing startup on one slot could spawn twice and silently overwrite an
+    entry in ``_workers``, leaking a child holding a full replica. Unreachable
+    in today's call order — which is exactly why the invariant should not rest
+    on that order.
+    """
+    from reliquary.validator.proof_worker import ProofWorkerPool
+
+    support = "tests.unit.proof_worker_support"
+    pool = ProofWorkerPool(
+        devices=("cuda:0#0", "cuda:0#1"),
+        context_factory=f"{support}:build_counter_context",
+        handler=f"{support}:echo_handler",
+    )
+    held: list[str] = []
+
+    def _fake_spawn(device_id: str):
+        # The per-slot lock must already be held when the spawn runs.
+        assert not pool._device_spawn_lock(device_id).acquire(blocking=False)
+        held.append(device_id)
+        return object()
+
+    pool._spawn = _fake_spawn
+    pool.start()
+    assert held == ["cuda:0#0", "cuda:0#1"]
+
+
+def test_a_tight_host_warns_before_the_replicas_land_on_it(caplog):
+    """The CPU move turns ~16-24 GB of VRAM into a permanent host-RSS floor.
+
+    On a validator with a known ~11 GB/h RSS leak that has already been
+    OOM-killed, that floor shortens time-to-OOM proportionally, and the OOM
+    lands mid-window: an aborted, unpaid window plus a lost LR warmup. The
+    budget is documented and nothing enforces it. Warn, never refuse — a
+    validator that runs degraded still earns, one that will not boot does not.
+    """
+    import logging
+
+    from reliquary.validator.proof_worker import (
+        assert_host_memory_for_cpu_replicas,
+    )
+
+    with caplog.at_level(
+        logging.WARNING, logger="reliquary.validator.proof_worker"
+    ):
+        assert_host_memory_for_cpu_replicas(
+            isolated_plane=True, available_gb=12.0,
+        )
+    assert "12.0" in caplog.text and "RAM" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(
+        logging.WARNING, logger="reliquary.validator.proof_worker"
+    ):
+        assert_host_memory_for_cpu_replicas(
+            isolated_plane=True, available_gb=64.0,
+        )
+    assert caplog.text == ""
+
+
+def test_a_gpu_resident_validator_is_never_warned_about_host_ram(caplog):
+    """No isolated plane means the replicas stay on the card.
+
+    The host floor does not exist there, and warning anyway would teach the
+    operator to scroll past the line that matters.
+    """
+    import logging
+
+    from reliquary.validator.proof_worker import (
+        assert_host_memory_for_cpu_replicas,
+    )
+
+    with caplog.at_level(
+        logging.WARNING, logger="reliquary.validator.proof_worker"
+    ):
+        assert_host_memory_for_cpu_replicas(
+            isolated_plane=False, available_gb=1.0,
+        )
+    assert caplog.text == ""
+
+
+def test_the_kl_reference_raises_the_host_floor(caplog):
+    """A pinned KL base model is a fourth replica, +8 GB on the same floor."""
+    import logging
+
+    from reliquary.validator.proof_worker import (
+        assert_host_memory_for_cpu_replicas,
+    )
+
+    with caplog.at_level(
+        logging.WARNING, logger="reliquary.validator.proof_worker"
+    ):
+        assert_host_memory_for_cpu_replicas(
+            isolated_plane=True, available_gb=28.0, kl_base_model=False,
+        )
+    assert caplog.text == ""
+
+    caplog.clear()
+    with caplog.at_level(
+        logging.WARNING, logger="reliquary.validator.proof_worker"
+    ):
+        assert_host_memory_for_cpu_replicas(
+            isolated_plane=True, available_gb=28.0, kl_base_model=True,
+        )
+    assert "RAM" in caplog.text

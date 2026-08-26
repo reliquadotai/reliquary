@@ -32,6 +32,8 @@ __all__ = [
     "ProofWorkerUnavailable",
     "assert_isolation_supported",
     "assert_proof_slots_supported",
+    "mps_control_pipe_path",
+    "assert_host_memory_for_cpu_replicas",
     "validator_replica_device",
     "build_isolated_proof_plane",
     "build_proof_context",
@@ -245,7 +247,12 @@ class ProofWorkerPool:
 
     def start(self) -> None:
         for device_id in self._devices:
-            self._worker_for(device_id)
+            # Same lock _request takes. Nothing calls into the pool during
+            # startup today, but leaving the spawn invariant resting on that
+            # call order lets a future caller spawn a slot twice and drop one
+            # child, still holding a full replica, out of the map.
+            with self._device_spawn_lock(device_id):
+                self._worker_for(device_id)
 
     def _worker_for(self, device_id: str) -> _Worker:
         """Return the live worker, replacing one that died since last use."""
@@ -264,6 +271,15 @@ class ProofWorkerPool:
                     f"{device_id}"
                 )
             worker = self._spawn(device_id)
+            if self._closed:
+                # close() holds no lock across a spawn and a spawn can block
+                # for start_timeout_seconds, so its snapshot cannot contain
+                # this child. Publishing it now would leak a replica and an
+                # open pipe past the shutdown meant to reap them.
+                self._kill(worker)
+                raise ProofWorkerUnavailable(
+                    f"proof worker pool closed while {device_id} was starting"
+                )
             self._workers[device_id] = worker
         return worker
 
@@ -280,6 +296,11 @@ class ProofWorkerPool:
         worker = self._workers.pop(device_id, None)
         if worker is None:
             return
+        self._kill(worker)
+
+    @staticmethod
+    def _kill(worker: "_Worker") -> None:
+        """Reap one child, whether or not it ever reached ``_workers``."""
         try:
             worker.connection.close()
         except OSError:
@@ -679,6 +700,23 @@ def build_isolated_proof_plane(
     return pool, proxies
 
 
+# CUDA's own default when CUDA_MPS_PIPE_DIRECTORY is unset. A box running the
+# daemon on the default path sets nothing, so reading the variable alone would
+# report "no MPS" for the common case.
+_DEFAULT_MPS_PIPE_DIRECTORY = "/tmp/nvidia-mps"
+
+
+def mps_control_pipe_path() -> str:
+    """The named pipe ``nvidia-cuda-mps-control -d`` creates when it starts."""
+    import os
+
+    directory = (
+        os.environ.get("CUDA_MPS_PIPE_DIRECTORY", "").strip()
+        or _DEFAULT_MPS_PIPE_DIRECTORY
+    )
+    return os.path.join(directory, "control")
+
+
 def assert_proof_slots_supported(
     *,
     slots_per_device: int,
@@ -710,6 +748,22 @@ def assert_proof_slots_supported(
             "in-process",
             int(slots_per_device),
         )
+        return
+    if int(slots_per_device) > 1:
+        import os
+
+        pipe = mps_control_pipe_path()
+        if not os.path.exists(pipe):
+            logger.warning(
+                "%d proof slots per GPU, but no CUDA MPS control pipe at %s. "
+                "Without an MPS server the slots' CUDA contexts time-slice "
+                "instead of overlapping: 4 slots measured 8.3 s against 5.7 s "
+                "with one. Start it with nvidia-cuda-mps-control -d and give "
+                "the container the same CUDA_MPS_PIPE_DIRECTORY. Nothing else "
+                "reports this — the proofs stay correct, only slower.",
+                int(slots_per_device),
+                pipe,
+            )
 
 
 def validator_replica_device(
@@ -731,6 +785,67 @@ def validator_replica_device(
     leave a flash-attention-2 model on the CPU and prove there, silently.
     """
     return "cpu" if isolated_plane else gpu_device
+
+
+# What the validator's own replicas cost in host RAM once they leave the card.
+# The train/verify pair is ~16 GB steady, but RELIQUARY_RESUME_FROM rebinds
+# train_model only after the replacement has loaded, so three are alive for a
+# moment at every boot. A pinned KL reference is a fourth.
+VALIDATOR_REPLICA_HOST_MEMORY_FLOOR_GB = 24.0
+VALIDATOR_KL_REFERENCE_HOST_MEMORY_GB = 8.0
+
+
+def _available_host_memory_gb() -> float | None:
+    """``MemAvailable`` in GB, or None where /proc/meminfo is not readable."""
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / (1024.0 * 1024.0)
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def assert_host_memory_for_cpu_replicas(
+    *,
+    isolated_plane: bool,
+    kl_base_model: bool = False,
+    available_gb: float | None = None,
+) -> None:
+    """Warn when the host cannot carry the replicas the CPU move puts on it.
+
+    An isolated plane hands this process's train/verify pair to host RAM,
+    converting VRAM into a PERMANENT RSS floor. This validator has a known
+    ~11 GB/h RSS leak and has been OOM-killed before, so the floor shortens
+    time-to-OOM proportionally — and the OOM lands mid-window: an aborted,
+    unpaid window plus a lost LR warmup.
+
+    Warn, never refuse. A validator running with a tight host still earns; one
+    that will not boot does not. This exists so the regression is a decision at
+    startup rather than a restart hours later.
+    """
+    if not isolated_plane:
+        return
+    floor = VALIDATOR_REPLICA_HOST_MEMORY_FLOOR_GB
+    if kl_base_model:
+        floor += VALIDATOR_KL_REFERENCE_HOST_MEMORY_GB
+    available = (
+        _available_host_memory_gb() if available_gb is None
+        else float(available_gb)
+    )
+    if available is None or available >= floor:
+        return
+    logger.warning(
+        "Isolated proof plane: this process's replicas load on the CPU and "
+        "need ~%.0f GB of host RAM, but only %.1f GB is available. They are a "
+        "permanent RSS floor, not a transient — with the known RSS leak this "
+        "box will reach OOM sooner, and an OOM mid-window costs an unpaid "
+        "window and the LR warmup. Free host RAM, or run without "
+        "RELIQUARY_PROOF_PROCESS_ISOLATION.",
+        floor,
+        available,
+    )
 
 
 def assert_isolation_supported(

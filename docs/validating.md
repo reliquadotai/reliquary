@@ -128,15 +128,10 @@ PCIe over 192 archived rollouts:
 
 Two rules follow from that table:
 
-- **Start the CUDA MPS daemon**, or most of the gain stays on the table —
-  without it the CUDA contexts time-slice instead of overlapping:
-  ```bash
-  export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-mps-log
-  mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
-  nvidia-cuda-mps-control -d
-  ```
-  The container needs the same `CUDA_MPS_PIPE_DIRECTORY`. MPS changes no
-  verdict: on/off at 1 and 4 slots returned 192/192 identical proof results.
+- **Start the CUDA MPS daemon** (`scripts/setup_cuda_mps.sh`, on the host),
+  or most of the gain stays on the table — without it the CUDA contexts
+  time-slice instead of overlapping. MPS changes no verdict: on/off at 1 and 4
+  slots returned 192/192 identical proof results.
 - **Budget 10.2 GB of VRAM per slot.** That figure is flat in rollout length
   (512 → 8959 tokens moves peak allocation by 0.20 GB), so size the fleet
   against free VRAM, not against how long completions may grow. Stay clear of
@@ -164,6 +159,48 @@ has loaded, so three replicas are alive for a moment at every boot (a fourth,
 RSS, so check free host RAM before enabling — this validator has a known RSS
 leak and has OOM-restarted before, and a fixed floor shortens time-to-OOM
 proportionally.
+
+#### Setting this up on a fresh box
+
+Nothing here is discoverable from a running validator, so follow the list
+rather than memory. Every value below must be identical in all three places it
+appears (host daemon, `.env`, compose bind).
+
+1. **Host** — start the MPS daemon. Idempotent, safe to re-run:
+   ```bash
+   bash scripts/setup_cuda_mps.sh
+   ```
+   It refuses rather than continuing if `nvidia-cuda-mps-control` is missing:
+   on a host that cannot run it, stay at one slot. It also installs a systemd
+   unit, because the container restarts after a host reboot and the daemon
+   would not — the box would come back at ~1.45× with nothing but a boot
+   warning to say so. `--no-service` skips that.
+2. **`docker/.env`** — the four keys that move together, all documented in
+   `docker/.env.example.trainer`:
+   ```bash
+   RELIQUARY_PROOF_PROCESS_ISOLATION=1
+   RELIQUARY_DETACHED_TRAINER=1          # required by isolation
+   RELIQUARY_PROOF_SLOTS_PER_DEVICE=2    # raise once you have watched a day
+   CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
+   RELIQUARY_IPC_MODE=host               # slots only; see step 3
+   ```
+3. **Compose** — `docker-compose.trainer.yml` binds the pipe directory
+   unconditionally and takes its IPC mode from `RELIQUARY_IPC_MODE`, which
+   defaults to `private`. Both the bind and the host IPC namespace are needed:
+   MPS reaches its server over shared memory as well as the pipe. The IPC
+   namespace is opt-in on purpose — it hands the host's SysV IPC and
+   `/dev/shm` to a container that runs untrusted submissions (gVisor, not the
+   IPC namespace, is the boundary for miner code), and a one-slot deployment
+   gains nothing from it.
+4. **Confirm** — start the validator and read the boot log. It warns when the
+   control pipe is not reachable:
+   ```
+   4 proof slots per GPU, but no CUDA MPS control pipe at /tmp/nvidia-mps/control
+   ```
+   No warning means the pipe is there. It does **not** mean the contexts
+   actually overlap — a broken IPC namespace fails silently, and CUDA reports
+   nothing either way. The only real confirmation is the clock: time a window
+   at one slot against N.
 
 The CLI compatibility default remains `openmathinstruct`, but the production
 auction contract is mixed Math+Code. Configure the trainer explicitly:

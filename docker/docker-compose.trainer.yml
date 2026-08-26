@@ -26,6 +26,25 @@ services:
     # "cannot set up cgroup for root".
     cgroup: host
     env_file: .env
+    environment:
+      # Proof slots overlap on one card only through the host's CUDA MPS
+      # daemon; without it their CUDA contexts time-slice and four slots
+      # measure 8.3 s against 5.7 s. Harmless when the daemon is not running:
+      # CUDA falls back to its own contexts. Keep this in step with the bind
+      # mount below — the path must be identical on both sides.
+      CUDA_MPS_PIPE_DIRECTORY: ${CUDA_MPS_PIPE_DIRECTORY:-/tmp/nvidia-mps}
+    # MPS clients reach the server over the pipe directory AND shared memory,
+    # so slots need the host IPC namespace as well as the bind below. This is
+    # NVIDIA's documented container recipe; the bind alone is not enough, and
+    # neither failure is reported by CUDA — confirm with the 1-slot vs N-slot
+    # timing, not by the container starting.
+    #
+    # OPT-IN, and deliberately not the default: it hands the host's SysV IPC
+    # and /dev/shm to a container that runs untrusted submissions. gVisor, not
+    # the IPC namespace, is the boundary for miner code — but a one-slot
+    # deployment gains nothing here, so it should not pay for it either.
+    # Set RELIQUARY_IPC_MODE=host in docker/.env when running proof slots.
+    ipc: ${RELIQUARY_IPC_MODE:-private}
     # NVIDIA Container Toolkit required on the host.
     deploy:
       resources:
@@ -42,6 +61,13 @@ services:
         source: ${BT_WALLETS_DIR:?set BT_WALLETS_DIR to the host path of your wallets/}
         target: ${BT_WALLET_PATH:-/opt/reliquary/wallets}
         read_only: true
+      # CUDA MPS control pipe, created on the host by nvidia-cuda-mps-control.
+      # create_host_path keeps the container startable on a box with no MPS.
+      - type: bind
+        source: ${CUDA_MPS_PIPE_DIRECTORY:-/tmp/nvidia-mps}
+        target: ${CUDA_MPS_PIPE_DIRECTORY:-/tmp/nvidia-mps}
+        bind:
+          create_host_path: true
       # Persistent state (staging checkpoints, HF cache)
       - reliquary-state:/root/reliquary/state
       - hf-cache:/root/.cache/huggingface

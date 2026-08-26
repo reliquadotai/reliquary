@@ -553,6 +553,17 @@ def validate(
             )
             isolated_plane = bool(PROOF_PROCESS_ISOLATION and proof_slots)
 
+            # The CPU move turns VRAM into a permanent host-RSS floor. Say so
+            # before paying for it, not hours later through an OOM restart.
+            from reliquary.constants import KL_BASE_MODEL as _kl_base
+            from reliquary.validator.proof_worker import (
+                assert_host_memory_for_cpu_replicas,
+            )
+
+            assert_host_memory_for_cpu_replicas(
+                isolated_plane=isolated_plane,
+                kl_base_model=bool(_kl_base),
+            )
             model = load_validator_replica(
                 checkpoint,
                 isolated_plane=isolated_plane,
