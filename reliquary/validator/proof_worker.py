@@ -185,7 +185,7 @@ class ProofWorkerPool:
     name the same card (``cuda:0#0``, ``cuda:0#1``, ...): without an MPS server
     their CUDA contexts time-slice and a second slot buys almost nothing —
     which is what the original x1.04 measurement here recorded — but with one
-    they overlap, and four slots measure x2.19 (see PROOF_SLOTS_PER_DEVICE).
+    they overlap, and four slots measure ~x2 (see PROOF_SLOTS_PER_DEVICE).
     Every slot runs the same batch=1 path, so no verdict can shift.
     """
 

@@ -431,7 +431,7 @@ def test_slot_ids_are_never_counted_as_capacity():
     """Capacity is a claim about physical cards, not about processes.
 
     ``available_device_seconds`` is ``wall x len(configured_devices)``. Four
-    slots on one H100 measure 2.19x, not 4x, so letting slot ids reach this
+    slots on one H100 measure ~2x, not 4x, so letting slot ids reach this
     call would inflate the qualified budget — the one direction a fail-closed
     gate must never move. The CLI passes the physical devices here and the
     slots only to the pool and the scheduler; this pins the guard that makes

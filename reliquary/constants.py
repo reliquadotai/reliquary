@@ -1475,6 +1475,10 @@ PROOF_PROCESS_ISOLATION = (
 #       4       8.3 s       5.7 s
 #       8           -       5.8 s   (plateau: the GPU is the limit here)
 #
+# Reproduced on a second H100 PCIe after three review rounds: 11.7 / 6.9 / 5.9
+# at 1 / 2 / 4 slots, i.e. ~2x. Quote the range, not a third digit — the
+# baseline moves a few percent between cards.
+#
 # Without an MPS server the CUDA contexts time-slice, which is the x1.04 the
 # original isolation note recorded; with one they genuinely overlap. Every
 # slot runs the same batch=1 path, and the whole matrix returned 192/192
