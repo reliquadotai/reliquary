@@ -140,10 +140,15 @@ def max_new_tokens_for_environment(environment: str) -> int:
 # (gradeable) answer instead of an unparseable thinking truncation. H200 sweeps
 # on real OpenMathInstruct prompts found 2048/512 to match 2048/256 reward
 # (5/6) with better EOS rate, while 4096/256 was slower and lower reward.
-_MATH_PROFILE = ACTIVE_PROTOCOL_PROFILE.environments["openmathinstruct"]
-_MATH_BFT_PROFILE = _MATH_PROFILE.bft
-MATH_ANSWER_FORMAT = _MATH_PROFILE.answer_format
-if MATH_ANSWER_FORMAT not in ("boxed", "boxed_or_trailing_number"):
+_MATH_PROFILE = ACTIVE_PROTOCOL_PROFILE.environments.get("openmathinstruct")
+_MATH_BFT_PROFILE = _MATH_PROFILE.bft if _MATH_PROFILE is not None else None
+MATH_ANSWER_FORMAT = (
+    _MATH_PROFILE.answer_format if _MATH_PROFILE is not None else None
+)
+if _MATH_PROFILE is not None and MATH_ANSWER_FORMAT not in (
+    "boxed",
+    "boxed_or_trailing_number",
+):
     raise ValueError("openmathinstruct profile must declare an answer format")
 BFT_ENABLED = _MATH_BFT_PROFILE is not None
 # 2026-07 Qwen3.5-4B behavior study (held-out OMI, vLLM): the 4B thinks a median
@@ -620,8 +625,11 @@ B_BATCH = 16 if PROTOCOL_VERSION >= 4 else 8
 # processed per optimizer step: 2 × B_BATCH prompts × M_ROLLOUTS sequences.
 # v3: 16 × 8 = 128. v4: 32 × 16 = 512.
 ENVIRONMENT_MIX: list[tuple[str, int]] = [
-    ("openmathinstruct", B_BATCH),
-    ("opencodeinstruct", B_BATCH),
+    (
+        name,
+        B_BATCH if profile.batch_target is None else int(profile.batch_target),
+    )
+    for name, profile in ACTIVE_PROTOCOL_PROFILE.environments.items()
 ]
 
 # Auction-v3 deliberately narrows only the ranked GPU proof prefix: B_BATCH
@@ -860,9 +868,8 @@ MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW = 2
 DIFFICULTY_AUCTION_ENFORCE = _os.environ.get(
     "RELIQUARY_DIFFICULTY_AUCTION_ENFORCE", "1"
 ).strip().lower() not in ("0", "false", "no", "off", "")
-DIFFICULTY_AUCTION_ENVIRONMENTS = (
-    "openmathinstruct",
-    "opencodeinstruct",
+DIFFICULTY_AUCTION_ENVIRONMENTS = tuple(
+    ACTIVE_PROTOCOL_PROFILE.environments
 )
 
 ENFORCE_ENVELOPE_SIGNATURE = _os.environ.get(

@@ -123,6 +123,7 @@ def encode_training_payload(
     window_start: int,
     checkpoint_revision: str,
     env_order: list[str],
+    env_targets: dict[str, int] | None = None,
     window_quarantine: dict,
 ) -> bytes:
     groups_meta: list[dict[str, Any]] = []
@@ -175,10 +176,11 @@ def encode_training_payload(
                     pi_old_flat.extend(pi_old)
                 pi_old_off.append(len(pi_old_flat))
 
+    protocol_header = _artifact_protocol_header(
+        latest_schema_version=PAYLOAD_SCHEMA_VERSION,
+    )
     header = {
-        **_artifact_protocol_header(
-            latest_schema_version=PAYLOAD_SCHEMA_VERSION,
-        ),
+        **protocol_header,
         "window_start": int(window_start),
         "checkpoint_revision": str(checkpoint_revision),
         "env_order": list(env_order),
@@ -188,6 +190,22 @@ def encode_training_payload(
         "validated_spans": validated_spans,
         "termination_paths": termination_paths,
     }
+    if int(protocol_header["schema_version"]) >= 2:
+        resolved_targets = dict(env_targets or {})
+        if not env_order or len(set(env_order)) != len(env_order):
+            raise ValueError(
+                "schema-v2 training payload env_order must be non-empty and unique"
+            )
+        if set(resolved_targets) != set(env_order):
+            raise ValueError(
+                "schema-v2 training payload targets must match env_order"
+            )
+        if any(int(value) <= 0 for value in resolved_targets.values()):
+            raise ValueError("training payload targets must be positive")
+        header["env_targets"] = {
+            environment: int(resolved_targets[environment])
+            for environment in env_order
+        }
     buf = io.BytesIO()
     np.savez_compressed(
         buf,
@@ -222,6 +240,25 @@ class DecodedPayload:
         self.window_start = int(header["window_start"])
         self.checkpoint_revision = str(header["checkpoint_revision"])
         self.env_order = list(header["env_order"])
+        if self.schema_version >= 2 and (
+            not self.env_order
+            or len(set(self.env_order)) != len(self.env_order)
+            or "env_targets" not in header
+        ):
+            raise ValueError(
+                "schema-v2 training payload requires unique order and targets"
+            )
+        self.env_targets = {
+            str(name): int(target)
+            for name, target in dict(header.get("env_targets") or {}).items()
+        }
+        if (
+            self.schema_version >= 2
+            and set(self.env_targets) != set(self.env_order)
+        ):
+            raise ValueError("training payload targets do not match env_order")
+        if any(target <= 0 for target in self.env_targets.values()):
+            raise ValueError("training payload targets must be positive")
         self.window_quarantine = dict(header["window_quarantine"])
         self._groups_meta = header["groups"]
         self._rollout_meta = header["rollout_meta"]

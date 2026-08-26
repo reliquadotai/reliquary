@@ -36,6 +36,7 @@ from reliquary.environment.grader_client import (
 )
 from reliquary.environment.opencodeinstruct import _entry_function_name, _extract_python
 from reliquary.environment.openmathinstruct import _compute_omi_reward
+from reliquary.environment.registry import get_environment_spec
 from reliquary.protocol.legacy_merkle import legacy_submission_merkle_matches
 from reliquary.protocol.signatures import (
     verify_commit_signature,
@@ -105,6 +106,15 @@ class AdmissionRuntimeMaterials:
     problem: dict[str, Any]
     completion_texts: list[str]
     code_cases: list[dict[str, Any]] | None = None
+    reward_materials: Any = None
+
+    @property
+    def effective_reward_materials(self) -> Any:
+        return (
+            self.reward_materials
+            if self.reward_materials is not None
+            else self.code_cases
+        )
 
 
 @dataclass(frozen=True)
@@ -112,6 +122,15 @@ class AdmissionProblemMaterials:
     problem: dict[str, Any]
     rendered_prompt: str
     code_cases: list[dict[str, Any]] | None = None
+    reward_materials: Any = None
+
+    @property
+    def effective_reward_materials(self) -> Any:
+        return (
+            self.reward_materials
+            if self.reward_materials is not None
+            else self.code_cases
+        )
 
 
 @dataclass
@@ -146,6 +165,10 @@ class PreparedSubmission:
     unboxed_count: int = 0
     attainable_rewards: tuple[float, ...] = ()
     robust_utility: float | None = None
+    task_family: str | None = None
+    generator_version: str | None = None
+    operation_id: str | None = None
+    difficulty: int | None = None
 
 
 class _AdmissionTimeout(TimeoutError):
@@ -356,7 +379,14 @@ def _natural_cap_termination(
     meta: dict[str, Any],
     context: AdmissionContext,
 ) -> bool:
-    if context.environment != "openmathinstruct":
+    try:
+        uses_math_bft = (
+            get_environment_spec(context.environment).termination_policy
+            == "math_bft"
+        )
+    except ValueError:
+        uses_math_bft = False
+    if not uses_math_bft:
         return False
     if meta.get("forced") or meta.get("force_span") not in (None, []):
         return False
@@ -406,10 +436,14 @@ def _classify_termination(rollout, context: AdmissionContext) -> str:
         if len(eos_positions) > 1 or eos_positions[0] != len(completion) - 1:
             return "bad_termination"
         return "ok"
-    if (
-        context.environment == "openmathinstruct"
-        and _forced_cap_termination(meta)
-    ):
+    try:
+        uses_math_bft = (
+            get_environment_spec(context.environment).termination_policy
+            == "math_bft"
+        )
+    except ValueError:
+        uses_math_bft = False
+    if uses_math_bft and _forced_cap_termination(meta):
         if not _force_span_valid(tokens, meta, context):
             return "tampered"
         return "ok"
@@ -723,6 +757,30 @@ def _compute_code_rewards(
         executor.shutdown(wait=False, cancel_futures=True)
 
 
+def _score_openmath_adapter(
+    problem: dict[str, Any],
+    completion_texts: list[str],
+    reward_materials: Any = None,
+) -> list[float]:
+    del reward_materials
+    return [
+        float(_compute_omi_reward(problem, text))
+        for text in completion_texts
+    ]
+
+
+def _score_opencode_adapter(
+    problem: dict[str, Any],
+    completion_texts: list[str],
+    reward_materials: Any = None,
+) -> list[float]:
+    del problem
+    return _compute_code_rewards(
+        completion_texts,
+        list(reward_materials or []),
+    )
+
+
 def score_and_finalize_submission(
     parsed: ParsedSubmission,
     materials: AdmissionRuntimeMaterials,
@@ -784,19 +842,11 @@ def score_and_finalize_submission(
 
             reward_started = time.perf_counter()
             try:
-                if context.environment == "openmathinstruct":
-                    computed = [
-                        float(_compute_omi_reward(materials.problem, text))
-                        for text in materials.completion_texts
-                    ]
-                    authoritative = False
-                elif context.environment == "opencodeinstruct":
-                    computed = _compute_code_rewards(
-                        materials.completion_texts,
-                        materials.code_cases or [],
+                try:
+                    environment_spec = get_environment_spec(
+                        context.environment
                     )
-                    authoritative = True
-                else:
+                except ValueError:
                     return result(
                         request=request,
                         completion_texts=materials.completion_texts,
@@ -808,6 +858,14 @@ def score_and_finalize_submission(
                         body_parse_ms=parsed.body_parse_ms,
                         preparation_ms=parsed.preparation_ms,
                     )
+                computed = environment_spec.score_many(
+                    materials.problem,
+                    materials.completion_texts,
+                    materials.effective_reward_materials,
+                )
+                authoritative = (
+                    environment_spec.validator_authoritative_reward
+                )
             except GraderInfrastructureError:
                 raise
             except Exception:
@@ -867,7 +925,7 @@ def score_and_finalize_submission(
                     if is_missing_final_answer_box(text)
                 )
                 if (
-                    context.environment == "openmathinstruct"
+                    environment_spec.final_answer_policy == "boxed"
                     and MATH_ANSWER_FORMAT == "boxed"
                 )
                 else ()
@@ -886,12 +944,18 @@ def score_and_finalize_submission(
                     robust_uncertain_reward_utility,
                 )
 
-                total_tests = (
-                    max(1, len(materials.code_cases or ()))
-                    if context.environment == "opencodeinstruct"
-                    else 1
-                )
-                attainable_rewards = fractional_reward_lattice(total_tests)
+                if environment_spec.attainable_rewards:
+                    attainable_rewards = (
+                        environment_spec.attainable_rewards
+                    )
+                else:
+                    total_tests = max(
+                        1,
+                        len(materials.effective_reward_materials or ()),
+                    )
+                    attainable_rewards = fractional_reward_lattice(
+                        total_tests
+                    )
                 robust_utility = robust_uncertain_reward_utility(
                     rewards,
                     sigma_min=(
@@ -921,29 +985,30 @@ def score_and_finalize_submission(
                     reward_grading_ms=reward_ms,
                 )
 
-            for index, text in enumerate(materials.completion_texts):
-                meta = request.rollouts[index].commit.get("rollout", {}) or {}
-                malformed, _ = has_malformed_final_answer(
-                    rewards[index],
-                    text,
-                    completion_length=int(meta.get("completion_length", 0)),
-                    cap=max_new_tokens_for_environment(
-                        context.environment
-                    ),
-                )
-                if malformed:
-                    return result(
-                        request=request,
-                        completion_texts=materials.completion_texts,
-                        rewards=rewards,
-                        rollout_hashes=parsed.rollout_hashes,
-                        selection_digest=parsed.selection_digest,
-                        reject_reason=RejectReason.MALFORMED_FINAL_ANSWER,
-                        reject_stage="malformed_final_answer",
-                        body_parse_ms=parsed.body_parse_ms,
-                        preparation_ms=parsed.preparation_ms,
-                        reward_grading_ms=reward_ms,
+            if environment_spec.final_answer_policy == "boxed":
+                for index, text in enumerate(materials.completion_texts):
+                    meta = request.rollouts[index].commit.get("rollout", {}) or {}
+                    malformed, _ = has_malformed_final_answer(
+                        rewards[index],
+                        text,
+                        completion_length=int(meta.get("completion_length", 0)),
+                        cap=max_new_tokens_for_environment(
+                            context.environment
+                        ),
                     )
+                    if malformed:
+                        return result(
+                            request=request,
+                            completion_texts=materials.completion_texts,
+                            rewards=rewards,
+                            rollout_hashes=parsed.rollout_hashes,
+                            selection_digest=parsed.selection_digest,
+                            reject_reason=RejectReason.MALFORMED_FINAL_ANSWER,
+                            reject_stage="malformed_final_answer",
+                            body_parse_ms=parsed.body_parse_ms,
+                            preparation_ms=parsed.preparation_ms,
+                            reward_grading_ms=reward_ms,
+                        )
 
             clone_metrics = detect_opposite_reward_clones(
                 materials.completion_texts, rewards
@@ -966,7 +1031,7 @@ def score_and_finalize_submission(
                 meta = rollout.commit.get("rollout")
                 if isinstance(meta, dict):
                     meta["truncated"] = False
-                    if context.environment != "openmathinstruct":
+                    if environment_spec.termination_policy != "math_bft":
                         meta["forced"] = False
 
             return result(
@@ -1050,6 +1115,7 @@ def materialize_and_score_submission(
                 problem=materials.problem,
                 completion_texts=[],
                 code_cases=materials.code_cases,
+                reward_materials=materials.reward_materials,
             ),
             context,
             deadline_monotonic,
@@ -1081,6 +1147,7 @@ def materialize_and_score_submission(
                 problem=materials.problem,
                 completion_texts=completion_texts,
                 code_cases=materials.code_cases,
+                reward_materials=materials.reward_materials,
             ),
             context,
             deadline_monotonic,
@@ -1146,5 +1213,28 @@ def prepare_submission(
         materials.problem,
         code_cases=materials.code_cases,
     )
+    prepared.task_family = (
+        str(materials.problem.get("task_family"))
+        if materials.problem.get("task_family") is not None
+        else None
+    )
+    prepared.generator_version = (
+        str(materials.problem.get("generator_version"))
+        if materials.problem.get("generator_version") is not None
+        else None
+    )
+    prepared.operation_id = (
+        str(materials.problem.get("operation_id"))
+        if materials.problem.get("operation_id") is not None
+        else None
+    )
+    try:
+        prepared.difficulty = (
+            int(materials.problem["difficulty"])
+            if "difficulty" in materials.problem
+            else None
+        )
+    except (TypeError, ValueError, OverflowError):
+        prepared.difficulty = None
     prepared.legacy_merkle_status = parsed.legacy_merkle_status
     return prepared

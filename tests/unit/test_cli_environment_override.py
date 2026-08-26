@@ -113,6 +113,27 @@ def test_miner_never_requires_grader(monkeypatch):
     assert cli._miner_requires_grader(["openmathinstruct", "opencodeinstruct"]) is False
 
 
+def test_cli_environment_resolution_is_fail_closed(monkeypatch):
+    monkeypatch.delenv("RELIQUARY_PROTOCOL_PROFILE", raising=False)
+    cli = _reload_cli_main()
+
+    assert cli._resolve_cli_environment_mix("openmathinstruct") == [
+        ("openmathinstruct", cli.B_BATCH)
+    ]
+    with pytest.raises(ValueError, match="at least one"):
+        cli._resolve_cli_environment_mix("")
+    with pytest.raises(ValueError, match="duplicate"):
+        cli._resolve_cli_environment_mix(
+            "openmathinstruct,openmathinstruct"
+        )
+    with pytest.raises(ValueError, match="Unknown environment"):
+        cli._resolve_cli_environment_mix("missing")
+    # Installed does not imply eligible: the default v2 profile does not
+    # declare the new environment and must never fall back to Math+Code.
+    with pytest.raises(ValueError, match="not declared"):
+        cli._resolve_cli_environment_mix("reliquaryverifiable_v1")
+
+
 def test_v2_ignores_stale_proof_device_configuration(monkeypatch):
     monkeypatch.setenv("RELIQUARY_PROOF_DEVICES", "cuda:0")
     cli = _reload_cli_main()

@@ -74,6 +74,7 @@ def _encode_decode(batches):
         window_start=30100,
         checkpoint_revision="rev-abc",
         env_order=["openmathinstruct", "opencodeinstruct"],
+        env_targets={"openmathinstruct": 16, "opencodeinstruct": 16},
         window_quarantine={"quarantined": False, "reasons": []},
     )
     assert isinstance(blob, bytes)
@@ -85,6 +86,9 @@ def test_header_round_trip():
     assert decoded.window_start == 30100
     assert decoded.checkpoint_revision == "rev-abc"
     assert decoded.env_order == ["openmathinstruct", "opencodeinstruct"]
+    # The active legacy v2 profile emits schema 1 and intentionally omits the
+    # additive target map. V5+ payloads pin it in schema 2.
+    assert decoded.env_targets == {}
     assert decoded.window_quarantine == {"quarantined": False, "reasons": []}
 
 
@@ -206,6 +210,10 @@ def test_artifact_schema_preserves_legacy_worker_compatibility(
     if protocol_version >= 5:
         expected = active_training_identity()
         assert decoded.training_identity == expected
+        assert decoded.env_targets == {
+            "openmathinstruct": 16,
+            "opencodeinstruct": 16,
+        }
         for key, value in expected.items():
             assert tombstone[key] == value
     else:
@@ -213,3 +221,16 @@ def test_artifact_schema_preserves_legacy_worker_compatibility(
             value is None for value in decoded.training_identity.values()
         )
         assert not set(active_training_identity()).intersection(tombstone)
+
+
+def test_schema_v2_payload_requires_exact_environment_targets(monkeypatch):
+    monkeypatch.setattr(C, "PROTOCOL_VERSION", 6)
+    with pytest.raises(ValueError, match="targets must match"):
+        encode_training_payload(
+            _window_batches(),
+            window_start=30100,
+            checkpoint_revision="rev-abc",
+            env_order=["openmathinstruct", "opencodeinstruct"],
+            env_targets={"openmathinstruct": 16},
+            window_quarantine={"quarantined": False, "reasons": []},
+        )

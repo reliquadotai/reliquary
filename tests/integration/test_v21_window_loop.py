@@ -165,6 +165,9 @@ def _patch_open_grpo_window(svc):
         bootstrap=False,
         queue_drained_predicate=None,
         operator_by_hotkey=None,
+        proof_scheduler=None,
+        verify_commitment_proofs_fn=None,
+        batch_target=B_BATCH,
     ):
         b = GrpoWindowBatcher(
             window_start=window_start,
@@ -187,6 +190,7 @@ def _patch_open_grpo_window(svc):
             # Integration tests don't drive wall clock; disable the drand
             # timing gate so submissions with drand_round=0 still accept.
             drand_round_check_enabled=False,
+            batch_target=max(1, batch_target),
         )
         # Match the per-window randomness used in ``_make_commit`` so the
         # WRONG_RANDOMNESS check from PR #23 accepts the test requests.
@@ -321,6 +325,9 @@ async def test_open_window_passes_verify_model_to_batcher(monkeypatch):
         bootstrap=False,
         queue_drained_predicate=None,
         operator_by_hotkey=None,
+        proof_scheduler=None,
+        verify_commitment_proofs_fn=None,
+        batch_target=B_BATCH,
     ):
         captured["model"] = model
         # Return a minimal batcher stub so the rest of _open_window doesn't crash
@@ -336,6 +343,7 @@ async def test_open_window_passes_verify_model_to_batcher(monkeypatch):
             verify_signature_fn=lambda c, h: True,
             completion_text_fn=lambda r: "",
             drand_round_check_enabled=False,
+            batch_target=max(1, batch_target),
         )
 
     with patch.object(svc_mod, "open_grpo_window", side_effect=_capture_open):
@@ -913,6 +921,8 @@ async def test_seal_drain_waits_for_inflight_proofs():
         window_start, env, model, *, cooldown_map, content_cooldown_map,
         hash_set, tokenizer, bootstrap=False, queue_drained_predicate=None,
         operator_by_hotkey=None,
+        proof_scheduler=None, verify_commitment_proofs_fn=None,
+        batch_target=B_BATCH,
     ):
         captured["pred"] = queue_drained_predicate
         return GrpoWindowBatcher(
@@ -926,6 +936,7 @@ async def test_seal_drain_waits_for_inflight_proofs():
             verify_signature_fn=lambda c, h: True,
             completion_text_fn=lambda r: "",
             drand_round_check_enabled=False,
+            batch_target=max(1, batch_target),
         )
 
     with patch.object(svc_mod, "open_grpo_window", side_effect=_capture_open):

@@ -186,6 +186,42 @@ def test_profiles_are_frozen_slotted_and_recursively_immutable():
         profiles.PROFILES["new"] = profile
 
 
+def test_reliquary_verifiable_profile_is_isolated_and_explicit():
+    profile = profiles.PROFILES[
+        "qwen3-4b-reliquary-verifiable-v6-dev1"
+    ]
+    assert profile.protocol_version == 6
+    assert tuple(profile.environments) == ("reliquaryverifiable_v1",)
+    environment = profile.environments["reliquaryverifiable_v1"]
+    assert environment.max_new_tokens == 1024
+    assert environment.batch_target == 16
+    assert environment.answer_format == "last_json_object_v1"
+    assert environment.environment_contract_id == "reliquary-records-v1"
+    assert len(environment.environment_manifest_sha256) == 64
+    contract = profile.to_generation_contract()["environments"][
+        "reliquaryverifiable_v1"
+    ]
+    assert contract["batch_target"] == 16
+    assert contract["environment_manifest_sha256"] == (
+        environment.environment_manifest_sha256
+    )
+
+
+def test_historical_profiles_omit_new_environment_contract_fields():
+    for profile_id in (
+        "qwen35-2b-auction-v2",
+        "qwen35-4b-auction-v3",
+        "qwen3-4b-base-dapo-v4",
+        "qwen3-4b-base-dapo-reasoning-v5",
+    ):
+        for environment in profiles.PROFILES[
+            profile_id
+        ].to_generation_contract()["environments"].values():
+            assert "batch_target" not in environment
+            assert "environment_contract_id" not in environment
+            assert "environment_manifest_sha256" not in environment
+
+
 @pytest.mark.parametrize(
     "profile_id,expected",
     [

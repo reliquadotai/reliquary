@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from reliquary.constants import B_BATCH
 from reliquary.validator.batcher import ValidSubmission
 from reliquary.protocol.submission import RolloutSubmission
 
@@ -213,13 +214,17 @@ async def test_archive_includes_prompt_and_rollout_content():
     assert archive["window_status"] == "completed"
     assert archive["window_start"] == 42
     assert archive["environment"] == "fake"
+    assert archive["batch_targets"] == {"fake": B_BATCH}
+    assert archive["environment_manifest_sha256_by_environment"] == {
+        "fake": None
+    }
     assert len(archive["batch"]) == 2
 
     import math
     entry0 = archive["batch"][0]
     assert entry0["prompt_idx"] == 7
     assert entry0["prompt_content_sha256"] == "11" * 32
-    assert "target_content_sha256" not in entry0
+    assert entry0["target_content_sha256"] == "22" * 32
     assert entry0["prompt"] == "question 7"
     assert entry0["ground_truth"] == "answer 7"
     expected_sigma = math.sqrt((4 / 8) * (1 - 4 / 8))  # Bernoulli(p=0.5) → 0.5

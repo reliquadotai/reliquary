@@ -26,6 +26,7 @@ from reliquary.protocol.profiles import (
     ACTIVE_PROTOCOL_PROFILE,
     to_generation_contract,
 )
+from reliquary.environment.registry import get_environment_spec
 from reliquary.shared.prompt_range import window_prompt_range
 from reliquary.infrastructure import chain
 from reliquary.protocol.submission import RolloutSubmission
@@ -687,6 +688,7 @@ class MiningEngine:
             BFT_ENABLED,
             BFT_FORCE_ANSWER,
             BFT_THINKING_BUDGET,
+            max_new_tokens_for_environment,
         )
         from reliquary.miner.forced_seed_sampler import (
             ForcedSeedLogitsProcessor, forced_seed_generate_kwargs,
@@ -709,9 +711,23 @@ class MiningEngine:
         active_env_name = env_name
         if active_env_name is None:
             active_env_name = getattr(getattr(self, "env", None), "name", None)
-        bft_applicable = BFT_ENABLED and (
-            active_env_name is None or active_env_name == "openmathinstruct"
+        environment_cap = min(
+            int(self.max_new_tokens),
+            max_new_tokens_for_environment(str(active_env_name or "")),
         )
+        if active_env_name is None:
+            # Legacy single-environment callers omitted env_name and were
+            # always the active Math lane. Preserve that invocation contract.
+            bft_applicable = BFT_ENABLED
+        else:
+            try:
+                bft_applicable = BFT_ENABLED and (
+                    get_environment_spec(
+                        str(active_env_name)
+                    ).termination_policy == "math_bft"
+                )
+            except ValueError:
+                bft_applicable = False
 
         with torch.no_grad():
             input_tensor = torch.tensor(
@@ -726,8 +742,8 @@ class MiningEngine:
             # rollout index r, resuming at completion offset 0.
             base_kwargs = {
                 "max_new_tokens": (
-                    min(self.max_new_tokens, BFT_THINKING_BUDGET)
-                    if bft_applicable else self.max_new_tokens
+                    min(environment_cap, BFT_THINKING_BUDGET)
+                    if bft_applicable else environment_cap
                 ),
                 "pad_token_id": pad_token_id,
                 "attention_mask": attention_mask,

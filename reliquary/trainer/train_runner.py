@@ -42,6 +42,11 @@ class TrainRunner:
         self.model = model
         self.ref_model = ref_model
         self.env_order = list(env_order)
+        self.env_targets = {
+            str(name): int(target) for name, target in env_targets.items()
+        }
+        if set(self.env_targets) != set(self.env_order):
+            raise ValueError("trainer environment targets must match env_order")
         self._train_step = train_step_fn
         self._assess = assess_fn
         self._accumulator = BalancedTrainingAccumulator(env_targets)
@@ -99,6 +104,15 @@ class TrainRunner:
         policy_ratio_drift into an adaptive publication) — the
         accumulator is reset first, matching the validator's finally.
         """
+        payload_targets = dict(getattr(decoded, "env_targets", {}) or {})
+        if payload_targets and payload_targets != self.env_targets:
+            raise ValueError(
+                "training payload environment targets do not match trainer"
+            )
+        if list(getattr(decoded, "env_order", self.env_order)) != self.env_order:
+            raise ValueError(
+                "training payload environment order does not match trainer"
+            )
         self._accumulator.add_window(
             self._filter_missing_pi_old(decoded.batches()),
             window_n=decoded.window_start,

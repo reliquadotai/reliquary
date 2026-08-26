@@ -90,6 +90,31 @@ class EnvironmentProfile:
     bft: BFTProfile | None
     answer_format: str | None = None
     prompt_template: PromptTemplateProfile | None = None
+    # Optional per-environment selected-group target. Historical profiles omit
+    # it and retain the protocol's legacy B_BATCH value byte-for-byte.
+    batch_target: int | None = None
+    # Consensus identity for generated/verifier-backed environments. Omitted
+    # from historical profiles so v2-v5 generation contracts do not change.
+    environment_contract_id: str | None = None
+    environment_manifest_sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        if int(self.max_new_tokens) <= 0:
+            raise ValueError("environment max_new_tokens must be positive")
+        if self.batch_target is not None and int(self.batch_target) <= 0:
+            raise ValueError("environment batch_target must be positive")
+        if bool(self.environment_contract_id) != bool(
+            self.environment_manifest_sha256
+        ):
+            raise ValueError(
+                "environment contract id and manifest sha256 must be set together"
+            )
+        digest = self.environment_manifest_sha256
+        if digest is not None and (
+            len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError("environment manifest sha256 must be lowercase hex")
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +199,15 @@ class ProtocolProfile:
                 environment_contract["prompt_template"] = (
                     environment.prompt_template.to_generation_contract()
                 )
+            if environment.batch_target is not None:
+                environment_contract["batch_target"] = environment.batch_target
+            if environment.environment_contract_id is not None:
+                environment_contract["environment_contract_id"] = (
+                    environment.environment_contract_id
+                )
+                environment_contract["environment_manifest_sha256"] = (
+                    environment.environment_manifest_sha256
+                )
             environments[name] = environment_contract
 
         return {
@@ -256,6 +290,14 @@ _CODE_REASONING_PROMPT = PromptTemplateProfile(
         "After your reasoning, provide the final implementation in the last "
         "fenced Python code block."
     ),
+)
+
+_RELIQUARY_RECORDS_PROMPT = PromptTemplateProfile(
+    template_id="reliquary-records-v1",
+    # The generated problem already contains the full input, ordered
+    # operations, and exact answer channel. Keeping this wrapper as the
+    # identity makes the rendered bytes explicit in the signed contract.
+    template="$problem",
 )
 
 _PROFILE_VALUES = (
@@ -393,6 +435,37 @@ _PROFILE_VALUES = (
         },
         throughput_tiebreak=ThroughputTiebreakProfile(
             token_cap=8192,
+            bucket_tokens_per_round=50,
+        ),
+    ),
+    ProtocolProfile(
+        profile_id="qwen3-4b-reliquary-verifiable-v6-dev1",
+        # Isolated infrastructure/frontier profile. It deliberately reuses the
+        # exact pinned v4/v5 base revision without joining their Math+Code
+        # checkpoint lineage.
+        model_id="Qwen/Qwen3-4B-Base",
+        model_revision="906bfd4b4dc7f14ee4320094d8b41684abff8539",
+        protocol_version=6,
+        collection_seconds=100,
+        upload_grace_seconds=33,
+        prompt_encoding="raw",
+        sampling=_SAMPLING_DAPO,
+        environments={
+            "reliquaryverifiable_v1": EnvironmentProfile(
+                max_new_tokens=1024,
+                bft=None,
+                answer_format="last_json_object_v1",
+                prompt_template=_RELIQUARY_RECORDS_PROMPT,
+                batch_target=16,
+                environment_contract_id="reliquary-records-v1",
+                environment_manifest_sha256=(
+                    "d0d5d838e40b383d1c95a62d1cdded8"
+                    "458f4a7b62df621c87c9435b62207929b"
+                ),
+            ),
+        },
+        throughput_tiebreak=ThroughputTiebreakProfile(
+            token_cap=1024,
             bucket_tokens_per_round=50,
         ),
     ),

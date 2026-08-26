@@ -392,6 +392,7 @@ def open_grpo_window(
     operator_by_hotkey: dict[str, str] | None = None,
     proof_scheduler=None,
     verify_commitment_proofs_fn=None,
+    batch_target: int = B_BATCH,
 ) -> GrpoWindowBatcher:
     """Instantiate a GrpoWindowBatcher for this window.
 
@@ -431,6 +432,7 @@ def open_grpo_window(
         operator_by_hotkey=operator_by_hotkey,
         proof_scheduler=proof_scheduler,
         verify_commitment_proofs_fn=verify_commitment_proofs_fn,
+        batch_target=batch_target,
     )
 
 
@@ -648,8 +650,21 @@ class ValidationService:
             self.envs: dict[str, Environment] = {_env_name: env}
         else:
             self.env_mix = env_mix if env_mix is not None else list(ENVIRONMENT_MIX)
+            if not self.env_mix:
+                raise ValueError("environment mix must not be empty")
+            names = [str(name) for name, _target in self.env_mix]
+            if any(not name for name in names):
+                raise ValueError("environment names must be non-empty")
+            if len(set(names)) != len(names):
+                raise ValueError("environment mix contains duplicate names")
+            if any(int(target) <= 0 for _name, target in self.env_mix):
+                raise ValueError("environment targets must be positive")
             env_names = [n for n, _ in self.env_mix]
             self.envs = load_environments(env_names)
+
+        self.env_targets = {
+            str(name): int(target) for name, target in self.env_mix
+        }
 
         # Legacy accessor — archive code and tests grew up around single-env.
         # Points to the first env in the mix; consumers needing all envs
@@ -1789,6 +1804,7 @@ class ValidationService:
                     self._queue_and_proofs_drained
                 ),
                 "operator_by_hotkey": operator_by_hotkey,
+                "batch_target": self.env_targets[env_name],
             }
             if self.proof_scheduler is not None:
                 open_kwargs["proof_scheduler"] = self.proof_scheduler
@@ -1966,7 +1982,8 @@ class ValidationService:
         if batcher is None or batcher.is_sealed():
             return False
         distinct_valid = self._distinct_valid_prompt_count(batcher)
-        if distinct_valid >= B_BATCH:
+        target = int(getattr(batcher, "batch_target", B_BATCH))
+        if distinct_valid >= target:
             return False
         if (
             getattr(batcher, "proof_grading_attempts", 0)
@@ -2007,6 +2024,10 @@ class ValidationService:
         )
         return int(getattr(batcher, count_name, 0) or 0)
 
+    @staticmethod
+    def _batch_target(batcher) -> int:
+        return int(getattr(batcher, "batch_target", B_BATCH))
+
     def _duplicate_prompt_shortfall_drained(self, batcher) -> bool:
         """True when duplicates filled raw submissions but not trainable slots."""
         if batcher is None or batcher.is_sealed():
@@ -2015,7 +2036,8 @@ class ValidationService:
             return False
         valid_count = self._admitted_count(batcher)
         distinct_valid = self._distinct_valid_prompt_count(batcher)
-        if valid_count < B_BATCH or distinct_valid >= B_BATCH:
+        target = self._batch_target(batcher)
+        if valid_count < target or distinct_valid >= target:
             return False
         queue_depth = int(getattr(self.server, "submit_queue_depth", 0) or 0)
         inflight = int(getattr(self.server, "proof_verification_inflight", 0) or 0)
@@ -2184,7 +2206,7 @@ class ValidationService:
             return None
         valid_count = self._admitted_count(batcher)
         distinct_valid = self._distinct_valid_prompt_count(batcher)
-        if distinct_valid >= B_BATCH:
+        if distinct_valid >= self._batch_target(batcher):
             return None
         if not self._queue_and_proofs_drained():
             return None
@@ -2211,6 +2233,7 @@ class ValidationService:
         Per-env so a fast env never seals a slower one short.
         """
         env = getattr(getattr(batcher, "env", None), "name", "?")
+        target = self._batch_target(batcher)
         if getattr(batcher, "difficulty_auction_enabled", False):
             # The full population is the auction's input. Duplicate/sparse idle
             # breakers would let an early burst truncate the fixed collection
@@ -2226,9 +2249,9 @@ class ValidationService:
                 env,
                 reason,
                 self._admitted_count(batcher),
-                B_BATCH,
+                target,
                 self._distinct_valid_prompt_count(batcher),
-                B_BATCH,
+                target,
             )
             batcher.force_seal(reason)
             return reason
@@ -2248,8 +2271,8 @@ class ValidationService:
             "Window %d env=%s force-sealing partial: reason=%s valid=%d/%d "
             "distinct=%d/%d idle_s=%s age_s=%s",
             self._window_n, env, reason,
-            getattr(batcher, "valid_count", 0), B_BATCH,
-            self._distinct_valid_prompt_count(batcher), B_BATCH,
+            getattr(batcher, "valid_count", 0), target,
+            self._distinct_valid_prompt_count(batcher), target,
             self._seconds_since_last_valid_submission(batcher),
             self._window_open_age_seconds(batcher),
         )
@@ -3330,6 +3353,28 @@ class ValidationService:
 
         eos_ids = resolve_eos_token_ids(self.verify_model, self.tokenizer)
 
+        def _archive_batch_target(env_name: str, batcher) -> int:
+            candidate = getattr(batcher, "batch_target", None)
+            if (
+                isinstance(candidate, int)
+                and not isinstance(candidate, bool)
+                and candidate > 0
+            ):
+                return candidate
+            return int(
+                getattr(self, "env_targets", {}).get(env_name, B_BATCH)
+            )
+
+        def _environment_manifest_digest(env_name: str) -> str | None:
+            from reliquary.environment.registry import get_environment_spec
+
+            try:
+                return get_environment_spec(
+                    env_name
+                ).environment_manifest_sha256
+            except ValueError:
+                return None
+
         def _resp_time(arrived_at: float) -> float | None:
             if window_opened_at is None or not arrived_at:
                 return None
@@ -3345,6 +3390,12 @@ class ValidationService:
                 difficulty_by_id.get(id(s), {})
                 if isinstance(difficulty_by_id, dict)
                 else {}
+            )
+            environment_name = str(
+                getattr(getattr(batcher, "env", None), "name", "")
+            )
+            environment_manifest_digest = _environment_manifest_digest(
+                environment_name
             )
             arrival_ts = getattr(s, "arrival_ts", None)
             window_opened_wall_ts = getattr(
@@ -3379,6 +3430,16 @@ class ValidationService:
                 "prompt_content_sha256": getattr(
                     s, "prompt_content_sha256", None
                 ) or difficulty_meta.get("prompt_content_sha256"),
+                "target_content_sha256": getattr(
+                    s, "target_content_sha256", None
+                ),
+                "environment_manifest_sha256": (
+                    environment_manifest_digest
+                ),
+                "task_family": getattr(s, "task_family", None),
+                "generator_version": getattr(s, "generator_version", None),
+                "operation_id": getattr(s, "operation_id", None),
+                "task_difficulty": getattr(s, "difficulty", None),
                 "canonical_rank": meta.get("canonical_rank"),
                 "accepted_into_pool": not rejected,
                 "selected_for_batch": bool(meta.get("selected_for_batch", False)),
@@ -3728,6 +3789,14 @@ class ValidationService:
             "randomness": first_batcher.randomness,
             "environment": env_names_list[0],   # legacy singular, kept for compat
             "environments": env_names_list,      # multi-env canonical field
+            "batch_targets": {
+                env_name: _archive_batch_target(env_name, env_batcher)
+                for env_name, env_batcher in batcher_dict.items()
+            },
+            "environment_manifest_sha256_by_environment": {
+                env_name: _environment_manifest_digest(env_name)
+                for env_name in env_names_list
+            },
             "force_seal_reason": getattr(first_batcher, "force_seal_reason", None),
             "force_seal_reason_by_environment": {
                 env_name: getattr(env_batcher, "force_seal_reason", None)
@@ -3858,6 +3927,7 @@ class ValidationService:
                 window_start=int(window_n),
                 checkpoint_revision=str(checkpoint_revision),
                 env_order=[name for name, _ in self.env_mix],
+                env_targets=dict(self.env_mix),
                 window_quarantine=dict(window_quarantine or {}),
             )
             self._training_payload_queue_ref().enqueue_payload(
@@ -3953,6 +4023,28 @@ class ValidationService:
             window_start, failure_stage, failure_type,
         )
         env_names = list(batchers)
+        from reliquary.environment.registry import get_environment_spec
+
+        def _manifest_digest(env_name: str) -> str | None:
+            try:
+                return get_environment_spec(
+                    env_name
+                ).environment_manifest_sha256
+            except ValueError:
+                return None
+
+        def _target(env_name: str, batcher) -> int:
+            candidate = getattr(batcher, "batch_target", None)
+            if (
+                isinstance(candidate, int)
+                and not isinstance(candidate, bool)
+                and candidate > 0
+            ):
+                return candidate
+            return int(
+                getattr(self, "env_targets", {}).get(env_name, B_BATCH)
+            )
+
         validator_hotkey = str(
             getattr(getattr(getattr(self, "wallet", None), "hotkey", None),
                     "ss58_address", "")
@@ -3969,6 +4061,13 @@ class ValidationService:
             "randomness": str(getattr(first_batcher, "randomness", "")),
             "environment": env_names[0] if env_names else "",
             "environments": env_names,
+            "batch_targets": {
+                name: _target(name, batcher)
+                for name, batcher in batchers.items()
+            },
+            "environment_manifest_sha256_by_environment": {
+                name: _manifest_digest(name) for name in env_names
+            },
             "failure_stage": str(failure_stage),
             "failure_type": str(failure_type),
             "force_seal_reason": getattr(
@@ -4093,7 +4192,10 @@ class ValidationService:
                 "checkpoint_revision": cp.revision if cp else None,
                 "checkpoint_n": cp.checkpoint_n if cp else self._checkpoint_n,
                 "training_kl_reference": dict(self.kl_reference_state),
-                "batch_size": B_BATCH,
+                "batch_size": self.env_targets.get(
+                    self.env.name, B_BATCH
+                ),
+                "batch_targets": dict(self.env_targets),
                 "m_rollouts_per_prompt": M_ROLLOUTS,
                 "environment": self.env.name,
                 "netuid": self.netuid,

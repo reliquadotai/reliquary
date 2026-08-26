@@ -21,11 +21,22 @@ from reliquary.constants import (
     T_PROTO,
 )
 from reliquary.shared.modeling import resolve_eos_token_ids
+from reliquary.environment.registry import get_environment_spec
 
 logger = logging.getLogger(__name__)
 
 _GPU_VOCAB_FLOAT_WORKSPACE_BYTES = 256 * 1024 * 1024
 _UTILITY_ENTROPY_MAX_POSITIONS = 64
+
+
+def _uses_math_bft_environment(env_name: str | None) -> bool:
+    try:
+        return (
+            get_environment_spec(str(env_name or "")).termination_policy
+            == "math_bft"
+        )
+    except ValueError:
+        return False
 
 
 @dataclass(frozen=True)
@@ -195,7 +206,7 @@ def is_natural_bft_cap_candidate(
     ``ProofResult.natural_close_pick_ok`` so a miner cannot manufacture the
     close token.
     """
-    if env_name != "openmathinstruct":
+    if not _uses_math_bft_environment(env_name):
         return False
 
     rollout_meta = commit.get("rollout", {}) or {}
@@ -280,7 +291,7 @@ def verify_termination(
     if (
         prompt_length + completion_length >= protocol_cap
         or (
-            env_name == "openmathinstruct"
+            _uses_math_bft_environment(env_name)
             and is_forced_bft_cap_termination(commit)
         )
     ):
@@ -360,7 +371,7 @@ def is_cap_truncation(
         else MAX_NEW_TOKENS_PROTOCOL_CAP
     )
     if (
-        env_name == "openmathinstruct"
+        _uses_math_bft_environment(env_name)
         and is_forced_bft_cap_termination(commit)
     ):
         return False

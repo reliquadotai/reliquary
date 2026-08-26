@@ -41,6 +41,7 @@ from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
 
 from reliquary.constants import (
     B_BATCH,
+    ENVIRONMENT_MIX,
     DRAND_ROUND_BACKWARD_TOLERANCE,
     DIFFICULTY_AUCTION_DELTA,
     DIFFICULTY_AUCTION_ENFORCE,
@@ -91,6 +92,7 @@ from reliquary.constants import (
     max_truncated_for_environment,
 )
 from reliquary.environment.virtual_parquet import PromptSourceUnavailable
+from reliquary.environment.registry import get_environment_spec
 from reliquary.infrastructure.process_health import collect_process_health
 from reliquary.protocol.legacy_merkle import (
     legacy_submission_merkle_matches,
@@ -150,6 +152,15 @@ from reliquary.validator.verifier import (
     rewards_std,
     validate_force_span,
 )
+
+
+def _admission_resource_class(environment: str) -> str:
+    """Return the registered class; local test environments use the CPU lane."""
+
+    try:
+        return get_environment_spec(environment).admission_resource_class
+    except ValueError:
+        return "cpu"
 
 logger = logging.getLogger(__name__)
 
@@ -876,8 +887,14 @@ def _proof_free_submission_reject(
             continue
 
         total_length = prompt_length + completion_length
-        is_math = rollout.env_name == "openmathinstruct"
-        if is_math and is_forced_bft_cap_termination(commit):
+        try:
+            uses_math_bft = (
+                get_environment_spec(rollout.env_name).termination_policy
+                == "math_bft"
+            )
+        except ValueError:
+            uses_math_bft = False
+        if uses_math_bft and is_forced_bft_cap_termination(commit):
             # Only exempt from the truncation budget if the claimed FORCE span
             # is structurally valid (byte-exact, position-pinned). A fake-forced
             # rollout is rejected here instead of after a GPU proof; the full
@@ -949,8 +966,12 @@ class _Health(BaseModel):
     queue_depth_by_environment: dict[str, int] = Field(default_factory=dict)
     admission_workers_by_environment: dict[str, int] = Field(
         default_factory=lambda: {
-            "openmathinstruct": MATH_ADMISSION_WORKERS,
-            "opencodeinstruct": CODE_ADMISSION_WORKERS,
+            environment: (
+                CODE_ADMISSION_WORKERS
+                if _admission_resource_class(environment) == "sandbox"
+                else MATH_ADMISSION_WORKERS
+            )
+            for environment, _target in ENVIRONMENT_MIX
         }
     )
     admission_pool_state_by_environment: dict[str, dict[str, Any]] = Field(
@@ -1378,7 +1399,14 @@ class ValidatorServer:
         if batcher is None:
             self.set_active_batchers({})
         else:
-            env_name = getattr(getattr(batcher, "env", None), "name", "unknown")
+            raw_env_name = getattr(
+                getattr(batcher, "env", None), "name", None
+            )
+            env_name = (
+                raw_env_name
+                if isinstance(raw_env_name, str) and raw_env_name
+                else ENVIRONMENT_MIX[0][0]
+            )
             self.set_active_batchers({env_name: batcher})
 
     def _refund_submission_quota(self, hotkey: str) -> None:
@@ -1958,20 +1986,35 @@ class ValidatorServer:
 
     @property
     def submit_queue_depth(self) -> int:
-        return sum(self.submit_queue_depth_by_environment.values())
+        queues = {
+            id(self._submission_queue_for_environment(environment)): (
+                self._submission_queue_for_environment(environment)
+            )
+            for environment in self._reported_environment_names()
+        }
+        return sum(queue.qsize() for queue in queues.values())
+
+    def _reported_environment_names(self) -> tuple[str, ...]:
+        return (
+            tuple(self._active_batchers)
+            if self._active_batchers
+            else tuple(name for name, _target in ENVIRONMENT_MIX)
+        )
 
     @property
     def submit_queue_depth_by_environment(self) -> dict[str, int]:
         return {
-            "openmathinstruct": self._submit_queue.qsize(),
-            "opencodeinstruct": self._code_submit_queue.qsize(),
+            environment: self._submission_queue_for_environment(
+                environment
+            ).qsize()
+            for environment in self._reported_environment_names()
         }
 
     def _submission_queue_for_environment(
         self,
         environment: str,
     ) -> asyncio.Queue:
-        if environment == "opencodeinstruct":
+        if _admission_resource_class(environment) == "sandbox":
             return self._code_submit_queue
         return self._submit_queue
 
@@ -1982,12 +2025,10 @@ class ValidatorServer:
     @property
     def proof_verification_inflight_by_environment(self) -> dict[str, int]:
         return {
-            "openmathinstruct": self._inflight_proofs_by_environment.get(
-                "openmathinstruct", 0
-            ),
-            "opencodeinstruct": self._inflight_proofs_by_environment.get(
-                "opencodeinstruct", 0
-            ),
+            environment: self._inflight_proofs_by_environment.get(
+                environment, 0
+            )
+            for environment in self._reported_environment_names()
         }
 
     def set_late_drop_callback(
@@ -2485,12 +2526,14 @@ class ValidatorServer:
             prompt_mismatch_circuit_breaker=prompt_mismatch_circuit,
             no_reveal_circuit_breaker=no_reveal_circuit,
             submission_upload_grace_seconds=SUBMISSION_UPLOAD_GRACE_SECONDS,
-            batch_size=B_BATCH,
+            batch_size=int(
+                getattr(batcher, "batch_target", B_BATCH)
+            ),
             queue_depth=self.submit_queue_depth,
             queue_depth_by_environment=self.submit_queue_depth_by_environment,
             admission_workers_by_environment={
-                "openmathinstruct": MATH_ADMISSION_WORKERS,
-                "opencodeinstruct": CODE_ADMISSION_WORKERS,
+                environment: self._admission_worker_count(environment)
+                for environment in self._reported_environment_names()
             },
             admission_pool_state_by_environment={
                 env_name: {
@@ -2533,10 +2576,7 @@ class ValidatorServer:
                         env_name in self._admission_process_pools
                     ),
                 }
-                for env_name in (
-                    "openmathinstruct",
-                    "opencodeinstruct",
-                )
+                for env_name in self._reported_environment_names()
             },
             proof_verification_inflight=self._inflight_proofs,
             proof_verification_inflight_by_environment=(
@@ -2951,9 +2991,15 @@ class ValidatorServer:
 
     @staticmethod
     def _admission_worker_count(environment: str) -> int:
-        if environment == "opencodeinstruct":
+        if _admission_resource_class(environment) == "sandbox":
             return CODE_ADMISSION_WORKERS
         return MATH_ADMISSION_WORKERS
+
+    @staticmethod
+    def _admission_wall_seconds(environment: str) -> float:
+        if _admission_resource_class(environment) == "sandbox":
+            return CODE_ADMISSION_WALL_SECONDS
+        return MATH_ADMISSION_WALL_SECONDS
 
     def _new_admission_pool(
         self,
@@ -5164,11 +5210,7 @@ class ValidatorServer:
         admission_started = False
         identity_reserved = False
         cancel_identity_on_exit = False
-        wall_seconds = (
-            CODE_ADMISSION_WALL_SECONDS
-            if environment == "opencodeinstruct"
-            else MATH_ADMISSION_WALL_SECONDS
-        )
+        wall_seconds = self._admission_wall_seconds(environment)
         deadline = time.monotonic() + wall_seconds
 
         def reject_without_request(
