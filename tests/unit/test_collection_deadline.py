@@ -1,6 +1,11 @@
 """The window is time-boxed. Its MINIMUM duration is the deadline itself — an
 early seal is exactly the speed race we are removing: whoever triggered it would
 cut off the slow-but-hard submissions still generating.
+
+The one exception inverts that reasoning instead of violating it: the
+proven-dominance close (test_auction_early_close.py) fires only when NO
+submission could still land — capacity terminal-full and every receipt
+resolved — so there is no slow-but-hard submission left to cut off.
 """
 
 

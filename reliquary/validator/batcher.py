@@ -56,6 +56,7 @@ from reliquary.constants import (
     ROBUST_TRUNCATION_UTILITY_ENABLED,
     SIGMA_MIN,
     REJECTED_LIST_CAP_PER_HOTKEY,
+    AUCTION_EARLY_CLOSE_MODE,
     WINDOW_COLLECTION_SECONDS,
     SUBMISSION_UPLOAD_GRACE_SECONDS,
     CODE_SEMANTIC_AUTH_ENFORCE,
@@ -974,6 +975,13 @@ class GrpoWindowBatcher:
         # synchronous test contexts — there the seal fires immediately on
         # the B-th distinct, matching the pre-v2.3 timing.
         self._seal_trigger_round: int | None = None
+        # Proven-dominance early close (see AUCTION_EARLY_CLOSE_MODE).
+        # ``eligible_at`` pins the FIRST moment dominance held — shadow mode's
+        # whole output. ``refusing`` flips once, under the precommit lock, and
+        # is what lets the close converge against a steady precommit stream.
+        self.early_close_eligible_at: float | None = None
+        self.early_close_sealed = False
+        self._early_close_refusing_precommits = False
         self._loop: asyncio.AbstractEventLoop | None = None
         # Optional callback the seal-extension coroutine polls to check
         # whether the server's submit_queue has finished draining items
@@ -1234,6 +1242,14 @@ class GrpoWindowBatcher:
             self._prune_upload_precommits_locked(now)
             if self._seal_flag.is_set() or self._seal_snapshot_started:
                 return False, "collection_sealed", None
+            if self._early_close_refusing_precommits:
+                # Dominance holds: no reveal can be admitted any more, so a
+                # new receipt would only feed a doomed upload. batch_filled is
+                # the wire reason miners already handle for a full window —
+                # they learn ~30 s earlier and save the body transfer.
+                reason = "batch_filled"
+                self._record_upload_precommit_rejection_locked(reason)
+                return False, reason, None
             operator = self._operator_for_hotkey(hotkey)
             if operator is None:
                 reason = "precommit_operator_unmapped"
@@ -1464,6 +1480,19 @@ class GrpoWindowBatcher:
                     self._productive_capacity_used_locked()
                 )
             return {
+                "early_close": {
+                    "mode": AUCTION_EARLY_CLOSE_MODE,
+                    "eligible_offset_seconds": (
+                        None
+                        if self.early_close_eligible_at is None
+                        else self.early_close_eligible_at
+                        - self.window_opened_at
+                    ),
+                    "sealed_early": self.early_close_sealed,
+                    "refusing_precommits": (
+                        self._early_close_refusing_precommits
+                    ),
+                },
                 "accepted_receipts": accepted,
                 "revealed": self._upload_precommit_revealed,
                 "revealed_terminal": terminal,
@@ -1493,6 +1522,70 @@ class GrpoWindowBatcher:
                 ),
             }
 
+    def _early_close_dominance_locked(self) -> bool:
+        """The window's outcome is provably fixed. Caller holds the admission
+        lock.
+
+        Capacity must be fully charged by TERMINAL work: refunds only come
+        from in-flight grading (``_grading_refundable`` is applied when an
+        inflight reservation is released), so both reservation maps must be
+        empty. Once true it stays true for the window — a later reveal is
+        rejected ``proof_grading_attempts_full`` before it can start anything.
+        """
+        return (
+            self._proof_grading_charged
+            >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+            and not self._pending_proof_reservations
+            and not self._inflight_proof_reservations
+        )
+
+    def _poll_early_close(self, now: float) -> bool:
+        """Seal a dominance-complete auction window before its deadline.
+
+        Lock order mirrors the reveal/claim path (precommit lock, then
+        admission lock), and the seal flag is set under the precommit lock —
+        the same atomicity the deadline branch relies on: a racing precommit
+        lands entirely before the seal or is rejected after it.
+
+        Enforce honours every signed promise to the letter: armed receipts
+        are waited out to their own grace deadline (bounding the close at
+        roughly fill+grace); only NEW precommits are refused, which is what
+        makes the wait converge against a steady precommit stream.
+        """
+        with self._upload_precommit_lock:
+            with self._proof_admission_lock:
+                if not self._early_close_dominance_locked():
+                    return False
+            if self.early_close_eligible_at is None:
+                self.early_close_eligible_at = now
+                logger.info(
+                    "auction_early_close_eligible window=%d env=%s mode=%s "
+                    "offset_s=%.1f",
+                    self.window_start,
+                    getattr(self.env, "name", "?"),
+                    AUCTION_EARLY_CLOSE_MODE,
+                    now - self.window_opened_at,
+                )
+            if AUCTION_EARLY_CLOSE_MODE != "enforce":
+                return False
+            self._early_close_refusing_precommits = True
+            self._prune_upload_precommits_locked(now)
+            if self._upload_precommits:
+                return False
+            self._seal_flag.set()
+            self.early_close_sealed = True
+            logger.info(
+                "auction_early_close_sealed window=%d env=%s offset_s=%.1f "
+                "saved_s=%.1f",
+                self.window_start,
+                getattr(self.env, "name", "?"),
+                now - self.window_opened_at,
+                WINDOW_COLLECTION_SECONDS - (now - self.window_opened_at),
+            )
+        if self._seal_event is not None:
+            self._seal_event.set()
+        return True
+
     def poll_deadline(self) -> bool:
         """Seal an auction environment at its fixed collection deadline.
 
@@ -1504,6 +1597,12 @@ class GrpoWindowBatcher:
         if not self.difficulty_auction_enabled:
             return False
         now = self._time_fn()
+        if (
+            AUCTION_EARLY_CLOSE_MODE != "off"
+            and now - self.window_opened_at < WINDOW_COLLECTION_SECONDS
+            and self._poll_early_close(now)
+        ):
+            return True
         if now - self.window_opened_at >= WINDOW_COLLECTION_SECONDS:
             with self._upload_precommit_lock:
                 self._prune_upload_precommits_locked(now)

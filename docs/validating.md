@@ -245,6 +245,29 @@ gate still trips before cadence, the rejected update is excluded and the
 validator publishes only the previously accepted in-memory steps before
 resuming against the refreshed behavior policy.
 
+### Early close of a full window
+
+`RELIQUARY_AUCTION_EARLY_CLOSE_MODE` (default `shadow`):
+
+- `off` — today's validator, byte for byte.
+- `shadow` — observationally identical to `off`; logs
+  `auction_early_close_eligible` with the offset at which the window's outcome
+  became provably fixed, and reports it under `early_close` in the receipt
+  conservation stats. Read a day of shadow data before enforcing.
+- `enforce` — seal a window once its outcome is provably fixed: productive
+  capacity fully charged by terminal work, nothing in flight that could refund
+  a slot, and **every accepted upload receipt resolved to its own grace
+  deadline**. New precommits are refused with `batch_filled` from the moment
+  dominance holds (the miner learns ~30 s earlier and saves a doomed upload).
+
+Measured 2026-08-26: environments fill at +19-45 s and then reject everything
+for a median 79 s of the 102 s cycle. Enforce closes around fill+grace
+(~+55-80 s). The generation contract is untouched — `collection_seconds` was
+always the ceiling and miners compare the contract's value, never the observed
+duration; window numbering is sequential and the reference miner is a pure
+`/state` poller, so variable-length windows are already protocol reality
+(every abort produces one).
+
 ### Cooldown on training restart
 
 The prompt cooldown is restored at startup from a run-keyed snapshot on R2, so

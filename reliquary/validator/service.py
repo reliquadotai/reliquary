@@ -2259,8 +2259,11 @@ class ValidationService:
     async def _wait_for_window_seal(self) -> str:
         """Wait until every active env's batcher seals.
 
-        Auction batchers seal on their fixed collection deadline; legacy
-        batchers retain their B-distinct/drand-boundary seal. Per-environment
+        Auction batchers seal on their fixed collection deadline — or at
+        proven dominance when AUCTION_EARLY_CLOSE_MODE=enforce (capacity
+        terminal-full, every receipt grace resolved; poll_deadline owns the
+        condition). Legacy batchers retain their B-distinct/drand-boundary
+        seal. Per-environment
         liveness guards cannot let a fast environment cut a slower one short.
         The window advances only once all are sealed (or the global timeout).
         """

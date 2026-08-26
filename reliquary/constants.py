@@ -787,6 +787,34 @@ NO_REVEAL_CIRCUIT_FAILURE_THRESHOLD = 4
 NO_REVEAL_CIRCUIT_FAILURE_WINDOW_WINDOWS = 10
 NO_REVEAL_CIRCUIT_COOLDOWN_WINDOWS = (10, 50, 250)
 
+# Proven-dominance early close of a full auction window.
+#
+# Measured 2026-08-26: both environments fill their 64 productive slots at
+# +19s to +45s and the window then spends a median 79 s of its 102 s cycle
+# rejecting everything with batch_filled. Dominance = the outcome is provably
+# fixed: capacity fully charged by TERMINAL work (refunds only come from
+# in-flight grading, which must be empty) — after which no reveal can be
+# admitted, so closing changes no miner's result.
+#
+# The close never breaks a signed promise: armed upload receipts are waited
+# out to their own grace deadline, and only NEW precommits are refused (with
+# batch_filled, the existing wire reason for a full window — the miner learns
+# ~30 s earlier and saves the doomed upload). collection_seconds in the
+# generation contract is untouched: it was always the ceiling, and the miner
+# compares the contract's VALUE, never the observed duration.
+#
+#   off      — today's validator, byte for byte.
+#   shadow   — observationally identical to off; records when dominance was
+#              reached so the saving is measured before enforce is switched on.
+#   enforce  — seal at dominance + resolved graces (~fill+33 s ≈ +55-80 s).
+AUCTION_EARLY_CLOSE_MODE = _os.environ.get(
+    "RELIQUARY_AUCTION_EARLY_CLOSE_MODE", "shadow"
+).strip().lower()
+if AUCTION_EARLY_CLOSE_MODE not in {"off", "shadow", "enforce"}:
+    raise ValueError(
+        "RELIQUARY_AUCTION_EARLY_CLOSE_MODE must be off, shadow or enforce"
+    )
+
 # Process-isolated auction preparation. These hard per-candidate walls make the
 # accepted receipt population drainable even when submitted math or code is
 # pathological. They do not control GPU proof time, which has its own budget.
