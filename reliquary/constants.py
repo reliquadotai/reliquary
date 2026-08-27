@@ -874,6 +874,18 @@ NO_REVEAL_CIRCUIT_FAILURE_THRESHOLD = 4
 NO_REVEAL_CIRCUIT_FAILURE_WINDOW_WINDOWS = 10
 NO_REVEAL_CIRCUIT_COOLDOWN_WINDOWS = (10, 50, 250)
 
+# Seal a full auction window early: capacity terminal-full, every receipt
+# grace resolved. off | shadow (records eligibility, changes nothing) |
+# enforce. Empty means unset — a bare env-file line must not crash the boot.
+AUCTION_EARLY_CLOSE_MODE = (
+    _os.environ.get("RELIQUARY_AUCTION_EARLY_CLOSE_MODE", "").strip().lower()
+    or "shadow"
+)
+if AUCTION_EARLY_CLOSE_MODE not in {"off", "shadow", "enforce"}:
+    raise ValueError(
+        "RELIQUARY_AUCTION_EARLY_CLOSE_MODE must be off, shadow or enforce"
+    )
+
 # Process-isolated auction preparation. These hard per-candidate walls make the
 # accepted receipt population drainable even when submitted math or code is
 # pathological. They do not control GPU proof time, which has its own budget.

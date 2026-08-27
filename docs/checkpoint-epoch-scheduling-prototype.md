@@ -143,7 +143,9 @@ the exact phase, durations, target, and selected reveal limit. Compact
 commitments are bounded per canonical operator and lane. This controls validator
 work without claiming that uncoordinated local preparation has zero discarded
 work. Selection also grants at most one reveal ticket per operator and prompt
-inside a lane.
+inside a lane. The production auction's proven-dominance early-close policy is
+explicitly disabled for experimental epoch batchers; the manifest-bound common
+deadline remains authoritative in every early-close mode.
 
 The local reference planner is bounded and has no submission transport. A
 backend-neutral callback may prepare token sequences, after which the existing

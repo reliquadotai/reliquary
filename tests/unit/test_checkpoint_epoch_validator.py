@@ -770,3 +770,29 @@ def test_epoch_collection_and_candidate_limit_are_instance_bound():
 
     now[0] = 1_601.0
     assert batcher.poll_deadline() is True
+
+
+def test_epoch_collection_ignores_production_early_close(monkeypatch):
+    import reliquary.validator.batcher as batcher_module
+    from reliquary.constants import MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+
+    monkeypatch.setattr(batcher_module, "AUCTION_EARLY_CLOSE_MODE", "enforce")
+    now = [0.0]
+    batcher = _make_batcher(
+        operator_by_hotkey={"miner": "operator"},
+        experimental_epoch_ranking=True,
+        collection_seconds=1_600.0,
+        time_fn=lambda: now[0],
+        wall_clock_fn=lambda: now[0],
+    )
+    batcher.mark_window_opened(monotonic_time=0.0, wall_time=0.0)
+    batcher._proof_grading_charged = MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+
+    now[0] = 100.0
+    assert batcher.poll_deadline() is False
+    assert batcher.early_close_eligible_at is None
+    assert batcher.early_close_sealed is False
+
+    now[0] = 1_601.0
+    assert batcher.poll_deadline() is True
+    assert batcher.early_close_sealed is False
