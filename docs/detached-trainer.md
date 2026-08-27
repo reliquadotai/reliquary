@@ -24,6 +24,8 @@ its verify plane on the serial publication beat.
 | `RELIQUARY_TRAINER_STATE_DIR` | trainer | staging + resume directory (default `/root/reliquary/trainer`). |
 | `RELIQUARY_TRAINER_WINDOW_STRIDE` | trainer | journal stride (default 1, matching live window numbering). |
 | `RELIQUARY_HF_REPO_ID` + R2 env (`R2_*`) | trainer | checkpoint repo and payload bucket — same names as the validator. |
+| `RELIQUARY_CHECKPOINT_RETENTION_ENABLED=1` | trainer | enable dense R2 first-50 history, bounded HF blocks, sparse later evaluation snapshots, and the HF storage ceiling. See `docs/checkpoint-retention.md`; explicit because compaction is irreversible. |
+| `RELIQUARY_TRAINER_PUBLICATION_SEQ=<n>` | trainer | one-time audited run-local sequence when migrating a legacy candidate manifest. Fresh runs begin at 0 automatically; new manifests/profiles persist it. |
 
 Both flags default OFF; flag-off is byte-identical to main.
 
@@ -95,6 +97,11 @@ Candidate manifests and payloads now carry profile ID, protocol version,
 training-run ID, and generation-contract hash. A stale v4 manifest is ignored
 in favor of the explicit v5 bootstrap; a mismatched payload fails closed rather
 than advancing the journal cursor.
+
+Enable bounded checkpoint retention before taking the worker live. A fresh run
+gets a run-local sequence automatically. For an existing run, follow
+`docs/checkpoint-retention.md` to audit the history and create the protected
+first-50 branch before setting the feature flag.
 
 ## Recovery
 

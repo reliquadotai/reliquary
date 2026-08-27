@@ -22,8 +22,15 @@ def resolve_resume_point(
     *,
     env: Mapping[str, str],
     expected_identity: Mapping[str, object] | None = None,
-) -> tuple[str | None, int, int]:
-    """Return ``(revision, cursor, checkpoint_n)``: the checkpoint
+) -> tuple[str | None, int, int, int | None]:
+    """Return ``(revision, cursor, checkpoint_n, publication_seq)``.
+
+    ``publication_seq`` is the run-local count used by bounded retention.  It
+    is distinct from the globally monotonic checkpoint number, which can span
+    resets and repositories.  Legacy manifests deliberately return ``None``
+    unless the operator supplies the audited migration value.
+
+    The checkpoint
     revision to load (None = bootstrap), the journal cursor to resume
     after, and the last published checkpoint number (0 = none yet —
     checkpoint numbering must never regress across restarts)."""
@@ -40,6 +47,11 @@ def resolve_resume_point(
                 str(manifest["revision"]),
                 int(manifest["trained_window_cursor"]),
                 int(manifest.get("checkpoint_n", 0)),
+                (
+                    int(manifest["publication_seq"])
+                    if manifest.get("publication_seq") is not None
+                    else _optional_publication_seq(env)
+                ),
             )
         logger.warning(
             "candidate manifest belongs to another protocol/run (%s); "
@@ -61,4 +73,26 @@ def resolve_resume_point(
         env.get("RELIQUARY_TRAINER_BOOTSTRAP_REVISION", "")
     ).strip() or None
     raw_n = str(env.get("RELIQUARY_TRAINER_CHECKPOINT_N", "")).strip()
-    return revision, int(bootstrap), int(raw_n) if raw_n else 0
+    publication_seq = _optional_publication_seq(env)
+    if publication_seq is None:
+        # Reaching the explicit bootstrap path means there is no manifest for
+        # the requested run identity (or no manifest at all).  The bootstrap
+        # revision can be a base-reset commit, but it is not a publication by
+        # this run's detached trainer, so the run-local sequence starts at 0.
+        publication_seq = 0
+    return (
+        revision,
+        int(bootstrap),
+        int(raw_n) if raw_n else 0,
+        publication_seq,
+    )
+
+
+def _optional_publication_seq(env: Mapping[str, str]) -> int | None:
+    raw = str(env.get("RELIQUARY_TRAINER_PUBLICATION_SEQ", "")).strip()
+    if not raw:
+        return None
+    value = int(raw)
+    if value < 0:
+        raise ValueError("RELIQUARY_TRAINER_PUBLICATION_SEQ must be >= 0")
+    return value

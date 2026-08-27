@@ -88,6 +88,7 @@ def run_train_worker(*, shadow: bool = False) -> None:
     )
     from reliquary.trainer.journal import WindowJournal, r2_fetch_fn
     from reliquary.trainer.publisher import TrainerPublisher
+    from reliquary.trainer.retention import CheckpointRetentionPolicy
     from reliquary.trainer.resume import resolve_resume_point
     from reliquary.trainer.train_runner import TrainRunner
     from reliquary.trainer.worker import TrainerLockLost, TrainerWorker
@@ -106,11 +107,12 @@ def run_train_worker(*, shadow: bool = False) -> None:
     ))
     client = _r2_client()
     fetch = r2_fetch_fn(client, bucket)
+    retention_policy = CheckpointRetentionPolicy.from_env()
 
     expected_identity = (
         active_training_identity() if PROTOCOL_VERSION >= 5 else None
     )
-    revision, cursor, checkpoint_n = resolve_resume_point(
+    revision, cursor, checkpoint_n, publication_seq = resolve_resume_point(
         fetch,
         env=os.environ,
         expected_identity=expected_identity,
@@ -136,9 +138,27 @@ def run_train_worker(*, shadow: bool = False) -> None:
         cursor = int(profile.get("trained_window_cursor", cursor))
         raw_step = profile.get("lr_schedule_step")
         lr_schedule_step = int(raw_step) if raw_step is not None else None
+        raw_publication_seq = profile.get("publication_seq")
+        if raw_publication_seq is not None:
+            publication_seq = int(raw_publication_seq)
         model_path = str(snapshot_dir)
         load_kwargs = {}
         tokenizer = load_tokenizer(model_path)
+
+    if retention_policy.enabled and publication_seq is None:
+        raise SystemExit(
+            "bounded checkpoint retention is enabled for a legacy run with "
+            "no publication sequence; run scripts/prepare_hf_retention.py, "
+            "create the protected first-history branch, and set "
+            "RELIQUARY_TRAINER_PUBLICATION_SEQ to the reported value"
+        )
+    if publication_seq is not None and int(publication_seq) < 0:
+        raise SystemExit("checkpoint publication sequence cannot be negative")
+    if not retention_policy.enabled:
+        # Preserve the pre-retention manifest/profile shape exactly.  The
+        # sequence exists only to drive irreversible retention operations and
+        # is introduced when the explicit feature flag is enabled.
+        publication_seq = None
 
     # Telemetry: train_step's emit_metrics is a silent no-op unless
     # telemetry.init ran. The trainer has no wallet; the run identity
@@ -147,17 +167,20 @@ def run_train_worker(*, shadow: bool = False) -> None:
     from reliquary import constants as _C
     from reliquary.validator import telemetry as _telemetry
 
+    telemetry_config = {
+        "role": "train-worker",
+        "shadow": bool(shadow),
+        "learning_rate": _C.LEARNING_RATE,
+        "kl_beta": _C.KL_BETA,
+        "publish_interval": CHECKPOINT_PUBLISH_INTERVAL_WINDOWS,
+    }
+    if retention_policy.enabled:
+        telemetry_config["checkpoint_retention_enabled"] = True
     _telemetry.init(
         hotkey_ss58=os.environ.get(
             "RELIQUARY_TRAINER_WANDB_IDENTITY", "trainer0",
         ),
-        config={
-            "role": "train-worker",
-            "shadow": bool(shadow),
-            "learning_rate": _C.LEARNING_RATE,
-            "kl_beta": _C.KL_BETA,
-            "publish_interval": CHECKPOINT_PUBLISH_INTERVAL_WINDOWS,
-        },
+        config=telemetry_config,
     )
 
     logger.info("loading model from %s", model_path)
@@ -185,21 +208,36 @@ def run_train_worker(*, shadow: bool = False) -> None:
         tokenizer=tokenizer,
         r2_client=client,
         bucket=bucket,
+        retention_policy=retention_policy,
     )
 
-    publish_state = {"checkpoint_n": checkpoint_n}
+    publish_state = {
+        "checkpoint_n": checkpoint_n,
+        "publication_seq": publication_seq,
+    }
 
     def publish_fn(reason: str) -> str:
         from reliquary.validator.training import current_lr_schedule_step
 
-        publish_state["checkpoint_n"] += 1
-        return asyncio.run(publisher.publish(
+        next_checkpoint_n = int(publish_state["checkpoint_n"]) + 1
+        current_seq = publish_state["publication_seq"]
+        next_publication_seq = (
+            int(current_seq) + 1 if current_seq is not None else None
+        )
+        revision = asyncio.run(publisher.publish(
             runner.model,
-            checkpoint_n=publish_state["checkpoint_n"],
+            checkpoint_n=next_checkpoint_n,
             lr_schedule_step=current_lr_schedule_step(),
             trained_window_cursor=worker.cursor,
             reason=reason,
+            publication_seq=next_publication_seq,
+            expected_parent_revision=worker.last_published_revision,
         ))
+        # Advance counters only after HF + R2 + the candidate manifest commit.
+        # A failed upload retries the exact same checkpoint and sequence.
+        publish_state["checkpoint_n"] = next_checkpoint_n
+        publish_state["publication_seq"] = next_publication_seq
+        return revision
 
     def head_revision_fn() -> str | None:
         from huggingface_hub import HfApi
