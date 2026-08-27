@@ -33,6 +33,30 @@ class BFTProfile:
 
 
 @dataclass(frozen=True, slots=True)
+class EpisodeProfile:
+    schema: str
+    renderer_id: str
+    max_turns: int
+    max_action_tokens: int
+    max_episode_tokens: int
+    max_observation_bytes: int
+
+    def __post_init__(self) -> None:
+        if self.schema != "reliquary/episode/v1":
+            raise ValueError("unsupported episode schema")
+        if not self.renderer_id:
+            raise ValueError("episode renderer id must not be empty")
+        if int(self.max_turns) <= 0:
+            raise ValueError("episode max_turns must be positive")
+        if int(self.max_action_tokens) <= 0:
+            raise ValueError("episode max_action_tokens must be positive")
+        if int(self.max_episode_tokens) <= 0:
+            raise ValueError("episode max_episode_tokens must be positive")
+        if int(self.max_observation_bytes) <= 0:
+            raise ValueError("episode max_observation_bytes must be positive")
+
+
+@dataclass(frozen=True, slots=True)
 class PromptTemplateProfile:
     """Exact prompt text and rendering rule for a protocol environment.
 
@@ -49,11 +73,25 @@ class PromptTemplateProfile:
         parsed = Template(self.template)
         if not self.template_id:
             raise ValueError("prompt template id must not be empty")
-        if not parsed.is_valid():
+        # ``Template.is_valid/get_identifiers`` arrived in Python 3.11. The
+        # project requires 3.11+, but this small fallback keeps lightweight
+        # qualification hosts on 3.10 able to inspect contracts.
+        if hasattr(parsed, "is_valid"):
+            valid = parsed.is_valid()
+            identifiers = set(parsed.get_identifiers())
+        else:  # pragma: no cover - compatibility host only
+            valid = True
+            identifiers = set()
+            for match in parsed.pattern.finditer(parsed.template):
+                if match.group("invalid") is not None:
+                    valid = False
+                identifier = match.group("named") or match.group("braced")
+                if identifier is not None:
+                    identifiers.add(identifier)
+        if not valid:
             raise ValueError(
                 f"prompt template {self.template_id!r} is not valid"
             )
-        identifiers = set(parsed.get_identifiers())
         unknown = identifiers - {"problem", "contract"}
         if unknown:
             raise ValueError(
@@ -97,6 +135,9 @@ class EnvironmentProfile:
     # from historical profiles so v2-v5 generation contracts do not change.
     environment_contract_id: str | None = None
     environment_manifest_sha256: str | None = None
+    # Present only for the Episode v1 fork. Historical profiles omit this
+    # field and therefore retain their exact generation-contract bytes.
+    episode: EpisodeProfile | None = None
 
     def __post_init__(self) -> None:
         if int(self.max_new_tokens) <= 0:
@@ -208,6 +249,16 @@ class ProtocolProfile:
                 environment_contract["environment_manifest_sha256"] = (
                     environment.environment_manifest_sha256
                 )
+            if environment.episode is not None:
+                episode = environment.episode
+                environment_contract["episode"] = {
+                    "schema": episode.schema,
+                    "renderer_id": episode.renderer_id,
+                    "max_turns": episode.max_turns,
+                    "max_action_tokens": episode.max_action_tokens,
+                    "max_episode_tokens": episode.max_episode_tokens,
+                    "max_observation_bytes": episode.max_observation_bytes,
+                }
             environments[name] = environment_contract
 
         return {
@@ -469,6 +520,82 @@ _PROFILE_VALUES = (
             bucket_tokens_per_round=50,
         ),
     ),
+    ProtocolProfile(
+        profile_id="qwen3-4b-reliquary-episode-v7-dev1",
+        # Opt-in development profile for the canonical multi-turn format. It
+        # intentionally preserves the existing Qwen3-4B base revision so the
+        # environment and assistant-mask fork can be evaluated independently.
+        model_id="Qwen/Qwen3-4B-Base",
+        model_revision="906bfd4b4dc7f14ee4320094d8b41684abff8539",
+        protocol_version=7,
+        collection_seconds=300,
+        upload_grace_seconds=33,
+        prompt_encoding="raw",
+        sampling=_SAMPLING_DAPO,
+        environments={
+            "reliquary_stateful_tools_v1": EnvironmentProfile(
+                max_new_tokens=16384,
+                bft=None,
+                answer_format="episode_json_action_v1",
+                batch_target=16,
+                environment_contract_id="reliquary-stateful-tools-v1",
+                environment_manifest_sha256=(
+                    "b0792fc5bf342bb615c22111d65d3458"
+                    "eec42a88dd48d2f773cacddd0cf0a0fb"
+                ),
+                episode=EpisodeProfile(
+                    schema="reliquary/episode/v1",
+                    renderer_id="reliquary-jsonl-tools-v1",
+                    max_turns=8,
+                    max_action_tokens=1024,
+                    max_episode_tokens=16384,
+                    max_observation_bytes=65536,
+                ),
+            ),
+            "reliquary_retrieval_tools_v1": EnvironmentProfile(
+                max_new_tokens=16384,
+                bft=None,
+                answer_format="episode_json_action_v1",
+                batch_target=16,
+                environment_contract_id="reliquary-retrieval-tools-v1",
+                environment_manifest_sha256=(
+                    "d928f6dfcb0dd101dbf6e60ee786a33e"
+                    "3e9ebd806b621349de7edec1aead7593"
+                ),
+                episode=EpisodeProfile(
+                    schema="reliquary/episode/v1",
+                    renderer_id="reliquary-jsonl-tools-v1",
+                    max_turns=6,
+                    max_action_tokens=1024,
+                    max_episode_tokens=16384,
+                    max_observation_bytes=65536,
+                ),
+            ),
+            "reliquary_workspace_tools_v1": EnvironmentProfile(
+                max_new_tokens=16384,
+                bft=None,
+                answer_format="episode_json_action_v1",
+                batch_target=16,
+                environment_contract_id="reliquary-workspace-tools-v1",
+                environment_manifest_sha256=(
+                    "2ee517dd7118defb997df4bd008da28f4"
+                    "d45d926ce2fdedf63870cd18f8c1a96"
+                ),
+                episode=EpisodeProfile(
+                    schema="reliquary/episode/v1",
+                    renderer_id="reliquary-jsonl-tools-v1",
+                    max_turns=7,
+                    max_action_tokens=1024,
+                    max_episode_tokens=16384,
+                    max_observation_bytes=65536,
+                ),
+            ),
+        },
+        throughput_tiebreak=ThroughputTiebreakProfile(
+            token_cap=4096,
+            bucket_tokens_per_round=50,
+        ),
+    ),
 )
 
 PROFILES: Mapping[str, ProtocolProfile] = MappingProxyType(
@@ -546,6 +673,7 @@ __all__ = [
     "BFTProfile",
     "DEFAULT_PROFILE_ID",
     "EnvironmentProfile",
+    "EpisodeProfile",
     "PromptTemplateProfile",
     "PROFILES",
     "ProtocolProfile",

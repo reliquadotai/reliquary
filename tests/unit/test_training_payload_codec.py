@@ -173,6 +173,45 @@ def test_force_span_and_termination_path_round_trip():
     assert getattr(other, "_validated_force_span", None) is None
 
 
+def test_episode_assistant_spans_round_trip(monkeypatch):
+    from reliquary.validator.training import _policy_token_positions
+
+    monkeypatch.setattr(C, "PROTOCOL_VERSION", 7)
+    monkeypatch.setattr(C, "T_PROTO", 1.0)
+    monkeypatch.setattr(C, "PI_OLD_FROM_VERIFY_LOGPROBS", True)
+    monkeypatch.setattr(C, "RECOMPUTE_PI_OLD_FROM_VERIFY", True)
+    rollout = _roll(
+        1.0,
+        8,
+        env="reliquary_stateful_tools_v1",
+        prompt_length=4,
+    )
+    rollout.commit["rollout"]["episode"] = {"schema_version": "test"}
+    rollout.commit["rollout"]["token_logprobs"] = [-0.2] * 4
+    rollout._validated_assistant_spans = ((4, 6), (9, 11))
+    rollout._validated_termination_path = "finished"
+    rollout._validated_completion_logprobs = [-0.3] * 4
+    batches = {
+        "reliquary_stateful_tools_v1": [_group([rollout], prompt_idx=9)]
+    }
+    blob = encode_training_payload(
+        batches,
+        window_start=30100,
+        checkpoint_revision="rev-episode",
+        env_order=["reliquary_stateful_tools_v1"],
+        env_targets={"reliquary_stateful_tools_v1": 16},
+        window_quarantine={"quarantined": False, "reasons": []},
+    )
+    decoded = decode_training_payload(blob).batches()[
+        "reliquary_stateful_tools_v1"
+    ][0].rollouts[0]
+    assert decoded._validated_assistant_spans == ((4, 6), (9, 11))
+    assert decoded._validated_termination_path == "finished"
+    assert _policy_token_positions(decoded) == [4, 5, 9, 10]
+    assert _completion_token_logprobs(decoded) == pytest.approx([-0.2] * 4)
+    assert _validator_completion_logprobs(decoded, 4) == pytest.approx([-0.3] * 4)
+
+
 def test_tombstone_round_trip():
     doc = decode_tombstone(encode_tombstone(
         window_start=30105, failure_stage="proof_capacity",

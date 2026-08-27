@@ -1,0 +1,12 @@
+{
+  "schema": "reliquary/environment-source/v1",
+  "environment": "reliquary_retrieval_tools_v1",
+  "contract": "reliquary/episode/v1",
+  "generator": "reliquary-retrieval-tools-generator-v1",
+  "renderer": "reliquary-jsonl-tools-v1",
+  "reward": "deterministic-answer-evidence-v1",
+  "source": "Reliquary-authored procedural frozen document collections",
+  "external_data": false,
+  "network_required": false,
+  "license": "MIT"
+}

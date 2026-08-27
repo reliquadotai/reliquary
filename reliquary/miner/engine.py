@@ -8,6 +8,7 @@ Merkle root commitment, HTTP batch submission to validator.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import time
@@ -539,10 +540,19 @@ class MiningEngine:
 
                 env = self.envs[env_name]
                 problem = env.get_problem(prompt_idx)
-                generations = self._generate_m_rollouts(
-                    problem, randomness, env_name=env_name,
-                    prompt_idx=prompt_idx, checkpoint_hash=local_hash,
-                )
+                environment_spec = get_environment_spec(env_name)
+                if environment_spec.interaction_mode == "episode":
+                    generations = self._generate_m_episode_rollouts(
+                        env,
+                        randomness,
+                        prompt_idx=prompt_idx,
+                        checkpoint_hash=local_hash,
+                    )
+                else:
+                    generations = self._generate_m_rollouts(
+                        problem, randomness, env_name=env_name,
+                        prompt_idx=prompt_idx, checkpoint_hash=local_hash,
+                    )
                 if len(generations) < M_ROLLOUTS:
                     logger.warning(
                         "generated %d/%d for prompt %d; skipping",
@@ -796,17 +806,78 @@ class MiningEngine:
             })
         return rollouts
 
+    def _generate_m_episode_rollouts(
+        self,
+        env,
+        randomness: str,
+        *,
+        prompt_idx: int,
+        checkpoint_hash: str,
+    ) -> list[dict]:
+        """Generate M complete canonical episodes, one turn at a time."""
+
+        from reliquary.environment.agentic.renderer import CanonicalEpisodeRenderer
+        from reliquary.environment.agentic.runner import EpisodeRunner
+        from reliquary.miner.episode_policy import HFEpisodePolicy
+
+        profile = ACTIVE_PROTOCOL_PROFILE.environments[env.name].episode
+        if profile is None:
+            raise RuntimeError(f"episode profile missing for {env.name}")
+
+        def encode(text: str) -> list[int]:
+            encoded = self.tokenizer.encode(text, add_special_tokens=False)
+            return list(getattr(encoded, "ids", encoded))
+
+        renderer = CanonicalEpisodeRenderer(encode)
+        task = env.get_task(prompt_idx)
+        hotkey = self.wallet.hotkey.ss58_address
+        generations: list[dict] = []
+        for rollout_index in range(M_ROLLOUTS):
+            seed_material = (
+                f"{randomness}:{hotkey}:{env.name}:{prompt_idx}:{rollout_index}"
+            ).encode("utf-8")
+            seed = int.from_bytes(hashlib.sha256(seed_material).digest()[:8], "big")
+            policy = HFEpisodePolicy(
+                model=self.vllm_model,
+                tokenizer=self.tokenizer,
+                randomness=randomness,
+                hotkey=hotkey,
+                prompt_idx=prompt_idx,
+                checkpoint_hash=checkpoint_hash,
+                rollout_index=rollout_index,
+                max_action_tokens=profile.max_action_tokens,
+                max_episode_tokens=profile.max_episode_tokens,
+            )
+            trace = EpisodeRunner(
+                renderer=renderer,
+                max_turns=min(profile.max_turns, env.max_turns),
+                max_episode_tokens=profile.max_episode_tokens,
+                max_observation_bytes=profile.max_observation_bytes,
+            ).run(env, task, seed=seed, policy=policy)
+            if not trace.assistant_spans:
+                raise RuntimeError("episode generated no assistant actions")
+            generations.append({
+                "tokens": list(trace.tokens),
+                "prompt_length": int(trace.assistant_spans[0][0]),
+                "forced": False,
+                "trace": trace,
+            })
+        return generations
+
     def _build_rollout_submission(self, generation, problem, randomness, *, env=None):
         """Build a RolloutSubmission: completion + claimed reward + GRAIL commit."""
         active_env = env if env is not None else self.env
         all_tokens = generation["tokens"]
         prompt_length = generation["prompt_length"]
-        completion_tokens = all_tokens[prompt_length:]
-        completion_text = self.tokenizer.decode(completion_tokens)
-        if getattr(active_env, "validator_authoritative_reward", False):
+        if generation.get("trace") is not None:
             reward = 0.0
         else:
-            reward = active_env.compute_reward(problem, completion_text)
+            completion_tokens = all_tokens[prompt_length:]
+            completion_text = self.tokenizer.decode(completion_tokens)
+            if getattr(active_env, "validator_authoritative_reward", False):
+                reward = 0.0
+            else:
+                reward = active_env.compute_reward(problem, completion_text)
 
         commit = self._build_grail_commit(generation, randomness)
         return RolloutSubmission(
@@ -831,8 +902,14 @@ class MiningEngine:
         """
         import torch
 
-        from reliquary.constants import GRAIL_PROOF_VERSION
-        from reliquary.protocol.signatures import sign_commit_binding
+        from reliquary.constants import (
+            GRAIL_EPISODE_PROOF_VERSION,
+            GRAIL_PROOF_VERSION,
+        )
+        from reliquary.protocol.signatures import (
+            sign_commit_binding,
+            sign_episode_commit_binding,
+        )
         from reliquary.shared.forward import forward_single_layer
 
         all_tokens: list[int] = generation["tokens"]
@@ -855,23 +932,62 @@ class MiningEngine:
 
         # fp32 log_softmax to match the validator and reduce tail-token drift.
         log_probs = torch.log_softmax(logits[0].float(), dim=-1)
+        trace = generation.get("trace")
+        policy_positions = (
+            [
+                position
+                for start, end in trace.assistant_spans
+                for position in range(start, end)
+            ]
+            if trace is not None
+            else list(range(prompt_length, len(all_tokens)))
+        )
         token_logprobs: list[float] = []
-        for i in range(prompt_length, len(all_tokens)):
+        for i in policy_positions:
             token_logprobs.append(log_probs[i - 1, all_tokens[i]].item())
 
-        # Sign
         model_name: str = getattr(self.hf_model, "name_or_path", "unknown")
-        signature = sign_commit_binding(
-            all_tokens, randomness, model_name, LAYER_INDEX,
-            commitments, self.wallet,
-        )
+        rollout_metadata = _rollout_metadata(generation, token_logprobs)
+        if trace is not None:
+            reward = trace.reward
+            if reward is None:
+                raise RuntimeError("episode trace has no reward report")
+            episode = {
+                "schema_version": trace.schema,
+                "renderer_id": "reliquary-jsonl-tools-v1",
+                "task_id": trace.task_id,
+                "seed": trace.seed,
+                "actions": [action.to_wire() for action in trace.actions],
+                "assistant_spans": [list(span) for span in trace.assistant_spans],
+                "observation_digests": list(trace.observation_digests),
+                "termination_reason": trace.termination_reason,
+                "state_digest": reward.state_digest,
+                "trace_digest": trace.trace_digest,
+            }
+            rollout_metadata["episode"] = episode
+            signature = sign_episode_commit_binding(
+                all_tokens,
+                randomness,
+                model_name,
+                LAYER_INDEX,
+                commitments,
+                episode,
+                self.wallet,
+            )
+            proof_version = GRAIL_EPISODE_PROOF_VERSION
+        else:
+            signature = sign_commit_binding(
+                all_tokens, randomness, model_name, LAYER_INDEX,
+                commitments, self.wallet,
+            )
+            proof_version = GRAIL_PROOF_VERSION
 
         return {
             "tokens": all_tokens,
             "commitments": commitments,
-            "proof_version": GRAIL_PROOF_VERSION,
+            "proof_version": proof_version,
             "model": {"name": model_name, "layer_index": LAYER_INDEX},
             "signature": signature.hex(),
             "beacon": {"randomness": randomness},
-            "rollout": _rollout_metadata(generation, token_logprobs),
+            "rollout": rollout_metadata,
         }

@@ -25,6 +25,7 @@ import multiprocessing
 import os
 import numbers
 import secrets
+import sys
 import urllib.parse
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -849,6 +850,16 @@ def _proof_free_submission_reject(
             bootstrap=bool(getattr(batcher, "bootstrap", False)),
         ):
             return RejectReason.OUT_OF_ZONE, "zone"
+
+    try:
+        interaction_mode = get_environment_spec(environment).interaction_mode
+    except ValueError:
+        interaction_mode = "single_turn"
+    if interaction_mode == "episode":
+        # The isolated admission worker reconstructs and replays the complete
+        # canonical episode. A final tokenizer EOS is neither required nor a
+        # valid proxy for an environment's terminal state.
+        return None, None
 
     eos_set = _proof_free_eos_set(batcher)
     if not eos_set:
@@ -3021,13 +3032,18 @@ class ValidatorServer:
             tokenizer_json.encode("utf-8")
         ).hexdigest()
         worker_count = self._admission_worker_count(environment)
-        pool = ProcessPoolExecutor(
+        pool_kwargs: dict[str, Any] = dict(
             max_workers=worker_count,
             mp_context=multiprocessing.get_context("spawn"),
             initializer=initialize_admission_worker,
             initargs=(tokenizer_json,),
-            max_tasks_per_child=ADMISSION_PROCESS_MAX_TASKS,
         )
+        # Python 3.11+ supports bounded child recycling directly. Keep the
+        # qualification/control plane importable on 3.10 hosts even though the
+        # production package itself requires Python >=3.11.
+        if tuple(sys.version_info[:2]) >= (3, 11):
+            pool_kwargs["max_tasks_per_child"] = ADMISSION_PROCESS_MAX_TASKS
+        pool = ProcessPoolExecutor(**pool_kwargs)
         # ProcessPoolExecutor is lazy. Fully start it at the quiescent boundary
         # so the first reveal cannot spend its candidate wall budget waiting
         # for child imports. Short held probes let every child claim work; the

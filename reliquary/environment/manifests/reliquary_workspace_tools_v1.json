@@ -1,0 +1,12 @@
+{
+  "schema": "reliquary/environment-source/v1",
+  "environment": "reliquary_workspace_tools_v1",
+  "contract": "reliquary/episode/v1",
+  "generator": "reliquary-workspace-tools-generator-v1",
+  "renderer": "reliquary-jsonl-tools-v1",
+  "reward": "deterministic-workspace-invariants-v1",
+  "source": "Reliquary-authored procedural file-repair workspaces",
+  "external_data": false,
+  "network_required": false,
+  "license": "MIT"
+}

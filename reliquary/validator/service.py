@@ -412,8 +412,17 @@ def open_grpo_window(
         return tokenizer.decode(tokens[prompt_len:])
 
     def _canonical_prompt_tokens(prompt_idx: int) -> list[int]:
+        from reliquary.environment.registry import get_environment_spec
         from reliquary.protocol.tokens import encode_prompt
 
+        try:
+            spec = get_environment_spec(str(getattr(env, "name", "")))
+        except ValueError:
+            spec = None
+        if spec is not None and spec.interaction_mode == "episode":
+            from reliquary.environment.agentic.compat import encode_episode_prompt
+
+            return encode_episode_prompt(tokenizer, env, prompt_idx)
         problem = env.get_problem(prompt_idx)
         return encode_prompt(tokenizer, problem["prompt"])
 
@@ -5003,6 +5012,7 @@ class ValidationService:
             prompt_content_sha256,
             render_canonical_prompt,
         )
+        from reliquary.environment.registry import get_environment_spec
 
         resolved = 0
         for env_name, prompt_map in self._cooldown_per_env.items():
@@ -5013,9 +5023,20 @@ class ValidationService:
                 if int(selected_window) <= snapshot_window:
                     continue
                 problem = env.get_problem(int(prompt_idx))
-                rendered = render_canonical_prompt(
-                    self.tokenizer, str(problem["prompt"])
-                )
+                try:
+                    spec = get_environment_spec(env_name)
+                except ValueError:
+                    spec = None
+                if spec is not None and spec.interaction_mode == "episode":
+                    from reliquary.environment.agentic.compat import (
+                        rendered_episode_prompt,
+                    )
+
+                    rendered = rendered_episode_prompt(env, int(prompt_idx))
+                else:
+                    rendered = render_canonical_prompt(
+                        self.tokenizer, str(problem["prompt"])
+                    )
                 digest = prompt_content_sha256(env_name, rendered)
                 prior = content_state.get(digest, -1)
                 if int(selected_window) > prior:

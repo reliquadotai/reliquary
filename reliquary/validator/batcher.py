@@ -160,6 +160,7 @@ from reliquary.validator.verifier import (
     is_in_zone,
     is_cap_truncation,
     is_natural_bft_cap_candidate,
+    policy_token_positions,
     rewards_std,
     validate_force_span,
     verify_logprobs_claim,
@@ -288,6 +289,15 @@ def _environment_policy(env: Any, field: str, default: Any = None) -> Any:
         return getattr(env, field, default)
 
 
+def _render_environment_prompt(env: Any, tokenizer: Any, prompt_idx: int) -> str:
+    if _environment_policy(env, "interaction_mode", "single_turn") == "episode":
+        from reliquary.environment.agentic.compat import rendered_episode_prompt
+
+        return rendered_episode_prompt(env, prompt_idx)
+    problem = env.get_problem(prompt_idx)
+    return render_canonical_prompt(tokenizer, str(problem["prompt"]))
+
+
 def _reward_matches_claim(actual: float, claimed: float, *, tolerance: float = 1e-6) -> bool:
     actual_f = float(actual)
     claimed_f = float(claimed)
@@ -335,6 +345,7 @@ def _verify_short_logprob_claim(
     prompt_length: int,
     completion_length: int,
     claimed_logprobs,
+    policy_positions: list[int] | None = None,
 ):
     """Full-coverage logprob-claim check for completions shorter than
     CHALLENGE_K, where the sampled-challenge check cannot run (it returns a
@@ -369,15 +380,19 @@ def _verify_short_logprob_claim(
         return None, None
     claimed = list(claimed_logprobs or [])
     if len(claimed) == len(tokens):
-        offset = prompt_length
+        claimed_values = (
+            [claimed[position] for position in policy_positions]
+            if policy_positions is not None
+            else claimed[prompt_length:prompt_length + completion_length]
+        )
     elif len(claimed) == completion_length:
-        offset = 0
+        claimed_values = claimed
     else:
         return False, float("inf")
     devs = []
     for j in range(completion_length):
         try:
-            miner_lp = float(claimed[offset + j])
+            miner_lp = float(claimed_values[j])
         except (TypeError, ValueError, IndexError):
             return False, float("inf")
         if not math.isfinite(miner_lp):
@@ -2381,8 +2396,8 @@ class GrpoWindowBatcher:
         from reliquary.validator.admission import AdmissionProblemMaterials
 
         problem = self.env.get_problem(prompt_idx)
-        rendered_prompt = render_canonical_prompt(
-            self.tokenizer, str(problem["prompt"])
+        rendered_prompt = _render_environment_prompt(
+            self.env, self.tokenizer, prompt_idx
         )
         code_cases = None
         reward_materials = None
@@ -3086,8 +3101,8 @@ class GrpoWindowBatcher:
             selection_digest=compute_rollouts_selection_digest(request.rollouts),
             prompt_content_sha256=prompt_content_sha256(
                 str(getattr(self.env, "name", "")),
-                render_canonical_prompt(
-                    self.tokenizer, str(problem["prompt"])
+                _render_environment_prompt(
+                    self.env, self.tokenizer, request.prompt_idx
                 ),
             ),
             target_content_sha256=target_content_sha256(
@@ -3423,11 +3438,24 @@ class GrpoWindowBatcher:
             # ``completion_len`` computed later at the sparse-outputs section)
             # so the u-stream can accompany the verify call below.
             _seed_meta = rollout.commit.get("rollout") or {}
-            _seed_completion_len = int(_seed_meta.get("completion_length", 0))
+            _is_episode = isinstance(_seed_meta.get("episode"), dict)
             _seed_prompt_len = int(_seed_meta.get("prompt_length", 0))
             _seed_tokens = rollout.commit.get("tokens") or []
-            _seed_completion_tokens = _seed_tokens[
-                _seed_prompt_len:_seed_prompt_len + _seed_completion_len
+            _policy_positions = policy_token_positions(
+                list(_seed_tokens), _seed_meta
+            )
+            _seed_completion_len = len(_policy_positions)
+            if _is_episode:
+                trusted_spans = getattr(
+                    rollout, "_validated_assistant_spans", None
+                )
+                if trusted_spans is None:
+                    return reject(
+                        RejectReason.REWARD_MISMATCH,
+                        "episode_replay_binding",
+                    )
+            _seed_completion_tokens = [
+                _seed_tokens[position] for position in _policy_positions
             ]
             rollout_token_metrics = token_degeneracy_metrics(
                 _seed_completion_tokens
@@ -3574,7 +3602,7 @@ class GrpoWindowBatcher:
             # Reads precomputed p_stop on ``proof`` — no logits round-trip.
             # Skipped when the stub didn't populate sparse outputs (legacy
             # test fixtures that opted out of behavioural enforcement).
-            if proof.has_sparse_outputs:
+            if proof.has_sparse_outputs and not _is_episode:
                 if has_eos_padding(
                     rollout.commit,
                     self.tokenizer,
@@ -3699,26 +3727,32 @@ class GrpoWindowBatcher:
 
             rollout_dict = rollout.commit.get("rollout", {}) or {}
             prompt_len = int(rollout_dict.get("prompt_length", 0))
-            completion_len = int(rollout_dict.get("completion_length", 0))
+            policy_positions = policy_token_positions(
+                list(rollout.commit["tokens"]), rollout_dict
+            )
+            completion_len = len(policy_positions)
             claimed_lp = rollout_dict.get("token_logprobs", []) or []
 
             # BFT carve-out: validate a forced rollout's FORCE span (byte-exact,
             # atomic-</think>-anchored, at the thinking budget); a valid span's
             # positions are exempted from the per-token auth / distribution
             # checks (their probability is legitimately ~0 — injected, not sampled).
-            carve_ok, exempt_positions = validate_force_span(
-                rollout.commit["tokens"], rollout_dict,
-                canonical_force_ids, prompt_len,
-                thinking_budget=BFT_THINKING_BUDGET,
-                think_close_ids=force_think_close_ids,
-            )
+            if _is_episode:
+                carve_ok, exempt_positions = True, set()
+            else:
+                carve_ok, exempt_positions = validate_force_span(
+                    rollout.commit["tokens"], rollout_dict,
+                    canonical_force_ids, prompt_len,
+                    thinking_budget=BFT_THINKING_BUDGET,
+                    think_close_ids=force_think_close_ids,
+                )
             if not carve_ok:
                 return reject(
                     RejectReason.TOKEN_TAMPERED,
                     "force_span",
                     sketch_diff_max=sketch_diff_max,
                 )
-            if rollout_dict.get("forced"):
+            if rollout_dict.get("forced") and not _is_episode:
                 declared_span = rollout_dict.get("force_span")
                 rollout._validated_force_span = (
                     int(declared_span[0]),
@@ -3731,16 +3765,23 @@ class GrpoWindowBatcher:
                 if rollout._validated_force_span is not None
                 else 0
             )
-            rollout._validated_termination_path = classify_bft_termination(
-                rollout.commit["tokens"],
-                prompt_length=prompt_len,
-                completion_length=completion_len,
-                eos_ids=telemetry_eos_ids,
-                think_close_ids=telemetry_think_close_ids,
-                validated_force_span=rollout._validated_force_span,
-                thinking_budget=BFT_THINKING_BUDGET,
-                answer_budget=BFT_ANSWER_BUDGET,
-            )
+            if _is_episode:
+                rollout._validated_termination_path = str(
+                    (rollout_dict.get("episode") or {}).get(
+                        "termination_reason", "episode_done"
+                    )
+                )
+            else:
+                rollout._validated_termination_path = classify_bft_termination(
+                    rollout.commit["tokens"],
+                    prompt_length=prompt_len,
+                    completion_length=completion_len,
+                    eos_ids=telemetry_eos_ids,
+                    think_close_ids=telemetry_think_close_ids,
+                    validated_force_span=rollout._validated_force_span,
+                    thinking_budget=BFT_THINKING_BUDGET,
+                    answer_budget=BFT_ANSWER_BUDGET,
+                )
             seed_cdf_entry["termination_path"] = (
                 rollout._validated_termination_path
             )
@@ -3754,6 +3795,7 @@ class GrpoWindowBatcher:
                 completion_length=completion_len,
                 claimed_logprobs=claimed_lp,
                 proof=proof,
+                policy_positions=(policy_positions if _is_episode else None),
             )
             if not lp_ok and completion_len < CHALLENGE_K:
                 # The sampled-challenge check is a deterministic fail below
@@ -3772,6 +3814,7 @@ class GrpoWindowBatcher:
                     prompt_len,
                     completion_len,
                     claimed_lp,
+                    policy_positions=(policy_positions if _is_episode else None),
                 )
                 with self._proof_admission_lock:
                     self.logprob_short_full_coverage_checks += 1
@@ -3817,6 +3860,56 @@ class GrpoWindowBatcher:
                     lp_dev_max=lp_dev_max,
                     dist_q10_min=dist_q10_min,
                 )
+
+            if _is_episode:
+                chosen_probs = list(
+                    getattr(proof, "completion_chosen_probs", []) or []
+                )
+                entropies = list(
+                    getattr(proof, "completion_entropies", []) or []
+                )
+                utility_rollouts.append({
+                    "rollout_idx": rollout_idx,
+                    "reward": float(getattr(rollout, "reward", 0.0) or 0.0),
+                    "prompt_length": prompt_len,
+                    "completion_length": completion_len,
+                    "natural_eos": False,
+                    "validated_force_span": None,
+                    "termination_path": rollout._validated_termination_path,
+                    "chosen_nll": {
+                        "mean": (
+                            sum(-math.log(max(float(p), 1e-45)) for p in chosen_probs)
+                            / len(chosen_probs)
+                            if chosen_probs else None
+                        ),
+                        "p50": None,
+                        "p90": None,
+                    },
+                    "full_policy_entropy": {
+                        "mean": (
+                            sum(float(value) for value in entropies) / len(entropies)
+                            if entropies else None
+                        ),
+                        "p50": None,
+                        "p90": None,
+                    },
+                    "full_policy_entropy_samples": len(entropies),
+                    "hidden_start_f16_b64": getattr(
+                        proof, "hidden_start_f16_b64", None
+                    ),
+                    "hidden_delta_f16_b64": getattr(
+                        proof, "hidden_delta_f16_b64", None
+                    ),
+                    "hidden_dim": int(getattr(proof, "hidden_dim", 0) or 0),
+                    "hidden_end_completion_offset": getattr(
+                        proof, "hidden_end_completion_offset", None
+                    ),
+                    "representation_shift_l2": getattr(
+                        proof, "representation_shift_l2", None
+                    ),
+                    "token_degeneracy": dict(rollout_token_metrics),
+                })
+                continue
 
             boxed_ok, boxed_metrics = evaluate_boxed_answer_probability(
                 tokens=rollout.commit["tokens"],

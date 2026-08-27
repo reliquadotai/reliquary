@@ -123,6 +123,12 @@ class RolloutSubmission(BaseModel):
     # miner-declared span from influencing GRPO loss masking.
     _validated_force_span: tuple[int, int] | None = PrivateAttr(default=None)
     _validated_termination_path: str | None = PrivateAttr(default=None)
+    # Episode v1: derived by validator replay. Wire-declared spans are never
+    # consumed by training until they match replay and are copied here.
+    _validated_assistant_spans: tuple[tuple[int, int], ...] | None = PrivateAttr(
+        default=None
+    )
+    _validated_episode_trace_digest: str | None = PrivateAttr(default=None)
 
     tokens: list[int] = Field(..., min_length=1)
     reward: FiniteFloat  # miner's local reward; validator re-checks it
@@ -450,6 +456,58 @@ class RolloutMetadata(BaseModel):
     # the overlong side of the reward shaping.
     truncated: bool = False
 
+    # Present only for Reliquary Episode v1. Keeping it nested preserves the
+    # historical single-turn metadata fields and outer submission envelope.
+    episode: "EpisodeMetadata | None" = None
+
+
+class EpisodeMetadata(BaseModel):
+    """Structured episode material committed beside a flattened token trace."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["reliquary/episode/v1"]
+    renderer_id: Literal["reliquary-jsonl-tools-v1"]
+    task_id: str = Field(..., min_length=1, max_length=128)
+    seed: int = Field(..., ge=0)
+    actions: list[dict[str, Any]] = Field(..., min_length=1, max_length=64)
+    assistant_spans: list[list[int]] = Field(..., min_length=1, max_length=64)
+    observation_digests: list[str] = Field(default_factory=list, max_length=64)
+    termination_reason: str = Field(..., min_length=1, max_length=64)
+    state_digest: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    trace_digest: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def _spans_and_actions_are_bounded(self):
+        previous = 0
+        for span in self.assistant_spans:
+            if len(span) != 2:
+                raise ValueError("assistant spans must contain [start, end]")
+            start, end = int(span[0]), int(span[1])
+            if start < previous or end <= start:
+                raise ValueError("assistant spans must be sorted and non-empty")
+            previous = end
+        if len(self.actions) != len(self.assistant_spans):
+            raise ValueError("one assistant span is required for every action")
+        if len(self.observation_digests) != len(self.actions):
+            raise ValueError("one observation digest is required for every action")
+        if any(
+            len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for value in self.observation_digests
+        ):
+            raise ValueError("observation digests must be lowercase SHA-256 hex")
+        return self
+
+    @property
+    def assistant_token_count(self) -> int:
+        return sum(int(end) - int(start) for start, end in self.assistant_spans)
+
+
+# Resolve the intentional forward declaration while keeping the historical
+# RolloutMetadata field order and serialized shape unchanged.
+RolloutMetadata.model_rebuild()
+
 
 class CommitModel(BaseModel):
     """The inner ``commit`` dict shipped by the miner inside ``RolloutSubmission``.
@@ -463,7 +521,7 @@ class CommitModel(BaseModel):
 
     tokens: list[int] = Field(..., min_length=CHALLENGE_K)
     commitments: list[dict]
-    proof_version: Literal["v7"]
+    proof_version: Literal["v7", "v8"]
     model: ModelInfo
     signature: str = Field(..., pattern=r"^[0-9a-fA-F]+$")
     beacon: BeaconInfo
@@ -493,6 +551,22 @@ class CommitModel(BaseModel):
                 f"completion_length({v.completion_length}) must equal "
                 f"len(tokens)={len(tokens)}"
             )
+        if v.episode is not None:
+            proof_version = info.data.get("proof_version")
+            if proof_version != "v8":
+                raise ValueError("episode metadata requires GRAIL proof v8")
+            if any(int(end) > len(tokens) for _start, end in v.episode.assistant_spans):
+                raise ValueError("assistant span exceeds token sequence")
+            if len(v.token_logprobs) not in (
+                len(tokens),
+                v.episode.assistant_token_count,
+            ):
+                raise ValueError(
+                    "episode token_logprobs must be full-sequence or assistant-only"
+                )
+            return v
+        if info.data.get("proof_version") != "v7":
+            raise ValueError("single-turn metadata requires GRAIL proof v7")
         # Two layouts are accepted, matching ``verify_logprobs_claim`` in
         # ``validator/verifier.py``:
         #   * full-sequence: len == len(tokens), prompt entries ignored

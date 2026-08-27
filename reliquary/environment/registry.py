@@ -24,11 +24,13 @@ from types import MappingProxyType
 from typing import Any, Literal
 
 from reliquary.environment.base import Environment
+from reliquary.environment.agentic.base import EpisodeEnvironment
 
 
 AdmissionResourceClass = Literal["cpu", "sandbox"]
 TerminationPolicy = Literal["eos_or_cap", "math_bft"]
 FinalAnswerPolicy = Literal["boxed", "fenced_python", "json"]
+InteractionMode = Literal["single_turn", "episode"]
 
 
 def _import_attribute(path: str) -> Any:
@@ -62,6 +64,9 @@ class EnvironmentSpec:
     reward_lattice_policy: str
     attainable_rewards: tuple[float, ...]
     contract_version: str
+    interaction_mode: InteractionMode = "single_turn"
+    episode_replay_path: str | None = None
+    renderer_id: str | None = None
     environment_manifest_sha256: str | None = None
     reward_materializer_method: str | None = None
 
@@ -88,6 +93,18 @@ class EnvironmentSpec:
             "json",
         ):
             raise ValueError("unknown final-answer policy")
+        if self.interaction_mode not in ("single_turn", "episode"):
+            raise ValueError("unknown interaction mode")
+        if self.interaction_mode == "episode":
+            if not self.episode_replay_path or not self.renderer_id:
+                raise ValueError(
+                    "episode environments require replay path and renderer id"
+                )
+            _validate_import_path(self.episode_replay_path)
+        elif self.episode_replay_path is not None or self.renderer_id is not None:
+            raise ValueError(
+                "single-turn environments cannot declare episode runtime fields"
+            )
         values = tuple(float(value) for value in self.attainable_rewards)
         if any(value < 0.0 or value > 1.0 for value in values):
             raise ValueError("attainable rewards must be within [0, 1]")
@@ -96,13 +113,21 @@ class EnvironmentSpec:
         _validate_import_path(self.factory_path)
         _validate_import_path(self.scorer_path)
 
-    def create(self) -> Environment:
+    def create(self) -> Environment | EpisodeEnvironment:
         factory = _import_attribute(self.factory_path)
         if not callable(factory):
             raise TypeError(f"environment factory {self.factory_path!r} is not callable")
         environment = factory()
-        if not isinstance(environment, Environment):
-            raise TypeError(f"factory for {self.name!r} returned an invalid environment")
+        expected_protocol = (
+            EpisodeEnvironment
+            if self.interaction_mode == "episode"
+            else Environment
+        )
+        if not isinstance(environment, expected_protocol):
+            raise TypeError(
+                f"factory for {self.name!r} returned an invalid "
+                f"{self.interaction_mode} environment"
+            )
         if getattr(environment, "name", None) != self.name:
             raise ValueError(
                 f"environment factory name mismatch: expected {self.name!r}, "
@@ -116,6 +141,8 @@ class EnvironmentSpec:
         completion_texts: list[str],
         reward_materials: Any = None,
     ) -> list[float]:
+        if self.interaction_mode == "episode":
+            raise TypeError("episode environments must be scored by replay")
         scorer = _import_attribute(self.scorer_path)
         if not callable(scorer):
             raise TypeError(f"environment scorer {self.scorer_path!r} is not callable")
@@ -142,7 +169,33 @@ class EnvironmentSpec:
             manifest["environment_manifest_sha256"] = (
                 self.environment_manifest_sha256
             )
+        # Historical single-turn manifests remain byte-for-byte stable.
+        if self.interaction_mode == "episode":
+            manifest.update({
+                "interaction_mode": "episode",
+                "episode_schema": "reliquary/episode/v1",
+                "renderer_id": self.renderer_id,
+            })
         return manifest
+
+    def replay(
+        self,
+        *,
+        task_index: int,
+        seed: int,
+        actions: Sequence[dict[str, Any]],
+    ) -> Any:
+        if self.interaction_mode != "episode" or not self.episode_replay_path:
+            raise TypeError(f"environment {self.name!r} is not episode-based")
+        replay = _import_attribute(self.episode_replay_path)
+        if not callable(replay):
+            raise TypeError(f"episode replay {self.episode_replay_path!r} is not callable")
+        return replay(
+            self.create(),
+            task_index=int(task_index),
+            seed=int(seed),
+            actions=list(actions),
+        )
 
 
 def _validate_import_path(path: str) -> None:
@@ -207,6 +260,81 @@ _SPEC_VALUES = (
         environment_manifest_sha256=(
             "d0d5d838e40b383d1c95a62d1cdded8"
             "458f4a7b62df621c87c9435b62207929b"
+        ),
+    ),
+    EnvironmentSpec(
+        name="reliquary_stateful_tools_v1",
+        factory_path=(
+            "reliquary.environment.agentic.envs.stateful_tools_v1:"
+            "StatefulToolsEnvironment"
+        ),
+        scorer_path=(
+            "reliquary.environment.agentic.suite:"
+            "episode_score_many_not_supported"
+        ),
+        validator_authoritative_reward=True,
+        admission_resource_class="cpu",
+        termination_policy="eos_or_cap",
+        final_answer_policy="json",
+        reward_lattice_policy="weighted-invariants-v1",
+        attainable_rewards=(),
+        contract_version="reliquary-stateful-tools-v1",
+        interaction_mode="episode",
+        episode_replay_path="reliquary.environment.agentic.suite:replay_submission",
+        renderer_id="reliquary-jsonl-tools-v1",
+        environment_manifest_sha256=(
+            "b0792fc5bf342bb615c22111d65d3458"
+            "eec42a88dd48d2f773cacddd0cf0a0fb"
+        ),
+    ),
+    EnvironmentSpec(
+        name="reliquary_retrieval_tools_v1",
+        factory_path=(
+            "reliquary.environment.agentic.envs.retrieval_tools_v1:"
+            "RetrievalToolsEnvironment"
+        ),
+        scorer_path=(
+            "reliquary.environment.agentic.suite:"
+            "episode_score_many_not_supported"
+        ),
+        validator_authoritative_reward=True,
+        admission_resource_class="cpu",
+        termination_policy="eos_or_cap",
+        final_answer_policy="json",
+        reward_lattice_policy="weighted-evidence-v1",
+        attainable_rewards=(),
+        contract_version="reliquary-retrieval-tools-v1",
+        interaction_mode="episode",
+        episode_replay_path="reliquary.environment.agentic.suite:replay_submission",
+        renderer_id="reliquary-jsonl-tools-v1",
+        environment_manifest_sha256=(
+            "d928f6dfcb0dd101dbf6e60ee786a33e"
+            "3e9ebd806b621349de7edec1aead7593"
+        ),
+    ),
+    EnvironmentSpec(
+        name="reliquary_workspace_tools_v1",
+        factory_path=(
+            "reliquary.environment.agentic.envs.workspace_tools_v1:"
+            "WorkspaceToolsEnvironment"
+        ),
+        scorer_path=(
+            "reliquary.environment.agentic.suite:"
+            "episode_score_many_not_supported"
+        ),
+        validator_authoritative_reward=True,
+        admission_resource_class="sandbox",
+        termination_policy="eos_or_cap",
+        final_answer_policy="json",
+        reward_lattice_policy="weighted-workspace-invariants-v1",
+        attainable_rewards=(),
+        contract_version="reliquary-workspace-tools-v1",
+        interaction_mode="episode",
+        episode_replay_path="reliquary.environment.agentic.suite:replay_submission",
+        renderer_id="reliquary-jsonl-tools-v1",
+        environment_manifest_sha256=(
+            "2ee517dd7118defb997df4bd008da28f4"
+            "d45d926ce2fdedf63870cd18f8c1a96"
         ),
     ),
 )
@@ -312,6 +440,7 @@ def resolve_environment_mix(
 __all__ = [
     "ENVIRONMENT_SPECS",
     "EnvironmentSpec",
+    "InteractionMode",
     "environment_catalog",
     "environment_manifest",
     "environment_manifest_sha256",

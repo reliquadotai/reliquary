@@ -1,0 +1,12 @@
+{
+  "schema": "reliquary/environment-source/v1",
+  "environment": "reliquary_stateful_tools_v1",
+  "contract": "reliquary/episode/v1",
+  "generator": "reliquary-stateful-tools-generator-v1",
+  "renderer": "reliquary-jsonl-tools-v1",
+  "reward": "deterministic-weighted-state-invariants-v1",
+  "source": "Reliquary-authored procedural retail, support, and CRM worlds",
+  "external_data": false,
+  "network_required": false,
+  "license": "MIT"
+}

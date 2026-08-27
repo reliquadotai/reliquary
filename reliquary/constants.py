@@ -7,6 +7,9 @@ No os.getenv() overrides. Changes require coordinated deployment.
 # ────────────────  GRAIL PROOF VERSION  ────────────────
 
 GRAIL_PROOF_VERSION = "v7"
+# Episode v1 commits bind structured actions and assistant spans in addition to
+# the token/commitment payload. Legacy single-turn profiles remain on v7.
+GRAIL_EPISODE_PROOF_VERSION = "v8"
 
 # ────────────────  CRYPTOGRAPHIC CONSTANTS  ────────────────
 
@@ -132,6 +135,20 @@ def max_new_tokens_for_environment(environment: str) -> int:
     return MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV.get(
         environment,
         MAX_NEW_TOKENS_PROTOCOL_CAP,
+    )
+
+
+def episode_limits_for_environment(environment: str) -> tuple[int, int, int] | None:
+    """Return action-token, episode-token and observation-byte limits."""
+
+    profile = ACTIVE_PROTOCOL_PROFILE.environments.get(environment)
+    episode = profile.episode if profile is not None else None
+    if episode is None:
+        return None
+    return (
+        int(episode.max_action_tokens),
+        int(episode.max_episode_tokens),
+        int(episode.max_observation_bytes),
     )
 
 # Budget-Forced Termination (BFT): if a rollout has not emitted </think> by

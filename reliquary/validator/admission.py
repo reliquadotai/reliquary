@@ -27,6 +27,7 @@ from reliquary.constants import (
     MATH_ANSWER_FORMAT,
     ROBUST_TRUNCATION_UTILITY_ENABLED,
     SIGMA_MIN,
+    episode_limits_for_environment,
     max_new_tokens_for_environment,
     max_truncated_for_environment,
 )
@@ -419,6 +420,10 @@ def _classify_termination(rollout, context: AdmissionContext) -> str:
     commit = rollout.commit
     tokens = list(commit.get("tokens") or [])
     meta = commit.get("rollout", {}) or {}
+    # Episode termination is an environment state transition, not a trailing
+    # tokenizer EOS. The authoritative replay gate below validates it.
+    if isinstance(meta.get("episode"), dict):
+        return "ok"
     try:
         prompt_length = int(meta.get("prompt_length", 0))
         completion_length = int(meta.get("completion_length", 0))
@@ -858,11 +863,96 @@ def score_and_finalize_submission(
                         body_parse_ms=parsed.body_parse_ms,
                         preparation_ms=parsed.preparation_ms,
                     )
-                computed = environment_spec.score_many(
-                    materials.problem,
-                    materials.completion_texts,
-                    materials.effective_reward_materials,
-                )
+                if environment_spec.interaction_mode == "episode":
+                    if _WORKER_TOKENIZER is None:
+                        raise RuntimeError("episode replay tokenizer unavailable")
+                    from reliquary.environment.agentic.replay import (
+                        replay_tokenized_episode,
+                    )
+
+                    def encode_piece(text: str) -> list[int]:
+                        encoded = _WORKER_TOKENIZER.encode(
+                            text, add_special_tokens=False
+                        )
+                        return list(getattr(encoded, "ids", encoded))
+
+                    def decode_piece(ids: list[int]) -> str:
+                        return str(_WORKER_TOKENIZER.decode(
+                            list(ids), skip_special_tokens=False
+                        ))
+
+                    computed = []
+                    for rollout in request.rollouts:
+                        raw_meta = rollout.commit.get("rollout", {}) or {}
+                        episode = raw_meta.get("episode")
+                        if not isinstance(episode, dict):
+                            raise ValueError("episode metadata missing")
+                        spans = tuple(
+                            (int(span[0]), int(span[1]))
+                            for span in episode.get("assistant_spans", [])
+                        )
+                        limits = episode_limits_for_environment(
+                            context.environment
+                        )
+                        if limits is None:
+                            raise ValueError("episode limits missing from profile")
+                        (
+                            max_action_tokens,
+                            max_episode_tokens,
+                            max_observation_bytes,
+                        ) = limits
+                        if len(rollout.commit["tokens"]) > max_episode_tokens:
+                            raise ValueError("episode token budget exceeded")
+                        if any(
+                            end - start > max_action_tokens
+                            for start, end in spans
+                        ):
+                            raise ValueError("episode action token budget exceeded")
+                        trace = replay_tokenized_episode(
+                            environment_spec.create(),
+                            task_index=request.prompt_idx,
+                            seed=int(episode["seed"]),
+                            tokens=list(rollout.commit["tokens"]),
+                            assistant_spans=spans,
+                            decode=decode_piece,
+                            encode=encode_piece,
+                            max_episode_tokens=max_episode_tokens,
+                            max_observation_bytes=max_observation_bytes,
+                        )
+                        reward = trace.reward
+                        if reward is None:
+                            raise ValueError("episode replay did not produce reward")
+                        if trace.task_id != str(episode.get("task_id")):
+                            raise ValueError("episode task binding mismatch")
+                        if [action.to_wire() for action in trace.actions] != list(
+                            episode.get("actions") or []
+                        ):
+                            raise ValueError("episode action binding mismatch")
+                        if tuple(trace.tokens) != tuple(rollout.commit["tokens"]):
+                            raise ValueError("episode canonical transcript mismatch")
+                        if trace.assistant_spans != spans:
+                            raise ValueError("episode assistant span mismatch")
+                        if list(trace.observation_digests) != list(
+                            episode.get("observation_digests") or []
+                        ):
+                            raise ValueError("episode observation mismatch")
+                        if trace.termination_reason != str(
+                            episode.get("termination_reason")
+                        ):
+                            raise ValueError("episode termination mismatch")
+                        if reward.state_digest != str(episode.get("state_digest")):
+                            raise ValueError("episode state digest mismatch")
+                        if trace.trace_digest != str(episode.get("trace_digest")):
+                            raise ValueError("episode trace digest mismatch")
+                        rollout._validated_assistant_spans = spans
+                        rollout._validated_episode_trace_digest = trace.trace_digest
+                        computed.append(float(reward.reward))
+                else:
+                    computed = environment_spec.score_many(
+                        materials.problem,
+                        materials.completion_texts,
+                        materials.effective_reward_materials,
+                    )
                 authoritative = (
                     environment_spec.validator_authoritative_reward
                 )
@@ -1124,11 +1214,12 @@ def materialize_and_score_submission(
         with _deadline(deadline_monotonic):
             if _WORKER_TOKENIZER is None:
                 raise RuntimeError("admission worker tokenizer unavailable")
+            encoded_prompt = _WORKER_TOKENIZER.encode(
+                materials.rendered_prompt,
+                add_special_tokens=False,
+            )
             canonical_prompt_tokens = list(
-                _WORKER_TOKENIZER.encode(
-                    materials.rendered_prompt,
-                    add_special_tokens=False,
-                ).ids
+                getattr(encoded_prompt, "ids", encoded_prompt)
             )
             completion_texts = []
             for rollout in request.rollouts:

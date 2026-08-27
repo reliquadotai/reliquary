@@ -18,9 +18,9 @@ from typing import Any
 
 import numpy as np
 
-PAYLOAD_SCHEMA_VERSION = 2
+PAYLOAD_SCHEMA_VERSION = 3
 TOMBSTONE_SCHEMA_VERSION = 2
-_SUPPORTED_PAYLOAD_SCHEMA_VERSIONS = {1, PAYLOAD_SCHEMA_VERSION}
+_SUPPORTED_PAYLOAD_SCHEMA_VERSIONS = {1, 2, PAYLOAD_SCHEMA_VERSION}
 _SUPPORTED_TOMBSTONE_SCHEMA_VERSIONS = {1, TOMBSTONE_SCHEMA_VERSION}
 _TRAINING_IDENTITY_KEYS = (
     "protocol_profile_id",
@@ -132,6 +132,7 @@ def encode_training_payload(
     # force span and termination path drive loss masking (PR #167) and
     # must survive the hop as the private attrs training reads.
     validated_spans: list[list[int] | None] = []
+    assistant_spans: list[list[list[int]] | None] = []
     termination_paths: list[str | None] = []
     rewards: list[float] = []
     env_names: list[str] = []
@@ -160,6 +161,19 @@ def encode_training_payload(
                 validated_spans.append(
                     [int(span[0]), int(span[1])] if span else None
                 )
+                episode_spans = getattr(
+                    rollout, "_validated_assistant_spans", None
+                )
+                assistant_spans.append(
+                    (
+                        [
+                            [int(item[0]), int(item[1])]
+                            for item in episode_spans
+                        ]
+                        if episode_spans is not None
+                        else None
+                    )
+                )
                 term = getattr(rollout, "_validated_termination_path", None)
                 termination_paths.append(str(term) if term else None)
                 rewards.append(float(getattr(rollout, "reward", 0.0)))
@@ -168,7 +182,12 @@ def encode_training_payload(
                 tokens_off.append(len(tokens_flat))
                 miner_lp_flat.extend(float(v) for v in miner_lp)
                 miner_lp_off.append(len(miner_lp_flat))
-                pi_old = _pi_old_for_encode(rollout, completion_length)
+                policy_length = (
+                    sum(end - start for start, end in episode_spans)
+                    if episode_spans is not None
+                    else completion_length
+                )
+                pi_old = _pi_old_for_encode(rollout, policy_length)
                 if pi_old is None:
                     has_pi_old.append(False)
                 else:
@@ -188,6 +207,7 @@ def encode_training_payload(
         "groups": groups_meta,
         "rollout_meta": rollout_meta,
         "validated_spans": validated_spans,
+        "assistant_spans": assistant_spans,
         "termination_paths": termination_paths,
     }
     if int(protocol_header["schema_version"]) >= 2:
@@ -263,6 +283,7 @@ class DecodedPayload:
         self._groups_meta = header["groups"]
         self._rollout_meta = header["rollout_meta"]
         self._validated_spans = header.get("validated_spans") or []
+        self._assistant_spans = header.get("assistant_spans") or []
         self._termination_paths = header.get("termination_paths") or []
         self._arrays = arrays
 
@@ -299,6 +320,14 @@ class DecodedPayload:
                         rollout._validated_force_span = (
                             int(span[0]), int(span[1]),
                         )
+                if i < len(self._assistant_spans):
+                    spans = self._assistant_spans[i]
+                    if spans is not None:
+                        rollout._validated_assistant_spans = tuple(
+                            (int(span[0]), int(span[1]))
+                            for span in spans
+                        )
+                if i < len(self._termination_paths):
                     term = self._termination_paths[i]
                     if term:
                         rollout._validated_termination_path = str(term)
