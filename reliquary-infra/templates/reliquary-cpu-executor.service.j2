@@ -1,0 +1,19 @@
+[Unit]
+Description=Reliquary zero-secret hostile CPU executor
+Requires=docker.service reliquary-executor-egress.service
+After=docker.service reliquary-executor-egress.service network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/reliquary-cpu-executor
+ExecStart=/usr/bin/docker compose --env-file /etc/reliquary/cpu-executor.env --file /opt/reliquary-cpu-executor/compose.yml up --detach --no-build --remove-orphans
+ExecReload=/usr/bin/docker compose --env-file /etc/reliquary/cpu-executor.env --file /opt/reliquary-cpu-executor/compose.yml up --detach --no-build --remove-orphans
+ExecStop=/usr/bin/docker compose --env-file /etc/reliquary/cpu-executor.env --file /opt/reliquary-cpu-executor/compose.yml down --timeout 30
+TimeoutStartSec=300
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

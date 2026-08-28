@@ -5,7 +5,8 @@ FROM ${PYTHON_IMAGE} AS grader-rootfs
 FROM ${PYTHON_IMAGE}
 
 ARG RELIQUARY_BUILD_REVISION=unknown
-ARG RUNSC_RELEASE=20260525
+ARG RUNSC_RELEASE=20260817
+ARG RUNSC_SHA512=84936438d583ec976800f464e75a83e1515f0890b451b9b4db219c4472b54ca9b106a6772ee683f1e64cce2128871d7637b14d800591f8451b8137f6c39fb2ef
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -19,22 +20,25 @@ RUN apt-get update -qq \
  && apt-get install -y -qq ca-certificates wget \
  && rm -rf /var/lib/apt/lists/*
 
-# Only the CPU agent's transport/runtime dependencies. The validator's torch,
-# CUDA, Bittensor, datasets, R2, HF, and wallet stack are intentionally absent.
-RUN pip install \
-      'pydantic==2.13.4' \
-      'httpx==0.28.1' \
-      'fastapi==0.141.1' \
-      'uvicorn==0.52.4'
+# Only the CPU agent's hash-locked transport/runtime dependencies. The
+# validator's torch, CUDA, Bittensor, datasets, R2, HF, and wallet stack are
+# intentionally absent.
+COPY docker/cpu-executor-requirements.lock /tmp/cpu-executor-requirements.lock
+RUN pip install --require-hashes --no-deps \
+      --requirement /tmp/cpu-executor-requirements.lock \
+ && rm -f /tmp/cpu-executor-requirements.lock
 
-# Pin the same gVisor release as the validator image. The checksum supplied by
-# the release is verified before installation.
+# Pin a dated gVisor production release. Verify against the checksum committed
+# with this build rather than trusting a checksum downloaded beside the binary.
+# Only runsc is needed because the agent invokes OCI bundles directly; the
+# containerd shim and metric sidecar from the current multi-file release are
+# deliberately absent.
 RUN ARCH="$(uname -m)" \
  && BASE="https://storage.googleapis.com/gvisor/releases/release/${RUNSC_RELEASE}/${ARCH}" \
- && wget -q "${BASE}/runsc" "${BASE}/runsc.sha512" \
- && sha512sum -c runsc.sha512 \
+ && wget -q "${BASE}/runsc" \
+ && printf '%s  %s\n' "${RUNSC_SHA512}" runsc | sha512sum -c - \
  && install -m 0755 runsc /usr/local/bin/runsc \
- && rm -f runsc runsc.sha512
+ && rm -f runsc
 
 WORKDIR /opt/reliquary
 COPY reliquary /opt/reliquary/reliquary
@@ -46,6 +50,10 @@ RUN install -m 0644 \
       /opt/reliquary/reliquary/environment/grader/worker.py \
       /opt/reliquary/reliquary/environment/grader/bundle/rootfs/opt/worker.py \
  && test -x /opt/reliquary/reliquary/environment/grader/bundle/rootfs/usr/local/bin/python3
+
+LABEL org.opencontainers.image.title="Reliquary zero-secret CPU executor" \
+      org.opencontainers.image.revision="${RELIQUARY_BUILD_REVISION}" \
+      org.opencontainers.image.source="https://github.com/reliqua-ai/reliquary"
 
 EXPOSE 8443
 

@@ -1,0 +1,15 @@
+[Unit]
+Description=Reliquary executor trusted-network egress isolation
+After=network-online.target
+Before=docker.service reliquary-cpu-executor.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=-/usr/sbin/nft delete table inet reliquary_executor
+ExecStart=/usr/sbin/nft --file /etc/nftables.d/reliquary-executor-egress.nft
+ExecStop=-/usr/sbin/nft delete table inet reliquary_executor
+
+[Install]
+WantedBy=multi-user.target

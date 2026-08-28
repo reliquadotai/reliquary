@@ -37,6 +37,8 @@
           - ca-certificates
           - chrony
           - curl
+          - docker-buildx
+          - docker-compose-v2
           - docker.io
           - fail2ban
           - jq
@@ -137,6 +139,10 @@
           owner: root
           group: root
           mode: "0700"
+        - path: /var/lib/reliquary-build
+          owner: root
+          group: root
+          mode: "0750"
 
     - name: Record the deployed infrastructure identity
       ansible.builtin.template:

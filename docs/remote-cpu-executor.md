@@ -43,6 +43,11 @@ The remote request contains:
 - function/method entry point, arguments, keyword arguments;
 - per-case timeout.
 
+The contract also carries a content-bound overall batch deadline, computed
+from case count and per-case timeout and capped at 120 seconds. This bounds
+work that remains after a client disconnect and prevents a large set of
+individually fast cases from becoming an unbounded executor request.
+
 It cannot contain expected values or comparison rules: the strict protocol
 rejects extra fields. The response contains only bound case IDs, statuses,
 JSON-safe bounded outputs, executor identity, and elapsed time. The trusted
@@ -95,6 +100,10 @@ reuse behavior in an isolated lab. It must remain `0` in production.
 
 The outer service also bounds code, request, response, case count, timeout,
 and worker-output sizes. Admission is bounded before a job takes a worker.
+The API owns a fixed thread pool equal to `MAX_INFLIGHT`; it does not inherit
+AnyIO's smaller generic blocking-thread limit. A burst beyond that exact bound
+is rejected immediately with `503` and a `busy` metric instead of accumulating
+an unbounded in-process queue.
 
 ## Capacity model
 
@@ -126,26 +135,33 @@ Keep `RELIQUARY_CPU_EXECUTOR_MAX_INFLIGHT` equal to the worker pool initially;
 this creates backpressure before work queues behind disposable sandboxes and
 exceeds the validator's existing wall budget.
 
-## Before renting the machine
+## Build and deployment package
 
 The code is ready when all of the following pass on the branch:
 
 1. execution contract, transport, service, shadow, disposal, and legacy grader
    tests;
 2. a real TLS/mTLS loopback smoke test;
-3. CPU-executor image build and container start on Linux;
-4. shell and Compose validation;
+3. CPU-executor image build and non-hostile image inspection on Linux;
+4. artifact digest, Ansible syntax, shell, and Compose validation;
 5. no wallet/GPU/storage packages or credentials in the CPU image/environment.
 
-The Docker build and runsc integration require Linux. macOS can validate the
-contract, coordinator, API, and mTLS transport, but cannot qualify the actual
-gVisor host boundary.
+`scripts/build_cpu_executor_artifact.sh` creates an immutable linux/amd64 image
+archive, manifest, package inventory, Docker inspection, history, runsc
+version, and evidence checksums. Runtime Python packages are locked with exact
+artifact hashes. gVisor is pinned to dated release `20260817`, and the committed
+SHA-512 is checked independently of the download location.
+
+The Linux build does not qualify the actual gVisor boundary. That gate requires
+the dedicated KVM host, because miner code must never be attack-tested on
+`ctrl-01`.
 
 ## Host and network prerequisites
 
-Use a dedicated Linux host with Docker and a private address reachable only
-from the validator/control host. Bind port 8443 to that private address. Apply
-both provider firewall and host nftables rules:
+Use a dedicated Linux host with Docker, KVM, and a private address reachable
+only from the validator/control host. Bind port 8443 to that exact address.
+The container uses host networking so Docker cannot create a forwarding rule
+that bypasses the host firewall. Apply both provider firewall and host rules:
 
 ```text
 validator private IP -> cpu-exec private IP:8443 allow
@@ -172,16 +188,30 @@ Keep `/secure/reliquary-cpu-pki/ca/ca.key` offline. Copy only
 `cpu-executor/` to the execution host and only `grader-client/` to the
 validator host.
 
-On the CPU host:
+Build on trusted `ctrl-01` without starting the executor:
 
 ```bash
-cp docker/.env.example.cpu-executor docker/.env.cpu-executor
-# Edit private IP, executor ID, pool sizes, PKI directory, and build revision.
-docker compose \
-  --env-file docker/.env.cpu-executor \
-  -f docker/docker-compose.cpu-executor.yml \
-  up -d --build
+sudo scripts/build_cpu_executor_artifact.sh \
+  /var/lib/reliquary-build/cpu-executor/<git-revision> \
+  <git-revision>
+sudo scripts/verify_cpu_executor_artifact.sh \
+  /var/lib/reliquary-build/cpu-executor/<git-revision>
 ```
+
+Copy `reliquary-infra/inventory/cpu-exec.example.yml` outside Git, fill it
+from the artifact manifest and PKI output, then provision the new host:
+
+```bash
+ansible-playbook \
+  -i /secure/cpu-exec-01.yml \
+  reliquary-infra/playbooks/cpu-exec-01.yml
+```
+
+The playbook refuses missing KVM, swap, wallets, an uploaded CA private key,
+certificate/address mismatch, a corrupt image, or an image-ID mismatch. It
+installs only the server leaf, disables Docker bridge/NAT/firewall mutation,
+denies new host connections to trusted/private networks, exposes metrics only
+on loopback, and runs a final host validator.
 
 From the validator host, prove server identity and client-certificate
 enforcement:
@@ -202,6 +232,22 @@ python scripts/smoke_remote_cpu_executor.py https://10.81.20.2:8443 \
   --ca /etc/reliquary/grader-client-pki/ca.crt \
   --cert /etc/reliquary/grader-client-pki/client.crt \
   --key /etc/reliquary/grader-client-pki/client.key
+```
+
+Then run the dedicated-host-only containment and capacity gates:
+
+```bash
+python scripts/attack_test_cpu_executor.py https://10.81.20.2:8443 \
+  --ca /etc/reliquary/grader-client-pki/ca.crt \
+  --cert /etc/reliquary/grader-client-pki/client.crt \
+  --key /etc/reliquary/grader-client-pki/client.key \
+  --confirm-dedicated-host
+
+python scripts/load_test_cpu_executor.py https://10.81.20.2:8443 \
+  --ca /etc/reliquary/grader-client-pki/ca.crt \
+  --cert /etc/reliquary/grader-client-pki/client.crt \
+  --key /etc/reliquary/grader-client-pki/client.key \
+  --requests 10000 --parallel 16
 ```
 
 On the validator, add:
@@ -248,6 +294,8 @@ shadow.executor.success_latency_p95_ms
 ```
 
 The CPU agent exposes `/v1/health` and `/metrics` on the same mTLS endpoint.
+Its API metrics include exact in-flight, peak, maximum, success, overload, and
+execution-error counts.
 
 ## Cutover
 

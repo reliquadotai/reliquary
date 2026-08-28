@@ -1,0 +1,480 @@
+---
+- name: Provision the Reliquary zero-secret hostile CPU execution host
+  hosts: cpu-exec-01
+  become: true
+  gather_facts: true
+  vars:
+    cpu_exec_infra_dir: "{{ playbook_dir | dirname }}"
+    cpu_exec_repo_dir: "{{ (playbook_dir | dirname) | dirname }}"
+
+  pre_tasks:
+    - name: Require every security and artifact input
+      ansible.builtin.assert:
+        that:
+          - cpu_exec_admin_user is defined
+          - cpu_exec_admin_authorized_key is defined
+          - cpu_exec_admin_authorized_key | length > 80
+          - cpu_exec_management_cidr is defined
+          - cpu_exec_bind_ip is defined
+          - cpu_exec_ctrl_source_cidr is defined
+          - cpu_exec_image_archive is defined
+          - cpu_exec_image_archive_sha256 is match('^[0-9a-f]{64}$')
+          - cpu_exec_image_id is match('^sha256:[0-9a-f]{64}$')
+          - cpu_exec_image_revision is match('^[0-9a-f]{40}$')
+          - cpu_exec_runtime_id is match('^grader-sha256:[0-9a-f]{64}$')
+          - cpu_exec_pki_source_dir is defined
+          - (cpu_exec_pool_size | default(16) | int) >= 1
+          - (cpu_exec_pool_size | default(16) | int) <= 128
+          - (cpu_exec_max_inflight | default(16) | int) >= 1
+          - (cpu_exec_max_inflight | default(16) | int) <= (cpu_exec_pool_size | default(16) | int)
+          - (cpu_exec_runsc_platform | default('kvm')) in ['kvm', 'systrap']
+        fail_msg: "cpu-exec-01 requires explicit network, PKI, capacity, and immutable artifact inputs"
+
+    - name: Require Ubuntu 24.04 on x86-64
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "Ubuntu"
+          - ansible_distribution_version is version('24.04', '>=')
+          - ansible_architecture == "x86_64"
+        fail_msg: "cpu-exec-01 requires x86-64 Ubuntu 24.04 or newer"
+
+    - name: Inspect hardware virtualization
+      ansible.builtin.shell: |
+        set -o pipefail
+        grep -Em1 '\b(vmx|svm)\b' /proc/cpuinfo
+      args:
+        executable: /bin/bash
+      register: cpu_virtualization
+      changed_when: false
+
+    - name: Inspect KVM device
+      ansible.builtin.stat:
+        path: /dev/kvm
+      register: kvm_device
+
+    - name: Require KVM for the gVisor KVM platform and Firecracker readiness
+      ansible.builtin.assert:
+        that:
+          - cpu_virtualization.rc == 0
+          - kvm_device.stat.exists
+          - kvm_device.stat.ischr
+        fail_msg: "hardware virtualization and /dev/kvm must work before provisioning"
+
+    - name: Refuse any Bittensor wallet on the hostile execution host
+      ansible.builtin.shell: |
+        set -o pipefail
+        ! find /root /home -maxdepth 4 -type d -name wallets -path '*/.bittensor/*' -print -quit | grep -q .
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Check local artifact and leaf identities on the Ansible controller
+      ansible.builtin.assert:
+        that:
+          - cpu_exec_image_archive is file
+          - (cpu_exec_pki_source_dir + '/server.crt') is file
+          - (cpu_exec_pki_source_dir + '/server.key') is file
+          - (cpu_exec_pki_source_dir + '/ca.crt') is file
+          - not ((cpu_exec_pki_source_dir + '/ca.key') is file)
+        fail_msg: "artifact/server PKI is missing, or the offline CA key is in the upload directory"
+      delegate_to: localhost
+      become: false
+
+  tasks:
+    - name: Set the execution hostname
+      ansible.builtin.hostname:
+        name: cpu-exec-01
+
+    - name: Install the minimal host, security, and monitoring packages
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+        name:
+          - auditd
+          - audispd-plugins
+          - ca-certificates
+          - chrony
+          - curl
+          - docker-compose-v2
+          - docker.io
+          - fail2ban
+          - jq
+          - nftables
+          - prometheus-node-exporter
+          - python3
+          - unattended-upgrades
+          - ufw
+        state: present
+
+    - name: Apply available package upgrades
+      ansible.builtin.apt:
+        upgrade: dist
+        update_cache: true
+
+    - name: Create the administrative user
+      ansible.builtin.user:
+        name: "{{ cpu_exec_admin_user }}"
+        groups: sudo
+        append: true
+        shell: /bin/bash
+        create_home: true
+
+    - name: Create the administrative SSH directory
+      ansible.builtin.file:
+        path: "/home/{{ cpu_exec_admin_user }}/.ssh"
+        state: directory
+        owner: "{{ cpu_exec_admin_user }}"
+        group: "{{ cpu_exec_admin_user }}"
+        mode: "0700"
+
+    - name: Install the sole administrative SSH key
+      ansible.builtin.copy:
+        dest: "/home/{{ cpu_exec_admin_user }}/.ssh/authorized_keys"
+        content: "{{ cpu_exec_admin_authorized_key }}\n"
+        owner: "{{ cpu_exec_admin_user }}"
+        group: "{{ cpu_exec_admin_user }}"
+        mode: "0600"
+
+    - name: Allow passwordless automation for the administrative user
+      ansible.builtin.copy:
+        dest: "/etc/sudoers.d/90-{{ cpu_exec_admin_user }}"
+        owner: root
+        group: root
+        mode: "0440"
+        validate: /usr/sbin/visudo -cf %s
+        content: "{{ cpu_exec_admin_user }} ALL=(ALL:ALL) NOPASSWD: ALL\n"
+
+    - name: Create executor configuration directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - {path: /etc/reliquary, mode: "0755"}
+        - {path: /etc/reliquary/cpu-executor-pki, mode: "0700"}
+        - {path: /etc/nftables.d, mode: "0755"}
+        - {path: /opt/reliquary-cpu-executor, mode: "0755"}
+        - {path: /var/lib/reliquary-artifacts, mode: "0700"}
+        - {path: /var/lib/prometheus/node-exporter, mode: "0755"}
+
+    - name: Install only the server leaf identity and public CA
+      ansible.builtin.copy:
+        src: "{{ cpu_exec_pki_source_dir }}/{{ item.name }}"
+        dest: "/etc/reliquary/cpu-executor-pki/{{ item.name }}"
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - {name: ca.crt, mode: "0644"}
+        - {name: server.crt, mode: "0644"}
+        - {name: server.key, mode: "0600"}
+      no_log: true
+
+    - name: Refuse a server certificate close to expiry
+      ansible.builtin.command: >-
+        openssl x509 -checkend 1209600 -noout
+        -in /etc/reliquary/cpu-executor-pki/server.crt
+      changed_when: false
+
+    - name: Verify the server leaf against the installed CA
+      ansible.builtin.command: >-
+        openssl verify -purpose sslserver
+        -CAfile /etc/reliquary/cpu-executor-pki/ca.crt
+        /etc/reliquary/cpu-executor-pki/server.crt
+      changed_when: false
+
+    - name: Verify the server certificate binds the execution address
+      ansible.builtin.command: >-
+        openssl verify -verify_ip {{ cpu_exec_bind_ip | quote }}
+        -CAfile /etc/reliquary/cpu-executor-pki/ca.crt
+        /etc/reliquary/cpu-executor-pki/server.crt
+      changed_when: false
+
+    - name: Install hardened Docker daemon policy with no bridge or firewall mutation
+      ansible.builtin.template:
+        src: "{{ cpu_exec_infra_dir }}/templates/docker-daemon-executor.json.j2"
+        dest: /etc/docker/daemon.json
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart Docker
+
+    - name: Install hostile-host kernel policy
+      ansible.builtin.template:
+        src: "{{ cpu_exec_infra_dir }}/templates/99-reliquary-executor-sysctl.conf.j2"
+        dest: /etc/sysctl.d/99-reliquary-executor.conf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload sysctl
+
+    - name: Install trusted-network egress isolation policy
+      ansible.builtin.template:
+        src: "{{ cpu_exec_infra_dir }}/templates/reliquary-executor-egress.nft.j2"
+        dest: /etc/nftables.d/reliquary-executor-egress.nft
+        owner: root
+        group: root
+        mode: "0600"
+      notify: Restart executor egress isolation
+
+    - name: Install egress isolation unit
+      ansible.builtin.template:
+        src: "{{ cpu_exec_infra_dir }}/templates/reliquary-executor-egress.service.j2"
+        dest: /etc/systemd/system/reliquary-executor-egress.service
+        owner: root
+        group: root
+        mode: "0644"
+      notify:
+        - Reload systemd
+        - Restart executor egress isolation
+
+    - name: Install SSH and fail2ban policies
+      ansible.builtin.template:
+        src: "{{ cpu_exec_infra_dir }}/templates/{{ item.src }}"
+        dest: "{{ item.dest }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - src: 50-reliquary-executor-sshd.conf.j2
+          dest: /etc/ssh/sshd_config.d/00-reliquary.conf
+        - src: reliquary-fail2ban.local.j2
+          dest: /etc/fail2ban/jail.d/reliquary.local
+      notify:
+        - Restart SSH
+        - Restart fail2ban
+
+    - name: Validate SSH configuration before root is disabled
+      ansible.builtin.command: sshd -t
+      changed_when: false
+
+    - name: Bind node exporter only to loopback
+      ansible.builtin.template:
+        src: "{{ cpu_exec_infra_dir }}/templates/prometheus-node-exporter.default.j2"
+        dest: /etc/default/prometheus-node-exporter
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart node exporter
+
+    - name: Disable swap now
+      ansible.builtin.command: swapoff -a
+      when: ansible_swaptotal_mb | int > 0
+      changed_when: true
+
+    - name: Disable swap persistently
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^(\s*[^#\n]+\s+[^\s]+\s+swap\s+.*)$'
+        replace: '# disabled-by-reliquary: \1'
+
+    - name: Read firewall state
+      ansible.builtin.command: ufw status verbose
+      register: cpu_exec_ufw
+      changed_when: false
+
+    - name: Apply deny-by-default firewall policy
+      ansible.builtin.command: "{{ item }}"
+      loop:
+        - ufw default deny incoming
+        - ufw default allow outgoing
+      changed_when: true
+      when: "'Default: deny (incoming), allow (outgoing)' not in cpu_exec_ufw.stdout"
+
+    - name: Allow key-only management SSH from the explicit operator network
+      ansible.builtin.command: >-
+        ufw allow proto tcp from {{ cpu_exec_management_cidr | quote }}
+        to any port 22 comment 'Reliquary management SSH'
+      register: cpu_exec_ssh_rule
+      changed_when: "'Rule added' in cpu_exec_ssh_rule.stdout"
+
+    - name: Allow only ctrl-01 to reach the private mTLS executor
+      ansible.builtin.command: >-
+        ufw allow proto tcp from {{ cpu_exec_ctrl_source_cidr | quote }}
+        to {{ cpu_exec_bind_ip | quote }} port {{ cpu_exec_port | default(8443) }}
+        comment 'Reliquary ctrl mTLS'
+      register: cpu_exec_api_rule
+      changed_when: "'Rule added' in cpu_exec_api_rule.stdout"
+
+    - name: Enable the firewall
+      ansible.builtin.command: ufw --force enable
+      changed_when: true
+      when: "'Status: active' not in cpu_exec_ufw.stdout"
+
+    - name: Install the immutable executor Compose specification
+      ansible.builtin.copy:
+        src: "{{ cpu_exec_repo_dir }}/docker/docker-compose.cpu-executor.yml"
+        dest: /opt/reliquary-cpu-executor/compose.yml
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart CPU executor
+
+    - name: Install the immutable runtime configuration
+      ansible.builtin.template:
+        src: "{{ cpu_exec_infra_dir }}/templates/cpu-executor.env.j2"
+        dest: /etc/reliquary/cpu-executor.env
+        owner: root
+        group: root
+        mode: "0600"
+      notify: Restart CPU executor
+
+    - name: Record the expected immutable image ID
+      ansible.builtin.copy:
+        dest: /etc/reliquary/cpu-executor-image-id
+        content: "{{ cpu_exec_image_id }}\n"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Check whether the exact executor image is already present
+      ansible.builtin.command: "docker image inspect {{ cpu_exec_image_id }}"
+      register: cpu_exec_image_present
+      changed_when: false
+      failed_when: false
+
+    - name: Stage the executor image archive
+      ansible.builtin.copy:
+        src: "{{ cpu_exec_image_archive }}"
+        dest: /var/lib/reliquary-artifacts/cpu-executor.tar.gz
+        owner: root
+        group: root
+        mode: "0600"
+      when: cpu_exec_image_present.rc != 0
+
+    - name: Verify the staged executor archive digest
+      ansible.builtin.command: >-
+        sha256sum /var/lib/reliquary-artifacts/cpu-executor.tar.gz
+      register: staged_archive_digest
+      changed_when: false
+      when: cpu_exec_image_present.rc != 0
+
+    - name: Refuse a corrupted or different executor archive
+      ansible.builtin.assert:
+        that: staged_archive_digest.stdout.split()[0] == cpu_exec_image_archive_sha256
+      when: cpu_exec_image_present.rc != 0
+
+    - name: Import the verified executor image
+      ansible.builtin.shell: |
+        set -o pipefail
+        gzip --decompress --stdout /var/lib/reliquary-artifacts/cpu-executor.tar.gz | docker image load
+      args:
+        executable: /bin/bash
+      when: cpu_exec_image_present.rc != 0
+      changed_when: true
+      notify: Restart CPU executor
+
+    - name: Verify the exact image ID exists after import
+      ansible.builtin.command: "docker image inspect {{ cpu_exec_image_id }}"
+      changed_when: false
+
+    - name: Remove the staging archive after verified import
+      ansible.builtin.file:
+        path: /var/lib/reliquary-artifacts/cpu-executor.tar.gz
+        state: absent
+
+    - name: Install the execution service and validation command
+      ansible.builtin.template:
+        src: "{{ cpu_exec_infra_dir }}/templates/reliquary-cpu-executor.service.j2"
+        dest: /etc/systemd/system/reliquary-cpu-executor.service
+        owner: root
+        group: root
+        mode: "0644"
+      notify:
+        - Reload systemd
+        - Restart CPU executor
+
+    - name: Install the host validation command
+      ansible.builtin.copy:
+        src: "{{ cpu_exec_infra_dir }}/scripts/validate_cpu_exec_01.sh"
+        dest: /usr/local/sbin/reliquary-validate-cpu-exec
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Enable required host services
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+      loop:
+        - auditd
+        - chrony
+        - docker
+        - fail2ban
+        - prometheus-node-exporter
+        - reliquary-executor-egress
+        - reliquary-cpu-executor
+
+    - name: Flush configuration handlers
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for the container health gate
+      ansible.builtin.command: >-
+        docker inspect --format {% raw %}'{{.State.Health.Status}}'{% endraw %}
+        reliquary-cpu-executor
+      register: executor_container_health
+      changed_when: false
+      retries: 40
+      delay: 5
+      until: executor_container_health.stdout == 'healthy'
+
+    - name: Run complete execution-host validation
+      ansible.builtin.command: /usr/local/sbin/reliquary-validate-cpu-exec
+      changed_when: false
+
+    - name: Check whether package upgrades require reboot
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: cpu_exec_reboot_required
+
+    - name: Report the explicit reboot gate
+      ansible.builtin.debug:
+        msg: >-
+          Host package upgrades require a reboot. Reboot, reconnect as
+          {{ cpu_exec_admin_user }}, and rerun this playbook before qualification.
+      when: cpu_exec_reboot_required.stat.exists
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+    - name: Restart Docker
+      ansible.builtin.systemd_service:
+        name: docker
+        state: restarted
+
+    - name: Reload sysctl
+      ansible.builtin.command: sysctl --system
+      changed_when: true
+
+    - name: Restart executor egress isolation
+      ansible.builtin.systemd_service:
+        name: reliquary-executor-egress
+        state: restarted
+        daemon_reload: true
+
+    - name: Restart SSH
+      ansible.builtin.systemd_service:
+        name: ssh
+        state: restarted
+
+    - name: Restart fail2ban
+      ansible.builtin.systemd_service:
+        name: fail2ban
+        state: restarted
+
+    - name: Restart node exporter
+      ansible.builtin.systemd_service:
+        name: prometheus-node-exporter
+        state: restarted
+
+    - name: Restart CPU executor
+      ansible.builtin.systemd_service:
+        name: reliquary-cpu-executor
+        state: restarted
+        daemon_reload: true

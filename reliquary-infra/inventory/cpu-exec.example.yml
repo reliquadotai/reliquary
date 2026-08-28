@@ -1,0 +1,27 @@
+---
+# Copy outside Git, replace every angle-bracket value, and pass with -i.
+all:
+  hosts:
+    cpu-exec-01:
+      ansible_host: <management-ip>
+      ansible_user: root
+      ansible_python_interpreter: /usr/bin/python3
+  vars:
+    cpu_exec_admin_user: reliquary-admin
+    cpu_exec_admin_authorized_key: <operator-public-ssh-key>
+    cpu_exec_management_cidr: <operator-ip-or-vpn-cidr>
+    cpu_exec_bind_ip: <private-execution-ip>
+    cpu_exec_ctrl_source_cidr: <ctrl-01-private-ip>/32
+    cpu_exec_image_archive: <absolute-local-artifact-tar.gz>
+    cpu_exec_image_archive_sha256: <manifest-archive-sha256>
+    cpu_exec_image_id: sha256:<manifest-image-id>
+    cpu_exec_image_revision: <manifest-git-revision>
+    cpu_exec_runtime_id: grader-sha256:<manifest-runtime-id>
+    cpu_exec_pki_source_dir: <absolute-local-pki>/cpu-executor
+
+    # AX42 prototype values. Scale pool/inflight together after measurements.
+    cpu_exec_pool_size: 16
+    cpu_exec_max_inflight: 16
+    cpu_exec_host_cpus: "7.0"
+    cpu_exec_host_memory_limit: 56g
+    cpu_exec_host_pids_limit: 8192

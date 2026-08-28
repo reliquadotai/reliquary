@@ -61,10 +61,35 @@ def test_execution_request_omits_expected_values_and_is_content_bound():
     assert "expected" not in json.dumps(payload)
     assert "compare" not in json.dumps(payload)
     assert len(request.job_id) == 64
+    assert request.protocol_version == 2
+    assert request.batch_timeout_s == 5.0
 
     payload["code"] = "def add(a, b): return 0"
     with pytest.raises(ValidationError, match="code_sha256 mismatch"):
         SandboxBatchRequest.model_validate(payload)
+
+
+def test_execution_request_has_a_bounded_overall_batch_deadline():
+    from reliquary.environment.grader.executor import (
+        MAX_EXECUTOR_BATCH_TIMEOUT_SECONDS,
+        make_sandbox_batch_request,
+    )
+
+    request = make_sandbox_batch_request(
+        runtime_id="grader-test-v1",
+        code="def add(a, b): return a + b",
+        cases=[_case(), _case(), _case()],
+        timeout_s=5.0,
+    )
+    capped = make_sandbox_batch_request(
+        runtime_id="grader-test-v1",
+        code="def add(a, b): return a + b",
+        cases=[_case() for _ in range(100)],
+        timeout_s=5.0,
+    )
+
+    assert request.batch_timeout_s == 15.0
+    assert capped.batch_timeout_s == MAX_EXECUTOR_BATCH_TIMEOUT_SECONDS
 
 
 def test_execution_contract_rejects_expected_field_on_remote_case():
@@ -184,6 +209,8 @@ def test_cpu_executor_api_validates_runtime_and_exposes_health():
     assert pool.requests == [request]
     assert health.json()["status"] == "ok"
     assert health.json()["runtime_id"] == request.runtime_id
+    assert health.json()["sandbox_backend"] == "runsc"
+    assert health.json()["sandbox_platform"] == "unknown"
     assert "grader_executor_requests_total" in metrics.text
 
 
@@ -210,6 +237,54 @@ def test_cpu_executor_api_rejects_wrong_runtime_and_extra_expected():
     assert mismatch.status_code == 409
     assert rejected.status_code == 422
     assert pool.requests == []
+
+
+def test_cpu_executor_api_rejects_overload_without_queueing():
+    from reliquary.environment.grader.remote import create_cpu_executor_app
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    class _BlockingPool(_FakePool):
+        def execute_sandbox_batch(self, request):
+            entered.set()
+            assert release.wait(timeout=5.0)
+            return super().execute_sandbox_batch(request)
+
+    request = _request()
+    pool = _BlockingPool()
+    app = create_cpu_executor_app(
+        pool,
+        runtime_id=request.runtime_id,
+        executor_id="cpu-test",
+        max_inflight=1,
+    )
+    first_status: list[int] = []
+
+    with TestClient(app) as client:
+        first = threading.Thread(
+            target=lambda: first_status.append(
+                client.post("/v1/execute", json=request.model_dump(mode="json")).status_code
+            )
+        )
+        first.start()
+        assert entered.wait(timeout=5.0)
+        overloaded = client.post(
+            "/v1/execute",
+            json=request.model_dump(mode="json"),
+        )
+        release.set()
+        first.join(timeout=5.0)
+        health = client.get("/v1/health").json()
+
+    assert first_status == [200]
+    assert overloaded.status_code == 503
+    assert health["api"] == {
+        "max_inflight": 1,
+        "inflight": 0,
+        "peak_inflight": 1,
+        "requests": {"busy": 1, "error": 0, "ok": 1},
+    }
 
 
 def test_cpu_executor_api_runs_the_existing_worker_pool(tmp_path):

@@ -2,12 +2,8 @@
 # never on the wallet/control machine.
 services:
   reliquary-cpu-executor:
-    image: ${CPU_EXECUTOR_IMAGE:-reliquary-cpu-executor:prototype}
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.cpu-executor
-      args:
-        RELIQUARY_BUILD_REVISION: ${RELIQUARY_BUILD_REVISION:-prototype}
+    image: ${CPU_EXECUTOR_IMAGE:?set the verified immutable image ID}
+    pull_policy: never
     container_name: reliquary-cpu-executor
     restart: unless-stopped
     stop_grace_period: 30s
@@ -19,17 +15,36 @@ services:
     # boundary.
     privileged: true
     cgroup: host
+    ipc: private
+    pid: private
+    # Host networking avoids Docker's port-forwarding rules bypassing the host
+    # firewall. The agent itself must bind only cpu-exec-01's private address.
+    network_mode: host
     read_only: true
     tmpfs:
       - /tmp:rw,nosuid,nodev,noexec,size=2g
       - /run:rw,nosuid,nodev,size=512m
-    pids_limit: 8192
+    pids_limit: ${RELIQUARY_CPU_EXECUTOR_HOST_PIDS_LIMIT:-8192}
+    mem_limit: ${RELIQUARY_CPU_EXECUTOR_HOST_MEMORY_LIMIT:-56g}
+    cpus: ${RELIQUARY_CPU_EXECUTOR_HOST_CPUS:-7.0}
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
 
     env_file: .env.cpu-executor
-    ports:
-      - "${RELIQUARY_CPU_EXECUTOR_BIND_IP:?set private bind IP}:${RELIQUARY_CPU_EXECUTOR_PORT:-8443}:${RELIQUARY_CPU_EXECUTOR_PORT:-8443}"
     volumes:
       - type: bind
         source: ${RELIQUARY_CPU_EXECUTOR_PKI_DIR:-./pki/cpu-executor}
         target: /etc/reliquary/pki
         read_only: true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json; p=json.load(open('/tmp/reliquary-cpu-executor-health.json')); assert not p['shutdown_complete']; assert p['workers_alive'] == p['pool_size']"
+      interval: 15s
+      timeout: 3s
+      retries: 4
+      start_period: 120s

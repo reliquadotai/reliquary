@@ -65,7 +65,7 @@ GRADER_CONTAINER_ID_PLACEHOLDER = "{container_id}"
 GRADER_HEALTH_HEARTBEAT_SECONDS = 30.0
 
 
-def runsc_worker_argv(bundle: str) -> list[str]:
+def runsc_worker_argv(bundle: str, *, platform: str | None = None) -> list[str]:
     """Production runsc argv for a sandbox worker.
 
     ``--ignore-cgroups`` is a GLOBAL flag and MUST sit before the ``run``
@@ -77,8 +77,18 @@ def runsc_worker_argv(bundle: str) -> list[str]:
     The sandbox is already bounded by the bundle rlimits + ``--network=none``
     + the server's wall-clock timeout, so the cgroup is redundant here.
     """
-    return ["runsc", "--network=none", "--ignore-cgroups", "run",
-            "--bundle", bundle, GRADER_CONTAINER_ID_PLACEHOLDER]
+    if platform not in {None, "kvm", "systrap"}:
+        raise ValueError("runsc platform must be 'kvm' or 'systrap'")
+    argv = ["runsc", "--network=none", "--ignore-cgroups"]
+    if platform is not None:
+        argv.append(f"--platform={platform}")
+    return [
+        *argv,
+        "run",
+        "--bundle",
+        bundle,
+        GRADER_CONTAINER_ID_PLACEHOLDER,
+    ]
 
 
 # How many requests one warm worker serves before it is recycled.
@@ -835,6 +845,7 @@ class GraderServer:
         request: SandboxBatchRequest,
     ) -> SandboxBatchResult:
         started = time.perf_counter()
+        batch_deadline = started + request.batch_timeout_s
         worker = self._acquire_worker(timeout=self.worker_acquire_timeout_s)
         if worker is None:
             raise SandboxExecutorError("capacity_unavailable")
@@ -843,13 +854,23 @@ class GraderServer:
         try:
             worker.in_use = True
             for case in request.cases:
+                remaining_batch_s = batch_deadline - time.perf_counter()
+                if remaining_batch_s <= 0.0:
+                    results.append(
+                        SandboxCaseResult(
+                            case_id=case.case_id,
+                            status="timeout",
+                            output=None,
+                        )
+                    )
+                    break
                 worker_request = {
                     "req_id": f"{request.job_id}:{case.case_id}",
                     "code": request.code,
                     "entry": case.entry,
                     "args": case.args,
                     "kwargs": case.kwargs,
-                    "timeout_s": request.timeout_s,
+                    "timeout_s": min(request.timeout_s, remaining_batch_s),
                 }
                 response = self._evaluate_on_worker(worker, worker_request)
                 status = str(response.get("status", "grader_error"))

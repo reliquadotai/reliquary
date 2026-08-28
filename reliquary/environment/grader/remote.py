@@ -8,6 +8,8 @@ storage credentials.
 from __future__ import annotations
 
 import argparse
+import asyncio
+import concurrent.futures
 import json
 import logging
 import os
@@ -17,12 +19,12 @@ import socket
 import ssl
 import sys
 import threading
+from contextlib import asynccontextmanager
 from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import ValidationError
-from starlette.concurrency import run_in_threadpool
 
 from reliquary.constants import GRADER_EVAL_TIMEOUT_SECONDS, GRADER_POOL_SIZE
 from reliquary.environment.grader.executor import (
@@ -39,10 +41,6 @@ from reliquary.environment.grader.server import GraderServer, runsc_worker_argv
 
 logger = logging.getLogger(__name__)
 _IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/+~-]{0,191}$")
-
-
-class _ExecutorBusy(RuntimeError):
-    pass
 
 
 def _bounded_json_response(payload: dict[str, Any], *, status_code: int) -> Response:
@@ -65,6 +63,7 @@ def create_cpu_executor_app(
     runtime_id: str,
     executor_id: str,
     max_inflight: int,
+    sandbox_platform: str = "unknown",
 ) -> FastAPI:
     if _IDENTITY_RE.fullmatch(runtime_id) is None:
         raise ValueError("invalid runtime_id")
@@ -73,16 +72,34 @@ def create_cpu_executor_app(
     if max_inflight <= 0:
         raise ValueError("max_inflight must be positive")
 
+    execution_threads = concurrent.futures.ThreadPoolExecutor(
+        max_workers=max_inflight,
+        thread_name_prefix="cpu-executor",
+    )
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        try:
+            yield
+        finally:
+            execution_threads.shutdown(wait=True, cancel_futures=True)
+
     app = FastAPI(
         title="Reliquary CPU executor",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+        lifespan=lifespan,
     )
     capacity = threading.BoundedSemaphore(max_inflight)
+    api_lock = threading.Lock()
+    api_requests = {"ok": 0, "busy": 0, "error": 0}
+    api_inflight = 0
+    api_peak_inflight = 0
 
     @app.post("/v1/execute")
     async def execute(request: Request) -> Response:
+        nonlocal api_inflight, api_peak_inflight
         content_type = request.headers.get("content-type", "")
         if content_type.split(";", 1)[0].strip().lower() != "application/json":
             raise HTTPException(status_code=415, detail="application/json required")
@@ -116,13 +133,18 @@ def create_cpu_executor_app(
         if execution_request.runtime_id != runtime_id:
             raise HTTPException(status_code=409, detail="runtime mismatch")
 
+        if not capacity.acquire(blocking=False):
+            with api_lock:
+                api_requests["busy"] += 1
+            raise HTTPException(
+                status_code=503, detail="executor capacity unavailable"
+            )
+        with api_lock:
+            api_inflight += 1
+            api_peak_inflight = max(api_peak_inflight, api_inflight)
+
         def _execute() -> SandboxBatchResult:
-            if not capacity.acquire(timeout=min(1.0, execution_request.timeout_s)):
-                raise _ExecutorBusy
-            try:
-                result = pool.execute_sandbox_batch(execution_request)
-            finally:
-                capacity.release()
+            result = pool.execute_sandbox_batch(execution_request)
             return SandboxBatchResult(
                 **{
                     **result.model_dump(mode="python"),
@@ -131,26 +153,44 @@ def create_cpu_executor_app(
             )
 
         try:
-            result = await run_in_threadpool(_execute)
-        except _ExecutorBusy as exc:
-            raise HTTPException(
-                status_code=503, detail="executor capacity unavailable"
-            ) from exc
+            result = await asyncio.get_running_loop().run_in_executor(
+                execution_threads,
+                _execute,
+            )
         except SandboxExecutorError as exc:
+            with api_lock:
+                api_requests["error"] += 1
             logger.warning(
                 "cpu executor failed job=%s reason=%s",
                 execution_request.job_id,
                 exc.reason,
             )
             raise HTTPException(status_code=503, detail="executor failure") from exc
+        finally:
+            with api_lock:
+                api_inflight -= 1
+            capacity.release()
 
         response_body = result.model_dump_json().encode("utf-8")
         if len(response_body) > MAX_EXECUTOR_RESPONSE_BYTES:
+            with api_lock:
+                api_requests["error"] += 1
             logger.warning(
                 "cpu executor response exceeded limit job=%s", execution_request.job_id
             )
             raise HTTPException(status_code=503, detail="executor response too large")
+        with api_lock:
+            api_requests["ok"] += 1
         return Response(content=response_body, media_type="application/json")
+
+    def _api_snapshot() -> dict[str, Any]:
+        with api_lock:
+            return {
+                "max_inflight": max_inflight,
+                "inflight": api_inflight,
+                "peak_inflight": api_peak_inflight,
+                "requests": dict(api_requests),
+            }
 
     @app.get("/v1/health")
     async def health() -> Response:
@@ -168,6 +208,9 @@ def create_cpu_executor_app(
                 "protocol_version": EXECUTOR_PROTOCOL_VERSION,
                 "runtime_id": runtime_id,
                 "executor_id": executor_id,
+                "sandbox_backend": "runsc",
+                "sandbox_platform": sandbox_platform,
+                "api": _api_snapshot(),
                 "pool": pool_health,
             },
             status_code=200 if status == "ok" else 503,
@@ -175,8 +218,21 @@ def create_cpu_executor_app(
 
     @app.get("/metrics")
     async def metrics() -> Response:
+        snapshot = _api_snapshot()
+        lines = [pool.metrics_text().rstrip("\n")]
+        for status, count in sorted(snapshot["requests"].items()):
+            lines.append(
+                f'reliquary_cpu_executor_http_requests_total{{status="{status}"}} {count}'
+            )
+        lines.extend(
+            [
+                f'reliquary_cpu_executor_http_inflight {snapshot["inflight"]}',
+                f'reliquary_cpu_executor_http_peak_inflight {snapshot["peak_inflight"]}',
+                f'reliquary_cpu_executor_http_max_inflight {snapshot["max_inflight"]}',
+            ]
+        )
         return Response(
-            content=pool.metrics_text(),
+            content="\n".join(lines) + "\n",
             media_type="text/plain; version=0.0.4",
         )
 
@@ -258,6 +314,12 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         default=_flag("RELIQUARY_ALLOW_UNSANDBOXED_GRADER"),
     )
+    parser.add_argument(
+        "--sandbox-platform",
+        choices=("kvm", "systrap"),
+        default=os.environ.get("RELIQUARY_RUNSC_PLATFORM", "kvm").strip().lower(),
+        help="gVisor platform: kvm on bare metal, systrap inside a VM",
+    )
     return parser.parse_args()
 
 
@@ -287,7 +349,7 @@ def main() -> None:
             raise SystemExit("unsandboxed executor may bind only to loopback")
         worker_argv = [sys.executable, "-m", "reliquary.environment.grader.worker"]
     else:
-        worker_argv = runsc_worker_argv(bundle)
+        worker_argv = runsc_worker_argv(bundle, platform=args.sandbox_platform)
 
     tls_values = (args.tls_cert, args.tls_key, args.client_ca)
     if not all(tls_values):
@@ -317,16 +379,20 @@ def main() -> None:
         runtime_id=args.runtime_id,
         executor_id=args.executor_id,
         max_inflight=max_inflight,
+        sandbox_platform=(
+            args.sandbox_platform if use_runsc else "unsandboxed-loopback"
+        ),
     )
 
     pool.start()
     try:
         logger.info(
-            "cpu executor ready host=%s port=%d pool=%d runtime=%s",
+            "cpu executor ready host=%s port=%d pool=%d runtime=%s platform=%s",
             args.host,
             args.port,
             args.pool_size,
             args.runtime_id,
+            args.sandbox_platform,
         )
         uvicorn.run(
             app,

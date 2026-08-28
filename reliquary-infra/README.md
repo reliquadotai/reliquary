@@ -1,7 +1,7 @@
 # Reliquary validator infrastructure
 
-- Status: architecture plan plus a deployed, non-authoritative `ctrl-01`
-  foundation
+- Status: deployed non-authoritative `ctrl-01` foundation plus a complete,
+  not-yet-provisioned `cpu-exec-01` deployment package
 - Evidence dates: 2026-08-21, 2026-08-25, and 2026-08-28
 - Production image revision inspected:
   ab6478f1657b9134d628c93e8816a14651910146
@@ -13,6 +13,13 @@
   proof workers, a provisioned CPU execution host, scoped GPU workload
   identity, provider adapters, signer separation, off-host backups, public
   DNS/TLS, and production cutover remain gated.
+
+The `cpu-exec-01` package now includes a pinned/hash-verified gVisor/KVM image,
+exact host-capacity admission, one-use sandboxes, mTLS PKI tooling, an immutable
+artifact builder/verifier, a deny-by-default Ansible host playbook, malicious
+corpus and load gates, and a complete host validator. The image can be built
+and stored on `ctrl-01`, but hostile execution must wait for the separate KVM
+machine.
 
 ## 2026-08-25 implementation correction
 
@@ -164,6 +171,7 @@ failures.
 - [Rom optimization review and revised next step](06-rom-optimizations-review.md)
 - [CPU control and hostile-execution split](07-cpu-control-execution-split.md)
 - [ctrl-01 deployment, qualification, and remaining gates](08-ctrl-01-deployment-report.md)
+- [cpu-exec-01 package, controls, and exact deployment gate](09-cpu-exec-01-readiness.md)
 
 ## Non-negotiable invariants
 

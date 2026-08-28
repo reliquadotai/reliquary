@@ -1,0 +1,8 @@
+table inet reliquary_executor {
+  chain output {
+    type filter hook output priority -20; policy accept;
+    ct state established,related accept
+    ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16 } reject
+    ip6 daddr { fc00::/7, fe80::/10 } reject
+  }
+}

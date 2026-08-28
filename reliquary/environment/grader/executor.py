@@ -24,12 +24,13 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-EXECUTOR_PROTOCOL_VERSION = 1
+EXECUTOR_PROTOCOL_VERSION = 2
 MAX_EXECUTOR_CODE_BYTES = 1024 * 1024
 MAX_EXECUTOR_CASES = 256
 MAX_EXECUTOR_REQUEST_BYTES = 4 * 1024 * 1024
 MAX_EXECUTOR_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_EXECUTOR_TIMEOUT_SECONDS = 30.0
+MAX_EXECUTOR_BATCH_TIMEOUT_SECONDS = 120.0
 REMOTE_EXECUTOR_TIMEOUT_HEADROOM_SECONDS = 5.0
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -125,6 +126,7 @@ def compute_sandbox_job_id(
     code_sha256: str,
     cases: list[SandboxCase],
     timeout_s: float,
+    batch_timeout_s: float,
 ) -> str:
     material = {
         "protocol_version": protocol_version,
@@ -132,6 +134,7 @@ def compute_sandbox_job_id(
         "code_sha256": code_sha256,
         "cases": [case.model_dump(mode="json") for case in cases],
         "timeout_s": timeout_s,
+        "batch_timeout_s": batch_timeout_s,
     }
     return hashlib.sha256(_canonical_json(material)).hexdigest()
 
@@ -147,6 +150,10 @@ class SandboxBatchRequest(BaseModel):
     code_sha256: str = Field(min_length=64, max_length=64)
     cases: list[SandboxCase] = Field(min_length=1, max_length=MAX_EXECUTOR_CASES)
     timeout_s: float = Field(gt=0.0, le=MAX_EXECUTOR_TIMEOUT_SECONDS)
+    batch_timeout_s: float = Field(
+        gt=0.0,
+        le=MAX_EXECUTOR_BATCH_TIMEOUT_SECONDS,
+    )
 
     @field_validator("job_id", "code_sha256")
     @classmethod
@@ -171,6 +178,8 @@ class SandboxBatchRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_content_binding(self) -> "SandboxBatchRequest":
+        if self.batch_timeout_s < self.timeout_s:
+            raise ValueError("batch timeout cannot be shorter than case timeout")
         actual_code_sha256 = hashlib.sha256(self.code.encode("utf-8")).hexdigest()
         if actual_code_sha256 != self.code_sha256:
             raise ValueError("code_sha256 mismatch")
@@ -180,6 +189,7 @@ class SandboxBatchRequest(BaseModel):
             code_sha256=self.code_sha256,
             cases=self.cases,
             timeout_s=self.timeout_s,
+            batch_timeout_s=self.batch_timeout_s,
         )
         if self.job_id != expected_job_id:
             raise ValueError("job_id mismatch")
@@ -257,12 +267,17 @@ def make_sandbox_batch_request(
         for index, case in enumerate(cases)
     ]
     code_sha256 = hashlib.sha256(code.encode("utf-8")).hexdigest()
+    batch_timeout_s = min(
+        MAX_EXECUTOR_BATCH_TIMEOUT_SECONDS,
+        max(timeout_s, timeout_s * len(sandbox_cases)),
+    )
     job_id = compute_sandbox_job_id(
         protocol_version=EXECUTOR_PROTOCOL_VERSION,
         runtime_id=runtime_id,
         code_sha256=code_sha256,
         cases=sandbox_cases,
         timeout_s=timeout_s,
+        batch_timeout_s=batch_timeout_s,
     )
     return SandboxBatchRequest(
         protocol_version=EXECUTOR_PROTOCOL_VERSION,
@@ -273,6 +288,7 @@ def make_sandbox_batch_request(
         code_sha256=code_sha256,
         cases=sandbox_cases,
         timeout_s=timeout_s,
+        batch_timeout_s=batch_timeout_s,
     )
 
 
@@ -384,7 +400,10 @@ class RemoteSandboxExecutor:
                 f"{self.endpoint}/v1/execute",
                 content=body,
                 headers={"Content-Type": "application/json"},
-                timeout=(request.timeout_s + REMOTE_EXECUTOR_TIMEOUT_HEADROOM_SECONDS),
+                timeout=(
+                    request.batch_timeout_s
+                    + REMOTE_EXECUTOR_TIMEOUT_HEADROOM_SECONDS
+                ),
             ) as response:
                 if response.status_code != 200:
                     raise SandboxExecutorError(f"http_{response.status_code}")
