@@ -2408,6 +2408,7 @@ def test_health_exposes_each_environment_window_independently():
                 "sealed_early": False,
                 "refusing_precommits": False,
             },
+            "batch_fill_offset_seconds": None,
             "accepted_receipts": 0,
             "revealed": 0,
             "revealed_terminal": 0,

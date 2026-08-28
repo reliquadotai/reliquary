@@ -980,6 +980,10 @@ class GrpoWindowBatcher:
         # derived from it, never cached, so the two cannot disagree.
         self.early_close_eligible_at: float | None = None
         self.early_close_sealed = False
+        # Shadow measurement for the fill-closed window design: seconds from
+        # window open to the first moment the training batch was fillable,
+        # i.e. B_BATCH distinct prompts admitted. Records once, never moves.
+        self.batch_fill_offset_s: float | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         # Optional callback the seal-extension coroutine polls to check
         # whether the server's submit_queue has finished draining items
@@ -1493,6 +1497,10 @@ class GrpoWindowBatcher:
                         self._early_close_refusing_precommits_locked()
                     ),
                 },
+                # Shadow input for the fill-closed window design: how far into
+                # the window the training batch first became fillable. None
+                # while it never did.
+                "batch_fill_offset_seconds": self.batch_fill_offset_s,
                 "accepted_receipts": accepted,
                 "revealed": self._upload_precommit_revealed,
                 "revealed_terminal": terminal,
@@ -1625,6 +1633,25 @@ class GrpoWindowBatcher:
             self._seal_event.set()
         return True
 
+    def _poll_batch_fill(self, now: float) -> None:
+        """Record when the training batch first became fillable.
+
+        Measurement only — it changes no decision. ``_pending`` holds graded,
+        in-zone candidates, so distinct prompts among them is exactly what a
+        batch can draw on.
+
+        Lock-free by the same reasoning as ``_early_close_possible``: this
+        runs on the event-loop thread that also serves miners, and the
+        admission locks have a convoy history. ``list()`` is one atomic copy
+        of a list the receipt cap keeps small, and reading one poll late only
+        moves the recorded offset by a tick.
+        """
+        if self.batch_fill_offset_s is not None:
+            return
+        if len({p.prompt_idx for p in list(self._pending)}) < B_BATCH:
+            return
+        self.batch_fill_offset_s = now - self.window_opened_at
+
     def poll_deadline(self) -> bool:
         """Seal an auction environment at its fixed collection deadline.
 
@@ -1636,6 +1663,7 @@ class GrpoWindowBatcher:
         if not self.difficulty_auction_enabled:
             return False
         now = self._time_fn()
+        self._poll_batch_fill(now)
         if (
             now - self.window_opened_at < WINDOW_COLLECTION_SECONDS
             and self._poll_early_close(now)
