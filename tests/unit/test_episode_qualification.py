@@ -3,12 +3,15 @@ from __future__ import annotations
 import hashlib
 import json
 
+import torch
+
 from scripts.qualify_episode_suite import (
     _artifact_digest,
     qualify_adversarial,
     qualify_cpu,
     summarize_model_environment,
 )
+from scripts.qualify_episode_training_gpu import _model_weight_sha256
 
 
 def _git_blob_sha1(value: bytes) -> str:
@@ -75,6 +78,17 @@ def test_receipt_may_include_intentionally_undownloaded_metadata(tmp_path):
     assert artifact["revision_verified"] is True
     assert artifact["revision_receipt"]["files"] == 1
     assert artifact["revision_receipt"]["receipt_files"] == 2
+
+
+def test_complete_model_weight_digest_detects_an_optimizer_change():
+    model = torch.nn.Linear(4, 3)
+    before = _model_weight_sha256(model)
+    with torch.no_grad():
+        model.weight[0, 0].add_(1.0)
+    after = _model_weight_sha256(model)
+
+    assert len(before) == 64
+    assert before != after
 
 
 def _row(reward: float, *, error=None, exact_replay=True):
