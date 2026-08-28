@@ -43,7 +43,8 @@ def test_economic_sensitivity_is_deterministic_and_marks_scope():
     assert "not production telemetry" in first["scope"]
     baseline = first["length_rows"][2]
     assert baseline["mean_completion_tokens"] == 2_000
-    assert baseline["flat_slot_capacity_index"] == 1.0
+    assert baseline["unbounded_generation_capacity_index"] == 1.0
+    assert baseline["ticketed_epoch_paid_group_index"] == 1.0
     assert baseline["gross_token_capacity_index"] == 1.0
     assert first["symmetric_gross_token_contest"][-1] == {
         "operators": 32,

@@ -14,17 +14,19 @@ import math
 from typing import Any, Mapping, Sequence
 
 
-CHECKPOINT_EPOCH_SCHEMA_VERSION = 7
-CHECKPOINT_EPOCH_CAPABILITY_ID = "checkpoint-epoch-scheduling-v7"
+CHECKPOINT_EPOCH_SCHEMA_VERSION = 8
+CHECKPOINT_EPOCH_CAPABILITY_ID = "checkpoint-epoch-scheduling-v8"
 CHECKPOINT_EPOCH_REQUIRED_WINDOW_COUNT = 16
 CHECKPOINT_EPOCH_SCHEDULE_MODE = "concurrent_checkpoint_epoch"
-CHECKPOINT_EPOCH_ADMISSION_POLICY = "signed_set_operator_rounds_v2"
-CHECKPOINT_EPOCH_VALUATION_POLICY = "robust_gated_difficulty_delta1_v1"
+CHECKPOINT_EPOCH_ADMISSION_POLICY = "self_selected_intent_operator_rounds_v1"
+CHECKPOINT_EPOCH_VALUATION_POLICY = "balanced_advantage_portfolio_v1"
 CHECKPOINT_EPOCH_RANKING_POLICY = (
-    "utility_then_operator_rounds_post_seal_beacon_v2"
+    "strata_operator_rounds_post_seal_beacon_v1"
 )
 CHECKPOINT_EPOCH_REWARD_POLICY = "selected_slot_v1"
-CHECKPOINT_EPOCH_FINALIZATION_POLICY = "ordered_lanes_atomic_epoch_v1"
+CHECKPOINT_EPOCH_FINALIZATION_POLICY = (
+    "streamed_validation_ordered_lanes_atomic_epoch_v1"
+)
 CHECKPOINT_EPOCH_COMMITMENT_SET_SCHEMA_VERSION = 1
 CHECKPOINT_EPOCH_TRAINING_MODES = frozenset(
     {
@@ -115,6 +117,8 @@ class EpochPlan:
     reward_policy: str
     finalization_policy: str
     commitments_per_operator_per_environment_lane: int
+    intent_seconds: float
+    backup_activation_fractions: tuple[float, ...]
     reveal_seconds: float
     epoch_id: str
     epoch_seed: str
@@ -684,6 +688,8 @@ def _intent_dict(
     reward_policy: str,
     finalization_policy: str,
     commitments_per_operator_per_environment_lane: int,
+    intent_seconds: float,
+    backup_activation_fractions: Sequence[float],
     reveal_seconds: float,
     environment_universes: Mapping[str, int],
 ) -> dict[str, Any]:
@@ -720,6 +726,8 @@ def _intent_dict(
         "commitments_per_operator_per_environment_lane": (
             commitments_per_operator_per_environment_lane
         ),
+        "intent_seconds": intent_seconds,
+        "backup_activation_fractions": list(backup_activation_fractions),
         "reveal_seconds": reveal_seconds,
         "environment_universes": {
             name: int(environment_universes[name])
@@ -749,6 +757,8 @@ def derive_epoch_id(
     reward_policy: str = CHECKPOINT_EPOCH_REWARD_POLICY,
     finalization_policy: str = CHECKPOINT_EPOCH_FINALIZATION_POLICY,
     commitments_per_operator_per_environment_lane: int = 16,
+    intent_seconds: float = 60.0,
+    backup_activation_fractions: Sequence[float] = (0.5, 0.75),
     reveal_seconds: float = 60.0,
     environment_universes: Mapping[str, int],
 ) -> str:
@@ -778,6 +788,8 @@ def derive_epoch_id(
         commitments_per_operator_per_environment_lane=(
             commitments_per_operator_per_environment_lane
         ),
+        intent_seconds=intent_seconds,
+        backup_activation_fractions=backup_activation_fractions,
         reveal_seconds=reveal_seconds,
         environment_universes=environment_universes,
     )
@@ -913,6 +925,8 @@ def build_epoch_plan(
     reward_policy: str = CHECKPOINT_EPOCH_REWARD_POLICY,
     finalization_policy: str = CHECKPOINT_EPOCH_FINALIZATION_POLICY,
     commitments_per_operator_per_environment_lane: int = 16,
+    intent_seconds: float = 60.0,
+    backup_activation_fractions: Sequence[float] = (0.5, 0.75),
     reveal_seconds: float = 60.0,
     experimental_capability_id: str = CHECKPOINT_EPOCH_CAPABILITY_ID,
 ) -> EpochPlan:
@@ -962,6 +976,12 @@ def build_epoch_plan(
         commitments_per_operator_per_environment_lane,
         minimum=1,
     )
+    intent_seconds = _require_number(
+        "intent_seconds", intent_seconds, minimum=0.001
+    )
+    backup_activation_fractions = _validate_backup_activation_fractions(
+        backup_activation_fractions
+    )
     reveal_seconds = _require_number(
         "reveal_seconds", reveal_seconds, minimum=0.001
     )
@@ -993,6 +1013,8 @@ def build_epoch_plan(
         commitments_per_operator_per_environment_lane=(
             commitments_per_operator_per_environment_lane
         ),
+        intent_seconds=intent_seconds,
+        backup_activation_fractions=backup_activation_fractions,
         reveal_seconds=reveal_seconds,
         environment_universes=universes,
     )
@@ -1050,6 +1072,8 @@ def build_epoch_plan(
         commitments_per_operator_per_environment_lane=(
             commitments_per_operator_per_environment_lane
         ),
+        intent_seconds=intent_seconds,
+        backup_activation_fractions=backup_activation_fractions,
         reveal_seconds=reveal_seconds,
         epoch_id=epoch_id,
         epoch_seed=epoch_seed,
@@ -1085,6 +1109,10 @@ def epoch_plan_to_dict(plan: EpochPlan) -> dict[str, Any]:
         "finalization_policy": plan.finalization_policy,
         "commitments_per_operator_per_environment_lane": (
             plan.commitments_per_operator_per_environment_lane
+        ),
+        "intent_seconds": plan.intent_seconds,
+        "backup_activation_fractions": list(
+            plan.backup_activation_fractions
         ),
         "reveal_seconds": plan.reveal_seconds,
         "epoch_id": plan.epoch_id,
@@ -1156,6 +1184,8 @@ def parse_epoch_plan(
             "reward_policy",
             "finalization_policy",
             "commitments_per_operator_per_environment_lane",
+            "intent_seconds",
+            "backup_activation_fractions",
             "reveal_seconds",
             "epoch_id",
             "epoch_seed",
@@ -1274,6 +1304,13 @@ def parse_epoch_plan(
         commitments_per_operator_per_environment_lane=(
             obj["commitments_per_operator_per_environment_lane"]
         ),
+        intent_seconds=obj["intent_seconds"],
+        backup_activation_fractions=tuple(
+            _list(
+                obj["backup_activation_fractions"],
+                "backup_activation_fractions",
+            )
+        ),
         reveal_seconds=obj["reveal_seconds"],
         epoch_id=obj["epoch_id"],
         epoch_seed=obj["epoch_seed"],
@@ -1329,6 +1366,8 @@ def validate_epoch_plan(
         commitments_per_operator_per_environment_lane=(
             plan.commitments_per_operator_per_environment_lane
         ),
+        intent_seconds=plan.intent_seconds,
+        backup_activation_fractions=plan.backup_activation_fractions,
         reveal_seconds=plan.reveal_seconds,
         environment_universes=environment_universes,
         experimental_capability_id=plan.experimental_capability_id,
@@ -1406,6 +1445,28 @@ def _require_number(name: str, value: Any, *, minimum: float) -> float:
     ):
         raise ValueError(f"{name} must be a finite number >= {minimum}")
     return float(value)
+
+
+def _validate_backup_activation_fractions(
+    value: Sequence[float],
+) -> tuple[float, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ValueError("backup_activation_fractions must be a sequence")
+    result = tuple(
+        _require_number(
+            f"backup_activation_fractions[{index}]",
+            item,
+            minimum=0.001,
+        )
+        for index, item in enumerate(value)
+    )
+    if any(item >= 1.0 for item in result):
+        raise ValueError("backup activation fractions must be below one")
+    if tuple(sorted(set(result))) != result:
+        raise ValueError(
+            "backup activation fractions must be unique and increasing"
+        )
+    return result
 
 
 def _require_hex64(name: str, value: Any) -> str:

@@ -40,10 +40,13 @@ from reliquary.constants import (
 )
 from reliquary.protocol.signatures import (
     build_envelope_binding,
+    build_epoch_generation_intent_binding,
     build_precommit_binding,
     sign_envelope,
+    sign_epoch_generation_intent,
     sign_precommit,
     verify_envelope_signature,
+    verify_epoch_generation_intent_signature,
     verify_precommit_signature,
 )
 from reliquary.protocol.submission import (
@@ -195,6 +198,50 @@ def _signed_request(
 # ---------------------------------------------------------------------------
 # 1. Canonical message determinism + field coverage
 # ---------------------------------------------------------------------------
+
+
+def test_generation_intent_signature_binds_every_pre_generation_field():
+    keypair = _new_keypair()
+
+    class _W:
+        class hotkey:
+            ss58_address = keypair.ss58_address
+
+            @staticmethod
+            def sign(message: bytes) -> bytes:
+                return keypair.sign(message)
+
+    fields = {
+        "miner_hotkey": keypair.ss58_address,
+        "operator_id": "operator-a",
+        "epoch_id": "1" * 64,
+        "manifest_sha256": "2" * 64,
+        "window_start": 500,
+        "environment": "math",
+        "prompt_idx": 42,
+        "prompt_content_sha256": "3" * 64,
+        "checkpoint_hash": "4" * 40,
+        "generation_randomness": "5" * 64,
+        "protocol_version": 99,
+        "generation_profile_id": "experimental-fixture",
+        "nonce": "intent-nonce",
+    }
+    signature = sign_epoch_generation_intent(wallet=_W, **fields).hex()
+
+    assert build_epoch_generation_intent_binding(**fields) == (
+        build_epoch_generation_intent_binding(**fields)
+    )
+    assert verify_epoch_generation_intent_signature(
+        **fields, intent_signature=signature
+    )
+    assert not verify_epoch_generation_intent_signature(
+        **{**fields, "prompt_idx": 43},
+        intent_signature=signature,
+    )
+    assert not verify_epoch_generation_intent_signature(
+        **{**fields, "generation_randomness": "6" * 64},
+        intent_signature=signature,
+    )
 
 
 def test_envelope_binding_is_deterministic():

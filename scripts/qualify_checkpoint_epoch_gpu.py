@@ -30,7 +30,10 @@ from reliquary.constants import (
 )
 from reliquary.environment.forced_sampling import u_at
 from reliquary.miner.engine import MiningEngine
-from reliquary.miner.submitter import finalize_checkpoint_epoch_commitment_v1
+from reliquary.miner.submitter import (
+    finalize_checkpoint_epoch_commitment_v1,
+    finalize_checkpoint_epoch_generation_intent_v1,
+)
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     CommitModel,
@@ -42,13 +45,15 @@ from reliquary.shared.checkpoint_epoch import (
     BeaconBinding,
     CheckpointBinding,
     ProtocolBinding,
-    SignedEpochCommitmentSet,
     WindowSchedule,
     build_epoch_plan,
-    commitment_set_sha256,
-    commitment_set_signing_bytes,
     generation_contract_sha256,
     manifest_sha256,
+)
+from reliquary.shared.checkpoint_epoch_market import (
+    SignedGenerationIntentSet,
+    generation_intent_set_sha256,
+    generation_intent_set_signing_bytes,
 )
 from reliquary.shared.modeling import load_text_generation_model, load_tokenizer
 from reliquary.validator.batcher import (
@@ -59,6 +64,10 @@ from reliquary.validator.batcher import (
     _verify_short_logprob_claim,
 )
 from reliquary.validator.server import ValidatorServer
+from reliquary.validator.prompt_content import (
+    prompt_content_sha256,
+    render_canonical_prompt,
+)
 from reliquary.validator.verifier import (
     verify_commitment_proofs,
     verify_logprobs_claim,
@@ -197,7 +206,7 @@ def _qualify_http_lane(
         {wallet.hotkey.ss58_address},
         operator_by_hotkey={wallet.hotkey.ss58_address: operator},
     )
-    server.set_checkpoint_epoch_phase("commitment")
+    server.set_checkpoint_epoch_phase("intent")
     server.set_current_state(WindowState.OPEN)
 
     async def exercise_http():
@@ -206,31 +215,46 @@ def _qualify_http_lane(
             transport=transport,
             base_url="http://offline-qualification",
         ) as client:
-            committed = (
+            intent = finalize_checkpoint_epoch_generation_intent_v1(
+                wallet=wallet,
+                operator_id=operator,
+                plan=plan,
+                window_start=epoch_window.window_number,
+                environment=environment.name,
+                prompt_idx=finalized.precommit.prompt_idx,
+                prompt_content_sha256=prompt_content_sha256(
+                    environment.name,
+                    render_canonical_prompt(
+                        tokenizer,
+                        str(environment.problem["prompt"]),
+                    ),
+                ),
+            )
+            intention = (
                 await client.post(
-                    "/submit/precommit",
-                    content=finalized.precommit.model_dump_json(),
+                    "/checkpoint-epoch/generation-intents",
+                    content=intent.model_dump_json(),
                     headers={"Content-Type": "application/json"},
                 )
             ).json()
-            if not committed.get("accepted"):
-                raise RuntimeError(f"precommit failed: {committed}")
+            if not intention.get("accepted"):
+                raise RuntimeError(f"generation intent failed: {intention}")
             server.set_checkpoint_epoch_phase("selection")
-            frozen = server.freeze_checkpoint_epoch_commitment_set(
-                commitment_close_round=close_round,
+            frozen = server.freeze_checkpoint_epoch_generation_intent_set(
+                intent_close_round=close_round,
                 validator_hotkey=wallet.hotkey.ss58_address,
             )
-            server.install_checkpoint_epoch_commitment_set(
-                SignedEpochCommitmentSet(
-                    commitment_set=frozen,
-                    commitment_set_sha256=commitment_set_sha256(frozen),
+            server.install_checkpoint_epoch_generation_intent_set(
+                SignedGenerationIntentSet(
+                    intent_set=frozen,
+                    intent_set_sha256=generation_intent_set_sha256(frozen),
                     validator_signature=wallet.hotkey.sign(
-                        commitment_set_signing_bytes(frozen)
+                        generation_intent_set_signing_bytes(frozen)
                     ).hex(),
                 )
             )
-            selected = server.select_checkpoint_epoch_reveals(
-                commitment_close_round=close_round,
+            selected = server.select_checkpoint_epoch_generation_tickets(
+                intent_close_round=close_round,
                 admission_beacon=BeaconBinding(
                     source=plan.epoch_beacon.source,
                     chain=plan.epoch_beacon.chain,
@@ -238,8 +262,20 @@ def _qualify_http_lane(
                     round=close_round + 1,
                     randomness="e" * 64,
                 ),
-                reveal_deadline_ts=time.time() + 120.0,
+                generation_deadline_ts=time.time() + 120.0,
             )
+            committed = (
+                await client.post(
+                    "/submit/precommit",
+                    content=finalized.precommit.model_dump_json(),
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Reliquary-Epoch-Intent": intention["intent_id"],
+                    },
+                )
+            ).json()
+            if not committed.get("accepted"):
+                raise RuntimeError(f"precommit failed: {committed}")
             batcher.window_opened_wall_ts = (
                 time.time() - plan.window_schedule.collection_seconds - 1.0
             )
@@ -271,6 +307,7 @@ def _qualify_http_lane(
             server._complete_upload_receipt(queued.receipt, admission)
             admission_seconds = time.perf_counter() - admission_started
             return (
+                intention,
                 committed,
                 selected,
                 revealed,
@@ -281,6 +318,7 @@ def _qualify_http_lane(
 
     close_round = plan.epoch_beacon.round + 9
     (
+        intention,
         committed,
         selected,
         revealed,
@@ -306,11 +344,12 @@ def _qualify_http_lane(
     winners, rewards = batcher.seal_batch(commit_side_effects=False)
     candidate = batcher.auction_candidates[0]
     return {
-        "precommit_accepted": committed["accepted"],
-        "selected_reveals": selected[(
+        "intent_accepted": intention["accepted"],
+        "payload_precommit_accepted": committed["accepted"],
+        "selected_primary": selected[(
             environment.name,
             epoch_window.window_number,
-        )],
+        )]["primary"],
         "reveal_accepted": bool(revealed["accepted"]),
         "candidate_admitted": admission.accepted,
         "pending_before_seal": pending_before_seal,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 import time
@@ -8,23 +9,43 @@ import time
 from fastapi.testclient import TestClient
 import pytest
 
-from reliquary.protocol.submission import RejectReason, WindowState
+from reliquary.constants import (
+    PROTOCOL_GENERATION_CONTRACT,
+    PROTOCOL_PROFILE_ID,
+    PROTOCOL_VERSION,
+)
+from reliquary.protocol.signatures import (
+    sign_epoch_generation_intent,
+    sign_precommit,
+)
+from reliquary.protocol.submission import (
+    EpochGenerationIntentRequest,
+    RejectReason,
+    SubmissionPrecommitRequest,
+    WindowState,
+)
 from reliquary.shared.checkpoint_epoch import (
     BeaconBinding,
     CheckpointBinding,
     ProtocolBinding,
-    SignedEpochCommitmentSet,
     WindowSchedule,
     build_epoch_plan,
     canonical_manifest_bytes,
-    commitment_set_sha256,
+    generation_contract_sha256,
     manifest_sha256,
+)
+from reliquary.shared.checkpoint_epoch_market import (
+    SignedGenerationIntentSet,
+    generation_intent_set_sha256,
 )
 from reliquary.validator.observability import SubmitTelemetry
 from reliquary.validator.server import ValidatorServer
 from tests.unit.test_grpo_window_batcher import _make_batcher, _request
 from tests.unit.test_validator_server import _batcher as _server_batcher
-from tests.unit.test_validator_server import _precommit_for, _request as _server_request
+from tests.unit.test_validator_server import (
+    _TestWallet,
+    _request as _server_request,
+)
 
 
 def _plan(
@@ -32,12 +53,16 @@ def _plan(
     randomness: str = "4" * 64,
     window_count: int = 2,
     environments: dict[str, int] | None = None,
+    target_groups: int = 16,
+    candidate_limit: int = 24,
 ):
     return build_epoch_plan(
         protocol=ProtocolBinding(
-            profile_id="checkpoint-epoch-test-only",
-            protocol_version=99,
-            generation_contract_sha256="1" * 64,
+            profile_id=PROTOCOL_PROFILE_ID,
+            protocol_version=PROTOCOL_VERSION,
+            generation_contract_sha256=generation_contract_sha256(
+                PROTOCOL_GENERATION_CONTRACT
+            ),
         ),
         checkpoint=CheckpointBinding(
             number=7,
@@ -62,8 +87,8 @@ def _plan(
             timeout_seconds=7200,
         ),
         training_mode="sequential_steps",
-        target_groups_per_environment_lane=16,
-        candidate_limit_per_environment_lane=24,
+        target_groups_per_environment_lane=target_groups,
+        candidate_limit_per_environment_lane=candidate_limit,
         environment_universes=environments or {"math": 1_000},
         prompt_range_size=50,
     )
@@ -86,6 +111,91 @@ def _server(plan=None):
         server.set_current_checkpoint(_checkpoint(plan))
         server.set_checkpoint_epoch_plan(plan)
     return server
+
+
+def _generation_intent(plan, batcher, request):
+    from reliquary.validator.prompt_content import prompt_content_sha256
+
+    materials = batcher.materialize_admission_problem(request.prompt_idx)
+    fields = {
+        "miner_hotkey": request.miner_hotkey,
+        "operator_id": "operator-a",
+        "epoch_id": plan.epoch_id,
+        "manifest_sha256": manifest_sha256(plan),
+        "window_start": request.window_start,
+        "environment": "fake",
+        "prompt_idx": request.prompt_idx,
+        "prompt_content_sha256": prompt_content_sha256(
+            "fake", materials.rendered_prompt
+        ),
+        "checkpoint_hash": request.checkpoint_hash,
+        "generation_randomness": batcher.randomness,
+        "protocol_version": request.protocol_version,
+        "generation_profile_id": request.generation_profile_id,
+        "nonce": "intent-nonce",
+    }
+    return EpochGenerationIntentRequest(
+        **fields,
+        intent_signature=sign_epoch_generation_intent(
+            wallet=_TestWallet, **fields
+        ).hex(),
+    )
+
+
+def _epoch_precommit_for(request, payload: bytes, randomness: str):
+    fields = {
+        "miner_hotkey": request.miner_hotkey,
+        "window_start": request.window_start,
+        "prompt_idx": request.prompt_idx,
+        "merkle_root": request.merkle_root,
+        "checkpoint_hash": request.checkpoint_hash,
+        "environment": "fake",
+        "payload_bytes": len(payload),
+        "payload_sha256": hashlib.sha256(payload).hexdigest(),
+        "drand_round": request.drand_round,
+        "randomness": randomness,
+        "protocol_version": request.protocol_version,
+        "generation_profile_id": request.generation_profile_id,
+        "nonce": request.nonce,
+    }
+    signature = sign_precommit(wallet=_TestWallet, **fields).hex()
+    fields.pop("randomness")
+    return SubmissionPrecommitRequest(
+        **fields, precommit_signature=signature
+    )
+
+
+def _select_generation_intent(server, client, plan, intent):
+    response = client.post(
+        "/checkpoint-epoch/generation-intents",
+        content=intent.model_dump_json(),
+        headers={"Content-Type": "application/json"},
+    ).json()
+    assert response["accepted"] is True
+    close_round = plan.epoch_beacon.round + 9
+    server.set_checkpoint_epoch_phase("selection")
+    frozen = server.freeze_checkpoint_epoch_generation_intent_set(
+        intent_close_round=close_round,
+        validator_hotkey="validator",
+    )
+    publication = SignedGenerationIntentSet(
+        intent_set=frozen,
+        intent_set_sha256=generation_intent_set_sha256(frozen),
+        validator_signature="aa",
+    )
+    server.install_checkpoint_epoch_generation_intent_set(publication)
+    counts = server.select_checkpoint_epoch_generation_tickets(
+        intent_close_round=close_round,
+        admission_beacon=BeaconBinding(
+            source="drand",
+            chain=plan.epoch_beacon.chain,
+            chain_hash=plan.epoch_beacon.chain_hash,
+            round=close_round + 1,
+            randomness="e" * 64,
+        ),
+        generation_deadline_ts=time.time() + 60.0,
+    )
+    return response["intent_id"], close_round, counts
 
 
 def test_disabled_surface_keeps_legacy_state_compatible():
@@ -219,224 +329,198 @@ class _EpochLaneBatcher:
         pass
 
 
-def test_epoch_commitment_cannot_upload_until_post_commit_selection():
-    plan = _plan(environments={"fake": 1_000})
+def _generation_server(plan, request):
     batcher = _server_batcher(window_start=plan.first_window)
     batcher.experimental_epoch_ranking = True
     batcher.difficulty_auction_enabled = True
     batcher.collection_seconds = plan.window_schedule.collection_seconds
     batcher.current_checkpoint_hash = plan.checkpoint.revision
+    batcher.randomness = plan.windows[0].generation_randomness
+    batcher._operator_by_hotkey = {request.miner_hotkey: "operator-a"}
+    server = ValidatorServer()
+    server._auction_admission_enabled = True
+    server.set_current_checkpoint(_checkpoint(plan))
+    server.set_checkpoint_epoch_plan(plan)
+    server.set_active_epoch_batchers({("fake", plan.first_window): batcher})
+    server.set_registered_hotkeys(
+        {request.miner_hotkey},
+        operator_by_hotkey={request.miner_hotkey: "operator-a"},
+    )
+    server.set_checkpoint_epoch_phase("intent")
+    server.set_current_state(WindowState.OPEN)
+    return server, batcher
+
+
+def test_epoch_payload_requires_a_post_freeze_generation_ticket():
+    plan = _plan(environments={"fake": 1_000})
     prompt_idx = plan.windows[0].prompt_slices[0].start
     request = _server_request(
         prompt_idx=prompt_idx,
         window_start=plan.first_window,
         checkpoint_hash=plan.checkpoint.revision,
+        randomness=plan.windows[0].generation_randomness,
         valid_merkle=True,
     )
-    batcher._operator_by_hotkey = {request.miner_hotkey: "operator-a"}
-    payload = request.model_dump_json().encode("utf-8")
-    precommit = _precommit_for(request, payload_bytes=len(payload))
-
-    server = ValidatorServer()
-    server._auction_admission_enabled = True
-    server.set_current_checkpoint(_checkpoint(plan))
-    server.set_checkpoint_epoch_plan(plan)
-    server.set_active_epoch_batchers({
-        ("fake", plan.first_window): batcher,
-    })
-    server.set_registered_hotkeys(
-        {request.miner_hotkey},
-        operator_by_hotkey={request.miner_hotkey: "operator-a"},
+    request = request.model_copy(
+        update={"generation_profile_id": plan.protocol.profile_id}
     )
-    server.set_checkpoint_epoch_phase("commitment")
-    server.set_current_state(WindowState.OPEN)
+    server, batcher = _generation_server(plan, request)
+    payload = request.model_dump_json().encode("utf-8")
+    precommit = _epoch_precommit_for(
+        request, payload, plan.windows[0].generation_randomness
+    )
 
     with TestClient(server.app) as client:
-        committed = client.post(
+        before_ticket = client.post(
             "/submit/precommit",
             content=precommit.model_dump_json(),
             headers={"Content-Type": "application/json"},
         ).json()
-        assert committed["accepted"] is True
-        assert committed["upload_deadline_ts"] is None
-        assert batcher.pending_upload_precommits == 0
-        early = client.post(
+        intent = _generation_intent(plan, batcher, request)
+        intent_id, _, _ = _select_generation_intent(
+            server, client, plan, intent
+        )
+        selected = client.post(
+            "/submit/precommit",
+            content=precommit.model_dump_json(),
+            headers={
+                "Content-Type": "application/json",
+                "X-Reliquary-Epoch-Intent": intent_id,
+            },
+        ).json()
+        server.set_checkpoint_epoch_plan(None)
+        stale = client.post(
             "/submit",
             content=payload,
             headers={
                 "Content-Type": "application/json",
-                "X-Reliquary-Precommit": committed["receipt_id"],
+                "X-Reliquary-Precommit": selected["receipt_id"],
             },
         )
 
-    assert early.json()["reason"] == RejectReason.REVEAL_NOT_SELECTED.value
-    assert batcher.proof_grading_attempts == 0
+    assert before_ticket["reason"] == RejectReason.PRECOMMIT_EXPIRED.value
+    assert selected["accepted"] is True
+    assert selected["upload_deadline_ts"] is not None
+    assert stale.status_code in {409, 503}
+    assert batcher.pending_upload_precommits == 0
 
 
-@pytest.mark.parametrize(
-    ("round_reject", "accepted"),
-    (
-        (RejectReason.STALE_ROUND, True),
-        (RejectReason.FUTURE_ROUND, False),
-    ),
-)
-def test_epoch_commitment_uses_receipt_deadline_not_stale_round_bucket(
-    round_reject,
-    accepted,
-):
-    from reliquary.validator.observability import DrandRoundObservation
-
+def test_generation_intent_set_precedes_beacon_and_is_advertised():
     plan = _plan(environments={"fake": 1_000})
-    batcher = _server_batcher(window_start=plan.first_window)
-    batcher.experimental_epoch_ranking = True
-    batcher.drand_round_check_enabled = True
-    batcher.collection_seconds = plan.window_schedule.collection_seconds
-    batcher.current_checkpoint_hash = plan.checkpoint.revision
-    batcher.observe_drand_round = lambda *_args, **_kwargs: DrandRoundObservation(
-        submitted_drand_round=100,
-        arrival_drand_round=101,
-        drand_delta=-1,
-        drand_tolerance=0,
-        drand_status=(
-            "stale" if round_reject is RejectReason.STALE_ROUND else "future"
-        ),
-        reject_reason=round_reject,
-    )
     prompt_idx = plan.windows[0].prompt_slices[0].start
     request = _server_request(
         prompt_idx=prompt_idx,
         window_start=plan.first_window,
         checkpoint_hash=plan.checkpoint.revision,
+        randomness=plan.windows[0].generation_randomness,
         valid_merkle=True,
     )
-    batcher._operator_by_hotkey = {request.miner_hotkey: "operator-a"}
-    payload = request.model_dump_json().encode("utf-8")
-    precommit = _precommit_for(request, payload_bytes=len(payload))
-    server = ValidatorServer()
-    server._auction_admission_enabled = True
-    server.set_current_checkpoint(_checkpoint(plan))
-    server.set_checkpoint_epoch_plan(plan)
-    server.set_active_epoch_batchers({("fake", plan.first_window): batcher})
-    server.set_registered_hotkeys(
-        {request.miner_hotkey},
-        operator_by_hotkey={request.miner_hotkey: "operator-a"},
+    request = request.model_copy(
+        update={"generation_profile_id": plan.protocol.profile_id}
     )
-    server.set_checkpoint_epoch_phase("commitment")
-    server.set_current_state(WindowState.OPEN)
+    server, batcher = _generation_server(plan, request)
 
     with TestClient(server.app) as client:
-        response = client.post(
-            "/submit/precommit",
-            content=precommit.model_dump_json(),
-            headers={"Content-Type": "application/json"},
-        ).json()
-
-    assert response["accepted"] is accepted
-    assert response["reason"] == (
-        RejectReason.ACCEPTED.value if accepted else round_reject.value
-    )
-
-
-def test_selected_epoch_commitment_gets_bounded_reveal_right():
-    plan = _plan(environments={"fake": 1_000})
-    batcher = _server_batcher(window_start=plan.first_window)
-    batcher.experimental_epoch_ranking = True
-    batcher.difficulty_auction_enabled = True
-    batcher.collection_seconds = plan.window_schedule.collection_seconds
-    batcher.current_checkpoint_hash = plan.checkpoint.revision
-    prompt_idx = plan.windows[0].prompt_slices[0].start
-    request = _server_request(
-        prompt_idx=prompt_idx,
-        window_start=plan.first_window,
-        checkpoint_hash=plan.checkpoint.revision,
-        valid_merkle=True,
-    )
-    batcher._operator_by_hotkey = {request.miner_hotkey: "operator-a"}
-    payload = request.model_dump_json().encode("utf-8")
-    precommit = _precommit_for(request, payload_bytes=len(payload))
-    server = ValidatorServer()
-    server._auction_admission_enabled = True
-    server.set_current_checkpoint(_checkpoint(plan))
-    server.set_checkpoint_epoch_plan(plan)
-    server.set_active_epoch_batchers({("fake", plan.first_window): batcher})
-    server.set_registered_hotkeys(
-        {request.miner_hotkey},
-        operator_by_hotkey={request.miner_hotkey: "operator-a"},
-    )
-    server.set_checkpoint_epoch_phase("commitment")
-    server.set_current_state(WindowState.OPEN)
-
-    with TestClient(server.app) as client:
-        committed = client.post(
-            "/submit/precommit",
-            content=precommit.model_dump_json(),
-            headers={"Content-Type": "application/json"},
-        ).json()
-        commitment_close_round = plan.epoch_beacon.round + 9
-        server.set_checkpoint_epoch_phase("selection")
-        frozen = server.freeze_checkpoint_epoch_commitment_set(
-            commitment_close_round=commitment_close_round,
-            validator_hotkey="validator",
-        )
-        server.install_checkpoint_epoch_commitment_set(
-            SignedEpochCommitmentSet(
-                commitment_set=frozen,
-                commitment_set_sha256=commitment_set_sha256(frozen),
-                validator_signature="aa",
-            )
-        )
-        with pytest.raises(ValueError, match="follow commitment close"):
-            server.select_checkpoint_epoch_reveals(
-                commitment_close_round=commitment_close_round,
-                admission_beacon=BeaconBinding(
-                    source="drand",
-                    chain=plan.epoch_beacon.chain,
-                    chain_hash=plan.epoch_beacon.chain_hash,
-                    round=commitment_close_round,
-                    randomness="e" * 64,
-                ),
-                reveal_deadline_ts=time.time() + 60.0,
-            )
-        counts = server.select_checkpoint_epoch_reveals(
-            commitment_close_round=commitment_close_round,
-            admission_beacon=BeaconBinding(
-                source="drand",
-                chain=plan.epoch_beacon.chain,
-                chain_hash=plan.epoch_beacon.chain_hash,
-                round=commitment_close_round + 1,
-                randomness="e" * 64,
-            ),
-            reveal_deadline_ts=time.time() + 60.0,
+        intent_id, close_round, counts = _select_generation_intent(
+            server,
+            client,
+            plan,
+            _generation_intent(plan, batcher, request),
         )
         status = client.get(
-            f"/checkpoint-epoch/commitments/{committed['receipt_id']}"
+            f"/checkpoint-epoch/generation-intents/{intent_id}"
         ).json()
         state = client.get(
             f"/state?env=fake&window={plan.first_window}"
         ).json()
-        batcher.window_opened_wall_ts = (
-            time.time() - plan.window_schedule.collection_seconds - 1.0
+        publication = client.get(
+            "/checkpoint-epoch/generation-intent-set"
         )
-        revealed = client.post(
-            "/submit",
-            content=payload,
-            headers={
-                "Content-Type": "application/json",
-                "X-Reliquary-Precommit": committed["receipt_id"],
-            },
-        ).json()
 
-    assert counts == {("fake", plan.first_window): 1}
-    assert status["status"] == "selected"
-    assert status["admission_beacon_round"] == commitment_close_round + 1
-    assert state["checkpoint_epoch_phase"] == "reveal"
-    assert state["checkpoint_epoch_admission_beacon_round"] == (
-        commitment_close_round + 1
+    assert counts[("fake", plan.first_window)]["primary"] == 1
+    assert status["status"] == "primary"
+    assert status["admission_beacon_round"] == close_round + 1
+    assert state["checkpoint_epoch_phase"] == "generation"
+    assert state["checkpoint_epoch_generation_intent_set_sha256"] == (
+        status["intent_set_sha256"]
     )
-    assert revealed["reason"] not in {
-        RejectReason.REVEAL_NOT_SELECTED.value,
-        RejectReason.PRECOMMIT_EXPIRED.value,
-    }
+    assert publication.status_code == 200
+    assert close_round < state["checkpoint_epoch_admission_beacon_round"]
+
+
+def test_standby_ticket_cannot_submit_until_its_advertised_wave():
+    plan = _plan(
+        environments={"fake": 1_000},
+        target_groups=1,
+        candidate_limit=2,
+    )
+    prompt_start = plan.windows[0].prompt_slices[0].start
+    requests = [
+        _server_request(
+            prompt_idx=prompt_start + offset,
+            window_start=plan.first_window,
+            checkpoint_hash=plan.checkpoint.revision,
+            randomness=plan.windows[0].generation_randomness,
+            valid_merkle=True,
+        ).model_copy(
+            update={"generation_profile_id": plan.protocol.profile_id}
+        )
+        for offset in range(2)
+    ]
+    server, batcher = _generation_server(plan, requests[0])
+
+    with TestClient(server.app) as client:
+        for request in requests:
+            response = client.post(
+                "/checkpoint-epoch/generation-intents",
+                content=_generation_intent(
+                    plan, batcher, request
+                ).model_dump_json(),
+                headers={"Content-Type": "application/json"},
+            ).json()
+            assert response["accepted"] is True
+        close_round = plan.epoch_beacon.round + 1
+        server.set_checkpoint_epoch_phase("selection")
+        frozen = server.freeze_checkpoint_epoch_generation_intent_set(
+            intent_close_round=close_round,
+            validator_hotkey="validator",
+        )
+        publication = SignedGenerationIntentSet(
+            intent_set=frozen,
+            intent_set_sha256=generation_intent_set_sha256(frozen),
+            validator_signature="aa",
+        )
+        server.install_checkpoint_epoch_generation_intent_set(publication)
+        server.select_checkpoint_epoch_generation_tickets(
+            intent_close_round=close_round,
+            admission_beacon=BeaconBinding(
+                source="drand",
+                chain=plan.epoch_beacon.chain,
+                chain_hash=plan.epoch_beacon.chain_hash,
+                round=close_round + 1,
+                randomness="e" * 64,
+            ),
+            generation_deadline_ts=time.time() + 60.0,
+        )
+
+    primary = next(
+        receipt
+        for receipt in server._epoch_generation_intents.values()
+        if receipt.status == "primary"
+    )
+    standby = next(
+        receipt
+        for receipt in server._epoch_generation_intents.values()
+        if receipt.status == "standby"
+    )
+    primary.status = "revealed"
+
+    first_wave = server.activate_checkpoint_epoch_backup_wave(1)
+    final_wave = server.activate_checkpoint_epoch_backup_wave(2)
+
+    assert first_wave["activated"] == 0
+    assert standby.status == "active_backup"
+    assert final_wave["activated"] == 1
 
 
 def test_real_epoch_batcher_builder_honors_each_requested_logical_window(
@@ -502,7 +586,7 @@ async def test_epoch_runner_opens_sixteen_lanes_together_then_consumes_in_order(
 
     service._build_window_batchers = build
     service._wait_for_checkpoint_epoch_phase_deadline = AsyncMock()
-    service.server.drain_checkpoint_epoch_commitments = AsyncMock()
+    service.server.drain_checkpoint_epoch_generation_intents = AsyncMock()
     admission_beacon = BeaconBinding(
         source="drand",
         chain=plan.epoch_beacon.chain,
@@ -524,8 +608,8 @@ async def test_epoch_runner_opens_sixteen_lanes_together_then_consumes_in_order(
     assert len(built) == 16
     assert len({batcher.opened_at for batcher in built}) == 1
     assert len({batcher.opened_wall for batcher in built}) == 1
-    assert service._wait_for_checkpoint_epoch_phase_deadline.await_count == 2
-    service.server.drain_checkpoint_epoch_commitments.assert_awaited_once_with()
+    assert service._wait_for_checkpoint_epoch_phase_deadline.await_count == 4
+    service.server.drain_checkpoint_epoch_generation_intents.assert_awaited_once_with()
     service._fetch_checkpoint_epoch_seal_beacon.assert_awaited_once_with(
         after_round=admission_beacon.round
     )
@@ -818,17 +902,13 @@ def test_epoch_exact_utility_ties_visit_operators_in_rounds():
     batcher.seal_batch()
 
     ranked = sorted(batcher.auction_candidates, key=lambda row: row["rank"])
-    assert [row["operator_round"] for row in ranked] == [
-        0, 0, 0,
-        1, 1, 1,
-        2, 2, 2,
-        3, 3, 3,
-    ]
-    for round_index in range(4):
+    rounds = [row["operator_round"] for row in ranked]
+    assert rounds == sorted(rounds)
+    for round_index in sorted(set(rounds)):
         rows = [
             row for row in ranked if row["operator_round"] == round_index
         ]
-        assert len({row["operator_id"] for row in rows}) == 3
+        assert len({row["operator_id"] for row in rows}) == len(rows)
 
 
 def test_epoch_valuation_does_not_inherit_production_flat_toggle(monkeypatch):

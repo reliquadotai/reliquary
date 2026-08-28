@@ -22,9 +22,11 @@ from reliquary.shared.checkpoint_epoch import (
     generation_contract_sha256,
     manifest_sha256,
 )
+from reliquary.shared.checkpoint_epoch_market import GenerationTicket
 
 
 CONTRACT = {"profile_id": "experimental-fixture", "sampling": {"temperature": 1.0}}
+INTENT_SET_SHA256 = "d" * 64
 
 
 def _plan(*, checkpoint_revision: str = "a" * 40):
@@ -131,7 +133,12 @@ def _state(plan, *, window=50, state="OPEN", **overrides):
         "checkpoint_epoch_collection_seconds": (
             plan.window_schedule.collection_seconds
         ),
-        "checkpoint_epoch_phase": "commitment",
+        "checkpoint_epoch_intent_seconds": plan.intent_seconds,
+        "checkpoint_epoch_backup_activation_fractions": list(
+            plan.backup_activation_fractions
+        ),
+        "checkpoint_epoch_phase": "generation",
+        "checkpoint_epoch_generation_intent_set_sha256": INTENT_SET_SHA256,
         "generation_profile_id": plan.protocol.profile_id,
         "protocol_version": plan.protocol.protocol_version,
         "generation_contract": CONTRACT,
@@ -144,6 +151,27 @@ def _state(plan, *, window=50, state="OPEN", **overrides):
     return values
 
 
+def _select_all(planner):
+    intents = planner.generation_intents(
+        operator_id="operator-a", miner_hotkey="miner-a"
+    )
+    tickets = tuple(
+        GenerationTicket(
+            intent_id=intent.intent_id,
+            role="primary",
+            activation_wave=0,
+            operator_round=index,
+            selection_rank=index,
+        )
+        for index, intent in enumerate(intents)
+    )
+    planner.apply_generation_tickets(
+        tickets,
+        intent_set_sha256=INTENT_SET_SHA256,
+    )
+    return tickets
+
+
 def _prepare_one(planner, plan, spec=None):
     spec = spec or _spec(plan)
     queued = planner.enqueue(
@@ -152,6 +180,7 @@ def _prepare_one(planner, plan, spec=None):
         specs=[spec],
     )
     assert len(queued) == 1
+    _select_all(planner)
     prepared = planner.prepare_next(
         lambda record: PreparedGroup(payload=_payload(record), gpu_seconds=2.5)
     )
@@ -228,6 +257,7 @@ def test_concurrent_epoch_release_polls_each_exact_lane(tmp_path):
         expected_manifest_sha256=manifest_sha256(plan),
         specs=[_spec(plan, 0), _spec(plan, 1)],
     )
+    _select_all(planner)
     first = planner.prepare_next(
         lambda record: PreparedGroup(payload=_payload(record), gpu_seconds=1.0)
     )
@@ -270,6 +300,7 @@ def test_commitment_release_is_not_limited_by_reveal_cohort_size(tmp_path):
         expected_manifest_sha256=manifest_sha256(plan),
         specs=specs,
     )
+    _select_all(planner)
     for _ in specs:
         assert planner.prepare_next(
             lambda record: PreparedGroup(
@@ -357,6 +388,7 @@ def test_prepared_payload_cannot_contain_final_selection_randomness(tmp_path):
         expected_manifest_sha256=manifest_sha256(plan),
         specs=[_spec(plan)],
     )
+    _select_all(planner)
 
     def prepare(record):
         payload = _payload(record)

@@ -28,6 +28,10 @@ from reliquary.shared.checkpoint_epoch import (
     parse_epoch_plan,
     validate_epoch_plan,
 )
+from reliquary.shared.checkpoint_epoch_market import (
+    GenerationIntent,
+    GenerationTicket,
+)
 from reliquary.protocol.signatures import verify_epoch_intent_signature
 from reliquary.validator.checkpoint_epoch_runtime import (
     canonical_signed_intent_bytes,
@@ -38,7 +42,14 @@ from reliquary.validator.checkpoint_epoch_runtime import (
 
 CHECKPOINT_EPOCH_ENDPOINT = "/checkpoint-epoch"
 CHECKPOINT_EPOCH_INTENT_ENDPOINT = "/checkpoint-epoch/intent"
-_ACTIVE = frozenset({"planned", "generating", "prepared", "releasing"})
+_ACTIVE = frozenset({
+    "intent_pending",
+    "standby",
+    "selected",
+    "generating",
+    "prepared",
+    "releasing",
+})
 _TERMINAL = frozenset({"released", "quarantined"})
 _HEX = frozenset("0123456789abcdef")
 _FORBIDDEN_RANDOMNESS_KEYS = frozenset(
@@ -172,6 +183,8 @@ class EpochWorkBinding:
     candidate_limit_per_environment_lane: int
     admission_policy: str
     commitments_per_operator_per_environment_lane: int
+    intent_seconds: float
+    backup_activation_fractions: tuple[float, ...]
     collection_seconds: float
     reveal_seconds: float
     checkpoint_number: int
@@ -202,6 +215,10 @@ class ShadowRecord:
     prepared_at: float | None = None
     released_at: float | None = None
     quarantine_reason: str | None = None
+    generation_intent_set_sha256: str | None = None
+    generation_ticket_role: str | None = None
+    generation_ticket_activation_wave: int | None = None
+    generation_ticket_selection_rank: int | None = None
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -309,7 +326,11 @@ class EpochShadowPlanner:
     def _record_from_dict(value: Mapping[str, Any]) -> ShadowRecord:
         if value.get("schema_version") != 1:
             raise ValueError("unsupported shadow record schema")
-        binding = EpochWorkBinding(**dict(value["binding"]))
+        binding_values = dict(value["binding"])
+        binding_values["backup_activation_fractions"] = tuple(
+            binding_values.get("backup_activation_fractions", ())
+        )
+        binding = EpochWorkBinding(**binding_values)
         fields = {
             key: item
             for key, item in value.items()
@@ -338,6 +359,27 @@ class EpochShadowPlanner:
             _require_digest(name, getattr(binding, name))
         if record.identity != EpochShadowPlanner._identity(binding):
             raise ValueError("shadow identity does not bind the record")
+        if record.generation_intent_set_sha256 is not None:
+            _require_digest(
+                "generation_intent_set_sha256",
+                record.generation_intent_set_sha256,
+            )
+        if record.generation_ticket_role not in {None, "primary", "backup"}:
+            raise ValueError("invalid generation ticket role")
+        ticket_values = (
+            record.generation_ticket_activation_wave,
+            record.generation_ticket_selection_rank,
+        )
+        if record.generation_ticket_role is None:
+            if any(value is not None for value in ticket_values):
+                raise ValueError("ticket metadata exists without a ticket")
+        elif any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            for value in ticket_values
+        ):
+            raise ValueError("invalid generation ticket metadata")
         if not (
             binding.prompt_slice_start <= binding.prompt_idx < binding.prompt_slice_stop
         ):
@@ -547,6 +589,10 @@ class EpochShadowPlanner:
                 commitments_per_operator_per_environment_lane=(
                     plan.commitments_per_operator_per_environment_lane
                 ),
+                intent_seconds=plan.intent_seconds,
+                backup_activation_fractions=(
+                    plan.backup_activation_fractions
+                ),
                 collection_seconds=plan.window_schedule.collection_seconds,
                 reveal_seconds=plan.reveal_seconds,
                 checkpoint_number=plan.checkpoint.number,
@@ -585,7 +631,7 @@ class EpochShadowPlanner:
             now = self._clock()
             record = ShadowRecord(
                 identity=identity,
-                status="planned",
+                status="intent_pending",
                 created_at=now,
                 updated_at=now,
                 binding=binding,
@@ -597,6 +643,90 @@ class EpochShadowPlanner:
             reserved += record.reservation_bytes
             per_window[key] += 1
         return accepted
+
+    def generation_intents(
+        self,
+        *,
+        operator_id: str,
+        miner_hotkey: str,
+    ) -> tuple[GenerationIntent, ...]:
+        """Return miner-chosen, pre-generation intents for the frozen set."""
+        self._require_enabled()
+        if not operator_id or not miner_hotkey:
+            raise ValueError("operator_id and miner_hotkey are required")
+        return tuple(
+            GenerationIntent(
+                intent_id=record.identity,
+                operator_id=operator_id,
+                miner_hotkey=miner_hotkey,
+                window_number=record.binding.window_number,
+                environment=record.binding.environment,
+                prompt_idx=record.binding.prompt_idx,
+                prompt_content_sha256=(
+                    record.binding.prompt_content_sha256
+                ),
+                generation_nonce=record.identity,
+            )
+            for record in sorted(
+                self.records("queue"), key=lambda item: item.identity
+            )
+            if record.status == "intent_pending"
+        )
+
+    def apply_generation_tickets(
+        self,
+        tickets: Sequence[GenerationTicket],
+        *,
+        intent_set_sha256: str,
+        active_backup_wave: int = 0,
+    ) -> dict[str, int]:
+        """Adopt the signed-set result before any expensive generation."""
+        self._require_enabled()
+        if (
+            isinstance(active_backup_wave, bool)
+            or not isinstance(active_backup_wave, int)
+            or active_backup_wave < 0
+        ):
+            raise ValueError("active_backup_wave must be non-negative")
+        _require_digest("intent_set_sha256", intent_set_sha256)
+        for ticket in tickets:
+            if (
+                ticket.role not in {"primary", "backup"}
+                or ticket.activation_wave < 0
+                or ticket.selection_rank < 0
+                or ticket.operator_round < 0
+                or (ticket.role == "primary" and ticket.activation_wave != 0)
+                or (ticket.role == "backup" and ticket.activation_wave < 1)
+            ):
+                raise ValueError("invalid generation ticket")
+        by_id = {ticket.intent_id: ticket for ticket in tickets}
+        if len(by_id) != len(tickets):
+            raise ValueError("duplicate generation ticket")
+        counts = {"selected": 0, "standby": 0, "not_selected": 0}
+        for path, record in self._records(self.queue_dir):
+            if record.status not in {"intent_pending", "standby"}:
+                continue
+            ticket = by_id.get(record.identity)
+            if ticket is None:
+                self._quarantine(path, record, "intent_not_selected")
+                counts["not_selected"] += 1
+                continue
+            active = (
+                ticket.role == "primary"
+                or ticket.activation_wave <= active_backup_wave
+            )
+            updated = replace(
+                record,
+                status="selected" if active else "standby",
+                updated_at=self._clock(),
+                generation_intent_set_sha256=intent_set_sha256,
+                generation_ticket_role=ticket.role,
+                generation_ticket_activation_wave=ticket.activation_wave,
+                generation_ticket_selection_rank=ticket.selection_rank,
+            )
+            self._write(path, self._record_dict(updated))
+            counts[updated.status] += 1
+        return counts
 
     @staticmethod
     def _validate_payload(record: ShadowRecord, payload: Mapping[str, Any]) -> None:
@@ -652,7 +782,7 @@ class EpochShadowPlanner:
         planned = [
             (path, record)
             for path, record in self._records(self.queue_dir)
-            if record.status == "planned"
+            if record.status == "selected"
         ]
         if not planned:
             return None
@@ -756,6 +886,16 @@ class EpochShadowPlanner:
                 binding.collection_seconds,
                 "admission_policy_changed",
             ),
+            (
+                "checkpoint_epoch_intent_seconds",
+                binding.intent_seconds,
+                "admission_policy_changed",
+            ),
+            (
+                "checkpoint_epoch_backup_activation_fractions",
+                list(binding.backup_activation_fractions),
+                "admission_policy_changed",
+            ),
             ("checkpoint_n", binding.checkpoint_number, "checkpoint_changed"),
             (
                 "checkpoint_repo_id",
@@ -771,6 +911,14 @@ class EpochShadowPlanner:
         for field, value, reason in expected:
             if _get(state, field) != value:
                 return reason
+        if (
+            record.generation_intent_set_sha256 is not None
+            and _get(
+                state, "checkpoint_epoch_generation_intent_set_sha256"
+            )
+            != record.generation_intent_set_sha256
+        ):
+            return "generation_intent_set_changed"
         if EpochShadowPlanner._contract_hash(state) != (
             binding.generation_contract_sha256
         ):
@@ -798,9 +946,9 @@ class EpochShadowPlanner:
         except (TypeError, ValueError):
             return []
         live_open = _state_text(_get(live_state, "state", "")) == "open"
-        commitment_open = (
+        generation_open = (
             _state_text(_get(live_state, "checkpoint_epoch_phase", ""))
-            == "commitment"
+            == "generation"
         )
         released: list[Path] = []
         for path, record in self._records(self.queue_dir):
@@ -810,7 +958,7 @@ class EpochShadowPlanner:
             if (
                 live_window != binding.window_number
                 or not live_open
-                or not commitment_open
+                or not generation_open
             ):
                 continue
             if _get(live_state, "randomness") != binding.generation_randomness:
@@ -957,7 +1105,28 @@ class EpochShadowPlanner:
                 record.status in {"prepared", "released"} for record in all_records
             ),
             "valid_groups_released_local": len(released),
-            "discarded_stale_work": len(quarantined),
+            "generation_intents_planned": len(all_records),
+            "primary_tickets": sum(
+                record.generation_ticket_role == "primary"
+                for record in all_records
+            ),
+            "backup_tickets": sum(
+                record.generation_ticket_role == "backup"
+                for record in all_records
+            ),
+            "unselected_intents": sum(
+                record.quarantine_reason == "intent_not_selected"
+                for record in quarantined
+            ),
+            "discarded_generated_work": sum(
+                (record.actual_gpu_seconds or 0.0) > 0.0
+                for record in quarantined
+            ),
+            "discarded_stale_work": sum(
+                record.quarantine_reason not in {"intent_not_selected"}
+                for record in quarantined
+            ),
+            "quarantined_records": len(quarantined),
             "queue_groups": len(queue),
             "queue_bytes": sum(record.reservation_bytes for record in queue),
             "queue_age_seconds": max(ages) if ages else None,

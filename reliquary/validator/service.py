@@ -38,9 +38,11 @@ from reliquary.constants import (
     DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR,
     ENVIRONMENT_MIX,
     EXPERIMENTAL_CHECKPOINT_EPOCH_CANDIDATES_PER_LANE,
+    EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_ACTIVATION_FRACTIONS,
     EXPERIMENTAL_CHECKPOINT_EPOCH_COLLECTION_SECONDS,
     EXPERIMENTAL_CHECKPOINT_EPOCH_COMMITMENTS_PER_OPERATOR_PER_LANE,
     EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED,
+    EXPERIMENTAL_CHECKPOINT_EPOCH_INTENT_SECONDS,
     EXPERIMENTAL_CHECKPOINT_EPOCH_REVEAL_SECONDS,
     EXPERIMENTAL_CHECKPOINT_EPOCH_TRAINING_MODE,
     EXPERIMENTAL_CHECKPOINT_EPOCH_WARMUP_ROUNDS,
@@ -113,12 +115,14 @@ from reliquary.shared.checkpoint_epoch import (
     EpochPlan,
     EpochWindow,
     ProtocolBinding,
-    SignedEpochCommitmentSet,
     WindowSchedule,
-    commitment_set_sha256,
-    commitment_set_signing_bytes,
     generation_contract_sha256,
     manifest_sha256,
+)
+from reliquary.shared.checkpoint_epoch_market import (
+    SignedGenerationIntentSet,
+    generation_intent_set_sha256,
+    generation_intent_set_signing_bytes,
 )
 from reliquary.validator import telemetry
 from reliquary.validator.batcher import GrpoWindowBatcher
@@ -1864,6 +1868,10 @@ class ValidationService:
             != CHECKPOINT_EPOCH_FINALIZATION_POLICY
             or plan.commitments_per_operator_per_environment_lane
             != EXPERIMENTAL_CHECKPOINT_EPOCH_COMMITMENTS_PER_OPERATOR_PER_LANE
+            or plan.intent_seconds
+            != EXPERIMENTAL_CHECKPOINT_EPOCH_INTENT_SECONDS
+            or plan.backup_activation_fractions
+            != EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_ACTIVATION_FRACTIONS
             or plan.reveal_seconds
             != EXPERIMENTAL_CHECKPOINT_EPOCH_REVEAL_SECONDS
             or plan.candidate_limit_per_environment_lane
@@ -1996,6 +2004,10 @@ class ValidationService:
                 finalization_policy=CHECKPOINT_EPOCH_FINALIZATION_POLICY,
                 commitments_per_operator_per_environment_lane=(
                     EXPERIMENTAL_CHECKPOINT_EPOCH_COMMITMENTS_PER_OPERATOR_PER_LANE
+                ),
+                intent_seconds=EXPERIMENTAL_CHECKPOINT_EPOCH_INTENT_SECONDS,
+                backup_activation_fractions=(
+                    EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_ACTIVATION_FRACTIONS
                 ),
                 reveal_seconds=EXPERIMENTAL_CHECKPOINT_EPOCH_REVEAL_SECONDS,
                 environment_universes={
@@ -2476,7 +2488,7 @@ class ValidationService:
         self._window_preparation_stage = None
         self.server.clear_window_preparation_failure()
         self._publish_window_preparation_state()
-        self.server.set_checkpoint_epoch_phase("commitment")
+        self.server.set_checkpoint_epoch_phase("intent")
         self._set_state(WindowState.OPEN)
 
     async def _run_checkpoint_epoch(self) -> None:
@@ -2575,85 +2587,115 @@ class ValidationService:
             self._activate_checkpoint_epoch(activation_chain_info)
             activated = True
 
-            self._window_iteration_stage = "checkpoint_epoch_commitment"
-            commitment_started_at = time.monotonic()
-            publish_pipeline(phase="commitment")
+            self._window_iteration_stage = "checkpoint_epoch_intent"
+            intent_started_at = time.monotonic()
+            publish_pipeline(phase="intent")
             await self._wait_for_checkpoint_epoch_phase_deadline(
-                seconds_from_open=plan.window_schedule.collection_seconds
+                duration_seconds=plan.intent_seconds
             )
             publish_pipeline(
                 phase="selection",
-                commitment_seconds=round(
-                    max(0.0, time.monotonic() - commitment_started_at),
+                intent_seconds=round(
+                    max(0.0, time.monotonic() - intent_started_at),
                     6,
                 ),
             )
-            # Close ingress synchronously before any await. Requests already
-            # inside the HTTP handler are drained; later ones see selection and
-            # cannot enter the frozen set.
+            # Close intent ingress synchronously before any await, freeze the
+            # exact population, and only then fetch beacon A. A miner therefore
+            # cannot decide what to generate after seeing admission randomness.
             self.server.set_checkpoint_epoch_phase("selection")
-            await self.server.drain_checkpoint_epoch_commitments()
-            _, commitment_close_round = await self._checkpoint_epoch_drand_snapshot()
-            frozen_set = self.server.freeze_checkpoint_epoch_commitment_set(
-                commitment_close_round=commitment_close_round,
+            await self.server.drain_checkpoint_epoch_generation_intents()
+            _, intent_close_round = await self._checkpoint_epoch_drand_snapshot()
+            frozen_set = self.server.freeze_checkpoint_epoch_generation_intent_set(
+                intent_close_round=intent_close_round,
                 validator_hotkey=str(self.wallet.hotkey.ss58_address),
             )
-            publication = SignedEpochCommitmentSet(
-                commitment_set=frozen_set,
-                commitment_set_sha256=commitment_set_sha256(frozen_set),
+            publication = SignedGenerationIntentSet(
+                intent_set=frozen_set,
+                intent_set_sha256=generation_intent_set_sha256(frozen_set),
                 validator_signature=self.wallet.hotkey.sign(
-                    commitment_set_signing_bytes(frozen_set)
+                    generation_intent_set_signing_bytes(frozen_set)
                 ).hex(),
             )
             store = self._checkpoint_epoch_store
             if store is None:
                 raise RuntimeError("checkpoint epoch store is unavailable")
-            store.install_commitment_set(plan, publication)
-            self.server.install_checkpoint_epoch_commitment_set(publication)
+            store.install_generation_intent_set(plan, publication)
+            self.server.install_checkpoint_epoch_generation_intent_set(publication)
             _, admission_beacon = await self._fetch_checkpoint_epoch_admission_beacon(
-                commitment_close_round=commitment_close_round,
+                commitment_close_round=intent_close_round,
             )
-            reveal_deadline_ts = time.time() + plan.reveal_seconds
-            selected_counts = self.server.select_checkpoint_epoch_reveals(
-                commitment_close_round=commitment_close_round,
+            generation_deadline_ts = (
+                time.time() + plan.window_schedule.collection_seconds
+            )
+            selected_counts = self.server.select_checkpoint_epoch_generation_tickets(
+                intent_close_round=intent_close_round,
                 admission_beacon=admission_beacon,
-                reveal_deadline_ts=reveal_deadline_ts,
+                generation_deadline_ts=generation_deadline_ts,
+            )
+            primary_count = sum(
+                counts["primary"] for counts in selected_counts.values()
+            )
+            standby_count = sum(
+                counts["standby"] for counts in selected_counts.values()
             )
             logger.info(
-                "Checkpoint epoch %s commitments closed lanes=%d "
-                "commit_round=%d admission_round=%d selected=%d",
+                "Checkpoint epoch %s intents closed lanes=%d "
+                "intent_round=%d admission_round=%d primary=%d standby=%d",
                 plan.epoch_id[:12],
                 plan.window_count,
-                commitment_close_round,
+                intent_close_round,
                 admission_beacon.round,
-                sum(selected_counts.values()),
+                primary_count,
+                standby_count,
             )
 
-            self._window_iteration_stage = "checkpoint_epoch_reveal"
-            reveal_started_at = time.monotonic()
+            self._window_iteration_stage = "checkpoint_epoch_generation"
+            generation_started_at = time.monotonic()
             publish_pipeline(
-                phase="reveal",
+                phase="generation",
                 admission_beacon_round=admission_beacon.round,
-                selected_reveals=sum(selected_counts.values()),
+                selected_primary=primary_count,
+                selected_standby=standby_count,
             )
+            previous_fraction = 0.0
+            backup_metrics: list[dict[str, int]] = []
+            for wave, fraction in enumerate(
+                plan.backup_activation_fractions, start=1
+            ):
+                await self._wait_for_checkpoint_epoch_phase_deadline(
+                    duration_seconds=(
+                        plan.window_schedule.collection_seconds
+                        * (fraction - previous_fraction)
+                    )
+                )
+                backup_metrics.append(
+                    self.server.activate_checkpoint_epoch_backup_wave(wave)
+                )
+                previous_fraction = fraction
             await self._wait_for_checkpoint_epoch_phase_deadline(
-                duration_seconds=plan.reveal_seconds
+                duration_seconds=(
+                    plan.window_schedule.collection_seconds
+                    * (1.0 - previous_fraction)
+                )
             )
+            self.server.set_checkpoint_epoch_phase("sealing")
             publish_pipeline(
                 phase="sealing",
-                reveal_seconds=round(
-                    max(0.0, time.monotonic() - reveal_started_at),
+                generation_seconds=round(
+                    max(0.0, time.monotonic() - generation_started_at),
                     6,
                 ),
+                backup_waves=backup_metrics,
             )
             self._set_state(WindowState.TRAINING)
             for batcher in self._active_batchers.values():
-                batcher.force_seal("checkpoint_epoch_reveal_closed")
+                batcher.force_seal("checkpoint_epoch_generation_closed")
             drain_timeouts = await self._freeze_auction_populations(
                 list(self._active_batchers.values())
             )
             if any(drain_timeouts.values()):
-                raise RuntimeError("checkpoint epoch reveal drain timed out")
+                raise RuntimeError("checkpoint epoch generation drain timed out")
 
             late_drops = dict(self._late_drops)
             self._late_drops.clear()

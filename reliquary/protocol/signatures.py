@@ -32,6 +32,7 @@ ENVELOPE_DOMAIN = b"reliquary-envelope-v1"
 ENVELOPE_DOMAIN_V3 = b"reliquary-envelope-v3"
 PRECOMMIT_DOMAIN = b"reliquary-upload-precommit-v2"
 PRECOMMIT_DOMAIN_V3 = b"reliquary-upload-precommit-v3"
+EPOCH_GENERATION_INTENT_DOMAIN = b"reliquary-checkpoint-epoch-generation-intent-v1"
 
 
 def hash_commitments(commitments: list[dict]) -> bytes:
@@ -403,6 +404,88 @@ def verify_precommit_signature(
         return False
 
 
+def build_epoch_generation_intent_binding(
+    *,
+    miner_hotkey: str,
+    operator_id: str,
+    epoch_id: str,
+    manifest_sha256: str,
+    window_start: int,
+    environment: str,
+    prompt_idx: int,
+    prompt_content_sha256: str,
+    checkpoint_hash: str,
+    generation_randomness: str,
+    protocol_version: int,
+    generation_profile_id: str,
+    nonce: str,
+) -> bytes:
+    """Bind one miner-selected prompt claim before payload generation."""
+
+    def lp(value: bytes) -> bytes:
+        return len(value).to_bytes(4, "big") + value
+
+    def hex_bytes(name: str, value: str) -> bytes:
+        normalized = str(value).lower()
+        if len(normalized) != 64 or any(
+            character not in "0123456789abcdef" for character in normalized
+        ):
+            raise ValueError(f"{name} must be lowercase SHA-256")
+        return bytes.fromhex(normalized)
+
+    fields = (
+        miner_hotkey.encode("utf-8"),
+        operator_id.encode("utf-8"),
+        hex_bytes("epoch_id", epoch_id),
+        hex_bytes("manifest_sha256", manifest_sha256),
+        int(window_start).to_bytes(8, "big", signed=False),
+        environment.encode("utf-8"),
+        int(prompt_idx).to_bytes(8, "big", signed=False),
+        hex_bytes("prompt_content_sha256", prompt_content_sha256),
+        checkpoint_hash.encode("utf-8"),
+        hex_bytes("generation_randomness", generation_randomness),
+        int(protocol_version).to_bytes(8, "big", signed=False),
+        generation_profile_id.encode("utf-8"),
+        nonce.encode("utf-8"),
+    )
+    digest = hashlib.sha256()
+    digest.update(EPOCH_GENERATION_INTENT_DOMAIN)
+    for field in fields:
+        digest.update(lp(field))
+    return digest.digest()
+
+
+def sign_epoch_generation_intent(*, wallet, **binding_fields) -> bytes:
+    if bt is None:
+        raise ImportError("bittensor is required for signing")
+    if not hasattr(wallet, "hotkey") or not hasattr(wallet.hotkey, "sign"):
+        raise TypeError("Wallet must provide hotkey.sign()")
+    return wallet.hotkey.sign(
+        build_epoch_generation_intent_binding(**binding_fields)
+    )
+
+
+def verify_epoch_generation_intent_signature(
+    *, intent_signature: str, **binding_fields
+) -> bool:
+    if bt is None or not intent_signature:
+        return False
+    try:
+        message = build_epoch_generation_intent_binding(**binding_fields)
+        keypair = bt.Keypair(  # type: ignore[union-attr]
+            ss58_address=binding_fields["miner_hotkey"]
+        )
+        return bool(
+            keypair.verify(
+                data=message,
+                signature=bytes.fromhex(intent_signature),
+            )
+        )
+    except Exception as exc:
+        logger.debug("epoch generation-intent signature failed: %s", exc)
+        return False
+
+
 def verify_epoch_commitment_set_signature(
     publication,
     *,
@@ -432,6 +515,38 @@ def verify_epoch_commitment_set_signature(
         )
     except Exception as exc:
         logger.debug("epoch commitment-set signature verify failed: %s", exc)
+        return False
+
+
+def verify_epoch_generation_intent_set_signature(
+    publication,
+    *,
+    expected_validator_hotkey: str,
+) -> bool:
+    """Verify the frozen pre-generation intent population."""
+    if bt is None or not expected_validator_hotkey:
+        return False
+    try:
+        from reliquary.shared.checkpoint_epoch_market import (
+            canonical_signed_generation_intent_set_bytes,
+            generation_intent_set_signing_bytes,
+        )
+
+        canonical_signed_generation_intent_set_bytes(publication)
+        intent_set = publication.intent_set
+        if intent_set.validator_hotkey != expected_validator_hotkey:
+            return False
+        keypair = bt.Keypair(  # type: ignore[union-attr]
+            ss58_address=expected_validator_hotkey
+        )
+        return bool(
+            keypair.verify(
+                data=generation_intent_set_signing_bytes(intent_set),
+                signature=bytes.fromhex(publication.validator_signature),
+            )
+        )
+    except Exception as exc:
+        logger.debug("epoch generation intent-set signature verify failed: %s", exc)
         return False
 
 
