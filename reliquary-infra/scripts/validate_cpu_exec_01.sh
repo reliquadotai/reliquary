@@ -32,8 +32,24 @@ test "$(docker inspect --format '{{.State.Health.Status}}' "${CONTAINER_ID}")" =
 test "$(docker inspect --format '{{.Image}}' "${CONTAINER_ID}")" = "${EXPECTED_IMAGE_ID}"
 test "$(docker inspect --format '{{.HostConfig.NetworkMode}}' "${CONTAINER_ID}")" = host
 test "$(docker inspect --format '{{.HostConfig.Privileged}}' "${CONTAINER_ID}")" = true
-! docker inspect --format '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}' \
-  "${CONTAINER_ID}" | grep -Eq 'docker\.sock|/root|/home|/etc($|/)|/var/lib($|/)'
+test "$(docker inspect "${CONTAINER_ID}" | jq '[
+  .[0].Mounts[]
+  | select(
+      .Type != "bind"
+      or .Source != "/etc/reliquary/cpu-executor-pki"
+      or .Destination != "/etc/reliquary/pki"
+      or .RW != false
+    )
+] | length')" = 0
+test "$(docker inspect "${CONTAINER_ID}" | jq '[
+  .[0].Mounts[]
+  | select(
+      .Type == "bind"
+      and .Source == "/etc/reliquary/cpu-executor-pki"
+      and .Destination == "/etc/reliquary/pki"
+      and .RW == false
+    )
+] | length')" = 1
 
 ss -H -lnt | awk '{print $4}' | grep -Fxq "${EXPECTED_BIND_IP}:${EXPECTED_PORT}"
 ! ss -H -lnt | awk '{print $4}' | grep -Eq "^(0\.0\.0\.0|\[::\]):${EXPECTED_PORT}$"

@@ -54,6 +54,7 @@ ARCHIVE_PATH="${OUTPUT_DIR}/reliquary-cpu-executor-${REVISION}.tar.gz"
 docker build \
   --progress plain \
   --platform linux/amd64 \
+  --network host \
   --build-arg "RELIQUARY_BUILD_REVISION=${REVISION}" \
   --build-arg "RUNSC_RELEASE=${RUNSC_RELEASE}" \
   --build-arg "RUNSC_SHA256=${RUNSC_SHA256}" \
