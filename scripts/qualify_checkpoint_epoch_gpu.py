@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 import bittensor as bt
 import httpx
+from pydantic import ValidationError
 import torch
 
 from reliquary.constants import (
@@ -30,7 +31,11 @@ from reliquary.constants import (
 from reliquary.environment.forced_sampling import u_at
 from reliquary.miner.engine import MiningEngine
 from reliquary.miner.submitter import finalize_checkpoint_epoch_commitment_v1
-from reliquary.protocol.submission import BatchSubmissionRequest, WindowState
+from reliquary.protocol.submission import (
+    BatchSubmissionRequest,
+    CommitModel,
+    WindowState,
+)
 from reliquary.protocol.profiles import resolve_protocol_profile
 from reliquary.protocol.tokens import encode_prompt
 from reliquary.shared.checkpoint_epoch import (
@@ -349,7 +354,11 @@ def main() -> None:
     prompt_idx = prompt_slice.start
     problem = {
         "id": "offline-qualification",
-        "prompt": "Compute 17 * 23 and place the final answer in a box.",
+        "prompt": (
+            "Solve this arithmetic problem carefully and show the intermediate "
+            "calculation so another reader can verify it. Compute 17 * 23, "
+            "then place the final numerical answer in a boxed expression."
+        ),
         "ground_truth": "391",
     }
 
@@ -358,6 +367,8 @@ def main() -> None:
         profile.model_id,
         revision=profile.model_revision,
     )
+    if len(encode_prompt(tokenizer, problem["prompt"])) < CHALLENGE_K:
+        raise SystemExit("qualification prompt must cover the proof challenge")
     model = load_text_generation_model(
         profile.model_id,
         revision=profile.model_revision,
@@ -413,6 +424,13 @@ def main() -> None:
         window_number=window.window_number,
         checkpoint_revision=profile.model_revision,
     )
+    for rollout_index, rollout in enumerate(request.rollouts):
+        try:
+            CommitModel.model_validate(rollout.commit)
+        except ValidationError as exc:
+            raise RuntimeError(
+                f"rollout {rollout_index} commit schema failed: {exc}"
+            ) from exc
     finalized = finalize_checkpoint_epoch_commitment_v1(
         request,
         plan=plan,
