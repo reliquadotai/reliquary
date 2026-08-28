@@ -401,3 +401,67 @@ def verify_precommit_signature(
     except Exception as exc:
         logger.debug("precommit signature verify failed: %s", exc)
         return False
+
+
+def verify_epoch_commitment_set_signature(
+    publication,
+    *,
+    expected_validator_hotkey: str,
+) -> bool:
+    """Verify the frozen epoch commitment set against the expected validator."""
+    if bt is None or not expected_validator_hotkey:
+        return False
+    try:
+        from reliquary.shared.checkpoint_epoch import (
+            commitment_set_signing_bytes,
+            validate_signed_commitment_set,
+        )
+
+        validate_signed_commitment_set(publication)
+        commitment_set = publication.commitment_set
+        if commitment_set.validator_hotkey != expected_validator_hotkey:
+            return False
+        keypair = bt.Keypair(  # type: ignore[union-attr]
+            ss58_address=expected_validator_hotkey
+        )
+        return bool(
+            keypair.verify(
+                data=commitment_set_signing_bytes(commitment_set),
+                signature=bytes.fromhex(publication.validator_signature),
+            )
+        )
+    except Exception as exc:
+        logger.debug("epoch commitment-set signature verify failed: %s", exc)
+        return False
+
+
+def verify_epoch_intent_signature(
+    publication,
+    *,
+    expected_validator_hotkey: str,
+) -> bool:
+    """Verify the immutable pre-beacon intent against the validator hotkey."""
+    if bt is None or not expected_validator_hotkey:
+        return False
+    try:
+        from reliquary.validator.checkpoint_epoch_runtime import (
+            canonical_signed_intent_bytes,
+            intent_signing_bytes,
+        )
+
+        # Canonical encoding validates the digest, hotkey and signature shape.
+        canonical_signed_intent_bytes(publication)
+        if publication.validator_hotkey != expected_validator_hotkey:
+            return False
+        keypair = bt.Keypair(  # type: ignore[union-attr]
+            ss58_address=expected_validator_hotkey
+        )
+        return bool(
+            keypair.verify(
+                data=intent_signing_bytes(publication.intent),
+                signature=bytes.fromhex(publication.validator_signature),
+            )
+        )
+    except Exception as exc:
+        logger.debug("epoch intent signature verify failed: %s", exc)
+        return False

@@ -25,8 +25,10 @@ before OPEN, or add a production submission transport to the reference planner.
 
 1. The immutable checkpoint revision is installed and its proof replicas are
    coherent.
-2. The validator observes drand round `R0`, durably fixes the intent for
-   `R1 = R0 + 1`, and confirms that intent locally before `R1` is available.
+2. The validator observes drand round `R0`, durably fixes and signs the intent
+   for `R1 = R0 + 1`, then confirms from a second round observation that those
+   durable bytes preceded `R1`. It exposes the canonical signed bytes while
+   `R1` is still unavailable.
 3. The validator fetches and verifies exactly `R1`; a different round is never
    substituted.
 4. That beacon derives the epoch root, all 16 generation seeds, and every
@@ -40,10 +42,10 @@ before OPEN, or add a production submission transport to the reference planner.
 7. Miners retain generated payloads locally and send only their signed compact
    commitments during the common commitment phase.
 8. After that phase closes, the validator drains the bounded compact requests
-   already at ingress before obtaining fresh public beacon A. That beacon
-   deterministically selects a bounded reveal cohort without using commitment
-   arrival time. Selection visits the canonical operator identities in
-   deterministic rounds.
+   already at ingress, freezes their complete canonical set, signs it, persists
+   it, and exposes those exact bytes. Only then does it target fresh public
+   beacon A. The signed-set hash is an input to arrival-neutral selection,
+   which visits canonical operator identities in deterministic rounds.
 9. Only selected commitments may upload their exact committed payload during
    the manifest-bound reveal interval. The validator then freezes and drains
    those reveals.
@@ -103,11 +105,18 @@ validation of any lane. Changing the checkpoint, contract, beacon, schedule,
 training mode, horizon, offset, logical window, environment, or dataset binding
 changes the appropriate identifier, seed, or manifest hash.
 
-The validator persists a create-only pre-beacon intent and then a create-only
-manifest. Restart recovery reloads the same canonical bytes. Local persistence
-is the strongest locally verifiable commit-before-beacon rule available here;
-it is not a public proof of prior commitment. Public signed intent publication
-and consistency observation remain production gates.
+The validator persists a create-only signed pre-beacon intent and then a
+create-only manifest. The narrow `/checkpoint-epoch/intent` endpoint exposes
+the signed intent while the target beacon is still pending. A miner verifies
+the validator signature, canonical bytes, ETag, exact plan derivation, and the
+independent drand signature before adopting a plan. Restart recovery reloads
+the same canonical bytes.
+
+This gives observers a consistency surface but not a consensus timestamp for
+the HTTP publication. The locally fsynced second-round observation is still a
+validator assertion. A production revision must define independent observation
+or another trustless checkpoint-commit timestamp; this prototype does not
+claim stronger ordering than the infrastructure can prove.
 
 ## Concurrent commitment, selection, and reveal
 
@@ -115,11 +124,14 @@ The 16 entries are logical lanes inside one physical OPEN phase; they do not
 open one after another. A miner queries
 `/state?env=<name>&window=<number>` for each lane it intends to release.
 
-Preparing work does not send its payload. During the commitment phase the miner
-submits the existing signed precommit envelope, which binds the exact serialized
-payload hash, size, prompt, lane, checkpoint, profile, and generation inputs.
-The validator stores that compact object without reserving proof or grading
-capacity. A payload sent before selection is refused.
+Preparing work does not send its payload. At exact commitment OPEN, the miner
+revalidates live state and finalizes fresh drand-round, nonce, envelope signature
+and precommit signature fields. It durably keeps those exact reveal bytes, then
+sends only the compact precommit that binds their hash, size, prompt, lane,
+checkpoint, profile, and generation inputs. The shared finalizer exists so a
+prepared body is never reused with stale transport freshness. The validator
+stores the compact object without reserving proof or grading capacity. A
+payload sent before selection is refused.
 
 After beacon A, miners poll the narrow commitment-status endpoint. A selected
 commitment receives one bounded reveal deadline; a non-selected commitment
@@ -149,8 +161,16 @@ deadline remains authoritative in every early-close mode.
 
 The local reference planner is bounded and has no submission transport. A
 backend-neutral callback may prepare token sequences, after which the existing
-request builder performs canonical rewards, proofs, log probabilities,
-signatures, and formatting.
+request builder performs canonical rewards, proofs, log probabilities, and
+formatting. The miner transport helper finalizes signatures only at exact OPEN;
+the planner itself remains incapable of network sends by default.
+
+Its deterministic baseline walks lane, prompt, then environment order. The
+optional `value_per_gpu_second` policy orders the same bounded records by an
+operator-supplied estimate of eligible training value divided by estimated
+generation seconds, with the baseline tuple as a stable tie-break. These local
+estimates affect only preparation order; they are never sent to the validator
+or used in ranking or rewards.
 
 ## Prompt slices and cooldown
 
@@ -189,6 +209,14 @@ parameters between calls; aggregate mode computes one gradient against one
 parameter state. Both keep the published behavior checkpoint frozen for the
 whole epoch and publish at most one successor checkpoint after completion.
 
+The detached journal carries the same immutable epoch/lane binding plus the
+training-run identity. It writes a small terminal marker only after all 16
+payloads or tombstones have uploaded.
+The detached trainer waits for that marker before consuming lane zero: an
+aborted epoch is skipped as one unit, while a completed epoch is processed in
+the manifest-selected sequential or aggregate mode. In aggregate mode the one
+successful optimizer call credits the full horizon for publication cadence.
+
 ## Ranking, seal randomness, and rewards
 
 The advance plan contains generation randomness only. It never contains or
@@ -209,13 +237,16 @@ accounting. It does not introduce payment for unselected work.
 The commitment bound and round-based reveal selection reuse the repository's
 canonical operator mapping; they do not invent an identity from hotkeys. This
 prototype does not claim that the mapping makes participation Sybil-resistant.
-The compact commitment set remains validator-local in this vertical slice.
-Selection is reproducible from that set and beacon A, while cross-observer
-completeness requires a future public consistency surface.
+The complete canonical commitment set is exposed through the narrow signed
+`/checkpoint-epoch/commitment-set` endpoint before beacon A is requested.
+Miners verify its validator signature and ETag, and reveal selection commits to
+its SHA-256. Observers can therefore reproduce selection from the signed set and
+beacon A.
 
-Durable experimental state is deliberately small: one create-only intent, one
-create-only canonical manifest, one current pointer, an activation marker, one
-terminal outcome, and bounded local prepared work plus quarantine records. An
+Durable experimental state is deliberately small: one create-only signed
+intent, one create-only canonical manifest, one signed frozen commitment set,
+one current pointer, an activation marker, one terminal outcome, one detached
+training marker, and bounded local prepared work plus quarantine records. An
 activated epoch is never reopened after restart. An interrupted epoch is
 retired and its unconsumed training journal entries are tombstoned; the
 validator requires a successor checkpoint before it can schedule another
@@ -267,7 +298,7 @@ epoch intent and manifest.
 Rollback disables the capability, withdraws the read-only plan surface, and
 quarantines unreleased local work. Current profiles continue through their
 unchanged ordinary window path. Production activation additionally requires
-public intent consistency, recovery validation, capacity qualification, an
+multi-observer intent consistency, recovery validation, capacity qualification, an
 independent protocol and mechanism review, an explicit cutover, and an explicit
 rollback procedure. Review must confirm the common-OPEN admission behavior
 under representative load; merge of this inactive capability is not that

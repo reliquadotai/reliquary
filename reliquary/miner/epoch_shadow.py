@@ -28,20 +28,29 @@ from reliquary.shared.checkpoint_epoch import (
     parse_epoch_plan,
     validate_epoch_plan,
 )
+from reliquary.protocol.signatures import verify_epoch_intent_signature
+from reliquary.validator.checkpoint_epoch_runtime import (
+    canonical_signed_intent_bytes,
+    plan_from_intent,
+    parse_signed_epoch_intent,
+)
 
 
 CHECKPOINT_EPOCH_ENDPOINT = "/checkpoint-epoch"
+CHECKPOINT_EPOCH_INTENT_ENDPOINT = "/checkpoint-epoch/intent"
 _ACTIVE = frozenset({"planned", "generating", "prepared", "releasing"})
 _TERMINAL = frozenset({"released", "quarantined"})
 _HEX = frozenset("0123456789abcdef")
-_FORBIDDEN_RANDOMNESS_KEYS = frozenset({
-    "auction_randomness",
-    "post_seal_randomness",
-    "seal_beacon",
-    "seal_randomness",
-    "selection_randomness",
-    "tie_break_randomness",
-})
+_FORBIDDEN_RANDOMNESS_KEYS = frozenset(
+    {
+        "auction_randomness",
+        "post_seal_randomness",
+        "seal_beacon",
+        "seal_randomness",
+        "selection_randomness",
+        "tie_break_randomness",
+    }
+)
 
 
 class ShadowPlannerError(RuntimeError):
@@ -60,10 +69,11 @@ class EpochPlanMismatch(ShadowPlannerError):
 class ShadowPlannerConfig:
     spool_root: Path
     enabled: bool = False
-    max_queue_groups: int = 64
+    max_queue_groups: int = 512
     max_queue_bytes: int = 512 * 1024 * 1024
-    max_groups_per_environment_window: int = 8
-    target_groups_per_environment_window: int = 8
+    max_groups_per_environment_window: int = 16
+    target_groups_per_environment_window: int = 16
+    scheduling_policy: Literal["lane_order", "value_per_gpu_second"] = "lane_order"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "spool_root", Path(self.spool_root))
@@ -78,6 +88,11 @@ class ShadowPlannerConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be positive")
+        if self.scheduling_policy not in {
+            "lane_order",
+            "value_per_gpu_second",
+        }:
+            raise ValueError("unsupported shadow scheduling policy")
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +102,8 @@ class ShadowWorkSpec:
     prompt_idx: int
     prompt_content_sha256: str
     estimated_payload_bytes: int = 1
+    expected_eligible_training_value: float = 1.0
+    estimated_gpu_seconds: float = 1.0
 
     def __post_init__(self) -> None:
         if (
@@ -107,6 +124,25 @@ class ShadowWorkSpec:
             or self.estimated_payload_bytes < 1
         ):
             raise ValueError("estimated_payload_bytes must be positive")
+        if (
+            isinstance(self.expected_eligible_training_value, bool)
+            or not isinstance(
+                self.expected_eligible_training_value,
+                (int, float),
+            )
+            or not math.isfinite(self.expected_eligible_training_value)
+            or self.expected_eligible_training_value < 0
+        ):
+            raise ValueError(
+                "expected_eligible_training_value must be finite and non-negative"
+            )
+        if (
+            isinstance(self.estimated_gpu_seconds, bool)
+            or not isinstance(self.estimated_gpu_seconds, (int, float))
+            or not math.isfinite(self.estimated_gpu_seconds)
+            or self.estimated_gpu_seconds <= 0
+        ):
+            raise ValueError("estimated_gpu_seconds must be finite and positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +185,8 @@ class EpochWorkBinding:
     prompt_slice_stop: int
     prompt_idx: int
     prompt_content_sha256: str
+    expected_eligible_training_value: float = 1.0
+    estimated_gpu_seconds: float = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,13 +339,18 @@ class EpochShadowPlanner:
         if record.identity != EpochShadowPlanner._identity(binding):
             raise ValueError("shadow identity does not bind the record")
         if not (
-            binding.prompt_slice_start
-            <= binding.prompt_idx
-            < binding.prompt_slice_stop
+            binding.prompt_slice_start <= binding.prompt_idx < binding.prompt_slice_stop
         ):
             raise ValueError("bound prompt is outside its slice")
         if record.reservation_bytes < 1:
             raise ValueError("reservation_bytes must be positive")
+        if (
+            not math.isfinite(binding.expected_eligible_training_value)
+            or binding.expected_eligible_training_value < 0
+            or not math.isfinite(binding.estimated_gpu_seconds)
+            or binding.estimated_gpu_seconds <= 0
+        ):
+            raise ValueError("invalid local scheduling estimates")
 
     def _write_record(self, directory: Path, record: ShadowRecord) -> Path:
         path = directory / f"{record.identity}.json"
@@ -395,9 +438,12 @@ class EpochShadowPlanner:
         self,
         fetch_read_only: Callable[[str], bytes | str],
         *,
+        expected_validator_hotkey: str,
         expected_manifest_sha256: str | None = None,
     ) -> EpochPlan:
         self._require_enabled()
+        if not expected_validator_hotkey:
+            raise ValueError("expected validator hotkey is required")
         raw = fetch_read_only(CHECKPOINT_EPOCH_ENDPOINT)
         encoded = raw.encode("utf-8") if isinstance(raw, str) else bytes(raw)
         expected = expected_manifest_sha256 or hashlib.sha256(encoded).hexdigest()
@@ -405,6 +451,31 @@ class EpochShadowPlanner:
             encoded,
             expected_manifest_sha256=expected,
         )
+        signed_raw = fetch_read_only(CHECKPOINT_EPOCH_INTENT_ENDPOINT)
+        signed_encoded = (
+            signed_raw.encode("utf-8")
+            if isinstance(signed_raw, str)
+            else bytes(signed_raw)
+        )
+        publication = parse_signed_epoch_intent(signed_encoded)
+        if signed_encoded != canonical_signed_intent_bytes(
+            publication
+        ) or not verify_epoch_intent_signature(
+            publication,
+            expected_validator_hotkey=expected_validator_hotkey,
+        ):
+            raise EpochPlanMismatch("checkpoint epoch intent signature failed")
+        try:
+            expected_plan = plan_from_intent(
+                publication.intent,
+                beacon=plan.epoch_beacon,
+            )
+        except (TypeError, ValueError) as exc:
+            raise EpochPlanMismatch(
+                "checkpoint epoch plan differs from signed intent"
+            ) from exc
+        if expected_plan != plan:
+            raise EpochPlanMismatch("checkpoint epoch plan differs from signed intent")
         self.adopt_plan(plan, expected)
         return plan
 
@@ -489,6 +560,10 @@ class EpochShadowPlanner:
                 prompt_slice_stop=prompt_slice.stop,
                 prompt_idx=spec.prompt_idx,
                 prompt_content_sha256=spec.prompt_content_sha256,
+                expected_eligible_training_value=(
+                    float(spec.expected_eligible_training_value)
+                ),
+                estimated_gpu_seconds=float(spec.estimated_gpu_seconds),
             )
             identity = self._identity(binding)
             paths = (
@@ -552,7 +627,7 @@ class EpochShadowPlanner:
             "generation_randomness": binding.generation_randomness,
         }
         for key, expected_value in expected.items():
-            if key in payload and payload[key] != expected_value:
+            if payload.get(key) != expected_value:
                 raise ShadowPlannerError(f"prepared payload has wrong {key}")
         rollouts = payload.get("rollouts")
         if not isinstance(rollouts, list) or not rollouts:
@@ -581,14 +656,23 @@ class EpochShadowPlanner:
         ]
         if not planned:
             return None
-        path, record = min(
-            planned,
-            key=lambda item: (
-                item[1].binding.window_offset,
-                item[1].binding.prompt_idx,
-                item[1].binding.environment,
-            ),
-        )
+
+        def scheduling_key(item):
+            binding = item[1].binding
+            deterministic = (
+                binding.window_offset,
+                binding.prompt_idx,
+                binding.environment,
+                item[1].identity,
+            )
+            if self.config.scheduling_policy == "lane_order":
+                return deterministic
+            value_per_second = (
+                binding.expected_eligible_training_value / binding.estimated_gpu_seconds
+            )
+            return (-value_per_second, *deterministic)
+
+        path, record = min(planned, key=scheduling_key)
         generating = replace(
             record,
             status="generating",
@@ -863,9 +947,14 @@ class EpochShadowPlanner:
             "gpu_seconds_generated": sum(
                 record.actual_gpu_seconds or 0.0 for record in all_records
             ),
-            "valid_groups_prepared_local": sum(
-                record.status in {"prepared", "released"}
+            "expected_eligible_training_value_prepared": sum(
+                record.binding.expected_eligible_training_value
                 for record in all_records
+                if record.status in {"prepared", "released"}
+            ),
+            "scheduling_policy": self.config.scheduling_policy,
+            "valid_groups_prepared_local": sum(
+                record.status in {"prepared", "released"} for record in all_records
             ),
             "valid_groups_released_local": len(released),
             "discarded_stale_work": len(quarantined),
@@ -879,6 +968,7 @@ class EpochShadowPlanner:
 
 __all__ = [
     "CHECKPOINT_EPOCH_ENDPOINT",
+    "CHECKPOINT_EPOCH_INTENT_ENDPOINT",
     "EpochPlanMismatch",
     "EpochShadowPlanner",
     "EpochWorkBinding",

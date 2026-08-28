@@ -20,12 +20,16 @@ from reliquary.shared.checkpoint_epoch import (
     CheckpointBinding,
     EpochPlan,
     ProtocolBinding,
+    SignedEpochCommitmentSet,
     WindowSchedule,
     build_epoch_plan,
     canonical_json_bytes,
     canonical_manifest_bytes,
+    canonical_signed_commitment_set_bytes,
     manifest_sha256,
     parse_epoch_plan,
+    parse_signed_commitment_set,
+    validate_commitment_set_for_plan,
 )
 
 
@@ -61,6 +65,14 @@ class EpochCommitIntent:
     @property
     def intent_id(self) -> str:
         return hashlib.sha256(canonical_intent_bytes(self)).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class SignedEpochIntent:
+    intent: EpochCommitIntent
+    intent_sha256: str
+    validator_hotkey: str
+    validator_signature: str
 
 
 def _intent_dict(intent: EpochCommitIntent) -> dict[str, Any]:
@@ -117,6 +129,68 @@ def _intent_dict(intent: EpochCommitIntent) -> dict[str, Any]:
 
 def canonical_intent_bytes(intent: EpochCommitIntent) -> bytes:
     return canonical_json_bytes(_intent_dict(intent))
+
+
+def intent_signing_bytes(intent: EpochCommitIntent) -> bytes:
+    domain = b"reliquary/checkpoint-epoch/intent-signing/v1"
+    raw = canonical_intent_bytes(intent)
+    digest = hashlib.sha256()
+    digest.update(len(domain).to_bytes(4, "big"))
+    digest.update(domain)
+    digest.update(len(raw).to_bytes(8, "big"))
+    digest.update(raw)
+    return digest.digest()
+
+
+def canonical_signed_intent_bytes(value: SignedEpochIntent) -> bytes:
+    if not isinstance(value, SignedEpochIntent):
+        raise TypeError("value must be SignedEpochIntent")
+    if value.intent_sha256 != value.intent.intent_id:
+        raise ValueError("signed epoch intent hash differs")
+    if not value.validator_hotkey:
+        raise ValueError("signed epoch intent validator hotkey is empty")
+    signature = value.validator_signature
+    if (
+        not signature
+        or len(signature) > 256
+        or len(signature) % 2
+        or any(character not in "0123456789abcdef" for character in signature)
+    ):
+        raise ValueError("signed epoch intent signature is invalid")
+    return canonical_json_bytes(
+        {
+            "intent": _intent_dict(value.intent),
+            "intent_sha256": value.intent_sha256,
+            "validator_hotkey": value.validator_hotkey,
+            "validator_signature": value.validator_signature,
+        }
+    )
+
+
+def parse_signed_epoch_intent(raw: bytes | str) -> SignedEpochIntent:
+    raw_bytes = raw.encode("utf-8") if isinstance(raw, str) else bytes(raw)
+    try:
+        value = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid signed checkpoint epoch intent") from exc
+    if not isinstance(value, dict) or set(value) != {
+        "intent",
+        "intent_sha256",
+        "validator_hotkey",
+        "validator_signature",
+    }:
+        raise ValueError("signed checkpoint epoch intent keys differ")
+    intent_raw = canonical_json_bytes(value["intent"])
+    intent = parse_epoch_intent(intent_raw)
+    publication = SignedEpochIntent(
+        intent=intent,
+        intent_sha256=value["intent_sha256"],
+        validator_hotkey=value["validator_hotkey"],
+        validator_signature=value["validator_signature"],
+    )
+    if raw_bytes != canonical_signed_intent_bytes(publication):
+        raise ValueError("signed checkpoint epoch intent is not canonical")
+    return publication
 
 
 def build_epoch_intent(
@@ -373,6 +447,10 @@ class EpochStore:
             raise EpochStoreError(
                 "intent was not durably confirmed before beacon availability"
             )
+        if self.load_signed_intent(intent) is None:
+            raise EpochStoreError(
+                "signed epoch intent was not durable before confirmation"
+            )
         raw = canonical_json_bytes(
             {
                 "intent_id": intent.intent_id,
@@ -421,6 +499,36 @@ class EpochStore:
         )
         self._write_pointer("current-plan", plan.epoch_id)
         return raw
+
+    def install_signed_intent(
+        self,
+        publication: SignedEpochIntent,
+    ) -> bytes:
+        current = self.load_current_intent()
+        if current is None or current != publication.intent:
+            raise EpochStoreError("signed epoch intent is not current")
+        raw = canonical_signed_intent_bytes(publication)
+        self._install_create_only(
+            self.root / f"signed-intent-{publication.intent.intent_id}.json",
+            raw,
+            "signed intent",
+        )
+        return raw
+
+    def load_signed_intent(
+        self,
+        intent: EpochCommitIntent,
+    ) -> SignedEpochIntent | None:
+        path = self.root / f"signed-intent-{intent.intent_id}.json"
+        if not path.exists():
+            return None
+        try:
+            publication = parse_signed_epoch_intent(path.read_bytes())
+        except (OSError, ValueError, TypeError) as exc:
+            raise EpochStoreError("invalid signed epoch intent") from exc
+        if publication.intent != intent:
+            raise EpochStoreError("signed epoch intent differs from intent")
+        return publication
 
     def load_current_plan(self) -> EpochPlan | None:
         identifier = self._read_pointer("current-plan")
@@ -493,6 +601,43 @@ class EpochStore:
             raise EpochStoreError("epoch terminal outcome does not match plan")
         return str(value["status"])
 
+    def install_commitment_set(
+        self,
+        plan: EpochPlan,
+        publication: SignedEpochCommitmentSet,
+    ) -> bytes:
+        """Persist the signed frozen set before admission randomness exists."""
+        if not self.is_activated(plan):
+            raise EpochStoreError("checkpoint epoch was not activated")
+        try:
+            validate_commitment_set_for_plan(publication.commitment_set, plan)
+        except (TypeError, ValueError) as exc:
+            raise EpochStoreError("commitment set does not match epoch plan") from exc
+        raw = canonical_signed_commitment_set_bytes(publication)
+        self._install_create_only(
+            self.root / f"commitments-{plan.epoch_id}.json",
+            raw,
+            "signed commitment set",
+        )
+        return raw
+
+    def load_commitment_set(
+        self,
+        plan: EpochPlan,
+    ) -> SignedEpochCommitmentSet | None:
+        path = self.root / f"commitments-{plan.epoch_id}.json"
+        if not path.exists():
+            return None
+        try:
+            publication = parse_signed_commitment_set(path.read_bytes())
+        except (OSError, ValueError, TypeError) as exc:
+            raise EpochStoreError("invalid signed commitment set") from exc
+        try:
+            validate_commitment_set_for_plan(publication.commitment_set, plan)
+        except (TypeError, ValueError) as exc:
+            raise EpochStoreError("stored commitment set does not match plan") from exc
+        return publication
+
     def _install_create_only(
         self,
         path: Path,
@@ -544,8 +689,12 @@ __all__ = [
     "EpochEquivocationError",
     "EpochStore",
     "EpochStoreError",
+    "SignedEpochIntent",
     "build_epoch_intent",
     "canonical_intent_bytes",
+    "canonical_signed_intent_bytes",
+    "intent_signing_bytes",
     "parse_epoch_intent",
+    "parse_signed_epoch_intent",
     "plan_from_intent",
 ]

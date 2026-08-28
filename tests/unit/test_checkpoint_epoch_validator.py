@@ -13,9 +13,11 @@ from reliquary.shared.checkpoint_epoch import (
     BeaconBinding,
     CheckpointBinding,
     ProtocolBinding,
+    SignedEpochCommitmentSet,
     WindowSchedule,
     build_epoch_plan,
     canonical_manifest_bytes,
+    commitment_set_sha256,
     manifest_sha256,
 )
 from reliquary.validator.observability import SubmitTelemetry
@@ -306,25 +308,38 @@ def test_selected_epoch_commitment_gets_bounded_reveal_right():
             content=precommit.model_dump_json(),
             headers={"Content-Type": "application/json"},
         ).json()
+        commitment_close_round = plan.epoch_beacon.round + 9
+        server.set_checkpoint_epoch_phase("selection")
+        frozen = server.freeze_checkpoint_epoch_commitment_set(
+            commitment_close_round=commitment_close_round,
+            validator_hotkey="validator",
+        )
+        server.install_checkpoint_epoch_commitment_set(
+            SignedEpochCommitmentSet(
+                commitment_set=frozen,
+                commitment_set_sha256=commitment_set_sha256(frozen),
+                validator_signature="aa",
+            )
+        )
         with pytest.raises(ValueError, match="follow commitment close"):
             server.select_checkpoint_epoch_reveals(
-                commitment_close_round=plan.epoch_beacon.round + 10,
+                commitment_close_round=commitment_close_round,
                 admission_beacon=BeaconBinding(
                     source="drand",
                     chain=plan.epoch_beacon.chain,
                     chain_hash=plan.epoch_beacon.chain_hash,
-                    round=plan.epoch_beacon.round + 10,
+                    round=commitment_close_round,
                     randomness="e" * 64,
                 ),
                 reveal_deadline_ts=time.time() + 60.0,
             )
         counts = server.select_checkpoint_epoch_reveals(
-            commitment_close_round=plan.epoch_beacon.round + 9,
+            commitment_close_round=commitment_close_round,
             admission_beacon=BeaconBinding(
                 source="drand",
                 chain=plan.epoch_beacon.chain,
                 chain_hash=plan.epoch_beacon.chain_hash,
-                round=plan.epoch_beacon.round + 10,
+                round=commitment_close_round + 1,
                 randomness="e" * 64,
             ),
             reveal_deadline_ts=time.time() + 60.0,
@@ -349,10 +364,10 @@ def test_selected_epoch_commitment_gets_bounded_reveal_right():
 
     assert counts == {("fake", plan.first_window): 1}
     assert status["status"] == "selected"
-    assert status["admission_beacon_round"] == plan.epoch_beacon.round + 10
+    assert status["admission_beacon_round"] == commitment_close_round + 1
     assert state["checkpoint_epoch_phase"] == "reveal"
     assert state["checkpoint_epoch_admission_beacon_round"] == (
-        plan.epoch_beacon.round + 10
+        commitment_close_round + 1
     )
     assert revealed["reason"] not in {
         RejectReason.REVEAL_NOT_SELECTED.value,
@@ -390,7 +405,6 @@ def test_real_epoch_batcher_builder_honors_each_requested_logical_window(
 
 @pytest.mark.asyncio
 async def test_epoch_runner_opens_sixteen_lanes_together_then_consumes_in_order(
-    monkeypatch,
     tmp_path,
 ):
     from reliquary.validator.checkpoint_epoch_runtime import EpochStore
@@ -402,14 +416,14 @@ async def test_epoch_runner_opens_sixteen_lanes_together_then_consumes_in_order(
     service.server.set_checkpoint_epoch_plan(plan)
     service._checkpoint_epoch_store = EpochStore(tmp_path)
     service._window_n = plan.first_window - 1
-    monkeypatch.setattr(
-        "reliquary.infrastructure.drand.get_current_chain",
-        lambda: {
-            "name": plan.epoch_beacon.chain,
-            "hash": plan.epoch_beacon.chain_hash,
-            "genesis_time": 0,
-            "period": 30,
-        },
+    chain_info = {
+        "name": plan.epoch_beacon.chain,
+        "hash": plan.epoch_beacon.chain_hash,
+        "genesis_time": 0,
+        "period": 30,
+    }
+    service._checkpoint_epoch_drand_snapshot = AsyncMock(
+        side_effect=[(chain_info, 120), (chain_info, 149)]
     )
     built: list[_EpochLaneBatcher] = []
 
@@ -466,7 +480,6 @@ async def test_epoch_runner_opens_sixteen_lanes_together_then_consumes_in_order(
 
 @pytest.mark.asyncio
 async def test_epoch_failure_closes_routes_and_tombstones_unconsumed_lanes(
-    monkeypatch,
     tmp_path,
 ):
     from reliquary.validator.checkpoint_epoch_runtime import EpochStore
@@ -479,14 +492,14 @@ async def test_epoch_failure_closes_routes_and_tombstones_unconsumed_lanes(
     service.server.set_checkpoint_epoch_plan(plan)
     service._checkpoint_epoch_store = EpochStore(tmp_path)
     service._window_n = plan.first_window - 1
-    monkeypatch.setattr(
-        "reliquary.infrastructure.drand.get_current_chain",
-        lambda: {
-            "name": plan.epoch_beacon.chain,
-            "hash": plan.epoch_beacon.chain_hash,
-            "genesis_time": 0,
-            "period": 30,
-        },
+    chain_info = {
+        "name": plan.epoch_beacon.chain,
+        "hash": plan.epoch_beacon.chain_hash,
+        "genesis_time": 0,
+        "period": 30,
+    }
+    service._checkpoint_epoch_drand_snapshot = AsyncMock(
+        side_effect=[(chain_info, 120), (chain_info, 149)]
     )
 
     def build(window_number: int):

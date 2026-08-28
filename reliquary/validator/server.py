@@ -117,11 +117,18 @@ from reliquary.protocol.tokens import verify_tokens
 from reliquary.shared.checkpoint_epoch import (
     BeaconBinding,
     EpochAdmissionCommitment,
+    EpochCommitmentRecord,
+    EpochCommitmentSet,
     EpochPlan,
+    SignedEpochCommitmentSet,
+    build_commitment_set,
     canonical_manifest_bytes,
+    canonical_signed_commitment_set_bytes,
     manifest_sha256,
     parse_epoch_plan,
     select_epoch_reveals,
+    validate_commitment_set_for_plan,
+    validate_signed_commitment_set,
 )
 from reliquary.shared.hf_compat import (
     resolve_max_context_length,
@@ -1236,8 +1243,13 @@ class ValidatorServer:
         self._checkpoint_epoch_manifest_bytes: bytes | None = None
         self._checkpoint_epoch_manifest_sha256: str | None = None
         self._checkpoint_epoch_manifests_by_id: dict[str, bytes] = {}
+        self._checkpoint_epoch_signed_intent_bytes: bytes | None = None
+        self._checkpoint_epoch_intent_sha256: str | None = None
         self._checkpoint_epoch_phase: str | None = None
         self._checkpoint_epoch_admission_beacon: BeaconBinding | None = None
+        self._checkpoint_epoch_frozen_commitment_set: EpochCommitmentSet | None = None
+        self._checkpoint_epoch_commitment_set: SignedEpochCommitmentSet | None = None
+        self._checkpoint_epoch_commitment_set_bytes: bytes | None = None
         self.app: FastAPI = self._build_app()
         self._server: uvicorn.Server | None = None
         self._task: asyncio.Task[Any] | None = None
@@ -1346,6 +1358,11 @@ class ValidatorServer:
             epoch.epoch_id if epoch is not None else None,
             self._checkpoint_epoch_manifest_sha256,
             self._checkpoint_epoch_phase,
+            (
+                self._checkpoint_epoch_commitment_set.commitment_set_sha256
+                if self._checkpoint_epoch_commitment_set is not None
+                else None
+            ),
             (
                 self._checkpoint_epoch_admission_beacon.round
                 if self._checkpoint_epoch_admission_beacon is not None
@@ -2016,12 +2033,28 @@ class ValidatorServer:
 
     def set_current_checkpoint(self, entry) -> None:
         plan = self._checkpoint_epoch_plan
-        if plan is not None and (
+        plan_differs = plan is not None and (
             entry is None
             or int(entry.checkpoint_n) != plan.checkpoint.number
             or str(entry.repo_id) != plan.checkpoint.repo_id
             or str(entry.revision) != plan.checkpoint.revision
-        ):
+        )
+        intent_differs = False
+        if self._checkpoint_epoch_signed_intent_bytes is not None:
+            from reliquary.validator.checkpoint_epoch_runtime import (
+                parse_signed_epoch_intent,
+            )
+
+            intent_checkpoint = parse_signed_epoch_intent(
+                self._checkpoint_epoch_signed_intent_bytes
+            ).intent.checkpoint
+            intent_differs = (
+                entry is None
+                or int(entry.checkpoint_n) != intent_checkpoint.number
+                or str(entry.repo_id) != intent_checkpoint.repo_id
+                or str(entry.revision) != intent_checkpoint.revision
+            )
+        if plan_differs or intent_differs:
             self.set_checkpoint_epoch_plan(None)
         self._current_checkpoint = entry
 
@@ -2031,8 +2064,13 @@ class ValidatorServer:
             self._checkpoint_epoch_plan = None
             self._checkpoint_epoch_manifest_bytes = None
             self._checkpoint_epoch_manifest_sha256 = None
+            self._checkpoint_epoch_signed_intent_bytes = None
+            self._checkpoint_epoch_intent_sha256 = None
             self._checkpoint_epoch_phase = None
             self._checkpoint_epoch_admission_beacon = None
+            self._checkpoint_epoch_frozen_commitment_set = None
+            self._checkpoint_epoch_commitment_set = None
+            self._checkpoint_epoch_commitment_set_bytes = None
             self._state_response_cache.clear()
             return
 
@@ -2060,12 +2098,107 @@ class ValidatorServer:
         self._checkpoint_epoch_manifest_sha256 = digest
         self._state_response_cache.clear()
 
+    def set_checkpoint_epoch_signed_intent(
+        self,
+        raw: bytes,
+        *,
+        intent_sha256: str,
+    ) -> None:
+        """Expose immutable signed intent bytes fixed before the epoch beacon."""
+        encoded = bytes(raw)
+        if len(intent_sha256) != 64 or any(
+            c not in "0123456789abcdef" for c in intent_sha256
+        ):
+            raise ValueError("invalid checkpoint epoch intent SHA-256")
+        from reliquary.validator.checkpoint_epoch_runtime import (
+            parse_signed_epoch_intent,
+        )
+
+        publication = parse_signed_epoch_intent(encoded)
+        if publication.intent_sha256 != intent_sha256:
+            raise ValueError("checkpoint epoch signed intent SHA differs")
+        existing = self._checkpoint_epoch_signed_intent_bytes
+        if existing is not None and existing != encoded:
+            raise ValueError("checkpoint epoch signed intent equivocation")
+        self._checkpoint_epoch_signed_intent_bytes = encoded
+        self._checkpoint_epoch_intent_sha256 = intent_sha256
+
     def set_checkpoint_epoch_phase(self, phase: str | None) -> None:
-        if phase not in {None, "commitment", "reveal"}:
+        if phase not in {None, "commitment", "selection", "reveal"}:
             raise ValueError("invalid checkpoint epoch phase")
         if phase is not None and self._checkpoint_epoch_plan is None:
             raise RuntimeError("checkpoint epoch plan is unavailable")
         self._checkpoint_epoch_phase = phase
+        self._state_response_cache.clear()
+
+    def freeze_checkpoint_epoch_commitment_set(
+        self,
+        *,
+        commitment_close_round: int,
+        validator_hotkey: str,
+    ) -> EpochCommitmentSet:
+        """Freeze the exact post-deadline set before admission randomness."""
+        plan = self._checkpoint_epoch_plan
+        manifest = self._checkpoint_epoch_manifest_sha256
+        if (
+            plan is None
+            or manifest is None
+            or self._checkpoint_epoch_phase != "selection"
+        ):
+            raise RuntimeError("checkpoint epoch is not freezing commitments")
+        records = [
+            EpochCommitmentRecord(
+                receipt_id=receipt.receipt_id,
+                commitment_id=receipt.precommit_signature,
+                operator_id=str(receipt.operator),
+                miner_hotkey=receipt.miner_hotkey,
+                window_number=receipt.window_start,
+                environment=receipt.environment,
+                prompt_idx=receipt.prompt_idx,
+                payload_sha256=receipt.payload_sha256,
+            )
+            for receipt in self._upload_precommit_receipts.values()
+            if (
+                receipt.epoch_commitment
+                and not receipt.consumed
+                and receipt.admission_beacon_round is None
+                and receipt.operator is not None
+                and self._batcher_is_active(receipt.batcher)
+            )
+        ]
+        frozen = build_commitment_set(
+            records,
+            epoch_id=plan.epoch_id,
+            manifest_sha256_hex=manifest,
+            commitment_close_round=int(commitment_close_round),
+            validator_hotkey=str(validator_hotkey),
+        )
+        validate_commitment_set_for_plan(frozen, plan)
+        existing = self._checkpoint_epoch_frozen_commitment_set
+        if existing is not None and existing != frozen:
+            raise RuntimeError("checkpoint epoch commitment set equivocated")
+        self._checkpoint_epoch_frozen_commitment_set = frozen
+        return frozen
+
+    def install_checkpoint_epoch_commitment_set(
+        self,
+        publication: SignedEpochCommitmentSet,
+    ) -> None:
+        """Expose only the signed bytes for the already-frozen exact set."""
+        validate_signed_commitment_set(publication)
+        frozen = self._checkpoint_epoch_frozen_commitment_set
+        if frozen is None or publication.commitment_set != frozen:
+            raise RuntimeError("signed commitment set differs from frozen set")
+        plan = self._checkpoint_epoch_plan
+        if plan is None:
+            raise RuntimeError("checkpoint epoch plan is unavailable")
+        validate_commitment_set_for_plan(publication.commitment_set, plan)
+        raw = canonical_signed_commitment_set_bytes(publication)
+        existing = self._checkpoint_epoch_commitment_set_bytes
+        if existing is not None and existing != raw:
+            raise RuntimeError("signed commitment set equivocated")
+        self._checkpoint_epoch_commitment_set = publication
+        self._checkpoint_epoch_commitment_set_bytes = raw
         self._state_response_cache.clear()
 
     async def drain_checkpoint_epoch_commitments(
@@ -2074,8 +2207,8 @@ class ValidatorServer:
         timeout_seconds: float = 30.0,
     ) -> None:
         """Wait for compact requests already at ingress to finish admission."""
-        if self._checkpoint_epoch_phase != "commitment":
-            raise RuntimeError("checkpoint epoch commitment phase is not active")
+        if self._checkpoint_epoch_phase != "selection":
+            raise RuntimeError("checkpoint epoch selection phase is not active")
         loop = asyncio.get_running_loop()
         deadline = loop.time() + float(timeout_seconds)
         while self._precommit_http_inflight:
@@ -2093,15 +2226,19 @@ class ValidatorServer:
         """Turn compact commitments into a bounded, arrival-neutral cohort."""
         plan = self._checkpoint_epoch_plan
         manifest = self._checkpoint_epoch_manifest_sha256
+        publication = self._checkpoint_epoch_commitment_set
         if (
             plan is None
             or manifest is None
-            or self._checkpoint_epoch_phase != "commitment"
+            or publication is None
+            or self._checkpoint_epoch_phase != "selection"
         ):
-            raise RuntimeError("checkpoint epoch commitment phase is not active")
+            raise RuntimeError("checkpoint epoch selection phase is not active")
+        frozen = publication.commitment_set
         if (
             isinstance(commitment_close_round, bool)
             or int(commitment_close_round) < plan.epoch_beacon.round
+            or int(commitment_close_round) != frozen.commitment_close_round
             or admission_beacon.round <= int(commitment_close_round)
         ):
             raise ValueError("admission beacon must follow commitment close")
@@ -2115,36 +2252,50 @@ class ValidatorServer:
             raise ValueError("reveal deadline must be in the future")
 
         selected_counts: dict[tuple[str, int], int] = {}
+        receipt_by_id = self._upload_precommit_receipts
         for (environment, window), batcher in sorted(
             self._active_epoch_batchers.items(),
             key=lambda item: (item[0][1], item[0][0]),
         ):
-            receipts = [
-                receipt
-                for receipt in self._upload_precommit_receipts.values()
-                if receipt.epoch_commitment
-                and not receipt.consumed
-                and receipt.batcher is batcher
-                and receipt.admission_beacon_round is None
-                and receipt.operator is not None
+            records = [
+                record
+                for record in frozen.commitments
+                if record.environment == environment and record.window_number == window
             ]
+            receipts = []
+            for record in records:
+                receipt = receipt_by_id.get(record.receipt_id)
+                if (
+                    receipt is None
+                    or receipt.consumed
+                    or receipt.batcher is not batcher
+                    or receipt.precommit_signature != record.commitment_id
+                    or str(receipt.operator) != record.operator_id
+                    or receipt.miner_hotkey != record.miner_hotkey
+                    or receipt.prompt_idx != record.prompt_idx
+                    or receipt.payload_sha256 != record.payload_sha256
+                    or receipt.admission_beacon_round is not None
+                ):
+                    raise RuntimeError("live commitment differs from signed frozen set")
+                receipts.append(receipt)
             ordered_ids = (
                 select_epoch_reveals(
                     [
                         EpochAdmissionCommitment(
-                            commitment_id=receipt.precommit_signature,
-                            operator_id=str(receipt.operator),
-                            window_number=receipt.window_start,
-                            environment=receipt.environment,
-                            prompt_idx=receipt.prompt_idx,
-                            payload_sha256=receipt.payload_sha256,
+                            commitment_id=record.commitment_id,
+                            operator_id=record.operator_id,
+                            window_number=record.window_number,
+                            environment=record.environment,
+                            prompt_idx=record.prompt_idx,
+                            payload_sha256=record.payload_sha256,
                         )
-                        for receipt in receipts
+                        for record in records
                     ],
                     admission_randomness=admission_beacon.randomness,
                     epoch_id=plan.epoch_id,
                     manifest_sha256_hex=manifest,
-                    limit=max(1, len(receipts)),
+                    commitment_set_sha256_hex=(publication.commitment_set_sha256),
+                    limit=max(1, len(records)),
                     per_prompt_limit=MAX_SUBMISSIONS_PER_PROMPT,
                 )
                 if receipts
@@ -5665,6 +5816,18 @@ class ValidatorServer:
                     and self._checkpoint_epoch_admission_beacon is not None
                     else None
                 ),
+                checkpoint_epoch_commitment_set_sha256=(
+                    self._checkpoint_epoch_commitment_set.commitment_set_sha256
+                    if epoch is not None
+                    and self._checkpoint_epoch_commitment_set is not None
+                    else None
+                ),
+                checkpoint_epoch_commitment_root=(
+                    self._checkpoint_epoch_commitment_set.commitment_set.commitment_root
+                    if epoch is not None
+                    and self._checkpoint_epoch_commitment_set is not None
+                    else None
+                ),
                 randomness=batcher.randomness,
             )
             excluded_fields: set[str] = set()
@@ -5688,6 +5851,8 @@ class ValidatorServer:
                         "checkpoint_epoch_phase",
                         "checkpoint_epoch_reveal_seconds",
                         "checkpoint_epoch_admission_beacon_round",
+                        "checkpoint_epoch_commitment_set_sha256",
+                        "checkpoint_epoch_commitment_root",
                     }
                 )
             body = payload.model_dump_json(
@@ -5740,6 +5905,43 @@ class ValidatorServer:
                 },
             )
 
+        @app.get("/checkpoint-epoch/intent")
+        async def checkpoint_epoch_intent():
+            raw = self._checkpoint_epoch_signed_intent_bytes
+            digest = self._checkpoint_epoch_intent_sha256
+            if raw is None or digest is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="checkpoint_epoch_intent_unavailable",
+                )
+            return Response(
+                content=raw,
+                media_type="application/json",
+                headers={
+                    "ETag": f'"{digest}"',
+                    "Cache-Control": "no-cache, must-revalidate",
+                },
+            )
+
+        @app.get("/checkpoint-epoch/commitment-set")
+        async def checkpoint_epoch_commitment_set():
+            """Return the canonical signed set frozen before beacon A."""
+            raw = self._checkpoint_epoch_commitment_set_bytes
+            publication = self._checkpoint_epoch_commitment_set
+            if raw is None or publication is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="checkpoint_epoch_commitment_set_unavailable",
+                )
+            return Response(
+                content=raw,
+                media_type="application/json",
+                headers={
+                    "ETag": f'"{publication.commitment_set_sha256}"',
+                    "Cache-Control": "no-cache, must-revalidate",
+                },
+            )
+
         @app.get(
             "/checkpoint-epoch/commitments/{receipt_id}",
             response_model=EpochCommitmentStatus,
@@ -5768,6 +5970,16 @@ class ValidatorServer:
                 admission_beacon_round=receipt.admission_beacon_round,
                 reveal_deadline_ts=(
                     receipt.expires_at_wall if receipt.epoch_selected else None
+                ),
+                commitment_set_sha256=(
+                    self._checkpoint_epoch_commitment_set.commitment_set_sha256
+                    if self._checkpoint_epoch_commitment_set is not None
+                    else None
+                ),
+                commitment_root=(
+                    self._checkpoint_epoch_commitment_set.commitment_set.commitment_root
+                    if self._checkpoint_epoch_commitment_set is not None
+                    else None
                 ),
             )
 

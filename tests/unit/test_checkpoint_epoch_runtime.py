@@ -16,6 +16,7 @@ from reliquary.validator.checkpoint_epoch_runtime import (
     EpochEquivocationError,
     EpochStore,
     EpochStoreError,
+    SignedEpochIntent,
     build_epoch_intent,
     canonical_intent_bytes,
     parse_epoch_intent,
@@ -64,6 +65,17 @@ def _beacon(randomness: str = "d" * 64):
     )
 
 
+def _install_signed_intent(store: EpochStore, intent) -> None:
+    store.install_signed_intent(
+        SignedEpochIntent(
+            intent=intent,
+            intent_sha256=intent.intent_id,
+            validator_hotkey="validator",
+            validator_signature="aa",
+        )
+    )
+
+
 def test_intent_is_canonical_and_targets_exactly_the_next_round():
     intent = _intent()
 
@@ -94,6 +106,7 @@ def test_store_enforces_commit_before_beacon(tmp_path):
     store = EpochStore(tmp_path)
     intent = _intent()
     store.install_intent(intent)
+    _install_signed_intent(store, intent)
 
     with pytest.raises(EpochStoreError, match="before beacon"):
         store.confirm_before_beacon(intent, observed_round=1_001)
@@ -110,6 +123,7 @@ def test_restart_reload_is_byte_identical(tmp_path):
     first = EpochStore(tmp_path)
     intent = _intent()
     first.install_intent(intent)
+    _install_signed_intent(first, intent)
     first.confirm_before_beacon(intent, observed_round=1_000)
     plan = plan_from_intent(intent, beacon=_beacon())
     expected = first.install_plan(intent, plan)
@@ -125,6 +139,7 @@ def test_activation_and_terminal_outcome_are_create_only(tmp_path):
     store = EpochStore(tmp_path)
     intent = _intent()
     store.install_intent(intent)
+    _install_signed_intent(store, intent)
     store.confirm_before_beacon(intent, observed_round=1_000)
     plan = plan_from_intent(intent, beacon=_beacon())
     store.install_plan(intent, plan)
@@ -146,6 +161,7 @@ def test_corrupt_activation_marker_is_rejected(tmp_path):
     store = EpochStore(tmp_path)
     intent = _intent()
     store.install_intent(intent)
+    _install_signed_intent(store, intent)
     store.confirm_before_beacon(intent, observed_round=1_000)
     plan = plan_from_intent(intent, beacon=_beacon())
     store.install_plan(intent, plan)
@@ -161,6 +177,7 @@ def test_manifest_equivocation_is_rejected(tmp_path):
     store = EpochStore(tmp_path)
     intent = _intent()
     store.install_intent(intent)
+    _install_signed_intent(store, intent)
     store.confirm_before_beacon(intent, observed_round=1_000)
     plan = plan_from_intent(intent, beacon=_beacon())
     path = tmp_path / f"plan-{plan.epoch_id}.json"

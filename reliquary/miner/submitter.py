@@ -13,6 +13,7 @@ import logging
 import os
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
@@ -20,6 +21,10 @@ import httpx
 
 from reliquary.constants import VALIDATOR_HTTP_PORT
 from reliquary.protocol.signatures import sign_envelope, sign_precommit
+from reliquary.protocol.signatures import (
+    verify_epoch_commitment_set_signature,
+    verify_epoch_intent_signature,
+)
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     BatchSubmissionResponse,
@@ -33,9 +38,21 @@ from reliquary.protocol.submission import (
 from reliquary.shared.checkpoint_epoch import (
     CHECKPOINT_EPOCH_CAPABILITY_ID,
     EpochPlan,
+    SignedEpochCommitmentSet,
+    canonical_signed_commitment_set_bytes,
+    commitment_set_sha256,
     generation_contract_sha256,
     manifest_sha256,
     parse_epoch_plan,
+    parse_signed_commitment_set,
+    validate_commitment_set_for_plan,
+    validate_epoch_plan,
+)
+from reliquary.validator.checkpoint_epoch_runtime import (
+    SignedEpochIntent,
+    canonical_signed_intent_bytes,
+    plan_from_intent,
+    parse_signed_epoch_intent,
 )
 from reliquary.shared.runtime_fingerprint import bind_runtime_profile_nonce
 
@@ -59,6 +76,14 @@ class NoValidatorFoundError(RuntimeError):
 
 class SubmissionError(RuntimeError):
     """All submission retries exhausted."""
+
+
+@dataclass(frozen=True, slots=True)
+class FinalizedEpochCommitment:
+    """Exact reveal bytes plus the compact commitment that binds them."""
+
+    payload: bytes
+    precommit: SubmissionPrecommitRequest
 
 
 def discover_validator_url(metagraph: Any, port: int = VALIDATOR_HTTP_PORT) -> str:
@@ -255,6 +280,120 @@ async def _verify_checkpoint_epoch_public_beacon(plan: EpochPlan) -> None:
         raise SubmissionError(
             "checkpoint epoch public beacon validation failed"
         ) from exc
+
+
+def finalize_checkpoint_epoch_commitment_v1(
+    request: BatchSubmissionRequest,
+    *,
+    plan: EpochPlan,
+    wallet: Any,
+    drand_round: int,
+    nonce: str | None = None,
+) -> FinalizedEpochCommitment:
+    """Bind prepared generation to fresh transport fields at commitment OPEN.
+
+    The returned payload must be durably retained before its compact precommit
+    is posted. Re-finalizing after an accepted precommit creates different
+    reveal bytes and is therefore intentionally not a retry mechanism.
+    """
+    validate_epoch_plan(plan)
+    if not hasattr(wallet, "hotkey") or not hasattr(wallet.hotkey, "sign"):
+        raise TypeError("wallet must provide hotkey.sign()")
+    wallet_hotkey = str(getattr(wallet.hotkey, "ss58_address", ""))
+    if not wallet_hotkey or wallet_hotkey != request.miner_hotkey:
+        raise SubmissionError("wallet hotkey differs from prepared payload")
+    if (
+        isinstance(drand_round, bool)
+        or not isinstance(drand_round, int)
+        or drand_round < 1
+    ):
+        raise ValueError("drand_round must be positive")
+    if nonce is not None and (
+        not isinstance(nonce, str) or not nonce or len(nonce) > 128
+    ):
+        raise ValueError("nonce must be a non-empty bounded string")
+    environments = {rollout.env_name for rollout in request.rollouts}
+    if len(environments) != 1:
+        raise SubmissionError("submission must contain exactly one environment")
+    environment = next(iter(environments))
+    offset = request.window_start - plan.first_window
+    if offset < 0 or offset >= plan.window_count:
+        raise SubmissionError("prepared window is outside checkpoint epoch")
+    epoch_window = plan.windows[offset]
+    prompt_slices = {item.environment: item for item in epoch_window.prompt_slices}
+    prompt_slice = prompt_slices.get(environment)
+    if (
+        epoch_window.window_number != request.window_start
+        or request.checkpoint_hash != plan.checkpoint.revision
+        or request.protocol_version != plan.protocol.protocol_version
+        or request.generation_profile_id != plan.protocol.profile_id
+        or prompt_slice is None
+        or not prompt_slice.start <= request.prompt_idx < prompt_slice.stop
+    ):
+        raise SubmissionError("prepared payload differs from checkpoint epoch")
+    randomness = epoch_window.generation_randomness
+    for rollout in request.rollouts:
+        beacon = rollout.commit.get("beacon")
+        if not isinstance(beacon, dict) or beacon.get("randomness") != randomness:
+            raise SubmissionError("prepared rollout has wrong epoch randomness")
+
+    fresh_nonce = nonce if nonce is not None else os.urandom(16).hex()
+    if request.runtime_fingerprint is not None:
+        fresh_nonce = bind_runtime_profile_nonce(
+            fresh_nonce,
+            request.runtime_fingerprint.profile_hash,
+        )
+    if len(fresh_nonce) > 128:
+        raise ValueError("runtime-bound nonce is too long")
+    envelope_signature = sign_envelope(
+        wallet=wallet,
+        miner_hotkey=request.miner_hotkey,
+        window_start=request.window_start,
+        prompt_idx=request.prompt_idx,
+        merkle_root=request.merkle_root,
+        checkpoint_hash=request.checkpoint_hash,
+        drand_round=int(drand_round),
+        randomness=randomness,
+        nonce=fresh_nonce,
+        protocol_version=request.protocol_version,
+        generation_profile_id=request.generation_profile_id,
+    ).hex()
+    finalized = request.model_copy(
+        update={
+            "drand_round": int(drand_round),
+            "nonce": fresh_nonce,
+            "envelope_signature": envelope_signature,
+        }
+    )
+    wire_exclude = (
+        {"generation_profile_id"} if not finalized.generation_profile_id else None
+    )
+    payload = finalized.model_dump_json(exclude=wire_exclude).encode("utf-8")
+    precommit_fields = {
+        "miner_hotkey": finalized.miner_hotkey,
+        "window_start": finalized.window_start,
+        "prompt_idx": finalized.prompt_idx,
+        "merkle_root": finalized.merkle_root,
+        "checkpoint_hash": finalized.checkpoint_hash,
+        "environment": environment,
+        "payload_bytes": len(payload),
+        "payload_sha256": hashlib.sha256(payload).hexdigest(),
+        "drand_round": int(drand_round),
+        "randomness": randomness,
+        "protocol_version": finalized.protocol_version,
+        "generation_profile_id": finalized.generation_profile_id,
+        "nonce": fresh_nonce,
+    }
+    precommit = SubmissionPrecommitRequest(
+        **{
+            key: value for key, value in precommit_fields.items() if key != "randomness"
+        },
+        precommit_signature=sign_precommit(
+            wallet=wallet,
+            **precommit_fields,
+        ).hex(),
+    )
+    return FinalizedEpochCommitment(payload=payload, precommit=precommit)
 
 
 async def submit_batch_v2(
@@ -604,12 +743,114 @@ async def get_checkpoint_epoch_commitment_status_v1(
     )
 
 
+async def get_checkpoint_epoch_commitment_set_v1(
+    url: str,
+    *,
+    expected_validator_hotkey: str,
+    expected_commitment_set_sha256: str | None = None,
+    expected_plan: EpochPlan | None = None,
+    client: httpx.AsyncClient | None = None,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> SignedEpochCommitmentSet:
+    """Fetch and verify the exact set signed before admission beacon A."""
+    if not expected_validator_hotkey:
+        raise ValueError("expected validator hotkey is required")
+    own_client = client is None
+    http = client or httpx.AsyncClient(timeout=timeout)
+    try:
+        response = await http.get(
+            f"{url}/checkpoint-epoch/commitment-set",
+            timeout=timeout,
+        )
+        if response.status_code >= 400:
+            raise SubmissionError(
+                f"commitment-set HTTP {response.status_code}: {_safe_detail(response)}"
+            )
+        try:
+            publication = parse_signed_commitment_set(response.content)
+        except (TypeError, ValueError) as exc:
+            raise SubmissionError("invalid checkpoint epoch commitment set") from exc
+        digest = publication.commitment_set_sha256
+        if (
+            expected_commitment_set_sha256 is not None
+            and digest != expected_commitment_set_sha256
+        ):
+            raise SubmissionError("checkpoint epoch commitment set changed")
+        if digest != commitment_set_sha256(publication.commitment_set):
+            raise SubmissionError("checkpoint epoch commitment-set hash differs")
+        etag = response.headers.get("ETag", "")
+        if etag != f'"{digest}"':
+            raise SubmissionError("checkpoint epoch commitment-set ETag differs")
+        if not verify_epoch_commitment_set_signature(
+            publication,
+            expected_validator_hotkey=expected_validator_hotkey,
+        ):
+            raise SubmissionError("checkpoint epoch commitment-set signature failed")
+        if expected_plan is not None:
+            try:
+                validate_commitment_set_for_plan(
+                    publication.commitment_set,
+                    expected_plan,
+                )
+            except (TypeError, ValueError) as exc:
+                raise SubmissionError(
+                    "checkpoint epoch commitment set differs from plan"
+                ) from exc
+        if response.content != canonical_signed_commitment_set_bytes(publication):
+            raise SubmissionError("checkpoint epoch commitment set is not canonical")
+        return publication
+    finally:
+        if own_client:
+            await http.aclose()
+
+
+async def get_checkpoint_epoch_intent_v1(
+    url: str,
+    *,
+    expected_validator_hotkey: str,
+    client: httpx.AsyncClient | None = None,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> SignedEpochIntent:
+    """Fetch the validator-signed intent that existed before epoch beacon."""
+    if not expected_validator_hotkey:
+        raise ValueError("expected validator hotkey is required")
+    own_client = client is None
+    http = client or httpx.AsyncClient(timeout=timeout)
+    try:
+        response = await http.get(
+            f"{url}/checkpoint-epoch/intent",
+            timeout=timeout,
+        )
+        if response.status_code >= 400:
+            raise SubmissionError(
+                f"epoch-intent HTTP {response.status_code}: {_safe_detail(response)}"
+            )
+        try:
+            publication = parse_signed_epoch_intent(response.content)
+        except (TypeError, ValueError) as exc:
+            raise SubmissionError("invalid signed checkpoint epoch intent") from exc
+        if response.headers.get("ETag", "") != (f'"{publication.intent_sha256}"'):
+            raise SubmissionError("checkpoint epoch intent ETag differs")
+        if not verify_epoch_intent_signature(
+            publication,
+            expected_validator_hotkey=expected_validator_hotkey,
+        ):
+            raise SubmissionError("checkpoint epoch intent signature failed")
+        if response.content != canonical_signed_intent_bytes(publication):
+            raise SubmissionError("checkpoint epoch intent is not canonical")
+        return publication
+    finally:
+        if own_client:
+            await http.aclose()
+
+
 async def reveal_checkpoint_epoch_payload_v1(
     url: str,
     *,
     receipt_id: str,
     payload: bytes,
     plan: EpochPlan,
+    expected_validator_hotkey: str,
     client: httpx.AsyncClient | None = None,
     timeout: float = _DEFAULT_TIMEOUT,
 ) -> BatchSubmissionResponse:
@@ -637,27 +878,34 @@ async def reveal_checkpoint_epoch_payload_v1(
             item.environment: item for item in epoch_window.prompt_slices
         }
         prompt_slice = slices.get(environment)
-        state_contract = state.generation_contract or {}
-        exact_state = (
-            state.state.value == "open"
-            and state.checkpoint_epoch_phase == "reveal"
-            and state.checkpoint_epoch_id == plan.epoch_id
-            and state.checkpoint_epoch_manifest_sha256 == manifest_sha256(plan)
-            and state.window_n == request.window_start
-            and state.checkpoint_n == plan.checkpoint.number
-            and state.checkpoint_repo_id == plan.checkpoint.repo_id
-            and state.checkpoint_revision == request.checkpoint_hash
-            == plan.checkpoint.revision
-            and state.protocol_version == plan.protocol.protocol_version
-            and state.generation_profile_id == plan.protocol.profile_id
-            and generation_contract_sha256(state_contract)
-            == plan.protocol.generation_contract_sha256
-            and state.randomness == epoch_window.generation_randomness
-            and request.prompt_idx not in state.cooldown_prompts
-            and prompt_slice is not None
-            and prompt_slice.start <= request.prompt_idx < prompt_slice.stop
-        )
-        if not exact_state:
+        expected_manifest = manifest_sha256(plan)
+
+        def exact_live_state(candidate) -> bool:
+            candidate_contract = candidate.generation_contract or {}
+            return bool(
+                candidate.state.value == "open"
+                and candidate.checkpoint_epoch_phase == "reveal"
+                and candidate.checkpoint_epoch_id == plan.epoch_id
+                and candidate.checkpoint_epoch_manifest_sha256 == expected_manifest
+                and candidate.window_n == request.window_start
+                and candidate.checkpoint_n == plan.checkpoint.number
+                and candidate.checkpoint_repo_id == plan.checkpoint.repo_id
+                and candidate.checkpoint_revision
+                == request.checkpoint_hash
+                == plan.checkpoint.revision
+                and candidate.protocol_version == plan.protocol.protocol_version
+                and candidate.generation_profile_id == plan.protocol.profile_id
+                and generation_contract_sha256(candidate_contract)
+                == plan.protocol.generation_contract_sha256
+                and candidate.randomness == epoch_window.generation_randomness
+                and candidate.checkpoint_epoch_commitment_set_sha256 is not None
+                and candidate.checkpoint_epoch_commitment_root is not None
+                and request.prompt_idx not in candidate.cooldown_prompts
+                and prompt_slice is not None
+                and prompt_slice.start <= request.prompt_idx < prompt_slice.stop
+            )
+
+        if not exact_live_state(state):
             raise SubmissionError("live state no longer matches epoch reveal binding")
         status = await get_checkpoint_epoch_commitment_status_v1(
             url,
@@ -670,6 +918,68 @@ async def reveal_checkpoint_epoch_payload_v1(
                 accepted=False,
                 reason=RejectReason.REVEAL_NOT_SELECTED,
             )
+        if (
+            status.commitment_set_sha256 != state.checkpoint_epoch_commitment_set_sha256
+            or status.commitment_root != state.checkpoint_epoch_commitment_root
+        ):
+            raise SubmissionError("commitment status differs from live frozen set")
+        publication = await get_checkpoint_epoch_commitment_set_v1(
+            url,
+            expected_validator_hotkey=expected_validator_hotkey,
+            expected_commitment_set_sha256=(
+                state.checkpoint_epoch_commitment_set_sha256
+            ),
+            expected_plan=plan,
+            client=http,
+            timeout=timeout,
+        )
+        commitment_set = publication.commitment_set
+        if (
+            commitment_set.epoch_id != plan.epoch_id
+            or commitment_set.manifest_sha256 != manifest_sha256(plan)
+            or commitment_set.commitment_root != state.checkpoint_epoch_commitment_root
+            or status.admission_beacon_round is None
+            or state.checkpoint_epoch_admission_beacon_round is None
+            or status.admission_beacon_round
+            != state.checkpoint_epoch_admission_beacon_round
+            or state.checkpoint_epoch_admission_beacon_round
+            <= commitment_set.commitment_close_round
+        ):
+            raise SubmissionError("signed commitment set differs from epoch state")
+        payload_sha256 = hashlib.sha256(payload).hexdigest()
+        matching = [
+            record
+            for record in commitment_set.commitments
+            if record.receipt_id == receipt_id
+        ]
+        if len(matching) != 1:
+            raise SubmissionError("commitment receipt is absent or duplicated")
+        record = matching[0]
+        if (
+            record.miner_hotkey != request.miner_hotkey
+            or record.window_number != request.window_start
+            or record.environment != environment
+            or record.prompt_idx != request.prompt_idx
+            or record.payload_sha256 != payload_sha256
+        ):
+            raise SubmissionError("payload differs from signed commitment record")
+        release_state = await get_window_state_v2(
+            url,
+            env=environment,
+            window=request.window_start,
+            client=http,
+            timeout=timeout,
+        )
+        if (
+            not exact_live_state(release_state)
+            or release_state.checkpoint_epoch_commitment_set_sha256
+            != publication.commitment_set_sha256
+            or release_state.checkpoint_epoch_commitment_root
+            != commitment_set.commitment_root
+            or release_state.checkpoint_epoch_admission_beacon_round
+            != status.admission_beacon_round
+        ):
+            raise SubmissionError("epoch binding changed before payload release")
         response = await http.post(
             f"{url}/submit",
             content=payload,
@@ -707,6 +1017,7 @@ async def get_runtime_contract_v1(
 async def get_checkpoint_epoch_plan_v1(
     url: str,
     *,
+    expected_validator_hotkey: str,
     expected_manifest_sha256: str | None = None,
     client: httpx.AsyncClient | None = None,
     timeout: float = _DEFAULT_TIMEOUT,
@@ -717,6 +1028,8 @@ async def get_checkpoint_epoch_plan_v1(
     warm-up, before an ordinary window exists. Local release must still match
     the same digest in the later exact-OPEN state.
     """
+    if not expected_validator_hotkey:
+        raise ValueError("expected validator hotkey is required")
     if expected_manifest_sha256 is not None and (
         len(expected_manifest_sha256) != 64
         or any(
@@ -784,12 +1097,26 @@ async def get_checkpoint_epoch_plan_v1(
                 raise SubmissionError(
                     "checkpoint epoch manifest validation failed"
                 ) from exc
-            if (
-                plan.experimental_capability_id
-                != CHECKPOINT_EPOCH_CAPABILITY_ID
-            ):
+            if plan.experimental_capability_id != CHECKPOINT_EPOCH_CAPABILITY_ID:
+                raise SubmissionError("unsupported checkpoint epoch capability")
+            publication = await get_checkpoint_epoch_intent_v1(
+                url,
+                expected_validator_hotkey=expected_validator_hotkey,
+                client=http,
+                timeout=timeout,
+            )
+            try:
+                expected_plan = plan_from_intent(
+                    publication.intent,
+                    beacon=plan.epoch_beacon,
+                )
+            except (TypeError, ValueError) as exc:
                 raise SubmissionError(
-                    "unsupported checkpoint epoch capability"
+                    "checkpoint epoch plan differs from signed intent"
+                ) from exc
+            if expected_plan != plan:
+                raise SubmissionError(
+                    "checkpoint epoch plan differs from signed intent"
                 )
             await _verify_checkpoint_epoch_public_beacon(plan)
             return plan

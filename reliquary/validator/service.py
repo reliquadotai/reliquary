@@ -108,7 +108,10 @@ from reliquary.shared.checkpoint_epoch import (
     EpochPlan,
     EpochWindow,
     ProtocolBinding,
+    SignedEpochCommitmentSet,
     WindowSchedule,
+    commitment_set_sha256,
+    commitment_set_signing_bytes,
     generation_contract_sha256,
     manifest_sha256,
 )
@@ -118,7 +121,10 @@ from reliquary.validator.checkpoint import CheckpointStore
 from reliquary.validator.checkpoint_epoch_runtime import (
     EpochCommitIntent,
     EpochStore,
+    SignedEpochIntent,
     build_epoch_intent,
+    canonical_signed_intent_bytes,
+    intent_signing_bytes,
     plan_from_intent,
 )
 from reliquary.validator.cooldown import ContentCooldownMap, CooldownMap
@@ -837,28 +843,28 @@ class ValidationService:
         self._checkpoint_n: int = 0
         self._publish_every = CHECKPOINT_PUBLISH_INTERVAL_WINDOWS
         self._trained_windows_since_publish = 0
+        self._training_tombstoned_windows: set[int] = set()
         self._adaptive_publication_pending = False
         self._adaptive_publication_reason: str | None = None
-        self.server.set_training_publish_state({
-            "trained_windows_since_publish": 0,
-            "publish_interval": self._publish_every,
-            "publication_pending": False,
-            "adaptive_publication_pending": False,
-            "adaptive_publication_reason": None,
-        })
+        self.server.set_training_publish_state(
+            {
+                "trained_windows_since_publish": 0,
+                "publish_interval": self._publish_every,
+                "publication_pending": False,
+                "adaptive_publication_pending": False,
+                "adaptive_publication_reason": None,
+            }
+        )
         accumulator_targets = dict(self.env_mix)
         if (
             EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED
-            and EXPERIMENTAL_CHECKPOINT_EPOCH_TRAINING_MODE
-            == "aggregate_one_step"
+            and EXPERIMENTAL_CHECKPOINT_EPOCH_TRAINING_MODE == "aggregate_one_step"
         ):
             accumulator_targets = {
                 name: target * CHECKPOINT_PUBLISH_INTERVAL_WINDOWS
                 for name, target in accumulator_targets.items()
             }
-        self._training_accumulator = BalancedTrainingAccumulator(
-            accumulator_targets
-        )
+        self._training_accumulator = BalancedTrainingAccumulator(accumulator_targets)
         self.server.set_training_accumulator_state(
             self._training_accumulator.snapshot()
         )
@@ -1932,16 +1938,22 @@ class ValidationService:
             and existing.checkpoint.number == int(checkpoint.checkpoint_n)
             and existing.checkpoint.repo_id == str(checkpoint.repo_id)
             and existing.checkpoint.revision == str(checkpoint.revision)
-            and existing.first_window <= next_window
+            and existing.first_window
+            <= next_window
             < existing.first_window + existing.window_count
             and store.is_confirmed(existing)
         ):
+            publication = store.load_signed_intent(existing)
+            if publication is None:
+                raise RuntimeError("confirmed checkpoint epoch intent is unsigned")
+            self.server.set_checkpoint_epoch_signed_intent(
+                canonical_signed_intent_bytes(publication),
+                intent_sha256=publication.intent_sha256,
+            )
             return existing
 
         for _attempt in range(4):
-            chain_info, observed_round = (
-                await self._checkpoint_epoch_drand_snapshot()
-            )
+            chain_info, observed_round = await self._checkpoint_epoch_drand_snapshot()
             intent = build_epoch_intent(
                 protocol=protocol,
                 checkpoint_number=int(checkpoint.checkpoint_n),
@@ -1971,16 +1983,28 @@ class ValidationService:
                 ),
                 reveal_seconds=EXPERIMENTAL_CHECKPOINT_EPOCH_REVEAL_SECONDS,
                 environment_universes={
-                    name: len(environment)
-                    for name, environment in self.envs.items()
+                    name: len(environment) for name, environment in self.envs.items()
                 },
             )
             store.install_intent(intent)
+            publication = SignedEpochIntent(
+                intent=intent,
+                intent_sha256=intent.intent_id,
+                validator_hotkey=str(self.wallet.hotkey.ss58_address),
+                validator_signature=self.wallet.hotkey.sign(
+                    intent_signing_bytes(intent)
+                ).hex(),
+            )
+            signed_raw = store.install_signed_intent(publication)
             _, confirmed_round = await self._checkpoint_epoch_drand_snapshot()
             if confirmed_round < intent.beacon_target_round:
                 store.confirm_before_beacon(
                     intent,
                     observed_round=confirmed_round,
+                )
+                self.server.set_checkpoint_epoch_signed_intent(
+                    signed_raw,
+                    intent_sha256=publication.intent_sha256,
                 )
                 return intent
         raise RuntimeError(
@@ -2074,15 +2098,16 @@ class ValidationService:
                 terminal_status = "aborted"
                 store.mark_terminal(restored, status=terminal_status)
             if terminal_status == "aborted":
-                for window_number in range(
-                    max(next_window, restored.first_window),
-                    restored.first_window + restored.window_count,
-                ):
-                    self._write_training_tombstone(
-                        window_number,
-                        "checkpoint_epoch_restart",
-                        "InterruptedCheckpointEpoch",
-                    )
+                self._abort_training_epoch_journal(
+                    restored,
+                    failure_stage="checkpoint_epoch_restart",
+                    failure_type="InterruptedCheckpointEpoch",
+                )
+            else:
+                self._write_training_epoch_marker(
+                    restored,
+                    status="completed",
+                )
             self._window_n = max(
                 self._window_n,
                 restored.first_window + restored.window_count - 1,
@@ -2102,11 +2127,30 @@ class ValidationService:
         if (
             restored is not None
             and self._checkpoint_epoch_matches(restored, checkpoint)
-            and restored.first_window <= next_window
+            and restored.first_window
+            <= next_window
             < restored.first_window + restored.window_count
         ):
             self._validate_checkpoint_epoch_runtime_config(restored)
             await self._verify_checkpoint_epoch_beacon(restored.epoch_beacon)
+            restored_intent = store.load_current_intent()
+            if (
+                restored_intent is None
+                or not store.is_confirmed(restored_intent)
+                or plan_from_intent(
+                    restored_intent,
+                    beacon=restored.epoch_beacon,
+                )
+                != restored
+            ):
+                raise RuntimeError("restored epoch plan lacks its confirmed intent")
+            restored_publication = store.load_signed_intent(restored_intent)
+            if restored_publication is None:
+                raise RuntimeError("restored epoch plan lacks its signed intent")
+            self.server.set_checkpoint_epoch_signed_intent(
+                canonical_signed_intent_bytes(restored_publication),
+                intent_sha256=restored_publication.intent_sha256,
+            )
             plan = restored
         else:
             intent = await self._checkpoint_epoch_intent(
@@ -2459,6 +2503,11 @@ class ValidationService:
                 store = self._checkpoint_epoch_store
                 if store is not None:
                     store.mark_terminal(plan, status="aborted")
+                self._abort_training_epoch_journal(
+                    plan,
+                    failure_stage=failure_stage,
+                    failure_type=failure_type,
+                )
             self._set_state(WindowState.READY)
 
         try:
@@ -2488,9 +2537,30 @@ class ValidationService:
             await self._wait_for_checkpoint_epoch_phase_deadline(
                 seconds_from_open=plan.window_schedule.collection_seconds
             )
+            # Close ingress synchronously before any await. Requests already
+            # inside the HTTP handler are drained; later ones see selection and
+            # cannot enter the frozen set.
+            self.server.set_checkpoint_epoch_phase("selection")
             await self.server.drain_checkpoint_epoch_commitments()
-            commitment_close_round, admission_beacon = (
-                await self._fetch_checkpoint_epoch_admission_beacon()
+            _, commitment_close_round = await self._checkpoint_epoch_drand_snapshot()
+            frozen_set = self.server.freeze_checkpoint_epoch_commitment_set(
+                commitment_close_round=commitment_close_round,
+                validator_hotkey=str(self.wallet.hotkey.ss58_address),
+            )
+            publication = SignedEpochCommitmentSet(
+                commitment_set=frozen_set,
+                commitment_set_sha256=commitment_set_sha256(frozen_set),
+                validator_signature=self.wallet.hotkey.sign(
+                    commitment_set_signing_bytes(frozen_set)
+                ).hex(),
+            )
+            store = self._checkpoint_epoch_store
+            if store is None:
+                raise RuntimeError("checkpoint epoch store is unavailable")
+            store.install_commitment_set(plan, publication)
+            self.server.install_checkpoint_epoch_commitment_set(publication)
+            _, admission_beacon = await self._fetch_checkpoint_epoch_admission_beacon(
+                commitment_close_round=commitment_close_round,
             )
             reveal_deadline_ts = time.time() + plan.reveal_seconds
             selected_counts = self.server.select_checkpoint_epoch_reveals(
@@ -2573,7 +2643,21 @@ class ValidationService:
         store = self._checkpoint_epoch_store
         if store is None:
             raise RuntimeError("checkpoint epoch store is unavailable")
-        store.mark_terminal(plan, status="completed")
+        epoch_windows = {window.window_number for window in plan.windows}
+        training_status = (
+            "aborted"
+            if epoch_windows.intersection(self._training_tombstoned_windows)
+            else "completed"
+        )
+        store.mark_terminal(plan, status=training_status)
+        if training_status == "aborted":
+            self._abort_training_epoch_journal(
+                plan,
+                failure_stage="checkpoint_epoch_training_journal",
+                failure_type="IncompleteCheckpointEpoch",
+            )
+        else:
+            self._write_training_epoch_marker(plan, status="completed")
         self._set_state(WindowState.READY)
 
     async def _refresh_registered_hotkeys(
@@ -3783,6 +3867,9 @@ class ValidationService:
                 self._checkpoint_n,
                 TRAIN_UNTIL_CHECKPOINT_N,
             )
+            if detached_trainer and epoch_finalize:
+                accumulator_meta["discarded"] = self._training_accumulator.reset()
+                accumulator_meta["reset_reason"] = "detached_epoch_journal_owns_batch"
         elif accumulator_ready:
             accumulator_meta["training_attempted"] = True
             try:
@@ -4651,29 +4738,70 @@ class ValidationService:
         from reliquary.shared.training_payload import encode_training_payload
 
         try:
+            checkpoint_epoch = self._training_payload_epoch_binding(window_n)
             data = encode_training_payload(
                 window_batches,
                 window_start=int(window_n),
                 checkpoint_revision=str(checkpoint_revision),
                 env_order=[name for name, _ in self.env_mix],
                 window_quarantine=dict(window_quarantine or {}),
+                checkpoint_epoch=checkpoint_epoch,
             )
             self._training_payload_queue_ref().enqueue_payload(
-                int(window_n), data,
+                int(window_n),
+                data,
             )
+            self._training_tombstoned_windows.discard(int(window_n))
         except Exception:
             logger.exception(
-                "training payload write failed for window %s", window_n,
+                "training payload write failed for window %s",
+                window_n,
             )
             # The journal contract is "never advance on absence": a hole
             # with neither payload nor tombstone stalls the trainer
             # forever. A failed encode must still produce a marker.
             self._write_training_tombstone(
-                window_n, "payload_encode", "PayloadEncodeError",
+                window_n,
+                "payload_encode",
+                "PayloadEncodeError",
             )
 
+    def _training_payload_epoch_binding(
+        self,
+        window_start: int,
+        *,
+        plan: EpochPlan | None = None,
+    ):
+        epoch_plan = plan or self._checkpoint_epoch_plan
+        if epoch_plan is None:
+            return None
+        offset = int(window_start) - epoch_plan.first_window
+        if offset < 0 or offset >= epoch_plan.window_count:
+            return None
+        from reliquary.shared.training_payload import (
+            CheckpointEpochTrainingBinding,
+        )
+
+        return CheckpointEpochTrainingBinding(
+            epoch_id=epoch_plan.epoch_id,
+            manifest_sha256=manifest_sha256(epoch_plan),
+            training_run_id=TRAINING_RUN_ID,
+            training_mode=epoch_plan.training_mode,
+            first_window=epoch_plan.first_window,
+            lane_offset=offset,
+            window_count=epoch_plan.window_count,
+            target_groups_per_environment_lane=(
+                epoch_plan.target_groups_per_environment_lane
+            ),
+        )
+
     def _write_training_tombstone(
-        self, window_start: int, failure_stage: str, failure_type: str,
+        self,
+        window_start: int,
+        failure_stage: str,
+        failure_type: str,
+        *,
+        checkpoint_epoch_plan: EpochPlan | None = None,
     ) -> None:
         """Tombstone keeps the trainer's journal gapless: the trainer
         never advances on absence, only on an explicit marker."""
@@ -4683,19 +4811,94 @@ class ValidationService:
             return
         from reliquary.shared.training_payload import encode_tombstone
 
+        checkpoint_epoch = self._training_payload_epoch_binding(
+            window_start,
+            plan=checkpoint_epoch_plan,
+        )
         try:
+            if checkpoint_epoch is not None:
+                self._training_tombstoned_windows.add(int(window_start))
             self._training_payload_queue_ref().enqueue_tombstone(
                 int(window_start),
                 encode_tombstone(
                     window_start=int(window_start),
                     failure_stage=str(failure_stage),
                     failure_type=str(failure_type),
+                    checkpoint_epoch=checkpoint_epoch,
                 ),
             )
         except Exception:
             logger.exception(
-                "training tombstone write failed for window %s", window_start,
+                "training tombstone write failed for window %s",
+                window_start,
             )
+            if checkpoint_epoch is not None:
+                raise
+
+    def _write_training_epoch_marker(
+        self,
+        plan: EpochPlan,
+        *,
+        status: str,
+    ) -> None:
+        from reliquary.constants import WRITE_TRAINING_PAYLOADS
+
+        if not WRITE_TRAINING_PAYLOADS:
+            return
+        from reliquary.shared.training_payload import (
+            encode_checkpoint_epoch_marker,
+        )
+
+        binding = self._training_payload_epoch_binding(
+            plan.first_window,
+            plan=plan,
+        )
+        if binding is None:
+            raise RuntimeError("checkpoint epoch marker has no plan binding")
+        try:
+            data = encode_checkpoint_epoch_marker(binding, status=status)
+            self._training_payload_queue_ref().enqueue_epoch_marker(
+                plan.epoch_id,
+                data,
+            )
+            self._training_tombstoned_windows.difference_update(
+                range(
+                    plan.first_window,
+                    plan.first_window + plan.window_count,
+                )
+            )
+        except Exception:
+            logger.exception(
+                "training epoch marker write failed for epoch %s",
+                plan.epoch_id[:12],
+            )
+            raise
+
+    def _abort_training_epoch_journal(
+        self,
+        plan: EpochPlan,
+        *,
+        failure_stage: str,
+        failure_type: str,
+    ) -> None:
+        """Make an aborted epoch gapless before publishing its commit marker."""
+        failures: list[int] = []
+        for window in plan.windows:
+            try:
+                self._write_training_tombstone(
+                    window.window_number,
+                    failure_stage,
+                    failure_type,
+                    checkpoint_epoch_plan=plan,
+                )
+            except Exception:
+                failures.append(window.window_number)
+        if failures:
+            raise RuntimeError(
+                "checkpoint epoch abort journal is incomplete for windows "
+                + ",".join(str(window) for window in failures)
+            )
+        self._write_training_epoch_marker(plan, status="aborted")
 
     def _training_payload_queue_ref(self):
         """Injected queue for tests; process singleton in production."""
@@ -6013,18 +6216,24 @@ class ValidationService:
         self,
         *,
         after_round: int = 0,
+        phase_close_round: int | None = None,
     ) -> tuple[int, BeaconBinding]:
         """Return the first verified beacon after a locally observed phase end."""
         plan = self._checkpoint_epoch_plan
         if plan is None or not self.use_drand:
             raise RuntimeError("checkpoint epoch seal requires drand")
-        chain_info, close_round = await self._checkpoint_epoch_drand_snapshot()
+        chain_info, observed_round = await self._checkpoint_epoch_drand_snapshot()
+        close_round = (
+            observed_round if phase_close_round is None else int(phase_close_round)
+        )
         if (
             str(chain_info["name"]) != plan.epoch_beacon.chain
             or str(chain_info["hash"]) != plan.epoch_beacon.chain_hash
         ):
             raise RuntimeError("drand chain changed during checkpoint epoch")
-        target_round = max(close_round, int(after_round)) + 1
+        # Choose the target only after all phase data was frozen and persisted.
+        # If persistence crossed a drand boundary, skip that now-known output.
+        target_round = max(observed_round, close_round, int(after_round)) + 1
         while True:
             _, current_round = await self._checkpoint_epoch_drand_snapshot()
             if current_round >= target_round:
@@ -6053,12 +6262,15 @@ class ValidationService:
 
     async def _fetch_checkpoint_epoch_admission_beacon(
         self,
+        *,
+        commitment_close_round: int,
     ) -> tuple[int, BeaconBinding]:
         plan = self._checkpoint_epoch_plan
         if plan is None:
             raise RuntimeError("checkpoint epoch plan is unavailable")
         return await self._fetch_checkpoint_epoch_post_phase_beacon(
-            after_round=plan.epoch_beacon.round
+            after_round=plan.epoch_beacon.round,
+            phase_close_round=commitment_close_round,
         )
 
     async def _fetch_checkpoint_epoch_seal_beacon(

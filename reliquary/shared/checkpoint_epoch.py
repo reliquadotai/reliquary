@@ -14,15 +14,18 @@ import math
 from typing import Any, Mapping, Sequence
 
 
-CHECKPOINT_EPOCH_SCHEMA_VERSION = 4
-CHECKPOINT_EPOCH_CAPABILITY_ID = "checkpoint-epoch-scheduling-v4"
+CHECKPOINT_EPOCH_SCHEMA_VERSION = 5
+CHECKPOINT_EPOCH_CAPABILITY_ID = "checkpoint-epoch-scheduling-v5"
 CHECKPOINT_EPOCH_REQUIRED_WINDOW_COUNT = 16
 CHECKPOINT_EPOCH_SCHEDULE_MODE = "concurrent_checkpoint_epoch"
-CHECKPOINT_EPOCH_ADMISSION_POLICY = "post_commit_operator_rounds_v1"
-CHECKPOINT_EPOCH_TRAINING_MODES = frozenset({
-    "aggregate_one_step",
-    "sequential_steps",
-})
+CHECKPOINT_EPOCH_ADMISSION_POLICY = "signed_set_operator_rounds_v2"
+CHECKPOINT_EPOCH_COMMITMENT_SET_SCHEMA_VERSION = 1
+CHECKPOINT_EPOCH_TRAINING_MODES = frozenset(
+    {
+        "aggregate_one_step",
+        "sequential_steps",
+    }
+)
 
 _ID_DOMAIN = b"reliquary/checkpoint-epoch/id/v1"
 _ROOT_DOMAIN = b"reliquary/checkpoint-epoch/root/v1"
@@ -30,6 +33,8 @@ _WINDOW_DOMAIN = b"reliquary/checkpoint-epoch/window/v1"
 _SLICE_DOMAIN = b"reliquary/checkpoint-epoch/slice/v1"
 _ADMISSION_OPERATOR_DOMAIN = b"reliquary/checkpoint-epoch/admission-operator/v1"
 _ADMISSION_COMMITMENT_DOMAIN = b"reliquary/checkpoint-epoch/admission-commitment/v1"
+_COMMITMENT_SET_ROOT_DOMAIN = b"reliquary/checkpoint-epoch/commitment-set-root/v1"
+_COMMITMENT_SET_SIGNING_DOMAIN = b"reliquary/checkpoint-epoch/commitment-set-signing/v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,12 +123,49 @@ class EpochAdmissionCommitment:
     payload_sha256: str
 
 
+@dataclass(frozen=True, slots=True)
+class EpochCommitmentRecord:
+    """One accepted compact commitment in the public frozen set."""
+
+    receipt_id: str
+    commitment_id: str
+    operator_id: str
+    miner_hotkey: str
+    window_number: int
+    environment: str
+    prompt_idx: int
+    payload_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class EpochCommitmentSet:
+    """Canonical set frozen and persisted before the admission beacon."""
+
+    schema_version: int
+    epoch_id: str
+    manifest_sha256: str
+    commitment_close_round: int
+    validator_hotkey: str
+    commitment_root: str
+    commitments: tuple[EpochCommitmentRecord, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SignedEpochCommitmentSet:
+    """Public validator attestation over one immutable commitment set."""
+
+    commitment_set: EpochCommitmentSet
+    commitment_set_sha256: str
+    validator_signature: str
+
+
 def select_epoch_reveals(
     commitments: Sequence[EpochAdmissionCommitment],
     *,
     admission_randomness: str,
     epoch_id: str,
     manifest_sha256_hex: str,
+    commitment_set_sha256_hex: str,
     limit: int,
     per_prompt_limit: int,
 ) -> tuple[str, ...]:
@@ -136,10 +178,9 @@ def select_epoch_reveals(
     _require_hex64("admission_randomness", admission_randomness)
     _require_hex64("epoch_id", epoch_id)
     _require_hex64("manifest_sha256_hex", manifest_sha256_hex)
+    _require_hex64("commitment_set_sha256_hex", commitment_set_sha256_hex)
     limit = _require_int("limit", limit, minimum=1)
-    per_prompt_limit = _require_int(
-        "per_prompt_limit", per_prompt_limit, minimum=1
-    )
+    per_prompt_limit = _require_int("per_prompt_limit", per_prompt_limit, minimum=1)
     by_operator: dict[str, list[EpochAdmissionCommitment]] = {}
     seen: set[str] = set()
     lane: tuple[int, str] | None = None
@@ -165,6 +206,7 @@ def select_epoch_reveals(
     beacon = bytes.fromhex(admission_randomness)
     epoch = bytes.fromhex(epoch_id)
     manifest = bytes.fromhex(manifest_sha256_hex)
+    commitment_set_digest = bytes.fromhex(commitment_set_sha256_hex)
 
     def operator_key(operator_id: str) -> str:
         if lane is None:
@@ -174,10 +216,13 @@ def select_epoch_reveals(
             beacon,
             epoch,
             manifest,
-            canonical_json_bytes({
-                "environment": lane[1],
-                "window_number": lane[0],
-            }),
+            commitment_set_digest,
+            canonical_json_bytes(
+                {
+                    "environment": lane[1],
+                    "window_number": lane[0],
+                }
+            ),
             operator_id.encode("utf-8"),
         )
 
@@ -187,14 +232,17 @@ def select_epoch_reveals(
             beacon,
             epoch,
             manifest,
-            canonical_json_bytes({
-                "commitment_id": commitment.commitment_id,
-                "environment": commitment.environment,
-                "operator_id": commitment.operator_id,
-                "payload_sha256": commitment.payload_sha256,
-                "prompt_idx": commitment.prompt_idx,
-                "window_number": commitment.window_number,
-            }),
+            commitment_set_digest,
+            canonical_json_bytes(
+                {
+                    "commitment_id": commitment.commitment_id,
+                    "environment": commitment.environment,
+                    "operator_id": commitment.operator_id,
+                    "payload_sha256": commitment.payload_sha256,
+                    "prompt_idx": commitment.prompt_idx,
+                    "window_number": commitment.window_number,
+                }
+            ),
         )
 
     operators = sorted(by_operator, key=lambda value: (operator_key(value), value))
@@ -284,6 +332,290 @@ def _frame_hash(domain: bytes, *parts: bytes) -> str:
         digest.update(len(part).to_bytes(8, "big"))
         digest.update(part)
     return digest.hexdigest()
+
+
+def _commitment_record_dict(
+    value: EpochCommitmentRecord,
+) -> dict[str, Any]:
+    return {
+        "receipt_id": value.receipt_id,
+        "commitment_id": value.commitment_id,
+        "operator_id": value.operator_id,
+        "miner_hotkey": value.miner_hotkey,
+        "window_number": value.window_number,
+        "environment": value.environment,
+        "prompt_idx": value.prompt_idx,
+        "payload_sha256": value.payload_sha256,
+    }
+
+
+def _validate_commitment_record(value: EpochCommitmentRecord) -> None:
+    if not isinstance(value, EpochCommitmentRecord):
+        raise TypeError("commitments must contain EpochCommitmentRecord")
+    _require_text("receipt_id", value.receipt_id)
+    _require_text("commitment_id", value.commitment_id)
+    _require_text("operator_id", value.operator_id)
+    _require_text("miner_hotkey", value.miner_hotkey)
+    _require_int("window_number", value.window_number, minimum=0)
+    _require_text("environment", value.environment)
+    _require_int("prompt_idx", value.prompt_idx, minimum=0)
+    _require_hex64("payload_sha256", value.payload_sha256)
+
+
+def _canonical_commitment_records(
+    commitments: Sequence[EpochCommitmentRecord],
+) -> tuple[EpochCommitmentRecord, ...]:
+    records = tuple(commitments)
+    for record in records:
+        _validate_commitment_record(record)
+    ordered = tuple(
+        sorted(
+            records,
+            key=lambda record: canonical_json_bytes(_commitment_record_dict(record)),
+        )
+    )
+    if records != ordered:
+        raise ValueError("checkpoint epoch commitments are not canonical")
+    receipt_ids = {record.receipt_id for record in records}
+    commitment_ids = {record.commitment_id for record in records}
+    if len(receipt_ids) != len(records):
+        raise ValueError("duplicate checkpoint epoch receipt")
+    if len(commitment_ids) != len(records):
+        raise ValueError("duplicate checkpoint epoch commitment")
+    return records
+
+
+def _commitment_root(
+    commitments: Sequence[EpochCommitmentRecord],
+) -> str:
+    records = [_commitment_record_dict(item) for item in commitments]
+    return _frame_hash(
+        _COMMITMENT_SET_ROOT_DOMAIN,
+        canonical_json_bytes(records),
+    )
+
+
+def commitment_set_to_dict(value: EpochCommitmentSet) -> dict[str, Any]:
+    return {
+        "schema_version": value.schema_version,
+        "epoch_id": value.epoch_id,
+        "manifest_sha256": value.manifest_sha256,
+        "commitment_close_round": value.commitment_close_round,
+        "validator_hotkey": value.validator_hotkey,
+        "commitment_root": value.commitment_root,
+        "commitments": [
+            _commitment_record_dict(record) for record in value.commitments
+        ],
+    }
+
+
+def validate_commitment_set(value: EpochCommitmentSet) -> None:
+    if not isinstance(value, EpochCommitmentSet):
+        raise TypeError("commitment_set must be an EpochCommitmentSet")
+    if value.schema_version != CHECKPOINT_EPOCH_COMMITMENT_SET_SCHEMA_VERSION:
+        raise ValueError("unsupported checkpoint epoch commitment-set schema")
+    _require_hex64("epoch_id", value.epoch_id)
+    _require_hex64("manifest_sha256", value.manifest_sha256)
+    _require_int("commitment_close_round", value.commitment_close_round, minimum=1)
+    _require_text("validator_hotkey", value.validator_hotkey)
+    _require_hex64("commitment_root", value.commitment_root)
+    records = _canonical_commitment_records(value.commitments)
+    if value.commitment_root != _commitment_root(records):
+        raise ValueError("checkpoint epoch commitment root differs")
+
+
+def build_commitment_set(
+    commitments: Sequence[EpochCommitmentRecord],
+    *,
+    epoch_id: str,
+    manifest_sha256_hex: str,
+    commitment_close_round: int,
+    validator_hotkey: str,
+) -> EpochCommitmentSet:
+    _require_hex64("epoch_id", epoch_id)
+    _require_hex64("manifest_sha256_hex", manifest_sha256_hex)
+    _require_int("commitment_close_round", commitment_close_round, minimum=1)
+    _require_text("validator_hotkey", validator_hotkey)
+    supplied = tuple(commitments)
+    for record in supplied:
+        _validate_commitment_record(record)
+    records = tuple(
+        sorted(
+            supplied,
+            key=lambda record: canonical_json_bytes(_commitment_record_dict(record)),
+        )
+    )
+    value = EpochCommitmentSet(
+        schema_version=CHECKPOINT_EPOCH_COMMITMENT_SET_SCHEMA_VERSION,
+        epoch_id=epoch_id,
+        manifest_sha256=manifest_sha256_hex,
+        commitment_close_round=int(commitment_close_round),
+        validator_hotkey=validator_hotkey,
+        commitment_root=_commitment_root(records),
+        commitments=records,
+    )
+    validate_commitment_set(value)
+    return value
+
+
+def canonical_commitment_set_bytes(value: EpochCommitmentSet) -> bytes:
+    validate_commitment_set(value)
+    return canonical_json_bytes(commitment_set_to_dict(value))
+
+
+def commitment_set_sha256(value: EpochCommitmentSet) -> str:
+    return hashlib.sha256(canonical_commitment_set_bytes(value)).hexdigest()
+
+
+def commitment_set_signing_bytes(value: EpochCommitmentSet) -> bytes:
+    """Return the fixed-size message signed by the validator hotkey."""
+    return bytes.fromhex(
+        _frame_hash(
+            _COMMITMENT_SET_SIGNING_DOMAIN,
+            canonical_commitment_set_bytes(value),
+        )
+    )
+
+
+def signed_commitment_set_to_dict(
+    value: SignedEpochCommitmentSet,
+) -> dict[str, Any]:
+    return {
+        "commitment_set": commitment_set_to_dict(value.commitment_set),
+        "commitment_set_sha256": value.commitment_set_sha256,
+        "validator_signature": value.validator_signature,
+    }
+
+
+def validate_signed_commitment_set(
+    value: SignedEpochCommitmentSet,
+) -> None:
+    if not isinstance(value, SignedEpochCommitmentSet):
+        raise TypeError("publication must be a SignedEpochCommitmentSet")
+    validate_commitment_set(value.commitment_set)
+    _require_hex64("commitment_set_sha256", value.commitment_set_sha256)
+    if value.commitment_set_sha256 != commitment_set_sha256(value.commitment_set):
+        raise ValueError("checkpoint epoch commitment-set SHA-256 differs")
+    signature = value.validator_signature
+    if (
+        not isinstance(signature, str)
+        or not signature
+        or len(signature) > 256
+        or len(signature) % 2
+        or any(character not in "0123456789abcdef" for character in signature)
+    ):
+        raise ValueError("validator signature must be lowercase hexadecimal")
+
+
+def validate_commitment_set_for_plan(
+    value: EpochCommitmentSet,
+    plan: EpochPlan,
+) -> None:
+    """Validate every frozen record against its immutable epoch lane."""
+    validate_commitment_set(value)
+    validate_epoch_plan(plan)
+    if (
+        value.epoch_id != plan.epoch_id
+        or value.manifest_sha256 != manifest_sha256(plan)
+    ):
+        raise ValueError("checkpoint epoch commitment set differs from plan")
+
+    windows = {window.window_number: window for window in plan.windows}
+    operator_lane_counts: dict[tuple[str, int, str], int] = {}
+    for record in value.commitments:
+        window = windows.get(record.window_number)
+        if window is None:
+            raise ValueError("checkpoint epoch commitment window is outside plan")
+        slices = {
+            prompt_slice.environment: prompt_slice
+            for prompt_slice in window.prompt_slices
+        }
+        prompt_slice = slices.get(record.environment)
+        if prompt_slice is None or not (
+            prompt_slice.start <= record.prompt_idx < prompt_slice.stop
+        ):
+            raise ValueError("checkpoint epoch commitment prompt is outside plan")
+        count_key = (
+            record.operator_id,
+            record.window_number,
+            record.environment,
+        )
+        operator_lane_counts[count_key] = operator_lane_counts.get(count_key, 0) + 1
+        if operator_lane_counts[count_key] > (
+            plan.commitments_per_operator_per_environment_lane
+        ):
+            raise ValueError("checkpoint epoch operator commitment bound exceeded")
+
+
+def canonical_signed_commitment_set_bytes(
+    value: SignedEpochCommitmentSet,
+) -> bytes:
+    validate_signed_commitment_set(value)
+    return canonical_json_bytes(signed_commitment_set_to_dict(value))
+
+
+def parse_signed_commitment_set(
+    raw: bytes | str,
+) -> SignedEpochCommitmentSet:
+    raw_bytes = raw.encode("utf-8") if isinstance(raw, str) else bytes(raw)
+    obj = _strict_json_loads(raw_bytes)
+    _exact_keys(
+        obj,
+        {"commitment_set", "commitment_set_sha256", "validator_signature"},
+        "signed commitment set",
+    )
+    set_obj = _mapping(obj["commitment_set"], "commitment_set")
+    _exact_keys(
+        set_obj,
+        {
+            "schema_version",
+            "epoch_id",
+            "manifest_sha256",
+            "commitment_close_round",
+            "validator_hotkey",
+            "commitment_root",
+            "commitments",
+        },
+        "commitment_set",
+    )
+    records: list[EpochCommitmentRecord] = []
+    for index, item in enumerate(
+        _list(set_obj["commitments"], "commitment_set.commitments")
+    ):
+        record_obj = _mapping(item, f"commitment_set.commitments[{index}]")
+        _exact_keys(
+            record_obj,
+            {
+                "receipt_id",
+                "commitment_id",
+                "operator_id",
+                "miner_hotkey",
+                "window_number",
+                "environment",
+                "prompt_idx",
+                "payload_sha256",
+            },
+            f"commitment_set.commitments[{index}]",
+        )
+        records.append(EpochCommitmentRecord(**record_obj))
+    commitment_set = EpochCommitmentSet(
+        schema_version=set_obj["schema_version"],
+        epoch_id=set_obj["epoch_id"],
+        manifest_sha256=set_obj["manifest_sha256"],
+        commitment_close_round=set_obj["commitment_close_round"],
+        validator_hotkey=set_obj["validator_hotkey"],
+        commitment_root=set_obj["commitment_root"],
+        commitments=tuple(records),
+    )
+    publication = SignedEpochCommitmentSet(
+        commitment_set=commitment_set,
+        commitment_set_sha256=obj["commitment_set_sha256"],
+        validator_signature=obj["validator_signature"],
+    )
+    validate_signed_commitment_set(publication)
+    if raw_bytes != canonical_signed_commitment_set_bytes(publication):
+        raise ValueError("signed commitment set is not canonical JSON")
+    return publication
 
 
 def _protocol_dict(value: ProtocolBinding) -> dict[str, Any]:
@@ -1103,20 +1435,30 @@ __all__ = [
     "BeaconBinding",
     "CHECKPOINT_EPOCH_CAPABILITY_ID",
     "CHECKPOINT_EPOCH_ADMISSION_POLICY",
+    "CHECKPOINT_EPOCH_COMMITMENT_SET_SCHEMA_VERSION",
     "CHECKPOINT_EPOCH_REQUIRED_WINDOW_COUNT",
     "CHECKPOINT_EPOCH_SCHEDULE_MODE",
     "CHECKPOINT_EPOCH_SCHEMA_VERSION",
     "CHECKPOINT_EPOCH_TRAINING_MODES",
     "CheckpointBinding",
     "EpochAdmissionCommitment",
+    "EpochCommitmentRecord",
+    "EpochCommitmentSet",
     "EpochPlan",
     "EpochWindow",
     "PromptSlice",
     "ProtocolBinding",
+    "SignedEpochCommitmentSet",
     "WindowSchedule",
     "build_epoch_plan",
+    "build_commitment_set",
+    "canonical_commitment_set_bytes",
     "canonical_json_bytes",
     "canonical_manifest_bytes",
+    "canonical_signed_commitment_set_bytes",
+    "commitment_set_sha256",
+    "commitment_set_signing_bytes",
+    "commitment_set_to_dict",
     "derive_epoch_id",
     "derive_epoch_seed",
     "derive_prompt_slices",
@@ -1125,6 +1467,11 @@ __all__ = [
     "generation_contract_sha256",
     "manifest_sha256",
     "parse_epoch_plan",
+    "parse_signed_commitment_set",
     "select_epoch_reveals",
+    "signed_commitment_set_to_dict",
+    "validate_commitment_set",
+    "validate_commitment_set_for_plan",
     "validate_epoch_plan",
+    "validate_signed_commitment_set",
 ]

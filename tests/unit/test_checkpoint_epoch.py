@@ -9,14 +9,20 @@ from reliquary.shared.checkpoint_epoch import (
     BeaconBinding,
     CheckpointBinding,
     EpochAdmissionCommitment,
+    EpochCommitmentRecord,
     ProtocolBinding,
+    SignedEpochCommitmentSet,
     WindowSchedule,
     build_epoch_plan,
+    build_commitment_set,
     canonical_manifest_bytes,
+    canonical_signed_commitment_set_bytes,
+    commitment_set_sha256,
     derive_prompt_slices,
     derive_window_seed,
     manifest_sha256,
     parse_epoch_plan,
+    parse_signed_commitment_set,
     select_epoch_reveals,
 )
 
@@ -69,15 +75,13 @@ def _plan(*, count: int = 16, **overrides):
 
 def test_manifest_is_canonical_deterministic_and_stable():
     first = _plan()
-    second = _plan(
-        environment_universes={"math": 100_000, "code": 90_000}
-    )
+    second = _plan(environment_universes={"math": 100_000, "code": 90_000})
 
     assert first == second
     assert canonical_manifest_bytes(first) == canonical_manifest_bytes(second)
     assert parse_epoch_plan(canonical_manifest_bytes(first)) == first
     assert manifest_sha256(first) == (
-        "40b49c6970a1df9d1fd77200112c7cce60bc914c1b4f9b01d1e5bf37d6156c50"
+        "cde46238666bee60bfe8ba89dea9061a7f79ebcb488500befdd4fb0b69a0673b"
     )
     assert first.window_schedule.mode == "concurrent_checkpoint_epoch"
     assert first.training_mode == "sequential_steps"
@@ -205,6 +209,7 @@ def test_post_commit_selection_is_arrival_neutral_and_operator_rounded():
         admission_randomness="9" * 64,
         epoch_id=plan.epoch_id,
         manifest_sha256_hex=digest,
+        commitment_set_sha256_hex="a" * 64,
         limit=6,
         per_prompt_limit=10,
     )
@@ -213,6 +218,7 @@ def test_post_commit_selection_is_arrival_neutral_and_operator_rounded():
         admission_randomness="9" * 64,
         epoch_id=plan.epoch_id,
         manifest_sha256_hex=digest,
+        commitment_set_sha256_hex="a" * 64,
         limit=6,
         per_prompt_limit=10,
     )
@@ -223,6 +229,54 @@ def test_post_commit_selection_is_arrival_neutral_and_operator_rounded():
         operator: sum(item.startswith(f"commit-{operator}-") for item in selected)
         for operator in ("alice", "bob", "carol")
     } == {"alice": 2, "bob": 2, "carol": 2}
+
+
+def test_signed_commitment_set_is_canonical_and_mutation_bound():
+    plan = _plan()
+    records = [
+        EpochCommitmentRecord(
+            receipt_id=f"receipt-{index}",
+            commitment_id=f"commitment-{index}",
+            operator_id=f"operator-{index}",
+            miner_hotkey=f"miner-{index}",
+            window_number=plan.first_window,
+            environment="math",
+            prompt_idx=index,
+            payload_sha256=f"{index + 1:064x}",
+        )
+        for index in range(3)
+    ]
+    first = build_commitment_set(
+        records,
+        epoch_id=plan.epoch_id,
+        manifest_sha256_hex=manifest_sha256(plan),
+        commitment_close_round=120,
+        validator_hotkey="validator",
+    )
+    second = build_commitment_set(
+        list(reversed(records)),
+        epoch_id=plan.epoch_id,
+        manifest_sha256_hex=manifest_sha256(plan),
+        commitment_close_round=120,
+        validator_hotkey="validator",
+    )
+    assert first == second
+    publication = SignedEpochCommitmentSet(
+        commitment_set=first,
+        commitment_set_sha256=commitment_set_sha256(first),
+        validator_signature="aa",
+    )
+    raw = canonical_signed_commitment_set_bytes(publication)
+    assert parse_signed_commitment_set(raw) == publication
+
+    changed = build_commitment_set(
+        [replace(records[0], payload_sha256="f" * 64), *records[1:]],
+        epoch_id=plan.epoch_id,
+        manifest_sha256_hex=manifest_sha256(plan),
+        commitment_close_round=120,
+        validator_hotkey="validator",
+    )
+    assert commitment_set_sha256(changed) != commitment_set_sha256(first)
 
 
 def test_post_commit_selection_applies_prompt_cap_deterministically():
@@ -243,6 +297,7 @@ def test_post_commit_selection_applies_prompt_cap_deterministically():
         admission_randomness="8" * 64,
         epoch_id=plan.epoch_id,
         manifest_sha256_hex=manifest_sha256(plan),
+        commitment_set_sha256_hex="a" * 64,
         limit=8,
         per_prompt_limit=2,
     )
@@ -269,6 +324,7 @@ def test_post_commit_selection_gives_one_ticket_per_operator_prompt():
         admission_randomness="8" * 64,
         epoch_id=plan.epoch_id,
         manifest_sha256_hex=manifest_sha256(plan),
+        commitment_set_sha256_hex="a" * 64,
         limit=4,
         per_prompt_limit=10,
     )
@@ -295,18 +351,19 @@ def test_post_commit_selection_binds_operator_order_to_one_lane():
         admission_randomness="7" * 64,
         epoch_id=plan.epoch_id,
         manifest_sha256_hex=digest,
+        commitment_set_sha256_hex="a" * 64,
         limit=4,
         per_prompt_limit=10,
     )
     next_lane = [
-        replace(item, window_number=plan.first_window + 1)
-        for item in commitments
+        replace(item, window_number=plan.first_window + 1) for item in commitments
     ]
     next_selected = select_epoch_reveals(
         next_lane,
         admission_randomness="7" * 64,
         epoch_id=plan.epoch_id,
         manifest_sha256_hex=digest,
+        commitment_set_sha256_hex="a" * 64,
         limit=4,
         per_prompt_limit=10,
     )
@@ -318,6 +375,7 @@ def test_post_commit_selection_binds_operator_order_to_one_lane():
             admission_randomness="7" * 64,
             epoch_id=plan.epoch_id,
             manifest_sha256_hex=digest,
+            commitment_set_sha256_hex="a" * 64,
             limit=2,
             per_prompt_limit=10,
         )

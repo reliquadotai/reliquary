@@ -134,6 +134,9 @@ def _run_policy(
                     manifest_sha256_hex=hashlib.sha256(
                         b"synthetic-manifest"
                     ).hexdigest(),
+                    commitment_set_sha256_hex=hashlib.sha256(
+                        b"synthetic-commitment-set"
+                    ).hexdigest(),
                     limit=reveal_limit,
                     per_prompt_limit=10,
                 ))

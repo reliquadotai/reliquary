@@ -44,6 +44,12 @@ from reliquary.shared.checkpoint_epoch import (
     manifest_sha256,
 )
 from reliquary.shared.runtime_fingerprint import collect_runtime_fingerprint
+from reliquary.validator.checkpoint_epoch_runtime import (
+    SignedEpochIntent,
+    build_epoch_intent,
+    canonical_signed_intent_bytes,
+    plan_from_intent,
+)
 
 
 # --------------------- discover_validator_url ---------------------
@@ -607,6 +613,45 @@ def _checkpoint_epoch_plan_fixture(environment: str = "math"):
     )
 
 
+def _signed_epoch_intent_fixture(plan):
+    universes = {
+        prompt_slice.environment: prompt_slice.universe_size
+        for prompt_slice in plan.windows[0].prompt_slices
+    }
+    intent = build_epoch_intent(
+        protocol=plan.protocol,
+        checkpoint_number=plan.checkpoint.number,
+        checkpoint_repo_id=plan.checkpoint.repo_id,
+        checkpoint_revision=plan.checkpoint.revision,
+        commit_observed_round=plan.checkpoint.commit_observed_round,
+        first_window=plan.first_window,
+        window_count=plan.window_count,
+        beacon_chain=plan.epoch_beacon.chain,
+        beacon_chain_hash=plan.epoch_beacon.chain_hash,
+        warmup_rounds=plan.warmup_rounds,
+        window_schedule=plan.window_schedule,
+        training_mode=plan.training_mode,
+        prompt_range_size=plan.prompt_range_size,
+        target_groups_per_environment_lane=(plan.target_groups_per_environment_lane),
+        candidate_limit_per_environment_lane=(
+            plan.candidate_limit_per_environment_lane
+        ),
+        admission_policy=plan.admission_policy,
+        commitments_per_operator_per_environment_lane=(
+            plan.commitments_per_operator_per_environment_lane
+        ),
+        reveal_seconds=plan.reveal_seconds,
+        environment_universes=universes,
+    )
+    assert plan_from_intent(intent, beacon=plan.epoch_beacon) == plan
+    return SignedEpochIntent(
+        intent=intent,
+        intent_sha256=intent.intent_id,
+        validator_hotkey="validator",
+        validator_signature="aa",
+    )
+
+
 @pytest.mark.asyncio
 async def test_checkpoint_epoch_commitment_client_never_uploads_payload(
     monkeypatch,
@@ -677,6 +722,9 @@ async def test_epoch_reveal_client_refuses_unselected_payload(monkeypatch):
         checkpoint_epoch_id=plan.epoch_id,
         checkpoint_epoch_manifest_sha256=manifest_sha256(plan),
         checkpoint_epoch_phase="reveal",
+        checkpoint_epoch_admission_beacon_round=120,
+        checkpoint_epoch_commitment_set_sha256="d" * 64,
+        checkpoint_epoch_commitment_root="e" * 64,
         randomness=plan.windows[0].generation_randomness,
     )
     posts = []
@@ -689,6 +737,8 @@ async def test_epoch_reveal_client_refuses_unselected_payload(monkeypatch):
             "status": "not_selected",
             "admission_beacon_round": 120,
             "reveal_deadline_ts": None,
+            "commitment_set_sha256": "d" * 64,
+            "commitment_root": "e" * 64,
         })
 
     async def _post(self, url, **kwargs):
@@ -703,6 +753,7 @@ async def test_epoch_reveal_client_refuses_unselected_payload(monkeypatch):
         receipt_id="receipt",
         payload=request.model_dump_json().encode("utf-8"),
         plan=plan,
+        expected_validator_hotkey="validator",
         client=client,
     )
 
@@ -723,10 +774,17 @@ async def test_get_checkpoint_epoch_plan_binds_etag_state_and_canonical_body(
 
     plan = _checkpoint_epoch_plan_fixture()
     digest = manifest_sha256(plan)
-    seen = {}
+    publication = _signed_epoch_intent_fixture(plan)
+    seen = []
 
     async def _get(self, url, timeout=None):
-        seen["url"] = url
+        seen.append(url)
+        if url.endswith("/intent"):
+            return httpx.Response(
+                200,
+                content=canonical_signed_intent_bytes(publication),
+                headers={"ETag": f'"{publication.intent_sha256}"'},
+            )
         return httpx.Response(
             200,
             content=canonical_manifest_bytes(plan),
@@ -739,17 +797,26 @@ async def test_get_checkpoint_epoch_plan_binds_etag_state_and_canonical_body(
     monkeypatch.setattr(httpx.AsyncClient, "get", _get)
     monkeypatch.setattr(
         submitter_module,
+        "verify_epoch_intent_signature",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        submitter_module,
         "_verify_checkpoint_epoch_public_beacon",
         _verify_public_beacon,
     )
     client = httpx.AsyncClient()
     fetched = await get_checkpoint_epoch_plan_v1(
         "http://fake",
+        expected_validator_hotkey="validator",
         expected_manifest_sha256=digest,
         client=client,
     )
 
-    assert seen["url"] == "http://fake/checkpoint-epoch"
+    assert seen == [
+        "http://fake/checkpoint-epoch",
+        "http://fake/checkpoint-epoch/intent",
+    ]
     assert fetched == plan
     await client.aclose()
 
@@ -760,8 +827,15 @@ async def test_get_checkpoint_epoch_plan_can_discover_during_warmup(monkeypatch)
 
     plan = _checkpoint_epoch_plan_fixture()
     digest = manifest_sha256(plan)
+    publication = _signed_epoch_intent_fixture(plan)
 
     async def _get(self, url, timeout=None):
+        if url.endswith("/intent"):
+            return httpx.Response(
+                200,
+                content=canonical_signed_intent_bytes(publication),
+                headers={"ETag": f'"{publication.intent_sha256}"'},
+            )
         return httpx.Response(
             200,
             content=canonical_manifest_bytes(plan),
@@ -774,15 +848,24 @@ async def test_get_checkpoint_epoch_plan_can_discover_during_warmup(monkeypatch)
     monkeypatch.setattr(httpx.AsyncClient, "get", _get)
     monkeypatch.setattr(
         submitter_module,
+        "verify_epoch_intent_signature",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        submitter_module,
         "_verify_checkpoint_epoch_public_beacon",
         _verify_public_beacon,
     )
     client = httpx.AsyncClient()
 
-    assert await get_checkpoint_epoch_plan_v1(
-        "http://fake",
-        client=client,
-    ) == plan
+    assert (
+        await get_checkpoint_epoch_plan_v1(
+            "http://fake",
+            expected_validator_hotkey="validator",
+            client=client,
+        )
+        == plan
+    )
     await client.aclose()
 
 
@@ -887,6 +970,7 @@ async def test_get_checkpoint_epoch_plan_rejects_etag_equivocation(monkeypatch):
     with pytest.raises(SubmissionError, match="ETag"):
         await get_checkpoint_epoch_plan_v1(
             "http://fake",
+            expected_validator_hotkey="validator",
             expected_manifest_sha256=manifest_sha256(plan),
             client=client,
         )

@@ -334,6 +334,8 @@ class EpochCommitmentStatus(BaseModel):
     ]
     admission_beacon_round: int | None = Field(default=None, ge=1)
     reveal_deadline_ts: float | None = None
+    commitment_set_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    commitment_root: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class GrpoBatchState(BaseModel):
@@ -366,10 +368,14 @@ class GrpoBatchState(BaseModel):
         default=None,
         gt=0,
     )
-    checkpoint_epoch_phase: Literal["commitment", "reveal"] | None = None
+    checkpoint_epoch_phase: Literal["commitment", "selection", "reveal"] | None = None
     checkpoint_epoch_reveal_seconds: float | None = Field(default=None, gt=0)
-    checkpoint_epoch_admission_beacon_round: int | None = Field(
-        default=None, ge=1
+    checkpoint_epoch_admission_beacon_round: int | None = Field(default=None, ge=1)
+    checkpoint_epoch_commitment_set_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    checkpoint_epoch_commitment_root: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
     )
     # v2.3: drand beacon randomness for this window. Empty string between
     # OPEN and the first successful _set_window_randomness; miners loop on
