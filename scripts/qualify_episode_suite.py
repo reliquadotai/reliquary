@@ -98,6 +98,7 @@ def _verify_huggingface_tree_receipt(
         "path": str(relative_receipt),
         "verified": False,
         "files": 0,
+        "receipt_files": 0,
         "reason": None,
     }
     if _COMMIT_SHA_PATTERN.fullmatch(revision) is None:
@@ -115,11 +116,16 @@ def _verify_huggingface_tree_receipt(
     if receipt.get("format_version") != 1 or not isinstance(expected, dict):
         result["reason"] = "receipt_shape_invalid"
         return result
-    result["files"] = len(expected)
-    if set(expected) != set(file_sha256):
+    result["files"] = len(file_sha256)
+    result["receipt_files"] = len(expected)
+    # snapshot_download may intentionally fetch only the model/runtime allow
+    # list while its tree receipt describes README/license metadata as well.
+    # Every downloaded file must still be named and digest-bound by receipt.
+    if not set(file_sha256).issubset(expected):
         result["reason"] = "receipt_file_set_mismatch"
         return result
-    for relative, metadata in expected.items():
+    for relative in file_sha256:
+        metadata = expected[relative]
         if not isinstance(metadata, dict):
             result["reason"] = f"receipt_metadata_invalid:{relative}"
             return result

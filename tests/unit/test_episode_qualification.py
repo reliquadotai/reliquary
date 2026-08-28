@@ -63,6 +63,20 @@ def test_artifact_digest_ignores_cache_but_receipt_detects_tampering(tmp_path):
     assert "mismatch" in tampered["revision_receipt"]["reason"]
 
 
+def test_receipt_may_include_intentionally_undownloaded_metadata(tmp_path):
+    revision = "c" * 40
+    downloaded = {"config.json": b"{}"}
+    receipt_files = {**downloaded, "README.md": b"not downloaded"}
+    (tmp_path / "config.json").write_bytes(downloaded["config.json"])
+    _write_hf_receipt(tmp_path, revision, receipt_files)
+
+    artifact = _artifact_digest(str(tmp_path), revision)
+
+    assert artifact["revision_verified"] is True
+    assert artifact["revision_receipt"]["files"] == 1
+    assert artifact["revision_receipt"]["receipt_files"] == 2
+
+
 def _row(reward: float, *, error=None, exact_replay=True):
     return {
         "reward": reward,
