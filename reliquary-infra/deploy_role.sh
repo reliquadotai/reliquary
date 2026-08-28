@@ -8,7 +8,7 @@ if [[ "$#" -lt 2 ]]; then
 fi
 
 ROLE="$1"
-INVENTORY="$2"
+INVENTORY_INPUT="$2"
 shift 2
 INFRA_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -28,10 +28,12 @@ case "${ROLE}" in
     ;;
 esac
 
-test -f "${INVENTORY}" || {
-  echo "inventory does not exist: ${INVENTORY}" >&2
+test -f "${INVENTORY_INPUT}" || {
+  echo "inventory does not exist: ${INVENTORY_INPUT}" >&2
   exit 2
 }
+INVENTORY_DIR="$(cd "$(dirname "${INVENTORY_INPUT}")" && pwd)"
+INVENTORY="${INVENTORY_DIR}/$(basename "${INVENTORY_INPUT}")"
 for command_name in ansible-inventory ansible-playbook; do
   command -v "${command_name}" >/dev/null 2>&1 || {
     echo "${command_name} is required" >&2
@@ -39,6 +41,7 @@ for command_name in ansible-inventory ansible-playbook; do
   }
 done
 
+cd "${INFRA_DIR}"
 ANSIBLE_CONFIG="${INFRA_DIR}/ansible.cfg" \
   ansible-inventory --inventory "${INVENTORY}" --host "${ROLE}" >/dev/null
 ANSIBLE_CONFIG="${INFRA_DIR}/ansible.cfg" \
