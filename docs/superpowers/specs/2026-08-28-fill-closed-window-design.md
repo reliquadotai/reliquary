@@ -205,11 +205,15 @@ different job. It is no longer breaking ties in a ranking — there is no
 ranking — it is deciding what the validator spends its next grading and
 proof budget on.
 
-The queue is bounded, and at capacity it drops the WORST entry rather than
-the newest: dropping the newest would turn the bound into a second arrival
-race, which is what ordering by rate exists to remove. A refused offer
-still advances that hotkey's clock, since the work was produced and the
-refusal was not its doing.
+The queue is **not** bounded, and must not be. It holds hashes rather than
+payloads, so it is cheap, and the expensive stages behind it are already
+bounded by the environment's target — a precommit past the target simply
+never gets served. Adding a global ceiling would be actively harmful, and
+`constants.py` already records why: *"any global counter can be
+deliberately burned before honest bodies arrive"*. Receipt memory is
+bounded per identity instead, by
+`MAX_PENDING_UPLOAD_PRECOMMITS_PER_{HOTKEY,OPERATOR}`, which a flood
+cannot use against anyone but itself.
 
 The order matters: the two cheap refusals gate the two expensive stages, so
 the validator never grades or proves a group it already knows it cannot
@@ -346,10 +350,11 @@ Two consequences:
   `MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW`, `MAX_PROOF_WALL_SECONDS = 240`,
   and the fail-closed capacity qualification are all seal-time envelopes
   that no longer describe the shape of the work.
-- **A bounded queue with an explicit backpressure policy**, which
-  Component 2 now specifies: the queue drops its worst-rate entry rather
-  than its newest arrival. The depth and the reject reason are part of the
-  contract, not an implementation detail.
+- **No global backpressure ceiling.** An earlier draft called for a bounded
+  queue; that was wrong, and `constants.py` says why — a global counter can
+  be burned before honest bodies arrive. The admission queue holds hashes,
+  the target bounds the expensive work behind it, and receipt memory is
+  already bounded per identity.
 
 PR #207 (several proof slots per GPU, measured 12.5 s at one slot against
 5.7 s at four with MPS) is what makes this affordable; re-measure at

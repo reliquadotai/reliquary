@@ -37,12 +37,7 @@ class QueuedPrecommit:
 class ThroughputAdmissionQueue:
     """Hold precommits until the validator has budget to validate one."""
 
-    def __init__(
-        self, *, window_opened_at: float, max_pending: int | None = None
-    ) -> None:
-        if max_pending is not None and max_pending <= 0:
-            raise ValueError("max_pending must be positive")
-        self._max_pending = max_pending
+    def __init__(self, *, window_opened_at: float) -> None:
         self._window_opened_at = float(window_opened_at)
         self._queued: dict[str, list[QueuedPrecommit]] = {}
         # Last observed arrival per hotkey. The rate has to describe the group
@@ -59,12 +54,16 @@ class ThroughputAdmissionQueue:
         environment: str,
         payload_bytes: int,
         arrived_at: float,
-    ) -> QueuedPrecommit | None:
-        """Queue a precommit, or return None if it cannot displace anything.
+    ) -> QueuedPrecommit:
+        """Queue a precommit. Never refuses.
 
-        At capacity the WORST queued entry is dropped, never the newest.
-        Dropping the newest would turn the bound into a second arrival race —
-        exactly what ordering by rate exists to remove.
+        The queue holds hashes, not payloads, so it is cheap, and the
+        expensive stages behind it are already bounded by the environment's
+        target. Bounding it again globally would be actively harmful:
+        ``constants.py`` records why there is no global receipt ceiling —
+        "any global counter can be deliberately burned before honest bodies
+        arrive". Receipt memory is bounded per identity instead, by
+        ``MAX_PENDING_UPLOAD_PRECOMMITS_PER_{HOTKEY,OPERATOR}``.
         """
         started_at = self._last_arrival.get(hotkey, self._window_opened_at)
         elapsed = max(arrived_at - started_at, 1e-9)
@@ -77,20 +76,7 @@ class ThroughputAdmissionQueue:
             arrived_at=float(arrived_at),
             elapsed=elapsed,
         )
-        entries = self._queued.setdefault(environment, [])
-        if self._max_pending is not None and len(entries) >= self._max_pending:
-            worst = max(
-                entries,
-                key=lambda queued: (
-                    -queued.throughput,
-                    queued.arrived_at,
-                    queued.receipt_id,
-                ),
-            )
-            if entry.throughput <= worst.throughput:
-                return None
-            entries.remove(worst)
-        entries.append(entry)
+        self._queued.setdefault(environment, []).append(entry)
         return entry
 
     def take_best(self, environment: str) -> QueuedPrecommit | None:
