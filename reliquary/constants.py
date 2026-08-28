@@ -730,7 +730,16 @@ if (
 # groups rather than when a clock expires. Gated so the auction path stays
 # live and byte-identical for v4/v5: a validator reaches this code only by
 # selecting the v6 profile AND arming the capability.
-FILL_CLOSED_ENABLED = _os.environ.get(
+#
+# Fails closed unless the active profile IS v6, regardless of the env var.
+# FILL_CLOSED_TARGET_GROUPS_PER_ENV below derives from B_BATCH and
+# CHECKPOINT_PUBLISH_INTERVAL_WINDOWS, and both are profile-dependent (v2
+# gives 32, v4/v5 give 256, v6 gives 256) -- so arming this under any
+# non-v6 profile would silently size a v6-shaped window from another
+# protocol's batch shape instead of refusing to run. Same shape as the
+# neighbouring EXPERIMENTAL_CHECKPOINT_EPOCH capability, which fails closed
+# unless CHECKPOINT_PUBLISH_INTERVAL_WINDOWS is exactly its required horizon.
+FILL_CLOSED_ENABLED = PROTOCOL_VERSION >= 6 and _os.environ.get(
     "RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
 
