@@ -720,6 +720,47 @@ if (
         "attempt limit"
     )
 
+# ────────────────  FILL-CLOSED WINDOW (v6)  ────────────────
+
+# The v6 window ends when every environment holds its target of PROVEN
+# groups rather than when a clock expires. Gated so the auction path stays
+# live and byte-identical for v4/v5: a validator reaches this code only by
+# selecting the v6 profile AND arming the capability.
+FILL_CLOSED_ENABLED = _os.environ.get(
+    "RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+
+# Proven groups that close one environment. 16 optimizer steps x B_BATCH.
+FILL_CLOSED_TARGET_GROUPS_PER_ENV = int(_os.environ.get(
+    "RELIQUARY_FILL_CLOSED_TARGET_GROUPS_PER_ENV",
+    str(CHECKPOINT_PUBLISH_INTERVAL_WINDOWS * B_BATCH),
+))
+if FILL_CLOSED_TARGET_GROUPS_PER_ENV <= 0:
+    raise ValueError(
+        "RELIQUARY_FILL_CLOSED_TARGET_GROUPS_PER_ENV must be positive"
+    )
+
+# Backstop only. A window normally ends on its fill; this stops a stalled
+# fleet holding one open forever, and seals whatever is proven.
+FILL_CLOSED_MAX_SECONDS = float(_os.environ.get(
+    "RELIQUARY_FILL_CLOSED_MAX_SECONDS", "1800"
+))
+if not _math.isfinite(FILL_CLOSED_MAX_SECONDS) or FILL_CLOSED_MAX_SECONDS <= 0:
+    raise ValueError("RELIQUARY_FILL_CLOSED_MAX_SECONDS must be positive")
+
+# Ceiling on one operator's share of an environment's accepted tokens.
+# Counted in TOKENS, not groups: under per-token payment a group count
+# bounds nothing, since an operator can take few very long groups. 0.34
+# denies any single operator a third of an environment while leaving room
+# for a fleet of three to fill it. Move it from measured concentration.
+FILL_CLOSED_MAX_OPERATOR_TOKEN_SHARE = float(_os.environ.get(
+    "RELIQUARY_FILL_CLOSED_MAX_OPERATOR_TOKEN_SHARE", "0.34"
+))
+if not 0.0 < FILL_CLOSED_MAX_OPERATOR_TOKEN_SHARE <= 1.0:
+    raise ValueError(
+        "RELIQUARY_FILL_CLOSED_MAX_OPERATOR_TOKEN_SHARE must be in (0, 1]"
+    )
+
 # Runtime default for CLI/Docker operators. OpenCode remains available through
 # ENVIRONMENT_MIX, but code execution is opt-in until the runsc canary and
 # miner rollout are coordinated.

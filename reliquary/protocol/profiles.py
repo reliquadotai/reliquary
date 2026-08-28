@@ -396,6 +396,35 @@ _PROFILE_VALUES = (
             bucket_tokens_per_round=50,
         ),
     ),
+    ProtocolProfile(
+        # Same model, same sampling, same budgets, same prompts as v5. v6
+        # changes when a window ends and who gets admitted, never what a
+        # miner generates -- so the generation contract is v5's, field for
+        # field, and a diff of the two profiles shows only the window.
+        profile_id="qwen3-4b-base-dapo-fill-closed-v6",
+        model_id="Qwen/Qwen3-4B-Base",
+        model_revision="906bfd4b4dc7f14ee4320094d8b41684abff8539",
+        protocol_version=6,
+        collection_seconds=100,
+        upload_grace_seconds=33,
+        prompt_encoding="raw",
+        sampling=_SAMPLING_DAPO,
+        environments={
+            "openmathinstruct": EnvironmentProfile(
+                max_new_tokens=8192,
+                bft=None,
+                answer_format="boxed",
+                prompt_template=_MATH_REASONING_PROMPT,
+            ),
+            "opencodeinstruct": EnvironmentProfile(
+                max_new_tokens=8192,
+                bft=None,
+                prompt_template=_CODE_REASONING_PROMPT,
+            ),
+        },
+        # No ranking in v6, so no tie-break to rank with.
+        throughput_tiebreak=None,
+    ),
 )
 
 PROFILES: Mapping[str, ProtocolProfile] = MappingProxyType(
