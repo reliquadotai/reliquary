@@ -97,6 +97,7 @@ def test_intent_rejects_unknown_schedule_and_training_modes():
 @pytest.mark.parametrize(
     ("field", "value"),
     [
+        ("valuation_policy", "raw_tokens"),
         ("ranking_policy", "throughput_admission"),
         ("reward_policy", "per_token"),
         ("finalization_policy", "arrival_stream"),

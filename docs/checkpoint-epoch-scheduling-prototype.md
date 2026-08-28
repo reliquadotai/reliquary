@@ -36,12 +36,17 @@ admission:
 - the detached trainer waits for the epoch's terminal marker before consuming
   lane zero, so a later lane failure cannot leave a partially trained epoch;
 - admission and final ranking never consult payload throughput or arrival;
+- the epoch valuation is fixed to validator-gated difficulty with `delta=1`
+  and cannot inherit the production flat-value runtime switch;
+- exact-utility ties visit every canonical operator once before any operator
+  receives a second proof opportunity;
 - rewards remain the existing fixed selected-slot split. A different reward
   function requires a separately reviewed protocol revision and replay data.
 
 The manifest binds these decisions as
 `signed_set_operator_rounds_v2`,
-`utility_then_post_seal_beacon_v1`, `selected_slot_v1`, and
+`robust_gated_difficulty_delta1_v1`,
+`utility_then_operator_rounds_post_seal_beacon_v2`, `selected_slot_v1`, and
 `ordered_lanes_atomic_epoch_v1`. They are protocol choices, not runtime knobs.
 This prevents a validator from silently combining the public epoch plan with a
 different admission, ranking, reward, or finalization rule.
@@ -100,7 +105,8 @@ The strict canonical JSON manifest and its SHA-256 bind:
 - target groups and maximum selected reveals per environment/lane;
 - compact-commitment operator bound, arrival-neutral selection policy, and
   reveal duration;
-- final ranking, selected-slot reward, and ordered atomic-finalization policy;
+- validator-gated difficulty valuation, final ranking, selected-slot reward,
+  and ordered atomic-finalization policy;
 - `sequential_steps` or `aggregate_one_step` training mode;
 - every environment and dataset-universe size;
 - prompt-range width and explicit overlap policy;
@@ -255,11 +261,14 @@ The advance plan contains generation randomness only. It never contains or
 derives seal, auction, or final tie-break randomness.
 
 Beacon A is obtained after compact commitments are frozen and controls only
-which bounded cohort may reveal. Beacon B is obtained after reveals are frozen
-and orders candidates that are equal on validator-authoritative
-utility/difficulty. Neither selection uses generation completion, throughput,
-upload, or arrival time. The production ranking path is unchanged when the
-experiment is disabled.
+which bounded cohort may reveal. Beacon B is obtained after reveals are frozen.
+Epoch candidates rank first by the manifest-bound validator difficulty value
+`std(rewards) * (1 - mean(rewards))` after the existing robust gate. Within an
+exact-value tier, Beacon B orders canonical operators and candidates in rounds:
+every represented operator receives one proof opportunity before any receives
+a second. Neither selection uses generation completion, throughput, upload, or
+arrival time. The production flat-value switch and production ranking path are
+unchanged and are not consulted by epoch ranking.
 
 The prototype retains the current selected-slot reward model and burn
 accounting. It does not introduce payment for unselected work.

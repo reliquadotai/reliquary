@@ -109,6 +109,7 @@ from reliquary.shared.checkpoint_epoch import (
     CHECKPOINT_EPOCH_REQUIRED_WINDOW_COUNT,
     CHECKPOINT_EPOCH_REWARD_POLICY,
     CHECKPOINT_EPOCH_SCHEDULE_MODE,
+    CHECKPOINT_EPOCH_VALUATION_POLICY,
     EpochPlan,
     EpochWindow,
     ProtocolBinding,
@@ -1856,6 +1857,7 @@ class ValidationService:
             or plan.candidate_limit_per_environment_lane
             != EXPERIMENTAL_CHECKPOINT_EPOCH_CANDIDATES_PER_LANE
             or plan.admission_policy != CHECKPOINT_EPOCH_ADMISSION_POLICY
+            or plan.valuation_policy != CHECKPOINT_EPOCH_VALUATION_POLICY
             or plan.ranking_policy != CHECKPOINT_EPOCH_RANKING_POLICY
             or plan.reward_policy != CHECKPOINT_EPOCH_REWARD_POLICY
             or plan.finalization_policy
@@ -1988,6 +1990,7 @@ class ValidationService:
                     EXPERIMENTAL_CHECKPOINT_EPOCH_CANDIDATES_PER_LANE
                 ),
                 admission_policy=CHECKPOINT_EPOCH_ADMISSION_POLICY,
+                valuation_policy=CHECKPOINT_EPOCH_VALUATION_POLICY,
                 ranking_policy=CHECKPOINT_EPOCH_RANKING_POLICY,
                 reward_policy=CHECKPOINT_EPOCH_REWARD_POLICY,
                 finalization_policy=CHECKPOINT_EPOCH_FINALIZATION_POLICY,

@@ -100,6 +100,7 @@ from reliquary.validator.difficulty_auction import (
     ShadowSubmission,
     auction_difficulty_score,
     auction_value,
+    difficulty_score,
     flat_auction_value,
     fractional_reward_lattice,
     robust_uncertain_reward_utility,
@@ -217,6 +218,31 @@ def _epoch_candidate_tiebreak(
     update_text(environment)
     update_text(operator_id)
     digest.update(int(prompt_idx).to_bytes(8, "big"))
+    return digest.digest()
+
+
+def _epoch_operator_tiebreak(
+    *,
+    seal_randomness: str,
+    checkpoint_revision: str,
+    window_start: int,
+    environment: str,
+    operator_id: str,
+) -> bytes:
+    """Order operators without letting prompt or payload choice mint tickets."""
+    digest = hashlib.sha256()
+    digest.update(b"reliquary/checkpoint-epoch/final-operator/v1\x00")
+
+    def update_text(value: str) -> None:
+        encoded = value.encode("utf-8")
+        digest.update(len(encoded).to_bytes(4, "big"))
+        digest.update(encoded)
+
+    update_text(seal_randomness)
+    update_text(checkpoint_revision)
+    digest.update(int(window_start).to_bytes(8, "big"))
+    update_text(environment)
+    update_text(operator_id)
     return digest.digest()
 
 
@@ -543,6 +569,72 @@ def _pending_difficulty_score(pending):
         reward_std=score.reward_std,
         reward_count=score.reward_count,
     )
+
+
+def _pending_epoch_difficulty_score(pending):
+    """Manifest-bound epoch value, independent of the production flat flag."""
+    score = difficulty_score(
+        pending.rewards,
+        delta=1.0,
+    )
+    robust_utility = getattr(pending, "robust_utility", None)
+    if robust_utility is None:
+        return score
+    return type(score)(
+        value=float(robust_utility),
+        mean_reward=score.mean_reward,
+        reward_std=score.reward_std,
+        reward_count=score.reward_count,
+    )
+
+
+def _rank_epoch_candidates(
+    scored,
+    *,
+    operator_by_id: dict[int, str | None],
+    candidate_tiebreak_by_id: dict[int, bytes],
+    operator_tiebreak_by_id: dict[str, bytes],
+):
+    """Rank utility first, then visit operators in rounds inside each tie."""
+    by_value: dict[float, list[tuple[Any, Any]]] = {}
+    for item in scored:
+        by_value.setdefault(float(item[1].value), []).append(item)
+
+    ranked: list[tuple[Any, Any]] = []
+    operator_round_by_id: dict[int, int] = {}
+    for value in sorted(by_value, reverse=True):
+        by_operator: dict[str, list[tuple[Any, Any]]] = {}
+        for item in by_value[value]:
+            operator = operator_by_id[id(item[0])]
+            if operator is None:
+                raise RuntimeError(
+                    "checkpoint epoch ranking requires canonical operators"
+                )
+            by_operator.setdefault(operator, []).append(item)
+        for queue in by_operator.values():
+            queue.sort(key=lambda item: candidate_tiebreak_by_id[id(item[0])])
+        operators = sorted(
+            by_operator,
+            key=lambda operator: (
+                operator_tiebreak_by_id[operator],
+                operator,
+            ),
+        )
+        round_index = 0
+        while True:
+            added = False
+            for operator in operators:
+                queue = by_operator[operator]
+                if round_index >= len(queue):
+                    continue
+                item = queue[round_index]
+                ranked.append(item)
+                operator_round_by_id[id(item[0])] = round_index
+                added = True
+            if not added:
+                break
+            round_index += 1
+    return ranked, operator_round_by_id
 
 
 @dataclass
@@ -4706,12 +4798,10 @@ class GrpoWindowBatcher:
     def _prove_ranked(self, pool: float = 1.0) -> list[ValidSubmission]:
         """Prove strict auction winners until ``B_BATCH`` distinct prompts pass.
 
-        Difficulty remains primary and validator-observed precommit drand round
-        remains secondary. Exact ties use post-deadline drand bound only to the
-        checkpoint, window, environment, operator and prompt. Hotkeys and miner
-        payload fields cannot mint extra tie tickets. If seal drand is
-        unavailable, exact validator-observed precommit arrival is the explicit
-        liveness fallback; known window randomness is never an economic salt.
+        Production keeps its profile-bound ordering. Experimental epoch mode
+        uses a manifest-bound difficulty value, then visits canonical operators
+        in rounds inside each exact-value tier. Fresh post-deadline drand orders
+        operators and their candidates without consulting throughput or arrival.
 
         A prompt is claimed only after a submission passes proof. A fabricated
         leader therefore fails without squatting the prompt, and the next
@@ -4732,12 +4822,21 @@ class GrpoWindowBatcher:
         """
         with self._lock:
             pending = list(self._pending)
-        scored = [(p, _pending_difficulty_score(p)) for p in pending]
+        scored = [
+            (
+                p,
+                _pending_epoch_difficulty_score(p)
+                if self.experimental_epoch_ranking
+                else _pending_difficulty_score(p),
+            )
+            for p in pending
+        ]
         operator_by_id: dict[int, str | None] = {}
         arrival_by_id: dict[int, int] = {}
         arrival_source_by_id: dict[int, str] = {}
         exact_arrival_by_id: dict[int, float] = {}
         tiebreak_by_id: dict[int, bytes] = {}
+        operator_tiebreak_by_id: dict[str, bytes] = {}
         if self.experimental_epoch_ranking:
             if not self.seal_randomness or self.seal_beacon_round is None:
                 raise RuntimeError(
@@ -4771,6 +4870,10 @@ class GrpoWindowBatcher:
                 self._precommit_arrival_of(pending_submission)
             )
             if self.experimental_epoch_ranking:
+                if operator is None:
+                    raise RuntimeError(
+                        "checkpoint epoch ranking requires canonical operators"
+                    )
                 tiebreak = _epoch_candidate_tiebreak(
                     seal_randomness=self.seal_randomness,
                     checkpoint_revision=self.current_checkpoint_hash,
@@ -4778,6 +4881,16 @@ class GrpoWindowBatcher:
                     environment=environment,
                     operator_id=operator or "",
                     prompt_idx=pending_submission.prompt_idx,
+                )
+                operator_tiebreak_by_id.setdefault(
+                    operator,
+                    _epoch_operator_tiebreak(
+                        seal_randomness=self.seal_randomness,
+                        checkpoint_revision=self.current_checkpoint_hash,
+                        window_start=self.window_start,
+                        environment=environment,
+                        operator_id=operator,
+                    ),
                 )
             else:
                 tiebreak = _auction_operator_tiebreak(
@@ -4791,16 +4904,17 @@ class GrpoWindowBatcher:
             tiebreak_by_id[id(pending_submission)] = tiebreak
 
         if self.experimental_epoch_ranking:
-            # Advance work makes arrival and throughput meaningless. Equal
-            # utility is ordered only by entropy first available after close.
-            ranked = sorted(
+            # Utility stays primary. Inside an exact-value tier, canonical
+            # operators are visited once before any receives a second proof
+            # opportunity. Neither round uses arrival or throughput.
+            ranked, operator_round_by_id = _rank_epoch_candidates(
                 scored,
-                key=lambda item: (
-                    -item[1].value,
-                    tiebreak_by_id[id(item[0])],
-                ),
+                operator_by_id=operator_by_id,
+                candidate_tiebreak_by_id=tiebreak_by_id,
+                operator_tiebreak_by_id=operator_tiebreak_by_id,
             )
         else:
+            operator_round_by_id = {}
             # Keep the production profile's ranking byte-for-byte equivalent.
             throughput_profile = PROTOCOL_THROUGHPUT_TIEBREAK
             window_open = self.window_open_drand_round
@@ -4907,6 +5021,15 @@ class GrpoWindowBatcher:
                             self.collection_close_drand_round
                         ),
                         "seal_beacon_round": self.seal_beacon_round,
+                    }
+                    if self.experimental_epoch_ranking
+                    else {}
+                ),
+                **(
+                    {
+                        "operator_round": operator_round_by_id[
+                            id(pending_submission)
+                        ]
                     }
                     if self.experimental_epoch_ranking
                     else {}

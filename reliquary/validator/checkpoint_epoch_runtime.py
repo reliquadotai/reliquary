@@ -20,6 +20,7 @@ from reliquary.shared.checkpoint_epoch import (
     CHECKPOINT_EPOCH_SCHEDULE_MODE,
     CHECKPOINT_EPOCH_SCHEMA_VERSION,
     CHECKPOINT_EPOCH_TRAINING_MODES,
+    CHECKPOINT_EPOCH_VALUATION_POLICY,
     CheckpointBinding,
     EpochPlan,
     ProtocolBinding,
@@ -61,6 +62,7 @@ class EpochCommitIntent:
     target_groups_per_environment_lane: int
     candidate_limit_per_environment_lane: int
     admission_policy: str
+    valuation_policy: str
     ranking_policy: str
     reward_policy: str
     finalization_policy: str
@@ -123,6 +125,7 @@ def _intent_dict(intent: EpochCommitIntent) -> dict[str, Any]:
             intent.candidate_limit_per_environment_lane
         ),
         "admission_policy": intent.admission_policy,
+        "valuation_policy": intent.valuation_policy,
         "ranking_policy": intent.ranking_policy,
         "reward_policy": intent.reward_policy,
         "finalization_policy": intent.finalization_policy,
@@ -220,6 +223,7 @@ def build_epoch_intent(
     target_groups_per_environment_lane: int,
     candidate_limit_per_environment_lane: int,
     admission_policy: str = CHECKPOINT_EPOCH_ADMISSION_POLICY,
+    valuation_policy: str = CHECKPOINT_EPOCH_VALUATION_POLICY,
     ranking_policy: str = CHECKPOINT_EPOCH_RANKING_POLICY,
     reward_policy: str = CHECKPOINT_EPOCH_REWARD_POLICY,
     finalization_policy: str = CHECKPOINT_EPOCH_FINALIZATION_POLICY,
@@ -265,6 +269,7 @@ def build_epoch_intent(
             candidate_limit_per_environment_lane
         ),
         admission_policy=str(admission_policy),
+        valuation_policy=str(valuation_policy),
         ranking_policy=str(ranking_policy),
         reward_policy=str(reward_policy),
         finalization_policy=str(finalization_policy),
@@ -283,6 +288,7 @@ def build_epoch_intent(
         or intent.candidate_limit_per_environment_lane
         < intent.target_groups_per_environment_lane
         or intent.admission_policy != CHECKPOINT_EPOCH_ADMISSION_POLICY
+        or intent.valuation_policy != CHECKPOINT_EPOCH_VALUATION_POLICY
         or intent.ranking_policy != CHECKPOINT_EPOCH_RANKING_POLICY
         or intent.reward_policy != CHECKPOINT_EPOCH_REWARD_POLICY
         or intent.finalization_policy
@@ -317,6 +323,7 @@ def parse_epoch_intent(raw: bytes) -> EpochCommitIntent:
         "target_groups_per_environment_lane",
         "candidate_limit_per_environment_lane",
         "admission_policy",
+        "valuation_policy",
         "ranking_policy",
         "reward_policy",
         "finalization_policy",
@@ -361,6 +368,7 @@ def parse_epoch_intent(raw: bytes) -> EpochCommitIntent:
             value["candidate_limit_per_environment_lane"]
         ),
         admission_policy=value["admission_policy"],
+        valuation_policy=value["valuation_policy"],
         ranking_policy=value["ranking_policy"],
         reward_policy=value["reward_policy"],
         finalization_policy=value["finalization_policy"],
@@ -383,6 +391,7 @@ def parse_epoch_intent(raw: bytes) -> EpochCommitIntent:
         or intent.candidate_limit_per_environment_lane
         < intent.target_groups_per_environment_lane
         or intent.admission_policy != CHECKPOINT_EPOCH_ADMISSION_POLICY
+        or intent.valuation_policy != CHECKPOINT_EPOCH_VALUATION_POLICY
         or intent.ranking_policy != CHECKPOINT_EPOCH_RANKING_POLICY
         or intent.reward_policy != CHECKPOINT_EPOCH_REWARD_POLICY
         or intent.finalization_policy
@@ -427,6 +436,7 @@ def plan_from_intent(
             intent.candidate_limit_per_environment_lane
         ),
         admission_policy=intent.admission_policy,
+        valuation_policy=intent.valuation_policy,
         ranking_policy=intent.ranking_policy,
         reward_policy=intent.reward_policy,
         finalization_policy=intent.finalization_policy,

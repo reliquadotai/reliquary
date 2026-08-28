@@ -14,12 +14,15 @@ import math
 from typing import Any, Mapping, Sequence
 
 
-CHECKPOINT_EPOCH_SCHEMA_VERSION = 6
-CHECKPOINT_EPOCH_CAPABILITY_ID = "checkpoint-epoch-scheduling-v6"
+CHECKPOINT_EPOCH_SCHEMA_VERSION = 7
+CHECKPOINT_EPOCH_CAPABILITY_ID = "checkpoint-epoch-scheduling-v7"
 CHECKPOINT_EPOCH_REQUIRED_WINDOW_COUNT = 16
 CHECKPOINT_EPOCH_SCHEDULE_MODE = "concurrent_checkpoint_epoch"
 CHECKPOINT_EPOCH_ADMISSION_POLICY = "signed_set_operator_rounds_v2"
-CHECKPOINT_EPOCH_RANKING_POLICY = "utility_then_post_seal_beacon_v1"
+CHECKPOINT_EPOCH_VALUATION_POLICY = "robust_gated_difficulty_delta1_v1"
+CHECKPOINT_EPOCH_RANKING_POLICY = (
+    "utility_then_operator_rounds_post_seal_beacon_v2"
+)
 CHECKPOINT_EPOCH_REWARD_POLICY = "selected_slot_v1"
 CHECKPOINT_EPOCH_FINALIZATION_POLICY = "ordered_lanes_atomic_epoch_v1"
 CHECKPOINT_EPOCH_COMMITMENT_SET_SCHEMA_VERSION = 1
@@ -107,6 +110,7 @@ class EpochPlan:
     target_groups_per_environment_lane: int
     candidate_limit_per_environment_lane: int
     admission_policy: str
+    valuation_policy: str
     ranking_policy: str
     reward_policy: str
     finalization_policy: str
@@ -675,6 +679,7 @@ def _intent_dict(
     target_groups_per_environment_lane: int,
     candidate_limit_per_environment_lane: int,
     admission_policy: str,
+    valuation_policy: str,
     ranking_policy: str,
     reward_policy: str,
     finalization_policy: str,
@@ -708,6 +713,7 @@ def _intent_dict(
             candidate_limit_per_environment_lane
         ),
         "admission_policy": admission_policy,
+        "valuation_policy": valuation_policy,
         "ranking_policy": ranking_policy,
         "reward_policy": reward_policy,
         "finalization_policy": finalization_policy,
@@ -738,6 +744,7 @@ def derive_epoch_id(
     target_groups_per_environment_lane: int,
     candidate_limit_per_environment_lane: int,
     admission_policy: str = CHECKPOINT_EPOCH_ADMISSION_POLICY,
+    valuation_policy: str = CHECKPOINT_EPOCH_VALUATION_POLICY,
     ranking_policy: str = CHECKPOINT_EPOCH_RANKING_POLICY,
     reward_policy: str = CHECKPOINT_EPOCH_REWARD_POLICY,
     finalization_policy: str = CHECKPOINT_EPOCH_FINALIZATION_POLICY,
@@ -764,6 +771,7 @@ def derive_epoch_id(
             candidate_limit_per_environment_lane
         ),
         admission_policy=admission_policy,
+        valuation_policy=valuation_policy,
         ranking_policy=ranking_policy,
         reward_policy=reward_policy,
         finalization_policy=finalization_policy,
@@ -900,6 +908,7 @@ def build_epoch_plan(
     candidate_limit_per_environment_lane: int,
     environment_universes: Mapping[str, int],
     admission_policy: str = CHECKPOINT_EPOCH_ADMISSION_POLICY,
+    valuation_policy: str = CHECKPOINT_EPOCH_VALUATION_POLICY,
     ranking_policy: str = CHECKPOINT_EPOCH_RANKING_POLICY,
     reward_policy: str = CHECKPOINT_EPOCH_REWARD_POLICY,
     finalization_policy: str = CHECKPOINT_EPOCH_FINALIZATION_POLICY,
@@ -940,6 +949,8 @@ def build_epoch_plan(
     )
     if admission_policy != CHECKPOINT_EPOCH_ADMISSION_POLICY:
         raise ValueError("unsupported checkpoint epoch admission policy")
+    if valuation_policy != CHECKPOINT_EPOCH_VALUATION_POLICY:
+        raise ValueError("unsupported checkpoint epoch valuation policy")
     if ranking_policy != CHECKPOINT_EPOCH_RANKING_POLICY:
         raise ValueError("unsupported checkpoint epoch ranking policy")
     if reward_policy != CHECKPOINT_EPOCH_REWARD_POLICY:
@@ -975,6 +986,7 @@ def build_epoch_plan(
             candidate_limit_per_environment_lane
         ),
         admission_policy=admission_policy,
+        valuation_policy=valuation_policy,
         ranking_policy=ranking_policy,
         reward_policy=reward_policy,
         finalization_policy=finalization_policy,
@@ -1031,6 +1043,7 @@ def build_epoch_plan(
             candidate_limit_per_environment_lane
         ),
         admission_policy=admission_policy,
+        valuation_policy=valuation_policy,
         ranking_policy=ranking_policy,
         reward_policy=reward_policy,
         finalization_policy=finalization_policy,
@@ -1066,6 +1079,7 @@ def epoch_plan_to_dict(plan: EpochPlan) -> dict[str, Any]:
             plan.candidate_limit_per_environment_lane
         ),
         "admission_policy": plan.admission_policy,
+        "valuation_policy": plan.valuation_policy,
         "ranking_policy": plan.ranking_policy,
         "reward_policy": plan.reward_policy,
         "finalization_policy": plan.finalization_policy,
@@ -1137,6 +1151,7 @@ def parse_epoch_plan(
             "target_groups_per_environment_lane",
             "candidate_limit_per_environment_lane",
             "admission_policy",
+            "valuation_policy",
             "ranking_policy",
             "reward_policy",
             "finalization_policy",
@@ -1252,6 +1267,7 @@ def parse_epoch_plan(
             obj["candidate_limit_per_environment_lane"]
         ),
         admission_policy=obj["admission_policy"],
+        valuation_policy=obj["valuation_policy"],
         ranking_policy=obj["ranking_policy"],
         reward_policy=obj["reward_policy"],
         finalization_policy=obj["finalization_policy"],
@@ -1306,6 +1322,7 @@ def validate_epoch_plan(
             plan.candidate_limit_per_environment_lane
         ),
         admission_policy=plan.admission_policy,
+        valuation_policy=plan.valuation_policy,
         ranking_policy=plan.ranking_policy,
         reward_policy=plan.reward_policy,
         finalization_policy=plan.finalization_policy,
@@ -1482,6 +1499,7 @@ __all__ = [
     "CHECKPOINT_EPOCH_ADMISSION_POLICY",
     "CHECKPOINT_EPOCH_COMMITMENT_SET_SCHEMA_VERSION",
     "CHECKPOINT_EPOCH_FINALIZATION_POLICY",
+    "CHECKPOINT_EPOCH_VALUATION_POLICY",
     "CHECKPOINT_EPOCH_RANKING_POLICY",
     "CHECKPOINT_EPOCH_REQUIRED_WINDOW_COUNT",
     "CHECKPOINT_EPOCH_REWARD_POLICY",
