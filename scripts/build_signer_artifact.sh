@@ -67,6 +67,11 @@ docker run --rm --network none --entrypoint python "${IMAGE_ID}" \
 docker run --rm --network none --entrypoint python "${IMAGE_ID}" \
   -c 'from reliquary.signer.protocol import SIGNER_PROTOCOL_VERSION; print(SIGNER_PROTOCOL_VERSION)' \
   > "${OUTPUT_DIR}/protocol-version.txt"
+docker run --rm --network none --read-only \
+  --tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m,mode=0700,uid=10001,gid=10001 \
+  --entrypoint python "${IMAGE_ID}" \
+  -c 'import bittensor; from reliquary.signer.backend import BittensorSignerBackend; print("signer-import-ok")' \
+  > "${OUTPUT_DIR}/runtime-import.txt"
 docker image inspect "${IMAGE_ID}" > "${OUTPUT_DIR}/image-inspect.json"
 docker history --no-trunc "${IMAGE_ID}" > "${OUTPUT_DIR}/image-history.txt"
 
@@ -115,6 +120,7 @@ sha256sum \
   "${OUTPUT_DIR}/image-history.txt" \
   "${OUTPUT_DIR}/python-packages.txt" \
   "${OUTPUT_DIR}/protocol-version.txt" \
+  "${OUTPUT_DIR}/runtime-import.txt" \
   > "${OUTPUT_DIR}/evidence.sha256"
 chmod -R go-w "${OUTPUT_DIR}"
 
