@@ -1,0 +1,50 @@
+# Wallet-owning semantic signer. This specification belongs only on signer-01.
+services:
+  reliquary-signer:
+    image: ${SIGNER_IMAGE:?set the verified immutable signer image ID}
+    pull_policy: never
+    container_name: reliquary-signer
+    restart: unless-stopped
+    stop_grace_period: 30s
+    init: true
+    user: "10001:10001"
+    network_mode: host
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ipc: private
+    pid: private
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=16m,mode=0700,uid=10001,gid=10001
+    pids_limit: 128
+    mem_limit: 1g
+    cpus: 1.0
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 4096
+    env_file: .env.signer
+    volumes:
+      - type: bind
+        source: ${RELIQUARY_SIGNER_PKI_DIR:-/etc/reliquary/signer-pki}
+        target: /etc/reliquary/pki
+        read_only: true
+      - type: bind
+        source: ${RELIQUARY_SIGNER_WALLET_DIR:-/var/lib/reliquary-signer/wallets}
+        target: /var/lib/reliquary-signer/wallets
+        read_only: true
+      - type: bind
+        source: ${RELIQUARY_SIGNER_STATE_DIR:-/var/lib/reliquary-signer/state}
+        target: /var/lib/reliquary-signer/state
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json; p=json.load(open('/tmp/reliquary-signer-health.json')); assert p['status']=='ready'"
+      interval: 15s
+      timeout: 3s
+      retries: 4
+      start_period: 30s

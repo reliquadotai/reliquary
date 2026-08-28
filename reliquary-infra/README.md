@@ -1,7 +1,7 @@
 # Reliquary validator infrastructure
 
-- Status: deployed non-authoritative `ctrl-01` foundation plus a complete,
-  not-yet-provisioned `cpu-exec-01` deployment package
+- Status: deployed non-authoritative `ctrl-01` foundation plus complete,
+  not-yet-provisioned `cpu-exec-01` and `signer-01` deployment packages
 - Evidence dates: 2026-08-21, 2026-08-25, and 2026-08-28
 - Production image revision inspected:
   ab6478f1657b9134d628c93e8816a14651910146
@@ -11,7 +11,7 @@
   hardened shadow `ctrl-01` now serves immutable state, health, checkpoint, and
   runtime-contract snapshots on loopback and has passed 2x target load. Remote
   proof workers, a provisioned CPU execution host, scoped GPU workload
-  identity, provider adapters, signer separation, off-host backups, public
+  identity, provider adapters, off-host backups, public
   DNS/TLS, and production cutover remain gated.
 
 The `cpu-exec-01` package now includes a pinned/hash-verified gVisor/KVM image,
@@ -20,6 +20,12 @@ artifact builder/verifier, a deny-by-default Ansible host playbook, malicious
 corpus and load gates, and a complete host validator. The image can be built
 and stored on `ctrl-01`, but hostile execution must wait for the separate KVM
 machine.
+
+The `signer-01` package now includes a semantic-only signer API, durable replay
+journal, hotkey-only Bittensor backend, independent mTLS PKI, hash-locked
+minimal image, deny-by-default host role, and end-to-end TLS/signature tests.
+All three CPU roles share one `deploy_role.sh` switch. See the
+[three-role build and release contract](10-three-role-build-and-release.md).
 
 ## 2026-08-25 implementation correction
 
@@ -172,6 +178,7 @@ failures.
 - [CPU control and hostile-execution split](07-cpu-control-execution-split.md)
 - [ctrl-01 deployment, qualification, and remaining gates](08-ctrl-01-deployment-report.md)
 - [cpu-exec-01 package, controls, and exact deployment gate](09-cpu-exec-01-readiness.md)
+- [Three-role build and release contract](10-three-role-build-and-release.md)
 
 ## Non-negotiable invariants
 

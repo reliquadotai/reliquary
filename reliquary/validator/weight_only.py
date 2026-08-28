@@ -44,10 +44,13 @@ class WeightOnlyValidator:
     No local state: every submit recomputes from scratch.
     """
 
-    def __init__(self, wallet, netuid: int) -> None:
+    def __init__(self, wallet, netuid: int, *, signer_client: Any | None = None) -> None:
         self.wallet = wallet
         self.netuid = netuid
+        self.signer_client = signer_client
+        self.validator_hotkey = str(wallet.hotkey.ss58_address)
         self._last_submit_epoch: int | None = None
+        self._active_submit_epoch: int | None = None
 
     async def run(self) -> None:
         """Poll the epoch boundary and submit weights once per epoch.
@@ -59,7 +62,7 @@ class WeightOnlyValidator:
         """
         logger.info(
             "Weight-only validator started (netuid=%d, hotkey=%s)",
-            self.netuid, self.wallet.hotkey.ss58_address,
+            self.netuid, self.validator_hotkey,
         )
         subtensor = None
         try:
@@ -93,6 +96,7 @@ class WeightOnlyValidator:
                         await asyncio.sleep(POLL_INTERVAL_SECONDS)
                         continue
 
+                    self._active_submit_epoch = current_epoch_id
                     submitted = await self.submit_once()
                     self._last_submit_epoch = current_epoch_id
                     logger.info(
@@ -124,7 +128,7 @@ class WeightOnlyValidator:
         finally:
             await chain.close_subtensor(subtensor)
 
-    async def submit_once(self) -> bool:
+    async def submit_once(self, *, epoch_id: int | None = None) -> bool:
         """Run one set_weights cycle: read R2 archives → replay EMA → submit
         on-chain. Returns True iff the chain accepted the extrinsic.
 
@@ -149,7 +153,13 @@ class WeightOnlyValidator:
 
         subtensor = await chain.get_subtensor()
         try:
-            submitted = await self._submit_weights(subtensor, miner_weights)
+            previous_epoch = self._active_submit_epoch
+            if epoch_id is not None:
+                self._active_submit_epoch = int(epoch_id)
+            try:
+                submitted = await self._submit_weights(subtensor, miner_weights)
+            finally:
+                self._active_submit_epoch = previous_epoch
         finally:
             await chain.close_subtensor(subtensor)
         return submitted
@@ -198,7 +208,7 @@ class WeightOnlyValidator:
 
         if _uid_burn is not None:
             return int(_uid_burn)
-        own_uid = hotkey_to_uid.get(self.wallet.hotkey.ss58_address)
+        own_uid = hotkey_to_uid.get(self.validator_hotkey)
         if own_uid is None:
             logger.warning(
                 "burn uid: this validator's hotkey is absent from the "
@@ -208,7 +218,9 @@ class WeightOnlyValidator:
         return int(own_uid)
 
     async def _submit_weights(
-        self, subtensor, miner_weights: dict[str, float],
+        self,
+        subtensor,
+        miner_weights: dict[str, float],
     ) -> bool:
         meta = await chain.get_metagraph(subtensor, self.netuid)
         hotkey_to_uid = dict(zip(meta.hotkeys, meta.uids))
@@ -244,9 +256,19 @@ class WeightOnlyValidator:
 
         uids = list(weights_by_uid)
         weight_vals = [weights_by_uid[uid] for uid in uids]
-        submitted = await chain.set_weights(
-            subtensor, self.wallet, self.netuid, uids, weight_vals,
-        )
+        if self.signer_client is None:
+            submitted = await chain.set_weights(
+                subtensor, self.wallet, self.netuid, uids, weight_vals,
+            )
+        else:
+            if self._active_submit_epoch is None:
+                raise RuntimeError("remote signer weight submission requires epoch_id")
+            submitted = await self.signer_client.set_weights(
+                epoch_id=self._active_submit_epoch,
+                netuid=self.netuid,
+                uids=uids,
+                weights=weight_vals,
+            )
         if submitted:
             logger.info(
                 "Submitted weights: %d registered miners "

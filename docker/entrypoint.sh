@@ -6,8 +6,20 @@
 #   2. Validator main process
 set -euo pipefail
 
-: "${BT_WALLET_NAME:?BT_WALLET_NAME is required}"
-: "${BT_HOTKEY:?BT_HOTKEY is required}"
+REMOTE_SIGNER_URL="${RELIQUARY_SIGNER_URL:-}"
+if [[ -n "${REMOTE_SIGNER_URL}" ]]; then
+  : "${RELIQUARY_SIGNER_EXPECTED_HOTKEY:?required in remote signer mode}"
+  : "${RELIQUARY_SIGNER_CA:?required in remote signer mode}"
+  : "${RELIQUARY_SIGNER_CERT:?required in remote signer mode}"
+  : "${RELIQUARY_SIGNER_KEY:?required in remote signer mode}"
+  BT_WALLET_NAME="${BT_WALLET_NAME:-remote-signer}"
+  BT_HOTKEY="${BT_HOTKEY:-remote-signer}"
+  BT_WALLET_PATH="${BT_WALLET_PATH:-/nonexistent/remote-signer-wallet}"
+  export BT_WALLET_NAME BT_HOTKEY BT_WALLET_PATH
+else
+  : "${BT_WALLET_NAME:?BT_WALLET_NAME is required}"
+  : "${BT_HOTKEY:?BT_HOTKEY is required}"
+fi
 
 GRADER_PID=""
 VALIDATOR_PID=""
@@ -70,30 +82,32 @@ trap terminate_children TERM INT
 trap cleanup EXIT
 
 # ── Credential permissions ────────────────────────────────────────────────
-DEFAULT_WALLET_PATH="/opt/reliquary/wallets"
-LEGACY_WALLET_PATH="/root/.bittensor/wallets"
-if [[ -n "${BT_WALLET_PATH:-}" ]]; then
-  WALLET_DIR="${BT_WALLET_PATH}"
-elif [[ -d "${DEFAULT_WALLET_PATH}" ]]; then
-  WALLET_DIR="${DEFAULT_WALLET_PATH}"
-elif [[ -d "${LEGACY_WALLET_PATH}" ]]; then
-  WALLET_DIR="${LEGACY_WALLET_PATH}"
-else
-  WALLET_DIR="${DEFAULT_WALLET_PATH}"
-fi
-export BT_WALLET_PATH="${WALLET_DIR}"
-if [[ ! -d "${WALLET_DIR}" ]]; then
-  echo "[entrypoint] FATAL: credential directory is not mounted" >&2
-  exit 1
-fi
-if [[ "${RELIQUARY_DROP_VALIDATOR_PRIVILEGES:-0}" == "1" ]]; then
-  read_check=(setpriv --reuid=1000 --regid=1000 --clear-groups test -r "${WALLET_DIR}")
-else
-  read_check=(test -r "${WALLET_DIR}")
-fi
-if ! "${read_check[@]}"; then
-  echo "[entrypoint] FATAL: credential directory is not readable" >&2
-  exit 1
+if [[ -z "${REMOTE_SIGNER_URL}" ]]; then
+  DEFAULT_WALLET_PATH="/opt/reliquary/wallets"
+  LEGACY_WALLET_PATH="/root/.bittensor/wallets"
+  if [[ -n "${BT_WALLET_PATH:-}" ]]; then
+    WALLET_DIR="${BT_WALLET_PATH}"
+  elif [[ -d "${DEFAULT_WALLET_PATH}" ]]; then
+    WALLET_DIR="${DEFAULT_WALLET_PATH}"
+  elif [[ -d "${LEGACY_WALLET_PATH}" ]]; then
+    WALLET_DIR="${LEGACY_WALLET_PATH}"
+  else
+    WALLET_DIR="${DEFAULT_WALLET_PATH}"
+  fi
+  export BT_WALLET_PATH="${WALLET_DIR}"
+  if [[ ! -d "${WALLET_DIR}" ]]; then
+    echo "[entrypoint] FATAL: credential directory is not mounted" >&2
+    exit 1
+  fi
+  if [[ "${RELIQUARY_DROP_VALIDATOR_PRIVILEGES:-0}" == "1" ]]; then
+    read_check=(setpriv --reuid=1000 --regid=1000 --clear-groups test -r "${WALLET_DIR}")
+  else
+    read_check=(test -r "${WALLET_DIR}")
+  fi
+  if ! "${read_check[@]}"; then
+    echo "[entrypoint] FATAL: credential directory is not readable" >&2
+    exit 1
+  fi
 fi
 
 ENVIRONMENTS="${RELIQUARY_ENVIRONMENTS:-openmathinstruct}"

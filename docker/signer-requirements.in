@@ -1,0 +1,6 @@
+# Isolated signer dependency graph. Keep this independent from the validator,
+# trainer, storage, and GPU stacks.
+bittensor==10.5.0
+pydantic==2.13.4
+fastapi==0.141.1
+uvicorn==0.52.4

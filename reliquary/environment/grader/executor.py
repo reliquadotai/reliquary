@@ -366,9 +366,9 @@ class RemoteSandboxExecutor:
             context = ssl.create_default_context(cafile=ca_cert)
             context.minimum_version = ssl.TLSVersion.TLSv1_2
             context.load_cert_chain(certfile=client_cert, keyfile=client_key)
-            self._client = httpx.Client(verify=context)
+            self._client = httpx.Client(verify=context, trust_env=False)
         else:
-            self._client = httpx.Client()
+            self._client = httpx.Client(trust_env=False)
 
     def _record_success(self, latency_ms: float) -> None:
         with self._lock:

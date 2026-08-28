@@ -1,0 +1,28 @@
+---
+# Copy outside Git, replace every angle-bracket value, and pass to deploy_role.sh.
+all:
+  hosts:
+    signer-01:
+      ansible_host: <management-ip>
+      ansible_user: root
+      ansible_python_interpreter: /usr/bin/python3
+  vars:
+    signer_admin_user: reliquary-admin
+    signer_admin_authorized_key: <operator-public-ssh-key>
+    signer_management_cidr: <operator-ip-or-vpn-cidr>
+    signer_bind_ip: <private-signer-ip>
+    signer_ctrl_source_cidr: <ctrl-01-private-ip>/32
+    signer_network: finney
+    signer_netuid: 81
+    signer_repo_id: aivolutionedge/reliquary-sn
+    signer_expected_hotkey: <validator-hotkey-ss58-address>
+    signer_wallet_name: validator
+    signer_hotkey_name: default
+    signer_axon_ip: <public-validator-ip>
+    signer_axon_port: 8443
+    signer_port: 8444
+    signer_image_archive: <absolute-local-signer-artifact-tar.gz>
+    signer_image_archive_sha256: <manifest-archive-sha256>
+    signer_image_id: sha256:<manifest-image-id>
+    signer_image_revision: <manifest-git-revision>
+    signer_pki_source_dir: <absolute-local-pki>/signer

@@ -1,5 +1,10 @@
 # cpu-exec-01 deployment readiness
 
+`Content-bound protocol v2` is the current internal executor contract. It is
+not an obsolete public API version. The number is pinned because v2 binds the
+exact code digest, ordered cases, runtime digest, and deadlines into the job
+identifier; the executor rejects every other version.
+
 ## Outcome
 
 The hostile CPU split is implemented as a deployable prototype without making

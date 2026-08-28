@@ -22,6 +22,26 @@
         that: not root_wallets.stat.exists
         fail_msg: "Refusing to provision ctrl-01 while /root/.bittensor/wallets exists"
 
+    - name: Validate optional remote execution and signing contracts
+      ansible.builtin.assert:
+        that:
+          - (ctrl_cpu_executor_mode | default('shadow')) in ['shadow', 'remote']
+          - >-
+            (ctrl_cpu_executor_url | default('') | length == 0) or
+            (
+              ctrl_cpu_executor_url is match('^https://') and
+              ctrl_cpu_executor_runtime_id is match('^grader-sha256:[0-9a-f]{64}$') and
+              ctrl_cpu_executor_client_pki_source_dir is defined
+            )
+          - >-
+            (ctrl_signer_url | default('') | length == 0) or
+            (
+              ctrl_signer_url is match('^https://') and
+              ctrl_signer_expected_hotkey | length >= 40 and
+              ctrl_signer_client_pki_source_dir is defined
+            )
+        fail_msg: "remote control contracts require HTTPS, pinned identity, and client PKI"
+
   tasks:
     - name: Set the control hostname
       ansible.builtin.hostname:
@@ -62,6 +82,14 @@
         append: true
         shell: /bin/bash
         create_home: true
+      register: ctrl_admin_account
+
+    - name: Pin the container-readable control identity
+      ansible.builtin.assert:
+        that:
+          - ctrl_admin_account.uid == 1000
+          - ctrl_admin_account.group == 1000
+        fail_msg: "ctrl-01 requires its sole control/container identity at uid/gid 1000"
 
     - name: Create the administrative SSH directory
       ansible.builtin.file:
@@ -143,6 +171,93 @@
           owner: root
           group: root
           mode: "0750"
+        - path: /etc/reliquary/executor-client
+          owner: root
+          group: "1000"
+          mode: "0750"
+        - path: /etc/reliquary/signer-client
+          owner: root
+          group: "1000"
+          mode: "0750"
+
+    - name: Validate optional client leaf bundles on the Ansible controller
+      ansible.builtin.assert:
+        that:
+          - (item.path + '/ca.crt') is file
+          - (item.path + '/client.crt') is file
+          - (item.path + '/client.key') is file
+          - not ((item.path + '/ca.key') is file)
+        fail_msg: "client PKI is incomplete or contains an offline CA key"
+      loop:
+        - enabled: "{{ ctrl_cpu_executor_url | default('') | length > 0 }}"
+          path: "{{ ctrl_cpu_executor_client_pki_source_dir | default('/nonexistent') }}"
+        - enabled: "{{ ctrl_signer_url | default('') | length > 0 }}"
+          path: "{{ ctrl_signer_client_pki_source_dir | default('/nonexistent') }}"
+      when: item.enabled | bool
+      delegate_to: localhost
+      become: false
+
+    - name: Install remote service client leaf identities without CA keys
+      ansible.builtin.copy:
+        src: "{{ item.source }}/{{ item.name }}"
+        dest: "/etc/reliquary/{{ item.target }}/{{ item.name }}"
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - enabled: "{{ ctrl_cpu_executor_url | default('') | length > 0 }}"
+          source: "{{ ctrl_cpu_executor_client_pki_source_dir | default('/nonexistent') }}"
+          target: executor-client
+          name: ca.crt
+          owner: root
+          group: root
+          mode: "0644"
+        - enabled: "{{ ctrl_cpu_executor_url | default('') | length > 0 }}"
+          source: "{{ ctrl_cpu_executor_client_pki_source_dir | default('/nonexistent') }}"
+          target: executor-client
+          name: client.crt
+          owner: root
+          group: root
+          mode: "0644"
+        - enabled: "{{ ctrl_cpu_executor_url | default('') | length > 0 }}"
+          source: "{{ ctrl_cpu_executor_client_pki_source_dir | default('/nonexistent') }}"
+          target: executor-client
+          name: client.key
+          owner: "1000"
+          group: "1000"
+          mode: "0600"
+        - enabled: "{{ ctrl_signer_url | default('') | length > 0 }}"
+          source: "{{ ctrl_signer_client_pki_source_dir | default('/nonexistent') }}"
+          target: signer-client
+          name: ca.crt
+          owner: root
+          group: root
+          mode: "0644"
+        - enabled: "{{ ctrl_signer_url | default('') | length > 0 }}"
+          source: "{{ ctrl_signer_client_pki_source_dir | default('/nonexistent') }}"
+          target: signer-client
+          name: client.crt
+          owner: root
+          group: root
+          mode: "0644"
+        - enabled: "{{ ctrl_signer_url | default('') | length > 0 }}"
+          source: "{{ ctrl_signer_client_pki_source_dir | default('/nonexistent') }}"
+          target: signer-client
+          name: client.key
+          owner: "1000"
+          group: "1000"
+          mode: "0600"
+      when: item.enabled | bool
+      no_log: true
+
+    - name: Render the wallet-free control role contract
+      ansible.builtin.template:
+        src: "{{ playbook_dir | dirname }}/templates/control-role.env.j2"
+        dest: /etc/reliquary/control-role.env
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
 
     - name: Record the deployed infrastructure identity
       ansible.builtin.template:

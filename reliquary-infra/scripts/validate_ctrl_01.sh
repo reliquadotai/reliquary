@@ -29,5 +29,8 @@ ss -lntup | grep -Eq '127\.0\.0\.1:9100'
 ! ss -lntup | grep -Eq '0\.0\.0\.0:(80|443|8081|9100)'
 ! swapon --show --noheadings | grep -q .
 ufw status | grep -q 'Status: active'
+! find /root /home -maxdepth 5 -type d -name wallets -path '*/.bittensor/*' -print -quit | grep -q .
+test ! -e /etc/reliquary/executor-client/ca.key
+test ! -e /etc/reliquary/signer-client/ca.key
 
 echo "ctrl-01 validation passed"

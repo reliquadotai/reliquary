@@ -10,11 +10,15 @@ __pycache__/
 wallet_deploy/
 .env
 docker/.env.cpu-executor
+docker/.env.signer
 docker/pki/
 reliquary-infra/secrets/
 reliquary-infra/.ansible/
 reliquary-infra/reports/private/
 reliquary-infra/inventory/hosts.yml
+reliquary-infra/inventory/cpu-exec.yml
+reliquary-infra/inventory/signer.yml
+reliquary-infra/inventory/three-role.yml
 reliquary-infra/inventory/group_vars/all.yml
 reliquary-infra/inventory/known_hosts
 

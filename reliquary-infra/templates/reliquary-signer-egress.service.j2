@@ -1,0 +1,15 @@
+[Unit]
+Description=Reliquary signer private-network egress denial
+Before=docker.service reliquary-signer.service
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/nftables.d/reliquary-signer-egress.nft
+ExecReload=/usr/sbin/nft -f /etc/nftables.d/reliquary-signer-egress.nft
+ExecStop=/usr/sbin/nft delete table inet reliquary_signer
+
+[Install]
+WantedBy=multi-user.target

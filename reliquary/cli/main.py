@@ -536,14 +536,31 @@ def validate(
         )
 
     async def _run():
-        import bittensor as bt
-
         from reliquary.infrastructure.chain import get_subtensor
 
-        wallet_kwargs = {"name": wallet_name, "hotkey": hotkey}
-        if wallet_path:
-            wallet_kwargs["path"] = wallet_path
-        wallet = bt.Wallet(**wallet_kwargs)
+        signer_client = None
+        if os.environ.get("RELIQUARY_SIGNER_URL", "").strip():
+            from reliquary.signer.client import RemoteSignerClient
+
+            signer_client = RemoteSignerClient.from_environment(
+                network=network,
+                netuid=netuid,
+                repo_id=hf_repo_id,
+            )
+            health = await asyncio.to_thread(signer_client.assert_ready)
+            wallet = signer_client.public_wallet
+            logger.info(
+                "Remote signer ready (hotkey=%s protocol=%d)",
+                health.signer_hotkey,
+                health.protocol_version,
+            )
+        else:
+            import bittensor as bt
+
+            wallet_kwargs = {"name": wallet_name, "hotkey": hotkey}
+            if wallet_path:
+                wallet_kwargs["path"] = wallet_path
+            wallet = bt.Wallet(**wallet_kwargs)
         subtensor = await get_subtensor()
 
         if train:
@@ -762,6 +779,7 @@ def validate(
                     proof_capacity_qualification
                 ),
                 proof_worker_pool=proof_worker_pool,
+                signer_client=signer_client,
             )
             # Run the weight setter in a dedicated OS thread with its own
             # event loop. asyncio is single-threaded, so any sync blocking
@@ -773,7 +791,11 @@ def validate(
 
             def _run_weight_setter() -> None:
                 try:
-                    worker = WeightOnlyValidator(wallet=wallet, netuid=netuid)
+                    worker = WeightOnlyValidator(
+                        wallet=wallet,
+                        netuid=netuid,
+                        signer_client=signer_client,
+                    )
                     asyncio.run(worker.run())
                 except Exception:
                     logger.exception("weight-setter thread crashed")
@@ -787,7 +809,11 @@ def validate(
         else:
             from reliquary.validator.weight_only import WeightOnlyValidator
 
-            validator = WeightOnlyValidator(wallet=wallet, netuid=netuid)
+            validator = WeightOnlyValidator(
+                wallet=wallet,
+                netuid=netuid,
+                signer_client=signer_client,
+            )
             await validator.run()
 
     _run_validator_event_loop(_run())

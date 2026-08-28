@@ -18,3 +18,14 @@ ctrl_snapshot_health_stale_seconds: 5.00
 # Public reads remain closed until DNS/TLS and shadow-parity gates are approved.
 ctrl_public_http_enabled: false
 ctrl_nginx_listen_port: 8081
+
+# Leave both URLs empty while ctrl-01 is a shadow edge. When the other roles
+# exist, set these and rerun the same ctrl-01 playbook. CPU stays shadow until
+# parity gates pass; signer activation removes the local wallet mount.
+ctrl_cpu_executor_url: ""
+ctrl_cpu_executor_mode: shadow
+# ctrl_cpu_executor_runtime_id: grader-sha256:<executor-manifest-runtime-id>
+# ctrl_cpu_executor_client_pki_source_dir: <absolute-local-pki>/grader-client
+ctrl_signer_url: ""
+# ctrl_signer_expected_hotkey: <public-validator-hotkey>
+# ctrl_signer_client_pki_source_dir: <absolute-local-pki>/signer-client

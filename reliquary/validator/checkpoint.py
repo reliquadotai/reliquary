@@ -39,6 +39,29 @@ class _WalletLike(Protocol):
         def sign(data: bytes) -> bytes: ...
 
 
+class _CheckpointSigner(Protocol):
+    def sign_checkpoint(
+        self, *, checkpoint_n: int, repo_id: str, revision: str
+    ) -> bytes: ...
+
+
+class _WalletCheckpointSigner:
+    """Compatibility adapter for the pre-extraction local wallet path."""
+
+    def __init__(self, wallet: _WalletLike) -> None:
+        self.wallet = wallet
+
+    def sign_checkpoint(
+        self, *, checkpoint_n: int, repo_id: str, revision: str
+    ) -> bytes:
+        del repo_id  # The existing on-wire checkpoint payload excludes repo_id.
+        return bytes(
+            self.wallet.hotkey.sign(
+                f"{int(checkpoint_n)}|{revision}".encode("utf-8")
+            )
+        )
+
+
 class CheckpointStore:
     """Owns the in-memory current manifest + the publish lifecycle.
 
@@ -63,6 +86,7 @@ class CheckpointStore:
         tokenizer: Any = None,
         upload_fn: Callable[..., Awaitable[str]] | None = None,
         save_fn: Callable[[Any, Any, Path], None] | None = None,
+        signer: _CheckpointSigner | None = None,
     ) -> None:
         self.validator_hotkey = validator_hotkey
         self.wallet = wallet
@@ -73,6 +97,7 @@ class CheckpointStore:
         self.staging_dir.mkdir(parents=True, exist_ok=True)
         self._upload = upload_fn or _default_upload
         self._save = save_fn or _default_save_hf_format
+        self._signer = signer or _WalletCheckpointSigner(wallet)
         self._current: ManifestEntry | None = None
 
     def current_manifest(self) -> ManifestEntry | None:
@@ -118,8 +143,11 @@ class CheckpointStore:
             shutil.rmtree(snapshot_dir, ignore_errors=True)
 
         # 3. Sign (n || revision) — strong cross-validator proof
-        sig_payload = f"{checkpoint_n}|{revision}".encode()
-        sig_bytes = self.wallet.hotkey.sign(sig_payload)
+        sig_bytes = await asyncio.to_thread(
+            self.sign_manifest,
+            checkpoint_n,
+            revision,
+        )
         signature = "ed25519:" + sig_bytes.hex()
 
         # 4. Install manifest
@@ -143,8 +171,7 @@ class CheckpointStore:
         trainer. The wallet signs at INSTALL time — the attestation
         "this is my current checkpoint" only becomes true once the
         verify plane holds these weights, which is the caller's swap."""
-        sig_payload = f"{int(checkpoint_n)}|{revision}".encode()
-        sig_bytes = self.wallet.hotkey.sign(sig_payload)
+        sig_bytes = self.sign_manifest(checkpoint_n, revision)
         entry = ManifestEntry(
             checkpoint_n=int(checkpoint_n),
             repo_id=self.repo_id,
@@ -157,6 +184,16 @@ class CheckpointStore:
             checkpoint_n, self.repo_id, str(revision)[:12],
         )
         return entry
+
+    def sign_manifest(self, checkpoint_n: int, revision: str) -> bytes:
+        """Sign only the existing structured checkpoint claim."""
+        return bytes(
+            self._signer.sign_checkpoint(
+                checkpoint_n=int(checkpoint_n),
+                repo_id=self.repo_id,
+                revision=str(revision),
+            )
+        )
 
 
 # ---- production defaults (lazy-imported so tests don't drag torch/HF in) ----
