@@ -36,6 +36,7 @@ from reliquary.constants import (
     MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW,
     MIN_EOS_PROBABILITY,
     MATH_ANSWER_FORMAT,
+    FILL_CLOSED_ENABLED,
     FORENSIC_SAMPLE_PER_WINDOW,
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
     MAX_PENDING_SUBMISSION_BYTES_PER_ENV,
@@ -1072,6 +1073,14 @@ class GrpoWindowBatcher:
         # winners. Both record once and never move.
         self.graded_batch_fill_offset_s: float | None = None
         self.graded_prefix_fill_offset_s: float | None = None
+        # Fill-closed content-dedup guard. Under per-slot auction payment a
+        # resubmitted group won a duplicate slot at worst; under per-token
+        # payment it collects the same tokens twice, so this must be airtight
+        # rather than best-effort. Populated by ``_register_payload_digest``,
+        # called from the precommit path before any capacity is reserved.
+        # Per-window like the fields above: a fresh set every window because
+        # a new ``GrpoWindowBatcher`` is constructed per window.
+        self._payload_digests_seen: set[str] = set()
         self._loop: asyncio.AbstractEventLoop | None = None
         # Optional callback the seal-extension coroutine polls to check
         # whether the server's submit_queue has finished draining items
@@ -1264,6 +1273,20 @@ class GrpoWindowBatcher:
     def collection_closed(self) -> bool:
         """Whether the generation/commit phase has reached its fixed cutoff."""
         return self._time_fn() - self.window_opened_at >= self.collection_seconds
+
+    def _register_payload_digest(self, digest: str) -> bool:
+        """Record a submission payload digest for this window.
+
+        Returns True the first time ``digest`` is seen this window, False on
+        every resubmission. Under fill-closed per-token payment a duplicate
+        group would collect payment for the same tokens twice, so this must
+        be airtight rather than best-effort -- the precommit gives it for
+        free, at the hash, before any payload moves or capacity is reserved.
+        """
+        if digest in self._payload_digests_seen:
+            return False
+        self._payload_digests_seen.add(digest)
+        return True
 
     def _record_upload_precommit_rejection_locked(self, reason: str) -> None:
         self._upload_precommit_rejections[reason] = (

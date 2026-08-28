@@ -3550,3 +3550,16 @@ def test_short_forged_rollout_rejected_at_identity_temperature(monkeypatch):
 
     assert _prove_one(b, req) is None
     assert b.reject_counts[RejectReason.LOGPROB_MISMATCH.value] == 1
+
+
+def test_a_duplicate_payload_hash_is_refused_at_precommit(monkeypatch):
+    """Same group twice is the same tokens paid twice."""
+    import reliquary.validator.batcher as batcher_module
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+
+    batcher = _make_batcher()
+    batcher.mark_window_opened()
+    digest = "a" * 64
+
+    assert batcher._register_payload_digest(digest) is True
+    assert batcher._register_payload_digest(digest) is False

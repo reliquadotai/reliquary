@@ -15,7 +15,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator, Sequence
 
 from pydantic import ValidationError
 
@@ -1148,3 +1148,33 @@ def prepare_submission(
     )
     prepared.legacy_merkle_status = parsed.legacy_merkle_status
     return prepared
+
+
+def robust_utility_admits(
+    rewards: Sequence[float],
+    *,
+    sigma_min: float,
+    truncated_indices: Iterable[int] = (),
+    attainable_rewards: Iterable[float] = (0.0, 1.0),
+) -> bool:
+    """Whether a group survives its least favourable interpretation.
+
+    The auction defended against the manufactured zero by PRICING it: the
+    gated utility is minimised over every joint assignment of the truncated
+    rollouts' reward lattice, and the gate returns 0.0 below SIGMA_MIN, so a
+    manipulated group could never score above its honest value.
+
+    With no auction there is no price, so the same computation has to become
+    an admission decision. Utility 0.0 means some true reading of this group
+    is out of zone; refuse it.
+    """
+    from reliquary.validator.difficulty_auction import (
+        robust_uncertain_reward_utility,
+    )
+
+    return robust_uncertain_reward_utility(
+        rewards,
+        sigma_min=sigma_min,
+        uncertain_indices=truncated_indices,
+        attainable_rewards=attainable_rewards,
+    ) > 0.0
