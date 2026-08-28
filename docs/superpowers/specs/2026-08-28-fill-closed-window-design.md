@@ -376,13 +376,22 @@ is identically zero until the window is already over. Shadowing the real
 rule is therefore impossible before Stage 2 — an earlier draft of this
 document said otherwise and was wrong.
 
-What is measurable today is the batch-shaped fill: the offset from window
-open at which `_pending` — graded, in-zone candidates — first holds
-`B_BATCH` distinct prompts. That is when the batch became fillable, and it
-is the upper bound the proven-count close converges to once proving moves
-to arrival. PR #212 measured the adjacent quantity (productive *capacity*
-charges at +19 s to +45 s), but capacity is 64 receipts while a batch needs
-distinct prompts.
+What is measurable today is the graded fill, and it **brackets** the answer
+rather than pinning it. Nothing in `_pending` is proven, and a group that
+fails its proof is not a group, so:
+
+    floor    B_BATCH distinct graded prompts        every proof passes
+    ceiling  MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW   half fail, the budgeted
+             distinct graded prompts                worst case
+
+The ceiling is not an invented number: the ranked prefix is `2 * B_BATCH`
+precisely because it is "B_BATCH winners plus B_BATCH possible failed
+candidates". The proven fill sits between the two, and recording only the
+floor would size the design on its most optimistic case.
+
+PR #212 measured the adjacent quantity (productive *capacity* charges at
++19 s to +45 s), but capacity is 64 receipts while a batch needs distinct
+prompts.
 
 It is read by polling, not by hooking admission: the resolution needed is
 seconds, and the admission locks have a documented convoy history. It is
@@ -390,8 +399,12 @@ recorded once per environment per window and carried in
 `upload_precommit_conservation`, which already reaches the R2 archive and
 `/health` per environment.
 
-Acceptance: the offset is populated on healthy windows and its distribution
-answers open question 1. Nothing else changes.
+Acceptance: both offsets are populated on healthy windows and the width of
+the bracket answers open question 1. Nothing else changes.
+
+The bracket collapses to a point in Stage 2: once proving runs on arrival,
+the proven count is observable during the window and the close rule can be
+shadowed directly.
 
 **Stage 2 — validate on arrival, proof path unchanged.** Move GRAIL from
 seal to arrival with the auction still in place. Acceptance criterion is

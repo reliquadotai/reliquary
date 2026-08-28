@@ -60,7 +60,7 @@ def test_fill_offset_records_when_b_batch_distinct_prompts_are_pending():
 
     b.poll_deadline()
 
-    assert b.batch_fill_offset_s == 31.0
+    assert b.graded_batch_fill_offset_s == 31.0
 
 
 def test_repeated_prompts_do_not_fill_the_batch():
@@ -77,7 +77,7 @@ def test_repeated_prompts_do_not_fill_the_batch():
 
     b.poll_deadline()
 
-    assert b.batch_fill_offset_s is None
+    assert b.graded_batch_fill_offset_s is None
 
 
 def test_fill_offset_latches_at_the_first_fillable_moment():
@@ -98,7 +98,7 @@ def test_fill_offset_latches_at_the_first_fillable_moment():
     advance(40.0)
     b.poll_deadline()
 
-    assert b.batch_fill_offset_s == 31.0
+    assert b.graded_batch_fill_offset_s == 31.0
 
 
 def test_fill_offset_is_exposed_for_analysis():
@@ -114,7 +114,7 @@ def test_fill_offset_is_exposed_for_analysis():
     advance(31.0)
     b.poll_deadline()
 
-    assert b.upload_precommit_conservation()["batch_fill_offset_seconds"] == 31.0
+    assert b.upload_precommit_conservation()["graded_batch_fill_offset_seconds"] == 31.0
 
 
 def test_fill_offset_is_absent_until_the_batch_is_fillable():
@@ -122,4 +122,34 @@ def test_fill_offset_is_absent_until_the_batch_is_fillable():
     advance(31.0)
     b.poll_deadline()
 
-    assert b.upload_precommit_conservation()["batch_fill_offset_seconds"] is None
+    assert b.upload_precommit_conservation()["graded_batch_fill_offset_seconds"] is None
+
+
+def test_prefix_fill_is_recorded_separately_and_later():
+    """B_BATCH graded prompts is a floor, not the answer.
+
+    Nothing in ``_pending`` is proven — GRAIL runs at seal — and a group that
+    fails its proof is not a group. The system already budgets for that:
+    ``MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW`` is ``2 * B_BATCH``, "B_BATCH
+    winners plus B_BATCH possible failed candidates".
+
+    So the offset at which a PROVEN batch could have been filled is bracketed:
+    at best the B_BATCH offset (every proof passes), at worst the ranked-prefix
+    offset (half fail). Recording only the floor would size the design on its
+    most optimistic case.
+    """
+    from reliquary.constants import MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW
+
+    b, advance = _clock_batcher()
+    for prompt_idx in range(B_BATCH):
+        b._pending.append(_pending(prompt_idx))
+    advance(31.0)
+    b.poll_deadline()
+
+    for prompt_idx in range(B_BATCH, MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW):
+        b._pending.append(_pending(prompt_idx))
+    advance(19.0)
+    b.poll_deadline()
+
+    assert b.graded_batch_fill_offset_s == 31.0
+    assert b.graded_prefix_fill_offset_s == 50.0
