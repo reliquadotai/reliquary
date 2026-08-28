@@ -34,6 +34,7 @@ class TrainerWorker:
         last_published_revision: str | None,
         shadow: bool = False,
         freeze_fn: Callable[[], str | None] | None = None,
+        abort_epoch_fn: Callable[[Any], None] | None = None,
     ) -> None:
         self._journal = journal
         self._train_fn = train_fn
@@ -45,6 +46,7 @@ class TrainerWorker:
         self.last_published_revision = last_published_revision
         self.shadow = bool(shadow)
         self._freeze_fn = freeze_fn
+        self._abort_epoch_fn = abort_epoch_fn
         self.trained_since_publish = 0
         self.adaptive_publication_pending = False
         self.tombstones_seen = 0
@@ -98,36 +100,81 @@ class TrainerWorker:
         if entry is None:
             return "waited"
         kind, value = entry
+        epoch_binding = (
+            value.get("checkpoint_epoch")
+            if kind == "tombstone"
+            else getattr(value, "checkpoint_epoch", None)
+        )
+        if epoch_binding is not None:
+            status_fn = getattr(
+                self._journal,
+                "checkpoint_epoch_status",
+                None,
+            )
+            if not callable(status_fn):
+                raise RuntimeError(
+                    "checkpoint epoch payload requires a marker-aware journal"
+                )
+            epoch_status = status_fn(epoch_binding)
+            if epoch_status is None:
+                return "waited"
+            if epoch_status == "aborted":
+                if self._abort_epoch_fn is not None:
+                    self._abort_epoch_fn(
+                        value
+                        if kind == "tombstone"
+                        else {"checkpoint_epoch": epoch_binding}
+                    )
+                self.cursor += self.stride
+                self.tombstones_seen += 1
+                logger.warning(
+                    "checkpoint epoch %s aborted; skipping lane %s",
+                    epoch_binding.epoch_id[:12],
+                    self.cursor,
+                )
+                return "epoch_aborted"
+            if epoch_status != "completed":
+                raise RuntimeError("unknown checkpoint epoch marker status")
         if kind == "tombstone":
+            if self._abort_epoch_fn is not None:
+                self._abort_epoch_fn(value)
             self.cursor += self.stride
             self.tombstones_seen += 1
             logger.warning("window %s tombstoned: %s", self.cursor, value)
             return "tombstone"
-        if bool(value.window_quarantine.get("quarantined")):
-            self.cursor += self.stride
+        window_quarantined = bool(value.window_quarantine.get("quarantined"))
+        if window_quarantined:
             self.quarantined_seen += 1
+        if window_quarantined and epoch_binding is None:
+            self.cursor += self.stride
             logger.warning(
-                "window %s quarantined at seal; skipping", self.cursor,
+                "window %s quarantined at seal; skipping",
+                self.cursor,
             )
             return "quarantined"
+        if window_quarantined:
+            logger.warning(
+                "epoch lane %s quarantined at seal; recording an empty lane",
+                self.cursor + self.stride,
+            )
         try:
             trained = self._train_fn(value)
         except TrainingStepSkipped as exc:
             self.cursor += self.stride
             self.health_skips += 1
-            if (
-                exc.reason == "policy_ratio_drift"
-                and self.trained_since_publish > 0
-            ):
+            if exc.reason == "policy_ratio_drift" and self.trained_since_publish > 0:
                 self.adaptive_publication_pending = True
             logger.warning(
                 "train step skipped for window %s: %s",
-                self.cursor, exc.reason,
+                self.cursor,
+                exc.reason,
             )
             return "trained"
         self.cursor += self.stride
         if trained:
-            self.trained_since_publish += 1
+            self.trained_since_publish += (
+                epoch_binding.publication_units if epoch_binding is not None else 1
+            )
         return "trained"
 
     def snapshot(self) -> dict[str, Any]:

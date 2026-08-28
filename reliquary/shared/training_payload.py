@@ -13,15 +13,25 @@ import hashlib
 import io
 import json
 import math
+from dataclasses import asdict, dataclass
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 
 PAYLOAD_SCHEMA_VERSION = 2
 TOMBSTONE_SCHEMA_VERSION = 2
-_SUPPORTED_PAYLOAD_SCHEMA_VERSIONS = {1, PAYLOAD_SCHEMA_VERSION}
-_SUPPORTED_TOMBSTONE_SCHEMA_VERSIONS = {1, TOMBSTONE_SCHEMA_VERSION}
+CHECKPOINT_EPOCH_ARTIFACT_SCHEMA_VERSION = 3
+_SUPPORTED_PAYLOAD_SCHEMA_VERSIONS = {
+    1,
+    PAYLOAD_SCHEMA_VERSION,
+    CHECKPOINT_EPOCH_ARTIFACT_SCHEMA_VERSION,
+}
+_SUPPORTED_TOMBSTONE_SCHEMA_VERSIONS = {
+    1,
+    TOMBSTONE_SCHEMA_VERSION,
+    CHECKPOINT_EPOCH_ARTIFACT_SCHEMA_VERSION,
+}
 _TRAINING_IDENTITY_KEYS = (
     "protocol_profile_id",
     "protocol_version",
@@ -32,6 +42,93 @@ _TRAINING_IDENTITY_KEYS = (
 
 class TrainingPayloadProtocolMismatch(RuntimeError):
     """A detached-training artifact belongs to another protocol/run."""
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointEpochTrainingBinding:
+    """Exact epoch/lane identity carried through the detached journal."""
+
+    epoch_id: str
+    manifest_sha256: str
+    training_run_id: str
+    training_mode: str
+    first_window: int
+    lane_offset: int
+    window_count: int
+    target_groups_per_environment_lane: int
+
+    @property
+    def final_lane(self) -> bool:
+        return self.lane_offset == self.window_count - 1
+
+    @property
+    def publication_units(self) -> int:
+        if self.training_mode == "aggregate_one_step" and self.final_lane:
+            return self.window_count
+        return 1
+
+
+def _checkpoint_epoch_binding(
+    value: CheckpointEpochTrainingBinding | Mapping[str, Any],
+    *,
+    window_start: int,
+) -> CheckpointEpochTrainingBinding:
+    if isinstance(value, CheckpointEpochTrainingBinding):
+        binding = value
+    elif isinstance(value, Mapping) and set(value) == {
+        "epoch_id",
+        "manifest_sha256",
+        "training_run_id",
+        "training_mode",
+        "first_window",
+        "lane_offset",
+        "window_count",
+        "target_groups_per_environment_lane",
+    }:
+        binding = CheckpointEpochTrainingBinding(**dict(value))
+    else:
+        raise ValueError("invalid checkpoint epoch training binding")
+    for name, digest in (
+        ("epoch_id", binding.epoch_id),
+        ("manifest_sha256", binding.manifest_sha256),
+    ):
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError(f"invalid checkpoint epoch {name}")
+    if (
+        not isinstance(binding.training_run_id, str)
+        or not binding.training_run_id
+        or len(binding.training_run_id) > 256
+    ):
+        raise ValueError("invalid checkpoint epoch training run")
+    if binding.training_mode not in {
+        "aggregate_one_step",
+        "sequential_steps",
+    }:
+        raise ValueError("invalid checkpoint epoch training mode")
+    integer_fields = (
+        binding.first_window,
+        binding.lane_offset,
+        binding.window_count,
+        binding.target_groups_per_environment_lane,
+    )
+    if any(
+        isinstance(item, bool) or not isinstance(item, int) for item in integer_fields
+    ):
+        raise ValueError("checkpoint epoch training integers are invalid")
+    if (
+        binding.first_window < 0
+        or binding.window_count < 1
+        or binding.lane_offset < 0
+        or binding.lane_offset >= binding.window_count
+        or binding.target_groups_per_environment_lane < 1
+        or binding.first_window + binding.lane_offset != int(window_start)
+    ):
+        raise ValueError("checkpoint epoch training range is invalid")
+    return binding
 
 
 def active_training_identity() -> dict[str, Any]:
@@ -124,6 +221,9 @@ def encode_training_payload(
     checkpoint_revision: str,
     env_order: list[str],
     window_quarantine: dict,
+    checkpoint_epoch: (
+        CheckpointEpochTrainingBinding | Mapping[str, Any] | None
+    ) = None,
 ) -> bytes:
     groups_meta: list[dict[str, Any]] = []
     rollout_meta: list[dict[str, Any]] = []
@@ -175,10 +275,25 @@ def encode_training_payload(
                     pi_old_flat.extend(pi_old)
                 pi_old_off.append(len(pi_old_flat))
 
+    epoch_binding = (
+        _checkpoint_epoch_binding(checkpoint_epoch, window_start=window_start)
+        if checkpoint_epoch is not None
+        else None
+    )
+    artifact_schema = (
+        CHECKPOINT_EPOCH_ARTIFACT_SCHEMA_VERSION
+        if epoch_binding is not None
+        else PAYLOAD_SCHEMA_VERSION
+    )
+    protocol_header = _artifact_protocol_header(
+        latest_schema_version=artifact_schema,
+    )
+    if epoch_binding is not None and protocol_header["schema_version"] != (
+        CHECKPOINT_EPOCH_ARTIFACT_SCHEMA_VERSION
+    ):
+        raise ValueError("checkpoint epoch journal requires protocol v5+")
     header = {
-        **_artifact_protocol_header(
-            latest_schema_version=PAYLOAD_SCHEMA_VERSION,
-        ),
+        **protocol_header,
         "window_start": int(window_start),
         "checkpoint_revision": str(checkpoint_revision),
         "env_order": list(env_order),
@@ -188,12 +303,12 @@ def encode_training_payload(
         "validated_spans": validated_spans,
         "termination_paths": termination_paths,
     }
+    if epoch_binding is not None:
+        header["checkpoint_epoch"] = asdict(epoch_binding)
     buf = io.BytesIO()
     np.savez_compressed(
         buf,
-        header=np.frombuffer(
-            json.dumps(header).encode("utf-8"), dtype=np.uint8
-        ),
+        header=np.frombuffer(json.dumps(header).encode("utf-8"), dtype=np.uint8),
         rewards=np.asarray(rewards, dtype=np.float32),
         env_names=np.asarray(env_names, dtype=np.str_),
         tokens_flat=np.asarray(tokens_flat, dtype=np.int32),
@@ -211,18 +326,27 @@ class DecodedPayload:
     def __init__(self, arrays: dict[str, np.ndarray]) -> None:
         header = json.loads(bytes(arrays["header"]).decode("utf-8"))
         if header["schema_version"] not in _SUPPORTED_PAYLOAD_SCHEMA_VERSIONS:
-            raise ValueError(
-                f"unsupported payload schema {header['schema_version']}"
-            )
+            raise ValueError(f"unsupported payload schema {header['schema_version']}")
         self.schema_version = header["schema_version"]
         self.training_identity = {
-            key: header.get(key)
-            for key in _TRAINING_IDENTITY_KEYS
+            key: header.get(key) for key in _TRAINING_IDENTITY_KEYS
         }
         self.window_start = int(header["window_start"])
         self.checkpoint_revision = str(header["checkpoint_revision"])
         self.env_order = list(header["env_order"])
         self.window_quarantine = dict(header["window_quarantine"])
+        raw_epoch = header.get("checkpoint_epoch")
+        if self.schema_version == CHECKPOINT_EPOCH_ARTIFACT_SCHEMA_VERSION:
+            if raw_epoch is None:
+                raise ValueError("epoch payload omitted checkpoint epoch binding")
+            self.checkpoint_epoch = _checkpoint_epoch_binding(
+                raw_epoch,
+                window_start=self.window_start,
+            )
+        else:
+            if raw_epoch is not None:
+                raise ValueError("legacy payload carries checkpoint epoch binding")
+            self.checkpoint_epoch = None
         self._groups_meta = header["groups"]
         self._rollout_meta = header["rollout_meta"]
         self._validated_spans = header.get("validated_spans") or []
@@ -280,20 +404,117 @@ def decode_training_payload(data: bytes) -> DecodedPayload:
 
 
 def encode_tombstone(
-    *, window_start: int, failure_stage: str, failure_type: str
+    *,
+    window_start: int,
+    failure_stage: str,
+    failure_type: str,
+    checkpoint_epoch: (
+        CheckpointEpochTrainingBinding | Mapping[str, Any] | None
+    ) = None,
 ) -> bytes:
-    return json.dumps({
-        **_artifact_protocol_header(
-            latest_schema_version=TOMBSTONE_SCHEMA_VERSION,
-        ),
+    epoch_binding = (
+        _checkpoint_epoch_binding(checkpoint_epoch, window_start=window_start)
+        if checkpoint_epoch is not None
+        else None
+    )
+    artifact_schema = (
+        CHECKPOINT_EPOCH_ARTIFACT_SCHEMA_VERSION
+        if epoch_binding is not None
+        else TOMBSTONE_SCHEMA_VERSION
+    )
+    protocol_header = _artifact_protocol_header(
+        latest_schema_version=artifact_schema,
+    )
+    if epoch_binding is not None and protocol_header["schema_version"] != (
+        CHECKPOINT_EPOCH_ARTIFACT_SCHEMA_VERSION
+    ):
+        raise ValueError("checkpoint epoch journal requires protocol v5+")
+    doc = {
+        **protocol_header,
         "window_start": int(window_start),
         "failure_stage": str(failure_stage),
         "failure_type": str(failure_type),
-    }).encode("utf-8")
+    }
+    if epoch_binding is not None:
+        doc["checkpoint_epoch"] = asdict(epoch_binding)
+    return json.dumps(doc).encode("utf-8")
 
 
 def decode_tombstone(data: bytes) -> dict[str, Any]:
     doc = json.loads(data.decode("utf-8"))
     if doc.get("schema_version") not in _SUPPORTED_TOMBSTONE_SCHEMA_VERSIONS:
         raise ValueError("unsupported tombstone schema")
+    raw_epoch = doc.get("checkpoint_epoch")
+    if doc["schema_version"] == CHECKPOINT_EPOCH_ARTIFACT_SCHEMA_VERSION:
+        if raw_epoch is None:
+            raise ValueError("epoch tombstone omitted checkpoint epoch binding")
+        binding = _checkpoint_epoch_binding(
+            raw_epoch,
+            window_start=int(doc["window_start"]),
+        )
+        doc["checkpoint_epoch"] = binding
+    elif raw_epoch is not None:
+        raise ValueError("legacy tombstone carries checkpoint epoch binding")
+    return doc
+
+
+def encode_checkpoint_epoch_marker(
+    checkpoint_epoch: CheckpointEpochTrainingBinding | Mapping[str, Any],
+    *,
+    status: str,
+) -> bytes:
+    binding = _checkpoint_epoch_binding(
+        checkpoint_epoch,
+        window_start=(
+            checkpoint_epoch.first_window + checkpoint_epoch.lane_offset
+            if isinstance(checkpoint_epoch, CheckpointEpochTrainingBinding)
+            else int(checkpoint_epoch["first_window"])
+            + int(checkpoint_epoch["lane_offset"])
+        ),
+    )
+    if binding.lane_offset != 0:
+        raise ValueError("checkpoint epoch marker must bind lane zero")
+    if status not in {"completed", "aborted"}:
+        raise ValueError("invalid checkpoint epoch marker status")
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "status": status,
+            "checkpoint_epoch": asdict(binding),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def decode_checkpoint_epoch_marker(data: bytes) -> dict[str, Any]:
+    try:
+        doc = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid checkpoint epoch marker") from exc
+    if (
+        not isinstance(doc, dict)
+        or set(doc) != {"schema_version", "status", "checkpoint_epoch"}
+        or doc["schema_version"] != 1
+        or doc["status"] not in {"completed", "aborted"}
+    ):
+        raise ValueError("invalid checkpoint epoch marker")
+    raw_binding = doc["checkpoint_epoch"]
+    if not isinstance(raw_binding, dict):
+        raise ValueError("invalid checkpoint epoch marker binding")
+    binding = _checkpoint_epoch_binding(
+        raw_binding,
+        window_start=(
+            int(raw_binding["first_window"]) + int(raw_binding["lane_offset"])
+        ),
+    )
+    if binding.lane_offset != 0:
+        raise ValueError("checkpoint epoch marker must bind lane zero")
+    canonical = encode_checkpoint_epoch_marker(
+        binding,
+        status=doc["status"],
+    )
+    if data != canonical:
+        raise ValueError("checkpoint epoch marker is not canonical")
+    doc["checkpoint_epoch"] = binding
     return doc
