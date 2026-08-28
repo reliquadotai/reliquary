@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+umask 077
+DESTINATION=/var/backups/reliquary
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+ARCHIVE="${DESTINATION}/ctrl-01-config-${STAMP}.tar.gz"
+TEMPORARY="${ARCHIVE}.partial"
+trap 'rm -f "${TEMPORARY}"' EXIT
+
+install -d -m 0700 "${DESTINATION}"
+BACKUP_PATHS=(
+  etc/reliquary
+  etc/nginx
+  etc/systemd/system/reliquary-snapshot-sync.service
+  etc/systemd/system/reliquary-config-backup.service
+  etc/systemd/system/reliquary-config-backup.timer
+  etc/sysctl.d/99-reliquary.conf
+)
+if [[ -f /etc/ssh/sshd_config.d/00-reliquary.conf ]]; then
+  BACKUP_PATHS+=(etc/ssh/sshd_config.d/00-reliquary.conf)
+fi
+tar --directory / --create --gzip --file "${TEMPORARY}" "${BACKUP_PATHS[@]}"
+mv "${TEMPORARY}" "${ARCHIVE}"
+find "${DESTINATION}" -type f -name 'ctrl-01-config-*.tar.gz' -mtime +14 -delete

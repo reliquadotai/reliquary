@@ -1,0 +1,441 @@
+---
+- name: Provision the Reliquary trusted control host
+  hosts: ctrl-01
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Require Ubuntu 24.04
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "Ubuntu"
+          - ansible_distribution_version is version('24.04', '>=')
+        fail_msg: "ctrl-01 requires Ubuntu 24.04 or newer"
+
+    - name: Refuse a host with a configured wallet directory
+      ansible.builtin.stat:
+        path: /root/.bittensor/wallets
+      register: root_wallets
+
+    - name: Assert that no wallet is present
+      ansible.builtin.assert:
+        that: not root_wallets.stat.exists
+        fail_msg: "Refusing to provision ctrl-01 while /root/.bittensor/wallets exists"
+
+  tasks:
+    - name: Set the control hostname
+      ansible.builtin.hostname:
+        name: ctrl-01
+
+    - name: Update apt metadata and install security/runtime packages
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+        name:
+          - auditd
+          - audispd-plugins
+          - ca-certificates
+          - chrony
+          - curl
+          - docker.io
+          - fail2ban
+          - jq
+          - nginx
+          - prometheus-node-exporter
+          - python3
+          - rsync
+          - unattended-upgrades
+          - ufw
+        state: present
+
+    - name: Apply available package upgrades
+      ansible.builtin.apt:
+        upgrade: dist
+        update_cache: true
+
+    - name: Create the administrative user
+      ansible.builtin.user:
+        name: "{{ ctrl_admin_user }}"
+        groups: sudo
+        append: true
+        shell: /bin/bash
+        create_home: true
+
+    - name: Create the administrative SSH directory
+      ansible.builtin.file:
+        path: "/home/{{ ctrl_admin_user }}/.ssh"
+        state: directory
+        owner: "{{ ctrl_admin_user }}"
+        group: "{{ ctrl_admin_user }}"
+        mode: "0700"
+
+    - name: Install the administrative SSH key
+      ansible.builtin.copy:
+        dest: "/home/{{ ctrl_admin_user }}/.ssh/authorized_keys"
+        content: "{{ ctrl_admin_authorized_key }}\n"
+        owner: "{{ ctrl_admin_user }}"
+        group: "{{ ctrl_admin_user }}"
+        mode: "0600"
+
+    - name: Allow passwordless automation for the administrative user
+      ansible.builtin.copy:
+        dest: "/etc/sudoers.d/90-{{ ctrl_admin_user }}"
+        owner: root
+        group: root
+        mode: "0440"
+        validate: /usr/sbin/visudo -cf %s
+        content: "{{ ctrl_admin_user }} ALL=(ALL:ALL) NOPASSWD: ALL\n"
+
+    - name: Create the zero-login snapshot service account
+      ansible.builtin.user:
+        name: reliquary-edge
+        system: true
+        create_home: false
+        shell: /usr/sbin/nologin
+
+    - name: Grant read-only snapshot access to nginx and node exporter
+      ansible.builtin.user:
+        name: "{{ item }}"
+        groups: reliquary-edge
+        append: true
+      loop:
+        - www-data
+        - prometheus
+      notify:
+        - Reload nginx
+        - Restart node exporter
+
+    - name: Create control service directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - path: /etc/reliquary
+          owner: root
+          group: root
+          mode: "0755"
+        - path: /usr/local/lib/reliquary
+          owner: root
+          group: root
+          mode: "0755"
+        - path: /var/lib/reliquary-edge
+          owner: reliquary-edge
+          group: reliquary-edge
+          mode: "0755"
+        - path: /var/lib/reliquary-edge/snapshots
+          owner: reliquary-edge
+          group: reliquary-edge
+          mode: "0755"
+        - path: /var/lib/prometheus/node-exporter
+          owner: reliquary-edge
+          group: prometheus
+          mode: "0750"
+        - path: /var/backups/reliquary
+          owner: root
+          group: root
+          mode: "0700"
+
+    - name: Record the deployed infrastructure identity
+      ansible.builtin.template:
+        src: ../templates/deployment.json.j2
+        dest: /etc/reliquary/deployment.json
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Install the immutable snapshot publisher
+      ansible.builtin.copy:
+        src: ../services/snapshot_sync.py
+        dest: /usr/local/lib/reliquary/snapshot_sync.py
+        owner: root
+        group: root
+        mode: "0755"
+      notify: Restart snapshot publisher
+
+    - name: Configure the snapshot publisher
+      ansible.builtin.template:
+        src: ../templates/snapshot-sync.env.j2
+        dest: /etc/reliquary/snapshot-sync.env
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart snapshot publisher
+
+    - name: Install the snapshot systemd unit
+      ansible.builtin.template:
+        src: ../templates/reliquary-snapshot-sync.service.j2
+        dest: /etc/systemd/system/reliquary-snapshot-sync.service
+        owner: root
+        group: root
+        mode: "0644"
+      notify:
+        - Reload systemd
+        - Restart snapshot publisher
+
+    - name: Install the isolated nginx edge configuration
+      ansible.builtin.template:
+        src: ../templates/reliquary-edge.nginx.j2
+        dest: /etc/nginx/conf.d/reliquary-edge.conf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload nginx
+
+    - name: Remove the default public nginx site
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: Reload nginx
+
+    - name: Configure node exporter on loopback with textfile metrics
+      ansible.builtin.template:
+        src: ../templates/prometheus-node-exporter.default.j2
+        dest: /etc/default/prometheus-node-exporter
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart node exporter
+
+    - name: Configure the Docker daemon for local-only control workloads
+      ansible.builtin.file:
+        path: /etc/docker
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install the hardened Docker daemon configuration
+      ansible.builtin.template:
+        src: ../templates/docker-daemon.json.j2
+        dest: /etc/docker/daemon.json
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart Docker
+
+    - name: Install kernel and network hardening
+      ansible.builtin.template:
+        src: ../templates/99-reliquary-sysctl.conf.j2
+        dest: /etc/sysctl.d/99-reliquary.conf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload sysctl
+
+    - name: Configure fail2ban for key-only SSH
+      ansible.builtin.template:
+        src: ../templates/reliquary-fail2ban.local.j2
+        dest: /etc/fail2ban/jail.d/reliquary.local
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart fail2ban
+
+    - name: Disable the inapplicable bare-metal IPMI service
+      ansible.builtin.systemd_service:
+        name: openipmi.service
+        enabled: false
+        masked: true
+        state: stopped
+
+    - name: Clear stale service failure state
+      ansible.builtin.command: systemctl reset-failed
+      changed_when: false
+
+    - name: Install the local configuration backup command
+      ansible.builtin.template:
+        src: ../templates/reliquary-config-backup.sh.j2
+        dest: /usr/local/sbin/reliquary-config-backup
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Install the control-host validation command
+      ansible.builtin.copy:
+        src: ../scripts/validate_ctrl_01.sh
+        dest: /usr/local/sbin/reliquary-validate-ctrl
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Install the local configuration backup unit
+      ansible.builtin.template:
+        src: "../templates/{{ item }}.j2"
+        dest: "/etc/systemd/system/{{ item }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - reliquary-config-backup.service
+        - reliquary-config-backup.timer
+      notify: Reload systemd
+
+    - name: Disable unencrypted swap before any key is installed
+      ansible.builtin.command: swapoff -a
+      when: ansible_swaptotal_mb | int > 0
+      changed_when: true
+
+    - name: Disable swap mounts persistently
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^(\s*[^#\n]+\s+[^\s]+\s+swap\s+.*)$'
+        replace: '# disabled-by-reliquary: \1'
+
+    - name: Inspect firewall state
+      ansible.builtin.command: ufw status verbose
+      register: ufw_state_before
+      changed_when: false
+
+    - name: Set firewall defaults
+      ansible.builtin.command: "{{ item }}"
+      loop:
+        - ufw default deny incoming
+        - ufw default allow outgoing
+      register: ufw_defaults
+      changed_when: true
+      when: "'Default: deny (incoming), allow (outgoing)' not in ufw_state_before.stdout"
+
+    - name: Allow key-only SSH through the firewall
+      ansible.builtin.command: "ufw allow 22/tcp comment 'key-only SSH'"
+      register: ufw_ssh
+      changed_when: "'Rule added' in ufw_ssh.stdout"
+
+    - name: Keep public HTTP closed before cutover
+      ansible.builtin.command: "ufw --force delete allow {{ item }}/tcp"
+      loop:
+        - "80"
+        - "443"
+      register: ufw_public_delete
+      changed_when: "'Rule deleted' in ufw_public_delete.stdout"
+      failed_when: false
+      when: not ctrl_public_http_enabled | bool
+
+    - name: Open public HTTP only when explicitly approved
+      ansible.builtin.command: "ufw allow {{ item }}/tcp"
+      loop:
+        - "80"
+        - "443"
+      register: ufw_public_add
+      changed_when: "'Rule added' in ufw_public_add.stdout"
+      when: ctrl_public_http_enabled | bool
+
+    - name: Enable the firewall
+      ansible.builtin.command: ufw --force enable
+      register: ufw_enable
+      changed_when: true
+      when: "'Status: active' not in ufw_state_before.stdout"
+
+    - name: Install SSH hardening after the admin key exists
+      ansible.builtin.template:
+        src: ../templates/50-reliquary-sshd.conf.j2
+        dest: /etc/ssh/sshd_config.d/00-reliquary.conf
+        owner: root
+        group: root
+        mode: "0644"
+        validate: /usr/sbin/sshd -t -f %s
+      notify: Restart SSH
+      when: ctrl_lock_root | default(true) | bool
+
+    - name: Enable core services
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+      loop:
+        - auditd
+        - chrony
+        - docker
+        - fail2ban
+        - nginx
+        - prometheus-node-exporter
+        - reliquary-snapshot-sync
+        - reliquary-config-backup.timer
+
+    - name: Flush service configuration changes
+      ansible.builtin.meta: flush_handlers
+
+    - name: Validate nginx configuration
+      ansible.builtin.command: nginx -t
+      changed_when: false
+
+    - name: Wait for a fresh default state snapshot
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ ctrl_nginx_listen_port }}/readyz"
+        status_code: 200
+        return_content: true
+      register: ready_response
+      retries: 90
+      delay: 1
+      until: ready_response.status == 200
+
+    - name: Verify that economic writes fail closed in shadow mode
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ ctrl_nginx_listen_port }}/submit"
+        method: POST
+        body_format: json
+        body: {}
+        status_code: 503
+
+    - name: Run a configuration backup
+      ansible.builtin.command: systemctl start reliquary-config-backup.service
+      changed_when: true
+
+    - name: Run the complete local control-host validation
+      ansible.builtin.command: /usr/local/sbin/reliquary-validate-ctrl
+      changed_when: false
+
+    - name: Check whether an upgraded kernel requires a reboot
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Reboot after package upgrades when required
+      ansible.builtin.reboot:
+        reboot_timeout: 900
+      when:
+        - reboot_required.stat.exists
+        - not (ctrl_lock_root | default(true) | bool)
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+    - name: Restart snapshot publisher
+      ansible.builtin.systemd_service:
+        name: reliquary-snapshot-sync
+        state: restarted
+        daemon_reload: true
+
+    - name: Reload nginx
+      ansible.builtin.systemd_service:
+        name: nginx
+        state: reloaded
+
+    - name: Restart node exporter
+      ansible.builtin.systemd_service:
+        name: prometheus-node-exporter
+        state: restarted
+
+    - name: Restart Docker
+      ansible.builtin.systemd_service:
+        name: docker
+        state: restarted
+
+    - name: Reload sysctl
+      ansible.builtin.command: sysctl --system
+      changed_when: true
+
+    - name: Restart fail2ban
+      ansible.builtin.systemd_service:
+        name: fail2ban
+        state: restarted
+
+    - name: Restart SSH
+      ansible.builtin.systemd_service:
+        name: ssh
+        state: restarted

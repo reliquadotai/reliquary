@@ -1,0 +1,20 @@
+---
+ctrl_admin_user: reliquary-admin
+ctrl_admin_authorized_key: >-
+  ssh-ed25519 REPLACE_WITH_THE_ADMINISTRATOR_PUBLIC_KEY reliquary-admin
+ctrl_infra_revision: "{{ lookup('ansible.builtin.pipe', 'git -C .. rev-parse HEAD') | trim }}"
+
+# Shadow source only. This is not a submission proxy and carries no credential.
+ctrl_snapshot_upstream: https://validator-state.example.invalid
+ctrl_snapshot_environments:
+  - openmathinstruct
+  - opencodeinstruct
+ctrl_snapshot_state_interval_seconds: 0.50
+ctrl_snapshot_health_interval_seconds: 1.00
+ctrl_snapshot_timeout_seconds: 2.00
+ctrl_snapshot_state_stale_seconds: 3.00
+ctrl_snapshot_health_stale_seconds: 5.00
+
+# Public reads remain closed until DNS/TLS and shadow-parity gates are approved.
+ctrl_public_http_enabled: false
+ctrl_nginx_listen_port: 8081

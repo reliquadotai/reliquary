@@ -1,0 +1,3 @@
+# Keep the real SSH host key in the ignored `known_hosts` file.
+# Obtain its fingerprint through the hosting provider or another independent
+# channel before adding an OpenSSH known_hosts entry here.

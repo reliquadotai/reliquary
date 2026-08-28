@@ -11,6 +11,12 @@ wallet_deploy/
 .env
 docker/.env.cpu-executor
 docker/pki/
+reliquary-infra/secrets/
+reliquary-infra/.ansible/
+reliquary-infra/reports/private/
+reliquary-infra/inventory/hosts.yml
+reliquary-infra/inventory/group_vars/all.yml
+reliquary-infra/inventory/known_hosts
 
 # Local Claude Code state
 .claude/
