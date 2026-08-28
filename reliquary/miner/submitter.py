@@ -20,20 +20,33 @@ from urllib.parse import quote
 import httpx
 
 from reliquary.constants import VALIDATOR_HTTP_PORT
-from reliquary.protocol.signatures import sign_envelope, sign_precommit
+from reliquary.protocol.signatures import (
+    sign_envelope,
+    sign_epoch_generation_intent,
+    sign_precommit,
+)
 from reliquary.protocol.signatures import (
     verify_epoch_commitment_set_signature,
+    verify_epoch_generation_intent_set_signature,
     verify_epoch_intent_signature,
 )
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     BatchSubmissionResponse,
     EpochCommitmentStatus,
+    EpochGenerationIntentRequest,
+    EpochGenerationIntentResponse,
+    EpochGenerationIntentStatus,
     GrpoBatchState,
     RejectReason,
     RuntimeContract,
     SubmissionPrecommitRequest,
     SubmissionPrecommitResponse,
+)
+from reliquary.shared.checkpoint_epoch_market import (
+    SignedGenerationIntentSet,
+    canonical_signed_generation_intent_set_bytes,
+    parse_signed_generation_intent_set,
 )
 from reliquary.shared.checkpoint_epoch import (
     CHECKPOINT_EPOCH_CAPABILITY_ID,
@@ -66,6 +79,7 @@ _CHECKPOINT_EPOCH_BEACON_VERIFY_TIMEOUT_SECONDS = 12.0
 # Miners running against slow links (Targon port-forward etc.) benefit further.
 _DEFAULT_TIMEOUT = 60.0
 _PRECOMMIT_HEADER = "X-Reliquary-Precommit"
+_EPOCH_INTENT_HEADER = "X-Reliquary-Epoch-Intent"
 _DRAND_BOUNDARY_SAFETY_SECONDS = 1.0
 _DRAND_BOUNDARY_SETTLE_SECONDS = 0.05
 
@@ -405,6 +419,7 @@ async def submit_batch_v2(
     wallet: Any | None = None,
     randomness: str = "",
     drand_round_fn: Callable[[], int] | None = None,
+    epoch_generation_intent_id: str | None = None,
 ) -> BatchSubmissionResponse:
     """POST a v2 batch submission, refreshing signed freshness per attempt.
 
@@ -566,7 +581,14 @@ async def submit_batch_v2(
                                 else None
                             )
                         ).encode("utf-8"),
-                        headers={"Content-Type": "application/json"},
+                        headers={
+                            "Content-Type": "application/json",
+                            **(
+                                {_EPOCH_INTENT_HEADER: epoch_generation_intent_id}
+                                if epoch_generation_intent_id is not None
+                                else {}
+                            ),
+                        },
                         timeout=timeout,
                     )
                 except (httpx.RequestError, httpx.TimeoutException) as exc:
@@ -575,6 +597,10 @@ async def submit_batch_v2(
                         await asyncio.sleep(delay)
                     continue
                 if precommit_response.status_code == 404:
+                    if epoch_generation_intent_id is not None:
+                        raise SubmissionError(
+                            "validator has no generation-intent submission path"
+                        )
                     logger.warning(
                         "validator has no upload-precommit endpoint; using "
                         "deadline-sensitive direct submission"
@@ -696,6 +722,139 @@ async def get_window_state_v2(
         state_url, GrpoBatchState,
         client=client, timeout=timeout,
     )
+
+
+def finalize_checkpoint_epoch_generation_intent_v1(
+    *,
+    wallet: Any,
+    operator_id: str,
+    plan: EpochPlan,
+    window_start: int,
+    environment: str,
+    prompt_idx: int,
+    prompt_content_sha256: str,
+    nonce: str | None = None,
+) -> EpochGenerationIntentRequest:
+    """Sign one cheap prompt claim before generation ticket selection."""
+    epoch_window = next(
+        (item for item in plan.windows if item.window_number == window_start),
+        None,
+    )
+    if epoch_window is None or environment not in {
+        item.environment for item in epoch_window.prompt_slices
+    }:
+        raise ValueError("generation intent lane is outside the epoch plan")
+    miner_hotkey = str(wallet.hotkey.ss58_address)
+    generation_nonce = nonce or os.urandom(16).hex()
+    fields = {
+        "miner_hotkey": miner_hotkey,
+        "operator_id": operator_id,
+        "epoch_id": plan.epoch_id,
+        "manifest_sha256": manifest_sha256(plan),
+        "window_start": window_start,
+        "environment": environment,
+        "prompt_idx": prompt_idx,
+        "prompt_content_sha256": prompt_content_sha256,
+        "checkpoint_hash": plan.checkpoint.revision,
+        "generation_randomness": epoch_window.generation_randomness,
+        "protocol_version": plan.protocol.protocol_version,
+        "generation_profile_id": plan.protocol.profile_id,
+        "nonce": generation_nonce,
+    }
+    return EpochGenerationIntentRequest(
+        **fields,
+        intent_signature=sign_epoch_generation_intent(
+            wallet=wallet, **fields
+        ).hex(),
+    )
+
+
+async def post_checkpoint_epoch_generation_intent_v1(
+    url: str,
+    intent: EpochGenerationIntentRequest,
+    *,
+    client: httpx.AsyncClient | None = None,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> EpochGenerationIntentResponse:
+    own_client = client is None
+    http = client or httpx.AsyncClient(timeout=timeout)
+    try:
+        response = await http.post(
+            f"{url}/checkpoint-epoch/generation-intents",
+            content=intent.model_dump_json().encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            timeout=timeout,
+        )
+        if response.status_code >= 400:
+            raise SubmissionError(
+                f"generation intent HTTP {response.status_code}: "
+                f"{_safe_detail(response)}"
+            )
+        result = EpochGenerationIntentResponse.model_validate(response.json())
+        if result.accepted and result.intent_id is None:
+            raise SubmissionError("accepted generation intent omitted intent_id")
+        return result
+    finally:
+        if own_client:
+            await http.aclose()
+
+
+async def get_checkpoint_epoch_generation_intent_status_v1(
+    url: str,
+    intent_id: str,
+    *,
+    client: httpx.AsyncClient | None = None,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> EpochGenerationIntentStatus:
+    return await _get_with_retry(
+        f"{url}/checkpoint-epoch/generation-intents/{quote(intent_id, safe='')}",
+        EpochGenerationIntentStatus,
+        client=client,
+        timeout=timeout,
+    )
+
+
+async def get_checkpoint_epoch_generation_intent_set_v1(
+    url: str,
+    *,
+    expected_validator_hotkey: str,
+    expected_intent_set_sha256: str,
+    expected_plan: EpochPlan,
+    client: httpx.AsyncClient | None = None,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> SignedGenerationIntentSet:
+    own_client = client is None
+    http = client or httpx.AsyncClient(timeout=timeout)
+    try:
+        response = await http.get(
+            f"{url}/checkpoint-epoch/generation-intent-set", timeout=timeout
+        )
+        if response.status_code >= 400:
+            raise SubmissionError(
+                f"generation intent set HTTP {response.status_code}: "
+                f"{_safe_detail(response)}"
+            )
+        publication = parse_signed_generation_intent_set(response.content)
+        if (
+            publication.intent_set_sha256 != expected_intent_set_sha256
+            or publication.intent_set.epoch_id != expected_plan.epoch_id
+            or publication.intent_set.manifest_sha256
+            != manifest_sha256(expected_plan)
+        ):
+            raise SubmissionError("generation intent set differs from live epoch")
+        if not verify_epoch_generation_intent_set_signature(
+            publication,
+            expected_validator_hotkey=expected_validator_hotkey,
+        ):
+            raise SubmissionError("generation intent set signature is invalid")
+        if response.content != canonical_signed_generation_intent_set_bytes(
+            publication
+        ):
+            raise SubmissionError("generation intent set is not canonical")
+        return publication
+    finally:
+        if own_client:
+            await http.aclose()
 
 
 async def post_checkpoint_epoch_commitment_v1(

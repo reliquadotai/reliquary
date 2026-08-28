@@ -11,6 +11,13 @@ from reliquary.shared.checkpoint_epoch import (
     WindowSchedule,
     canonical_json_bytes,
     canonical_manifest_bytes,
+    manifest_sha256,
+)
+from reliquary.shared.checkpoint_epoch_market import (
+    GenerationIntent,
+    SignedGenerationIntentSet,
+    build_generation_intent_set,
+    generation_intent_set_sha256,
 )
 from reliquary.validator.checkpoint_epoch_runtime import (
     EpochEquivocationError,
@@ -147,6 +154,56 @@ def test_restart_reload_is_byte_identical(tmp_path):
 
     assert restored == plan
     assert canonical_manifest_bytes(restored) == expected
+
+
+def test_generation_intent_set_restart_is_byte_identical_and_create_only(tmp_path):
+    store = EpochStore(tmp_path)
+    intent = _intent()
+    store.install_intent(intent)
+    _install_signed_intent(store, intent)
+    store.confirm_before_beacon(intent, observed_round=1_000)
+    plan = plan_from_intent(intent, beacon=_beacon())
+    store.install_plan(intent, plan)
+    store.mark_activated(plan)
+    frozen = build_generation_intent_set(
+        (
+            GenerationIntent(
+                intent_id="intent-a",
+                operator_id="operator-a",
+                miner_hotkey="miner-a",
+                window_number=plan.first_window,
+                environment="math",
+                prompt_idx=next(
+                    item.start
+                    for item in plan.windows[0].prompt_slices
+                    if item.environment == "math"
+                ),
+                prompt_content_sha256="1" * 64,
+                generation_nonce="nonce-a",
+            ),
+        ),
+        epoch_id=plan.epoch_id,
+        manifest_sha256_hex=manifest_sha256(plan),
+        intent_close_round=plan.epoch_beacon.round + 1,
+        validator_hotkey="validator",
+    )
+    publication = SignedGenerationIntentSet(
+        intent_set=frozen,
+        intent_set_sha256=generation_intent_set_sha256(frozen),
+        validator_signature="aa",
+    )
+
+    expected = store.install_generation_intent_set(plan, publication)
+    restored = EpochStore(tmp_path).load_generation_intent_set(plan)
+
+    assert restored == publication
+    assert store.install_generation_intent_set(plan, publication) == expected
+    changed = replace(
+        publication,
+        validator_signature="bb",
+    )
+    with pytest.raises(EpochEquivocationError):
+        store.install_generation_intent_set(plan, changed)
 
 
 def test_activation_and_terminal_outcome_are_create_only(tmp_path):

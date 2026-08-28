@@ -35,6 +35,11 @@ from reliquary.shared.checkpoint_epoch import (
     parse_signed_commitment_set,
     validate_commitment_set_for_plan,
 )
+from reliquary.shared.checkpoint_epoch_market import (
+    SignedGenerationIntentSet,
+    canonical_signed_generation_intent_set_bytes,
+    parse_signed_generation_intent_set,
+)
 
 
 class EpochStoreError(RuntimeError):
@@ -67,6 +72,8 @@ class EpochCommitIntent:
     reward_policy: str
     finalization_policy: str
     commitments_per_operator_per_environment_lane: int
+    intent_seconds: float
+    backup_activation_fractions: tuple[float, ...]
     reveal_seconds: float
     environment_universes: tuple[tuple[str, int], ...]
 
@@ -131,6 +138,10 @@ def _intent_dict(intent: EpochCommitIntent) -> dict[str, Any]:
         "finalization_policy": intent.finalization_policy,
         "commitments_per_operator_per_environment_lane": (
             intent.commitments_per_operator_per_environment_lane
+        ),
+        "intent_seconds": intent.intent_seconds,
+        "backup_activation_fractions": list(
+            intent.backup_activation_fractions
         ),
         "reveal_seconds": intent.reveal_seconds,
         "environment_universes": {
@@ -228,6 +239,8 @@ def build_epoch_intent(
     reward_policy: str = CHECKPOINT_EPOCH_REWARD_POLICY,
     finalization_policy: str = CHECKPOINT_EPOCH_FINALIZATION_POLICY,
     commitments_per_operator_per_environment_lane: int = 16,
+    intent_seconds: float = 60.0,
+    backup_activation_fractions: tuple[float, ...] = (0.5, 0.75),
     reveal_seconds: float = 60.0,
     environment_universes: Mapping[str, int],
 ) -> EpochCommitIntent:
@@ -276,6 +289,10 @@ def build_epoch_intent(
         commitments_per_operator_per_environment_lane=int(
             commitments_per_operator_per_environment_lane
         ),
+        intent_seconds=float(intent_seconds),
+        backup_activation_fractions=tuple(
+            float(value) for value in backup_activation_fractions
+        ),
         reveal_seconds=float(reveal_seconds),
         environment_universes=universes,
     )
@@ -294,6 +311,15 @@ def build_epoch_intent(
         or intent.finalization_policy
         != CHECKPOINT_EPOCH_FINALIZATION_POLICY
         or intent.commitments_per_operator_per_environment_lane < 1
+        or not math.isfinite(intent.intent_seconds)
+        or intent.intent_seconds <= 0
+        or not intent.backup_activation_fractions
+        or tuple(sorted(set(intent.backup_activation_fractions)))
+        != intent.backup_activation_fractions
+        or any(
+            not math.isfinite(value) or not 0.0 < value < 1.0
+            for value in intent.backup_activation_fractions
+        )
         or not math.isfinite(intent.reveal_seconds)
         or intent.reveal_seconds <= 0
     ):
@@ -328,6 +354,8 @@ def parse_epoch_intent(raw: bytes) -> EpochCommitIntent:
         "reward_policy",
         "finalization_policy",
         "commitments_per_operator_per_environment_lane",
+        "intent_seconds",
+        "backup_activation_fractions",
         "reveal_seconds",
         "environment_universes",
     }:
@@ -375,6 +403,10 @@ def parse_epoch_intent(raw: bytes) -> EpochCommitIntent:
         commitments_per_operator_per_environment_lane=(
             value["commitments_per_operator_per_environment_lane"]
         ),
+        intent_seconds=value["intent_seconds"],
+        backup_activation_fractions=tuple(
+            value["backup_activation_fractions"]
+        ),
         reveal_seconds=value["reveal_seconds"],
         environment_universes=tuple(
             (str(name), int(size)) for name, size in sorted(universes.items())
@@ -397,6 +429,15 @@ def parse_epoch_intent(raw: bytes) -> EpochCommitIntent:
         or intent.finalization_policy
         != CHECKPOINT_EPOCH_FINALIZATION_POLICY
         or intent.commitments_per_operator_per_environment_lane < 1
+        or not math.isfinite(intent.intent_seconds)
+        or intent.intent_seconds <= 0
+        or not intent.backup_activation_fractions
+        or tuple(sorted(set(intent.backup_activation_fractions)))
+        != intent.backup_activation_fractions
+        or any(
+            not math.isfinite(value) or not 0.0 < value < 1.0
+            for value in intent.backup_activation_fractions
+        )
         or not math.isfinite(intent.reveal_seconds)
         or intent.reveal_seconds <= 0
     ):
@@ -443,6 +484,8 @@ def plan_from_intent(
         commitments_per_operator_per_environment_lane=(
             intent.commitments_per_operator_per_environment_lane
         ),
+        intent_seconds=intent.intent_seconds,
+        backup_activation_fractions=intent.backup_activation_fractions,
         reveal_seconds=intent.reveal_seconds,
         environment_universes=dict(intent.environment_universes),
     )
@@ -678,6 +721,49 @@ class EpochStore:
             validate_commitment_set_for_plan(publication.commitment_set, plan)
         except (TypeError, ValueError) as exc:
             raise EpochStoreError("stored commitment set does not match plan") from exc
+        return publication
+
+    def install_generation_intent_set(
+        self,
+        plan: EpochPlan,
+        publication: SignedGenerationIntentSet,
+    ) -> bytes:
+        """Persist the exact miner intent population before beacon A."""
+        if not self.is_activated(plan):
+            raise EpochStoreError("checkpoint epoch was not activated")
+        intent_set = publication.intent_set
+        if (
+            intent_set.epoch_id != plan.epoch_id
+            or intent_set.manifest_sha256 != manifest_sha256(plan)
+            or intent_set.intent_close_round < plan.epoch_beacon.round
+        ):
+            raise EpochStoreError("generation intent set does not match epoch plan")
+        raw = canonical_signed_generation_intent_set_bytes(publication)
+        self._install_create_only(
+            self.root / f"generation-intents-{plan.epoch_id}.json",
+            raw,
+            "signed generation intent set",
+        )
+        return raw
+
+    def load_generation_intent_set(
+        self,
+        plan: EpochPlan,
+    ) -> SignedGenerationIntentSet | None:
+        path = self.root / f"generation-intents-{plan.epoch_id}.json"
+        if not path.exists():
+            return None
+        try:
+            publication = parse_signed_generation_intent_set(path.read_bytes())
+        except (OSError, ValueError, TypeError) as exc:
+            raise EpochStoreError("invalid signed generation intent set") from exc
+        intent_set = publication.intent_set
+        if (
+            intent_set.epoch_id != plan.epoch_id
+            or intent_set.manifest_sha256 != manifest_sha256(plan)
+            or intent_set.intent_close_round < plan.epoch_beacon.round
+        ):
+            raise EpochStoreError("stored generation intent set differs from plan")
         return publication
 
     def _install_create_only(

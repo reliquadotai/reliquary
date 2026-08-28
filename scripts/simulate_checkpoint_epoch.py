@@ -22,8 +22,12 @@ from reliquary.shared.checkpoint_epoch import (
     CHECKPOINT_EPOCH_RANKING_POLICY,
     CHECKPOINT_EPOCH_REWARD_POLICY,
     CHECKPOINT_EPOCH_VALUATION_POLICY,
-    EpochAdmissionCommitment,
-    select_epoch_reveals,
+)
+from reliquary.shared.checkpoint_epoch_market import (
+    GenerationIntent,
+    PortfolioCandidate,
+    select_generation_tickets,
+    select_training_portfolio,
 )
 from reliquary.protocol.profiles import resolve_protocol_profile
 from reliquary.validator.batch_selection import throughput_rank
@@ -131,7 +135,10 @@ def _economic_sensitivity() -> dict[str, object]:
         rows.append({
             "mean_completion_tokens": length,
             "groups_generated": groups,
-            "flat_slot_capacity_index": round(groups / baseline_groups, 6),
+            "unbounded_generation_capacity_index": round(
+                groups / baseline_groups, 6
+            ),
+            "ticketed_epoch_paid_group_index": 1.0,
             "gross_token_capacity_index": round(
                 groups * length / (baseline_groups * baseline_length),
                 6,
@@ -139,6 +146,10 @@ def _economic_sensitivity() -> dict[str, object]:
         })
     return {
         "scope": "synthetic linear-cost sensitivity; not production telemetry",
+        "interpretation": (
+            "generation tickets are fixed before compute, so shortening a "
+            "response cannot create more paid groups inside the epoch"
+        ),
         "assumptions": {
             "rollouts_per_group": rollouts,
             "generation_seconds": seconds,
@@ -202,6 +213,8 @@ def _run_policy(
     selected: list[Candidate] = []
     underfill_by_environment = Counter()
     first_lane_underfill = 0
+    generation_intents = 0
+    activated_backups = 0
     for environment in ("math", "code"):
         for lane in range(horizon):
             lane_candidates = [
@@ -212,41 +225,63 @@ def _run_policy(
             ][:candidate_supply]
             policy_population.extend(lane_candidates)
             if epoch_mode:
-                commitments = [
-                    EpochAdmissionCommitment(
-                        commitment_id=(
-                            f"{candidate.environment}:{candidate.lane}:"
-                            f"{candidate.operator}:{candidate.prompt}"
-                        ),
+                generation_intents += len(lane_candidates)
+                intent_by_id = {
+                    (
+                        f"{candidate.environment}:{candidate.lane}:"
+                        f"{candidate.operator}:{candidate.prompt}"
+                    ): candidate
+                    for candidate in lane_candidates
+                }
+                intents = [
+                    GenerationIntent(
+                        intent_id=intent_id,
                         operator_id=str(candidate.operator),
+                        miner_hotkey=f"miner-{candidate.operator}",
                         window_number=candidate.lane,
                         environment=candidate.environment,
                         prompt_idx=candidate.prompt,
-                        payload_sha256=hashlib.sha256(
-                            repr(candidate).encode("utf-8")
+                        prompt_content_sha256=hashlib.sha256(
+                            f"prompt:{candidate.environment}:{candidate.prompt}".encode()
                         ).hexdigest(),
+                        generation_nonce=intent_id,
                     )
-                    for candidate in lane_candidates
+                    for intent_id, candidate in intent_by_id.items()
                 ]
-                selected_ids = set(select_epoch_reveals(
-                    commitments,
+                epoch_id = hashlib.sha256(b"synthetic-epoch").hexdigest()
+                manifest = hashlib.sha256(b"synthetic-manifest").hexdigest()
+                intent_set = hashlib.sha256(b"synthetic-intent-set").hexdigest()
+                tickets = select_generation_tickets(
+                    intents,
                     admission_randomness=f"{seed:064x}",
-                    epoch_id=hashlib.sha256(b"synthetic-epoch").hexdigest(),
-                    manifest_sha256_hex=hashlib.sha256(
-                        b"synthetic-manifest"
-                    ).hexdigest(),
-                    commitment_set_sha256_hex=hashlib.sha256(
-                        b"synthetic-commitment-set"
-                    ).hexdigest(),
-                    limit=reveal_limit,
+                    epoch_id=epoch_id,
+                    manifest_sha256_hex=manifest,
+                    intent_set_sha256_hex=intent_set,
+                    primary_limit=target,
+                    backup_limit=max(0, reveal_limit - target),
+                    backup_waves=2,
                     per_prompt_limit=10,
-                ))
-                lane_candidates = [
-                    candidate
-                    for candidate, commitment in zip(lane_candidates, commitments)
-                    if commitment.commitment_id in selected_ids
+                )
+                primary_ids = [
+                    ticket.intent_id for ticket in tickets if ticket.role == "primary"
                 ]
-                lane_candidates = _rank_epoch_lane(seed, lane_candidates)
+                backup_ids = [
+                    ticket.intent_id for ticket in tickets if ticket.role == "backup"
+                ]
+                generated_ids = list(primary_ids)
+                # The final advertised wave activates the bounded reserve:
+                # proof failures are unknown before seal.
+                for intent_id in backup_ids:
+                    generated_ids.append(intent_id)
+                    activated_backups += 1
+                lane_candidates = [
+                    intent_by_id[intent_id] for intent_id in generated_ids
+                ]
+                # Intentions are cheap; only selected/activated tickets spend
+                # generation compute.
+                if intents:
+                    del policy_population[-len(intents):]
+                policy_population.extend(lane_candidates)
             else:
                 throughput = _THROUGHPUT
                 if throughput is None:
@@ -268,6 +303,46 @@ def _run_policy(
                 for candidate in lane_candidates
                 if candidate.valid and not candidate.stale
             ]
+            if epoch_mode and lane_candidates:
+                portfolio_inputs = [
+                    PortfolioCandidate(
+                        candidate_id=(
+                            f"{candidate.environment}:{candidate.lane}:"
+                            f"{candidate.operator}:{candidate.prompt}"
+                        ),
+                        operator_id=str(candidate.operator),
+                        prompt_idx=candidate.prompt,
+                        prompt_content_sha256=hashlib.sha256(
+                            f"prompt:{candidate.environment}:{candidate.prompt}".encode()
+                        ).hexdigest(),
+                        mean_reward=candidate.difficulty,
+                        reward_std=max(
+                            0.01,
+                            candidate.difficulty * (1.0 - candidate.difficulty),
+                        ),
+                        robust_utility=max(
+                            0.01,
+                            candidate.difficulty * (1.0 - candidate.difficulty),
+                        ),
+                    )
+                    for candidate in lane_candidates
+                ]
+                portfolio = select_training_portfolio(
+                    portfolio_inputs,
+                    seal_randomness=f"{seed + 1:064x}",
+                    epoch_id=epoch_id,
+                    manifest_sha256_hex=manifest,
+                    target=target,
+                )
+                chosen_ids = {item.candidate_id for item in portfolio}
+                lane_candidates = [
+                    candidate
+                    for candidate in lane_candidates
+                    if (
+                        f"{candidate.environment}:{candidate.lane}:"
+                        f"{candidate.operator}:{candidate.prompt}"
+                    ) in chosen_ids
+                ]
             winners = lane_candidates[:target]
             selected.extend(winners)
             missing = target - len(winners)
@@ -282,7 +357,9 @@ def _run_policy(
     return {
         "policy": name,
         "candidate_supply_per_environment_lane": candidate_supply,
-        "selected_reveal_limit_per_environment_lane": reveal_limit,
+        "selected_generation_limit_per_environment_lane": reveal_limit,
+        "generation_intents": generation_intents if epoch_mode else None,
+        "activated_backups": activated_backups if epoch_mode else None,
         "generated_candidates": len(policy_population),
         "valid_candidates_available": sum(
             candidate.valid and not candidate.stale for candidate in policy_population
@@ -339,34 +416,45 @@ def main() -> None:
     parser.add_argument("--horizon", type=int, default=16)
     parser.add_argument("--target", type=int, default=16)
     parser.add_argument("--current-candidates", type=int, default=64)
-    parser.add_argument("--epoch-candidates", type=int, default=32)
-    parser.add_argument("--epoch-commitments", type=int, default=64)
+    parser.add_argument(
+        "--epoch-generation-limit",
+        "--epoch-candidates",
+        dest="epoch_generation_limit",
+        type=int,
+        default=32,
+    )
+    parser.add_argument(
+        "--epoch-intents",
+        "--epoch-commitments",
+        dest="epoch_intents",
+        type=int,
+        default=64,
+    )
     args = parser.parse_args()
     if min(
         args.horizon,
         args.target,
         args.current_candidates,
-        args.epoch_candidates,
-        args.epoch_commitments,
+        args.epoch_generation_limit,
+        args.epoch_intents,
     ) < 1:
         parser.error("all sizing arguments must be positive")
-    if min(args.current_candidates, args.epoch_candidates) < args.target:
+    if min(args.current_candidates, args.epoch_generation_limit) < args.target:
         parser.error("candidate limits must be at least the target")
-    if args.epoch_commitments < args.epoch_candidates:
-        parser.error("epoch commitments must cover the reveal cohort")
+    if args.epoch_intents < args.epoch_generation_limit:
+        parser.error("epoch intents must cover the generation cohort")
 
     population = _population(
         rng=random.Random(args.seed),
         horizon=args.horizon,
-        candidate_limit=max(args.current_candidates, args.epoch_commitments),
+        candidate_limit=max(args.current_candidates, args.epoch_intents),
     )
     report = {
         "scope": "synthetic capacity-envelope replay; not production telemetry",
         "assumptions": {
             "environments": ["math", "code"],
             "operators": 12,
-            "epoch_prepared_at_open_probability": 0.75,
-            "epoch_commitments_are_selected_before_payload_reveal": True,
+            "epoch_generation_intents_are_selected_before_compute": True,
             "epoch_admission_policy": CHECKPOINT_EPOCH_ADMISSION_POLICY,
             "epoch_valuation_policy": CHECKPOINT_EPOCH_VALUATION_POLICY,
             "epoch_ranking_policy": CHECKPOINT_EPOCH_RANKING_POLICY,
@@ -391,8 +479,8 @@ def main() -> None:
             population=population,
             horizon=args.horizon,
             target=args.target,
-            candidate_supply=args.epoch_commitments,
-            reveal_limit=args.epoch_candidates,
+            candidate_supply=args.epoch_intents,
+            reveal_limit=args.epoch_generation_limit,
             epoch_mode=True,
         ),
         "economic_sensitivity": _economic_sensitivity(),

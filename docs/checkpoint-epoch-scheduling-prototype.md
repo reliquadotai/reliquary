@@ -1,363 +1,266 @@
-# Checkpoint-epoch scheduling prototype
+# Checkpoint-epoch market prototype
 
-Status: implementation-complete experimental capability, disabled by default.
-It is suitable for isolated activation qualification, but it is not an active
-production protocol. This prototype changes no current production profile or
-canonical contract. A future coordinated protocol/profile revision is required
-before production activation.
+Status: experimental, disabled by default, and not production-ready. The
+prototype changes no active profile, canonical contract, reward rule, or
+legacy ranking path. Production activation requires a coordinated protocol
+revision and an isolated end-to-end qualification.
 
-## Goals and non-goals
+## Goal
 
-The prototype publishes the complete generation plan for one checkpoint
-horizon, then opens all 16 logical lanes in one checkpoint-wide collection
-phase. Selected usable groups form a frozen reservoir after the common
-deadline.
+Reliquary should maximize useful and diverse training groups per unit of
+inference and validator work. Miner prompt selection is part of the product:
+the market should preserve it without using transport timing, response length,
+or raw throughput as a proxy for training value.
 
-The horizon comes from `CHECKPOINT_PUBLISH_INTERVAL_WINDOWS`. Experimental
-activation fails closed unless that configured value is exactly 16.
+The prototype replaces 16 sequential generation races with one checkpoint
+epoch whose horizon is `CHECKPOINT_PUBLISH_INTERVAL_WINDOWS`. It publishes all
+generation seeds and prompt slices together, opens every logical lane at the
+same instant, and supports either 16 ordered optimizer steps or one aggregated
+optimizer step.
 
-Work remains miner-directed: the validator publishes seeds and eligible prompt
-slices but never assigns prompts or generation jobs. The prototype does not
-deploy a profile, publish a checkpoint, change production rewards, accept work
-before OPEN, or add a production submission transport to the reference planner.
+The design does not promise zero unused inference. Proof failures and partial
+outages require redundancy. It instead makes redundancy explicit and bounded,
+and prevents unselected work from starting in the normal path.
 
-## Final hybrid mechanism
+## Mechanism
 
-The final mechanism keeps the checkpoint-epoch control loop and adopts only the
-work-conserving parts of continuous processing that do not make speed decide
-admission:
+The schema-v8 experiment separates four decisions that the production window
+currently combines:
 
-- compact commitments are frozen before a public admission beacon;
-- selected payloads are decoded, graded, and retained during reveal;
-- GRAIL starts only after the complete reveal population is frozen and the
-  fresh post-reveal seal beacon fixes the final economic order;
-- lanes seal in ascending manifest offset and each completed balanced lane is
-  written immediately to the detached journal;
-- the detached trainer waits for the epoch's terminal marker before consuming
-  lane zero, so a later lane failure cannot leave a partially trained epoch;
-- admission and final ranking never consult payload throughput or arrival;
-- the epoch valuation is fixed to validator-gated difficulty with `delta=1`
-  and cannot inherit the production flat-value runtime switch;
-- exact-utility ties visit every canonical operator once before any operator
-  receives a second proof opportunity;
-- rewards remain the existing fixed selected-slot split. A different reward
-  function requires a separately reviewed protocol revision and replay data.
+1. miners select prompts cheaply;
+2. public randomness selects who may spend generation compute;
+3. selected payloads are validated during a common generation horizon;
+4. a fresh post-deadline beacon orders a balanced training portfolio.
 
-The manifest binds these decisions as
-`signed_set_operator_rounds_v2`,
-`robust_gated_difficulty_delta1_v1`,
-`utility_then_operator_rounds_post_seal_beacon_v2`, `selected_slot_v1`, and
-`ordered_lanes_atomic_epoch_v1`. They are protocol choices, not runtime knobs.
-This prevents a validator from silently combining the public epoch plan with a
-different admission, ranking, reward, or finalization rule.
+Neither selection accepts arrival time, bytes, completion tokens, generated
+groups per second, or a drand-derived elapsed-time bucket as an input.
 
-## Checkpoint-bound state machine
+### 1. Checkpoint and public plan
 
-1. The immutable checkpoint revision is installed and its proof replicas are
-   coherent.
-2. The validator observes drand round `R0`, durably fixes and signs the intent
-   for `R1 = R0 + 1`, then confirms from a second round observation that those
-   durable bytes preceded `R1`. It exposes the canonical signed bytes while
-   `R1` is still unavailable.
-3. The validator fetches and verifies exactly `R1`; a different round is never
-   substituted.
-4. That beacon derives the epoch root, all 16 generation seeds, and every
-   environment's 16 prompt slices.
-5. The canonical plan is exposed with an advertised
-   `activation_not_before_round`, giving time for checkpoint download and model
-   warm-up.
-6. At activation, every `(environment, logical window)` lane is installed in
-   one routing swap. Every batcher receives the same exact monotonic and wall
-   clock OPEN timestamp and therefore the same commitment deadline.
-7. Miners retain generated payloads locally and send only their signed compact
-   commitments during the common commitment phase.
-8. After that phase closes, the validator drains the bounded compact requests
-   already at ingress, freezes their complete canonical set, signs it, persists
-   it, and exposes those exact bytes. Only then does it target fresh public
-   beacon A. The signed-set hash is an input to arrival-neutral selection,
-   which visits canonical operator identities in deterministic rounds.
-9. Only selected commitments may upload their exact committed payload during
-   the manifest-bound reveal interval. The validator then freezes and drains
-   those reveals.
-10. Fresh public beacon B is obtained only after the reveal interval. It is
-    distinct from beacon A and supplies final equal-value ordering.
-11. Lanes seal in deterministic offset order into the usable-group reservoir,
-    which the manifest-bound training mode then consumes.
+The validator first commits the immutable checkpoint revision. It then fixes
+and signs an intent for a later drand round, persists that intent, and fetches
+exactly the targeted beacon only after it becomes available. The beacon derives
+the epoch root, 16 unique generation seeds, and every environment's 16 prompt
+slices.
 
-`activation_not_before_round` is a lower bound, not a prediction of local
-availability. The common OPEN edge occurs once the validator is ready at or
-after that round.
+The manifest binds:
 
-Generation preparation begins from the public manifest. Submission does not:
-all 16 lanes become OPEN in the same atomic routing change, and none is a
-future live window after that point.
+- schema and capability versions;
+- protocol profile/version and canonical contract hash;
+- checkpoint number, repository, revision, and observed commit round;
+- source beacon chain, round, and randomness;
+- first window, exact horizon, and common schedule;
+- advertised warm-up, intent, generation, upload-grace, and backup timings;
+- every per-environment prompt slice and every generation seed;
+- target, backup, operator-round, portfolio, reward, and training policies;
+- the canonical manifest SHA-256.
 
-## Canonical manifest and derivation
+The plan contains no seal or auction randomness. All 16 lanes share one atomic
+OPEN timestamp after the advertised warm-up boundary.
 
-The strict canonical JSON manifest and its SHA-256 bind:
+The current infrastructure can prove local durable ordering: checkpoint and
+signed intent bytes exist before the targeted epoch beacon. It cannot turn an
+HTTP publication timestamp into a trustless global fact. A production revision
+must specify an independently observable commitment surface.
 
-- schema/domain and experimental capability versions;
-- protocol profile/version and canonical generation-contract hash;
-- checkpoint number, repository, immutable revision, and observed commit round;
-- drand source, chain, chain hash, exact round, and verified randomness;
-- first logical window and exact configured horizon;
-- common activation/warm-up and collection/timeout policy;
-- target groups and maximum selected reveals per environment/lane;
-- compact-commitment operator bound, arrival-neutral selection policy, and
-  reveal duration;
-- validator-gated difficulty valuation, final ranking, selected-slot reward,
-  and ordered atomic-finalization policy;
-- `sequential_steps` or `aggregate_one_step` training mode;
-- every environment and dataset-universe size;
-- prompt-range width and explicit overlap policy;
-- every lane offset, logical window number, generation seed, and prompt slice.
+### 2. Self-selected generation intentions
 
-Conceptually:
+During the advertised intent phase, a miner submits a signed, compact claim
+binding one selected prompt to:
+
+- operator and miner identities;
+- epoch ID and manifest hash;
+- logical window and environment;
+- prompt index and validator-canonical prompt-content hash;
+- checkpoint, profile, protocol, and generation randomness;
+- a unique nonce.
+
+An intention has no generated tokens or payload hash. It is cheap enough that
+response length and generation hardware cannot increase the number of claims
+made before the deadline. Prompt range and cooldown are checked here, then
+checked again when a selected payload is admitted.
+
+Intentions are bounded per canonical operator and lane. That mapping is the
+repository's accounting identity; the experiment does not claim that it is
+intrinsically Sybil-resistant. Identity cost and concentration must be measured
+before choosing a production cap.
+
+### 3. Frozen population and generation tickets
+
+At intent close, the validator stops ingress, drains requests already inside
+the handler, freezes the exact canonical intent set, signs it, persists it
+create-only, and exposes its bytes and hash. Only then may it fetch beacon A.
+
+Beacon A selects primary and standby generation tickets. Operators are visited
+in deterministic rounds; an additional claim by one operator cannot precede
+the first eligible claim of another operator. Prompt and operator/prompt caps
+are applied during selection. Arrival order is absent.
+
+Primary ticket holders may generate immediately. Standby ticket holders must
+not generate until their advertised backup wave becomes active. The default
+waves occur at configured fractions of the common horizon. Intermediate waves
+activate only the deterministic number needed to cover observed shortfall. The
+final wave activates the remaining manifest-bounded reserve because seal-time
+proof failures are not yet observable. This caps worst-case generation at 2×
+the target with the production-sized fixture, instead of allowing an unbounded
+race, while giving valid primaries most of the horizon without redundant work.
+
+A full payload precommit must carry the selected intent ID. The validator
+rejects it unless the ticket is primary or an activated backup and every
+checkpoint, epoch, manifest, lane, prompt, profile, and randomness binding is
+exact. A standby, unselected, stale, replaced, or expired intention cannot
+reserve upload capacity.
+
+### 4. Streamed validation and final seal
+
+Selected miners generate during the common horizon and use the existing
+payload precommit/reveal transport. Decode, formatting checks, prompt binding,
+grading, duplicate checks, token/logprob authenticity preparation, and bounded
+admission run as payloads arrive. Arrival changes validator utilization only;
+it does not change rank or reward.
+
+The final GRAIL proof budget remains bounded and is consumed after the candidate
+population freezes. This avoids making proof-worker availability an admission
+clock. Forced-stream handling, formatting, grading, GRAIL, checkpoint binding,
+cooldown, and duplicate protection are unchanged.
+
+After the generation deadline and admission drain, the validator obtains fresh
+beacon B. Beacon B is later than beacon A and never appears in the advance plan.
+It is used only for deterministic operator ordering and exact-value ties.
+
+## Training portfolio
+
+Pure throughput ordering was rejected because it concentrates admission on
+fast production rather than demonstrated training value. Pure random selection
+was also rejected because it discards the information supplied by validator
+grading. Raw per-token payment is not included: it would change the reward
+unit, make padding controls economically load-bearing, and can turn the market
+into a direct contest for paid compute volume.
+
+The experimental portfolio uses validator-derived group outcomes:
+
+- frontier signal: mean reward in `(0.00, 0.25]`;
+- learning signal: mean reward in `(0.25, 0.75]`;
+- consolidation signal: mean reward in `(0.75, 1.00]`.
+
+For a target of 16, the manifest-bound starting quotas are 4/8/4. Inside each
+stratum, canonical operators are visited in rounds. Robust utility selects an
+operator's best candidate; it does not decide which operator is visited next.
+Unused quota spills deterministically into eligible strata. Prompt index and
+content identities stay unique across the selected portfolio.
+
+The 4/8/4 mix is an explicit experiment, not a claim of optimality. It prevents
+one easy or one narrowly optimized difficulty region from absorbing the whole
+batch while producing direct telemetry for a later training ablation. The
+production flat-value toggle cannot silently replace this policy in epoch mode.
+
+Rewards remain the existing equal selected-slot split. Response length, token
+count, generation duration, and arrival do not change a selected slot's value.
+Because generation rights are chosen before generation begins, making a
+response shorter cannot create more tickets for that epoch. A future reward
+change must be evaluated separately with EOS, padding, quality, concentration,
+and cost measurements.
+
+## Prompt slices and miner choice
+
+Slices are non-overlapping when the environment universe permits it. If it
+does not, the manifest names a deterministic cycle policy. Admission and final
+selection retain the existing cooldown semantics; earlier logical lanes win a
+deterministic overlap when the same content cannot be used twice.
+
+Publishing the full horizon lets miners compare prompts across lanes. That is a
+deliberate trade: it enables miner curation and scheduling, but can bias the
+training distribution toward locally predictable outcomes. The required
+measurements are selected difficulty, prompt/content diversity, environment
+coverage, local-score calibration, and divergence from uniform slice sampling.
+
+## Training modes
+
+`RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_TRAINING_MODE` is bound into the plan:
+
+- `sequential_steps` consumes the 16 lane reservoirs in manifest order while
+  retaining one frozen behavior checkpoint for the epoch;
+- `aggregate_one_step` combines the usable reservoir into one optimizer update
+  using the trainer's existing token-budgeted microbatching and gradient
+  accumulation.
+
+The modes are not mathematically equivalent. Both publish at most one successor
+checkpoint after the complete epoch. The detached trainer consumes an epoch
+only after its terminal marker exists, so a partial restart cannot silently
+train or publish half an epoch.
+
+## Miner queue and invalidation
+
+The reference planner is opt-in and has no send capability by default. Its
+durable states are:
 
 ```text
-epoch_id   = SHA256(domain/id || canonical_pre_beacon_intent)
-epoch_root = SHA256(domain/root || epoch_id || verified_beacon_R1)
-
-seed[i] = SHA256(
-    domain/window || epoch_root || uint64(i) || uint64(window_number[i])
-)
-
-slice[i, environment] = DERIVE_SLICE(
-    domain/slice,
-    epoch_root,
-    environment,
-    dataset_universe,
-    prompt_range_width,
-    i,
-)
+intent_pending -> primary/standby -> selected -> generating -> prepared
+prepared -> released
+any ambiguous or stale state -> quarantine
 ```
 
-Direct indexed derivation avoids mutable generator state and permits independent
-validation of any lane. Changing the checkpoint, contract, beacon, schedule,
-training mode, horizon, offset, logical window, environment, or dataset binding
-changes the appropriate identifier, seed, or manifest hash.
+The miner revalidates exact live state immediately before generation and again
+before payload release. It checks the checkpoint, protocol, canonical contract,
+epoch, manifest, intent-set hash, lane, generation seed, prompt slice, prompt
+content, cooldown, phase, deadline, and active backup wave. Future work never
+submits early. A checkpoint, contract, manifest, or generation-randomness
+change invalidates the whole queue; ambiguous work is quarantined and is never
+replayed under a new binding.
 
-The validator persists a create-only signed pre-beacon intent and then a
-create-only manifest. The narrow `/checkpoint-epoch/intent` endpoint exposes
-the signed intent while the target beacon is still pending. A miner verifies
-the validator signature, canonical bytes, ETag, exact plan derivation, and the
-independent drand signature before adopting a plan. Restart recovery reloads
-the same canonical bytes.
+The planner reports generated GPU-seconds, prepared and released groups,
+stale/ambiguous discards, lane/environment coverage, underfill opportunity,
+backup activation, and queue age. Local scheduling may use deterministic lane
+order or an estimated eligible-value-per-second heuristic. Local scheduling
+metadata is never sent to the validator and never enters ranking.
 
-This gives observers a consistency surface but not a consensus timestamp for
-the HTTP publication. The locally fsynced second-round observation is still a
-validator assertion. A production revision must define independent observation
-or another trustless checkpoint-commit timestamp; this prototype does not
-claim stronger ordering than the infrastructure can prove.
+## Restart and equivocation
 
-## Concurrent commitment, selection, and reveal
+The checkpoint intent, manifest, frozen generation-intent set, activation, and
+terminal outcome use create-only persistence. Reinstalling identical bytes is
+idempotent; different bytes for the same identifier are rejected. An
+interrupted activated epoch is retired and tombstoned as one unit rather than
+reopened with an ambiguous population.
 
-The 16 entries are logical lanes inside one physical OPEN phase; they do not
-open one after another. A miner queries
-`/state?env=<name>&window=<number>` for each lane it intends to release.
+## Threat model and mitigations
 
-Preparing work does not send its payload. At exact commitment OPEN, the miner
-revalidates live state and finalizes the nonce, envelope signature, precommit
-signature, and observed drand-round telemetry. It durably keeps those exact
-reveal bytes, then sends only the compact precommit that binds their hash,
-size, prompt, lane, checkpoint, profile, and generation inputs. The validator's
-receipt timestamp and fixed commitment deadline determine eligibility. An
-older signed round is recorded but does not reject or rank an epoch commitment;
-a claimed future round remains invalid. The validator stores the compact object
-without reserving proof or grading capacity. A payload sent before selection is
-refused.
+- Checkpoint grinding is limited by binding the immutable revision before the
+  epoch beacon.
+- Advance cherry-picking and prompt-distribution bias are observable through
+  manifest-bound slices and selection-distribution telemetry; they remain a
+  product trade requiring ablation.
+- Submission volume cannot buy earlier admission because the population is
+  frozen and operator-rounded before generation.
+- Simultaneous OPEN bursts carry compact intentions rather than generated
+  payloads; payload work is bounded by selected tickets.
+- Manifest or intent-set equivocation is detectable from canonical signed
+  hashes and rejected by create-only storage.
+- Stale and ambiguous work is quarantined against its exact binding.
+- Final ordering cannot be precomputed because beacon B is fetched only after
+  collection closes.
 
-After beacon A, miners poll the narrow commitment-status endpoint. A selected
-commitment receives one bounded reveal deadline; a non-selected commitment
-cannot upload. Immediately before reveal, the miner rechecks exact OPEN and
-reveal phase plus checkpoint, epoch ID, manifest hash, profile, contract,
-logical window, generation seed, prompt slice, and cooldown. Replaced, stale,
-or ambiguous work is quarantined and never replayed under another binding. The
-existing formatting, authenticity, grading, proof, duplicate, checkpoint, and
-forced-stream checks remain in force.
+## Evaluation and activation gates
 
-Every lane targets `B_BATCH` selected groups. The experimental default chooses
-at most `2 * B_BATCH` payload reveals per environment/lane: 16 targets plus a
-16-candidate proof-failure reserve with the production value of `B_BATCH`.
-Deterministic sensitivity replay keeps the reserve explicit: the former
-half-batch reserve underfilled too often at the fixture's stated validity rates,
-while a full-batch reserve filled 99.4% of 500 complete synthetic epochs and
-still halves the old 64-payload ceiling. This is a capacity result, not live
-telemetry. The limit is applied only after the commitment phase and therefore
-does not create a first-arrival pool. The reveal bound and compact-commitment
-bound are manifest-bound and cannot change within an epoch.
+The repository replay records how much candidate inference is unused under the
+current windows and compares arrival, throughput, operator-round, and
+checkpoint-epoch policies. Synthetic runs are capacity checks only; unavailable
+economic or training telemetry is reported as unavailable rather than inferred.
 
-The common commitment phase defaults to the existing per-window duration
-multiplied by the checkpoint horizon. It never closes early. State advertises
-the exact phase, durations, target, and selected reveal limit. Compact
-commitments are bounded per canonical operator and lane. This controls validator
-work without claiming that uncoordinated local preparation has zero discarded
-work. Selection also grants at most one reveal ticket per operator and prompt
-inside a lane. The production auction's proven-dominance early-close policy is
-explicitly disabled for experimental epoch batchers; the manifest-bound common
-deadline remains authoritative in every early-close mode.
+Before coordinated activation, reviewers must measure on an isolated run:
 
-The local reference planner is bounded and has no submission transport. A
-backend-neutral callback may prepare token sequences, after which the existing
-request builder performs canonical rewards, proofs, log probabilities, and
-formatting. The miner transport helper finalizes signatures only at exact OPEN;
-the planner itself remains incapable of network sends by default.
+- valid and proven groups available by each deadline;
+- inference-seconds per selected group and accepted tokens per accelerator-hour;
+- environment underfill, burned slots, backup activation, and stale work;
+- time to primary completion and the common-OPEN request burst;
+- operator reward HHI/Gini and tickets per operator;
+- selected response-length distribution without using length as quality;
+- prompt difficulty, content diversity, and cross-lane selection bias;
+- training loss, KL, reward, stability, and downstream quality for both training
+  modes;
+- proof-plane capacity after the changed path manifest is requalified.
 
-Its deterministic baseline walks lane, prompt, then environment order. The
-optional `value_per_gpu_second` policy orders the same bounded records by an
-operator-supplied estimate of eligible training value divided by estimated
-generation seconds, with the baseline tuple as a stable tie-break. These local
-estimates affect only preparation order; they are never sent to the validator
-or used in ranking or rewards.
-
-## Prompt slices and cooldown
-
-Each environment receives one slice per lane. Slices are non-overlapping when
-the universe permits it. Otherwise the manifest names one deterministic cycle
-policy; it never widens the universe or weakens cooldown.
-
-Because lanes collect together, admission uses each lane's opening snapshot.
-Final selection then rechecks the shared live prompt and content cooldown while
-sealing lanes in ascending offset order. In an overlap cycle, an earlier
-selected lane deterministically makes the same prompt ineligible for later
-lanes. Miner release also rechecks prompt content and the advertised cooldown.
-
-Revealing the full horizon creates cross-lane prompt-selection bias: miners can
-compare all public slices before choosing work. This is a conscious product
-choice requiring diversity, difficulty, and selection-distribution metrics,
-not a free efficiency claim.
-
-## Training reservoir modes
-
-The plan binds the value of
-`RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_TRAINING_MODE`:
-
-- `sequential_steps` consumes lane batches in deterministic offset order. The
-  existing balanced accumulator can carry a sparse environment into the next
-  lane. Each optimizer call uses the same frozen behavior checkpoint.
-- `aggregate_one_step` retains up to the complete 16-lane target per
-  environment and passes the usable reservoir to one `train_step` call. That
-  function already uses token-budgeted microbatches and gradient accumulation,
-  so this is one optimizer update without one giant in-memory forward. An
-  underfilled reservoir is consumed only when every configured environment is
-  represented.
-
-These modes are not mathematically equivalent. Sequential mode updates model
-parameters between calls; aggregate mode computes one gradient against one
-parameter state. Both keep the published behavior checkpoint frozen for the
-whole epoch and publish at most one successor checkpoint after completion.
-
-The detached journal carries the same immutable epoch/lane binding plus the
-training-run identity. It writes a small terminal marker only after all 16
-payloads or tombstones have uploaded.
-The detached trainer waits for that marker before consuming lane zero: an
-aborted epoch is skipped as one unit, while a completed epoch is processed in
-the manifest-selected sequential or aggregate mode. In aggregate mode the one
-successful optimizer call credits the full horizon for publication cadence.
-
-## Ranking, seal randomness, and rewards
-
-The advance plan contains generation randomness only. It never contains or
-derives seal, auction, or final tie-break randomness.
-
-Beacon A is obtained after compact commitments are frozen and controls only
-which bounded cohort may reveal. Beacon B is obtained after reveals are frozen.
-Epoch candidates rank first by the manifest-bound validator difficulty value
-`std(rewards) * (1 - mean(rewards))` after the existing robust gate. Within an
-exact-value tier, Beacon B orders canonical operators and candidates in rounds:
-every represented operator receives one proof opportunity before any receives
-a second. Neither selection uses generation completion, throughput, upload, or
-arrival time. The production flat-value switch and production ranking path are
-unchanged and are not consulted by epoch ranking.
-
-The prototype retains the current selected-slot reward model and burn
-accounting. It does not introduce payment for unselected work.
-
-## Identity, quotas, persistence, and invalidation
-
-The commitment bound and round-based reveal selection reuse the repository's
-canonical operator mapping; they do not invent an identity from hotkeys. This
-prototype does not claim that the mapping makes participation Sybil-resistant.
-The complete canonical commitment set is exposed through the narrow signed
-`/checkpoint-epoch/commitment-set` endpoint before beacon A is requested.
-Miners verify its validator signature and ETag, and reveal selection commits to
-its SHA-256. Observers can therefore reproduce selection from the signed set and
-beacon A.
-
-Durable experimental state is deliberately small: one create-only signed
-intent, one create-only canonical manifest, one signed frozen commitment set,
-one current pointer, an activation marker, one terminal outcome, one detached
-training marker, and bounded local prepared work plus quarantine records. An
-activated epoch is never reopened after restart. An interrupted epoch is
-retired and its unconsumed training journal entries are tombstoned; the
-validator requires a successor checkpoint before it can schedule another
-epoch. A checkpoint, profile, contract, epoch, or manifest change invalidates
-all unreleased work. Admission safety circuits share the one physical OPEN
-phase while prompt and duplicate accounting remains bound to exact lanes.
-
-## Threat model and measurements
-
-Production review must cover checkpoint grinding, advance cherry-picking,
-prompt-distribution bias, multi-identity flooding, common-OPEN request bursts,
-stale work, and manifest equivocation. The prototype addresses these at the
-protocol boundary through commit-before-beacon ordering, canonical immutable
-bindings, distinct generation, admission, and final-order beacons, exact-lane
-routing, bounded local queues, final cooldown checks, and create-only storage.
-It does not claim that those controls replace public consistency or operational
-capacity validation.
-
-No economic result is inferred from unavailable telemetry. Before activation,
-measure valid/proven groups available by deadline, environment underfill and
-burned share, generated compute per selected group, accepted tokens per
-compute-hour, warm-up loss, operator concentration, prompt difficulty and
-diversity, common-OPEN ingress, and stale/discarded work.
-
-The configured capacity envelope has one deterministic property: at the
-default 32-reveal limit, at most 16 fully valid revealed candidates can remain
-outside a full 16-group selection. This is a bound on validator-processed
-payloads, not a measured claim about generation cost, profitability, or
-participation. The reserve should be reduced or increased only from observed
-proof-failure and underfill data.
-
-`/health` exposes bounded `checkpoint_epoch_pipeline` telemetry containing the
-common-phase durations, admission and seal beacon rounds, per-lane proof time,
-selected-group counts, finalized-lane count, and terminal outcome. This is the
-measurement surface for changing the advertised collection duration or proof
-capacity; neither is inferred from offer rate.
-
-Reviewers can exercise the deterministic synthetic shape comparison with:
-
-```bash
-python3.12 scripts/simulate_checkpoint_epoch.py
-```
-
-Its JSON output states its assumptions and marks every field that requires
-authenticated operational telemetry. It is a capacity regression fixture, not
-an economic forecast.
-
-An optional CUDA qualification loads the pinned profile model, prepares one
-real forced-seed group, verifies all proofs and logprobs, and can carry the
-payload through the local epoch precommit, selection, reveal, admission, seal,
-and winner path. It never starts a listener or contacts a validator:
-
-```bash
-RELIQUARY_PROTOCOL_PROFILE=qwen3-4b-base-dapo-reasoning-v5 \
-  python3.12 scripts/qualify_checkpoint_epoch_gpu.py \
-  --max-new-tokens 8192 --http-lane
-```
-
-## Rollout and rollback
-
-Rollout starts only in an isolated environment with the explicit capability
-flag and a coordinated experimental profile whose checkpoint horizon is 16.
-Reviewers may choose either training mode, but changing it creates a different
-epoch intent and manifest.
-
-Rollback disables the capability, withdraws the read-only plan surface, and
-quarantines unreleased local work. Current profiles continue through their
-unchanged ordinary window path. Production activation additionally requires
-multi-observer intent consistency, recovery validation, capacity qualification, an
-independent protocol and mechanism review, an explicit cutover, and an explicit
-rollback procedure. Review must confirm the common-OPEN admission behavior
-under representative load; merge of this inactive capability is not that
-confirmation.
+Activation also requires a new protocol/profile capability, miner cutover
+documentation, rollback rehearsal, and independent protocol review. Rollback is
+disabling the experimental capability and returning to the untouched current
+window loop. This branch must not be deployed, merged, or used to publish a
+checkpoint as part of prototype qualification.

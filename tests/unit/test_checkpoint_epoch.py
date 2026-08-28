@@ -81,16 +81,18 @@ def test_manifest_is_canonical_deterministic_and_stable():
     assert canonical_manifest_bytes(first) == canonical_manifest_bytes(second)
     assert parse_epoch_plan(canonical_manifest_bytes(first)) == first
     assert manifest_sha256(first) == (
-        "ffc183f670c13edf5db4980476f4e01302471e6e7ac28821fe97c0b4024ae2e7"
+        "a3fa5ef505987dfaa8110ea8b4d8aeb620199b64d6f42ddd575ca763c74ce04c"
     )
     assert first.window_schedule.mode == "concurrent_checkpoint_epoch"
     assert first.training_mode == "sequential_steps"
-    assert first.valuation_policy == "robust_gated_difficulty_delta1_v1"
+    assert first.valuation_policy == "balanced_advantage_portfolio_v1"
     assert first.ranking_policy == (
-        "utility_then_operator_rounds_post_seal_beacon_v2"
+        "strata_operator_rounds_post_seal_beacon_v1"
     )
     assert first.reward_policy == "selected_slot_v1"
-    assert first.finalization_policy == "ordered_lanes_atomic_epoch_v1"
+    assert first.finalization_policy == (
+        "streamed_validation_ordered_lanes_atomic_epoch_v1"
+    )
 
 
 def test_production_horizon_has_sixteen_unique_domain_separated_seeds():

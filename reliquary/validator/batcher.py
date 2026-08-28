@@ -631,14 +631,90 @@ def _rank_epoch_candidates(
     operator_by_id: dict[int, str | None],
     candidate_tiebreak_by_id: dict[int, bytes],
     operator_tiebreak_by_id: dict[str, bytes],
+    seal_randomness: str,
+    epoch_id: str,
+    manifest_sha256_hex: str,
 ):
-    """Rank utility first, then visit operators in rounds inside each tie."""
+    """Build a varied portfolio, then retain deterministic proof backups.
+
+    Difficulty strata receive manifest-fixed shares.  Inside each stratum,
+    canonical operators are visited in rounds before any operator receives a
+    second opportunity.  Utility chooses one operator's best candidate but
+    never lets that operator jump another operator in the same stratum.
+    """
+    from reliquary.shared.checkpoint_epoch_market import (
+        PortfolioCandidate,
+        select_training_portfolio,
+    )
+
+    def digest_or_hash(value: str) -> str:
+        normalized = str(value).lower()
+        if len(normalized) == 64 and all(
+            character in "0123456789abcdef" for character in normalized
+        ):
+            return normalized
+        return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+
+    seal_digest = digest_or_hash(seal_randomness)
+    epoch_digest = digest_or_hash(epoch_id)
+    manifest_digest = digest_or_hash(manifest_sha256_hex)
+    item_by_candidate: dict[str, tuple[Any, Any]] = {}
+    portfolio_candidates = []
+    for item in scored:
+        pending, score = item
+        operator = operator_by_id[id(pending)]
+        if operator is None:
+            raise RuntimeError(
+                "checkpoint epoch ranking requires canonical operators"
+            )
+        candidate_id = candidate_tiebreak_by_id[id(pending)].hex()
+        content_digest = str(
+            getattr(pending, "prompt_content_sha256", "") or ""
+        )
+        if len(content_digest) != 64:
+            content_digest = hashlib.sha256(
+                f"{getattr(pending, 'prompt_idx', -1)}".encode("utf-8")
+            ).hexdigest()
+        item_by_candidate[candidate_id] = item
+        portfolio_candidates.append(
+            PortfolioCandidate(
+                candidate_id=candidate_id,
+                operator_id=operator,
+                prompt_idx=int(pending.prompt_idx),
+                prompt_content_sha256=content_digest,
+                mean_reward=float(score.mean_reward),
+                reward_std=float(score.reward_std),
+                robust_utility=float(score.value),
+            )
+        )
+
+    portfolio = select_training_portfolio(
+        portfolio_candidates,
+        seal_randomness=seal_digest,
+        epoch_id=epoch_digest,
+        manifest_sha256_hex=manifest_digest,
+        target=min(B_BATCH, len(portfolio_candidates)) or 1,
+    )
+    ranked = [item_by_candidate[item.candidate_id] for item in portfolio]
+    selected_ids = {item.candidate_id for item in portfolio}
+    operator_round_by_id = {
+        id(item_by_candidate[item.candidate_id][0]): item.operator_round
+        for item in portfolio
+    }
+
+    # Keep every remaining bounded candidate as a proof-failure fallback. The
+    # same post-seal entropy orders exact values; arrival and throughput remain
+    # absent. These rows cannot displace the portfolio prefix unless a selected
+    # candidate fails proof or a prompt/content cooldown check.
     by_value: dict[float, list[tuple[Any, Any]]] = {}
     for item in scored:
+        if candidate_tiebreak_by_id[id(item[0])].hex() in selected_ids:
+            continue
         by_value.setdefault(float(item[1].value), []).append(item)
 
-    ranked: list[tuple[Any, Any]] = []
-    operator_round_by_id: dict[int, int] = {}
+    fallback_round_base = (
+        max(operator_round_by_id.values(), default=-1) + 1
+    )
     for value in sorted(by_value, reverse=True):
         by_operator: dict[str, list[tuple[Any, Any]]] = {}
         for item in by_value[value]:
@@ -666,11 +742,14 @@ def _rank_epoch_candidates(
                     continue
                 item = queue[round_index]
                 ranked.append(item)
-                operator_round_by_id[id(item[0])] = round_index
+                operator_round_by_id[id(item[0])] = (
+                    fallback_round_base + round_index
+                )
                 added = True
             if not added:
                 break
             round_index += 1
+        fallback_round_base += round_index
     return ranked, operator_round_by_id
 
 
@@ -6151,6 +6230,11 @@ class GrpoWindowBatcher:
                 operator_by_id=operator_by_id,
                 candidate_tiebreak_by_id=tiebreak_by_id,
                 operator_tiebreak_by_id=operator_tiebreak_by_id,
+                seal_randomness=self.seal_randomness,
+                epoch_id=str(getattr(self, "checkpoint_epoch_id", "")),
+                manifest_sha256_hex=str(
+                    getattr(self, "checkpoint_epoch_manifest_sha256", "")
+                ),
             )
         else:
             operator_round_by_id = {}

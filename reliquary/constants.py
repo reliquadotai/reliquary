@@ -636,6 +636,42 @@ if (
         "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_COLLECTION_SECONDS must be "
         "finite and positive"
     )
+# Short, arrival-neutral self-selection phase before expensive generation.
+# Miners choose their own prompt/lane; a post-close beacon grants generation
+# rights. This is separate from the common generation horizon above.
+EXPERIMENTAL_CHECKPOINT_EPOCH_INTENT_SECONDS = float(_os.environ.get(
+    "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_INTENT_SECONDS", "60",
+))
+if (
+    not _math.isfinite(EXPERIMENTAL_CHECKPOINT_EPOCH_INTENT_SECONDS)
+    or EXPERIMENTAL_CHECKPOINT_EPOCH_INTENT_SECONDS <= 0
+):
+    raise ValueError(
+        "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_INTENT_SECONDS must be "
+        "finite and positive"
+    )
+EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_ACTIVATION_FRACTIONS = tuple(
+    float(value.strip())
+    for value in _os.environ.get(
+        "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_ACTIVATION_FRACTIONS",
+        "0.5,0.75",
+    ).split(",")
+    if value.strip()
+)
+if (
+    not EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_ACTIVATION_FRACTIONS
+    or tuple(
+        sorted(set(EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_ACTIVATION_FRACTIONS))
+    ) != EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_ACTIVATION_FRACTIONS
+    or any(
+        not _math.isfinite(value) or not 0.0 < value < 1.0
+        for value in EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_ACTIVATION_FRACTIONS
+    )
+):
+    raise ValueError(
+        "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_ACTIVATION_FRACTIONS "
+        "must be unique increasing fractions in (0, 1)"
+    )
 EXPERIMENTAL_CHECKPOINT_EPOCH_TRAINING_MODE = _os.environ.get(
     "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_TRAINING_MODE",
     "sequential_steps",
@@ -698,11 +734,9 @@ M_ROLLOUTS = ACTIVE_PROTOCOL_PROFILE.sampling.rollouts
 B_BATCH = 16 if PROTOCOL_VERSION >= 4 else 8
 
 # Epoch admission keeps one target batch of proof-failure reserve instead of
-# copying the production auction's 64 productive candidates into every
-# concurrent lane. The value is explicit, configurable and committed in the
-# epoch manifest. Synthetic sensitivity replay showed the old half-batch
-# reserve underfilled 76.2% of complete epochs at the fixture's 78-86% validity,
-# while a full-batch reserve filled 99.4% and still halved the payload ceiling.
+# copying the production auction's unbounded offer into every concurrent lane.
+# Proof outcomes are not known when the final backup wave starts, so the value
+# is explicit, configurable and committed in the epoch manifest.
 EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_CANDIDATES_PER_LANE = int(_os.environ.get(
     "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_CANDIDATES_PER_LANE",
     str(B_BATCH),
@@ -715,17 +749,25 @@ if EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_CANDIDATES_PER_LANE < 0:
 EXPERIMENTAL_CHECKPOINT_EPOCH_CANDIDATES_PER_LANE = (
     B_BATCH + EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_CANDIDATES_PER_LANE
 )
-EXPERIMENTAL_CHECKPOINT_EPOCH_COMMITMENTS_PER_OPERATOR_PER_LANE = int(
+EXPERIMENTAL_CHECKPOINT_EPOCH_INTENTS_PER_OPERATOR_PER_LANE = int(
     _os.environ.get(
-        "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_COMMITMENTS_PER_OPERATOR_PER_LANE",
-        str(B_BATCH),
+        "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_INTENTS_PER_OPERATOR_PER_LANE",
+        _os.environ.get(
+            "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_COMMITMENTS_PER_OPERATOR_PER_LANE",
+            str(B_BATCH),
+        ),
     )
 )
-if EXPERIMENTAL_CHECKPOINT_EPOCH_COMMITMENTS_PER_OPERATOR_PER_LANE <= 0:
+if EXPERIMENTAL_CHECKPOINT_EPOCH_INTENTS_PER_OPERATOR_PER_LANE <= 0:
     raise ValueError(
-        "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_COMMITMENTS_PER_OPERATOR_PER_LANE "
+        "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_INTENTS_PER_OPERATOR_PER_LANE "
         "must be positive"
     )
+# Internal schema-v7 name retained as a compatibility alias while the
+# experimental manifest field is migrated in a future schema revision.
+EXPERIMENTAL_CHECKPOINT_EPOCH_COMMITMENTS_PER_OPERATOR_PER_LANE = (
+    EXPERIMENTAL_CHECKPOINT_EPOCH_INTENTS_PER_OPERATOR_PER_LANE
+)
 EXPERIMENTAL_CHECKPOINT_EPOCH_REVEAL_SECONDS = float(_os.environ.get(
     "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_REVEAL_SECONDS", "60",
 ))
