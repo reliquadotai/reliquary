@@ -86,6 +86,10 @@ from reliquary.protocol.submission import (
     WindowState,
 )
 from reliquary.protocol.tokens import verify_tokens
+from reliquary.validator.admission_priority import (
+    QueuedPrecommit,
+    ThroughputAdmissionQueue,
+)
 from reliquary.validator.batch_selection import (
     throughput_rank,
     explain_batch_selection,
@@ -1081,6 +1085,9 @@ class GrpoWindowBatcher:
         # Per-window like the fields above: a fresh set every window because
         # a new ``GrpoWindowBatcher`` is constructed per window.
         self._payload_digests_seen: set[str] = set()
+        # v6 only. Precommits wait here until the validator has budget to
+        # validate one, ordered by production rate rather than arrival.
+        self.admission_queue: ThroughputAdmissionQueue | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         # Optional callback the seal-extension coroutine polls to check
         # whether the server's submit_queue has finished draining items
@@ -1241,6 +1248,13 @@ class GrpoWindowBatcher:
         self.window_opened_wall_ts = (
             self._wall_clock() if wall_time is None else float(wall_time)
         )
+        # v6 only. Freshly ordered every window, same as the state above —
+        # a new ``GrpoWindowBatcher`` per window means there is nothing to
+        # carry over.
+        if FILL_CLOSED_ENABLED:
+            self.admission_queue = ThroughputAdmissionQueue(
+                window_opened_at=self.window_opened_at
+            )
         # Anchor the throughput draw tie-break: the drand round at window open is
         # the reference from which each submission's elapsed (= its attached
         # drand_round − this) is measured. Best-effort — on any drand hiccup the
@@ -1287,6 +1301,12 @@ class GrpoWindowBatcher:
             return False
         self._payload_digests_seen.add(digest)
         return True
+
+    def _next_admission(self, environment: str) -> QueuedPrecommit | None:
+        """The highest-rate precommit waiting for this environment."""
+        if self.admission_queue is None:
+            return None
+        return self.admission_queue.take_best(environment)
 
     def _record_upload_precommit_rejection_locked(self, reason: str) -> None:
         self._upload_precommit_rejections[reason] = (
@@ -1422,6 +1442,20 @@ class GrpoWindowBatcher:
                 self._upload_precommit_peak_pending,
                 len(self._upload_precommits),
             )
+            # v6 only. Feed the rate-ordered queue right here, at accept —
+            # not at reveal — so it can prioritise whose body to pull next
+            # instead of only ordering work already on disk. ``now`` (not
+            # ``t_arrival_wall``) matches ``window_opened_at``'s clock: both
+            # are ``self._time_fn()``, the monotonic base the rest of this
+            # class measures elapsed against; wall time and monotonic time
+            # are not interchangeable in the rate formula's denominator.
+            if FILL_CLOSED_ENABLED and self.admission_queue is not None:
+                self.admission_queue.offer(
+                    receipt_id=receipt_id,
+                    environment=getattr(self.env, "name", ""),
+                    payload_bytes=payload_bytes,
+                    precommit_arrived_at=now,
+                )
             return True, None, deadline
 
     def try_register_selected_epoch_reveal(
