@@ -38,6 +38,30 @@ def _pending_stub(
     )
 
 
+def test_accept_submission_wires_the_arrival_proof_call(monkeypatch):
+    """The unit tests above call ``_submit_arrival_proof`` directly; this
+    proves it is actually reached from the real admission entrypoint at both
+    ``_pending.append`` sites' shared caller (``accept_submission`` ->
+    ``_accept_locked``), not just callable in isolation."""
+    import reliquary.validator.batcher as batcher_module
+    from tests.unit.test_grpo_window_batcher import _request
+
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+
+    extended = []
+    batcher = _make_batcher()
+    batcher.fill_state = batcher_module.FillState(
+        targets={"openmathinstruct": 4, "opencodeinstruct": 4}
+    )
+    batcher._extend_proof_plan = lambda candidates: extended.extend(candidates)
+
+    response = batcher.accept_submission(_request(prompt_idx=9, hotkey="miner"))
+
+    assert response.accepted is True
+    assert len(extended) == 1
+    assert batcher.fill_state.snapshot()["in_flight"]["openmathinstruct"] == 1
+
+
 def test_an_arriving_submission_is_extended_onto_the_open_plan(monkeypatch):
     import reliquary.validator.batcher as batcher_module
     monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)

@@ -2949,6 +2949,8 @@ class GrpoWindowBatcher:
             self.confirm_logical_group_reservation(request)
             request._retain_payload = True
             self._pending.append(pending)
+            if FILL_CLOSED_ENABLED and self.fill_state is not None:
+                self._submit_arrival_proof(pending)
             self._submissions_per_prompt.setdefault(
                 request.prompt_idx, []
             ).append(pending)
@@ -3505,6 +3507,8 @@ class GrpoWindowBatcher:
             self.confirm_logical_group_reservation(request)
             request._retain_payload = True
             self._pending.append(pending)
+            if FILL_CLOSED_ENABLED and self.fill_state is not None:
+                self._submit_arrival_proof(pending)
             self._submissions_per_prompt.setdefault(
                 request.prompt_idx, []
             ).append(pending)
