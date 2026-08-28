@@ -176,6 +176,41 @@ from "capacity charged" to "training target proven".
 5. On success the group is accepted; on any failure the reservation is
    released and the next arrival takes it.
 
+### Admission is ordered by rate, not by arrival
+
+Closing on a fill hands the slots still open near the close to whoever
+finishes first — systematically whoever produced the SHORTEST rollouts.
+Per-token payment does not fix that: a long group has to get *in* before
+it can be paid. Left alone, the design would keep a bounty on short
+answers at exactly the margin where it decides who trains.
+
+So precommits queue, and the queue is ordered by production rate:
+
+    rate = payload_bytes / (arrival - that hotkey's previous arrival)
+
+At fixed hardware the rate is the same whether a group is 500 or 5000
+tokens per rollout, so length stops deciding who gets in. A precommit that
+lands while an earlier one is still being validated goes ahead of it if it
+was produced faster.
+
+Both terms are safe from the miner: `payload_bytes` is bound by the signed
+precommit and enforced against the upload that follows it, and elapsed
+comes from validator-observed arrivals. Elapsed runs from that hotkey's
+PREVIOUS arrival, not from window open — measured from open, a miner's
+Nth precommit shows elapsed `N x generation_time`, its apparent rate
+decays as `1/N`, and only its first submission would ever compete.
+
+This is the throughput measure the auction used as a tie-break, kept for a
+different job. It is no longer breaking ties in a ranking — there is no
+ranking — it is deciding what the validator spends its next grading and
+proof budget on.
+
+The queue is bounded, and at capacity it drops the WORST entry rather than
+the newest: dropping the newest would turn the bound into a second arrival
+race, which is what ordering by rate exists to remove. A refused offer
+still advances that hotkey's clock, since the work was produced and the
+refusal was not its doing.
+
 The order matters: the two cheap refusals gate the two expensive stages, so
 the validator never grades or proves a group it already knows it cannot
 use.
@@ -311,11 +346,10 @@ Two consequences:
   `MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW`, `MAX_PROOF_WALL_SECONDS = 240`,
   and the fail-closed capacity qualification are all seal-time envelopes
   that no longer describe the shape of the work.
-- **A bounded queue with an explicit backpressure policy.** When arrivals
-  outrun proof capacity, the validator either rejects with a retry hint or
-  drops the overflow. Rejecting is preferable: it is visible to the miner
-  and keeps arrival order meaningful. The queue depth and the reject
-  reason are part of the contract, not an implementation detail.
+- **A bounded queue with an explicit backpressure policy**, which
+  Component 2 now specifies: the queue drops its worst-rate entry rather
+  than its newest arrival. The depth and the reject reason are part of the
+  contract, not an implementation detail.
 
 PR #207 (several proof slots per GPU, measured 12.5 s at one slot against
 5.7 s at four with MPS) is what makes this affordable; re-measure at
@@ -455,9 +489,11 @@ restore ranking.
 - **Lottery selection among commitments.** Removes the compute race the
   subnet wants to pay for, and makes revenue depend on ticket count rather
   than work delivered.
-- **Keeping the throughput tie-break.** It exists to stop pure-arrival
-  ordering penalising long generation. With no ordering and per-token
-  payment, it has no job left.
+- **Deleting the throughput measure outright.** An earlier draft did. It
+  was wrong: without it, admission falls back to arrival order, and the
+  marginal slots near the close go to whoever produced the shortest
+  rollouts. The measure keeps its job, it changes it — from breaking ties
+  in a ranking to ordering the admission queue.
 - **Sixteen simultaneous prompt-slice lanes** (PR #198). Lanes all finish
   at the same instant — the end of collection — so nothing can be
   pipelined, and the per-lane submission caps stop being a rate.
