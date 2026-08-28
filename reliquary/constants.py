@@ -4,6 +4,11 @@ Immutable values that all network participants must agree on.
 No os.getenv() overrides. Changes require coordinated deployment.
 """
 
+import math as _math
+import os as _os
+
+from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE
+
 # ────────────────  GRAIL PROOF VERSION  ────────────────
 
 GRAIL_PROOF_VERSION = "v7"
@@ -45,10 +50,6 @@ PROOF_SKETCH_TOLERANCE_GROWTH = 5.0
 # Override with GRAIL_ATTN_IMPL for test envs without flash-attn compiled
 # (e.g. "eager" or "sdpa"). Production runs must stay on flash_attention_2
 # because sketch commitments are bit-sensitive to attention kernel variance.
-import math as _math
-import os as _os
-
-from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE
 
 ATTN_IMPLEMENTATION = _os.environ.get("GRAIL_ATTN_IMPL", "flash_attention_2")
 
@@ -657,12 +658,15 @@ M_ROLLOUTS = ACTIVE_PROTOCOL_PROFILE.sampling.rollouts
 # watch as training lengthens responses, NOT the slot count.
 B_BATCH = 16 if PROTOCOL_VERSION >= 4 else 8
 
-# Epoch admission keeps a small proof-failure reserve instead of copying the
-# production auction's 64 productive candidates into every concurrent lane.
-# The value is explicit, configurable and committed in the epoch manifest.
+# Epoch admission keeps one target batch of proof-failure reserve instead of
+# copying the production auction's 64 productive candidates into every
+# concurrent lane. The value is explicit, configurable and committed in the
+# epoch manifest. Synthetic sensitivity replay showed the old half-batch
+# reserve underfilled 76.2% of complete epochs at the fixture's 78-86% validity,
+# while a full-batch reserve filled 99.4% and still halved the payload ceiling.
 EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_CANDIDATES_PER_LANE = int(_os.environ.get(
     "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_CANDIDATES_PER_LANE",
-    str(max(1, B_BATCH // 2)),
+    str(B_BATCH),
 ))
 if EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_CANDIDATES_PER_LANE < 0:
     raise ValueError(

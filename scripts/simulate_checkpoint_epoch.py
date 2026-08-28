@@ -20,6 +20,15 @@ from reliquary.shared.checkpoint_epoch import (
     EpochAdmissionCommitment,
     select_epoch_reveals,
 )
+from reliquary.protocol.profiles import resolve_protocol_profile
+from reliquary.validator.batch_selection import throughput_rank
+
+
+_CURRENT_PROFILE = resolve_protocol_profile(
+    "qwen3-4b-base-dapo-reasoning-v5"
+)
+_ROLLOUTS = _CURRENT_PROFILE.sampling.rollouts
+_THROUGHPUT = _CURRENT_PROFILE.throughput_tiebreak
 
 
 @dataclass(frozen=True)
@@ -31,7 +40,7 @@ class Candidate:
     difficulty: float
     tokens: int
     gpu_seconds: float
-    arrival_seconds: float
+    prepared_at_open: bool
     valid: bool
     stale: bool
 
@@ -59,7 +68,6 @@ def _population(
     rng: random.Random,
     horizon: int,
     candidate_limit: int,
-    epoch_mode: bool,
 ) -> list[Candidate]:
     candidates: list[Candidate] = []
     for environment in ("math", "code"):
@@ -67,16 +75,15 @@ def _population(
         for lane in range(horizon):
             for index in range(candidate_limit):
                 gpu_seconds = rng.lognormvariate(math.log(45.0), 0.35)
-                prepared = epoch_mode and rng.random() < 0.75
                 candidates.append(Candidate(
                     environment=environment,
                     lane=lane,
                     operator=rng.randrange(12),
                     prompt=lane * 10_000 + index,
                     difficulty=round(rng.random(), 1),
-                    tokens=rng.randint(2_000, 8_000),
+                    tokens=rng.randint(2_000, 8_000) * _ROLLOUTS,
                     gpu_seconds=gpu_seconds,
-                    arrival_seconds=(0.0 if prepared else gpu_seconds),
+                    prepared_at_open=rng.random() < 0.75,
                     valid=rng.random() < validity,
                     stale=rng.random() < 0.015,
                 ))
@@ -87,18 +94,14 @@ def _run_policy(
     *,
     name: str,
     seed: int,
+    population: list[Candidate],
     horizon: int,
     target: int,
     candidate_supply: int,
     reveal_limit: int,
     epoch_mode: bool,
 ) -> dict[str, object]:
-    population = _population(
-        rng=random.Random(seed),
-        horizon=horizon,
-        candidate_limit=candidate_supply,
-        epoch_mode=epoch_mode,
-    )
+    policy_population: list[Candidate] = []
     selected: list[Candidate] = []
     underfill_by_environment = Counter()
     first_lane_underfill = 0
@@ -109,7 +112,8 @@ def _run_policy(
                 for candidate in population
                 if candidate.environment == environment
                 and candidate.lane == lane
-            ]
+            ][:candidate_supply]
+            policy_population.extend(lane_candidates)
             if epoch_mode:
                 commitments = [
                     EpochAdmissionCommitment(
@@ -150,10 +154,19 @@ def _run_policy(
                     _tiebreak(seed, candidate),
                 ))
             else:
+                throughput = _THROUGHPUT
+                if throughput is None:
+                    raise RuntimeError("active profile has no throughput tie-break")
                 lane_candidates.sort(key=lambda candidate: (
                     -candidate.difficulty,
-                    -(candidate.tokens / max(candidate.arrival_seconds, 1.0)),
-                    candidate.arrival_seconds,
+                    throughput_rank(
+                        candidate.tokens,
+                        arrival_round=int(candidate.gpu_seconds // 3.0),
+                        window_open_round=0,
+                        token_cap=throughput.token_cap * _ROLLOUTS,
+                        bucket_tokens_per_round=throughput.bucket_tokens_per_round,
+                    ),
+                    int(candidate.gpu_seconds // 3.0),
                     _tiebreak(seed, candidate),
                 ))
             lane_candidates = [
@@ -168,7 +181,7 @@ def _run_policy(
             if lane == 0:
                 first_lane_underfill += missing
 
-    generated_seconds = sum(candidate.gpu_seconds for candidate in population)
+    generated_seconds = sum(candidate.gpu_seconds for candidate in policy_population)
     selected_tokens = sum(candidate.tokens for candidate in selected)
     operator_counts = Counter(candidate.operator for candidate in selected)
     shares = [count / max(len(selected), 1) for count in operator_counts.values()]
@@ -176,9 +189,9 @@ def _run_policy(
         "policy": name,
         "candidate_supply_per_environment_lane": candidate_supply,
         "selected_reveal_limit_per_environment_lane": reveal_limit,
-        "generated_candidates": len(population),
+        "generated_candidates": len(policy_population),
         "valid_candidates_available": sum(
-            candidate.valid and not candidate.stale for candidate in population
+            candidate.valid and not candidate.stale for candidate in policy_population
         ),
         "selected_training_groups": len(selected),
         "underfill_by_environment": dict(sorted(underfill_by_environment.items())),
@@ -213,17 +226,16 @@ def _run_policy(
             6,
         ),
         "open_edge_submission_burst": sum(
-            candidate.arrival_seconds == 0.0 for candidate in population
+            epoch_mode and candidate.prepared_at_open
+            for candidate in policy_population
         ),
-        "open_edge_payload_burst": (
-            0 if epoch_mode else sum(
-                candidate.arrival_seconds == 0.0 for candidate in population
-            )
-        ),
+        "open_edge_payload_burst": 0,
         "post_selection_payload_burst_upper_bound": (
             2 * horizon * reveal_limit if epoch_mode else 0
         ),
-        "stale_discarded_work": sum(candidate.stale for candidate in population),
+        "stale_discarded_work": sum(
+            candidate.stale for candidate in policy_population
+        ),
     }
 
 
@@ -233,7 +245,7 @@ def main() -> None:
     parser.add_argument("--horizon", type=int, default=16)
     parser.add_argument("--target", type=int, default=16)
     parser.add_argument("--current-candidates", type=int, default=64)
-    parser.add_argument("--epoch-candidates", type=int, default=24)
+    parser.add_argument("--epoch-candidates", type=int, default=32)
     parser.add_argument("--epoch-commitments", type=int, default=64)
     args = parser.parse_args()
     if min(
@@ -249,6 +261,11 @@ def main() -> None:
     if args.epoch_commitments < args.epoch_candidates:
         parser.error("epoch commitments must cover the reveal cohort")
 
+    population = _population(
+        rng=random.Random(args.seed),
+        horizon=args.horizon,
+        candidate_limit=max(args.current_candidates, args.epoch_commitments),
+    )
     report = {
         "scope": "synthetic capacity-envelope replay; not production telemetry",
         "assumptions": {
@@ -262,6 +279,7 @@ def main() -> None:
         "current": _run_policy(
             name="current_per_window",
             seed=args.seed,
+            population=population,
             horizon=args.horizon,
             target=args.target,
             candidate_supply=args.current_candidates,
@@ -271,6 +289,7 @@ def main() -> None:
         "checkpoint_epoch": _run_policy(
             name="checkpoint_epoch",
             seed=args.seed,
+            population=population,
             horizon=args.horizon,
             target=args.target,
             candidate_supply=args.epoch_commitments,

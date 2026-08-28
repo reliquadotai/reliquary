@@ -4397,7 +4397,20 @@ class ValidatorServer:
                         request, batcher, round_reject,
                     )
                 if drand_observation.reject_reason is not None:
-                    return reject(drand_observation.reject_reason)
+                    # Epoch commitments are bound to the active epoch, lane,
+                    # checkpoint, generation randomness, nonce, and exact
+                    # payload digest. Their validator-stamped receipt time and
+                    # fixed commitment deadline are authoritative; the miner's
+                    # round is telemetry, never an admission or rank key. An
+                    # older signed round is therefore harmless, while a future
+                    # round remains impossible to have observed. Ordinary
+                    # windows retain their exact production freshness policy.
+                    if (
+                        not epoch_commitment
+                        or drand_observation.reject_reason
+                        is RejectReason.FUTURE_ROUND
+                    ):
+                        return reject(drand_observation.reject_reason)
             else:
                 drand_observation = self._fallback_drand_observation(
                     request, batcher, None,
