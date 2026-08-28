@@ -21,6 +21,7 @@ from reliquary.shared.checkpoint_epoch import (
     CHECKPOINT_EPOCH_FINALIZATION_POLICY,
     CHECKPOINT_EPOCH_RANKING_POLICY,
     CHECKPOINT_EPOCH_REWARD_POLICY,
+    CHECKPOINT_EPOCH_VALUATION_POLICY,
     EpochAdmissionCommitment,
     select_epoch_reveals,
 )
@@ -65,6 +66,98 @@ def _tiebreak(seed: int, candidate: Candidate) -> bytes:
         f"{candidate.operator}:{candidate.prompt}"
     )
     return hashlib.sha256(value.encode("utf-8")).digest()
+
+
+def _operator_tiebreak(seed: int, candidate: Candidate) -> bytes:
+    value = (
+        f"{seed}:{candidate.environment}:{candidate.lane}:"
+        f"{candidate.operator}"
+    )
+    return hashlib.sha256(value.encode("utf-8")).digest()
+
+
+def _rank_epoch_lane(seed: int, candidates: list[Candidate]) -> list[Candidate]:
+    """Mirror utility-first, operator-rounded ordering inside exact ties."""
+    by_value: dict[float, list[Candidate]] = {}
+    for candidate in candidates:
+        by_value.setdefault(candidate.difficulty, []).append(candidate)
+    ranked: list[Candidate] = []
+    for value in sorted(by_value, reverse=True):
+        by_operator: dict[int, list[Candidate]] = {}
+        for candidate in by_value[value]:
+            by_operator.setdefault(candidate.operator, []).append(candidate)
+        for queue in by_operator.values():
+            queue.sort(key=lambda candidate: _tiebreak(seed, candidate))
+        operators = sorted(
+            by_operator,
+            key=lambda operator: (
+                _operator_tiebreak(seed, by_operator[operator][0]),
+                operator,
+            ),
+        )
+        round_index = 0
+        while True:
+            added = False
+            for operator in operators:
+                queue = by_operator[operator]
+                if round_index < len(queue):
+                    ranked.append(queue[round_index])
+                    added = True
+            if not added:
+                break
+            round_index += 1
+    return ranked
+
+
+def _economic_sensitivity() -> dict[str, object]:
+    """Transparent length and token-contest arithmetic, not a forecast."""
+    rollouts = 16
+    seconds = 1_600.0
+    aggregate_tokens_per_second = 800.0
+    fixed_group_seconds = 2.0
+    baseline_length = 2_000
+
+    def capacity(length: int) -> int:
+        group_seconds = (
+            fixed_group_seconds
+            + rollouts * length / aggregate_tokens_per_second
+        )
+        return int(seconds // group_seconds)
+
+    baseline_groups = capacity(baseline_length)
+    rows = []
+    for length in (500, 1_000, 2_000, 4_000, 8_000):
+        groups = capacity(length)
+        rows.append({
+            "mean_completion_tokens": length,
+            "groups_generated": groups,
+            "flat_slot_capacity_index": round(groups / baseline_groups, 6),
+            "gross_token_capacity_index": round(
+                groups * length / (baseline_groups * baseline_length),
+                6,
+            ),
+        })
+    return {
+        "scope": "synthetic linear-cost sensitivity; not production telemetry",
+        "assumptions": {
+            "rollouts_per_group": rollouts,
+            "generation_seconds": seconds,
+            "aggregate_tokens_per_second": aggregate_tokens_per_second,
+            "fixed_group_seconds": fixed_group_seconds,
+            "baseline_completion_tokens": baseline_length,
+        },
+        "length_rows": rows,
+        "symmetric_gross_token_contest": [
+            {
+                "operators": operators,
+                "pool_fraction_dissipated_as_linear_cost": round(
+                    (operators - 1) / operators,
+                    6,
+                ),
+            }
+            for operators in (2, 4, 8, 16, 32)
+        ],
+    }
 
 
 def _population(
@@ -153,10 +246,7 @@ def _run_policy(
                     for candidate, commitment in zip(lane_candidates, commitments)
                     if commitment.commitment_id in selected_ids
                 ]
-                lane_candidates.sort(key=lambda candidate: (
-                    -candidate.difficulty,
-                    _tiebreak(seed, candidate),
-                ))
+                lane_candidates = _rank_epoch_lane(seed, lane_candidates)
             else:
                 throughput = _THROUGHPUT
                 if throughput is None:
@@ -278,6 +368,7 @@ def main() -> None:
             "epoch_prepared_at_open_probability": 0.75,
             "epoch_commitments_are_selected_before_payload_reveal": True,
             "epoch_admission_policy": CHECKPOINT_EPOCH_ADMISSION_POLICY,
+            "epoch_valuation_policy": CHECKPOINT_EPOCH_VALUATION_POLICY,
             "epoch_ranking_policy": CHECKPOINT_EPOCH_RANKING_POLICY,
             "epoch_reward_policy": CHECKPOINT_EPOCH_REWARD_POLICY,
             "epoch_finalization_policy": CHECKPOINT_EPOCH_FINALIZATION_POLICY,
@@ -304,6 +395,7 @@ def main() -> None:
             reveal_limit=args.epoch_candidates,
             epoch_mode=True,
         ),
+        "economic_sensitivity": _economic_sensitivity(),
         "unmeasurable_without_authenticated_telemetry": [
             "real generation cost",
             "real profitability",

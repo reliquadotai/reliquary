@@ -791,6 +791,66 @@ def test_epoch_ranking_ignores_arrival_and_throughput(monkeypatch):
     )
 
 
+def test_epoch_exact_utility_ties_visit_operators_in_rounds():
+    operators = {
+        f"miner-{operator}-{index}": f"operator-{operator}"
+        for operator in range(3)
+        for index in range(4)
+    }
+    batcher = _make_batcher(
+        operator_by_hotkey=operators,
+        experimental_epoch_ranking=True,
+    )
+    rewards = [1.0, 1.0] + [0.0] * 6
+    prompt = 0
+    for hotkey in operators:
+        _accept_with_arrival(
+            batcher,
+            _request(prompt_idx=prompt, hotkey=hotkey, rewards=rewards),
+            100 + prompt,
+        )
+        prompt += 1
+    batcher.current_checkpoint_hash = "2" * 40
+    batcher.collection_close_drand_round = 200
+    batcher.seal_randomness = "fresh-seal"
+    batcher.seal_beacon_round = 201
+
+    batcher.seal_batch()
+
+    ranked = sorted(batcher.auction_candidates, key=lambda row: row["rank"])
+    assert [row["operator_round"] for row in ranked] == [
+        0, 0, 0,
+        1, 1, 1,
+        2, 2, 2,
+        3, 3, 3,
+    ]
+    for round_index in range(4):
+        rows = [
+            row for row in ranked if row["operator_round"] == round_index
+        ]
+        assert len({row["operator_id"] for row in rows}) == 3
+
+
+def test_epoch_valuation_does_not_inherit_production_flat_toggle(monkeypatch):
+    import reliquary.validator.batcher as batcher_module
+
+    monkeypatch.setattr(
+        batcher_module,
+        "flat_auction_value",
+        lambda _value: (_ for _ in ()).throw(
+            AssertionError("epoch valuation consulted production flat toggle")
+        ),
+    )
+    pending = SimpleNamespace(
+        rewards=[1.0, 1.0] + [0.0] * 6,
+        robust_utility=None,
+    )
+
+    score = batcher_module._pending_epoch_difficulty_score(pending)
+
+    assert 0.0 < score.value < 1.0
+
+
 @pytest.mark.parametrize(
     ("randomness", "round_number"),
     (("", 201), ("fresh", None), ("fresh", 200)),

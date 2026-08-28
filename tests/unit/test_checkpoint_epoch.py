@@ -81,11 +81,14 @@ def test_manifest_is_canonical_deterministic_and_stable():
     assert canonical_manifest_bytes(first) == canonical_manifest_bytes(second)
     assert parse_epoch_plan(canonical_manifest_bytes(first)) == first
     assert manifest_sha256(first) == (
-        "f9c12701d8e5af993b7e15cd5c82b264f0d7a524eacbf39b61a7f47a2e276e63"
+        "ffc183f670c13edf5db4980476f4e01302471e6e7ac28821fe97c0b4024ae2e7"
     )
     assert first.window_schedule.mode == "concurrent_checkpoint_epoch"
     assert first.training_mode == "sequential_steps"
-    assert first.ranking_policy == "utility_then_post_seal_beacon_v1"
+    assert first.valuation_policy == "robust_gated_difficulty_delta1_v1"
+    assert first.ranking_policy == (
+        "utility_then_operator_rounds_post_seal_beacon_v2"
+    )
     assert first.reward_policy == "selected_slot_v1"
     assert first.finalization_policy == "ordered_lanes_atomic_epoch_v1"
 
@@ -171,6 +174,7 @@ def test_manifest_bindings_change_hash(change):
     ("field", "value", "message"),
     [
         ("ranking_policy", "throughput_admission", "ranking policy"),
+        ("valuation_policy", "raw_tokens", "valuation policy"),
         ("reward_policy", "per_token", "reward policy"),
         ("finalization_policy", "arrival_stream", "finalization policy"),
     ],
