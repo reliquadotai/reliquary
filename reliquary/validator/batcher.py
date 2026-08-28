@@ -37,6 +37,7 @@ from reliquary.constants import (
     MIN_EOS_PROBABILITY,
     MATH_ANSWER_FORMAT,
     FILL_CLOSED_ENABLED,
+    FILL_CLOSED_MAX_SECONDS,
     FORENSIC_SAMPLE_PER_WINDOW,
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
     MAX_PENDING_SUBMISSION_BYTES_PER_ENV,
@@ -86,10 +87,12 @@ from reliquary.protocol.submission import (
     WindowState,
 )
 from reliquary.protocol.tokens import verify_tokens
+from reliquary.validator.admission import robust_utility_admits
 from reliquary.validator.admission_priority import (
     QueuedPrecommit,
     ThroughputAdmissionQueue,
 )
+from reliquary.validator.fill_window import FillState
 from reliquary.validator.batch_selection import (
     throughput_rank,
     explain_batch_selection,
@@ -1088,6 +1091,20 @@ class GrpoWindowBatcher:
         # v6 only. Precommits wait here until the validator has budget to
         # validate one, ordered by production rate rather than arrival.
         self.admission_queue: ThroughputAdmissionQueue | None = None
+        # v6 only. None on the auction path, which proves at seal instead of
+        # on arrival. Set by the window activation code once every
+        # environment's target is known; ``_submit_arrival_proof`` is a
+        # no-op while it is None.
+        self.fill_state: FillState | None = None
+        # v6 only. The open-ended plan this window's arrival proofs extend.
+        # Lazily created by ``_extend_proof_plan`` on the first arrival --
+        # there is no earlier moment with a scheduler and a checkpoint
+        # revision both ready.
+        self._open_proof_plan_id: str | None = None
+        # v6 only. The open-ended plan's ranks must strictly increase in
+        # dispatch order (see ``GlobalProofScheduler.extend``); arrival order
+        # is not otherwise available as an integer, so this counts it.
+        self._arrival_proof_rank: int = 0
         self._loop: asyncio.AbstractEventLoop | None = None
         # Optional callback the seal-extension coroutine polls to check
         # whether the server's submit_queue has finished draining items
@@ -1307,6 +1324,107 @@ class GrpoWindowBatcher:
         if self.admission_queue is None:
             return None
         return self.admission_queue.take_best(environment)
+
+    def _extend_proof_plan(self, candidates: list[RankedProof]) -> None:
+        """Hand newly-admitted candidates to this window's open-ended plan.
+
+        Lazily submits the plan on the first arrival proof: ``fill_state``
+        (and therefore every environment's target) is only populated at
+        window activation, so there is no earlier moment with a
+        ``required_passes`` to submit. Every later call extends the same
+        plan instead of resubmitting it.
+        """
+        if not candidates:
+            return
+        scheduler = self._proof_scheduler
+        if scheduler is None:
+            raise RuntimeError("arrival proof path requires a scheduler")
+        environment = str(getattr(self.env, "name", ""))
+        if self._open_proof_plan_id is None:
+            plan_id = f"{self.window_start}:{environment}:fill-closed"
+            target = self.fill_state.snapshot()["targets"][environment]
+            scheduler.submit(
+                ProofPlan(
+                    plan_id=plan_id,
+                    environment=environment,
+                    checkpoint_revision=self.current_checkpoint_hash,
+                    candidates=tuple(candidates),
+                    required_passes=target,
+                    # The scheduler's own deadline is a second, independent
+                    # backstop under the window-duration one Task 7 polls
+                    # (``FILL_CLOSED_MAX_SECONDS``) -- belt and braces, not
+                    # a redundant knob to keep in sync by hand.
+                    deadline_at=(
+                        self.window_opened_at + FILL_CLOSED_MAX_SECONDS
+                    ),
+                    priority=0,
+                    allow_shortfall=True,
+                    open_ended=True,
+                )
+            )
+            self._open_proof_plan_id = plan_id
+        else:
+            scheduler.extend(self._open_proof_plan_id, candidates)
+
+    def _submit_arrival_proof(self, pending: PendingSubmission) -> None:
+        """Reserve capacity and hand the group to the open-ended plan.
+
+        The two cheap refusals (duplicate hash, environment full) have
+        already run by the time this is called; this is the expensive
+        half. ``robust_utility_admits`` is the admission-time analogue of
+        the auction's least-favourable pricing (Task 4): with no auction to
+        price a manufactured zero, a group whose least favourable reading
+        leaves the zone must be refused outright, before any capacity is
+        touched. A reservation that fails to reach the scheduler is
+        released, which immediately reopens capacity for the next arrival
+        -- without that, a run of failures would stall the window below its
+        target.
+        """
+        if self.fill_state is None:
+            return
+        environment = str(getattr(self.env, "name", ""))
+        if not self.fill_state.may_admit(environment):
+            return
+        truncated_indices = (
+            (pending.truncated_index,)
+            if pending.truncated_index is not None
+            else ()
+        )
+        sigma_min = BOOTSTRAP_SIGMA_MIN if self.bootstrap else SIGMA_MIN
+        if not robust_utility_admits(
+            pending.rewards,
+            sigma_min=sigma_min,
+            truncated_indices=truncated_indices,
+            attainable_rewards=pending.attainable_rewards or (0.0, 1.0),
+        ):
+            return
+
+        self.fill_state.reserve(environment)
+        operator = self._operator_for_hotkey(pending.hotkey)
+        operator_remaining = (
+            MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW
+            - self.operator_proof_failure_debt(operator)
+            if operator is not None
+            else 0
+        )
+        hotkey_remaining = (
+            MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
+            - self.proof_failure_debt(pending.hotkey)
+        )
+        self._arrival_proof_rank += 1
+        candidate = self._ranked_proof_for(
+            pending,
+            rank=self._arrival_proof_rank,
+            operator=operator,
+            operator_remaining=operator_remaining,
+            hotkey_remaining=hotkey_remaining,
+            tag="arrival",
+        )
+        try:
+            self._extend_proof_plan([candidate])
+        except Exception:
+            self.fill_state.release(environment)
+            raise
 
     def _record_upload_precommit_rejection_locked(self, reason: str) -> None:
         self._upload_precommit_rejections[reason] = (
@@ -4577,6 +4695,51 @@ class GrpoWindowBatcher:
                 return float(candidate)
         return 0.0
 
+    def _ranked_proof_for(
+        self,
+        pending: PendingSubmission,
+        *,
+        rank: int,
+        operator: str | None,
+        operator_remaining: int,
+        hotkey_remaining: int,
+        tag: str,
+    ) -> RankedProof:
+        """Build one ``RankedProof`` for ``pending``.
+
+        Shared by the seal-time ranked path (``_prove_ranked_scheduled``,
+        ``tag="winner"``, eligibility and debt already checked by the
+        caller) and the v6 arrival path (``_submit_arrival_proof``,
+        ``tag="arrival"``). ``operator`` may be ``None`` (unmapped
+        identity) -- the seal path never reaches here in that case, but the
+        arrival path has no equivalent pre-filter, so this degrades to a
+        hotkey-only resource rather than raising.
+        """
+        environment = str(getattr(self.env, "name", ""))
+        content_digest = pending.prompt_content_sha256
+        prompt_key: Any = (
+            ("content", content_digest)
+            if content_digest
+            else ("prompt", pending.prompt_idx)
+        )
+        resources: tuple[tuple[Any, int], ...] = (
+            ((environment, "hotkey", pending.hotkey), hotkey_remaining),
+        )
+        if operator is not None:
+            resources = (
+                ((environment, "operator", operator), operator_remaining),
+            ) + resources
+        return RankedProof(
+            job_id=f"{self.window_start}:{environment}:{tag}:{rank}",
+            rank=rank,
+            prompt_key=prompt_key,
+            payload=_ScheduledProofPayload(
+                batcher=self,
+                pending=pending,
+            ),
+            resources=resources,
+        )
+
     def _prove_ranked_scheduled(
         self,
         *,
@@ -4636,33 +4799,15 @@ class GrpoWindowBatcher:
                 continue
 
             rank = int(row["rank"])
-            job_id = (
-                f"{self.window_start}:{environment}:winner:{rank}"
-            )
-            prompt_key: Any = (
-                ("content", content_digest)
-                if content_digest
-                else ("prompt", pending.prompt_idx)
-            )
-            candidate = RankedProof(
-                job_id=job_id,
+            candidate = self._ranked_proof_for(
+                pending,
                 rank=rank,
-                prompt_key=prompt_key,
-                payload=_ScheduledProofPayload(
-                    batcher=self,
-                    pending=pending,
-                ),
-                resources=(
-                    (
-                        (environment, "operator", operator),
-                        operator_remaining,
-                    ),
-                    (
-                        (environment, "hotkey", pending.hotkey),
-                        hotkey_remaining,
-                    ),
-                ),
+                operator=operator,
+                operator_remaining=operator_remaining,
+                hotkey_remaining=hotkey_remaining,
+                tag="winner",
             )
+            job_id = candidate.job_id
             candidates.append(candidate)
             row_by_job[job_id] = row
             pending_by_job[job_id] = pending
