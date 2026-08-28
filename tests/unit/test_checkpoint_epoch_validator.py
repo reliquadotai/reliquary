@@ -540,6 +540,12 @@ async def test_epoch_runner_opens_sixteen_lanes_together_then_consumes_in_order(
     assert service.server._active_batcher_values() == ()
     assert service._current_window_state is WindowState.READY
     assert service._checkpoint_epoch_store.terminal_status(plan) == "completed"
+    pipeline = service.server._checkpoint_epoch_pipeline_state
+    assert pipeline["finalization_policy"] == plan.finalization_policy
+    assert pipeline["phase"] == "terminal"
+    assert pipeline["terminal_status"] == "completed"
+    assert pipeline["lanes_finalized"] == 16
+    assert list(pipeline["lane_metrics"]) == [str(index) for index in range(16)]
 
 
 @pytest.mark.asyncio
@@ -605,6 +611,10 @@ async def test_epoch_failure_closes_routes_and_tombstones_unconsumed_lanes(
     assert service._window_n == plan.first_window + plan.window_count - 1
     assert service._checkpoint_epoch_store.terminal_status(plan) == "aborted"
     assert service._current_window_state is WindowState.READY
+    pipeline = service.server._checkpoint_epoch_pipeline_state
+    assert pipeline["phase"] == "terminal"
+    assert pipeline["terminal_status"] == "aborted"
+    assert pipeline["failure_type"] == "RuntimeError"
 
 
 @pytest.mark.asyncio

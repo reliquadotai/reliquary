@@ -1091,6 +1091,7 @@ class _Health(BaseModel):
     training_checkpoint_publication_pending: bool = False
     training_adaptive_publication_pending: bool = False
     training_adaptive_publication_reason: str | None = None
+    checkpoint_epoch_pipeline: dict[str, Any] = Field(default_factory=dict)
     forced_seed_enforced: bool = FORCED_SEED_ENFORCE
     forced_seed_consistency_floor: float = FORCED_SEED_CONSISTENCY_FLOOR
     forced_seed_rollout_floor: float = FORCED_SEED_ROLLOUT_FLOOR
@@ -1250,6 +1251,7 @@ class ValidatorServer:
         self._checkpoint_epoch_frozen_commitment_set: EpochCommitmentSet | None = None
         self._checkpoint_epoch_commitment_set: SignedEpochCommitmentSet | None = None
         self._checkpoint_epoch_commitment_set_bytes: bytes | None = None
+        self._checkpoint_epoch_pipeline_state: dict[str, Any] = {}
         self.app: FastAPI = self._build_app()
         self._server: uvicorn.Server | None = None
         self._task: asyncio.Task[Any] | None = None
@@ -2071,6 +2073,7 @@ class ValidatorServer:
             self._checkpoint_epoch_frozen_commitment_set = None
             self._checkpoint_epoch_commitment_set = None
             self._checkpoint_epoch_commitment_set_bytes = None
+            self._checkpoint_epoch_pipeline_state = {}
             self._state_response_cache.clear()
             return
 
@@ -2129,6 +2132,14 @@ class ValidatorServer:
         if phase is not None and self._checkpoint_epoch_plan is None:
             raise RuntimeError("checkpoint epoch plan is unavailable")
         self._checkpoint_epoch_phase = phase
+        self._state_response_cache.clear()
+
+    def set_checkpoint_epoch_pipeline_state(
+        self,
+        state: dict[str, Any],
+    ) -> None:
+        """Publish bounded lifecycle telemetry for the active experiment."""
+        self._checkpoint_epoch_pipeline_state = dict(state)
         self._state_response_cache.clear()
 
     def freeze_checkpoint_epoch_commitment_set(
@@ -3315,6 +3326,9 @@ class ValidatorServer:
             ),
             training_adaptive_publication_reason=training_publish.get(
                 "adaptive_publication_reason"
+            ),
+            checkpoint_epoch_pipeline=dict(
+                self._checkpoint_epoch_pipeline_state
             ),
             forced_seed_enforced=FORCED_SEED_ENFORCE,
             forced_seed_consistency_floor=FORCED_SEED_CONSISTENCY_FLOOR,

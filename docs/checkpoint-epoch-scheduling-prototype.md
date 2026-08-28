@@ -1,10 +1,10 @@
 # Checkpoint-epoch scheduling prototype
 
-Status: experimental and disabled by default. The implementation is intended
-to be mergeable as an inactive capability, but it is not an activation-ready
+Status: implementation-complete experimental capability, disabled by default.
+It is suitable for isolated activation qualification, but it is not an active
 production protocol. This prototype changes no current production profile or
 canonical contract. A future coordinated protocol/profile revision is required
-before activation.
+before production activation.
 
 ## Goals and non-goals
 
@@ -20,6 +20,31 @@ Work remains miner-directed: the validator publishes seeds and eligible prompt
 slices but never assigns prompts or generation jobs. The prototype does not
 deploy a profile, publish a checkpoint, change production rewards, accept work
 before OPEN, or add a production submission transport to the reference planner.
+
+## Final hybrid mechanism
+
+The final mechanism keeps the checkpoint-epoch control loop and adopts only the
+work-conserving parts of continuous processing that do not make speed decide
+admission:
+
+- compact commitments are frozen before a public admission beacon;
+- selected payloads are decoded, graded, and retained during reveal;
+- GRAIL starts only after the complete reveal population is frozen and the
+  fresh post-reveal seal beacon fixes the final economic order;
+- lanes seal in ascending manifest offset and each completed balanced lane is
+  written immediately to the detached journal;
+- the detached trainer waits for the epoch's terminal marker before consuming
+  lane zero, so a later lane failure cannot leave a partially trained epoch;
+- admission and final ranking never consult payload throughput or arrival;
+- rewards remain the existing fixed selected-slot split. A different reward
+  function requires a separately reviewed protocol revision and replay data.
+
+The manifest binds these decisions as
+`signed_set_operator_rounds_v2`,
+`utility_then_post_seal_beacon_v1`, `selected_slot_v1`, and
+`ordered_lanes_atomic_epoch_v1`. They are protocol choices, not runtime knobs.
+This prevents a validator from silently combining the public epoch plan with a
+different admission, ranking, reward, or finalization rule.
 
 ## Checkpoint-bound state machine
 
@@ -75,6 +100,7 @@ The strict canonical JSON manifest and its SHA-256 bind:
 - target groups and maximum selected reveals per environment/lane;
 - compact-commitment operator bound, arrival-neutral selection policy, and
   reveal duration;
+- final ranking, selected-slot reward, and ordered atomic-finalization policy;
 - `sequential_steps` or `aggregate_one_step` training mode;
 - every environment and dataset-universe size;
 - prompt-range width and explicit overlap policy;
@@ -283,6 +309,12 @@ outside a full 16-group selection. This is a bound on validator-processed
 payloads, not a measured claim about generation cost, profitability, or
 participation. The reserve should be reduced or increased only from observed
 proof-failure and underfill data.
+
+`/health` exposes bounded `checkpoint_epoch_pipeline` telemetry containing the
+common-phase durations, admission and seal beacon rounds, per-lane proof time,
+selected-group counts, finalized-lane count, and terminal outcome. This is the
+measurement surface for changing the advertised collection duration or proof
+capacity; neither is inferred from offer rate.
 
 Reviewers can exercise the deterministic synthetic shape comparison with:
 

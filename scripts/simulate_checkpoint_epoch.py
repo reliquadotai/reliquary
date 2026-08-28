@@ -17,6 +17,10 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from reliquary.shared.checkpoint_epoch import (
+    CHECKPOINT_EPOCH_ADMISSION_POLICY,
+    CHECKPOINT_EPOCH_FINALIZATION_POLICY,
+    CHECKPOINT_EPOCH_RANKING_POLICY,
+    CHECKPOINT_EPOCH_REWARD_POLICY,
     EpochAdmissionCommitment,
     select_epoch_reveals,
 )
@@ -273,6 +277,10 @@ def main() -> None:
             "operators": 12,
             "epoch_prepared_at_open_probability": 0.75,
             "epoch_commitments_are_selected_before_payload_reveal": True,
+            "epoch_admission_policy": CHECKPOINT_EPOCH_ADMISSION_POLICY,
+            "epoch_ranking_policy": CHECKPOINT_EPOCH_RANKING_POLICY,
+            "epoch_reward_policy": CHECKPOINT_EPOCH_REWARD_POLICY,
+            "epoch_finalization_policy": CHECKPOINT_EPOCH_FINALIZATION_POLICY,
             "reward_or_profit_claim": False,
         },
         "seed": args.seed,
