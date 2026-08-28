@@ -1,17 +1,19 @@
-"""Throughput-ordered admission: producing long must not cost you your place.
+"""Rate-ordered admission: producing long must not cost you your place.
 
-The fill-closed window closes when the batch is full, and admission is by
-arrival. That hands the marginal slots — the ones still open near the close —
-to whoever finishes first, which is systematically whoever produced the
-SHORTEST rollouts. Per-token payment does not fix it: you have to get in first.
+The fill-closed window closes when the batch is full, and the slots still open
+near the close would otherwise go to whoever finishes first — systematically
+whoever produced the SHORTEST rollouts. Per-token payment does not fix it: a
+long group has to get in before it can be paid.
 
-So the queue is ordered by throughput rather than by arrival. A precommit that
-lands while an earlier one is still being validated goes ahead of it if it was
-produced at a better rate. At fixed hardware the rate is the same whether the
-group is 500 or 5000 tokens per rollout, so length stops deciding who gets in.
+So the queue is ordered by production rate:
 
-Both terms are safe from the miner. ``payload_bytes`` is bound by the signed
-precommit and enforced against the upload; elapsed is validator-observed.
+    rate = payload_bytes / (precommit arrival - window open)
+
+It is measured at the PRECOMMIT, not the upload, so transport latency is
+inside the measure and a fat uplink cannot buy a place. And the denominator
+runs from window open for every group — no identity in the formula at all —
+so splitting across hotkeys changes nothing, and parallel producers gain
+volume without gaining rank.
 """
 
 from __future__ import annotations
@@ -21,80 +23,73 @@ from reliquary.validator.admission_priority import ThroughputAdmissionQueue
 MATH = "openmathinstruct"
 
 
-def _offer(queue, receipt, *, hotkey, at, payload_bytes, env=MATH):
+def _offer(queue, receipt, *, at, payload_bytes, env=MATH):
     return queue.offer(
         receipt_id=receipt,
-        hotkey=hotkey,
         environment=env,
         payload_bytes=payload_bytes,
-        arrived_at=at,
+        precommit_arrived_at=at,
     )
 
 
 def test_the_faster_producer_is_served_first_even_when_it_arrives_later():
     queue = ThroughputAdmissionQueue(window_opened_at=0.0)
 
-    # slow: 1000 bytes over 50 s  = 20 B/s
-    _offer(queue, "slow", hotkey="a", at=50.0, payload_bytes=1000)
-    # fast: 9000 bytes over 60 s  = 150 B/s, and it arrived LAST
-    _offer(queue, "fast", hotkey="b", at=60.0, payload_bytes=9000)
+    _offer(queue, "slow", at=50.0, payload_bytes=1000)   # 20 B/s
+    _offer(queue, "fast", at=60.0, payload_bytes=9000)   # 150 B/s, arrived LAST
 
     assert queue.take_best(MATH).receipt_id == "fast"
     assert queue.take_best(MATH).receipt_id == "slow"
     assert queue.take_best(MATH) is None
 
 
-def test_a_steady_miner_keeps_a_steady_rate_across_the_window():
-    """Elapsed is per-submission, not since window open.
+def test_the_rate_runs_from_window_open_and_carries_no_identity():
+    """Two identical groups from any two senders get the same rate: the
+    formula has no hotkey and no operator in it. What decides is only how far
+    into the window the precommit landed, and how many bytes it binds."""
+    queue = ThroughputAdmissionQueue(window_opened_at=100.0)
 
-    Measured from window open, a miner's Nth precommit shows elapsed
-    N x generation_time, so its apparent rate decays as 1/N and only its first
-    submission ever competes. The rate must describe the group that was just
-    produced, so it runs from that hotkey's previous arrival.
+    first = _offer(queue, "r1", at=125.0, payload_bytes=5000)
+    second = _offer(queue, "r2", at=125.0, payload_bytes=5000)
+
+    assert first.elapsed == 25.0
+    assert first.throughput == second.throughput == 200.0
+
+
+def test_parallel_producers_gain_volume_not_rank():
+    """Eight groups from eight GPUs all landing at 25 s each rate as a single
+    25 s group does. They win by having eight tickets, not by out-ranking.
+
+    Measured from the sender's previous arrival instead, the eighth would show
+    0.1 s elapsed and a 250x rate — a double count of the same hardware.
     """
     queue = ThroughputAdmissionQueue(window_opened_at=0.0)
 
-    first = _offer(queue, "r1", hotkey="steady", at=20.0, payload_bytes=2000)
-    second = _offer(queue, "r2", hotkey="steady", at=40.0, payload_bytes=2000)
-    third = _offer(queue, "r3", hotkey="steady", at=60.0, payload_bytes=2000)
+    solo = _offer(queue, "solo", at=25.0, payload_bytes=8000)
+    burst = [
+        _offer(queue, f"burst-{i}", at=25.0 + 0.1 * i, payload_bytes=8000)
+        for i in range(8)
+    ]
 
-    assert first.throughput == second.throughput == third.throughput
-
-
-def test_the_first_submission_of_a_hotkey_runs_from_window_open():
-    """There is no previous arrival to run from, and the window open is the
-    earliest moment the work could have started — the seed did not exist
-    before it."""
-    queue = ThroughputAdmissionQueue(window_opened_at=100.0)
-
-    entry = _offer(queue, "r1", hotkey="a", at=125.0, payload_bytes=5000)
-
-    assert entry.elapsed == 25.0
+    assert max(b.throughput for b in burst) <= solo.throughput
+    assert min(b.throughput for b in burst) > solo.throughput * 0.97
 
 
 def test_equal_rates_break_on_arrival_then_receipt():
-    """Order must not depend on insertion accidents.
-
-    Rates collide often — two miners on the same hardware produce the same
-    ratio — and an order that fell out of list ordering would make a window
-    unreproducible when replaying it from the archive.
-    """
+    """Rates collide often; an order that fell out of list ordering would make
+    a window unreproducible when replaying it from the archive."""
     queue = ThroughputAdmissionQueue(window_opened_at=0.0)
-    _offer(queue, "later", hotkey="b", at=30.0, payload_bytes=3000)
-    _offer(queue, "earlier", hotkey="a", at=20.0, payload_bytes=2000)
+    _offer(queue, "later", at=30.0, payload_bytes=3000)
+    _offer(queue, "earlier", at=20.0, payload_bytes=2000)
 
     assert queue.take_best(MATH).receipt_id == "earlier"
 
 
 def test_environments_queue_independently():
-    """Math and Code fill at different rates and close independently, so one
-    cannot be allowed to starve the other's queue."""
     queue = ThroughputAdmissionQueue(window_opened_at=0.0)
-    _offer(queue, "math", hotkey="a", at=10.0, payload_bytes=9000)
-    _offer(queue, "code", hotkey="b", at=10.0, payload_bytes=100,
-           env="opencodeinstruct")
+    _offer(queue, "math", at=10.0, payload_bytes=9000)
+    _offer(queue, "code", at=10.0, payload_bytes=100, env="opencodeinstruct")
 
     assert queue.take_best("opencodeinstruct").receipt_id == "code"
     assert queue.take_best("opencodeinstruct") is None
     assert queue.take_best(MATH).receipt_id == "math"
-

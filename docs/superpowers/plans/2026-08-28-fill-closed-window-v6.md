@@ -367,7 +367,7 @@ git commit -m "feat(window): per-environment fill accounting and the close rule"
 - Test: `tests/unit/test_token_rewards.py`
 
 **Interfaces:**
-- Consumes: `constants.FILL_CLOSED_MAX_OPERATOR_TOKEN_SHARE`.
+- Consumes: nothing from constants.
 - Produces: `AcceptedGroup(hotkey: str, operator_id: str, eos_tokens: int)` and `split_environment_pool(groups: Sequence[AcceptedGroup], *, pool: float, max_operator_share: float) -> dict[str, float]` keyed by hotkey.
 
 - [ ] **Step 1: Write the failing tests**
@@ -693,12 +693,12 @@ def test_a_faster_later_precommit_is_admitted_before_a_slower_earlier_one(
 
     # slow: 1000 bytes over 50 s. fast: 9000 bytes over 60 s, arriving LAST.
     batcher.admission_queue.offer(
-        receipt_id="slow", hotkey="a", environment=env,
-        payload_bytes=1_000, arrived_at=batcher.window_opened_at + 50.0,
+        receipt_id="slow", environment=env, payload_bytes=1_000,
+        precommit_arrived_at=batcher.window_opened_at + 50.0,
     )
     batcher.admission_queue.offer(
-        receipt_id="fast", hotkey="b", environment=env,
-        payload_bytes=9_000, arrived_at=batcher.window_opened_at + 60.0,
+        receipt_id="fast", environment=env, payload_bytes=9_000,
+        precommit_arrived_at=batcher.window_opened_at + 60.0,
     )
 
     assert batcher._next_admission(env).receipt_id == "fast"
@@ -731,7 +731,7 @@ Set it in the v6 window-open path, `ThroughputAdmissionQueue(window_opened_at=se
         return self.admission_queue.take_best(environment)
 ```
 
-**Both terms of the rate are outside the miner's control.** `payload_bytes` comes from the signed precommit and is enforced against the upload by `_precommit_matches_submission`; elapsed comes from validator-observed arrivals, measured from that hotkey's previous arrival rather than from window open — measured from open, a miner's Nth precommit shows elapsed `N × generation_time` and only its first submission would ever compete.
+**The rate is `payload_bytes / (precommit arrival − window open)`, and it carries no identity.** `payload_bytes` comes from the signed precommit and is enforced against the upload by `_precommit_matches_submission`; the arrival is validator-observed at the PRECOMMIT so transport latency is inside the measure. There is no hotkey and no operator in the formula — splitting across hotkeys changes nothing, and a parallel producer gains volume without gaining rank.
 
 - [ ] **Step 4: Run the test and the precommit suites**
 
@@ -1144,7 +1144,10 @@ In `select_batch_and_distribute`, where `slot_share = pool / B_BATCH` is compute
                 for submission in batch
             ],
             pool=pool,
-            max_operator_share=FILL_CLOSED_MAX_OPERATOR_TOKEN_SHARE,
+            # No operator cap: every identity a cap could key on costs one
+            # registration to multiply. Per-token payment IS the concentration
+            # control, because it keys on nothing. See the spec, Component 5.
+            max_operator_share=1.0,
         )
 ```
 

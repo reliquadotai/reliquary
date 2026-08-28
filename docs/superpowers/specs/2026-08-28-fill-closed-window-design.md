@@ -186,19 +186,28 @@ answers at exactly the margin where it decides who trains.
 
 So precommits queue, and the queue is ordered by production rate:
 
-    rate = payload_bytes / (arrival - that hotkey's previous arrival)
+    rate = payload_bytes / (precommit arrival - window open)
 
 At fixed hardware the rate is the same whether a group is 500 or 5000
 tokens per rollout, so length stops deciding who gets in. A precommit that
 lands while an earlier one is still being validated goes ahead of it if it
 was produced faster.
 
-Both terms are safe from the miner: `payload_bytes` is bound by the signed
-precommit and enforced against the upload that follows it, and elapsed
-comes from validator-observed arrivals. Elapsed runs from that hotkey's
-PREVIOUS arrival, not from window open — measured from open, a miner's
-Nth precommit shows elapsed `N x generation_time`, its apparent rate
-decays as `1/N`, and only its first submission would ever compete.
+Three properties of the formula, each deliberate:
+
+- **Measured at the precommit, not the upload.** Transport latency is inside
+  the measure, so a fat uplink cannot buy a place — only faster generation
+  can.
+- **No identity in the formula.** The denominator runs from window open for
+  every group. Splitting production across hotkeys changes nothing, and a
+  parallel producer gains volume without gaining rank: eight groups from
+  eight GPUs all landing at 25 s each rate exactly as one 25 s group does.
+  (An earlier draft measured from the sender's previous arrival; that made
+  the eighth group show 0.1 s of elapsed and a 250x rate — a double count of
+  hardware that had already earned eight tickets by volume.)
+- **Both terms are outside the miner's control.** `payload_bytes` is bound by
+  the signed precommit and enforced against the upload that follows it, and
+  the arrival is validator-observed.
 
 This is the throughput measure the auction used as a tie-break, kept for a
 different job. It is no longer breaking ties in a ranking — there is no
@@ -324,11 +333,11 @@ The three other barriers are unaffected: `MAX_TRUNCATED_PER_SUBMISSION`,
 the robust-utility rejection of Component 3, and the fact that a padded
 rollout grades 0 and can push its group out of the sigma zone.
 
-**Per-operator cap, expressed as a token share.** Without a cap,
-first-arrived is winner-take-all for the fastest operator. A cap counted
-in *groups* does not bound the payout under per-token payment — an
-operator can take few, very long groups — so the cap must bound an
-operator's share of an environment's accepted tokens.
+**No per-operator cap.** Every identity a cap could key on — hotkey or
+coldkey — costs one registration to multiply, so a cap is bought around
+rather than respected. Per-token payment is the concentration control
+instead, precisely because it keys on nothing: it pays what was produced,
+and a count that does not exist cannot be split across coldkeys.
 
 **Archive and weights.** Weight-only validators replay the EMA from R2
 archives and must converge bit-for-bit, so the accepted token count per
@@ -385,7 +394,6 @@ closes, and the per-environment fill rate is the telemetry to watch.
 | `RELIQUARY_WINDOW_TARGET_GROUPS_PER_ENV` | proven groups that close an environment | `256` (= 16 steps x `B_BATCH`) |
 | `RELIQUARY_WINDOW_MAX_SECONDS` | backstop; seal partial past it | `1800` |
 | `RELIQUARY_ENV_POOL_WEIGHTS` | share of the pool per environment | equal |
-| `RELIQUARY_MAX_OPERATOR_TOKEN_SHARE` | cap on one operator's share of an env's accepted tokens | `0.34` |
 | `RELIQUARY_PROOF_QUEUE_DEPTH` | bounded arrival queue before backpressure | to be sized from measurement |
 
 `CHECKPOINT_PUBLISH_INTERVAL_WINDOWS` is deleted: one window is one pi_old
@@ -534,10 +542,12 @@ restore ranking.
    flat valuation the auction was not selecting on quality, so the
    expectation is no — but `k_mean` and in-zone yield are the measurement,
    and they should be read before Stage 3 is armed, not after.
-3. ~~The operator token-share cap.~~ **Decided: a share of an
-   environment's accepted tokens, defaulting to `0.34`.** A count of groups
-   would not bound the payout under per-token payment — an operator can take
-   few, very long groups — so the cap has to bound the same quantity the
-   payment divides. `0.34` lets no single operator take a third of an
-   environment while leaving room for a fleet of three to fill it; it is a
-   starting value to move from measured concentration, not a derived one.
+3. ~~The operator token-share cap.~~ **Removed.** An operator is a coldkey,
+   and a coldkey costs one registration, so any per-operator bound is
+   bought around by registering more of them — the same hole that makes a
+   per-operator round-robin unsafe. It was also infeasible below three
+   operators at the chosen default (2 x 0.34 < 1). Concentration is
+   answered by per-token payment instead, which knows no identity and so
+   cannot be diluted: an operator taking seven slots with short groups
+   collects seven times little, and there is no count to split across
+   coldkeys.
