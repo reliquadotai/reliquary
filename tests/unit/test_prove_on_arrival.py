@@ -149,6 +149,58 @@ def test_a_plan_extension_failure_releases_the_reservation(monkeypatch):
     assert batcher.fill_state.snapshot()["in_flight"]["openmathinstruct"] == 0
 
 
+def test_a_passing_proof_records_proven_and_a_failing_one_releases(monkeypatch):
+    """The completion path: ``_execute_scheduled_proof`` runs once per
+    candidate, synchronously, on whatever thread executes the proof --
+    before the scheduler's coordinator later applies decisions in rank
+    order. That is the one place the pass/fail fact is known, for both the
+    seal-ranked path (fill_state is None there, so this is a no-op) and the
+    v6 arrival path."""
+    import reliquary.validator.batcher as batcher_module
+    from tests.unit.test_grpo_window_batcher import (
+        _always_false_grail, _always_true_grail, _make_batcher, _request,
+    )
+
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+
+    passing = _make_batcher(verify_commitment_proofs_fn=_always_true_grail)
+    passing.fill_state = batcher_module.FillState(
+        targets={"openmathinstruct": 4, "opencodeinstruct": 4}
+    )
+    passing._extend_proof_plan = lambda candidates: None
+    passing.accept_submission(_request(prompt_idx=11, hotkey="miner-pass"))
+    pending = passing.pending_submissions()[0]
+    # accept_submission already reserved via _submit_arrival_proof.
+    assert passing.fill_state.snapshot()["in_flight"]["openmathinstruct"] == 1
+
+    verified = passing._execute_scheduled_proof(
+        pending, model=None, count_operator_debt=True,
+    )
+
+    assert verified is not None
+    snap = passing.fill_state.snapshot()
+    assert snap["proven"]["openmathinstruct"] == 1
+    assert snap["in_flight"]["openmathinstruct"] == 0
+
+    failing = _make_batcher(verify_commitment_proofs_fn=_always_false_grail)
+    failing.fill_state = batcher_module.FillState(
+        targets={"openmathinstruct": 4, "opencodeinstruct": 4}
+    )
+    failing._extend_proof_plan = lambda candidates: None
+    failing.accept_submission(_request(prompt_idx=12, hotkey="miner-fail"))
+    pending = failing.pending_submissions()[0]
+    assert failing.fill_state.snapshot()["in_flight"]["openmathinstruct"] == 1
+
+    verified = failing._execute_scheduled_proof(
+        pending, model=None, count_operator_debt=True,
+    )
+
+    assert verified is None
+    snap = failing.fill_state.snapshot()
+    assert snap["proven"]["openmathinstruct"] == 0
+    assert snap["in_flight"]["openmathinstruct"] == 0
+
+
 def test_v6_does_not_consult_the_seal_time_proof_wall(monkeypatch):
     """The wall bounded ONE seal burst. v6 has no burst -- it proves
     continuously -- so the window backstop is the only time bound."""

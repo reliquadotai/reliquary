@@ -1105,6 +1105,14 @@ class GrpoWindowBatcher:
         # dispatch order (see ``GlobalProofScheduler.extend``); arrival order
         # is not otherwise available as an integer, so this counts it.
         self._arrival_proof_rank: int = 0
+        # v6 only. ``FillState`` has no internal locking of its own (see
+        # fill_window.py). ``reserve`` happens under ``self._lock`` (the
+        # admission commit lock); ``record_proven``/``release`` happen from
+        # proof-worker device threads, which never touch ``self._lock`` (see
+        # ``_verify_expensive``'s docstring). A dedicated lock -- rather than
+        # reusing either existing one -- keeps this critical section leaf-only
+        # and unable to introduce a new lock-ordering hazard between them.
+        self._fill_state_lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
         # Optional callback the seal-extension coroutine polls to check
         # whether the server's submit_queue has finished draining items
@@ -1399,7 +1407,8 @@ class GrpoWindowBatcher:
         ):
             return
 
-        self.fill_state.reserve(environment)
+        with self._fill_state_lock:
+            self.fill_state.reserve(environment)
         operator = self._operator_for_hotkey(pending.hotkey)
         operator_remaining = (
             MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW
@@ -1423,7 +1432,8 @@ class GrpoWindowBatcher:
         try:
             self._extend_proof_plan([candidate])
         except Exception:
-            self.fill_state.release(environment)
+            with self._fill_state_lock:
+                self.fill_state.release(environment)
             raise
 
     def _record_upload_precommit_rejection_locked(self, reason: str) -> None:
@@ -4570,6 +4580,19 @@ class GrpoWindowBatcher:
                     )
                     + 1
                 )
+        # v6 only. This runs on a proof-worker device thread -- possibly one
+        # of several running concurrently -- for both the seal-ranked path
+        # (fill_state is None there) and the v6 arrival path. A candidate
+        # that fails its proof releases the reservation ``_submit_arrival_
+        # proof`` made, reopening capacity for the next arrival; one that
+        # passes counts toward the environment's target.
+        if FILL_CLOSED_ENABLED and self.fill_state is not None:
+            environment = str(getattr(self.env, "name", ""))
+            with self._fill_state_lock:
+                if verified is not None:
+                    self.fill_state.record_proven(environment)
+                else:
+                    self.fill_state.release(environment)
         return verified
 
     def _reject(
