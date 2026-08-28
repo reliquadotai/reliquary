@@ -19,6 +19,8 @@ from typing import Any
 from reliquary.constants import (
     AUCTION_ADMISSION_DRAIN_DEADLINE_SECONDS,
     BATCH_PROMPT_COOLDOWN_WINDOWS,
+    COOLDOWN_COMPACTION_INTERVAL_WINDOWS,
+    COOLDOWN_DELTA_SNAPSHOTS_ENABLED,
     COOLDOWN_REBUILD_LOOKBACK,
     COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS,
     TRAINING_RUN_ID,
@@ -143,6 +145,14 @@ _STARTUP_HASH_REBUILD_TIMEOUT_SECONDS = 30.0
 def _cooldown_snapshot_key(run_id: str) -> str:
     """R2 key for the run-keyed cooldown snapshot."""
     return f"cooldown_snapshots/{run_id}.json"
+
+
+def _cooldown_delta_prefix(run_id: str) -> str:
+    return f"cooldown_deltas/{run_id}/"
+
+
+def _cooldown_delta_key(run_id: str, window: int) -> str:
+    return f"{_cooldown_delta_prefix(run_id)}window-{window:020d}.json.gz"
 
 
 def _content_cooldown_snapshot_key(run_id: str) -> str:
@@ -814,6 +824,10 @@ class ValidationService:
             self._training_accumulator.snapshot()
         )
         self._windows_since_cooldown_snapshot = 0
+        self._cooldown_base_snapshot_window = -1
+        self._cooldown_persisted_window = -1
+        self._cooldown_delta_keys: list[str] = []
+        self._cooldown_snapshot_task: asyncio.Task[None] | None = None
         self._checkpoint_store = CheckpointStore(
             validator_hotkey=wallet.hotkey.ss58_address,
             wallet=wallet,
@@ -1606,6 +1620,21 @@ class ValidationService:
             name: len(content_map)
             for name, content_map in self._content_cooldown_per_env.items()
         }
+        snapshot.update({
+            "prompt_counts_by_environment": {
+                name: len(cooldown_map)
+                for name, cooldown_map in self._cooldown_per_env.items()
+            },
+            "prompt_snapshot_mode": (
+                "delta" if COOLDOWN_DELTA_SNAPSHOTS_ENABLED else "full"
+            ),
+            "prompt_base_snapshot_window": self._cooldown_base_snapshot_window,
+            "prompt_persisted_window": self._cooldown_persisted_window,
+            "snapshot_background_inflight": bool(
+                self._cooldown_snapshot_task is not None
+                and not self._cooldown_snapshot_task.done()
+            ),
+        })
         return snapshot
 
     def _publish_window_preparation_state(self) -> None:
@@ -4426,9 +4455,27 @@ class ValidationService:
                         self._windows_since_cooldown_snapshot
                         >= COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS
                     ):
-                        await self._snapshot_cooldown()
-                        await self._snapshot_content_cooldown()
-                        self._windows_since_cooldown_snapshot = 0
+                        task = self._cooldown_snapshot_task
+                        if task is None or task.done():
+                            if task is not None:
+                                # Retrieve any unexpected terminal exception;
+                                # the snapshot helpers themselves are best effort.
+                                try:
+                                    task.result()
+                                except Exception:
+                                    logger.exception(
+                                        "background cooldown snapshot failed"
+                                    )
+                            self._cooldown_snapshot_task = asyncio.create_task(
+                                self._snapshot_cooldowns_background(),
+                                name="cooldown_snapshot",
+                            )
+                            self._windows_since_cooldown_snapshot = 0
+                        else:
+                            logger.warning(
+                                "cooldown snapshot still running; next window "
+                                "will retry scheduling without delaying OPEN"
+                            )
 
                     # set_weights is owned by a concurrent WeightOnlyValidator
                     # task running off the same R2 archives; no need to do it
@@ -4572,6 +4619,16 @@ class ValidationService:
                     self._set_state(WindowState.READY)
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
         finally:
+            cooldown_snapshot_task = self._cooldown_snapshot_task
+            if (
+                cooldown_snapshot_task is not None
+                and not cooldown_snapshot_task.done()
+            ):
+                cooldown_snapshot_task.cancel()
+                await asyncio.gather(
+                    cooldown_snapshot_task, return_exceptions=True
+                )
+            self._cooldown_snapshot_task = None
             # Cancel the archive worker and let it drain in-flight uploads
             # before we tear down the server. The worker survives many
             # window cycles so we shut it down deliberately rather than
@@ -4762,9 +4819,27 @@ class ValidationService:
         if snapshot and snapshot.get("run_id") == TRAINING_RUN_ID:
             try:
                 envs = snapshot.get("envs", {}) or {}
+                if not isinstance(envs, dict):
+                    raise ValueError("cooldown snapshot envs must be an object")
+                snapshot_window = int(
+                    snapshot.get("snapshot_window", current_window)
+                )
+                if snapshot_window < 0 or snapshot_window > current_window:
+                    raise ValueError("cooldown snapshot window is outside history")
                 for env_name, cooldown_map in self._cooldown_per_env.items():
-                    cooldown_map.import_state(envs.get(env_name, {}))
-                snapshot_window = int(snapshot.get("snapshot_window", current_window))
+                    env_state = envs.get(env_name, {})
+                    if not isinstance(env_state, dict):
+                        raise ValueError(
+                            f"cooldown snapshot env {env_name} must be an object"
+                        )
+                    if any(
+                        int(selected_window) > snapshot_window
+                        for selected_window in env_state.values()
+                    ):
+                        raise ValueError(
+                            "cooldown snapshot contains a future selection"
+                        )
+                    cooldown_map.import_state(env_state)
             except Exception:
                 # Corrupt / partially-written / tampered snapshot — must not
                 # crash startup. Discard any partial restore and fall through.
@@ -4774,13 +4849,19 @@ class ValidationService:
                 for cooldown_map in self._cooldown_per_env.values():
                     cooldown_map.import_state({})
             else:
-                gap = max(0, current_window - snapshot_window)
+                self._cooldown_base_snapshot_window = snapshot_window
+                persisted_window = await self._restore_cooldown_deltas(
+                    snapshot_window, current_window
+                )
+                self._cooldown_persisted_window = persisted_window
+                gap = max(0, current_window - persisted_window)
                 if gap > 0:
                     await self._replay_cooldown_gap(current_window, gap)
                 logger.info(
-                    "Restored cooldown from snapshot run=%s snapshot_window=%d "
-                    "gap=%d (current=%d, sizes=%s)",
-                    TRAINING_RUN_ID, snapshot_window, gap, current_window,
+                    "Restored cooldown run=%s base_window=%d "
+                    "persisted_window=%d gap=%d (current=%d, sizes=%s)",
+                    TRAINING_RUN_ID, snapshot_window, persisted_window,
+                    gap, current_window,
                     {n: len(m) for n, m in self._cooldown_per_env.items()},
                 )
                 return
@@ -4798,6 +4879,70 @@ class ValidationService:
         await self._rebuild_cooldown_from_archives(
             current_window, COOLDOWN_REBUILD_LOOKBACK,
         )
+
+    async def _restore_cooldown_deltas(
+        self, base_window: int, current_window: int
+    ) -> int:
+        """Replay contiguous v2 deltas after a durable full snapshot."""
+        if not COOLDOWN_DELTA_SNAPSHOTS_ENABLED:
+            return base_window
+        try:
+            keys = await storage.list_json_keys(
+                _cooldown_delta_prefix(TRAINING_RUN_ID)
+            )
+        except Exception:
+            logger.exception("Failed to list cooldown deltas")
+            return base_window
+        latest = base_window
+        applied_keys: list[str] = []
+        for key in keys:
+            try:
+                delta = await storage.download_json(key)
+                if not delta:
+                    raise ValueError("empty delta")
+                delta_window = int(delta["snapshot_window"])
+                if delta_window <= latest:
+                    # An obsolete object may remain after best-effort cleanup
+                    # of a successfully published full compaction.
+                    continue
+                if (
+                    delta.get("schema_version") != 2
+                    or delta.get("run_id") != TRAINING_RUN_ID
+                    or int(delta.get("from_window_exclusive", -1)) != latest
+                ):
+                    raise ValueError("non-contiguous or incompatible delta")
+                if delta_window > current_window:
+                    break
+                envs = delta.get("envs", {})
+                if not isinstance(envs, dict):
+                    raise ValueError("delta envs must be an object")
+                validated_envs: dict[str, dict] = {}
+                for env_name, cooldown_map in self._cooldown_per_env.items():
+                    env_delta = envs.get(env_name, {})
+                    if not isinstance(env_delta, dict):
+                        raise ValueError(
+                            f"delta env {env_name} must be an object"
+                        )
+                    if any(
+                        not latest < int(selected_window) <= delta_window
+                        for selected_window in env_delta.values()
+                    ):
+                        raise ValueError(
+                            "delta selection falls outside its window bounds"
+                        )
+                    validated_envs[env_name] = env_delta
+                for env_name, cooldown_map in self._cooldown_per_env.items():
+                    cooldown_map.apply_delta(validated_envs[env_name])
+                latest = delta_window
+                applied_keys.append(key)
+            except Exception:
+                logger.exception(
+                    "Cooldown delta replay stopped at key=%s latest=%d",
+                    key, latest,
+                )
+                break
+        self._cooldown_delta_keys = applied_keys
+        return latest
 
     async def _rebuild_cooldown_from_archives(self, current_window: int, n: int) -> None:
         """Rebuild every env's cooldown from scratch from the last ``n`` R2
@@ -4846,34 +4991,91 @@ class ValidationService:
         except Exception:
             logger.exception("Cooldown gap-replay failed; using snapshot only")
 
+    async def _snapshot_cooldowns_background(self) -> None:
+        """Persist both cooldown namespaces without delaying the next OPEN."""
+        await self._snapshot_cooldown()
+        await self._snapshot_content_cooldown()
+
     async def _snapshot_cooldown(self) -> None:
-        """Persist the per-env cooldown maps to R2, keyed by the training run id,
-        so a restart restores the full cooldown without replaying history. Best
-        effort — a snapshot failure must never break the window loop."""
+        """Persist a compact delta or periodic full snapshot, best effort."""
         try:
             window = self._window_n
+            full_snapshot_due = (
+                not COOLDOWN_DELTA_SNAPSHOTS_ENABLED
+                or self._cooldown_base_snapshot_window < 0
+                or window - self._cooldown_base_snapshot_window
+                >= COOLDOWN_COMPACTION_INTERVAL_WINDOWS
+            )
 
-            def _build() -> dict:
-                # Copy can be multi-MB (cooldown never expires) — build it off
-                # the event loop. Safe: the window loop is sequential here, no
-                # concurrent record_batched between seal and the next window.
+            if full_snapshot_due:
+                def _build_full() -> dict:
+                    removed = {
+                        name: cd.compact(window)
+                        for name, cd in self._cooldown_per_env.items()
+                    }
+                    return {
+                        "schema_version": 2,
+                        "run_id": TRAINING_RUN_ID,
+                        "snapshot_window": window,
+                        "compacted_entries": removed,
+                        "envs": {
+                            name: cd.export_state(through_window=window)
+                            for name, cd in self._cooldown_per_env.items()
+                        },
+                    }
+
+                snapshot = await asyncio.to_thread(_build_full)
+                uploaded = await storage.upload_json(
+                    _cooldown_snapshot_key(TRAINING_RUN_ID), snapshot
+                )
+                if not uploaded:
+                    return
+                old_delta_keys = list(self._cooldown_delta_keys)
+                self._cooldown_base_snapshot_window = window
+                self._cooldown_persisted_window = window
+                self._cooldown_delta_keys = []
+                if old_delta_keys:
+                    try:
+                        await storage.delete_keys(old_delta_keys)
+                    except Exception:
+                        logger.exception(
+                            "Full cooldown snapshot is durable, but old delta "
+                            "cleanup failed"
+                        )
+                logger.info(
+                    "Compacted cooldown run=%s window=%d (sizes=%s)",
+                    TRAINING_RUN_ID, window,
+                    {n: len(m) for n, m in self._cooldown_per_env.items()},
+                )
+                return
+
+            after_window = max(
+                self._cooldown_base_snapshot_window,
+                self._cooldown_persisted_window,
+            )
+
+            def _build_delta() -> dict:
                 return {
+                    "schema_version": 2,
                     "run_id": TRAINING_RUN_ID,
+                    "from_window_exclusive": after_window,
                     "snapshot_window": window,
                     "envs": {
-                        name: cd.export_state()
+                        name: cd.export_delta(after_window, window)
                         for name, cd in self._cooldown_per_env.items()
                     },
                 }
 
-            snapshot = await asyncio.to_thread(_build)
-            if await storage.upload_json(
-                _cooldown_snapshot_key(TRAINING_RUN_ID), snapshot
-            ):
+            delta = await asyncio.to_thread(_build_delta)
+            key = _cooldown_delta_key(TRAINING_RUN_ID, window)
+            if await storage.upload_json(key, delta):
+                self._cooldown_persisted_window = window
+                self._cooldown_delta_keys.append(key)
                 logger.info(
-                    "Snapshotted cooldown run=%s window=%d (sizes=%s)",
-                    TRAINING_RUN_ID, self._window_n,
-                    {n: len(m) for n, m in self._cooldown_per_env.items()},
+                    "Snapshotted cooldown delta run=%s from=%d through=%d "
+                    "(sizes=%s)",
+                    TRAINING_RUN_ID, after_window, window,
+                    {name: len(entries) for name, entries in delta["envs"].items()},
                 )
         except Exception:
             logger.exception("Cooldown snapshot failed (non-fatal)")
@@ -5023,7 +5225,7 @@ class ValidationService:
                 "snapshot_window": window,
                 "complete": True,
                 "envs": {
-                    name: content_map.export_state()
+                    name: content_map.export_state(through_window=window)
                     for name, content_map in self._content_cooldown_per_env.items()
                 },
             }

@@ -305,7 +305,12 @@ def mine(
         from reliquary.environment import load_environments
         from reliquary.infrastructure.chain import get_subtensor, get_metagraph, NETUID
         from reliquary.miner.engine import MiningEngine
-        from reliquary.miner.submitter import discover_validator_url, get_window_state_v2
+        from reliquary.miner.submitter import (
+            EndpointNotFoundError,
+            discover_validator_url,
+            get_miner_state_v1,
+            get_window_state_v2,
+        )
         from reliquary.shared.modeling import (
             MODEL_SNAPSHOT_ALLOW_PATTERNS,
             load_text_generation_model,
@@ -320,6 +325,8 @@ def mine(
 
         # --- Resolve initial checkpoint from validator if available ---
         initial_path = checkpoint  # fallback to --checkpoint arg
+        initial_checkpoint_n = 0
+        initial_checkpoint_hash = ""
         try:
             if validator_url:
                 url = validator_url
@@ -330,7 +337,16 @@ def mine(
             import httpx
             from huggingface_hub import snapshot_download
             async with httpx.AsyncClient(timeout=30) as client:
-                state = await get_window_state_v2(url, client=client)
+                try:
+                    state, _etag = await get_miner_state_v1(
+                        url, client=client
+                    )
+                    if state is None:
+                        raise RuntimeError(
+                            "unexpected 304 during initial state fetch"
+                        )
+                except EndpointNotFoundError:
+                    state = await get_window_state_v2(url, client=client)
             if state.checkpoint_repo_id and state.checkpoint_revision:
                 logger.info(
                     "Validator at %s is on checkpoint %d (%s@%s). "
@@ -338,11 +354,14 @@ def mine(
                     url, state.checkpoint_n, state.checkpoint_repo_id,
                     state.checkpoint_revision[:12],
                 )
-                initial_path = snapshot_download(
+                initial_path = await asyncio.to_thread(
+                    snapshot_download,
                     repo_id=state.checkpoint_repo_id,
                     revision=state.checkpoint_revision,
                     allow_patterns=MODEL_SNAPSHOT_ALLOW_PATTERNS,
                 )
+                initial_checkpoint_n = state.checkpoint_n
+                initial_checkpoint_hash = state.checkpoint_revision
                 logger.info("Using initial checkpoint path: %s", initial_path)
             else:
                 logger.info(
@@ -394,12 +413,12 @@ def mine(
             mix=mix,
             proof_gpu=0 if proof_device == "cuda:0" else 1,
             validator_url_override=validator_url or None,
+            initial_checkpoint_n=initial_checkpoint_n,
+            initial_checkpoint_hash=initial_checkpoint_hash,
+            initial_checkpoint_path=(
+                initial_path if initial_checkpoint_hash else None
+            ),
         )
-
-        # Seed engine's _loaded_checkpoint_path so the first
-        # maybe_pull_checkpoint sees we're already synced (skips redundant reload).
-        if initial_path != checkpoint:
-            engine._loaded_checkpoint_path = initial_path
 
         logger.info("Miner ready. Entering main loop.")
         try:

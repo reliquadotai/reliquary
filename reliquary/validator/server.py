@@ -18,8 +18,10 @@ from __future__ import annotations
 import asyncio
 import collections
 import functools
+import gzip
 import hashlib
 import importlib.metadata
+import json
 import logging
 import multiprocessing
 import os
@@ -87,6 +89,7 @@ from reliquary.constants import (
     PROTOCOL_GENERATION_CONTRACT,
     PROTOCOL_PROFILE_ID,
     PROTOCOL_VERSION,
+    PROMPT_RANGE_SIZE,
     max_new_tokens_for_environment,
     max_truncated_for_environment,
 )
@@ -104,13 +107,17 @@ from reliquary.protocol.submission import (
     BatchSubmissionResponse,
     CommitModel,
     GrpoBatchState,
+    MinerEnvironmentState,
+    MinerState,
     RejectReason,
     RuntimeContract,
     RuntimeFingerprint,
     SubmissionPrecommitRequest,
     SubmissionPrecommitResponse,
     Verdict,
+    VerdictsPage,
     VerdictsResponse,
+    encode_cooldown_bitmap,
 )
 from reliquary.protocol.tokens import verify_tokens
 from reliquary.shared.hf_compat import (
@@ -123,6 +130,7 @@ from reliquary.shared.modeling import (
     think_close_token_ids,
 )
 from reliquary.shared.runtime_fingerprint import collect_runtime_fingerprint
+from reliquary.shared.prompt_range import window_prompt_range
 from reliquary.validator.admission import (
     AdmissionContext,
     AdmissionReceiptBinding,
@@ -203,6 +211,48 @@ class _QueuedAuctionSubmission:
 VERDICT_CAP_PER_HOTKEY = 200
 
 
+def _batcher_cooldown_prompts(batcher: Any) -> set[int] | frozenset[int] | list[int]:
+    """Return the O(1) snapshot, with compatibility for embedded batchers.
+
+    Older integrations and lightweight test doubles only expose the legacy
+    sorted list.  Production batchers always expose the immutable membership
+    set, so the admission hot path remains constant-time without making the
+    server brittle during a rolling upgrade.
+    """
+    membership = getattr(batcher, "cooldown_prompts_membership", None)
+    if isinstance(membership, (set, frozenset)):
+        return membership
+    snapshot = getattr(batcher, "cooldown_prompts_snapshot", None)
+    if isinstance(snapshot, list):
+        return snapshot
+    return []
+
+
+@dataclass(frozen=True)
+class _CachedHttpResponse:
+    """Pre-serialized control-plane response and its compressed variant."""
+
+    body: bytes
+    gzip_body: bytes
+    etag: str
+
+
+_NO_ACTIVE_WINDOW_BODY = b'{"detail":"no_active_window"}'
+_LIVE_BODY = b'{"status":"ok"}'
+_READINESS_EVENT_LOOP_P99_MS = float(
+    os.environ.get("RELIQUARY_READINESS_EVENT_LOOP_P99_MS", "1000")
+)
+_READINESS_ENDPOINT_P99_MS = float(
+    os.environ.get("RELIQUARY_READINESS_ENDPOINT_P99_MS", "2000")
+)
+_READINESS_ARCHIVE_QUEUE_DEPTH = int(
+    os.environ.get("RELIQUARY_READINESS_ARCHIVE_QUEUE_DEPTH", "50")
+)
+_READINESS_ARCHIVE_OLDEST_SECONDS = float(
+    os.environ.get("RELIQUARY_READINESS_ARCHIVE_OLDEST_SECONDS", "900")
+)
+
+
 def _chain_client_fingerprint() -> dict[str, str | None]:
     """Return the chain codec versions that determine SCALE compatibility."""
     versions: dict[str, str | None] = {}
@@ -253,7 +303,7 @@ def _protocol_contract_reject_reason(
 
 
 class _StateFastPathMiddleware:
-    """Answer cached ``GET /state`` polls before the FastAPI stack runs.
+    """Answer cached control-plane GETs before the FastAPI stack runs.
 
     The 2026-08-01 py-spy profile of the live v3 validator showed the event
     loop ~90% busy on PER-REQUEST framework machinery (routing dispatch,
@@ -274,35 +324,130 @@ class _StateFastPathMiddleware:
     async def __call__(
         self, scope: dict[str, Any], receive: Any, send: Any
     ) -> None:
+        path = scope.get("path")
         if (
             scope.get("type") != "http"
-            or scope.get("path") != "/state"
+            or path not in {"/state", "/miner-state", "/health", "/livez", "/readyz"}
             or scope.get("method") != "GET"
         ):
             await self.app(scope, receive, send)
             return
+
+        request_headers = {
+            key.lower(): value
+            for key, value in scope.get("headers", [])
+        }
+        accept_encoding = request_headers.get(b"accept-encoding", b"").lower()
+        if_none_match = request_headers.get(b"if-none-match", b"").decode(
+            "latin-1"
+        )
+        started = time.perf_counter()
+
+        async def send_cached(
+            cached: _CachedHttpResponse | bytes,
+            *,
+            status: int = 200,
+            cache_control: bytes = b"private, no-cache",
+            retry_after: bytes | None = None,
+        ) -> None:
+            if isinstance(cached, bytes):
+                cached = self._server._make_cached_response(cached)
+            headers = [
+                (b"content-type", b"application/json"),
+                (b"cache-control", cache_control),
+                (b"etag", cached.etag.encode("ascii")),
+                (b"vary", b"Accept-Encoding"),
+            ]
+            if retry_after is not None:
+                headers.append((b"retry-after", retry_after))
+            if status == 200 and if_none_match == cached.etag:
+                await send({
+                    "type": "http.response.start",
+                    "status": 304,
+                    "headers": headers,
+                })
+                await send({"type": "http.response.body", "body": b""})
+                self._server._record_control_plane_request(
+                    path, cache_hit=True, not_modified=True,
+                    response_bytes=0,
+                )
+                return
+            use_gzip = b"gzip" in accept_encoding and len(cached.gzip_body) < len(cached.body)
+            body = cached.gzip_body if use_gzip else cached.body
+            if use_gzip:
+                headers.append((b"content-encoding", b"gzip"))
+            headers.append((b"content-length", str(len(body)).encode("ascii")))
+            await send({
+                "type": "http.response.start",
+                "status": status,
+                "headers": headers,
+            })
+            await send({"type": "http.response.body", "body": body})
+            self._server._record_control_plane_request(
+                path, cache_hit=True, not_modified=False,
+                response_bytes=len(body),
+            )
+
+        if path == "/livez":
+            await send_cached(
+                self._server._live_response,
+                cache_control=b"no-store",
+            )
+            return
+
+        if path == "/readyz":
+            readiness = self._server._cached_readiness_response()
+            if readiness is None:
+                self._server._record_control_plane_request(path, cache_hit=False)
+                await self.app(scope, receive, send)
+                return
+            status, cached = readiness
+            await send_cached(cached, status=status, cache_control=b"no-store")
+            return
+
+        if path == "/health":
+            cached = self._server._health_response_cache
+            if cached is None:
+                self._server._record_control_plane_request(path, cache_hit=False)
+                await self.app(scope, receive, send)
+                return
+            await send_cached(cached)
+            return
+
+        if not self._server._active_batchers:
+            await send_cached(
+                self._server._no_active_window_response,
+                status=503,
+                cache_control=b"no-store",
+                retry_after=b"1",
+            )
+            return
+
         env: str | None = None
         query = scope.get("query_string") or b""
-        if query:
-            values = urllib.parse.parse_qs(query.decode("latin-1")).get("env")
+        if path == "/state" and query:
+            values = [
+                value for key, value in urllib.parse.parse_qsl(
+                    query.decode("latin-1"), keep_blank_values=True
+                )
+                if key == "env"
+            ]
             if values:
-                env = values[0]
-        started = time.perf_counter()
-        body = self._server._cached_state_response(env)
-        if body is None:
+                # Match FastAPI's scalar-query behavior: the last repeated
+                # value wins, and a blank value remains an explicit env="".
+                env = values[-1]
+        cached = (
+            self._server._cached_state_response(env)
+            if path == "/state"
+            else self._server._cached_miner_state_response()
+        )
+        if cached is None:
+            self._server._record_control_plane_request(path, cache_hit=False)
             await self.app(scope, receive, send)
             return
-        await send({
-            "type": "http.response.start",
-            "status": 200,
-            "headers": [
-                (b"content-type", b"application/json"),
-                (b"content-length", str(len(body)).encode("ascii")),
-            ],
-        })
-        await send({"type": "http.response.body", "body": body})
-        # Keep /health's endpoint-latency observability honest on hits too.
-        self._server._endpoint_latency_samples_ms["/state"].append(
+        await send_cached(cached)
+        # Keep diagnostic endpoint-latency observability honest on hits too.
+        self._server._endpoint_latency_samples_ms[path].append(
             max(0.0, (time.perf_counter() - started) * 1000.0)
         )
 
@@ -907,6 +1052,8 @@ def _proof_free_submission_reject(
 
 class _Health(BaseModel):
     status: str
+    ready: bool = True
+    readiness_reasons: list[str] = Field(default_factory=list)
     active_window: int | None
     image_revision: str | None = None
     protocol_version: int = PROTOCOL_VERSION
@@ -964,6 +1111,7 @@ class _Health(BaseModel):
     endpoint_latency_ms: dict[str, dict[str, float | None]] = Field(
         default_factory=dict
     )
+    control_plane: dict[str, Any] = Field(default_factory=dict)
     admission_latency_ms_by_environment: dict[
         str, dict[str, dict[str, float | None]]
     ] = Field(default_factory=dict)
@@ -1134,7 +1282,38 @@ class ValidatorServer:
         # starved the proof worker's Python sections of the GIL. The key holds
         # everything that can change the payload, so a hit is byte-identical
         # to a rebuild and staleness is structurally zero.
-        self._state_response_cache: dict[str, tuple[tuple, bytes]] = {}
+        self._state_response_cache: dict[
+            str, tuple[tuple, _CachedHttpResponse]
+        ] = {}
+        self._state_response_build_locks: dict[str, asyncio.Lock] = (
+            collections.defaultdict(asyncio.Lock)
+        )
+        self._miner_state_response_cache: (
+            tuple[tuple, _CachedHttpResponse] | None
+        ) = None
+        self._health_response_cache: _CachedHttpResponse | None = None
+        self._readiness_response_cache: (
+            tuple[int, _CachedHttpResponse] | None
+        ) = None
+        self._live_response = self._make_cached_response(_LIVE_BODY)
+        self._no_active_window_response = self._make_cached_response(
+            _NO_ACTIVE_WINDOW_BODY
+        )
+        self._control_plane_requests: collections.Counter[str] = (
+            collections.Counter()
+        )
+        self._control_plane_cache_hits: collections.Counter[str] = (
+            collections.Counter()
+        )
+        self._control_plane_not_modified: collections.Counter[str] = (
+            collections.Counter()
+        )
+        self._control_plane_response_bytes: collections.Counter[str] = (
+            collections.Counter()
+        )
+        self._control_plane_request_times: dict[
+            str, collections.deque[float]
+        ] = collections.defaultdict(lambda: collections.deque(maxlen=100_000))
         self._registration_gate_enforced = False
         self._registered_hotkeys: frozenset[str] | None = None
         self._operator_by_hotkey: dict[str, str] = {}
@@ -1257,6 +1436,7 @@ class ValidatorServer:
         )
         self._event_loop_monitor_task: asyncio.Task[None] | None = None
         self._process_health_monitor_task: asyncio.Task[None] | None = None
+        self._health_snapshot_monitor_task: asyncio.Task[None] | None = None
         self._process_health_snapshot: dict[str, Any] = {
             "status": "pending",
             "collected_at": None,
@@ -1283,7 +1463,104 @@ class ValidatorServer:
         # asyncio is single-threaded so no lock is needed — every mutation
         # site runs on the event loop.
         self._verdicts: dict[str, collections.deque[dict]] = {}
+        self._verdict_sequence_by_hotkey: collections.Counter[str] = (
+            collections.Counter()
+        )
         self._recent_reject_counts: collections.Counter[str] = collections.Counter()
+
+    @staticmethod
+    def _make_cached_response(body: bytes) -> _CachedHttpResponse:
+        return _CachedHttpResponse(
+            body=body,
+            gzip_body=gzip.compress(body, compresslevel=1),
+            etag=f'"{hashlib.sha256(body).hexdigest()}"',
+        )
+
+    @staticmethod
+    def _make_legacy_state_response(
+        fields: dict[str, Any],
+        exclude_fields: set[str] | None,
+    ) -> _CachedHttpResponse:
+        """Validate, serialize, hash, and compress legacy state off-loop."""
+        body = GrpoBatchState(**fields).model_dump_json(
+            exclude=exclude_fields,
+        ).encode("utf-8")
+        return ValidatorServer._make_cached_response(body)
+
+    def _record_control_plane_request(
+        self,
+        path: str,
+        *,
+        cache_hit: bool,
+        not_modified: bool = False,
+        response_bytes: int = 0,
+    ) -> None:
+        now = time.monotonic()
+        self._control_plane_requests[path] += 1
+        self._control_plane_request_times[path].append(now)
+        if cache_hit:
+            self._control_plane_cache_hits[path] += 1
+        if not_modified:
+            self._control_plane_not_modified[path] += 1
+        self._control_plane_response_bytes[path] += max(0, int(response_bytes))
+
+    def _control_plane_health(self) -> dict[str, Any]:
+        now = time.monotonic()
+        request_rates: dict[str, int] = {}
+        for path, samples in self._control_plane_request_times.items():
+            while samples and now - samples[0] > 60.0:
+                samples.popleft()
+            request_rates[path] = len(samples)
+        miner_cached = (
+            self._miner_state_response_cache[1]
+            if self._miner_state_response_cache is not None
+            else None
+        )
+        return {
+            "state_fastpath_enabled": os.environ.get(
+                "RELIQUARY_STATE_FASTPATH", "1"
+            ) not in ("0", "false", "False"),
+            "miner_state_schema_version": 1,
+            "miner_state_cached": miner_cached is not None,
+            "miner_state_payload_bytes": (
+                len(miner_cached.body) if miner_cached is not None else None
+            ),
+            "miner_state_gzip_bytes": (
+                len(miner_cached.gzip_body) if miner_cached is not None else None
+            ),
+            "requests_total": dict(self._control_plane_requests),
+            "requests_last_60s": request_rates,
+            "cache_hits_total": dict(self._control_plane_cache_hits),
+            "not_modified_total": dict(self._control_plane_not_modified),
+            "response_bytes_total": dict(self._control_plane_response_bytes),
+        }
+
+    def _cache_health_payload(self, payload: "_Health") -> None:
+        self._health_response_cache = self._make_cached_response(
+            payload.model_dump_json().encode("utf-8")
+        )
+        ready = payload.ready
+        readiness_body = (
+            b'{"status":"ready"}'
+            if ready
+            else json.dumps(
+                {
+                    "status": "not_ready",
+                    "health_status": payload.status,
+                    "reasons": payload.readiness_reasons,
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        self._readiness_response_cache = (
+            200 if ready else 503,
+            self._make_cached_response(readiness_body),
+        )
+
+    def _cached_readiness_response(
+        self,
+    ) -> tuple[int, _CachedHttpResponse] | None:
+        return self._readiness_response_cache
 
     def _state_cache_key(self, batcher) -> tuple:
         """Everything the /state payload depends on, for one batcher."""
@@ -1299,10 +1576,14 @@ class ValidatorServer:
             self._current_state,
             submission_count,
             cp.checkpoint_n if cp else -1,
+            cp.repo_id if cp else None,
             cp.revision if cp else None,
+            batcher.randomness,
         )
 
-    def _cached_state_response(self, env: str | None) -> bytes | None:
+    def _cached_state_response(
+        self, env: str | None
+    ) -> _CachedHttpResponse | None:
         """Cached /state bytes for ``env`` if still valid, else None.
 
         Called from the ASGI fast path, outside the FastAPI stack — must stay
@@ -1319,6 +1600,36 @@ class ValidatorServer:
                 return None
             cached = self._state_response_cache.get(env or "")
             if cached is None or cached[0] != self._state_cache_key(batcher):
+                return None
+            return cached[1]
+        except Exception:
+            return None
+
+    def _miner_state_cache_key(self) -> tuple:
+        cp = self._current_checkpoint
+        return (
+            self._current_state,
+            tuple(
+                (
+                    env_name,
+                    id(batcher),
+                    batcher.window_start,
+                    batcher.randomness,
+                    batcher.prompt_range,
+                )
+                for env_name, batcher in self._active_batchers.items()
+            ),
+            cp.checkpoint_n if cp else -1,
+            cp.repo_id if cp else None,
+            cp.revision if cp else None,
+            PROTOCOL_VERSION,
+            PROTOCOL_PROFILE_ID,
+        )
+
+    def _cached_miner_state_response(self) -> _CachedHttpResponse | None:
+        try:
+            cached = self._miner_state_response_cache
+            if cached is None or cached[0] != self._miner_state_cache_key():
                 return None
             return cached[1]
         except Exception:
@@ -2031,9 +2342,9 @@ class ValidatorServer:
             reward, and deferred-proof outcome fields
 
         The verdict is stored in a per-hotkey ring buffer
-        (``VERDICT_CAP_PER_HOTKEY`` entries). Older verdicts roll off
-        silently. Read-side: ``GET /verdicts/{hotkey}`` filters by hotkey
-        and (optionally) by a ``since`` unix timestamp.
+        (``VERDICT_CAP_PER_HOTKEY`` entries). The cursor endpoint reports
+        rollover explicitly; the legacy read-side ``GET /verdicts/{hotkey}``
+        filters by hotkey and (optionally) by a ``since`` unix timestamp.
         """
         if hotkey not in self._verdicts:
             self._verdicts[hotkey] = collections.deque(maxlen=VERDICT_CAP_PER_HOTKEY)
@@ -2068,6 +2379,8 @@ class ValidatorServer:
             entry["rewarded"] = rewarded
         if sigma is not None:
             entry["sigma"] = float(sigma)
+        self._verdict_sequence_by_hotkey[hotkey] += 1
+        entry["_sequence"] = self._verdict_sequence_by_hotkey[hotkey]
         self._verdicts[hotkey].append(entry)
 
     def _current_drand_round_best_effort(self) -> int | None:
@@ -2075,8 +2388,10 @@ class ValidatorServer:
         ci = getattr(batcher, "_drand_chain_info", None) if batcher else None
         try:
             if ci is None:
-                from reliquary.infrastructure.drand import get_current_chain
-                ci = get_current_chain()
+                # Health must be observational and local-only. Relay discovery
+                # can perform synchronous network I/O and previously made the
+                # health probe itself block the validator event loop.
+                return None
             from reliquary.infrastructure.chain import compute_current_drand_round
             return int(compute_current_drand_round(
                 time.time(), ci["genesis_time"], ci["period"],
@@ -2405,6 +2720,65 @@ class ValidatorServer:
                     rejection_snapshot.get("grader_failures", {})
                 ).items()
             }
+        event_loop_lag = self._latency_summary(
+            self._event_loop_lag_samples_ms
+        )
+        endpoint_latency = {
+            path: self._latency_summary(samples)
+            for path, samples in self._endpoint_latency_samples_ms.items()
+            if path in {
+                "/health",
+                "/state",
+                "/miner-state",
+                "/submit/precommit",
+                "/submit",
+            }
+        }
+        control_plane = self._control_plane_health()
+        event_loop_p99 = event_loop_lag.get("p99")
+        endpoint_p99_degraded = any(
+            isinstance(summary.get("p99"), numbers.Real)
+            and summary["p99"] > _READINESS_ENDPOINT_P99_MS
+            for summary in endpoint_latency.values()
+        )
+        archive_depth = archive_queue.get("depth")
+        archive_oldest_age = archive_queue.get("oldest_age_seconds")
+        archive_degraded = (
+            isinstance(archive_depth, numbers.Integral)
+            and archive_depth > _READINESS_ARCHIVE_QUEUE_DEPTH
+        ) or (
+            isinstance(archive_oldest_age, numbers.Real)
+            and archive_oldest_age > _READINESS_ARCHIVE_OLDEST_SECONDS
+        )
+        readiness_reasons: list[str] = []
+        if any(
+            source.get("status") == "degraded"
+            for source in prompt_sources.values()
+        ):
+            readiness_reasons.append("prompt_source_degraded")
+        if (
+            self._registration_gate_enforced
+            and registration_cache_usable is not True
+        ):
+            readiness_reasons.append("registration_cache_unusable")
+        if content_cooldown.get("complete") is False:
+            readiness_reasons.append("content_cooldown_incomplete")
+        if (
+            proof_scheduler.get("required") is True
+            and proof_scheduler.get("state") != "running"
+        ):
+            readiness_reasons.append("proof_scheduler_unavailable")
+        if self._process_health_snapshot.get("status") == "critical":
+            readiness_reasons.append("process_health_critical")
+        if (
+            isinstance(event_loop_p99, numbers.Real)
+            and event_loop_p99 > _READINESS_EVENT_LOOP_P99_MS
+        ):
+            readiness_reasons.append("event_loop_lag")
+        if endpoint_p99_degraded:
+            readiness_reasons.append("endpoint_latency")
+        if archive_degraded:
+            readiness_reasons.append("archive_backlog")
         health_status = (
             "degraded"
             if (
@@ -2437,11 +2811,19 @@ class ValidatorServer:
                 or no_reveal_circuit.get("status") == "degraded"
                 or self._process_health_snapshot.get("status")
                 in {"warning", "critical"}
+                or (
+                    isinstance(event_loop_p99, numbers.Real)
+                    and event_loop_p99 > _READINESS_EVENT_LOOP_P99_MS
+                )
+                or endpoint_p99_degraded
+                or archive_degraded
             )
             else "ok"
         )
         return _Health(
             status=health_status,
+            ready=not readiness_reasons,
+            readiness_reasons=readiness_reasons,
             active_window=batcher.window_start if batcher else None,
             image_revision=self._image_revision,
             protocol_version=PROTOCOL_VERSION,
@@ -2542,14 +2924,9 @@ class ValidatorServer:
             proof_verification_inflight_by_environment=(
                 self.proof_verification_inflight_by_environment
             ),
-            event_loop_lag_ms=self._latency_summary(
-                self._event_loop_lag_samples_ms
-            ),
-            endpoint_latency_ms={
-                path: self._latency_summary(samples)
-                for path, samples in self._endpoint_latency_samples_ms.items()
-                if path in {"/health", "/state", "/submit/precommit", "/submit"}
-            },
+            event_loop_lag_ms=event_loop_lag,
+            endpoint_latency_ms=endpoint_latency,
+            control_plane=control_plane,
             admission_latency_ms_by_environment={
                 env_name: {
                     metric: self._latency_summary(samples)
@@ -3616,6 +3993,8 @@ class ValidatorServer:
                 if path in {
                     "/health",
                     "/state",
+                    "/miner-state",
+                    "/readyz",
                     "/submit/precommit",
                     "/submit",
                 }:
@@ -3633,7 +4012,32 @@ class ValidatorServer:
 
         @app.get("/health", response_model=_Health)
         async def health() -> _Health:
-            return self._health_payload()
+            payload = self._health_payload()
+            self._cache_health_payload(payload)
+            return payload
+
+        @app.get("/livez")
+        async def livez() -> Response:
+            """Process liveness only; constant-time and dependency-free."""
+            return Response(
+                content=self._live_response.body,
+                media_type="application/json",
+                headers={"Cache-Control": "no-store"},
+            )
+
+        @app.get("/readyz")
+        async def readyz() -> Response:
+            """Traffic readiness derived from the cached diagnostic snapshot."""
+            if self._readiness_response_cache is None:
+                self._cache_health_payload(self._health_payload())
+            assert self._readiness_response_cache is not None
+            status, cached = self._readiness_response_cache
+            return Response(
+                content=cached.body,
+                status_code=status,
+                media_type="application/json",
+                headers={"Cache-Control": "no-store"},
+            )
 
         @app.post(
             "/submit/precommit",
@@ -3787,7 +4191,7 @@ class ValidatorServer:
                 lo, hi = prompt_range
                 if not (lo <= request.prompt_idx < hi):
                     return reject(RejectReason.PROMPT_OUT_OF_RANGE)
-            if request.prompt_idx in batcher.cooldown_prompts_snapshot:
+            if request.prompt_idx in _batcher_cooldown_prompts(batcher):
                 return reject(RejectReason.PROMPT_IN_COOLDOWN)
             try:
                 environment_size = await asyncio.to_thread(len, batcher.env)
@@ -4749,7 +5153,7 @@ class ValidatorServer:
                         RejectReason.PROMPT_OUT_OF_RANGE,
                         reject_stage="prompt_range",
                     )
-            if request.prompt_idx in batcher.cooldown_prompts_snapshot:
+            if request.prompt_idx in _batcher_cooldown_prompts(batcher):
                 return _cheap_reject(
                     RejectReason.PROMPT_IN_COOLDOWN,
                     reject_stage="cooldown",
@@ -5003,12 +5407,6 @@ class ValidatorServer:
                 batcher = self.active_batcher
                 if batcher is None:
                     raise HTTPException(status_code=503, detail="no_active_window")
-            cp = self._current_checkpoint
-            submission_count = (
-                getattr(batcher, "pending_count", batcher.valid_count)
-                if getattr(batcher, "difficulty_auction_enabled", False)
-                else batcher.valid_count
-            )
             # Serialized-bytes cache: everything the payload depends on is in
             # the key, so a hit is byte-identical to a rebuild. ``id(batcher)``
             # covers a same-window batcher swap (fresh cooldown snapshot).
@@ -5016,18 +5414,163 @@ class ValidatorServer:
             # the FastAPI stack; this in-handler check only serves requests
             # that raced a cache fill.
             cache_slot = env or ""
-            cache_key = self._state_cache_key(batcher)
-            cached = self._state_response_cache.get(cache_slot)
+            async with self._state_response_build_locks[cache_slot]:
+                current_batcher = (
+                    self._active_batchers.get(env)
+                    if env is not None
+                    else self.active_batcher
+                )
+                if current_batcher is not batcher:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="window_changed_during_state_build",
+                        headers={"Retry-After": "1"},
+                    )
+                # A concurrent request may have filled the cache while this
+                # request awaited the per-slot build lock.
+                cp = self._current_checkpoint
+                cache_key = self._state_cache_key(batcher)
+                cached = self._state_response_cache.get(cache_slot)
+                if cached is not None and cached[0] == cache_key:
+                    cached_response = cached[1]
+                else:
+                    submission_count = (
+                        getattr(batcher, "pending_count", batcher.valid_count)
+                        if getattr(batcher, "difficulty_auction_enabled", False)
+                        else batcher.valid_count
+                    )
+                    fields = {
+                        "state": self._current_state,
+                        "window_n": batcher.window_start,
+                        "anchor_block": batcher.window_start,
+                        "cooldown_prompts": batcher.cooldown_prompts_snapshot,
+                        "valid_submissions": submission_count,
+                        "checkpoint_n": cp.checkpoint_n if cp else 0,
+                        "checkpoint_repo_id": cp.repo_id if cp else None,
+                        "checkpoint_revision": cp.revision if cp else None,
+                        "protocol_version": (
+                            PROTOCOL_VERSION if PROTOCOL_VERSION >= 3 else None
+                        ),
+                        "generation_profile_id": (
+                            PROTOCOL_PROFILE_ID if PROTOCOL_VERSION >= 3 else None
+                        ),
+                        "generation_contract": (
+                            dict(PROTOCOL_GENERATION_CONTRACT)
+                            if PROTOCOL_VERSION >= 3
+                            else None
+                        ),
+                        "randomness": batcher.randomness,
+                    }
+                    exclude_fields = (
+                        {
+                            "protocol_version",
+                            "generation_profile_id",
+                            "generation_contract",
+                        }
+                        if PROTOCOL_VERSION < 3
+                        else None
+                    )
+                    cached_response = await asyncio.to_thread(
+                        self._make_legacy_state_response,
+                        fields,
+                        exclude_fields,
+                    )
+                    current_batcher = (
+                        self._active_batchers.get(env)
+                        if env is not None
+                        else self.active_batcher
+                    )
+                    latest_key = self._state_cache_key(batcher)
+                    # valid_submissions (tuple slot 3) may advance while a
+                    # large legacy list serializes; serving that count once is
+                    # harmless and the next poll rebuilds. Window/state/
+                    # checkpoint/randomness changes must fail closed.
+                    identity_changed = (
+                        latest_key[:3] + latest_key[4:]
+                        != cache_key[:3] + cache_key[4:]
+                    )
+                    if current_batcher is not batcher or identity_changed:
+                        raise HTTPException(
+                            status_code=503,
+                            detail="window_changed_during_state_build",
+                            headers={"Retry-After": "1"},
+                        )
+                    self._state_response_cache[cache_slot] = (
+                        cache_key, cached_response
+                    )
+            return Response(
+                content=cached_response.body,
+                media_type="application/json",
+                headers={
+                    "Cache-Control": "private, no-cache",
+                    "ETag": cached_response.etag,
+                    "Vary": "Accept-Encoding",
+                },
+            )
+
+        @app.get("/miner-state", response_model=MinerState)
+        async def miner_state() -> Response:
+            """Bounded state for miners, carrying every environment once.
+
+            Legacy ``/state`` remains untouched for rolling compatibility.
+            This endpoint sends only each environment's deterministic active
+            prompt slice as a bitset, bounding the cooldown wire cost by
+            ``PROMPT_RANGE_SIZE`` rather than the training run's history.
+            """
+            if not self._active_batchers:
+                raise HTTPException(
+                    status_code=503,
+                    detail="no_active_window",
+                    headers={"Retry-After": "1"},
+                )
+            cache_key = self._miner_state_cache_key()
+            cached = self._miner_state_response_cache
             if cached is not None and cached[0] == cache_key:
                 return Response(
-                    content=cached[1], media_type="application/json"
+                    content=cached[1].body,
+                    media_type="application/json",
+                    headers={
+                        "Cache-Control": "private, no-cache",
+                        "ETag": cached[1].etag,
+                        "Vary": "Accept-Encoding",
+                    },
                 )
-            payload = GrpoBatchState(
+            environments: dict[str, MinerEnvironmentState] = {}
+            for env_name, batcher in self._active_batchers.items():
+                prompt_range = batcher.prompt_range
+                if prompt_range is None and batcher.randomness:
+                    prompt_range = window_prompt_range(
+                        batcher.randomness,
+                        getattr(batcher.env, "name", env_name),
+                        len(batcher.env),
+                        PROMPT_RANGE_SIZE,
+                    )
+                if prompt_range is None:
+                    # Randomness is populated immediately after OPEN. Until
+                    # then miners already wait on the empty randomness field;
+                    # an empty slice keeps the interim response bounded.
+                    prompt_range = (0, 0)
+                bitmap, cooldown_count = encode_cooldown_bitmap(
+                    _batcher_cooldown_prompts(batcher),
+                    prompt_range,
+                )
+                environments[env_name] = MinerEnvironmentState(
+                    prompt_range=prompt_range,
+                    cooldown_bitmap=bitmap,
+                    cooldown_count=cooldown_count,
+                )
+            first_batcher = next(iter(self._active_batchers.values()))
+            cp = self._current_checkpoint
+            payload = MinerState(
                 state=self._current_state,
-                window_n=batcher.window_start,
-                anchor_block=batcher.window_start,
-                cooldown_prompts=batcher.cooldown_prompts_snapshot,
-                valid_submissions=submission_count,
+                window_n=first_batcher.window_start,
+                anchor_block=first_batcher.window_start,
+                window_opened_at=first_batcher.window_opened_wall_ts,
+                submission_deadline_at=(
+                    first_batcher.window_opened_wall_ts
+                    + WINDOW_COLLECTION_SECONDS
+                ),
+                environments=environments,
                 checkpoint_n=cp.checkpoint_n if cp else 0,
                 checkpoint_repo_id=cp.repo_id if cp else None,
                 checkpoint_revision=cp.revision if cp else None,
@@ -5042,21 +5585,24 @@ class ValidatorServer:
                     if PROTOCOL_VERSION >= 3
                     else None
                 ),
-                randomness=batcher.randomness,
+                randomness=first_batcher.randomness,
             )
-            body = payload.model_dump_json(
-                exclude=(
-                    {
-                        "protocol_version",
-                        "generation_profile_id",
-                        "generation_contract",
-                    }
-                    if PROTOCOL_VERSION < 3
-                    else None
-                ),
-            ).encode("utf-8")
-            self._state_response_cache[cache_slot] = (cache_key, body)
-            return Response(content=body, media_type="application/json")
+            body = payload.model_dump_json().encode("utf-8")
+            cached_response = await asyncio.to_thread(
+                self._make_cached_response, body
+            )
+            self._miner_state_response_cache = (
+                cache_key, cached_response
+            )
+            return Response(
+                content=body,
+                media_type="application/json",
+                headers={
+                    "Cache-Control": "private, no-cache",
+                    "ETag": cached_response.etag,
+                    "Vary": "Accept-Encoding",
+                },
+            )
 
         @app.get("/runtime-contract", response_model=RuntimeContract)
         async def runtime_contract() -> RuntimeContract:
@@ -5117,10 +5663,64 @@ class ValidatorServer:
             if not ring:
                 return VerdictsResponse(verdicts=[])
             out = [
-                Verdict(**entry) for entry in ring
+                Verdict(**{
+                    key: value for key, value in entry.items()
+                    if key != "_sequence"
+                }) for entry in ring
                 if entry["ts"] > since
             ]
             return VerdictsResponse(verdicts=out)
+
+        @app.get(
+            "/miner-verdicts/{hotkey}",
+            response_model=VerdictsPage,
+            response_model_exclude_none=True,
+        )
+        async def miner_verdicts(
+            hotkey: str,
+            after: int = 0,
+            limit: int = VERDICT_CAP_PER_HOTKEY,
+        ) -> VerdictsPage:
+            """Cursor-based verdict feed with explicit ring-gap detection."""
+            after = max(0, int(after))
+            limit = max(1, min(int(limit), VERDICT_CAP_PER_HOTKEY))
+            ring = self._verdicts.get(hotkey)
+            if not ring:
+                latest = int(self._verdict_sequence_by_hotkey.get(hotkey, 0))
+                cursor_ahead = after > latest
+                return VerdictsPage(
+                    verdicts=[],
+                    next_cursor=latest if cursor_ahead else max(after, latest),
+                    oldest_available_cursor=latest,
+                    truncated=cursor_ahead,
+                )
+            oldest = int(ring[0]["_sequence"])
+            latest = int(ring[-1]["_sequence"])
+            cursor_ahead = after > latest
+            effective_after = oldest - 1 if cursor_ahead else after
+            truncated = after < oldest - 1 or cursor_ahead
+            entries = [
+                {
+                    **{
+                        key: value for key, value in entry.items()
+                        if key != "_sequence"
+                    },
+                    "sequence": int(entry["_sequence"]),
+                }
+                for entry in ring
+                if int(entry["_sequence"]) > effective_after
+            ][:limit]
+            next_cursor = (
+                int(entries[-1]["sequence"])
+                if entries
+                else max(effective_after, oldest - 1)
+            )
+            return VerdictsPage(
+                verdicts=entries,
+                next_cursor=next_cursor,
+                oldest_available_cursor=oldest,
+                truncated=truncated,
+            )
 
         # Add this last so Starlette places it outermost, ahead of the
         # BaseHTTPMiddleware used by ``stamp_arrival``. Otherwise FastAPI may
@@ -5843,6 +6443,21 @@ class ValidatorServer:
             except asyncio.CancelledError:
                 return
 
+    async def _monitor_health_snapshot(self, interval: float = 1.0) -> None:
+        """Refresh rich health off-loop; HTTP probes only read cached bytes."""
+        while True:
+            try:
+                payload = await asyncio.to_thread(self._health_payload)
+                self._cache_health_payload(payload)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("health snapshot refresh failed")
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                return
+
     async def start(self) -> None:
         if self._task is not None:
             return
@@ -5904,6 +6519,10 @@ class ValidatorServer:
             self._monitor_process_health(),
             name="validator_process_health_monitor",
         )
+        self._health_snapshot_monitor_task = asyncio.create_task(
+            self._monitor_health_snapshot(),
+            name="validator_health_snapshot_monitor",
+        )
         await asyncio.sleep(0)
         logger.info(
             "Validator HTTP server listening on %s:%d "
@@ -5926,6 +6545,13 @@ class ValidatorServer:
             process_health_task.cancel()
             await asyncio.gather(process_health_task, return_exceptions=True)
         self._process_health_monitor_task = None
+        health_snapshot_task = self._health_snapshot_monitor_task
+        if health_snapshot_task is not None and not health_snapshot_task.done():
+            health_snapshot_task.cancel()
+            await asyncio.gather(
+                health_snapshot_task, return_exceptions=True
+            )
+        self._health_snapshot_monitor_task = None
         worker_tasks = [
             task
             for task in (

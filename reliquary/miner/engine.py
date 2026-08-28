@@ -77,21 +77,32 @@ async def maybe_pull_checkpoint(
     download_fn,
     load_fn,
 ):
-    """If remote checkpoint_n > local, download via HF and load.
+    """Activate a newer or same-number/different-revision checkpoint.
 
     state.checkpoint_repo_id + state.checkpoint_revision identify the
     HF snapshot. download_fn/load_fn still injected for testability.
 
     Returns ``(new_local_n, new_local_hash, new_model)``. If no update is
-    needed (remote ≤ local, or remote has no repo/revision yet), returns
-    inputs unchanged.
+    needed (remote is older, identities match, or the remote snapshot is not
+    published yet), returns inputs unchanged. Comparing the revision as well
+    as the counter handles a fresh miner joining checkpoint zero and a
+    validator republishing a corrected revision without changing its number.
     """
-    if state.checkpoint_n <= local_n:
+    if state.checkpoint_n < local_n:
+        return local_n, local_hash, local_model
+    if (
+        state.checkpoint_n == local_n
+        and state.checkpoint_revision == local_hash
+    ):
         return local_n, local_hash, local_model
     if state.checkpoint_repo_id is None or state.checkpoint_revision is None:
         return local_n, local_hash, local_model
     local_path = await download_fn(state.checkpoint_repo_id, state.checkpoint_revision)
-    new_model = load_fn(local_path)
+    # Model construction and device transfer are synchronous and can take most
+    # of a collection window. Keep them off the miner's polling event loop.
+    new_model = await asyncio.to_thread(load_fn, local_path)
+    if new_model is None:
+        raise RuntimeError("checkpoint loader returned no activated model")
     return state.checkpoint_n, state.checkpoint_revision, new_model
 
 
@@ -134,13 +145,13 @@ def pick_prompt_idx(
     span = hi - lo
     if span <= 0:
         raise RuntimeError("no eligible prompt — empty range")
-    cd_in_span = sum(1 for c in cooldown_prompts if lo <= c < hi)
-    if cd_in_span < span / 2:
-        for _ in range(max_attempts):
-            idx = lo + rng.randrange(span)
-            if idx not in cooldown_prompts:
-                return idx
-        raise RuntimeError("no eligible prompt found after max attempts")
+    # Try random membership probes first. Do not scan the entire cooldown set:
+    # legacy validators may expose hundreds of thousands of entries even though
+    # this window's eligible range is only PROMPT_RANGE_SIZE wide.
+    for _ in range(max_attempts):
+        idx = lo + rng.randrange(span)
+        if idx not in cooldown_prompts:
+            return idx
     eligible = [i for i in range(lo, hi) if i not in cooldown_prompts]
     if not eligible:
         raise RuntimeError("no eligible prompt — range fully in cooldown")
@@ -155,6 +166,7 @@ def pick_env_and_prompt(
     rng: _random.Random | None = None,
     max_attempts: int = 1000,
     randomness: str | None = None,
+    prompt_ranges: dict[str, tuple[int, int]] | None = None,
 ) -> tuple[str, int]:
     """Sample env per `mix` weights, then a prompt within that env.
 
@@ -174,8 +186,12 @@ def pick_env_and_prompt(
         avail_weights = [weights[names.index(n)] for n in available]
         env_name = rng.choices(available, weights=avail_weights)[0]
         env = envs[env_name]
-        prompt_range = None
-        if randomness:
+        prompt_range = (
+            prompt_ranges.get(env_name)
+            if prompt_ranges is not None
+            else None
+        )
+        if prompt_range is None and randomness:
             env_label = getattr(env, "name", env_name)
             prompt_range = window_prompt_range(
                 randomness, env_label, len(env), PROMPT_RANGE_SIZE,
@@ -366,6 +382,9 @@ class MiningEngine:
         proof_gpu: int = 1,
         max_new_tokens: int = MAX_NEW_TOKENS_PROTOCOL_CAP,
         validator_url_override: str | None = None,
+        initial_checkpoint_n: int = 0,
+        initial_checkpoint_hash: str = "",
+        initial_checkpoint_path: str | None = None,
     ) -> None:
         self.vllm_model = vllm_model
         self.hf_model = hf_model
@@ -375,6 +394,9 @@ class MiningEngine:
         self.proof_gpu = proof_gpu
         self.max_new_tokens = max_new_tokens
         self.validator_url_override = validator_url_override
+        self.initial_checkpoint_n = max(0, int(initial_checkpoint_n))
+        self.initial_checkpoint_hash = str(initial_checkpoint_hash)
+        self._loaded_checkpoint_path = initial_checkpoint_path
 
         if envs is not None and mix is not None:
             self.envs = envs
@@ -415,8 +437,9 @@ class MiningEngine:
 
         from reliquary.constants import M_ROLLOUTS, POLL_INTERVAL_SECONDS
         from reliquary.miner.submitter import (
-            SubmissionError, discover_validator_url,
-            get_runtime_contract_v1, get_window_state_v2, submit_batch_v2,
+            EndpointNotFoundError, SubmissionError, discover_validator_url,
+            get_miner_state_v1, get_runtime_contract_v1,
+            get_verdicts_page_v1, get_window_state_v2, submit_batch_v2,
         )
         from reliquary.protocol.submission import (
             BatchSubmissionRequest, RuntimeFingerprint, WindowState,
@@ -439,8 +462,21 @@ class MiningEngine:
         # nothing to pre-fetch. The miner just reads what /state reports.
         rng = random.Random()
         results = []
-        local_n = 0
-        local_hash = ""
+        local_n = self.initial_checkpoint_n
+        local_hash = self.initial_checkpoint_hash
+        miner_state_supported: bool | None = None
+        cached_miner_state = None
+        miner_state_etag: str | None = None
+        legacy_cooldown_window: int | None = None
+        prompt_ranges: dict[str, tuple[int, int]] = {}
+        checkpoint_task: asyncio.Task | None = None
+        checkpoint_target: tuple[int, str] | None = None
+        checkpoint_failures = 0
+        checkpoint_retry_at = 0.0
+        verdict_cursor = 0
+        verdicts_supported: bool | None = None
+        verdict_task: asyncio.Task | None = None
+        pending_verdict_roots: set[str] = set()
 
         async with httpx.AsyncClient(timeout=30) as client:
             runtime_fingerprint = None
@@ -465,27 +501,236 @@ class MiningEngine:
                 runtime_fingerprint = None
                 logger.info("validator runtime telemetry unavailable")
             while True:
+                # Verdict feedback is optional and never blocks state polling.
+                if verdict_task is not None and verdict_task.done():
+                    try:
+                        page = verdict_task.result()
+                        verdicts_supported = True
+                        if page.truncated:
+                            logger.warning(
+                                "verdict cursor gap: oldest_available=%d "
+                                "previous_cursor=%d",
+                                page.oldest_available_cursor,
+                                verdict_cursor,
+                            )
+                            # Missing terminal verdicts have rolled out or the
+                            # validator restarted its in-memory sequence. They
+                            # cannot be recovered by polling forever.
+                            pending_verdict_roots.clear()
+                        verdict_cursor = page.next_cursor
+                        for verdict in page.verdicts:
+                            logger.info(
+                                "verdict sequence=%d window=%s root=%s "
+                                "accepted=%s reason=%s selected=%s rewarded=%s",
+                                verdict.sequence,
+                                verdict.window_n,
+                                verdict.merkle_root[:12],
+                                verdict.accepted,
+                                verdict.reason.value,
+                                verdict.selected_for_batch,
+                                verdict.rewarded,
+                            )
+                            if (
+                                not verdict.accepted
+                                or verdict.selected_for_batch is not None
+                                or verdict.rewarded is not None
+                            ):
+                                pending_verdict_roots.discard(
+                                    verdict.merkle_root
+                                )
+                    except EndpointNotFoundError:
+                        verdicts_supported = False
+                    except Exception as exc:
+                        logger.debug("verdict poll failed: %s", exc)
+                    verdict_task = None
+                if (
+                    pending_verdict_roots
+                    and verdicts_supported is not False
+                    and verdict_task is None
+                ):
+                    verdict_task = asyncio.create_task(
+                        get_verdicts_page_v1(
+                            url,
+                            self.wallet.hotkey.ss58_address,
+                            after=verdict_cursor,
+                            client=client,
+                        ),
+                        name="miner_verdict_poll",
+                    )
+
                 try:
-                    state = await get_window_state_v2(url, client=client)
+                    if miner_state_supported is not False:
+                        try:
+                            fetched, new_etag = await get_miner_state_v1(
+                                url,
+                                client=client,
+                                etag=miner_state_etag,
+                            )
+                            miner_state_supported = True
+                            if fetched is not None:
+                                missing_envs = set(self.envs) - set(
+                                    fetched.environments
+                                )
+                                if missing_envs:
+                                    raise SubmissionError(
+                                        "miner-state missing environments: "
+                                        f"{sorted(missing_envs)}"
+                                    )
+                                cached_miner_state = fetched
+                                self._cooldown_per_env = {
+                                    env_name: fetched.environments[
+                                        env_name
+                                    ].cooldown_prompts()
+                                    for env_name in self.envs
+                                }
+                                prompt_ranges = {
+                                    env_name: fetched.environments[
+                                        env_name
+                                    ].prompt_range
+                                    for env_name in self.envs
+                                }
+                            miner_state_etag = new_etag
+                            if cached_miner_state is None:
+                                raise SubmissionError(
+                                    "validator returned 304 before miner-state cache fill"
+                                )
+                            state = cached_miner_state
+                        except EndpointNotFoundError:
+                            miner_state_supported = False
+                            miner_state_etag = None
+                            cached_miner_state = None
+                            logger.info(
+                                "validator lacks /miner-state; using legacy /state"
+                            )
+                            state = await get_window_state_v2(
+                                url, client=client
+                            )
+                    else:
+                        state = await get_window_state_v2(url, client=client)
                 except SubmissionError:
                     # /state may return 503 between windows; wait briefly.
-                    await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                    await asyncio.sleep(min(1.0, POLL_INTERVAL_SECONDS))
                     continue
                 except Exception as e:
                     logger.debug("state fetch failed: %s", e)
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
                     continue
 
-                # Pull new checkpoint if needed (works at any state).
-                try:
-                    local_n, local_hash, self.hf_model = await maybe_pull_checkpoint(
-                        state=state, local_n=local_n, local_hash=local_hash,
-                        local_model=self.hf_model,
-                        download_fn=_hf_download,
-                        load_fn=self._load_checkpoint,
+                # Legacy fallback: load every env exactly once per window and
+                # require every response to describe the same window/randomness.
+                # Never fan one environment's cooldown into another.
+                if (
+                    miner_state_supported is False
+                    and legacy_cooldown_window != state.window_n
+                ):
+                    try:
+                        cooldowns: dict[str, set[int]] = {}
+                        for env_name in self._cooldown_per_env:
+                            env_state = await get_window_state_v2(
+                                url, env=env_name, client=client,
+                            )
+                            if (
+                                env_state.window_n != state.window_n
+                                or env_state.randomness != state.randomness
+                            ):
+                                raise SubmissionError(
+                                    "legacy per-env state crossed a window boundary"
+                                )
+                            cooldowns[env_name] = set(
+                                env_state.cooldown_prompts
+                            )
+                        self._cooldown_per_env = cooldowns
+                        legacy_cooldown_window = state.window_n
+                    except Exception as exc:
+                        logger.warning(
+                            "incomplete legacy environment state; waiting: %s",
+                            exc,
+                        )
+                        await asyncio.sleep(1)
+                        continue
+
+                # Stage checkpoint acquisition in the background. Mining fails
+                # closed until the generation/proof pair and advertised hash
+                # all identify the same revision.
+                remote_revision = state.checkpoint_revision or ""
+                remote_target = (state.checkpoint_n, remote_revision)
+                checkpoint_identity_changed = (
+                    state.checkpoint_n > local_n
+                    or (
+                        state.checkpoint_n == local_n
+                        and bool(remote_revision)
+                        and remote_revision != local_hash
                     )
-                except Exception:
-                    logger.exception("checkpoint pull failed; keeping local")
+                )
+                if checkpoint_identity_changed:
+                    if (
+                        not state.checkpoint_repo_id
+                        or not remote_revision
+                    ):
+                        logger.info(
+                            "checkpoint %d is not fully published; waiting",
+                            state.checkpoint_n,
+                        )
+                        await asyncio.sleep(0.2)
+                        continue
+                    if time.monotonic() < checkpoint_retry_at:
+                        await asyncio.sleep(0.2)
+                        continue
+                    if checkpoint_task is None:
+                        checkpoint_target = remote_target
+                        checkpoint_task = asyncio.create_task(
+                            maybe_pull_checkpoint(
+                                state=state,
+                                local_n=local_n,
+                                local_hash=local_hash,
+                                local_model=self.hf_model,
+                                download_fn=_hf_download,
+                                load_fn=self._load_checkpoint,
+                            ),
+                            name=f"miner_checkpoint_{state.checkpoint_n}",
+                        )
+                    if checkpoint_target != remote_target:
+                        # asyncio.to_thread cannot cancel an in-flight model
+                        # load. Let the serialized activation finish, remain
+                        # fail-closed, then advance again to the newer target.
+                        logger.info(
+                            "checkpoint advanced while activation was running: "
+                            "staged=%s current=%s",
+                            checkpoint_target,
+                            remote_target,
+                        )
+                    if not checkpoint_task.done():
+                        await asyncio.sleep(0.2)
+                        continue
+                    try:
+                        local_n, local_hash, self.hf_model = (
+                            checkpoint_task.result()
+                        )
+                        checkpoint_failures = 0
+                        checkpoint_retry_at = 0.0
+                    except Exception:
+                        checkpoint_failures += 1
+                        retry_delay = min(
+                            60.0, float(2 ** min(checkpoint_failures, 6))
+                        )
+                        checkpoint_retry_at = time.monotonic() + retry_delay
+                        logger.exception(
+                            "checkpoint activation failed; staying on local "
+                            "revision and retrying in %.1fs",
+                            retry_delay,
+                        )
+                    finally:
+                        checkpoint_task = None
+                        checkpoint_target = None
+                    continue
+                if remote_revision and local_hash != remote_revision:
+                    logger.error(
+                        "checkpoint mismatch: local=%s remote=%s; refusing to submit",
+                        local_hash[:12] or "none",
+                        remote_revision[:12],
+                    )
+                    await asyncio.sleep(1)
+                    continue
 
                 if state.state != WindowState.OPEN:
                     await asyncio.sleep(1)
@@ -509,27 +754,25 @@ class MiningEngine:
                 if not randomness:
                     await asyncio.sleep(0.1)
                     continue
+                submission_deadline = getattr(
+                    state, "submission_deadline_at", None
+                )
+                if (
+                    submission_deadline is not None
+                    and submission_deadline - time.time() <= 5.0
+                ):
+                    logger.info(
+                        "insufficient window runway for generation: %.2fs",
+                        submission_deadline - time.time(),
+                    )
+                    await asyncio.sleep(0.2)
+                    continue
 
-                # Per-env cooldown: /state's flat ``cooldown_prompts`` covers
-                # only the validator's first env, but ``prompt_idx`` is per-env,
-                # so query each env for its own set. Fall back to the base set
-                # on a fetch error rather than stall the loop.
-                for env_name in self._cooldown_per_env:
-                    try:
-                        env_state = await get_window_state_v2(
-                            url, env=env_name, client=client,
-                        )
-                        self._cooldown_per_env[env_name] = set(
-                            env_state.cooldown_prompts
-                        )
-                    except Exception:
-                        self._cooldown_per_env[env_name] = set(
-                            state.cooldown_prompts
-                        )
                 try:
                     env_name, prompt_idx = pick_env_and_prompt(
                         self.envs, self.mix, self._cooldown_per_env, rng=rng,
                         randomness=randomness,
+                        prompt_ranges=prompt_ranges or None,
                     )
                 except RuntimeError:
                     logger.info("all envs fully in cooldown; sleeping")
@@ -573,6 +816,54 @@ class MiningEngine:
                         else ""
                     ),
                 )
+                # Generation/proof construction can span a state transition.
+                # Revalidate immediately before precommit so stale work never
+                # consumes ingress or per-window quota.
+                try:
+                    if miner_state_supported is not False:
+                        refreshed, miner_state_etag = await get_miner_state_v1(
+                            url,
+                            client=client,
+                            etag=miner_state_etag,
+                        )
+                        if refreshed is not None:
+                            cached_miner_state = refreshed
+                        confirmation = cached_miner_state
+                    else:
+                        confirmation = await get_window_state_v2(
+                            url, client=client
+                        )
+                except Exception as exc:
+                    logger.info(
+                        "state recheck failed; dropping generated submission: %s",
+                        exc,
+                    )
+                    continue
+                if (
+                    confirmation is None
+                    or confirmation.state != WindowState.OPEN
+                    or confirmation.window_n != state.window_n
+                    or confirmation.randomness != state.randomness
+                    or (
+                        getattr(
+                            confirmation, "submission_deadline_at", None
+                        ) is not None
+                        and time.time()
+                        >= confirmation.submission_deadline_at
+                    )
+                    or (
+                        confirmation.checkpoint_revision
+                        and confirmation.checkpoint_revision != local_hash
+                    )
+                ):
+                    logger.info(
+                        "window changed during generation; dropping stale work "
+                        "generated_window=%d current_window=%s current_state=%s",
+                        state.window_n,
+                        getattr(confirmation, "window_n", None),
+                        getattr(confirmation, "state", None),
+                    )
+                    continue
                 try:
                     resp = await submit_batch_v2(
                         url,
@@ -588,6 +879,12 @@ class MiningEngine:
                         resp.reason.value if hasattr(resp.reason, "value") else resp.reason,
                     )
                     results.append(resp)
+                    if resp.accepted:
+                        pending_verdict_roots.add(merkle_root)
+                    if resp.reason is RejectReason.WINDOW_NOT_ACTIVE:
+                        await asyncio.sleep(
+                            getattr(resp, "_retry_after_seconds", None) or 1.0
+                        )
                 except SubmissionError as exc:
                     logger.error("submit failed: %s", exc)
 
@@ -612,7 +909,9 @@ class MiningEngine:
 
         logger.info("Loading checkpoint from %s", local_path)
 
-        # 1. Reload hf_model (for GRAIL proofs) on the proof GPU.
+        # Stage both model copies before publishing either reference. If one
+        # load fails, the old generation/proof pair remains active and the
+        # caller does not advance its checkpoint hash.
         try:
             new_hf = load_text_generation_model(
                 local_path,
@@ -624,17 +923,8 @@ class MiningEngine:
                 "Failed to reload hf_model from %s; keeping old model",
                 local_path,
             )
-            return self.hf_model
+            raise
 
-        old_hf = self.hf_model
-        self.hf_model = new_hf
-        del old_hf
-        try:
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
-
-        # 2. Reload vllm_model on the generation GPU.
         try:
             new_gen = load_text_generation_model(
                 local_path,
@@ -643,17 +933,24 @@ class MiningEngine:
             ).to(f"cuda:{self.vllm_gpu}").eval()
         except Exception:
             logger.exception(
-                "Failed to reload vllm_model from %s; miner generation is "
-                "BROKEN until the next successful pull. hf_model was swapped "
-                "so GRAIL proofs will be inconsistent.",
+                "Failed to stage vllm_model from %s; keeping the prior "
+                "generation/proof pair",
                 local_path,
             )
-            self.vllm_model = None
-            self._loaded_checkpoint_path = None
-            return self.hf_model
+            del new_hf
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            raise
 
+        old_hf = self.hf_model
         old_gen = self.vllm_model
+        self.hf_model = new_hf
         self.vllm_model = new_gen
+        # Both public references now identify the same checkpoint. Only after
+        # that atomic assignment do we release the previous pair.
+        del old_hf
         del old_gen
         try:
             torch.cuda.empty_cache()

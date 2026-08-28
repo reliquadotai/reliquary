@@ -85,6 +85,12 @@ class ArchiveQueue:
         self._archives_enqueued_total = 0
         self._enqueue_gaps_total = 0
         self._last_enqueue_gap: dict[str, int] | None = None
+        self._pending_files: list[Path] = []
+        self._oldest_pending_mtime: float | None = None
+        # One startup scan is acceptable; health probes must never rescan the
+        # directory. The producer and worker refresh this cached view whenever
+        # they change or enumerate the queue.
+        self._pending()
 
     # ------------------------------------------------------------------
     # Producer API — called from the validator's main loop
@@ -118,6 +124,9 @@ class ArchiveQueue:
             int(window_start), self._last_enqueued_window or int(window_start)
         )
         self._archives_enqueued_total += 1
+        self._update_pending_snapshot(
+            sorted({*self._pending_files, final_path})
+        )
 
         logger.info(
             "ArchiveQueue: enqueued window %d (%d bytes, path=%s)",
@@ -131,10 +140,21 @@ class ArchiveQueue:
 
     def _pending(self) -> list[Path]:
         """Sorted oldest-first list of pending files in the queue."""
-        return sorted(
+        pending = sorted(
             p for p in self.queue_dir.glob("window-*.json.gz")
             if not p.name.endswith(".tmp")
         )
+        self._update_pending_snapshot(pending)
+        return pending
+
+    def _update_pending_snapshot(self, pending: list[Path]) -> None:
+        self._pending_files = list(pending)
+        self._oldest_pending_mtime = None
+        if pending:
+            try:
+                self._oldest_pending_mtime = pending[0].stat().st_mtime
+            except OSError:
+                pass
 
     @staticmethod
     def _window_n_from_path(path: Path) -> int | None:
@@ -154,20 +174,17 @@ class ArchiveQueue:
         return float(RETRY_BACKOFF_SECONDS[-1])
 
     def snapshot(self, *, now: float | None = None) -> dict:
-        """Return a secret-free, JSON-safe queue health snapshot."""
-        pending = self._pending()
+        """Return cached queue health without filesystem I/O."""
+        pending = self._pending_files
         oldest_window = (
             self._window_n_from_path(pending[0]) if pending else None
         )
         oldest_age_seconds = None
-        if pending:
-            try:
-                current = time.time() if now is None else float(now)
-                oldest_age_seconds = max(
-                    0.0, current - pending[0].stat().st_mtime
-                )
-            except OSError:
-                oldest_age_seconds = None
+        if pending and self._oldest_pending_mtime is not None:
+            current = time.time() if now is None else float(now)
+            oldest_age_seconds = max(
+                0.0, current - self._oldest_pending_mtime
+            )
         return {
             "depth": len(pending),
             "oldest_window": oldest_window,
@@ -261,6 +278,14 @@ class ArchiveQueue:
             logger.warning(
                 "ArchiveQueue: upload OK for window %d but failed to "
                 "delete %s: %s", window_n, path, e,
+            )
+        else:
+            self._update_pending_snapshot(
+                [
+                    pending_path
+                    for pending_path in self._pending_files
+                    if pending_path != path
+                ]
             )
         logger.info(
             "Uploaded GRPO dataset for window %d (%d bytes, key=%s, "

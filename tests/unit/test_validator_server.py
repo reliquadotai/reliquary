@@ -2720,3 +2720,21 @@ async def test_worker_drops_late_items_for_stale_batcher():
     )
     assert old_batcher.pending_proof_reservations == 0
     assert old_batcher.proof_grading_attempts == 0
+
+
+def test_liveness_stays_lightweight_while_readiness_reflects_event_loop_lag():
+    server = ValidatorServer()
+    server._event_loop_lag_samples_ms.append(5_000.0)
+    client = TestClient(server.app)
+
+    health = client.get("/health")
+    readiness = client.get("/readyz")
+    liveness = client.get("/livez")
+
+    assert health.status_code == 200
+    assert health.json()["status"] == "degraded"
+    assert health.json()["control_plane"]["miner_state_schema_version"] == 1
+    assert readiness.status_code == 503
+    assert readiness.json()["status"] == "not_ready"
+    assert liveness.status_code == 200
+    assert liveness.json() == {"status": "ok"}

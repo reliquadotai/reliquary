@@ -295,14 +295,24 @@ local or mirrored snapshot before serving miners.
 curl http://localhost:8080/health
 # → {"status":"ok","active_window":42}
 
+# Dependency-free process liveness and traffic readiness
+curl http://localhost:8080/livez
+curl --fail http://localhost:8080/readyz
+
 # State (trainer only — weight-only doesn't expose HTTP)
 curl http://localhost:8080/state
+
+# Preferred bounded all-environment miner control state
+curl --compressed -i http://localhost:8080/miner-state
 
 # Real-time per-submission verdicts for a given miner hotkey (trainer only).
 # Use to confirm a specific miner is being accepted (or what reject reason
 # they're hitting) without waiting for the post-window R2 archive upload.
 curl 'http://localhost:8080/verdicts/<miner_hotkey_ss58>?since=0'
 # → {"verdicts":[{"merkle_root":"...","window_n":N,"accepted":true,"reason":"accepted","ts":...}, ...]}
+
+# Preferred gap-detectable verdict cursor
+curl 'http://localhost:8080/miner-verdicts/<miner_hotkey_ss58>?after=0'
 ```
 
 For the weight-only mode, the only signal that things are working is the log line `Submitting weights: N miners …` once per subnet epoch (~30 minutes on netuid 81).

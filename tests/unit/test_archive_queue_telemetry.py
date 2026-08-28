@@ -72,3 +72,18 @@ def test_archive_queue_snapshot_tracks_failure_without_dropping(tmp_path, monkey
     assert snapshot["upload_failures_total"] == 1
     assert snapshot["last_failed_window"] == 44
     assert snapshot["last_upload_failure_ts"] is not None
+
+
+def test_archive_queue_health_snapshot_never_scans_disk(tmp_path, monkeypatch):
+    queue = ArchiveQueue(str(tmp_path))
+    queue.enqueue(45, {"window_start": 45})
+    monkeypatch.setattr(
+        queue,
+        "_pending",
+        lambda: (_ for _ in ()).throw(AssertionError("unexpected disk scan")),
+    )
+
+    snapshot = queue.snapshot()
+
+    assert snapshot["depth"] == 1
+    assert snapshot["oldest_window"] == 45

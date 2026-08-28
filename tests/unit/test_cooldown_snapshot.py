@@ -125,6 +125,103 @@ async def test_snapshot_cooldown_writes_run_keyed_state():
 
 
 @pytest.mark.asyncio
+async def test_delta_snapshot_writes_only_changes_since_persisted_window():
+    svc = _service(50)
+    svc._cooldown_base_snapshot_window = 40
+    svc._cooldown_persisted_window = 40
+    svc._cooldown_per_env["fake"].record_batched(1, 30)
+    svc._cooldown_per_env["fake"].record_batched(2, 45)
+    captured = {}
+
+    async def fake_upload(key, data):
+        captured.update({"key": key, "data": data})
+        return True
+
+    with patch(
+        "reliquary.validator.service.COOLDOWN_DELTA_SNAPSHOTS_ENABLED", True,
+    ), patch(
+        "reliquary.infrastructure.storage.upload_json", new=fake_upload,
+    ):
+        await svc._snapshot_cooldown()
+
+    assert captured["key"].endswith("window-00000000000000000050.json.gz")
+    assert captured["data"]["from_window_exclusive"] == 40
+    assert captured["data"]["envs"]["fake"] == {2: 45}
+    assert svc._cooldown_persisted_window == 50
+
+
+@pytest.mark.asyncio
+async def test_restore_replays_contiguous_delta_before_archive_gap():
+    svc = _service(50)
+    base = {
+        "run_id": "default",
+        "snapshot_window": 40,
+        "envs": {"fake": {"1": 30}},
+    }
+    delta = {
+        "schema_version": 2,
+        "run_id": "default",
+        "from_window_exclusive": 40,
+        "snapshot_window": 50,
+        "envs": {"fake": {"2": 45}},
+    }
+    key = "cooldown_deltas/default/window-00000000000000000050.json.gz"
+
+    with patch(
+        "reliquary.validator.service.COOLDOWN_DELTA_SNAPSHOTS_ENABLED", True,
+    ), patch(
+        "reliquary.infrastructure.storage.download_json",
+        new=AsyncMock(side_effect=[base, delta]),
+    ), patch(
+        "reliquary.infrastructure.storage.list_json_keys",
+        new=AsyncMock(return_value=[key]),
+    ), patch(
+        "reliquary.infrastructure.storage.list_recent_datasets",
+        new=AsyncMock(return_value=[]),
+    ) as archive_replay:
+        await svc._rebuild_cooldown_from_history()
+
+    assert svc._cooldown_per_env["fake"].export_state() == {1: 30, 2: 45}
+    assert svc._cooldown_persisted_window == 50
+    archive_replay.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_restore_rejects_delta_with_future_selection():
+    svc = _service(50)
+    base = {
+        "run_id": "default",
+        "snapshot_window": 40,
+        "envs": {"fake": {"1": 30}},
+    }
+    corrupt_delta = {
+        "schema_version": 2,
+        "run_id": "default",
+        "from_window_exclusive": 40,
+        "snapshot_window": 50,
+        "envs": {"fake": {"2": 999}},
+    }
+    with patch(
+        "reliquary.validator.service.COOLDOWN_DELTA_SNAPSHOTS_ENABLED", True,
+    ), patch(
+        "reliquary.infrastructure.storage.download_json",
+        new=AsyncMock(side_effect=[base, corrupt_delta]),
+    ), patch(
+        "reliquary.infrastructure.storage.list_json_keys",
+        new=AsyncMock(return_value=[
+            "cooldown_deltas/default/window-00000000000000000050.json.gz"
+        ]),
+    ), patch(
+        "reliquary.infrastructure.storage.list_recent_datasets",
+        new=AsyncMock(return_value=[]),
+    ):
+        await svc._rebuild_cooldown_from_history()
+
+    assert svc._cooldown_per_env["fake"].export_state() == {1: 30}
+    assert svc._cooldown_persisted_window == 40
+
+
+@pytest.mark.asyncio
 async def test_corrupt_snapshot_does_not_crash_and_falls_back():
     """B2: a malformed snapshot (bad envs payload) must not crash startup — it
     is discarded and we fall back (empty for a fresh run)."""

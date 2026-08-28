@@ -12,7 +12,9 @@ from reliquary.constants import VALIDATOR_HTTP_PORT
 from reliquary.miner.submitter import (
     NoValidatorFoundError,
     discover_validator_url,
+    get_miner_state_v1,
     get_runtime_contract_v1,
+    get_verdicts_page_v1,
     get_window_state_v2,
     submit_batch_v2,
 )
@@ -20,10 +22,13 @@ from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     BatchSubmissionResponse,
     GrpoBatchState,
+    MinerEnvironmentState,
+    MinerState,
     RejectReason,
     RolloutSubmission,
     RuntimeContract,
     RuntimeFingerprint,
+    VerdictsPage,
     WindowState,
 )
 from reliquary.shared.runtime_fingerprint import collect_runtime_fingerprint
@@ -550,16 +555,89 @@ async def test_submit_batch_v2_503_maps_to_window_not_active(monkeypatch):
 
     async def _post(self, url, content=None, headers=None, timeout=None):
         call_count["n"] += 1
-        return httpx.Response(503, json={"detail": "no_active_window"})
+        return httpx.Response(
+            503,
+            json={"detail": "no_active_window"},
+            headers={"Retry-After": "7"},
+        )
 
     monkeypatch.setattr(httpx.AsyncClient, "post", _post)
     client = httpx.AsyncClient()
     resp = await submit_batch_v2("http://fake", _v2_request(), client=client)
     assert resp.accepted is False
     assert resp.reason == RejectReason.WINDOW_NOT_ACTIVE
+    assert resp._retry_after_seconds == 7.0
     # Crucially: no retries. One call, not three.
     assert call_count["n"] == 1
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_get_miner_state_supports_etag_and_304(monkeypatch):
+    state = MinerState(
+        state=WindowState.OPEN,
+        window_n=100,
+        anchor_block=100,
+        environments={
+            "math": MinerEnvironmentState(
+                prompt_range=(10, 18),
+                cooldown_bitmap="AQ==",
+                cooldown_count=1,
+            )
+        },
+        checkpoint_n=0,
+        randomness="ab" * 32,
+    )
+    seen_headers = []
+
+    async def _get(self, url, headers=None, timeout=None):
+        seen_headers.append(dict(headers or {}))
+        if len(seen_headers) == 1:
+            return httpx.Response(
+                200,
+                json=state.model_dump(mode="json"),
+                headers={"ETag": '"state-1"'},
+            )
+        return httpx.Response(304, headers={"ETag": '"state-1"'})
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", _get)
+    async with httpx.AsyncClient() as client:
+        fetched, etag = await get_miner_state_v1(
+            "http://fake", client=client
+        )
+        unchanged, same_etag = await get_miner_state_v1(
+            "http://fake", client=client, etag=etag
+        )
+
+    assert fetched == state
+    assert unchanged is None
+    assert same_etag == '"state-1"'
+    assert seen_headers[1]["If-None-Match"] == '"state-1"'
+    assert seen_headers[0]["Accept-Encoding"] == "gzip"
+
+
+@pytest.mark.asyncio
+async def test_get_verdicts_page_uses_integer_cursor(monkeypatch):
+    seen = {}
+    page = VerdictsPage(
+        verdicts=[],
+        next_cursor=9,
+        oldest_available_cursor=4,
+        truncated=False,
+    )
+
+    async def _get(self, url, timeout=None):
+        seen["url"] = url
+        return httpx.Response(200, json=page.model_dump(mode="json"))
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", _get)
+    async with httpx.AsyncClient() as client:
+        result = await get_verdicts_page_v1(
+            "http://fake", "hot/key", after=8, client=client
+        )
+
+    assert result.next_cursor == 9
+    assert seen["url"].endswith("/miner-verdicts/hot%2Fkey?after=8")
 
 
 @pytest.mark.asyncio

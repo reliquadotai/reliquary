@@ -203,3 +203,29 @@ def test_apply_history_keeps_older_when_snapshot_is_newer():
     m.import_state({7: 200})
     m.apply_history([{"window_start": 150, "batch": [{"prompt_idx": 7}]}], current_window=210)
     assert m.export_state() == {7: 200}  # snapshot's newer window wins
+
+
+def test_delta_roundtrip_and_compaction():
+    base = CooldownMap(cooldown_windows=50)
+    base.record_batched(1, 100)
+    base.record_batched(2, 110)
+    base.record_batched(3, 120)
+
+    delta = base.export_delta(after_window=105, through_window=115)
+    assert delta == {2: 110}
+
+    restored = CooldownMap(cooldown_windows=50)
+    restored.import_state({1: 100})
+    restored.apply_delta({str(k): v for k, v in delta.items()})
+    assert restored.export_state() == {1: 100, 2: 110}
+
+    assert restored.compact(current_window=160) == 2
+    assert restored.export_state() == {}
+
+
+def test_export_through_window_excludes_concurrent_future_entries():
+    cooldown = CooldownMap(cooldown_windows=1000)
+    cooldown.record_batched(1, 10)
+    cooldown.record_batched(2, 20)
+
+    assert cooldown.export_state(through_window=10) == {1: 10}

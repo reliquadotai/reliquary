@@ -50,6 +50,30 @@ async def test_no_pull_when_local_up_to_date():
 
 
 @pytest.mark.asyncio
+async def test_pull_when_checkpoint_zero_revision_differs():
+    """A fresh miner must activate the validator's published checkpoint zero."""
+    state = MagicMock()
+    state.checkpoint_n = 0
+    state.checkpoint_repo_id = "aivolutionedge/reliquary-sn"
+    state.checkpoint_revision = "rev_sha_000"
+
+    download_fn = AsyncMock(return_value="/hf_cache/model_0")
+    load_fn = MagicMock(return_value="model_0")
+
+    new_local_n, new_hash, new_model = await maybe_pull_checkpoint(
+        state=state, local_n=0, local_hash="", local_model="bootstrap",
+        download_fn=download_fn, load_fn=load_fn,
+    )
+
+    assert (new_local_n, new_hash, new_model) == (
+        0, "rev_sha_000", "model_0",
+    )
+    download_fn.assert_awaited_once_with(
+        "aivolutionedge/reliquary-sn", "rev_sha_000"
+    )
+
+
+@pytest.mark.asyncio
 async def test_no_pull_when_repo_missing():
     """Pre-first-publish: state has checkpoint_n=0 and repo_id=None — don't try to download."""
     state = MagicMock()

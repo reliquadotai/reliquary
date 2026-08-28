@@ -14,7 +14,7 @@ rebuild. No TTL: staleness is structurally zero.
 
 from fastapi.testclient import TestClient
 
-from reliquary.protocol.submission import GrpoBatchState, WindowState
+from reliquary.protocol.submission import GrpoBatchState, MinerState, WindowState
 from reliquary.validator.cooldown import CooldownMap
 
 from tests.unit.test_validator_server import (  # reuse the existing harness
@@ -233,3 +233,55 @@ def test_error_paths_unchanged():
     server = _server()
     client = TestClient(server.app)
     assert client.get("/state", params={"env": "nope"}).status_code == 404
+
+
+def test_miner_state_is_bounded_all_env_and_conditionally_cacheable():
+    server = _server()
+    client = TestClient(server.app)
+
+    first = client.get("/miner-state", headers={"Accept-Encoding": "identity"})
+    assert first.status_code == 200
+    state = MinerState.model_validate(first.json())
+    assert set(state.environments) == {"fake"}
+    assert 42 in state.environments["fake"].cooldown_prompts()
+    # FakeEnv has 1,000 prompts: the bitset is exactly 125 raw bytes and the
+    # entire JSON control response remains comfortably below legacy list sizes.
+    assert len(first.content) < 2_500
+
+    etag = first.headers["etag"]
+    unchanged = client.get(
+        "/miner-state",
+        headers={"If-None-Match": etag, "Accept-Encoding": "gzip"},
+    )
+    assert unchanged.status_code == 304
+    assert unchanged.content == b""
+
+
+def test_fastpath_precompresses_cached_miner_state():
+    client = TestClient(_server().app)
+    client.get("/miner-state")  # fill cache through the route
+    response = client.get(
+        "/miner-state", headers={"Accept-Encoding": "gzip"}
+    )
+    assert response.status_code == 200
+    assert response.headers["content-encoding"] == "gzip"
+
+
+def test_no_active_state_fastpath_is_small_and_retryable():
+    client = TestClient(ValidatorServer().app)
+    for path in ("/state", "/miner-state"):
+        response = client.get(path)
+        assert response.status_code == 503
+        assert response.headers["retry-after"] == "1"
+        assert response.json() == {"detail": "no_active_window"}
+
+
+def test_state_fastpath_matches_fastapi_blank_and_repeated_env_semantics():
+    server = _server()
+    client = TestClient(server.app)
+    client.get("/state")  # warm the base slot
+
+    assert client.get("/state?env=").status_code == 404
+    repeated = client.get("/state?env=nope&env=fake")
+    assert repeated.status_code == 200
+    assert repeated.json()["window_n"] == 500

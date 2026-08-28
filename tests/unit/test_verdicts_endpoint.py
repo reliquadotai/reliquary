@@ -483,3 +483,49 @@ def test_verdict_without_sigma_omits_the_field() -> None:
     body = client.get("/verdicts/hk").json()
 
     assert "sigma" not in body["verdicts"][-1]
+
+
+def test_cursor_verdict_endpoint_detects_ring_rollover() -> None:
+    server, client = _make_server_open()
+    for index in range(VERDICT_CAP_PER_HOTKEY + 3):
+        server.record_verdict(
+            "hk",
+            f"{index:064x}",
+            True,
+            RejectReason.ACCEPTED,
+            window_n=1,
+        )
+
+    body = client.get("/miner-verdicts/hk", params={"after": 0}).json()
+
+    assert body["truncated"] is True
+    assert body["oldest_available_cursor"] == 4
+    assert body["verdicts"][0]["sequence"] == 4
+    assert body["next_cursor"] == VERDICT_CAP_PER_HOTKEY + 3
+
+    incremental = client.get(
+        "/miner-verdicts/hk",
+        params={"after": body["next_cursor"]},
+    ).json()
+    assert incremental["verdicts"] == []
+    assert incremental["truncated"] is False
+
+
+def test_cursor_ahead_after_validator_restart_resets_and_recovers() -> None:
+    server, client = _make_server_open()
+    server.record_verdict(
+        "hk", "f" * 64, True, RejectReason.ACCEPTED, window_n=1,
+    )
+
+    body = client.get("/miner-verdicts/hk", params={"after": 99}).json()
+
+    assert body["truncated"] is True
+    assert body["verdicts"][0]["sequence"] == 1
+    assert body["next_cursor"] == 1
+
+    empty_server = ValidatorServer()
+    empty = TestClient(empty_server.app).get(
+        "/miner-verdicts/hk", params={"after": 99},
+    ).json()
+    assert empty["truncated"] is True
+    assert empty["next_cursor"] == 0

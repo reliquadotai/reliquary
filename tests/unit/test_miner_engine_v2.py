@@ -40,6 +40,20 @@ def test_pick_prompt_all_cooldown_raises():
         pick_prompt_idx(env, cooldown_prompts=cooldown, rng=rng)
 
 
+def test_pick_prompt_does_not_scan_cooldown_history_when_probe_succeeds():
+    class _NoIterationSet(set):
+        def __iter__(self):
+            raise AssertionError("must not scan the whole cooldown set")
+
+    env = FakeEnv()
+    idx = pick_prompt_idx(
+        env,
+        cooldown_prompts=_NoIterationSet({99}),
+        rng=random.Random(1),
+    )
+    assert 0 <= idx < 99
+
+
 def test_engine_default_max_new_tokens_is_protocol_cap():
     """The env-var override is removed; max_new_tokens is the protocol cap."""
     import inspect

@@ -706,6 +706,19 @@ COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS = max(
     1, int(_os.environ.get("COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS", "10"))
 )
 
+# Delta persistence is a rolling-cutover feature. Keep it disabled until every
+# validator binary that may be used for rollback understands delta replay; old
+# binaries only read the full snapshot key. When enabled, small per-cadence
+# deltas replace full-map rewrites and a durable full compaction is published at
+# this wider interval before obsolete deltas are deleted.
+COOLDOWN_DELTA_SNAPSHOTS_ENABLED = _os.environ.get(
+    "COOLDOWN_DELTA_SNAPSHOTS_ENABLED", "0"
+).strip().lower() in ("1", "true", "yes", "on")
+COOLDOWN_COMPACTION_INTERVAL_WINDOWS = max(
+    COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS,
+    int(_os.environ.get("COOLDOWN_COMPACTION_INTERVAL_WINDOWS", "1000")),
+)
+
 # Per-window prompt range (anti pre-curation). Each window, miner and
 # validator derive the same contiguous slice of the prompt index space from
 # the shared per-window randomness; once enforcement is armed only

@@ -6,17 +6,21 @@ Operational guide for running a miner on Bittensor subnet 81. For conceptual bac
 
 1. Miner starts with `reliquary mine --wallet-name ... --hotkey ...`
 2. Discovers the validator's HTTP URL via the Bittensor metagraph (or uses `--validator-url` override).
-3. Calls `GET /state` to read `checkpoint_repo_id` and `checkpoint_revision`.
+3. Calls `GET /miner-state` to read the bounded control state, including
+   `checkpoint_repo_id` and `checkpoint_revision` (with legacy `/state`
+   fallback during rolling upgrades).
 4. If the validator has a published checkpoint, downloads it from Hugging Face and loads those weights.
 5. Falls back to the required `--checkpoint` value (`Qwen/Qwen3-4B-Base` for v5) if no checkpoint is published yet.
 6. Enters the main loop in `MiningEngine.mine_window()`:
-   - Poll `/state` every tick.
-   - If `state.checkpoint_n > local_n`, download the new HF revision and reload both model copies.
+   - Poll `/miner-state` with `If-None-Match` every tick.
+   - If the checkpoint number advances, or the advertised revision differs at
+     the same number, stage the new HF revision and atomically swap both model
+     copies only after both loads succeed.
    - If `state.state == OPEN`, pick a prompt, generate rollouts, and submit.
 
 The boot query ensures a miner joining an already-running subnet lands directly on the current model, skipping an initial reject cycle.
 
-`/state.generation_profile_id` and `/state.generation_contract` are
+`/miner-state.generation_profile_id` and `/miner-state.generation_contract` are
 authoritative. Protocol v5 uses `qwen3-4b-base-dapo-reasoning-v5`. This is a coordinated
 hard cutover, not an optional local model or token-cap change: the reference
 miner refuses to generate unless its active profile exactly matches the
@@ -43,11 +47,11 @@ active environment; extra groups from one environment do not overweight it.
 
 Every miner runs a continuous poll-submit loop:
 
-1. **Polls `/state`.** The response (`GrpoBatchState`) carries `state`, `window_n`, `checkpoint_n`, `checkpoint_repo_id`, `checkpoint_revision`, `cooldown_prompts`, and (new in v2.3) **`randomness`** — the validator's per-window seed sourced from drand-quicknet + drand-round. Use it directly as the GRAIL r_vec seed; do **not** recompute it locally from `block_hash + drand` like v2.2 miners did. (`block_hash` was dropped from the v2.3 seed entirely — see the design spec for the reasoning).
+1. **Polls `/miner-state`.** The versioned response carries `state`, `window_n`, checkpoint identity, every active environment's prompt range and bounded `bitset-v1` cooldown, and **`randomness`** — the validator's per-window seed sourced from drand-quicknet + drand-round. Send `If-None-Match` with the last ETag; HTTP 304 means the validated state is unchanged. Use `randomness` directly as the GRAIL r_vec seed; do **not** recompute it locally. Older validators fall back to per-environment `/state?env=...` calls once per window.
    - If `state != "open"`, the validator is in `TRAINING` or `PUBLISHING`. Sleep briefly (1 s) and re-poll. Do not submit while the window is not open.
    - If `checkpoint_n` advanced since the last poll, download the new HF revision and reload weights.
 
-2. **Picks a prompt.** Selects a `prompt_idx` from one active environment. OpenMath uses **OpenMathInstruct-2** ([`nvidia/OpenMathInstruct-2`](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2), ~14 million problems, math-reasoning style) and local reward computation. OpenCode uses the public curated dataset (`R0mAI/opencodeinstruct-curated`) with validator-authoritative grading. In both cases, skip prompts in `cooldown_prompts`. The reference engine uses uniform-random sampling with rejection against the cooldown set. (v2.3 switched OpenMath from Hendrycks MATH because the 12 500-prompt env exhausted under one-shot cooldown — see "One-shot prompts" below.)
+2. **Picks a prompt.** Selects a `prompt_idx` from one active environment, inside that environment's advertised `prompt_range`, and skips set bits in its cooldown bitmap. OpenMath uses **OpenMathInstruct-2** ([`nvidia/OpenMathInstruct-2`](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2), ~14 million problems, math-reasoning style) and local reward computation. OpenCode uses the public curated dataset (`R0mAI/opencodeinstruct-curated`) with validator-authoritative grading.
 
 3. **Generates M=16 rollouts.** Runs exactly 16 completions with the repository's forced-seed sampler. The deterministic stream excludes hotkey identity and is derived from window randomness, prompt, checkpoint, rollout index, and token position. Set `protocol_version=5`, render the generation contract's exact step-by-step environment template, encode that canonical prompt as raw text (do not apply a chat template), use `temperature=1.0`, `top_p=1.0`, and `top_k=0`, terminate at the first configured EOS, and do not add a presence/repetition processor that the validator does not reproduce.
 
@@ -132,10 +136,11 @@ Per submission you have `(window_n, prompt_idx)`. Two lookup paths:
 The reference strategy (`pick_prompt_idx` in `reliquary/miner/engine.py`) is uniform-random sampling with rejection against the cooldown set:
 
 ```
-GET /state  →  GrpoBatchState
+GET /miner-state  →  MinerState (schema_version=1)
 ```
 
-- Read `cooldown_prompts` and pick any `prompt_idx` not in that set.
+- Decode the selected environment's `cooldown_bitmap`, then pick an unset
+  `prompt_idx` inside its `prompt_range`.
 - Read `checkpoint_revision` and include it verbatim as `checkpoint_hash` in your submission.
 - Read `window_n` and use it as the authoritative window identifier.
 
@@ -200,10 +205,10 @@ The validator emits one of the following reasons on every failed submission. Eac
 
 | Reason | Meaning | Action |
 |---|---|---|
-| `WRONG_CHECKPOINT` | `checkpoint_hash` does not match the active HF revision | Re-poll `/state`, update revision, retry. Most common transient reject — happens briefly after every new checkpoint publish. |
-| `WRONG_RANDOMNESS` | `commit.beacon.randomness` doesn't match the validator's per-window seed (`state.randomness` on v2.3+; locally-derived `H(block_hash + drand)` on v2.2). Almost always caused by reusing a sketch built for an earlier window. | (v2.3) Read `state.randomness` from `/state` directly; do not re-derive locally. (v2.2) Derive per-window from chain + drand. In both cases: tag each sketch with the window it was built for and discard before firing if the window has advanced. |
+| `WRONG_CHECKPOINT` | `checkpoint_hash` does not match the active HF revision | Re-poll `/miner-state`, atomically activate the advertised revision, then retry. |
+| `WRONG_RANDOMNESS` | `commit.beacon.randomness` doesn't match the validator's advertised per-window seed. Almost always caused by reusing a sketch built for an earlier window. | Read `randomness` from `/miner-state` directly; tag generated work with its window and discard it if the pre-submit state recheck changed. |
 | `BAD_PROMPT_IDX` | `prompt_idx` out of range for the active environment | Use the env's prompt-index space (`0..N-1`). v2.3 / OpenMathInstruct-2: `N ≈ 14_000_000`. |
-| `PROMPT_IN_COOLDOWN` | `prompt_idx` was in the active cooldown set | v2.3: `BATCH_PROMPT_COOLDOWN_WINDOWS = 1_000_000` makes prompts effectively single-use. Read `cooldown_prompts[]` from `/state` **before each pick** and skip anything in the list. |
+| `PROMPT_IN_COOLDOWN` | `prompt_idx` was in the active cooldown set | `BATCH_PROMPT_COOLDOWN_WINDOWS = 1_000_000` makes prompts effectively single-use. Decode the bounded environment cooldown from `/miner-state` once per state revision and skip set bits. |
 | `SUPERSEDED` | Historical only; current same-prompt competition resolves at auction seal | Upgrade parsers that still expect the old runner-up flow |
 | `OUT_OF_ZONE` | σ of your 16 rewards is below threshold (`SIGMA_MIN = 0.24` steady, `0.22` during the first `BOOTSTRAP_WINDOWS = 100` windows), or an uncertain off-format outcome can move the group out of zone | Pick a prompt with at least one success and one failure; always emit a valid boxed Math answer |
 | `REWARD_MISMATCH` | OpenMath reward claim disagreed with recomputation, or a Code grader worker crashed ambiguously while handling the candidate | Recheck Math parsing; for Code, report repeatable crash-triggering output rather than retrying indefinitely |
@@ -218,34 +223,41 @@ The validator emits one of the following reasons on every failed submission. Eac
 | `BAD_SIGNATURE` | GRAIL commit signature failed | Check wallet hotkey and signing code |
 | `WORKER_DROPPED` | The batcher swapped before dequeue, or the Code grader had a retryable infrastructure outage. Grader-outage quota is refunded. | Re-poll and retry later; sustained events indicate validator backpressure or grader health problems |
 
-`PROMPT_IN_COOLDOWN` is the most common **persistent** rejection caused by miner code: if your picker doesn't read `cooldown_prompts[]` before each pick, you will repeatedly submit prompts the validator has already cooled. Read the field — it's small and refreshes every `/state` call. The dashboard surfaces this directly on the miner drawer.
+`PROMPT_IN_COOLDOWN` is the most common **persistent** rejection caused by miner code. The legacy `/state.cooldown_prompts` list is retained only for compatibility and can be large; new miners use the bounded `/miner-state` bitset and cache it by ETag.
 
-### Real-time verdict feedback (`/verdicts/{hotkey}`)
+### Real-time verdict feedback (`/miner-verdicts/{hotkey}`)
 
 Under the production worker path `/submit` returns only `accepted=True reason="submitted"`. The first `/verdicts` result reports pool admission. The final result arrives after the collection deadline and seal-time proof. Identify it by non-null `selected_for_batch` and `rewarded`; do not treat the first `ACCEPTED` as a win.
 
-The validator exposes the real per-submission verdicts via:
+The reference miner uses the gap-detectable cursor endpoint:
 
 ```
-GET http://<validator-host>:<validator-port>/verdicts/{your_hotkey}?since=<unix_ts>
+GET http://<validator-host>:<validator-port>/miner-verdicts/{your_hotkey}?after=<sequence>
 ```
 
-Response (`VerdictsResponse` in `reliquary/protocol/submission.py`):
+Response (`VerdictsPage` in `reliquary/protocol/submission.py`):
 
 ```json
 {
   "verdicts": [
-    {"merkle_root": "ab12...64hex", "window_n": 1858, "accepted": true, "reason": "accepted", "ts": 1747353600.5},
-    {"merkle_root": "ab12...64hex", "window_n": 1858, "accepted": true, "reason": "accepted", "selected_for_batch": true, "rewarded": true, "canonical_rank": 2, "ts": 1747353901.1},
-    {"merkle_root": "ef56...64hex", "window_n": 1858, "accepted": false, "reason": "grail_fail", "accepted_into_pool": true, "selected_for_batch": false, "rewarded": false, "reject_stage": "auction_seal", "ts": 1747353902.0}
-  ]
+    {"sequence": 121, "merkle_root": "ab12...64hex", "window_n": 1858, "accepted": true, "reason": "accepted", "ts": 1747353600.5},
+    {"sequence": 122, "merkle_root": "ab12...64hex", "window_n": 1858, "accepted": true, "reason": "accepted", "selected_for_batch": true, "rewarded": true, "canonical_rank": 2, "ts": 1747353901.1},
+    {"sequence": 123, "merkle_root": "ef56...64hex", "window_n": 1858, "accepted": false, "reason": "grail_fail", "accepted_into_pool": true, "selected_for_batch": false, "rewarded": false, "reject_stage": "auction_seal", "ts": 1747353902.0}
+  ],
+  "next_cursor": 123,
+  "oldest_available_cursor": 1,
+  "truncated": false
 }
 ```
 
 Properties:
 
-- **Per-hotkey ring buffer** of the last `VERDICT_CAP_PER_HOTKEY = 200` verdicts. Older entries roll off silently.
-- **Ordered by `ts` ascending.** Pass the highest `ts` you've seen as `?since=<ts>` to get only newer entries — strict `>` filter, so the same `ts` is excluded.
+- **Per-hotkey ring buffer** of the last `VERDICT_CAP_PER_HOTKEY = 200`
+  verdicts. `truncated=true` reports rollover or a cursor reset after validator
+  restart.
+- **Monotonic integer cursor.** Persist `next_cursor` and pass it as `after`.
+  `truncated=true` explicitly reports that the ring rolled over before the
+  requested cursor.
 - **Empty list for unseen hotkeys** (200, not 404).
 - **Public read.** Same trust model as the R2 archive; anyone can query any hotkey's verdicts.
 - **Lock-free.** Doesn't compete with the submit worker for the batcher lock.
@@ -459,7 +471,10 @@ If submissions are rejected, the `reason` field tells you why (see the rejection
 
 ## Monitoring and stopping
 
-The miner loop runs until killed. Between windows (when `/state` returns `state != "open"`) it sleeps 1 s and re-polls. On network errors it backs off for up to 12 s. No per-window state is kept locally, so restarting is safe.
+The miner loop runs until killed. Between windows it sleeps 1 s and re-polls.
+Control-plane requests use 2–3 second timeouts with sub-second jittered retry;
+the 60-second timeout remains reserved for submission uploads. Cooldown state is
+cached by ETag and `(window_n, environment)` in memory; restarting is safe.
 
 ```bash
 # GPU utilization during generation and proof construction.
