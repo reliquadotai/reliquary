@@ -43,7 +43,7 @@ services:
         - CMD
         - python
         - -c
-        - "import json; p=json.load(open('/tmp/reliquary-cpu-executor-health.json')); assert not p['shutdown_complete']; assert p['workers_alive'] == p['pool_size']"
+        - "import json,os,socket; p=json.load(open('/tmp/reliquary-cpu-executor-health.json')); assert not p['shutdown_complete']; assert p['workers_alive'] == p['pool_size']; s=socket.create_connection((os.environ['RELIQUARY_CPU_EXECUTOR_HOST'],int(os.environ['RELIQUARY_CPU_EXECUTOR_PORT'])),2); s.close()"
       interval: 15s
       timeout: 3s
       retries: 4
