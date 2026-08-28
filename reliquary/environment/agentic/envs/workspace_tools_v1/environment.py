@@ -78,35 +78,89 @@ def _build_task(index: int) -> EpisodeTask:
     index = int(index) % TASK_COUNT
     digest = hashlib.sha256(f"{GENERATOR_VERSION}:{index}".encode()).digest()
     rng = random.Random(int.from_bytes(digest[:16], "big"))
-    multiplier = rng.randrange(2, 10)
-    original = (
-        "def scale(values):\n"
-        "    \"\"\"Return each input multiplied by the configured factor.\"\"\"\n"
-        "    return [value + FACTOR for value in values]\n\n"
-        f"FACTOR = {multiplier}\n"
-    )
-    expected = original.replace("value + FACTOR", "value * FACTOR")
+    family = index % 4
+    if family == 0:
+        multiplier = rng.randrange(2, 10)
+        original = (
+            "def scale(values):\n"
+            "    \"\"\"Return each input multiplied by the configured factor.\"\"\"\n"
+            "    return [value + FACTOR for value in values]\n\n"
+            f"FACTOR = {multiplier}\n"
+        )
+        expected = original.replace("value + FACTOR", "value * FACTOR")
+        prompt = (
+            "Fix src/transform.py so scale(values) multiplies each value by "
+            "FACTOR. Preserve every other file, run the tests, and finish with "
+            "a short summary."
+        )
+        specification = (
+            f"scale([1, 3]) == [{multiplier}, {3 * multiplier}]\n"
+        )
+        summary = "Fixed scale to multiply by FACTOR; tests pass."
+        family_name = "arithmetic_operator"
+    elif family == 1:
+        limit = rng.randrange(3, 12)
+        original = (
+            "def indices(limit):\n"
+            "    \"\"\"Return every integer from zero through limit.\"\"\"\n"
+            "    return list(range(limit))\n"
+        )
+        expected = original.replace("range(limit)", "range(limit + 1)")
+        prompt = (
+            "Fix src/transform.py so indices(limit) includes the upper bound. "
+            "Preserve every other file, run the tests, and finish with a short "
+            "summary."
+        )
+        specification = f"indices({limit})[-1] == {limit}\n"
+        summary = "Fixed the inclusive upper bound; tests pass."
+        family_name = "boundary_condition"
+    elif family == 2:
+        original = (
+            "def non_negative(values):\n"
+            "    \"\"\"Keep positive values and zero in their original order.\"\"\"\n"
+            "    return [value for value in values if value > 0]\n"
+        )
+        expected = original.replace("value > 0", "value >= 0")
+        prompt = (
+            "Fix src/transform.py so non_negative(values) retains zero as well "
+            "as positive values. Preserve every other file, run the tests, and "
+            "finish with a short summary."
+        )
+        specification = "non_negative([-2, 0, 3]) == [0, 3]\n"
+        summary = "Fixed zero handling in non_negative; tests pass."
+        family_name = "filter_predicate"
+    else:
+        original = (
+            "def normalize(value):\n"
+            "    \"\"\"Trim surrounding whitespace and lowercase the value.\"\"\"\n"
+            "    return value.lower()\n"
+        )
+        expected = original.replace("value.lower()", "value.strip().lower()")
+        prompt = (
+            "Fix src/transform.py so normalize(value) trims surrounding "
+            "whitespace before lowercasing. Preserve every other file, run the "
+            "tests, and finish with a short summary."
+        )
+        specification = "normalize('  Ready ') == 'ready'\n"
+        summary = "Fixed whitespace normalization; tests pass."
+        family_name = "string_normalization"
     return EpisodeTask(
         id=hashlib.sha256(
             f"reliquary_workspace_tools_v1:{index}".encode()
         ).hexdigest()[:16],
-        prompt=(
-            "Fix the implementation in src/transform.py so scale(values) "
-            "multiplies each value by FACTOR. Preserve every other file, run the "
-            "tests, and finish with a short summary."
-        ),
+        prompt=prompt,
         tools=TOOLS,
         metadata={
-            "family": "single_file_repair",
+            "family": family_name,
             "generator_version": GENERATOR_VERSION,
             "generator_index": index,
-            "difficulty": 1,
+            "difficulty": 1 + family,
         },
         private={
             "files": {
                 "src/transform.py": original,
-                "README.md": "# Deterministic scale utility\n",
-                "tests/spec.txt": f"scale([1, 3]) == [{multiplier}, {3 * multiplier}]\n",
+                "README.md": "# Deterministic transform utility\n",
+                "tests/spec.txt": specification,
             },
             "expected_path": "src/transform.py",
             "expected_content": expected,
@@ -117,7 +171,7 @@ def _build_task(index: int) -> EpisodeTask:
                 ),
                 AssistantAction.tool_call("run_tests"),
                 AssistantAction.tool_call(
-                    "finish", response="Fixed scale to multiply by FACTOR; tests pass."
+                    "finish", response=summary
                 ),
             ),
         },
@@ -284,6 +338,7 @@ class WorkspaceToolsEnvironment:
             checks,
             state_digest=sha256_json(current_files),
             fatal=fatal,
+            binary=True,
         )
 
     def close(self, state: WorkspaceState) -> None:

@@ -20,6 +20,7 @@ from dataclasses import dataclass
 import hashlib
 import importlib
 import json
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal
 
@@ -204,6 +205,84 @@ def _validate_import_path(path: str) -> None:
         raise ValueError(f"invalid import path {path!r}")
 
 
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+_MANIFEST_ROOT = Path(__file__).resolve().parent / "manifests"
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _canonical_document_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _implementation_sha256(paths: Sequence[str]) -> str:
+    digest = hashlib.sha256()
+    for relative in sorted(paths):
+        path = (_REPOSITORY_ROOT / relative).resolve()
+        if _REPOSITORY_ROOT not in path.parents:
+            raise ValueError(f"implementation path escapes repository: {relative}")
+        file_digest = _file_sha256(path)
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(file_digest.encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _validate_installed_manifest(spec: EnvironmentSpec) -> None:
+    expected_digest = spec.environment_manifest_sha256
+    if expected_digest is None:
+        return
+    path = _MANIFEST_ROOT / f"{spec.name}.json"
+    if not path.is_file():
+        raise ValueError(f"environment manifest missing: {path}")
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    actual_digest = _canonical_document_sha256(manifest)
+    if actual_digest != expected_digest:
+        raise ValueError(
+            f"environment manifest digest mismatch for {spec.name}: "
+            f"expected {expected_digest}, got {actual_digest}"
+        )
+    if manifest.get("environment") != spec.name:
+        if manifest.get("environment_id") != spec.name:
+            raise ValueError(f"environment manifest name mismatch for {spec.name}")
+    implementation_files = manifest.get("implementation_files")
+    implementation_digest = manifest.get("implementation_sha256")
+    if implementation_files is not None or implementation_digest is not None:
+        if not isinstance(implementation_files, list) or not all(
+            isinstance(value, str) and value for value in implementation_files
+        ):
+            raise ValueError(f"invalid implementation file list for {spec.name}")
+        if _implementation_sha256(implementation_files) != implementation_digest:
+            raise ValueError(f"implementation digest mismatch for {spec.name}")
+    for path_key, digest_key in (
+        ("golden_fixture", "golden_fixture_sha256"),
+        ("episode_schema", "episode_schema_sha256"),
+    ):
+        relative = manifest.get(path_key)
+        bound_digest = manifest.get(digest_key)
+        # Historical generated manifests bind a fixture digest without
+        # carrying its repository-relative path. Their dedicated qualifier
+        # verifies that legacy shape; new Episode v1 manifests bind both.
+        if relative is None:
+            continue
+        if not isinstance(bound_digest, str):
+            raise ValueError(f"incomplete {path_key} binding for {spec.name}")
+        bound_path = (_REPOSITORY_ROOT / relative).resolve()
+        if _REPOSITORY_ROOT not in bound_path.parents:
+            raise ValueError(f"{path_key} escapes repository for {spec.name}")
+        if _file_sha256(bound_path) != bound_digest:
+            raise ValueError(f"{path_key} digest mismatch for {spec.name}")
+
+
 _SPEC_VALUES = (
     EnvironmentSpec(
         name="openmathinstruct",
@@ -276,15 +355,15 @@ _SPEC_VALUES = (
         admission_resource_class="cpu",
         termination_policy="eos_or_cap",
         final_answer_policy="json",
-        reward_lattice_policy="weighted-invariants-v1",
-        attainable_rewards=(),
+        reward_lattice_policy="binary-v1",
+        attainable_rewards=(0.0, 1.0),
         contract_version="reliquary-stateful-tools-v1",
         interaction_mode="episode",
         episode_replay_path="reliquary.environment.agentic.suite:replay_submission",
         renderer_id="reliquary-jsonl-tools-v1",
         environment_manifest_sha256=(
-            "b0792fc5bf342bb615c22111d65d3458"
-            "eec42a88dd48d2f773cacddd0cf0a0fb"
+            "2b803b2caaa53f55144dcbea8e4af83c"
+            "2be069bb53c1eabde5600808375c7043"
         ),
     ),
     EnvironmentSpec(
@@ -301,15 +380,15 @@ _SPEC_VALUES = (
         admission_resource_class="cpu",
         termination_policy="eos_or_cap",
         final_answer_policy="json",
-        reward_lattice_policy="weighted-evidence-v1",
-        attainable_rewards=(),
+        reward_lattice_policy="binary-v1",
+        attainable_rewards=(0.0, 1.0),
         contract_version="reliquary-retrieval-tools-v1",
         interaction_mode="episode",
         episode_replay_path="reliquary.environment.agentic.suite:replay_submission",
         renderer_id="reliquary-jsonl-tools-v1",
         environment_manifest_sha256=(
-            "d928f6dfcb0dd101dbf6e60ee786a33e"
-            "3e9ebd806b621349de7edec1aead7593"
+            "fa772a63257da98f2acea67406ac1a5c"
+            "b68a1422317ac0abb809f3cd70e7a70b"
         ),
     ),
     EnvironmentSpec(
@@ -326,15 +405,15 @@ _SPEC_VALUES = (
         admission_resource_class="sandbox",
         termination_policy="eos_or_cap",
         final_answer_policy="json",
-        reward_lattice_policy="weighted-workspace-invariants-v1",
-        attainable_rewards=(),
+        reward_lattice_policy="binary-v1",
+        attainable_rewards=(0.0, 1.0),
         contract_version="reliquary-workspace-tools-v1",
         interaction_mode="episode",
         episode_replay_path="reliquary.environment.agentic.suite:replay_submission",
         renderer_id="reliquary-jsonl-tools-v1",
         environment_manifest_sha256=(
-            "2ee517dd7118defb997df4bd008da28f4"
-            "d45d926ce2fdedf63870cd18f8c1a96"
+            "b5e5b13e9bb25f82465fad4132ef9185"
+            "2d2a1f5ad04239bdf936c23d4b634795"
         ),
     ),
 )
@@ -347,6 +426,7 @@ def _build_catalog(
     for spec in specs:
         if spec.name in catalog:
             raise ValueError(f"duplicate environment registration: {spec.name}")
+        _validate_installed_manifest(spec)
         catalog[spec.name] = spec
     return MappingProxyType(catalog)
 
@@ -420,13 +500,30 @@ def resolve_environment_mix(
 
     mix: list[tuple[str, int]] = []
     for name in names:
-        get_environment_spec(name)
+        spec = get_environment_spec(name)
         try:
             environment_profile = profile_environments[name]
         except KeyError as exc:
             raise ValueError(
                 f"environment {name!r} is not declared by the active protocol profile"
             ) from exc
+        profile_contract = getattr(
+            environment_profile, "environment_contract_id", None
+        )
+        profile_manifest = getattr(
+            environment_profile, "environment_manifest_sha256", None
+        )
+        if profile_contract is not None and profile_contract != spec.contract_version:
+            raise ValueError(
+                f"environment {name!r} contract does not match installed code"
+            )
+        if (
+            profile_manifest is not None
+            and profile_manifest != spec.environment_manifest_sha256
+        ):
+            raise ValueError(
+                f"environment {name!r} manifest does not match installed code"
+            )
         configured = getattr(environment_profile, "batch_target", None)
         target = int(
             default_batch_target if configured is None else configured

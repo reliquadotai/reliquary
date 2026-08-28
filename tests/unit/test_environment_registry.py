@@ -100,6 +100,49 @@ def test_resolve_environment_mix_uses_profile_target_or_legacy_default():
     ) == [("openmathinstruct", 16), ("opencodeinstruct", 7)]
 
 
+def test_resolve_environment_mix_rejects_contract_or_manifest_drift():
+    spec = get_environment_spec("reliquary_stateful_tools_v1")
+    base = {
+        "batch_target": 16,
+        "environment_contract_id": spec.contract_version,
+        "environment_manifest_sha256": spec.environment_manifest_sha256,
+    }
+    with pytest.raises(ValueError, match="contract does not match"):
+        resolve_environment_mix(
+            [spec.name],
+            profile_environments={
+                spec.name: SimpleNamespace(
+                    **{**base, "environment_contract_id": "wrong-v1"}
+                )
+            },
+            default_batch_target=16,
+        )
+    with pytest.raises(ValueError, match="manifest does not match"):
+        resolve_environment_mix(
+            [spec.name],
+            profile_environments={
+                spec.name: SimpleNamespace(
+                    **{**base, "environment_manifest_sha256": "0" * 64}
+                )
+            },
+            default_batch_target=16,
+        )
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "reliquary_stateful_tools_v1",
+        "reliquary_retrieval_tools_v1",
+        "reliquary_workspace_tools_v1",
+    ),
+)
+def test_episode_specs_expose_the_binary_training_reward_lattice(name):
+    spec = get_environment_spec(name)
+    assert spec.reward_lattice_policy == "binary-v1"
+    assert spec.attainable_rewards == (0.0, 1.0)
+
+
 def test_spec_rejects_invalid_lattice_and_import_path():
     kwargs = dict(
         name="x",

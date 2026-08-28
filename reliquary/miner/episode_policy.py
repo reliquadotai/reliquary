@@ -26,7 +26,7 @@ class JsonActionStoppingCriteria:
             try:
                 AssistantAction.from_json(text)
                 verdicts.append(True)
-            except (TypeError, ValueError):
+            except (RecursionError, TypeError, ValueError):
                 verdicts.append(False)
         return torch.tensor(verdicts, device=input_ids.device, dtype=torch.bool)
 

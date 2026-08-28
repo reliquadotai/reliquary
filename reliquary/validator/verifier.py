@@ -518,6 +518,41 @@ def policy_token_positions(
     )
 
 
+def proof_challenge_indices(
+    tokens: list[int],
+    rollout_meta: dict[str, Any],
+    randomness: str,
+) -> list[int]:
+    """Select GRAIL positions from the policy span for Episode v1.
+
+    Tool observations and renderer separators are validator-produced and
+    replayed byte-exactly. V8 therefore spends its bounded sketch challenges
+    only on model-generated assistant tokens. Legacy v7 keeps its historical
+    full-sequence selection unchanged.
+    """
+
+    from reliquary.protocol.crypto import indices_from_root
+
+    episode = rollout_meta.get("episode")
+    if isinstance(episode, dict):
+        policy_positions = policy_token_positions(tokens, rollout_meta)
+        if not policy_positions:
+            return []
+        relative = indices_from_root(
+            tokens,
+            randomness,
+            len(policy_positions),
+            min(CHALLENGE_K, len(policy_positions)),
+        )
+        return [policy_positions[index] for index in relative]
+    return indices_from_root(
+        tokens,
+        randomness,
+        len(tokens),
+        min(CHALLENGE_K, len(tokens)),
+    )
+
+
 def verify_commitment_proofs(
     commit: dict,
     model: Any,
@@ -545,7 +580,6 @@ def verify_commitment_proofs(
     counts are computed on GPU the same way. When None (pre-forced-seed
     clients), ``seed_n_stochastic``/``seed_n_match`` stay at 0 — no-op.
     """
-    from reliquary.protocol.crypto import indices_from_root
     from reliquary.protocol.grail_verifier import GRAILVerifier
     from reliquary.shared.forward import forward_single_layer
     from reliquary.shared.hf_compat import resolve_hidden_size
@@ -570,10 +604,17 @@ def verify_commitment_proofs(
     verifier = GRAILVerifier(hidden_dim=hidden_dim)
     r_vec = verifier.generate_r_vec(randomness)
 
-    expected_challenges = min(CHALLENGE_K, seq_len)
-    challenge_indices = indices_from_root(
-        tokens, randomness, seq_len, expected_challenges
+    challenge_indices = proof_challenge_indices(
+        tokens,
+        rollout_meta,
+        randomness,
     )
+    challenge_domain_size = (
+        len(policy_positions)
+        if isinstance(rollout_meta.get("episode"), dict)
+        else seq_len
+    )
+    expected_challenges = min(CHALLENGE_K, challenge_domain_size)
 
     device = next(model.parameters()).device
     input_ids = torch.tensor([tokens], device=device)
@@ -738,7 +779,11 @@ def verify_commitment_proofs(
 
     # SECURITY: All expected challenge positions must be checked and pass.
     # A miner cannot benefit from having fewer positions verified.
-    all_passed = passed == checked and checked >= expected_challenges
+    all_passed = bool(
+        expected_challenges > 0
+        and passed == checked
+        and checked == expected_challenges
+    )
     return ProofResult(
         all_passed=all_passed,
         passed=passed,

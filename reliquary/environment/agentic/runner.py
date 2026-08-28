@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import replace
+import hashlib
 from typing import Protocol
 
 from reliquary.environment.agentic.base import EpisodeEnvironment
@@ -99,9 +100,16 @@ class EpisodeRunner:
                 )
                 try:
                     action = AssistantAction.from_json(generated.text)
-                except (TypeError, ValueError):
+                except (RecursionError, TypeError, ValueError):
+                    raw_bytes = generated.text.encode(
+                        "utf-8", errors="backslashreplace"
+                    )
                     action = AssistantAction.tool_call(
-                        "__invalid_action__", raw=generated.text
+                        "__invalid_action__",
+                        raw_prefix=raw_bytes[:256].decode(
+                            "utf-8", errors="replace"
+                        ),
+                        raw_sha256=hashlib.sha256(raw_bytes).hexdigest(),
                     )
                 actions.append(action)
                 events.append(

@@ -13,7 +13,10 @@ def episode_problem(environment: Any, index: int) -> dict[str, Any]:
         "prompt": task.prompt,
         "ground_truth": "",
         "task_id": task.id,
-        "task_family": task.metadata.get("task_family", environment.name),
+        "task_family": task.metadata.get(
+            "family",
+            task.metadata.get("task_family", environment.name),
+        ),
         "generator_version": task.metadata.get("generator_version", "v1"),
     }
     for key in ("operation_id", "difficulty"):

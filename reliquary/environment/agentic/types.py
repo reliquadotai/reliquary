@@ -271,17 +271,23 @@ class RewardReport:
         *,
         state_digest: str,
         fatal: bool = False,
+        binary: bool = False,
     ) -> "RewardReport":
         values = tuple(checks)
+        success = bool(values) and not fatal and all(
+            check.passed for check in values
+        )
         denominator = sum(check.weight for check in values)
         reward = (
-            0.0
+            float(success)
+            if binary
+            else 0.0
             if fatal or denominator <= 0
             else sum(check.weight for check in values if check.passed) / denominator
         )
         return cls(
             reward=float(reward),
-            success=bool(values) and not fatal and all(check.passed for check in values),
+            success=success,
             checks=values,
             state_digest=state_digest,
         )

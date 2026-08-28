@@ -215,6 +215,40 @@ class TestMinimumChallengesEnforced:
 
     @patch("reliquary.shared.forward.forward_single_layer")
     @patch("reliquary.shared.hf_compat.resolve_hidden_size", return_value=HIDDEN_DIM)
+    def test_episode_policy_span_still_requires_full_challenge_count(
+        self, _rhs, mock_fwd
+    ):
+        from reliquary.validator.verifier import verify_commitment_proofs
+
+        seq_len = 64
+        mock_fwd.return_value = (
+            torch.randn(1, seq_len, HIDDEN_DIM),
+            torch.zeros(1, seq_len, 10),
+        )
+        commit = {
+            "tokens": [index % 10 for index in range(seq_len)],
+            "commitments": [{"sketch": 0}] * seq_len,
+            "rollout": {
+                "episode": {"assistant_spans": [[8, 48]]},
+            },
+        }
+
+        with patch(
+            "reliquary.protocol.crypto.indices_from_root",
+            return_value=[0, 1],
+        ), patch(
+            "reliquary.protocol.grail_verifier.GRAILVerifier.verify_commitment",
+            return_value=(True, {}),
+        ):
+            result = verify_commitment_proofs(
+                commit, _make_mock_model(), VALIDATOR_RANDOMNESS
+            )
+        assert result.checked == 2
+        assert result.passed == 2
+        assert result.all_passed is False
+
+    @patch("reliquary.shared.forward.forward_single_layer")
+    @patch("reliquary.shared.hf_compat.resolve_hidden_size", return_value=HIDDEN_DIM)
     def test_one_failure_rejects(self, _rhs, mock_fwd):
         from reliquary.validator.verifier import verify_commitment_proofs
 

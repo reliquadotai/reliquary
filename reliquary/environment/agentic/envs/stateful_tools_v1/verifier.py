@@ -28,6 +28,41 @@ def database_snapshot(connection: Any) -> dict[str, list[list[Any]]]:
     return snapshot
 
 
+def expected_database_snapshot(task: EpisodeTask) -> dict[str, list[list[Any]]]:
+    """Build the only final database state accepted for this task.
+
+    Checking an exact snapshot prevents a model from satisfying the target
+    while also applying an otherwise-allowed mutation to a distractor row.
+    """
+
+    rows = task.private["rows"]
+    expected = dict(task.private["expected"])
+    family = str(task.metadata["family"])
+    customer_id = str(task.private["target_customer_id"])
+    order_id = str(task.private["target_order_id"])
+    orders = [list(row) for row in rows["orders"]]
+    if family == "address_update":
+        for row in orders:
+            if row[0] == order_id:
+                row[3] = expected["address"]
+                break
+    refunds: list[list[Any]] = []
+    if family == "refund":
+        refunds.append([
+            expected["refund_id"],
+            order_id,
+            expected["refund_cents"],
+        ])
+    return {
+        "customers": sorted(
+            [list(row) for row in rows["customers"]], key=lambda row: row[0]
+        ),
+        "orders": sorted(orders, key=lambda row: row[0]),
+        "refunds": sorted(refunds, key=lambda row: row[0]),
+        "notes": [[1, customer_id, expected["note"]]],
+    }
+
+
 def grade_state(task: EpisodeTask, state: Any, trace: EpisodeTrace) -> RewardReport:
     expected = dict(task.private["expected"])
     customer_id = str(task.private["target_customer_id"])
@@ -102,14 +137,24 @@ def grade_state(task: EpisodeTask, state: Any, trace: EpisodeTrace) -> RewardRep
             weight=0.5,
         )
     )
-    allowed = set(expected["allowed_mutations"])
-    forbidden = [mutation for mutation in state.mutations if mutation[0] not in allowed]
+    expected_mutations = {
+        "address_update": [
+            ("update_address", order_id),
+            ("add_note", customer_id),
+        ],
+        "refund": [
+            ("create_refund", order_id),
+            ("add_note", customer_id),
+        ],
+        "support_note": [("add_note", customer_id)],
+    }[family]
+    mutations_exact = sorted(state.mutations) == sorted(expected_mutations)
     checks.append(
         RewardCheck(
-            "no_forbidden_mutations",
-            not forbidden,
+            "mutations_exact",
+            mutations_exact,
             weight=2.0,
-            detail="" if not forbidden else repr(forbidden[:3]),
+            detail="" if mutations_exact else repr(state.mutations[:6]),
         )
     )
     checks.append(
@@ -121,9 +166,18 @@ def grade_state(task: EpisodeTask, state: Any, trace: EpisodeTrace) -> RewardRep
     )
 
     snapshot = database_snapshot(connection)
-    fatal = bool(forbidden)
+    expected_snapshot = expected_database_snapshot(task)
+    state_exact = snapshot == expected_snapshot
+    checks.append(
+        RewardCheck(
+            "database_state_exact",
+            state_exact,
+            weight=3.0,
+        )
+    )
     return RewardReport.from_checks(
         checks,
         state_digest=sha256_json(snapshot),
-        fatal=fatal,
+        fatal=not state_exact,
+        binary=True,
     )

@@ -7,7 +7,10 @@ from reliquary.protocol.profiles import resolve_protocol_profile
 from reliquary.protocol.signatures import build_episode_commit_binding
 from reliquary.protocol.submission import CommitModel
 from reliquary.validator.training import _policy_token_positions
-from reliquary.validator.verifier import policy_token_positions
+from reliquary.validator.verifier import (
+    policy_token_positions,
+    proof_challenge_indices,
+)
 
 
 def _episode_commit() -> dict:
@@ -96,3 +99,16 @@ def test_v8_signature_binding_changes_with_episode_state():
     changed["state_digest"] = "f" * 64
     second = build_episode_commit_binding(**kwargs, episode=changed)
     assert first != second
+
+
+def test_v8_grail_challenges_only_model_generated_tokens():
+    commit = _episode_commit()
+    expected = set(policy_token_positions(
+        commit["tokens"], commit["rollout"]
+    ))
+    challenged = proof_challenge_indices(
+        commit["tokens"], commit["rollout"], "ab" * 32
+    )
+    assert challenged
+    assert set(challenged) <= expected
+    assert len(challenged) == len(expected)

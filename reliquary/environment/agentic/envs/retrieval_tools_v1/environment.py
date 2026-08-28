@@ -77,44 +77,119 @@ def _build_task(index: int) -> EpisodeTask:
     rng = random.Random(int.from_bytes(digest[:16], "big"))
     project = f"Project-{rng.randrange(1000, 9999)}"
     code = f"ZX-{rng.randrange(10000, 99999)}"
-    target_id = f"doc-{rng.randrange(100000, 999999)}"
-    distractor_ids = [f"doc-{rng.randrange(100000, 999999)}" for _ in range(4)]
-    documents = {
-        target_id: (
-            f"Operations memo for {project}. The approved recovery code is {code}. "
-            "This supersedes all earlier drafts."
-        ),
-        distractor_ids[0]: f"Meeting notes for {project}; recovery approval is pending.",
-        distractor_ids[1]: "General incident response handbook with no project codes.",
-        distractor_ids[2]: f"An obsolete draft mentions code ZZ-{rng.randrange(10000, 99999)}.",
-        distractor_ids[3]: "Procurement schedule and unrelated delivery dates.",
-    }
+    base_id = rng.randrange(100000, 999990)
+    document_ids = [f"doc-{base_id + offset}" for offset in range(6)]
+    family = index % 3
+    if family == 0:
+        target_id = document_ids[0]
+        documents = {
+            target_id: (
+                f"Operations memo for {project}. The approved recovery code is "
+                f"{code}. This supersedes all earlier drafts."
+            ),
+            document_ids[1]: (
+                f"Meeting notes for {project}; recovery approval is pending."
+            ),
+            document_ids[2]: "General incident response handbook with no codes.",
+            document_ids[3]: (
+                "An obsolete draft mentions code "
+                f"ZZ-{rng.randrange(10000, 99999)}."
+            ),
+            document_ids[4]: "Procurement schedule and unrelated delivery dates.",
+        }
+        prompt = (
+            f"Find the currently approved recovery code for {project}. Answer "
+            "with the code and cite only documents that directly support it."
+        )
+        required_opened = (target_id,)
+        expected_citations = (target_id,)
+        reference = (
+            AssistantAction.tool_call("search_documents", query=project),
+            AssistantAction.tool_call("open_document", document_id=target_id),
+            AssistantAction.tool_call(
+                "finish", response=code, citations=[target_id]
+            ),
+        )
+        family_name = "single_evidence"
+    elif family == 1:
+        alias = f"Cluster-{rng.randrange(100, 999)}"
+        link_id, code_id = document_ids[:2]
+        documents = {
+            link_id: (
+                f"Deployment registry: {project} currently maps to {alias}."
+            ),
+            code_id: (
+                f"Recovery ledger for {alias}: approved code {code}."
+            ),
+            document_ids[2]: f"Archive: {project} previously used Cluster-001.",
+            document_ids[3]: "General recovery policy without project mappings.",
+            document_ids[4]: "Unrelated cluster maintenance schedule.",
+        }
+        prompt = (
+            f"Resolve the current deployment alias for {project}, then find its "
+            "approved recovery code. Answer with the code and cite both documents "
+            "needed to establish the chain."
+        )
+        required_opened = (link_id, code_id)
+        expected_citations = (link_id, code_id)
+        reference = (
+            AssistantAction.tool_call("search_documents", query=project),
+            AssistantAction.tool_call("open_document", document_id=link_id),
+            AssistantAction.tool_call("search_documents", query=alias),
+            AssistantAction.tool_call("open_document", document_id=code_id),
+            AssistantAction.tool_call(
+                "finish", response=code, citations=[link_id, code_id]
+            ),
+        )
+        family_name = "multi_hop_alias"
+    else:
+        old_id, current_id = document_ids[:2]
+        old_code = f"ZZ-{rng.randrange(10000, 99999)}"
+        documents = {
+            old_id: (
+                f"Revision 1 for {project}: recovery code {old_code}. Superseded."
+            ),
+            current_id: (
+                f"Revision 2 for {project}: recovery code {code}. Current and "
+                "approved."
+            ),
+            document_ids[2]: f"Meeting agenda for {project}; no approval decision.",
+            document_ids[3]: "General document-retention policy.",
+            document_ids[4]: "Unrelated incident report.",
+        }
+        prompt = (
+            f"Compare the available revisions for {project} and return the current "
+            "approved recovery code. Cite only the current authoritative revision."
+        )
+        required_opened = (old_id, current_id)
+        expected_citations = (current_id,)
+        reference = (
+            AssistantAction.tool_call("search_documents", query=project),
+            AssistantAction.tool_call("open_document", document_id=old_id),
+            AssistantAction.tool_call("open_document", document_id=current_id),
+            AssistantAction.tool_call(
+                "finish", response=code, citations=[current_id]
+            ),
+        )
+        family_name = "revision_resolution"
     return EpisodeTask(
         id=hashlib.sha256(
             f"reliquary_retrieval_tools_v1:{index}".encode()
         ).hexdigest()[:16],
-        prompt=(
-            f"Find the currently approved recovery code for {project}. Answer with "
-            "the code and cite only documents that directly support it."
-        ),
+        prompt=prompt,
         tools=TOOLS,
         metadata={
-            "family": "frozen_evidence_retrieval",
+            "family": family_name,
             "generator_version": GENERATOR_VERSION,
             "generator_index": index,
             "difficulty": 1 + index % 3,
         },
         private={
             "documents": documents,
-            "target_document_id": target_id,
+            "required_opened": required_opened,
+            "expected_citations": expected_citations,
             "answer": code,
-            "reference_actions": (
-                AssistantAction.tool_call("search_documents", query=project),
-                AssistantAction.tool_call("open_document", document_id=target_id),
-                AssistantAction.tool_call(
-                    "finish", response=code, citations=[target_id]
-                ),
-            ),
+            "reference_actions": reference,
         },
     )
 
@@ -168,7 +243,10 @@ class RetrievalToolsEnvironment:
             if name == "search_documents":
                 if set(arguments) != {"query"}:
                     raise ValueError("search_documents requires query")
-                terms = set(re.findall(r"[a-z0-9-]+", str(arguments["query"]).lower()))
+                query = str(arguments["query"])
+                if not query or len(query) > 512:
+                    raise ValueError("query must contain 1..512 characters")
+                terms = set(re.findall(r"[a-z0-9-]+", query.lower()))
                 if not terms:
                     raise ValueError("query must not be empty")
                 scored = []
@@ -198,7 +276,12 @@ class RetrievalToolsEnvironment:
                     isinstance(value, str) for value in citations
                 ):
                     raise ValueError("citations must be a list of strings")
-                state.final_response = str(arguments["response"])
+                if len(citations) > 16:
+                    raise ValueError("citations must contain at most 16 IDs")
+                response = str(arguments["response"])
+                if not response or len(response) > 4096:
+                    raise ValueError("response must contain 1..4096 characters")
+                state.final_response = response
                 state.citations = tuple(citations)
                 return StepResult(
                     state,
@@ -222,15 +305,32 @@ class RetrievalToolsEnvironment:
         state: RetrievalState,
         trace: EpisodeTrace,
     ) -> RewardReport:
-        target = str(task.private["target_document_id"])
+        required_opened = set(task.private["required_opened"])
+        expected_citations = tuple(task.private["expected_citations"])
         answer = str(task.private["answer"])
         citations = set(state.citations)
         checks = (
-            RewardCheck("answer_exact", answer.lower() in (state.final_response or "").lower(), 2.0),
-            RewardCheck("target_document_opened", target in state.opened, 1.0),
-            RewardCheck("target_document_cited", target in citations, 2.0),
+            RewardCheck(
+                "answer_exact",
+                answer.casefold() == (state.final_response or "").strip().casefold(),
+                2.0,
+            ),
+            RewardCheck(
+                "required_documents_opened",
+                required_opened <= state.opened,
+                1.0,
+            ),
+            RewardCheck(
+                "required_documents_cited",
+                set(expected_citations) <= citations,
+                2.0,
+            ),
             RewardCheck("citations_are_opened", citations <= state.opened, 1.0),
-            RewardCheck("citations_are_minimal", citations == {target}, 1.0),
+            RewardCheck(
+                "citations_are_exact",
+                state.citations == expected_citations,
+                1.0,
+            ),
             RewardCheck("no_invalid_tool_calls", state.invalid_actions == 0, 0.5),
             RewardCheck("finished_explicitly", trace.termination_reason == "finished", 0.5),
         )
@@ -241,7 +341,11 @@ class RetrievalToolsEnvironment:
                 "citations": list(state.citations),
             }
         )
-        return RewardReport.from_checks(checks, state_digest=digest)
+        return RewardReport.from_checks(
+            checks,
+            state_digest=digest,
+            binary=True,
+        )
 
     def close(self, state: RetrievalState) -> None:
         state.closed = True
