@@ -7,6 +7,7 @@ import argparse
 import concurrent.futures
 import json
 import math
+import ssl
 import statistics
 import time
 
@@ -37,8 +38,10 @@ def main() -> int:
     if args.requests < 1 or args.parallel < 1:
         parser.error("requests and parallel must be positive")
 
-    tls = httpx.create_ssl_context(verify=args.ca, cert=(args.cert, args.key))
-    with httpx.Client(verify=tls, timeout=10.0) as client:
+    tls = ssl.create_default_context(cafile=args.ca)
+    tls.minimum_version = ssl.TLSVersion.TLSv1_2
+    tls.load_cert_chain(certfile=args.cert, keyfile=args.key)
+    with httpx.Client(verify=tls, timeout=10.0, trust_env=False) as client:
         health = client.get(f"{args.endpoint.rstrip('/')}/v1/health")
         health.raise_for_status()
         runtime_id = str(health.json()["runtime_id"])

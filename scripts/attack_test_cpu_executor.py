@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import ssl
 import time
 
 import httpx
@@ -48,8 +49,10 @@ def main() -> int:
     if not args.confirm_dedicated_host:
         parser.error("--confirm-dedicated-host is required")
 
-    tls = httpx.create_ssl_context(verify=args.ca, cert=(args.cert, args.key))
-    with httpx.Client(verify=tls, timeout=10.0) as client:
+    tls = ssl.create_default_context(cafile=args.ca)
+    tls.minimum_version = ssl.TLSVersion.TLSv1_2
+    tls.load_cert_chain(certfile=args.cert, keyfile=args.key)
+    with httpx.Client(verify=tls, timeout=10.0, trust_env=False) as client:
         before = client.get(f"{args.endpoint.rstrip('/')}/v1/health")
         before.raise_for_status()
         runtime_id = str(before.json()["runtime_id"])
@@ -116,7 +119,7 @@ def main() -> int:
         executor.close()
 
     time.sleep(1.0)
-    with httpx.Client(verify=tls, timeout=10.0) as client:
+    with httpx.Client(verify=tls, timeout=10.0, trust_env=False) as client:
         after = client.get(f"{args.endpoint.rstrip('/')}/v1/health")
         after.raise_for_status()
     pool = after.json()["pool"]
