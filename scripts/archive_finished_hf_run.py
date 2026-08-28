@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Archive selected checkpoints from a finished HF run, then compact it.
+"""Archive selected checkpoints from a retired HF run, then compact it.
 
 The command is deliberately two phase. ``--apply`` copies and verifies the
 selected immutable revisions in R2. Adding ``--squash`` performs the separate,
 irreversible Hugging Face super-squash only after every archive manifest and
-object has been verified. The active trainer repository is always rejected.
+object has already been verified by an earlier archive invocation. Nothing
+invokes this command when training stops: the operator chooses when the
+benchmarking cooldown is complete. The active trainer repository is rejected.
 """
 
 from __future__ import annotations
@@ -55,6 +57,14 @@ def _parser() -> argparse.ArgumentParser:
         "--apply",
         action="store_true",
         help="Copy and verify the selected snapshots in R2.",
+    )
+    parser.add_argument(
+        "--confirm-finished",
+        action="store_true",
+        help=(
+            "Confirm that training is stopped and the repository is not the "
+            "active serving/download source. Required with --apply."
+        ),
     )
     parser.add_argument(
         "--squash",
@@ -380,6 +390,8 @@ def main() -> int:
     numbers = _checkpoint_numbers(args.checkpoints)
     if args.squash and not args.apply:
         raise SystemExit("--squash requires --apply")
+    if args.apply and not args.confirm_finished:
+        raise SystemExit("--apply requires --confirm-finished")
     if args.apply and not args.expected_head:
         raise SystemExit("--apply requires --expected-head")
     active_repo = os.environ.get("RELIQUARY_HF_REPO_ID", "").strip()
@@ -440,6 +452,7 @@ def main() -> int:
         "selected": selected,
         "apply": bool(args.apply),
         "squash": bool(args.squash),
+        "operator_confirmed_finished": bool(args.confirm_finished),
     }
     if not args.apply:
         print(json.dumps(result, indent=2, sort_keys=True))
@@ -475,6 +488,11 @@ def main() -> int:
                 flush=True,
             )
         else:
+            if args.squash:
+                raise SystemExit(
+                    "--squash requires a completed earlier archive phase; "
+                    f"missing verified R2 manifest: {manifest_key}"
+                )
             with tempfile.TemporaryDirectory(
                 prefix=f"reliquary-finished-{checkpoint_n:06d}-",
             ) as temporary:
