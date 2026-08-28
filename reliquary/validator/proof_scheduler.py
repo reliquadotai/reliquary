@@ -103,6 +103,11 @@ class ProofPlan:
     # A genuinely sparse eligible population is not a capacity incident:
     # empty slots burn. Callers that require exact capacity can leave this off.
     allow_shortfall: bool = False
+    # An open-ended plan accepts candidates after submission and does NOT
+    # finalise when its queue drains — a window that is still admitting has
+    # simply not produced the next candidate yet. It ends on its target, its
+    # deadline, or an explicit ``seal``.
+    open_ended: bool = False
 
 
 @dataclass(frozen=True)
@@ -183,6 +188,7 @@ class _RawCompletion:
 @dataclass
 class _PlanState:
     plan: ProofPlan
+    # Mutable: ``extend`` appends to an open-ended plan in flight.
     candidates: tuple[RankedProof, ...]
     submitted_at: float
     max_attempts: int
@@ -201,6 +207,7 @@ class _PlanState:
     attempts_started: int = 0
     passed: int = 0
     stop_dispatch: bool = False
+    sealed: bool = False
     completion_reason: str | None = None
     abort_reason: CapacityAbortReason | None = None
     final_result: ProofPlanResult | None = None
@@ -393,6 +400,77 @@ class GlobalProofScheduler:
                 self._reevaluate_plan_locked(state)
             self._condition.notify_all()
             return tuple(ProofPlanHandle(self, state) for state in states)
+
+    def extend(
+        self, plan_id: str, candidates: Sequence[RankedProof]
+    ) -> None:
+        """Append candidates to an open-ended plan already in flight.
+
+        Mirrors what ``_build_plan_state`` derives at submission. Ranks must
+        continue the existing sequence: the coordinator applies decisions in
+        rank order, so a rank landing behind ``next_apply_index`` would be
+        applied never or twice.
+        """
+        if not candidates:
+            return
+        with self._condition:
+            state = self._plans.get(plan_id)
+            if state is None:
+                raise ValueError(f"unknown plan_id {plan_id!r}")
+            if not state.plan.open_ended:
+                raise ValueError(f"plan {plan_id!r} is not open-ended")
+            if state.sealed or state.final_result is not None:
+                raise ValueError(f"plan {plan_id!r} no longer accepts work")
+
+            added = tuple(sorted(candidates, key=lambda item: item.rank))
+            highest = state.candidates[-1].rank if state.candidates else None
+            for candidate in added:
+                if candidate.job_id in state.candidate_by_id:
+                    raise ValueError(
+                        f"duplicate job_id {candidate.job_id!r}"
+                    )
+                if highest is not None and candidate.rank <= highest:
+                    raise ValueError(
+                        "extended candidates must rank after the plan's "
+                        f"existing work (got {candidate.rank}, have {highest})"
+                    )
+                highest = candidate.rank
+
+            state.candidates = state.candidates + added
+            for candidate in added:
+                state.candidate_by_id[candidate.job_id] = candidate
+                state.phases[candidate.job_id] = _JobPhase.PENDING
+                chain = state.prompt_chains.get(candidate.prompt_key, ())
+                state.prompt_chains[candidate.prompt_key] = chain + (
+                    candidate.job_id,
+                )
+                state.prompt_positions.setdefault(candidate.prompt_key, 0)
+            if state.plan.max_attempts is None:
+                state.max_attempts = len(state.candidates)
+            else:
+                state.max_attempts = min(
+                    state.plan.max_attempts, len(state.candidates)
+                )
+            self._condition.notify_all()
+
+    def seal(self, plan_id: str) -> None:
+        """Stop an open-ended plan accepting work.
+
+        Restores ordinary semantics: from here, running out of candidates is
+        terminal again, so a plan short of its target reports the shortfall
+        instead of waiting for a submission that will never come. Idempotent,
+        and a no-op on a plan that already finalised.
+        """
+        with self._condition:
+            state = self._plans.get(plan_id)
+            if state is None:
+                raise ValueError(f"unknown plan_id {plan_id!r}")
+            if state.sealed or state.final_result is not None:
+                return
+            state.sealed = True
+            self._reevaluate_plan_locked(state)
+            self._finalize_if_terminal_locked(state)
+            self._condition.notify_all()
 
     def expire_deadlines(self) -> None:
         """Synchronously evaluate deadlines, useful for service polls and tests."""
@@ -1003,6 +1081,15 @@ class GlobalProofScheduler:
             self._apply_ready_locked(state)
             return
 
+        if state.plan.open_ended and not state.sealed:
+            # Everything below decides that the plan can no longer reach its
+            # target because it has run out of work. While the window is still
+            # admitting, running out of work means the next submission has not
+            # arrived yet — not that the target is unreachable. The deadline
+            # abort above and the target stop above both still apply.
+            self._apply_ready_locked(state)
+            return
+
         if state.plan.complete_all:
             self._finalize_if_terminal_locked(state)
             if state.final_result is not None:
@@ -1248,6 +1335,16 @@ class GlobalProofScheduler:
             or state.next_apply_index != len(state.candidates)
             or state.active_job_ids
         ):
+            return
+        if (
+            state.plan.open_ended
+            and not state.sealed
+            and state.abort_reason is None
+            and state.passed < state.plan.required_passes
+        ):
+            # Exhaustion is not terminal while the window still admits.
+            # Reaching the target IS, though — that is the fill close — and so
+            # is a deadline abort.
             return
         if (
             state.abort_reason is None
