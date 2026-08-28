@@ -385,7 +385,7 @@ closes, and the per-environment fill rate is the telemetry to watch.
 | `RELIQUARY_WINDOW_TARGET_GROUPS_PER_ENV` | proven groups that close an environment | `256` (= 16 steps x `B_BATCH`) |
 | `RELIQUARY_WINDOW_MAX_SECONDS` | backstop; seal partial past it | `1800` |
 | `RELIQUARY_ENV_POOL_WEIGHTS` | share of the pool per environment | equal |
-| `RELIQUARY_MAX_OPERATOR_TOKEN_SHARE` | cap on one operator's share of an env's accepted tokens | to be chosen deliberately |
+| `RELIQUARY_MAX_OPERATOR_TOKEN_SHARE` | cap on one operator's share of an env's accepted tokens | `0.34` |
 | `RELIQUARY_PROOF_QUEUE_DEPTH` | bounded arrival queue before backpressure | to be sized from measurement |
 
 `CHECKPOINT_PUBLISH_INTERVAL_WINDOWS` is deleted: one window is one pi_old
@@ -393,17 +393,25 @@ interval by construction. The emission cadence (32 proven groups) is
 derived from `B_BATCH` and the environment mix, not separately tunable —
 the same reasoning as `GRAD_ACCUM_STEPS = len(ENVIRONMENT_MIX)`.
 
-No design-level enablement flag. Today's behaviour is not a point in this
-parameter space, so an on/off flag would buy a second, unexecuted code
-path — and this repository has paid for that once already, when the
-proof-isolation work sat inert behind an OFF flag until a review found
-nine findings, two critical, in code nobody had run.
+**This ships as a coexisting protocol profile, not as a replacement.**
 
-The close rule does get an `AUCTION_EARLY_CLOSE_MODE`-style
-`off | shadow | enforce`, which is a different thing: shadow mode *runs*
-the rule on live traffic and records what it would have decided. It is a
-measurement, not a dormant branch, and it is retired once the rule is
-armed.
+An earlier draft argued against any enablement flag, on the grounds that a
+flag buys a second unexecuted code path — this repository paid for that
+once, when the proof-isolation work sat inert behind an OFF flag until a
+review found nine findings in code nobody had run. That reasoning was
+sound about *flags*; it was wrong about *profiles*.
+
+A `ProtocolProfile` is not a dormant branch. `v4` and `v5` already coexist
+today, each pinned by contract-hash tests, and the profile decides real
+behaviour for whoever runs it. Shipping the fill-closed window as `v6`
+means the auction path stays live and untouched, the two regimes can be
+run side by side, and the comparison stops being theoretical — the one
+number that settles the design, proof-plane occupancy during collection,
+becomes measurable rather than argued.
+
+This deliberately adopts the rollout property of the checkpoint-epoch
+prototype, which is one of the genuinely better things about it: an
+experimental capability that cannot silently change production.
 
 ## Testing strategy
 
@@ -453,7 +461,11 @@ and training payloads byte-identical on R2 replay.
 **Stage 3 — remove the auction, arm the fill close.**
 
 **Stage 4 — per-token payment.** Emission is the widest blast radius in
-the system; it ships last and alone, so any regression is attributable.
+the system. Under a coexisting `v6` profile it can ship inside the same
+branch rather than after it: production emission runs the unchanged
+auction path, and the per-token split is reached only by a validator that
+has explicitly selected the experimental profile. Attribution is preserved
+by the profile boundary instead of by shipping order.
 
 **Unit coverage required:**
 
@@ -522,6 +534,10 @@ restore ranking.
    flat valuation the auction was not selecting on quality, so the
    expectation is no — but `k_mean` and in-zone yield are the measurement,
    and they should be read before Stage 3 is armed, not after.
-3. **The operator token-share cap.** It is now the only fairness lever
-   against concentration under first-arrived admission, so its value
-   deserves a deliberate choice rather than inheriting `B_BATCH`.
+3. ~~The operator token-share cap.~~ **Decided: a share of an
+   environment's accepted tokens, defaulting to `0.34`.** A count of groups
+   would not bound the payout under per-token payment — an operator can take
+   few, very long groups — so the cap has to bound the same quantity the
+   payment divides. `0.34` lets no single operator take a third of an
+   environment while leaving room for a fleet of three to fill it; it is a
+   starting value to move from measured concentration, not a derived one.
