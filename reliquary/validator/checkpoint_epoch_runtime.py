@@ -14,6 +14,9 @@ from reliquary.shared.checkpoint_epoch import (
     BeaconBinding,
     CHECKPOINT_EPOCH_ADMISSION_POLICY,
     CHECKPOINT_EPOCH_CAPABILITY_ID,
+    CHECKPOINT_EPOCH_FINALIZATION_POLICY,
+    CHECKPOINT_EPOCH_RANKING_POLICY,
+    CHECKPOINT_EPOCH_REWARD_POLICY,
     CHECKPOINT_EPOCH_SCHEDULE_MODE,
     CHECKPOINT_EPOCH_SCHEMA_VERSION,
     CHECKPOINT_EPOCH_TRAINING_MODES,
@@ -58,6 +61,9 @@ class EpochCommitIntent:
     target_groups_per_environment_lane: int
     candidate_limit_per_environment_lane: int
     admission_policy: str
+    ranking_policy: str
+    reward_policy: str
+    finalization_policy: str
     commitments_per_operator_per_environment_lane: int
     reveal_seconds: float
     environment_universes: tuple[tuple[str, int], ...]
@@ -117,6 +123,9 @@ def _intent_dict(intent: EpochCommitIntent) -> dict[str, Any]:
             intent.candidate_limit_per_environment_lane
         ),
         "admission_policy": intent.admission_policy,
+        "ranking_policy": intent.ranking_policy,
+        "reward_policy": intent.reward_policy,
+        "finalization_policy": intent.finalization_policy,
         "commitments_per_operator_per_environment_lane": (
             intent.commitments_per_operator_per_environment_lane
         ),
@@ -211,6 +220,9 @@ def build_epoch_intent(
     target_groups_per_environment_lane: int,
     candidate_limit_per_environment_lane: int,
     admission_policy: str = CHECKPOINT_EPOCH_ADMISSION_POLICY,
+    ranking_policy: str = CHECKPOINT_EPOCH_RANKING_POLICY,
+    reward_policy: str = CHECKPOINT_EPOCH_REWARD_POLICY,
+    finalization_policy: str = CHECKPOINT_EPOCH_FINALIZATION_POLICY,
     commitments_per_operator_per_environment_lane: int = 16,
     reveal_seconds: float = 60.0,
     environment_universes: Mapping[str, int],
@@ -253,6 +265,9 @@ def build_epoch_intent(
             candidate_limit_per_environment_lane
         ),
         admission_policy=str(admission_policy),
+        ranking_policy=str(ranking_policy),
+        reward_policy=str(reward_policy),
+        finalization_policy=str(finalization_policy),
         commitments_per_operator_per_environment_lane=int(
             commitments_per_operator_per_environment_lane
         ),
@@ -268,6 +283,10 @@ def build_epoch_intent(
         or intent.candidate_limit_per_environment_lane
         < intent.target_groups_per_environment_lane
         or intent.admission_policy != CHECKPOINT_EPOCH_ADMISSION_POLICY
+        or intent.ranking_policy != CHECKPOINT_EPOCH_RANKING_POLICY
+        or intent.reward_policy != CHECKPOINT_EPOCH_REWARD_POLICY
+        or intent.finalization_policy
+        != CHECKPOINT_EPOCH_FINALIZATION_POLICY
         or intent.commitments_per_operator_per_environment_lane < 1
         or not math.isfinite(intent.reveal_seconds)
         or intent.reveal_seconds <= 0
@@ -298,6 +317,9 @@ def parse_epoch_intent(raw: bytes) -> EpochCommitIntent:
         "target_groups_per_environment_lane",
         "candidate_limit_per_environment_lane",
         "admission_policy",
+        "ranking_policy",
+        "reward_policy",
+        "finalization_policy",
         "commitments_per_operator_per_environment_lane",
         "reveal_seconds",
         "environment_universes",
@@ -339,6 +361,9 @@ def parse_epoch_intent(raw: bytes) -> EpochCommitIntent:
             value["candidate_limit_per_environment_lane"]
         ),
         admission_policy=value["admission_policy"],
+        ranking_policy=value["ranking_policy"],
+        reward_policy=value["reward_policy"],
+        finalization_policy=value["finalization_policy"],
         commitments_per_operator_per_environment_lane=(
             value["commitments_per_operator_per_environment_lane"]
         ),
@@ -358,6 +383,10 @@ def parse_epoch_intent(raw: bytes) -> EpochCommitIntent:
         or intent.candidate_limit_per_environment_lane
         < intent.target_groups_per_environment_lane
         or intent.admission_policy != CHECKPOINT_EPOCH_ADMISSION_POLICY
+        or intent.ranking_policy != CHECKPOINT_EPOCH_RANKING_POLICY
+        or intent.reward_policy != CHECKPOINT_EPOCH_REWARD_POLICY
+        or intent.finalization_policy
+        != CHECKPOINT_EPOCH_FINALIZATION_POLICY
         or intent.commitments_per_operator_per_environment_lane < 1
         or not math.isfinite(intent.reveal_seconds)
         or intent.reveal_seconds <= 0
@@ -398,6 +427,9 @@ def plan_from_intent(
             intent.candidate_limit_per_environment_lane
         ),
         admission_policy=intent.admission_policy,
+        ranking_policy=intent.ranking_policy,
+        reward_policy=intent.reward_policy,
+        finalization_policy=intent.finalization_policy,
         commitments_per_operator_per_environment_lane=(
             intent.commitments_per_operator_per_environment_lane
         ),

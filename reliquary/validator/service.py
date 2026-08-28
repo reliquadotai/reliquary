@@ -111,7 +111,11 @@ from reliquary.infrastructure import chain, storage
 from reliquary.protocol.submission import RejectReason, RolloutSubmission, WindowState
 from reliquary.shared.checkpoint_epoch import (
     BeaconBinding,
+    CHECKPOINT_EPOCH_ADMISSION_POLICY,
+    CHECKPOINT_EPOCH_FINALIZATION_POLICY,
+    CHECKPOINT_EPOCH_RANKING_POLICY,
     CHECKPOINT_EPOCH_REQUIRED_WINDOW_COUNT,
+    CHECKPOINT_EPOCH_REWARD_POLICY,
     CHECKPOINT_EPOCH_SCHEDULE_MODE,
     EpochPlan,
     EpochWindow,
@@ -2051,6 +2055,11 @@ class ValidationService:
             or plan.target_groups_per_environment_lane != B_BATCH
             or plan.candidate_limit_per_environment_lane
             != EXPERIMENTAL_CHECKPOINT_EPOCH_CANDIDATES_PER_LANE
+            or plan.admission_policy != CHECKPOINT_EPOCH_ADMISSION_POLICY
+            or plan.ranking_policy != CHECKPOINT_EPOCH_RANKING_POLICY
+            or plan.reward_policy != CHECKPOINT_EPOCH_REWARD_POLICY
+            or plan.finalization_policy
+            != CHECKPOINT_EPOCH_FINALIZATION_POLICY
             or plan.commitments_per_operator_per_environment_lane
             != EXPERIMENTAL_CHECKPOINT_EPOCH_COMMITMENTS_PER_OPERATOR_PER_LANE
             or plan.reveal_seconds
@@ -2178,6 +2187,10 @@ class ValidationService:
                 candidate_limit_per_environment_lane=(
                     EXPERIMENTAL_CHECKPOINT_EPOCH_CANDIDATES_PER_LANE
                 ),
+                admission_policy=CHECKPOINT_EPOCH_ADMISSION_POLICY,
+                ranking_policy=CHECKPOINT_EPOCH_RANKING_POLICY,
+                reward_policy=CHECKPOINT_EPOCH_REWARD_POLICY,
+                finalization_policy=CHECKPOINT_EPOCH_FINALIZATION_POLICY,
                 commitments_per_operator_per_environment_lane=(
                     EXPERIMENTAL_CHECKPOINT_EPOCH_COMMITMENTS_PER_OPERATOR_PER_LANE
                 ),
@@ -2762,6 +2775,27 @@ class ValidationService:
         plan = self._checkpoint_epoch_plan
         if plan is None:
             raise RuntimeError("checkpoint epoch plan is unavailable")
+        epoch_started_at = time.monotonic()
+        pipeline_state: dict[str, Any] = {
+            "schema_version": 1,
+            "epoch_id": plan.epoch_id,
+            "finalization_policy": plan.finalization_policy,
+            "phase": "opening",
+            "lanes_total": plan.window_count,
+            "lanes_finalized": 0,
+            "lane_metrics": {},
+            "terminal_status": None,
+        }
+
+        def publish_pipeline(**updates: Any) -> None:
+            pipeline_state.update(updates)
+            pipeline_state["elapsed_seconds"] = round(
+                max(0.0, time.monotonic() - epoch_started_at),
+                6,
+            )
+            self.server.set_checkpoint_epoch_pipeline_state(pipeline_state)
+
+        publish_pipeline()
         activated = False
         late_drops: dict | None = None
         completed_windows: set[int] = set()
@@ -2770,6 +2804,11 @@ class ValidationService:
         }
 
         def close_failed_epoch(failure_type: str) -> None:
+            publish_pipeline(
+                phase="terminal",
+                terminal_status="aborted",
+                failure_type=str(failure_type),
+            )
             self.server.set_active_epoch_batchers({})
             if activated:
                 failure_stage = self._window_iteration_stage
@@ -2828,8 +2867,17 @@ class ValidationService:
             activated = True
 
             self._window_iteration_stage = "checkpoint_epoch_commitment"
+            commitment_started_at = time.monotonic()
+            publish_pipeline(phase="commitment")
             await self._wait_for_checkpoint_epoch_phase_deadline(
                 seconds_from_open=plan.window_schedule.collection_seconds
+            )
+            publish_pipeline(
+                phase="selection",
+                commitment_seconds=round(
+                    max(0.0, time.monotonic() - commitment_started_at),
+                    6,
+                ),
             )
             # Close ingress synchronously before any await. Requests already
             # inside the HTTP handler are drained; later ones see selection and
@@ -2873,8 +2921,21 @@ class ValidationService:
             )
 
             self._window_iteration_stage = "checkpoint_epoch_reveal"
+            reveal_started_at = time.monotonic()
+            publish_pipeline(
+                phase="reveal",
+                admission_beacon_round=admission_beacon.round,
+                selected_reveals=sum(selected_counts.values()),
+            )
             await self._wait_for_checkpoint_epoch_phase_deadline(
                 duration_seconds=plan.reveal_seconds
+            )
+            publish_pipeline(
+                phase="sealing",
+                reveal_seconds=round(
+                    max(0.0, time.monotonic() - reveal_started_at),
+                    6,
+                ),
             )
             self._set_state(WindowState.TRAINING)
             for batcher in self._active_batchers.values():
@@ -2890,8 +2951,17 @@ class ValidationService:
             reject_counts = dict(
                 getattr(self.server, "_recent_reject_counts", {})
             )
+            seal_beacon_started_at = time.monotonic()
             epoch_seal = await self._fetch_checkpoint_epoch_seal_beacon(
                 after_round=admission_beacon.round
+            )
+            publish_pipeline(
+                phase="finalizing",
+                seal_beacon_round=epoch_seal[1].round,
+                seal_beacon_wait_seconds=round(
+                    max(0.0, time.monotonic() - seal_beacon_started_at),
+                    6,
+                ),
             )
             # Close every route after selected reveals are frozen.
             self.server.set_active_epoch_batchers({})
@@ -2906,6 +2976,7 @@ class ValidationService:
                     if final_lane
                     else "checkpoint_epoch_reservoir"
                 )
+                lane_started_at = time.monotonic()
                 await self._train_and_publish(
                     batchers=lane,
                     window_n=window.window_number,
@@ -2918,6 +2989,46 @@ class ValidationService:
                     epoch_finalize=final_lane,
                 )
                 completed_windows.add(window.window_number)
+                lane_metrics = dict(pipeline_state["lane_metrics"])
+                lane_metrics[str(window.offset)] = {
+                    "window_number": window.window_number,
+                    "elapsed_seconds": round(
+                        max(0.0, time.monotonic() - lane_started_at),
+                        6,
+                    ),
+                    "proof_attempts": sum(
+                        int(getattr(batcher, "proof_attempts", 0) or 0)
+                        for batcher in lane.values()
+                    ),
+                    "proof_wall_seconds": round(
+                        sum(
+                            float(
+                                getattr(
+                                    batcher,
+                                    "proof_wall_elapsed_seconds",
+                                    0.0,
+                                )
+                                or 0.0
+                            )
+                            for batcher in lane.values()
+                        ),
+                        6,
+                    ),
+                    "selected_groups": sum(
+                        (
+                            len(batcher.valid_submissions())
+                            if callable(
+                                getattr(batcher, "valid_submissions", None)
+                            )
+                            else int(getattr(batcher, "valid_count", 0) or 0)
+                        )
+                        for batcher in lane.values()
+                    ),
+                }
+                publish_pipeline(
+                    lane_metrics=lane_metrics,
+                    lanes_finalized=len(completed_windows),
+                )
         except asyncio.CancelledError:
             close_failed_epoch("CancelledError")
             raise
@@ -2952,6 +3063,16 @@ class ValidationService:
             )
         else:
             self._write_training_epoch_marker(plan, status="completed")
+        publish_pipeline(
+            phase="terminal",
+            terminal_status=training_status,
+        )
+        log_structured(
+            logger,
+            logging.INFO,
+            "checkpoint_epoch_pipeline",
+            dict(pipeline_state),
+        )
         self._set_state(WindowState.READY)
 
     async def _refresh_registered_hotkeys(

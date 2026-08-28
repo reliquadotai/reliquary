@@ -94,6 +94,19 @@ def test_intent_rejects_unknown_schedule_and_training_modes():
         _intent(training_mode="unknown")
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("ranking_policy", "throughput_admission"),
+        ("reward_policy", "per_token"),
+        ("finalization_policy", "arrival_stream"),
+    ],
+)
+def test_intent_rejects_uncoordinated_economic_policy_changes(field, value):
+    with pytest.raises(ValueError, match="admission bounds"):
+        _intent(**{field: value})
+
+
 def test_intent_rejects_a_schema_version_mutation():
     value = json.loads(canonical_intent_bytes(_intent()))
     value["schema_version"] += 1

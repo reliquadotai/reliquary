@@ -81,10 +81,13 @@ def test_manifest_is_canonical_deterministic_and_stable():
     assert canonical_manifest_bytes(first) == canonical_manifest_bytes(second)
     assert parse_epoch_plan(canonical_manifest_bytes(first)) == first
     assert manifest_sha256(first) == (
-        "cde46238666bee60bfe8ba89dea9061a7f79ebcb488500befdd4fb0b69a0673b"
+        "f9c12701d8e5af993b7e15cd5c82b264f0d7a524eacbf39b61a7f47a2e276e63"
     )
     assert first.window_schedule.mode == "concurrent_checkpoint_epoch"
     assert first.training_mode == "sequential_steps"
+    assert first.ranking_policy == "utility_then_post_seal_beacon_v1"
+    assert first.reward_policy == "selected_slot_v1"
+    assert first.finalization_policy == "ordered_lanes_atomic_epoch_v1"
 
 
 def test_production_horizon_has_sixteen_unique_domain_separated_seeds():
@@ -162,6 +165,23 @@ def test_overlap_fallback_is_explicit_and_deterministic():
 )
 def test_manifest_bindings_change_hash(change):
     assert manifest_sha256(_plan(**change)) != manifest_sha256(_plan())
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("ranking_policy", "throughput_admission", "ranking policy"),
+        ("reward_policy", "per_token", "reward policy"),
+        ("finalization_policy", "arrival_stream", "finalization policy"),
+    ],
+)
+def test_manifest_rejects_uncoordinated_economic_policy_changes(
+    field,
+    value,
+    message,
+):
+    with pytest.raises(ValueError, match=message):
+        _plan(**{field: value})
 
 
 def test_window_offset_and_number_are_both_seed_bindings():
