@@ -6,19 +6,15 @@ FROM ${PYTHON_IMAGE}
 
 ARG RELIQUARY_BUILD_REVISION=unknown
 ARG RUNSC_RELEASE=20260817
+ARG RUNSC_SHA256=048b89aada69dc3333422e139d6e9d02f8ab06bda52398060e0fbdacca00074c
 ARG RUNSC_SHA512=84936438d583ec976800f464e75a83e1515f0890b451b9b4db219c4472b54ca9b106a6772ee683f1e64cce2128871d7637b14d800591f8451b8137f6c39fb2ef
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONDONTWRITEBYTECODE=1 \
+ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONPATH=/opt/reliquary \
     RELIQUARY_BUILD_REVISION=${RELIQUARY_BUILD_REVISION}
-
-RUN apt-get update -qq \
- && apt-get install -y -qq ca-certificates wget \
- && rm -rf /var/lib/apt/lists/*
 
 # Only the CPU agent's hash-locked transport/runtime dependencies. The
 # validator's torch, CUDA, Bittensor, datasets, R2, HF, and wallet stack are
@@ -28,17 +24,16 @@ RUN pip install --require-hashes --no-deps \
       --requirement /tmp/cpu-executor-requirements.lock \
  && rm -f /tmp/cpu-executor-requirements.lock
 
-# Pin a dated gVisor production release. Verify against the checksum committed
+# Pin a dated gVisor production release. Docker verifies the checksum committed
 # with this build rather than trusting a checksum downloaded beside the binary.
 # Only runsc is needed because the agent invokes OCI bundles directly; the
 # containerd shim and metric sidecar from the current multi-file release are
 # deliberately absent.
-RUN ARCH="$(uname -m)" \
- && BASE="https://storage.googleapis.com/gvisor/releases/release/${RUNSC_RELEASE}/${ARCH}" \
- && wget -q "${BASE}/runsc" \
- && printf '%s  %s\n' "${RUNSC_SHA512}" runsc | sha512sum -c - \
- && install -m 0755 runsc /usr/local/bin/runsc \
- && rm -f runsc
+ADD --checksum=sha256:${RUNSC_SHA256} \
+    https://storage.googleapis.com/gvisor/releases/release/${RUNSC_RELEASE}/x86_64/runsc \
+    /usr/local/bin/runsc
+RUN chmod 0755 /usr/local/bin/runsc \
+ && printf '%s  %s\n' "${RUNSC_SHA512}" /usr/local/bin/runsc | sha512sum -c -
 
 WORKDIR /opt/reliquary
 COPY reliquary /opt/reliquary/reliquary

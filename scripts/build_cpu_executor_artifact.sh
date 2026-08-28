@@ -12,6 +12,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUTPUT_DIR="$1"
 REVISION="${2:-}"
 RUNSC_RELEASE=20260817
+RUNSC_SHA256=048b89aada69dc3333422e139d6e9d02f8ab06bda52398060e0fbdacca00074c
 RUNSC_SHA512=84936438d583ec976800f464e75a83e1515f0890b451b9b4db219c4472b54ca9b106a6772ee683f1e64cce2128871d7637b14d800591f8451b8137f6c39fb2ef
 
 for command_name in docker gzip jq sha256sum; do
@@ -51,9 +52,11 @@ IMAGE_TAG="reliquary-cpu-executor:${REVISION}"
 ARCHIVE_PATH="${OUTPUT_DIR}/reliquary-cpu-executor-${REVISION}.tar.gz"
 
 docker build \
+  --progress plain \
   --platform linux/amd64 \
   --build-arg "RELIQUARY_BUILD_REVISION=${REVISION}" \
   --build-arg "RUNSC_RELEASE=${RUNSC_RELEASE}" \
+  --build-arg "RUNSC_SHA256=${RUNSC_SHA256}" \
   --build-arg "RUNSC_SHA512=${RUNSC_SHA512}" \
   --tag "${IMAGE_TAG}" \
   --file "${REPO_DIR}/docker/Dockerfile.cpu-executor" \
@@ -105,6 +108,7 @@ jq -n \
   --arg archive_sha256 "${ARCHIVE_SHA256}" \
   --argjson archive_bytes "${ARCHIVE_SIZE}" \
   --arg runsc_release "${RUNSC_RELEASE}" \
+  --arg runsc_sha256 "${RUNSC_SHA256}" \
   --arg runsc_sha512 "${RUNSC_SHA512}" \
   '{
     schema_version: ($schema_version | tonumber),
@@ -119,6 +123,7 @@ jq -n \
     target_platform: "linux/amd64",
     sandbox_backend: "gvisor-runsc",
     runsc_release: $runsc_release,
+    runsc_sha256: $runsc_sha256,
     runsc_sha512: $runsc_sha512
   }' > "${OUTPUT_DIR}/manifest.json"
 

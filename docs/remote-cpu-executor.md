@@ -149,8 +149,9 @@ The code is ready when all of the following pass on the branch:
 `scripts/build_cpu_executor_artifact.sh` creates an immutable linux/amd64 image
 archive, manifest, package inventory, Docker inspection, history, runsc
 version, and evidence checksums. Runtime Python packages are locked with exact
-artifact hashes. gVisor is pinned to dated release `20260817`, and the committed
-SHA-512 is checked independently of the download location.
+artifact hashes. gVisor is pinned to dated release `20260817`; Docker verifies
+the committed SHA-256 while the build also checks the independent SHA-512.
+No APT repository or OS package download is needed to build the runtime image.
 
 The Linux build does not qualify the actual gVisor boundary. That gate requires
 the dedicated KVM host, because miner code must never be attack-tested on

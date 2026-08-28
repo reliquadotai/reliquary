@@ -25,7 +25,7 @@ library, GPU library, R2/HF client, or signer logic was added to the executor.
 
 | Boundary | Implemented behavior |
 |---|---|
-| Source and runtime | Full Git revision, OCI image ID, grader runtime digest, dated gVisor release, independent gVisor SHA-512, and hash-locked Python artifacts |
+| Source and runtime | Full Git revision, OCI image ID, grader runtime digest, dated gVisor release, committed SHA-256 plus independent SHA-512, and hash-locked Python artifacts; no APT dependency in the image build |
 | Request | Strict schema, 4 MiB maximum, 1 MiB code maximum, deterministic content-bound job ID, maximum 256 ordered cases, maximum 30-second case timeout and 120-second overall batch deadline |
 | Result | 2 MiB maximum, strict job/attempt/runtime/case binding, JSON-safe primitive values only; expected answers never leave control |
 | Admission | Dedicated thread count equals configured in-flight limit; no hidden 40-thread cap; overload fails immediately with measurable `503` |
