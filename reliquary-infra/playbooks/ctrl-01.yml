@@ -146,7 +146,7 @@
 
     - name: Record the deployed infrastructure identity
       ansible.builtin.template:
-        src: ../templates/deployment.json.j2
+        src: "{{ playbook_dir | dirname }}/templates/deployment.json.j2"
         dest: /etc/reliquary/deployment.json
         owner: root
         group: root
@@ -163,7 +163,7 @@
 
     - name: Configure the snapshot publisher
       ansible.builtin.template:
-        src: ../templates/snapshot-sync.env.j2
+        src: "{{ playbook_dir | dirname }}/templates/snapshot-sync.env.j2"
         dest: /etc/reliquary/snapshot-sync.env
         owner: root
         group: root
@@ -172,7 +172,7 @@
 
     - name: Install the snapshot systemd unit
       ansible.builtin.template:
-        src: ../templates/reliquary-snapshot-sync.service.j2
+        src: "{{ playbook_dir | dirname }}/templates/reliquary-snapshot-sync.service.j2"
         dest: /etc/systemd/system/reliquary-snapshot-sync.service
         owner: root
         group: root
@@ -183,7 +183,7 @@
 
     - name: Install the isolated nginx edge configuration
       ansible.builtin.template:
-        src: ../templates/reliquary-edge.nginx.j2
+        src: "{{ playbook_dir | dirname }}/templates/reliquary-edge.nginx.j2"
         dest: /etc/nginx/conf.d/reliquary-edge.conf
         owner: root
         group: root
@@ -198,7 +198,7 @@
 
     - name: Configure node exporter on loopback with textfile metrics
       ansible.builtin.template:
-        src: ../templates/prometheus-node-exporter.default.j2
+        src: "{{ playbook_dir | dirname }}/templates/prometheus-node-exporter.default.j2"
         dest: /etc/default/prometheus-node-exporter
         owner: root
         group: root
@@ -215,7 +215,7 @@
 
     - name: Install the hardened Docker daemon configuration
       ansible.builtin.template:
-        src: ../templates/docker-daemon.json.j2
+        src: "{{ playbook_dir | dirname }}/templates/docker-daemon.json.j2"
         dest: /etc/docker/daemon.json
         owner: root
         group: root
@@ -224,7 +224,7 @@
 
     - name: Install kernel and network hardening
       ansible.builtin.template:
-        src: ../templates/99-reliquary-sysctl.conf.j2
+        src: "{{ playbook_dir | dirname }}/templates/99-reliquary-sysctl.conf.j2"
         dest: /etc/sysctl.d/99-reliquary.conf
         owner: root
         group: root
@@ -233,7 +233,7 @@
 
     - name: Configure fail2ban for key-only SSH
       ansible.builtin.template:
-        src: ../templates/reliquary-fail2ban.local.j2
+        src: "{{ playbook_dir | dirname }}/templates/reliquary-fail2ban.local.j2"
         dest: /etc/fail2ban/jail.d/reliquary.local
         owner: root
         group: root
@@ -253,7 +253,7 @@
 
     - name: Install the local configuration backup command
       ansible.builtin.template:
-        src: ../templates/reliquary-config-backup.sh.j2
+        src: "{{ playbook_dir | dirname }}/templates/reliquary-config-backup.sh.j2"
         dest: /usr/local/sbin/reliquary-config-backup
         owner: root
         group: root
@@ -269,7 +269,7 @@
 
     - name: Install the local configuration backup unit
       ansible.builtin.template:
-        src: "../templates/{{ item }}.j2"
+        src: "{{ playbook_dir | dirname }}/templates/{{ item }}.j2"
         dest: "/etc/systemd/system/{{ item }}"
         owner: root
         group: root
@@ -336,7 +336,7 @@
 
     - name: Install SSH hardening after the admin key exists
       ansible.builtin.template:
-        src: ../templates/50-reliquary-sshd.conf.j2
+        src: "{{ playbook_dir | dirname }}/templates/50-reliquary-sshd.conf.j2"
         dest: /etc/ssh/sshd_config.d/00-reliquary.conf
         owner: root
         group: root
@@ -387,8 +387,9 @@
         status_code: 503
 
     - name: Run a configuration backup
-      ansible.builtin.command: systemctl start reliquary-config-backup.service
-      changed_when: true
+      ansible.builtin.systemd_service:
+        name: reliquary-config-backup.service
+        state: started
 
     - name: Run the complete local control-host validation
       ansible.builtin.command: /usr/local/sbin/reliquary-validate-ctrl
