@@ -10,6 +10,14 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-28-fill-closed-window-design.md`
 
+**Base:** branch `design/fill-closed-v6`, which is
+`checkpoint-epoch-scheduling-prototype` (PR #198) merged with the
+fill-closed work. **The checkpoint-epoch capability is inherited, not
+rewritten** — its commits stand as they are, gated by
+`RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED`. v6 is a third regime
+beside it and beside the production auction, each independently gated and
+all three off by default. Nothing in this plan modifies epoch code.
+
 ## Global Constraints
 
 - **Never change `v4` or `v5` behaviour.** `tests/unit/test_protocol_profiles.py` pins their canonical generation-contract bytes; those tests must pass untouched.
