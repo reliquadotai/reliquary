@@ -320,6 +320,64 @@ def test_auction_submit_requires_precommit_before_body_parse(monkeypatch):
     assert response.headers["connection"] == "close"
 
 
+def test_claiming_a_precommit_stamps_its_receipt_id_onto_the_request():
+    """v6 only. The arrival proof path looks up the rate a precommit
+    registered off ``pending.request._precommit_receipt_id``. This is the
+    exact point the body is matched to its precommit, so it is where the
+    id must land -- a replay or a mismatch must never stamp anything."""
+    batcher = _batcher(window_start=500)
+    server = ValidatorServer()
+    request = _request(valid_merkle=True)
+    raw_body = request.model_dump_json().encode()
+    payload_sha256 = hashlib.sha256(raw_body).hexdigest()
+    receipt_id = "rate-linking-receipt"
+    receipt = _UploadPrecommitReceipt(
+        receipt_id=receipt_id,
+        precommit_signature="signed",
+        miner_hotkey=request.miner_hotkey,
+        prompt_idx=request.prompt_idx,
+        window_start=request.window_start,
+        merkle_root=request.merkle_root,
+        checkpoint_hash=request.checkpoint_hash,
+        environment=FakeEnv.name,
+        payload_bytes=len(raw_body),
+        payload_sha256=payload_sha256,
+        drand_round=request.drand_round,
+        protocol_version=request.protocol_version,
+        nonce=request.nonce,
+        expires_at_wall=time.time() + 30.0,
+        precommit_arrival_ts=time.time(),
+        drand_observation=DrandRoundObservation(
+            submitted_drand_round=request.drand_round,
+            arrival_drand_round=request.drand_round,
+            drand_delta=0,
+            drand_tolerance=0,
+            drand_status="current",
+            reject_reason=None,
+        ),
+        batcher=batcher,
+        body_completed_at_wall=time.time(),
+    )
+    server._upload_precommit_receipts[receipt_id] = receipt
+
+    assert getattr(request, "_precommit_receipt_id", "") == ""
+
+    status, claimed = server._claim_upload_precommit(
+        receipt_id,
+        request,
+        batcher=batcher,
+        environment=FakeEnv.name,
+        payload_bytes=len(raw_body),
+        payload_sha256=payload_sha256,
+        upload_started_at=time.time(),
+        body_completed_at=time.time(),
+    )
+
+    assert status == "valid"
+    assert claimed is receipt
+    assert request._precommit_receipt_id == receipt_id
+
+
 @pytest.mark.asyncio
 async def test_grader_crash_prepared_result_retains_operator_prompt_claim():
     batcher = _batcher(window_start=500)

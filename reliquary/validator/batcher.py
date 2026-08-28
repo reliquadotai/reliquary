@@ -88,10 +88,7 @@ from reliquary.protocol.submission import (
 )
 from reliquary.protocol.tokens import verify_tokens
 from reliquary.validator.admission import robust_utility_admits
-from reliquary.validator.admission_priority import (
-    QueuedPrecommit,
-    ThroughputAdmissionQueue,
-)
+from reliquary.validator.admission_priority import ThroughputAdmissionQueue
 from reliquary.validator.fill_window import FillState
 from reliquary.validator.batch_selection import (
     throughput_rank,
@@ -738,6 +735,35 @@ class _UploadPrecommitReservation:
 
 
 @dataclass(frozen=True)
+class _BufferedArrivalProof:
+    """One graded body waiting in ``_arrival_proof_buffer`` for the plan.
+
+    ``rate`` is ``None`` when the receipt fell out of the admission queue
+    (no precommit, a different window, or the queue itself is off) -- the
+    sort key below sends that to the back rather than raising, so a queue
+    miss degrades the group's priority instead of stalling admission.
+    """
+
+    pending: PendingSubmission = field(repr=False)
+    rate: float | None
+    sequence: int
+
+
+def _arrival_buffer_sort_key(
+    entry: _BufferedArrivalProof,
+) -> tuple[int, float, int]:
+    """Highest rate first; unknown rate last; ties broken by arrival order.
+
+    Sorting happens here, once, before any candidate is built or any
+    capacity is spent -- never inside ``extend``, which only ever sees
+    ranks already fixed in dispatch order.
+    """
+    if entry.rate is None:
+        return (1, 0.0, entry.sequence)
+    return (0, -entry.rate, entry.sequence)
+
+
+@dataclass(frozen=True)
 class _ScheduledProofPayload:
     batcher: Any = field(repr=False)
     pending: PendingSubmission = field(repr=False)
@@ -1105,6 +1131,17 @@ class GrpoWindowBatcher:
         # dispatch order (see ``GlobalProofScheduler.extend``); arrival order
         # is not otherwise available as an integer, so this counts it.
         self._arrival_proof_rank: int = 0
+        # v6 only. The rate-ordered queue (Task 5) never hands out a
+        # provable candidate of its own -- a ``PendingSubmission`` does not
+        # exist until the body has arrived and graded, later and on a
+        # different path than the precommit the queue holds. So its ORDER
+        # becomes this buffer's drain order instead: every graded body
+        # waits here, keyed by the rate its own precommit registered, until
+        # ``_drain_arrival_proof_buffer`` pulls it into the plan highest
+        # rate first. ``_arrival_proof_sequence`` is the buffer's own
+        # insertion counter, used only to break rate ties deterministically.
+        self._arrival_proof_buffer: list[_BufferedArrivalProof] = []
+        self._arrival_proof_sequence: int = 0
         # v6 only. ``FillState`` has no internal locking of its own (see
         # fill_window.py). ``reserve`` happens under ``self._lock`` (the
         # admission commit lock); ``record_proven``/``release`` happen from
@@ -1327,12 +1364,6 @@ class GrpoWindowBatcher:
         self._payload_digests_seen.add(digest)
         return True
 
-    def _next_admission(self, environment: str) -> QueuedPrecommit | None:
-        """The highest-rate precommit waiting for this environment."""
-        if self.admission_queue is None:
-            return None
-        return self.admission_queue.take_best(environment)
-
     def _extend_proof_plan(self, candidates: list[RankedProof]) -> None:
         """Hand newly-admitted candidates to this window's open-ended plan.
 
@@ -1375,24 +1406,25 @@ class GrpoWindowBatcher:
             scheduler.extend(self._open_proof_plan_id, candidates)
 
     def _submit_arrival_proof(self, pending: PendingSubmission) -> None:
-        """Reserve capacity and hand the group to the open-ended plan.
+        """Buffer one graded body for the open-ended plan, then drain.
 
-        The two cheap refusals (duplicate hash, environment full) have
-        already run by the time this is called; this is the expensive
-        half. ``robust_utility_admits`` is the admission-time analogue of
-        the auction's least-favourable pricing (Task 4): with no auction to
+        ``robust_utility_admits`` is the admission-time analogue of the
+        auction's least-favourable pricing (Task 4): with no auction to
         price a manufactured zero, a group whose least favourable reading
-        leaves the zone must be refused outright, before any capacity is
-        touched. A reservation that fails to reach the scheduler is
-        released, which immediately reopens capacity for the next arrival
-        -- without that, a run of failures would stall the window below its
-        target.
+        leaves the zone must be refused outright, before it ever touches
+        the buffer or any capacity.
+
+        Everything past that gate is queueing, not deciding: the body is
+        keyed by the rate its own precommit registered
+        (``ThroughputAdmissionQueue.rate_of``) and appended to
+        ``_arrival_proof_buffer``, so a slower body that happens to grade
+        first does not jump a faster one still on its way in. The actual
+        reservation and dispatch order are decided in
+        ``_drain_arrival_proof_buffer``, not here.
         """
         if self.fill_state is None:
             return
         environment = str(getattr(self.env, "name", ""))
-        if not self.fill_state.may_admit(environment):
-            return
         truncated_indices = (
             (pending.truncated_index,)
             if pending.truncated_index is not None
@@ -1407,34 +1439,77 @@ class GrpoWindowBatcher:
         ):
             return
 
+        rate = None
+        receipt_id = getattr(pending.request, "_precommit_receipt_id", "") or None
+        if receipt_id is not None and self.admission_queue is not None:
+            rate = self.admission_queue.rate_of(receipt_id)
+
         with self._fill_state_lock:
-            self.fill_state.reserve(environment)
-        operator = self._operator_for_hotkey(pending.hotkey)
-        operator_remaining = (
-            MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW
-            - self.operator_proof_failure_debt(operator)
-            if operator is not None
-            else 0
-        )
-        hotkey_remaining = (
-            MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
-            - self.proof_failure_debt(pending.hotkey)
-        )
-        self._arrival_proof_rank += 1
-        candidate = self._ranked_proof_for(
-            pending,
-            rank=self._arrival_proof_rank,
-            operator=operator,
-            operator_remaining=operator_remaining,
-            hotkey_remaining=hotkey_remaining,
-            tag="arrival",
-        )
-        try:
-            self._extend_proof_plan([candidate])
-        except Exception:
+            self._arrival_proof_sequence += 1
+            self._arrival_proof_buffer.append(
+                _BufferedArrivalProof(
+                    pending=pending,
+                    rate=rate,
+                    sequence=self._arrival_proof_sequence,
+                )
+            )
+
+        self._drain_arrival_proof_buffer(environment)
+
+    def _drain_arrival_proof_buffer(self, environment: str) -> None:
+        """Pull the buffer's highest-rate entry into the plan, one at a
+        time, for as long as the environment has room.
+
+        Called on both moments capacity can change: a graded body landing
+        (so a fast group is not left waiting behind nothing) and a proof
+        completing (so freed capacity goes to the next-fastest group, not
+        just whichever happens to arrive next).
+
+        Sorting and reservation both happen HERE, at drain time -- never
+        at buffering time. That is what keeps a buffered group's
+        reservation honest: a group sitting behind a full environment has
+        consumed nothing, and if it never drains, it never will.
+        """
+        if self.fill_state is None:
+            return
+        while True:
             with self._fill_state_lock:
-                self.fill_state.release(environment)
-            raise
+                if not self._arrival_proof_buffer:
+                    return
+                if not self.fill_state.may_admit(environment):
+                    return
+                self._arrival_proof_buffer.sort(key=_arrival_buffer_sort_key)
+                entry = self._arrival_proof_buffer.pop(0)
+                self.fill_state.reserve(environment)
+                self._arrival_proof_rank += 1
+                rank = self._arrival_proof_rank
+
+            pending = entry.pending
+            operator = self._operator_for_hotkey(pending.hotkey)
+            operator_remaining = (
+                MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW
+                - self.operator_proof_failure_debt(operator)
+                if operator is not None
+                else 0
+            )
+            hotkey_remaining = (
+                MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
+                - self.proof_failure_debt(pending.hotkey)
+            )
+            candidate = self._ranked_proof_for(
+                pending,
+                rank=rank,
+                operator=operator,
+                operator_remaining=operator_remaining,
+                hotkey_remaining=hotkey_remaining,
+                tag="arrival",
+            )
+            try:
+                self._extend_proof_plan([candidate])
+            except Exception:
+                with self._fill_state_lock:
+                    self.fill_state.release(environment)
+                raise
 
     def _record_upload_precommit_rejection_locked(self, reason: str) -> None:
         self._upload_precommit_rejections[reason] = (
@@ -4593,6 +4668,7 @@ class GrpoWindowBatcher:
                     self.fill_state.record_proven(environment)
                 else:
                     self.fill_state.release(environment)
+            self._drain_arrival_proof_buffer(environment)
         return verified
 
     def _reject(

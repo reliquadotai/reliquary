@@ -255,6 +255,12 @@ class BatchSubmissionRequest(BaseModel):
     # grader worker.  The response remains the wire-compatible nonfatal
     # WORKER_DROPPED reason, but the server must not refund the consumed quota.
     _grader_worker_crashed: bool = PrivateAttr(default=False)
+    # v6 only. The upload precommit's receipt_id, stamped once the body is
+    # matched to it (``ValidatorServer._claim_upload_precommit``). Lets the
+    # arrival-proof path look up the rate the precommit registered with
+    # ``ThroughputAdmissionQueue.rate_of`` -- empty when there was no
+    # precommit (pre-v6 traffic, or the precommit path disabled).
+    _precommit_receipt_id: str = PrivateAttr(default="")
 
     @field_validator("rollouts")
     @classmethod

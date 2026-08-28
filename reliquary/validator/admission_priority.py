@@ -25,6 +25,14 @@ Three properties of that formula, each deliberate:
 Pure and dependency-free, like ``difficulty_auction`` and ``batch_selection``.
 It admits nothing, grades nothing and proves nothing; it only decides what
 the validator should spend its next grading and proof budget on.
+
+A ``PendingSubmission`` -- rewards, robust utility, everything the proof
+plane needs -- does not exist until the body has arrived and been graded,
+later and on a different path than the precommit this queue holds. So the
+queue is never drained directly for a provable candidate; instead
+``rate_of`` lets the batcher look up the rate a graded body's precommit
+registered, and the batcher buffers graded bodies in that order itself
+(see ``GrpoWindowBatcher._drain_arrival_proof_buffer``).
 """
 
 from __future__ import annotations
@@ -51,6 +59,7 @@ class ThroughputAdmissionQueue:
     def __init__(self, *, window_opened_at: float) -> None:
         self._window_opened_at = float(window_opened_at)
         self._queued: dict[str, list[QueuedPrecommit]] = {}
+        self._by_receipt: dict[str, QueuedPrecommit] = {}
 
     def offer(
         self,
@@ -79,22 +88,18 @@ class ThroughputAdmissionQueue:
             elapsed=elapsed,
         )
         self._queued.setdefault(environment, []).append(entry)
+        self._by_receipt[receipt_id] = entry
         return entry
 
-    def take_best(self, environment: str) -> QueuedPrecommit | None:
-        entries = self._queued.get(environment)
-        if not entries:
-            return None
-        # Rates collide often — two miners on the same hardware produce the
-        # same ratio — so the tie-break is explicit rather than left to list
-        # ordering, which would make a window unreproducible on replay.
-        best = min(
-            entries,
-            key=lambda entry: (
-                -entry.throughput,
-                entry.precommit_arrived_at,
-                entry.receipt_id,
-            ),
-        )
-        entries.remove(best)
-        return best
+    def rate_of(self, receipt_id: str) -> float | None:
+        """The throughput a precommit registered, or ``None`` if unknown.
+
+        Lets the batcher key its own per-window dispatch buffer by rate at
+        the moment a body grades, without this queue ever handing out a
+        receipt as if it were a provable candidate. ``None`` on a miss
+        (never offered, or offered in a different window) rather than
+        raising: a graded body with no matching precommit still has to
+        degrade to a defined priority, not crash the admission path.
+        """
+        entry = self._by_receipt.get(receipt_id)
+        return entry.throughput if entry is not None else None

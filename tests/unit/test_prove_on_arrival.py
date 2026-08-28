@@ -1,5 +1,6 @@
 """Under v6 a submission is proven when it arrives, not at seal."""
 import hashlib
+import types
 
 from reliquary.validator.batcher import PendingSubmission
 
@@ -123,6 +124,111 @@ def test_a_full_environment_refuses_without_reserving(monkeypatch):
 
     assert extended == []
     assert batcher.fill_state.snapshot()["in_flight"]["openmathinstruct"] == 1
+
+
+def test_a_buffered_group_is_not_reserved_until_drained(monkeypatch):
+    """A body that arrives while the environment is full sits in the
+    buffer; buffering must reserve nothing. Only ``_drain_arrival_proof_
+    buffer`` -- run once capacity frees -- reserves and extends it."""
+    import reliquary.validator.batcher as batcher_module
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+
+    extended = []
+    batcher = _make_batcher()
+    batcher.fill_state = batcher_module.FillState(
+        targets={"openmathinstruct": 1, "opencodeinstruct": 1}
+    )
+    batcher._extend_proof_plan = lambda candidates: extended.extend(candidates)
+    env = "openmathinstruct"
+    batcher.fill_state.reserve(env)  # already at target
+
+    batcher._submit_arrival_proof(_pending_stub(prompt_idx=41))
+
+    assert extended == []
+    assert batcher.fill_state.snapshot()["in_flight"][env] == 1
+    assert len(batcher._arrival_proof_buffer) == 1
+
+    batcher.fill_state.release(env)  # capacity frees elsewhere
+    batcher._drain_arrival_proof_buffer(env)
+
+    assert len(extended) == 1
+    assert batcher.fill_state.snapshot()["in_flight"][env] == 1
+    assert len(batcher._arrival_proof_buffer) == 0
+
+
+def test_ranks_handed_to_extend_strictly_increase_across_drains(monkeypatch):
+    """``extend`` refuses a rank at or behind the plan's current highest
+    (``proof_scheduler.py``'s ``next_apply_index`` invariant). The rank
+    counter must keep climbing across every drain, not just within one."""
+    import reliquary.validator.batcher as batcher_module
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+
+    extended = []
+    batcher = _make_batcher()
+    batcher.fill_state = batcher_module.FillState(
+        targets={"openmathinstruct": 1, "opencodeinstruct": 1}
+    )
+    batcher._extend_proof_plan = lambda candidates: extended.extend(candidates)
+    env = "openmathinstruct"
+
+    batcher._submit_arrival_proof(_pending_stub(prompt_idx=61))  # drains now
+    batcher._submit_arrival_proof(_pending_stub(prompt_idx=62))  # buffers: full
+    batcher._submit_arrival_proof(_pending_stub(prompt_idx=63))  # buffers: full
+
+    assert len(extended) == 1
+
+    batcher.fill_state.release(env)
+    batcher._drain_arrival_proof_buffer(env)  # a second, separate drain
+
+    batcher.fill_state.release(env)
+    batcher._drain_arrival_proof_buffer(env)  # a third, separate drain
+
+    assert len(extended) == 3
+    ranks = [candidate.rank for candidate in extended]
+    assert ranks == sorted(ranks)
+    assert len(set(ranks)) == len(ranks)
+
+
+def test_an_unknown_rate_falls_back_to_lowest_priority_not_a_crash(monkeypatch):
+    """``rate_of`` misses when a receipt was never offered (or was offered
+    in a different window). The group must still drain -- after every
+    known-rate group, however small its rate -- rather than raise."""
+    import reliquary.validator.batcher as batcher_module
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+
+    extended = []
+    batcher = _make_batcher()
+    batcher.mark_window_opened()
+    batcher.admission_queue = batcher_module.ThroughputAdmissionQueue(
+        window_opened_at=batcher.window_opened_at
+    )
+    env = "openmathinstruct"
+    batcher.admission_queue.offer(
+        receipt_id="known", environment=env, payload_bytes=1,
+        precommit_arrived_at=batcher.window_opened_at + 100.0,  # tiny rate
+    )
+    batcher.fill_state = batcher_module.FillState(
+        targets={"openmathinstruct": 2, "opencodeinstruct": 2}
+    )
+    batcher.fill_state.reserve(env)
+    batcher.fill_state.reserve(env)  # full: both bodies below buffer
+    batcher._extend_proof_plan = lambda candidates: extended.extend(candidates)
+
+    unknown = _pending_stub(prompt_idx=71)
+    unknown.request = types.SimpleNamespace(_precommit_receipt_id="never-offered")
+    known = _pending_stub(prompt_idx=72)
+    known.request = types.SimpleNamespace(_precommit_receipt_id="known")
+
+    batcher._submit_arrival_proof(unknown)  # arrives first, unknown rate
+    batcher._submit_arrival_proof(known)    # arrives second, a known (tiny) rate
+
+    assert extended == []
+
+    batcher.fill_state.release(env)
+    batcher._drain_arrival_proof_buffer(env)
+
+    assert len(extended) == 1
+    assert extended[0].payload.pending.prompt_idx == 72  # "known" wins despite tiny rate
 
 
 def test_a_plan_extension_failure_releases_the_reservation(monkeypatch):

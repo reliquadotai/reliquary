@@ -32,15 +32,25 @@ def _offer(queue, receipt, *, at, payload_bytes, env=MATH):
     )
 
 
-def test_the_faster_producer_is_served_first_even_when_it_arrives_later():
+def test_rate_of_reports_the_throughput_a_receipt_registered():
     queue = ThroughputAdmissionQueue(window_opened_at=0.0)
 
     _offer(queue, "slow", at=50.0, payload_bytes=1000)   # 20 B/s
     _offer(queue, "fast", at=60.0, payload_bytes=9000)   # 150 B/s, arrived LAST
 
-    assert queue.take_best(MATH).receipt_id == "fast"
-    assert queue.take_best(MATH).receipt_id == "slow"
-    assert queue.take_best(MATH) is None
+    assert queue.rate_of("fast") == 150.0
+    assert queue.rate_of("slow") == 20.0
+
+
+def test_rate_of_an_unknown_receipt_is_none_not_a_crash():
+    """A graded body whose receipt never went through ``offer`` (never
+    queued, or queued in a different window) must degrade to a defined
+    priority rather than raise -- the batcher's buffer sort depends on
+    this returning cleanly."""
+    queue = ThroughputAdmissionQueue(window_opened_at=0.0)
+    _offer(queue, "slow", at=50.0, payload_bytes=1000)
+
+    assert queue.rate_of("never-offered") is None
 
 
 def test_the_rate_runs_from_window_open_and_carries_no_identity():
@@ -75,21 +85,13 @@ def test_parallel_producers_gain_volume_not_rank():
     assert min(b.throughput for b in burst) > solo.throughput * 0.97
 
 
-def test_equal_rates_break_on_arrival_then_receipt():
-    """Rates collide often; an order that fell out of list ordering would make
-    a window unreproducible when replaying it from the archive."""
-    queue = ThroughputAdmissionQueue(window_opened_at=0.0)
-    _offer(queue, "later", at=30.0, payload_bytes=3000)
-    _offer(queue, "earlier", at=20.0, payload_bytes=2000)
-
-    assert queue.take_best(MATH).receipt_id == "earlier"
-
-
-def test_environments_queue_independently():
+def test_rate_of_looks_up_by_receipt_regardless_of_environment():
+    """``rate_of`` has no environment parameter: a receipt_id is unique on
+    its own, and the batcher that calls it already knows which environment
+    it is (its own -- one batcher per environment)."""
     queue = ThroughputAdmissionQueue(window_opened_at=0.0)
     _offer(queue, "math", at=10.0, payload_bytes=9000)
     _offer(queue, "code", at=10.0, payload_bytes=100, env="opencodeinstruct")
 
-    assert queue.take_best("opencodeinstruct").receipt_id == "code"
-    assert queue.take_best("opencodeinstruct") is None
-    assert queue.take_best(MATH).receipt_id == "math"
+    assert queue.rate_of("code") == 10.0
+    assert queue.rate_of("math") == 900.0

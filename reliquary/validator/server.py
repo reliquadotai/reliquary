@@ -1948,6 +1948,12 @@ class ValidatorServer:
         if receipt.consumed:
             return "replay", receipt
         receipt.consumed = True
+        # v6 only. This is the exact point a body is matched to its
+        # precommit -- stamp the receipt onto the request so the arrival
+        # proof path can look up the rate it registered
+        # (``ThroughputAdmissionQueue.rate_of``). ``request`` is the same
+        # object batcher.py later stores on ``PendingSubmission.request``.
+        request._precommit_receipt_id = receipt_id
         revealed = getattr(
             type(receipt.batcher), "mark_upload_precommit_revealed", None
         )
