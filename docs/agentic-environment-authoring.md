@@ -48,6 +48,12 @@ partial credit into GRPO. A task generator should expose several meaningful
 families through `task.metadata["family"]` instead of producing cosmetic
 variants of one template.
 
+An invalid JSON action or unknown tool is an immediate terminal binary failure.
+Once `no_invalid_tool_calls` has failed, success is impossible, so continuing to
+sample would only consume GPU tokens without changing the outcome. New binary
+environments should use the same fail-fast rule unless their reward contract
+explicitly makes recovery from malformed actions possible.
+
 Then:
 
 1. Add the environment package to `agentic/envs` and `BUILTIN_EPISODE_ENVIRONMENTS`.

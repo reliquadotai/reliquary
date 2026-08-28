@@ -297,6 +297,8 @@ class RetrievalToolsEnvironment:
             return StepResult(
                 state,
                 self._event(name, {"ok": False, "error": str(exc)[:512]}),
+                done=True,
+                termination_reason="invalid_action",
             )
 
     def grade(

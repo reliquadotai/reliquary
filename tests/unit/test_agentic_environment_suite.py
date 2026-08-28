@@ -231,5 +231,32 @@ def test_invalid_model_text_becomes_a_bounded_replayable_action():
         policy=InvalidThenFinal(),
     )
     assert trace.actions[0].tool == "__invalid_action__"
+    assert len(trace.actions) == 1
     assert len(trace.actions[0].to_json().encode("utf-8")) < 1024
+    assert trace.termination_reason == "invalid_action"
     assert trace.reward is not None and trace.reward.reward == 0.0
+
+
+@pytest.mark.parametrize(
+    "environment_name",
+    [
+        "reliquary_stateful_tools_v1",
+        "reliquary_retrieval_tools_v1",
+        "reliquary_workspace_tools_v1",
+    ],
+)
+def test_invalid_action_is_an_immediate_binary_failure(environment_name):
+    env = get_environment_spec(environment_name).create()
+    task = env.get_task(0)
+    trace = EpisodeRunner().run(
+        env,
+        task,
+        seed=0,
+        policy=ScriptedPolicy([AssistantAction.tool_call("unknown")]),
+    )
+    assert len(trace.actions) == 1
+    assert trace.actions[0].tool == "unknown"
+    assert trace.termination_reason == "invalid_action"
+    assert trace.reward is not None
+    assert trace.reward.reward == 0.0
+    assert trace.reward.success is False

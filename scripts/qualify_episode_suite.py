@@ -10,6 +10,7 @@ import json
 import math
 import platform
 from pathlib import Path
+import re
 import statistics
 import subprocess
 import sys
@@ -34,6 +35,7 @@ from reliquary.protocol.profiles import resolve_protocol_profile  # noqa: E402
 
 
 DEFAULT_PROFILE = "qwen3-4b-reliquary-episode-v7-dev1"
+_COMMIT_SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 
 
 def _byte_encode(text: str) -> list[int]:
@@ -80,6 +82,62 @@ def _git_identity() -> dict[str, Any]:
         return {"revision": None, "tracked_dirty": None}
 
 
+def _verify_huggingface_tree_receipt(
+    root: Path,
+    *,
+    revision: str,
+    file_sha256: dict[str, str],
+    file_git_blob_sha1: dict[str, str],
+    file_sizes: dict[str, int],
+) -> dict[str, Any]:
+    """Verify a downloaded HF tree against its immutable-revision receipt."""
+
+    relative_receipt = Path(".cache") / "huggingface" / "trees" / f"{revision}.json"
+    receipt_path = root / relative_receipt
+    result: dict[str, Any] = {
+        "path": str(relative_receipt),
+        "verified": False,
+        "files": 0,
+        "reason": None,
+    }
+    if _COMMIT_SHA_PATTERN.fullmatch(revision) is None:
+        result["reason"] = "revision_is_not_a_full_commit_sha"
+        return result
+    if not receipt_path.is_file():
+        result["reason"] = "receipt_missing"
+        return result
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        result["reason"] = "receipt_unreadable"
+        return result
+    expected = receipt.get("files")
+    if receipt.get("format_version") != 1 or not isinstance(expected, dict):
+        result["reason"] = "receipt_shape_invalid"
+        return result
+    result["files"] = len(expected)
+    if set(expected) != set(file_sha256):
+        result["reason"] = "receipt_file_set_mismatch"
+        return result
+    for relative, metadata in expected.items():
+        if not isinstance(metadata, dict):
+            result["reason"] = f"receipt_metadata_invalid:{relative}"
+            return result
+        if metadata.get("size") != file_sizes[relative]:
+            result["reason"] = f"receipt_size_mismatch:{relative}"
+            return result
+        lfs_sha256 = metadata.get("lfs_sha256")
+        if lfs_sha256 is not None:
+            if lfs_sha256 != file_sha256[relative]:
+                result["reason"] = f"receipt_lfs_digest_mismatch:{relative}"
+                return result
+        elif metadata.get("blob_id") != file_git_blob_sha1[relative]:
+            result["reason"] = f"receipt_blob_digest_mismatch:{relative}"
+            return result
+    result["verified"] = True
+    return result
+
+
 def _artifact_digest(source: str, revision: str) -> dict[str, Any]:
     path = Path(source).expanduser()
     if not path.exists():
@@ -91,25 +149,49 @@ def _artifact_digest(source: str, revision: str) -> dict[str, Any]:
             "sha256": hashlib.sha256(identity.encode("utf-8")).hexdigest(),
             "files": None,
             "bytes": None,
+            "revision_receipt": None,
+            "revision_verified": False,
         }
     files = [path] if path.is_file() else sorted(
-        value for value in path.rglob("*") if value.is_file()
+        value
+        for value in path.rglob("*")
+        if value.is_file()
+        and ".cache" not in value.relative_to(path).parts
     )
     digest = hashlib.sha256()
     total_bytes = 0
+    file_sha256: dict[str, str] = {}
+    file_git_blob_sha1: dict[str, str] = {}
+    file_sizes: dict[str, int] = {}
     for file_path in files:
         relative = file_path.name if path.is_file() else str(
             file_path.relative_to(path)
         )
+        size = file_path.stat().st_size
         file_digest = hashlib.sha256()
+        git_blob_digest = hashlib.sha1(usedforsecurity=False)
+        git_blob_digest.update(f"blob {size}\0".encode("ascii"))
         with file_path.open("rb") as handle:
             while chunk := handle.read(8 * 1024 * 1024):
                 file_digest.update(chunk)
+                git_blob_digest.update(chunk)
                 total_bytes += len(chunk)
+        file_sha256[relative] = file_digest.hexdigest()
+        file_git_blob_sha1[relative] = git_blob_digest.hexdigest()
+        file_sizes[relative] = size
         digest.update(relative.encode("utf-8"))
         digest.update(b"\0")
-        digest.update(file_digest.hexdigest().encode("ascii"))
+        digest.update(file_sha256[relative].encode("ascii"))
         digest.update(b"\n")
+    receipt = None
+    if path.is_dir():
+        receipt = _verify_huggingface_tree_receipt(
+            path,
+            revision=revision,
+            file_sha256=file_sha256,
+            file_git_blob_sha1=file_git_blob_sha1,
+            file_sizes=file_sizes,
+        )
     return {
         "kind": "local_artifact_tree",
         "source": str(path.resolve()),
@@ -117,6 +199,8 @@ def _artifact_digest(source: str, revision: str) -> dict[str, Any]:
         "sha256": digest.hexdigest(),
         "files": len(files),
         "bytes": total_bytes,
+        "revision_receipt": receipt,
+        "revision_verified": bool(receipt and receipt["verified"]),
     }
 
 
@@ -319,7 +403,7 @@ def qualify_model(
     ).to(device).eval()
     resolved_commit = getattr(model.config, "_commit_hash", None)
     revision_verified = bool(
-        artifact["kind"] == "local_artifact_tree"
+        artifact.get("revision_verified")
         or resolved_commit == model_revision
     )
 

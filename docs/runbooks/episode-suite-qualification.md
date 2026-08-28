@@ -45,16 +45,40 @@ python3 scripts/qualify_episode_suite.py \
 ```
 
 This checks turn-by-turn generation and exact replay, hashes the local model
-artifact, verifies the revision, and reports reward mix, GRPO-eligible groups,
+artifact, verifies every downloaded file against the Hugging Face receipt for
+the exact 40-character revision, and reports reward mix, GRPO-eligible groups,
 invalid actions, assistant/total tokens, latency and peak VRAM. It fails closed
 unless the environment has at least one success, one failure and one rollout
 group whose reward standard deviation reaches the active protocol threshold.
 It is a qualification gate, not a benchmark, and does not promote weights.
+Invalid actions terminate immediately because they make the binary success
+contract unrecoverable; a regression to repeated post-invalid sampling should
+be treated as wasted GPU capacity.
 
 After stateful passes, repeat with retrieval, then workspace. Finally omit
 `--environment` to qualify the combined suite. A uniformly failing base model
 means the environment is technically replay-safe but not yet learnable with
 the current prompt/model frontier; do not weaken the verifier to force a pass.
+
+## Real-checkpoint optimizer gate
+
+After model rollouts pass, exercise the complete training handoff with the same
+local checkpoint and CUDA runtime:
+
+```bash
+python3 scripts/qualify_episode_training_gpu.py \
+  --model-path /models/Qwen3-4B-Base \
+  --model-revision 906bfd4b4dc7f14ee4320094d8b41684abff8539 \
+  --device cuda:0 \
+  --json-out /tmp/reliquary-episode-training-gpu.json
+```
+
+The gate constructs one mixed 16-rollout group, replays it through validator
+admission, round-trips the detached training payload and runs one real BF16
+GRPO update with the production attention and optimizer configuration. It
+fails unless all rollouts reach the optimizer, the scheduler advances and the
+full in-memory model weight hash changes. The report binds the artifact receipt,
+code/runtime/device identities, rewards, token counts, metrics and peak VRAM.
 
 ## Full development-network gate
 

@@ -1,10 +1,66 @@
 from __future__ import annotations
 
+import hashlib
+import json
+
 from scripts.qualify_episode_suite import (
+    _artifact_digest,
     qualify_adversarial,
     qualify_cpu,
     summarize_model_environment,
 )
+
+
+def _git_blob_sha1(value: bytes) -> str:
+    digest = hashlib.sha1(usedforsecurity=False)
+    digest.update(f"blob {len(value)}\0".encode("ascii"))
+    digest.update(value)
+    return digest.hexdigest()
+
+
+def _write_hf_receipt(root, revision: str, files: dict[str, bytes]) -> None:
+    tree = root / ".cache" / "huggingface" / "trees"
+    tree.mkdir(parents=True)
+    receipt = {
+        "format_version": 1,
+        "files": {
+            name: {"size": len(value), "blob_id": _git_blob_sha1(value)}
+            for name, value in files.items()
+        },
+    }
+    (tree / f"{revision}.json").write_text(json.dumps(receipt))
+
+
+def test_local_artifact_requires_and_verifies_immutable_revision_receipt(tmp_path):
+    revision = "a" * 40
+    files = {"config.json": b"{}", "tokenizer.json": b"tokens"}
+    for name, value in files.items():
+        (tmp_path / name).write_bytes(value)
+    _write_hf_receipt(tmp_path, revision, files)
+
+    artifact = _artifact_digest(str(tmp_path), revision)
+
+    assert artifact["files"] == 2
+    assert artifact["revision_verified"] is True
+    assert artifact["revision_receipt"]["verified"] is True
+
+
+def test_artifact_digest_ignores_cache_but_receipt_detects_tampering(tmp_path):
+    revision = "b" * 40
+    files = {"config.json": b"original"}
+    (tmp_path / "config.json").write_bytes(files["config.json"])
+    _write_hf_receipt(tmp_path, revision, files)
+    first = _artifact_digest(str(tmp_path), revision)
+
+    (tmp_path / ".cache" / "transient.lock").write_text("changed")
+    second = _artifact_digest(str(tmp_path), revision)
+    assert second["sha256"] == first["sha256"]
+    assert second["revision_verified"] is True
+
+    (tmp_path / "config.json").write_bytes(b"tampered")
+    tampered = _artifact_digest(str(tmp_path), revision)
+    assert tampered["revision_verified"] is False
+    assert "mismatch" in tampered["revision_receipt"]["reason"]
 
 
 def _row(reward: float, *, error=None, exact_replay=True):

@@ -37,7 +37,10 @@ _NEUTRAL_PROCESSOR_KWARGS = {
     "encoder_repetition_penalty": 1.0,
     "no_repeat_ngram_size": 0,
     "encoder_no_repeat_ngram_size": 0,
-    "min_length": 0,
+    # Transformers 5.9 warns when both zero-valued length controls are passed.
+    # Explicit None still overrides generation_config without adding a
+    # processor; min_new_tokens=0 is the single active no-op control.
+    "min_length": None,
     "min_new_tokens": 0,
     "suppress_tokens": None,
     "begin_suppress_tokens": None,

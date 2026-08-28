@@ -362,8 +362,8 @@ _SPEC_VALUES = (
         episode_replay_path="reliquary.environment.agentic.suite:replay_submission",
         renderer_id="reliquary-jsonl-tools-v1",
         environment_manifest_sha256=(
-            "2b803b2caaa53f55144dcbea8e4af83c"
-            "2be069bb53c1eabde5600808375c7043"
+            "746b3114299c07144cbfe24c339df938"
+            "9d5d606ffb2764ff0e9e5fd12cd86bb6"
         ),
     ),
     EnvironmentSpec(
@@ -387,8 +387,8 @@ _SPEC_VALUES = (
         episode_replay_path="reliquary.environment.agentic.suite:replay_submission",
         renderer_id="reliquary-jsonl-tools-v1",
         environment_manifest_sha256=(
-            "fa772a63257da98f2acea67406ac1a5c"
-            "b68a1422317ac0abb809f3cd70e7a70b"
+            "d8693064fd24b169cc6cf1f2d69997b"
+            "2b697a262ba6357d1cebfe74cd294a01c"
         ),
     ),
     EnvironmentSpec(
@@ -412,8 +412,8 @@ _SPEC_VALUES = (
         episode_replay_path="reliquary.environment.agentic.suite:replay_submission",
         renderer_id="reliquary-jsonl-tools-v1",
         environment_manifest_sha256=(
-            "b5e5b13e9bb25f82465fad4132ef9185"
-            "2d2a1f5ad04239bdf936c23d4b634795"
+            "92eba3051cb8a6c2bf60a27ccbd1eb1"
+            "13911e1daf1b5e589fa7c4b507fda347b"
         ),
     ),
 )

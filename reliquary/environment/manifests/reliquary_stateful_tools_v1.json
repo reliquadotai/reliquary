@@ -32,7 +32,7 @@
     "reliquary/environment/agentic/suite.py",
     "reliquary/environment/agentic/types.py"
   ],
-  "implementation_sha256": "f16d788cd0b9d45061518a4d2dd83b79b1ae78dfffaae684b66a72a3ca0424f9",
+  "implementation_sha256": "ffad6ea3228c5e26c2304d7a1b89fb7a20f9113d4c080cfaeb7217f36756289d",
   "source": "Reliquary-authored procedural retail, support, and CRM worlds",
   "external_data": false,
   "network_required": false,
