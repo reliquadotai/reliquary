@@ -4738,7 +4738,10 @@ class ValidationService:
         from reliquary.shared.training_payload import encode_training_payload
 
         try:
-            checkpoint_epoch = self._training_payload_epoch_binding(window_n)
+            checkpoint_epoch = ValidationService._training_payload_epoch_binding(
+                self,
+                window_n,
+            )
             data = encode_training_payload(
                 window_batches,
                 window_start=int(window_n),
@@ -4751,7 +4754,13 @@ class ValidationService:
                 int(window_n),
                 data,
             )
-            self._training_tombstoned_windows.discard(int(window_n))
+            tombstoned_windows = getattr(
+                self,
+                "_training_tombstoned_windows",
+                None,
+            )
+            if tombstoned_windows is not None:
+                tombstoned_windows.discard(int(window_n))
         except Exception:
             logger.exception(
                 "training payload write failed for window %s",
@@ -4772,7 +4781,7 @@ class ValidationService:
         *,
         plan: EpochPlan | None = None,
     ):
-        epoch_plan = plan or self._checkpoint_epoch_plan
+        epoch_plan = plan or getattr(self, "_checkpoint_epoch_plan", None)
         if epoch_plan is None:
             return None
         offset = int(window_start) - epoch_plan.first_window
@@ -4811,7 +4820,8 @@ class ValidationService:
             return
         from reliquary.shared.training_payload import encode_tombstone
 
-        checkpoint_epoch = self._training_payload_epoch_binding(
+        checkpoint_epoch = ValidationService._training_payload_epoch_binding(
+            self,
             window_start,
             plan=checkpoint_epoch_plan,
         )
