@@ -273,6 +273,70 @@ def test_epoch_commitment_cannot_upload_until_post_commit_selection():
     assert batcher.proof_grading_attempts == 0
 
 
+@pytest.mark.parametrize(
+    ("round_reject", "accepted"),
+    (
+        (RejectReason.STALE_ROUND, True),
+        (RejectReason.FUTURE_ROUND, False),
+    ),
+)
+def test_epoch_commitment_uses_receipt_deadline_not_stale_round_bucket(
+    round_reject,
+    accepted,
+):
+    from reliquary.validator.observability import DrandRoundObservation
+
+    plan = _plan(environments={"fake": 1_000})
+    batcher = _server_batcher(window_start=plan.first_window)
+    batcher.experimental_epoch_ranking = True
+    batcher.drand_round_check_enabled = True
+    batcher.collection_seconds = plan.window_schedule.collection_seconds
+    batcher.current_checkpoint_hash = plan.checkpoint.revision
+    batcher.observe_drand_round = lambda *_args, **_kwargs: DrandRoundObservation(
+        submitted_drand_round=100,
+        arrival_drand_round=101,
+        drand_delta=-1,
+        drand_tolerance=0,
+        drand_status=(
+            "stale" if round_reject is RejectReason.STALE_ROUND else "future"
+        ),
+        reject_reason=round_reject,
+    )
+    prompt_idx = plan.windows[0].prompt_slices[0].start
+    request = _server_request(
+        prompt_idx=prompt_idx,
+        window_start=plan.first_window,
+        checkpoint_hash=plan.checkpoint.revision,
+        valid_merkle=True,
+    )
+    batcher._operator_by_hotkey = {request.miner_hotkey: "operator-a"}
+    payload = request.model_dump_json().encode("utf-8")
+    precommit = _precommit_for(request, payload_bytes=len(payload))
+    server = ValidatorServer()
+    server._auction_admission_enabled = True
+    server.set_current_checkpoint(_checkpoint(plan))
+    server.set_checkpoint_epoch_plan(plan)
+    server.set_active_epoch_batchers({("fake", plan.first_window): batcher})
+    server.set_registered_hotkeys(
+        {request.miner_hotkey},
+        operator_by_hotkey={request.miner_hotkey: "operator-a"},
+    )
+    server.set_checkpoint_epoch_phase("commitment")
+    server.set_current_state(WindowState.OPEN)
+
+    with TestClient(server.app) as client:
+        response = client.post(
+            "/submit/precommit",
+            content=precommit.model_dump_json(),
+            headers={"Content-Type": "application/json"},
+        ).json()
+
+    assert response["accepted"] is accepted
+    assert response["reason"] == (
+        RejectReason.ACCEPTED.value if accepted else round_reject.value
+    )
+
+
 def test_selected_epoch_commitment_gets_bounded_reveal_right():
     plan = _plan(environments={"fake": 1_000})
     batcher = _server_batcher(window_start=plan.first_window)

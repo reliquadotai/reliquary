@@ -87,7 +87,6 @@ from reliquary.protocol.submission import (
 from reliquary.protocol.tokens import verify_tokens
 from reliquary.validator.batch_selection import (
     throughput_rank,
-    _within_slot_key,
     explain_batch_selection,
     select_batch_and_distribute,
 )
@@ -102,7 +101,6 @@ from reliquary.validator.difficulty_auction import (
     auction_difficulty_score,
     auction_value,
     flat_auction_value,
-    difficulty_score,
     fractional_reward_lattice,
     robust_uncertain_reward_utility,
     select_shadow_auction,
@@ -122,7 +120,6 @@ from reliquary.validator.proof_scheduler import (
     CapacityAbortReason,
     GlobalProofScheduler,
     ProofDecisionStatus,
-    ProofExecution,
     ProofPlan,
     ProofPlanOutcome,
     RankedProof,

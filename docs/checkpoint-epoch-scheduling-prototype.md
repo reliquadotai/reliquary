@@ -125,13 +125,15 @@ open one after another. A miner queries
 `/state?env=<name>&window=<number>` for each lane it intends to release.
 
 Preparing work does not send its payload. At exact commitment OPEN, the miner
-revalidates live state and finalizes fresh drand-round, nonce, envelope signature
-and precommit signature fields. It durably keeps those exact reveal bytes, then
-sends only the compact precommit that binds their hash, size, prompt, lane,
-checkpoint, profile, and generation inputs. The shared finalizer exists so a
-prepared body is never reused with stale transport freshness. The validator
-stores the compact object without reserving proof or grading capacity. A
-payload sent before selection is refused.
+revalidates live state and finalizes the nonce, envelope signature, precommit
+signature, and observed drand-round telemetry. It durably keeps those exact
+reveal bytes, then sends only the compact precommit that binds their hash,
+size, prompt, lane, checkpoint, profile, and generation inputs. The validator's
+receipt timestamp and fixed commitment deadline determine eligibility. An
+older signed round is recorded but does not reject or rank an epoch commitment;
+a claimed future round remains invalid. The validator stores the compact object
+without reserving proof or grading capacity. A payload sent before selection is
+refused.
 
 After beacon A, miners poll the narrow commitment-status endpoint. A selected
 commitment receives one bounded reveal deadline; a non-selected commitment
@@ -143,9 +145,13 @@ existing formatting, authenticity, grading, proof, duplicate, checkpoint, and
 forced-stream checks remain in force.
 
 Every lane targets `B_BATCH` selected groups. The experimental default chooses
-at most `B_BATCH + B_BATCH / 2` payload reveals per environment/lane: 16 targets
-plus an 8-candidate proof-failure reserve with the production value of
-`B_BATCH`. The limit is applied only after the commitment phase and therefore
+at most `2 * B_BATCH` payload reveals per environment/lane: 16 targets plus a
+16-candidate proof-failure reserve with the production value of `B_BATCH`.
+Deterministic sensitivity replay keeps the reserve explicit: the former
+half-batch reserve underfilled too often at the fixture's stated validity rates,
+while a full-batch reserve filled 99.4% of 500 complete synthetic epochs and
+still halves the old 64-payload ceiling. This is a capacity result, not live
+telemetry. The limit is applied only after the commitment phase and therefore
 does not create a first-arrival pool. The reveal bound and compact-commitment
 bound are manifest-bound and cannot change within an epoch.
 
@@ -272,8 +278,8 @@ compute-hour, warm-up loss, operator concentration, prompt difficulty and
 diversity, common-OPEN ingress, and stale/discarded work.
 
 The configured capacity envelope has one deterministic property: at the
-default 24-reveal limit, at most eight fully valid revealed candidates can
-remain outside a full 16-group selection. This is a bound on validator-processed
+default 32-reveal limit, at most 16 fully valid revealed candidates can remain
+outside a full 16-group selection. This is a bound on validator-processed
 payloads, not a measured claim about generation cost, profitability, or
 participation. The reserve should be reduced or increased only from observed
 proof-failure and underfill data.
@@ -287,6 +293,17 @@ python3.12 scripts/simulate_checkpoint_epoch.py
 Its JSON output states its assumptions and marks every field that requires
 authenticated operational telemetry. It is a capacity regression fixture, not
 an economic forecast.
+
+An optional CUDA qualification loads the pinned profile model, prepares one
+real forced-seed group, verifies all proofs and logprobs, and can carry the
+payload through the local epoch precommit, selection, reveal, admission, seal,
+and winner path. It never starts a listener or contacts a validator:
+
+```bash
+RELIQUARY_PROTOCOL_PROFILE=qwen3-4b-base-dapo-reasoning-v5 \
+  python3.12 scripts/qualify_checkpoint_epoch_gpu.py \
+  --max-new-tokens 8192 --http-lane
+```
 
 ## Rollout and rollback
 
