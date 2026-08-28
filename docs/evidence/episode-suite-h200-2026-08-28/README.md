@@ -15,9 +15,12 @@ Reliquary Episode v1 suite. No weight release or network activation is implied.
   entries not downloaded were repository documentation/license metadata.
 - Model shadow reports bind code revision
   `db00f285c8b097c05e3101fec23c5fd62baae295`.
-- The optimizer report and final full suite bind revision
+- The stateful optimizer report and final full suite bind revision
   `77f1429848b4e77053b56735805c23fee0331780`; the intervening commit adds only
   a unit test for the full-model weight digest.
+- Retrieval and workspace optimizer reports bind revision
+  `777f80001aecbbbaec2f1583e94f05e6cf6a1fac`; that intervening commit archives
+  this evidence and makes no executable-code change.
 
 ## Results
 
@@ -41,16 +44,21 @@ reducing p95 from 143.131 seconds to 8.424 seconds. Retrieval p95 fell from
 81.747 seconds to 7.853 seconds; its artifact-bound forced-seed sample changed,
 so its before/after reward counts are not a paired quality comparison.
 
-The real CUDA optimizer gate used FlashAttention 2, replayed and admitted one
-mixed 16-rollout stateful group, round-tripped the detached training payload,
-and processed all 1,144 assistant tokens in one BF16 GRPO step. The scheduler
-advanced once, gradients were finite, and the complete model weight digest
-changed:
+The real CUDA optimizer gate used FlashAttention 2 and, for each environment,
+replayed and admitted one mixed 16-rollout group, round-tripped the detached
+training payload and ran one BF16 GRPO step. Every scheduler advanced once,
+every gradient gate passed and every complete model weight digest changed:
+
+| Environment | Assistant tokens | Grad norm | Elapsed seconds | Peak allocation bytes |
+|---|---:|---:|---:|---:|
+| stateful | 1,144 | 15.6875 | 37.848 | 27,529,947,136 |
+| retrieval | 568 | 18.25 | 37.191 | 25,828,440,576 |
+| workspace | 880 | 14.8125 | 37.073 | 26,394,975,232 |
+
+The stateful full-model digests were:
 
 - before: `0eb89f96962225806a95309663a282f48c1fba5eca772258f56c877d683729dc`
 - after: `ec617f33d978fb6f74bd922c0fd824b5463c30fff52315af7a42411626ab5dc9`
-- elapsed: 37.848 seconds
-- peak PyTorch allocation after model load: 27,529,947,136 bytes
 
 ## Known inherited GPU finding
 
@@ -69,6 +77,8 @@ failure is retained in `gpu-suite-77f1429.log`.
 eac4bd21bd25188198cc0496277eee6125400868ba1816b6dbb9a8507e63a9aa  episode-cpu-py312-linux-db00f28.json
 5df4f1417859e901f33067a2c9caafd62c2752df75a671f7504d127e8f08c87c  episode-determinism-py312-ubuntu24.jsonl
 247a7229cbe9aaf8b6bef3f4f72e8c5f7c1383ce0b7172d8bfeadf74e21187f1  episode-training-gpu-77f1429.json
+b47e01b0569647e26e0c834cfb6af96d87686992b082baad632f0da3aa92819b  episode-training-gpu-retrieval-777f800.json
+87b812e766c746b20521e4df97b2b5dba9d3771d8c6bba0afe9cef4f3ce05305  episode-training-gpu-workspace-777f800.json
 cd52da457cc8ea23db2a75ae3b44febff1085ce2b573ca22de1bf845c917b485  full-cpu-py312-linux-77f1429.log
 909a5aa4d49a2caaca8426b10884911cce367e3bac642138e5170efd301c8dd7  gpu-suite-77f1429.log
 7d7ef694a856d4a9e74469af2dd300adb1351d17e894df08adbf9a1ca3e941e2  model-reliquary_retrieval_tools_v1-8x16-db00f28.json
