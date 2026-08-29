@@ -2225,6 +2225,9 @@ class ValidationService:
         verification in ``indices_from_root`` if the chain call that fills
         randomness fails (e.g. finney WebSocket returns 503).
         """
+        from reliquary.validator.fill_closed_batch_assembler import (
+            FillClosedBatchAssembler,
+        )
         from reliquary.validator.fill_window import FillState
 
         if self._candidate_activation_nonce is None:
@@ -2266,6 +2269,41 @@ class ValidationService:
             if FILL_CLOSED_ENABLED
             else None
         )
+        # v6 only (R13). Batch ASSEMBLY moves here too, beside FillState,
+        # same gate: a GrpoWindowBatcher only ever holds its own
+        # environment's proven groups (see batcher.py:_emit_training_
+        # batch), so it cannot join every environment's B_BATCH chunk
+        # into one DAPO training batch by itself -- only the service,
+        # which sees every environment's batcher for this window, can.
+        # One assembler per window, injected as every batcher's
+        # ``emit_training_batch_fn`` below. Logged (not raised) before
+        # being replaced: a still-open PREVIOUS window's assembler may
+        # hold a remainder that never became a full B_BATCH-per-
+        # environment payload -- by design (see FillClosedBatchAssembler's
+        # module docstring: a partial batch is exactly what its
+        # carry-forward exists to avoid), but it should stay observable.
+        previous_assembler = getattr(self, "_fill_closed_assembler", None)
+        if previous_assembler is not None:
+            remainder = previous_assembler.remainder_snapshot()
+            has_remainder = any(remainder["in_accumulator"].values()) or any(
+                remainder["pending"].values()
+            )
+            logger.log(
+                logging.WARNING if has_remainder else logging.DEBUG,
+                "FillClosedBatchAssembler: window %d closed with remainder "
+                "%s (never emitted as a partial batch)",
+                previous_assembler.window_start, remainder,
+            )
+        fill_closed_assembler = (
+            FillClosedBatchAssembler(
+                window_start=target_window,
+                env_order=[name for name, _ in self.env_mix],
+                enqueue_fn=self._write_fill_closed_training_payload,
+            )
+            if FILL_CLOSED_ENABLED
+            else None
+        )
+        self._fill_closed_assembler = fill_closed_assembler
         for env_name, env in self.envs.items():
             open_kwargs = {
                 "window_start": target_window,
@@ -2283,6 +2321,10 @@ class ValidationService:
                 ),
                 "operator_by_hotkey": operator_by_hotkey,
             }
+            if fill_closed_assembler is not None:
+                open_kwargs["emit_training_batch_fn"] = (
+                    fill_closed_assembler.accept
+                )
             if epoch_window is not None:
                 plan = self._checkpoint_epoch_plan
                 if plan is None:
@@ -4954,6 +4996,34 @@ class ValidationService:
             get_training_payload_queue,
         )
         return get_training_payload_queue()
+
+    def _write_fill_closed_training_payload(
+        self, key: int, data: bytes,
+    ) -> None:
+        """R13: enqueue_fn injected into this window's
+        ``FillClosedBatchAssembler``. Independent of the seal-time
+        ``_write_training_payload`` -- no quarantine assessment or
+        checkpoint-epoch binding here yet (see task-7b-report.md's
+        NEEDS_CONTEXT: those are cross-batcher concerns of their own,
+        tied to the once-per-window seal flow, not decided for continuous
+        per-batch emission). Best-effort and silent on
+        ``WRITE_TRAINING_PAYLOADS`` off, matching the seal path's own
+        kill-switch; a write failure here is logged and dropped rather
+        than tombstoned, since -- unlike a sealed window -- there is no
+        single terminal journal slot for a mid-window emission to mark
+        failed against.
+        """
+        from reliquary.constants import WRITE_TRAINING_PAYLOADS
+
+        if not WRITE_TRAINING_PAYLOADS:
+            return
+        try:
+            self._training_payload_queue_ref().enqueue_payload(key, data)
+        except Exception:
+            logger.exception(
+                "fill-closed training payload write failed for journal "
+                "key %s", key,
+            )
 
     def _enqueue_aborted_window(
         self,

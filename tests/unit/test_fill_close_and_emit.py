@@ -118,6 +118,65 @@ def test_service_builds_one_shared_fill_state_and_injects_every_batcher(
     }
 
 
+def _build_two_env_fill_closed_service(monkeypatch, *, enabled: bool):
+    """Shared setup for the R13 wiring tests below."""
+    import reliquary.validator.service as service_module
+    from reliquary.validator.cooldown import ContentCooldownMap, CooldownMap
+    from tests.unit.test_service_v2 import _build_late_drop_service
+
+    monkeypatch.setattr(service_module, "FILL_CLOSED_ENABLED", enabled)
+
+    svc = _build_late_drop_service()
+    math_env = FakeEnv()
+    code_env = PrivateRewardFakeEnv()
+    svc.envs = {"openmathinstruct": math_env, "opencodeinstruct": code_env}
+    svc.env_mix = [
+        ("openmathinstruct", B_BATCH), ("opencodeinstruct", B_BATCH),
+    ]
+    svc.env = math_env
+    svc._cooldown_per_env = {
+        name: CooldownMap(cooldown_windows=1_000_000) for name in svc.envs
+    }
+    svc._content_cooldown_per_env = {
+        name: ContentCooldownMap(cooldown_windows=1_000_000)
+        for name in svc.envs
+    }
+    return svc
+
+
+def test_service_wires_one_assembler_into_every_batcher(monkeypatch):
+    """R13 (4): the assembler is constructed beside the shared FillState,
+    same place, same gate, and injected as every batcher's
+    ``emit_training_batch_fn`` -- the SAME bound method, so both
+    batchers' chunks join in the same assembler instance."""
+    svc = _build_two_env_fill_closed_service(monkeypatch, enabled=True)
+
+    batchers = svc._build_window_batchers(999)
+
+    math_fn = batchers["openmathinstruct"]._emit_training_batch_fn
+    code_fn = batchers["opencodeinstruct"]._emit_training_batch_fn
+    assert math_fn is not None
+    assert code_fn is not None
+    assert math_fn.__self__ is code_fn.__self__
+    from reliquary.validator.fill_closed_batch_assembler import (
+        FillClosedBatchAssembler,
+    )
+    assert isinstance(math_fn.__self__, FillClosedBatchAssembler)
+    assert math_fn.__self__.window_start == 999
+
+
+def test_no_assembler_and_no_callback_with_the_gate_off(monkeypatch):
+    """(d): with FILL_CLOSED_ENABLED off, no assembler is created and
+    every batcher's ``emit_training_batch_fn`` is None."""
+    svc = _build_two_env_fill_closed_service(monkeypatch, enabled=False)
+
+    batchers = svc._build_window_batchers(999)
+
+    assert getattr(svc, "_fill_closed_assembler", None) is None
+    for batcher in batchers.values():
+        assert batcher._emit_training_batch_fn is None
+
+
 def test_a_batch_is_emitted_every_b_batch_proven_groups(monkeypatch):
     """16 x 32 = 512 is arithmetic, not a schedule the miner can see.
 
