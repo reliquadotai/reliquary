@@ -3,7 +3,7 @@ import threading
 
 from reliquary.constants import B_BATCH
 from tests.unit.test_grpo_window_batcher import (
-    PrivateRewardFakeEnv, _make_batcher,
+    FakeEnv, PrivateRewardFakeEnv, _make_batcher,
 )
 
 
@@ -73,6 +73,49 @@ def test_the_shared_fill_state_lock_is_the_same_object_on_both_batchers(
     assert math_batcher.fill_state.lock is code_batcher.fill_state.lock
     assert not hasattr(math_batcher, "_fill_state_lock")
     assert not hasattr(code_batcher, "_fill_state_lock")
+
+
+def test_service_builds_one_shared_fill_state_and_injects_every_batcher(
+    monkeypatch,
+):
+    """R10 (4): the service is the single place a v6 window's
+    ``FillState`` is constructed. ``_build_window_batchers`` builds one
+    ``GrpoWindowBatcher`` per environment (unrelated to this test); this
+    pins that every one of them gets the SAME ``FillState`` instance,
+    with every environment's target, assigned to ``.fill_state``."""
+    import reliquary.validator.service as service_module
+    from reliquary.constants import FILL_CLOSED_TARGET_GROUPS_PER_ENV
+    from reliquary.validator.cooldown import ContentCooldownMap, CooldownMap
+    from tests.unit.test_service_v2 import _build_late_drop_service
+
+    monkeypatch.setattr(service_module, "FILL_CLOSED_ENABLED", True)
+
+    svc = _build_late_drop_service()
+    math_env = FakeEnv()
+    code_env = PrivateRewardFakeEnv()
+    svc.envs = {"openmathinstruct": math_env, "opencodeinstruct": code_env}
+    svc.env_mix = [
+        ("openmathinstruct", B_BATCH), ("opencodeinstruct", B_BATCH),
+    ]
+    svc.env = math_env
+    svc._cooldown_per_env = {
+        name: CooldownMap(cooldown_windows=1_000_000) for name in svc.envs
+    }
+    svc._content_cooldown_per_env = {
+        name: ContentCooldownMap(cooldown_windows=1_000_000)
+        for name in svc.envs
+    }
+
+    batchers = svc._build_window_batchers(999)
+
+    assert set(batchers) == {"openmathinstruct", "opencodeinstruct"}
+    shared = batchers["openmathinstruct"].fill_state
+    assert shared is not None
+    assert batchers["opencodeinstruct"].fill_state is shared
+    assert shared.snapshot()["targets"] == {
+        "openmathinstruct": FILL_CLOSED_TARGET_GROUPS_PER_ENV,
+        "opencodeinstruct": FILL_CLOSED_TARGET_GROUPS_PER_ENV,
+    }
 
 
 def test_a_batch_is_emitted_every_b_batch_proven_groups(monkeypatch):

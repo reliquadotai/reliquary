@@ -44,6 +44,8 @@ from reliquary.constants import (
     EXPERIMENTAL_CHECKPOINT_EPOCH_REVEAL_SECONDS,
     EXPERIMENTAL_CHECKPOINT_EPOCH_TRAINING_MODE,
     EXPERIMENTAL_CHECKPOINT_EPOCH_WARMUP_ROUNDS,
+    FILL_CLOSED_ENABLED,
+    FILL_CLOSED_TARGET_GROUPS_PER_ENV,
     FORCED_SEED_CDF_BOUNDARY_EPSILON,
     FORCED_SEED_CDF_ENFORCE,
     FORCED_SEED_CONSISTENCY_FLOOR,
@@ -2223,6 +2225,8 @@ class ValidationService:
         verification in ``indices_from_root`` if the chain call that fills
         randomness fails (e.g. finney WebSocket returns 503).
         """
+        from reliquary.validator.fill_window import FillState
+
         if self._candidate_activation_nonce is None:
             self._candidate_activation_nonce = os.urandom(32)
         target_window = int(target_window)
@@ -2244,6 +2248,24 @@ class ValidationService:
             )
         operator_by_hotkey = self.server.operator_by_hotkey_snapshot()
         batchers: dict[str, GrpoWindowBatcher] = {}
+        # v6 only (R10). One ``FillState`` is shared across every
+        # per-environment batcher for this window: the service builds one
+        # ``GrpoWindowBatcher`` per environment, but ``FillState`` is
+        # multi-key and ``is_closed()`` needs every environment full, so
+        # each batcher can't own its own instance. This is the single
+        # place a v6 window's ``FillState`` is constructed -- every
+        # batcher below just gets the same object assigned to
+        # ``.fill_state``; nothing else in the codebase constructs one.
+        shared_fill_state = (
+            FillState(
+                targets={
+                    env_name: FILL_CLOSED_TARGET_GROUPS_PER_ENV
+                    for env_name in self.envs
+                }
+            )
+            if FILL_CLOSED_ENABLED
+            else None
+        )
         for env_name, env in self.envs.items():
             open_kwargs = {
                 "window_start": target_window,
@@ -2304,6 +2326,8 @@ class ValidationService:
                 **open_kwargs,
             )
             batcher.current_checkpoint_hash = cp_hash
+            if shared_fill_state is not None:
+                batcher.fill_state = shared_fill_state
             if epoch_window is not None:
                 plan = self._checkpoint_epoch_plan
                 if plan is None:
