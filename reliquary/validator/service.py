@@ -2299,6 +2299,7 @@ class ValidationService:
                 window_start=target_window,
                 env_order=[name for name, _ in self.env_mix],
                 enqueue_fn=self._write_fill_closed_training_payload,
+                tombstone_fn=self._write_fill_closed_training_tombstone,
             )
             if FILL_CLOSED_ENABLED
             else None
@@ -5002,16 +5003,16 @@ class ValidationService:
     ) -> None:
         """R13: enqueue_fn injected into this window's
         ``FillClosedBatchAssembler``. Independent of the seal-time
-        ``_write_training_payload`` -- no quarantine assessment or
-        checkpoint-epoch binding here yet (see task-7b-report.md's
-        NEEDS_CONTEXT: those are cross-batcher concerns of their own,
-        tied to the once-per-window seal flow, not decided for continuous
-        per-batch emission). Best-effort and silent on
-        ``WRITE_TRAINING_PAYLOADS`` off, matching the seal path's own
-        kill-switch; a write failure here is logged and dropped rather
-        than tombstoned, since -- unlike a sealed window -- there is no
-        single terminal journal slot for a mid-window emission to mark
-        failed against.
+        ``_write_training_payload`` -- no checkpoint-epoch binding here
+        (v6 windows are not epoch-final windows). The assembler itself
+        now runs ``assess_training_batch`` per batch (R14) and only
+        calls this for batches it did NOT quarantine; a quarantined
+        batch goes to ``_write_fill_closed_training_tombstone`` instead.
+        Best-effort and silent on ``WRITE_TRAINING_PAYLOADS`` off,
+        matching the seal path's own kill-switch; a write failure here
+        is logged and dropped rather than tombstoned, since -- unlike a
+        sealed window -- there is no single terminal journal slot for a
+        mid-window emission to mark failed against.
         """
         from reliquary.constants import WRITE_TRAINING_PAYLOADS
 
@@ -5022,6 +5023,33 @@ class ValidationService:
         except Exception:
             logger.exception(
                 "fill-closed training payload write failed for journal "
+                "key %s", key,
+            )
+
+    def _write_fill_closed_training_tombstone(
+        self, key: int, data: bytes,
+    ) -> None:
+        """R14: tombstone_fn injected into this window's
+        ``FillClosedBatchAssembler``, called instead of ``_write_fill_
+        closed_training_payload`` for a batch ``assess_training_batch``
+        quarantines. Written under the batch's OWN encoded journal key
+        (not the bare window) so ``WindowJournal.next_entry`` finds it at
+        the same cursor position a payload would have occupied -- the
+        trainer's cursor advances on this marker instead of stalling.
+        Mirrors the payload sibling: best-effort, silent on
+        ``WRITE_TRAINING_PAYLOADS`` off, and a write failure here is
+        logged and dropped for the same reason (no single terminal slot
+        to mark failed against mid-window).
+        """
+        from reliquary.constants import WRITE_TRAINING_PAYLOADS
+
+        if not WRITE_TRAINING_PAYLOADS:
+            return
+        try:
+            self._training_payload_queue_ref().enqueue_tombstone(key, data)
+        except Exception:
+            logger.exception(
+                "fill-closed training tombstone write failed for journal "
                 "key %s", key,
             )
 
