@@ -424,6 +424,7 @@ def open_grpo_window(
     tokenizer,
     bootstrap: bool = False,
     queue_drained_predicate=None,
+    emit_training_batch_fn=None,
     operator_by_hotkey: dict[str, str] | None = None,
     proof_scheduler=None,
     verify_commitment_proofs_fn=None,
@@ -444,6 +445,15 @@ def open_grpo_window(
     can wait for every queued trigger-round submission to be GRAIL-
     validated before firing the seal. See
     ``GrpoWindowBatcher._delayed_seal_at_drand_boundary``.
+
+    ``emit_training_batch_fn`` is v6 only: called with the accumulated
+    ``dict[str, list[ValidSubmission]]`` every time a B_BATCH-per-
+    environment slice of proven groups is ready, from whichever proof-
+    worker thread completed the proof that filled it (see
+    ``GrpoWindowBatcher._emit_training_batch``). ``None`` here -- no
+    caller wires a detached-trainer writer into it yet; see
+    ``docs/superpowers/plans/2026-08-28-fill-closed-window-v6.md``,
+    Component 4.
     """
     def _completion_text(rollout: RolloutSubmission) -> str:
         prompt_len = rollout.commit.get("rollout", {}).get("prompt_length", 0)
@@ -468,6 +478,7 @@ def open_grpo_window(
         completion_text_fn=_completion_text,
         canonical_prompt_tokens_fn=_canonical_prompt_tokens,
         queue_drained_predicate=queue_drained_predicate,
+        emit_training_batch_fn=emit_training_batch_fn,
         operator_by_hotkey=operator_by_hotkey,
         proof_scheduler=proof_scheduler,
         verify_commitment_proofs_fn=verify_commitment_proofs_fn,
