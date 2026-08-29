@@ -1,6 +1,10 @@
 """The window ends on its fill, and batches leave while it is still open."""
+import threading
+
 from reliquary.constants import B_BATCH
-from tests.unit.test_grpo_window_batcher import _make_batcher
+from tests.unit.test_grpo_window_batcher import (
+    PrivateRewardFakeEnv, _make_batcher,
+)
 
 
 def test_the_window_seals_when_every_environment_is_full(monkeypatch):
@@ -21,6 +25,56 @@ def test_the_window_seals_when_every_environment_is_full(monkeypatch):
     assert batcher.poll_deadline() is True
 
 
+def test_two_env_batchers_share_one_fill_state_for_is_closed(monkeypatch):
+    """R10: the service builds one ``GrpoWindowBatcher`` per environment,
+    but ``FillState`` is multi-key and ``is_closed()`` needs every
+    environment full. One shared instance, injected into both batchers'
+    ``.fill_state``, is what makes ``is_closed()`` see across them."""
+    import reliquary.validator.batcher as batcher_module
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+
+    shared = batcher_module.FillState(
+        targets={"openmathinstruct": 1, "opencodeinstruct": 1}
+    )
+    math_batcher = _make_batcher()
+    code_batcher = _make_batcher(env=PrivateRewardFakeEnv())
+    math_batcher.fill_state = shared
+    code_batcher.fill_state = shared
+
+    shared.record_proven("openmathinstruct")
+
+    assert math_batcher.fill_state.is_closed() is False
+    assert code_batcher.fill_state.is_closed() is False
+
+    shared.record_proven("opencodeinstruct")
+
+    assert math_batcher.fill_state.is_closed() is True
+    assert code_batcher.fill_state.is_closed() is True
+
+
+def test_the_shared_fill_state_lock_is_the_same_object_on_both_batchers(
+    monkeypatch,
+):
+    """The lock has to live ON the shared ``FillState`` instance (moved
+    there per R10) -- a per-batcher ``_fill_state_lock`` would give each
+    batcher its own, separate lock around the SAME shared object, which is
+    no lock at all."""
+    import reliquary.validator.batcher as batcher_module
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+
+    shared = batcher_module.FillState(
+        targets={"openmathinstruct": 1, "opencodeinstruct": 1}
+    )
+    math_batcher = _make_batcher()
+    code_batcher = _make_batcher(env=PrivateRewardFakeEnv())
+    math_batcher.fill_state = shared
+    code_batcher.fill_state = shared
+
+    assert math_batcher.fill_state.lock is code_batcher.fill_state.lock
+    assert not hasattr(math_batcher, "_fill_state_lock")
+    assert not hasattr(code_batcher, "_fill_state_lock")
+
+
 def test_a_batch_is_emitted_every_b_batch_proven_groups(monkeypatch):
     """16 x 32 = 512 is arithmetic, not a schedule the miner can see."""
     import reliquary.validator.batcher as batcher_module
@@ -31,14 +85,96 @@ def test_a_batch_is_emitted_every_b_batch_proven_groups(monkeypatch):
     batcher.fill_state = batcher_module.FillState(
         targets={"openmathinstruct": 64, "opencodeinstruct": 64}
     )
-    batcher._emit_training_batch = lambda: emitted.append(1)
+    # Stub the injected callback, not ``_emit_training_batch`` itself: the
+    # counter check-and-increment now lives INSIDE ``_emit_training_batch``,
+    # under ``fill_state.lock``, together with the slice and watermark
+    # advance (Task 7 review, Critical) -- stubbing the method out would
+    # bypass that gating entirely instead of exercising it.
+    batcher._emit_training_batch_fn = lambda batch: emitted.append(batch)
 
     for _ in range(B_BATCH):
-        batcher.fill_state.record_proven("openmathinstruct")
-        batcher.fill_state.record_proven("opencodeinstruct")
+        with batcher.fill_state.lock:
+            batcher.fill_state.record_proven("openmathinstruct")
+            batcher._proven_groups.setdefault(
+                "openmathinstruct", []
+            ).append(object())
+            batcher.fill_state.record_proven("opencodeinstruct")
+            batcher._proven_groups.setdefault(
+                "opencodeinstruct", []
+            ).append(object())
         batcher._maybe_emit_batch()
 
     assert len(emitted) == 1
+
+
+def test_concurrent_proven_writes_and_emission_never_drop_or_duplicate_groups(
+    monkeypatch,
+):
+    """Task 7 review, Critical: ``_maybe_emit_batch`` read
+    ``fill_state.snapshot()['proven']`` and ``_emit_training_batch`` read
+    ``self._proven_groups[env]`` WITHOUT ``fill_state``'s lock, while
+    ``_reconcile_fill_state_decisions`` mutates both together UNDER it, on
+    a possibly different proof-worker thread. A reader could observe a
+    ``proven`` count that had advanced past a ``_proven_groups`` append not
+    yet made, slice a short list, advance the watermark anyway, and
+    permanently discard the group arriving right after -- silent loss of
+    trained data. A writer thread and an emitter thread hammer the same
+    batcher concurrently; every proven group must come out of the emit
+    callback exactly once (no drops, no duplicates).
+    """
+    import reliquary.validator.batcher as batcher_module
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+
+    n_cycles = 13  # 13 * B_BATCH == 208, close to the requested ~200
+    n_groups = n_cycles * B_BATCH
+    envs = ("openmathinstruct", "opencodeinstruct")
+
+    batcher = _make_batcher()
+    batcher.fill_state = batcher_module.FillState(
+        targets={env: n_groups for env in envs}
+    )
+    emitted_batches: list[dict] = []
+    batcher._emit_training_batch_fn = lambda batch: emitted_batches.append(
+        batch
+    )
+
+    appended: dict[str, list[object]] = {env: [] for env in envs}
+
+    def writer() -> None:
+        for _ in range(n_groups):
+            for env in envs:
+                group = object()
+                with batcher.fill_state.lock:
+                    batcher.fill_state.record_proven(env)
+                    batcher._proven_groups.setdefault(env, []).append(group)
+                appended[env].append(group)
+
+    stop = threading.Event()
+
+    def emitter() -> None:
+        while not stop.is_set():
+            batcher._maybe_emit_batch()
+
+    writer_thread = threading.Thread(target=writer)
+    emitter_thread = threading.Thread(target=emitter)
+    emitter_thread.start()
+    writer_thread.start()
+    writer_thread.join()
+    stop.set()
+    emitter_thread.join()
+    batcher._maybe_emit_batch()  # drain whatever became ready right at the end
+
+    emitted_by_env: dict[str, list[object]] = {env: [] for env in envs}
+    for batch in emitted_batches:
+        for env, groups in batch.items():
+            emitted_by_env[env].extend(groups)
+
+    for env in envs:
+        emitted_ids = sorted(id(g) for g in emitted_by_env[env])
+        appended_ids = sorted(id(g) for g in appended[env])
+        assert emitted_ids == appended_ids, (
+            env, len(emitted_ids), len(appended_ids),
+        )
 
 
 def test_state_advertises_which_environments_are_still_admitting(monkeypatch):
@@ -114,10 +250,23 @@ def test_emission_is_hooked_from_the_reconcile_walk_not_record_proven(
         batcher.fill_state = batcher_module.FillState(
             targets={"openmathinstruct": 1, "opencodeinstruct": 1}
         )
-        batcher._emit_training_batch = lambda: emitted.append(1)
+        # Stub the injected callback, not ``_emit_training_batch`` itself:
+        # the counter check-and-increment now lives INSIDE
+        # ``_emit_training_batch``, under ``fill_state.lock`` (Task 7
+        # review, Critical), so it must stay live for repeated
+        # ``_maybe_emit_batch`` calls (via ``_wait_until``'s polling) to
+        # self-gate correctly instead of re-firing on every poll.
+        batcher._emit_training_batch_fn = lambda batch: emitted.append(batch)
 
         # Bypasses the reconcile walk entirely -- must not trigger emission.
+        # Also seeds a matching proven GROUP (not just the count) for the
+        # other environment, so the real accumulator this test now
+        # exercises can actually reach ``ready`` once math's real proof
+        # completes below.
         batcher.fill_state.record_proven("opencodeinstruct")
+        batcher._proven_groups.setdefault("opencodeinstruct", []).append(
+            object()
+        )
         assert emitted == []
 
         assert batcher.accept_submission(

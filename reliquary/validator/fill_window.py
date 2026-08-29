@@ -15,6 +15,7 @@ group that fails its proof is not a group.
 
 from __future__ import annotations
 
+import threading
 from typing import Mapping
 
 
@@ -27,6 +28,19 @@ class FillState:
         self._targets = {str(name): int(target) for name, target in targets.items()}
         self._proven = {name: 0 for name in self._targets}
         self._in_flight = {name: 0 for name in self._targets}
+        # One window shares exactly one ``FillState`` across every
+        # per-environment ``GrpoWindowBatcher`` instance (each batcher only
+        # ever reserves/records on its own environment key, but
+        # ``is_closed()`` needs every environment). The lock lives HERE,
+        # not on each batcher, precisely because the instance is shared:
+        # two batchers each taking their own lock around this same object
+        # would be no lock at all. Methods below are deliberately
+        # lock-free -- callers hold ``self.lock`` for the whole
+        # read-modify-write they need, including reads paired with
+        # mutations of state that lives elsewhere (a batcher's own
+        # ``_proven_groups``/watermark), which is why this can't just be
+        # an internal per-method lock.
+        self.lock = threading.Lock()
 
     def _known(self, environment: str) -> str:
         if environment not in self._targets:

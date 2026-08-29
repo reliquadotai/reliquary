@@ -1,4 +1,6 @@
 """Admission stops on proven + in-flight; the close fires on proven alone."""
+import threading
+
 import pytest
 
 from reliquary.validator.fill_window import FillState
@@ -61,3 +63,13 @@ def test_releasing_what_was_never_reserved_is_a_bug_not_a_no_op():
     state = _state()
     with pytest.raises(ValueError):
         state.release(MATH)
+
+
+def test_the_instance_owns_a_lock_for_sharing_across_batchers():
+    """One ``FillState`` is shared across every per-environment batcher for
+    a window (R10). Sharing the OBJECT but not a lock on it would mean two
+    batchers each taking their own separate lock around the same instance
+    -- no lock at all. The lock has to live on the shared instance itself."""
+    state = _state()
+
+    assert isinstance(state.lock, type(threading.Lock()))
