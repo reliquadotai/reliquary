@@ -129,3 +129,45 @@ def test_batcher_wires_the_group_scale_cap():
     src = inspect.getsource(B)
     assert "per_rollout_cap=throughput_profile.token_cap" in src
     assert "token_cap=throughput_profile.token_cap * M_ROLLOUTS" in src
+
+
+def test_arrival_is_not_a_second_rank_key_after_throughput():
+    """Equal throughput goes directly to sealed drand, regardless of arrival."""
+    from reliquary.validator.batcher import _auction_rank_key
+
+    common = {
+        "difficulty_value": 0.5,
+        "throughput": -12,
+        "tiebreak": b"same-ticket",
+        "throughput_enabled": True,
+        "seal_randomness_available": True,
+    }
+    early = _auction_rank_key(
+        arrival_round=101, exact_arrival=1000.1, **common
+    )
+    late = _auction_rank_key(
+        arrival_round=130, exact_arrival=1087.9, **common
+    )
+
+    assert early == late
+
+
+def test_historical_non_throughput_profile_keeps_arrival_order():
+    """The v2 contract has no throughput denominator, so it stays unchanged."""
+    from reliquary.validator.batcher import _auction_rank_key
+
+    common = {
+        "difficulty_value": 0.5,
+        "throughput": 0,
+        "tiebreak": b"same-ticket",
+        "throughput_enabled": False,
+        "seal_randomness_available": True,
+    }
+    early = _auction_rank_key(
+        arrival_round=101, exact_arrival=1000.1, **common
+    )
+    late = _auction_rank_key(
+        arrival_round=130, exact_arrival=1087.9, **common
+    )
+
+    assert early < late

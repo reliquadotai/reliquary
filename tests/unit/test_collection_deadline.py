@@ -1,11 +1,9 @@
-"""The window is time-boxed. Its MINIMUM duration is the deadline itself — an
-early seal is exactly the speed race we are removing: whoever triggered it would
-cut off the slow-but-hard submissions still generating.
+"""The profile deadline is the hard collection ceiling.
 
-The one exception inverts that reasoning instead of violating it: the
-proven-dominance close (test_auction_early_close.py) fires only when NO
-submission could still land — capacity terminal-full and every receipt
-resolved — so there is no slow-but-hard submission left to cut off.
+Adaptive close is covered separately in ``test_auction_early_close.py``. It is
+forbidden before 60 seconds and requires primary/challenger headroom, prior-GPU
+completion, quiet arrivals, and completely drained uploads/admission. These
+tests retain coverage of the unconditional ceiling and admission semantics.
 """
 
 
@@ -58,8 +56,7 @@ def test_collection_deadline_starts_at_activation_not_construction():
 
 
 def test_late_submission_is_accepted_while_the_window_is_open():
-    """No more count-based BATCH_FILLED. A miner who took 250s on a hard prompt
-    still gets in — that is the entire point of the deadline."""
+    """No B_BATCH count seal: later work still enters while collection is open."""
     from tests.unit.test_grpo_window_batcher import _make_batcher, _request
 
     b = _make_batcher()

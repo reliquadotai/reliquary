@@ -203,6 +203,36 @@ def test_seal_wait_and_close_flips_fsm_at_deadline():
     assert stub.states == [WindowState.READY]
 
 
+class _AdaptiveSealCloseStub:
+    _seal_wait_and_close = ValidationService._seal_wait_and_close
+
+    def __init__(self):
+        self.states = []
+        self.observed_ready = None
+
+    async def _wait_for_window_seal(self, *, early_close_ready=None):
+        self.observed_ready = early_close_ready()
+        return "sealed"
+
+    def _set_state(self, state):
+        self.states.append(state)
+
+
+def test_pipelined_seal_wait_forwards_gpu_completion_gate():
+    """The collecting window observes completion of the previous GPU half."""
+    from reliquary.protocol.submission import WindowState
+
+    stub = _AdaptiveSealCloseStub()
+    gpu_done = False
+    reason = _run(stub._seal_wait_and_close(
+        early_close_ready=lambda: gpu_done
+    ))
+
+    assert reason == "sealed"
+    assert stub.observed_ready is False
+    assert stub.states == [WindowState.READY]
+
+
 def test_publication_forecast_false_under_freeze(monkeypatch):
     """RELIQUARY_DISABLE_TRAIN freezes the counter; without the gate a
     counter stuck at publish_every-1 would pin the loop serial forever."""

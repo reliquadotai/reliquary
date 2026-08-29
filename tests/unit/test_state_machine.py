@@ -619,14 +619,16 @@ async def test_activate_window_binds_batcher_loop_for_delayed_seal():
 
 
 @pytest.mark.asyncio
-async def test_wait_for_window_seal_force_seals_drained_proof_cap():
-    """A full proof cap with no queued/in-flight work cannot fill later."""
+async def test_auction_proof_cap_cannot_bypass_the_collection_ceiling():
+    """Exhaustion is not permission to seal before adaptive timing gates."""
+    from reliquary.constants import WINDOW_COLLECTION_SECONDS
     from reliquary.validator.service import MAX_GRADING_STARTS_PER_WINDOW
 
     svc = _make_service()
     svc._open_window()
     svc._activate_window()
     batcher = svc._active_batcher
+    batcher.difficulty_auction_enabled = True
 
     # Exhaustion is gated on the never-refunded grading-starts backstop:
     # non-productive rejects refund the productive admission budget, so only
@@ -635,12 +637,17 @@ async def test_wait_for_window_seal_force_seals_drained_proof_cap():
     assert batcher.valid_count == 0
     assert svc.server.submit_queue_depth == 0
     assert svc.server.proof_verification_inflight == 0
+    assert svc._force_seal_dead_batcher(batcher, {}) is None
+    assert batcher.is_sealed() is False
+
+    # The unconditional hard ceiling still guarantees liveness.
+    batcher.window_opened_at -= WINDOW_COLLECTION_SECONDS
 
     reason = await svc._wait_for_window_seal()
 
-    assert reason == "proof_admission_exhausted_drained"
+    assert reason == "sealed"
     assert batcher.is_sealed()
-    assert batcher.force_seal_reason == "proof_admission_exhausted_drained"
+    assert batcher.force_seal_reason is None
 
 
 def test_proof_cap_breaker_waits_for_inflight_or_queued_work():
