@@ -362,17 +362,31 @@ REJECTED_LIST_CAP_PER_HOTKEY = 5
 # Default HTTP port the validator listens on for miner submissions.
 VALIDATOR_HTTP_PORT = 8888
 
-# Hard ceiling on total grading attempts (reward computation) admitted per
-# window — the anti-DoS / queue bound and the outer cap on GPU proof work.
+# Productive admission has two layers. The first 64 candidates are the
+# long-standing primary population target. Another 32 challenger positions are
+# available by default so the short groups that arrive first cannot close the
+# population before longer answers have had a realistic chance to land.
+#
+# The total is validator-owned and may be raised to 128 operationally without a
+# miner cutover. It is intentionally independent of the 32-candidate ranked GPU
+# proof prefix: only candidates that can still win are proven at seal.
+PRIMARY_PROOF_GRADING_ATTEMPTS_PER_WINDOW = 64
+MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW = int(
+    _os.environ.get(
+        "RELIQUARY_MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW", "96"
+    )
+)
+
+# Hard ceiling on total productive grading attempts (reward computation)
+# admitted per window — the anti-DoS / queue bound and the outer cap on retained
+# auction candidates.
 # Counts every grading attempt that actually starts and is never refunded.
 # Pending work reserves capacity separately, so a degenerate-reward flood cannot
 # grow the bounded submit queue or saturate the grader pool while discarded
 # queue items do not burn work that never ran.
-# Admission remains at 64 started grading jobs per environment. It is consumed
-# before deferred GRAIL proof, so coupling it to the smaller seal-time proof
-# prefix would let two eight-submission hotkeys fill a v3 environment with
-# forged commitments before any GPU authentication runs.
-MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW = 64
+# It is consumed before deferred GRAIL proof, so coupling it to the smaller
+# seal-time proof prefix would let a small set of hotkeys fill an environment
+# with forged commitments before any GPU authentication runs.
 
 # The ceiling above bounds PRODUCTIVE admission: a submission that never
 # reached the grader (protocol conformance) or whose reward simply landed
@@ -380,9 +394,21 @@ MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW = 64
 # flood cannot hold receipts the rest of the fleet needs to fill the window.
 # Refunding alone would leave grading work bounded only by the per-hotkey
 # quota times the fleet size, so this second, never-refunded ceiling caps the
-# total grading starts a window can be made to run. Deliberately well above
-# the productive budget: it is a denial-of-service backstop, not a slot budget.
-MAX_GRADING_STARTS_PER_WINDOW = 4 * MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+# total grading starts a window can be made to run. Keep this fixed at the
+# historical 256 even when the productive population changes: it is a
+# denial-of-service backstop, not a slot budget.
+MAX_GRADING_STARTS_PER_WINDOW = 256
+
+if not (
+    PRIMARY_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+    <= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+    <= 128
+):
+    raise ValueError(
+        "RELIQUARY_MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW must be between "
+        f"{PRIMARY_PROOF_GRADING_ATTEMPTS_PER_WINDOW} and "
+        "128"
+    )
 
 # Seal-time GRAIL work is serial and an adversarial ranked prefix may fail one
 # candidate after another. The attempt ceiling bounds cardinality; this second
@@ -494,18 +520,31 @@ AUCTION_ADMISSION_DRAIN_DEADLINE_SECONDS = 390.0
 PROOF_ADMISSION_STALL_POLL_SECONDS = 0.5
 
 # Legacy-selector sparse-window liveness breaker. Production auction
-# environments use the fixed collection deadline instead; these values remain
-# for the emergency kill-switch path and any out-of-scope environment.
+# environments use their adaptive poll plus hard collection ceiling instead;
+# these values remain for the emergency kill-switch path and any out-of-scope
+# environment.
 SPARSE_VALID_IDLE_SEAL_SECONDS = 300.0
 SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS = 4
 SPARSE_VALID_MAX_WINDOW_SECONDS = 900.0
 
-# Fixed collection timing is versioned with the generation budget. We do not
-# early-close: doing so would reward arrival rather than let the complete
-# auction population compete under the advertised deadline.
+# Collection timing is versioned with the generation budget. The advertised
+# value remains the hard ceiling. Adaptive close may finish between 60 s and
+# this ceiling only after the primary population exists, the previous GPU half
+# has finished, admission and uploads are drained, and the candidate stream has
+# been quiet for a drand round. This preserves pipeline throughput while the 32
+# extra challenger positions protect longer answers from the old 64-candidate
+# arrival cutoff.
 WINDOW_COLLECTION_SECONDS = float(
     ACTIVE_PROTOCOL_PROFILE.collection_seconds
 )
+AUCTION_EARLY_CLOSE_MIN_SECONDS = 60.0
+AUCTION_EARLY_CLOSE_QUIET_SECONDS = 3.0
+if not (
+    0 < AUCTION_EARLY_CLOSE_MIN_SECONDS < WINDOW_COLLECTION_SECONDS
+):
+    raise ValueError(
+        "adaptive auction minimum must be below the collection ceiling"
+    )
 
 # Difficulty-auction v2: number of ranked-pass non-winners proven per window
 # purely for the forensic auth gates (token-auth, distribution, forced-seed),
@@ -787,9 +826,10 @@ NO_REVEAL_CIRCUIT_FAILURE_THRESHOLD = 4
 NO_REVEAL_CIRCUIT_FAILURE_WINDOW_WINDOWS = 10
 NO_REVEAL_CIRCUIT_COOLDOWN_WINDOWS = (10, 50, 250)
 
-# Seal a full auction window early: capacity terminal-full, every receipt
-# grace resolved. off | shadow (records eligibility, changes nothing) |
-# enforce. Empty means unset — a bare env-file line must not crash the boot.
+# Adaptive auction close. off | shadow (records eligibility, changes nothing) |
+# enforce. Production already runs enforce; keeping the switch provides an
+# immediate rollback without introducing a staging-only activation gate. Empty
+# means unset — a bare env-file line must not crash the boot.
 AUCTION_EARLY_CLOSE_MODE = (
     _os.environ.get("RELIQUARY_AUCTION_EARLY_CLOSE_MODE", "").strip().lower()
     or "shadow"

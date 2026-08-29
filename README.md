@@ -64,13 +64,16 @@ use.
   />
 </p>
 
-1. **Collect.** Math and Code each accept candidates for a fixed 100-second
-   interval. Every group contains exactly 16 rollouts.
+1. **Collect.** Math and Code each accept up to 96 productive candidates. The
+   100-second profile value is a hard ceiling; a GPU-aware quiet/drain check may
+   close from 60 seconds onward, after the primary 64-candidate population.
+   Every group contains exactly 16 rollouts.
 2. **Grade.** The validator recomputes Math rewards and executes Code cases in
    its sandbox. Groups below the reward-variance gate are rejected.
 3. **Rank.** In-zone groups rank by
    `std(rewards) × (1 − mean(rewards))`; equal values use a capped throughput
-   bucket, validator-observed arrival round, then a post-deadline drand tie-break.
+   bucket, then a post-seal drand tie-break. Validator-observed arrival is used
+   once, as the throughput denominator, not again as a second speed preference.
 4. **Prove.** Economic proof runs top-down only for candidates that can still
    win. A bounded, unpaid non-winner sample is also proven for forensic
    telemetry and cannot affect the auction.

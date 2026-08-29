@@ -245,33 +245,36 @@ gate still trips before cadence, the rejected update is excluded and the
 validator publishes only the previously accepted in-memory steps before
 resuming against the refreshed behavior policy.
 
-### Early close of a full window
+### Adaptive 60–100 second collection
 
 `RELIQUARY_AUCTION_EARLY_CLOSE_MODE` (default `shadow`):
 
-- `off` — today's validator, byte for byte.
-- `shadow` — observationally identical to `off`; logs
-  `auction_early_close_eligible` with the offset at which the window's outcome
-  became provably fixed, and reports it under `early_close` in the receipt
-  conservation stats. Read a day of shadow data before enforcing.
-- `enforce` — seal a window once its outcome is provably fixed: productive
-  capacity fully charged by terminal work, nothing in flight that could refund
-  a slot, and **every accepted upload receipt resolved to its own grace
-  deadline**, bounded at one grace past dominance — a body that completes
-  transport and then dies is unprunable, and an unbounded wait would latch the
-  refusal without ever sealing. New precommits are refused from the moment
-  dominance holds, with the same reason a sealed window gives
-  (`PRECOMMIT_EXPIRED` on the wire): terminal for the reference miner, which
-  retries `batch_filled`. The miner learns ~30 s earlier and skips a doomed
-  upload.
+- `off` — use only the 100-second ceiling.
+- `shadow` — record when the adaptive gates would have closed, without sealing.
+- `enforce` — enable the adaptive close. The live validator already uses this
+  value; there is no additional staging-only activation flag.
 
-Measured 2026-08-26: environments fill at +19-45 s and then reject everything
-for a median 79 s of the 102 s cycle. Enforce closes around fill+grace
-(~+55-80 s). The generation contract is untouched — `collection_seconds` was
-always the ceiling and miners compare the contract's value, never the observed
-duration; window numbering is sequential and the reference miner is a pure
-`/state` poller, so variable-length windows are already protocol reality
-(every abort produces one).
+Enforce never seals before 60 seconds and never waits past the profile's
+100-second ceiling. Between them, one environment is eligible only after:
+
+1. at least the primary 64 productive candidates and `B_BATCH` trainable
+   prompts exist;
+2. the previous pipelined GPU half has finished;
+3. no upload receipt, pending admission, or in-flight grading remains; and
+4. no candidate was accepted for at least one actual drand round.
+
+Productive admission defaults to 96, leaving 32 challenger positions after the
+primary population. Override it with
+`RELIQUARY_MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW=128` if later evidence calls
+for more collection headroom; this does not change the 32 ranked GPU-proof
+attempts, proof wall, generation contract, or miner protocol.
+
+The old 64-cap dominance close was self-confirming: it refused all later bodies
+and then treated their absence as proof that the winner set could not change.
+The adaptive close makes no dominance claim and performs no mid-window proof.
+`collection_seconds=100` remains the hard ceiling miners advertise and poll
+against; window numbering and the `/state` OPEN edge already support variable
+observed durations.
 
 ### Cooldown on training restart
 
@@ -364,9 +367,11 @@ current constants are explained from the miner's perspective in
 | Math / Code `max_new_tokens` | `8192` / `8192` | Per-rollout generation cap for both environments |
 | Math / Code `bft` | `null` / `null` | Budget-forced termination is disabled in v5 |
 | `FORCED_SEED_PROTOCOL_VERSION` | 5 | Mandatory hotkey-free forced stream while enforcement is active |
-| `WINDOW_COLLECTION_SECONDS` | 100 | Fixed collection interval for both Math and Code auction populations |
+| `WINDOW_COLLECTION_SECONDS` | 100 | Hard collection ceiling for both Math and Code auction populations |
+| `AUCTION_EARLY_CLOSE_MIN_SECONDS` | 60 | Earliest adaptive close; all drain/GPU/quiet/population gates must also pass |
 | `SUBMISSION_UPLOAD_GRACE_SECONDS` | 33 | Reveal grace for an exact body precommitted before collection cutoff |
-| `MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW` | 64 | Started admission-grading ceiling per environment/window |
+| `PRIMARY_PROOF_GRADING_ATTEMPTS_PER_WINDOW` | 64 | Primary population required before adaptive close |
+| `MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW` | 96 | Productive candidate ceiling per environment/window; 32 default challenger positions |
 | `MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW` | 32 | Ranked seal-time GPU proof ceiling per environment/window |
 | `FORENSIC_SAMPLE_PER_WINDOW` | 2 | Unpaid non-winner proof sample; cannot affect auction selection |
 | `MAX_PROOF_WALL_SECONDS` | 240 | Seal-time proof wall-clock ceiling per environment |
@@ -432,12 +437,15 @@ operator logical claim         zone and cheap authenticity guards
 rate/queue/payload bounds      -> pending auction pool
 -> reason="submitted"          -> first /verdicts lifecycle record
 
-100 s deadline
--> stop new admission and drain pre-deadline work (max 60 s)
+60–100 s adaptive collection
+-> after 60 s: require primary population + previous GPU half complete
+-> require one drand round quiet + no uploads/pending/in-flight admission
+-> otherwise continue to the 100 s hard ceiling
+-> stop new admission and drain pre-seal work
 -> freeze Math and Code populations independently
--> fetch post-deadline drand salt
--> rank by difficulty, capped throughput bucket, validator arrival round,
-   sealed operator/prompt tie hash
+-> fetch post-seal drand salt
+-> rank by difficulty, capped throughput bucket, sealed operator/prompt tie hash
+   (validator arrival is only the throughput clock denominator)
 -> prove top-down under attempt/wall/operator-debt bounds
 -> at most 16 distinct prompts; no operator winner cap
 -> pay exactly the selected training groups; no boundary split
