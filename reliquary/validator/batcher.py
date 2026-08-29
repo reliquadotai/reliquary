@@ -90,6 +90,7 @@ from reliquary.protocol.tokens import verify_tokens
 from reliquary.validator.admission import robust_utility_admits
 from reliquary.validator.admission_priority import ThroughputAdmissionQueue
 from reliquary.validator.fill_window import FillState
+from reliquary.validator.training_accumulator import BalancedTrainingAccumulator
 from reliquary.validator.batch_selection import (
     throughput_rank,
     explain_batch_selection,
@@ -811,6 +812,9 @@ class GrpoWindowBatcher:
         drand_chain_info: dict | None = None,
         drand_round_backward_tolerance: int | None = None,
         queue_drained_predicate: Callable[[], bool] | None = None,
+        emit_training_batch_fn: (
+            Callable[[dict[str, list[Any]]], None] | None
+        ) = None,
         operator_by_hotkey: dict[str, str] | None = None,
         current_round_fn: Callable[[], int | None] | None = None,
         proof_scheduler: GlobalProofScheduler | None = None,
@@ -1184,6 +1188,53 @@ class GrpoWindowBatcher:
         # for this lock has already exited before ``_fill_state_lock`` is
         # taken, so they never actually nest at all.
         self._proof_plan_lock = threading.Lock()
+        # v6 only. Serializes ``_maybe_emit_batch``'s ordering barrier so
+        # two proof-worker device threads crossing the B_BATCH boundary at
+        # once can never both observe the same ``ready`` value (double-
+        # emit) or emit out of counter order. Deliberately its OWN lock,
+        # not ``_fill_state_lock``: emission can block on I/O (the write
+        # to the detached trainer's journal), and ``_fill_state_lock`` is
+        # on the hot path every admission and proof completion takes --
+        # nesting a possible disk-write wait inside it would convoy the
+        # whole fill-state critical section behind that write, the same
+        # class of hazard ``_proof_plan_lock`` was already kept separate
+        # to avoid. Never taken together with ``_fill_state_lock`` or
+        # ``_proof_plan_lock`` in either order -- the only fill_state
+        # access under it is ``snapshot()``, a dict copy, not a mutation.
+        self._emit_batch_lock = threading.Lock()
+        # v6 only. Monotonic count of training batches already handed to
+        # the detached trainer. ``_maybe_emit_batch`` only ever walks this
+        # forward to ``proven // B_BATCH``, under ``_fill_state_lock`` --
+        # the ordering barrier that keeps two proof-worker threads
+        # completing out of order from emitting out of order too.
+        self._batches_emitted: int = 0
+        # v6 only. Every PASSED group, per environment, appended in the
+        # same rank order ``handle.decisions()`` guarantees. The source
+        # ``_emit_training_batch`` slices B_BATCH at a time from.
+        self._proven_groups: dict[str, list[Any]] = {}
+        # v6 only. How many of ``_proven_groups[environment]`` have
+        # already been folded into an emitted batch, so a group is never
+        # emitted twice and never skipped.
+        self._emitted_group_watermark: dict[str, int] = {}
+        # v6 only. Lazily sized to B_BATCH per environment on first
+        # emission -- ``fill_state`` (and therefore the environment set)
+        # is not known until window activation. This is the same
+        # accumulator the auction path uses to carry a sparse
+        # environment's deficit across windows; here it only ever needs
+        # to carry a single cycle's rounding remainder, since
+        # ``_maybe_emit_batch`` never fires until every environment
+        # already has at least B_BATCH new proven groups.
+        self._batch_training_accumulator: BalancedTrainingAccumulator | None = (
+            None
+        )
+        # v6 only. Injected by the service, following the
+        # ``queue_drained_predicate`` pattern below: called with
+        # ``dict[str, list[ValidSubmission]]`` once a B_BATCH-per-
+        # environment slice is ready. Runs on whichever proof-worker
+        # thread completed the proof that crossed the boundary -- see
+        # ``_emit_training_batch``. ``None`` in test contexts and until
+        # the service wires a real detached-trainer writer.
+        self._emit_training_batch_fn = emit_training_batch_fn
         self._loop: asyncio.AbstractEventLoop | None = None
         # Optional callback the seal-extension coroutine polls to check
         # whether the server's submit_queue has finished draining items
@@ -1579,6 +1630,11 @@ class GrpoWindowBatcher:
         -- proved or not -- is guaranteed to appear, whether or not the
         callable ran, so this walks it instead of accounting inline in
         the callable.
+
+        ``proven`` can only have just increased when this returns, so it
+        also calls ``_maybe_emit_batch`` -- once the lock above is
+        released, never while held, since emission takes its own
+        ``_emit_batch_lock`` (see that lock's docstring).
         """
         handle = self._open_proof_plan_handle
         if handle is None:
@@ -1590,8 +1646,99 @@ class GrpoWindowBatcher:
                 self._accounted_arrival_decisions.add(decision.job_id)
                 if decision.status is ProofDecisionStatus.PASSED:
                     self.fill_state.record_proven(environment)
+                    self._proven_groups.setdefault(environment, []).append(
+                        decision.value
+                    )
                 else:
                     self.fill_state.release(environment)
+        self._maybe_emit_batch()
+
+    def _maybe_emit_batch(self) -> None:
+        """Emit one training batch per B_BATCH proven groups in every env.
+
+        A DAPO step needs B_BATCH groups from EACH environment, so the
+        trigger is the slowest environment. Guarded by
+        ``_emit_batch_lock`` (see its docstring for why that lock and not
+        ``_fill_state_lock``) so two proof-worker threads finishing at the
+        same instant can never both observe the same ``ready`` value and
+        double-emit, and the ``while`` below is an ordering barrier: it
+        emits consecutively from a monotonically increasing counter,
+        never from proof-completion order, so batch 5 is never written
+        before batch 4.
+
+        Only called from ``_reconcile_fill_state_decisions``, after its
+        walk -- never from ``FillState.record_proven`` directly, which a
+        test double (or any future caller) could invoke without a real
+        scheduler decision behind it.
+        """
+        if self.fill_state is None:
+            return
+        with self._emit_batch_lock:
+            proven = self.fill_state.snapshot()["proven"]
+            ready = min(proven.values()) // B_BATCH
+            while self._batches_emitted < ready:
+                self._batches_emitted += 1
+                self._emit_training_batch()
+
+    def _emit_training_batch(self) -> None:
+        """Hand the next B_BATCH-per-environment slice of proven groups to
+        the detached trainer.
+
+        Called with ``_emit_batch_lock`` held (from ``_maybe_emit_batch``),
+        on whichever proof-worker thread completed the proof that crossed
+        the B_BATCH boundary -- never ``_fill_state_lock``, so a slow
+        write here never blocks admission or proof completion elsewhere.
+        ``self._emit_training_batch_fn`` -- like
+        ``TrainingPayloadQueue.enqueue_payload`` on the existing seal path
+        -- is a plain filesystem write with no asyncio primitives, so it
+        is called directly here rather than marshalled onto the event
+        loop via ``self._loop.call_soon_threadsafe``; a future
+        implementation that genuinely needs the loop is responsible for
+        its own scheduling, the same way ``_delayed_seal_at_drand_
+        boundary`` does.
+
+        Uses ``BalancedTrainingAccumulator`` (the same class the auction
+        path uses to carry a sparse environment's deficit across windows)
+        as the home for this cycle's remainder: each environment
+        contributes its next unemitted B_BATCH slice, and the accumulator
+        is what actually produces the ordered ``env -> groups`` batch and
+        resets for the next cycle.
+        """
+        environments = list(self.fill_state.snapshot()["targets"])
+        if self._batch_training_accumulator is None:
+            self._batch_training_accumulator = BalancedTrainingAccumulator(
+                {environment: B_BATCH for environment in environments}
+            )
+        slices: dict[str, list[Any]] = {}
+        for environment in environments:
+            groups = self._proven_groups.get(environment, [])
+            start = self._emitted_group_watermark.get(environment, 0)
+            end = start + B_BATCH
+            slices[environment] = groups[start:end]
+            self._emitted_group_watermark[environment] = min(end, len(groups))
+        self._batch_training_accumulator.add_window(
+            slices,
+            window_n=self.window_start,
+            checkpoint_revision=self.current_checkpoint_hash,
+        )
+        if not self._batch_training_accumulator.ready:
+            # Defensive only: the B_BATCH arithmetic in
+            # ``_maybe_emit_batch`` guarantees every environment has at
+            # least B_BATCH new proven groups by the time this runs. If a
+            # caller ever violates that, the accumulator holds what
+            # arrived and the next cycle tops it up.
+            return
+        window_batches = dict(
+            zip(
+                environments,
+                self._batch_training_accumulator.training_batches(
+                    environments
+                ),
+            )
+        )
+        self._batch_training_accumulator.reset()
+        if self._emit_training_batch_fn is not None:
+            self._emit_training_batch_fn(window_batches)
 
     def _record_upload_precommit_rejection_locked(self, reason: str) -> None:
         self._upload_precommit_rejections[reason] = (
@@ -2000,6 +2147,16 @@ class GrpoWindowBatcher:
                 "graded_prefix_fill_offset_seconds": (
                     self.graded_prefix_fill_offset_s
                 ),
+                # v6 only. Per-environment proven/in_flight/target/closed,
+                # so a fleet honouring a closed environment can rebalance
+                # toward the scarce one -- the reference miner already
+                # re-reads /state every loop iteration and samples its
+                # environment by the mix weights. None on the auction path.
+                "fill_state": (
+                    None
+                    if self.fill_state is None
+                    else self.fill_state.snapshot()
+                ),
                 "accepted_receipts": accepted,
                 "revealed": self._upload_precommit_revealed,
                 "revealed_terminal": terminal,
@@ -2173,6 +2330,22 @@ class GrpoWindowBatcher:
         if not self.difficulty_auction_enabled:
             return False
         now = self._time_fn()
+        if FILL_CLOSED_ENABLED and self.fill_state is not None:
+            # v6 replaces the clock with a count: the auction's early-close
+            # and fixed-deadline branches below never run for this window,
+            # and neither does the seal-time proof wall they share (v6
+            # proves continuously, not in one seal-time burst -- see
+            # ``test_v6_does_not_consult_the_seal_time_proof_wall``).
+            with self._fill_state_lock:
+                closed = self.fill_state.is_closed()
+            if closed:
+                self._seal_flag.set()
+                return True
+            if now - self.window_opened_at >= FILL_CLOSED_MAX_SECONDS:
+                # Backstop: a stalled fleet must not hold a window open.
+                self._seal_flag.set()
+                return True
+            return False
         self._poll_batch_fill(now)
         if (
             now - self.window_opened_at < self.collection_seconds

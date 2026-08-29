@@ -2468,6 +2468,7 @@ def test_health_exposes_each_environment_window_independently():
             },
             "graded_batch_fill_offset_seconds": None,
             "graded_prefix_fill_offset_seconds": None,
+            "fill_state": None,
             "accepted_receipts": 0,
             "revealed": 0,
             "revealed_terminal": 0,
