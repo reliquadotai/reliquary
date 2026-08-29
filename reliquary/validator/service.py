@@ -2282,16 +2282,28 @@ class ValidationService:
         # environment payload -- by design (see FillClosedBatchAssembler's
         # module docstring: a partial batch is exactly what its
         # carry-forward exists to avoid), but it should stay observable.
+        #
+        # R16: ``close()`` is what actually disposes of that remainder
+        # now -- emitted as one final partial batch when every
+        # environment contributed at least one group, tombstoned
+        # otherwise -- instead of the WARNING below being the only
+        # signal, one window later, that proven, paid rollouts were
+        # dropped with no marker. The snapshot is still read FIRST,
+        # before ``close()`` resets it, purely so this log line keeps
+        # reporting what was actually outstanding.
         previous_assembler = getattr(self, "_fill_closed_assembler", None)
         if previous_assembler is not None:
             remainder = previous_assembler.remainder_snapshot()
             has_remainder = any(remainder["in_accumulator"].values()) or any(
                 remainder["pending"].values()
             )
+            previous_assembler.close()
             logger.log(
                 logging.WARNING if has_remainder else logging.DEBUG,
                 "FillClosedBatchAssembler: window %d closed with remainder "
-                "%s (never emitted as a partial batch)",
+                "%s (close() emitted it as a final partial batch, or "
+                "tombstoned it, so the trainer's cursor still advances -- "
+                "see the assembler's own log line for which)",
                 previous_assembler.window_start, remainder,
             )
         fill_closed_assembler = (

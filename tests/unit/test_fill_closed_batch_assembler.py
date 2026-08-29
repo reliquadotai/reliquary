@@ -36,6 +36,13 @@ def _prompt_ids(groups: list) -> list:
     return [g.prompt_idx for g in groups]
 
 
+def _partial_chunk(tag: int, env: str, n: int) -> list:
+    return [
+        _group([_roll(1.0, 4, env=env)], prompt_idx=tag * 1000 + i)
+        for i in range(n)
+    ]
+
+
 def test_interleaved_chunks_join_into_one_ordered_payload_per_cycle(
     monkeypatch,
 ):
@@ -298,3 +305,155 @@ def test_batch_verdict_log_includes_the_batch_index(monkeypatch, caplog):
         and "quarantin" in record.getMessage().lower()
         for record in caplog.records
     )
+
+
+def test_close_emits_the_remainder_as_a_payload_when_every_env_has_groups(
+    monkeypatch,
+):
+    """R16: at window close, math is short (B_BATCH - 2 groups) but code
+    already sits at a full B_BATCH held in the accumulator, blocked
+    because math never reached B_BATCH to complete the cycle -- exactly
+    the ``remainder_snapshot`` scenario that used to be read-only and
+    reported one window later as a WARNING with no marker written. Every
+    environment has at least one group, so ``close()`` emits it as one
+    final, partial payload rather than dropping proven, paid rollouts.
+    """
+    import reliquary.infrastructure.training_payload_queue as queue_module
+
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
+
+    window = 42
+    enqueued: list[tuple[int, bytes]] = []
+    tombstoned: list[tuple[int, bytes]] = []
+    assembler = FillClosedBatchAssembler(
+        window_start=window,
+        env_order=ENV_ORDER,
+        enqueue_fn=lambda key, data: enqueued.append((key, data)),
+        tombstone_fn=lambda key, data: tombstoned.append((key, data)),
+    )
+
+    math_partial = _partial_chunk(0, "openmathinstruct", B_BATCH - 2)
+    code_full = _chunk(0, "opencodeinstruct")
+    assembler.accept("openmathinstruct", math_partial, window, "rev")
+    assembler.accept("opencodeinstruct", code_full, window, "rev")
+
+    # Neither chunk alone completes a cycle (math is short), so nothing
+    # has been written yet -- this remainder is genuinely unaddressed
+    # until close() runs.
+    assert enqueued == []
+    assert tombstoned == []
+
+    assembler.close()
+
+    assert tombstoned == []
+    assert len(enqueued) == 1
+    key, data = enqueued[0]
+    assert key == encoded_window_journal_key(window, 0)
+    batches = decode_training_payload(data).batches()
+    assert _prompt_ids(batches["openmathinstruct"]) == _prompt_ids(
+        math_partial
+    )
+    assert _prompt_ids(batches["opencodeinstruct"]) == _prompt_ids(code_full)
+    assert assembler.next_batch_index == 1
+
+
+def test_close_tombstones_when_one_env_contributed_nothing(monkeypatch):
+    """R16: opencodeinstruct never called accept() this cycle at all --
+    zero groups, not just a short chunk. There is no batch to assemble
+    (a DAPO step still needs every environment represented), so close()
+    writes a tombstone under the next batch's key instead, so the
+    trainer's journal cursor still advances rather than stalling.
+    """
+    import reliquary.infrastructure.training_payload_queue as queue_module
+
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
+
+    window = 42
+    enqueued: list[tuple[int, bytes]] = []
+    tombstoned: list[tuple[int, bytes]] = []
+    assembler = FillClosedBatchAssembler(
+        window_start=window,
+        env_order=ENV_ORDER,
+        enqueue_fn=lambda key, data: enqueued.append((key, data)),
+        tombstone_fn=lambda key, data: tombstoned.append((key, data)),
+    )
+
+    assembler.accept(
+        "openmathinstruct", _partial_chunk(0, "openmathinstruct", 5),
+        window, "rev",
+    )
+
+    assembler.close()
+
+    assert enqueued == []
+    assert len(tombstoned) == 1
+    key, data = tombstoned[0]
+    assert key == encoded_window_journal_key(window, 0)
+    decoded = decode_tombstone(data)
+    assert decoded["window_start"] == window
+    assert assembler.next_batch_index == 1
+
+
+def test_a_second_close_is_a_noop(monkeypatch):
+    """R16: close() must be idempotent -- a second call (or one racing a
+    final in-flight accept()) must not write a second payload/tombstone
+    under a fresh batch index."""
+    import reliquary.infrastructure.training_payload_queue as queue_module
+
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
+
+    window = 42
+    enqueued: list[tuple[int, bytes]] = []
+    tombstoned: list[tuple[int, bytes]] = []
+    assembler = FillClosedBatchAssembler(
+        window_start=window,
+        env_order=ENV_ORDER,
+        enqueue_fn=lambda key, data: enqueued.append((key, data)),
+        tombstone_fn=lambda key, data: tombstoned.append((key, data)),
+    )
+
+    for env in ENV_ORDER:
+        assembler.accept(
+            env, _partial_chunk(0, env, 3), window, "rev",
+        )
+
+    assembler.close()
+    assert len(enqueued) + len(tombstoned) == 1
+    next_index_after_first_close = assembler.next_batch_index
+
+    assembler.close()
+
+    assert len(enqueued) + len(tombstoned) == 1
+    assert assembler.next_batch_index == next_index_after_first_close
+
+
+def test_enqueue_fn_is_invoked_without_the_lock_held(monkeypatch):
+    """R17: accept() used to hold ``self._lock`` through ``_drain_locked``
+    all the way into the call to ``_enqueue_fn`` -- a blocking filesystem
+    write -- on whichever proof-worker thread happened to call
+    ``accept``. The fake ``enqueue_fn`` below asserts the lock is free
+    the instant it runs, which fails on the pre-fix code (the call was
+    made from inside ``with self._lock:``).
+    """
+    import reliquary.infrastructure.training_payload_queue as queue_module
+
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
+
+    window = 42
+    calls: list[int] = []
+
+    def enqueue_fn(key: int, data: bytes) -> None:
+        assert not assembler._lock.locked()
+        calls.append(key)
+
+    assembler = FillClosedBatchAssembler(
+        window_start=window,
+        env_order=ENV_ORDER,
+        enqueue_fn=enqueue_fn,
+        tombstone_fn=lambda key, data: None,
+    )
+
+    for env in ENV_ORDER:
+        assembler.accept(env, _chunk(0, env), window, "rev")
+
+    assert calls == [encoded_window_journal_key(window, 0)]

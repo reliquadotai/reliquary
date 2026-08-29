@@ -18,15 +18,25 @@ code k=0, ...). This holds one chunk in flight per environment inside a
 past that until the accumulator's current cycle empties out, so a fast
 environment's second chunk is never lost, only held -- exactly the
 remainder ``BalancedTrainingAccumulator`` already exists to carry.
+
+Lock discipline (R17): ``self._lock`` guards only the in-memory join
+state (the accumulator and the pending queues). Every method that mutates
+that state does so entirely under the lock, builds any payload/tombstone
+bytes it needs to write while still holding it, then releases the lock
+BEFORE calling ``_enqueue_fn``/``_tombstone_fn`` -- the same discipline
+``batcher.py``'s ``_maybe_emit_batch`` uses around its own injected
+callback (see batcher.py's module docstring on ``_emit_training_batch``):
+a blocking filesystem write must never run while a proof-worker thread
+holds the lock another thread needs.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, NamedTuple, Sequence
 
-from reliquary.constants import B_BATCH
+from reliquary.constants import B_BATCH, FILL_CLOSED_EMISSIONS_PER_WINDOW
 from reliquary.infrastructure.training_payload_queue import (
     encoded_window_journal_key,
 )
@@ -38,6 +48,16 @@ from reliquary.validator.quarantine import assess_training_batch
 from reliquary.validator.training_accumulator import BalancedTrainingAccumulator
 
 logger = logging.getLogger(__name__)
+
+
+class _PreparedWrite(NamedTuple):
+    """One payload or tombstone, fully encoded while ``_lock`` was held,
+    ready to be written (and logged) after it is released."""
+
+    key: int
+    data: bytes
+    is_tombstone: bool
+    log_message: str
 
 
 class FillClosedBatchAssembler:
@@ -76,6 +96,10 @@ class FillClosedBatchAssembler:
         # two different proof-worker device threads at once, and both the
         # accumulator and the pending queues are shared, mutable state.
         self._lock = threading.Lock()
+        # R16: set by ``close()``, under ``_lock``, so a second call (or a
+        # call racing a final ``accept``) is a no-op rather than a second
+        # payload/tombstone under the same batch index.
+        self._closed = False
 
     def accept(
         self,
@@ -103,9 +127,11 @@ class FillClosedBatchAssembler:
         with self._lock:
             self._checkpoint_revision = str(checkpoint_revision)
             self._pending[environment].append(list(groups))
-            self._drain_locked()
+            prepared = self._drain_locked()
+        self._write_all(prepared)
 
-    def _drain_locked(self) -> None:
+    def _drain_locked(self) -> list[_PreparedWrite]:
+        prepared: list[_PreparedWrite] = []
         while True:
             fed_any = False
             counts = self._accumulator.snapshot()["counts"]
@@ -122,13 +148,24 @@ class FillClosedBatchAssembler:
                     )
                     fed_any = True
             if self._accumulator.ready:
-                self._write_one_payload_locked()
+                prepared.append(
+                    self._prepare_payload_locked(allow_partial=False)
+                )
                 continue
             if not fed_any:
-                return
+                return prepared
 
-    def _write_one_payload_locked(self) -> None:
-        extracted = self._accumulator.training_batches(self._env_order)
+    def _prepare_payload_locked(
+        self, *, allow_partial: bool
+    ) -> _PreparedWrite:
+        """Build one payload or tombstone from the accumulator's current
+        cycle, mutating only in-memory state (the accumulator itself and
+        ``next_batch_index``). No I/O here (R17) -- the caller writes the
+        returned ``_PreparedWrite`` after releasing ``_lock``.
+        """
+        extracted = self._accumulator.training_batches(
+            self._env_order, allow_partial=allow_partial,
+        )
         window_batches = dict(zip(self._env_order, extracted))
         self._accumulator.reset()
         flat_batch = [
@@ -161,7 +198,7 @@ class FillClosedBatchAssembler:
                 failure_stage="training_quarantine",
                 failure_type="TrainingQuarantine",
             )
-            self._tombstone_fn(key, data)
+            is_tombstone = True
         else:
             data = encode_training_payload(
                 window_batches,
@@ -171,27 +208,111 @@ class FillClosedBatchAssembler:
                 window_quarantine=decision.to_archive(),
                 checkpoint_epoch=None,
             )
-            self._enqueue_fn(key, data)
-        logger.info(
+            is_tombstone = False
+        log_message = (
             "FillClosedBatchAssembler: window %d batch %d %s (journal "
-            "key %d, quarantined=%s reasons=%s)",
-            self.window_start, self.next_batch_index,
-            "tombstoned" if decision.quarantined else "written",
-            key, decision.quarantined, decision.reasons,
+            "key %d, quarantined=%s reasons=%s)" % (
+                self.window_start, self.next_batch_index,
+                "tombstoned" if is_tombstone else "written",
+                key, decision.quarantined, decision.reasons,
+            )
         )
         self.next_batch_index += 1
+        return _PreparedWrite(key, data, is_tombstone, log_message)
+
+    def _prepare_incomplete_remainder_tombstone_locked(self) -> _PreparedWrite:
+        """R16: the ``close()`` path when at least one environment
+        contributed nothing to the final, partial cycle. There is no
+        batch to assess -- quarantine (R14) judges assembled batches, and
+        no batch was assembled -- so this writes a plain tombstone under
+        the next batch index, distinct from the R14 quarantine tombstone,
+        purely so the trainer's journal cursor still advances instead of
+        stalling on a window whose remainder never became a payload.
+        """
+        key = encoded_window_journal_key(
+            self.window_start, self.next_batch_index
+        )
+        data = encode_tombstone(
+            window_start=self.window_start,
+            failure_stage="fill_closed_incomplete_remainder",
+            failure_type="IncompleteRemainder",
+        )
+        log_message = (
+            "FillClosedBatchAssembler: window %d batch %d tombstoned at "
+            "close (journal key %d, incomplete remainder %s)" % (
+                self.window_start, self.next_batch_index, key,
+                self._accumulator.snapshot()["counts"],
+            )
+        )
+        self._accumulator.reset()
+        self.next_batch_index += 1
+        return _PreparedWrite(key, data, True, log_message)
+
+    def _write_all(self, prepared: list[_PreparedWrite]) -> None:
+        """Perform the actual writes -- and only the writes -- outside
+        ``_lock`` (R17). Called with the list already fully encoded."""
+        for entry in prepared:
+            if entry.is_tombstone:
+                self._tombstone_fn(entry.key, entry.data)
+            else:
+                self._enqueue_fn(entry.key, entry.data)
+            logger.info(entry.log_message)
+
+    def close(self) -> None:
+        """Called once by the service when this window closes (R16),
+        after every batcher has handed its last chunk to ``accept``. A
+        window's final cycle rarely lands exactly on B_BATCH for every
+        environment; before this method existed, that remainder was only
+        ever read (``remainder_snapshot``, one window later, as a
+        WARNING) -- proven, paid rollouts were silently dropped with no
+        marker.
+
+        If every environment contributed at least one group to the
+        current cycle, that partial cycle is emitted as one final batch
+        -- a short DAPO minibatch is still a valid optimizer step, and
+        the seal path already trains on partial windows -- through the
+        SAME quarantine gate (R14) a full batch clears. Otherwise (some
+        environment contributed nothing at all) a tombstone is written
+        under the next batch's key instead, so the trainer's cursor still
+        advances.
+
+        Idempotent: a second call, or one racing a final in-flight
+        ``accept``, is a no-op -- ``_closed`` is set under the same lock
+        that gates the decision of what (if anything) to write.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            # Defensive: a window whose accept() calls exactly exhausted
+            # every encoded slot this window owns (next_batch_index ==
+            # FILL_CLOSED_EMISSIONS_PER_WINDOW, the full-fill case) has
+            # nothing left to reclaim -- there is no key left to write
+            # under, and encoded_window_journal_key raises past this
+            # bound. Pre-existing latent bound, not introduced here; this
+            # only keeps close() from being the thing that trips it.
+            if self.next_batch_index >= FILL_CLOSED_EMISSIONS_PER_WINDOW:
+                return
+            if self._accumulator.has_groups_for_all_targets:
+                prepared = [
+                    self._prepare_payload_locked(allow_partial=True)
+                ]
+            else:
+                prepared = [
+                    self._prepare_incomplete_remainder_tombstone_locked()
+                ]
+        self._write_all(prepared)
 
     def remainder_snapshot(self) -> dict[str, Any]:
         """Groups still held and not yet part of a written payload, for
-        observability at window seal (R13, item 5: the remainder is never
-        emitted as a partial batch -- a DAPO step needs B_BATCH of every
-        environment, and partial batches are exactly what this class's
-        carry-forward exists to avoid)."""
-        counts = self._accumulator.snapshot()["counts"]
-        return {
-            "in_accumulator": dict(counts),
-            "pending": {
+        observability (R16: ``close()`` is now what disposes of this at
+        window seal -- a full accumulator cycle emitted as a partial
+        batch, or tombstoned -- so by the time a caller reads this after
+        ``close()`` has run, it reports an empty remainder)."""
+        with self._lock:
+            counts = self._accumulator.snapshot()["counts"]
+            pending = {
                 environment: len(chunks)
                 for environment, chunks in self._pending.items()
-            },
-        }
+            }
+        return {"in_accumulator": dict(counts), "pending": pending}
