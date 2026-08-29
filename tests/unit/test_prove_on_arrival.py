@@ -506,3 +506,124 @@ def test_a_decision_is_accounted_exactly_once_across_repeated_walks(monkeypatch)
     snap = batcher.fill_state.snapshot()
     assert snap["proven"][env] == 1
     assert snap["in_flight"][env] == 0
+
+
+def test_concurrent_drains_do_not_race_on_rank_allocation(monkeypatch):
+    """``_arrival_proof_rank`` is allocated under ``_fill_state_lock``, but
+    (pre-fix) ``_extend_proof_plan`` ran AFTER that block released it. Two
+    threads draining the same environment concurrently -- which
+    ``_execute_scheduled_proof``'s own comment says is routine in
+    production with more than one device -- could allocate ranks 5 then 6
+    but call ``extend`` in the opposite order, which the scheduler refuses
+    (``rank <= its current highest`` -> ``ValueError``).
+
+    This drives ``_drain_arrival_proof_buffer`` directly from N threads,
+    released together by a ``Barrier``, against a buffer pre-populated
+    with N entries and a REAL ``GlobalProofScheduler`` (so ``extend``'s
+    refusal is genuine, not simulated). Going through the full admission
+    -> scheduler -> device-worker-completion chain to manufacture this
+    same interleaving turned out to not reproduce reliably even over many
+    attempts (see the report) -- decision application happens strictly
+    AFTER a proof callable returns, so two callables released from the
+    same barrier still can't race on `` _drain_arrival_proof_buffer`` this
+    directly. Driving the method under test straight from N threads is
+    the deterministic version of the same race. Repeated in a loop:
+    GIL-interleaving races are not guaranteed on any single pass.
+    """
+    import threading
+    import time
+
+    import reliquary.validator.batcher as batcher_module
+    from reliquary.validator.proof_scheduler import (
+        GlobalProofScheduler, ProofExecution,
+    )
+    from tests.unit.test_grpo_window_batcher import _make_batcher
+    from tests.unit.test_proof_scheduler import _wait_until
+
+    # Widens the exact window under test (between allocating a rank and
+    # calling extend/submit with it) so the interleaving is not left to
+    # chance GIL preemption, which -- empirically, see the report -- does
+    # not land in that window reliably even over many bare attempts.
+    # Standard technique for a concurrency bug: this is test-only
+    # instrumentation, not a change to the code under test's logic.
+    original_ranked_proof_for = batcher_module.GrpoWindowBatcher._ranked_proof_for
+
+    def _slow_ranked_proof_for(self, *args, **kwargs):
+        time.sleep(0.005)
+        return original_ranked_proof_for(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        batcher_module.GrpoWindowBatcher,
+        "_ranked_proof_for",
+        _slow_ranked_proof_for,
+    )
+
+    env = "openmathinstruct"
+    n_threads = 8
+
+    def _trivial_prove(_invocation):
+        return ProofExecution(passed=True, value=object())
+
+    for attempt in range(20):
+        scheduler = GlobalProofScheduler(
+            devices=("gpu-0", "gpu-1"),
+            environments=("openmathinstruct", "opencodeinstruct"),
+            proof_callable=_trivial_prove,
+            checkpoint_revision="",
+        )
+        try:
+            batcher = _make_batcher(proof_scheduler=scheduler)
+            batcher.fill_state = batcher_module.FillState(
+                targets={"openmathinstruct": n_threads, "opencodeinstruct": n_threads}
+            )
+
+            # Pre-populate the buffer directly -- this test targets
+            # ``_drain_arrival_proof_buffer``'s own atomicity, not the
+            # admission path that normally fills it.
+            for i in range(n_threads):
+                batcher._arrival_proof_sequence += 1
+                batcher._arrival_proof_buffer.append(
+                    batcher_module._BufferedArrivalProof(
+                        pending=_pending_stub(prompt_idx=attempt * 100 + i),
+                        rate=None,
+                        sequence=batcher._arrival_proof_sequence,
+                    )
+                )
+
+            barrier = threading.Barrier(n_threads)
+            errors: list[Exception] = []
+
+            def _drain_worker() -> None:
+                barrier.wait(timeout=5.0)
+                try:
+                    batcher._drain_arrival_proof_buffer(env)
+                except Exception as exc:  # noqa: BLE001 -- captured, not swallowed
+                    errors.append(exc)
+
+            threads = [
+                threading.Thread(target=_drain_worker) for _ in range(n_threads)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10.0)
+
+            assert errors == [], (attempt, errors)
+            assert batcher._arrival_proof_buffer == []
+            # Total committed (proven + in_flight) must equal exactly the
+            # number of entries drained -- some may already have resolved
+            # PASSED and been reconciled (moving in_flight -> proven) by
+            # the time the last thread finishes, which is expected, not a
+            # bug: reconcile runs at the top of every drain call too.
+            snap = batcher.fill_state.snapshot()
+            assert snap["proven"][env] + snap["in_flight"][env] == n_threads
+
+            handle = batcher._open_proof_plan_handle
+            _wait_until(
+                lambda: len(handle.decisions()) >= n_threads, timeout=5.0
+            )
+            ranks = [decision.rank for decision in handle.decisions()]
+            assert ranks == sorted(ranks), (attempt, ranks)
+            assert len(set(ranks)) == len(ranks), (attempt, ranks)
+        finally:
+            scheduler.close()

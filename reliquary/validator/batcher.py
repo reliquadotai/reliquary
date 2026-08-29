@@ -1166,6 +1166,24 @@ class GrpoWindowBatcher:
         # reusing either existing one -- keeps this critical section leaf-only
         # and unable to introduce a new lock-ordering hazard between them.
         self._fill_state_lock = threading.Lock()
+        # v6 only. Rank allocation and the extend/submit call that consumes
+        # it must be atomic with respect to EACH OTHER, or two proof-worker
+        # device threads draining the same environment concurrently (see
+        # ``_execute_scheduled_proof``'s own comment: this is routine in
+        # production with more than one device) can allocate ranks 5 then
+        # 6, then call ``extend`` in the opposite order -- which the
+        # scheduler refuses (rank <= its current highest). This also
+        # protects ``_extend_proof_plan``'s lazy first ``scheduler.submit``:
+        # its ``_open_proof_plan_id is None`` check-then-act is unsafe
+        # without it. Deliberately separate from ``_fill_state_lock``
+        # (buffer/reserve/release/record_proven) rather than reused for it,
+        # so the two never need to nest in more than one fixed order: this
+        # lock is always the OUTER one, on the single path
+        # (``_drain_arrival_proof_buffer``'s except clause) where both are
+        # ever touched by the same call -- and there, the ``with`` block
+        # for this lock has already exited before ``_fill_state_lock`` is
+        # taken, so they never actually nest at all.
+        self._proof_plan_lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
         # Optional callback the seal-extension coroutine polls to check
         # whether the server's submit_queue has finished draining items
@@ -1503,8 +1521,6 @@ class GrpoWindowBatcher:
                 self._arrival_proof_buffer.sort(key=_arrival_buffer_sort_key)
                 entry = self._arrival_proof_buffer.pop(0)
                 self.fill_state.reserve(environment)
-                self._arrival_proof_rank += 1
-                rank = self._arrival_proof_rank
 
             pending = entry.pending
             operator = self._operator_for_hotkey(pending.hotkey)
@@ -1518,17 +1534,30 @@ class GrpoWindowBatcher:
                 MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
                 - self.proof_failure_debt(pending.hotkey)
             )
-            candidate = self._ranked_proof_for(
-                pending,
-                rank=rank,
-                operator=operator,
-                operator_remaining=operator_remaining,
-                hotkey_remaining=hotkey_remaining,
-                tag="arrival",
-            )
             try:
-                self._extend_proof_plan([candidate])
+                # Rank allocation and the call that consumes it
+                # (``_extend_proof_plan``, which both reads-or-creates the
+                # plan id and calls ``submit``/``extend``) must be one
+                # atomic step: releasing the lock in between is exactly
+                # what let two concurrent drainers allocate ranks 5 then 6
+                # and call ``extend`` in the opposite order.
+                with self._proof_plan_lock:
+                    self._arrival_proof_rank += 1
+                    rank = self._arrival_proof_rank
+                    candidate = self._ranked_proof_for(
+                        pending,
+                        rank=rank,
+                        operator=operator,
+                        operator_remaining=operator_remaining,
+                        hotkey_remaining=hotkey_remaining,
+                        tag="arrival",
+                    )
+                    self._extend_proof_plan([candidate])
             except Exception:
+                # ``_proof_plan_lock`` has already been released by the
+                # ``with`` block above by the time control reaches here, so
+                # this never nests the two locks -- no ordering to keep
+                # consistent against any other call site.
                 with self._fill_state_lock:
                     self.fill_state.release(environment)
                 raise
