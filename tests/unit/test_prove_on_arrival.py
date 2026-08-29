@@ -256,55 +256,81 @@ def test_a_plan_extension_failure_releases_the_reservation(monkeypatch):
 
 
 def test_a_passing_proof_records_proven_and_a_failing_one_releases(monkeypatch):
-    """The completion path: ``_execute_scheduled_proof`` runs once per
-    candidate, synchronously, on whatever thread executes the proof --
-    before the scheduler's coordinator later applies decisions in rank
-    order. That is the one place the pass/fail fact is known, for both the
-    seal-ranked path (fill_state is None there, so this is a no-op) and the
-    v6 arrival path."""
+    """Accounting flows through the scheduler's own decision list, not
+    through ``_execute_scheduled_proof``'s return value directly (see
+    ``_reconcile_fill_state_decisions``) -- the scheduler settles some
+    candidates without ever calling that method, so a real scheduler is
+    what makes a PASSED/REJECTED decision exist to walk. A passing proof's
+    PASSED decision records proven; a failing proof's REJECTED decision
+    releases."""
     import reliquary.validator.batcher as batcher_module
+    from reliquary.validator.proof_scheduler import GlobalProofScheduler
     from tests.unit.test_grpo_window_batcher import (
-        _always_false_grail, _always_true_grail, _make_batcher, _request,
+        _always_false_grail, _execute_scheduler_payload, _make_batcher,
+        _request,
     )
+    from tests.unit.test_proof_scheduler import _wait_until
 
     monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+    env = "openmathinstruct"
 
-    passing = _make_batcher(verify_commitment_proofs_fn=_always_true_grail)
-    passing.fill_state = batcher_module.FillState(
-        targets={"openmathinstruct": 4, "opencodeinstruct": 4}
+    passing_scheduler = GlobalProofScheduler(
+        devices=("gpu-0",),
+        environments=("openmathinstruct", "opencodeinstruct"),
+        proof_callable=_execute_scheduler_payload,
+        checkpoint_revision="",
     )
-    passing._extend_proof_plan = lambda candidates: None
-    passing.accept_submission(_request(prompt_idx=11, hotkey="miner-pass"))
-    pending = passing.pending_submissions()[0]
-    # accept_submission already reserved via _submit_arrival_proof.
-    assert passing.fill_state.snapshot()["in_flight"]["openmathinstruct"] == 1
+    try:
+        passing = _make_batcher(proof_scheduler=passing_scheduler)
+        passing.fill_state = batcher_module.FillState(
+            targets={"openmathinstruct": 4, "opencodeinstruct": 4}
+        )
+        assert passing.accept_submission(
+            _request(prompt_idx=11, hotkey="miner-pass")
+        ).accepted
+        # accept_submission already reserved via _submit_arrival_proof.
+        assert passing.fill_state.snapshot()["in_flight"][env] == 1
 
-    verified = passing._execute_scheduled_proof(
-        pending, model=None, count_operator_debt=True,
+        def _passed() -> bool:
+            passing._drain_arrival_proof_buffer(env)
+            return passing.fill_state.snapshot()["proven"][env] == 1
+
+        _wait_until(_passed, timeout=5.0)
+        snap = passing.fill_state.snapshot()
+        assert snap["proven"][env] == 1
+        assert snap["in_flight"][env] == 0
+    finally:
+        assert passing_scheduler.close()
+
+    failing_scheduler = GlobalProofScheduler(
+        devices=("gpu-0",),
+        environments=("openmathinstruct", "opencodeinstruct"),
+        proof_callable=_execute_scheduler_payload,
+        checkpoint_revision="",
     )
+    try:
+        failing = _make_batcher(
+            proof_scheduler=failing_scheduler,
+            verify_commitment_proofs_fn=_always_false_grail,
+        )
+        failing.fill_state = batcher_module.FillState(
+            targets={"openmathinstruct": 4, "opencodeinstruct": 4}
+        )
+        assert failing.accept_submission(
+            _request(prompt_idx=12, hotkey="miner-fail")
+        ).accepted
+        assert failing.fill_state.snapshot()["in_flight"][env] == 1
 
-    assert verified is not None
-    snap = passing.fill_state.snapshot()
-    assert snap["proven"]["openmathinstruct"] == 1
-    assert snap["in_flight"]["openmathinstruct"] == 0
+        def _released() -> bool:
+            failing._drain_arrival_proof_buffer(env)
+            return failing.fill_state.snapshot()["in_flight"][env] == 0
 
-    failing = _make_batcher(verify_commitment_proofs_fn=_always_false_grail)
-    failing.fill_state = batcher_module.FillState(
-        targets={"openmathinstruct": 4, "opencodeinstruct": 4}
-    )
-    failing._extend_proof_plan = lambda candidates: None
-    failing.accept_submission(_request(prompt_idx=12, hotkey="miner-fail"))
-    pending = failing.pending_submissions()[0]
-    assert failing.fill_state.snapshot()["in_flight"]["openmathinstruct"] == 1
-
-    verified = failing._execute_scheduled_proof(
-        pending, model=None, count_operator_debt=True,
-    )
-
-    assert verified is None
-    snap = failing.fill_state.snapshot()
-    assert snap["proven"]["openmathinstruct"] == 0
-    assert snap["in_flight"]["openmathinstruct"] == 0
+        _wait_until(_released, timeout=5.0)
+        snap = failing.fill_state.snapshot()
+        assert snap["proven"][env] == 0
+        assert snap["in_flight"][env] == 0
+    finally:
+        assert failing_scheduler.close()
 
 
 def test_v6_does_not_consult_the_seal_time_proof_wall(monkeypatch):
@@ -322,3 +348,161 @@ def test_v6_does_not_consult_the_seal_time_proof_wall(monkeypatch):
 
     # A zero wall would abort the auction path instantly; v6 must ignore it.
     assert batcher.poll_deadline() is False
+
+
+def test_a_skipped_prompt_claimed_decision_releases_its_reservation(monkeypatch):
+    """Reproduces the leak found in code review: 3 candidates on 2 prompts,
+    target 3. Only 2 groups can ever pass -- one per prompt -- so the loser
+    on the shared prompt is settled by the scheduler as SKIPPED_PROMPT_
+    CLAIMED, entirely inside its own coordinator, WITHOUT ever calling
+    ``_execute_scheduled_proof``. Only the decisions walk can catch that;
+    without it this reservation leaks forever and the environment starves
+    below its target even though nothing is actually still in flight."""
+    import reliquary.validator.batcher as batcher_module
+    from reliquary.validator.proof_scheduler import GlobalProofScheduler
+    from tests.unit.test_grpo_window_batcher import (
+        _execute_scheduler_payload, _make_batcher, _request,
+    )
+    from tests.unit.test_proof_scheduler import _wait_until
+
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+    env = "openmathinstruct"
+
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0",),
+        environments=("openmathinstruct", "opencodeinstruct"),
+        proof_callable=_execute_scheduler_payload,
+        checkpoint_revision="",
+    )
+    try:
+        batcher = _make_batcher(proof_scheduler=scheduler)
+        batcher.fill_state = batcher_module.FillState(
+            targets={"openmathinstruct": 3, "opencodeinstruct": 3}
+        )
+
+        # Two submissions competing for the SAME prompt (only one can win
+        # it), one on a different prompt: 3 candidates, 2 distinct prompts.
+        assert batcher.accept_submission(
+            _request(prompt_idx=1, hotkey="hk-a")
+        ).accepted
+        assert batcher.accept_submission(
+            _request(prompt_idx=1, hotkey="hk-b")
+        ).accepted
+        assert batcher.accept_submission(
+            _request(prompt_idx=2, hotkey="hk-c")
+        ).accepted
+
+        def _settled() -> bool:
+            batcher._drain_arrival_proof_buffer(env)
+            snap = batcher.fill_state.snapshot()
+            return snap["proven"][env] == 2 and snap["in_flight"][env] == 0
+
+        _wait_until(_settled, timeout=5.0)
+
+        snap = batcher.fill_state.snapshot()
+        assert snap["proven"][env] == 2
+        assert snap["in_flight"][env] == 0
+        assert batcher.fill_state.may_admit(env) is True
+    finally:
+        assert scheduler.close()
+
+
+def test_a_raising_proof_callable_releases_its_reservation(monkeypatch):
+    """An uncaught exception from ``_verify_expensive`` faults the whole
+    scheduler (infrastructure failure, not a miner-attributable reject --
+    see the comment in ``_execute_scheduled_proof``). The faulted candidate
+    still gets a terminal, non-PASSED decision synthesized once the fault
+    applies, so the decisions walk must release its reservation exactly
+    like any other non-PASSED outcome -- accounting must not depend on
+    ``_execute_scheduled_proof`` returning normally."""
+    import reliquary.validator.batcher as batcher_module
+    from reliquary.validator.proof_scheduler import GlobalProofScheduler
+    from tests.unit.test_grpo_window_batcher import _make_batcher, _request
+    from tests.unit.test_proof_scheduler import _wait_until
+
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+    env = "openmathinstruct"
+
+    def _boom(_invocation):
+        raise RuntimeError("proof device failed")
+
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0",),
+        environments=("openmathinstruct", "opencodeinstruct"),
+        proof_callable=_boom,
+        checkpoint_revision="",
+    )
+    try:
+        batcher = _make_batcher(proof_scheduler=scheduler)
+        batcher.fill_state = batcher_module.FillState(
+            targets={"openmathinstruct": 4, "opencodeinstruct": 4}
+        )
+        assert batcher.accept_submission(
+            _request(prompt_idx=5, hotkey="hk-fault")
+        ).accepted
+        assert batcher.fill_state.snapshot()["in_flight"][env] == 1
+
+        def _released() -> bool:
+            batcher._drain_arrival_proof_buffer(env)
+            return batcher.fill_state.snapshot()["in_flight"][env] == 0
+
+        _wait_until(_released, timeout=5.0)
+
+        snap = batcher.fill_state.snapshot()
+        assert snap["proven"][env] == 0
+        assert snap["in_flight"][env] == 0
+    finally:
+        assert scheduler.close()
+
+
+def test_a_decision_is_accounted_exactly_once_across_repeated_walks(monkeypatch):
+    """Two separate triggers (a graded body landing, a proof completing)
+    both call the walk; a job_id already accounted must never be
+    double-released or double-counted just because the walk ran twice
+    before any NEW decision arrived."""
+    import reliquary.validator.batcher as batcher_module
+    from reliquary.validator.proof_scheduler import (
+        ProofDecision, ProofDecisionStatus,
+    )
+
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+    env = "openmathinstruct"
+
+    batcher = _make_batcher()
+    batcher.fill_state = batcher_module.FillState(
+        targets={"openmathinstruct": 4, "opencodeinstruct": 4}
+    )
+    batcher.fill_state.reserve(env)
+    batcher.fill_state.reserve(env)
+
+    class _FakeHandle:
+        def __init__(self, decisions):
+            self._decisions = tuple(decisions)
+
+        def decisions(self):
+            return self._decisions
+
+    batcher._open_proof_plan_handle = _FakeHandle([
+        ProofDecision(
+            job_id="j1", rank=1, prompt_key=("prompt", 1),
+            status=ProofDecisionStatus.PASSED, device_id="gpu-0",
+            started_at=0.0, finished_at=1.0,
+        ),
+        ProofDecision(
+            job_id="j2", rank=2, prompt_key=("prompt", 2),
+            status=ProofDecisionStatus.REJECTED, device_id="gpu-0",
+            started_at=0.0, finished_at=1.0,
+        ),
+    ])
+
+    batcher._reconcile_fill_state_decisions(env)
+    snap = batcher.fill_state.snapshot()
+    assert snap["proven"][env] == 1
+    assert snap["in_flight"][env] == 0
+
+    # Same two decisions, walked again -- must be a no-op, not a second
+    # record_proven/release for job ids already accounted.
+    batcher._reconcile_fill_state_decisions(env)
+    snap = batcher.fill_state.snapshot()
+    assert snap["proven"][env] == 1
+    assert snap["in_flight"][env] == 0

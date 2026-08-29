@@ -126,6 +126,7 @@ from reliquary.validator.proof_scheduler import (
     GlobalProofScheduler,
     ProofDecisionStatus,
     ProofPlan,
+    ProofPlanHandle,
     ProofPlanOutcome,
     RankedProof,
 )
@@ -1127,6 +1128,21 @@ class GrpoWindowBatcher:
         # there is no earlier moment with a scheduler and a checkpoint
         # revision both ready.
         self._open_proof_plan_id: str | None = None
+        # v6 only. Handle onto that same plan. The scheduler resolves some
+        # terminal decisions (a losing candidate on a prompt another
+        # candidate already won, a resource limit, "not needed") entirely
+        # inside its own coordinator, without ever invoking the proof
+        # callable -- so fill_state accounting cannot live only in
+        # ``_execute_scheduled_proof``, which runs exclusively when a
+        # worker dispatches a job. This handle's ``.decisions()`` is the
+        # one place every terminal fact is guaranteed to show up, whether
+        # or not the callable ran; ``_reconcile_fill_state_decisions``
+        # walks it.
+        self._open_proof_plan_handle: ProofPlanHandle | None = None
+        # v6 only. job_ids already reconciled from the handle above, so a
+        # decision already accounted (proven or released) is never
+        # double-counted across repeated walks.
+        self._accounted_arrival_decisions: set[str] = set()
         # v6 only. The open-ended plan's ranks must strictly increase in
         # dispatch order (see ``GlobalProofScheduler.extend``); arrival order
         # is not otherwise available as an integer, so this counts it.
@@ -1382,7 +1398,7 @@ class GrpoWindowBatcher:
         if self._open_proof_plan_id is None:
             plan_id = f"{self.window_start}:{environment}:fill-closed"
             target = self.fill_state.snapshot()["targets"][environment]
-            scheduler.submit(
+            handle = scheduler.submit(
                 ProofPlan(
                     plan_id=plan_id,
                     environment=environment,
@@ -1402,6 +1418,11 @@ class GrpoWindowBatcher:
                 )
             )
             self._open_proof_plan_id = plan_id
+            # Retained for ``_reconcile_fill_state_decisions``: the one
+            # place every terminal decision the scheduler makes for this
+            # plan is guaranteed to show up, whether or not a worker ever
+            # ran the candidate's proof callable.
+            self._open_proof_plan_handle = handle
         else:
             scheduler.extend(self._open_proof_plan_id, candidates)
 
@@ -1472,6 +1493,7 @@ class GrpoWindowBatcher:
         """
         if self.fill_state is None:
             return
+        self._reconcile_fill_state_decisions(environment)
         while True:
             with self._fill_state_lock:
                 if not self._arrival_proof_buffer:
@@ -1510,6 +1532,37 @@ class GrpoWindowBatcher:
                 with self._fill_state_lock:
                     self.fill_state.release(environment)
                 raise
+
+    def _reconcile_fill_state_decisions(self, environment: str) -> None:
+        """Account every terminal decision the scheduler has made so far,
+        exactly once each.
+
+        ``_execute_scheduled_proof`` only runs when a worker actually
+        dispatches a candidate's proof callable. The scheduler settles
+        some terminal decisions entirely inside its own coordinator
+        without ever doing that -- a losing candidate on a prompt another
+        candidate already won (``SKIPPED_PROMPT_CLAIMED``), a resource
+        limit, or "not needed" once the target is already covered. Left
+        unaccounted, each of those leaks its reservation forever: capacity
+        that can never be spent and can never be freed, starving the
+        environment below its target. ``handle.decisions()`` is rank-
+        ordered and append-only, and is the one place every terminal fact
+        -- proved or not -- is guaranteed to appear, whether or not the
+        callable ran, so this walks it instead of accounting inline in
+        the callable.
+        """
+        handle = self._open_proof_plan_handle
+        if handle is None:
+            return
+        with self._fill_state_lock:
+            for decision in handle.decisions():
+                if decision.job_id in self._accounted_arrival_decisions:
+                    continue
+                self._accounted_arrival_decisions.add(decision.job_id)
+                if decision.status is ProofDecisionStatus.PASSED:
+                    self.fill_state.record_proven(environment)
+                else:
+                    self.fill_state.release(environment)
 
     def _record_upload_precommit_rejection_locked(self, reason: str) -> None:
         self._upload_precommit_rejections[reason] = (
@@ -4657,17 +4710,17 @@ class GrpoWindowBatcher:
                 )
         # v6 only. This runs on a proof-worker device thread -- possibly one
         # of several running concurrently -- for both the seal-ranked path
-        # (fill_state is None there) and the v6 arrival path. A candidate
-        # that fails its proof releases the reservation ``_submit_arrival_
-        # proof`` made, reopening capacity for the next arrival; one that
-        # passes counts toward the environment's target.
+        # (fill_state is None there) and the v6 arrival path. Accounting
+        # does NOT happen here directly: the scheduler settles some
+        # candidates (a losing candidate on a claimed prompt, a resource
+        # limit, "not needed") without ever calling this method at all, so
+        # crediting only what runs here would leak every one of those
+        # reservations forever. ``_drain_arrival_proof_buffer`` reconciles
+        # against the scheduler's own decision list instead, which is the
+        # one place every terminal fact -- this one included -- is
+        # guaranteed to show up.
         if FILL_CLOSED_ENABLED and self.fill_state is not None:
             environment = str(getattr(self.env, "name", ""))
-            with self._fill_state_lock:
-                if verified is not None:
-                    self.fill_state.record_proven(environment)
-                else:
-                    self.fill_state.release(environment)
             self._drain_arrival_proof_buffer(environment)
         return verified
 
