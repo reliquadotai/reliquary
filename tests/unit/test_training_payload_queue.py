@@ -2,8 +2,11 @@
 
 import asyncio
 
+import pytest
+
 from reliquary.infrastructure.training_payload_queue import (
     TrainingPayloadQueue,
+    encoded_window_journal_key,
     payload_key,
     tombstone_key,
 )
@@ -14,6 +17,71 @@ def test_keys():
     assert tombstone_key(30100) == (
         "reliquary/training/window-30100.tombstone.json"
     )
+
+
+def test_encoded_journal_key_is_the_raw_window_with_the_gate_off(
+    monkeypatch,
+):
+    """v4/v5 must stay byte-for-byte unchanged: one payload per window,
+    keyed by the window number itself, regardless of ``batch_index``."""
+    import reliquary.infrastructure.training_payload_queue as queue_module
+
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", False)
+
+    assert encoded_window_journal_key(30100) == 30100
+    assert encoded_window_journal_key(30100, batch_index=0) == 30100
+    # Even a nonzero batch_index is ignored with the gate off -- v4/v5
+    # code never passes one, but the encoding must not apply regardless.
+    assert encoded_window_journal_key(30100, batch_index=3) == 30100
+
+
+def test_encoded_journal_key_under_fill_closed(monkeypatch):
+    """R11: window_start * FILL_CLOSED_EMISSIONS_PER_WINDOW + batch_index,
+    gated on FILL_CLOSED_ENABLED. Pins ``batch_index=3`` at
+    ``window_start=42`` per the brief; ``FILL_CLOSED_EMISSIONS_PER_WINDOW``
+    itself is monkeypatched to a fixed 16 so this test doesn't depend on
+    the runtime PROTOCOL_VERSION (it derives from
+    CHECKPOINT_PUBLISH_INTERVAL_WINDOWS, which is profile-dependent --
+    see the separate derivation test below)."""
+    import reliquary.infrastructure.training_payload_queue as queue_module
+
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_EMISSIONS_PER_WINDOW", 16)
+
+    assert encoded_window_journal_key(42, batch_index=3) == 42 * 16 + 3
+    assert encoded_window_journal_key(42, batch_index=0) == 42 * 16
+    assert encoded_window_journal_key(43, batch_index=0) == 43 * 16
+    # Consecutive integers within one window's range, exactly what the
+    # trainer's cursor (stride=1) already walks -- no trainer change.
+    keys = [
+        encoded_window_journal_key(42, batch_index=i) for i in range(16)
+    ]
+    assert keys == list(range(42 * 16, 42 * 16 + 16))
+
+
+def test_fill_closed_emissions_per_window_derives_from_publish_interval():
+    """16 for the same reason FILL_CLOSED_TARGET_GROUPS_PER_ENV is 256:
+    one B_BATCH-per-environment emission per optimizer step, and the
+    target is CHECKPOINT_PUBLISH_INTERVAL_WINDOWS steps worth of groups."""
+    from reliquary.constants import (
+        CHECKPOINT_PUBLISH_INTERVAL_WINDOWS,
+        FILL_CLOSED_EMISSIONS_PER_WINDOW,
+    )
+
+    assert (
+        FILL_CLOSED_EMISSIONS_PER_WINDOW == CHECKPOINT_PUBLISH_INTERVAL_WINDOWS
+    )
+
+
+def test_encoded_journal_key_rejects_out_of_range_batch_index(monkeypatch):
+    import reliquary.infrastructure.training_payload_queue as queue_module
+
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
+
+    with pytest.raises(ValueError):
+        encoded_window_journal_key(42, batch_index=16)
+    with pytest.raises(ValueError):
+        encoded_window_journal_key(42, batch_index=-1)
 
 
 def test_enqueue_writes_atomically(tmp_path):

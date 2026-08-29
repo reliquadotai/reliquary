@@ -753,6 +753,18 @@ if FILL_CLOSED_TARGET_GROUPS_PER_ENV <= 0:
         "RELIQUARY_FILL_CLOSED_TARGET_GROUPS_PER_ENV must be positive"
     )
 
+# How many training-payload emissions one v6 window can produce, for the
+# journal key encoding (R11): window_start * FILL_CLOSED_EMISSIONS_PER_
+# WINDOW + batch_index. Derived from CHECKPOINT_PUBLISH_INTERVAL_WINDOWS
+# for the same reason FILL_CLOSED_TARGET_GROUPS_PER_ENV is derived from it
+# above -- one B_BATCH-per-environment emission per optimizer step, and a
+# window's target is exactly CHECKPOINT_PUBLISH_INTERVAL_WINDOWS steps
+# worth of groups. A literal, not separately env-overridable: an operator
+# changing this without changing the target (or vice versa) would size
+# the journal's per-window key range out of step with how many emissions
+# a window can actually produce.
+FILL_CLOSED_EMISSIONS_PER_WINDOW = CHECKPOINT_PUBLISH_INTERVAL_WINDOWS
+
 # Backstop only. A window normally ends on its fill; this stops a stalled
 # fleet holding one open forever, and seals whatever is proven.
 FILL_CLOSED_MAX_SECONDS = float(_os.environ.get(

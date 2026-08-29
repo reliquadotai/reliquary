@@ -16,6 +16,11 @@ from pathlib import Path
 import time
 from typing import Callable
 
+from reliquary.constants import (
+    FILL_CLOSED_EMISSIONS_PER_WINDOW,
+    FILL_CLOSED_ENABLED,
+)
+
 logger = logging.getLogger(__name__)
 
 R2_TRAINING_PREFIX = "reliquary/training"
@@ -34,6 +39,40 @@ def payload_key(window_start: int) -> str:
 
 def tombstone_key(window_start: int) -> str:
     return f"{R2_TRAINING_PREFIX}/window-{int(window_start)}{_TOMBSTONE_SUFFIX}"
+
+
+def encoded_window_journal_key(window_start: int, batch_index: int = 0) -> int:
+    """The journal key one training-payload slot is filed under.
+
+    v4/v5 (``FILL_CLOSED_ENABLED`` off): one payload per window;
+    unchanged, byte-for-byte -- the key IS the window number, and
+    ``batch_index`` is ignored.
+
+    v6 (R11): a still-open window can emit up to
+    ``FILL_CLOSED_EMISSIONS_PER_WINDOW`` training payloads (one per
+    B_BATCH-per-environment cycle) rather than exactly one at seal.
+    Reusing ``enqueue_payload``'s one-slot-per-window key as-is would let
+    each later emission in the same window silently overwrite the
+    previous one, so this encodes ``window_start *
+    FILL_CLOSED_EMISSIONS_PER_WINDOW + batch_index`` instead.
+    ``WindowJournal.next_entry``'s cursor already just advances by
+    ``stride`` (1) and fetches ``payload_key(cursor + stride)`` one
+    integer at a time -- it needs no change at all: this encoding makes
+    exactly ``FILL_CLOSED_EMISSIONS_PER_WINDOW`` consecutive integers
+    cover one window before rolling into the next window's range, so the
+    cursor already walks it correctly and ``publish_every`` (measured in
+    emitted training-payload entries) holds unchanged.
+    """
+    if not FILL_CLOSED_ENABLED:
+        return int(window_start)
+    if not 0 <= batch_index < FILL_CLOSED_EMISSIONS_PER_WINDOW:
+        raise ValueError(
+            "batch_index must be in "
+            f"[0, {FILL_CLOSED_EMISSIONS_PER_WINDOW}), got {batch_index}"
+        )
+    return int(window_start) * FILL_CLOSED_EMISSIONS_PER_WINDOW + int(
+        batch_index
+    )
 
 
 def epoch_marker_key(epoch_id: str) -> str:
