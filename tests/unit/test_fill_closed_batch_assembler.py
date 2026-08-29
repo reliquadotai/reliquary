@@ -11,8 +11,12 @@ from reliquary.constants import B_BATCH
 from reliquary.infrastructure.training_payload_queue import (
     encoded_window_journal_key,
     payload_key,
+    tombstone_key,
 )
-from reliquary.shared.training_payload import decode_training_payload
+from reliquary.shared.training_payload import (
+    decode_tombstone,
+    decode_training_payload,
+)
 from reliquary.validator.fill_closed_batch_assembler import (
     FillClosedBatchAssembler,
 )
@@ -51,6 +55,7 @@ def test_interleaved_chunks_join_into_one_ordered_payload_per_cycle(
         window_start=window,
         env_order=ENV_ORDER,
         enqueue_fn=lambda key, data: written.append((key, data)),
+        tombstone_fn=lambda key, data: None,
     )
 
     math_k0 = _chunk(0, "openmathinstruct")
@@ -113,6 +118,7 @@ def test_assembled_payload_round_trips_through_the_trainer_journal(
         enqueue_fn=lambda key, data: written.__setitem__(
             payload_key(key), data
         ),
+        tombstone_fn=lambda key, data: None,
     )
     for env in ENV_ORDER:
         assembler.accept(env, _chunk(0, env), window, "rev")
@@ -135,6 +141,7 @@ def test_accept_rejects_a_chunk_for_a_different_window():
         window_start=42,
         env_order=ENV_ORDER,
         enqueue_fn=lambda key, data: None,
+        tombstone_fn=lambda key, data: None,
     )
     import pytest
 
@@ -151,6 +158,7 @@ def test_remainder_snapshot_reports_what_never_became_a_payload():
         window_start=42,
         env_order=ENV_ORDER,
         enqueue_fn=lambda key, data: None,
+        tombstone_fn=lambda key, data: None,
     )
     assembler.accept(
         "openmathinstruct", _chunk(0, "openmathinstruct"), 42, "rev",
@@ -163,3 +171,130 @@ def test_remainder_snapshot_reports_what_never_became_a_payload():
     assert snapshot["pending"] == {
         "openmathinstruct": 0, "opencodeinstruct": 0,
     }
+
+
+def _chunk_with_suspicious_reward_shape(tag: int, env: str, n: int) -> list:
+    """Same shape as ``_chunk`` but the first ``n`` groups carry a
+    ``reward_shape`` that ``assess_training_batch`` treats as suspicious
+    (short zero-length tail, so this trips ``reward_shape_density``
+    rather than ``long_zero_tail_reward_shape``) -- the cheapest real
+    quarantine trigger buildable from these fixtures, per
+    TRAINING_QUARANTINE_REWARD_SHAPE_MIN_GROUPS=2.
+    """
+    groups = _chunk(tag, env)
+    for group in groups[:n]:
+        group.reward_shape = {
+            "suspicious": True,
+            "zero_length_mode": 120,
+            "zero_length_mode_count": 4,
+        }
+    return groups
+
+
+def test_quarantined_batch_is_tombstoned_not_enqueued(monkeypatch):
+    """R14: assess_training_batch runs on every assembled batch, not just
+    at seal. A batch it quarantines must never reach ``enqueue_fn`` --
+    that is exactly the poisoned-data path the seal-time gate exists to
+    close, and v6 bypassed it entirely. Instead a tombstone is written
+    under the batch's OWN encoded journal key, so the trainer's cursor
+    still advances (it never advances on absence, only on an explicit
+    marker).
+    """
+    import reliquary.infrastructure.training_payload_queue as queue_module
+
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
+
+    window = 42
+    enqueued: list[tuple[int, bytes]] = []
+    tombstoned: list[tuple[int, bytes]] = []
+    assembler = FillClosedBatchAssembler(
+        window_start=window,
+        env_order=ENV_ORDER,
+        enqueue_fn=lambda key, data: enqueued.append((key, data)),
+        tombstone_fn=lambda key, data: tombstoned.append((key, data)),
+    )
+
+    # Two suspicious groups in math, two in code -> reward_shape_groups=4
+    # in the flat batch, well past TRAINING_QUARANTINE_REWARD_SHAPE_MIN_
+    # GROUPS=2. This is the REAL rule firing, not a mock.
+    math_chunk = _chunk_with_suspicious_reward_shape(
+        0, "openmathinstruct", 2
+    )
+    code_chunk = _chunk_with_suspicious_reward_shape(
+        0, "opencodeinstruct", 2
+    )
+    assembler.accept("openmathinstruct", math_chunk, window, "rev")
+    assembler.accept("opencodeinstruct", code_chunk, window, "rev")
+
+    assert enqueued == []
+    assert len(tombstoned) == 1
+    key, data = tombstoned[0]
+    assert key == encoded_window_journal_key(window, 0)
+    assert tombstone_key(key) != tombstone_key(window)  # under the batch key
+    decoded = decode_tombstone(data)
+    assert decoded["window_start"] == window
+    assert assembler.next_batch_index == 1
+
+
+def test_clean_batch_enqueues_with_the_real_quarantine_decision(monkeypatch):
+    """R14: a batch assess_training_batch does NOT quarantine still
+    enqueues, and its ``window_quarantine`` carries the real decision's
+    ``to_archive()`` -- not the previously-hardcoded
+    ``{"quarantined": False, "reasons": []}``, which papered over every
+    signal assess_training_batch computes (metrics included).
+    """
+    import reliquary.infrastructure.training_payload_queue as queue_module
+
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
+
+    window = 42
+    enqueued: list[tuple[int, bytes]] = []
+    assembler = FillClosedBatchAssembler(
+        window_start=window,
+        env_order=ENV_ORDER,
+        enqueue_fn=lambda key, data: enqueued.append((key, data)),
+        tombstone_fn=lambda key, data: None,
+    )
+    for env in ENV_ORDER:
+        assembler.accept(env, _chunk(0, env), window, "rev")
+
+    assert len(enqueued) == 1
+    _, data = enqueued[0]
+    decoded = decode_training_payload(data)
+    assert decoded.window_quarantine["quarantined"] is False
+    assert decoded.window_quarantine["reasons"] == []
+    # The real decision carries metrics; the old hardcoded dict had none.
+    assert "metrics" in decoded.window_quarantine
+    assert decoded.window_quarantine["metrics"]["n_groups"] == 2 * B_BATCH
+
+
+def test_batch_verdict_log_includes_the_batch_index(monkeypatch, caplog):
+    """R14: the verdict is logged with the batch index -- v6 writes up
+    to FILL_CLOSED_EMISSIONS_PER_WINDOW payloads per window, so a log
+    line naming only the window cannot tell which batch was assessed."""
+    import logging
+
+    import reliquary.infrastructure.training_payload_queue as queue_module
+
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
+
+    window = 42
+    assembler = FillClosedBatchAssembler(
+        window_start=window,
+        env_order=ENV_ORDER,
+        enqueue_fn=lambda key, data: None,
+        tombstone_fn=lambda key, data: None,
+    )
+    with caplog.at_level(
+        logging.INFO,
+        logger="reliquary.validator.fill_closed_batch_assembler",
+    ):
+        for env in ENV_ORDER:
+            assembler.accept(env, _chunk(0, env), window, "rev")
+
+    assert any(
+        str(window) in record.getMessage()
+        and "batch 0" in record.getMessage()
+        and "quarantin" in record.getMessage().lower()
+        for record in caplog.records
+    )

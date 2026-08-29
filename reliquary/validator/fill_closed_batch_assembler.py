@@ -30,7 +30,11 @@ from reliquary.constants import B_BATCH
 from reliquary.infrastructure.training_payload_queue import (
     encoded_window_journal_key,
 )
-from reliquary.shared.training_payload import encode_training_payload
+from reliquary.shared.training_payload import (
+    encode_tombstone,
+    encode_training_payload,
+)
+from reliquary.validator.quarantine import assess_training_batch
 from reliquary.validator.training_accumulator import BalancedTrainingAccumulator
 
 logger = logging.getLogger(__name__)
@@ -45,10 +49,12 @@ class FillClosedBatchAssembler:
         window_start: int,
         env_order: Sequence[str],
         enqueue_fn: Callable[[int, bytes], None],
+        tombstone_fn: Callable[[int, bytes], None],
     ) -> None:
         self.window_start = int(window_start)
         self._env_order = list(env_order)
         self._enqueue_fn = enqueue_fn
+        self._tombstone_fn = tombstone_fn
         self._accumulator = BalancedTrainingAccumulator(
             {environment: B_BATCH for environment in self._env_order}
         )
@@ -125,27 +131,53 @@ class FillClosedBatchAssembler:
         extracted = self._accumulator.training_batches(self._env_order)
         window_batches = dict(zip(self._env_order, extracted))
         self._accumulator.reset()
-        data = encode_training_payload(
-            window_batches,
-            window_start=self.window_start,
-            checkpoint_revision=self._checkpoint_revision,
-            env_order=list(self._env_order),
-            # No per-batch quarantine assessment yet -- assess_training_
-            # batch's reject-count aggregation is itself a cross-batcher
-            # concern the coordinator's R13 dispatch does not cover; see
-            # task-7b-report.md's earlier NEEDS_CONTEXT for the seal-time
-            # machinery this would need to share or replace.
-            window_quarantine={"quarantined": False, "reasons": []},
-            checkpoint_epoch=None,
-        )
+        flat_batch = [
+            group
+            for env_batch in window_batches.values()
+            for group in env_batch
+        ]
+        # Per-batch, not per-window (R14): v6 writes up to
+        # FILL_CLOSED_EMISSIONS_PER_WINDOW payloads per window where the
+        # seal path writes exactly one, so each one is its own admission
+        # to the optimizer and must clear the same gate on its own.
+        # reject_counts is not aggregated per-batch here -- the seal
+        # path's OWN accumulated-batch gate (service.py's
+        # ``accumulated_quarantine``) makes this identical simplification
+        # for the identical reason: reject-count aggregation is a
+        # cross-batcher concern that spans a whole window's rejections,
+        # not one join cycle's, and this class has no wiring to it.
+        decision = assess_training_batch(flat_batch, reject_counts={})
         key = encoded_window_journal_key(
             self.window_start, self.next_batch_index
         )
-        self._enqueue_fn(key, data)
+        if decision.quarantined:
+            # Do NOT enqueue: this is exactly the poisoned-data path the
+            # seal-time gate exists to close. A tombstone still goes out
+            # under this batch's OWN encoded key so the trainer's cursor
+            # advances -- it never advances on absence, only on an
+            # explicit marker (see service._write_training_tombstone).
+            data = encode_tombstone(
+                window_start=self.window_start,
+                failure_stage="training_quarantine",
+                failure_type="TrainingQuarantine",
+            )
+            self._tombstone_fn(key, data)
+        else:
+            data = encode_training_payload(
+                window_batches,
+                window_start=self.window_start,
+                checkpoint_revision=self._checkpoint_revision,
+                env_order=list(self._env_order),
+                window_quarantine=decision.to_archive(),
+                checkpoint_epoch=None,
+            )
+            self._enqueue_fn(key, data)
         logger.info(
-            "FillClosedBatchAssembler: window %d batch %d written "
-            "(journal key %d)",
-            self.window_start, self.next_batch_index, key,
+            "FillClosedBatchAssembler: window %d batch %d %s (journal "
+            "key %d, quarantined=%s reasons=%s)",
+            self.window_start, self.next_batch_index,
+            "tombstoned" if decision.quarantined else "written",
+            key, decision.quarantined, decision.reasons,
         )
         self.next_batch_index += 1
 
