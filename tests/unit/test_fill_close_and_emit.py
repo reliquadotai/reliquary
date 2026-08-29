@@ -119,21 +119,32 @@ def test_service_builds_one_shared_fill_state_and_injects_every_batcher(
 
 
 def test_a_batch_is_emitted_every_b_batch_proven_groups(monkeypatch):
-    """16 x 32 = 512 is arithmetic, not a schedule the miner can see."""
+    """16 x 32 = 512 is arithmetic, not a schedule the miner can see.
+
+    R13: a batcher's own emission now depends ONLY on its own
+    environment's proven count (assembly across environments moved to the
+    service), so the callback signature is
+    ``(environment, groups, window_start, checkpoint_revision)`` for ONE
+    chunk of THIS batcher's own environment -- not a cross-env dict.
+    """
     import reliquary.validator.batcher as batcher_module
     monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
 
     emitted = []
-    batcher = _make_batcher()
+    batcher = _make_batcher()  # openmathinstruct
     batcher.fill_state = batcher_module.FillState(
-        targets={"openmathinstruct": 64, "opencodeinstruct": 64}
+        targets={"openmathinstruct": 64}
     )
     # Stub the injected callback, not ``_emit_training_batch`` itself: the
     # counter check-and-increment now lives INSIDE ``_emit_training_batch``,
     # under ``fill_state.lock``, together with the slice and watermark
     # advance (Task 7 review, Critical) -- stubbing the method out would
     # bypass that gating entirely instead of exercising it.
-    batcher._emit_training_batch_fn = lambda batch: emitted.append(batch)
+    batcher._emit_training_batch_fn = (
+        lambda environment, groups, window_start, checkpoint_revision: (
+            emitted.append((environment, groups))
+        )
+    )
 
     for _ in range(B_BATCH):
         with batcher.fill_state.lock:
@@ -141,13 +152,11 @@ def test_a_batch_is_emitted_every_b_batch_proven_groups(monkeypatch):
             batcher._proven_groups.setdefault(
                 "openmathinstruct", []
             ).append(object())
-            batcher.fill_state.record_proven("opencodeinstruct")
-            batcher._proven_groups.setdefault(
-                "opencodeinstruct", []
-            ).append(object())
         batcher._maybe_emit_batch()
 
     assert len(emitted) == 1
+    assert emitted[0][0] == "openmathinstruct"
+    assert len(emitted[0][1]) == B_BATCH
 
 
 def test_concurrent_proven_writes_and_emission_never_drop_or_duplicate_groups(
@@ -164,33 +173,37 @@ def test_concurrent_proven_writes_and_emission_never_drop_or_duplicate_groups(
     trained data. A writer thread and an emitter thread hammer the same
     batcher concurrently; every proven group must come out of the emit
     callback exactly once (no drops, no duplicates).
+
+    R13 narrowed a batcher to its own environment only, so this is now
+    single-environment by construction -- the race being tested (the
+    fill_state.lock discipline around proven/_proven_groups/watermark) is
+    unaffected by how many environments exist.
     """
     import reliquary.validator.batcher as batcher_module
     monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
 
     n_cycles = 13  # 13 * B_BATCH == 208, close to the requested ~200
     n_groups = n_cycles * B_BATCH
-    envs = ("openmathinstruct", "opencodeinstruct")
+    env = "openmathinstruct"
 
     batcher = _make_batcher()
-    batcher.fill_state = batcher_module.FillState(
-        targets={env: n_groups for env in envs}
-    )
-    emitted_batches: list[dict] = []
-    batcher._emit_training_batch_fn = lambda batch: emitted_batches.append(
-        batch
+    batcher.fill_state = batcher_module.FillState(targets={env: n_groups})
+    emitted_chunks: list[list] = []
+    batcher._emit_training_batch_fn = (
+        lambda environment, groups, window_start, checkpoint_revision: (
+            emitted_chunks.append(groups)
+        )
     )
 
-    appended: dict[str, list[object]] = {env: [] for env in envs}
+    appended: list[object] = []
 
     def writer() -> None:
         for _ in range(n_groups):
-            for env in envs:
-                group = object()
-                with batcher.fill_state.lock:
-                    batcher.fill_state.record_proven(env)
-                    batcher._proven_groups.setdefault(env, []).append(group)
-                appended[env].append(group)
+            group = object()
+            with batcher.fill_state.lock:
+                batcher.fill_state.record_proven(env)
+                batcher._proven_groups.setdefault(env, []).append(group)
+            appended.append(group)
 
     stop = threading.Event()
 
@@ -207,17 +220,12 @@ def test_concurrent_proven_writes_and_emission_never_drop_or_duplicate_groups(
     emitter_thread.join()
     batcher._maybe_emit_batch()  # drain whatever became ready right at the end
 
-    emitted_by_env: dict[str, list[object]] = {env: [] for env in envs}
-    for batch in emitted_batches:
-        for env, groups in batch.items():
-            emitted_by_env[env].extend(groups)
-
-    for env in envs:
-        emitted_ids = sorted(id(g) for g in emitted_by_env[env])
-        appended_ids = sorted(id(g) for g in appended[env])
-        assert emitted_ids == appended_ids, (
-            env, len(emitted_ids), len(appended_ids),
-        )
+    emitted_flat = [group for chunk in emitted_chunks for group in chunk]
+    emitted_ids = sorted(id(g) for g in emitted_flat)
+    appended_ids = sorted(id(g) for g in appended)
+    assert emitted_ids == appended_ids, (
+        len(emitted_ids), len(appended_ids),
+    )
 
 
 def test_state_advertises_which_environments_are_still_admitting(monkeypatch):
@@ -269,6 +277,10 @@ def test_emission_is_hooked_from_the_reconcile_walk_not_record_proven(
     scheduler's only path to accounting a PASSED group. A direct
     ``record_proven`` call (bypassing the walk entirely) must NOT emit on
     its own; only a REAL scheduler's terminal decision, walked, does.
+
+    R13: single-key ``FillState`` -- a batcher's own emission depends only
+    on its own environment now, so the cross-env convenience seeding round
+    1 needed is gone.
     """
     import reliquary.validator.batcher as batcher_module
     from reliquary.validator.proof_scheduler import GlobalProofScheduler
@@ -290,27 +302,18 @@ def test_emission_is_hooked_from_the_reconcile_walk_not_record_proven(
     )
     try:
         batcher = _make_batcher(proof_scheduler=scheduler)
-        batcher.fill_state = batcher_module.FillState(
-            targets={"openmathinstruct": 1, "opencodeinstruct": 1}
-        )
+        batcher.fill_state = batcher_module.FillState(targets={env: 1})
         # Stub the injected callback, not ``_emit_training_batch`` itself:
         # the counter check-and-increment now lives INSIDE
         # ``_emit_training_batch``, under ``fill_state.lock`` (Task 7
         # review, Critical), so it must stay live for repeated
         # ``_maybe_emit_batch`` calls (via ``_wait_until``'s polling) to
         # self-gate correctly instead of re-firing on every poll.
-        batcher._emit_training_batch_fn = lambda batch: emitted.append(batch)
-
-        # Bypasses the reconcile walk entirely -- must not trigger emission.
-        # Also seeds a matching proven GROUP (not just the count) for the
-        # other environment, so the real accumulator this test now
-        # exercises can actually reach ``ready`` once math's real proof
-        # completes below.
-        batcher.fill_state.record_proven("opencodeinstruct")
-        batcher._proven_groups.setdefault("opencodeinstruct", []).append(
-            object()
+        batcher._emit_training_batch_fn = (
+            lambda environment, groups, window_start, checkpoint_revision: (
+                emitted.append((environment, groups))
+            )
         )
-        assert emitted == []
 
         assert batcher.accept_submission(
             _request(prompt_idx=21, hotkey="miner")
@@ -322,6 +325,13 @@ def test_emission_is_hooked_from_the_reconcile_walk_not_record_proven(
 
         _wait_until(_proven, timeout=5.0)
 
+        assert len(emitted) == 1
+        assert emitted[0][0] == env
+        assert len(emitted[0][1]) == 1
+
+        # Bypasses the reconcile walk entirely -- must not trigger a
+        # second emission on its own.
+        batcher.fill_state.record_proven(env)
         assert len(emitted) == 1
     finally:
         assert scheduler.close()

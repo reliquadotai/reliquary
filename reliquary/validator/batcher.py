@@ -90,7 +90,6 @@ from reliquary.protocol.tokens import verify_tokens
 from reliquary.validator.admission import robust_utility_admits
 from reliquary.validator.admission_priority import ThroughputAdmissionQueue
 from reliquary.validator.fill_window import FillState
-from reliquary.validator.training_accumulator import BalancedTrainingAccumulator
 from reliquary.validator.batch_selection import (
     throughput_rank,
     explain_batch_selection,
@@ -813,7 +812,7 @@ class GrpoWindowBatcher:
         drand_round_backward_tolerance: int | None = None,
         queue_drained_predicate: Callable[[], bool] | None = None,
         emit_training_batch_fn: (
-            Callable[[dict[str, list[Any]]], None] | None
+            Callable[[str, list[Any], int, str], None] | None
         ) = None,
         operator_by_hotkey: dict[str, str] | None = None,
         current_round_fn: Callable[[], int | None] | None = None,
@@ -1214,24 +1213,17 @@ class GrpoWindowBatcher:
         # already been folded into an emitted batch, so a group is never
         # emitted twice and never skipped.
         self._emitted_group_watermark: dict[str, int] = {}
-        # v6 only. Lazily sized to B_BATCH per environment on first
-        # emission -- ``fill_state`` (and therefore the environment set)
-        # is not known until window activation. This is the same
-        # accumulator the auction path uses to carry a sparse
-        # environment's deficit across windows; here it only ever needs
-        # to carry a single cycle's rounding remainder, since
-        # ``_maybe_emit_batch`` never fires until every environment
-        # already has at least B_BATCH new proven groups.
-        self._batch_training_accumulator: BalancedTrainingAccumulator | None = (
-            None
-        )
-        # v6 only. Injected by the service, following the
-        # ``queue_drained_predicate`` pattern below: called with
-        # ``dict[str, list[ValidSubmission]]`` once a B_BATCH-per-
-        # environment slice is ready. Runs on whichever proof-worker
-        # thread completed the proof that crossed the boundary -- see
-        # ``_emit_training_batch``. ``None`` in test contexts and until
-        # the service wires a real detached-trainer writer.
+        # v6 only (R13). Injected by the service as
+        # ``FillClosedBatchAssembler.accept``, following the
+        # ``queue_drained_predicate`` pattern below. Called with
+        # ``(environment, groups, window_start, checkpoint_revision)`` for
+        # ONE B_BATCH-sized chunk of THIS batcher's own environment --
+        # never every environment: a batcher only ever holds its own
+        # environment's proven groups, so joining every environment's
+        # chunk into one DAPO batch happens in the service-side assembler,
+        # not here. Runs on whichever proof-worker thread completed the
+        # proof that crossed the boundary -- see ``_emit_training_batch``.
+        # ``None`` in test contexts and on the auction path.
         self._emit_training_batch_fn = emit_training_batch_fn
         self._loop: asyncio.AbstractEventLoop | None = None
         # Optional callback the seal-extension coroutine polls to check
@@ -1704,31 +1696,41 @@ class GrpoWindowBatcher:
         self._maybe_emit_batch()
 
     def _maybe_emit_batch(self) -> None:
-        """Emit every training batch newly ready, one B_BATCH-per-
-        environment cycle at a time.
+        """Emit every B_BATCH chunk of THIS environment's own proven
+        groups that has newly become ready, one at a time.
 
-        A DAPO step needs B_BATCH groups from EACH environment, so the
-        trigger is the slowest environment. The readiness check, the
-        counter increment, the proven-groups slice and the watermark
-        advance all happen together in ONE critical section, inside
-        ``_emit_training_batch``, under ``fill_state.lock`` -- the SAME
-        lock ``_reconcile_fill_state_decisions`` holds while appending to
-        ``_proven_groups`` (Task 7 review, Critical). Splitting the
-        counter check-and-increment from the slice/watermark advance into
-        two separate lock acquisitions would let two cycles interleave:
-        cycle N+1 could read the watermark before cycle N had advanced it
-        and slice the SAME groups again. One combined critical section is
-        what makes ``self._batches_emitted``'s increment and the
-        watermark's advance atomic with each other, not just individually
-        locked.
+        R13: batch ASSEMBLY -- joining every configured environment's
+        B_BATCH chunk into one cross-environment DAPO batch -- moved to
+        the service (``FillClosedBatchAssembler``). A single batcher only
+        ever accounts its own environment's proven groups (see
+        ``_reconcile_fill_state_decisions``, keyed by ``self.env.name``),
+        so it cannot itself assemble a batch needing groups from every
+        environment; only the service, which sees every environment's
+        batcher for a window, can. This method's job narrows to: claim
+        and hand off THIS environment's own next chunk, as soon as it is
+        ready, independent of any other environment's progress.
 
-        ``_emit_training_batch`` returns the ready ``window_batches`` (or
-        ``None`` when nothing new crossed the boundary) and releases the
-        lock BEFORE returning, so the callback below -- possible I/O, the
-        write to the detached trainer's journal -- never runs while the
-        lock is held. Cycle N+1's callback can only be issued after cycle
-        N's slice has been safely walled off by the watermark advance,
-        even though the callbacks' own completion order is not itself
+        The readiness check, the counter increment, the proven-groups
+        slice and the watermark advance all happen together in ONE
+        critical section, inside ``_emit_training_batch``, under
+        ``fill_state.lock`` -- the SAME lock
+        ``_reconcile_fill_state_decisions`` holds while appending to
+        ``_proven_groups`` (Task 7 review, Critical; unchanged by R13).
+        Splitting the counter check-and-increment from the slice/watermark
+        advance into two separate lock acquisitions would let two cycles
+        interleave: cycle N+1 could read the watermark before cycle N had
+        advanced it and slice the SAME groups again. One combined
+        critical section is what makes ``self._batches_emitted``'s
+        increment and the watermark's advance atomic with each other, not
+        just individually locked.
+
+        ``_emit_training_batch`` returns the ready chunk (or ``None`` when
+        nothing new crossed the boundary) and releases the lock BEFORE
+        returning, so the callback below -- possible I/O, the write to
+        the detached trainer's journal -- never runs while the lock is
+        held. Cycle N+1's callback can only be issued after cycle N's
+        slice has been safely walled off by the watermark advance, even
+        though the callbacks' own completion order is not itself
         serialized.
 
         Only called from ``_reconcile_fill_state_decisions``, after its
@@ -1739,30 +1741,36 @@ class GrpoWindowBatcher:
         if self.fill_state is None:
             return
         while True:
-            window_batches = self._emit_training_batch()
-            if window_batches is None:
+            chunk = self._emit_training_batch()
+            if chunk is None:
                 return
             if self._emit_training_batch_fn is not None:
-                self._emit_training_batch_fn(window_batches)
+                self._emit_training_batch_fn(*chunk)
 
-    def _emit_training_batch(self) -> dict[str, list[Any]] | None:
-        """Atomically claim and slice the next ready B_BATCH-per-
-        environment cycle, under ``fill_state.lock``; return it for
-        ``_maybe_emit_batch`` to hand to the detached trainer OUTSIDE the
-        lock.
+    def _emit_training_batch(
+        self,
+    ) -> tuple[str, list[Any], int, str] | None:
+        """Atomically claim and slice the next ready B_BATCH chunk of
+        THIS environment's own proven groups, under ``fill_state.lock``;
+        return ``(environment, groups, window_start, checkpoint_revision)``
+        for ``_maybe_emit_batch`` to hand to the injected callback OUTSIDE
+        the lock.
 
-        Reads ``fill_state.snapshot()['proven']``, checks and increments
-        ``self._batches_emitted``, slices ``self._proven_groups`` and
-        advances ``self._emitted_group_watermark`` -- the full (fill_state
-        counts, proven_groups, watermark) triple -- all under the one
-        lock (Task 7 review, Critical), so a concurrent
-        ``_reconcile_fill_state_decisions`` append can never be read
-        half-applied. Returns ``None`` under the lock when no new cycle is
-        ready yet, or (defensively -- the B_BATCH arithmetic above
-        guarantees it never actually happens) when the freshly-sliced
-        cycle's own accumulator still isn't ready: the next cycle simply
-        tops it up rather than corrupting the watermark it already
-        advanced.
+        R13: readiness now depends ONLY on this environment's own proven
+        count (``fill_state.snapshot()['proven'][environment]``), not
+        ``min(...)`` across every environment (the pre-R13 shape) -- a
+        fast environment no longer waits on a slow sibling to emit its
+        OWN next chunk; joining the two environments' chunks back into
+        one DAPO batch is the service-side assembler's job, not this
+        batcher's.
+
+        Checks and increments ``self._batches_emitted``, slices
+        ``self._proven_groups[environment]`` and advances
+        ``self._emitted_group_watermark[environment]`` -- all under the
+        one lock (Task 7 review, Critical; unchanged by R13), so a
+        concurrent ``_reconcile_fill_state_decisions`` append can never be
+        read half-applied. Returns ``None`` under the lock when no new
+        chunk is ready yet.
 
         ``self._emit_training_batch_fn`` -- like
         ``TrainingPayloadQueue.enqueue_payload`` on the existing seal path
@@ -1772,51 +1780,24 @@ class GrpoWindowBatcher:
         future implementation that genuinely needs the loop is
         responsible for its own scheduling, the same way
         ``_delayed_seal_at_drand_boundary`` does.
-
-        Uses ``BalancedTrainingAccumulator`` (the same class the auction
-        path uses to carry a sparse environment's deficit across windows)
-        as the home for this cycle's remainder: each environment
-        contributes its next unemitted B_BATCH slice, and the accumulator
-        is what actually produces the ordered ``env -> groups`` batch and
-        resets for the next cycle.
         """
+        environment = str(getattr(self.env, "name", ""))
         with self.fill_state.lock:
-            proven = self.fill_state.snapshot()["proven"]
-            ready = min(proven.values()) // B_BATCH
+            proven = self.fill_state.snapshot()["proven"][environment]
+            ready = proven // B_BATCH
             if self._batches_emitted >= ready:
                 return None
             self._batches_emitted += 1
-            environments = list(self.fill_state.snapshot()["targets"])
-            if self._batch_training_accumulator is None:
-                self._batch_training_accumulator = BalancedTrainingAccumulator(
-                    {environment: B_BATCH for environment in environments}
-                )
-            slices: dict[str, list[Any]] = {}
-            for environment in environments:
-                groups = self._proven_groups.get(environment, [])
-                start = self._emitted_group_watermark.get(environment, 0)
-                end = start + B_BATCH
-                slices[environment] = groups[start:end]
-                self._emitted_group_watermark[environment] = min(
-                    end, len(groups)
-                )
-            self._batch_training_accumulator.add_window(
-                slices,
-                window_n=self.window_start,
-                checkpoint_revision=self.current_checkpoint_hash,
+            groups = self._proven_groups.get(environment, [])
+            start = self._emitted_group_watermark.get(environment, 0)
+            end = start + B_BATCH
+            chunk = groups[start:end]
+            self._emitted_group_watermark[environment] = min(
+                end, len(groups)
             )
-            if not self._batch_training_accumulator.ready:
-                return None
-            window_batches = dict(
-                zip(
-                    environments,
-                    self._batch_training_accumulator.training_batches(
-                        environments
-                    ),
-                )
-            )
-            self._batch_training_accumulator.reset()
-            return window_batches
+            window_start = self.window_start
+            checkpoint_revision = self.current_checkpoint_hash
+        return (environment, chunk, window_start, checkpoint_revision)
 
     def _record_upload_precommit_rejection_locked(self, reason: str) -> None:
         self._upload_precommit_rejections[reason] = (
