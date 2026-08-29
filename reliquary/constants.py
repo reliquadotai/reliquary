@@ -773,19 +773,6 @@ FILL_CLOSED_MAX_SECONDS = float(_os.environ.get(
 if not _math.isfinite(FILL_CLOSED_MAX_SECONDS) or FILL_CLOSED_MAX_SECONDS <= 0:
     raise ValueError("RELIQUARY_FILL_CLOSED_MAX_SECONDS must be positive")
 
-# Ceiling on one operator's share of an environment's accepted tokens.
-# Counted in TOKENS, not groups: under per-token payment a group count
-# bounds nothing, since an operator can take few very long groups. 0.34
-# denies any single operator a third of an environment while leaving room
-# for a fleet of three to fill it. Move it from measured concentration.
-FILL_CLOSED_MAX_OPERATOR_TOKEN_SHARE = float(_os.environ.get(
-    "RELIQUARY_FILL_CLOSED_MAX_OPERATOR_TOKEN_SHARE", "0.34"
-))
-if not 0.0 < FILL_CLOSED_MAX_OPERATOR_TOKEN_SHARE <= 1.0:
-    raise ValueError(
-        "RELIQUARY_FILL_CLOSED_MAX_OPERATOR_TOKEN_SHARE must be in (0, 1]"
-    )
-
 # Runtime default for CLI/Docker operators. OpenCode remains available through
 # ENVIRONMENT_MIX, but code execution is opt-in until the runsc canary and
 # miner rollout are coordinated.

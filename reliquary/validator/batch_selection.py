@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 from typing import Any, Protocol
 
+from reliquary.constants import FILL_CLOSED_ENABLED
 from reliquary.validator.cooldown import CooldownMap
 
 
@@ -249,6 +250,44 @@ def select_batch_and_distribute(
             # Boundary round consumes all remaining slot value, so any
             # later round contributes zero — stop iterating.
             break
+
+    if FILL_CLOSED_ENABLED:
+        # v6 pays per completion token instead of a flat slot share (see
+        # token_rewards.py's module docstring for why). ``eos_tokens`` was
+        # produced once at admission (admission.count_eos_completion_tokens)
+        # and is read here as a plain attribute -- never recomputed. The
+        # ``rewards`` dict the loop above built with ``slot_share`` is
+        # discarded on this path; only ``training_batch`` (the prompt/slot
+        # selection, unchanged) is kept.
+        #
+        # ``pool`` here is this call's PER-BATCH share, not the window's:
+        # v6 assembles FILL_CLOSED_EMISSIONS_PER_WINDOW batches per window
+        # and this function is called once per assembled batch (unlike the
+        # v4/v5 auction path above, which is one call per window). The
+        # caller is responsible for dividing the window pool across batches
+        # before calling in here -- do not "fix" this into a window-wide
+        # split.
+        from reliquary.validator.token_rewards import (
+            AcceptedGroup,
+            split_environment_pool,
+        )
+
+        return training_batch, split_environment_pool(
+            [
+                AcceptedGroup(
+                    hotkey=submission.hotkey,
+                    # No operator registry is available at this call site,
+                    # and none is needed for payment (no cap keys on it --
+                    # see token_rewards.py). Archive-only field.
+                    operator_id=getattr(
+                        submission, "operator_id", None
+                    ) or submission.hotkey,
+                    eos_tokens=submission.eos_tokens,
+                )
+                for submission in training_batch
+            ],
+            pool=pool,
+        )
 
     return training_batch, rewards
 

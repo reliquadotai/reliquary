@@ -4532,6 +4532,12 @@ class ValidationService:
                     "merkle_root": s.merkle_root_bytes.hex(),
                     "selection_digest": s.selection_digest.hex(),
                     "claimed_checkpoint_hash": s.claimed_checkpoint_hash,
+                    # v6: completion tokens over genuinely EOS-terminated
+                    # rollouts, produced once at admission. Additive field --
+                    # a weight-only validator replaying per-token payment
+                    # from the archive needs this to divide the same way the
+                    # live validator did (see token_rewards.py).
+                    "eos_tokens": int(getattr(s, "eos_tokens", 0) or 0),
                     "sketch_diff_max": s.sketch_diff_max,
                     "lp_dev_max": s.lp_dev_max,
                     "dist_q10_min": s.dist_q10_min,

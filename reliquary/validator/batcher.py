@@ -588,6 +588,11 @@ class PendingSubmission:
     unboxed_count: int = 0
     attainable_rewards: tuple[float, ...] = ()
     robust_utility: float | None = None
+    # v6 per-token payment: completion tokens over genuinely EOS-terminated
+    # rollouts, computed once at admission (see
+    # ``admission.count_eos_completion_tokens``) and merely carried from here
+    # onto ``ValidSubmission`` -- never recomputed at distribution.
+    eos_tokens: int = 0
     value: float = field(init=False, default=0.0)
 
     def __post_init__(self):
@@ -652,6 +657,9 @@ class ValidSubmission:
     reward_shape: dict[str, Any] = field(default_factory=dict)
     ingress_observability: dict[str, Any] = field(default_factory=dict)
     utility_rollouts: list[dict[str, Any]] = field(default_factory=list)
+    # v6 per-token payment: carried from ``PendingSubmission.eos_tokens``
+    # (computed once at admission), not recomputed here or at distribution.
+    eos_tokens: int = 0
 
     def __post_init__(self):
         self.merkle_root = self.merkle_root_bytes
@@ -3296,6 +3304,7 @@ class GrpoWindowBatcher:
                 getattr(prepared, "attainable_rewards", ()) or ()
             ),
             robust_utility=getattr(prepared, "robust_utility", None),
+            eos_tokens=int(getattr(prepared, "eos_tokens", 0) or 0),
             drand_round=request.drand_round,
             merkle_root=bytes.fromhex(request.merkle_root),
             selection_digest=prepared.selection_digest
@@ -4945,6 +4954,10 @@ class GrpoWindowBatcher:
                 telemetry.archive_fields() if telemetry else {}
             ),
             utility_rollouts=utility_rollouts,
+            # Carried, not recomputed: the GPU proof authenticates tokens,
+            # not termination shape, and the count was already produced at
+            # admission from the same commit data (see PendingSubmission).
+            eos_tokens=int(getattr(pending, "eos_tokens", 0) or 0),
         )
         # The caller decides whether this is an auction winner or an immediate
         # legacy admission.

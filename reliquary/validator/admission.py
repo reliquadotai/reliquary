@@ -146,6 +146,10 @@ class PreparedSubmission:
     unboxed_count: int = 0
     attainable_rewards: tuple[float, ...] = ()
     robust_utility: float | None = None
+    # v6 per-token payment (see token_rewards.py): completion tokens summed
+    # over rollouts that genuinely terminated on EOS. Computed once here so
+    # distribution only ever reads it (see ``count_eos_completion_tokens``).
+    eos_tokens: int = 0
 
 
 class _AdmissionTimeout(TimeoutError):
@@ -454,6 +458,45 @@ def truncated_rollout_indices(
         for index, rollout in enumerate(request.rollouts)
         if _classify_termination(rollout, context) == "truncated"
     )
+
+
+def count_eos_completion_tokens(
+    request: BatchSubmissionRequest,
+    context: AdmissionContext,
+) -> int:
+    """Sum completion tokens over genuinely EOS-terminated rollouts.
+
+    v6 pays per completion token (see ``token_rewards.py``) instead of a flat
+    per-slot share, so revenue no longer scales with ``1/length``. Only a
+    rollout the model itself chose to end may be paid for its length:
+    ``_classify_termination`` returns ``"ok"`` both for real EOS termination
+    and for an accepted BFT/natural cap shape (forced or naturally-timed
+    closure at the protocol budget with no EOS token present at all). Paying
+    a cap shape the same as a real EOS termination would erase the strictly
+    negative margin padding-to-the-cap must keep -- it was forced to stop by
+    policy, not by the model choosing to stop. So a rollout contributes its
+    completion length here iff it classifies ``"ok"`` AND its completion's
+    final token is a genuine EOS token.
+    """
+    if not context.eos_token_ids:
+        return 0
+    eos_ids = set(context.eos_token_ids)
+    total = 0
+    for rollout in request.rollouts:
+        if _classify_termination(rollout, context) != "ok":
+            continue
+        commit = rollout.commit
+        tokens = list(commit.get("tokens") or [])
+        meta = commit.get("rollout", {}) or {}
+        try:
+            prompt_length = int(meta.get("prompt_length", 0))
+            completion_length = int(meta.get("completion_length", 0))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        completion = tokens[prompt_length: prompt_length + completion_length]
+        if completion and int(completion[-1]) in eos_ids:
+            total += completion_length
+    return total
 
 
 def _termination_reject(
@@ -984,6 +1027,7 @@ def score_and_finalize_submission(
                 unboxed_count=len(unboxed_indices),
                 attainable_rewards=attainable_rewards,
                 robust_utility=robust_utility,
+                eos_tokens=count_eos_completion_tokens(request, context),
                 body_parse_ms=parsed.body_parse_ms,
                 preparation_ms=(
                     parsed.preparation_ms

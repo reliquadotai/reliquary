@@ -46,7 +46,9 @@ def _rollout(r=1.0, eos=False):
     )
 
 
-def _valid_submission(prompt_idx, k=4, hotkey="hk", eos_first=False):
+def _valid_submission(
+    prompt_idx, k=4, hotkey="hk", eos_first=False, eos_tokens=0
+):
     import math
     rollouts = [
         _rollout(r=1.0 if i < k else 0.0, eos=(eos_first and i == 0))
@@ -60,6 +62,7 @@ def _valid_submission(prompt_idx, k=4, hotkey="hk", eos_first=False):
         merkle_root_bytes=b"\xab" * 32,
         sigma=sigma,
         rollouts=rollouts,
+        eos_tokens=eos_tokens,
         completion_texts=[f"text_{i}" for i in range(8)],
         sketch_diff_max=412,
         lp_dev_max=0.00037,
