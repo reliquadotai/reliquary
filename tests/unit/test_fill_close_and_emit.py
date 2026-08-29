@@ -325,3 +325,137 @@ def test_emission_is_hooked_from_the_reconcile_walk_not_record_proven(
         assert len(emitted) == 1
     finally:
         assert scheduler.close()
+
+
+def test_backstop_seals_the_open_plan_so_it_finalises_instead_of_hanging(
+    monkeypatch,
+):
+    """Nothing previously called ``scheduler.seal(...)`` when a v6 window
+    closes. An open-ended plan does not finalise on exhaustion -- that is
+    its whole point -- so at the backstop (target not reached) the plan
+    stayed open forever: in-flight proofs still completed and got
+    reconciled, but the plan never reported terminal, ``drain`` could wait
+    on it forever, and the next window's plan for the same environment
+    would be refused (one active plan per environment).
+    """
+    import reliquary.validator.batcher as batcher_module
+    from reliquary.validator.proof_scheduler import (
+        GlobalProofScheduler, ProofPlanOutcome,
+    )
+    from tests.unit.test_grpo_window_batcher import (
+        _execute_scheduler_payload, _request,
+    )
+    from tests.unit.test_proof_scheduler import _wait_until
+
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+    env = "openmathinstruct"
+
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0",),
+        environments=("openmathinstruct", "opencodeinstruct"),
+        proof_callable=_execute_scheduler_payload,
+        checkpoint_revision="",
+    )
+    try:
+        batcher = _make_batcher(proof_scheduler=scheduler)
+        # target=4: far short of what we ever submit, so the plan can only
+        # finalise via an explicit seal, never by reaching its target.
+        batcher.fill_state = batcher_module.FillState(
+            targets={"openmathinstruct": 4}
+        )
+        batcher.mark_window_opened()
+
+        assert batcher.accept_submission(
+            _request(prompt_idx=21, hotkey="miner")
+        ).accepted
+
+        def _proven() -> bool:
+            batcher._drain_arrival_proof_buffer(env)
+            return batcher.fill_state.snapshot()["proven"][env] == 1
+
+        _wait_until(_proven, timeout=5.0)
+
+        handle = batcher._open_proof_plan_handle
+        assert handle is not None
+        # Exhaustion is not terminal on its own while a window still
+        # admits -- confirms this test would hang without the fix, not
+        # pass vacuously because the plan was already done.
+        assert handle.done() is False
+
+        # The scheduler's own plan deadline was fixed, at submission time,
+        # using the REAL clock and the default FILL_CLOSED_MAX_SECONDS --
+        # comfortably in the future. Patching the constant AFTER the plan
+        # already exists only moves the WINDOW's own backstop check,
+        # isolating this test from the scheduler's independent deadline
+        # mechanism.
+        monkeypatch.setattr(batcher_module, "FILL_CLOSED_MAX_SECONDS", 0.0)
+
+        assert batcher.poll_deadline() is True
+
+        assert handle.done() is True
+        result = handle.result(timeout=1.0)
+        # NEEDS_CONTEXT resolved by direct measurement (see report): with
+        # the real v6 plan config (``allow_shortfall=True``, set by
+        # ``_extend_proof_plan``), a short, sealed, open-ended plan
+        # finalises COMPLETED with a shortfall completion_reason, not
+        # CAPACITY_ABORTED -- CAPACITY_ABORTED is only what
+        # ``allow_shortfall=False`` produces.
+        assert result.outcome is ProofPlanOutcome.COMPLETED
+        assert batcher.fill_state.snapshot()["in_flight"][env] == 0
+    finally:
+        assert scheduler.close()
+
+
+def test_fill_close_also_seals_the_plan_which_finalises_completed(
+    monkeypatch,
+):
+    """Reaching the target already finalises the plan on its own (see
+    ``_finalize_if_terminal_locked``); this only confirms the new,
+    unconditional seal call at fill-close is a safe, idempotent no-op
+    there, not a second, conflicting way to close it."""
+    import reliquary.validator.batcher as batcher_module
+    from reliquary.validator.proof_scheduler import (
+        GlobalProofScheduler, ProofPlanOutcome,
+    )
+    from tests.unit.test_grpo_window_batcher import (
+        _execute_scheduler_payload, _request,
+    )
+    from tests.unit.test_proof_scheduler import _wait_until
+
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+    env = "openmathinstruct"
+
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0",),
+        environments=("openmathinstruct", "opencodeinstruct"),
+        proof_callable=_execute_scheduler_payload,
+        checkpoint_revision="",
+    )
+    try:
+        batcher = _make_batcher(proof_scheduler=scheduler)
+        batcher.fill_state = batcher_module.FillState(
+            targets={"openmathinstruct": 1}
+        )
+        batcher.mark_window_opened()
+
+        assert batcher.accept_submission(
+            _request(prompt_idx=21, hotkey="miner")
+        ).accepted
+
+        def _closed() -> bool:
+            batcher._drain_arrival_proof_buffer(env)
+            return batcher.fill_state.is_closed()
+
+        _wait_until(_closed, timeout=5.0)
+
+        assert batcher.poll_deadline() is True
+
+        handle = batcher._open_proof_plan_handle
+        assert handle is not None
+        assert handle.done() is True
+        assert (
+            handle.result(timeout=1.0).outcome is ProofPlanOutcome.COMPLETED
+        )
+        assert batcher.fill_state.snapshot()["in_flight"][env] == 0
+    finally:
+        assert scheduler.close()

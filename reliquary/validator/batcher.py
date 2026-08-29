@@ -1493,6 +1493,57 @@ class GrpoWindowBatcher:
         else:
             scheduler.extend(self._open_proof_plan_id, candidates)
 
+    def _seal_v6_proof_plan(self) -> None:
+        """Finalise this window's open-ended proof plan when the window
+        itself seals -- fill-close or backstop, ``poll_deadline``'s only
+        two v6 exits.
+
+        ``GlobalProofScheduler.extend`` never closes an open-ended plan on
+        its own: exhaustion is not terminal while a window still admits,
+        by design (see ``ProofPlan.open_ended``). Left unsealed past
+        window close, the plan simply never reports ``done()`` --
+        ``drain()`` can wait on it forever, and the next window's plan for
+        this environment is refused (one active plan per environment).
+
+        Called unconditionally on both v6 seal paths. At fill-close,
+        reaching every environment's target has almost always ALREADY
+        finalised (and, in the scheduler, RETIRED) this environment's plan
+        on its own, via ``_finalize_if_terminal_locked`` -- before this
+        ever runs, since ``fill_state.record_proven`` and the scheduler's
+        own ``passed >= required_passes`` bookkeeping key off the very
+        same decision. ``GlobalProofScheduler.seal`` documents itself as
+        "idempotent, a no-op on a plan that already finalised", but that
+        guard lives INSIDE the same lock acquisition that finalises AND
+        retires a plan -- externally, by the time any caller observes a
+        plan as done, its ``plan_id`` has already been popped from the
+        scheduler's live map, so ``seal`` raises ``ValueError`` for it
+        instead. That is expected here, not a caller bug (this
+        environment's own ``_open_proof_plan_id`` was submitted by this
+        same batcher, never invented), so it is caught and treated as the
+        no-op it conceptually is. Only the backstop (target not reached)
+        actually needs the call to do anything.
+
+        Non-blocking, since ``poll_deadline`` runs on the event-loop
+        thread that also serves miners: ``seal`` finalises synchronously
+        under the scheduler's own lock when no proof is currently active
+        on a device thread, but if one IS active, sealing only marks the
+        plan closed to new work -- finalisation completes later, on that
+        worker's own completion path, which already reconciles (see
+        ``_execute_scheduled_proof`` -> ``_drain_arrival_proof_buffer``).
+        The immediate reconcile below only catches the case where sealing
+        itself was enough to finalise synchronously, so the window's own
+        ``fill_state`` (in particular ``in_flight``) reflects the plan's
+        outcome right away in the common case.
+        """
+        if self._proof_scheduler is None or self._open_proof_plan_id is None:
+            return
+        try:
+            self._proof_scheduler.seal(self._open_proof_plan_id)
+        except ValueError:
+            pass
+        environment = str(getattr(self.env, "name", ""))
+        self._reconcile_fill_state_decisions(environment)
+
     def _submit_arrival_proof(self, pending: PendingSubmission) -> None:
         """Buffer one graded body for the open-ended plan, then drain.
 
@@ -2370,10 +2421,12 @@ class GrpoWindowBatcher:
             with self.fill_state.lock:
                 closed = self.fill_state.is_closed()
             if closed:
+                self._seal_v6_proof_plan()
                 self._seal_flag.set()
                 return True
             if now - self.window_opened_at >= FILL_CLOSED_MAX_SECONDS:
                 # Backstop: a stalled fleet must not hold a window open.
+                self._seal_v6_proof_plan()
                 self._seal_flag.set()
                 return True
             return False
