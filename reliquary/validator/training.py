@@ -16,6 +16,7 @@ import gc
 import logging
 import math
 import threading
+import warnings
 from typing import Any, Optional
 
 import torch
@@ -269,8 +270,16 @@ def _lazy_init(model, global_step_hint: int | None = None) -> bool:
         # weight reset, so checkpoint_n is not a step count). Replaying the
         # warmup on every restart threw away ~10 windows of full-LR updates
         # per crash.
-        for _ in range(hint):
-            _scheduler.step()
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"Detected call of `lr_scheduler\.step\(\)` before "
+                        r"`optimizer\.step\(\)`",
+                category=UserWarning,
+                module=r"torch\.optim\.lr_scheduler",
+            )
+            for _ in range(hint):
+                _scheduler.step()
         restored_factor = _lr_lambda(hint)
         logger.info(
             "LR schedule restored to step %d (same-run restart; re-warmup "
