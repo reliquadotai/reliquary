@@ -9,6 +9,10 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from reliquary.constants import (
+    FILL_CLOSED_EMISSIONS_PER_WINDOW,
+    FILL_CLOSED_ENABLED,
+)
 from reliquary.infrastructure.training_payload_queue import (
     epoch_marker_key,
     payload_key,
@@ -42,10 +46,27 @@ class WindowJournal:
         self, cursor: int, *, stride: int
     ) -> tuple[str, Any] | None:
         target = int(cursor) + int(stride)
+        # v6 only (R13). Under FILL_CLOSED_ENABLED, ``target`` is not a
+        # window number -- it is the ENCODED journal key
+        # (window_start * FILL_CLOSED_EMISSIONS_PER_WINDOW + batch_index,
+        # see encoded_window_journal_key), because a still-open window
+        # writes up to FILL_CLOSED_EMISSIONS_PER_WINDOW payloads under
+        # consecutive keys. The payload's own ``window_start`` field
+        # still carries the REAL window number (train_step's LR/step
+        # bookkeeping needs the real number, not an inflated encoded
+        # one), so the two are compared through the SAME encoding rather
+        # than for raw equality. The fetch key itself needs no
+        # translation either way: ``payload_key``/``tombstone_key`` are
+        # opaque addressing, and the writer already computed this exact
+        # ``target`` value via ``encoded_window_journal_key``.
+        expected_window_start = (
+            target // FILL_CLOSED_EMISSIONS_PER_WINDOW
+            if FILL_CLOSED_ENABLED else target
+        )
         data = self._fetch(payload_key(target))
         if data is not None:
             decoded = decode_training_payload(data)
-            if decoded.window_start != target:
+            if decoded.window_start != expected_window_start:
                 raise ValueError("training payload window differs from journal key")
             if self._expected_identity:
                 validate_training_identity(
@@ -57,7 +78,7 @@ class WindowJournal:
         data = self._fetch(tombstone_key(target))
         if data is not None:
             tombstone = decode_tombstone(data)
-            if int(tombstone.get("window_start", -1)) != target:
+            if int(tombstone.get("window_start", -1)) != expected_window_start:
                 raise ValueError("training tombstone window differs from journal key")
             if self._expected_identity:
                 validate_training_identity(
