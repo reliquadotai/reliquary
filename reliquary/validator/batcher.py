@@ -6358,6 +6358,63 @@ class GrpoWindowBatcher:
         }
         return [], {}
 
+    def _seal_fill_closed_window(
+        self,
+        *,
+        commit_side_effects: bool,
+    ) -> tuple[list[ValidSubmission], dict[str, float]]:
+        """Seal a v6 window: prove nothing, select nothing, pay nothing.
+
+        C1. Under v6 every group was proved when it ARRIVED, assembled into
+        DAPO batches by the service's ``FillClosedBatchAssembler``, written
+        to the trainer journal under the encoded key space, and paid by the
+        per-token split (R20). ``self._pending`` still holds every graded
+        body, so letting the auction's seal run over it would prove each one
+        a SECOND time — a second ``{w}:{env}:auction-winners`` plan on the
+        same device, a second charge of operator proof-failure debt, and a
+        selection whose reward map contradicts the one already paid.
+
+        What still belongs here is the seal path's OTHER job: it is the only
+        writer of the prompt cooldown, the content cooldown and the
+        rollout-hash dedup set. Those are recorded for the groups this
+        environment actually proved and paid (``self._proven_groups``), so
+        the next window does not re-serve a prompt v6 already trained on.
+        Nothing is selected: the returned batch is empty, and the service's
+        ``sealed_dict`` is empty with it.
+        """
+        environment = str(getattr(self.env, "name", ""))
+        # Read the proven groups under the lock that guards them
+        # (``_reconcile_fill_state_decisions`` appends under
+        # ``fill_state.lock``), before taking ``self._lock`` — the two are
+        # never held together anywhere else and must not start here.
+        if self.fill_state is not None:
+            with self.fill_state.lock:
+                paid = list(self._proven_groups.get(environment, []))
+        else:
+            paid = list(self._proven_groups.get(environment, []))
+        with self._lock:
+            self.selection_metadata_by_id = {}
+            self.rewards_by_hotkey = {}
+            self.rewarded_but_not_selected_by_hotkey = {}
+            self._pending_seal_side_effects = _SealSideEffects(
+                rewarded_prompts=tuple(sorted({
+                    int(group.prompt_idx) for group in paid
+                })),
+                rewarded_contents=tuple(sorted({
+                    str(group.prompt_content_sha256)
+                    for group in paid
+                    if len(str(group.prompt_content_sha256)) == 64
+                })),
+                rollout_hashes=tuple(
+                    rollout_hash
+                    for group in paid
+                    for rollout_hash in group.rollout_hashes
+                ),
+            )
+            if commit_side_effects:
+                self._commit_seal_side_effects_locked()
+        return [], {}
+
     def _seal_batch_inner(
         self,
         pool: float = 1.0,
@@ -6373,7 +6430,14 @@ class GrpoWindowBatcher:
         Returns (training_batch, rewards_by_hotkey). Auction rewards are derived
         directly from the proven training winners; legacy mode retains its
         historical chronological split behavior.
+
+        Under v6 none of that happens here — see
+        ``_seal_fill_closed_window``.
         """
+        if FILL_CLOSED_ENABLED:
+            return self._seal_fill_closed_window(
+                commit_side_effects=commit_side_effects,
+            )
         if self.difficulty_auction_enabled:
             self._prove_ranked(pool)
             if self.proof_capacity_aborted:
