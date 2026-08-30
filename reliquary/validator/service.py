@@ -4567,13 +4567,20 @@ class ValidationService:
             )
             env_obj = self.envs.get(env_name, self.env)
             env_batch, env_rewards = sealed_dict.get(env_name, ([], {}))
+            # Parallel to ``env_batch``: which assembled batch paid each
+            # group, or None off the v6 path (v4/v5 pay once per window,
+            # so there is no batch to name and the field is not written).
+            paid_batch_indices: list[int | None] = [None] * len(env_batch)
             if FILL_CLOSED_ENABLED:
-                # R24: the paid set, not the auction's winners.
-                env_batch = list(fill_closed_batches.get(env_name, ()))
+                # R24: the paid set, not the auction's winners. R28: with
+                # the batch index each group was paid in.
+                paid = list(fill_closed_batches.get(env_name, ()))
+                env_batch = [group for _index, group in paid]
+                paid_batch_indices = [index for index, _group in paid]
 
             batched_keys = {(s.hotkey, s.prompt_idx) for s in env_batch}
 
-            for s in env_batch:
+            for paid_batch_index, s in zip(paid_batch_indices, env_batch):
                 try:
                     problem = env_obj.get_problem(s.prompt_idx)
                 except Exception:
@@ -4585,7 +4592,7 @@ class ValidationService:
                         s.prompt_idx,
                     )
                     problem = {}
-                batch_entries.append({
+                entry = {
                     "hotkey": s.hotkey,
                     "prompt_idx": s.prompt_idx,
                     "env_name": env_name,
@@ -4631,7 +4638,14 @@ class ValidationService:
                         s, "code_semantic_auth_positive_min_prob", None
                     ),
                     **_submission_obs_payload(s, batcher),
-                })
+                }
+                if paid_batch_index is not None:
+                    # R28: v6 pays per assembled batch, so a weight-only
+                    # validator replaying the map from ``eos_tokens`` has to
+                    # divide within each batch. Additive: v4/v5 entries and
+                    # older readers are untouched.
+                    entry["batch_index"] = int(paid_batch_index)
+                batch_entries.append(entry)
 
             # All validated submissions that didn't make the final batch —
             # metadata only (no rollouts/text, no prompt).

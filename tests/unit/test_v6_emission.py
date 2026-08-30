@@ -609,13 +609,18 @@ def _paid_valid_submission(prompt_idx, hotkey, eos_tokens):
     )
 
 
-def _single_env_assembler(monkeypatch, window=42):
+def _single_env_assembler(monkeypatch, window=42, b_batch=None):
+    from reliquary.validator import fill_closed_batch_assembler as module
     from reliquary.validator.fill_closed_batch_assembler import (
         FillClosedBatchAssembler,
     )
     import reliquary.infrastructure.training_payload_queue as queue_module
 
     monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
+    if b_batch is not None:
+        # Shrink a full batch so one window assembles several of them
+        # without fabricating 16 groups apiece.
+        monkeypatch.setattr(module, "B_BATCH", b_batch)
     return FillClosedBatchAssembler(
         window_start=window,
         env_order=["fake"],
@@ -652,18 +657,33 @@ async def test_the_archive_batch_is_the_assembler_paid_set(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_the_archived_batch_replays_the_reward_map(monkeypatch):
-    """A weight-only validator divides the pool over the archive's
-    ``eos_tokens``. That replay must land on the live map exactly."""
+async def test_the_archived_batch_replays_the_reward_map_per_batch(monkeypatch):
+    """R28: a weight-only validator divides the pool over the archive's
+    ``eos_tokens`` -- but payment is per assembled BATCH, so the replay
+    has to divide per batch too. The archive carries ``batch_index`` per
+    entry for exactly that; without it the replay is only right for a
+    single-batch window, which no real window is."""
     import reliquary.validator.service as service
     monkeypatch.setattr(service, "FILL_CLOSED_ENABLED", True)
 
-    assembler = _single_env_assembler(monkeypatch)
+    assembler = _single_env_assembler(monkeypatch, b_batch=3)
+    # Batch 0 fills on arrival at B_BATCH=3 and is written immediately.
     assembler.accept(
         "fake",
         [
-            _paid_valid_submission(101, "paid1", 1_000),
-            _paid_valid_submission(102, "paid2", 3_000),
+            _paid_valid_submission(101, "a", 1_000),
+            _paid_valid_submission(102, "b", 3_000),
+            _paid_valid_submission(103, "d", 4_000),
+        ],
+        42, "rev",
+    )
+    # Batch 1 is the partial remainder close() forces out at archive.
+    # "b" straddles the two batches -- the case a flat replay gets wrong.
+    assembler.accept(
+        "fake",
+        [
+            _paid_valid_submission(104, "b", 1_000),
+            _paid_valid_submission(105, "c", 1_000),
         ],
         42, "rev",
     )
@@ -671,16 +691,67 @@ async def test_the_archived_batch_replays_the_reward_map(monkeypatch):
     archive = await _archive_one_v6_window(assembler=assembler)
 
     entries = archive["batch"]
-    total = sum(int(e["eos_tokens"]) for e in entries)
-    env_batch_pool = 1.0 / 1 / FILL_CLOSED_EMISSIONS_PER_WINDOW
-    replayed = {
-        e["hotkey"]: env_batch_pool * int(e["eos_tokens"]) / total
-        for e in entries
-    }
+    assert {int(e["batch_index"]) for e in entries} == {0, 1}
     live = archive["rewards_by_hotkey"]
-    assert set(replayed) == set(live)
+
+    env_batch_pool = 1.0 / 1 / FILL_CLOSED_EMISSIONS_PER_WINDOW
+    by_batch: dict[int, list] = {}
+    for entry in entries:
+        by_batch.setdefault(int(entry["batch_index"]), []).append(entry)
+    replayed: dict[str, float] = {}
+    for batch in by_batch.values():
+        batch_tokens = sum(int(e["eos_tokens"]) for e in batch)
+        for entry in batch:
+            share = env_batch_pool * int(entry["eos_tokens"]) / batch_tokens
+            replayed[entry["hotkey"]] = (
+                replayed.get(entry["hotkey"], 0.0) + share
+            )
+
+    assert set(replayed) == set(live) == {"a", "b", "c", "d"}
     for hotkey, share in replayed.items():
         assert abs(share - live[hotkey]) < 1e-12
+
+
+@pytest.mark.asyncio
+async def test_a_flat_replay_of_a_multi_batch_window_is_wrong(monkeypatch):
+    """The counter-example R28 rests on: dividing the whole window's pool
+    over the whole window's tokens does NOT reproduce the live map once a
+    hotkey is paid in two batches. Pinned so a future reader cannot mistake
+    the single-batch case for the general one."""
+    import reliquary.validator.service as service
+    monkeypatch.setattr(service, "FILL_CLOSED_ENABLED", True)
+
+    assembler = _single_env_assembler(monkeypatch, b_batch=3)
+    assembler.accept(
+        "fake",
+        [
+            _paid_valid_submission(101, "a", 1_000),
+            _paid_valid_submission(102, "b", 3_000),
+            _paid_valid_submission(103, "d", 4_000),
+        ],
+        42, "rev",
+    )
+    assembler.accept(
+        "fake",
+        [
+            _paid_valid_submission(104, "b", 1_000),
+            _paid_valid_submission(105, "c", 1_000),
+        ],
+        42, "rev",
+    )
+
+    archive = await _archive_one_v6_window(assembler=assembler)
+
+    entries = archive["batch"]
+    live = archive["rewards_by_hotkey"]
+    window_pool = sum(live.values())
+    window_tokens = sum(int(e["eos_tokens"]) for e in entries)
+    flat: dict[str, float] = {}
+    for entry in entries:
+        share = window_pool * int(entry["eos_tokens"]) / window_tokens
+        flat[entry["hotkey"]] = flat.get(entry["hotkey"], 0.0) + share
+
+    assert abs(flat["b"] - live["b"]) > 1e-6
 
 
 # --- Minor: a duplicate payload digest is refused at precommit --------

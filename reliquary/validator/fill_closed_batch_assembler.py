@@ -83,12 +83,15 @@ class FillClosedBatchAssembler:
         self._window_pool = float(window_pool)
         self._rewards_by_hotkey: dict[str, float] = {}
         # R24: every group this window actually PAID, in payment order, per
-        # environment. The archive reads this in place of the auction's
+        # environment, each paired with the batch index it was paid in
+        # (R28). The archive reads this in place of the auction's
         # winners -- under v6 the seal path selects nothing, so a
         # weight-only validator replaying ``rewards_by_hotkey`` from
         # ``eos_tokens`` has to divide over exactly the set the live
-        # validator divided over.
-        self._paid_groups: dict[str, list[Any]] = {
+        # validator divided over, batch by batch: the pool is split per
+        # assembled batch, so a hotkey paid in two batches does not
+        # reproduce from one flat per-window division.
+        self._paid_groups: dict[str, list[tuple[int, Any]]] = {
             environment: [] for environment in self._env_order
         }
         self._accumulator = BalancedTrainingAccumulator(
@@ -241,7 +244,9 @@ class FillClosedBatchAssembler:
         # state" -- service.py), and a miner whose proven group happens
         # to share a batch with someone else's poisoned one must not
         # lose its pay for it.
-        self._accrue_payment_locked(window_batches)
+        self._accrue_payment_locked(
+            window_batches, batch_index=self.next_batch_index
+        )
         decision = assess_training_batch(flat_batch, reject_counts={})
         key = encoded_window_journal_key(
             self.window_start, self.next_batch_index
@@ -308,7 +313,7 @@ class FillClosedBatchAssembler:
         return _PreparedWrite(key, data, True, log_message)
 
     def _accrue_payment_locked(
-        self, window_batches: dict[str, list[Any]]
+        self, window_batches: dict[str, list[Any]], *, batch_index: int
     ) -> None:
         """Credit one assembled batch into this window's reward map (R20).
 
@@ -349,7 +354,9 @@ class FillClosedBatchAssembler:
             / FILL_CLOSED_EMISSIONS_PER_WINDOW
         )
         for environment, env_batch in window_batches.items():
-            self._paid_groups.setdefault(environment, []).extend(env_batch)
+            self._paid_groups.setdefault(environment, []).extend(
+                (int(batch_index), group) for group in env_batch
+            )
             shares = split_environment_pool(
                 [
                     AcceptedGroup(
@@ -384,13 +391,20 @@ class FillClosedBatchAssembler:
         with self._lock:
             return dict(self._rewards_by_hotkey)
 
-    def paid_groups(self) -> dict[str, list[Any]]:
-        """The groups this window's reward map was computed over (R24).
+    def paid_groups(self) -> dict[str, list[tuple[int, Any]]]:
+        """The groups this window's reward map was computed over (R24),
+        each as ``(batch_index, group)`` (R28).
 
         Complete once ``close()`` has returned, exactly like
         ``reward_map()`` -- the two are written in the same critical
         section, so the archive can never carry a payment whose group is
         missing or a group that was never paid.
+
+        The batch index is not decoration: ``_accrue_payment_locked``
+        splits ``pool / n_envs / EMISSIONS`` WITHIN each batch, so the
+        archive's replay has to group by it. Divide one window's whole
+        pool over one window's whole token mass and any hotkey paid in
+        two batches comes out wrong.
         """
         with self._lock:
             return {
