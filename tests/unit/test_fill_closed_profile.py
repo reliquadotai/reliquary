@@ -69,3 +69,49 @@ def test_the_capability_cannot_be_armed_under_a_non_v6_profile():
         env=v6_env,
     )
     assert v6_result.stdout.strip() == "True"
+
+
+def _constants_under(**env_overrides):
+    """Import ``reliquary.constants`` in a fresh interpreter under a v6
+    profile plus ``env_overrides``. Returns the CompletedProcess."""
+    base_env = {
+        k: v for k, v in os.environ.items() if not k.startswith("RELIQUARY_")
+    }
+    base_env["RELIQUARY_PROTOCOL_PROFILE"] = "qwen3-4b-base-dapo-fill-closed-v6"
+    base_env["RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED"] = "1"
+    base_env.update(env_overrides)
+    return subprocess.run(
+        [
+            sys.executable, "-c",
+            "from reliquary import constants as c; "
+            "print(c.FILL_CLOSED_TARGET_GROUPS_PER_ENV, "
+            "c.FILL_CLOSED_EMISSIONS_PER_WINDOW, c.B_BATCH)",
+        ],
+        capture_output=True, text=True, env=base_env,
+    )
+
+
+def test_the_default_target_sits_exactly_on_the_emission_ceiling():
+    """The target is what one window's key range can actually hold: every
+    emission is one B_BATCH-per-environment batch, and a window owns
+    FILL_CLOSED_EMISSIONS_PER_WINDOW keys."""
+    result = _constants_under()
+
+    assert result.returncode == 0, result.stderr
+    target, emissions, b_batch = (int(x) for x in result.stdout.split())
+    assert target == emissions * b_batch
+
+
+def test_a_target_past_the_emission_ceiling_refuses_to_import():
+    """I2: the target is env-overridable, the emission count is a literal.
+    Raising the target alone lets a window fill past its own key range --
+    ``encoded_window_journal_key`` then raises ValueError from
+    ``FillClosedBatchAssembler`` on a PROOF thread, which faults the whole
+    proof plane. Fail at import, where an operator can read the message."""
+    result = _constants_under(
+        RELIQUARY_FILL_CLOSED_TARGET_GROUPS_PER_ENV="100000",
+    )
+
+    assert result.returncode != 0
+    assert "FILL_CLOSED_EMISSIONS_PER_WINDOW" in result.stderr
+    assert "journal" in result.stderr

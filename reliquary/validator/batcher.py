@@ -1433,6 +1433,62 @@ class GrpoWindowBatcher:
         """Whether the generation/commit phase has reached its fixed cutoff."""
         return self._time_fn() - self.window_opened_at >= self.collection_seconds
 
+    def _count_eos_completion_tokens(self, request) -> int:
+        """EOS-terminated completion tokens for the direct admission path.
+
+        I1. The process-isolated path already carries this on
+        ``PreparedSubmission`` (``admission.count_eos_completion_tokens``,
+        computed where the worker's ``AdmissionContext`` lives). The
+        compatibility path in ``_accept_locked`` has no worker and no
+        context, so it resolves the same few fields the predicate actually
+        reads -- the EOS ids, the environment, and the ``</think>`` ids the
+        BFT cap shapes are recognised by -- and calls the SAME function, so
+        the two paths cannot drift on what counts as a paid token.
+
+        Gated (R21): v4/v5 pay a flat slot share, so they must not spend an
+        extra ``_classify_termination`` pass per submission, and their
+        archives carry 0. Best-effort on the tokenizer: a resolution failure
+        degrades to an empty EOS set, which the counter reads as 0 rather
+        than crashing admission.
+        """
+        if not FILL_CLOSED_ENABLED:
+            return 0
+        from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
+        from reliquary.shared.modeling import (
+            resolve_eos_token_ids,
+            think_close_token_ids,
+        )
+        from reliquary.validator.admission import (
+            AdmissionContext,
+            count_eos_completion_tokens,
+        )
+
+        try:
+            eos_ids = tuple(sorted(
+                resolve_eos_token_ids(self.model, self.tokenizer) or ()
+            ))
+        except Exception:
+            eos_ids = ()
+        if not eos_ids:
+            return 0
+        try:
+            think_close_ids = tuple(think_close_token_ids(self.tokenizer))
+        except Exception:
+            think_close_ids = ()
+        context = AdmissionContext(
+            randomness=str(self.randomness or ""),
+            environment=str(getattr(self.env, "name", "")),
+            vocab_size=None,
+            max_sequence_length=MAX_NEW_TOKENS_PROTOCOL_CAP,
+            eos_token_ids=eos_ids,
+            canonical_force_ids=(),
+            think_close_ids=think_close_ids,
+            bootstrap=bool(self.bootstrap),
+            enforce_envelope_signature=False,
+            enforce_legacy_merkle=False,
+        )
+        return count_eos_completion_tokens(request, context)
+
     def _register_payload_digest(self, digest: str) -> bool:
         """Record a submission payload digest for this window.
 
@@ -3833,6 +3889,10 @@ class GrpoWindowBatcher:
             drand_round=request.drand_round,
             merkle_root=bytes.fromhex(request.merkle_root),
             selection_digest=compute_rollouts_selection_digest(request.rollouts),
+            # I1: the prepared path sets this from the admission worker's own
+            # count; this compatibility path has to produce it itself, or
+            # every group admitted here is paid 0 by the token split.
+            eos_tokens=self._count_eos_completion_tokens(request),
             prompt_content_sha256=prompt_content_sha256(
                 str(getattr(self.env, "name", "")),
                 render_canonical_prompt(

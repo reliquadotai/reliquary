@@ -525,3 +525,75 @@ async def test_the_archive_closes_the_window_it_is_archiving(monkeypatch):
     archive = await _archive_one_v6_window(assembler=assembler)
 
     assert set(archive["rewards_by_hotkey"]) == {"mather", "coder"}
+
+
+# --- I1: the direct admission path must carry eos_tokens too ----------
+
+
+def _eos_terminated_request(prompt_idx=11, hotkey="miner"):
+    """A ``_request`` whose every rollout ends on the tokenizer's EOS id
+    (99, see ``_make_batcher``'s default tokenizer)."""
+    from tests.unit.test_grpo_window_batcher import _request
+
+    request = _request(prompt_idx=prompt_idx, hotkey=hotkey)
+    for rollout in request.rollouts:
+        tokens = list(rollout.commit["tokens"]) + [99]
+        rollout.tokens = tokens
+        rollout.commit["tokens"] = tokens
+        meta = rollout.commit["rollout"]
+        meta["completion_length"] = int(meta["completion_length"]) + 1
+        rollout.commit["commitments"] = [{"sketch": 0} for _ in tokens]
+        meta["token_logprobs"] = [0.0] * len(tokens)
+    return request
+
+
+def _arm_direct_path(monkeypatch):
+    import reliquary.validator.admission as admission_module
+    import reliquary.validator.batcher as batcher_module
+
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+    monkeypatch.setattr(admission_module, "FILL_CLOSED_ENABLED", True)
+
+
+def test_a_group_through_the_direct_path_is_paid(monkeypatch):
+    """I1: ``_accept_locked`` -- the compatibility path for callers that do
+    not go through the process-isolated admission worker -- built its
+    ``PendingSubmission`` without ``eos_tokens``, so every group admitted
+    through it defaulted to 0 and the token split paid it nothing."""
+    from tests.unit.test_grpo_window_batcher import _make_batcher
+
+    _arm_direct_path(monkeypatch)
+    batcher = _make_batcher()
+    batcher.difficulty_auction_enabled = True
+
+    response = batcher.accept_submission(_eos_terminated_request())
+
+    assert response.accepted is True
+    assert batcher.pending_submissions()[-1].eos_tokens > 0
+
+
+def test_the_direct_path_counts_nothing_when_the_gate_is_off():
+    """R21: v4/v5 must not spend a third ``_classify_termination`` pass per
+    submission, and their archives carry 0."""
+    from tests.unit.test_grpo_window_batcher import _make_batcher
+
+    batcher = _make_batcher()
+    batcher.difficulty_auction_enabled = True
+
+    batcher.accept_submission(_eos_terminated_request())
+
+    assert batcher.pending_submissions()[-1].eos_tokens == 0
+
+
+def test_the_direct_path_pays_only_genuine_eos_terminations(monkeypatch):
+    """The same restriction the prepared path enforces: a rollout that ran
+    to the cap without EOS contributes no paid tokens."""
+    from tests.unit.test_grpo_window_batcher import _make_batcher, _request
+
+    _arm_direct_path(monkeypatch)
+    batcher = _make_batcher()
+    batcher.difficulty_auction_enabled = True
+
+    batcher.accept_submission(_request(prompt_idx=12, hotkey="capper"))
+
+    assert batcher.pending_submissions()[-1].eos_tokens == 0

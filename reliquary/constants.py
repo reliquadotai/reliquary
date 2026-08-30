@@ -765,6 +765,27 @@ if FILL_CLOSED_TARGET_GROUPS_PER_ENV <= 0:
 # a window can actually produce.
 FILL_CLOSED_EMISSIONS_PER_WINDOW = CHECKPOINT_PUBLISH_INTERVAL_WINDOWS
 
+# The two must stay in step, and only one of them is env-overridable. A
+# window can emit at most FILL_CLOSED_EMISSIONS_PER_WINDOW batches of
+# B_BATCH groups per environment, which is exactly the key range
+# ``encoded_window_journal_key`` reserves for it. Raise the target past
+# that and the window fills past its own range: the assembler asks for
+# batch_index == FILL_CLOSED_EMISSIONS_PER_WINDOW and the encoder raises
+# ValueError -- on a PROOF-worker thread, which escalates to a scheduler
+# fault and a validator restart. Fail here instead, at import, where the
+# operator who set the variable can read why.
+if (
+    FILL_CLOSED_TARGET_GROUPS_PER_ENV
+    > FILL_CLOSED_EMISSIONS_PER_WINDOW * B_BATCH
+):
+    raise ValueError(
+        "RELIQUARY_FILL_CLOSED_TARGET_GROUPS_PER_ENV="
+        f"{FILL_CLOSED_TARGET_GROUPS_PER_ENV} exceeds "
+        f"FILL_CLOSED_EMISSIONS_PER_WINDOW ({FILL_CLOSED_EMISSIONS_PER_WINDOW})"
+        f" * B_BATCH ({B_BATCH}); a window would fill past the journal key "
+        "range reserved for it and the encoder would raise on a proof thread"
+    )
+
 # Backstop only. A window normally ends on its fill; this stops a stalled
 # fleet holding one open forever, and seals whatever is proven.
 FILL_CLOSED_MAX_SECONDS = float(_os.environ.get(
