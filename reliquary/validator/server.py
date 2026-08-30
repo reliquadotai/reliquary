@@ -4624,6 +4624,10 @@ class ValidatorServer:
                     request.miner_hotkey,
                     t_arrival_wall=commit_received_at,
                     payload_bytes=request.payload_bytes,
+                    # v6 content dedup: the precommit commits to the exact
+                    # serialized reveal, so a duplicate is refused here
+                    # rather than after the body has been uploaded.
+                    payload_sha256=request.payload_sha256,
                 )
             except Exception:
                 cancel_circuit_canaries()
@@ -4646,6 +4650,10 @@ class ValidatorServer:
                     "collection_sealed",
                 }:
                     reason = RejectReason.PRECOMMIT_EXPIRED
+                elif register_reason == "precommit_duplicate_payload":
+                    # Terminal and self-describing on the wire: this exact
+                    # payload was already precommitted this window.
+                    reason = RejectReason.HASH_DUPLICATE
                 else:
                     reason = RejectReason.BATCH_FILLED
                 return reject(reason)

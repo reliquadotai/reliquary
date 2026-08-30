@@ -1926,12 +1926,20 @@ class GrpoWindowBatcher:
         *,
         t_arrival_wall: float,
         payload_bytes: int,
+        payload_sha256: str = "",
     ) -> tuple[bool, str | None, float | None]:
         """Reserve one bounded reveal received before collection closes.
 
         Returns ``(accepted, reason, monotonic_deadline)``.  This reservation is
         deliberately separate from economic operator/prompt claims: a miner that
         never uploads cannot squat an auction prompt.
+
+        ``payload_sha256`` is the precommit's own commitment to the exact
+        serialized reveal. Under v6 it is the content-dedup key: per-token
+        payment makes a resubmitted group collect the SAME tokens twice,
+        where the flat slot share merely cost it a slot. The digest is
+        already in hand here, before any payload moves or capacity is
+        reserved, so the refusal is free.
         """
         if not self.difficulty_auction_enabled:
             return False, "precommit_requires_auction", None
@@ -1958,6 +1966,17 @@ class GrpoWindowBatcher:
             operator = self._operator_for_hotkey(hotkey)
             if operator is None:
                 reason = "precommit_operator_unmapped"
+                self._record_upload_precommit_rejection_locked(reason)
+                return False, reason, None
+            # v6 only. Content dedup becomes monetary (spec Component 3):
+            # refuse a payload digest this window has already seen, before
+            # any capacity is reserved and before the body is uploaded.
+            if (
+                FILL_CLOSED_ENABLED
+                and payload_sha256
+                and not self._register_payload_digest(str(payload_sha256))
+            ):
+                reason = "precommit_duplicate_payload"
                 self._record_upload_precommit_rejection_locked(reason)
                 return False, reason, None
             hotkey_count = sum(

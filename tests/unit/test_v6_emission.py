@@ -681,3 +681,64 @@ async def test_the_archived_batch_replays_the_reward_map(monkeypatch):
     assert set(replayed) == set(live)
     for hotkey, share in replayed.items():
         assert abs(share - live[hotkey]) < 1e-12
+
+
+# --- Minor: a duplicate payload digest is refused at precommit --------
+
+
+def _precommit_batcher(monkeypatch=None):
+    from tests.unit.test_grpo_window_batcher import _make_batcher
+
+    batcher = _make_batcher()
+    batcher.difficulty_auction_enabled = True
+    batcher._operator_for_hotkey = lambda hotkey: f"op-{hotkey}"
+    return batcher
+
+
+def _precommit(batcher, receipt_id, digest, hotkey="miner"):
+    return batcher.try_register_upload_precommit(
+        receipt_id,
+        hotkey,
+        t_arrival_wall=batcher.window_opened_wall_ts,
+        payload_bytes=1234,
+        payload_sha256=digest,
+    )
+
+
+def test_a_duplicate_payload_digest_is_refused_before_upload(monkeypatch):
+    """Under the flat slot share a resubmitted group won a duplicate slot at
+    worst; under per-token payment it collects the SAME tokens twice. The
+    precommit already carries the digest, so the refusal costs nothing and
+    lands before any payload moves."""
+    import reliquary.validator.batcher as batcher_module
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+
+    batcher = _precommit_batcher()
+    digest = "ab" * 32
+
+    assert _precommit(batcher, "r1", digest)[0] is True
+    accepted, reason, deadline = _precommit(batcher, "r2", digest)
+
+    assert accepted is False
+    assert reason == "precommit_duplicate_payload"
+    assert deadline is None
+
+
+def test_a_distinct_payload_digest_is_still_accepted(monkeypatch):
+    import reliquary.validator.batcher as batcher_module
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+
+    batcher = _precommit_batcher()
+
+    assert _precommit(batcher, "r1", "ab" * 32)[0] is True
+    assert _precommit(batcher, "r2", "cd" * 32)[0] is True
+
+
+def test_the_digest_guard_is_inert_when_the_gate_is_off():
+    """v4/v5 keep their behaviour byte for byte: the flat slot share made a
+    resubmission cost a slot, not a second payment."""
+    batcher = _precommit_batcher()
+    digest = "ab" * 32
+
+    assert _precommit(batcher, "r1", digest)[0] is True
+    assert _precommit(batcher, "r2", digest)[0] is True
