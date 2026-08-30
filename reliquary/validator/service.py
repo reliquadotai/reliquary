@@ -4880,6 +4880,16 @@ class ValidationService:
 
         if not WRITE_TRAINING_PAYLOADS:
             return
+        if FILL_CLOSED_ENABLED:
+            # C2. This enqueues under the BARE window number, but under v6
+            # the journal key space is window * FILL_CLOSED_EMISSIONS_PER_
+            # WINDOW + batch_index -- so a raw-key write for window w lands
+            # in window w // EMISSIONS's first slot, on top of whatever the
+            # assembler put there. The window's payloads were already
+            # written, batch by batch, by FillClosedBatchAssembler under
+            # their own encoded keys (R13); the seal path has nothing to
+            # add and nowhere valid to put it.
+            return
         from reliquary.shared.training_payload import encode_training_payload
 
         try:
@@ -4970,6 +4980,11 @@ class ValidationService:
             window_start,
             plan=checkpoint_epoch_plan,
         )
+        if FILL_CLOSED_ENABLED and checkpoint_epoch is None:
+            self._write_fill_closed_window_tombstones(
+                int(window_start), str(failure_stage), str(failure_type),
+            )
+            return
         try:
             if checkpoint_epoch is not None:
                 self._training_tombstoned_windows.add(int(window_start))
@@ -5064,6 +5079,53 @@ class ValidationService:
             get_training_payload_queue,
         )
         return get_training_payload_queue()
+
+    def _write_fill_closed_window_tombstones(
+        self,
+        window_start: int,
+        failure_stage: str,
+        failure_type: str,
+    ) -> None:
+        """C2: mark a failed v6 window across its WHOLE encoded key range.
+
+        ``WindowJournal.next_entry`` walks the encoded key space one integer
+        at a time and never advances on absence, only on an explicit marker
+        (journal.py). A v6 window owns
+        ``FILL_CLOSED_EMISSIONS_PER_WINDOW`` consecutive keys, so the seal
+        path's single raw-key tombstone leaves that whole range unwritten
+        and parks the trainer's cursor on the first hole forever -- it would
+        never reach any later window either.
+
+        Padding starts at the assembler's ``next_batch_index``: a window can
+        abort AFTER emitting real batches, and those slots already hold
+        payloads. This is the same rule ``FillClosedBatchAssembler.close()``
+        applies at a normal close (R18), reached here for the windows that
+        never get to close.
+        """
+        from reliquary.constants import FILL_CLOSED_EMISSIONS_PER_WINDOW
+        from reliquary.infrastructure.training_payload_queue import (
+            encoded_window_journal_key,
+        )
+        from reliquary.shared.training_payload import encode_tombstone
+
+        assembler = self._fill_closed_assemblers.get(int(window_start))
+        first_index = max(
+            0, int(getattr(assembler, "next_batch_index", 0) or 0)
+        )
+        data = encode_tombstone(
+            window_start=int(window_start),
+            failure_stage=str(failure_stage),
+            failure_type=str(failure_type),
+        )
+        for index in range(first_index, FILL_CLOSED_EMISSIONS_PER_WINDOW):
+            key = encoded_window_journal_key(int(window_start), index)
+            try:
+                self._training_payload_queue_ref().enqueue_tombstone(key, data)
+            except Exception:
+                logger.exception(
+                    "fill-closed window tombstone write failed for journal "
+                    "key %s", key,
+                )
 
     def _write_fill_closed_training_payload(
         self, key: int, data: bytes,
@@ -5166,6 +5228,11 @@ class ValidationService:
         self._write_training_tombstone(
             window_start, failure_stage, failure_type,
         )
+        # An aborted window never reaches ``_archive_window``, the only other
+        # place an assembler is popped; without this the dict keeps one dead
+        # assembler per consecutive abort. Dropped AFTER the tombstones above,
+        # which read its ``next_batch_index`` to know where padding starts.
+        self._fill_closed_assemblers.pop(window_start, None)
         env_names = list(batchers)
         validator_hotkey = str(
             getattr(getattr(getattr(self, "wallet", None), "hotkey", None),
