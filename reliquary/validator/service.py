@@ -5131,7 +5131,9 @@ class ValidationService:
         )
         from reliquary.shared.training_payload import encode_tombstone
 
-        assembler = self._fill_closed_assemblers.get(int(window_start))
+        assembler = getattr(self, "_fill_closed_assemblers", {}).get(
+            int(window_start)
+        )
         first_index = max(
             0, int(getattr(assembler, "next_batch_index", 0) or 0)
         )
@@ -5255,7 +5257,9 @@ class ValidationService:
         # place an assembler is popped; without this the dict keeps one dead
         # assembler per consecutive abort. Dropped AFTER the tombstones above,
         # which read its ``next_batch_index`` to know where padding starts.
-        self._fill_closed_assemblers.pop(window_start, None)
+        # ``getattr`` for the same reason the dedup set above uses it: test
+        # stubs and partially-built services call this method too.
+        getattr(self, "_fill_closed_assemblers", {}).pop(window_start, None)
         env_names = list(batchers)
         validator_hotkey = str(
             getattr(getattr(getattr(self, "wallet", None), "hotkey", None),
