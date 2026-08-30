@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from reliquary.constants import BFT_ANSWER_BUDGET, BFT_THINKING_BUDGET
 from reliquary.validator.admission import AdmissionContext
 from reliquary.validator.batch_selection import select_batch_and_distribute
 from reliquary.validator.batcher import PendingSubmission
@@ -61,7 +62,9 @@ def test_the_auction_path_is_untouched_when_the_gate_is_off():
     assert rewards["short"] == rewards["long"]
 
 
-def _context(eos_token_ids=(99,), environment="openmathinstruct"):
+def _context(
+    eos_token_ids=(99,), environment="openmathinstruct", think_close_ids=(),
+):
     return AdmissionContext(
         randomness="cd" * 16,
         environment=environment,
@@ -69,36 +72,29 @@ def _context(eos_token_ids=(99,), environment="openmathinstruct"):
         max_sequence_length=4096,
         eos_token_ids=eos_token_ids,
         canonical_force_ids=(),
-        think_close_ids=(),
+        think_close_ids=think_close_ids,
         bootstrap=False,
         enforce_envelope_signature=False,
         enforce_legacy_merkle=False,
     )
 
 
-def test_eos_tokens_are_counted_at_admission_and_exclude_cap_hits(monkeypatch):
-    """One EOS-terminated rollout of N tokens, one cap-hit rollout: only the
-    EOS-terminated one pays, and the count lands on PendingSubmission."""
+def test_eos_tokens_are_counted_at_admission_and_land_on_the_submission(
+    monkeypatch,
+):
+    """One EOS-terminated rollout of N tokens: it pays N, and the count is
+    carried on PendingSubmission rather than recomputed downstream."""
     import reliquary.validator.admission as admission
+    monkeypatch.setattr(admission, "FILL_CLOSED_ENABLED", True)
 
     context = _context()
-    # Cap-hit classification needs prompt_length + completion_length to
-    # reach the protocol cap without an EOS token present.
-    monkeypatch.setattr(admission, "max_new_tokens_for_environment", lambda env: 8)
-
     eos_terminated = SimpleNamespace(
         commit={
             "tokens": [1, 2, 3, 4, 5, 99],
             "rollout": {"prompt_length": 1, "completion_length": 5},
         }
     )
-    cap_hit = SimpleNamespace(
-        commit={
-            "tokens": [1] + [7] * 8,
-            "rollout": {"prompt_length": 1, "completion_length": 8},
-        }
-    )
-    request = SimpleNamespace(rollouts=[eos_terminated, cap_hit])
+    request = SimpleNamespace(rollouts=[eos_terminated])
 
     eos_tokens = admission.count_eos_completion_tokens(request, context)
     assert eos_tokens == 5
@@ -107,13 +103,112 @@ def test_eos_tokens_are_counted_at_admission_and_exclude_cap_hits(monkeypatch):
         hotkey="hk",
         prompt_idx=1,
         request=request,
-        rewards=[1.0, 0.0],
+        rewards=[1.0],
         drand_round=0,
         merkle_root=b"\x00" * 32,
         selection_digest=b"\x00" * 32,
         eos_tokens=eos_tokens,
     )
     assert pending.eos_tokens == 5
+
+
+def _natural_cap_rollout():
+    """An ACCEPTED cap shape that never emitted an EOS token.
+
+    ``_classify_termination`` returns ``"ok"`` for this (see
+    ``_natural_cap_termination``): openmathinstruct, unforced, a completion
+    exactly BFT_THINKING_BUDGET + BFT_ANSWER_BUDGET long that fills the
+    token stream, with a think-close token inside phase one. It is
+    admitted and graded -- it simply never chose to stop.
+    """
+    completion = [7] + [3] * (BFT_THINKING_BUDGET + BFT_ANSWER_BUDGET - 1)
+    return SimpleNamespace(
+        commit={
+            "tokens": [1] + completion,
+            "rollout": {
+                "prompt_length": 1,
+                "completion_length": len(completion),
+            },
+        }
+    )
+
+
+def test_an_accepted_cap_shape_without_eos_pays_nothing(monkeypatch):
+    """The single property per-token payment rests on.
+
+    A rollout that ran to the budget without ever emitting EOS is still
+    ACCEPTED (``_classify_termination`` -> ``"ok"``), so it is not the
+    ``"truncated"`` reject shape. If it were paid for its length, padding
+    to the cap would earn the maximum per group and the strictly negative
+    margin on padding -- the reason the flat slot share could be removed
+    at all -- would invert.
+    """
+    import reliquary.validator.admission as admission
+    monkeypatch.setattr(admission, "FILL_CLOSED_ENABLED", True)
+
+    context = _context(think_close_ids=(7,))
+    cap_shape = _natural_cap_rollout()
+    # The shape is ACCEPTED, not rejected -- that is what makes it decisive.
+    assert admission._classify_termination(cap_shape, context) == "ok"
+
+    request = SimpleNamespace(rollouts=[cap_shape])
+    assert admission.count_eos_completion_tokens(request, context) == 0
+
+
+def test_a_declared_completion_length_cannot_inflate_the_payment(monkeypatch):
+    """Payment counts the validator's OWN slice, never a miner's number.
+
+    ``completion_length`` arrives in the miner's commit. Nothing on the
+    general path binds it to ``len(tokens)``, so a short EOS-terminated
+    rollout can declare a huge one; under a proportional split that buys
+    the pool.
+    """
+    import reliquary.validator.admission as admission
+    monkeypatch.setattr(admission, "FILL_CLOSED_ENABLED", True)
+
+    context = _context()
+    real_completion = [2] * 499 + [99]
+    inflated = SimpleNamespace(
+        commit={
+            "tokens": [1] + real_completion,
+            "rollout": {
+                "prompt_length": 1,
+                # Ten times the truth.
+                "completion_length": 10 * len(real_completion),
+            },
+        }
+    )
+    request = SimpleNamespace(rollouts=[inflated])
+
+    # Still admitted: the slice ends on EOS whatever the declaration says.
+    assert admission._classify_termination(inflated, context) == "ok"
+    assert admission.count_eos_completion_tokens(request, context) == 500
+
+
+def test_counting_is_gated_off_outside_v6(monkeypatch):
+    """v4/v5 pay a flat slot share, so they must not pay a third
+    ``_classify_termination`` pass per submission -- and their archives
+    carry ``eos_tokens=0``."""
+    import reliquary.validator.admission as admission
+    monkeypatch.setattr(admission, "FILL_CLOSED_ENABLED", False)
+
+    context = _context()
+    eos_terminated = SimpleNamespace(
+        commit={
+            "tokens": [1, 2, 3, 4, 5, 99],
+            "rollout": {"prompt_length": 1, "completion_length": 5},
+        }
+    )
+    calls = []
+    real = admission._classify_termination
+    monkeypatch.setattr(
+        admission, "_classify_termination",
+        lambda rollout, ctx: (calls.append(rollout), real(rollout, ctx))[1],
+    )
+
+    request = SimpleNamespace(rollouts=[eos_terminated])
+    assert admission.count_eos_completion_tokens(request, context) == 0
+    assert calls == []
 
 
 async def _archive_one_v6_window():

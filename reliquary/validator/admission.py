@@ -23,6 +23,7 @@ from reliquary.constants import (
     BOOTSTRAP_SIGMA_MIN,
     BFT_ANSWER_BUDGET,
     BFT_THINKING_BUDGET,
+    FILL_CLOSED_ENABLED,
     GRADER_EVAL_TIMEOUT_SECONDS,
     MATH_ANSWER_FORMAT,
     ROBUST_TRUNCATION_UTILITY_ENABLED,
@@ -477,7 +478,20 @@ def count_eos_completion_tokens(
     policy, not by the model choosing to stop. So a rollout contributes its
     completion length here iff it classifies ``"ok"`` AND its completion's
     final token is a genuine EOS token.
+
+    The length paid is ``len(completion)`` -- the validator's OWN slice of
+    the token stream -- never the miner-declared ``completion_length`` the
+    slice was taken with. Nothing on the general path binds that declaration
+    to ``len(tokens)``, so a 500-token rollout may declare 16000; under the
+    flat slot share that bought nothing, under a proportional split it would
+    buy the pool.
+
+    Gated on ``FILL_CLOSED_ENABLED`` (R21): only v6 pays per token, so v4/v5
+    must not spend a third ``_classify_termination`` pass per submission,
+    and their archives carry ``eos_tokens=0``.
     """
+    if not FILL_CLOSED_ENABLED:
+        return 0
     if not context.eos_token_ids:
         return 0
     eos_ids = set(context.eos_token_ids)
@@ -495,7 +509,7 @@ def count_eos_completion_tokens(
             continue
         completion = tokens[prompt_length: prompt_length + completion_length]
         if completion and int(completion[-1]) in eos_ids:
-            total += completion_length
+            total += len(completion)
     return total
 
 
