@@ -657,18 +657,21 @@ def test_close_drains_pending_before_deciding_the_remainder(monkeypatch):
     assert math_prompt_ids_seen == _prompt_ids(math_partial)
 
 
-def test_accept_after_close_raises_instead_of_merging_into_a_dead_assembler(
-    monkeypatch,
+def test_accept_after_close_records_the_straggler_instead_of_raising(
+    monkeypatch, caplog,
 ):
-    """R19: a straggler proof-worker callback landing after close() has
-    already run must be loud, not lost -- close() has already claimed
-    every key this window owns (the remainder plus R18's padding), so
-    quietly merging a late chunk into the accumulator would just leave
-    it unwritten and unread again, exactly the failure R16-R19 exist to
-    close.
+    """R19 (amended): a proof finishing just after the window seals is a
+    NORMAL race, not a fault -- raising here (the original R19) escalated
+    an ordinary timing race into a full proof-plane fault. A straggler
+    landing after close() must return normally, bump the straggler
+    counter (exposed via remainder_snapshot() for the service to carry
+    into the window's archive/telemetry), and log the loss at ERROR --
+    lost to training since the window is sealed, but never silent and
+    never a restart.
     """
+    import logging
+
     import reliquary.infrastructure.training_payload_queue as queue_module
-    import pytest
 
     monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
 
@@ -685,7 +688,29 @@ def test_accept_after_close_raises_instead_of_merging_into_a_dead_assembler(
     )
     assembler.close()
 
-    with pytest.raises(RuntimeError, match=str(window)):
+    straggler_chunk = _chunk(0, "opencodeinstruct")
+    with caplog.at_level(
+        logging.ERROR,
+        logger="reliquary.validator.fill_closed_batch_assembler",
+    ):
         assembler.accept(
-            "opencodeinstruct", _chunk(0, "opencodeinstruct"), window, "rev",
-        )
+            "opencodeinstruct", straggler_chunk, window, "rev",
+        )  # must NOT raise
+
+    assert any(
+        str(window) in record.getMessage()
+        and "opencodeinstruct" in record.getMessage()
+        and record.levelno == logging.ERROR
+        for record in caplog.records
+    )
+    stragglers = assembler.remainder_snapshot()["stragglers"]
+    assert stragglers["count"] == 1
+    assert stragglers["last_environment"] == "opencodeinstruct"
+
+    # A second straggler keeps counting rather than raising or resetting.
+    assembler.accept(
+        "opencodeinstruct", _chunk(1, "opencodeinstruct"), window, "rev",
+    )
+    assert (
+        assembler.remainder_snapshot()["stragglers"]["count"] == 2
+    )

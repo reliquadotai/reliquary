@@ -100,6 +100,14 @@ class FillClosedBatchAssembler:
         # call racing a final ``accept``) is a no-op rather than a second
         # payload/tombstone under the same batch index.
         self._closed = False
+        # R19 (amended): a straggler proof-worker callback landing after
+        # ``close()`` is a NORMAL race (a proof finishing just after the
+        # window seals), not a fault -- it is recorded here rather than
+        # raised, and exposed through ``remainder_snapshot()`` so the
+        # service can carry it into the window's own telemetry/archive.
+        self._straggler_count = 0
+        self._last_straggler_environment: str | None = None
+        self._last_straggler_batch_index: int | None = None
 
     def accept(
         self,
@@ -124,21 +132,36 @@ class FillClosedBatchAssembler:
                 f"assembler for window {self.window_start} received a "
                 f"chunk for window {window_start}"
             )
+        straggler_log_message: str | None = None
         with self._lock:
-            # R19: a straggler proof-worker callback landing after
-            # ``close()`` has already run must not merge silently into a
-            # dead assembler (close()'s own remainder/padding writes have
-            # already claimed every key this window owns) -- it must be
-            # loud. Checked under the SAME lock ``close()`` sets
-            # ``_closed`` under, so this can never race a concurrent
-            # ``close()`` into passing here right as the window shuts.
+            # R19 (amended): a straggler proof-worker callback landing
+            # after ``close()`` has already run is a NORMAL race -- a
+            # proof finishing just after the window sealed -- not a
+            # fault. Escalating it (the original R19 raised here) faulted
+            # the whole proof plane over an ordinary timing race. Checked
+            # under the SAME lock ``close()`` sets ``_closed`` under, so
+            # this can never race a concurrent ``close()`` into merging
+            # in right as the window shuts.
             if self._closed:
-                raise RuntimeError(
-                    f"assembler closed for window {self.window_start}"
+                self._straggler_count += 1
+                self._last_straggler_environment = environment
+                self._last_straggler_batch_index = self.next_batch_index
+                straggler_log_message = (
+                    "FillClosedBatchAssembler: straggler chunk for "
+                    "window %d env %s arrived after close() -- %d proven "
+                    "groups lost to training (window already sealed); "
+                    "straggler count now %d" % (
+                        self.window_start, environment, len(groups),
+                        self._straggler_count,
+                    )
                 )
-            self._checkpoint_revision = str(checkpoint_revision)
-            self._pending[environment].append(list(groups))
-            prepared = self._drain_locked()
+                prepared: list[_PreparedWrite] = []
+            else:
+                self._checkpoint_revision = str(checkpoint_revision)
+                self._pending[environment].append(list(groups))
+                prepared = self._drain_locked()
+        if straggler_log_message is not None:
+            logger.error(straggler_log_message)
         self._write_all(prepared)
 
     def _drain_locked(self) -> list[_PreparedWrite]:
@@ -289,9 +312,10 @@ class FillClosedBatchAssembler:
 
         Idempotent: a second call, or one racing a final in-flight
         ``accept``, is a no-op -- ``_closed`` is set under the same lock
-        that gates the decision of what (if anything) to write, and a
-        straggler ``accept`` landing after this point raises instead of
-        merging into a dead assembler (R19).
+        that gates the decision of what (if anything) to write. A
+        straggler ``accept`` landing after this point does NOT raise
+        (R19, amended): it is a normal race, not a fault, so it is
+        recorded (``remainder_snapshot()``) and logged at ERROR instead.
 
         R19: before deciding what the remainder even IS, this drains
         ``_pending`` the same way ``_drain_locked`` always does --
@@ -393,11 +417,30 @@ class FillClosedBatchAssembler:
         observability (R16: ``close()`` is now what disposes of this at
         window seal -- a full accumulator cycle emitted as a partial
         batch, or tombstoned -- so by the time a caller reads this after
-        ``close()`` has run, it reports an empty remainder)."""
+        ``close()`` has run, it reports an empty remainder).
+
+        ``stragglers`` (R19, amended): a proof-worker callback landing
+        after ``close()`` no longer raises -- it is a normal race, not a
+        fault -- so this is the one place that race becomes observable
+        again, for the service to carry into the window's own
+        telemetry/archive. ``count`` is 0 until the first straggler ever
+        lands; ``last_environment``/``last_batch_index`` identify the
+        most recent one only (not a full log -- see the ERROR-level log
+        line for a per-occurrence record).
+        """
         with self._lock:
             counts = self._accumulator.snapshot()["counts"]
             pending = {
                 environment: len(chunks)
                 for environment, chunks in self._pending.items()
             }
-        return {"in_accumulator": dict(counts), "pending": pending}
+            stragglers = {
+                "count": self._straggler_count,
+                "last_environment": self._last_straggler_environment,
+                "last_batch_index": self._last_straggler_batch_index,
+            }
+        return {
+            "in_accumulator": dict(counts),
+            "pending": pending,
+            "stragglers": stragglers,
+        }
