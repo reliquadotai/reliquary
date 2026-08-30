@@ -757,10 +757,10 @@ async def test_a_flat_replay_of_a_multi_batch_window_is_wrong(monkeypatch):
 # --- Minor: a duplicate payload digest is refused at precommit --------
 
 
-def _precommit_batcher(monkeypatch=None):
+def _precommit_batcher(monkeypatch=None, **overrides):
     from tests.unit.test_grpo_window_batcher import _make_batcher
 
-    batcher = _make_batcher()
+    batcher = _make_batcher(**overrides)
     batcher.difficulty_auction_enabled = True
     batcher._operator_for_hotkey = lambda hotkey: f"op-{hotkey}"
     return batcher
@@ -813,3 +813,63 @@ def test_the_digest_guard_is_inert_when_the_gate_is_off():
 
     assert _precommit(batcher, "r1", digest)[0] is True
     assert _precommit(batcher, "r2", digest)[0] is True
+
+
+# --- R29: an expired precommit gives its payload digest back ----------
+
+
+def test_an_expired_precommit_releases_its_payload_digest(monkeypatch):
+    """The digest is burned at precommit-ACCEPT, before the body has moved.
+    A miner whose upload fails and whose receipt then expires must be able
+    to retry the same body: otherwise it is locked out for the rest of the
+    window, the exact shape of the no-reveal circuit regression that made
+    100% of ``rate_limited`` rejects honest operators."""
+    import reliquary.validator.batcher as batcher_module
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+
+    clock = [1_000.0]
+    batcher = _precommit_batcher(time_fn=lambda: clock[0])
+    digest = "ab" * 32
+
+    accepted, _reason, deadline = _precommit(batcher, "r1", digest)
+    assert accepted is True
+
+    # The upload never lands; the receipt ages past its own deadline and is
+    # pruned on the next registration.
+    clock[0] = float(deadline) + 1.0
+
+    assert _precommit(batcher, "r2", digest)[0] is True
+
+
+def test_an_explicitly_expired_precommit_releases_its_digest(monkeypatch):
+    """Same release on the caller-driven expiry path (the seal drain and
+    ``resolve_upload_precommit(expired=True)``), not just the pruner."""
+    import reliquary.validator.batcher as batcher_module
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+
+    batcher = _precommit_batcher()
+    digest = "ab" * 32
+
+    assert _precommit(batcher, "r1", digest)[0] is True
+    assert batcher.resolve_upload_precommit("r1", expired=True) is True
+
+    assert _precommit(batcher, "r2", digest)[0] is True
+
+
+def test_a_revealed_precommit_keeps_its_digest_burned(monkeypatch):
+    """The dedup itself must survive: once the body has been revealed, the
+    same digest is a resubmission collecting the same tokens twice, however
+    the receipt ends afterwards."""
+    import reliquary.validator.batcher as batcher_module
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+
+    batcher = _precommit_batcher()
+    digest = "ab" * 32
+
+    assert _precommit(batcher, "r1", digest)[0] is True
+    assert batcher.mark_upload_precommit_revealed("r1") is True
+    assert batcher.resolve_upload_precommit("r1", expired=True) is True
+
+    accepted, reason, _deadline = _precommit(batcher, "r2", digest)
+    assert accepted is False
+    assert reason == "precommit_duplicate_payload"

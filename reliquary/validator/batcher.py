@@ -741,6 +741,9 @@ class _UploadPrecommitReservation:
     accounted_payload_bytes: int = 0
     revealed: bool = False
     payload_transferred: bool = False
+    # The digest burned for this receipt at accept, carried so an expiry
+    # can give it back (R29). Empty off the v6 path, where nothing burns.
+    payload_sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -1503,6 +1506,20 @@ class GrpoWindowBatcher:
         self._payload_digests_seen.add(digest)
         return True
 
+    def _release_payload_digest(self, digest: str) -> None:
+        """Give a digest back to the window (R29).
+
+        The burn happens at precommit-ACCEPT, before a single byte of the
+        body has moved -- so a receipt that never delivers one has taken a
+        digest out of circulation for nothing. An honest miner retrying the
+        same body after a failed upload would be refused HASH_DUPLICATE for
+        the rest of the window: the same lockout shape as the no-reveal
+        circuit, where every ``rate_limited`` reject turned out to be an
+        honest operator. A REVEALED precommit keeps its burn -- that one IS
+        the dedup, and the tokens behind it were already paid for.
+        """
+        self._payload_digests_seen.discard(str(digest))
+
     def _extend_proof_plan(self, candidates: list[RankedProof]) -> None:
         """Hand newly-admitted candidates to this window's open-ended plan.
 
@@ -1916,6 +1933,10 @@ class GrpoWindowBatcher:
                 )
         if expired:
             self._upload_precommit_expired += 1
+            if not reservation.revealed and reservation.payload_sha256:
+                # R29: nothing was ever revealed under this digest, so it
+                # must not stay burned for the rest of the window.
+                self._release_payload_digest(reservation.payload_sha256)
         else:
             self._upload_precommit_terminal += 1
 
@@ -2009,6 +2030,13 @@ class GrpoWindowBatcher:
                     operator=operator,
                     deadline=deadline,
                     payload_bytes=payload_bytes,
+                    # Carried so an expiry releases exactly what was burned
+                    # above (R29); only set when the burn actually happened.
+                    payload_sha256=(
+                        str(payload_sha256)
+                        if FILL_CLOSED_ENABLED and payload_sha256
+                        else ""
+                    ),
                 )
             )
             self._upload_precommit_accepted += 1
