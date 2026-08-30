@@ -4,7 +4,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from reliquary.constants import BFT_ANSWER_BUDGET, BFT_THINKING_BUDGET
+from reliquary.constants import (
+    BFT_ANSWER_BUDGET,
+    BFT_THINKING_BUDGET,
+    FILL_CLOSED_EMISSIONS_PER_WINDOW,
+)
 from reliquary.validator.admission import AdmissionContext
 from reliquary.validator.batch_selection import select_batch_and_distribute
 from reliquary.validator.batcher import PendingSubmission
@@ -279,7 +283,136 @@ def test_counting_is_gated_off_outside_v6(monkeypatch):
     assert calls == []
 
 
-async def _archive_one_v6_window():
+# --- R20: payment lives in the assembler, not the seal path ------------
+
+ENV_ORDER = ["openmathinstruct", "opencodeinstruct"]
+
+
+def _paying_group(env, hotkey, eos_tokens, prompt_idx):
+    from tests.unit.test_training_payload_codec import _group, _roll
+
+    group = _group([_roll(1.0, 4, env=env)], prompt_idx=prompt_idx)
+    group.hotkey = hotkey
+    group.eos_tokens = eos_tokens
+    return group
+
+
+def _assembler(monkeypatch, window=42, window_pool=1.0):
+    from reliquary.validator.fill_closed_batch_assembler import (
+        FillClosedBatchAssembler,
+    )
+    import reliquary.infrastructure.training_payload_queue as queue_module
+
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
+    return FillClosedBatchAssembler(
+        window_start=window,
+        env_order=ENV_ORDER,
+        enqueue_fn=lambda key, data: None,
+        tombstone_fn=lambda key, data: None,
+        window_pool=window_pool,
+    )
+
+
+def _one_batch(assembler, math_groups, code_groups, window=42):
+    """Force exactly one assembled batch out of partial chunks."""
+    assembler.accept("openmathinstruct", math_groups, window, "rev")
+    assembler.accept("opencodeinstruct", code_groups, window, "rev")
+    assembler.close()
+
+
+def test_the_assembler_splits_a_batch_pool_by_eos_tokens(monkeypatch):
+    """R20 + R15: nine times the tokens, nine times the share."""
+    assembler = _assembler(monkeypatch)
+    _one_batch(
+        assembler,
+        [
+            _paying_group("openmathinstruct", "short", 1_000, 1),
+            _paying_group("openmathinstruct", "long", 9_000, 2),
+        ],
+        [_paying_group("opencodeinstruct", "coder", 5_000, 3)],
+    )
+
+    rewards = assembler.reward_map()
+    # One batch draws window_pool / envs / emissions-per-window per env.
+    env_batch_pool = 1.0 / len(ENV_ORDER) / FILL_CLOSED_EMISSIONS_PER_WINDOW
+    assert abs(rewards["short"] - 0.1 * env_batch_pool) < 1e-12
+    assert abs(rewards["long"] - 0.9 * env_batch_pool) < 1e-12
+
+
+def test_one_environments_token_mass_cannot_eat_the_others_share(monkeypatch):
+    """Each environment keeps its own pool, exactly as the seal path's
+    ``pool_per_env`` does -- otherwise a long-completion environment
+    takes a short one's emission through raw token mass."""
+    assembler = _assembler(monkeypatch)
+    _one_batch(
+        assembler,
+        [_paying_group("openmathinstruct", "mather", 1_000, 1)],
+        [_paying_group("opencodeinstruct", "coder", 1_000_000, 2)],
+    )
+
+    rewards = assembler.reward_map()
+    assert abs(rewards["mather"] - rewards["coder"]) < 1e-12
+
+
+def test_a_group_with_no_eos_tokens_is_paid_nothing(monkeypatch):
+    """A group whose every rollout hit the cap without EOS pays zero --
+    the admission-side property, carried through to the split."""
+    assembler = _assembler(monkeypatch)
+    _one_batch(
+        assembler,
+        [
+            _paying_group("openmathinstruct", "padder", 0, 1),
+            _paying_group("openmathinstruct", "finisher", 500, 2),
+        ],
+        [_paying_group("opencodeinstruct", "coder", 500, 3)],
+    )
+
+    rewards = assembler.reward_map()
+    assert "padder" not in rewards
+    env_batch_pool = 1.0 / len(ENV_ORDER) / FILL_CLOSED_EMISSIONS_PER_WINDOW
+    assert abs(rewards["finisher"] - env_batch_pool) < 1e-12
+
+
+def test_one_batch_draws_exactly_its_even_share_of_the_window(monkeypatch):
+    """The divisor: one window's pool spread evenly over its batches, so
+    the totals match a once-per-window split."""
+    assembler = _assembler(monkeypatch)
+    _one_batch(
+        assembler,
+        [_paying_group("openmathinstruct", "mather", 700, 1)],
+        [_paying_group("opencodeinstruct", "coder", 700, 2)],
+    )
+
+    total = sum(assembler.reward_map().values())
+    assert abs(total - 1.0 / FILL_CLOSED_EMISSIONS_PER_WINDOW) < 1e-12
+
+
+def test_a_quarantined_batch_still_pays(monkeypatch):
+    """Quarantine protects model state, not emission -- the seal path
+    says so in as many words (service.py: "Rewards and archives remain
+    per-window; this gate only protects model state"). A miner whose
+    proven group lands in a batch some OTHER miner poisoned must not
+    lose its pay for it."""
+    import reliquary.validator.fill_closed_batch_assembler as module
+
+    assembler = _assembler(monkeypatch)
+    monkeypatch.setattr(
+        module, "assess_training_batch",
+        lambda batch, reject_counts: SimpleNamespace(
+            quarantined=True, reasons=["poisoned"],
+            to_archive=lambda: {"quarantined": True},
+        ),
+    )
+    _one_batch(
+        assembler,
+        [_paying_group("openmathinstruct", "mather", 700, 1)],
+        [_paying_group("opencodeinstruct", "coder", 700, 2)],
+    )
+
+    assert assembler.reward_map()["mather"] > 0.0
+
+
+async def _archive_one_v6_window(assembler=None):
     from reliquary.validator.service import ValidationService
 
     fake_tok = MagicMock()
@@ -320,6 +453,9 @@ async def _archive_one_v6_window():
             captured["window_start"] = window_start
             captured["data"] = data
 
+    if assembler is not None:
+        svc._fill_closed_assemblers[assembler.window_start] = assembler
+
     with patch(
         "reliquary.infrastructure.archive_queue.get_archive_queue",
         return_value=_StubQueue(),
@@ -340,3 +476,52 @@ async def test_the_archive_records_eos_tokens_per_accepted_group(monkeypatch):
 
     for entry in archive["batch"]:
         assert isinstance(entry["eos_tokens"], int)
+
+
+@pytest.mark.asyncio
+async def test_the_archive_pays_from_the_assembler_not_the_auction(monkeypatch):
+    """R20: under v6 the seal path pays nothing, so the authoritative
+    per-hotkey emission in the archive -- what a weight-only validator
+    replays -- must be the assembler's token split."""
+    import reliquary.validator.service as service
+    monkeypatch.setattr(service, "FILL_CLOSED_ENABLED", True)
+
+    assembler = _assembler(monkeypatch, window=42)
+    _one_batch(
+        assembler,
+        [_paying_group("openmathinstruct", "mather", 700, 1)],
+        [_paying_group("opencodeinstruct", "coder", 2_100, 2)],
+    )
+
+    archive = await _archive_one_v6_window(assembler=assembler)
+
+    assert archive["rewards_by_hotkey"] == assembler.reward_map()
+    assert set(archive["rewards_by_hotkey"]) == {"mather", "coder"}
+
+
+@pytest.mark.asyncio
+async def test_the_archive_closes_the_window_it_is_archiving(monkeypatch):
+    """The remainder batch is emitted by ``close()``. In serial mode
+    ``close()`` otherwise runs at the NEXT window's open -- after this
+    archive was already written -- so its pay would never reach the
+    archive that a weight-only validator replays."""
+    import reliquary.validator.service as service
+    monkeypatch.setattr(service, "FILL_CLOSED_ENABLED", True)
+
+    assembler = _assembler(monkeypatch, window=42)
+    # Chunks handed over, but nothing closed: the remainder is still held.
+    assembler.accept(
+        "openmathinstruct",
+        [_paying_group("openmathinstruct", "mather", 700, 1)],
+        42, "rev",
+    )
+    assembler.accept(
+        "opencodeinstruct",
+        [_paying_group("opencodeinstruct", "coder", 700, 2)],
+        42, "rev",
+    )
+    assert assembler.reward_map() == {}
+
+    archive = await _archive_one_v6_window(assembler=assembler)
+
+    assert set(archive["rewards_by_hotkey"]) == {"mather", "coder"}

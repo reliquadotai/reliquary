@@ -934,6 +934,13 @@ class ValidationService:
         # the last window generated under the previous checkpoint is proven.
         # (batchers, window_n, verify_task, late_drops_snapshot)
         self._gpu_backlog: tuple | None = None
+        # v6 (R20). The assembler that computed a window's per-token
+        # payment, keyed by window, so ``_archive_window`` can read the
+        # map belonging to the window it is ARCHIVING. ``_fill_closed_
+        # assembler`` alone is not enough: in pipelined mode the next
+        # window's ``_open_window_batchers`` has already replaced it by
+        # the time the stashed window is archived.
+        self._fill_closed_assemblers: dict[int, Any] = {}
         self.kl_reference_state: dict[str, Any] = {
             "schema_version": 1,
             "mode": "rolling",
@@ -2312,11 +2319,20 @@ class ValidationService:
                 env_order=[name for name, _ in self.env_mix],
                 enqueue_fn=self._write_fill_closed_training_payload,
                 tombstone_fn=self._write_fill_closed_training_tombstone,
+                # R20: one window's whole emission budget. The assembler
+                # splits it per environment and per batch itself -- it is
+                # the only place a v6 window's assembled batches are
+                # known, and under v6 there is no auction to pay at seal.
+                window_pool=1.0,
             )
             if FILL_CLOSED_ENABLED
             else None
         )
         self._fill_closed_assembler = fill_closed_assembler
+        if fill_closed_assembler is not None:
+            self._fill_closed_assemblers[target_window] = (
+                fill_closed_assembler
+            )
         for env_name, env in self.envs.items():
             open_kwargs = {
                 "window_start": target_window,
@@ -4677,6 +4693,35 @@ class ValidationService:
             grader_failures_by_environment[env_name] = env_grader_failures
             for reason, count in env_grader_failures.items():
                 grader_failures[reason] = grader_failures.get(reason, 0) + count
+
+        if FILL_CLOSED_ENABLED:
+            # R20: under v6 the seal path pays nothing -- the spec removes
+            # the auction and the seal path IS the auction -- so the
+            # authoritative per-hotkey emission is the token split the
+            # assembler computed over this window's assembled batches, not
+            # ``env_rewards`` (which the auction filled with a flat slot
+            # share, or the legacy path left empty).
+            archived_window = int(getattr(first_batcher, "window_start", 0))
+            assembler = self._fill_closed_assemblers.pop(archived_window, None)
+            # Any assembler older than the window being archived belongs to
+            # a window that was dropped before it ever reached here; nothing
+            # will read it again.
+            for stale in [
+                key for key in self._fill_closed_assemblers
+                if key < archived_window
+            ]:
+                self._fill_closed_assemblers.pop(stale, None)
+            if assembler is not None:
+                # Idempotent (R16). The window's LAST batch is the partial
+                # remainder ``close()`` forces out, and in serial mode
+                # ``close()`` otherwise runs at the next window's open --
+                # after this archive is written -- so that batch's pay
+                # would never reach the archive a weight-only validator
+                # replays. In pipelined mode this is already a no-op.
+                assembler.close()
+                combined_rewards = dict(assembler.reward_map())
+            else:
+                combined_rewards = {}
 
         # Pipelined mode passes a stash-time snapshot: the live counter was
         # reset at the NEXT window's activation and holds its rejects, not

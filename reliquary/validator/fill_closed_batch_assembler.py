@@ -70,11 +70,18 @@ class FillClosedBatchAssembler:
         env_order: Sequence[str],
         enqueue_fn: Callable[[int, bytes], None],
         tombstone_fn: Callable[[int, bytes], None],
+        window_pool: float = 1.0,
     ) -> None:
         self.window_start = int(window_start)
         self._env_order = list(env_order)
         self._enqueue_fn = enqueue_fn
         self._tombstone_fn = tombstone_fn
+        # R20: this window's whole emission budget. v6 has no auction --
+        # and the seal path IS the auction -- so payment is computed here,
+        # the only place a v6 window's ASSEMBLED batches are known. See
+        # ``_accrue_payment_locked`` for how one batch's draw is derived.
+        self._window_pool = float(window_pool)
+        self._rewards_by_hotkey: dict[str, float] = {}
         self._accumulator = BalancedTrainingAccumulator(
             {environment: B_BATCH for environment in self._env_order}
         )
@@ -217,6 +224,15 @@ class FillClosedBatchAssembler:
         # for the identical reason: reject-count aggregation is a
         # cross-batcher concern that spans a whole window's rejections,
         # not one join cycle's, and this class has no wiring to it.
+        #
+        # Payment (R20) is credited BEFORE the quarantine verdict
+        # below, deliberately: quarantine protects model state, not
+        # emission. The seal path says so in as many words ("Rewards and
+        # archives remain per-window; this gate only protects model
+        # state" -- service.py), and a miner whose proven group happens
+        # to share a batch with someone else's poisoned one must not
+        # lose its pay for it.
+        self._accrue_payment_locked(window_batches)
         decision = assess_training_batch(flat_batch, reject_counts={})
         key = encoded_window_journal_key(
             self.window_start, self.next_batch_index
@@ -281,6 +297,82 @@ class FillClosedBatchAssembler:
         self._accumulator.reset()
         self.next_batch_index += 1
         return _PreparedWrite(key, data, True, log_message)
+
+    def _accrue_payment_locked(
+        self, window_batches: dict[str, list[Any]]
+    ) -> None:
+        """Credit one assembled batch into this window's reward map (R20).
+
+        Under v6 there is no auction to pay at seal, so this is where
+        emission is decided: per assembled batch, by EOS-terminated
+        completion tokens (``split_environment_pool``), never by a flat
+        slot share. ``eos_tokens`` was produced once at admission
+        (``admission.count_eos_completion_tokens``) and is read here as a
+        plain attribute -- never recomputed.
+
+        Two divisors, both deliberate:
+
+        * ``len(self._env_order)`` -- each environment keeps its own pool,
+          exactly as the seal path's ``pool_per_env`` does. Pooling the
+          environments together would let a long-completion environment
+          take a short one's emission through raw token mass alone.
+        * ``FILL_CLOSED_EMISSIONS_PER_WINDOW`` (R15) -- a v6 window emits
+          up to that many batches where the seal path emitted exactly
+          one, so one window's pool is spread evenly over its batches.
+          Totals are identical to splitting the pool once per window: N
+          batches x pool/N. A window that closes with fewer batches pays
+          out proportionally less and burns the rest, which is what v4/v5
+          already do with unfilled slots (see ``batch_selection``'s module
+          docstring) -- burn, never redistribute.
+
+        Called with ``_lock`` held and does no I/O, per R17.
+        """
+        from reliquary.validator.token_rewards import (
+            AcceptedGroup,
+            split_environment_pool,
+        )
+
+        if not self._env_order:
+            return
+        batch_pool_per_env = (
+            self._window_pool
+            / len(self._env_order)
+            / FILL_CLOSED_EMISSIONS_PER_WINDOW
+        )
+        for env_batch in window_batches.values():
+            shares = split_environment_pool(
+                [
+                    AcceptedGroup(
+                        hotkey=str(getattr(group, "hotkey", "")),
+                        # Archive-only; no cap keys on it, by design (see
+                        # token_rewards.py). ValidSubmission carries no
+                        # operator_id, so the hotkey stands in.
+                        operator_id=str(
+                            getattr(group, "operator_id", None)
+                            or getattr(group, "hotkey", "")
+                        ),
+                        eos_tokens=int(getattr(group, "eos_tokens", 0) or 0),
+                    )
+                    for group in env_batch
+                ],
+                pool=batch_pool_per_env,
+            )
+            for hotkey, share in shares.items():
+                self._rewards_by_hotkey[hotkey] = (
+                    self._rewards_by_hotkey.get(hotkey, 0.0) + share
+                )
+
+    def reward_map(self) -> dict[str, float]:
+        """This window's emission so far, ``{hotkey: reward}`` (R20).
+
+        Complete once ``close()`` has returned: every batch this window
+        assembled -- including the partial remainder ``close()`` forces
+        out -- goes through ``_prepare_payload_locked``, which credits it.
+        The service reads this at archive time in place of the auction's
+        map.
+        """
+        with self._lock:
+            return dict(self._rewards_by_hotkey)
 
     def _write_all(self, prepared: list[_PreparedWrite]) -> None:
         """Perform the actual writes -- and only the writes -- outside
