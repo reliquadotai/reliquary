@@ -82,6 +82,15 @@ class FillClosedBatchAssembler:
         # ``_accrue_payment_locked`` for how one batch's draw is derived.
         self._window_pool = float(window_pool)
         self._rewards_by_hotkey: dict[str, float] = {}
+        # R24: every group this window actually PAID, in payment order, per
+        # environment. The archive reads this in place of the auction's
+        # winners -- under v6 the seal path selects nothing, so a
+        # weight-only validator replaying ``rewards_by_hotkey`` from
+        # ``eos_tokens`` has to divide over exactly the set the live
+        # validator divided over.
+        self._paid_groups: dict[str, list[Any]] = {
+            environment: [] for environment in self._env_order
+        }
         self._accumulator = BalancedTrainingAccumulator(
             {environment: B_BATCH for environment in self._env_order}
         )
@@ -339,7 +348,8 @@ class FillClosedBatchAssembler:
             / len(self._env_order)
             / FILL_CLOSED_EMISSIONS_PER_WINDOW
         )
-        for env_batch in window_batches.values():
+        for environment, env_batch in window_batches.items():
+            self._paid_groups.setdefault(environment, []).extend(env_batch)
             shares = split_environment_pool(
                 [
                     AcceptedGroup(
@@ -373,6 +383,20 @@ class FillClosedBatchAssembler:
         """
         with self._lock:
             return dict(self._rewards_by_hotkey)
+
+    def paid_groups(self) -> dict[str, list[Any]]:
+        """The groups this window's reward map was computed over (R24).
+
+        Complete once ``close()`` has returned, exactly like
+        ``reward_map()`` -- the two are written in the same critical
+        section, so the archive can never carry a payment whose group is
+        missing or a group that was never paid.
+        """
+        with self._lock:
+            return {
+                environment: list(groups)
+                for environment, groups in self._paid_groups.items()
+            }
 
     def _write_all(self, prepared: list[_PreparedWrite]) -> None:
         """Perform the actual writes -- and only the writes -- outside

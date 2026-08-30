@@ -4493,6 +4493,48 @@ class ValidationService:
                 out.append(entry)
             return out
 
+        # R20/R24: under v6 the seal path pays nothing and selects nothing
+        # -- the spec removes the auction and the seal path IS the auction --
+        # so BOTH the archive's per-hotkey emission and its ``batch`` entries
+        # come from the assembler: the token split it computed, over exactly
+        # the groups it paid. ``sealed_dict`` is empty under v6 (see
+        # ``_seal_fill_closed_window``), and a weight-only validator replaying
+        # the map from ``eos_tokens`` must divide over the same set.
+        # Resolved BEFORE the per-env loop below, which reads its batches.
+        fill_closed_assembler = None
+        fill_closed_batches: dict[str, list] = {}
+        if FILL_CLOSED_ENABLED:
+            archived_window = int(getattr(first_batcher, "window_start", 0))
+            fill_closed_assembler = self._fill_closed_assemblers.pop(
+                archived_window, None
+            )
+            # Any assembler older than the window being archived belongs to
+            # a window that was dropped before it ever reached here; nothing
+            # will read it again.
+            for stale in [
+                key for key in self._fill_closed_assemblers
+                if key < archived_window
+            ]:
+                self._fill_closed_assemblers.pop(stale, None)
+            if fill_closed_assembler is None:
+                # Not a silent zero: with no assembler this window pays
+                # nobody and archives an empty batch, which is a wiring
+                # failure, not an outcome.
+                logger.error(
+                    "Window %d: v6 archive found no batch assembler; the "
+                    "window pays nothing and archives no batch",
+                    archived_window,
+                )
+            else:
+                # Idempotent (R16). The window's LAST batch is the partial
+                # remainder ``close()`` forces out, and in serial mode
+                # ``close()`` otherwise runs at the next window's open --
+                # after this archive is written -- so that batch's pay and
+                # its groups would never reach the archive a weight-only
+                # validator replays. In pipelined mode this is a no-op.
+                fill_closed_assembler.close()
+                fill_closed_batches = fill_closed_assembler.paid_groups()
+
         # Build the combined batch entries and runners_up from all envs.
         batch_entries = []
         runners_up = []
@@ -4525,6 +4567,9 @@ class ValidationService:
             )
             env_obj = self.envs.get(env_name, self.env)
             env_batch, env_rewards = sealed_dict.get(env_name, ([], {}))
+            if FILL_CLOSED_ENABLED:
+                # R24: the paid set, not the auction's winners.
+                env_batch = list(fill_closed_batches.get(env_name, ()))
 
             batched_keys = {(s.hotkey, s.prompt_idx) for s in env_batch}
 
@@ -4695,33 +4740,11 @@ class ValidationService:
                 grader_failures[reason] = grader_failures.get(reason, 0) + count
 
         if FILL_CLOSED_ENABLED:
-            # R20: under v6 the seal path pays nothing -- the spec removes
-            # the auction and the seal path IS the auction -- so the
-            # authoritative per-hotkey emission is the token split the
-            # assembler computed over this window's assembled batches, not
-            # ``env_rewards`` (which the auction filled with a flat slot
-            # share, or the legacy path left empty).
-            archived_window = int(getattr(first_batcher, "window_start", 0))
-            assembler = self._fill_closed_assemblers.pop(archived_window, None)
-            # Any assembler older than the window being archived belongs to
-            # a window that was dropped before it ever reached here; nothing
-            # will read it again.
-            for stale in [
-                key for key in self._fill_closed_assemblers
-                if key < archived_window
-            ]:
-                self._fill_closed_assemblers.pop(stale, None)
-            if assembler is not None:
-                # Idempotent (R16). The window's LAST batch is the partial
-                # remainder ``close()`` forces out, and in serial mode
-                # ``close()`` otherwise runs at the next window's open --
-                # after this archive is written -- so that batch's pay
-                # would never reach the archive a weight-only validator
-                # replays. In pipelined mode this is already a no-op.
-                assembler.close()
-                combined_rewards = dict(assembler.reward_map())
-            else:
-                combined_rewards = {}
+            combined_rewards = (
+                dict(fill_closed_assembler.reward_map())
+                if fill_closed_assembler is not None
+                else {}
+            )
 
         # Pipelined mode passes a stash-time snapshot: the live counter was
         # reset at the NEXT window's activation and holds its rejects, not

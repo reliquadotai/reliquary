@@ -597,3 +597,87 @@ def test_the_direct_path_pays_only_genuine_eos_terminations(monkeypatch):
     batcher.accept_submission(_request(prompt_idx=12, hotkey="capper"))
 
     assert batcher.pending_submissions()[-1].eos_tokens == 0
+
+
+# --- I4 (R24): the archive's batch is what was PAID -------------------
+
+
+def _paid_valid_submission(prompt_idx, hotkey, eos_tokens):
+    return _valid_submission(
+        prompt_idx=prompt_idx, hotkey=hotkey, eos_first=True,
+        eos_tokens=eos_tokens,
+    )
+
+
+def _single_env_assembler(monkeypatch, window=42):
+    from reliquary.validator.fill_closed_batch_assembler import (
+        FillClosedBatchAssembler,
+    )
+    import reliquary.infrastructure.training_payload_queue as queue_module
+
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
+    return FillClosedBatchAssembler(
+        window_start=window,
+        env_order=["fake"],
+        enqueue_fn=lambda key, data: None,
+        tombstone_fn=lambda key, data: None,
+        window_pool=1.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_archive_batch_is_the_assembler_paid_set(monkeypatch):
+    """R24: with the seal path selecting nothing under v6, the archive's
+    ``batch`` must come from the assembler -- the auction's winners are a
+    different set (usually empty) and a weight-only validator replaying the
+    reward map needs the groups the map was computed over."""
+    import reliquary.validator.service as service
+    monkeypatch.setattr(service, "FILL_CLOSED_ENABLED", True)
+
+    assembler = _single_env_assembler(monkeypatch)
+    assembler.accept(
+        "fake",
+        [
+            _paid_valid_submission(101, "paid1", 1_000),
+            _paid_valid_submission(102, "paid2", 3_000),
+        ],
+        42, "rev",
+    )
+
+    archive = await _archive_one_v6_window(assembler=assembler)
+
+    archived = {(e["hotkey"], e["prompt_idx"]) for e in archive["batch"]}
+    assert archived == {("paid1", 101), ("paid2", 102)}
+    assert set(archive["rewards_by_hotkey"]) == {"paid1", "paid2"}
+
+
+@pytest.mark.asyncio
+async def test_the_archived_batch_replays_the_reward_map(monkeypatch):
+    """A weight-only validator divides the pool over the archive's
+    ``eos_tokens``. That replay must land on the live map exactly."""
+    import reliquary.validator.service as service
+    monkeypatch.setattr(service, "FILL_CLOSED_ENABLED", True)
+
+    assembler = _single_env_assembler(monkeypatch)
+    assembler.accept(
+        "fake",
+        [
+            _paid_valid_submission(101, "paid1", 1_000),
+            _paid_valid_submission(102, "paid2", 3_000),
+        ],
+        42, "rev",
+    )
+
+    archive = await _archive_one_v6_window(assembler=assembler)
+
+    entries = archive["batch"]
+    total = sum(int(e["eos_tokens"]) for e in entries)
+    env_batch_pool = 1.0 / 1 / FILL_CLOSED_EMISSIONS_PER_WINDOW
+    replayed = {
+        e["hotkey"]: env_batch_pool * int(e["eos_tokens"]) / total
+        for e in entries
+    }
+    live = archive["rewards_by_hotkey"]
+    assert set(replayed) == set(live)
+    for hotkey, share in replayed.items():
+        assert abs(share - live[hotkey]) < 1e-12
