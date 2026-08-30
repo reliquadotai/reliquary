@@ -109,17 +109,18 @@ class ThroughputTiebreakProfile:
     so generating past the useful budget earns no rank, and because throughput is
     a rate rather than a total, padding adds tokens and time in step.
 
-    INCOMPATIBLE WITH SPECULATIVE EARLY CLOSE. Sealing a window before its
-    deadline requires that a leading candidate can no longer be overtaken, which
-    held under arrival ordering — arriving later meant ranking later, full stop.
-    Throughput ordering breaks that: a submission arriving later can still
-    outrank an earlier one by serving faster, so leadership is not decided until
-    the deadline. Proving mid-window would spend the bounded proof wall on
-    candidates that later lose. (The final tiebreak also draws on seal randomness,
-    which does not exist until the seal.) Dominance would only be provable for a
-    candidate at both the value ceiling AND the maximum attainable throughput
-    bucket, which is too rare to build a mechanism on. If early close is ever
-    reconsidered, one of the two has to go.
+    Arrival already appears in the elapsed-time denominator, so applying it
+    again after this bucket would double-penalize later, longer answers. Exact
+    bucket ties therefore go directly to post-seal randomness.
+
+    An adaptive collection close is an operational pipeline policy, not proof
+    that the economic leader is mathematically final: a later candidate could
+    still have ranked higher. It must therefore never pre-prove or cache a
+    mid-window leader. The validator instead expands productive capacity, keeps
+    the profile's collection time as a hard ceiling, and may freeze only after a
+    minimum collection period, a primary population, prior-GPU completion, and
+    fully quiet/drained admission. Ranking and proof still begin only after that
+    population is atomically frozen and post-seal randomness exists.
     """
 
     token_cap: int

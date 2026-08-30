@@ -2440,6 +2440,12 @@ def test_health_exposes_each_environment_window_independently():
     health = TestClient(server.app).get("/health").json()
 
     assert health["valid_submissions_count"] == 4
+    assert health["difficulty_auction_productive_candidate_limit"] == 96
+    assert health["difficulty_auction_primary_candidate_target"] == 64
+    assert health["difficulty_auction_challenger_capacity"] == 32
+    assert health["auction_early_close_mode"] == "shadow"
+    assert health["auction_early_close_min_seconds"] == 60.0
+    assert health["auction_collection_ceiling_seconds"] == 100.0
     assert health["window_environments"]["openmathinstruct"] == {
         "window_n": 500,
         "sealed": False,
@@ -2460,11 +2466,21 @@ def test_health_exposes_each_environment_window_independently():
         "pending_upload_precommits": 0,
         "upload_precommit_payload_bytes": 0,
         "upload_precommit_conservation": {
-            "early_close": {
-                "mode": "shadow",
-                "eligible_offset_seconds": None,
-                "sealed_early": False,
-                "refusing_precommits": False,
+                "early_close": {
+                    "mode": "shadow",
+                    "strategy": "adaptive_gpu_quiet",
+                    "minimum_collection_seconds": 60.0,
+                    "maximum_collection_seconds": 100.0,
+                    "quiet_seconds": 3.0,
+                    "primary_candidate_target": 64,
+                    "challenger_capacity": 32,
+                    "pipeline_ready": False,
+                    "pipeline_ready_offset_seconds": None,
+                    "last_blocker": "minimum_collection",
+                    "eligible_offset_seconds": None,
+                    "sealed_early": False,
+                    "sealed_offset_seconds": None,
+                    "refusing_precommits": False,
             },
             "graded_batch_fill_offset_seconds": None,
             "graded_prefix_fill_offset_seconds": None,
@@ -2481,7 +2497,7 @@ def test_health_exposes_each_environment_window_independently():
             "peak_pending": 0,
             "capacity_reserved": 0,
             "productive_capacity_used": 3,
-            "productive_capacity_limit": 64,
+            "productive_capacity_limit": 96,
             "capacity_conserved": True,
             "inactive_receipts": 0,
             "capacity_rejections": {},

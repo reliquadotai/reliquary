@@ -92,9 +92,10 @@ def throughput_rank(
       time in step), and ``min(.., token_cap)`` gives zero rank past the cap.
 
     Returns ``-bucket`` so that higher throughput sorts FIRST inside a value
-    tier; the arrival round that follows it in the auction rank key breaks
-    within-bucket ties deterministically. Non-numeric or missing token counts
-    degrade to throughput 0 (last bucket, arrival-ordered) rather than raising.
+    tier. A post-seal drand ticket breaks within-bucket ties; arrival is not
+    applied again after already serving as this rate's denominator. Non-numeric
+    or missing token counts degrade to throughput 0 (last bucket) rather than
+    raising.
 
     ``arrival_round`` must be the validator-OBSERVED round: it is the throughput
     *denominator*, so a miner shading its own submitted round downward would

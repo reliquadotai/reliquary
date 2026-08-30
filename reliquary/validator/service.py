@@ -14,10 +14,12 @@ from pathlib import Path
 import re
 import tempfile
 import time
-from typing import Any
+from typing import Any, Callable
 
 from reliquary.constants import (
     AUCTION_ADMISSION_DRAIN_DEADLINE_SECONDS,
+    AUCTION_EARLY_CLOSE_MIN_SECONDS,
+    AUCTION_EARLY_CLOSE_MODE,
     BATCH_PROMPT_COOLDOWN_WINDOWS,
     COOLDOWN_REBUILD_LOOKBACK,
     COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS,
@@ -67,6 +69,7 @@ from reliquary.constants import (
     M_ROLLOUTS,
     MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW,
     MAX_GRADING_STARTS_PER_WINDOW,
+    MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
     MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW,
     MAX_PROOF_WALL_SECONDS,
     MAX_SEAL_QUEUE_DRAIN_SECONDS,
@@ -80,6 +83,7 @@ from reliquary.constants import (
     PROTOCOL_PROFILE_ID,
     PROTOCOL_VERSION,
     PROOF_ADMISSION_STALL_POLL_SECONDS,
+    PRIMARY_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
     REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS,
     RECOMPUTE_PI_OLD_FROM_VERIFY,
@@ -1415,7 +1419,11 @@ class ValidationService:
                     window_n,
                 )
 
-    async def _seal_wait_and_close(self) -> str:
+    async def _seal_wait_and_close(
+        self,
+        *,
+        early_close_ready: Callable[[], bool] | None = None,
+    ) -> str:
         """Seal-wait as a concurrent task during a pipelined GPU half.
 
         poll_deadline() is only driven by _wait_for_window_seal; if the loop
@@ -1423,10 +1431,17 @@ class ValidationService:
         into a 100 s collection), the collecting window would seal late and
         /state would show OPEN for the entire cycle — out-of-phase miners
         would then never see an OPEN -> not-OPEN edge and never re-sync.
-        Running it concurrently seals ON the deadline and flips the FSM to
-        READY at that moment, restoring the serial-mode miner-visible edge.
+        Running it concurrently seals on the ceiling and flips the FSM to READY
+        at that moment. The callback also lets adaptive close observe the exact
+        instant the previous window's GPU half finishes, without a shared flag
+        that could leak across iterations.
         """
-        reason = await self._wait_for_window_seal()
+        if early_close_ready is None:
+            reason = await self._wait_for_window_seal()
+        else:
+            reason = await self._wait_for_window_seal(
+                early_close_ready=early_close_ready
+            )
         self._set_state(WindowState.READY)
         return reason
 
@@ -3136,26 +3151,11 @@ class ValidationService:
         """
         env = getattr(getattr(batcher, "env", None), "name", "?")
         if getattr(batcher, "difficulty_auction_enabled", False):
-            # The full population is the auction's input. Duplicate/sparse idle
-            # breakers would let an early burst truncate the fixed collection
-            # period and recreate the speed race. Only an exhausted, fully
-            # drained grading budget is terminal before the deadline.
-            if not self._proof_admission_exhausted_and_drained(batcher):
-                return None
-            reason = "proof_admission_exhausted_drained"
-            logger.warning(
-                "Window %d env=%s force-sealing auction: reason=%s "
-                "admitted=%d/%d distinct=%d/%d",
-                self._window_n,
-                env,
-                reason,
-                self._admitted_count(batcher),
-                B_BATCH,
-                self._distinct_valid_prompt_count(batcher),
-                B_BATCH,
-            )
-            batcher.force_seal(reason)
-            return reason
+            # Auction timing belongs exclusively to poll_deadline. An exhausted
+            # grading-start backstop can occur before the 60 s fairness floor
+            # and must not bypass the GPU/quiet/population gates. The 100 s
+            # ceiling remains unconditional, so no auction can hang here.
+            return None
         if self._proof_admission_exhausted_and_drained(batcher):
             reason = "proof_admission_exhausted_drained"
         elif self._duplicate_prompt_shortfall_drained(batcher):
@@ -3184,16 +3184,17 @@ class ValidationService:
         self,
         *,
         fixed_deadline_only: bool = False,
+        early_close_ready: Callable[[], bool] | None = None,
     ) -> str:
         """Wait until every active env's batcher seals.
 
-        Auction batchers seal on their fixed collection deadline — or at
-        proven dominance when AUCTION_EARLY_CLOSE_MODE=enforce (capacity
-        terminal-full, every receipt grace resolved; poll_deadline owns the
-        condition). Legacy batchers retain their B-distinct/drand-boundary
-        seal. Per-environment
-        liveness guards cannot let a fast environment cut a slower one short.
-        The window advances only once all are sealed (or the global timeout).
+        Auction batchers have a 100 s ceiling. In enforce mode they may close
+        after 60 s once the primary population exists, the candidate stream is
+        quiet, uploads/admission are drained, and ``early_close_ready`` says the
+        previous pipelined GPU half has finished. Legacy batchers retain their
+        B-distinct/drand-boundary seal. Per-environment liveness guards cannot
+        let a fast environment cut a slower one short. The window advances only
+        once all are sealed (or the global timeout).
         """
         batchers = list(self._active_batchers.values())
         if not batchers:
@@ -3205,10 +3206,16 @@ class ValidationService:
         reasons: dict[str, str] = {}
         while True:
             for b in batchers:
-                # Normal path: seal on the fixed collection deadline.
+                # The hard ceiling ignores GPU readiness; only adaptive close
+                # is gated by it.
                 poll = getattr(b, "poll_deadline", None)
                 if callable(poll):
-                    poll()
+                    pipeline_ready = (
+                        True
+                        if early_close_ready is None
+                        else bool(early_close_ready())
+                    )
+                    poll(pipeline_ready=pipeline_ready)
                 if b.is_sealed():
                     continue
                 r = (
@@ -3594,7 +3601,8 @@ class ValidationService:
 
         if owns_routing:
             self._set_state(WindowState.TRAINING)
-        # Seal every environment after its collection deadline. Auction mode
+        # Seal every environment after its adaptive close or hard ceiling.
+        # Auction mode
         # ranks the frozen pending population, proves candidates top-down, and
         # selects at most B_BATCH winners independently for Math and Code.
         per_env_targets = dict(self.env_mix)
@@ -3609,10 +3617,11 @@ class ValidationService:
         # count, as GRAD_ACCUM_STEPS already does) so every validator uses the
         # same pool and an env a validator does not run burns its share.
         pool_per_env = 1.0 / len(self.env_mix)
-        # Fetch a fresh drand beacon AFTER the collection deadline. It strictly
-        # orders candidates equal on score and validator-observed arrival round,
-        # and keys the forensic sample. If the bounded fetch fails, exact
-        # validator precommit arrival orders ties and forensics are disabled.
+        # Fetch a fresh drand beacon AFTER the populations freeze. It strictly
+        # orders v5 candidates equal on score and throughput, and keys the
+        # forensic sample. If the bounded fetch fails, v5 uses its deterministic
+        # operator/prompt ticket (legacy non-throughput profiles retain exact
+        # validator-arrival fallback) and forensics are disabled.
         epoch_batchers = [
             batcher
             for batcher in batchers.values()
@@ -3632,8 +3641,8 @@ class ValidationService:
                 batcher.seal_beacon_round = seal_beacon.round
         else:
             seal_randomness = await self._fetch_seal_randomness()
-            for batcher in batchers.values():
-                batcher.seal_randomness = seal_randomness
+            for b in batchers.values():
+                b.seal_randomness = seal_randomness
         # Both environments submit their strict rank order to one global,
         # device-owning scheduler. The scheduler applies decisions in rank
         # order even when distinct replicas finish out of order.
@@ -4436,6 +4445,9 @@ class ValidationService:
                 ),
                 "difficulty_auction_arrival_round_source": difficulty_meta.get(
                     "arrival_round_source"
+                ),
+                "difficulty_auction_throughput_rank": difficulty_meta.get(
+                    "throughput_rank"
                 ),
                 "difficulty_auction_tier": difficulty_meta.get("tier"),
                 "difficulty_auction_tier_size": difficulty_meta.get(
@@ -5440,6 +5452,22 @@ class ValidationService:
                 "difficulty_auction_collection_seconds": (
                     WINDOW_COLLECTION_SECONDS
                 ),
+                "difficulty_auction_early_close_mode": (
+                    AUCTION_EARLY_CLOSE_MODE
+                ),
+                "difficulty_auction_early_close_min_seconds": (
+                    AUCTION_EARLY_CLOSE_MIN_SECONDS
+                ),
+                "difficulty_auction_primary_candidate_target": (
+                    PRIMARY_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+                ),
+                "difficulty_auction_productive_candidate_limit": (
+                    MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+                ),
+                "difficulty_auction_challenger_capacity": (
+                    MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+                    - PRIMARY_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+                ),
                 "difficulty_auction_proof_attempt_limit": (
                     MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW
                 ),
@@ -5594,20 +5622,26 @@ class ValidationService:
                             stashed_reject_counts,
                         ) = self._gpu_backlog
                         self._gpu_backlog = None
-                        seal_wait_task = asyncio.create_task(
-                            self._seal_wait_and_close()
-                        )
-                        self._window_iteration_stage = (
-                            "pipelined_train_archive"
-                        )
-                        try:
-                            await self._train_and_publish(
+                        gpu_half_task = asyncio.create_task(
+                            self._train_and_publish(
                                 batchers=stashed_batchers,
                                 window_n=stashed_n,
                                 verify_task=stashed_verify_task,
                                 late_drops=stashed_drops,
                                 server_reject_counts=stashed_reject_counts,
+                            ),
+                            name=f"pipelined_gpu_half_{stashed_n}",
+                        )
+                        seal_wait_task = asyncio.create_task(
+                            self._seal_wait_and_close(
+                                early_close_ready=gpu_half_task.done
                             )
+                        )
+                        self._window_iteration_stage = (
+                            "pipelined_train_archive"
+                        )
+                        try:
+                            await gpu_half_task
                         except asyncio.CancelledError:
                             seal_wait_task.cancel()
                             try:
@@ -6601,11 +6635,11 @@ class ValidationService:
         )
 
     async def _fetch_seal_randomness(self) -> str:
-        """Fetch post-deadline drand with a bounded retry budget.
+        """Fetch post-seal drand with a bounded retry budget.
 
         The beacon strictly orders exact auction ties and keys the forensic
         sample. A total outage returns ``""`` after six seconds; ranking then
-        falls back to validator-observed precommit arrival rather than known
+        uses the active profile's deterministic fallback rather than known
         window randomness.
         """
         if not self.use_drand:

@@ -40,6 +40,8 @@ import uvicorn
 from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
 
 from reliquary.constants import (
+    AUCTION_EARLY_CLOSE_MIN_SECONDS,
+    AUCTION_EARLY_CLOSE_MODE,
     B_BATCH,
     DRAND_ROUND_BACKWARD_TOLERANCE,
     DIFFICULTY_AUCTION_DELTA,
@@ -65,6 +67,7 @@ from reliquary.constants import (
     MAX_PENDING_SUBMISSION_BYTES_PER_ENV,
     MAX_PENDING_SUBMISSION_BYTES_PER_HOTKEY,
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
+    MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
     MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW,
     MAX_PROOF_WALL_SECONDS,
     MAX_SUBMISSION_PAYLOAD_BYTES,
@@ -73,6 +76,7 @@ from reliquary.constants import (
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
     REGISTERED_HOTKEY_STALE_GRACE_SECONDS,
     PRECOMMIT_BODY_READ_TIMEOUT_SECONDS,
+    PRIMARY_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
     SUBMISSION_HEADER_READ_TIMEOUT_SECONDS,
     SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS,
     SPARSE_VALID_IDLE_SEAL_SECONDS,
@@ -1029,6 +1033,21 @@ class _Health(BaseModel):
     difficulty_auction_proof_attempt_limit: int = (
         MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW
     )
+    difficulty_auction_productive_candidate_limit: int = (
+        MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+    )
+    difficulty_auction_primary_candidate_target: int = (
+        PRIMARY_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+    )
+    difficulty_auction_challenger_capacity: int = (
+        MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+        - PRIMARY_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+    )
+    auction_early_close_mode: str = AUCTION_EARLY_CLOSE_MODE
+    auction_early_close_min_seconds: float = (
+        AUCTION_EARLY_CLOSE_MIN_SECONDS
+    )
+    auction_collection_ceiling_seconds: float = WINDOW_COLLECTION_SECONDS
     difficulty_auction_proof_wall_limit_seconds: float = MAX_PROOF_WALL_SECONDS
     difficulty_auction_proof_wall_elapsed_seconds: float | None = None
     difficulty_auction_proof_wall_exhausted: bool | None = None

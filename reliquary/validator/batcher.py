@@ -46,6 +46,7 @@ from reliquary.constants import (
     MAX_PENDING_UPLOAD_PRECOMMITS_PER_OPERATOR,
     MAX_GRADING_STARTS_PER_WINDOW,
     MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
+    PRIMARY_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
     MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW,
     MAX_PROOF_WALL_SECONDS,
     MAX_SEAL_QUEUE_DRAIN_SECONDS,
@@ -58,7 +59,9 @@ from reliquary.constants import (
     ROBUST_TRUNCATION_UTILITY_ENABLED,
     SIGMA_MIN,
     REJECTED_LIST_CAP_PER_HOTKEY,
+    AUCTION_EARLY_CLOSE_MIN_SECONDS,
     AUCTION_EARLY_CLOSE_MODE,
+    AUCTION_EARLY_CLOSE_QUIET_SECONDS,
     WINDOW_COLLECTION_SECONDS,
     SUBMISSION_UPLOAD_GRACE_SECONDS,
     CODE_SEMANTIC_AUTH_ENFORCE,
@@ -224,6 +227,33 @@ def _epoch_candidate_tiebreak(
     update_text(operator_id)
     digest.update(int(prompt_idx).to_bytes(8, "big"))
     return digest.digest()
+
+
+def _auction_rank_key(
+    *,
+    difficulty_value: float,
+    throughput: int,
+    arrival_round: int,
+    exact_arrival: float,
+    tiebreak: bytes,
+    throughput_enabled: bool,
+    seal_randomness_available: bool,
+) -> tuple[Any, ...]:
+    """Build the profile-compatible economic rank key.
+
+    Throughput-enabled profiles use validator arrival only inside
+    ``throughput``'s elapsed-time denominator. Adding arrival again here would
+    double-penalize long answers inside the same throughput bucket. Historical
+    profiles without throughput retain their original arrival ordering.
+    """
+    if throughput_enabled:
+        return (-difficulty_value, throughput, tiebreak)
+    return (
+        -difficulty_value,
+        arrival_round,
+        0.0 if seal_randomness_available else exact_arrival,
+        tiebreak,
+    )
 
 
 def _int_or_none(value: Any) -> int | None:
@@ -980,8 +1010,9 @@ class GrpoWindowBatcher:
         # seal, once the ranked candidates have been proven.
         self.pending_count: int = 0
         # GPU proofs spent by ``_prove_ranked`` this window; telemetry reads it
-        # after seal. Bounded by the graded pool ceiling
-        # (MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW) and the per-hotkey failure cap.
+        # after seal. Bounded independently by
+        # MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW and identity failure debt; raising
+        # the retained candidate pool does not increase this GPU prefix.
         self.proof_attempts: int = 0
 
         if verify_commitment_proofs_fn is None:
@@ -1029,10 +1060,10 @@ class GrpoWindowBatcher:
             int, list[PendingSubmission | ValidSubmission]
         ] = {}
         self.randomness: str = ""
-        # Drand beacon fetched at seal (post-deadline). It keys exact auction
+        # Drand beacon fetched after the population freezes. It keys exact auction
         # ties and the forensic sample so neither can be ground before cutoff.
-        # Empty in mock/no-drand mode activates validator-arrival fallback and
-        # disables forensic sampling.
+        # Empty in mock/no-drand mode activates the profile-specific deterministic
+        # fallback and disables forensic sampling.
         self.seal_randomness: str = ""
         self.seal_beacon_round: int | None = None
         self.collection_close_drand_round: int | None = None
@@ -1108,11 +1139,14 @@ class GrpoWindowBatcher:
         # synchronous test contexts — there the seal fires immediately on
         # the B-th distinct, matching the pre-v2.3 timing.
         self._seal_trigger_round: int | None = None
-        # Proven-dominance early close (see AUCTION_EARLY_CLOSE_MODE).
-        # ``eligible_at`` pins the FIRST moment dominance held; refusal is
-        # derived from it, never cached, so the two cannot disagree.
+        # Adaptive pipeline-aware close (see AUCTION_EARLY_CLOSE_MODE).
+        # ``eligible_at`` pins the first moment every close gate held.
         self.early_close_eligible_at: float | None = None
         self.early_close_sealed = False
+        self.early_close_sealed_at: float | None = None
+        self.early_close_pipeline_ready = False
+        self.early_close_pipeline_ready_at: float | None = None
+        self.early_close_blocker: str | None = "minimum_collection"
         # Shadow measurement for the fill-closed window design. Nothing in
         # ``_pending`` is proven — GRAIL runs at seal — so the offset at which
         # a PROVEN batch could have filled is BRACKETED, never pinned: at best
@@ -1406,7 +1440,9 @@ class GrpoWindowBatcher:
         # Anchor the throughput draw tie-break: the drand round at window open is
         # the reference from which each submission's elapsed (= its attached
         # drand_round − this) is measured. Best-effort — on any drand hiccup the
-        # throughput key sees None and cleanly degrades to arrival ordering.
+        # throughput key sees None and cleanly degrades to the post-seal
+        # operator/prompt draw. On throughput-enabled profiles raw arrival is
+        # never a second standalone rank key; legacy profiles remain unchanged.
         try:
             if self._drand_chain_info is None:
                 from reliquary.infrastructure.drand import get_current_chain
@@ -1420,15 +1456,11 @@ class GrpoWindowBatcher:
             self.window_open_drand_round = None
 
     def is_sealed(self) -> bool:
-        """True once the collection deadline has expired (or a safety-valve
-        ``force_seal`` fired). Thread-safe and loop-independent (reads the
-        underlying ``threading.Event``, never touches the lazy
-        ``asyncio.Event``).
+        """True once adaptive close, the ceiling, or a safety valve fired.
 
-        The window stays open for its configured collection duration. Only
-        after this returns True does further work for the window short-circuit.
-        Callers (the HTTP /submit handler and the submit worker) use it to drop
-        post-deadline submissions.
+        Thread-safe and loop-independent: reads the underlying
+        ``threading.Event``, never the lazy ``asyncio.Event``. Callers (the HTTP
+        submit handler and worker) use it to drop post-seal submissions.
         """
         return self._seal_flag.is_set()
 
@@ -1975,14 +2007,10 @@ class GrpoWindowBatcher:
             if self._seal_flag.is_set() or self._seal_snapshot_started:
                 return False, "collection_sealed", None
             if self._early_close_refusing_precommits_locked():
-                # Dominance holds: no reveal can be admitted any more, so this
-                # receipt could only feed a doomed upload. Asked here rather
-                # than read from a flag the 0.5 s seal poll writes — a
-                # precommit landing in that gap would otherwise hold the seal
-                # for its whole 33 s grace. ``collection_sealed`` maps to
-                # PRECOMMIT_EXPIRED on the wire, which the miner treats as
-                # terminal; batch_filled is the one reason it RETRIES
-                # (submitter.py:395), and this refusal never reopens.
+                # Eligibility and the seal flag are written under this same
+                # lock. This derived guard documents the invariant and keeps a
+                # future split between eligibility and sealing from admitting
+                # a receipt into a permanently closed window.
                 return False, "collection_sealed", None
             operator = self._operator_for_hotkey(hotkey)
             if operator is None:
@@ -2305,6 +2333,28 @@ class GrpoWindowBatcher:
             return {
                 "early_close": {
                     "mode": AUCTION_EARLY_CLOSE_MODE,
+                    "strategy": "adaptive_gpu_quiet",
+                    "minimum_collection_seconds": (
+                        AUCTION_EARLY_CLOSE_MIN_SECONDS
+                    ),
+                    "maximum_collection_seconds": WINDOW_COLLECTION_SECONDS,
+                    "quiet_seconds": self._early_close_quiet_seconds(),
+                    "primary_candidate_target": (
+                        PRIMARY_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+                    ),
+                    "challenger_capacity": max(
+                        0,
+                        MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+                        - PRIMARY_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
+                    ),
+                    "pipeline_ready": self.early_close_pipeline_ready,
+                    "pipeline_ready_offset_seconds": (
+                        None
+                        if self.early_close_pipeline_ready_at is None
+                        else self.early_close_pipeline_ready_at
+                        - self.window_opened_at
+                    ),
+                    "last_blocker": self.early_close_blocker,
                     "eligible_offset_seconds": (
                         None
                         if self.early_close_eligible_at is None
@@ -2312,6 +2362,12 @@ class GrpoWindowBatcher:
                         - self.window_opened_at
                     ),
                     "sealed_early": self.early_close_sealed,
+                    "sealed_offset_seconds": (
+                        None
+                        if self.early_close_sealed_at is None
+                        else self.early_close_sealed_at
+                        - self.window_opened_at
+                    ),
                     "refusing_precommits": (
                         self._early_close_refusing_precommits_locked()
                     ),
@@ -2360,107 +2416,160 @@ class GrpoWindowBatcher:
                 ),
             }
 
-    def _early_close_dominance_locked(self) -> bool:
-        """The window's outcome is provably fixed. Caller holds the admission
-        lock.
-
-        Capacity must be fully charged by TERMINAL work: refunds only come
-        from in-flight grading, so both reservation maps must be empty. Once
-        true it stays true — a later reveal is rejected
-        ``proof_grading_attempts_full`` before it can start anything.
-        """
-        return (
-            self._proof_grading_charged
-            >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
-            and not self._pending_proof_reservations
-            and not self._inflight_proof_reservations
-        )
+    def _early_close_quiet_seconds(self) -> float:
+        """One actual drand round, with the quicknet period as fallback."""
+        try:
+            period = float((self._drand_chain_info or {})["period"])
+        except (KeyError, TypeError, ValueError):
+            period = AUCTION_EARLY_CLOSE_QUIET_SECONDS
+        return max(AUCTION_EARLY_CLOSE_QUIET_SECONDS, period)
 
     def _early_close_refusing_precommits_locked(self) -> bool:
-        """Whether dominance currently bars new receipts. Precommit lock held.
-
-        Derived, never cached: the poll and the register path must answer the
-        same question at the same instant.
-        """
-        if (
-            self.experimental_epoch_ranking
-            or AUCTION_EARLY_CLOSE_MODE != "enforce"
-        ):
+        """Whether adaptive sealing has atomically closed new receipts."""
+        if self.experimental_epoch_ranking:
+            # Epoch lanes keep the manifest-bound common deadline
+            # authoritative in every early-close mode (PR #198).
             return False
-        if self.early_close_eligible_at is not None:
-            return True
-        with self._proof_admission_lock:
-            return self._early_close_dominance_locked()
-
-    def _early_close_possible(self) -> bool:
-        """Lock-free pre-filter for the 0.5 s seal poll.
-
-        poll_deadline runs on the event-loop thread that also serves miners,
-        and these are the locks the precommit and per-chunk byte paths
-        contend on — this plane has a convoy history. Each read is
-        GIL-atomic and a false negative only delays the close by one tick.
-        """
-        if self.experimental_epoch_ranking or AUCTION_EARLY_CLOSE_MODE == "off":
-            return False
-        if self.early_close_eligible_at is not None:
-            # Shadow has nothing left to record; enforce still has to drain.
-            return AUCTION_EARLY_CLOSE_MODE == "enforce"
         return (
-            self._proof_grading_charged
-            >= MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW
-            and not self._pending_proof_reservations
-            and not self._inflight_proof_reservations
+            AUCTION_EARLY_CLOSE_MODE == "enforce"
+            and self.early_close_eligible_at is not None
         )
 
-    def _poll_early_close(self, now: float) -> bool:
-        """Seal a dominance-complete auction window before its deadline.
+    def _early_close_possible(
+        self,
+        now: float,
+        *,
+        pipeline_ready: bool,
+    ) -> bool:
+        """Lock-free pre-filter for the 0.5 s adaptive seal poll.
 
-        Lock order mirrors the reveal/claim path (precommit, then admission),
-        and the seal flag is set under the precommit lock — the same atomicity
-        the deadline branch relies on.
-
-        The wait for armed receipts is BOUNDED at one grace past dominance.
-        ``_prune_upload_precommits_locked`` can only expire a receipt whose
-        body never arrived, so a raw upload that completes transport and then
-        dies is unprunable; without the bound it would latch the refusal and
-        never seal, which is strictly worse than not running at all. The
-        deadline branch tolerates that state for the same reason: its own wait
-        is bounded and then it seals unconditionally.
+        The primary target prevents a sparse lull from cutting off miners. The
+        extra productive capacity remains available to 32 late challengers by
+        default. False negatives are harmless: they delay the next check by one
+        poll, while every condition is rechecked under the admission locks.
         """
-        if not self._early_close_possible():
+        self.early_close_pipeline_ready = bool(pipeline_ready)
+        if pipeline_ready and self.early_close_pipeline_ready_at is None:
+            self.early_close_pipeline_ready_at = now
+
+        if self.experimental_epoch_ranking:
+            # Epoch lanes never close early: the manifest-bound common
+            # deadline stays authoritative in every mode (PR #198).
+            self.early_close_blocker = "epoch_ranking"
+            return False
+        if AUCTION_EARLY_CLOSE_MODE == "off":
+            self.early_close_blocker = "mode_off"
+            return False
+        if self.early_close_eligible_at is not None:
+            # Shadow records the first hypothetical close and remains open.
+            return False
+
+        elapsed = now - self.window_opened_at
+        if elapsed < AUCTION_EARLY_CLOSE_MIN_SECONDS:
+            self.early_close_blocker = "minimum_collection"
+            return False
+        if not pipeline_ready:
+            self.early_close_blocker = "previous_gpu_half"
+            return False
+        if self.pending_count < PRIMARY_PROOF_GRADING_ATTEMPTS_PER_WINDOW:
+            self.early_close_blocker = "primary_candidate_target"
+            return False
+        if self.distinct_pending_prompt_count() < B_BATCH:
+            self.early_close_blocker = "trainable_prompt_target"
+            return False
+        if self.last_valid_submission_at is None:
+            self.early_close_blocker = "no_candidate_activity"
+            return False
+        if (
+            now - self.last_valid_submission_at
+            < self._early_close_quiet_seconds()
+        ):
+            self.early_close_blocker = "candidate_quiet_period"
+            return False
+        if self._pending_proof_reservations:
+            self.early_close_blocker = "pending_admission"
+            return False
+        if self._inflight_proof_reservations:
+            self.early_close_blocker = "inflight_admission"
+            return False
+        return True
+
+    def _poll_early_close(
+        self,
+        now: float,
+        *,
+        pipeline_ready: bool,
+    ) -> bool:
+        """Seal an idle, drained, GPU-ready auction between 60 and 100 s.
+
+        Lock order mirrors reveal admission (precommit, then proof admission).
+        The seal flag is set while holding the precommit lock, so a receipt is
+        either fully before the adaptive close or rejected after it. Existing
+        receipts are never discarded by the adaptive path: their body can add
+        a challenger, so the close waits for the receipt map to become empty.
+        The fixed 100 s ceiling retains its bounded upload-grace behavior.
+        """
+        if not self._early_close_possible(
+            now, pipeline_ready=pipeline_ready
+        ):
             return False
         with self._upload_precommit_lock:
-            if self.early_close_eligible_at is None:
-                with self._proof_admission_lock:
-                    if not self._early_close_dominance_locked():
-                        return False
-                self.early_close_eligible_at = now
-                logger.info(
-                    "auction_early_close_eligible window=%d env=%s mode=%s "
-                    "offset_s=%.1f",
-                    self.window_start,
-                    getattr(self.env, "name", "?"),
-                    AUCTION_EARLY_CLOSE_MODE,
-                    now - self.window_opened_at,
-                )
-            if AUCTION_EARLY_CLOSE_MODE != "enforce":
-                return False
             self._prune_upload_precommits_locked(now)
-            drain_deadline = (
-                self.early_close_eligible_at + SUBMISSION_UPLOAD_GRACE_SECONDS
+            if self._upload_precommits:
+                self.early_close_blocker = "pending_uploads"
+                return False
+            with self._proof_admission_lock:
+                if self._pending_proof_reservations:
+                    self.early_close_blocker = "pending_admission"
+                    return False
+                if self._inflight_proof_reservations:
+                    self.early_close_blocker = "inflight_admission"
+                    return False
+                if (
+                    self.pending_count
+                    < PRIMARY_PROOF_GRADING_ATTEMPTS_PER_WINDOW
+                ):
+                    self.early_close_blocker = "primary_candidate_target"
+                    return False
+                if (
+                    self.last_valid_submission_at is None
+                    or now - self.last_valid_submission_at
+                    < self._early_close_quiet_seconds()
+                ):
+                    self.early_close_blocker = "candidate_quiet_period"
+                    return False
+
+            self.early_close_eligible_at = now
+            self.early_close_blocker = None
+            logger.info(
+                "auction_early_close_eligible window=%d env=%s mode=%s "
+                "offset_s=%.1f candidates=%d capacity=%d pipeline_ready=%s",
+                self.window_start,
+                getattr(self.env, "name", "?"),
+                AUCTION_EARLY_CLOSE_MODE,
+                now - self.window_opened_at,
+                self.pending_count,
+                MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
+                pipeline_ready,
             )
-            if self._upload_precommits and now < drain_deadline:
+            if AUCTION_EARLY_CLOSE_MODE != "enforce":
                 return False
             self._seal_flag.set()
             self.early_close_sealed = True
+            self.early_close_sealed_at = now
             logger.info(
                 "auction_early_close_sealed window=%d env=%s offset_s=%.1f "
-                "saved_s=%.1f unresolved_receipts=%d",
+                "saved_s=%.1f candidates=%d challenger_used=%d",
                 self.window_start,
                 getattr(self.env, "name", "?"),
                 now - self.window_opened_at,
                 self.collection_seconds - (now - self.window_opened_at),
-                len(self._upload_precommits),
+                self.pending_count,
+                max(
+                    0,
+                    self.pending_count
+                    - PRIMARY_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
+                ),
             )
         if self._seal_event is not None:
             self._seal_event.set()
@@ -2493,8 +2602,9 @@ class GrpoWindowBatcher:
         if distinct >= MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW:
             self.graded_prefix_fill_offset_s = offset
 
-    def poll_deadline(self) -> bool:
-        """Seal an auction environment at its fixed collection deadline.
+
+    def poll_deadline(self, *, pipeline_ready: bool = True) -> bool:
+        """Seal an auction at its adaptive close or fixed 100 s ceiling.
 
         Non-auction environments keep the legacy B-distinct/drand-boundary seal
         and therefore treat this poll as a no-op.
@@ -2525,7 +2635,9 @@ class GrpoWindowBatcher:
         self._poll_batch_fill(now)
         if (
             now - self.window_opened_at < self.collection_seconds
-            and self._poll_early_close(now)
+            and self._poll_early_close(
+                now, pipeline_ready=pipeline_ready
+            )
         ):
             return True
         if now - self.window_opened_at >= self.collection_seconds:
@@ -5496,12 +5608,16 @@ class GrpoWindowBatcher:
     def _prove_ranked(self, pool: float = 1.0) -> list[ValidSubmission]:
         """Prove strict auction winners until ``B_BATCH`` distinct prompts pass.
 
-        Difficulty remains primary and validator-observed precommit drand round
-        remains secondary. Exact ties use post-deadline drand bound only to the
+        On throughput-enabled profiles, difficulty remains primary and capped
+        throughput remains secondary. Validator-observed precommit drand is
+        used exactly once: as the elapsed-time denominator of that throughput
+        rate, not as a second arrival preference. Equal
+        difficulty/throughput candidates use post-seal drand bound only to the
         checkpoint, window, environment, operator and prompt. Hotkeys and miner
         payload fields cannot mint extra tie tickets. If seal drand is
-        unavailable, exact validator-observed precommit arrival is the explicit
-        liveness fallback; known window randomness is never an economic salt.
+        unavailable, the same hash is a deterministic liveness fallback. Old
+        profiles with no throughput contract retain their historical arrival
+        ordering.
 
         A prompt is claimed only after a submission passes proof. A fabricated
         leader therefore fails without squatting the prompt, and the next
@@ -5528,6 +5644,10 @@ class GrpoWindowBatcher:
         arrival_source_by_id: dict[int, str] = {}
         exact_arrival_by_id: dict[int, float] = {}
         tiebreak_by_id: dict[int, bytes] = {}
+        throughput_profile = PROTOCOL_THROUGHPUT_TIEBREAK
+        # Filled only on the non-epoch branch below: epoch ranking never
+        # orders by throughput, so its candidates carry None in the rows.
+        throughput_by_id: dict[int, int] = {}
         if self.experimental_epoch_ranking:
             if not self.seal_randomness or self.seal_beacon_round is None:
                 raise RuntimeError(
@@ -5546,7 +5666,11 @@ class GrpoWindowBatcher:
             rank_entropy_source = (
                 "seal_drand"
                 if self.seal_randomness
-                else "validator_arrival_fallback"
+                else (
+                    "deterministic_operator_prompt_fallback"
+                    if throughput_profile is not None
+                    else "validator_arrival_fallback"
+                )
             )
         environment = str(getattr(self.env, "name", ""))
         for pending_submission, _score in scored:
@@ -5591,13 +5715,22 @@ class GrpoWindowBatcher:
                 ),
             )
         else:
-            # Keep the production profile's ranking byte-for-byte equivalent.
-            throughput_profile = PROTOCOL_THROUGHPUT_TIEBREAK
+            # Difficulty ranks first, so throughput never trades against
+            # training utility — it only orders candidates already judged equally
+            # useful. Among those, ordering by arrival penalises long generation
+            # (a 16k rollout arrives after a 500-token one at identical hardware),
+            # and with binary rewards the difficulty score takes only nine values,
+            # so those ties are common rather than marginal. Tokens-per-round is
+            # length-neutral instead. Absent from the v2 profile, so the deployed
+            # 2B ordering is untouched.
             window_open = self.window_open_drand_round
-            throughput_by_id: dict[int, int] = {}
             for pending_submission, _score in scored:
                 throughput_by_id[id(pending_submission)] = (
                     throughput_rank(
+                        # Anti-padding cap per rollout; the group ceiling below is
+                        # M_ROLLOUTS x cap so real 8-rollout totals stay
+                        # discriminant (the single-rollout cap on the sum clamped
+                        # 53% of groups onto one constant = raw arrival ordering).
                         _generated_tokens_of(
                             pending_submission,
                             per_rollout_cap=throughput_profile.token_cap,
@@ -5609,25 +5742,23 @@ class GrpoWindowBatcher:
                             throughput_profile.bucket_tokens_per_round
                         ),
                     )
-                    if throughput_profile is not None
-                    and window_open is not None
+                    if throughput_profile is not None and window_open is not None
                     else 0
                 )
             ranked = sorted(
                 scored,
-                key=lambda item: (
-                    -item[1].value,
-                    throughput_by_id[id(item[0])],
-                    arrival_by_id[id(item[0])],
-                    (
-                        0.0
-                        if self.seal_randomness
-                        else exact_arrival_by_id[id(item[0])]
-                    ),
-                    tiebreak_by_id[id(item[0])],
+                key=lambda item: _auction_rank_key(
+                    difficulty_value=item[1].value,
+                    throughput=throughput_by_id[id(item[0])],
+                    arrival_round=arrival_by_id[id(item[0])],
+                    exact_arrival=exact_arrival_by_id[id(item[0])],
+                    tiebreak=tiebreak_by_id[id(item[0])],
+                    throughput_enabled=throughput_profile is not None,
+                    seal_randomness_available=bool(self.seal_randomness),
                 ),
             )
-
+            # Tiers remain diagnostic only. The final tiebreak makes the economic
+            # ranking strict, so no tier can expand the selected or rewarded set.
         tier_by_id: dict[int, int] = {}
         tier_sizes: list[int] = []
         last_tier_key: tuple[float, ...] | None = None
@@ -5637,7 +5768,11 @@ class GrpoWindowBatcher:
                 if self.experimental_epoch_ranking
                 else (
                     score.value,
-                    arrival_by_id[id(pending_submission)],
+                    (
+                        throughput_by_id[id(pending_submission)]
+                        if throughput_profile is not None
+                        else arrival_by_id[id(pending_submission)]
+                    ),
                 )
             )
             if tier_key != last_tier_key:
@@ -5674,6 +5809,9 @@ class GrpoWindowBatcher:
                 "arrival_round_source": arrival_source_by_id[
                     id(pending_submission)
                 ],
+                "throughput_rank": throughput_by_id.get(
+                    id(pending_submission)
+                ),
                 "precommit_arrival_ts": exact_arrival_by_id[
                     id(pending_submission)
                 ],
@@ -6109,12 +6247,12 @@ class GrpoWindowBatcher:
         only ever run on the ranked winners; sampling a few losers keeps the
         pre-generation / token-tamper detectors alive. With the default budget
         of two, one sample is the next-ranked utility counterfactual and one is
-        selected unpredictably from the rest using post-deadline drand. Results
+        selected unpredictably from the rest using post-seal drand. Results
         never enter ``_valid`` and are never paid.
 
-        The authoritative auction rank already includes post-deadline seal
-        randomness for exact score/arrival ties. Empty seal randomness means no
-        final rank exists, so sampling remains disabled in that state.
+        The authoritative auction rank already includes post-seal randomness
+        for exact economic ties. Empty seal randomness means no unpredictable
+        forensic draw exists, so sampling remains disabled in that state.
         """
         if FORENSIC_SAMPLE_PER_WINDOW <= 0 or not self.seal_randomness:
             self.forensic_sample = []

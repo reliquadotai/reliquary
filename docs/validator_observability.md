@@ -22,7 +22,7 @@ Validator submit logs use the `validator_submit_lifecycle` event with a
   `reject_stage` and `reject_reason` together; for `batch_filled`, also read
   `batch_filled_reason`, `current_valid_count`, and `trigger_round`.
 - `seal_triggered`: legacy-selector stage only. Protocol-v4 auction environments
-  seal on the 150-second collection deadline and bounded queue drain.
+  use the adaptive collection telemetry described below instead.
 - `auction_finalized`: seal-time result for every pending candidate. Read
   `canonical_rank`, `auction_status`, `selected_for_batch`, and `rewarded`.
 - `final_batch_selected`: final auction ordering has run. A submission
@@ -38,13 +38,17 @@ Interpretation guide:
   precommit, `arrival_drand_round` is the validator round at precommit arrival;
   otherwise it is the body request's arrival round. `drand_delta=0` means
   current; `<0` means stale; `>0` means future. Submitted drand does not affect
-  auction rank.
+  auction rank. On throughput-enabled profiles, validator-observed arrival is
+  the elapsed-round denominator of capped throughput and is not applied again
+  as a standalone rank preference.
 - `upload_precommit_status=valid` means a signed commitment to the exact body
   hash and byte count arrived before collection cutoff. The reveal may complete
   during the bounded 33-second upload grace. `present`, `invalid`, `expired`,
   and `replay` distinguish the other receipt paths.
 - `seal_trigger_round` applies to legacy mode. In auction mode use the
-  collection deadline, population-freeze state, and rank entropy source.
+  `upload_precommit_conservation.early_close` block. It exposes the 60-second
+  minimum, 100-second ceiling, primary/challenger capacity, prior-GPU readiness,
+  current blocker, eligibility offset, and actual early-seal offset.
 - `batch_filled` does not always mean the same thing. Check
   `batch_filled_reason`: common values include
   `submitted_round_gt_seal_trigger_round`, `batch_already_sealed`,
@@ -63,6 +67,14 @@ revision, app start time, checkpoint revision, current window, drand round,
 per-environment pending/queue/proof state, operator mapping, grader failures,
 archive queue, and recent reject counts. It must not include access keys,
 tokens, wallet material, or private keys.
+
+Top-level auction fields publish the productive candidate limit (96 by
+default), the primary target (64), challenger capacity (32), unchanged ranked
+proof limit, adaptive close mode, and 60/100-second timing. Per-environment
+`upload_precommit_conservation.early_close.last_blocker` explains why a live
+window has not closed; common values are `minimum_collection`,
+`previous_gpu_half`, `primary_candidate_target`, `candidate_quiet_period`,
+`pending_uploads`, `pending_admission`, and `inflight_admission`.
 
 `/health.process_lifecycle` is the long-lived sandbox leak stop-line:
 
@@ -96,9 +108,11 @@ checkpoint, archive queue, registration snapshot, and immutable image digest.
 R2 archives persist `force_seal_reason_by_environment` and
 `reward_alignment_by_environment`. Completed auction windows require zero
 paid-unselected and selected-unrewarded groups. A non-null
-`auction_queue_drain_timeout` means the fixed collection closed correctly but
-some predeadline admission work exceeded the bounded drain period. Candidate
-rows carry the same ingress and admission timings as live verdicts.
+`auction_queue_drain_timeout` means collection closed correctly (adaptively or
+at its ceiling) but some pre-seal admission work exceeded the bounded drain
+period. Candidate rows carry the same ingress and admission timings as live
+verdicts plus `throughput_rank`; flattened submission rows expose the latter as
+`difficulty_auction_throughput_rank` for archive queries.
 
 ## Inference runtime and BFT telemetry
 

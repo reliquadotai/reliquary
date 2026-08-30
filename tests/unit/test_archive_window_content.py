@@ -174,6 +174,7 @@ async def test_archive_includes_prompt_and_rollout_content():
             "proof_passed": True,
             "arrival_drand_round": 103,
             "arrival_round_source": "arrival",
+            "throughput_rank": -12,
             "tier": 0,
             "tier_size": 1,
             "operator_id": "operator-a",
@@ -283,6 +284,7 @@ async def test_archive_includes_prompt_and_rollout_content():
     assert entry0["difficulty_auction_proof_passed"] is True
     assert entry0["difficulty_auction_arrival_drand_round"] == 103
     assert entry0["difficulty_auction_arrival_round_source"] == "arrival"
+    assert entry0["difficulty_auction_throughput_rank"] == -12
     assert entry0["difficulty_auction_tier"] == 0
     assert entry0["difficulty_auction_tier_size"] == 1
     assert entry0["difficulty_auction_operator_id"] == "operator-a"
