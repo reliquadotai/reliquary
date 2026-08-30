@@ -3752,6 +3752,9 @@ class ValidationService:
                     "selected_for_batch": selected,
                     "rewarded": rewarded,
                     "reward_amount": meta.get("reward_amount"),
+                    # Which mechanism actually credited it (R20): under v6
+                    # the seal path's slot share is reported but not paid.
+                    "payment_source": meta.get("payment_source"),
                     "selection_reason": meta.get("selection_reason"),
                     "batch_filled_reason": (
                         meta.get("selection_reason") if not selected else None
@@ -4358,6 +4361,7 @@ class ValidationService:
                 "accepted_into_pool": not rejected,
                 "selected_for_batch": bool(meta.get("selected_for_batch", False)),
                 "rewarded": bool(meta.get("rewarded", False)),
+                "payment_source": meta.get("payment_source"),
                 "batch_filled_reason": (
                     meta.get("selection_reason")
                     if not meta.get("selected_for_batch", False)

@@ -5776,6 +5776,14 @@ class GrpoWindowBatcher:
             )
 
         slot_share = pool / B_BATCH
+        # ``reward_amount`` below is this slot share. Under v6 the seal path
+        # pays nothing -- payment is the per-token split
+        # ``FillClosedBatchAssembler`` computes over assembled batches (R20)
+        # -- so reporting the share unqualified would hand an operator a
+        # number that was never credited. Name the payer.
+        payment_source = (
+            "fill_closed_token_split" if FILL_CLOSED_ENABLED else "slot_share"
+        )
         rewards: dict[str, float] = {}
         metadata: dict[int, dict[str, Any]] = {}
         for selected_rank, submission in enumerate(winners, start=1):
@@ -5792,6 +5800,7 @@ class GrpoWindowBatcher:
                 "selected_for_batch": True,
                 "rewarded": True,
                 "reward_amount": slot_share,
+                "payment_source": payment_source,
                 "canonical_rank": canonical_rank,
                 "selection_reason": "selected_auction_winner",
             }

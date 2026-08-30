@@ -17,8 +17,14 @@ from tests.unit.test_archive_window_content import (
 )
 
 
-def test_v6_rewards_are_proportional_to_eos_tokens(monkeypatch):
-    """Two accepted groups, nine times the tokens, nine times the share."""
+def test_the_seal_path_never_pays_per_token_under_v6(monkeypatch):
+    """R20: v6 payment does not live here.
+
+    The spec removes the auction under v6 and the seal path IS the auction,
+    so ``select_batch_and_distribute`` keeps its v4/v5 arithmetic whatever
+    the gate says. The token split runs in ``FillClosedBatchAssembler``,
+    where the assembled batches -- not the window's slots -- are known.
+    """
     import reliquary.validator.batch_selection as selection
     monkeypatch.setattr(selection, "FILL_CLOSED_ENABLED", True)
 
@@ -38,8 +44,7 @@ def test_v6_rewards_are_proportional_to_eos_tokens(monkeypatch):
     )
 
     assert len(batch) == 2
-    assert abs(rewards["short"] - 0.1) < 1e-9
-    assert abs(rewards["long"] - 0.9) < 1e-9
+    assert rewards["short"] == rewards["long"] == 0.5
 
 
 def test_the_auction_path_is_untouched_when_the_gate_is_off():
@@ -60,6 +65,69 @@ def test_the_auction_path_is_untouched_when_the_gate_is_off():
     )
 
     assert rewards["short"] == rewards["long"]
+
+
+def test_selection_telemetry_names_who_actually_paid(monkeypatch):
+    """The Minor: ``rewarded``/``reward_amount`` are a SLOT share.
+
+    Under v6 nothing on this path is paid, so reporting a slot share with
+    no further qualification tells an operator a number that was never
+    credited. Name the payer instead.
+    """
+    import reliquary.validator.batch_selection as selection
+
+    submissions = [
+        _valid_submission(prompt_idx=1, hotkey="short", eos_first=True),
+        _valid_submission(prompt_idx=2, hotkey="long", eos_first=True),
+    ]
+    kwargs = dict(
+        b=2,
+        cooldown_map=CooldownMap(cooldown_windows=50),
+        current_window=42,
+        pool=1.0,
+    )
+
+    meta = selection.explain_batch_selection(submissions, **kwargs)
+    assert {row["payment_source"] for row in meta.values()} == {"slot_share"}
+
+    monkeypatch.setattr(selection, "FILL_CLOSED_ENABLED", True)
+    meta = selection.explain_batch_selection(submissions, **kwargs)
+    assert {row["payment_source"] for row in meta.values()} == {
+        "fill_closed_token_split"
+    }
+
+
+def test_auction_telemetry_names_who_actually_paid(monkeypatch):
+    """Same Minor, on the arm production actually runs.
+
+    ``DIFFICULTY_AUCTION_ENFORCE=1`` means ``_finalize_auction_winners``, not
+    ``explain_batch_selection``, is what writes ``selection_metadata_by_id``
+    in production -- so it is the reporter that drifts under v6.
+    """
+    from reliquary.validator.batcher import GrpoWindowBatcher
+    import reliquary.validator.batcher as batcher_module
+
+    def _finalize():
+        stub = SimpleNamespace(
+            _valid=[SimpleNamespace(
+                hotkey="hk", prompt_idx=1, prompt_content_sha256="c" * 64,
+            )],
+            difficulty_auction_metadata_by_id={},
+            auction_candidates=[],
+            reward_alignment={},
+            selection_metadata_by_id={},
+            rewarded_but_not_selected_by_hotkey={},
+            rewards_by_hotkey={},
+        )
+        GrpoWindowBatcher._finalize_auction_winners(stub, pool=1.0)
+        return list(stub.selection_metadata_by_id.values())
+
+    assert {row["payment_source"] for row in _finalize()} == {"slot_share"}
+
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+    assert {row["payment_source"] for row in _finalize()} == {
+        "fill_closed_token_split"
+    }
 
 
 def _context(
