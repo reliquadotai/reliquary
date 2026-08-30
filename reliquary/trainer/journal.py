@@ -26,6 +26,65 @@ from reliquary.shared.training_payload import (
 )
 
 
+RAW_JOURNAL_KEY_SPACE = "raw"
+FILL_CLOSED_JOURNAL_KEY_SPACE = "fill_closed"
+
+
+def active_journal_key_space() -> str:
+    """Which key space THIS process reads and writes the journal in."""
+    return (
+        FILL_CLOSED_JOURNAL_KEY_SPACE
+        if FILL_CLOSED_ENABLED
+        else RAW_JOURNAL_KEY_SPACE
+    )
+
+
+# Module-level convenience for writers that stamp the marker beside the
+# cursor. Read through ``active_journal_key_space()`` where the gate may be
+# patched at runtime (tests).
+ACTIVE_JOURNAL_KEY_SPACE = active_journal_key_space()
+
+
+def migrate_journal_cursor(
+    cursor: int, key_space: str | None,
+) -> tuple[int, str]:
+    """Translate a stored cursor into the ACTIVE journal key space (R25).
+
+    Returns ``(cursor, key_space)`` in the active space, so the caller can
+    persist the marker it was migrated into and a second resume from the
+    same checkpoint is a no-op.
+
+    The cutover is the whole point. Before v6 the cursor IS a window number;
+    under v6 the journal is keyed ``window * FILL_CLOSED_EMISSIONS_PER_WINDOW
+    + batch_index``, so resuming a raw cursor against the encoded space would
+    park the trainer inside a long-finished window forever, or raise on
+    ``next_entry``'s window-start comparison. That must not be a manual
+    runbook step: the kind of step that gets skipped.
+
+    A missing marker reads as ``"raw"`` -- every checkpoint published before
+    this field existed is raw-keyed. An unrecognised marker raises rather
+    than guessing which multiplication to apply.
+
+    The bootstrap cursor (``RELIQUARY_TRAINER_BOOTSTRAP_CURSOR``) is NOT
+    migrated: it carries no marker and is an operator's explicit statement of
+    where the journal starts, so it is taken as already being in the active
+    space.
+    """
+    stored = str(key_space or RAW_JOURNAL_KEY_SPACE)
+    active = active_journal_key_space()
+    known = {RAW_JOURNAL_KEY_SPACE, FILL_CLOSED_JOURNAL_KEY_SPACE}
+    if stored not in known:
+        raise ValueError(
+            f"unknown journal key space {stored!r}; expected one of "
+            + ", ".join(sorted(known))
+        )
+    if stored == active:
+        return int(cursor), active
+    if active == FILL_CLOSED_JOURNAL_KEY_SPACE:
+        return int(cursor) * FILL_CLOSED_EMISSIONS_PER_WINDOW, active
+    return int(cursor) // FILL_CLOSED_EMISSIONS_PER_WINDOW, active
+
+
 class WindowJournal:
     """Reads the next journal entry via an injected key fetcher.
 

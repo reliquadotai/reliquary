@@ -86,7 +86,11 @@ def run_train_worker(*, shadow: bool = False) -> None:
         load_text_generation_model,
         load_tokenizer,
     )
-    from reliquary.trainer.journal import WindowJournal, r2_fetch_fn
+    from reliquary.trainer.journal import (
+        WindowJournal,
+        migrate_journal_cursor,
+        r2_fetch_fn,
+    )
     from reliquary.trainer.publisher import TrainerPublisher
     from reliquary.trainer.resume import resolve_resume_point
     from reliquary.trainer.train_runner import TrainRunner
@@ -134,6 +138,22 @@ def run_train_worker(*, shadow: bool = False) -> None:
         # The PROFILE is authoritative for run state; the manifest cursor
         # was only a hint for which snapshot to fetch.
         cursor = int(profile.get("trained_window_cursor", cursor))
+        # C3/R25: a checkpoint published before the v6 cutover carries a
+        # cursor in RAW window space; this journal reads the encoded space
+        # (window * FILL_CLOSED_EMISSIONS_PER_WINDOW + batch). Migrate here,
+        # exactly once, detected by the marker the publisher stamps beside
+        # the cursor -- never as a manual runbook step. The next publish
+        # writes the migrated marker, so a later resume is a no-op.
+        migrated, key_space = migrate_journal_cursor(
+            cursor, profile.get("journal_key_space"),
+        )
+        if migrated != cursor:
+            logger.warning(
+                "journal key space changed (%s -> %s): cursor %d -> %d",
+                profile.get("journal_key_space") or "raw",
+                key_space, cursor, migrated,
+            )
+        cursor = migrated
         raw_step = profile.get("lr_schedule_step")
         lr_schedule_step = int(raw_step) if raw_step is not None else None
         model_path = str(snapshot_dir)

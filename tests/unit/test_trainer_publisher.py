@@ -9,6 +9,7 @@ from reliquary.trainer.publisher import (
     checkpoint_key,
 )
 from reliquary.shared.training_payload import active_training_identity
+from reliquary.trainer.journal import ACTIVE_JOURNAL_KEY_SPACE
 
 
 class _R2:
@@ -88,6 +89,7 @@ def test_publish_order_manifest_and_cleanup(tmp_path):
         **active_training_identity(),
         "checkpoint_n": 5, "repo_id": "org/repo", "revision": "rev-123",
         "trained_window_cursor": 30110, "reason": "cadence",
+        "journal_key_space": ACTIVE_JOURNAL_KEY_SPACE,
     }
     assert not any(tmp_path.iterdir())  # staging cleaned
 
@@ -165,3 +167,40 @@ def test_staging_cleaned_on_failure(tmp_path):
         ))
     assert not any(tmp_path.iterdir())
     assert CANDIDATE_MANIFEST_KEY not in r2.objects
+
+
+def test_the_publisher_stamps_the_journal_key_space(tmp_path):
+    """C3: the resume-time cursor migration is detected by a marker stored
+    BESIDE the cursor, so both writers of the cursor must stamp it."""
+    from reliquary.trainer.journal import ACTIVE_JOURNAL_KEY_SPACE
+
+    r2, order = _R2(), []
+    captured = {}
+
+    def save_fn(model, tokenizer, path):
+        (path / "model.safetensors").write_bytes(b"w")
+
+    async def hf_upload(folder_path, repo_id, commit_message):
+        import pathlib
+        for p in pathlib.Path(folder_path).iterdir():
+            if p.suffix == ".json":
+                captured[p.name] = json.loads(p.read_text())
+        return "rev-9"
+
+    pub = TrainerPublisher(
+        repo_id="org/repo", staging_dir=str(tmp_path), tokenizer=None,
+        save_fn=save_fn, hf_upload_fn=hf_upload, r2_client=r2,
+        bucket="reliquary",
+    )
+    asyncio.run(pub.publish(
+        object(), checkpoint_n=7, lr_schedule_step=99,
+        trained_window_cursor=30200, reason="cadence",
+    ))
+
+    profile = next(
+        doc for doc in captured.values()
+        if doc.get("trained_window_cursor") is not None
+    )
+    manifest = json.loads(r2.objects[CANDIDATE_MANIFEST_KEY])
+    assert profile["journal_key_space"] == ACTIVE_JOURNAL_KEY_SPACE
+    assert manifest["journal_key_space"] == ACTIVE_JOURNAL_KEY_SPACE

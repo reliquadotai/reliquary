@@ -73,9 +73,15 @@ class TrainerPublisher:
         trained_window_cursor: int,
         reason: str,
     ) -> str:
+        from reliquary.trainer.journal import active_journal_key_space
         from reliquary.validator.checkpoint_profile import (
             write_checkpoint_profile,
         )
+
+        # C3/R25: the key space the cursor below is expressed in, stored
+        # beside it so a resume can detect a cutover and migrate exactly
+        # once instead of relying on a manual runbook step.
+        key_space = active_journal_key_space()
 
         snapshot_dir = self.staging_dir / f"ckpt_{checkpoint_n}"
         snapshot_dir.mkdir(parents=True, exist_ok=True)
@@ -85,6 +91,7 @@ class TrainerPublisher:
             )
             extra: dict[str, Any] = {
                 "trained_window_cursor": int(trained_window_cursor),
+                "journal_key_space": key_space,
             }
             if lr_schedule_step is not None:
                 extra["lr_schedule_step"] = int(lr_schedule_step)
@@ -123,6 +130,7 @@ class TrainerPublisher:
                 "revision": str(revision),
                 "trained_window_cursor": int(trained_window_cursor),
                 "reason": str(reason),
+                "journal_key_space": key_space,
             }
             await asyncio.to_thread(
                 self._r2.put_object,

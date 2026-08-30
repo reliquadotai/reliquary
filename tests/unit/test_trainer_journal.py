@@ -73,3 +73,83 @@ def test_v5_identity_mismatch_fails_closed():
         match="protocol_profile_id",
     ):
         journal.next_entry(100, stride=1)
+
+
+# ---- C3: journal key-space migration at resume (R25) ------------------
+
+
+def test_a_raw_cursor_is_multiplied_once_when_v6_is_armed(monkeypatch):
+    """R25: at cutover the trainer's cursor is a WINDOW number, but the v6
+    journal is keyed window * EMISSIONS + batch. Resuming a raw cursor
+    against the encoded space parks the trainer 15/16 of a window early
+    forever, or raises on the window-start comparison."""
+    import reliquary.trainer.journal as journal_module
+    from reliquary.trainer.journal import migrate_journal_cursor
+
+    monkeypatch.setattr(journal_module, "FILL_CLOSED_ENABLED", True)
+    emissions = journal_module.FILL_CLOSED_EMISSIONS_PER_WINDOW
+
+    cursor, key_space = migrate_journal_cursor(30_000, "raw")
+
+    assert cursor == 30_000 * emissions
+    assert key_space == "fill_closed"
+
+
+def test_migration_is_idempotent(monkeypatch):
+    """The marker is rewritten with the cursor, so a second resume from the
+    migrated checkpoint must be a no-op -- otherwise every restart
+    multiplies again."""
+    import reliquary.trainer.journal as journal_module
+    from reliquary.trainer.journal import migrate_journal_cursor
+
+    monkeypatch.setattr(journal_module, "FILL_CLOSED_ENABLED", True)
+
+    once = migrate_journal_cursor(30_000, "raw")
+    twice = migrate_journal_cursor(*once)
+
+    assert twice == once
+
+
+def test_a_fill_closed_cursor_is_divided_when_the_gate_is_off(monkeypatch):
+    """The other direction: rolling v6 back must not leave the cursor 16x
+    past the end of the raw key space."""
+    import reliquary.trainer.journal as journal_module
+    from reliquary.trainer.journal import migrate_journal_cursor
+
+    monkeypatch.setattr(journal_module, "FILL_CLOSED_ENABLED", False)
+    emissions = journal_module.FILL_CLOSED_EMISSIONS_PER_WINDOW
+
+    cursor, key_space = migrate_journal_cursor(30_000 * emissions, "fill_closed")
+
+    assert cursor == 30_000
+    assert key_space == "raw"
+
+
+def test_an_absent_marker_reads_as_raw(monkeypatch):
+    """Every checkpoint published before this field existed is raw-keyed."""
+    import reliquary.trainer.journal as journal_module
+    from reliquary.trainer.journal import migrate_journal_cursor
+
+    monkeypatch.setattr(journal_module, "FILL_CLOSED_ENABLED", True)
+    emissions = journal_module.FILL_CLOSED_EMISSIONS_PER_WINDOW
+
+    assert migrate_journal_cursor(7, None) == (7 * emissions, "fill_closed")
+
+
+def test_an_unknown_marker_refuses_to_guess(monkeypatch):
+    import reliquary.trainer.journal as journal_module
+    from reliquary.trainer.journal import migrate_journal_cursor
+
+    monkeypatch.setattr(journal_module, "FILL_CLOSED_ENABLED", True)
+
+    with pytest.raises(ValueError):
+        migrate_journal_cursor(7, "something-else")
+
+
+def test_the_matching_marker_leaves_the_cursor_alone(monkeypatch):
+    import reliquary.trainer.journal as journal_module
+    from reliquary.trainer.journal import migrate_journal_cursor
+
+    monkeypatch.setattr(journal_module, "FILL_CLOSED_ENABLED", False)
+
+    assert migrate_journal_cursor(30_000, "raw") == (30_000, "raw")
