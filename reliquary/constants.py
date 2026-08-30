@@ -743,6 +743,26 @@ FILL_CLOSED_ENABLED = PROTOCOL_VERSION >= 6 and _os.environ.get(
     "RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
 
+# The two experimental capabilities are mutually exclusive, and a box with
+# both armed must not boot (R30). They collide on the training journal:
+#   * the tombstone path writes under the RAW window key whenever a
+#     checkpoint epoch is present, which under fill-closed collides with
+#     the encoded key space (window * FILL_CLOSED_EMISSIONS_PER_WINDOW +
+#     batch_index) every other v6 write uses;
+#   * an epoch opening mid-window would close() that window's batch
+#     assembler early, sealing a window that is still collecting.
+# Neither is a runtime condition anything downstream can recover from, so
+# it is refused here, where an operator reads the message.
+if FILL_CLOSED_ENABLED and EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED:
+    raise ValueError(
+        "RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED and "
+        "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED cannot both be "
+        "enabled: a checkpoint epoch sends training tombstones to the raw "
+        "window journal key, which collides with the fill-closed encoded "
+        "key space, and an epoch opening mid-window closes that window's "
+        "batch assembler early. Disable one."
+    )
+
 # Proven groups that close one environment. 16 optimizer steps x B_BATCH.
 FILL_CLOSED_TARGET_GROUPS_PER_ENV = int(_os.environ.get(
     "RELIQUARY_FILL_CLOSED_TARGET_GROUPS_PER_ENV",

@@ -115,3 +115,32 @@ def test_a_target_past_the_emission_ceiling_refuses_to_import():
     assert result.returncode != 0
     assert "FILL_CLOSED_EMISSIONS_PER_WINDOW" in result.stderr
     assert "journal" in result.stderr
+
+
+def test_the_two_experimental_capabilities_refuse_to_run_together():
+    """R30: fill-closed and checkpoint-epoch are mutually exclusive.
+
+    With both armed, C2's tombstone gate (``and checkpoint_epoch is None``)
+    falls back to the RAW journal key, colliding with v6's encoded key
+    space -- the original bug -- and ``_open_checkpoint_epoch`` would
+    ``close()`` a lane's assembler before its window is done. Import is the
+    only place an operator reads the refusal.
+    """
+    result = _constants_under(
+        RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED="1",
+    )
+
+    assert result.returncode != 0
+    assert "RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED" in result.stderr
+    assert "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED" in result.stderr
+
+
+def test_checkpoint_epoch_alone_still_imports():
+    """The refusal is about the PAIR: the epoch capability on its own (v6
+    profile, fill-closed disarmed) is untouched by this branch."""
+    result = _constants_under(
+        RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED="0",
+        RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED="1",
+    )
+
+    assert result.returncode == 0, result.stderr
