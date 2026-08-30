@@ -125,6 +125,17 @@ class FillClosedBatchAssembler:
                 f"chunk for window {window_start}"
             )
         with self._lock:
+            # R19: a straggler proof-worker callback landing after
+            # ``close()`` has already run must not merge silently into a
+            # dead assembler (close()'s own remainder/padding writes have
+            # already claimed every key this window owns) -- it must be
+            # loud. Checked under the SAME lock ``close()`` sets
+            # ``_closed`` under, so this can never race a concurrent
+            # ``close()`` into passing here right as the window shuts.
+            if self._closed:
+                raise RuntimeError(
+                    f"assembler closed for window {self.window_start}"
+                )
             self._checkpoint_revision = str(checkpoint_revision)
             self._pending[environment].append(list(groups))
             prepared = self._drain_locked()
@@ -278,30 +289,104 @@ class FillClosedBatchAssembler:
 
         Idempotent: a second call, or one racing a final in-flight
         ``accept``, is a no-op -- ``_closed`` is set under the same lock
-        that gates the decision of what (if anything) to write.
+        that gates the decision of what (if anything) to write, and a
+        straggler ``accept`` landing after this point raises instead of
+        merging into a dead assembler (R19).
+
+        R19: before deciding what the remainder even IS, this drains
+        ``_pending`` the same way ``_drain_locked`` always does --
+        because a chunk can be sitting there for a reason that has
+        nothing to do with this being the window's last cycle: an
+        environment's accumulator slot was already full (at B_BATCH)
+        when a LATER chunk for that same environment arrived, so
+        ``_drain_locked`` held it back rather than overflow the current
+        cycle. Reading only ``self._accumulator`` -- as this method did
+        before R19 -- misses that held chunk entirely: it is real,
+        proven, paid work that a caller reading ``remainder_snapshot()``
+        right after ``close()`` would still see as outstanding, silently
+        unaccounted for. Forcing the remainder write below resets the
+        accumulator and frees every environment's capacity again, so a
+        held chunk gets a fresh chance to drain on the next pass; this
+        repeats until both ``_pending`` and the accumulator are
+        genuinely empty (or the window's own encoded range runs out),
+        so ``remainder_snapshot()`` reports empty on both counts once
+        this returns.
         """
         with self._lock:
             if self._closed:
                 return
             self._closed = True
-            # Defensive: a window whose accept() calls exactly exhausted
-            # every encoded slot this window owns (next_batch_index ==
-            # FILL_CLOSED_EMISSIONS_PER_WINDOW, the full-fill case) has
-            # nothing left to reclaim -- there is no key left to write
-            # under, and encoded_window_journal_key raises past this
-            # bound. Pre-existing latent bound, not introduced here; this
-            # only keeps close() from being the thing that trips it.
-            if self.next_batch_index >= FILL_CLOSED_EMISSIONS_PER_WINDOW:
-                return
-            if self._accumulator.has_groups_for_all_targets:
-                prepared = [
-                    self._prepare_payload_locked(allow_partial=True)
-                ]
-            else:
-                prepared = [
-                    self._prepare_incomplete_remainder_tombstone_locked()
-                ]
+            prepared: list[_PreparedWrite] = []
+            while self.next_batch_index < FILL_CLOSED_EMISSIONS_PER_WINDOW:
+                # Absorb whatever fits without forcing anything -- the
+                # SAME merge ``accept()`` uses, including writing any
+                # full cross-env cycle it completes along the way.
+                prepared.extend(self._drain_locked())
+                counts = self._accumulator.snapshot()["counts"]
+                still_outstanding = any(counts.values()) or any(
+                    self._pending[environment]
+                    for environment in self._env_order
+                )
+                if not still_outstanding:
+                    break
+                if self._accumulator.has_groups_for_all_targets:
+                    prepared.append(
+                        self._prepare_payload_locked(allow_partial=True)
+                    )
+                else:
+                    prepared.append(
+                        self._prepare_incomplete_remainder_tombstone_locked()
+                    )
+                # Loop again: the forced write above just reset the
+                # accumulator, freeing every environment's capacity --
+                # anything still queued in ``_pending`` (R19's repro: a
+                # second full chunk for an environment whose slot was
+                # already at B_BATCH) gets pulled in on the next pass
+                # instead of being left behind.
+            # R18: whatever slots the loop above did not use, up to the
+            # window's own ceiling, would otherwise stay unwritten
+            # forever -- see ``_prepare_underfill_padding_locked``.
+            prepared.extend(self._prepare_underfill_padding_locked())
         self._write_all(prepared)
+
+    def _prepare_underfill_padding_locked(self) -> list[_PreparedWrite]:
+        """R18: ``WindowJournal.next_entry`` (trainer/journal.py) walks
+        the encoded key space one integer at a time -- ``payload_key``,
+        then ``tombstone_key``, else wait -- with no logic to jump past
+        a window whose range it never fully used. A window that closes
+        after fewer than ``FILL_CLOSED_EMISSIONS_PER_WINDOW`` batches
+        (the common case: production proof budgets saturate well under
+        the window's full target) leaves every later slot in ITS OWN
+        range unwritten. The trainer's cursor parks on the first one
+        forever -- not just missing this window's tail, but never
+        reaching any later window either, since the journal "never
+        advances on absence, only on an explicit marker" (journal.py's
+        own module docstring). Tombstoning every remaining slot here,
+        right after the remainder above claims its own, makes the
+        journal gapless by construction for this window -- the same
+        invariant a fully-filled window already gets for free by using
+        every slot itself.
+        """
+        padding: list[_PreparedWrite] = []
+        while self.next_batch_index < FILL_CLOSED_EMISSIONS_PER_WINDOW:
+            key = encoded_window_journal_key(
+                self.window_start, self.next_batch_index
+            )
+            data = encode_tombstone(
+                window_start=self.window_start,
+                failure_stage="window_underfilled",
+                failure_type="WindowUnderfilled",
+            )
+            log_message = (
+                "FillClosedBatchAssembler: window %d batch %d padded "
+                "with a tombstone at close (journal key %d, window "
+                "underfilled)" % (
+                    self.window_start, self.next_batch_index, key,
+                )
+            )
+            padding.append(_PreparedWrite(key, data, True, log_message))
+            self.next_batch_index += 1
+        return padding
 
     def remainder_snapshot(self) -> dict[str, Any]:
         """Groups still held and not yet part of a written payload, for

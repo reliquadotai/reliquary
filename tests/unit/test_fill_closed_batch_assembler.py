@@ -319,6 +319,7 @@ def test_close_emits_the_remainder_as_a_payload_when_every_env_has_groups(
     final, partial payload rather than dropping proven, paid rollouts.
     """
     import reliquary.infrastructure.training_payload_queue as queue_module
+    from reliquary.constants import FILL_CLOSED_EMISSIONS_PER_WINDOW
 
     monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
 
@@ -345,7 +346,6 @@ def test_close_emits_the_remainder_as_a_payload_when_every_env_has_groups(
 
     assembler.close()
 
-    assert tombstoned == []
     assert len(enqueued) == 1
     key, data = enqueued[0]
     assert key == encoded_window_journal_key(window, 0)
@@ -354,7 +354,11 @@ def test_close_emits_the_remainder_as_a_payload_when_every_env_has_groups(
         math_partial
     )
     assert _prompt_ids(batches["opencodeinstruct"]) == _prompt_ids(code_full)
-    assert assembler.next_batch_index == 1
+    # R18: everything past the remainder's own slot is padded with
+    # tombstones so the journal is gapless -- see the dedicated padding
+    # tests below for the full key-accounting assertions.
+    assert len(tombstoned) == FILL_CLOSED_EMISSIONS_PER_WINDOW - 1
+    assert assembler.next_batch_index == FILL_CLOSED_EMISSIONS_PER_WINDOW
 
 
 def test_close_tombstones_when_one_env_contributed_nothing(monkeypatch):
@@ -386,12 +390,14 @@ def test_close_tombstones_when_one_env_contributed_nothing(monkeypatch):
     assembler.close()
 
     assert enqueued == []
-    assert len(tombstoned) == 1
+    # R18: the remainder tombstone plus padding for every slot after it.
+    from reliquary.constants import FILL_CLOSED_EMISSIONS_PER_WINDOW
+    assert len(tombstoned) == FILL_CLOSED_EMISSIONS_PER_WINDOW
     key, data = tombstoned[0]
     assert key == encoded_window_journal_key(window, 0)
     decoded = decode_tombstone(data)
     assert decoded["window_start"] == window
-    assert assembler.next_batch_index == 1
+    assert assembler.next_batch_index == FILL_CLOSED_EMISSIONS_PER_WINDOW
 
 
 def test_a_second_close_is_a_noop(monkeypatch):
@@ -418,12 +424,17 @@ def test_a_second_close_is_a_noop(monkeypatch):
         )
 
     assembler.close()
-    assert len(enqueued) + len(tombstoned) == 1
+    from reliquary.constants import FILL_CLOSED_EMISSIONS_PER_WINDOW
+    assert (
+        len(enqueued) + len(tombstoned) == FILL_CLOSED_EMISSIONS_PER_WINDOW
+    )
     next_index_after_first_close = assembler.next_batch_index
 
     assembler.close()
 
-    assert len(enqueued) + len(tombstoned) == 1
+    assert (
+        len(enqueued) + len(tombstoned) == FILL_CLOSED_EMISSIONS_PER_WINDOW
+    )
     assert assembler.next_batch_index == next_index_after_first_close
 
 
@@ -457,3 +468,224 @@ def test_enqueue_fn_is_invoked_without_the_lock_held(monkeypatch):
         assembler.accept(env, _chunk(0, env), window, "rev")
 
     assert calls == [encoded_window_journal_key(window, 0)]
+
+
+def test_close_pads_every_remaining_slot_when_remainder_has_every_env(
+    monkeypatch,
+):
+    """R18: WindowJournal.next_entry walks the encoded key space one
+    integer at a time with no jump logic, so any slot this window's
+    range never writes parks the trainer's cursor there forever -- not
+    just for this window's tail, but for every window after it too.
+    One full cycle writes a payload at index 0; a remainder with every
+    env represented gets its own payload at index 1 (R16); everything
+    from there through the window's ceiling must be tombstoned so the
+    journal is gapless, with no key skipped or written twice.
+    """
+    import reliquary.infrastructure.training_payload_queue as queue_module
+    from reliquary.constants import FILL_CLOSED_EMISSIONS_PER_WINDOW
+
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
+
+    window = 42
+    enqueued: list[tuple[int, bytes]] = []
+    tombstoned: list[tuple[int, bytes]] = []
+    assembler = FillClosedBatchAssembler(
+        window_start=window,
+        env_order=ENV_ORDER,
+        enqueue_fn=lambda key, data: enqueued.append((key, data)),
+        tombstone_fn=lambda key, data: tombstoned.append((key, data)),
+    )
+
+    for env in ENV_ORDER:
+        assembler.accept(env, _chunk(0, env), window, "rev")
+    assert len(enqueued) == 1
+    assert assembler.next_batch_index == 1
+
+    for env in ENV_ORDER:
+        assembler.accept(
+            env, _partial_chunk(1, env, B_BATCH - 2), window, "rev",
+        )
+
+    assembler.close()
+
+    remainder_index = 1
+    assert len(enqueued) == 2
+    payload_keys = [key for key, _ in enqueued]
+    assert payload_keys == [
+        encoded_window_journal_key(window, 0),
+        encoded_window_journal_key(window, remainder_index),
+    ]
+    expected_padding_keys = {
+        encoded_window_journal_key(window, idx)
+        for idx in range(
+            remainder_index + 1, FILL_CLOSED_EMISSIONS_PER_WINDOW
+        )
+    }
+    tombstone_keys = {key for key, _ in tombstoned}
+    assert tombstone_keys == expected_padding_keys
+
+    all_written = [key for key, _ in enqueued] + [
+        key for key, _ in tombstoned
+    ]
+    assert len(all_written) == len(set(all_written))  # no duplicate key
+    assert set(all_written) == {
+        encoded_window_journal_key(window, idx)
+        for idx in range(FILL_CLOSED_EMISSIONS_PER_WINDOW)
+    }
+    assert assembler.next_batch_index == FILL_CLOSED_EMISSIONS_PER_WINDOW
+
+
+def test_close_pads_every_remaining_slot_when_remainder_is_empty(
+    monkeypatch,
+):
+    """R18: same gaplessness requirement as above, but the remainder
+    itself is the R16 "one env empty" tombstone case -- so index 1
+    through the ceiling are ALL tombstones (the remainder marker plus
+    the padding), and only index 0's earlier full cycle is a payload.
+    """
+    import reliquary.infrastructure.training_payload_queue as queue_module
+    from reliquary.constants import FILL_CLOSED_EMISSIONS_PER_WINDOW
+
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
+
+    window = 42
+    enqueued: list[tuple[int, bytes]] = []
+    tombstoned: list[tuple[int, bytes]] = []
+    assembler = FillClosedBatchAssembler(
+        window_start=window,
+        env_order=ENV_ORDER,
+        enqueue_fn=lambda key, data: enqueued.append((key, data)),
+        tombstone_fn=lambda key, data: tombstoned.append((key, data)),
+    )
+
+    for env in ENV_ORDER:
+        assembler.accept(env, _chunk(0, env), window, "rev")
+    assert len(enqueued) == 1
+    assert assembler.next_batch_index == 1
+
+    # opencodeinstruct never contributes to the final cycle at all.
+    assembler.accept(
+        "openmathinstruct", _partial_chunk(1, "openmathinstruct", 3),
+        window, "rev",
+    )
+
+    assembler.close()
+
+    assert len(enqueued) == 1  # only the earlier full cycle
+    tombstone_keys = {key for key, _ in tombstoned}
+    assert tombstone_keys == {
+        encoded_window_journal_key(window, idx)
+        for idx in range(1, FILL_CLOSED_EMISSIONS_PER_WINDOW)
+    }
+
+    all_written = [key for key, _ in enqueued] + [
+        key for key, _ in tombstoned
+    ]
+    assert len(all_written) == len(set(all_written))
+    assert set(all_written) == {
+        encoded_window_journal_key(window, idx)
+        for idx in range(FILL_CLOSED_EMISSIONS_PER_WINDOW)
+    }
+    assert assembler.next_batch_index == FILL_CLOSED_EMISSIONS_PER_WINDOW
+
+
+def test_close_drains_pending_before_deciding_the_remainder(monkeypatch):
+    """R19 Critical: opencodeinstruct sends TWO full B_BATCH chunks --
+    the second queues into ``_pending`` because the accumulator's code
+    slot from the first chunk is already full -- while math sends only
+    a partial chunk. ``close()`` used to look only at
+    ``self._accumulator``, so the queued second code chunk was silently
+    dropped: ``remainder_snapshot()`` read right after ``close()`` kept
+    reporting it as outstanding pending work, contradicting its own
+    docstring. ``close()`` must drain ``_pending`` first (looping, since
+    a forced remainder write frees capacity for the next pass) so both
+    ``_pending`` and the accumulator are genuinely empty once it
+    returns, and every key this window ever touches is written exactly
+    once -- nothing vanishes, and nothing is double-counted.
+    """
+    import reliquary.infrastructure.training_payload_queue as queue_module
+    from reliquary.constants import FILL_CLOSED_EMISSIONS_PER_WINDOW
+
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
+
+    window = 42
+    enqueued: list[tuple[int, bytes]] = []
+    tombstoned: list[tuple[int, bytes]] = []
+    assembler = FillClosedBatchAssembler(
+        window_start=window,
+        env_order=ENV_ORDER,
+        enqueue_fn=lambda key, data: enqueued.append((key, data)),
+        tombstone_fn=lambda key, data: tombstoned.append((key, data)),
+    )
+
+    code_chunk_1 = _chunk(0, "opencodeinstruct")
+    code_chunk_2 = _chunk(1, "opencodeinstruct")
+    math_partial = _partial_chunk(0, "openmathinstruct", B_BATCH - 2)
+
+    assembler.accept("opencodeinstruct", code_chunk_1, window, "rev")
+    assembler.accept("opencodeinstruct", code_chunk_2, window, "rev")
+    assembler.accept("openmathinstruct", math_partial, window, "rev")
+
+    pre_close = assembler.remainder_snapshot()
+    assert pre_close["pending"]["opencodeinstruct"] == 1
+    assert enqueued == []
+    assert tombstoned == []
+
+    assembler.close()
+
+    post_close = assembler.remainder_snapshot()
+    assert post_close["pending"] == {env: 0 for env in ENV_ORDER}
+    assert post_close["in_accumulator"] == {env: 0 for env in ENV_ORDER}
+
+    all_written = [key for key, _ in enqueued] + [
+        key for key, _ in tombstoned
+    ]
+    assert len(all_written) == len(set(all_written))
+    assert set(all_written) == {
+        encoded_window_journal_key(window, idx)
+        for idx in range(FILL_CLOSED_EMISSIONS_PER_WINDOW)
+    }
+
+    # math's only chunk was proven exactly once -- it must appear in
+    # exactly one written payload, not zero (dropped) and not two
+    # (duplicated).
+    math_prompt_ids_seen: list[int] = []
+    for _, data in enqueued:
+        batches = decode_training_payload(data).batches()
+        math_prompt_ids_seen.extend(_prompt_ids(batches["openmathinstruct"]))
+    assert math_prompt_ids_seen == _prompt_ids(math_partial)
+
+
+def test_accept_after_close_raises_instead_of_merging_into_a_dead_assembler(
+    monkeypatch,
+):
+    """R19: a straggler proof-worker callback landing after close() has
+    already run must be loud, not lost -- close() has already claimed
+    every key this window owns (the remainder plus R18's padding), so
+    quietly merging a late chunk into the accumulator would just leave
+    it unwritten and unread again, exactly the failure R16-R19 exist to
+    close.
+    """
+    import reliquary.infrastructure.training_payload_queue as queue_module
+    import pytest
+
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
+
+    window = 42
+    assembler = FillClosedBatchAssembler(
+        window_start=window,
+        env_order=ENV_ORDER,
+        enqueue_fn=lambda key, data: None,
+        tombstone_fn=lambda key, data: None,
+    )
+    assembler.accept(
+        "openmathinstruct", _partial_chunk(0, "openmathinstruct", 3),
+        window, "rev",
+    )
+    assembler.close()
+
+    with pytest.raises(RuntimeError, match=str(window)):
+        assembler.accept(
+            "opencodeinstruct", _chunk(0, "opencodeinstruct"), window, "rev",
+        )
