@@ -1,7 +1,10 @@
 # Task 12 report — service pacing + the window-open gate (v6.1, R34/R35/R36)
 
-## Status: DONE. Commits `9c01ef1`, `986a52b`, `5f552c6` (+ a docstring
-follow-up). 24 new pins in `tests/unit/test_pick_pacing.py`, every one
+## Status: DONE. Commits `9c01ef1`, `986a52b`, `5f552c6`, `a8d52a7`,
+`226975c`. Full suite on HEAD: **2358 passed**, 13 skipped, 1 failed —
+baseline 2334 + exactly the 24 new pins, and the single failure
+(`test_admission_isolation.py::test_spawned_worker_deadline_is_terminal`)
+is the pre-existing one, identical at the T11 baseline. Every new pin was
 watched red first (24/24 red on the first run, with the right
 `AttributeError`/`ImportError` reasons, not harness bugs).
 
