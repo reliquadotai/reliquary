@@ -3366,6 +3366,19 @@ class ValidationService:
         gate reads as "not yet", so every failure here degrades to picks
         stopping and the backstop sealing a partial window, never to a
         pick firing on a cadence nobody measured.
+
+        GAP, deliberately left visible: ``read_step_cursor`` reads the
+        queue's LOCAL ``step-cursor.json``, and the trainer writes that
+        file on the train worker, from where the drain UPLOADS it to
+        ``reliquary/training/step-cursor.json``. Nothing downloads it back
+        on this side, so today this returns None on the validator and
+        every window takes its first ``FILL_CLOSED_PICK_PIPELINE_DEPTH``
+        picks on the time floor and then waits for the backstop (pinned by
+        ``test_an_absent_cursor_still_lets_the_first_picks_fire``). The
+        seam is right and the missing half is one R2 GET behind this
+        method -- a fetch-then-read on the queue -- which is a transport
+        decision (cadence, cost, threading) that belongs with the rest of
+        the cursor transport, not here.
         """
         try:
             return self._training_payload_queue_ref().read_step_cursor()
