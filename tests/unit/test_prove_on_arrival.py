@@ -211,41 +211,56 @@ def test_an_unknown_rate_falls_back_to_lowest_priority_not_a_crash(monkeypatch):
     in a different window). The group must still drain -- after every
     known-rate group, however small its rate -- rather than raise.
 
-    R33: a release no longer reopens the budget, so the two entries are
-    placed in the buffer directly (as a genuine concurrent race would --
-    both landing before either's own drain runs) instead of via arrival
-    + release; the sort-and-pick logic under test is exactly the same
-    ``_drain_arrival_proof_buffer`` code either way."""
+    Driven through the REAL intake (``_submit_arrival_proof`` doing its
+    own ``rate_of``/``payload_bytes_of`` lookups), with only the
+    auto-drain held off so both bodies sit in the buffer together, the
+    way a genuine concurrent race leaves them -- the same shape
+    ``test_rate_ordered_admission`` uses. That also covers the miss
+    fallback on the SIZE: the queue has no entry for the unknown
+    receipt, so ``payload_bytes`` degrades to the request's own accounted
+    size (0 for a body that was never precommitted) instead of raising.
+
+    R33: a release no longer reopens the budget, so the buffer cannot be
+    filled by arrival + release; holding the drain off is what produces
+    two competing entries now."""
     import reliquary.validator.batcher as batcher_module
-    from reliquary.validator.batcher import _BufferedArrivalProof
+    from tests.unit.test_rate_ordered_admission import _pending_for_receipt
 
     monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
 
     extended = []
     batcher = _make_batcher()
+    batcher.mark_window_opened()
     env = "openmathinstruct"
+    batcher.admission_queue = batcher_module.ThroughputAdmissionQueue(
+        window_opened_at=batcher.window_opened_at
+    )
+    # Only the "known" receipt was ever offered: 1000 bytes over 1000 s
+    # of window, a rate of 1.0 -- feeble, but known.
+    batcher.admission_queue.offer(
+        receipt_id="known", environment=env, payload_bytes=1_000,
+        precommit_arrived_at=batcher.window_opened_at + 1_000.0,
+    )
     batcher.fill_state = batcher_module.FillState(
         budgets={"openmathinstruct": 1, "opencodeinstruct": 1}, picks_target=16
     )
     batcher._extend_proof_plan = lambda candidates: extended.extend(candidates)
 
-    # payload_bytes/receipt_id ride along from the precommit for the
-    # PICK's tie-break (amendment v6.1); the drain order under test here
-    # keys off the rate alone.
-    unknown = _BufferedArrivalProof(
-        pending=_pending_stub(prompt_idx=71), rate=None,
-        payload_bytes=90_000, receipt_id="unknown", sequence=1,
-    )
-    known = _BufferedArrivalProof(
-        pending=_pending_stub(prompt_idx=72), rate=0.001,
-        payload_bytes=1_000, receipt_id="known", sequence=2,
-    )
-    batcher._arrival_proof_buffer.extend([unknown, known])
+    real_drain = batcher._drain_arrival_proof_buffer
+    batcher._drain_arrival_proof_buffer = lambda environment: None
+    batcher._submit_arrival_proof(_pending_for_receipt(71, "never-offered"))
+    batcher._submit_arrival_proof(_pending_for_receipt(72, "known"))
+    batcher._drain_arrival_proof_buffer = real_drain
+
+    unknown, known = batcher._arrival_proof_buffer
+    assert (unknown.rate, unknown.payload_bytes) == (None, 0)
+    assert known.rate == 1.0
+    assert known.payload_bytes == 1_000
 
     batcher._drain_arrival_proof_buffer(env)
 
     assert len(extended) == 1
-    assert extended[0].payload.pending.prompt_idx == 72  # "known" wins despite tiny rate
+    assert extended[0].payload.pending.prompt_idx == 72  # "known" wins
     assert len(batcher._arrival_proof_buffer) == 1
     assert batcher._arrival_proof_buffer[0] is unknown
 

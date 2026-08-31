@@ -11,8 +11,10 @@ def test_the_window_seals_at_the_nth_pick(monkeypatch):
     """R35: the window used to seal when every environment reached its
     proven target -- it no longer does. Proven groups now only
     accumulate in the pool; ``record_pick()`` is called directly here to
-    pin the FillState/``poll_deadline`` seam (Task 11 wires the real
-    pick-by-rate call that drives it in production)."""
+    pin the FillState/``poll_deadline`` seam (the real pick-by-rate call
+    that drives it in production is ``pick_training_batch``). R37: a pick
+    ordinal is per environment, so the seal takes every environment's
+    half of the last event."""
     import reliquary.validator.batcher as batcher_module
     monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
 
@@ -26,7 +28,10 @@ def test_the_window_seals_at_the_nth_pick(monkeypatch):
     batcher.fill_state.record_proven("opencodeinstruct")
     assert batcher.poll_deadline() is False
 
-    batcher.fill_state.record_pick()
+    batcher.fill_state.record_pick("openmathinstruct")
+    assert batcher.poll_deadline() is False
+
+    batcher.fill_state.record_pick("opencodeinstruct")
 
     assert batcher.poll_deadline() is True
 
@@ -36,7 +41,9 @@ def test_two_env_batchers_share_one_fill_state_for_is_closed(monkeypatch):
     but ``FillState`` is shared and ``is_closed()`` is window-wide (R35:
     gated on picks, not a per-environment proven count). One shared
     instance, injected into both batchers' ``.fill_state``, is what makes
-    ``is_closed()`` see across them."""
+    ``is_closed()`` see across them -- and under R37 seeing across them
+    means asking EVERY environment for its own ordinal, so one
+    environment racing ahead never closes the window under its sibling."""
     import reliquary.validator.batcher as batcher_module
     monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
 
@@ -48,12 +55,14 @@ def test_two_env_batchers_share_one_fill_state_for_is_closed(monkeypatch):
     math_batcher.fill_state = shared
     code_batcher.fill_state = shared
 
-    shared.record_pick()
+    shared.record_pick("openmathinstruct")
+    shared.record_pick("opencodeinstruct")
+    shared.record_pick("openmathinstruct")
 
     assert math_batcher.fill_state.is_closed() is False
     assert code_batcher.fill_state.is_closed() is False
 
-    shared.record_pick()
+    shared.record_pick("opencodeinstruct")
 
     assert math_batcher.fill_state.is_closed() is True
     assert code_batcher.fill_state.is_closed() is True
@@ -549,7 +558,7 @@ def test_fill_close_also_seals_the_plan_which_finalises_completed(
             batcher._drain_arrival_proof_buffer(env)
             snap = batcher.fill_state.snapshot()
             if snap["proven"][env] >= 1 and snap["picks_emitted"] == 0:
-                batcher.fill_state.record_pick()
+                batcher.fill_state.record_pick(env)
             return batcher.fill_state.is_closed()
 
         _wait_until(_closed, timeout=5.0)

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import itertools
 import logging
 import math
 import threading
@@ -820,6 +821,13 @@ def _arrival_buffer_sort_key(
     return (0, -entry.rate, entry.sequence)
 
 
+# Monotone across every ``_ProvenGroup`` this process builds. Only ever
+# compared WITHIN one batcher's own pool, where it is the order in which
+# proofs completed; process-wide simply removes any way to construct a
+# record without one (see ``_pick_sort_key``'s final component).
+_proven_group_sequence = itertools.count(1)
+
+
 @dataclass
 class _ProvenGroup:
     """One PASSED group sitting in this environment's pick pool (v6.1).
@@ -830,6 +838,9 @@ class _ProvenGroup:
     from every later pick. That flag replaces the contiguous-prefix
     watermark the old watermark-order emission used: a pick claims an
     arbitrary SUBSET of the pool, which no single integer can describe.
+
+    ``sequence`` is assigned here, at the append, and exists only to make
+    the pick order TOTAL -- see ``_pick_sort_key``.
     """
 
     value: Any = field(repr=False)
@@ -837,11 +848,14 @@ class _ProvenGroup:
     payload_bytes: int
     receipt_id: str
     picked: bool = False
+    sequence: int = field(default_factory=lambda: next(_proven_group_sequence))
 
 
-def _pick_sort_key(group: _ProvenGroup) -> tuple[int, float, int, str]:
+def _pick_sort_key(
+    group: _ProvenGroup,
+) -> tuple[int, float, int, str, int]:
     """Highest precommit rate first; unknown rate last; ties broken by
-    payload bytes DESCENDING, then receipt id.
+    payload bytes DESCENDING, then receipt id, then append sequence.
 
     The tie-break is the load-bearing half. The rate metric is
     length-NEUTRAL by construction (payload bytes over elapsed since
@@ -851,16 +865,27 @@ def _pick_sort_key(group: _ProvenGroup) -> tuple[int, float, int, str]:
     would hand the seat straight back to whoever finished first, which is
     systematically the shortest answer: the exact bias amendment v6.1
     exists to remove. The larger payload wins instead, so a tie resolves
-    toward length diversity. The receipt id only makes the order total
-    (and deterministic across the pool's list order).
+    toward length diversity.
+
+    The last two components only make the order TOTAL. The receipt id is
+    not enough on its own: it is empty for any group whose precommit fell
+    out of the admission queue, so two such groups with equal bytes tied
+    on every component and a stable sort quietly resolved them by pool
+    position -- append order, i.e. the arrival tie-break this key
+    forswears two paragraphs up. ``sequence`` ends it explicitly instead,
+    and being unique it can never itself tie.
     """
     if group.rate is None:
-        return (1, 0.0, -int(group.payload_bytes), str(group.receipt_id))
+        return (
+            1, 0.0, -int(group.payload_bytes), str(group.receipt_id),
+            int(group.sequence),
+        )
     return (
         0,
         -float(group.rate),
         -int(group.payload_bytes),
         str(group.receipt_id),
+        int(group.sequence),
     )
 
 
@@ -1980,7 +2005,18 @@ class GrpoWindowBatcher:
             return False
         environment = str(getattr(self.env, "name", ""))
         with self.fill_state.lock:
-            if self.fill_state.is_closed() or self.is_sealed():
+            # This environment's OWN ordinal, not the window-wide close
+            # (R37): while a sibling still owes its half of the event in
+            # flight the window is deliberately not closed, so
+            # ``is_closed()`` cannot be what stops an environment that
+            # has already taken every pick it owns.
+            snapshot = self.fill_state.snapshot()
+            if (
+                self.is_sealed()
+                or snapshot["closed"]
+                or self.fill_state.picks_taken(environment)
+                >= snapshot["picks_target"]
+            ):
                 return False
             unpicked = 0
             for group in self._proven_groups.get(environment, []):
@@ -2038,20 +2074,37 @@ class GrpoWindowBatcher:
         """
         if self.fill_state is None:
             return False
-        chunk = self._claim_pick_chunk()
-        if chunk is None:
+        claim = self._claim_pick_chunk()
+        if claim is None:
             return False
+        *chunk, claimed = claim
         if self._emit_training_batch_fn is not None:
-            self._emit_training_batch_fn(*chunk)
+            try:
+                self._emit_training_batch_fn(*chunk)
+            except BaseException:
+                # The groups were flagged under the lock; the callback
+                # that would have made them payable did not complete, so
+                # nothing reached the assembler. Left flagged they would
+                # be invisible to BOTH payment and the close's burn count
+                # -- unflag them instead: a later pick can still seat
+                # them, and if none does the close burns them like any
+                # other surplus. The pick ordinal stays spent: the
+                # sibling environment's half of this event is already
+                # out, and rewinding it would desynchronise the window.
+                with self.fill_state.lock:
+                    for group in claimed:
+                        group.picked = False
+                raise
         return True
 
     def _claim_pick_chunk(
         self,
-    ) -> tuple[str, list[Any], int, str] | None:
+    ) -> tuple[str, list[Any], int, str, list[_ProvenGroup]] | None:
         """Atomically choose, claim and account one pick's worth of THIS
         environment's pool, under ``fill_state.lock``; return
-        ``(environment, groups, window_start, checkpoint_revision)`` for
-        ``pick_training_batch`` to hand to the callback OUTSIDE the lock.
+        ``(environment, groups, window_start, checkpoint_revision)`` plus
+        the claimed pool records, for ``pick_training_batch`` to hand to
+        the callback OUTSIDE the lock (and to unflag if that raises).
         ``None`` (still under the lock) when no pick is possible.
 
         R13: a pick depends ONLY on this environment's own pool -- a fast
@@ -2059,22 +2112,25 @@ class GrpoWindowBatcher:
         environments' chunks back into one DAPO batch is the service-side
         assembler's job, not this batcher's.
 
-        Two counters, deliberately different in scope. ``_batches_emitted``
-        is this ENVIRONMENT's pick ordinal. ``FillState.picks_emitted`` is
-        WINDOW-wide, and one pick k is one DAPO batch built from every
-        environment's own k-th chunk -- so the window-wide counter is
-        advanced by whichever environment reaches ordinal k FIRST, and the
-        sibling that follows it into the same pick k does not advance it
-        again. Counting once per environment instead would close a
-        two-environment window at half the batches R35 asks for.
+        Gated on THIS environment's own pick ordinal (R37), never on the
+        window-wide ``is_closed()``. One pick event is one DAPO batch
+        built from every environment's own k-th chunk, so between the two
+        halves of event k the window is deliberately still open --
+        closing on the leader's half locked its sibling out of the event
+        it was in the middle of and tombstoned that half unpaid. The
+        window-wide count is the MIN over environments and moves on its
+        own when the last half lands; this only has to record the half it
+        just took.
 
-        Refuses once the window is closed rather than letting
-        ``record_pick`` raise: a paced pick racing the seal is a normal
-        outcome, not a fault.
+        Refuses when the ordinal is spent (or the window already sealed)
+        rather than letting ``record_pick`` raise: a paced pick racing
+        the seal is a normal outcome, not a fault.
         """
         environment = str(getattr(self.env, "name", ""))
         with self.fill_state.lock:
-            if self.fill_state.is_closed() or self.is_sealed():
+            if self.is_sealed() or self.fill_state.picks_taken(
+                environment
+            ) >= self.fill_state.snapshot()["picks_target"]:
                 return None
             pool = [
                 group
@@ -2085,17 +2141,35 @@ class GrpoWindowBatcher:
                 return None
             pool.sort(key=_pick_sort_key)
             claimed = pool[:B_BATCH]
+            # Accounted BEFORE the claim: ``record_pick``'s divergence
+            # guard raises on a miscall, and it must do so without
+            # leaving half a pool flagged. Caught here rather than left
+            # to travel: the service drives picks from an unguarded poll
+            # loop, so a raise would take the whole window wait down over
+            # what is a bookkeeping fault. Loud (ERROR) and inert (no
+            # claim) instead -- the sibling can still take its own half,
+            # which is exactly what puts the ordinals back level.
+            try:
+                self.fill_state.record_pick(environment)
+            except ValueError:
+                logger.error(
+                    "fill-closed window %d (%s): pick refused by the "
+                    "ordinal guard, ordinals %s against target %d -- a "
+                    "pick event was driven on one environment only, or "
+                    "twice on one",
+                    self.window_start,
+                    environment,
+                    self.fill_state.snapshot()["picks_by_environment"],
+                    self.fill_state.snapshot()["picks_target"],
+                )
+                return None
+            self._batches_emitted += 1
             for group in claimed:
                 group.picked = True
-            self._batches_emitted += 1
-            if self._batches_emitted > self.fill_state.snapshot()[
-                "picks_emitted"
-            ]:
-                self.fill_state.record_pick()
             chunk = [group.value for group in claimed]
             window_start = self.window_start
             checkpoint_revision = self.current_checkpoint_hash
-        return (environment, chunk, window_start, checkpoint_revision)
+        return (environment, chunk, window_start, checkpoint_revision, claimed)
 
     def _burn_unpicked_proven_groups(self) -> None:
         """R32: at close, whatever is proven but was never picked is

@@ -288,9 +288,13 @@ def test_a_window_wide_pick_is_counted_once_across_environments(monkeypatch):
     window-wide (one shared ``FillState``) while a batcher only ever holds
     its OWN environment's pool. One pick k is therefore N batcher calls --
     one per environment, joined into a single DAPO batch by the assembler
-    -- and must advance the window-wide counter ONCE, not once per
+    -- and must advance the window-wide count ONCE, not once per
     environment, or a two-environment fleet would close its window after
-    half the batches it is supposed to emit."""
+    half the batches it is supposed to emit.
+
+    R37 realizes that count as the MIN over per-environment ordinals: an
+    event half-taken is still the event in flight, so it does not move
+    until its second half lands."""
     import reliquary.validator.batcher as batcher_module
     monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
 
@@ -310,10 +314,13 @@ def test_a_window_wide_pick_is_counted_once_across_environments(monkeypatch):
                env="opencodeinstruct")
 
     assert math_batcher.pick_training_batch() is True
-    assert shared.snapshot()["picks_emitted"] == 1
+    assert shared.snapshot()["picks_emitted"] == 0  # event 1 still in flight
     assert code_batcher.pick_training_batch() is True
 
     assert shared.snapshot()["picks_emitted"] == 1
+    assert shared.snapshot()["picks_by_environment"] == {
+        "openmathinstruct": 1, "opencodeinstruct": 1,
+    }
 
 
 def test_no_pick_happens_once_the_window_has_closed(monkeypatch):
@@ -418,3 +425,205 @@ def test_the_auction_path_has_no_picks_and_no_burn():
     conservation = batcher.upload_precommit_conservation()
     assert conservation["fill_closed_burned_groups"] == 0
     assert conservation["fill_closed_burned_eos_tokens"] == 0
+
+
+def test_both_environments_take_the_final_pick_event(monkeypatch):
+    """The Critical R37 fixes, reproduced end to end.
+
+    With one window-wide counter, the first environment's Nth
+    ``record_pick`` flipped ``is_closed()`` and ``_claim_pick_chunk``
+    refused its sibling IN THE SAME EVENT: the sibling's B_BATCH groups
+    were tombstoned unpaid and the environment that did pick had its half
+    batch written alone -- 1/16 of every window's training data, silently.
+    The gate is this environment's OWN ordinal now, so the last event
+    completes on both sides.
+    """
+    import reliquary.validator.batcher as batcher_module
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+
+    shared = batcher_module.FillState(
+        budgets={"openmathinstruct": 512, "opencodeinstruct": 512},
+        picks_target=1,
+    )
+    math_batcher = _make_batcher()
+    code_batcher = _make_batcher(env=PrivateRewardFakeEnv())
+    picked = []
+    for batcher in (math_batcher, code_batcher):
+        batcher.fill_state = shared
+        batcher.mark_window_opened()
+        batcher._emit_training_batch_fn = (
+            lambda environment, groups, window_start, revision: picked.append(
+                (environment, len(groups))
+            )
+        )
+    for i in range(B_BATCH):
+        _prove(math_batcher, f"m{i}", rate=1.0, payload_bytes=10)
+        _prove(code_batcher, f"c{i}", rate=1.0, payload_bytes=10,
+               env="opencodeinstruct")
+
+    assert math_batcher.pick_training_batch() is True
+    # The window must NOT be closed here: its second half is still owed.
+    assert shared.is_closed() is False
+    assert math_batcher.poll_deadline() is False
+    assert code_batcher.pick_training_batch() is True
+
+    assert sorted(picked) == [
+        ("opencodeinstruct", B_BATCH), ("openmathinstruct", B_BATCH),
+    ]
+    assert shared.is_closed() is True
+
+
+def test_a_pick_is_refused_once_this_environment_has_taken_them_all(
+    monkeypatch,
+):
+    """The own-ordinal gate has to bound picks by itself: the window-wide
+    ``is_closed()`` stays False while a sibling lags, so it cannot be what
+    stops an environment from taking a pick it no longer owns."""
+    import reliquary.validator.batcher as batcher_module
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+
+    shared = batcher_module.FillState(
+        budgets={"openmathinstruct": 512, "opencodeinstruct": 512},
+        picks_target=1,
+    )
+    batcher = _make_batcher()
+    batcher.fill_state = shared
+    batcher.mark_window_opened()
+    picked = _capture_picks(batcher)
+    for i in range(2 * B_BATCH):
+        _prove(batcher, f"m{i}", rate=1.0, payload_bytes=10)
+
+    assert batcher.pick_training_batch() is True
+    assert shared.is_closed() is False  # the code sibling still owes one
+
+    assert batcher.pick_training_batch() is False
+    assert batcher.can_pick() is False
+    assert len(picked) == 1
+
+
+def test_identical_groups_are_ordered_by_sequence_not_by_list_position(
+    monkeypatch,
+):
+    """Minor (c): with an empty ``receipt_id`` and equal payload bytes the
+    first three key components all tie, and a stable sort then silently
+    fell back to pool order -- the arrival tie-break the docstring
+    forswears. A monotone per-batcher sequence, assigned when the group is
+    appended to the pool, makes the order total and explicit.
+
+    Pinned in both directions: the same two groups in the opposite pool
+    order must still resolve the same way.
+    """
+    import reliquary.validator.batcher as batcher_module
+
+    def _contested(order):
+        batcher = _fill_closed_batcher(monkeypatch)
+        picked = _capture_picks(batcher)
+        for i in range(B_BATCH - 1):
+            _prove(batcher, f"filler-{i}", rate=99.0, payload_bytes=10)
+        pool = batcher._proven_groups[ENV]
+        first = batcher_module._ProvenGroup(
+            value=SimpleNamespace(name="first", eos_tokens=0),
+            rate=1.0, payload_bytes=10, receipt_id="", sequence=1,
+        )
+        second = batcher_module._ProvenGroup(
+            value=SimpleNamespace(name="second", eos_tokens=0),
+            rate=1.0, payload_bytes=10, receipt_id="", sequence=2,
+        )
+        with batcher.fill_state.lock:
+            for group in order(first, second):
+                batcher.fill_state.record_proven(ENV)
+                pool.append(group)
+        assert batcher.pick_training_batch() is True
+        return _names(picked[0][1])
+
+    assert "first" in _contested(lambda a, b: (a, b))
+    assert "second" not in _contested(lambda a, b: (a, b))
+    assert "first" in _contested(lambda a, b: (b, a))
+    assert "second" not in _contested(lambda a, b: (b, a))
+
+
+def test_the_real_appender_hands_out_increasing_sequences(monkeypatch):
+    """The sequence is only a total order if the pool's own appender
+    assigns it -- a default that never moves would tie every group."""
+    batcher = _fill_closed_batcher(monkeypatch)
+    for i in range(3):
+        _prove(batcher, f"g{i}", rate=1.0, payload_bytes=10)
+
+    sequences = [group.sequence for group in batcher._proven_groups[ENV]]
+
+    assert sequences == sorted(set(sequences))
+
+
+def test_a_raising_callback_returns_its_chunk_to_the_pool(monkeypatch):
+    """Minor (3): the chunk is flagged picked under the lock, then handed
+    to a callback that writes to the trainer journal OUTSIDE it. If that
+    write raises, the groups are neither paid (nothing landed in the
+    assembler) nor burned (they look picked) -- they vanish from both
+    sides of the accounting. Unmark them: they stay pickable, and if no
+    later pick takes them the close burns them like any other surplus."""
+    batcher = _fill_closed_batcher(monkeypatch, picks_target=4)
+
+    def _explode(environment, groups, window_start, revision):
+        raise RuntimeError("journal write failed")
+
+    batcher._emit_training_batch_fn = _explode
+    for i in range(B_BATCH):
+        _prove(batcher, f"g{i}", rate=1.0, payload_bytes=10, eos_tokens=3)
+
+    with pytest.raises(RuntimeError):
+        batcher.pick_training_batch()
+
+    assert all(
+        not group.picked for group in batcher._proven_groups[ENV]
+    )
+
+    import reliquary.validator.batcher as batcher_module
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_MAX_SECONDS", 0.0)
+    assert batcher.poll_deadline() is True
+
+    conservation = batcher.upload_precommit_conservation()
+    assert conservation["fill_closed_burned_groups"] == B_BATCH
+    assert conservation["fill_closed_burned_eos_tokens"] == 3 * B_BATCH
+
+
+def test_a_diverged_pick_is_refused_and_logged_not_raised(
+    monkeypatch, caplog
+):
+    """The divergence guard is loud at the ``FillState`` level (it raises)
+    but must not travel: ``_drive_fill_closed_picks`` runs unguarded on
+    the service's 0.5 s poll, so an exception there would take the whole
+    window wait down. The batcher catches it, logs ERROR and refuses the
+    pick -- nothing is claimed, the sibling can still take its own half,
+    and the state stays consistent."""
+    import reliquary.validator.batcher as batcher_module
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+
+    shared = batcher_module.FillState(
+        budgets={"openmathinstruct": 512, "opencodeinstruct": 512},
+        picks_target=16,
+    )
+    batcher = _make_batcher()
+    batcher.fill_state = shared
+    batcher.mark_window_opened()
+    picked = _capture_picks(batcher)
+    for i in range(2 * B_BATCH):
+        _prove(batcher, f"m{i}", rate=1.0, payload_bytes=10)
+
+    assert batcher.pick_training_batch() is True  # math takes event 1
+
+    # The code sibling never took its half, so math taking event 2 would
+    # put the ordinals two apart -- a service miscall.
+    with caplog.at_level(logging.ERROR, logger="reliquary.validator.batcher"):
+        assert batcher.pick_training_batch() is False
+
+    assert len(picked) == 1
+    assert shared.snapshot()["picks_by_environment"] == {
+        "openmathinstruct": 1, "opencodeinstruct": 0,
+    }
+    assert sum(
+        1 for group in batcher._proven_groups[ENV] if group.picked
+    ) == B_BATCH
+    assert any(
+        record.levelno == logging.ERROR and "pick" in record.getMessage()
+        for record in caplog.records
+    )

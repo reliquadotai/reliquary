@@ -73,23 +73,79 @@ def test_record_proven_does_not_by_itself_close_the_window():
 
 
 def test_the_window_closes_at_the_nth_pick():
+    """R37: one pick event is one DAPO batch, built from every
+    environment's own k-th chunk, so an ordinal is per ENVIRONMENT and
+    the window closes only once every environment has taken its Nth."""
     state = _state(picks_target=2)
-    state.record_pick()
-    assert state.is_closed() is False
-
-    state.record_pick()
+    for _ in range(2):
+        state.record_pick(MATH)
+        assert state.is_closed() is False
+        state.record_pick(CODE)
 
     assert state.is_closed() is True
 
 
-def test_a_pick_past_the_target_raises():
-    """A pick past ``picks_target`` is a caller bug -- the window should
-    already have sealed at the target-th pick."""
+def test_one_environment_reaching_the_target_does_not_close_the_window():
+    """The Critical R37 fixes, at its source: with a single window-wide
+    counter the first environment's Nth pick flipped ``is_closed``, and
+    the sibling that had to take the SAME event was refused -- its half
+    of the batch tombstoned unpaid while the other half burned."""
     state = _state(picks_target=1)
-    state.record_pick()
+
+    state.record_pick(MATH)
+
+    assert state.is_closed() is False
+
+    state.record_pick(CODE)
+
+    assert state.is_closed() is True
+
+
+def test_picks_emitted_is_the_min_over_environments():
+    """``picks_emitted`` is what the service reads to name the pick event
+    it is about to drive, so it must count only COMPLETE events: an event
+    half-taken is still the event in flight, not the next one."""
+    state = _state(picks_target=4)
+    state.record_pick(MATH)
+
+    assert state.snapshot()["picks_emitted"] == 0
+
+    state.record_pick(CODE)
+
+    assert state.snapshot()["picks_emitted"] == 1
+
+
+def test_environment_ordinals_may_not_diverge_by_more_than_one():
+    """The divergence guard (R37). At most one event is ever in flight,
+    so ordinals differ by at most 1. Anything further means the caller
+    drove one environment twice, or drove only one -- a half-closed
+    window, which used to be silent. Fail loudly, and leave the state
+    exactly as it was so the guard itself cannot corrupt accounting."""
+    state = _state(picks_target=4)
+    state.record_pick(MATH)
 
     with pytest.raises(ValueError):
-        state.record_pick()
+        state.record_pick(MATH)
+
+    assert state.snapshot()["picks_by_environment"] == {MATH: 1, CODE: 0}
+
+
+def test_a_pick_past_the_target_raises():
+    """A pick past ``picks_target`` is a caller bug -- the window should
+    already have sealed once every environment took its target-th pick."""
+    state = _state(picks_target=1)
+    state.record_pick(MATH)
+    state.record_pick(CODE)
+
+    with pytest.raises(ValueError):
+        state.record_pick(MATH)
+
+
+def test_a_pick_for_an_unknown_environment_raises():
+    state = _state(picks_target=1)
+
+    with pytest.raises(ValueError):
+        state.record_pick("nosuchenv")
 
 
 def test_picks_target_must_be_positive():
@@ -110,7 +166,8 @@ def test_the_instance_owns_a_lock_for_sharing_across_batchers():
 def test_snapshot_exposes_the_new_accounting_fields():
     state = _state(budget=5, picks_target=3)
     state.reserve(MATH)
-    state.record_pick()
+    state.record_pick(MATH)
+    state.record_pick(CODE)
 
     snap = state.snapshot()
 
@@ -118,6 +175,7 @@ def test_snapshot_exposes_the_new_accounting_fields():
     assert snap["admitted"] == {MATH: 1, CODE: 0}
     assert snap["in_flight"] == {MATH: 1, CODE: 0}
     assert snap["proven"] == {MATH: 0, CODE: 0}
+    assert snap["picks_by_environment"] == {MATH: 1, CODE: 1}
     assert snap["picks_emitted"] == 1
     assert snap["picks_target"] == 3
     assert snap["closed"] is False

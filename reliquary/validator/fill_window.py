@@ -5,7 +5,7 @@ no model and no GPU. Admission and closing are governed by two, separate
 rules --
 
     admit while   admitted < budget                (per environment)
-    close when    picks_emitted >= picks_target     (window-wide)
+    close when    every env's pick ordinal >= picks_target
 
 which are deliberately decoupled (R33, R35, amendment v6.1). Admission no
 longer gates on a per-environment "target" that also closes the window --
@@ -22,6 +22,16 @@ groups across the pool, and the window closes when the Nth pick has been
 emitted, regardless of how much proven surplus is left in any
 environment's pool. A proven group never picked by close is burned (R32):
 logged, archived with a count, never redistributed and never paid.
+
+R37: a pick EVENT is window-wide but it is taken one environment at a
+time -- one event is one DAPO batch, built from every environment's own
+k-th chunk -- so the ordinal counted here is PER ENVIRONMENT. A single
+window-wide counter could not express the moment between the two halves
+of an event: the first environment's Nth pick flipped the window closed
+and locked its sibling out of the very event it was in the middle of,
+tombstoning that half unpaid. ``picks_emitted`` is therefore the MIN over
+environments (complete events only) and ``is_closed()`` asks every
+environment, not the leader.
 """
 
 from __future__ import annotations
@@ -50,7 +60,9 @@ class FillState:
         self._proven = {name: 0 for name in self._budgets}
         self._in_flight = {name: 0 for name in self._budgets}
         self._picks_target = int(picks_target)
-        self._picks_emitted = 0
+        # Per environment (R37), never a single window-wide counter: see
+        # the module docstring for the half-event this exists to express.
+        self._picks = {name: 0 for name in self._budgets}
         # One window shares exactly one ``FillState`` across every
         # per-environment ``GrpoWindowBatcher`` instance (each batcher only
         # ever reserves/records on its own environment key, but
@@ -92,16 +104,40 @@ class FillState:
             self._in_flight[name] -= 1
         self._proven[name] += 1
 
-    def record_pick(self) -> None:
-        """Account one pick (Component 3 of the amendment). Window-wide,
-        not per-environment: a pick selects across every environment's
-        pool at once."""
-        if self._picks_emitted >= self._picks_target:
-            raise ValueError("pick past picks_target")
-        self._picks_emitted += 1
+    def record_pick(self, environment: str) -> None:
+        """Account this environment's share of one pick event (Component
+        3 of the amendment).
+
+        Two guards, both loud on purpose. Past ``picks_target`` is a
+        caller bug: the window should already have sealed. And ordinals
+        may differ by at most 1 -- exactly one event is ever in flight,
+        so a wider spread means the caller drove one environment twice,
+        or drove only one of them, which used to close a window at half
+        its batches in silence. Validated BEFORE the counter moves, so a
+        refused pick leaves the accounting exactly as it was.
+        """
+        name = self._known(environment)
+        if self._picks[name] >= self._picks_target:
+            raise ValueError(
+                f"pick past picks_target for {name!r}"
+            )
+        prospective = dict(self._picks)
+        prospective[name] += 1
+        if max(prospective.values()) - min(prospective.values()) > 1:
+            raise ValueError(
+                "pick ordinals diverged past one in-flight event: "
+                f"{prospective}"
+            )
+        self._picks[name] = prospective[name]
+
+    def picks_taken(self, environment: str) -> int:
+        """This environment's own pick ordinal -- what gates whether it
+        may take another (a batcher's ``_claim_pick_chunk``), as opposed
+        to whether the WINDOW is finished (``is_closed``)."""
+        return self._picks[self._known(environment)]
 
     def is_closed(self) -> bool:
-        return self._picks_emitted >= self._picks_target
+        return min(self._picks.values()) >= self._picks_target
 
     def snapshot(self) -> dict:
         return {
@@ -109,7 +145,11 @@ class FillState:
             "admitted": dict(self._admitted),
             "proven": dict(self._proven),
             "in_flight": dict(self._in_flight),
-            "picks_emitted": self._picks_emitted,
+            "picks_by_environment": dict(self._picks),
+            # Complete events only: the leader's half-taken event is not
+            # one, so the service naming the next event to drive sees the
+            # event still in flight rather than the one after it.
+            "picks_emitted": min(self._picks.values()),
             "picks_target": self._picks_target,
             "closed": self.is_closed(),
         }

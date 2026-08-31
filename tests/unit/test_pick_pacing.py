@@ -396,8 +396,13 @@ def test_an_environment_that_refuses_after_a_sibling_picked_logs_error(
         and "pick event" in record.getMessage()
         for record in caplog.records
     )
-    # The window-wide counter still moved exactly once, not twice.
-    assert shared.snapshot()["picks_emitted"] == 1
+    # R37: the event is INCOMPLETE, which is what the ERROR reports --
+    # math took its half, code never did, and the window-wide count (the
+    # min over environments) therefore does not move at all. It used to
+    # read 1 here, off a single window-wide counter that could not tell a
+    # half-taken event from a finished one.
+    assert shared.snapshot()["picks_by_environment"] == {MATH: 1, CODE: 0}
+    assert shared.snapshot()["picks_emitted"] == 0
 
 
 def test_with_the_gate_off_no_pick_ever_fires(monkeypatch):
@@ -439,10 +444,19 @@ def test_can_pick_answers_the_readiness_question_cheaply(monkeypatch):
 
 
 def test_can_pick_is_false_once_the_window_is_closed(monkeypatch):
+    """R37: closing takes BOTH environments' halves of the last event --
+    and either half alone is already enough to stop the environment that
+    took it, since ``can_pick`` gates on that environment's own ordinal."""
     math, code, shared, clock = _two_env_window(monkeypatch, picks_target=1)
     _prove(math, MATH, B_BATCH)
     assert math.can_pick() is True
-    shared.record_pick()
+
+    shared.record_pick(MATH)
+    assert math.can_pick() is False
+    assert shared.is_closed() is False
+
+    shared.record_pick(CODE)
+    assert shared.is_closed() is True
     assert math.can_pick() is False
 
 
