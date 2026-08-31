@@ -1858,6 +1858,7 @@ class GrpoWindowBatcher:
                 MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
                 - self.proof_failure_debt(pending.hotkey)
             )
+            job_id: str | None = None
             try:
                 # Rank allocation and the call that consumes it
                 # (``_extend_proof_plan``, which both reads-or-creates the
@@ -1880,8 +1881,12 @@ class GrpoWindowBatcher:
                     # a proven value, nothing else -- this is where the
                     # buffered entry's rate and payload size are pinned to
                     # that job_id so the pick pool can be built from a
-                    # decision alone.
-                    self._arrival_proof_meta[candidate.job_id] = (
+                    # decision alone. Written BEFORE ``extend``: the moment
+                    # the plan holds the candidate, a device thread can
+                    # decide it, and the reconcile that follows must find
+                    # the rate already there.
+                    job_id = candidate.job_id
+                    self._arrival_proof_meta[job_id] = (
                         entry.rate, entry.payload_bytes, entry.receipt_id,
                     )
                     self._extend_proof_plan([candidate])
@@ -1890,6 +1895,10 @@ class GrpoWindowBatcher:
                 # ``with`` block above by the time control reaches here, so
                 # this never nests the two locks -- no ordering to keep
                 # consistent against any other call site.
+                if job_id is not None:
+                    # No candidate reached the plan, so no decision will
+                    # ever carry this job_id away again.
+                    self._arrival_proof_meta.pop(job_id, None)
                 with self.fill_state.lock:
                     self.fill_state.release(environment)
                 raise
@@ -2067,7 +2076,11 @@ class GrpoWindowBatcher:
         v4/v5 already apply to unfilled slots.
 
         One-shot: ``poll_deadline`` is polled on a loop, so this records
-        what the window ENDED with, not a running per-poll tally.
+        what the window ENDED with, not a running per-poll tally. A proof
+        that only finalises AFTER this ran (a straggler still on a device
+        thread at the seal) lands in the pool unpicked and unpaid like
+        any other burn, but lands too late to be in this count -- the
+        window is already sealed and no pick can take it.
         """
         if self.fill_state is None or self._unpicked_groups_burned:
             return
