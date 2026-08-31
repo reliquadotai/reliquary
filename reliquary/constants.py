@@ -1268,6 +1268,9 @@ if TRAIN_UNTIL_CHECKPOINT_N < 0:
 MICROBATCH_MAX_PADDED_TOKENS = 32768
 
 # Linear LR warmup for the first N training steps (= N windows sealed).
+# After it the schedule is FLAT, per DAPO §4.1 (AdamW, constant LR + linear
+# warmup). The 10k-window cosine that used to follow reached factor 0.49 in
+# 5.5 days at the live cadence — a run decaying to a halt nobody had chosen.
 LR_WARMUP_WINDOWS = 10
 
 # Short LR re-ramp applied after a process restart WITHIN the same training
@@ -1281,10 +1284,6 @@ LR_RESTART_REWARMUP_WINDOWS = int(
 )
 if LR_RESTART_REWARMUP_WINDOWS < 0:
     raise ValueError("RELIQUARY_LR_RESTART_REWARMUP_WINDOWS must be >= 0")
-
-# Cosine schedule end target (in windows). Chosen large so LR never
-# actually reaches zero at normal cadence — effectively a slow decay.
-LR_COSINE_MAX_WINDOWS = 10_000
 
 # Default base model (HF repo id). Served as the reference for KL and the
 # cold-start checkpoint.

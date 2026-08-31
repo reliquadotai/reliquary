@@ -3,7 +3,7 @@
 Single-step-per-window GRPO implementation: group-relative advantages
 computed from the rewards in each ValidSubmission, PPO-clipped surrogate
 loss, KL penalty against a frozen reference model (the validator's
-starting checkpoint). Linear warmup + cosine LR schedule.
+starting checkpoint). Linear warmup + flat LR schedule.
 
 By default, uses miner-provided token log-probs (from the GRAIL commit) as
 π_old. Production can instead pass the published behavior model and recompute
@@ -24,7 +24,7 @@ import torch.utils.checkpoint
 from reliquary.validator import telemetry
 from reliquary.constants import (
     GRAD_CLIP_NORM, GRAD_NORM_SKIP_THRESHOLD, KL_BETA, LEARNING_RATE,
-    LR_COSINE_MAX_WINDOWS, LR_WARMUP_WINDOWS,
+    LR_WARMUP_WINDOWS,
     MICROBATCH_MAX_PADDED_TOKENS, PPO_CLIP_EPSILON_HIGH, PPO_CLIP_EPSILON_LOW,
     PPO_DUAL_CLIP_C,
     LR_RESTART_REWARMUP_WINDOWS,
@@ -246,13 +246,14 @@ def _lazy_init(model, global_step_hint: int | None = None) -> bool:
     rewarmup = LR_RESTART_REWARMUP_WINDOWS if hint > 0 else 0
 
     def _lr_lambda(step: int) -> float:
-        if step < LR_WARMUP_WINDOWS:
-            base = (step + 1) / LR_WARMUP_WINDOWS
-        else:
-            progress = (step - LR_WARMUP_WINDOWS) / max(
-                1, LR_COSINE_MAX_WINDOWS - LR_WARMUP_WINDOWS
-            )
-            base = 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
+        # Linear warmup, then FLAT — DAPO's schedule (§4.1: AdamW, constant
+        # 1e-6, linear warmup). No decay term: a run must be stoppable on
+        # evidence, not extinguished by a horizon nobody re-derives.
+        base = (
+            (step + 1) / LR_WARMUP_WINDOWS
+            if step < LR_WARMUP_WINDOWS
+            else 1.0
+        )
         if rewarmup > 0 and step >= hint:
             # Same-run restart: schedule position was restored, but the
             # Adam moments were not persisted — a short ramp over the first
@@ -271,20 +272,11 @@ def _lazy_init(model, global_step_hint: int | None = None) -> bool:
         # per crash.
         for _ in range(hint):
             _scheduler.step()
-        restored_factor = _lr_lambda(hint)
         logger.info(
             "LR schedule restored to step %d (same-run restart; re-warmup "
             "over %d windows; lr factor %.4f)", hint, rewarmup,
-            restored_factor,
+            _lr_lambda(hint),
         )
-        if restored_factor <= 0.25:
-            logger.warning(
-                "Restored LR schedule position %d puts the cosine factor at "
-                "%.4f — the decay horizon (LR_COSINE_MAX_WINDOWS=%d) is no "
-                "longer masked by restart resets; revisit the schedule if "
-                "this is not intended",
-                hint, restored_factor, LR_COSINE_MAX_WINDOWS,
-            )
     _optimizer_model_id = id(model)
     logger.info("Training state initialised (optimizer, scheduler)")
     return True
