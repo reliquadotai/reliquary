@@ -5,14 +5,13 @@ publish cadence changed across protocol versions). Fail-closed: missing
 field or foreign run id => full warmup, exactly like before the feature.
 """
 import json
-import math
 
 import pytest
 import torch
 
 import reliquary.validator.training as training
 from reliquary.constants import (
-    LR_RESTART_REWARMUP_WINDOWS, LR_WARMUP_WINDOWS, LR_COSINE_MAX_WINDOWS,
+    LR_RESTART_REWARMUP_WINDOWS, LR_WARMUP_WINDOWS,
     LEARNING_RATE, TRAINING_RUN_ID,
 )
 from reliquary.validator.checkpoint_profile import (
@@ -37,21 +36,30 @@ def _lr():
     return training._optimizer.param_groups[0]["lr"]
 
 
-def _old_lambda(step):
-    """The pre-feature schedule, verbatim."""
+def _unrestarted_lambda(step):
+    """The schedule a run that never restarted would see: linear warmup,
+    then flat. Written out independently so a change to the production
+    lambda has to be made twice, deliberately."""
     if step < LR_WARMUP_WINDOWS:
         return (step + 1) / LR_WARMUP_WINDOWS
-    progress = (step - LR_WARMUP_WINDOWS) / max(
-        1, LR_COSINE_MAX_WINDOWS - LR_WARMUP_WINDOWS
-    )
-    return 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
+    return 1.0
 
 
-def test_fresh_run_bit_identical_to_old_schedule():
+def test_fresh_run_warms_up_then_holds():
     assert training._lazy_init(_tiny_model(), global_step_hint=0)
     lam = training._scheduler.lr_lambdas[0]
     for step in range(0, 12_000, 7):
-        assert lam(step) == _old_lambda(step), step
+        assert lam(step) == _unrestarted_lambda(step), step
+
+
+def test_schedule_is_flat_after_warmup():
+    """DAPO §4.1 runs a constant LR. The old cosine over 10k windows was
+    justified as "≈ constant at realistic window counts"; at ~94 s/window a
+    run crosses 10k in ~11 days and the factor reaches 0 mid-run."""
+    assert training._lazy_init(_tiny_model(), global_step_hint=0)
+    lam = training._scheduler.lr_lambdas[0]
+    for step in range(LR_WARMUP_WINDOWS, 60_000, 137):
+        assert lam(step) == 1.0, step
 
 
 def test_restored_position_reported_exactly():
@@ -67,12 +75,12 @@ def test_step_counter_none_before_init():
 
 
 def test_restart_runs_exactly_r_windows_below_full_lr():
-    hint = 300  # early cosine: base factor ~1.0
+    hint = 300  # past warmup: base factor is 1.0
     assert training._lazy_init(_tiny_model(), global_step_hint=hint)
     lam = training._scheduler.lr_lambdas[0]
     below = [
         k for k in range(hint, hint + LR_RESTART_REWARMUP_WINDOWS + 5)
-        if lam(k) < _old_lambda(k)
+        if lam(k) < _unrestarted_lambda(k)
     ]
     assert len(below) == LR_RESTART_REWARMUP_WINDOWS
 
@@ -82,13 +90,13 @@ def test_after_ramp_exact_equality_with_unrestarted_run():
     assert training._lazy_init(_tiny_model(), global_step_hint=hint)
     lam = training._scheduler.lr_lambdas[0]
     for k in range(hint + LR_RESTART_REWARMUP_WINDOWS, hint + 500):
-        assert lam(k) == _old_lambda(k), k
+        assert lam(k) == _unrestarted_lambda(k), k
 
 
 def test_first_window_uses_ramped_restored_position():
     hint = 337
     assert training._lazy_init(_tiny_model(), global_step_hint=hint)
-    expected = LEARNING_RATE * _old_lambda(hint) * (
+    expected = LEARNING_RATE * _unrestarted_lambda(hint) * (
         1 / (LR_RESTART_REWARMUP_WINDOWS + 1)
     )
     assert _lr() == pytest.approx(expected, rel=1e-6)
