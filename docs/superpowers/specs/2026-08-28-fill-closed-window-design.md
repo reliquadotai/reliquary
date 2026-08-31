@@ -132,9 +132,16 @@ one per ~600 s window.
 `WINDOW_TARGET_GROUPS_PER_ENV` **proven** groups. Not admitted, not graded
 — proven, because a group that fails GRAIL is not a group.
 
-    admit while:  proven[e] + in_flight[e] < target[e]
-    close when:   for every env e, proven[e] >= target[e]
+    admit while:  admitted[e] < admission_budget[e]        (v6.1)
+    pick:         B_BATCH best by rate among proven-unemitted, per env
+    close when:   the 16th pick has been emitted            (v6.1)
     backstop:     WINDOW_MAX_SECONDS elapsed -> seal partial
+
+**Amended by v6.1 (see the Amendment section at the end): seats are granted
+at trainer-paced picks by rate, not on arrival, and the close is the 16th
+pick rather than a proven count.** The original rule is kept below for the
+record of why proven-vs-admitted mattered; that reasoning still holds
+inside each pick.
 
 Admission stops on `proven + in_flight`, the close fires on `proven` alone.
 Gating admission on `proven` would over-admit by the whole proof pipeline
@@ -551,3 +558,84 @@ restore ranking.
    cannot be diluted: an operator taking seven slots with short groups
    collects seven times little, and there is no count to split across
    coldkeys.
+
+## Amendment v6.1 — trainer-paced picks (2026-08-30)
+
+**Why.** The measured fleet oversupplies the original close rule: at
+>=4.3 groups/s against a 256-group target, every seat is claimed in
+arrival order by t~120 s. The rate queue only orders candidates that
+wait, and nobody waits while seats remain — so admission degenerates to
+first-come-first-served, and any answer longer than
+`t_close x generation speed` (~5-6k tokens) can never land. That is the
+auction's short bias, relocated. Verified in code: reservation happens at
+drain time by rate, but the buffer holds one entry at a time while
+capacity is free; the rate arbitrated only the ~15-20% of seats reopened
+by proof failures.
+
+**1. Seats are granted at picks, not on arrival.** Grading and proof
+still run on arrival (Component 2 unchanged); proven groups accumulate in
+a pool. A *pick* selects, per environment, the `B_BATCH` best **by
+precommit rate** among proven-and-unemitted groups. Rate ties break by
+payload bytes DESCENDING, then receipt id — the rate metric is
+length-neutral, so ties are the common case, and breaking them by arrival
+would hand the seat back to the shortest. Emission, quarantine and
+payment per picked batch are exactly Components 4-5. A proven group never
+picked by close is burned: logged, archived with a count, never
+redistributed and never paid.
+
+**2. Picks are paced by the trainer's own consumption.** The trainer
+writes a one-object cursor through the payload-queue transport after
+every optimizer step. Pick k (k > depth) is gated on the cursor showing
+step k−depth consumed, with depth = 2 so the trainer always holds one
+batch in hand. The first `depth` picks are gated on
+`FILL_CLOSED_FIRST_PICK_SECONDS` (default 30) after window open. No
+constant anywhere encodes the trainer's step time: the cadence is
+measured, not declared, and survives any model/hardware/config change on
+the train worker unchanged. *(A protocol horizon floor `k·H/16` was
+designed and DEFERRED: `H` derives from fleet token speed, unmeasured
+until the shadow run. Without it, a much faster trainer shortens the
+window and with it the maximum learnable length — accepted for now;
+revisit with shadow data.)*
+
+**3. The window closes at the 16th pick** — not at a proven count. The
+`FILL_CLOSED_MAX_SECONDS` backstop is unchanged. The next window opens on
+DETECTION of the published checkpoint N+1: the synchronization point that
+already exists because miners need the new revision to generate. Any
+intra-window pacing drift resets there; the journal backlog is bounded at
+`depth` batches by construction.
+
+**4. Admission is bounded by budget, not by target.**
+`FILL_CLOSED_ADMISSION_BUDGET_PER_ENV` (default 512) replaces the target
+in `may_admit`. Over-collection is deliberate: late, longer groups must
+exist in the pool for late picks to choose them. The proven-vs-in-flight
+reasoning of Component 1 still governs reservations inside the budget.
+
+**Properties.** Each pick's candidate population has had strictly more
+time to generate than the last: a short-to-long curriculum per window,
+with no parameter. Within a pick, the length-neutral rate decides seats
+(hardware productivity); within a seat, per-token payment decides
+earnings. The fleet's excess capacity converts into length diversity
+instead of `batch_filled` rejections. Sequential resubmitters self-demote
+(the window-open-anchored rate divides by k for a miner's k-th group), so
+seats spread across machines with no identity anywhere.
+
+**Failure modes.** Cursor stale -> picks stop -> backstop seals partial
+(existing path). Trainer dead -> the next window never opens, which is
+correct: there is no policy to generate against. Both are stalls, never
+wrong payments.
+
+**Configuration added.**
+- `FILL_CLOSED_FIRST_PICK_SECONDS` (default 30)
+- `FILL_CLOSED_PICK_PIPELINE_DEPTH` (default 2)
+- `FILL_CLOSED_ADMISSION_BUDGET_PER_ENV` (default 512)
+- trainer cursor object name under the payload-queue transport
+
+**Tests that pin the amendment.**
+- A 16k-equivalent group arriving late with full rate beats an early 2k
+  group at the pick (the bias this amendment removes).
+- Rate ties go to the larger payload, never the earlier arrival.
+- Pick k+depth does not emit before the cursor shows step k consumed;
+  it emits promptly after.
+- The window closes at the 16th pick even with proven groups left over,
+  and the leftovers are burned with an archived count.
+- With the gate off, none of this is reachable.
