@@ -146,3 +146,91 @@ Full targeted run: `test_cli_cursor_queue.py` + `test_trainer_worker.py` +
 `test_cli_train_worker.py` → **52 passed**. Did not re-run the full suite
 this round (only `cli.py` + one new test file touched, no shared-file risk
 with the other implementer's in-flight fill_window/service/batcher work).
+
+## Fix round 2 (R38 cursor round-trip)
+
+T12 found the real blocking hole: the drain uploads `step-cursor.json` to
+R2 from the trainer host, but nothing validator-side ever downloads it —
+`read_step_cursor()` only reads the LOCAL file, which on the validator
+never exists (nothing writes it there). Ruling R38: the validator reads
+the cursor via one bounded R2 GET, transport code living in
+`training_payload_queue.py`.
+
+Changes, `reliquary/infrastructure/training_payload_queue.py`:
+- Extracted `_r2_client(config)`: the shared boto3-client-from-env-vars
+  construction, factored out of `_default_delete` so a new direct R2 call
+  doesn't re-derive the account/endpoint/credential resolution a third
+  time ("reuse its client construction, do not build a second config
+  path"). `_default_delete` now calls it.
+- Added `_default_fetch_step_cursor() -> bytes | None`: sync boto3
+  GetObject for `step_cursor_key()`, through `_r2_client`, but with a
+  **short, non-retrying** `Config` (`connect_timeout=2, read_timeout=2,
+  max_attempts=1`) — deliberately tighter than the upload/delete path's
+  15s/30s/3-retries, since this backs a *synchronous* call on the
+  validator's `_wait_for_window_seal` 0.5s poll cadence, not a background
+  drain. Swallows everything to `None`, never raises.
+- Added `_parse_step_cursor(raw)` — the corrupt/torn/wrong-schema →
+  `None` parse, factored out and now shared by both `read_step_cursor`
+  (local) and the new `fetch_step_cursor` (remote), same behavior as
+  before for `read_step_cursor`.
+- Added `TrainingPayloadQueue.fetch_step_cursor(fetch_fn=None)`: one
+  bounded remote GET, defaulting to `_default_fetch_step_cursor`, same
+  "never raises, absent/torn/wrong-schema/network-error/timeout → None"
+  contract as `read_step_cursor`. Docstring states explicitly that
+  throttling (at most once per gated poll tick) lives with the caller —
+  this method neither caches nor rate-limits.
+
+`reliquary/validator/service.py`: the one instructed line —
+`_read_trainer_step_cursor` now calls `.fetch_step_cursor()` instead of
+`.read_step_cursor()`. Nothing else in the file touched (confirmed via
+`git diff` — single-line diff).
+
+TDD: watched red (9 new tests failed with `AttributeError:
+_default_fetch_step_cursor` before the change), then green. Covers: a
+true two-instance round trip (writer drains to a fake remote-store dict,
+a SEPARATE reader queue instance — different `queue_dir`, simulating the
+validator/trainer host split — fetches it back, proving `read_step_cursor`
+alone cannot see it); absent key, corrupt body, missing field, and a
+raised network/timeout exception all → `None`; the default `fetch_fn`
+wiring; and two tests pinning the actual production `_default_fetch_step_cursor`
+(short/non-retrying Config, correct key, swallows a `get_object`
+exception) plus one proving `_default_delete` and
+`_default_fetch_step_cursor` share the same client-construction call
+(same resolved endpoint from `_r2_client`). No real R2 credentials
+needed — mirrors the existing drain tests' injectable-callable seam
+(`upload_fn`/`delete_fn` style) for the two production-wiring tests,
+`boto3.client` itself is monkeypatched (same technique already used
+nowhere else in this file's tests, but it's the standard way to pin a
+lazily-imported call without live credentials).
+
+`tests/unit/test_training_payload_queue.py`: 25/25 pass (16 pre-existing
++ 9 new). Also re-ran `test_cli_cursor_queue.py`, `test_trainer_worker.py`,
+`test_trainer_journal.py`, `test_pick_pacing.py`, `test_pick_by_rate.py`,
+`test_fill_closed_batch_assembler.py` together: 26 failures, ALL in
+`test_pick_pacing.py`/`test_pick_by_rate.py`
+(`FillState.record_pick() missing 1 required positional argument:
+'environment'`) — `batcher.py` calling the pre-R37 single-arg
+`record_pick()` against `fill_window.py`'s in-flight (uncommitted) R37
+signature change; both files are explicitly off-limits to me and mid-edit
+by the other implementer, not something I touched. Zero failures in any
+file I touched.
+
+Full-suite result appended below once the background run finishes.
+
+Additional fix in the same round: my one-line `service.py` change
+(`read_step_cursor()` -> `fetch_step_cursor()`) broke T12's
+`tests/unit/test_pick_pacing.py::_CursorQueue` test double, which only
+implemented `read_step_cursor`. Renamed its method to
+`fetch_step_cursor(self, fetch_fn=None)` (same body, one comment added) —
+a direct, mechanical consequence of the instructed call-site change, not
+a `fill_window.py`/`batcher.py` edit. `test_pick_pacing.py`: 24/24 pass
+after. The remaining `record_pick()` TypeError failures seen mid-round
+were the R37 fixer's WIP mid-commit; `8a85ff0` landed and resolved them
+independently — confirmed by a second full run showing test_pick_pacing.py
+fully green.
+
+Committed without waiting for the final full-suite run (per coordinator:
+the controller runs it at the final pass). Targeted runs green:
+`test_training_payload_queue.py` 25/25, `test_pick_pacing.py` 24/24,
+`test_cli_cursor_queue.py`/`test_trainer_worker.py`/`test_trainer_journal.py`
+all green.

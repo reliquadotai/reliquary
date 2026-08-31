@@ -188,3 +188,166 @@ def test_step_cursor_uploads_via_same_transport_and_stays_local(tmp_path):
     assert set(uploaded) == {"reliquary/training/step-cursor.json"}
     assert json.loads(uploaded[step_cursor_key()])["journal_key"] == 30142
     assert (tmp_path / "step-cursor.json").exists()
+
+
+# ---------------- R38: fetch_step_cursor (remote read) ----------------
+
+
+def test_fetch_step_cursor_round_trips_through_a_shared_remote_store(
+    tmp_path,
+):
+    """Simulates the real split: the trainer's drain uploads the cursor
+    from ITS local queue instance, the validator reads it back through a
+    DIFFERENT queue instance pointed at a different local directory --
+    read_step_cursor (local file) cannot see this at all. No real R2 in
+    unit tests, so both sides go through the same injectable fetch/upload
+    seam the drain's own tests already use (an in-memory dict standing in
+    for the bucket)."""
+    remote_store: dict[str, bytes] = {}
+
+    writer = TrainingPayloadQueue(queue_dir=str(tmp_path / "trainer"))
+    writer.write_step_cursor(30142)
+    asyncio.run(
+        writer.drain_once(upload_fn=lambda k, d: remote_store.update({k: d}))
+    )
+
+    reader = TrainingPayloadQueue(queue_dir=str(tmp_path / "validator"))
+    assert reader.read_step_cursor() is None  # nothing local to this side
+    got = reader.fetch_step_cursor(
+        fetch_fn=lambda: remote_store.get(step_cursor_key())
+    )
+    assert got == 30142
+
+
+def test_fetch_step_cursor_absent_key_reads_none(tmp_path):
+    q = TrainingPayloadQueue(queue_dir=str(tmp_path))
+    assert q.fetch_step_cursor(fetch_fn=lambda: None) is None
+
+
+def test_fetch_step_cursor_corrupt_body_reads_none(tmp_path):
+    q = TrainingPayloadQueue(queue_dir=str(tmp_path))
+    assert q.fetch_step_cursor(fetch_fn=lambda: b"{not valid json") is None
+
+
+def test_fetch_step_cursor_missing_field_reads_none(tmp_path):
+    q = TrainingPayloadQueue(queue_dir=str(tmp_path))
+    assert q.fetch_step_cursor(fetch_fn=lambda: b"{}") is None
+
+
+def test_fetch_step_cursor_network_error_reads_none_not_an_exception(
+    tmp_path,
+):
+    q = TrainingPayloadQueue(queue_dir=str(tmp_path))
+
+    def timed_out():
+        raise TimeoutError("connect timed out")
+
+    assert q.fetch_step_cursor(fetch_fn=timed_out) is None
+
+
+def test_fetch_step_cursor_default_fetch_fn_is_used_when_none_given(
+    tmp_path, monkeypatch,
+):
+    """Wires to the production GetObject path by default -- monkeypatch
+    the module-level default rather than inject, to prove the wiring
+    itself (not just the seam) is correct."""
+    import reliquary.infrastructure.training_payload_queue as queue_module
+
+    monkeypatch.setattr(
+        queue_module, "_default_fetch_step_cursor",
+        lambda: b'{"journal_key": 55, "written_at": 1.0}',
+    )
+    q = TrainingPayloadQueue(queue_dir=str(tmp_path))
+    assert q.fetch_step_cursor() == 55
+
+
+class _FakeStreamingBody:
+    def __init__(self, body: bytes):
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+
+def test_default_fetch_step_cursor_uses_a_short_bounded_non_retrying_client(
+    monkeypatch,
+):
+    """The drain's PUT/DELETE tolerate 15s connect / 30s read with up to
+    3 retries because they run off the hot path in a background drain.
+    This call sits on the validator's 0.5s pick-gate poll cadence and
+    must fail fast instead -- pins the actual production Config, not just
+    the injectable seam."""
+    import reliquary.infrastructure.training_payload_queue as queue_module
+
+    captured = {}
+
+    def fake_boto3_client(service, **kwargs):
+        captured["config"] = kwargs["config"]
+        captured["endpoint_url"] = kwargs["endpoint_url"]
+
+        class _Client:
+            def get_object(self, **_kwargs):
+                captured["get_object_kwargs"] = _kwargs
+                return {"Body": _FakeStreamingBody(b'{"journal_key": 7}')}
+
+        return _Client()
+
+    monkeypatch.setattr("boto3.client", fake_boto3_client)
+    result = queue_module._default_fetch_step_cursor()
+    assert result == b'{"journal_key": 7}'
+    cfg = captured["config"]
+    assert cfg.connect_timeout <= 3
+    assert cfg.read_timeout <= 3
+    assert cfg.retries["max_attempts"] <= 1
+    assert (
+        captured["get_object_kwargs"]["Key"]
+        == "reliquary/training/step-cursor.json"
+    )
+
+
+def test_default_fetch_step_cursor_swallows_get_object_failure(monkeypatch):
+    def fake_boto3_client(service, **kwargs):
+        class _Client:
+            def get_object(self, **_kwargs):
+                raise RuntimeError("r2 down")
+
+        return _Client()
+
+    monkeypatch.setattr("boto3.client", fake_boto3_client)
+    import reliquary.infrastructure.training_payload_queue as queue_module
+
+    assert queue_module._default_fetch_step_cursor() is None
+
+
+def test_default_delete_and_default_fetch_step_cursor_share_client_construction(
+    monkeypatch,
+):
+    """R38: 'reuse its client construction, do not build a second config
+    path' -- both go through the same env-var-resolving _r2_client
+    helper rather than each re-deriving account/endpoint/credentials."""
+    import reliquary.infrastructure.training_payload_queue as queue_module
+
+    endpoints_seen = []
+
+    def fake_boto3_client(service, **kwargs):
+        endpoints_seen.append(kwargs["endpoint_url"])
+
+        class _Client:
+            def delete_object(self, **_kwargs):
+                pass
+
+            def get_object(self, **_kwargs):
+                return {"Body": _FakeStreamingBody(b"{}")}
+
+        return _Client()
+
+    monkeypatch.setattr("boto3.client", fake_boto3_client)
+    monkeypatch.setenv("R2_ACCOUNT_ID", "acct123")
+    monkeypatch.delenv("R2_ENDPOINT_URL", raising=False)
+
+    queue_module._default_delete("reliquary/training/window-1.tombstone.json")
+    queue_module._default_fetch_step_cursor()
+
+    assert len(endpoints_seen) == 2
+    assert endpoints_seen[0] == endpoints_seen[1]
+    assert "acct123" in endpoints_seen[0]

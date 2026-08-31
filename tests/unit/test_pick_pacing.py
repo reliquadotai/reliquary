@@ -126,7 +126,12 @@ class _CursorQueue:
         self.cursor = cursor
         self.reads = 0
 
-    def read_step_cursor(self):
+    def fetch_step_cursor(self, fetch_fn=None):
+        # R38: the validator reads the trainer's cursor via a bounded
+        # remote GET (fetch_step_cursor), not the local-file read
+        # (read_step_cursor) -- the two run on different hosts. This
+        # fake stands in for whichever transport call
+        # _read_trainer_step_cursor makes.
         self.reads += 1
         return self.cursor
 

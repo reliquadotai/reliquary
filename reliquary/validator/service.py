@@ -3399,7 +3399,7 @@ class ValidationService:
         the cursor transport, not here.
         """
         try:
-            return self._training_payload_queue_ref().read_step_cursor()
+            return self._training_payload_queue_ref().fetch_step_cursor()
         except Exception:
             logger.warning(
                 "trainer step cursor unreadable; picks stay gated",

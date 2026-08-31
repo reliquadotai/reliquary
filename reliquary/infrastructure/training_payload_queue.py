@@ -124,28 +124,93 @@ def _default_upload(key: str, body: bytes) -> None:
     )
 
 
-def _default_delete(key: str) -> None:
-    """Best-effort sync boto3 DeleteObject (tombstone superseded by a
-    replayed payload). Runs inside to_thread."""
+def _r2_client(config):
+    """Build a boto3 S3 client from the standard R2 env vars.
+
+    Shared by every synchronous R2 call this module makes DIRECTLY
+    (``_default_delete``, ``_default_fetch_step_cursor``) so each call
+    site supplies only the ``botocore.config.Config`` (timeouts, retries)
+    it needs instead of re-deriving the account/endpoint/credential
+    resolution a second (or third) time. The upload PUT already has its
+    own proven helper for the equivalent (``storage._sync_boto3_put``);
+    this is that helper's counterpart for the smaller synchronous calls
+    that live in this module.
+    """
     import boto3
-    from botocore.config import Config
 
     account_id = os.getenv("R2_ACCOUNT_ID", "")
     endpoint = (
         os.getenv("R2_ENDPOINT_URL")
         or f"https://{account_id}.r2.cloudflarestorage.com"
     )
-    client = boto3.client(
+    return boto3.client(
         "s3",
         endpoint_url=endpoint,
         aws_access_key_id=os.getenv("R2_ACCESS_KEY_ID", ""),
         aws_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY", ""),
         region_name=os.getenv("R2_REGION", "us-east-1"),
-        config=Config(retries={"max_attempts": 2, "mode": "standard"}),
+        config=config,
     )
+
+
+def _default_delete(key: str) -> None:
+    """Best-effort sync boto3 DeleteObject (tombstone superseded by a
+    replayed payload). Runs inside to_thread."""
+    from botocore.config import Config
+
+    client = _r2_client(Config(retries={"max_attempts": 2, "mode": "standard"}))
     client.delete_object(
         Bucket=os.getenv("R2_BUCKET_ID", "reliquary"), Key=key,
     )
+
+
+# R38: deliberately tighter than the upload/delete config above. Those run
+# off the hot path inside the background drain loop and can afford 15s
+# connect / 30s read with up to 3 retries. This one backs a SYNCHRONOUS
+# call on the validator's pick-gate poll (``_wait_for_window_seal``'s 0.5s
+# cadence, see ``service._read_trainer_step_cursor``) -- a hung store must
+# fail fast, not stall that cadence, so: short timeouts, no retry.
+_STEP_CURSOR_FETCH_CONNECT_TIMEOUT_SECONDS = 2
+_STEP_CURSOR_FETCH_READ_TIMEOUT_SECONDS = 2
+
+
+def _default_fetch_step_cursor() -> bytes | None:
+    """Best-effort sync boto3 GetObject for the trainer's step-cursor
+    object (the R2 counterpart of ``write_step_cursor``'s local write,
+    read by a DIFFERENT process than the one that wrote it -- e.g. the
+    validator reading what the detached trainer's drain uploaded).
+
+    Returns ``None`` on ANY failure (missing key, network error, timeout)
+    -- never raises. See the module-level timeout constants above for why
+    this config is deliberately tighter than the upload/delete path's.
+    """
+    from botocore.config import Config
+
+    client = _r2_client(
+        Config(
+            connect_timeout=_STEP_CURSOR_FETCH_CONNECT_TIMEOUT_SECONDS,
+            read_timeout=_STEP_CURSOR_FETCH_READ_TIMEOUT_SECONDS,
+            retries={"max_attempts": 1, "mode": "standard"},
+        )
+    )
+    try:
+        response = client.get_object(
+            Bucket=os.getenv("R2_BUCKET_ID", "reliquary"),
+            Key=step_cursor_key(),
+        )
+        return response["Body"].read()
+    except Exception:
+        return None
+
+
+def _parse_step_cursor(raw: bytes) -> int | None:
+    """Shared by ``read_step_cursor`` and ``fetch_step_cursor``: a
+    corrupt/torn/wrong-schema body reads as ``None``, never raises."""
+    try:
+        data = json.loads(raw)
+        return int(data["journal_key"])
+    except (ValueError, TypeError, KeyError):
+        return None
 
 
 class TrainingPayloadQueue:
@@ -254,11 +319,44 @@ class TrainingPayloadQueue:
             raw = path.read_bytes()
         except OSError:
             return None
+        return _parse_step_cursor(raw)
+
+    def fetch_step_cursor(
+        self, fetch_fn: Callable[[], bytes | None] | None = None,
+    ) -> int | None:
+        """One bounded REMOTE GET of the trainer's step-cursor object.
+
+        ``read_step_cursor`` reads the LOCAL file THIS process's own
+        drain wrote -- of no use to a DIFFERENT process reading what
+        ANOTHER process's drain already uploaded (R38: the validator
+        reading what the detached trainer published; the two run on
+        different hosts and never share a local queue_dir). This
+        performs one GET instead, by default through
+        ``_default_fetch_step_cursor`` (the same client-construction
+        helper the drain's other direct R2 calls use, with a short,
+        non-retrying timeout so a hung store fails fast).
+
+        Same "never raises" contract as ``read_step_cursor``: a missing
+        key, network error, timeout, or an unparseable/wrong-schema body
+        all read as ``None`` -- there is no way here to distinguish "no
+        cursor yet" from "couldn't check", and the caller (a pick gate)
+        must treat both as "not yet" rather than take the poll loop down.
+
+        Throttling lives with the CALLER, not here:
+        ``service._read_trainer_step_cursor`` is consulted at most once
+        per gated pick check inside ``_wait_for_window_seal``'s 0.5s
+        poll; this method makes no attempt to cache or rate-limit a
+        repeated call on its own -- the bounded per-call timeout is what
+        keeps a single hung call from stalling that cadence, not caching.
+        """
+        fn = fetch_fn or _default_fetch_step_cursor
         try:
-            data = json.loads(raw)
-            return int(data["journal_key"])
-        except (ValueError, TypeError, KeyError):
+            raw = fn()
+        except Exception:
             return None
+        if raw is None:
+            return None
+        return _parse_step_cursor(raw)
 
     # ---------------- consumer ----------------
 
