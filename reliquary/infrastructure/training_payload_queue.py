@@ -10,6 +10,7 @@ dashboard consumes.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from pathlib import Path
@@ -31,6 +32,7 @@ RETRY_BACKOFF_SECONDS: tuple[int, ...] = (5, 30, 120, 600, 1800)
 _PAYLOAD_SUFFIX = ".npz"
 _TOMBSTONE_SUFFIX = ".tombstone.json"
 _EPOCH_MARKER_SUFFIX = ".epoch.json"
+_STEP_CURSOR_FILENAME = "step-cursor.json"
 
 
 def payload_key(window_start: int) -> str:
@@ -73,6 +75,16 @@ def encoded_window_journal_key(window_start: int, batch_index: int = 0) -> int:
     return int(window_start) * FILL_CLOSED_EMISSIONS_PER_WINDOW + int(
         batch_index
     )
+
+
+def step_cursor_key() -> str:
+    """R2 key for the trainer's single per-step consumption cursor (v6.1).
+
+    One object for the whole trainer, overwritten every step -- there is
+    no window/batch_index in this key, unlike ``payload_key``/
+    ``tombstone_key``.
+    """
+    return f"{R2_TRAINING_PREFIX}/{_STEP_CURSOR_FILENAME}"
 
 
 def epoch_marker_key(epoch_id: str) -> str:
@@ -205,13 +217,56 @@ class TrainingPayloadQueue:
         )
         return path
 
+    # ---------------- v6.1: trainer step cursor ----------------
+
+    def write_step_cursor(self, journal_key: int) -> None:
+        """Overwrite the single per-step consumption cursor object.
+
+        Called by the trainer after it consumes one journal entry (trained
+        payload or tombstone) so the validator can pace picks on real
+        consumption (Amendment v6.1) instead of a declared interval. This
+        is a plain, synchronous, atomic local write -- the same
+        temp-file+rename discipline as ``_enqueue`` -- never a growing
+        log: each call replaces the previous object in place. Delivery to
+        R2 rides the existing drain/upload transport (see ``_pending``),
+        unlike a payload/tombstone the local file is NOT deleted after a
+        successful upload, since it must stay in place to be overwritten
+        by the next step.
+        """
+        body = json.dumps(
+            {"journal_key": int(journal_key), "written_at": time.time()}
+        ).encode("utf-8")
+        self._enqueue(_STEP_CURSOR_FILENAME, body)
+
+    def read_step_cursor(self) -> int | None:
+        """Read back the local step-cursor object, or ``None`` if it is
+        absent, unreadable, or unparseable.
+
+        A torn read (process crashed mid-write, or the reader raced a
+        writer -- the ``os.replace`` rename is atomic but a caller could
+        still catch the file between an unrelated partial write from a
+        future format) must look exactly like "no cursor yet": this is
+        advisory pacing telemetry read from a validator poll loop, and
+        raising here would take that loop down over a stale timestamp.
+        """
+        path = self.queue_dir / _STEP_CURSOR_FILENAME
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            return None
+        try:
+            data = json.loads(raw)
+            return int(data["journal_key"])
+        except (ValueError, TypeError, KeyError):
+            return None
+
     # ---------------- consumer ----------------
 
     def _pending(self) -> list[Path]:
         return sorted(
             (
                 path
-                for pattern in ("window-*", "epoch-*")
+                for pattern in ("window-*", "epoch-*", _STEP_CURSOR_FILENAME)
                 for path in self.queue_dir.glob(pattern)
                 if not path.name.endswith(".tmp")
             ),
@@ -221,6 +276,8 @@ class TrainingPayloadQueue:
     @staticmethod
     def _key_for(path: Path) -> str | None:
         name = path.name
+        if name == _STEP_CURSOR_FILENAME:
+            return step_cursor_key()
         if name.startswith("window-") and (
             name.endswith(_TOMBSTONE_SUFFIX) or name.endswith(_PAYLOAD_SUFFIX)
         ):
@@ -315,6 +372,12 @@ class TrainingPayloadQueue:
                 logger.debug(
                     "tombstone cleanup failed for %s (non-fatal)", sibling,
                 )
+        if path.name == _STEP_CURSOR_FILENAME:
+            # Not a consumed-once queue entry: a single overwritten object
+            # that must stay local so the next step's write can replace it
+            # in place. It re-uploads (idempotently) every drain cycle
+            # until the next write changes it.
+            return True
         try:
             path.unlink()
         except OSError as e:

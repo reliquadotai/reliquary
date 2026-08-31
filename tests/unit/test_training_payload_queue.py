@@ -1,6 +1,7 @@
 """Durable local queue feeding the R2 ``reliquary/training/`` prefix."""
 
 import asyncio
+import json
 
 import pytest
 
@@ -8,6 +9,7 @@ from reliquary.infrastructure.training_payload_queue import (
     TrainingPayloadQueue,
     encoded_window_journal_key,
     payload_key,
+    step_cursor_key,
     tombstone_key,
 )
 
@@ -133,3 +135,56 @@ def test_restart_rescan_picks_up_pending(tmp_path):
     uploaded = {}
     asyncio.run(q2.drain_once(upload_fn=lambda k, d: uploaded.update({k: d})))
     assert "reliquary/training/window-30100.npz" in uploaded
+
+
+# ---------------- v6.1: trainer-paced picks step cursor ----------------
+
+
+def test_step_cursor_absent_reads_none(tmp_path):
+    q = TrainingPayloadQueue(queue_dir=str(tmp_path))
+    assert q.read_step_cursor() is None
+
+
+def test_step_cursor_round_trips(tmp_path):
+    q = TrainingPayloadQueue(queue_dir=str(tmp_path))
+    q.write_step_cursor(30142)
+    assert q.read_step_cursor() == 30142
+
+
+def test_step_cursor_is_overwritten_not_appended(tmp_path):
+    """Never a growing log: each write replaces the single object."""
+    q = TrainingPayloadQueue(queue_dir=str(tmp_path))
+    q.write_step_cursor(30142)
+    q.write_step_cursor(30143)
+    assert q.read_step_cursor() == 30143
+    assert not list(tmp_path.glob("*.tmp"))
+    assert len(list(tmp_path.glob("step-cursor.json*"))) == 1
+
+
+def test_step_cursor_corrupt_json_reads_as_stale_none(tmp_path):
+    q = TrainingPayloadQueue(queue_dir=str(tmp_path))
+    (tmp_path / "step-cursor.json").write_bytes(b"{not valid json")
+    assert q.read_step_cursor() is None
+
+
+def test_step_cursor_missing_field_reads_as_stale_none(tmp_path):
+    q = TrainingPayloadQueue(queue_dir=str(tmp_path))
+    (tmp_path / "step-cursor.json").write_bytes(b"{}")
+    assert q.read_step_cursor() is None
+
+
+def test_step_cursor_key_naming():
+    assert step_cursor_key() == "reliquary/training/step-cursor.json"
+
+
+def test_step_cursor_uploads_via_same_transport_and_stays_local(tmp_path):
+    """The cursor rides the same drain/upload transport as payloads, but
+    (unlike a payload) it is never deleted after upload -- it is a single
+    overwritten object, not a consumed-once queue entry."""
+    q = TrainingPayloadQueue(queue_dir=str(tmp_path))
+    q.write_step_cursor(30142)
+    uploaded = {}
+    asyncio.run(q.drain_once(upload_fn=lambda k, d: uploaded.update({k: d})))
+    assert set(uploaded) == {"reliquary/training/step-cursor.json"}
+    assert json.loads(uploaded[step_cursor_key()])["journal_key"] == 30142
+    assert (tmp_path / "step-cursor.json").exists()

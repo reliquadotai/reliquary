@@ -145,3 +145,53 @@ def test_shadow_mode_never_publishes():
     w.run_once()
     assert w.run_once() == "published"  # counter reset, but...
     assert env.published == []          # ...nothing actually published
+
+
+# ---------------- v6.1: trainer-paced picks step cursor ----------------
+
+
+def test_writes_cursor_after_trained_payload():
+    env = _Env({101: ("payload", _Decoded(101))})
+    written = []
+    w = _worker(env, cursor_writer=written.append)
+    assert w.run_once() == "trained"
+    assert written == [101]
+
+
+def test_writes_cursor_after_tombstone():
+    """Tombstones advance the walk but are not training steps. They MUST
+    still bump the cursor: the validator paces on consumption of journal
+    keys, and a tombstoned key will never be trained -- not bumping here
+    would stall the pacer forever on every skipped window."""
+    env = _Env({101: ("tombstone", {"failure_stage": "s"})})
+    written = []
+    w = _worker(env, cursor_writer=written.append)
+    assert w.run_once() == "tombstone"
+    assert written == [101]
+
+
+def test_writes_cursor_after_quarantined_window():
+    env = _Env({101: ("payload", _Decoded(101, quarantined=True))})
+    written = []
+    w = _worker(env, cursor_writer=written.append)
+    assert w.run_once() == "quarantined"
+    assert written == [101]
+
+
+def test_cursor_write_failure_does_not_fail_training_step():
+    env = _Env({101: ("payload", _Decoded(101))})
+
+    def boom(journal_key):
+        raise RuntimeError("R2 down")
+
+    w = _worker(env, cursor_writer=boom)
+    assert w.run_once() == "trained"
+    assert w.cursor == 101
+    assert env.trained  # training happened despite the telemetry failure
+
+
+def test_no_cursor_writer_configured_is_a_noop():
+    env = _Env({101: ("payload", _Decoded(101))})
+    w = _worker(env)  # default cursor_writer=None
+    assert w.run_once() == "trained"
+    assert w.cursor == 101
