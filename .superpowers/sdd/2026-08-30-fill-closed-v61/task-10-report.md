@@ -1,6 +1,6 @@
 # Task 10 report — trainer step cursor (v6.1 trainer-paced picks)
 
-## Status: DONE, committed
+## Status: DONE, committed (fix round 1 addresses the confirmed cli-wiring gap)
 
 ## Files touched (mine only)
 - `reliquary/infrastructure/training_payload_queue.py`
@@ -101,3 +101,48 @@ Committed with `git add` by filename (only the 5 files listed above under
 "Files touched"), leaving the other implementer's uncommitted changes to
 `constants.py`/`fill_window.py`/`service.py`/`batcher.py`/their test files
 untouched in the working tree.
+
+## Fix round 1 (cli wiring)
+
+Reviewer confirmed the gap: `reliquary/trainer/cli.py::run_train_worker`
+never constructed a `TrainingPayloadQueue` and its `TrainerWorker(...)` call
+omitted `cursor_writer`, so the cursor was dead code in production.
+
+Fix, in `reliquary/trainer/cli.py` only:
+- Added `_build_cursor_queue(state_dir)`: a 5-line factory returning a
+  `TrainingPayloadQueue` scoped at `state_dir / "cursor_queue"` (no such
+  queue existed in cli.py's scope before, so this is a new instance, not a
+  reused one — per the reviewer's "if one exists... else a new one"
+  instruction). Named distinctly from the validator's own default
+  (`pending_training_payloads`) so the two queues never glob each other's
+  files even if `RELIQUARY_STATE_DIR`/`RELIQUARY_TRAINER_STATE_DIR` ever
+  pointed at the same root.
+- Added `_drain_cursor_queue_forever(queue)`: `asyncio.run(queue.run_forever())`.
+  `run_train_worker`'s main loop is a plain synchronous `while True` (no
+  persistent asyncio event loop — unlike the validator's async service,
+  which schedules `run_forever` as a task on its already-running loop), so
+  this runs on its own daemon thread instead.
+- In `run_train_worker`: construct `cursor_queue = _build_cursor_queue(state_dir)`,
+  start `_drain_cursor_queue_forever` on a daemon `threading.Thread` before
+  constructing the worker, and pass `cursor_writer=cursor_queue.write_step_cursor`
+  into the `TrainerWorker(...)` call. This makes the local `step-cursor.json`
+  actually reach R2 in production.
+
+`run_train_worker` itself still cannot be unit-tested (loads a real model on
+`cuda:0`), so per the reviewer's instruction only the extracted factory is
+covered: new `tests/unit/test_cli_cursor_queue.py` (4 tests — returns a
+`TrainingPayloadQueue`, scoped under the given `state_dir`, subdir name
+distinct from the validator's default, and a full write/read round trip
+through it). Confirmed red-by-construction: `_build_cursor_queue` does not
+exist in `git show HEAD:reliquary/trainer/cli.py` (grep count 0), so the
+import in these tests would have failed before the fix; all 4 pass after.
+
+`reliquary.trainer.cli` still imports cleanly and exposes both new
+functions (`python -c "import reliquary.trainer.cli as m; m._build_cursor_queue;
+m._drain_cursor_queue_forever"` — ok).
+
+Full targeted run: `test_cli_cursor_queue.py` + `test_trainer_worker.py` +
+`test_training_payload_queue.py` + `test_trainer_journal.py` +
+`test_cli_train_worker.py` → **52 passed**. Did not re-run the full suite
+this round (only `cli.py` + one new test file touched, no shared-file risk
+with the other implementer's in-flight fill_window/service/batcher work).

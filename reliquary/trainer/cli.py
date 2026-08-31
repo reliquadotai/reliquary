@@ -10,6 +10,7 @@ import asyncio
 import logging
 import os
 from pathlib import Path
+import threading
 import time
 
 logger = logging.getLogger(__name__)
@@ -69,6 +70,39 @@ def _hf_download(repo_id: str, revision: str) -> str:
     from huggingface_hub import snapshot_download
 
     return snapshot_download(repo_id=repo_id, revision=revision)
+
+
+def _build_cursor_queue(state_dir: Path):
+    """The trainer-host queue instance for the v6.1 per-step pacing
+    cursor (Amendment v6.1 -- trainer-paced picks).
+
+    Scoped under ``state_dir`` (``RELIQUARY_TRAINER_STATE_DIR``) in a
+    subdirectory distinct from the validator's own ``TrainingPayloadQueue``
+    default (``pending_training_payloads``, rooted at
+    ``RELIQUARY_STATE_DIR``) so the two never glob each other's files even
+    if both processes ever ran on the same host. It rides the same
+    drain/upload transport as payloads and tombstones
+    (``training_payload_queue.step_cursor_key``); the caller is
+    responsible for actually draining it (see ``_drain_cursor_queue_forever``)
+    or the local ``step-cursor.json`` never reaches R2.
+    """
+    from reliquary.infrastructure.training_payload_queue import (
+        TrainingPayloadQueue,
+    )
+
+    return TrainingPayloadQueue(queue_dir=str(state_dir / "cursor_queue"))
+
+
+def _drain_cursor_queue_forever(queue) -> None:
+    """Background-thread entry point that uploads the cursor to R2.
+
+    ``run_train_worker`` is a plain synchronous poll loop with no
+    persistent asyncio event loop of its own (unlike the validator's
+    asyncio service, which schedules ``run_forever`` as a task on its
+    already-running loop) -- so this runs on an isolated daemon thread
+    with its own loop instead.
+    """
+    asyncio.run(queue.run_forever())
 
 
 def run_train_worker(*, shadow: bool = False) -> None:
@@ -266,6 +300,16 @@ def run_train_worker(*, shadow: bool = False) -> None:
             return "training_checkpoint_ceiling"
         return None
 
+    # v6.1 (Amendment: trainer-paced picks) — advisory telemetry only,
+    # wired unconditionally on every profile (see TrainerWorker docs).
+    cursor_queue = _build_cursor_queue(state_dir)
+    threading.Thread(
+        target=_drain_cursor_queue_forever,
+        args=(cursor_queue,),
+        daemon=True,
+        name="trainer-cursor-queue-drain",
+    ).start()
+
     worker = TrainerWorker(
         journal=WindowJournal(
             fetch_fn=fetch,
@@ -281,6 +325,7 @@ def run_train_worker(*, shadow: bool = False) -> None:
         shadow=shadow,
         freeze_fn=freeze_fn,
         abort_epoch_fn=runner.abort_epoch,
+        cursor_writer=cursor_queue.write_step_cursor,
     )
 
     logger.info(
