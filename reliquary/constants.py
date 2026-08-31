@@ -872,6 +872,43 @@ if FILL_CLOSED_ADMISSION_BUDGET_PER_ENV <= 0:
         "RELIQUARY_FILL_CLOSED_ADMISSION_BUDGET_PER_ENV must be positive"
     )
 
+# Amendment v6.1 (R34): picks are paced by the TRAINER's own consumption
+# cursor, so no constant here may encode the trainer's step time -- the
+# cadence has to survive any model/hardware/config change on the train
+# worker unchanged. These two only describe the SHAPE of the pipeline:
+#
+#   * the first ``FILL_CLOSED_PICK_PIPELINE_DEPTH`` picks have nothing to
+#     wait on (the window has emitted nothing yet, so the cursor cannot
+#     have advanced into it) and are released on a plain wall-clock floor
+#     after the window opens;
+#   * every later pick k waits for the cursor to reach this window's
+#     batch ``k - depth - 1``, which leaves the trainer holding
+#     ``depth - 1`` unconsumed batches at the moment pick k lands -- it
+#     never starves, and the journal backlog is bounded at ``depth``.
+FILL_CLOSED_FIRST_PICK_SECONDS = float(_os.environ.get(
+    "RELIQUARY_FILL_CLOSED_FIRST_PICK_SECONDS", "30"
+))
+if (
+    not _math.isfinite(FILL_CLOSED_FIRST_PICK_SECONDS)
+    or FILL_CLOSED_FIRST_PICK_SECONDS < 0
+):
+    raise ValueError(
+        "RELIQUARY_FILL_CLOSED_FIRST_PICK_SECONDS must be finite and >= 0"
+    )
+
+FILL_CLOSED_PICK_PIPELINE_DEPTH = int(_os.environ.get(
+    "RELIQUARY_FILL_CLOSED_PICK_PIPELINE_DEPTH", "2"
+))
+if not 1 <= FILL_CLOSED_PICK_PIPELINE_DEPTH <= FILL_CLOSED_EMISSIONS_PER_WINDOW:
+    # Depth 0 would gate pick 1 on a batch that pick 1 itself produces --
+    # a deadlock every window until the backstop. Depth past the window's
+    # own emission count would put EVERY pick on the time floor, which is
+    # the unpaced behaviour the amendment exists to remove.
+    raise ValueError(
+        "RELIQUARY_FILL_CLOSED_PICK_PIPELINE_DEPTH must be in [1, "
+        f"{FILL_CLOSED_EMISSIONS_PER_WINDOW}]"
+    )
+
 # Runtime default for CLI/Docker operators. OpenCode remains available through
 # ENVIRONMENT_MIX, but code execution is opt-in until the runsc canary and
 # miner rollout are coordinated.

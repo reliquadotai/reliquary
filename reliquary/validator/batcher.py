@@ -1955,6 +1955,42 @@ class GrpoWindowBatcher:
                 else:
                     self.fill_state.release(environment)
 
+    def can_pick(self) -> bool:
+        """Could a pick seat a full batch from THIS environment right now?
+
+        The readiness half of the service's pick event (R36): a pick is a
+        WINDOW event, so the service must know that EVERY environment can
+        seat ``B_BATCH`` before it drives any of them -- half a DAPO batch
+        is not a batch. Answering it by calling ``pick_training_batch``
+        and undoing it would need a rollback path; this just counts.
+
+        Check-then-pick is race-safe without holding the lock across
+        both: the proven pool only ever GROWS between the two (proofs
+        complete and append; nothing removes), and the only other
+        subtraction -- a pick claiming groups -- runs on this same poll
+        thread. A True here can therefore go stale only in the harmless
+        direction. ``pick_training_batch`` re-checks the same conditions
+        under the lock regardless.
+
+        Stops counting at ``B_BATCH`` rather than sizing the whole pool:
+        this runs per environment on a 0.5 s loop against a pool that the
+        admission budget lets grow to 512.
+        """
+        if self.fill_state is None:
+            return False
+        environment = str(getattr(self.env, "name", ""))
+        with self.fill_state.lock:
+            if self.fill_state.is_closed() or self.is_sealed():
+                return False
+            unpicked = 0
+            for group in self._proven_groups.get(environment, []):
+                if group.picked:
+                    continue
+                unpicked += 1
+                if unpicked >= B_BATCH:
+                    return True
+        return False
+
     def pick_training_batch(self) -> bool:
         """Take one PICK: hand the ``B_BATCH`` best-by-rate proven groups
         of THIS environment to the injected callback. Returns whether a
