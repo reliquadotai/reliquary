@@ -953,6 +953,11 @@ class ValidationService:
         # window's ``_open_window_batchers`` has already replaced it by
         # the time the stashed window is archived.
         self._fill_closed_assemblers: dict[int, Any] = {}
+        # v6.1 (R35). The checkpoint revision the last CLOSED v6 window
+        # collected against; the next window's open waits for a different
+        # one. None means the gate is not armed (no v6 window has closed,
+        # or the one that did emitted no batches).
+        self._fill_closed_checkpoint_baseline: str | None = None
         self.kl_reference_state: dict[str, Any] = {
             "schema_version": 1,
             "mode": "rolling",
@@ -1531,10 +1536,23 @@ class ValidationService:
 
         intake = getattr(self, "_checkpoint_intake", None)
         if intake is None:
+            # Detached mode reaches here before the first
+            # ``_detached_checkpoint_tick`` has built the intake; without
+            # it the gate could only watch the installed manifest and
+            # would sit until the backstop. Construction touches boto3
+            # and the R2 environment, so a failure degrades to exactly
+            # that manifest-only wait rather than killing the iteration.
             from reliquary.constants import DETACHED_TRAINER as _detached
 
             if _detached:
-                intake = self._detached_intake_ref()
+                try:
+                    intake = self._detached_intake_ref()
+                except Exception:
+                    logger.exception(
+                        "could not build the checkpoint intake for the v6 "
+                        "window-open gate; watching the installed manifest "
+                        "only"
+                    )
         loop = asyncio.get_running_loop()
         started = loop.time()
         deadline = started + FILL_CLOSED_MAX_SECONDS
