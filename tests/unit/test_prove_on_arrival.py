@@ -229,11 +229,16 @@ def test_an_unknown_rate_falls_back_to_lowest_priority_not_a_crash(monkeypatch):
     )
     batcher._extend_proof_plan = lambda candidates: extended.extend(candidates)
 
+    # payload_bytes/receipt_id ride along from the precommit for the
+    # PICK's tie-break (amendment v6.1); the drain order under test here
+    # keys off the rate alone.
     unknown = _BufferedArrivalProof(
-        pending=_pending_stub(prompt_idx=71), rate=None, sequence=1
+        pending=_pending_stub(prompt_idx=71), rate=None,
+        payload_bytes=90_000, receipt_id="unknown", sequence=1,
     )
     known = _BufferedArrivalProof(
-        pending=_pending_stub(prompt_idx=72), rate=0.001, sequence=2
+        pending=_pending_stub(prompt_idx=72), rate=0.001,
+        payload_bytes=1_000, receipt_id="known", sequence=2,
     )
     batcher._arrival_proof_buffer.extend([unknown, known])
 
@@ -606,6 +611,8 @@ def test_concurrent_drains_do_not_race_on_rank_allocation(monkeypatch):
                     batcher_module._BufferedArrivalProof(
                         pending=_pending_stub(prompt_idx=attempt * 100 + i),
                         rate=None,
+                        payload_bytes=0,
+                        receipt_id="",
                         sequence=batcher._arrival_proof_sequence,
                     )
                 )

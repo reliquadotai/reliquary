@@ -452,11 +452,10 @@ def open_grpo_window(
     validated before firing the seal. See
     ``GrpoWindowBatcher._delayed_seal_at_drand_boundary``.
 
-    ``emit_training_batch_fn`` is v6 only: called with the accumulated
-    ``dict[str, list[ValidSubmission]]`` every time a B_BATCH-per-
-    environment slice of proven groups is ready, from whichever proof-
-    worker thread completed the proof that filled it (see
-    ``GrpoWindowBatcher._emit_training_batch``). ``None`` here -- no
+    ``emit_training_batch_fn`` is v6 only: called with one environment's
+    picked B_BATCH chunk every time that environment takes a pick, from
+    whichever thread called ``pick_training_batch`` (see
+    ``GrpoWindowBatcher.pick_training_batch``). ``None`` here -- no
     caller wires a detached-trainer writer into it yet; see
     ``docs/superpowers/plans/2026-08-28-fill-closed-window-v6.md``,
     Component 4.

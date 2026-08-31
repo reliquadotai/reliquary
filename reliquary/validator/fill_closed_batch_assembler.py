@@ -24,8 +24,8 @@ state (the accumulator and the pending queues). Every method that mutates
 that state does so entirely under the lock, builds any payload/tombstone
 bytes it needs to write while still holding it, then releases the lock
 BEFORE calling ``_enqueue_fn``/``_tombstone_fn`` -- the same discipline
-``batcher.py``'s ``_maybe_emit_batch`` uses around its own injected
-callback (see batcher.py's module docstring on ``_emit_training_batch``):
+``batcher.py``'s ``pick_training_batch`` uses around its own injected
+callback (see batcher.py's docstring on ``_claim_pick_chunk``):
 a blocking filesystem write must never run while a proof-worker thread
 holds the lock another thread needs.
 """

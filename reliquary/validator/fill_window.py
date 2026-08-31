@@ -60,7 +60,8 @@ class FillState:
         # lock at all. Methods below are deliberately lock-free -- callers
         # hold ``self.lock`` for the whole read-modify-write they need,
         # including reads paired with mutations of state that lives
-        # elsewhere (a batcher's own ``_proven_groups``/watermark), which
+        # elsewhere (a batcher's own ``_proven_groups``/pick counter),
+        # which
         # is why this can't just be an internal per-method lock.
         self.lock = threading.Lock()
 

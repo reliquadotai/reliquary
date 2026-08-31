@@ -784,10 +784,18 @@ class _BufferedArrivalProof:
     (no precommit, a different window, or the queue itself is off) -- the
     sort key below sends that to the back rather than raising, so a queue
     miss degrades the group's priority instead of stalling admission.
+
+    ``rate`` and ``payload_bytes`` are read ONCE here, at arrival, while
+    the precommit that registered them is still in this window's
+    ``ThroughputAdmissionQueue``. Both then travel with the group all the
+    way onto ``_ProvenGroup`` (amendment v6.1), because the pick that
+    finally spends them runs long after -- and must not re-derive either.
     """
 
     pending: PendingSubmission = field(repr=False)
     rate: float | None
+    payload_bytes: int
+    receipt_id: str
     sequence: int
 
 
@@ -799,10 +807,61 @@ def _arrival_buffer_sort_key(
     Sorting happens here, once, before any candidate is built or any
     capacity is spent -- never inside ``extend``, which only ever sees
     ranks already fixed in dispatch order.
+
+    This orders the spending of GRADING/PROOF budget, not seats: under
+    amendment v6.1 a proven group has bought nothing but a place in the
+    pick pool, so arrival is a perfectly good tie-break here (it decides
+    only who is proved first among equally productive miners). The SEAT
+    tie-break is ``_pick_sort_key``, and it deliberately does not fall
+    back to arrival.
     """
     if entry.rate is None:
         return (1, 0.0, entry.sequence)
     return (0, -entry.rate, entry.sequence)
+
+
+@dataclass
+class _ProvenGroup:
+    """One PASSED group sitting in this environment's pick pool (v6.1).
+
+    Proving on arrival no longer grants a seat -- it only puts the group
+    here. A pick (``pick_training_batch``) then takes the ``B_BATCH``
+    best by ``rate``, and ``picked`` is how a claimed group is walled off
+    from every later pick. That flag replaces the contiguous-prefix
+    watermark the old watermark-order emission used: a pick claims an
+    arbitrary SUBSET of the pool, which no single integer can describe.
+    """
+
+    value: Any = field(repr=False)
+    rate: float | None
+    payload_bytes: int
+    receipt_id: str
+    picked: bool = False
+
+
+def _pick_sort_key(group: _ProvenGroup) -> tuple[int, float, int, str]:
+    """Highest precommit rate first; unknown rate last; ties broken by
+    payload bytes DESCENDING, then receipt id.
+
+    The tie-break is the load-bearing half. The rate metric is
+    length-NEUTRAL by construction (payload bytes over elapsed since
+    window open), so at fixed hardware two groups of wildly different
+    length register the SAME rate -- ties are the common case here, not a
+    corner. Breaking them by arrival, the way the arrival buffer does,
+    would hand the seat straight back to whoever finished first, which is
+    systematically the shortest answer: the exact bias amendment v6.1
+    exists to remove. The larger payload wins instead, so a tie resolves
+    toward length diversity. The receipt id only makes the order total
+    (and deterministic across the pool's list order).
+    """
+    if group.rate is None:
+        return (1, 0.0, -int(group.payload_bytes), str(group.receipt_id))
+    return (
+        0,
+        -float(group.rate),
+        -int(group.payload_bytes),
+        str(group.receipt_id),
+    )
 
 
 @dataclass(frozen=True)
@@ -1168,8 +1227,8 @@ class GrpoWindowBatcher:
         self.admission_queue: ThroughputAdmissionQueue | None = None
         # v6 only. None on the auction path, which proves at seal instead of
         # on arrival. Set by the window activation code once every
-        # environment's target is known; ``_submit_arrival_proof`` is a
-        # no-op while it is None.
+        # environment's admission budget is known; ``_submit_arrival_proof``
+        # is a no-op while it is None.
         self.fill_state: FillState | None = None
         # v6 only. The open-ended plan this window's arrival proofs extend.
         # Lazily created by ``_extend_proof_plan`` on the first arrival --
@@ -1206,6 +1265,16 @@ class GrpoWindowBatcher:
         # insertion counter, used only to break rate ties deterministically.
         self._arrival_proof_buffer: list[_BufferedArrivalProof] = []
         self._arrival_proof_sequence: int = 0
+        # v6.1 only. job_id -> the (rate, payload_bytes, receipt_id) that
+        # dispatched it, so ``_reconcile_fill_state_decisions`` can build
+        # a ``_ProvenGroup`` from a decision alone: the scheduler hands
+        # back a job_id and a value, never the buffered entry, and the
+        # precommit behind it is not looked up a second time. Popped as
+        # each decision is accounted, so this holds only what is actually
+        # in flight.
+        self._arrival_proof_meta: dict[
+            str, tuple[float | None, int, str]
+        ] = {}
         # v6 only. ``FillState`` has no internal locking of its own (see
         # fill_window.py) -- its ``.lock`` is what callers hold. It lives ON
         # the (possibly shared, see R10) instance rather than on this
@@ -1214,13 +1283,14 @@ class GrpoWindowBatcher:
         # per-batcher lock around a shared object is no lock at all.
         # ``reserve`` happens under ``self._lock`` (the admission commit
         # lock); ``record_proven``/``release``/the proven-groups walk/the
-        # emission slice all happen from proof-worker device threads, which
-        # never touch ``self._lock`` (see ``_verify_expensive``'s
-        # docstring) -- ``fill_state.lock`` is what keeps THOSE mutually
-        # exclusive instead. Per Task 7 review (Critical): every reader or
-        # writer of the (fill_state counts, ``_proven_groups``, per-env
-        # watermark) triple holds this one lock, so a proof-worker thread
-        # can never observe a ``proven`` count that has advanced past a
+        # pick's selection and claim all happen from proof-worker device
+        # threads (and, for a pick, the service's own thread), which never
+        # touch ``self._lock`` (see ``_verify_expensive``'s docstring) --
+        # ``fill_state.lock`` is what keeps THOSE mutually exclusive
+        # instead. Per Task 7 review (Critical): every reader or writer of
+        # the (fill_state counts, ``_proven_groups``, pick counters)
+        # triple holds this one lock, so a picking thread can never
+        # observe a ``proven`` count that has advanced past a
         # ``_proven_groups`` append not yet made.
         # v6 only. Rank allocation and the extend/submit call that consumes
         # it must be atomic with respect to EACH OTHER, or two proof-worker
@@ -1240,24 +1310,35 @@ class GrpoWindowBatcher:
         # for this lock has already exited before ``fill_state.lock`` is
         # taken, so they never actually nest at all.
         self._proof_plan_lock = threading.Lock()
-        # v6 only. Monotonic count of training batches already handed to
-        # the detached trainer. ``_emit_training_batch`` walks this forward
-        # to ``proven // B_BATCH`` under ``fill_state.lock`` -- the SAME
-        # lock the proven-groups append and watermark advance use (Task 7
-        # review, Critical: splitting the counter check-and-increment from
-        # the slice/watermark advance into separate critical sections would
-        # let two batches interleave and duplicate or drop a slice). The
-        # dedicated ``_emit_batch_lock`` this replaced is gone: with the
-        # counter under ``fill_state.lock`` too, it had no remaining job.
+        # v6 only. Monotonic count of picks THIS batcher's environment has
+        # taken. Read-modify-written inside ``_claim_pick_chunk`` under
+        # ``fill_state.lock`` -- the SAME lock the proven-groups append and
+        # the ``picked`` flags use (Task 7 review, Critical: splitting the
+        # counter check-and-increment from the claim into separate
+        # critical sections would let two picks interleave and claim the
+        # same group twice). The dedicated ``_emit_batch_lock`` this
+        # replaced is gone: with the counter under ``fill_state.lock``
+        # too, it had no remaining job.
+        #
+        # v6.1: this is a PER-ENVIRONMENT ordinal, while
+        # ``FillState.picks_emitted`` is window-wide -- one pick k is one
+        # DAPO batch, assembled from every environment's own k-th chunk.
+        # See ``_claim_pick_chunk`` for why only the first environment to
+        # reach ordinal k advances the window-wide counter.
         self._batches_emitted: int = 0
         # v6 only. Every PASSED group, per environment, appended in the
-        # same rank order ``handle.decisions()`` guarantees. The source
-        # ``_emit_training_batch`` slices B_BATCH at a time from.
-        self._proven_groups: dict[str, list[Any]] = {}
-        # v6 only. How many of ``_proven_groups[environment]`` have
-        # already been folded into an emitted batch, so a group is never
-        # emitted twice and never skipped.
-        self._emitted_group_watermark: dict[str, int] = {}
+        # same rank order ``handle.decisions()`` guarantees -- the pool
+        # ``pick_training_batch`` chooses the B_BATCH best by rate from.
+        # v6.1: append order is no longer emission order; the pool is
+        # sorted at every pick and claimed groups are flagged in place.
+        self._proven_groups: dict[str, list[_ProvenGroup]] = {}
+        # v6.1 only. What the close burned: proven groups no pick ever
+        # took (R32), counted once by ``_burn_unpicked_proven_groups`` and
+        # surfaced through ``upload_precommit_conservation`` so the
+        # archive records how much the over-collection actually cost.
+        self._burned_unpicked_groups: int = 0
+        self._burned_unpicked_eos_tokens: int = 0
+        self._unpicked_groups_burned: bool = False
         # v6 only (R13). Injected by the service as
         # ``FillClosedBatchAssembler.accept``, following the
         # ``queue_drained_predicate`` pattern below. Called with
@@ -1266,8 +1347,10 @@ class GrpoWindowBatcher:
         # never every environment: a batcher only ever holds its own
         # environment's proven groups, so joining every environment's
         # chunk into one DAPO batch happens in the service-side assembler,
-        # not here. Runs on whichever proof-worker thread completed the
-        # proof that crossed the boundary -- see ``_emit_training_batch``.
+        # not here. v6.1: runs on whichever thread called
+        # ``pick_training_batch`` (the service's, paced on the trainer
+        # cursor), never on the proof-completion path -- a finished proof
+        # only grows the pool now.
         # ``None`` in test contexts and on the auction path.
         self._emit_training_batch_fn = emit_training_batch_fn
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -1569,14 +1652,18 @@ class GrpoWindowBatcher:
         environment = str(getattr(self.env, "name", ""))
         if self._open_proof_plan_id is None:
             plan_id = f"{self.window_start}:{environment}:fill-closed"
-            target = self.fill_state.snapshot()["budgets"][environment]
+            # The plan's own pass target is the admission BUDGET, not the
+            # window's close condition: v6.1 closes on picks (R35), and
+            # over-collecting against the budget is the point (R33), so the
+            # plan must stay willing to prove everything the budget admits.
+            budget = self.fill_state.snapshot()["budgets"][environment]
             handle = scheduler.submit(
                 ProofPlan(
                     plan_id=plan_id,
                     environment=environment,
                     checkpoint_revision=self.current_checkpoint_hash,
                     candidates=tuple(candidates),
-                    required_passes=target,
+                    required_passes=budget,
                     # The scheduler's own deadline is a second, independent
                     # backstop under the window-duration one Task 7 polls
                     # (``FILL_CLOSED_MAX_SECONDS``) -- belt and braces, not
@@ -1610,13 +1697,16 @@ class GrpoWindowBatcher:
         ``drain()`` can wait on it forever, and the next window's plan for
         this environment is refused (one active plan per environment).
 
-        Called unconditionally on both v6 seal paths. At fill-close,
-        reaching every environment's target has almost always ALREADY
-        finalised (and, in the scheduler, RETIRED) this environment's plan
-        on its own, via ``_finalize_if_terminal_locked`` -- before this
-        ever runs, since ``fill_state.record_proven`` and the scheduler's
-        own ``passed >= required_passes`` bookkeeping key off the very
-        same decision. ``GlobalProofScheduler.seal`` documents itself as
+        Called unconditionally on both v6 seal paths. It usually has real
+        work to do on BOTH now: under amendment v6.1 the window closes at
+        the Nth pick (R35) while the plan's own ``required_passes`` is the
+        admission budget (R33), which deliberately over-collects -- so a
+        window normally seals with its plan still open, rather than the
+        plan having already finalised itself by covering its target. The
+        self-finalising case survives where a plan does exhaust its budget
+        (via ``_finalize_if_terminal_locked``, off the very same decision
+        ``fill_state.record_proven`` keys off), and this call has to stay
+        harmless there. ``GlobalProofScheduler.seal`` documents itself as
         "idempotent, a no-op on a plan that already finalised", but that
         guard lives INSIDE the same lock acquisition that finalises AND
         retires a plan -- externally, by the time any caller observes a
@@ -1625,8 +1715,7 @@ class GrpoWindowBatcher:
         instead. That is expected here, not a caller bug (this
         environment's own ``_open_proof_plan_id`` was submitted by this
         same batcher, never invented), so it is caught and treated as the
-        no-op it conceptually is. Only the backstop (target not reached)
-        actually needs the call to do anything.
+        no-op it conceptually is.
 
         Non-blocking, since ``poll_deadline`` runs on the event-loop
         thread that also serves miners: ``seal`` finalises synchronously
@@ -1665,6 +1754,12 @@ class GrpoWindowBatcher:
         first does not jump a faster one still on its way in. The actual
         reservation and dispatch order are decided in
         ``_drain_arrival_proof_buffer``, not here.
+
+        The rate and the precommit's payload size are captured HERE, at
+        the one moment both are cheaply available, and carried through
+        the buffer onto the proven record (amendment v6.1): the pick that
+        eventually spends them runs after the proof, on a different
+        thread, with no receipt in hand.
         """
         if self.fill_state is None:
             return
@@ -1684,9 +1779,19 @@ class GrpoWindowBatcher:
             return
 
         rate = None
+        payload_bytes = None
         receipt_id = getattr(pending.request, "_precommit_receipt_id", "") or None
         if receipt_id is not None and self.admission_queue is not None:
             rate = self.admission_queue.rate_of(receipt_id)
+            payload_bytes = self.admission_queue.payload_bytes_of(receipt_id)
+        if payload_bytes is None:
+            # Queue miss (no precommit, another window, queue off): fall
+            # back to the size the revealed body itself accounted for, and
+            # to 0 when even that is unknown -- which sorts last on the
+            # pick's tie-break, the same direction an unknown rate does.
+            payload_bytes = int(
+                getattr(pending.request, "_payload_bytes", 0) or 0
+            )
 
         with self.fill_state.lock:
             self._arrival_proof_sequence += 1
@@ -1694,6 +1799,8 @@ class GrpoWindowBatcher:
                 _BufferedArrivalProof(
                     pending=pending,
                     rate=rate,
+                    payload_bytes=int(payload_bytes),
+                    receipt_id=str(receipt_id or ""),
                     sequence=self._arrival_proof_sequence,
                 )
             )
@@ -1702,17 +1809,29 @@ class GrpoWindowBatcher:
 
     def _drain_arrival_proof_buffer(self, environment: str) -> None:
         """Pull the buffer's highest-rate entry into the plan, one at a
-        time, for as long as the environment has room.
+        time, for as long as the environment has admission BUDGET left.
 
-        Called on both moments capacity can change: a graded body landing
+        Called on both moments the buffer can move: a graded body landing
         (so a fast group is not left waiting behind nothing) and a proof
-        completing (so freed capacity goes to the next-fastest group, not
-        just whichever happens to arrive next).
+        completing (so the next-fastest group goes out next, rather than
+        whichever happens to arrive next).
 
-        Sorting and reservation both happen HERE, at drain time -- never
-        at buffering time. That is what keeps a buffered group's
-        reservation honest: a group sitting behind a full environment has
-        consumed nothing, and if it never drains, it never will.
+        Sorting and the budget spend both happen HERE, at drain time --
+        never at buffering time. That is what keeps a buffered group
+        honest: a group sitting behind a spent budget has consumed
+        nothing, and if it never drains, it never will.
+
+        R33: what ``may_admit`` gates is a MONOTONE budget, and that is
+        the point of the new meaning -- draining is what spends real
+        grading and proof cost, so a group whose proof then fails does
+        NOT hand its budget back. ``release()`` frees proof capacity
+        (``in_flight``) for the next candidate; it never reopens
+        admission. Once an environment's budget is spent, this drain goes
+        permanently inert for the rest of the window and whatever is
+        still buffered stays buffered. Under amendment v6.1 that costs a
+        miner nothing it was promised: budget buys a proof attempt and a
+        place in the pick pool, never a seat -- seats are granted at
+        picks (``pick_training_batch``), out of the pool, by rate.
         """
         if self.fill_state is None:
             return
@@ -1757,6 +1876,14 @@ class GrpoWindowBatcher:
                         hotkey_remaining=hotkey_remaining,
                         tag="arrival",
                     )
+                    # v6.1: the scheduler's decision carries a job_id and
+                    # a proven value, nothing else -- this is where the
+                    # buffered entry's rate and payload size are pinned to
+                    # that job_id so the pick pool can be built from a
+                    # decision alone.
+                    self._arrival_proof_meta[candidate.job_id] = (
+                        entry.rate, entry.payload_bytes, entry.receipt_id,
+                    )
                     self._extend_proof_plan([candidate])
             except Exception:
                 # ``_proof_plan_lock`` has already been released by the
@@ -1785,11 +1912,13 @@ class GrpoWindowBatcher:
         callable ran, so this walks it instead of accounting inline in
         the callable.
 
-        ``proven`` can only have just increased when this returns, so it
-        also calls ``_maybe_emit_batch`` -- once the lock above is
-        released, never while held: emission's own critical section (see
-        ``_emit_training_batch``) takes the SAME ``fill_state.lock``, and
-        this one is not reentrant.
+        Amendment v6.1: a completed proof GROWS THE POOL and nothing
+        else. The old automatic emission trigger fired from here whenever
+        ``proven // B_BATCH`` advanced, which is precisely what made
+        admission order into emission order. Picks are now external and
+        paced by the trainer's own consumption (the service's call to
+        ``pick_training_batch``), so there is deliberately no emission
+        call left on this path.
         """
         handle = self._open_proof_plan_handle
         if handle is None:
@@ -1799,118 +1928,171 @@ class GrpoWindowBatcher:
                 if decision.job_id in self._accounted_arrival_decisions:
                     continue
                 self._accounted_arrival_decisions.add(decision.job_id)
+                rate, payload_bytes, receipt_id = (
+                    self._arrival_proof_meta.pop(
+                        decision.job_id, (None, 0, "")
+                    )
+                )
                 if decision.status is ProofDecisionStatus.PASSED:
                     self.fill_state.record_proven(environment)
                     self._proven_groups.setdefault(environment, []).append(
-                        decision.value
+                        _ProvenGroup(
+                            value=decision.value,
+                            rate=rate,
+                            payload_bytes=payload_bytes,
+                            receipt_id=receipt_id,
+                        )
                     )
                 else:
                     self.fill_state.release(environment)
-        self._maybe_emit_batch()
 
-    def _maybe_emit_batch(self) -> None:
-        """Emit every B_BATCH chunk of THIS environment's own proven
-        groups that has newly become ready, one at a time.
+    def pick_training_batch(self) -> bool:
+        """Take one PICK: hand the ``B_BATCH`` best-by-rate proven groups
+        of THIS environment to the injected callback. Returns whether a
+        pick actually happened.
 
-        R13: batch ASSEMBLY -- joining every configured environment's
-        B_BATCH chunk into one cross-environment DAPO batch -- moved to
-        the service (``FillClosedBatchAssembler``). A single batcher only
-        ever accounts its own environment's proven groups (see
-        ``_reconcile_fill_state_decisions``, keyed by ``self.env.name``),
-        so it cannot itself assemble a batch needing groups from every
-        environment; only the service, which sees every environment's
-        batcher for a window, can. This method's job narrows to: claim
-        and hand off THIS environment's own next chunk, as soon as it is
-        ready, independent of any other environment's progress.
+        Amendment v6.1, point 1. Seats are granted here, not on arrival.
+        Everything in ``_proven_groups`` has already been graded and
+        proved, so the pool is the population of groups that COULD be
+        trained on; this chooses which ``B_BATCH`` of them are, by
+        precommit rate (``_pick_sort_key``). Because each pick draws from
+        a pool that has had strictly more time to fill, later picks can
+        seat answers that were still generating when the earlier ones ran
+        -- a short-to-long curriculum with no parameter, and the whole
+        reason the amendment exists.
 
-        The readiness check, the counter increment, the proven-groups
-        slice and the watermark advance all happen together in ONE
-        critical section, inside ``_emit_training_batch``, under
-        ``fill_state.lock`` -- the SAME lock
-        ``_reconcile_fill_state_decisions`` holds while appending to
-        ``_proven_groups`` (Task 7 review, Critical; unchanged by R13).
-        Splitting the counter check-and-increment from the slice/watermark
-        advance into two separate lock acquisitions would let two cycles
-        interleave: cycle N+1 could read the watermark before cycle N had
-        advanced it and slice the SAME groups again. One combined
-        critical section is what makes ``self._batches_emitted``'s
-        increment and the watermark's advance atomic with each other, not
-        just individually locked.
+        Externally triggered ON PURPOSE. The old emission fired itself
+        from the proof-completion path the moment ``proven // B_BATCH``
+        advanced, which made admission order into emission order and left
+        no moment at which a choice could be made. The SERVICE decides
+        when a pick happens (Task 12 paces it on the trainer's own
+        consumption cursor); this method only executes one.
 
-        ``_emit_training_batch`` returns the ready chunk (or ``None`` when
-        nothing new crossed the boundary) and releases the lock BEFORE
-        returning, so the callback below -- possible I/O, the write to
-        the detached trainer's journal -- never runs while the lock is
-        held. Cycle N+1's callback can only be issued after cycle N's
-        slice has been safely walled off by the watermark advance, even
-        though the callbacks' own completion order is not itself
-        serialized.
+        A pick never emits a partial batch: with fewer than ``B_BATCH``
+        unpicked proven groups it refuses and returns False, leaving the
+        pool untouched for the next call. Partials exist only at the
+        backstop close, which keeps its own path (the assembler's
+        ``close()``).
 
-        Only called from ``_reconcile_fill_state_decisions``, after its
-        walk -- never from ``FillState.record_proven`` directly, which a
-        test double (or any future caller) could invoke without a real
-        scheduler decision behind it.
-        """
-        if self.fill_state is None:
-            return
-        while True:
-            chunk = self._emit_training_batch()
-            if chunk is None:
-                return
-            if self._emit_training_batch_fn is not None:
-                self._emit_training_batch_fn(*chunk)
-
-    def _emit_training_batch(
-        self,
-    ) -> tuple[str, list[Any], int, str] | None:
-        """Atomically claim and slice the next ready B_BATCH chunk of
-        THIS environment's own proven groups, under ``fill_state.lock``;
-        return ``(environment, groups, window_start, checkpoint_revision)``
-        for ``_maybe_emit_batch`` to hand to the injected callback OUTSIDE
-        the lock.
-
-        R13: readiness now depends ONLY on this environment's own proven
-        count (``fill_state.snapshot()['proven'][environment]``), not
-        ``min(...)`` across every environment (the pre-R13 shape) -- a
-        fast environment no longer waits on a slow sibling to emit its
-        OWN next chunk; joining the two environments' chunks back into
-        one DAPO batch is the service-side assembler's job, not this
-        batcher's.
-
-        Checks and increments ``self._batches_emitted``, slices
-        ``self._proven_groups[environment]`` and advances
-        ``self._emitted_group_watermark[environment]`` -- all under the
-        one lock (Task 7 review, Critical; unchanged by R13), so a
-        concurrent ``_reconcile_fill_state_decisions`` append can never be
-        read half-applied. Returns ``None`` under the lock when no new
-        chunk is ready yet.
+        Lock discipline is the one ``_maybe_emit_batch`` established: the
+        selection, the ``picked`` flags, the pick counters and the
+        ``FillState`` accounting all happen in ONE critical section
+        inside ``_claim_pick_chunk`` under ``fill_state.lock`` -- the SAME
+        lock ``_reconcile_fill_state_decisions`` appends to
+        ``_proven_groups`` under (Task 7 review, Critical) -- and the
+        callback, which writes to the detached trainer's journal, runs
+        only after that lock is released.
 
         ``self._emit_training_batch_fn`` -- like
         ``TrainingPayloadQueue.enqueue_payload`` on the existing seal path
-        -- is a plain filesystem write with no asyncio primitives, so
-        ``_maybe_emit_batch`` calls it directly rather than marshalled
-        onto the event loop via ``self._loop.call_soon_threadsafe``; a
-        future implementation that genuinely needs the loop is
-        responsible for its own scheduling, the same way
-        ``_delayed_seal_at_drand_boundary`` does.
+        -- is a plain filesystem write with no asyncio primitives, so it
+        is called directly rather than marshalled onto the event loop via
+        ``self._loop.call_soon_threadsafe``; a future implementation that
+        genuinely needs the loop is responsible for its own scheduling,
+        the same way ``_delayed_seal_at_drand_boundary`` does.
+        """
+        if self.fill_state is None:
+            return False
+        chunk = self._claim_pick_chunk()
+        if chunk is None:
+            return False
+        if self._emit_training_batch_fn is not None:
+            self._emit_training_batch_fn(*chunk)
+        return True
+
+    def _claim_pick_chunk(
+        self,
+    ) -> tuple[str, list[Any], int, str] | None:
+        """Atomically choose, claim and account one pick's worth of THIS
+        environment's pool, under ``fill_state.lock``; return
+        ``(environment, groups, window_start, checkpoint_revision)`` for
+        ``pick_training_batch`` to hand to the callback OUTSIDE the lock.
+        ``None`` (still under the lock) when no pick is possible.
+
+        R13: a pick depends ONLY on this environment's own pool -- a fast
+        environment does not wait on a slow sibling; joining the two
+        environments' chunks back into one DAPO batch is the service-side
+        assembler's job, not this batcher's.
+
+        Two counters, deliberately different in scope. ``_batches_emitted``
+        is this ENVIRONMENT's pick ordinal. ``FillState.picks_emitted`` is
+        WINDOW-wide, and one pick k is one DAPO batch built from every
+        environment's own k-th chunk -- so the window-wide counter is
+        advanced by whichever environment reaches ordinal k FIRST, and the
+        sibling that follows it into the same pick k does not advance it
+        again. Counting once per environment instead would close a
+        two-environment window at half the batches R35 asks for.
+
+        Refuses once the window is closed rather than letting
+        ``record_pick`` raise: a paced pick racing the seal is a normal
+        outcome, not a fault.
         """
         environment = str(getattr(self.env, "name", ""))
         with self.fill_state.lock:
-            proven = self.fill_state.snapshot()["proven"][environment]
-            ready = proven // B_BATCH
-            if self._batches_emitted >= ready:
+            if self.fill_state.is_closed() or self.is_sealed():
                 return None
+            pool = [
+                group
+                for group in self._proven_groups.get(environment, [])
+                if not group.picked
+            ]
+            if len(pool) < B_BATCH:
+                return None
+            pool.sort(key=_pick_sort_key)
+            claimed = pool[:B_BATCH]
+            for group in claimed:
+                group.picked = True
             self._batches_emitted += 1
-            groups = self._proven_groups.get(environment, [])
-            start = self._emitted_group_watermark.get(environment, 0)
-            end = start + B_BATCH
-            chunk = groups[start:end]
-            self._emitted_group_watermark[environment] = min(
-                end, len(groups)
-            )
+            if self._batches_emitted > self.fill_state.snapshot()[
+                "picks_emitted"
+            ]:
+                self.fill_state.record_pick()
+            chunk = [group.value for group in claimed]
             window_start = self.window_start
             checkpoint_revision = self.current_checkpoint_hash
         return (environment, chunk, window_start, checkpoint_revision)
+
+    def _burn_unpicked_proven_groups(self) -> None:
+        """R32: at close, whatever is proven but was never picked is
+        BURNED -- counted, logged, and never paid.
+
+        Deliberate, not a leak. Admission is bounded by a budget rather
+        than by the window's emission target precisely so that the pool
+        over-collects (R33): late picks can only choose longer answers if
+        those answers are already sitting in the pool, which means the
+        pool must hold more than the picks will ever take. The surplus is
+        the price of that choice. It is never redistributed and never
+        paid -- payment happens only in the assembler, and a burned group
+        never reaches it -- which is the same burn-never-redistribute rule
+        v4/v5 already apply to unfilled slots.
+
+        One-shot: ``poll_deadline`` is polled on a loop, so this records
+        what the window ENDED with, not a running per-poll tally.
+        """
+        if self.fill_state is None or self._unpicked_groups_burned:
+            return
+        environment = str(getattr(self.env, "name", ""))
+        with self.fill_state.lock:
+            self._unpicked_groups_burned = True
+            burned = [
+                group
+                for group in self._proven_groups.get(environment, [])
+                if not group.picked
+            ]
+            self._burned_unpicked_groups = len(burned)
+            self._burned_unpicked_eos_tokens = sum(
+                int(getattr(group.value, "eos_tokens", 0) or 0)
+                for group in burned
+            )
+        if self._burned_unpicked_groups:
+            logger.info(
+                "fill-closed window %d (%s): burned %d proven group(s) no "
+                "pick took, %d eos tokens -- never paid (R32)",
+                self.window_start,
+                environment,
+                self._burned_unpicked_groups,
+                self._burned_unpicked_eos_tokens,
+            )
 
     def _record_upload_precommit_rejection_locked(self, reason: str) -> None:
         self._upload_precommit_rejections[reason] = (
@@ -2323,7 +2505,7 @@ class GrpoWindowBatcher:
                     self._productive_capacity_used_locked()
                 )
             # v6 only. Task 7 review (Minor): ``snapshot()`` reads the same
-            # mutable (proven, in_flight) dicts ``_emit_training_batch``
+            # mutable (proven, in_flight) dicts ``_claim_pick_chunk``
             # mutates under ``fill_state.lock`` -- take it here too, even
             # for this read-only status report.
             fill_state_snapshot = None
@@ -2381,12 +2563,21 @@ class GrpoWindowBatcher:
                 "graded_prefix_fill_offset_seconds": (
                     self.graded_prefix_fill_offset_s
                 ),
-                # v6 only. Per-environment proven/in_flight/target/closed,
+                # v6 only. Per-environment proven/in_flight/budget, plus
+                # the window-wide picks and closed flag,
                 # so a fleet honouring a closed environment can rebalance
                 # toward the scarce one -- the reference miner already
                 # re-reads /state every loop iteration and samples its
                 # environment by the mix weights. None on the auction path.
                 "fill_state": fill_state_snapshot,
+                # v6.1 only (R32). What the close burned: proven groups no
+                # pick ever took. Archived so the cost of deliberate
+                # over-collection (R33) is measurable rather than
+                # inferred -- 0 on the auction path and before the close.
+                "fill_closed_burned_groups": self._burned_unpicked_groups,
+                "fill_closed_burned_eos_tokens": (
+                    self._burned_unpicked_eos_tokens
+                ),
                 "accepted_receipts": accepted,
                 "revealed": self._upload_precommit_revealed,
                 "revealed_terminal": terminal,
@@ -2623,12 +2814,19 @@ class GrpoWindowBatcher:
             with self.fill_state.lock:
                 closed = self.fill_state.is_closed()
             if closed:
+                # R35: the close is the Nth PICK, so by construction the
+                # pool can still hold proven groups no pick took. They
+                # burn (R32) -- see ``_burn_unpicked_proven_groups``.
                 self._seal_v6_proof_plan()
+                self._burn_unpicked_proven_groups()
                 self._seal_flag.set()
                 return True
             if now - self.window_opened_at >= FILL_CLOSED_MAX_SECONDS:
                 # Backstop: a stalled fleet must not hold a window open.
+                # Everything proven is unpicked here, and burns for the
+                # same reason: nothing that skips the assembler is paid.
                 self._seal_v6_proof_plan()
+                self._burn_unpicked_proven_groups()
                 self._seal_flag.set()
                 return True
             return False
@@ -6622,8 +6820,9 @@ class GrpoWindowBatcher:
         What still belongs here is the seal path's OTHER job: it is the only
         writer of the prompt cooldown, the content cooldown and the
         rollout-hash dedup set. Those are recorded for the groups this
-        environment actually proved and paid (``self._proven_groups``), so
-        the next window does not re-serve a prompt v6 already trained on.
+        environment actually proved (``self._proven_groups``, picked or
+        burned), so the next window does not re-serve a prompt v6 has
+        already spent.
         Nothing is selected: the returned batch is empty, and the service's
         ``sealed_dict`` is empty with it.
         """
@@ -6632,27 +6831,34 @@ class GrpoWindowBatcher:
         # (``_reconcile_fill_state_decisions`` appends under
         # ``fill_state.lock``), before taking ``self._lock`` — the two are
         # never held together anywhere else and must not start here.
+        #
+        # v6.1: every PROVEN group, picked or burned (R32). The cooldown
+        # sets are a replay defence, not a payment record: a burned group
+        # was still graded, proved and seen, so its prompt and rollout
+        # hashes stay spent for the next window exactly as a picked one's
+        # do. ``.value`` unwraps the pick-pool record.
         if self.fill_state is not None:
             with self.fill_state.lock:
-                paid = list(self._proven_groups.get(environment, []))
+                proven = list(self._proven_groups.get(environment, []))
         else:
-            paid = list(self._proven_groups.get(environment, []))
+            proven = list(self._proven_groups.get(environment, []))
+        recorded = [group.value for group in proven]
         with self._lock:
             self.selection_metadata_by_id = {}
             self.rewards_by_hotkey = {}
             self.rewarded_but_not_selected_by_hotkey = {}
             self._pending_seal_side_effects = _SealSideEffects(
                 rewarded_prompts=tuple(sorted({
-                    int(group.prompt_idx) for group in paid
+                    int(group.prompt_idx) for group in recorded
                 })),
                 rewarded_contents=tuple(sorted({
                     str(group.prompt_content_sha256)
-                    for group in paid
+                    for group in recorded
                     if len(str(group.prompt_content_sha256)) == 64
                 })),
                 rollout_hashes=tuple(
                     rollout_hash
-                    for group in paid
+                    for group in recorded
                     for rollout_hash in group.rollout_hashes
                 ),
             )

@@ -103,3 +103,15 @@ class ThroughputAdmissionQueue:
         """
         entry = self._by_receipt.get(receipt_id)
         return entry.throughput if entry is not None else None
+
+    def payload_bytes_of(self, receipt_id: str) -> int | None:
+        """The size the precommit bound itself to, or ``None`` on a miss.
+
+        The rate is length-NEUTRAL by construction, so equal rates are the
+        common case rather than a corner; the pick (amendment v6.1) breaks
+        those ties by payload size, and this is where that size comes
+        from -- the same signed, upload-enforced number the rate's
+        numerator uses, not anything the body can restate later.
+        """
+        entry = self._by_receipt.get(receipt_id)
+        return entry.payload_bytes if entry is not None else None

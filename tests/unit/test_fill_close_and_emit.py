@@ -189,14 +189,30 @@ def test_no_assembler_and_no_callback_with_the_gate_off(monkeypatch):
         assert batcher._emit_training_batch_fn is None
 
 
-def test_a_batch_is_emitted_every_b_batch_proven_groups(monkeypatch):
+def _pool_record(batcher_module, name, *, rate=1.0, payload_bytes=1_000):
+    """One entry of the pick pool, as ``_reconcile_fill_state_decisions``
+    builds it: the proven value plus the rate and payload size that
+    travelled with it from its precommit."""
+    return batcher_module._ProvenGroup(
+        value=name, rate=rate, payload_bytes=payload_bytes, receipt_id=name,
+    )
+
+
+def test_a_pick_hands_over_one_b_batch_chunk_of_its_own_environment(
+    monkeypatch,
+):
     """16 x 32 = 512 is arithmetic, not a schedule the miner can see.
 
-    R13: a batcher's own emission now depends ONLY on its own
-    environment's proven count (assembly across environments moved to the
-    service), so the callback signature is
-    ``(environment, groups, window_start, checkpoint_revision)`` for ONE
-    chunk of THIS batcher's own environment -- not a cross-env dict.
+    R13: a batcher's own emission depends ONLY on its own environment
+    (assembly across environments moved to the service), so the callback
+    signature is ``(environment, groups, window_start,
+    checkpoint_revision)`` for ONE chunk of THIS batcher's own
+    environment -- not a cross-env dict.
+
+    Amendment v6.1: what triggers that callback is a PICK, not the
+    arrival of the B_BATCH-th proven group. Proving a full batch's worth
+    here emits nothing on its own; the single ``pick_training_batch()``
+    call below is what hands the chunk over.
     """
     import reliquary.validator.batcher as batcher_module
     monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
@@ -206,49 +222,50 @@ def test_a_batch_is_emitted_every_b_batch_proven_groups(monkeypatch):
     batcher.fill_state = batcher_module.FillState(
         budgets={"openmathinstruct": 64}, picks_target=16
     )
-    # Stub the injected callback, not ``_emit_training_batch`` itself: the
-    # counter check-and-increment now lives INSIDE ``_emit_training_batch``,
-    # under ``fill_state.lock``, together with the slice and watermark
-    # advance (Task 7 review, Critical) -- stubbing the method out would
-    # bypass that gating entirely instead of exercising it.
+    # Stub the injected callback, not ``_claim_pick_chunk`` itself: the
+    # selection, the claim and the pick accounting all live INSIDE it,
+    # under ``fill_state.lock`` (Task 7 review, Critical) -- stubbing the
+    # method out would bypass that gating entirely instead of exercising
+    # it.
     batcher._emit_training_batch_fn = (
         lambda environment, groups, window_start, checkpoint_revision: (
-            emitted.append((environment, groups))
+            emitted.append((environment, groups, window_start))
         )
     )
 
-    for _ in range(B_BATCH):
+    for i in range(B_BATCH):
         with batcher.fill_state.lock:
             batcher.fill_state.record_proven("openmathinstruct")
             batcher._proven_groups.setdefault(
                 "openmathinstruct", []
-            ).append(object())
-        batcher._maybe_emit_batch()
+            ).append(_pool_record(batcher_module, f"g{i}"))
+
+    assert emitted == []
+
+    assert batcher.pick_training_batch() is True
 
     assert len(emitted) == 1
     assert emitted[0][0] == "openmathinstruct"
     assert len(emitted[0][1]) == B_BATCH
+    assert emitted[0][2] == batcher.window_start
 
 
-def test_concurrent_proven_writes_and_emission_never_drop_or_duplicate_groups(
+def test_concurrent_proven_writes_and_picks_never_drop_or_duplicate_groups(
     monkeypatch,
 ):
-    """Task 7 review, Critical: ``_maybe_emit_batch`` read
-    ``fill_state.snapshot()['proven']`` and ``_emit_training_batch`` read
-    ``self._proven_groups[env]`` WITHOUT ``fill_state``'s lock, while
+    """Task 7 review, Critical: the readiness check and the claim used to
+    read ``fill_state.snapshot()['proven']`` and ``self._proven_groups``
+    WITHOUT ``fill_state``'s lock, while
     ``_reconcile_fill_state_decisions`` mutates both together UNDER it, on
-    a possibly different proof-worker thread. A reader could observe a
-    ``proven`` count that had advanced past a ``_proven_groups`` append not
-    yet made, slice a short list, advance the watermark anyway, and
-    permanently discard the group arriving right after -- silent loss of
-    trained data. A writer thread and an emitter thread hammer the same
-    batcher concurrently; every proven group must come out of the emit
-    callback exactly once (no drops, no duplicates).
+    a possibly different proof-worker thread -- a reader could slice a
+    list shorter than the count it had already believed and permanently
+    discard the group arriving right after: silent loss of trained data.
 
-    R13 narrowed a batcher to its own environment only, so this is now
-    single-environment by construction -- the race being tested (the
-    fill_state.lock discipline around proven/_proven_groups/watermark) is
-    unaffected by how many environments exist.
+    The lock discipline is unchanged by amendment v6.1, but what it now
+    protects is the pick's selection and its ``picked`` flags rather than
+    a watermark. A writer thread and a PICKING thread hammer the same
+    batcher concurrently; every proven group must come out of the pick
+    callback exactly once (no drops, no duplicates).
     """
     import reliquary.validator.batcher as batcher_module
     monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
@@ -258,7 +275,9 @@ def test_concurrent_proven_writes_and_emission_never_drop_or_duplicate_groups(
     env = "openmathinstruct"
 
     batcher = _make_batcher()
-    batcher.fill_state = batcher_module.FillState(budgets={env: n_groups}, picks_target=16)
+    batcher.fill_state = batcher_module.FillState(
+        budgets={env: n_groups}, picks_target=n_cycles
+    )
     emitted_chunks: list[list] = []
     batcher._emit_training_batch_fn = (
         lambda environment, groups, window_start, checkpoint_revision: (
@@ -266,36 +285,37 @@ def test_concurrent_proven_writes_and_emission_never_drop_or_duplicate_groups(
         )
     )
 
-    appended: list[object] = []
+    appended: list[str] = []
 
     def writer() -> None:
-        for _ in range(n_groups):
-            group = object()
+        for i in range(n_groups):
+            name = f"g{i}"
             with batcher.fill_state.lock:
                 batcher.fill_state.record_proven(env)
-                batcher._proven_groups.setdefault(env, []).append(group)
-            appended.append(group)
+                batcher._proven_groups.setdefault(env, []).append(
+                    _pool_record(batcher_module, name)
+                )
+            appended.append(name)
 
     stop = threading.Event()
 
-    def emitter() -> None:
+    def picker() -> None:
         while not stop.is_set():
-            batcher._maybe_emit_batch()
+            batcher.pick_training_batch()
 
     writer_thread = threading.Thread(target=writer)
-    emitter_thread = threading.Thread(target=emitter)
-    emitter_thread.start()
+    picker_thread = threading.Thread(target=picker)
+    picker_thread.start()
     writer_thread.start()
     writer_thread.join()
     stop.set()
-    emitter_thread.join()
-    batcher._maybe_emit_batch()  # drain whatever became ready right at the end
+    picker_thread.join()
+    while batcher.pick_training_batch():  # drain what the close still allows
+        pass
 
     emitted_flat = [group for chunk in emitted_chunks for group in chunk]
-    emitted_ids = sorted(id(g) for g in emitted_flat)
-    appended_ids = sorted(id(g) for g in appended)
-    assert emitted_ids == appended_ids, (
-        len(emitted_ids), len(appended_ids),
+    assert sorted(emitted_flat) == sorted(appended), (
+        len(emitted_flat), len(appended),
     )
 
 
@@ -339,19 +359,18 @@ def test_v6_does_not_consult_the_seal_time_proof_wall(monkeypatch):
     assert batcher.poll_deadline() is False
 
 
-def test_emission_is_hooked_from_the_reconcile_walk_not_record_proven(
+def test_the_pool_grows_from_the_reconcile_walk_not_from_record_proven(
     monkeypatch,
 ):
-    """Pins the hook point named in task-7-addendum.md: ``_maybe_emit_batch``
-    must be called from ``_reconcile_fill_state_decisions``, after its walk
-    -- not from ``FillState.record_proven`` directly, which is now the
-    scheduler's only path to accounting a PASSED group. A direct
-    ``record_proven`` call (bypassing the walk entirely) must NOT emit on
-    its own; only a REAL scheduler's terminal decision, walked, does.
+    """Pins the hook point named in task-7-addendum.md: a PASSED group
+    reaches the pool from ``_reconcile_fill_state_decisions``'s walk of
+    the scheduler's own terminal decisions -- not from
+    ``FillState.record_proven``, which a test double (or any future
+    caller) could invoke with no scheduler decision behind it and no
+    group to add.
 
-    R13: single-key ``FillState`` -- a batcher's own emission depends only
-    on its own environment now, so the cross-env convenience seeding round
-    1 needed is gone.
+    Amendment v6.1: the walk no longer emits anything either way. It
+    grows the pool; picks are the service's call.
     """
     import reliquary.validator.batcher as batcher_module
     from reliquary.validator.proof_scheduler import GlobalProofScheduler
@@ -373,13 +392,9 @@ def test_emission_is_hooked_from_the_reconcile_walk_not_record_proven(
     )
     try:
         batcher = _make_batcher(proof_scheduler=scheduler)
-        batcher.fill_state = batcher_module.FillState(budgets={env: 1}, picks_target=16)
-        # Stub the injected callback, not ``_emit_training_batch`` itself:
-        # the counter check-and-increment now lives INSIDE
-        # ``_emit_training_batch``, under ``fill_state.lock`` (Task 7
-        # review, Critical), so it must stay live for repeated
-        # ``_maybe_emit_batch`` calls (via ``_wait_until``'s polling) to
-        # self-gate correctly instead of re-firing on every poll.
+        batcher.fill_state = batcher_module.FillState(
+            budgets={env: 1}, picks_target=16
+        )
         batcher._emit_training_batch_fn = (
             lambda environment, groups, window_start, checkpoint_revision: (
                 emitted.append((environment, groups))
@@ -396,14 +411,18 @@ def test_emission_is_hooked_from_the_reconcile_walk_not_record_proven(
 
         _wait_until(_proven, timeout=5.0)
 
-        assert len(emitted) == 1
-        assert emitted[0][0] == env
-        assert len(emitted[0][1]) == 1
+        # The walk put the group in the pool -- and emitted nothing.
+        assert len(batcher._proven_groups[env]) == 1
+        assert emitted == []
 
-        # Bypasses the reconcile walk entirely -- must not trigger a
-        # second emission on its own.
+        # Bypasses the walk entirely: it moves the COUNT and nothing
+        # else, so the pool still holds exactly one pickable group.
         batcher.fill_state.record_proven(env)
+        assert len(batcher._proven_groups[env]) == 1
+
+        assert batcher.pick_training_batch() is True
         assert len(emitted) == 1
+        assert emitted[0] == (env, [batcher._proven_groups[env][0].value])
     finally:
         assert scheduler.close()
 

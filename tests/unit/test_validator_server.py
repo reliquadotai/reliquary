@@ -2485,6 +2485,10 @@ def test_health_exposes_each_environment_window_independently():
             "graded_batch_fill_offset_seconds": None,
             "graded_prefix_fill_offset_seconds": None,
             "fill_state": None,
+            # v6.1 (R32): zero off the fill-closed path -- an auction
+            # window has no pick pool and therefore nothing to burn.
+            "fill_closed_burned_groups": 0,
+            "fill_closed_burned_eos_tokens": 0,
             "accepted_receipts": 0,
             "revealed": 0,
             "revealed_terminal": 0,
