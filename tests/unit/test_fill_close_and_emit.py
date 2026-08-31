@@ -7,46 +7,53 @@ from tests.unit.test_grpo_window_batcher import (
 )
 
 
-def test_the_window_seals_when_every_environment_is_full(monkeypatch):
+def test_the_window_seals_at_the_nth_pick(monkeypatch):
+    """R35: the window used to seal when every environment reached its
+    proven target -- it no longer does. Proven groups now only
+    accumulate in the pool; ``record_pick()`` is called directly here to
+    pin the FillState/``poll_deadline`` seam (Task 11 wires the real
+    pick-by-rate call that drives it in production)."""
     import reliquary.validator.batcher as batcher_module
     monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
 
     batcher = _make_batcher()
     batcher.fill_state = batcher_module.FillState(
-        targets={"openmathinstruct": 1, "opencodeinstruct": 1}
+        budgets={"openmathinstruct": 1, "opencodeinstruct": 1}, picks_target=1
     )
     batcher.mark_window_opened()
 
     batcher.fill_state.record_proven("openmathinstruct")
+    batcher.fill_state.record_proven("opencodeinstruct")
     assert batcher.poll_deadline() is False
 
-    batcher.fill_state.record_proven("opencodeinstruct")
+    batcher.fill_state.record_pick()
 
     assert batcher.poll_deadline() is True
 
 
 def test_two_env_batchers_share_one_fill_state_for_is_closed(monkeypatch):
     """R10: the service builds one ``GrpoWindowBatcher`` per environment,
-    but ``FillState`` is multi-key and ``is_closed()`` needs every
-    environment full. One shared instance, injected into both batchers'
-    ``.fill_state``, is what makes ``is_closed()`` see across them."""
+    but ``FillState`` is shared and ``is_closed()`` is window-wide (R35:
+    gated on picks, not a per-environment proven count). One shared
+    instance, injected into both batchers' ``.fill_state``, is what makes
+    ``is_closed()`` see across them."""
     import reliquary.validator.batcher as batcher_module
     monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
 
     shared = batcher_module.FillState(
-        targets={"openmathinstruct": 1, "opencodeinstruct": 1}
+        budgets={"openmathinstruct": 1, "opencodeinstruct": 1}, picks_target=2
     )
     math_batcher = _make_batcher()
     code_batcher = _make_batcher(env=PrivateRewardFakeEnv())
     math_batcher.fill_state = shared
     code_batcher.fill_state = shared
 
-    shared.record_proven("openmathinstruct")
+    shared.record_pick()
 
     assert math_batcher.fill_state.is_closed() is False
     assert code_batcher.fill_state.is_closed() is False
 
-    shared.record_proven("opencodeinstruct")
+    shared.record_pick()
 
     assert math_batcher.fill_state.is_closed() is True
     assert code_batcher.fill_state.is_closed() is True
@@ -63,7 +70,7 @@ def test_the_shared_fill_state_lock_is_the_same_object_on_both_batchers(
     monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
 
     shared = batcher_module.FillState(
-        targets={"openmathinstruct": 1, "opencodeinstruct": 1}
+        budgets={"openmathinstruct": 1, "opencodeinstruct": 1}, picks_target=16
     )
     math_batcher = _make_batcher()
     code_batcher = _make_batcher(env=PrivateRewardFakeEnv())
@@ -82,9 +89,13 @@ def test_service_builds_one_shared_fill_state_and_injects_every_batcher(
     ``FillState`` is constructed. ``_build_window_batchers`` builds one
     ``GrpoWindowBatcher`` per environment (unrelated to this test); this
     pins that every one of them gets the SAME ``FillState`` instance,
-    with every environment's target, assigned to ``.fill_state``."""
+    with every environment's admission budget and the window's picks
+    target, assigned to ``.fill_state``."""
     import reliquary.validator.service as service_module
-    from reliquary.constants import FILL_CLOSED_TARGET_GROUPS_PER_ENV
+    from reliquary.constants import (
+        FILL_CLOSED_ADMISSION_BUDGET_PER_ENV,
+        FILL_CLOSED_EMISSIONS_PER_WINDOW,
+    )
     from reliquary.validator.cooldown import ContentCooldownMap, CooldownMap
     from tests.unit.test_service_v2 import _build_late_drop_service
 
@@ -112,10 +123,11 @@ def test_service_builds_one_shared_fill_state_and_injects_every_batcher(
     shared = batchers["openmathinstruct"].fill_state
     assert shared is not None
     assert batchers["opencodeinstruct"].fill_state is shared
-    assert shared.snapshot()["targets"] == {
-        "openmathinstruct": FILL_CLOSED_TARGET_GROUPS_PER_ENV,
-        "opencodeinstruct": FILL_CLOSED_TARGET_GROUPS_PER_ENV,
+    assert shared.snapshot()["budgets"] == {
+        "openmathinstruct": FILL_CLOSED_ADMISSION_BUDGET_PER_ENV,
+        "opencodeinstruct": FILL_CLOSED_ADMISSION_BUDGET_PER_ENV,
     }
+    assert shared.snapshot()["picks_target"] == FILL_CLOSED_EMISSIONS_PER_WINDOW
 
 
 def _build_two_env_fill_closed_service(monkeypatch, *, enabled: bool):
@@ -192,7 +204,7 @@ def test_a_batch_is_emitted_every_b_batch_proven_groups(monkeypatch):
     emitted = []
     batcher = _make_batcher()  # openmathinstruct
     batcher.fill_state = batcher_module.FillState(
-        targets={"openmathinstruct": 64}
+        budgets={"openmathinstruct": 64}, picks_target=16
     )
     # Stub the injected callback, not ``_emit_training_batch`` itself: the
     # counter check-and-increment now lives INSIDE ``_emit_training_batch``,
@@ -246,7 +258,7 @@ def test_concurrent_proven_writes_and_emission_never_drop_or_duplicate_groups(
     env = "openmathinstruct"
 
     batcher = _make_batcher()
-    batcher.fill_state = batcher_module.FillState(targets={env: n_groups})
+    batcher.fill_state = batcher_module.FillState(budgets={env: n_groups}, picks_target=16)
     emitted_chunks: list[list] = []
     batcher._emit_training_batch_fn = (
         lambda environment, groups, window_start, checkpoint_revision: (
@@ -295,7 +307,7 @@ def test_state_advertises_which_environments_are_still_admitting(monkeypatch):
 
     batcher = _make_batcher()
     batcher.fill_state = batcher_module.FillState(
-        targets={"openmathinstruct": 1, "opencodeinstruct": 1}
+        budgets={"openmathinstruct": 1, "opencodeinstruct": 1}, picks_target=16
     )
     batcher.fill_state.record_proven("opencodeinstruct")
 
@@ -319,7 +331,7 @@ def test_v6_does_not_consult_the_seal_time_proof_wall(monkeypatch):
 
     batcher = _make_batcher()
     batcher.fill_state = batcher_module.FillState(
-        targets={"openmathinstruct": 4, "opencodeinstruct": 4}
+        budgets={"openmathinstruct": 4, "opencodeinstruct": 4}, picks_target=16
     )
     batcher.mark_window_opened()
 
@@ -361,7 +373,7 @@ def test_emission_is_hooked_from_the_reconcile_walk_not_record_proven(
     )
     try:
         batcher = _make_batcher(proof_scheduler=scheduler)
-        batcher.fill_state = batcher_module.FillState(targets={env: 1})
+        batcher.fill_state = batcher_module.FillState(budgets={env: 1}, picks_target=16)
         # Stub the injected callback, not ``_emit_training_batch`` itself:
         # the counter check-and-increment now lives INSIDE
         # ``_emit_training_batch``, under ``fill_state.lock`` (Task 7
@@ -430,7 +442,7 @@ def test_backstop_seals_the_open_plan_so_it_finalises_instead_of_hanging(
         # target=4: far short of what we ever submit, so the plan can only
         # finalise via an explicit seal, never by reaching its target.
         batcher.fill_state = batcher_module.FillState(
-            targets={"openmathinstruct": 4}
+            budgets={"openmathinstruct": 4}, picks_target=16
         )
         batcher.mark_window_opened()
 
@@ -478,10 +490,13 @@ def test_backstop_seals_the_open_plan_so_it_finalises_instead_of_hanging(
 def test_fill_close_also_seals_the_plan_which_finalises_completed(
     monkeypatch,
 ):
-    """Reaching the target already finalises the plan on its own (see
-    ``_finalize_if_terminal_locked``); this only confirms the new,
-    unconditional seal call at fill-close is a safe, idempotent no-op
-    there, not a second, conflicting way to close it."""
+    """Reaching the plan's own ``required_passes`` (still sized off the
+    admission budget, see ``_extend_proof_plan``) already finalises the
+    plan on its own (see ``_finalize_if_terminal_locked``); this only
+    confirms the new, unconditional seal call at fill-close is a safe,
+    idempotent no-op there, not a second, conflicting way to close it.
+    ``record_pick()`` is called directly to reach fill-close here (Task
+    11 wires the real pick-by-rate call in production)."""
     import reliquary.validator.batcher as batcher_module
     from reliquary.validator.proof_scheduler import (
         GlobalProofScheduler, ProofPlanOutcome,
@@ -503,7 +518,7 @@ def test_fill_close_also_seals_the_plan_which_finalises_completed(
     try:
         batcher = _make_batcher(proof_scheduler=scheduler)
         batcher.fill_state = batcher_module.FillState(
-            targets={"openmathinstruct": 1}
+            budgets={"openmathinstruct": 1}, picks_target=1
         )
         batcher.mark_window_opened()
 
@@ -513,6 +528,9 @@ def test_fill_close_also_seals_the_plan_which_finalises_completed(
 
         def _closed() -> bool:
             batcher._drain_arrival_proof_buffer(env)
+            snap = batcher.fill_state.snapshot()
+            if snap["proven"][env] >= 1 and snap["picks_emitted"] == 0:
+                batcher.fill_state.record_pick()
             return batcher.fill_state.is_closed()
 
         _wait_until(_closed, timeout=5.0)

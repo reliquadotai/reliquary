@@ -1556,9 +1556,9 @@ class GrpoWindowBatcher:
         """Hand newly-admitted candidates to this window's open-ended plan.
 
         Lazily submits the plan on the first arrival proof: ``fill_state``
-        (and therefore every environment's target) is only populated at
-        window activation, so there is no earlier moment with a
-        ``required_passes`` to submit. Every later call extends the same
+        (and therefore every environment's admission budget) is only
+        populated at window activation, so there is no earlier moment with
+        a ``required_passes`` to submit. Every later call extends the same
         plan instead of resubmitting it.
         """
         if not candidates:
@@ -1569,7 +1569,7 @@ class GrpoWindowBatcher:
         environment = str(getattr(self.env, "name", ""))
         if self._open_proof_plan_id is None:
             plan_id = f"{self.window_start}:{environment}:fill-closed"
-            target = self.fill_state.snapshot()["targets"][environment]
+            target = self.fill_state.snapshot()["budgets"][environment]
             handle = scheduler.submit(
                 ProofPlan(
                     plan_id=plan_id,

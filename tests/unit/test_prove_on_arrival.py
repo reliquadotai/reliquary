@@ -1,6 +1,5 @@
 """Under v6 a submission is proven when it arrives, not at seal."""
 import hashlib
-import types
 
 from reliquary.validator.batcher import PendingSubmission
 
@@ -52,7 +51,7 @@ def test_accept_submission_wires_the_arrival_proof_call(monkeypatch):
     extended = []
     batcher = _make_batcher()
     batcher.fill_state = batcher_module.FillState(
-        targets={"openmathinstruct": 4, "opencodeinstruct": 4}
+        budgets={"openmathinstruct": 4, "opencodeinstruct": 4}, picks_target=16
     )
     batcher._extend_proof_plan = lambda candidates: extended.extend(candidates)
 
@@ -70,7 +69,7 @@ def test_an_arriving_submission_is_extended_onto_the_open_plan(monkeypatch):
     extended = []
     batcher = _make_batcher()
     batcher.fill_state = batcher_module.FillState(
-        targets={"openmathinstruct": 4, "opencodeinstruct": 4}
+        budgets={"openmathinstruct": 4, "opencodeinstruct": 4}, picks_target=16
     )
     batcher._extend_proof_plan = lambda candidates: extended.extend(candidates)
 
@@ -90,7 +89,7 @@ def test_a_manufactured_zero_is_refused_before_capacity_is_reserved(monkeypatch)
     extended = []
     batcher = _make_batcher()
     batcher.fill_state = batcher_module.FillState(
-        targets={"openmathinstruct": 4, "opencodeinstruct": 4}
+        budgets={"openmathinstruct": 4, "opencodeinstruct": 4}, picks_target=16
     )
     batcher._extend_proof_plan = lambda candidates: extended.extend(candidates)
 
@@ -115,7 +114,7 @@ def test_a_full_environment_refuses_without_reserving(monkeypatch):
     extended = []
     batcher = _make_batcher()
     batcher.fill_state = batcher_module.FillState(
-        targets={"openmathinstruct": 1, "opencodeinstruct": 1}
+        budgets={"openmathinstruct": 1, "opencodeinstruct": 1}, picks_target=16
     )
     batcher._extend_proof_plan = lambda candidates: extended.extend(candidates)
     batcher.fill_state.reserve("openmathinstruct")  # already at target
@@ -126,21 +125,20 @@ def test_a_full_environment_refuses_without_reserving(monkeypatch):
     assert batcher.fill_state.snapshot()["in_flight"]["openmathinstruct"] == 1
 
 
-def test_a_buffered_group_is_not_reserved_until_drained(monkeypatch):
-    """A body that arrives while the environment is full sits in the
-    buffer; buffering must reserve nothing. Only ``_drain_arrival_proof_
-    buffer`` -- run once capacity frees -- reserves and extends it."""
+def test_a_buffered_group_is_not_reserved_on_arrival(monkeypatch):
+    """A body that arrives while the environment is at budget sits in the
+    buffer; buffering must reserve nothing."""
     import reliquary.validator.batcher as batcher_module
     monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
 
     extended = []
     batcher = _make_batcher()
     batcher.fill_state = batcher_module.FillState(
-        targets={"openmathinstruct": 1, "opencodeinstruct": 1}
+        budgets={"openmathinstruct": 1, "opencodeinstruct": 1}, picks_target=16
     )
     batcher._extend_proof_plan = lambda candidates: extended.extend(candidates)
     env = "openmathinstruct"
-    batcher.fill_state.reserve(env)  # already at target
+    batcher.fill_state.reserve(env)  # already at budget
 
     batcher._submit_arrival_proof(_pending_stub(prompt_idx=41))
 
@@ -148,40 +146,59 @@ def test_a_buffered_group_is_not_reserved_until_drained(monkeypatch):
     assert batcher.fill_state.snapshot()["in_flight"][env] == 1
     assert len(batcher._arrival_proof_buffer) == 1
 
-    batcher.fill_state.release(env)  # capacity frees elsewhere
-    batcher._drain_arrival_proof_buffer(env)
 
-    assert len(extended) == 1
-    assert batcher.fill_state.snapshot()["in_flight"][env] == 1
-    assert len(batcher._arrival_proof_buffer) == 0
-
-
-def test_ranks_handed_to_extend_strictly_increase_across_drains(monkeypatch):
-    """``extend`` refuses a rank at or behind the plan's current highest
-    (``proof_scheduler.py``'s ``next_apply_index`` invariant). The rank
-    counter must keep climbing across every drain, not just within one."""
+def test_a_buffered_group_stays_buffered_once_the_budget_is_spent(monkeypatch):
+    """R33: ``admitted`` is monotone -- a release frees in-flight PROOF
+    capacity (a failed proof no longer occupies a proof-worker slot) but
+    never refunds the budget a reservation already spent. A body that
+    landed while the environment was at budget therefore stays buffered
+    even after something else releases: the grading cost the budget paid
+    for was real, and does not come back on someone else's failure."""
     import reliquary.validator.batcher as batcher_module
     monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
 
     extended = []
     batcher = _make_batcher()
     batcher.fill_state = batcher_module.FillState(
-        targets={"openmathinstruct": 1, "opencodeinstruct": 1}
+        budgets={"openmathinstruct": 1, "opencodeinstruct": 1}, picks_target=16
     )
     batcher._extend_proof_plan = lambda candidates: extended.extend(candidates)
     env = "openmathinstruct"
+    batcher.fill_state.reserve(env)  # already at budget
+
+    batcher._submit_arrival_proof(_pending_stub(prompt_idx=41))
+    assert len(batcher._arrival_proof_buffer) == 1
+
+    batcher.fill_state.release(env)  # frees in_flight, NOT the budget
+    batcher._drain_arrival_proof_buffer(env)
+
+    assert extended == []
+    assert batcher.fill_state.snapshot()["in_flight"][env] == 0
+    assert len(batcher._arrival_proof_buffer) == 1
+
+
+def test_ranks_handed_to_extend_strictly_increase_across_drains(monkeypatch):
+    """``extend`` refuses a rank at or behind the plan's current highest
+    (``proof_scheduler.py``'s ``next_apply_index`` invariant). The rank
+    counter must keep climbing across every drain, not just within one.
+
+    R33: a release no longer reopens the budget (``admitted`` is
+    monotone), so ample budget -- not a release -- is what lets each of
+    the three submissions below drain on its own turn, one separate
+    ``_drain_arrival_proof_buffer`` call per submission."""
+    import reliquary.validator.batcher as batcher_module
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+
+    extended = []
+    batcher = _make_batcher()
+    batcher.fill_state = batcher_module.FillState(
+        budgets={"openmathinstruct": 3, "opencodeinstruct": 3}, picks_target=16
+    )
+    batcher._extend_proof_plan = lambda candidates: extended.extend(candidates)
 
     batcher._submit_arrival_proof(_pending_stub(prompt_idx=61))  # drains now
-    batcher._submit_arrival_proof(_pending_stub(prompt_idx=62))  # buffers: full
-    batcher._submit_arrival_proof(_pending_stub(prompt_idx=63))  # buffers: full
-
-    assert len(extended) == 1
-
-    batcher.fill_state.release(env)
-    batcher._drain_arrival_proof_buffer(env)  # a second, separate drain
-
-    batcher.fill_state.release(env)
-    batcher._drain_arrival_proof_buffer(env)  # a third, separate drain
+    batcher._submit_arrival_proof(_pending_stub(prompt_idx=62))  # drains now
+    batcher._submit_arrival_proof(_pending_stub(prompt_idx=63))  # drains now
 
     assert len(extended) == 3
     ranks = [candidate.rank for candidate in extended]
@@ -192,43 +209,40 @@ def test_ranks_handed_to_extend_strictly_increase_across_drains(monkeypatch):
 def test_an_unknown_rate_falls_back_to_lowest_priority_not_a_crash(monkeypatch):
     """``rate_of`` misses when a receipt was never offered (or was offered
     in a different window). The group must still drain -- after every
-    known-rate group, however small its rate -- rather than raise."""
+    known-rate group, however small its rate -- rather than raise.
+
+    R33: a release no longer reopens the budget, so the two entries are
+    placed in the buffer directly (as a genuine concurrent race would --
+    both landing before either's own drain runs) instead of via arrival
+    + release; the sort-and-pick logic under test is exactly the same
+    ``_drain_arrival_proof_buffer`` code either way."""
     import reliquary.validator.batcher as batcher_module
+    from reliquary.validator.batcher import _BufferedArrivalProof
+
     monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
 
     extended = []
     batcher = _make_batcher()
-    batcher.mark_window_opened()
-    batcher.admission_queue = batcher_module.ThroughputAdmissionQueue(
-        window_opened_at=batcher.window_opened_at
-    )
     env = "openmathinstruct"
-    batcher.admission_queue.offer(
-        receipt_id="known", environment=env, payload_bytes=1,
-        precommit_arrived_at=batcher.window_opened_at + 100.0,  # tiny rate
-    )
     batcher.fill_state = batcher_module.FillState(
-        targets={"openmathinstruct": 2, "opencodeinstruct": 2}
+        budgets={"openmathinstruct": 1, "opencodeinstruct": 1}, picks_target=16
     )
-    batcher.fill_state.reserve(env)
-    batcher.fill_state.reserve(env)  # full: both bodies below buffer
     batcher._extend_proof_plan = lambda candidates: extended.extend(candidates)
 
-    unknown = _pending_stub(prompt_idx=71)
-    unknown.request = types.SimpleNamespace(_precommit_receipt_id="never-offered")
-    known = _pending_stub(prompt_idx=72)
-    known.request = types.SimpleNamespace(_precommit_receipt_id="known")
+    unknown = _BufferedArrivalProof(
+        pending=_pending_stub(prompt_idx=71), rate=None, sequence=1
+    )
+    known = _BufferedArrivalProof(
+        pending=_pending_stub(prompt_idx=72), rate=0.001, sequence=2
+    )
+    batcher._arrival_proof_buffer.extend([unknown, known])
 
-    batcher._submit_arrival_proof(unknown)  # arrives first, unknown rate
-    batcher._submit_arrival_proof(known)    # arrives second, a known (tiny) rate
-
-    assert extended == []
-
-    batcher.fill_state.release(env)
     batcher._drain_arrival_proof_buffer(env)
 
     assert len(extended) == 1
     assert extended[0].payload.pending.prompt_idx == 72  # "known" wins despite tiny rate
+    assert len(batcher._arrival_proof_buffer) == 1
+    assert batcher._arrival_proof_buffer[0] is unknown
 
 
 def test_a_plan_extension_failure_releases_the_reservation(monkeypatch):
@@ -237,7 +251,7 @@ def test_a_plan_extension_failure_releases_the_reservation(monkeypatch):
 
     batcher = _make_batcher()
     batcher.fill_state = batcher_module.FillState(
-        targets={"openmathinstruct": 4, "opencodeinstruct": 4}
+        budgets={"openmathinstruct": 4, "opencodeinstruct": 4}, picks_target=16
     )
 
     def _boom(candidates):
@@ -283,7 +297,7 @@ def test_a_passing_proof_records_proven_and_a_failing_one_releases(monkeypatch):
     try:
         passing = _make_batcher(proof_scheduler=passing_scheduler)
         passing.fill_state = batcher_module.FillState(
-            targets={"openmathinstruct": 4, "opencodeinstruct": 4}
+            budgets={"openmathinstruct": 4, "opencodeinstruct": 4}, picks_target=16
         )
         assert passing.accept_submission(
             _request(prompt_idx=11, hotkey="miner-pass")
@@ -314,7 +328,7 @@ def test_a_passing_proof_records_proven_and_a_failing_one_releases(monkeypatch):
             verify_commitment_proofs_fn=_always_false_grail,
         )
         failing.fill_state = batcher_module.FillState(
-            targets={"openmathinstruct": 4, "opencodeinstruct": 4}
+            budgets={"openmathinstruct": 4, "opencodeinstruct": 4}, picks_target=16
         )
         assert failing.accept_submission(
             _request(prompt_idx=12, hotkey="miner-fail")
@@ -342,7 +356,7 @@ def test_v6_does_not_consult_the_seal_time_proof_wall(monkeypatch):
 
     batcher = _make_batcher()
     batcher.fill_state = batcher_module.FillState(
-        targets={"openmathinstruct": 4, "opencodeinstruct": 4}
+        budgets={"openmathinstruct": 4, "opencodeinstruct": 4}, picks_target=16
     )
     batcher.mark_window_opened()
 
@@ -352,12 +366,18 @@ def test_v6_does_not_consult_the_seal_time_proof_wall(monkeypatch):
 
 def test_a_skipped_prompt_claimed_decision_releases_its_reservation(monkeypatch):
     """Reproduces the leak found in code review: 3 candidates on 2 prompts,
-    target 3. Only 2 groups can ever pass -- one per prompt -- so the loser
+    budget 3. Only 2 groups can ever pass -- one per prompt -- so the loser
     on the shared prompt is settled by the scheduler as SKIPPED_PROMPT_
     CLAIMED, entirely inside its own coordinator, WITHOUT ever calling
     ``_execute_scheduled_proof``. Only the decisions walk can catch that;
-    without it this reservation leaks forever and the environment starves
-    below its target even though nothing is actually still in flight."""
+    without it this reservation leaks forever and ``in_flight`` never goes
+    back to 0 even though nothing is actually still proving.
+
+    R33: the budget itself does NOT reopen for the loser -- all 3 were
+    real reservations, and a failed one still spent real budget, so
+    ``may_admit`` stays False once ``admitted`` reaches it. Only
+    ``in_flight`` (proof-worker capacity, not admission) is what this
+    reservation-leak fix actually frees."""
     import reliquary.validator.batcher as batcher_module
     from reliquary.validator.proof_scheduler import GlobalProofScheduler
     from tests.unit.test_grpo_window_batcher import (
@@ -377,7 +397,7 @@ def test_a_skipped_prompt_claimed_decision_releases_its_reservation(monkeypatch)
     try:
         batcher = _make_batcher(proof_scheduler=scheduler)
         batcher.fill_state = batcher_module.FillState(
-            targets={"openmathinstruct": 3, "opencodeinstruct": 3}
+            budgets={"openmathinstruct": 3, "opencodeinstruct": 3}, picks_target=16
         )
 
         # Two submissions competing for the SAME prompt (only one can win
@@ -402,7 +422,7 @@ def test_a_skipped_prompt_claimed_decision_releases_its_reservation(monkeypatch)
         snap = batcher.fill_state.snapshot()
         assert snap["proven"][env] == 2
         assert snap["in_flight"][env] == 0
-        assert batcher.fill_state.may_admit(env) is True
+        assert batcher.fill_state.may_admit(env) is False
     finally:
         assert scheduler.close()
 
@@ -435,7 +455,7 @@ def test_a_raising_proof_callable_releases_its_reservation(monkeypatch):
     try:
         batcher = _make_batcher(proof_scheduler=scheduler)
         batcher.fill_state = batcher_module.FillState(
-            targets={"openmathinstruct": 4, "opencodeinstruct": 4}
+            budgets={"openmathinstruct": 4, "opencodeinstruct": 4}, picks_target=16
         )
         assert batcher.accept_submission(
             _request(prompt_idx=5, hotkey="hk-fault")
@@ -470,7 +490,7 @@ def test_a_decision_is_accounted_exactly_once_across_repeated_walks(monkeypatch)
 
     batcher = _make_batcher()
     batcher.fill_state = batcher_module.FillState(
-        targets={"openmathinstruct": 4, "opencodeinstruct": 4}
+        budgets={"openmathinstruct": 4, "opencodeinstruct": 4}, picks_target=16
     )
     batcher.fill_state.reserve(env)
     batcher.fill_state.reserve(env)
@@ -574,7 +594,7 @@ def test_concurrent_drains_do_not_race_on_rank_allocation(monkeypatch):
         try:
             batcher = _make_batcher(proof_scheduler=scheduler)
             batcher.fill_state = batcher_module.FillState(
-                targets={"openmathinstruct": n_threads, "opencodeinstruct": n_threads}
+                budgets={"openmathinstruct": n_threads, "opencodeinstruct": n_threads}, picks_target=16
             )
 
             # Pre-populate the buffer directly -- this test targets

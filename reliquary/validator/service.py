@@ -46,8 +46,8 @@ from reliquary.constants import (
     EXPERIMENTAL_CHECKPOINT_EPOCH_REVEAL_SECONDS,
     EXPERIMENTAL_CHECKPOINT_EPOCH_TRAINING_MODE,
     EXPERIMENTAL_CHECKPOINT_EPOCH_WARMUP_ROUNDS,
+    FILL_CLOSED_ADMISSION_BUDGET_PER_ENV,
     FILL_CLOSED_ENABLED,
-    FILL_CLOSED_TARGET_GROUPS_PER_ENV,
     FORCED_SEED_CDF_BOUNDARY_EPSILON,
     FORCED_SEED_CDF_ENFORCE,
     FORCED_SEED_CONSISTENCY_FLOOR,
@@ -2247,6 +2247,7 @@ class ValidationService:
         verification in ``indices_from_root`` if the chain call that fills
         randomness fails (e.g. finney WebSocket returns 503).
         """
+        from reliquary.constants import FILL_CLOSED_EMISSIONS_PER_WINDOW
         from reliquary.validator.fill_closed_batch_assembler import (
             FillClosedBatchAssembler,
         )
@@ -2276,17 +2277,24 @@ class ValidationService:
         # v6 only (R10). One ``FillState`` is shared across every
         # per-environment batcher for this window: the service builds one
         # ``GrpoWindowBatcher`` per environment, but ``FillState`` is
-        # multi-key and ``is_closed()`` needs every environment full, so
-        # each batcher can't own its own instance. This is the single
-        # place a v6 window's ``FillState`` is constructed -- every
-        # batcher below just gets the same object assigned to
-        # ``.fill_state``; nothing else in the codebase constructs one.
+        # multi-key (budgets) and window-wide (picks), so each batcher
+        # can't own its own instance. This is the single place a v6
+        # window's ``FillState`` is constructed -- every batcher below
+        # just gets the same object assigned to ``.fill_state``; nothing
+        # else in the codebase constructs one.
+        #
+        # Amendment v6.1 (R33, R35): admission is bounded by
+        # ``FILL_CLOSED_ADMISSION_BUDGET_PER_ENV``, not the old per-env
+        # proven target -- the window no longer closes on a proven count,
+        # it closes at the ``FILL_CLOSED_EMISSIONS_PER_WINDOW``-th pick
+        # (``picks_target``), which is window-wide, not per-environment.
         shared_fill_state = (
             FillState(
-                targets={
-                    env_name: FILL_CLOSED_TARGET_GROUPS_PER_ENV
+                budgets={
+                    env_name: FILL_CLOSED_ADMISSION_BUDGET_PER_ENV
                     for env_name in self.envs
-                }
+                },
+                picks_target=FILL_CLOSED_EMISSIONS_PER_WINDOW,
             )
             if FILL_CLOSED_ENABLED
             else None

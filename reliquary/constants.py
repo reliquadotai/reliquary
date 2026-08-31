@@ -853,6 +853,25 @@ FILL_CLOSED_MAX_SECONDS = float(_os.environ.get(
 if not _math.isfinite(FILL_CLOSED_MAX_SECONDS) or FILL_CLOSED_MAX_SECONDS <= 0:
     raise ValueError("RELIQUARY_FILL_CLOSED_MAX_SECONDS must be positive")
 
+# Amendment v6.1 (R33): admission is bounded by a per-environment BUDGET,
+# not by ``FILL_CLOSED_TARGET_GROUPS_PER_ENV`` -- the window no longer
+# closes on a proven count (see FillState.is_closed, gated on picks
+# instead), so admission needs its own bound. Over-collection past what
+# any single pick could ever choose is deliberate: a pick only chooses
+# among groups already proven, so late, longer-generating groups must
+# already be sitting in the pool for a late pick to pick them. The
+# grading cost of every admitted candidate is real and non-refundable
+# (FillState's ``admitted`` counter is monotone), so this is still a real
+# ceiling on fleet spend, just not the same number as the close rule.
+FILL_CLOSED_ADMISSION_BUDGET_PER_ENV = int(_os.environ.get(
+    "RELIQUARY_FILL_CLOSED_ADMISSION_BUDGET_PER_ENV",
+    "512",
+))
+if FILL_CLOSED_ADMISSION_BUDGET_PER_ENV <= 0:
+    raise ValueError(
+        "RELIQUARY_FILL_CLOSED_ADMISSION_BUDGET_PER_ENV must be positive"
+    )
+
 # Runtime default for CLI/Docker operators. OpenCode remains available through
 # ENVIRONMENT_MIX, but code execution is opt-in until the runsc canary and
 # miner rollout are coordinated.
