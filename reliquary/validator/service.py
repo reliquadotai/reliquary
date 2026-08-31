@@ -48,6 +48,9 @@ from reliquary.constants import (
     EXPERIMENTAL_CHECKPOINT_EPOCH_WARMUP_ROUNDS,
     FILL_CLOSED_ADMISSION_BUDGET_PER_ENV,
     FILL_CLOSED_ENABLED,
+    FILL_CLOSED_FIRST_PICK_SECONDS,
+    FILL_CLOSED_MAX_SECONDS,
+    FILL_CLOSED_PICK_PIPELINE_DEPTH,
     FORCED_SEED_CDF_BOUNDARY_EPSILON,
     FORCED_SEED_CDF_ENFORCE,
     FORCED_SEED_CONSISTENCY_FLOOR,
@@ -3187,6 +3190,128 @@ class ValidationService:
         batcher.force_seal(reason)
         return reason
 
+    def _read_trainer_step_cursor(self) -> int | None:
+        """The last journal key the trainer reported CONSUMING, or None.
+
+        Amendment v6.1 point 2. ``read_step_cursor`` already swallows a
+        missing/torn/unparseable object into None -- pacing telemetry must
+        never take the poll loop down -- and this adds the same treatment
+        for a queue that refuses outright. None means "unknown", which the
+        gate reads as "not yet", so every failure here degrades to picks
+        stopping and the backstop sealing a partial window, never to a
+        pick firing on a cadence nobody measured.
+        """
+        try:
+            return self._training_payload_queue_ref().read_step_cursor()
+        except Exception:
+            logger.warning(
+                "trainer step cursor unreadable; picks stay gated",
+                exc_info=True,
+            )
+            return None
+
+    def _fill_closed_pick_gate_open(self, batcher, *, next_pick: int) -> bool:
+        """Is the pacing gate for pick ``next_pick`` (1-indexed) open?
+
+        R34, and the one place the off-by-ones live:
+
+        * ``next_pick <= depth``: nothing has been emitted into this
+          window's key range yet, so no cursor value could ever release
+          these -- they run on ``FILL_CLOSED_FIRST_PICK_SECONDS`` after
+          the window opened, measured on the BATCHER's clock (the same
+          one ``FILL_CLOSED_MAX_SECONDS`` uses, so the floor and the
+          backstop can never disagree about how old a window is).
+        * ``next_pick > depth``: pick k emits batch index ``k - 1``, so
+          the batch ``depth`` picks back is index ``k - depth - 1``, and
+          the gate is the trainer's cursor having REACHED that batch's
+          encoded journal key (the cursor holds the last key consumed,
+          see ``TrainerWorker._advance_cursor``). With depth 2, pick 3
+          waits on batch 0: batch 1 is then still in the trainer's hands,
+          which is exactly the one-batch buffer R34 asks for.
+
+        ``>=`` rather than ``==`` because the trainer skips keys it never
+        trains (tombstones, quarantined batches, health skips all advance
+        the cursor) -- and because the encoding is monotone across
+        windows, so a cursor left in a PREVIOUS window is simply too
+        small and needs no separate staleness rule.
+        """
+        if next_pick <= FILL_CLOSED_PICK_PIPELINE_DEPTH:
+            age = self._window_open_age_seconds(batcher)
+            return age is not None and age >= FILL_CLOSED_FIRST_PICK_SECONDS
+        from reliquary.infrastructure.training_payload_queue import (
+            encoded_window_journal_key,
+        )
+
+        required = encoded_window_journal_key(
+            int(batcher.window_start),
+            next_pick - FILL_CLOSED_PICK_PIPELINE_DEPTH - 1,
+        )
+        cursor = self._read_trainer_step_cursor()
+        return cursor is not None and int(cursor) >= required
+
+    def _drive_fill_closed_picks(self, batchers) -> bool:
+        """Fire at most ONE window-wide pick event; return whether it did.
+
+        R36: a pick is a WINDOW event, not a per-environment one. One pick
+        k is one DAPO batch built from every environment's own k-th chunk,
+        so this fires only when EVERY environment can seat ``B_BATCH`` and
+        then drives all of them in a single pass. Driving a ready
+        environment alone would emit half a batch and, worse, advance the
+        window-wide count -- closing a two-environment window at half the
+        batches R35 asks for.
+
+        Readiness is checked before the pacing gate on purpose: a fleet
+        that is not producing then costs no cursor read at all, and the
+        cursor is read at most once per poll tick (once per call, inside
+        ``_fill_closed_pick_gate_open``, and only on the branch that
+        actually needs it).
+
+        Check-then-pick without holding the lock across both is safe --
+        the proven pool only grows, and ``pick_training_batch`` re-checks
+        under ``fill_state.lock`` anyway. If a sibling still refuses after
+        one environment succeeded, that invariant is broken somewhere: log
+        at ERROR rather than emit a half batch silently. Nothing is
+        advanced twice here -- the window-wide counter is moved by
+        whichever batcher reaches ordinal k first, inside
+        ``_claim_pick_chunk``.
+        """
+        if not FILL_CLOSED_ENABLED:
+            return False
+        picking = [
+            batcher for batcher in batchers
+            if getattr(batcher, "fill_state", None) is not None
+        ]
+        if not picking:
+            return False
+        fill_state = picking[0].fill_state
+        with fill_state.lock:
+            if fill_state.is_closed():
+                return False
+            next_pick = int(fill_state.snapshot()["picks_emitted"]) + 1
+        if not all(batcher.can_pick() for batcher in picking):
+            return False
+        if not self._fill_closed_pick_gate_open(
+            picking[0], next_pick=next_pick
+        ):
+            return False
+        refused = [
+            str(getattr(getattr(batcher, "env", None), "name", "?"))
+            for batcher in picking
+            if not batcher.pick_training_batch()
+        ]
+        if refused and len(refused) < len(picking):
+            logger.error(
+                "Window %d: pick event %d was driven on %d environment(s) "
+                "but %s refused after passing the readiness check; that "
+                "batch is short and the window-wide count still advanced "
+                "once",
+                int(getattr(picking[0], "window_start", 0)),
+                next_pick,
+                len(picking),
+                ",".join(refused),
+            )
+        return len(refused) < len(picking)
+
     async def _wait_for_window_seal(
         self,
         *,
@@ -3212,6 +3337,11 @@ class ValidationService:
         dup_since: dict[str, float] = {}
         reasons: dict[str, str] = {}
         while True:
+            # v6.1 (R34/R36): the pick event runs on this same 0.5 s
+            # cadence, BEFORE the seal poll -- so the 16th pick closes the
+            # window and ``poll_deadline`` seals it on the same tick
+            # rather than a tick later. Inert with the gate off.
+            self._drive_fill_closed_picks(batchers)
             for b in batchers:
                 # The hard ceiling ignores GPU readiness; only adaptive close
                 # is gated by it.

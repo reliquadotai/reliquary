@@ -72,8 +72,13 @@ class _Clock:
 def _two_env_window(monkeypatch, *, picks_target=16, clock=None):
     """One shared FillState across a math and a code batcher, exactly as
     ``_build_window_batchers`` wires them."""
+    import reliquary.infrastructure.training_payload_queue as queue_module
     import reliquary.validator.batcher as batcher_module
     monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+    # The journal key encoding is itself gated: with the flag off it
+    # collapses every batch of a window onto the bare window number, so a
+    # cursor test would be comparing 500 to 500. Production runs it armed.
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
     clock = clock or _Clock()
     shared = batcher_module.FillState(
         budgets={MATH: 512, CODE: 512}, picks_target=picks_target
@@ -320,12 +325,16 @@ def test_a_stale_cursor_from_an_older_window_does_not_release_a_pick(
     """The encoded key is monotone across windows, so a cursor left on
     the PREVIOUS window's last batch is simply too small -- no special
     staleness rule needed."""
+    from reliquary.constants import FILL_CLOSED_EMISSIONS_PER_WINDOW
     import reliquary.validator.service as service_module
     monkeypatch.setattr(service_module, "FILL_CLOSED_PICK_PIPELINE_DEPTH", 2)
     math, code, shared, clock = _two_env_window(monkeypatch)
     clock.now += 60.0
     service = _service(
-        monkeypatch, cursor=encoded_window_journal_key(WINDOW - 1, 15)
+        monkeypatch,
+        cursor=encoded_window_journal_key(
+            WINDOW - 1, FILL_CLOSED_EMISSIONS_PER_WINDOW - 1
+        ),
     )
     for _ in range(2):
         _prove(math, MATH, B_BATCH)
