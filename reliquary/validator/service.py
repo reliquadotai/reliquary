@@ -179,6 +179,12 @@ logger = logging.getLogger(__name__)
 _HF_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _STARTUP_HASH_REBUILD_TIMEOUT_SECONDS = 30.0
 
+# v6.1 (R35): how often the between-windows checkpoint gate re-asks the
+# candidate manifest. Deliberately NOT the seal loop's 0.5 s -- each ask
+# is an R2 GET, and the gate is a wait of seconds-to-a-minute, not a
+# hot loop. Not an operator knob: nothing downstream is sized off it.
+FILL_CLOSED_CHECKPOINT_POLL_SECONDS = 2.0
+
 
 class CheckpointEpochExecutionError(RuntimeError):
     """A partially consumed experimental epoch requires a clean restart."""
@@ -1403,14 +1409,7 @@ class ValidationService:
                 "swapping trainer checkpoints", window_n,
             )
             return
-        task = self._intake_stage_task
-        if task is None or task.done():
-            manifest = await asyncio.to_thread(intake.poll)
-            if manifest is not None:
-                self._intake_stage_task = asyncio.create_task(
-                    asyncio.to_thread(intake.stage, manifest),
-                    name="checkpoint_intake_stage",
-                )
+        await self._poll_and_stage_checkpoint_candidate(intake)
         if intake.staged_ready:
             if owns_routing:
                 await self._swap_staged_checkpoint(window_n)
@@ -1420,6 +1419,173 @@ class ValidationService:
                     "pipelined; deferring swap to the serial beat",
                     window_n,
                 )
+
+    async def _poll_and_stage_checkpoint_candidate(self, intake) -> bool:
+        """Ask R2 for a new candidate manifest; start staging it if there
+        is one. Returns whether a NEW candidate was DETECTED.
+
+        Extracted from ``_detached_checkpoint_tick`` because v6.1's
+        between-windows gate (R35) needs the same poll-and-stage without
+        the swap: staging is a multi-gigabyte download and must overlap
+        the next window's collection, so detection -- not installation --
+        is what releases the gate. Never starts a second staging task
+        while one is in flight, exactly as the tick did.
+        """
+        task = self._intake_stage_task
+        if task is not None and not task.done():
+            return False
+        manifest = await asyncio.to_thread(intake.poll)
+        if manifest is None:
+            return False
+        self._intake_stage_task = asyncio.create_task(
+            asyncio.to_thread(intake.stage, manifest),
+            name="checkpoint_intake_stage",
+        )
+        return True
+
+    def _arm_fill_closed_checkpoint_gate(self) -> None:
+        """Remember which revision the window that just closed collected
+        against, so the NEXT open can wait for its successor (R35).
+
+        Only armed when the closed window actually emitted batches: a
+        window that emitted none produced nothing for the trainer to step
+        on, so there is no checkpoint N+1 coming and holding rotation for
+        one would stall the validator for a whole backstop with nothing
+        to show. ``next_batch_index`` is the assembler's count of real
+        emissions and has not yet been padded by ``close()`` at this
+        point in the loop.
+        """
+        assembler = getattr(self, "_fill_closed_assembler", None)
+        emitted = int(getattr(assembler, "next_batch_index", 0) or 0)
+        if emitted <= 0:
+            self._fill_closed_checkpoint_baseline = None
+            return
+        try:
+            manifest = self._checkpoint_store.current_manifest()
+        except Exception:
+            logger.exception(
+                "could not read the current manifest at v6 close; the next "
+                "window will open without waiting for a checkpoint"
+            )
+            manifest = None
+        self._fill_closed_checkpoint_baseline = (
+            str(manifest.revision) if manifest is not None else None
+        )
+
+    def _fill_closed_checkpoint_detected(self, baseline: str) -> bool:
+        """Has the validator SEEN a checkpoint other than ``baseline``?
+
+        Three places a revision can show up, cheapest first: already
+        installed (the swap ran on its own serial beat), staged or
+        mid-staging in the intake, or -- the caller's own poll -- freshly
+        returned by the candidate manifest. Any of them means checkpoint
+        N+1 exists and miners will be able to generate against it.
+        """
+        try:
+            manifest = self._checkpoint_store.current_manifest()
+        except Exception:
+            manifest = None
+        if manifest is not None and str(manifest.revision) != baseline:
+            return True
+        intake = getattr(self, "_checkpoint_intake", None)
+        if intake is None:
+            return False
+        snapshot = intake.snapshot()
+        return any(
+            revision and str(revision) != baseline
+            for revision in (
+                snapshot.get("installed_revision"),
+                snapshot.get("staged_revision"),
+                snapshot.get("staging_revision"),
+            )
+        )
+
+    async def _wait_for_fill_closed_checkpoint(self) -> str:
+        """R35: hold the next v6 window's construction until the
+        checkpoint published from THIS window's batches is detected.
+
+        The amendment closes a window at its 16th pick and opens the next
+        one on the synchronisation point that already exists -- miners
+        need the new revision to generate against, so opening a window on
+        the old policy would collect rollouts the trainer has already
+        moved past. Any intra-window pacing drift resets here, and the
+        journal backlog stays bounded at ``depth`` by construction.
+
+        Bounded by ``FILL_CLOSED_MAX_SECONDS``, the same backstop that
+        bounds the window itself: a dead trainer publishes nothing ever,
+        and an unbounded wait would take the validator off the air
+        entirely rather than merely stop its learning. On expiry the next
+        window opens on the SAME revision and says so at ERROR.
+
+        Same discipline as ``_wait_for_window_seal``: a bounded async
+        wait with an explicit poll interval, never a busy loop.
+        """
+        if not FILL_CLOSED_ENABLED:
+            return "disabled"
+        baseline = getattr(self, "_fill_closed_checkpoint_baseline", None)
+        if not baseline:
+            return "not_armed"
+        if self._fill_closed_checkpoint_detected(baseline):
+            self._fill_closed_checkpoint_baseline = None
+            return "checkpoint_detected"
+
+        intake = getattr(self, "_checkpoint_intake", None)
+        if intake is None:
+            from reliquary.constants import DETACHED_TRAINER as _detached
+
+            if _detached:
+                intake = self._detached_intake_ref()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        deadline = started + FILL_CLOSED_MAX_SECONDS
+        logger.info(
+            "Window %d closed on its picks; holding the next window's open "
+            "until the checkpoint trained from its batches is detected "
+            "(parent revision %s, backstop %.0f s). Opening now would "
+            "collect against a policy the trainer has already moved past.",
+            self._window_n, str(baseline)[:12], FILL_CLOSED_MAX_SECONDS,
+        )
+        while True:
+            polled = False
+            if intake is not None:
+                try:
+                    # A fresh candidate manifest IS the detection: the
+                    # staging task it starts has not run yet, so the
+                    # intake snapshot below would still look empty.
+                    polled = await self._poll_and_stage_checkpoint_candidate(
+                        intake
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "candidate manifest poll failed while waiting for "
+                        "the next checkpoint; retrying"
+                    )
+            if polled or self._fill_closed_checkpoint_detected(baseline):
+                self._fill_closed_checkpoint_baseline = None
+                logger.info(
+                    "Checkpoint after window %d detected in %.1f s; opening "
+                    "the next window",
+                    self._window_n, loop.time() - started,
+                )
+                return "checkpoint_detected"
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                logger.error(
+                    "No checkpoint detected %.0f s after window %d closed; "
+                    "opening the next window on the SAME revision %s. The "
+                    "trainer is stalled or dead -- its cursor will not move "
+                    "either, so that window will take its first %d picks on "
+                    "the time floor and then end on its own backstop.",
+                    FILL_CLOSED_MAX_SECONDS, self._window_n,
+                    str(baseline)[:12], FILL_CLOSED_PICK_PIPELINE_DEPTH,
+                )
+                self._fill_closed_checkpoint_baseline = None
+                return "checkpoint_wait_timeout"
+            await asyncio.sleep(
+                min(FILL_CLOSED_CHECKPOINT_POLL_SECONDS, remaining)
+            )
 
     async def _seal_wait_and_close(
         self,
@@ -5728,6 +5894,12 @@ class ValidationService:
                             self._windows_since_cooldown_snapshot = 0
                         continue
                     self._window_iteration_stage = "open"
+                    # v6.1 (R35): the next window opens on DETECTION of
+                    # the checkpoint the last one's batches produced. A
+                    # no-op with the gate off, and before the first v6
+                    # close (nothing armed) -- rotation stays byte-
+                    # identical for v4/v5.
+                    await self._wait_for_fill_closed_checkpoint()
                     self._open_window()
                     self._window_iteration_stage = "admission_pools"
                     self._set_window_preparation_stage("admission_pools")
@@ -5879,6 +6051,11 @@ class ValidationService:
                             "Window %d sealed by liveness breaker: %s",
                             self._window_n, seal_reason,
                         )
+                    if FILL_CLOSED_ENABLED:
+                        # R35: arm the next open's checkpoint gate while
+                        # this window's assembler is still the current
+                        # one (``_train_and_publish`` pops it below).
+                        self._arm_fill_closed_checkpoint_gate()
 
                     from reliquary.constants import PIPELINED_WINDOWS
 

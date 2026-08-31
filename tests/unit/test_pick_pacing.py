@@ -26,8 +26,6 @@ import asyncio
 import logging
 from types import SimpleNamespace
 
-import pytest
-
 from reliquary.constants import B_BATCH
 from reliquary.infrastructure.training_payload_queue import (
     encoded_window_journal_key,
@@ -494,12 +492,12 @@ class _Intake:
 
 
 def _rotation_service(monkeypatch, *, baseline, store, intake=None,
-                      detached=True, enabled=True, clock=None):
+                      enabled=True):
     import reliquary.validator.service as service_module
     monkeypatch.setattr(service_module, "FILL_CLOSED_ENABLED", enabled)
-    monkeypatch.setattr(service_module, "DETACHED_TRAINER", detached)
-    monkeypatch.setattr(service_module, "FILL_CLOSED_CHECKPOINT_POLL_SECONDS",
-                        0.0)
+    monkeypatch.setattr(
+        service_module, "FILL_CLOSED_CHECKPOINT_POLL_SECONDS", 0.0
+    )
     service = ValidationService.__new__(ValidationService)
     service._fill_closed_checkpoint_baseline = baseline
     service._checkpoint_store = store
@@ -521,7 +519,11 @@ def test_rotation_waits_until_a_new_revision_is_detected(monkeypatch):
     reason = _run(service._wait_for_fill_closed_checkpoint())
     assert reason == "checkpoint_detected"
     assert intake.polls == 3
-    assert intake.staged == [{"revision": "new" * 13 + "b"}]
+    # DETECTION releases the gate; the multi-gigabyte download it just
+    # started overlaps the next window's collection rather than blocking
+    # the open on it.
+    assert service._intake_stage_task is not None
+    assert service._fill_closed_checkpoint_baseline is None
 
 
 def test_rotation_returns_at_once_when_the_swap_already_happened(

@@ -899,7 +899,9 @@ if (
 FILL_CLOSED_PICK_PIPELINE_DEPTH = int(_os.environ.get(
     "RELIQUARY_FILL_CLOSED_PICK_PIPELINE_DEPTH", "2"
 ))
-if not 1 <= FILL_CLOSED_PICK_PIPELINE_DEPTH <= FILL_CLOSED_EMISSIONS_PER_WINDOW:
+if not (
+    1 <= FILL_CLOSED_PICK_PIPELINE_DEPTH <= FILL_CLOSED_EMISSIONS_PER_WINDOW
+):
     # Depth 0 would gate pick 1 on a batch that pick 1 itself produces --
     # a deadlock every window until the backstop. Depth past the window's
     # own emission count would put EVERY pick on the time floor, which is
