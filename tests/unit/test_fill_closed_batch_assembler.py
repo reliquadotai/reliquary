@@ -1,9 +1,9 @@
 """R13: the service-level join of per-environment emission chunks into
 one cross-environment DAPO training batch.
 
-A GrpoWindowBatcher only ever hands the assembler its OWN environment's
-next B_BATCH chunk (see batcher.py:_emit_training_batch); chunks from two
-environments can arrive in any interleaving. The assembler must pair them
+A GrpoWindowBatcher only ever hands the assembler the B_BATCH chunk its
+OWN environment picked (see batcher.py:pick_training_batch); chunks from
+two environments can arrive in any interleaving. The assembler must pair them
 up correctly regardless of arrival order, write exactly one payload per
 completed cycle, and never skip or duplicate a cycle's chunk.
 """
