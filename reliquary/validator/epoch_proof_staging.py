@@ -119,6 +119,7 @@ class TicketedEpochProofCoordinator:
         self.binding = binding
         self._records: dict[str, _Record] = {}
         self._payload_owner: dict[str, str] = {}
+        self._rank_owner: dict[tuple[int, str, int], str] = {}
         self._frozen = False
         self._population_sha256: str | None = None
         self._claims: dict[tuple[int, str], tuple[str, tuple[str, ...]]] = {}
@@ -141,8 +142,12 @@ class TicketedEpochProofCoordinator:
                 return False
             if candidate.payload_sha256 in self._payload_owner:
                 raise EpochProofStagingError("payload is already staged")
+            rank_key = (*candidate.lane, candidate.selection_rank)
+            if rank_key in self._rank_owner:
+                raise EpochProofStagingError("ticket rank is already staged")
             self._records[candidate.intent_id] = _Record(candidate)
             self._payload_owner[candidate.payload_sha256] = candidate.intent_id
+            self._rank_owner[rank_key] = candidate.intent_id
             return True
 
     def freeze(self) -> str:
@@ -245,17 +250,7 @@ class TicketedEpochProofCoordinator:
                     or record.state is not StagedProofState.PASSED
                 ):
                     raise EpochProofStagingError("winner is not a passed lane proof")
-            claim = hashlib.sha256(
-                canonical_json_bytes(
-                    {
-                        "epoch_id": self.binding.epoch_id,
-                        "manifest_sha256": self.binding.manifest_sha256,
-                        "population_sha256": self._population_sha256,
-                        "lane": list(lane),
-                        "winner_intent_ids": list(winners),
-                    }
-                )
-            ).hexdigest()
+            claim = self._claim_sha256(lane, winners)
             existing = self._claims.get(lane)
             if existing:
                 if existing != (claim, winners):
@@ -287,18 +282,59 @@ class TicketedEpochProofCoordinator:
             "schema_version",
         }:
             raise ValueError("epoch proof snapshot keys differ")
-        if body["schema_version"] != cls.SCHEMA_VERSION:
+        if (
+            not isinstance(body["schema_version"], int)
+            or isinstance(body["schema_version"], bool)
+            or body["schema_version"] != cls.SCHEMA_VERSION
+        ):
             raise ValueError("unsupported epoch proof snapshot schema")
+        binding_body = _exact_object(
+            "binding",
+            body["binding"],
+            {
+                "checkpoint_revision",
+                "environments",
+                "epoch_id",
+                "first_window",
+                "generation_contract_sha256",
+                "generation_randomness_by_offset",
+                "manifest_sha256",
+                "protocol_profile_id",
+                "window_count",
+            },
+        )
         binding = EpochProofBinding(**{
-            **body["binding"],
-            "environments": tuple(body["binding"]["environments"]),
+            **binding_body,
+            "environments": tuple(binding_body["environments"]),
             "generation_randomness_by_offset": tuple(
-                body["binding"]["generation_randomness_by_offset"]
+                binding_body["generation_randomness_by_offset"]
             ),
         })
         coordinator = cls(binding)
-        for value in body["records"]:
-            candidate = TicketedProofCandidate(**value["candidate"])
+        if not isinstance(body["records"], list):
+            raise ValueError("records must be an array")
+        for index, raw_value in enumerate(body["records"]):
+            value = _exact_object(
+                f"records[{index}]",
+                raw_value,
+                {"candidate", "result_sha256", "state"},
+            )
+            candidate_body = _exact_object(
+                f"records[{index}].candidate",
+                value["candidate"],
+                {
+                    "environment",
+                    "generation_randomness",
+                    "intent_id",
+                    "operator_id",
+                    "payload_sha256",
+                    "prompt_idx",
+                    "selection_rank",
+                    "ticket_state",
+                    "window_number",
+                },
+            )
+            candidate = TicketedProofCandidate(**candidate_body)
             coordinator.stage(candidate)
             record = coordinator._records[candidate.intent_id]
             state = StagedProofState(value["state"])
@@ -312,7 +348,9 @@ class TicketedEpochProofCoordinator:
                 _hex64("result_sha256", record.result_sha256)
             elif record.result_sha256 is not None:
                 raise ValueError("non-terminal proof has a result digest")
-        coordinator._frozen = bool(body["frozen"])
+        if not isinstance(body["frozen"], bool):
+            raise ValueError("frozen must be a boolean")
+        coordinator._frozen = body["frozen"]
         coordinator._population_sha256 = body["population_sha256"]
         if coordinator._frozen:
             _hex64("population_sha256", coordinator._population_sha256)
@@ -320,14 +358,42 @@ class TicketedEpochProofCoordinator:
                 raise ValueError("epoch proof population digest differs")
         elif body["population_sha256"] is not None:
             raise ValueError("unfrozen snapshot has a population hash")
-        for value in body["claims"]:
-            lane = value["window_number"], value["environment"]
-            coordinator._validate_lane(lane)
-            _hex64("claim_sha256", value["claim_sha256"])
-            coordinator._claims[lane] = (
-                value["claim_sha256"],
-                tuple(value["winner_intent_ids"]),
+        elif any(
+            record.state is not StagedProofState.STAGED
+            for record in coordinator._records.values()
+        ):
+            raise ValueError("unfrozen snapshot has an advanced proof state")
+        if not isinstance(body["claims"], list):
+            raise ValueError("claims must be an array")
+        if body["claims"] and not coordinator._frozen:
+            raise ValueError("unfrozen snapshot has finalization claims")
+        for index, raw_value in enumerate(body["claims"]):
+            value = _exact_object(
+                f"claims[{index}]",
+                raw_value,
+                {
+                    "claim_sha256",
+                    "environment",
+                    "window_number",
+                    "winner_intent_ids",
+                },
             )
+            lane = value["window_number"], value["environment"]
+            _hex64("claim_sha256", value["claim_sha256"])
+            if lane in coordinator._claims:
+                raise ValueError("snapshot repeats a lane finalization claim")
+            raw_winners = value["winner_intent_ids"]
+            if not isinstance(raw_winners, list) or any(
+                not isinstance(intent_id, str) for intent_id in raw_winners
+            ):
+                raise ValueError("winner_intent_ids must be an array of strings")
+            winners = tuple(raw_winners)
+            claim, should_emit = coordinator.claim_lane_finalization(
+                lane,
+                winners,
+            )
+            if not should_emit or claim != value["claim_sha256"]:
+                raise ValueError("lane finalization claim digest differs")
         return coordinator
 
     def quarantined_intent_ids(self) -> tuple[str, ...]:
@@ -363,6 +429,23 @@ class TicketedEpochProofCoordinator:
         self.binding.randomness_for(lane[0])
         if lane[1] not in self.binding.environments:
             raise EpochProofStagingError("unknown epoch environment")
+
+    def _claim_sha256(
+        self,
+        lane: tuple[int, str],
+        winners: tuple[str, ...],
+    ) -> str:
+        return hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "epoch_id": self.binding.epoch_id,
+                    "manifest_sha256": self.binding.manifest_sha256,
+                    "population_sha256": self._population_sha256,
+                    "lane": list(lane),
+                    "winner_intent_ids": list(winners),
+                }
+            )
+        ).hexdigest()
 
     def _snapshot(self) -> dict[str, Any]:
         return {
@@ -450,6 +533,18 @@ def _candidate_dict(candidate: TicketedProofCandidate) -> dict[str, Any]:
         "selection_rank": candidate.selection_rank,
         "ticket_state": candidate.ticket_state,
     }
+
+
+def _exact_object(
+    label: str,
+    value: object,
+    expected_keys: set[str],
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be an object")
+    if set(value) != expected_keys:
+        raise ValueError(f"{label} keys differ")
+    return value
 
 
 def _hex64(name: str, value: str) -> None:

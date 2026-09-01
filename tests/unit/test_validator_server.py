@@ -28,6 +28,7 @@ from reliquary.protocol.signatures import sign_envelope, sign_precommit
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     BatchSubmissionResponse,
+    FillClosedWindowState,
     GrpoBatchState,
     RolloutSubmission,
     RejectReason,
@@ -2343,6 +2344,10 @@ def test_fill_closed_state_advertises_cutoff_progress_and_budget(monkeypatch):
         "in_flight": {"openmathinstruct": 0},
         "remaining": {"openmathinstruct": 32},
     }
+    with pytest.raises(ValueError, match="provenance must be complete"):
+        FillClosedWindowState.model_validate(
+            {**first, "generation_beacon_chain_hash": None}
+        )
 
     with batcher.fill_state.lock:
         batcher.fill_state.reserve("openmathinstruct")

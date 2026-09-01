@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
 
+from reliquary.shared.checkpoint_epoch import canonical_json_bytes
 from reliquary.validator.epoch_proof_staging import (
     EpochProofBinding,
     EpochProofStagingError,
@@ -147,6 +149,10 @@ def test_stage_binds_randomness_and_rejects_intent_or_payload_rebinding():
         coordinator.stage(
             _candidate(1, intent_id="other-intent", payload_digit="4")
         )
+    with pytest.raises(EpochProofStagingError, match="rank is already staged"):
+        coordinator.stage(
+            _candidate(0, intent_id="rank-conflict", payload_digit="f")
+        )
     changed_randomness = TicketedProofCandidate(
         **{
             **first.__dict__,
@@ -258,6 +264,44 @@ def test_lane_finalization_claim_is_idempotent_and_cannot_change():
     with pytest.raises(EpochProofStagingError, match="already claimed differently"):
         coordinator.claim_lane_finalization(
             (100, "math"), ("intent-1",)
+        )
+
+
+def test_restore_recomputes_claims_and_rejects_duplicate_lane_claims():
+    coordinator = TicketedEpochProofCoordinator(_binding())
+    coordinator.stage(_candidate(0))
+    coordinator.freeze()
+    coordinator.mark_dispatched("intent-0")
+    coordinator.record_terminal(
+        "intent-0", passed=True, result_sha256="1" * 64
+    )
+    coordinator.claim_lane_finalization((100, "math"), ("intent-0",))
+    body = json.loads(coordinator.snapshot_bytes())
+
+    changed = json.loads(json.dumps(body))
+    changed["claims"][0]["claim_sha256"] = "f" * 64
+    with pytest.raises(ValueError, match="claim digest differs"):
+        TicketedEpochProofCoordinator.from_snapshot_bytes(
+            canonical_json_bytes(changed)
+        )
+
+    duplicated = json.loads(json.dumps(body))
+    duplicated["claims"].append(dict(duplicated["claims"][0]))
+    with pytest.raises(ValueError, match="repeats a lane"):
+        TicketedEpochProofCoordinator.from_snapshot_bytes(
+            canonical_json_bytes(duplicated)
+        )
+
+
+def test_restore_rejects_unknown_nested_fields():
+    coordinator = TicketedEpochProofCoordinator(_binding())
+    coordinator.stage(_candidate(0))
+    body = json.loads(coordinator.snapshot_bytes())
+    body["records"][0]["candidate"]["unexpected"] = True
+
+    with pytest.raises(ValueError, match="candidate keys differ"):
+        TicketedEpochProofCoordinator.from_snapshot_bytes(
+            canonical_json_bytes(body)
         )
 
 

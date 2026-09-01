@@ -423,6 +423,19 @@ class FillClosedWindowState(BaseModel):
     in_flight: dict[str, int]
     remaining: dict[str, int]
 
+    @model_validator(mode="after")
+    def _validate_beacon_provenance(self) -> "FillClosedWindowState":
+        provenance = (
+            self.generation_beacon_chain,
+            self.generation_beacon_chain_hash,
+            self.generation_beacon_round,
+        )
+        if any(value is not None for value in provenance) and any(
+            value is None for value in provenance
+        ):
+            raise ValueError("generation beacon provenance must be complete")
+        return self
+
 
 class GrpoBatchState(BaseModel):
     """Live window state for miners polling ``/state`` (v2.1)."""
