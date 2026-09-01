@@ -1346,11 +1346,6 @@ class GrpoWindowBatcher:
         # too, it had no remaining job.
         #
         # v6.1: this is a PER-ENVIRONMENT ordinal, while
-        # ``FillState.picks_emitted`` is window-wide -- one pick k is one
-        # DAPO batch, assembled from every environment's own k-th chunk.
-        # See ``_claim_pick_chunk`` for why only the first environment to
-        # reach ordinal k advances the window-wide counter.
-        self._batches_emitted: int = 0
         # v6 only. Every PASSED group, per environment, appended in the
         # same rank order ``handle.decisions()`` guarantees -- the pool
         # ``pick_training_batch`` chooses the B_BATCH best by rate from.
@@ -1993,9 +1988,13 @@ class GrpoWindowBatcher:
         both: the proven pool only ever GROWS between the two (proofs
         complete and append; nothing removes), and the only other
         subtraction -- a pick claiming groups -- runs on this same poll
-        thread. A True here can therefore go stale only in the harmless
-        direction. ``pick_training_batch`` re-checks the same conditions
-        under the lock regardless.
+        thread. So does every v6 seal path (``poll_deadline`` is driven
+        only from ``_wait_for_window_seal``'s loop), which is what
+        excludes a seal slipping between the check and the pick -- the
+        single-threaded loop ownership, not the growth argument. A True
+        here can therefore go stale only in the harmless direction.
+        ``pick_training_batch`` re-checks the same conditions under the
+        lock regardless.
 
         Stops counting at ``B_BATCH`` rather than sizing the whole pool:
         this runs per environment on a 0.5 s loop against a pool that the
@@ -2163,7 +2162,6 @@ class GrpoWindowBatcher:
                     self.fill_state.snapshot()["picks_target"],
                 )
                 return None
-            self._batches_emitted += 1
             for group in claimed:
                 group.picked = True
             chunk = [group.value for group in claimed]
