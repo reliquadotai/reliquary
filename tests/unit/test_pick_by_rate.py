@@ -1,18 +1,7 @@
-"""Seats are granted at PICKS, by precommit rate -- not in arrival order.
+"""Characterization tests for the disabled rate-pick qualification path.
 
-Amendment v6.1, point 1: proving still happens on arrival, but a proven
-group only joins a POOL. A *pick* then selects the ``B_BATCH`` best by
-precommit rate among the proven-and-unemitted groups of one environment.
-That is what converts excess candidate capacity into length diversity:
-every later pick chooses from a population that has had strictly more
-time to generate, so a long answer that could never finish before the
-old first-come-first-served admission filled up can now land.
-
-The tests below pin the three things the amendment actually promises --
-the rate decides, ties do NOT fall back to arrival, and a pick is an
-external call rather than an automatic consequence of a proof finishing
--- plus the close consequence of R32: whatever is proven but never
-picked is burned, counted and logged, and never paid.
+The tests pin its deterministic priority, tie-break, explicit pick boundary,
+and terminal accounting without selecting this policy for the v1 market.
 """
 import logging
 from types import SimpleNamespace
@@ -76,24 +65,15 @@ def _names(groups) -> set[str]:
     return {group.name for group in groups}
 
 
-def test_a_late_full_rate_group_beats_an_early_low_rate_group(monkeypatch):
-    """The bias this amendment removes.
-
-    Under the watermark-order emission this replaces, the first B_BATCH
-    proven groups WERE the batch -- so the slow, early group was in and
-    the fast, late one (arriving after the seats were gone) could never
-    be. The pick reverses that: the late group's precommit rate is what
-    buys the seat, and the early group's low rate is what loses it.
-    """
+def test_higher_rate_precedes_lower_rate_regardless_of_record_order(monkeypatch):
+    """Configured rate priority is independent of pool insertion order."""
     batcher = _fill_closed_batcher(monkeypatch)
     picked = _capture_picks(batcher)
 
-    # Appended FIRST, so append order alone would have seated it.
-    _prove(batcher, "early-slow", rate=1.0, payload_bytes=1_000)
+    _prove(batcher, "first-low", rate=1.0, payload_bytes=1_000)
     for i in range(B_BATCH - 1):
         _prove(batcher, f"filler-{i}", rate=50.0, payload_bytes=5_000)
-    # Appended LAST: a long answer that only finished near the close.
-    _prove(batcher, "late-fast", rate=900.0, payload_bytes=90_000)
+    _prove(batcher, "last-high", rate=900.0, payload_bytes=90_000)
 
     assert batcher.pick_training_batch() is True
 
@@ -101,31 +81,27 @@ def test_a_late_full_rate_group_beats_an_early_low_rate_group(monkeypatch):
     environment, groups = picked[0]
     assert environment == ENV
     assert len(groups) == B_BATCH
-    assert "late-fast" in _names(groups)
-    assert "early-slow" not in _names(groups)
+    assert "last-high" in _names(groups)
+    assert "first-low" not in _names(groups)
 
 
-def test_a_rate_tie_goes_to_the_larger_payload_never_the_earlier_arrival(
+def test_rate_tie_uses_payload_size_before_insertion_order(
     monkeypatch,
 ):
-    """The rate is length-neutral (bytes over elapsed), so equal rates are
-    the COMMON case, not a corner. Falling back to arrival there would
-    hand the seat straight back to the shortest answer -- the very bias
-    the pick exists to remove -- so the larger payload wins instead."""
+    """The configured secondary key is applied before insertion order."""
     batcher = _fill_closed_batcher(monkeypatch)
     picked = _capture_picks(batcher)
 
-    # Same rate everywhere. The SMALLEST payload arrived first.
-    _prove(batcher, "early-short", rate=100.0, payload_bytes=1_000)
+    _prove(batcher, "first-small", rate=100.0, payload_bytes=1_000)
     for i in range(B_BATCH - 1):
         _prove(batcher, f"filler-{i}", rate=100.0, payload_bytes=50_000)
-    _prove(batcher, "late-long", rate=100.0, payload_bytes=90_000)
+    _prove(batcher, "last-large", rate=100.0, payload_bytes=90_000)
 
     assert batcher.pick_training_batch() is True
 
     _environment, groups = picked[0]
-    assert "late-long" in _names(groups)
-    assert "early-short" not in _names(groups)
+    assert "last-large" in _names(groups)
+    assert "first-small" not in _names(groups)
 
 
 def test_an_unknown_rate_sorts_last_instead_of_crashing_the_pick(monkeypatch):
