@@ -313,7 +313,7 @@ def test_every_event_walks_its_own_cursor_boundary_and_closes(monkeypatch):
 
 
 def test_the_backstop_still_seals_a_stalled_window(monkeypatch):
-    """No pick ever fires (an empty fleet), and the window still ends:
+    """No pick ever fires (empty supply), and the window still ends:
     ``FILL_CLOSED_MAX_SECONDS`` is untouched by the pacing."""
     from reliquary.constants import FILL_CLOSED_MAX_SECONDS
 
@@ -397,7 +397,7 @@ def test_the_cursor_is_read_once_per_tick_and_only_when_gating(monkeypatch):
 
 
 def test_a_pool_short_window_never_reads_the_cursor(monkeypatch):
-    """Readiness is checked before the gate, so a fleet that is not
+    """Readiness is checked before the gate, so candidate supply that is not
     producing costs no cursor I/O at all."""
     math, code, shared, clock = _two_env_window(monkeypatch)
     clock.now += 60.0

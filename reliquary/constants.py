@@ -887,8 +887,8 @@ if (
         "range reserved for it and the encoder would raise on a proof thread"
     )
 
-# Backstop only. A window normally ends on its fill; this stops a stalled
-# fleet holding one open forever, and seals whatever is proven.
+# Backstop only. A window normally ends on its fill; this stops stalled
+# candidate supply holding one open forever, and seals whatever is proven.
 FILL_CLOSED_MAX_SECONDS = float(_os.environ.get(
     "RELIQUARY_FILL_CLOSED_MAX_SECONDS", "1800"
 ))
@@ -904,7 +904,7 @@ if not _math.isfinite(FILL_CLOSED_MAX_SECONDS) or FILL_CLOSED_MAX_SECONDS <= 0:
 # already be sitting in the pool for a late pick to pick them. The
 # grading cost of every admitted candidate is real and non-refundable
 # (FillState's ``admitted`` counter is monotone), so this is still a real
-# ceiling on fleet spend, just not the same number as the close rule.
+# ceiling on aggregate generation spend, just not the close rule.
 FILL_CLOSED_ADMISSION_BUDGET_PER_ENV = int(_os.environ.get(
     "RELIQUARY_FILL_CLOSED_ADMISSION_BUDGET_PER_ENV",
     "512",

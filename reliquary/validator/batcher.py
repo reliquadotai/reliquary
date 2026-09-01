@@ -1575,7 +1575,7 @@ class GrpoWindowBatcher:
         # Productive admission budget, bounded by
         # MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW. Refunded when a submission
         # consumed no grading and produced no candidate, so an always-invalid
-        # flood cannot hold receipts the rest of the fleet needs.
+        # flood cannot hold receipts other participants need.
         self._proof_grading_charged = 0
         self._pending_proof_reservations: dict[
             int, tuple[BatchSubmissionRequest, str, bool, int]
@@ -2857,7 +2857,7 @@ class GrpoWindowBatcher:
                 ),
                 # v6 only. Per-environment proven/in_flight/budget, plus
                 # the window-wide picks and closed flag,
-                # so a fleet honouring a closed environment can rebalance
+                # so miners honouring a closed environment can rebalance
                 # toward the scarce one -- the reference miner already
                 # re-reads /state every loop iteration and samples its
                 # environment by the mix weights. None on the auction path.
@@ -3114,7 +3114,7 @@ class GrpoWindowBatcher:
                 self._seal_flag.set()
                 return True
             if now - self.window_opened_at >= FILL_CLOSED_MAX_SECONDS:
-                # Backstop: a stalled fleet must not hold a window open.
+                # Backstop: stalled candidate supply cannot hold a window open.
                 # Everything proven is unpicked here, and burns for the
                 # same reason: nothing that skips the assembler is paid.
                 self._seal_v6_proof_plan()

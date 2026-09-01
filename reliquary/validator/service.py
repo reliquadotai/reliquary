@@ -3622,8 +3622,8 @@ class ValidationService:
         window-wide count -- closing a two-environment window at half the
         batches R35 asks for.
 
-        Readiness is checked before the pacing gate on purpose: a fleet
-        that is not producing then costs no cursor read at all, and the
+        Readiness is checked before the pacing gate on purpose: insufficient
+        candidate supply then costs no cursor read at all, and the
         cursor is read at most once per poll tick (once per call, inside
         ``_fill_closed_pick_gate_open``, and only on the branch that
         actually needs it).

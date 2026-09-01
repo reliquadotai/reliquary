@@ -244,7 +244,7 @@ def _economic_sensitivity() -> dict[str, object]:
             "adaptive_fill_at_90_percent_validity": 0.1,
             "note": (
                 "group-count envelope only; it does not price utility, proof "
-                "cost, retries, or real fleet behavior"
+                "cost, retries, or real participant behavior"
             ),
         },
     }

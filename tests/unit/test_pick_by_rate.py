@@ -3,7 +3,7 @@
 Amendment v6.1, point 1: proving still happens on arrival, but a proven
 group only joins a POOL. A *pick* then selects the ``B_BATCH`` best by
 precommit rate among the proven-and-unemitted groups of one environment.
-That is what converts the fleet's excess capacity into length diversity:
+That is what converts excess candidate capacity into length diversity:
 every later pick chooses from a population that has had strictly more
 time to generate, so a long answer that could never finish before the
 old first-come-first-served admission filled up can now land.
@@ -289,7 +289,7 @@ def test_a_window_wide_pick_is_counted_once_across_environments(monkeypatch):
     its OWN environment's pool. One pick k is therefore N batcher calls --
     one per environment, joined into a single DAPO batch by the assembler
     -- and must advance the window-wide count ONCE, not once per
-    environment, or a two-environment fleet would close its window after
+    environment, or a two-environment run would close its window after
     half the batches it is supposed to emit.
 
     R37 realizes that count as the MIN over per-environment ordinals: an

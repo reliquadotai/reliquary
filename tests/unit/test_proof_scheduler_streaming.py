@@ -124,7 +124,7 @@ def test_an_open_plan_still_aborts_on_its_deadline():
     """The backstop must survive open-endedness.
 
     Open-endedness only makes EXHAUSTION non-terminal. A window that runs past
-    its maximum duration still has to end, or a stalled fleet would hold the
+    its maximum duration still has to end, or stalled supply would hold the
     plan open forever.
     """
     scheduler = _scheduler(lambda invocation: True)

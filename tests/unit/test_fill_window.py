@@ -42,7 +42,7 @@ def test_a_released_reservation_frees_in_flight_but_not_budget():
 
 def test_budget_is_monotone_across_many_reserve_release_cycles():
     """Reserve-then-release, repeated, must never reopen admission: each
-    ``reserve()`` is a real grading attempt the fleet already paid for,
+    ``reserve()`` is a real grading attempt participants already paid for,
     regardless of how many times capacity later frees."""
     state = _state(budget=3)
     for _ in range(3):
