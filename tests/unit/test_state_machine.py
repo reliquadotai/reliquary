@@ -998,10 +998,10 @@ async def test_publish_every_n_trained_windows(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_resume_from_path_installs_manifest():
-    """resume_from="path:/tmp/ckpt_3" loads the directory AND installs a
-    manifest so /state announces checkpoint_n=3 to miners immediately."""
-    import tempfile, os
+async def test_resume_from_path_stays_local_and_unadvertised():
+    """A local test snapshot must not be presented as a public revision."""
+    import os
+    import tempfile
     from unittest.mock import MagicMock
     from reliquary.validator.service import ValidationService
 
@@ -1028,10 +1028,10 @@ async def test_resume_from_path_installs_manifest():
         assert svc.train_model is not None
         assert load_calls == [ckpt_dir]
         mf = svc._checkpoint_store.current_manifest()
-        assert mf is not None
-        assert mf.checkpoint_n == 3
+        assert mf is None
         assert svc._checkpoint_n == 3
-        assert svc._verify_model_checkpoint_revision == ckpt_dir
+        assert svc._verify_model_checkpoint_revision is None
+        assert svc._local_resume_unadvertised is True
 
 
 @pytest.mark.asyncio
@@ -1056,7 +1056,8 @@ async def test_resume_from_load_failure_aborts():
     to the base model (would cause GRAIL mismatch on first submission)."""
     from unittest.mock import MagicMock
     from reliquary.validator.service import ValidationService
-    import os, tempfile
+    import os
+    import tempfile
 
     def failing_load(path):
         raise RuntimeError("corrupt checkpoint")

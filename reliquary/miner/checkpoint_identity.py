@@ -19,6 +19,15 @@ from reliquary.shared.checkpoint_identity import (
 _SCHEMA_VERSION = 1
 
 
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("checkpoint identity record has duplicate keys")
+        value[key] = item
+    return value
+
+
 class CheckpointIdentityError(RuntimeError):
     """A checkpoint identity is invalid, corrupt, rolled back, or rebound."""
 
@@ -127,7 +136,10 @@ class MinerCheckpointIdentityStore:
             return None
         try:
             raw = self.path.read_bytes()
-            record = json.loads(raw.decode("utf-8"))
+            record = json.loads(
+                raw.decode("utf-8"),
+                object_pairs_hook=_unique_json_object,
+            )
             return ActivatedCheckpoint.from_record(record)
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
             raise CheckpointIdentityError(

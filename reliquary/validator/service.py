@@ -961,6 +961,7 @@ class ValidationService:
         self._current_window_state: WindowState = WindowState.READY
 
         self._resume_from = resume_from
+        self._local_resume_unadvertised = False
         # The resume load must land where the boot load did. A pool means the
         # working replicas live in the workers, so this process's pair stays
         # on the CPU; no pool means it still proves in-process.
@@ -1336,9 +1337,12 @@ class ValidationService:
                     current.revision if current is not None else None
                 ),
                 expected_identity=(
-                    active_training_identity()
+                    {
+                        **active_training_identity(),
+                        "repo_id": self._checkpoint_store.repo_id,
+                    }
                     if PROTOCOL_VERSION >= 5
-                    else None
+                    else {"repo_id": self._checkpoint_store.repo_id}
                 ),
             )
         return self._checkpoint_intake
@@ -2088,10 +2092,11 @@ class ValidationService:
         if not self._resume_from:
             return
         from reliquary.validator.resume import (
+            PathSource,
+            ShaSource,
             parse_resume_source,
             resolve_resume_source,
         )
-        from reliquary.validator.checkpoint import ManifestEntry
 
         def _commit_title(repo_id, revision):
             from huggingface_hub import HfApi
@@ -2151,30 +2156,29 @@ class ValidationService:
             self.verify_model.eval()
             for p in self.verify_model.parameters():
                 p.requires_grad = False
-        # Extract the canonical revision string to publish to miners.
-        # IMPORTANT: strip the scheme prefix — miners call HF with this value
-        # as the ``revision=`` kwarg, and HF rejects ``sha:<hex>`` / ``path:<dir>``
-        # strings outright. They must see a bare 40-char hex (for sha) or a
-        # bare local path identifier (for path, though that's a test-only mode
-        # and miners won't successfully pull it anyway).
-        from reliquary.validator.resume import ShaSource
         if isinstance(source, ShaSource):
             revision_str = source.sha
-        else:
-            revision_str = source.path
-        self._verify_model_checkpoint_revision = revision_str
-        # Reconstruct manifest so miners see the resumed checkpoint via /state.
-        sig_payload = f"{checkpoint_n}|{revision_str}".encode()
-        sig_bytes = self.wallet.hotkey.sign(sig_payload)
-        entry = ManifestEntry(
-            checkpoint_n=checkpoint_n,
-            repo_id=self._checkpoint_store.repo_id,
-            revision=revision_str,
-            signature="ed25519:" + sig_bytes.hex(),
-        )
-        self._checkpoint_store._current = entry
+            self._verify_model_checkpoint_revision = revision_str
+            entry = self._checkpoint_store.install_external(
+                checkpoint_n,
+                revision_str,
+            )
+            self.server.set_current_checkpoint(entry)
+            self._local_resume_unadvertised = False
+        elif isinstance(source, PathSource):
+            # A local directory has no immutable public identity. It is useful
+            # for isolated tests, but must never become a revision in /state.
+            self._verify_model_checkpoint_revision = None
+            self._checkpoint_store.clear_manifest()
+            self.server.set_current_checkpoint(None)
+            self._local_resume_unadvertised = True
+            logger.warning(
+                "Loaded local checkpoint path for isolated use only; no "
+                "public checkpoint manifest was installed"
+            )
+        else:  # pragma: no cover - parse_resume_source is exhaustive
+            raise TypeError("unsupported resume source")
         self._checkpoint_n = checkpoint_n
-        self.server.set_current_checkpoint(entry)
         logger.info(
             "Resumed from %s: checkpoint_n=%d",
             self._resume_from, checkpoint_n,
@@ -6195,6 +6199,14 @@ class ValidationService:
         await self._serve_axon_on_chain(subtensor)
         await self._apply_resume_from()                  # ← resume before bootstrap
         await self._bootstrap_state_from_external()
+        if (
+            self._local_resume_unadvertised
+            and self._checkpoint_store.current_manifest() is None
+        ):
+            raise RuntimeError(
+                "local path resume is isolated/test-only; a validator must "
+                "resume from an immutable published revision"
+            )
         if PROTOCOL_VERSION >= 3 and self.proof_scheduler is None:
             raise RuntimeError(
                 "auction-v3 requires configured proof replicas; set "
