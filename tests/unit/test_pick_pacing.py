@@ -17,10 +17,13 @@ No constant encodes the trainer's step time (R31): the cadence is
 measured off the cursor, so it survives any model/hardware change on the
 train worker unchanged.
 
-And R35's other half: after a v6 window closes, the next one does not
-open until the service has DETECTED the checkpoint the closed window's
-16 batches produced -- the synchronisation point that already exists
-because miners need the new revision to generate against.
+And R39, which replaced R35's checkpoint reading: after a v6 window
+closes, the next one does not open until the trainer has CONSUMED the
+batches that window emitted. Waiting on a PUBLICATION was structurally
+wrong -- the trainer publishes at 16 TRAINED batches cumulative, not per
+window, so an underfilled window waited a full backstop for a checkpoint
+that was never coming and a mid-window publish over-armed the next
+window. Consumption has neither failure mode.
 """
 import asyncio
 import logging
@@ -262,21 +265,37 @@ def test_a_window_wide_event_advances_the_count_exactly_once(monkeypatch):
         assert shared.snapshot()["picks_emitted"] == expected
 
 
-def test_sixteen_events_close_the_window(monkeypatch):
-    """R35: the window closes at the 16th PICK, and ``poll_deadline``
+def test_every_event_walks_its_own_cursor_boundary_and_closes(monkeypatch):
+    """R35 end to end, with NO shortcut cursor: every pick past the depth
+    is stepped over its own boundary, so the LAST event's gate
+    (k = picks_target -> batch ``k - depth - 1``) is pinned on both sides
+    like every other one. The window then closes and ``poll_deadline``
     seals it on the very next poll."""
     from reliquary.constants import FILL_CLOSED_EMISSIONS_PER_WINDOW
+    import reliquary.validator.service as service_module
+    monkeypatch.setattr(service_module, "FILL_CLOSED_PICK_PIPELINE_DEPTH", 2)
 
+    target = FILL_CLOSED_EMISSIONS_PER_WINDOW
     math, code, shared, clock = _two_env_window(
-        monkeypatch, picks_target=FILL_CLOSED_EMISSIONS_PER_WINDOW
+        monkeypatch, picks_target=target
     )
     clock.now += 60.0
-    service = _service(monkeypatch, cursor=10**9)
-    for _ in range(FILL_CLOSED_EMISSIONS_PER_WINDOW):
+    service = _service(monkeypatch, cursor=None)
+    queue = service._training_payload_queue
+
+    for k in range(1, target + 1):
         assert math.poll_deadline() is False
         _prove(math, MATH, B_BATCH)
         _prove(code, CODE, B_BATCH)
+        if k > 2:
+            consumed = encoded_window_journal_key(WINDOW, k - 3)
+            # One short of the boundary: still gated, including on the
+            # window's LAST event.
+            queue.cursor = consumed - 1
+            assert service._drive_fill_closed_picks([math, code]) is False
+            queue.cursor = consumed
         assert service._drive_fill_closed_picks([math, code]) is True
+        assert shared.snapshot()["picks_emitted"] == k
 
     assert shared.is_closed() is True
     assert service._drive_fill_closed_picks([math, code]) is False
@@ -410,6 +429,28 @@ def test_an_environment_that_refuses_after_a_sibling_picked_logs_error(
     assert shared.snapshot()["picks_emitted"] == 0
 
 
+def test_every_environment_refusing_is_logged_too(monkeypatch, caplog):
+    """A total refusal is not "nothing happened": readiness said every
+    environment could seat a batch and then none did, which is the same
+    broken invariant as a partial refusal and has to be as loud."""
+    math, code, shared, clock = _two_env_window(monkeypatch)
+    _prove(math, MATH, B_BATCH)
+    _prove(code, CODE, B_BATCH)
+    clock.now += 60.0
+    service = _service(monkeypatch)
+    monkeypatch.setattr(math, "pick_training_batch", lambda: False)
+    monkeypatch.setattr(code, "pick_training_batch", lambda: False)
+
+    with caplog.at_level(logging.ERROR):
+        assert service._drive_fill_closed_picks([math, code]) is False
+    assert any(
+        record.levelno == logging.ERROR
+        and "pick event" in record.getMessage()
+        for record in caplog.records
+    )
+    assert shared.snapshot()["picks_emitted"] == 0
+
+
 def test_with_the_gate_off_no_pick_ever_fires(monkeypatch):
     """v4/v5 stay byte-identical: the loop is inert without the flag."""
     math, code, shared, clock = _two_env_window(monkeypatch)
@@ -465,172 +506,167 @@ def test_can_pick_is_false_once_the_window_is_closed(monkeypatch):
     assert math.can_pick() is False
 
 
+
+
 # ------------------------------------------------------------------ #
-# B. the next window opens on checkpoint detection (R35)              #
+# B. rotation waits on CONSUMPTION (R39)                              #
 # ------------------------------------------------------------------ #
 
 def _run(coro):
     return asyncio.run(coro)
 
 
-class _Store:
-    def __init__(self, revision):
-        self.revision = revision
-
-    def current_manifest(self):
-        return (
-            None if self.revision is None
-            else SimpleNamespace(revision=self.revision)
-        )
-
-
-class _Intake:
-    def __init__(self, manifests=()):
-        self._manifests = list(manifests)
-        self.polls = 0
-        self.staged = []
-        self.installed_revision = None
-        self.staged_revision = None
-        self._staging_revision = None
-
-    def poll(self):
-        self.polls += 1
-        return self._manifests.pop(0) if self._manifests else None
-
-    def stage(self, manifest):
-        self.staged.append(manifest)
-        self.staged_revision = str(manifest["revision"])
-        return True
-
-    def snapshot(self):
-        return {
-            "installed_revision": self.installed_revision,
-            "staged_revision": self.staged_revision,
-            "staging_revision": self._staging_revision,
-        }
-
-
-def _rotation_service(monkeypatch, *, baseline, store, intake=None,
-                      enabled=True):
+def _rotation_service(monkeypatch, *, key, cursor=None, enabled=True,
+                      freeze=False):
+    import reliquary.infrastructure.training_payload_queue as queue_module
     import reliquary.validator.service as service_module
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
     monkeypatch.setattr(service_module, "FILL_CLOSED_ENABLED", enabled)
     monkeypatch.setattr(
-        service_module, "FILL_CLOSED_CHECKPOINT_POLL_SECONDS", 0.0
+        service_module, "FILL_CLOSED_ROTATION_POLL_SECONDS", 0.0
     )
+    monkeypatch.setenv("RELIQUARY_DISABLE_TRAIN", "1" if freeze else "0")
     service = ValidationService.__new__(ValidationService)
-    service._fill_closed_checkpoint_baseline = baseline
-    service._checkpoint_store = store
-    service._checkpoint_intake = intake
-    service._intake_stage_task = None
-    service._window_n = 500
+    service._training_payload_queue = _CursorQueue(cursor)
+    service._fill_closed_rotation_key = key
+    service._window_n = WINDOW
+    service._window_preparation_stage = None
+    service.stages = []
+    service._set_window_preparation_stage = service.stages.append
     return service
 
 
-def test_rotation_waits_until_a_new_revision_is_detected(monkeypatch):
-    """R35: the closed window's 16 batches are in the journal; the next
-    window must not open on the OLD policy. The wait releases the moment
-    the intake's poll reports checkpoint N+1."""
-    store = _Store("old" * 13 + "a")
-    intake = _Intake([None, None, {"revision": "new" * 13 + "b"}])
-    service = _rotation_service(
-        monkeypatch, baseline=store.revision, store=store, intake=intake
-    )
-    reason = _run(service._wait_for_fill_closed_checkpoint())
-    assert reason == "checkpoint_detected"
-    assert intake.polls == 3
-    # DETECTION releases the gate; the multi-gigabyte download it just
-    # started overlaps the next window's collection rather than blocking
-    # the open on it.
-    assert service._intake_stage_task is not None
-    assert service._fill_closed_checkpoint_baseline is None
+def test_an_underfilled_window_waits_only_for_its_own_batches(monkeypatch):
+    """R39, the case revision-comparison got wrong. This window emitted 3
+    batches, not 16, so the trainer will NOT publish a checkpoint off it
+    -- and rotation must not wait for one. It waits for exactly what this
+    window put in the journal: the cursor reaching batch 2."""
+    last = encoded_window_journal_key(WINDOW, 2)
+    service = _rotation_service(monkeypatch, key=last, cursor=last - 1)
+
+    async def drive():
+        task = asyncio.create_task(service._wait_for_fill_closed_rotation())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not task.done()  # still holding on batch 2
+        service._training_payload_queue.cursor = last
+        return await task
+
+    assert _run(drive()) == "batches_consumed"
 
 
-def test_rotation_returns_at_once_when_the_swap_already_happened(
+def test_rotation_releases_at_once_when_the_cursor_is_already_past(
     monkeypatch,
 ):
-    """The serial beat usually swaps in ``_train_and_publish`` BEFORE the
-    loop comes round: the manifest already names N+1, so there is nothing
-    to wait for and no intake poll at all."""
-    store = _Store("new")
-    intake = _Intake()
-    service = _rotation_service(
-        monkeypatch, baseline="old", store=store, intake=intake
+    """The common case: the trainer consumed the window's last batch
+    while the GPU half was still archiving, so there is nothing to wait
+    for and no poll loop is entered."""
+    last = encoded_window_journal_key(WINDOW, 2)
+    service = _rotation_service(monkeypatch, key=last, cursor=last + 4)
+    assert _run(service._wait_for_fill_closed_rotation()) == (
+        "batches_consumed"
     )
-    assert _run(service._wait_for_fill_closed_checkpoint()) == (
-        "checkpoint_detected"
-    )
-    assert intake.polls == 0
+    assert service._training_payload_queue.reads == 1
+    assert service.stages == []
+
+
+def test_a_window_that_emitted_nothing_does_not_wait_at_all(monkeypatch):
+    """Zero emitted -> nothing for the trainer to consume -> rotate
+    immediately. Arming on "a window closed" instead would stall a dead
+    window for a whole backstop."""
+    service = _rotation_service(monkeypatch, key=None, cursor=None)
+    assert _run(service._wait_for_fill_closed_rotation()) == "not_armed"
+    assert service._training_payload_queue.reads == 0
 
 
 def test_rotation_is_bounded_by_the_fill_closed_backstop(monkeypatch):
-    """A dead trainer would otherwise stall rotation forever. The wait
-    reuses ``FILL_CLOSED_MAX_SECONDS`` and opens the next window anyway,
-    saying so."""
+    """A dead trainer never consumes anything; the backstop opens the
+    next window anyway rather than taking the validator off the air."""
     import reliquary.validator.service as service_module
     monkeypatch.setattr(service_module, "FILL_CLOSED_MAX_SECONDS", 0.0)
-    store = _Store("old")
-    intake = _Intake()
-    service = _rotation_service(
-        monkeypatch, baseline="old", store=store, intake=intake
-    )
-    assert _run(service._wait_for_fill_closed_checkpoint()) == (
-        "checkpoint_wait_timeout"
+    last = encoded_window_journal_key(WINDOW, 2)
+    service = _rotation_service(monkeypatch, key=last, cursor=None)
+    assert _run(service._wait_for_fill_closed_rotation()) == (
+        "rotation_wait_timeout"
     )
 
 
-def test_rotation_does_not_wait_when_no_v6_window_has_closed(monkeypatch):
-    """No baseline armed (first window ever, or a window that emitted
-    nothing) -> nothing to wait for."""
-    store = _Store("old")
-    intake = _Intake()
+def test_an_emergency_freeze_skips_the_gate(monkeypatch, caplog):
+    """RELIQUARY_DISABLE_TRAIN stops the trainer consuming anything, so
+    holding rotation on consumption would stall the validator for a
+    backstop per window during the very incident the freeze exists for."""
+    last = encoded_window_journal_key(WINDOW, 2)
     service = _rotation_service(
-        monkeypatch, baseline=None, store=store, intake=intake
+        monkeypatch, key=last, cursor=None, freeze=True
     )
-    assert _run(service._wait_for_fill_closed_checkpoint()) == "not_armed"
-    assert intake.polls == 0
+    with caplog.at_level(logging.WARNING):
+        assert _run(service._wait_for_fill_closed_rotation()) == (
+            "emergency_freeze"
+        )
+    assert any(
+        "freeze" in record.getMessage() for record in caplog.records
+    )
+    assert service._training_payload_queue.reads == 0
+
+
+def test_the_wait_publishes_a_preparation_stage(monkeypatch):
+    """A wait that can last the whole backstop must say so on /state, or
+    a stalled rotation is indistinguishable from a hung validator."""
+    last = encoded_window_journal_key(WINDOW, 2)
+    service = _rotation_service(monkeypatch, key=last, cursor=last - 1)
+
+    async def drive():
+        task = asyncio.create_task(service._wait_for_fill_closed_rotation())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert service.stages == ["fill_closed_rotation_wait"]
+        service._training_payload_queue.cursor = last
+        await task
+
+    _run(drive())
 
 
 def test_with_the_gate_off_rotation_never_waits(monkeypatch):
-    store = _Store("old")
-    intake = _Intake([{"revision": "new"}])
     service = _rotation_service(
-        monkeypatch, baseline="old", store=store, intake=intake,
+        monkeypatch, key=encoded_window_journal_key(WINDOW, 2), cursor=None,
         enabled=False,
     )
-    assert _run(service._wait_for_fill_closed_checkpoint()) == "disabled"
-    assert intake.polls == 0
+    assert _run(service._wait_for_fill_closed_rotation()) == "disabled"
+    assert service._training_payload_queue.reads == 0
 
 
-def test_a_staged_but_unswapped_checkpoint_counts_as_detected(monkeypatch):
-    """DETECTION, not installation, is the release condition (R35): the
-    download can finish under the next window's collection."""
-    store = _Store("old")
-    intake = _Intake()
-    intake.staged_revision = "new"
-    service = _rotation_service(
-        monkeypatch, baseline="old", store=store, intake=intake
-    )
-    assert _run(service._wait_for_fill_closed_checkpoint()) == (
-        "checkpoint_detected"
-    )
-    assert intake.polls == 0
-
-
-def test_a_closed_window_that_emitted_batches_arms_the_gate(monkeypatch):
-    """The baseline is the revision the CLOSED window collected against,
-    captured at seal -- and only when the window actually emitted
-    batches, since a window that emitted nothing produces no checkpoint
-    to wait for."""
+def test_the_arming_records_the_last_emitted_batchs_journal_key(monkeypatch):
+    """The gate's whole input: the key of the LAST batch this window
+    emitted, or None when it emitted none. Nothing about revisions."""
+    import reliquary.infrastructure.training_payload_queue as queue_module
     import reliquary.validator.service as service_module
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
     monkeypatch.setattr(service_module, "FILL_CLOSED_ENABLED", True)
     service = ValidationService.__new__(ValidationService)
-    service._checkpoint_store = _Store("rev-a")
-    service._fill_closed_checkpoint_baseline = None
+    service._fill_closed_rotation_key = "stale"
 
-    service._fill_closed_assembler = SimpleNamespace(next_batch_index=0)
-    service._arm_fill_closed_checkpoint_gate()
-    assert service._fill_closed_checkpoint_baseline is None
+    service._fill_closed_assembler = SimpleNamespace(
+        window_start=WINDOW, next_batch_index=0
+    )
+    service._arm_fill_closed_rotation_gate()
+    assert service._fill_closed_rotation_key is None
 
-    service._fill_closed_assembler = SimpleNamespace(next_batch_index=16)
-    service._arm_fill_closed_checkpoint_gate()
-    assert service._fill_closed_checkpoint_baseline == "rev-a"
+    service._fill_closed_assembler = SimpleNamespace(
+        window_start=WINDOW, next_batch_index=3
+    )
+    service._arm_fill_closed_rotation_gate()
+    assert service._fill_closed_rotation_key == encoded_window_journal_key(
+        WINDOW, 2
+    )
+
+
+def test_the_arming_is_consumed_by_one_wait(monkeypatch):
+    """One close, one wait: a second rotation must not re-wait on a key
+    the trainer already passed (or, worse, on a stale window's key)."""
+    last = encoded_window_journal_key(WINDOW, 2)
+    service = _rotation_service(monkeypatch, key=last, cursor=last)
+    assert _run(service._wait_for_fill_closed_rotation()) == (
+        "batches_consumed"
+    )
+    assert service._fill_closed_rotation_key is None
+    assert _run(service._wait_for_fill_closed_rotation()) == "not_armed"

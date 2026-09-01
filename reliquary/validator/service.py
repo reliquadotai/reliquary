@@ -179,11 +179,12 @@ logger = logging.getLogger(__name__)
 _HF_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _STARTUP_HASH_REBUILD_TIMEOUT_SECONDS = 30.0
 
-# v6.1 (R35): how often the between-windows checkpoint gate re-asks the
-# candidate manifest. Deliberately NOT the seal loop's 0.5 s -- each ask
-# is an R2 GET, and the gate is a wait of seconds-to-a-minute, not a
-# hot loop. Not an operator knob: nothing downstream is sized off it.
-FILL_CLOSED_CHECKPOINT_POLL_SECONDS = 2.0
+# v6.1 (R39): how often the between-windows rotation gate re-asks the
+# trainer's consumption cursor. Deliberately NOT the seal loop's 0.5 s --
+# each ask is a bounded R2 GET, and the gate is a wait of
+# seconds-to-a-minute, not a hot loop. Not an operator knob: nothing
+# downstream is sized off it.
+FILL_CLOSED_ROTATION_POLL_SECONDS = 2.0
 
 
 class CheckpointEpochExecutionError(RuntimeError):
@@ -953,11 +954,13 @@ class ValidationService:
         # window's ``_open_window_batchers`` has already replaced it by
         # the time the stashed window is archived.
         self._fill_closed_assemblers: dict[int, Any] = {}
-        # v6.1 (R35). The checkpoint revision the last CLOSED v6 window
-        # collected against; the next window's open waits for a different
-        # one. None means the gate is not armed (no v6 window has closed,
-        # or the one that did emitted no batches).
-        self._fill_closed_checkpoint_baseline: str | None = None
+        # v6.1 (R39). The journal key of the LAST batch the last CLOSED
+        # v6 window emitted; the next window's open waits for the
+        # trainer's cursor to reach it. None means the gate is not armed
+        # (no v6 window has closed, or the one that did emitted nothing,
+        # in which case there is nothing to consume and nothing to wait
+        # for). Consumed by the wait -- one close, one wait.
+        self._fill_closed_rotation_key: int | None = None
         self.kl_reference_state: dict[str, Any] = {
             "schema_version": 1,
             "mode": "rolling",
@@ -1448,162 +1451,139 @@ class ValidationService:
         )
         return True
 
-    def _arm_fill_closed_checkpoint_gate(self) -> None:
-        """Remember which revision the window that just closed collected
-        against, so the NEXT open can wait for its successor (R35).
+    def _arm_fill_closed_rotation_gate(self) -> None:
+        """R39: remember the journal key of the LAST batch this window
+        emitted, so the next window opens only once the trainer has
+        CONSUMED it.
 
-        Only armed when the closed window actually emitted batches: a
-        window that emitted none produced nothing for the trainer to step
-        on, so there is no checkpoint N+1 coming and holding rotation for
-        one would stall the validator for a whole backstop with nothing
-        to show. ``next_batch_index`` is the assembler's count of real
-        emissions and has not yet been padded by ``close()`` at this
-        point in the loop.
+        Supersedes the revision-baseline gate this method used to arm.
+        Waiting for a PUBLICATION was structurally wrong: the trainer
+        publishes at 16 TRAINED batches CUMULATIVE, not per window, so an
+        underfilled window armed a wait for a checkpoint that would never
+        come (a full backstop of dead air), and a publication landing
+        mid-window over-armed the next one. Consumption has neither
+        failure mode -- a window waits for exactly what it put in the
+        journal, and nothing else. Checkpoint adoption is untouched and
+        stays on ``_detached_checkpoint_tick``'s serial beat; if the
+        consumption being waited on happened to cross the publish
+        boundary, the staged revision is adopted there as usual.
+
+        ``next_batch_index`` is the assembler's count of real emissions
+        and has not yet been padded by ``close()`` at this point in the
+        loop, so key ``next_batch_index - 1`` is the last batch this
+        window actually emitted. Zero emitted disarms outright: there is
+        nothing to consume, so there is nothing to wait for.
         """
+        from reliquary.constants import FILL_CLOSED_EMISSIONS_PER_WINDOW
+        from reliquary.infrastructure.training_payload_queue import (
+            encoded_window_journal_key,
+        )
+
         assembler = getattr(self, "_fill_closed_assembler", None)
         emitted = int(getattr(assembler, "next_batch_index", 0) or 0)
-        if emitted <= 0:
-            self._fill_closed_checkpoint_baseline = None
+        window_start = getattr(assembler, "window_start", None)
+        if emitted <= 0 or window_start is None:
+            # No emissions, or no assembler to say which window they were
+            # filed under: disarm rather than guess a key, since a wrong
+            # key gates the next window on something nobody will consume.
+            self._fill_closed_rotation_key = None
             return
-        try:
-            manifest = self._checkpoint_store.current_manifest()
-        except Exception:
-            logger.exception(
-                "could not read the current manifest at v6 close; the next "
-                "window will open without waiting for a checkpoint"
-            )
-            manifest = None
-        self._fill_closed_checkpoint_baseline = (
-            str(manifest.revision) if manifest is not None else None
+        # Clamped rather than trusted: the encoder raises outside the
+        # window's reserved range, and this runs on the window loop where
+        # that would cost the whole iteration for a telemetry value.
+        index = min(emitted - 1, FILL_CLOSED_EMISSIONS_PER_WINDOW - 1)
+        self._fill_closed_rotation_key = encoded_window_journal_key(
+            int(window_start), index
         )
 
-    def _fill_closed_checkpoint_detected(self, baseline: str) -> bool:
-        """Has the validator SEEN a checkpoint other than ``baseline``?
-
-        Three places a revision can show up, cheapest first: already
-        installed (the swap ran on its own serial beat), staged or
-        mid-staging in the intake, or -- the caller's own poll -- freshly
-        returned by the candidate manifest. Any of them means checkpoint
-        N+1 exists and miners will be able to generate against it.
-        """
-        try:
-            manifest = self._checkpoint_store.current_manifest()
-        except Exception:
-            manifest = None
-        if manifest is not None and str(manifest.revision) != baseline:
-            return True
-        intake = getattr(self, "_checkpoint_intake", None)
-        if intake is None:
-            return False
-        snapshot = intake.snapshot()
-        return any(
-            revision and str(revision) != baseline
-            for revision in (
-                snapshot.get("installed_revision"),
-                snapshot.get("staged_revision"),
-                snapshot.get("staging_revision"),
-            )
-        )
-
-    async def _wait_for_fill_closed_checkpoint(self) -> str:
-        """R35: hold the next v6 window's construction until the
-        checkpoint published from THIS window's batches is detected.
+    async def _wait_for_fill_closed_rotation(self) -> str:
+        """R39: hold the next v6 window's construction until the trainer
+        has consumed every batch the closed window emitted.
 
         The amendment closes a window at its 16th pick and opens the next
-        one on the synchronisation point that already exists -- miners
-        need the new revision to generate against, so opening a window on
-        the old policy would collect rollouts the trainer has already
-        moved past. Any intra-window pacing drift resets here, and the
-        journal backlog stays bounded at ``depth`` by construction.
+        one on a synchronisation point, so that a window is never
+        collected against a policy the trainer has already moved past and
+        intra-window pacing drift resets between windows. The point is
+        the trainer's own cursor reaching this window's last batch --
+        measured consumption, never a declared interval and never a
+        publication (see ``_arm_fill_closed_rotation_gate`` for why the
+        publication reading was wrong).
+
+        The arming is CONSUMED here: one close, one wait. A second call
+        finds nothing armed and returns immediately, so a stale key can
+        never gate a later window.
+
+        Skipped entirely under ``RELIQUARY_DISABLE_TRAIN``: the freeze
+        stops the trainer consuming anything, so the gate would stall the
+        validator for a backstop per window during the very incident the
+        freeze exists to contain.
 
         Bounded by ``FILL_CLOSED_MAX_SECONDS``, the same backstop that
-        bounds the window itself: a dead trainer publishes nothing ever,
-        and an unbounded wait would take the validator off the air
-        entirely rather than merely stop its learning. On expiry the next
-        window opens on the SAME revision and says so at ERROR.
-
-        Same discipline as ``_wait_for_window_seal``: a bounded async
-        wait with an explicit poll interval, never a busy loop.
+        bounds the window itself -- a dead trainer consumes nothing ever,
+        and an unbounded wait would take the validator off the air rather
+        than merely stop its learning. Same discipline as
+        ``_wait_for_window_seal``: a bounded async wait with an explicit
+        poll interval, never a busy loop, and a preparation stage on
+        ``/state`` throughout so a held rotation is legible from outside.
         """
         if not FILL_CLOSED_ENABLED:
             return "disabled"
-        baseline = getattr(self, "_fill_closed_checkpoint_baseline", None)
-        if not baseline:
+        required = getattr(self, "_fill_closed_rotation_key", None)
+        if required is None:
             return "not_armed"
-        if self._fill_closed_checkpoint_detected(baseline):
-            self._fill_closed_checkpoint_baseline = None
-            return "checkpoint_detected"
+        self._fill_closed_rotation_key = None
+        if os.environ.get("RELIQUARY_DISABLE_TRAIN", "").lower() in {
+            "1", "true", "yes", "on",
+        }:
+            logger.warning(
+                "Window %d: emergency freeze active; not holding the next "
+                "window's open on trainer consumption (nothing will ever "
+                "consume journal key %s under the freeze)",
+                self._window_n, required,
+            )
+            return "emergency_freeze"
 
-        intake = getattr(self, "_checkpoint_intake", None)
-        if intake is None:
-            # Detached mode reaches here before the first
-            # ``_detached_checkpoint_tick`` has built the intake; without
-            # it the gate could only watch the installed manifest and
-            # would sit until the backstop. Construction touches boto3
-            # and the R2 environment, so a failure degrades to exactly
-            # that manifest-only wait rather than killing the iteration.
-            from reliquary.constants import DETACHED_TRAINER as _detached
+        def consumed() -> bool:
+            cursor = self._read_trainer_step_cursor()
+            return cursor is not None and int(cursor) >= int(required)
 
-            if _detached:
-                try:
-                    intake = self._detached_intake_ref()
-                except Exception:
-                    logger.exception(
-                        "could not build the checkpoint intake for the v6 "
-                        "window-open gate; watching the installed manifest "
-                        "only"
-                    )
+        if consumed():
+            return "batches_consumed"
         loop = asyncio.get_running_loop()
         started = loop.time()
         deadline = started + FILL_CLOSED_MAX_SECONDS
+        self._set_window_preparation_stage("fill_closed_rotation_wait")
         logger.info(
-            "Window %d closed on its picks; holding the next window's open "
-            "until the checkpoint trained from its batches is detected "
-            "(parent revision %s, backstop %.0f s). Opening now would "
-            "collect against a policy the trainer has already moved past.",
-            self._window_n, str(baseline)[:12], FILL_CLOSED_MAX_SECONDS,
+            "Window %d closed; holding the next window's open until the "
+            "trainer has consumed its last batch (journal key %s, backstop "
+            "%.0f s). Opening now would collect against a policy the "
+            "trainer has already moved past.",
+            self._window_n, required, FILL_CLOSED_MAX_SECONDS,
         )
         while True:
-            polled = False
-            if intake is not None:
-                try:
-                    # A fresh candidate manifest IS the detection: the
-                    # staging task it starts has not run yet, so the
-                    # intake snapshot below would still look empty.
-                    polled = await self._poll_and_stage_checkpoint_candidate(
-                        intake
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.exception(
-                        "candidate manifest poll failed while waiting for "
-                        "the next checkpoint; retrying"
-                    )
-            if polled or self._fill_closed_checkpoint_detected(baseline):
-                self._fill_closed_checkpoint_baseline = None
-                logger.info(
-                    "Checkpoint after window %d detected in %.1f s; opening "
-                    "the next window",
-                    self._window_n, loop.time() - started,
-                )
-                return "checkpoint_detected"
             remaining = deadline - loop.time()
             if remaining <= 0:
                 logger.error(
-                    "No checkpoint detected %.0f s after window %d closed; "
-                    "opening the next window on the SAME revision %s. The "
-                    "trainer is stalled or dead -- its cursor will not move "
-                    "either, so that window will take its first %d picks on "
-                    "the time floor and then end on its own backstop.",
-                    FILL_CLOSED_MAX_SECONDS, self._window_n,
-                    str(baseline)[:12], FILL_CLOSED_PICK_PIPELINE_DEPTH,
+                    "Trainer has not consumed window %d's last batch "
+                    "(journal key %s) %.0f s after it closed; opening the "
+                    "next window anyway. The trainer is stalled or dead -- "
+                    "its cursor will not move for that window either, so it "
+                    "will take its first %d picks on the time floor and then "
+                    "end on its own backstop.",
+                    self._window_n, required, FILL_CLOSED_MAX_SECONDS,
+                    FILL_CLOSED_PICK_PIPELINE_DEPTH,
                 )
-                self._fill_closed_checkpoint_baseline = None
-                return "checkpoint_wait_timeout"
+                return "rotation_wait_timeout"
             await asyncio.sleep(
-                min(FILL_CLOSED_CHECKPOINT_POLL_SECONDS, remaining)
+                min(FILL_CLOSED_ROTATION_POLL_SECONDS, remaining)
             )
+            if consumed():
+                logger.info(
+                    "Window %d's batches consumed in %.1f s; opening the "
+                    "next window",
+                    self._window_n, loop.time() - started,
+                )
+                return "batches_consumed"
 
     async def _seal_wait_and_close(
         self,
@@ -3463,14 +3443,19 @@ class ValidationService:
         ``_fill_closed_pick_gate_open``, and only on the branch that
         actually needs it).
 
-        Check-then-pick without holding the lock across both is safe --
-        the proven pool only grows, and ``pick_training_batch`` re-checks
-        under ``fill_state.lock`` anyway. If a sibling still refuses after
-        one environment succeeded, that invariant is broken somewhere: log
-        at ERROR rather than emit a half batch silently. Nothing is
-        advanced twice here -- the window-wide counter is moved by
-        whichever batcher reaches ordinal k first, inside
-        ``_claim_pick_chunk``.
+        Check-then-pick without holding the lock across the readiness
+        scan and the picks is safe because THIS LOOP OWNS BOTH. Picking,
+        the readiness check and ``poll_deadline``'s seal all run on the
+        one ``_wait_for_window_seal`` task, so no seal and no rival pick
+        can interleave between them; the proof threads that run
+        concurrently only ever GROW the pool, which can invalidate a
+        False (harmless -- the next 0.5 s tick sees it) but never a True.
+        That ownership, not the pool's growth, is what excludes the
+        seal-vs-pick interleaving. If an environment still refuses, the
+        invariant is broken somewhere: log at ERROR rather than emit a
+        half batch silently -- an incomplete event costs nothing wrong
+        under R37, since ``picks_emitted`` is the MIN over environments'
+        ordinals and a half-taken event simply does not count.
         """
         if not FILL_CLOSED_ENABLED:
             return False
@@ -3496,16 +3481,25 @@ class ValidationService:
             for batcher in picking
             if not batcher.pick_training_batch()
         ]
-        if refused and len(refused) < len(picking):
+        if refused:
+            # Both shapes are the same broken invariant and both are
+            # loud. A PARTIAL refusal leaves the event half-taken, which
+            # R37's per-environment ordinals make survivable (the
+            # window-wide count is the min, so it simply does not move)
+            # but never correct. A TOTAL refusal means readiness said
+            # every environment could seat a batch and then none did.
             logger.error(
                 "Window %d: pick event %d was driven on %d environment(s) "
-                "but %s refused after passing the readiness check; that "
-                "batch is short and the window-wide count still advanced "
-                "once",
+                "and %s refused after passing the readiness check (%s); "
+                "the window-wide count does not advance for an incomplete "
+                "event",
                 int(getattr(picking[0], "window_start", 0)),
                 next_pick,
                 len(picking),
                 ",".join(refused),
+                "no environment took it"
+                if len(refused) == len(picking)
+                else "the event is half-taken",
             )
         return len(refused) < len(picking)
 
@@ -5925,12 +5919,12 @@ class ValidationService:
                             self._windows_since_cooldown_snapshot = 0
                         continue
                     self._window_iteration_stage = "open"
-                    # v6.1 (R35): the next window opens on DETECTION of
-                    # the checkpoint the last one's batches produced. A
-                    # no-op with the gate off, and before the first v6
-                    # close (nothing armed) -- rotation stays byte-
-                    # identical for v4/v5.
-                    await self._wait_for_fill_closed_checkpoint()
+                    # v6.1 (R39): the next window opens once the trainer
+                    # has CONSUMED the last one's batches. A no-op with
+                    # the gate off, under an emergency freeze, and before
+                    # the first v6 close (nothing armed) -- rotation stays
+                    # byte-identical for v4/v5.
+                    await self._wait_for_fill_closed_rotation()
                     self._open_window()
                     self._window_iteration_stage = "admission_pools"
                     self._set_window_preparation_stage("admission_pools")
@@ -6083,10 +6077,12 @@ class ValidationService:
                             self._window_n, seal_reason,
                         )
                     if FILL_CLOSED_ENABLED:
-                        # R35: arm the next open's checkpoint gate while
-                        # this window's assembler is still the current
-                        # one (``_train_and_publish`` pops it below).
-                        self._arm_fill_closed_checkpoint_gate()
+                        # R39: arm the next open's consumption gate while
+                        # this window's assembler is still the current one
+                        # (``_train_and_publish`` pops it below) and its
+                        # ``next_batch_index`` still counts only the real
+                        # mid-window emissions, before ``close()`` pads.
+                        self._arm_fill_closed_rotation_gate()
 
                     from reliquary.constants import PIPELINED_WINDOWS
 
