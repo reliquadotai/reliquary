@@ -9,8 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from reliquary.constants import B_BATCH
-from reliquary.validator.batcher import GrpoWindowBatcher, ValidSubmission
+from reliquary.validator.batcher import GrpoWindowBatcher
 from reliquary.validator.cooldown import CooldownMap
 
 
@@ -347,7 +346,6 @@ def test_service_creates_grpo_window_batcher():
 async def test_rebuild_cooldown_from_history_populates_map():
     """ValidationService._rebuild_cooldown_from_history fetches archives
     from R2 and populates the cooldown map."""
-    from reliquary.constants import BATCH_PROMPT_COOLDOWN_WINDOWS
     from reliquary.validator.service import ValidationService
 
     # Build a fake service — minimal state to call the rebuild method.
@@ -371,6 +369,9 @@ async def test_rebuild_cooldown_from_history_populates_map():
     svc._window_n = 105  # authoritative counter
 
     with patch(
+        "reliquary.infrastructure.storage.download_json",
+        new=AsyncMock(return_value=None),
+    ), patch(
         "reliquary.infrastructure.storage.list_recent_datasets",
         new=AsyncMock(return_value=archives),
     ):
@@ -453,10 +454,7 @@ def test_service_constructs_hash_set_with_dedup_retention():
     """ValidationService owns a RolloutHashSet sized to HASH_DEDUP_RETENTION_WINDOWS,
     decoupled from the prompt cooldown horizon so the dedup outlives cooldown."""
     from unittest.mock import MagicMock
-    from reliquary.constants import (
-        BATCH_PROMPT_COOLDOWN_WINDOWS,
-        HASH_DEDUP_RETENTION_WINDOWS,
-    )
+    from reliquary.constants import HASH_DEDUP_RETENTION_WINDOWS
     from reliquary.validator.dedup import RolloutHashSet
     from reliquary.validator.service import ValidationService
 
@@ -539,19 +537,25 @@ async def test_rebuild_hashes_from_history_populates_set():
             ],
         }
     ]
-    with patch(
-        "reliquary.infrastructure.storage.list_recent_datasets",
+    with patch.object(
+        svc,
+        "_load_archive_range",
         new=AsyncMock(return_value=archives),
-    ):
+    ) as load_range:
         await svc._rebuild_hashes_from_history()
 
+    load_range.assert_awaited_once_with(
+        start_window=1,
+        end_window=110,
+        require_all=True,
+    )
     assert bytes.fromhex(h_explicit) in svc._hash_set
     assert compute_rollout_hash([40, 50, 60]) in svc._hash_set
 
 
 @pytest.mark.asyncio
-async def test_rebuild_hashes_from_history_timeout_fails_open():
-    """A slow best-effort archive replay cannot block validator startup."""
+async def test_rebuild_hashes_from_history_timeout_fails_closed():
+    """Unknown durable history cannot silently disable rollout dedup."""
     from unittest.mock import MagicMock, patch
 
     from reliquary.validator.service import ValidationService
@@ -579,18 +583,74 @@ async def test_rebuild_hashes_from_history_timeout_fails_open():
         await asyncio.sleep(60)
 
     with (
-        patch(
-            "reliquary.infrastructure.storage.list_recent_datasets",
-            new=_never_returns,
-        ),
+        patch.object(svc, "_load_archive_range", new=_never_returns),
         patch(
             "reliquary.validator.service._STARTUP_HASH_REBUILD_TIMEOUT_SECONDS",
             0.01,
         ),
     ):
-        await asyncio.wait_for(svc._rebuild_hashes_from_history(), 1)
+        with pytest.raises(RuntimeError, match="hash history rebuild failed"):
+            await asyncio.wait_for(svc._rebuild_hashes_from_history(), 1)
 
     assert len(svc._hash_set) == 0
+
+
+@pytest.mark.asyncio
+async def test_rebuild_hashes_uses_local_pending_archive_during_r2_outage(
+    tmp_path,
+):
+    from reliquary.infrastructure.archive_queue import ArchiveQueue
+    from reliquary.validator.dedup import compute_rollout_hash
+    from reliquary.validator.service import ValidationService
+
+    class _HashEnv:
+        name = "fake"
+
+        def __len__(self): return 100
+        def get_problem(self, i): return {"prompt": "p", "ground_truth": "a"}
+        def compute_reward(self, p, c): return 0.0
+
+    class _HashWallet:
+        class _Hk:
+            ss58_address = "5FHk"
+            @staticmethod
+            def sign(d): return b"sig"
+        hotkey = _Hk()
+
+    svc = ValidationService(
+        wallet=_HashWallet(), model=MagicMock(), tokenizer=MagicMock(),
+        env=_HashEnv(), netuid=99,
+    )
+    svc._window_n = 1
+    queue = ArchiveQueue(str(tmp_path / "pending"))
+    selected = compute_rollout_hash([10, 20, 30])
+    rewarded_runner = compute_rollout_hash([40, 50, 60])
+    queue.enqueue(
+        1,
+        {
+            "window_start": 1,
+            "window_status": "completed",
+            "batch": [
+                {"rollouts": [{"hash": selected.hex(), "tokens": []}]}
+            ],
+            "runners_up": [
+                {
+                    "rewarded": True,
+                    "rollout_hashes": [rewarded_runner.hex()],
+                }
+            ],
+        },
+    )
+    svc._archive_queue = queue
+
+    with patch(
+        "reliquary.infrastructure.storage.list_recent_datasets",
+        new=AsyncMock(side_effect=OSError("R2 unavailable")),
+    ):
+        await svc._rebuild_hashes_from_history()
+
+    assert selected in svc._hash_set
+    assert rewarded_runner in svc._hash_set
 
 
 def test_record_late_drop_aggregates_per_hotkey_and_reason():

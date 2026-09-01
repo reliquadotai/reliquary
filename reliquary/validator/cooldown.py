@@ -13,6 +13,46 @@ import threading
 
 
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+_PROMPT_INDEX_RE = re.compile(r"^(0|[1-9][0-9]*)$")
+
+
+def _nonnegative_int(value: object, field: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
+    return value
+
+
+def _prompt_index(value: object) -> int:
+    if type(value) is int:
+        return _nonnegative_int(value, "prompt index")
+    if not isinstance(value, str) or not _PROMPT_INDEX_RE.fullmatch(value):
+        raise ValueError("prompt index key must be canonical decimal")
+    return int(value)
+
+
+def parse_prompt_cooldown_state(state: object) -> dict[int, int]:
+    """Parse one durable prompt-cooldown map without numeric coercion."""
+    if not isinstance(state, dict):
+        raise ValueError("cooldown snapshot state must be an object")
+    restored: dict[int, int] = {}
+    for raw_idx, raw_window in state.items():
+        idx = _prompt_index(raw_idx)
+        if idx in restored:
+            raise ValueError("cooldown snapshot contains duplicate prompt keys")
+        restored[idx] = _nonnegative_int(raw_window, "selected window")
+    return restored
+
+
+def parse_content_cooldown_state(state: object) -> dict[str, int]:
+    """Parse one durable content-cooldown map without normalization."""
+    if not isinstance(state, dict):
+        raise ValueError("content cooldown snapshot state must be an object")
+    restored: dict[str, int] = {}
+    for digest, window in state.items():
+        if not isinstance(digest, str) or not _SHA256_HEX_RE.fullmatch(digest):
+            raise ValueError("content digest must be 64 lowercase hex characters")
+        restored[digest] = _nonnegative_int(window, "selected window")
+    return restored
 
 
 class CooldownMap:
@@ -56,7 +96,8 @@ class CooldownMap:
             return set()
         with self._lock:
             return {
-                idx for idx, last in self._last_batched.items()
+                idx
+                for idx, last in self._last_batched.items()
                 if current_window - last < self._cooldown_windows
             }
 
@@ -118,12 +159,7 @@ class CooldownMap:
 
     def import_state(self, last_batched: dict) -> None:
         """Replace state from an ``export_state`` snapshot (keys may be str)."""
-        restored = {
-            int(raw_idx): int(raw_window)
-            for raw_idx, raw_window in last_batched.items()
-        }
-        if any(idx < 0 or window < 0 for idx, window in restored.items()):
-            raise ValueError("cooldown snapshot contains a negative value")
+        restored = parse_prompt_cooldown_state(last_batched)
         with self._lock:
             self._last_batched = restored
 
@@ -149,7 +185,8 @@ class CooldownMap:
                     continue
                 rewarded_entries = list(record.get("batch", []))
                 rewarded_entries.extend(
-                    entry for entry in record.get("runners_up", [])
+                    entry
+                    for entry in record.get("runners_up", [])
                     if entry.get("rewarded", False)
                 )
                 for entry in rewarded_entries:
@@ -226,14 +263,7 @@ class ContentCooldownMap:
             }
 
     def import_state(self, last_selected: dict) -> None:
-        restored: dict[str, int] = {}
-        for digest, window in last_selected.items():
-            selected_window = int(window)
-            if selected_window < 0:
-                raise ValueError(
-                    "content cooldown snapshot contains a negative window"
-                )
-            restored[self._digest(str(digest))] = selected_window
+        restored = parse_content_cooldown_state(last_selected)
         with self._lock:
             self._last_selected = restored
 

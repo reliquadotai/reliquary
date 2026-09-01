@@ -146,7 +146,12 @@ from reliquary.validator.checkpoint_epoch_runtime import (
     intent_signing_bytes,
     plan_from_intent,
 )
-from reliquary.validator.cooldown import ContentCooldownMap, CooldownMap
+from reliquary.validator.cooldown import (
+    ContentCooldownMap,
+    CooldownMap,
+    parse_content_cooldown_state,
+    parse_prompt_cooldown_state,
+)
 from reliquary.validator.dedup import RolloutHashSet
 from reliquary.validator.errors import FatalProofPlaneError
 from reliquary.validator.observability import log_structured, runtime_revision
@@ -367,6 +372,14 @@ def _write_gzip_json_atomic(path: Path, value: dict[str, Any]) -> None:
             raw.flush()
             os.fsync(raw.fileno())
         os.replace(tmp_name, path)
+        directory_fd = os.open(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except Exception:
         try:
             os.unlink(tmp_name)
@@ -849,6 +862,10 @@ class ValidationService:
         # flight: a shared boolean would let the GPU half's archive of the
         # stashed window suppress the collecting window's tombstone.
         self._archive_enqueued_windows: set[int] = set()
+        # Highest window whose archive/tombstone is durably queued. Periodic
+        # cooldown snapshots may cover this watermark, never a merely opened
+        # or pipelined-stashed window whose seal side effects are still pending.
+        self._cooldown_durable_window: int = 0
         self._window_iteration_stage = "startup"
         self._utility_telemetry = UtilityTelemetryWriter()
         # Detached-trainer payload worker handle; the queue itself is a
@@ -5616,7 +5633,12 @@ class ValidationService:
         # hours, and queued payloads survive process restarts.
         from reliquary.infrastructure.archive_queue import get_archive_queue
         get_archive_queue().enqueue(first_batcher.window_start, archive)
-        self._archive_enqueued_windows.add(int(first_batcher.window_start))
+        archived_window = int(first_batcher.window_start)
+        self._archive_enqueued_windows.add(archived_window)
+        self._cooldown_durable_window = max(
+            getattr(self, "_cooldown_durable_window", 0),
+            archived_window,
+        )
 
     def _write_training_payload(
         self,
@@ -6069,6 +6091,10 @@ class ValidationService:
 
         get_archive_queue().enqueue(first_batcher.window_start, archive)
         self._archive_enqueued_windows.add(window_start)
+        self._cooldown_durable_window = max(
+            getattr(self, "_cooldown_durable_window", 0),
+            window_start,
+        )
         logger.error(
             "Window %d archived as aborted stage=%s error_type=%s",
             first_batcher.window_start,
@@ -6283,7 +6309,7 @@ class ValidationService:
                             self._windows_since_cooldown_snapshot
                             >= COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS
                         ):
-                            if await self._snapshot_all_cooldowns():
+                            if await self._snapshot_committed_cooldowns():
                                 self._windows_since_cooldown_snapshot = 0
                         continue
                     self._window_iteration_stage = "open"
@@ -6516,7 +6542,7 @@ class ValidationService:
                         self._windows_since_cooldown_snapshot
                         >= COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS
                     ):
-                        if await self._snapshot_all_cooldowns():
+                        if await self._snapshot_committed_cooldowns():
                             self._windows_since_cooldown_snapshot = 0
 
                     # set_weights is owned by a concurrent WeightOnlyValidator
@@ -6763,6 +6789,7 @@ class ValidationService:
         except Exception as exc:
             logger.exception("Failed to bootstrap durable window identity")
             raise RuntimeError("window identity bootstrap failed") from exc
+        self._cooldown_durable_window = self._window_n
 
         # 2. checkpoint_n + revision from HF commit history.
         #
@@ -6868,8 +6895,11 @@ class ValidationService:
             raise ValueError("cooldown snapshot is incomplete")
         if snapshot.get("run_id") != TRAINING_RUN_ID:
             raise ValueError("cooldown run id mismatch")
-        snapshot_window = int(snapshot.get("snapshot_window", -1))
-        if not 0 <= snapshot_window <= current_window:
+        snapshot_window = snapshot.get("snapshot_window")
+        if (
+            type(snapshot_window) is not int
+            or not 0 <= snapshot_window <= current_window
+        ):
             raise ValueError("cooldown snapshot window is outside history")
         envs = snapshot.get("envs")
         if not isinstance(envs, dict) or not env_names.issubset(envs):
@@ -6880,14 +6910,14 @@ class ValidationService:
                 raise ValueError(
                     f"cooldown snapshot env {env_name} must be an object"
                 )
-            for raw_idx, raw_window in state.items():
-                if int(raw_idx) < 0:
-                    raise ValueError("cooldown snapshot contains a negative index")
-                selected_window = int(raw_window)
-                if not 0 <= selected_window <= snapshot_window:
-                    raise ValueError(
-                        "cooldown snapshot selection is outside its history"
-                    )
+            parsed = parse_prompt_cooldown_state(state)
+            if any(
+                selected_window > snapshot_window
+                for selected_window in parsed.values()
+            ):
+                raise ValueError(
+                    "cooldown snapshot selection is outside its history"
+                )
         return snapshot_window
 
     async def _rebuild_cooldown_from_history(self) -> None:
@@ -6993,7 +7023,7 @@ class ValidationService:
             current_window, COOLDOWN_REBUILD_LOOKBACK,
         )
 
-    async def _load_cooldown_archives(
+    async def _load_archive_range(
         self,
         *,
         start_window: int,
@@ -7033,19 +7063,19 @@ class ValidationService:
                 or window_start not in expected
                 or window_start in merged
             ):
-                raise RuntimeError("remote cooldown archive identity mismatch")
+                raise RuntimeError("remote archive identity mismatch")
             merged[window_start] = archive
         for window_start, archive in local.items():
             if window_start in merged and merged[window_start] != archive:
-                raise RuntimeError("local and remote cooldown archives conflict")
+                raise RuntimeError("local and remote archives conflict")
             merged[window_start] = archive
 
         missing = expected.difference(merged)
         if remote_error is not None and missing:
-            raise RuntimeError("cooldown archive lookup failed") from remote_error
+            raise RuntimeError("archive lookup failed") from remote_error
         if require_all and missing:
             raise RuntimeError(
-                f"cooldown archive range is incomplete: {sorted(missing)}"
+                f"archive range is incomplete: {sorted(missing)}"
             )
         return [merged[window] for window in sorted(merged)]
 
@@ -7058,7 +7088,7 @@ class ValidationService:
         archives (used only when no snapshot is available)."""
         try:
             start_window = max(0, current_window + 1 - n)
-            archives = await self._load_cooldown_archives(
+            archives = await self._load_archive_range(
                 start_window=start_window,
                 end_window=current_window,
                 require_all=False,
@@ -7087,7 +7117,7 @@ class ValidationService:
         if gap > COOLDOWN_REBUILD_LOOKBACK:
             raise RuntimeError("cooldown gap exceeds the bounded replay horizon")
         try:
-            archives = await self._load_cooldown_archives(
+            archives = await self._load_archive_range(
                 start_window=current_window - gap + 1,
                 end_window=current_window,
                 require_all=True,
@@ -7101,7 +7131,11 @@ class ValidationService:
             logger.exception("Cooldown gap-replay failed; refusing startup")
             raise RuntimeError("cooldown gap replay failed") from exc
 
-    async def _snapshot_cooldown(self) -> bool:
+    async def _snapshot_cooldown(
+        self,
+        *,
+        snapshot_window: int | None = None,
+    ) -> bool:
         """Persist the per-env cooldown maps to R2, keyed by the training run id,
         so a restart restores the full cooldown without replaying history.
 
@@ -7112,7 +7146,9 @@ class ValidationService:
         """
         snapshot: dict[str, Any] | None = None
         try:
-            window = self._window_n
+            window = self._window_n if snapshot_window is None else snapshot_window
+            if type(window) is not int or not 0 <= window <= self._window_n:
+                raise ValueError("cooldown snapshot window is not committed")
 
             def _build() -> dict:
                 return {
@@ -7155,18 +7191,36 @@ class ValidationService:
                 "Snapshotted cooldown run=%s window=%d local=%s remote=%s "
                 "(sizes=%s)",
                 TRAINING_RUN_ID,
-                self._window_n,
+                window,
                 local_written,
                 remote_written,
                 {name: len(state) for name, state in self._cooldown_per_env.items()},
             )
         return local_written or remote_written
 
-    async def _snapshot_all_cooldowns(self) -> bool:
+    async def _snapshot_all_cooldowns(
+        self,
+        *,
+        snapshot_window: int | None = None,
+    ) -> bool:
         """Persist both cooldown identities before advancing retry cadence."""
-        prompt_written = await self._snapshot_cooldown()
-        content_written = await self._snapshot_content_cooldown()
+        prompt_written = await self._snapshot_cooldown(
+            snapshot_window=snapshot_window
+        )
+        content_written = await self._snapshot_content_cooldown(
+            snapshot_window=snapshot_window
+        )
         return prompt_written and content_written
+
+    async def _snapshot_committed_cooldowns(self) -> bool:
+        """Snapshot only through the latest durably recorded window."""
+        snapshot_window = min(
+            self._window_n,
+            getattr(self, "_cooldown_durable_window", 0),
+        )
+        return await self._snapshot_all_cooldowns(
+            snapshot_window=snapshot_window
+        )
 
     @staticmethod
     def _validate_content_snapshot(
@@ -7174,6 +7228,8 @@ class ValidationService:
         env_names: set[str],
         current_window: int,
     ) -> int:
+        if snapshot.get("schema_version") != 1:
+            raise ValueError("unsupported content cooldown snapshot schema")
         if snapshot.get("run_id") != TRAINING_RUN_ID:
             raise ValueError("content cooldown run id mismatch")
         if snapshot.get("complete") is not True:
@@ -7181,8 +7237,11 @@ class ValidationService:
         envs = snapshot.get("envs")
         if not isinstance(envs, dict) or set(envs) != env_names:
             raise ValueError("content cooldown environments are incomplete")
-        snapshot_window = int(snapshot.get("snapshot_window", -1))
-        if not 0 <= snapshot_window <= current_window:
+        snapshot_window = snapshot.get("snapshot_window")
+        if (
+            type(snapshot_window) is not int
+            or not 0 <= snapshot_window <= current_window
+        ):
             raise ValueError(
                 "content cooldown snapshot window is outside history"
             )
@@ -7192,9 +7251,10 @@ class ValidationService:
                 raise ValueError(
                     f"content cooldown env {env_name} must be an object"
                 )
+            parsed = parse_content_cooldown_state(state)
             if any(
-                not 0 <= int(selected_window) <= snapshot_window
-                for selected_window in state.values()
+                selected_window > snapshot_window
+                for selected_window in parsed.values()
             ):
                 raise ValueError(
                     "content cooldown selection is outside its history"
@@ -7339,14 +7399,20 @@ class ValidationService:
             )
             raise RuntimeError("content cooldown restore incomplete") from exc
 
-    async def _snapshot_content_cooldown(self) -> bool:
+    async def _snapshot_content_cooldown(
+        self,
+        *,
+        snapshot_window: int | None = None,
+    ) -> bool:
         """Persist locally before the best-effort R2 mirror.
 
         Returns whether a restart-safe local snapshot exists. The caller uses
         this as a startup gate; periodic callers may continue from the complete
         in-memory map while health reports a later disk failure.
         """
-        window = self._window_n
+        window = self._window_n if snapshot_window is None else snapshot_window
+        if type(window) is not int or not 0 <= window <= self._window_n:
+            raise ValueError("content cooldown snapshot window is not committed")
 
         def _build() -> dict[str, Any]:
             return {
@@ -7416,16 +7482,26 @@ class ValidationService:
 
     async def _rebuild_hashes_from_history(self) -> None:
         """Rebuild ``self._hash_set`` from the last HASH_DEDUP_RETENTION_WINDOWS
-        archives. Horizon is independent of cooldown — see constants docstring.
-        Compat path covers pre-feature archives (no ``hash`` field) by
-        recomputing from ``tokens``.
+        durable archives, merging the remote store with the local pending
+        queue. Unknown or incomplete history fails startup closed: otherwise a
+        paid rollout could be replayed during an object-store outage.
         """
         try:
             current_window = self._window_n
+            if current_window <= 0:
+                self._hash_set.rebuild_from_history(
+                    [], current_window=current_window,
+                )
+                return
+            start_window = max(
+                1,
+                current_window + 1 - HASH_DEDUP_RETENTION_WINDOWS,
+            )
             archives = await asyncio.wait_for(
-                storage.list_recent_datasets(
-                    current_window=current_window + 1,
-                    n=HASH_DEDUP_RETENTION_WINDOWS,
+                self._load_archive_range(
+                    start_window=start_window,
+                    end_window=current_window,
+                    require_all=True,
                 ),
                 timeout=_STARTUP_HASH_REBUILD_TIMEOUT_SECONDS,
             )
@@ -7438,16 +7514,11 @@ class ValidationService:
                 len(archives), HASH_DEDUP_RETENTION_WINDOWS,
                 current_window, len(self._hash_set),
             )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Hash-set rebuild from history timed out after %.1fs; "
-                "starting empty",
-                _STARTUP_HASH_REBUILD_TIMEOUT_SECONDS,
-            )
-        except Exception:
+        except Exception as exc:
             logger.exception(
-                "Failed to rebuild hash set from history; starting empty"
+                "Failed to rebuild complete hash history; refusing startup"
             )
+            raise RuntimeError("hash history rebuild failed") from exc
 
     async def _wait_for_next_drand_boundary(self) -> None:
         """Align window OPEN to the next drand round boundary.

@@ -1,6 +1,7 @@
 """Run-keyed cooldown snapshot: restore + gap-replay, reset on a fresh run,
 and the snapshot write shape. Storage is mocked — no R2."""
 
+import os
 from dataclasses import dataclass
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -330,6 +331,52 @@ def test_prompt_snapshot_schema_requires_complete_v2_records():
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("snapshot_window", True),
+        ("snapshot_window", 10.0),
+        ("snapshot_window", "10"),
+        ("selected_window", False),
+        ("selected_window", 9.0),
+        ("selected_window", "9"),
+    ],
+)
+def test_prompt_snapshot_rejects_numeric_coercion(field, value):
+    from reliquary.validator.service import ValidationService
+
+    snapshot = {
+        "schema_version": 2,
+        "run_id": "default",
+        "snapshot_window": value if field == "snapshot_window" else 10,
+        "complete": True,
+        "envs": {
+            "fake": {"1": value if field == "selected_window" else 9}
+        },
+    }
+    with pytest.raises(ValueError):
+        ValidationService._validate_cooldown_snapshot(
+            snapshot, {"fake"}, 10
+        )
+
+
+@pytest.mark.parametrize("key", ["01", "+1", " 1", "1 "])
+def test_prompt_snapshot_requires_canonical_prompt_keys(key):
+    from reliquary.validator.service import ValidationService
+
+    snapshot = {
+        "schema_version": 2,
+        "run_id": "default",
+        "snapshot_window": 10,
+        "complete": True,
+        "envs": {"fake": {key: 9}},
+    }
+    with pytest.raises(ValueError, match="canonical decimal"):
+        ValidationService._validate_cooldown_snapshot(
+            snapshot, {"fake"}, 10
+        )
+
+
 @pytest.mark.asyncio
 async def test_snapshot_pair_advances_only_when_both_identities_are_durable():
     svc = _service(77)
@@ -340,6 +387,90 @@ async def test_snapshot_pair_advances_only_when_both_identities_are_durable():
 
     svc._snapshot_content_cooldown.return_value = True
     assert await svc._snapshot_all_cooldowns() is True
+
+
+@pytest.mark.asyncio
+async def test_pipelined_snapshot_uses_last_durable_window(tmp_path):
+    from reliquary.validator.service import (
+        _content_cooldown_local_path,
+        _cooldown_local_path,
+        _read_gzip_json,
+    )
+
+    svc = _service(11)
+    svc._cooldown_durable_window = 10
+    svc._cooldown_per_env["fake"].record_batched(1, 10)
+    svc._cooldown_per_env["fake"].record_batched(2, 11)
+    svc._content_cooldown_per_env["fake"].record_selected("a" * 64, 10)
+    svc._content_cooldown_per_env["fake"].record_selected("b" * 64, 11)
+
+    with patch.dict(
+        "os.environ", {"RELIQUARY_STATE_DIR": str(tmp_path)}
+    ), patch(
+        "reliquary.infrastructure.storage.upload_json",
+        new=AsyncMock(return_value=True),
+    ):
+        assert await svc._snapshot_committed_cooldowns() is True
+        prompt = _read_gzip_json(_cooldown_local_path("default"))
+        content = _read_gzip_json(_content_cooldown_local_path("default"))
+
+    assert prompt["snapshot_window"] == 10
+    assert prompt["envs"]["fake"] == {"1": 10}
+    assert content["snapshot_window"] == 10
+    assert content["envs"]["fake"] == {"a" * 64: 10}
+
+
+@pytest.mark.asyncio
+async def test_pipelined_restart_replays_window_after_snapshot_watermark(
+    tmp_path,
+):
+    from reliquary.infrastructure.archive_queue import ArchiveQueue
+
+    with patch.dict(
+        "os.environ", {"RELIQUARY_STATE_DIR": str(tmp_path)}
+    ), patch(
+        "reliquary.infrastructure.storage.upload_json",
+        new=AsyncMock(return_value=True),
+    ):
+        before = _service(11)
+        before._cooldown_per_env["fake"].record_batched(1, 10)
+        assert await before._snapshot_cooldown(snapshot_window=10) is True
+
+        queue = ArchiveQueue(str(tmp_path / "pending_archives"))
+        queue.enqueue(
+            11,
+            {
+                "window_start": 11,
+                "window_status": "completed",
+                "environment": "fake",
+                "batch": [{"prompt_idx": 99}],
+            },
+        )
+
+        restarted = _service(11)
+        restarted._archive_queue = queue
+        with patch(
+            "reliquary.infrastructure.storage.download_json",
+            new=AsyncMock(return_value=None),
+        ), patch(
+            "reliquary.infrastructure.storage.list_recent_datasets",
+            new=AsyncMock(return_value=[]),
+        ):
+            await restarted._rebuild_cooldown_from_history()
+
+    assert restarted._cooldown_per_env["fake"].is_in_cooldown(99, 11)
+
+
+def test_atomic_snapshot_fsyncs_file_and_parent_directory(tmp_path):
+    from reliquary.validator.service import _write_gzip_json_atomic
+
+    real_fsync = os.fsync
+    with patch(
+        "reliquary.validator.service.os.fsync", wraps=real_fsync
+    ) as fsync:
+        _write_gzip_json_atomic(tmp_path / "snapshot.json.gz", {"ok": True})
+
+    assert fsync.call_count == 2
 
 
 @pytest.mark.asyncio
@@ -357,6 +488,38 @@ async def test_corrupt_snapshot_fails_closed_instead_of_resetting_cooldown():
         with pytest.raises(RuntimeError, match="no valid durable copy"):
             await svc._rebuild_cooldown_from_history()
     assert len(svc._cooldown_per_env["fake"]) == 0
+
+
+@pytest.mark.parametrize(
+    ("snapshot_window", "digest", "selected_window"),
+    [
+        (True, "a" * 64, 9),
+        (10.0, "a" * 64, 9),
+        ("10", "a" * 64, 9),
+        (10, "A" * 64, 9),
+        (10, "a" * 64, False),
+        (10, "a" * 64, 9.0),
+        (10, "a" * 64, "9"),
+    ],
+)
+def test_content_snapshot_requires_canonical_durable_values(
+    snapshot_window,
+    digest,
+    selected_window,
+):
+    from reliquary.validator.service import ValidationService
+
+    snapshot = {
+        "schema_version": 1,
+        "run_id": "default",
+        "snapshot_window": snapshot_window,
+        "complete": True,
+        "envs": {"fake": {digest: selected_window}},
+    }
+    with pytest.raises(ValueError):
+        ValidationService._validate_content_snapshot(
+            snapshot, {"fake"}, 10
+        )
 
 
 @pytest.mark.asyncio

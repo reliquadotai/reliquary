@@ -1,5 +1,8 @@
 """CooldownMap — in-memory lifecycle."""
 
+import json
+from pathlib import Path
+
 import pytest
 
 from reliquary.validator.cooldown import ContentCooldownMap, CooldownMap
@@ -83,11 +86,6 @@ def test_content_cooldown_rejects_truncated_digest():
     content = ContentCooldownMap(cooldown_windows=50)
     with pytest.raises(ValueError, match="64 lowercase hex"):
         content.record_selected("ab", window=100)
-
-
-import json
-import tempfile
-from pathlib import Path
 
 
 def test_persist_and_load_roundtrip(tmp_path: Path):
@@ -227,3 +225,36 @@ def test_snapshot_import_rejects_negative_values():
     content = ContentCooldownMap(cooldown_windows=1000)
     with pytest.raises(ValueError, match="negative"):
         content.import_state({"a" * 64: -1})
+
+
+@pytest.mark.parametrize("value", [True, 1.0, "1"])
+def test_prompt_snapshot_import_rejects_coerced_windows(value):
+    prompt = CooldownMap(cooldown_windows=1000)
+    with pytest.raises(ValueError, match="non-negative integer"):
+        prompt.import_state({"1": value})
+
+
+@pytest.mark.parametrize("key", [True, 1.0, "01", "+1", " 1"])
+def test_prompt_snapshot_import_rejects_noncanonical_keys(key):
+    prompt = CooldownMap(cooldown_windows=1000)
+    with pytest.raises(ValueError):
+        prompt.import_state({key: 1})
+
+
+def test_prompt_snapshot_import_rejects_normalized_duplicate_keys():
+    prompt = CooldownMap(cooldown_windows=1000)
+    with pytest.raises(ValueError, match="duplicate prompt keys"):
+        prompt.import_state({1: 1, "1": 1})
+
+
+@pytest.mark.parametrize("value", [False, 1.0, "1"])
+def test_content_snapshot_import_rejects_coerced_windows(value):
+    content = ContentCooldownMap(cooldown_windows=1000)
+    with pytest.raises(ValueError, match="non-negative integer"):
+        content.import_state({"a" * 64: value})
+
+
+def test_content_snapshot_import_requires_canonical_digest():
+    content = ContentCooldownMap(cooldown_windows=1000)
+    with pytest.raises(ValueError, match="lowercase hex"):
+        content.import_state({"A" * 64: 1})
