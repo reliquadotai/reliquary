@@ -210,9 +210,8 @@ replayed under a new binding.
 
 The planner reports generated GPU-seconds, prepared and released groups,
 stale/ambiguous discards, lane/environment coverage, underfill opportunity,
-backup activation, and queue age. Local scheduling may use deterministic lane
-order or an estimated eligible-value-per-second heuristic. Local scheduling
-metadata is never sent to the validator and never enters ranking.
+backup activation, and queue age. Work is prepared in deterministic lane order;
+local planner metadata is never sent to the validator and never enters ranking.
 
 ## Restart and equivocation
 

@@ -84,7 +84,6 @@ class ShadowPlannerConfig:
     max_queue_bytes: int = 512 * 1024 * 1024
     max_groups_per_environment_window: int = 16
     target_groups_per_environment_window: int = 16
-    scheduling_policy: Literal["lane_order", "value_per_gpu_second"] = "lane_order"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "spool_root", Path(self.spool_root))
@@ -99,13 +98,6 @@ class ShadowPlannerConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be positive")
-        if self.scheduling_policy not in {
-            "lane_order",
-            "value_per_gpu_second",
-        }:
-            raise ValueError("unsupported shadow scheduling policy")
-
-
 @dataclass(frozen=True, slots=True)
 class ShadowWorkSpec:
     window_offset: int
@@ -113,8 +105,6 @@ class ShadowWorkSpec:
     prompt_idx: int
     prompt_content_sha256: str
     estimated_payload_bytes: int = 1
-    expected_eligible_training_value: float = 1.0
-    estimated_gpu_seconds: float = 1.0
 
     def __post_init__(self) -> None:
         if (
@@ -135,27 +125,6 @@ class ShadowWorkSpec:
             or self.estimated_payload_bytes < 1
         ):
             raise ValueError("estimated_payload_bytes must be positive")
-        if (
-            isinstance(self.expected_eligible_training_value, bool)
-            or not isinstance(
-                self.expected_eligible_training_value,
-                (int, float),
-            )
-            or not math.isfinite(self.expected_eligible_training_value)
-            or self.expected_eligible_training_value < 0
-        ):
-            raise ValueError(
-                "expected_eligible_training_value must be finite and non-negative"
-            )
-        if (
-            isinstance(self.estimated_gpu_seconds, bool)
-            or not isinstance(self.estimated_gpu_seconds, (int, float))
-            or not math.isfinite(self.estimated_gpu_seconds)
-            or self.estimated_gpu_seconds <= 0
-        ):
-            raise ValueError("estimated_gpu_seconds must be finite and positive")
-
-
 @dataclass(frozen=True, slots=True)
 class PreparedGroup:
     payload: Mapping[str, Any]
@@ -198,8 +167,6 @@ class EpochWorkBinding:
     prompt_slice_stop: int
     prompt_idx: int
     prompt_content_sha256: str
-    expected_eligible_training_value: float = 1.0
-    estimated_gpu_seconds: float = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -386,14 +353,6 @@ class EpochShadowPlanner:
             raise ValueError("bound prompt is outside its slice")
         if record.reservation_bytes < 1:
             raise ValueError("reservation_bytes must be positive")
-        if (
-            not math.isfinite(binding.expected_eligible_training_value)
-            or binding.expected_eligible_training_value < 0
-            or not math.isfinite(binding.estimated_gpu_seconds)
-            or binding.estimated_gpu_seconds <= 0
-        ):
-            raise ValueError("invalid local scheduling estimates")
-
     def _write_record(self, directory: Path, record: ShadowRecord) -> Path:
         path = directory / f"{record.identity}.json"
         self._write(path, self._record_dict(record))
@@ -606,10 +565,6 @@ class EpochShadowPlanner:
                 prompt_slice_stop=prompt_slice.stop,
                 prompt_idx=spec.prompt_idx,
                 prompt_content_sha256=spec.prompt_content_sha256,
-                expected_eligible_training_value=(
-                    float(spec.expected_eligible_training_value)
-                ),
-                estimated_gpu_seconds=float(spec.estimated_gpu_seconds),
             )
             identity = self._identity(binding)
             paths = (
@@ -787,22 +742,15 @@ class EpochShadowPlanner:
         if not planned:
             return None
 
-        def scheduling_key(item):
-            binding = item[1].binding
-            deterministic = (
-                binding.window_offset,
-                binding.prompt_idx,
-                binding.environment,
+        path, record = min(
+            planned,
+            key=lambda item: (
+                item[1].binding.window_offset,
+                item[1].binding.prompt_idx,
+                item[1].binding.environment,
                 item[1].identity,
-            )
-            if self.config.scheduling_policy == "lane_order":
-                return deterministic
-            value_per_second = (
-                binding.expected_eligible_training_value / binding.estimated_gpu_seconds
-            )
-            return (-value_per_second, *deterministic)
-
-        path, record = min(planned, key=scheduling_key)
+            ),
+        )
         generating = replace(
             record,
             status="generating",
@@ -1095,12 +1043,6 @@ class EpochShadowPlanner:
             "gpu_seconds_generated": sum(
                 record.actual_gpu_seconds or 0.0 for record in all_records
             ),
-            "expected_eligible_training_value_prepared": sum(
-                record.binding.expected_eligible_training_value
-                for record in all_records
-                if record.status in {"prepared", "released"}
-            ),
-            "scheduling_policy": self.config.scheduling_policy,
             "valid_groups_prepared_local": sum(
                 record.status in {"prepared", "released"} for record in all_records
             ),
