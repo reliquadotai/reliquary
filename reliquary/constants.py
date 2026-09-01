@@ -820,9 +820,14 @@ if (
 # protocol's batch shape instead of refusing to run. Same shape as the
 # neighbouring EXPERIMENTAL_CHECKPOINT_EPOCH capability, which fails closed
 # unless CHECKPOINT_PUBLISH_INTERVAL_WINDOWS is exactly its required horizon.
-FILL_CLOSED_ENABLED = PROTOCOL_VERSION >= 6 and _os.environ.get(
+_FILL_CLOSED_REQUESTED = _os.environ.get(
     "RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
+_FILL_CLOSED_PROFILE_ID = "qwen3-4b-base-dapo-fill-closed-v6"
+FILL_CLOSED_ENABLED = (
+    PROTOCOL_PROFILE_ID == _FILL_CLOSED_PROFILE_ID
+    and _FILL_CLOSED_REQUESTED
+)
 
 # The two experimental capabilities are mutually exclusive, and a box with
 # both armed must not boot (R30). They collide on the training journal:
@@ -834,7 +839,7 @@ FILL_CLOSED_ENABLED = PROTOCOL_VERSION >= 6 and _os.environ.get(
 #     assembler early, sealing a window that is still collecting.
 # Neither is a runtime condition anything downstream can recover from, so
 # it is refused here, where an operator reads the message.
-if FILL_CLOSED_ENABLED and EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED:
+if _FILL_CLOSED_REQUESTED and EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED:
     raise ValueError(
         "RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED and "
         "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED cannot both be "
@@ -842,6 +847,22 @@ if FILL_CLOSED_ENABLED and EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED:
         "window journal key, which collides with the fill-closed encoded "
         "key space, and an epoch opening mid-window closes that window's "
         "batch assembler early. Disable one."
+    )
+if _FILL_CLOSED_REQUESTED and PROTOCOL_PROFILE_ID != _FILL_CLOSED_PROFILE_ID:
+    raise ValueError(
+        "RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED requires the exact "
+        f"{_FILL_CLOSED_PROFILE_ID!r} profile"
+    )
+if EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED:
+    raise ValueError(
+        "checkpoint-epoch runtime activation requires a coordinated release "
+        "contract and dedicated profile; no current production or "
+        "experimental profile is qualified"
+    )
+if PROTOCOL_PROFILE_ID == _FILL_CLOSED_PROFILE_ID and not FILL_CLOSED_ENABLED:
+    raise ValueError(
+        f"the {_FILL_CLOSED_PROFILE_ID!r} profile requires its explicit "
+        "experimental fill-closed capability"
     )
 
 # Proven groups that close one environment. 16 optimizer steps x B_BATCH.

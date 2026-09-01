@@ -45,16 +45,17 @@ def test_the_capability_cannot_be_armed_under_a_non_v6_profile():
     }
     base_env["RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED"] = "1"
 
-    # Armed under v4: must fail closed despite the env var asking for it.
+    # Armed under v4: an incoherent request must refuse to boot rather than
+    # silently ignore the flag and run a different market.
     v4_env = dict(base_env, RELIQUARY_PROTOCOL_PROFILE="qwen3-4b-base-dapo-v4")
     v4_result = subprocess.run(
         [sys.executable, "-c", script],
-        check=True,
         capture_output=True,
         text=True,
         env=v4_env,
     )
-    assert v4_result.stdout.strip() == "False"
+    assert v4_result.returncode != 0
+    assert "requires the exact" in v4_result.stderr
 
     # Armed under v6: the same env var now takes effect.
     v6_env = dict(
@@ -297,12 +298,26 @@ def test_the_two_experimental_capabilities_refuse_to_run_together():
     assert "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED" in result.stderr
 
 
-def test_checkpoint_epoch_alone_still_imports():
-    """The refusal is about the PAIR: the epoch capability on its own (v6
-    profile, fill-closed disarmed) is untouched by this branch."""
+def test_checkpoint_epoch_refuses_to_repurpose_an_existing_profile():
+    """No V4/V5/V6 profile carries the epoch market contract yet."""
+    for profile_id in (
+        "qwen3-4b-base-dapo-reasoning-v5",
+        "qwen3-4b-base-dapo-fill-closed-v6",
+    ):
+        result = _constants_under(
+            RELIQUARY_PROTOCOL_PROFILE=profile_id,
+            RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED="0",
+            RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED="1",
+        )
+
+        assert result.returncode != 0
+        assert "dedicated profile" in result.stderr
+
+
+def test_fill_profile_refuses_to_run_as_an_ordinary_auction():
     result = _constants_under(
         RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED="0",
-        RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED="1",
     )
 
-    assert result.returncode == 0, result.stderr
+    assert result.returncode != 0
+    assert "requires its explicit" in result.stderr
