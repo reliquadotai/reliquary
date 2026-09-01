@@ -22,8 +22,8 @@ streaming implementation.  It provides the following fail-closed rules:
 1. Only `primary` and already activated `active_backup` tickets can be staged.
 2. Every candidate is bound to the epoch, manifest, checkpoint, profile,
    contract, exact logical lane, and that lane's generation randomness.
-3. The frozen ticket `selection_rank`, not request arrival, defines dispatch
-   order.
+3. The frozen ticket `selection_rank`, unique inside each lane, not request
+   arrival, defines dispatch order.
 4. One payload digest can have only one proof owner in the epoch.
 5. A repeated dispatch or conflicting terminal result is rejected.
 6. Every candidate in a lane must be passed or rejected before the lane can be
@@ -35,7 +35,10 @@ streaming implementation.  It provides the following fail-closed rules:
    call ran.
 
 The coordinator snapshot is canonical JSON so a durable journal can persist it
-atomically before dispatch and after a terminal result.
+atomically before dispatch and after a terminal result. Recovery rejects
+unknown nested fields, illegal pre-freeze state, duplicate ranks or lane
+claims, and any finalization digest that cannot be recomputed from terminal
+passed records.
 
 ## Runtime activation requirements
 

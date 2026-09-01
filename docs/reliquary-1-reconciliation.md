@@ -51,10 +51,12 @@ The reconciliation branch currently contains:
 | utility/difficulty portfolio, operator rounds and fresh post-close tie beacon | implemented without changing production ranking |
 | bounded proof scheduler, progressive trainer journal and cursor telemetry | implemented in the separate disabled fill experiment |
 | coherent fill horizon, capacity and read-only progress state | implemented for qualification of that experiment, not selected as the v1 market |
+| create-only fill journal receipts and checkpoint-adoption rotation barrier | implemented behind the disabled fill experiment |
 | immutable release contracts and environment/task/trajectory ABI | implemented as inactive composition boundaries |
+| profile/capability activation atomicity | implemented fail-closed; no existing V4/V5/V6 profile may activate the checkpoint epoch |
 | ticket-only streaming proof shared across all 16 concurrent lanes | integration gate; must preserve arrival-neutral final selection and restart recovery |
 | trainer-paced per-lane epoch barriers | target contract; the current epoch uses one common generation horizon before ordered finalization |
-| end-to-end durable proof-result recovery and checkpoint adoption | activation gate |
+| end-to-end epoch proof-result and partial-window economic recovery | activation gate |
 | external adapter conformance and hardware-backed end-to-end qualification | activation gate |
 
 The pull request remains a Draft until every activation gate is either
@@ -340,6 +342,20 @@ Contradictory bytes, missing parents, a cursor beyond the journal, or an
 unverifiable signature stop the epoch for operator review. Recovery never
 guesses which of two states was intended. Temporary transport retries use
 idempotency keys; semantic retries across a changed binding are forbidden.
+
+The disabled fill implementation now commits a hidden, fsynced payload body
+and retained SHA-256 receipt before making a journal slot visible. The
+assembler advances its index and accrues rewards only after that durable
+commit; identical retries are no-ops and conflicting bytes fail closed. Its
+persisted between-window barrier binds the complete journal range to the
+parent checkpoint and, for a full publication cadence, stays closed until both
+trainer consumption and exact successor-checkpoint adoption are observed.
+
+This does not yet reconstruct ownership of a partially completed live window.
+Receipt-backed bytes survive restart, but in-memory proof, admission and
+assembler reward state does not. Activation therefore requires either durable
+transaction state for that lifecycle or an explicit whole-window
+abort/quarantine protocol. Ambiguous replay is not a recovery mechanism.
 
 ## Compatibility and code layout
 
