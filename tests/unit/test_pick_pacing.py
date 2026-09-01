@@ -547,14 +547,14 @@ def _rotation_service(monkeypatch, *, key, cursor=None, enabled=True,
             source_window=WINDOW,
             required_journal_key=key,
             parent_checkpoint_n=7,
-            parent_revision="parent-revision",
+            parent_revision="7" * 40,
             durable_payload_count=3,
             requires_successor=requires_successor,
         )
     service._checkpoint_store = SimpleNamespace(
         repo_id="org/repo",
         current_manifest=lambda: SimpleNamespace(
-            checkpoint_n=7, revision="parent-revision"
+            checkpoint_n=7, revision="7" * 40
         )
     )
     service._window_n = WINDOW
@@ -675,7 +675,7 @@ def test_the_arming_records_the_last_emitted_batchs_journal_key(monkeypatch):
     service._fill_closed_rotation_gate = SimpleNamespace(stale=True)
     service._checkpoint_store = SimpleNamespace(
         current_manifest=lambda: SimpleNamespace(
-            checkpoint_n=7, revision="parent-revision"
+            checkpoint_n=7, revision="7" * 40
         )
     )
 
@@ -692,8 +692,55 @@ def test_the_arming_records_the_last_emitted_batchs_journal_key(monkeypatch):
     gate = service._fill_closed_rotation_gate
     assert gate.required_journal_key == encoded_window_journal_key(WINDOW, 2)
     assert gate.parent_checkpoint_n == 7
-    assert gate.parent_revision == "parent-revision"
+    assert gate.parent_revision == "7" * 40
     assert gate.requires_successor is False
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("next_batch_index", True),
+        ("next_batch_index", 3.0),
+        ("next_batch_index", "3"),
+        ("window_start", True),
+        ("window_start", 42.0),
+        ("window_start", "42"),
+        ("durable_payload_count", False),
+        ("durable_payload_count", 3.0),
+        ("durable_payload_count", "3"),
+    ],
+)
+def test_rotation_arming_does_not_coerce_persisted_fields(
+    monkeypatch,
+    field,
+    value,
+):
+    import reliquary.infrastructure.training_payload_queue as queue_module
+    import reliquary.validator.service as service_module
+
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
+    monkeypatch.setattr(service_module, "FILL_CLOSED_ENABLED", True)
+    service = ValidationService.__new__(ValidationService)
+    service._fill_closed_rotation_store = None
+    service._fill_closed_rotation_gate = None
+    assembler = {
+        "window_start": WINDOW,
+        "next_batch_index": 3,
+        "durable_payload_count": 3,
+    }
+    assembler[field] = value
+    service._fill_closed_assembler = SimpleNamespace(**assembler)
+    service._checkpoint_store = SimpleNamespace(
+        current_manifest=lambda: SimpleNamespace(
+            checkpoint_n=7,
+            revision="7" * 40,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="not canonical"):
+        service._arm_fill_closed_rotation_gate()
+
+    assert service._fill_closed_rotation_gate is None
 
 
 def test_the_arming_is_consumed_by_one_wait(monkeypatch):
@@ -730,13 +777,13 @@ def test_full_window_requires_covering_checkpoint_adoption(monkeypatch):
         assert not task.done()
         gate = service._fill_closed_rotation_gate.record_adoption(
             checkpoint_n=8,
-            revision="successor-revision",
+            revision="8" * 40,
             trained_cursor=last,
         )
         service._fill_closed_rotation_gate = gate
         service._checkpoint_store = SimpleNamespace(
             current_manifest=lambda: SimpleNamespace(
-                checkpoint_n=8, revision="successor-revision"
+                checkpoint_n=8, revision="8" * 40
             )
         )
         return await task

@@ -22,6 +22,28 @@ from reliquary.trainer.publisher import CANDIDATE_MANIFEST_KEY
 logger = logging.getLogger(__name__)
 
 
+def _environment_string(
+    env: Mapping[str, str],
+    key: str,
+) -> str:
+    value = env.get(key, "")
+    if not isinstance(value, str):
+        raise ValueError(f"{key} must be configured as a string")
+    return value.strip()
+
+
+def _environment_nonnegative_int(
+    env: Mapping[str, str],
+    key: str,
+) -> int:
+    raw = _environment_string(env, key)
+    try:
+        value = int(raw, 10)
+    except ValueError as exc:
+        raise ValueError(f"{key} must contain a base-10 integer") from exc
+    return require_checkpoint_number(value, field=key)
+
+
 def resolve_resume_point(
     fetch_fn: Callable[[str], bytes | None],
     *,
@@ -35,6 +57,8 @@ def resolve_resume_point(
     raw = fetch_fn(CANDIDATE_MANIFEST_KEY)
     if raw is not None:
         manifest = strict_json_loads(raw)
+        if not isinstance(manifest, dict):
+            raise ValueError("trainer resume manifest must be a JSON object")
         mismatches = {
             key: (manifest.get(key), expected)
             for key, expected in (expected_identity or {}).items()
@@ -49,7 +73,10 @@ def resolve_resume_point(
             )
             return (
                 revision,
-                int(manifest["trained_window_cursor"]),
+                require_checkpoint_number(
+                    manifest.get("trained_window_cursor"),
+                    field="trainer resume manifest cursor",
+                ),
                 checkpoint_n,
             )
         logger.warning(
@@ -57,7 +84,10 @@ def resolve_resume_point(
             "using the explicit bootstrap configuration",
             ", ".join(sorted(mismatches)),
         )
-    bootstrap = str(env.get("RELIQUARY_TRAINER_BOOTSTRAP_CURSOR", "")).strip()
+    bootstrap = _environment_string(
+        env,
+        "RELIQUARY_TRAINER_BOOTSTRAP_CURSOR",
+    )
     if not bootstrap:
         logger.critical(
             "no candidate manifest in R2 and no "
@@ -68,9 +98,10 @@ def resolve_resume_point(
     # Mid-run bootstrap (shadow start, cutover from in-process training):
     # begin from the validator's last PUBLISHED checkpoint, not the base
     # model, so the shadow comparison and the cutover are seamless.
-    raw_revision = str(
-        env.get("RELIQUARY_TRAINER_BOOTSTRAP_REVISION", "")
-    ).strip()
+    raw_revision = _environment_string(
+        env,
+        "RELIQUARY_TRAINER_BOOTSTRAP_REVISION",
+    )
     revision = (
         require_immutable_checkpoint_revision(
             raw_revision,
@@ -79,13 +110,17 @@ def resolve_resume_point(
         if raw_revision
         else None
     )
-    raw_n = str(env.get("RELIQUARY_TRAINER_CHECKPOINT_N", "")).strip()
+    raw_n = _environment_string(env, "RELIQUARY_TRAINER_CHECKPOINT_N")
     checkpoint_n = (
-        require_checkpoint_number(
-            int(raw_n),
-            field="trainer bootstrap checkpoint number",
-        )
+        _environment_nonnegative_int(env, "RELIQUARY_TRAINER_CHECKPOINT_N")
         if raw_n
         else 0
     )
-    return revision, int(bootstrap), checkpoint_n
+    return (
+        revision,
+        _environment_nonnegative_int(
+            env,
+            "RELIQUARY_TRAINER_BOOTSTRAP_CURSOR",
+        ),
+        checkpoint_n,
+    )

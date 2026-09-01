@@ -1556,11 +1556,17 @@ class ValidationService:
         )
 
         assembler = getattr(self, "_fill_closed_assembler", None)
-        emitted = int(getattr(assembler, "next_batch_index", 0) or 0)
+        emitted = getattr(assembler, "next_batch_index", 0)
+        if type(emitted) is not int or emitted < 0:
+            raise RuntimeError(
+                "fill-closed assembler batch index is not canonical"
+            )
         window_start = getattr(assembler, "window_start", None)
-        if window_start is None or (emitted <= 0 and not reserve_full_range):
+        if window_start is None or (emitted == 0 and not reserve_full_range):
             self._clear_fill_closed_rotation_gate()
             return
+        if type(window_start) is not int or window_start < 0:
+            raise RuntimeError("fill-closed source window is not canonical")
         index = (
             FILL_CLOSED_EMISSIONS_PER_WINDOW - 1
             if reserve_full_range
@@ -1571,16 +1577,18 @@ class ValidationService:
             raise RuntimeError(
                 "fill-closed rotation cannot bind an unpublished parent"
             )
-        payload_count = int(
-            getattr(assembler, "durable_payload_count", 0) or 0
-        )
+        payload_count = getattr(assembler, "durable_payload_count", 0)
+        if type(payload_count) is not int or payload_count < 0:
+            raise RuntimeError(
+                "fill-closed durable payload count is not canonical"
+            )
         gate = FillClosedRotationGate(
-            source_window=int(window_start),
+            source_window=window_start,
             required_journal_key=encoded_window_journal_key(
-                int(window_start), index
+                window_start, index
             ),
-            parent_checkpoint_n=int(checkpoint.checkpoint_n),
-            parent_revision=str(checkpoint.revision),
+            parent_checkpoint_n=checkpoint.checkpoint_n,
+            parent_revision=checkpoint.revision,
             durable_payload_count=payload_count,
             requires_successor=(
                 payload_count >= FILL_CLOSED_EMISSIONS_PER_WINDOW
@@ -7123,7 +7131,7 @@ class ValidationService:
             archives = await self._load_archive_range(
                 start_window=start_window,
                 end_window=current_window,
-                require_all=False,
+                require_all=True,
             )
             for env_name, cooldown_map in self._cooldown_per_env.items():
                 cooldown_map.rebuild_from_history(

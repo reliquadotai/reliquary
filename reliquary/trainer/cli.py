@@ -12,8 +12,39 @@ import os
 from pathlib import Path
 import threading
 import time
+from typing import Mapping
+
+from reliquary.shared.checkpoint_identity import require_checkpoint_number
 
 logger = logging.getLogger(__name__)
+
+
+def _profile_nonnegative_int(
+    profile: Mapping[str, object],
+    key: str,
+    *,
+    default: int | None = None,
+) -> int | None:
+    value = profile.get(key, default)
+    if value is None:
+        return None
+    return require_checkpoint_number(
+        value,
+        field=f"trainer checkpoint profile {key}",
+    )
+
+
+def _environment_positive_int(name: str, default: str) -> int:
+    raw = os.environ.get(name, default)
+    if not isinstance(raw, str):
+        raise ValueError(f"{name} must be configured as a string")
+    try:
+        value = int(raw.strip(), 10)
+    except ValueError as exc:
+        raise ValueError(f"{name} must contain a base-10 integer") from exc
+    if value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
 
 
 def _r2_client():
@@ -173,7 +204,14 @@ def run_train_worker(*, shadow: bool = False) -> None:
         profile = validate_checkpoint_profile(snapshot_dir, required=True)
         # The PROFILE is authoritative for run state; the manifest cursor
         # was only a hint for which snapshot to fetch.
-        cursor = int(profile.get("trained_window_cursor", cursor))
+        profile_cursor = _profile_nonnegative_int(
+            profile,
+            "trained_window_cursor",
+            default=cursor,
+        )
+        if profile_cursor is None:
+            raise ValueError("trainer checkpoint profile cursor is missing")
+        cursor = profile_cursor
         # C3/R25: a checkpoint published before the v6 cutover carries a
         # cursor in RAW window space; this journal reads the encoded space
         # (window * FILL_CLOSED_EMISSIONS_PER_WINDOW + batch). Migrate here,
@@ -190,8 +228,10 @@ def run_train_worker(*, shadow: bool = False) -> None:
                 key_space, cursor, migrated,
             )
         cursor = migrated
-        raw_step = profile.get("lr_schedule_step")
-        lr_schedule_step = int(raw_step) if raw_step is not None else None
+        lr_schedule_step = _profile_nonnegative_int(
+            profile,
+            "lr_schedule_step",
+        )
         model_path = str(snapshot_dir)
         load_kwargs = {}
         tokenizer = load_tokenizer(model_path)
@@ -322,7 +362,10 @@ def run_train_worker(*, shadow: bool = False) -> None:
         publish_fn=publish_fn,
         head_revision_fn=head_revision_fn,
         cursor=cursor,
-        stride=int(os.environ.get("RELIQUARY_TRAINER_WINDOW_STRIDE", "1")),
+        stride=_environment_positive_int(
+            "RELIQUARY_TRAINER_WINDOW_STRIDE",
+            "1",
+        ),
         publish_every=CHECKPOINT_PUBLISH_INTERVAL_WINDOWS,
         last_published_revision=last_revision,
         shadow=shadow,

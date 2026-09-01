@@ -201,6 +201,53 @@ def test_publish_rejects_noncanonical_checkpoint_number(
     assert CANDIDATE_MANIFEST_KEY not in r2.objects
 
 
+@pytest.mark.parametrize("cursor", [True, 30110.0, "30110", -1])
+def test_publish_rejects_noncanonical_cursor_atomically(tmp_path, cursor):
+    r2, order = _R2(), []
+    pub = _publisher(tmp_path, r2, order)
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        asyncio.run(
+            pub.publish(
+                object(),
+                checkpoint_n=5,
+                lr_schedule_step=None,
+                trained_window_cursor=cursor,
+                reason="cadence",
+            )
+        )
+
+    assert order == []
+    assert r2.uploads == []
+    assert r2.objects == {}
+    assert not any(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("lr_schedule_step", [True, 80.0, "80", -1])
+def test_publish_rejects_noncanonical_lr_step_atomically(
+    tmp_path,
+    lr_schedule_step,
+):
+    r2, order = _R2(), []
+    pub = _publisher(tmp_path, r2, order)
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        asyncio.run(
+            pub.publish(
+                object(),
+                checkpoint_n=5,
+                lr_schedule_step=lr_schedule_step,
+                trained_window_cursor=30110,
+                reason="cadence",
+            )
+        )
+
+    assert order == []
+    assert r2.uploads == []
+    assert r2.objects == {}
+    assert not any(tmp_path.iterdir())
+
+
 @pytest.mark.parametrize("checkpoint_n", [4, 5])
 def test_publish_rejects_checkpoint_number_at_or_below_resume_floor(
     tmp_path, checkpoint_n,

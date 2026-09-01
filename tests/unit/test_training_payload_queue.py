@@ -1,6 +1,7 @@
 """Durable local queue feeding the R2 ``reliquary/training/`` prefix."""
 
 import asyncio
+import hashlib
 import json
 import threading
 
@@ -13,6 +14,18 @@ from reliquary.infrastructure.training_payload_queue import (
     step_cursor_key,
     tombstone_key,
 )
+
+
+def _step_cursor_bytes(journal_key: int, *, written_at: float = 1.0) -> bytes:
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "journal_key": journal_key,
+            "written_at": written_at,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
 
 
 def test_keys():
@@ -175,6 +188,59 @@ def test_committed_receipt_survives_upload_and_restart(tmp_path):
         q2.enqueue_committed_payload(30100, b"changed")
 
 
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        (
+            b'{"schema_version":1,"schema_version":1,"journal_key":30100,'
+            b'"kind":"payload","sha256":"'
+            + hashlib.sha256(b"abc").hexdigest().encode()
+            + b'","size":3}',
+            "unreadable",
+        ),
+        (
+            b'{"schema_version":NaN,"journal_key":30100,"kind":"payload",'
+            b'"sha256":"'
+            + hashlib.sha256(b"abc").hexdigest().encode()
+            + b'","size":3}',
+            "unreadable",
+        ),
+        (
+            b'{"schema_version":true,"journal_key":30100,"kind":"payload",'
+            b'"sha256":"'
+            + hashlib.sha256(b"abc").hexdigest().encode()
+            + b'","size":3}',
+            "invalid schema",
+        ),
+    ],
+)
+def test_committed_receipt_rejects_ambiguous_durable_json(
+    tmp_path,
+    body,
+    message,
+):
+    q = TrainingPayloadQueue(queue_dir=str(tmp_path))
+    artifact = q.enqueue_committed_payload(30100, b"abc")
+    receipt = tmp_path / "journal_commits" / "window-30100.json"
+    receipt.write_bytes(body)
+
+    with pytest.raises(RuntimeError, match=message):
+        q.enqueue_committed_payload(30100, b"abc")
+
+    assert artifact.read_bytes() == b"abc"
+
+
+@pytest.mark.parametrize("journal_key", [True, 7.0, "7", -1])
+def test_committed_journal_key_is_not_coerced(tmp_path, journal_key):
+    q = TrainingPayloadQueue(queue_dir=str(tmp_path))
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        q.enqueue_committed_payload(journal_key, b"abc")
+
+    assert not list(tmp_path.glob("window-*"))
+    assert not list((tmp_path / "journal_commits").glob("window-*"))
+
+
 def test_committed_entry_repairs_an_unreceipted_hidden_body(
     tmp_path, monkeypatch,
 ):
@@ -311,6 +377,40 @@ def test_step_cursor_missing_field_reads_as_stale_none(tmp_path):
     assert q.read_step_cursor() is None
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"schema_version":1,"journal_key":7,"journal_key":8,"written_at":1}',
+        b'{"schema_version":1,"journal_key":7,"written_at":NaN}',
+        b'{"schema_version":1,"journal_key":7,"written_at":1e999}',
+        b'{"schema_version":true,"journal_key":7,"written_at":1}',
+        b'{"schema_version":1,"journal_key":true,"written_at":1}',
+        b'{"schema_version":1,"journal_key":7.0,"written_at":1}',
+        b'{"schema_version":1,"journal_key":"7","written_at":1}',
+        b'{"schema_version":1,"journal_key":-1,"written_at":1}',
+    ],
+)
+def test_step_cursor_rejects_ambiguous_or_coerced_values(tmp_path, body):
+    q = TrainingPayloadQueue(queue_dir=str(tmp_path))
+    (tmp_path / "step-cursor.json").write_bytes(body)
+
+    assert q.read_step_cursor() is None
+
+
+@pytest.mark.parametrize("journal_key", [True, 7.0, "7", -1])
+def test_step_cursor_invalid_write_is_atomic(tmp_path, journal_key):
+    q = TrainingPayloadQueue(queue_dir=str(tmp_path))
+    q.write_step_cursor(6)
+    path = tmp_path / "step-cursor.json"
+    original = path.read_bytes()
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        q.write_step_cursor(journal_key)
+
+    assert path.read_bytes() == original
+    assert q.read_step_cursor() == 6
+
+
 def test_step_cursor_key_naming():
     assert step_cursor_key() == "reliquary/training/step-cursor.json"
 
@@ -410,7 +510,7 @@ def test_fetch_step_cursor_keeps_the_last_good_value_on_a_later_failure(
     stall the pick gate through exactly the brief outage this cache
     exists to smooth over."""
     q = TrainingPayloadQueue(queue_dir=str(tmp_path))
-    q.fetch_step_cursor(fetch_fn=lambda: b'{"journal_key": 9}')
+    q.fetch_step_cursor(fetch_fn=lambda: _step_cursor_bytes(9))
     q._step_cursor_fetch_thread.join(timeout=2)
     assert q.fetch_step_cursor() == 9
 
@@ -433,7 +533,7 @@ def test_fetch_step_cursor_default_fetch_fn_is_used_when_none_given(
 
     monkeypatch.setattr(
         queue_module, "_default_fetch_step_cursor",
-        lambda: b'{"journal_key": 55, "written_at": 1.0}',
+        lambda: _step_cursor_bytes(55),
     )
     q = TrainingPayloadQueue(queue_dir=str(tmp_path))
     q.fetch_step_cursor()
@@ -451,7 +551,7 @@ def test_fetch_step_cursor_value_cache_limits_gets_to_one_per_window(
 
     def counting_fetch():
         calls.append(1)
-        return b'{"journal_key": 42}'
+        return _step_cursor_bytes(42)
 
     q.fetch_step_cursor(fetch_fn=counting_fetch)
     q._step_cursor_fetch_thread.join(timeout=2)
@@ -474,7 +574,7 @@ def test_fetch_step_cursor_never_runs_two_fetches_concurrently(tmp_path):
     def slow_fetch():
         calls.append(1)
         gate.wait(timeout=2)
-        return b'{"journal_key": 7}'
+        return _step_cursor_bytes(7)
 
     q.fetch_step_cursor(fetch_fn=slow_fetch)
     # Called again immediately, while the first fetch is still blocked on

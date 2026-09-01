@@ -178,22 +178,35 @@ class CooldownMap:
         older entries have already expired and are skipped.
         """
         horizon = current_window - self._cooldown_windows
-        with self._lock:
-            for record in archived_windows:
-                w = int(record["window_start"])
-                if w <= horizon:
-                    continue
-                rewarded_entries = list(record.get("batch", []))
-                rewarded_entries.extend(
-                    entry
-                    for entry in record.get("runners_up", [])
-                    if entry.get("rewarded", False)
+        updates: dict[int, int] = {}
+        for record in archived_windows:
+            w = _nonnegative_int(
+                record.get("window_start"),
+                "archive window",
+            )
+            if w <= horizon:
+                continue
+            rewarded_entries = list(record.get("batch", []))
+            rewarded_entries.extend(
+                entry
+                for entry in record.get("runners_up", [])
+                if entry.get("rewarded", False)
+            )
+            for entry in rewarded_entries:
+                idx = _nonnegative_int(
+                    entry.get("prompt_idx"),
+                    "archive prompt index",
                 )
-                for entry in rewarded_entries:
-                    idx = int(entry["prompt_idx"])
-                    # Keep the most recent window for each prompt.
-                    if self._last_batched.get(idx, -1) < w:
-                        self._last_batched[idx] = w
+                if updates.get(idx, -1) < w:
+                    updates[idx] = w
+
+        # Validate the complete durable history before changing live state.
+        # A corrupt later archive must not leave a partially applied cooldown.
+        with self._lock:
+            for idx, w in updates.items():
+                # Keep the most recent window for each prompt.
+                if self._last_batched.get(idx, -1) < w:
+                    self._last_batched[idx] = w
 
     def rebuild_from_history(
         self,

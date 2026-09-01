@@ -122,7 +122,7 @@ async def test_snapshot_lookup_failure_cannot_reset_a_training_run():
 @pytest.mark.asyncio
 async def test_default_run_without_snapshot_falls_back_to_archive():
     svc = _service(40)
-    archives = [{"window_start": 38, "environment": "fake", "batch": [{"prompt_idx": 5}]}]
+    archives = _gap_archives(0, 40, selected_window=38)
     with patch(
         "reliquary.infrastructure.storage.download_json",
         new=AsyncMock(return_value=None),
@@ -131,7 +131,28 @@ async def test_default_run_without_snapshot_falls_back_to_archive():
         new=AsyncMock(return_value=archives),
     ):
         await svc._rebuild_cooldown_from_history()
-    assert svc._cooldown_per_env["fake"].is_in_cooldown(5, 40) is True
+    assert svc._cooldown_per_env["fake"].is_in_cooldown(99, 40) is True
+
+
+@pytest.mark.asyncio
+async def test_default_run_without_snapshot_rejects_incomplete_archive_coverage():
+    svc = _service(40)
+    incomplete = [
+        archive
+        for archive in _gap_archives(0, 40)
+        if archive["window_start"] != 20
+    ]
+    with patch(
+        "reliquary.infrastructure.storage.download_json",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "reliquary.infrastructure.storage.list_recent_datasets",
+        new=AsyncMock(return_value=incomplete),
+    ):
+        with pytest.raises(RuntimeError, match="history rebuild failed"):
+            await svc._rebuild_cooldown_from_history()
+
+    assert len(svc._cooldown_per_env["fake"]) == 0
 
 
 @pytest.mark.asyncio

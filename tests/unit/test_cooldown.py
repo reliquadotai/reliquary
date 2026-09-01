@@ -203,6 +203,36 @@ def test_apply_history_keeps_older_when_snapshot_is_newer():
     assert m.export_state() == {7: 200}  # snapshot's newer window wins
 
 
+@pytest.mark.parametrize("prompt_idx", [True, 7.0, "7", -1])
+def test_apply_history_rejects_coerced_prompt_indices_atomically(prompt_idx):
+    m = CooldownMap(cooldown_windows=1000)
+    m.import_state({7: 100})
+    history = [
+        {"window_start": 150, "batch": [{"prompt_idx": 99}]},
+        {"window_start": 151, "batch": [{"prompt_idx": prompt_idx}]},
+    ]
+
+    with pytest.raises(ValueError, match="archive prompt index"):
+        m.apply_history(history, current_window=170)
+
+    assert m.export_state() == {7: 100}
+
+
+@pytest.mark.parametrize("window_start", [True, 150.0, "150", -1])
+def test_apply_history_rejects_coerced_archive_windows_atomically(window_start):
+    m = CooldownMap(cooldown_windows=1000)
+    m.import_state({7: 100})
+    history = [
+        {"window_start": 150, "batch": [{"prompt_idx": 99}]},
+        {"window_start": window_start, "batch": [{"prompt_idx": 100}]},
+    ]
+
+    with pytest.raises(ValueError, match="archive window"):
+        m.apply_history(history, current_window=170)
+
+    assert m.export_state() == {7: 100}
+
+
 def test_snapshot_export_excludes_entries_after_snapshot_boundary():
     prompt = CooldownMap(cooldown_windows=1000)
     prompt.record_batched(1, 10)

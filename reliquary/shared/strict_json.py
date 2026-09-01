@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 
@@ -21,6 +22,13 @@ def _reject_nonfinite_constant(value: str) -> None:
     raise ValueError(f"non-finite JSON constant: {value}")
 
 
+def _finite_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite JSON number: {value}")
+    return parsed
+
+
 def strict_json_loads(raw: str | bytes | bytearray) -> Any:
     """Decode canonical-value JSON for durable protocol records.
 
@@ -34,6 +42,7 @@ def strict_json_loads(raw: str | bytes | bytearray) -> Any:
         raw,
         object_pairs_hook=_object_without_duplicate_keys,
         parse_constant=_reject_nonfinite_constant,
+        parse_float=_finite_float,
     )
 
 

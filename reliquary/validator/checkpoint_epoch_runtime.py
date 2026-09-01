@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-import json
 import math
 import os
 from pathlib import Path
@@ -41,6 +40,7 @@ from reliquary.shared.checkpoint_epoch_market import (
     canonical_signed_generation_intent_set_bytes,
     parse_signed_generation_intent_set,
 )
+from reliquary.shared.strict_json import strict_json_loads
 
 
 class EpochStoreError(RuntimeError):
@@ -194,8 +194,8 @@ def canonical_signed_intent_bytes(value: SignedEpochIntent) -> bytes:
 def parse_signed_epoch_intent(raw: bytes | str) -> SignedEpochIntent:
     raw_bytes = raw.encode("utf-8") if isinstance(raw, str) else bytes(raw)
     try:
-        value = json.loads(raw_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        value = strict_json_loads(raw_bytes)
+    except (TypeError, ValueError) as exc:
         raise ValueError("invalid signed checkpoint epoch intent") from exc
     if not isinstance(value, dict) or set(value) != {
         "intent",
@@ -331,8 +331,8 @@ def build_epoch_intent(
 
 def parse_epoch_intent(raw: bytes) -> EpochCommitIntent:
     try:
-        value = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        value = strict_json_loads(raw)
+    except (TypeError, ValueError) as exc:
         raise ValueError("invalid checkpoint epoch intent") from exc
     if not isinstance(value, dict):
         raise ValueError("checkpoint epoch intent must be an object")
@@ -528,7 +528,7 @@ class EpochStore:
         observed_round: int,
     ) -> None:
         if (
-            isinstance(observed_round, bool)
+            type(observed_round) is not int
             or observed_round < 1
             or observed_round >= intent.beacon_target_round
         ):
@@ -542,7 +542,7 @@ class EpochStore:
         raw = canonical_json_bytes(
             {
                 "intent_id": intent.intent_id,
-                "observed_round": int(observed_round),
+                "observed_round": observed_round,
                 "beacon_target_round": intent.beacon_target_round,
             }
         )
@@ -557,14 +557,25 @@ class EpochStore:
         if not path.exists():
             return False
         try:
-            value = json.loads(path.read_text(encoding="utf-8"))
+            raw = path.read_bytes()
+            value = strict_json_loads(raw)
+            if not isinstance(value, dict) or set(value) != {
+                "intent_id",
+                "observed_round",
+                "beacon_target_round",
+            }:
+                return False
+            observed_round = value["observed_round"]
+            beacon_target_round = value["beacon_target_round"]
             return (
                 value["intent_id"] == intent.intent_id
-                and value["beacon_target_round"] == intent.beacon_target_round
-                and 1 <= int(value["observed_round"])
-                < intent.beacon_target_round
+                and type(observed_round) is int
+                and type(beacon_target_round) is int
+                and beacon_target_round == intent.beacon_target_round
+                and 1 <= observed_round < intent.beacon_target_round
+                and raw == canonical_json_bytes(value)
             )
-        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        except (OSError, ValueError, KeyError, TypeError):
             return False
 
     def install_plan(
@@ -677,17 +688,19 @@ class EpochStore:
             return None
         try:
             raw = path.read_bytes()
-            value = json.loads(raw)
-        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            value = strict_json_loads(raw)
+        except (OSError, ValueError, TypeError) as exc:
             raise EpochStoreError("invalid epoch terminal outcome") from exc
         if (
-            value.get("epoch_id") != plan.epoch_id
+            not isinstance(value, dict)
+            or set(value) != {"epoch_id", "manifest_sha256", "status"}
+            or value.get("epoch_id") != plan.epoch_id
             or value.get("manifest_sha256") != manifest_sha256(plan)
             or value.get("status") not in {"completed", "aborted"}
             or raw != canonical_json_bytes(value)
         ):
             raise EpochStoreError("epoch terminal outcome does not match plan")
-        return str(value["status"])
+        return value["status"]
 
     def install_commitment_set(
         self,

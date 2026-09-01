@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import threading
@@ -23,6 +24,7 @@ from reliquary.constants import (
     FILL_CLOSED_EMISSIONS_PER_WINDOW,
     FILL_CLOSED_ENABLED,
 )
+from reliquary.shared.strict_json import strict_json_loads
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +37,7 @@ _PAYLOAD_SUFFIX = ".npz"
 _TOMBSTONE_SUFFIX = ".tombstone.json"
 _EPOCH_MARKER_SUFFIX = ".epoch.json"
 _STEP_CURSOR_FILENAME = "step-cursor.json"
+_STEP_CURSOR_SCHEMA_VERSION = 1
 
 # R40 #1c: fetch_step_cursor's cache TTL. Matches the order of magnitude
 # of service.FILL_CLOSED_ROTATION_POLL_SECONDS (2.0) by value, not by
@@ -232,9 +235,32 @@ def _parse_step_cursor(raw: bytes) -> int | None:
     """Shared by ``read_step_cursor`` and ``fetch_step_cursor``: a
     corrupt/torn/wrong-schema body reads as ``None``, never raises."""
     try:
-        data = json.loads(raw)
-        return int(data["journal_key"])
-    except (ValueError, TypeError, KeyError):
+        data = strict_json_loads(raw)
+        if not isinstance(data, dict) or set(data) != {
+            "schema_version",
+            "journal_key",
+            "written_at",
+        }:
+            return None
+        schema_version = data["schema_version"]
+        journal_key = data["journal_key"]
+        written_at = data["written_at"]
+        if (
+            type(schema_version) is not int
+            or schema_version != _STEP_CURSOR_SCHEMA_VERSION
+        ):
+            return None
+        if type(journal_key) is not int or journal_key < 0:
+            return None
+        if (
+            isinstance(written_at, bool)
+            or not isinstance(written_at, (int, float))
+            or not math.isfinite(written_at)
+            or written_at < 0
+        ):
+            return None
+        return journal_key
+    except (ValueError, TypeError, KeyError, UnicodeDecodeError):
         return None
 
 
@@ -327,7 +353,8 @@ class TrainingPayloadQueue:
         fields = {"schema_version", "journal_key", "kind", "sha256", "size"}
         if not isinstance(receipt, dict) or set(receipt) != fields:
             raise RuntimeError(f"journal commit receipt {source} has invalid fields")
-        if receipt.get("schema_version") != 1:
+        schema_version = receipt.get("schema_version")
+        if type(schema_version) is not int or schema_version != 1:
             raise RuntimeError(f"journal commit receipt {source} has invalid schema")
         slot = receipt.get("journal_key")
         size = receipt.get("size")
@@ -369,7 +396,7 @@ class TrainingPayloadQueue:
         with self._journal_commit_lock:
             for receipt_path in sorted(self._journal_commit_dir.glob("window-*.json")):
                 try:
-                    receipt = json.loads(receipt_path.read_text("utf-8"))
+                    receipt = strict_json_loads(receipt_path.read_bytes())
                 except (OSError, ValueError, TypeError) as exc:
                     raise RuntimeError(
                         f"journal commit receipt {receipt_path.name} is unreadable"
@@ -478,7 +505,9 @@ class TrainingPayloadQueue:
         so retries remain idempotent.  Restart finishes a receipt-backed hidden
         rename; an unreceipted body can only be claimed byte-identically.
         """
-        slot = int(window_start)
+        if type(window_start) is not int or window_start < 0:
+            raise ValueError("journal key must be a non-negative integer")
+        slot = window_start
         body = bytes(data)
         kind = "tombstone" if is_tombstone else "payload"
         digest = hashlib.sha256(body).hexdigest()
@@ -500,7 +529,7 @@ class TrainingPayloadQueue:
 
         with self._journal_commit_lock:
             try:
-                existing_receipt = json.loads(receipt_path.read_text("utf-8"))
+                existing_receipt = strict_json_loads(receipt_path.read_bytes())
             except FileNotFoundError:
                 existing_receipt = None
             except (OSError, ValueError, TypeError) as exc:
@@ -628,8 +657,18 @@ class TrainingPayloadQueue:
         successful upload, since it must stay in place to be overwritten
         by the next step.
         """
+        if type(journal_key) is not int or journal_key < 0:
+            raise ValueError(
+                "trainer journal cursor must be a non-negative integer"
+            )
         body = json.dumps(
-            {"journal_key": int(journal_key), "written_at": time.time()}
+            {
+                "schema_version": _STEP_CURSOR_SCHEMA_VERSION,
+                "journal_key": journal_key,
+                "written_at": time.time(),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
         ).encode("utf-8")
         self._enqueue(_STEP_CURSOR_FILENAME, body)
 

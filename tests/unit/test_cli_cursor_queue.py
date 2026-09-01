@@ -9,8 +9,14 @@ function of its inputs -- the factory that builds the queue instance.
 
 from pathlib import Path
 
+import pytest
+
 from reliquary.infrastructure.training_payload_queue import TrainingPayloadQueue
-from reliquary.trainer.cli import _build_cursor_queue
+from reliquary.trainer.cli import (
+    _build_cursor_queue,
+    _environment_positive_int,
+    _profile_nonnegative_int,
+)
 
 
 def test_build_cursor_queue_returns_a_training_payload_queue(tmp_path):
@@ -40,3 +46,23 @@ def test_build_cursor_queue_round_trips_the_step_cursor(tmp_path):
     assert queue.read_step_cursor() is None
     queue.write_step_cursor(30142)
     assert queue.read_step_cursor() == 30142
+
+
+@pytest.mark.parametrize("value", [True, 7.0, "7", -1])
+def test_trainer_profile_cursor_does_not_coerce_durable_values(value):
+    with pytest.raises(ValueError, match="non-negative integer"):
+        _profile_nonnegative_int({"trained_window_cursor": value}, "trained_window_cursor")
+
+
+def test_trainer_environment_stride_is_explicitly_parsed(monkeypatch):
+    monkeypatch.setenv("RELIQUARY_TRAINER_WINDOW_STRIDE", " 2 ")
+
+    assert _environment_positive_int("RELIQUARY_TRAINER_WINDOW_STRIDE", "1") == 2
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "1.0", "true"])
+def test_trainer_environment_stride_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("RELIQUARY_TRAINER_WINDOW_STRIDE", value)
+
+    with pytest.raises(ValueError):
+        _environment_positive_int("RELIQUARY_TRAINER_WINDOW_STRIDE", "1")

@@ -145,6 +145,58 @@ def test_store_enforces_commit_before_beacon(tmp_path):
     assert store.load_current_plan() == plan
 
 
+@pytest.mark.parametrize("observed_round", [True, 1_000.0, "1000"])
+def test_commit_confirmation_does_not_coerce_observed_round(
+    tmp_path,
+    observed_round,
+):
+    store = EpochStore(tmp_path)
+    intent = _intent()
+    store.install_intent(intent)
+    _install_signed_intent(store, intent)
+    confirmation = tmp_path / f"confirmed-{intent.intent_id}.json"
+
+    with pytest.raises(EpochStoreError, match="before beacon"):
+        store.confirm_before_beacon(intent, observed_round=observed_round)
+
+    assert not confirmation.exists()
+
+
+@pytest.mark.parametrize("observed_round", [True, 1_000.0, "1000"])
+def test_persisted_confirmation_requires_an_exact_integer_round(
+    tmp_path,
+    observed_round,
+):
+    store = EpochStore(tmp_path)
+    intent = _intent()
+    path = tmp_path / f"confirmed-{intent.intent_id}.json"
+    path.write_bytes(
+        canonical_json_bytes(
+            {
+                "intent_id": intent.intent_id,
+                "observed_round": observed_round,
+                "beacon_target_round": intent.beacon_target_round,
+            }
+        )
+    )
+
+    assert store.is_confirmed(intent) is False
+
+
+def test_persisted_confirmation_rejects_duplicate_json_keys(tmp_path):
+    store = EpochStore(tmp_path)
+    intent = _intent()
+    path = tmp_path / f"confirmed-{intent.intent_id}.json"
+    path.write_bytes(
+        (
+            '{"beacon_target_round":1001,"intent_id":"%s",'
+            '"observed_round":1000,"observed_round":999}'
+        ).encode("utf-8") % intent.intent_id.encode("ascii")
+    )
+
+    assert store.is_confirmed(intent) is False
+
+
 def test_restart_reload_is_byte_identical(tmp_path):
     first = EpochStore(tmp_path)
     intent = _intent()

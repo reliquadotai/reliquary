@@ -106,6 +106,21 @@ class TrainerPublisher:
             checkpoint_n,
             field="trainer published checkpoint number",
         )
+        trained_window_cursor = require_checkpoint_number(
+            trained_window_cursor,
+            field="trainer published window cursor",
+        )
+        if lr_schedule_step is not None:
+            lr_schedule_step = require_checkpoint_number(
+                lr_schedule_step,
+                field="trainer published LR schedule step",
+            )
+        if (
+            not isinstance(reason, str)
+            or not reason
+            or reason.strip() != reason
+        ):
+            raise ValueError("trainer publication reason must be canonical text")
         if (
             self._checkpoint_number_floor is not None
             and checkpoint_n <= self._checkpoint_number_floor
@@ -126,11 +141,11 @@ class TrainerPublisher:
                 self._save, model, self.tokenizer, snapshot_dir,
             )
             extra: dict[str, Any] = {
-                "trained_window_cursor": int(trained_window_cursor),
+                "trained_window_cursor": trained_window_cursor,
                 "journal_key_space": key_space,
             }
             if lr_schedule_step is not None:
-                extra["lr_schedule_step"] = int(lr_schedule_step)
+                extra["lr_schedule_step"] = lr_schedule_step
             write_checkpoint_profile(snapshot_dir, extra=extra)
 
             revision = await self._hf_upload(
@@ -168,8 +183,8 @@ class TrainerPublisher:
                 "checkpoint_n": checkpoint_n,
                 "repo_id": self.repo_id,
                 "revision": revision,
-                "trained_window_cursor": int(trained_window_cursor),
-                "reason": str(reason),
+                "trained_window_cursor": trained_window_cursor,
+                "reason": reason,
                 "journal_key_space": key_space,
             }
             await asyncio.to_thread(

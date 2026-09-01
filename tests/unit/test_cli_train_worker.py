@@ -165,6 +165,22 @@ def test_matching_manifest_rejects_noncanonical_checkpoint_number(
         )
 
 
+@pytest.mark.parametrize("cursor", [True, 30110.0, "30110", -1])
+def test_matching_manifest_rejects_noncanonical_cursor(cursor):
+    with pytest.raises(ValueError, match="non-negative integer"):
+        resolve_resume_point(
+            _manifest_fetch(
+                {
+                    "checkpoint_n": 530,
+                    "repo_id": "org/repo",
+                    "revision": REV_5,
+                    "trained_window_cursor": cursor,
+                }
+            ),
+            env={},
+        )
+
+
 def test_matching_manifest_rejects_duplicate_checkpoint_number():
     raw = (
         b'{"checkpoint_n":529,"checkpoint_n":530,"repo_id":"org/repo",'
@@ -183,6 +199,23 @@ def test_bootstrap_rejects_negative_checkpoint_number():
                 "RELIQUARY_TRAINER_BOOTSTRAP_CURSOR": "30110",
                 "RELIQUARY_TRAINER_CHECKPOINT_N": "-1",
             },
+        )
+
+
+@pytest.mark.parametrize("cursor", ["-1", "1.0", "true"])
+def test_bootstrap_rejects_invalid_cursor_strings(cursor):
+    with pytest.raises(ValueError):
+        resolve_resume_point(
+            lambda key: None,
+            env={"RELIQUARY_TRAINER_BOOTSTRAP_CURSOR": cursor},
+        )
+
+
+def test_bootstrap_rejects_non_string_cursor_config():
+    with pytest.raises(ValueError, match="configured as a string"):
+        resolve_resume_point(
+            lambda key: None,
+            env={"RELIQUARY_TRAINER_BOOTSTRAP_CURSOR": 30110},
         )
 
 

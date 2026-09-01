@@ -16,6 +16,11 @@ import os
 from pathlib import Path
 from typing import Any
 
+from reliquary.shared.checkpoint_identity import (
+    require_immutable_checkpoint_revision,
+)
+from reliquary.shared.strict_json import strict_json_loads
+
 
 @dataclass(frozen=True)
 class FillClosedRotationGate:
@@ -31,7 +36,7 @@ class FillClosedRotationGate:
     schema_version: int = 1
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
+        if type(self.schema_version) is not int or self.schema_version != 1:
             raise ValueError("unsupported fill-closed rotation gate schema")
         for field in (
             "source_window",
@@ -42,8 +47,10 @@ class FillClosedRotationGate:
             value = getattr(self, field)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{field} must be a non-negative integer")
-        if not isinstance(self.parent_revision, str) or not self.parent_revision:
-            raise ValueError("parent_revision must be a non-empty string")
+        require_immutable_checkpoint_revision(
+            self.parent_revision,
+            field="fill-closed parent revision",
+        )
         if not isinstance(self.requires_successor, bool):
             raise ValueError("requires_successor must be a boolean")
         adoption = (
@@ -62,8 +69,10 @@ class FillClosedRotationGate:
                 or self.adopted_checkpoint_n < 0
             ):
                 raise ValueError("adopted_checkpoint_n must be non-negative")
-            if not isinstance(self.adopted_revision, str) or not self.adopted_revision:
-                raise ValueError("adopted_revision must be a non-empty string")
+            require_immutable_checkpoint_revision(
+                self.adopted_revision,
+                field="fill-closed adopted revision",
+            )
             if (
                 isinstance(self.adopted_trainer_cursor, bool)
                 or not isinstance(self.adopted_trainer_cursor, int)
@@ -80,9 +89,9 @@ class FillClosedRotationGate:
     ) -> "FillClosedRotationGate":
         return replace(
             self,
-            adopted_checkpoint_n=int(checkpoint_n),
-            adopted_revision=str(revision),
-            adopted_trainer_cursor=int(trained_cursor),
+            adopted_checkpoint_n=checkpoint_n,
+            adopted_revision=revision,
+            adopted_trainer_cursor=trained_cursor,
         )
 
     def adoption_covers(self, checkpoint: Any | None) -> bool:
@@ -91,9 +100,13 @@ class FillClosedRotationGate:
             return True
         if checkpoint is None or self.adopted_checkpoint_n is None:
             return False
+        checkpoint_n = getattr(checkpoint, "checkpoint_n", None)
+        revision = getattr(checkpoint, "revision", None)
         return (
-            int(getattr(checkpoint, "checkpoint_n", -1)) == self.adopted_checkpoint_n
-            and str(getattr(checkpoint, "revision", "")) == self.adopted_revision
+            type(checkpoint_n) is int
+            and checkpoint_n == self.adopted_checkpoint_n
+            and isinstance(revision, str)
+            and revision == self.adopted_revision
             and self.adopted_checkpoint_n > self.parent_checkpoint_n
             and self.adopted_revision != self.parent_revision
             and self.adopted_trainer_cursor is not None
@@ -108,7 +121,7 @@ class FillClosedRotationGate:
     @classmethod
     def from_bytes(cls, raw: bytes) -> "FillClosedRotationGate":
         try:
-            payload = json.loads(raw)
+            payload = strict_json_loads(raw)
         except (TypeError, ValueError) as exc:
             raise ValueError("invalid fill-closed rotation gate JSON") from exc
         if not isinstance(payload, dict):
@@ -116,7 +129,10 @@ class FillClosedRotationGate:
         expected = set(cls.__dataclass_fields__)
         if set(payload) != expected:
             raise ValueError("fill-closed rotation gate fields differ")
-        return cls(**payload)
+        gate = cls(**payload)
+        if raw != gate.to_bytes():
+            raise ValueError("fill-closed rotation gate is not canonical")
+        return gate
 
 
 class FillClosedRotationStore:
@@ -136,16 +152,23 @@ class FillClosedRotationStore:
     def save(self, gate: FillClosedRotationGate) -> None:
         raw = gate.to_bytes()
         tmp = self.path.with_suffix(".json.tmp")
-        with open(tmp, "wb") as handle:
-            handle.write(raw)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, self.path)
-        directory_fd = os.open(self.path.parent, os.O_RDONLY)
         try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+            with open(tmp, "wb") as handle:
+                handle.write(raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, self.path)
+            directory_fd = os.open(self.path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except Exception:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+            raise
 
     def clear(self) -> None:
         try:
