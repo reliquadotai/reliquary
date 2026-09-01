@@ -5,10 +5,9 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
-from typing import Any
 
 import pytest
+import torch
 
 from reliquary.constants import (
     B_BATCH,
@@ -23,12 +22,18 @@ from reliquary.protocol.submission import (
     RejectReason,
     RolloutSubmission,
 )
-from reliquary.validator.batcher import GrpoWindowBatcher
+from reliquary.validator import batcher as batcher_mod
+from reliquary.validator.batcher import (
+    GrpoWindowBatcher,
+    RejectedSubmission,
+    ValidSubmission,
+)
 from reliquary.validator.observability import SubmitTelemetry
 from reliquary.validator.proof_scheduler import (
     GlobalProofScheduler,
     ProofExecution,
 )
+from reliquary.validator.verifier import ProofResult
 
 
 class FakeEnv:
@@ -49,14 +54,10 @@ class PrivateRewardFakeEnv(FakeEnv):
 
 
 def _always_true_grail(commit, model, randomness):
-    import torch
-    from reliquary.validator.verifier import ProofResult
     return ProofResult(all_passed=True, passed=1, checked=1, logits=torch.empty(0))
 
 
 def _always_false_grail(commit, model, randomness):
-    import torch
-    from reliquary.validator.verifier import ProofResult
     return ProofResult(all_passed=False, passed=0, checked=1, logits=torch.empty(0))
 
 
@@ -190,7 +191,7 @@ def _make_batcher(**overrides) -> GrpoWindowBatcher:
     return b
 
 
-def _prove_one(b: GrpoWindowBatcher, req) -> "ValidSubmission | None":
+def _prove_one(b: GrpoWindowBatcher, req) -> ValidSubmission | None:
     """Run one request through its environment's configured proof path.
 
     Auction-enabled Math and Code both defer proof to seal. Returns None when
@@ -319,9 +320,6 @@ def test_ingestion_resets_forced_flag_in_non_math_env():
 
 
 def test_grail_verifier_receives_tokenizer_for_sparse_pstop():
-    import torch
-    from reliquary.validator.verifier import ProofResult
-
     seen_tokenizers = []
 
     def tokenizer_aware_grail(commit, model, randomness, *, tokenizer=None, seed_u_values=None):
@@ -852,10 +850,6 @@ def test_distinct_prompts_in_batch_only():
 
 # --- v2.1 seal_event + checkpoint_hash gating ---
 
-import asyncio
-
-import pytest
-
 
 def _request_v21(prompt_idx=42, window_start=500,
                  rewards=None, hotkey="hk", checkpoint_hash="sha256:abc"):
@@ -1125,9 +1119,6 @@ def test_failed_submission_does_not_consume_bucket_slot():
     anti-starvation invariant moved to seal: a squatter that fails the proof
     does NOT lock the prompt — the honest same-prompt submission behind it is
     promoted and wins the slot."""
-    import torch
-    from reliquary.validator.verifier import ProofResult
-
     calls = {"n": 0}
 
     def grail_fail_first(commit, model, randomness):
@@ -1641,10 +1632,6 @@ def test_constructor_accepts_tokenizer():
     assert b.tokenizer is fake_tok
 
 
-import torch
-from reliquary.validator.verifier import ProofResult
-
-
 def _grail_with_logits(seq_len: int, eos_id: int = 99):
     """Stub that opts into behavioural checks with high EOS probability
     at the termination position. The actual EOS pass/fail depends on
@@ -2002,7 +1989,6 @@ def test_termination_skipped_when_grail_returns_empty_logits():
 
 
 def test_rejected_submissions_list_initialised_empty():
-    from reliquary.validator.batcher import GrpoWindowBatcher, RejectedSubmission
     b = _make_batcher()  # existing helper in this file
     assert hasattr(b, "rejected_submissions")
     assert b.rejected_submissions == []
@@ -2015,7 +2001,6 @@ def test_rejected_submissions_list_initialised_empty():
 
 
 def _empty_logits():
-    import torch
     return torch.empty(0)
 
 
@@ -2026,7 +2011,6 @@ def _build_request(*, hotkey: str = "hk", prompt_idx: int = 42, window_start: in
 
 def test_rejected_grail_fail_omits_sketch_diff_max(monkeypatch):
     """GRAIL_FAIL must NOT expose sketch_diff_max — anti-tuning."""
-    from reliquary.validator.verifier import ProofResult
     from reliquary.protocol.submission import RejectReason
 
     b = _make_batcher()  # existing helper
@@ -3209,9 +3193,6 @@ def test_accept_genuine_wrong_wellformed_answer():
     req = _request_with_prompt_unique_tokens(rewards=[1.0] * 4 + [0.0] * 4)
     resp = b.accept_submission(req)
     assert resp.accepted is True
-
-
-from reliquary.validator import batcher as batcher_mod
 
 
 def test_set_prompt_range_none_before_cutover(monkeypatch):

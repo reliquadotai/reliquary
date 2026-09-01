@@ -1,7 +1,7 @@
 """_archive_window includes prompt + rollout content on R2."""
 
 from dataclasses import dataclass
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -380,8 +380,6 @@ async def test_archive_includes_prompt_and_rollout_content():
 @pytest.mark.asyncio
 async def test_archive_includes_per_rollout_hash():
     """Each rollout in the archive's batch entry carries a hex SHA256 hash."""
-    from unittest.mock import AsyncMock, MagicMock, patch
-
     from reliquary.validator.service import ValidationService
 
     fake_tok = MagicMock()
