@@ -106,3 +106,43 @@ async def test_pull_from_zero_local_to_nonzero_remote():
     assert new_local_n == 7
     assert new_hash == "rev_sha_007"
     assert new_model == "model_7"
+
+
+@pytest.mark.asyncio
+async def test_pull_when_revision_changes_at_same_checkpoint_number():
+    state = MagicMock()
+    state.checkpoint_n = 5
+    state.checkpoint_repo_id = "aivolutionedge/reliquary-sn"
+    state.checkpoint_revision = "corrected_rev"
+    download_fn = AsyncMock(return_value="/hf_cache/corrected")
+    load_fn = MagicMock(return_value="corrected_model")
+
+    result = await maybe_pull_checkpoint(
+        state=state,
+        local_n=5,
+        local_hash="old_rev",
+        local_model="old_model",
+        download_fn=download_fn,
+        load_fn=load_fn,
+    )
+
+    assert result == (5, "corrected_rev", "corrected_model")
+    download_fn.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_loader_failure_does_not_advance_checkpoint_identity():
+    state = MagicMock()
+    state.checkpoint_n = 5
+    state.checkpoint_repo_id = "aivolutionedge/reliquary-sn"
+    state.checkpoint_revision = "new_rev"
+
+    with pytest.raises(RuntimeError, match="no activated model"):
+        await maybe_pull_checkpoint(
+            state=state,
+            local_n=4,
+            local_hash="old_rev",
+            local_model="old_model",
+            download_fn=AsyncMock(return_value="/hf_cache/new"),
+            load_fn=MagicMock(return_value=None),
+        )
