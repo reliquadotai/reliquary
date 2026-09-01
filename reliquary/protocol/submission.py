@@ -447,7 +447,7 @@ class GrpoBatchState(BaseModel):
     anchor_block: int = Field(..., ge=0)
     cooldown_prompts: list[int] = Field(default_factory=list)
     valid_submissions: int = Field(..., ge=0)
-    checkpoint_n: int = Field(..., ge=0)
+    checkpoint_n: int | None = Field(default=None, ge=0, strict=True)
     checkpoint_repo_id: str | None = None
     checkpoint_revision: str | None = None
     protocol_version: int | None = Field(default=None, ge=0)
@@ -604,7 +604,7 @@ class MinerState(BaseModel):
     window_opened_at: float | None = Field(default=None, ge=0)
     submission_deadline_at: float | None = Field(default=None, ge=0)
     environments: dict[str, MinerEnvironmentState]
-    checkpoint_n: int = Field(..., ge=0)
+    checkpoint_n: int | None = Field(default=None, ge=0, strict=True)
     checkpoint_repo_id: str | None = None
     checkpoint_revision: str | None = None
     protocol_version: int | None = Field(default=None, ge=0)
