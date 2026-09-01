@@ -6108,7 +6108,6 @@ class GrpoWindowBatcher:
         unavailable, the same hash is a deterministic liveness fallback. Old
         profiles with no throughput contract retain their historical arrival
         ordering. Experimental epoch mode instead
-        Production keeps its profile-bound ordering. Experimental epoch mode
         uses a manifest-bound difficulty value, then visits canonical operators
         in rounds inside each exact-value tier. Fresh post-deadline drand orders
         operators and their candidates without consulting throughput or arrival.
