@@ -586,6 +586,23 @@ def test_content_snapshot_requires_canonical_durable_values(
         )
 
 
+@pytest.mark.parametrize("schema_version", [True, 1.0, "1"])
+def test_content_snapshot_requires_an_exact_schema_integer(schema_version):
+    from reliquary.validator.service import ValidationService
+
+    snapshot = {
+        "schema_version": schema_version,
+        "run_id": "default",
+        "snapshot_window": 10,
+        "complete": True,
+        "envs": {"fake": {"a" * 64: 9}},
+    }
+    with pytest.raises(ValueError, match="snapshot schema"):
+        ValidationService._validate_content_snapshot(
+            snapshot, {"fake"}, 10
+        )
+
+
 @pytest.mark.asyncio
 async def test_content_cooldown_first_restore_backfills_prompt_state(tmp_path):
     svc = _service(77)

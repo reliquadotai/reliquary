@@ -7258,7 +7258,8 @@ class ValidationService:
         env_names: set[str],
         current_window: int,
     ) -> int:
-        if snapshot.get("schema_version") != 1:
+        schema_version = snapshot.get("schema_version")
+        if type(schema_version) is not int or schema_version != 1:
             raise ValueError("unsupported content cooldown snapshot schema")
         if snapshot.get("run_id") != TRAINING_RUN_ID:
             raise ValueError("content cooldown run id mismatch")
