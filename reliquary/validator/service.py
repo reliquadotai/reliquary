@@ -51,8 +51,10 @@ from reliquary.constants import (
     FILL_CLOSED_ADMISSION_BUDGET_PER_ENV,
     FILL_CLOSED_ENABLED,
     FILL_CLOSED_FIRST_PICK_SECONDS,
+    FILL_CLOSED_GRADING_START_BUDGET_PER_ENV,
     FILL_CLOSED_MAX_SECONDS,
     FILL_CLOSED_PICK_PIPELINE_DEPTH,
+    FILL_CLOSED_PRECOMMIT_SECONDS,
     FORCED_SEED_CDF_BOUNDARY_EPSILON,
     FORCED_SEED_CDF_ENFORCE,
     FORCED_SEED_CONSISTENCY_FLOOR,
@@ -472,6 +474,7 @@ def open_grpo_window(
     experimental_prompt_range: tuple[int, int] | None = None,
     collection_seconds: float | None = None,
     max_productive_candidates: int | None = None,
+    max_grading_starts: int | None = None,
     max_ranked_proof_attempts: int | None = None,
 ) -> GrpoWindowBatcher:
     """Instantiate a GrpoWindowBatcher for this window.
@@ -525,6 +528,7 @@ def open_grpo_window(
         experimental_prompt_range=experimental_prompt_range,
         collection_seconds=collection_seconds,
         max_productive_candidates=max_productive_candidates,
+        max_grading_starts=max_grading_starts,
         max_ranked_proof_attempts=max_ranked_proof_attempts,
     )
 
@@ -2586,6 +2590,20 @@ class ValidationService:
                 open_kwargs["emit_training_batch_fn"] = (
                     fill_closed_assembler.accept
                 )
+                # Fill-closed owns a macro-window ingress horizon and
+                # admission budget.  Pass both explicitly so the real service
+                # construction cannot fall back to the legacy 100-second / 96
+                # candidate auction limits.  This branch is capability-gated;
+                # V4/V5 keep the constructor defaults byte-for-byte.
+                open_kwargs.update({
+                    "collection_seconds": FILL_CLOSED_PRECOMMIT_SECONDS,
+                    "max_productive_candidates": (
+                        FILL_CLOSED_ADMISSION_BUDGET_PER_ENV
+                    ),
+                    "max_grading_starts": (
+                        FILL_CLOSED_GRADING_START_BUDGET_PER_ENV
+                    ),
+                })
             if epoch_window is not None:
                 plan = self._checkpoint_epoch_plan
                 if plan is None:

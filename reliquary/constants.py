@@ -895,6 +895,27 @@ FILL_CLOSED_MAX_SECONDS = float(_os.environ.get(
 if not _math.isfinite(FILL_CLOSED_MAX_SECONDS) or FILL_CLOSED_MAX_SECONDS <= 0:
     raise ValueError("RELIQUARY_FILL_CLOSED_MAX_SECONDS must be positive")
 
+# A fill-closed precommit must leave enough time for its advertised upload
+# grace before the window's hard backstop.  Reusing the profile's 100-second
+# collection value made the macro window keep running while ingress had already
+# closed.  This capability-local horizon fixes that seam without widening the
+# V4/V5 collection window or changing any profile contract.
+FILL_CLOSED_PRECOMMIT_SECONDS = float(_os.environ.get(
+    "RELIQUARY_FILL_CLOSED_PRECOMMIT_SECONDS",
+    str(FILL_CLOSED_MAX_SECONDS - SUBMISSION_UPLOAD_GRACE_SECONDS),
+))
+if (
+    not _math.isfinite(FILL_CLOSED_PRECOMMIT_SECONDS)
+    or FILL_CLOSED_PRECOMMIT_SECONDS <= 0
+    or FILL_CLOSED_PRECOMMIT_SECONDS + SUBMISSION_UPLOAD_GRACE_SECONDS
+    > FILL_CLOSED_MAX_SECONDS
+):
+    raise ValueError(
+        "RELIQUARY_FILL_CLOSED_PRECOMMIT_SECONDS must be positive and leave "
+        "SUBMISSION_UPLOAD_GRACE_SECONDS before "
+        "RELIQUARY_FILL_CLOSED_MAX_SECONDS"
+    )
+
 # Amendment v6.1 (R33): admission is bounded by a per-environment BUDGET,
 # not by ``FILL_CLOSED_TARGET_GROUPS_PER_ENV`` -- the window no longer
 # closes on a proven count (see FillState.is_closed, gated on picks
@@ -907,11 +928,40 @@ if not _math.isfinite(FILL_CLOSED_MAX_SECONDS) or FILL_CLOSED_MAX_SECONDS <= 0:
 # ceiling on aggregate generation spend, just not the close rule.
 FILL_CLOSED_ADMISSION_BUDGET_PER_ENV = int(_os.environ.get(
     "RELIQUARY_FILL_CLOSED_ADMISSION_BUDGET_PER_ENV",
-    "512",
+    str(2 * FILL_CLOSED_TARGET_GROUPS_PER_ENV),
 ))
-if FILL_CLOSED_ADMISSION_BUDGET_PER_ENV <= 0:
+_FILL_CLOSED_MAX_ADMISSION_BUDGET_PER_ENV = (
+    2 * FILL_CLOSED_EMISSIONS_PER_WINDOW * B_BATCH
+)
+if not (
+    FILL_CLOSED_TARGET_GROUPS_PER_ENV
+    <= FILL_CLOSED_ADMISSION_BUDGET_PER_ENV
+    <= _FILL_CLOSED_MAX_ADMISSION_BUDGET_PER_ENV
+):
     raise ValueError(
-        "RELIQUARY_FILL_CLOSED_ADMISSION_BUDGET_PER_ENV must be positive"
+        "RELIQUARY_FILL_CLOSED_ADMISSION_BUDGET_PER_ENV must be between "
+        "FILL_CLOSED_TARGET_GROUPS_PER_ENV and twice the full window's "
+        "trainable capacity"
+    )
+
+# Grading starts include protocol-valid bodies that later prove unproductive;
+# keep that anti-DoS wall distinct from the productive admission budget.  It is
+# explicit here because the generic batcher constructor's legacy fallback is
+# intentionally not a v6 policy.  The upper bound is finite and capability
+# local, so arming fill-closed cannot silently widen the global V4/V5 ceiling.
+FILL_CLOSED_GRADING_START_BUDGET_PER_ENV = int(_os.environ.get(
+    "RELIQUARY_FILL_CLOSED_GRADING_START_BUDGET_PER_ENV",
+    str(2 * FILL_CLOSED_ADMISSION_BUDGET_PER_ENV),
+))
+if not (
+    FILL_CLOSED_ADMISSION_BUDGET_PER_ENV
+    <= FILL_CLOSED_GRADING_START_BUDGET_PER_ENV
+    <= 4 * FILL_CLOSED_EMISSIONS_PER_WINDOW * B_BATCH
+):
+    raise ValueError(
+        "RELIQUARY_FILL_CLOSED_GRADING_START_BUDGET_PER_ENV must be at "
+        "least the admission budget and at most four times the full "
+        "window's trainable capacity"
     )
 
 # Amendment v6.1 (R34): picks are paced by the TRAINER's own consumption
