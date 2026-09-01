@@ -54,9 +54,11 @@ The reconciliation branch currently contains:
 | create-only fill journal receipts and checkpoint-adoption rotation barrier | implemented behind the disabled fill experiment |
 | immutable release contracts and environment/task/trajectory ABI | implemented as inactive composition boundaries |
 | profile/capability activation atomicity | implemented fail-closed; no existing V4/V5/V6 profile may activate the checkpoint epoch |
+| immutable checkpoint OID/repository binding and final miner admission recheck | implemented for the reference miner and bounded control endpoint |
+| cooldown and archive restart identity | local and remote records are reconciled by exact window; invalid, incomplete or conflicting recovery fails closed |
 | ticket-only streaming proof shared across all 16 concurrent lanes | integration gate; must preserve arrival-neutral final selection and restart recovery |
 | trainer-paced per-lane epoch barriers | target contract; the current epoch uses one common generation horizon before ordered finalization |
-| end-to-end epoch proof-result and partial-window economic recovery | activation gate |
+| durable per-ticket proof ownership, lane acknowledgements and economic release | activation gate; current staging types are not connected to the live epoch path |
 | external adapter conformance and hardware-backed end-to-end qualification | activation gate |
 
 The pull request remains a Draft until every activation gate is either
@@ -469,9 +471,12 @@ Reliquary 1 is activation-ready only when all of the following are true:
 - generation and seal randomness cannot be substituted;
 - all 16 lanes OPEN atomically and obey their advertised barriers;
 - no stale or pre-OPEN work can be released or replayed;
+- every checkpoint reference is an immutable commit OID bound to its repository;
 - final cooldown, prompt-range, authenticity, grading and proof checks pass;
 - ticket, proof queue and standby bounds survive burst tests;
 - lane journal, trainer cursor, payment and restart are exactly consistent;
+- archive/tombstone coverage is contiguous across restart and conflicts cannot
+  be reinterpreted as an empty cooldown;
 - checkpoint publication and adoption gate the next epoch;
 - Math, Code and external adapter conformance fixtures pass;
 - full Python, formatting, local integration and hardware-backed E2E suites
