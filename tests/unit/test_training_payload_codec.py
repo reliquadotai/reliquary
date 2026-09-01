@@ -153,6 +153,22 @@ def test_payload_decoder_requires_a_canonical_window_identity(window_start):
         decode_training_payload(blob)
 
 
+@pytest.mark.parametrize(
+    "checkpoint_revision",
+    [True, 7, 7.0, [], {}, None, "", " rev-abc", "rev-abc "],
+)
+def test_payload_decoder_never_normalizes_checkpoint_revision(
+    checkpoint_revision,
+):
+    blob = _replace_payload_header(
+        _payload_bytes(),
+        checkpoint_revision=checkpoint_revision,
+    )
+
+    with pytest.raises(ValueError, match="canonical text"):
+        decode_training_payload(blob)
+
+
 def test_epoch_payload_rejects_a_string_window_identity(monkeypatch):
     monkeypatch.setattr(C, "PROTOCOL_VERSION", 5)
     binding = _epoch_binding(first_window=7)

@@ -353,7 +353,16 @@ class DecodedPayload:
             header.get("window_start"),
             field="training payload window",
         )
-        self.checkpoint_revision = str(header["checkpoint_revision"])
+        checkpoint_revision = header.get("checkpoint_revision")
+        if (
+            not isinstance(checkpoint_revision, str)
+            or not checkpoint_revision
+            or checkpoint_revision.strip() != checkpoint_revision
+        ):
+            raise ValueError(
+                "training payload checkpoint revision must be canonical text"
+            )
+        self.checkpoint_revision = checkpoint_revision
         self.env_order = list(header["env_order"])
         self.window_quarantine = dict(header["window_quarantine"])
         raw_epoch = header.get("checkpoint_epoch")
