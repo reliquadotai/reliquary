@@ -93,6 +93,71 @@ def test_external_install_requires_immutable_revision(tmp_path):
     assert store.current_manifest() is None
 
 
+@pytest.mark.parametrize("checkpoint_n", [True, 2.0, "2", -1])
+def test_external_install_requires_canonical_checkpoint_number(
+    tmp_path,
+    checkpoint_n,
+):
+    wallet = MagicMock()
+    wallet.hotkey.sign = MagicMock(return_value=b"sig")
+    store = CheckpointStore(
+        validator_hotkey="5FHk",
+        wallet=wallet,
+        repo_id="aivolutionedge/reliquary-sn",
+        staging_dir_path=str(tmp_path),
+    )
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        store.install_external(checkpoint_n, REV_A)
+
+    wallet.hotkey.sign.assert_not_called()
+    assert store.current_manifest() is None
+
+
+def test_external_install_is_monotonic_and_idempotent(tmp_path):
+    wallet = MagicMock()
+    wallet.hotkey.sign = MagicMock(return_value=b"sig")
+    store = CheckpointStore(
+        validator_hotkey="5FHk",
+        wallet=wallet,
+        repo_id="aivolutionedge/reliquary-sn",
+        staging_dir_path=str(tmp_path),
+    )
+    installed = store.install_external(5, REV_A)
+
+    store.clear_manifest()
+    assert store.install_external(5, REV_A) is installed
+    with pytest.raises(ValueError, match="roll back"):
+        store.install_external(4, REV_B)
+    with pytest.raises(ValueError, match="rebind"):
+        store.install_external(5, REV_B)
+
+    wallet.hotkey.sign.assert_called_once_with(f"5|{REV_A}".encode())
+    assert store.current_manifest() is installed
+
+
+@pytest.mark.asyncio
+async def test_publish_rejects_nonadvancing_number_before_save_or_upload(tmp_path):
+    save = MagicMock()
+    upload = AsyncMock(return_value=REV_B)
+    store = CheckpointStore(
+        validator_hotkey="5FHk",
+        wallet=FakeWallet(),
+        repo_id="aivolutionedge/reliquary-sn",
+        staging_dir_path=str(tmp_path),
+        upload_fn=upload,
+        save_fn=save,
+    )
+    store.install_external(5, REV_A)
+
+    for checkpoint_n in (4, 5):
+        with pytest.raises(ValueError, match="advance monotonically"):
+            await store.publish(checkpoint_n, model=object())
+
+    save.assert_not_called()
+    upload.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_publish_increments_overrides_previous(tmp_path):
     fake_upload = AsyncMock(side_effect=[

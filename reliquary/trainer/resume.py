@@ -13,7 +13,8 @@ import logging
 from typing import Callable, Mapping
 
 from reliquary.shared.checkpoint_identity import (
-    require_checkpoint_repository,
+    canonical_checkpoint_identity,
+    require_checkpoint_number,
     require_immutable_checkpoint_revision,
 )
 from reliquary.trainer.publisher import CANDIDATE_MANIFEST_KEY
@@ -40,17 +41,16 @@ def resolve_resume_point(
             if manifest.get(key) != expected
         }
         if not mismatches:
-            require_checkpoint_repository(
+            checkpoint_n, _, revision = canonical_checkpoint_identity(
+                manifest.get("checkpoint_n"),
                 manifest.get("repo_id"),
-                field="trainer resume manifest repository",
+                manifest.get("revision"),
+                field="trainer resume manifest checkpoint",
             )
             return (
-                require_immutable_checkpoint_revision(
-                    manifest.get("revision"),
-                    field="trainer resume manifest revision",
-                ),
+                revision,
                 int(manifest["trained_window_cursor"]),
-                int(manifest.get("checkpoint_n", 0)),
+                checkpoint_n,
             )
         logger.warning(
             "candidate manifest belongs to another protocol/run (%s); "
@@ -80,4 +80,12 @@ def resolve_resume_point(
         else None
     )
     raw_n = str(env.get("RELIQUARY_TRAINER_CHECKPOINT_N", "")).strip()
-    return revision, int(bootstrap), int(raw_n) if raw_n else 0
+    checkpoint_n = (
+        require_checkpoint_number(
+            int(raw_n),
+            field="trainer bootstrap checkpoint number",
+        )
+        if raw_n
+        else 0
+    )
+    return revision, int(bootstrap), checkpoint_n

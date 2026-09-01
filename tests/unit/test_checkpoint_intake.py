@@ -35,9 +35,9 @@ class _R2:
             f.write(self.files[key])
 
 
-def _manifest(revision=REV_7):
+def _manifest(revision=REV_7, *, checkpoint_n=5, repo_id="org/repo"):
     return {
-        "checkpoint_n": 5, "repo_id": "org/repo", "revision": revision,
+        "checkpoint_n": checkpoint_n, "repo_id": repo_id, "revision": revision,
         "trained_window_cursor": 30110, "reason": "cadence",
     }
 
@@ -160,7 +160,51 @@ def test_poll_rejects_mutable_or_noncanonical_revision(tmp_path):
         )
 
         assert intake.poll() is None
-        assert "immutable revision" in (intake.last_error or "")
+        assert "identity is invalid" in (intake.last_error or "")
+
+
+@pytest.mark.parametrize("checkpoint_n", [True, 5.0, "5", -1])
+def test_poll_and_stage_reject_noncanonical_checkpoint_number(
+    tmp_path,
+    checkpoint_n,
+):
+    manifest = _manifest(checkpoint_n=checkpoint_n)
+    intake = CheckpointIntake(
+        r2_client=_R2(manifest=manifest),
+        bucket="b",
+        staging_dir=str(tmp_path),
+    )
+
+    assert intake.poll() is None
+    assert "identity is invalid" in (intake.last_error or "")
+    assert intake.stage(manifest) is False
+    assert not (tmp_path / REV_7).exists()
+
+
+@pytest.mark.parametrize(
+    "manifest, error",
+    [
+        (_manifest(REV_7, checkpoint_n=4), "roll back"),
+        (_manifest(REV_7, checkpoint_n=5), "rebind"),
+    ],
+)
+def test_intake_rejects_rollback_and_same_number_rebinding(
+    tmp_path,
+    manifest,
+    error,
+):
+    intake = CheckpointIntake(
+        r2_client=_R2(manifest=manifest),
+        bucket="b",
+        staging_dir=str(tmp_path),
+        installed_checkpoint_n=5,
+        installed_repo_id="org/repo",
+        installed_revision=REV_6,
+    )
+
+    assert intake.poll() is None
+    assert intake.stage(manifest) is False
+    assert error in (intake.last_error or "")
 
 
 def test_stage_rejects_revision_path_traversal_before_io(tmp_path):

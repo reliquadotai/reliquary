@@ -241,6 +241,7 @@ def run_train_worker(*, shadow: bool = False) -> None:
         tokenizer=tokenizer,
         r2_client=client,
         bucket=bucket,
+        checkpoint_number_floor=checkpoint_n,
     )
 
     publish_state = {"checkpoint_n": checkpoint_n}

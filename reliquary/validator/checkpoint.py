@@ -16,7 +16,10 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
 
 from reliquary.shared.checkpoint_identity import (
+    canonical_checkpoint_identity,
+    require_checkpoint_number,
     require_checkpoint_repository,
+    require_checkpoint_successor,
     require_immutable_checkpoint_revision,
 )
 from reliquary.validator.checkpoint_profile import write_checkpoint_profile
@@ -78,6 +81,7 @@ class CheckpointStore:
         self._upload = upload_fn or _default_upload
         self._save = save_fn or _default_save_hf_format
         self._current: ManifestEntry | None = None
+        self._identity_floor: ManifestEntry | None = None
 
     def current_manifest(self) -> ManifestEntry | None:
         return self._current
@@ -86,6 +90,19 @@ class CheckpointStore:
         """Withdraw the public manifest without assigning a local path ID."""
 
         self._current = None
+
+    def _floor_identity(self) -> tuple[int, str, str] | None:
+        floor = self._identity_floor or self._current
+        if floor is None:
+            return None
+        identity = canonical_checkpoint_identity(
+            floor.checkpoint_n,
+            floor.repo_id,
+            floor.revision,
+            field="installed checkpoint",
+        )
+        self._identity_floor = floor
+        return identity
 
     async def publish(
         self,
@@ -101,6 +118,16 @@ class CheckpointStore:
         and has no role in recovery or miner reload. Keeping it caused
         unbounded disk creep at ~7.6 GB/training step in v2.1.
         """
+        checkpoint_n = require_checkpoint_number(
+            checkpoint_n,
+            field="published checkpoint number",
+        )
+        floor = self._floor_identity()
+        if floor is not None and checkpoint_n <= floor[0]:
+            raise ValueError(
+                "published checkpoint number must advance monotonically"
+            )
+
         # 1. Save HF-format snapshot locally (dir with safetensors + config + tokenizer).
         snapshot_dir = self.staging_dir / f"ckpt_{checkpoint_n}"
         snapshot_dir.mkdir(parents=True, exist_ok=True)
@@ -143,6 +170,7 @@ class CheckpointStore:
             signature=signature,
         )
         self._current = entry
+        self._identity_floor = entry
         logger.info(
             "Published checkpoint %d to %s@%s",
             checkpoint_n, self.repo_id, revision[:12],
@@ -156,19 +184,32 @@ class CheckpointStore:
         trainer. The wallet signs at INSTALL time — the attestation
         "this is my current checkpoint" only becomes true once the
         verify plane holds these weights, which is the caller's swap."""
-        revision = require_immutable_checkpoint_revision(
+        candidate = canonical_checkpoint_identity(
+            checkpoint_n,
+            self.repo_id,
             revision,
-            field="external checkpoint revision",
+            field="external checkpoint",
         )
-        sig_payload = f"{int(checkpoint_n)}|{revision}".encode()
+        checkpoint_n, _, revision = candidate
+        if require_checkpoint_successor(
+            self._floor_identity(),
+            candidate,
+            field="external checkpoint",
+        ):
+            assert self._identity_floor is not None
+            self._current = self._identity_floor
+            return self._identity_floor
+
+        sig_payload = f"{checkpoint_n}|{revision}".encode()
         sig_bytes = self.wallet.hotkey.sign(sig_payload)
         entry = ManifestEntry(
-            checkpoint_n=int(checkpoint_n),
+            checkpoint_n=checkpoint_n,
             repo_id=self.repo_id,
             revision=revision,
             signature="ed25519:" + sig_bytes.hex(),
         )
         self._current = entry
+        self._identity_floor = entry
         logger.info(
             "Installed external checkpoint %d (%s@%s)",
             checkpoint_n, self.repo_id, revision[:12],

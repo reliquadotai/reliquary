@@ -1402,6 +1402,8 @@ class ValidatorServer:
         from reliquary.protocol.submission import WindowState
         self._current_state: WindowState = WindowState.READY
         self._current_checkpoint = None  # ManifestEntry | None
+        self._checkpoint_identity_floor: tuple[int, str, str] | None = None
+        self._checkpoint_identity_floor_entry = None
         self._late_drop_callback: Callable[[str, str], None] | None = None
         # Per-hotkey submission counter. Reset every time the active
         # batcher swaps (= window boundary). Read in /submit before any
@@ -2246,20 +2248,27 @@ class ValidatorServer:
         self._archive_queue_snapshot_callback = snapshot_callback
 
     def set_current_checkpoint(self, entry) -> None:
+        candidate_identity = None
+        candidate_is_idempotent = False
         if entry is not None:
             from reliquary.shared.checkpoint_identity import (
-                require_checkpoint_repository,
-                require_immutable_checkpoint_revision,
+                canonical_checkpoint_identity,
+                require_checkpoint_successor,
             )
 
-            require_checkpoint_repository(
+            candidate_identity = canonical_checkpoint_identity(
+                getattr(entry, "checkpoint_n", None),
                 getattr(entry, "repo_id", None),
-                field="advertised checkpoint repository",
-            )
-            require_immutable_checkpoint_revision(
                 getattr(entry, "revision", None),
-                field="advertised checkpoint revision",
+                field="advertised checkpoint",
             )
+            candidate_is_idempotent = require_checkpoint_successor(
+                self._checkpoint_identity_floor,
+                candidate_identity,
+                field="advertised checkpoint",
+            )
+            if candidate_is_idempotent:
+                entry = self._checkpoint_identity_floor_entry
         plan = self._checkpoint_epoch_plan
         plan_differs = plan is not None and (
             entry is None
@@ -2284,6 +2293,9 @@ class ValidatorServer:
             )
         if plan_differs or intent_differs:
             self.set_checkpoint_epoch_plan(None)
+        if candidate_identity is not None and not candidate_is_idempotent:
+            self._checkpoint_identity_floor = candidate_identity
+            self._checkpoint_identity_floor_entry = entry
         self._current_checkpoint = entry
 
     def set_checkpoint_epoch_plan(self, plan: EpochPlan | None) -> None:

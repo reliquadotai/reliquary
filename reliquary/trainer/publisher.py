@@ -16,6 +16,7 @@ import shutil
 from typing import Any, Callable
 
 from reliquary.shared.checkpoint_identity import (
+    require_checkpoint_number,
     require_checkpoint_repository,
     require_immutable_checkpoint_revision,
 )
@@ -60,6 +61,7 @@ class TrainerPublisher:
         tokenizer: Any,
         r2_client: Any,
         bucket: str,
+        checkpoint_number_floor: int | None = None,
         save_fn: Callable[[Any, Any, Path], None] | None = None,
         hf_upload_fn: Callable[..., Any] | None = None,
     ) -> None:
@@ -76,6 +78,14 @@ class TrainerPublisher:
         self._bucket = bucket
         self._save = save_fn or _default_save_hf_format
         self._hf_upload = hf_upload_fn or _default_upload
+        self._checkpoint_number_floor = (
+            require_checkpoint_number(
+                checkpoint_number_floor,
+                field="trainer publisher checkpoint number floor",
+            )
+            if checkpoint_number_floor is not None
+            else None
+        )
         self._previous_mirror_revision: str | None = None
 
     async def publish(
@@ -91,6 +101,18 @@ class TrainerPublisher:
         from reliquary.validator.checkpoint_profile import (
             write_checkpoint_profile,
         )
+
+        checkpoint_n = require_checkpoint_number(
+            checkpoint_n,
+            field="trainer published checkpoint number",
+        )
+        if (
+            self._checkpoint_number_floor is not None
+            and checkpoint_n <= self._checkpoint_number_floor
+        ):
+            raise ValueError(
+                "trainer published checkpoint number must advance monotonically"
+            )
 
         # C3/R25: the key space the cursor below is expressed in, stored
         # beside it so a resume can detect a cutover and migrate exactly
@@ -143,7 +165,7 @@ class TrainerPublisher:
 
             manifest = {
                 **active_training_identity(),
-                "checkpoint_n": int(checkpoint_n),
+                "checkpoint_n": checkpoint_n,
                 "repo_id": self.repo_id,
                 "revision": revision,
                 "trained_window_cursor": int(trained_window_cursor),
@@ -156,6 +178,7 @@ class TrainerPublisher:
                 Key=CANDIDATE_MANIFEST_KEY,
                 Body=json.dumps(manifest).encode("utf-8"),
             )
+            self._checkpoint_number_floor = checkpoint_n
         finally:
             shutil.rmtree(snapshot_dir, ignore_errors=True)
 

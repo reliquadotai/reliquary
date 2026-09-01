@@ -2781,6 +2781,91 @@ def test_server_refuses_to_advertise_mutable_checkpoint_revision():
         )
 
 
+@pytest.mark.parametrize("checkpoint_n", [True, 42.0, "42", -1])
+def test_server_refuses_noncanonical_checkpoint_number(checkpoint_n):
+    from reliquary.validator.checkpoint import ManifestEntry
+
+    server = ValidatorServer()
+    with pytest.raises(ValueError, match="non-negative integer"):
+        server.set_current_checkpoint(
+            ManifestEntry(
+                checkpoint_n=checkpoint_n,
+                repo_id="aivolutionedge/reliquary-sn",
+                revision="a" * 40,
+                signature="ed25519:sig",
+            )
+        )
+    assert server._current_checkpoint is None
+
+
+def test_server_rejects_checkpoint_rollback_and_rebinding():
+    from reliquary.validator.checkpoint import ManifestEntry
+
+    server = ValidatorServer()
+    first = ManifestEntry(
+        checkpoint_n=5,
+        repo_id="aivolutionedge/reliquary-sn",
+        revision="a" * 40,
+        signature="ed25519:first",
+    )
+    server.set_current_checkpoint(first)
+
+    with pytest.raises(ValueError, match="roll back"):
+        server.set_current_checkpoint(
+            ManifestEntry(
+                checkpoint_n=4,
+                repo_id="aivolutionedge/reliquary-sn",
+                revision="b" * 40,
+                signature="ed25519:rollback",
+            )
+        )
+    with pytest.raises(ValueError, match="rebind"):
+        server.set_current_checkpoint(
+            ManifestEntry(
+                checkpoint_n=5,
+                repo_id="aivolutionedge/reliquary-sn",
+                revision="b" * 40,
+                signature="ed25519:rebind",
+            )
+        )
+
+    assert server._current_checkpoint is first
+
+
+def test_server_identity_floor_survives_withdrawal():
+    from reliquary.validator.checkpoint import ManifestEntry
+
+    server = ValidatorServer()
+    first = ManifestEntry(
+        checkpoint_n=5,
+        repo_id="aivolutionedge/reliquary-sn",
+        revision="a" * 40,
+        signature="ed25519:first",
+    )
+    server.set_current_checkpoint(first)
+    server.set_current_checkpoint(None)
+
+    with pytest.raises(ValueError, match="roll back"):
+        server.set_current_checkpoint(
+            ManifestEntry(
+                checkpoint_n=4,
+                repo_id="aivolutionedge/reliquary-sn",
+                revision="b" * 40,
+                signature="ed25519:rollback",
+            )
+        )
+    server.set_current_checkpoint(
+        ManifestEntry(
+            checkpoint_n=5,
+            repo_id="aivolutionedge/reliquary-sn",
+            revision="a" * 40,
+            signature="ed25519:replacement-signature",
+        )
+    )
+
+    assert server._current_checkpoint is first
+
+
 # --- provisional response semantics ---
 
 def test_submit_returns_submitted_under_worker_path():

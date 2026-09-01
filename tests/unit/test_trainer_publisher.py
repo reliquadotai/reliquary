@@ -3,6 +3,8 @@
 import asyncio
 import json
 
+import pytest
+
 from reliquary.trainer.publisher import (
     CANDIDATE_MANIFEST_KEY,
     TrainerPublisher,
@@ -178,6 +180,50 @@ def test_staging_cleaned_on_failure(tmp_path):
             trained_window_cursor=30110, reason="cadence",
         ))
     assert not any(tmp_path.iterdir())
+    assert CANDIDATE_MANIFEST_KEY not in r2.objects
+
+
+@pytest.mark.parametrize("checkpoint_n", [True, 2.0, "2", -1])
+def test_publish_rejects_noncanonical_checkpoint_number(
+    tmp_path, checkpoint_n,
+):
+    r2, order = _R2(), []
+    pub = _publisher(tmp_path, r2, order)
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        asyncio.run(pub.publish(
+            object(), checkpoint_n=checkpoint_n, lr_schedule_step=None,
+            trained_window_cursor=30110, reason="cadence",
+        ))
+
+    assert order == []
+    assert r2.uploads == []
+    assert CANDIDATE_MANIFEST_KEY not in r2.objects
+
+
+@pytest.mark.parametrize("checkpoint_n", [4, 5])
+def test_publish_rejects_checkpoint_number_at_or_below_resume_floor(
+    tmp_path, checkpoint_n,
+):
+    r2, order = _R2(), []
+    pub = TrainerPublisher(
+        repo_id="org/repo",
+        staging_dir=str(tmp_path),
+        tokenizer=None,
+        r2_client=r2,
+        bucket="reliquary",
+        checkpoint_number_floor=5,
+        save_fn=lambda model, tokenizer, path: order.append("save"),
+        hf_upload_fn=lambda **kwargs: order.append("hf"),
+    )
+
+    with pytest.raises(ValueError, match="advance monotonically"):
+        asyncio.run(pub.publish(
+            object(), checkpoint_n=checkpoint_n, lr_schedule_step=None,
+            trained_window_cursor=30110, reason="cadence",
+        ))
+
+    assert order == []
     assert CANDIDATE_MANIFEST_KEY not in r2.objects
 
 

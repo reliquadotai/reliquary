@@ -147,6 +147,35 @@ def test_matching_manifest_rejects_mutable_revision():
         )
 
 
+@pytest.mark.parametrize("checkpoint_n", [True, 2.0, "2", -1])
+def test_matching_manifest_rejects_noncanonical_checkpoint_number(
+    checkpoint_n,
+):
+    with pytest.raises(ValueError, match="non-negative integer"):
+        resolve_resume_point(
+            _manifest_fetch(
+                {
+                    "checkpoint_n": checkpoint_n,
+                    "repo_id": "org/repo",
+                    "revision": REV_5,
+                    "trained_window_cursor": 30110,
+                }
+            ),
+            env={},
+        )
+
+
+def test_bootstrap_rejects_negative_checkpoint_number():
+    with pytest.raises(ValueError, match="non-negative integer"):
+        resolve_resume_point(
+            lambda key: None,
+            env={
+                "RELIQUARY_TRAINER_BOOTSTRAP_CURSOR": "30110",
+                "RELIQUARY_TRAINER_CHECKPOINT_N": "-1",
+            },
+        )
+
+
 def test_bootstrap_rejects_mutable_revision():
     with pytest.raises(ValueError, match="40-character commit OID"):
         resolve_resume_point(
