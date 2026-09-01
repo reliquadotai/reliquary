@@ -388,13 +388,215 @@ def _cryptarithm(rng: HashCounterRng) -> GeneratedLogicTask:
     )
 
 
+# ────────────────  dyck_language_errors  ────────────────
+
+
+def _balanced_sequence(rng: HashCounterRng, pairs: int) -> list[str]:
+    """Emit a fully balanced sequence; the stack always empties."""
+    stack: list[int] = []
+    out: list[str] = []
+    opened = 0
+    while len(out) < pairs * 2:
+        remaining = pairs * 2 - len(out)
+        must_close = len(stack) >= remaining
+        can_open = opened < pairs and not must_close
+        if can_open and (not stack or rng.randbelow(2) == 1):
+            kind = rng.randbelow(len(_BRACKETS))
+            stack.append(kind)
+            out.append(_BRACKETS[kind][0])
+            opened += 1
+        else:
+            out.append(_BRACKETS[stack.pop()][1])
+    return out
+
+
+def _dyck_language_errors(rng: HashCounterRng) -> GeneratedLogicTask:
+    pairs = 5 + rng.randbelow(6)
+    sequence = _balanced_sequence(rng, pairs)
+    closers = [
+        position for position, character in enumerate(sequence)
+        if character in (pair[1] for pair in _BRACKETS)
+    ]
+    # Swap one closer for a different type: the sequence first becomes
+    # invalid at exactly that position, so the answer is unambiguous.
+    target = closers[rng.randbelow(len(closers))]
+    others = [
+        pair[1] for pair in _BRACKETS if pair[1] != sequence[target]
+    ]
+    sequence[target] = others[rng.randbelow(len(others))]
+    prompt = (
+        "The bracket sequence below contains exactly one wrong closing "
+        "bracket. Reading left to right, give the 1-based position of the "
+        "first character at which the sequence becomes invalid.\n\n"
+        f"```\n{''.join(sequence)}\n```\n\n"
+        f"{_ANSWER_SHAPE}"
+    )
+    return GeneratedLogicTask(
+        prompt=prompt,
+        expected=target + 1,
+        operation_id="dyck-error-position-v1",
+        family="dyck_language_errors",
+        difficulty=min(5, 1 + pairs // 3),
+        check="equality",
+        constraints={},
+    )
+
+
+# ────────────────  object_properties  ────────────────
+
+_ITEMS = (
+    "basket", "bottle", "crate", "flask", "jar", "kettle", "lantern",
+    "pouch", "satchel", "tin", "urn", "vase",
+)
+_COLOURS = ("amber", "blue", "green", "grey", "red", "violet")
+_SIZES = ("large", "small", "tiny", "wide")
+_TEXTURES = ("rough", "smooth", "sticky", "worn")
+
+
+def _object_properties(rng: HashCounterRng) -> GeneratedLogicTask:
+    items = list(_ITEMS)
+    rng.shuffle(items)
+    count = 4 + rng.randbelow(3)
+    chosen = items[:count]
+    # Build the answer first, then give every other item a different colour
+    # or size, so exactly one item matches the query by construction.
+    target = rng.randbelow(count)
+    colour = rng.choice(_COLOURS)
+    size = rng.choice(_SIZES)
+    rows = []
+    for position, item in enumerate(chosen):
+        if position == target:
+            rows.append((item, colour, size, rng.choice(_TEXTURES)))
+            continue
+        if rng.randbelow(2) == 1:
+            others = tuple(c for c in _COLOURS if c != colour)
+            rows.append(
+                (item, rng.choice(others), size, rng.choice(_TEXTURES))
+            )
+        else:
+            others = tuple(z for z in _SIZES if z != size)
+            rows.append(
+                (item, colour, rng.choice(others), rng.choice(_TEXTURES))
+            )
+    order = list(range(count))
+    rng.shuffle(order)
+    lines = [
+        f"The {rows[i][0]} is {rows[i][1]}, {rows[i][2]} and {rows[i][3]}."
+        for i in order
+    ]
+    prompt = (
+        f"Exactly one item below is both {colour} and {size}. Name it.\n\n"
+        + "\n".join(lines)
+        + f"\n\nAnswer with the item name as a JSON string.\n\n"
+        f"{_ANSWER_SHAPE}"
+    )
+    return GeneratedLogicTask(
+        prompt=prompt,
+        expected=chosen[target],
+        operation_id="object-properties-v1",
+        family="object_properties",
+        difficulty=min(5, count - 2),
+        check="equality",
+        constraints={},
+    )
+
+
+# ────────────────  operation  ────────────────
+
+
+def _operation(rng: HashCounterRng) -> GeneratedLogicTask:
+    # Widened from 6/6/11/9: the non-nested branch spanned only ~32k
+    # distinct prompts and duplicated 2.35%. Operands stay small so the
+    # arithmetic itself does not get harder.
+    left_coefficient = 2 + rng.randbelow(10)
+    right_coefficient = 2 + rng.randbelow(10)
+    offset = rng.randbelow(19) - 9
+
+    def apply(a: int, b: int) -> int:
+        return left_coefficient * a + right_coefficient * b + offset
+
+    values = [1 + rng.randbelow(12) for _ in range(3)]
+    nested = rng.randbelow(2) == 1
+    if nested:
+        inner = apply(values[0], values[1])
+        expected = apply(inner, values[2])
+        expression = f"({values[0]} @ {values[1]}) @ {values[2]}"
+    else:
+        expected = apply(values[0], values[1])
+        expression = f"{values[0]} @ {values[1]}"
+    sign = "+" if offset >= 0 else "-"
+    prompt = (
+        "A new operator is defined as "
+        f"a @ b = {left_coefficient}a + {right_coefficient}b "
+        f"{sign} {abs(offset)}.\n\n"
+        f"Compute {expression}.\n\n"
+        "Answer with the resulting integer.\n\n"
+        f"{_ANSWER_SHAPE}"
+    )
+    return GeneratedLogicTask(
+        prompt=prompt,
+        expected=expected,
+        operation_id="custom-operator-v1",
+        family="operation",
+        difficulty=3 if nested else 2,
+        check="equality",
+        constraints={},
+    )
+
+
+# ────────────────  time_sequence  ────────────────
+
+_ARRIVERS = (
+    "Ada", "Bo", "Cleo", "Dmitri", "Elena", "Farid", "Greta", "Hugo",
+    "Ines", "Jonas", "Kira", "Liam",
+)
+
+
+def _time_sequence(rng: HashCounterRng) -> GeneratedLogicTask:
+    names = list(_ARRIVERS)
+    rng.shuffle(names)
+    count = 3 + rng.randbelow(3)
+    chosen = names[:count]
+    minutes = [7 * 60 + rng.randbelow(180)]
+    lines = [
+        f"{chosen[0]} arrived at "
+        f"{minutes[0] // 60:02d}:{minutes[0] % 60:02d}."
+    ]
+    for index in range(1, count):
+        delta = 5 + rng.randbelow(56)
+        after = rng.randbelow(2) == 1
+        minutes.append(minutes[index - 1] + (delta if after else -delta))
+        lines.append(
+            f"{chosen[index]} arrived {delta} minutes "
+            f"{'after' if after else 'before'} {chosen[index - 1]}."
+        )
+    target = 1 + rng.randbelow(count - 1)
+    total = minutes[target] % (24 * 60)
+    prompt = (
+        "\n".join(lines)
+        + f"\n\nAt what time did {chosen[target]} arrive? Answer with a "
+        'JSON string in 24-hour HH:MM form.\n\n'
+        f"{_ANSWER_SHAPE}"
+    )
+    return GeneratedLogicTask(
+        prompt=prompt,
+        expected=f"{total // 60:02d}:{total % 60:02d}",
+        operation_id="time-sequence-v1",
+        family="time_sequence",
+        difficulty=min(5, count),
+        check="equality",
+        constraints={},
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class Family:
     """One task family and whether the contract currently draws from it.
 
     ``band`` records the share of 16-rollout groups clearing SIGMA_MIN on
     Qwen3-4B-Base under the profile's sampling contract, so the roster
-    carries the evidence behind each decision.
+    carries the evidence behind each decision. ``-1.0`` means not yet
+    measured.
     """
 
     name: str
@@ -407,11 +609,15 @@ class Family:
 # a modulo over the active list, so a different roster is a different corpus.
 # Never compare band measurements taken under different rosters.
 _FAMILY_REGISTRY = (
-    Family("boolean_expressions", _boolean_expressions, True, 0.984),
+    Family("boolean_expressions", _boolean_expressions, True, 1.000),
     Family("cipher", _cipher, False, 0.000),
-    Family("cryptarithm", _cryptarithm, True, 0.109),
-    Family("dyck_language", _dyck_language, True, 0.562),
-    Family("numbrix", _numbrix, True, 0.266),
+    Family("cryptarithm", _cryptarithm, True, 0.141),
+    Family("dyck_language", _dyck_language, True, 0.641),
+    Family("dyck_language_errors", _dyck_language_errors, True, 0.719),
+    Family("numbrix", _numbrix, True, 0.250),
+    Family("object_properties", _object_properties, True, 0.984),
+    Family("operation", _operation, True, 1.000),
+    Family("time_sequence", _time_sequence, True, 1.000),
     Family("web_of_lies", _web_of_lies, True, 1.000),
 )
 

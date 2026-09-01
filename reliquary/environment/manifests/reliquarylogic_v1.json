@@ -6,7 +6,7 @@
   "generator_version": "logic-v1",
   "checker_version": "logic-checker-v1",
   "golden_fixture": "tests/fixtures/reliquarylogic_v1.jsonl",
-  "golden_fixture_sha256": "e51252cc18c3946b59626a6362607fc5353edbfd41a5f537a7f2704a6b494dc5",
+  "golden_fixture_sha256": "71f146de91c02972f2995976c7d2a044430959b194d040525631935d04b8b379",
   "implementation_digest_algorithm": "sha256-path-nul-file-sha256-newline-v1",
   "implementation_files": [
     "reliquary/environment/logic_tasks.py",
@@ -14,7 +14,7 @@
     "reliquary/environment/reliquarylogic.py",
     "reliquary/environment/structured_output.py"
   ],
-  "implementation_sha256": "e6e8a3828fd21b869ae5bcb15418fbe8e11c609d8da96b263a6cef45c5b03d30",
+  "implementation_sha256": "6529f3d601d7808d0b4272e25fb0c99fab91e1926b83f25758ef8eb4706afac1",
   "virtual_length": 2147483648,
   "protocol_reward_lattice": [
     0.0,
@@ -30,7 +30,11 @@
     "boolean_expressions",
     "cryptarithm",
     "dyck_language",
+    "dyck_language_errors",
     "numbrix",
+    "object_properties",
+    "operation",
+    "time_sequence",
     "web_of_lies"
   ],
   "reward": "deterministic-binary-outcome-v1",
@@ -39,7 +43,11 @@
     "cryptarithm": "constraint-satisfaction (any assignment making the sum hold)",
     "dyck_language": "equality",
     "numbrix": "constraint-satisfaction (no unique-solution requirement)",
-    "web_of_lies": "equality"
+    "web_of_lies": "equality",
+    "dyck_language_errors": "equality",
+    "object_properties": "equality",
+    "operation": "equality",
+    "time_sequence": "equality"
   },
   "limits": {
     "completion_bytes": 16384,
@@ -60,11 +68,15 @@
     "cipher"
   ],
   "measured_band_qwen3_4b_base": {
-    "boolean_expressions": 0.984,
+    "boolean_expressions": 1.0,
+    "operation": 1.0,
+    "time_sequence": 1.0,
     "web_of_lies": 1.0,
-    "dyck_language": 0.562,
-    "numbrix": 0.266,
-    "cryptarithm": 0.109,
+    "object_properties": 0.984,
+    "dyck_language_errors": 0.719,
+    "dyck_language": 0.641,
+    "numbrix": 0.25,
+    "cryptarithm": 0.141,
     "cipher": 0.0
   }
 }

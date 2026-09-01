@@ -54,14 +54,16 @@ def test_generator_is_total_over_a_wide_index_range():
         assert task.check in (
             "equality", "numbrix_path", "cryptarithm_sum",
         )
+        assert task.family in FAMILIES
 
 
 # cipher was removed after measurement: 0.0% of groups in the sigma band on
 # Qwen3-4B-Base, with 76% valid JSON and 99.5% EOS. Well-formed and always
 # wrong is a capability wall, not a difficulty setting.
 FAMILIES = {
-    "boolean_expressions", "cryptarithm",
-    "dyck_language", "numbrix", "web_of_lies",
+    "boolean_expressions", "cryptarithm", "dyck_language",
+    "dyck_language_errors", "numbrix", "object_properties",
+    "operation", "time_sequence", "web_of_lies",
 }
 
 
@@ -358,4 +360,5 @@ def test_roster_matches_what_the_generator_actually_draws():
     assert inactive, "cipher is retained as evidence of a measured verdict"
     for family in _FAMILY_REGISTRY:
         assert callable(family.generator)
-        assert 0.0 <= family.band <= 1.0
+        # -1.0 marks a family whose band has not been measured yet.
+        assert family.band == -1.0 or 0.0 <= family.band <= 1.0
