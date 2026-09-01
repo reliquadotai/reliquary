@@ -4,6 +4,14 @@ Provides the Environment protocol and a factory function to instantiate
 concrete environments by name.
 """
 
+from reliquary.environment.abi import (
+    EnvironmentAdapter,
+    EnvironmentManifest,
+    EnvironmentRegistry,
+    TaskEnvelope,
+    TrajectoryEnvelope,
+    TrajectoryEvent,
+)
 from reliquary.environment.base import Environment
 from reliquary.environment.openmathinstruct import OpenMathInstructEnvironment
 from reliquary.environment.opencodeinstruct import OpenCodeInstructEnvironment
@@ -34,6 +42,12 @@ def load_environments(names: list[str]) -> dict[str, Environment]:
 
 __all__ = [
     "Environment",
+    "EnvironmentAdapter",
+    "EnvironmentManifest",
+    "EnvironmentRegistry",
+    "TaskEnvelope",
+    "TrajectoryEnvelope",
+    "TrajectoryEvent",
     "load_environment",
     "load_environments",
 ]
