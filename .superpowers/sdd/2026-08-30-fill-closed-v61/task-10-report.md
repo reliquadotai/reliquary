@@ -234,3 +234,74 @@ the controller runs it at the final pass). Targeted runs green:
 `test_training_payload_queue.py` 25/25, `test_pick_pacing.py` 24/24,
 `test_cli_cursor_queue.py`/`test_trainer_worker.py`/`test_trainer_journal.py`
 all green.
+
+## Fix round 3 (final-review #1/#3/#4)
+
+R40. Whole-amendment review found one Critical and two Importants, all in
+my files.
+
+**#1 Critical — cursor GET blocking the miner-serving event loop.** Fixed
+all three parts, in `training_payload_queue.py`:
+- (a) Memoised client: `_cached_step_cursor_client()`, a module-level
+  singleton (`_STEP_CURSOR_CLIENT`) built once under a lock (double-checked
+  locking), reused by every `_default_fetch_step_cursor()` call instead of
+  a fresh `boto3.client(...)` (~50-200ms) each time.
+- (b) Non-blocking call site: chose **fire-and-collect over
+  `asyncio.to_thread`**. Reason: there are now TWO call sites through
+  `_read_trainer_step_cursor` (the pick gate, and — new since R39 landed
+  mid-amendment — the rotation-wait's `consumed()` closure at
+  `service.py:~1547`), and both call it as a **plain synchronous method**.
+  Threading `await`/`async def` through both chains (and their sync
+  wrapper closures) would ripple across two independent call chains in a
+  file I do not otherwise own this round. Fire-and-collect fixes both
+  call sites with **zero changes to service.py's call shape**: `fetch_step_cursor`
+  now returns the last COMPLETED value immediately and kicks a background
+  `threading.Thread` (in-flight-guarded, so never more than one
+  concurrent fetch) only when the cached value is stale. A one-tick-stale
+  cursor is harmless — the pick gate's comparison is `>=`, so staleness
+  only ever holds a pick back a little longer, never opens one early.
+- (c) ~2s value cache: `_STEP_CURSOR_CACHE_TTL_SECONDS = 2.0` (matches
+  `service.FILL_CLOSED_ROTATION_POLL_SECONDS` by value; importing it
+  would be circular). Reversed `fetch_step_cursor`'s docstring, which
+  used to explicitly refuse caching — throttling now lives in the queue,
+  not the caller. On a fetch FAILURE the cache is left at its last good
+  value (never regressed to `None`), so a transient R2 hiccup degrades to
+  "slightly stale" rather than repeatedly stalling the gate; the TTL
+  clock still resets on every completion (success or failure), giving a
+  natural ~2s retry cadence during a real outage instead of hammering
+  every poll tick.
+
+**#3 Important — stale gap docstring.** `service._read_trainer_step_cursor`'s
+docstring said "nothing downloads it back on this side" three lines above
+the code that does. Rewrote it to describe the actual R38/R40 transport
+(fire-and-collect, cached, safe on every poll tick). One-paragraph,
+docstring-only diff — confirmed via `git diff` (no other line in the file
+touched).
+
+**#4 Important — unchanged-object upload forever, every profile.** Added
+`self._step_cursor_last_uploaded_body` (per-queue-instance). `_try_upload`
+now short-circuits (no network call, no counters moved) when
+`path.name == step-cursor.json` and its freshly-read local body equals the
+last body actually uploaded — an idle trainer between real steps no
+longer PUTs an identical object every ~2s forever on v4/v5 too (~43k
+Class A ops/day/trainer before this fix). A genuinely new step (different
+`journal_key` or `written_at`) still uploads promptly.
+
+TDD, watched red first (14 tests failed before the change: `AttributeError:
+_STEP_CURSOR_CLIENT` and a same-body-twice assertion). Now green — new/
+updated tests cover: client memoisation (two `_default_fetch_step_cursor()`
+calls, one `boto3.client` construction); the value cache (repeated calls
+within the TTL window → one fetch); the in-flight guard (two calls before
+the first fetch resolves → one fetch, via a `threading.Event` gate, no
+sleep-based flakiness); failure keeps the last good value instead of
+regressing to `None`; and the changed-only upload (same body twice → one
+PUT; a real rewrite → a second PUT). All existing `fetch_step_cursor`
+tests from round 2 were updated for the new fire-and-collect contract
+(kick + join + re-read, instead of expecting the fetched value on the
+same call) rather than deleted.
+
+`tests/unit/test_training_payload_queue.py`: 30/30. `test_pick_pacing.py`:
+24/24 (exercises BOTH `_read_trainer_step_cursor` call sites — the pick
+gate and the R39 rotation-wait — through the same `_CursorQueue` fake).
+`test_cli_cursor_queue.py`: 4/4. Full-suite result appended below once the
+background run finishes.

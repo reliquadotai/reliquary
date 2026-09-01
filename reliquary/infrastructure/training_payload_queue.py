@@ -14,8 +14,9 @@ import json
 import logging
 import os
 from pathlib import Path
+import threading
 import time
-from typing import Callable
+from typing import Any, Callable
 
 from reliquary.constants import (
     FILL_CLOSED_EMISSIONS_PER_WINDOW,
@@ -33,6 +34,12 @@ _PAYLOAD_SUFFIX = ".npz"
 _TOMBSTONE_SUFFIX = ".tombstone.json"
 _EPOCH_MARKER_SUFFIX = ".epoch.json"
 _STEP_CURSOR_FILENAME = "step-cursor.json"
+
+# R40 #1c: fetch_step_cursor's cache TTL. Matches the order of magnitude
+# of service.FILL_CLOSED_ROTATION_POLL_SECONDS (2.0) by value, not by
+# import -- importing from reliquary.validator.service here would be
+# circular (service.py imports this module).
+_STEP_CURSOR_CACHE_TTL_SECONDS = 2.0
 
 
 def payload_key(window_start: int) -> str:
@@ -166,12 +173,36 @@ def _default_delete(key: str) -> None:
 
 # R38: deliberately tighter than the upload/delete config above. Those run
 # off the hot path inside the background drain loop and can afford 15s
-# connect / 30s read with up to 3 retries. This one backs a SYNCHRONOUS
-# call on the validator's pick-gate poll (``_wait_for_window_seal``'s 0.5s
-# cadence, see ``service._read_trainer_step_cursor``) -- a hung store must
-# fail fast, not stall that cadence, so: short timeouts, no retry.
+# connect / 30s read with up to 3 retries. This one backs the trainer
+# step-cursor GET -- a hung store must fail fast, not stall a poller, so:
+# short timeouts, no retry.
 _STEP_CURSOR_FETCH_CONNECT_TIMEOUT_SECONDS = 2
 _STEP_CURSOR_FETCH_READ_TIMEOUT_SECONDS = 2
+
+# R40 #1a: a fresh boto3 client costs ~50-200ms to construct on its own,
+# on top of the network round trip -- paid on every single poll tick
+# before this. One client, built once on first use, reused forever.
+# boto3 clients are safe for concurrent use (the SDK's own documented
+# pattern); the lock only guards the one-time construction race.
+_STEP_CURSOR_CLIENT: Any = None
+_STEP_CURSOR_CLIENT_LOCK = threading.Lock()
+
+
+def _cached_step_cursor_client() -> Any:
+    global _STEP_CURSOR_CLIENT
+    if _STEP_CURSOR_CLIENT is None:
+        with _STEP_CURSOR_CLIENT_LOCK:
+            if _STEP_CURSOR_CLIENT is None:
+                from botocore.config import Config
+
+                _STEP_CURSOR_CLIENT = _r2_client(
+                    Config(
+                        connect_timeout=_STEP_CURSOR_FETCH_CONNECT_TIMEOUT_SECONDS,
+                        read_timeout=_STEP_CURSOR_FETCH_READ_TIMEOUT_SECONDS,
+                        retries={"max_attempts": 1, "mode": "standard"},
+                    )
+                )
+    return _STEP_CURSOR_CLIENT
 
 
 def _default_fetch_step_cursor() -> bytes | None:
@@ -181,18 +212,11 @@ def _default_fetch_step_cursor() -> bytes | None:
     validator reading what the detached trainer's drain uploaded).
 
     Returns ``None`` on ANY failure (missing key, network error, timeout)
-    -- never raises. See the module-level timeout constants above for why
-    this config is deliberately tighter than the upload/delete path's.
+    -- never raises. Uses the memoised client (``_cached_step_cursor_client``)
+    with a config deliberately tighter than the upload/delete path's (see
+    the module-level timeout constants above).
     """
-    from botocore.config import Config
-
-    client = _r2_client(
-        Config(
-            connect_timeout=_STEP_CURSOR_FETCH_CONNECT_TIMEOUT_SECONDS,
-            read_timeout=_STEP_CURSOR_FETCH_READ_TIMEOUT_SECONDS,
-            retries={"max_attempts": 1, "mode": "standard"},
-        )
-    )
+    client = _cached_step_cursor_client()
     try:
         response = client.get_object(
             Bucket=os.getenv("R2_BUCKET_ID", "reliquary"),
@@ -225,6 +249,18 @@ class TrainingPayloadQueue:
         self._upload_failures_total = 0
         self._last_upload_success_ts: float | None = None
         self._last_upload_failure_ts: float | None = None
+        # R40 #1: fetch_step_cursor's fire-and-collect cache. 0.0 reads as
+        # "infinitely stale" against time.monotonic() (always positive),
+        # so the first call always kicks a fetch.
+        self._step_cursor_cache_value: int | None = None
+        self._step_cursor_cache_at: float = 0.0
+        self._step_cursor_cache_lock = threading.Lock()
+        self._step_cursor_fetch_in_flight = False
+        self._step_cursor_fetch_thread: threading.Thread | None = None
+        # R40 #4: last body this instance's drain actually uploaded, so an
+        # unchanged cursor (idle trainer between real steps) is not
+        # re-PUT every drain cycle forever.
+        self._step_cursor_last_uploaded_body: bytes | None = None
 
     # ---------------- producer ----------------
 
@@ -324,39 +360,80 @@ class TrainingPayloadQueue:
     def fetch_step_cursor(
         self, fetch_fn: Callable[[], bytes | None] | None = None,
     ) -> int | None:
-        """One bounded REMOTE GET of the trainer's step-cursor object.
+        """The last COMPLETED remote read of the trainer's step-cursor
+        object -- NEVER blocks on network I/O.
 
         ``read_step_cursor`` reads the LOCAL file THIS process's own
         drain wrote -- of no use to a DIFFERENT process reading what
         ANOTHER process's drain already uploaded (R38: the validator
         reading what the detached trainer published; the two run on
-        different hosts and never share a local queue_dir). This
-        performs one GET instead, by default through
-        ``_default_fetch_step_cursor`` (the same client-construction
-        helper the drain's other direct R2 calls use, with a short,
-        non-retrying timeout so a hung store fails fast).
+        different hosts and never share a local queue_dir).
 
-        Same "never raises" contract as ``read_step_cursor``: a missing
-        key, network error, timeout, or an unparseable/wrong-schema body
-        all read as ``None`` -- there is no way here to distinguish "no
-        cursor yet" from "couldn't check", and the caller (a pick gate)
-        must treat both as "not yet" rather than take the poll loop down.
+        R40 #1: this call site sits on the validator's miner-serving
+        event loop (``_wait_for_window_seal``'s 0.5s poll tick, and the
+        rotation-wait's own poll), so a synchronous GET here -- even a
+        short-timeout one -- would still stall that loop in multi-second
+        chunks under an R2 outage (picks 3..16 of every window). Instead
+        this is fire-and-collect, cached: it returns the LAST value a
+        background fetch completed with, immediately, and kicks a NEW
+        background fetch only when that value is stale (>=
+        ``_STEP_CURSOR_CACHE_TTL_SECONDS``, matching the order of
+        magnitude of ``service.FILL_CLOSED_ROTATION_POLL_SECONDS``) AND
+        no fetch is already in flight -- so at most one GET runs at a
+        time, and at most one per TTL window regardless of how often the
+        caller polls. The throttle lives HERE, not with the caller
+        (superseding the previous "makes no attempt to cache" contract).
 
-        Throttling lives with the CALLER, not here:
-        ``service._read_trainer_step_cursor`` is consulted at most once
-        per gated pick check inside ``_wait_for_window_seal``'s 0.5s
-        poll; this method makes no attempt to cache or rate-limit a
-        repeated call on its own -- the bounded per-call timeout is what
-        keeps a single hung call from stalling that cadence, not caching.
+        A cursor up to one TTL window stale is harmless: the pick gate's
+        comparison is ``>=``, and a stale-but-still-valid cursor merely
+        holds a pick back by up to that same window, never opens one
+        early. On a fetch FAILURE (network error, timeout, missing key,
+        bad schema) the cache is left at whatever it already held --
+        never regressed to ``None`` -- so a transient R2 hiccup degrades
+        to "slightly stale" rather than "picks stop", which the fetch
+        would otherwise cause every time it was consulted during an
+        outage. The very first call, before anything has ever completed,
+        returns ``None`` (which the gate already treats as "not yet").
         """
         fn = fetch_fn or _default_fetch_step_cursor
+        now = time.monotonic()
+        with self._step_cursor_cache_lock:
+            stale = (
+                now - self._step_cursor_cache_at
+                >= _STEP_CURSOR_CACHE_TTL_SECONDS
+            )
+            kick = stale and not self._step_cursor_fetch_in_flight
+            if kick:
+                self._step_cursor_fetch_in_flight = True
+            value = self._step_cursor_cache_value
+        if kick:
+            thread = threading.Thread(
+                target=self._refresh_step_cursor_cache,
+                args=(fn,),
+                daemon=True,
+                name="step-cursor-fetch",
+            )
+            self._step_cursor_fetch_thread = thread
+            thread.start()
+        return value
+
+    def _refresh_step_cursor_cache(
+        self, fn: Callable[[], bytes | None],
+    ) -> None:
+        """Background-thread body kicked by ``fetch_step_cursor``."""
         try:
             raw = fn()
         except Exception:
-            return None
-        if raw is None:
-            return None
-        return _parse_step_cursor(raw)
+            raw = None
+        parsed = None if raw is None else _parse_step_cursor(raw)
+        with self._step_cursor_cache_lock:
+            if parsed is not None:
+                self._step_cursor_cache_value = parsed
+            # Reset the TTL clock on EVERY completion, success or not --
+            # this is what turns a repeated failure into a natural ~TTL
+            # retry cadence instead of hammering every poll tick.
+            self._step_cursor_cache_at = time.monotonic()
+            self._step_cursor_fetch_in_flight = False
 
     # ---------------- consumer ----------------
 
@@ -421,6 +498,22 @@ class TrainingPayloadQueue:
         except OSError as e:
             logger.error("TrainingPayloadQueue: failed to read %s: %s", path, e)
             return False
+        if (
+            path.name == _STEP_CURSOR_FILENAME
+            and body == self._step_cursor_last_uploaded_body
+        ):
+            # R40 #4: unlike a payload/tombstone, the cursor is never
+            # deleted after upload (it must stay local, overwritten in
+            # place) -- so it re-enters ``_pending()`` on EVERY drain
+            # cycle regardless of whether the trainer took a new step
+            # since the last one. Without this check an idle trainer PUTs
+            # an identical object every ~2s forever, on every profile
+            # including v4/v5 where nothing even reads it: ~43k Class A
+            # ops/day/trainer, and this repo has hit a real R2 Class A
+            # billing incident from exactly this shape of waste before.
+            # A genuinely new step still uploads promptly (different
+            # body -- journal_key or written_at differs).
+            return True
         if path.name.startswith("epoch-"):
             from reliquary.shared.training_payload import (
                 decode_checkpoint_epoch_marker,
@@ -473,8 +566,9 @@ class TrainingPayloadQueue:
         if path.name == _STEP_CURSOR_FILENAME:
             # Not a consumed-once queue entry: a single overwritten object
             # that must stay local so the next step's write can replace it
-            # in place. It re-uploads (idempotently) every drain cycle
-            # until the next write changes it.
+            # in place. Remember what was just uploaded (R40 #4) so the
+            # NEXT drain cycle can skip re-uploading if nothing changed.
+            self._step_cursor_last_uploaded_body = body
             return True
         try:
             path.unlink()

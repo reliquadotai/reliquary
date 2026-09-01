@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import threading
 
 import pytest
 
@@ -190,7 +191,13 @@ def test_step_cursor_uploads_via_same_transport_and_stays_local(tmp_path):
     assert (tmp_path / "step-cursor.json").exists()
 
 
-# ---------------- R38: fetch_step_cursor (remote read) ----------------
+# ---------------- R38/R40: fetch_step_cursor (remote read) ------------
+# R40 #1: fetch_step_cursor is fire-and-collect -- a call NEVER blocks on
+# network I/O. It returns the last COMPLETED value immediately and, when
+# that value is stale (>= the TTL) and no fetch is already in flight,
+# kicks a background thread to refresh it. Tests that need to observe a
+# freshly-fetched value join the kicked thread
+# (``q._step_cursor_fetch_thread``) before reading the cache again.
 
 
 def test_fetch_step_cursor_round_trips_through_a_shared_remote_store(
@@ -213,28 +220,37 @@ def test_fetch_step_cursor_round_trips_through_a_shared_remote_store(
 
     reader = TrainingPayloadQueue(queue_dir=str(tmp_path / "validator"))
     assert reader.read_step_cursor() is None  # nothing local to this side
-    got = reader.fetch_step_cursor(
+    # First call: cache is cold, returns None immediately, kicks a fetch.
+    assert reader.fetch_step_cursor(
         fetch_fn=lambda: remote_store.get(step_cursor_key())
-    )
-    assert got == 30142
+    ) is None
+    reader._step_cursor_fetch_thread.join(timeout=2)
+    # Cache now warm -- a later call sees it without another GET.
+    assert reader.fetch_step_cursor() == 30142
 
 
-def test_fetch_step_cursor_absent_key_reads_none(tmp_path):
+def test_fetch_step_cursor_absent_key_stays_none(tmp_path):
     q = TrainingPayloadQueue(queue_dir=str(tmp_path))
-    assert q.fetch_step_cursor(fetch_fn=lambda: None) is None
+    q.fetch_step_cursor(fetch_fn=lambda: None)
+    q._step_cursor_fetch_thread.join(timeout=2)
+    assert q.fetch_step_cursor() is None
 
 
-def test_fetch_step_cursor_corrupt_body_reads_none(tmp_path):
+def test_fetch_step_cursor_corrupt_body_stays_none(tmp_path):
     q = TrainingPayloadQueue(queue_dir=str(tmp_path))
-    assert q.fetch_step_cursor(fetch_fn=lambda: b"{not valid json") is None
+    q.fetch_step_cursor(fetch_fn=lambda: b"{not valid json")
+    q._step_cursor_fetch_thread.join(timeout=2)
+    assert q.fetch_step_cursor() is None
 
 
-def test_fetch_step_cursor_missing_field_reads_none(tmp_path):
+def test_fetch_step_cursor_missing_field_stays_none(tmp_path):
     q = TrainingPayloadQueue(queue_dir=str(tmp_path))
-    assert q.fetch_step_cursor(fetch_fn=lambda: b"{}") is None
+    q.fetch_step_cursor(fetch_fn=lambda: b"{}")
+    q._step_cursor_fetch_thread.join(timeout=2)
+    assert q.fetch_step_cursor() is None
 
 
-def test_fetch_step_cursor_network_error_reads_none_not_an_exception(
+def test_fetch_step_cursor_network_error_never_raises_and_stays_none(
     tmp_path,
 ):
     q = TrainingPayloadQueue(queue_dir=str(tmp_path))
@@ -242,7 +258,32 @@ def test_fetch_step_cursor_network_error_reads_none_not_an_exception(
     def timed_out():
         raise TimeoutError("connect timed out")
 
+    # Must not raise even though the exception happens on the background
+    # thread the very first call kicks.
     assert q.fetch_step_cursor(fetch_fn=timed_out) is None
+    q._step_cursor_fetch_thread.join(timeout=2)
+    assert q.fetch_step_cursor() is None
+
+
+def test_fetch_step_cursor_keeps_the_last_good_value_on_a_later_failure(
+    tmp_path,
+):
+    """A transient R2 hiccup after a prior successful fetch must not
+    regress a known-good cursor back to None -- that would needlessly
+    stall the pick gate through exactly the brief outage this cache
+    exists to smooth over."""
+    q = TrainingPayloadQueue(queue_dir=str(tmp_path))
+    q.fetch_step_cursor(fetch_fn=lambda: b'{"journal_key": 9}')
+    q._step_cursor_fetch_thread.join(timeout=2)
+    assert q.fetch_step_cursor() == 9
+
+    def boom():
+        raise RuntimeError("r2 down")
+
+    q._step_cursor_cache_at = 0.0  # force staleness so the next call fetches
+    q.fetch_step_cursor(fetch_fn=boom)
+    q._step_cursor_fetch_thread.join(timeout=2)
+    assert q.fetch_step_cursor() == 9
 
 
 def test_fetch_step_cursor_default_fetch_fn_is_used_when_none_given(
@@ -258,7 +299,53 @@ def test_fetch_step_cursor_default_fetch_fn_is_used_when_none_given(
         lambda: b'{"journal_key": 55, "written_at": 1.0}',
     )
     q = TrainingPayloadQueue(queue_dir=str(tmp_path))
+    q.fetch_step_cursor()
+    q._step_cursor_fetch_thread.join(timeout=2)
     assert q.fetch_step_cursor() == 55
+
+
+def test_fetch_step_cursor_value_cache_limits_gets_to_one_per_window(
+    tmp_path,
+):
+    """R40 #1c: at most one GET per TTL window regardless of poll rate --
+    the throttle moved into the queue, off the caller."""
+    q = TrainingPayloadQueue(queue_dir=str(tmp_path))
+    calls = []
+
+    def counting_fetch():
+        calls.append(1)
+        return b'{"journal_key": 42}'
+
+    q.fetch_step_cursor(fetch_fn=counting_fetch)
+    q._step_cursor_fetch_thread.join(timeout=2)
+    assert len(calls) == 1
+
+    # Two more calls inside the TTL window: no new GET, even with a
+    # fetch_fn passed each time -- the cache decides, not the caller.
+    q.fetch_step_cursor(fetch_fn=counting_fetch)
+    assert q.fetch_step_cursor(fetch_fn=counting_fetch) == 42
+    assert len(calls) == 1
+
+
+def test_fetch_step_cursor_never_runs_two_fetches_concurrently(tmp_path):
+    """The in-flight guard, not just the TTL: two calls made before the
+    first fetch has finished must still only ever run one GET."""
+    q = TrainingPayloadQueue(queue_dir=str(tmp_path))
+    gate = threading.Event()
+    calls = []
+
+    def slow_fetch():
+        calls.append(1)
+        gate.wait(timeout=2)
+        return b'{"journal_key": 7}'
+
+    q.fetch_step_cursor(fetch_fn=slow_fetch)
+    # Called again immediately, while the first fetch is still blocked on
+    # the gate -- must not kick a second thread.
+    q.fetch_step_cursor(fetch_fn=slow_fetch)
+    gate.set()
+    q._step_cursor_fetch_thread.join(timeout=2)
+    assert len(calls) == 1
 
 
 class _FakeStreamingBody:
@@ -274,11 +361,12 @@ def test_default_fetch_step_cursor_uses_a_short_bounded_non_retrying_client(
 ):
     """The drain's PUT/DELETE tolerate 15s connect / 30s read with up to
     3 retries because they run off the hot path in a background drain.
-    This call sits on the validator's 0.5s pick-gate poll cadence and
-    must fail fast instead -- pins the actual production Config, not just
-    the injectable seam."""
+    This call sits on the validator's pick-gate poll cadence and must
+    fail fast instead -- pins the actual production Config, not just the
+    injectable seam."""
     import reliquary.infrastructure.training_payload_queue as queue_module
 
+    monkeypatch.setattr(queue_module, "_STEP_CURSOR_CLIENT", None)
     captured = {}
 
     def fake_boto3_client(service, **kwargs):
@@ -306,6 +394,10 @@ def test_default_fetch_step_cursor_uses_a_short_bounded_non_retrying_client(
 
 
 def test_default_fetch_step_cursor_swallows_get_object_failure(monkeypatch):
+    import reliquary.infrastructure.training_payload_queue as queue_module
+
+    monkeypatch.setattr(queue_module, "_STEP_CURSOR_CLIENT", None)
+
     def fake_boto3_client(service, **kwargs):
         class _Client:
             def get_object(self, **_kwargs):
@@ -314,9 +406,31 @@ def test_default_fetch_step_cursor_swallows_get_object_failure(monkeypatch):
         return _Client()
 
     monkeypatch.setattr("boto3.client", fake_boto3_client)
+    assert queue_module._default_fetch_step_cursor() is None
+
+
+def test_default_fetch_step_cursor_reuses_one_memoised_client(monkeypatch):
+    """R40 #1a: constructing a boto3 client costs ~50-200ms; a fresh
+    client per call used to pay that on every poll tick. One
+    construction, reused."""
     import reliquary.infrastructure.training_payload_queue as queue_module
 
-    assert queue_module._default_fetch_step_cursor() is None
+    monkeypatch.setattr(queue_module, "_STEP_CURSOR_CLIENT", None)
+    constructions = []
+
+    def fake_boto3_client(service, **kwargs):
+        constructions.append(1)
+
+        class _Client:
+            def get_object(self, **_kwargs):
+                return {"Body": _FakeStreamingBody(b'{"journal_key": 1}')}
+
+        return _Client()
+
+    monkeypatch.setattr("boto3.client", fake_boto3_client)
+    queue_module._default_fetch_step_cursor()
+    queue_module._default_fetch_step_cursor()
+    assert len(constructions) == 1
 
 
 def test_default_delete_and_default_fetch_step_cursor_share_client_construction(
@@ -327,6 +441,7 @@ def test_default_delete_and_default_fetch_step_cursor_share_client_construction(
     helper rather than each re-deriving account/endpoint/credentials."""
     import reliquary.infrastructure.training_payload_queue as queue_module
 
+    monkeypatch.setattr(queue_module, "_STEP_CURSOR_CLIENT", None)
     endpoints_seen = []
 
     def fake_boto3_client(service, **kwargs):
@@ -351,3 +466,27 @@ def test_default_delete_and_default_fetch_step_cursor_share_client_construction(
     assert len(endpoints_seen) == 2
     assert endpoints_seen[0] == endpoints_seen[1]
     assert "acct123" in endpoints_seen[0]
+
+
+# ---------------- R40 #4: drain skips an unchanged cursor upload -------
+
+
+def test_step_cursor_drain_skips_upload_when_body_is_unchanged(tmp_path):
+    """An idle trainer (between real steps) must not PUT an identical
+    step-cursor object every ~2s forever -- this repo has hit a real R2
+    Class A billing incident from exactly this shape of waste before."""
+    q = TrainingPayloadQueue(queue_dir=str(tmp_path))
+    q.write_step_cursor(30142)
+    uploads = []
+    asyncio.run(q.drain_once(upload_fn=lambda k, d: uploads.append(d)))
+    assert len(uploads) == 1
+
+    # Second drain cycle, nothing rewrote the local file -- same bytes,
+    # must not upload again.
+    asyncio.run(q.drain_once(upload_fn=lambda k, d: uploads.append(d)))
+    assert len(uploads) == 1
+
+    # A real step writes a NEW cursor -- must upload again promptly.
+    q.write_step_cursor(30143)
+    asyncio.run(q.drain_once(upload_fn=lambda k, d: uploads.append(d)))
+    assert len(uploads) == 2

@@ -3357,26 +3357,25 @@ class ValidationService:
     def _read_trainer_step_cursor(self) -> int | None:
         """The last journal key the trainer reported CONSUMING, or None.
 
-        Amendment v6.1 point 2. ``read_step_cursor`` already swallows a
-        missing/torn/unparseable object into None -- pacing telemetry must
-        never take the poll loop down -- and this adds the same treatment
-        for a queue that refuses outright. None means "unknown", which the
-        gate reads as "not yet", so every failure here degrades to picks
-        stopping and the backstop sealing a partial window, never to a
-        pick firing on a cadence nobody measured.
+        Amendment v6.1 point 2, transport in R38/R40:
+        ``fetch_step_cursor`` performs the remote R2 GET that reads back
+        what the detached trainer's own drain uploaded (the validator and
+        the trainer run on different hosts and never share a local
+        queue_dir, so the LOCAL-file ``read_step_cursor`` cannot see it).
+        It is fire-and-collect and internally cached (R40 #1): this call
+        never blocks on network I/O, returning the last value a
+        background fetch completed with and kicking a new one only when
+        that value is stale and none is already in flight -- safe to call
+        on every poll tick.
 
-        GAP, deliberately left visible: ``read_step_cursor`` reads the
-        queue's LOCAL ``step-cursor.json``, and the trainer writes that
-        file on the train worker, from where the drain UPLOADS it to
-        ``reliquary/training/step-cursor.json``. Nothing downloads it back
-        on this side, so today this returns None on the validator and
-        every window takes its first ``FILL_CLOSED_PICK_PIPELINE_DEPTH``
-        picks on the time floor and then waits for the backstop (pinned by
-        ``test_an_absent_cursor_still_lets_the_first_picks_fire``). The
-        seam is right and the missing half is one R2 GET behind this
-        method -- a fetch-then-read on the queue -- which is a transport
-        decision (cadence, cost, threading) that belongs with the rest of
-        the cursor transport, not here.
+        ``fetch_step_cursor`` already swallows a missing/torn/unparseable
+        object, a network error, or a timeout into None -- pacing
+        telemetry must never take the poll loop down -- and this adds the
+        same treatment for a queue reference that refuses outright. None
+        means "unknown", which the gate reads as "not yet", so every
+        failure here degrades to picks stopping and the backstop sealing
+        a partial window, never to a pick firing on a cadence nobody
+        measured.
         """
         try:
             return self._training_payload_queue_ref().fetch_step_cursor()
