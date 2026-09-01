@@ -134,6 +134,7 @@ from reliquary.shared.checkpoint_epoch_market import (
     generation_intent_set_sha256,
     generation_intent_set_signing_bytes,
 )
+from reliquary.shared.strict_json import strict_json_loads
 from reliquary.validator import telemetry
 from reliquary.validator.batcher import GrpoWindowBatcher
 from reliquary.validator.checkpoint import CheckpointStore
@@ -349,8 +350,8 @@ def _prompt_mismatch_circuit_namespace(
 def _read_gzip_json(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
-    with gzip.open(path, "rt", encoding="utf-8") as handle:
-        value = json.load(handle)
+    with gzip.open(path, "rb") as handle:
+        value = strict_json_loads(handle.read())
     if not isinstance(value, dict):
         raise ValueError("snapshot must be a JSON object")
     return value

@@ -631,7 +631,11 @@ async def test_rebuild_hashes_uses_local_pending_archive_during_r2_outage(
             "window_start": 1,
             "window_status": "completed",
             "batch": [
-                {"rollouts": [{"hash": selected.hex(), "tokens": []}]}
+                {
+                    "rollouts": [
+                        {"hash": selected.hex(), "tokens": [10, 20, 30]}
+                    ]
+                }
             ],
             "runners_up": [
                 {

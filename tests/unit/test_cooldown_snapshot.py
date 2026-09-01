@@ -1,6 +1,7 @@
 """Run-keyed cooldown snapshot: restore + gap-replay, reset on a fresh run,
 and the snapshot write shape. Storage is mocked — no R2."""
 
+import gzip
 import os
 from dataclasses import dataclass
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -487,6 +488,31 @@ async def test_corrupt_snapshot_fails_closed_instead_of_resetting_cooldown():
     ):
         with pytest.raises(RuntimeError, match="no valid durable copy"):
             await svc._rebuild_cooldown_from_history()
+    assert len(svc._cooldown_per_env["fake"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_duplicate_prompt_keys_in_local_snapshot_fail_closed(tmp_path):
+    from reliquary.validator.service import _cooldown_local_path
+
+    raw = (
+        b'{"schema_version":2,"run_id":"default","snapshot_window":40,'
+        b'"complete":true,"envs":{"fake":{"7":30,"7":31}}}'
+    )
+    with patch.dict(
+        "os.environ", {"RELIQUARY_STATE_DIR": str(tmp_path)}
+    ):
+        path = _cooldown_local_path("default")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(gzip.compress(raw))
+        svc = _service(40)
+        with patch(
+            "reliquary.infrastructure.storage.download_json",
+            new=AsyncMock(return_value=None),
+        ):
+            with pytest.raises(RuntimeError, match="no valid durable copy"):
+                await svc._rebuild_cooldown_from_history()
+
     assert len(svc._cooldown_per_env["fake"]) == 0
 
 

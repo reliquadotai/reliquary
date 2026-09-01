@@ -135,6 +135,18 @@ def test_archive_queue_rejects_noncanonical_pending_body_identity(
         queue.pending_window_numbers()
 
 
+def test_archive_queue_rejects_duplicate_keys_in_pending_body(tmp_path):
+    queue = ArchiveQueue(str(tmp_path))
+    raw = b'{"window_start":1,"window_start":1,"batch":[]}'
+    (tmp_path / "window-1.json.gz").write_bytes(gzip.compress(raw))
+
+    with pytest.raises(RuntimeError, match="invalid pending archive body") as exc:
+        queue.pending_window_numbers()
+
+    assert exc.value.__cause__ is not None
+    assert "duplicate JSON key: window_start" in str(exc.value.__cause__)
+
+
 def test_archive_queue_failed_replace_leaves_no_visible_commit(tmp_path):
     queue = ArchiveQueue(str(tmp_path))
 

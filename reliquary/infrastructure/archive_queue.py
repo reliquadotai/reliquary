@@ -40,6 +40,8 @@ from pathlib import Path
 import re
 import time
 
+from reliquary.shared.strict_json import strict_json_loads
+
 logger = logging.getLogger(__name__)
 
 
@@ -214,7 +216,7 @@ class ArchiveQueue:
                 f"invalid pending archive identity: {path.name}"
             )
         try:
-            value = json.loads(gzip.decompress(path.read_bytes()))
+            value = strict_json_loads(gzip.decompress(path.read_bytes()))
         except Exception as exc:
             raise RuntimeError(
                 f"invalid pending archive body: {path.name}"

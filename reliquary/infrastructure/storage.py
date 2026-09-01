@@ -27,6 +27,8 @@ from aiobotocore.session import get_session
 
 from botocore.config import Config
 
+from reliquary.shared.strict_json import strict_json_loads
+
 logger = logging.getLogger(__name__)
 
 
@@ -113,7 +115,7 @@ async def download_json(
             body = await resp["Body"].read()
             def _decode() -> dict:
                 decoded = gzip.decompress(body) if key.endswith(".gz") else body
-                return json.loads(decoded)
+                return strict_json_loads(decoded)
             return await asyncio.to_thread(_decode)
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "")
@@ -251,7 +253,7 @@ async def list_recent_datasets(
             try:
                 resp = await client.get_object(Bucket=bucket, Key=key)
                 body = await resp["Body"].read()
-                data = json.loads(gzip.decompress(body))
+                data = strict_json_loads(gzip.decompress(body))
                 if (
                     not isinstance(data, dict)
                     or data.get("window_start") != window_start
