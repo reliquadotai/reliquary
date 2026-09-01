@@ -126,3 +126,23 @@ def test_stale_manifest_without_v5_bootstrap_refuses_to_guess():
             env={},
             expected_identity={"protocol_version": 5},
         )
+
+
+def test_the_startup_skip_runs_after_migration_and_is_fully_wired():
+    """Wiring smoke test (R42 review, Important): ``run_train_worker``
+    loads a real model, so the guarantees that live in its body are
+    pinned at the source level -- brittle to renames by design, because
+    a rename should force whoever makes it to re-read this ordering:
+    the backlog skip must run on the MIGRATED cursor (R25 key space),
+    and the worker must actually receive the probe and the cap.
+    """
+    import inspect
+    from reliquary.trainer import cli
+
+    source = inspect.getsource(cli.run_train_worker)
+    migrate = source.index("migrate_journal_cursor(")
+    build = source.index("worker = TrainerWorker(")
+    skip = source.index("worker.skip_stale_backlog()")
+    assert migrate < build < skip
+    assert "exists_fn=exists" in source
+    assert "max_catchup=TRAINER_MAX_CATCHUP_STEPS" in source

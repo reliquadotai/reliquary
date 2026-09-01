@@ -649,6 +649,7 @@ data trains, never money.
 - `FILL_CLOSED_FIRST_PICK_SECONDS` (default 30)
 - `FILL_CLOSED_PICK_PIPELINE_DEPTH` (default 2)
 - `FILL_CLOSED_ADMISSION_BUDGET_PER_ENV` (default 512)
+- `TRAINER_MAX_CATCHUP_STEPS` (default 16 = one publish interval, 0 disables)
 - trainer cursor object name under the payload-queue transport
 
 **Tests that pin the amendment.**
@@ -659,4 +660,9 @@ data trains, never money.
   it emits promptly after.
 - The window closes at the 16th pick even with proven groups left over,
   and the leftovers are burned with an archived count.
-- With the gate off, none of this is reachable.
+- A 40-key backlog at restart is skipped down to the 16 most recent,
+  the cursor is written once at the jump target, and a zero cap
+  disables the skip entirely (R42).
+- With the gate off, none of this is reachable (the R42 restart skip
+  alone also runs on v5 -- one publish interval means the same thing
+  there).
