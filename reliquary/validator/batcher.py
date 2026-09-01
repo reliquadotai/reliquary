@@ -1387,16 +1387,12 @@ class GrpoWindowBatcher:
         # winners. Both record once and never move.
         self.graded_batch_fill_offset_s: float | None = None
         self.graded_prefix_fill_offset_s: float | None = None
-        # Fill-closed content-dedup guard. Under per-slot auction payment a
-        # resubmitted group won a duplicate slot at worst; under per-token
-        # payment it collects the same tokens twice, so this must be airtight
-        # rather than best-effort. Populated by ``_register_payload_digest``,
-        # called from the precommit path before any capacity is reserved.
+        # Qualification-only content deduplication before capacity reservation.
+        # Populated by ``_register_payload_digest`` from the precommit path.
         # Per-window like the fields above: a fresh set every window because
         # a new ``GrpoWindowBatcher`` is constructed per window.
         self._payload_digests_seen: set[str] = set()
-        # v6 only. Precommits wait here until the validator has budget to
-        # validate one, ordered by production rate rather than arrival.
+        # Qualification-only precommit queue with deterministic priority.
         self.admission_queue: ThroughputAdmissionQueue | None = None
         # v6 only. None on the auction path, which proves at seal instead of
         # on arrival. Set by the window activation code once every
@@ -2340,12 +2336,8 @@ class GrpoWindowBatcher:
         deliberately separate from economic operator/prompt claims: a miner that
         never uploads cannot squat an auction prompt.
 
-        ``payload_sha256`` is the precommit's own commitment to the exact
-        serialized reveal. Under v6 it is the content-dedup key: per-token
-        payment makes a resubmitted group collect the SAME tokens twice,
-        where the flat slot share merely cost it a slot. The digest is
-        already in hand here, before any payload moves or capacity is
-        reserved, so the refusal is free.
+        ``payload_sha256`` binds the exact serialized reveal and provides the
+        qualification path's content-deduplication key before capacity use.
         """
         if not self.difficulty_auction_enabled:
             return False, "precommit_requires_auction", None
