@@ -222,15 +222,15 @@ class TicketedEpochProofCoordinator:
                 intent_id
                 for intent_id, record in self._records.items()
                 if record.candidate.lane == lane
-                and record.state not in {
+                and record.state
+                not in {
                     StagedProofState.PASSED,
                     StagedProofState.REJECTED,
                 }
             )
             if blockers:
                 raise EpochProofStagingError(
-                    "lane has non-terminal or ambiguous proofs: "
-                    + ",".join(blockers)
+                    "lane has non-terminal or ambiguous proofs: " + ",".join(blockers)
                 )
 
     def claim_lane_finalization(
@@ -303,13 +303,15 @@ class TicketedEpochProofCoordinator:
                 "window_count",
             },
         )
-        binding = EpochProofBinding(**{
-            **binding_body,
-            "environments": tuple(binding_body["environments"]),
-            "generation_randomness_by_offset": tuple(
-                binding_body["generation_randomness_by_offset"]
-            ),
-        })
+        binding = EpochProofBinding(
+            **{
+                **binding_body,
+                "environments": tuple(binding_body["environments"]),
+                "generation_randomness_by_offset": tuple(
+                    binding_body["generation_randomness_by_offset"]
+                ),
+            }
+        )
         coordinator = cls(binding)
         if not isinstance(body["records"], list):
             raise ValueError("records must be an array")
@@ -398,11 +400,13 @@ class TicketedEpochProofCoordinator:
 
     def quarantined_intent_ids(self) -> tuple[str, ...]:
         with self._lock:
-            return tuple(sorted(
-                intent_id
-                for intent_id, record in self._records.items()
-                if record.state is StagedProofState.QUARANTINED
-            ))
+            return tuple(
+                sorted(
+                    intent_id
+                    for intent_id, record in self._records.items()
+                    if record.state is StagedProofState.QUARANTINED
+                )
+            )
 
     def _ordered(self) -> list[_Record]:
         return sorted(
@@ -516,8 +520,7 @@ def require_streaming_runtime(
     )
     if blockers:
         raise EpochProofStreamingUnsupported(
-            "checkpoint-epoch proof streaming is unavailable: "
-            + ",".join(blockers)
+            "checkpoint-epoch proof streaming is unavailable: " + ",".join(blockers)
         )
 
 

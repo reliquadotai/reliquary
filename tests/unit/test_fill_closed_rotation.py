@@ -43,15 +43,18 @@ def test_covering_candidate_requires_the_matching_active_checkpoint(tmp_path):
     store.save(candidate)
     recovered = FillClosedRotationStore(tmp_path).load()
 
-    assert recovered.adoption_covers(
-        SimpleNamespace(checkpoint_n=7, revision="parent")
-    ) is False
-    assert recovered.adoption_covers(
-        SimpleNamespace(checkpoint_n=8, revision="other")
-    ) is False
-    assert recovered.adoption_covers(
-        SimpleNamespace(checkpoint_n=8, revision="successor")
-    ) is True
+    assert (
+        recovered.adoption_covers(SimpleNamespace(checkpoint_n=7, revision="parent"))
+        is False
+    )
+    assert (
+        recovered.adoption_covers(SimpleNamespace(checkpoint_n=8, revision="other"))
+        is False
+    )
+    assert (
+        recovered.adoption_covers(SimpleNamespace(checkpoint_n=8, revision="successor"))
+        is True
+    )
 
 
 def test_corrupt_rotation_state_fails_closed_on_restart(tmp_path):

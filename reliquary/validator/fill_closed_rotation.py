@@ -62,10 +62,7 @@ class FillClosedRotationGate:
                 or self.adopted_checkpoint_n < 0
             ):
                 raise ValueError("adopted_checkpoint_n must be non-negative")
-            if (
-                not isinstance(self.adopted_revision, str)
-                or not self.adopted_revision
-            ):
+            if not isinstance(self.adopted_revision, str) or not self.adopted_revision:
                 raise ValueError("adopted_revision must be a non-empty string")
             if (
                 isinstance(self.adopted_trainer_cursor, bool)
@@ -95,10 +92,8 @@ class FillClosedRotationGate:
         if checkpoint is None or self.adopted_checkpoint_n is None:
             return False
         return (
-            int(getattr(checkpoint, "checkpoint_n", -1))
-            == self.adopted_checkpoint_n
-            and str(getattr(checkpoint, "revision", ""))
-            == self.adopted_revision
+            int(getattr(checkpoint, "checkpoint_n", -1)) == self.adopted_checkpoint_n
+            and str(getattr(checkpoint, "revision", "")) == self.adopted_revision
             and self.adopted_checkpoint_n > self.parent_checkpoint_n
             and self.adopted_revision != self.parent_revision
             and self.adopted_trainer_cursor is not None
@@ -106,9 +101,9 @@ class FillClosedRotationGate:
         )
 
     def to_bytes(self) -> bytes:
-        return json.dumps(
-            asdict(self), sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
+        return json.dumps(asdict(self), sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
 
     @classmethod
     def from_bytes(cls, raw: bytes) -> "FillClosedRotationGate":

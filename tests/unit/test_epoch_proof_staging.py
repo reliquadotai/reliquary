@@ -142,17 +142,11 @@ def test_stage_binds_randomness_and_rejects_intent_or_payload_rebinding():
     assert coordinator.stage(first) is False
 
     with pytest.raises(EpochProofStagingError, match="rebound"):
-        coordinator.stage(
-            _candidate(0, intent_id=first.intent_id, payload_digit="e")
-        )
+        coordinator.stage(_candidate(0, intent_id=first.intent_id, payload_digit="e"))
     with pytest.raises(EpochProofStagingError, match="already staged"):
-        coordinator.stage(
-            _candidate(1, intent_id="other-intent", payload_digit="4")
-        )
+        coordinator.stage(_candidate(1, intent_id="other-intent", payload_digit="4"))
     with pytest.raises(EpochProofStagingError, match="rank is already staged"):
-        coordinator.stage(
-            _candidate(0, intent_id="rank-conflict", payload_digit="f")
-        )
+        coordinator.stage(_candidate(0, intent_id="rank-conflict", payload_digit="f"))
     changed_randomness = TicketedProofCandidate(
         **{
             **first.__dict__,
@@ -191,23 +185,18 @@ def test_lane_fails_closed_until_every_proof_is_terminal():
     coordinator.freeze()
     coordinator.mark_dispatched("intent-0")
     coordinator.mark_dispatched("intent-1")
-    coordinator.record_terminal(
-        "intent-0", passed=True, result_sha256="1" * 64
-    )
+    coordinator.record_terminal("intent-0", passed=True, result_sha256="1" * 64)
 
     with pytest.raises(EpochProofStagingError, match="intent-1"):
         coordinator.assert_lane_terminal((100, "math"))
-    coordinator.record_terminal(
-        "intent-1", passed=False, result_sha256="2" * 64
+    coordinator.record_terminal("intent-1", passed=False, result_sha256="2" * 64)
+    assert (
+        coordinator.record_terminal("intent-1", passed=False, result_sha256="2" * 64)
+        is False
     )
-    assert coordinator.record_terminal(
-        "intent-1", passed=False, result_sha256="2" * 64
-    ) is False
     coordinator.assert_lane_terminal((100, "math"))
     with pytest.raises(EpochProofStagingError, match="cannot become terminal"):
-        coordinator.record_terminal(
-            "intent-1", passed=True, result_sha256="3" * 64
-        )
+        coordinator.record_terminal("intent-1", passed=True, result_sha256="3" * 64)
 
 
 def test_recovery_quarantines_inflight_work_and_never_reproofs_it():
@@ -231,9 +220,7 @@ def test_terminal_snapshot_is_canonical_and_byte_identical_on_restore():
     coordinator.stage(_candidate(0))
     coordinator.freeze()
     coordinator.mark_dispatched("intent-0")
-    coordinator.record_terminal(
-        "intent-0", passed=True, result_sha256="1" * 64
-    )
+    coordinator.record_terminal("intent-0", passed=True, result_sha256="1" * 64)
     raw = coordinator.snapshot_bytes()
     recovered = TicketedEpochProofCoordinator.from_snapshot_bytes(raw)
     assert recovered.snapshot_bytes() == raw
@@ -252,19 +239,13 @@ def test_lane_finalization_claim_is_idempotent_and_cannot_change():
             result_sha256=f"{rank + 1:x}" * 64,
         )
 
-    first = coordinator.claim_lane_finalization(
-        (100, "math"), ("intent-0",)
-    )
-    replay = coordinator.claim_lane_finalization(
-        (100, "math"), ("intent-0",)
-    )
+    first = coordinator.claim_lane_finalization((100, "math"), ("intent-0",))
+    replay = coordinator.claim_lane_finalization((100, "math"), ("intent-0",))
     assert first[1] is True
     assert replay[1] is False
     assert replay[0] == first[0]
     with pytest.raises(EpochProofStagingError, match="already claimed differently"):
-        coordinator.claim_lane_finalization(
-            (100, "math"), ("intent-1",)
-        )
+        coordinator.claim_lane_finalization((100, "math"), ("intent-1",))
 
 
 def test_restore_recomputes_claims_and_rejects_duplicate_lane_claims():
@@ -272,18 +253,14 @@ def test_restore_recomputes_claims_and_rejects_duplicate_lane_claims():
     coordinator.stage(_candidate(0))
     coordinator.freeze()
     coordinator.mark_dispatched("intent-0")
-    coordinator.record_terminal(
-        "intent-0", passed=True, result_sha256="1" * 64
-    )
+    coordinator.record_terminal("intent-0", passed=True, result_sha256="1" * 64)
     coordinator.claim_lane_finalization((100, "math"), ("intent-0",))
     body = json.loads(coordinator.snapshot_bytes())
 
     changed = json.loads(json.dumps(body))
     changed["claims"][0]["claim_sha256"] = "f" * 64
     with pytest.raises(ValueError, match="claim digest differs"):
-        TicketedEpochProofCoordinator.from_snapshot_bytes(
-            canonical_json_bytes(changed)
-        )
+        TicketedEpochProofCoordinator.from_snapshot_bytes(canonical_json_bytes(changed))
 
     duplicated = json.loads(json.dumps(body))
     duplicated["claims"].append(dict(duplicated["claims"][0]))
@@ -300,9 +277,7 @@ def test_restore_rejects_unknown_nested_fields():
     body["records"][0]["candidate"]["unexpected"] = True
 
     with pytest.raises(ValueError, match="candidate keys differ"):
-        TicketedEpochProofCoordinator.from_snapshot_bytes(
-            canonical_json_bytes(body)
-        )
+        TicketedEpochProofCoordinator.from_snapshot_bytes(canonical_json_bytes(body))
 
 
 def test_fully_capable_scheduler_contract_opens_the_activation_guard():
@@ -312,7 +287,5 @@ def test_fully_capable_scheduler_contract_opens_the_activation_guard():
         supports_predeclared_candidates=True,
         supports_rank_independent_extension=True,
     )
-    assert streaming_runtime_blockers(
-        capabilities, concurrent_lanes=16
-    ) == ()
+    assert streaming_runtime_blockers(capabilities, concurrent_lanes=16) == ()
     require_streaming_runtime(capabilities, concurrent_lanes=16)
