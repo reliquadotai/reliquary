@@ -305,6 +305,12 @@ def mine(
         from reliquary.environment import load_environments
         from reliquary.infrastructure.chain import get_subtensor, get_metagraph, NETUID
         from reliquary.miner.engine import MiningEngine
+        from reliquary.miner.checkpoint_identity import (
+            CheckpointIdentityError,
+            MinerCheckpointIdentityStore,
+            checkpoint_identity_from_state,
+            default_checkpoint_identity_path,
+        )
         from reliquary.miner.submitter import discover_validator_url, get_window_state_v2
         from reliquary.shared.modeling import (
             MODEL_SNAPSHOT_ALLOW_PATTERNS,
@@ -317,9 +323,14 @@ def mine(
             wallet_kwargs["path"] = wallet_path
         wallet = bt.Wallet(**wallet_kwargs)
         subtensor = await get_subtensor()
+        checkpoint_identity_store = MinerCheckpointIdentityStore(
+            default_checkpoint_identity_path(wallet.hotkey.ss58_address)
+        )
+        persisted_identity = checkpoint_identity_store.load()
 
         # --- Resolve initial checkpoint from validator if available ---
         initial_path = checkpoint  # fallback to --checkpoint arg
+        initial_checkpoint_identity = None
         try:
             if validator_url:
                 url = validator_url
@@ -331,30 +342,57 @@ def mine(
             from huggingface_hub import snapshot_download
             async with httpx.AsyncClient(timeout=30) as client:
                 state = await get_window_state_v2(url, client=client)
-            if state.checkpoint_repo_id and state.checkpoint_revision:
+            advertised_identity = checkpoint_identity_from_state(state)
+            if advertised_identity is not None:
+                checkpoint_identity_store.assert_advertisement(
+                    advertised_identity
+                )
                 logger.info(
                     "Validator at %s is on checkpoint %d (%s@%s). "
                     "Downloading to seed the miner model.",
-                    url, state.checkpoint_n, state.checkpoint_repo_id,
-                    state.checkpoint_revision[:12],
+                    url,
+                    advertised_identity.checkpoint_n,
+                    advertised_identity.repo_id,
+                    advertised_identity.oid[:12],
                 )
                 initial_path = snapshot_download(
-                    repo_id=state.checkpoint_repo_id,
-                    revision=state.checkpoint_revision,
+                    repo_id=advertised_identity.repo_id,
+                    revision=advertised_identity.oid,
                     allow_patterns=MODEL_SNAPSHOT_ALLOW_PATTERNS,
                 )
+                initial_checkpoint_identity = advertised_identity
                 logger.info("Using initial checkpoint path: %s", initial_path)
+            elif persisted_identity is not None:
+                raise CheckpointIdentityError(
+                    "validator omitted a previously activated checkpoint"
+                )
             else:
                 logger.info(
                     "Validator has no published checkpoint yet — using --checkpoint=%s",
                     checkpoint,
                 )
+        except CheckpointIdentityError:
+            raise
         except Exception as e:
-            logger.warning(
-                "Could not fetch validator checkpoint (%s); falling back to "
-                "--checkpoint=%s",
-                e, checkpoint,
-            )
+            if persisted_identity is None:
+                logger.warning(
+                    "Could not fetch validator checkpoint (%s); falling back "
+                    "to --checkpoint=%s",
+                    e,
+                    checkpoint,
+                )
+            else:
+                logger.warning(
+                    "Could not fetch validator checkpoint (%s); reloading "
+                    "the last durably activated revision",
+                    e,
+                )
+                initial_path = snapshot_download(
+                    repo_id=persisted_identity.repo_id,
+                    revision=persisted_identity.oid,
+                    allow_patterns=MODEL_SNAPSHOT_ALLOW_PATTERNS,
+                )
+                initial_checkpoint_identity = persisted_identity
 
         # --- Load models from resolved path ---
         logger.info("Loading models from %s...", initial_path)
@@ -383,6 +421,9 @@ def mine(
             **base_load_kwargs,
         ).to(proof_device).eval()
 
+        if initial_checkpoint_identity is not None:
+            checkpoint_identity_store.commit(initial_checkpoint_identity)
+
         envs = load_environments(env_names)
         mix = [(n, w) for n, w in ENVIRONMENT_MIX if n in envs]
         engine = MiningEngine(
@@ -394,6 +435,8 @@ def mine(
             mix=mix,
             proof_gpu=0 if proof_device == "cuda:0" else 1,
             validator_url_override=validator_url or None,
+            checkpoint_identity_store=checkpoint_identity_store,
+            initial_checkpoint_identity=initial_checkpoint_identity,
         )
 
         # Seed engine's _loaded_checkpoint_path so the first

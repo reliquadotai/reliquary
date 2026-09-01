@@ -87,7 +87,7 @@ async def test_no_pull_before_first_publish():
 
 
 @pytest.mark.asyncio
-async def test_no_pull_when_revision_is_missing():
+async def test_partial_checkpoint_identity_is_rejected():
     state = MagicMock(
         checkpoint_n=3,
         checkpoint_repo_id=REPO,
@@ -95,17 +95,17 @@ async def test_no_pull_when_revision_is_missing():
     )
     download_fn = AsyncMock()
 
-    result = await maybe_pull_checkpoint(
-        state=state,
-        local_n=2,
-        local_repo_id=REPO,
-        local_hash=REV_OLD,
-        local_model="local",
-        download_fn=download_fn,
-        load_fn=MagicMock(),
-    )
+    with pytest.raises(CheckpointIdentityError, match="invalid"):
+        await maybe_pull_checkpoint(
+            state=state,
+            local_n=2,
+            local_repo_id=REPO,
+            local_hash=REV_OLD,
+            local_model="local",
+            download_fn=download_fn,
+            load_fn=MagicMock(),
+        )
 
-    assert result == (2, REPO, REV_OLD, "local")
     download_fn.assert_not_awaited()
 
 
@@ -190,7 +190,7 @@ async def test_mutable_revision_is_rejected_before_download():
     )
     download_fn = AsyncMock()
 
-    with pytest.raises(CheckpointIdentityError, match="immutable commit"):
+    with pytest.raises(CheckpointIdentityError, match="invalid"):
         await maybe_pull_checkpoint(
             state=state,
             local_n=4,

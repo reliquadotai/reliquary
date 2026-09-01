@@ -22,6 +22,13 @@ from reliquary.constants import (
     M_ROLLOUTS,
     PROMPT_RANGE_SIZE,
 )
+from reliquary.miner.checkpoint_identity import (
+    ActivatedCheckpoint,
+    CheckpointIdentityError,
+    MinerCheckpointIdentityStore,
+    checkpoint_identity_from_state,
+    default_checkpoint_identity_path,
+)
 from reliquary.protocol.profiles import (
     ACTIVE_PROTOCOL_PROFILE,
     to_generation_contract,
@@ -34,23 +41,10 @@ if TYPE_CHECKING:
     from reliquary.environment.base import Environment
 
 logger = logging.getLogger(__name__)
-_GIT_OID_HEX = frozenset("0123456789abcdef")
-
-
-class CheckpointIdentityError(RuntimeError):
-    """A checkpoint number was rebound to a different immutable revision."""
 
 
 class CheckpointActivationRestartRequired(RuntimeError):
     """Checkpoint activation cannot safely continue in the current process."""
-
-
-def _is_immutable_checkpoint_revision(value: object) -> bool:
-    return (
-        isinstance(value, str)
-        and len(value) == 40
-        and all(character in _GIT_OID_HEX for character in value)
-    )
 
 
 def _eligible_generation_mix(
@@ -190,32 +184,29 @@ async def maybe_pull_checkpoint(
     update is needed (remote is older, identities match, or the remote snapshot
     is not published yet), returns inputs unchanged.
     """
-    if state.checkpoint_n < local_n:
+    remote_identity = checkpoint_identity_from_state(state)
+    if remote_identity is None:
         return local_n, local_repo_id, local_hash, local_model
-    if state.checkpoint_repo_id is None or state.checkpoint_revision is None:
+    if remote_identity.checkpoint_n < local_n:
         return local_n, local_repo_id, local_hash, local_model
-    if not _is_immutable_checkpoint_revision(state.checkpoint_revision):
-        raise CheckpointIdentityError(
-            "checkpoint revision is not an immutable commit identifier"
-        )
-    if state.checkpoint_n == local_n:
+    if remote_identity.checkpoint_n == local_n:
         if (
-            state.checkpoint_repo_id == local_repo_id
-            and state.checkpoint_revision == local_hash
+            remote_identity.repo_id == local_repo_id
+            and remote_identity.oid == local_hash
         ):
             return local_n, local_repo_id, local_hash, local_model
         if local_repo_id or local_hash:
             raise CheckpointIdentityError(
                 "checkpoint number was rebound to a different repository or revision"
             )
-    local_path = await download_fn(state.checkpoint_repo_id, state.checkpoint_revision)
+    local_path = await download_fn(remote_identity.repo_id, remote_identity.oid)
     new_model = await asyncio.to_thread(load_fn, local_path)
     if new_model is None:
         raise RuntimeError("checkpoint loader returned no activated model")
     return (
-        state.checkpoint_n,
-        state.checkpoint_repo_id,
-        state.checkpoint_revision,
+        remote_identity.checkpoint_n,
+        remote_identity.repo_id,
+        remote_identity.oid,
         new_model,
     )
 
@@ -496,6 +487,8 @@ class MiningEngine:
         proof_gpu: int = 1,
         max_new_tokens: int = MAX_NEW_TOKENS_PROTOCOL_CAP,
         validator_url_override: str | None = None,
+        checkpoint_identity_store: MinerCheckpointIdentityStore | None = None,
+        initial_checkpoint_identity: ActivatedCheckpoint | None = None,
     ) -> None:
         self.vllm_model = vllm_model
         self.hf_model = hf_model
@@ -505,6 +498,15 @@ class MiningEngine:
         self.proof_gpu = proof_gpu
         self.max_new_tokens = max_new_tokens
         self.validator_url_override = validator_url_override
+        self._checkpoint_identity_store = (
+            checkpoint_identity_store
+            or MinerCheckpointIdentityStore(
+                default_checkpoint_identity_path(
+                    wallet.hotkey.ss58_address,
+                )
+            )
+        )
+        self._initial_checkpoint_identity = initial_checkpoint_identity
 
         if envs is not None and mix is not None:
             self.envs = envs
@@ -625,9 +627,29 @@ class MiningEngine:
         # nothing to pre-fetch. The miner just reads what /state reports.
         rng = random.Random()
         results = []
-        local_n = 0
-        local_repo_id = ""
-        local_hash = ""
+        persisted_identity = self._checkpoint_identity_store.load()
+        initial_identity = self._initial_checkpoint_identity
+        if initial_identity is None and persisted_identity is not None:
+            raise CheckpointActivationRestartRequired(
+                "durable checkpoint identity exists but the active model "
+                "identity was not supplied"
+            )
+        if initial_identity is not None:
+            try:
+                self._checkpoint_identity_store.commit(initial_identity)
+            except CheckpointIdentityError:
+                raise
+            except Exception as exc:
+                raise CheckpointActivationRestartRequired(
+                    "checkpoint identity could not be persisted"
+                ) from exc
+            local_n = initial_identity.checkpoint_n
+            local_repo_id = initial_identity.repo_id
+            local_hash = initial_identity.oid
+        else:
+            local_n = 0
+            local_repo_id = ""
+            local_hash = ""
         miner_state_supported: bool | None = None
         cached_miner_state = None
         miner_state_etag: str | None = None
@@ -769,12 +791,7 @@ class MiningEngine:
 
                 # Pull new checkpoint if needed (works at any state).
                 try:
-                    (
-                        local_n,
-                        local_repo_id,
-                        local_hash,
-                        self.hf_model,
-                    ) = await maybe_pull_checkpoint(
+                    pulled = await maybe_pull_checkpoint(
                         state=state,
                         local_n=local_n,
                         local_hash=local_hash,
@@ -783,6 +800,26 @@ class MiningEngine:
                         download_fn=_hf_download,
                         load_fn=self._load_checkpoint,
                     )
+                    pulled_n, pulled_repo, pulled_hash, pulled_model = pulled
+                    if pulled_repo and pulled_hash:
+                        try:
+                            self._checkpoint_identity_store.commit(
+                                ActivatedCheckpoint(
+                                    checkpoint_n=pulled_n,
+                                    repo_id=pulled_repo,
+                                    oid=pulled_hash,
+                                )
+                            )
+                        except CheckpointIdentityError:
+                            raise
+                        except Exception as exc:
+                            raise CheckpointActivationRestartRequired(
+                                "checkpoint identity could not be persisted"
+                            ) from exc
+                    local_n = pulled_n
+                    local_repo_id = pulled_repo
+                    local_hash = pulled_hash
+                    self.hf_model = pulled_model
                 except (CheckpointIdentityError, CheckpointActivationRestartRequired):
                     logger.exception(
                         "checkpoint identity or activation is unsafe; "
