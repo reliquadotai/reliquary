@@ -15,6 +15,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
 
+from reliquary.shared.checkpoint_identity import (
+    require_checkpoint_repository,
+    require_immutable_checkpoint_revision,
+)
 from reliquary.validator.checkpoint_profile import write_checkpoint_profile
 
 logger = logging.getLogger(__name__)
@@ -66,7 +70,7 @@ class CheckpointStore:
     ) -> None:
         self.validator_hotkey = validator_hotkey
         self.wallet = wallet
-        self.repo_id = repo_id
+        self.repo_id = require_checkpoint_repository(repo_id)
         self.hf_token = hf_token or os.environ.get("HF_TOKEN")
         self.tokenizer = tokenizer
         self.staging_dir = Path(staging_dir_path)
@@ -77,6 +81,11 @@ class CheckpointStore:
 
     def current_manifest(self) -> ManifestEntry | None:
         return self._current
+
+    def clear_manifest(self) -> None:
+        """Withdraw the public manifest without assigning a local path ID."""
+
+        self._current = None
 
     async def publish(
         self,
@@ -109,6 +118,10 @@ class CheckpointStore:
                 folder_path=str(snapshot_dir),
                 repo_id=self.repo_id,
                 commit_message=f"checkpoint {checkpoint_n}",
+            )
+            revision = require_immutable_checkpoint_revision(
+                revision,
+                field="checkpoint publisher revision",
             )
         finally:
             # Always delete the staging copy. HF revision is canonical;
@@ -143,18 +156,22 @@ class CheckpointStore:
         trainer. The wallet signs at INSTALL time — the attestation
         "this is my current checkpoint" only becomes true once the
         verify plane holds these weights, which is the caller's swap."""
+        revision = require_immutable_checkpoint_revision(
+            revision,
+            field="external checkpoint revision",
+        )
         sig_payload = f"{int(checkpoint_n)}|{revision}".encode()
         sig_bytes = self.wallet.hotkey.sign(sig_payload)
         entry = ManifestEntry(
             checkpoint_n=int(checkpoint_n),
             repo_id=self.repo_id,
-            revision=str(revision),
+            revision=revision,
             signature="ed25519:" + sig_bytes.hex(),
         )
         self._current = entry
         logger.info(
             "Installed external checkpoint %d (%s@%s)",
-            checkpoint_n, self.repo_id, str(revision)[:12],
+            checkpoint_n, self.repo_id, revision[:12],
         )
         return entry
 

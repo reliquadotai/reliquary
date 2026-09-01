@@ -2724,10 +2724,11 @@ def test_state_endpoint_exposes_checkpoint_when_set():
     batcher = _batcher(window_start=500)
     server.set_active_batcher(batcher)
     server.set_current_state(WindowState.OPEN)
+    revision = "7" * 40
     server.set_current_checkpoint(ManifestEntry(
         checkpoint_n=7,
         repo_id="aivolutionedge/reliquary-sn",
-        revision="rev_sha_007",
+        revision=revision,
         signature="ed25519:sig",
     ))
     client = TestClient(server.app)
@@ -2735,7 +2736,7 @@ def test_state_endpoint_exposes_checkpoint_when_set():
     body = resp.json()
     assert body["checkpoint_n"] == 7
     assert body["checkpoint_repo_id"] == "aivolutionedge/reliquary-sn"
-    assert body["checkpoint_revision"] == "rev_sha_007"
+    assert body["checkpoint_revision"] == revision
 
 
 def test_checkpoint_endpoint_404_when_none_published():
@@ -2748,10 +2749,11 @@ def test_checkpoint_endpoint_404_when_none_published():
 def test_checkpoint_endpoint_returns_manifest_when_set():
     from reliquary.validator.checkpoint import ManifestEntry
     server = ValidatorServer()
+    revision = "a" * 40
     server.set_current_checkpoint(ManifestEntry(
         checkpoint_n=42,
         repo_id="aivolutionedge/reliquary-sn",
-        revision="rev_sha_042",
+        revision=revision,
         signature="ed25519:sig_42",
     ))
     client = TestClient(server.app)
@@ -2760,8 +2762,23 @@ def test_checkpoint_endpoint_returns_manifest_when_set():
     body = resp.json()
     assert body["checkpoint_n"] == 42
     assert body["repo_id"] == "aivolutionedge/reliquary-sn"
-    assert body["revision"] == "rev_sha_042"
+    assert body["revision"] == revision
     assert body["signature"] == "ed25519:sig_42"
+
+
+def test_server_refuses_to_advertise_mutable_checkpoint_revision():
+    from reliquary.validator.checkpoint import ManifestEntry
+
+    server = ValidatorServer()
+    with pytest.raises(ValueError, match="40-character commit OID"):
+        server.set_current_checkpoint(
+            ManifestEntry(
+                checkpoint_n=42,
+                repo_id="aivolutionedge/reliquary-sn",
+                revision="main",
+                signature="ed25519:sig_42",
+            )
+        )
 
 
 # --- provisional response semantics ---

@@ -15,6 +15,11 @@ from pathlib import Path
 import shutil
 from typing import Any, Callable
 
+from reliquary.shared.checkpoint_identity import (
+    require_checkpoint_repository,
+    require_immutable_checkpoint_revision,
+)
+
 logger = logging.getLogger(__name__)
 
 CANDIDATE_MANIFEST_KEY = "reliquary/training/candidate-manifest.json"
@@ -22,6 +27,15 @@ R2_CHECKPOINT_PREFIX = "reliquary/checkpoints"
 
 
 def checkpoint_key(revision: str, filename: str) -> str:
+    revision = require_immutable_checkpoint_revision(revision)
+    if (
+        not isinstance(filename, str)
+        or not filename
+        or "/" in filename
+        or "\\" in filename
+        or Path(filename).name != filename
+    ):
+        raise ValueError("checkpoint filename must be a single path component")
     return f"{R2_CHECKPOINT_PREFIX}/{revision}/{filename}"
 
 
@@ -54,7 +68,7 @@ class TrainerPublisher:
             _default_upload,
         )
 
-        self.repo_id = repo_id
+        self.repo_id = require_checkpoint_repository(repo_id)
         self.staging_dir = Path(staging_dir)
         self.staging_dir.mkdir(parents=True, exist_ok=True)
         self.tokenizer = tokenizer
@@ -102,6 +116,10 @@ class TrainerPublisher:
                 repo_id=self.repo_id,
                 commit_message=f"checkpoint {checkpoint_n} ({reason})",
             )
+            revision = require_immutable_checkpoint_revision(
+                revision,
+                field="trainer checkpoint publisher revision",
+            )
 
             # R2 mirror: every snapshot file under a revision-scoped
             # prefix, multipart-parallel (the validator pulls from here).
@@ -127,7 +145,7 @@ class TrainerPublisher:
                 **active_training_identity(),
                 "checkpoint_n": int(checkpoint_n),
                 "repo_id": self.repo_id,
-                "revision": str(revision),
+                "revision": revision,
                 "trained_window_cursor": int(trained_window_cursor),
                 "reason": str(reason),
                 "journal_key_space": key_space,
@@ -147,16 +165,16 @@ class TrainerPublisher:
         # the mirror grows ~8 GB per publish forever.
         await asyncio.to_thread(
             self._prune_mirror,
-            keep={str(revision), self._previous_mirror_revision},
+            keep={revision, self._previous_mirror_revision},
         )
-        self._previous_mirror_revision = str(revision)
+        self._previous_mirror_revision = revision
 
         logger.info(
             "Published checkpoint %d to %s@%s (cursor=%d, reason=%s)",
-            checkpoint_n, self.repo_id, str(revision)[:12],
+            checkpoint_n, self.repo_id, revision[:12],
             trained_window_cursor, reason,
         )
-        return str(revision)
+        return revision
 
     def _prune_mirror(self, *, keep: set[str | None]) -> None:
         """Best-effort deletion of mirror revisions outside ``keep`` —

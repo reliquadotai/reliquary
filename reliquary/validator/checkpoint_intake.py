@@ -16,6 +16,11 @@ from pathlib import Path
 import shutil
 from typing import Any, Callable
 
+from reliquary.shared.checkpoint_identity import (
+    require_checkpoint_repository,
+    require_immutable_checkpoint_revision,
+)
+
 logger = logging.getLogger(__name__)
 
 CANDIDATE_MANIFEST_KEY = "reliquary/training/candidate-manifest.json"
@@ -84,7 +89,14 @@ class CheckpointIntake:
         self._bucket = bucket
         self.staging_dir = Path(staging_dir)
         self.staging_dir.mkdir(parents=True, exist_ok=True)
-        self.installed_revision = installed_revision
+        self.installed_revision = (
+            require_immutable_checkpoint_revision(
+                installed_revision,
+                field="installed checkpoint revision",
+            )
+            if installed_revision is not None
+            else None
+        )
         self._validate = validate_fn
         self._expected_identity = dict(expected_identity or {})
         self._staged: tuple[dict[str, Any], Path] | None = None
@@ -109,9 +121,19 @@ class CheckpointIntake:
             return None
         try:
             manifest = json.loads(body.decode("utf-8"))
-            revision = str(manifest["revision"])
+            if not isinstance(manifest, dict):
+                raise TypeError("candidate manifest must be an object")
+            require_checkpoint_repository(
+                manifest.get("repo_id"),
+                field="candidate checkpoint repository",
+            )
+            revision = require_immutable_checkpoint_revision(
+                manifest.get("revision"),
+                field="candidate checkpoint revision",
+            )
         except (ValueError, KeyError, TypeError):
             logger.warning("malformed candidate manifest; ignoring")
+            self.last_error = "candidate manifest has no immutable revision"
             return None
         mismatches = {
             key: (manifest.get(key), expected)
@@ -135,10 +157,29 @@ class CheckpointIntake:
     def stage(self, manifest: dict[str, Any]) -> bool:
         """Download + validate one candidate snapshot (sync; callers run
         it off the loop). Returns True when staged."""
-        revision = str(manifest["revision"])
-        self._staging_revision = revision
-        dest = self.staging_dir / revision
+        revision = "<invalid>"
+        dest: Path | None = None
         try:
+            if not isinstance(manifest, dict):
+                raise TypeError("candidate manifest must be an object")
+            require_checkpoint_repository(
+                manifest.get("repo_id"),
+                field="candidate checkpoint repository",
+            )
+            revision = require_immutable_checkpoint_revision(
+                manifest.get("revision"),
+                field="candidate checkpoint revision",
+            )
+            staging_root = self.staging_dir.resolve()
+            candidate_dest = (staging_root / revision).resolve()
+            try:
+                candidate_dest.relative_to(staging_root)
+            except ValueError as exc:
+                raise ValueError(
+                    "candidate checkpoint path escapes the staging directory"
+                ) from exc
+            dest = candidate_dest
+            self._staging_revision = revision
             prefix = f"{R2_CHECKPOINT_PREFIX}/{revision}/"
             listed = self._r2.list_objects_v2(
                 Bucket=self._bucket, Prefix=prefix,
@@ -150,11 +191,25 @@ class CheckpointIntake:
             dest.mkdir(parents=True, exist_ok=True)
             for obj in contents:
                 key = obj["Key"]
+                if not isinstance(key, str) or not key.startswith(prefix):
+                    raise ValueError("checkpoint object escaped its revision prefix")
                 filename = key[len(prefix):]
-                if not filename or "/" in filename:
+                if (
+                    not filename
+                    or "/" in filename
+                    or "\\" in filename
+                    or filename in {".", ".."}
+                ):
                     continue
+                target = (dest / filename).resolve()
+                try:
+                    target.relative_to(dest)
+                except ValueError as exc:
+                    raise ValueError(
+                        "checkpoint object escaped the staged revision"
+                    ) from exc
                 self._r2.download_file(
-                    self._bucket, key, str(dest / filename), Config=config,
+                    self._bucket, key, str(target), Config=config,
                 )
             self._validate(dest)
         except Exception as exc:
@@ -163,7 +218,8 @@ class CheckpointIntake:
                 "checkpoint staging failed for %s; validator stays on the "
                 "current revision", revision,
             )
-            shutil.rmtree(dest, ignore_errors=True)
+            if dest is not None:
+                shutil.rmtree(dest, ignore_errors=True)
             return False
         finally:
             self._staging_revision = None
@@ -184,7 +240,10 @@ class CheckpointIntake:
         return staged
 
     def mark_installed(self, revision: str, staged_dir: Path) -> None:
-        self.installed_revision = str(revision)
+        self.installed_revision = require_immutable_checkpoint_revision(
+            revision,
+            field="installed checkpoint revision",
+        )
         shutil.rmtree(staged_dir, ignore_errors=True)
 
     def snapshot(self) -> dict[str, Any]:

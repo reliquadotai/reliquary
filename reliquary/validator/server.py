@@ -2246,6 +2246,20 @@ class ValidatorServer:
         self._archive_queue_snapshot_callback = snapshot_callback
 
     def set_current_checkpoint(self, entry) -> None:
+        if entry is not None:
+            from reliquary.shared.checkpoint_identity import (
+                require_checkpoint_repository,
+                require_immutable_checkpoint_revision,
+            )
+
+            require_checkpoint_repository(
+                getattr(entry, "repo_id", None),
+                field="advertised checkpoint repository",
+            )
+            require_immutable_checkpoint_revision(
+                getattr(entry, "revision", None),
+                field="advertised checkpoint revision",
+            )
         plan = self._checkpoint_epoch_plan
         plan_differs = plan is not None and (
             entry is None

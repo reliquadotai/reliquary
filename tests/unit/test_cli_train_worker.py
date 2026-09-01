@@ -7,6 +7,10 @@ import pytest
 from reliquary.trainer.resume import resolve_resume_point
 
 
+REV_5 = "5" * 40
+REV_7 = "7" * 40
+
+
 def _manifest_fetch(doc):
     payload = json.dumps(doc).encode("utf-8")
 
@@ -21,12 +25,12 @@ def _manifest_fetch(doc):
 def test_manifest_present_wins_over_env():
     revision, cursor, checkpoint_n = resolve_resume_point(
         _manifest_fetch({
-            "checkpoint_n": 530, "repo_id": "org/repo", "revision": "rev-7",
+            "checkpoint_n": 530, "repo_id": "org/repo", "revision": REV_7,
             "trained_window_cursor": 30110, "reason": "cadence",
         }),
         env={"RELIQUARY_TRAINER_BOOTSTRAP_CURSOR": "999"},
     )
-    assert revision == "rev-7"
+    assert revision == REV_7
     assert cursor == 30110
     # Numbering must never regress across restarts (two FATALs already
     # came from trusting a derived/inherited counter).
@@ -55,11 +59,11 @@ def test_bootstrap_revision_for_shadow_and_cutover():
         lambda key: None,
         env={
             "RELIQUARY_TRAINER_BOOTSTRAP_CURSOR": "30110",
-            "RELIQUARY_TRAINER_BOOTSTRAP_REVISION": "2463086760b7",
+            "RELIQUARY_TRAINER_BOOTSTRAP_REVISION": REV_5,
             "RELIQUARY_TRAINER_CHECKPOINT_N": "527",
         },
     )
-    assert revision == "2463086760b7"
+    assert revision == REV_5
     assert cursor == 30110
     assert checkpoint_n == 527
 
@@ -76,14 +80,14 @@ def test_matching_v5_manifest_wins_over_bootstrap():
             **identity,
             "checkpoint_n": 531,
             "repo_id": "org/repo",
-            "revision": "v5-rev",
+            "revision": REV_5,
             "trained_window_cursor": 30200,
             "reason": "cadence",
         }),
         env={"RELIQUARY_TRAINER_BOOTSTRAP_CURSOR": "999"},
         expected_identity=identity,
     )
-    assert (revision, cursor, checkpoint_n) == ("v5-rev", 30200, 531)
+    assert (revision, cursor, checkpoint_n) == (REV_5, 30200, 531)
 
 
 def test_stale_v4_manifest_uses_explicit_v5_base_reset():
@@ -103,13 +107,13 @@ def test_stale_v4_manifest_uses_explicit_v5_base_reset():
         }),
         env={
             "RELIQUARY_TRAINER_BOOTSTRAP_CURSOR": "30250",
-            "RELIQUARY_TRAINER_BOOTSTRAP_REVISION": "v5-base-reset",
+            "RELIQUARY_TRAINER_BOOTSTRAP_REVISION": REV_5,
             "RELIQUARY_TRAINER_CHECKPOINT_N": "531",
         },
         expected_identity=identity,
     )
     assert (revision, cursor, checkpoint_n) == (
-        "v5-base-reset",
+        REV_5,
         30250,
         531,
     )
@@ -125,4 +129,30 @@ def test_stale_manifest_without_v5_bootstrap_refuses_to_guess():
             }),
             env={},
             expected_identity={"protocol_version": 5},
+        )
+
+
+def test_matching_manifest_rejects_mutable_revision():
+    with pytest.raises(ValueError, match="40-character commit OID"):
+        resolve_resume_point(
+            _manifest_fetch(
+                {
+                    "checkpoint_n": 530,
+                    "repo_id": "org/repo",
+                    "revision": "main",
+                    "trained_window_cursor": 30110,
+                }
+            ),
+            env={},
+        )
+
+
+def test_bootstrap_rejects_mutable_revision():
+    with pytest.raises(ValueError, match="40-character commit OID"):
+        resolve_resume_point(
+            lambda key: None,
+            env={
+                "RELIQUARY_TRAINER_BOOTSTRAP_CURSOR": "30110",
+                "RELIQUARY_TRAINER_BOOTSTRAP_REVISION": "main",
+            },
         )

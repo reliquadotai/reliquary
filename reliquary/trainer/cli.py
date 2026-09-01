@@ -146,7 +146,9 @@ def run_train_worker(*, shadow: bool = False) -> None:
     fetch = r2_fetch_fn(client, bucket)
 
     expected_identity = (
-        active_training_identity() if PROTOCOL_VERSION >= 5 else None
+        {**active_training_identity(), "repo_id": repo_id}
+        if PROTOCOL_VERSION >= 5
+        else {"repo_id": repo_id}
     )
     revision, cursor, checkpoint_n = resolve_resume_point(
         fetch,

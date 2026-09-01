@@ -12,6 +12,10 @@ import json
 import logging
 from typing import Callable, Mapping
 
+from reliquary.shared.checkpoint_identity import (
+    require_checkpoint_repository,
+    require_immutable_checkpoint_revision,
+)
 from reliquary.trainer.publisher import CANDIDATE_MANIFEST_KEY
 
 logger = logging.getLogger(__name__)
@@ -36,8 +40,15 @@ def resolve_resume_point(
             if manifest.get(key) != expected
         }
         if not mismatches:
+            require_checkpoint_repository(
+                manifest.get("repo_id"),
+                field="trainer resume manifest repository",
+            )
             return (
-                str(manifest["revision"]),
+                require_immutable_checkpoint_revision(
+                    manifest.get("revision"),
+                    field="trainer resume manifest revision",
+                ),
                 int(manifest["trained_window_cursor"]),
                 int(manifest.get("checkpoint_n", 0)),
             )
@@ -57,8 +68,16 @@ def resolve_resume_point(
     # Mid-run bootstrap (shadow start, cutover from in-process training):
     # begin from the validator's last PUBLISHED checkpoint, not the base
     # model, so the shadow comparison and the cutover are seamless.
-    revision = str(
+    raw_revision = str(
         env.get("RELIQUARY_TRAINER_BOOTSTRAP_REVISION", "")
-    ).strip() or None
+    ).strip()
+    revision = (
+        require_immutable_checkpoint_revision(
+            raw_revision,
+            field="trainer bootstrap revision",
+        )
+        if raw_revision
+        else None
+    )
     raw_n = str(env.get("RELIQUARY_TRAINER_CHECKPOINT_N", "")).strip()
     return revision, int(bootstrap), int(raw_n) if raw_n else 0

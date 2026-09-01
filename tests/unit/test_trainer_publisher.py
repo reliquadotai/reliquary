@@ -12,6 +12,12 @@ from reliquary.shared.training_payload import active_training_identity
 from reliquary.trainer.journal import ACTIVE_JOURNAL_KEY_SPACE
 
 
+REV_1 = "1" * 40
+REV_2 = "2" * 40
+REV_3 = "3" * 40
+REV_9 = "9" * 40
+
+
 class _R2:
     def __init__(self):
         self.uploads = []      # (key, path) via upload_file
@@ -52,7 +58,7 @@ def _publisher(tmp_path, r2, order, *, hf_fails=False):
         if hf_fails:
             raise RuntimeError("hf down")
         order.append("hf")
-        return "rev-123"
+        return REV_1
 
     return TrainerPublisher(
         repo_id="org/repo", staging_dir=str(tmp_path), tokenizer=None,
@@ -62,8 +68,8 @@ def _publisher(tmp_path, r2, order, *, hf_fails=False):
 
 
 def test_keys():
-    assert checkpoint_key("rev-1", "model.safetensors") == (
-        "reliquary/checkpoints/rev-1/model.safetensors"
+    assert checkpoint_key(REV_1, "model.safetensors") == (
+        f"reliquary/checkpoints/{REV_1}/model.safetensors"
     )
     assert CANDIDATE_MANIFEST_KEY == (
         "reliquary/training/candidate-manifest.json"
@@ -77,17 +83,17 @@ def test_publish_order_manifest_and_cleanup(tmp_path):
         object(), checkpoint_n=5, lr_schedule_step=80,
         trained_window_cursor=30110, reason="cadence",
     ))
-    assert rev == "rev-123"
+    assert rev == REV_1
     assert order == ["save", "hf"]
     uploaded_keys = [k for k, _ in r2.uploads]
-    assert checkpoint_key("rev-123", "model.safetensors") in uploaded_keys
+    assert checkpoint_key(REV_1, "model.safetensors") in uploaded_keys
     # The profile file travels in the snapshot too.
     assert any(k.endswith("reliquary_checkpoint_profile.json") or
                "profile" in k for k in uploaded_keys) or len(uploaded_keys) >= 2
     manifest = json.loads(r2.objects[CANDIDATE_MANIFEST_KEY])
     assert manifest == {
         **active_training_identity(),
-        "checkpoint_n": 5, "repo_id": "org/repo", "revision": "rev-123",
+        "checkpoint_n": 5, "repo_id": "org/repo", "revision": REV_1,
         "trained_window_cursor": 30110, "reason": "cadence",
         "journal_key_space": ACTIVE_JOURNAL_KEY_SPACE,
     }
@@ -95,7 +101,7 @@ def test_publish_order_manifest_and_cleanup(tmp_path):
 
 
 def test_profile_extra_written(tmp_path):
-    r2, order = _R2(), []
+    r2 = _R2()
     captured = {}
 
     def save_fn(model, tokenizer, path):
@@ -106,7 +112,7 @@ def test_profile_extra_written(tmp_path):
         for p in pathlib.Path(folder_path).iterdir():
             if p.suffix == ".json":
                 captured[p.name] = json.loads(p.read_text())
-        return "rev-9"
+        return REV_9
 
     pub = TrainerPublisher(
         repo_id="org/repo", staging_dir=str(tmp_path), tokenizer=None,
@@ -126,14 +132,17 @@ def test_profile_extra_written(tmp_path):
 
 
 def test_mirror_keeps_only_last_two_revisions(tmp_path):
-    r2, order = _R2(), []
+    r2 = _R2()
     # A stale revision from before a restart must be cleaned too.
-    r2.objects["reliquary/checkpoints/rev-old/model.safetensors"] = b"x"
+    stale_revision = "a" * 40
+    r2.objects[
+        f"reliquary/checkpoints/{stale_revision}/model.safetensors"
+    ] = b"x"
 
     def save_fn(model, tokenizer, path):
         (path / "model.safetensors").write_bytes(b"w")
 
-    revs = iter(["rev-1", "rev-2", "rev-3"])
+    revs = iter([REV_1, REV_2, REV_3])
 
     async def hf_upload(folder_path, repo_id, commit_message):
         return next(revs)
@@ -152,8 +161,11 @@ def test_mirror_keeps_only_last_two_revisions(tmp_path):
         k.split("/")[2] for k in r2.objects
         if k.startswith("reliquary/checkpoints/")
     }
-    assert live_revs == {"rev-2", "rev-3"}
-    assert "reliquary/checkpoints/rev-old/model.safetensors" in r2.deleted
+    assert live_revs == {REV_2, REV_3}
+    assert (
+        f"reliquary/checkpoints/{stale_revision}/model.safetensors"
+        in r2.deleted
+    )
 
 
 def test_staging_cleaned_on_failure(tmp_path):
@@ -169,12 +181,48 @@ def test_staging_cleaned_on_failure(tmp_path):
     assert CANDIDATE_MANIFEST_KEY not in r2.objects
 
 
+def test_mutable_hf_revision_never_reaches_manifest_or_mirror(tmp_path):
+    r2 = _R2()
+
+    def save_fn(model, tokenizer, path):
+        (path / "model.safetensors").write_bytes(b"w")
+
+    async def hf_upload(folder_path, repo_id, commit_message):
+        return "main"
+
+    publisher = TrainerPublisher(
+        repo_id="org/repo",
+        staging_dir=str(tmp_path),
+        tokenizer=None,
+        save_fn=save_fn,
+        hf_upload_fn=hf_upload,
+        r2_client=r2,
+        bucket="reliquary",
+    )
+
+    import pytest
+
+    with pytest.raises(ValueError, match="40-character commit OID"):
+        asyncio.run(
+            publisher.publish(
+                object(),
+                checkpoint_n=5,
+                lr_schedule_step=None,
+                trained_window_cursor=30110,
+                reason="cadence",
+            )
+        )
+
+    assert r2.uploads == []
+    assert CANDIDATE_MANIFEST_KEY not in r2.objects
+
+
 def test_the_publisher_stamps_the_journal_key_space(tmp_path):
     """C3: the resume-time cursor migration is detected by a marker stored
     BESIDE the cursor, so both writers of the cursor must stamp it."""
     from reliquary.trainer.journal import ACTIVE_JOURNAL_KEY_SPACE
 
-    r2, order = _R2(), []
+    r2 = _R2()
     captured = {}
 
     def save_fn(model, tokenizer, path):
@@ -185,7 +233,7 @@ def test_the_publisher_stamps_the_journal_key_space(tmp_path):
         for p in pathlib.Path(folder_path).iterdir():
             if p.suffix == ".json":
                 captured[p.name] = json.loads(p.read_text())
-        return "rev-9"
+        return REV_9
 
     pub = TrainerPublisher(
         repo_id="org/repo", staging_dir=str(tmp_path), tokenizer=None,

@@ -8,6 +8,11 @@ from reliquary.validator.checkpoint import CheckpointStore, ManifestEntry
 from reliquary.validator.checkpoint_profile import CHECKPOINT_PROFILE_NAME
 
 
+REV_A = "a" * 40
+REV_B = "b" * 40
+REV_C = "c" * 40
+
+
 class FakeWallet:
     class _Hk:
         ss58_address = "5FHk"
@@ -36,7 +41,7 @@ def test_initial_manifest_is_none(tmp_path):
 
 @pytest.mark.asyncio
 async def test_publish_writes_uploads_signs_and_serves(tmp_path):
-    fake_upload = AsyncMock(return_value="abc123def456")
+    fake_upload = AsyncMock(return_value=REV_A)
     store = CheckpointStore(
         validator_hotkey="5FHk",
         wallet=FakeWallet(),
@@ -50,17 +55,49 @@ async def test_publish_writes_uploads_signs_and_serves(tmp_path):
     assert isinstance(entry, ManifestEntry)
     assert entry.checkpoint_n == 1
     assert entry.repo_id == "aivolutionedge/reliquary-sn"
-    assert entry.revision == "abc123def456"
+    assert entry.revision == REV_A
     assert entry.signature.startswith("ed25519:")
     fake_upload.assert_awaited_once()
     assert store.current_manifest() is entry
 
 
 @pytest.mark.asyncio
+async def test_publish_rejects_mutable_upload_revision(tmp_path):
+    store = CheckpointStore(
+        validator_hotkey="5FHk",
+        wallet=FakeWallet(),
+        repo_id="aivolutionedge/reliquary-sn",
+        staging_dir_path=str(tmp_path),
+        upload_fn=AsyncMock(return_value="main"),
+        save_fn=_save_stub,
+    )
+
+    with pytest.raises(ValueError, match="40-character commit OID"):
+        await store.publish(checkpoint_n=1, model=MagicMock())
+
+    assert store.current_manifest() is None
+    assert not (tmp_path / "ckpt_1").exists()
+
+
+def test_external_install_requires_immutable_revision(tmp_path):
+    store = CheckpointStore(
+        validator_hotkey="5FHk",
+        wallet=FakeWallet(),
+        repo_id="aivolutionedge/reliquary-sn",
+        staging_dir_path=str(tmp_path),
+    )
+
+    with pytest.raises(ValueError, match="40-character commit OID"):
+        store.install_external(2, "main")
+
+    assert store.current_manifest() is None
+
+
+@pytest.mark.asyncio
 async def test_publish_increments_overrides_previous(tmp_path):
     fake_upload = AsyncMock(side_effect=[
-        "rev_sha_001",
-        "rev_sha_002",
+        REV_A,
+        REV_B,
     ])
     store = CheckpointStore(
         validator_hotkey="5FHk",
@@ -74,7 +111,7 @@ async def test_publish_increments_overrides_previous(tmp_path):
     e2 = await store.publish(checkpoint_n=2, model=MagicMock())
     assert store.current_manifest() is e2
     assert store.current_manifest().checkpoint_n == 2
-    assert store.current_manifest().revision == "rev_sha_002"
+    assert store.current_manifest().revision == REV_B
 
 
 @pytest.mark.asyncio
@@ -97,7 +134,7 @@ async def test_upload_fn_receives_folder_and_kwargs(tmp_path):
         captured["has_profile"] = (
             _P(folder_path) / CHECKPOINT_PROFILE_NAME
         ).exists()
-        return "captured_revision_sha"
+        return REV_C
 
     store = CheckpointStore(
         validator_hotkey="5FHk",
@@ -115,7 +152,7 @@ async def test_upload_fn_receives_folder_and_kwargs(tmp_path):
     assert captured["has_config"] is True
     assert captured["has_profile"] is True
     assert "5" in captured["commit_message"]
-    assert entry.revision == "captured_revision_sha"
+    assert entry.revision == REV_C
 
 
 @pytest.mark.asyncio
@@ -129,7 +166,7 @@ async def test_save_receives_tokenizer(tmp_path):
         (path / "config.json").write_text("{}")
 
     fake_tokenizer = object()
-    fake_upload = AsyncMock(return_value="rev")
+    fake_upload = AsyncMock(return_value=REV_A)
     store = CheckpointStore(
         validator_hotkey="5FHk",
         wallet=FakeWallet(),
@@ -157,7 +194,7 @@ async def test_signature_includes_n_and_revision(tmp_path):
         hotkey = _Hk()
 
     async def fake_upload(folder_path, repo_id, commit_message):
-        return "revision_sha_42"
+        return REV_C
 
     store = CheckpointStore(
         validator_hotkey="5FHk",
@@ -169,7 +206,7 @@ async def test_signature_includes_n_and_revision(tmp_path):
     )
     entry = await store.publish(42, model=object())
     assert b"42" in captured["signed"]
-    assert b"revision_sha_42" in captured["signed"]
+    assert REV_C.encode() in captured["signed"]
     assert entry.signature == "ed25519:" + b"fake_sig".hex()
 
 
@@ -177,7 +214,7 @@ async def test_signature_includes_n_and_revision(tmp_path):
 async def test_repo_id_stored_in_manifest(tmp_path):
     """ManifestEntry carries the repo_id so miners can do from_pretrained(repo_id, revision)."""
     async def fake_upload(folder_path, repo_id, commit_message):
-        return "some_rev"
+        return REV_A
 
     store = CheckpointStore(
         validator_hotkey="5FHk",
@@ -189,7 +226,7 @@ async def test_repo_id_stored_in_manifest(tmp_path):
     )
     entry = await store.publish(3, model=object())
     assert entry.repo_id == "myorg/my-model"
-    assert entry.revision == "some_rev"
+    assert entry.revision == REV_A
 
 
 # ---- staging cleanup behaviour ---------------------------------------------
@@ -206,7 +243,7 @@ async def test_repo_id_stored_in_manifest(tmp_path):
 @pytest.mark.asyncio
 async def test_publish_deletes_staging_dir_after_successful_upload(tmp_path):
     """After a successful publish(), ckpt_<N> must not exist on disk."""
-    fake_upload = AsyncMock(return_value="rev_sha_001")
+    fake_upload = AsyncMock(return_value=REV_A)
     store = CheckpointStore(
         validator_hotkey="5FHk",
         wallet=FakeWallet(),
@@ -272,7 +309,7 @@ async def test_publish_deletes_staging_dir_on_save_failure(tmp_path):
 @pytest.mark.asyncio
 async def test_publish_repeated_calls_do_not_accumulate_directories(tmp_path):
     """N publishes leave 0 ckpt_* dirs behind (pre-fix: N dirs)."""
-    fake_upload = AsyncMock(side_effect=[f"rev_{i}" for i in range(5)])
+    fake_upload = AsyncMock(side_effect=[str(i) * 40 for i in range(1, 6)])
     store = CheckpointStore(
         validator_hotkey="5FHk",
         wallet=FakeWallet(),
@@ -307,7 +344,7 @@ async def test_publish_does_not_block_event_loop_during_save(tmp_path):
         wallet=FakeWallet(),
         repo_id="org/repo",
         staging_dir_path=str(tmp_path),
-        upload_fn=AsyncMock(return_value="rev_sha_001"),
+        upload_fn=AsyncMock(return_value=REV_A),
         save_fn=slow_save,
     )
 
