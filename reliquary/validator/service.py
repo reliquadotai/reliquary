@@ -163,6 +163,7 @@ from reliquary.validator.utility_telemetry import UtilityTelemetryWriter
 
 
 _WINDOW_ACTIVATION_RANDOMNESS_DOMAIN = b"reliquary/window-activation/v1\x00"
+_PUBLIC_WINDOW_RANDOMNESS_DOMAIN = b"reliquary/public-window-randomness/v1\x00"
 
 
 def _bind_window_activation_randomness(
@@ -179,6 +180,21 @@ def _bind_window_activation_randomness(
     digest.update(len(encoded_randomness).to_bytes(4, "big"))
     digest.update(encoded_randomness)
     digest.update(bytes(activation_nonce))
+    return digest.hexdigest()
+
+
+def _bind_public_window_randomness(
+    beacon_randomness: str,
+    *,
+    target_window: int,
+) -> str:
+    """Domain-separate a public beacon without adding private entropy."""
+    digest = hashlib.sha256()
+    digest.update(_PUBLIC_WINDOW_RANDOMNESS_DOMAIN)
+    digest.update(int(target_window).to_bytes(8, "big", signed=False))
+    encoded_randomness = str(beacon_randomness).encode("utf-8")
+    digest.update(len(encoded_randomness).to_bytes(4, "big"))
+    digest.update(encoded_randomness)
     return digest.hexdigest()
 
 
@@ -3820,14 +3836,25 @@ class ValidationService:
             raise last_exc
 
         if self.use_drand:
-            activation_nonce = getattr(self, "_candidate_activation_nonce", None)
-            if activation_nonce is None:
-                raise RuntimeError("window activation nonce is unavailable")
-            randomness = _bind_window_activation_randomness(
-                randomness,
-                target_window=int(target_window),
-                activation_nonce=activation_nonce,
-            )
+            if FILL_CLOSED_ENABLED:
+                # The experimental fill lane must be reproducible from the
+                # advertised public beacon and window alone. Legacy profiles
+                # retain their byte-for-byte activation binding below.
+                randomness = _bind_public_window_randomness(
+                    randomness,
+                    target_window=int(target_window),
+                )
+            else:
+                activation_nonce = getattr(
+                    self, "_candidate_activation_nonce", None
+                )
+                if activation_nonce is None:
+                    raise RuntimeError("window activation nonce is unavailable")
+                randomness = _bind_window_activation_randomness(
+                    randomness,
+                    target_window=int(target_window),
+                    activation_nonce=activation_nonce,
+                )
 
         for batcher in self._active_batchers.values():
             batcher.randomness = randomness

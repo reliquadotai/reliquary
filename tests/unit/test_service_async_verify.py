@@ -264,6 +264,59 @@ def test_activation_binding_is_window_and_nonce_specific():
     )
 
 
+def test_public_window_binding_is_reproducible_and_window_specific():
+    from reliquary.validator.service import _bind_public_window_randomness
+
+    first = _bind_public_window_randomness(
+        "public-beacon",
+        target_window=42,
+    )
+
+    assert first == _bind_public_window_randomness(
+        "public-beacon",
+        target_window=42,
+    )
+    assert first != _bind_public_window_randomness(
+        "public-beacon",
+        target_window=43,
+    )
+    assert first != _bind_public_window_randomness(
+        "different-beacon",
+        target_window=42,
+    )
+
+
+@pytest.mark.asyncio
+async def test_fill_window_uses_only_public_randomness_binding(monkeypatch):
+    from reliquary.validator import service as svc_mod
+
+    fake_beacon = {"round": 1, "randomness": "aa" * 32}
+
+    async def _stub_derive(self, subtensor, target_window):
+        return "computed_randomness", fake_beacon
+
+    monkeypatch.setattr(svc_mod, "FILL_CLOSED_ENABLED", True)
+    monkeypatch.setattr(
+        svc_mod.ValidationService,
+        "_derive_randomness",
+        _stub_derive,
+    )
+
+    svc = _make_test_service(use_drand=True)
+    svc._candidate_activation_nonce = None
+    svc._active_batcher = _make_test_batcher()
+    svc._window_n = 42
+
+    await svc._set_window_randomness(subtensor=None)
+
+    assert svc._active_batcher.randomness == (
+        svc_mod._bind_public_window_randomness(
+            "computed_randomness",
+            target_window=42,
+        )
+    )
+
+
 @pytest.mark.asyncio
 async def test_async_verify_failure_flips_beacon_invalid(monkeypatch):
     """If the background verify returns False, the batcher's
