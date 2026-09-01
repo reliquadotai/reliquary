@@ -79,6 +79,7 @@ from reliquary.constants import (
     REGISTERED_HOTKEY_STALE_GRACE_SECONDS,
     PRECOMMIT_BODY_READ_TIMEOUT_SECONDS,
     PRIMARY_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
+    PROMPT_RANGE_SIZE,
     SUBMISSION_HEADER_READ_TIMEOUT_SECONDS,
     SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS,
     SPARSE_VALID_IDLE_SEAL_SECONDS,
@@ -116,6 +117,8 @@ from reliquary.protocol.submission import (
     EpochGenerationIntentStatus,
     FillClosedWindowState,
     GrpoBatchState,
+    MinerEnvironmentState,
+    MinerState,
     RejectReason,
     RuntimeContract,
     RuntimeFingerprint,
@@ -123,6 +126,7 @@ from reliquary.protocol.submission import (
     SubmissionPrecommitResponse,
     Verdict,
     VerdictsResponse,
+    encode_cooldown_bitmap,
 )
 from reliquary.protocol.tokens import verify_tokens
 from reliquary.shared.checkpoint_epoch import (
@@ -159,6 +163,7 @@ from reliquary.shared.modeling import (
     think_close_token_ids,
 )
 from reliquary.shared.runtime_fingerprint import collect_runtime_fingerprint
+from reliquary.shared.prompt_range import window_prompt_range
 from reliquary.validator.admission import (
     AdmissionContext,
     AdmissionReceiptBinding,
@@ -1239,6 +1244,7 @@ class ValidatorServer:
         # everything that can change the payload, so a hit is byte-identical
         # to a rebuild and staleness is structurally zero.
         self._state_response_cache: dict[str, tuple[tuple, bytes]] = {}
+        self._miner_state_response_cache: tuple[tuple, bytes, str] | None = None
         self._registration_gate_enforced = False
         self._registered_hotkeys: frozenset[str] | None = None
         self._operator_by_hotkey: dict[str, str] = {}
@@ -1477,6 +1483,36 @@ class ValidatorServer:
             fill_sealed,
         )
 
+    def _miner_state_cache_key(self) -> tuple:
+        """Everything the additive bounded miner-state response depends on."""
+        checkpoint = self._current_checkpoint
+        return (
+            self._current_state,
+            tuple(
+                (
+                    environment,
+                    id(batcher),
+                    int(batcher.window_start),
+                    str(batcher.randomness),
+                    getattr(batcher, "prompt_range", None),
+                    float(batcher.window_opened_wall_ts),
+                    float(
+                        getattr(
+                            batcher,
+                            "collection_seconds",
+                            WINDOW_COLLECTION_SECONDS,
+                        )
+                    ),
+                )
+                for environment, batcher in sorted(self._active_batchers.items())
+            ),
+            checkpoint.checkpoint_n if checkpoint else -1,
+            checkpoint.repo_id if checkpoint else None,
+            checkpoint.revision if checkpoint else None,
+            PROTOCOL_VERSION,
+            PROTOCOL_PROFILE_ID,
+        )
+
     @staticmethod
     def _fill_closed_state_payload(
         batcher: GrpoWindowBatcher,
@@ -1619,6 +1655,7 @@ class ValidatorServer:
         self._bad_envelope_counts = {}
         self._recent_reject_counts = collections.Counter()
         self._state_response_cache = {}
+        self._miner_state_response_cache = None
         self._checkpoint_epoch_phase = None
         self._checkpoint_epoch_admission_beacon = None
 
@@ -6667,6 +6704,132 @@ class ValidatorServer:
             ).encode("utf-8")
             self._state_response_cache[cache_slot] = (cache_key, body)
             return Response(content=body, media_type="application/json")
+
+        @app.get("/miner-state", response_model=MinerState)
+        async def miner_state(request: Request) -> Response:
+            """Bounded all-environment state without changing legacy bytes.
+
+            ``/state`` remains the compatibility contract. This additive
+            endpoint carries only cooldown membership inside each deterministic
+            active prompt slice and supports conditional polling with an ETag.
+            Concurrent checkpoint epochs retain their exact per-lane
+            ``/state?env=...&window=...`` surface until a lane-aware bounded
+            schema is versioned.
+            """
+            if self._active_epoch_batchers:
+                raise HTTPException(
+                    status_code=409,
+                    detail="lane_aware_miner_state_required",
+                )
+            if not self._active_batchers:
+                raise HTTPException(
+                    status_code=503,
+                    detail="no_active_window",
+                    headers={"Retry-After": "1"},
+                )
+
+            cache_key = self._miner_state_cache_key()
+            cached = self._miner_state_response_cache
+            if cached is not None and cached[0] == cache_key:
+                if request.headers.get("if-none-match") == cached[2]:
+                    return Response(
+                        status_code=304,
+                        headers={
+                            "Cache-Control": "private, no-cache",
+                            "ETag": cached[2],
+                        },
+                    )
+                return Response(
+                    content=cached[1],
+                    media_type="application/json",
+                    headers={
+                        "Cache-Control": "private, no-cache",
+                        "ETag": cached[2],
+                    },
+                )
+
+            first_batcher = next(iter(self._active_batchers.values()))
+            environments: dict[str, MinerEnvironmentState] = {}
+            for environment, batcher in sorted(self._active_batchers.items()):
+                if (
+                    batcher.window_start != first_batcher.window_start
+                    or batcher.randomness != first_batcher.randomness
+                ):
+                    raise HTTPException(
+                        status_code=503,
+                        detail="inconsistent_active_window",
+                        headers={"Retry-After": "1"},
+                    )
+                prompt_range = getattr(batcher, "prompt_range", None)
+                if prompt_range is None and batcher.randomness:
+                    prompt_range = window_prompt_range(
+                        batcher.randomness,
+                        getattr(batcher.env, "name", environment),
+                        len(batcher.env),
+                        PROMPT_RANGE_SIZE,
+                    )
+                if prompt_range is None:
+                    prompt_range = (0, 0)
+                bitmap, cooldown_count = encode_cooldown_bitmap(
+                    set(batcher.cooldown_prompts_snapshot),
+                    prompt_range,
+                )
+                environments[environment] = MinerEnvironmentState(
+                    prompt_range=prompt_range,
+                    cooldown_bitmap=bitmap,
+                    cooldown_count=cooldown_count,
+                )
+
+            checkpoint = self._current_checkpoint
+            payload = MinerState(
+                state=self._current_state,
+                window_n=first_batcher.window_start,
+                anchor_block=first_batcher.window_start,
+                window_opened_at=first_batcher.window_opened_wall_ts,
+                submission_deadline_at=(
+                    float(first_batcher.window_opened_wall_ts)
+                    + float(
+                        getattr(
+                            first_batcher,
+                            "collection_seconds",
+                            WINDOW_COLLECTION_SECONDS,
+                        )
+                    )
+                ),
+                environments=environments,
+                checkpoint_n=checkpoint.checkpoint_n if checkpoint else 0,
+                checkpoint_repo_id=checkpoint.repo_id if checkpoint else None,
+                checkpoint_revision=checkpoint.revision if checkpoint else None,
+                protocol_version=(
+                    PROTOCOL_VERSION if PROTOCOL_VERSION >= 3 else None
+                ),
+                generation_profile_id=(
+                    PROTOCOL_PROFILE_ID if PROTOCOL_VERSION >= 3 else None
+                ),
+                generation_contract=(
+                    dict(PROTOCOL_GENERATION_CONTRACT)
+                    if PROTOCOL_VERSION >= 3
+                    else None
+                ),
+                randomness=first_batcher.randomness,
+            )
+            body = payload.model_dump_json().encode("utf-8")
+            if self._miner_state_cache_key() != cache_key:
+                raise HTTPException(
+                    status_code=503,
+                    detail="window_changed_during_state_build",
+                    headers={"Retry-After": "1"},
+                )
+            etag = f'"{hashlib.sha256(body).hexdigest()}"'
+            self._miner_state_response_cache = (cache_key, body, etag)
+            return Response(
+                content=body,
+                media_type="application/json",
+                headers={
+                    "Cache-Control": "private, no-cache",
+                    "ETag": etag,
+                },
+            )
 
         @app.get("/runtime-contract", response_model=RuntimeContract)
         async def runtime_contract() -> RuntimeContract:

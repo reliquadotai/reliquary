@@ -6,6 +6,8 @@ and the miner submitter (reliquary/miner/submitter.py) produces them.
 
 from __future__ import annotations
 
+import base64
+import binascii
 from enum import Enum
 from typing import Any, Literal
 
@@ -483,6 +485,116 @@ class GrpoBatchState(BaseModel):
     # empty until populated. Miners derive GRAIL commitments off this
     # value rather than recomputing locally, which guarantees byte-for-byte
     # agreement with the validator's verify path.
+    randomness: str = ""
+
+
+def encode_cooldown_bitmap(
+    prompt_indices: set[int] | frozenset[int] | list[int],
+    prompt_range: tuple[int, int],
+) -> tuple[str, int]:
+    """Encode cooldown membership inside one active prompt slice."""
+    start, end = prompt_range
+    if start < 0 or end < start:
+        raise ValueError("invalid prompt range")
+    span = end - start
+    bitmap = bytearray((span + 7) // 8)
+    count = 0
+    candidates = (
+        (
+            prompt_idx
+            for prompt_idx in range(start, end)
+            if prompt_idx in prompt_indices
+        )
+        if isinstance(prompt_indices, (set, frozenset))
+        and span < len(prompt_indices)
+        else prompt_indices
+    )
+    for prompt_idx in candidates:
+        offset = int(prompt_idx) - start
+        if not 0 <= offset < span:
+            continue
+        byte_n, bit_n = divmod(offset, 8)
+        mask = 1 << bit_n
+        if not bitmap[byte_n] & mask:
+            bitmap[byte_n] |= mask
+            count += 1
+    return base64.b64encode(bitmap).decode("ascii"), count
+
+
+def decode_cooldown_bitmap(
+    encoded: str,
+    prompt_range: tuple[int, int],
+) -> set[int]:
+    """Decode a ``bitset-v1`` cooldown and reject malformed wire data."""
+    start, end = prompt_range
+    if start < 0 or end < start:
+        raise ValueError("invalid prompt range")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("invalid cooldown bitmap base64") from exc
+    expected_bytes = (end - start + 7) // 8
+    if len(raw) != expected_bytes:
+        raise ValueError(
+            f"cooldown bitmap length {len(raw)} != expected {expected_bytes}"
+        )
+    if raw and (end - start) % 8:
+        valid_bits = (1 << ((end - start) % 8)) - 1
+        if raw[-1] & ~valid_bits:
+            raise ValueError("cooldown bitmap has out-of-range bits set")
+    return {
+        start + byte_n * 8 + bit_n
+        for byte_n, value in enumerate(raw)
+        for bit_n in range(8)
+        if value & (1 << bit_n)
+    }
+
+
+class MinerEnvironmentState(BaseModel):
+    """One environment's bounded prompt slice in ``GET /miner-state``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    encoding: Literal["bitset-v1"] = "bitset-v1"
+    prompt_range: tuple[int, int]
+    cooldown_bitmap: str
+    cooldown_count: int = Field(..., ge=0)
+
+    @model_validator(mode="after")
+    def _validate_bitmap(self) -> "MinerEnvironmentState":
+        decoded = decode_cooldown_bitmap(
+            self.cooldown_bitmap,
+            self.prompt_range,
+        )
+        if len(decoded) != self.cooldown_count:
+            raise ValueError("cooldown_count does not match cooldown_bitmap")
+        return self
+
+    def cooldown_prompts(self) -> set[int]:
+        return decode_cooldown_bitmap(
+            self.cooldown_bitmap,
+            self.prompt_range,
+        )
+
+
+class MinerState(BaseModel):
+    """Bounded all-environment control-plane state for reference miners."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1] = 1
+    state: WindowState
+    window_n: int = Field(..., ge=0)
+    anchor_block: int = Field(..., ge=0)
+    window_opened_at: float | None = Field(default=None, ge=0)
+    submission_deadline_at: float | None = Field(default=None, ge=0)
+    environments: dict[str, MinerEnvironmentState]
+    checkpoint_n: int = Field(..., ge=0)
+    checkpoint_repo_id: str | None = None
+    checkpoint_revision: str | None = None
+    protocol_version: int | None = Field(default=None, ge=0)
+    generation_profile_id: str | None = Field(default=None, max_length=64)
+    generation_contract: dict[str, Any] | None = None
     randomness: str = ""
 
 

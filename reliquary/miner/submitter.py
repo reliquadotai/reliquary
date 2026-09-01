@@ -38,6 +38,7 @@ from reliquary.protocol.submission import (
     EpochGenerationIntentResponse,
     EpochGenerationIntentStatus,
     GrpoBatchState,
+    MinerState,
     RejectReason,
     RuntimeContract,
     SubmissionPrecommitRequest,
@@ -78,6 +79,8 @@ _CHECKPOINT_EPOCH_BEACON_VERIFY_TIMEOUT_SECONDS = 12.0
 # a submission even in the async-queue path (the queue can back up under load).
 # Miners running against slow links (Targon port-forward etc.) benefit further.
 _DEFAULT_TIMEOUT = 60.0
+_CONTROL_TIMEOUT = 3.0
+_CONTROL_RETRY_DELAYS = (0.2, 0.5, 1.0)
 _PRECOMMIT_HEADER = "X-Reliquary-Precommit"
 _EPOCH_INTENT_HEADER = "X-Reliquary-Epoch-Intent"
 _DRAND_BOUNDARY_SAFETY_SECONDS = 1.0
@@ -90,6 +93,10 @@ class NoValidatorFoundError(RuntimeError):
 
 class SubmissionError(RuntimeError):
     """All submission retries exhausted."""
+
+
+class EndpointNotFoundError(SubmissionError):
+    """An optional or versioned validator capability is unavailable."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -722,6 +729,62 @@ async def get_window_state_v2(
         state_url, GrpoBatchState,
         client=client, timeout=timeout,
     )
+
+
+async def get_miner_state_v1(
+    url: str,
+    *,
+    client: httpx.AsyncClient | None = None,
+    timeout: float = _CONTROL_TIMEOUT,
+    etag: str | None = None,
+) -> tuple[MinerState | None, str | None]:
+    """Fetch bounded state, returning ``None`` for a conditional 304."""
+    own_client = client is None
+    cli = client or httpx.AsyncClient(timeout=timeout)
+    last_exc: Exception | None = None
+    try:
+        for attempt, delay in enumerate(_CONTROL_RETRY_DELAYS, start=1):
+            headers = {"Accept-Encoding": "gzip"}
+            if etag:
+                headers["If-None-Match"] = etag
+            try:
+                response = await cli.get(
+                    f"{url}/miner-state",
+                    headers=headers,
+                    timeout=timeout,
+                )
+            except (httpx.RequestError, httpx.TimeoutException) as exc:
+                last_exc = exc
+                if attempt < len(_CONTROL_RETRY_DELAYS):
+                    await asyncio.sleep(delay)
+                continue
+            if response.status_code == 304:
+                return None, response.headers.get("ETag") or etag
+            if response.status_code in {404, 409}:
+                raise EndpointNotFoundError(
+                    f"endpoint unavailable: {url}/miner-state"
+                )
+            if response.status_code == 503:
+                raise SubmissionError(
+                    f"no active window at {url}/miner-state"
+                )
+            if response.status_code >= 400:
+                last_exc = SubmissionError(
+                    f"HTTP {response.status_code}: {_safe_detail(response)}"
+                )
+                if response.status_code < 500:
+                    raise last_exc
+                if attempt < len(_CONTROL_RETRY_DELAYS):
+                    await asyncio.sleep(delay)
+                continue
+            return (
+                MinerState.model_validate(response.json()),
+                response.headers.get("ETag"),
+            )
+        raise SubmissionError(f"all retries failed: {last_exc}")
+    finally:
+        if own_client:
+            await cli.aclose()
 
 
 def finalize_checkpoint_epoch_generation_intent_v1(
