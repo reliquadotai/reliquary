@@ -164,6 +164,31 @@ def test_an_unknown_marker_refuses_to_guess(monkeypatch):
         migrate_journal_cursor(7, "something-else")
 
 
+@pytest.mark.parametrize("key_space", [False, 0, ""])
+def test_falsey_present_marker_never_aliases_legacy_missing(
+    monkeypatch,
+    key_space,
+):
+    import reliquary.trainer.journal as journal_module
+    from reliquary.trainer.journal import migrate_journal_cursor
+
+    monkeypatch.setattr(journal_module, "FILL_CLOSED_ENABLED", True)
+
+    with pytest.raises(ValueError, match="journal key space"):
+        migrate_journal_cursor(7, key_space)
+
+
+@pytest.mark.parametrize("cursor", [True, 7.0, "7", -1])
+def test_migration_never_coerces_the_durable_cursor(monkeypatch, cursor):
+    import reliquary.trainer.journal as journal_module
+    from reliquary.trainer.journal import migrate_journal_cursor
+
+    monkeypatch.setattr(journal_module, "FILL_CLOSED_ENABLED", True)
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        migrate_journal_cursor(cursor, "raw")
+
+
 def test_the_matching_marker_leaves_the_cursor_alone(monkeypatch):
     import reliquary.trainer.journal as journal_module
     from reliquary.trainer.journal import migrate_journal_cursor

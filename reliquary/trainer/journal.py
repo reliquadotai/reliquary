@@ -70,7 +70,16 @@ def migrate_journal_cursor(
     where the journal starts, so it is taken as already being in the active
     space.
     """
-    stored = str(key_space or RAW_JOURNAL_KEY_SPACE)
+    if type(cursor) is not int or cursor < 0:
+        raise ValueError("journal cursor must be a non-negative integer")
+    if key_space is None:
+        stored = RAW_JOURNAL_KEY_SPACE
+    elif type(key_space) is not str or not key_space:
+        raise ValueError(
+            "journal key space must be absent or a non-empty string"
+        )
+    else:
+        stored = key_space
     active = active_journal_key_space()
     known = {RAW_JOURNAL_KEY_SPACE, FILL_CLOSED_JOURNAL_KEY_SPACE}
     if stored not in known:
@@ -79,10 +88,10 @@ def migrate_journal_cursor(
             + ", ".join(sorted(known))
         )
     if stored == active:
-        return int(cursor), active
+        return cursor, active
     if active == FILL_CLOSED_JOURNAL_KEY_SPACE:
-        return int(cursor) * FILL_CLOSED_EMISSIONS_PER_WINDOW, active
-    return int(cursor) // FILL_CLOSED_EMISSIONS_PER_WINDOW, active
+        return cursor * FILL_CLOSED_EMISSIONS_PER_WINDOW, active
+    return cursor // FILL_CLOSED_EMISSIONS_PER_WINDOW, active
 
 
 class WindowJournal:
