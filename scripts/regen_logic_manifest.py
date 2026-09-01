@@ -80,6 +80,26 @@ def _implementation_sha256(paths) -> str:
     return digest.hexdigest()
 
 
+def _perturb(reference, spec):
+    """A near-miss the checker must reject, whatever the answer shape is."""
+    if isinstance(reference, bool):
+        return not reference
+    if isinstance(reference, str):
+        return reference[:-1] if len(reference) > 1 else reference + "x"
+    if isinstance(reference, dict):
+        broken = dict(reference)
+        key = sorted(broken)[0]
+        broken[key] = (broken[key] + 1) % 10
+        return broken
+    # Numbrix grid: swap two corners, which breaks path adjacency.
+    broken = [list(row) for row in reference]
+    size = spec["constraints"]["size"]
+    broken[0][0], broken[size - 1][size - 1] = (
+        broken[size - 1][size - 1], broken[0][0],
+    )
+    return broken
+
+
 def _import_without_catalog():
     """The package __init__ builds the catalog, which refuses a stale pin."""
     package = types.ModuleType("reliquary.environment")
@@ -102,26 +122,31 @@ def main() -> int:
     )
 
     environment = ReliquaryLogicEnvironment()
+
+    # One golden per family, taken at the first index that produces it, so
+    # coverage follows the generator list instead of a hand-picked tuple.
+    indices: dict[str, int] = {}
+    for index in range(20000):
+        family = generate_logic_task(index).family
+        indices.setdefault(family, index)
+    expected_families = {
+        generate_logic_task(index).family for index in range(20000)
+    }
+    if set(indices) != expected_families:
+        raise SystemExit("golden selection missed a family")
+
     rows = []
-    for index in (0, 1, 2, 7):
+    for index in sorted(indices.values()):
         problem = environment.get_problem(index)
         spec = json.loads(problem["ground_truth"])
         reference = generate_logic_task(index).expected
         accepted = json.dumps({"result": reference}, separators=(",", ":"))
-        if spec["family"] == "boolean_expressions":
-            rejected = [
-                json.dumps({"result": not reference}, separators=(",", ":"))
-            ]
-        else:
-            broken = [list(row) for row in reference]
-            size = spec["constraints"]["size"]
-            broken[0][0], broken[size - 1][size - 1] = (
-                broken[size - 1][size - 1], broken[0][0],
-            )
-            rejected = [
-                json.dumps({"result": broken}, separators=(",", ":"))
-            ]
-        rejected += ['{"result":null}', '{"result":[]}']
+        rejected = [
+            json.dumps({"result": _perturb(reference, spec)},
+                       separators=(",", ":")),
+            '{"result":null}',
+            '{"result":[]}',
+        ]
 
         assert environment.compute_reward(problem, accepted) == 1.0, index
         for bad in rejected:

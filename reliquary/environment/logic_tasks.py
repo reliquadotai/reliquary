@@ -210,9 +210,185 @@ def _numbrix(rng: HashCounterRng) -> GeneratedLogicTask:
     )
 
 
+# ────────────────  cipher  ────────────────
+
+_WORDS = (
+    "amber", "anchor", "bridge", "candle", "cavern", "cinder", "clover",
+    "copper", "cypher", "ember", "falcon", "garnet", "harbor", "hollow",
+    "indigo", "ivory", "jasper", "kernel", "lantern", "marble", "meadow",
+    "nectar", "obsidian", "onyx", "pewter", "quartz", "quiver", "ripple",
+    "saffron", "silver", "summit", "thicket", "timber", "velvet", "walnut",
+    "willow", "zenith", "zephyr",
+)
+
+
+def _shift(text: str, amount: int) -> str:
+    return "".join(
+        chr((ord(character) - 97 + amount) % 26 + 97) for character in text
+    )
+
+
+def _cipher(rng: HashCounterRng) -> GeneratedLogicTask:
+    words = list(_WORDS)
+    rng.shuffle(words)
+    plain = " ".join(words[: 3 + rng.randbelow(3)])
+    amount = 1 + rng.randbelow(25)
+    encoding = rng.randbelow(2) == 1
+    shifted = _shift(plain, amount if encoding else -amount)
+    given, expected = (plain, shifted) if encoding else (shifted, plain)
+    direction = "Encode" if encoding else "Decode"
+    prompt = (
+        f"{direction} the message below with a Caesar shift of {amount} "
+        f"{'forward' if encoding else 'backward'} through the alphabet. "
+        "Spaces are unchanged.\n\n"
+        f"```\n{given}\n```\n\n"
+        "Answer with the resulting string.\n\n"
+        f"{_ANSWER_SHAPE}"
+    )
+    return GeneratedLogicTask(
+        prompt=prompt,
+        expected=expected,
+        operation_id="caesar-cipher-v1",
+        family="cipher",
+        difficulty=2 + len(plain.split()) // 2,
+        check="equality",
+        constraints={},
+    )
+
+
+# ────────────────  dyck_language  ────────────────
+
+_BRACKETS = (("(", ")"), ("[", "]"), ("{", "}"))
+
+
+def _dyck_language(rng: HashCounterRng) -> GeneratedLogicTask:
+    steps = 10 + rng.randbelow(11)
+    stack: list[int] = []
+    sequence: list[str] = []
+    for step in range(steps):
+        remaining = steps - step
+        # Leave room to stay open at the end; never pop an empty stack.
+        if stack and (rng.randbelow(2) == 1 or len(stack) >= remaining):
+            sequence.append(_BRACKETS[stack.pop()][1])
+        else:
+            kind = rng.randbelow(len(_BRACKETS))
+            stack.append(kind)
+            sequence.append(_BRACKETS[kind][0])
+    if not stack:  # degenerate: force one open so the answer is non-empty
+        kind = rng.randbelow(len(_BRACKETS))
+        stack.append(kind)
+        sequence.append(_BRACKETS[kind][0])
+    expected = "".join(_BRACKETS[kind][1] for kind in reversed(stack))
+    prompt = (
+        "Complete the sequence below so every bracket is properly closed, "
+        "in the correct order. Answer with only the closing brackets you "
+        "would append, and nothing else.\n\n"
+        f"```\n{''.join(sequence)}\n```\n\n"
+        f"{_ANSWER_SHAPE}"
+    )
+    return GeneratedLogicTask(
+        prompt=prompt,
+        expected=expected,
+        operation_id="dyck-completion-v1",
+        family="dyck_language",
+        difficulty=min(5, 1 + len(expected) // 2),
+        check="equality",
+        constraints={},
+    )
+
+
+# ────────────────  web_of_lies  ────────────────
+
+_PEOPLE = (
+    "Ada", "Bo", "Cleo", "Dmitri", "Elena", "Farid", "Greta", "Hugo",
+    "Ines", "Jonas", "Kira", "Liam", "Mira", "Noor", "Osric", "Petra",
+)
+
+
+def _web_of_lies(rng: HashCounterRng) -> GeneratedLogicTask:
+    names = list(_PEOPLE)
+    rng.shuffle(names)
+    count = 4 + rng.randbelow(3)
+    chosen = names[:count]
+    honest = [rng.randbelow(2) == 1 for _ in chosen]
+
+    lines = [
+        f"{chosen[0]} {'tells the truth' if honest[0] else 'lies'}."
+    ]
+    # Each speaker reports on the next, so the chain is fully determined by
+    # the anchor above; a liar states the opposite of what is true.
+    for index in range(count - 1):
+        claim = honest[index + 1] if honest[index] else not honest[index + 1]
+        lines.append(
+            f"{chosen[index]} says that {chosen[index + 1]} "
+            f"{'tells the truth' if claim else 'lies'}."
+        )
+    target = 1 + rng.randbelow(count - 1)
+    prompt = (
+        "Each person either always tells the truth or always lies.\n\n"
+        + "\n".join(lines)
+        + f"\n\nDoes {chosen[target]} tell the truth? Answer with the JSON "
+        "boolean true or false.\n\n"
+        f"{_ANSWER_SHAPE}"
+    )
+    return GeneratedLogicTask(
+        prompt=prompt,
+        expected=honest[target],
+        operation_id="web-of-lies-v1",
+        family="web_of_lies",
+        difficulty=min(5, count - 1),
+        check="equality",
+        constraints={},
+    )
+
+
+# ────────────────  cryptarithm  ────────────────
+
+_LETTERS = "ABCDEFGHIJ"
+
+
+def _cryptarithm(rng: HashCounterRng) -> GeneratedLogicTask:
+    width = 3 + rng.randbelow(2)
+    # Build from a true sum, so the puzzle is solvable without any search.
+    left = rng.randbelow(9 * 10 ** (width - 1)) + 10 ** (width - 1)
+    right = rng.randbelow(9 * 10 ** (width - 1)) + 10 ** (width - 1)
+    total = left + right
+    digits = sorted({int(c) for c in f"{left}{right}{total}"})
+    mapping = {}
+    pool = list(_LETTERS)
+    rng.shuffle(pool)
+    for position, digit in enumerate(digits):
+        mapping[digit] = pool[position]
+
+    def encode(value: int) -> str:
+        return "".join(mapping[int(c)] for c in str(value))
+
+    words = [encode(left), encode(right), encode(total)]
+    prompt = (
+        "Each letter below stands for a distinct decimal digit, and the "
+        "addition holds as written. No number has a leading zero.\n\n"
+        f"```\n  {words[0]}\n+ {words[1]}\n= {words[2]}\n```\n\n"
+        "Answer with a JSON object mapping every letter to its digit.\n\n"
+        f"{_ANSWER_SHAPE}"
+    )
+    return GeneratedLogicTask(
+        prompt=prompt,
+        expected={letter: digit for digit, letter in mapping.items()},
+        operation_id="cryptarithm-sum-v1",
+        family="cryptarithm",
+        difficulty=min(5, width),
+        check="cryptarithm_sum",
+        constraints={"addends": words[:2], "sum": words[2]},
+    )
+
+
 _GENERATORS = (
     _boolean_expressions,
+    _cipher,
+    _cryptarithm,
+    _dyck_language,
     _numbrix,
+    _web_of_lies,
 )
 
 
@@ -269,6 +445,32 @@ def _check_numbrix(answer: Any, constraints: dict[str, Any]) -> bool:
     return True
 
 
+def _check_cryptarithm(answer: Any, constraints: dict[str, Any]) -> bool:
+    """Accept any assignment that makes the sum hold, not one stored answer."""
+    words = list(constraints["addends"]) + [constraints["sum"]]
+    if not isinstance(answer, dict):
+        return False
+    letters = sorted({character for word in words for character in word})
+    if sorted(answer) != letters:
+        return False
+    digits = []
+    for letter in letters:
+        value = answer[letter]
+        if not isinstance(value, int) or isinstance(value, bool):
+            return False
+        if not 0 <= value <= 9:
+            return False
+        digits.append(value)
+    if len(set(digits)) != len(digits):
+        return False
+    values = []
+    for word in words:
+        if answer[word[0]] == 0:
+            return False
+        values.append(int("".join(str(answer[c]) for c in word)))
+    return values[0] + values[1] == values[2]
+
+
 def check_answer(spec: dict[str, Any], answer: Any) -> bool:
     """Total checker: never raises, returns False on anything unexpected."""
     check = spec.get("check")
@@ -278,11 +480,13 @@ def check_answer(spec: dict[str, Any], answer: Any) -> bool:
         if isinstance(expected, bool) != isinstance(answer, bool):
             return False
         return answer == expected
+    constraints = spec.get("constraints")
+    if not isinstance(constraints, dict):
+        return False
     if check == "numbrix_path":
-        constraints = spec.get("constraints")
-        if not isinstance(constraints, dict):
-            return False
         return _check_numbrix(answer, constraints)
+    if check == "cryptarithm_sum":
+        return _check_cryptarithm(answer, constraints)
     return False
 
 

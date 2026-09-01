@@ -51,14 +51,22 @@ def test_generator_is_total_over_a_wide_index_range():
     for index in range(0, SAMPLE * 977, 977):
         task = generate_logic_task(index)
         assert task.prompt
-        assert task.check in ("equality", "numbrix_path")
+        assert task.check in (
+            "equality", "numbrix_path", "cryptarithm_sum",
+        )
+
+
+FAMILIES = {
+    "boolean_expressions", "cipher", "cryptarithm",
+    "dyck_language", "numbrix", "web_of_lies",
+}
 
 
 def test_families_are_represented():
     families = {
         generate_logic_task(index).family for index in range(SAMPLE)
     }
-    assert families == {"boolean_expressions", "numbrix"}
+    assert families == FAMILIES
 
 
 def test_generation_stays_inside_the_hot_path_budget():
@@ -82,7 +90,7 @@ def test_reference_answer_is_accepted_for_every_family():
             problem, _completion(_reference(index))
         ) == 1.0
         seen.add(spec["family"])
-    assert len(seen) == 2
+    assert seen == FAMILIES
 
 
 def test_wrong_answers_are_rejected():
@@ -90,7 +98,14 @@ def test_wrong_answers_are_rejected():
     for index in range(400):
         problem = environment.get_problem(index)
         expected = _reference(index)
-        wrong = not expected if isinstance(expected, bool) else [[0]]
+        if isinstance(expected, bool):
+            wrong = not expected
+        elif isinstance(expected, str):
+            wrong = expected + "zz"
+        elif isinstance(expected, dict):
+            wrong = {key: 0 for key in expected}
+        else:
+            wrong = [[0]]
         assert environment.compute_reward(problem, _completion(wrong)) == 0.0
 
 
@@ -201,9 +216,7 @@ def _goldens():
 def test_golden_problem_and_reward_contract():
     environment = ReliquaryLogicEnvironment()
     goldens = _goldens()
-    assert {golden["family"] for golden in goldens} == {
-        "boolean_expressions", "numbrix",
-    }
+    assert {golden["family"] for golden in goldens} == FAMILIES
     for golden in goldens:
         problem = environment.get_problem(golden["index"])
         assert problem["id"] == golden["id"]
@@ -274,3 +287,48 @@ def test_prompts_do_not_collide_across_a_wide_index_range():
     for family, ids in by_family.items():
         duplicate_rate = 1 - len(set(ids)) / len(ids)
         assert duplicate_rate < 0.02, f"{family}: {duplicate_rate:.2%}"
+
+
+def _first_of(environment, family):
+    for index in range(SAMPLE):
+        problem = environment.get_problem(index)
+        spec = _spec(problem)
+        if spec["family"] == family:
+            return problem, spec, _reference(index)
+    raise AssertionError(f"no {family} task in sample")
+
+
+def test_cryptarithm_checker_enforces_each_invariant():
+    environment = ReliquaryLogicEnvironment()
+    problem, spec, reference = _first_of(environment, "cryptarithm")
+    assert "expected" not in spec, "constraint spec must not ship an answer"
+
+    letters = sorted(reference)
+    collided = dict(reference)
+    collided[letters[1]] = collided[letters[0]]
+    assert environment.compute_reward(problem, _completion(collided)) == 0.0
+
+    dropped = {k: v for k, v in reference.items() if k != letters[0]}
+    assert environment.compute_reward(problem, _completion(dropped)) == 0.0
+
+    out_of_range = dict(reference)
+    out_of_range[letters[0]] = 10
+    assert environment.compute_reward(
+        problem, _completion(out_of_range)
+    ) == 0.0
+
+    leading = dict(reference)
+    leading[spec["constraints"]["sum"][0]] = 0
+    assert environment.compute_reward(problem, _completion(leading)) == 0.0
+
+    assert environment.compute_reward(problem, _completion(reference)) == 1.0
+
+
+def test_cryptarithm_puzzle_is_arithmetically_sound():
+    environment = ReliquaryLogicEnvironment()
+    _problem, spec, reference = _first_of(environment, "cryptarithm")
+    addends = spec["constraints"]["addends"]
+    total = spec["constraints"]["sum"]
+    decode = lambda word: int("".join(str(reference[c]) for c in word))
+    assert decode(addends[0]) + decode(addends[1]) == decode(total)
+    assert len(set(reference.values())) == len(reference)

@@ -6,7 +6,7 @@
   "generator_version": "logic-v1",
   "checker_version": "logic-checker-v1",
   "golden_fixture": "tests/fixtures/reliquarylogic_v1.jsonl",
-  "golden_fixture_sha256": "66b049e2c8386be5512ed24d7e53965a01e03671cbfbf1e4be9325d60a66cbc4",
+  "golden_fixture_sha256": "9391fb933becb78e55001c7a4b11910d91e412628008b39fff3dbc7bf00f261c",
   "implementation_digest_algorithm": "sha256-path-nul-file-sha256-newline-v1",
   "implementation_files": [
     "reliquary/environment/logic_tasks.py",
@@ -14,7 +14,7 @@
     "reliquary/environment/reliquarylogic.py",
     "reliquary/environment/structured_output.py"
   ],
-  "implementation_sha256": "57bc25594e323a92ded988520175d1a784ba7cbfeaab103b2e7315c3ee93c327",
+  "implementation_sha256": "9a7346c6eb83628532cfc663475f373812a617a6979a595fb362508d9f48e633",
   "virtual_length": 2147483648,
   "protocol_reward_lattice": [
     0.0,
@@ -28,12 +28,20 @@
   },
   "task_families": [
     "boolean_expressions",
-    "numbrix"
+    "cipher",
+    "cryptarithm",
+    "dyck_language",
+    "numbrix",
+    "web_of_lies"
   ],
   "reward": "deterministic-binary-outcome-v1",
   "checks": {
     "boolean_expressions": "equality",
-    "numbrix": "constraint-satisfaction (no unique-solution requirement)"
+    "cipher": "equality",
+    "cryptarithm": "constraint-satisfaction (any assignment making the sum hold)",
+    "dyck_language": "equality",
+    "numbrix": "constraint-satisfaction (no unique-solution requirement)",
+    "web_of_lies": "equality"
   },
   "limits": {
     "completion_bytes": 16384,
