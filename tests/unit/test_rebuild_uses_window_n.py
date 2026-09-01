@@ -41,7 +41,10 @@ async def test_rebuild_uses_state_window_n_not_block_derived():
     async def fake_list(current_window, n, *, strict=False):
         captured["current_window"] = current_window
         captured["strict"] = strict
-        return []
+        return [
+            {"window_start": window_start, "batch": []}
+            for window_start in range(1, 43)
+        ]
 
     # No snapshot for the default run -> falls back to the bounded archive scan.
     with patch(

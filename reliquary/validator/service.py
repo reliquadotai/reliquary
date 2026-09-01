@@ -3794,34 +3794,11 @@ class ValidationService:
             return None
 
     def _fill_closed_pick_gate_open(self, batcher, *, next_pick: int) -> bool:
-        """Is the pacing gate for pick ``next_pick`` (1-indexed) open?
+        """Return whether the qualification pick's pacing barrier is met.
 
-        R34 as amended by R41, and the one place the off-by-ones live:
-
-        * ``next_pick == 1``: nothing has been emitted into this window's
-          key range yet, so no cursor value could ever release it -- the
-          ONLY pick on the ``FILL_CLOSED_FIRST_PICK_SECONDS`` floor,
-          measured on the BATCHER's clock (the same one
-          ``FILL_CLOSED_MAX_SECONDS`` uses, so the floor and the backstop
-          can never disagree about how old a window is).
-        * ``next_pick >= 2``: pick k emits batch index ``k - 1``, so the
-          batch ``depth`` picks back is index ``k - depth - 1``, CLAMPED
-          at 0 (R41): pick 2 waits on batch 0 -- the end of the first
-          training step -- rather than sharing the floor. The trade,
-          measured when R41 was ruled: one emit-to-fetch bubble (~8-10 s)
-          at the end of step 1, once per window, and in exchange the
-          floor seats fall from 2/16 to 1/16 of the window and pick 2's
-          candidates get a whole step of extra generation time. Picks 2
-          and 3 share the batch-0 gate (max(0, k-depth-1) collides
-          there), which is what refills the depth-2 buffer immediately
-          after the bubble: from step 2 on the trainer always holds one
-          batch in hand, exactly the buffer R34 asks for.
-
-        ``>=`` rather than ``==`` because the trainer skips keys it never
-        trains (tombstones, quarantined batches, health skips all advance
-        the cursor) -- and because the encoding is monotone across
-        windows, so a cursor left in a PREVIOUS window is simply too
-        small and needs no separate staleness rule.
+        Pick one uses the configured opening floor. Later picks compare the
+        monotonic trainer cursor with the journal key selected by pipeline
+        depth; skipped terminal keys are therefore handled by ``>=``.
         """
         if next_pick <= 1:
             age = self._window_open_age_seconds(batcher)
@@ -7127,7 +7104,20 @@ class ValidationService:
         """Rebuild every env's cooldown from scratch from the last ``n`` R2
         archives (used only when no snapshot is available)."""
         try:
-            start_window = max(0, current_window + 1 - n)
+            if type(current_window) is not int or current_window < 0:
+                raise RuntimeError("cooldown rebuild window is not canonical")
+            if type(n) is not int or n < 1:
+                raise RuntimeError("cooldown rebuild horizon is not canonical")
+            if current_window == 0:
+                for cooldown_map in self._cooldown_per_env.values():
+                    cooldown_map.rebuild_from_history([], current_window=0)
+                logger.info(
+                    "Initialized empty cooldown before the first produced window"
+                )
+                return
+            # Window zero is the bootstrap sentinel; the first durable archive
+            # is window one. Every real window in the bounded range is required.
+            start_window = max(1, current_window + 1 - n)
             archives = await self._load_archive_range(
                 start_window=start_window,
                 end_window=current_window,

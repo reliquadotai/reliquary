@@ -122,7 +122,7 @@ async def test_snapshot_lookup_failure_cannot_reset_a_training_run():
 @pytest.mark.asyncio
 async def test_default_run_without_snapshot_falls_back_to_archive():
     svc = _service(40)
-    archives = _gap_archives(0, 40, selected_window=38)
+    archives = _gap_archives(1, 40, selected_window=38)
     with patch(
         "reliquary.infrastructure.storage.download_json",
         new=AsyncMock(return_value=None),
@@ -139,7 +139,7 @@ async def test_default_run_without_snapshot_rejects_incomplete_archive_coverage(
     svc = _service(40)
     incomplete = [
         archive
-        for archive in _gap_archives(0, 40)
+        for archive in _gap_archives(1, 40)
         if archive["window_start"] != 20
     ]
     with patch(
@@ -153,6 +153,23 @@ async def test_default_run_without_snapshot_rejects_incomplete_archive_coverage(
             await svc._rebuild_cooldown_from_history()
 
     assert len(svc._cooldown_per_env["fake"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_default_run_before_first_window_needs_no_bootstrap_archive():
+    svc = _service(0)
+    list_mock = AsyncMock(return_value=[])
+    with patch(
+        "reliquary.infrastructure.storage.download_json",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "reliquary.infrastructure.storage.list_recent_datasets",
+        new=list_mock,
+    ):
+        await svc._rebuild_cooldown_from_history()
+
+    assert len(svc._cooldown_per_env["fake"]) == 0
+    list_mock.assert_not_called()
 
 
 @pytest.mark.asyncio

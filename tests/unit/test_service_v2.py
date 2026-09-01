@@ -364,10 +364,10 @@ async def test_rebuild_cooldown_from_history_populates_map():
 
     archives = [
         {"window_start": window_start, "batch": []}
-        for window_start in range(106)
+        for window_start in range(1, 106)
     ]
-    archives[100]["batch"] = [{"prompt_idx": 42}]
-    archives[101]["batch"] = [{"prompt_idx": 7}]
+    archives[99]["batch"] = [{"prompt_idx": 42}]
+    archives[100]["batch"] = [{"prompt_idx": 7}]
     svc._window_n = 105  # authoritative counter
 
     with patch(
