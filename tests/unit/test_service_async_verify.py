@@ -15,9 +15,8 @@ This file initially holds the Task-4-level tests pinning the new
 
 from __future__ import annotations
 
-import asyncio
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -290,7 +289,12 @@ def test_public_window_binding_is_reproducible_and_window_specific():
 async def test_fill_window_uses_only_public_randomness_binding(monkeypatch):
     from reliquary.validator import service as svc_mod
 
-    fake_beacon = {"round": 1, "randomness": "aa" * 32}
+    fake_beacon = {
+        "round": 1,
+        "randomness": "aa" * 32,
+        "source_chain": "quicknet",
+        "source_chain_hash": "ab" * 32,
+    }
 
     async def _stub_derive(self, subtensor, target_window):
         return "computed_randomness", fake_beacon
@@ -315,6 +319,9 @@ async def test_fill_window_uses_only_public_randomness_binding(monkeypatch):
             target_window=42,
         )
     )
+    assert svc._active_batcher.window_open_drand_chain == "quicknet"
+    assert svc._active_batcher.window_open_drand_chain_hash == "ab" * 32
+    assert svc._active_batcher.window_open_drand_round == 1
 
 
 @pytest.mark.asyncio

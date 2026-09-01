@@ -147,7 +147,6 @@ from reliquary.shared.checkpoint_epoch_market import (
     SignedGenerationIntentSet,
     build_generation_intent_set,
     canonical_signed_generation_intent_set_bytes,
-    generation_intent_set_sha256,
     select_generation_tickets,
 )
 from reliquary.shared.hf_compat import (
@@ -1502,6 +1501,15 @@ class ValidatorServer:
         admitted = snapshot["admitted"]
         return FillClosedWindowState(
             phase=phase,
+            generation_beacon_chain=getattr(
+                batcher, "window_open_drand_chain", None
+            ),
+            generation_beacon_chain_hash=getattr(
+                batcher, "window_open_drand_chain_hash", None
+            ),
+            generation_beacon_round=getattr(
+                batcher, "window_open_drand_round", None
+            ),
             precommit_cutoff_ts=(
                 float(batcher.window_opened_wall_ts)
                 + float(batcher.collection_seconds)

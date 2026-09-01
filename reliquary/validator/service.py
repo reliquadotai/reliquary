@@ -3893,7 +3893,12 @@ class ValidationService:
 
         self._last_beacon = beacon
         if beacon is not None and beacon.get("round") is not None:
-            self._active_batcher.window_open_drand_round = int(beacon["round"])
+            for batcher in self._active_batchers.values():
+                batcher.window_open_drand_round = int(beacon["round"])
+                batcher.window_open_drand_chain = beacon.get("source_chain")
+                batcher.window_open_drand_chain_hash = beacon.get(
+                    "source_chain_hash"
+                )
         # Schedule background bittensor_drand cross-check. Only in real-drand
         # mode (mock path returns beacon=None). Pass all batchers so the
         # cross-check can invalidate the whole multi-environment window.
@@ -3901,7 +3906,8 @@ class ValidationService:
             from reliquary.infrastructure.drand import get_current_chain
 
             chain_info = get_current_chain()
-            self._active_batcher._drand_chain_info = chain_info
+            for batcher in self._active_batchers.values():
+                batcher._drand_chain_info = chain_info
             self._verify_task = asyncio.create_task(
                 self._verify_beacon_async(
                     list(self._active_batchers.values()),
@@ -7107,9 +7113,15 @@ class ValidationService:
             drand_round = chain.compute_current_drand_round(
                 time.time(), chain_info["genesis_time"], chain_info["period"],
             )
-            beacon = await asyncio.to_thread(
-                get_beacon, round_id=str(drand_round), use_drand=True,
+            beacon = dict(
+                await asyncio.to_thread(
+                    get_beacon,
+                    round_id=str(drand_round),
+                    use_drand=True,
+                )
             )
+            beacon["source_chain"] = str(chain_info["name"])
+            beacon["source_chain_hash"] = str(chain_info["hash"])
             randomness = chain.compute_window_randomness(
                 None, beacon["randomness"], drand_round=beacon["round"],
             )

@@ -2313,6 +2313,9 @@ def test_fill_closed_state_advertises_cutoff_progress_and_budget(monkeypatch):
         monotonic_time=1_000.0,
         wall_time=10_000.0,
     )
+    batcher.window_open_drand_chain = "quicknet"
+    batcher.window_open_drand_chain_hash = "ab" * 32
+    batcher.window_open_drand_round = 123
     batcher.fill_state = FillState(
         budgets={"openmathinstruct": 32},
         picks_target=2,
@@ -2325,6 +2328,9 @@ def test_fill_closed_state_advertises_cutoff_progress_and_budget(monkeypatch):
     first = client.get("/state").json()["fill_closed"]
     assert first == {
         "phase": "collecting",
+        "generation_beacon_chain": "quicknet",
+        "generation_beacon_chain_hash": "ab" * 32,
+        "generation_beacon_round": 123,
         "precommit_cutoff_ts": 10_200.0,
         "precommit_seconds": 200.0,
         "max_window_seconds": 300.0,
@@ -2468,8 +2474,10 @@ def test_state_endpoint_per_env_cooldown_via_query_param():
         b.randomness = "cd" * 16
         return b
 
-    math_cd = CooldownMap(cooldown_windows=50); math_cd.record_batched(11, 490)
-    code_cd = CooldownMap(cooldown_windows=50); code_cd.record_batched(22, 490)
+    math_cd = CooldownMap(cooldown_windows=50)
+    math_cd.record_batched(11, 490)
+    code_cd = CooldownMap(cooldown_windows=50)
+    code_cd.record_batched(22, 490)
     server = ValidatorServer()
     # Dict order = math first, so the no-arg /state reflects math (the bug).
     server.set_active_batchers({

@@ -403,6 +403,12 @@ class FillClosedWindowState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     phase: Literal["collecting", "draining", "sealed"]
+    generation_beacon_chain: str | None = Field(default=None, min_length=1)
+    generation_beacon_chain_hash: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    generation_beacon_round: int | None = Field(default=None, ge=1)
     precommit_cutoff_ts: FiniteFloat
     precommit_seconds: FiniteFloat = Field(..., gt=0)
     max_window_seconds: FiniteFloat = Field(..., gt=0)
