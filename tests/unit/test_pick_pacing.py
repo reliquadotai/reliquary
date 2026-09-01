@@ -29,6 +29,8 @@ import asyncio
 import logging
 from types import SimpleNamespace
 
+import pytest
+
 from reliquary.constants import B_BATCH
 from reliquary.infrastructure.training_payload_queue import (
     encoded_window_journal_key,
@@ -550,6 +552,7 @@ def _rotation_service(monkeypatch, *, key, cursor=None, enabled=True,
             requires_successor=requires_successor,
         )
     service._checkpoint_store = SimpleNamespace(
+        repo_id="org/repo",
         current_manifest=lambda: SimpleNamespace(
             checkpoint_n=7, revision="parent-revision"
         )
@@ -753,19 +756,41 @@ def test_candidate_cursor_must_cover_the_rotation_key(monkeypatch):
 
     service._record_fill_closed_checkpoint_candidate({
         "checkpoint_n": 8,
-        "revision": "too-early",
+        "repo_id": "org/repo",
+        "revision": "8" * 40,
         "trained_window_cursor": last - 1,
     })
     assert service._fill_closed_rotation_gate.adopted_revision is None
 
     service._record_fill_closed_checkpoint_candidate({
         "checkpoint_n": 8,
-        "revision": "covering",
+        "repo_id": "org/repo",
+        "revision": "9" * 40,
         "trained_window_cursor": last,
     })
-    assert service._fill_closed_rotation_gate.adopted_revision == "covering"
+    assert service._fill_closed_rotation_gate.adopted_revision == "9" * 40
     # Recording a covering candidate is not adoption.  The active manifest
     # still names the parent, so readiness remains false.
     assert service._fill_closed_rotation_adoption_ready(
         service._fill_closed_rotation_gate
     ) is False
+
+
+@pytest.mark.parametrize("checkpoint_n", [True, 8.0, "8", -1])
+def test_candidate_identity_is_not_coerced(monkeypatch, checkpoint_n):
+    last = encoded_window_journal_key(WINDOW, 2)
+    service = _rotation_service(
+        monkeypatch,
+        key=last,
+        cursor=last,
+        requires_successor=True,
+    )
+
+    service._record_fill_closed_checkpoint_candidate({
+        "checkpoint_n": checkpoint_n,
+        "repo_id": "org/repo",
+        "revision": "9" * 40,
+        "trained_window_cursor": last,
+    })
+
+    assert service._fill_closed_rotation_gate.adopted_revision is None

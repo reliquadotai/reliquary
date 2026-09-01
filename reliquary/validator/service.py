@@ -113,6 +113,10 @@ from reliquary.environment import load_environments
 from reliquary.environment.base import Environment
 from reliquary.infrastructure import chain, storage
 from reliquary.protocol.submission import RejectReason, RolloutSubmission, WindowState
+from reliquary.shared.checkpoint_identity import (
+    canonical_checkpoint_identity,
+    require_checkpoint_number,
+)
 from reliquary.shared.checkpoint_epoch import (
     BeaconBinding,
     CHECKPOINT_EPOCH_ADMISSION_POLICY,
@@ -1354,6 +1358,12 @@ class ValidationService:
                 installed_revision=(
                     current.revision if current is not None else None
                 ),
+                installed_checkpoint_n=(
+                    current.checkpoint_n if current is not None else None
+                ),
+                installed_repo_id=(
+                    current.repo_id if current is not None else None
+                ),
                 expected_identity=(
                     {
                         **active_training_identity(),
@@ -1423,13 +1433,25 @@ class ValidationService:
 
         intake = self._checkpoint_intake
         manifest, staged_dir = intake.take_staged()
-        revision = str(manifest["revision"])
-        # Persist the trainer cursor binding before changing the active
-        # checkpoint.  Readiness also requires the active manifest to equal
-        # this candidate, so a failed swap remains closed; a crash immediately
-        # after a successful install can recover the proof from this record.
-        self._record_fill_closed_checkpoint_candidate(manifest)
+        revision = "<invalid>"
         try:
+            checkpoint_n, repo_id, revision = canonical_checkpoint_identity(
+                manifest.get("checkpoint_n"),
+                manifest.get("repo_id"),
+                manifest.get("revision"),
+                field="staged checkpoint",
+            )
+            if repo_id != self._checkpoint_store.repo_id:
+                raise ValueError("staged checkpoint repository mismatch")
+            require_checkpoint_number(
+                manifest.get("trained_window_cursor"),
+                field="staged checkpoint trainer cursor",
+            )
+            # Persist the trainer cursor binding before changing the active
+            # checkpoint. Readiness also requires the active manifest to equal
+            # this candidate, so a failed swap remains closed; a crash after a
+            # successful install can recover the proof from this record.
+            self._record_fill_closed_checkpoint_candidate(manifest)
             await asyncio.to_thread(
                 self._refresh_verify_model_from_dir, staged_dir, revision,
             )
@@ -1438,9 +1460,9 @@ class ValidationService:
                     self._synchronize_proof_models, revision, str(staged_dir),
                 )
             entry = self._checkpoint_store.install_external(
-                int(manifest["checkpoint_n"]), revision,
+                checkpoint_n, revision,
             )
-            self._checkpoint_n = int(manifest["checkpoint_n"])
+            self._checkpoint_n = checkpoint_n
             self.server.set_current_checkpoint(entry)
             intake.mark_installed(revision, staged_dir)
             self._windows_since_checkpoint_swap = 0
@@ -1628,9 +1650,18 @@ class ValidationService:
         if gate is None or not gate.requires_successor:
             return
         try:
-            checkpoint_n = int(manifest["checkpoint_n"])
-            revision = str(manifest["revision"])
-            trained_cursor = int(manifest["trained_window_cursor"])
+            checkpoint_n, repo_id, revision = canonical_checkpoint_identity(
+                manifest.get("checkpoint_n"),
+                manifest.get("repo_id"),
+                manifest.get("revision"),
+                field="fill checkpoint candidate",
+            )
+            if repo_id != self._checkpoint_store.repo_id:
+                return
+            trained_cursor = require_checkpoint_number(
+                manifest.get("trained_window_cursor"),
+                field="fill checkpoint trainer cursor",
+            )
         except (KeyError, TypeError, ValueError):
             return
         if (
