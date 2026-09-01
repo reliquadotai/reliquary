@@ -163,6 +163,9 @@ def _backbite(
 
 
 def _numbrix(rng: HashCounterRng) -> GeneratedLogicTask:
+    # 4.7% in band on the base model. Shrinking to 3x3 duplicated 30% of
+    # prompts — too few Hamiltonian paths — so difficulty comes down by
+    # revealing more clues instead, which leaves the path space untouched.
     size = 4 + rng.randbelow(2)
     # A serpentine alone spans only 16 shapes under the grid symmetries, which
     # left 1.75% of prompts duplicated; backbite mixing removes that.
@@ -177,7 +180,7 @@ def _numbrix(rng: HashCounterRng) -> GeneratedLogicTask:
     revealed = {order[0], order[-1]}
     interior = [cell for cell in order[1:-1]]
     rng.shuffle(interior)
-    for cell in interior[: (size * size * 2) // 5]:
+    for cell in interior[: (size * size * 2) // 3]:
         revealed.add(cell)
 
     grid = [
@@ -210,52 +213,6 @@ def _numbrix(rng: HashCounterRng) -> GeneratedLogicTask:
     )
 
 
-# ────────────────  cipher  ────────────────
-
-_WORDS = (
-    "amber", "anchor", "bridge", "candle", "cavern", "cinder", "clover",
-    "copper", "cypher", "ember", "falcon", "garnet", "harbor", "hollow",
-    "indigo", "ivory", "jasper", "kernel", "lantern", "marble", "meadow",
-    "nectar", "obsidian", "onyx", "pewter", "quartz", "quiver", "ripple",
-    "saffron", "silver", "summit", "thicket", "timber", "velvet", "walnut",
-    "willow", "zenith", "zephyr",
-)
-
-
-def _shift(text: str, amount: int) -> str:
-    return "".join(
-        chr((ord(character) - 97 + amount) % 26 + 97) for character in text
-    )
-
-
-def _cipher(rng: HashCounterRng) -> GeneratedLogicTask:
-    words = list(_WORDS)
-    rng.shuffle(words)
-    plain = " ".join(words[: 3 + rng.randbelow(3)])
-    amount = 1 + rng.randbelow(25)
-    encoding = rng.randbelow(2) == 1
-    shifted = _shift(plain, amount if encoding else -amount)
-    given, expected = (plain, shifted) if encoding else (shifted, plain)
-    direction = "Encode" if encoding else "Decode"
-    prompt = (
-        f"{direction} the message below with a Caesar shift of {amount} "
-        f"{'forward' if encoding else 'backward'} through the alphabet. "
-        "Spaces are unchanged.\n\n"
-        f"```\n{given}\n```\n\n"
-        "Answer with the resulting string.\n\n"
-        f"{_ANSWER_SHAPE}"
-    )
-    return GeneratedLogicTask(
-        prompt=prompt,
-        expected=expected,
-        operation_id="caesar-cipher-v1",
-        family="cipher",
-        difficulty=2 + len(plain.split()) // 2,
-        check="equality",
-        constraints={},
-    )
-
-
 # ────────────────  dyck_language  ────────────────
 
 _BRACKETS = (("(", ")"), ("[", "]"), ("{", "}"))
@@ -280,6 +237,9 @@ def _dyck_language(rng: HashCounterRng) -> GeneratedLogicTask:
         sequence.append(_BRACKETS[kind][0])
     expected = "".join(_BRACKETS[kind][1] for kind in reversed(stack))
     prompt = (
+        # Instruction before the content, not after: the same task with the
+        # instruction moved below the code block measured 42.2% in band
+        # against 67.2% here.
         "Complete the sequence below so every bracket is properly closed, "
         "in the correct order. Answer with only the closing brackets you "
         "would append, and nothing else.\n\n"
@@ -348,7 +308,8 @@ _LETTERS = "ABCDEFGHIJ"
 
 
 def _cryptarithm(rng: HashCounterRng) -> GeneratedLogicTask:
-    width = 3 + rng.randbelow(2)
+    # 3-4 digit addends measured 1.6% in band on the base model.
+    width = 2 + rng.randbelow(2)
     # Build from a true sum, so the puzzle is solvable without any search.
     left = rng.randbelow(9 * 10 ** (width - 1)) + 10 ** (width - 1)
     right = rng.randbelow(9 * 10 ** (width - 1)) + 10 ** (width - 1)
@@ -384,7 +345,6 @@ def _cryptarithm(rng: HashCounterRng) -> GeneratedLogicTask:
 
 _GENERATORS = (
     _boolean_expressions,
-    _cipher,
     _cryptarithm,
     _dyck_language,
     _numbrix,

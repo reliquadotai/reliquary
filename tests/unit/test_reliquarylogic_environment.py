@@ -56,8 +56,11 @@ def test_generator_is_total_over_a_wide_index_range():
         )
 
 
+# cipher was removed after measurement: 0.0% of groups in the sigma band on
+# Qwen3-4B-Base, with 76% valid JSON and 99.5% EOS. Well-formed and always
+# wrong is a capability wall, not a difficulty setting.
 FAMILIES = {
-    "boolean_expressions", "cipher", "cryptarithm",
+    "boolean_expressions", "cryptarithm",
     "dyck_language", "numbrix", "web_of_lies",
 }
 

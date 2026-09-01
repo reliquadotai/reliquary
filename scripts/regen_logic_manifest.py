@@ -82,6 +82,13 @@ def _implementation_sha256(paths) -> str:
 
 def _perturb(reference, spec):
     """A near-miss the checker must reject, whatever the answer shape is."""
+    if spec.get("check") == "numbrix_path":
+        broken = [list(row) for row in reference]
+        size = spec["constraints"]["size"]
+        broken[0][0], broken[size - 1][size - 1] = (
+            broken[size - 1][size - 1], broken[0][0],
+        )
+        return broken
     if isinstance(reference, bool):
         return not reference
     if isinstance(reference, str):
@@ -91,13 +98,9 @@ def _perturb(reference, spec):
         key = sorted(broken)[0]
         broken[key] = (broken[key] + 1) % 10
         return broken
-    # Numbrix grid: swap two corners, which breaks path adjacency.
-    broken = [list(row) for row in reference]
-    size = spec["constraints"]["size"]
-    broken[0][0], broken[size - 1][size - 1] = (
-        broken[size - 1][size - 1], broken[0][0],
-    )
-    return broken
+    if isinstance(reference, list):
+        return reference[:-1] if len(reference) > 1 else reference + [0]
+    return None
 
 
 def _import_without_catalog():
