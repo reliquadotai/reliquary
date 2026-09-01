@@ -37,6 +37,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import time
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,8 @@ logger = logging.getLogger(__name__)
 # production: most transient blips clear within a minute; longer-duration
 # issues (Cloudflare regional incidents) can last 30-60 min.
 RETRY_BACKOFF_SECONDS: tuple[int, ...] = (5, 30, 120, 600, 1800)
+
+_WINDOW_ARCHIVE_NAME = re.compile(r"^window-(0|[1-9][0-9]*)\.json\.gz$")
 
 
 def _default_queue_dir() -> str:
@@ -96,6 +99,22 @@ class ArchiveQueue:
         Writes atomically via ``.tmp + os.replace`` so a process crash
         mid-write cannot leave a half-written file in the queue.
         """
+        if type(window_start) is not int or window_start < 0:
+            raise ValueError(
+                "archive window_start must be a non-negative integer"
+            )
+        if not isinstance(data, dict):
+            raise TypeError("archive payload must be a dictionary")
+        body_window = data.get("window_start")
+        if type(body_window) is not int or body_window < 0:
+            raise ValueError(
+                "archive payload window_start must be a non-negative integer"
+            )
+        if body_window != window_start:
+            raise ValueError(
+                "archive payload window_start must match the queue identity"
+            )
+
         payload = json.dumps(data, separators=(",", ":")).encode()
         compressed = gzip.compress(payload)
 
@@ -178,7 +197,9 @@ class ArchiveQueue:
         result: dict[int, dict] = {}
         for path in self._pending():
             window_n = self._window_n_from_path(path)
-            if window_n is None or not start_window <= window_n <= end_window:
+            if window_n is None:
+                raise RuntimeError(f"invalid pending archive path: {path.name}")
+            if not start_window <= window_n <= end_window:
                 continue
             value = self._read_pending_archive(path, window_n)
             if window_n in result:
@@ -188,13 +209,22 @@ class ArchiveQueue:
 
     @staticmethod
     def _read_pending_archive(path: Path, window_n: int) -> dict:
+        if type(window_n) is not int or window_n < 0:
+            raise RuntimeError(
+                f"invalid pending archive identity: {path.name}"
+            )
         try:
             value = json.loads(gzip.decompress(path.read_bytes()))
         except Exception as exc:
             raise RuntimeError(
                 f"invalid pending archive body: {path.name}"
             ) from exc
-        if not isinstance(value, dict) or value.get("window_start") != window_n:
+        if not isinstance(value, dict):
+            raise RuntimeError(
+                f"pending archive identity mismatch: {path.name}"
+            )
+        body_window = value.get("window_start")
+        if type(body_window) is not int or body_window != window_n:
             raise RuntimeError(
                 f"pending archive identity mismatch: {path.name}"
             )
@@ -203,11 +233,10 @@ class ArchiveQueue:
     @staticmethod
     def _window_n_from_path(path: Path) -> int | None:
         """Parse ``window-<N>.json.gz`` -> ``N`` or None on malformed name."""
-        try:
-            stem = path.name  # window-N.json.gz
-            return int(stem.split("-", 1)[1].split(".", 1)[0])
-        except (IndexError, ValueError):
+        match = _WINDOW_ARCHIVE_NAME.fullmatch(path.name)
+        if match is None:
             return None
+        return int(match.group(1))
 
     def _backoff_delay(self, attempts: int) -> float:
         """Exponential backoff: lookup table with floor at the last entry."""

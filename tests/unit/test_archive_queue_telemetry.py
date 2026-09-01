@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
+import json
 from unittest.mock import patch
 
 import pytest
@@ -50,10 +52,85 @@ def test_archive_queue_replays_pending_bodies_by_exact_window(tmp_path):
 
 def test_archive_queue_rejects_body_key_identity_mismatch(tmp_path):
     queue = ArchiveQueue(str(tmp_path))
-    queue.enqueue(50, {"window_start": 49})
 
-    with pytest.raises(RuntimeError, match="identity mismatch"):
-        queue.pending_archives(start_window=50, end_window=50)
+    with pytest.raises(ValueError, match="must match the queue identity"):
+        queue.enqueue(50, {"window_start": 49})
+
+    assert not (tmp_path / "window-50.json.gz").exists()
+    assert not (tmp_path / "window-50.json.gz.tmp").exists()
+
+
+@pytest.mark.parametrize("window_start", [True, -1, 1.0, "1"])
+def test_archive_queue_rejects_noncanonical_queue_identity_before_write(
+    tmp_path,
+    window_start,
+):
+    queue = ArchiveQueue(str(tmp_path))
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        queue.enqueue(window_start, {"window_start": window_start})
+
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("payload", [None, [], "archive"])
+def test_archive_queue_rejects_non_dictionary_body_before_write(
+    tmp_path,
+    payload,
+):
+    queue = ArchiveQueue(str(tmp_path))
+
+    with pytest.raises(TypeError, match="must be a dictionary"):
+        queue.enqueue(1, payload)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("body_window", [True, -1, 1.0, "1"])
+def test_archive_queue_rejects_noncanonical_body_identity_before_write(
+    tmp_path,
+    body_window,
+):
+    queue = ArchiveQueue(str(tmp_path))
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        queue.enqueue(1, {"window_start": body_window})
+
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "window-True.json.gz",
+        "window--1.json.gz",
+        "window-01.json.gz",
+        "window-1.foo.json.gz",
+    ],
+)
+def test_archive_queue_rejects_noncanonical_pending_filename(
+    tmp_path,
+    filename,
+):
+    queue = ArchiveQueue(str(tmp_path))
+    body = gzip.compress(json.dumps({"window_start": 1}).encode())
+    (tmp_path / filename).write_bytes(body)
+
+    with pytest.raises(RuntimeError, match="invalid pending archive path"):
+        queue.pending_window_numbers()
+    with pytest.raises(RuntimeError, match="invalid pending archive path"):
+        queue.pending_archives(start_window=0, end_window=10)
+
+
+@pytest.mark.parametrize("body_window", [True, -1, 1.0, "1"])
+def test_archive_queue_rejects_noncanonical_pending_body_identity(
+    tmp_path,
+    body_window,
+):
+    queue = ArchiveQueue(str(tmp_path))
+    body = gzip.compress(json.dumps({"window_start": body_window}).encode())
+    (tmp_path / "window-1.json.gz").write_bytes(body)
+
     with pytest.raises(RuntimeError, match="identity mismatch"):
         queue.pending_window_numbers()
 
