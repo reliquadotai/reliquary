@@ -8,7 +8,6 @@ cursor — the trainer refuses to guess where the journal starts.
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Callable, Mapping
 
@@ -17,6 +16,7 @@ from reliquary.shared.checkpoint_identity import (
     require_checkpoint_number,
     require_immutable_checkpoint_revision,
 )
+from reliquary.shared.strict_json import strict_json_loads
 from reliquary.trainer.publisher import CANDIDATE_MANIFEST_KEY
 
 logger = logging.getLogger(__name__)
@@ -34,7 +34,7 @@ def resolve_resume_point(
     checkpoint numbering must never regress across restarts)."""
     raw = fetch_fn(CANDIDATE_MANIFEST_KEY)
     if raw is not None:
-        manifest = json.loads(raw.decode("utf-8"))
+        manifest = strict_json_loads(raw)
         mismatches = {
             key: (manifest.get(key), expected)
             for key, expected in (expected_identity or {}).items()

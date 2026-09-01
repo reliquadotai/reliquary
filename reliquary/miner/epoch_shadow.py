@@ -32,6 +32,7 @@ from reliquary.shared.checkpoint_epoch_market import (
     GenerationIntent,
     GenerationTicket,
 )
+from reliquary.shared.strict_json import strict_json_loads
 from reliquary.protocol.signatures import verify_epoch_intent_signature
 from reliquary.validator.checkpoint_epoch_runtime import (
     canonical_signed_intent_bytes,
@@ -360,7 +361,7 @@ class EpochShadowPlanner:
 
     def _read_record(self, path: Path) -> ShadowRecord:
         encoded = path.read_bytes()
-        value = json.loads(encoded)
+        value = strict_json_loads(encoded)
         if not isinstance(value, dict) or encoded != _canonical_json(value):
             raise ValueError("shadow record is not canonical")
         record = self._record_from_dict(value)
@@ -422,7 +423,7 @@ class EpochShadowPlanner:
             raise EpochPlanMismatch("public epoch beacon verification failed")
 
         if self.active_plan_path.exists():
-            current = json.loads(self.active_plan_path.read_bytes())
+            current = strict_json_loads(self.active_plan_path.read_bytes())
             if current.get("manifest_sha256") != digest:
                 self.invalidate_all("plan_replaced")
         self._write(
@@ -430,7 +431,9 @@ class EpochShadowPlanner:
             {
                 "schema_version": 1,
                 "manifest_sha256": digest,
-                "canonical_manifest": json.loads(canonical_manifest_bytes(plan)),
+                "canonical_manifest": strict_json_loads(
+                    canonical_manifest_bytes(plan)
+                ),
             },
         )
         return digest

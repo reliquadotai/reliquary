@@ -10,7 +10,6 @@ window.
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 import shutil
@@ -23,6 +22,7 @@ from reliquary.shared.checkpoint_identity import (
     require_checkpoint_successor,
     require_immutable_checkpoint_revision,
 )
+from reliquary.shared.strict_json import strict_json_loads
 
 logger = logging.getLogger(__name__)
 
@@ -193,7 +193,7 @@ class CheckpointIntake:
         except Exception:
             return None
         try:
-            manifest = json.loads(body.decode("utf-8"))
+            manifest = strict_json_loads(body)
             if not isinstance(manifest, dict):
                 raise TypeError("candidate manifest must be an object")
             candidate = self._manifest_identity(manifest)

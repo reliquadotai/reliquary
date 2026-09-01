@@ -70,6 +70,19 @@ def test_checkpoint_profile_rejects_unreadable_metadata(tmp_path):
         validate_checkpoint_profile(tmp_path, required=True)
 
 
+def test_checkpoint_profile_rejects_duplicate_lineage_keys(tmp_path):
+    encoded = json.dumps(active_checkpoint_profile(), separators=(",", ":"))
+    encoded = encoded.replace(
+        '"profile_id":',
+        '"profile_id":"shadowed","profile_id":',
+        1,
+    )
+    (tmp_path / CHECKPOINT_PROFILE_NAME).write_text(encoded, encoding="utf-8")
+
+    with pytest.raises(CheckpointProfileMismatch, match="unreadable"):
+        validate_checkpoint_profile(tmp_path, required=True)
+
+
 def test_checkpoint_profile_rejects_run_state_collision(tmp_path):
     with pytest.raises(ValueError, match="cannot replace lineage fields"):
         write_checkpoint_profile(

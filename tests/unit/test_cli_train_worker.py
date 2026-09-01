@@ -165,6 +165,16 @@ def test_matching_manifest_rejects_noncanonical_checkpoint_number(
         )
 
 
+def test_matching_manifest_rejects_duplicate_checkpoint_number():
+    raw = (
+        b'{"checkpoint_n":529,"checkpoint_n":530,"repo_id":"org/repo",'
+        + f'"revision":"{REV_5}","trained_window_cursor":30110}}'.encode()
+    )
+
+    with pytest.raises(ValueError, match="duplicate JSON key: checkpoint_n"):
+        resolve_resume_point(lambda key: raw, env={})
+
+
 def test_bootstrap_rejects_negative_checkpoint_number():
     with pytest.raises(ValueError, match="non-negative integer"):
         resolve_resume_point(

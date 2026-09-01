@@ -16,7 +16,6 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 import hashlib
-import json
 import math
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -26,6 +25,7 @@ from reliquary.shared.checkpoint_epoch import (
     CHECKPOINT_EPOCH_VALUATION_POLICY as CHECKPOINT_EPOCH_PORTFOLIO_POLICY,
     canonical_json_bytes,
 )
+from reliquary.shared.strict_json import strict_json_loads
 
 _INTENT_OPERATOR_DOMAIN = b"reliquary/checkpoint-epoch/intent-operator/v1"
 _INTENT_CANDIDATE_DOMAIN = b"reliquary/checkpoint-epoch/intent-candidate/v1"
@@ -294,8 +294,8 @@ def parse_signed_generation_intent_set(
 ) -> SignedGenerationIntentSet:
     raw_bytes = raw.encode("utf-8") if isinstance(raw, str) else bytes(raw)
     try:
-        value = json.loads(raw_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        value = strict_json_loads(raw_bytes)
+    except (UnicodeError, ValueError) as exc:
         raise ValueError("invalid signed generation intent set") from exc
     if not isinstance(value, Mapping) or set(value) != {
         "intent_set",

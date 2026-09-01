@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
+
 from reliquary.shared.checkpoint_epoch_market import (
     GenerationIntent,
     PortfolioCandidate,
@@ -100,6 +102,31 @@ def test_generation_intent_set_is_canonical_and_mutation_bound():
     assert generation_intent_set_sha256(changed) != (
         generation_intent_set_sha256(first)
     )
+
+
+def test_generation_intent_set_rejects_duplicate_publication_key():
+    intents = [_intent("alice", index) for index in range(2)]
+    intent_set = build_generation_intent_set(
+        intents,
+        epoch_id=EPOCH,
+        manifest_sha256_hex=MANIFEST,
+        intent_close_round=120,
+        validator_hotkey="validator",
+    )
+    publication = SignedGenerationIntentSet(
+        intent_set=intent_set,
+        intent_set_sha256=generation_intent_set_sha256(intent_set),
+        validator_signature="aa",
+    )
+    encoded = canonical_signed_generation_intent_set_bytes(publication)
+    ambiguous = encoded.replace(
+        b'"intent_set_sha256":',
+        b'"intent_set_sha256":"' + b"0" * 64 + b'","intent_set_sha256":',
+        1,
+    )
+
+    with pytest.raises(ValueError, match="invalid signed generation intent set"):
+        parse_signed_generation_intent_set(ambiguous)
 
 
 def test_generation_ticket_binding_changes_with_intent_mutation():

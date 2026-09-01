@@ -179,6 +179,22 @@ def test_tombstone_round_trip():
     assert doc["failure_type"] == "ProofCapacityAbort"
 
 
+def test_tombstone_rejects_duplicate_durable_identity():
+    encoded = encode_tombstone(
+        window_start=30105,
+        failure_stage="proof_capacity",
+        failure_type="ProofCapacityAbort",
+    )
+    ambiguous = encoded.replace(
+        b'"window_start": 30105',
+        b'"window_start": 1, "window_start": 30105',
+        1,
+    )
+
+    with pytest.raises(ValueError, match="duplicate JSON key: window_start"):
+        decode_tombstone(ambiguous)
+
+
 @pytest.mark.parametrize(
     ("protocol_version", "payload_schema", "tombstone_schema"),
     [

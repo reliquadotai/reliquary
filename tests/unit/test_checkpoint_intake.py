@@ -35,6 +35,17 @@ class _R2:
             f.write(self.files[key])
 
 
+class _RawManifestR2(_R2):
+    def __init__(self, raw: bytes):
+        super().__init__()
+        self.raw = raw
+
+    def get_object(self, Bucket, Key):
+        if Key == CANDIDATE_MANIFEST_KEY:
+            return {"Body": type("B", (), {"read": lambda s: self.raw})()}
+        raise KeyError(Key)
+
+
 def _manifest(revision=REV_7, *, checkpoint_n=5, repo_id="org/repo"):
     return {
         "checkpoint_n": checkpoint_n, "repo_id": repo_id, "revision": revision,
@@ -57,6 +68,21 @@ def test_poll_none_when_no_manifest(tmp_path):
         r2_client=_R2(), bucket="b", staging_dir=str(tmp_path),
     )
     assert intake.poll() is None
+
+
+def test_poll_rejects_duplicate_manifest_keys(tmp_path):
+    raw = (
+        b'{"checkpoint_n":4,"checkpoint_n":5,"repo_id":"org/repo",'
+        + f'"revision":"{REV_7}","trained_window_cursor":30110}}'.encode()
+    )
+    intake = CheckpointIntake(
+        r2_client=_RawManifestR2(raw),
+        bucket="b",
+        staging_dir=str(tmp_path),
+    )
+
+    assert intake.poll() is None
+    assert "identity is invalid" in (intake.last_error or "")
 
 
 def test_poll_ignores_manifest_from_another_protocol_run(tmp_path):

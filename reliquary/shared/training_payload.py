@@ -19,6 +19,8 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from reliquary.shared.strict_json import strict_json_loads
+
 PAYLOAD_SCHEMA_VERSION = 2
 TOMBSTONE_SCHEMA_VERSION = 2
 CHECKPOINT_EPOCH_ARTIFACT_SCHEMA_VERSION = 3
@@ -324,7 +326,7 @@ def encode_training_payload(
 
 class DecodedPayload:
     def __init__(self, arrays: dict[str, np.ndarray]) -> None:
-        header = json.loads(bytes(arrays["header"]).decode("utf-8"))
+        header = strict_json_loads(bytes(arrays["header"]))
         if header["schema_version"] not in _SUPPORTED_PAYLOAD_SCHEMA_VERSIONS:
             raise ValueError(f"unsupported payload schema {header['schema_version']}")
         self.schema_version = header["schema_version"]
@@ -441,7 +443,7 @@ def encode_tombstone(
 
 
 def decode_tombstone(data: bytes) -> dict[str, Any]:
-    doc = json.loads(data.decode("utf-8"))
+    doc = strict_json_loads(data)
     if doc.get("schema_version") not in _SUPPORTED_TOMBSTONE_SCHEMA_VERSIONS:
         raise ValueError("unsupported tombstone schema")
     raw_epoch = doc.get("checkpoint_epoch")
@@ -489,8 +491,8 @@ def encode_checkpoint_epoch_marker(
 
 def decode_checkpoint_epoch_marker(data: bytes) -> dict[str, Any]:
     try:
-        doc = json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        doc = strict_json_loads(data)
+    except (UnicodeError, ValueError) as exc:
         raise ValueError("invalid checkpoint epoch marker") from exc
     if (
         not isinstance(doc, dict)
