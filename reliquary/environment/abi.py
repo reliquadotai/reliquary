@@ -16,6 +16,10 @@ import math
 from types import MappingProxyType
 from typing import Any, Literal, Protocol, runtime_checkable
 
+from reliquary.protocol.release_contract import (
+    canonical_json_bytes as _canonical_json_bytes,
+)
+
 
 ENVIRONMENT_MANIFEST_SCHEMA = "reliquary/environment-manifest/v1"
 TASK_ENVELOPE_SCHEMA = "reliquary/task/v1"
@@ -87,13 +91,7 @@ def _thaw_json(value: Any) -> Any:
 
 def canonical_json_bytes(value: Any) -> bytes:
     """Return the canonical JSON encoding used by environment contracts."""
-    encoded = json.dumps(
-        _thaw_json(_freeze_json(value)),
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-        allow_nan=False,
-    ).encode("utf-8")
+    encoded = _canonical_json_bytes(_thaw_json(_freeze_json(value)))
     if len(encoded) > _MAX_DOCUMENT_BYTES:
         raise ValueError("canonical environment document exceeds the byte limit")
     return encoded
