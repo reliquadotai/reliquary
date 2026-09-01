@@ -116,3 +116,88 @@ so in the docstring rather than adding a second mechanism.
   budget, so the plan is now essentially never self-finalising and every
   window relies on `_seal_v6_proof_plan`'s explicit seal. That path is
   tested but was previously the rare case, not the norm.
+
+## Fix round 1 (R37)
+
+Commit `8a85ff0`. All 11 new pins watched red first.
+
+**Critical — per-environment pick ordinals.** `FillState` no longer keeps
+one window-wide integer. `record_pick(environment)` advances that
+environment's own ordinal; `snapshot()["picks_emitted"]` is the MIN over
+environments (complete events only — which is exactly what
+`_drive_fill_closed_picks` reads to name the event it is about to drive,
+so T12's `next_pick` arithmetic stays correct mid-event); `is_closed()`
+asks every environment; `picks_taken(env)` and
+`snapshot()["picks_by_environment"]` are new. `_claim_pick_chunk` and
+`can_pick()` gate on THIS environment's ordinal against `picks_target`,
+never on the window-wide close — so the final event's sibling is never
+refused, and `poll_deadline` cannot observe a closed window between the
+two halves of one event.
+
+**Important — divergence guard.** `record_pick` refuses (raises) when the
+spread of ordinals would exceed one in-flight event, validated before it
+mutates so a refused pick leaves the accounting untouched. The batcher
+CATCHES that ValueError, logs at ERROR and returns None:
+`_drive_fill_closed_picks` runs unguarded on the service's 0.5 s poll, so
+a raise there would take the whole window wait down over a bookkeeping
+fault. Loud and inert instead — and the sibling's next half is what puts
+the ordinals back level.
+
+**Minor (c) — total order.** `_ProvenGroup` carries a monotone `sequence`
+(default factory, so no construction site can omit it) and
+`_pick_sort_key` ends on it. Empty `receipt_id` + equal payload bytes
+used to tie on every component and resolve by pool position — the
+arrival tie-break the key's own docstring forswears.
+
+**Minor (3) — callback raise.** `pick_training_batch` unflags the claimed
+groups if `_emit_training_batch_fn` raises: nothing reached the
+assembler, so leaving them flagged made them invisible to BOTH payment
+and the close's burn count. They stay pickable; if no later pick takes
+them the close burns them. The ordinal stays spent — the sibling's half
+of that event is already out and rewinding would desynchronise the
+window.
+
+**Minor (f).** `test_an_unknown_rate_falls_back_to_lowest_priority_not_a_crash`
+now drives the real `_submit_arrival_proof` (real `rate_of` /
+`payload_bytes_of` lookups, only the auto-drain stubbed, like its sibling
+in `test_rate_ordered_admission.py`) and asserts the size fallback
+through a genuine queue miss.
+
+### T12 tests that pinned the old single-counter semantics (flagged, not contorted)
+
+- `test_pick_pacing.py::test_an_environment_that_refuses_after_a_sibling_picked_logs_error`
+  asserted `picks_emitted == 1` after ONE environment picked. Under R37
+  that event is incomplete, which is what the ERROR reports: the
+  assertion is now `picks_by_environment == {math: 1, code: 0}` and
+  `picks_emitted == 0`.
+- `test_pick_pacing.py::test_can_pick_is_false_once_the_window_is_closed`
+  closed the window with a single bare `record_pick()`; it now records
+  both environments and additionally pins that either half alone already
+  stops the environment that took it.
+- `test_fill_close_and_emit.py`: three bare `record_pick()` calls became
+  per-environment, and the two-batcher `is_closed` test now shows a
+  leader one event ahead NOT closing the window.
+
+### Verification
+
+`test_fill_window.py` 14, `test_pick_by_rate.py` 20, plus
+`test_pick_pacing.py`, `test_fill_close_and_emit.py`,
+`test_prove_on_arrival.py`, `test_rate_ordered_admission.py`,
+`test_v6_seal_seam.py`, `test_fill_closed_batch_assembler.py`,
+`test_grpo_window_batcher.py`, `test_validator_server.py` — 335 together.
+Full suite `2377 passed, 13 skipped, 1 deselected`.
+
+### Concern: concurrent edits in the shared worktree
+
+The R38/T10 fix round is editing `service.py`,
+`training_payload_queue.py` and `test_pick_pacing.py` in this same tree
+while this round ran. Their in-flight rename (`read_step_cursor` →
+`fetch_step_cursor` in `_read_trainer_step_cursor`) makes T12's
+`_CursorQueue` stub raise, failing every cursor-gated test in
+`test_pick_pacing.py`, and their newer red tests reference a rotation
+gate that does not exist yet. Those failures are theirs, not this
+round's: the numbers above were measured with a local, non-repo pytest
+plugin aliasing that one stub method, and every failure without it is an
+`AttributeError` on their new names (`fetch_step_cursor`,
+`FILL_CLOSED_ROTATION_POLL_SECONDS`, `_arm_fill_closed_rotation_gate`).
+Re-run the suite once both rounds have landed.
