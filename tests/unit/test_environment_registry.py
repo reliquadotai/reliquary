@@ -24,6 +24,7 @@ def test_catalog_is_immutable_and_contains_legacy_environments():
         "openmathinstruct",
         "opencodeinstruct",
         "reliquaryverifiable_v1",
+        "reliquarylogic_v1",
         "reliquary_stateful_tools_v1",
         "reliquary_retrieval_tools_v1",
         "reliquary_workspace_tools_v1",

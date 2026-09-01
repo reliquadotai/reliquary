@@ -351,6 +351,14 @@ _RELIQUARY_RECORDS_PROMPT = PromptTemplateProfile(
     template="$problem",
 )
 
+_RELIQUARY_LOGIC_PROMPT = PromptTemplateProfile(
+    template_id="reliquary-logic-v1",
+    # The generated problem already carries the puzzle and the exact answer
+    # channel, so the wrapper is the identity — same rule as the records
+    # template, and it keeps the rendered bytes explicit in the contract.
+    template="$problem",
+)
+
 _PROFILE_VALUES = (
     ProtocolProfile(
         profile_id="qwen35-2b-auction-v2",
@@ -593,6 +601,40 @@ _PROFILE_VALUES = (
         },
         throughput_tiebreak=ThroughputTiebreakProfile(
             token_cap=4096,
+            bucket_tokens_per_round=50,
+        ),
+    ),
+    ProtocolProfile(
+        profile_id="qwen3-4b-reliquary-logic-v8-dev1",
+        # Dormant development profile for the procedural logic suite. It
+        # reuses the pinned v4/v5 base revision without joining any existing
+        # checkpoint lineage, and declares the logic environment alone so a
+        # canary never perturbs the live Math+Code lanes.
+        model_id="Qwen/Qwen3-4B-Base",
+        model_revision="906bfd4b4dc7f14ee4320094d8b41684abff8539",
+        protocol_version=8,
+        collection_seconds=100,
+        upload_grace_seconds=33,
+        prompt_encoding="raw",
+        sampling=_SAMPLING_DAPO,
+        environments={
+            "reliquarylogic_v1": EnvironmentProfile(
+                # Numbrix needs room to reason over a grid before emitting it;
+                # boolean expressions finish far short of this cap.
+                max_new_tokens=2048,
+                bft=None,
+                answer_format="last_json_object_v1",
+                prompt_template=_RELIQUARY_LOGIC_PROMPT,
+                batch_target=16,
+                environment_contract_id="reliquary-logic-v1",
+                environment_manifest_sha256=(
+                    "956d559057e9f5b37ce552127a7c33e"
+                    "a3964ebe5d42b358e7e67ef910b364e73"
+                ),
+            ),
+        },
+        throughput_tiebreak=ThroughputTiebreakProfile(
+            token_cap=2048,
             bucket_tokens_per_round=50,
         ),
     ),

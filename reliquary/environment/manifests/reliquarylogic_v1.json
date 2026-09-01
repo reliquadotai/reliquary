@@ -1,0 +1,53 @@
+{
+  "schema": "reliquary/generated-environment-manifest/v1",
+  "environment": "reliquarylogic_v1",
+  "environment_contract_id": "reliquary-logic-v1",
+  "task_family": "logic_v1",
+  "generator_version": "logic-v1",
+  "checker_version": "logic-checker-v1",
+  "golden_fixture": "tests/fixtures/reliquarylogic_v1.jsonl",
+  "golden_fixture_sha256": "66b049e2c8386be5512ed24d7e53965a01e03671cbfbf1e4be9325d60a66cbc4",
+  "implementation_digest_algorithm": "sha256-path-nul-file-sha256-newline-v1",
+  "implementation_files": [
+    "reliquary/environment/logic_tasks.py",
+    "reliquary/environment/records_tasks.py",
+    "reliquary/environment/reliquarylogic.py",
+    "reliquary/environment/structured_output.py"
+  ],
+  "implementation_sha256": "57bc25594e323a92ded988520175d1a784ba7cbfeaab103b2e7315c3ee93c327",
+  "virtual_length": 2147483648,
+  "protocol_reward_lattice": [
+    0.0,
+    1.0
+  ],
+  "answer_schema": {
+    "required_keys": [
+      "result"
+    ],
+    "additional_keys": false
+  },
+  "task_families": [
+    "boolean_expressions",
+    "numbrix"
+  ],
+  "reward": "deterministic-binary-outcome-v1",
+  "checks": {
+    "boolean_expressions": "equality",
+    "numbrix": "constraint-satisfaction (no unique-solution requirement)"
+  },
+  "limits": {
+    "completion_bytes": 16384,
+    "container_items": 64,
+    "json_depth": 8,
+    "max_integer_magnitude": 9007199254740991,
+    "max_grid_size": 5
+  },
+  "external_data": false,
+  "network_required": false,
+  "provenance": {
+    "origin": "Reliquary-authored procedural generators; task designs follow the SynLogic families",
+    "external_prompt_sources": [],
+    "upstream_reference": "https://github.com/MiniMax-AI/SynLogic",
+    "spdx_license": "MIT"
+  }
+}

@@ -342,6 +342,28 @@ _SPEC_VALUES = (
         ),
     ),
     EnvironmentSpec(
+        name="reliquarylogic_v1",
+        factory_path=(
+            "reliquary.environment.reliquarylogic:"
+            "ReliquaryLogicEnvironment"
+        ),
+        scorer_path=(
+            "reliquary.environment.reliquarylogic:"
+            "score_reliquarylogic"
+        ),
+        validator_authoritative_reward=True,
+        admission_resource_class="cpu",
+        termination_policy="eos_or_cap",
+        final_answer_policy="json",
+        reward_lattice_policy="binary-v1",
+        attainable_rewards=(0.0, 1.0),
+        contract_version="reliquary-logic-v1",
+        environment_manifest_sha256=(
+            "956d559057e9f5b37ce552127a7c33e"
+            "a3964ebe5d42b358e7e67ef910b364e73"
+        ),
+    ),
+    EnvironmentSpec(
         name="reliquary_stateful_tools_v1",
         factory_path=(
             "reliquary.environment.agentic.envs.stateful_tools_v1:"
