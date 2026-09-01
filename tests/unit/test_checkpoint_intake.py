@@ -83,6 +83,20 @@ def test_poll_ignores_manifest_from_another_protocol_run(tmp_path):
     assert "identity mismatch" in (intake.last_error or "")
 
 
+def test_stage_rechecks_manifest_identity(tmp_path):
+    intake = CheckpointIntake(
+        r2_client=_R2(),
+        bucket="b",
+        staging_dir=str(tmp_path),
+        expected_identity={"training_run_id": "expected-run"},
+    )
+
+    assert intake.stage(
+        {**_manifest(), "training_run_id": "other-run"}
+    ) is False
+    assert "identity mismatch" in (intake.last_error or "")
+
+
 def test_stage_downloads_validates_and_flags_ready(tmp_path):
     r2 = _R2(
         manifest=_manifest(),

@@ -170,8 +170,18 @@ class CheckpointIntake:
                 manifest.get("revision"),
                 field="candidate checkpoint revision",
             )
+            mismatches = {
+                key: (manifest.get(key), expected)
+                for key, expected in self._expected_identity.items()
+                if manifest.get(key) != expected
+            }
+            if mismatches:
+                raise ValueError("candidate manifest identity mismatch")
             staging_root = self.staging_dir.resolve()
-            candidate_dest = (staging_root / revision).resolve()
+            unresolved_dest = staging_root / revision
+            if unresolved_dest.is_symlink():
+                raise ValueError("candidate checkpoint path cannot be a symlink")
+            candidate_dest = unresolved_dest.resolve()
             try:
                 candidate_dest.relative_to(staging_root)
             except ValueError as exc:
