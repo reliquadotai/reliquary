@@ -1,20 +1,4 @@
-"""Rate-ordered admission: producing long must not cost you your place.
-
-The fill-closed window closes when the batch is full, and the slots still open
-near the close would otherwise go to whoever finishes first — systematically
-whoever produced the SHORTEST rollouts. Per-token payment does not fix it: a
-long group has to get in before it can be paid.
-
-So the queue is ordered by production rate:
-
-    rate = payload_bytes / (precommit arrival - window open)
-
-It is measured at the PRECOMMIT, not the upload, so transport latency is
-inside the measure and a fat uplink cannot buy a place. And the denominator
-runs from window open for every group — no identity in the formula at all —
-so splitting across hotkeys changes nothing, and parallel producers gain
-volume without gaining rank.
-"""
+"""Characterization tests for the disabled fill priority queue."""
 
 from __future__ import annotations
 
@@ -43,10 +27,7 @@ def test_rate_of_reports_the_throughput_a_receipt_registered():
 
 
 def test_rate_of_an_unknown_receipt_is_none_not_a_crash():
-    """A graded body whose receipt never went through ``offer`` (never
-    queued, or queued in a different window) must degrade to a defined
-    priority rather than raise -- the batcher's buffer sort depends on
-    this returning cleanly."""
+    """An unknown receipt has an explicit, non-raising result."""
     queue = ThroughputAdmissionQueue(window_opened_at=0.0)
     _offer(queue, "slow", at=50.0, payload_bytes=1000)
 
@@ -54,9 +35,7 @@ def test_rate_of_an_unknown_receipt_is_none_not_a_crash():
 
 
 def test_the_rate_runs_from_window_open_and_carries_no_identity():
-    """Two identical groups from any two senders get the same rate: the
-    formula has no hotkey and no operator in it. What decides is only how far
-    into the window the precommit landed, and how many bytes it binds."""
+    """Equivalent receipts produce the same deterministic priority."""
     queue = ThroughputAdmissionQueue(window_opened_at=100.0)
 
     first = _offer(queue, "r1", at=125.0, payload_bytes=5000)
@@ -66,13 +45,7 @@ def test_the_rate_runs_from_window_open_and_carries_no_identity():
     assert first.throughput == second.throughput == 200.0
 
 
-def test_parallel_producers_gain_volume_not_rank():
-    """Eight groups from eight GPUs all landing at 25 s each rate as a single
-    25 s group does. They win by having eight tickets, not by out-ranking.
-
-    Measured from the sender's previous arrival instead, the eighth would show
-    0.1 s elapsed and a 250x rate — a double count of the same hardware.
-    """
+def test_multiple_receipts_share_one_elapsed_time_origin():
     queue = ThroughputAdmissionQueue(window_opened_at=0.0)
 
     solo = _offer(queue, "solo", at=25.0, payload_bytes=8000)
@@ -86,9 +59,7 @@ def test_parallel_producers_gain_volume_not_rank():
 
 
 def test_rate_of_looks_up_by_receipt_regardless_of_environment():
-    """``rate_of`` has no environment parameter: a receipt_id is unique on
-    its own, and the batcher that calls it already knows which environment
-    it is (its own -- one batcher per environment)."""
+    """Receipt identity is sufficient for a deterministic lookup."""
     queue = ThroughputAdmissionQueue(window_opened_at=0.0)
     _offer(queue, "math", at=10.0, payload_bytes=9000)
     _offer(queue, "code", at=10.0, payload_bytes=100, env="opencodeinstruct")
