@@ -392,3 +392,26 @@ def test_every_family_including_inactive_ones_still_works():
             seen.add(task.prompt)
         # A family that cannot vary its prompt would be burned at seal.
         assert len(seen) > 190, f"{family.name}: {len(seen)}/200 distinct"
+
+
+def test_boolean_answers_accept_the_string_form_only():
+    """The one false negative measured on real rollouts, and nothing wider."""
+    from reliquary.environment.logic_tasks import check_answer
+
+    spec = {"check": "equality", "expected": True, "constraints": {}}
+    for accepted in (True, "true", "True", "  TRUE  "):
+        assert check_answer(spec, accepted) is True, accepted
+    # Everything else stays rejected: each would be a farmable surface for a
+    # failure mode that measured zero occurrences.
+    for rejected in (1, "1", "yes", 1.0, False, "false", None, [True]):
+        assert check_answer(spec, rejected) is False, rejected
+
+    negative = {"check": "equality", "expected": False, "constraints": {}}
+    assert check_answer(negative, "false") is True
+    assert check_answer(negative, "true") is False
+    assert check_answer(negative, 0) is False
+
+    # A non-boolean answer must never be satisfied by a boolean.
+    numeric = {"check": "equality", "expected": 1, "constraints": {}}
+    assert check_answer(numeric, True) is False
+    assert check_answer(numeric, 1) is True

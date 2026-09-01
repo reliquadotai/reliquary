@@ -23,6 +23,10 @@ SIGMA_MIN = 0.24
 ROLLOUTS = 16
 
 
+def _json_line(row: dict) -> str:
+    return json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+
+
 def band_bounds(rollouts: int, sigma_min: float) -> tuple[int, int]:
     ok = [
         k for k in range(rollouts + 1)
@@ -43,6 +47,9 @@ def main() -> int:
     parser.add_argument("--output", required=True)
     parser.add_argument("--include-inactive", action="store_true",
                         help="also measure families the roster does not draw")
+    parser.add_argument("--audit-dump", default=None,
+                        help="JSONL of every rollout: parsed answer, score, "
+                             "reference — the input to a grader audit")
     parser.add_argument("--dump-samples", type=int, default=0,
                         help="raw completions per family, for diagnosis")
     args = parser.parse_args()
@@ -131,6 +138,7 @@ def main() -> int:
     print(f"generation {time.time() - started:.0f}s", flush=True)
 
     low, high = band_bounds(ROLLOUTS, SIGMA_MIN)
+    audit = open(args.audit_dump, "w", encoding="utf-8") if args.audit_dump else None
     rows = []
     samples: dict[str, list[str]] = collections.defaultdict(list)
     for (family, index, problem), output in zip(problems, outputs):
@@ -150,6 +158,19 @@ def main() -> int:
             # Keep unparsable completions: they are what needs diagnosing.
             if not ok and len(samples[family]) < args.dump_samples:
                 samples[family].append(text[:400])
+            if audit is not None:
+                bare = family.rstrip("*")
+                reference = generate_logic_task(index).expected \
+                    if not family.endswith("*") else None
+                audit.write(_json_line({
+                    "family": bare,
+                    "index": index,
+                    "parsed": ok,
+                    "answer": (answer.get("result") if ok else None),
+                    "reward": rewards[-1],
+                    "reference": reference,
+                    "raw_tail": text[-160:],
+                }))
         successes = sum(1 for value in rewards if value >= 1.0)
         rows.append({
             "family": family,
@@ -161,6 +182,9 @@ def main() -> int:
             "finished": finished,
             "median_tokens": sorted(lengths)[len(lengths) // 2],
         })
+
+    if audit is not None:
+        audit.close()
 
     with open(args.output, "w", encoding="utf-8") as handle:
         json.dump({

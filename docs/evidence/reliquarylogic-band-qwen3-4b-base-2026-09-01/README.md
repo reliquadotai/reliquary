@@ -94,3 +94,73 @@ Roughly 90 seconds of generation on an H100 for 832 prompts by 16 rollouts.
 2e38a954bc1715317bb4ca36ad8a7c7ac6a37ff4fb31ecb9d0151781ed4cda3c  band-12-families.json
 bff7aa7398cee1f9096e1abf3232cd72a479c8527051b5ade65f12fccd3a0218  band-with-inactive.json
 ```
+
+---
+
+# Grader audit — 2026-09-01, second H100
+
+Answers the question the band figures cannot: does this environment carry the
+false-negative disease that cost the math lane 28% before its fix and still
+costs it 4%.
+
+`grader-audit-before-fix.jsonl.gz` and `grader-audit-after-fix.jsonl.gz` hold
+every one of 12,288 rollouts — family, parsed answer, reward, reference —
+which is what makes the rates below checkable rather than asserted.
+
+## Result
+
+| | before | after |
+|---|---:|---:|
+| parsed rollouts scoring 0 | 6,441 | 6,439 |
+| **false negatives** | **8 (0.12%)** | **0 (0.00%)** |
+| rollouts scoring 1.0 | 3,115 | 3,121 |
+| **false positives** | **0** | **0** |
+
+Thirteen false-negative vectors were enumerated by inspection beforehand —
+int-as-string, float, casing, leading article, digits-as-strings. Real
+rollouts produced **one** of them: a boolean rendered as the string
+`"false"`, eight times, all in `web_of_lies`. The other twelve occurred
+exactly zero times.
+
+Only that one was fixed. Each unmeasured tolerance would widen a surface a
+miner can farm for no measured gain, which is the same trade the forced-seed
+floor of 0.75 documents.
+
+False positives were probed separately and adversarially: 1,000 wrong
+numbrix grids (permutations, transposes, rotations, duplicates,
+out-of-range) and 6,000 random cryptarithm assignments cross-checked against
+an independent verifier. None was accepted. On the nine equality families a
+false positive is structurally impossible — the comparison is `==` against a
+typed reference.
+
+The eight rollouts that read as false positives in a naive diff after the
+fix are the same eight that were false negatives before: `'false'` and
+`'FALSE'` against reference `False`. The audit script was comparing before
+normalisation, not the checker misbehaving.
+
+## Why this environment does not inherit the math grader's problem
+
+The math grader has to interpret free LaTeX, where `1/2`, `0.5` and
+`\frac{1}{2}` denote the same value and it must know so. This one compares
+constrained JSON types, where `52` has one spelling. The strictness of the
+envelope is the protection.
+
+The cost is visible instead: valid-JSON rates run 43% to 94% by family, so
+rollouts are lost on format rather than on notation. That is a measurable
+loss, not a silent bias.
+
+## Reproducibility floor
+
+The same model, revision, sampling seeds and suite seed run on two different
+H100 PCIe boxes move each family's band by a median of 1.6 points and at
+most 4.7 points — vLLM batching is not deterministic across schedulers, so
+the sampled tokens differ. Read band differences against that floor: under
+about 5 points is noise.
+
+## File integrity
+
+```text
+6f7ed8a177812b96a447d492af7670d0a2ad17bfa542a86d18a06c30eeb2bae8  band-12-families-after-grader-fix.json
+9816e4a31750002bec29a4b1608e71b686dc13bdcc34f84a738d57c0388be3f2  grader-audit-before-fix.jsonl.gz
+ce5f8982d30425b876480ae5cf3b3dee6e1254a4fa8bf2ee7c5045a8b5187275  grader-audit-after-fix.jsonl.gz
+```
