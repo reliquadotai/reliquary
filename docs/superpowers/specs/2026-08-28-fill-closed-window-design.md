@@ -587,8 +587,16 @@ redistributed and never paid.
 writes a one-object cursor through the payload-queue transport after
 every optimizer step. Pick k (k > depth) is gated on the cursor showing
 step k−depth consumed, with depth = 2 so the trainer always holds one
-batch in hand. The first `depth` picks are gated on
-`FILL_CLOSED_FIRST_PICK_SECONDS` (default 30) after window open. No
+batch in hand. Only pick 1 is gated on
+`FILL_CLOSED_FIRST_PICK_SECONDS` (default 30) after window open — it is
+the one pick with no prior step to wait on. Every pick k >= 2 waits on
+batch `max(0, k - depth - 1)` consumed (R41, the user's call): pick 2
+fires at the end of the FIRST training step rather than sharing the
+floor, halving the floor-seat share to 1/16 and buying pick 2's
+candidates a whole step of extra generation time, at the cost of one
+emit-to-fetch bubble (~8-10 s) at the end of step 1, once per window —
+picks 2 and 3 share the batch-0 gate, which refills the depth-2 buffer
+immediately after. No
 constant anywhere encodes the trainer's step time: the cadence is
 measured, not declared, and survives any model/hardware/config change on
 the train worker unchanged. *(A protocol horizon floor `k·H/16` was

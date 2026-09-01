@@ -174,22 +174,24 @@ def test_the_first_pick_waits_for_the_first_pick_floor(monkeypatch):
     assert shared.snapshot()["picks_emitted"] == 1
 
 
-def test_a_pick_past_the_depth_waits_for_the_cursor_both_sides(monkeypatch):
-    """R34: pick ``depth + 1`` is gated on the trainer having CONSUMED
-    this window's batch 0 -- both boundary sides pinned. One below the
-    encoded key is not enough; the key itself is."""
+def test_the_second_pick_waits_for_the_end_of_the_first_step_both_sides(
+    monkeypatch,
+):
+    """R41: only pick 1 rides the time floor. Pick 2 is gated on the
+    trainer having CONSUMED batch 0 -- the end of the first training
+    step -- both boundary sides pinned. One below the encoded key is
+    not enough; the key itself is."""
     import reliquary.validator.service as service_module
     monkeypatch.setattr(service_module, "FILL_CLOSED_PICK_PIPELINE_DEPTH", 2)
     math, code, shared, clock = _two_env_window(monkeypatch)
     clock.now += 60.0
     service = _service(monkeypatch)
 
-    # Burn the two free picks off the time floor.
-    for _ in range(2):
-        _prove(math, MATH, B_BATCH)
-        _prove(code, CODE, B_BATCH)
-        assert service._drive_fill_closed_picks([math, code]) is True
-    assert shared.snapshot()["picks_emitted"] == 2
+    # Burn the ONE free pick off the time floor.
+    _prove(math, MATH, B_BATCH)
+    _prove(code, CODE, B_BATCH)
+    assert service._drive_fill_closed_picks([math, code]) is True
+    assert shared.snapshot()["picks_emitted"] == 1
 
     _prove(math, MATH, B_BATCH)
     _prove(code, CODE, B_BATCH)
@@ -197,9 +199,16 @@ def test_a_pick_past_the_depth_waits_for_the_cursor_both_sides(monkeypatch):
 
     service._training_payload_queue.cursor = batch_zero - 1
     assert service._drive_fill_closed_picks([math, code]) is False
-    assert shared.snapshot()["picks_emitted"] == 2
+    assert shared.snapshot()["picks_emitted"] == 1
 
     service._training_payload_queue.cursor = batch_zero
+    assert service._drive_fill_closed_picks([math, code]) is True
+    assert shared.snapshot()["picks_emitted"] == 2
+
+    # Picks 2 and 3 share the batch-0 gate (the max(0, ...) clamp), which
+    # is what refills the depth-2 buffer right after the step-1 bubble.
+    _prove(math, MATH, B_BATCH)
+    _prove(code, CODE, B_BATCH)
     assert service._drive_fill_closed_picks([math, code]) is True
     assert shared.snapshot()["picks_emitted"] == 3
 
@@ -287,8 +296,8 @@ def test_every_event_walks_its_own_cursor_boundary_and_closes(monkeypatch):
         assert math.poll_deadline() is False
         _prove(math, MATH, B_BATCH)
         _prove(code, CODE, B_BATCH)
-        if k > 2:
-            consumed = encoded_window_journal_key(WINDOW, k - 3)
+        if k >= 2:
+            consumed = encoded_window_journal_key(WINDOW, max(0, k - 3))
             # One short of the boundary: still gated, including on the
             # window's LAST event.
             queue.cursor = consumed - 1
@@ -319,26 +328,25 @@ def test_the_backstop_still_seals_a_stalled_window(monkeypatch):
     assert shared.is_closed() is False
 
 
-def test_an_absent_cursor_still_lets_the_first_picks_fire(monkeypatch):
+def test_an_absent_cursor_still_lets_the_first_pick_fire(monkeypatch):
     """Failure mode from the spec: cursor stale/absent -> picks stop.
-    But the first ``depth`` picks never depended on it, so they still
-    fire on the time floor and the trainer gets something to chew on."""
+    But pick 1 never depended on it (R41: the only floor pick), so it
+    still fires and the trainer gets something to chew on."""
     import reliquary.validator.service as service_module
     monkeypatch.setattr(service_module, "FILL_CLOSED_PICK_PIPELINE_DEPTH", 2)
     math, code, shared, clock = _two_env_window(monkeypatch)
     clock.now += 60.0
     service = _service(monkeypatch, cursor=None)
 
-    for expected in (1, 2):
-        _prove(math, MATH, B_BATCH)
-        _prove(code, CODE, B_BATCH)
-        assert service._drive_fill_closed_picks([math, code]) is True
-        assert shared.snapshot()["picks_emitted"] == expected
+    _prove(math, MATH, B_BATCH)
+    _prove(code, CODE, B_BATCH)
+    assert service._drive_fill_closed_picks([math, code]) is True
+    assert shared.snapshot()["picks_emitted"] == 1
 
     _prove(math, MATH, B_BATCH)
     _prove(code, CODE, B_BATCH)
     assert service._drive_fill_closed_picks([math, code]) is False
-    assert shared.snapshot()["picks_emitted"] == 2
+    assert shared.snapshot()["picks_emitted"] == 1
 
 
 def test_a_stale_cursor_from_an_older_window_does_not_release_a_pick(
@@ -358,10 +366,9 @@ def test_a_stale_cursor_from_an_older_window_does_not_release_a_pick(
             WINDOW - 1, FILL_CLOSED_EMISSIONS_PER_WINDOW - 1
         ),
     )
-    for _ in range(2):
-        _prove(math, MATH, B_BATCH)
-        _prove(code, CODE, B_BATCH)
-        assert service._drive_fill_closed_picks([math, code]) is True
+    _prove(math, MATH, B_BATCH)
+    _prove(code, CODE, B_BATCH)
+    assert service._drive_fill_closed_picks([math, code]) is True
 
     _prove(math, MATH, B_BATCH)
     _prove(code, CODE, B_BATCH)
@@ -378,10 +385,9 @@ def test_the_cursor_is_read_once_per_tick_and_only_when_gating(monkeypatch):
     service = _service(monkeypatch, cursor=10**9)
     queue = service._training_payload_queue
 
-    for _ in range(2):
-        _prove(math, MATH, B_BATCH)
-        _prove(code, CODE, B_BATCH)
-        service._drive_fill_closed_picks([math, code])
+    _prove(math, MATH, B_BATCH)
+    _prove(code, CODE, B_BATCH)
+    service._drive_fill_closed_picks([math, code])
     assert queue.reads == 0
 
     _prove(math, MATH, B_BATCH)

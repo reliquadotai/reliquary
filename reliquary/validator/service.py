@@ -3389,21 +3389,26 @@ class ValidationService:
     def _fill_closed_pick_gate_open(self, batcher, *, next_pick: int) -> bool:
         """Is the pacing gate for pick ``next_pick`` (1-indexed) open?
 
-        R34, and the one place the off-by-ones live:
+        R34 as amended by R41, and the one place the off-by-ones live:
 
-        * ``next_pick <= depth``: nothing has been emitted into this
-          window's key range yet, so no cursor value could ever release
-          these -- they run on ``FILL_CLOSED_FIRST_PICK_SECONDS`` after
-          the window opened, measured on the BATCHER's clock (the same
-          one ``FILL_CLOSED_MAX_SECONDS`` uses, so the floor and the
-          backstop can never disagree about how old a window is).
-        * ``next_pick > depth``: pick k emits batch index ``k - 1``, so
-          the batch ``depth`` picks back is index ``k - depth - 1``, and
-          the gate is the trainer's cursor having REACHED that batch's
-          encoded journal key (the cursor holds the last key consumed,
-          see ``TrainerWorker._advance_cursor``). With depth 2, pick 3
-          waits on batch 0: batch 1 is then still in the trainer's hands,
-          which is exactly the one-batch buffer R34 asks for.
+        * ``next_pick == 1``: nothing has been emitted into this window's
+          key range yet, so no cursor value could ever release it -- the
+          ONLY pick on the ``FILL_CLOSED_FIRST_PICK_SECONDS`` floor,
+          measured on the BATCHER's clock (the same one
+          ``FILL_CLOSED_MAX_SECONDS`` uses, so the floor and the backstop
+          can never disagree about how old a window is).
+        * ``next_pick >= 2``: pick k emits batch index ``k - 1``, so the
+          batch ``depth`` picks back is index ``k - depth - 1``, CLAMPED
+          at 0 (R41): pick 2 waits on batch 0 -- the end of the first
+          training step -- rather than sharing the floor. The trade,
+          measured when R41 was ruled: one emit-to-fetch bubble (~8-10 s)
+          at the end of step 1, once per window, and in exchange the
+          floor seats fall from 2/16 to 1/16 of the window and pick 2's
+          candidates get a whole step of extra generation time. Picks 2
+          and 3 share the batch-0 gate (max(0, k-depth-1) collides
+          there), which is what refills the depth-2 buffer immediately
+          after the bubble: from step 2 on the trainer always holds one
+          batch in hand, exactly the buffer R34 asks for.
 
         ``>=`` rather than ``==`` because the trainer skips keys it never
         trains (tombstones, quarantined batches, health skips all advance
@@ -3411,7 +3416,7 @@ class ValidationService:
         windows, so a cursor left in a PREVIOUS window is simply too
         small and needs no separate staleness rule.
         """
-        if next_pick <= FILL_CLOSED_PICK_PIPELINE_DEPTH:
+        if next_pick <= 1:
             age = self._window_open_age_seconds(batcher)
             return age is not None and age >= FILL_CLOSED_FIRST_PICK_SECONDS
         from reliquary.infrastructure.training_payload_queue import (
@@ -3420,7 +3425,7 @@ class ValidationService:
 
         required = encoded_window_journal_key(
             int(batcher.window_start),
-            next_pick - FILL_CLOSED_PICK_PIPELINE_DEPTH - 1,
+            max(0, next_pick - FILL_CLOSED_PICK_PIPELINE_DEPTH - 1),
         )
         cursor = self._read_trainer_step_cursor()
         return cursor is not None and int(cursor) >= required
