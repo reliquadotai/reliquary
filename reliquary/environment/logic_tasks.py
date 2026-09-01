@@ -589,7 +589,7 @@ def _time_sequence(rng: HashCounterRng) -> GeneratedLogicTask:
     )
 
 
-# ────────────────  math_path (inactive)  ────────────────
+# ────────────────  math_path  ────────────────
 
 
 def _math_path(rng: HashCounterRng) -> GeneratedLogicTask:
@@ -639,7 +639,7 @@ def _math_path(rng: HashCounterRng) -> GeneratedLogicTask:
     )
 
 
-# ────────────────  space_reasoning (inactive)  ────────────────
+# ────────────────  space_reasoning  ────────────────
 
 _SHELF_ITEMS = (
     "atlas", "almanac", "diary", "folio", "gazette", "journal", "ledger",
@@ -681,7 +681,7 @@ def _space_reasoning(rng: HashCounterRng) -> GeneratedLogicTask:
     )
 
 
-# ────────────────  word_sorting_mistake (inactive)  ────────────────
+# ────────────────  word_sorting_mistake  ────────────────
 
 
 def _word_sorting_mistake(rng: HashCounterRng) -> GeneratedLogicTask:
@@ -732,19 +732,19 @@ class Family:
 # a modulo over the active list, so a different roster is a different corpus.
 # Never compare band measurements taken under different rosters.
 _FAMILY_REGISTRY = (
-    Family("boolean_expressions", _boolean_expressions, True, 1.000),
+    Family("boolean_expressions", _boolean_expressions, True, 0.984),
     Family("cipher", _cipher, False, 0.000),
-    Family("cryptarithm", _cryptarithm, True, 0.141),
+    Family("cryptarithm", _cryptarithm, True, 0.156),
     Family("dyck_language", _dyck_language, True, 0.641),
-    Family("dyck_language_errors", _dyck_language_errors, True, 0.719),
-    Family("math_path", _math_path, False, -1.0),
-    Family("numbrix", _numbrix, True, 0.250),
-    Family("object_properties", _object_properties, True, 0.984),
-    Family("operation", _operation, True, 1.000),
-    Family("space_reasoning", _space_reasoning, False, -1.0),
-    Family("time_sequence", _time_sequence, True, 1.000),
+    Family("dyck_language_errors", _dyck_language_errors, True, 0.531),
+    Family("math_path", _math_path, True, 0.438),
+    Family("numbrix", _numbrix, True, 0.219),
+    Family("object_properties", _object_properties, True, 0.969),
+    Family("operation", _operation, True, 0.984),
+    Family("space_reasoning", _space_reasoning, True, 0.984),
+    Family("time_sequence", _time_sequence, True, 0.984),
     Family("web_of_lies", _web_of_lies, True, 1.000),
-    Family("word_sorting_mistake", _word_sorting_mistake, False, -1.0),
+    Family("word_sorting_mistake", _word_sorting_mistake, True, 0.688),
 )
 
 # cipher is inactive: measured 0.0% in band with 76% valid JSON and 99.5%

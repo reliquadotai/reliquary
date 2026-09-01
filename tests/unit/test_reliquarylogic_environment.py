@@ -62,8 +62,9 @@ def test_generator_is_total_over_a_wide_index_range():
 # wrong is a capability wall, not a difficulty setting.
 FAMILIES = {
     "boolean_expressions", "cryptarithm", "dyck_language",
-    "dyck_language_errors", "numbrix", "object_properties",
-    "operation", "time_sequence", "web_of_lies",
+    "dyck_language_errors", "math_path", "numbrix", "object_properties",
+    "operation", "space_reasoning", "time_sequence", "web_of_lies",
+    "word_sorting_mistake",
 }
 
 
