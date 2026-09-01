@@ -885,6 +885,22 @@ if FILL_CLOSED_ADMISSION_BUDGET_PER_ENV <= 0:
 #     batch ``k - depth - 1``, which leaves the trainer holding
 #     ``depth - 1`` unconsumed batches at the moment pick k lands -- it
 #     never starves, and the journal backlog is bounded at ``depth``.
+# Restart freshness cap for the detached trainer, in journal keys
+# (= optimizer steps; one window is FILL_CLOSED_EMISSIONS_PER_WINDOW of
+# them). When the trainer comes back from an outage it skips everything
+# more than this many keys behind the frontier instead of grinding a
+# full optimizer step through every stale batch: the data was generated
+# against a policy that has long since moved on, and the drift breakers
+# would spend the whole catch-up firing. 16 = one publish interval.
+# 0 disables the skip. Skipped windows were already paid at archive.
+TRAINER_MAX_CATCHUP_STEPS = int(_os.environ.get(
+    "RELIQUARY_TRAINER_MAX_CATCHUP_STEPS", "16"
+))
+if TRAINER_MAX_CATCHUP_STEPS < 0:
+    raise ValueError(
+        "RELIQUARY_TRAINER_MAX_CATCHUP_STEPS must be >= 0"
+    )
+
 FILL_CLOSED_FIRST_PICK_SECONDS = float(_os.environ.get(
     "RELIQUARY_FILL_CLOSED_FIRST_PICK_SECONDS", "30"
 ))

@@ -115,6 +115,7 @@ def run_train_worker(*, shadow: bool = False) -> None:
         DEFAULT_BASE_MODEL_REVISION,
         ENVIRONMENT_MIX,
         PROTOCOL_VERSION,
+        TRAINER_MAX_CATCHUP_STEPS,
     )
     from reliquary.shared.modeling import (
         load_text_generation_model,
@@ -123,6 +124,7 @@ def run_train_worker(*, shadow: bool = False) -> None:
     from reliquary.trainer.journal import (
         WindowJournal,
         migrate_journal_cursor,
+        r2_exists_fn,
         r2_fetch_fn,
     )
     from reliquary.trainer.publisher import TrainerPublisher
@@ -144,6 +146,7 @@ def run_train_worker(*, shadow: bool = False) -> None:
     ))
     client = _r2_client()
     fetch = r2_fetch_fn(client, bucket)
+    exists = r2_exists_fn(client, bucket)
 
     expected_identity = (
         active_training_identity() if PROTOCOL_VERSION >= 5 else None
@@ -314,6 +317,7 @@ def run_train_worker(*, shadow: bool = False) -> None:
         journal=WindowJournal(
             fetch_fn=fetch,
             expected_identity=expected_identity,
+            exists_fn=exists,
         ),
         train_fn=runner.step,
         publish_fn=publish_fn,
@@ -326,8 +330,10 @@ def run_train_worker(*, shadow: bool = False) -> None:
         freeze_fn=freeze_fn,
         abort_epoch_fn=runner.abort_epoch,
         cursor_writer=cursor_queue.write_step_cursor,
+        max_catchup=TRAINER_MAX_CATCHUP_STEPS,
     )
 
+    worker.skip_stale_backlog()
     logger.info(
         "train-worker starting: cursor=%d, revision=%s, shadow=%s",
         worker.cursor, revision, shadow,

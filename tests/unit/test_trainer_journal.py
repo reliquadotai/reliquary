@@ -153,3 +153,52 @@ def test_the_matching_marker_leaves_the_cursor_alone(monkeypatch):
     monkeypatch.setattr(journal_module, "FILL_CLOSED_ENABLED", False)
 
     assert migrate_journal_cursor(30_000, "raw") == (30_000, "raw")
+
+
+# ------------------------------------------------------- catch-up (R42)
+
+def _store_with_entries(*window_numbers, tombstones=()):
+    from reliquary.infrastructure.training_payload_queue import (
+        payload_key, tombstone_key,
+    )
+    store = {}
+    for n in window_numbers:
+        store[payload_key(n)] = b"payload-bytes"
+    for n in tombstones:
+        store[tombstone_key(n)] = b"tombstone-bytes"
+    return store
+
+
+def test_backlog_depth_counts_consecutive_entries_and_stops_at_the_gap():
+    journal = WindowJournal(_store_with_entries(101, 102, 103, 105).get)
+    assert journal.backlog_depth(100, stride=1) == 3
+
+
+def test_backlog_depth_counts_a_tombstone_as_an_entry():
+    """A tombstoned key still occupies its slot: R18 keeps the journal
+    gapless, so the first ABSENCE is the frontier, never a tombstone."""
+    journal = WindowJournal(
+        _store_with_entries(101, 103, tombstones=(102,)).get
+    )
+    assert journal.backlog_depth(100, stride=1) == 3
+
+
+def test_backlog_depth_is_zero_at_the_frontier():
+    journal = WindowJournal(_store_with_entries(101).get)
+    assert journal.backlog_depth(101, stride=1) == 0
+
+
+def test_backlog_depth_probes_existence_without_fetching_bodies():
+    """The probe must not download megabytes of stale payloads it exists
+    to avoid training: with an exists_fn injected, fetch is never hit."""
+    from reliquary.infrastructure.training_payload_queue import payload_key
+    fetched = []
+
+    def fetch(key):
+        fetched.append(key)
+        return b"x"
+
+    keys = {payload_key(n) for n in (101, 102)}
+    journal = WindowJournal(fetch, exists_fn=lambda k: k in keys)
+    assert journal.backlog_depth(100, stride=1) == 2
+    assert fetched == []

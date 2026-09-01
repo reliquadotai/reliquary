@@ -195,3 +195,89 @@ def test_no_cursor_writer_configured_is_a_noop():
     w = _worker(env)  # default cursor_writer=None
     assert w.run_once() == "trained"
     assert w.cursor == 101
+
+
+# ------------------------------------------------------- catch-up (R42)
+
+def _worker_over_journal(env, store, cursor=100, **kw):
+    from reliquary.trainer.journal import WindowJournal
+    from reliquary.trainer.worker import TrainerWorker
+    return TrainerWorker(
+        journal=WindowJournal(store.get),
+        train_fn=env.train,
+        publish_fn=env.publish,
+        head_revision_fn=lambda: env.head,
+        cursor=cursor,
+        stride=1,
+        publish_every=kw.pop("publish_every", 16),
+        last_published_revision="rev-0",
+        **kw,
+    )
+
+
+def _payload_store(first, last):
+    from reliquary.infrastructure.training_payload_queue import payload_key
+    from reliquary.shared.training_payload import encode_training_payload
+    store = {}
+    for n in range(first, last + 1):
+        store[payload_key(n)] = encode_training_payload(
+            {},
+            window_start=n,
+            checkpoint_revision="rev-0",
+            env_order=[],
+            window_quarantine={"quarantined": False, "reasons": []},
+        )
+    return store
+
+
+def test_a_deep_backlog_is_skipped_down_to_the_catchup_cap():
+    """The restart incident: the trainer was down for 40 keys' worth of
+    emissions; it must NOT grind an optimizer step through stale data --
+    it jumps to the 16 most recent, counted and loud."""
+    env = _Env({})
+    store = _payload_store(101, 140)
+    w = _worker_over_journal(env, store, cursor=100, max_catchup=16)
+    assert w.skip_stale_backlog() == 24
+    assert w.cursor == 124
+    assert w.snapshot()["stale_skipped"] == 24
+    assert w.trained_since_publish == 0
+
+
+def test_a_shallow_backlog_is_not_touched():
+    env = _Env({})
+    store = _payload_store(101, 110)
+    w = _worker_over_journal(env, store, cursor=100, max_catchup=16)
+    assert w.skip_stale_backlog() == 0
+    assert w.cursor == 100
+
+
+def test_a_zero_cap_disables_the_skip_entirely():
+    env = _Env({})
+    store = _payload_store(101, 140)
+    w = _worker_over_journal(env, store, cursor=100, max_catchup=0)
+    assert w.skip_stale_backlog() == 0
+    assert w.cursor == 100
+
+
+def test_the_jump_writes_the_cursor_once_so_the_validator_unsticks():
+    """The one cursor write after the jump is what releases the
+    validator's pacing and rotation gates without waiting for their
+    backstops -- the skip must publish where training will resume."""
+    env = _Env({})
+    store = _payload_store(101, 140)
+    written = []
+    w = _worker_over_journal(
+        env, store, cursor=100, max_catchup=16,
+        cursor_writer=written.append,
+    )
+    w.skip_stale_backlog()
+    assert written == [124]
+
+
+def test_training_resumes_normally_after_the_skip():
+    env = _Env({})
+    store = _payload_store(101, 120)
+    w = _worker_over_journal(env, store, cursor=100, max_catchup=16)
+    assert w.skip_stale_backlog() == 4
+    assert w.run_once() == "trained"
+    assert w.cursor == 105

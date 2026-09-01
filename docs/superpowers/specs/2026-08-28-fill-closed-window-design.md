@@ -632,6 +632,19 @@ seats spread across machines with no identity anywhere.
 correct: there is no policy to generate against. Both are stalls, never
 wrong payments.
 
+**Restart freshness (R42).** While the trainer is down each stalled
+window still emits its floor picks before the backstop, so a long outage
+leaves a tail of stale batches in the journal. On restart the trainer
+probes the frontier (existence-only; R18's gapless journal makes the
+first absence THE frontier) and skips everything more than
+`TRAINER_MAX_CATCHUP_STEPS` (default 16 = one publish interval, 0
+disables) behind it, then writes its cursor once -- which is what
+releases the validator's pacing and rotation gates immediately instead
+of at their backstops. Every batch is bound to its target step (the
+encoded journal key), so freshness is pure arithmetic; skipped windows
+were already paid at the validator's archive, so the skip touches which
+data trains, never money.
+
 **Configuration added.**
 - `FILL_CLOSED_FIRST_PICK_SECONDS` (default 30)
 - `FILL_CLOSED_PICK_PIPELINE_DEPTH` (default 2)

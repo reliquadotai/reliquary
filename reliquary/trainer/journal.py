@@ -97,9 +97,38 @@ class WindowJournal:
         fetch_fn: Callable[[str], bytes | None],
         *,
         expected_identity: dict[str, Any] | None = None,
+        exists_fn: Callable[[str], bool] | None = None,
     ) -> None:
         self._fetch = fetch_fn
         self._expected_identity = dict(expected_identity or {})
+        # Existence-only probe for ``backlog_depth``: a HEAD, never a
+        # body download -- the probe exists precisely to avoid fetching
+        # megabytes of stale payloads it is deciding to skip. Falls back
+        # to the fetcher when absent (tests over dicts).
+        self._exists = exists_fn or (lambda key: fetch_fn(key) is not None)
+
+    def entry_exists(self, cursor: int, *, stride: int) -> bool:
+        target = int(cursor) + int(stride)
+        return self._exists(payload_key(target)) or self._exists(
+            tombstone_key(target)
+        )
+
+    def backlog_depth(
+        self, cursor: int, *, stride: int, cap: int = 100_000
+    ) -> int:
+        """How many consecutive entries sit ahead of ``cursor``.
+
+        Under the fill-closed journal this is exact: R18 keeps every key
+        up to the frontier occupied (payload or tombstone), so the first
+        absence IS the frontier, never a gap the validator will fill in
+        later. ``cap`` only bounds a pathological store.
+        """
+        depth = 0
+        probe = int(cursor)
+        while depth < cap and self.entry_exists(probe, stride=stride):
+            probe += int(stride)
+            depth += 1
+        return depth
 
     def next_entry(
         self, cursor: int, *, stride: int
@@ -188,3 +217,21 @@ def r2_fetch_fn(client: Any, bucket: str) -> Callable[[str], bytes | None]:
             return None
 
     return fetch
+
+
+def r2_exists_fn(client: Any, bucket: str) -> Callable[[str], bool]:
+    """Existence probe: boto3 HeadObject, False on any miss.
+
+    HeadObject raises ClientError (404) rather than NoSuchKey; treat every
+    failure as absence -- a transient error at worst under-counts the
+    backlog, which only makes the catch-up skip smaller, never larger.
+    """
+
+    def exists(key: str) -> bool:
+        try:
+            client.head_object(Bucket=bucket, Key=key)
+            return True
+        except Exception:
+            return False
+
+    return exists

@@ -36,6 +36,7 @@ class TrainerWorker:
         freeze_fn: Callable[[], str | None] | None = None,
         abort_epoch_fn: Callable[[Any], None] | None = None,
         cursor_writer: Callable[[int], None] | None = None,
+        max_catchup: int = 0,
     ) -> None:
         self._journal = journal
         self._train_fn = train_fn
@@ -59,6 +60,42 @@ class TrainerWorker:
         self.tombstones_seen = 0
         self.quarantined_seen = 0
         self.health_skips = 0
+        self.max_catchup = int(max_catchup)
+        self.stale_skipped = 0
+
+    def skip_stale_backlog(self) -> int:
+        """Jump a restart's deep backlog down to the catch-up cap.
+
+        The incident this exists for: the trainer is down while the
+        validator keeps emitting; on restart the journal walk would grind
+        through every stale key at a full optimizer step each, training
+        against data whose policy has long since moved on. Every batch is
+        bound to its target step (the encoded journal key), so freshness
+        is just arithmetic: anything more than ``max_catchup`` steps
+        behind the frontier is dead -- skip it, loudly. The one cursor
+        write after the jump is what tells the validator's pacing and
+        rotation gates the trainer is back at the frontier, so a stalled
+        rotation unsticks immediately instead of at its backstop.
+
+        Skipped windows were already paid at the validator's archive;
+        nothing here touches money, only which data trains. 0 disables.
+        """
+        if self.max_catchup <= 0:
+            return 0
+        depth = self._journal.backlog_depth(self.cursor, stride=self.stride)
+        excess = depth - self.max_catchup
+        if excess <= 0:
+            return 0
+        first = self.cursor + self.stride
+        self.cursor += excess * self.stride
+        self.stale_skipped += excess
+        logger.warning(
+            "stale backlog: skipping %d journal keys (%d..%d), training "
+            "resumes %d behind the frontier",
+            excess, first, self.cursor, self.max_catchup,
+        )
+        self._write_cursor(self.cursor)
+        return excess
 
     def _advance_cursor(self) -> None:
         """The single place the journal cursor moves forward.
@@ -219,6 +256,7 @@ class TrainerWorker:
             "last_published_revision": self.last_published_revision,
             "tombstones_seen": self.tombstones_seen,
             "quarantined_seen": self.quarantined_seen,
+            "stale_skipped": self.stale_skipped,
             "health_skips": self.health_skips,
             "shadow": self.shadow,
         }
