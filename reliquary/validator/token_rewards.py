@@ -1,26 +1,9 @@
-"""Divide an environment's pool by EOS-terminated completion tokens.
+"""Deterministic token-weighted accounting for the disabled fill experiment.
 
-Replaces ``slot_share = pool / B_BATCH``. Under the flat share a group costs
-``16L/r`` rounds at rate ``r`` and length ``L`` and pays the same whatever
-``L`` is, so revenue per GPU-second is proportional to ``1/L`` and halving
-response length doubles income. Dividing by tokens removes that.
-
-Only EOS-terminated rollouts contribute. The caller does that filtering; this
-module simply never invents value for a token it was not given. That
-restriction is load-bearing rather than cosmetic: the flat share is currently
-one of four barriers against EOS suppression, and per-token payment removes
-it. Paying only terminated tokens restores a strictly negative margin on
-padding.
-
-There is deliberately no per-operator cap. Every identity a cap could key on
--- operator, coldkey, hotkey -- costs one registration to multiply, so a cap
-is bought around rather than respected. Per-token payment is itself the
-concentration control precisely because it keys on nothing but tokens
-produced: a registration count does not exist in this function's inputs, so
-it cannot be split across coldkeys the way a slot count could.
-
-Pure and deterministic: two validators replaying the same archive must reach
-the same numbers bit for bit.
+The caller supplies already eligible groups and their counted completion
+tokens. This isolated function exists for replay and qualification; the
+Reliquary 1 target retains selected-slot rewards and does not activate this
+policy.
 """
 
 from __future__ import annotations
@@ -32,7 +15,7 @@ from typing import Sequence
 @dataclass(frozen=True)
 class AcceptedGroup:
     hotkey: str
-    # Archived for audit; no longer drives payment (see module docstring).
+    # Retained in the archived accounting record.
     operator_id: str
     eos_tokens: int
 

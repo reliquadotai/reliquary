@@ -1,38 +1,9 @@
-"""Rate-ordered admission queue.
+"""Deterministic priority queue for the disabled fill experiment.
 
-A fill-closed window closes when its batch is full, so the slots still open
-near the close go to whoever finishes first — systematically whoever produced
-the shortest rollouts. Ordering the queue by production RATE instead of by
-arrival removes that: at fixed hardware the rate is the same whether a group
-is 500 or 5000 tokens per rollout, so length stops deciding who gets in.
-
-    rate = payload_bytes / (precommit arrival - window open)
-
-Three properties of that formula, each deliberate:
-
-* It is measured at the PRECOMMIT, not the upload. Transport is therefore
-  inside the measure — a fat uplink cannot buy a place, only faster
-  generation can.
-* The denominator runs from window open for every group, and there is no
-  identity in the formula. Splitting production across hotkeys changes
-  nothing. Measured from a sender's previous arrival instead, a parallel
-  producer's eighth group would show 0.1 s of elapsed and a 250x rate — a
-  double count of hardware that already earned eight tickets by volume.
-* Both terms are outside the miner's control. ``payload_bytes`` is bound by
-  the signed precommit and enforced against the upload; the arrival is
-  validator-observed.
-
-Pure and dependency-free, like ``difficulty_auction`` and ``batch_selection``.
-It admits nothing, grades nothing and proves nothing; it only decides what
-the validator should spend its next grading and proof budget on.
-
-A ``PendingSubmission`` -- rewards, robust utility, everything the proof
-plane needs -- does not exist until the body has arrived and been graded,
-later and on a different path than the precommit this queue holds. So the
-queue is never drained directly for a provable candidate; instead
-``rate_of`` lets the batcher look up the rate a graded body's precommit
-registered, and the batcher buffers graded bodies in that order itself
-(see ``GrpoWindowBatcher._drain_arrival_proof_buffer``).
+The module preserves the fill branch's exact qualification policy so it can be
+replayed and compared behind its own capability. It does not admit, grade,
+prove, select, or pay a submission. Reliquary 1 does not use this priority for
+ticket admission or final ranking.
 """
 
 from __future__ import annotations
@@ -69,16 +40,7 @@ class ThroughputAdmissionQueue:
         payload_bytes: int,
         precommit_arrived_at: float,
     ) -> QueuedPrecommit:
-        """Queue a precommit. Never refuses.
-
-        The queue holds hashes, not payloads, so it is cheap, and the
-        expensive stages behind it are already bounded by the environment's
-        target. Bounding it again globally would be actively harmful:
-        ``constants.py`` records why there is no global receipt ceiling —
-        "any global counter can be deliberately burned before honest bodies
-        arrive". Receipt memory is bounded per identity instead, by
-        ``MAX_PENDING_UPLOAD_PRECOMMITS_PER_{HOTKEY,OPERATOR}``.
-        """
+        """Record one bounded precommit for later deterministic lookup."""
         elapsed = max(precommit_arrived_at - self._window_opened_at, 1e-9)
         entry = QueuedPrecommit(
             receipt_id=receipt_id,
@@ -92,26 +54,11 @@ class ThroughputAdmissionQueue:
         return entry
 
     def rate_of(self, receipt_id: str) -> float | None:
-        """The throughput a precommit registered, or ``None`` if unknown.
-
-        Lets the batcher key its own per-window dispatch buffer by rate at
-        the moment a body grades, without this queue ever handing out a
-        receipt as if it were a provable candidate. ``None`` on a miss
-        (never offered, or offered in a different window) rather than
-        raising: a graded body with no matching precommit still has to
-        degrade to a defined priority, not crash the admission path.
-        """
+        """Return the recorded experimental priority, or ``None``."""
         entry = self._by_receipt.get(receipt_id)
         return entry.throughput if entry is not None else None
 
     def payload_bytes_of(self, receipt_id: str) -> int | None:
-        """The size the precommit bound itself to, or ``None`` on a miss.
-
-        The rate is length-NEUTRAL by construction, so equal rates are the
-        common case rather than a corner; the pick (amendment v6.1) breaks
-        those ties by payload size, and this is where that size comes
-        from -- the same signed, upload-enforced number the rate's
-        numerator uses, not anything the body can restate later.
-        """
+        """Return the payload size bound by the receipt, or ``None``."""
         entry = self._by_receipt.get(receipt_id)
         return entry.payload_bytes if entry is not None else None
