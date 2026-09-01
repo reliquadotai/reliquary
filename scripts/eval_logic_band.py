@@ -46,7 +46,7 @@ def main() -> int:
     args = parser.parse_args()
 
     from reliquary.environment.logic_tasks import (
-        VIRTUAL_LENGTH, generate_logic_task,
+        VIRTUAL_LENGTH, active_families, generate_logic_task,
     )
     from reliquary.environment.reliquarylogic import ReliquaryLogicEnvironment
     from reliquary.environment.structured_output import extract_json_answer
@@ -79,7 +79,9 @@ def main() -> int:
         for family in order
         for index in by_family[family]
     ]
+    roster = active_families()
     print(f"{len(problems)} prompts over {len(order)} families", flush=True)
+    print(f"roster: {','.join(roster)}", flush=True)
 
     from vllm import LLM, SamplingParams
 
@@ -138,6 +140,9 @@ def main() -> int:
         json.dump({
             "model": args.model,
             "revision": args.revision,
+            # Toggling a family remaps the index space, so a measurement is
+            # only comparable to another taken under the same roster.
+            "roster": list(roster),
             "rollouts": ROLLOUTS,
             "sigma_min": SIGMA_MIN,
             "band": [low, high],

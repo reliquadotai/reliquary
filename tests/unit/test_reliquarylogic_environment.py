@@ -335,3 +335,27 @@ def test_cryptarithm_puzzle_is_arithmetically_sound():
     decode = lambda word: int("".join(str(reference[c]) for c in word))
     assert decode(addends[0]) + decode(addends[1]) == decode(total)
     assert len(set(reference.values())) == len(reference)
+
+
+def test_roster_matches_what_the_generator_actually_draws():
+    """Guards against a roster that disagrees with the active generators."""
+    from reliquary.environment.logic_tasks import (
+        _FAMILY_REGISTRY, active_families,
+    )
+
+    roster = active_families()
+    assert set(roster) == FAMILIES
+    assert len(set(roster)) == len(roster)
+    drawn = {generate_logic_task(index).family for index in range(SAMPLE)}
+    assert drawn == set(roster)
+
+    names = [family.name for family in _FAMILY_REGISTRY]
+    assert names == sorted(names), "keep the roster alphabetical"
+    assert len(set(names)) == len(names)
+    # An inactive family stays implemented and callable; only the contract
+    # stops drawing from it.
+    inactive = [f for f in _FAMILY_REGISTRY if not f.active]
+    assert inactive, "cipher is retained as evidence of a measured verdict"
+    for family in _FAMILY_REGISTRY:
+        assert callable(family.generator)
+        assert 0.0 <= family.band <= 1.0

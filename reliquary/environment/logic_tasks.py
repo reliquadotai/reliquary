@@ -213,6 +213,51 @@ def _numbrix(rng: HashCounterRng) -> GeneratedLogicTask:
     )
 
 
+# ────────────────  cipher (inactive)  ────────────────
+
+_WORDS = (
+    "amber", "anchor", "bridge", "candle", "cavern", "cinder", "clover",
+    "copper", "cypher", "ember", "falcon", "garnet", "harbor", "hollow",
+    "indigo", "ivory", "jasper", "kernel", "lantern", "marble", "meadow",
+    "nectar", "obsidian", "onyx", "pewter", "quartz", "quiver", "ripple",
+    "saffron", "silver", "summit", "thicket", "timber", "velvet", "walnut",
+    "willow", "zenith", "zephyr",
+)
+
+
+def _shift(text: str, amount: int) -> str:
+    return "".join(
+        chr((ord(character) - 97 + amount) % 26 + 97) for character in text
+    )
+
+
+def _cipher(rng: HashCounterRng) -> GeneratedLogicTask:
+    words = list(_WORDS)
+    rng.shuffle(words)
+    plain = " ".join(words[: 3 + rng.randbelow(3)])
+    amount = 1 + rng.randbelow(25)
+    encoding = rng.randbelow(2) == 1
+    shifted = _shift(plain, amount if encoding else -amount)
+    given, expected = (plain, shifted) if encoding else (shifted, plain)
+    direction = "Encode" if encoding else "Decode"
+    prompt = (
+        f"{direction} the message below with a Caesar shift of {amount} "
+        f"{'forward' if encoding else 'backward'} through the alphabet. "
+        "Spaces are unchanged.\n\n"
+        f"```\n{given}\n```\n\n"
+        "Answer with the resulting string.\n\n"
+        f"{_ANSWER_SHAPE}"
+    )
+    return GeneratedLogicTask(
+        prompt=prompt,
+        expected=expected,
+        operation_id="caesar-cipher-v1",
+        family="cipher",
+        difficulty=2 + len(plain.split()) // 2,
+        check="equality",
+        constraints={},
+    )
+
 # ────────────────  dyck_language  ────────────────
 
 _BRACKETS = (("(", ")"), ("[", "]"), ("{", "}"))
@@ -343,13 +388,50 @@ def _cryptarithm(rng: HashCounterRng) -> GeneratedLogicTask:
     )
 
 
-_GENERATORS = (
-    _boolean_expressions,
-    _cryptarithm,
-    _dyck_language,
-    _numbrix,
-    _web_of_lies,
+@dataclass(frozen=True, slots=True)
+class Family:
+    """One task family and whether the contract currently draws from it.
+
+    ``band`` records the share of 16-rollout groups clearing SIGMA_MIN on
+    Qwen3-4B-Base under the profile's sampling contract, so the roster
+    carries the evidence behind each decision.
+    """
+
+    name: str
+    generator: Any
+    active: bool
+    band: float
+
+
+# Toggling ``active`` REMAPS THE WHOLE INDEX SPACE: the family is drawn with
+# a modulo over the active list, so a different roster is a different corpus.
+# Never compare band measurements taken under different rosters.
+_FAMILY_REGISTRY = (
+    Family("boolean_expressions", _boolean_expressions, True, 0.984),
+    Family("cipher", _cipher, False, 0.000),
+    Family("cryptarithm", _cryptarithm, True, 0.109),
+    Family("dyck_language", _dyck_language, True, 0.562),
+    Family("numbrix", _numbrix, True, 0.266),
+    Family("web_of_lies", _web_of_lies, True, 1.000),
 )
+
+# cipher is inactive: measured 0.0% in band with 76% valid JSON and 99.5%
+# EOS, i.e. well-formed and always wrong. Character-level shifting resists
+# tokenisation. Kept implemented because that verdict is against the BASE
+# model; a trained checkpoint may reach it.
+
+_GENERATORS = tuple(
+    family.generator for family in _FAMILY_REGISTRY if family.active
+)
+if not _GENERATORS:
+    raise ValueError("at least one logic family must be active")
+
+
+def active_families() -> tuple[str, ...]:
+    """Roster identity, recorded beside any measurement taken under it."""
+    return tuple(
+        family.name for family in _FAMILY_REGISTRY if family.active
+    )
 
 
 def generate_logic_task(index: int) -> GeneratedLogicTask:
@@ -457,6 +539,7 @@ __all__ = [
     "GeneratedLogicTask",
     "TASK_FAMILY",
     "VIRTUAL_LENGTH",
+    "active_families",
     "check_answer",
     "generate_logic_task",
     "verifier_spec",

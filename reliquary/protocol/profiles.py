@@ -628,8 +628,8 @@ _PROFILE_VALUES = (
                 batch_target=16,
                 environment_contract_id="reliquary-logic-v1",
                 environment_manifest_sha256=(
-                    "9854f7e3f209676a1d5d4cdba6d85f6"
-                    "1195bd107b03984ef123ebedef08d0db7"
+                    "1348a9e040704bfd148ca54ccc25f53"
+                    "2920b87f8bf1f4167bd41d3280e205543"
                 ),
             ),
         },
