@@ -363,7 +363,8 @@ def parse_epoch_intent(raw: bytes) -> EpochCommitIntent:
     }:
         raise ValueError("checkpoint epoch intent keys differ")
     if (
-        value["schema_version"] != CHECKPOINT_EPOCH_SCHEMA_VERSION
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != CHECKPOINT_EPOCH_SCHEMA_VERSION
         or value["experimental_capability_id"]
         != CHECKPOINT_EPOCH_CAPABILITY_ID
     ):

@@ -223,7 +223,11 @@ def build_generation_intent_set(
 
 
 def generation_intent_set_to_dict(value: GenerationIntentSet) -> dict[str, Any]:
-    if not isinstance(value, GenerationIntentSet) or value.schema_version != 1:
+    if (
+        not isinstance(value, GenerationIntentSet)
+        or type(value.schema_version) is not int
+        or value.schema_version != 1
+    ):
         raise ValueError("unsupported generation intent set")
     expected = build_generation_intent_set(
         value.intents,
@@ -317,6 +321,9 @@ def parse_signed_generation_intent_set(
     raw_intents = body["intents"]
     if not isinstance(raw_intents, list):
         raise ValueError("generation intent-set intents must be a list")
+    schema_version = body["schema_version"]
+    if type(schema_version) is not int or schema_version != 1:
+        raise ValueError("unsupported generation intent-set schema")
     intents = []
     expected_keys = {
         "environment",
@@ -333,7 +340,7 @@ def parse_signed_generation_intent_set(
             raise ValueError("generation intent keys differ")
         intents.append(GenerationIntent(**item))
     intent_set = GenerationIntentSet(
-        schema_version=body["schema_version"],
+        schema_version=schema_version,
         epoch_id=body["epoch_id"],
         manifest_sha256=body["manifest_sha256"],
         intent_close_round=body["intent_close_round"],

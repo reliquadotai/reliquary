@@ -24,6 +24,8 @@ from reliquary.shared.checkpoint_epoch import (
     parse_epoch_plan,
     parse_signed_commitment_set,
     select_epoch_reveals,
+    validate_commitment_set,
+    validate_epoch_plan,
 )
 
 
@@ -93,6 +95,19 @@ def test_manifest_is_canonical_deterministic_and_stable():
     assert first.finalization_policy == (
         "streamed_validation_ordered_lanes_atomic_epoch_v1"
     )
+
+
+@pytest.mark.parametrize("schema_version", [True, 1.0, "1"])
+def test_manifest_schema_requires_an_exact_integer(schema_version):
+    plan = _plan()
+    value = json.loads(canonical_manifest_bytes(plan))
+    value["schema_version"] = schema_version
+    raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+    with pytest.raises(ValueError, match="unsupported checkpoint epoch schema"):
+        parse_epoch_plan(raw)
+    with pytest.raises(ValueError, match="unsupported checkpoint epoch schema"):
+        validate_epoch_plan(replace(plan, schema_version=schema_version))
 
 
 def test_production_horizon_has_sixteen_unique_domain_separated_seeds():
@@ -303,6 +318,50 @@ def test_signed_commitment_set_is_canonical_and_mutation_bound():
         validator_hotkey="validator",
     )
     assert commitment_set_sha256(changed) != commitment_set_sha256(first)
+
+
+@pytest.mark.parametrize("schema_version", [True, 1.0, "1"])
+def test_commitment_set_schema_requires_an_exact_integer(schema_version):
+    plan = _plan()
+    commitment_set = build_commitment_set(
+        [
+            EpochCommitmentRecord(
+                receipt_id="receipt-0",
+                commitment_id="commitment-0",
+                operator_id="operator-0",
+                miner_hotkey="miner-0",
+                window_number=plan.first_window,
+                environment="math",
+                prompt_idx=0,
+                payload_sha256="1" * 64,
+            )
+        ],
+        epoch_id=plan.epoch_id,
+        manifest_sha256_hex=manifest_sha256(plan),
+        commitment_close_round=120,
+        validator_hotkey="validator",
+    )
+    with pytest.raises(
+        ValueError,
+        match="unsupported checkpoint epoch commitment-set schema",
+    ):
+        validate_commitment_set(
+            replace(commitment_set, schema_version=schema_version)
+        )
+
+    publication = SignedEpochCommitmentSet(
+        commitment_set=commitment_set,
+        commitment_set_sha256=commitment_set_sha256(commitment_set),
+        validator_signature="aa",
+    )
+    value = json.loads(canonical_signed_commitment_set_bytes(publication))
+    value["commitment_set"]["schema_version"] = schema_version
+    raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    with pytest.raises(
+        ValueError,
+        match="unsupported checkpoint epoch commitment-set schema",
+    ):
+        parse_signed_commitment_set(raw)
 
 
 def test_post_commit_selection_applies_prompt_cap_deterministically():

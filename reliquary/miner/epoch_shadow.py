@@ -292,7 +292,8 @@ class EpochShadowPlanner:
 
     @staticmethod
     def _record_from_dict(value: Mapping[str, Any]) -> ShadowRecord:
-        if value.get("schema_version") != 1:
+        schema_version = value.get("schema_version")
+        if type(schema_version) is not int or schema_version != 1:
             raise ValueError("unsupported shadow record schema")
         binding_values = dict(value["binding"])
         binding_values["backup_activation_fractions"] = tuple(
@@ -424,6 +425,18 @@ class EpochShadowPlanner:
 
         if self.active_plan_path.exists():
             current = strict_json_loads(self.active_plan_path.read_bytes())
+            if (
+                not isinstance(current, dict)
+                or set(current)
+                != {"schema_version", "manifest_sha256", "canonical_manifest"}
+                or type(current["schema_version"]) is not int
+                or current["schema_version"] != 1
+            ):
+                raise ValueError("invalid active checkpoint epoch plan record")
+            parse_epoch_plan(
+                _canonical_json(current["canonical_manifest"]),
+                expected_manifest_sha256=current["manifest_sha256"],
+            )
             if current.get("manifest_sha256") != digest:
                 self.invalidate_all("plan_replaced")
         self._write(
@@ -892,9 +905,8 @@ class EpochShadowPlanner:
         if mismatch is not None:
             self.invalidate_all(mismatch)
             return []
-        try:
-            live_window = int(_get(live_state, "window_n"))
-        except (TypeError, ValueError):
+        live_window = _get(live_state, "window_n")
+        if type(live_window) is not int or live_window < 0:
             return []
         live_open = _state_text(_get(live_state, "state", "")) == "open"
         generation_open = (
@@ -971,16 +983,29 @@ class EpochShadowPlanner:
         """Release work after polling each exact concurrently open lane."""
         self._require_enabled()
         released: list[Path] = []
-        for (environment, window_number), state in sorted(
-            live_states.items(),
-            key=lambda item: (item[0][1], item[0][0]),
+        lanes: list[tuple[str, int, Mapping[str, Any] | Any]] = []
+        for key, state in live_states.items():
+            if not isinstance(key, tuple) or len(key) != 2:
+                continue
+            environment, window_number = key
+            if (
+                not isinstance(environment, str)
+                or type(window_number) is not int
+                or window_number < 0
+            ):
+                continue
+            state_window = _get(state, "window_n")
+            if (
+                type(state_window) is not int
+                or state_window < 0
+                or state_window != window_number
+            ):
+                continue
+            lanes.append((environment, window_number, state))
+        for environment, _window_number, state in sorted(
+            lanes,
+            key=lambda item: (item[1], item[0]),
         ):
-            try:
-                state_window = int(_get(state, "window_n"))
-            except (TypeError, ValueError):
-                continue
-            if state_window != int(window_number):
-                continue
             cooldown = _get(state, "cooldown_prompts", ())
             if not isinstance(cooldown, Collection) or isinstance(
                 cooldown, (str, bytes)

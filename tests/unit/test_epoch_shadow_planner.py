@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+import json
 
 import pytest
 
@@ -232,6 +233,28 @@ def test_future_work_never_releases_before_exact_open(tmp_path):
     assert planner.records("released") == []
 
 
+@pytest.mark.parametrize("window_number", [True, 50.0, "50"])
+def test_release_requires_an_exact_integer_live_window(
+    tmp_path,
+    window_number,
+):
+    plan = _plan()
+    planner = _planner(tmp_path)
+    prepared = _prepare_one(planner, plan)
+    state = _state(plan)
+    state["window_n"] = window_number
+
+    assert planner.release_ready(
+        live_state=state,
+        cooldown_prompts_by_environment={
+            prepared.binding.environment: set(),
+        },
+        prompt_sha256=_prompt_digest,
+    ) == []
+    assert [record.status for record in planner.records()] == ["prepared"]
+    assert planner.records("released") == []
+
+
 def test_exact_open_release_is_local_and_fully_bound(tmp_path):
     plan = _plan()
     planner = _planner(tmp_path)
@@ -280,6 +303,39 @@ def test_concurrent_epoch_release_polls_each_exact_lane(tmp_path):
 
     assert len(released) == 2
     assert planner.records() == []
+
+
+@pytest.mark.parametrize(
+    ("mapping_window", "state_window"),
+    [
+        (True, 50),
+        (50.0, 50),
+        ("50", 50),
+        (50, True),
+        (50, 50.0),
+        (50, "50"),
+    ],
+)
+def test_epoch_release_requires_exact_integer_window_identities(
+    tmp_path,
+    mapping_window,
+    state_window,
+):
+    plan = _plan()
+    planner = _planner(tmp_path)
+    prepared = _prepare_one(planner, plan)
+    state = _state(plan)
+    state["window_n"] = state_window
+    state["cooldown_prompts"] = []
+
+    assert planner.release_epoch_ready(
+        live_states={
+            (prepared.binding.environment, mapping_window): state,
+        },
+        prompt_sha256=_prompt_digest,
+    ) == []
+    assert [record.status for record in planner.records()] == ["prepared"]
+    assert planner.records("released") == []
 
 
 def test_commitment_release_is_not_limited_by_reveal_cohort_size(tmp_path):
@@ -378,6 +434,44 @@ def test_ambiguous_generation_is_quarantined_on_restart(tmp_path):
     assert restarted.records("quarantine")[0].quarantine_reason == (
         "ambiguous_restart"
     )
+
+
+@pytest.mark.parametrize("schema_version", [True, 1.0, "1"])
+def test_durable_shadow_record_requires_exact_integer_schema(
+    tmp_path,
+    schema_version,
+):
+    plan = _plan()
+    planner = _planner(tmp_path)
+    record = planner.enqueue(
+        plan,
+        expected_manifest_sha256=manifest_sha256(plan),
+        specs=[_spec(plan)],
+    )[0]
+    path = planner.queue_dir / f"{record.identity}.json"
+    value = planner._record_dict(record)
+    value["schema_version"] = schema_version
+    planner._write(path, value)
+
+    assert planner.records() == []
+    assert not path.exists()
+    assert (planner.quarantine_dir / f"corrupt-{path.name}").exists()
+
+
+@pytest.mark.parametrize("schema_version", [True, 1.0, "1"])
+def test_durable_active_plan_requires_exact_integer_schema(
+    tmp_path,
+    schema_version,
+):
+    plan = _plan()
+    planner = _planner(tmp_path)
+    digest = planner.adopt_plan(plan, manifest_sha256(plan))
+    value = json.loads(planner.active_plan_path.read_bytes())
+    value["schema_version"] = schema_version
+    planner._write(planner.active_plan_path, value)
+
+    with pytest.raises(ValueError, match="invalid active checkpoint epoch plan"):
+        planner.adopt_plan(plan, digest)
 
 
 def test_prepared_payload_cannot_contain_final_selection_randomness(tmp_path):

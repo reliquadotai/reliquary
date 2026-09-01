@@ -120,9 +120,10 @@ def test_intent_rejects_uncoordinated_economic_policy_changes(field, value):
         _intent(**{field: value})
 
 
-def test_intent_rejects_a_schema_version_mutation():
+@pytest.mark.parametrize("schema_version", [True, 1.0, "1", 2])
+def test_intent_rejects_a_schema_version_mutation(schema_version):
     value = json.loads(canonical_intent_bytes(_intent()))
-    value["schema_version"] += 1
+    value["schema_version"] = schema_version
 
     with pytest.raises(ValueError, match="version differs"):
         parse_epoch_intent(canonical_json_bytes(value))

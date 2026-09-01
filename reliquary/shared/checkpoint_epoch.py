@@ -426,7 +426,10 @@ def commitment_set_to_dict(value: EpochCommitmentSet) -> dict[str, Any]:
 def validate_commitment_set(value: EpochCommitmentSet) -> None:
     if not isinstance(value, EpochCommitmentSet):
         raise TypeError("commitment_set must be an EpochCommitmentSet")
-    if value.schema_version != CHECKPOINT_EPOCH_COMMITMENT_SET_SCHEMA_VERSION:
+    if (
+        type(value.schema_version) is not int
+        or value.schema_version != CHECKPOINT_EPOCH_COMMITMENT_SET_SCHEMA_VERSION
+    ):
         raise ValueError("unsupported checkpoint epoch commitment-set schema")
     _require_hex64("epoch_id", value.epoch_id)
     _require_hex64("manifest_sha256", value.manifest_sha256)
@@ -592,6 +595,12 @@ def parse_signed_commitment_set(
         },
         "commitment_set",
     )
+    schema_version = set_obj["schema_version"]
+    if (
+        type(schema_version) is not int
+        or schema_version != CHECKPOINT_EPOCH_COMMITMENT_SET_SCHEMA_VERSION
+    ):
+        raise ValueError("unsupported checkpoint epoch commitment-set schema")
     records: list[EpochCommitmentRecord] = []
     for index, item in enumerate(
         _list(set_obj["commitments"], "commitment_set.commitments")
@@ -613,7 +622,7 @@ def parse_signed_commitment_set(
         )
         records.append(EpochCommitmentRecord(**record_obj))
     commitment_set = EpochCommitmentSet(
-        schema_version=set_obj["schema_version"],
+        schema_version=schema_version,
         epoch_id=set_obj["epoch_id"],
         manifest_sha256=set_obj["manifest_sha256"],
         commitment_close_round=set_obj["commitment_close_round"],
@@ -1193,6 +1202,12 @@ def parse_epoch_plan(
         },
         "manifest",
     )
+    schema_version = obj["schema_version"]
+    if (
+        type(schema_version) is not int
+        or schema_version != CHECKPOINT_EPOCH_SCHEMA_VERSION
+    ):
+        raise ValueError("unsupported checkpoint epoch schema")
 
     protocol_obj = _mapping(obj["protocol"], "protocol")
     _exact_keys(
@@ -1277,7 +1292,7 @@ def parse_epoch_plan(
         )
 
     plan = EpochPlan(
-        schema_version=obj["schema_version"],
+        schema_version=schema_version,
         experimental_capability_id=obj["experimental_capability_id"],
         protocol=ProtocolBinding(**protocol_obj),
         checkpoint=CheckpointBinding(**checkpoint_obj),
@@ -1329,7 +1344,10 @@ def validate_epoch_plan(
 ) -> None:
     if not isinstance(plan, EpochPlan):
         raise TypeError("plan must be an EpochPlan")
-    if plan.schema_version != CHECKPOINT_EPOCH_SCHEMA_VERSION:
+    if (
+        type(plan.schema_version) is not int
+        or plan.schema_version != CHECKPOINT_EPOCH_SCHEMA_VERSION
+    ):
         raise ValueError("unsupported checkpoint epoch schema")
     if environment_universes is None:
         environment_universes = {}

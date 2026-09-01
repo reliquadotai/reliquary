@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 
 import pytest
 
@@ -127,6 +128,30 @@ def test_generation_intent_set_rejects_duplicate_publication_key():
 
     with pytest.raises(ValueError, match="invalid signed generation intent set"):
         parse_signed_generation_intent_set(ambiguous)
+
+
+@pytest.mark.parametrize("schema_version", [True, 1.0, "1"])
+def test_generation_intent_set_parser_requires_exact_integer_schema(
+    schema_version,
+):
+    intent_set = build_generation_intent_set(
+        [_intent("alice", 0)],
+        epoch_id=EPOCH,
+        manifest_sha256_hex=MANIFEST,
+        intent_close_round=120,
+        validator_hotkey="validator",
+    )
+    publication = SignedGenerationIntentSet(
+        intent_set=intent_set,
+        intent_set_sha256=generation_intent_set_sha256(intent_set),
+        validator_signature="aa",
+    )
+    value = json.loads(canonical_signed_generation_intent_set_bytes(publication))
+    value["intent_set"]["schema_version"] = schema_version
+    raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+    with pytest.raises(ValueError, match="unsupported generation intent-set schema"):
+        parse_signed_generation_intent_set(raw)
 
 
 def test_generation_ticket_binding_changes_with_intent_mutation():
