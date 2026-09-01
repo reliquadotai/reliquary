@@ -465,30 +465,14 @@ def count_eos_completion_tokens(
     request: BatchSubmissionRequest,
     context: AdmissionContext,
 ) -> int:
-    """Sum completion tokens over genuinely EOS-terminated rollouts.
+    """Count validator-observed tokens in eligible EOS-terminated completions.
 
-    v6 pays per completion token (see ``token_rewards.py``) instead of a flat
-    per-slot share, so revenue no longer scales with ``1/length``. Only a
-    rollout the model itself chose to end may be paid for its length:
-    ``_classify_termination`` returns ``"ok"`` both for real EOS termination
-    and for an accepted BFT/natural cap shape (forced or naturally-timed
-    closure at the protocol budget with no EOS token present at all). Paying
-    a cap shape the same as a real EOS termination would erase the strictly
-    negative margin padding-to-the-cap must keep -- it was forced to stop by
-    policy, not by the model choosing to stop. So a rollout contributes its
-    completion length here iff it classifies ``"ok"`` AND its completion's
-    final token is a genuine EOS token.
-
-    The length paid is ``len(completion)`` -- the validator's OWN slice of
-    the token stream -- never the miner-declared ``completion_length`` the
-    slice was taken with. Nothing on the general path binds that declaration
-    to ``len(tokens)``, so a 500-token rollout may declare 16000; under the
-    flat slot share that bought nothing, under a proportional split it would
-    buy the pool.
-
-    Gated on ``FILL_CLOSED_ENABLED`` (R21): only v6 pays per token, so v4/v5
-    must not spend a third ``_classify_termination`` pass per submission,
-    and their archives carry ``eos_tokens=0``.
+    ``_classify_termination`` also accepts protocol-defined cap closures, so
+    this accounting path separately requires a genuine final EOS token. The
+    count comes from the validator-observed completion slice rather than a
+    miner-declared metadata value. The calculation is isolated behind the
+    disabled fill capability; existing production profiles continue to archive
+    ``eos_tokens=0``.
     """
     if not FILL_CLOSED_ENABLED:
         return 0

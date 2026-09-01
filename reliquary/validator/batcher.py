@@ -974,18 +974,10 @@ class _BufferedArrivalProof:
 def _arrival_buffer_sort_key(
     entry: _BufferedArrivalProof,
 ) -> tuple[int, float, int]:
-    """Highest rate first; unknown rate last; ties broken by arrival order.
+    """Return the deterministic proof-dispatch key for the fill experiment.
 
-    Sorting happens here, once, before any candidate is built or any
-    capacity is spent -- never inside ``extend``, which only ever sees
-    ranks already fixed in dispatch order.
-
-    This orders the spending of GRADING/PROOF budget, not seats: under
-    amendment v6.1 a proven group has bought nothing but a place in the
-    pick pool, so arrival is a perfectly good tie-break here (it decides
-    only who is proved first among equally productive miners). The SEAT
-    tie-break is ``_pick_sort_key``, and it deliberately does not fall
-    back to arrival.
+    Dispatch priority controls verification scheduling only. Final selection
+    uses ``_pick_sort_key`` and is evaluated separately.
     """
     if entry.rate is None:
         return (1, 0.0, entry.sequence)
@@ -1003,12 +995,11 @@ _proven_group_sequence = itertools.count(1)
 class _ProvenGroup:
     """One PASSED group sitting in this environment's pick pool (v6.1).
 
-    Proving on arrival no longer grants a seat -- it only puts the group
-    here. A pick (``pick_training_batch``) then takes the ``B_BATCH``
-    best by ``rate``, and ``picked`` is how a claimed group is walled off
-    from every later pick. That flag replaces the contiguous-prefix
-    watermark the old watermark-order emission used: a pick claims an
-    arbitrary SUBSET of the pool, which no single integer can describe.
+    Proof completion establishes eligibility, not selection. A later
+    ``pick_training_batch`` call applies the experimental selection key, and
+    ``picked`` prevents a selected group from entering another batch. Because
+    selection may claim a subset of the pool, a single prefix watermark cannot
+    represent this state.
 
     ``sequence`` is assigned here, at the append, and exists only to make
     the pick order TOTAL -- see ``_pick_sort_key``.
@@ -1025,26 +1016,12 @@ class _ProvenGroup:
 def _pick_sort_key(
     group: _ProvenGroup,
 ) -> tuple[int, float, int, str, int]:
-    """Highest precommit rate first; unknown rate last; ties broken by
-    payload bytes DESCENDING, then receipt id, then append sequence.
+    """Return the fill experiment's total, deterministic selection key.
 
-    The tie-break is the load-bearing half. The rate metric is
-    length-NEUTRAL by construction (payload bytes over elapsed since
-    window open), so at fixed hardware two groups of wildly different
-    length register the SAME rate -- ties are the common case here, not a
-    corner. Breaking them by arrival, the way the arrival buffer does,
-    would hand the seat straight back to whoever finished first, which is
-    systematically the shortest answer: the exact bias amendment v6.1
-    exists to remove. The larger payload wins instead, so a tie resolves
-    toward length diversity.
-
-    The last two components only make the order TOTAL. The receipt id is
-    not enough on its own: it is empty for any group whose precommit fell
-    out of the admission queue, so two such groups with equal bytes tied
-    on every component and a stable sort quietly resolved them by pool
-    position -- append order, i.e. the arrival tie-break this key
-    forswears two paragraphs up. ``sequence`` ends it explicitly instead,
-    and being unique it can never itself tie.
+    Known priorities precede unknown priorities. Remaining components are the
+    receipt-bound payload size, receipt identifier, and unique append sequence;
+    together they make the ordering total without consulting proof completion
+    order as an implicit fallback.
     """
     if group.rate is None:
         return (
@@ -6237,22 +6214,15 @@ class GrpoWindowBatcher:
             )
         else:
             operator_round_by_id = {}
-            # Difficulty ranks first, so throughput never trades against
-            # training utility — it only orders candidates already judged equally
-            # useful. Among those, ordering by arrival penalises long generation
-            # (a 16k rollout arrives after a 500-token one at identical hardware),
-            # and with binary rewards the difficulty score takes only nine values,
-            # so those ties are common rather than marginal. Tokens-per-round is
-            # length-neutral instead. Absent from the v2 profile, so the deployed
-            # 2B ordering is untouched.
+            # The production profile keeps difficulty primary and applies its
+            # contract-bound throughput key only within equal-difficulty tiers.
+            # Profiles without that capability retain their existing ordering.
             window_open = self.window_open_drand_round
             for pending_submission, _score in scored:
                 throughput_by_id[id(pending_submission)] = (
                     throughput_rank(
-                        # Anti-padding cap per rollout; the group ceiling below is
-                        # M_ROLLOUTS x cap so real 8-rollout totals stay
-                        # discriminant (the single-rollout cap on the sum clamped
-                        # 53% of groups onto one constant = raw arrival ordering).
+                        # Apply the profile cap independently to each rollout,
+                        # then use the corresponding group-wide ceiling.
                         _generated_tokens_of(
                             pending_submission,
                             per_rollout_cap=throughput_profile.token_cap,
