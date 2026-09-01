@@ -362,3 +362,32 @@ def test_roster_matches_what_the_generator_actually_draws():
         assert callable(family.generator)
         # -1.0 marks a family whose band has not been measured yet.
         assert family.band == -1.0 or 0.0 <= family.band <= 1.0
+
+
+def test_every_family_including_inactive_ones_still_works():
+    """Inactive families are unreachable from generate_logic_task.
+
+    Without this they would be covered by nothing and rot silently until
+    somebody flipped the flag.
+    """
+    import json as _json
+    from reliquary.environment.logic_tasks import (
+        _FAMILY_REGISTRY, check_answer, verifier_spec,
+    )
+    from reliquary.environment.records_tasks import HashCounterRng
+
+    for family in _FAMILY_REGISTRY:
+        seen = set()
+        for trial in range(200):
+            rng = HashCounterRng(
+                hashlib.sha256(f"{family.name}{trial}".encode()).digest()
+            )
+            task = family.generator(rng)
+            assert task.family == family.name
+            assert task.prompt
+            assert 1 <= task.difficulty <= 5
+            spec = _json.loads(verifier_spec(task))
+            assert check_answer(spec, task.expected), family.name
+            seen.add(task.prompt)
+        # A family that cannot vary its prompt would be burned at seal.
+        assert len(seen) > 190, f"{family.name}: {len(seen)}/200 distinct"

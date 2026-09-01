@@ -589,6 +589,129 @@ def _time_sequence(rng: HashCounterRng) -> GeneratedLogicTask:
     )
 
 
+# ────────────────  math_path (inactive)  ────────────────
+
+
+def _math_path(rng: HashCounterRng) -> GeneratedLogicTask:
+    """Multi-step arithmetic with a scalar answer.
+
+    Deliberately deep but flat: it separates whether numbrix and cryptarithm
+    scored low because of reasoning depth or because of answer shape.
+    """
+    size = 4 + rng.randbelow(2)
+    grid = [
+        [1 + rng.randbelow(20) for _ in range(size)] for _ in range(size)
+    ]
+    row, column = rng.randbelow(size), rng.randbelow(size)
+    steps = 5 + rng.randbelow(4)
+    moves, visited = [], [(row, column)]
+    for _ in range(steps):
+        options = [
+            (name, r, c) for name, r, c in (
+                ("up", row - 1, column), ("down", row + 1, column),
+                ("left", row, column - 1), ("right", row, column + 1),
+            ) if 0 <= r < size and 0 <= c < size
+        ]
+        name, row, column = options[rng.randbelow(len(options))]
+        moves.append(name)
+        visited.append((row, column))
+    total = sum(grid[r][c] for r, c in visited)
+    rendered = "\n".join(" ".join(f"{value:2d}" for value in line) for line in grid)
+    start = visited[0]
+    prompt = (
+        f"Start on the cell at row {start[0] + 1}, column {start[1] + 1} of "
+        f"the {size}x{size} grid below, then make these moves in order: "
+        f"{', '.join(moves)}. Rows are numbered from the top and columns "
+        "from the left. Add up every cell you stand on, including the "
+        "starting cell and the cell after each move.\n\n"
+        f"```\n{rendered}\n```\n\n"
+        "Answer with the total as an integer.\n\n"
+        f"{_ANSWER_SHAPE}"
+    )
+    return GeneratedLogicTask(
+        prompt=prompt,
+        expected=total,
+        operation_id="math-path-sum-v1",
+        family="math_path",
+        difficulty=min(5, 1 + steps // 2),
+        check="equality",
+        constraints={},
+    )
+
+
+# ────────────────  space_reasoning (inactive)  ────────────────
+
+_SHELF_ITEMS = (
+    "atlas", "almanac", "diary", "folio", "gazette", "journal", "ledger",
+    "manual", "novel", "primer", "register", "songbook",
+)
+
+
+def _space_reasoning(rng: HashCounterRng) -> GeneratedLogicTask:
+    items = list(_SHELF_ITEMS)
+    rng.shuffle(items)
+    count = 4 + rng.randbelow(3)
+    shelf = items[:count]
+    # The arrangement is chosen first; the clues are read off it, so the
+    # puzzle is consistent by construction and never needs solving.
+    lines = [f"The {shelf[0]} is at the far left."]
+    for index in range(count - 1):
+        lines.append(
+            f"The {shelf[index + 1]} is immediately to the right of "
+            f"the {shelf[index]}."
+        )
+    order = list(range(len(lines)))
+    rng.shuffle(order)
+    position = 1 + rng.randbelow(count)
+    prompt = (
+        f"{count} books sit in a row on a shelf.\n\n"
+        + "\n".join(lines[i] for i in order)
+        + f"\n\nWhich book is number {position} counting from the left? "
+        "Answer with the book name as a JSON string.\n\n"
+        f"{_ANSWER_SHAPE}"
+    )
+    return GeneratedLogicTask(
+        prompt=prompt,
+        expected=shelf[position - 1],
+        operation_id="shelf-order-v1",
+        family="space_reasoning",
+        difficulty=min(5, count - 2),
+        check="equality",
+        constraints={},
+    )
+
+
+# ────────────────  word_sorting_mistake (inactive)  ────────────────
+
+
+def _word_sorting_mistake(rng: HashCounterRng) -> GeneratedLogicTask:
+    pool = list(_WORDS)
+    rng.shuffle(pool)
+    count = 6 + rng.randbelow(5)
+    words = sorted(pool[:count])
+    # Swapping one adjacent pair makes exactly one word sit before a word
+    # that should precede it, so the first out-of-order word is unique.
+    cut = rng.randbelow(count - 1)
+    words[cut], words[cut + 1] = words[cut + 1], words[cut]
+    prompt = (
+        "The words below should be in alphabetical order, but exactly one "
+        "adjacent pair has been swapped. Reading left to right, name the "
+        "first word that appears out of order.\n\n"
+        f"```\n{', '.join(words)}\n```\n\n"
+        "Answer with that word as a JSON string.\n\n"
+        f"{_ANSWER_SHAPE}"
+    )
+    return GeneratedLogicTask(
+        prompt=prompt,
+        expected=words[cut],
+        operation_id="word-sorting-mistake-v1",
+        family="word_sorting_mistake",
+        difficulty=min(5, 1 + count // 3),
+        check="equality",
+        constraints={},
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class Family:
     """One task family and whether the contract currently draws from it.
@@ -614,11 +737,14 @@ _FAMILY_REGISTRY = (
     Family("cryptarithm", _cryptarithm, True, 0.141),
     Family("dyck_language", _dyck_language, True, 0.641),
     Family("dyck_language_errors", _dyck_language_errors, True, 0.719),
+    Family("math_path", _math_path, False, -1.0),
     Family("numbrix", _numbrix, True, 0.250),
     Family("object_properties", _object_properties, True, 0.984),
     Family("operation", _operation, True, 1.000),
+    Family("space_reasoning", _space_reasoning, False, -1.0),
     Family("time_sequence", _time_sequence, True, 1.000),
     Family("web_of_lies", _web_of_lies, True, 1.000),
+    Family("word_sorting_mistake", _word_sorting_mistake, False, -1.0),
 )
 
 # cipher is inactive: measured 0.0% in band with 76% valid JSON and 99.5%

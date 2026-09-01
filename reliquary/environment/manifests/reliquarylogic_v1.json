@@ -14,7 +14,7 @@
     "reliquary/environment/reliquarylogic.py",
     "reliquary/environment/structured_output.py"
   ],
-  "implementation_sha256": "6529f3d601d7808d0b4272e25fb0c99fab91e1926b83f25758ef8eb4706afac1",
+  "implementation_sha256": "54e2bc8734b1bae6bb1fa259446ed8fa425fd4dde1ae6fa739851666bca3f0f8",
   "virtual_length": 2147483648,
   "protocol_reward_lattice": [
     0.0,
@@ -47,7 +47,10 @@
     "dyck_language_errors": "equality",
     "object_properties": "equality",
     "operation": "equality",
-    "time_sequence": "equality"
+    "time_sequence": "equality",
+    "math_path": "equality",
+    "space_reasoning": "equality",
+    "word_sorting_mistake": "equality"
   },
   "limits": {
     "completion_bytes": 16384,
@@ -65,7 +68,10 @@
     "spdx_license": "MIT"
   },
   "inactive_families": [
-    "cipher"
+    "cipher",
+    "math_path",
+    "space_reasoning",
+    "word_sorting_mistake"
   ],
   "measured_band_qwen3_4b_base": {
     "boolean_expressions": 1.0,

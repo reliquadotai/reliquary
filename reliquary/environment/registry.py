@@ -359,8 +359,8 @@ _SPEC_VALUES = (
         attainable_rewards=(0.0, 1.0),
         contract_version="reliquary-logic-v1",
         environment_manifest_sha256=(
-            "be4f3bf47d14886716703fdf0aa0824"
-            "458a7df03073ce30d5f3576f6366e706c"
+            "81a511c5faf9422466d26be61d673a8"
+            "804ed56d123e9f66cff365373f342cfb4"
         ),
     ),
     EnvironmentSpec(
