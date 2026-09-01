@@ -866,25 +866,21 @@ if FILL_CLOSED_TARGET_GROUPS_PER_ENV <= 0:
 # a window can actually produce.
 FILL_CLOSED_EMISSIONS_PER_WINDOW = CHECKPOINT_PUBLISH_INTERVAL_WINDOWS
 
-# The two must stay in step, and only one of them is env-overridable. A
-# window can emit at most FILL_CLOSED_EMISSIONS_PER_WINDOW batches of
-# B_BATCH groups per environment, which is exactly the key range
-# ``encoded_window_journal_key`` reserves for it. Raise the target past
-# that and the window fills past its own range: the assembler asks for
-# batch_index == FILL_CLOSED_EMISSIONS_PER_WINDOW and the encoder raises
-# ValueError -- on a PROOF-worker thread, which escalates to a scheduler
-# fault and a validator restart. Fail here instead, at import, where the
-# operator who set the variable can read why.
-if (
-    FILL_CLOSED_TARGET_GROUPS_PER_ENV
-    > FILL_CLOSED_EMISSIONS_PER_WINDOW * B_BATCH
-):
+# The target, pick horizon and journal key range are one shape. v6.1 closes
+# after ``FILL_CLOSED_EMISSIONS_PER_WINDOW`` complete B_BATCH picks, so a
+# smaller target is just as incoherent as a larger one: the former cannot close
+# and the latter writes past its key range. Keep the old environment variable
+# only as a validated deployment input; it may not redefine one field alone.
+_FILL_CLOSED_TRAINABLE_GROUPS_PER_ENV = (
+    FILL_CLOSED_EMISSIONS_PER_WINDOW * B_BATCH
+)
+if FILL_CLOSED_TARGET_GROUPS_PER_ENV != _FILL_CLOSED_TRAINABLE_GROUPS_PER_ENV:
     raise ValueError(
         "RELIQUARY_FILL_CLOSED_TARGET_GROUPS_PER_ENV="
-        f"{FILL_CLOSED_TARGET_GROUPS_PER_ENV} exceeds "
+        f"{FILL_CLOSED_TARGET_GROUPS_PER_ENV} must equal "
         f"FILL_CLOSED_EMISSIONS_PER_WINDOW ({FILL_CLOSED_EMISSIONS_PER_WINDOW})"
-        f" * B_BATCH ({B_BATCH}); a window would fill past the journal key "
-        "range reserved for it and the encoder would raise on a proof thread"
+        f" * B_BATCH ({B_BATCH}) so the pick horizon, admission target and "
+        "journal key range cannot diverge"
     )
 
 # Backstop only. A window normally ends on its fill; this stops stalled
@@ -931,10 +927,10 @@ FILL_CLOSED_ADMISSION_BUDGET_PER_ENV = int(_os.environ.get(
     str(2 * FILL_CLOSED_TARGET_GROUPS_PER_ENV),
 ))
 _FILL_CLOSED_MAX_ADMISSION_BUDGET_PER_ENV = (
-    2 * FILL_CLOSED_EMISSIONS_PER_WINDOW * B_BATCH
+    2 * _FILL_CLOSED_TRAINABLE_GROUPS_PER_ENV
 )
 if not (
-    FILL_CLOSED_TARGET_GROUPS_PER_ENV
+    _FILL_CLOSED_TRAINABLE_GROUPS_PER_ENV
     <= FILL_CLOSED_ADMISSION_BUDGET_PER_ENV
     <= _FILL_CLOSED_MAX_ADMISSION_BUDGET_PER_ENV
 ):
@@ -956,7 +952,7 @@ FILL_CLOSED_GRADING_START_BUDGET_PER_ENV = int(_os.environ.get(
 if not (
     FILL_CLOSED_ADMISSION_BUDGET_PER_ENV
     <= FILL_CLOSED_GRADING_START_BUDGET_PER_ENV
-    <= 4 * FILL_CLOSED_EMISSIONS_PER_WINDOW * B_BATCH
+    <= 4 * _FILL_CLOSED_TRAINABLE_GROUPS_PER_ENV
 ):
     raise ValueError(
         "RELIQUARY_FILL_CLOSED_GRADING_START_BUDGET_PER_ENV must be at "

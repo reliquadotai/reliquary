@@ -135,6 +135,16 @@ def test_a_target_past_the_emission_ceiling_refuses_to_import():
     assert "journal" in result.stderr
 
 
+def test_a_target_below_the_pick_horizon_also_refuses_to_import():
+    result = _constants_under(
+        RELIQUARY_FILL_CLOSED_TARGET_GROUPS_PER_ENV="16",
+    )
+
+    assert result.returncode != 0
+    assert "must equal FILL_CLOSED_EMISSIONS_PER_WINDOW" in result.stderr
+    assert "pick horizon" in result.stderr
+
+
 def test_fill_closed_runtime_bounds_are_coherent_and_finite():
     result = _v6_script(
         "from reliquary import constants as c; "
