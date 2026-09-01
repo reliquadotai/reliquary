@@ -572,6 +572,8 @@ class MinerEnvironmentState(BaseModel):
     prompt_range: tuple[int, int]
     cooldown_bitmap: str
     cooldown_count: int = Field(..., ge=0)
+    accepting_submissions: bool
+    admission_remaining: int = Field(..., ge=0)
 
     @model_validator(mode="after")
     def _validate_bitmap(self) -> "MinerEnvironmentState":

@@ -34,6 +34,40 @@ if TYPE_CHECKING:
     from reliquary.environment.base import Environment
 
 logger = logging.getLogger(__name__)
+_GIT_OID_HEX = frozenset("0123456789abcdef")
+
+
+class CheckpointIdentityError(RuntimeError):
+    """A checkpoint number was rebound to a different immutable revision."""
+
+
+class CheckpointActivationRestartRequired(RuntimeError):
+    """Checkpoint activation cannot safely continue in the current process."""
+
+
+def _is_immutable_checkpoint_revision(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 40
+        and all(character in _GIT_OID_HEX for character in value)
+    )
+
+
+def _eligible_generation_mix(
+    mix: list[tuple[str, int]],
+    miner_state,
+) -> list[tuple[str, int]]:
+    """Remove lanes that already advertise closed admission."""
+    if miner_state is None:
+        return list(mix)
+    return [
+        (environment, weight)
+        for environment, weight in mix
+        if (
+            environment in miner_state.environments
+            and miner_state.environments[environment].accepting_submissions
+        )
+    ]
 
 
 def _state_matches_active_protocol(state) -> bool:
@@ -61,6 +95,7 @@ def _release_state_mismatch_reason(
     environment_size: int,
     cooldown_prompts: set[int],
     prompt_range: tuple[int, int] | None,
+    accepting_submissions: bool | None = None,
     now: float | None = None,
 ) -> str | None:
     """Return why locally prepared work must not cross into live ingress."""
@@ -89,6 +124,8 @@ def _release_state_mismatch_reason(
         return "protocol_mismatch"
     if getattr(release_state, "checkpoint_epoch_id", None) is not None:
         return "epoch_requires_ticketed_planner"
+    if accepting_submissions is False:
+        return "admission_closed"
     if request.window_start != release_state.window_n:
         return "request_window_mismatch"
     if request.checkpoint_hash != (release_state.checkpoint_revision or ""):
@@ -137,6 +174,7 @@ def _initial_runtime_bound_nonce(runtime_fingerprint) -> str:
 async def maybe_pull_checkpoint(
     state,
     local_n: int,
+    local_repo_id: str,
     local_hash: str,
     local_model,
     *,
@@ -148,24 +186,38 @@ async def maybe_pull_checkpoint(
     state.checkpoint_repo_id + state.checkpoint_revision identify the
     HF snapshot. download_fn/load_fn still injected for testability.
 
-    Returns ``(new_local_n, new_local_hash, new_model)``. If no update is
-    needed (remote is older, identities match, or the remote snapshot is not
-    published yet), returns inputs unchanged.
+    Returns ``(new_local_n, new_repo_id, new_local_hash, new_model)``. If no
+    update is needed (remote is older, identities match, or the remote snapshot
+    is not published yet), returns inputs unchanged.
     """
     if state.checkpoint_n < local_n:
-        return local_n, local_hash, local_model
-    if (
-        state.checkpoint_n == local_n
-        and state.checkpoint_revision == local_hash
-    ):
-        return local_n, local_hash, local_model
+        return local_n, local_repo_id, local_hash, local_model
     if state.checkpoint_repo_id is None or state.checkpoint_revision is None:
-        return local_n, local_hash, local_model
+        return local_n, local_repo_id, local_hash, local_model
+    if not _is_immutable_checkpoint_revision(state.checkpoint_revision):
+        raise CheckpointIdentityError(
+            "checkpoint revision is not an immutable commit identifier"
+        )
+    if state.checkpoint_n == local_n:
+        if (
+            state.checkpoint_repo_id == local_repo_id
+            and state.checkpoint_revision == local_hash
+        ):
+            return local_n, local_repo_id, local_hash, local_model
+        if local_repo_id or local_hash:
+            raise CheckpointIdentityError(
+                "checkpoint number was rebound to a different repository or revision"
+            )
     local_path = await download_fn(state.checkpoint_repo_id, state.checkpoint_revision)
     new_model = await asyncio.to_thread(load_fn, local_path)
     if new_model is None:
         raise RuntimeError("checkpoint loader returned no activated model")
-    return state.checkpoint_n, state.checkpoint_revision, new_model
+    return (
+        state.checkpoint_n,
+        state.checkpoint_repo_id,
+        state.checkpoint_revision,
+        new_model,
+    )
 
 
 async def _hf_download(repo_id: str, revision: str) -> str:
@@ -574,6 +626,7 @@ class MiningEngine:
         rng = random.Random()
         results = []
         local_n = 0
+        local_repo_id = ""
         local_hash = ""
         miner_state_supported: bool | None = None
         cached_miner_state = None
@@ -716,23 +769,46 @@ class MiningEngine:
 
                 # Pull new checkpoint if needed (works at any state).
                 try:
-                    local_n, local_hash, self.hf_model = await maybe_pull_checkpoint(
-                        state=state, local_n=local_n, local_hash=local_hash,
+                    (
+                        local_n,
+                        local_repo_id,
+                        local_hash,
+                        self.hf_model,
+                    ) = await maybe_pull_checkpoint(
+                        state=state,
+                        local_n=local_n,
+                        local_hash=local_hash,
+                        local_repo_id=local_repo_id,
                         local_model=self.hf_model,
                         download_fn=_hf_download,
                         load_fn=self._load_checkpoint,
                     )
+                except (CheckpointIdentityError, CheckpointActivationRestartRequired):
+                    logger.exception(
+                        "checkpoint identity or activation is unsafe; "
+                        "terminating for a clean restart"
+                    )
+                    raise
                 except Exception:
                     logger.exception("checkpoint pull failed; keeping local")
 
                 if (
-                    state.checkpoint_revision
-                    and local_hash != state.checkpoint_revision
+                    (
+                        state.checkpoint_repo_id
+                        and local_repo_id != state.checkpoint_repo_id
+                    )
+                    or (
+                        state.checkpoint_revision
+                        and local_hash != state.checkpoint_revision
+                    )
                 ):
                     logger.warning(
-                        "checkpoint activation incomplete; local=%s remote=%s",
+                        "checkpoint activation incomplete; local=%s@%s "
+                        "remote=%s@%s",
+                        local_repo_id or "none",
                         local_hash[:12] or "none",
-                        state.checkpoint_revision[:12],
+                        state.checkpoint_repo_id or "none",
+                        (state.checkpoint_revision or "")[:12] or "none",
                     )
                     await asyncio.sleep(1)
                     continue
@@ -760,9 +836,23 @@ class MiningEngine:
                     await asyncio.sleep(0.1)
                     continue
 
+                generation_mix = _eligible_generation_mix(
+                    self.mix,
+                    cached_miner_state if miner_state_supported is True else None,
+                )
+                if not generation_mix:
+                    logger.info(
+                        "all environment admission lanes are closed; waiting"
+                    )
+                    await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                    continue
+
                 try:
                     env_name, prompt_idx = pick_env_and_prompt(
-                        self.envs, self.mix, self._cooldown_per_env, rng=rng,
+                        self.envs,
+                        generation_mix,
+                        self._cooldown_per_env,
+                        rng=rng,
                         randomness=randomness,
                         prompt_ranges=prompt_ranges or None,
                     )
@@ -819,6 +909,7 @@ class MiningEngine:
                             )
                         release_cooldown = env_release.cooldown_prompts()
                         release_range = env_release.prompt_range
+                        release_accepting = env_release.accepting_submissions
                     else:
                         release_state = await get_window_state_v2(
                             url,
@@ -834,6 +925,7 @@ class MiningEngine:
                             len(env),
                             PROMPT_RANGE_SIZE,
                         )
+                        release_accepting = None
                 except Exception as exc:
                     logger.info(
                         "state recheck failed; discarding prepared work: %s",
@@ -849,6 +941,7 @@ class MiningEngine:
                     environment_size=len(env),
                     cooldown_prompts=release_cooldown,
                     prompt_range=release_range,
+                    accepting_submissions=release_accepting,
                 )
                 if mismatch is not None:
                     logger.info(
@@ -898,15 +991,53 @@ class MiningEngine:
 
         logger.info("Loading checkpoint from %s", local_path)
 
+        def _load_one(device: int):
+            return load_text_generation_model(
+                local_path,
+                torch_dtype=torch.bfloat16,
+                attn_implementation=ATTN_IMPLEMENTATION,
+            ).to(f"cuda:{device}").eval()
+
+        old_hf = self.hf_model
+        old_gen = self.vllm_model
+
+        # A single-device miner cannot hold both the old pair and a staged new
+        # pair at once. Move the old pair to host memory before loading. Any
+        # failure after that point is terminal for this process: a supervisor
+        # restart reconstructs one coherent pair from the advertised revision.
+        if self.proof_gpu == self.vllm_gpu:
+            new_hf = None
+            new_gen = None
+            try:
+                old_hf.to("cpu")
+                old_gen.to("cpu")
+                torch.cuda.empty_cache()
+                new_hf = _load_one(self.proof_gpu)
+                new_gen = _load_one(self.vllm_gpu)
+            except Exception as exc:
+                del new_hf
+                del new_gen
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                raise CheckpointActivationRestartRequired(
+                    "single-device checkpoint activation requires restart"
+                ) from exc
+
+            self.hf_model = new_hf
+            self.vllm_model = new_gen
+            del old_hf
+            del old_gen
+            self._loaded_checkpoint_path = local_path
+            logger.info("Checkpoint %s loaded into both models", local_path)
+            return self.hf_model
+
         # Stage both copies before publishing either reference. If one load
         # fails, the previous generation/proof pair and checkpoint identity
         # remain active together.
         try:
-            new_hf = load_text_generation_model(
-                local_path,
-                torch_dtype=torch.bfloat16,
-                attn_implementation=ATTN_IMPLEMENTATION,
-            ).to(f"cuda:{self.proof_gpu}").eval()
+            new_hf = _load_one(self.proof_gpu)
         except Exception:
             logger.exception(
                 "Failed to reload hf_model from %s; keeping old model",
@@ -915,11 +1046,7 @@ class MiningEngine:
             raise
 
         try:
-            new_gen = load_text_generation_model(
-                local_path,
-                torch_dtype=torch.bfloat16,
-                attn_implementation=ATTN_IMPLEMENTATION,
-            ).to(f"cuda:{self.vllm_gpu}").eval()
+            new_gen = _load_one(self.vllm_gpu)
         except Exception:
             logger.exception(
                 "Failed to stage vllm_model from %s; keeping the prior "
@@ -933,8 +1060,6 @@ class MiningEngine:
                 pass
             raise
 
-        old_hf = self.hf_model
-        old_gen = self.vllm_model
         self.hf_model = new_hf
         self.vllm_model = new_gen
         del old_hf

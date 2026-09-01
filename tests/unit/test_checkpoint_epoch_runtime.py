@@ -101,6 +101,11 @@ def test_intent_rejects_unknown_schedule_and_training_modes():
         _intent(training_mode="unknown")
 
 
+def test_intent_requires_an_immutable_checkpoint_revision():
+    with pytest.raises(ValueError, match="immutable commit OID"):
+        _intent(checkpoint_revision="main")
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

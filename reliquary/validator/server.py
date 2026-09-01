@@ -126,6 +126,7 @@ from reliquary.protocol.submission import (
     SubmissionPrecommitResponse,
     Verdict,
     VerdictsResponse,
+    WindowState,
     encode_cooldown_bitmap,
 )
 from reliquary.protocol.tokens import verify_tokens
@@ -1496,6 +1497,17 @@ class ValidatorServer:
                     str(batcher.randomness),
                     getattr(batcher, "prompt_range", None),
                     float(batcher.window_opened_wall_ts),
+                    bool(batcher.is_sealed()),
+                    bool(batcher.collection_closed()),
+                    int(getattr(batcher, "candidate_capacity_used", 0)),
+                    int(getattr(batcher, "max_productive_candidates", 0)),
+                    int(getattr(batcher, "proof_grading_attempts", 0)),
+                    int(getattr(batcher, "max_grading_starts", 0)),
+                    (
+                        int(batcher.fill_state.revision)
+                        if getattr(batcher, "fill_state", None) is not None
+                        else None
+                    ),
                     float(
                         getattr(
                             batcher,
@@ -6774,10 +6786,47 @@ class ValidatorServer:
                     set(batcher.cooldown_prompts_snapshot),
                     prompt_range,
                 )
+                productive_remaining = max(
+                    0,
+                    int(batcher.max_productive_candidates)
+                    - int(batcher.candidate_capacity_used),
+                )
+                grading_remaining = max(
+                    0,
+                    int(batcher.max_grading_starts)
+                    - int(batcher.proof_grading_attempts),
+                )
+                fill_state = getattr(batcher, "fill_state", None)
+                if fill_state is not None:
+                    with fill_state.lock:
+                        fill_snapshot = fill_state.snapshot()
+                    fill_remaining = max(
+                        0,
+                        int(fill_snapshot["budgets"][environment])
+                        - int(fill_snapshot["admitted"][environment]),
+                    )
+                    admission_remaining = min(
+                        productive_remaining,
+                        grading_remaining,
+                        fill_remaining,
+                    )
+                else:
+                    admission_remaining = min(
+                        productive_remaining,
+                        grading_remaining,
+                    )
+                accepting_submissions = (
+                    self._current_state is WindowState.OPEN
+                    and not batcher.is_sealed()
+                    and not batcher.collection_closed()
+                    and admission_remaining > 0
+                )
                 environments[environment] = MinerEnvironmentState(
                     prompt_range=prompt_range,
                     cooldown_bitmap=bitmap,
                     cooldown_count=cooldown_count,
+                    accepting_submissions=accepting_submissions,
+                    admission_remaining=admission_remaining,
                 )
 
             checkpoint = self._current_checkpoint

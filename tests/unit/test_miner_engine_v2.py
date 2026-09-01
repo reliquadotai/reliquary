@@ -6,13 +6,31 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from reliquary.miner.engine import pick_prompt_idx
+from reliquary.miner.engine import _eligible_generation_mix, pick_prompt_idx
 from reliquary.shared.modeling import MODEL_SNAPSHOT_ALLOW_PATTERNS
 
 
 class FakeEnv:
     def __len__(self):
         return 100
+
+
+def test_generation_mix_skips_closed_admission_lanes():
+    state = SimpleNamespace(environments={
+        "math": SimpleNamespace(accepting_submissions=False),
+        "code": SimpleNamespace(accepting_submissions=True),
+    })
+
+    assert _eligible_generation_mix(
+        [("math", 2), ("code", 1)],
+        state,
+    ) == [("code", 1)]
+    assert _eligible_generation_mix([("math", 1)], state) == []
+
+
+def test_generation_mix_preserves_legacy_state_behavior():
+    mix = [("math", 2), ("code", 1)]
+    assert _eligible_generation_mix(mix, None) == mix
 
 
 def test_pick_prompt_in_range():
@@ -163,6 +181,9 @@ def test_release_recheck_binds_window_contract_range_and_cooldown():
     assert _release_state_mismatch_reason(
         **{**kwargs, "prompt_range": (20, 30)}
     ) == "prompt_out_of_range"
+    assert _release_state_mismatch_reason(
+        **{**kwargs, "accepting_submissions": False}
+    ) == "admission_closed"
     assert _release_state_mismatch_reason(
         **{
             **kwargs,

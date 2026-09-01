@@ -33,6 +33,7 @@ from reliquary.shared.checkpoint_epoch import (
     manifest_sha256,
     parse_epoch_plan,
     parse_signed_commitment_set,
+    validate_checkpoint_binding,
     validate_commitment_set_for_plan,
 )
 from reliquary.shared.checkpoint_epoch_market import (
@@ -252,6 +253,7 @@ def build_epoch_intent(
         revision=str(checkpoint_revision),
         commit_observed_round=int(commit_observed_round),
     )
+    validate_checkpoint_binding(checkpoint)
     universes = tuple(
         (str(name), int(environment_universes[name]))
         for name in sorted(environment_universes)
@@ -412,6 +414,7 @@ def parse_epoch_intent(raw: bytes) -> EpochCommitIntent:
             (str(name), int(size)) for name, size in sorted(universes.items())
         ),
     )
+    validate_checkpoint_binding(intent.checkpoint)
     if raw != canonical_intent_bytes(intent):
         raise ValueError("checkpoint epoch intent is not canonical")
     if intent.window_schedule.mode != CHECKPOINT_EPOCH_SCHEDULE_MODE:

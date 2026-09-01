@@ -931,7 +931,7 @@ def build_epoch_plan(
     experimental_capability_id: str = CHECKPOINT_EPOCH_CAPABILITY_ID,
 ) -> EpochPlan:
     _validate_protocol(protocol)
-    _validate_checkpoint(checkpoint)
+    validate_checkpoint_binding(checkpoint)
     _validate_beacon(epoch_beacon)
     _require_text("experimental_capability_id", experimental_capability_id)
     first_window = _require_int("first_window", first_window, minimum=0)
@@ -1479,6 +1479,16 @@ def _require_hex64(name: str, value: Any) -> str:
     return value
 
 
+def _require_hex40(name: str, value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 40
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{name} must be a 40-character immutable commit OID")
+    return value
+
+
 def _validate_protocol(value: ProtocolBinding) -> None:
     if not isinstance(value, ProtocolBinding):
         raise ValueError("protocol must be a ProtocolBinding")
@@ -1490,12 +1500,12 @@ def _validate_protocol(value: ProtocolBinding) -> None:
     )
 
 
-def _validate_checkpoint(value: CheckpointBinding) -> None:
+def validate_checkpoint_binding(value: CheckpointBinding) -> None:
     if not isinstance(value, CheckpointBinding):
         raise ValueError("checkpoint must be a CheckpointBinding")
     _require_int("checkpoint.number", value.number, minimum=0)
     _require_text("checkpoint.repo_id", value.repo_id)
-    _require_text("checkpoint.revision", value.revision)
+    _require_hex40("checkpoint.revision", value.revision)
     _require_int(
         "checkpoint.commit_observed_round",
         value.commit_observed_round,

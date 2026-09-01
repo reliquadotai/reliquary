@@ -65,6 +65,8 @@ def test_miner_state_carries_each_environment_once():
     assert 11 in state.environments["openmathinstruct"].cooldown_prompts()
     assert 22 not in state.environments["openmathinstruct"].cooldown_prompts()
     assert 22 in state.environments["opencodeinstruct"].cooldown_prompts()
+    assert state.environments["openmathinstruct"].accepting_submissions is True
+    assert state.environments["openmathinstruct"].admission_remaining > 0
 
 
 def test_miner_state_etag_supports_conditional_polling():
@@ -75,6 +77,55 @@ def test_miner_state_etag_supports_conditional_polling():
     assert second.status_code == 304
     assert second.content == b""
     assert second.headers["etag"] == etag
+
+
+def test_miner_state_etag_and_admission_change_when_a_batcher_seals():
+    server = _server()
+    client = TestClient(server.app)
+    first = client.get("/miner-state")
+    etag = first.headers["etag"]
+
+    server._active_batchers["openmathinstruct"].force_seal("test")
+    updated = client.get("/miner-state", headers={"If-None-Match": etag})
+
+    assert updated.status_code == 200
+    assert updated.headers["etag"] != etag
+    environment = updated.json()["environments"]["openmathinstruct"]
+    assert environment["accepting_submissions"] is False
+
+
+def test_miner_state_closes_when_productive_capacity_is_exhausted():
+    server = _server()
+    client = TestClient(server.app)
+    first = client.get("/miner-state")
+    etag = first.headers["etag"]
+
+    batcher = server._active_batchers["openmathinstruct"]
+    batcher._proof_grading_charged = batcher.max_productive_candidates
+    updated = client.get("/miner-state", headers={"If-None-Match": etag})
+
+    assert updated.status_code == 200
+    assert updated.headers["etag"] != etag
+    environment = updated.json()["environments"]["openmathinstruct"]
+    assert environment["accepting_submissions"] is False
+    assert environment["admission_remaining"] == 0
+
+
+def test_miner_state_closes_when_grading_start_budget_is_exhausted():
+    server = _server()
+    client = TestClient(server.app)
+    first = client.get("/miner-state")
+    etag = first.headers["etag"]
+
+    batcher = server._active_batchers["openmathinstruct"]
+    batcher._proof_grading_attempts = batcher.max_grading_starts
+    updated = client.get("/miner-state", headers={"If-None-Match": etag})
+
+    assert updated.status_code == 200
+    assert updated.headers["etag"] != etag
+    environment = updated.json()["environments"]["openmathinstruct"]
+    assert environment["accepting_submissions"] is False
+    assert environment["admission_remaining"] == 0
 
 
 def test_miner_state_does_not_change_legacy_state_bytes():

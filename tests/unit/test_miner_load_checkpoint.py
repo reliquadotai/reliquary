@@ -83,3 +83,44 @@ def test_load_checkpoint_vllm_load_failure_keeps_old_pair(mock_engine):
     assert mock_engine.hf_model is original_hf
     assert mock_engine.vllm_model is original_vllm
     assert getattr(mock_engine, "_loaded_checkpoint_path", None) is None
+
+
+def test_same_device_activation_moves_old_pair_to_host_first(mock_engine):
+    mock_engine.proof_gpu = 0
+    mock_engine.vllm_gpu = 0
+    original_hf = mock_engine.hf_model
+    original_vllm = mock_engine.vllm_model
+    mock_hf = _make_hf_mock("new_hf")
+    mock_gen = _make_hf_mock("new_gen")
+
+    with patch(
+        "reliquary.shared.modeling.load_text_generation_model",
+        side_effect=[mock_hf, mock_gen],
+    ):
+        result = mock_engine._load_checkpoint("/tmp/single-device")
+
+    original_hf.to.assert_called_once_with("cpu")
+    original_vllm.to.assert_called_once_with("cpu")
+    assert mock_engine.hf_model is mock_hf
+    assert mock_engine.vllm_model is mock_gen
+    assert result is mock_hf
+
+
+def test_same_device_partial_activation_requires_clean_restart(mock_engine):
+    from reliquary.miner.engine import CheckpointActivationRestartRequired
+
+    mock_engine.proof_gpu = 0
+    mock_engine.vllm_gpu = 0
+    mock_hf = _make_hf_mock("new_hf")
+
+    with patch(
+        "reliquary.shared.modeling.load_text_generation_model",
+        side_effect=[mock_hf, RuntimeError("gen GPU OOM")],
+    ):
+        with pytest.raises(
+            CheckpointActivationRestartRequired,
+            match="requires restart",
+        ):
+            mock_engine._load_checkpoint("/tmp/single-device-broken")
+
+    assert getattr(mock_engine, "_loaded_checkpoint_path", None) is None
