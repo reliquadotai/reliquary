@@ -40,6 +40,24 @@ def test_tombstone_found_when_no_payload():
     assert kind == "tombstone" and doc["window_start"] == 101
 
 
+@pytest.mark.parametrize("window_start", [True, 101.0, "101"])
+def test_journal_never_coerces_a_decoded_tombstone_window(
+    monkeypatch,
+    window_start,
+):
+    import reliquary.trainer.journal as journal_module
+
+    store = {"reliquary/training/window-101.tombstone.json": b"tombstone"}
+    monkeypatch.setattr(
+        journal_module,
+        "decode_tombstone",
+        lambda data: {"window_start": window_start},
+    )
+
+    with pytest.raises(ValueError, match="window differs"):
+        WindowJournal(fetch_fn=store.get).next_entry(100, stride=1)
+
+
 def test_payload_wins_over_tombstone():
     store = {
         "reliquary/training/window-101.npz": _payload_bytes(101),

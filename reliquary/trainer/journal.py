@@ -137,7 +137,12 @@ class WindowJournal:
         data = self._fetch(tombstone_key(target))
         if data is not None:
             tombstone = decode_tombstone(data)
-            if int(tombstone.get("window_start", -1)) != expected_window_start:
+            tombstone_window = tombstone.get("window_start")
+            if (
+                type(tombstone_window) is not int
+                or tombstone_window < 0
+                or tombstone_window != expected_window_start
+            ):
                 raise ValueError("training tombstone window differs from journal key")
             if self._expected_identity:
                 validate_training_identity(

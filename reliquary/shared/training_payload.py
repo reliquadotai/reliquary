@@ -46,6 +46,12 @@ class TrainingPayloadProtocolMismatch(RuntimeError):
     """A detached-training artifact belongs to another protocol/run."""
 
 
+def _nonnegative_int(value: object, *, field: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class CheckpointEpochTrainingBinding:
     """Exact epoch/lane identity carried through the detached journal."""
@@ -75,6 +81,10 @@ def _checkpoint_epoch_binding(
     *,
     window_start: int,
 ) -> CheckpointEpochTrainingBinding:
+    window_start = _nonnegative_int(
+        window_start,
+        field="checkpoint epoch window",
+    )
     if isinstance(value, CheckpointEpochTrainingBinding):
         binding = value
     elif isinstance(value, Mapping) and set(value) == {
@@ -127,7 +137,7 @@ def _checkpoint_epoch_binding(
         or binding.lane_offset < 0
         or binding.lane_offset >= binding.window_count
         or binding.target_groups_per_environment_lane < 1
-        or binding.first_window + binding.lane_offset != int(window_start)
+        or binding.first_window + binding.lane_offset != window_start
     ):
         raise ValueError("checkpoint epoch training range is invalid")
     return binding
@@ -327,13 +337,22 @@ def encode_training_payload(
 class DecodedPayload:
     def __init__(self, arrays: dict[str, np.ndarray]) -> None:
         header = strict_json_loads(bytes(arrays["header"]))
-        if header["schema_version"] not in _SUPPORTED_PAYLOAD_SCHEMA_VERSIONS:
-            raise ValueError(f"unsupported payload schema {header['schema_version']}")
-        self.schema_version = header["schema_version"]
+        if not isinstance(header, dict):
+            raise ValueError("training payload header must be an object")
+        schema_version = header.get("schema_version")
+        if (
+            type(schema_version) is not int
+            or schema_version not in _SUPPORTED_PAYLOAD_SCHEMA_VERSIONS
+        ):
+            raise ValueError(f"unsupported payload schema {schema_version}")
+        self.schema_version = schema_version
         self.training_identity = {
             key: header.get(key) for key in _TRAINING_IDENTITY_KEYS
         }
-        self.window_start = int(header["window_start"])
+        self.window_start = _nonnegative_int(
+            header.get("window_start"),
+            field="training payload window",
+        )
         self.checkpoint_revision = str(header["checkpoint_revision"])
         self.env_order = list(header["env_order"])
         self.window_quarantine = dict(header["window_quarantine"])
@@ -444,15 +463,25 @@ def encode_tombstone(
 
 def decode_tombstone(data: bytes) -> dict[str, Any]:
     doc = strict_json_loads(data)
-    if doc.get("schema_version") not in _SUPPORTED_TOMBSTONE_SCHEMA_VERSIONS:
+    if not isinstance(doc, dict):
+        raise ValueError("training tombstone must be an object")
+    schema_version = doc.get("schema_version")
+    if (
+        type(schema_version) is not int
+        or schema_version not in _SUPPORTED_TOMBSTONE_SCHEMA_VERSIONS
+    ):
         raise ValueError("unsupported tombstone schema")
+    window_start = _nonnegative_int(
+        doc.get("window_start"),
+        field="training tombstone window",
+    )
     raw_epoch = doc.get("checkpoint_epoch")
-    if doc["schema_version"] == CHECKPOINT_EPOCH_ARTIFACT_SCHEMA_VERSION:
+    if schema_version == CHECKPOINT_EPOCH_ARTIFACT_SCHEMA_VERSION:
         if raw_epoch is None:
             raise ValueError("epoch tombstone omitted checkpoint epoch binding")
         binding = _checkpoint_epoch_binding(
             raw_epoch,
-            window_start=int(doc["window_start"]),
+            window_start=window_start,
         )
         doc["checkpoint_epoch"] = binding
     elif raw_epoch is not None:
@@ -497,6 +526,7 @@ def decode_checkpoint_epoch_marker(data: bytes) -> dict[str, Any]:
     if (
         not isinstance(doc, dict)
         or set(doc) != {"schema_version", "status", "checkpoint_epoch"}
+        or type(doc["schema_version"]) is not int
         or doc["schema_version"] != 1
         or doc["status"] not in {"completed", "aborted"}
     ):
@@ -504,11 +534,17 @@ def decode_checkpoint_epoch_marker(data: bytes) -> dict[str, Any]:
     raw_binding = doc["checkpoint_epoch"]
     if not isinstance(raw_binding, dict):
         raise ValueError("invalid checkpoint epoch marker binding")
+    first_window = _nonnegative_int(
+        raw_binding.get("first_window"),
+        field="checkpoint epoch first window",
+    )
+    lane_offset = _nonnegative_int(
+        raw_binding.get("lane_offset"),
+        field="checkpoint epoch lane offset",
+    )
     binding = _checkpoint_epoch_binding(
         raw_binding,
-        window_start=(
-            int(raw_binding["first_window"]) + int(raw_binding["lane_offset"])
-        ),
+        window_start=first_window + lane_offset,
     )
     if binding.lane_offset != 0:
         raise ValueError("checkpoint epoch marker must bind lane zero")

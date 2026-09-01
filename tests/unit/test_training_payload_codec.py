@@ -6,6 +6,8 @@ live objects. A silently dropped field degrades the model, not the tests
 — so equality is checked on the consumed accessors, not just raw fields.
 """
 
+import io
+import json
 import math
 from types import SimpleNamespace
 
@@ -14,11 +16,14 @@ import pytest
 
 from reliquary import constants as C
 from reliquary.shared.training_payload import (
+    CheckpointEpochTrainingBinding,
     PAYLOAD_SCHEMA_VERSION,
     TOMBSTONE_SCHEMA_VERSION,
     active_training_identity,
+    decode_checkpoint_epoch_marker,
     decode_tombstone,
     decode_training_payload,
+    encode_checkpoint_epoch_marker,
     encode_tombstone,
     encode_training_payload,
 )
@@ -80,12 +85,84 @@ def _encode_decode(batches):
     return decode_training_payload(blob)
 
 
+def _replace_payload_header(blob: bytes, **updates) -> bytes:
+    with np.load(io.BytesIO(blob), allow_pickle=False) as npz:
+        arrays = {key: npz[key] for key in npz.files}
+    header = json.loads(bytes(arrays["header"]))
+    header.update(updates)
+    arrays["header"] = np.frombuffer(
+        json.dumps(header).encode("utf-8"),
+        dtype=np.uint8,
+    )
+    output = io.BytesIO()
+    np.savez_compressed(output, **arrays)
+    return output.getvalue()
+
+
+def _payload_bytes(*, window_start: int = 30100, checkpoint_epoch=None) -> bytes:
+    return encode_training_payload(
+        _window_batches(),
+        window_start=window_start,
+        checkpoint_revision="rev-abc",
+        env_order=["openmathinstruct", "opencodeinstruct"],
+        window_quarantine={"quarantined": False, "reasons": []},
+        checkpoint_epoch=checkpoint_epoch,
+    )
+
+
+def _epoch_binding(*, first_window: int = 30100):
+    return CheckpointEpochTrainingBinding(
+        epoch_id="1" * 64,
+        manifest_sha256="2" * 64,
+        training_run_id=C.TRAINING_RUN_ID,
+        training_mode="sequential_steps",
+        first_window=first_window,
+        lane_offset=0,
+        window_count=2,
+        target_groups_per_environment_lane=1,
+    )
+
+
 def test_header_round_trip():
     decoded = _encode_decode(_window_batches())
     assert decoded.window_start == 30100
     assert decoded.checkpoint_revision == "rev-abc"
     assert decoded.env_order == ["openmathinstruct", "opencodeinstruct"]
     assert decoded.window_quarantine == {"quarantined": False, "reasons": []}
+
+
+@pytest.mark.parametrize("schema_version", [True, 2.0, "2"])
+def test_payload_decoder_requires_an_exact_integer_schema(schema_version):
+    blob = _replace_payload_header(
+        _payload_bytes(),
+        schema_version=schema_version,
+    )
+
+    with pytest.raises(ValueError, match="unsupported payload schema"):
+        decode_training_payload(blob)
+
+
+@pytest.mark.parametrize("window_start", [True, 30100.0, "30100", -1])
+def test_payload_decoder_requires_a_canonical_window_identity(window_start):
+    blob = _replace_payload_header(
+        _payload_bytes(),
+        window_start=window_start,
+    )
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        decode_training_payload(blob)
+
+
+def test_epoch_payload_rejects_a_string_window_identity(monkeypatch):
+    monkeypatch.setattr(C, "PROTOCOL_VERSION", 5)
+    binding = _epoch_binding(first_window=7)
+    blob = _replace_payload_header(
+        _payload_bytes(window_start=7, checkpoint_epoch=binding),
+        window_start="7",
+    )
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        decode_training_payload(blob)
 
 
 def test_consumed_accessors_round_trip():
@@ -193,6 +270,49 @@ def test_tombstone_rejects_duplicate_durable_identity():
 
     with pytest.raises(ValueError, match="duplicate JSON key: window_start"):
         decode_tombstone(ambiguous)
+
+
+@pytest.mark.parametrize("schema_version", [True, 2.0, "2"])
+def test_tombstone_requires_an_exact_integer_schema(schema_version):
+    doc = json.loads(
+        encode_tombstone(
+            window_start=30105,
+            failure_stage="proof_capacity",
+            failure_type="ProofCapacityAbort",
+        )
+    )
+    doc["schema_version"] = schema_version
+
+    with pytest.raises(ValueError, match="unsupported tombstone schema"):
+        decode_tombstone(json.dumps(doc).encode("utf-8"))
+
+
+@pytest.mark.parametrize("window_start", [True, 30105.0, "30105", -1])
+def test_tombstone_requires_a_canonical_window_identity(window_start):
+    doc = json.loads(
+        encode_tombstone(
+            window_start=30105,
+            failure_stage="proof_capacity",
+            failure_type="ProofCapacityAbort",
+        )
+    )
+    doc["window_start"] = window_start
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        decode_tombstone(json.dumps(doc).encode("utf-8"))
+
+
+def test_epoch_marker_rejects_a_boolean_schema_version():
+    marker = json.loads(
+        encode_checkpoint_epoch_marker(
+            _epoch_binding(),
+            status="completed",
+        )
+    )
+    marker["schema_version"] = True
+
+    with pytest.raises(ValueError, match="invalid checkpoint epoch marker"):
+        decode_checkpoint_epoch_marker(json.dumps(marker).encode("utf-8"))
 
 
 @pytest.mark.parametrize(
