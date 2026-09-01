@@ -27,6 +27,28 @@ def _task_for_index(index: int) -> GeneratedLogicTask:
     return generate_logic_task(index)
 
 
+def problem_from_task(
+    task: GeneratedLogicTask, generator_index: int
+) -> dict[str, Any]:
+    """Problem dict for a task.
+
+    Split out so a family that the roster does not currently draw can still
+    be scored offline, without activating it and remapping the index space.
+    """
+    prompt = task.prompt
+    return {
+        "id": sha256(prompt.encode("utf-8")).hexdigest()[:16],
+        "prompt": prompt,
+        "ground_truth": verifier_spec(task),
+        "task_family": TASK_FAMILY,
+        "family": task.family,
+        "difficulty": task.difficulty,
+        "operation_id": task.operation_id,
+        "generator_version": GENERATOR_VERSION,
+        "generator_index": generator_index,
+    }
+
+
 class ReliquaryLogicEnvironment:
     """Procedural logic puzzles with an exact JSON reward."""
 
@@ -41,19 +63,7 @@ class ReliquaryLogicEnvironment:
 
     def get_problem(self, index: int) -> dict[str, Any]:
         normalized = int(index) % VIRTUAL_LENGTH
-        task = _task_for_index(normalized)
-        prompt = task.prompt
-        return {
-            "id": sha256(prompt.encode("utf-8")).hexdigest()[:16],
-            "prompt": prompt,
-            "ground_truth": verifier_spec(task),
-            "task_family": TASK_FAMILY,
-            "family": task.family,
-            "difficulty": task.difficulty,
-            "operation_id": task.operation_id,
-            "generator_version": GENERATOR_VERSION,
-            "generator_index": normalized,
-        }
+        return problem_from_task(_task_for_index(normalized), normalized)
 
     def compute_reward(self, problem: dict, completion: str) -> float:
         try:
@@ -100,5 +110,6 @@ def score_reliquarylogic(
 
 __all__ = [
     "ReliquaryLogicEnvironment",
+    "problem_from_task",
     "score_reliquarylogic",
 ]

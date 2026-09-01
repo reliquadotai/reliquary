@@ -14,7 +14,7 @@
     "reliquary/environment/reliquarylogic.py",
     "reliquary/environment/structured_output.py"
   ],
-  "implementation_sha256": "54e2bc8734b1bae6bb1fa259446ed8fa425fd4dde1ae6fa739851666bca3f0f8",
+  "implementation_sha256": "7451a0ab3a320bbce9a3045a958a9e3576e05c20e2a3b8ed6ef60b8834e79140",
   "virtual_length": 2147483648,
   "protocol_reward_lattice": [
     0.0,

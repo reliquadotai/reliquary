@@ -41,6 +41,8 @@ def main() -> int:
     parser.add_argument("--gen-seed", type=int, default=7)
     parser.add_argument("--gpu-mem", type=float, default=0.85)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--include-inactive", action="store_true",
+                        help="also measure families the roster does not draw")
     parser.add_argument("--dump-samples", type=int, default=0,
                         help="raw completions per family, for diagnosis")
     args = parser.parse_args()
@@ -48,7 +50,9 @@ def main() -> int:
     from reliquary.environment.logic_tasks import (
         VIRTUAL_LENGTH, active_families, generate_logic_task,
     )
-    from reliquary.environment.reliquarylogic import ReliquaryLogicEnvironment
+    from reliquary.environment.reliquarylogic import (
+        ReliquaryLogicEnvironment, problem_from_task,
+    )
     from reliquary.environment.structured_output import extract_json_answer
 
     environment = ReliquaryLogicEnvironment()
@@ -79,6 +83,28 @@ def main() -> int:
         for family in order
         for index in by_family[family]
     ]
+    if args.include_inactive:
+        # Drawn straight from the generator: an inactive family has no index
+        # that yields it, and activating one to measure it would remap the
+        # corpus and invalidate every other column in this table.
+        import hashlib as _hashlib
+
+        from reliquary.environment.logic_tasks import _FAMILY_REGISTRY
+        from reliquary.environment.records_tasks import HashCounterRng
+
+        for family in _FAMILY_REGISTRY:
+            if family.active:
+                continue
+            order.append(family.name + "*")
+            for trial in range(wanted):
+                seed = _hashlib.sha256(
+                    f"{args.suite_seed}:{family.name}:{trial}".encode()
+                ).digest()
+                task = family.generator(HashCounterRng(seed))
+                problems.append((
+                    family.name + "*", trial,
+                    problem_from_task(task, trial),
+                ))
     roster = active_families()
     print(f"{len(problems)} prompts over {len(order)} families", flush=True)
     print(f"roster: {','.join(roster)}", flush=True)
