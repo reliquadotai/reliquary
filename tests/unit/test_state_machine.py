@@ -514,7 +514,7 @@ async def test_train_and_publish_bumps_checkpoint_n(monkeypatch):
     fake_entry = ManifestEntry(
         checkpoint_n=initial_checkpoint + 1,
         repo_id="aivolutionedge/reliquary-sn",
-        revision="rev_sha_x",
+        revision="a" * 40,
         signature="ed25519:x",
     )
     svc._checkpoint_store.publish = AsyncMock(return_value=fake_entry)
@@ -586,11 +586,11 @@ def test_open_window_wires_checkpoint_hash_into_batcher():
     svc._checkpoint_store.current_manifest = MagicMock(return_value=ManifestEntry(
         checkpoint_n=5,
         repo_id="aivolutionedge/reliquary-sn",
-        revision="rev_sha_005",
+        revision="5" * 40,
         signature="ed25519:sig",
     ))
     svc._open_window()
-    assert svc._active_batcher.current_checkpoint_hash == "rev_sha_005"
+    assert svc._active_batcher.current_checkpoint_hash == "5" * 40
 
 
 @pytest.mark.asyncio
@@ -966,7 +966,7 @@ async def test_publish_every_n_trained_windows(monkeypatch):
         entry = ManifestEntry(
             checkpoint_n=checkpoint_n,
             repo_id="aivolutionedge/reliquary-sn",
-            revision=f"rev_{checkpoint_n:03d}",
+            revision=f"{checkpoint_n:040x}",
             signature="ed25519:sig",
         )
         published_entries.append(entry)
