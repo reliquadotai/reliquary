@@ -177,3 +177,63 @@ established pattern in `test_v6_emission.py` /
    checkpoint. Conservative, bounded by the backstop, and in practice
    unreachable in serial mode (`_publication_due_next_half` routes
    exactly that case serially).
+
+## Fix round 1 (R39)
+
+Commit `8c4faf3`. All 6 findings addressed; 3 new pins (27 in
+`test_pick_pacing.py`), the underfilled-window case watched red first.
+
+**Important 1 — R39 replaces the revision-baseline gate.** The gate now
+arms on the *journal key of the last batch the closed window emitted*
+(`assembler.next_batch_index - 1`, read at seal before `close()` pads the
+range) and releases when the trainer's cursor — remote since R38 —
+reaches it. `_arm_fill_closed_checkpoint_gate` /
+`_wait_for_fill_closed_checkpoint` / `_fill_closed_checkpoint_detected` /
+`_fill_closed_checkpoint_baseline` are gone, replaced by
+`_arm_fill_closed_rotation_gate` / `_wait_for_fill_closed_rotation` /
+`_fill_closed_rotation_key`; `FILL_CLOSED_CHECKPOINT_POLL_SECONDS` →
+`FILL_CLOSED_ROTATION_POLL_SECONDS`. Zero emitted disarms outright.
+Neither old failure mode survives: an underfilled window waits only for
+its own three batches, and a mid-window publish cannot arm anything
+because publications are no longer read. The arming is *consumed* by the
+wait (one close, one wait), so a stale key can never gate a later window;
+if `window_start` is somehow unavailable the gate disarms rather than
+guess a key nobody will consume.
+
+**Important 2 — freeze contract.** The gate no longer polls or stages
+anything, so no staging download can start under a freeze. Beyond that,
+`RELIQUARY_DISABLE_TRAIN` now skips the gate entirely with a WARNING
+naming the key nothing will consume — otherwise the freeze would cost a
+full backstop of dead air per window during the incident it exists to
+contain. `_poll_and_stage_checkpoint_candidate` is kept: it is still
+`_detached_checkpoint_tick`'s own body, and checkpoint adoption stays on
+that serial beat untouched.
+
+**Minors.** (1) A *total* refusal after readiness passed now logs ERROR
+like a partial one — same broken invariant — and the message no longer
+claims an incomplete event advances the count, which R37 made false
+(`picks_emitted` is the MIN over ordinals). (2)
+`test_sixteen_events_close_the_window` no longer jumps the gates with
+`cursor=1e9`: it is now
+`test_every_event_walks_its_own_cursor_boundary_and_closes`, stepping
+every pick past the depth over both sides of its own boundary, so the
+window's LAST event (k = target → batch k−3) is pinned like the rest.
+(3) The wait publishes a `fill_closed_rotation_wait` preparation stage,
+so a held rotation is legible on `/state` instead of looking like a hung
+validator. (4) The real guarantee is stated in
+`_drive_fill_closed_picks`: single-threaded loop ownership of
+readiness+pick+seal is what excludes the interleaving; pool-only-grows
+merely makes a stale `False` harmless, never a `True` wrong.
+
+**Concerns.**
+- **Minor 4 is only half done.** The accurate statement went into
+  `_drive_fill_closed_picks` (service.py, the caller where the guarantee
+  actually lives). `can_pick`'s own docstring in `batcher.py` still leads
+  with "the proven pool only ever GROWS" as the safety argument; that
+  file was explicitly off-limits this round. One sentence for whoever
+  owns `batcher.py` next.
+- **The remainder batch.** Arming reads `next_batch_index` at seal, so
+  the gate waits for the last *mid-window* batch. `close()` may afterwards
+  force out one more real partial batch, which the gate does not wait for
+  — at most one key, inside the depth−1 tolerance. Waiting for it would
+  mean arming inside the GPU half, which the pipelined path defers.
