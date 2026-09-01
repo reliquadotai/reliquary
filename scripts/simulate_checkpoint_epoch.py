@@ -129,11 +129,35 @@ def _economic_sensitivity() -> dict[str, object]:
         return int(seconds // group_seconds)
 
     baseline_groups = capacity(baseline_length)
+    reference_competitor_tokens = (16 - 1) * rollouts * baseline_length
+    baseline_group_seconds = (
+        fixed_group_seconds
+        + rollouts * baseline_length / aggregate_tokens_per_second
+    )
+    baseline_flat_return = (1.0 / 16.0) / baseline_group_seconds
+    baseline_token_share = (
+        rollouts * baseline_length
+        / (reference_competitor_tokens + rollouts * baseline_length)
+    )
+    baseline_token_return = baseline_token_share / baseline_group_seconds
+    baseline_offer_rate = (
+        rollouts * baseline_length / baseline_group_seconds
+    )
     rows = []
     for length in (500, 1_000, 2_000, 4_000, 8_000):
         groups = capacity(length)
+        group_seconds = (
+            fixed_group_seconds
+            + rollouts * length / aggregate_tokens_per_second
+        )
+        tokens = rollouts * length
+        unilateral_token_share = tokens / (
+            reference_competitor_tokens + tokens
+        )
+        offer_rate = tokens / group_seconds
         rows.append({
             "mean_completion_tokens": length,
+            "group_gpu_seconds": round(group_seconds, 6),
             "groups_generated": groups,
             "unbounded_generation_capacity_index": round(
                 groups / baseline_groups, 6
@@ -143,12 +167,38 @@ def _economic_sensitivity() -> dict[str, object]:
                 groups * length / (baseline_groups * baseline_length),
                 6,
             ),
+            # Direct selected-slot return still prices a group, not its
+            # length. The ticket prevents a miner from minting extra entries
+            # after generation starts; it does not claim length itself is
+            # valuable.
+            "flat_slot_return_per_gpu_second_index": round(
+                ((1.0 / 16.0) / group_seconds) / baseline_flat_return,
+                6,
+            ),
+            # One operator changes length while the other 15 groups stay at
+            # the reference length. This is the useful local-incentive test
+            # for gross per-token payment; a symmetric system-wide shortening
+            # still leaves every group with 1/16 of the fixed pool.
+            "unilateral_token_share_return_per_gpu_second_index": round(
+                (unilateral_token_share / group_seconds)
+                / baseline_token_return,
+                6,
+            ),
+            "first_offer_rate_index": round(
+                offer_rate / baseline_offer_rate,
+                6,
+            ),
+            # With elapsed time measured from common OPEN, a fourth group on
+            # one sequential device advertises one quarter of the rate of four
+            # identical first groups produced in parallel.
+            "fourth_sequential_offer_vs_parallel": 0.25,
         })
     return {
         "scope": "synthetic linear-cost sensitivity; not production telemetry",
         "interpretation": (
             "generation tickets are fixed before compute, so shortening a "
-            "response cannot create more paid groups inside the epoch"
+            "response cannot create more entries inside the epoch; quality "
+            "must be measured independently because length is not utility"
         ),
         "assumptions": {
             "rollouts_per_group": rollouts,
@@ -156,8 +206,27 @@ def _economic_sensitivity() -> dict[str, object]:
             "aggregate_tokens_per_second": aggregate_tokens_per_second,
             "fixed_group_seconds": fixed_group_seconds,
             "baseline_completion_tokens": baseline_length,
+            "other_selected_groups_at_reference_length": 15,
         },
         "length_rows": rows,
+        "control_tradeoffs": {
+            "rate_admission": (
+                "approximately length-neutral for a first linear-cost group, "
+                "but common-open elapsed time gives parallel first groups a "
+                "structural advantage over sequential later groups"
+            ),
+            "gross_token_payment": (
+                "approximately neutral for one miner changing length against "
+                "a fixed competitor population, but does not score semantic "
+                "quality and does not stay neutral when the whole population "
+                "changes together"
+            ),
+            "ticketed_selected_slot": (
+                "removes arrival and ticket-volume from selection after the "
+                "public cohort is frozen; final utility remains a separate "
+                "validator-authoritative ordering"
+            ),
+        },
         "symmetric_gross_token_contest": [
             {
                 "operators": operators,
@@ -168,6 +237,16 @@ def _economic_sensitivity() -> dict[str, object]:
             }
             for operators in (2, 4, 8, 16, 32)
         ],
+        "synthetic_compute_waste_envelope": {
+            "unbounded_64_for_16": 0.75,
+            "ticketed_32_for_16_worst_case": 0.5,
+            "ticketed_20_for_16_example": 0.2,
+            "adaptive_fill_at_90_percent_validity": 0.1,
+            "note": (
+                "group-count envelope only; it does not price utility, proof "
+                "cost, retries, or real fleet behavior"
+            ),
+        },
     }
 
 
