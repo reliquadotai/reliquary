@@ -37,6 +37,31 @@ The existing throughput-ranked production path and V4/V5 generation contracts
 remain byte-for-byte unchanged during implementation. Reliquary 1 is a new
 coordinated release, not a reinterpretation of V4 or V5.
 
+## Branch implementation status
+
+This document defines the target release contract. It is intentionally more
+strict than the current runtime and must not be read as an activation claim.
+The reconciliation branch currently contains:
+
+| Surface | Status on this branch |
+| --- | --- |
+| 16-lane manifest, unique seeds/slices, checkpoint-before-beacon ordering | implemented behind the disabled checkpoint-epoch capability |
+| signed miner-selected intents, frozen population, primary/standby tickets | implemented behind the disabled checkpoint-epoch capability |
+| atomic common OPEN, exact miner release binding and stale-work quarantine | implemented in the reference shadow planner and validator path |
+| utility/difficulty portfolio, operator rounds and fresh post-close tie beacon | implemented without changing production ranking |
+| bounded proof scheduler, progressive trainer journal and cursor telemetry | implemented in the separate disabled fill experiment |
+| coherent fill horizon, capacity and read-only progress state | implemented for qualification of that experiment, not selected as the v1 market |
+| immutable release contracts and environment/task/trajectory ABI | implemented as inactive composition boundaries |
+| ticket-only streaming proof shared across all 16 concurrent lanes | integration gate; must preserve arrival-neutral final selection and restart recovery |
+| trainer-paced per-lane epoch barriers | target contract; the current epoch uses one common generation horizon before ordered finalization |
+| end-to-end durable proof-result recovery and checkpoint adoption | activation gate |
+| external adapter conformance and hardware-backed end-to-end qualification | activation gate |
+
+The pull request remains a Draft until every activation gate is either
+implemented and qualified or removed from the candidate capability bundle.
+Code that exists only in the fill experiment is reusable infrastructure, not
+evidence that its admission or reward policy has been selected.
+
 ## What is retained and what changes
 
 The reconciliation retains these fill-closed implementation ideas:
