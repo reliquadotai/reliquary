@@ -125,6 +125,63 @@ async def test_snapshot_cooldown_writes_run_keyed_state():
 
 
 @pytest.mark.asyncio
+async def test_prompt_restore_prefers_newer_local_snapshot(tmp_path):
+    from reliquary.validator.service import (
+        _cooldown_local_path,
+        _write_gzip_json_atomic,
+    )
+
+    remote = {
+        "run_id": "default",
+        "snapshot_window": 30,
+        "envs": {"fake": {"1": 20}},
+    }
+    local = {
+        "schema_version": 2,
+        "run_id": "default",
+        "snapshot_window": 40,
+        "complete": True,
+        "envs": {"fake": {"1": 20, "2": 40}},
+    }
+    with patch.dict("os.environ", {"RELIQUARY_STATE_DIR": str(tmp_path)}):
+        _write_gzip_json_atomic(_cooldown_local_path("default"), local)
+        svc = _service(45)
+        with patch(
+            "reliquary.infrastructure.storage.download_json",
+            new=AsyncMock(return_value=remote),
+        ), patch(
+            "reliquary.infrastructure.storage.list_recent_datasets",
+            new=AsyncMock(return_value=[]),
+        ):
+            await svc._rebuild_cooldown_from_history()
+
+    assert svc._cooldown_per_env["fake"].export_state() == {1: 20, 2: 40}
+
+
+@pytest.mark.asyncio
+async def test_prompt_snapshot_is_durable_locally_when_r2_fails(tmp_path):
+    from reliquary.validator.service import (
+        _cooldown_local_path,
+        _read_gzip_json,
+    )
+
+    svc = _service(77)
+    svc._cooldown_per_env["fake"].record_batched(7, 70)
+    with patch.dict(
+        "os.environ", {"RELIQUARY_STATE_DIR": str(tmp_path)}
+    ), patch(
+        "reliquary.infrastructure.storage.upload_json",
+        new=AsyncMock(side_effect=OSError("R2 unavailable")),
+    ):
+        assert await svc._snapshot_cooldown() is True
+        snapshot = _read_gzip_json(_cooldown_local_path("default"))
+
+    assert snapshot is not None
+    assert snapshot["snapshot_window"] == 77
+    assert snapshot["envs"]["fake"] == {"7": 70}
+
+
+@pytest.mark.asyncio
 async def test_corrupt_snapshot_does_not_crash_and_falls_back():
     """B2: a malformed snapshot (bad envs payload) must not crash startup — it
     is discarded and we fall back (empty for a fresh run)."""
@@ -201,6 +258,51 @@ async def test_content_snapshot_restores_and_resolves_only_new_prompt_state(
     assert restored[old_digest] == 60
     assert len(restored) == 2
     assert max(restored.values()) == 75
+
+
+@pytest.mark.asyncio
+async def test_content_restore_prefers_newer_local_snapshot(tmp_path):
+    from reliquary.validator.prompt_content import prompt_content_sha256
+    from reliquary.validator.service import (
+        _content_cooldown_local_path,
+        _write_gzip_json_atomic,
+    )
+
+    old_digest = prompt_content_sha256("fake", "old")
+    new_digest = prompt_content_sha256("fake", "new")
+    remote = {
+        "schema_version": 1,
+        "run_id": "default",
+        "snapshot_window": 50,
+        "complete": True,
+        "envs": {"fake": {old_digest: 40}},
+    }
+    local = {
+        "schema_version": 1,
+        "run_id": "default",
+        "snapshot_window": 70,
+        "complete": True,
+        "envs": {"fake": {old_digest: 40, new_digest: 70}},
+    }
+    with patch.dict("os.environ", {"RELIQUARY_STATE_DIR": str(tmp_path)}):
+        _write_gzip_json_atomic(
+            _content_cooldown_local_path("default"),
+            local,
+        )
+        svc = _service(80)
+        with patch(
+            "reliquary.infrastructure.storage.download_json",
+            new=AsyncMock(return_value=remote),
+        ), patch(
+            "reliquary.infrastructure.storage.upload_json",
+            new=AsyncMock(return_value=True),
+        ):
+            await svc._restore_content_cooldown()
+
+    assert svc._content_cooldown_per_env["fake"].export_state() == {
+        old_digest: 40,
+        new_digest: 70,
+    }
 
 
 @pytest.mark.asyncio

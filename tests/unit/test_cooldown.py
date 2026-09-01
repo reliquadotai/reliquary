@@ -203,3 +203,27 @@ def test_apply_history_keeps_older_when_snapshot_is_newer():
     m.import_state({7: 200})
     m.apply_history([{"window_start": 150, "batch": [{"prompt_idx": 7}]}], current_window=210)
     assert m.export_state() == {7: 200}  # snapshot's newer window wins
+
+
+def test_snapshot_export_excludes_entries_after_snapshot_boundary():
+    prompt = CooldownMap(cooldown_windows=1000)
+    prompt.record_batched(1, 10)
+    prompt.record_batched(2, 20)
+    assert prompt.export_state(through_window=10) == {1: 10}
+
+    content = ContentCooldownMap(cooldown_windows=1000)
+    first = "a" * 64
+    second = "b" * 64
+    content.record_selected(first, 10)
+    content.record_selected(second, 20)
+    assert content.export_state(through_window=10) == {first: 10}
+
+
+def test_snapshot_import_rejects_negative_values():
+    prompt = CooldownMap(cooldown_windows=1000)
+    with pytest.raises(ValueError, match="negative"):
+        prompt.import_state({1: -1})
+
+    content = ContentCooldownMap(cooldown_windows=1000)
+    with pytest.raises(ValueError, match="negative"):
+        content.import_state({"a" * 64: -1})

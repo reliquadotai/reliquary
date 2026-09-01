@@ -222,6 +222,14 @@ def _cooldown_snapshot_key(run_id: str) -> str:
     return f"cooldown_snapshots/{run_id}.json"
 
 
+def _cooldown_local_path(run_id: str) -> Path:
+    state_dir = Path(
+        os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")
+    )
+    safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id)
+    return state_dir / "cooldown" / f"{safe_run_id}.json.gz"
+
+
 def _content_cooldown_snapshot_key(run_id: str) -> str:
     return f"content_cooldown_snapshots/{run_id}.json.gz"
 
@@ -339,14 +347,14 @@ def _read_gzip_json(path: Path) -> dict[str, Any] | None:
     with gzip.open(path, "rt", encoding="utf-8") as handle:
         value = json.load(handle)
     if not isinstance(value, dict):
-        raise ValueError("content cooldown snapshot must be a JSON object")
+        raise ValueError("snapshot must be a JSON object")
     return value
 
 
 def _write_gzip_json_atomic(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
-        prefix=".content-cooldown.", suffix=".json.gz", dir=path.parent
+        prefix=".snapshot.", suffix=".json.gz", dir=path.parent
     )
     try:
         with os.fdopen(fd, "wb") as raw:
@@ -6683,6 +6691,37 @@ class ValidationService:
                 "validator stays on whatever --resume-from gave us"
             )
 
+    @staticmethod
+    def _validate_cooldown_snapshot(
+        snapshot: dict[str, Any],
+        env_names: set[str],
+        current_window: int,
+    ) -> int:
+        """Validate a complete prompt-cooldown snapshot before mutation."""
+        if snapshot.get("run_id") != TRAINING_RUN_ID:
+            raise ValueError("cooldown run id mismatch")
+        snapshot_window = int(snapshot.get("snapshot_window", -1))
+        if not 0 <= snapshot_window <= current_window:
+            raise ValueError("cooldown snapshot window is outside history")
+        envs = snapshot.get("envs")
+        if not isinstance(envs, dict) or not env_names.issubset(envs):
+            raise ValueError("cooldown snapshot environments are incomplete")
+        for env_name in env_names:
+            state = envs[env_name]
+            if not isinstance(state, dict):
+                raise ValueError(
+                    f"cooldown snapshot env {env_name} must be an object"
+                )
+            for raw_idx, raw_window in state.items():
+                if int(raw_idx) < 0:
+                    raise ValueError("cooldown snapshot contains a negative index")
+                selected_window = int(raw_window)
+                if not 0 <= selected_window <= snapshot_window:
+                    raise ValueError(
+                        "cooldown snapshot selection is outside its history"
+                    )
+        return snapshot_window
+
     async def _rebuild_cooldown_from_history(self) -> None:
         """At startup, restore per-env cooldown from the run-keyed R2 snapshot,
         then replay only the windows recorded since it was taken — so the FULL
@@ -6693,39 +6732,69 @@ class ValidationService:
         starts empty — a new model must be allowed to re-see every prompt.
         """
         current_window = self._window_n
-        snapshot = None
+        candidates: list[tuple[int, str, dict[str, Any]]] = []
+        remote_snapshot = None
         try:
-            snapshot = await storage.download_json(
+            remote_snapshot = await storage.download_json(
                 _cooldown_snapshot_key(TRAINING_RUN_ID)
             )
         except Exception:
             logger.exception("Failed to read cooldown snapshot")
+        local_snapshot = None
+        try:
+            local_snapshot = await asyncio.to_thread(
+                _read_gzip_json,
+                _cooldown_local_path(TRAINING_RUN_ID),
+            )
+        except Exception:
+            logger.exception("Failed to read local cooldown snapshot")
 
-        if snapshot and snapshot.get("run_id") == TRAINING_RUN_ID:
+        env_names = set(self._cooldown_per_env)
+        for source, snapshot in (
+            ("r2", remote_snapshot),
+            ("local", local_snapshot),
+        ):
+            if snapshot is None:
+                continue
             try:
-                envs = snapshot.get("envs", {}) or {}
-                for env_name, cooldown_map in self._cooldown_per_env.items():
-                    cooldown_map.import_state(envs.get(env_name, {}))
-                snapshot_window = int(snapshot.get("snapshot_window", current_window))
+                snapshot_window = self._validate_cooldown_snapshot(
+                    snapshot,
+                    env_names,
+                    current_window,
+                )
             except Exception:
-                # Corrupt / partially-written / tampered snapshot — must not
-                # crash startup. Discard any partial restore and fall through.
                 logger.exception(
-                    "Corrupt cooldown snapshot for run=%s; discarding it", TRAINING_RUN_ID,
+                    "Invalid %s cooldown snapshot for run=%s; discarding it",
+                    source,
+                    TRAINING_RUN_ID,
                 )
-                for cooldown_map in self._cooldown_per_env.values():
-                    cooldown_map.import_state({})
             else:
-                gap = max(0, current_window - snapshot_window)
-                if gap > 0:
-                    await self._replay_cooldown_gap(current_window, gap)
-                logger.info(
-                    "Restored cooldown from snapshot run=%s snapshot_window=%d "
-                    "gap=%d (current=%d, sizes=%s)",
-                    TRAINING_RUN_ID, snapshot_window, gap, current_window,
-                    {n: len(m) for n, m in self._cooldown_per_env.items()},
-                )
-                return
+                candidates.append((snapshot_window, source, snapshot))
+
+        if candidates:
+            # Prefer the newest valid durable view. Local wins an exact tie,
+            # because it is written before the best-effort R2 mirror.
+            snapshot_window, source, snapshot = max(
+                candidates,
+                key=lambda item: (item[0], item[1] == "local"),
+            )
+            envs = snapshot["envs"]
+            for env_name, cooldown_map in self._cooldown_per_env.items():
+                cooldown_map.import_state(envs[env_name])
+            gap = max(0, current_window - snapshot_window)
+            if gap > 0:
+                await self._replay_cooldown_gap(current_window, gap)
+            logger.info(
+                "Restored cooldown from %s run=%s snapshot_window=%d "
+                "gap=%d (current=%d, sizes=%s)",
+                source,
+                TRAINING_RUN_ID,
+                snapshot_window,
+                gap,
+                current_window,
+                {name: len(state) for name, state in self._cooldown_per_env.items()},
+            )
+            return
 
         if TRAINING_RUN_ID != "default":
             logger.info(
@@ -6788,42 +6857,72 @@ class ValidationService:
         except Exception:
             logger.exception("Cooldown gap-replay failed; using snapshot only")
 
-    async def _snapshot_cooldown(self) -> None:
+    async def _snapshot_cooldown(self) -> bool:
         """Persist the per-env cooldown maps to R2, keyed by the training run id,
-        so a restart restores the full cooldown without replaying history. Best
-        effort — a snapshot failure must never break the window loop."""
+        so a restart restores the full cooldown without replaying history.
+
+        The local atomic snapshot is authoritative for a same-host restart;
+        R2 is a best-effort mirror for host replacement. Returns whether at
+        least one durable copy was written. A failure never breaks the window
+        loop, but it remains visible in logs.
+        """
+        snapshot: dict[str, Any] | None = None
         try:
             window = self._window_n
 
             def _build() -> dict:
-                # Copy can be multi-MB (cooldown never expires) — build it off
-                # the event loop. Safe: the window loop is sequential here, no
-                # concurrent record_batched between seal and the next window.
                 return {
+                    "schema_version": 2,
                     "run_id": TRAINING_RUN_ID,
                     "snapshot_window": window,
+                    "complete": True,
                     "envs": {
-                        name: cd.export_state()
+                        name: cd.export_state(through_window=window)
                         for name, cd in self._cooldown_per_env.items()
                     },
                 }
 
             snapshot = await asyncio.to_thread(_build)
-            if await storage.upload_json(
-                _cooldown_snapshot_key(TRAINING_RUN_ID), snapshot
-            ):
-                logger.info(
-                    "Snapshotted cooldown run=%s window=%d (sizes=%s)",
-                    TRAINING_RUN_ID, self._window_n,
-                    {n: len(m) for n, m in self._cooldown_per_env.items()},
-                )
         except Exception:
-            logger.exception("Cooldown snapshot failed (non-fatal)")
+            logger.exception("Cooldown snapshot build failed (non-fatal)")
+            return False
+
+        local_written = False
+        try:
+            await asyncio.to_thread(
+                _write_gzip_json_atomic,
+                _cooldown_local_path(TRAINING_RUN_ID),
+                snapshot,
+            )
+            local_written = True
+        except Exception:
+            logger.exception("Local cooldown snapshot failed (non-fatal)")
+
+        remote_written = False
+        try:
+            remote_written = bool(await storage.upload_json(
+                _cooldown_snapshot_key(TRAINING_RUN_ID), snapshot
+            ))
+        except Exception:
+            logger.exception("R2 cooldown snapshot failed (non-fatal)")
+
+        if local_written or remote_written:
+            logger.info(
+                "Snapshotted cooldown run=%s window=%d local=%s remote=%s "
+                "(sizes=%s)",
+                TRAINING_RUN_ID,
+                self._window_n,
+                local_written,
+                remote_written,
+                {name: len(state) for name, state in self._cooldown_per_env.items()},
+            )
+        return local_written or remote_written
 
     @staticmethod
     def _validate_content_snapshot(
         snapshot: dict[str, Any],
         env_names: set[str],
+        current_window: int,
     ) -> int:
         if snapshot.get("run_id") != TRAINING_RUN_ID:
             raise ValueError("content cooldown run id mismatch")
@@ -6832,7 +6931,25 @@ class ValidationService:
         envs = snapshot.get("envs")
         if not isinstance(envs, dict) or set(envs) != env_names:
             raise ValueError("content cooldown environments are incomplete")
-        return int(snapshot.get("snapshot_window", -1))
+        snapshot_window = int(snapshot.get("snapshot_window", -1))
+        if not 0 <= snapshot_window <= current_window:
+            raise ValueError(
+                "content cooldown snapshot window is outside history"
+            )
+        for env_name in env_names:
+            state = envs[env_name]
+            if not isinstance(state, dict):
+                raise ValueError(
+                    f"content cooldown env {env_name} must be an object"
+                )
+            if any(
+                not 0 <= int(selected_window) <= snapshot_window
+                for selected_window in state.values()
+            ):
+                raise ValueError(
+                    "content cooldown selection is outside its history"
+                )
+        return snapshot_window
 
     def _top_up_content_cooldown_from_prompt_state(
         self,
@@ -6873,37 +6990,59 @@ class ValidationService:
         content snapshot and resolve only prompt entries newer than it.
         """
         env_names = set(self.envs)
-        snapshot: dict[str, Any] | None = None
-        source = "none"
+        candidates: list[tuple[int, str, dict[str, Any]]] = []
+        remote_snapshot: dict[str, Any] | None = None
         try:
-            candidate = await storage.download_json(
+            remote_snapshot = await storage.download_json(
                 _content_cooldown_snapshot_key(TRAINING_RUN_ID)
             )
-            if candidate is not None:
-                self._validate_content_snapshot(candidate, env_names)
-                snapshot = candidate
-                source = "r2"
         except Exception:
             logger.exception("Failed to restore R2 content cooldown snapshot")
 
-        if snapshot is None:
+        local_snapshot: dict[str, Any] | None = None
+        try:
+            local_snapshot = await asyncio.to_thread(
+                _read_gzip_json,
+                _content_cooldown_local_path(TRAINING_RUN_ID),
+            )
+        except Exception:
+            logger.exception("Failed to restore local content cooldown snapshot")
+
+        for source_name, candidate in (
+            ("r2", remote_snapshot),
+            ("local", local_snapshot),
+        ):
+            if candidate is None:
+                continue
             try:
-                candidate = await asyncio.to_thread(
-                    _read_gzip_json,
-                    _content_cooldown_local_path(TRAINING_RUN_ID),
+                candidate_window = self._validate_content_snapshot(
+                    candidate,
+                    env_names,
+                    self._window_n,
                 )
-                if candidate is not None:
-                    self._validate_content_snapshot(candidate, env_names)
-                    snapshot = candidate
-                    source = "local"
             except Exception:
-                logger.exception("Failed to restore local content cooldown snapshot")
+                logger.exception(
+                    "Invalid %s content cooldown snapshot; discarding it",
+                    source_name,
+                )
+            else:
+                candidates.append((candidate_window, source_name, candidate))
+
+        snapshot: dict[str, Any] | None = None
+        source = "none"
+        if candidates:
+            _, source, snapshot = max(
+                candidates,
+                key=lambda item: (item[0], item[1] == "local"),
+            )
 
         snapshot_window = -1
         try:
             if snapshot is not None:
                 snapshot_window = self._validate_content_snapshot(
-                    snapshot, env_names
+                    snapshot,
+                    env_names,
+                    self._window_n,
                 )
                 envs = snapshot["envs"]
                 for env_name, content_map in self._content_cooldown_per_env.items():
@@ -6965,7 +7104,7 @@ class ValidationService:
                 "snapshot_window": window,
                 "complete": True,
                 "envs": {
-                    name: content_map.export_state()
+                    name: content_map.export_state(through_window=window)
                     for name, content_map in self._content_cooldown_per_env.items()
                 },
             }

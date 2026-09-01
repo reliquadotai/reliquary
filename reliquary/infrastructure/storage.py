@@ -76,11 +76,16 @@ def get_s3_client(
     )
 
 
-async def upload_json(key: str, data: Any, **client_kwargs) -> bool:
-    """Upload JSON data to S3."""
+def _encode_json_payload(key: str, data: Any) -> bytes:
     payload = json.dumps(data, separators=(",", ":")).encode()
     if key.endswith(".gz"):
         payload = gzip.compress(payload)
+    return payload
+
+
+async def upload_json(key: str, data: Any, **client_kwargs) -> bool:
+    """Upload JSON without serializing or compressing on the event loop."""
+    payload = await asyncio.to_thread(_encode_json_payload, key, data)
     async with get_s3_client(**client_kwargs) as client:
         bucket = client_kwargs.get("bucket_name") or os.getenv("R2_BUCKET_ID", "reliquary")
         await client.put_object(Bucket=bucket, Key=key, Body=payload)
@@ -94,9 +99,11 @@ async def download_json(key: str, **client_kwargs) -> dict | None:
             bucket = client_kwargs.get("bucket_name") or os.getenv("R2_BUCKET_ID", "reliquary")
             resp = await client.get_object(Bucket=bucket, Key=key)
             body = await resp["Body"].read()
-            if key.endswith(".gz"):
-                body = gzip.decompress(body)
-            return json.loads(body)
+            def _decode() -> dict:
+                decoded = gzip.decompress(body) if key.endswith(".gz") else body
+                return json.loads(decoded)
+
+            return await asyncio.to_thread(_decode)
     except Exception as e:
         logger.debug("download_json failed for %s: %s", key, e)
         return None
