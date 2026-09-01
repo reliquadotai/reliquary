@@ -162,16 +162,12 @@ def test_a_second_pick_never_reuses_the_first_picks_groups(monkeypatch):
     first, second = _names(picked[0][1]), _names(picked[1][1])
     assert first & second == set()
     assert first | second == {f"g{i}" for i in range(2 * B_BATCH)}
-    # Best-by-rate first: the top half went out in the first pick.
+    # The configured priority determines the first disjoint batch.
     assert first == {f"g{i}" for i in range(B_BATCH, 2 * B_BATCH)}
 
 
 def test_a_completed_proof_no_longer_emits_on_its_own(monkeypatch):
-    """Under v6.1 a completed proof only GROWS the pool. Emission is the
-    service's call (Task 12 paces it on the trainer's cursor), so the
-    automatic ``proven // B_BATCH`` trigger on the proof-completion path
-    is gone -- reaching a full batch of proven groups emits nothing until
-    somebody picks."""
+    """Proof completion and service-paced emission remain separate events."""
     import reliquary.validator.batcher as batcher_module
     from reliquary.validator.proof_scheduler import GlobalProofScheduler
     from tests.unit.test_grpo_window_batcher import (
@@ -318,9 +314,7 @@ def test_no_pick_happens_once_the_window_has_closed(monkeypatch):
 def test_the_close_burns_the_proven_groups_no_pick_ever_took(
     monkeypatch, caplog
 ):
-    """R32: over-collection is the point, so a closing window normally has
-    proven surplus left. That surplus is BURNED -- counted, logged, and
-    never handed to the assembler, which is the only thing that pays."""
+    """Terminal unpicked records are counted and never assembled."""
     batcher = _fill_closed_batcher(monkeypatch, picks_target=1)
     picked = _capture_picks(batcher)
 

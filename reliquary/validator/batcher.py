@@ -1494,16 +1494,10 @@ class GrpoWindowBatcher:
         # too, it had no remaining job.
         #
         # v6.1: this is a PER-ENVIRONMENT ordinal, while
-        # v6 only. Every PASSED group, per environment, appended in the
-        # same rank order ``handle.decisions()`` guarantees -- the pool
-        # ``pick_training_batch`` chooses the B_BATCH best by rate from.
-        # v6.1: append order is no longer emission order; the pool is
-        # sorted at every pick and claimed groups are flagged in place.
+        # Qualification-only proven records. Selection applies the configured
+        # deterministic policy and marks claimed records in place.
         self._proven_groups: dict[str, list[_ProvenGroup]] = {}
-        # v6.1 only. What the close burned: proven groups no pick ever
-        # took (R32), counted once by ``_burn_unpicked_proven_groups`` and
-        # surfaced through ``upload_precommit_conservation`` so the
-        # archive records how much the over-collection actually cost.
+        # Terminal accounting for proven records no pick consumed.
         self._burned_unpicked_groups: int = 0
         self._burned_unpicked_eos_tokens: int = 0
         self._unpicked_groups_burned: bool = False
@@ -1810,10 +1804,8 @@ class GrpoWindowBatcher:
         environment = str(getattr(self.env, "name", ""))
         if self._open_proof_plan_id is None:
             plan_id = f"{self.window_start}:{environment}:fill-closed"
-            # The plan's own pass target is the admission BUDGET, not the
-            # window's close condition: v6.1 closes on picks (R35), and
-            # over-collecting against the budget is the point (R33), so the
-            # plan must stay willing to prove everything the budget admits.
+            # Proof work is bounded by the monotonic admission budget;
+            # window completion is tracked separately by pick ordinals.
             budget = self.fill_state.snapshot()["budgets"][environment]
             handle = scheduler.submit(
                 ProofPlan(
@@ -1855,16 +1847,8 @@ class GrpoWindowBatcher:
         ``drain()`` can wait on it forever, and the next window's plan for
         this environment is refused (one active plan per environment).
 
-        Called unconditionally on both v6 seal paths. It usually has real
-        work to do on BOTH now: under amendment v6.1 the window closes at
-        the Nth pick (R35) while the plan's own ``required_passes`` is the
-        admission budget (R33), which deliberately over-collects -- so a
-        window normally seals with its plan still open, rather than the
-        plan having already finalised itself by covering its target. The
-        self-finalising case survives where a plan does exhaust its budget
-        (via ``_finalize_if_terminal_locked``, off the very same decision
-        ``fill_state.record_proven`` keys off), and this call has to stay
-        harmless there. ``GlobalProofScheduler.seal`` documents itself as
+        Called on both v6 seal paths because the proof plan and window use
+        distinct terminal conditions. ``GlobalProofScheduler.seal`` is
         "idempotent, a no-op on a plan that already finalised", but that
         guard lives INSIDE the same lock acquisition that finalises AND
         retires a plan -- externally, by the time any caller observes a
@@ -2749,17 +2733,11 @@ class GrpoWindowBatcher:
                 "graded_prefix_fill_offset_seconds": (
                     self.graded_prefix_fill_offset_s
                 ),
-                # v6 only. Per-environment proven/in_flight/budget, plus
-                # the window-wide picks and closed flag,
-                # so miners honouring a closed environment can rebalance
-                # toward the scarce one -- the reference miner already
-                # re-reads /state every loop iteration and samples its
-                # environment by the mix weights. None on the auction path.
+                # Qualification-only per-environment progress and terminal
+                # state. None on the auction path.
                 "fill_state": fill_state_snapshot,
-                # v6.1 only (R32). What the close burned: proven groups no
-                # pick ever took. Archived so the cost of deliberate
-                # over-collection (R33) is measurable rather than
-                # inferred -- 0 on the auction path and before the close.
+                # Qualification-only terminal counts; zero on other paths and
+                # before terminal close.
                 "fill_closed_burned_groups": self._burned_unpicked_groups,
                 "fill_closed_burned_eos_tokens": (
                     self._burned_unpicked_eos_tokens
