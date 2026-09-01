@@ -138,6 +138,143 @@ def test_restart_rescan_picks_up_pending(tmp_path):
     assert "reliquary/training/window-30100.npz" in uploaded
 
 
+def test_committed_entry_retry_is_idempotent_and_conflict_is_rejected(
+    tmp_path,
+):
+    q = TrainingPayloadQueue(queue_dir=str(tmp_path))
+    first = q.enqueue_committed_payload(30100, b"abc")
+    second = q.enqueue_committed_payload(30100, b"abc")
+
+    assert first == second
+    assert first.read_bytes() == b"abc"
+    receipt = json.loads(
+        (tmp_path / "journal_commits" / "window-30100.json").read_text()
+    )
+    assert receipt["kind"] == "payload"
+    assert receipt["size"] == 3
+
+    with pytest.raises(RuntimeError, match="different commit"):
+        q.enqueue_committed_payload(30100, b"different")
+    with pytest.raises(RuntimeError, match="different commit"):
+        q.enqueue_committed_tombstone(30100, b"{}")
+
+
+def test_committed_receipt_survives_upload_and_restart(tmp_path):
+    q1 = TrainingPayloadQueue(queue_dir=str(tmp_path))
+    q1.enqueue_committed_payload(30100, b"abc")
+    asyncio.run(q1.drain_once(upload_fn=lambda key, data: None))
+    assert not (tmp_path / "window-30100.npz").exists()
+
+    # A fresh process sees the retained digest receipt.  The identical call
+    # is already committed (and therefore does not recreate an uploaded queue
+    # artifact); an equivocation remains rejected.
+    q2 = TrainingPayloadQueue(queue_dir=str(tmp_path))
+    q2.enqueue_committed_payload(30100, b"abc")
+    assert not (tmp_path / "window-30100.npz").exists()
+    with pytest.raises(RuntimeError, match="different commit"):
+        q2.enqueue_committed_payload(30100, b"changed")
+
+
+def test_committed_entry_repairs_an_unreceipted_hidden_body(
+    tmp_path, monkeypatch,
+):
+    q = TrainingPayloadQueue(queue_dir=str(tmp_path))
+    original = q._enqueue_durable
+    calls = 0
+
+    def fail_receipt(filename, data):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("receipt fsync failed")
+        return original(filename, data)
+
+    monkeypatch.setattr(q, "_enqueue_durable", fail_receipt)
+    with pytest.raises(OSError, match="receipt fsync failed"):
+        q.enqueue_committed_payload(30100, b"abc")
+
+    assert not (tmp_path / "window-30100.npz").exists()
+    assert not (
+        tmp_path / "journal_commits" / "window-30100.json"
+    ).exists()
+    staged = tmp_path / "journal_commits" / "window-30100.payload.body"
+    assert staged.read_bytes() == b"abc"
+    with pytest.raises(RuntimeError, match="different staged bytes"):
+        q.enqueue_committed_payload(30100, b"changed")
+
+    monkeypatch.setattr(q, "_enqueue_durable", original)
+    q.enqueue_committed_payload(30100, b"abc")
+    assert (tmp_path / "window-30100.npz").read_bytes() == b"abc"
+    assert not staged.exists()
+
+
+def test_restart_finishes_receipt_backed_hidden_commit(tmp_path, monkeypatch):
+    import reliquary.infrastructure.training_payload_queue as queue_module
+
+    q1 = TrainingPayloadQueue(queue_dir=str(tmp_path))
+
+    def fail_visible_rename(staging_path, final_path):
+        raise OSError("visible rename failed")
+
+    monkeypatch.setattr(
+        q1, "_publish_staged_journal_entry", fail_visible_rename,
+    )
+    with pytest.raises(OSError, match="visible rename failed"):
+        q1.enqueue_committed_payload(30100, b"abc")
+
+    assert (tmp_path / "journal_commits" / "window-30100.json").exists()
+    assert (
+        tmp_path / "journal_commits" / "window-30100.payload.body"
+    ).exists()
+    assert not (tmp_path / "window-30100.npz").exists()
+
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
+    TrainingPayloadQueue(queue_dir=str(tmp_path))
+    assert (tmp_path / "window-30100.npz").read_bytes() == b"abc"
+    assert not (
+        tmp_path / "journal_commits" / "window-30100.payload.body"
+    ).exists()
+
+
+def test_restart_fails_closed_on_unreceipted_hidden_body(
+    tmp_path, monkeypatch,
+):
+    import reliquary.infrastructure.training_payload_queue as queue_module
+
+    q1 = TrainingPayloadQueue(queue_dir=str(tmp_path))
+    original = q1._enqueue_durable
+    calls = 0
+
+    def fail_receipt(filename, data):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("receipt fsync failed")
+        return original(filename, data)
+
+    monkeypatch.setattr(q1, "_enqueue_durable", fail_receipt)
+    with pytest.raises(OSError, match="receipt fsync failed"):
+        q1.enqueue_committed_payload(30100, b"abc")
+
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
+    with pytest.raises(RuntimeError, match="requires recovery"):
+        TrainingPayloadQueue(queue_dir=str(tmp_path))
+
+
+def test_restart_fails_closed_on_conflicting_artifact_kind(
+    tmp_path, monkeypatch,
+):
+    import reliquary.infrastructure.training_payload_queue as queue_module
+
+    q1 = TrainingPayloadQueue(queue_dir=str(tmp_path))
+    q1.enqueue_committed_payload(30100, b"abc")
+    (tmp_path / "window-30100.tombstone.json").write_bytes(b"{}")
+
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
+    with pytest.raises(RuntimeError, match="conflicting tombstone"):
+        TrainingPayloadQueue(queue_dir=str(tmp_path))
+
+
 # ---------------- v6.1: trainer-paced picks step cursor ----------------
 
 

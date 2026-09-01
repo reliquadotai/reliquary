@@ -269,6 +269,12 @@ class _RecordingQueue:
     def enqueue_tombstone(self, key, data):
         self.tombstones.append((key, data))
 
+    def enqueue_committed_payload(self, key, data):
+        self.payloads.append((key, data))
+
+    def enqueue_committed_tombstone(self, key, data):
+        self.tombstones.append((key, data))
+
 
 def _service():
     from reliquary.validator.service import ValidationService

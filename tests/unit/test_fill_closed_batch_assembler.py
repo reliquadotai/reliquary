@@ -438,13 +438,13 @@ def test_a_second_close_is_a_noop(monkeypatch):
     assert assembler.next_batch_index == next_index_after_first_close
 
 
-def test_enqueue_fn_is_invoked_without_the_lock_held(monkeypatch):
-    """R17: accept() used to hold ``self._lock`` through ``_drain_locked``
-    all the way into the call to ``_enqueue_fn`` -- a blocking filesystem
-    write -- on whichever proof-worker thread happened to call
-    ``accept``. The fake ``enqueue_fn`` below asserts the lock is free
-    the instant it runs, which fails on the pre-fix code (the call was
-    made from inside ``with self._lock:``).
+def test_failed_enqueue_rolls_back_the_accept_without_payment(monkeypatch):
+    """A failed local commit owns neither the key nor the current chunk.
+
+    ``pick_training_batch`` makes that chunk pickable again when this callback
+    raises.  The assembler must therefore roll back the same chunk, retain the
+    earlier sibling, and leave index/payment untouched.  An identical retry
+    then commits exactly once.
     """
     import reliquary.infrastructure.training_payload_queue as queue_module
 
@@ -452,9 +452,12 @@ def test_enqueue_fn_is_invoked_without_the_lock_held(monkeypatch):
 
     window = 42
     calls: list[int] = []
+    fail = True
 
     def enqueue_fn(key: int, data: bytes) -> None:
-        assert not assembler._lock.locked()
+        nonlocal fail
+        if fail:
+            raise OSError("disk full")
         calls.append(key)
 
     assembler = FillClosedBatchAssembler(
@@ -464,10 +467,85 @@ def test_enqueue_fn_is_invoked_without_the_lock_held(monkeypatch):
         tombstone_fn=lambda key, data: None,
     )
 
-    for env in ENV_ORDER:
-        assembler.accept(env, _chunk(0, env), window, "rev")
+    math = _chunk(0, ENV_ORDER[0])
+    code = _chunk(0, ENV_ORDER[1])
+    assembler.accept(ENV_ORDER[0], math, window, "rev")
+
+    import pytest
+
+    with pytest.raises(OSError, match="disk full"):
+        assembler.accept(ENV_ORDER[1], code, window, "rev")
+
+    assert assembler.next_batch_index == 0
+    assert assembler.reward_map() == {}
+    assert assembler.paid_groups() == {env: [] for env in ENV_ORDER}
+    snapshot = assembler.remainder_snapshot()
+    assert snapshot["in_accumulator"] == {
+        ENV_ORDER[0]: B_BATCH,
+        ENV_ORDER[1]: 0,
+    }
+
+    fail = False
+    assembler.accept(ENV_ORDER[1], code, window, "rev")
 
     assert calls == [encoded_window_journal_key(window, 0)]
+    assert assembler.next_batch_index == 1
+    assert assembler.durable_payload_count == 1
+
+
+def test_post_enqueue_accounting_failure_is_idempotently_retryable(
+    monkeypatch,
+):
+    """A future reward error cannot leave partial pay behind a durable key."""
+    import pytest
+    import reliquary.infrastructure.training_payload_queue as queue_module
+
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
+    window = 42
+    committed: dict[int, bytes] = {}
+
+    def immutable_enqueue(key: int, data: bytes) -> None:
+        previous = committed.setdefault(key, data)
+        if previous != data:
+            raise RuntimeError("journal equivocation")
+
+    assembler = FillClosedBatchAssembler(
+        window_start=window,
+        env_order=ENV_ORDER,
+        enqueue_fn=immutable_enqueue,
+        tombstone_fn=lambda key, data: None,
+    )
+    original_accrue = assembler._accrue_payment_locked
+
+    def fail_after_partial_mutation(window_batches, *, batch_index):
+        assembler._paid_groups[ENV_ORDER[0]].append(
+            (batch_index, window_batches[ENV_ORDER[0]][0])
+        )
+        assembler._rewards_by_hotkey["partial"] = 1.0
+        raise RuntimeError("reward calculation failed")
+
+    assembler._accrue_payment_locked = fail_after_partial_mutation
+    math = _chunk(0, ENV_ORDER[0])
+    code = _chunk(0, ENV_ORDER[1])
+    assembler.accept(ENV_ORDER[0], math, window, "rev")
+    with pytest.raises(RuntimeError, match="reward calculation failed"):
+        assembler.accept(ENV_ORDER[1], code, window, "rev")
+
+    assert assembler.next_batch_index == 0
+    assert assembler.reward_map() == {}
+    assert assembler.paid_groups() == {env: [] for env in ENV_ORDER}
+    assert list(committed) == [encoded_window_journal_key(window, 0)]
+
+    assembler._accrue_payment_locked = original_accrue
+    assembler.accept(ENV_ORDER[1], code, window, "rev")
+
+    assert assembler.next_batch_index == 1
+    assert assembler.durable_payload_count == 1
+    assert list(committed) == [encoded_window_journal_key(window, 0)]
+    assert all(
+        len(groups) == B_BATCH
+        for groups in assembler.paid_groups().values()
+    )
 
 
 def test_close_pads_every_remaining_slot_when_remainder_has_every_env(
@@ -713,4 +791,60 @@ def test_accept_after_close_records_the_straggler_instead_of_raising(
     )
     assert (
         assembler.remainder_snapshot()["stragglers"]["count"] == 2
+    )
+
+
+def test_close_retries_from_the_first_undurable_key_without_double_commit(
+    monkeypatch,
+):
+    """A padding failure cannot create a hole or replay an earlier payload."""
+    import pytest
+    import reliquary.infrastructure.training_payload_queue as queue_module
+
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
+    window = 42
+    payload_keys: list[int] = []
+    tombstone_keys: list[int] = []
+    failed_once = False
+
+    def tombstone(key: int, data: bytes) -> None:
+        nonlocal failed_once
+        if not failed_once:
+            failed_once = True
+            raise OSError("queue unavailable")
+        tombstone_keys.append(key)
+
+    assembler = FillClosedBatchAssembler(
+        window_start=window,
+        env_order=ENV_ORDER,
+        enqueue_fn=lambda key, data: payload_keys.append(key),
+        tombstone_fn=tombstone,
+    )
+    for env in ENV_ORDER:
+        assembler.accept(env, _chunk(0, env), window, "rev")
+
+    assert assembler.next_batch_index == 1
+    assert assembler.durable_payload_count == 1
+    with pytest.raises(OSError, match="queue unavailable"):
+        assembler.close()
+
+    # Batch zero is committed once.  The failed tombstone did not consume
+    # index one and a retry resumes there.
+    assert payload_keys == [encoded_window_journal_key(window, 0)]
+    assert assembler.next_batch_index == 1
+    assert assembler.durable_tombstone_count == 0
+
+    assembler.close()
+
+    from reliquary.constants import FILL_CLOSED_EMISSIONS_PER_WINDOW
+
+    assert payload_keys == [encoded_window_journal_key(window, 0)]
+    assert tombstone_keys == [
+        encoded_window_journal_key(window, index)
+        for index in range(1, FILL_CLOSED_EMISSIONS_PER_WINDOW)
+    ]
+    assert assembler.next_batch_index == FILL_CLOSED_EMISSIONS_PER_WINDOW
+    assert assembler.durable_payload_count == 1
+    assert assembler.durable_tombstone_count == (
+        FILL_CLOSED_EMISSIONS_PER_WINDOW - 1
     )

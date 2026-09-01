@@ -990,13 +990,11 @@ class ValidationService:
         # window's ``_open_window_batchers`` has already replaced it by
         # the time the stashed window is archived.
         self._fill_closed_assemblers: dict[int, Any] = {}
-        # v6.1 (R39). The journal key of the LAST batch the last CLOSED
-        # v6 window emitted; the next window's open waits for the
-        # trainer's cursor to reach it. None means the gate is not armed
-        # (no v6 window has closed, or the one that did emitted nothing,
-        # in which case there is nothing to consume and nothing to wait
-        # for). Consumed by the wait -- one close, one wait.
-        self._fill_closed_rotation_key: int | None = None
+        # Experimental fill mode: a restart-safe barrier from the last
+        # durably emitted trainer entry to the next window.  A full cadence
+        # also binds the exact successor checkpoint publication/adoption.
+        self._fill_closed_rotation_store = None
+        self._fill_closed_rotation_gate = None
         self.kl_reference_state: dict[str, Any] = {
             "schema_version": 1,
             "mode": "rolling",
@@ -1404,6 +1402,11 @@ class ValidationService:
         intake = self._checkpoint_intake
         manifest, staged_dir = intake.take_staged()
         revision = str(manifest["revision"])
+        # Persist the trainer cursor binding before changing the active
+        # checkpoint.  Readiness also requires the active manifest to equal
+        # this candidate, so a failed swap remains closed; a crash immediately
+        # after a successful install can recover the proof from this record.
+        self._record_fill_closed_checkpoint_candidate(manifest)
         try:
             await asyncio.to_thread(
                 self._refresh_verify_model_from_dir, staged_dir, revision,
@@ -1487,139 +1490,275 @@ class ValidationService:
         )
         return True
 
-    def _arm_fill_closed_rotation_gate(self) -> None:
-        """R39: remember the journal key of the LAST batch this window
-        emitted, so the next window opens only once the trainer has
-        CONSUMED it.
+    def _arm_fill_closed_rotation_gate(
+        self, *, reserve_full_range: bool = False,
+    ) -> None:
+        """Persist the exact barrier the next experimental window must clear.
 
-        Supersedes the revision-baseline gate this method used to arm.
-        Waiting for a PUBLICATION was structurally wrong: the trainer
-        publishes at 16 TRAINED batches CUMULATIVE, not per window, so an
-        underfilled window armed a wait for a checkpoint that would never
-        come (a full backstop of dead air), and a publication landing
-        mid-window over-armed the next one. Consumption has neither
-        failure mode -- a window waits for exactly what it put in the
-        journal, and nothing else. Checkpoint adoption is untouched and
-        stays on ``_detached_checkpoint_tick``'s serial beat; if the
-        consumption being waited on happened to cross the publish
-        boundary, the staged revision is adopted there as usual.
-
-        ``next_batch_index`` is the assembler's count of real emissions
-        and has not yet been padded by ``close()`` at this point in the
-        loop, so key ``next_batch_index - 1`` is the last batch this
-        window actually emitted. Zero emitted disarms outright: there is
-        nothing to consume, so there is nothing to wait for.
+        Every window waits for measured consumption of its last durable
+        entry.  A window that produced a complete cadence of real payloads
+        additionally expects a newly trained checkpoint: the next open is
+        forbidden until a candidate manifest covering that cursor is both
+        published and installed into the verify/proof plane.  Underfilled or
+        quarantined windows do not invent a publication that the trainer's
+        counter will never produce.
         """
         from reliquary.constants import FILL_CLOSED_EMISSIONS_PER_WINDOW
         from reliquary.infrastructure.training_payload_queue import (
             encoded_window_journal_key,
         )
+        from reliquary.validator.fill_closed_rotation import (
+            FillClosedRotationGate,
+        )
 
         assembler = getattr(self, "_fill_closed_assembler", None)
         emitted = int(getattr(assembler, "next_batch_index", 0) or 0)
         window_start = getattr(assembler, "window_start", None)
-        if emitted <= 0 or window_start is None:
-            # No emissions, or no assembler to say which window they were
-            # filed under: disarm rather than guess a key, since a wrong
-            # key gates the next window on something nobody will consume.
-            self._fill_closed_rotation_key = None
+        if window_start is None or (emitted <= 0 and not reserve_full_range):
+            self._clear_fill_closed_rotation_gate()
             return
-        # Clamped rather than trusted: the encoder raises outside the
-        # window's reserved range, and this runs on the window loop where
-        # that would cost the whole iteration for a telemetry value.
-        index = min(emitted - 1, FILL_CLOSED_EMISSIONS_PER_WINDOW - 1)
-        self._fill_closed_rotation_key = encoded_window_journal_key(
-            int(window_start), index
+        index = (
+            FILL_CLOSED_EMISSIONS_PER_WINDOW - 1
+            if reserve_full_range
+            else min(emitted - 1, FILL_CLOSED_EMISSIONS_PER_WINDOW - 1)
+        )
+        checkpoint = self._checkpoint_store.current_manifest()
+        if checkpoint is None or not checkpoint.revision:
+            raise RuntimeError(
+                "fill-closed rotation cannot bind an unpublished parent"
+            )
+        payload_count = int(
+            getattr(assembler, "durable_payload_count", 0) or 0
+        )
+        gate = FillClosedRotationGate(
+            source_window=int(window_start),
+            required_journal_key=encoded_window_journal_key(
+                int(window_start), index
+            ),
+            parent_checkpoint_n=int(checkpoint.checkpoint_n),
+            parent_revision=str(checkpoint.revision),
+            durable_payload_count=payload_count,
+            requires_successor=(
+                payload_count >= FILL_CLOSED_EMISSIONS_PER_WINDOW
+            ),
+        )
+        self._persist_fill_closed_rotation_gate(gate)
+
+    def _initialize_fill_closed_rotation_store(self) -> None:
+        """Load the restart barrier at service start, before any window opens."""
+        if not FILL_CLOSED_ENABLED:
+            return
+        from reliquary.constants import DETACHED_TRAINER, WRITE_TRAINING_PAYLOADS
+
+        if not WRITE_TRAINING_PAYLOADS:
+            raise RuntimeError(
+                "experimental fill-closed mode requires "
+                "RELIQUARY_WRITE_TRAINING_PAYLOADS=1; payment cannot be "
+                "committed without its durable trainer journal entry"
+            )
+        if not DETACHED_TRAINER:
+            raise RuntimeError(
+                "experimental fill-closed mode requires the detached trainer; "
+                "the pipelined in-process half cannot publish while the next "
+                "open is held behind its successor-checkpoint barrier"
+            )
+        # Construct the queue before the HTTP server or any window.  Its
+        # fill-mode recovery pass finishes receipt-backed visible renames and
+        # rejects an unreceipted staging body, which cannot be reconciled with
+        # lost in-memory reward/index state after a process restart.
+        self._training_payload_queue_ref()
+        if getattr(self, "_fill_closed_rotation_store", None) is not None:
+            return
+        from reliquary.validator.fill_closed_rotation import (
+            FillClosedRotationStore,
         )
 
+        state_dir = Path(
+            os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")
+        )
+        store = FillClosedRotationStore(state_dir)
+        gate = store.load()
+        self._fill_closed_rotation_store = store
+        self._fill_closed_rotation_gate = gate
+
+    def _persist_fill_closed_rotation_gate(self, gate) -> None:
+        store = getattr(self, "_fill_closed_rotation_store", None)
+        if store is not None:
+            store.save(gate)
+        self._fill_closed_rotation_gate = gate
+
+    def _clear_fill_closed_rotation_gate(self) -> None:
+        store = getattr(self, "_fill_closed_rotation_store", None)
+        if store is not None:
+            store.clear()
+        self._fill_closed_rotation_gate = None
+
+    def _record_fill_closed_checkpoint_candidate(self, manifest: dict) -> None:
+        """Persist a covering candidate before attempting its atomic swap.
+
+        Readiness still compares this record with the active checkpoint, so a
+        failed swap cannot release the gate.  Persisting first closes the
+        opposite crash window: after a successful install and process death,
+        restart can prove which candidate's trainer cursor the active revision
+        covers without guessing from a revision alone.
+        """
+        gate = getattr(self, "_fill_closed_rotation_gate", None)
+        if gate is None or not gate.requires_successor:
+            return
+        try:
+            checkpoint_n = int(manifest["checkpoint_n"])
+            revision = str(manifest["revision"])
+            trained_cursor = int(manifest["trained_window_cursor"])
+        except (KeyError, TypeError, ValueError):
+            return
+        if (
+            checkpoint_n <= gate.parent_checkpoint_n
+            or revision == gate.parent_revision
+            or trained_cursor < gate.required_journal_key
+        ):
+            return
+        self._persist_fill_closed_rotation_gate(
+            gate.record_adoption(
+                checkpoint_n=checkpoint_n,
+                revision=revision,
+                trained_cursor=trained_cursor,
+            )
+        )
+
+    def _fill_closed_rotation_adoption_ready(self, gate) -> bool:
+        checkpoint = self._checkpoint_store.current_manifest()
+        return gate.adoption_covers(checkpoint)
+
+    async def _advance_fill_closed_checkpoint_adoption(self) -> None:
+        """Progress detached checkpoint polling/staging/swap without opening."""
+        from reliquary.constants import DETACHED_TRAINER
+
+        gate = getattr(self, "_fill_closed_rotation_gate", None)
+        if gate is None or not gate.requires_successor:
+            return
+        if not DETACHED_TRAINER:
+            checkpoint = self._checkpoint_store.current_manifest()
+            if (
+                checkpoint is not None
+                and checkpoint.checkpoint_n > gate.parent_checkpoint_n
+                and checkpoint.revision != gate.parent_revision
+            ):
+                self._persist_fill_closed_rotation_gate(
+                    gate.record_adoption(
+                        checkpoint_n=checkpoint.checkpoint_n,
+                        revision=checkpoint.revision,
+                        trained_cursor=gate.required_journal_key,
+                    )
+                )
+            return
+
+        intake = self._detached_intake_ref()
+        task = getattr(self, "_intake_stage_task", None)
+        if task is not None and task.done():
+            # Retrieve any unexpected task exception before clearing the
+            # handle.  ``CheckpointIntake.stage`` normally reports failure as
+            # False, but a programming error must remain visible.
+            await task
+            self._intake_stage_task = None
+        if intake.staged_ready:
+            await self._swap_staged_checkpoint(self._window_n)
+            return
+        if getattr(self, "_intake_stage_task", None) is None:
+            await self._poll_and_stage_checkpoint_candidate(intake)
+
     async def _wait_for_fill_closed_rotation(self) -> str:
-        """R39: hold the next v6 window's construction until the trainer
-        has consumed every batch the closed window emitted.
+        """Hold the next open until consumption and expected adoption agree.
 
-        The amendment closes a window at its 16th pick and opens the next
-        one on a synchronisation point, so that a window is never
-        collected against a policy the trainer has already moved past and
-        intra-window pacing drift resets between windows. The point is
-        the trainer's own cursor reaching this window's last batch --
-        measured consumption, never a declared interval and never a
-        publication (see ``_arm_fill_closed_rotation_gate`` for why the
-        publication reading was wrong).
-
-        The arming is CONSUMED here: one close, one wait. A second call
-        finds nothing armed and returns immediately, so a stale key can
-        never gate a later window.
-
-        Skipped entirely under ``RELIQUARY_DISABLE_TRAIN``: the freeze
-        stops the trainer consuming anything, so the gate would stall the
-        validator for a backstop per window during the very incident the
-        freeze exists to contain.
-
-        Bounded by ``FILL_CLOSED_MAX_SECONDS``, the same backstop that
-        bounds the window itself -- a dead trainer consumes nothing ever,
-        and an unbounded wait would take the validator off the air rather
-        than merely stop its learning. Same discipline as
-        ``_wait_for_window_seal``: a bounded async wait with an explicit
-        poll interval, never a busy loop, and a preparation stage on
-        ``/state`` throughout so a held rotation is legible from outside.
+        The time backstop is an observability/liveness boundary, not a policy
+        bypass: timeout and emergency freeze leave the durable gate armed and
+        return a blocked outcome.  The outer loop must remain closed and retry.
         """
         if not FILL_CLOSED_ENABLED:
             return "disabled"
-        required = getattr(self, "_fill_closed_rotation_key", None)
-        if required is None:
+        gate = getattr(self, "_fill_closed_rotation_gate", None)
+        if gate is None:
             return "not_armed"
-        self._fill_closed_rotation_key = None
         if os.environ.get("RELIQUARY_DISABLE_TRAIN", "").lower() in {
             "1", "true", "yes", "on",
         }:
+            self._set_window_preparation_stage("fill_closed_rotation_frozen")
             logger.warning(
-                "Window %d: emergency freeze active; not holding the next "
-                "window's open on trainer consumption (nothing will ever "
-                "consume journal key %s under the freeze)",
-                self._window_n, required,
+                "Window %d: emergency freeze active; keeping the next window "
+                "closed behind journal key %s",
+                self._window_n, gate.required_journal_key,
             )
             return "emergency_freeze"
 
         def consumed() -> bool:
             cursor = self._read_trainer_step_cursor()
-            return cursor is not None and int(cursor) >= int(required)
+            return (
+                cursor is not None
+                and int(cursor) >= gate.required_journal_key
+            )
 
-        if consumed():
-            return "batches_consumed"
+        async def ready() -> bool:
+            await self._advance_fill_closed_checkpoint_adoption()
+            active_gate = getattr(self, "_fill_closed_rotation_gate", gate)
+            return consumed() and self._fill_closed_rotation_adoption_ready(
+                active_gate
+            )
+
+        if await ready():
+            result = (
+                "checkpoint_adopted"
+                if gate.requires_successor else "batches_consumed"
+            )
+            self._clear_fill_closed_rotation_gate()
+            return result
         loop = asyncio.get_running_loop()
         started = loop.time()
         deadline = started + FILL_CLOSED_MAX_SECONDS
         self._set_window_preparation_stage("fill_closed_rotation_wait")
         logger.info(
-            "Window %d closed; holding the next window's open until the "
-            "trainer has consumed its last batch (journal key %s, backstop "
-            "%.0f s). Opening now would collect against a policy the "
-            "trainer has already moved past.",
-            self._window_n, required, FILL_CLOSED_MAX_SECONDS,
+            "Window %d closed; holding the next open for journal key %s "
+            "(successor checkpoint required=%s, backstop %.0f s)",
+            self._window_n,
+            gate.required_journal_key,
+            gate.requires_successor,
+            FILL_CLOSED_MAX_SECONDS,
         )
         while True:
             remaining = deadline - loop.time()
             if remaining <= 0:
-                logger.error(
-                    "Trainer has not consumed window %d's last batch "
-                    "(journal key %s) %.0f s after it closed; opening the "
-                    "next window anyway. The trainer is stalled or dead -- "
-                    "its cursor will not move for that window either, so it "
-                    "will take its first %d picks on the time floor and then "
-                    "end on its own backstop.",
-                    self._window_n, required, FILL_CLOSED_MAX_SECONDS,
-                    FILL_CLOSED_PICK_PIPELINE_DEPTH,
+                self._set_window_preparation_stage(
+                    "fill_closed_rotation_blocked"
                 )
-                return "rotation_wait_timeout"
+                logger.error(
+                    "Rotation gate for window %d did not clear in %.0f s "
+                    "(journal key %s successor=%s); leaving admission closed",
+                    self._window_n,
+                    FILL_CLOSED_MAX_SECONDS,
+                    gate.required_journal_key,
+                    gate.requires_successor,
+                )
+                return "rotation_blocked_timeout"
             await asyncio.sleep(
                 min(FILL_CLOSED_ROTATION_POLL_SECONDS, remaining)
             )
-            if consumed():
-                logger.info(
-                    "Window %d's batches consumed in %.1f s; opening the "
-                    "next window",
-                    self._window_n, loop.time() - started,
+            if os.environ.get("RELIQUARY_DISABLE_TRAIN", "").lower() in {
+                "1", "true", "yes", "on",
+            }:
+                self._set_window_preparation_stage(
+                    "fill_closed_rotation_frozen"
                 )
-                return "batches_consumed"
+                return "emergency_freeze"
+            if await ready():
+                result = (
+                    "checkpoint_adopted"
+                    if gate.requires_successor else "batches_consumed"
+                )
+                self._clear_fill_closed_rotation_gate()
+                logger.info(
+                    "Window %d rotation cleared in %.1f s (%s)",
+                    self._window_n, loop.time() - started,
+                    result,
+                )
+                return result
 
     async def _seal_wait_and_close(
         self,
@@ -5073,8 +5212,8 @@ class ValidationService:
         fill_closed_batches: dict[str, list] = {}
         if FILL_CLOSED_ENABLED:
             archived_window = int(getattr(first_batcher, "window_start", 0))
-            fill_closed_assembler = self._fill_closed_assemblers.pop(
-                archived_window, None
+            fill_closed_assembler = self._fill_closed_assemblers.get(
+                archived_window
             )
             # Any assembler older than the window being archived belongs to
             # a window that was dropped before it ever reached here; nothing
@@ -5102,6 +5241,11 @@ class ValidationService:
                 # validator replays. In pipelined mode this is a no-op.
                 fill_closed_assembler.close()
                 fill_closed_batches = fill_closed_assembler.paid_groups()
+                # Only release the recovery handle after close() has made the
+                # complete journal range durable.  On failure the aborted-
+                # window path needs this assembler's committed index to pad
+                # exactly the remaining keys without overwriting earlier ones.
+                self._fill_closed_assemblers.pop(archived_window, None)
 
         # Build the combined batch entries and runners_up from all envs.
         batch_entries = []
@@ -5726,13 +5870,7 @@ class ValidationService:
         )
         for index in range(first_index, FILL_CLOSED_EMISSIONS_PER_WINDOW):
             key = encoded_window_journal_key(int(window_start), index)
-            try:
-                self._training_payload_queue_ref().enqueue_tombstone(key, data)
-            except Exception:
-                logger.exception(
-                    "fill-closed window tombstone write failed for journal "
-                    "key %s", key,
-                )
+            self._write_fill_closed_training_tombstone(key, data)
 
     def _write_fill_closed_training_payload(
         self, key: int, data: bytes,
@@ -5744,23 +5882,16 @@ class ValidationService:
         now runs ``assess_training_batch`` per batch (R14) and only
         calls this for batches it did NOT quarantine; a quarantined
         batch goes to ``_write_fill_closed_training_tombstone`` instead.
-        Best-effort and silent on ``WRITE_TRAINING_PAYLOADS`` off,
-        matching the seal path's own kill-switch; a write failure here
-        is logged and dropped rather than tombstoned, since -- unlike a
-        sealed window -- there is no single terminal journal slot for a
-        mid-window emission to mark failed against.
+        Fill mode fails closed when payload writing is disabled or the local
+        durable enqueue fails.  The assembler catches no such error: it keeps
+        its journal index and reward map unchanged, and the batcher returns the
+        groups to its proven pool for an unambiguous retry.
         """
         from reliquary.constants import WRITE_TRAINING_PAYLOADS
 
         if not WRITE_TRAINING_PAYLOADS:
-            return
-        try:
-            self._training_payload_queue_ref().enqueue_payload(key, data)
-        except Exception:
-            logger.exception(
-                "fill-closed training payload write failed for journal "
-                "key %s", key,
-            )
+            raise RuntimeError("fill-closed trainer journal writing is disabled")
+        self._training_payload_queue_ref().enqueue_committed_payload(key, data)
 
     def _write_fill_closed_training_tombstone(
         self, key: int, data: bytes,
@@ -5772,22 +5903,15 @@ class ValidationService:
         (not the bare window) so ``WindowJournal.next_entry`` finds it at
         the same cursor position a payload would have occupied -- the
         trainer's cursor advances on this marker instead of stalling.
-        Mirrors the payload sibling: best-effort, silent on
-        ``WRITE_TRAINING_PAYLOADS`` off, and a write failure here is
-        logged and dropped for the same reason (no single terminal slot
-        to mark failed against mid-window).
+        Mirrors the payload sibling's create-only, fail-closed commit.
         """
         from reliquary.constants import WRITE_TRAINING_PAYLOADS
 
         if not WRITE_TRAINING_PAYLOADS:
-            return
-        try:
-            self._training_payload_queue_ref().enqueue_tombstone(key, data)
-        except Exception:
-            logger.exception(
-                "fill-closed training tombstone write failed for journal "
-                "key %s", key,
-            )
+            raise RuntimeError("fill-closed trainer journal writing is disabled")
+        self._training_payload_queue_ref().enqueue_committed_tombstone(
+            key, data
+        )
 
     def _enqueue_aborted_window(
         self,
@@ -6058,6 +6182,10 @@ class ValidationService:
     async def run(self, subtensor) -> None:
         from reliquary.infrastructure.archive_queue import get_archive_queue
 
+        # Load a persisted experimental rotation barrier before any startup
+        # path can construct or expose a new window.  Corrupt state raises and
+        # keeps the validator closed rather than guessing past the barrier.
+        self._initialize_fill_closed_rotation_store()
         archive_queue = get_archive_queue()
         self.server.configure_archive_queue_telemetry(archive_queue.snapshot)
         self.server.configure_registration_gate()
@@ -6147,12 +6275,16 @@ class ValidationService:
                             self._windows_since_cooldown_snapshot = 0
                         continue
                     self._window_iteration_stage = "open"
-                    # v6.1 (R39): the next window opens once the trainer
-                    # has CONSUMED the last one's batches. A no-op with
-                    # the gate off, under an emergency freeze, and before
-                    # the first v6 close (nothing armed) -- rotation stays
-                    # byte-identical for v4/v5.
-                    await self._wait_for_fill_closed_rotation()
+                    # Experimental fill mode never treats its synchronization
+                    # backstop or emergency freeze as permission to open.  The
+                    # durable gate remains armed and the loop retries closed.
+                    rotation = await self._wait_for_fill_closed_rotation()
+                    if rotation in {
+                        "emergency_freeze",
+                        "rotation_blocked_timeout",
+                    }:
+                        await asyncio.sleep(FILL_CLOSED_ROTATION_POLL_SECONDS)
+                        continue
                     self._open_window()
                     self._window_iteration_stage = "admission_pools"
                     self._set_window_preparation_stage("admission_pools")
@@ -6305,11 +6437,16 @@ class ValidationService:
                             self._window_n, seal_reason,
                         )
                     if FILL_CLOSED_ENABLED:
-                        # R39: arm the next open's consumption gate while
-                        # this window's assembler is still the current one
-                        # (``_train_and_publish`` pops it below) and its
-                        # ``next_batch_index`` still counts only the real
-                        # mid-window emissions, before ``close()`` pads.
+                        # Reserve the complete range first so a local disk
+                        # failure during close leaves a durable closed barrier,
+                        # then close transactionally and rewrite the gate with
+                        # the final real-payload count.  This also makes the
+                        # remainder/padding visible to the trainer before any
+                        # next-window decision.
+                        self._arm_fill_closed_rotation_gate(
+                            reserve_full_range=True
+                        )
+                        self._fill_closed_assembler.close()
                         self._arm_fill_closed_rotation_gate()
 
                     from reliquary.constants import PIPELINED_WINDOWS

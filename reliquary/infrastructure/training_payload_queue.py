@@ -10,6 +10,7 @@ dashboard consumes.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -261,6 +262,15 @@ class TrainingPayloadQueue:
         # unchanged cursor (idle trainer between real steps) is not
         # re-PUT every drain cycle forever.
         self._step_cursor_last_uploaded_body: bytes | None = None
+        # Experimental fill-closed entries are create-only journal commits,
+        # not replaceable cache values.  Serialise their artifact + receipt
+        # pair so two proof-worker callbacks cannot race the same key through
+        # the shared ``.tmp`` filename.
+        self._journal_commit_lock = threading.Lock()
+        self._journal_commit_dir = self.queue_dir / "journal_commits"
+        if FILL_CLOSED_ENABLED:
+            self._journal_commit_dir.mkdir(parents=True, exist_ok=True)
+            self._recover_committed_journal_entries()
 
     # ---------------- producer ----------------
 
@@ -271,6 +281,152 @@ class TrainingPayloadQueue:
             f.write(data)
         os.replace(tmp_path, final_path)
         return final_path
+
+    def _enqueue_durable(self, filename: str, data: bytes) -> Path:
+        """Atomic local commit with file and parent-directory durability."""
+        final_path = self.queue_dir / filename
+        tmp_path = self.queue_dir / (filename + ".tmp")
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp_path, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, final_path)
+        directory_fd = os.open(final_path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return final_path
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        directory_fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    def _journal_staging_path(self, slot: int, kind: str) -> Path:
+        return self._journal_commit_dir / f"window-{slot}.{kind}.body"
+
+    def _publish_staged_journal_entry(
+        self, staging_path: Path, final_path: Path,
+    ) -> None:
+        """Make a receipt-backed artifact visible to the upload scanner."""
+        os.replace(staging_path, final_path)
+        # The rename crosses directories.  Persist both the visible name and
+        # removal of the hidden staging name before reporting success.
+        self._fsync_directory(self.queue_dir)
+        self._fsync_directory(self._journal_commit_dir)
+
+    @staticmethod
+    def _validate_journal_receipt(
+        receipt: Any, *, source: str,
+    ) -> dict[str, Any]:
+        fields = {"schema_version", "journal_key", "kind", "sha256", "size"}
+        if not isinstance(receipt, dict) or set(receipt) != fields:
+            raise RuntimeError(f"journal commit receipt {source} has invalid fields")
+        if receipt.get("schema_version") != 1:
+            raise RuntimeError(f"journal commit receipt {source} has invalid schema")
+        slot = receipt.get("journal_key")
+        size = receipt.get("size")
+        kind = receipt.get("kind")
+        digest = receipt.get("sha256")
+        if isinstance(slot, bool) or not isinstance(slot, int) or slot < 0:
+            raise RuntimeError(f"journal commit receipt {source} has invalid key")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise RuntimeError(f"journal commit receipt {source} has invalid size")
+        if kind not in {"payload", "tombstone"}:
+            raise RuntimeError(f"journal commit receipt {source} has invalid kind")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise RuntimeError(f"journal commit receipt {source} has invalid digest")
+        return receipt
+
+    @staticmethod
+    def _artifact_matches_receipt(path: Path, receipt: dict[str, Any]) -> bool:
+        try:
+            body = path.read_bytes()
+        except OSError as exc:
+            raise RuntimeError(f"journal artifact {path} is unreadable") from exc
+        return (
+            len(body) == receipt["size"]
+            and hashlib.sha256(body).hexdigest() == receipt["sha256"]
+        )
+
+    def _recover_committed_journal_entries(self) -> None:
+        """Finish receipt-backed commits interrupted before visible rename.
+
+        The uploader only scans the queue root.  Staging bodies under the
+        receipt directory therefore cannot disappear before their receipt is
+        durable.  On restart, a valid receipt plus hidden body is enough to
+        finish the rename without reconstructing any in-memory batch state.
+        """
+        with self._journal_commit_lock:
+            for receipt_path in sorted(self._journal_commit_dir.glob("window-*.json")):
+                try:
+                    receipt = json.loads(receipt_path.read_text("utf-8"))
+                except (OSError, ValueError, TypeError) as exc:
+                    raise RuntimeError(
+                        f"journal commit receipt {receipt_path.name} is unreadable"
+                    ) from exc
+                receipt = self._validate_journal_receipt(
+                    receipt, source=receipt_path.name,
+                )
+                slot = receipt["journal_key"]
+                if receipt_path.name != f"window-{slot}.json":
+                    raise RuntimeError(
+                        f"journal commit receipt {receipt_path.name} names a different key"
+                    )
+                kind = receipt["kind"]
+                suffix = (
+                    _TOMBSTONE_SUFFIX if kind == "tombstone" else _PAYLOAD_SUFFIX
+                )
+                other_suffix = (
+                    _PAYLOAD_SUFFIX if kind == "tombstone" else _TOMBSTONE_SUFFIX
+                )
+                other_kind = "payload" if kind == "tombstone" else "tombstone"
+                final_path = self.queue_dir / f"window-{slot}{suffix}"
+                other_path = self.queue_dir / f"window-{slot}{other_suffix}"
+                staging_path = self._journal_staging_path(slot, kind)
+                other_staging_path = self._journal_staging_path(slot, other_kind)
+                if other_path.exists() or other_staging_path.exists():
+                    raise RuntimeError(
+                        f"journal key {slot} also has a conflicting {other_kind} artifact"
+                    )
+                if final_path.exists():
+                    if not self._artifact_matches_receipt(final_path, receipt):
+                        raise RuntimeError(
+                            f"journal key {slot} artifact differs from its receipt"
+                        )
+                    if staging_path.exists():
+                        if not self._artifact_matches_receipt(staging_path, receipt):
+                            raise RuntimeError(
+                                f"journal key {slot} staging body differs from its receipt"
+                            )
+                        staging_path.unlink()
+                        self._fsync_directory(self._journal_commit_dir)
+                elif staging_path.exists():
+                    if not self._artifact_matches_receipt(staging_path, receipt):
+                        raise RuntimeError(
+                            f"journal key {slot} staging body differs from its receipt"
+                        )
+                    self._publish_staged_journal_entry(staging_path, final_path)
+            orphaned = sorted(self._journal_commit_dir.glob("window-*.body"))
+            if orphaned:
+                # The body reached disk but its commit receipt did not.  Only
+                # the original producer can retry it byte-identically and
+                # restore reward/index state.  A fresh process has no safe
+                # basis to manufacture that in-memory transaction, so startup
+                # remains closed for explicit abort/quarantine recovery.
+                raise RuntimeError(
+                    "unreceipted fill-closed journal staging body requires "
+                    f"recovery: {orphaned[0].name}"
+                )
 
     def enqueue_payload(self, window_start: int, data: bytes) -> Path:
         # A window replayed under the same number after a fatal restart
@@ -301,6 +457,144 @@ class TrainingPayloadQueue:
             window_start,
         )
         return path
+
+    def _enqueue_committed_journal_entry(
+        self,
+        window_start: int,
+        data: bytes,
+        *,
+        is_tombstone: bool,
+    ) -> Path:
+        """Create one immutable fill-closed journal slot.
+
+        The ordinary payload methods intentionally retain their historical
+        replacement semantics for legacy windows.  Progressive fill-closed
+        emission needs a stronger contract: a journal key is committed once,
+        byte-identically retryable, and never allowed to change kind or body.
+
+        The opaque artifact is first written under a hidden staging name, its
+        small digest receipt is committed second, and only then is the artifact
+        renamed into the upload queue.  The receipt is retained after upload,
+        so retries remain idempotent.  Restart finishes a receipt-backed hidden
+        rename; an unreceipted body can only be claimed byte-identically.
+        """
+        slot = int(window_start)
+        body = bytes(data)
+        kind = "tombstone" if is_tombstone else "payload"
+        digest = hashlib.sha256(body).hexdigest()
+        suffix = _TOMBSTONE_SUFFIX if is_tombstone else _PAYLOAD_SUFFIX
+        other_suffix = _PAYLOAD_SUFFIX if is_tombstone else _TOMBSTONE_SUFFIX
+        final_path = self.queue_dir / f"window-{slot}{suffix}"
+        other_path = self.queue_dir / f"window-{slot}{other_suffix}"
+        receipt_path = self._journal_commit_dir / f"window-{slot}.json"
+        staging_path = self._journal_staging_path(slot, kind)
+        other_kind = "payload" if is_tombstone else "tombstone"
+        other_staging_path = self._journal_staging_path(slot, other_kind)
+        receipt = {
+            "schema_version": 1,
+            "journal_key": slot,
+            "kind": kind,
+            "sha256": digest,
+            "size": len(body),
+        }
+
+        with self._journal_commit_lock:
+            try:
+                existing_receipt = json.loads(receipt_path.read_text("utf-8"))
+            except FileNotFoundError:
+                existing_receipt = None
+            except (OSError, ValueError, TypeError) as exc:
+                raise RuntimeError(
+                    f"journal commit receipt for key {slot} is unreadable"
+                ) from exc
+            if existing_receipt is not None:
+                existing_receipt = self._validate_journal_receipt(
+                    existing_receipt, source=receipt_path.name,
+                )
+                expected = {
+                    "schema_version": 1,
+                    "journal_key": slot,
+                    "kind": kind,
+                    "sha256": digest,
+                    "size": len(body),
+                }
+                if existing_receipt != expected:
+                    raise RuntimeError(
+                        f"journal key {slot} already has a different commit"
+                    )
+                if other_path.exists() or other_staging_path.exists():
+                    raise RuntimeError(
+                        f"journal key {slot} also has a conflicting {other_kind} artifact"
+                    )
+                if final_path.exists() and not self._artifact_matches_receipt(
+                    final_path, expected,
+                ):
+                    raise RuntimeError(
+                        f"journal key {slot} artifact differs from its receipt"
+                    )
+                if staging_path.exists():
+                    if not self._artifact_matches_receipt(staging_path, expected):
+                        raise RuntimeError(
+                            f"journal key {slot} staging body differs from its receipt"
+                        )
+                    if final_path.exists():
+                        staging_path.unlink()
+                        self._fsync_directory(self._journal_commit_dir)
+                    else:
+                        self._publish_staged_journal_entry(
+                            staging_path, final_path,
+                        )
+                return final_path
+
+            if other_path.exists() or other_staging_path.exists():
+                raise RuntimeError(
+                    f"journal key {slot} already has a {other_kind} artifact"
+                )
+            if final_path.exists():
+                if final_path.read_bytes() != body:
+                    raise RuntimeError(
+                        f"journal key {slot} already has different bytes"
+                    )
+            elif staging_path.exists():
+                if staging_path.read_bytes() != body:
+                    raise RuntimeError(
+                        f"journal key {slot} already has different staged bytes"
+                    )
+            else:
+                self._enqueue_durable(
+                    str(Path("journal_commits") / staging_path.name), body,
+                )
+            self._enqueue_durable(
+                str(Path("journal_commits") / receipt_path.name),
+                json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode(
+                    "utf-8"
+                ),
+            )
+            # A legacy/pre-staging artifact may have been uploaded while the
+            # receipt was written.  Otherwise publish the hidden body now.
+            if not final_path.exists() and staging_path.exists():
+                self._publish_staged_journal_entry(staging_path, final_path)
+            logger.info(
+                "TrainingPayloadQueue: committed %s for journal key %d (%s)",
+                kind,
+                slot,
+                digest[:12],
+            )
+            return final_path
+
+    def enqueue_committed_payload(self, window_start: int, data: bytes) -> Path:
+        """Durably create or byte-identically replay one payload slot."""
+        return self._enqueue_committed_journal_entry(
+            window_start, data, is_tombstone=False,
+        )
+
+    def enqueue_committed_tombstone(
+        self, window_start: int, data: bytes,
+    ) -> Path:
+        """Durably create or byte-identically replay one tombstone slot."""
+        return self._enqueue_committed_journal_entry(
+            window_start, data, is_tombstone=True,
+        )
 
     def enqueue_epoch_marker(self, epoch_id: str, data: bytes) -> Path:
         from reliquary.shared.training_payload import (

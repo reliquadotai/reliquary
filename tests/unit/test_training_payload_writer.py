@@ -2,6 +2,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from reliquary import constants as C
 from reliquary.shared.training_payload import (
     decode_tombstone,
@@ -21,6 +23,12 @@ class _RecordingQueue:
         self.payloads[n] = data
 
     def enqueue_tombstone(self, n, data):
+        self.tombstones[n] = data
+
+    def enqueue_committed_payload(self, n, data):
+        self.payloads[n] = data
+
+    def enqueue_committed_tombstone(self, n, data):
         self.tombstones[n] = data
 
 
@@ -91,3 +99,54 @@ def test_writer_never_raises(monkeypatch):
         stub, _window_batches(), 30100, "rev", {},
     )
     ValidationService._write_training_tombstone(stub, 30100, "s", "t")
+
+
+def test_fill_closed_writer_commits_through_the_immutable_queue_api(
+    monkeypatch,
+):
+    monkeypatch.setattr(C, "WRITE_TRAINING_PAYLOADS", True)
+    queue = _RecordingQueue()
+    stub = _stub_service(queue)
+
+    ValidationService._write_fill_closed_training_payload(
+        stub, 481600, b"payload"
+    )
+    ValidationService._write_fill_closed_training_tombstone(
+        stub, 481601, b"tombstone"
+    )
+
+    assert queue.payloads == {481600: b"payload"}
+    assert queue.tombstones == {481601: b"tombstone"}
+
+
+def test_fill_closed_writer_fails_closed_when_the_queue_does(monkeypatch):
+    monkeypatch.setattr(C, "WRITE_TRAINING_PAYLOADS", True)
+
+    class _Boom:
+        def enqueue_committed_payload(self, n, data):
+            raise OSError("disk full")
+
+        def enqueue_committed_tombstone(self, n, data):
+            raise OSError("disk full")
+
+    stub = _stub_service(_Boom())
+    with pytest.raises(OSError, match="disk full"):
+        ValidationService._write_fill_closed_training_payload(
+            stub, 481600, b"payload"
+        )
+    with pytest.raises(OSError, match="disk full"):
+        ValidationService._write_fill_closed_training_tombstone(
+            stub, 481601, b"tombstone"
+        )
+
+
+def test_fill_closed_writer_cannot_pay_with_journal_writing_disabled(
+    monkeypatch,
+):
+    monkeypatch.setattr(C, "WRITE_TRAINING_PAYLOADS", False)
+    stub = _stub_service(_RecordingQueue())
+
+    with pytest.raises(RuntimeError, match="journal writing is disabled"):
+        ValidationService._write_fill_closed_training_payload(
+            stub, 481600, b"payload"
+        )

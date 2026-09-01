@@ -19,15 +19,13 @@ past that until the accumulator's current cycle empties out, so a fast
 environment's second chunk is never lost, only held -- exactly the
 remainder ``BalancedTrainingAccumulator`` already exists to carry.
 
-Lock discipline (R17): ``self._lock`` guards only the in-memory join
-state (the accumulator and the pending queues). Every method that mutates
-that state does so entirely under the lock, builds any payload/tombstone
-bytes it needs to write while still holding it, then releases the lock
-BEFORE calling ``_enqueue_fn``/``_tombstone_fn`` -- the same discipline
-``batcher.py``'s ``pick_training_batch`` uses around its own injected
-callback (see batcher.py's docstring on ``_claim_pick_chunk``):
-a blocking filesystem write must never run while a proof-worker thread
-holds the lock another thread needs.
+Commit discipline: the callback only performs a local atomic queue commit;
+network upload remains asynchronous.  A journal entry is durably enqueued
+while ``self._lock`` serialises its key, then the assembler advances the
+index and accrues payment.  This deliberately keeps the short local write in
+the critical section: releasing the lock between prepare and commit allowed
+another proof callback to reserve a later key, and mutating state before the
+write created paid journal holes on disk failure.
 """
 
 from __future__ import annotations
@@ -51,13 +49,14 @@ logger = logging.getLogger(__name__)
 
 
 class _PreparedWrite(NamedTuple):
-    """One payload or tombstone, fully encoded while ``_lock`` was held,
-    ready to be written (and logged) after it is released."""
+    """One uncommitted payload or tombstone for the current journal key."""
 
     key: int
     data: bytes
     is_tombstone: bool
     log_message: str
+    window_batches: dict[str, list[Any]] | None
+    reset_accumulator: bool
 
 
 class FillClosedBatchAssembler:
@@ -111,6 +110,12 @@ class FillClosedBatchAssembler:
         # environment's slot for THAT cycle is present, never from
         # whichever environment's callback happened to arrive last.
         self.next_batch_index: int = 0
+        # Counts only entries whose local durable enqueue completed.  The
+        # rotation gate uses the payload count to decide whether a successor
+        # checkpoint is actually expected; padding/quarantine tombstones do
+        # not create optimizer steps.
+        self.durable_payload_count: int = 0
+        self.durable_tombstone_count: int = 0
         # One lock: two per-environment batchers can call ``accept`` from
         # two different proof-worker device threads at once, and both the
         # accumulator and the pending queues are shared, mutable state.
@@ -151,7 +156,6 @@ class FillClosedBatchAssembler:
                 f"assembler for window {self.window_start} received a "
                 f"chunk for window {window_start}"
             )
-        straggler_log_message: str | None = None
         with self._lock:
             # R19 (amended): a straggler proof-worker callback landing
             # after ``close()`` has already run is a NORMAL race -- a
@@ -165,27 +169,92 @@ class FillClosedBatchAssembler:
                 self._straggler_count += 1
                 self._last_straggler_environment = environment
                 self._last_straggler_batch_index = self.next_batch_index
-                straggler_log_message = (
+                logger.error(
                     "FillClosedBatchAssembler: straggler chunk for "
                     "window %d env %s arrived after close() -- %d proven "
                     "groups lost to training (window already sealed); "
-                    "straggler count now %d" % (
-                        self.window_start, environment, len(groups),
-                        self._straggler_count,
-                    )
+                    "straggler count now %d",
+                    self.window_start,
+                    environment,
+                    len(groups),
+                    self._straggler_count,
                 )
-                prepared: list[_PreparedWrite] = []
-            else:
+                return
+            # ``pick_training_batch`` returns the current chunk to its proven
+            # pool when this callback raises.  Snapshot the join state before
+            # accepting it so a failed local journal commit cannot leave the
+            # same groups both retained here and pickable upstream.
+            before = self._join_state_snapshot_locked()
+            try:
                 self._checkpoint_revision = str(checkpoint_revision)
                 self._pending[environment].append(list(groups))
-                prepared = self._drain_locked()
-        if straggler_log_message is not None:
-            logger.error(straggler_log_message)
-        self._write_all(prepared)
+                prepared = self._prepare_next_ready_locked()
+                if prepared is not None:
+                    self._commit_write_locked(prepared)
+            except Exception:
+                self._restore_join_state_locked(before)
+                raise
 
-    def _drain_locked(self) -> list[_PreparedWrite]:
-        prepared: list[_PreparedWrite] = []
-        while True:
+    def _join_state_snapshot_locked(self) -> dict[str, Any]:
+        """Minimal rollback image for one ``accept`` transaction."""
+        return {
+            "accumulator_groups": {
+                environment: list(groups)
+                for environment, groups in self._accumulator._groups.items()
+            },
+            "accumulator_windows": {
+                environment: list(windows)
+                for environment, windows in self._accumulator._source_windows.items()
+            },
+            "accumulator_revision": self._accumulator.checkpoint_revision,
+            "pending": {
+                environment: [list(chunk) for chunk in chunks]
+                for environment, chunks in self._pending.items()
+            },
+            "checkpoint_revision": self._checkpoint_revision,
+            "next_batch_index": self.next_batch_index,
+            "durable_payload_count": self.durable_payload_count,
+            "durable_tombstone_count": self.durable_tombstone_count,
+            "rewards_by_hotkey": dict(self._rewards_by_hotkey),
+            "paid_groups": {
+                environment: list(groups)
+                for environment, groups in self._paid_groups.items()
+            },
+        }
+
+    def _restore_join_state_locked(self, snapshot: dict[str, Any]) -> None:
+        for environment in self._env_order:
+            self._accumulator._groups[environment] = list(
+                snapshot["accumulator_groups"][environment]
+            )
+            self._accumulator._source_windows[environment] = list(
+                snapshot["accumulator_windows"][environment]
+            )
+            self._pending[environment] = [
+                list(chunk) for chunk in snapshot["pending"][environment]
+            ]
+        self._accumulator.checkpoint_revision = snapshot[
+            "accumulator_revision"
+        ]
+        self._checkpoint_revision = snapshot["checkpoint_revision"]
+        self.next_batch_index = snapshot["next_batch_index"]
+        self.durable_payload_count = snapshot["durable_payload_count"]
+        self.durable_tombstone_count = snapshot["durable_tombstone_count"]
+        self._rewards_by_hotkey = dict(snapshot["rewards_by_hotkey"])
+        self._paid_groups = {
+            environment: list(groups)
+            for environment, groups in snapshot["paid_groups"].items()
+        }
+
+    def _prepare_next_ready_locked(self) -> _PreparedWrite | None:
+        """Feed queued chunks until one full cycle is ready.
+
+        At most one write is prepared per ``accept`` call.  That makes the
+        upstream callback transaction unambiguous: either this exact chunk is
+        durably owned by the assembler, or the whole call rolls back and the
+        batcher may safely make it pickable again.
+        """
+        while not self._accumulator.ready:
             fed_any = False
             counts = self._accumulator.snapshot()["counts"]
             for environment in self._env_order:
@@ -200,27 +269,18 @@ class FillClosedBatchAssembler:
                         checkpoint_revision=self._checkpoint_revision,
                     )
                     fed_any = True
-            if self._accumulator.ready:
-                prepared.append(
-                    self._prepare_payload_locked(allow_partial=False)
-                )
-                continue
             if not fed_any:
-                return prepared
+                return None
+        return self._prepare_payload_locked(allow_partial=False)
 
     def _prepare_payload_locked(
         self, *, allow_partial: bool
     ) -> _PreparedWrite:
-        """Build one payload or tombstone from the accumulator's current
-        cycle, mutating only in-memory state (the accumulator itself and
-        ``next_batch_index``). No I/O here (R17) -- the caller writes the
-        returned ``_PreparedWrite`` after releasing ``_lock``.
-        """
+        """Encode one entry without advancing accounting or journal state."""
         extracted = self._accumulator.training_batches(
             self._env_order, allow_partial=allow_partial,
         )
         window_batches = dict(zip(self._env_order, extracted))
-        self._accumulator.reset()
         flat_batch = [
             group
             for env_batch in window_batches.values()
@@ -237,16 +297,9 @@ class FillClosedBatchAssembler:
         # cross-batcher concern that spans a whole window's rejections,
         # not one join cycle's, and this class has no wiring to it.
         #
-        # Payment (R20) is credited BEFORE the quarantine verdict
-        # below, deliberately: quarantine protects model state, not
-        # emission. The seal path says so in as many words ("Rewards and
-        # archives remain per-window; this gate only protects model
-        # state" -- service.py), and a miner whose proven group happens
-        # to share a batch with someone else's poisoned one must not
-        # lose its pay for it.
-        self._accrue_payment_locked(
-            window_batches, batch_index=self.next_batch_index
-        )
+        # Quarantine protects model state, not emission.  Payment is still
+        # computed over this batch, but only in ``_commit_write_locked`` after
+        # its payload/tombstone is durably present in the local journal.
         decision = assess_training_batch(flat_batch, reject_counts={})
         key = encoded_window_journal_key(
             self.window_start, self.next_batch_index
@@ -281,8 +334,14 @@ class FillClosedBatchAssembler:
                 key, decision.quarantined, decision.reasons,
             )
         )
-        self.next_batch_index += 1
-        return _PreparedWrite(key, data, is_tombstone, log_message)
+        return _PreparedWrite(
+            key,
+            data,
+            is_tombstone,
+            log_message,
+            window_batches,
+            True,
+        )
 
     def _prepare_incomplete_remainder_tombstone_locked(self) -> _PreparedWrite:
         """R16: the ``close()`` path when at least one environment
@@ -308,9 +367,47 @@ class FillClosedBatchAssembler:
                 self._accumulator.snapshot()["counts"],
             )
         )
-        self._accumulator.reset()
-        self.next_batch_index += 1
-        return _PreparedWrite(key, data, True, log_message)
+        return _PreparedWrite(
+            key,
+            data,
+            True,
+            log_message,
+            None,
+            True,
+        )
+
+    def _commit_write_locked(self, entry: _PreparedWrite) -> None:
+        """Durably enqueue ``entry`` and only then commit accounting state."""
+        if entry.key != encoded_window_journal_key(
+            self.window_start, self.next_batch_index
+        ):
+            raise RuntimeError("prepared journal key is no longer current")
+        before = self._join_state_snapshot_locked()
+        try:
+            if entry.is_tombstone:
+                self._tombstone_fn(entry.key, entry.data)
+            else:
+                self._enqueue_fn(entry.key, entry.data)
+
+            # Everything below is in-memory and is expected not to fail.  The
+            # rollback image still covers it: if a future reward implementation
+            # raises after a partial mutation, an idempotent durable retry must
+            # not double-pay or skip this key.
+            if entry.window_batches is not None:
+                self._accrue_payment_locked(
+                    entry.window_batches, batch_index=self.next_batch_index
+                )
+            if entry.reset_accumulator:
+                self._accumulator.reset()
+            self.next_batch_index += 1
+            if entry.is_tombstone:
+                self.durable_tombstone_count += 1
+            else:
+                self.durable_payload_count += 1
+        except Exception:
+            self._restore_join_state_locked(before)
+            raise
+        logger.info(entry.log_message)
 
     def _accrue_payment_locked(
         self, window_batches: dict[str, list[Any]], *, batch_index: int
@@ -412,16 +509,6 @@ class FillClosedBatchAssembler:
                 for environment, groups in self._paid_groups.items()
             }
 
-    def _write_all(self, prepared: list[_PreparedWrite]) -> None:
-        """Perform the actual writes -- and only the writes -- outside
-        ``_lock`` (R17). Called with the list already fully encoded."""
-        for entry in prepared:
-            if entry.is_tombstone:
-                self._tombstone_fn(entry.key, entry.data)
-            else:
-                self._enqueue_fn(entry.key, entry.data)
-            logger.info(entry.log_message)
-
     def close(self) -> None:
         """Called once by the service when this window closes (R16),
         after every batcher has handed its last chunk to ``accept``. A
@@ -469,13 +556,19 @@ class FillClosedBatchAssembler:
         with self._lock:
             if self._closed:
                 return
-            self._closed = True
-            prepared: list[_PreparedWrite] = []
+            # Do not mark closed until every owned journal slot is locally
+            # durable.  If any callback raises, committed earlier slots stay
+            # committed and a later ``close()`` resumes exactly at the failed
+            # key; accepts are still allowed because their upstream picks were
+            # not durably claimed.
             while self.next_batch_index < FILL_CLOSED_EMISSIONS_PER_WINDOW:
                 # Absorb whatever fits without forcing anything -- the
                 # SAME merge ``accept()`` uses, including writing any
                 # full cross-env cycle it completes along the way.
-                prepared.extend(self._drain_locked())
+                prepared = self._prepare_next_ready_locked()
+                if prepared is not None:
+                    self._commit_write_locked(prepared)
+                    continue
                 counts = self._accumulator.snapshot()["counts"]
                 still_outstanding = any(counts.values()) or any(
                     self._pending[environment]
@@ -484,11 +577,11 @@ class FillClosedBatchAssembler:
                 if not still_outstanding:
                     break
                 if self._accumulator.has_groups_for_all_targets:
-                    prepared.append(
+                    self._commit_write_locked(
                         self._prepare_payload_locked(allow_partial=True)
                     )
                 else:
-                    prepared.append(
+                    self._commit_write_locked(
                         self._prepare_incomplete_remainder_tombstone_locked()
                     )
                 # Loop again: the forced write above just reset the
@@ -500,10 +593,13 @@ class FillClosedBatchAssembler:
             # R18: whatever slots the loop above did not use, up to the
             # window's own ceiling, would otherwise stay unwritten
             # forever -- see ``_prepare_underfill_padding_locked``.
-            prepared.extend(self._prepare_underfill_padding_locked())
-        self._write_all(prepared)
+            while self.next_batch_index < FILL_CLOSED_EMISSIONS_PER_WINDOW:
+                self._commit_write_locked(
+                    self._prepare_underfill_padding_locked()
+                )
+            self._closed = True
 
-    def _prepare_underfill_padding_locked(self) -> list[_PreparedWrite]:
+    def _prepare_underfill_padding_locked(self) -> _PreparedWrite:
         """R18: ``WindowJournal.next_entry`` (trainer/journal.py) walks
         the encoded key space one integer at a time -- ``payload_key``,
         then ``tombstone_key``, else wait -- with no logic to jump past
@@ -521,26 +617,31 @@ class FillClosedBatchAssembler:
         invariant a fully-filled window already gets for free by using
         every slot itself.
         """
-        padding: list[_PreparedWrite] = []
-        while self.next_batch_index < FILL_CLOSED_EMISSIONS_PER_WINDOW:
-            key = encoded_window_journal_key(
-                self.window_start, self.next_batch_index
+        if self.next_batch_index >= FILL_CLOSED_EMISSIONS_PER_WINDOW:
+            raise RuntimeError("fill-closed journal range is already complete")
+        key = encoded_window_journal_key(
+            self.window_start, self.next_batch_index
+        )
+        data = encode_tombstone(
+            window_start=self.window_start,
+            failure_stage="window_underfilled",
+            failure_type="WindowUnderfilled",
+        )
+        log_message = (
+            "FillClosedBatchAssembler: window %d batch %d padded "
+            "with a tombstone at close (journal key %d, window "
+            "underfilled)" % (
+                self.window_start, self.next_batch_index, key,
             )
-            data = encode_tombstone(
-                window_start=self.window_start,
-                failure_stage="window_underfilled",
-                failure_type="WindowUnderfilled",
-            )
-            log_message = (
-                "FillClosedBatchAssembler: window %d batch %d padded "
-                "with a tombstone at close (journal key %d, window "
-                "underfilled)" % (
-                    self.window_start, self.next_batch_index, key,
-                )
-            )
-            padding.append(_PreparedWrite(key, data, True, log_message))
-            self.next_batch_index += 1
-        return padding
+        )
+        return _PreparedWrite(
+            key,
+            data,
+            True,
+            log_message,
+            None,
+            False,
+        )
 
     def remainder_snapshot(self) -> dict[str, Any]:
         """Groups still held and not yet part of a written payload, for

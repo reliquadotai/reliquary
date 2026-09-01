@@ -523,7 +523,7 @@ def _run(coro):
 
 
 def _rotation_service(monkeypatch, *, key, cursor=None, enabled=True,
-                      freeze=False):
+                      freeze=False, requires_successor=False):
     import reliquary.infrastructure.training_payload_queue as queue_module
     import reliquary.validator.service as service_module
     monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
@@ -534,7 +534,26 @@ def _rotation_service(monkeypatch, *, key, cursor=None, enabled=True,
     monkeypatch.setenv("RELIQUARY_DISABLE_TRAIN", "1" if freeze else "0")
     service = ValidationService.__new__(ValidationService)
     service._training_payload_queue = _CursorQueue(cursor)
-    service._fill_closed_rotation_key = key
+    service._fill_closed_rotation_store = None
+    if key is None:
+        service._fill_closed_rotation_gate = None
+    else:
+        from reliquary.validator.fill_closed_rotation import (
+            FillClosedRotationGate,
+        )
+        service._fill_closed_rotation_gate = FillClosedRotationGate(
+            source_window=WINDOW,
+            required_journal_key=key,
+            parent_checkpoint_n=7,
+            parent_revision="parent-revision",
+            durable_payload_count=3,
+            requires_successor=requires_successor,
+        )
+    service._checkpoint_store = SimpleNamespace(
+        current_manifest=lambda: SimpleNamespace(
+            checkpoint_n=7, revision="parent-revision"
+        )
+    )
     service._window_n = WINDOW
     service._window_preparation_stage = None
     service.stages = []
@@ -586,21 +605,20 @@ def test_a_window_that_emitted_nothing_does_not_wait_at_all(monkeypatch):
 
 
 def test_rotation_is_bounded_by_the_fill_closed_backstop(monkeypatch):
-    """A dead trainer never consumes anything; the backstop opens the
-    next window anyway rather than taking the validator off the air."""
+    """A dead trainer reaches a visible backstop but admission stays closed."""
     import reliquary.validator.service as service_module
     monkeypatch.setattr(service_module, "FILL_CLOSED_MAX_SECONDS", 0.0)
     last = encoded_window_journal_key(WINDOW, 2)
     service = _rotation_service(monkeypatch, key=last, cursor=None)
     assert _run(service._wait_for_fill_closed_rotation()) == (
-        "rotation_wait_timeout"
+        "rotation_blocked_timeout"
     )
+    assert service._fill_closed_rotation_gate is not None
+    assert service.stages[-1] == "fill_closed_rotation_blocked"
 
 
-def test_an_emergency_freeze_skips_the_gate(monkeypatch, caplog):
-    """RELIQUARY_DISABLE_TRAIN stops the trainer consuming anything, so
-    holding rotation on consumption would stall the validator for a
-    backstop per window during the very incident the freeze exists for."""
+def test_an_emergency_freeze_keeps_admission_closed(monkeypatch, caplog):
+    """The incident switch freezes learning and cannot bypass rotation."""
     last = encoded_window_journal_key(WINDOW, 2)
     service = _rotation_service(
         monkeypatch, key=last, cursor=None, freeze=True
@@ -613,6 +631,8 @@ def test_an_emergency_freeze_skips_the_gate(monkeypatch, caplog):
         "freeze" in record.getMessage() for record in caplog.records
     )
     assert service._training_payload_queue.reads == 0
+    assert service._fill_closed_rotation_gate is not None
+    assert service.stages[-1] == "fill_closed_rotation_frozen"
 
 
 def test_the_wait_publishes_a_preparation_stage(monkeypatch):
@@ -642,28 +662,35 @@ def test_with_the_gate_off_rotation_never_waits(monkeypatch):
 
 
 def test_the_arming_records_the_last_emitted_batchs_journal_key(monkeypatch):
-    """The gate's whole input: the key of the LAST batch this window
-    emitted, or None when it emitted none. Nothing about revisions."""
+    """Arming binds the last durable key and its parent checkpoint."""
     import reliquary.infrastructure.training_payload_queue as queue_module
     import reliquary.validator.service as service_module
     monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
     monkeypatch.setattr(service_module, "FILL_CLOSED_ENABLED", True)
     service = ValidationService.__new__(ValidationService)
-    service._fill_closed_rotation_key = "stale"
+    service._fill_closed_rotation_store = None
+    service._fill_closed_rotation_gate = SimpleNamespace(stale=True)
+    service._checkpoint_store = SimpleNamespace(
+        current_manifest=lambda: SimpleNamespace(
+            checkpoint_n=7, revision="parent-revision"
+        )
+    )
 
     service._fill_closed_assembler = SimpleNamespace(
-        window_start=WINDOW, next_batch_index=0
+        window_start=WINDOW, next_batch_index=0, durable_payload_count=0,
     )
     service._arm_fill_closed_rotation_gate()
-    assert service._fill_closed_rotation_key is None
+    assert service._fill_closed_rotation_gate is None
 
     service._fill_closed_assembler = SimpleNamespace(
-        window_start=WINDOW, next_batch_index=3
+        window_start=WINDOW, next_batch_index=3, durable_payload_count=3,
     )
     service._arm_fill_closed_rotation_gate()
-    assert service._fill_closed_rotation_key == encoded_window_journal_key(
-        WINDOW, 2
-    )
+    gate = service._fill_closed_rotation_gate
+    assert gate.required_journal_key == encoded_window_journal_key(WINDOW, 2)
+    assert gate.parent_checkpoint_n == 7
+    assert gate.parent_revision == "parent-revision"
+    assert gate.requires_successor is False
 
 
 def test_the_arming_is_consumed_by_one_wait(monkeypatch):
@@ -674,5 +701,71 @@ def test_the_arming_is_consumed_by_one_wait(monkeypatch):
     assert _run(service._wait_for_fill_closed_rotation()) == (
         "batches_consumed"
     )
-    assert service._fill_closed_rotation_key is None
+    assert service._fill_closed_rotation_gate is None
     assert _run(service._wait_for_fill_closed_rotation()) == "not_armed"
+
+
+def test_full_window_requires_covering_checkpoint_adoption(monkeypatch):
+    """Cursor consumption alone cannot open work derived from stale weights."""
+    last = encoded_window_journal_key(WINDOW, 2)
+    service = _rotation_service(
+        monkeypatch,
+        key=last,
+        cursor=last,
+        requires_successor=True,
+    )
+
+    async def no_poll():
+        return None
+
+    service._advance_fill_closed_checkpoint_adoption = no_poll
+
+    async def drive():
+        task = asyncio.create_task(service._wait_for_fill_closed_rotation())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not task.done()
+        gate = service._fill_closed_rotation_gate.record_adoption(
+            checkpoint_n=8,
+            revision="successor-revision",
+            trained_cursor=last,
+        )
+        service._fill_closed_rotation_gate = gate
+        service._checkpoint_store = SimpleNamespace(
+            current_manifest=lambda: SimpleNamespace(
+                checkpoint_n=8, revision="successor-revision"
+            )
+        )
+        return await task
+
+    assert _run(drive()) == "checkpoint_adopted"
+    assert service._fill_closed_rotation_gate is None
+
+
+def test_candidate_cursor_must_cover_the_rotation_key(monkeypatch):
+    last = encoded_window_journal_key(WINDOW, 2)
+    service = _rotation_service(
+        monkeypatch,
+        key=last,
+        cursor=last,
+        requires_successor=True,
+    )
+
+    service._record_fill_closed_checkpoint_candidate({
+        "checkpoint_n": 8,
+        "revision": "too-early",
+        "trained_window_cursor": last - 1,
+    })
+    assert service._fill_closed_rotation_gate.adopted_revision is None
+
+    service._record_fill_closed_checkpoint_candidate({
+        "checkpoint_n": 8,
+        "revision": "covering",
+        "trained_window_cursor": last,
+    })
+    assert service._fill_closed_rotation_gate.adopted_revision == "covering"
+    # Recording a covering candidate is not adoption.  The active manifest
+    # still names the parent, so readiness remains false.
+    assert service._fill_closed_rotation_adoption_ready(
+        service._fill_closed_rotation_gate
+    ) is False
