@@ -5150,12 +5150,9 @@ class ValidatorServer:
                 if drand_observation.reject_reason is not None:
                     # Epoch commitments are bound to the active epoch, lane,
                     # checkpoint, generation randomness, nonce, and exact
-                    # payload digest. Their validator-stamped receipt time and
-                    # fixed commitment deadline are authoritative; the miner's
-                    # round is telemetry, never an admission or rank key. An
-                    # older signed round is therefore harmless, while a future
-                    # round remains impossible to have observed. Ordinary
-                    # windows retain their exact production freshness policy.
+                    # payload digest. Their validator receipt and fixed
+                    # deadline are the admission clock; ordinary windows retain
+                    # their configured production freshness policy.
                     if (
                         not epoch_commitment
                         or drand_observation.reject_reason

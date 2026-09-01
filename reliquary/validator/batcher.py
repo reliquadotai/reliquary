@@ -1778,11 +1778,8 @@ class GrpoWindowBatcher:
     def _register_payload_digest(self, digest: str) -> bool:
         """Record a submission payload digest for this window.
 
-        Returns True the first time ``digest`` is seen this window, False on
-        every resubmission. Under fill-closed per-token payment a duplicate
-        group would collect payment for the same tokens twice, so this must
-        be airtight rather than best-effort -- the precommit gives it for
-        free, at the hash, before any payload moves or capacity is reserved.
+        Returns ``True`` only for the first reservation of an exact digest.
+        Duplicate detection happens before payload transfer or capacity use.
         """
         if digest in self._payload_digests_seen:
             return False
@@ -1790,16 +1787,9 @@ class GrpoWindowBatcher:
         return True
 
     def _release_payload_digest(self, digest: str) -> None:
-        """Give a digest back to the window (R29).
+        """Release a pre-transfer reservation that never reached reveal.
 
-        The burn happens at precommit-ACCEPT, before a single byte of the
-        body has moved -- so a receipt that never delivers one has taken a
-        digest out of circulation for nothing. An honest miner retrying the
-        same body after a failed upload would be refused HASH_DUPLICATE for
-        the rest of the window: the same lockout shape as the no-reveal
-        circuit, where every ``rate_limited`` reject turned out to be an
-        honest operator. A REVEALED precommit keeps its burn -- that one IS
-        the dedup, and the tokens behind it were already paid for.
+        Revealed payloads retain their digest reservation for the window.
         """
         self._payload_digests_seen.discard(str(digest))
 
@@ -1907,27 +1897,10 @@ class GrpoWindowBatcher:
         self._reconcile_fill_state_decisions(environment)
 
     def _submit_arrival_proof(self, pending: PendingSubmission) -> None:
-        """Buffer one graded body for the open-ended plan, then drain.
+        """Validate and buffer one graded body for the qualification plan.
 
-        ``robust_utility_admits`` is the admission-time analogue of the
-        auction's least-favourable pricing (Task 4): with no auction to
-        price a manufactured zero, a group whose least favourable reading
-        leaves the zone must be refused outright, before it ever touches
-        the buffer or any capacity.
-
-        Everything past that gate is queueing, not deciding: the body is
-        keyed by the rate its own precommit registered
-        (``ThroughputAdmissionQueue.rate_of``) and appended to
-        ``_arrival_proof_buffer``, so a slower body that happens to grade
-        first does not jump a faster one still on its way in. The actual
-        reservation and dispatch order are decided in
-        ``_drain_arrival_proof_buffer``, not here.
-
-        The rate and the precommit's payload size are captured HERE, at
-        the one moment both are cheaply available, and carried through
-        the buffer onto the proven record (amendment v6.1): the pick that
-        eventually spends them runs after the proof, on a different
-        thread, with no receipt in hand.
+        Ordering metadata is captured before asynchronous proof dispatch so
+        the configured deterministic policy can be reproduced afterward.
         """
         if self.fill_state is None:
             return
@@ -1976,30 +1949,10 @@ class GrpoWindowBatcher:
         self._drain_arrival_proof_buffer(environment)
 
     def _drain_arrival_proof_buffer(self, environment: str) -> None:
-        """Pull the buffer's highest-rate entry into the plan, one at a
-        time, for as long as the environment has admission BUDGET left.
+        """Drain records by configured priority under a monotonic budget.
 
-        Called on both moments the buffer can move: a graded body landing
-        (so a fast group is not left waiting behind nothing) and a proof
-        completing (so the next-fastest group goes out next, rather than
-        whichever happens to arrive next).
-
-        Sorting and the budget spend both happen HERE, at drain time --
-        never at buffering time. That is what keeps a buffered group
-        honest: a group sitting behind a spent budget has consumed
-        nothing, and if it never drains, it never will.
-
-        R33: what ``may_admit`` gates is a MONOTONE budget, and that is
-        the point of the new meaning -- draining is what spends real
-        grading and proof cost, so a group whose proof then fails does
-        NOT hand its budget back. ``release()`` frees proof capacity
-        (``in_flight``) for the next candidate; it never reopens
-        admission. Once an environment's budget is spent, this drain goes
-        permanently inert for the rest of the window and whatever is
-        still buffered stays buffered. Under amendment v6.1 that costs a
-        miner nothing it was promised: budget buys a proof attempt and a
-        place in the pick pool, never a seat -- seats are granted at
-        picks (``pick_training_batch``), out of the pool, by rate.
+        A terminal proof decision releases concurrency but never refunds the
+        per-window admission budget.
         """
         if self.fill_state is None:
             return
@@ -2175,26 +2128,10 @@ class GrpoWindowBatcher:
         return False
 
     def pick_training_batch(self) -> bool:
-        """Take one PICK: hand the ``B_BATCH`` best-by-rate proven groups
-        of THIS environment to the injected callback. Returns whether a
-        pick actually happened.
+        """Emit one full batch from the disabled fill qualification pool.
 
-        Amendment v6.1, point 1. Seats are granted here, not on arrival.
-        Everything in ``_proven_groups`` has already been graded and
-        proved, so the pool is the population of groups that COULD be
-        trained on; this chooses which ``B_BATCH`` of them are, by
-        precommit rate (``_pick_sort_key``). Because each pick draws from
-        a pool that has had strictly more time to fill, later picks can
-        seat answers that were still generating when the earlier ones ran
-        -- a short-to-long curriculum with no parameter, and the whole
-        reason the amendment exists.
-
-        Externally triggered ON PURPOSE. The old emission fired itself
-        from the proof-completion path the moment ``proven // B_BATCH``
-        advanced, which made admission order into emission order and left
-        no moment at which a choice could be made. The SERVICE decides
-        when a pick happens (Task 12 paces it on the trainer's own
-        consumption cursor); this method only executes one.
+        The service owns pacing; this method applies the configured
+        deterministic priority to already-proven, unpicked records.
 
         A pick never emits a partial batch: with fewer than ``B_BATCH``
         unpicked proven groups it refuses and returns False, leaving the
@@ -2318,26 +2255,7 @@ class GrpoWindowBatcher:
         return (environment, chunk, window_start, checkpoint_revision, claimed)
 
     def _burn_unpicked_proven_groups(self) -> None:
-        """R32: at close, whatever is proven but was never picked is
-        BURNED -- counted, logged, and never paid.
-
-        Deliberate, not a leak. Admission is bounded by a budget rather
-        than by the window's emission target precisely so that the pool
-        over-collects (R33): late picks can only choose longer answers if
-        those answers are already sitting in the pool, which means the
-        pool must hold more than the picks will ever take. The surplus is
-        the price of that choice. It is never redistributed and never
-        paid -- payment happens only in the assembler, and a burned group
-        never reaches it -- which is the same burn-never-redistribute rule
-        v4/v5 already apply to unfilled slots.
-
-        One-shot: ``poll_deadline`` is polled on a loop, so this records
-        what the window ENDED with, not a running per-poll tally. A proof
-        that only finalises AFTER this ran (a straggler still on a device
-        thread at the seal) lands in the pool unpicked and unpaid like
-        any other burn, but lands too late to be in this count -- the
-        window is already sealed and no pick can take it.
-        """
+        """Record proven records left unpicked at terminal close exactly once."""
         if self.fill_state is None or self._unpicked_groups_burned:
             return
         environment = str(getattr(self.env, "name", ""))
@@ -2509,8 +2427,7 @@ class GrpoWindowBatcher:
                     operator=operator,
                     deadline=deadline,
                     payload_bytes=payload_bytes,
-                    # Carried so an expiry releases exactly what was burned
-                    # above (R29); only set when the burn actually happened.
+                    # Present only when this reservation owns the digest lock.
                     payload_sha256=(
                         str(payload_sha256)
                         if FILL_CLOSED_ENABLED and payload_sha256

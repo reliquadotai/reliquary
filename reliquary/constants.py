@@ -933,16 +933,8 @@ if (
         "RELIQUARY_FILL_CLOSED_MAX_SECONDS"
     )
 
-# Amendment v6.1 (R33): admission is bounded by a per-environment BUDGET,
-# not by ``FILL_CLOSED_TARGET_GROUPS_PER_ENV`` -- the window no longer
-# closes on a proven count (see FillState.is_closed, gated on picks
-# instead), so admission needs its own bound. Over-collection past what
-# any single pick could ever choose is deliberate: a pick only chooses
-# among groups already proven, so late, longer-generating groups must
-# already be sitting in the pool for a late pick to pick them. The
-# grading cost of every admitted candidate is real and non-refundable
-# (FillState's ``admitted`` counter is monotone), so this is still a real
-# ceiling on aggregate generation spend, just not the close rule.
+# Qualification-only bound on productive admissions per environment. It is
+# separate from the pick target and remains monotonic for a window.
 FILL_CLOSED_ADMISSION_BUDGET_PER_ENV = int(_os.environ.get(
     "RELIQUARY_FILL_CLOSED_ADMISSION_BUDGET_PER_ENV",
     str(2 * FILL_CLOSED_TARGET_GROUPS_PER_ENV),
@@ -981,19 +973,9 @@ if not (
         "window's trainable capacity"
     )
 
-# Amendment v6.1 (R34): picks are paced by the TRAINER's own consumption
-# cursor, so no constant here may encode the trainer's step time -- the
-# cadence has to survive any model/hardware/config change on the train
-# worker unchanged. These two only describe the SHAPE of the pipeline:
-#
-#   * the first ``FILL_CLOSED_PICK_PIPELINE_DEPTH`` picks have nothing to
-#     wait on (the window has emitted nothing yet, so the cursor cannot
-#     have advanced into it) and are released on a plain wall-clock floor
-#     after the window opens;
-#   * every later pick k waits for the cursor to reach this window's
-#     batch ``k - depth - 1``, which leaves the trainer holding
-#     ``depth - 1`` unconsumed batches at the moment pick k lands -- it
-#     never starves, and the journal backlog is bounded at ``depth``.
+# Qualification-only pacing parameters. The first pick uses a wall-clock
+# floor; subsequent picks are bounded by the durable trainer cursor and the
+# configured pipeline depth.
 FILL_CLOSED_FIRST_PICK_SECONDS = float(_os.environ.get(
     "RELIQUARY_FILL_CLOSED_FIRST_PICK_SECONDS", "30"
 ))

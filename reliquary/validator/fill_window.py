@@ -1,37 +1,8 @@
-"""Per-environment fill accounting for the v6.1 window.
+"""Dependency-free accounting for the disabled fill qualification path.
 
-Pure and dependency-free: it counts, it decides, it touches no submission,
-no model and no GPU. Admission and closing are governed by two, separate
-rules --
-
-    admit while   admitted < budget                (per environment)
-    close when    every env's pick ordinal >= picks_target
-
-which are deliberately decoupled (R33, R35, amendment v6.1). Admission no
-longer gates on a per-environment "target" that also closes the window --
-it gates on a budget, and over-collection against that budget is
-deliberate: a pick only ever chooses among proven-and-unemitted groups
-that already exist, so late, longer-generating groups have to be sitting
-in the pool *before* a late pick can choose them. Sizing admission to the
-window's close condition, as the old target did, would starve every pick
-after the first of anything but what had already proven by the time
-admission itself closed -- exactly the short bias this amendment removes.
-Closing, in turn, is no longer a per-environment proven count at all: a
-*pick* (Component 3 of the amendment) selects the best-by-rate proven
-groups across the pool, and the window closes when the Nth pick has been
-emitted, regardless of how much proven surplus is left in any
-environment's pool. A proven group never picked by close is burned (R32):
-logged, archived with a count, never redistributed and never paid.
-
-R37: a pick EVENT is window-wide but it is taken one environment at a
-time -- one event is one DAPO batch, built from every environment's own
-k-th chunk -- so the ordinal counted here is PER ENVIRONMENT. A single
-window-wide counter could not express the moment between the two halves
-of an event: the first environment's Nth pick flipped the window closed
-and locked its sibling out of the very event it was in the middle of,
-tombstoning that half unpaid. ``picks_emitted`` is therefore the MIN over
-environments (complete events only) and ``is_closed()`` asks every
-environment, not the leader.
+Admission uses a monotonic per-environment budget. Completion requires the
+configured pick ordinal for every environment, so a partially emitted
+multi-environment event cannot close the shared window.
 """
 
 from __future__ import annotations
