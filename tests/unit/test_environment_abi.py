@@ -87,9 +87,7 @@ def test_task_envelope_is_deeply_immutable_and_binds_manifest_and_seed():
     assert TaskEnvelope.parse(task.canonical_bytes) == task
 
     changed_seed = _task(manifest, task_seed="44" * 32)
-    changed_manifest = _task(
-        _manifest(revision="example-tools-2026-09-02")
-    )
+    changed_manifest = _task(_manifest(revision="example-tools-2026-09-02"))
     assert changed_seed.sha256 != task.sha256
     assert changed_manifest.sha256 != task.sha256
 
@@ -103,7 +101,7 @@ def test_trajectory_round_trip_binds_semantics_without_runtime_fields():
         task_sha256=task.sha256,
         events=(
             TrajectoryEvent(role="user", content="Find the record."),
-            TrajectoryEvent(role="assistant", content="{\"query\":\"record\"}"),
+            TrajectoryEvent(role="assistant", content='{"query":"record"}'),
             TrajectoryEvent(role="tool", name="lookup", content="record=7"),
             TrajectoryEvent(role="assistant", content="The answer is 7."),
         ),
@@ -153,4 +151,3 @@ def test_registry_requires_both_release_allowlist_and_exact_installed_manifest()
         EnvironmentRegistry({manifest.environment_id: "00" * 32}).register(
             Adapter(manifest)
         )
-

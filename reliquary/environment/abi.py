@@ -71,9 +71,7 @@ def _freeze_json(value: Any, *, path: str = "value") -> Any:
                 raise ValueError(f"{path} contains a duplicate object key")
             frozen[key] = _freeze_json(item, path=f"{path}.{key}")
         return MappingProxyType(frozen)
-    if isinstance(value, Sequence) and not isinstance(
-        value, (str, bytes, bytearray)
-    ):
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return tuple(
             _freeze_json(item, path=f"{path}[{index}]")
             for index, item in enumerate(value)
@@ -258,9 +256,7 @@ class TaskEnvelope:
         if self.schema != TASK_ENVELOPE_SCHEMA:
             raise ValueError(f"unsupported task schema: {self.schema}")
         _require_text("environment_id", self.environment_id)
-        _require_sha256(
-            "environment_manifest_sha256", self.environment_manifest_sha256
-        )
+        _require_sha256("environment_manifest_sha256", self.environment_manifest_sha256)
         _require_text("task_id", self.task_id)
         if not isinstance(self.task_index, int) or isinstance(self.task_index, bool):
             raise TypeError("task_index must be an integer")
@@ -349,14 +345,16 @@ class TrajectoryEnvelope:
         if self.schema != TRAJECTORY_ENVELOPE_SCHEMA:
             raise ValueError(f"unsupported trajectory schema: {self.schema}")
         _require_text("environment_id", self.environment_id)
-        _require_sha256(
-            "environment_manifest_sha256", self.environment_manifest_sha256
-        )
+        _require_sha256("environment_manifest_sha256", self.environment_manifest_sha256)
         _require_sha256("task_sha256", self.task_sha256)
         _require_text("termination_reason", self.termination_reason)
         events = tuple(self.events)
-        if not events or not all(isinstance(event, TrajectoryEvent) for event in events):
-            raise ValueError("trajectory events must be non-empty TrajectoryEvent values")
+        if not events or not all(
+            isinstance(event, TrajectoryEvent) for event in events
+        ):
+            raise ValueError(
+                "trajectory events must be non-empty TrajectoryEvent values"
+            )
         object.__setattr__(self, "events", events)
         object.__setattr__(
             self, "metadata", _freeze_json(self.metadata, path="metadata")
@@ -463,7 +461,9 @@ class EnvironmentRegistry:
         try:
             return self._adapters[environment_id]
         except KeyError as exc:
-            raise KeyError(f"environment adapter is not installed: {environment_id}") from exc
+            raise KeyError(
+                f"environment adapter is not installed: {environment_id}"
+            ) from exc
 
 
 __all__ = [

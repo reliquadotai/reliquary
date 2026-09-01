@@ -33,9 +33,7 @@ from reliquary.protocol.profiles import resolve_protocol_profile
 from reliquary.validator.batch_selection import throughput_rank
 
 
-_CURRENT_PROFILE = resolve_protocol_profile(
-    "qwen3-4b-base-dapo-reasoning-v5"
-)
+_CURRENT_PROFILE = resolve_protocol_profile("qwen3-4b-base-dapo-reasoning-v5")
 _ROLLOUTS = _CURRENT_PROFILE.sampling.rollouts
 _THROUGHPUT = _CURRENT_PROFILE.throughput_tiebreak
 
@@ -73,10 +71,7 @@ def _tiebreak(seed: int, candidate: Candidate) -> bytes:
 
 
 def _operator_tiebreak(seed: int, candidate: Candidate) -> bytes:
-    value = (
-        f"{seed}:{candidate.environment}:{candidate.lane}:"
-        f"{candidate.operator}"
-    )
+    value = f"{seed}:{candidate.environment}:{candidate.lane}:{candidate.operator}"
     return hashlib.sha256(value.encode("utf-8")).digest()
 
 
@@ -123,76 +118,71 @@ def _economic_sensitivity() -> dict[str, object]:
 
     def capacity(length: int) -> int:
         group_seconds = (
-            fixed_group_seconds
-            + rollouts * length / aggregate_tokens_per_second
+            fixed_group_seconds + rollouts * length / aggregate_tokens_per_second
         )
         return int(seconds // group_seconds)
 
     baseline_groups = capacity(baseline_length)
     reference_competitor_tokens = (16 - 1) * rollouts * baseline_length
     baseline_group_seconds = (
-        fixed_group_seconds
-        + rollouts * baseline_length / aggregate_tokens_per_second
+        fixed_group_seconds + rollouts * baseline_length / aggregate_tokens_per_second
     )
     baseline_flat_return = (1.0 / 16.0) / baseline_group_seconds
     baseline_token_share = (
-        rollouts * baseline_length
+        rollouts
+        * baseline_length
         / (reference_competitor_tokens + rollouts * baseline_length)
     )
     baseline_token_return = baseline_token_share / baseline_group_seconds
-    baseline_offer_rate = (
-        rollouts * baseline_length / baseline_group_seconds
-    )
+    baseline_offer_rate = rollouts * baseline_length / baseline_group_seconds
     rows = []
     for length in (500, 1_000, 2_000, 4_000, 8_000):
         groups = capacity(length)
         group_seconds = (
-            fixed_group_seconds
-            + rollouts * length / aggregate_tokens_per_second
+            fixed_group_seconds + rollouts * length / aggregate_tokens_per_second
         )
         tokens = rollouts * length
-        unilateral_token_share = tokens / (
-            reference_competitor_tokens + tokens
-        )
+        unilateral_token_share = tokens / (reference_competitor_tokens + tokens)
         offer_rate = tokens / group_seconds
-        rows.append({
-            "mean_completion_tokens": length,
-            "group_gpu_seconds": round(group_seconds, 6),
-            "groups_generated": groups,
-            "unbounded_generation_capacity_index": round(
-                groups / baseline_groups, 6
-            ),
-            "ticketed_epoch_paid_group_index": 1.0,
-            "gross_token_capacity_index": round(
-                groups * length / (baseline_groups * baseline_length),
-                6,
-            ),
-            # Direct selected-slot return still prices a group, not its
-            # length. The ticket prevents a miner from minting extra entries
-            # after generation starts; it does not claim length itself is
-            # valuable.
-            "flat_slot_return_per_gpu_second_index": round(
-                ((1.0 / 16.0) / group_seconds) / baseline_flat_return,
-                6,
-            ),
-            # One operator changes length while the other 15 groups stay at
-            # the reference length. This is the useful local-incentive test
-            # for gross per-token payment; a symmetric system-wide shortening
-            # still leaves every group with 1/16 of the fixed pool.
-            "unilateral_token_share_return_per_gpu_second_index": round(
-                (unilateral_token_share / group_seconds)
-                / baseline_token_return,
-                6,
-            ),
-            "first_offer_rate_index": round(
-                offer_rate / baseline_offer_rate,
-                6,
-            ),
-            # With elapsed time measured from common OPEN, a fourth group on
-            # one sequential device advertises one quarter of the rate of four
-            # identical first groups produced in parallel.
-            "fourth_sequential_offer_vs_parallel": 0.25,
-        })
+        rows.append(
+            {
+                "mean_completion_tokens": length,
+                "group_gpu_seconds": round(group_seconds, 6),
+                "groups_generated": groups,
+                "unbounded_generation_capacity_index": round(
+                    groups / baseline_groups, 6
+                ),
+                "ticketed_epoch_paid_group_index": 1.0,
+                "gross_token_capacity_index": round(
+                    groups * length / (baseline_groups * baseline_length),
+                    6,
+                ),
+                # Direct selected-slot return still prices a group, not its
+                # length. The ticket prevents a miner from minting extra entries
+                # after generation starts; it does not claim length itself is
+                # valuable.
+                "flat_slot_return_per_gpu_second_index": round(
+                    ((1.0 / 16.0) / group_seconds) / baseline_flat_return,
+                    6,
+                ),
+                # One operator changes length while the other 15 groups stay at
+                # the reference length. This is the useful local-incentive test
+                # for gross per-token payment; a symmetric system-wide shortening
+                # still leaves every group with 1/16 of the fixed pool.
+                "unilateral_token_share_return_per_gpu_second_index": round(
+                    (unilateral_token_share / group_seconds) / baseline_token_return,
+                    6,
+                ),
+                "first_offer_rate_index": round(
+                    offer_rate / baseline_offer_rate,
+                    6,
+                ),
+                # With elapsed time measured from common OPEN, a fourth group on
+                # one sequential device advertises one quarter of the rate of four
+                # identical first groups produced in parallel.
+                "fourth_sequential_offer_vs_parallel": 0.25,
+            }
+        )
     return {
         "scope": "synthetic linear-cost sensitivity; not production telemetry",
         "interpretation": (
@@ -262,18 +252,20 @@ def _population(
         for lane in range(horizon):
             for index in range(candidate_limit):
                 gpu_seconds = rng.lognormvariate(math.log(45.0), 0.35)
-                candidates.append(Candidate(
-                    environment=environment,
-                    lane=lane,
-                    operator=rng.randrange(12),
-                    prompt=lane * 10_000 + index,
-                    difficulty=round(rng.random(), 1),
-                    tokens=rng.randint(2_000, 8_000) * _ROLLOUTS,
-                    gpu_seconds=gpu_seconds,
-                    prepared_at_open=rng.random() < 0.75,
-                    valid=rng.random() < validity,
-                    stale=rng.random() < 0.015,
-                ))
+                candidates.append(
+                    Candidate(
+                        environment=environment,
+                        lane=lane,
+                        operator=rng.randrange(12),
+                        prompt=lane * 10_000 + index,
+                        difficulty=round(rng.random(), 1),
+                        tokens=rng.randint(2_000, 8_000) * _ROLLOUTS,
+                        gpu_seconds=gpu_seconds,
+                        prepared_at_open=rng.random() < 0.75,
+                        valid=rng.random() < validity,
+                        stale=rng.random() < 0.015,
+                    )
+                )
     return candidates
 
 
@@ -302,8 +294,7 @@ def _run_policy(
             lane_candidates = [
                 candidate
                 for candidate in population
-                if candidate.environment == environment
-                and candidate.lane == lane
+                if candidate.environment == environment and candidate.lane == lane
             ][:candidate_supply]
             policy_population.extend(lane_candidates)
             if epoch_mode:
@@ -362,33 +353,37 @@ def _run_policy(
                 # Intentions are cheap; only selected/activated tickets spend
                 # generation compute.
                 if intents:
-                    del policy_population[-len(intents):]
+                    del policy_population[-len(intents) :]
                 policy_population.extend(lane_candidates)
             elif mode == "current":
                 throughput = _THROUGHPUT
                 if throughput is None:
                     raise RuntimeError("active profile has no throughput tie-break")
-                lane_candidates.sort(key=lambda candidate: (
-                    -candidate.difficulty,
-                    throughput_rank(
-                        candidate.tokens,
-                        arrival_round=int(candidate.gpu_seconds // 3.0),
-                        window_open_round=0,
-                        token_cap=throughput.token_cap * _ROLLOUTS,
-                        bucket_tokens_per_round=throughput.bucket_tokens_per_round,
-                    ),
-                    int(candidate.gpu_seconds // 3.0),
-                    _tiebreak(seed, candidate),
-                ))
+                lane_candidates.sort(
+                    key=lambda candidate: (
+                        -candidate.difficulty,
+                        throughput_rank(
+                            candidate.tokens,
+                            arrival_round=int(candidate.gpu_seconds // 3.0),
+                            window_open_round=0,
+                            token_cap=throughput.token_cap * _ROLLOUTS,
+                            bucket_tokens_per_round=throughput.bucket_tokens_per_round,
+                        ),
+                        int(candidate.gpu_seconds // 3.0),
+                        _tiebreak(seed, candidate),
+                    )
+                )
             else:
                 # Mirror the fill proposal's economic ordering: validator-
                 # observed payload production rate only. Difficulty remains
                 # an eligibility measurement and does not order the pick.
-                lane_candidates.sort(key=lambda candidate: (
-                    -(candidate.tokens / max(candidate.gpu_seconds, 1e-9)),
-                    -candidate.tokens,
-                    _tiebreak(seed, candidate),
-                ))
+                lane_candidates.sort(
+                    key=lambda candidate: (
+                        -(candidate.tokens / max(candidate.gpu_seconds, 1e-9)),
+                        -candidate.tokens,
+                        _tiebreak(seed, candidate),
+                    )
+                )
             lane_candidates = [
                 candidate
                 for candidate in lane_candidates
@@ -432,7 +427,8 @@ def _run_policy(
                     if (
                         f"{candidate.environment}:{candidate.lane}:"
                         f"{candidate.operator}:{candidate.prompt}"
-                    ) in chosen_ids
+                    )
+                    in chosen_ids
                 ]
             winners = lane_candidates[:target]
             selected.extend(winners)
@@ -451,9 +447,7 @@ def _run_policy(
             candidate.tokens if mode == "rate_fill" else 1
         )
     reward_total = sum(reward_mass.values())
-    reward_shares = [
-        value / max(reward_total, 1) for value in reward_mass.values()
-    ]
+    reward_shares = [value / max(reward_total, 1) for value in reward_mass.values()]
     return {
         "policy": name,
         "selection_mode": mode,
@@ -471,8 +465,7 @@ def _run_policy(
         "selected_training_groups": len(selected),
         "underfill_by_environment": dict(sorted(underfill_by_environment.items())),
         "burned_slot_share": round(
-            sum(underfill_by_environment.values())
-            / (2 * horizon * target),
+            sum(underfill_by_environment.values()) / (2 * horizon * target),
             6,
         ),
         "generated_gpu_seconds": round(generated_seconds, 3),
@@ -486,13 +479,10 @@ def _run_policy(
         ),
         "first_lane_warmup_loss_groups": first_lane_underfill,
         "selected_operator_hhi": round(sum(share * share for share in shares), 6),
-        "reward_operator_hhi": round(
-            sum(share * share for share in reward_shares), 6
-        ),
+        "reward_operator_hhi": round(sum(share * share for share in reward_shares), 6),
         "selected_operator_gini": round(_gini(operator_counts.values()), 6),
         "selected_mean_difficulty": round(
-            sum(candidate.difficulty for candidate in selected)
-            / max(len(selected), 1),
+            sum(candidate.difficulty for candidate in selected) / max(len(selected), 1),
             6,
         ),
         "selected_mean_completion_tokens": round(
@@ -501,24 +491,18 @@ def _run_policy(
             3,
         ),
         "selected_distinct_prompt_share": round(
-            len({
-                (candidate.environment, candidate.prompt)
-                for candidate in selected
-            })
+            len({(candidate.environment, candidate.prompt) for candidate in selected})
             / max(len(selected), 1),
             6,
         ),
         "open_edge_submission_burst": sum(
-            epoch_mode and candidate.prepared_at_open
-            for candidate in policy_population
+            epoch_mode and candidate.prepared_at_open for candidate in policy_population
         ),
         "open_edge_payload_burst": 0,
         "post_selection_payload_burst_upper_bound": (
             2 * horizon * reveal_limit if epoch_mode else 0
         ),
-        "stale_discarded_work": sum(
-            candidate.stale for candidate in policy_population
-        ),
+        "stale_discarded_work": sum(candidate.stale for candidate in policy_population),
     }
 
 
@@ -544,20 +528,26 @@ def main() -> None:
         default=64,
     )
     args = parser.parse_args()
-    if min(
-        args.horizon,
-        args.target,
-        args.current_candidates,
-        args.fill_candidates,
-        args.epoch_generation_limit,
-        args.epoch_intents,
-    ) < 1:
+    if (
+        min(
+            args.horizon,
+            args.target,
+            args.current_candidates,
+            args.fill_candidates,
+            args.epoch_generation_limit,
+            args.epoch_intents,
+        )
+        < 1
+    ):
         parser.error("all sizing arguments must be positive")
-    if min(
-        args.current_candidates,
-        args.fill_candidates,
-        args.epoch_generation_limit,
-    ) < args.target:
+    if (
+        min(
+            args.current_candidates,
+            args.fill_candidates,
+            args.epoch_generation_limit,
+        )
+        < args.target
+    ):
         parser.error("candidate limits must be at least the target")
     if args.epoch_intents < args.epoch_generation_limit:
         parser.error("epoch intents must cover the generation cohort")
