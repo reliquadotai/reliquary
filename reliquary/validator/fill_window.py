@@ -63,6 +63,10 @@ class FillState:
         # Per environment (R37), never a single window-wide counter: see
         # the module docstring for the half-event this exists to express.
         self._picks = {name: 0 for name in self._budgets}
+        # Monotone cache generation for lock-free HTTP state-cache keys.  The
+        # state endpoint takes ``lock`` only for the tiny snapshot copy; it does
+        # not share the batcher's long-lived grading/proof lock.
+        self._revision = 0
         # One window shares exactly one ``FillState`` across every
         # per-environment ``GrpoWindowBatcher`` instance (each batcher only
         # ever reserves/records on its own environment key, but
@@ -90,12 +94,14 @@ class FillState:
         name = self._known(environment)
         self._in_flight[name] += 1
         self._admitted[name] += 1
+        self._revision += 1
 
     def release(self, environment: str) -> None:
         name = self._known(environment)
         if self._in_flight[name] <= 0:
             raise ValueError(f"no reservation to release for {name!r}")
         self._in_flight[name] -= 1
+        self._revision += 1
         # ``_admitted`` is untouched: see the budget comment above.
 
     def record_proven(self, environment: str) -> None:
@@ -103,6 +109,7 @@ class FillState:
         if self._in_flight[name] > 0:
             self._in_flight[name] -= 1
         self._proven[name] += 1
+        self._revision += 1
 
     def record_pick(self, environment: str) -> None:
         """Account this environment's share of one pick event (Component
@@ -129,6 +136,12 @@ class FillState:
                 f"{prospective}"
             )
         self._picks[name] = prospective[name]
+        self._revision += 1
+
+    @property
+    def revision(self) -> int:
+        """Monotone mutation generation used only for state-cache expiry."""
+        return self._revision
 
     def picks_taken(self, environment: str) -> int:
         """This environment's own pick ordinal -- what gates whether it

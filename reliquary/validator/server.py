@@ -52,6 +52,8 @@ from reliquary.constants import (
     DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES,
     DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR,
     ENFORCE_ENVELOPE_SIGNATURE,
+    FILL_CLOSED_ENABLED,
+    FILL_CLOSED_MAX_SECONDS,
     FORCED_SEED_CDF_BOUNDARY_EPSILON,
     FORCED_SEED_CDF_ENFORCE,
     FORCED_SEED_CONSISTENCY_FLOOR,
@@ -112,6 +114,7 @@ from reliquary.protocol.submission import (
     EpochGenerationIntentRequest,
     EpochGenerationIntentResponse,
     EpochGenerationIntentStatus,
+    FillClosedWindowState,
     GrpoBatchState,
     RejectReason,
     RuntimeContract,
@@ -1424,6 +1427,24 @@ class ValidatorServer:
             else batcher.valid_count
         )
         capacity_used = getattr(batcher, "candidate_capacity_used", 0)
+        fill_state = (
+            getattr(batcher, "fill_state", None)
+            if FILL_CLOSED_ENABLED
+            else None
+        )
+        fill_revision = (
+            getattr(fill_state, "revision", None)
+            if fill_state is not None
+            else None
+        )
+        fill_collection_closed = (
+            bool(batcher.collection_closed())
+            if fill_state is not None
+            else None
+        )
+        fill_sealed = (
+            bool(batcher.is_sealed()) if fill_state is not None else None
+        )
         return (
             id(batcher),
             batcher.window_start,
@@ -1452,6 +1473,52 @@ class ValidatorServer:
                 if self._checkpoint_epoch_admission_beacon is not None
                 else None
             ),
+            fill_revision,
+            fill_collection_closed,
+            fill_sealed,
+        )
+
+    @staticmethod
+    def _fill_closed_state_payload(
+        batcher: GrpoWindowBatcher,
+    ) -> FillClosedWindowState | None:
+        """Build the capability-only miner status from one shared snapshot."""
+        fill_state = (
+            getattr(batcher, "fill_state", None)
+            if FILL_CLOSED_ENABLED
+            else None
+        )
+        if fill_state is None:
+            return None
+        with fill_state.lock:
+            snapshot = fill_state.snapshot()
+        if batcher.is_sealed():
+            phase = "sealed"
+        elif batcher.collection_closed():
+            phase = "draining"
+        else:
+            phase = "collecting"
+        budgets = snapshot["budgets"]
+        admitted = snapshot["admitted"]
+        return FillClosedWindowState(
+            phase=phase,
+            precommit_cutoff_ts=(
+                float(batcher.window_opened_wall_ts)
+                + float(batcher.collection_seconds)
+            ),
+            precommit_seconds=float(batcher.collection_seconds),
+            max_window_seconds=FILL_CLOSED_MAX_SECONDS,
+            picks_emitted=snapshot["picks_emitted"],
+            picks_target=snapshot["picks_target"],
+            picks_by_environment=snapshot["picks_by_environment"],
+            admission_budgets=budgets,
+            admitted=admitted,
+            proven=snapshot["proven"],
+            in_flight=snapshot["in_flight"],
+            remaining={
+                environment: max(0, budget - admitted[environment])
+                for environment, budget in budgets.items()
+            },
         )
 
     def _active_batcher_values(self) -> tuple[GrpoWindowBatcher, ...]:
@@ -6375,12 +6442,12 @@ class ValidatorServer:
             env: str | None = None,
             window: int | None = None,
         ) -> GrpoBatchState:
-            """Current window + checkpoint state. Lock-free: reads only the
-            batcher's snapshot fields (set at construction) and the atomic
-            ``valid_count`` counter. The submit worker holds ``batcher._lock``
-            for up to ~25s per GRAIL verify, so this handler MUST NOT touch
-            it — otherwise miners polling /state starve the event loop and
-            timeout cascades hit every endpoint (see 2026-05-12 outage).
+            """Current window + checkpoint state. This never touches
+            ``batcher._lock``, which the submit worker can hold for ~25s per
+            GRAIL verify. Fill mode copies its small counter map under the
+            dedicated ``FillState.lock``; all other values are snapshots or
+            atomic counters. Polling /state therefore cannot join the grading
+            lock convoy that caused the 2026-05-12 timeout cascade.
 
             ``cooldown_prompts`` is PER-ENV (``prompt_idx`` indexes one env's
             problem set), so a multi-env window has a distinct cooldown set
@@ -6407,6 +6474,7 @@ class ValidatorServer:
                     raise HTTPException(status_code=503, detail="no_active_window")
             cp = self._current_checkpoint
             epoch = self._checkpoint_epoch_plan
+            fill_closed = self._fill_closed_state_payload(batcher)
             submission_count = (
                 getattr(batcher, "pending_count", batcher.valid_count)
                 if getattr(batcher, "difficulty_auction_enabled", False)
@@ -6543,6 +6611,7 @@ class ValidatorServer:
                     and self._checkpoint_epoch_commitment_set is not None
                     else None
                 ),
+                fill_closed=fill_closed,
                 randomness=batcher.randomness,
             )
             excluded_fields: set[str] = set()
@@ -6583,6 +6652,8 @@ class ValidatorServer:
                         "checkpoint_epoch_commitment_root",
                     }
                 )
+            if fill_closed is None:
+                excluded_fields.add("fill_closed")
             body = payload.model_dump_json(
                 exclude=excluded_fields or None,
             ).encode("utf-8")

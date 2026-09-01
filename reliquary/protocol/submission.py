@@ -397,6 +397,25 @@ class EpochCommitmentStatus(BaseModel):
     commitment_root: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
+class FillClosedWindowState(BaseModel):
+    """Optional miner-facing progress for the experimental fill window."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    phase: Literal["collecting", "draining", "sealed"]
+    precommit_cutoff_ts: FiniteFloat
+    precommit_seconds: FiniteFloat = Field(..., gt=0)
+    max_window_seconds: FiniteFloat = Field(..., gt=0)
+    picks_emitted: int = Field(..., ge=0)
+    picks_target: int = Field(..., ge=1)
+    picks_by_environment: dict[str, int]
+    admission_budgets: dict[str, int]
+    admitted: dict[str, int]
+    proven: dict[str, int]
+    in_flight: dict[str, int]
+    remaining: dict[str, int]
+
+
 class GrpoBatchState(BaseModel):
     """Live window state for miners polling ``/state`` (v2.1)."""
 
@@ -450,6 +469,9 @@ class GrpoBatchState(BaseModel):
     checkpoint_epoch_commitment_root: str | None = Field(
         default=None, pattern=r"^[0-9a-f]{64}$"
     )
+    # Capability-only progress. It is explicitly excluded from serialized
+    # responses while fill-closed is disabled, preserving legacy state bytes.
+    fill_closed: FillClosedWindowState | None = None
     # v2.3: drand beacon randomness for this window. Empty string between
     # OPEN and the first successful _set_window_randomness; miners loop on
     # empty until populated. Miners derive GRAIL commitments off this

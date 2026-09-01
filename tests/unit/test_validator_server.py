@@ -2292,9 +2292,86 @@ def test_state_endpoint_returns_grpo_batch_state():
     assert "protocol_version" not in payload
     assert "generation_profile_id" not in payload
     assert "generation_contract" not in payload
+    assert "fill_closed" not in payload
     state = GrpoBatchState(**payload)
     assert state.window_n == 500
     assert 42 in state.cooldown_prompts
+
+
+def test_fill_closed_state_advertises_cutoff_progress_and_budget(monkeypatch):
+    import reliquary.validator.server as server_module
+    from reliquary.protocol.submission import WindowState
+    from reliquary.validator.fill_window import FillState
+
+    monkeypatch.setattr(server_module, "FILL_CLOSED_ENABLED", True)
+    monkeypatch.setattr(server_module, "FILL_CLOSED_MAX_SECONDS", 300.0)
+    now = [1_000.0]
+    batcher = _batcher(window_start=500)
+    batcher._time_fn = lambda: now[0]
+    batcher.collection_seconds = 200.0
+    batcher.mark_window_opened(
+        monotonic_time=1_000.0,
+        wall_time=10_000.0,
+    )
+    batcher.fill_state = FillState(
+        budgets={"openmathinstruct": 32},
+        picks_target=2,
+    )
+    server = ValidatorServer()
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    client = TestClient(server.app)
+
+    first = client.get("/state").json()["fill_closed"]
+    assert first == {
+        "phase": "collecting",
+        "precommit_cutoff_ts": 10_200.0,
+        "precommit_seconds": 200.0,
+        "max_window_seconds": 300.0,
+        "picks_emitted": 0,
+        "picks_target": 2,
+        "picks_by_environment": {"openmathinstruct": 0},
+        "admission_budgets": {"openmathinstruct": 32},
+        "admitted": {"openmathinstruct": 0},
+        "proven": {"openmathinstruct": 0},
+        "in_flight": {"openmathinstruct": 0},
+        "remaining": {"openmathinstruct": 32},
+    }
+
+    with batcher.fill_state.lock:
+        batcher.fill_state.reserve("openmathinstruct")
+        batcher.fill_state.record_proven("openmathinstruct")
+        batcher.fill_state.record_pick("openmathinstruct")
+    updated = client.get("/state").json()["fill_closed"]
+    assert updated["admitted"] == {"openmathinstruct": 1}
+    assert updated["proven"] == {"openmathinstruct": 1}
+    assert updated["in_flight"] == {"openmathinstruct": 0}
+    assert updated["remaining"] == {"openmathinstruct": 31}
+    assert updated["picks_emitted"] == 1
+
+    now[0] = 1_201.0
+    assert client.get("/state").json()["fill_closed"]["phase"] == "draining"
+    batcher.force_seal("test")
+    assert client.get("/state").json()["fill_closed"]["phase"] == "sealed"
+
+
+def test_disabled_fill_closed_keeps_legacy_state_bytes(monkeypatch):
+    import reliquary.validator.server as server_module
+    from reliquary.protocol.submission import WindowState
+
+    monkeypatch.setattr(server_module, "FILL_CLOSED_ENABLED", False)
+    server = ValidatorServer()
+    server.set_active_batcher(_batcher(window_start=500))
+    server.set_current_state(WindowState.OPEN)
+
+    body = TestClient(server.app).get("/state").content
+
+    assert body == (
+        b'{"state":"open","window_n":500,"anchor_block":500,'
+        b'"cooldown_prompts":[],"valid_submissions":0,"checkpoint_n":0,'
+        b'"checkpoint_repo_id":null,"checkpoint_revision":null,'
+        b'"randomness":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}'
+    )
 
 
 def test_v3_state_advertises_exact_generation_contract(monkeypatch):
