@@ -160,6 +160,23 @@ class ProofPlanResult:
     finished_at: float
 
 
+@dataclass(frozen=True)
+class ProofSchedulerCapabilities:
+    """Explicit coordination guarantees offered by this scheduler.
+
+    The current scheduler was designed for one ordinary window at a time.  Its
+    result is owned by an in-process ``ProofPlanHandle`` and open plans can only
+    be extended at increasing ranks.  Publishing those constraints makes it
+    possible for newer collection modes to fail closed instead of accidentally
+    treating a convenient implementation detail as a protocol guarantee.
+    """
+
+    max_live_plans_per_environment: int
+    durable_result_recovery: bool
+    supports_predeclared_candidates: bool
+    supports_rank_independent_extension: bool
+
+
 # How many finished plan ids stay known to the anti-replay guard. At one plan
 # per environment per window this is days of history for a few hundred KB.
 RETIRED_PLAN_ID_MEMORY = 4096
@@ -359,6 +376,22 @@ class GlobalProofScheduler:
     def active_checkpoint_revision(self) -> str | None:
         with self._condition:
             return self._active_checkpoint_revision
+
+    @property
+    def capabilities(self) -> ProofSchedulerCapabilities:
+        """Return immutable facts needed by higher-level coordinators.
+
+        These values are intentionally conservative.  In particular, keeping a
+        handle alive is not durable recovery: after a process restart neither
+        completed results nor in-flight ownership can be reconstructed.
+        """
+
+        return ProofSchedulerCapabilities(
+            max_live_plans_per_environment=1,
+            durable_result_recovery=False,
+            supports_predeclared_candidates=False,
+            supports_rank_independent_extension=False,
+        )
 
     def checkpoint_ready(self, checkpoint_revision: str) -> bool:
         with self._condition:
