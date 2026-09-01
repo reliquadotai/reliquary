@@ -10,6 +10,7 @@ import pytest
 
 from reliquary.infrastructure.storage import (
     download_json,
+    list_recent_datasets,
     upload_json,
     upload_window_dataset,
 )
@@ -144,3 +145,38 @@ async def test_upload_and_download_json_gzip_by_key_suffix() -> None:
     assert captured["Bucket"] == "testbucket"
     assert gzip.decompress(captured["Body"]).startswith(b'{"complete":true')
     assert restored == {"complete": True, "items": [1, 2, 3]}
+
+
+@pytest.mark.asyncio
+async def test_strict_download_does_not_hide_storage_failure() -> None:
+    class _UnavailableClient:
+        async def get_object(self, **_kwargs):
+            raise OSError("storage unavailable")
+
+    with patch(
+        "reliquary.infrastructure.storage.get_s3_client",
+        return_value=_ClientContext(_UnavailableClient()),
+    ):
+        assert await download_json("state.json") is None
+        with pytest.raises(OSError, match="storage unavailable"):
+            await download_json("state.json", strict=True)
+
+
+@pytest.mark.asyncio
+async def test_strict_archive_read_binds_body_to_object_window() -> None:
+    payload = gzip.compress(json.dumps({"window_start": 99}).encode())
+
+    class _MismatchedClient:
+        async def get_object(self, **_kwargs):
+            return {"Body": _AsyncBody(payload)}
+
+    with patch(
+        "reliquary.infrastructure.storage.get_s3_client",
+        return_value=_ClientContext(_MismatchedClient()),
+    ):
+        with pytest.raises(ValueError, match="does not bind window 1"):
+            await list_recent_datasets(
+                current_window=2,
+                n=1,
+                strict=True,
+            )

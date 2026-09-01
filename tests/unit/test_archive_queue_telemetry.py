@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import patch
+
+import pytest
 
 from reliquary.infrastructure.archive_queue import ArchiveQueue
 
@@ -32,6 +35,38 @@ def test_archive_queue_reports_enqueue_continuity_gap(tmp_path):
 
     assert snapshot["enqueue_gaps_total"] == 1
     assert snapshot["last_enqueue_gap"] == {"after": 50, "before": 52}
+
+
+def test_archive_queue_replays_pending_bodies_by_exact_window(tmp_path):
+    queue = ArchiveQueue(str(tmp_path))
+    queue.enqueue(50, {"window_start": 50, "window_status": "aborted"})
+    queue.enqueue(51, {"window_start": 51, "batch": []})
+
+    assert queue.pending_window_numbers() == (50, 51)
+    assert queue.pending_archives(start_window=51, end_window=51) == {
+        51: {"window_start": 51, "batch": []}
+    }
+
+
+def test_archive_queue_rejects_body_key_identity_mismatch(tmp_path):
+    queue = ArchiveQueue(str(tmp_path))
+    queue.enqueue(50, {"window_start": 49})
+
+    with pytest.raises(RuntimeError, match="identity mismatch"):
+        queue.pending_archives(start_window=50, end_window=50)
+    with pytest.raises(RuntimeError, match="identity mismatch"):
+        queue.pending_window_numbers()
+
+
+def test_archive_queue_failed_replace_leaves_no_visible_commit(tmp_path):
+    queue = ArchiveQueue(str(tmp_path))
+
+    with patch("os.replace", side_effect=OSError("replace failed")):
+        with pytest.raises(OSError, match="replace failed"):
+            queue.enqueue(50, {"window_start": 50})
+
+    assert not (tmp_path / "window-50.json.gz").exists()
+    assert not (tmp_path / "window-50.json.gz.tmp").exists()
 
 
 def test_archive_queue_snapshot_tracks_success(tmp_path, monkeypatch):

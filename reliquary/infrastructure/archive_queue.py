@@ -101,9 +101,28 @@ class ArchiveQueue:
 
         final_path = self.queue_dir / f"window-{window_start}.json.gz"
         tmp_path = self.queue_dir / f"window-{window_start}.json.gz.tmp"
-        with open(tmp_path, "wb") as f:
-            f.write(compressed)
-        os.replace(tmp_path, final_path)
+        if final_path.exists():
+            existing = self._read_pending_archive(final_path, window_start)
+            if existing != data:
+                raise RuntimeError("conflicting archive already committed")
+            return final_path
+        try:
+            with open(tmp_path, "wb") as file_handle:
+                file_handle.write(compressed)
+                file_handle.flush()
+                os.fsync(file_handle.fileno())
+            os.replace(tmp_path, final_path)
+            directory_fd = os.open(self.queue_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except Exception:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
 
         if (
             self._last_enqueued_window is not None
@@ -135,6 +154,51 @@ class ArchiveQueue:
             p for p in self.queue_dir.glob("window-*.json.gz")
             if not p.name.endswith(".tmp")
         )
+
+    def pending_window_numbers(self) -> tuple[int, ...]:
+        """Return the exact window identities retained in the local journal."""
+        windows = []
+        for path in self._pending():
+            window_n = self._window_n_from_path(path)
+            if window_n is None:
+                raise RuntimeError(f"invalid pending archive path: {path.name}")
+            self._read_pending_archive(path, window_n)
+            windows.append(window_n)
+        if len(set(windows)) != len(windows):
+            raise RuntimeError("duplicate pending archive window")
+        return tuple(sorted(windows))
+
+    def pending_archives(
+        self,
+        *,
+        start_window: int,
+        end_window: int,
+    ) -> dict[int, dict]:
+        """Read and validate locally committed archives in an inclusive range."""
+        result: dict[int, dict] = {}
+        for path in self._pending():
+            window_n = self._window_n_from_path(path)
+            if window_n is None or not start_window <= window_n <= end_window:
+                continue
+            value = self._read_pending_archive(path, window_n)
+            if window_n in result:
+                raise RuntimeError("duplicate pending archive window")
+            result[window_n] = value
+        return result
+
+    @staticmethod
+    def _read_pending_archive(path: Path, window_n: int) -> dict:
+        try:
+            value = json.loads(gzip.decompress(path.read_bytes()))
+        except Exception as exc:
+            raise RuntimeError(
+                f"invalid pending archive body: {path.name}"
+            ) from exc
+        if not isinstance(value, dict) or value.get("window_start") != window_n:
+            raise RuntimeError(
+                f"pending archive identity mismatch: {path.name}"
+            )
+        return value
 
     @staticmethod
     def _window_n_from_path(path: Path) -> int | None:
@@ -203,8 +267,9 @@ class ArchiveQueue:
             return False
 
         try:
+            self._read_pending_archive(path, window_n)
             body = path.read_bytes()
-        except OSError as e:
+        except (OSError, RuntimeError) as e:
             logger.error("ArchiveQueue: failed to read %s: %s", path, e)
             return False
 

@@ -6187,6 +6187,7 @@ class ValidationService:
         # keeps the validator closed rather than guessing past the barrier.
         self._initialize_fill_closed_rotation_store()
         archive_queue = get_archive_queue()
+        self._archive_queue = archive_queue
         self.server.configure_archive_queue_telemetry(archive_queue.snapshot)
         self.server.configure_registration_gate()
         await self._refresh_registered_hotkeys(force=True, reason="startup")
@@ -6270,9 +6271,8 @@ class ValidationService:
                             self._windows_since_cooldown_snapshot
                             >= COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS
                         ):
-                            await self._snapshot_cooldown()
-                            await self._snapshot_content_cooldown()
-                            self._windows_since_cooldown_snapshot = 0
+                            if await self._snapshot_all_cooldowns():
+                                self._windows_since_cooldown_snapshot = 0
                         continue
                     self._window_iteration_stage = "open"
                     # Experimental fill mode never treats its synchronization
@@ -6504,9 +6504,8 @@ class ValidationService:
                         self._windows_since_cooldown_snapshot
                         >= COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS
                     ):
-                        await self._snapshot_cooldown()
-                        await self._snapshot_content_cooldown()
-                        self._windows_since_cooldown_snapshot = 0
+                        if await self._snapshot_all_cooldowns():
+                            self._windows_since_cooldown_snapshot = 0
 
                     # set_weights is owned by a concurrent WeightOnlyValidator
                     # task running off the same R2 archives; no need to do it
@@ -6733,14 +6732,25 @@ class ValidationService:
         """
         # 1. window_n from R2 archive keys
         try:
-            windows = await storage.list_all_window_keys()
+            remote_windows = await storage.list_all_window_keys(strict=True)
+            archive_queue = getattr(self, "_archive_queue", None)
+            local_windows = (
+                archive_queue.pending_window_numbers()
+                if archive_queue is not None
+                else ()
+            )
+            windows = sorted(set(remote_windows).union(local_windows))
             if windows:
                 self._window_n = max(windows)
-                logger.info("Bootstrapped window_n=%d from R2", self._window_n)
+                logger.info(
+                    "Bootstrapped window_n=%d from durable archives",
+                    self._window_n,
+                )
             else:
-                logger.info("No archives in R2 — starting from window_n=0")
-        except Exception:
-            logger.exception("Failed to bootstrap window_n from R2; starting at 0")
+                logger.info("No durable archives — starting from window_n=0")
+        except Exception as exc:
+            logger.exception("Failed to bootstrap durable window identity")
+            raise RuntimeError("window identity bootstrap failed") from exc
 
         # 2. checkpoint_n + revision from HF commit history.
         #
@@ -6835,6 +6845,15 @@ class ValidationService:
         current_window: int,
     ) -> int:
         """Validate a complete prompt-cooldown snapshot before mutation."""
+        schema_version = snapshot.get("schema_version", 1)
+        if (
+            not isinstance(schema_version, int)
+            or isinstance(schema_version, bool)
+            or schema_version not in {1, 2}
+        ):
+            raise ValueError("unsupported cooldown snapshot schema")
+        if schema_version == 2 and snapshot.get("complete") is not True:
+            raise ValueError("cooldown snapshot is incomplete")
         if snapshot.get("run_id") != TRAINING_RUN_ID:
             raise ValueError("cooldown run id mismatch")
         snapshot_window = int(snapshot.get("snapshot_window", -1))
@@ -6871,19 +6890,24 @@ class ValidationService:
         current_window = self._window_n
         candidates: list[tuple[int, str, dict[str, Any]]] = []
         remote_snapshot = None
+        remote_error: Exception | None = None
         try:
             remote_snapshot = await storage.download_json(
-                _cooldown_snapshot_key(TRAINING_RUN_ID)
+                _cooldown_snapshot_key(TRAINING_RUN_ID),
+                strict=True,
             )
-        except Exception:
+        except Exception as exc:
+            remote_error = exc
             logger.exception("Failed to read cooldown snapshot")
         local_snapshot = None
+        local_error: Exception | None = None
         try:
             local_snapshot = await asyncio.to_thread(
                 _read_gzip_json,
                 _cooldown_local_path(TRAINING_RUN_ID),
             )
-        except Exception:
+        except Exception as exc:
+            local_error = exc
             logger.exception("Failed to read local cooldown snapshot")
 
         env_names = set(self._cooldown_per_env)
@@ -6933,6 +6957,16 @@ class ValidationService:
             )
             return
 
+        if (
+            remote_snapshot is not None
+            or local_snapshot is not None
+            or remote_error is not None
+            or local_error is not None
+        ):
+            raise RuntimeError(
+                "cooldown snapshot exists but no valid durable copy can be restored"
+            )
+
         if TRAINING_RUN_ID != "default":
             logger.info(
                 "No cooldown snapshot for fresh run=%s — starting empty (reset).",
@@ -6947,12 +6981,75 @@ class ValidationService:
             current_window, COOLDOWN_REBUILD_LOOKBACK,
         )
 
-    async def _rebuild_cooldown_from_archives(self, current_window: int, n: int) -> None:
+    async def _load_cooldown_archives(
+        self,
+        *,
+        start_window: int,
+        end_window: int,
+        require_all: bool,
+    ) -> list[dict]:
+        """Merge remote and locally queued archives without identity gaps."""
+        if end_window < start_window:
+            return []
+        expected = set(range(start_window, end_window + 1))
+        remote_error: Exception | None = None
+        try:
+            remote = await storage.list_recent_datasets(
+                current_window=end_window + 1,
+                n=len(expected),
+                strict=True,
+            )
+        except Exception as exc:
+            remote_error = exc
+            remote = []
+
+        archive_queue = getattr(self, "_archive_queue", None)
+        local = (
+            archive_queue.pending_archives(
+                start_window=start_window,
+                end_window=end_window,
+            )
+            if archive_queue is not None
+            else {}
+        )
+        merged: dict[int, dict] = {}
+        for archive in remote:
+            window_start = archive.get("window_start")
+            if (
+                not isinstance(window_start, int)
+                or isinstance(window_start, bool)
+                or window_start not in expected
+                or window_start in merged
+            ):
+                raise RuntimeError("remote cooldown archive identity mismatch")
+            merged[window_start] = archive
+        for window_start, archive in local.items():
+            if window_start in merged and merged[window_start] != archive:
+                raise RuntimeError("local and remote cooldown archives conflict")
+            merged[window_start] = archive
+
+        missing = expected.difference(merged)
+        if remote_error is not None and missing:
+            raise RuntimeError("cooldown archive lookup failed") from remote_error
+        if require_all and missing:
+            raise RuntimeError(
+                f"cooldown archive range is incomplete: {sorted(missing)}"
+            )
+        return [merged[window] for window in sorted(merged)]
+
+    async def _rebuild_cooldown_from_archives(
+        self,
+        current_window: int,
+        n: int,
+    ) -> None:
         """Rebuild every env's cooldown from scratch from the last ``n`` R2
         archives (used only when no snapshot is available)."""
         try:
-            archives = await storage.list_recent_datasets(
-                current_window=current_window + 1, n=n,
+            start_window = max(0, current_window + 1 - n)
+            archives = await self._load_cooldown_archives(
+                start_window=start_window,
+                end_window=current_window,
+                require_all=False,
             )
             for env_name, cooldown_map in self._cooldown_per_env.items():
                 cooldown_map.rebuild_from_history(
@@ -6965,34 +7062,32 @@ class ValidationService:
                 len(archives), current_window,
                 {n2: len(m) for n2, m in self._cooldown_per_env.items()},
             )
-        except Exception:
+        except Exception as exc:
             logger.exception(
-                "Failed to rebuild cooldown from history; starting empty"
+                "Failed to rebuild cooldown from history; refusing startup"
             )
+            raise RuntimeError("cooldown history rebuild failed") from exc
 
     async def _replay_cooldown_gap(self, current_window: int, gap: int) -> None:
         """Merge the windows recorded since the snapshot into the restored
         cooldown. Bounded by COOLDOWN_REBUILD_LOOKBACK; in normal operation the
         gap is ~the snapshot (publish) cadence."""
-        n = min(gap + 1, COOLDOWN_REBUILD_LOOKBACK)
+        if gap > COOLDOWN_REBUILD_LOOKBACK:
+            raise RuntimeError("cooldown gap exceeds the bounded replay horizon")
         try:
-            archives = await storage.list_recent_datasets(
-                current_window=current_window + 1, n=n,
+            archives = await self._load_cooldown_archives(
+                start_window=current_window - gap + 1,
+                end_window=current_window,
+                require_all=True,
             )
             for env_name, cooldown_map in self._cooldown_per_env.items():
                 cooldown_map.apply_history(
                     _filter_archives_for_env(archives, env_name),
                     current_window=current_window,
                 )
-            if gap + 1 > COOLDOWN_REBUILD_LOOKBACK:
-                logger.warning(
-                    "Cooldown gap %d exceeds replay cap %d; prompts in the "
-                    "uncovered span may be re-eligible. Widen "
-                    "COOLDOWN_REBUILD_LOOKBACK if this recurs.",
-                    gap, COOLDOWN_REBUILD_LOOKBACK,
-                )
-        except Exception:
-            logger.exception("Cooldown gap-replay failed; using snapshot only")
+        except Exception as exc:
+            logger.exception("Cooldown gap-replay failed; refusing startup")
+            raise RuntimeError("cooldown gap replay failed") from exc
 
     async def _snapshot_cooldown(self) -> bool:
         """Persist the per-env cooldown maps to R2, keyed by the training run id,
@@ -7054,6 +7149,12 @@ class ValidationService:
                 {name: len(state) for name, state in self._cooldown_per_env.items()},
             )
         return local_written or remote_written
+
+    async def _snapshot_all_cooldowns(self) -> bool:
+        """Persist both cooldown identities before advancing retry cadence."""
+        prompt_written = await self._snapshot_cooldown()
+        content_written = await self._snapshot_content_cooldown()
+        return prompt_written and content_written
 
     @staticmethod
     def _validate_content_snapshot(
@@ -7131,7 +7232,8 @@ class ValidationService:
         remote_snapshot: dict[str, Any] | None = None
         try:
             remote_snapshot = await storage.download_json(
-                _content_cooldown_snapshot_key(TRAINING_RUN_ID)
+                _content_cooldown_snapshot_key(TRAINING_RUN_ID),
+                strict=True,
             )
         except Exception:
             logger.exception("Failed to restore R2 content cooldown snapshot")

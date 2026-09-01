@@ -38,8 +38,9 @@ async def test_rebuild_uses_state_window_n_not_block_derived():
     svc._window_n = 42  # authoritative v2.1 counter
 
     captured = {}
-    async def fake_list(current_window, n):
+    async def fake_list(current_window, n, *, strict=False):
         captured["current_window"] = current_window
+        captured["strict"] = strict
         return []
 
     # No snapshot for the default run -> falls back to the bounded archive scan.
@@ -54,3 +55,4 @@ async def test_rebuild_uses_state_window_n_not_block_derived():
 
     # _rebuild passes current_window = _window_n + 1 to list_recent_datasets
     assert captured["current_window"] == 43
+    assert captured["strict"] is True
