@@ -286,8 +286,11 @@ def _run_policy(
     target: int,
     candidate_supply: int,
     reveal_limit: int,
-    epoch_mode: bool,
+    mode: str,
 ) -> dict[str, object]:
+    if mode not in {"current", "rate_fill", "ticketed_epoch"}:
+        raise ValueError(f"unknown synthetic policy mode: {mode}")
+    epoch_mode = mode == "ticketed_epoch"
     policy_population: list[Candidate] = []
     selected: list[Candidate] = []
     underfill_by_environment = Counter()
@@ -361,7 +364,7 @@ def _run_policy(
                 if intents:
                     del policy_population[-len(intents):]
                 policy_population.extend(lane_candidates)
-            else:
+            elif mode == "current":
                 throughput = _THROUGHPUT
                 if throughput is None:
                     raise RuntimeError("active profile has no throughput tie-break")
@@ -375,6 +378,15 @@ def _run_policy(
                         bucket_tokens_per_round=throughput.bucket_tokens_per_round,
                     ),
                     int(candidate.gpu_seconds // 3.0),
+                    _tiebreak(seed, candidate),
+                ))
+            else:
+                # Mirror the fill proposal's economic ordering: validator-
+                # observed payload production rate only. Difficulty remains
+                # an eligibility measurement and does not order the pick.
+                lane_candidates.sort(key=lambda candidate: (
+                    -(candidate.tokens / max(candidate.gpu_seconds, 1e-9)),
+                    -candidate.tokens,
                     _tiebreak(seed, candidate),
                 ))
             lane_candidates = [
@@ -433,8 +445,21 @@ def _run_policy(
     selected_tokens = sum(candidate.tokens for candidate in selected)
     operator_counts = Counter(candidate.operator for candidate in selected)
     shares = [count / max(len(selected), 1) for count in operator_counts.values()]
+    reward_mass = Counter()
+    for candidate in selected:
+        reward_mass[candidate.operator] += (
+            candidate.tokens if mode == "rate_fill" else 1
+        )
+    reward_total = sum(reward_mass.values())
+    reward_shares = [
+        value / max(reward_total, 1) for value in reward_mass.values()
+    ]
     return {
         "policy": name,
+        "selection_mode": mode,
+        "reward_unit": (
+            "eos_completion_tokens" if mode == "rate_fill" else "selected_group"
+        ),
         "candidate_supply_per_environment_lane": candidate_supply,
         "selected_generation_limit_per_environment_lane": reveal_limit,
         "generation_intents": generation_intents if epoch_mode else None,
@@ -461,11 +486,19 @@ def _run_policy(
         ),
         "first_lane_warmup_loss_groups": first_lane_underfill,
         "selected_operator_hhi": round(sum(share * share for share in shares), 6),
+        "reward_operator_hhi": round(
+            sum(share * share for share in reward_shares), 6
+        ),
         "selected_operator_gini": round(_gini(operator_counts.values()), 6),
         "selected_mean_difficulty": round(
             sum(candidate.difficulty for candidate in selected)
             / max(len(selected), 1),
             6,
+        ),
+        "selected_mean_completion_tokens": round(
+            sum(candidate.tokens / _ROLLOUTS for candidate in selected)
+            / max(len(selected), 1),
+            3,
         ),
         "selected_distinct_prompt_share": round(
             len({
@@ -495,6 +528,7 @@ def main() -> None:
     parser.add_argument("--horizon", type=int, default=16)
     parser.add_argument("--target", type=int, default=16)
     parser.add_argument("--current-candidates", type=int, default=64)
+    parser.add_argument("--fill-candidates", type=int, default=32)
     parser.add_argument(
         "--epoch-generation-limit",
         "--epoch-candidates",
@@ -514,11 +548,16 @@ def main() -> None:
         args.horizon,
         args.target,
         args.current_candidates,
+        args.fill_candidates,
         args.epoch_generation_limit,
         args.epoch_intents,
     ) < 1:
         parser.error("all sizing arguments must be positive")
-    if min(args.current_candidates, args.epoch_generation_limit) < args.target:
+    if min(
+        args.current_candidates,
+        args.fill_candidates,
+        args.epoch_generation_limit,
+    ) < args.target:
         parser.error("candidate limits must be at least the target")
     if args.epoch_intents < args.epoch_generation_limit:
         parser.error("epoch intents must cover the generation cohort")
@@ -526,7 +565,11 @@ def main() -> None:
     population = _population(
         rng=random.Random(args.seed),
         horizon=args.horizon,
-        candidate_limit=max(args.current_candidates, args.epoch_intents),
+        candidate_limit=max(
+            args.current_candidates,
+            args.fill_candidates,
+            args.epoch_intents,
+        ),
     )
     report = {
         "scope": "synthetic capacity-envelope replay; not production telemetry",
@@ -539,6 +582,8 @@ def main() -> None:
             "epoch_ranking_policy": CHECKPOINT_EPOCH_RANKING_POLICY,
             "epoch_reward_policy": CHECKPOINT_EPOCH_REWARD_POLICY,
             "epoch_finalization_policy": CHECKPOINT_EPOCH_FINALIZATION_POLICY,
+            "rate_fill_orders_by_payload_tokens_per_generation_second": True,
+            "rate_fill_pays_eos_completion_token_share": True,
             "reward_or_profit_claim": False,
         },
         "seed": args.seed,
@@ -550,7 +595,17 @@ def main() -> None:
             target=args.target,
             candidate_supply=args.current_candidates,
             reveal_limit=args.current_candidates,
-            epoch_mode=False,
+            mode="current",
+        ),
+        "rate_paced_fill": _run_policy(
+            name="rate_paced_fill",
+            seed=args.seed,
+            population=population,
+            horizon=args.horizon,
+            target=args.target,
+            candidate_supply=args.fill_candidates,
+            reveal_limit=args.fill_candidates,
+            mode="rate_fill",
         ),
         "checkpoint_epoch": _run_policy(
             name="checkpoint_epoch",
@@ -560,7 +615,7 @@ def main() -> None:
             target=args.target,
             candidate_supply=args.epoch_intents,
             reveal_limit=args.epoch_generation_limit,
-            epoch_mode=True,
+            mode="ticketed_epoch",
         ),
         "economic_sensitivity": _economic_sensitivity(),
         "unmeasurable_without_authenticated_telemetry": [
@@ -569,6 +624,7 @@ def main() -> None:
             "real underfill",
             "real operator concentration",
             "real selection bias",
+            "fill stop response and work already in progress at close",
         ],
     }
     print(json.dumps(report, indent=2, sort_keys=True))
