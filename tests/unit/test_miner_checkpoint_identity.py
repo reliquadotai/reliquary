@@ -67,6 +67,10 @@ def test_store_rejects_same_number_rebinding(tmp_path, candidate):
     "record",
     [
         b"not-json",
+        (
+            b'{"schema_version":1,"schema_version":1,"checkpoint_n":5,'
+            b'"repo_id":"org/repo","oid":"' + REV_5.encode() + b'"}'
+        ),
         json.dumps(
             {
                 "schema_version": True,
