@@ -421,19 +421,25 @@ class TrainingPayloadQueue:
         self, fn: Callable[[], bytes | None],
     ) -> None:
         """Background-thread body kicked by ``fetch_step_cursor``."""
+        # try/finally, not just the fetch's try/except: if ANYTHING in this
+        # body ever raises past it, the in-flight flag must still drop, or
+        # the cache freezes forever with no crash to point at it.
         try:
-            raw = fn()
-        except Exception:
-            raw = None
-        parsed = None if raw is None else _parse_step_cursor(raw)
-        with self._step_cursor_cache_lock:
-            if parsed is not None:
-                self._step_cursor_cache_value = parsed
-            # Reset the TTL clock on EVERY completion, success or not --
-            # this is what turns a repeated failure into a natural ~TTL
-            # retry cadence instead of hammering every poll tick.
-            self._step_cursor_cache_at = time.monotonic()
-            self._step_cursor_fetch_in_flight = False
+            try:
+                raw = fn()
+            except Exception:
+                raw = None
+            parsed = None if raw is None else _parse_step_cursor(raw)
+            with self._step_cursor_cache_lock:
+                if parsed is not None:
+                    self._step_cursor_cache_value = parsed
+                # Reset the TTL clock on EVERY completion, success or not --
+                # this is what turns a repeated failure into a natural ~TTL
+                # retry cadence instead of hammering every poll tick.
+                self._step_cursor_cache_at = time.monotonic()
+        finally:
+            with self._step_cursor_cache_lock:
+                self._step_cursor_fetch_in_flight = False
 
     # ---------------- consumer ----------------
 
