@@ -42,7 +42,12 @@ async def test_derive_randomness_returns_tuple_in_drand_mode(monkeypatch):
         "randomness": "aa" * 32,
         "signature": "bb" * 48,
     }
-    fake_chain_info = {"genesis_time": 1692803367, "period": 3}
+    fake_chain_info = {
+        "name": "quicknet",
+        "hash": "ab" * 32,
+        "genesis_time": 1692803367,
+        "period": 3,
+    }
 
     monkeypatch.setattr(
         "reliquary.infrastructure.drand.get_beacon",
@@ -66,7 +71,11 @@ async def test_derive_randomness_returns_tuple_in_drand_mode(monkeypatch):
     assert len(result) == 2
     randomness, beacon = result
     assert randomness == "computed_randomness_hex"
-    assert beacon == fake_beacon
+    assert beacon == {
+        **fake_beacon,
+        "source_chain": "quicknet",
+        "source_chain_hash": "ab" * 32,
+    }
 
 
 @pytest.mark.asyncio
