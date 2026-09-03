@@ -47,11 +47,9 @@ ENVIRONMENT_NAME = "envscaler_tools_v1"
 GENERATOR_VERSION = "envscaler-v1"
 CHECKER_VERSION = "envscaler-checker-v1"
 MAX_TURNS = 12
-# A tool that raises is an observation, not the end of the episode: the
-# agent is guessing signatures for up to 25 tools and correcting from the
-# error is the skill being trained. The budget only bounds the cost of a
-# rollout that has stopped making progress.
-MAX_TOOL_ERRORS = 4
+# What runner.py calls a turn it could not read. Upstream reaches the same
+# state by routing content-without-a-tool-call to chat_with_user.
+_PROSE_TOOL = "__invalid_action__"
 _DATA_ENV_VAR = "RELIQUARY_ENVSCALER_DATA"
 
 
@@ -197,7 +195,20 @@ class EnvScalerToolsEnvironment:
     def step(
         self, task: EpisodeTask, state: WorldState, action: AssistantAction
     ) -> StepResult:
-        if action.kind == "final":
+        """Upstream's contract, followed deliberately.
+
+        `EnvScalerBaseEnv.step` is forgiving in a specific shape, and the
+        shape is the point: an unreadable turn or an unknown tool is an
+        error *observation* the agent may recover from, while prose with no
+        tool call is routed to `chat_with_user`, which in the non-conversational
+        mode ends the episode and scores the state reached. Only a tool that
+        raises is fatal. Departing from this measures our contract rather
+        than theirs.
+        """
+        name = str(action.tool) if action.kind == "tool" else ""
+        # runner.py turns a turn it cannot read into this call; upstream turns
+        # the same turn into chat_with_user, which terminates. Same thing.
+        if action.kind == "final" or name == _PROSE_TOOL:
             state.final_response = action.content or ""
             return StepResult(
                 state,
@@ -205,68 +216,70 @@ class EnvScalerToolsEnvironment:
                 done=True,
                 termination_reason="finished",
             )
-        name = str(action.tool)
         known = {spec.name for spec in task.tools}
         if name not in known:
-            return self._tool_error(
-                state, "error", "unknown tool: " + name[:80])
+            # Recoverable, and uncapped: max_turns already bounds the cost.
+            state.invalid_actions += 1
+            return StepResult(
+                state,
+                self._event("error", {
+                    "success": False,
+                    "error": f"unknown tool: {name[:80]}",
+                }),
+            )
         try:
             result = getattr(state.instance, name)(**dict(action.arguments))
         except Exception as exc:
-            return self._tool_error(
-                state, name, f"{type(exc).__name__}: {exc}")
+            state.invalid_actions += 1
+            return StepResult(
+                state,
+                self._event(name, {
+                    "success": False,
+                    "error": f"{type(exc).__name__}: {exc}"[:400],
+                }),
+                done=True,
+                termination_reason="tool_raised",
+            )
         state.calls.append(name)
         return StepResult(state, self._event(name, result))
-
-    def _tool_error(
-        self, state: WorldState, name: str, message: str
-    ) -> StepResult:
-        state.invalid_actions += 1
-        exhausted = state.invalid_actions >= MAX_TOOL_ERRORS
-        return StepResult(
-            state,
-            self._event(name, {"success": False, "error": message[:400]}),
-            done=exhausted,
-            termination_reason="invalid_action" if exhausted else None,
-        )
 
     def grade(
         self, task: EpisodeTask, state: WorldState, trace: EpisodeTrace
     ) -> RewardReport:
+        """Upstream's reward: the share of checks true at the final state.
+
+        `EnvScalerBaseEnv.calculate_reward` averages every check, including
+        the ones already true at reset — a no-op agent scores 0.166 on
+        average rather than zero, and breaking an invariant costs reward.
+        Grading only the checks the agent must flip, and only all-or-nothing,
+        makes the reward identically zero for every rollout of a 4B and
+        leaves the sigma gate nothing to select on.
+        """
         final = _state_of(state.instance)
         checks: list[RewardCheck] = []
-        required = passed = 0
+        passed = 0
         for position, entry in enumerate(task.private["checks"]):
-            source = entry["check_func"]
-            before = _run_check(source, state.initial, state.initial)
-            after = _run_check(source, state.initial, final)
-            # A check already true before the agent acted measures nothing.
-            counts = before is False
-            if counts:
-                required += 1
-                passed += int(after is True)
+            after = _run_check(entry["check_func"], state.initial, final)
+            passed += int(after is True)
             checks.append(RewardCheck(
                 name=f"check_{position}",
                 passed=after is True,
-                weight=1.0 if counts else 0.0,
+                weight=1.0,
                 detail=str(entry.get("check_item", ""))[:200],
             ))
+        total = len(task.private["checks"])
+        reward = passed / total if total else 0.0
         checks.append(RewardCheck(
-            "no_invalid_tool_calls", state.invalid_actions == 0, 0.5
+            "no_invalid_tool_calls", state.invalid_actions == 0, 0.0
         ))
         checks.append(RewardCheck(
             "finished_explicitly",
             trace.termination_reason == "finished",
-            0.5,
+            0.0,
         ))
-        success = (
-            required > 0
-            and passed == required
-            and trace.termination_reason == "finished"
-        )
         return RewardReport(
-            reward=1.0 if success else 0.0,
-            success=success,
+            reward=reward,
+            success=total > 0 and passed == total,
             checks=tuple(checks),
             state_digest=hashlib.sha256(
                 canonical_json(final).encode("utf-8")

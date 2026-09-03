@@ -6,6 +6,20 @@ training signal, which is a different question and the one that decides.
 Nothing is activated by this: `envscaler_tools_v1` is not registered in
 `registry.py` and no profile declares it.
 
+> **Correction, same day — the verdict below is withdrawn.**
+>
+> Everything under "Result" was measured against a port that was not
+> faithful to upstream. Reading `base_env.py`, `rl_non_conv_env.py` and
+> `parse_util.py` afterwards showed four divergences, each of which makes
+> the task harder than the paper's, and the reward one of which makes a
+> non-degenerate group impossible by construction. The numbers stand as a
+> measurement of *our contract*; they say nothing about EnvScaler. The
+> environment has since been rewritten to follow upstream and has **not
+> been re-measured** — that needs a GPU.
+>
+> The contract comparison in "What upstream actually does" is the part of
+> this document worth carrying forward.
+
 ## Bound identities
 
 - GPU: NVIDIA H100 PCIe 80 GB (sm90), vLLM 0.28.0,
@@ -151,6 +165,43 @@ fractional reward is nearly bimodal — a world is either manipulated
 correctly or not touched at all. Median group sigma is 0.000 in all three
 runs.
 
+## What upstream actually does
+
+Read after the fact, from the published `base_env.py`, `rl_non_conv_env.py`
+and `parse_util.py`.
+
+| | upstream | this port, as measured |
+|---|---|---|
+| unreadable turn | error observation, episode continues, no cap | fatal after 4 |
+| unknown tool | error observation, episode continues, no cap | fatal after 4 |
+| prose with no tool call | routed to `chat_with_user`, which **terminates and scores the state reached** | invalid action |
+| tool raises | fatal | fatal after 4 |
+| reward | `sum(checks)/len(checks)` — **continuous, over every check** | binary, conjunctive, over the checks false at reset |
+| action format | `<tool_call>{...}</tool_call>` with `<think>` blocks — Qwen's native shape | bare JSON in the `<\|reliquary_*\|>` frame |
+
+Two of these are decisive.
+
+**Prose is not a failure upstream.** `parse_action` turns content without a
+tool call into `chat_with_user`, and in the non-conversational mode
+`is_action_terminated` returns True for it. A base model that rambles
+therefore ends its episode cleanly and is scored on whatever state it
+reached. In this port it was an invalid action, and rambling is what a base
+model does.
+
+**The reward is continuous.** `calculate_reward` averages every check,
+including the ones already true at reset. Measured over 600 scenarios, an
+agent that does nothing scores **0.166 on average** (median 0.111, zero in
+31.5% of scenarios), and breaking an invariant costs reward. A binary
+conjunctive reward over 11 checks is identically zero for every rollout of
+a 4B, which forces sigma to zero and guarantees an empty band whatever the
+model does. That is a property of the grading, not of the environment.
+
+Two further facts about the corpus bear on this. It ships **140 SFT worlds
+and 51 RL worlds**; `rl_scen.json` covers only the 51. The RL half assumes
+a policy already taught to call tools in this format on the disjoint SFT
+half — a stage skipped entirely here, against a base model that has never
+emitted a tool call.
+
 ## What would change the verdict
 
 1. **Generated tasks at 2-5 checks.** The corpus cannot supply them (75 of
@@ -164,10 +215,15 @@ runs.
 
 ## Recommendation
 
-Keep the adapter, do not register it. It is 447 lines plus tests, it
-replays deterministically, and it costs nothing while dormant — the same
-posture as `cipher` in the logic roster. Re-measure when either the task
-generator or a stronger policy exists.
+Keep the adapter, do not register it. It replays deterministically and
+costs nothing while dormant — the same posture as `cipher` in the logic
+roster.
+
+The next step is not a decision, it is a re-measurement: the environment
+now follows upstream's contract, and the band has to be read again on a
+GPU before anything is concluded. The continuous reward is the change most
+likely to move it, because it is the one that made a non-degenerate group
+impossible rather than merely unlikely.
 
 ## Reproducing
 
