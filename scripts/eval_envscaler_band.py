@@ -133,8 +133,10 @@ arguments within <tool_call></tool_call> XML tags:
 <|im_start|>assistant
 """
 
+_NO_THINK = "<think>\n\n</think>\n\n"
 
-def qwen_initial_text(task) -> str:
+
+def qwen_initial_text(task, no_think: bool = False) -> str:
     tools = "\n".join(
         json.dumps({"type": "function", "function": {
             "name": spec.name,
@@ -143,15 +145,18 @@ def qwen_initial_text(task) -> str:
         }}, ensure_ascii=False)
         for spec in task.tools
     )
-    return _QWEN_SYSTEM.format(tools=tools, prompt=task.prompt)
+    text = _QWEN_SYSTEM.format(tools=tools, prompt=task.prompt)
+    return text + _NO_THINK if no_think else text
 
 
-def qwen_observation_text(events) -> str:
+def qwen_observation_text(events, no_think: bool = False) -> str:
     body = "".join(
         f"<tool_response>\n{event.content}\n</tool_response>\n"
         for event in events
     )
-    return f"<|im_end|>\n<|im_start|>user\n{body}<|im_end|>\n<|im_start|>assistant\n"
+    text = (f"<|im_end|>\n<|im_start|>user\n{body}"
+            f"<|im_end|>\n<|im_start|>assistant\n")
+    return text + _NO_THINK if no_think else text
 
 
 _TOOL_CALL = re.compile(r"<tool_call>\s*(\{.*?\})\s*(?:</tool_call>|$)", re.S)
@@ -209,6 +214,10 @@ def main() -> int:
                              "<tool_call> ChatML frame the model was actually "
                              "post-trained on, for measuring what our own "
                              "renderer costs")
+    parser.add_argument("--no-think", action="store_true",
+                        help="with --format qwen, pre-close the think block, "
+                             "which is Qwen3's documented way to turn "
+                             "reasoning off")
     parser.add_argument("--prose", choices=("terminates", "retries"),
                         default="terminates",
                         help="what an unreadable turn means. 'terminates' is "
@@ -221,13 +230,17 @@ def main() -> int:
     args = parser.parse_args()
 
     from reliquary.environment.agentic.envs.envscaler_tools_v1.environment import (
-        EnvScalerToolsEnvironment,
+        EnvScalerToolsEnvironment, _PROSE_TOOL,
     )
+    globals()["_PROSE_TOOL"] = _PROSE_TOOL
 
     environment = EnvScalerToolsEnvironment()
     qwen = args.fmt == "qwen"
-    render_initial = qwen_initial_text if qwen else initial_text
-    render_observation = qwen_observation_text if qwen else observation_text
+    if qwen:
+        render_initial = lambda t: qwen_initial_text(t, args.no_think)
+        render_observation = lambda e: qwen_observation_text(e, args.no_think)
+    else:
+        render_initial, render_observation = initial_text, observation_text
     from vllm import LLM, SamplingParams
 
     llm = LLM(
@@ -260,7 +273,7 @@ def main() -> int:
                 "text": render_initial(task), "done": False, "reason": None,
                 "tokens": 0, "turns": 0,
                 "strict_turns": 0, "strict_ok": 0, "strict_alive": True,
-                "unreadable": 0,
+                "unreadable": 0, "tool_ok": 0, "tool_err": 0, "ended": 0,
             })
 
     started = time.time()
@@ -324,7 +337,21 @@ def main() -> int:
                 )
                 rollout["unreadable"] += 1
             rollout["text"] += completion.text
+            # Every turn falls in exactly one of three buckets: unreadable,
+            # readable but the call failed, readable and the world moved.
+            # That is the line between a formatting problem and a competence
+            # one, and it cannot be read off the invalid-turn rate alone.
+            errors_before = rollout["state"].invalid_actions
+            readable = (action.kind == "tool"
+                        and action.tool not in (_PROSE_TOOL, "__unreadable__"))
             result = environment.step(rollout["task"], rollout["state"], action)
+            if readable:
+                if rollout["state"].invalid_actions > errors_before:
+                    rollout["tool_err"] += 1
+                else:
+                    rollout["tool_ok"] += 1
+            elif action.tool == _PROSE_TOOL:
+                rollout["ended"] += 1
             rollout["text"] += render_observation(result.events)
             if result.done:
                 rollout["done"] = True
@@ -361,6 +388,8 @@ def main() -> int:
             "invalid": sum(1 for r in replicas
                            if r["reason"] == "tool_raised"),
             "unreadable": sum(r["unreadable"] for r in replicas),
+            "tool_ok": sum(r["tool_ok"] for r in replicas),
+            "tool_err": sum(r["tool_err"] for r in replicas),
             "strict_turns": sum(r["strict_turns"] for r in replicas),
             "strict_ok": sum(r["strict_ok"] for r in replicas),
             "strict_alive": sum(1 for r in replicas if r["strict_alive"]),
@@ -374,7 +403,8 @@ def main() -> int:
     with open(args.output, "w", encoding="utf-8") as handle:
         json.dump({"model": args.model, "sigma_min": SIGMA_MIN,
                    "contract": args.contract, "prose": args.prose,
-                   "format": args.fmt, "rows": rows},
+                   "format": args.fmt, "no_think": args.no_think,
+                   "rows": rows},
                   handle, indent=1)
 
     n = len(rows)
@@ -398,6 +428,13 @@ def main() -> int:
           f"{sum(r['unreadable'] for r in rows) / max(strict_turns, 1):.1%}"
           f"   --format {args.fmt} --contract {args.contract} "
           f"--prose {args.prose}")
+    ok = sum(r["tool_ok"] for r in rows)
+    err = sum(r["tool_err"] for r in rows)
+    print(f"turns: readable+executed {ok / max(strict_turns, 1):.1%}"
+          f" | readable+failed {err / max(strict_turns, 1):.1%}"
+          f" | unreadable {sum(r['unreadable'] for r in rows) / max(strict_turns, 1):.1%}")
+    print(f"of readable turns, executed "
+          f"{ok / max(ok + err, 1):.1%}")
     print(f"turns with a readable action "
           f"{sum(r['strict_ok'] for r in rows) / max(strict_turns, 1):.1%}")
     print(f"explicit termination  {sum(r['finished'] for r in rows) / total:.1%}")

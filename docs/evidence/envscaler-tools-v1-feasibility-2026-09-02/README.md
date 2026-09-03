@@ -6,11 +6,17 @@ environment produce a training signal against the model we actually train?
 Nothing is activated by this. `envscaler_tools_v1` is not in `registry.py`
 and no profile declares it.
 
-**Answer: not against `Qwen3-4B-Base`, but the reason is not the one a
-first pass reported.** Under a faithful port, no rollout in 3,840 solves a
-task and no group clears the gate — yet the best group reaches sigma 0.210
-against a threshold of 0.24. The environment supplies gradient; it falls
-just short of the bar that decides whether the gradient is kept.
+**Answer: the environment works. Our starting point and our action
+contract do not.** On `Qwen3-4B` — same pretraining, post-trained — allowed
+to reason before acting, **5.1% of rollouts solve a task outright**, 66.7%
+of groups carry reward spread, and one group clears even the current gate.
+On `Qwen3-4B-Base` the best configuration solves none and tops out at sigma
+0.132, which no reasonable threshold recovers.
+
+The deciding factor is not the one a first pass looked for. Holding model
+and frame fixed, **turning reasoning off takes outright solves from 5.1% to
+zero** and groups with spread from 66.7% to 6.2%. Production's action
+contract forbids exactly that: bare JSON, no reasoning before the call.
 
 ## Bound identities
 
@@ -127,6 +133,71 @@ here, which retires the hypothesis that the renderer is what costs us.
 **No rollout ever solved a task** — 0 of 3,840 across every configuration,
 including the 14B first pass.
 
+## Post-training, and the factor that actually decides
+
+`Qwen/Qwen3-4B` and `Qwen/Qwen3-4B-Base` share a pretraining run, so
+comparing them isolates post-training; crossing that with the frame and
+with reasoning says which of the three carries the result.
+
+| model · frame · reasoning | mean | solves | spread | median sigma | max sigma |
+|---|---:|---:|---:|---:|---:|
+| base · ours · 512 tok | 0.225 | 0% | 22.9% | 0.000 | 0.210 |
+| base · ours · 2048 tok | 0.219 | 0% | 16.7% | 0.000 | 0.132 |
+| base · Qwen ChatML | 0.155 | 0% | 0% | 0.000 | 0.000 |
+| post-trained · ours · 2048 tok | 0.206 | 0% | 22.9% | 0.000 | — |
+| post-trained · ChatML · **no** reasoning | 0.337 | 0% | 6.2% | 0.000 | 0.169 |
+| post-trained · ChatML · **with** reasoning | **0.424** | **5.1%** | **66.7%** | **0.058** | **0.258** |
+
+The last two rows are one model, one frame, one corpus. Only the right to
+reason differs, and it is worth zero against 5.1% of outright solves and
+6.2% against 66.7% of usable groups. Nothing else measured comes close —
+which makes production's bare-JSON contract not merely lossy but the
+removal of the single source of capability on these tasks.
+
+### The base model does not fail on format
+
+Decomposing every turn into unreadable / readable-but-the-call-failed /
+readable-and-the-world-moved settles it. Base model, our frame, lenient
+reading: **37.9% unreadable, 49.3% readable and executed, 6.9% readable and
+failed — so 87.7% of readable calls succeed** — and still 0% of tasks
+solved. The model can call tools; it cannot decide which ones, in what
+order, to reach a thirteen-condition goal. That is planning, not encoding.
+
+### What threshold would make it usable
+
+Share of the 48 groups that would produce gradient, by threshold:
+
+| threshold | 0.05 | 0.08 | 0.10 | 0.12 | 0.15 | 0.20 | 0.24 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| post-trained + reasoning | 54.2% | 37.5% | 27.1% | 22.9% | 14.6% | 6.2% | 2.1% |
+| base | 12.5% | 6.2% | 6.2% | 4.2% | 0% | 0% | 0% |
+
+At 0.10 the post-trained model yields **27.1%** of groups. For scale,
+`reliquarylogic_v1`'s families run 15.6% to 100% and OpenMathInstruct-2
+measures 75.5% on this metric while having stopped teaching. 27% is a
+usable corpus by our own standard; 6.2% is not, and the base model's
+ceiling of 0.132 means no threshold rescues it.
+
+### The frame must match the model, and the answers are opposite
+
+| | base model | post-trained model |
+|---|---|---|
+| our `<\|reliquary_*\|>` frame | 37.9% unreadable, 0.219 | **87.2% unreadable**, 0.206 |
+| Qwen ChatML + `<tool_call>` | **100% unreadable**, 0.155 | 37.1% unreadable, **0.424** |
+
+The post-trained figure is not a token-budget artefact: the 2048-token
+control reproduces it. Under ChatML the base model emits the right payload
+(`{"name": "get_user_by_id", "arguments": {…}}`) inside invented tags
+(`<tool_use>`, `<dration>`) and otherwise drifts into Chinese and
+repetition loops — `<tool_call>` is a post-training convention it never
+received. The reverse case is the mirror: a chat model off its template
+degrades.
+
+This matters beyond EnvScaler, because the renderer is manifest-pinned. If
+the goal is a model that works in an application doing tool calls, that
+application speaks ChatML and `<tool_call>`. Training on a proprietary
+frame produces a model that speaks only that frame.
+
 ## What sigma >= 0.24 demands of a continuous reward
 
 Derived before the runs, and matched by them. The gate
@@ -196,10 +267,17 @@ re-prefills roughly **340k tokens**, against about **10k** for a
 Keep the adapter, do not register it — it replays deterministically and
 costs nothing dormant, the posture `cipher` has in the logic roster.
 
-Do not read this as "EnvScaler is too hard". Read it as: against a base
-model with no tool-use post-training, on the RL half of a corpus whose SFT
-half we skipped, the environment lands a factor of 1.15 short of a gate
-calibrated for binary rewards.
+**Fix the action contract now**, independently of any decision about
+EnvScaler: it is worth a factor of five to the four active episode
+environments and it structurally removes the one factor measured to produce
+capability. Then decide separately, and with the cost in view, whether to
+pay for the SFT stage and the per-group price to open tool calling at all.
+
+The cost is not a footnote. The configuration that works generates 6,272
+tokens per rollout at the median against 563 without reasoning; a
+16-rollout group processes on the order of **1.5M context tokens** against
+about 10k for a math or code group. That is over a hundredfold, for one
+usable group in four at a lowered threshold.
 
 ## Reproducing
 
@@ -231,6 +309,11 @@ python scripts/eval_envscaler_band.py --model Qwen/Qwen3-4B-Base \
 ec5cec5985387f515598d2f8cb804cd2665dd46b5dac331e1dcb5f98a18c63be  fix_14b_strict.json
 9fefecc37114c6110840f5378d9db4659e93009905258a5d6cf99bde4f8fc7f2  fix_4b_lenient.json
 c0cc72a5000a670d5fd160333a91c4c5f562db1aae22535ed86afdaeda7158f1  fix_4b_strict.json
+3213c24af3f81b75577dacb4f159335cfacf0c6bcec7936a7efef3e321b9980c  pt_base_2048.json
+f403879b4a42d272bf1293c785b7e402542079e9d3e6b479294c3a29d15fa614  pt_qwen_nothink.json
+a465df80732517973e222865c9b05a18253962dd4c19f71c6f886cec4adc7af3  pt_qwen_think.json
+3e748c4375688ccfcc62cc0a1448562222e0ed5a0b900833743d54a11e7085d6  pt_reliquary_2048.json
+6f985b1695958c5dcc8e05adba794e455e9f77f1ed796dffe48e5306f20dff91  pt_reliquary_len.json
 a5d2f95b3a9ff29bd6042ce96060be2102fba2cb857aa5fa69e3d2e42906e46c  qw_retries.json
 95e0abf2189f1df59ce94f2e46e41bf147cf968fee440cc451cb7fcace218a8b  qw_terminates.json
 f7764aca17b64f6b18f4d5966601f2366531a181db95b5aea624b25364f762eb  up_lenient_retries.json
