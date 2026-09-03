@@ -1,238 +1,214 @@
-# Can Reliquary use EnvScaler as a tool-calling environment? — 2026-09-02
+# Can Reliquary use EnvScaler as a tool-calling environment? — 2026-09-02/03
 
-The adapter is written and works. This measures whether it produces a
-training signal, which is a different question and the one that decides.
+The adapter works. This asks the separate, deciding question: does the
+environment produce a training signal against the model we actually train?
 
-Nothing is activated by this: `envscaler_tools_v1` is not registered in
-`registry.py` and no profile declares it.
+Nothing is activated by this. `envscaler_tools_v1` is not in `registry.py`
+and no profile declares it.
 
-> **Correction, same day — the verdict below is withdrawn.**
->
-> Everything under "Result" was measured against a port that was not
-> faithful to upstream. Reading `base_env.py`, `rl_non_conv_env.py` and
-> `parse_util.py` afterwards showed four divergences, each of which makes
-> the task harder than the paper's, and the reward one of which makes a
-> non-degenerate group impossible by construction. The numbers stand as a
-> measurement of *our contract*; they say nothing about EnvScaler. The
-> environment has since been rewritten to follow upstream and has **not
-> been re-measured** — that needs a GPU.
->
-> The contract comparison in "What upstream actually does" is the part of
-> this document worth carrying forward.
+**Answer: not against `Qwen3-4B-Base`, but the reason is not the one a
+first pass reported.** Under a faithful port, no rollout in 3,840 solves a
+task and no group clears the gate — yet the best group reaches sigma 0.210
+against a threshold of 0.24. The environment supplies gradient; it falls
+just short of the bar that decides whether the gradient is kept.
 
 ## Bound identities
 
-- GPU: NVIDIA H100 PCIe 80 GB (sm90), vLLM 0.28.0,
+- H100 PCIe 80 GB, vLLM 0.28.0, torch 2.13.0+cu130,
   `VLLM_USE_FLASHINFER_SAMPLER=0` (no CUDA toolkit in the image).
-- Models: `Qwen/Qwen3-4B-Base@906bfd4b4dc7f14ee4320094d8b41684abff8539`
-  — the revision the profiles pin — and `Qwen/Qwen3-14B` as a ceiling.
-- Sampling: T=1.0, top_p=1.0, top_k disabled, 16 rollouts, seed 7,
-  512 max new tokens per turn, 12 turns.
-- Prompting: the branch's own `CanonicalEpisodeRenderer`, not a bespoke
-  format. A first pass used a hand-written renderer and is discarded.
+- `Qwen/Qwen3-4B-Base@906bfd4b4dc7f14ee4320094d8b41684abff8539` — the
+  revision the profiles pin — and `Qwen/Qwen3-14B` for the first-pass ceiling.
+- T=1.0, top_p=1.0, top_k disabled, 16 rollouts, seed 7, 512 max new tokens
+  per turn, 12 turns, 48 tasks per configuration.
+- Prompting through the branch's own `CanonicalEpisodeRenderer`.
 
 ## What the corpus is
 
-51 worlds, 2,550 scenarios, drawn from EnvScaler's published RL split.
-Each world is a Python class exposing tools; each scenario is a natural
-language request plus boolean check functions over the terminal state.
+51 worlds, 2,550 scenarios, from EnvScaler's published RL split. Each world
+is a Python class exposing tools; each scenario is a request plus boolean
+check functions over the terminal state.
 
 | | |
 |---|---:|
 | tools per scenario | 18 median, 25 max |
 | checks per scenario | 13 median |
-| checks that *count* (false at reset) | 11 median |
-| scenarios with <= 4 counting checks | 2.9% |
-| scenarios with 0 counting checks | 0 |
+| checks false at reset | 11 median |
+| scenarios with <= 4 such checks | 2.9% |
 | initial prompt with the TOOLS block | ~14 KB, ~3.5k tokens |
 
-The difficulty distribution has no easy tail to carve out: the minimum is
-2 counting checks, and only 75 of 2,550 scenarios sit at 4 or below.
+The corpus also ships **140 SFT worlds against these 51 RL worlds**;
+`rl_scen.json` covers only the 51. The RL half assumes a policy already
+taught to call tools on the disjoint SFT half — a stage skipped here,
+against a base model that has never emitted a tool call.
 
 ## Determinism
 
 The upstream classes are LLM-written and reach for wall-clock time, uuid4
-and `datetime.now` — measured across the 191 published classes, 31% call
-`time.time()`, 32% `datetime.now()`, 20% uuid, and only 36% are clean.
-Left alone, miner and validator replaying one episode observe different
-bytes and the honest miner is rejected.
+and `datetime.now`: across the 191 published classes, 31.4% call
+`time.time()`, 31.9% `datetime.now()`, 20.4% uuid, 36.6% are clean. Left
+alone, miner and validator replaying one episode observe different bytes
+and the honest miner is rejected.
 
 Three frozen shims (`shims.py`, pinned by `tests/unit/test_envscaler_shims.py`)
-recover every world: **500 of 500 replayed episodes are byte-identical.**
-An earlier 188/300 divergence was two mistakes of mine — a missing
-`deepcopy` of the config, and a forgotten `datetime` shim.
+recover every world: **500 of 500 replayed episodes byte-identical.** An
+earlier 188/300 divergence was two mistakes — a missing `deepcopy` of the
+config, and a forgotten `datetime` shim.
 
-One further class calls `random.choice`, which no shim covers. It is
-`env_42_sft`, outside the 51 RL worlds, so the corpus in use is unaffected
-— but ingesting the SFT split later would need a fourth shim.
-
-## Cost
-
-At the measured median of 5 turns, a group of 16 rollouts re-prefills
-roughly **280k tokens**, against about **10k** for a 16-rollout math or
-code group — near **28x**. That ratio is the input `w_env` needs.
-
-## Result — 48 tasks x 16 rollouts, three contracts
-
-Two mistakes of mine were corrected before these runs and both had been
-suppressing the numbers: a greedy `{.*}` in the harness that read 96%
-invalid actions off a model emitting valid ones, and a `step()` that ended
-the episode the first time a tool raised. A tool error is now an
-observation with a budget of four, which is how the agent is supposed to
-learn to correct.
-
-| | 4B strict | 4B lenient | 14B strict |
-|---|---:|---:|---:|
-| pass@1 (binary) | 0.000 | 0.000 | 0.040 |
-| groups in band | 0.0% | 0.0% | 2.1% |
-| k=0 | 100.0% | 100.0% | 95.8% |
-| k=16 | 0.0% | 0.0% | 2.1% |
-| mean fractional reward | 0.014 | 0.065 | 0.210 |
-| rollouts moving >=1 check | 6.9% | 25.3% | 35.0% |
-| rollouts reaching the goal | 0.0% | 0.0% | 6.1% |
-| groups with sigma_frac >= 0.24 | 0.0% | 0.0% | 2.1% |
-| groups with any spread | 6.2% | 20.8% | 16.7% |
-| episodes killed (budget 4) | 82.4% | 49.3% | 61.7% |
-| turns unreadable | 65.4% | 29.8% | 42.0% |
-| turns that are bare JSON | 34.6% | 27.2% | 58.0% |
-| explicit termination | 13.3% | 38.0% | 8.5% |
-| turns (median) | 4 | 5 | 4 |
-| generated tokens (median) | 571 | 606 | 1122 |
-
-`band` is the share of 16-rollout groups whose reward sigma clears
-`SIGMA_MIN` (0.24) — at 16 rollouts, 1 to 15 successes. Outside it the
-auction values the group at zero and the gate drops it, so it is the only
-part of a corpus that produces gradient.
-
-### The environment does not train our model
-
-**Zero of 768 rollouts solved a task under either contract on
-Qwen3-4B-Base**, and no group lands in the band under binary *or*
-fractional reward. That is the answer to the question this document asks.
-
-Qwen3-14B is markedly better at the task itself — mean fractional reward
-0.210 against 0.065 — and still yields **one gradient-producing group in
-48**. Paying 28x a math group's tokens for a 2.1% band is not a trade
-worth making.
-
-### The action contract is expensive, and free to fix
-
-`AssistantAction.from_json` requires the whole completion to be one bare
-JSON object after `strip()`. Relaxing that to *the first brace-balanced
-object anywhere in the turn* — same action space, same determinism, both
-sides running the same function — is worth, on the same generations:
-
-| | strict | lenient |
-|---|---:|---:|
-| episodes killed by errors | 82.4% | 49.3% |
-| turns unreadable | 65.4% | 29.8% |
-| groups with any reward spread | 6.2% | 20.8% |
-| rollouts moving at least one check | 6.9% | 25.3% |
-| explicit termination | 13.3% | 38.0% |
-
-Two observations sharpen this. At turn 1, **78.2% of rollouts emit a
-valid, correctly named tool call while only 27.1% satisfy the contract** —
-the model writes a sentence of reasoning, then the JSON, and production
-discards both. And **no Qwen3-14B rollout, in 768, produced bare JSON on
-every turn**: the contract is most hostile to the models most able to do
-the work.
-
-This is not an EnvScaler finding. `runner.py` is the single path for all
-five episode environments on this branch, so the same tax is being paid by
-`stateful_tools_v1`, `retrieval_tools_v1`, `workspace_tools_v1` and
-`web_tools_v1`, whose 35-43% invalid-action rates were measured before
-this was understood.
-
-### Binary reward measures termination, not solving
-
-On the 14B, `env_141_rl-task_3` has **all sixteen rollouts at fractional
-1.0** — every counting check flipped — and ten binary successes. The six
-others solved the task and did not emit the final marker. A group's binary
-variance there is a formality, not a difficulty signal. The same shape
-explains `stateful_tools_v1`'s apparent 62% success, 95% of which tracked
-clean termination.
-
-The `invalid_actions == 0` veto on success was dropped for the same
-reason: recovering from a failed call is the behaviour being trained, so
-errors are reported as checks rather than voiding the episode.
-
-### Why the corpus is out of reach
-
-The median scenario needs **11 checks to flip together**, and the
-distribution has no easy tail: the minimum is 2, and 2.9% of scenarios sit
-at 4 or below. Fractional credit does not rescue this, because the
-fractional reward is nearly bimodal — a world is either manipulated
-correctly or not touched at all. Median group sigma is 0.000 in all three
-runs.
+One further class calls `random.choice`: `env_42_sft`, outside the 51 RL
+worlds. Ingesting the SFT split later would need a fourth shim.
 
 ## What upstream actually does
 
-Read after the fact, from the published `base_env.py`, `rl_non_conv_env.py`
-and `parse_util.py`.
+From the published `base_env.py`, `rl_non_conv_env.py` and `parse_util.py`.
+A first pass measured a port that diverged from all of this, and the
+divergences all made the task harder.
 
-| | upstream | this port, as measured |
+| | upstream | first pass |
 |---|---|---|
-| unreadable turn | error observation, episode continues, no cap | fatal after 4 |
-| unknown tool | error observation, episode continues, no cap | fatal after 4 |
+| unreadable turn | error observation, episode continues, uncapped | fatal after 4 |
+| unknown tool | error observation, episode continues, uncapped | fatal after 4 |
 | prose with no tool call | routed to `chat_with_user`, which **terminates and scores the state reached** | invalid action |
 | tool raises | fatal | fatal after 4 |
-| reward | `sum(checks)/len(checks)` — **continuous, over every check** | binary, conjunctive, over the checks false at reset |
-| action format | `<tool_call>{...}</tool_call>` with `<think>` blocks — Qwen's native shape | bare JSON in the `<\|reliquary_*\|>` frame |
+| reward | `sum(checks)/len(checks)` — **continuous, over every check** | binary, conjunctive, over checks false at reset |
 
-Two of these are decisive.
+The reward was decisive. Binary-conjunctive over 11 checks is identically
+zero for every rollout of a 4B, so sigma is exactly zero and the band is
+empty **by construction rather than by measurement**. Upstream's reward is
+non-zero for doing nothing: over 600 scenarios a no-op agent scores
+**0.166 mean, 0.111 median**, zero in 31.5% — and breaking an invariant
+costs reward.
 
-**Prose is not a failure upstream.** `parse_action` turns content without a
-tool call into `chat_with_user`, and in the non-conversational mode
-`is_action_terminated` returns True for it. A base model that rambles
-therefore ends its episode cleanly and is scored on whatever state it
-reached. In this port it was an invalid action, and rambling is what a base
-model does.
+## Result — faithful port
 
-**The reward is continuous.** `calculate_reward` averages every check,
-including the ones already true at reset. Measured over 600 scenarios, an
-agent that does nothing scores **0.166 on average** (median 0.111, zero in
-31.5% of scenarios), and breaking an invariant costs reward. A binary
-conjunctive reward over 11 checks is identically zero for every rollout of
-a 4B, which forces sigma to zero and guarantees an empty band whatever the
-model does. That is a property of the grading, not of the environment.
+48 tasks x 16 rollouts per configuration. `--contract` is how a turn is
+read (`strict` is production's `AssistantAction.from_json`, which demands
+the whole completion be one bare JSON object; `lenient` takes the first
+brace-balanced object anywhere). `--prose` is what an unreadable turn means
+(`terminates` is upstream's routing; `retries` makes it recoverable, which
+separates "the base model rambles" from "the environment cannot spread").
 
-Two further facts about the corpus bear on this. It ships **140 SFT worlds
-and 51 RL worlds**; `rl_scen.json` covers only the 51. The RL half assumes
-a policy already taught to call tools in this format on the disjoint SFT
-half — a stage skipped entirely here, against a base model that has never
-emitted a tool call.
+| | reliquary strict/term | reliquary lenient/term | reliquary lenient/retries | qwen chatml/retries |
+|---|---:|---:|---:|---:|
+| mean reward | 0.163 | 0.195 | 0.225 | 0.155 |
+| best-of-16 reward | 0.170 | 0.219 | 0.252 | 0.155 |
+| rollouts fully solving | 0.0% | 0.0% | 0.0% | 0.0% |
+| **GROUPS IN BAND (sigma>=0.24)** | 0.0% | 0.0% | 0.0% | 0.0% |
+| groups with any spread | 4.2% | 18.8% | 22.9% | 0.0% |
+| median group sigma | 0.000 | 0.000 | 0.000 | 0.000 |
+| max group sigma | 0.132 | 0.195 | 0.210 | 0.000 |
+| groups sigma>=0.05 | 2.1% | 12.5% | 10.4% | 0.0% |
+| groups sigma>=0.10 | 2.1% | 10.4% | 8.3% | 0.0% |
+| groups sigma>=0.15 | 0.0% | 6.2% | 4.2% | 0.0% |
+| groups sigma>=0.20 | 0.0% | 0.0% | 2.1% | 0.0% |
+| ended by a raising tool | 5.5% | 12.5% | 27.6% | 0.0% |
+| turns unreadable | 48.6% | 16.0% | 39.1% | 100.0% |
+| explicit termination | 92.6% | 79.7% | 39.2% | 0.0% |
+| over the 16k budget | 0.0% | 0.0% | 0.0% | 0.0% |
+| turns (median) | 1 | 2 | 6 | 12 |
+| generated tokens (median) | 193 | 294 | 636 | 5679 |
+
+Three readings.
+
+**The contract fix is worth a factor of five and is not enough.** Going
+from production's strict reading to the lenient one raises mean reward from
+0.163 to 0.225 against a 0.166 floor, and takes groups with any spread from
+4.2% to 22.9%. The band stays at 0.0%.
+
+**Qwen's own frame is worse, not better.** Rendering the episode as ChatML
+with `<tool_call>` tags — the shape Qwen3 was post-trained on — collapses
+to 100% unreadable turns and a mean reward of 0.155, *below* the do-nothing
+floor. Inspection of the raw completions shows why: the base model emits
+the right payload (`{"name": "get_user_by_id", "arguments": {...}}`) inside
+invented tags (`<tool_use>`, `<dration>`), and otherwise drifts into
+Chinese and repetition loops. `<tool_call>` is a post-training convention
+and this model has had no post-training. Our own frame is the better one
+here, which retires the hypothesis that the renderer is what costs us.
+
+**No rollout ever solved a task** — 0 of 3,840 across every configuration,
+including the 14B first pass.
+
+## What sigma >= 0.24 demands of a continuous reward
+
+Derived before the runs, and matched by them. The gate
+(`difficulty_auction.py:113`, `SIGMA_MIN` in `constants.py:623`) is a raw
+standard deviation over the group's rewards, with no normalisation for the
+reward's scale. With a no-op floor of 0.166:
+
+- as a near-binary mixture of "solves" and "does nothing", it needs
+  **10% to 90% of rollouts to solve the task outright**;
+- as partial progress alone, uniformly spread, it needs a spread of
+  **0.83 of reward — about 11 of 13 checks — between rollouts of one group**.
+
+Partial progress cannot reach it: five checks of spread between rollouts
+gives sigma ~0.115, under half the bar. **The threshold implicitly assumes
+a binary reward.** Any environment with graded credit is handicapped by it,
+which is a fact about the gate, not about EnvScaler.
+
+The observed maximum is 0.210, and the shape of that group is instructive.
+`env_158_rl-task_5` is bimodal — its rollouts score either 0.077 or 0.615,
+so some flip 8 of 13 checks and the rest flip one. That is the right shape.
+It misses only because the upper mode is minority (about 3 of 16); balanced
+8/8 the same two levels give sigma 0.269, which clears the gate.
+
+What separates the 11 groups with spread from the 37 without is **not**
+scenario length — both have a median of 13 checks. It is mean reward, 0.296
+against 0.203: whether the model engages the task at all.
+
+## First pass, superseded
+
+`fix_*.json` hold the unfaithful-port runs. Their band figures measure our
+contract and say nothing about EnvScaler, but two findings from them stand
+because they concern `runner.py`, the single action path for all five
+episode environments on this branch:
+
+- **The strict contract is a branch-wide tax.** At turn 1, **78.2% of
+  rollouts emit a valid, correctly named tool call while 27.1% satisfy the
+  contract** — the model writes a sentence of reasoning, then the JSON, and
+  production discards both. No Qwen3-14B rollout in 768 was bare JSON on
+  every turn: the contract is most hostile to the models most able to do the
+  work. This is plausibly part of the 35-43% invalid-action rates measured
+  on the branch's own episode suite.
+- **Binary reward measures termination, not solving.** One 14B group had all
+  sixteen rollouts at the goal state and ten binary successes; the other six
+  solved it and did not emit the final marker. The same shape explains
+  `stateful_tools_v1`'s apparent 62% success.
+
+## Cost
+
+At the best configuration's median of 6 turns, a group of 16 rollouts
+re-prefills roughly **340k tokens**, against about **10k** for a
+16-rollout math or code group. That ratio is the input `w_env` needs.
 
 ## What would change the verdict
 
-1. **Generated tasks at 2-5 checks.** The corpus cannot supply them (75 of
-   2,550), so they have to be produced — which is the offline generation
-   pipeline already planned as the next step.
-2. **A relaxed action contract.** Worth doing on its own merits for the
-   four active episode environments, independent of EnvScaler.
-3. **A materially stronger policy.** The 14B result is the evidence that
-   the ceiling moves with model strength; it is not evidence that a 9B
-   would clear the band.
+1. **Tasks a 4B solves outright between 10% and 90% of the time.** That is
+   what the gate requires, stated as a specification. This corpus supplies
+   none — hence the offline generator already planned.
+2. **A gate that normalises for reward scale**, or an env-specific
+   threshold. The best group here is at 0.210 against 0.24; the shape is
+   right and the scale is not.
+3. **The SFT stage.** 140 worlds exist for it and were not used.
+4. **A relaxed action contract**, worth doing on its own merits for the four
+   active episode environments whatever is decided about EnvScaler.
 
 ## Recommendation
 
-Keep the adapter, do not register it. It replays deterministically and
-costs nothing while dormant — the same posture as `cipher` in the logic
-roster.
+Keep the adapter, do not register it — it replays deterministically and
+costs nothing dormant, the posture `cipher` has in the logic roster.
 
-The next step is not a decision, it is a re-measurement: the environment
-now follows upstream's contract, and the band has to be read again on a
-GPU before anything is concluded. The continuous reward is the change most
-likely to move it, because it is the one that made a non-degenerate group
-impossible rather than merely unlikely.
+Do not read this as "EnvScaler is too hard". Read it as: against a base
+model with no tool-use post-training, on the RL half of a corpus whose SFT
+half we skipped, the environment lands a factor of 1.15 short of a gate
+calibrated for binary rewards.
 
 ## Reproducing
 
 The corpus is **not vendored**. `RELIQUARY_ENVSCALER_DATA` must point at a
-directory holding EnvScaler's published `env_meta.json` (191 world classes)
-and `rl_scen.json` (the RL scenario split); the loader keeps only the
-scenarios whose `env_id` resolves, and **addresses them by position**, so
-the file order is part of the corpus identity. Before any activation this
-should be a pinned revision of a fork rather than a loose directory.
+directory holding EnvScaler's `env_meta.json` (191 world classes) and
+`rl_scen.json` (the RL split); the loader keeps the scenarios whose
+`env_id` resolves and **addresses them by position**, so file order is part
+of the corpus identity. Before any activation this should be a pinned
+revision of a fork rather than a loose directory.
 
 The exact bytes these measurements ran against:
 
@@ -246,7 +222,7 @@ RELIQUARY_ENVSCALER_DATA=<data> VLLM_USE_FLASHINFER_SAMPLER=0 \
 python scripts/eval_envscaler_band.py --model Qwen/Qwen3-4B-Base \
   --revision 906bfd4b4dc7f14ee4320094d8b41684abff8539 \
   --tasks 48 --max-turns 12 --max-action-tokens 512 \
-  --contract strict --output band.json
+  --contract lenient --prose retries --output band.json
 ```
 
 ## File integrity
@@ -255,4 +231,10 @@ python scripts/eval_envscaler_band.py --model Qwen/Qwen3-4B-Base \
 ec5cec5985387f515598d2f8cb804cd2665dd46b5dac331e1dcb5f98a18c63be  fix_14b_strict.json
 9fefecc37114c6110840f5378d9db4659e93009905258a5d6cf99bde4f8fc7f2  fix_4b_lenient.json
 c0cc72a5000a670d5fd160333a91c4c5f562db1aae22535ed86afdaeda7158f1  fix_4b_strict.json
+a5d2f95b3a9ff29bd6042ce96060be2102fba2cb857aa5fa69e3d2e42906e46c  qw_retries.json
+95e0abf2189f1df59ce94f2e46e41bf147cf968fee440cc451cb7fcace218a8b  qw_terminates.json
+f7764aca17b64f6b18f4d5966601f2366531a181db95b5aea624b25364f762eb  up_lenient_retries.json
+d676590469f382b62ee49db05444f97bee79bed5d2d5b203ce28e49c68dfa414  up_lenient_terminates.json
+be87531620b061c25cef590a541954345399fdf288d863f9522b4446dfc1fd50  up_strict_retries.json
+25e365629695da1a8915765321bc0393020bfa117c74ad71c931302c81d4a3f2  up_strict_terminates.json
 ```

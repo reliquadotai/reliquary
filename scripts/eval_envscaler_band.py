@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 
@@ -103,6 +104,81 @@ def observation_text(events) -> str:
     return CanonicalEpisodeRenderer.observation_text(tuple(events))
 
 
+# --- Qwen's own tool-calling shape, for measuring what our frame costs ---
+#
+# Our renderer invents `<|reliquary_*|>` turn markers and asks for bare JSON.
+# Qwen3 was post-trained on `<tool_call>` inside a ChatML frame, so those
+# tokens are in the model's prior and ours are not. This is a measurement
+# variant, not a protocol proposal: the manifest pins the real renderer.
+
+_QWEN_SYSTEM = """<|im_start|>system
+You are a helpful assistant.
+
+# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{tools}
+</tools>
+
+For each function call, return a json object with function name and \
+arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{{"name": <function-name>, "arguments": <args-json-object>}}
+</tool_call><|im_end|>
+<|im_start|>user
+{prompt}<|im_end|>
+<|im_start|>assistant
+"""
+
+
+def qwen_initial_text(task) -> str:
+    tools = "\n".join(
+        json.dumps({"type": "function", "function": {
+            "name": spec.name,
+            "description": spec.description,
+            "parameters": dict(spec.parameters),
+        }}, ensure_ascii=False)
+        for spec in task.tools
+    )
+    return _QWEN_SYSTEM.format(tools=tools, prompt=task.prompt)
+
+
+def qwen_observation_text(events) -> str:
+    body = "".join(
+        f"<tool_response>\n{event.content}\n</tool_response>\n"
+        for event in events
+    )
+    return f"<|im_end|>\n<|im_start|>user\n{body}<|im_end|>\n<|im_start|>assistant\n"
+
+
+_TOOL_CALL = re.compile(r"<tool_call>\s*(\{.*?\})\s*(?:</tool_call>|$)", re.S)
+
+
+def qwen_action(text: str):
+    """Upstream's `parse_response`/`parse_action`, in their own format.
+
+    Note the key is ``name``, not ``tool``, and several calls in one turn
+    means the first is used.
+    """
+    match = _TOOL_CALL.search(text)
+    if match is None:
+        return None
+    try:
+        value = json.loads(match.group(1))
+    except Exception:
+        return None
+    if not isinstance(value, dict):
+        return None
+    name = value.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    args = value.get("arguments")
+    return ("tool", name, args if isinstance(args, dict) else {})
+
+
 def strict_action(text: str):
     """Production's reading: the whole turn must be one bare JSON object."""
     try:
@@ -120,10 +196,27 @@ def main() -> int:
     parser.add_argument("--max-action-tokens", type=int, default=512)
     parser.add_argument("--gen-seed", type=int, default=7)
     parser.add_argument("--gpu-mem", type=float, default=0.85)
+    parser.add_argument("--max-episode-tokens", type=int, default=16384,
+                        help="the episode profile's budget; a rollout that "
+                             "exceeds it ends, as runner.py would have it")
     parser.add_argument("--contract", choices=("strict", "lenient"),
                         default="strict",
                         help="how a turn is read into an action; strict is "
                              "what runner.py does today")
+    parser.add_argument("--format", dest="fmt",
+                        choices=("reliquary", "qwen"), default="reliquary",
+                        help="prompt and action shape. 'qwen' is the "
+                             "<tool_call> ChatML frame the model was actually "
+                             "post-trained on, for measuring what our own "
+                             "renderer costs")
+    parser.add_argument("--prose", choices=("terminates", "retries"),
+                        default="terminates",
+                        help="what an unreadable turn means. 'terminates' is "
+                             "upstream: content with no tool call becomes "
+                             "chat_with_user and ends the episode on the state "
+                             "reached. 'retries' makes it a recoverable error, "
+                             "which separates 'the base model rambles' from "
+                             "'the environment cannot produce spread'")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
@@ -132,18 +225,26 @@ def main() -> int:
     )
 
     environment = EnvScalerToolsEnvironment()
+    qwen = args.fmt == "qwen"
+    render_initial = qwen_initial_text if qwen else initial_text
+    render_observation = qwen_observation_text if qwen else observation_text
     from vllm import LLM, SamplingParams
 
     llm = LLM(
         model=args.model, revision=args.revision, dtype="bfloat16",
-        gpu_memory_utilization=args.gpu_mem, max_model_len=16384,
+        gpu_memory_utilization=args.gpu_mem,
+        # Headroom over the episode budget so the budget check below is what
+        # ends a long rollout, rather than vLLM raising mid-run.
+        max_model_len=max(2 * args.max_episode_tokens, 16384),
         seed=args.gen_seed,
     )
+    tokenizer = llm.get_tokenizer()
     sampling = SamplingParams(
         n=1, temperature=1.0, top_p=1.0, top_k=-1,
         max_tokens=args.max_action_tokens, seed=args.gen_seed,
-        stop=["<|reliquary_end|>", "<|reliquary_user|>", "<|reliquary_tool|>",
-              "<|reliquary_assistant|>", "<|reliquary_system|>"],
+        stop=(["<|im_end|>", "</tool_call>"] if qwen else
+              ["<|reliquary_end|>", "<|reliquary_user|>", "<|reliquary_tool|>",
+               "<|reliquary_assistant|>", "<|reliquary_system|>"]),
     )
 
     # One live rollout per (task, replica): the episode branches on what the
@@ -156,15 +257,21 @@ def main() -> int:
             state = environment.reset(task, seed=replica).state
             live.append({
                 "task": task, "replica": replica, "state": state,
-                "text": initial_text(task), "done": False, "reason": None,
-                "tokens": 0, "invalid": False, "turns": 0,
+                "text": render_initial(task), "done": False, "reason": None,
+                "tokens": 0, "turns": 0,
                 "strict_turns": 0, "strict_ok": 0, "strict_alive": True,
                 "unreadable": 0,
             })
 
     started = time.time()
     for turn in range(args.max_turns):
-        pending = [r for r in live if not r["done"]]
+        pending = []
+        for rollout in (r for r in live if not r["done"]):
+            if len(tokenizer.encode(rollout["text"])) > args.max_episode_tokens:
+                rollout["done"] = True
+                rollout["reason"] = "episode_token_limit"
+                continue
+            pending.append(rollout)
         if not pending:
             break
         prompts = [r["text"] for r in pending]
@@ -174,12 +281,25 @@ def main() -> int:
             rollout["tokens"] += len(completion.token_ids)
             rollout["turns"] += 1
             rollout["strict_turns"] += 1
-            strict = strict_action(completion.text)
-            rollout["strict_ok"] += int(strict is not None)
-            if strict is None:
-                rollout["strict_alive"] = False
-            action = strict
-            if action is None and args.contract == "lenient":
+            action = None
+            if qwen:
+                parsed = qwen_action(completion.text)
+                rollout["strict_ok"] += int(parsed is not None)
+                if parsed is None:
+                    rollout["strict_alive"] = False
+                else:
+                    try:
+                        action = AssistantAction(
+                            kind="tool", tool=parsed[1], arguments=parsed[2])
+                    except (TypeError, ValueError):
+                        action = None
+            else:
+                strict = strict_action(completion.text)
+                rollout["strict_ok"] += int(strict is not None)
+                if strict is None:
+                    rollout["strict_alive"] = False
+                action = strict
+            if action is None and not qwen and args.contract == "lenient":
                 parsed = parse_action(completion.text)
                 if parsed is not None:
                     kind, name, payload = parsed
@@ -193,18 +313,22 @@ def main() -> int:
                     except (TypeError, ValueError):
                         action = None
             if action is None:
-                # runner.py does exactly this: the turn becomes a call to a
-                # tool that does not exist, and the environment's error budget
-                # decides whether the episode survives it.
-                action = AssistantAction.tool_call("__invalid_action__")
+                # Upstream routes content-without-a-tool-call to
+                # chat_with_user, which terminates; the env recognises
+                # runner.py's __invalid_action__ as the same thing. Under
+                # --prose retries it is sent as a merely unknown tool, which
+                # the env treats as recoverable.
+                action = AssistantAction.tool_call(
+                    "__invalid_action__" if args.prose == "terminates"
+                    else "__unreadable__"
+                )
                 rollout["unreadable"] += 1
             rollout["text"] += completion.text
             result = environment.step(rollout["task"], rollout["state"], action)
-            rollout["text"] += observation_text(result.events)
+            rollout["text"] += render_observation(result.events)
             if result.done:
                 rollout["done"] = True
                 rollout["reason"] = result.termination_reason
-                rollout["invalid"] = result.termination_reason == "invalid_action"
         print(f"turn {turn + 1}: {len(pending)} live, "
               f"{sum(1 for r in live if r['done'])} finished", flush=True)
     for rollout in live:
@@ -241,13 +365,16 @@ def main() -> int:
             "strict_ok": sum(r["strict_ok"] for r in replicas),
             "strict_alive": sum(1 for r in replicas if r["strict_alive"]),
             "finished": sum(1 for r in replicas if r["reason"] == "finished"),
+            "over_budget": sum(1 for r in replicas
+                               if r["reason"] == "episode_token_limit"),
             "turns_median": sorted(r["turns"] for r in replicas)[len(replicas) // 2],
             "tokens_median": sorted(r["tokens"] for r in replicas)[len(replicas) // 2],
         })
 
     with open(args.output, "w", encoding="utf-8") as handle:
         json.dump({"model": args.model, "sigma_min": SIGMA_MIN,
-                   "contract": args.contract, "rows": rows},
+                   "contract": args.contract, "prose": args.prose,
+                   "format": args.fmt, "rows": rows},
                   handle, indent=1)
 
     n = len(rows)
@@ -269,10 +396,12 @@ def main() -> int:
           f"{sum(r['invalid'] for r in rows) / total:.1%}")
     print(f"turns unreadable      "
           f"{sum(r['unreadable'] for r in rows) / max(strict_turns, 1):.1%}"
-          f"   under --contract {args.contract}")
-    print(f"turns that are bare JSON "
+          f"   --format {args.fmt} --contract {args.contract} "
+          f"--prose {args.prose}")
+    print(f"turns with a readable action "
           f"{sum(r['strict_ok'] for r in rows) / max(strict_turns, 1):.1%}")
     print(f"explicit termination  {sum(r['finished'] for r in rows) / total:.1%}")
+    print(f"over the 16k budget   {sum(r['over_budget'] for r in rows) / total:.1%}")
     print(f"turns  median         {sorted(r['turns_median'] for r in rows)[n // 2]}")
     print(f"tokens median         {sorted(r['tokens_median'] for r in rows)[n // 2]}")
     return 0
