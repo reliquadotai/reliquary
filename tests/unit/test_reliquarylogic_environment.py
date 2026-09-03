@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 import time
 
+import pytest
+
 from reliquary.environment.base import Environment
 from reliquary.environment.registry import get_environment_spec
 from reliquary.environment.logic_tasks import (
@@ -219,7 +221,24 @@ def _goldens():
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
-def test_golden_problem_and_reward_contract():
+@pytest.mark.parametrize(
+    "profile_id", [None, "qwen3-4b-reliquary-logic-v8-dev1"]
+)
+def test_golden_problem_and_reward_contract(profile_id, monkeypatch):
+    """The fixture pins the generator, never the prompt envelope.
+
+    The envelope is pinned separately, by the profile's ``prompt_template``
+    sha256 in the generation contract. Replaying under the logic profile as
+    well as the default is what proves the split: were the fixture to hash
+    the rendered prompt, a regen would quietly rewrite it — and every digest
+    that binds it — according to whichever profile happened to be active.
+    """
+    if profile_id is not None:
+        from reliquary.protocol import profiles
+
+        monkeypatch.setattr(
+            profiles, "ACTIVE_PROTOCOL_PROFILE", PROFILES[profile_id]
+        )
     environment = ReliquaryLogicEnvironment()
     goldens = _goldens()
     assert {golden["family"] for golden in goldens} == FAMILIES
@@ -229,8 +248,10 @@ def test_golden_problem_and_reward_contract():
         assert problem["operation_id"] == golden["operation_id"]
         assert problem["difficulty"] == golden["difficulty"]
         assert hashlib.sha256(
-            problem["prompt"].encode()
-        ).hexdigest() == golden["prompt_sha256"]
+            generate_logic_task(
+                golden["index"] % VIRTUAL_LENGTH
+            ).prompt.encode()
+        ).hexdigest() == golden["puzzle_sha256"]
         assert hashlib.sha256(
             problem["ground_truth"].encode()
         ).hexdigest() == golden["target_sha256"]

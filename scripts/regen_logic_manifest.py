@@ -161,8 +161,12 @@ def main() -> int:
             "family": spec["family"],
             "operation_id": problem["operation_id"],
             "difficulty": problem["difficulty"],
-            "prompt_sha256": hashlib.sha256(
-                problem["prompt"].encode("utf-8")
+            # The generated puzzle, not problem["prompt"]: the served prompt
+            # carries the active profile's envelope, and the fixture must
+            # pin the generator alone. The envelope has its own pin, the
+            # prompt_template sha256 in the generation contract.
+            "puzzle_sha256": hashlib.sha256(
+                generate_logic_task(index).prompt.encode("utf-8")
             ).hexdigest(),
             "target_sha256": hashlib.sha256(
                 problem["ground_truth"].encode("utf-8")

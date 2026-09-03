@@ -352,11 +352,17 @@ _RELIQUARY_RECORDS_PROMPT = PromptTemplateProfile(
 )
 
 _RELIQUARY_LOGIC_PROMPT = PromptTemplateProfile(
-    template_id="reliquary-logic-v1",
-    # The generated problem already carries the puzzle and the exact answer
-    # channel, so the wrapper is the identity — same rule as the records
-    # template, and it keeps the rendered bytes explicit in the contract.
-    template="$problem",
+    template_id="reliquary-logic-step-by-step-v1",
+    # The generated problem carries the puzzle and the exact answer channel.
+    # The wrapper adds the one thing a generator cannot state for itself:
+    # that reasoning may come first. extract_json_answer already reads the
+    # last fence, so reasoning costs the answer channel nothing.
+    template=(
+        "Solve the following problem step by step.\n\n"
+        "$problem\n\n"
+        "After your reasoning, give the final answer in the last fenced JSON "
+        "code block."
+    ),
 )
 
 _PROFILE_VALUES = (
@@ -619,22 +625,24 @@ _PROFILE_VALUES = (
         sampling=_SAMPLING_DAPO,
         environments={
             "reliquarylogic_v1": EnvironmentProfile(
-                # Numbrix needs room to reason over a grid before emitting it;
-                # boolean expressions finish far short of this cap.
-                max_new_tokens=2048,
+                # The v4/v5 budget, unchanged: one base model, one budget to
+                # think in. Nothing about a logic puzzle earns a tighter cap
+                # than a math problem on the same weights, and the prompt now
+                # asks for the reasoning first.
+                max_new_tokens=8192,
                 bft=None,
                 answer_format="last_json_object_v1",
                 prompt_template=_RELIQUARY_LOGIC_PROMPT,
                 batch_target=16,
                 environment_contract_id="reliquary-logic-v1",
                 environment_manifest_sha256=(
-                    "642a696bf2197e8cc57e8acaa9b8bac"
-                    "988b90e8b0588ad310c6ec8374e7ef52a"
+                    "9cb29e487321b2e6c005f2a1a89ccff"
+                    "ecf01b1c09bfd03337094e338ab912ca9"
                 ),
             ),
         },
         throughput_tiebreak=ThroughputTiebreakProfile(
-            token_cap=2048,
+            token_cap=8192,
             bucket_tokens_per_round=50,
         ),
     ),

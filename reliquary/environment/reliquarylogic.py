@@ -27,6 +27,26 @@ def _task_for_index(index: int) -> GeneratedLogicTask:
     return generate_logic_task(index)
 
 
+ENVIRONMENT_NAME = "reliquarylogic_v1"
+
+
+def _render_prompt(puzzle: str) -> str:
+    """Wrap the generated puzzle in the active profile's prompt template.
+
+    A profile that does not declare this environment falls back to the bare
+    puzzle rather than raising: every live Math+Code profile omits logic, and
+    offline scoring runs under whichever profile happens to be active. The
+    import is local because the profile module is read at call time, so a
+    test can swap the active profile.
+    """
+    from reliquary.protocol import profiles
+
+    if ENVIRONMENT_NAME not in profiles.ACTIVE_PROTOCOL_PROFILE.environments:
+        return puzzle
+    rendered = profiles.render_active_prompt(ENVIRONMENT_NAME, problem=puzzle)
+    return puzzle if rendered is None else rendered
+
+
 def problem_from_task(
     task: GeneratedLogicTask, generator_index: int
 ) -> dict[str, Any]:
@@ -35,10 +55,12 @@ def problem_from_task(
     Split out so a family that the roster does not currently draw can still
     be scored offline, without activating it and remapping the index space.
     """
-    prompt = task.prompt
     return {
-        "id": sha256(prompt.encode("utf-8")).hexdigest()[:16],
-        "prompt": prompt,
+        # Identity is the puzzle, never the envelope: prompt_content_sha256
+        # burns an index for the content cooldown, so hashing the rendered
+        # prompt would resurrect every consumed index on a prompt change.
+        "id": sha256(task.prompt.encode("utf-8")).hexdigest()[:16],
+        "prompt": _render_prompt(task.prompt),
         "ground_truth": verifier_spec(task),
         "task_family": TASK_FAMILY,
         "family": task.family,

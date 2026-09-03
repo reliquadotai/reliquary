@@ -6,7 +6,7 @@
   "generator_version": "logic-v1",
   "checker_version": "logic-checker-v1",
   "golden_fixture": "tests/fixtures/reliquarylogic_v1.jsonl",
-  "golden_fixture_sha256": "483730e18c13c94c4ce3afac6116b387d4bf65c55e091c72a7509288ea872a19",
+  "golden_fixture_sha256": "12abdad7207f6bbbf8e6f01937fa4a8223d15902cb464ffdc67e950ae10da185",
   "implementation_digest_algorithm": "sha256-path-nul-file-sha256-newline-v1",
   "implementation_files": [
     "reliquary/environment/logic_tasks.py",
@@ -14,7 +14,7 @@
     "reliquary/environment/reliquarylogic.py",
     "reliquary/environment/structured_output.py"
   ],
-  "implementation_sha256": "fa2f6926273111ae399ed5060e4fe286acdf5d4cd138c61ee4e0cc7139510b61",
+  "implementation_sha256": "897d4a894e2b3bf0a48bcb01136633cbdb2ce933eef0bd24940cb57a028e10ff",
   "virtual_length": 2147483648,
   "protocol_reward_lattice": [
     0.0,
