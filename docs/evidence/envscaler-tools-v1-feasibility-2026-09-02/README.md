@@ -171,6 +171,20 @@ generator or a stronger policy exists.
 
 ## Reproducing
 
+The corpus is **not vendored**. `RELIQUARY_ENVSCALER_DATA` must point at a
+directory holding EnvScaler's published `env_meta.json` (191 world classes)
+and `rl_scen.json` (the RL scenario split); the loader keeps only the
+scenarios whose `env_id` resolves, and **addresses them by position**, so
+the file order is part of the corpus identity. Before any activation this
+should be a pinned revision of a fork rather than a loose directory.
+
+The exact bytes these measurements ran against:
+
+```text
+d2c0010f16ff77d6d55868ee386353b1d0aadace58beed1eed678e8f7c84c33d  env_meta.json
+5977bda0b941a9111b290cbf5ffd6d70678a36ddc499b8f153826fd22999337e  rl_scen.json
+```
+
 ```bash
 RELIQUARY_ENVSCALER_DATA=<data> VLLM_USE_FLASHINFER_SAMPLER=0 \
 python scripts/eval_envscaler_band.py --model Qwen/Qwen3-4B-Base \
