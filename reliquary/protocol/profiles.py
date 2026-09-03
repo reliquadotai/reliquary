@@ -548,8 +548,8 @@ _PROFILE_VALUES = (
                 batch_target=16,
                 environment_contract_id="reliquary-stateful-tools-v1",
                 environment_manifest_sha256=(
-                    "746b3114299c07144cbfe24c339df938"
-                    "9d5d606ffb2764ff0e9e5fd12cd86bb6"
+                    "3725a5ec6186702d3f387c2a8cb174ff"
+                    "ce672dc3efe9b877460a8454e775db2e"
                 ),
                 episode=EpisodeProfile(
                     schema="reliquary/episode/v1",
@@ -567,8 +567,8 @@ _PROFILE_VALUES = (
                 batch_target=16,
                 environment_contract_id="reliquary-retrieval-tools-v1",
                 environment_manifest_sha256=(
-                    "d8693064fd24b169cc6cf1f2d69997b"
-                    "2b697a262ba6357d1cebfe74cd294a01c"
+                    "94095ba52ae58895f19b99bc9d605d8"
+                    "a3b6cdea55118af1b857ed42d484072c0"
                 ),
                 episode=EpisodeProfile(
                     schema="reliquary/episode/v1",
@@ -586,8 +586,8 @@ _PROFILE_VALUES = (
                 batch_target=16,
                 environment_contract_id="reliquary-workspace-tools-v1",
                 environment_manifest_sha256=(
-                    "92eba3051cb8a6c2bf60a27ccbd1eb1"
-                    "13911e1daf1b5e589fa7c4b507fda347b"
+                    "9f888c49e5d1775f0f83314a0177ee5"
+                    "562c9e4858b8e4e401af8ef9ff7e0f4a7"
                 ),
                 episode=EpisodeProfile(
                     schema="reliquary/episode/v1",

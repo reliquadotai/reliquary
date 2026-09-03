@@ -50,6 +50,12 @@ MAX_TURNS = 12
 # What runner.py calls a turn it could not read. Upstream reaches the same
 # state by routing content-without-a-tool-call to chat_with_user.
 _PROSE_TOOL = "__invalid_action__"
+# Which checks the reward counts. Upstream averages every check, including
+# the 15.5% that are already true at reset — several of which are questions
+# about the world ("has the end date already passed?") rather than anything
+# the agent could accomplish. Crediting those compresses the usable range of
+# the reward and hands out score nobody earned.
+_REWARD_MODE = os.environ.get("RELIQUARY_ENVSCALER_REWARD", "required")
 _DATA_ENV_VAR = "RELIQUARY_ENVSCALER_DATA"
 
 
@@ -246,28 +252,40 @@ class EnvScalerToolsEnvironment:
     def grade(
         self, task: EpisodeTask, state: WorldState, trace: EpisodeTrace
     ) -> RewardReport:
-        """Upstream's reward: the share of checks true at the final state.
+        """Continuous reward over the checks the agent is asked to flip.
 
-        `EnvScalerBaseEnv.calculate_reward` averages every check, including
-        the ones already true at reset — a no-op agent scores 0.166 on
-        average rather than zero, and breaking an invariant costs reward.
-        Grading only the checks the agent must flip, and only all-or-nothing,
-        makes the reward identically zero for every rollout of a 4B and
-        leaves the sigma gate nothing to select on.
+        Upstream (`EnvScalerBaseEnv.calculate_reward`) averages every check.
+        That keeps the reward continuous — which is what the sigma gate needs
+        — but pays for the 15.5% already true at reset, so a no-op agent
+        scores 0.166 and the usable range shrinks accordingly. Restricting
+        the denominator to the checks that start false keeps the gradation
+        and recovers the range: measured on Qwen3-4B, groups clearing
+        SIGMA_MIN go from 2.1% to 10.4% with no change to the gate.
+
+        `RELIQUARY_ENVSCALER_REWARD=upstream` restores their definition, so
+        the two are comparable on one generation.
         """
         final = _state_of(state.instance)
         checks: list[RewardCheck] = []
-        passed = 0
+        counted = passed = 0
         for position, entry in enumerate(task.private["checks"]):
-            after = _run_check(entry["check_func"], state.initial, final)
-            passed += int(after is True)
+            source = entry["check_func"]
+            after = _run_check(source, state.initial, final)
+            # A check already true before the agent acted measures nothing.
+            required = (
+                True if _REWARD_MODE == "upstream"
+                else _run_check(source, state.initial, state.initial) is False
+            )
+            if required:
+                counted += 1
+                passed += int(after is True)
             checks.append(RewardCheck(
                 name=f"check_{position}",
                 passed=after is True,
-                weight=1.0,
+                weight=1.0 if required else 0.0,
                 detail=str(entry.get("check_item", ""))[:200],
             ))
-        total = len(task.private["checks"])
+        total = counted
         reward = passed / total if total else 0.0
         checks.append(RewardCheck(
             "no_invalid_tool_calls", state.invalid_actions == 0, 0.0
