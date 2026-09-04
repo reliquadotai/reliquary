@@ -1382,11 +1382,13 @@ TOKEN_AUTH_ARGMAX_CONF = 0.99
 TOKEN_AUTH_ENFORCE = True
 
 # All-token argmax-gated authenticity gate: a chosen completion token below this
-# threshold while the model's argmax is >= the confidence bound is rejected.
-# Enforced live; the shadow telemetry counters are retained for monitoring.
+# threshold while the model's argmax is >= the confidence bound is flagged.
+# v5 samples the full distribution via a public inverse CDF, so a low-probability
+# token can be the legal seed-selected token. Keep telemetry, but do not reject
+# on this signal alone.
 ALL_TOKEN_AUTH_SHADOW_THRESHOLD = 1e-5
 ALL_TOKEN_AUTH_SHADOW_ARGMAX_CONF = TOKEN_AUTH_ARGMAX_CONF
-ALL_TOKEN_AUTH_ENFORCE = True
+ALL_TOKEN_AUTH_ENFORCE = PROTOCOL_VERSION != 5
 
 # OpenCode semantic-token authenticity shadow gate. Generic token auth catches
 # near-impossible injections, and numeric auth catches many literal edits, but
