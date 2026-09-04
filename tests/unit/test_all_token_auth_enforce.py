@@ -1,13 +1,16 @@
-"""All-token authenticity enforcement for code rollouts.
+"""All-token authenticity telemetry for full-support rollouts.
 
-Covers the detector semantics the batcher now enforces on
-``opencodeinstruct``: a confident-position token outside the sampling
-support is flagged, an honest confident token passes, and the
-forced-termination span stays exempt (so it is never a false positive).
+Covers the detector semantics without treating a legal low-probability draw as
+proof of tampering.
 """
 
-import importlib
+import os
+import subprocess
+import sys
 
+import torch
+
+from reliquary.environment.forced_sampling import pick, warp
 from reliquary.validator.verifier import ProofResult, evaluate_all_token_auth_shadow
 
 
@@ -20,10 +23,14 @@ def _proof(chosen, argmax):
     )
 
 
-def test_flags_out_of_nucleus_token():
-    # Position 2: chosen prob is near-zero while the model was ~certain of a
-    # different argmax -> not samplable at protocol top_p, so it is flagged.
-    proof = _proof([0.99, 0.99, 1e-7, 0.99], [0.99, 0.99, 0.999, 0.99])
+def test_flags_legal_v5_inverse_cdf_tail_pick_for_telemetry():
+    probs = warp(torch.tensor([0.0, -12.0]), t=1.0, top_k=0, top_p=1.0)
+    u = float(probs[0]) + float(probs[1]) / 2
+    token = pick(probs, u)
+    assert token == 1
+    assert float(probs[token]) < 1e-5
+
+    proof = _proof([float(probs[token])], [float(probs.max())])
     ok, metrics = evaluate_all_token_auth_shadow(proof)
     assert ok is False
     assert metrics["findings"] == 1
@@ -54,13 +61,16 @@ def test_forced_span_is_exempt():
     assert metrics["findings"] == 0
 
 
-def test_enforce_flag_cannot_be_disabled_by_env(monkeypatch):
-    import reliquary.constants as constants
-
-    monkeypatch.setenv("RELIQUARY_ALL_TOKEN_AUTH_ENFORCE", "0")
-    reloaded = importlib.reload(constants)
-    try:
-        assert reloaded.ALL_TOKEN_AUTH_ENFORCE is True
-    finally:
-        monkeypatch.delenv("RELIQUARY_ALL_TOKEN_AUTH_ENFORCE", raising=False)
-        importlib.reload(constants)
+def test_v5_all_token_auth_is_shadow_only():
+    env = dict(os.environ)
+    env["RELIQUARY_PROTOCOL_PROFILE"] = "qwen3-4b-base-dapo-reasoning-v5"
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from reliquary.constants import ALL_TOKEN_AUTH_ENFORCE; "
+            "raise SystemExit(ALL_TOKEN_AUTH_ENFORCE)",
+        ],
+        check=True,
+        env=env,
+    )
