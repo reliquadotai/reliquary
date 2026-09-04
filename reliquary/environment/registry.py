@@ -3,7 +3,8 @@
 Registration, protocol eligibility, and operator activation are intentionally
 separate layers:
 
-* this module describes code that is installed;
+* this module describes known runtime artifacts (external wheels are optional
+  until selected);
 * ``ProtocolProfile.environments`` describes code allowed by the signed wire
   contract; and
 * the CLI environment list selects a non-empty subset for this process.
@@ -47,7 +48,7 @@ def _import_attribute(path: str) -> Any:
 
 @dataclass(frozen=True, slots=True)
 class EnvironmentSpec:
-    """Installed runtime behavior for one environment.
+    """Known runtime behavior for one environment.
 
     ``contract_version`` and the policy identifiers are consensus-facing.
     Import paths and resource-class settings are deliberately omitted from the
@@ -70,6 +71,8 @@ class EnvironmentSpec:
     renderer_id: str | None = None
     environment_manifest_sha256: str | None = None
     reward_materializer_method: str | None = None
+    external_distribution: str | None = None
+    external_artifact_resource: str | None = None
 
     def __post_init__(self) -> None:
         if not self.name or self.name.strip() != self.name:
@@ -113,12 +116,28 @@ class EnvironmentSpec:
             raise ValueError("attainable rewards must be unique and sorted")
         _validate_import_path(self.factory_path)
         _validate_import_path(self.scorer_path)
+        if bool(self.external_distribution) != bool(self.external_artifact_resource):
+            raise ValueError(
+                "external distribution and artifact resource must be set together"
+            )
+        if self.external_distribution is not None:
+            if self.interaction_mode != "episode" or digest is None:
+                raise ValueError(
+                    "external environments require episode mode and a manifest digest"
+                )
 
     def create(self) -> Environment | EpisodeEnvironment:
-        factory = _import_attribute(self.factory_path)
-        if not callable(factory):
-            raise TypeError(f"environment factory {self.factory_path!r} is not callable")
-        environment = factory()
+        if self.external_distribution is not None:
+            from reliquary.environment.agentic.external import (
+                load_external_episode_environment,
+            )
+
+            environment = load_external_episode_environment(self)
+        else:
+            factory = _import_attribute(self.factory_path)
+            if not callable(factory):
+                raise TypeError(f"environment factory {self.factory_path!r} is not callable")
+            environment = factory()
         expected_protocol = (
             EpisodeEnvironment
             if self.interaction_mode == "episode"
@@ -389,6 +408,30 @@ _SPEC_VALUES = (
         ),
     ),
     EnvironmentSpec(
+        name="reliquary_stateful_tools_v2",
+        factory_path="reliquary_stateful_tools:StatefulToolsEnvironment",
+        scorer_path=(
+            "reliquary.environment.agentic.suite:"
+            "episode_score_many_not_supported"
+        ),
+        validator_authoritative_reward=True,
+        admission_resource_class="cpu",
+        termination_policy="eos_or_cap",
+        final_answer_policy="json",
+        reward_lattice_policy="binary-v1",
+        attainable_rewards=(0.0, 1.0),
+        contract_version="reliquary/episode-json/v1",
+        interaction_mode="episode",
+        episode_replay_path="reliquary.environment.agentic.suite:replay_submission",
+        renderer_id="reliquary-jsonl-tools-v1",
+        environment_manifest_sha256=(
+            "9779a3151575687e823567c6c9c5459d"
+            "93794bab4f27f4bcde987c8414cb50f6"
+        ),
+        external_distribution="reliquary-stateful-tools",
+        external_artifact_resource="reliquary_stateful_tools/artifact.json",
+    ),
+    EnvironmentSpec(
         name="reliquary_retrieval_tools_v1",
         factory_path=(
             "reliquary.environment.agentic.envs.retrieval_tools_v1:"
@@ -448,7 +491,10 @@ def _build_catalog(
     for spec in specs:
         if spec.name in catalog:
             raise ValueError(f"duplicate environment registration: {spec.name}")
-        _validate_installed_manifest(spec)
+        # External wheels are optional until selected; their artifact is verified
+        # offline before first use instead of making the base install depend on it.
+        if spec.external_distribution is None:
+            _validate_installed_manifest(spec)
         catalog[spec.name] = spec
     return MappingProxyType(catalog)
 
@@ -546,6 +592,10 @@ def resolve_environment_mix(
             raise ValueError(
                 f"environment {name!r} manifest does not match installed code"
             )
+        if spec.external_distribution is not None:
+            from reliquary.environment.agentic.external import verify_external_artifact
+
+            verify_external_artifact(spec)
         configured = getattr(environment_profile, "batch_target", None)
         target = int(
             default_batch_target if configured is None else configured
