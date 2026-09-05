@@ -10,6 +10,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
+import random
+from contextlib import asynccontextmanager
 import os
 import time
 from collections.abc import Callable
@@ -41,6 +44,7 @@ from reliquary.protocol.submission import (
     MinerState,
     RejectReason,
     RuntimeContract,
+    VerdictsPage,
     SubmissionPrecommitRequest,
     SubmissionPrecommitResponse,
 )
@@ -80,6 +84,7 @@ _CHECKPOINT_EPOCH_BEACON_VERIFY_TIMEOUT_SECONDS = 12.0
 # Miners running against slow links (Targon port-forward etc.) benefit further.
 _DEFAULT_TIMEOUT = 60.0
 _CONTROL_TIMEOUT = 3.0
+_OPTIONAL_TIMEOUT = 2.0
 _CONTROL_RETRY_DELAYS = (0.2, 0.5, 1.0)
 _PRECOMMIT_HEADER = "X-Reliquary-Precommit"
 _EPOCH_INTENT_HEADER = "X-Reliquary-Epoch-Intent"
@@ -105,6 +110,22 @@ class FinalizedEpochCommitment:
 
     payload: bytes
     precommit: SubmissionPrecommitRequest
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    value = response.headers.get("Retry-After")
+    if value is None:
+        return None
+    try:
+        seconds = float(value)
+        return max(0.0, min(seconds, 60.0)) if math.isfinite(seconds) else None
+    except ValueError:
+        return None
+
+async def _sleep_retry(delay: float, *, jitter: bool) -> None:
+    if jitter:
+        delay *= random.uniform(0.8, 1.2)
+    await asyncio.sleep(max(0.0, delay))
 
 
 def discover_validator_url(metagraph: Any, port: int = VALIDATOR_HTTP_PORT) -> str:
@@ -165,9 +186,9 @@ async def _post_with_retry(
             # 503 "no active window" is informational for BatchSubmissionResponse —
             # don't retry, surface as a structured reject.
             if resp.status_code == 503 and response_model is BatchSubmissionResponse:
-                return BatchSubmissionResponse(
-                    accepted=False, reason=RejectReason.WINDOW_NOT_ACTIVE
-                )
+                result = BatchSubmissionResponse(accepted=False, reason=RejectReason.WINDOW_NOT_ACTIVE)
+                result._retry_after_seconds = _retry_after_seconds(resp)
+                return result
             # 4xx means the request is malformed or the validator rejected it
             # for a deterministic reason — retrying is pointless. Parse and return.
             if 400 <= resp.status_code < 500:
@@ -197,32 +218,43 @@ async def _get_with_retry(
     *,
     client: httpx.AsyncClient | None,
     timeout: float,
+    retry_delays: tuple[float, ...] = _RETRY_DELAYS,
+    jitter: bool = False,
 ) -> Any:
     last_exc: Exception | None = None
     own_client = client is None
     cli = client or httpx.AsyncClient(timeout=timeout)
     try:
-        for attempt, delay in enumerate(_RETRY_DELAYS, start=1):
+        for attempt, delay in enumerate(retry_delays, start=1):
             try:
                 resp = await cli.get(full_url, timeout=timeout)
             except (httpx.RequestError, httpx.TimeoutException) as e:
                 last_exc = e
-                if attempt < len(_RETRY_DELAYS):
-                    await asyncio.sleep(delay)
+                if attempt < len(retry_delays):
+                    await _sleep_retry(delay, jitter=jitter)
                 continue
             if resp.status_code == 503:
                 # No active window yet — caller's job to handle.
-                raise SubmissionError(f"no active window at {full_url}")
+                retry_after = _retry_after_seconds(resp)
+                suffix = (
+                    f" retry_after={retry_after}"
+                    if retry_after is not None else ""
+                )
+                raise SubmissionError(
+                    f"no active window at {full_url}{suffix}"
+                )
             if resp.status_code == 404:
-                raise SubmissionError(f"endpoint not found: {full_url}")
+                raise EndpointNotFoundError(
+                    f"endpoint not found: {full_url}"
+                )
             if 400 <= resp.status_code < 500:
                 raise SubmissionError(
                     f"HTTP {resp.status_code}: {_safe_detail(resp)}"
                 )
             if resp.status_code >= 500:
                 last_exc = SubmissionError(f"HTTP {resp.status_code}")
-                if attempt < len(_RETRY_DELAYS):
-                    await asyncio.sleep(delay)
+                if attempt < len(retry_delays):
+                    await _sleep_retry(delay, jitter=jitter)
                 continue
             return response_model.model_validate(resp.json())
         raise SubmissionError(f"all retries failed: {last_exc}")
@@ -678,10 +710,9 @@ async def submit_batch_v2(
                     await asyncio.sleep(delay)
                 continue
             if response.status_code == 503:
-                return BatchSubmissionResponse(
-                    accepted=False,
-                    reason=RejectReason.WINDOW_NOT_ACTIVE,
-                )
+                result = BatchSubmissionResponse(accepted=False, reason=RejectReason.WINDOW_NOT_ACTIVE)
+                result._retry_after_seconds = _retry_after_seconds(response)
+                return result
             if 400 <= response.status_code < 500:
                 reason = (
                     RejectReason.WINDOW_MISMATCH
@@ -707,7 +738,7 @@ async def get_window_state_v2(
     env: str | None = None,
     window: int | None = None,
     client: httpx.AsyncClient | None = None,
-    timeout: float = _DEFAULT_TIMEOUT,
+    timeout: float = _CONTROL_TIMEOUT,
 ) -> GrpoBatchState:
     """GET the validator's current v2 GrpoBatchState.
 
@@ -728,6 +759,7 @@ async def get_window_state_v2(
     return await _get_with_retry(
         state_url, GrpoBatchState,
         client=client, timeout=timeout,
+        retry_delays=_CONTROL_RETRY_DELAYS, jitter=True,
     )
 
 
@@ -756,7 +788,7 @@ async def get_miner_state_v1(
             except (httpx.RequestError, httpx.TimeoutException) as exc:
                 last_exc = exc
                 if attempt < len(_CONTROL_RETRY_DELAYS):
-                    await asyncio.sleep(delay)
+                    await _sleep_retry(delay, jitter=True)
                 continue
             if response.status_code == 304:
                 return None, response.headers.get("ETag") or etag
@@ -775,7 +807,7 @@ async def get_miner_state_v1(
                 if response.status_code < 500:
                     raise last_exc
                 if attempt < len(_CONTROL_RETRY_DELAYS):
-                    await asyncio.sleep(delay)
+                    await _sleep_retry(delay, jitter=True)
                 continue
             return (
                 MinerState.model_validate(response.json()),
@@ -1225,7 +1257,7 @@ async def get_runtime_contract_v1(
     url: str,
     *,
     client: httpx.AsyncClient | None = None,
-    timeout: float = _DEFAULT_TIMEOUT,
+    timeout: float = _OPTIONAL_TIMEOUT,
 ) -> RuntimeContract:
     """Discover optional runtime telemetry without changing legacy `/state`."""
     return await _get_with_retry(
@@ -1233,6 +1265,8 @@ async def get_runtime_contract_v1(
         RuntimeContract,
         client=client,
         timeout=timeout,
+        retry_delays=(0.0,),
+        jitter=False,
     )
 
 
@@ -1346,3 +1380,61 @@ async def get_checkpoint_epoch_plan_v1(
     finally:
         if own_client:
             await http.aclose()
+
+
+async def get_verdicts_page_v1(
+    url: str,
+    hotkey: str,
+    *,
+    after: int = 0,
+    stream_id: str | None = None,
+    client: httpx.AsyncClient | None = None,
+    timeout: float = _OPTIONAL_TIMEOUT,
+) -> VerdictsPage:
+    """Poll final verdicts without delaying state acquisition on failure."""
+    verdict_url = (
+        f"{url}/miner-verdicts/{quote(hotkey, safe='')}"
+        f"?after={max(0, int(after))}"
+    )
+    if stream_id is not None:
+        verdict_url += f"&stream_id={quote(stream_id, safe='')}"
+    return await _get_with_retry(
+        verdict_url,
+        VerdictsPage,
+        client=client,
+        timeout=timeout,
+        retry_delays=(0.0,),
+        jitter=False,
+    )
+
+
+@asynccontextmanager
+async def monitor_submission_verdicts(url, hotkey, client, submitted):
+    """Poll after the first accepted submission; own and cancel the HTTP task."""
+    async def poll():
+        cursor, stream_id = 0, None
+        await submitted.wait()
+        while True:
+            try:
+                page = await get_verdicts_page_v1(
+                    url, hotkey, after=cursor, stream_id=stream_id, client=client,
+                )
+                if page.truncated:
+                    logger.warning("verdict history gap or validator restart; resuming available feed")
+                for verdict in page.verdicts:
+                    logger.info("verdict window=%s root=%s accepted=%s reason=%s selected=%s",
+                                verdict.window_n, verdict.merkle_root, verdict.accepted,
+                                verdict.reason, verdict.selected_for_batch)
+                cursor, stream_id = page.next_cursor, page.stream_id
+            except EndpointNotFoundError:
+                return
+            except (SubmissionError, ValueError):
+                logger.debug("optional verdict poll unavailable")
+            await asyncio.sleep(2.0)
+
+    task = asyncio.create_task(poll(), name="miner-verdicts")
+    try:
+        yield
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

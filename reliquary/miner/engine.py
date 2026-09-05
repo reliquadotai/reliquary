@@ -604,6 +604,7 @@ class MiningEngine:
             SubmissionError,
             discover_validator_url,
             get_miner_state_v1,
+            monitor_submission_verdicts,
             get_runtime_contract_v1,
             get_window_state_v2,
             submit_batch_v2,
@@ -658,7 +659,11 @@ class MiningEngine:
         legacy_cooldown_window: int | None = None
         prompt_ranges: dict[str, tuple[int, int]] = {}
 
-        async with httpx.AsyncClient(timeout=30) as client:
+        submitted = asyncio.Event()
+        async with (
+            httpx.AsyncClient(timeout=30) as client,
+            monitor_submission_verdicts(url, self.wallet.hotkey.ss58_address, client, submitted),
+        ):
             runtime_fingerprint = None
             try:
                 contract = await get_runtime_contract_v1(url, client=client)
@@ -1015,6 +1020,10 @@ class MiningEngine:
                         resp.reason.value if hasattr(resp.reason, "value") else resp.reason,
                     )
                     results.append(resp)
+                    if resp.accepted:
+                        submitted.set()
+                    elif resp._retry_after_seconds is not None:
+                        await asyncio.sleep(resp._retry_after_seconds)
                 except SubmissionError as exc:
                     logger.error("submit failed: %s", exc)
 

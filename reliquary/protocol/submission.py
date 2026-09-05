@@ -296,6 +296,7 @@ class BatchSubmissionResponse(BaseModel):
 
     accepted: bool
     reason: RejectReason
+    _retry_after_seconds: float | None = PrivateAttr(default=None)
 
 
 class SubmissionPrecommitRequest(BaseModel):
@@ -684,6 +685,24 @@ class VerdictsResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     verdicts: list[Verdict]
+
+
+class SequencedVerdict(Verdict):
+    """A verdict with a monotonic per-hotkey cursor."""
+
+    sequence: int = Field(..., ge=1)
+
+
+class VerdictsPage(BaseModel):
+    """Gap-detectable verdict page used by ``GET /miner-verdicts``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    verdicts: list[SequencedVerdict]
+    next_cursor: int = Field(..., ge=0)
+    oldest_available_cursor: int = Field(..., ge=0)
+    truncated: bool = False
+    stream_id: str = Field(..., pattern=r"^[0-9a-f]{32}$")
 
 
 class ModelInfo(BaseModel):

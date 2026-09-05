@@ -1275,9 +1275,10 @@ class GrpoWindowBatcher:
         # stable during the batcher's lifetime — ``_cooldown`` is only
         # mutated by ``seal_batch`` at the very end — so a snapshot taken
         # here is correct for /state's entire lifetime.
-        self.cooldown_prompts_snapshot: list[int] = sorted(
+        self.cooldown_prompts_membership = frozenset(
             self._cooldown.current_cooldown_set(window_start)
         )
+        self.cooldown_prompts_snapshot: list[int] = sorted(self.cooldown_prompts_membership)
         # Atomic counter for /state's ``valid_submissions`` field. Updated
         # under ``_lock`` after each successful accept; the read in /state
         # is lock-free (int reads are GIL-atomic in CPython).

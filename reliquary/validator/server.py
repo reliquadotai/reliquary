@@ -28,6 +28,7 @@ import secrets
 import sys
 import urllib.parse
 import time
+import uuid
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
@@ -129,6 +130,7 @@ from reliquary.protocol.submission import (
     SubmissionPrecommitResponse,
     Verdict,
     VerdictsResponse,
+    VerdictsPage,
     WindowState,
     encode_cooldown_bitmap,
 )
@@ -373,14 +375,14 @@ class _StateFastPathMiddleware:
         window: int | None = None
         query = scope.get("query_string") or b""
         if query:
-            query_values = urllib.parse.parse_qs(query.decode("latin-1"))
+            query_values = urllib.parse.parse_qs(query.decode("latin-1"), keep_blank_values=True)
             values = query_values.get("env")
             if values:
-                env = values[0]
+                env = values[-1]
             windows = query_values.get("window")
             if windows:
                 try:
-                    window = int(windows[0])
+                    window = int(windows[-1])
                 except (TypeError, ValueError):
                     await self.app(scope, receive, send)
                     return
@@ -1455,6 +1457,8 @@ class ValidatorServer:
         # asyncio is single-threaded so no lock is needed — every mutation
         # site runs on the event loop.
         self._verdicts: dict[str, collections.deque[dict]] = {}
+        self._verdict_sequence_by_hotkey = collections.Counter()
+        self._verdict_stream_id = uuid.uuid4().hex
         self._recent_reject_counts: collections.Counter[str] = collections.Counter()
 
     def _state_cache_key(self, batcher) -> tuple:
@@ -3232,6 +3236,8 @@ class ValidatorServer:
             entry["rewarded"] = rewarded
         if sigma is not None:
             entry["sigma"] = float(sigma)
+        self._verdict_sequence_by_hotkey[hotkey] += 1
+        entry["_sequence"] = self._verdict_sequence_by_hotkey[hotkey]
         self._verdicts[hotkey].append(entry)
 
     def _current_drand_round_best_effort(self) -> int | None:
@@ -3239,8 +3245,7 @@ class ValidatorServer:
         ci = getattr(batcher, "_drand_chain_info", None) if batcher else None
         try:
             if ci is None:
-                from reliquary.infrastructure.drand import get_current_chain
-                ci = get_current_chain()
+                return None
             from reliquary.infrastructure.chain import compute_current_drand_round
             return int(compute_current_drand_round(
                 time.time(), ci["genesis_time"], ci["period"],
@@ -4838,6 +4843,41 @@ class ValidatorServer:
                 if callable(release):
                     release()
 
+        @app.get("/livez")
+        async def livez() -> Response:
+            return JSONResponse({"status": "ok"}, headers={"Cache-Control": "no-store"})
+
+        @app.get("/readyz")
+        async def readyz() -> Response:
+            # Local readiness only: no HF, R2, drand or diagnostic health build.
+            reasons = []
+            age = self.registration_cache_age()
+            if self._registration_gate_enforced and (
+                self._registered_hotkeys is None or age is None
+                or age > REGISTERED_HOTKEY_STALE_GRACE_SECONDS
+            ):
+                reasons.append("registration_cache_unavailable")
+            if self._process_health_snapshot.get("status") in {"critical", "error", "pending"}:
+                reasons.append("process_health_unavailable")
+            try:
+                if any(source.get("status") == "degraded" for source in self._prompt_source_health().values()):
+                    reasons.append("prompt_source_degraded")
+                if self._content_cooldown_health_callback is not None:
+                    cooldown = self._content_cooldown_health_callback()
+                    if cooldown.get("complete") is False:
+                        reasons.append("content_cooldown_incomplete")
+                if self._proof_scheduler_health_callback is not None:
+                    scheduler = self._proof_scheduler_health_callback()
+                    if scheduler.get("required") and scheduler.get("state") != "running":
+                        reasons.append("proof_scheduler_unavailable")
+            except Exception:
+                reasons.append("local_health_unavailable")
+            return JSONResponse(
+                {"ready": not reasons, "reasons": reasons},
+                status_code=503 if reasons else 200,
+                headers={"Cache-Control": "no-store"},
+            )
+
         @app.get("/health", response_model=_Health)
         async def health() -> _Health:
             return self._health_payload()
@@ -4897,7 +4937,7 @@ class ValidatorServer:
                 lower, upper = prompt_range
                 if not lower <= request.prompt_idx < upper:
                     return reject(RejectReason.PROMPT_OUT_OF_RANGE)
-            if request.prompt_idx in batcher.cooldown_prompts_snapshot:
+            if request.prompt_idx in getattr(batcher, "cooldown_prompts_membership", batcher.cooldown_prompts_snapshot):
                 return reject(RejectReason.PROMPT_IN_COOLDOWN)
             registration_reason = await self._registration_reject_reason(
                 request.miner_hotkey
@@ -5230,7 +5270,7 @@ class ValidatorServer:
                 lo, hi = prompt_range
                 if not (lo <= request.prompt_idx < hi):
                     return reject(RejectReason.PROMPT_OUT_OF_RANGE)
-            if request.prompt_idx in batcher.cooldown_prompts_snapshot:
+            if request.prompt_idx in getattr(batcher, "cooldown_prompts_membership", batcher.cooldown_prompts_snapshot):
                 return reject(RejectReason.PROMPT_IN_COOLDOWN)
             try:
                 environment_size = await asyncio.to_thread(len, batcher.env)
@@ -6352,7 +6392,7 @@ class ValidatorServer:
                         RejectReason.PROMPT_OUT_OF_RANGE,
                         reject_stage="prompt_range",
                     )
-            if request.prompt_idx in batcher.cooldown_prompts_snapshot:
+            if request.prompt_idx in getattr(batcher, "cooldown_prompts_membership", batcher.cooldown_prompts_snapshot):
                 return _cheap_reject(
                     RejectReason.PROMPT_IN_COOLDOWN,
                     reject_stage="cooldown",
@@ -6867,10 +6907,10 @@ class ValidatorServer:
                     )
                 if prompt_range is None:
                     prompt_range = (0, 0)
-                bitmap, cooldown_count = encode_cooldown_bitmap(
-                    set(batcher.cooldown_prompts_snapshot),
-                    prompt_range,
-                )
+                membership = getattr(batcher, "cooldown_prompts_membership", None)
+                if membership is None:
+                    membership = set(batcher.cooldown_prompts_snapshot)
+                bitmap, cooldown_count = encode_cooldown_bitmap(membership, prompt_range)
                 productive_remaining = max(
                     0,
                     int(batcher.max_productive_candidates)
@@ -7170,10 +7210,61 @@ class ValidatorServer:
             if not ring:
                 return VerdictsResponse(verdicts=[])
             out = [
-                Verdict(**entry) for entry in ring
+                Verdict(**{key: value for key, value in entry.items() if key != "_sequence"}) for entry in list(ring)
                 if entry["ts"] > since
             ]
             return VerdictsResponse(verdicts=out)
+
+        @app.get("/miner-verdicts/{hotkey}", response_model=VerdictsPage, response_model_exclude_none=True)
+        async def miner_verdicts(
+            hotkey: str,
+            after: int = 0,
+            stream_id: str | None = None,
+            limit: int = VERDICT_CAP_PER_HOTKEY,
+        ) -> VerdictsPage:
+            """Cursor-based verdict feed with explicit ring-gap detection."""
+            after = max(0, int(after))
+            limit = max(1, min(int(limit), VERDICT_CAP_PER_HOTKEY))
+            reset = stream_id is not None and stream_id != self._verdict_stream_id
+            ring = list(self._verdicts.get(hotkey, ()))
+            if not ring:
+                latest = int(self._verdict_sequence_by_hotkey.get(hotkey, 0))
+                cursor_ahead = reset or after > latest
+                return VerdictsPage(
+                    stream_id=self._verdict_stream_id,
+                    verdicts=[],
+                    next_cursor=latest if cursor_ahead else max(after, latest),
+                    oldest_available_cursor=latest,
+                    truncated=cursor_ahead,
+                )
+            oldest = int(ring[0]["_sequence"])
+            latest = int(ring[-1]["_sequence"])
+            cursor_ahead = reset or after > latest
+            effective_after = oldest - 1 if cursor_ahead else after
+            truncated = after < oldest - 1 or cursor_ahead
+            entries = [
+                {
+                    **{
+                        key: value for key, value in entry.items()
+                        if key != "_sequence"
+                    },
+                    "sequence": int(entry["_sequence"]),
+                }
+                for entry in ring
+                if int(entry["_sequence"]) > effective_after
+            ][:limit]
+            next_cursor = (
+                int(entries[-1]["sequence"])
+                if entries
+                else max(effective_after, oldest - 1)
+            )
+            return VerdictsPage(
+                stream_id=self._verdict_stream_id,
+                verdicts=entries,
+                next_cursor=next_cursor,
+                oldest_available_cursor=oldest,
+                truncated=truncated,
+            )
 
         # Add this last so Starlette places it outermost, ahead of the
         # BaseHTTPMiddleware used by ``stamp_arrival``. Otherwise FastAPI may
