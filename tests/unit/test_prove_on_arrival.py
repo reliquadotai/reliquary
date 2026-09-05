@@ -230,7 +230,7 @@ def test_an_unknown_rate_falls_back_to_lowest_priority_not_a_crash(monkeypatch):
 
     extended = []
     batcher = _make_batcher()
-    batcher.mark_window_opened()
+    batcher.mark_window_opened(monotonic_time=1000.0, wall_time=1000.0)
     env = "openmathinstruct"
     batcher.admission_queue = batcher_module.ThroughputAdmissionQueue(
         window_opened_at=batcher.window_opened_at

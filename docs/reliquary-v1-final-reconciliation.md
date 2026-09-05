@@ -205,6 +205,13 @@ and two macOS socket-path failures. `928f99b6b1a2a57dc0639e042021db677963180c`
 supplies the actual target/membership invariants to those test doubles; no
 production guard was relaxed. The final suite reruns all CPU tests.
 
+Linux CI also exposed a clock-dependent assertion in the arrival-priority
+test: real monotonic timestamps produced `0.9999999999999999` instead of the
+scenario's exact `1.0`. The test now supplies exactly representable activation
+timestamps through the existing clock arguments. Its exact rate and priority
+assertions are retained, with no production change. The arrival and ordering
+tests were rerun, followed by a full Linux CI run on the updated head.
+
 | Group | Component checks and targeted evidence |
 |---|---|
 | V1 | `test_release_contract`, `test_environment_abi`, `test_checkpoint_epoch*`, `test_epoch_proof_staging`, `test_epoch_shadow_planner`; included in full CPU |
