@@ -1,0 +1,1525 @@
+{
+  "cutoff": "2026-08-29T00:00:00Z",
+  "refs": [
+    {
+      "ref": "refs/heads/agent/balanced-sparse-training",
+      "sha": "59404b333266cdf439f7ee3b859d279a4124931e",
+      "committer_date": "2026-07-14T04:41:08+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "b05c4808538d95c7c800e282287295dc0a30dd6b"
+    },
+    {
+      "ref": "refs/heads/agent/forced-seed-cdf-telemetry",
+      "sha": "09a262feae6cbbdaf618630ac52f6dca845a22ce",
+      "committer_date": "2026-07-14T04:41:08+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "b05c4808538d95c7c800e282287295dc0a30dd6b"
+    },
+    {
+      "ref": "refs/heads/agent/grader-health-heartbeat",
+      "sha": "5f94e3531fe0094625058d172fc9a925c7838ae0",
+      "committer_date": "2026-08-19T00:33:15+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "5f94e3531fe0094625058d172fc9a925c7838ae0"
+    },
+    {
+      "ref": "refs/heads/agent/logical-group-dedup",
+      "sha": "2053d54a1bd9d6312f521879d726ffd3a8ed716e",
+      "committer_date": "2026-07-14T07:45:00+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "2053d54a1bd9d6312f521879d726ffd3a8ed716e"
+    },
+    {
+      "ref": "refs/heads/agent/per-env-window-health",
+      "sha": "4fd9daa0e44e10052b228e744c87be78a29faaae",
+      "committer_date": "2026-07-14T08:08:19+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "4fd9daa0e44e10052b228e744c87be78a29faaae"
+    },
+    {
+      "ref": "refs/heads/agent/preopen-window-resilience",
+      "sha": "563ef8627e4e762321b9f448854aa9c5d036e55f",
+      "committer_date": "2026-07-14T07:58:41+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "563ef8627e4e762321b9f448854aa9c5d036e55f"
+    },
+    {
+      "ref": "refs/heads/agent/prompt-source-resilience",
+      "sha": "f14bedd097e3e33c448e28d01ad10893216d6b9b",
+      "committer_date": "2026-07-14T07:28:39+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "f14bedd097e3e33c448e28d01ad10893216d6b9b"
+    },
+    {
+      "ref": "refs/heads/agent/protocol-admission-v2",
+      "sha": "5fa89cd67d07119bf974d0f93a672acdb91d4805",
+      "committer_date": "2026-07-14T04:41:00+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "b05c4808538d95c7c800e282287295dc0a30dd6b"
+    },
+    {
+      "ref": "refs/heads/agent/termination-proof-hardening",
+      "sha": "b05c4808538d95c7c800e282287295dc0a30dd6b",
+      "committer_date": "2026-07-14T04:40:53+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "b05c4808538d95c7c800e282287295dc0a30dd6b"
+    },
+    {
+      "ref": "refs/heads/agent/termination-shadow-diagnostics",
+      "sha": "0fa2fd38f7b409baf4c752f16407fd09196a8b13",
+      "committer_date": "2026-07-14T06:56:45+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "0fa2fd38f7b409baf4c752f16407fd09196a8b13"
+    },
+    {
+      "ref": "refs/heads/agent/termination-shadow-telemetry",
+      "sha": "38331d8dacda6d0745f5defe79ce631c0aaacc61",
+      "committer_date": "2026-07-14T06:47:24+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "38331d8dacda6d0745f5defe79ce631c0aaacc61"
+    },
+    {
+      "ref": "refs/heads/agent/v1-accounting-hardening",
+      "sha": "043f1857d603d82a5ef3728300acd3616114e3a3",
+      "committer_date": "2026-07-14T05:20:01+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "043f1857d603d82a5ef3728300acd3616114e3a3"
+    },
+    {
+      "ref": "refs/heads/agent/v1-admission-hardening",
+      "sha": "72b5d11eeb8a2ccfd05cce1f3c01302007135851",
+      "committer_date": "2026-07-14T05:16:25+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "72b5d11eeb8a2ccfd05cce1f3c01302007135851"
+    },
+    {
+      "ref": "refs/heads/agent/v1-balanced-sparse-training",
+      "sha": "80054bf457f5f3498db1bb0d390ef68578e0dbb5",
+      "committer_date": "2026-07-14T05:27:12+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "80054bf457f5f3498db1bb0d390ef68578e0dbb5"
+    },
+    {
+      "ref": "refs/heads/agent/v1-cdf-shadow-telemetry",
+      "sha": "69fa6eb2b40ae606a02f34a4699f3b29837edf4c",
+      "committer_date": "2026-07-14T05:23:33+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "69fa6eb2b40ae606a02f34a4699f3b29837edf4c"
+    },
+    {
+      "ref": "refs/heads/agent/v1-merkle-shadow",
+      "sha": "8a8454931481fc8cdb76bcf4fd1a2c97a9415d0d",
+      "committer_date": "2026-07-14T06:47:02+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "8a8454931481fc8cdb76bcf4fd1a2c97a9415d0d"
+    },
+    {
+      "ref": "refs/heads/agent/v4-docs-sync",
+      "sha": "9c07fe6a2853d4e25625e74d277228a9409b7db0",
+      "committer_date": "2026-08-18T16:27:00+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "9c07fe6a2853d4e25625e74d277228a9409b7db0"
+    },
+    {
+      "ref": "refs/heads/agent/v4-release-blockers",
+      "sha": "2591f9c4a77217902cac570f1c130a97d50a0dea",
+      "committer_date": "2026-08-18T15:52:08+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "2591f9c4a77217902cac570f1c130a97d50a0dea"
+    },
+    {
+      "ref": "refs/heads/agent/validator-accounting-hardening",
+      "sha": "83d4acf0ae552bc2f9f58d12133e4136f0106a21",
+      "committer_date": "2026-07-14T04:41:04+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "b05c4808538d95c7c800e282287295dc0a30dd6b"
+    },
+    {
+      "ref": "refs/heads/agent/validator-combined-recovery",
+      "sha": "9974d28ef733f17c120fb44134d50609c6b74d7e",
+      "committer_date": "2026-08-11T06:48:12+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "9974d28ef733f17c120fb44134d50609c6b74d7e"
+    },
+    {
+      "ref": "refs/heads/agent/wire-v2-cutover",
+      "sha": "983410d858893117f60a2a821ca77c447401059d",
+      "committer_date": "2026-07-14T05:34:34+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "7cd6a84099f636d2bd77694c69af4c9c755caf33"
+    },
+    {
+      "ref": "refs/heads/agent/wire-v2-release-contract",
+      "sha": "bf123de9022cb9931f5ccf4d3ccf9b83b12c49e2",
+      "committer_date": "2026-07-14T04:41:08+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "b05c4808538d95c7c800e282287295dc0a30dd6b"
+    },
+    {
+      "ref": "refs/heads/checkpoint-epoch-scheduling-prototype",
+      "sha": "6979f7e6e6210916f01dd54e3e56cc1d2915f223",
+      "committer_date": "2026-08-28T17:34:18Z",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "942cc80586c7e7debaaf9d78656e3cfb3cf76ad0"
+    },
+    {
+      "ref": "refs/heads/chore/watchtower-deploy-test",
+      "sha": "76acb02bcca664e67e522e8a2ae8bfdc1e0947eb",
+      "committer_date": "2026-05-11T13:16:54+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "76acb02bcca664e67e522e8a2ae8bfdc1e0947eb"
+    },
+    {
+      "ref": "refs/heads/ci/serialize-image-builds",
+      "sha": "bbebe3426e4bec3b1be3e8c40b65cab7d40f1ffc",
+      "committer_date": "2026-05-11T14:51:46+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "bbebe3426e4bec3b1be3e8c40b65cab7d40f1ffc"
+    },
+    {
+      "ref": "refs/heads/claude/angry-mcnulty-e90b46",
+      "sha": "1d282268b76bd4c0be2dcb15c24c5be66fcc2bab",
+      "committer_date": "2026-06-01T14:05:04Z",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "1d282268b76bd4c0be2dcb15c24c5be66fcc2bab"
+    },
+    {
+      "ref": "refs/heads/claude/frosty-bardeen-532559",
+      "sha": "ca3ac67304720b9cbc0c64fe9b5c62c078db0645",
+      "committer_date": "2026-07-02T19:26:09+02:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "ca3ac67304720b9cbc0c64fe9b5c62c078db0645"
+    },
+    {
+      "ref": "refs/heads/claude/hopeful-mayer-5f62d2",
+      "sha": "8f33b3e9a636558e06ed2d49b39eb2113d31a0c7",
+      "committer_date": "2026-06-14T16:03:19+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "8f33b3e9a636558e06ed2d49b39eb2113d31a0c7"
+    },
+    {
+      "ref": "refs/heads/claude/laughing-lamarr-c62c47",
+      "sha": "78fecfe67ebe624a48d6d748a9c89330084fa9f6",
+      "committer_date": "2026-05-13T14:01:39+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "78fecfe67ebe624a48d6d748a9c89330084fa9f6"
+    },
+    {
+      "ref": "refs/heads/claude/magical-solomon-c8e83a",
+      "sha": "0c14707c6c5d405c9985e6062fead4ac3c2b7063",
+      "committer_date": "2026-05-30T01:34:08+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "0c14707c6c5d405c9985e6062fead4ac3c2b7063"
+    },
+    {
+      "ref": "refs/heads/claude/nifty-pasteur-7103cb",
+      "sha": "8427af4674ece6424f4b4317dcc45f8e6702f234",
+      "committer_date": "2026-06-26T19:38:58+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "8f33b3e9a636558e06ed2d49b39eb2113d31a0c7"
+    },
+    {
+      "ref": "refs/heads/claude/pensive-cannon-814c7a",
+      "sha": "0c14707c6c5d405c9985e6062fead4ac3c2b7063",
+      "committer_date": "2026-05-30T01:34:08+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "0c14707c6c5d405c9985e6062fead4ac3c2b7063"
+    },
+    {
+      "ref": "refs/heads/claude/sleepy-edison-3a72f5",
+      "sha": "c3f9c7227d17ee7584900e6c0cd13a334ab8904a",
+      "committer_date": "2026-06-11T19:21:57+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "c3f9c7227d17ee7584900e6c0cd13a334ab8904a"
+    },
+    {
+      "ref": "refs/heads/claude/suspicious-merkle-117c7c",
+      "sha": "60a0bd3f021ec503e3d0d914feb470822e0fa566",
+      "committer_date": "2026-07-02T22:59:48+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "60a0bd3f021ec503e3d0d914feb470822e0fa566"
+    },
+    {
+      "ref": "refs/heads/claude/zen-jang-c3ecb9",
+      "sha": "3b114becd762095620a1e1758b2c00aa59facbf0",
+      "committer_date": "2026-07-02T17:13:50+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "3b114becd762095620a1e1758b2c00aa59facbf0"
+    },
+    {
+      "ref": "refs/heads/codex/adaptive-auction-fairness",
+      "sha": "625d8006b1633ed025b04991bc7a5f5276a20929",
+      "committer_date": "2026-08-29T20:02:43+08:00",
+      "reachable_commits_since_cutoff": 1,
+      "ancestor_of_main": false,
+      "merge_base_v1": "c0b01d1a4bf34a89d0074bdd4bb6460b6ebf5cc0"
+    },
+    {
+      "ref": "refs/heads/codex/all-token-auth-shadow",
+      "sha": "fffd83741326e766ce62567872373b503c6a0ca2",
+      "committer_date": "2026-06-26T17:13:18+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "fffd83741326e766ce62567872373b503c6a0ca2"
+    },
+    {
+      "ref": "refs/heads/codex/auth-forensics-signal-report",
+      "sha": "af32ba150717c2a72c51c9ae17bbc03445d4582a",
+      "committer_date": "2026-06-29T07:56:43+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "af32ba150717c2a72c51c9ae17bbc03445d4582a"
+    },
+    {
+      "ref": "refs/heads/codex/bft-runtime-observability-hardening",
+      "sha": "d08d87ea8abc79d8976e063f3d37b577a1784b5d",
+      "committer_date": "2026-07-15T10:12:54+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "d08d87ea8abc79d8976e063f3d37b577a1784b5d"
+    },
+    {
+      "ref": "refs/heads/codex/code-semantic-auth-forensics",
+      "sha": "2fcd4b6ab702f59f73d4f53043807937ae22797c",
+      "committer_date": "2026-06-27T20:07:34+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "2fcd4b6ab702f59f73d4f53043807937ae22797c"
+    },
+    {
+      "ref": "refs/heads/codex/control-plane-cooldown-hardening-draft",
+      "sha": "1357b9646852b05e75220e95d15a9d613a3f60e7",
+      "committer_date": "2026-08-28T21:28:44+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "c0b01d1a4bf34a89d0074bdd4bb6460b6ebf5cc0"
+    },
+    {
+      "ref": "refs/heads/codex/cot-2b-deploy-default-fix",
+      "sha": "bedadda1088dfd184be18bc6032244ec052d4d60",
+      "committer_date": "2026-07-02T17:38:52+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "bedadda1088dfd184be18bc6032244ec052d4d60"
+    },
+    {
+      "ref": "refs/heads/codex/cot-2b-production-ready",
+      "sha": "a4e2a50b33c1510b7f87bf568f1d03f10d0081db",
+      "committer_date": "2026-07-02T17:12:47+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "a4e2a50b33c1510b7f87bf568f1d03f10d0081db"
+    },
+    {
+      "ref": "refs/heads/codex/difficulty-auction-review",
+      "sha": "d1374d8456c41f37d0d22812e9d69738182b0ade",
+      "committer_date": "2026-07-14T15:47:25Z",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "d1374d8456c41f37d0d22812e9d69738182b0ade"
+    },
+    {
+      "ref": "refs/heads/codex/difficulty-auction-shadow",
+      "sha": "c8e755862a3c6c89001e9623eb204e13e5337d88",
+      "committer_date": "2026-07-15T17:53:52+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "c8e755862a3c6c89001e9623eb204e13e5337d88"
+    },
+    {
+      "ref": "refs/heads/codex/difficulty-auction-v2-kl-hardening",
+      "sha": "3afe14f7e8cc1f04f5e20a2aa1193f49972a9c0b",
+      "committer_date": "2026-07-16T19:49:36+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "3afe14f7e8cc1f04f5e20a2aa1193f49972a9c0b"
+    },
+    {
+      "ref": "refs/heads/codex/docs-live-qwen35",
+      "sha": "992fc183557c359d682919ef225884a5ad49611b",
+      "committer_date": "2026-06-03T12:12:41+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "992fc183557c359d682919ef225884a5ad49611b"
+    },
+    {
+      "ref": "refs/heads/codex/fix-detached-checkpoint-resume",
+      "sha": "e03863e4fb28623250bc75284071985a910208c4",
+      "committer_date": "2026-08-25T11:29:44+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "e03863e4fb28623250bc75284071985a910208c4"
+    },
+    {
+      "ref": "refs/heads/codex/fix-qwen35-tokenizer-pstop",
+      "sha": "4fae4d3fe41ffd4c848a1e5f88dbfc0bc093eef4",
+      "committer_date": "2026-06-03T14:52:40+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "4fae4d3fe41ffd4c848a1e5f88dbfc0bc093eef4"
+    },
+    {
+      "ref": "refs/heads/codex/fix-trainer-compose-volumes",
+      "sha": "4815e0fcc20ac1f0d9b173a7ba284949b3c1bd84",
+      "committer_date": "2026-06-03T07:20:42+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "4815e0fcc20ac1f0d9b173a7ba284949b3c1bd84"
+    },
+    {
+      "ref": "refs/heads/codex/fixed-kl-reference-experiment",
+      "sha": "ba9d7fa50f61cd80a81bdc1b16715116b1595b7c",
+      "committer_date": "2026-07-16T19:49:30+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "ba9d7fa50f61cd80a81bdc1b16715116b1595b7c"
+    },
+    {
+      "ref": "refs/heads/codex/force-span-training-boundary",
+      "sha": "d4a20c9f68f134681c6c8401a01704dccf6d5423",
+      "committer_date": "2026-07-15T00:25:48+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "d4a20c9f68f134681c6c8401a01704dccf6d5423"
+    },
+    {
+      "ref": "refs/heads/codex/grader-unique-runsc-workers",
+      "sha": "6c061d0bf79a105a753ba3c3da2522e30b8f40f9",
+      "committer_date": "2026-06-03T10:50:30+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "2bc290e3c78f03d32c985a9752018b22680b688b"
+    },
+    {
+      "ref": "refs/heads/codex/harden-prompt-mismatch-circuit",
+      "sha": "65a328c81a1b6bcc0a2a77ca917078830c5414d1",
+      "committer_date": "2026-08-25T19:23:37+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "65a328c81a1b6bcc0a2a77ca917078830c5414d1"
+    },
+    {
+      "ref": "refs/heads/codex/hf-checkpoint-retention",
+      "sha": "8e6d4375bc35106e77d853bea86b4df65f57f80c",
+      "committer_date": "2026-08-28T20:40:25+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "c0b01d1a4bf34a89d0074bdd4bb6460b6ebf5cc0"
+    },
+    {
+      "ref": "refs/heads/codex/issue-125-eval-dashboard",
+      "sha": "f76c316e5f58585a10756722f0d18d786004002b",
+      "committer_date": "2026-07-16T21:23:53+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "9f1681dbf95dab681f004f325475611cf79f2a97"
+    },
+    {
+      "ref": "refs/heads/codex/opencode-semantic-auth-shadow",
+      "sha": "39f53f3ecc6e8ac47891ad1f99d4a6a7e82991c3",
+      "committer_date": "2026-06-26T15:48:44+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "39f53f3ecc6e8ac47891ad1f99d4a6a7e82991c3"
+    },
+    {
+      "ref": "refs/heads/codex/private-token-auth-forensics",
+      "sha": "3b813bb3473db48decf746803737f60af80e3f52",
+      "committer_date": "2026-06-27T17:10:27+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "3b813bb3473db48decf746803737f60af80e3f52"
+    },
+    {
+      "ref": "refs/heads/codex/prompt-mismatch-circuit-breaker",
+      "sha": "07d94de56eebda5d1ef53bbcf34f0a0ccf37775f",
+      "committer_date": "2026-08-25T18:14:01+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "07d94de56eebda5d1ef53bbcf34f0a0ccf37775f"
+    },
+    {
+      "ref": "refs/heads/codex/protocol-hardening-20260714",
+      "sha": "729dffecf5307c82b70fe64266db67603580dae9",
+      "committer_date": "2026-07-14T04:31:48+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "b790e42843903a1ee2f3143311a3e90865238d7b"
+    },
+    {
+      "ref": "refs/heads/codex/qwen35-production-readiness",
+      "sha": "4338972ff011ed5ed00fe318391a882ae2aade8a",
+      "committer_date": "2026-06-03T02:40:22+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "4338972ff011ed5ed00fe318391a882ae2aade8a"
+    },
+    {
+      "ref": "refs/heads/codex/recycle-precommit-capacity",
+      "sha": "790c0f3a023431071da3b8eedd61436ea315a93e",
+      "committer_date": "2026-08-25T09:02:22+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "790c0f3a023431071da3b8eedd61436ea315a93e"
+    },
+    {
+      "ref": "refs/heads/codex/remote-cpu-sandbox-prototype",
+      "sha": "780df1c7cc62bcda0aaf37171644d546c0f49b29",
+      "committer_date": "2026-08-28T22:07:53+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "c0b01d1a4bf34a89d0074bdd4bb6460b6ebf5cc0"
+    },
+    {
+      "ref": "refs/heads/codex/rollout-token-invariant-fix",
+      "sha": "f66fe3e7be5e287ed868f8a197ff973f9aa722ff",
+      "committer_date": "2026-05-25T05:21:01+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "f66fe3e7be5e287ed868f8a197ff973f9aa722ff"
+    },
+    {
+      "ref": "refs/heads/codex/runtime-revision-build-env",
+      "sha": "fa11d0e56f1d63d1fe463ae45e1b4c7f642fe6ec",
+      "committer_date": "2026-06-26T16:22:10+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "fa11d0e56f1d63d1fe463ae45e1b4c7f642fe6ec"
+    },
+    {
+      "ref": "refs/heads/codex/validator-observability-upgrade",
+      "sha": "d9de275c4207260be101b6af46a24cec40edf0b8",
+      "committer_date": "2026-05-24T19:41:50+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "d9de275c4207260be101b6af46a24cec40edf0b8"
+    },
+    {
+      "ref": "refs/heads/codex/validator-process-reaping",
+      "sha": "5fc06195d85126eec3eee1e03deb12ced4e711fa",
+      "committer_date": "2026-07-31T02:59:04+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "b79ff801fbe6374041f24493a9f063629df5295e"
+    },
+    {
+      "ref": "refs/heads/codex/weight-setter-epoch-attempt",
+      "sha": "32928aec6fed34f1488a72608ce4f992c47618e5",
+      "committer_date": "2026-06-03T08:19:50+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "d16da86d16d94f094d51f2872ff75f3125807a2c"
+    },
+    {
+      "ref": "refs/heads/codex/zero-valid-window-liveness",
+      "sha": "595f48e776c5b28bdeca0bcbdbb1419c9a9af319",
+      "committer_date": "2026-06-03T07:47:28+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "595f48e776c5b28bdeca0bcbdbb1419c9a9af319"
+    },
+    {
+      "ref": "refs/heads/design/difficulty-auction",
+      "sha": "c1ce152a85d919f31c310ae672036b1886f41522",
+      "committer_date": "2026-07-15T19:21:50+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "c1ce152a85d919f31c310ae672036b1886f41522"
+    },
+    {
+      "ref": "refs/heads/design/difficulty-auction-v2",
+      "sha": "8a96ab211a3456720cff25cffa70567c6f97aa47",
+      "committer_date": "2026-07-17T20:57:52+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "8a96ab211a3456720cff25cffa70567c6f97aa47"
+    },
+    {
+      "ref": "refs/heads/design/reliquary-v1-reconciliation",
+      "sha": "71672e14ac2bef54e7be2177e9271c7cd2295c8e",
+      "committer_date": "2026-09-01T17:46:21+08:00",
+      "reachable_commits_since_cutoff": 122,
+      "ancestor_of_main": false,
+      "merge_base_v1": "71672e14ac2bef54e7be2177e9271c7cd2295c8e"
+    },
+    {
+      "ref": "refs/heads/experiment/training-recovery-calibration",
+      "sha": "68f70c0e613bd9262a89e96676e6ff836d452522",
+      "committer_date": "2026-07-17T08:27:19+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "68f70c0e613bd9262a89e96676e6ff836d452522"
+    },
+    {
+      "ref": "refs/heads/feat/4b-migration-bft16k-throughput",
+      "sha": "5f9a492369a4541a02b2ae8a32a0c932b55dbaef",
+      "committer_date": "2026-07-31T05:59:23+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "5f9a492369a4541a02b2ae8a32a0c932b55dbaef"
+    },
+    {
+      "ref": "refs/heads/feat/auction-v3-utility-foundation",
+      "sha": "9cdd0125c59f7f3a0f69926b716868a0eb3ae227",
+      "committer_date": "2026-07-22T14:53:19+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "9cdd0125c59f7f3a0f69926b716868a0eb3ae227"
+    },
+    {
+      "ref": "refs/heads/feat/blackbox-opencode-grader",
+      "sha": "598de228f79c86bb46dde9c3d5baa92307665e35",
+      "committer_date": "2026-06-02T17:09:48+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "598de228f79c86bb46dde9c3d5baa92307665e35"
+    },
+    {
+      "ref": "refs/heads/feat/chat-template-prompt-encoding",
+      "sha": "f4e95acc895443bbdbecd13292a8f9c3e8cda9db",
+      "committer_date": "2026-06-02T17:45:46+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "f4e95acc895443bbdbecd13292a8f9c3e8cda9db"
+    },
+    {
+      "ref": "refs/heads/feat/opencode-prod-candidate",
+      "sha": "a8f9b9cf70f63d9f06831961859b2755a621bda7",
+      "committer_date": "2026-06-03T06:43:20+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "a8f9b9cf70f63d9f06831961859b2755a621bda7"
+    },
+    {
+      "ref": "refs/heads/feat/r2-non-blocking-archive-retry-queue",
+      "sha": "94f78df00931bc266a781742d2d29973c6fb5a76",
+      "committer_date": "2026-05-11T12:26:57+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "94f78df00931bc266a781742d2d29973c6fb5a76"
+    },
+    {
+      "ref": "refs/heads/feat/reward-manipulation-detector",
+      "sha": "9702267a21e4cc58361976a95e072fe97f1d577d",
+      "committer_date": "2026-05-27T18:28:50+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "9702267a21e4cc58361976a95e072fe97f1d577d"
+    },
+    {
+      "ref": "refs/heads/fix/adaptive-training-publication",
+      "sha": "7040ca6cb566ec34367ad94621869e5e2de56b8d",
+      "committer_date": "2026-07-23T08:37:27+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "7040ca6cb566ec34367ad94621869e5e2de56b8d"
+    },
+    {
+      "ref": "refs/heads/fix/atomic-weight-epoch-snapshot",
+      "sha": "79c1379222e17c8f9d10d07bb0f205597821accf",
+      "committer_date": "2026-07-14T17:21:26+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "79c1379222e17c8f9d10d07bb0f205597821accf"
+    },
+    {
+      "ref": "refs/heads/fix/auction-admission-isolation",
+      "sha": "cc42be182b986e8a1591be97abc8f04c3a1dacc7",
+      "committer_date": "2026-07-19T20:32:32+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "cc42be182b986e8a1591be97abc8f04c3a1dacc7"
+    },
+    {
+      "ref": "refs/heads/fix/auction-ingress-admission",
+      "sha": "0741d81d05a0cf7e4475f317dbf53eed55cb79ce",
+      "committer_date": "2026-07-18T23:40:16+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "0741d81d05a0cf7e4475f317dbf53eed55cb79ce"
+    },
+    {
+      "ref": "refs/heads/fix/auction-v2-production-liveness",
+      "sha": "8b38f28558e5dd30716d16a5c373ffdebb010c31",
+      "committer_date": "2026-07-19T14:49:08+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "8b38f28558e5dd30716d16a5c373ffdebb010c31"
+    },
+    {
+      "ref": "refs/heads/fix/auction-v2-trained-only-rewards",
+      "sha": "2aa9fc90bf568e3083f1a55e752d9f455bec2a73",
+      "committer_date": "2026-07-22T04:33:26+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "2aa9fc90bf568e3083f1a55e752d9f455bec2a73"
+    },
+    {
+      "ref": "refs/heads/fix/bound-startup-rebuild-horizon",
+      "sha": "9fe203b20cbbdce5ef91e9e7a20ec05d9c29cc0a",
+      "committer_date": "2026-05-22T14:22:59+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "9fe203b20cbbdce5ef91e9e7a20ec05d9c29cc0a"
+    },
+    {
+      "ref": "refs/heads/fix/bounded-proof-admission",
+      "sha": "1a9bc62dedad990b9753dd15b6aeead86fca3787",
+      "committer_date": "2026-05-27T18:39:50+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "1a9bc62dedad990b9753dd15b6aeead86fca3787"
+    },
+    {
+      "ref": "refs/heads/fix/code-fence-selection",
+      "sha": "59d6519ed200de8011881224ecf653151327d496",
+      "committer_date": "2026-08-26T03:34:32+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "59d6519ed200de8011881224ecf653151327d496"
+    },
+    {
+      "ref": "refs/heads/fix/code-grader-crash-verdict-20260718",
+      "sha": "ee1fae886e1cd0e8bf221f85ca4d432b5c2f9e37",
+      "committer_date": "2026-07-19T02:11:43+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "ee1fae886e1cd0e8bf221f85ca4d432b5c2f9e37"
+    },
+    {
+      "ref": "refs/heads/fix/distinct-prompt-seal-liveness",
+      "sha": "1533d3b60a8e59839d1b31abd52a554fd5135fff",
+      "committer_date": "2026-05-30T00:41:21+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "2ebb619a6e18a231a0ee0255377f26a37de9b563"
+    },
+    {
+      "ref": "refs/heads/fix/docker-image-metadata-outage",
+      "sha": "b1c8d6d8b8558a800b032a24fdaba73b23f3dde1",
+      "committer_date": "2026-07-17T08:41:31+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "b1c8d6d8b8558a800b032a24fdaba73b23f3dde1"
+    },
+    {
+      "ref": "refs/heads/fix/drand-tolerance-contract",
+      "sha": "4eee92740bb07ba9e9631fc4ac6416aa5265520e",
+      "committer_date": "2026-07-18T02:01:28+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "4eee92740bb07ba9e9631fc4ac6416aa5265520e"
+    },
+    {
+      "ref": "refs/heads/fix/forensic-seed-diagnostics-memory",
+      "sha": "64f3412b168783b0c16ef3b9f852694ac52c883a",
+      "committer_date": "2026-07-19T00:38:12+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "64f3412b168783b0c16ef3b9f852694ac52c883a"
+    },
+    {
+      "ref": "refs/heads/fix/grader-crash-circuit-breaker-20260718",
+      "sha": "138c09d30dc027bc2a58d7dda612fddfaaa72803",
+      "committer_date": "2026-07-19T02:23:45+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "138c09d30dc027bc2a58d7dda612fddfaaa72803"
+    },
+    {
+      "ref": "refs/heads/fix/miner-runtime-nonce-bootstrap",
+      "sha": "4b82d038fe5a0269b4525e181825dbe7426fa085",
+      "committer_date": "2026-07-19T01:02:49+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "4b82d038fe5a0269b4525e181825dbe7426fa085"
+    },
+    {
+      "ref": "refs/heads/fix/operator-auction-fairness",
+      "sha": "7b4a4076230b2a9952fd8be82f6b79bfb33739d9",
+      "committer_date": "2026-08-26T03:44:31+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "7b4a4076230b2a9952fd8be82f6b79bfb33739d9"
+    },
+    {
+      "ref": "refs/heads/fix/precommit-receipt-timing",
+      "sha": "cd42618e8e3d585dabd9546f30f74f9cd3a7586f",
+      "committer_date": "2026-08-26T07:40:29+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "cd42618e8e3d585dabd9546f30f74f9cd3a7586f"
+    },
+    {
+      "ref": "refs/heads/fix/precommit-retry-freshness",
+      "sha": "af0d6a9c11a888f8ec9ff50665173a5649df187a",
+      "committer_date": "2026-07-18T23:51:52+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "af0d6a9c11a888f8ec9ff50665173a5649df187a"
+    },
+    {
+      "ref": "refs/heads/fix/precommit-reveal-admission",
+      "sha": "53d19a4a2f8d12350884a432c3a412209b52d259",
+      "committer_date": "2026-08-26T07:23:30+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "53d19a4a2f8d12350884a432c3a412209b52d259"
+    },
+    {
+      "ref": "refs/heads/fix/preflight-proof-admission",
+      "sha": "d34c6cda33143fb4ea0bdf4784de72a459c79bc6",
+      "committer_date": "2026-05-29T09:41:20+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "5f9f30b04754d2de54607434ab5e11c59ea30c6b"
+    },
+    {
+      "ref": "refs/heads/fix/preproof-cheap-rejects",
+      "sha": "a2252341953b282d0bd83a985974a120a28b7ef1",
+      "committer_date": "2026-05-29T09:56:15+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "6f1173a76da7987a865fe0b3f2586ffaf884a35c"
+    },
+    {
+      "ref": "refs/heads/fix/proof-failure-admission-debt",
+      "sha": "3b06bee584e40f99798a539fb74e31dfb770216a",
+      "committer_date": "2026-05-29T11:07:46+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "ebfb068917d6881d6d8213e437f56f6d5aec53dc"
+    },
+    {
+      "ref": "refs/heads/fix/proof-scheduler-rank-gap",
+      "sha": "9b626319a6b6dd0884104ee8520e31b40b2c23e7",
+      "committer_date": "2026-08-27T05:06:13+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "86e436036a846768662c7a1ab1757013089dd8b6"
+    },
+    {
+      "ref": "refs/heads/fix/quarantine-truncation-policy",
+      "sha": "399c5f207ce6119ba40d21ab7d2dbbb6e3b26940",
+      "committer_date": "2026-05-27T03:43:00+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "399c5f207ce6119ba40d21ab7d2dbbb6e3b26940"
+    },
+    {
+      "ref": "refs/heads/fix/r2-session-recycling-and-timeouts",
+      "sha": "f5c59923d2a7ff606f987fd7d5cd667cf7703657",
+      "committer_date": "2026-05-11T12:20:14+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "f5c59923d2a7ff606f987fd7d5cd667cf7703657"
+    },
+    {
+      "ref": "refs/heads/fix/r2-sync-boto3-upload-hot-path",
+      "sha": "80f809a0ad467b796b0f1ce84cdb0919d00f3f39",
+      "committer_date": "2026-05-11T12:22:22+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "80f809a0ad467b796b0f1ce84cdb0919d00f3f39"
+    },
+    {
+      "ref": "refs/heads/fix/registration-cache-deadline-scheduling",
+      "sha": "dce59b6a156b6b0c8e2a3532efb4a3d401d71065",
+      "committer_date": "2026-07-18T03:31:03+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "dce59b6a156b6b0c8e2a3532efb4a3d401d71065"
+    },
+    {
+      "ref": "refs/heads/fix/registration-cache-lite-neurons",
+      "sha": "ab0c7666f5e4252409f397f8ded71a8be6bb2a73",
+      "committer_date": "2026-07-18T04:10:08+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "ab0c7666f5e4252409f397f8ded71a8be6bb2a73"
+    },
+    {
+      "ref": "refs/heads/fix/registration-cache-refresh",
+      "sha": "434465cf0d6c26c56843bf137f2dd7005270d51e",
+      "committer_date": "2026-07-18T02:08:12+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "434465cf0d6c26c56843bf137f2dd7005270d51e"
+    },
+    {
+      "ref": "refs/heads/fix/registration-cache-retry-runway",
+      "sha": "b98d557e94d46a142e1312c18bc89e6976739cfa",
+      "committer_date": "2026-07-18T02:59:50+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "b98d557e94d46a142e1312c18bc89e6976739cfa"
+    },
+    {
+      "ref": "refs/heads/fix/remove-auction-operator-cap",
+      "sha": "6e7fa5d5fcd39377930a4e34fa31e7dac68ae5ee",
+      "committer_date": "2026-07-18T05:51:28+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "6e7fa5d5fcd39377930a4e34fa31e7dac68ae5ee"
+    },
+    {
+      "ref": "refs/heads/fix/reward-shape-truncation-guards",
+      "sha": "b352646822459f6a1a975897e48c380915f183de",
+      "committer_date": "2026-05-29T08:06:28+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "352523f523703bb05740188e82e5741475a48b9b"
+    },
+    {
+      "ref": "refs/heads/fix/rewarded-runner-cooldown",
+      "sha": "0b993f63c0388240f134e025cd11d3eee5c1acfd",
+      "committer_date": "2026-05-27T14:39:10+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "0b993f63c0388240f134e025cd11d3eee5c1acfd"
+    },
+    {
+      "ref": "refs/heads/fix/sparse-window-idle-seal",
+      "sha": "9537d3d9fa73b263405fb297c4a8fb3f9cb50423",
+      "committer_date": "2026-05-30T01:33:37+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "4ff4677dfc6ee477bb803dd4f2f6e012ce3c8494"
+    },
+    {
+      "ref": "refs/heads/fix/stale-proof-cap-breaker",
+      "sha": "6480a3a6fc4af6604d7030d23e85483c735d391e",
+      "committer_date": "2026-05-28T16:30:45+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "da19d6f6b8d7b04f1b870cfcb75cd09816fab94c"
+    },
+    {
+      "ref": "refs/heads/fix/submission-ingress-races",
+      "sha": "2b90f40029afe34328705b4daae50aaa6154c5a8",
+      "committer_date": "2026-08-26T08:35:18+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "2b90f40029afe34328705b4daae50aaa6154c5a8"
+    },
+    {
+      "ref": "refs/heads/fix/submit-envelope-signature",
+      "sha": "8e24c49c3bb31f215b4ca4a5b46cda22f75a3758",
+      "committer_date": "2026-05-17T06:44:57+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "8e24c49c3bb31f215b4ca4a5b46cda22f75a3758"
+    },
+    {
+      "ref": "refs/heads/fix/substrate-retry-window-randomness",
+      "sha": "ebeec3172581b2e4105b0686976bebd48659fb13",
+      "committer_date": "2026-05-11T16:54:47+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "ebeec3172581b2e4105b0686976bebd48659fb13"
+    },
+    {
+      "ref": "refs/heads/fix/subtensor-runtime-codec-compat",
+      "sha": "d01a38a00f874064e5fa4c4ff5086919823853e7",
+      "committer_date": "2026-07-17T06:38:48+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "d01a38a00f874064e5fa4c4ff5086919823853e7"
+    },
+    {
+      "ref": "refs/heads/fix/training-recovery-guards",
+      "sha": "187f2e2a408c7845841346bb7909a8b8c8289944",
+      "committer_date": "2026-07-16T21:44:39+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "187f2e2a408c7845841346bb7909a8b8c8289944"
+    },
+    {
+      "ref": "refs/heads/fix/v5-seed-auth-false-positive",
+      "sha": "4114ed1f60a015a54d9d3875c7d3189dca8a6ccc",
+      "committer_date": "2026-09-04T13:39:57+08:00",
+      "reachable_commits_since_cutoff": 3,
+      "ancestor_of_main": false,
+      "merge_base_v1": "4544394feecc312ebbfb30f7e0815fe62d034b33"
+    },
+    {
+      "ref": "refs/heads/fix/validator-bounded-submit-queue",
+      "sha": "f60689cc86f1e8ae52d6f0428a4fec08b39c4cac",
+      "committer_date": "2026-05-11T21:00:52+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "f60689cc86f1e8ae52d6f0428a4fec08b39c4cac"
+    },
+    {
+      "ref": "refs/heads/fix/validator-cuda-oom-recovery",
+      "sha": "607125c0b21c13cb2190238c9a0d29a62cb622bf",
+      "committer_date": "2026-05-11T14:30:19+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "607125c0b21c13cb2190238c9a0d29a62cb622bf"
+    },
+    {
+      "ref": "refs/heads/fix/validator-fatal-restart",
+      "sha": "b76ab91e50f0c7d2c5bb5ae1422cab3b2a14dd42",
+      "committer_date": "2026-08-08T23:53:44+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "b76ab91e50f0c7d2c5bb5ae1422cab3b2a14dd42"
+    },
+    {
+      "ref": "refs/heads/fix/wandb-step-commit",
+      "sha": "09a381c921997f7a3a261fb6f64a1e829e5007e0",
+      "committer_date": "2026-07-17T10:11:03+09:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "09a381c921997f7a3a261fb6f64a1e829e5007e0"
+    },
+    {
+      "ref": "refs/heads/grizz/validator-codebase-audit-619fa8",
+      "sha": "cff084c7d9674e0b5e408d0e2ef8a0cfee3c2360",
+      "committer_date": "2026-08-03T19:31:02+02:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "cff084c7d9674e0b5e408d0e2ef8a0cfee3c2360"
+    },
+    {
+      "ref": "refs/heads/main",
+      "sha": "c0b01d1a4bf34a89d0074bdd4bb6460b6ebf5cc0",
+      "committer_date": "2026-08-27T15:34:05+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "c0b01d1a4bf34a89d0074bdd4bb6460b6ebf5cc0"
+    },
+    {
+      "ref": "refs/heads/pr91",
+      "sha": "32ad71efd13ae93c8181012204e3d62ee2ef0c46",
+      "committer_date": "2026-06-12T05:12:25Z",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "32ad71efd13ae93c8181012204e3d62ee2ef0c46"
+    },
+    {
+      "ref": "refs/heads/private/stage2-process-isolation",
+      "sha": "48ca2650402ae29b93134a7f195612e5518355ae",
+      "committer_date": "2026-05-11T21:01:56+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "48ca2650402ae29b93134a7f195612e5518355ae"
+    },
+    {
+      "ref": "refs/heads/reliquary-environment-suite-v1",
+      "sha": "656c86227b7cd5a96676c3e88e31412ababf464c",
+      "committer_date": "2026-09-03T20:10:09Z",
+      "reachable_commits_since_cutoff": 19,
+      "ancestor_of_main": false,
+      "merge_base_v1": "c0b01d1a4bf34a89d0074bdd4bb6460b6ebf5cc0"
+    },
+    {
+      "ref": "refs/heads/revert/validator-authoritative-rewards",
+      "sha": "24368c7036499404f27a09c317b5660f64e8d25b",
+      "committer_date": "2026-05-25T16:31:26+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "24368c7036499404f27a09c317b5660f64e8d25b"
+    },
+    {
+      "ref": "refs/heads/standalone-environment-integration-v2",
+      "sha": "a76bca595f45d73c71dade086af55dc274f7526b",
+      "committer_date": "2026-09-04T12:18:52+08:00",
+      "reachable_commits_since_cutoff": 21,
+      "ancestor_of_main": false,
+      "merge_base_v1": "c0b01d1a4bf34a89d0074bdd4bb6460b6ebf5cc0"
+    },
+    {
+      "ref": "refs/heads/v5-reasoning-prompt",
+      "sha": "8d33cb3955ee2f4673209efb1e7da31fd9cf0914",
+      "committer_date": "2026-08-23T12:29:52+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "8d33cb3955ee2f4673209efb1e7da31fd9cf0914"
+    },
+    {
+      "ref": "refs/heads/work/reliquary-v1-admission",
+      "sha": "34ee05191cc6aad86013ca68272dd7157dfbf188",
+      "committer_date": "2026-09-01T14:36:24+08:00",
+      "reachable_commits_since_cutoff": 60,
+      "ancestor_of_main": false,
+      "merge_base_v1": "68f0047b0bae8159575252e19ea49bec87b4cc8f"
+    },
+    {
+      "ref": "refs/heads/work/reliquary-v1-contracts",
+      "sha": "df4a22a48b194c87a69be57fb32897df873ee448",
+      "committer_date": "2026-09-01T14:37:44+08:00",
+      "reachable_commits_since_cutoff": 58,
+      "ancestor_of_main": false,
+      "merge_base_v1": "68f0047b0bae8159575252e19ea49bec87b4cc8f"
+    },
+    {
+      "ref": "refs/heads/work/reliquary-v1-cooldown",
+      "sha": "4669c03e9b0776ad86afe95a5b4055e8751e937a",
+      "committer_date": "2026-09-01T14:59:29+08:00",
+      "reachable_commits_since_cutoff": 76,
+      "ancestor_of_main": false,
+      "merge_base_v1": "93c0e911269311f3bae7a25546e5327b7ccbca9d"
+    },
+    {
+      "ref": "refs/heads/work/reliquary-v1-durability",
+      "sha": "8a056f74446a31c7d2c64d07485c93c739ce10db",
+      "committer_date": "2026-09-01T15:04:53+08:00",
+      "reachable_commits_since_cutoff": 58,
+      "ancestor_of_main": false,
+      "merge_base_v1": "68f0047b0bae8159575252e19ea49bec87b4cc8f"
+    },
+    {
+      "ref": "refs/heads/work/reliquary-v1-market",
+      "sha": "57af2185274d7f4307c9c0a4de33ea1f9f4f343e",
+      "committer_date": "2026-09-01T14:27:47+08:00",
+      "reachable_commits_since_cutoff": 63,
+      "ancestor_of_main": false,
+      "merge_base_v1": "68f0047b0bae8159575252e19ea49bec87b4cc8f"
+    },
+    {
+      "ref": "refs/heads/work/reliquary-v1-ticketed-streaming",
+      "sha": "33ef7afd2a492055fd3c11fae759df326e936cc2",
+      "committer_date": "2026-09-01T14:55:27+08:00",
+      "reachable_commits_since_cutoff": 75,
+      "ancestor_of_main": false,
+      "merge_base_v1": "93c0e911269311f3bae7a25546e5327b7ccbca9d"
+    },
+    {
+      "ref": "refs/remotes/origin/HEAD",
+      "sha": "4544394feecc312ebbfb30f7e0815fe62d034b33",
+      "committer_date": "2026-08-31T13:10:16+01:00",
+      "reachable_commits_since_cutoff": 2,
+      "ancestor_of_main": true,
+      "merge_base_v1": "4544394feecc312ebbfb30f7e0815fe62d034b33"
+    },
+    {
+      "ref": "refs/remotes/origin/agent/grader-health-heartbeat",
+      "sha": "5f94e3531fe0094625058d172fc9a925c7838ae0",
+      "committer_date": "2026-08-19T00:33:15+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "5f94e3531fe0094625058d172fc9a925c7838ae0"
+    },
+    {
+      "ref": "refs/remotes/origin/agent/v4-docs-sync",
+      "sha": "9c07fe6a2853d4e25625e74d277228a9409b7db0",
+      "committer_date": "2026-08-18T16:27:00+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "9c07fe6a2853d4e25625e74d277228a9409b7db0"
+    },
+    {
+      "ref": "refs/remotes/origin/agent/v4-release-blockers",
+      "sha": "2591f9c4a77217902cac570f1c130a97d50a0dea",
+      "committer_date": "2026-08-18T15:52:08+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "2591f9c4a77217902cac570f1c130a97d50a0dea"
+    },
+    {
+      "ref": "refs/remotes/origin/agent/validator-combined-recovery",
+      "sha": "9974d28ef733f17c120fb44134d50609c6b74d7e",
+      "committer_date": "2026-08-11T06:48:12+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "9974d28ef733f17c120fb44134d50609c6b74d7e"
+    },
+    {
+      "ref": "refs/remotes/origin/checkpoint-epoch-scheduling-prototype",
+      "sha": "6979f7e6e6210916f01dd54e3e56cc1d2915f223",
+      "committer_date": "2026-08-28T17:34:18Z",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "942cc80586c7e7debaaf9d78656e3cfb3cf76ad0"
+    },
+    {
+      "ref": "refs/remotes/origin/codex/adaptive-auction-fairness",
+      "sha": "625d8006b1633ed025b04991bc7a5f5276a20929",
+      "committer_date": "2026-08-29T20:02:43+08:00",
+      "reachable_commits_since_cutoff": 1,
+      "ancestor_of_main": false,
+      "merge_base_v1": "c0b01d1a4bf34a89d0074bdd4bb6460b6ebf5cc0"
+    },
+    {
+      "ref": "refs/remotes/origin/codex/control-plane-cooldown-hardening-draft",
+      "sha": "1357b9646852b05e75220e95d15a9d613a3f60e7",
+      "committer_date": "2026-08-28T21:28:44+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "c0b01d1a4bf34a89d0074bdd4bb6460b6ebf5cc0"
+    },
+    {
+      "ref": "refs/remotes/origin/codex/fix-detached-checkpoint-resume",
+      "sha": "e03863e4fb28623250bc75284071985a910208c4",
+      "committer_date": "2026-08-25T11:29:44+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "e03863e4fb28623250bc75284071985a910208c4"
+    },
+    {
+      "ref": "refs/remotes/origin/codex/fix-grader-queue-listener-eof-health",
+      "sha": "ad33a83bd0aff88c4e08f874521c6e1ae0b3b6c2",
+      "committer_date": "2026-08-27T03:08:58+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "86e436036a846768662c7a1ab1757013089dd8b6"
+    },
+    {
+      "ref": "refs/remotes/origin/codex/fix-proof-scheduler-raw-resource-deadlock",
+      "sha": "37dfafeb565e4664cea217f1e27daad354d36bbe",
+      "committer_date": "2026-08-27T01:58:02+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "260557060d03fb3188599339c1d6d484a00f0588"
+    },
+    {
+      "ref": "refs/remotes/origin/codex/harden-prompt-mismatch-circuit",
+      "sha": "65a328c81a1b6bcc0a2a77ca917078830c5414d1",
+      "committer_date": "2026-08-25T19:23:37+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "65a328c81a1b6bcc0a2a77ca917078830c5414d1"
+    },
+    {
+      "ref": "refs/remotes/origin/codex/hf-checkpoint-retention",
+      "sha": "8e6d4375bc35106e77d853bea86b4df65f57f80c",
+      "committer_date": "2026-08-28T20:40:25+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "c0b01d1a4bf34a89d0074bdd4bb6460b6ebf5cc0"
+    },
+    {
+      "ref": "refs/remotes/origin/codex/prompt-mismatch-circuit-breaker",
+      "sha": "07d94de56eebda5d1ef53bbcf34f0a0ccf37775f",
+      "committer_date": "2026-08-25T18:14:01+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "07d94de56eebda5d1ef53bbcf34f0a0ccf37775f"
+    },
+    {
+      "ref": "refs/remotes/origin/codex/recycle-precommit-capacity",
+      "sha": "790c0f3a023431071da3b8eedd61436ea315a93e",
+      "committer_date": "2026-08-25T09:02:22+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "790c0f3a023431071da3b8eedd61436ea315a93e"
+    },
+    {
+      "ref": "refs/remotes/origin/codex/remote-cpu-sandbox-prototype",
+      "sha": "780df1c7cc62bcda0aaf37171644d546c0f49b29",
+      "committer_date": "2026-08-28T22:07:53+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "c0b01d1a4bf34a89d0074bdd4bb6460b6ebf5cc0"
+    },
+    {
+      "ref": "refs/remotes/origin/dependabot/pip/transformers-5.10.1",
+      "sha": "27f6f0e5f248383c1bdd0f40615fb6cc5f647562",
+      "committer_date": "2026-09-02T03:14:42Z",
+      "reachable_commits_since_cutoff": 3,
+      "ancestor_of_main": false,
+      "merge_base_v1": "4544394feecc312ebbfb30f7e0815fe62d034b33"
+    },
+    {
+      "ref": "refs/remotes/origin/design/fill-closed-v6",
+      "sha": "9fa42ea006084d27184f58a70773237e957d1087",
+      "committer_date": "2026-09-01T09:15:50Z",
+      "reachable_commits_since_cutoff": 57,
+      "ancestor_of_main": false,
+      "merge_base_v1": "1424e6d6cb986940e30d36c6effb90d80172c95b"
+    },
+    {
+      "ref": "refs/remotes/origin/design/macro-window-dapo-batch",
+      "sha": "90cf6a1677d86e1a23ddefa61a49d4ac9ab4846e",
+      "committer_date": "2026-08-28T12:10:16Z",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "90cf6a1677d86e1a23ddefa61a49d4ac9ab4846e"
+    },
+    {
+      "ref": "refs/remotes/origin/design/reliquary-v1-reconciliation",
+      "sha": "71672e14ac2bef54e7be2177e9271c7cd2295c8e",
+      "committer_date": "2026-09-01T17:46:21+08:00",
+      "reachable_commits_since_cutoff": 122,
+      "ancestor_of_main": false,
+      "merge_base_v1": "71672e14ac2bef54e7be2177e9271c7cd2295c8e"
+    },
+    {
+      "ref": "refs/remotes/origin/feat/auction-early-close",
+      "sha": "7cef0345ff2d616a7295fc9d1f6df51f20debfb4",
+      "committer_date": "2026-08-26T23:46:26Z",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "7cef0345ff2d616a7295fc9d1f6df51f20debfb4"
+    },
+    {
+      "ref": "refs/remotes/origin/feat/detached-trainer-r2",
+      "sha": "f1c771b9585ba61bfeb9add8affa6c7cd32be220",
+      "committer_date": "2026-08-22T15:54:47Z",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "f1c771b9585ba61bfeb9add8affa6c7cd32be220"
+    },
+    {
+      "ref": "refs/remotes/origin/feat/pipelined-window-collection",
+      "sha": "b2604502576db314472a909de5ffb5e990c90d03",
+      "committer_date": "2026-08-19T20:00:36Z",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "b2604502576db314472a909de5ffb5e990c90d03"
+    },
+    {
+      "ref": "refs/remotes/origin/feat/qwen3-base-dapo-v4-profile",
+      "sha": "a6456b498edbb1a154dfc6c20b4ebdaace3f6db3",
+      "committer_date": "2026-08-18T16:31:58+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "a6456b498edbb1a154dfc6c20b4ebdaace3f6db3"
+    },
+    {
+      "ref": "refs/remotes/origin/fix/code-extract-entry-v6",
+      "sha": "476c50119e8537880fb4c03688641df0001c448d",
+      "committer_date": "2026-08-25T18:39:47Z",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "476c50119e8537880fb4c03688641df0001c448d"
+    },
+    {
+      "ref": "refs/remotes/origin/fix/code-fence-selection",
+      "sha": "59d6519ed200de8011881224ecf653151327d496",
+      "committer_date": "2026-08-26T03:34:32+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "59d6519ed200de8011881224ecf653151327d496"
+    },
+    {
+      "ref": "refs/remotes/origin/fix/grader-cpu-rlimit-lifetime",
+      "sha": "426413d8de1d582611b5cad4d66ddf864583500c",
+      "committer_date": "2026-08-24T22:47:26Z",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "426413d8de1d582611b5cad4d66ddf864583500c"
+    },
+    {
+      "ref": "refs/remotes/origin/fix/hf-bootstrap-checkpoint-title",
+      "sha": "1dd00d49bfcb47ad7e7c4266963e9810476c6723",
+      "committer_date": "2026-08-24T18:05:10Z",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "1dd00d49bfcb47ad7e7c4266963e9810476c6723"
+    },
+    {
+      "ref": "refs/remotes/origin/fix/integration-stubs-train-step-kwargs",
+      "sha": "b3f09e7c7caa49e5596c31a6335885a692b5f130",
+      "committer_date": "2026-08-20T11:15:57Z",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "b3f09e7c7caa49e5596c31a6335885a692b5f130"
+    },
+    {
+      "ref": "refs/remotes/origin/fix/lr-flat-schedule",
+      "sha": "5b0ced28bccb45d7078a13de7541b4ec0ab38bb0",
+      "committer_date": "2026-08-31T11:08:52Z",
+      "reachable_commits_since_cutoff": 2,
+      "ancestor_of_main": false,
+      "merge_base_v1": "84dcc571f41c755fc00a0d9bc1bd3fb5f6e4a7f6"
+    },
+    {
+      "ref": "refs/remotes/origin/fix/precommit-receipt-timing",
+      "sha": "cd42618e8e3d585dabd9546f30f74f9cd3a7586f",
+      "committer_date": "2026-08-26T07:40:29+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "cd42618e8e3d585dabd9546f30f74f9cd3a7586f"
+    },
+    {
+      "ref": "refs/remotes/origin/fix/precommit-reveal-admission",
+      "sha": "53d19a4a2f8d12350884a432c3a412209b52d259",
+      "committer_date": "2026-08-26T07:23:30+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "53d19a4a2f8d12350884a432c3a412209b52d259"
+    },
+    {
+      "ref": "refs/remotes/origin/fix/proof-plane-isolation-review",
+      "sha": "bfc1dfe58db42b41cfc7ea20802aff86176783ff",
+      "committer_date": "2026-08-24T13:40:44Z",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "bfc1dfe58db42b41cfc7ea20802aff86176783ff"
+    },
+    {
+      "ref": "refs/remotes/origin/fix/proof-scheduler-plan-retention",
+      "sha": "5a11067b060c543c0d9401c8b0bc60b87197f4d7",
+      "committer_date": "2026-08-26T13:09:50Z",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "5a11067b060c543c0d9401c8b0bc60b87197f4d7"
+    },
+    {
+      "ref": "refs/remotes/origin/fix/proof-scheduler-rank-gap",
+      "sha": "9b626319a6b6dd0884104ee8520e31b40b2c23e7",
+      "committer_date": "2026-08-27T05:06:13+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": false,
+      "merge_base_v1": "86e436036a846768662c7a1ab1757013089dd8b6"
+    },
+    {
+      "ref": "refs/remotes/origin/fix/proof-scheduler-retire-plans",
+      "sha": "b2981a6aa0513b8fed457d6479c93bbb0abcbb4e",
+      "committer_date": "2026-08-26T13:59:43Z",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "b2981a6aa0513b8fed457d6479c93bbb0abcbb4e"
+    },
+    {
+      "ref": "refs/remotes/origin/fix/short-completion-logprob-full-coverage",
+      "sha": "eaa1510906fdb6d43b1c5e8bb151321ccea635eb",
+      "committer_date": "2026-08-21T12:10:41Z",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "eaa1510906fdb6d43b1c5e8bb151321ccea635eb"
+    },
+    {
+      "ref": "refs/remotes/origin/fix/submission-ingress-races",
+      "sha": "2b90f40029afe34328705b4daae50aaa6154c5a8",
+      "committer_date": "2026-08-26T08:35:18+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "2b90f40029afe34328705b4daae50aaa6154c5a8"
+    },
+    {
+      "ref": "refs/remotes/origin/fix/train-step-fake-signature",
+      "sha": "9502d5eb08a2fa6b1b53df643f191565375ab4a1",
+      "committer_date": "2026-08-11T14:36:15Z",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "9502d5eb08a2fa6b1b53df643f191565375ab4a1"
+    },
+    {
+      "ref": "refs/remotes/origin/fix/v5-seed-auth-false-positive",
+      "sha": "4114ed1f60a015a54d9d3875c7d3189dca8a6ccc",
+      "committer_date": "2026-09-04T13:39:57+08:00",
+      "reachable_commits_since_cutoff": 3,
+      "ancestor_of_main": false,
+      "merge_base_v1": "4544394feecc312ebbfb30f7e0815fe62d034b33"
+    },
+    {
+      "ref": "refs/remotes/origin/main",
+      "sha": "4544394feecc312ebbfb30f7e0815fe62d034b33",
+      "committer_date": "2026-08-31T13:10:16+01:00",
+      "reachable_commits_since_cutoff": 2,
+      "ancestor_of_main": true,
+      "merge_base_v1": "4544394feecc312ebbfb30f7e0815fe62d034b33"
+    },
+    {
+      "ref": "refs/remotes/origin/perf/collection-window-100s",
+      "sha": "d3ff6ff8894177445b2976da4ed236f75eabbdc4",
+      "committer_date": "2026-08-19T00:25:17Z",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "d3ff6ff8894177445b2976da4ed236f75eabbdc4"
+    },
+    {
+      "ref": "refs/remotes/origin/perf/parallel-proof-plane",
+      "sha": "b9e430dbd5f624840e4a38d0ce66584e02c3fe22",
+      "committer_date": "2026-08-26T14:38:47Z",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "b9e430dbd5f624840e4a38d0ce66584e02c3fe22"
+    },
+    {
+      "ref": "refs/remotes/origin/perf/proof-plane-process-isolation",
+      "sha": "df2bff50d754f323b48e9275107ad8ca520f170b",
+      "committer_date": "2026-08-23T22:27:34Z",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "df2bff50d754f323b48e9275107ad8ca520f170b"
+    },
+    {
+      "ref": "refs/remotes/origin/perf/unpad-sync-cache",
+      "sha": "152a372e17df256cfbea283088843bc594914328",
+      "committer_date": "2026-08-20T10:46:22Z",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "152a372e17df256cfbea283088843bc594914328"
+    },
+    {
+      "ref": "refs/remotes/origin/perf/verifier-fused-lm-head",
+      "sha": "b64550801c29000caa49935aab3a9d11cc6428a5",
+      "committer_date": "2026-08-11T14:54:21Z",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "b64550801c29000caa49935aab3a9d11cc6428a5"
+    },
+    {
+      "ref": "refs/remotes/origin/reliquary-environment-suite-v1",
+      "sha": "656c86227b7cd5a96676c3e88e31412ababf464c",
+      "committer_date": "2026-09-03T20:10:09Z",
+      "reachable_commits_since_cutoff": 19,
+      "ancestor_of_main": false,
+      "merge_base_v1": "c0b01d1a4bf34a89d0074bdd4bb6460b6ebf5cc0"
+    },
+    {
+      "ref": "refs/remotes/origin/standalone-environment-integration-v2",
+      "sha": "a76bca595f45d73c71dade086af55dc274f7526b",
+      "committer_date": "2026-09-04T12:18:52+08:00",
+      "reachable_commits_since_cutoff": 21,
+      "ancestor_of_main": false,
+      "merge_base_v1": "c0b01d1a4bf34a89d0074bdd4bb6460b6ebf5cc0"
+    },
+    {
+      "ref": "refs/remotes/origin/test/proof-isolation-equivalence",
+      "sha": "ac98b076c65b6e57de06613a9b2762d1e4951e04",
+      "committer_date": "2026-08-24T13:53:20Z",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "ac98b076c65b6e57de06613a9b2762d1e4951e04"
+    },
+    {
+      "ref": "refs/remotes/origin/v5-reasoning-prompt",
+      "sha": "8d33cb3955ee2f4673209efb1e7da31fd9cf0914",
+      "committer_date": "2026-08-23T12:29:52+08:00",
+      "reachable_commits_since_cutoff": 0,
+      "ancestor_of_main": true,
+      "merge_base_v1": "8d33cb3955ee2f4673209efb1e7da31fd9cf0914"
+    }
+  ]
+}
