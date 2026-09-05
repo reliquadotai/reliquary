@@ -117,6 +117,7 @@ def test_service_builds_one_shared_fill_state_and_injects_every_batcher(
     svc.env_mix = [
         ("openmathinstruct", B_BATCH), ("opencodeinstruct", B_BATCH),
     ]
+    svc.env_targets = dict(svc.env_mix)
     svc.env = math_env
     svc._cooldown_per_env = {
         name: CooldownMap(cooldown_windows=1_000_000) for name in svc.envs
@@ -154,6 +155,7 @@ def _build_two_env_fill_closed_service(monkeypatch, *, enabled: bool):
     svc.env_mix = [
         ("openmathinstruct", B_BATCH), ("opencodeinstruct", B_BATCH),
     ]
+    svc.env_targets = dict(svc.env_mix)
     svc.env = math_env
     svc._cooldown_per_env = {
         name: CooldownMap(cooldown_windows=1_000_000) for name in svc.envs

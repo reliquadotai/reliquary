@@ -98,6 +98,7 @@ def _setup(*,
     batcher.window_start = 500
     batcher.current_checkpoint_hash = current_checkpoint_hash
     batcher.cooldown_prompts_snapshot = cooldown_prompts or []
+    batcher.cooldown_prompts_membership = frozenset(batcher.cooldown_prompts_snapshot)
     batcher.env = MagicMock()
     batcher.env.__len__.return_value = env_len
     batcher.is_sealed.return_value = False

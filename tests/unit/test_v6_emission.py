@@ -113,6 +113,7 @@ def test_auction_telemetry_names_who_actually_paid(monkeypatch):
 
     def _finalize():
         stub = SimpleNamespace(
+            batch_target=1,
             _valid=[SimpleNamespace(
                 hotkey="hk", prompt_idx=1, prompt_content_sha256="c" * 64,
             )],
