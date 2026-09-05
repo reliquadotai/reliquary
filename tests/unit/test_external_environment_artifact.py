@@ -8,7 +8,6 @@ import sys
 
 import pytest
 
-from reliquary.environment.agentic.external import verify_external_artifact
 from reliquary.environment.agentic.runner import EpisodeRunner, ScriptedPolicy
 from reliquary.environment.agentic.types import AssistantAction, canonical_json
 from reliquary.environment.registry import EnvironmentSpec, _build_catalog
@@ -138,9 +137,19 @@ def test_external_wheel_adapter_verifies_then_replays_and_fails_on_drift(
     monkeypatch.syspath_prepend(str(tmp_path))
     monkeypatch.delitem(sys.modules, "fake_external_env", raising=False)
     importlib.invalidate_caches()
-    verify_external_artifact.cache_clear()
 
+    # An earlier sys.path package must never execute, even before rejection.
+    shadow = tmp_path / "shadow"
+    (shadow / "fake_external_env").mkdir(parents=True)
+    sentinel = tmp_path / "unverified-executed"
+    (shadow / "fake_external_env" / "__init__.py").write_text(
+        f"from pathlib import Path; Path({str(sentinel)!r}).touch()"
+    )
+    monkeypatch.syspath_prepend(str(shadow))
     env = spec.create()
+    assert not sentinel.exists()
+    # Repeat loading does not re-execute code but revalidates all pinned bytes.
+    assert spec.create().name == spec.name
     task = env.get_task(0)
     trace = EpisodeRunner().run(
         env,
@@ -155,10 +164,41 @@ def test_external_wheel_adapter_verifies_then_replays_and_fails_on_drift(
     )
     assert trace.reward is not None and trace.reward.reward == 1.0
 
-    verify_external_artifact.cache_clear()
     with pytest.raises(ValueError, match="artifact digest mismatch"):
         replace(spec, environment_manifest_sha256="0" * 64).create()
+    from types import ModuleType
+    original = sys.modules["fake_external_env"]
+    spoofed = ModuleType("fake_external_env")
+    spoofed.__file__ = str(implementation)
+    monkeypatch.setitem(sys.modules, "fake_external_env", spoofed)
+    with pytest.raises(ValueError, match="imported without verification"):
+        spec.create()
+    monkeypatch.setitem(sys.modules, "fake_external_env", original)
     implementation.write_text(_PACKAGE + "\n# drift\n", encoding="utf-8")
-    verify_external_artifact.cache_clear()
     with pytest.raises(ValueError, match="file digest mismatch"):
         spec.create()
+
+
+def test_wheel_download_rejects_wrong_bytes_without_clobbering_files(tmp_path, monkeypatch):
+    from scripts import qualify_external_environment as qualification
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, size):
+            yield b"untrusted wheel"
+
+    monkeypatch.setattr(qualification.requests, "get", lambda *args, **kw: Response())
+    preserved = tmp_path / (qualification.WHEEL_NAME + ".partial")
+    preserved.write_bytes(b"user file")
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        qualification.download_pinned_wheel(tmp_path)
+    assert list(tmp_path.iterdir()) == [preserved]
+    assert preserved.read_bytes() == b"user file"

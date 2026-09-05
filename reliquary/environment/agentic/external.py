@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from functools import cache
 import hashlib
 import importlib
 import importlib.metadata
+import importlib.abc
+import importlib.util
+import sys
+import threading
 import json
 from pathlib import Path, PurePosixPath
 from typing import Any, TYPE_CHECKING
@@ -90,7 +93,6 @@ def _load_json_object(path: Path) -> dict[str, Any]:
     return value
 
 
-@cache
 def verify_external_artifact(spec: EnvironmentSpec) -> Mapping[str, Any]:
     """Verify one installed distribution before any of its code is imported."""
 
@@ -434,25 +436,72 @@ class ExternalEpisodeEnvironment:
         self._backend.close(state)
 
 
+_IMPORT_LOCK = threading.RLock()
+_VERIFIED_MODULES: dict[str, tuple[str, Any]] = {}
+
+
+class _ArtifactSourceLoader(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    """Execute only a snapshot of hash-bound source, never sys.path or pyc code."""
+
+    def __init__(self, package: str, sources: dict, digest: str) -> None:
+        self.package, self.sources, self.digest = package, sources, digest
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != self.package and not fullname.startswith(self.package + "."):
+            return None
+        if fullname not in self.sources:
+            raise ImportError(f"external module is not artifact-bound: {fullname}")
+        filename, _, package = self.sources[fullname]
+        return importlib.util.spec_from_file_location(
+            fullname, filename, loader=self,
+            submodule_search_locations=[str(Path(filename).parent)] if package else None,
+        )
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        filename, source, _ = self.sources[module.__name__]
+        exec(compile(source, filename, "exec", dont_inherit=True), module.__dict__)
+        _VERIFIED_MODULES[module.__name__] = (self.digest, module)
+
+
 def load_external_episode_environment(
     spec: EnvironmentSpec,
 ) -> ExternalEpisodeEnvironment:
-    artifact = verify_external_artifact(spec)
-    entrypoint = artifact["entrypoints"]["replay"]
-    module_name, _, attribute_name = entrypoint.partition(":")
-    module = importlib.import_module(module_name)
-    origin = getattr(module, "__file__", None)
-    distribution = importlib.metadata.distribution(spec.external_distribution or "")
-    bound_origins = {
-        Path(distribution.locate_file(relative)).resolve()
-        for relative in artifact["files"]
-    }
-    if not isinstance(origin, str) or Path(origin).resolve() not in bound_origins:
-        raise ValueError("external replay module did not load from the pinned artifact")
-    backend_type = getattr(module, attribute_name, None)
-    if not callable(backend_type):
-        raise TypeError(f"external replay entrypoint is not callable: {entrypoint}")
-    return ExternalEpisodeEnvironment(backend_type(), spec)
+    with _IMPORT_LOCK:
+        artifact = verify_external_artifact(spec)
+        distribution = importlib.metadata.distribution(spec.external_distribution or "")
+        package = PurePosixPath(spec.external_artifact_resource or "").parts[0]
+        sources = {}
+        for relative, digest in artifact["files"].items():
+            if not relative.endswith(".py"):
+                continue
+            path = Path(distribution.locate_file(relative)).resolve()
+            source = path.read_bytes()
+            if _sha256(source) != digest:
+                raise ValueError(f"external artifact file digest mismatch: {relative}")
+            is_package = relative.endswith("/__init__.py")
+            module_name = relative[:-12] if is_package else relative[:-3]
+            sources[module_name.replace("/", ".")] = (str(path), source, is_package)
+        # Already imported modules must originate from this verified source
+        # loader. A matching __file__ alone is forgeable and does not bind code.
+        for name, module in tuple(sys.modules.items()):
+            if name == package or name.startswith(package + "."):
+                if _VERIFIED_MODULES.get(name) != (spec.environment_manifest_sha256, module):
+                    raise ValueError(f"external module was imported without verification: {name}")
+        loader = _ArtifactSourceLoader(package, sources, spec.environment_manifest_sha256)
+        entrypoint = artifact["entrypoints"]["replay"]
+        module_name, _, attribute_name = entrypoint.partition(":")
+        sys.meta_path.insert(0, loader)
+        try:
+            module = importlib.import_module(module_name)
+        finally:
+            sys.meta_path.remove(loader)
+        backend_type = getattr(module, attribute_name, None)
+        if not callable(backend_type):
+            raise TypeError(f"external replay entrypoint is not callable: {entrypoint}")
+        return ExternalEpisodeEnvironment(backend_type(), spec)
 
 
 __all__ = [
