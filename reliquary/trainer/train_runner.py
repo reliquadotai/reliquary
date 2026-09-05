@@ -42,11 +42,14 @@ class TrainRunner:
         self.model = model
         self.ref_model = ref_model
         self.env_order = list(env_order)
-        self._train_step = train_step_fn
-        self._assess = assess_fn
-        self._base_targets = {
+        self.env_targets = {
             str(name): int(target) for name, target in env_targets.items()
         }
+        if set(self.env_targets) != set(self.env_order):
+            raise ValueError("trainer environment targets must match env_order")
+        self._train_step = train_step_fn
+        self._assess = assess_fn
+        self._base_targets = self.env_targets
         self._accumulator = BalancedTrainingAccumulator(self._base_targets)
         self._aggregate_epoch_key: tuple | None = None
         self._aggregate_next_offset = 0
@@ -218,6 +221,11 @@ class TrainRunner:
 
     def step(self, decoded: Any) -> bool:
         """Feed one journal lane; return True only when an optimizer step ran."""
+        payload_targets = dict(getattr(decoded, "env_targets", {}) or {})
+        if payload_targets and payload_targets != self._base_targets:
+            raise ValueError("training payload environment targets do not match trainer")
+        if list(getattr(decoded, "env_order", self.env_order)) != self.env_order:
+            raise ValueError("training payload environment order does not match trainer")
         binding = getattr(decoded, "checkpoint_epoch", None)
         if binding is not None and binding.training_mode == "aggregate_one_step":
             return self._step_aggregate_epoch(decoded)

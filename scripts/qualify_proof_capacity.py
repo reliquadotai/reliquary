@@ -52,7 +52,7 @@ from reliquary.validator.proof_capacity import (  # noqa: E402
 )
 
 
-ENVIRONMENTS = ("openmathinstruct", "opencodeinstruct")
+ENVIRONMENTS = tuple(MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV)
 ROLLOUTS_PER_PROOF = M_ROLLOUTS
 MINIMUM_CAP_FRACTION = 0.9
 MINIMUM_SAMPLES_PER_DEVICE_PER_ENVIRONMENT = 20

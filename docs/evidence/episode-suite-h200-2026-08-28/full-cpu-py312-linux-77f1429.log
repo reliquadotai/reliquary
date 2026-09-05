@@ -1,0 +1,50 @@
+........................................................................ [  3%]
+........................................................................ [  6%]
+........................................................................ [  9%]
+........................................................................ [ 13%]
+........................................................................ [ 16%]
+........................................................................ [ 19%]
+........................................................................ [ 23%]
+........................................................................ [ 26%]
+........................................................................ [ 29%]
+........................................................................ [ 33%]
+........................................................................ [ 36%]
+........................................................................ [ 39%]
+........................................................................ [ 43%]
+........................................................................ [ 46%]
+........................................................................ [ 49%]
+........................................................................ [ 53%]
+........................................................................ [ 56%]
+........................................................................ [ 59%]
+........................................................................ [ 62%]
+........................................................................ [ 66%]
+........................................................................ [ 69%]
+........................................................................ [ 72%]
+........................................................................ [ 76%]
+........................................................................ [ 79%]
+........................................................................ [ 82%]
+........................................................................ [ 86%]
+........................................................................ [ 89%]
+........................................................................ [ 92%]
+........................................................................ [ 96%]
+........................................................................ [ 99%]
+............                                                             [100%]
+=============================== warnings summary ===============================
+.venv/lib/python3.12/site-packages/fastapi/testclient.py:1
+  /home/ubuntu/reliquary-env-suite-f55fadb/.venv/lib/python3.12/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+tests/unit/test_lr_restart_reconstruction.py::test_restored_position_reported_exactly
+tests/unit/test_lr_restart_reconstruction.py::test_restart_runs_exactly_r_windows_below_full_lr
+tests/unit/test_lr_restart_reconstruction.py::test_after_ramp_exact_equality_with_unrestarted_run
+tests/unit/test_lr_restart_reconstruction.py::test_first_window_uses_ramped_restored_position
+tests/unit/test_lr_restart_reconstruction.py::test_hint_consumed_only_at_first_init
+  /home/ubuntu/reliquary-env-suite-f55fadb/.venv/lib/python3.12/site-packages/torch/optim/lr_scheduler.py:182: UserWarning: Detected call of `lr_scheduler.step()` before `optimizer.step()`. In PyTorch 1.1.0 and later, you should call them in the opposite order: `optimizer.step()` before `lr_scheduler.step()`.  Failure to do this will result in PyTorch skipping the first value of the learning rate schedule. See more details at https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate
+    warnings.warn(
+
+tests/unit/test_training_rollout_loss.py::test_rollout_loss_zero_advantage_gives_zero_ppo_loss
+  /home/ubuntu/reliquary-env-suite-f55fadb/.venv/lib/python3.12/site-packages/transformers/models/gpt2/tokenization_gpt2.py:110: DeprecationWarning: Deprecated in 0.9.0: BPE.__init__ will not create from files anymore, try `BPE.from_file` instead
+    BPE(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+2172 passed, 7 warnings in 139.77s (0:02:19)

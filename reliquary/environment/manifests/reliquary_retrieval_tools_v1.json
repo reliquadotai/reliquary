@@ -1,0 +1,37 @@
+{
+  "schema": "reliquary/environment-source/v1",
+  "environment": "reliquary_retrieval_tools_v1",
+  "contract": "reliquary/episode/v1",
+  "generator": "reliquary-retrieval-tools-generator-v1",
+  "renderer": "reliquary-jsonl-tools-v1",
+  "reward": "deterministic-binary-outcome-v1",
+  "reward_diagnostics": "weighted-answer-evidence-checks-v1",
+  "proof": "grail-v8-assistant-policy-spans",
+  "task_families": [
+    "single_evidence",
+    "multi_hop_alias",
+    "revision_resolution"
+  ],
+  "episode_schema": "reliquary/environment/schemas/episode-v1.schema.json",
+  "episode_schema_sha256": "a9bf6d2a8704440a835f4882b3c9fb37e1e19701cc3c27f4ca017e7ce40ea39a",
+  "golden_fixture": "reliquary/environment/manifests/goldens/reliquary_retrieval_tools_v1.jsonl",
+  "golden_fixture_sha256": "e42556bb1dd66e184a1e49bba4862a7a91b8c81d981972b491db700baf531a57",
+  "implementation_digest_algorithm": "sha256-path-nul-file-sha256-newline-v1",
+  "implementation_files": [
+    "reliquary/environment/agentic/__init__.py",
+    "reliquary/environment/agentic/base.py",
+    "reliquary/environment/agentic/compat.py",
+    "reliquary/environment/agentic/envs/retrieval_tools_v1/__init__.py",
+    "reliquary/environment/agentic/envs/retrieval_tools_v1/environment.py",
+    "reliquary/environment/agentic/renderer.py",
+    "reliquary/environment/agentic/replay.py",
+    "reliquary/environment/agentic/runner.py",
+    "reliquary/environment/agentic/suite.py",
+    "reliquary/environment/agentic/types.py"
+  ],
+  "implementation_sha256": "cce2e89999e1c9ae79d206f6d6fbec49661897e4d2c18559269376cc09a62bd1",
+  "source": "Reliquary-authored procedural frozen document collections",
+  "external_data": false,
+  "network_required": false,
+  "license": "MIT"
+}

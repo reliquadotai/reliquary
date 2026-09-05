@@ -36,7 +36,6 @@ from reliquary.constants import (
     MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW,
     MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW,
     MIN_EOS_PROBABILITY,
-    MATH_ANSWER_FORMAT,
     FILL_CLOSED_ENABLED,
     FILL_CLOSED_MAX_SECONDS,
     FORENSIC_SAMPLE_PER_WINDOW,
@@ -79,6 +78,7 @@ from reliquary.constants import (
 from reliquary.environment.base import Environment
 from reliquary.environment.grader_client import GraderInfrastructureError
 from reliquary.environment.opencodeinstruct import _entry_function_name
+from reliquary.environment.registry import get_environment_spec
 from reliquary.shared.prompt_range import window_prompt_range
 from reliquary.protocol.legacy_merkle import legacy_submission_merkle_matches
 from reliquary.protocol.submission import (
@@ -168,6 +168,7 @@ from reliquary.validator.verifier import (
     is_in_zone,
     is_cap_truncation,
     is_natural_bft_cap_candidate,
+    policy_token_positions,
     rewards_std,
     validate_force_span,
     verify_logprobs_claim,
@@ -354,7 +355,34 @@ def _enrich_code_semantic_counterfactuals(
 
 
 def _uses_validator_authoritative_reward(env: Any) -> bool:
-    return bool(getattr(env, "validator_authoritative_reward", False))
+    try:
+        return get_environment_spec(
+            str(getattr(env, "name", ""))
+        ).validator_authoritative_reward
+    except ValueError:
+        # Test and embedding environments may intentionally be local-only.
+        return bool(getattr(env, "validator_authoritative_reward", False))
+
+
+def _environment_policy(env: Any, field: str, default: Any = None) -> Any:
+    """Resolve registered policy while retaining local test-env embedding."""
+
+    try:
+        return getattr(
+            get_environment_spec(str(getattr(env, "name", ""))),
+            field,
+        )
+    except (AttributeError, ValueError):
+        return getattr(env, field, default)
+
+
+def _render_environment_prompt(env: Any, tokenizer: Any, prompt_idx: int) -> str:
+    if _environment_policy(env, "interaction_mode", "single_turn") == "episode":
+        from reliquary.environment.agentic.compat import rendered_episode_prompt
+
+        return rendered_episode_prompt(env, prompt_idx)
+    problem = env.get_problem(prompt_idx)
+    return render_canonical_prompt(tokenizer, str(problem["prompt"]))
 
 
 def _reward_matches_claim(actual: float, claimed: float, *, tolerance: float = 1e-6) -> bool:
@@ -404,6 +432,7 @@ def _verify_short_logprob_claim(
     prompt_length: int,
     completion_length: int,
     claimed_logprobs,
+    policy_positions: list[int] | None = None,
 ):
     """Full-coverage logprob-claim check for completions shorter than
     CHALLENGE_K, where the sampled-challenge check cannot run (it returns a
@@ -438,15 +467,19 @@ def _verify_short_logprob_claim(
         return None, None
     claimed = list(claimed_logprobs or [])
     if len(claimed) == len(tokens):
-        offset = prompt_length
+        claimed_values = (
+            [claimed[position] for position in policy_positions]
+            if policy_positions is not None
+            else claimed[prompt_length:prompt_length + completion_length]
+        )
     elif len(claimed) == completion_length:
-        offset = 0
+        claimed_values = claimed
     else:
         return False, float("inf")
     devs = []
     for j in range(completion_length):
         try:
-            miner_lp = float(claimed[offset + j])
+            miner_lp = float(claimed_values[j])
         except (TypeError, ValueError, IndexError):
             return False, float("inf")
         if not math.isfinite(miner_lp):
@@ -777,6 +810,10 @@ class PendingSubmission:
     selection_digest: bytes
     prompt_content_sha256: str = ""
     target_content_sha256: str = ""
+    task_family: str | None = None
+    generator_version: str | None = None
+    operation_id: str | None = None
+    difficulty: int | None = None
     arrived_at: float = 0.0
     # Wall clock of the CHEAP admission decision. The pre-generation forensic
     # metric is arrival_ts - (decision_ts - response_time), so it must be the
@@ -825,6 +862,10 @@ class ValidSubmission:
     completion_texts: list[str] = field(default_factory=list)
     prompt_content_sha256: str = ""
     target_content_sha256: str = ""
+    task_family: str | None = None
+    generator_version: str | None = None
+    operation_id: str | None = None
+    difficulty: int | None = None
     arrived_at: float = 0.0
     # Filter telemetry (worst-case across this submission's rollouts).
     # Captured for post-hoc threshold calibration without re-running tests.
@@ -1096,11 +1137,15 @@ class GrpoWindowBatcher:
         max_productive_candidates: int | None = None,
         max_grading_starts: int | None = None,
         max_ranked_proof_attempts: int | None = None,
+        batch_target: int = B_BATCH,
     ) -> None:
         from reliquary.constants import DRAND_ROUND_BACKWARD_TOLERANCE
 
         self.window_start = window_start
         self.env = env
+        self.batch_target = int(batch_target)
+        if self.batch_target <= 0:
+            raise ValueError("batch_target must be positive")
         self.difficulty_auction_enabled = bool(
             DIFFICULTY_AUCTION_ENFORCE
             and getattr(env, "name", "") in DIFFICULTY_AUCTION_ENVIRONMENTS
@@ -3719,17 +3764,34 @@ class GrpoWindowBatcher:
         from reliquary.validator.admission import AdmissionProblemMaterials
 
         problem = self.env.get_problem(prompt_idx)
-        rendered_prompt = render_canonical_prompt(
-            self.tokenizer, str(problem["prompt"])
+        rendered_prompt = _render_environment_prompt(
+            self.env, self.tokenizer, prompt_idx
         )
         code_cases = None
-        cases_loader = getattr(self.env, "admission_reward_cases", None)
+        reward_materials = None
+        try:
+            from reliquary.environment.registry import get_environment_spec
+
+            spec = get_environment_spec(getattr(self.env, "name", ""))
+        except ValueError:
+            spec = None
+        materializer_name = (
+            spec.reward_materializer_method if spec is not None else None
+        )
+        cases_loader = (
+            getattr(self.env, materializer_name, None)
+            if materializer_name
+            else None
+        )
         if callable(cases_loader):
-            code_cases = list(cases_loader(problem))
+            reward_materials = cases_loader(problem)
+            if getattr(self.env, "name", "") == "opencodeinstruct":
+                code_cases = list(reward_materials)
         return AdmissionProblemMaterials(
             problem=dict(problem),
             rendered_prompt=rendered_prompt,
             code_cases=code_cases,
+            reward_materials=reward_materials,
         )
 
     def reserve_prepared_identity(
@@ -3880,6 +3942,10 @@ class GrpoWindowBatcher:
             or compute_rollouts_selection_digest(request.rollouts),
             prompt_content_sha256=prepared.prompt_content_sha256,
             target_content_sha256=prepared.target_content_sha256,
+            task_family=getattr(prepared, "task_family", None),
+            generator_version=getattr(prepared, "generator_version", None),
+            operation_id=getattr(prepared, "operation_id", None),
+            difficulty=getattr(prepared, "difficulty", None),
             arrived_at=self._time_fn(),
             decision_ts=self._wall_clock(),
             telemetry=telemetry,
@@ -4127,6 +4193,11 @@ class GrpoWindowBatcher:
             if list(rollout.tokens) != list(rollout.commit["tokens"]):
                 return reject(RejectReason.TOKENS_MISMATCH, "token_invariant")
 
+        from reliquary.validator.admission import submission_interaction_matches
+
+        if not submission_interaction_matches(request, getattr(self.env, "name", "")):
+            return reject(RejectReason.BAD_SCHEMA, "environment_interaction")
+
         # Defense in depth for direct batcher callers. The HTTP path computes
         # this before quota/proof admission and marks the private request attr;
         # no wire field or miner behavior changes.
@@ -4284,10 +4355,9 @@ class GrpoWindowBatcher:
                 for index, text in enumerate(completion_texts)
                 if is_missing_final_answer_box(text)
             )
-            if (
-                getattr(self.env, "name", "") == "openmathinstruct"
-                and MATH_ANSWER_FORMAT == "boxed"
-            )
+            if _environment_policy(
+                self.env, "final_answer_policy"
+            ) == "boxed"
             else ()
         )
         robust_utility = None
@@ -4327,24 +4397,27 @@ class GrpoWindowBatcher:
         # negative used to manufacture k=4 / sigma=0.5 and pass the zone filter.
         # Aligned with the env (which scores the last box); a well-formed wrong
         # answer is a legitimate negative and is not flagged. Before GRAIL.
-        for _ri, _text in enumerate(completion_texts):
-            _rmeta = request.rollouts[_ri].commit.get("rollout", {}) or {}
-            _clen = int(_rmeta.get("completion_length", 0))
-            _bad, _bad_reason = has_malformed_final_answer(
-                rewards[_ri], _text,
-                completion_length=_clen,
-                cap=max_new_tokens_for_environment(
-                    str(getattr(self.env, "name", ""))
-                ),
-            )
-            if _bad:
-                logger.info(
-                    "reject reason=malformed_final_answer hotkey=%s rollout=%d cond=%s",
-                    request.miner_hotkey, _ri, _bad_reason,
+        if _environment_policy(self.env, "final_answer_policy") == "boxed":
+            for _ri, _text in enumerate(completion_texts):
+                _rmeta = request.rollouts[_ri].commit.get("rollout", {}) or {}
+                _clen = int(_rmeta.get("completion_length", 0))
+                _bad, _bad_reason = has_malformed_final_answer(
+                    rewards[_ri], _text,
+                    completion_length=_clen,
+                    cap=max_new_tokens_for_environment(
+                        str(getattr(self.env, "name", ""))
+                    ),
                 )
-                return reject(
-                    RejectReason.MALFORMED_FINAL_ANSWER, "malformed_final_answer"
-                )
+                if _bad:
+                    logger.info(
+                        "reject reason=malformed_final_answer "
+                        "hotkey=%s rollout=%d cond=%s",
+                        request.miner_hotkey, _ri, _bad_reason,
+                    )
+                    return reject(
+                        RejectReason.MALFORMED_FINAL_ANSWER,
+                        "malformed_final_answer",
+                    )
 
         clone_metrics = detect_opposite_reward_clones(completion_texts, rewards)
         if clone_metrics.suspicious:
@@ -4369,10 +4442,10 @@ class GrpoWindowBatcher:
             _ingest_meta = rollout.commit.get("rollout")
             if isinstance(_ingest_meta, dict):
                 _ingest_meta["truncated"] = False
-                # BFT is math-only: `forced` is validator-honoured solely for
-                # openmathinstruct. Wipe any non-math value so the carve-out
-                # stays scoped to math.
-                if getattr(self.env, "name", "") != "openmathinstruct":
+                # The registry explicitly scopes the BFT force-span carve-out.
+                if _environment_policy(
+                    self.env, "termination_policy", "eos_or_cap"
+                ) != "math_bft":
                     _ingest_meta["forced"] = False
             if not self._verify_signature(rollout.commit, request.miner_hotkey):
                 return reject(RejectReason.BAD_SIGNATURE, "rollout_signature")
@@ -4408,12 +4481,28 @@ class GrpoWindowBatcher:
             eos_tokens=self._count_eos_completion_tokens(request),
             prompt_content_sha256=prompt_content_sha256(
                 str(getattr(self.env, "name", "")),
-                render_canonical_prompt(
-                    self.tokenizer, str(problem["prompt"])
+                _render_environment_prompt(
+                    self.env, self.tokenizer, request.prompt_idx
                 ),
             ),
             target_content_sha256=target_content_sha256(
                 str(getattr(self.env, "name", "")), problem
+            ),
+            task_family=(
+                str(problem.get("task_family"))
+                if problem.get("task_family") is not None else None
+            ),
+            generator_version=(
+                str(problem.get("generator_version"))
+                if problem.get("generator_version") is not None else None
+            ),
+            operation_id=(
+                str(problem.get("operation_id"))
+                if problem.get("operation_id") is not None else None
+            ),
+            difficulty=(
+                int(problem["difficulty"])
+                if problem.get("difficulty") is not None else None
             ),
             arrived_at=self._time_fn(),
             decision_ts=self._wall_clock(),
@@ -4437,7 +4526,10 @@ class GrpoWindowBatcher:
             self.valid_count = len(self._valid)
 
             distinct_eligible = self.distinct_valid_prompt_count()
-            if distinct_eligible >= B_BATCH and self._seal_trigger_round is None:
+            if (
+                distinct_eligible >= self.batch_target
+                and self._seal_trigger_round is None
+            ):
                 self._seal_trigger_round = request.drand_round
                 proven.seal_trigger_round = self._seal_trigger_round
                 if telemetry is not None:
@@ -4449,7 +4541,7 @@ class GrpoWindowBatcher:
                         "seal_triggered",
                         telemetry,
                         distinct_eligible=distinct_eligible,
-                        batch_size=B_BATCH,
+                        batch_size=self.batch_target,
                         seal_trigger_round=self._seal_trigger_round,
                     )
                 if self._loop is not None:
@@ -4728,11 +4820,24 @@ class GrpoWindowBatcher:
             # ``completion_len`` computed later at the sparse-outputs section)
             # so the u-stream can accompany the verify call below.
             _seed_meta = rollout.commit.get("rollout") or {}
-            _seed_completion_len = int(_seed_meta.get("completion_length", 0))
+            _is_episode = isinstance(_seed_meta.get("episode"), dict)
             _seed_prompt_len = int(_seed_meta.get("prompt_length", 0))
             _seed_tokens = rollout.commit.get("tokens") or []
-            _seed_completion_tokens = _seed_tokens[
-                _seed_prompt_len:_seed_prompt_len + _seed_completion_len
+            _policy_positions = policy_token_positions(
+                list(_seed_tokens), _seed_meta
+            )
+            _seed_completion_len = len(_policy_positions)
+            if _is_episode:
+                trusted_spans = getattr(
+                    rollout, "_validated_assistant_spans", None
+                )
+                if trusted_spans is None:
+                    return reject(
+                        RejectReason.REWARD_MISMATCH,
+                        "episode_replay_binding",
+                    )
+            _seed_completion_tokens = [
+                _seed_tokens[position] for position in _policy_positions
             ]
             rollout_token_metrics = token_degeneracy_metrics(
                 _seed_completion_tokens
@@ -4879,7 +4984,7 @@ class GrpoWindowBatcher:
             # Reads precomputed p_stop on ``proof`` — no logits round-trip.
             # Skipped when the stub didn't populate sparse outputs (legacy
             # test fixtures that opted out of behavioural enforcement).
-            if proof.has_sparse_outputs:
+            if proof.has_sparse_outputs and not _is_episode:
                 if has_eos_padding(
                     rollout.commit,
                     self.tokenizer,
@@ -5004,26 +5109,32 @@ class GrpoWindowBatcher:
 
             rollout_dict = rollout.commit.get("rollout", {}) or {}
             prompt_len = int(rollout_dict.get("prompt_length", 0))
-            completion_len = int(rollout_dict.get("completion_length", 0))
+            policy_positions = policy_token_positions(
+                list(rollout.commit["tokens"]), rollout_dict
+            )
+            completion_len = len(policy_positions)
             claimed_lp = rollout_dict.get("token_logprobs", []) or []
 
             # BFT carve-out: validate a forced rollout's FORCE span (byte-exact,
             # atomic-</think>-anchored, at the thinking budget); a valid span's
             # positions are exempted from the per-token auth / distribution
             # checks (their probability is legitimately ~0 — injected, not sampled).
-            carve_ok, exempt_positions = validate_force_span(
-                rollout.commit["tokens"], rollout_dict,
-                canonical_force_ids, prompt_len,
-                thinking_budget=BFT_THINKING_BUDGET,
-                think_close_ids=force_think_close_ids,
-            )
+            if _is_episode:
+                carve_ok, exempt_positions = True, set()
+            else:
+                carve_ok, exempt_positions = validate_force_span(
+                    rollout.commit["tokens"], rollout_dict,
+                    canonical_force_ids, prompt_len,
+                    thinking_budget=BFT_THINKING_BUDGET,
+                    think_close_ids=force_think_close_ids,
+                )
             if not carve_ok:
                 return reject(
                     RejectReason.TOKEN_TAMPERED,
                     "force_span",
                     sketch_diff_max=sketch_diff_max,
                 )
-            if rollout_dict.get("forced"):
+            if rollout_dict.get("forced") and not _is_episode:
                 declared_span = rollout_dict.get("force_span")
                 rollout._validated_force_span = (
                     int(declared_span[0]),
@@ -5036,16 +5147,23 @@ class GrpoWindowBatcher:
                 if rollout._validated_force_span is not None
                 else 0
             )
-            rollout._validated_termination_path = classify_bft_termination(
-                rollout.commit["tokens"],
-                prompt_length=prompt_len,
-                completion_length=completion_len,
-                eos_ids=telemetry_eos_ids,
-                think_close_ids=telemetry_think_close_ids,
-                validated_force_span=rollout._validated_force_span,
-                thinking_budget=BFT_THINKING_BUDGET,
-                answer_budget=BFT_ANSWER_BUDGET,
-            )
+            if _is_episode:
+                rollout._validated_termination_path = str(
+                    (rollout_dict.get("episode") or {}).get(
+                        "termination_reason", "episode_done"
+                    )
+                )
+            else:
+                rollout._validated_termination_path = classify_bft_termination(
+                    rollout.commit["tokens"],
+                    prompt_length=prompt_len,
+                    completion_length=completion_len,
+                    eos_ids=telemetry_eos_ids,
+                    think_close_ids=telemetry_think_close_ids,
+                    validated_force_span=rollout._validated_force_span,
+                    thinking_budget=BFT_THINKING_BUDGET,
+                    answer_budget=BFT_ANSWER_BUDGET,
+                )
             seed_cdf_entry["termination_path"] = (
                 rollout._validated_termination_path
             )
@@ -5059,6 +5177,7 @@ class GrpoWindowBatcher:
                 completion_length=completion_len,
                 claimed_logprobs=claimed_lp,
                 proof=proof,
+                policy_positions=(policy_positions if _is_episode else None),
             )
             if not lp_ok and completion_len < CHALLENGE_K:
                 # The sampled-challenge check is a deterministic fail below
@@ -5077,6 +5196,7 @@ class GrpoWindowBatcher:
                     prompt_len,
                     completion_len,
                     claimed_lp,
+                    policy_positions=(policy_positions if _is_episode else None),
                 )
                 with self._proof_admission_lock:
                     self.logprob_short_full_coverage_checks += 1
@@ -5122,6 +5242,56 @@ class GrpoWindowBatcher:
                     lp_dev_max=lp_dev_max,
                     dist_q10_min=dist_q10_min,
                 )
+
+            if _is_episode:
+                chosen_probs = list(
+                    getattr(proof, "completion_chosen_probs", []) or []
+                )
+                entropies = list(
+                    getattr(proof, "completion_entropies", []) or []
+                )
+                utility_rollouts.append({
+                    "rollout_idx": rollout_idx,
+                    "reward": float(getattr(rollout, "reward", 0.0) or 0.0),
+                    "prompt_length": prompt_len,
+                    "completion_length": completion_len,
+                    "natural_eos": False,
+                    "validated_force_span": None,
+                    "termination_path": rollout._validated_termination_path,
+                    "chosen_nll": {
+                        "mean": (
+                            sum(-math.log(max(float(p), 1e-45)) for p in chosen_probs)
+                            / len(chosen_probs)
+                            if chosen_probs else None
+                        ),
+                        "p50": None,
+                        "p90": None,
+                    },
+                    "full_policy_entropy": {
+                        "mean": (
+                            sum(float(value) for value in entropies) / len(entropies)
+                            if entropies else None
+                        ),
+                        "p50": None,
+                        "p90": None,
+                    },
+                    "full_policy_entropy_samples": len(entropies),
+                    "hidden_start_f16_b64": getattr(
+                        proof, "hidden_start_f16_b64", None
+                    ),
+                    "hidden_delta_f16_b64": getattr(
+                        proof, "hidden_delta_f16_b64", None
+                    ),
+                    "hidden_dim": int(getattr(proof, "hidden_dim", 0) or 0),
+                    "hidden_end_completion_offset": getattr(
+                        proof, "hidden_end_completion_offset", None
+                    ),
+                    "representation_shift_l2": getattr(
+                        proof, "representation_shift_l2", None
+                    ),
+                    "token_degeneracy": dict(rollout_token_metrics),
+                })
+                continue
 
             boxed_ok, boxed_metrics = evaluate_boxed_answer_probability(
                 tokens=rollout.commit["tokens"],
@@ -5487,6 +5657,10 @@ class GrpoWindowBatcher:
             completion_texts=completion_texts,
             prompt_content_sha256=pending.prompt_content_sha256,
             target_content_sha256=pending.target_content_sha256,
+            task_family=pending.task_family,
+            generator_version=pending.generator_version,
+            operation_id=pending.operation_id,
+            difficulty=pending.difficulty,
             arrived_at=pending.arrived_at,
             sketch_diff_max=sketch_diff_max,
             lp_dev_max=lp_dev_max,
@@ -5833,7 +6007,7 @@ class GrpoWindowBatcher:
                 environment=environment,
                 checkpoint_revision=self.current_checkpoint_hash,
                 candidates=tuple(candidates),
-                required_passes=B_BATCH,
+                required_passes=self.batch_target,
                 deadline_at=deadline_at,
                 max_attempts=self.max_ranked_proof_attempts,
                 priority=0,
@@ -5945,7 +6119,7 @@ class GrpoWindowBatcher:
             proven = []
             claimed.clear()
             claimed_contents.clear()
-        elif len(proven) >= B_BATCH:
+        elif len(proven) >= self.batch_target:
             stop_reason = "batch_filled"
         else:
             stop_reason = "eligible_shortfall"
@@ -5960,7 +6134,7 @@ class GrpoWindowBatcher:
         )
 
     def _prove_ranked(self, pool: float = 1.0) -> list[ValidSubmission]:
-        """Prove strict auction winners until ``B_BATCH`` distinct prompts pass.
+        """Prove strict auction winners until ``batch_target`` prompts pass.
 
         On throughput-enabled profiles, difficulty remains primary and capped
         throughput remains secondary. Validator-observed precommit drand is
@@ -5987,7 +6161,7 @@ class GrpoWindowBatcher:
         (``MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW``) caps a
         multi-hotkey flood so proving can never exceed the graded pool. On
         exhaustion we log, stop, and advance with the shortfall (fewer than
-        ``B_BATCH`` in ``_valid``); the training path already burns unpaid slots.
+        ``batch_target`` in ``_valid``); the training path already burns unpaid slots.
 
         Runs OUTSIDE ``_lock``: ``_verify_expensive`` is 5-25 s of GPU per
         candidate, mutates reject state, and is not thread-safe, so the loop is
@@ -6255,7 +6429,7 @@ class GrpoWindowBatcher:
             )
         else:
             for (p, _score), row in zip(ranked, candidate_rows):
-                if len(proven) >= B_BATCH:
+                if len(proven) >= self.batch_target:
                     stop_reason = "batch_filled"
                     break
                 if p.prompt_idx in claimed:
@@ -6392,7 +6566,7 @@ class GrpoWindowBatcher:
         winners = list(self._valid)
         prompt_ids = [submission.prompt_idx for submission in winners]
         content_ids = [submission.prompt_content_sha256 for submission in winners]
-        if len(winners) > B_BATCH:
+        if len(winners) > self.batch_target:
             raise RuntimeError(
                 "auction reward alignment failed: winner count exceeds batch size"
             )
@@ -6408,7 +6582,7 @@ class GrpoWindowBatcher:
                 "auction reward alignment failed: duplicate winning content"
             )
 
-        slot_share = pool / B_BATCH
+        slot_share = pool / self.batch_target
         # ``reward_amount`` below is this slot share. Under v6 the seal path
         # pays nothing -- payment is the per-token split
         # ``FillClosedBatchAssembler`` computes over assembled batches (R20)
@@ -6791,7 +6965,7 @@ class GrpoWindowBatcher:
             ],
             "production_changed": False,
             "delta": DIFFICULTY_AUCTION_DELTA,
-            "batch_size": B_BATCH,
+            "batch_size": self.batch_target,
             "validated_candidates": len(self._valid),
             "max_candidates": DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES,
             "operator_cap_requested": (
@@ -6838,7 +7012,7 @@ class GrpoWindowBatcher:
             )
             result = select_shadow_auction(
                 shadow_pool,
-                b=B_BATCH,
+                b=self.batch_target,
                 delta=DIFFICULTY_AUCTION_DELTA,
                 max_slots_per_operator=(
                     DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR
@@ -7150,14 +7324,14 @@ class GrpoWindowBatcher:
             else:
                 self.selection_metadata_by_id = explain_batch_selection(
                     submissions=self._valid,
-                    b=B_BATCH,
+                    b=self.batch_target,
                     cooldown_map=self._cooldown,
                     current_window=self.window_start,
                     pool=pool,
                 )
                 batch, rewards = select_batch_and_distribute(
                     submissions=self._valid,
-                    b=B_BATCH,
+                    b=self.batch_target,
                     cooldown_map=self._cooldown,
                     current_window=self.window_start,
                     pool=pool,

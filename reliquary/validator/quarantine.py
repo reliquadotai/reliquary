@@ -12,7 +12,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from reliquary.constants import (
-    MAX_NEW_TOKENS_PROTOCOL_CAP,
     TRAINING_QUARANTINE_ENABLED,
     TRAINING_QUARANTINE_MAX_MEAN_COMPLETION_LENGTH,
     TRAINING_QUARANTINE_MAX_REWARD_VECTOR_SHARE,
@@ -23,6 +22,7 @@ from reliquary.constants import (
     TRAINING_QUARANTINE_LONG_ZERO_TAIL_MIN_LENGTH,
     TRAINING_QUARANTINE_REWARD_SHAPE_MIN_GROUPS,
     TRAINING_QUARANTINE_REWARD_VECTOR_MIN_GROUPS,
+    max_new_tokens_for_environment,
 )
 
 
@@ -65,6 +65,17 @@ def _binary_reward_vector(group: Any) -> str:
         reward = float(getattr(rollout, "reward", 0.0))
         bits.append("1" if reward >= 0.5 else "0")
     return "".join(bits)
+
+
+def _group_environment(group: Any) -> str:
+    direct = str(getattr(group, "environment", "") or "")
+    if direct:
+        return direct
+    for rollout in getattr(group, "rollouts", []):
+        name = str(getattr(rollout, "env_name", "") or "")
+        if name:
+            return name
+    return ""
 
 
 def assess_training_batch(
@@ -115,16 +126,23 @@ def assess_training_batch(
         pass
 
     completion_lengths: list[int] = []
+    completion_lengths_with_caps: list[tuple[int, int]] = []
     cap_length_groups = 0
     extreme_length_groups = 0
     reward_shape_groups = 0
     long_zero_tail_shape_groups = 0
     for group in batch:
+        environment_cap = max_new_tokens_for_environment(
+            _group_environment(group)
+        )
         group_lengths = [
             _completion_length(rollout)
             for rollout in getattr(group, "rollouts", [])
         ]
         completion_lengths.extend(group_lengths)
+        completion_lengths_with_caps.extend(
+            (length, environment_cap) for length in group_lengths
+        )
         reward_shape = getattr(group, "reward_shape", {}) or {}
         if bool(reward_shape.get("suspicious", False)):
             reward_shape_groups += 1
@@ -132,7 +150,7 @@ def assess_training_batch(
                 TRAINING_QUARANTINE_LONG_ZERO_TAIL_MIN_LENGTH
             ):
                 long_zero_tail_shape_groups += 1
-        if any(length >= MAX_NEW_TOKENS_PROTOCOL_CAP for length in group_lengths):
+        if any(length >= environment_cap for length in group_lengths):
             cap_length_groups += 1
         if any(
             length >= TRAINING_QUARANTINE_MAX_SINGLE_COMPLETION_LENGTH
@@ -146,8 +164,8 @@ def assess_training_batch(
         if completion_lengths else 0.0
     )
     cap_length_rollouts = sum(
-        1 for length in completion_lengths
-        if length >= MAX_NEW_TOKENS_PROTOCOL_CAP
+        1 for length, cap in completion_lengths_with_caps
+        if length >= cap
     )
     extreme_length_rollouts = sum(
         1 for length in completion_lengths

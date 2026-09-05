@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reliquary.ai/schemas/episode-v1.schema.json",
+  "title": "Reliquary Episode v1 metadata",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "renderer_id",
+    "task_id",
+    "seed",
+    "actions",
+    "assistant_spans",
+    "observation_digests",
+    "termination_reason",
+    "state_digest",
+    "trace_digest"
+  ],
+  "properties": {
+    "schema_version": {"const": "reliquary/episode/v1"},
+    "renderer_id": {"const": "reliquary-jsonl-tools-v1"},
+    "task_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "seed": {"type": "integer", "minimum": 0},
+    "actions": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["tool", "arguments"],
+            "properties": {
+              "tool": {"type": "string", "minLength": 1},
+              "arguments": {"type": "object"}
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["final"],
+            "properties": {"final": {"type": "string"}}
+          }
+        ]
+      }
+    },
+    "assistant_spans": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": {
+        "type": "array",
+        "prefixItems": [
+          {"type": "integer", "minimum": 0},
+          {"type": "integer", "minimum": 1}
+        ],
+        "minItems": 2,
+        "maxItems": 2
+      }
+    },
+    "observation_digests": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+    },
+    "termination_reason": {"type": "string", "minLength": 1, "maxLength": 64},
+    "state_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "trace_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

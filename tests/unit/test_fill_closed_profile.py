@@ -203,6 +203,7 @@ svc.envs = {
     "opencodeinstruct": PrivateRewardFakeEnv(),
 }
 svc.env_mix = [(name, c.B_BATCH) for name in svc.envs]
+svc.env_targets = dict(svc.env_mix)
 svc.env = svc.envs["openmathinstruct"]
 svc._cooldown_per_env = {
     name: CooldownMap(cooldown_windows=1_000_000) for name in svc.envs

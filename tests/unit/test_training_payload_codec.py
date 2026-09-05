@@ -79,6 +79,7 @@ def _encode_decode(batches):
         window_start=30100,
         checkpoint_revision="rev-abc",
         env_order=["openmathinstruct", "opencodeinstruct"],
+        env_targets={"openmathinstruct": 16, "opencodeinstruct": 16},
         window_quarantine={"quarantined": False, "reasons": []},
     )
     assert isinstance(blob, bytes)
@@ -128,6 +129,9 @@ def test_header_round_trip():
     assert decoded.window_start == 30100
     assert decoded.checkpoint_revision == "rev-abc"
     assert decoded.env_order == ["openmathinstruct", "opencodeinstruct"]
+    # The active legacy v2 profile emits schema 1 and intentionally omits the
+    # additive target map. V5+ payloads pin it in schema 2.
+    assert decoded.env_targets == {}
     assert decoded.window_quarantine == {"quarantined": False, "reasons": []}
 
 
@@ -262,6 +266,45 @@ def test_force_span_and_termination_path_round_trip():
     assert getattr(other, "_validated_force_span", None) is None
 
 
+def test_episode_assistant_spans_round_trip(monkeypatch):
+    from reliquary.validator.training import _policy_token_positions
+
+    monkeypatch.setattr(C, "PROTOCOL_VERSION", 7)
+    monkeypatch.setattr(C, "T_PROTO", 1.0)
+    monkeypatch.setattr(C, "PI_OLD_FROM_VERIFY_LOGPROBS", True)
+    monkeypatch.setattr(C, "RECOMPUTE_PI_OLD_FROM_VERIFY", True)
+    rollout = _roll(
+        1.0,
+        8,
+        env="reliquary_stateful_tools_v1",
+        prompt_length=4,
+    )
+    rollout.commit["rollout"]["episode"] = {"schema_version": "test"}
+    rollout.commit["rollout"]["token_logprobs"] = [-0.2] * 4
+    rollout._validated_assistant_spans = ((4, 6), (9, 11))
+    rollout._validated_termination_path = "finished"
+    rollout._validated_completion_logprobs = [-0.3] * 4
+    batches = {
+        "reliquary_stateful_tools_v1": [_group([rollout], prompt_idx=9)]
+    }
+    blob = encode_training_payload(
+        batches,
+        window_start=30100,
+        checkpoint_revision="rev-episode",
+        env_order=["reliquary_stateful_tools_v1"],
+        env_targets={"reliquary_stateful_tools_v1": 16},
+        window_quarantine={"quarantined": False, "reasons": []},
+    )
+    decoded = decode_training_payload(blob).batches()[
+        "reliquary_stateful_tools_v1"
+    ][0].rollouts[0]
+    assert decoded._validated_assistant_spans == ((4, 6), (9, 11))
+    assert decoded._validated_termination_path == "finished"
+    assert _policy_token_positions(decoded) == [4, 5, 9, 10]
+    assert _completion_token_logprobs(decoded) == pytest.approx([-0.2] * 4)
+    assert _validator_completion_logprobs(decoded, 4) == pytest.approx([-0.3] * 4)
+
+
 def test_tombstone_round_trip():
     doc = decode_tombstone(encode_tombstone(
         window_start=30105, failure_stage="proof_capacity",
@@ -358,6 +401,10 @@ def test_artifact_schema_preserves_legacy_worker_compatibility(
     if protocol_version >= 5:
         expected = active_training_identity()
         assert decoded.training_identity == expected
+        assert decoded.env_targets == {
+            "openmathinstruct": 16,
+            "opencodeinstruct": 16,
+        }
         for key, value in expected.items():
             assert tombstone[key] == value
     else:
@@ -365,3 +412,56 @@ def test_artifact_schema_preserves_legacy_worker_compatibility(
             value is None for value in decoded.training_identity.values()
         )
         assert not set(active_training_identity()).intersection(tombstone)
+
+
+def test_schema_v2_payload_requires_exact_environment_targets(monkeypatch):
+    monkeypatch.setattr(C, "PROTOCOL_VERSION", 6)
+    with pytest.raises(ValueError, match="targets must match"):
+        encode_training_payload(
+            _window_batches(),
+            window_start=30100,
+            checkpoint_revision="rev-abc",
+            env_order=["openmathinstruct", "opencodeinstruct"],
+            env_targets={"openmathinstruct": 16},
+            window_quarantine={"quarantined": False, "reasons": []},
+        )
+
+
+@pytest.mark.parametrize("epoch", [False, True])
+def test_extended_payload_keeps_episode_masks_and_epoch_identity(monkeypatch, epoch):
+    monkeypatch.setattr(C, "PROTOCOL_VERSION", 7)
+    monkeypatch.setattr(C, "T_PROTO", 1.0)
+    rollout = _roll(1.0, 4)
+    rollout._validated_assistant_spans = ((7, 9), (10, 11))
+    rollout._validated_completion_logprobs = [-1.0] * 3
+    blob = encode_training_payload(
+        {"openmathinstruct": [_group([rollout])]}, window_start=30100,
+        checkpoint_revision="a" * 40, env_order=["openmathinstruct"],
+        env_targets={"openmathinstruct": 1}, window_quarantine={},
+        checkpoint_epoch=_epoch_binding() if epoch else None,
+    )
+    decoded = decode_training_payload(blob)
+    assert decoded.schema_version == (5 if epoch else 4)
+    assert decoded.checkpoint_epoch == (_epoch_binding() if epoch else None)
+    restored = decoded.batches()["openmathinstruct"][0].rollouts[0]
+    assert restored._validated_assistant_spans == ((7, 9), (10, 11))
+    assert restored._validated_completion_logprobs == [-1.0] * 3
+    if epoch:
+        with pytest.raises(ValueError, match="omitted checkpoint epoch binding"):
+            decode_training_payload(_replace_payload_header(blob, checkpoint_epoch=None))
+    else:
+        # Published inactive suite schema 3 remains readable, including masks.
+        historical = decode_training_payload(_replace_payload_header(blob, schema_version=3))
+        assert historical.checkpoint_epoch is None
+        assert historical.batches()["openmathinstruct"][0].rollouts[0]._validated_assistant_spans == ((7, 9), (10, 11))
+
+
+def test_historical_epoch_payload_and_targetless_v5_remain_readable(monkeypatch):
+    monkeypatch.setattr(C, "PROTOCOL_VERSION", 5)
+    ordinary = decode_training_payload(_payload_bytes())
+    assert ordinary.schema_version == 2 and ordinary.env_targets == {}
+    epoch = decode_training_payload(_payload_bytes(checkpoint_epoch=_epoch_binding()))
+    assert epoch.schema_version == 3 and epoch.checkpoint_epoch == _epoch_binding()
+    with pytest.raises(ValueError, match="ambiguous schema-3"):
+        decode_training_payload(_replace_payload_header(
+            _payload_bytes(checkpoint_epoch=_epoch_binding()), assistant_spans=[]))

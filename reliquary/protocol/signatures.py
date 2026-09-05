@@ -16,11 +16,12 @@ else:
         bt = None  # type: ignore
 
 from reliquary.protocol.tokens import hash_tokens
-from reliquary.constants import GRAIL_PROOF_VERSION
+from reliquary.constants import GRAIL_EPISODE_PROOF_VERSION, GRAIL_PROOF_VERSION
 
 logger = logging.getLogger(__name__)
 
 COMMIT_DOMAIN = b"grail-commit-v1"
+EPISODE_COMMIT_DOMAIN = b"grail-commit-v8-episode"
 
 # Domain separation tag for the per-request envelope signature. Distinct
 # from ``COMMIT_DOMAIN`` so a per-rollout commit signature can never be
@@ -98,6 +99,63 @@ def sign_commit_binding(
     return wallet.hotkey.sign(msg)  # type: ignore[union-attr]
 
 
+def build_episode_commit_binding(
+    tokens: list[int],
+    randomness_hex: str,
+    model_name: str,
+    layer_index: int,
+    commitments: list[dict],
+    episode: dict,
+) -> bytes:
+    """Bind the v7 proof material and the complete Episode v1 trace metadata."""
+
+    base = build_commit_binding(
+        tokens,
+        randomness_hex,
+        model_name,
+        layer_index,
+        commitments,
+    )
+    episode_bytes = json.dumps(
+        episode,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    h = hashlib.sha256()
+    h.update(EPISODE_COMMIT_DOMAIN)
+    for part in (base, episode_bytes):
+        h.update(len(part).to_bytes(4, "big"))
+        h.update(part)
+    return h.digest()
+
+
+def sign_episode_commit_binding(
+    tokens: list[int],
+    randomness_hex: str,
+    model_name: str,
+    layer_index: int,
+    commitments: list[dict],
+    episode: dict,
+    wallet: bt.Wallet,  # type: ignore[misc]
+) -> bytes:
+    if bt is None:
+        raise ImportError("bittensor is required for sign_episode_commit_binding")
+    if not hasattr(wallet, "hotkey") or not hasattr(wallet.hotkey, "sign"):
+        raise TypeError("Wallet must provide hotkey.sign()")
+    return wallet.hotkey.sign(  # type: ignore[union-attr]
+        build_episode_commit_binding(
+            tokens,
+            randomness_hex,
+            model_name,
+            layer_index,
+            commitments,
+            episode,
+        )
+    )
+
+
 def verify_commit_signature(commit: dict, wallet_address: str) -> bool:
     """Verify commit signature binding tokens, randomness, model, layer, and proofs."""
     if bt is None:
@@ -107,7 +165,10 @@ def verify_commit_signature(commit: dict, wallet_address: str) -> bool:
         sig = bytes.fromhex(commit["signature"])
         proof_version = commit.get("proof_version")
 
-        if not proof_version or proof_version != GRAIL_PROOF_VERSION:
+        if proof_version not in (
+            GRAIL_PROOF_VERSION,
+            GRAIL_EPISODE_PROOF_VERSION,
+        ):
             logger.debug("Invalid proof version: %s", proof_version)
             return False
 
@@ -119,7 +180,27 @@ def verify_commit_signature(commit: dict, wallet_address: str) -> bool:
         model_name = model_info.get("name", "")
         layer_index = int(model_info.get("layer_index"))
 
-        msg = build_commit_binding(tokens, randomness, model_name, layer_index, commitments)
+        if proof_version == GRAIL_EPISODE_PROOF_VERSION:
+            episode = (commit.get("rollout") or {}).get("episode")
+            if not isinstance(episode, dict):
+                logger.debug("Episode v8 commit missing episode metadata")
+                return False
+            msg = build_episode_commit_binding(
+                tokens,
+                randomness,
+                model_name,
+                layer_index,
+                commitments,
+                episode,
+            )
+        else:
+            msg = build_commit_binding(
+                tokens,
+                randomness,
+                model_name,
+                layer_index,
+                commitments,
+            )
 
         keypair = bt.Keypair(ss58_address=wallet_address)
         return keypair.verify(data=msg, signature=sig)  # type: ignore[union-attr,return-value]

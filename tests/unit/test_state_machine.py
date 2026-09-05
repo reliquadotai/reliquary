@@ -51,6 +51,23 @@ def _make_service():
     return svc
 
 
+def _enable_empty_training_fixture(monkeypatch) -> None:
+    """Keep the historical empty-window fixture without a zero-size batcher."""
+    import reliquary.validator.service as svc_mod
+
+    original_open = svc_mod.open_grpo_window
+
+    def _open_with_positive_target(*args, batch_target=B_BATCH, **kwargs):
+        return original_open(
+            *args,
+            batch_target=max(1, int(batch_target)),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(svc_mod, "B_BATCH", 0)
+    monkeypatch.setattr(svc_mod, "open_grpo_window", _open_with_positive_target)
+
+
 def test_service_initial_state_is_ready():
     svc = _make_service()
     assert svc._current_window_state == WindowState.READY
@@ -498,7 +515,7 @@ async def test_train_and_publish_bumps_checkpoint_n(monkeypatch):
     # Patch B_BATCH to 0 so an empty sealed batch counts as "full" and the
     # train+publish path runs. Real behaviour with non-zero B_BATCH is
     # covered by the integration tests that exercise actual submissions.
-    monkeypatch.setattr("reliquary.validator.service.B_BATCH", 0)
+    _enable_empty_training_fixture(monkeypatch)
 
     svc = _make_service()
     initial_checkpoint = svc._checkpoint_n
@@ -948,7 +965,7 @@ async def test_publish_every_n_trained_windows(monkeypatch):
     """
     # Patch B_BATCH so empty batches count as "full" (real-batch behaviour is
     # covered by the integration test that uses real submissions).
-    monkeypatch.setattr("reliquary.validator.service.B_BATCH", 0)
+    _enable_empty_training_fixture(monkeypatch)
 
     import reliquary.validator.service as svc_mod
     from reliquary.validator.checkpoint import ManifestEntry

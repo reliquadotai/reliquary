@@ -1,0 +1,31 @@
+{
+  "schema": "reliquary/generated-environment-manifest/v1",
+  "environment_id": "reliquaryverifiable_v1",
+  "environment_contract_id": "reliquary-records-v1",
+  "task_family": "records_v1",
+  "generator_version": "records-v1",
+  "checker_version": "records-checker-v1",
+  "golden_fixture_sha256": "c6f18de7e1bec2fd20aeb426c9b06d7c5c27a0b68028f8f65b23329fcf1a9e21",
+  "virtual_length": 33554432,
+  "protocol_reward_lattice": [0.0, 1.0],
+  "answer_schema": {"required_keys": ["result"], "additional_keys": false},
+  "limits": {
+    "completion_bytes": 16384,
+    "container_items": 64,
+    "json_depth": 8,
+    "max_integer_magnitude": 9007199254740991,
+    "max_input_records": 10
+  },
+  "operation_templates": [
+    "filter-sort-project-v1",
+    "active-sort-rename-v1",
+    "deduplicate-project-v1",
+    "group-count-sum-v1",
+    "top-project-v1"
+  ],
+  "provenance": {
+    "origin": "Reliquary-authored synthetic schemas, records, prompts, and operations",
+    "external_prompt_sources": [],
+    "spdx_license": "MIT"
+  }
+}

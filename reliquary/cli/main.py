@@ -16,12 +16,12 @@ from pathlib import Path
 import typer
 
 from reliquary.constants import (
+    B_BATCH,
     PROOF_PROCESS_ISOLATION,
     DEFAULT_BASE_MODEL,
     DEFAULT_BASE_MODEL_REVISION,
     DEFAULT_ENVIRONMENTS,
     DEFAULT_HF_REPO_ID,
-    ENVIRONMENT_MIX,
     FORENSIC_SAMPLE_PER_WINDOW,
     MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV,
     MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW,
@@ -33,6 +33,8 @@ from reliquary.constants import (
     PROTOCOL_VERSION,
     VALIDATOR_HTTP_PORT,
 )
+from reliquary.environment.registry import resolve_environment_mix
+from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE
 from reliquary.validator.errors import FatalProofPlaneError
 
 _DEFAULT_ENVS = DEFAULT_ENVIRONMENTS
@@ -42,6 +44,15 @@ app = typer.Typer(name="reliquary", help="Reliquary — Verifiable Inference Sub
 logger = logging.getLogger(__name__)
 
 _grader_proc: "subprocess.Popen | None" = None
+
+
+def _resolve_cli_environment_mix(value: str) -> list[tuple[str, int]]:
+    names = [name.strip() for name in value.split(",")]
+    return resolve_environment_mix(
+        names,
+        profile_environments=ACTIVE_PROTOCOL_PROFILE.environments,
+        default_batch_target=B_BATCH,
+    )
 
 
 def _run_validator_event_loop(coroutine) -> None:
@@ -285,7 +296,8 @@ def mine(
     os.environ["BT_NETWORK"] = network
     os.environ["NETUID"] = str(netuid)
 
-    env_names = [n.strip() for n in environments.split(",") if n.strip()]
+    mix = _resolve_cli_environment_mix(environments)
+    env_names = [name for name, _target in mix]
     logger.info(
         "Starting Reliquary miner (network=%s, netuid=%d, envs=%s)",
         network, netuid, env_names,
@@ -425,7 +437,6 @@ def mine(
             checkpoint_identity_store.commit(initial_checkpoint_identity)
 
         envs = load_environments(env_names)
-        mix = [(n, w) for n, w in ENVIRONMENT_MIX if n in envs]
         engine = MiningEngine(
             vllm_model,
             hf_model,
@@ -517,7 +528,8 @@ def validate(
     os.environ["BT_NETWORK"] = network
     os.environ["NETUID"] = str(netuid)
 
-    env_names = [n.strip() for n in environments.split(",") if n.strip()]
+    mix = _resolve_cli_environment_mix(environments) if train else []
+    env_names = [name for name, _target in mix]
     if train and "opencodeinstruct" in env_names:
         _ensure_grader_running()
     if train:
@@ -738,7 +750,6 @@ def validate(
                         **base_load_kwargs,
                     ).to(device).eval()
 
-            mix = [(n, w) for n, w in ENVIRONMENT_MIX if n in env_names]
             service = ValidationService(
                 wallet,
                 model,
@@ -751,7 +762,7 @@ def validate(
                 external_port=(external_port or http_port) if external_ip else None,
                 hf_repo_id=hf_repo_id,
                 resume_from=resume_from or None,
-                env_mix=mix if mix else None,
+                env_mix=mix,
                 proof_devices=proof_slots or None,
                 proof_models=proof_models or None,
                 proof_capacity_qualification=(
