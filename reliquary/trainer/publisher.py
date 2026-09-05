@@ -1,9 +1,8 @@
 """Trainer-side checkpoint publication: HF (miners' source) + R2 mirror
 (validator's fast path) + the candidate manifest the validator polls.
 
-Signing stays with the validator: it signs (checkpoint_n || revision) at
-swap time, after downloading and profile-validating the snapshot. The
-candidate manifest is written LAST — it is the commit point.
+Active Hugging Face history is append-only. Finished-run retention is an
+explicit operator workflow and is never triggered by this publisher.
 """
 
 from __future__ import annotations
@@ -20,6 +19,9 @@ from reliquary.shared.checkpoint_identity import (
     require_checkpoint_repository,
     require_immutable_checkpoint_revision,
 )
+
+
+from reliquary.trainer.storage_guard import HfStorageGuard
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +66,7 @@ class TrainerPublisher:
         checkpoint_number_floor: int | None = None,
         save_fn: Callable[[Any, Any, Path], None] | None = None,
         hf_upload_fn: Callable[..., Any] | None = None,
+        storage_guard: HfStorageGuard | None = None,
     ) -> None:
         from reliquary.validator.checkpoint import (
             _default_save_hf_format,
@@ -86,6 +89,9 @@ class TrainerPublisher:
             if checkpoint_number_floor is not None
             else None
         )
+
+
+        self._storage_guard = storage_guard or HfStorageGuard()
         self._previous_mirror_revision: str | None = None
 
     async def publish(
@@ -148,6 +154,19 @@ class TrainerPublisher:
                 extra["lr_schedule_step"] = lr_schedule_step
             write_checkpoint_profile(snapshot_dir, extra=extra)
 
+            snapshot_bytes = sum(
+                path.stat().st_size
+                for path in snapshot_dir.rglob("*")
+                if path.is_file()
+            )
+            # This is a read-only quota check. It never deletes, branches, or
+            # rewrites active history; failure leaves HF untouched.
+            await asyncio.to_thread(
+                self._storage_guard.assert_upload_allowed,
+                repo_id=self.repo_id,
+                upload_bytes=snapshot_bytes,
+            )
+
             revision = await self._hf_upload(
                 folder_path=str(snapshot_dir),
                 repo_id=self.repo_id,
@@ -197,10 +216,9 @@ class TrainerPublisher:
         finally:
             shutil.rmtree(snapshot_dir, ignore_errors=True)
 
-        # Bound the mirror: keep the current + previous revision only
-        # (previous eliminates any race with a validator mid-download).
-        # HF is the durable archive of every revision; without cleanup
-        # the mirror grows ~8 GB per publish forever.
+        # Bound only the serving mirror: keep the current + previous revision
+        # (previous eliminates a validator download race). HF continues to
+        # retain every active-run checkpoint until manual finalization.
         await asyncio.to_thread(
             self._prune_mirror,
             keep={revision, self._previous_mirror_revision},

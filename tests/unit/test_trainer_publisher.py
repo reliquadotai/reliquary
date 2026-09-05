@@ -51,7 +51,7 @@ class _R2:
         self.deleted.append(Key)
 
 
-def _publisher(tmp_path, r2, order, *, hf_fails=False):
+def _publisher(tmp_path, r2, order, *, hf_fails=False, storage_guard=None):
     def save_fn(model, tokenizer, path):
         (path / "model.safetensors").write_bytes(b"weights")
         order.append("save")
@@ -65,7 +65,7 @@ def _publisher(tmp_path, r2, order, *, hf_fails=False):
     return TrainerPublisher(
         repo_id="org/repo", staging_dir=str(tmp_path), tokenizer=None,
         save_fn=save_fn, hf_upload_fn=hf_upload, r2_client=r2,
-        bucket="reliquary",
+        bucket="reliquary", storage_guard=storage_guard,
     )
 
 
@@ -131,6 +131,7 @@ def test_profile_extra_written(tmp_path):
     ]
     assert profiles and profiles[0]["lr_schedule_step"] == 99
     assert profiles[0]["trained_window_cursor"] == 30200
+    assert "publication_seq" not in profiles[0]
 
 
 def test_mirror_keeps_only_last_two_revisions(tmp_path):
@@ -173,7 +174,6 @@ def test_mirror_keeps_only_last_two_revisions(tmp_path):
 def test_staging_cleaned_on_failure(tmp_path):
     r2, order = _R2(), []
     pub = _publisher(tmp_path, r2, order, hf_fails=True)
-    import pytest
     with pytest.raises(RuntimeError, match="hf down"):
         asyncio.run(pub.publish(
             object(), checkpoint_n=5, lr_schedule_step=None,
@@ -345,3 +345,41 @@ def test_the_publisher_stamps_the_journal_key_space(tmp_path):
     manifest = json.loads(r2.objects[CANDIDATE_MANIFEST_KEY])
     assert profile["journal_key_space"] == ACTIVE_JOURNAL_KEY_SPACE
     assert manifest["journal_key_space"] == ACTIVE_JOURNAL_KEY_SPACE
+
+
+def test_storage_guard_runs_before_hf_upload(tmp_path):
+    class _Guard:
+        def assert_upload_allowed(self, *, repo_id, upload_bytes):
+            assert repo_id == "org/repo"
+            assert upload_bytes > len(b"weights")
+            order.append("guard")
+
+    r2, order = _R2(), []
+    pub = _publisher(tmp_path, r2, order, storage_guard=_Guard())
+
+    asyncio.run(pub.publish(
+        object(), checkpoint_n=5, lr_schedule_step=None,
+        trained_window_cursor=30110, reason="cadence",
+    ))
+
+    assert order == ["save", "guard", "hf"]
+
+
+def test_storage_guard_freezes_without_mutating_hf_or_r2(tmp_path):
+    class _Guard:
+        def assert_upload_allowed(self, *, repo_id, upload_bytes):
+            order.append("guard")
+            raise RuntimeError("storage safety ceiling")
+
+    r2, order = _R2(), []
+    pub = _publisher(tmp_path, r2, order, storage_guard=_Guard())
+
+    with pytest.raises(RuntimeError, match="storage safety ceiling"):
+        asyncio.run(pub.publish(
+            object(), checkpoint_n=5, lr_schedule_step=None,
+            trained_window_cursor=30110, reason="cadence",
+        ))
+
+    assert order == ["save", "guard"]
+    assert not r2.objects
+    assert not any(tmp_path.iterdir())
