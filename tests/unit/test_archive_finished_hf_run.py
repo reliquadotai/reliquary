@@ -141,3 +141,24 @@ def test_archive_manifest_rejects_duplicate_identity():
     })
     with pytest.raises(ValueError, match="duplicate JSON key"):
         archive._manifest(client, "bucket", "key")
+
+
+def test_incomplete_archive_refused_against_complete_source_tree():
+    api = SimpleNamespace(model_info=lambda **kwargs: SimpleNamespace(siblings=[
+        SimpleNamespace(rfilename="config.json", size=2),
+        SimpleNamespace(rfilename="model.safetensors", size=10),
+    ]))
+    with pytest.raises(RuntimeError, match="complete HF source tree"):
+        archive._verify_source_inventory(api, "org/repo", "a" * 40,
+                                        {"files": [{"path": "config.json", "size": 2}]})
+
+
+def test_tags_and_ambiguous_checkpoint_numbers_refuse_finalization():
+    with pytest.raises(RuntimeError, match="tags retain history"):
+        archive._reject_retaining_tags(SimpleNamespace(tags=["checkpoint-1"]))
+    api = SimpleNamespace(list_repo_commits=lambda **kwargs: [
+        SimpleNamespace(title="checkpoint 10", commit_id="a" * 40),
+        SimpleNamespace(title="checkpoint 10", commit_id="b" * 40),
+    ])
+    with pytest.raises(ValueError, match="ambiguous checkpoint number"):
+        archive._selected_commits(api, "org/repo", [10])

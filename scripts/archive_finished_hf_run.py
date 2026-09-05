@@ -96,13 +96,16 @@ def _run_key(repo_id: str, source_head: str) -> str:
 
 
 def _selected_commits(api: HfApi, repo_id: str, numbers: list[int]) -> list[dict]:
-    # The Hub returns newest first. setdefault intentionally selects the newest
-    # commit if a checkpoint title was used more than once during publication.
+    # A reused selected checkpoint number must not silently choose a revision.
     by_number: dict[int, Any] = {}
     for commit in api.list_repo_commits(repo_id=repo_id, repo_type="model"):
         match = CHECKPOINT_TITLE.match(str(commit.title or ""))
         if match:
-            by_number.setdefault(int(match.group(1)), commit)
+            number = int(match.group(1))
+            previous = by_number.get(number)
+            if number in numbers and previous is not None and previous.commit_id != commit.commit_id:
+                raise ValueError(f"ambiguous checkpoint number: {number}")
+            by_number.setdefault(number, commit)
     missing = sorted(set(numbers) - set(by_number))
     if missing:
         raise SystemExit(f"checkpoint(s) are absent from HF history: {missing}")
@@ -303,10 +306,21 @@ def _hf_tree(api: HfApi, repo_id: str, revision: str) -> dict[str, int]:
         revision=revision,
         files_metadata=True,
     )
-    return {
-        str(item.rfilename): int(item.size or 0)
-        for item in info.siblings
-    }
+    if any(type(item.size) is not int or item.size < 0 for item in info.siblings):
+        raise ValueError("HF source tree contains unknown file sizes")
+    return {str(item.rfilename): item.size for item in info.siblings}
+
+
+def _verify_source_inventory(api, repo_id, revision, manifest):
+    source = _hf_tree(api, repo_id, revision)
+    archived = {item["path"]: item["size"] for item in manifest["files"]}
+    if not source or source != archived:
+        raise RuntimeError("R2 archive inventory differs from the complete HF source tree")
+
+
+def _reject_retaining_tags(refs):
+    if getattr(refs, "tags", ()):
+        raise RuntimeError("refusing to compact while HF tags retain history")
 
 
 def _verify_completed_squash(
@@ -336,6 +350,7 @@ def _verify_completed_squash(
             "single-commit root created by this command; refusing to continue"
         )
     refs = api.list_repo_refs(args.repo_id, repo_type="model")
+    _reject_retaining_tags(refs)
     if [branch.name for branch in refs.branches] != ["main"]:
         raise RuntimeError("unexpected HF branches after super-squash")
 
@@ -457,6 +472,7 @@ def main() -> int:
             "the final model before compacting"
         )
     refs = api.list_repo_refs(args.repo_id, repo_type="model")
+    _reject_retaining_tags(refs)
     extra_branches = [
         branch.name for branch in refs.branches if branch.name != "main"
     ]
@@ -580,6 +596,7 @@ def main() -> int:
                 f"({revision[:12]})",
                 flush=True,
             )
+        _verify_source_inventory(api, args.repo_id, revision, manifest)
         archived.append(
             {
                 "checkpoint_n": checkpoint_n,
@@ -609,6 +626,7 @@ def main() -> int:
             f"observed={observed_head}"
         )
     observed_refs = api.list_repo_refs(args.repo_id, repo_type="model")
+    _reject_retaining_tags(observed_refs)
     if [branch.name for branch in observed_refs.branches] != ["main"]:
         raise RuntimeError("HF branches changed before squash")
     message = (
