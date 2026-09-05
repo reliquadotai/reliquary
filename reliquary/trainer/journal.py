@@ -14,12 +14,10 @@ from reliquary.constants import (
     FILL_CLOSED_ENABLED,
 )
 from reliquary.infrastructure.training_payload_queue import (
-    epoch_marker_key,
     payload_key,
     tombstone_key,
 )
 from reliquary.shared.training_payload import (
-    decode_checkpoint_epoch_marker,
     decode_tombstone,
     decode_training_payload,
     validate_training_identity,
@@ -162,34 +160,6 @@ class WindowJournal:
             return "tombstone", tombstone
         return None
 
-    def checkpoint_epoch_status(self, binding: Any) -> str | None:
-        """Return the durable all-lanes terminal status, or wait for it."""
-        raw = self._fetch(epoch_marker_key(binding.epoch_id))
-        if raw is None:
-            return None
-        marker = decode_checkpoint_epoch_marker(raw)
-        marked = marker["checkpoint_epoch"]
-        expected = (
-            binding.epoch_id,
-            binding.manifest_sha256,
-            binding.training_run_id,
-            binding.training_mode,
-            binding.first_window,
-            binding.window_count,
-            binding.target_groups_per_environment_lane,
-        )
-        actual = (
-            marked.epoch_id,
-            marked.manifest_sha256,
-            marked.training_run_id,
-            marked.training_mode,
-            marked.first_window,
-            marked.window_count,
-            marked.target_groups_per_environment_lane,
-        )
-        if actual != expected:
-            raise ValueError("checkpoint epoch marker binding differs")
-        return str(marker["status"])
 
 
 def r2_fetch_fn(client: Any, bucket: str) -> Callable[[str], bytes | None]:

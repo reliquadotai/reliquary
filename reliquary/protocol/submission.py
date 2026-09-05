@@ -338,72 +338,12 @@ class SubmissionPrecommitResponse(BaseModel):
     upload_deadline_ts: float | None = None
 
 
-class EpochGenerationIntentRequest(BaseModel):
-    """Signed miner-selected prompt claim sent before expensive generation."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    miner_hotkey: str = Field(..., min_length=1)
-    operator_id: str = Field(..., min_length=1)
-    epoch_id: str = Field(..., pattern=r"^[0-9a-f]{64}$")
-    manifest_sha256: str = Field(..., pattern=r"^[0-9a-f]{64}$")
-    window_start: int = Field(..., ge=0)
-    environment: str = Field(..., min_length=1, max_length=64)
-    prompt_idx: int = Field(..., ge=0)
-    prompt_content_sha256: str = Field(..., pattern=r"^[0-9a-f]{64}$")
-    checkpoint_hash: str = Field(..., min_length=1, max_length=256)
-    generation_randomness: str = Field(..., pattern=r"^[0-9a-f]{64}$")
-    protocol_version: int = Field(..., ge=1)
-    generation_profile_id: str = Field(..., min_length=1, max_length=64)
-    nonce: str = Field(..., min_length=1, max_length=128)
-    intent_signature: str = Field(
-        ..., min_length=2, max_length=256, pattern=r"^[0-9a-fA-F]+$"
-    )
 
 
-class EpochGenerationIntentResponse(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    accepted: bool
-    reason: RejectReason
-    intent_id: str | None = None
 
 
-class EpochGenerationIntentStatus(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    intent_id: str = Field(..., min_length=1, max_length=128)
-    status: Literal[
-        "pending_selection",
-        "primary",
-        "standby",
-        "active_backup",
-        "payload_committed",
-        "revealed",
-        "not_selected",
-        "expired",
-    ]
-    admission_beacon_round: int | None = Field(default=None, ge=1)
-    generation_deadline_ts: float | None = None
-    activation_wave: int | None = Field(default=None, ge=0)
-    intent_set_sha256: str | None = Field(
-        default=None, pattern=r"^[0-9a-f]{64}$"
-    )
 
 
-class EpochCommitmentStatus(BaseModel):
-    """Status of an experimental compact commitment and its reveal right."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    receipt_id: str = Field(..., min_length=1, max_length=128)
-    status: Literal[
-        "pending_selection", "selected", "not_selected", "revealed", "expired"
-    ]
-    admission_beacon_round: int | None = Field(default=None, ge=1)
-    reveal_deadline_ts: float | None = None
-    commitment_set_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
-    commitment_root: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class FillClosedWindowState(BaseModel):
@@ -460,43 +400,6 @@ class GrpoBatchState(BaseModel):
     protocol_version: int | None = Field(default=None, ge=0)
     generation_profile_id: str | None = Field(default=None, max_length=64)
     generation_contract: dict[str, Any] | None = None
-    # Present only while the disabled-by-default checkpoint-epoch capability
-    # has an active immutable manifest. Legacy responses omit both fields.
-    checkpoint_epoch_id: str | None = Field(default=None, max_length=128)
-    checkpoint_epoch_manifest_sha256: str | None = Field(
-        default=None,
-        pattern=r"^[0-9a-f]{64}$",
-    )
-    checkpoint_epoch_target_groups: int | None = Field(default=None, ge=1)
-    checkpoint_epoch_candidate_limit: int | None = Field(default=None, ge=1)
-    checkpoint_epoch_candidate_remaining: int | None = Field(default=None, ge=0)
-    checkpoint_epoch_collection_seconds: float | None = Field(
-        default=None,
-        gt=0,
-    )
-    checkpoint_epoch_intent_seconds: float | None = Field(default=None, gt=0)
-    checkpoint_epoch_backup_activation_fractions: list[float] | None = None
-    checkpoint_epoch_phase: Literal[
-        "intent", "selection", "generation", "sealing",
-        # Accepted only for the disabled v7 recovery surface.
-        "commitment", "reveal",
-    ] | None = None
-    checkpoint_epoch_reveal_seconds: float | None = Field(default=None, gt=0)
-    checkpoint_epoch_admission_beacon_round: int | None = Field(default=None, ge=1)
-    checkpoint_epoch_generation_intent_set_sha256: str | None = Field(
-        default=None, pattern=r"^[0-9a-f]{64}$"
-    )
-    checkpoint_epoch_generation_intent_root: str | None = Field(
-        default=None, pattern=r"^[0-9a-f]{64}$"
-    )
-    checkpoint_epoch_generation_deadline_ts: float | None = None
-    checkpoint_epoch_active_backup_wave: int | None = Field(default=None, ge=0)
-    checkpoint_epoch_commitment_set_sha256: str | None = Field(
-        default=None, pattern=r"^[0-9a-f]{64}$"
-    )
-    checkpoint_epoch_commitment_root: str | None = Field(
-        default=None, pattern=r"^[0-9a-f]{64}$"
-    )
     # Capability-only progress. It is explicitly excluded from serialized
     # responses while fill-closed is disabled, preserving legacy state bytes.
     fill_closed: FillClosedWindowState | None = None

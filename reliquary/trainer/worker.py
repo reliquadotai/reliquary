@@ -34,7 +34,6 @@ class TrainerWorker:
         last_published_revision: str | None,
         shadow: bool = False,
         freeze_fn: Callable[[], str | None] | None = None,
-        abort_epoch_fn: Callable[[Any], None] | None = None,
         cursor_writer: Callable[[int], None] | None = None,
     ) -> None:
         self._journal = journal
@@ -47,7 +46,6 @@ class TrainerWorker:
         self.last_published_revision = last_published_revision
         self.shadow = bool(shadow)
         self._freeze_fn = freeze_fn
-        self._abort_epoch_fn = abort_epoch_fn
         # Amendment v6.1 (trainer-paced picks): advisory pacing telemetry,
         # written every time the journal cursor advances -- unconditional
         # on every profile. The trainer has no notion of FILL_CLOSED and
@@ -64,7 +62,7 @@ class TrainerWorker:
         """The single place the journal cursor moves forward.
 
         Every advance -- trained payload, tombstone, quarantine skip,
-        health skip, or aborted epoch lane -- is a journal key the
+        health skip -- is a journal key the
         validator's picker can now count as consumed, whether or not an
         optimizer step happened on it. Publishing the telemetry cursor
         here, unconditionally, keeps the pacer from stalling on any of
@@ -134,44 +132,7 @@ class TrainerWorker:
         if entry is None:
             return "waited"
         kind, value = entry
-        epoch_binding = (
-            value.get("checkpoint_epoch")
-            if kind == "tombstone"
-            else getattr(value, "checkpoint_epoch", None)
-        )
-        if epoch_binding is not None:
-            status_fn = getattr(
-                self._journal,
-                "checkpoint_epoch_status",
-                None,
-            )
-            if not callable(status_fn):
-                raise RuntimeError(
-                    "checkpoint epoch payload requires a marker-aware journal"
-                )
-            epoch_status = status_fn(epoch_binding)
-            if epoch_status is None:
-                return "waited"
-            if epoch_status == "aborted":
-                if self._abort_epoch_fn is not None:
-                    self._abort_epoch_fn(
-                        value
-                        if kind == "tombstone"
-                        else {"checkpoint_epoch": epoch_binding}
-                    )
-                self._advance_cursor()
-                self.tombstones_seen += 1
-                logger.warning(
-                    "checkpoint epoch %s aborted; skipping lane %s",
-                    epoch_binding.epoch_id[:12],
-                    self.cursor,
-                )
-                return "epoch_aborted"
-            if epoch_status != "completed":
-                raise RuntimeError("unknown checkpoint epoch marker status")
         if kind == "tombstone":
-            if self._abort_epoch_fn is not None:
-                self._abort_epoch_fn(value)
             self._advance_cursor()
             self.tombstones_seen += 1
             logger.warning("window %s tombstoned: %s", self.cursor, value)
@@ -179,18 +140,13 @@ class TrainerWorker:
         window_quarantined = bool(value.window_quarantine.get("quarantined"))
         if window_quarantined:
             self.quarantined_seen += 1
-        if window_quarantined and epoch_binding is None:
+        if window_quarantined:
             self._advance_cursor()
             logger.warning(
                 "window %s quarantined at seal; skipping",
                 self.cursor,
             )
             return "quarantined"
-        if window_quarantined:
-            logger.warning(
-                "epoch lane %s quarantined at seal; recording an empty lane",
-                self.cursor + self.stride,
-            )
         try:
             trained = self._train_fn(value)
         except TrainingStepSkipped as exc:
@@ -206,9 +162,7 @@ class TrainerWorker:
             return "trained"
         self._advance_cursor()
         if trained:
-            self.trained_since_publish += (
-                epoch_binding.publication_units if epoch_binding is not None else 1
-            )
+            self.trained_since_publish += 1
         return "trained"
 
     def snapshot(self) -> dict[str, Any]:

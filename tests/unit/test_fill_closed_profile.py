@@ -281,38 +281,8 @@ assert shared.is_closed() is True
     assert result.returncode == 0, result.stderr
 
 
-def test_the_two_experimental_capabilities_refuse_to_run_together():
-    """R30: fill-closed and checkpoint-epoch are mutually exclusive.
-
-    With both armed, C2's tombstone gate (``and checkpoint_epoch is None``)
-    falls back to the RAW journal key, colliding with v6's encoded key
-    space -- the original bug -- and ``_open_checkpoint_epoch`` would
-    ``close()`` a lane's assembler before its window is done. Import is the
-    only place an operator reads the refusal.
-    """
-    result = _constants_under(
-        RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED="1",
-    )
-
-    assert result.returncode != 0
-    assert "RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED" in result.stderr
-    assert "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED" in result.stderr
 
 
-def test_checkpoint_epoch_refuses_to_repurpose_an_existing_profile():
-    """No V4/V5/V6 profile carries the epoch market contract yet."""
-    for profile_id in (
-        "qwen3-4b-base-dapo-reasoning-v5",
-        "qwen3-4b-base-dapo-fill-closed-v6",
-    ):
-        result = _constants_under(
-            RELIQUARY_PROTOCOL_PROFILE=profile_id,
-            RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED="0",
-            RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED="1",
-        )
-
-        assert result.returncode != 0
-        assert "dedicated profile" in result.stderr
 
 
 def test_fill_profile_refuses_to_run_as_an_ordinary_auction():

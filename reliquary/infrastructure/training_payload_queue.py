@@ -35,7 +35,6 @@ RETRY_BACKOFF_SECONDS: tuple[int, ...] = (5, 30, 120, 600, 1800)
 
 _PAYLOAD_SUFFIX = ".npz"
 _TOMBSTONE_SUFFIX = ".tombstone.json"
-_EPOCH_MARKER_SUFFIX = ".epoch.json"
 _STEP_CURSOR_FILENAME = "step-cursor.json"
 _STEP_CURSOR_SCHEMA_VERSION = 1
 
@@ -98,14 +97,6 @@ def step_cursor_key() -> str:
     return f"{R2_TRAINING_PREFIX}/{_STEP_CURSOR_FILENAME}"
 
 
-def epoch_marker_key(epoch_id: str) -> str:
-    if (
-        not isinstance(epoch_id, str)
-        or len(epoch_id) != 64
-        or any(character not in "0123456789abcdef" for character in epoch_id)
-    ):
-        raise ValueError("epoch_id must be lowercase SHA-256")
-    return f"{R2_TRAINING_PREFIX}/epoch-{epoch_id}{_EPOCH_MARKER_SUFFIX}"
 
 
 def _default_queue_dir() -> str:
@@ -625,21 +616,6 @@ class TrainingPayloadQueue:
             window_start, data, is_tombstone=True,
         )
 
-    def enqueue_epoch_marker(self, epoch_id: str, data: bytes) -> Path:
-        from reliquary.shared.training_payload import (
-            decode_checkpoint_epoch_marker,
-        )
-
-        marker = decode_checkpoint_epoch_marker(data)
-        if marker["checkpoint_epoch"].epoch_id != epoch_id:
-            raise ValueError("checkpoint epoch marker identifier differs")
-        epoch_marker_key(epoch_id)
-        path = self._enqueue(f"epoch-{epoch_id}{_EPOCH_MARKER_SUFFIX}", data)
-        logger.info(
-            "TrainingPayloadQueue: enqueued terminal marker for epoch %s",
-            epoch_id[:12],
-        )
-        return path
 
     # ---------------- v6.1: trainer step cursor ----------------
 
@@ -780,11 +756,11 @@ class TrainingPayloadQueue:
         return sorted(
             (
                 path
-                for pattern in ("window-*", "epoch-*", _STEP_CURSOR_FILENAME)
+                for pattern in ("window-*", _STEP_CURSOR_FILENAME)
                 for path in self.queue_dir.glob(pattern)
                 if not path.name.endswith(".tmp")
             ),
-            key=lambda path: (path.name.startswith("epoch-"), path.name),
+            key=lambda path: path.name,
         )
 
     @staticmethod
@@ -795,8 +771,6 @@ class TrainingPayloadQueue:
         if name.startswith("window-") and (
             name.endswith(_TOMBSTONE_SUFFIX) or name.endswith(_PAYLOAD_SUFFIX)
         ):
-            return f"{R2_TRAINING_PREFIX}/{name}"
-        if name.startswith("epoch-") and name.endswith(_EPOCH_MARKER_SUFFIX):
             return f"{R2_TRAINING_PREFIX}/{name}"
         return None
 
@@ -853,25 +827,6 @@ class TrainingPayloadQueue:
             # A genuinely new step still uploads promptly (different
             # body -- journal_key or written_at differs).
             return True
-        if path.name.startswith("epoch-"):
-            from reliquary.shared.training_payload import (
-                decode_checkpoint_epoch_marker,
-            )
-
-            marker = decode_checkpoint_epoch_marker(body)
-            binding = marker["checkpoint_epoch"]
-            pending_names = {item.name for item in self.queue_dir.glob("window-*")}
-            for window_start in range(
-                binding.first_window,
-                binding.first_window + binding.window_count,
-            ):
-                if (
-                    f"window-{window_start}{_PAYLOAD_SUFFIX}" in pending_names
-                    or f"window-{window_start}{_TOMBSTONE_SUFFIX}" in pending_names
-                ):
-                    # The marker is the commit point consumed by detached
-                    # trainers and cannot overtake any lane artifact.
-                    return False
         try:
             await asyncio.to_thread(upload_fn, key, body)
         except Exception as e:

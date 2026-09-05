@@ -630,82 +630,6 @@ if CHECKPOINT_PUBLISH_INTERVAL_WINDOWS <= 0:
         "RELIQUARY_CHECKPOINT_PUBLISH_INTERVAL_WINDOWS must be positive"
     )
 
-# Experimental checkpoint-epoch scheduling.  This capability deliberately
-# lives outside the canonical production profiles: enabling it changes when
-# generation randomness is revealed and needs a future coordinated profile.
-EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED = _os.environ.get(
-    "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED", "0"
-).lower() in {"1", "true", "yes", "on"}
-EXPERIMENTAL_CHECKPOINT_EPOCH_WARMUP_ROUNDS = int(_os.environ.get(
-    "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_WARMUP_ROUNDS", "20",
-))
-if EXPERIMENTAL_CHECKPOINT_EPOCH_WARMUP_ROUNDS <= 0:
-    raise ValueError(
-        "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_WARMUP_ROUNDS must be positive"
-    )
-# Every logical lane opens together.  Give the shared collection the same
-# aggregate wall budget as the production horizon it replaces, instead of
-# compressing sixteen windows into one production-window deadline.
-EXPERIMENTAL_CHECKPOINT_EPOCH_COLLECTION_SECONDS = float(_os.environ.get(
-    "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_COLLECTION_SECONDS",
-    str(WINDOW_COLLECTION_SECONDS * CHECKPOINT_PUBLISH_INTERVAL_WINDOWS),
-))
-if (
-    not _math.isfinite(EXPERIMENTAL_CHECKPOINT_EPOCH_COLLECTION_SECONDS)
-    or EXPERIMENTAL_CHECKPOINT_EPOCH_COLLECTION_SECONDS <= 0
-):
-    raise ValueError(
-        "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_COLLECTION_SECONDS must be "
-        "finite and positive"
-    )
-# Short, arrival-neutral self-selection phase before expensive generation.
-# Miners choose their own prompt/lane; a post-close beacon grants generation
-# rights. This is separate from the common generation horizon above.
-EXPERIMENTAL_CHECKPOINT_EPOCH_INTENT_SECONDS = float(_os.environ.get(
-    "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_INTENT_SECONDS", "60",
-))
-if (
-    not _math.isfinite(EXPERIMENTAL_CHECKPOINT_EPOCH_INTENT_SECONDS)
-    or EXPERIMENTAL_CHECKPOINT_EPOCH_INTENT_SECONDS <= 0
-):
-    raise ValueError(
-        "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_INTENT_SECONDS must be "
-        "finite and positive"
-    )
-EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_ACTIVATION_FRACTIONS = tuple(
-    float(value.strip())
-    for value in _os.environ.get(
-        "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_ACTIVATION_FRACTIONS",
-        "0.5,0.75",
-    ).split(",")
-    if value.strip()
-)
-if (
-    not EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_ACTIVATION_FRACTIONS
-    or tuple(
-        sorted(set(EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_ACTIVATION_FRACTIONS))
-    ) != EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_ACTIVATION_FRACTIONS
-    or any(
-        not _math.isfinite(value) or not 0.0 < value < 1.0
-        for value in EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_ACTIVATION_FRACTIONS
-    )
-):
-    raise ValueError(
-        "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_ACTIVATION_FRACTIONS "
-        "must be unique increasing fractions in (0, 1)"
-    )
-EXPERIMENTAL_CHECKPOINT_EPOCH_TRAINING_MODE = _os.environ.get(
-    "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_TRAINING_MODE",
-    "sequential_steps",
-).strip().lower()
-if EXPERIMENTAL_CHECKPOINT_EPOCH_TRAINING_MODE not in {
-    "aggregate_one_step",
-    "sequential_steps",
-}:
-    raise ValueError(
-        "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_TRAINING_MODE must be "
-        "aggregate_one_step or sequential_steps"
-    )
 
 # Default HF repo target for published checkpoints. Operator may
 # override via --hf-repo-id CLI arg. Must be a writable repo id for
@@ -755,52 +679,6 @@ M_ROLLOUTS = ACTIVE_PROTOCOL_PROFILE.sampling.rollouts
 # watch as training lengthens responses, NOT the slot count.
 B_BATCH = 16 if PROTOCOL_VERSION >= 4 else 8
 
-# Epoch admission keeps one target batch of proof-failure reserve instead of
-# copying the production auction's unbounded offer into every concurrent lane.
-# Proof outcomes are not known when the final backup wave starts, so the value
-# is explicit, configurable and committed in the epoch manifest.
-EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_CANDIDATES_PER_LANE = int(_os.environ.get(
-    "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_CANDIDATES_PER_LANE",
-    str(B_BATCH),
-))
-if EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_CANDIDATES_PER_LANE < 0:
-    raise ValueError(
-        "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_CANDIDATES_PER_LANE "
-        "must be non-negative"
-    )
-EXPERIMENTAL_CHECKPOINT_EPOCH_CANDIDATES_PER_LANE = (
-    B_BATCH + EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_CANDIDATES_PER_LANE
-)
-EXPERIMENTAL_CHECKPOINT_EPOCH_INTENTS_PER_OPERATOR_PER_LANE = int(
-    _os.environ.get(
-        "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_INTENTS_PER_OPERATOR_PER_LANE",
-        _os.environ.get(
-            "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_COMMITMENTS_PER_OPERATOR_PER_LANE",
-            str(B_BATCH),
-        ),
-    )
-)
-if EXPERIMENTAL_CHECKPOINT_EPOCH_INTENTS_PER_OPERATOR_PER_LANE <= 0:
-    raise ValueError(
-        "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_INTENTS_PER_OPERATOR_PER_LANE "
-        "must be positive"
-    )
-# Internal schema-v7 name retained as a compatibility alias while the
-# experimental manifest field is migrated in a future schema revision.
-EXPERIMENTAL_CHECKPOINT_EPOCH_COMMITMENTS_PER_OPERATOR_PER_LANE = (
-    EXPERIMENTAL_CHECKPOINT_EPOCH_INTENTS_PER_OPERATOR_PER_LANE
-)
-EXPERIMENTAL_CHECKPOINT_EPOCH_REVEAL_SECONDS = float(_os.environ.get(
-    "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_REVEAL_SECONDS", "60",
-))
-if (
-    not _math.isfinite(EXPERIMENTAL_CHECKPOINT_EPOCH_REVEAL_SECONDS)
-    or EXPERIMENTAL_CHECKPOINT_EPOCH_REVEAL_SECONDS <= 0
-):
-    raise ValueError(
-        "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_REVEAL_SECONDS must be "
-        "finite and positive"
-    )
 
 # (env_name, prompts_per_batch). Sum across entries = total prompts
 # processed per optimizer step: 2 × B_BATCH prompts × M_ROLLOUTS sequences.
@@ -821,14 +699,6 @@ ENVIRONMENT_MIX: list[tuple[str, int]] = [
 MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW = (
     2 * B_BATCH if PROTOCOL_VERSION >= 3 else 64
 )
-if (
-    EXPERIMENTAL_CHECKPOINT_EPOCH_CANDIDATES_PER_LANE
-    > MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW
-):
-    raise ValueError(
-        "checkpoint epoch candidates per lane cannot exceed the ranked proof "
-        "attempt limit"
-    )
 
 # ────────────────  FILL-CLOSED WINDOW (v6)  ────────────────
 
@@ -842,9 +712,7 @@ if (
 # CHECKPOINT_PUBLISH_INTERVAL_WINDOWS, and both are profile-dependent (v2
 # gives 32, v4/v5 give 256, v6 gives 256) -- so arming this under any
 # non-v6 profile would silently size a v6-shaped window from another
-# protocol's batch shape instead of refusing to run. Same shape as the
-# neighbouring EXPERIMENTAL_CHECKPOINT_EPOCH capability, which fails closed
-# unless CHECKPOINT_PUBLISH_INTERVAL_WINDOWS is exactly its required horizon.
+# protocol's batch shape instead of refusing to run.
 _FILL_CLOSED_REQUESTED = _os.environ.get(
     "RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -854,35 +722,10 @@ FILL_CLOSED_ENABLED = (
     and _FILL_CLOSED_REQUESTED
 )
 
-# The two experimental capabilities are mutually exclusive, and a box with
-# both armed must not boot (R30). They collide on the training journal:
-#   * the tombstone path writes under the RAW window key whenever a
-#     checkpoint epoch is present, which under fill-closed collides with
-#     the encoded key space (window * FILL_CLOSED_EMISSIONS_PER_WINDOW +
-#     batch_index) every other v6 write uses;
-#   * an epoch opening mid-window would close() that window's batch
-#     assembler early, sealing a window that is still collecting.
-# Neither is a runtime condition anything downstream can recover from, so
-# it is refused here, where an operator reads the message.
-if _FILL_CLOSED_REQUESTED and EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED:
-    raise ValueError(
-        "RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED and "
-        "RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED cannot both be "
-        "enabled: a checkpoint epoch sends training tombstones to the raw "
-        "window journal key, which collides with the fill-closed encoded "
-        "key space, and an epoch opening mid-window closes that window's "
-        "batch assembler early. Disable one."
-    )
 if _FILL_CLOSED_REQUESTED and PROTOCOL_PROFILE_ID != _FILL_CLOSED_PROFILE_ID:
     raise ValueError(
         "RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED requires the exact "
         f"{_FILL_CLOSED_PROFILE_ID!r} profile"
-    )
-if EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED:
-    raise ValueError(
-        "checkpoint-epoch runtime activation requires a coordinated release "
-        "contract and dedicated profile; no current production or "
-        "experimental profile is qualified"
     )
 if PROTOCOL_PROFILE_ID == _FILL_CLOSED_PROFILE_ID and not FILL_CLOSED_ENABLED:
     raise ValueError(

@@ -370,7 +370,6 @@ def run_train_worker(*, shadow: bool = False) -> None:
         last_published_revision=last_revision,
         shadow=shadow,
         freeze_fn=freeze_fn,
-        abort_epoch_fn=runner.abort_epoch,
         cursor_writer=cursor_queue.write_step_cursor,
     )
 

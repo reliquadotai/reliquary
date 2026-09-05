@@ -30,7 +30,6 @@ CAP_MANIFEST_16_LANES = "generation.manifest-16-lanes/v1"
 CAP_MINER_SELECTED_INTENTS = "market.miner-selected-intents/v1"
 CAP_SELECTED_SLOT_REWARD = "reward.selected-slot/v1"
 CAP_STREAMING_TICKET_VALIDATION = "verification.streaming-ticketed/v1"
-CAP_TICKETED_PACED_EPOCH = "market.ticketed-paced-epoch/v1"
 CAP_TRAINER_PACED_LANES = "training.trainer-paced-lanes/v1"
 
 _IDENTIFIER_RE = re.compile(r"[a-z0-9][a-z0-9._/-]{0,126}[a-z0-9]$")
@@ -187,7 +186,6 @@ RELIQUARY_1_CAPABILITIES = CapabilityBundle.from_iterable(
         CAP_MINER_SELECTED_INTENTS,
         CAP_SELECTED_SLOT_REWARD,
         CAP_STREAMING_TICKET_VALIDATION,
-        CAP_TICKETED_PACED_EPOCH,
         CAP_TRAINER_PACED_LANES,
     ),
 )
@@ -422,7 +420,6 @@ __all__ = [
     "CAP_MINER_SELECTED_INTENTS",
     "CAP_SELECTED_SLOT_REWARD",
     "CAP_STREAMING_TICKET_VALIDATION",
-    "CAP_TICKETED_PACED_EPOCH",
     "CAP_TRAINER_PACED_LANES",
     "CapabilityBundle",
     "ContractComponent",

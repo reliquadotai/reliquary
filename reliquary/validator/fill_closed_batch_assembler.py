@@ -323,7 +323,6 @@ class FillClosedBatchAssembler:
                 checkpoint_revision=self._checkpoint_revision,
                 env_order=list(self._env_order),
                 window_quarantine=decision.to_archive(),
-                checkpoint_epoch=None,
             )
             is_tombstone = False
         log_message = (

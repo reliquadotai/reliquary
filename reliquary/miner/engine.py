@@ -118,8 +118,6 @@ def _release_state_mismatch_reason(
         return "contract_changed"
     if not _state_matches_active_protocol(release_state):
         return "protocol_mismatch"
-    if getattr(release_state, "checkpoint_epoch_id", None) is not None:
-        return "epoch_requires_ticketed_planner"
     if accepting_submissions is False:
         return "admission_closed"
     if request.window_start != release_state.window_n:

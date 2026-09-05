@@ -9,7 +9,6 @@ import reliquary.protocol.release_contract as release_contract_module
 from reliquary.protocol.profiles import to_generation_contract
 from reliquary.protocol.release_contract import (
     CAP_FRESH_POST_SEAL_ORDERING,
-    CAP_TICKETED_PACED_EPOCH,
     ContractComponent,
     EnvironmentContract,
     RELIQUARY_1_CAPABILITIES,
@@ -58,7 +57,7 @@ def test_release_contract_round_trip_and_hash_vector_are_stable() -> None:
 
     assert parse_release_contract(release.to_bytes()) == release
     assert release.canonical_sha256 == (
-        "da5def253914c9f8b926dc24aefdab84d538e5f009a1dca905800ccc6bb0d11e"
+        "05cb885b71e347310e4e1b0df02f44f802f5212142e0f71911e92a36ad4f988a"
     )
 
 
@@ -116,7 +115,6 @@ def test_component_ids_are_globally_unique() -> None:
 def test_capabilities_replace_numeric_feature_dispatch() -> None:
     release = _release()
 
-    assert release.supports(CAP_TICKETED_PACED_EPOCH)
     assert release.supports(CAP_FRESH_POST_SEAL_ORDERING)
     assert not release.supports("market.fill-closed-rate/v1")
 

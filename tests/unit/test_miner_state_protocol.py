@@ -136,14 +136,6 @@ def test_miner_state_does_not_change_legacy_state_bytes():
     assert after == before
 
 
-def test_concurrent_epoch_requires_lane_aware_state():
-    batcher = _batcher()
-    server = ValidatorServer()
-    server.set_active_epoch_batchers({
-        ("fake", batcher.window_start): batcher,
-    })
-    server.set_current_state(WindowState.OPEN)
-    assert TestClient(server.app).get("/miner-state").status_code == 409
 
 
 @pytest.mark.asyncio

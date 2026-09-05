@@ -39,15 +39,6 @@ from reliquary.constants import (
     DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES,
     DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR,
     ENVIRONMENT_MIX,
-    EXPERIMENTAL_CHECKPOINT_EPOCH_CANDIDATES_PER_LANE,
-    EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_ACTIVATION_FRACTIONS,
-    EXPERIMENTAL_CHECKPOINT_EPOCH_COLLECTION_SECONDS,
-    EXPERIMENTAL_CHECKPOINT_EPOCH_COMMITMENTS_PER_OPERATOR_PER_LANE,
-    EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED,
-    EXPERIMENTAL_CHECKPOINT_EPOCH_INTENT_SECONDS,
-    EXPERIMENTAL_CHECKPOINT_EPOCH_REVEAL_SECONDS,
-    EXPERIMENTAL_CHECKPOINT_EPOCH_TRAINING_MODE,
-    EXPERIMENTAL_CHECKPOINT_EPOCH_WARMUP_ROUNDS,
     FILL_CLOSED_ADMISSION_BUDGET_PER_ENV,
     FILL_CLOSED_ENABLED,
     FILL_CLOSED_FIRST_PICK_SECONDS,
@@ -84,7 +75,6 @@ from reliquary.constants import (
     PPO_CLIP_EPSILON_HIGH,
     PPO_CLIP_EPSILON_LOW,
     PPO_RATIO_OUTSIDE_CLIP_SKIP_THRESHOLD,
-    PROMPT_RANGE_SIZE,
     PROTOCOL_GENERATION_CONTRACT,
     PROTOCOL_PROFILE_ID,
     PROTOCOL_VERSION,
@@ -117,40 +107,10 @@ from reliquary.shared.checkpoint_identity import (
     canonical_checkpoint_identity,
     require_checkpoint_number,
 )
-from reliquary.shared.checkpoint_epoch import (
-    BeaconBinding,
-    CHECKPOINT_EPOCH_ADMISSION_POLICY,
-    CHECKPOINT_EPOCH_FINALIZATION_POLICY,
-    CHECKPOINT_EPOCH_RANKING_POLICY,
-    CHECKPOINT_EPOCH_REQUIRED_WINDOW_COUNT,
-    CHECKPOINT_EPOCH_REWARD_POLICY,
-    CHECKPOINT_EPOCH_SCHEDULE_MODE,
-    CHECKPOINT_EPOCH_VALUATION_POLICY,
-    EpochPlan,
-    EpochWindow,
-    ProtocolBinding,
-    WindowSchedule,
-    generation_contract_sha256,
-    manifest_sha256,
-)
-from reliquary.shared.checkpoint_epoch_market import (
-    SignedGenerationIntentSet,
-    generation_intent_set_sha256,
-    generation_intent_set_signing_bytes,
-)
 from reliquary.shared.strict_json import strict_json_loads
 from reliquary.validator import telemetry
 from reliquary.validator.batcher import GrpoWindowBatcher
 from reliquary.validator.checkpoint import CheckpointStore
-from reliquary.validator.checkpoint_epoch_runtime import (
-    EpochCommitIntent,
-    EpochStore,
-    SignedEpochIntent,
-    build_epoch_intent,
-    canonical_signed_intent_bytes,
-    intent_signing_bytes,
-    plan_from_intent,
-)
 from reliquary.validator.cooldown import (
     ContentCooldownMap,
     CooldownMap,
@@ -221,10 +181,6 @@ _STARTUP_HASH_REBUILD_TIMEOUT_SECONDS = 30.0
 # seconds-to-a-minute, not a hot loop. Not an operator knob: nothing
 # downstream is sized off it.
 FILL_CLOSED_ROTATION_POLL_SECONDS = 2.0
-
-
-class CheckpointEpochExecutionError(RuntimeError):
-    """A partially consumed experimental epoch requires a clean restart."""
 
 
 def _cooldown_snapshot_key(run_id: str) -> str:
@@ -496,7 +452,6 @@ def open_grpo_window(
     operator_by_hotkey: dict[str, str] | None = None,
     proof_scheduler=None,
     verify_commitment_proofs_fn=None,
-    experimental_epoch_ranking: bool = False,
     experimental_prompt_range: tuple[int, int] | None = None,
     collection_seconds: float | None = None,
     max_productive_candidates: int | None = None,
@@ -560,7 +515,6 @@ def open_grpo_window(
         operator_by_hotkey=operator_by_hotkey,
         proof_scheduler=proof_scheduler,
         verify_commitment_proofs_fn=verify_commitment_proofs_fn,
-        experimental_epoch_ranking=experimental_epoch_ranking,
         experimental_prompt_range=experimental_prompt_range,
         collection_seconds=collection_seconds,
         max_productive_candidates=max_productive_candidates,
@@ -964,14 +918,6 @@ class ValidationService:
             }
         )
         accumulator_targets = dict(self.env_mix)
-        if (
-            EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED
-            and EXPERIMENTAL_CHECKPOINT_EPOCH_TRAINING_MODE == "aggregate_one_step"
-        ):
-            accumulator_targets = {
-                name: target * CHECKPOINT_PUBLISH_INTERVAL_WINDOWS
-                for name, target in accumulator_targets.items()
-            }
         self._training_accumulator = BalancedTrainingAccumulator(accumulator_targets)
         self.server.set_training_accumulator_state(
             self._training_accumulator.snapshot()
@@ -984,15 +930,6 @@ class ValidationService:
             staging_dir_path=CHECKPOINT_STAGING_DIR_DEFAULT,
             tokenizer=tokenizer,
         )
-        self._checkpoint_epoch_plan: EpochPlan | None = None
-        self._checkpoint_epoch_store: EpochStore | None = None
-        if EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED:
-            state_root = Path(
-                os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")
-            )
-            self._checkpoint_epoch_store = EpochStore(
-                state_root / "checkpoint_epochs"
-            )
         # Multi-batcher: one GrpoWindowBatcher per active env.
         self._active_batchers: dict[str, GrpoWindowBatcher] = {}
         # Stashed by ``_set_window_randomness`` after the drand fetch
@@ -2265,410 +2202,15 @@ class ValidationService:
             self._resume_from, checkpoint_n,
         )
 
-    @staticmethod
-    def _checkpoint_epoch_protocol_binding() -> ProtocolBinding:
-        return ProtocolBinding(
-            profile_id=PROTOCOL_PROFILE_ID,
-            protocol_version=PROTOCOL_VERSION,
-            generation_contract_sha256=generation_contract_sha256(
-                PROTOCOL_GENERATION_CONTRACT
-            ),
-        )
 
-    @staticmethod
-    def _checkpoint_epoch_matches(plan: EpochPlan, checkpoint) -> bool:
-        return bool(
-            checkpoint is not None
-            and plan.checkpoint.number == int(checkpoint.checkpoint_n)
-            and plan.checkpoint.repo_id == str(checkpoint.repo_id)
-            and plan.checkpoint.revision == str(checkpoint.revision)
-        )
 
-    def _validate_checkpoint_epoch_runtime_config(self, plan: EpochPlan) -> None:
-        expected_schedule = WindowSchedule(
-            mode=CHECKPOINT_EPOCH_SCHEDULE_MODE,
-            collection_seconds=(
-                EXPERIMENTAL_CHECKPOINT_EPOCH_COLLECTION_SECONDS
-            ),
-            timeout_seconds=WINDOW_TIMEOUT_SECONDS,
-        )
-        expected_universes = {
-            name: len(environment)
-            for name, environment in self.envs.items()
-        }
-        plan_universes = {
-            item.environment: item.universe_size
-            for item in plan.windows[0].prompt_slices
-        }
-        if (
-            plan.protocol != self._checkpoint_epoch_protocol_binding()
-            or plan.window_count != CHECKPOINT_PUBLISH_INTERVAL_WINDOWS
-            or plan.window_schedule != expected_schedule
-            or plan.training_mode
-            != EXPERIMENTAL_CHECKPOINT_EPOCH_TRAINING_MODE
-            or plan.warmup_rounds
-            != EXPERIMENTAL_CHECKPOINT_EPOCH_WARMUP_ROUNDS
-            or plan.prompt_range_size != PROMPT_RANGE_SIZE
-            or plan.target_groups_per_environment_lane != B_BATCH
-            or plan.candidate_limit_per_environment_lane
-            != EXPERIMENTAL_CHECKPOINT_EPOCH_CANDIDATES_PER_LANE
-            or plan.admission_policy != CHECKPOINT_EPOCH_ADMISSION_POLICY
-            or plan.valuation_policy != CHECKPOINT_EPOCH_VALUATION_POLICY
-            or plan.ranking_policy != CHECKPOINT_EPOCH_RANKING_POLICY
-            or plan.reward_policy != CHECKPOINT_EPOCH_REWARD_POLICY
-            or plan.finalization_policy
-            != CHECKPOINT_EPOCH_FINALIZATION_POLICY
-            or plan.commitments_per_operator_per_environment_lane
-            != EXPERIMENTAL_CHECKPOINT_EPOCH_COMMITMENTS_PER_OPERATOR_PER_LANE
-            or plan.intent_seconds
-            != EXPERIMENTAL_CHECKPOINT_EPOCH_INTENT_SECONDS
-            or plan.backup_activation_fractions
-            != EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_ACTIVATION_FRACTIONS
-            or plan.reveal_seconds
-            != EXPERIMENTAL_CHECKPOINT_EPOCH_REVEAL_SECONDS
-            or plan.candidate_limit_per_environment_lane
-            > MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW
-            or plan_universes != expected_universes
-        ):
-            raise RuntimeError("checkpoint epoch runtime configuration changed")
 
-    def _checkpoint_epoch_window(
-        self,
-        window_number: int,
-    ) -> EpochWindow | None:
-        plan = getattr(self, "_checkpoint_epoch_plan", None)
-        if plan is None:
-            return None
-        offset = int(window_number) - plan.first_window
-        if offset < 0 or offset >= plan.window_count:
-            return None
-        window = plan.windows[offset]
-        if window.offset != offset or window.window_number != window_number:
-            raise RuntimeError("checkpoint epoch window mapping is invalid")
-        return window
 
-    async def _checkpoint_epoch_drand_snapshot(self) -> tuple[dict, int]:
-        from reliquary.infrastructure.drand import get_current_chain
 
-        chain_info = await asyncio.to_thread(get_current_chain)
-        current_round = chain.compute_current_drand_round(
-            time.time(),
-            chain_info["genesis_time"],
-            chain_info["period"],
-        )
-        return chain_info, int(current_round)
 
-    async def _verify_checkpoint_epoch_beacon(
-        self,
-        beacon: BeaconBinding,
-    ) -> None:
-        from reliquary.infrastructure.drand import verify_beacon_signature
 
-        from reliquary.infrastructure.drand import get_beacon
 
-        fetched = await asyncio.to_thread(
-            get_beacon,
-            round_id=str(beacon.round),
-            use_drand=True,
-            use_fallback=False,
-        )
-        signature = fetched.get("signature")
-        if (
-            str(fetched.get("source")) != beacon.source
-            or str(fetched.get("chain")) != beacon.chain
-            or str(fetched.get("chain_hash")) != beacon.chain_hash
-            or int(fetched.get("round", -1)) != beacon.round
-            or str(fetched.get("randomness")) != beacon.randomness
-            or not signature
-        ):
-            raise RuntimeError("checkpoint epoch beacon does not match drand")
-        verified = await asyncio.to_thread(
-            verify_beacon_signature,
-            beacon.chain_hash,
-            beacon.round,
-            beacon.randomness,
-            str(signature),
-        )
-        if verified is not True:
-            raise RuntimeError("checkpoint epoch beacon verification failed")
 
-    async def _checkpoint_epoch_intent(
-        self,
-        checkpoint,
-        *,
-        next_window: int,
-    ) -> EpochCommitIntent:
-        store = self._checkpoint_epoch_store
-        if store is None:
-            raise RuntimeError("checkpoint epoch store is unavailable")
-        protocol = self._checkpoint_epoch_protocol_binding()
-        existing = store.load_current_intent()
-        if (
-            existing is not None
-            and existing.protocol == protocol
-            and existing.checkpoint.number == int(checkpoint.checkpoint_n)
-            and existing.checkpoint.repo_id == str(checkpoint.repo_id)
-            and existing.checkpoint.revision == str(checkpoint.revision)
-            and existing.first_window
-            <= next_window
-            < existing.first_window + existing.window_count
-            and store.is_confirmed(existing)
-        ):
-            publication = store.load_signed_intent(existing)
-            if publication is None:
-                raise RuntimeError("confirmed checkpoint epoch intent is unsigned")
-            self.server.set_checkpoint_epoch_signed_intent(
-                canonical_signed_intent_bytes(publication),
-                intent_sha256=publication.intent_sha256,
-            )
-            return existing
-
-        for _attempt in range(4):
-            chain_info, observed_round = await self._checkpoint_epoch_drand_snapshot()
-            intent = build_epoch_intent(
-                protocol=protocol,
-                checkpoint_number=int(checkpoint.checkpoint_n),
-                checkpoint_repo_id=str(checkpoint.repo_id),
-                checkpoint_revision=str(checkpoint.revision),
-                commit_observed_round=observed_round,
-                first_window=next_window,
-                window_count=CHECKPOINT_PUBLISH_INTERVAL_WINDOWS,
-                beacon_chain=str(chain_info["name"]),
-                beacon_chain_hash=str(chain_info["hash"]),
-                warmup_rounds=EXPERIMENTAL_CHECKPOINT_EPOCH_WARMUP_ROUNDS,
-                window_schedule=WindowSchedule(
-                    mode=CHECKPOINT_EPOCH_SCHEDULE_MODE,
-                    collection_seconds=(
-                        EXPERIMENTAL_CHECKPOINT_EPOCH_COLLECTION_SECONDS
-                    ),
-                    timeout_seconds=WINDOW_TIMEOUT_SECONDS,
-                ),
-                training_mode=EXPERIMENTAL_CHECKPOINT_EPOCH_TRAINING_MODE,
-                prompt_range_size=PROMPT_RANGE_SIZE,
-                target_groups_per_environment_lane=B_BATCH,
-                candidate_limit_per_environment_lane=(
-                    EXPERIMENTAL_CHECKPOINT_EPOCH_CANDIDATES_PER_LANE
-                ),
-                admission_policy=CHECKPOINT_EPOCH_ADMISSION_POLICY,
-                valuation_policy=CHECKPOINT_EPOCH_VALUATION_POLICY,
-                ranking_policy=CHECKPOINT_EPOCH_RANKING_POLICY,
-                reward_policy=CHECKPOINT_EPOCH_REWARD_POLICY,
-                finalization_policy=CHECKPOINT_EPOCH_FINALIZATION_POLICY,
-                commitments_per_operator_per_environment_lane=(
-                    EXPERIMENTAL_CHECKPOINT_EPOCH_COMMITMENTS_PER_OPERATOR_PER_LANE
-                ),
-                intent_seconds=EXPERIMENTAL_CHECKPOINT_EPOCH_INTENT_SECONDS,
-                backup_activation_fractions=(
-                    EXPERIMENTAL_CHECKPOINT_EPOCH_BACKUP_ACTIVATION_FRACTIONS
-                ),
-                reveal_seconds=EXPERIMENTAL_CHECKPOINT_EPOCH_REVEAL_SECONDS,
-                environment_universes={
-                    name: len(environment) for name, environment in self.envs.items()
-                },
-            )
-            store.install_intent(intent)
-            publication = SignedEpochIntent(
-                intent=intent,
-                intent_sha256=intent.intent_id,
-                validator_hotkey=str(self.wallet.hotkey.ss58_address),
-                validator_signature=self.wallet.hotkey.sign(
-                    intent_signing_bytes(intent)
-                ).hex(),
-            )
-            signed_raw = store.install_signed_intent(publication)
-            _, confirmed_round = await self._checkpoint_epoch_drand_snapshot()
-            if confirmed_round < intent.beacon_target_round:
-                store.confirm_before_beacon(
-                    intent,
-                    observed_round=confirmed_round,
-                )
-                self.server.set_checkpoint_epoch_signed_intent(
-                    signed_raw,
-                    intent_sha256=publication.intent_sha256,
-                )
-                return intent
-        raise RuntimeError(
-            "could not persist checkpoint epoch intent before its beacon"
-        )
-
-    async def _plan_from_checkpoint_epoch_intent(
-        self,
-        intent: EpochCommitIntent,
-    ) -> EpochPlan:
-        store = self._checkpoint_epoch_store
-        if store is None or not store.is_confirmed(intent):
-            raise RuntimeError("checkpoint epoch intent is not confirmed")
-
-        while True:
-            _, current_round = await self._checkpoint_epoch_drand_snapshot()
-            if current_round >= intent.beacon_target_round:
-                break
-            await asyncio.sleep(0.25)
-
-        from reliquary.infrastructure.drand import get_beacon
-
-        fetched = await asyncio.to_thread(
-            get_beacon,
-            round_id=str(intent.beacon_target_round),
-            use_drand=True,
-            use_fallback=False,
-        )
-        beacon = BeaconBinding(
-            source=str(fetched["source"]),
-            chain=str(fetched["chain"]),
-            chain_hash=str(fetched["chain_hash"]),
-            round=int(fetched["round"]),
-            randomness=str(fetched["randomness"]),
-        )
-        await self._verify_checkpoint_epoch_beacon(beacon)
-        plan = plan_from_intent(intent, beacon=beacon)
-        store.install_plan(intent, plan)
-        return plan
-
-    async def _ensure_checkpoint_epoch_plan(self) -> EpochPlan | None:
-        if not EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED:
-            return None
-        if (
-            CHECKPOINT_PUBLISH_INTERVAL_WINDOWS
-            != CHECKPOINT_EPOCH_REQUIRED_WINDOW_COUNT
-        ):
-            raise RuntimeError(
-                "concurrent checkpoint epochs require a configured horizon "
-                f"of {CHECKPOINT_EPOCH_REQUIRED_WINDOW_COUNT} windows"
-            )
-        if not self.use_drand:
-            raise RuntimeError("checkpoint epoch requires verified drand")
-        checkpoint = self._checkpoint_store.current_manifest()
-        if checkpoint is None:
-            self._checkpoint_epoch_plan = None
-            self.server.set_checkpoint_epoch_plan(None)
-            return None
-
-        next_window = (
-            self._candidate_window_n
-            if self._candidate_window_n is not None
-            else self._window_n + 1
-        )
-        active = self._checkpoint_epoch_plan
-        if active is not None and not self._checkpoint_epoch_matches(
-            active, checkpoint
-        ):
-            self._checkpoint_epoch_plan = None
-            self.server.set_checkpoint_epoch_plan(None)
-            active = None
-        if active is not None:
-            self._validate_checkpoint_epoch_runtime_config(active)
-            if self._checkpoint_epoch_window(next_window) is not None:
-                return active
-            raise CheckpointEpochExecutionError(
-                "checkpoint epoch ended without a successor checkpoint"
-            )
-
-        store = self._checkpoint_epoch_store
-        if store is None:
-            raise RuntimeError("checkpoint epoch store is unavailable")
-        restored = store.load_current_plan()
-        if (
-            restored is not None
-            and self._checkpoint_epoch_matches(restored, checkpoint)
-            and store.is_activated(restored)
-        ):
-            terminal_status = store.terminal_status(restored)
-            if terminal_status is None:
-                terminal_status = "aborted"
-                store.mark_terminal(restored, status=terminal_status)
-            if terminal_status == "aborted":
-                self._abort_training_epoch_journal(
-                    restored,
-                    failure_stage="checkpoint_epoch_restart",
-                    failure_type="InterruptedCheckpointEpoch",
-                )
-            else:
-                self._write_training_epoch_marker(
-                    restored,
-                    status="completed",
-                )
-            self._window_n = max(
-                self._window_n,
-                restored.first_window + restored.window_count - 1,
-            )
-            self._candidate_window_n = None
-            next_window = self._window_n + 1
-            logger.warning(
-                "Retired previously activated checkpoint epoch %s status=%s",
-                restored.epoch_id[:12],
-                terminal_status,
-            )
-            self._checkpoint_epoch_plan = None
-            self.server.set_checkpoint_epoch_plan(None)
-            raise CheckpointEpochExecutionError(
-                "activated checkpoint epoch requires a successor checkpoint"
-            )
-        if (
-            restored is not None
-            and self._checkpoint_epoch_matches(restored, checkpoint)
-            and restored.first_window
-            <= next_window
-            < restored.first_window + restored.window_count
-        ):
-            self._validate_checkpoint_epoch_runtime_config(restored)
-            await self._verify_checkpoint_epoch_beacon(restored.epoch_beacon)
-            restored_intent = store.load_current_intent()
-            if (
-                restored_intent is None
-                or not store.is_confirmed(restored_intent)
-                or plan_from_intent(
-                    restored_intent,
-                    beacon=restored.epoch_beacon,
-                )
-                != restored
-            ):
-                raise RuntimeError("restored epoch plan lacks its confirmed intent")
-            restored_publication = store.load_signed_intent(restored_intent)
-            if restored_publication is None:
-                raise RuntimeError("restored epoch plan lacks its signed intent")
-            self.server.set_checkpoint_epoch_signed_intent(
-                canonical_signed_intent_bytes(restored_publication),
-                intent_sha256=restored_publication.intent_sha256,
-            )
-            plan = restored
-        else:
-            intent = await self._checkpoint_epoch_intent(
-                checkpoint,
-                next_window=next_window,
-            )
-            plan = await self._plan_from_checkpoint_epoch_intent(intent)
-            latest = self._checkpoint_store.current_manifest()
-            if not self._checkpoint_epoch_matches(plan, latest):
-                raise RuntimeError(
-                    "checkpoint changed while constructing epoch plan"
-                )
-
-        self._checkpoint_epoch_plan = plan
-        self.server.set_checkpoint_epoch_plan(plan)
-        logger.info(
-            "Checkpoint epoch active id=%s manifest=%s windows=%d..%d",
-            plan.epoch_id[:12],
-            manifest_sha256(plan)[:12],
-            plan.first_window,
-            plan.first_window + plan.window_count - 1,
-        )
-        return plan
-
-    async def _wait_for_checkpoint_epoch_activation(self) -> None:
-        plan = self._checkpoint_epoch_plan
-        next_window = (
-            self._candidate_window_n
-            if self._candidate_window_n is not None
-            else self._window_n + 1
-        )
-        if plan is None or next_window != plan.first_window:
-            return
-        while True:
-            _, current_round = await self._checkpoint_epoch_drand_snapshot()
-            if current_round >= plan.activation_not_before_round:
-                return
-            await asyncio.sleep(0.5)
 
     def _open_window(self) -> None:
         """Prepare one legacy window without exposing it to HTTP yet."""
@@ -2701,7 +2243,6 @@ class ValidationService:
         if self._candidate_activation_nonce is None:
             self._candidate_activation_nonce = os.urandom(32)
         target_window = int(target_window)
-        epoch_window = self._checkpoint_epoch_window(target_window)
         self._set_window_preparation_stage("batcher_construction")
         bootstrap = is_bootstrap_window(
             window_start=target_window,
@@ -2837,33 +2378,6 @@ class ValidationService:
                         FILL_CLOSED_GRADING_START_BUDGET_PER_ENV
                     ),
                 })
-            if epoch_window is not None:
-                plan = self._checkpoint_epoch_plan
-                if plan is None:
-                    raise RuntimeError("checkpoint epoch plan disappeared")
-                slices = [
-                    item
-                    for item in epoch_window.prompt_slices
-                    if item.environment == env_name
-                ]
-                if len(slices) != 1:
-                    raise RuntimeError(
-                        "checkpoint epoch has no unique environment slice"
-                    )
-                open_kwargs.update({
-                    "experimental_epoch_ranking": True,
-                    "experimental_prompt_range": (
-                        slices[0].start,
-                        slices[0].stop,
-                    ),
-                    "collection_seconds": plan.window_schedule.collection_seconds,
-                    "max_productive_candidates": (
-                        plan.candidate_limit_per_environment_lane
-                    ),
-                    "max_ranked_proof_attempts": (
-                        plan.candidate_limit_per_environment_lane
-                    ),
-                })
             if self.proof_scheduler is not None:
                 open_kwargs["proof_scheduler"] = self.proof_scheduler
             if self._proof_worker_pool is not None:
@@ -2882,16 +2396,6 @@ class ValidationService:
             batcher.current_checkpoint_hash = cp_hash
             if shared_fill_state is not None:
                 batcher.fill_state = shared_fill_state
-            if epoch_window is not None:
-                plan = self._checkpoint_epoch_plan
-                if plan is None:
-                    raise RuntimeError("checkpoint epoch plan disappeared")
-                batcher.checkpoint_epoch_id = plan.epoch_id
-                batcher.checkpoint_epoch_manifest_sha256 = manifest_sha256(plan)
-                batcher.checkpoint_epoch_window_offset = epoch_window.offset
-                batcher.checkpoint_epoch_generation_randomness = (
-                    epoch_window.generation_randomness
-                )
             batchers[env_name] = batcher
         return batchers
 
@@ -2933,459 +2437,9 @@ class ValidationService:
         self._publish_window_preparation_state()
         self._set_state(WindowState.OPEN)
 
-    async def _wait_for_checkpoint_epoch_phase_deadline(
-        self,
-        *,
-        seconds_from_open: float | None = None,
-        duration_seconds: float | None = None,
-    ) -> None:
-        """Wait for an epoch phase without sealing any logical lane."""
-        loop = asyncio.get_running_loop()
-        if seconds_from_open is not None:
-            batchers = list(self._active_batchers.values())
-            if not batchers:
-                raise RuntimeError("checkpoint epoch lanes are unavailable")
-            opened = {
-                float(
-                    getattr(batcher, "window_opened_at")
-                    if hasattr(batcher, "window_opened_at")
-                    else getattr(batcher, "opened_at")
-                )
-                for batcher in batchers
-            }
-            if len(opened) != 1:
-                raise RuntimeError("checkpoint epoch lanes did not open together")
-            deadline = next(iter(opened)) + float(seconds_from_open)
-        elif duration_seconds is not None:
-            deadline = loop.time() + float(duration_seconds)
-        else:
-            raise ValueError("checkpoint epoch phase deadline is missing")
-        while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                return
-            await asyncio.sleep(min(0.25, remaining))
 
-    def _open_checkpoint_epoch(self) -> None:
-        """Prepare every logical lane in one checkpoint-wide collection."""
-        plan = self._checkpoint_epoch_plan
-        if plan is None:
-            raise RuntimeError("checkpoint epoch plan is unavailable")
-        if plan.window_count != CHECKPOINT_EPOCH_REQUIRED_WINDOW_COUNT:
-            raise RuntimeError("checkpoint epoch does not contain sixteen lanes")
-        if self._gpu_backlog is not None:
-            raise RuntimeError("checkpoint epoch cannot overlap pipelined backlog")
-        if self._candidate_window_n is None:
-            self._candidate_window_n = self._window_n + 1
-        if self._candidate_window_n != plan.first_window:
-            raise RuntimeError("checkpoint epoch does not start at candidate window")
 
-        batchers: dict[str, GrpoWindowBatcher] = {}
-        for epoch_window in plan.windows:
-            lane = self._build_window_batchers(epoch_window.window_number)
-            for environment, batcher in lane.items():
-                if (
-                    getattr(
-                        batcher,
-                        "checkpoint_epoch_generation_randomness",
-                        None,
-                    )
-                    != epoch_window.generation_randomness
-                ):
-                    raise RuntimeError("checkpoint epoch batcher binding changed")
-                batcher.randomness = epoch_window.generation_randomness
-                batcher.set_prompt_range()
-                batchers[f"{epoch_window.window_number}:{environment}"] = batcher
-        self._active_batchers = batchers
-        self._last_beacon = None
-        self._verify_task = None
 
-    def _activate_checkpoint_epoch(self, chain_info: dict) -> None:
-        """Atomically expose all lanes with one exact OPEN timestamp."""
-        plan = self._checkpoint_epoch_plan
-        if plan is None or not self._active_batchers:
-            raise RuntimeError("checkpoint epoch batchers are unavailable")
-        expected_windows = {window.window_number for window in plan.windows}
-        actual_windows = {
-            int(batcher.window_start)
-            for batcher in self._active_batchers.values()
-        }
-        if actual_windows != expected_windows:
-            raise RuntimeError("checkpoint epoch lane set is incomplete")
-
-        if (
-            str(chain_info["name"]) != plan.epoch_beacon.chain
-            or str(chain_info["hash"]) != plan.epoch_beacon.chain_hash
-        ):
-            raise RuntimeError("drand chain changed before epoch activation")
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-        monotonic_open = loop.time() if loop is not None else time.monotonic()
-        wall_open = time.time()
-        routes: dict[tuple[str, int], GrpoWindowBatcher] = {}
-        for batcher in self._active_batchers.values():
-            batcher._drand_chain_info = chain_info
-            batcher.mark_window_opened(
-                monotonic_time=monotonic_open,
-                wall_time=wall_open,
-            )
-            if loop is not None:
-                batcher.bind_event_loop(loop)
-            environment = str(getattr(batcher.env, "name", ""))
-            route = (environment, int(batcher.window_start))
-            if route in routes:
-                raise RuntimeError("duplicate checkpoint epoch lane")
-            routes[route] = batcher
-
-        store = self._checkpoint_epoch_store
-        if store is None:
-            raise RuntimeError("checkpoint epoch store is unavailable")
-        store.mark_activated(plan)
-        self.server.set_active_epoch_batchers(routes)
-        self._window_n = plan.first_window
-        self._candidate_window_n = None
-        self._window_preparation_stage = None
-        self.server.clear_window_preparation_failure()
-        self._publish_window_preparation_state()
-        self.server.set_checkpoint_epoch_phase("intent")
-        self._set_state(WindowState.OPEN)
-
-    async def _run_checkpoint_epoch(self) -> None:
-        """Collect all lanes together, then consume the frozen reservoir."""
-        plan = self._checkpoint_epoch_plan
-        if plan is None:
-            raise RuntimeError("checkpoint epoch plan is unavailable")
-        epoch_started_at = time.monotonic()
-        pipeline_state: dict[str, Any] = {
-            "schema_version": 1,
-            "epoch_id": plan.epoch_id,
-            "finalization_policy": plan.finalization_policy,
-            "phase": "opening",
-            "lanes_total": plan.window_count,
-            "lanes_finalized": 0,
-            "lane_metrics": {},
-            "terminal_status": None,
-        }
-
-        def publish_pipeline(**updates: Any) -> None:
-            pipeline_state.update(updates)
-            pipeline_state["elapsed_seconds"] = round(
-                max(0.0, time.monotonic() - epoch_started_at),
-                6,
-            )
-            self.server.set_checkpoint_epoch_pipeline_state(pipeline_state)
-
-        publish_pipeline()
-        activated = False
-        late_drops: dict | None = None
-        completed_windows: set[int] = set()
-        lane_batchers: dict[int, dict[str, GrpoWindowBatcher]] = {
-            window.window_number: {} for window in plan.windows
-        }
-
-        def close_failed_epoch(failure_type: str) -> None:
-            publish_pipeline(
-                phase="terminal",
-                terminal_status="aborted",
-                failure_type=str(failure_type),
-            )
-            self.server.set_active_epoch_batchers({})
-            if activated:
-                failure_stage = self._window_iteration_stage
-                for window in plan.windows:
-                    if window.window_number in completed_windows:
-                        continue
-                    lane = lane_batchers[window.window_number]
-                    if not lane:
-                        continue
-                    try:
-                        self._enqueue_aborted_window(
-                            failure_stage=failure_stage,
-                            failure_type=failure_type,
-                            batchers=lane,
-                            late_drops=late_drops,
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Failed to tombstone checkpoint epoch lane %d",
-                            window.window_number,
-                        )
-            self._active_batchers = {}
-            if activated:
-                self._window_n = plan.first_window + plan.window_count - 1
-                store = self._checkpoint_epoch_store
-                if store is not None:
-                    store.mark_terminal(plan, status="aborted")
-                self._abort_training_epoch_journal(
-                    plan,
-                    failure_stage=failure_stage,
-                    failure_type=failure_type,
-                )
-            self._set_state(WindowState.READY)
-
-        try:
-            self._window_iteration_stage = "checkpoint_epoch_open"
-            self._open_checkpoint_epoch()
-            for batcher in self._active_batchers.values():
-                environment = str(getattr(batcher.env, "name", ""))
-                lane_batchers[int(batcher.window_start)][environment] = batcher
-            if any(
-                set(lane_batchers[window.window_number]) != set(self.envs)
-                for window in plan.windows
-            ):
-                raise RuntimeError(
-                    "checkpoint epoch environment reservoir is incomplete"
-                )
-
-            first_lane = lane_batchers[plan.first_window]
-            self._window_iteration_stage = "checkpoint_epoch_admission_pools"
-            await self.server.prepare_admission_pools(first_lane)
-            activation_chain_info, _ = (
-                await self._checkpoint_epoch_drand_snapshot()
-            )
-            self._activate_checkpoint_epoch(activation_chain_info)
-            activated = True
-
-            self._window_iteration_stage = "checkpoint_epoch_intent"
-            intent_started_at = time.monotonic()
-            publish_pipeline(phase="intent")
-            await self._wait_for_checkpoint_epoch_phase_deadline(
-                duration_seconds=plan.intent_seconds
-            )
-            publish_pipeline(
-                phase="selection",
-                intent_seconds=round(
-                    max(0.0, time.monotonic() - intent_started_at),
-                    6,
-                ),
-            )
-            # Close intent ingress synchronously before any await, freeze the
-            # exact population, and only then fetch beacon A. A miner therefore
-            # cannot decide what to generate after seeing admission randomness.
-            self.server.set_checkpoint_epoch_phase("selection")
-            await self.server.drain_checkpoint_epoch_generation_intents()
-            _, intent_close_round = await self._checkpoint_epoch_drand_snapshot()
-            frozen_set = self.server.freeze_checkpoint_epoch_generation_intent_set(
-                intent_close_round=intent_close_round,
-                validator_hotkey=str(self.wallet.hotkey.ss58_address),
-            )
-            publication = SignedGenerationIntentSet(
-                intent_set=frozen_set,
-                intent_set_sha256=generation_intent_set_sha256(frozen_set),
-                validator_signature=self.wallet.hotkey.sign(
-                    generation_intent_set_signing_bytes(frozen_set)
-                ).hex(),
-            )
-            store = self._checkpoint_epoch_store
-            if store is None:
-                raise RuntimeError("checkpoint epoch store is unavailable")
-            store.install_generation_intent_set(plan, publication)
-            self.server.install_checkpoint_epoch_generation_intent_set(publication)
-            _, admission_beacon = await self._fetch_checkpoint_epoch_admission_beacon(
-                commitment_close_round=intent_close_round,
-            )
-            generation_deadline_ts = (
-                time.time() + plan.window_schedule.collection_seconds
-            )
-            selected_counts = self.server.select_checkpoint_epoch_generation_tickets(
-                intent_close_round=intent_close_round,
-                admission_beacon=admission_beacon,
-                generation_deadline_ts=generation_deadline_ts,
-            )
-            primary_count = sum(
-                counts["primary"] for counts in selected_counts.values()
-            )
-            standby_count = sum(
-                counts["standby"] for counts in selected_counts.values()
-            )
-            logger.info(
-                "Checkpoint epoch %s intents closed lanes=%d "
-                "intent_round=%d admission_round=%d primary=%d standby=%d",
-                plan.epoch_id[:12],
-                plan.window_count,
-                intent_close_round,
-                admission_beacon.round,
-                primary_count,
-                standby_count,
-            )
-
-            self._window_iteration_stage = "checkpoint_epoch_generation"
-            generation_started_at = time.monotonic()
-            publish_pipeline(
-                phase="generation",
-                admission_beacon_round=admission_beacon.round,
-                selected_primary=primary_count,
-                selected_standby=standby_count,
-            )
-            previous_fraction = 0.0
-            backup_metrics: list[dict[str, int]] = []
-            for wave, fraction in enumerate(
-                plan.backup_activation_fractions, start=1
-            ):
-                await self._wait_for_checkpoint_epoch_phase_deadline(
-                    duration_seconds=(
-                        plan.window_schedule.collection_seconds
-                        * (fraction - previous_fraction)
-                    )
-                )
-                backup_metrics.append(
-                    self.server.activate_checkpoint_epoch_backup_wave(wave)
-                )
-                previous_fraction = fraction
-            await self._wait_for_checkpoint_epoch_phase_deadline(
-                duration_seconds=(
-                    plan.window_schedule.collection_seconds
-                    * (1.0 - previous_fraction)
-                )
-            )
-            self.server.set_checkpoint_epoch_phase("sealing")
-            publish_pipeline(
-                phase="sealing",
-                generation_seconds=round(
-                    max(0.0, time.monotonic() - generation_started_at),
-                    6,
-                ),
-                backup_waves=backup_metrics,
-            )
-            self._set_state(WindowState.TRAINING)
-            for batcher in self._active_batchers.values():
-                batcher.force_seal("checkpoint_epoch_generation_closed")
-            drain_timeouts = await self._freeze_auction_populations(
-                list(self._active_batchers.values())
-            )
-            if any(drain_timeouts.values()):
-                raise RuntimeError("checkpoint epoch generation drain timed out")
-
-            late_drops = dict(self._late_drops)
-            self._late_drops.clear()
-            reject_counts = dict(
-                getattr(self.server, "_recent_reject_counts", {})
-            )
-            seal_beacon_started_at = time.monotonic()
-            epoch_seal = await self._fetch_checkpoint_epoch_seal_beacon(
-                after_round=admission_beacon.round
-            )
-            publish_pipeline(
-                phase="finalizing",
-                seal_beacon_round=epoch_seal[1].round,
-                seal_beacon_wait_seconds=round(
-                    max(0.0, time.monotonic() - seal_beacon_started_at),
-                    6,
-                ),
-            )
-            # Close every route after selected reveals are frozen.
-            self.server.set_active_epoch_batchers({})
-
-            for index, window in enumerate(plan.windows):
-                final_lane = index == plan.window_count - 1
-                lane = lane_batchers[window.window_number]
-                self._active_batchers = lane
-                self._window_n = window.window_number
-                self._window_iteration_stage = (
-                    "checkpoint_epoch_finalize"
-                    if final_lane
-                    else "checkpoint_epoch_reservoir"
-                )
-                lane_started_at = time.monotonic()
-                await self._train_and_publish(
-                    batchers=lane,
-                    window_n=window.window_number,
-                    verify_task=None,
-                    late_drops=late_drops if final_lane else {},
-                    server_reject_counts=(
-                        reject_counts if final_lane else {}
-                    ),
-                    epoch_seal=epoch_seal,
-                    epoch_finalize=final_lane,
-                )
-                completed_windows.add(window.window_number)
-                lane_metrics = dict(pipeline_state["lane_metrics"])
-                lane_metrics[str(window.offset)] = {
-                    "window_number": window.window_number,
-                    "elapsed_seconds": round(
-                        max(0.0, time.monotonic() - lane_started_at),
-                        6,
-                    ),
-                    "proof_attempts": sum(
-                        int(getattr(batcher, "proof_attempts", 0) or 0)
-                        for batcher in lane.values()
-                    ),
-                    "proof_wall_seconds": round(
-                        sum(
-                            float(
-                                getattr(
-                                    batcher,
-                                    "proof_wall_elapsed_seconds",
-                                    0.0,
-                                )
-                                or 0.0
-                            )
-                            for batcher in lane.values()
-                        ),
-                        6,
-                    ),
-                    "selected_groups": sum(
-                        (
-                            len(batcher.valid_submissions())
-                            if callable(
-                                getattr(batcher, "valid_submissions", None)
-                            )
-                            else int(getattr(batcher, "valid_count", 0) or 0)
-                        )
-                        for batcher in lane.values()
-                    ),
-                }
-                publish_pipeline(
-                    lane_metrics=lane_metrics,
-                    lanes_finalized=len(completed_windows),
-                )
-        except asyncio.CancelledError:
-            close_failed_epoch("CancelledError")
-            raise
-        except FatalProofPlaneError:
-            close_failed_epoch("FatalProofPlaneError")
-            raise
-        except Exception as exc:
-            close_failed_epoch(type(exc).__name__)
-            if activated:
-                raise CheckpointEpochExecutionError(
-                    "checkpoint epoch failed after its common OPEN"
-                ) from exc
-            raise
-
-        self._active_batchers = {}
-        self._window_n = plan.first_window + plan.window_count - 1
-        store = self._checkpoint_epoch_store
-        if store is None:
-            raise RuntimeError("checkpoint epoch store is unavailable")
-        epoch_windows = {window.window_number for window in plan.windows}
-        training_status = (
-            "aborted"
-            if epoch_windows.intersection(self._training_tombstoned_windows)
-            else "completed"
-        )
-        store.mark_terminal(plan, status=training_status)
-        if training_status == "aborted":
-            self._abort_training_epoch_journal(
-                plan,
-                failure_stage="checkpoint_epoch_training_journal",
-                failure_type="IncompleteCheckpointEpoch",
-            )
-        else:
-            self._write_training_epoch_marker(plan, status="completed")
-        publish_pipeline(
-            phase="terminal",
-            terminal_status=training_status,
-        )
-        log_structured(
-            logger,
-            logging.INFO,
-            "checkpoint_epoch_pipeline",
-            dict(pipeline_state),
-        )
-        self._set_state(WindowState.READY)
 
     async def _refresh_registered_hotkeys(
         self,
@@ -4023,21 +3077,6 @@ class ValidationService:
                 else self._window_n
             )
         self._set_window_preparation_stage("randomness")
-        epoch_window = self._checkpoint_epoch_window(target_window)
-        if epoch_window is not None:
-            for batcher in self._active_batchers.values():
-                if (
-                    getattr(batcher, "checkpoint_epoch_generation_randomness", None)
-                    != epoch_window.generation_randomness
-                ):
-                    raise RuntimeError(
-                        "prepared batcher does not match checkpoint epoch"
-                    )
-                batcher.randomness = epoch_window.generation_randomness
-                batcher.set_prompt_range()
-            self._last_beacon = None
-            self._verify_task = None
-            return
         # 3 attempts total: original + 2 retries. Backoff is 0.5s then 1.0s,
         # so worst-case added latency is 1.5s — well inside the 60s window
         # budget. Sustained outages still bubble after attempt 3.
@@ -4284,8 +3323,6 @@ class ValidationService:
         verify_task=None,
         late_drops: dict | None = None,
         server_reject_counts: dict | None = None,
-        epoch_seal: tuple[int, BeaconBinding] | None = None,
-        epoch_finalize: bool = False,
     ) -> None:
         """TRAINING + PUBLISHING + READY phases for one sealed window."""
         # Pipelined mode passes the SEALED window's batchers explicitly while
@@ -4387,27 +3424,9 @@ class ValidationService:
         # forensic sample. If the bounded fetch fails, v5 uses its deterministic
         # operator/prompt ticket (legacy non-throughput profiles retain exact
         # validator-arrival fallback) and forensics are disabled.
-        epoch_batchers = [
-            batcher
-            for batcher in batchers.values()
-            if getattr(batcher, "experimental_epoch_ranking", False) is True
-        ]
-        if epoch_batchers:
-            if len(epoch_batchers) != len(batchers):
-                raise RuntimeError("mixed epoch and production ranking window")
-            close_round, seal_beacon = (
-                epoch_seal
-                if epoch_seal is not None
-                else await self._fetch_checkpoint_epoch_seal_beacon()
-            )
-            for batcher in epoch_batchers:
-                batcher.collection_close_drand_round = close_round
-                batcher.seal_randomness = seal_beacon.randomness
-                batcher.seal_beacon_round = seal_beacon.round
-        else:
-            seal_randomness = await self._fetch_seal_randomness()
-            for b in batchers.values():
-                b.seal_randomness = seal_randomness
+        seal_randomness = await self._fetch_seal_randomness()
+        for b in batchers.values():
+            b.seal_randomness = seal_randomness
         # Both environments submit their strict rank order to one global,
         # device-owning scheduler. The scheduler applies decisions in rank
         # order even when distinct replicas finish out of order.
@@ -4656,26 +3675,12 @@ class ValidationService:
         }
 
         env_order = [name for name, _ in self.env_mix]
-        allow_partial_epoch_batch = bool(
-            epoch_finalize
-            and EXPERIMENTAL_CHECKPOINT_EPOCH_TRAINING_MODE
-            == "aggregate_one_step"
-        )
         accumulator_ready = (
             len(checkpoint_revisions) == 1
-            and (
-                self._training_accumulator.ready
-                or (
-                    allow_partial_epoch_batch
-                    and self._training_accumulator.has_groups_for_all_targets
-                )
-            )
+            and self._training_accumulator.ready
         )
         batches = (
-            self._training_accumulator.training_batches(
-                env_order,
-                allow_partial=allow_partial_epoch_batch,
-            )
+            self._training_accumulator.training_batches(env_order)
             if accumulator_ready else []
         )
 
@@ -4750,9 +3755,6 @@ class ValidationService:
                 self._checkpoint_n,
                 TRAIN_UNTIL_CHECKPOINT_N,
             )
-            if detached_trainer and epoch_finalize:
-                accumulator_meta["discarded"] = self._training_accumulator.reset()
-                accumulator_meta["reset_reason"] = "detached_epoch_journal_owns_batch"
         elif accumulator_ready:
             accumulator_meta["training_attempted"] = True
             try:
@@ -4881,16 +3883,12 @@ class ValidationService:
                 self._trained_windows_since_publish >= self._publish_every
                 or self._adaptive_publication_pending
                 or (
-                    epoch_finalize
-                    and self._trained_windows_since_publish > 0
-                )
-                or (
                     trained
                     and self._checkpoint_store.current_manifest() is None
                 )
             )
         )
-        if should_publish and not owns_routing and not epoch_finalize:
+        if should_publish and not owns_routing:
             # SERIAL BEAT: publication only ever runs in a serial iteration,
             # where no window is collecting against the old checkpoint. This
             # half is pipelined (adaptive drift or a quarantined train step
@@ -4909,8 +3907,6 @@ class ValidationService:
                 publication_reason = "adaptive_policy_ratio_drift"
             elif self._trained_windows_since_publish >= self._publish_every:
                 publication_reason = "cadence"
-            elif epoch_finalize:
-                publication_reason = "checkpoint_epoch"
             else:
                 publication_reason = "bootstrap"
             try:
@@ -4952,7 +3948,7 @@ class ValidationService:
                         self._synchronize_proof_models,
                         entry.revision,
                     )
-                if publication_retry_pending or epoch_finalize:
+                if publication_retry_pending:
                     discarded = self._training_accumulator.reset()
                     post_publish_state = self._training_accumulator.snapshot()
                     accumulator_meta["post_publish_discarded"] = discarded
@@ -5763,10 +4759,6 @@ class ValidationService:
         from reliquary.shared.training_payload import encode_training_payload
 
         try:
-            checkpoint_epoch = ValidationService._training_payload_epoch_binding(
-                self,
-                window_n,
-            )
             data = encode_training_payload(
                 window_batches,
                 window_start=int(window_n),
@@ -5774,7 +4766,6 @@ class ValidationService:
                 env_order=[name for name, _ in self.env_mix],
                 env_targets=dict(self.env_mix),
                 window_quarantine=dict(window_quarantine or {}),
-                checkpoint_epoch=checkpoint_epoch,
             )
             self._training_payload_queue_ref().enqueue_payload(
                 int(window_n),
@@ -5801,42 +4792,12 @@ class ValidationService:
                 "PayloadEncodeError",
             )
 
-    def _training_payload_epoch_binding(
-        self,
-        window_start: int,
-        *,
-        plan: EpochPlan | None = None,
-    ):
-        epoch_plan = plan or getattr(self, "_checkpoint_epoch_plan", None)
-        if epoch_plan is None:
-            return None
-        offset = int(window_start) - epoch_plan.first_window
-        if offset < 0 or offset >= epoch_plan.window_count:
-            return None
-        from reliquary.shared.training_payload import (
-            CheckpointEpochTrainingBinding,
-        )
-
-        return CheckpointEpochTrainingBinding(
-            epoch_id=epoch_plan.epoch_id,
-            manifest_sha256=manifest_sha256(epoch_plan),
-            training_run_id=TRAINING_RUN_ID,
-            training_mode=epoch_plan.training_mode,
-            first_window=epoch_plan.first_window,
-            lane_offset=offset,
-            window_count=epoch_plan.window_count,
-            target_groups_per_environment_lane=(
-                epoch_plan.target_groups_per_environment_lane
-            ),
-        )
 
     def _write_training_tombstone(
         self,
         window_start: int,
         failure_stage: str,
         failure_type: str,
-        *,
-        checkpoint_epoch_plan: EpochPlan | None = None,
     ) -> None:
         """Tombstone keeps the trainer's journal gapless: the trainer
         never advances on absence, only on an explicit marker."""
@@ -5846,26 +4807,18 @@ class ValidationService:
             return
         from reliquary.shared.training_payload import encode_tombstone
 
-        checkpoint_epoch = ValidationService._training_payload_epoch_binding(
-            self,
-            window_start,
-            plan=checkpoint_epoch_plan,
-        )
-        if FILL_CLOSED_ENABLED and checkpoint_epoch is None:
+        if FILL_CLOSED_ENABLED:
             self._write_fill_closed_window_tombstones(
                 int(window_start), str(failure_stage), str(failure_type),
             )
             return
         try:
-            if checkpoint_epoch is not None:
-                self._training_tombstoned_windows.add(int(window_start))
             self._training_payload_queue_ref().enqueue_tombstone(
                 int(window_start),
                 encode_tombstone(
                     window_start=int(window_start),
                     failure_stage=str(failure_stage),
                     failure_type=str(failure_type),
-                    checkpoint_epoch=checkpoint_epoch,
                 ),
             )
         except Exception:
@@ -5873,73 +4826,8 @@ class ValidationService:
                 "training tombstone write failed for window %s",
                 window_start,
             )
-            if checkpoint_epoch is not None:
-                raise
 
-    def _write_training_epoch_marker(
-        self,
-        plan: EpochPlan,
-        *,
-        status: str,
-    ) -> None:
-        from reliquary.constants import WRITE_TRAINING_PAYLOADS
 
-        if not WRITE_TRAINING_PAYLOADS:
-            return
-        from reliquary.shared.training_payload import (
-            encode_checkpoint_epoch_marker,
-        )
-
-        binding = self._training_payload_epoch_binding(
-            plan.first_window,
-            plan=plan,
-        )
-        if binding is None:
-            raise RuntimeError("checkpoint epoch marker has no plan binding")
-        try:
-            data = encode_checkpoint_epoch_marker(binding, status=status)
-            self._training_payload_queue_ref().enqueue_epoch_marker(
-                plan.epoch_id,
-                data,
-            )
-            self._training_tombstoned_windows.difference_update(
-                range(
-                    plan.first_window,
-                    plan.first_window + plan.window_count,
-                )
-            )
-        except Exception:
-            logger.exception(
-                "training epoch marker write failed for epoch %s",
-                plan.epoch_id[:12],
-            )
-            raise
-
-    def _abort_training_epoch_journal(
-        self,
-        plan: EpochPlan,
-        *,
-        failure_stage: str,
-        failure_type: str,
-    ) -> None:
-        """Make an aborted epoch gapless before publishing its commit marker."""
-        failures: list[int] = []
-        for window in plan.windows:
-            try:
-                self._write_training_tombstone(
-                    window.window_number,
-                    failure_stage,
-                    failure_type,
-                    checkpoint_epoch_plan=plan,
-                )
-            except Exception:
-                failures.append(window.window_number)
-        if failures:
-            raise RuntimeError(
-                "checkpoint epoch abort journal is incomplete for windows "
-                + ",".join(str(window) for window in failures)
-            )
-        self._write_training_epoch_marker(plan, status="aborted")
 
     def _training_payload_queue_ref(self):
         """Injected queue for tests; process singleton in production."""
@@ -5999,8 +4887,7 @@ class ValidationService:
     ) -> None:
         """R13: enqueue_fn injected into this window's
         ``FillClosedBatchAssembler``. Independent of the seal-time
-        ``_write_training_payload`` -- no checkpoint-epoch binding here
-        (v6 windows are not epoch-final windows). The assembler itself
+        ``_write_training_payload``. The assembler itself
         now runs ``assess_training_batch`` per batch (R14) and only
         calls this for batches it did NOT quarantine; a quarantined
         batch goes to ``_write_fill_closed_training_tombstone`` instead.
@@ -6074,7 +4961,7 @@ class ValidationService:
             "archive_enqueue",
             "pipelined_stash",
             "pipelined_train_archive",
-        } and not str(iteration_stage).startswith("checkpoint_epoch_"):
+        }:
             return
         # The archive-dedup guard above also dedups this tombstone: one
         # marker per aborted window, matching the trainer's journal.
@@ -6425,21 +5312,6 @@ class ValidationService:
                             "proof_replica_refresh"
                         )
                     await self._ensure_proof_scheduler_ready()
-                    self._window_iteration_stage = "checkpoint_epoch"
-                    checkpoint_epoch = await self._ensure_checkpoint_epoch_plan()
-                    await self._wait_for_checkpoint_epoch_activation()
-                    if checkpoint_epoch is not None:
-                        await self._run_checkpoint_epoch()
-                        self._windows_since_cooldown_snapshot += (
-                            checkpoint_epoch.window_count
-                        )
-                        if (
-                            self._windows_since_cooldown_snapshot
-                            >= COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS
-                        ):
-                            if await self._snapshot_committed_cooldowns():
-                                self._windows_since_cooldown_snapshot = 0
-                        continue
                     self._window_iteration_stage = "open"
                     # Experimental fill mode never treats its synchronization
                     # backstop or emergency freeze as permission to open.  The
@@ -6677,15 +5549,6 @@ class ValidationService:
                     # task running off the same R2 archives; no need to do it
                     # here. The trainer is purely about training + uploads.
                 except asyncio.CancelledError:
-                    raise
-                except CheckpointEpochExecutionError:
-                    logger.exception(
-                        "Checkpoint epoch stopped after partial execution; "
-                        "terminating for a clean checkpoint reload"
-                    )
-                    self.server.set_active_batchers({})
-                    self._active_batchers = {}
-                    self._set_state(WindowState.READY)
                     raise
                 except FatalProofPlaneError:
                     logger.exception(
@@ -7746,75 +6609,8 @@ class ValidationService:
         block_hash = await chain.get_block_hash(subtensor, target_window)
         return chain.compute_window_randomness(block_hash), None
 
-    async def _fetch_checkpoint_epoch_post_phase_beacon(
-        self,
-        *,
-        after_round: int = 0,
-        phase_close_round: int | None = None,
-    ) -> tuple[int, BeaconBinding]:
-        """Return the first verified beacon after a locally observed phase end."""
-        plan = self._checkpoint_epoch_plan
-        if plan is None or not self.use_drand:
-            raise RuntimeError("checkpoint epoch seal requires drand")
-        chain_info, observed_round = await self._checkpoint_epoch_drand_snapshot()
-        close_round = (
-            observed_round if phase_close_round is None else int(phase_close_round)
-        )
-        if (
-            str(chain_info["name"]) != plan.epoch_beacon.chain
-            or str(chain_info["hash"]) != plan.epoch_beacon.chain_hash
-        ):
-            raise RuntimeError("drand chain changed during checkpoint epoch")
-        # Choose the target only after all phase data was frozen and persisted.
-        # If persistence crossed a drand boundary, skip that now-known output.
-        target_round = max(observed_round, close_round, int(after_round)) + 1
-        while True:
-            _, current_round = await self._checkpoint_epoch_drand_snapshot()
-            if current_round >= target_round:
-                break
-            await asyncio.sleep(0.25)
 
-        from reliquary.infrastructure.drand import get_beacon
 
-        fetched = await asyncio.to_thread(
-            get_beacon,
-            round_id=str(target_round),
-            use_drand=True,
-            use_fallback=False,
-        )
-        beacon = BeaconBinding(
-            source=str(fetched["source"]),
-            chain=str(fetched["chain"]),
-            chain_hash=str(fetched["chain_hash"]),
-            round=int(fetched["round"]),
-            randomness=str(fetched["randomness"]),
-        )
-        await self._verify_checkpoint_epoch_beacon(beacon)
-        if beacon.round <= close_round:
-            raise RuntimeError("checkpoint epoch phase beacon is not post-close")
-        return close_round, beacon
-
-    async def _fetch_checkpoint_epoch_admission_beacon(
-        self,
-        *,
-        commitment_close_round: int,
-    ) -> tuple[int, BeaconBinding]:
-        plan = self._checkpoint_epoch_plan
-        if plan is None:
-            raise RuntimeError("checkpoint epoch plan is unavailable")
-        return await self._fetch_checkpoint_epoch_post_phase_beacon(
-            after_round=plan.epoch_beacon.round,
-            phase_close_round=commitment_close_round,
-        )
-
-    async def _fetch_checkpoint_epoch_seal_beacon(
-        self,
-        *,
-        after_round: int = 0,
-    ) -> tuple[int, BeaconBinding]:
-        return await self._fetch_checkpoint_epoch_post_phase_beacon(
-            after_round=after_round
-        )
 
     async def _fetch_seal_randomness(self) -> str:
         """Fetch post-seal drand with a bounded retry budget.

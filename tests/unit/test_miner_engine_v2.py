@@ -149,7 +149,6 @@ def test_release_recheck_binds_window_contract_range_and_cooldown():
             if ACTIVE_PROTOCOL_PROFILE.protocol_version >= 3
             else None
         ),
-        checkpoint_epoch_id=None,
         submission_deadline_at=200.0,
     )
     request = SimpleNamespace(
@@ -224,7 +223,6 @@ def test_release_recheck_rejects_deadline_and_checkpoint_change():
         protocol_version=ACTIVE_PROTOCOL_PROFILE.protocol_version,
         generation_profile_id=profile_id,
         generation_contract=contract,
-        checkpoint_epoch_id=None,
         submission_deadline_at=100.0,
     )
     request = SimpleNamespace(

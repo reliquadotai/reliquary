@@ -16,14 +16,11 @@ import pytest
 
 from reliquary import constants as C
 from reliquary.shared.training_payload import (
-    CheckpointEpochTrainingBinding,
     PAYLOAD_SCHEMA_VERSION,
     TOMBSTONE_SCHEMA_VERSION,
     active_training_identity,
-    decode_checkpoint_epoch_marker,
     decode_tombstone,
     decode_training_payload,
-    encode_checkpoint_epoch_marker,
     encode_tombstone,
     encode_training_payload,
 )
@@ -100,28 +97,16 @@ def _replace_payload_header(blob: bytes, **updates) -> bytes:
     return output.getvalue()
 
 
-def _payload_bytes(*, window_start: int = 30100, checkpoint_epoch=None) -> bytes:
+def _payload_bytes(*, window_start: int = 30100) -> bytes:
     return encode_training_payload(
         _window_batches(),
         window_start=window_start,
         checkpoint_revision="rev-abc",
         env_order=["openmathinstruct", "opencodeinstruct"],
         window_quarantine={"quarantined": False, "reasons": []},
-        checkpoint_epoch=checkpoint_epoch,
     )
 
 
-def _epoch_binding(*, first_window: int = 30100):
-    return CheckpointEpochTrainingBinding(
-        epoch_id="1" * 64,
-        manifest_sha256="2" * 64,
-        training_run_id=C.TRAINING_RUN_ID,
-        training_mode="sequential_steps",
-        first_window=first_window,
-        lane_offset=0,
-        window_count=2,
-        target_groups_per_environment_lane=1,
-    )
 
 
 def test_header_round_trip():
@@ -173,16 +158,6 @@ def test_payload_decoder_never_normalizes_checkpoint_revision(
         decode_training_payload(blob)
 
 
-def test_epoch_payload_rejects_a_string_window_identity(monkeypatch):
-    monkeypatch.setattr(C, "PROTOCOL_VERSION", 5)
-    binding = _epoch_binding(first_window=7)
-    blob = _replace_payload_header(
-        _payload_bytes(window_start=7, checkpoint_epoch=binding),
-        window_start="7",
-    )
-
-    with pytest.raises(ValueError, match="non-negative integer"):
-        decode_training_payload(blob)
 
 
 def test_consumed_accessors_round_trip():
@@ -361,17 +336,6 @@ def test_tombstone_requires_a_canonical_window_identity(window_start):
         decode_tombstone(json.dumps(doc).encode("utf-8"))
 
 
-def test_epoch_marker_rejects_a_boolean_schema_version():
-    marker = json.loads(
-        encode_checkpoint_epoch_marker(
-            _epoch_binding(),
-            status="completed",
-        )
-    )
-    marker["schema_version"] = True
-
-    with pytest.raises(ValueError, match="invalid checkpoint epoch marker"):
-        decode_checkpoint_epoch_marker(json.dumps(marker).encode("utf-8"))
 
 
 @pytest.mark.parametrize(
@@ -425,43 +389,3 @@ def test_schema_v2_payload_requires_exact_environment_targets(monkeypatch):
             env_targets={"openmathinstruct": 16},
             window_quarantine={"quarantined": False, "reasons": []},
         )
-
-
-@pytest.mark.parametrize("epoch", [False, True])
-def test_extended_payload_keeps_episode_masks_and_epoch_identity(monkeypatch, epoch):
-    monkeypatch.setattr(C, "PROTOCOL_VERSION", 7)
-    monkeypatch.setattr(C, "T_PROTO", 1.0)
-    rollout = _roll(1.0, 4)
-    rollout._validated_assistant_spans = ((7, 9), (10, 11))
-    rollout._validated_completion_logprobs = [-1.0] * 3
-    blob = encode_training_payload(
-        {"openmathinstruct": [_group([rollout])]}, window_start=30100,
-        checkpoint_revision="a" * 40, env_order=["openmathinstruct"],
-        env_targets={"openmathinstruct": 1}, window_quarantine={},
-        checkpoint_epoch=_epoch_binding() if epoch else None,
-    )
-    decoded = decode_training_payload(blob)
-    assert decoded.schema_version == (5 if epoch else 4)
-    assert decoded.checkpoint_epoch == (_epoch_binding() if epoch else None)
-    restored = decoded.batches()["openmathinstruct"][0].rollouts[0]
-    assert restored._validated_assistant_spans == ((7, 9), (10, 11))
-    assert restored._validated_completion_logprobs == [-1.0] * 3
-    if epoch:
-        with pytest.raises(ValueError, match="omitted checkpoint epoch binding"):
-            decode_training_payload(_replace_payload_header(blob, checkpoint_epoch=None))
-    else:
-        # Published inactive suite schema 3 remains readable, including masks.
-        historical = decode_training_payload(_replace_payload_header(blob, schema_version=3))
-        assert historical.checkpoint_epoch is None
-        assert historical.batches()["openmathinstruct"][0].rollouts[0]._validated_assistant_spans == ((7, 9), (10, 11))
-
-
-def test_historical_epoch_payload_and_targetless_v5_remain_readable(monkeypatch):
-    monkeypatch.setattr(C, "PROTOCOL_VERSION", 5)
-    ordinary = decode_training_payload(_payload_bytes())
-    assert ordinary.schema_version == 2 and ordinary.env_targets == {}
-    epoch = decode_training_payload(_payload_bytes(checkpoint_epoch=_epoch_binding()))
-    assert epoch.schema_version == 3 and epoch.checkpoint_epoch == _epoch_binding()
-    with pytest.raises(ValueError, match="ambiguous schema-3"):
-        decode_training_payload(_replace_payload_header(
-            _payload_bytes(checkpoint_epoch=_epoch_binding()), assistant_spans=[]))
