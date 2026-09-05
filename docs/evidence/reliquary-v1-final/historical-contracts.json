@@ -1,0 +1,42 @@
+{
+  "default_profile": "qwen35-2b-auction-v2",
+  "external_in_any_profile": false,
+  "baselines": [
+    {
+      "baseline": "4544394feecc312ebbfb30f7e0815fe62d034b33",
+      "all_baseline_fields_unchanged": true,
+      "added_fields_in_historical_profiles_are_null": true,
+      "generation_contract_sha256": {
+        "qwen35-2b-auction-v2": "d763f85b1366ac1b25d0de1251899d6a8aceee11f5235f18817176a039d15dd1",
+        "qwen35-4b-auction-v3": "3d0b7013d980b565065e19627fbaeb592c96a1604fb7bd3af8e31d15d04c87e8",
+        "qwen3-4b-base-dapo-v4": "e3098b00582d395fc7176ff835c988588e29a530343942c081781f1bab65de91",
+        "qwen3-4b-base-dapo-reasoning-v5": "19e98f5a3ddac1980efe66fd80db1ec0f8db87a5e60934efd5d0e8985435eadd"
+      },
+      "new_profiles": [
+        "qwen3-4b-base-dapo-fill-closed-v6",
+        "qwen3-4b-reliquary-episode-v7-dev1",
+        "qwen3-4b-reliquary-logic-v8-dev1",
+        "qwen3-4b-reliquary-verifiable-v6-dev1"
+      ]
+    },
+    {
+      "baseline": "71672e14ac2bef54e7be2177e9271c7cd2295c8e",
+      "all_baseline_fields_unchanged": true,
+      "added_fields_in_historical_profiles_are_null": true,
+      "generation_contract_sha256": {
+        "qwen35-2b-auction-v2": "d763f85b1366ac1b25d0de1251899d6a8aceee11f5235f18817176a039d15dd1",
+        "qwen35-4b-auction-v3": "3d0b7013d980b565065e19627fbaeb592c96a1604fb7bd3af8e31d15d04c87e8",
+        "qwen3-4b-base-dapo-v4": "e3098b00582d395fc7176ff835c988588e29a530343942c081781f1bab65de91",
+        "qwen3-4b-base-dapo-reasoning-v5": "19e98f5a3ddac1980efe66fd80db1ec0f8db87a5e60934efd5d0e8985435eadd",
+        "qwen3-4b-base-dapo-fill-closed-v6": "1696eef2a8ff52284842f2253d6f699b50bc657dc93b20fc61a257db7d449385"
+      },
+      "new_profiles": [
+        "qwen3-4b-reliquary-episode-v7-dev1",
+        "qwen3-4b-reliquary-logic-v8-dev1",
+        "qwen3-4b-reliquary-verifiable-v6-dev1"
+      ]
+    }
+  ],
+  "determinism_corpus_sha256": "8ded73c1867bc2d883f57d3fbcaece91829a563dc74b50a2932262dbf9ad6e55",
+  "determinism_corpus_git_blob": "9819e06c24a69ba26b527e824bd3189f670ea7ac"
+}

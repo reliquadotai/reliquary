@@ -39,6 +39,13 @@ from reliquary.constants import (
     DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES,
     DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR,
     ENVIRONMENT_MIX,
+    FILL_CLOSED_ADMISSION_BUDGET_PER_ENV,
+    FILL_CLOSED_ENABLED,
+    FILL_CLOSED_FIRST_PICK_SECONDS,
+    FILL_CLOSED_GRADING_START_BUDGET_PER_ENV,
+    FILL_CLOSED_MAX_SECONDS,
+    FILL_CLOSED_PICK_PIPELINE_DEPTH,
+    FILL_CLOSED_PRECOMMIT_SECONDS,
     FORCED_SEED_CDF_BOUNDARY_EPSILON,
     FORCED_SEED_CDF_ENFORCE,
     FORCED_SEED_CONSISTENCY_FLOOR,
@@ -96,10 +103,20 @@ from reliquary.environment import load_environments
 from reliquary.environment.base import Environment
 from reliquary.infrastructure import chain, storage
 from reliquary.protocol.submission import RejectReason, RolloutSubmission, WindowState
+from reliquary.shared.checkpoint_identity import (
+    canonical_checkpoint_identity,
+    require_checkpoint_number,
+)
+from reliquary.shared.strict_json import strict_json_loads
 from reliquary.validator import telemetry
 from reliquary.validator.batcher import GrpoWindowBatcher
 from reliquary.validator.checkpoint import CheckpointStore
-from reliquary.validator.cooldown import ContentCooldownMap, CooldownMap
+from reliquary.validator.cooldown import (
+    ContentCooldownMap,
+    CooldownMap,
+    parse_content_cooldown_state,
+    parse_prompt_cooldown_state,
+)
 from reliquary.validator.dedup import RolloutHashSet
 from reliquary.validator.errors import FatalProofPlaneError
 from reliquary.validator.observability import log_structured, runtime_revision
@@ -118,6 +135,7 @@ from reliquary.validator.utility_telemetry import UtilityTelemetryWriter
 
 
 _WINDOW_ACTIVATION_RANDOMNESS_DOMAIN = b"reliquary/window-activation/v1\x00"
+_PUBLIC_WINDOW_RANDOMNESS_DOMAIN = b"reliquary/public-window-randomness/v1\x00"
 
 
 def _bind_window_activation_randomness(
@@ -137,15 +155,45 @@ def _bind_window_activation_randomness(
     return digest.hexdigest()
 
 
+def _bind_public_window_randomness(
+    beacon_randomness: str,
+    *,
+    target_window: int,
+) -> str:
+    """Domain-separate a public beacon without adding private entropy."""
+    digest = hashlib.sha256()
+    digest.update(_PUBLIC_WINDOW_RANDOMNESS_DOMAIN)
+    digest.update(int(target_window).to_bytes(8, "big", signed=False))
+    encoded_randomness = str(beacon_randomness).encode("utf-8")
+    digest.update(len(encoded_randomness).to_bytes(4, "big"))
+    digest.update(encoded_randomness)
+    return digest.hexdigest()
+
+
 logger = logging.getLogger(__name__)
 
 _HF_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _STARTUP_HASH_REBUILD_TIMEOUT_SECONDS = 30.0
 
+# v6.1 (R39): how often the between-windows rotation gate re-asks the
+# trainer's consumption cursor. Deliberately NOT the seal loop's 0.5 s --
+# each ask is a bounded R2 GET, and the gate is a wait of
+# seconds-to-a-minute, not a hot loop. Not an operator knob: nothing
+# downstream is sized off it.
+FILL_CLOSED_ROTATION_POLL_SECONDS = 2.0
+
 
 def _cooldown_snapshot_key(run_id: str) -> str:
     """R2 key for the run-keyed cooldown snapshot."""
     return f"cooldown_snapshots/{run_id}.json"
+
+
+def _cooldown_local_path(run_id: str) -> Path:
+    state_dir = Path(
+        os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")
+    )
+    safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id)
+    return state_dir / "cooldown" / f"{safe_run_id}.json.gz"
 
 
 def _content_cooldown_snapshot_key(run_id: str) -> str:
@@ -262,17 +310,17 @@ def _prompt_mismatch_circuit_namespace(
 def _read_gzip_json(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
-    with gzip.open(path, "rt", encoding="utf-8") as handle:
-        value = json.load(handle)
+    with gzip.open(path, "rb") as handle:
+        value = strict_json_loads(handle.read())
     if not isinstance(value, dict):
-        raise ValueError("content cooldown snapshot must be a JSON object")
+        raise ValueError("snapshot must be a JSON object")
     return value
 
 
 def _write_gzip_json_atomic(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
-        prefix=".content-cooldown.", suffix=".json.gz", dir=path.parent
+        prefix=".snapshot.", suffix=".json.gz", dir=path.parent
     )
     try:
         with os.fdopen(fd, "wb") as raw:
@@ -285,6 +333,14 @@ def _write_gzip_json_atomic(path: Path, value: dict[str, Any]) -> None:
             raw.flush()
             os.fsync(raw.fileno())
         os.replace(tmp_name, path)
+        directory_fd = os.open(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except Exception:
         try:
             os.unlink(tmp_name)
@@ -392,9 +448,16 @@ def open_grpo_window(
     tokenizer,
     bootstrap: bool = False,
     queue_drained_predicate=None,
+    emit_training_batch_fn=None,
     operator_by_hotkey: dict[str, str] | None = None,
     proof_scheduler=None,
     verify_commitment_proofs_fn=None,
+    experimental_prompt_range: tuple[int, int] | None = None,
+    collection_seconds: float | None = None,
+    max_productive_candidates: int | None = None,
+    max_grading_starts: int | None = None,
+    max_ranked_proof_attempts: int | None = None,
+    batch_target: int = B_BATCH,
 ) -> GrpoWindowBatcher:
     """Instantiate a GrpoWindowBatcher for this window.
 
@@ -407,6 +470,14 @@ def open_grpo_window(
     can wait for every queued trigger-round submission to be GRAIL-
     validated before firing the seal. See
     ``GrpoWindowBatcher._delayed_seal_at_drand_boundary``.
+
+    ``emit_training_batch_fn`` is v6 only: called with one environment's
+    picked B_BATCH chunk every time that environment takes a pick, from
+    whichever thread called ``pick_training_batch`` (see
+    ``GrpoWindowBatcher.pick_training_batch``). ``None`` here -- no
+    caller wires a detached-trainer writer into it yet; see
+    ``docs/superpowers/plans/2026-08-28-fill-closed-window-v6.md``,
+    Component 4.
     """
     def _completion_text(rollout: RolloutSubmission) -> str:
         prompt_len = rollout.commit.get("rollout", {}).get("prompt_length", 0)
@@ -414,8 +485,17 @@ def open_grpo_window(
         return tokenizer.decode(tokens[prompt_len:])
 
     def _canonical_prompt_tokens(prompt_idx: int) -> list[int]:
+        from reliquary.environment.registry import get_environment_spec
         from reliquary.protocol.tokens import encode_prompt
 
+        try:
+            spec = get_environment_spec(str(getattr(env, "name", "")))
+        except ValueError:
+            spec = None
+        if spec is not None and spec.interaction_mode == "episode":
+            from reliquary.environment.agentic.compat import encode_episode_prompt
+
+            return encode_episode_prompt(tokenizer, env, prompt_idx)
         problem = env.get_problem(prompt_idx)
         return encode_prompt(tokenizer, problem["prompt"])
 
@@ -431,9 +511,16 @@ def open_grpo_window(
         completion_text_fn=_completion_text,
         canonical_prompt_tokens_fn=_canonical_prompt_tokens,
         queue_drained_predicate=queue_drained_predicate,
+        emit_training_batch_fn=emit_training_batch_fn,
         operator_by_hotkey=operator_by_hotkey,
         proof_scheduler=proof_scheduler,
         verify_commitment_proofs_fn=verify_commitment_proofs_fn,
+        experimental_prompt_range=experimental_prompt_range,
+        collection_seconds=collection_seconds,
+        max_productive_candidates=max_productive_candidates,
+        max_grading_starts=max_grading_starts,
+        max_ranked_proof_attempts=max_ranked_proof_attempts,
+        batch_target=batch_target,
     )
 
 
@@ -651,8 +738,21 @@ class ValidationService:
             self.envs: dict[str, Environment] = {_env_name: env}
         else:
             self.env_mix = env_mix if env_mix is not None else list(ENVIRONMENT_MIX)
+            if not self.env_mix:
+                raise ValueError("environment mix must not be empty")
+            names = [str(name) for name, _target in self.env_mix]
+            if any(not name for name in names):
+                raise ValueError("environment names must be non-empty")
+            if len(set(names)) != len(names):
+                raise ValueError("environment mix contains duplicate names")
+            if any(int(target) <= 0 for _name, target in self.env_mix):
+                raise ValueError("environment targets must be positive")
             env_names = [n for n, _ in self.env_mix]
             self.envs = load_environments(env_names)
+
+        self.env_targets = {
+            str(name): int(target) for name, target in self.env_mix
+        }
 
         # Legacy accessor — archive code and tests grew up around single-env.
         # Points to the first env in the mix; consumers needing all envs
@@ -745,6 +845,10 @@ class ValidationService:
         # flight: a shared boolean would let the GPU half's archive of the
         # stashed window suppress the collecting window's tombstone.
         self._archive_enqueued_windows: set[int] = set()
+        # Highest window whose archive/tombstone is durably queued. Periodic
+        # cooldown snapshots may cover this watermark, never a merely opened
+        # or pipelined-stashed window whose seal side effects are still pending.
+        self._cooldown_durable_window: int = 0
         self._window_iteration_stage = "startup"
         self._utility_telemetry = UtilityTelemetryWriter()
         # Detached-trainer payload worker handle; the queue itself is a
@@ -801,18 +905,20 @@ class ValidationService:
         self._checkpoint_n: int = 0
         self._publish_every = CHECKPOINT_PUBLISH_INTERVAL_WINDOWS
         self._trained_windows_since_publish = 0
+        self._training_tombstoned_windows: set[int] = set()
         self._adaptive_publication_pending = False
         self._adaptive_publication_reason: str | None = None
-        self.server.set_training_publish_state({
-            "trained_windows_since_publish": 0,
-            "publish_interval": self._publish_every,
-            "publication_pending": False,
-            "adaptive_publication_pending": False,
-            "adaptive_publication_reason": None,
-        })
-        self._training_accumulator = BalancedTrainingAccumulator(
-            dict(self.env_mix)
+        self.server.set_training_publish_state(
+            {
+                "trained_windows_since_publish": 0,
+                "publish_interval": self._publish_every,
+                "publication_pending": False,
+                "adaptive_publication_pending": False,
+                "adaptive_publication_reason": None,
+            }
         )
+        accumulator_targets = dict(self.env_mix)
+        self._training_accumulator = BalancedTrainingAccumulator(accumulator_targets)
         self.server.set_training_accumulator_state(
             self._training_accumulator.snapshot()
         )
@@ -838,6 +944,7 @@ class ValidationService:
         self._current_window_state: WindowState = WindowState.READY
 
         self._resume_from = resume_from
+        self._local_resume_unadvertised = False
         # The resume load must land where the boot load did. A pool means the
         # working replicas live in the workers, so this process's pair stays
         # on the CPU; no pool means it still proves in-process.
@@ -860,6 +967,18 @@ class ValidationService:
         # the last window generated under the previous checkpoint is proven.
         # (batchers, window_n, verify_task, late_drops_snapshot)
         self._gpu_backlog: tuple | None = None
+        # v6 (R20). The assembler that computed a window's per-token
+        # payment, keyed by window, so ``_archive_window`` can read the
+        # map belonging to the window it is ARCHIVING. ``_fill_closed_
+        # assembler`` alone is not enough: in pipelined mode the next
+        # window's ``_open_window_batchers`` has already replaced it by
+        # the time the stashed window is archived.
+        self._fill_closed_assemblers: dict[int, Any] = {}
+        # Experimental fill mode: a restart-safe barrier from the last
+        # durably emitted trainer entry to the next window.  A full cadence
+        # also binds the exact successor checkpoint publication/adoption.
+        self._fill_closed_rotation_store = None
+        self._fill_closed_rotation_gate = None
         self.kl_reference_state: dict[str, Any] = {
             "schema_version": 1,
             "mode": "rolling",
@@ -1200,10 +1319,19 @@ class ValidationService:
                 installed_revision=(
                     current.revision if current is not None else None
                 ),
+                installed_checkpoint_n=(
+                    current.checkpoint_n if current is not None else None
+                ),
+                installed_repo_id=(
+                    current.repo_id if current is not None else None
+                ),
                 expected_identity=(
-                    active_training_identity()
+                    {
+                        **active_training_identity(),
+                        "repo_id": self._checkpoint_store.repo_id,
+                    }
                     if PROTOCOL_VERSION >= 5
-                    else None
+                    else {"repo_id": self._checkpoint_store.repo_id}
                 ),
             )
         return self._checkpoint_intake
@@ -1266,8 +1394,25 @@ class ValidationService:
 
         intake = self._checkpoint_intake
         manifest, staged_dir = intake.take_staged()
-        revision = str(manifest["revision"])
+        revision = "<invalid>"
         try:
+            checkpoint_n, repo_id, revision = canonical_checkpoint_identity(
+                manifest.get("checkpoint_n"),
+                manifest.get("repo_id"),
+                manifest.get("revision"),
+                field="staged checkpoint",
+            )
+            if repo_id != self._checkpoint_store.repo_id:
+                raise ValueError("staged checkpoint repository mismatch")
+            require_checkpoint_number(
+                manifest.get("trained_window_cursor"),
+                field="staged checkpoint trainer cursor",
+            )
+            # Persist the trainer cursor binding before changing the active
+            # checkpoint. Readiness also requires the active manifest to equal
+            # this candidate, so a failed swap remains closed; a crash after a
+            # successful install can recover the proof from this record.
+            self._record_fill_closed_checkpoint_candidate(manifest)
             await asyncio.to_thread(
                 self._refresh_verify_model_from_dir, staged_dir, revision,
             )
@@ -1276,9 +1421,9 @@ class ValidationService:
                     self._synchronize_proof_models, revision, str(staged_dir),
                 )
             entry = self._checkpoint_store.install_external(
-                int(manifest["checkpoint_n"]), revision,
+                checkpoint_n, revision,
             )
-            self._checkpoint_n = int(manifest["checkpoint_n"])
+            self._checkpoint_n = checkpoint_n
             self.server.set_current_checkpoint(entry)
             intake.mark_installed(revision, staged_dir)
             self._windows_since_checkpoint_swap = 0
@@ -1316,14 +1461,7 @@ class ValidationService:
                 "swapping trainer checkpoints", window_n,
             )
             return
-        task = self._intake_stage_task
-        if task is None or task.done():
-            manifest = await asyncio.to_thread(intake.poll)
-            if manifest is not None:
-                self._intake_stage_task = asyncio.create_task(
-                    asyncio.to_thread(intake.stage, manifest),
-                    name="checkpoint_intake_stage",
-                )
+        await self._poll_and_stage_checkpoint_candidate(intake)
         if intake.staged_ready:
             if owns_routing:
                 await self._swap_staged_checkpoint(window_n)
@@ -1333,6 +1471,316 @@ class ValidationService:
                     "pipelined; deferring swap to the serial beat",
                     window_n,
                 )
+
+    async def _poll_and_stage_checkpoint_candidate(self, intake) -> bool:
+        """Ask R2 for a new candidate manifest; start staging it if there
+        is one. Returns whether a NEW candidate was DETECTED.
+
+        Extracted from ``_detached_checkpoint_tick`` because v6.1's
+        between-windows gate (R35) needs the same poll-and-stage without
+        the swap: staging is a multi-gigabyte download and must overlap
+        the next window's collection, so detection -- not installation --
+        is what releases the gate. Never starts a second staging task
+        while one is in flight, exactly as the tick did.
+        """
+        task = self._intake_stage_task
+        if task is not None and not task.done():
+            return False
+        manifest = await asyncio.to_thread(intake.poll)
+        if manifest is None:
+            return False
+        self._intake_stage_task = asyncio.create_task(
+            asyncio.to_thread(intake.stage, manifest),
+            name="checkpoint_intake_stage",
+        )
+        return True
+
+    def _arm_fill_closed_rotation_gate(
+        self, *, reserve_full_range: bool = False,
+    ) -> None:
+        """Persist the exact barrier the next experimental window must clear.
+
+        Every window waits for measured consumption of its last durable
+        entry.  A window that produced a complete cadence of real payloads
+        additionally expects a newly trained checkpoint: the next open is
+        forbidden until a candidate manifest covering that cursor is both
+        published and installed into the verify/proof plane.  Underfilled or
+        quarantined windows do not invent a publication that the trainer's
+        counter will never produce.
+        """
+        from reliquary.constants import FILL_CLOSED_EMISSIONS_PER_WINDOW
+        from reliquary.infrastructure.training_payload_queue import (
+            encoded_window_journal_key,
+        )
+        from reliquary.validator.fill_closed_rotation import (
+            FillClosedRotationGate,
+        )
+
+        assembler = getattr(self, "_fill_closed_assembler", None)
+        emitted = getattr(assembler, "next_batch_index", 0)
+        if type(emitted) is not int or emitted < 0:
+            raise RuntimeError(
+                "fill-closed assembler batch index is not canonical"
+            )
+        window_start = getattr(assembler, "window_start", None)
+        if window_start is None or (emitted == 0 and not reserve_full_range):
+            self._clear_fill_closed_rotation_gate()
+            return
+        if type(window_start) is not int or window_start < 0:
+            raise RuntimeError("fill-closed source window is not canonical")
+        index = (
+            FILL_CLOSED_EMISSIONS_PER_WINDOW - 1
+            if reserve_full_range
+            else min(emitted - 1, FILL_CLOSED_EMISSIONS_PER_WINDOW - 1)
+        )
+        checkpoint = self._checkpoint_store.current_manifest()
+        if checkpoint is None or not checkpoint.revision:
+            raise RuntimeError(
+                "fill-closed rotation cannot bind an unpublished parent"
+            )
+        payload_count = getattr(assembler, "durable_payload_count", 0)
+        if type(payload_count) is not int or payload_count < 0:
+            raise RuntimeError(
+                "fill-closed durable payload count is not canonical"
+            )
+        gate = FillClosedRotationGate(
+            source_window=window_start,
+            required_journal_key=encoded_window_journal_key(
+                window_start, index
+            ),
+            parent_checkpoint_n=checkpoint.checkpoint_n,
+            parent_revision=checkpoint.revision,
+            durable_payload_count=payload_count,
+            requires_successor=(
+                payload_count >= FILL_CLOSED_EMISSIONS_PER_WINDOW
+            ),
+        )
+        self._persist_fill_closed_rotation_gate(gate)
+
+    def _initialize_fill_closed_rotation_store(self) -> None:
+        """Load the restart barrier at service start, before any window opens."""
+        if not FILL_CLOSED_ENABLED:
+            return
+        from reliquary.constants import DETACHED_TRAINER, WRITE_TRAINING_PAYLOADS
+
+        if not WRITE_TRAINING_PAYLOADS:
+            raise RuntimeError(
+                "experimental fill-closed mode requires "
+                "RELIQUARY_WRITE_TRAINING_PAYLOADS=1; payment cannot be "
+                "committed without its durable trainer journal entry"
+            )
+        if not DETACHED_TRAINER:
+            raise RuntimeError(
+                "experimental fill-closed mode requires the detached trainer; "
+                "the pipelined in-process half cannot publish while the next "
+                "open is held behind its successor-checkpoint barrier"
+            )
+        # Construct the queue before the HTTP server or any window.  Its
+        # fill-mode recovery pass finishes receipt-backed visible renames and
+        # rejects an unreceipted staging body, which cannot be reconciled with
+        # lost in-memory reward/index state after a process restart.
+        self._training_payload_queue_ref()
+        if getattr(self, "_fill_closed_rotation_store", None) is not None:
+            return
+        from reliquary.validator.fill_closed_rotation import (
+            FillClosedRotationStore,
+        )
+
+        state_dir = Path(
+            os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")
+        )
+        store = FillClosedRotationStore(state_dir)
+        gate = store.load()
+        self._fill_closed_rotation_store = store
+        self._fill_closed_rotation_gate = gate
+
+    def _persist_fill_closed_rotation_gate(self, gate) -> None:
+        store = getattr(self, "_fill_closed_rotation_store", None)
+        if store is not None:
+            store.save(gate)
+        self._fill_closed_rotation_gate = gate
+
+    def _clear_fill_closed_rotation_gate(self) -> None:
+        store = getattr(self, "_fill_closed_rotation_store", None)
+        if store is not None:
+            store.clear()
+        self._fill_closed_rotation_gate = None
+
+    def _record_fill_closed_checkpoint_candidate(self, manifest: dict) -> None:
+        """Persist a covering candidate before attempting its atomic swap.
+
+        Readiness still compares this record with the active checkpoint, so a
+        failed swap cannot release the gate.  Persisting first closes the
+        opposite crash window: after a successful install and process death,
+        restart can prove which candidate's trainer cursor the active revision
+        covers without guessing from a revision alone.
+        """
+        gate = getattr(self, "_fill_closed_rotation_gate", None)
+        if gate is None or not gate.requires_successor:
+            return
+        try:
+            checkpoint_n, repo_id, revision = canonical_checkpoint_identity(
+                manifest.get("checkpoint_n"),
+                manifest.get("repo_id"),
+                manifest.get("revision"),
+                field="fill checkpoint candidate",
+            )
+            if repo_id != self._checkpoint_store.repo_id:
+                return
+            trained_cursor = require_checkpoint_number(
+                manifest.get("trained_window_cursor"),
+                field="fill checkpoint trainer cursor",
+            )
+        except (KeyError, TypeError, ValueError):
+            return
+        if (
+            checkpoint_n <= gate.parent_checkpoint_n
+            or revision == gate.parent_revision
+            or trained_cursor < gate.required_journal_key
+        ):
+            return
+        self._persist_fill_closed_rotation_gate(
+            gate.record_adoption(
+                checkpoint_n=checkpoint_n,
+                revision=revision,
+                trained_cursor=trained_cursor,
+            )
+        )
+
+    def _fill_closed_rotation_adoption_ready(self, gate) -> bool:
+        checkpoint = self._checkpoint_store.current_manifest()
+        return gate.adoption_covers(checkpoint)
+
+    async def _advance_fill_closed_checkpoint_adoption(self) -> None:
+        """Progress detached checkpoint polling/staging/swap without opening."""
+        from reliquary.constants import DETACHED_TRAINER
+
+        gate = getattr(self, "_fill_closed_rotation_gate", None)
+        if gate is None or not gate.requires_successor:
+            return
+        if not DETACHED_TRAINER:
+            checkpoint = self._checkpoint_store.current_manifest()
+            if (
+                checkpoint is not None
+                and checkpoint.checkpoint_n > gate.parent_checkpoint_n
+                and checkpoint.revision != gate.parent_revision
+            ):
+                self._persist_fill_closed_rotation_gate(
+                    gate.record_adoption(
+                        checkpoint_n=checkpoint.checkpoint_n,
+                        revision=checkpoint.revision,
+                        trained_cursor=gate.required_journal_key,
+                    )
+                )
+            return
+
+        intake = self._detached_intake_ref()
+        task = getattr(self, "_intake_stage_task", None)
+        if task is not None and task.done():
+            # Retrieve any unexpected task exception before clearing the
+            # handle.  ``CheckpointIntake.stage`` normally reports failure as
+            # False, but a programming error must remain visible.
+            await task
+            self._intake_stage_task = None
+        if intake.staged_ready:
+            await self._swap_staged_checkpoint(self._window_n)
+            return
+        if getattr(self, "_intake_stage_task", None) is None:
+            await self._poll_and_stage_checkpoint_candidate(intake)
+
+    async def _wait_for_fill_closed_rotation(self) -> str:
+        """Hold the next open until consumption and expected adoption agree.
+
+        The time backstop is an observability/liveness boundary, not a policy
+        bypass: timeout and emergency freeze leave the durable gate armed and
+        return a blocked outcome.  The outer loop must remain closed and retry.
+        """
+        if not FILL_CLOSED_ENABLED:
+            return "disabled"
+        gate = getattr(self, "_fill_closed_rotation_gate", None)
+        if gate is None:
+            return "not_armed"
+        if os.environ.get("RELIQUARY_DISABLE_TRAIN", "").lower() in {
+            "1", "true", "yes", "on",
+        }:
+            self._set_window_preparation_stage("fill_closed_rotation_frozen")
+            logger.warning(
+                "Window %d: emergency freeze active; keeping the next window "
+                "closed behind journal key %s",
+                self._window_n, gate.required_journal_key,
+            )
+            return "emergency_freeze"
+
+        def consumed() -> bool:
+            cursor = self._read_trainer_step_cursor()
+            return (
+                cursor is not None
+                and int(cursor) >= gate.required_journal_key
+            )
+
+        async def ready() -> bool:
+            await self._advance_fill_closed_checkpoint_adoption()
+            active_gate = getattr(self, "_fill_closed_rotation_gate", gate)
+            return consumed() and self._fill_closed_rotation_adoption_ready(
+                active_gate
+            )
+
+        if await ready():
+            result = (
+                "checkpoint_adopted"
+                if gate.requires_successor else "batches_consumed"
+            )
+            self._clear_fill_closed_rotation_gate()
+            return result
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        deadline = started + FILL_CLOSED_MAX_SECONDS
+        self._set_window_preparation_stage("fill_closed_rotation_wait")
+        logger.info(
+            "Window %d closed; holding the next open for journal key %s "
+            "(successor checkpoint required=%s, backstop %.0f s)",
+            self._window_n,
+            gate.required_journal_key,
+            gate.requires_successor,
+            FILL_CLOSED_MAX_SECONDS,
+        )
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                self._set_window_preparation_stage(
+                    "fill_closed_rotation_blocked"
+                )
+                logger.error(
+                    "Rotation gate for window %d did not clear in %.0f s "
+                    "(journal key %s successor=%s); leaving admission closed",
+                    self._window_n,
+                    FILL_CLOSED_MAX_SECONDS,
+                    gate.required_journal_key,
+                    gate.requires_successor,
+                )
+                return "rotation_blocked_timeout"
+            await asyncio.sleep(
+                min(FILL_CLOSED_ROTATION_POLL_SECONDS, remaining)
+            )
+            if os.environ.get("RELIQUARY_DISABLE_TRAIN", "").lower() in {
+                "1", "true", "yes", "on",
+            }:
+                self._set_window_preparation_stage(
+                    "fill_closed_rotation_frozen"
+                )
+                return "emergency_freeze"
+            if await ready():
+                result = (
+                    "checkpoint_adopted"
+                    if gate.requires_successor else "batches_consumed"
+                )
+                self._clear_fill_closed_rotation_gate()
+                logger.info(
+                    "Window %d rotation cleared in %.1f s (%s)",
+                    self._window_n, loop.time() - started,
+                    result,
+                )
+                return result
 
     async def _seal_wait_and_close(
         self,
@@ -1662,10 +2110,11 @@ class ValidationService:
         if not self._resume_from:
             return
         from reliquary.validator.resume import (
+            PathSource,
+            ShaSource,
             parse_resume_source,
             resolve_resume_source,
         )
-        from reliquary.validator.checkpoint import ManifestEntry
 
         def _commit_title(repo_id, revision):
             from huggingface_hub import HfApi
@@ -1725,37 +2174,57 @@ class ValidationService:
             self.verify_model.eval()
             for p in self.verify_model.parameters():
                 p.requires_grad = False
-        # Extract the canonical revision string to publish to miners.
-        # IMPORTANT: strip the scheme prefix — miners call HF with this value
-        # as the ``revision=`` kwarg, and HF rejects ``sha:<hex>`` / ``path:<dir>``
-        # strings outright. They must see a bare 40-char hex (for sha) or a
-        # bare local path identifier (for path, though that's a test-only mode
-        # and miners won't successfully pull it anyway).
-        from reliquary.validator.resume import ShaSource
         if isinstance(source, ShaSource):
             revision_str = source.sha
-        else:
-            revision_str = source.path
-        self._verify_model_checkpoint_revision = revision_str
-        # Reconstruct manifest so miners see the resumed checkpoint via /state.
-        sig_payload = f"{checkpoint_n}|{revision_str}".encode()
-        sig_bytes = self.wallet.hotkey.sign(sig_payload)
-        entry = ManifestEntry(
-            checkpoint_n=checkpoint_n,
-            repo_id=self._checkpoint_store.repo_id,
-            revision=revision_str,
-            signature="ed25519:" + sig_bytes.hex(),
-        )
-        self._checkpoint_store._current = entry
+            self._verify_model_checkpoint_revision = revision_str
+            entry = self._checkpoint_store.install_external(
+                checkpoint_n,
+                revision_str,
+            )
+            self.server.set_current_checkpoint(entry)
+            self._local_resume_unadvertised = False
+        elif isinstance(source, PathSource):
+            # A local directory has no immutable public identity. It is useful
+            # for isolated tests, but must never become a revision in /state.
+            self._verify_model_checkpoint_revision = None
+            self._checkpoint_store.clear_manifest()
+            self.server.set_current_checkpoint(None)
+            self._local_resume_unadvertised = True
+            logger.warning(
+                "Loaded local checkpoint path for isolated use only; no "
+                "public checkpoint manifest was installed"
+            )
+        else:  # pragma: no cover - parse_resume_source is exhaustive
+            raise TypeError("unsupported resume source")
         self._checkpoint_n = checkpoint_n
-        self.server.set_current_checkpoint(entry)
         logger.info(
             "Resumed from %s: checkpoint_n=%d",
             self._resume_from, checkpoint_n,
         )
 
+
+
+
+
+
+
+
+
+
+
     def _open_window(self) -> None:
-        """Create GrpoWindowBatchers (one per env) in a non-active state.
+        """Prepare one legacy window without exposing it to HTTP yet."""
+        if self._candidate_window_n is None:
+            self._candidate_window_n = self._window_n + 1
+        self._active_batchers = self._build_window_batchers(
+            self._candidate_window_n
+        )
+
+    def _build_window_batchers(
+        self,
+        target_window: int,
+    ) -> dict[str, GrpoWindowBatcher]:
+        """Create one environment batcher set for an exact logical window.
 
         Builds all batchers and wires the active checkpoint hash, but does
         NOT expose them to the HTTP server yet — call ``_activate_window``
@@ -1765,11 +2234,15 @@ class ValidationService:
         verification in ``indices_from_root`` if the chain call that fills
         randomness fails (e.g. finney WebSocket returns 503).
         """
-        if self._candidate_window_n is None:
-            self._candidate_window_n = self._window_n + 1
+        from reliquary.constants import FILL_CLOSED_EMISSIONS_PER_WINDOW
+        from reliquary.validator.fill_closed_batch_assembler import (
+            FillClosedBatchAssembler,
+        )
+        from reliquary.validator.fill_window import FillState
+
         if self._candidate_activation_nonce is None:
             self._candidate_activation_nonce = os.urandom(32)
-        target_window = self._candidate_window_n
+        target_window = int(target_window)
         self._set_window_preparation_stage("batcher_construction")
         bootstrap = is_bootstrap_window(
             window_start=target_window,
@@ -1786,7 +2259,89 @@ class ValidationService:
                 "proof scheduler is not ready for the active checkpoint"
             )
         operator_by_hotkey = self.server.operator_by_hotkey_snapshot()
-        self._active_batchers = {}
+        batchers: dict[str, GrpoWindowBatcher] = {}
+        # v6 only (R10). One ``FillState`` is shared across every
+        # per-environment batcher for this window: the service builds one
+        # ``GrpoWindowBatcher`` per environment, but ``FillState`` is
+        # multi-key (budgets) and window-wide (picks), so each batcher
+        # can't own its own instance. This is the single place a v6
+        # window's ``FillState`` is constructed -- every batcher below
+        # just gets the same object assigned to ``.fill_state``; nothing
+        # else in the codebase constructs one.
+        #
+        # Amendment v6.1 (R33, R35): admission is bounded by
+        # ``FILL_CLOSED_ADMISSION_BUDGET_PER_ENV``, not the old per-env
+        # proven target -- the window no longer closes on a proven count,
+        # it closes at the ``FILL_CLOSED_EMISSIONS_PER_WINDOW``-th pick
+        # (``picks_target``), which is window-wide, not per-environment.
+        shared_fill_state = (
+            FillState(
+                budgets={
+                    env_name: FILL_CLOSED_ADMISSION_BUDGET_PER_ENV
+                    for env_name in self.envs
+                },
+                picks_target=FILL_CLOSED_EMISSIONS_PER_WINDOW,
+            )
+            if FILL_CLOSED_ENABLED
+            else None
+        )
+        # v6 only (R13). Batch ASSEMBLY moves here too, beside FillState,
+        # same gate: a GrpoWindowBatcher only ever holds its own
+        # environment's proven groups (see batcher.py:_emit_training_
+        # batch), so it cannot join every environment's B_BATCH chunk
+        # into one DAPO training batch by itself -- only the service,
+        # which sees every environment's batcher for this window, can.
+        # One assembler per window, injected as every batcher's
+        # ``emit_training_batch_fn`` below. Logged (not raised) before
+        # being replaced: a still-open PREVIOUS window's assembler may
+        # hold a remainder that never became a full B_BATCH-per-
+        # environment payload -- by design (see FillClosedBatchAssembler's
+        # module docstring: a partial batch is exactly what its
+        # carry-forward exists to avoid), but it should stay observable.
+        #
+        # R16: ``close()`` is what actually disposes of that remainder
+        # now -- emitted as one final partial batch when every
+        # environment contributed at least one group, tombstoned
+        # otherwise -- instead of the WARNING below being the only
+        # signal, one window later, that proven, paid rollouts were
+        # dropped with no marker. The snapshot is still read FIRST,
+        # before ``close()`` resets it, purely so this log line keeps
+        # reporting what was actually outstanding.
+        previous_assembler = getattr(self, "_fill_closed_assembler", None)
+        if previous_assembler is not None:
+            remainder = previous_assembler.remainder_snapshot()
+            has_remainder = any(remainder["in_accumulator"].values()) or any(
+                remainder["pending"].values()
+            )
+            previous_assembler.close()
+            logger.log(
+                logging.WARNING if has_remainder else logging.DEBUG,
+                "FillClosedBatchAssembler: window %d closed with remainder "
+                "%s (close() emitted it as a final partial batch, or "
+                "tombstoned it, so the trainer's cursor still advances -- "
+                "see the assembler's own log line for which)",
+                previous_assembler.window_start, remainder,
+            )
+        fill_closed_assembler = (
+            FillClosedBatchAssembler(
+                window_start=target_window,
+                env_order=[name for name, _ in self.env_mix],
+                enqueue_fn=self._write_fill_closed_training_payload,
+                tombstone_fn=self._write_fill_closed_training_tombstone,
+                # R20: one window's whole emission budget. The assembler
+                # splits it per environment and per batch itself -- it is
+                # the only place a v6 window's assembled batches are
+                # known, and under v6 there is no auction to pay at seal.
+                window_pool=1.0,
+            )
+            if FILL_CLOSED_ENABLED
+            else None
+        )
+        self._fill_closed_assembler = fill_closed_assembler
+        if fill_closed_assembler is not None:
+            self._fill_closed_assemblers[target_window] = (
+                fill_closed_assembler
+            )
         for env_name, env in self.envs.items():
             open_kwargs = {
                 "window_start": target_window,
@@ -1803,7 +2358,26 @@ class ValidationService:
                     self._queue_and_proofs_drained
                 ),
                 "operator_by_hotkey": operator_by_hotkey,
+                "batch_target": self.env_targets[env_name],
             }
+            if fill_closed_assembler is not None:
+                open_kwargs["emit_training_batch_fn"] = (
+                    fill_closed_assembler.accept
+                )
+                # Fill-closed owns a macro-window ingress horizon and
+                # admission budget.  Pass both explicitly so the real service
+                # construction cannot fall back to the legacy 100-second / 96
+                # candidate auction limits.  This branch is capability-gated;
+                # V4/V5 keep the constructor defaults byte-for-byte.
+                open_kwargs.update({
+                    "collection_seconds": FILL_CLOSED_PRECOMMIT_SECONDS,
+                    "max_productive_candidates": (
+                        FILL_CLOSED_ADMISSION_BUDGET_PER_ENV
+                    ),
+                    "max_grading_starts": (
+                        FILL_CLOSED_GRADING_START_BUDGET_PER_ENV
+                    ),
+                })
             if self.proof_scheduler is not None:
                 open_kwargs["proof_scheduler"] = self.proof_scheduler
             if self._proof_worker_pool is not None:
@@ -1820,7 +2394,10 @@ class ValidationService:
                 **open_kwargs,
             )
             batcher.current_checkpoint_hash = cp_hash
-            self._active_batchers[env_name] = batcher
+            if shared_fill_state is not None:
+                batcher.fill_state = shared_fill_state
+            batchers[env_name] = batcher
+        return batchers
 
     def _activate_window(self) -> None:
         """Expose all prepared batchers to the HTTP server and mark OPEN.
@@ -1859,6 +2436,10 @@ class ValidationService:
         self.server.clear_window_preparation_failure()
         self._publish_window_preparation_state()
         self._set_state(WindowState.OPEN)
+
+
+
+
 
     async def _refresh_registered_hotkeys(
         self,
@@ -1980,11 +2561,16 @@ class ValidationService:
         if batcher is None or batcher.is_sealed():
             return False
         distinct_valid = self._distinct_valid_prompt_count(batcher)
-        if distinct_valid >= B_BATCH:
+        target = int(getattr(batcher, "batch_target", B_BATCH))
+        if distinct_valid >= target:
             return False
         if (
             getattr(batcher, "proof_grading_attempts", 0)
-            < MAX_GRADING_STARTS_PER_WINDOW
+            < getattr(
+                batcher,
+                "max_grading_starts",
+                MAX_GRADING_STARTS_PER_WINDOW,
+            )
         ):
             return False
         queue_depth = int(getattr(self.server, "submit_queue_depth", 0) or 0)
@@ -2021,6 +2607,10 @@ class ValidationService:
         )
         return int(getattr(batcher, count_name, 0) or 0)
 
+    @staticmethod
+    def _batch_target(batcher) -> int:
+        return int(getattr(batcher, "batch_target", B_BATCH))
+
     def _duplicate_prompt_shortfall_drained(self, batcher) -> bool:
         """True when duplicates filled raw submissions but not trainable slots."""
         if batcher is None or batcher.is_sealed():
@@ -2029,7 +2619,8 @@ class ValidationService:
             return False
         valid_count = self._admitted_count(batcher)
         distinct_valid = self._distinct_valid_prompt_count(batcher)
-        if valid_count < B_BATCH or distinct_valid >= B_BATCH:
+        target = self._batch_target(batcher)
+        if valid_count < target or distinct_valid >= target:
             return False
         queue_depth = int(getattr(self.server, "submit_queue_depth", 0) or 0)
         inflight = int(getattr(self.server, "proof_verification_inflight", 0) or 0)
@@ -2198,7 +2789,7 @@ class ValidationService:
             return None
         valid_count = self._admitted_count(batcher)
         distinct_valid = self._distinct_valid_prompt_count(batcher)
-        if distinct_valid >= B_BATCH:
+        if distinct_valid >= self._batch_target(batcher):
             return None
         if not self._queue_and_proofs_drained():
             return None
@@ -2225,6 +2816,7 @@ class ValidationService:
         Per-env so a fast env never seals a slower one short.
         """
         env = getattr(getattr(batcher, "env", None), "name", "?")
+        target = self._batch_target(batcher)
         if getattr(batcher, "difficulty_auction_enabled", False):
             # Auction timing belongs exclusively to poll_deadline. An exhausted
             # grading-start backstop can occur before the 60 s fairness floor
@@ -2247,17 +2839,148 @@ class ValidationService:
             "Window %d env=%s force-sealing partial: reason=%s valid=%d/%d "
             "distinct=%d/%d idle_s=%s age_s=%s",
             self._window_n, env, reason,
-            getattr(batcher, "valid_count", 0), B_BATCH,
-            self._distinct_valid_prompt_count(batcher), B_BATCH,
+            getattr(batcher, "valid_count", 0), target,
+            self._distinct_valid_prompt_count(batcher), target,
             self._seconds_since_last_valid_submission(batcher),
             self._window_open_age_seconds(batcher),
         )
         batcher.force_seal(reason)
         return reason
 
+    def _read_trainer_step_cursor(self) -> int | None:
+        """The last journal key the trainer reported CONSUMING, or None.
+
+        Amendment v6.1 point 2, transport in R38/R40:
+        ``fetch_step_cursor`` performs the remote R2 GET that reads back
+        what the detached trainer's own drain uploaded (the validator and
+        the trainer run on different hosts and never share a local
+        queue_dir, so the LOCAL-file ``read_step_cursor`` cannot see it).
+        It is fire-and-collect and internally cached (R40 #1): this call
+        never blocks on network I/O, returning the last value a
+        background fetch completed with and kicking a new one only when
+        that value is stale and none is already in flight -- safe to call
+        on every poll tick.
+
+        ``fetch_step_cursor`` already swallows a missing/torn/unparseable
+        object, a network error, or a timeout into None -- pacing
+        telemetry must never take the poll loop down -- and this adds the
+        same treatment for a queue reference that refuses outright. None
+        means "unknown", which the gate reads as "not yet", so every
+        failure here degrades to picks stopping and the backstop sealing
+        a partial window, never to a pick firing on a cadence nobody
+        measured.
+        """
+        try:
+            return self._training_payload_queue_ref().fetch_step_cursor()
+        except Exception:
+            logger.warning(
+                "trainer step cursor unreadable; picks stay gated",
+                exc_info=True,
+            )
+            return None
+
+    def _fill_closed_pick_gate_open(self, batcher, *, next_pick: int) -> bool:
+        """Return whether the qualification pick's pacing barrier is met.
+
+        Pick one uses the configured opening floor. Later picks compare the
+        monotonic trainer cursor with the journal key selected by pipeline
+        depth; skipped terminal keys are therefore handled by ``>=``.
+        """
+        if next_pick <= 1:
+            age = self._window_open_age_seconds(batcher)
+            return age is not None and age >= FILL_CLOSED_FIRST_PICK_SECONDS
+        from reliquary.infrastructure.training_payload_queue import (
+            encoded_window_journal_key,
+        )
+
+        required = encoded_window_journal_key(
+            int(batcher.window_start),
+            max(0, next_pick - FILL_CLOSED_PICK_PIPELINE_DEPTH - 1),
+        )
+        cursor = self._read_trainer_step_cursor()
+        return cursor is not None and int(cursor) >= required
+
+    def _drive_fill_closed_picks(self, batchers) -> bool:
+        """Fire at most ONE window-wide pick event; return whether it did.
+
+        R36: a pick is a WINDOW event, not a per-environment one. One pick
+        k is one DAPO batch built from every environment's own k-th chunk,
+        so this fires only when EVERY environment can seat ``B_BATCH`` and
+        then drives all of them in a single pass. Driving a ready
+        environment alone would emit half a batch and, worse, advance the
+        window-wide count -- closing a two-environment window at half the
+        batches R35 asks for.
+
+        Readiness is checked before the pacing gate on purpose: insufficient
+        candidate supply then costs no cursor read at all, and the
+        cursor is read at most once per poll tick (once per call, inside
+        ``_fill_closed_pick_gate_open``, and only on the branch that
+        actually needs it).
+
+        Check-then-pick without holding the lock across the readiness
+        scan and the picks is safe because THIS LOOP OWNS BOTH. Picking,
+        the readiness check and ``poll_deadline``'s seal all run on the
+        one ``_wait_for_window_seal`` task, so no seal and no rival pick
+        can interleave between them; the proof threads that run
+        concurrently only ever GROW the pool, which can invalidate a
+        False (harmless -- the next 0.5 s tick sees it) but never a True.
+        That ownership, not the pool's growth, is what excludes the
+        seal-vs-pick interleaving. If an environment still refuses, the
+        invariant is broken somewhere: log at ERROR rather than emit a
+        half batch silently -- an incomplete event costs nothing wrong
+        under R37, since ``picks_emitted`` is the MIN over environments'
+        ordinals and a half-taken event simply does not count.
+        """
+        if not FILL_CLOSED_ENABLED:
+            return False
+        picking = [
+            batcher for batcher in batchers
+            if getattr(batcher, "fill_state", None) is not None
+        ]
+        if not picking:
+            return False
+        fill_state = picking[0].fill_state
+        with fill_state.lock:
+            if fill_state.is_closed():
+                return False
+            next_pick = int(fill_state.snapshot()["picks_emitted"]) + 1
+        if not all(batcher.can_pick() for batcher in picking):
+            return False
+        if not self._fill_closed_pick_gate_open(
+            picking[0], next_pick=next_pick
+        ):
+            return False
+        refused = [
+            str(getattr(getattr(batcher, "env", None), "name", "?"))
+            for batcher in picking
+            if not batcher.pick_training_batch()
+        ]
+        if refused:
+            # Both shapes are the same broken invariant and both are
+            # loud. A PARTIAL refusal leaves the event half-taken, which
+            # R37's per-environment ordinals make survivable (the
+            # window-wide count is the min, so it simply does not move)
+            # but never correct. A TOTAL refusal means readiness said
+            # every environment could seat a batch and then none did.
+            logger.error(
+                "Window %d: pick event %d was driven on %d environment(s) "
+                "and %s refused after passing the readiness check (%s); "
+                "the window-wide count does not advance for an incomplete "
+                "event",
+                int(getattr(picking[0], "window_start", 0)),
+                next_pick,
+                len(picking),
+                ",".join(refused),
+                "no environment took it"
+                if len(refused) == len(picking)
+                else "the event is half-taken",
+            )
+        return len(refused) < len(picking)
+
     async def _wait_for_window_seal(
         self,
         *,
+        fixed_deadline_only: bool = False,
         early_close_ready: Callable[[], bool] | None = None,
     ) -> str:
         """Wait until every active env's batcher seals.
@@ -2279,6 +3002,11 @@ class ValidationService:
         dup_since: dict[str, float] = {}
         reasons: dict[str, str] = {}
         while True:
+            # v6.1 (R34/R36): the pick event runs on this same 0.5 s
+            # cadence, BEFORE the seal poll -- so the 16th pick closes the
+            # window and ``poll_deadline`` seals it on the same tick
+            # rather than a tick later. Inert with the gate off.
+            self._drive_fill_closed_picks(batchers)
             for b in batchers:
                 # The hard ceiling ignores GPU readiness; only adaptive close
                 # is gated by it.
@@ -2292,7 +3020,11 @@ class ValidationService:
                     poll(pipeline_ready=pipeline_ready)
                 if b.is_sealed():
                     continue
-                r = self._force_seal_dead_batcher(b, dup_since)
+                r = (
+                    None
+                    if fixed_deadline_only
+                    else self._force_seal_dead_batcher(b, dup_since)
+                )
                 if r is not None:
                     reasons[getattr(getattr(b, "env", None), "name", "?")] = r
 
@@ -2378,14 +3110,25 @@ class ValidationService:
             raise last_exc
 
         if self.use_drand:
-            activation_nonce = getattr(self, "_candidate_activation_nonce", None)
-            if activation_nonce is None:
-                raise RuntimeError("window activation nonce is unavailable")
-            randomness = _bind_window_activation_randomness(
-                randomness,
-                target_window=int(target_window),
-                activation_nonce=activation_nonce,
-            )
+            if FILL_CLOSED_ENABLED:
+                # The experimental fill lane must be reproducible from the
+                # advertised public beacon and window alone. Legacy profiles
+                # retain their byte-for-byte activation binding below.
+                randomness = _bind_public_window_randomness(
+                    randomness,
+                    target_window=int(target_window),
+                )
+            else:
+                activation_nonce = getattr(
+                    self, "_candidate_activation_nonce", None
+                )
+                if activation_nonce is None:
+                    raise RuntimeError("window activation nonce is unavailable")
+                randomness = _bind_window_activation_randomness(
+                    randomness,
+                    target_window=int(target_window),
+                    activation_nonce=activation_nonce,
+                )
 
         for batcher in self._active_batchers.values():
             batcher.randomness = randomness
@@ -2406,7 +3149,12 @@ class ValidationService:
 
         self._last_beacon = beacon
         if beacon is not None and beacon.get("round") is not None:
-            self._active_batcher.window_open_drand_round = int(beacon["round"])
+            for batcher in self._active_batchers.values():
+                batcher.window_open_drand_round = int(beacon["round"])
+                batcher.window_open_drand_chain = beacon.get("source_chain")
+                batcher.window_open_drand_chain_hash = beacon.get(
+                    "source_chain_hash"
+                )
         # Schedule background bittensor_drand cross-check. Only in real-drand
         # mode (mock path returns beacon=None). Pass all batchers so the
         # cross-check can invalidate the whole multi-environment window.
@@ -2414,7 +3162,8 @@ class ValidationService:
             from reliquary.infrastructure.drand import get_current_chain
 
             chain_info = get_current_chain()
-            self._active_batcher._drand_chain_info = chain_info
+            for batcher in self._active_batchers.values():
+                batcher._drand_chain_info = chain_info
             self._verify_task = asyncio.create_task(
                 self._verify_beacon_async(
                     list(self._active_batchers.values()),
@@ -2812,6 +3561,9 @@ class ValidationService:
                     "selected_for_batch": selected,
                     "rewarded": rewarded,
                     "reward_amount": meta.get("reward_amount"),
+                    # Which mechanism actually credited it (R20): under v6
+                    # the seal path's slot share is reported but not paid.
+                    "payment_source": meta.get("payment_source"),
                     "selection_reason": meta.get("selection_reason"),
                     "batch_filled_reason": (
                         meta.get("selection_reason") if not selected else None
@@ -2924,7 +3676,8 @@ class ValidationService:
 
         env_order = [name for name, _ in self.env_mix]
         accumulator_ready = (
-            len(checkpoint_revisions) == 1 and self._training_accumulator.ready
+            len(checkpoint_revisions) == 1
+            and self._training_accumulator.ready
         )
         batches = (
             self._training_accumulator.training_batches(env_order)
@@ -3341,6 +4094,28 @@ class ValidationService:
 
         eos_ids = resolve_eos_token_ids(self.verify_model, self.tokenizer)
 
+        def _archive_batch_target(env_name: str, batcher) -> int:
+            candidate = getattr(batcher, "batch_target", None)
+            if (
+                isinstance(candidate, int)
+                and not isinstance(candidate, bool)
+                and candidate > 0
+            ):
+                return candidate
+            return int(
+                getattr(self, "env_targets", {}).get(env_name, B_BATCH)
+            )
+
+        def _environment_manifest_digest(env_name: str) -> str | None:
+            from reliquary.environment.registry import get_environment_spec
+
+            try:
+                return get_environment_spec(
+                    env_name
+                ).environment_manifest_sha256
+            except ValueError:
+                return None
+
         def _resp_time(arrived_at: float) -> float | None:
             if window_opened_at is None or not arrived_at:
                 return None
@@ -3356,6 +4131,12 @@ class ValidationService:
                 difficulty_by_id.get(id(s), {})
                 if isinstance(difficulty_by_id, dict)
                 else {}
+            )
+            environment_name = str(
+                getattr(getattr(batcher, "env", None), "name", "")
+            )
+            environment_manifest_digest = _environment_manifest_digest(
+                environment_name
             )
             arrival_ts = getattr(s, "arrival_ts", None)
             window_opened_wall_ts = getattr(
@@ -3390,10 +4171,21 @@ class ValidationService:
                 "prompt_content_sha256": getattr(
                     s, "prompt_content_sha256", None
                 ) or difficulty_meta.get("prompt_content_sha256"),
+                "target_content_sha256": getattr(
+                    s, "target_content_sha256", None
+                ),
+                "environment_manifest_sha256": (
+                    environment_manifest_digest
+                ),
+                "task_family": getattr(s, "task_family", None),
+                "generator_version": getattr(s, "generator_version", None),
+                "operation_id": getattr(s, "operation_id", None),
+                "task_difficulty": getattr(s, "difficulty", None),
                 "canonical_rank": meta.get("canonical_rank"),
                 "accepted_into_pool": not rejected,
                 "selected_for_batch": bool(meta.get("selected_for_batch", False)),
                 "rewarded": bool(meta.get("rewarded", False)),
+                "payment_source": meta.get("payment_source"),
                 "batch_filled_reason": (
                     meta.get("selection_reason")
                     if not meta.get("selected_for_batch", False)
@@ -3512,6 +4304,53 @@ class ValidationService:
                 out.append(entry)
             return out
 
+        # R20/R24: under v6 the seal path pays nothing and selects nothing
+        # -- the spec removes the auction and the seal path IS the auction --
+        # so BOTH the archive's per-hotkey emission and its ``batch`` entries
+        # come from the assembler: the token split it computed, over exactly
+        # the groups it paid. ``sealed_dict`` is empty under v6 (see
+        # ``_seal_fill_closed_window``), and a weight-only validator replaying
+        # the map from ``eos_tokens`` must divide over the same set.
+        # Resolved BEFORE the per-env loop below, which reads its batches.
+        fill_closed_assembler = None
+        fill_closed_batches: dict[str, list] = {}
+        if FILL_CLOSED_ENABLED:
+            archived_window = int(getattr(first_batcher, "window_start", 0))
+            fill_closed_assembler = self._fill_closed_assemblers.get(
+                archived_window
+            )
+            # Any assembler older than the window being archived belongs to
+            # a window that was dropped before it ever reached here; nothing
+            # will read it again.
+            for stale in [
+                key for key in self._fill_closed_assemblers
+                if key < archived_window
+            ]:
+                self._fill_closed_assemblers.pop(stale, None)
+            if fill_closed_assembler is None:
+                # Not a silent zero: with no assembler this window pays
+                # nobody and archives an empty batch, which is a wiring
+                # failure, not an outcome.
+                logger.error(
+                    "Window %d: v6 archive found no batch assembler; the "
+                    "window pays nothing and archives no batch",
+                    archived_window,
+                )
+            else:
+                # Idempotent (R16). The window's LAST batch is the partial
+                # remainder ``close()`` forces out, and in serial mode
+                # ``close()`` otherwise runs at the next window's open --
+                # after this archive is written -- so that batch's pay and
+                # its groups would never reach the archive a weight-only
+                # validator replays. In pipelined mode this is a no-op.
+                fill_closed_assembler.close()
+                fill_closed_batches = fill_closed_assembler.paid_groups()
+                # Only release the recovery handle after close() has made the
+                # complete journal range durable.  On failure the aborted-
+                # window path needs this assembler's committed index to pad
+                # exactly the remaining keys without overwriting earlier ones.
+                self._fill_closed_assemblers.pop(archived_window, None)
+
         # Build the combined batch entries and runners_up from all envs.
         batch_entries = []
         runners_up = []
@@ -3544,10 +4383,20 @@ class ValidationService:
             )
             env_obj = self.envs.get(env_name, self.env)
             env_batch, env_rewards = sealed_dict.get(env_name, ([], {}))
+            # Parallel to ``env_batch``: which assembled batch paid each
+            # group, or None off the v6 path (v4/v5 pay once per window,
+            # so there is no batch to name and the field is not written).
+            paid_batch_indices: list[int | None] = [None] * len(env_batch)
+            if FILL_CLOSED_ENABLED:
+                # R24: the paid set, not the auction's winners. R28: with
+                # the batch index each group was paid in.
+                paid = list(fill_closed_batches.get(env_name, ()))
+                env_batch = [group for _index, group in paid]
+                paid_batch_indices = [index for index, _group in paid]
 
             batched_keys = {(s.hotkey, s.prompt_idx) for s in env_batch}
 
-            for s in env_batch:
+            for paid_batch_index, s in zip(paid_batch_indices, env_batch):
                 try:
                     problem = env_obj.get_problem(s.prompt_idx)
                 except Exception:
@@ -3559,7 +4408,7 @@ class ValidationService:
                         s.prompt_idx,
                     )
                     problem = {}
-                batch_entries.append({
+                entry = {
                     "hotkey": s.hotkey,
                     "prompt_idx": s.prompt_idx,
                     "env_name": env_name,
@@ -3571,6 +4420,12 @@ class ValidationService:
                     "merkle_root": s.merkle_root_bytes.hex(),
                     "selection_digest": s.selection_digest.hex(),
                     "claimed_checkpoint_hash": s.claimed_checkpoint_hash,
+                    # v6: completion tokens over genuinely EOS-terminated
+                    # rollouts, produced once at admission. Additive field --
+                    # a weight-only validator replaying per-token payment
+                    # from the archive needs this to divide the same way the
+                    # live validator did (see token_rewards.py).
+                    "eos_tokens": int(getattr(s, "eos_tokens", 0) or 0),
                     "sketch_diff_max": s.sketch_diff_max,
                     "lp_dev_max": s.lp_dev_max,
                     "dist_q10_min": s.dist_q10_min,
@@ -3599,7 +4454,14 @@ class ValidationService:
                         s, "code_semantic_auth_positive_min_prob", None
                     ),
                     **_submission_obs_payload(s, batcher),
-                })
+                }
+                if paid_batch_index is not None:
+                    # R28: v6 pays per assembled batch, so a weight-only
+                    # validator replaying the map from ``eos_tokens`` has to
+                    # divide within each batch. Additive: v4/v5 entries and
+                    # older readers are untouched.
+                    entry["batch_index"] = int(paid_batch_index)
+                batch_entries.append(entry)
 
             # All validated submissions that didn't make the final batch —
             # metadata only (no rollouts/text, no prompt).
@@ -3707,6 +4569,13 @@ class ValidationService:
             for reason, count in env_grader_failures.items():
                 grader_failures[reason] = grader_failures.get(reason, 0) + count
 
+        if FILL_CLOSED_ENABLED:
+            combined_rewards = (
+                dict(fill_closed_assembler.reward_map())
+                if fill_closed_assembler is not None
+                else {}
+            )
+
         # Pipelined mode passes a stash-time snapshot: the live counter was
         # reset at the NEXT window's activation and holds its rejects, not
         # this window's.
@@ -3742,6 +4611,14 @@ class ValidationService:
             "randomness": first_batcher.randomness,
             "environment": env_names_list[0],   # legacy singular, kept for compat
             "environments": env_names_list,      # multi-env canonical field
+            "batch_targets": {
+                env_name: _archive_batch_target(env_name, env_batcher)
+                for env_name, env_batcher in batcher_dict.items()
+            },
+            "environment_manifest_sha256_by_environment": {
+                env_name: _environment_manifest_digest(env_name)
+                for env_name in env_names_list
+            },
             "force_seal_reason": getattr(first_batcher, "force_seal_reason", None),
             "force_seal_reason_by_environment": {
                 env_name: getattr(env_batcher, "force_seal_reason", None)
@@ -3847,7 +4724,12 @@ class ValidationService:
         # hours, and queued payloads survive process restarts.
         from reliquary.infrastructure.archive_queue import get_archive_queue
         get_archive_queue().enqueue(first_batcher.window_start, archive)
-        self._archive_enqueued_windows.add(int(first_batcher.window_start))
+        archived_window = int(first_batcher.window_start)
+        self._archive_enqueued_windows.add(archived_window)
+        self._cooldown_durable_window = max(
+            getattr(self, "_cooldown_durable_window", 0),
+            archived_window,
+        )
 
     def _write_training_payload(
         self,
@@ -3864,6 +4746,16 @@ class ValidationService:
 
         if not WRITE_TRAINING_PAYLOADS:
             return
+        if FILL_CLOSED_ENABLED:
+            # C2. This enqueues under the BARE window number, but under v6
+            # the journal key space is window * FILL_CLOSED_EMISSIONS_PER_
+            # WINDOW + batch_index -- so a raw-key write for window w lands
+            # in window w // EMISSIONS's first slot, on top of whatever the
+            # assembler put there. The window's payloads were already
+            # written, batch by batch, by FillClosedBatchAssembler under
+            # their own encoded keys (R13); the seal path has nothing to
+            # add and nowhere valid to put it.
+            return
         from reliquary.shared.training_payload import encode_training_payload
 
         try:
@@ -3872,24 +4764,40 @@ class ValidationService:
                 window_start=int(window_n),
                 checkpoint_revision=str(checkpoint_revision),
                 env_order=[name for name, _ in self.env_mix],
+                env_targets=dict(self.env_mix),
                 window_quarantine=dict(window_quarantine or {}),
             )
             self._training_payload_queue_ref().enqueue_payload(
-                int(window_n), data,
+                int(window_n),
+                data,
             )
+            tombstoned_windows = getattr(
+                self,
+                "_training_tombstoned_windows",
+                None,
+            )
+            if tombstoned_windows is not None:
+                tombstoned_windows.discard(int(window_n))
         except Exception:
             logger.exception(
-                "training payload write failed for window %s", window_n,
+                "training payload write failed for window %s",
+                window_n,
             )
             # The journal contract is "never advance on absence": a hole
             # with neither payload nor tombstone stalls the trainer
             # forever. A failed encode must still produce a marker.
             self._write_training_tombstone(
-                window_n, "payload_encode", "PayloadEncodeError",
+                window_n,
+                "payload_encode",
+                "PayloadEncodeError",
             )
 
+
     def _write_training_tombstone(
-        self, window_start: int, failure_stage: str, failure_type: str,
+        self,
+        window_start: int,
+        failure_stage: str,
+        failure_type: str,
     ) -> None:
         """Tombstone keeps the trainer's journal gapless: the trainer
         never advances on absence, only on an explicit marker."""
@@ -3899,6 +4807,11 @@ class ValidationService:
             return
         from reliquary.shared.training_payload import encode_tombstone
 
+        if FILL_CLOSED_ENABLED:
+            self._write_fill_closed_window_tombstones(
+                int(window_start), str(failure_stage), str(failure_type),
+            )
+            return
         try:
             self._training_payload_queue_ref().enqueue_tombstone(
                 int(window_start),
@@ -3910,8 +4823,11 @@ class ValidationService:
             )
         except Exception:
             logger.exception(
-                "training tombstone write failed for window %s", window_start,
+                "training tombstone write failed for window %s",
+                window_start,
             )
+
+
 
     def _training_payload_queue_ref(self):
         """Injected queue for tests; process singleton in production."""
@@ -3922,6 +4838,89 @@ class ValidationService:
             get_training_payload_queue,
         )
         return get_training_payload_queue()
+
+    def _write_fill_closed_window_tombstones(
+        self,
+        window_start: int,
+        failure_stage: str,
+        failure_type: str,
+    ) -> None:
+        """C2: mark a failed v6 window across its WHOLE encoded key range.
+
+        ``WindowJournal.next_entry`` walks the encoded key space one integer
+        at a time and never advances on absence, only on an explicit marker
+        (journal.py). A v6 window owns
+        ``FILL_CLOSED_EMISSIONS_PER_WINDOW`` consecutive keys, so the seal
+        path's single raw-key tombstone leaves that whole range unwritten
+        and parks the trainer's cursor on the first hole forever -- it would
+        never reach any later window either.
+
+        Padding starts at the assembler's ``next_batch_index``: a window can
+        abort AFTER emitting real batches, and those slots already hold
+        payloads. This is the same rule ``FillClosedBatchAssembler.close()``
+        applies at a normal close (R18), reached here for the windows that
+        never get to close.
+        """
+        from reliquary.constants import FILL_CLOSED_EMISSIONS_PER_WINDOW
+        from reliquary.infrastructure.training_payload_queue import (
+            encoded_window_journal_key,
+        )
+        from reliquary.shared.training_payload import encode_tombstone
+
+        assembler = getattr(self, "_fill_closed_assemblers", {}).get(
+            int(window_start)
+        )
+        first_index = max(
+            0, int(getattr(assembler, "next_batch_index", 0) or 0)
+        )
+        data = encode_tombstone(
+            window_start=int(window_start),
+            failure_stage=str(failure_stage),
+            failure_type=str(failure_type),
+        )
+        for index in range(first_index, FILL_CLOSED_EMISSIONS_PER_WINDOW):
+            key = encoded_window_journal_key(int(window_start), index)
+            self._write_fill_closed_training_tombstone(key, data)
+
+    def _write_fill_closed_training_payload(
+        self, key: int, data: bytes,
+    ) -> None:
+        """R13: enqueue_fn injected into this window's
+        ``FillClosedBatchAssembler``. Independent of the seal-time
+        ``_write_training_payload``. The assembler itself
+        now runs ``assess_training_batch`` per batch (R14) and only
+        calls this for batches it did NOT quarantine; a quarantined
+        batch goes to ``_write_fill_closed_training_tombstone`` instead.
+        Fill mode fails closed when payload writing is disabled or the local
+        durable enqueue fails.  The assembler catches no such error: it keeps
+        its journal index and reward map unchanged, and the batcher returns the
+        groups to its proven pool for an unambiguous retry.
+        """
+        from reliquary.constants import WRITE_TRAINING_PAYLOADS
+
+        if not WRITE_TRAINING_PAYLOADS:
+            raise RuntimeError("fill-closed trainer journal writing is disabled")
+        self._training_payload_queue_ref().enqueue_committed_payload(key, data)
+
+    def _write_fill_closed_training_tombstone(
+        self, key: int, data: bytes,
+    ) -> None:
+        """R14: tombstone_fn injected into this window's
+        ``FillClosedBatchAssembler``, called instead of ``_write_fill_
+        closed_training_payload`` for a batch ``assess_training_batch``
+        quarantines. Written under the batch's OWN encoded journal key
+        (not the bare window) so ``WindowJournal.next_entry`` finds it at
+        the same cursor position a payload would have occupied -- the
+        trainer's cursor advances on this marker instead of stalling.
+        Mirrors the payload sibling's create-only, fail-closed commit.
+        """
+        from reliquary.constants import WRITE_TRAINING_PAYLOADS
+
+        if not WRITE_TRAINING_PAYLOADS:
+            raise RuntimeError("fill-closed trainer journal writing is disabled")
+        self._training_payload_queue_ref().enqueue_committed_tombstone(
+            key, data
+        )
 
     def _enqueue_aborted_window(
         self,
@@ -3949,7 +4948,10 @@ class ValidationService:
         window_start = int(first_batcher.window_start)
         if window_start in getattr(self, "_archive_enqueued_windows", set()):
             return
-        if getattr(self, "_window_iteration_stage", "seal_train_archive") not in {
+        iteration_stage = getattr(
+            self, "_window_iteration_stage", "seal_train_archive"
+        )
+        if iteration_stage not in {
             "open",
             "drand_boundary",
             "randomness",
@@ -3966,7 +4968,36 @@ class ValidationService:
         self._write_training_tombstone(
             window_start, failure_stage, failure_type,
         )
+        # An aborted window never reaches ``_archive_window``, the only other
+        # place an assembler is popped; without this the dict keeps one dead
+        # assembler per consecutive abort. Dropped AFTER the tombstones above,
+        # which read its ``next_batch_index`` to know where padding starts.
+        # ``getattr`` for the same reason the dedup set above uses it: test
+        # stubs and partially-built services call this method too.
+        getattr(self, "_fill_closed_assemblers", {}).pop(window_start, None)
         env_names = list(batchers)
+        from reliquary.environment.registry import get_environment_spec
+
+        def _manifest_digest(env_name: str) -> str | None:
+            try:
+                return get_environment_spec(
+                    env_name
+                ).environment_manifest_sha256
+            except ValueError:
+                return None
+
+        def _target(env_name: str, batcher) -> int:
+            candidate = getattr(batcher, "batch_target", None)
+            if (
+                isinstance(candidate, int)
+                and not isinstance(candidate, bool)
+                and candidate > 0
+            ):
+                return candidate
+            return int(
+                getattr(self, "env_targets", {}).get(env_name, B_BATCH)
+            )
+
         validator_hotkey = str(
             getattr(getattr(getattr(self, "wallet", None), "hotkey", None),
                     "ss58_address", "")
@@ -3983,6 +5014,13 @@ class ValidationService:
             "randomness": str(getattr(first_batcher, "randomness", "")),
             "environment": env_names[0] if env_names else "",
             "environments": env_names,
+            "batch_targets": {
+                name: _target(name, batcher)
+                for name, batcher in batchers.items()
+            },
+            "environment_manifest_sha256_by_environment": {
+                name: _manifest_digest(name) for name in env_names
+            },
             "failure_stage": str(failure_stage),
             "failure_type": str(failure_type),
             "force_seal_reason": getattr(
@@ -4065,6 +5103,10 @@ class ValidationService:
 
         get_archive_queue().enqueue(first_batcher.window_start, archive)
         self._archive_enqueued_windows.add(window_start)
+        self._cooldown_durable_window = max(
+            getattr(self, "_cooldown_durable_window", 0),
+            window_start,
+        )
         logger.error(
             "Window %d archived as aborted stage=%s error_type=%s",
             first_batcher.window_start,
@@ -4107,7 +5149,10 @@ class ValidationService:
                 "checkpoint_revision": cp.revision if cp else None,
                 "checkpoint_n": cp.checkpoint_n if cp else self._checkpoint_n,
                 "training_kl_reference": dict(self.kl_reference_state),
-                "batch_size": B_BATCH,
+                "batch_size": self.env_targets.get(
+                    self.env.name, B_BATCH
+                ),
+                "batch_targets": dict(self.env_targets),
                 "m_rollouts_per_prompt": M_ROLLOUTS,
                 "environment": self.env.name,
                 "netuid": self.netuid,
@@ -4182,7 +5227,12 @@ class ValidationService:
     async def run(self, subtensor) -> None:
         from reliquary.infrastructure.archive_queue import get_archive_queue
 
+        # Load a persisted experimental rotation barrier before any startup
+        # path can construct or expose a new window.  Corrupt state raises and
+        # keeps the validator closed rather than guessing past the barrier.
+        self._initialize_fill_closed_rotation_store()
         archive_queue = get_archive_queue()
+        self._archive_queue = archive_queue
         self.server.configure_archive_queue_telemetry(archive_queue.snapshot)
         self.server.configure_registration_gate()
         await self._refresh_registered_hotkeys(force=True, reason="startup")
@@ -4190,6 +5240,14 @@ class ValidationService:
         await self._serve_axon_on_chain(subtensor)
         await self._apply_resume_from()                  # ← resume before bootstrap
         await self._bootstrap_state_from_external()
+        if (
+            self._local_resume_unadvertised
+            and self._checkpoint_store.current_manifest() is None
+        ):
+            raise RuntimeError(
+                "local path resume is isolated/test-only; a validator must "
+                "resume from an immutable published revision"
+            )
         if PROTOCOL_VERSION >= 3 and self.proof_scheduler is None:
             raise RuntimeError(
                 "auction-v3 requires configured proof replicas; set "
@@ -4255,6 +5313,16 @@ class ValidationService:
                         )
                     await self._ensure_proof_scheduler_ready()
                     self._window_iteration_stage = "open"
+                    # Experimental fill mode never treats its synchronization
+                    # backstop or emergency freeze as permission to open.  The
+                    # durable gate remains armed and the loop retries closed.
+                    rotation = await self._wait_for_fill_closed_rotation()
+                    if rotation in {
+                        "emergency_freeze",
+                        "rotation_blocked_timeout",
+                    }:
+                        await asyncio.sleep(FILL_CLOSED_ROTATION_POLL_SECONDS)
+                        continue
                     self._open_window()
                     self._window_iteration_stage = "admission_pools"
                     self._set_window_preparation_stage("admission_pools")
@@ -4406,6 +5474,18 @@ class ValidationService:
                             "Window %d sealed by liveness breaker: %s",
                             self._window_n, seal_reason,
                         )
+                    if FILL_CLOSED_ENABLED:
+                        # Reserve the complete range first so a local disk
+                        # failure during close leaves a durable closed barrier,
+                        # then close transactionally and rewrite the gate with
+                        # the final real-payload count.  This also makes the
+                        # remainder/padding visible to the trainer before any
+                        # next-window decision.
+                        self._arm_fill_closed_rotation_gate(
+                            reserve_full_range=True
+                        )
+                        self._fill_closed_assembler.close()
+                        self._arm_fill_closed_rotation_gate()
 
                     from reliquary.constants import PIPELINED_WINDOWS
 
@@ -4462,9 +5542,8 @@ class ValidationService:
                         self._windows_since_cooldown_snapshot
                         >= COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS
                     ):
-                        await self._snapshot_cooldown()
-                        await self._snapshot_content_cooldown()
-                        self._windows_since_cooldown_snapshot = 0
+                        if await self._snapshot_committed_cooldowns():
+                            self._windows_since_cooldown_snapshot = 0
 
                     # set_weights is owned by a concurrent WeightOnlyValidator
                     # task running off the same R2 archives; no need to do it
@@ -4682,14 +5761,26 @@ class ValidationService:
         """
         # 1. window_n from R2 archive keys
         try:
-            windows = await storage.list_all_window_keys()
+            remote_windows = await storage.list_all_window_keys(strict=True)
+            archive_queue = getattr(self, "_archive_queue", None)
+            local_windows = (
+                archive_queue.pending_window_numbers()
+                if archive_queue is not None
+                else ()
+            )
+            windows = sorted(set(remote_windows).union(local_windows))
             if windows:
                 self._window_n = max(windows)
-                logger.info("Bootstrapped window_n=%d from R2", self._window_n)
+                logger.info(
+                    "Bootstrapped window_n=%d from durable archives",
+                    self._window_n,
+                )
             else:
-                logger.info("No archives in R2 — starting from window_n=0")
-        except Exception:
-            logger.exception("Failed to bootstrap window_n from R2; starting at 0")
+                logger.info("No durable archives — starting from window_n=0")
+        except Exception as exc:
+            logger.exception("Failed to bootstrap durable window identity")
+            raise RuntimeError("window identity bootstrap failed") from exc
+        self._cooldown_durable_window = self._window_n
 
         # 2. checkpoint_n + revision from HF commit history.
         #
@@ -4777,6 +5868,49 @@ class ValidationService:
                 "validator stays on whatever --resume-from gave us"
             )
 
+    @staticmethod
+    def _validate_cooldown_snapshot(
+        snapshot: dict[str, Any],
+        env_names: set[str],
+        current_window: int,
+    ) -> int:
+        """Validate a complete prompt-cooldown snapshot before mutation."""
+        schema_version = snapshot.get("schema_version", 1)
+        if (
+            not isinstance(schema_version, int)
+            or isinstance(schema_version, bool)
+            or schema_version not in {1, 2}
+        ):
+            raise ValueError("unsupported cooldown snapshot schema")
+        if schema_version == 2 and snapshot.get("complete") is not True:
+            raise ValueError("cooldown snapshot is incomplete")
+        if snapshot.get("run_id") != TRAINING_RUN_ID:
+            raise ValueError("cooldown run id mismatch")
+        snapshot_window = snapshot.get("snapshot_window")
+        if (
+            type(snapshot_window) is not int
+            or not 0 <= snapshot_window <= current_window
+        ):
+            raise ValueError("cooldown snapshot window is outside history")
+        envs = snapshot.get("envs")
+        if not isinstance(envs, dict) or not env_names.issubset(envs):
+            raise ValueError("cooldown snapshot environments are incomplete")
+        for env_name in env_names:
+            state = envs[env_name]
+            if not isinstance(state, dict):
+                raise ValueError(
+                    f"cooldown snapshot env {env_name} must be an object"
+                )
+            parsed = parse_prompt_cooldown_state(state)
+            if any(
+                selected_window > snapshot_window
+                for selected_window in parsed.values()
+            ):
+                raise ValueError(
+                    "cooldown snapshot selection is outside its history"
+                )
+        return snapshot_window
+
     async def _rebuild_cooldown_from_history(self) -> None:
         """At startup, restore per-env cooldown from the run-keyed R2 snapshot,
         then replay only the windows recorded since it was taken — so the FULL
@@ -4787,39 +5921,84 @@ class ValidationService:
         starts empty — a new model must be allowed to re-see every prompt.
         """
         current_window = self._window_n
-        snapshot = None
+        candidates: list[tuple[int, str, dict[str, Any]]] = []
+        remote_snapshot = None
+        remote_error: Exception | None = None
         try:
-            snapshot = await storage.download_json(
-                _cooldown_snapshot_key(TRAINING_RUN_ID)
+            remote_snapshot = await storage.download_json(
+                _cooldown_snapshot_key(TRAINING_RUN_ID),
+                strict=True,
             )
-        except Exception:
+        except Exception as exc:
+            remote_error = exc
             logger.exception("Failed to read cooldown snapshot")
+        local_snapshot = None
+        local_error: Exception | None = None
+        try:
+            local_snapshot = await asyncio.to_thread(
+                _read_gzip_json,
+                _cooldown_local_path(TRAINING_RUN_ID),
+            )
+        except Exception as exc:
+            local_error = exc
+            logger.exception("Failed to read local cooldown snapshot")
 
-        if snapshot and snapshot.get("run_id") == TRAINING_RUN_ID:
+        env_names = set(self._cooldown_per_env)
+        for source, snapshot in (
+            ("r2", remote_snapshot),
+            ("local", local_snapshot),
+        ):
+            if snapshot is None:
+                continue
             try:
-                envs = snapshot.get("envs", {}) or {}
-                for env_name, cooldown_map in self._cooldown_per_env.items():
-                    cooldown_map.import_state(envs.get(env_name, {}))
-                snapshot_window = int(snapshot.get("snapshot_window", current_window))
+                snapshot_window = self._validate_cooldown_snapshot(
+                    snapshot,
+                    env_names,
+                    current_window,
+                )
             except Exception:
-                # Corrupt / partially-written / tampered snapshot — must not
-                # crash startup. Discard any partial restore and fall through.
                 logger.exception(
-                    "Corrupt cooldown snapshot for run=%s; discarding it", TRAINING_RUN_ID,
+                    "Invalid %s cooldown snapshot for run=%s; discarding it",
+                    source,
+                    TRAINING_RUN_ID,
                 )
-                for cooldown_map in self._cooldown_per_env.values():
-                    cooldown_map.import_state({})
             else:
-                gap = max(0, current_window - snapshot_window)
-                if gap > 0:
-                    await self._replay_cooldown_gap(current_window, gap)
-                logger.info(
-                    "Restored cooldown from snapshot run=%s snapshot_window=%d "
-                    "gap=%d (current=%d, sizes=%s)",
-                    TRAINING_RUN_ID, snapshot_window, gap, current_window,
-                    {n: len(m) for n, m in self._cooldown_per_env.items()},
-                )
-                return
+                candidates.append((snapshot_window, source, snapshot))
+
+        if candidates:
+            # Prefer the newest valid durable view. Local wins an exact tie,
+            # because it is written before the best-effort R2 mirror.
+            snapshot_window, source, snapshot = max(
+                candidates,
+                key=lambda item: (item[0], item[1] == "local"),
+            )
+            envs = snapshot["envs"]
+            for env_name, cooldown_map in self._cooldown_per_env.items():
+                cooldown_map.import_state(envs[env_name])
+            gap = max(0, current_window - snapshot_window)
+            if gap > 0:
+                await self._replay_cooldown_gap(current_window, gap)
+            logger.info(
+                "Restored cooldown from %s run=%s snapshot_window=%d "
+                "gap=%d (current=%d, sizes=%s)",
+                source,
+                TRAINING_RUN_ID,
+                snapshot_window,
+                gap,
+                current_window,
+                {name: len(state) for name, state in self._cooldown_per_env.items()},
+            )
+            return
+
+        if (
+            remote_snapshot is not None
+            or local_snapshot is not None
+            or remote_error is not None
+            or local_error is not None
+        ):
+            raise RuntimeError(
+                "cooldown snapshot exists but no valid durable copy can be restored"
+            )
 
         if TRAINING_RUN_ID != "default":
             logger.info(
@@ -4835,12 +6014,88 @@ class ValidationService:
             current_window, COOLDOWN_REBUILD_LOOKBACK,
         )
 
-    async def _rebuild_cooldown_from_archives(self, current_window: int, n: int) -> None:
+    async def _load_archive_range(
+        self,
+        *,
+        start_window: int,
+        end_window: int,
+        require_all: bool,
+    ) -> list[dict]:
+        """Merge remote and locally queued archives without identity gaps."""
+        if end_window < start_window:
+            return []
+        expected = set(range(start_window, end_window + 1))
+        remote_error: Exception | None = None
+        try:
+            remote = await storage.list_recent_datasets(
+                current_window=end_window + 1,
+                n=len(expected),
+                strict=True,
+            )
+        except Exception as exc:
+            remote_error = exc
+            remote = []
+
+        archive_queue = getattr(self, "_archive_queue", None)
+        local = (
+            archive_queue.pending_archives(
+                start_window=start_window,
+                end_window=end_window,
+            )
+            if archive_queue is not None
+            else {}
+        )
+        merged: dict[int, dict] = {}
+        for archive in remote:
+            window_start = archive.get("window_start")
+            if (
+                not isinstance(window_start, int)
+                or isinstance(window_start, bool)
+                or window_start not in expected
+                or window_start in merged
+            ):
+                raise RuntimeError("remote archive identity mismatch")
+            merged[window_start] = archive
+        for window_start, archive in local.items():
+            if window_start in merged and merged[window_start] != archive:
+                raise RuntimeError("local and remote archives conflict")
+            merged[window_start] = archive
+
+        missing = expected.difference(merged)
+        if remote_error is not None and missing:
+            raise RuntimeError("archive lookup failed") from remote_error
+        if require_all and missing:
+            raise RuntimeError(
+                f"archive range is incomplete: {sorted(missing)}"
+            )
+        return [merged[window] for window in sorted(merged)]
+
+    async def _rebuild_cooldown_from_archives(
+        self,
+        current_window: int,
+        n: int,
+    ) -> None:
         """Rebuild every env's cooldown from scratch from the last ``n`` R2
         archives (used only when no snapshot is available)."""
         try:
-            archives = await storage.list_recent_datasets(
-                current_window=current_window + 1, n=n,
+            if type(current_window) is not int or current_window < 0:
+                raise RuntimeError("cooldown rebuild window is not canonical")
+            if type(n) is not int or n < 1:
+                raise RuntimeError("cooldown rebuild horizon is not canonical")
+            if current_window == 0:
+                for cooldown_map in self._cooldown_per_env.values():
+                    cooldown_map.rebuild_from_history([], current_window=0)
+                logger.info(
+                    "Initialized empty cooldown before the first produced window"
+                )
+                return
+            # Window zero is the bootstrap sentinel; the first durable archive
+            # is window one. Every real window in the bounded range is required.
+            start_window = max(1, current_window + 1 - n)
+            archives = await self._load_archive_range(
+                start_window=start_window,
+                end_window=current_window,
+                require_all=True,
             )
             for env_name, cooldown_map in self._cooldown_per_env.items():
                 cooldown_map.rebuild_from_history(
@@ -4853,72 +6108,133 @@ class ValidationService:
                 len(archives), current_window,
                 {n2: len(m) for n2, m in self._cooldown_per_env.items()},
             )
-        except Exception:
+        except Exception as exc:
             logger.exception(
-                "Failed to rebuild cooldown from history; starting empty"
+                "Failed to rebuild cooldown from history; refusing startup"
             )
+            raise RuntimeError("cooldown history rebuild failed") from exc
 
     async def _replay_cooldown_gap(self, current_window: int, gap: int) -> None:
         """Merge the windows recorded since the snapshot into the restored
         cooldown. Bounded by COOLDOWN_REBUILD_LOOKBACK; in normal operation the
         gap is ~the snapshot (publish) cadence."""
-        n = min(gap + 1, COOLDOWN_REBUILD_LOOKBACK)
+        if gap > COOLDOWN_REBUILD_LOOKBACK:
+            raise RuntimeError("cooldown gap exceeds the bounded replay horizon")
         try:
-            archives = await storage.list_recent_datasets(
-                current_window=current_window + 1, n=n,
+            archives = await self._load_archive_range(
+                start_window=current_window - gap + 1,
+                end_window=current_window,
+                require_all=True,
             )
             for env_name, cooldown_map in self._cooldown_per_env.items():
                 cooldown_map.apply_history(
                     _filter_archives_for_env(archives, env_name),
                     current_window=current_window,
                 )
-            if gap + 1 > COOLDOWN_REBUILD_LOOKBACK:
-                logger.warning(
-                    "Cooldown gap %d exceeds replay cap %d; prompts in the "
-                    "uncovered span may be re-eligible. Widen "
-                    "COOLDOWN_REBUILD_LOOKBACK if this recurs.",
-                    gap, COOLDOWN_REBUILD_LOOKBACK,
-                )
-        except Exception:
-            logger.exception("Cooldown gap-replay failed; using snapshot only")
+        except Exception as exc:
+            logger.exception("Cooldown gap-replay failed; refusing startup")
+            raise RuntimeError("cooldown gap replay failed") from exc
 
-    async def _snapshot_cooldown(self) -> None:
+    async def _snapshot_cooldown(
+        self,
+        *,
+        snapshot_window: int | None = None,
+    ) -> bool:
         """Persist the per-env cooldown maps to R2, keyed by the training run id,
-        so a restart restores the full cooldown without replaying history. Best
-        effort — a snapshot failure must never break the window loop."""
+        so a restart restores the full cooldown without replaying history.
+
+        The local atomic snapshot is authoritative for a same-host restart;
+        R2 is a best-effort mirror for host replacement. Returns whether at
+        least one durable copy was written. A failure never breaks the window
+        loop, but it remains visible in logs.
+        """
+        snapshot: dict[str, Any] | None = None
         try:
-            window = self._window_n
+            window = self._window_n if snapshot_window is None else snapshot_window
+            if type(window) is not int or not 0 <= window <= self._window_n:
+                raise ValueError("cooldown snapshot window is not committed")
 
             def _build() -> dict:
-                # Copy can be multi-MB (cooldown never expires) — build it off
-                # the event loop. Safe: the window loop is sequential here, no
-                # concurrent record_batched between seal and the next window.
                 return {
+                    "schema_version": 2,
                     "run_id": TRAINING_RUN_ID,
                     "snapshot_window": window,
+                    "complete": True,
                     "envs": {
-                        name: cd.export_state()
+                        name: cd.export_state(through_window=window)
                         for name, cd in self._cooldown_per_env.items()
                     },
                 }
 
             snapshot = await asyncio.to_thread(_build)
-            if await storage.upload_json(
-                _cooldown_snapshot_key(TRAINING_RUN_ID), snapshot
-            ):
-                logger.info(
-                    "Snapshotted cooldown run=%s window=%d (sizes=%s)",
-                    TRAINING_RUN_ID, self._window_n,
-                    {n: len(m) for n, m in self._cooldown_per_env.items()},
-                )
         except Exception:
-            logger.exception("Cooldown snapshot failed (non-fatal)")
+            logger.exception("Cooldown snapshot build failed (non-fatal)")
+            return False
+
+        local_written = False
+        try:
+            await asyncio.to_thread(
+                _write_gzip_json_atomic,
+                _cooldown_local_path(TRAINING_RUN_ID),
+                snapshot,
+            )
+            local_written = True
+        except Exception:
+            logger.exception("Local cooldown snapshot failed (non-fatal)")
+
+        remote_written = False
+        try:
+            remote_written = bool(await storage.upload_json(
+                _cooldown_snapshot_key(TRAINING_RUN_ID), snapshot
+            ))
+        except Exception:
+            logger.exception("R2 cooldown snapshot failed (non-fatal)")
+
+        if local_written or remote_written:
+            logger.info(
+                "Snapshotted cooldown run=%s window=%d local=%s remote=%s "
+                "(sizes=%s)",
+                TRAINING_RUN_ID,
+                window,
+                local_written,
+                remote_written,
+                {name: len(state) for name, state in self._cooldown_per_env.items()},
+            )
+        return local_written or remote_written
+
+    async def _snapshot_all_cooldowns(
+        self,
+        *,
+        snapshot_window: int | None = None,
+    ) -> bool:
+        """Persist both cooldown identities before advancing retry cadence."""
+        prompt_written = await self._snapshot_cooldown(
+            snapshot_window=snapshot_window
+        )
+        content_written = await self._snapshot_content_cooldown(
+            snapshot_window=snapshot_window
+        )
+        return prompt_written and content_written
+
+    async def _snapshot_committed_cooldowns(self) -> bool:
+        """Snapshot only through the latest durably recorded window."""
+        snapshot_window = min(
+            self._window_n,
+            getattr(self, "_cooldown_durable_window", 0),
+        )
+        return await self._snapshot_all_cooldowns(
+            snapshot_window=snapshot_window
+        )
 
     @staticmethod
     def _validate_content_snapshot(
         snapshot: dict[str, Any],
         env_names: set[str],
+        current_window: int,
     ) -> int:
+        schema_version = snapshot.get("schema_version")
+        if type(schema_version) is not int or schema_version != 1:
+            raise ValueError("unsupported content cooldown snapshot schema")
         if snapshot.get("run_id") != TRAINING_RUN_ID:
             raise ValueError("content cooldown run id mismatch")
         if snapshot.get("complete") is not True:
@@ -4926,7 +6242,29 @@ class ValidationService:
         envs = snapshot.get("envs")
         if not isinstance(envs, dict) or set(envs) != env_names:
             raise ValueError("content cooldown environments are incomplete")
-        return int(snapshot.get("snapshot_window", -1))
+        snapshot_window = snapshot.get("snapshot_window")
+        if (
+            type(snapshot_window) is not int
+            or not 0 <= snapshot_window <= current_window
+        ):
+            raise ValueError(
+                "content cooldown snapshot window is outside history"
+            )
+        for env_name in env_names:
+            state = envs[env_name]
+            if not isinstance(state, dict):
+                raise ValueError(
+                    f"content cooldown env {env_name} must be an object"
+                )
+            parsed = parse_content_cooldown_state(state)
+            if any(
+                selected_window > snapshot_window
+                for selected_window in parsed.values()
+            ):
+                raise ValueError(
+                    "content cooldown selection is outside its history"
+                )
+        return snapshot_window
 
     def _top_up_content_cooldown_from_prompt_state(
         self,
@@ -4937,6 +6275,7 @@ class ValidationService:
             prompt_content_sha256,
             render_canonical_prompt,
         )
+        from reliquary.environment.registry import get_environment_spec
 
         resolved = 0
         for env_name, prompt_map in self._cooldown_per_env.items():
@@ -4947,9 +6286,20 @@ class ValidationService:
                 if int(selected_window) <= snapshot_window:
                     continue
                 problem = env.get_problem(int(prompt_idx))
-                rendered = render_canonical_prompt(
-                    self.tokenizer, str(problem["prompt"])
-                )
+                try:
+                    spec = get_environment_spec(env_name)
+                except ValueError:
+                    spec = None
+                if spec is not None and spec.interaction_mode == "episode":
+                    from reliquary.environment.agentic.compat import (
+                        rendered_episode_prompt,
+                    )
+
+                    rendered = rendered_episode_prompt(env, int(prompt_idx))
+                else:
+                    rendered = render_canonical_prompt(
+                        self.tokenizer, str(problem["prompt"])
+                    )
                 digest = prompt_content_sha256(env_name, rendered)
                 prior = content_state.get(digest, -1)
                 if int(selected_window) > prior:
@@ -4967,37 +6317,60 @@ class ValidationService:
         content snapshot and resolve only prompt entries newer than it.
         """
         env_names = set(self.envs)
-        snapshot: dict[str, Any] | None = None
-        source = "none"
+        candidates: list[tuple[int, str, dict[str, Any]]] = []
+        remote_snapshot: dict[str, Any] | None = None
         try:
-            candidate = await storage.download_json(
-                _content_cooldown_snapshot_key(TRAINING_RUN_ID)
+            remote_snapshot = await storage.download_json(
+                _content_cooldown_snapshot_key(TRAINING_RUN_ID),
+                strict=True,
             )
-            if candidate is not None:
-                self._validate_content_snapshot(candidate, env_names)
-                snapshot = candidate
-                source = "r2"
         except Exception:
             logger.exception("Failed to restore R2 content cooldown snapshot")
 
-        if snapshot is None:
+        local_snapshot: dict[str, Any] | None = None
+        try:
+            local_snapshot = await asyncio.to_thread(
+                _read_gzip_json,
+                _content_cooldown_local_path(TRAINING_RUN_ID),
+            )
+        except Exception:
+            logger.exception("Failed to restore local content cooldown snapshot")
+
+        for source_name, candidate in (
+            ("r2", remote_snapshot),
+            ("local", local_snapshot),
+        ):
+            if candidate is None:
+                continue
             try:
-                candidate = await asyncio.to_thread(
-                    _read_gzip_json,
-                    _content_cooldown_local_path(TRAINING_RUN_ID),
+                candidate_window = self._validate_content_snapshot(
+                    candidate,
+                    env_names,
+                    self._window_n,
                 )
-                if candidate is not None:
-                    self._validate_content_snapshot(candidate, env_names)
-                    snapshot = candidate
-                    source = "local"
             except Exception:
-                logger.exception("Failed to restore local content cooldown snapshot")
+                logger.exception(
+                    "Invalid %s content cooldown snapshot; discarding it",
+                    source_name,
+                )
+            else:
+                candidates.append((candidate_window, source_name, candidate))
+
+        snapshot: dict[str, Any] | None = None
+        source = "none"
+        if candidates:
+            _, source, snapshot = max(
+                candidates,
+                key=lambda item: (item[0], item[1] == "local"),
+            )
 
         snapshot_window = -1
         try:
             if snapshot is not None:
                 snapshot_window = self._validate_content_snapshot(
-                    snapshot, env_names
+                    snapshot,
+                    env_names,
+                    self._window_n,
                 )
                 envs = snapshot["envs"]
                 for env_name, content_map in self._content_cooldown_per_env.items():
@@ -5043,14 +6416,20 @@ class ValidationService:
             )
             raise RuntimeError("content cooldown restore incomplete") from exc
 
-    async def _snapshot_content_cooldown(self) -> bool:
+    async def _snapshot_content_cooldown(
+        self,
+        *,
+        snapshot_window: int | None = None,
+    ) -> bool:
         """Persist locally before the best-effort R2 mirror.
 
         Returns whether a restart-safe local snapshot exists. The caller uses
         this as a startup gate; periodic callers may continue from the complete
         in-memory map while health reports a later disk failure.
         """
-        window = self._window_n
+        window = self._window_n if snapshot_window is None else snapshot_window
+        if type(window) is not int or not 0 <= window <= self._window_n:
+            raise ValueError("content cooldown snapshot window is not committed")
 
         def _build() -> dict[str, Any]:
             return {
@@ -5059,7 +6438,7 @@ class ValidationService:
                 "snapshot_window": window,
                 "complete": True,
                 "envs": {
-                    name: content_map.export_state()
+                    name: content_map.export_state(through_window=window)
                     for name, content_map in self._content_cooldown_per_env.items()
                 },
             }
@@ -5120,16 +6499,26 @@ class ValidationService:
 
     async def _rebuild_hashes_from_history(self) -> None:
         """Rebuild ``self._hash_set`` from the last HASH_DEDUP_RETENTION_WINDOWS
-        archives. Horizon is independent of cooldown — see constants docstring.
-        Compat path covers pre-feature archives (no ``hash`` field) by
-        recomputing from ``tokens``.
+        durable archives, merging the remote store with the local pending
+        queue. Unknown or incomplete history fails startup closed: otherwise a
+        paid rollout could be replayed during an object-store outage.
         """
         try:
             current_window = self._window_n
+            if current_window <= 0:
+                self._hash_set.rebuild_from_history(
+                    [], current_window=current_window,
+                )
+                return
+            start_window = max(
+                1,
+                current_window + 1 - HASH_DEDUP_RETENTION_WINDOWS,
+            )
             archives = await asyncio.wait_for(
-                storage.list_recent_datasets(
-                    current_window=current_window + 1,
-                    n=HASH_DEDUP_RETENTION_WINDOWS,
+                self._load_archive_range(
+                    start_window=start_window,
+                    end_window=current_window,
+                    require_all=True,
                 ),
                 timeout=_STARTUP_HASH_REBUILD_TIMEOUT_SECONDS,
             )
@@ -5142,16 +6531,11 @@ class ValidationService:
                 len(archives), HASH_DEDUP_RETENTION_WINDOWS,
                 current_window, len(self._hash_set),
             )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Hash-set rebuild from history timed out after %.1fs; "
-                "starting empty",
-                _STARTUP_HASH_REBUILD_TIMEOUT_SECONDS,
-            )
-        except Exception:
+        except Exception as exc:
             logger.exception(
-                "Failed to rebuild hash set from history; starting empty"
+                "Failed to rebuild complete hash history; refusing startup"
             )
+            raise RuntimeError("hash history rebuild failed") from exc
 
     async def _wait_for_next_drand_boundary(self) -> None:
         """Align window OPEN to the next drand round boundary.
@@ -5207,9 +6591,15 @@ class ValidationService:
             drand_round = chain.compute_current_drand_round(
                 time.time(), chain_info["genesis_time"], chain_info["period"],
             )
-            beacon = await asyncio.to_thread(
-                get_beacon, round_id=str(drand_round), use_drand=True,
+            beacon = dict(
+                await asyncio.to_thread(
+                    get_beacon,
+                    round_id=str(drand_round),
+                    use_drand=True,
+                )
             )
+            beacon["source_chain"] = str(chain_info["name"])
+            beacon["source_chain_hash"] = str(chain_info["hash"])
             randomness = chain.compute_window_randomness(
                 None, beacon["randomness"], drand_round=beacon["round"],
             )
@@ -5218,6 +6608,9 @@ class ValidationService:
         # disable drand keep working without a live drand fetch.
         block_hash = await chain.get_block_hash(subtensor, target_window)
         return chain.compute_window_randomness(block_hash), None
+
+
+
 
     async def _fetch_seal_randomness(self) -> str:
         """Fetch post-seal drand with a bounded retry budget.

@@ -55,3 +55,12 @@ build-backend = "hatchling.build"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+filterwarnings = [
+    "error::DeprecationWarning",
+    "error::PendingDeprecationWarning",
+    "error::FutureWarning",
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
+    # Starlette 1.6 imports this compatibility alias from AnyIO 4.15.
+    "ignore:The anyio.abc.BlockingPortal alias is deprecated, use anyio.from_thread.BlockingPortal instead.:DeprecationWarning",
+    "ignore:Deprecated in 0.9.0. BPE.__init__ will not create from files anymore",
+]

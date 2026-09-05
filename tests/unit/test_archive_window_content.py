@@ -1,10 +1,11 @@
 """_archive_window includes prompt + rollout content on R2."""
 
 from dataclasses import dataclass
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from reliquary.constants import B_BATCH
 from reliquary.validator.batcher import ValidSubmission
 from reliquary.protocol.submission import RolloutSubmission
 
@@ -46,7 +47,9 @@ def _rollout(r=1.0, eos=False):
     )
 
 
-def _valid_submission(prompt_idx, k=4, hotkey="hk", eos_first=False):
+def _valid_submission(
+    prompt_idx, k=4, hotkey="hk", eos_first=False, eos_tokens=0
+):
     import math
     rollouts = [
         _rollout(r=1.0 if i < k else 0.0, eos=(eos_first and i == 0))
@@ -60,6 +63,7 @@ def _valid_submission(prompt_idx, k=4, hotkey="hk", eos_first=False):
         merkle_root_bytes=b"\xab" * 32,
         sigma=sigma,
         rollouts=rollouts,
+        eos_tokens=eos_tokens,
         completion_texts=[f"text_{i}" for i in range(8)],
         sketch_diff_max=412,
         lp_dev_max=0.00037,
@@ -214,13 +218,17 @@ async def test_archive_includes_prompt_and_rollout_content():
     assert archive["window_status"] == "completed"
     assert archive["window_start"] == 42
     assert archive["environment"] == "fake"
+    assert archive["batch_targets"] == {"fake": B_BATCH}
+    assert archive["environment_manifest_sha256_by_environment"] == {
+        "fake": None
+    }
     assert len(archive["batch"]) == 2
 
     import math
     entry0 = archive["batch"][0]
     assert entry0["prompt_idx"] == 7
     assert entry0["prompt_content_sha256"] == "11" * 32
-    assert "target_content_sha256" not in entry0
+    assert entry0["target_content_sha256"] == "22" * 32
     assert entry0["prompt"] == "question 7"
     assert entry0["ground_truth"] == "answer 7"
     expected_sigma = math.sqrt((4 / 8) * (1 - 4 / 8))  # Bernoulli(p=0.5) → 0.5
@@ -377,8 +385,6 @@ async def test_archive_includes_prompt_and_rollout_content():
 @pytest.mark.asyncio
 async def test_archive_includes_per_rollout_hash():
     """Each rollout in the archive's batch entry carries a hex SHA256 hash."""
-    from unittest.mock import AsyncMock, MagicMock, patch
-
     from reliquary.validator.service import ValidationService
 
     fake_tok = MagicMock()

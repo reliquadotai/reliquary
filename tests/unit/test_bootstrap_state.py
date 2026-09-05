@@ -1,6 +1,5 @@
 """ValidationService._bootstrap_state_from_external: derives window_n + checkpoint_n + EMA from R2 + HF."""
 
-from collections import defaultdict
 from dataclasses import dataclass
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -121,8 +120,7 @@ async def test_bootstrap_checkpoint_n_from_hf_commits():
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_tolerates_r2_failure():
-    """R2 failure during window key fetch → window_n stays 0, no exception raised."""
+async def test_bootstrap_fails_closed_when_remote_window_identity_is_unknown():
     svc = _make_service()
 
     with (
@@ -136,7 +134,51 @@ async def test_bootstrap_tolerates_r2_failure():
         ),
         patch("huggingface_hub.HfApi.list_repo_commits", return_value=[]),
     ):
-        await svc._bootstrap_state_from_external()  # must not raise
+        with pytest.raises(RuntimeError, match="window identity bootstrap"):
+            await svc._bootstrap_state_from_external()
+
+    assert svc._window_n == 0
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_includes_locally_committed_pending_archives(tmp_path):
+    from reliquary.infrastructure.archive_queue import ArchiveQueue
+
+    svc = _make_service()
+    queue = ArchiveQueue(str(tmp_path / "pending"))
+    queue.enqueue(43, {"window_start": 43, "window_status": "aborted"})
+    svc._archive_queue = queue
+
+    with (
+        patch(
+            "reliquary.infrastructure.storage.list_all_window_keys",
+            new=AsyncMock(return_value=[1, 42]),
+        ),
+        patch("huggingface_hub.HfApi.list_repo_commits", return_value=[]),
+    ):
+        await svc._bootstrap_state_from_external()
+
+    assert svc._window_n == 43
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_rejects_a_corrupt_highest_pending_archive(tmp_path):
+    from reliquary.infrastructure.archive_queue import ArchiveQueue
+
+    svc = _make_service()
+    queue = ArchiveQueue(str(tmp_path / "pending"))
+    (queue.queue_dir / "window-99.json.gz").write_bytes(b"not-gzip")
+    svc._archive_queue = queue
+
+    with (
+        patch(
+            "reliquary.infrastructure.storage.list_all_window_keys",
+            new=AsyncMock(return_value=[42]),
+        ),
+        patch("huggingface_hub.HfApi.list_repo_commits", return_value=[]),
+    ):
+        with pytest.raises(RuntimeError, match="window identity bootstrap"):
+            await svc._bootstrap_state_from_external()
 
     assert svc._window_n == 0
 

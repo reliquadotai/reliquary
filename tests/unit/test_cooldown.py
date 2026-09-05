@@ -1,5 +1,8 @@
 """CooldownMap — in-memory lifecycle."""
 
+import json
+from pathlib import Path
+
 import pytest
 
 from reliquary.validator.cooldown import ContentCooldownMap, CooldownMap
@@ -83,11 +86,6 @@ def test_content_cooldown_rejects_truncated_digest():
     content = ContentCooldownMap(cooldown_windows=50)
     with pytest.raises(ValueError, match="64 lowercase hex"):
         content.record_selected("ab", window=100)
-
-
-import json
-import tempfile
-from pathlib import Path
 
 
 def test_persist_and_load_roundtrip(tmp_path: Path):
@@ -203,3 +201,90 @@ def test_apply_history_keeps_older_when_snapshot_is_newer():
     m.import_state({7: 200})
     m.apply_history([{"window_start": 150, "batch": [{"prompt_idx": 7}]}], current_window=210)
     assert m.export_state() == {7: 200}  # snapshot's newer window wins
+
+
+@pytest.mark.parametrize("prompt_idx", [True, 7.0, "7", -1])
+def test_apply_history_rejects_coerced_prompt_indices_atomically(prompt_idx):
+    m = CooldownMap(cooldown_windows=1000)
+    m.import_state({7: 100})
+    history = [
+        {"window_start": 150, "batch": [{"prompt_idx": 99}]},
+        {"window_start": 151, "batch": [{"prompt_idx": prompt_idx}]},
+    ]
+
+    with pytest.raises(ValueError, match="archive prompt index"):
+        m.apply_history(history, current_window=170)
+
+    assert m.export_state() == {7: 100}
+
+
+@pytest.mark.parametrize("window_start", [True, 150.0, "150", -1])
+def test_apply_history_rejects_coerced_archive_windows_atomically(window_start):
+    m = CooldownMap(cooldown_windows=1000)
+    m.import_state({7: 100})
+    history = [
+        {"window_start": 150, "batch": [{"prompt_idx": 99}]},
+        {"window_start": window_start, "batch": [{"prompt_idx": 100}]},
+    ]
+
+    with pytest.raises(ValueError, match="archive window"):
+        m.apply_history(history, current_window=170)
+
+    assert m.export_state() == {7: 100}
+
+
+def test_snapshot_export_excludes_entries_after_snapshot_boundary():
+    prompt = CooldownMap(cooldown_windows=1000)
+    prompt.record_batched(1, 10)
+    prompt.record_batched(2, 20)
+    assert prompt.export_state(through_window=10) == {1: 10}
+
+    content = ContentCooldownMap(cooldown_windows=1000)
+    first = "a" * 64
+    second = "b" * 64
+    content.record_selected(first, 10)
+    content.record_selected(second, 20)
+    assert content.export_state(through_window=10) == {first: 10}
+
+
+def test_snapshot_import_rejects_negative_values():
+    prompt = CooldownMap(cooldown_windows=1000)
+    with pytest.raises(ValueError, match="negative"):
+        prompt.import_state({1: -1})
+
+    content = ContentCooldownMap(cooldown_windows=1000)
+    with pytest.raises(ValueError, match="negative"):
+        content.import_state({"a" * 64: -1})
+
+
+@pytest.mark.parametrize("value", [True, 1.0, "1"])
+def test_prompt_snapshot_import_rejects_coerced_windows(value):
+    prompt = CooldownMap(cooldown_windows=1000)
+    with pytest.raises(ValueError, match="non-negative integer"):
+        prompt.import_state({"1": value})
+
+
+@pytest.mark.parametrize("key", [True, 1.0, "01", "+1", " 1"])
+def test_prompt_snapshot_import_rejects_noncanonical_keys(key):
+    prompt = CooldownMap(cooldown_windows=1000)
+    with pytest.raises(ValueError):
+        prompt.import_state({key: 1})
+
+
+def test_prompt_snapshot_import_rejects_normalized_duplicate_keys():
+    prompt = CooldownMap(cooldown_windows=1000)
+    with pytest.raises(ValueError, match="duplicate prompt keys"):
+        prompt.import_state({1: 1, "1": 1})
+
+
+@pytest.mark.parametrize("value", [False, 1.0, "1"])
+def test_content_snapshot_import_rejects_coerced_windows(value):
+    content = ContentCooldownMap(cooldown_windows=1000)
+    with pytest.raises(ValueError, match="non-negative integer"):
+        content.import_state({"a" * 64: value})
+
+
+def test_content_snapshot_import_requires_canonical_digest():
+    content = ContentCooldownMap(cooldown_windows=1000)
+    with pytest.raises(ValueError, match="lowercase hex"):
+        content.import_state({"A" * 64: 1})

@@ -4,9 +4,17 @@ Immutable values that all network participants must agree on.
 No os.getenv() overrides. Changes require coordinated deployment.
 """
 
+import math as _math
+import os as _os
+
+from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE
+
 # ────────────────  GRAIL PROOF VERSION  ────────────────
 
 GRAIL_PROOF_VERSION = "v7"
+# Episode v1 commits bind structured actions and assistant spans in addition to
+# the token/commitment payload. Legacy single-turn profiles remain on v7.
+GRAIL_EPISODE_PROOF_VERSION = "v8"
 
 # ────────────────  CRYPTOGRAPHIC CONSTANTS  ────────────────
 
@@ -45,10 +53,6 @@ PROOF_SKETCH_TOLERANCE_GROWTH = 5.0
 # Override with GRAIL_ATTN_IMPL for test envs without flash-attn compiled
 # (e.g. "eager" or "sdpa"). Production runs must stay on flash_attention_2
 # because sketch commitments are bit-sensitive to attention kernel variance.
-import math as _math
-import os as _os
-
-from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE
 
 ATTN_IMPLEMENTATION = _os.environ.get("GRAIL_ATTN_IMPL", "flash_attention_2")
 
@@ -134,16 +138,35 @@ def max_new_tokens_for_environment(environment: str) -> int:
         MAX_NEW_TOKENS_PROTOCOL_CAP,
     )
 
+
+def episode_limits_for_environment(environment: str) -> tuple[int, int, int] | None:
+    """Return action-token, episode-token and observation-byte limits."""
+
+    profile = ACTIVE_PROTOCOL_PROFILE.environments.get(environment)
+    episode = profile.episode if profile is not None else None
+    if episode is None:
+        return None
+    return (
+        int(episode.max_action_tokens),
+        int(episode.max_episode_tokens),
+        int(episode.max_observation_bytes),
+    )
+
 # Budget-Forced Termination (BFT): if a rollout has not emitted </think> by
 # BFT_THINKING_BUDGET tokens, the miner appends BFT_FORCE_TEMPLATE and samples
 # the answer in BFT_ANSWER_BUDGET more tokens, so it terminates with a real
 # (gradeable) answer instead of an unparseable thinking truncation. H200 sweeps
 # on real OpenMathInstruct prompts found 2048/512 to match 2048/256 reward
 # (5/6) with better EOS rate, while 4096/256 was slower and lower reward.
-_MATH_PROFILE = ACTIVE_PROTOCOL_PROFILE.environments["openmathinstruct"]
-_MATH_BFT_PROFILE = _MATH_PROFILE.bft
-MATH_ANSWER_FORMAT = _MATH_PROFILE.answer_format
-if MATH_ANSWER_FORMAT not in ("boxed", "boxed_or_trailing_number"):
+_MATH_PROFILE = ACTIVE_PROTOCOL_PROFILE.environments.get("openmathinstruct")
+_MATH_BFT_PROFILE = _MATH_PROFILE.bft if _MATH_PROFILE is not None else None
+MATH_ANSWER_FORMAT = (
+    _MATH_PROFILE.answer_format if _MATH_PROFILE is not None else None
+)
+if _MATH_PROFILE is not None and MATH_ANSWER_FORMAT not in (
+    "boxed",
+    "boxed_or_trailing_number",
+):
     raise ValueError("openmathinstruct profile must declare an answer format")
 BFT_ENABLED = _MATH_BFT_PROFILE is not None
 # 2026-07 Qwen3.5-4B behavior study (held-out OMI, vLLM): the 4B thinks a median
@@ -607,6 +630,7 @@ if CHECKPOINT_PUBLISH_INTERVAL_WINDOWS <= 0:
         "RELIQUARY_CHECKPOINT_PUBLISH_INTERVAL_WINDOWS must be positive"
     )
 
+
 # Default HF repo target for published checkpoints. Operator may
 # override via --hf-repo-id CLI arg. Must be a writable repo id for
 # the validator's HF token.
@@ -655,12 +679,16 @@ M_ROLLOUTS = ACTIVE_PROTOCOL_PROFILE.sampling.rollouts
 # watch as training lengthens responses, NOT the slot count.
 B_BATCH = 16 if PROTOCOL_VERSION >= 4 else 8
 
+
 # (env_name, prompts_per_batch). Sum across entries = total prompts
 # processed per optimizer step: 2 × B_BATCH prompts × M_ROLLOUTS sequences.
 # v3: 16 × 8 = 128. v4: 32 × 16 = 512.
 ENVIRONMENT_MIX: list[tuple[str, int]] = [
-    ("openmathinstruct", B_BATCH),
-    ("opencodeinstruct", B_BATCH),
+    (
+        name,
+        B_BATCH if profile.batch_target is None else int(profile.batch_target),
+    )
+    for name, profile in ACTIVE_PROTOCOL_PROFILE.environments.items()
 ]
 
 # Auction-v3 deliberately narrows only the ranked GPU proof prefix: B_BATCH
@@ -671,6 +699,176 @@ ENVIRONMENT_MIX: list[tuple[str, int]] = [
 MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW = (
     2 * B_BATCH if PROTOCOL_VERSION >= 3 else 64
 )
+
+# ────────────────  FILL-CLOSED WINDOW (v6)  ────────────────
+
+# The v6 window ends when every environment holds its target of PROVEN
+# groups rather than when a clock expires. Gated so the auction path stays
+# live and byte-identical for v4/v5: a validator reaches this code only by
+# selecting the v6 profile AND arming the capability.
+#
+# Fails closed unless the active profile IS v6, regardless of the env var.
+# FILL_CLOSED_TARGET_GROUPS_PER_ENV below derives from B_BATCH and
+# CHECKPOINT_PUBLISH_INTERVAL_WINDOWS, and both are profile-dependent (v2
+# gives 32, v4/v5 give 256, v6 gives 256) -- so arming this under any
+# non-v6 profile would silently size a v6-shaped window from another
+# protocol's batch shape instead of refusing to run.
+_FILL_CLOSED_REQUESTED = _os.environ.get(
+    "RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+_FILL_CLOSED_PROFILE_ID = "qwen3-4b-base-dapo-fill-closed-v6"
+FILL_CLOSED_ENABLED = (
+    PROTOCOL_PROFILE_ID == _FILL_CLOSED_PROFILE_ID
+    and _FILL_CLOSED_REQUESTED
+)
+
+if _FILL_CLOSED_REQUESTED and PROTOCOL_PROFILE_ID != _FILL_CLOSED_PROFILE_ID:
+    raise ValueError(
+        "RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED requires the exact "
+        f"{_FILL_CLOSED_PROFILE_ID!r} profile"
+    )
+if PROTOCOL_PROFILE_ID == _FILL_CLOSED_PROFILE_ID and not FILL_CLOSED_ENABLED:
+    raise ValueError(
+        f"the {_FILL_CLOSED_PROFILE_ID!r} profile requires its explicit "
+        "experimental fill-closed capability"
+    )
+
+# Proven groups that close one environment. 16 optimizer steps x B_BATCH.
+FILL_CLOSED_TARGET_GROUPS_PER_ENV = int(_os.environ.get(
+    "RELIQUARY_FILL_CLOSED_TARGET_GROUPS_PER_ENV",
+    str(CHECKPOINT_PUBLISH_INTERVAL_WINDOWS * B_BATCH),
+))
+if FILL_CLOSED_TARGET_GROUPS_PER_ENV <= 0:
+    raise ValueError(
+        "RELIQUARY_FILL_CLOSED_TARGET_GROUPS_PER_ENV must be positive"
+    )
+
+# How many training-payload emissions one v6 window can produce, for the
+# journal key encoding (R11): window_start * FILL_CLOSED_EMISSIONS_PER_
+# WINDOW + batch_index. Derived from CHECKPOINT_PUBLISH_INTERVAL_WINDOWS
+# for the same reason FILL_CLOSED_TARGET_GROUPS_PER_ENV is derived from it
+# above -- one B_BATCH-per-environment emission per optimizer step, and a
+# window's target is exactly CHECKPOINT_PUBLISH_INTERVAL_WINDOWS steps
+# worth of groups. A literal, not separately env-overridable: an operator
+# changing this without changing the target (or vice versa) would size
+# the journal's per-window key range out of step with how many emissions
+# a window can actually produce.
+FILL_CLOSED_EMISSIONS_PER_WINDOW = CHECKPOINT_PUBLISH_INTERVAL_WINDOWS
+
+# The target, pick horizon and journal key range are one shape. v6.1 closes
+# after ``FILL_CLOSED_EMISSIONS_PER_WINDOW`` complete B_BATCH picks, so a
+# smaller target is just as incoherent as a larger one: the former cannot close
+# and the latter writes past its key range. Keep the old environment variable
+# only as a validated deployment input; it may not redefine one field alone.
+_FILL_CLOSED_TRAINABLE_GROUPS_PER_ENV = (
+    FILL_CLOSED_EMISSIONS_PER_WINDOW * B_BATCH
+)
+if FILL_CLOSED_TARGET_GROUPS_PER_ENV != _FILL_CLOSED_TRAINABLE_GROUPS_PER_ENV:
+    raise ValueError(
+        "RELIQUARY_FILL_CLOSED_TARGET_GROUPS_PER_ENV="
+        f"{FILL_CLOSED_TARGET_GROUPS_PER_ENV} must equal "
+        f"FILL_CLOSED_EMISSIONS_PER_WINDOW ({FILL_CLOSED_EMISSIONS_PER_WINDOW})"
+        f" * B_BATCH ({B_BATCH}) so the pick horizon, admission target and "
+        "journal key range cannot diverge"
+    )
+
+# Backstop only. A window normally ends on its fill; this stops stalled
+# candidate supply holding one open forever, and seals whatever is proven.
+FILL_CLOSED_MAX_SECONDS = float(_os.environ.get(
+    "RELIQUARY_FILL_CLOSED_MAX_SECONDS", "1800"
+))
+if not _math.isfinite(FILL_CLOSED_MAX_SECONDS) or FILL_CLOSED_MAX_SECONDS <= 0:
+    raise ValueError("RELIQUARY_FILL_CLOSED_MAX_SECONDS must be positive")
+
+# A fill-closed precommit must leave enough time for its advertised upload
+# grace before the window's hard backstop.  Reusing the profile's 100-second
+# collection value made the macro window keep running while ingress had already
+# closed.  This capability-local horizon fixes that seam without widening the
+# V4/V5 collection window or changing any profile contract.
+FILL_CLOSED_PRECOMMIT_SECONDS = float(_os.environ.get(
+    "RELIQUARY_FILL_CLOSED_PRECOMMIT_SECONDS",
+    str(FILL_CLOSED_MAX_SECONDS - SUBMISSION_UPLOAD_GRACE_SECONDS),
+))
+if (
+    not _math.isfinite(FILL_CLOSED_PRECOMMIT_SECONDS)
+    or FILL_CLOSED_PRECOMMIT_SECONDS <= 0
+    or FILL_CLOSED_PRECOMMIT_SECONDS + SUBMISSION_UPLOAD_GRACE_SECONDS
+    > FILL_CLOSED_MAX_SECONDS
+):
+    raise ValueError(
+        "RELIQUARY_FILL_CLOSED_PRECOMMIT_SECONDS must be positive and leave "
+        "SUBMISSION_UPLOAD_GRACE_SECONDS before "
+        "RELIQUARY_FILL_CLOSED_MAX_SECONDS"
+    )
+
+# Qualification-only bound on productive admissions per environment. It is
+# separate from the pick target and remains monotonic for a window.
+FILL_CLOSED_ADMISSION_BUDGET_PER_ENV = int(_os.environ.get(
+    "RELIQUARY_FILL_CLOSED_ADMISSION_BUDGET_PER_ENV",
+    str(2 * FILL_CLOSED_TARGET_GROUPS_PER_ENV),
+))
+_FILL_CLOSED_MAX_ADMISSION_BUDGET_PER_ENV = (
+    2 * _FILL_CLOSED_TRAINABLE_GROUPS_PER_ENV
+)
+if not (
+    _FILL_CLOSED_TRAINABLE_GROUPS_PER_ENV
+    <= FILL_CLOSED_ADMISSION_BUDGET_PER_ENV
+    <= _FILL_CLOSED_MAX_ADMISSION_BUDGET_PER_ENV
+):
+    raise ValueError(
+        "RELIQUARY_FILL_CLOSED_ADMISSION_BUDGET_PER_ENV must be between "
+        "FILL_CLOSED_TARGET_GROUPS_PER_ENV and twice the full window's "
+        "trainable capacity"
+    )
+
+# Grading starts include protocol-valid bodies that later prove unproductive;
+# keep that anti-DoS wall distinct from the productive admission budget.  It is
+# explicit here because the generic batcher constructor's legacy fallback is
+# intentionally not a v6 policy.  The upper bound is finite and capability
+# local, so arming fill-closed cannot silently widen the global V4/V5 ceiling.
+FILL_CLOSED_GRADING_START_BUDGET_PER_ENV = int(_os.environ.get(
+    "RELIQUARY_FILL_CLOSED_GRADING_START_BUDGET_PER_ENV",
+    str(2 * FILL_CLOSED_ADMISSION_BUDGET_PER_ENV),
+))
+if not (
+    FILL_CLOSED_ADMISSION_BUDGET_PER_ENV
+    <= FILL_CLOSED_GRADING_START_BUDGET_PER_ENV
+    <= 4 * _FILL_CLOSED_TRAINABLE_GROUPS_PER_ENV
+):
+    raise ValueError(
+        "RELIQUARY_FILL_CLOSED_GRADING_START_BUDGET_PER_ENV must be at "
+        "least the admission budget and at most four times the full "
+        "window's trainable capacity"
+    )
+
+# Qualification-only pacing parameters. The first pick uses a wall-clock
+# floor; subsequent picks are bounded by the durable trainer cursor and the
+# configured pipeline depth.
+FILL_CLOSED_FIRST_PICK_SECONDS = float(_os.environ.get(
+    "RELIQUARY_FILL_CLOSED_FIRST_PICK_SECONDS", "30"
+))
+if (
+    not _math.isfinite(FILL_CLOSED_FIRST_PICK_SECONDS)
+    or FILL_CLOSED_FIRST_PICK_SECONDS < 0
+):
+    raise ValueError(
+        "RELIQUARY_FILL_CLOSED_FIRST_PICK_SECONDS must be finite and >= 0"
+    )
+
+FILL_CLOSED_PICK_PIPELINE_DEPTH = int(_os.environ.get(
+    "RELIQUARY_FILL_CLOSED_PICK_PIPELINE_DEPTH", "2"
+))
+if not (
+    1 <= FILL_CLOSED_PICK_PIPELINE_DEPTH <= FILL_CLOSED_EMISSIONS_PER_WINDOW
+):
+    # Depth 0 would gate pick 1 on a batch that pick 1 itself produces --
+    # a deadlock every window until the backstop. Depth past the window's
+    # own emission count would put EVERY pick on the time floor, which is
+    # the unpaced behaviour the amendment exists to remove.
+    raise ValueError(
+        "RELIQUARY_FILL_CLOSED_PICK_PIPELINE_DEPTH must be in [1, "
+        f"{FILL_CLOSED_EMISSIONS_PER_WINDOW}]"
+    )
 
 # Runtime default for CLI/Docker operators. OpenCode remains available through
 # ENVIRONMENT_MIX, but code execution is opt-in until the runsc canary and
@@ -900,9 +1098,8 @@ MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW = 2
 DIFFICULTY_AUCTION_ENFORCE = _os.environ.get(
     "RELIQUARY_DIFFICULTY_AUCTION_ENFORCE", "1"
 ).strip().lower() not in ("0", "false", "no", "off", "")
-DIFFICULTY_AUCTION_ENVIRONMENTS = (
-    "openmathinstruct",
-    "opencodeinstruct",
+DIFFICULTY_AUCTION_ENVIRONMENTS = tuple(
+    ACTIVE_PROTOCOL_PROFILE.environments
 )
 
 ENFORCE_ENVELOPE_SIGNATURE = _os.environ.get(
@@ -1382,11 +1579,13 @@ TOKEN_AUTH_ARGMAX_CONF = 0.99
 TOKEN_AUTH_ENFORCE = True
 
 # All-token argmax-gated authenticity gate: a chosen completion token below this
-# threshold while the model's argmax is >= the confidence bound is rejected.
-# Enforced live; the shadow telemetry counters are retained for monitoring.
+# threshold while the model's argmax is >= the confidence bound is flagged.
+# v5 samples the full distribution via a public inverse CDF, so a low-probability
+# token can be the legal seed-selected token. Keep telemetry, but do not reject
+# on this signal alone.
 ALL_TOKEN_AUTH_SHADOW_THRESHOLD = 1e-5
 ALL_TOKEN_AUTH_SHADOW_ARGMAX_CONF = TOKEN_AUTH_ARGMAX_CONF
-ALL_TOKEN_AUTH_ENFORCE = True
+ALL_TOKEN_AUTH_ENFORCE = PROTOCOL_VERSION != 5
 
 # OpenCode semantic-token authenticity shadow gate. Generic token auth catches
 # near-impossible injections, and numeric auth catches many literal edits, but

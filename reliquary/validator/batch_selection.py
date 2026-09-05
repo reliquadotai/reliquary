@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 from typing import Any, Protocol
 
+from reliquary.constants import FILL_CLOSED_ENABLED
 from reliquary.validator.cooldown import CooldownMap
 
 
@@ -268,12 +269,21 @@ def explain_batch_selection(
     distinguish "accepted into the pool" from "selected for training" from
     "rewarded by emission sharing". Keys are ``id(submission)``.
     """
+    # ``rewarded``/``reward_amount`` below are the SLOT share this function
+    # mirrors. Under v6 the seal path pays nothing at all -- payment is the
+    # per-token split ``FillClosedBatchAssembler`` computes over assembled
+    # batches (R20) -- so reporting a slot share unqualified would hand an
+    # operator a number that was never credited. Name the payer.
+    payment_source = (
+        "fill_closed_token_split" if FILL_CLOSED_ENABLED else "slot_share"
+    )
     meta: dict[int, dict[str, Any]] = {
         id(sub): {
             "accepted_into_pool": True,
             "selected_for_batch": False,
             "rewarded": False,
             "reward_amount": 0.0,
+            "payment_source": payment_source,
             "canonical_rank": None,
             "selection_reason": "not_reached_before_batch_filled",
         }

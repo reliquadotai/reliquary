@@ -15,9 +15,8 @@ This file initially holds the Task-4-level tests pinning the new
 
 from __future__ import annotations
 
-import asyncio
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -43,7 +42,12 @@ async def test_derive_randomness_returns_tuple_in_drand_mode(monkeypatch):
         "randomness": "aa" * 32,
         "signature": "bb" * 48,
     }
-    fake_chain_info = {"genesis_time": 1692803367, "period": 3}
+    fake_chain_info = {
+        "name": "quicknet",
+        "hash": "ab" * 32,
+        "genesis_time": 1692803367,
+        "period": 3,
+    }
 
     monkeypatch.setattr(
         "reliquary.infrastructure.drand.get_beacon",
@@ -67,7 +71,11 @@ async def test_derive_randomness_returns_tuple_in_drand_mode(monkeypatch):
     assert len(result) == 2
     randomness, beacon = result
     assert randomness == "computed_randomness_hex"
-    assert beacon == fake_beacon
+    assert beacon == {
+        **fake_beacon,
+        "source_chain": "quicknet",
+        "source_chain_hash": "ab" * 32,
+    }
 
 
 @pytest.mark.asyncio
@@ -262,6 +270,67 @@ def test_activation_binding_is_window_and_nonce_specific():
         target_window=42,
         activation_nonce=b"\x02" * 32,
     )
+
+
+def test_public_window_binding_is_reproducible_and_window_specific():
+    from reliquary.validator.service import _bind_public_window_randomness
+
+    first = _bind_public_window_randomness(
+        "public-beacon",
+        target_window=42,
+    )
+
+    assert first == _bind_public_window_randomness(
+        "public-beacon",
+        target_window=42,
+    )
+    assert first != _bind_public_window_randomness(
+        "public-beacon",
+        target_window=43,
+    )
+    assert first != _bind_public_window_randomness(
+        "different-beacon",
+        target_window=42,
+    )
+
+
+@pytest.mark.asyncio
+async def test_fill_window_uses_only_public_randomness_binding(monkeypatch):
+    from reliquary.validator import service as svc_mod
+
+    fake_beacon = {
+        "round": 1,
+        "randomness": "aa" * 32,
+        "source_chain": "quicknet",
+        "source_chain_hash": "ab" * 32,
+    }
+
+    async def _stub_derive(self, subtensor, target_window):
+        return "computed_randomness", fake_beacon
+
+    monkeypatch.setattr(svc_mod, "FILL_CLOSED_ENABLED", True)
+    monkeypatch.setattr(
+        svc_mod.ValidationService,
+        "_derive_randomness",
+        _stub_derive,
+    )
+
+    svc = _make_test_service(use_drand=True)
+    svc._candidate_activation_nonce = None
+    svc._active_batcher = _make_test_batcher()
+    svc._window_n = 42
+
+    await svc._set_window_randomness(subtensor=None)
+
+    assert svc._active_batcher.randomness == (
+        svc_mod._bind_public_window_randomness(
+            "computed_randomness",
+            target_window=42,
+        )
+    )
+    assert svc._active_batcher.window_open_drand_chain == "quicknet"
+    assert svc._active_batcher.window_open_drand_chain_hash == "ab" * 32
+    assert svc._active_batcher.window_open_drand_round == 1
 
 
 @pytest.mark.asyncio

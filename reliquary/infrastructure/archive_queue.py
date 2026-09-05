@@ -37,7 +37,10 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import time
+
+from reliquary.shared.strict_json import strict_json_loads
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +50,8 @@ logger = logging.getLogger(__name__)
 # production: most transient blips clear within a minute; longer-duration
 # issues (Cloudflare regional incidents) can last 30-60 min.
 RETRY_BACKOFF_SECONDS: tuple[int, ...] = (5, 30, 120, 600, 1800)
+
+_WINDOW_ARCHIVE_NAME = re.compile(r"^window-(0|[1-9][0-9]*)\.json\.gz$")
 
 
 def _default_queue_dir() -> str:
@@ -96,14 +101,49 @@ class ArchiveQueue:
         Writes atomically via ``.tmp + os.replace`` so a process crash
         mid-write cannot leave a half-written file in the queue.
         """
+        if type(window_start) is not int or window_start < 0:
+            raise ValueError(
+                "archive window_start must be a non-negative integer"
+            )
+        if not isinstance(data, dict):
+            raise TypeError("archive payload must be a dictionary")
+        body_window = data.get("window_start")
+        if type(body_window) is not int or body_window < 0:
+            raise ValueError(
+                "archive payload window_start must be a non-negative integer"
+            )
+        if body_window != window_start:
+            raise ValueError(
+                "archive payload window_start must match the queue identity"
+            )
+
         payload = json.dumps(data, separators=(",", ":")).encode()
         compressed = gzip.compress(payload)
 
         final_path = self.queue_dir / f"window-{window_start}.json.gz"
         tmp_path = self.queue_dir / f"window-{window_start}.json.gz.tmp"
-        with open(tmp_path, "wb") as f:
-            f.write(compressed)
-        os.replace(tmp_path, final_path)
+        if final_path.exists():
+            existing = self._read_pending_archive(final_path, window_start)
+            if existing != data:
+                raise RuntimeError("conflicting archive already committed")
+            return final_path
+        try:
+            with open(tmp_path, "wb") as file_handle:
+                file_handle.write(compressed)
+                file_handle.flush()
+                os.fsync(file_handle.fileno())
+            os.replace(tmp_path, final_path)
+            directory_fd = os.open(self.queue_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except Exception:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
 
         if (
             self._last_enqueued_window is not None
@@ -136,14 +176,69 @@ class ArchiveQueue:
             if not p.name.endswith(".tmp")
         )
 
+    def pending_window_numbers(self) -> tuple[int, ...]:
+        """Return the exact window identities retained in the local journal."""
+        windows = []
+        for path in self._pending():
+            window_n = self._window_n_from_path(path)
+            if window_n is None:
+                raise RuntimeError(f"invalid pending archive path: {path.name}")
+            self._read_pending_archive(path, window_n)
+            windows.append(window_n)
+        if len(set(windows)) != len(windows):
+            raise RuntimeError("duplicate pending archive window")
+        return tuple(sorted(windows))
+
+    def pending_archives(
+        self,
+        *,
+        start_window: int,
+        end_window: int,
+    ) -> dict[int, dict]:
+        """Read and validate locally committed archives in an inclusive range."""
+        result: dict[int, dict] = {}
+        for path in self._pending():
+            window_n = self._window_n_from_path(path)
+            if window_n is None:
+                raise RuntimeError(f"invalid pending archive path: {path.name}")
+            if not start_window <= window_n <= end_window:
+                continue
+            value = self._read_pending_archive(path, window_n)
+            if window_n in result:
+                raise RuntimeError("duplicate pending archive window")
+            result[window_n] = value
+        return result
+
+    @staticmethod
+    def _read_pending_archive(path: Path, window_n: int) -> dict:
+        if type(window_n) is not int or window_n < 0:
+            raise RuntimeError(
+                f"invalid pending archive identity: {path.name}"
+            )
+        try:
+            value = strict_json_loads(gzip.decompress(path.read_bytes()))
+        except Exception as exc:
+            raise RuntimeError(
+                f"invalid pending archive body: {path.name}"
+            ) from exc
+        if not isinstance(value, dict):
+            raise RuntimeError(
+                f"pending archive identity mismatch: {path.name}"
+            )
+        body_window = value.get("window_start")
+        if type(body_window) is not int or body_window != window_n:
+            raise RuntimeError(
+                f"pending archive identity mismatch: {path.name}"
+            )
+        return value
+
     @staticmethod
     def _window_n_from_path(path: Path) -> int | None:
         """Parse ``window-<N>.json.gz`` -> ``N`` or None on malformed name."""
-        try:
-            stem = path.name  # window-N.json.gz
-            return int(stem.split("-", 1)[1].split(".", 1)[0])
-        except (IndexError, ValueError):
+        match = _WINDOW_ARCHIVE_NAME.fullmatch(path.name)
+        if match is None:
             return None
+        return int(match.group(1))
 
     def _backoff_delay(self, attempts: int) -> float:
         """Exponential backoff: lookup table with floor at the last entry."""
@@ -203,8 +298,9 @@ class ArchiveQueue:
             return False
 
         try:
+            self._read_pending_archive(path, window_n)
             body = path.read_bytes()
-        except OSError as e:
+        except (OSError, RuntimeError) as e:
             logger.error("ArchiveQueue: failed to read %s: %s", path, e)
             return False
 

@@ -6,13 +6,31 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from reliquary.miner.engine import pick_prompt_idx
+from reliquary.miner.engine import _eligible_generation_mix, pick_prompt_idx
 from reliquary.shared.modeling import MODEL_SNAPSHOT_ALLOW_PATTERNS
 
 
 class FakeEnv:
     def __len__(self):
         return 100
+
+
+def test_generation_mix_skips_closed_admission_lanes():
+    state = SimpleNamespace(environments={
+        "math": SimpleNamespace(accepting_submissions=False),
+        "code": SimpleNamespace(accepting_submissions=True),
+    })
+
+    assert _eligible_generation_mix(
+        [("math", 2), ("code", 1)],
+        state,
+    ) == [("code", 1)]
+    assert _eligible_generation_mix([("math", 1)], state) == []
+
+
+def test_generation_mix_preserves_legacy_state_behavior():
+    mix = [("math", 2), ("code", 1)]
+    assert _eligible_generation_mix(mix, None) == mix
 
 
 def test_pick_prompt_in_range():
@@ -104,6 +122,136 @@ def test_v3_state_contract_fails_closed(monkeypatch):
     )
 
 
+def test_release_recheck_binds_window_contract_range_and_cooldown():
+    from reliquary.constants import FORCED_SEED_PROTOCOL_VERSION
+    from reliquary.miner.engine import _release_state_mismatch_reason
+    from reliquary.protocol.profiles import (
+        ACTIVE_PROTOCOL_PROFILE,
+        to_generation_contract,
+    )
+    from reliquary.protocol.submission import WindowState
+
+    state = SimpleNamespace(
+        state=WindowState.OPEN,
+        window_n=50,
+        randomness="ab" * 32,
+        checkpoint_n=7,
+        checkpoint_repo_id="owner/repo",
+        checkpoint_revision="revision",
+        protocol_version=ACTIVE_PROTOCOL_PROFILE.protocol_version,
+        generation_profile_id=(
+            ACTIVE_PROTOCOL_PROFILE.profile_id
+            if ACTIVE_PROTOCOL_PROFILE.protocol_version >= 3
+            else None
+        ),
+        generation_contract=(
+            to_generation_contract(ACTIVE_PROTOCOL_PROFILE)
+            if ACTIVE_PROTOCOL_PROFILE.protocol_version >= 3
+            else None
+        ),
+        submission_deadline_at=200.0,
+    )
+    request = SimpleNamespace(
+        window_start=50,
+        prompt_idx=12,
+        checkpoint_hash="revision",
+        protocol_version=FORCED_SEED_PROTOCOL_VERSION,
+        generation_profile_id=(
+            ACTIVE_PROTOCOL_PROFILE.profile_id
+            if ACTIVE_PROTOCOL_PROFILE.protocol_version >= 3
+            else ""
+        ),
+    )
+    kwargs = {
+        "initial_state": state,
+        "release_state": state,
+        "request": request,
+        "environment_name": "fake",
+        "environment_size": 100,
+        "cooldown_prompts": set(),
+        "prompt_range": (10, 20),
+        "now": 100.0,
+    }
+    assert _release_state_mismatch_reason(**kwargs) is None
+
+    assert _release_state_mismatch_reason(
+        **{**kwargs, "cooldown_prompts": {12}}
+    ) == "prompt_in_cooldown"
+    assert _release_state_mismatch_reason(
+        **{**kwargs, "prompt_range": (20, 30)}
+    ) == "prompt_out_of_range"
+    assert _release_state_mismatch_reason(
+        **{**kwargs, "accepting_submissions": False}
+    ) == "admission_closed"
+    assert _release_state_mismatch_reason(
+        **{
+            **kwargs,
+            "release_state": SimpleNamespace(**{
+                **state.__dict__,
+                "randomness": "cd" * 32,
+            }),
+        }
+    ) == "randomness_changed"
+
+
+def test_release_recheck_rejects_deadline_and_checkpoint_change():
+    from reliquary.constants import FORCED_SEED_PROTOCOL_VERSION
+    from reliquary.miner.engine import _release_state_mismatch_reason
+    from reliquary.protocol.profiles import (
+        ACTIVE_PROTOCOL_PROFILE,
+        to_generation_contract,
+    )
+    from reliquary.protocol.submission import WindowState
+
+    contract = (
+        to_generation_contract(ACTIVE_PROTOCOL_PROFILE)
+        if ACTIVE_PROTOCOL_PROFILE.protocol_version >= 3
+        else None
+    )
+    profile_id = (
+        ACTIVE_PROTOCOL_PROFILE.profile_id
+        if ACTIVE_PROTOCOL_PROFILE.protocol_version >= 3
+        else None
+    )
+    initial = SimpleNamespace(
+        state=WindowState.OPEN,
+        window_n=50,
+        randomness="ab" * 32,
+        checkpoint_n=7,
+        checkpoint_repo_id="owner/repo",
+        checkpoint_revision="revision",
+        protocol_version=ACTIVE_PROTOCOL_PROFILE.protocol_version,
+        generation_profile_id=profile_id,
+        generation_contract=contract,
+        submission_deadline_at=100.0,
+    )
+    request = SimpleNamespace(
+        window_start=50,
+        prompt_idx=12,
+        checkpoint_hash="revision",
+        protocol_version=FORCED_SEED_PROTOCOL_VERSION,
+        generation_profile_id=profile_id or "",
+    )
+    kwargs = dict(
+        initial_state=initial,
+        release_state=initial,
+        request=request,
+        environment_name="fake",
+        environment_size=100,
+        cooldown_prompts=set(),
+        prompt_range=(10, 20),
+        now=100.0,
+    )
+    assert _release_state_mismatch_reason(**kwargs) == "submission_deadline_passed"
+
+    changed = SimpleNamespace(**{
+        **initial.__dict__,
+        "checkpoint_revision": "replacement",
+        "submission_deadline_at": 200.0,
+    })
+    assert _release_state_mismatch_reason(
+        **{**kwargs, "release_state": changed}
+    ) == "contract_changed"
 @pytest.mark.asyncio
 async def test_checkpoint_download_allows_qwen35_shards(monkeypatch):
     from reliquary.miner import engine as engine_mod

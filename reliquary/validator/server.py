@@ -25,8 +25,10 @@ import multiprocessing
 import os
 import numbers
 import secrets
+import sys
 import urllib.parse
 import time
+import uuid
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
@@ -43,6 +45,7 @@ from reliquary.constants import (
     AUCTION_EARLY_CLOSE_MIN_SECONDS,
     AUCTION_EARLY_CLOSE_MODE,
     B_BATCH,
+    ENVIRONMENT_MIX,
     DRAND_ROUND_BACKWARD_TOLERANCE,
     DIFFICULTY_AUCTION_DELTA,
     DIFFICULTY_AUCTION_ENFORCE,
@@ -52,6 +55,8 @@ from reliquary.constants import (
     DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES,
     DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR,
     ENFORCE_ENVELOPE_SIGNATURE,
+    FILL_CLOSED_ENABLED,
+    FILL_CLOSED_MAX_SECONDS,
     FORCED_SEED_CDF_BOUNDARY_EPSILON,
     FORCED_SEED_CDF_ENFORCE,
     FORCED_SEED_CONSISTENCY_FLOOR,
@@ -77,6 +82,7 @@ from reliquary.constants import (
     REGISTERED_HOTKEY_STALE_GRACE_SECONDS,
     PRECOMMIT_BODY_READ_TIMEOUT_SECONDS,
     PRIMARY_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
+    PROMPT_RANGE_SIZE,
     SUBMISSION_HEADER_READ_TIMEOUT_SECONDS,
     SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS,
     SPARSE_VALID_IDLE_SEAL_SECONDS,
@@ -95,6 +101,7 @@ from reliquary.constants import (
     max_truncated_for_environment,
 )
 from reliquary.environment.virtual_parquet import PromptSourceUnavailable
+from reliquary.environment.registry import get_environment_spec
 from reliquary.infrastructure.process_health import collect_process_health
 from reliquary.protocol.legacy_merkle import (
     legacy_submission_merkle_matches,
@@ -107,7 +114,10 @@ from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     BatchSubmissionResponse,
     CommitModel,
+    FillClosedWindowState,
     GrpoBatchState,
+    MinerEnvironmentState,
+    MinerState,
     RejectReason,
     RuntimeContract,
     RuntimeFingerprint,
@@ -115,6 +125,9 @@ from reliquary.protocol.submission import (
     SubmissionPrecommitResponse,
     Verdict,
     VerdictsResponse,
+    VerdictsPage,
+    WindowState,
+    encode_cooldown_bitmap,
 )
 from reliquary.protocol.tokens import verify_tokens
 from reliquary.shared.hf_compat import (
@@ -127,6 +140,7 @@ from reliquary.shared.modeling import (
     think_close_token_ids,
 )
 from reliquary.shared.runtime_fingerprint import collect_runtime_fingerprint
+from reliquary.shared.prompt_range import window_prompt_range
 from reliquary.validator.admission import (
     AdmissionContext,
     AdmissionReceiptBinding,
@@ -154,6 +168,15 @@ from reliquary.validator.verifier import (
     rewards_std,
     validate_force_span,
 )
+
+
+def _admission_resource_class(environment: str) -> str:
+    """Return the registered class; local test environments use the CPU lane."""
+
+    try:
+        return get_environment_spec(environment).admission_resource_class
+    except ValueError:
+        return "cpu"
 
 logger = logging.getLogger(__name__)
 
@@ -184,12 +207,16 @@ class _UploadPrecommitReceipt:
     operator: str | None = None
     upload_started_at_wall: float | None = None
     body_completed_at_wall: float | None = None
+    admission_policy_window: int | None = None
     consumed: bool = False
     outcome: BatchSubmissionResponse | None = None
     terminal: bool = False
     terminal_recorded: bool = False
     reveal_success_recorded: bool = False
     reveal_failure_recorded: bool = False
+    admission_beacon_round: int | None = None
+
+
 
 
 @dataclass(frozen=True)
@@ -286,13 +313,26 @@ class _StateFastPathMiddleware:
             await self.app(scope, receive, send)
             return
         env: str | None = None
+        window: int | None = None
         query = scope.get("query_string") or b""
         if query:
-            values = urllib.parse.parse_qs(query.decode("latin-1")).get("env")
+            query_values = urllib.parse.parse_qs(query.decode("latin-1"), keep_blank_values=True)
+            values = query_values.get("env")
             if values:
-                env = values[0]
+                env = values[-1]
+            windows = query_values.get("window")
+            if windows:
+                try:
+                    window = int(windows[-1])
+                except (TypeError, ValueError):
+                    await self.app(scope, receive, send)
+                    return
         started = time.perf_counter()
-        body = self._server._cached_state_response(env)
+        body = (
+            self._server._cached_state_response(env)
+            if window is None
+            else self._server._cached_state_response(env, window)
+        )
         if body is None:
             await self.app(scope, receive, send)
             return
@@ -843,6 +883,16 @@ def _proof_free_submission_reject(
         ):
             return RejectReason.OUT_OF_ZONE, "zone"
 
+    try:
+        interaction_mode = get_environment_spec(environment).interaction_mode
+    except ValueError:
+        interaction_mode = "single_turn"
+    if interaction_mode == "episode":
+        # The isolated admission worker reconstructs and replays the complete
+        # canonical episode. A final tokenizer EOS is neither required nor a
+        # valid proxy for an environment's terminal state.
+        return None, None
+
     eos_set = _proof_free_eos_set(batcher)
     if not eos_set:
         return None, None
@@ -880,8 +930,14 @@ def _proof_free_submission_reject(
             continue
 
         total_length = prompt_length + completion_length
-        is_math = rollout.env_name == "openmathinstruct"
-        if is_math and is_forced_bft_cap_termination(commit):
+        try:
+            uses_math_bft = (
+                get_environment_spec(rollout.env_name).termination_policy
+                == "math_bft"
+            )
+        except ValueError:
+            uses_math_bft = False
+        if uses_math_bft and is_forced_bft_cap_termination(commit):
             # Only exempt from the truncation budget if the claimed FORCE span
             # is structurally valid (byte-exact, position-pinned). A fake-forced
             # rollout is rejected here instead of after a GPU proof; the full
@@ -953,8 +1009,12 @@ class _Health(BaseModel):
     queue_depth_by_environment: dict[str, int] = Field(default_factory=dict)
     admission_workers_by_environment: dict[str, int] = Field(
         default_factory=lambda: {
-            "openmathinstruct": MATH_ADMISSION_WORKERS,
-            "opencodeinstruct": CODE_ADMISSION_WORKERS,
+            environment: (
+                CODE_ADMISSION_WORKERS
+                if _admission_resource_class(environment) == "sandbox"
+                else MATH_ADMISSION_WORKERS
+            )
+            for environment, _target in ENVIRONMENT_MIX
         }
     )
     admission_pool_state_by_environment: dict[str, dict[str, Any]] = Field(
@@ -1154,6 +1214,7 @@ class ValidatorServer:
         # everything that can change the payload, so a hit is byte-identical
         # to a rebuild and staleness is structurally zero.
         self._state_response_cache: dict[str, tuple[tuple, bytes]] = {}
+        self._miner_state_response_cache: tuple[tuple, bytes, str] | None = None
         self._registration_gate_enforced = False
         self._registered_hotkeys: frozenset[str] | None = None
         self._operator_by_hotkey: dict[str, str] = {}
@@ -1240,6 +1301,7 @@ class ValidatorServer:
         self._admission_materialization_pool: ThreadPoolExecutor | None = None
         self._precommit_signature_pool: ThreadPoolExecutor | None = None
         self._precommit_signature_inflight = 0
+        self._precommit_http_inflight = 0
         self._admission_active_by_environment: collections.Counter[str] = (
             collections.Counter()
         )
@@ -1283,25 +1345,29 @@ class ValidatorServer:
         from reliquary.protocol.submission import WindowState
         self._current_state: WindowState = WindowState.READY
         self._current_checkpoint = None  # ManifestEntry | None
+        self._checkpoint_identity_floor: tuple[int, str, str] | None = None
+        self._checkpoint_identity_floor_entry = None
         self._late_drop_callback: Callable[[str, str], None] | None = None
         # Per-hotkey submission counter. Reset every time the active
         # batcher swaps (= window boundary). Read in /submit before any
         # heavier check so a saturated miner trip the rate limit on the
         # cheapest possible path.
-        self._per_window_counts: dict[str, int] = {}
+        self._per_window_counts: dict[str | tuple[int, str], int] = {}
         # Per-hotkey BAD_ENVELOPE_SIGNATURE counter. Reset on batcher
         # swap alongside ``_per_window_counts``. Caps how many bad
         # packets one hotkey can burn per window — see
         # ``MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW`` for the rationale
         # (closes the connection-priming side-channel without re-opening
         # the spoof-DoS that PR #35 closed).
-        self._bad_envelope_counts: dict[str, int] = {}
+        self._bad_envelope_counts: dict[str | tuple[int, str], int] = {}
         # Per-hotkey ring buffer of recent verdicts. Keys are miner ss58
         # addresses; values are deques of ``Verdict``-shaped dicts (stored
         # as plain dicts to keep the hot path serialization-free).
         # asyncio is single-threaded so no lock is needed — every mutation
         # site runs on the event loop.
         self._verdicts: dict[str, collections.deque[dict]] = {}
+        self._verdict_sequence_by_hotkey = collections.Counter()
+        self._verdict_stream_id = uuid.uuid4().hex
         self._recent_reject_counts: collections.Counter[str] = collections.Counter()
 
     def _state_cache_key(self, batcher) -> tuple:
@@ -1312,48 +1378,162 @@ class ValidatorServer:
             if getattr(batcher, "difficulty_auction_enabled", False)
             else batcher.valid_count
         )
+        capacity_used = getattr(batcher, "candidate_capacity_used", 0)
+        fill_state = (
+            getattr(batcher, "fill_state", None)
+            if FILL_CLOSED_ENABLED
+            else None
+        )
+        fill_revision = (
+            getattr(fill_state, "revision", None)
+            if fill_state is not None
+            else None
+        )
+        fill_collection_closed = (
+            bool(batcher.collection_closed())
+            if fill_state is not None
+            else None
+        )
+        fill_sealed = (
+            bool(batcher.is_sealed()) if fill_state is not None else None
+        )
         return (
             id(batcher),
             batcher.window_start,
             self._current_state,
             submission_count,
+            capacity_used,
             cp.checkpoint_n if cp else -1,
             cp.revision if cp else None,
+            fill_revision,
+            fill_collection_closed,
+            fill_sealed,
         )
 
-    def _cached_state_response(self, env: str | None) -> bytes | None:
-        """Cached /state bytes for ``env`` if still valid, else None.
+    def _miner_state_cache_key(self) -> tuple:
+        """Everything the additive bounded miner-state response depends on."""
+        checkpoint = self._current_checkpoint
+        return (
+            self._current_state,
+            tuple(
+                (
+                    environment,
+                    id(batcher),
+                    int(batcher.window_start),
+                    str(batcher.randomness),
+                    getattr(batcher, "prompt_range", None),
+                    float(batcher.window_opened_wall_ts),
+                    bool(batcher.is_sealed()),
+                    bool(batcher.collection_closed()),
+                    int(getattr(batcher, "candidate_capacity_used", 0)),
+                    int(getattr(batcher, "max_productive_candidates", 0)),
+                    int(getattr(batcher, "proof_grading_attempts", 0)),
+                    int(getattr(batcher, "max_grading_starts", 0)),
+                    (
+                        int(batcher.fill_state.revision)
+                        if getattr(batcher, "fill_state", None) is not None
+                        else None
+                    ),
+                    float(
+                        getattr(
+                            batcher,
+                            "collection_seconds",
+                            WINDOW_COLLECTION_SECONDS,
+                        )
+                    ),
+                )
+                for environment, batcher in sorted(self._active_batchers.items())
+            ),
+            checkpoint.checkpoint_n if checkpoint else -1,
+            checkpoint.repo_id if checkpoint else None,
+            checkpoint.revision if checkpoint else None,
+            PROTOCOL_VERSION,
+            PROTOCOL_PROFILE_ID,
+        )
 
-        Called from the ASGI fast path, outside the FastAPI stack — must stay
-        lock-free and never raise: any unusual condition (no window, unknown
-        env, cold cache) returns None and the request falls through to the
-        normal route, which owns error semantics and cache fills.
-        """
-        try:
-            if env is not None:
-                batcher = self._active_batchers.get(env)
-            else:
-                batcher = self.active_batcher
-            if batcher is None:
-                return None
-            cached = self._state_response_cache.get(env or "")
-            if cached is None or cached[0] != self._state_cache_key(batcher):
-                return None
-            return cached[1]
-        except Exception:
+    @staticmethod
+    def _fill_closed_state_payload(
+        batcher: GrpoWindowBatcher,
+    ) -> FillClosedWindowState | None:
+        """Build the capability-only miner status from one shared snapshot."""
+        fill_state = (
+            getattr(batcher, "fill_state", None)
+            if FILL_CLOSED_ENABLED
+            else None
+        )
+        if fill_state is None:
             return None
+        with fill_state.lock:
+            snapshot = fill_state.snapshot()
+        if batcher.is_sealed():
+            phase = "sealed"
+        elif batcher.collection_closed():
+            phase = "draining"
+        else:
+            phase = "collecting"
+        budgets = snapshot["budgets"]
+        admitted = snapshot["admitted"]
+        return FillClosedWindowState(
+            phase=phase,
+            generation_beacon_chain=getattr(
+                batcher, "window_open_drand_chain", None
+            ),
+            generation_beacon_chain_hash=getattr(
+                batcher, "window_open_drand_chain_hash", None
+            ),
+            generation_beacon_round=getattr(
+                batcher, "window_open_drand_round", None
+            ),
+            precommit_cutoff_ts=(
+                float(batcher.window_opened_wall_ts)
+                + float(batcher.collection_seconds)
+            ),
+            precommit_seconds=float(batcher.collection_seconds),
+            max_window_seconds=FILL_CLOSED_MAX_SECONDS,
+            picks_emitted=snapshot["picks_emitted"],
+            picks_target=snapshot["picks_target"],
+            picks_by_environment=snapshot["picks_by_environment"],
+            admission_budgets=budgets,
+            admitted=admitted,
+            proven=snapshot["proven"],
+            in_flight=snapshot["in_flight"],
+            remaining={
+                environment: max(0, budget - admitted[environment])
+                for environment, budget in budgets.items()
+            },
+        )
 
-    def set_active_batchers(self, batchers: dict[str, GrpoWindowBatcher]) -> None:
-        """Register multi-env batchers and update the legacy scalar accessor.
+    def _active_batcher_values(self) -> tuple[GrpoWindowBatcher, ...]:
+        return tuple(self._active_batchers.values())
 
-        ``batchers`` is {env_name: GrpoWindowBatcher}. An empty dict means
-        no window is active (between READY and the next OPEN).
-        """
-        changed = batchers is not self._active_batchers or set(batchers) != set(self._active_batchers)
-        if changed:
-            transition_ts = time.time()
-            for receipt in self._upload_precommit_receipts.values():
-                if not receipt.consumed and (
+    def _active_batcher_items(self) -> tuple[tuple[str, GrpoWindowBatcher], ...]:
+        return tuple(self._active_batchers.items())
+
+    def _lookup_active_batcher(
+        self,
+        environment: str,
+        window_start: int | None = None,
+    ) -> GrpoWindowBatcher | None:
+        return self._active_batchers.get(environment)
+
+    def _batcher_is_active(self, batcher: GrpoWindowBatcher) -> bool:
+        return batcher in self._active_batcher_values()
+
+    def _batchers_by_environment(self) -> dict[str, GrpoWindowBatcher]:
+        result: dict[str, GrpoWindowBatcher] = {}
+        for batcher in self._active_batcher_values():
+            environment = str(
+                getattr(getattr(batcher, "env", None), "name", "unknown")
+            )
+            result.setdefault(environment, batcher)
+        return result
+
+    def _reset_window_scoped_state(self) -> None:
+        transition_ts = time.time()
+        for receipt in self._upload_precommit_receipts.values():
+            if (
+                not receipt.consumed
+                and (
                     (
                         receipt.body_completed_at_wall is None
                         and (
@@ -1367,23 +1547,68 @@ class ValidatorServer:
                         and receipt.body_completed_at_wall
                         > receipt.expires_at_wall
                     )
-                ):
-                    self._record_no_reveal(receipt)
-                resolver = getattr(
-                    type(receipt.batcher), "resolve_upload_precommit", None
                 )
-                if resolver is not None:
-                    resolver(
-                        receipt.batcher,
-                        receipt.receipt_id,
-                        expired=not receipt.consumed,
-                    )
-            self._upload_precommit_receipts = {}
-            self._upload_precommit_by_signature = {}
-            self._admission_contexts = {}
-            self._per_window_counts = {}
-            self._bad_envelope_counts = {}
-            self._recent_reject_counts = collections.Counter()
+            ):
+                self._record_no_reveal(receipt)
+            resolver = getattr(
+                type(receipt.batcher), "resolve_upload_precommit", None
+            )
+            if resolver is not None:
+                resolver(
+                    receipt.batcher,
+                    receipt.receipt_id,
+                    expired=not receipt.consumed,
+                )
+        self._upload_precommit_receipts = {}
+        self._upload_precommit_by_signature = {}
+        self._admission_contexts = {}
+        self._per_window_counts = {}
+        self._bad_envelope_counts = {}
+        self._recent_reject_counts = collections.Counter()
+        self._state_response_cache = {}
+        self._miner_state_response_cache = None
+
+    def _cached_state_response(
+        self,
+        env: str | None,
+        window_start: int | None = None,
+    ) -> bytes | None:
+        """Cached /state bytes for ``env`` if still valid, else None.
+
+        Called from the ASGI fast path, outside the FastAPI stack — must stay
+        lock-free and never raise: any unusual condition (no window, unknown
+        env, cold cache) returns None and the request falls through to the
+        normal route, which owns error semantics and cache fills.
+        """
+        try:
+            if env is not None:
+                batcher = self._lookup_active_batcher(env, window_start)
+            elif window_start is not None:
+                return None
+            else:
+                batcher = self.active_batcher
+            if batcher is None:
+                return None
+            cache_slot = f"{env or ''}|{window_start if window_start is not None else ''}"
+            cached = self._state_response_cache.get(cache_slot)
+            if cached is None or cached[0] != self._state_cache_key(batcher):
+                return None
+            return cached[1]
+        except Exception:
+            return None
+
+    def set_active_batchers(self, batchers: dict[str, GrpoWindowBatcher]) -> None:
+        """Register multi-env batchers and update the legacy scalar accessor.
+
+        ``batchers`` is {env_name: GrpoWindowBatcher}. An empty dict means
+        no window is active (between READY and the next OPEN).
+        """
+        changed = (
+            batchers is not self._active_batchers
+            or set(batchers) != set(self._active_batchers)
+        )
+        if changed:
+            self._reset_window_scoped_state()
         self._active_batchers = batchers
         # Legacy scalar: first batcher in dict (or None if empty).
         self.active_batcher = next(iter(batchers.values())) if batchers else None
@@ -1392,20 +1617,47 @@ class ValidatorServer:
                 proof_model=getattr(self.active_batcher, "model", None),
             )
 
+
     def set_active_batcher(self, batcher: GrpoWindowBatcher | None) -> None:
         """Legacy single-env shim. Wraps into a dict and delegates."""
         if batcher is None:
             self.set_active_batchers({})
         else:
-            env_name = getattr(getattr(batcher, "env", None), "name", "unknown")
+            raw_env_name = getattr(
+                getattr(batcher, "env", None), "name", None
+            )
+            env_name = (
+                raw_env_name
+                if isinstance(raw_env_name, str) and raw_env_name
+                else ENVIRONMENT_MIX[0][0]
+            )
             self.set_active_batchers({env_name: batcher})
 
-    def _refund_submission_quota(self, hotkey: str) -> None:
-        current_count = self._per_window_counts.get(hotkey, 0)
+    def _window_counter_key(
+        self,
+        hotkey: str,
+        window_start: int | None,
+    ) -> str | tuple[int, str]:
+        keyed = (
+            (int(window_start), hotkey)
+            if window_start is not None
+            else None
+        )
+        if keyed is not None and keyed in self._per_window_counts:
+            return keyed
+        return hotkey
+
+    def _refund_submission_quota(
+        self,
+        hotkey: str,
+        window_start: int | None = None,
+    ) -> None:
+        key = self._window_counter_key(hotkey, window_start)
+        current_count = self._per_window_counts.get(key, 0)
         if current_count <= 1:
-            self._per_window_counts.pop(hotkey, None)
+            self._per_window_counts.pop(key, None)
         else:
-            self._per_window_counts[hotkey] = current_count - 1
+            self._per_window_counts[key] = current_count - 1
 
     @staticmethod
     def _worker_drop_refunds_quota(request: BatchSubmissionRequest) -> bool:
@@ -1415,8 +1667,16 @@ class ValidatorServer:
     @staticmethod
     def _receipt_collection_deadline(receipt: _UploadPrecommitReceipt) -> float:
         return float(receipt.batcher.window_opened_wall_ts) + float(
-            WINDOW_COLLECTION_SECONDS
+            getattr(
+                receipt.batcher,
+                "collection_seconds",
+                WINDOW_COLLECTION_SECONDS,
+            )
         )
+
+    @staticmethod
+    def _receipt_upload_start_deadline(receipt: _UploadPrecommitReceipt) -> float:
+        return ValidatorServer._receipt_collection_deadline(receipt)
 
     def _submission_body_read_deadline(
         self,
@@ -1427,12 +1687,19 @@ class ValidatorServer:
         """Return the protocol wall deadline for an incomplete HTTP body."""
         if path == "/submit/precommit":
             cutoffs = []
-            for batcher in self._active_batchers.values():
+            for batcher in self._active_batcher_values():
                 opened_at = getattr(batcher, "window_opened_wall_ts", None)
                 if opened_at is None or _is_mock_like(opened_at):
                     continue
                 cutoffs.append(
-                    float(opened_at) + float(WINDOW_COLLECTION_SECONDS)
+                    float(opened_at)
+                    + float(
+                        getattr(
+                            batcher,
+                            "collection_seconds",
+                            WINDOW_COLLECTION_SECONDS,
+                        )
+                    )
                 )
             return max(cutoffs) if cutoffs else None
         if path == "/submit":
@@ -1462,7 +1729,11 @@ class ValidatorServer:
         update = self._no_reveal_circuit.record_no_reveal(
             environment=receipt.environment,
             operator=receipt.operator,
-            window=receipt.window_start,
+            window=(
+                receipt.admission_policy_window
+                if receipt.admission_policy_window is not None
+                else receipt.window_start
+            ),
             precommit_signature=receipt.precommit_signature,
             precommit_arrival_ts=receipt.precommit_arrival_ts,
         )
@@ -1485,7 +1756,11 @@ class ValidatorServer:
         update = self._no_reveal_circuit.record_reveal(
             environment=receipt.environment,
             operator=receipt.operator,
-            window=receipt.window_start,
+            window=(
+                receipt.admission_policy_window
+                if receipt.admission_policy_window is not None
+                else receipt.window_start
+            ),
             precommit_signature=receipt.precommit_signature,
             precommit_arrival_ts=receipt.precommit_arrival_ts,
         )
@@ -1546,7 +1821,7 @@ class ValidatorServer:
         if not isinstance(receipt_id, str):
             return True, None
         receipt = self._upload_precommit_receipts.get(receipt_id)
-        if receipt is None or receipt.batcher not in self._active_batchers.values():
+        if receipt is None or not self._batcher_is_active(receipt.batcher):
             return False, "upload_precommit_missing"
         if receipt.terminal:
             return False, "upload_precommit_terminal"
@@ -1604,12 +1879,12 @@ class ValidatorServer:
                         )
                         or (
                             receipt.upload_started_at_wall is None
-                            and self._receipt_collection_deadline(receipt)
+                            and self._receipt_upload_start_deadline(receipt)
                             <= current
                         )
                     )
                 )
-                or receipt.batcher not in self._active_batchers.values()
+                or not self._batcher_is_active(receipt.batcher)
             )
         ]
         for receipt_id in expired:
@@ -1620,7 +1895,7 @@ class ValidatorServer:
                     receipt.body_completed_at_wall is None
                     and (
                         receipt.expires_at_wall < current
-                        or self._receipt_collection_deadline(receipt) <= current
+                        or self._receipt_upload_start_deadline(receipt) <= current
                     )
                 )
                 or (
@@ -1742,6 +2017,12 @@ class ValidatorServer:
         if receipt.consumed:
             return "replay", receipt
         receipt.consumed = True
+        # v6 only. This is the exact point a body is matched to its
+        # precommit -- stamp the receipt onto the request so the arrival
+        # proof path can look up the rate it registered
+        # (``ThroughputAdmissionQueue.rate_of``). ``request`` is the same
+        # object batcher.py later stores on ``PendingSubmission.request``.
+        request._precommit_receipt_id = receipt_id
         revealed = getattr(
             type(receipt.batcher), "mark_upload_precommit_revealed", None
         )
@@ -1826,7 +2107,44 @@ class ValidatorServer:
         self._archive_queue_snapshot_callback = snapshot_callback
 
     def set_current_checkpoint(self, entry) -> None:
+        candidate_identity = None
+        candidate_is_idempotent = False
+        if entry is not None:
+            from reliquary.shared.checkpoint_identity import (
+                canonical_checkpoint_identity,
+                require_checkpoint_successor,
+            )
+
+            candidate_identity = canonical_checkpoint_identity(
+                getattr(entry, "checkpoint_n", None),
+                getattr(entry, "repo_id", None),
+                getattr(entry, "revision", None),
+                field="advertised checkpoint",
+            )
+            candidate_is_idempotent = require_checkpoint_successor(
+                self._checkpoint_identity_floor,
+                candidate_identity,
+                field="advertised checkpoint",
+            )
+            if candidate_is_idempotent:
+                entry = self._checkpoint_identity_floor_entry
+        if candidate_identity is not None and not candidate_is_idempotent:
+            self._checkpoint_identity_floor = candidate_identity
+            self._checkpoint_identity_floor_entry = entry
         self._current_checkpoint = entry
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     def configure_registration_gate(self) -> None:
         """Arm admission against the service-managed metagraph snapshot."""
@@ -1870,6 +2188,9 @@ class ValidatorServer:
         if resolved_operator:
             identities["operator"] = str(resolved_operator)
         return identities
+
+    def _admission_policy_window(self, window_start: int) -> int:
+        return int(window_start)
 
     def registration_cache_age(self, *, now: float | None = None) -> float | None:
         if self._registration_refreshed_at is None:
@@ -1977,20 +2298,35 @@ class ValidatorServer:
 
     @property
     def submit_queue_depth(self) -> int:
-        return sum(self.submit_queue_depth_by_environment.values())
+        queues = {
+            id(self._submission_queue_for_environment(environment)): (
+                self._submission_queue_for_environment(environment)
+            )
+            for environment in self._reported_environment_names()
+        }
+        return sum(queue.qsize() for queue in queues.values())
+
+    def _reported_environment_names(self) -> tuple[str, ...]:
+        return (
+            tuple(self._active_batchers)
+            if self._active_batchers
+            else tuple(name for name, _target in ENVIRONMENT_MIX)
+        )
 
     @property
     def submit_queue_depth_by_environment(self) -> dict[str, int]:
         return {
-            "openmathinstruct": self._submit_queue.qsize(),
-            "opencodeinstruct": self._code_submit_queue.qsize(),
+            environment: self._submission_queue_for_environment(
+                environment
+            ).qsize()
+            for environment in self._reported_environment_names()
         }
 
     def _submission_queue_for_environment(
         self,
         environment: str,
     ) -> asyncio.Queue:
-        if environment == "opencodeinstruct":
+        if _admission_resource_class(environment) == "sandbox":
             return self._code_submit_queue
         return self._submit_queue
 
@@ -2001,12 +2337,10 @@ class ValidatorServer:
     @property
     def proof_verification_inflight_by_environment(self) -> dict[str, int]:
         return {
-            "openmathinstruct": self._inflight_proofs_by_environment.get(
-                "openmathinstruct", 0
-            ),
-            "opencodeinstruct": self._inflight_proofs_by_environment.get(
-                "opencodeinstruct", 0
-            ),
+            environment: self._inflight_proofs_by_environment.get(
+                environment, 0
+            )
+            for environment in self._reported_environment_names()
         }
 
     def set_late_drop_callback(
@@ -2087,6 +2421,8 @@ class ValidatorServer:
             entry["rewarded"] = rewarded
         if sigma is not None:
             entry["sigma"] = float(sigma)
+        self._verdict_sequence_by_hotkey[hotkey] += 1
+        entry["_sequence"] = self._verdict_sequence_by_hotkey[hotkey]
         self._verdicts[hotkey].append(entry)
 
     def _current_drand_round_best_effort(self) -> int | None:
@@ -2094,8 +2430,7 @@ class ValidatorServer:
         ci = getattr(batcher, "_drand_chain_info", None) if batcher else None
         try:
             if ci is None:
-                from reliquary.infrastructure.drand import get_current_chain
-                ci = get_current_chain()
+                return None
             from reliquary.infrastructure.chain import compute_current_drand_round
             return int(compute_current_drand_round(
                 time.time(), ci["genesis_time"], ci["period"],
@@ -2118,7 +2453,7 @@ class ValidatorServer:
                     }
                 }
 
-        batchers = dict(self._active_batchers)
+        batchers = dict(self._active_batcher_items())
         if not batchers and self.active_batcher is not None:
             env = getattr(self.active_batcher, "env", None)
             env_name = getattr(env, "name", "unknown")
@@ -2370,7 +2705,7 @@ class ValidatorServer:
             }
         window_environments = {
             str(env_name): self._window_environment_health(env_batcher)
-            for env_name, env_batcher in self._active_batchers.items()
+            for env_name, env_batcher in self._active_batcher_items()
         }
         active_window_health = (
             self._window_environment_health(batcher) if batcher else {}
@@ -2385,7 +2720,7 @@ class ValidatorServer:
         )
         logical_group_dedup: dict[str, dict[str, int]] = {}
         grader_failures_by_environment: dict[str, dict[str, int]] = {}
-        for env_name, env_batcher in self._active_batchers.items():
+        for env_name, env_batcher in self._active_batcher_items():
             snapshot_fn = getattr(
                 type(env_batcher), "rejection_telemetry_snapshot", None
             )
@@ -2504,12 +2839,14 @@ class ValidatorServer:
             prompt_mismatch_circuit_breaker=prompt_mismatch_circuit,
             no_reveal_circuit_breaker=no_reveal_circuit,
             submission_upload_grace_seconds=SUBMISSION_UPLOAD_GRACE_SECONDS,
-            batch_size=B_BATCH,
+            batch_size=int(
+                getattr(batcher, "batch_target", B_BATCH)
+            ),
             queue_depth=self.submit_queue_depth,
             queue_depth_by_environment=self.submit_queue_depth_by_environment,
             admission_workers_by_environment={
-                "openmathinstruct": MATH_ADMISSION_WORKERS,
-                "opencodeinstruct": CODE_ADMISSION_WORKERS,
+                environment: self._admission_worker_count(environment)
+                for environment in self._reported_environment_names()
             },
             admission_pool_state_by_environment={
                 env_name: {
@@ -2552,10 +2889,7 @@ class ValidatorServer:
                         env_name in self._admission_process_pools
                     ),
                 }
-                for env_name in (
-                    "openmathinstruct",
-                    "opencodeinstruct",
-                )
+                for env_name in self._reported_environment_names()
             },
             proof_verification_inflight=self._inflight_proofs,
             proof_verification_inflight_by_environment=(
@@ -2970,9 +3304,15 @@ class ValidatorServer:
 
     @staticmethod
     def _admission_worker_count(environment: str) -> int:
-        if environment == "opencodeinstruct":
+        if _admission_resource_class(environment) == "sandbox":
             return CODE_ADMISSION_WORKERS
         return MATH_ADMISSION_WORKERS
+
+    @staticmethod
+    def _admission_wall_seconds(environment: str) -> float:
+        if _admission_resource_class(environment) == "sandbox":
+            return CODE_ADMISSION_WALL_SECONDS
+        return MATH_ADMISSION_WALL_SECONDS
 
     def _new_admission_pool(
         self,
@@ -2981,7 +3321,7 @@ class ValidatorServer:
         batcher: GrpoWindowBatcher | None = None,
     ) -> ProcessPoolExecutor:
         if batcher is None:
-            batcher = self._active_batchers.get(environment)
+            batcher = self._lookup_active_batcher(environment)
         tokenizer = getattr(batcher, "tokenizer", None)
         backend = getattr(tokenizer, "backend_tokenizer", None)
         serializer = getattr(backend, "to_str", None)
@@ -2994,13 +3334,18 @@ class ValidatorServer:
             tokenizer_json.encode("utf-8")
         ).hexdigest()
         worker_count = self._admission_worker_count(environment)
-        pool = ProcessPoolExecutor(
+        pool_kwargs: dict[str, Any] = dict(
             max_workers=worker_count,
             mp_context=multiprocessing.get_context("spawn"),
             initializer=initialize_admission_worker,
             initargs=(tokenizer_json,),
-            max_tasks_per_child=ADMISSION_PROCESS_MAX_TASKS,
         )
+        # Python 3.11+ supports bounded child recycling directly. Keep the
+        # qualification/control plane importable on 3.10 hosts even though the
+        # production package itself requires Python >=3.11.
+        if tuple(sys.version_info[:2]) >= (3, 11):
+            pool_kwargs["max_tasks_per_child"] = ADMISSION_PROCESS_MAX_TASKS
+        pool = ProcessPoolExecutor(**pool_kwargs)
         # ProcessPoolExecutor is lazy. Fully start it at the quiescent boundary
         # so the first reveal cannot spend its candidate wall budget waiting
         # for child imports. Short held probes let every child claim work; the
@@ -3158,7 +3503,7 @@ class ValidatorServer:
         if receipt is None:
             self._prune_upload_precommits(now=body_completed_at)
             return "invalid", None
-        if receipt.batcher not in self._active_batchers.values():
+        if not self._batcher_is_active(receipt.batcher):
             return "invalid", None
         if receipt.consumed:
             return "replay", receipt
@@ -3275,7 +3620,7 @@ class ValidatorServer:
             return None
         if not any(
             bool(getattr(batcher, "difficulty_auction_enabled", False))
-            for batcher in self._active_batchers.values()
+            for batcher in self._active_batcher_values()
         ):
             return None
 
@@ -3289,7 +3634,7 @@ class ValidatorServer:
         receipt = self._upload_precommit_receipts.get(receipt_id)
         if (
             receipt is None
-            or receipt.batcher not in self._active_batchers.values()
+            or not self._batcher_is_active(receipt.batcher)
             or not bool(
                 getattr(receipt.batcher, "difficulty_auction_enabled", False)
             )
@@ -3310,7 +3655,7 @@ class ValidatorServer:
         eligibility_at = (
             float(wire_started_at) if wire_started_at is not None else task_arrival
         )
-        if eligibility_at > self._receipt_collection_deadline(receipt):
+        if eligibility_at > self._receipt_upload_start_deadline(receipt):
             self._fail_upload_receipt(
                 receipt,
                 reason=RejectReason.PRECOMMIT_EXPIRED,
@@ -3628,9 +3973,17 @@ class ValidatorServer:
                 )
             )
             request_started = time.perf_counter()
+            is_precommit = request.url.path == "/submit/precommit"
+            if is_precommit:
+                self._precommit_http_inflight += 1
             try:
                 return await call_next(request)
             finally:
+                if is_precommit:
+                    self._precommit_http_inflight = max(
+                        0,
+                        self._precommit_http_inflight - 1,
+                    )
                 path = request.url.path
                 if path in {
                     "/health",
@@ -3650,9 +4003,45 @@ class ValidatorServer:
                 if callable(release):
                     release()
 
+        @app.get("/livez")
+        async def livez() -> Response:
+            return JSONResponse({"status": "ok"}, headers={"Cache-Control": "no-store"})
+
+        @app.get("/readyz")
+        async def readyz() -> Response:
+            # Local readiness only: no HF, R2, drand or diagnostic health build.
+            reasons = []
+            age = self.registration_cache_age()
+            if self._registration_gate_enforced and (
+                self._registered_hotkeys is None or age is None
+                or age > REGISTERED_HOTKEY_STALE_GRACE_SECONDS
+            ):
+                reasons.append("registration_cache_unavailable")
+            if self._process_health_snapshot.get("status") in {"critical", "error", "pending"}:
+                reasons.append("process_health_unavailable")
+            try:
+                if any(source.get("status") == "degraded" for source in self._prompt_source_health().values()):
+                    reasons.append("prompt_source_degraded")
+                if self._content_cooldown_health_callback is not None:
+                    cooldown = self._content_cooldown_health_callback()
+                    if cooldown.get("complete") is False:
+                        reasons.append("content_cooldown_incomplete")
+                if self._proof_scheduler_health_callback is not None:
+                    scheduler = self._proof_scheduler_health_callback()
+                    if scheduler.get("required") and scheduler.get("state") != "running":
+                        reasons.append("proof_scheduler_unavailable")
+            except Exception:
+                reasons.append("local_health_unavailable")
+            return JSONResponse(
+                {"ready": not reasons, "reasons": reasons},
+                status_code=503 if reasons else 200,
+                headers={"Cache-Control": "no-store"},
+            )
+
         @app.get("/health", response_model=_Health)
         async def health() -> _Health:
             return self._health_payload()
+
 
         @app.post(
             "/submit/precommit",
@@ -3687,7 +4076,10 @@ class ValidatorServer:
 
             if self._current_state != WindowState.OPEN:
                 return reject(RejectReason.WINDOW_NOT_ACTIVE)
-            batcher = self._active_batchers.get(request.environment)
+            batcher = self._lookup_active_batcher(
+                request.environment,
+                request.window_start,
+            )
             if batcher is None:
                 return reject(RejectReason.BAD_SCHEMA)
             if request.window_start != batcher.window_start:
@@ -3701,6 +4093,15 @@ class ValidatorServer:
             )
             if headers_completed_at < float(batcher.window_opened_wall_ts):
                 return reject(RejectReason.WINDOW_NOT_ACTIVE)
+            collection_close = float(batcher.window_opened_wall_ts) + float(
+                getattr(
+                    batcher,
+                    "collection_seconds",
+                    WINDOW_COLLECTION_SECONDS,
+                )
+            )
+            if commit_received_at > collection_close:
+                return reject(RejectReason.PRECOMMIT_EXPIRED)
             if request.payload_bytes > MAX_SUBMISSION_PAYLOAD_BYTES:
                 return reject(RejectReason.BAD_SCHEMA)
             if (
@@ -3776,11 +4177,6 @@ class ValidatorServer:
                 )
             if commit_received_at < float(batcher.window_opened_wall_ts):
                 return reject(RejectReason.WINDOW_NOT_ACTIVE)
-            if commit_received_at > (
-                float(batcher.window_opened_wall_ts)
-                + float(WINDOW_COLLECTION_SECONDS)
-            ):
-                return reject(RejectReason.PRECOMMIT_EXPIRED)
             if batcher.drand_round_check_enabled:
                 if hasattr(type(batcher), "observe_drand_round"):
                     drand_observation = batcher.observe_drand_round(
@@ -3806,7 +4202,7 @@ class ValidatorServer:
                 lo, hi = prompt_range
                 if not (lo <= request.prompt_idx < hi):
                     return reject(RejectReason.PROMPT_OUT_OF_RANGE)
-            if request.prompt_idx in batcher.cooldown_prompts_snapshot:
+            if request.prompt_idx in getattr(batcher, "cooldown_prompts_membership", batcher.cooldown_prompts_snapshot):
                 return reject(RejectReason.PROMPT_IN_COOLDOWN)
             try:
                 environment_size = await asyncio.to_thread(len, batcher.env)
@@ -3833,7 +4229,10 @@ class ValidatorServer:
             # reservations or publish a receipt into a replaced batcher.
             if self._current_state != WindowState.OPEN:
                 return reject(RejectReason.WINDOW_NOT_ACTIVE)
-            if self._active_batchers.get(request.environment) is not batcher:
+            if self._lookup_active_batcher(
+                request.environment,
+                request.window_start,
+            ) is not batcher:
                 return reject(RejectReason.WINDOW_MISMATCH)
             self._prune_upload_precommits()
             existing_id = self._upload_precommit_by_signature.get(
@@ -3852,11 +4251,19 @@ class ValidatorServer:
                     upload_deadline_ts=existing.expires_at_wall,
                 )
 
-            count = self._per_window_counts.get(request.miner_hotkey, 0)
+            quota_key = self._window_counter_key(
+                request.miner_hotkey,
+                request.window_start,
+            )
+            count = self._per_window_counts.get(quota_key, 0)
             if count >= MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW:
                 return reject(RejectReason.RATE_LIMITED)
 
             operator = self._operator_by_hotkey.get(request.miner_hotkey)
+            admission_policy_window = self._admission_policy_window(
+                request.window_start
+            )
+
             circuit_identities = self._prompt_mismatch_identities(
                 request.miner_hotkey,
                 operator=operator,
@@ -3864,7 +4271,7 @@ class ValidatorServer:
             circuit_decision = self._prompt_mismatch_circuit.admit_precommit(
                 environment=request.environment,
                 identities=circuit_identities,
-                window=request.window_start,
+                window=admission_policy_window,
                 precommit_signature=request.precommit_signature,
             )
             if not circuit_decision.allowed:
@@ -3883,7 +4290,7 @@ class ValidatorServer:
             no_reveal_decision = self._no_reveal_circuit.admit_precommit(
                 environment=request.environment,
                 operator=operator,
-                window=request.window_start,
+                window=admission_policy_window,
                 precommit_signature=request.precommit_signature,
             )
             if not no_reveal_decision.allowed:
@@ -3901,7 +4308,7 @@ class ValidatorServer:
                     self._prompt_mismatch_circuit.cancel_canary(
                         environment=request.environment,
                         identities=circuit_identities,
-                        window=request.window_start,
+                        window=admission_policy_window,
                         precommit_signature=request.precommit_signature,
                     )
                 return reject(RejectReason.RATE_LIMITED)
@@ -3911,14 +4318,14 @@ class ValidatorServer:
                     self._prompt_mismatch_circuit.cancel_canary(
                         environment=request.environment,
                         identities=circuit_identities,
-                        window=request.window_start,
+                        window=admission_policy_window,
                         precommit_signature=request.precommit_signature,
                     )
                 if no_reveal_decision.canary:
                     self._no_reveal_circuit.cancel_canary(
                         environment=request.environment,
                         operator=operator,
-                        window=request.window_start,
+                        window=admission_policy_window,
                         precommit_signature=request.precommit_signature,
                     )
 
@@ -3936,6 +4343,10 @@ class ValidatorServer:
                     request.miner_hotkey,
                     t_arrival_wall=commit_received_at,
                     payload_bytes=request.payload_bytes,
+                    # v6 content dedup: the precommit commits to the exact
+                    # serialized reveal, so a duplicate is refused here
+                    # rather than after the body has been uploaded.
+                    payload_sha256=request.payload_sha256,
                 )
             except Exception:
                 cancel_circuit_canaries()
@@ -3958,6 +4369,10 @@ class ValidatorServer:
                     "collection_sealed",
                 }:
                     reason = RejectReason.PRECOMMIT_EXPIRED
+                elif register_reason == "precommit_duplicate_payload":
+                    # Terminal and self-describing on the wire: this exact
+                    # payload was already precommitted this window.
+                    reason = RejectReason.HASH_DUPLICATE
                 else:
                     reason = RejectReason.BATCH_FILLED
                 return reject(reason)
@@ -3987,12 +4402,13 @@ class ValidatorServer:
                 drand_observation=drand_observation,
                 batcher=batcher,
                 operator=operator,
+                admission_policy_window=admission_policy_window,
             )
             self._upload_precommit_receipts[receipt_id] = receipt
             self._upload_precommit_by_signature[
                 request.precommit_signature
             ] = receipt_id
-            self._per_window_counts[request.miner_hotkey] = count + 1
+            self._per_window_counts[quota_key] = count + 1
             logger.info(
                 "upload_precommit_accepted window=%d env=%s prompt=%d "
                 "hotkey=%s payload_bytes=%d grace_s=%.3f",
@@ -4180,9 +4596,10 @@ class ValidatorServer:
                 # pre-OPEN miner would have signed against, since /state
                 # exposes the empty string in that case). That's
                 # consistent with the schema's default.
+                signature_batcher = self.active_batcher
                 _randomness_for_sig = (
-                    self.active_batcher.randomness
-                    if self.active_batcher is not None
+                    signature_batcher.randomness
+                    if signature_batcher is not None
                     else ""
                 )
                 envelope_signature_valid = await asyncio.to_thread(
@@ -4236,9 +4653,13 @@ class ValidatorServer:
                     # /verdicts so a legitimate miner being spoofed
                     # learns about it.
                     telemetry.mark_decision()
-                    bn = self._bad_envelope_counts.get(hk, 0)
+                    bad_envelope_key = self._window_counter_key(
+                        hk,
+                        request.window_start,
+                    )
+                    bn = self._bad_envelope_counts.get(bad_envelope_key, 0)
                     if bn < MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW:
-                        self._bad_envelope_counts[hk] = bn + 1
+                        self._bad_envelope_counts[bad_envelope_key] = bn + 1
                         # NB: we still record the verdict against the
                         # CLAIMED hotkey — that's what the rejected packet
                         # carried — but we do NOT increment its rate-limit
@@ -4308,7 +4729,7 @@ class ValidatorServer:
                     submitted_environment_count=len(submission_env_names),
                 )
             submission_env_name = next(iter(submission_env_names))
-            if not self._active_batchers and self.active_batcher is None:
+            if not self._active_batcher_values():
                 telemetry.mark_decision()
                 log_submission_stage(
                     logger,
@@ -4320,7 +4741,10 @@ class ValidatorServer:
                     accepted_into_pool=False,
                 )
                 raise HTTPException(status_code=503, detail="no_active_window")
-            batcher = self._active_batchers.get(submission_env_name)
+            batcher = self._lookup_active_batcher(
+                submission_env_name,
+                request.window_start,
+            )
             if batcher is None:
                 # Loose MagicMock fixtures and legacy single-batcher embedding
                 # do not always expose a stable env.name. Production batchers
@@ -4330,7 +4754,7 @@ class ValidatorServer:
                     getattr(self.active_batcher, "env", None), "name", None
                 )
                 if (
-                    not self._active_batchers
+                    not self._active_batcher_values()
                     or active_env_name is None
                     or _is_mock_like(active_env_name)
                 ):
@@ -4524,7 +4948,8 @@ class ValidatorServer:
             # up after restart must not burn the hotkey's quota for the new
             # window. Once the request is known to target this live window,
             # count it before cheap rejects/GRAIL so spam still self-throttles.
-            n = self._per_window_counts.get(hk, 0)
+            quota_key = self._window_counter_key(hk, request.window_start)
+            n = self._per_window_counts.get(quota_key, 0)
             if (
                 not precommit_reserved
                 and n >= MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW
@@ -4554,10 +4979,10 @@ class ValidatorServer:
                     )
                 )
             if not precommit_reserved:
-                self._per_window_counts[hk] = n + 1
+                self._per_window_counts[quota_key] = n + 1
 
             def _refund_current_quota() -> None:
-                self._refund_submission_quota(hk)
+                self._refund_submission_quota(hk, request.window_start)
 
             def _prompt_source_unavailable(
                 exc: PromptSourceUnavailable,
@@ -4768,7 +5193,7 @@ class ValidatorServer:
                         RejectReason.PROMPT_OUT_OF_RANGE,
                         reject_stage="prompt_range",
                     )
-            if request.prompt_idx in batcher.cooldown_prompts_snapshot:
+            if request.prompt_idx in getattr(batcher, "cooldown_prompts_membership", batcher.cooldown_prompts_snapshot):
                 return _cheap_reject(
                     RejectReason.PROMPT_IN_COOLDOWN,
                     reject_stage="cooldown",
@@ -4920,7 +5345,7 @@ class ValidatorServer:
                     and resp.reason is RejectReason.WORKER_DROPPED
                     and self._worker_drop_refunds_quota(request)
                 ):
-                    self._refund_submission_quota(hk)
+                    self._refund_submission_quota(hk, request.window_start)
                 log_submission_stage(
                     logger,
                     logging.INFO,
@@ -4996,13 +5421,16 @@ class ValidatorServer:
                 else None
             ),
         )
-        async def state(env: str | None = None) -> GrpoBatchState:
-            """Current window + checkpoint state. Lock-free: reads only the
-            batcher's snapshot fields (set at construction) and the atomic
-            ``valid_count`` counter. The submit worker holds ``batcher._lock``
-            for up to ~25s per GRAIL verify, so this handler MUST NOT touch
-            it — otherwise miners polling /state starve the event loop and
-            timeout cascades hit every endpoint (see 2026-05-12 outage).
+        async def state(
+            env: str | None = None,
+            window: int | None = None,
+        ) -> GrpoBatchState:
+            """Current window + checkpoint state. This never touches
+            ``batcher._lock``, which the submit worker can hold for ~25s per
+            GRAIL verify. Fill mode copies its small counter map under the
+            dedicated ``FillState.lock``; all other values are snapshots or
+            atomic counters. Polling /state therefore cannot join the grading
+            lock convoy that caused the 2026-05-12 timeout cascade.
 
             ``cooldown_prompts`` is PER-ENV (``prompt_idx`` indexes one env's
             problem set), so a multi-env window has a distinct cooldown set
@@ -5010,19 +5438,23 @@ class ValidatorServer:
             batcher to report; without it we report the first active batcher
             (legacy single-env behavior). Miners must poll once per env to
             learn each env's real cooldown — the flat field can only carry
-            one. window_n/randomness/checkpoint are identical across envs.
+            one.
             """
             if env is not None:
-                batcher = self._active_batchers.get(env)
+                batcher = self._lookup_active_batcher(env, window)
                 if batcher is None:
-                    if not self._active_batchers:
+                    if not self._active_batcher_values():
                         raise HTTPException(status_code=503, detail="no_active_window")
-                    raise HTTPException(status_code=404, detail="unknown_env")
+                    detail = "unknown_window" if window is not None else "unknown_env"
+                    raise HTTPException(status_code=404, detail=detail)
+            elif window is not None:
+                raise HTTPException(status_code=400, detail="window_requires_env")
             else:
                 batcher = self.active_batcher
                 if batcher is None:
                     raise HTTPException(status_code=503, detail="no_active_window")
             cp = self._current_checkpoint
+            fill_closed = self._fill_closed_state_payload(batcher)
             submission_count = (
                 getattr(batcher, "pending_count", batcher.valid_count)
                 if getattr(batcher, "difficulty_auction_enabled", False)
@@ -5034,7 +5466,7 @@ class ValidatorServer:
             # Hits are normally answered by ``_StateFastPathMiddleware`` before
             # the FastAPI stack; this in-handler check only serves requests
             # that raced a cache fill.
-            cache_slot = env or ""
+            cache_slot = f"{env or ''}|{window if window is not None else ''}"
             cache_key = self._state_cache_key(batcher)
             cached = self._state_response_cache.get(cache_slot)
             if cached is not None and cached[0] == cache_key:
@@ -5051,6 +5483,165 @@ class ValidatorServer:
                 checkpoint_repo_id=cp.repo_id if cp else None,
                 checkpoint_revision=cp.revision if cp else None,
                 protocol_version=(
+                    PROTOCOL_VERSION
+                    if PROTOCOL_VERSION >= 3
+                    else None
+                ),
+                generation_profile_id=(
+                    PROTOCOL_PROFILE_ID
+                    if PROTOCOL_VERSION >= 3
+                    else None
+                ),
+                generation_contract=(
+                    dict(PROTOCOL_GENERATION_CONTRACT)
+                    if PROTOCOL_VERSION >= 3
+                    else None
+                ),
+                fill_closed=fill_closed,
+                randomness=batcher.randomness,
+            )
+            excluded_fields: set[str] = set()
+            if PROTOCOL_VERSION < 3:
+                excluded_fields.update(
+                    {
+                        "protocol_version",
+                        "generation_profile_id",
+                        "generation_contract",
+                    }
+                )
+            if fill_closed is None:
+                excluded_fields.add("fill_closed")
+            body = payload.model_dump_json(
+                exclude=excluded_fields or None,
+            ).encode("utf-8")
+            self._state_response_cache[cache_slot] = (cache_key, body)
+            return Response(content=body, media_type="application/json")
+
+        @app.get("/miner-state", response_model=MinerState)
+        async def miner_state(request: Request) -> Response:
+            """Bounded all-environment state without changing legacy bytes.
+
+            ``/state`` remains the compatibility contract. This additive
+            endpoint carries only cooldown membership inside each deterministic
+            active prompt slice and supports conditional polling with an ETag.
+            """
+            if not self._active_batchers:
+                raise HTTPException(
+                    status_code=503,
+                    detail="no_active_window",
+                    headers={"Retry-After": "1"},
+                )
+
+            cache_key = self._miner_state_cache_key()
+            cached = self._miner_state_response_cache
+            if cached is not None and cached[0] == cache_key:
+                if request.headers.get("if-none-match") == cached[2]:
+                    return Response(
+                        status_code=304,
+                        headers={
+                            "Cache-Control": "private, no-cache",
+                            "ETag": cached[2],
+                        },
+                    )
+                return Response(
+                    content=cached[1],
+                    media_type="application/json",
+                    headers={
+                        "Cache-Control": "private, no-cache",
+                        "ETag": cached[2],
+                    },
+                )
+
+            first_batcher = next(iter(self._active_batchers.values()))
+            environments: dict[str, MinerEnvironmentState] = {}
+            for environment, batcher in sorted(self._active_batchers.items()):
+                if (
+                    batcher.window_start != first_batcher.window_start
+                    or batcher.randomness != first_batcher.randomness
+                ):
+                    raise HTTPException(
+                        status_code=503,
+                        detail="inconsistent_active_window",
+                        headers={"Retry-After": "1"},
+                    )
+                prompt_range = getattr(batcher, "prompt_range", None)
+                if prompt_range is None and batcher.randomness:
+                    prompt_range = window_prompt_range(
+                        batcher.randomness,
+                        getattr(batcher.env, "name", environment),
+                        len(batcher.env),
+                        PROMPT_RANGE_SIZE,
+                    )
+                if prompt_range is None:
+                    prompt_range = (0, 0)
+                membership = getattr(batcher, "cooldown_prompts_membership", None)
+                if membership is None:
+                    membership = set(batcher.cooldown_prompts_snapshot)
+                bitmap, cooldown_count = encode_cooldown_bitmap(membership, prompt_range)
+                productive_remaining = max(
+                    0,
+                    int(batcher.max_productive_candidates)
+                    - int(batcher.candidate_capacity_used),
+                )
+                grading_remaining = max(
+                    0,
+                    int(batcher.max_grading_starts)
+                    - int(batcher.proof_grading_attempts),
+                )
+                fill_state = getattr(batcher, "fill_state", None)
+                if fill_state is not None:
+                    with fill_state.lock:
+                        fill_snapshot = fill_state.snapshot()
+                    fill_remaining = max(
+                        0,
+                        int(fill_snapshot["budgets"][environment])
+                        - int(fill_snapshot["admitted"][environment]),
+                    )
+                    admission_remaining = min(
+                        productive_remaining,
+                        grading_remaining,
+                        fill_remaining,
+                    )
+                else:
+                    admission_remaining = min(
+                        productive_remaining,
+                        grading_remaining,
+                    )
+                accepting_submissions = (
+                    self._current_state is WindowState.OPEN
+                    and not batcher.is_sealed()
+                    and not batcher.collection_closed()
+                    and admission_remaining > 0
+                )
+                environments[environment] = MinerEnvironmentState(
+                    prompt_range=prompt_range,
+                    cooldown_bitmap=bitmap,
+                    cooldown_count=cooldown_count,
+                    accepting_submissions=accepting_submissions,
+                    admission_remaining=admission_remaining,
+                )
+
+            checkpoint = self._current_checkpoint
+            payload = MinerState(
+                state=self._current_state,
+                window_n=first_batcher.window_start,
+                anchor_block=first_batcher.window_start,
+                window_opened_at=first_batcher.window_opened_wall_ts,
+                submission_deadline_at=(
+                    float(first_batcher.window_opened_wall_ts)
+                    + float(
+                        getattr(
+                            first_batcher,
+                            "collection_seconds",
+                            WINDOW_COLLECTION_SECONDS,
+                        )
+                    )
+                ),
+                environments=environments,
+                checkpoint_n=checkpoint.checkpoint_n if checkpoint else 0,
+                checkpoint_repo_id=checkpoint.repo_id if checkpoint else None,
+                checkpoint_revision=checkpoint.revision if checkpoint else None,
+                protocol_version=(
                     PROTOCOL_VERSION if PROTOCOL_VERSION >= 3 else None
                 ),
                 generation_profile_id=(
@@ -5061,21 +5652,25 @@ class ValidatorServer:
                     if PROTOCOL_VERSION >= 3
                     else None
                 ),
-                randomness=batcher.randomness,
+                randomness=first_batcher.randomness,
             )
-            body = payload.model_dump_json(
-                exclude=(
-                    {
-                        "protocol_version",
-                        "generation_profile_id",
-                        "generation_contract",
-                    }
-                    if PROTOCOL_VERSION < 3
-                    else None
-                ),
-            ).encode("utf-8")
-            self._state_response_cache[cache_slot] = (cache_key, body)
-            return Response(content=body, media_type="application/json")
+            body = payload.model_dump_json().encode("utf-8")
+            if self._miner_state_cache_key() != cache_key:
+                raise HTTPException(
+                    status_code=503,
+                    detail="window_changed_during_state_build",
+                    headers={"Retry-After": "1"},
+                )
+            etag = f'"{hashlib.sha256(body).hexdigest()}"'
+            self._miner_state_response_cache = (cache_key, body, etag)
+            return Response(
+                content=body,
+                media_type="application/json",
+                headers={
+                    "Cache-Control": "private, no-cache",
+                    "ETag": etag,
+                },
+            )
 
         @app.get("/runtime-contract", response_model=RuntimeContract)
         async def runtime_contract() -> RuntimeContract:
@@ -5101,6 +5696,12 @@ class ValidatorServer:
                 "revision": cp.revision,
                 "signature": cp.signature,
             }
+
+
+
+
+
+
 
         @app.get(
             "/verdicts/{hotkey}",
@@ -5136,10 +5737,61 @@ class ValidatorServer:
             if not ring:
                 return VerdictsResponse(verdicts=[])
             out = [
-                Verdict(**entry) for entry in ring
+                Verdict(**{key: value for key, value in entry.items() if key != "_sequence"}) for entry in list(ring)
                 if entry["ts"] > since
             ]
             return VerdictsResponse(verdicts=out)
+
+        @app.get("/miner-verdicts/{hotkey}", response_model=VerdictsPage, response_model_exclude_none=True)
+        async def miner_verdicts(
+            hotkey: str,
+            after: int = 0,
+            stream_id: str | None = None,
+            limit: int = VERDICT_CAP_PER_HOTKEY,
+        ) -> VerdictsPage:
+            """Cursor-based verdict feed with explicit ring-gap detection."""
+            after = max(0, int(after))
+            limit = max(1, min(int(limit), VERDICT_CAP_PER_HOTKEY))
+            reset = stream_id is not None and stream_id != self._verdict_stream_id
+            ring = list(self._verdicts.get(hotkey, ()))
+            if not ring:
+                latest = int(self._verdict_sequence_by_hotkey.get(hotkey, 0))
+                cursor_ahead = reset or after > latest
+                return VerdictsPage(
+                    stream_id=self._verdict_stream_id,
+                    verdicts=[],
+                    next_cursor=latest if cursor_ahead else max(after, latest),
+                    oldest_available_cursor=latest,
+                    truncated=cursor_ahead,
+                )
+            oldest = int(ring[0]["_sequence"])
+            latest = int(ring[-1]["_sequence"])
+            cursor_ahead = reset or after > latest
+            effective_after = oldest - 1 if cursor_ahead else after
+            truncated = after < oldest - 1 or cursor_ahead
+            entries = [
+                {
+                    **{
+                        key: value for key, value in entry.items()
+                        if key != "_sequence"
+                    },
+                    "sequence": int(entry["_sequence"]),
+                }
+                for entry in ring
+                if int(entry["_sequence"]) > effective_after
+            ][:limit]
+            next_cursor = (
+                int(entries[-1]["sequence"])
+                if entries
+                else max(effective_after, oldest - 1)
+            )
+            return VerdictsPage(
+                stream_id=self._verdict_stream_id,
+                verdicts=entries,
+                next_cursor=next_cursor,
+                oldest_available_cursor=oldest,
+                truncated=truncated,
+            )
 
         # Add this last so Starlette places it outermost, ahead of the
         # BaseHTTPMiddleware used by ``stamp_arrival``. Otherwise FastAPI may
@@ -5183,11 +5835,7 @@ class ValidatorServer:
         admission_started = False
         identity_reserved = False
         cancel_identity_on_exit = False
-        wall_seconds = (
-            CODE_ADMISSION_WALL_SECONDS
-            if environment == "opencodeinstruct"
-            else MATH_ADMISSION_WALL_SECONDS
-        )
+        wall_seconds = self._admission_wall_seconds(environment)
         deadline = time.monotonic() + wall_seconds
 
         def reject_without_request(
@@ -5207,7 +5855,7 @@ class ValidatorServer:
             return BatchSubmissionResponse(accepted=False, reason=reason)
 
         try:
-            if batcher not in self._active_batchers.values():
+            if not self._batcher_is_active(batcher):
                 response = reject_without_request(
                     RejectReason.WORKER_DROPPED, "worker"
                 )
@@ -5268,12 +5916,17 @@ class ValidatorServer:
                 receipt.miner_hotkey,
                 operator=receipt.operator,
             )
+            admission_policy_window = (
+                receipt.admission_policy_window
+                if receipt.admission_policy_window is not None
+                else receipt.window_start
+            )
             if prepared.prompt_binding_verified:
                 circuit_update = (
                     self._prompt_mismatch_circuit.record_binding_success(
                         environment=receipt.environment,
                         identities=circuit_identities,
-                        window=receipt.window_start,
+                        window=admission_policy_window,
                         precommit_signature=receipt.precommit_signature,
                         precommit_arrival_ts=receipt.precommit_arrival_ts,
                     )
@@ -5291,7 +5944,7 @@ class ValidatorServer:
                 circuit_update = self._prompt_mismatch_circuit.record_mismatch(
                     environment=receipt.environment,
                     identities=circuit_identities,
-                    window=receipt.window_start,
+                    window=admission_policy_window,
                     precommit_signature=receipt.precommit_signature,
                     precommit_arrival_ts=receipt.precommit_arrival_ts,
                 )
@@ -5459,7 +6112,10 @@ class ValidatorServer:
                     or self._worker_drop_refunds_quota(request)
                 )
             ):
-                self._refund_submission_quota(receipt.miner_hotkey)
+                self._refund_submission_quota(
+                    receipt.miner_hotkey,
+                    receipt.window_start,
+                )
             self._record_raw_terminal(
                 receipt,
                 telemetry,
@@ -5516,7 +6172,7 @@ class ValidatorServer:
             # miner has already received a provisional ``SUBMITTED`` from
             # the /submit response and learns the real outcome (or its
             # absence) from the R2 archive.
-            if batcher not in self._active_batchers.values():
+            if not self._batcher_is_active(batcher):
                 self._cancel_proof_admission(batcher, request)
                 self._cancel_logical_group_reservation(batcher, request)
                 telemetry.refresh_from_batcher(batcher, at_decision=True)
@@ -5710,7 +6366,10 @@ class ValidatorServer:
                     and response.reason is RejectReason.WORKER_DROPPED
                     and self._worker_drop_refunds_quota(request)
                 ):
-                    self._refund_submission_quota(request.miner_hotkey)
+                    self._refund_submission_quota(
+                        request.miner_hotkey,
+                        request.window_start,
+                    )
                     quota_refunded = True
                 log_submission_stage(
                     logger,
@@ -5874,7 +6533,7 @@ class ValidatorServer:
             thread_name_prefix="reliquary-precommit-signature",
         )
         self._auction_admission_enabled = True
-        await self.prepare_admission_pools(self._active_batchers)
+        await self.prepare_admission_pools(self._batchers_by_environment())
         protocol_class = type(
             "SubmissionHttpProtocol",
             (_SubmissionHttpProtocol,),

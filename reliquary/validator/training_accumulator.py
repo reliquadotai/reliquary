@@ -32,6 +32,14 @@ class BalancedTrainingAccumulator:
             for name, target in self.targets.items()
         )
 
+    @property
+    def has_groups_for_all_targets(self) -> bool:
+        """Whether every configured environment can contribute to a step."""
+        return all(
+            target == 0 or bool(self._groups[name])
+            for name, target in self.targets.items()
+        )
+
     def snapshot(self) -> dict[str, Any]:
         return {
             "checkpoint_revision": self.checkpoint_revision,
@@ -100,8 +108,15 @@ class BalancedTrainingAccumulator:
             "snapshot": self.snapshot(),
         }
 
-    def training_batches(self, env_order: Sequence[str]) -> list[list[Any]]:
-        if not self.ready:
+    def training_batches(
+        self,
+        env_order: Sequence[str],
+        *,
+        allow_partial: bool = False,
+    ) -> list[list[Any]]:
+        if not self.ready and not (
+            allow_partial and self.has_groups_for_all_targets
+        ):
             raise RuntimeError("balanced training accumulator is not ready")
         if set(env_order) != set(self.targets) or len(env_order) != len(self.targets):
             raise ValueError("training environment order does not match accumulator")

@@ -27,5 +27,4 @@ jobs:
         run: |
           pytest -q \
             --ignore=tests/gpu \
-            --ignore=tests/integration/test_grader_e2e.py \
-            --disable-warnings
+            --ignore=tests/integration/test_grader_e2e.py

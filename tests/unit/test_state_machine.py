@@ -51,6 +51,23 @@ def _make_service():
     return svc
 
 
+def _enable_empty_training_fixture(monkeypatch) -> None:
+    """Keep the historical empty-window fixture without a zero-size batcher."""
+    import reliquary.validator.service as svc_mod
+
+    original_open = svc_mod.open_grpo_window
+
+    def _open_with_positive_target(*args, batch_target=B_BATCH, **kwargs):
+        return original_open(
+            *args,
+            batch_target=max(1, int(batch_target)),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(svc_mod, "B_BATCH", 0)
+    monkeypatch.setattr(svc_mod, "open_grpo_window", _open_with_positive_target)
+
+
 def test_service_initial_state_is_ready():
     svc = _make_service()
     assert svc._current_window_state == WindowState.READY
@@ -498,7 +515,7 @@ async def test_train_and_publish_bumps_checkpoint_n(monkeypatch):
     # Patch B_BATCH to 0 so an empty sealed batch counts as "full" and the
     # train+publish path runs. Real behaviour with non-zero B_BATCH is
     # covered by the integration tests that exercise actual submissions.
-    monkeypatch.setattr("reliquary.validator.service.B_BATCH", 0)
+    _enable_empty_training_fixture(monkeypatch)
 
     svc = _make_service()
     initial_checkpoint = svc._checkpoint_n
@@ -514,7 +531,7 @@ async def test_train_and_publish_bumps_checkpoint_n(monkeypatch):
     fake_entry = ManifestEntry(
         checkpoint_n=initial_checkpoint + 1,
         repo_id="aivolutionedge/reliquary-sn",
-        revision="rev_sha_x",
+        revision="a" * 40,
         signature="ed25519:x",
     )
     svc._checkpoint_store.publish = AsyncMock(return_value=fake_entry)
@@ -586,11 +603,11 @@ def test_open_window_wires_checkpoint_hash_into_batcher():
     svc._checkpoint_store.current_manifest = MagicMock(return_value=ManifestEntry(
         checkpoint_n=5,
         repo_id="aivolutionedge/reliquary-sn",
-        revision="rev_sha_005",
+        revision="5" * 40,
         signature="ed25519:sig",
     ))
     svc._open_window()
-    assert svc._active_batcher.current_checkpoint_hash == "rev_sha_005"
+    assert svc._active_batcher.current_checkpoint_hash == "5" * 40
 
 
 @pytest.mark.asyncio
@@ -948,7 +965,7 @@ async def test_publish_every_n_trained_windows(monkeypatch):
     """
     # Patch B_BATCH so empty batches count as "full" (real-batch behaviour is
     # covered by the integration test that uses real submissions).
-    monkeypatch.setattr("reliquary.validator.service.B_BATCH", 0)
+    _enable_empty_training_fixture(monkeypatch)
 
     import reliquary.validator.service as svc_mod
     from reliquary.validator.checkpoint import ManifestEntry
@@ -966,7 +983,7 @@ async def test_publish_every_n_trained_windows(monkeypatch):
         entry = ManifestEntry(
             checkpoint_n=checkpoint_n,
             repo_id="aivolutionedge/reliquary-sn",
-            revision=f"rev_{checkpoint_n:03d}",
+            revision=f"{checkpoint_n:040x}",
             signature="ed25519:sig",
         )
         published_entries.append(entry)
@@ -998,10 +1015,10 @@ async def test_publish_every_n_trained_windows(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_resume_from_path_installs_manifest():
-    """resume_from="path:/tmp/ckpt_3" loads the directory AND installs a
-    manifest so /state announces checkpoint_n=3 to miners immediately."""
-    import tempfile, os
+async def test_resume_from_path_stays_local_and_unadvertised():
+    """A local test snapshot must not be presented as a public revision."""
+    import os
+    import tempfile
     from unittest.mock import MagicMock
     from reliquary.validator.service import ValidationService
 
@@ -1028,10 +1045,10 @@ async def test_resume_from_path_installs_manifest():
         assert svc.train_model is not None
         assert load_calls == [ckpt_dir]
         mf = svc._checkpoint_store.current_manifest()
-        assert mf is not None
-        assert mf.checkpoint_n == 3
+        assert mf is None
         assert svc._checkpoint_n == 3
-        assert svc._verify_model_checkpoint_revision == ckpt_dir
+        assert svc._verify_model_checkpoint_revision is None
+        assert svc._local_resume_unadvertised is True
 
 
 @pytest.mark.asyncio
@@ -1056,7 +1073,8 @@ async def test_resume_from_load_failure_aborts():
     to the base model (would cause GRAIL mismatch on first submission)."""
     from unittest.mock import MagicMock
     from reliquary.validator.service import ValidationService
-    import os, tempfile
+    import os
+    import tempfile
 
     def failing_load(path):
         raise RuntimeError("corrupt checkpoint")

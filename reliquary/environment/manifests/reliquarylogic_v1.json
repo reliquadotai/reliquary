@@ -1,0 +1,92 @@
+{
+  "schema": "reliquary/generated-environment-manifest/v1",
+  "environment": "reliquarylogic_v1",
+  "environment_contract_id": "reliquary-logic-v1",
+  "task_family": "logic_v1",
+  "generator_version": "logic-v1",
+  "checker_version": "logic-checker-v1",
+  "golden_fixture": "tests/fixtures/reliquarylogic_v1.jsonl",
+  "golden_fixture_sha256": "12abdad7207f6bbbf8e6f01937fa4a8223d15902cb464ffdc67e950ae10da185",
+  "implementation_digest_algorithm": "sha256-path-nul-file-sha256-newline-v1",
+  "implementation_files": [
+    "reliquary/environment/logic_tasks.py",
+    "reliquary/environment/records_tasks.py",
+    "reliquary/environment/reliquarylogic.py",
+    "reliquary/environment/structured_output.py"
+  ],
+  "implementation_sha256": "897d4a894e2b3bf0a48bcb01136633cbdb2ce933eef0bd24940cb57a028e10ff",
+  "virtual_length": 2147483648,
+  "protocol_reward_lattice": [
+    0.0,
+    1.0
+  ],
+  "answer_schema": {
+    "required_keys": [
+      "result"
+    ],
+    "additional_keys": false
+  },
+  "task_families": [
+    "boolean_expressions",
+    "cryptarithm",
+    "dyck_language",
+    "dyck_language_errors",
+    "math_path",
+    "numbrix",
+    "object_properties",
+    "operation",
+    "space_reasoning",
+    "time_sequence",
+    "web_of_lies",
+    "word_sorting_mistake"
+  ],
+  "reward": "deterministic-binary-outcome-v1",
+  "checks": {
+    "boolean_expressions": "equality",
+    "cryptarithm": "constraint-satisfaction (any assignment making the sum hold)",
+    "dyck_language": "equality",
+    "numbrix": "constraint-satisfaction (no unique-solution requirement)",
+    "web_of_lies": "equality",
+    "dyck_language_errors": "equality",
+    "object_properties": "equality",
+    "operation": "equality",
+    "time_sequence": "equality",
+    "math_path": "equality",
+    "space_reasoning": "equality",
+    "word_sorting_mistake": "equality"
+  },
+  "limits": {
+    "completion_bytes": 16384,
+    "container_items": 64,
+    "json_depth": 8,
+    "max_integer_magnitude": 9007199254740991,
+    "max_grid_size": 5
+  },
+  "external_data": false,
+  "network_required": false,
+  "provenance": {
+    "origin": "Reliquary-authored procedural generators; task designs follow the SynLogic families",
+    "external_prompt_sources": [],
+    "upstream_reference": "https://github.com/MiniMax-AI/SynLogic",
+    "spdx_license": "MIT"
+  },
+  "inactive_families": [
+    "cipher"
+  ],
+  "measured_band_qwen3_4b_base": {
+    "web_of_lies": 1.0,
+    "boolean_expressions": 0.984,
+    "operation": 0.984,
+    "space_reasoning": 0.984,
+    "time_sequence": 0.984,
+    "object_properties": 0.969,
+    "word_sorting_mistake": 0.688,
+    "dyck_language": 0.641,
+    "dyck_language_errors": 0.531,
+    "math_path": 0.438,
+    "numbrix": 0.219,
+    "cryptarithm": 0.156,
+    "cipher": 0.0
+  },
+  "measured_band_roster_size": 12
+}

@@ -33,6 +33,30 @@ class BFTProfile:
 
 
 @dataclass(frozen=True, slots=True)
+class EpisodeProfile:
+    schema: str
+    renderer_id: str
+    max_turns: int
+    max_action_tokens: int
+    max_episode_tokens: int
+    max_observation_bytes: int
+
+    def __post_init__(self) -> None:
+        if self.schema != "reliquary/episode/v1":
+            raise ValueError("unsupported episode schema")
+        if not self.renderer_id:
+            raise ValueError("episode renderer id must not be empty")
+        if int(self.max_turns) <= 0:
+            raise ValueError("episode max_turns must be positive")
+        if int(self.max_action_tokens) <= 0:
+            raise ValueError("episode max_action_tokens must be positive")
+        if int(self.max_episode_tokens) <= 0:
+            raise ValueError("episode max_episode_tokens must be positive")
+        if int(self.max_observation_bytes) <= 0:
+            raise ValueError("episode max_observation_bytes must be positive")
+
+
+@dataclass(frozen=True, slots=True)
 class PromptTemplateProfile:
     """Exact prompt text and rendering rule for a protocol environment.
 
@@ -49,11 +73,25 @@ class PromptTemplateProfile:
         parsed = Template(self.template)
         if not self.template_id:
             raise ValueError("prompt template id must not be empty")
-        if not parsed.is_valid():
+        # ``Template.is_valid/get_identifiers`` arrived in Python 3.11. The
+        # project requires 3.11+, but this small fallback keeps lightweight
+        # qualification hosts on 3.10 able to inspect contracts.
+        if hasattr(parsed, "is_valid"):
+            valid = parsed.is_valid()
+            identifiers = set(parsed.get_identifiers())
+        else:  # pragma: no cover - compatibility host only
+            valid = True
+            identifiers = set()
+            for match in parsed.pattern.finditer(parsed.template):
+                if match.group("invalid") is not None:
+                    valid = False
+                identifier = match.group("named") or match.group("braced")
+                if identifier is not None:
+                    identifiers.add(identifier)
+        if not valid:
             raise ValueError(
                 f"prompt template {self.template_id!r} is not valid"
             )
-        identifiers = set(parsed.get_identifiers())
         unknown = identifiers - {"problem", "contract"}
         if unknown:
             raise ValueError(
@@ -90,6 +128,34 @@ class EnvironmentProfile:
     bft: BFTProfile | None
     answer_format: str | None = None
     prompt_template: PromptTemplateProfile | None = None
+    # Optional per-environment selected-group target. Historical profiles omit
+    # it and retain the protocol's legacy B_BATCH value byte-for-byte.
+    batch_target: int | None = None
+    # Consensus identity for generated/verifier-backed environments. Omitted
+    # from historical profiles so v2-v5 generation contracts do not change.
+    environment_contract_id: str | None = None
+    environment_manifest_sha256: str | None = None
+    # Present only for the Episode v1 fork. Historical profiles omit this
+    # field and therefore retain their exact generation-contract bytes.
+    episode: EpisodeProfile | None = None
+
+    def __post_init__(self) -> None:
+        if int(self.max_new_tokens) <= 0:
+            raise ValueError("environment max_new_tokens must be positive")
+        if self.batch_target is not None and int(self.batch_target) <= 0:
+            raise ValueError("environment batch_target must be positive")
+        if bool(self.environment_contract_id) != bool(
+            self.environment_manifest_sha256
+        ):
+            raise ValueError(
+                "environment contract id and manifest sha256 must be set together"
+            )
+        digest = self.environment_manifest_sha256
+        if digest is not None and (
+            len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError("environment manifest sha256 must be lowercase hex")
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +241,25 @@ class ProtocolProfile:
                 environment_contract["prompt_template"] = (
                     environment.prompt_template.to_generation_contract()
                 )
+            if environment.batch_target is not None:
+                environment_contract["batch_target"] = environment.batch_target
+            if environment.environment_contract_id is not None:
+                environment_contract["environment_contract_id"] = (
+                    environment.environment_contract_id
+                )
+                environment_contract["environment_manifest_sha256"] = (
+                    environment.environment_manifest_sha256
+                )
+            if environment.episode is not None:
+                episode = environment.episode
+                environment_contract["episode"] = {
+                    "schema": episode.schema,
+                    "renderer_id": episode.renderer_id,
+                    "max_turns": episode.max_turns,
+                    "max_action_tokens": episode.max_action_tokens,
+                    "max_episode_tokens": episode.max_episode_tokens,
+                    "max_observation_bytes": episode.max_observation_bytes,
+                }
             environments[name] = environment_contract
 
         return {
@@ -256,6 +341,28 @@ _CODE_REASONING_PROMPT = PromptTemplateProfile(
         "$problem$contract\n\n"
         "After your reasoning, provide the final implementation in the last "
         "fenced Python code block."
+    ),
+)
+
+_RELIQUARY_RECORDS_PROMPT = PromptTemplateProfile(
+    template_id="reliquary-records-v1",
+    # The generated problem already contains the full input, ordered
+    # operations, and exact answer channel. Keeping this wrapper as the
+    # identity makes the rendered bytes explicit in the signed contract.
+    template="$problem",
+)
+
+_RELIQUARY_LOGIC_PROMPT = PromptTemplateProfile(
+    template_id="reliquary-logic-step-by-step-v1",
+    # The generated problem carries the puzzle and the exact answer channel.
+    # The wrapper adds the one thing a generator cannot state for itself:
+    # that reasoning may come first. extract_json_answer already reads the
+    # last fence, so reasoning costs the answer channel nothing.
+    template=(
+        "Solve the following problem step by step.\n\n"
+        "$problem\n\n"
+        "After your reasoning, give the final answer in the last fenced JSON "
+        "code block."
     ),
 )
 
@@ -397,6 +504,178 @@ _PROFILE_VALUES = (
             bucket_tokens_per_round=50,
         ),
     ),
+    ProtocolProfile(
+        # Same model, same sampling, same budgets, same prompts as v5. v6
+        # changes when a window ends and who gets admitted, never what a
+        # miner generates -- so the generation contract is v5's, field for
+        # field, and a diff of the two profiles shows only the window.
+        profile_id="qwen3-4b-base-dapo-fill-closed-v6",
+        model_id="Qwen/Qwen3-4B-Base",
+        model_revision="906bfd4b4dc7f14ee4320094d8b41684abff8539",
+        protocol_version=6,
+        collection_seconds=100,
+        upload_grace_seconds=33,
+        prompt_encoding="raw",
+        sampling=_SAMPLING_DAPO,
+        environments={
+            "openmathinstruct": EnvironmentProfile(
+                max_new_tokens=8192,
+                bft=None,
+                answer_format="boxed",
+                prompt_template=_MATH_REASONING_PROMPT,
+            ),
+            "opencodeinstruct": EnvironmentProfile(
+                max_new_tokens=8192,
+                bft=None,
+                prompt_template=_CODE_REASONING_PROMPT,
+            ),
+        },
+        # No ranking in v6, so no tie-break to rank with.
+        throughput_tiebreak=None,
+    ),
+    ProtocolProfile(
+        profile_id="qwen3-4b-reliquary-verifiable-v6-dev1",
+        # Isolated infrastructure/frontier profile. It deliberately reuses the
+        # exact pinned v4/v5 base revision without joining their Math+Code
+        # checkpoint lineage.
+        model_id="Qwen/Qwen3-4B-Base",
+        model_revision="906bfd4b4dc7f14ee4320094d8b41684abff8539",
+        protocol_version=6,
+        collection_seconds=100,
+        upload_grace_seconds=33,
+        prompt_encoding="raw",
+        sampling=_SAMPLING_DAPO,
+        environments={
+            "reliquaryverifiable_v1": EnvironmentProfile(
+                max_new_tokens=1024,
+                bft=None,
+                answer_format="last_json_object_v1",
+                prompt_template=_RELIQUARY_RECORDS_PROMPT,
+                batch_target=16,
+                environment_contract_id="reliquary-records-v1",
+                environment_manifest_sha256=(
+                    "d0d5d838e40b383d1c95a62d1cdded8"
+                    "458f4a7b62df621c87c9435b62207929b"
+                ),
+            ),
+        },
+        throughput_tiebreak=ThroughputTiebreakProfile(
+            token_cap=1024,
+            bucket_tokens_per_round=50,
+        ),
+    ),
+    ProtocolProfile(
+        profile_id="qwen3-4b-reliquary-episode-v7-dev1",
+        # Opt-in development profile for the canonical multi-turn format. It
+        # intentionally preserves the existing Qwen3-4B base revision so the
+        # environment and assistant-mask fork can be evaluated independently.
+        model_id="Qwen/Qwen3-4B-Base",
+        model_revision="906bfd4b4dc7f14ee4320094d8b41684abff8539",
+        protocol_version=7,
+        collection_seconds=300,
+        upload_grace_seconds=33,
+        prompt_encoding="raw",
+        sampling=_SAMPLING_DAPO,
+        environments={
+            "reliquary_stateful_tools_v1": EnvironmentProfile(
+                max_new_tokens=16384,
+                bft=None,
+                answer_format="episode_json_action_v1",
+                batch_target=16,
+                environment_contract_id="reliquary-stateful-tools-v1",
+                environment_manifest_sha256=(
+                    "3725a5ec6186702d3f387c2a8cb174ff"
+                    "ce672dc3efe9b877460a8454e775db2e"
+                ),
+                episode=EpisodeProfile(
+                    schema="reliquary/episode/v1",
+                    renderer_id="reliquary-jsonl-tools-v1",
+                    max_turns=8,
+                    max_action_tokens=1024,
+                    max_episode_tokens=16384,
+                    max_observation_bytes=65536,
+                ),
+            ),
+            "reliquary_retrieval_tools_v1": EnvironmentProfile(
+                max_new_tokens=16384,
+                bft=None,
+                answer_format="episode_json_action_v1",
+                batch_target=16,
+                environment_contract_id="reliquary-retrieval-tools-v1",
+                environment_manifest_sha256=(
+                    "94095ba52ae58895f19b99bc9d605d8"
+                    "a3b6cdea55118af1b857ed42d484072c0"
+                ),
+                episode=EpisodeProfile(
+                    schema="reliquary/episode/v1",
+                    renderer_id="reliquary-jsonl-tools-v1",
+                    max_turns=6,
+                    max_action_tokens=1024,
+                    max_episode_tokens=16384,
+                    max_observation_bytes=65536,
+                ),
+            ),
+            "reliquary_workspace_tools_v1": EnvironmentProfile(
+                max_new_tokens=16384,
+                bft=None,
+                answer_format="episode_json_action_v1",
+                batch_target=16,
+                environment_contract_id="reliquary-workspace-tools-v1",
+                environment_manifest_sha256=(
+                    "9f888c49e5d1775f0f83314a0177ee5"
+                    "562c9e4858b8e4e401af8ef9ff7e0f4a7"
+                ),
+                episode=EpisodeProfile(
+                    schema="reliquary/episode/v1",
+                    renderer_id="reliquary-jsonl-tools-v1",
+                    max_turns=7,
+                    max_action_tokens=1024,
+                    max_episode_tokens=16384,
+                    max_observation_bytes=65536,
+                ),
+            ),
+        },
+        throughput_tiebreak=ThroughputTiebreakProfile(
+            token_cap=4096,
+            bucket_tokens_per_round=50,
+        ),
+    ),
+    ProtocolProfile(
+        profile_id="qwen3-4b-reliquary-logic-v8-dev1",
+        # Dormant development profile for the procedural logic suite. It
+        # reuses the pinned v4/v5 base revision without joining any existing
+        # checkpoint lineage, and declares the logic environment alone so a
+        # canary never perturbs the live Math+Code lanes.
+        model_id="Qwen/Qwen3-4B-Base",
+        model_revision="906bfd4b4dc7f14ee4320094d8b41684abff8539",
+        protocol_version=8,
+        collection_seconds=100,
+        upload_grace_seconds=33,
+        prompt_encoding="raw",
+        sampling=_SAMPLING_DAPO,
+        environments={
+            "reliquarylogic_v1": EnvironmentProfile(
+                # The v4/v5 budget, unchanged: one base model, one budget to
+                # think in. Nothing about a logic puzzle earns a tighter cap
+                # than a math problem on the same weights, and the prompt now
+                # asks for the reasoning first.
+                max_new_tokens=8192,
+                bft=None,
+                answer_format="last_json_object_v1",
+                prompt_template=_RELIQUARY_LOGIC_PROMPT,
+                batch_target=16,
+                environment_contract_id="reliquary-logic-v1",
+                environment_manifest_sha256=(
+                    "9cb29e487321b2e6c005f2a1a89ccff"
+                    "ecf01b1c09bfd03337094e338ab912ca9"
+                ),
+            ),
+        },
+        throughput_tiebreak=ThroughputTiebreakProfile(
+            token_cap=8192,
+            bucket_tokens_per_round=50,
+        ),
+    ),
 )
 
 PROFILES: Mapping[str, ProtocolProfile] = MappingProxyType(
@@ -474,6 +753,7 @@ __all__ = [
     "BFTProfile",
     "DEFAULT_PROFILE_ID",
     "EnvironmentProfile",
+    "EpisodeProfile",
     "PromptTemplateProfile",
     "PROFILES",
     "ProtocolProfile",
