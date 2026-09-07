@@ -174,8 +174,13 @@ def _make_batcher(**overrides) -> GrpoWindowBatcher:
         tokenizer=_DefaultFakeTokenizer(),
         verify_commitment_proofs_fn=_always_true_grail,
         verify_signature_fn=_always_true_sig,
+        # The marker drives FakeEnv.compute_reward; the box satisfies the
+        # answer contract. v5+ Math is answer_format="boxed", and a completion
+        # without one reads as an uncertain off-format outcome, which the
+        # robust-utility gate rejects as OUT_OF_ZONE before the test's own
+        # assertions ever run.
         completion_text_fn=lambda rollout: (
-            "CORRECT" if rollout.reward > 0.5 else "wrong"
+            r"CORRECT \boxed{1}" if rollout.reward > 0.5 else r"wrong \boxed{0}"
         ),
         hash_set=None,
         # The vast majority of legacy tests construct requests without an

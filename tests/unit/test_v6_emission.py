@@ -71,6 +71,7 @@ def test_the_auction_path_is_untouched_when_the_gate_is_off():
     assert rewards["short"] == rewards["long"]
 
 
+@pytest.mark.classic_window
 def test_selection_telemetry_names_who_actually_paid(monkeypatch):
     """The Minor: ``rewarded``/``reward_amount`` are a SLOT share.
 
@@ -101,6 +102,7 @@ def test_selection_telemetry_names_who_actually_paid(monkeypatch):
     }
 
 
+@pytest.mark.classic_window
 def test_auction_telemetry_names_who_actually_paid(monkeypatch):
     """Same Minor, on the arm production actually runs.
 
@@ -206,6 +208,7 @@ def _natural_cap_rollout():
     )
 
 
+@pytest.mark.classic_window
 def test_an_accepted_cap_shape_without_eos_pays_nothing(monkeypatch):
     """The single property per-token payment rests on.
 
@@ -573,6 +576,7 @@ def test_a_group_through_the_direct_path_is_paid(monkeypatch):
     assert batcher.pending_submissions()[-1].eos_tokens > 0
 
 
+@pytest.mark.classic_window
 def test_the_direct_path_counts_nothing_when_the_gate_is_off():
     """R21: v4/v5 must not spend a third ``_classify_termination`` pass per
     submission, and their archives carry 0."""
@@ -806,6 +810,7 @@ def test_a_distinct_payload_digest_is_still_accepted(monkeypatch):
     assert _precommit(batcher, "r2", "cd" * 32)[0] is True
 
 
+@pytest.mark.classic_window
 def test_the_digest_guard_is_inert_when_the_gate_is_off():
     """v4/v5 keep their behaviour byte for byte: the flat slot share made a
     resubmission cost a slot, not a second payment."""

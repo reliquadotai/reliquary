@@ -14,6 +14,8 @@ v4/v5 keep every byte of their behaviour.
 import hashlib
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from reliquary import constants
 from reliquary.validator.batcher import PendingSubmission
 
@@ -113,6 +115,7 @@ def test_a_v6_seal_still_records_the_cooldown_of_what_it_proved(monkeypatch):
     assert 18 in cooled
 
 
+@pytest.mark.classic_window
 def test_the_auction_seal_is_untouched_when_the_gate_is_off():
     """v4/v5 regression pin: with the gate off the seal path still proves
     and still selects."""
@@ -221,6 +224,7 @@ def test_an_aborted_v6_window_drops_its_assembler(monkeypatch):
     assert 30_000 not in svc._fill_closed_assemblers
 
 
+@pytest.mark.classic_window
 def test_the_seal_path_still_writes_a_raw_key_when_the_gate_is_off(monkeypatch):
     """v4/v5 regression pin: one tombstone, one raw key, unchanged."""
     monkeypatch.setattr(constants, "WRITE_TRAINING_PAYLOADS", True)
@@ -234,6 +238,7 @@ def test_the_seal_path_still_writes_a_raw_key_when_the_gate_is_off(monkeypatch):
     assert [key for key, _ in queue.tombstones] == [30_000]
 
 
+@pytest.mark.classic_window
 def test_the_seal_path_still_writes_a_payload_when_the_gate_is_off(monkeypatch):
     monkeypatch.setattr(constants, "WRITE_TRAINING_PAYLOADS", True)
 
