@@ -16,6 +16,7 @@ from reliquary.constants import (
     MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW,
     MAX_SUBMISSIONS_PER_PROMPT,
     M_ROLLOUTS,
+    PROTOCOL_VERSION,
 )
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
@@ -104,7 +105,10 @@ def _request(
     rewards=None, hotkey="hk",
 ) -> BatchSubmissionRequest:
     if rewards is None:
-        rewards = [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+        # Derived, not literal: a submission carries exactly M_ROLLOUTS
+        # rollouts, and that count differs between protocol profiles.
+        half = M_ROLLOUTS // 2
+        rewards = [1.0] * half + [0.0] * (M_ROLLOUTS - half)
     rollouts = []
     for idx, r in enumerate(rewards):
         # Shift token ids by idx so each rollout has a unique sequence;
@@ -126,7 +130,7 @@ def _request(
         merkle_root="00" * 32,
         rollouts=rollouts,
         checkpoint_hash="sha256:test",
-        protocol_version=2,
+        protocol_version=PROTOCOL_VERSION,
     )
 
 
