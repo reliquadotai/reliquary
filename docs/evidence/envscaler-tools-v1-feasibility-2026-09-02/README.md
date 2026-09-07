@@ -285,15 +285,46 @@ The corpus is **not vendored**. `RELIQUARY_ENVSCALER_DATA` must point at a
 directory holding EnvScaler's `env_meta.json` (191 world classes) and
 `rl_scen.json` (the RL split); the loader keeps the scenarios whose
 `env_id` resolves and **addresses them by position**, so file order is part
-of the corpus identity. Before any activation this should be a pinned
-revision of a fork rather than a loose directory.
+of the corpus identity.
 
-The exact bytes these measurements ran against:
+### The pin, made reproducible — 2026-09-07
+
+This section originally pinned two files by digest alone:
 
 ```text
 d2c0010f16ff77d6d55868ee386353b1d0aadace58beed1eed678e8f7c84c33d  env_meta.json
 5977bda0b941a9111b290cbf5ffd6d70678a36ddc499b8f153826fd22999337e  rl_scen.json
 ```
+
+Those bytes are gone with the box that held them, and they were never
+reproducible in the first place: upstream ships `tools` and `init_config`
+as **JSON strings**, the loader wants them decoded, and the directory held
+one particular re-serialisation of that decode. A digest over someone's
+`json.dump` settings pins nothing anyone else can rebuild.
+
+`scripts/fetch_envscaler_corpus.py` replaces it. It pins the upstream
+revisions, verifies the served bytes, decodes the two string fields,
+serialises canonically, and refuses to write on a digest mismatch:
+
+| | repo | revision | upstream sha256 |
+|---|---|---|---|
+| `env_meta.json` | `XXHStudyHard/EnvScaler-191-Env` | `3d30c6ac2446` | `600fa6d9…f04f49bd` |
+| `rl_scen.json` | `XXHStudyHard/EnvScaler-RL-Scenario` | `a14061538b0f` | `99c05a81…c7c2abe8` |
+
+Both files were uploaded 2026-01-09 and never rewritten. Rebuilt output:
+
+```text
+f0e874c28b3592c5820afcdbae28d3c10d7687632d5e1f922a6a68a2d904f81d  env_meta.json
+a953b969366d0ad0dc6e5262084fc7d46b6cefb992bd02ac5083fec537622e06  rl_scen.json
+```
+
+The rebuilt corpus reproduces this document's own description of the input
+— 51 RL worlds, 2,550 scenarios, 18 tools median, 25 max — and turns the
+eight oracle tests from `skipped` to passing. **One figure does not match:
+checks per scenario is 14 over all 2,550 scenarios, not the 13 recorded
+above**, and the median is a flat 14 rather than a rounded 13.5. The likely
+explanation is that 13 was measured over the 48-task sample, but it is
+unexplained, so the number stands corrected here rather than quietly.
 
 ```bash
 RELIQUARY_ENVSCALER_DATA=<data> VLLM_USE_FLASHINFER_SAMPLER=0 \
