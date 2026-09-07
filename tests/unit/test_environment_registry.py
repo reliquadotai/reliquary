@@ -29,6 +29,9 @@ def test_catalog_is_immutable_and_contains_legacy_environments():
         "reliquary_stateful_tools_v2",
         "reliquary_retrieval_tools_v1",
         "reliquary_workspace_tools_v1",
+        # Registered so a measurement can address it by name; no profile
+        # declares it, so no window can draw it.
+        "envscaler_tools_v1",
     )
     with pytest.raises(TypeError):
         ENVIRONMENT_SPECS["new"] = ENVIRONMENT_SPECS["openmathinstruct"]

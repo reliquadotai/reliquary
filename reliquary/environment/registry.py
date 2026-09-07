@@ -21,6 +21,7 @@ from dataclasses import dataclass
 import hashlib
 import importlib
 import json
+import os
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal
@@ -71,6 +72,10 @@ class EnvironmentSpec:
     renderer_id: str | None = None
     environment_manifest_sha256: str | None = None
     reward_materializer_method: str | None = None
+    # Set when the corpus lives outside the wheel. `create()` refuses rather
+    # than handing back an environment that raises on its first task, and
+    # `constants` refuses to boot a profile that names it unset.
+    required_data_env_var: str | None = None
     external_distribution: str | None = None
     external_artifact_resource: str | None = None
 
@@ -127,6 +132,16 @@ class EnvironmentSpec:
                 )
 
     def create(self) -> Environment | EpisodeEnvironment:
+        if self.required_data_env_var and not os.environ.get(
+            self.required_data_env_var
+        ):
+            # The corpus loader is lazy, so without this the environment
+            # builds cleanly and dies on its first `get_task` — mid-window,
+            # far from the missing configuration that caused it.
+            raise RuntimeError(
+                f"{self.name} needs its corpus: {self.required_data_env_var} "
+                "must point at the directory holding it"
+            )
         if self.external_distribution is not None:
             from reliquary.environment.agentic.external import (
                 load_external_episode_environment,
@@ -480,6 +495,40 @@ _SPEC_VALUES = (
             "9f888c49e5d1775f0f83314a0177ee5"
             "562c9e4858b8e4e401af8ef9ff7e0f4a7"
         ),
+    ),
+    # Installed, and deliberately named by no profile. The corpus is
+    # third-party and fetched rather than vendored, so `create()` fails
+    # without RELIQUARY_ENVSCALER_DATA. Being in the registry is what lets a
+    # measurement address it by name without a profile claiming it is live.
+    EnvironmentSpec(
+        name="envscaler_tools_v1",
+        factory_path=(
+            "reliquary.environment.agentic.envs.envscaler_tools_v1.environment:"
+            "EnvScalerToolsEnvironment"
+        ),
+        scorer_path=(
+            "reliquary.environment.agentic.suite:"
+            "episode_score_many_not_supported"
+        ),
+        validator_authoritative_reward=True,
+        # The worlds are LLM-written Python `exec`d out of the corpus, so a
+        # rollout runs third-party source however frozen the namespace is.
+        admission_resource_class="sandbox",
+        termination_policy="eos_or_cap",
+        final_answer_policy="json",
+        # Reward is passed checks over total checks and the denominator
+        # varies by scenario, so the lattice cannot be enumerated.
+        reward_lattice_policy="fractional-by-check-count-v1",
+        attainable_rewards=(),
+        contract_version="envscaler-tools-v1",
+        interaction_mode="episode",
+        episode_replay_path="reliquary.environment.agentic.suite:replay_submission",
+        renderer_id="reliquary-jsonl-tools-v1",
+        environment_manifest_sha256=(
+            "3634fb5110df0d3e2d04233fa766a4a6"
+            "c8c732bb8c0e3000e0cc78d9263fd273"
+        ),
+        required_data_env_var="RELIQUARY_ENVSCALER_DATA",
     ),
 )
 

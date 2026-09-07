@@ -34,6 +34,10 @@ EPISODE_ENVIRONMENTS = {
     "reliquary_stateful_tools_v1": "reliquary-stateful-tools-v1",
     "reliquary_retrieval_tools_v1": "reliquary-retrieval-tools-v1",
     "reliquary_workspace_tools_v1": "reliquary-workspace-tools-v1",
+    # Registered but named by no profile, so its pin lives in registry.py
+    # alone. `_rewrite_block` treats a missing profile block as absent
+    # rather than as an error only for that reason.
+    "envscaler_tools_v1": "envscaler-tools-v1",
 }
 
 _DIGEST = re.compile(
@@ -62,14 +66,23 @@ def _implementation_sha256(paths: list[str]) -> str:
     return digest.hexdigest()
 
 
-def _rewrite_block(path: Path, opener: str, contract: str, digest: str) -> None:
-    """Replace the digest inside the one block naming this contract."""
+def _rewrite_block(
+    path: Path, opener: str, contract: str, digest: str, *, required: bool = True
+) -> bool:
+    """Replace the digest inside the one block naming this contract.
+
+    Returns whether a block was found. An environment no profile declares
+    has no block to rewrite in `profiles.py`; more than one block, or a
+    missing block where one is required, is still an error.
+    """
     text = path.read_text(encoding="utf-8")
     parts = text.split(opener)
     hits = [
         index for index, part in enumerate(parts)
         if index > 0 and f'"{contract}",' in part
     ]
+    if not hits and not required:
+        return False
     if len(hits) != 1:
         raise SystemExit(
             f"expected exactly one {opener} block for {contract} in "
@@ -91,6 +104,7 @@ def _rewrite_block(path: Path, opener: str, contract: str, digest: str) -> None:
         raise SystemExit(f"no digest pin inside the {contract} block")
     parts[index] = patched
     path.write_text(opener.join(parts), encoding="utf-8")
+    return True
 
 
 def main() -> int:
@@ -121,10 +135,16 @@ def main() -> int:
             json.loads(manifest_path.read_text(encoding="utf-8"))
         )
         _rewrite_block(REGISTRY, "    EnvironmentSpec(", contract, digest)
-        _rewrite_block(PROFILES, "EnvironmentProfile(", contract, digest)
+        in_profile = _rewrite_block(
+            PROFILES, "EnvironmentProfile(", contract, digest, required=False
+        )
 
         moved = "unchanged" if before == manifest["implementation_sha256"] else "updated"
-        print(f"{environment:<32} impl {moved}  manifest {digest[:16]}…")
+        where = "registry+profiles" if in_profile else "registry only"
+        print(
+            f"{environment:<32} impl {moved}  manifest {digest[:16]}… "
+            f"({where})"
+        )
 
     check = subprocess.run(
         [sys.executable, "-c",

@@ -691,6 +691,33 @@ ENVIRONMENT_MIX: list[tuple[str, int]] = [
     for name, profile in ACTIVE_PROTOCOL_PROFILE.environments.items()
 ]
 
+
+def _require_environment_corpora() -> None:
+    """Refuse to boot a profile whose corpus is not on this machine.
+
+    An environment whose corpus lives outside the wheel loads it lazily, so
+    without this the validator starts, wins prompts, and fails on the first
+    task of the first window. Fail at import instead, where the operator can
+    still read why.
+    """
+    from reliquary.environment.registry import get_environment_spec
+
+    for name, _ in ENVIRONMENT_MIX:
+        try:
+            spec = get_environment_spec(name)
+        except (KeyError, ValueError):
+            continue  # unknown names are the environment list's business
+        variable = spec.required_data_env_var
+        if variable and not _os.environ.get(variable):
+            raise ValueError(
+                f"the {PROTOCOL_PROFILE_ID!r} profile names {name!r}, whose "
+                f"corpus is not vendored; set {variable} to the directory "
+                "holding it"
+            )
+
+
+_require_environment_corpora()
+
 # Auction-v3 deliberately narrows only the ranked GPU proof prefix: B_BATCH
 # winners plus B_BATCH possible failed candidates per environment. Derived from
 # B_BATCH rather than written as a literal, so a batch-size change cannot leave

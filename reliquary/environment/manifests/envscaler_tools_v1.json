@@ -1,0 +1,56 @@
+{
+  "schema": "reliquary/environment-source/v1",
+  "environment": "envscaler_tools_v1",
+  "contract": "reliquary/episode/v1",
+  "generator": "envscaler-rl-scenario-corpus-v1",
+  "renderer": "reliquary-jsonl-tools-v1",
+  "reward": "deterministic-check-ratio-v1",
+  "reward_diagnostics": "boolean-state-checks-over-terminal-state-v1",
+  "proof": "grail-v8-assistant-policy-spans",
+  "episode_schema": "reliquary/environment/schemas/episode-v1.schema.json",
+  "episode_schema_sha256": "a9bf6d2a8704440a835f4882b3c9fb37e1e19701cc3c27f4ca017e7ce40ea39a",
+  "implementation_digest_algorithm": "sha256-path-nul-file-sha256-newline-v1",
+  "implementation_files": [
+    "reliquary/environment/agentic/__init__.py",
+    "reliquary/environment/agentic/base.py",
+    "reliquary/environment/agentic/compat.py",
+    "reliquary/environment/agentic/envs/envscaler_tools_v1/__init__.py",
+    "reliquary/environment/agentic/envs/envscaler_tools_v1/environment.py",
+    "reliquary/environment/agentic/envs/envscaler_tools_v1/shims.py",
+    "reliquary/environment/agentic/renderer.py",
+    "reliquary/environment/agentic/replay.py",
+    "reliquary/environment/agentic/runner.py",
+    "reliquary/environment/agentic/suite.py",
+    "reliquary/environment/agentic/types.py"
+  ],
+  "implementation_sha256": "75f038aca5bf0a7c0d7c097f817984e17d7b73cb9b910464628da5cc86a79433",
+  "source": "EnvScaler (RUC-NLPIR), programmatically synthesised tool worlds",
+  "external_data": true,
+  "network_required": false,
+  "license": "MIT",
+  "corpus": {
+    "virtual_length": 2550,
+    "rl_worlds": 51,
+    "distributed_worlds": 191,
+    "builder": "scripts/fetch_envscaler_corpus.py",
+    "data_env_var": "RELIQUARY_ENVSCALER_DATA",
+    "files": {
+      "env_meta.json": {
+        "repo_id": "XXHStudyHard/EnvScaler-191-Env",
+        "repo_type": "dataset",
+        "revision": "3d30c6ac2446c06b79d727f196b84df90cc9cb69",
+        "filename": "191_env_metadata_processed.json",
+        "upstream_sha256": "600fa6d9613e3a104807edbff863d26ea48aeb1d5d3ef758c0e6f109f04f49bd",
+        "normalized_sha256": "f0e874c28b3592c5820afcdbae28d3c10d7687632d5e1f922a6a68a2d904f81d"
+      },
+      "rl_scen.json": {
+        "repo_id": "XXHStudyHard/EnvScaler-RL-Scenario",
+        "repo_type": "dataset",
+        "revision": "a14061538b0ffd3e84d44edf40fbe67477f83552",
+        "filename": "envscaler_rl_scenario_metadata.json",
+        "upstream_sha256": "99c05a81710da5adc81453a05f166023f2cd3235a03a9eb8b5736ba8c7c2abe8",
+        "normalized_sha256": "a953b969366d0ad0dc6e5262084fc7d46b6cefb992bd02ac5083fec537622e06"
+      }
+    }
+  }
+}
