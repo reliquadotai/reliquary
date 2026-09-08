@@ -4909,12 +4909,11 @@ class ValidationService:
         if not WRITE_TRAINING_PAYLOADS:
             raise RuntimeError("fill-closed trainer journal writing is disabled")
         queue = self._training_payload_queue_ref()
+        accounting = accounting_rows(batches, batch_index=key % FILL_CLOSED_EMISSIONS_PER_WINDOW)
         if is_tombstone:
-            queue.enqueue_committed_tombstone(key, data)
+            queue.enqueue_committed_tombstone(key, data, accounting=accounting)
         else:
-            queue.enqueue_committed_payload(key, data, accounting=accounting_rows(
-                batches, batch_index=key % FILL_CLOSED_EMISSIONS_PER_WINDOW,
-            ))
+            queue.enqueue_committed_payload(key, data, accounting=accounting)
 
     def _write_fill_closed_training_payload(
         self, key: int, data: bytes,

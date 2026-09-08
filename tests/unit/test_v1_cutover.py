@@ -129,6 +129,19 @@ def test_crash_during_archive_enqueue_replays_exact_archive(tmp_path, monkeypatc
     assert not store.windows()
 
 
+def test_quarantined_training_still_preserves_miner_payment_after_crash(tmp_path, monkeypatch):
+    store, queue, archives, rotation = _recovery_setup(tmp_path, monkeypatch)
+    rows = [{"env_name": env, "batch_index": 0, "hotkey": "alice",
+             "prompt_idx": 1, "eos_tokens": 16, "claimed_checkpoint_hash": "a" * 40}
+            for env in ("math", "code")]
+    queue.enqueue_committed_tombstone(672, b"training-quarantine", accounting=rows)
+    store.recover(42, queue=queue, archives=archives, rotation=rotation)
+    archive = archives.pending_archives(start_window=42, end_window=42)[42]
+    assert archive["rewards_by_hotkey"] == {"alice": 1 / 16}
+    assert archive["durable_payload_count"] == 0
+    assert not rotation.load().requires_successor
+
+
 def test_validator_drain_finishes_pipeline_before_acknowledging(tmp_path, monkeypatch):
     from reliquary.validator.service import ValidationService
 

@@ -150,11 +150,11 @@ class FillClosedRecoveryStore:
             receipt = queue._validate_journal_receipt(strict_json_loads(path.read_bytes()), source=path.name)
             if receipt["journal_key"] != key:
                 raise RuntimeError("recovery receipt belongs to another key")
-            if receipt["kind"] == "tombstone":
+            if receipt["kind"] == "tombstone" and receipt["schema_version"] == 1:
                 continue
             if receipt["schema_version"] != 2:
                 raise RuntimeError("paid window recovery requires accounting receipts")
-            payload_count += 1
+            payload_count += int(receipt["kind"] == "payload")
             paid = receipt["accounting"]
             for row in paid:
                 if (row["env_name"] not in environments or row["batch_index"] != index

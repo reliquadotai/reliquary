@@ -613,11 +613,11 @@ class TrainingPayloadQueue:
         )
 
     def enqueue_committed_tombstone(
-        self, window_start: int, data: bytes,
+        self, window_start: int, data: bytes, *, accounting: list[dict] | None = None,
     ) -> Path:
         """Durably create or byte-identically replay one tombstone slot."""
         return self._enqueue_committed_journal_entry(
-            window_start, data, is_tombstone=True,
+            window_start, data, is_tombstone=True, accounting=accounting,
         )
 
 
