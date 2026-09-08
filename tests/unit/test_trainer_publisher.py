@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import hashlib
+import io
 
 import pytest
 
@@ -14,6 +16,26 @@ from reliquary.shared.training_payload import active_training_identity
 from reliquary.trainer.journal import ACTIVE_JOURNAL_KEY_SPACE
 
 
+FAKE_HEAD = {"head": "0" * 40}
+
+
+@pytest.fixture(autouse=True)
+def _fake_hf(monkeypatch):
+    FAKE_HEAD["head"] = "0" * 40
+    monkeypatch.setattr(
+        "reliquary.trainer.publisher._default_hf_head", lambda repo: FAKE_HEAD["head"]
+    )
+
+
+def _committed(revision):
+    FAKE_HEAD["head"] = revision
+    return revision
+
+
+def _staging_empty(path):
+    return not [p for p in path.iterdir() if p.name != ".publication.lock"]
+
+
 REV_1 = "1" * 40
 REV_2 = "2" * 40
 REV_3 = "3" * 40
@@ -22,29 +44,52 @@ REV_9 = "9" * 40
 
 class _R2:
     def __init__(self):
-        self.uploads = []      # (key, path) via upload_file
-        self.objects = {}      # key -> bytes via put_object
-        self.deleted = []      # keys via delete_object
+        self.uploads = []  # (key, path) via upload_file
+        self.objects = {}  # key -> bytes via put_object
+        self.deleted = []  # keys via delete_object
 
     def upload_file(self, path, bucket, key, Config=None):
         assert Config is not None  # multipart config is mandatory
         self.uploads.append((key, path))
         self.objects[key] = b"<file>"
 
+    def get_object(self, Bucket, Key):
+        from botocore.exceptions import ClientError
+
+        if Key not in self.objects:
+            raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+        raw = self.objects[Key]
+        return {
+            "Body": io.BytesIO(raw),
+            "ETag": '"' + hashlib.sha256(raw).hexdigest() + '"',
+        }
+
     def put_object(self, Bucket, Key, Body, **kw):
+        old = self.objects.get(Key)
+        if "IfNoneMatch" in kw:
+            assert old is None
+        if "IfMatch" in kw:
+            assert (
+                old is not None
+                and kw["IfMatch"] == '"' + hashlib.sha256(old).hexdigest() + '"'
+            )
         self.objects[Key] = Body
 
     def list_objects_v2(self, Bucket, Prefix, Delimiter=None):
         if Delimiter:
-            prefixes = sorted({
-                k[: k.index(Delimiter, len(Prefix)) + 1]
-                for k in self.objects
-                if k.startswith(Prefix) and Delimiter in k[len(Prefix):]
-            })
+            prefixes = sorted(
+                {
+                    k[: k.index(Delimiter, len(Prefix)) + 1]
+                    for k in self.objects
+                    if k.startswith(Prefix) and Delimiter in k[len(Prefix) :]
+                }
+            )
             return {"CommonPrefixes": [{"Prefix": p} for p in prefixes]}
-        return {"Contents": [
-            {"Key": k} for k in sorted(self.objects) if k.startswith(Prefix)
-        ]}
+        return {
+            "Contents": [
+                {"Key": k} for k in sorted(self.objects) if k.startswith(Prefix)
+            ]
+        }
 
     def delete_object(self, Bucket, Key):
         self.objects.pop(Key, None)
@@ -56,16 +101,21 @@ def _publisher(tmp_path, r2, order, *, hf_fails=False, storage_guard=None):
         (path / "model.safetensors").write_bytes(b"weights")
         order.append("save")
 
-    async def hf_upload(folder_path, repo_id, commit_message):
+    async def hf_upload(folder_path, repo_id, commit_message, parent_commit):
         if hf_fails:
             raise RuntimeError("hf down")
         order.append("hf")
-        return REV_1
+        return _committed(REV_1)
 
     return TrainerPublisher(
-        repo_id="org/repo", staging_dir=str(tmp_path), tokenizer=None,
-        save_fn=save_fn, hf_upload_fn=hf_upload, r2_client=r2,
-        bucket="reliquary", storage_guard=storage_guard,
+        repo_id="org/repo",
+        staging_dir=str(tmp_path),
+        tokenizer=None,
+        save_fn=save_fn,
+        hf_upload_fn=hf_upload,
+        r2_client=r2,
+        bucket="reliquary",
+        storage_guard=storage_guard,
     )
 
 
@@ -73,33 +123,45 @@ def test_keys():
     assert checkpoint_key(REV_1, "model.safetensors") == (
         f"reliquary/checkpoints/{REV_1}/model.safetensors"
     )
-    assert CANDIDATE_MANIFEST_KEY == (
-        "reliquary/training/candidate-manifest.json"
-    )
+    assert CANDIDATE_MANIFEST_KEY == ("reliquary/training/candidate-manifest.json")
 
 
 def test_publish_order_manifest_and_cleanup(tmp_path):
     r2, order = _R2(), []
     pub = _publisher(tmp_path, r2, order)
-    rev = asyncio.run(pub.publish(
-        object(), checkpoint_n=5, lr_schedule_step=80,
-        trained_window_cursor=30110, reason="cadence",
-    ))
+    rev = asyncio.run(
+        pub.publish(
+            object(),
+            parent_revision=FAKE_HEAD["head"],
+            checkpoint_n=5,
+            lr_schedule_step=80,
+            trained_window_cursor=30110,
+            reason="cadence",
+        )
+    )
     assert rev == REV_1
     assert order == ["save", "hf"]
     uploaded_keys = [k for k, _ in r2.uploads]
     assert checkpoint_key(REV_1, "model.safetensors") in uploaded_keys
     # The profile file travels in the snapshot too.
-    assert any(k.endswith("reliquary_checkpoint_profile.json") or
-               "profile" in k for k in uploaded_keys) or len(uploaded_keys) >= 2
+    assert (
+        any(
+            k.endswith("reliquary_checkpoint_profile.json") or "profile" in k
+            for k in uploaded_keys
+        )
+        or len(uploaded_keys) >= 2
+    )
     manifest = json.loads(r2.objects[CANDIDATE_MANIFEST_KEY])
     assert manifest == {
         **active_training_identity(),
-        "checkpoint_n": 5, "repo_id": "org/repo", "revision": REV_1,
-        "trained_window_cursor": 30110, "reason": "cadence",
+        "checkpoint_n": 5,
+        "repo_id": "org/repo",
+        "revision": REV_1,
+        "trained_window_cursor": 30110,
+        "reason": "cadence",
         "journal_key_space": ACTIVE_JOURNAL_KEY_SPACE,
     }
-    assert not any(tmp_path.iterdir())  # staging cleaned
+    assert _staging_empty(tmp_path)  # staging cleaned
 
 
 def test_profile_extra_written(tmp_path):
@@ -109,25 +171,35 @@ def test_profile_extra_written(tmp_path):
     def save_fn(model, tokenizer, path):
         (path / "model.safetensors").write_bytes(b"w")
 
-    async def hf_upload(folder_path, repo_id, commit_message):
+    async def hf_upload(folder_path, repo_id, commit_message, parent_commit):
         import pathlib
+
         for p in pathlib.Path(folder_path).iterdir():
             if p.suffix == ".json":
                 captured[p.name] = json.loads(p.read_text())
-        return REV_9
+        return _committed(REV_9)
 
     pub = TrainerPublisher(
-        repo_id="org/repo", staging_dir=str(tmp_path), tokenizer=None,
-        save_fn=save_fn, hf_upload_fn=hf_upload, r2_client=r2,
+        repo_id="org/repo",
+        staging_dir=str(tmp_path),
+        tokenizer=None,
+        save_fn=save_fn,
+        hf_upload_fn=hf_upload,
+        r2_client=r2,
         bucket="reliquary",
     )
-    asyncio.run(pub.publish(
-        object(), checkpoint_n=7, lr_schedule_step=99,
-        trained_window_cursor=30200, reason="cadence",
-    ))
+    asyncio.run(
+        pub.publish(
+            object(),
+            parent_revision=FAKE_HEAD["head"],
+            checkpoint_n=7,
+            lr_schedule_step=99,
+            trained_window_cursor=30200,
+            reason="cadence",
+        )
+    )
     profiles = [
-        doc for doc in captured.values()
-        if doc.get("lr_schedule_step") is not None
+        doc for doc in captured.values() if doc.get("lr_schedule_step") is not None
     ]
     assert profiles and profiles[0]["lr_schedule_step"] == 99
     assert profiles[0]["trained_window_cursor"] == 30200
@@ -138,63 +210,80 @@ def test_mirror_keeps_only_last_two_revisions(tmp_path):
     r2 = _R2()
     # A stale revision from before a restart must be cleaned too.
     stale_revision = "a" * 40
-    r2.objects[
-        f"reliquary/checkpoints/{stale_revision}/model.safetensors"
-    ] = b"x"
+    r2.objects[f"reliquary/checkpoints/{stale_revision}/model.safetensors"] = b"x"
 
     def save_fn(model, tokenizer, path):
         (path / "model.safetensors").write_bytes(b"w")
 
     revs = iter([REV_1, REV_2, REV_3])
 
-    async def hf_upload(folder_path, repo_id, commit_message):
-        return next(revs)
+    async def hf_upload(folder_path, repo_id, commit_message, parent_commit):
+        return _committed(next(revs))
 
     pub = TrainerPublisher(
-        repo_id="org/repo", staging_dir=str(tmp_path), tokenizer=None,
-        save_fn=save_fn, hf_upload_fn=hf_upload, r2_client=r2,
+        repo_id="org/repo",
+        staging_dir=str(tmp_path),
+        tokenizer=None,
+        save_fn=save_fn,
+        hf_upload_fn=hf_upload,
+        r2_client=r2,
         bucket="reliquary",
     )
     for n in (1, 2, 3):
-        asyncio.run(pub.publish(
-            object(), checkpoint_n=n, lr_schedule_step=None,
-            trained_window_cursor=30100 + n, reason="cadence",
-        ))
+        asyncio.run(
+            pub.publish(
+                object(),
+                parent_revision=FAKE_HEAD["head"],
+                checkpoint_n=n,
+                lr_schedule_step=None,
+                trained_window_cursor=30100 + n,
+                reason="cadence",
+            )
+        )
     live_revs = {
-        k.split("/")[2] for k in r2.objects
-        if k.startswith("reliquary/checkpoints/")
+        k.split("/")[2] for k in r2.objects if k.startswith("reliquary/checkpoints/")
     }
     assert live_revs == {REV_2, REV_3}
-    assert (
-        f"reliquary/checkpoints/{stale_revision}/model.safetensors"
-        in r2.deleted
-    )
+    assert f"reliquary/checkpoints/{stale_revision}/model.safetensors" in r2.deleted
 
 
-def test_staging_cleaned_on_failure(tmp_path):
+def test_staging_retained_on_hf_failure(tmp_path):
     r2, order = _R2(), []
     pub = _publisher(tmp_path, r2, order, hf_fails=True)
     with pytest.raises(RuntimeError, match="hf down"):
-        asyncio.run(pub.publish(
-            object(), checkpoint_n=5, lr_schedule_step=None,
-            trained_window_cursor=30110, reason="cadence",
-        ))
-    assert not any(tmp_path.iterdir())
+        asyncio.run(
+            pub.publish(
+                object(),
+                parent_revision=FAKE_HEAD["head"],
+                checkpoint_n=5,
+                lr_schedule_step=None,
+                trained_window_cursor=30110,
+                reason="cadence",
+            )
+        )
+    assert (tmp_path / "publication.json").is_file()
     assert CANDIDATE_MANIFEST_KEY not in r2.objects
 
 
 @pytest.mark.parametrize("checkpoint_n", [True, 2.0, "2", -1])
 def test_publish_rejects_noncanonical_checkpoint_number(
-    tmp_path, checkpoint_n,
+    tmp_path,
+    checkpoint_n,
 ):
     r2, order = _R2(), []
     pub = _publisher(tmp_path, r2, order)
 
     with pytest.raises(ValueError, match="non-negative integer"):
-        asyncio.run(pub.publish(
-            object(), checkpoint_n=checkpoint_n, lr_schedule_step=None,
-            trained_window_cursor=30110, reason="cadence",
-        ))
+        asyncio.run(
+            pub.publish(
+                object(),
+                parent_revision=FAKE_HEAD["head"],
+                checkpoint_n=checkpoint_n,
+                lr_schedule_step=None,
+                trained_window_cursor=30110,
+                reason="cadence",
+            )
+        )
 
     assert order == []
     assert r2.uploads == []
@@ -210,6 +299,7 @@ def test_publish_rejects_noncanonical_cursor_atomically(tmp_path, cursor):
         asyncio.run(
             pub.publish(
                 object(),
+                parent_revision=FAKE_HEAD["head"],
                 checkpoint_n=5,
                 lr_schedule_step=None,
                 trained_window_cursor=cursor,
@@ -220,7 +310,7 @@ def test_publish_rejects_noncanonical_cursor_atomically(tmp_path, cursor):
     assert order == []
     assert r2.uploads == []
     assert r2.objects == {}
-    assert not any(tmp_path.iterdir())
+    assert _staging_empty(tmp_path)
 
 
 @pytest.mark.parametrize("lr_schedule_step", [True, 80.0, "80", -1])
@@ -235,6 +325,7 @@ def test_publish_rejects_noncanonical_lr_step_atomically(
         asyncio.run(
             pub.publish(
                 object(),
+                parent_revision=FAKE_HEAD["head"],
                 checkpoint_n=5,
                 lr_schedule_step=lr_schedule_step,
                 trained_window_cursor=30110,
@@ -245,12 +336,13 @@ def test_publish_rejects_noncanonical_lr_step_atomically(
     assert order == []
     assert r2.uploads == []
     assert r2.objects == {}
-    assert not any(tmp_path.iterdir())
+    assert _staging_empty(tmp_path)
 
 
 @pytest.mark.parametrize("checkpoint_n", [4, 5])
 def test_publish_rejects_checkpoint_number_at_or_below_resume_floor(
-    tmp_path, checkpoint_n,
+    tmp_path,
+    checkpoint_n,
 ):
     r2, order = _R2(), []
     pub = TrainerPublisher(
@@ -265,10 +357,16 @@ def test_publish_rejects_checkpoint_number_at_or_below_resume_floor(
     )
 
     with pytest.raises(ValueError, match="advance monotonically"):
-        asyncio.run(pub.publish(
-            object(), checkpoint_n=checkpoint_n, lr_schedule_step=None,
-            trained_window_cursor=30110, reason="cadence",
-        ))
+        asyncio.run(
+            pub.publish(
+                object(),
+                parent_revision=FAKE_HEAD["head"],
+                checkpoint_n=checkpoint_n,
+                lr_schedule_step=None,
+                trained_window_cursor=30110,
+                reason="cadence",
+            )
+        )
 
     assert order == []
     assert CANDIDATE_MANIFEST_KEY not in r2.objects
@@ -280,7 +378,7 @@ def test_mutable_hf_revision_never_reaches_manifest_or_mirror(tmp_path):
     def save_fn(model, tokenizer, path):
         (path / "model.safetensors").write_bytes(b"w")
 
-    async def hf_upload(folder_path, repo_id, commit_message):
+    async def hf_upload(folder_path, repo_id, commit_message, parent_commit):
         return "main"
 
     publisher = TrainerPublisher(
@@ -299,6 +397,7 @@ def test_mutable_hf_revision_never_reaches_manifest_or_mirror(tmp_path):
         asyncio.run(
             publisher.publish(
                 object(),
+                parent_revision=FAKE_HEAD["head"],
                 checkpoint_n=5,
                 lr_schedule_step=None,
                 trained_window_cursor=30110,
@@ -321,26 +420,36 @@ def test_the_publisher_stamps_the_journal_key_space(tmp_path):
     def save_fn(model, tokenizer, path):
         (path / "model.safetensors").write_bytes(b"w")
 
-    async def hf_upload(folder_path, repo_id, commit_message):
+    async def hf_upload(folder_path, repo_id, commit_message, parent_commit):
         import pathlib
+
         for p in pathlib.Path(folder_path).iterdir():
             if p.suffix == ".json":
                 captured[p.name] = json.loads(p.read_text())
-        return REV_9
+        return _committed(REV_9)
 
     pub = TrainerPublisher(
-        repo_id="org/repo", staging_dir=str(tmp_path), tokenizer=None,
-        save_fn=save_fn, hf_upload_fn=hf_upload, r2_client=r2,
+        repo_id="org/repo",
+        staging_dir=str(tmp_path),
+        tokenizer=None,
+        save_fn=save_fn,
+        hf_upload_fn=hf_upload,
+        r2_client=r2,
         bucket="reliquary",
     )
-    asyncio.run(pub.publish(
-        object(), checkpoint_n=7, lr_schedule_step=99,
-        trained_window_cursor=30200, reason="cadence",
-    ))
+    asyncio.run(
+        pub.publish(
+            object(),
+            parent_revision=FAKE_HEAD["head"],
+            checkpoint_n=7,
+            lr_schedule_step=99,
+            trained_window_cursor=30200,
+            reason="cadence",
+        )
+    )
 
     profile = next(
-        doc for doc in captured.values()
-        if doc.get("trained_window_cursor") is not None
+        doc for doc in captured.values() if doc.get("trained_window_cursor") is not None
     )
     manifest = json.loads(r2.objects[CANDIDATE_MANIFEST_KEY])
     assert profile["journal_key_space"] == ACTIVE_JOURNAL_KEY_SPACE
@@ -357,10 +466,16 @@ def test_storage_guard_runs_before_hf_upload(tmp_path):
     r2, order = _R2(), []
     pub = _publisher(tmp_path, r2, order, storage_guard=_Guard())
 
-    asyncio.run(pub.publish(
-        object(), checkpoint_n=5, lr_schedule_step=None,
-        trained_window_cursor=30110, reason="cadence",
-    ))
+    asyncio.run(
+        pub.publish(
+            object(),
+            parent_revision=FAKE_HEAD["head"],
+            checkpoint_n=5,
+            lr_schedule_step=None,
+            trained_window_cursor=30110,
+            reason="cadence",
+        )
+    )
 
     assert order == ["save", "guard", "hf"]
 
@@ -375,11 +490,17 @@ def test_storage_guard_freezes_without_mutating_hf_or_r2(tmp_path):
     pub = _publisher(tmp_path, r2, order, storage_guard=_Guard())
 
     with pytest.raises(RuntimeError, match="storage safety ceiling"):
-        asyncio.run(pub.publish(
-            object(), checkpoint_n=5, lr_schedule_step=None,
-            trained_window_cursor=30110, reason="cadence",
-        ))
+        asyncio.run(
+            pub.publish(
+                object(),
+                parent_revision=FAKE_HEAD["head"],
+                checkpoint_n=5,
+                lr_schedule_step=None,
+                trained_window_cursor=30110,
+                reason="cadence",
+            )
+        )
 
     assert order == ["save", "guard"]
     assert not r2.objects
-    assert not any(tmp_path.iterdir())
+    assert (tmp_path / "publication.json").is_file()
