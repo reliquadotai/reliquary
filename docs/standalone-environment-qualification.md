@@ -16,7 +16,7 @@ profile; it does not add a fourth training environment.
 
 The candidate pin is committed in `docker/logic-release.json`:
 
-- External source: `641de1ab263933b22032cb91fb910ba9db9a52f7`.
+- External source: `f95be97372a9b114376657f075fd0d00b88eb563`.
 - Planned release tag: `logic-v0.1.0a1` (the source/candidate build is usable
   before publication; the release URL is usable only after that tag is published).
 - Wheel: `reliquary_logic-0.1.0a1-py3-none-any.whl`.
