@@ -4,6 +4,8 @@ RUN apt-get update -qq && apt-get install -y -qq git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /opt/reliquary
 COPY reliquary /opt/reliquary/reliquary
+# The immutable historical catalog binds this fixture at import time too.
+COPY tests/fixtures/reliquarylogic_v1.jsonl /opt/reliquary/tests/fixtures/reliquarylogic_v1.jsonl
 COPY scripts /opt/reliquary/scripts
 COPY docker/logic-release.json docker/logic-runtime-requirements.lock /opt/reliquary/docker/
 ENV PYTHONPATH=/opt/reliquary PYTHONDONTWRITEBYTECODE=1
