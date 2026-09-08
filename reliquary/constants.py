@@ -1599,7 +1599,9 @@ TOKEN_AUTH_ENFORCE = True
 # on this signal alone.
 ALL_TOKEN_AUTH_SHADOW_THRESHOLD = 1e-5
 ALL_TOKEN_AUTH_SHADOW_ARGMAX_CONF = TOKEN_AUTH_ARGMAX_CONF
-ALL_TOKEN_AUTH_ENFORCE = PROTOCOL_VERSION != 5
+# Fill-closed keeps V5's full-support sampler: a legal tail draw is still
+# telemetry, not proof of tampering. Other V6 development profiles are separate.
+ALL_TOKEN_AUTH_ENFORCE = PROTOCOL_VERSION != 5 and not FILL_CLOSED_ENABLED
 
 # OpenCode semantic-token authenticity shadow gate. Generic token auth catches
 # near-impossible injections, and numeric auth catches many literal edits, but

@@ -9,6 +9,7 @@ import subprocess
 import sys
 
 import torch
+import pytest
 
 from reliquary.environment.forced_sampling import pick, warp
 from reliquary.validator.verifier import ProofResult, evaluate_all_token_auth_shadow
@@ -61,15 +62,24 @@ def test_forced_span_is_exempt():
     assert metrics["findings"] == 0
 
 
-def test_v5_all_token_auth_is_shadow_only():
+@pytest.mark.parametrize("profile,fill,enforce", [
+    ("qwen3-4b-base-dapo-reasoning-v5", "0", False),
+    ("qwen3-4b-base-dapo-fill-closed-v6", "1", False),
+    ("qwen3-4b-reliquary-verifiable-v6-dev1", "0", True),
+])
+def test_all_token_auth_policy_preserves_the_sampler_boundary(profile, fill, enforce):
     env = dict(os.environ)
-    env["RELIQUARY_PROTOCOL_PROFILE"] = "qwen3-4b-base-dapo-reasoning-v5"
+    env["RELIQUARY_PROTOCOL_PROFILE"] = profile
+    env["RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED"] = fill
     subprocess.run(
         [
             sys.executable,
             "-c",
-            "from reliquary.constants import ALL_TOKEN_AUTH_ENFORCE; "
-            "raise SystemExit(ALL_TOKEN_AUTH_ENFORCE)",
+            "from reliquary.constants import ALL_TOKEN_AUTH_ENFORCE, "
+            "TOKEN_AUTH_ENFORCE, FORCED_SEED_ENFORCE, FORCED_SEED_CDF_ENFORCE; "
+            f"assert ALL_TOKEN_AUTH_ENFORCE is {enforce}; "
+            "assert TOKEN_AUTH_ENFORCE and FORCED_SEED_ENFORCE; "
+            "assert not FORCED_SEED_CDF_ENFORCE",
         ],
         check=True,
         env=env,

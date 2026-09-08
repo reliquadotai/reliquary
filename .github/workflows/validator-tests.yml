@@ -28,6 +28,13 @@ jobs:
           pytest -q \
             --ignore=tests/gpu \
             --ignore=tests/integration/test_grader_e2e.py
+      - name: Check V5 authenticity boundaries
+        env:
+          RELIQUARY_PROTOCOL_PROFILE: qwen3-4b-base-dapo-reasoning-v5
+          RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED: "0"
+        run: |
+          pytest -q tests/unit/test_grpo_window_batcher.py \
+            -k 'all_token_auth or forced_seed_group_gate or forced_seed_gate_abstains or forced_seed_cdf_gate or forged or tamper'
 
   # The suite above runs at DEFAULT_PROFILE_ID, which is still v2, so it
   # exercises the fill-closed code with B_BATCH=8 and M_ROLLOUTS=8. This job
@@ -78,6 +85,12 @@ jobs:
             tests/unit/test_pick_pacing.py \
             tests/unit/test_rate_ordered_admission.py \
             tests/unit/test_remote_cpu_executor.py \
+            tests/unit/test_all_token_auth_enforce.py \
+            tests/unit/test_prepare_v5_fill_checkpoint.py \
             tests/unit/test_semantic_signer.py \
             tests/unit/test_checkpoint_store.py \
             tests/unit/test_weight_only_validator.py
+      - name: Check inherited V5 authenticity boundaries
+        run: |
+          pytest -q tests/unit/test_grpo_window_batcher.py \
+            -k 'all_token_auth or forced_seed_group_gate or forced_seed_gate_abstains or forced_seed_cdf_gate or forged or tamper'

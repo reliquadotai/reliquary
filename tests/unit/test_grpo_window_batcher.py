@@ -16,6 +16,7 @@ from reliquary.constants import (
     MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW,
     MAX_SUBMISSIONS_PER_PROMPT,
     M_ROLLOUTS,
+    PROTOCOL_PROFILE_ID,
     PROTOCOL_VERSION,
 )
 from reliquary.protocol.submission import (
@@ -131,6 +132,7 @@ def _request(
         rollouts=rollouts,
         checkpoint_hash="sha256:test",
         protocol_version=PROTOCOL_VERSION,
+        generation_profile_id=PROTOCOL_PROFILE_ID,
     )
 
 
@@ -2832,7 +2834,7 @@ def test_all_token_auth_shadow_records_without_rejecting(monkeypatch, tmp_path):
     assert sub is not None
     assert sub.all_token_auth_shadow_findings == M_ROLLOUTS * 2
     assert sub.all_token_auth_shadow_min_prob == pytest.approx(4.0e-7)
-    assert sub.all_token_auth_shadow_positive_findings == 4 * 2
+    assert sub.all_token_auth_shadow_positive_findings == (M_ROLLOUTS // 2) * 2
     assert sub.all_token_auth_shadow_positive_min_prob == pytest.approx(7.0e-6)
 
     records = [json.loads(line) for line in forensics_path.read_text().splitlines()]
@@ -3290,8 +3292,8 @@ def _grail_with_seed_counts(n_stoch: int, n_match: int):
 
 
 def test_forced_seed_group_gate_rejects_below_floor_when_enforcing(monkeypatch):
-    """Aggregate over 8 rollouts: 80 stochastic positions, 8 matches (0.10)
-    is well below FORCED_SEED_CONSISTENCY_FLOOR (0.80). With FORCED_SEED_ENFORCE
+    """The aggregate match rate is 1 / 10 for every rollout,
+    well below FORCED_SEED_CONSISTENCY_FLOOR (0.80). With FORCED_SEED_ENFORCE
     on, the group is rejected SEED_MISMATCH after the per-rollout loop."""
     import reliquary.validator.batcher as batcher_mod
 
@@ -3301,7 +3303,7 @@ def test_forced_seed_group_gate_rejects_below_floor_when_enforcing(monkeypatch):
         verify_commitment_proofs_fn=_grail_with_seed_counts(n_stoch=10, n_match=1),
     )
     b.current_checkpoint_hash = "sha256:test"   # pinned -> seed enforcement active
-    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+    req = _request()
     assert _prove_one(b, req) is None
     assert b.reject_counts[RejectReason.SEED_MISMATCH.value] == 1
     assert len(b.valid_submissions()) == 0
@@ -3321,7 +3323,7 @@ def test_forced_seed_gate_abstains_when_checkpoint_hash_unpinned(monkeypatch):
         verify_commitment_proofs_fn=_grail_with_seed_counts(n_stoch=10, n_match=1),
     )
     b.current_checkpoint_hash = ""              # not yet published -> not pinned
-    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+    req = _request()
     # Unpinned hash -> the gate abstains: the proof passes at seal, not rejected.
     assert _prove_one(b, req) is not None
 
@@ -3336,7 +3338,7 @@ def test_forced_seed_group_gate_shadow_when_not_enforcing(monkeypatch):
         window_start=500,
         verify_commitment_proofs_fn=_grail_with_seed_counts(n_stoch=10, n_match=1),
     )
-    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+    req = _request()
     # Not enforcing -> shadow only: the proof passes at seal, not rejected.
     assert _prove_one(b, req) is not None
 
@@ -3406,7 +3408,7 @@ def test_forced_seed_cdf_gate_rejects_sparse_branch_mismatch(monkeypatch):
     )
     b.current_checkpoint_hash = "sha256:test"
 
-    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+    req = _request()
     assert _prove_one(b, req) is None
     assert b.reject_counts[RejectReason.SEED_MISMATCH.value] == 1
     assert len(recorded) == 1
@@ -3429,7 +3431,7 @@ def test_forced_seed_cdf_gate_is_shadow_until_calibrated(monkeypatch):
     b.current_checkpoint_hash = "sha256:test"
 
     # CDF enforcement off -> shadow only: the proof passes at seal.
-    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+    req = _request()
     assert _prove_one(b, req) is not None
 
 
