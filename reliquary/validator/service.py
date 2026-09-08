@@ -667,6 +667,12 @@ class ValidationService:
     ) -> None:
         self.wallet = wallet
         self._signer_client = signer_client
+        self._network_proof = getattr(proof_worker_pool, "is_remote", False) is True
+        if self._network_proof:
+            from reliquary.constants import DETACHED_TRAINER
+            from reliquary.validator.proof_worker import ProofModelProxy
+            if not DETACHED_TRAINER or not isinstance(model, ProofModelProxy) or KL_BASE_MODEL:
+                raise ValueError("CPU controller requires detached training and a remote model proxy")
         import importlib.metadata as _im
         try:
             reliquary_version = _im.version("reliquary")
@@ -697,8 +703,10 @@ class ValidationService:
         # verifies commitment proofs and can independently supply PPO's old
         # policy. In rolling mode it is also the KL reference; fixed mode uses
         # a separately pinned base model. Refreshed only after publication.
-        self.train_model = model
-        if model is not None:
+        self.train_model = None if self._network_proof else model
+        if self._network_proof:
+            self.verify_model = model
+        elif model is not None:
             try:
                 self.verify_model = copy.deepcopy(model)
                 self.verify_model.eval()
@@ -1264,6 +1272,12 @@ class ValidationService:
             degraded_reasons.append("verify_checkpoint_mismatch")
         if published_revision and active_revision != published_revision:
             degraded_reasons.append("scheduler_checkpoint_mismatch")
+        pool = getattr(self, "_proof_worker_pool", None)
+        if getattr(self, "_network_proof", False):
+            remote = pool.readiness_snapshot()
+            snapshot["remote_proof"] = remote
+            if remote.get("ready") is not True:
+                degraded_reasons.append("remote_proof_unavailable")
         snapshot.update({
             "required": PROTOCOL_VERSION >= 3,
             "profile_id": PROTOCOL_PROFILE_ID,
@@ -1416,9 +1430,13 @@ class ValidationService:
             # this candidate, so a failed swap remains closed; a crash after a
             # successful install can recover the proof from this record.
             self._record_fill_closed_checkpoint_candidate(manifest)
-            await asyncio.to_thread(
-                self._refresh_verify_model_from_dir, staged_dir, revision,
-            )
+            bind = getattr(getattr(self, "_proof_worker_pool", None), "bind_checkpoint", None)
+            if callable(bind):
+                bind(checkpoint_n, repo_id, revision)
+            if not getattr(self, "_network_proof", False):
+                await asyncio.to_thread(
+                    self._refresh_verify_model_from_dir, staged_dir, revision,
+                )
             if self.proof_scheduler is not None:
                 await asyncio.to_thread(
                     self._synchronize_proof_models, revision, str(staged_dir),
@@ -1881,7 +1899,8 @@ class ValidationService:
             raise RuntimeError(
                 "proof scheduler requires a published checkpoint revision"
             )
-        if self._verify_model_checkpoint_revision != checkpoint_revision:
+        if (self._verify_model_checkpoint_revision != checkpoint_revision
+                and not getattr(self, "_network_proof", False)):
             raise RuntimeError(
                 "verify model weights are not certified for the checkpoint"
             )
@@ -1922,6 +1941,12 @@ class ValidationService:
             self._synchronize_proof_workers(
                 checkpoint_revision, snapshot_dir,
             )
+            if getattr(self, "_network_proof", False):
+                self._proof_worker_pool.assert_ready()
+                self._verify_model_checkpoint_revision = checkpoint_revision
+                self.server.set_proof_runtime_fingerprint(
+                    self._proof_worker_pool.runtime_fingerprint,
+                )
             scheduler.resume(checkpoint_revision)
             return
         reference_state = self.verify_model.state_dict()
@@ -1954,6 +1979,11 @@ class ValidationService:
             raise RuntimeError(
                 "scheduled proving requires a published checkpoint"
             )
+        if getattr(self, "_network_proof", False):
+            try:
+                await asyncio.to_thread(self._proof_worker_pool.assert_ready)
+            except Exception as exc:
+                raise FatalProofPlaneError("remote proof worker is unavailable") from exc
         if self._verify_model_checkpoint_revision != checkpoint.revision:
             from reliquary.constants import DETACHED_TRAINER as _detached
 
@@ -2137,7 +2167,13 @@ class ValidationService:
 
         def _download(repo_id, revision):
             from huggingface_hub import snapshot_download
-            return snapshot_download(repo_id=repo_id, revision=revision)
+            options = {}
+            if getattr(self, "_network_proof", False):
+                options["allow_patterns"] = [
+                    "reliquary_protocol_profile.json", "config.json", "generation_config.json",
+                    "tokenizer*", "special_tokens_map.json", "vocab.json", "merges.txt",
+                ]
+            return snapshot_download(repo_id=repo_id, revision=revision, **options)
 
         source = parse_resume_source(self._resume_from)
         local_path, checkpoint_n = resolve_resume_source(
@@ -2166,6 +2202,20 @@ class ValidationService:
         self._resumed_lr_schedule_step = _coerce_lr_schedule_step(
             (resumed_profile or {}).get("lr_schedule_step")
         )
+        bind = getattr(getattr(self, "_proof_worker_pool", None), "bind_checkpoint", None)
+        if callable(bind) and isinstance(source, ShaSource):
+            bind(checkpoint_n, self._checkpoint_store.repo_id, source.sha)
+        if getattr(self, "_network_proof", False):
+            if not isinstance(source, ShaSource):
+                raise ValueError("remote proof resume requires a published immutable SHA")
+            await asyncio.to_thread(self._synchronize_proof_models, source.sha)
+            entry = await asyncio.to_thread(
+                self._checkpoint_store.install_external, checkpoint_n, source.sha,
+            )
+            self._checkpoint_n = checkpoint_n
+            self.server.set_current_checkpoint(entry)
+            self._local_resume_unadvertised = False
+            return
         # Load weights — this replaces both models loaded at __init__.
         # verify_model gets the resumed weights too (so the batcher
         # verifies miners against the resumed checkpoint, which is what
@@ -2400,6 +2450,11 @@ class ValidationService:
                 open_kwargs["verify_commitment_proofs_fn"] = (
                     self._remote_commitment_verifier
                 )
+                factory = getattr(self._proof_worker_pool, "verifier_for_window", None)
+                if callable(factory):
+                    open_kwargs["verify_commitment_proofs_fn"] = factory(
+                        target_window, env_name, cp_hash,
+                    )
                 # Paths that prove without naming a device — the forensic
                 # sample, and the legacy non-auction admission — fall back to
                 # the batcher's own model. In isolated mode that has to be a

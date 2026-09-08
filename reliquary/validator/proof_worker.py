@@ -156,7 +156,9 @@ def _worker_main(
         if operation == "shutdown":
             return
         try:
-            if operation == "reload":
+            if operation == "describe":
+                payload = describe_proof_context(context)
+            elif operation == "reload":
                 if reload_fn is None:
                     raise RuntimeError("worker has no reload handler")
                 payload = reload_fn(context, *args, **kwargs)
@@ -428,6 +430,14 @@ class ProofWorkerPool:
         """Revision this worker is certified for, or None when unknown."""
         return self._revisions.get(device_id)
 
+    def describe(self, device_id: str) -> dict[str, Any]:
+        """Read identity from the process that owns the actual weights."""
+        return self._request(device_id, "describe", (), {})
+
+    def is_alive(self, device_id: str) -> bool:
+        worker = self._workers.get(device_id)
+        return bool(not self._closed and worker is not None and worker.process.is_alive())
+
     def close(self, force: bool = False) -> None:
         """Retire every worker.
 
@@ -483,6 +493,33 @@ def run_commitment_proof(
         tokenizer=context["tokenizer"],
         seed_u_values=seed_u_values,
     )
+
+
+def describe_proof_context(context: MutableMapping[str, Any]) -> dict[str, Any]:
+    """No tensors: metadata is measured inside the GPU-owning interpreter."""
+    import torch
+    from reliquary.shared.runtime_fingerprint import collect_runtime_fingerprint
+    from reliquary.validator.proof_capacity import (
+        physical_proof_device, resolve_cuda_proof_devices,
+    )
+
+    model = context["model"]
+    if model is None:
+        raise ProofWorkerUnavailable("proof worker has no loaded model")
+    device = context["device"]
+    identity, = resolve_cuda_proof_devices(
+        [physical_proof_device(device)], cuda=torch.cuda,
+    )
+    return {
+        "device_id": device,
+        "physical_device": identity.device_id,
+        "hardware_class": identity.hardware_class,
+        "device_uuid": identity.device_uuid,
+        "revision": context.get("revision"),
+        "runtime": collect_runtime_fingerprint(generation_model=model, proof_model=model),
+        "config": model.config.to_dict(),
+        "generation_config": model.generation_config.to_dict(),
+    }
 
 
 def reload_proof_context(
