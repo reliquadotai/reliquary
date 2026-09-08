@@ -434,7 +434,7 @@ class TrainerPublisher:
         )
         commit_message = (
             f"checkpoint {transaction['manifest']['checkpoint_n']} "
-            f"({transaction['manifest']['reason']}) [{transaction['publication_id']}]"
+            f"({transaction['manifest']['reason']}; publication={transaction['publication_id']})"
         )
         if revision is None:
             if head != transaction["parent_revision"]:

@@ -36,6 +36,8 @@ class HF:
         return self.head
 
     async def upload(self, *, folder_path, repo_id, commit_message, parent_commit):
+        from reliquary.validator.resume import checkpoint_n_from_commit_title
+        assert checkpoint_n_from_commit_title(commit_message) is not None
         self.calls += 1
         assert parent_commit == self.head, "HF CAS failed"
         if self.failure == "before":
