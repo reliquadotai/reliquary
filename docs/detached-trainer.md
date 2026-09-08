@@ -24,6 +24,16 @@ its verify plane on the serial publication beat.
 | `RELIQUARY_TRAINER_STATE_DIR` | trainer | staging + resume directory (default `/root/reliquary/trainer`). |
 | `RELIQUARY_TRAINER_WINDOW_STRIDE` | trainer | journal stride (default 1, matching live window numbering). |
 | `RELIQUARY_HF_REPO_ID` + R2 env (`R2_*`) | trainer | checkpoint repo and payload bucket — same names as the validator. |
+| `RELIQUARY_HF_STORAGE_FREEZE_TB=<TB>` | trainer | optional read-only organization quota guard before HF upload. It never rewrites active history. See `docs/checkpoint-retention.md`. |
+
+When the disabled checkpoint-epoch capability is explicitly enabled, every
+journal payload also carries its epoch ID, manifest hash, training-run identity,
+lane offset, horizon, and selected training mode. The validator uploads a
+terminal epoch marker only after all lane payloads/tombstones are durable in
+R2. The trainer waits for that marker before consuming lane zero, skips an
+aborted epoch atomically, and then either performs the normal sequential steps
+or one horizon-wide aggregate step according to the manifest. Ordinary
+production payloads retain their existing schema and behavior.
 
 Both flags default OFF; flag-off is byte-identical to main.
 
@@ -95,6 +105,12 @@ Candidate manifests and payloads now carry profile ID, protocol version,
 training-run ID, and generation-contract hash. A stale v4 manifest is ignored
 in favor of the explicit v5 bootstrap; a mismatched payload fails closed rather
 than advancing the journal cursor.
+
+Active training history is append-only. Stopping the trainer does not archive or
+prune anything, so the full checkpoint series remains available throughout the
+benchmark cooldown. Once a run is finished, tested, and no longer used for
+serving, follow the two-phase manual procedure in
+`docs/checkpoint-retention.md`.
 
 ## Recovery
 

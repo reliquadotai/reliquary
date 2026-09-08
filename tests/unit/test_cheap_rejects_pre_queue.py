@@ -12,6 +12,7 @@ the request).
 """
 
 import math
+import time
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -98,6 +99,7 @@ def _setup(*,
     batcher.window_start = 500
     batcher.current_checkpoint_hash = current_checkpoint_hash
     batcher.cooldown_prompts_snapshot = cooldown_prompts or []
+    batcher.cooldown_prompts_membership = frozenset(batcher.cooldown_prompts_snapshot)
     batcher.env = MagicMock()
     batcher.env.__len__.return_value = env_len
     batcher.is_sealed.return_value = False
@@ -812,8 +814,6 @@ def test_validate_drand_round_called_with_arrival_timestamp():
     The worker must not re-read wall time after queueing, and request headers
     must not antedate an incomplete signed body.
     """
-    import time
-
     s, batcher = _setup(
         current_checkpoint_hash="sha256:current",
         drand_round_check_enabled=True,
@@ -847,8 +847,6 @@ def test_stalled_handler_does_not_reject_round_inside_arrival_window():
     Once the complete body is stamped, later handler or queue latency cannot
     turn an on-time request into a stale one.
     """
-    import time
-
     s, batcher = _setup(
         current_checkpoint_hash="sha256:current",
         drand_round_check_enabled=True,

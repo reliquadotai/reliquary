@@ -42,9 +42,15 @@ class TrainRunner:
         self.model = model
         self.ref_model = ref_model
         self.env_order = list(env_order)
+        self.env_targets = {
+            str(name): int(target) for name, target in env_targets.items()
+        }
+        if set(self.env_targets) != set(self.env_order):
+            raise ValueError("trainer environment targets must match env_order")
         self._train_step = train_step_fn
         self._assess = assess_fn
-        self._accumulator = BalancedTrainingAccumulator(env_targets)
+        self._base_targets = self.env_targets
+        self._accumulator = BalancedTrainingAccumulator(self._base_targets)
         # Restored LR position; passed on every call like the validator's
         # _lr_global_step_hint (the schedule advances internally after
         # _lazy_init consumes it once).
@@ -87,28 +93,27 @@ class TrainRunner:
                     logger.warning(
                         "dropping group prompt_idx=%s (%s): missing "
                         "validator pi_old; refusing miner-claim fallback",
-                        getattr(group, "prompt_idx", "?"), env,
+                        getattr(group, "prompt_idx", "?"),
+                        env,
                     )
             out[env] = kept
         return out
 
-    def step(self, decoded: Any) -> bool:
-        """Feed one decoded window; returns True when a train step ran.
 
-        TrainingStepSkipped propagates to the caller (the worker turns
-        policy_ratio_drift into an adaptive publication) — the
-        accumulator is reset first, matching the validator's finally.
-        """
-        self._accumulator.add_window(
-            self._filter_missing_pi_old(decoded.batches()),
-            window_n=decoded.window_start,
-            checkpoint_revision=decoded.checkpoint_revision,
+
+    def _run_ready_step(
+        self,
+        decoded: Any,
+        *,
+        allow_partial: bool = False,
+    ) -> bool:
+        batches = self._accumulator.training_batches(
+            self.env_order,
+            allow_partial=allow_partial,
         )
-        if not self._accumulator.ready:
-            return False
-        batches = self._accumulator.training_batches(self.env_order)
         verdict = self._assess(
-            [g for batch in batches for g in batch], reject_counts={},
+            [group for batch in batches for group in batch],
+            reject_counts={},
         )
         if verdict.quarantined:
             logger.warning(
@@ -128,9 +133,8 @@ class TrainRunner:
         except TrainingStepSkipped:
             raise  # worker handles health gates (adaptive publication)
         except Exception:
-            # Parity with the in-process path (service.py: "train_step
-            # failed; archiving anyway"): a CUDA OOM or kernel fault on
-            # one window must not become a crash loop replaying it.
+            # Parity with the in-process path: a failed step is consumed rather
+            # than replayed ambiguously against partially-mutated optimizer state.
             logger.exception(
                 "train_step failed for window %s; skipping this batch",
                 decoded.window_start,
@@ -139,6 +143,29 @@ class TrainRunner:
         finally:
             self._accumulator.reset()
         return True
+
+
+    def step(self, decoded: Any) -> bool:
+        """Feed one journal lane; return True only when an optimizer step ran."""
+        payload_targets = dict(getattr(decoded, "env_targets", {}) or {})
+        if payload_targets and payload_targets != self._base_targets:
+            raise ValueError("training payload environment targets do not match trainer")
+        if list(getattr(decoded, "env_order", self.env_order)) != self.env_order:
+            raise ValueError("training payload environment order does not match trainer")
+        self._accumulator.add_window(
+            (
+                {}
+                if bool(decoded.window_quarantine.get("quarantined"))
+                else self._filter_missing_pi_old(decoded.batches())
+            ),
+            window_n=decoded.window_start,
+            checkpoint_revision=decoded.checkpoint_revision,
+        )
+        if not self._accumulator.ready:
+            return False
+        return self._run_ready_step(decoded)
+
+
 
     def snapshot(self) -> dict[str, Any]:
         return {"accumulator": self._accumulator.snapshot()}

@@ -11,7 +11,6 @@ import re
 from typing import Any, Mapping, Sequence
 
 
-_ENVIRONMENTS = ("openmathinstruct", "opencodeinstruct")
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _CUDA_DEVICE_RE = re.compile(r"^cuda:(\d+)$")
@@ -510,7 +509,14 @@ class ProofCapacityQualification:
             raise ProofCapacityQualificationError(
                 "proof-capacity benchmark needs 20 samples per GPU and environment"
             )
-        for environment in _ENVIRONMENTS:
+        required_environments = tuple(
+            minimum_completion_tokens_per_environment
+        )
+        if not required_environments:
+            raise ProofCapacityQualificationError(
+                "proof-capacity qualification requires an active environment"
+            )
+        for environment in required_environments:
             proof_count = self.proofs_per_environment.get(environment)
             p95_seconds = self.p95_seconds_per_proof.get(environment)
             if (

@@ -28,6 +28,7 @@ from reliquary.protocol.signatures import sign_envelope, sign_precommit
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     BatchSubmissionResponse,
+    FillClosedWindowState,
     GrpoBatchState,
     RolloutSubmission,
     RejectReason,
@@ -318,6 +319,64 @@ def test_auction_submit_requires_precommit_before_body_parse(monkeypatch):
         "reason": RejectReason.PRECOMMIT_REQUIRED.value,
     }
     assert response.headers["connection"] == "close"
+
+
+def test_claiming_a_precommit_stamps_its_receipt_id_onto_the_request():
+    """v6 only. The arrival proof path looks up the rate a precommit
+    registered off ``pending.request._precommit_receipt_id``. This is the
+    exact point the body is matched to its precommit, so it is where the
+    id must land -- a replay or a mismatch must never stamp anything."""
+    batcher = _batcher(window_start=500)
+    server = ValidatorServer()
+    request = _request(valid_merkle=True)
+    raw_body = request.model_dump_json().encode()
+    payload_sha256 = hashlib.sha256(raw_body).hexdigest()
+    receipt_id = "rate-linking-receipt"
+    receipt = _UploadPrecommitReceipt(
+        receipt_id=receipt_id,
+        precommit_signature="signed",
+        miner_hotkey=request.miner_hotkey,
+        prompt_idx=request.prompt_idx,
+        window_start=request.window_start,
+        merkle_root=request.merkle_root,
+        checkpoint_hash=request.checkpoint_hash,
+        environment=FakeEnv.name,
+        payload_bytes=len(raw_body),
+        payload_sha256=payload_sha256,
+        drand_round=request.drand_round,
+        protocol_version=request.protocol_version,
+        nonce=request.nonce,
+        expires_at_wall=time.time() + 30.0,
+        precommit_arrival_ts=time.time(),
+        drand_observation=DrandRoundObservation(
+            submitted_drand_round=request.drand_round,
+            arrival_drand_round=request.drand_round,
+            drand_delta=0,
+            drand_tolerance=0,
+            drand_status="current",
+            reject_reason=None,
+        ),
+        batcher=batcher,
+        body_completed_at_wall=time.time(),
+    )
+    server._upload_precommit_receipts[receipt_id] = receipt
+
+    assert getattr(request, "_precommit_receipt_id", "") == ""
+
+    status, claimed = server._claim_upload_precommit(
+        receipt_id,
+        request,
+        batcher=batcher,
+        environment=FakeEnv.name,
+        payload_bytes=len(raw_body),
+        payload_sha256=payload_sha256,
+        upload_started_at=time.time(),
+        body_completed_at=time.time(),
+    )
+
+    assert status == "valid"
+    assert claimed is receipt
+    assert request._precommit_receipt_id == receipt_id
 
 
 @pytest.mark.asyncio
@@ -2234,9 +2293,96 @@ def test_state_endpoint_returns_grpo_batch_state():
     assert "protocol_version" not in payload
     assert "generation_profile_id" not in payload
     assert "generation_contract" not in payload
+    assert "fill_closed" not in payload
     state = GrpoBatchState(**payload)
     assert state.window_n == 500
     assert 42 in state.cooldown_prompts
+
+
+def test_fill_closed_state_advertises_cutoff_progress_and_budget(monkeypatch):
+    import reliquary.validator.server as server_module
+    from reliquary.protocol.submission import WindowState
+    from reliquary.validator.fill_window import FillState
+
+    monkeypatch.setattr(server_module, "FILL_CLOSED_ENABLED", True)
+    monkeypatch.setattr(server_module, "FILL_CLOSED_MAX_SECONDS", 300.0)
+    now = [1_000.0]
+    batcher = _batcher(window_start=500)
+    batcher._time_fn = lambda: now[0]
+    batcher.collection_seconds = 200.0
+    batcher.mark_window_opened(
+        monotonic_time=1_000.0,
+        wall_time=10_000.0,
+    )
+    batcher.window_open_drand_chain = "quicknet"
+    batcher.window_open_drand_chain_hash = "ab" * 32
+    batcher.window_open_drand_round = 123
+    batcher.fill_state = FillState(
+        budgets={"openmathinstruct": 32},
+        picks_target=2,
+    )
+    server = ValidatorServer()
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    client = TestClient(server.app)
+
+    first = client.get("/state").json()["fill_closed"]
+    assert first == {
+        "phase": "collecting",
+        "generation_beacon_chain": "quicknet",
+        "generation_beacon_chain_hash": "ab" * 32,
+        "generation_beacon_round": 123,
+        "precommit_cutoff_ts": 10_200.0,
+        "precommit_seconds": 200.0,
+        "max_window_seconds": 300.0,
+        "picks_emitted": 0,
+        "picks_target": 2,
+        "picks_by_environment": {"openmathinstruct": 0},
+        "admission_budgets": {"openmathinstruct": 32},
+        "admitted": {"openmathinstruct": 0},
+        "proven": {"openmathinstruct": 0},
+        "in_flight": {"openmathinstruct": 0},
+        "remaining": {"openmathinstruct": 32},
+    }
+    with pytest.raises(ValueError, match="provenance must be complete"):
+        FillClosedWindowState.model_validate(
+            {**first, "generation_beacon_chain_hash": None}
+        )
+
+    with batcher.fill_state.lock:
+        batcher.fill_state.reserve("openmathinstruct")
+        batcher.fill_state.record_proven("openmathinstruct")
+        batcher.fill_state.record_pick("openmathinstruct")
+    updated = client.get("/state").json()["fill_closed"]
+    assert updated["admitted"] == {"openmathinstruct": 1}
+    assert updated["proven"] == {"openmathinstruct": 1}
+    assert updated["in_flight"] == {"openmathinstruct": 0}
+    assert updated["remaining"] == {"openmathinstruct": 31}
+    assert updated["picks_emitted"] == 1
+
+    now[0] = 1_201.0
+    assert client.get("/state").json()["fill_closed"]["phase"] == "draining"
+    batcher.force_seal("test")
+    assert client.get("/state").json()["fill_closed"]["phase"] == "sealed"
+
+
+def test_disabled_fill_closed_keeps_legacy_state_bytes(monkeypatch):
+    import reliquary.validator.server as server_module
+    from reliquary.protocol.submission import WindowState
+
+    monkeypatch.setattr(server_module, "FILL_CLOSED_ENABLED", False)
+    server = ValidatorServer()
+    server.set_active_batcher(_batcher(window_start=500))
+    server.set_current_state(WindowState.OPEN)
+
+    body = TestClient(server.app).get("/state").content
+
+    assert body == (
+        b'{"state":"open","window_n":500,"anchor_block":500,'
+        b'"cooldown_prompts":[],"valid_submissions":0,"checkpoint_n":0,'
+        b'"checkpoint_repo_id":null,"checkpoint_revision":null,'
+        b'"randomness":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}'
+    )
 
 
 def test_v3_state_advertises_exact_generation_contract(monkeypatch):
@@ -2333,8 +2479,10 @@ def test_state_endpoint_per_env_cooldown_via_query_param():
         b.randomness = "cd" * 16
         return b
 
-    math_cd = CooldownMap(cooldown_windows=50); math_cd.record_batched(11, 490)
-    code_cd = CooldownMap(cooldown_windows=50); code_cd.record_batched(22, 490)
+    math_cd = CooldownMap(cooldown_windows=50)
+    math_cd.record_batched(11, 490)
+    code_cd = CooldownMap(cooldown_windows=50)
+    code_cd.record_batched(22, 490)
     server = ValidatorServer()
     # Dict order = math first, so the no-arg /state reflects math (the bug).
     server.set_active_batchers({
@@ -2424,6 +2572,13 @@ def test_health_exposes_each_environment_window_independently():
                     "sealed_offset_seconds": None,
                     "refusing_precommits": False,
             },
+            "graded_batch_fill_offset_seconds": None,
+            "graded_prefix_fill_offset_seconds": None,
+            "fill_state": None,
+            # v6.1 (R32): zero off the fill-closed path -- an auction
+            # window has no pick pool and therefore nothing to burn.
+            "fill_closed_burned_groups": 0,
+            "fill_closed_burned_eos_tokens": 0,
             "accepted_receipts": 0,
             "revealed": 0,
             "revealed_terminal": 0,
@@ -2569,10 +2724,11 @@ def test_state_endpoint_exposes_checkpoint_when_set():
     batcher = _batcher(window_start=500)
     server.set_active_batcher(batcher)
     server.set_current_state(WindowState.OPEN)
+    revision = "7" * 40
     server.set_current_checkpoint(ManifestEntry(
         checkpoint_n=7,
         repo_id="aivolutionedge/reliquary-sn",
-        revision="rev_sha_007",
+        revision=revision,
         signature="ed25519:sig",
     ))
     client = TestClient(server.app)
@@ -2580,7 +2736,7 @@ def test_state_endpoint_exposes_checkpoint_when_set():
     body = resp.json()
     assert body["checkpoint_n"] == 7
     assert body["checkpoint_repo_id"] == "aivolutionedge/reliquary-sn"
-    assert body["checkpoint_revision"] == "rev_sha_007"
+    assert body["checkpoint_revision"] == revision
 
 
 def test_checkpoint_endpoint_404_when_none_published():
@@ -2593,10 +2749,11 @@ def test_checkpoint_endpoint_404_when_none_published():
 def test_checkpoint_endpoint_returns_manifest_when_set():
     from reliquary.validator.checkpoint import ManifestEntry
     server = ValidatorServer()
+    revision = "a" * 40
     server.set_current_checkpoint(ManifestEntry(
         checkpoint_n=42,
         repo_id="aivolutionedge/reliquary-sn",
-        revision="rev_sha_042",
+        revision=revision,
         signature="ed25519:sig_42",
     ))
     client = TestClient(server.app)
@@ -2605,8 +2762,108 @@ def test_checkpoint_endpoint_returns_manifest_when_set():
     body = resp.json()
     assert body["checkpoint_n"] == 42
     assert body["repo_id"] == "aivolutionedge/reliquary-sn"
-    assert body["revision"] == "rev_sha_042"
+    assert body["revision"] == revision
     assert body["signature"] == "ed25519:sig_42"
+
+
+def test_server_refuses_to_advertise_mutable_checkpoint_revision():
+    from reliquary.validator.checkpoint import ManifestEntry
+
+    server = ValidatorServer()
+    with pytest.raises(ValueError, match="40-character commit OID"):
+        server.set_current_checkpoint(
+            ManifestEntry(
+                checkpoint_n=42,
+                repo_id="aivolutionedge/reliquary-sn",
+                revision="main",
+                signature="ed25519:sig_42",
+            )
+        )
+
+
+@pytest.mark.parametrize("checkpoint_n", [True, 42.0, "42", -1])
+def test_server_refuses_noncanonical_checkpoint_number(checkpoint_n):
+    from reliquary.validator.checkpoint import ManifestEntry
+
+    server = ValidatorServer()
+    with pytest.raises(ValueError, match="non-negative integer"):
+        server.set_current_checkpoint(
+            ManifestEntry(
+                checkpoint_n=checkpoint_n,
+                repo_id="aivolutionedge/reliquary-sn",
+                revision="a" * 40,
+                signature="ed25519:sig",
+            )
+        )
+    assert server._current_checkpoint is None
+
+
+def test_server_rejects_checkpoint_rollback_and_rebinding():
+    from reliquary.validator.checkpoint import ManifestEntry
+
+    server = ValidatorServer()
+    first = ManifestEntry(
+        checkpoint_n=5,
+        repo_id="aivolutionedge/reliquary-sn",
+        revision="a" * 40,
+        signature="ed25519:first",
+    )
+    server.set_current_checkpoint(first)
+
+    with pytest.raises(ValueError, match="roll back"):
+        server.set_current_checkpoint(
+            ManifestEntry(
+                checkpoint_n=4,
+                repo_id="aivolutionedge/reliquary-sn",
+                revision="b" * 40,
+                signature="ed25519:rollback",
+            )
+        )
+    with pytest.raises(ValueError, match="rebind"):
+        server.set_current_checkpoint(
+            ManifestEntry(
+                checkpoint_n=5,
+                repo_id="aivolutionedge/reliquary-sn",
+                revision="b" * 40,
+                signature="ed25519:rebind",
+            )
+        )
+
+    assert server._current_checkpoint is first
+
+
+def test_server_identity_floor_survives_withdrawal():
+    from reliquary.validator.checkpoint import ManifestEntry
+
+    server = ValidatorServer()
+    first = ManifestEntry(
+        checkpoint_n=5,
+        repo_id="aivolutionedge/reliquary-sn",
+        revision="a" * 40,
+        signature="ed25519:first",
+    )
+    server.set_current_checkpoint(first)
+    server.set_current_checkpoint(None)
+
+    with pytest.raises(ValueError, match="roll back"):
+        server.set_current_checkpoint(
+            ManifestEntry(
+                checkpoint_n=4,
+                repo_id="aivolutionedge/reliquary-sn",
+                revision="b" * 40,
+                signature="ed25519:rollback",
+            )
+        )
+    server.set_current_checkpoint(
+        ManifestEntry(
+            checkpoint_n=5,
+            repo_id="aivolutionedge/reliquary-sn",
+            revision="a" * 40,
+            signature="ed25519:replacement-signature",
+        )
+    )
+
+    assert server._current_checkpoint is first
 
 
 # --- provisional response semantics ---

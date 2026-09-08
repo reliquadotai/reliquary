@@ -3,6 +3,8 @@
 from copy import deepcopy
 from types import SimpleNamespace
 
+import pytest
+
 from reliquary.protocol.submission import RejectReason
 
 
@@ -60,6 +62,14 @@ def test_compute_rollout_hash_rejects_negative_tokens():
     from reliquary.validator.dedup import compute_rollout_hash
     with pytest.raises(ValueError):
         compute_rollout_hash([1, -2, 3])
+
+
+@pytest.mark.parametrize("token", [True, 1.0, "1", 2**32])
+def test_compute_rollout_hash_rejects_noncanonical_tokens(token):
+    from reliquary.validator.dedup import compute_rollout_hash
+
+    with pytest.raises(ValueError, match="token id"):
+        compute_rollout_hash([token])
 
 
 def test_logical_group_hash_is_deterministic_and_domain_sized():
@@ -211,6 +221,53 @@ def test_rebuild_from_history_indexes_hash_field():
     assert bytes.fromhex(h_a) in s
     assert bytes.fromhex(h_b) in s
     assert len(s) == 2
+
+
+def test_rebuild_rejects_hash_that_does_not_match_archived_tokens_atomically():
+    from reliquary.validator.dedup import RolloutHashSet, compute_rollout_hash
+
+    s = RolloutHashSet(retention_windows=50)
+    existing = compute_rollout_hash([9, 9, 9])
+    s.add(existing, window=99)
+    wrong = compute_rollout_hash([1, 2, 4]).hex()
+    archives = [
+        {
+            "window_start": 100,
+            "batch": [
+                {
+                    "rollouts": [
+                        {"tokens": [1, 2, 3], "hash": wrong},
+                    ]
+                }
+            ],
+        }
+    ]
+
+    with pytest.raises(ValueError, match="hash does not match tokens"):
+        s.rebuild_from_history(archives, current_window=110)
+
+    assert existing in s
+    assert len(s) == 1
+
+
+@pytest.mark.parametrize("digest", ["A" * 64, "a" * 63, 7, None])
+def test_rebuild_requires_canonical_stored_rollout_digest(digest):
+    from reliquary.validator.dedup import RolloutHashSet
+
+    archives = [
+        {
+            "window_start": 100,
+            "batch": [
+                {"rollouts": [{"tokens": [1, 2, 3], "hash": digest}]}
+            ],
+        }
+    ]
+
+    with pytest.raises(ValueError, match="64 lowercase hex"):
+        RolloutHashSet(retention_windows=50).rebuild_from_history(
+            archives,
+            current_window=110,
+        )
 
 
 def test_rebuild_from_history_recomputes_when_hash_missing():

@@ -6,6 +6,8 @@ and the miner submitter (reliquary/miner/submitter.py) produces them.
 
 from __future__ import annotations
 
+import base64
+import binascii
 from enum import Enum
 from typing import Any, Literal
 
@@ -98,6 +100,7 @@ class RejectReason(str, Enum):
     PRECOMMIT_REQUIRED = "precommit_required"
     PRECOMMIT_INVALID = "precommit_invalid"
     PRECOMMIT_EXPIRED = "precommit_expired"
+    REVEAL_NOT_SELECTED = "reveal_not_selected"
     PROTOCOL_MISMATCH = "protocol_mismatch"
     GENERATION_CONTRACT_MISMATCH = "generation_contract_mismatch"
     PROOF_CAPACITY_ABORT = "proof_capacity_abort"
@@ -123,6 +126,12 @@ class RolloutSubmission(BaseModel):
     # miner-declared span from influencing GRPO loss masking.
     _validated_force_span: tuple[int, int] | None = PrivateAttr(default=None)
     _validated_termination_path: str | None = PrivateAttr(default=None)
+    # Episode v1: derived by validator replay. Wire-declared spans are never
+    # consumed by training until they match replay and are copied here.
+    _validated_assistant_spans: tuple[tuple[int, int], ...] | None = PrivateAttr(
+        default=None
+    )
+    _validated_episode_trace_digest: str | None = PrivateAttr(default=None)
 
     tokens: list[int] = Field(..., min_length=1)
     reward: FiniteFloat  # miner's local reward; validator re-checks it
@@ -254,6 +263,12 @@ class BatchSubmissionRequest(BaseModel):
     # grader worker.  The response remains the wire-compatible nonfatal
     # WORKER_DROPPED reason, but the server must not refund the consumed quota.
     _grader_worker_crashed: bool = PrivateAttr(default=False)
+    # v6 only. The upload precommit's receipt_id, stamped once the body is
+    # matched to it (``ValidatorServer._claim_upload_precommit``). Lets the
+    # arrival-proof path look up the rate the precommit registered with
+    # ``ThroughputAdmissionQueue.rate_of`` -- empty when there was no
+    # precommit (pre-v6 traffic, or the precommit path disabled).
+    _precommit_receipt_id: str = PrivateAttr(default="")
 
     @field_validator("rollouts")
     @classmethod
@@ -281,6 +296,7 @@ class BatchSubmissionResponse(BaseModel):
 
     accepted: bool
     reason: RejectReason
+    _retry_after_seconds: float | None = PrivateAttr(default=None)
 
 
 class SubmissionPrecommitRequest(BaseModel):
@@ -322,6 +338,52 @@ class SubmissionPrecommitResponse(BaseModel):
     upload_deadline_ts: float | None = None
 
 
+
+
+
+
+
+
+
+
+class FillClosedWindowState(BaseModel):
+    """Optional miner-facing progress for the experimental fill window."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    phase: Literal["collecting", "draining", "sealed"]
+    generation_beacon_chain: str | None = Field(default=None, min_length=1)
+    generation_beacon_chain_hash: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    generation_beacon_round: int | None = Field(default=None, ge=1)
+    precommit_cutoff_ts: FiniteFloat
+    precommit_seconds: FiniteFloat = Field(..., gt=0)
+    max_window_seconds: FiniteFloat = Field(..., gt=0)
+    picks_emitted: int = Field(..., ge=0)
+    picks_target: int = Field(..., ge=1)
+    picks_by_environment: dict[str, int]
+    admission_budgets: dict[str, int]
+    admitted: dict[str, int]
+    proven: dict[str, int]
+    in_flight: dict[str, int]
+    remaining: dict[str, int]
+
+    @model_validator(mode="after")
+    def _validate_beacon_provenance(self) -> "FillClosedWindowState":
+        provenance = (
+            self.generation_beacon_chain,
+            self.generation_beacon_chain_hash,
+            self.generation_beacon_round,
+        )
+        if any(value is not None for value in provenance) and any(
+            value is None for value in provenance
+        ):
+            raise ValueError("generation beacon provenance must be complete")
+        return self
+
+
 class GrpoBatchState(BaseModel):
     """Live window state for miners polling ``/state`` (v2.1)."""
 
@@ -332,17 +394,132 @@ class GrpoBatchState(BaseModel):
     anchor_block: int = Field(..., ge=0)
     cooldown_prompts: list[int] = Field(default_factory=list)
     valid_submissions: int = Field(..., ge=0)
-    checkpoint_n: int = Field(..., ge=0)
+    checkpoint_n: int | None = Field(default=None, ge=0, strict=True)
     checkpoint_repo_id: str | None = None
     checkpoint_revision: str | None = None
     protocol_version: int | None = Field(default=None, ge=0)
     generation_profile_id: str | None = Field(default=None, max_length=64)
     generation_contract: dict[str, Any] | None = None
+    # Capability-only progress. It is explicitly excluded from serialized
+    # responses while fill-closed is disabled, preserving legacy state bytes.
+    fill_closed: FillClosedWindowState | None = None
     # v2.3: drand beacon randomness for this window. Empty string between
     # OPEN and the first successful _set_window_randomness; miners loop on
     # empty until populated. Miners derive GRAIL commitments off this
     # value rather than recomputing locally, which guarantees byte-for-byte
     # agreement with the validator's verify path.
+    randomness: str = ""
+
+
+def encode_cooldown_bitmap(
+    prompt_indices: set[int] | frozenset[int] | list[int],
+    prompt_range: tuple[int, int],
+) -> tuple[str, int]:
+    """Encode cooldown membership inside one active prompt slice."""
+    start, end = prompt_range
+    if start < 0 or end < start:
+        raise ValueError("invalid prompt range")
+    span = end - start
+    bitmap = bytearray((span + 7) // 8)
+    count = 0
+    candidates = (
+        (
+            prompt_idx
+            for prompt_idx in range(start, end)
+            if prompt_idx in prompt_indices
+        )
+        if isinstance(prompt_indices, (set, frozenset))
+        and span < len(prompt_indices)
+        else prompt_indices
+    )
+    for prompt_idx in candidates:
+        offset = int(prompt_idx) - start
+        if not 0 <= offset < span:
+            continue
+        byte_n, bit_n = divmod(offset, 8)
+        mask = 1 << bit_n
+        if not bitmap[byte_n] & mask:
+            bitmap[byte_n] |= mask
+            count += 1
+    return base64.b64encode(bitmap).decode("ascii"), count
+
+
+def decode_cooldown_bitmap(
+    encoded: str,
+    prompt_range: tuple[int, int],
+) -> set[int]:
+    """Decode a ``bitset-v1`` cooldown and reject malformed wire data."""
+    start, end = prompt_range
+    if start < 0 or end < start:
+        raise ValueError("invalid prompt range")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("invalid cooldown bitmap base64") from exc
+    expected_bytes = (end - start + 7) // 8
+    if len(raw) != expected_bytes:
+        raise ValueError(
+            f"cooldown bitmap length {len(raw)} != expected {expected_bytes}"
+        )
+    if raw and (end - start) % 8:
+        valid_bits = (1 << ((end - start) % 8)) - 1
+        if raw[-1] & ~valid_bits:
+            raise ValueError("cooldown bitmap has out-of-range bits set")
+    return {
+        start + byte_n * 8 + bit_n
+        for byte_n, value in enumerate(raw)
+        for bit_n in range(8)
+        if value & (1 << bit_n)
+    }
+
+
+class MinerEnvironmentState(BaseModel):
+    """One environment's bounded prompt slice in ``GET /miner-state``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    encoding: Literal["bitset-v1"] = "bitset-v1"
+    prompt_range: tuple[int, int]
+    cooldown_bitmap: str
+    cooldown_count: int = Field(..., ge=0)
+    accepting_submissions: bool
+    admission_remaining: int = Field(..., ge=0)
+
+    @model_validator(mode="after")
+    def _validate_bitmap(self) -> "MinerEnvironmentState":
+        decoded = decode_cooldown_bitmap(
+            self.cooldown_bitmap,
+            self.prompt_range,
+        )
+        if len(decoded) != self.cooldown_count:
+            raise ValueError("cooldown_count does not match cooldown_bitmap")
+        return self
+
+    def cooldown_prompts(self) -> set[int]:
+        return decode_cooldown_bitmap(
+            self.cooldown_bitmap,
+            self.prompt_range,
+        )
+
+
+class MinerState(BaseModel):
+    """Bounded all-environment control-plane state for reference miners."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1] = 1
+    state: WindowState
+    window_n: int = Field(..., ge=0)
+    anchor_block: int = Field(..., ge=0)
+    window_opened_at: float | None = Field(default=None, ge=0)
+    submission_deadline_at: float | None = Field(default=None, ge=0)
+    environments: dict[str, MinerEnvironmentState]
+    checkpoint_n: int | None = Field(default=None, ge=0, strict=True)
+    checkpoint_repo_id: str | None = None
+    checkpoint_revision: str | None = None
+    protocol_version: int | None = Field(default=None, ge=0)
+    generation_profile_id: str | None = Field(default=None, max_length=64)
+    generation_contract: dict[str, Any] | None = None
     randomness: str = ""
 
 
@@ -413,6 +590,24 @@ class VerdictsResponse(BaseModel):
     verdicts: list[Verdict]
 
 
+class SequencedVerdict(Verdict):
+    """A verdict with a monotonic per-hotkey cursor."""
+
+    sequence: int = Field(..., ge=1)
+
+
+class VerdictsPage(BaseModel):
+    """Gap-detectable verdict page used by ``GET /miner-verdicts``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    verdicts: list[SequencedVerdict]
+    next_cursor: int = Field(..., ge=0)
+    oldest_available_cursor: int = Field(..., ge=0)
+    truncated: bool = False
+    stream_id: str = Field(..., pattern=r"^[0-9a-f]{32}$")
+
+
 class ModelInfo(BaseModel):
     """Identifies the model the miner ran."""
 
@@ -450,6 +645,58 @@ class RolloutMetadata(BaseModel):
     # the overlong side of the reward shaping.
     truncated: bool = False
 
+    # Present only for Reliquary Episode v1. Keeping it nested preserves the
+    # historical single-turn metadata fields and outer submission envelope.
+    episode: "EpisodeMetadata | None" = None
+
+
+class EpisodeMetadata(BaseModel):
+    """Structured episode material committed beside a flattened token trace."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["reliquary/episode/v1"]
+    renderer_id: Literal["reliquary-jsonl-tools-v1"]
+    task_id: str = Field(..., min_length=1, max_length=128)
+    seed: int = Field(..., ge=0)
+    actions: list[dict[str, Any]] = Field(..., min_length=1, max_length=64)
+    assistant_spans: list[list[int]] = Field(..., min_length=1, max_length=64)
+    observation_digests: list[str] = Field(default_factory=list, max_length=64)
+    termination_reason: str = Field(..., min_length=1, max_length=64)
+    state_digest: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    trace_digest: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def _spans_and_actions_are_bounded(self):
+        previous = 0
+        for span in self.assistant_spans:
+            if len(span) != 2:
+                raise ValueError("assistant spans must contain [start, end]")
+            start, end = int(span[0]), int(span[1])
+            if start < previous or end <= start:
+                raise ValueError("assistant spans must be sorted and non-empty")
+            previous = end
+        if len(self.actions) != len(self.assistant_spans):
+            raise ValueError("one assistant span is required for every action")
+        if len(self.observation_digests) != len(self.actions):
+            raise ValueError("one observation digest is required for every action")
+        if any(
+            len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for value in self.observation_digests
+        ):
+            raise ValueError("observation digests must be lowercase SHA-256 hex")
+        return self
+
+    @property
+    def assistant_token_count(self) -> int:
+        return sum(int(end) - int(start) for start, end in self.assistant_spans)
+
+
+# Resolve the intentional forward declaration while keeping the historical
+# RolloutMetadata field order and serialized shape unchanged.
+RolloutMetadata.model_rebuild()
+
 
 class CommitModel(BaseModel):
     """The inner ``commit`` dict shipped by the miner inside ``RolloutSubmission``.
@@ -463,7 +710,7 @@ class CommitModel(BaseModel):
 
     tokens: list[int] = Field(..., min_length=CHALLENGE_K)
     commitments: list[dict]
-    proof_version: Literal["v7"]
+    proof_version: Literal["v7", "v8"]
     model: ModelInfo
     signature: str = Field(..., pattern=r"^[0-9a-fA-F]+$")
     beacon: BeaconInfo
@@ -493,6 +740,22 @@ class CommitModel(BaseModel):
                 f"completion_length({v.completion_length}) must equal "
                 f"len(tokens)={len(tokens)}"
             )
+        if v.episode is not None:
+            proof_version = info.data.get("proof_version")
+            if proof_version != "v8":
+                raise ValueError("episode metadata requires GRAIL proof v8")
+            if any(int(end) > len(tokens) for _start, end in v.episode.assistant_spans):
+                raise ValueError("assistant span exceeds token sequence")
+            if len(v.token_logprobs) not in (
+                len(tokens),
+                v.episode.assistant_token_count,
+            ):
+                raise ValueError(
+                    "episode token_logprobs must be full-sequence or assistant-only"
+                )
+            return v
+        if info.data.get("proof_version") != "v7":
+            raise ValueError("single-turn metadata requires GRAIL proof v7")
         # Two layouts are accepted, matching ``verify_logprobs_claim`` in
         # ``validator/verifier.py``:
         #   * full-sequence: len == len(tokens), prompt entries ignored

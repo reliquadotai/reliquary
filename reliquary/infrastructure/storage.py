@@ -27,6 +27,8 @@ from aiobotocore.session import get_session
 
 from botocore.config import Config
 
+from reliquary.shared.strict_json import strict_json_loads
+
 logger = logging.getLogger(__name__)
 
 
@@ -76,28 +78,56 @@ def get_s3_client(
     )
 
 
-async def upload_json(key: str, data: Any, **client_kwargs) -> bool:
-    """Upload JSON data to S3."""
+def _encode_json_payload(key: str, data: Any) -> bytes:
     payload = json.dumps(data, separators=(",", ":")).encode()
     if key.endswith(".gz"):
         payload = gzip.compress(payload)
+    return payload
+
+
+async def upload_json(key: str, data: Any, **client_kwargs) -> bool:
+    """Upload JSON without serializing or compressing on the event loop."""
+    payload = await asyncio.to_thread(_encode_json_payload, key, data)
     async with get_s3_client(**client_kwargs) as client:
         bucket = client_kwargs.get("bucket_name") or os.getenv("R2_BUCKET_ID", "reliquary")
         await client.put_object(Bucket=bucket, Key=key, Body=payload)
     return True
 
 
-async def download_json(key: str, **client_kwargs) -> dict | None:
-    """Download and parse JSON from S3."""
+async def download_json(
+    key: str,
+    *,
+    strict: bool = False,
+    **client_kwargs,
+) -> dict | None:
+    """Download and parse JSON from S3.
+
+    The compatibility default preserves the historic best-effort behavior.
+    Durable protocol state uses ``strict=True`` so only an explicit 404 means
+    "absent"; transport, authentication, and decode failures remain errors.
+    """
+    from botocore.exceptions import ClientError
+
     try:
         async with get_s3_client(**client_kwargs) as client:
             bucket = client_kwargs.get("bucket_name") or os.getenv("R2_BUCKET_ID", "reliquary")
             resp = await client.get_object(Bucket=bucket, Key=key)
             body = await resp["Body"].read()
-            if key.endswith(".gz"):
-                body = gzip.decompress(body)
-            return json.loads(body)
+            def _decode() -> dict:
+                decoded = gzip.decompress(body) if key.endswith(".gz") else body
+                return strict_json_loads(decoded)
+            return await asyncio.to_thread(_decode)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in {"NoSuchKey", "404", "NotFound"}:
+            return None
+        if strict:
+            raise
+        logger.debug("download_json failed for %s: %s", key, exc)
+        return None
     except Exception as e:
+        if strict:
+            raise
         logger.debug("download_json failed for %s: %s", key, e)
         return None
 
@@ -192,6 +222,8 @@ async def upload_window_dataset(
 async def list_recent_datasets(
     current_window: int,
     n: int,
+    *,
+    strict: bool = False,
     **client_kwargs,
 ) -> list[dict]:
     """Download last *n* window archives from the flat R2 prefix in ascending order.
@@ -221,22 +253,37 @@ async def list_recent_datasets(
             try:
                 resp = await client.get_object(Bucket=bucket, Key=key)
                 body = await resp["Body"].read()
-                data = json.loads(gzip.decompress(body))
+                data = strict_json_loads(gzip.decompress(body))
+                if (
+                    not isinstance(data, dict)
+                    or data.get("window_start") != window_start
+                ):
+                    raise ValueError(
+                        f"archive {key} does not bind window {window_start}"
+                    )
                 archives.append(data)
             except ClientError as e:
                 code = e.response.get("Error", {}).get("Code", "")
                 if code in ("NoSuchKey", "404"):
                     logger.debug("skip missing window %d (%s)", window_start, key)
                     continue
+                if strict:
+                    raise
                 logger.warning(
                     "skip window %d: %s (%s)", window_start, code, e,
                 )
             except Exception as e:
+                if strict:
+                    raise
                 logger.warning("skip window %d: parse failed (%s)", window_start, e)
     return archives
 
 
-async def list_all_window_keys(**client_kwargs) -> list[int]:
+async def list_all_window_keys(
+    *,
+    strict: bool = False,
+    **client_kwargs,
+) -> list[int]:
     """Paginate the flat dataset prefix and return all window_n ints present.
 
     Used by validators at startup to derive ``window_n`` without local state.
@@ -259,6 +306,8 @@ async def list_all_window_keys(**client_kwargs) -> list[int]:
                     if m:
                         windows.append(int(m.group(1)))
         except ClientError:
+            if strict:
+                raise
             logger.exception("list_all_window_keys failed")
             return []
     return sorted(windows)

@@ -89,7 +89,7 @@ def test_forced_seed_generate_kwargs_neutralizes_generation_config_processors():
     assert kw["encoder_repetition_penalty"] == 1.0
     assert kw["no_repeat_ngram_size"] == 0
     assert kw["encoder_no_repeat_ngram_size"] == 0
-    assert kw["min_length"] == 0
+    assert kw["min_length"] is None
     assert kw["min_new_tokens"] == 0
     assert kw["suppress_tokens"] is None
     assert kw["begin_suppress_tokens"] is None

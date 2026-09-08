@@ -34,6 +34,7 @@ class TrainerWorker:
         last_published_revision: str | None,
         shadow: bool = False,
         freeze_fn: Callable[[], str | None] | None = None,
+        cursor_writer: Callable[[int], None] | None = None,
     ) -> None:
         self._journal = journal
         self._train_fn = train_fn
@@ -45,11 +46,44 @@ class TrainerWorker:
         self.last_published_revision = last_published_revision
         self.shadow = bool(shadow)
         self._freeze_fn = freeze_fn
+        # Amendment v6.1 (trainer-paced picks): advisory pacing telemetry,
+        # written every time the journal cursor advances -- unconditional
+        # on every profile. The trainer has no notion of FILL_CLOSED and
+        # should not gain one here; on v5 (or with no writer configured)
+        # this is a harmless no-op.
+        self._cursor_writer = cursor_writer
         self.trained_since_publish = 0
         self.adaptive_publication_pending = False
         self.tombstones_seen = 0
         self.quarantined_seen = 0
         self.health_skips = 0
+
+    def _advance_cursor(self) -> None:
+        """The single place the journal cursor moves forward.
+
+        Every advance -- trained payload, tombstone, quarantine skip,
+        health skip -- is a journal key the
+        validator's picker can now count as consumed, whether or not an
+        optimizer step happened on it. Publishing the telemetry cursor
+        here, unconditionally, keeps the pacer from stalling on any of
+        those non-training advances (a tombstoned or quarantined key is
+        never coming back to be trained).
+        """
+        self.cursor += self.stride
+        self._write_cursor(self.cursor)
+
+    def _write_cursor(self, journal_key: int) -> None:
+        if self._cursor_writer is None:
+            return
+        try:
+            self._cursor_writer(journal_key)
+        except Exception:
+            # Advisory only: training must never fail because pacing
+            # telemetry could not be written (R2 hiccup, disk full, ...).
+            logger.warning(
+                "cursor telemetry write failed for journal key %s "
+                "(advisory, ignored)", journal_key, exc_info=True,
+            )
 
     def _publication_due(self) -> bool:
         return (
@@ -99,33 +133,34 @@ class TrainerWorker:
             return "waited"
         kind, value = entry
         if kind == "tombstone":
-            self.cursor += self.stride
+            self._advance_cursor()
             self.tombstones_seen += 1
             logger.warning("window %s tombstoned: %s", self.cursor, value)
             return "tombstone"
-        if bool(value.window_quarantine.get("quarantined")):
-            self.cursor += self.stride
+        window_quarantined = bool(value.window_quarantine.get("quarantined"))
+        if window_quarantined:
             self.quarantined_seen += 1
+        if window_quarantined:
+            self._advance_cursor()
             logger.warning(
-                "window %s quarantined at seal; skipping", self.cursor,
+                "window %s quarantined at seal; skipping",
+                self.cursor,
             )
             return "quarantined"
         try:
             trained = self._train_fn(value)
         except TrainingStepSkipped as exc:
-            self.cursor += self.stride
+            self._advance_cursor()
             self.health_skips += 1
-            if (
-                exc.reason == "policy_ratio_drift"
-                and self.trained_since_publish > 0
-            ):
+            if exc.reason == "policy_ratio_drift" and self.trained_since_publish > 0:
                 self.adaptive_publication_pending = True
             logger.warning(
                 "train step skipped for window %s: %s",
-                self.cursor, exc.reason,
+                self.cursor,
+                exc.reason,
             )
             return "trained"
-        self.cursor += self.stride
+        self._advance_cursor()
         if trained:
             self.trained_since_publish += 1
         return "trained"

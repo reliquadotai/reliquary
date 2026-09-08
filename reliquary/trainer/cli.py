@@ -10,9 +10,41 @@ import asyncio
 import logging
 import os
 from pathlib import Path
+import threading
 import time
+from typing import Mapping
+
+from reliquary.shared.checkpoint_identity import require_checkpoint_number
 
 logger = logging.getLogger(__name__)
+
+
+def _profile_nonnegative_int(
+    profile: Mapping[str, object],
+    key: str,
+    *,
+    default: int | None = None,
+) -> int | None:
+    value = profile.get(key, default)
+    if value is None:
+        return None
+    return require_checkpoint_number(
+        value,
+        field=f"trainer checkpoint profile {key}",
+    )
+
+
+def _environment_positive_int(name: str, default: str) -> int:
+    raw = os.environ.get(name, default)
+    if not isinstance(raw, str):
+        raise ValueError(f"{name} must be configured as a string")
+    try:
+        value = int(raw.strip(), 10)
+    except ValueError as exc:
+        raise ValueError(f"{name} must contain a base-10 integer") from exc
+    if value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
 
 
 def _r2_client():
@@ -71,6 +103,39 @@ def _hf_download(repo_id: str, revision: str) -> str:
     return snapshot_download(repo_id=repo_id, revision=revision)
 
 
+def _build_cursor_queue(state_dir: Path):
+    """The trainer-host queue instance for the v6.1 per-step pacing
+    cursor (Amendment v6.1 -- trainer-paced picks).
+
+    Scoped under ``state_dir`` (``RELIQUARY_TRAINER_STATE_DIR``) in a
+    subdirectory distinct from the validator's own ``TrainingPayloadQueue``
+    default (``pending_training_payloads``, rooted at
+    ``RELIQUARY_STATE_DIR``) so the two never glob each other's files even
+    if both processes ever ran on the same host. It rides the same
+    drain/upload transport as payloads and tombstones
+    (``training_payload_queue.step_cursor_key``); the caller is
+    responsible for actually draining it (see ``_drain_cursor_queue_forever``)
+    or the local ``step-cursor.json`` never reaches R2.
+    """
+    from reliquary.infrastructure.training_payload_queue import (
+        TrainingPayloadQueue,
+    )
+
+    return TrainingPayloadQueue(queue_dir=str(state_dir / "cursor_queue"))
+
+
+def _drain_cursor_queue_forever(queue) -> None:
+    """Background-thread entry point that uploads the cursor to R2.
+
+    ``run_train_worker`` is a plain synchronous poll loop with no
+    persistent asyncio event loop of its own (unlike the validator's
+    asyncio service, which schedules ``run_forever`` as a task on its
+    already-running loop) -- so this runs on an isolated daemon thread
+    with its own loop instead.
+    """
+    asyncio.run(queue.run_forever())
+
+
 def run_train_worker(*, shadow: bool = False) -> None:
     import torch
 
@@ -86,7 +151,11 @@ def run_train_worker(*, shadow: bool = False) -> None:
         load_text_generation_model,
         load_tokenizer,
     )
-    from reliquary.trainer.journal import WindowJournal, r2_fetch_fn
+    from reliquary.trainer.journal import (
+        WindowJournal,
+        migrate_journal_cursor,
+        r2_fetch_fn,
+    )
     from reliquary.trainer.publisher import TrainerPublisher
     from reliquary.trainer.resume import resolve_resume_point
     from reliquary.trainer.train_runner import TrainRunner
@@ -108,7 +177,9 @@ def run_train_worker(*, shadow: bool = False) -> None:
     fetch = r2_fetch_fn(client, bucket)
 
     expected_identity = (
-        active_training_identity() if PROTOCOL_VERSION >= 5 else None
+        {**active_training_identity(), "repo_id": repo_id}
+        if PROTOCOL_VERSION >= 5
+        else {"repo_id": repo_id}
     )
     revision, cursor, checkpoint_n = resolve_resume_point(
         fetch,
@@ -133,9 +204,34 @@ def run_train_worker(*, shadow: bool = False) -> None:
         profile = validate_checkpoint_profile(snapshot_dir, required=True)
         # The PROFILE is authoritative for run state; the manifest cursor
         # was only a hint for which snapshot to fetch.
-        cursor = int(profile.get("trained_window_cursor", cursor))
-        raw_step = profile.get("lr_schedule_step")
-        lr_schedule_step = int(raw_step) if raw_step is not None else None
+        profile_cursor = _profile_nonnegative_int(
+            profile,
+            "trained_window_cursor",
+            default=cursor,
+        )
+        if profile_cursor is None:
+            raise ValueError("trainer checkpoint profile cursor is missing")
+        cursor = profile_cursor
+        # C3/R25: a checkpoint published before the v6 cutover carries a
+        # cursor in RAW window space; this journal reads the encoded space
+        # (window * FILL_CLOSED_EMISSIONS_PER_WINDOW + batch). Migrate here,
+        # exactly once, detected by the marker the publisher stamps beside
+        # the cursor -- never as a manual runbook step. The next publish
+        # writes the migrated marker, so a later resume is a no-op.
+        migrated, key_space = migrate_journal_cursor(
+            cursor, profile.get("journal_key_space"),
+        )
+        if migrated != cursor:
+            logger.warning(
+                "journal key space changed (%s -> %s): cursor %d -> %d",
+                profile.get("journal_key_space") or "raw",
+                key_space, cursor, migrated,
+            )
+        cursor = migrated
+        lr_schedule_step = _profile_nonnegative_int(
+            profile,
+            "lr_schedule_step",
+        )
         model_path = str(snapshot_dir)
         load_kwargs = {}
         tokenizer = load_tokenizer(model_path)
@@ -185,6 +281,7 @@ def run_train_worker(*, shadow: bool = False) -> None:
         tokenizer=tokenizer,
         r2_client=client,
         bucket=bucket,
+        checkpoint_number_floor=checkpoint_n,
     )
 
     publish_state = {"checkpoint_n": checkpoint_n}
@@ -246,6 +343,16 @@ def run_train_worker(*, shadow: bool = False) -> None:
             return "training_checkpoint_ceiling"
         return None
 
+    # v6.1 (Amendment: trainer-paced picks) — advisory telemetry only,
+    # wired unconditionally on every profile (see TrainerWorker docs).
+    cursor_queue = _build_cursor_queue(state_dir)
+    threading.Thread(
+        target=_drain_cursor_queue_forever,
+        args=(cursor_queue,),
+        daemon=True,
+        name="trainer-cursor-queue-drain",
+    ).start()
+
     worker = TrainerWorker(
         journal=WindowJournal(
             fetch_fn=fetch,
@@ -255,11 +362,15 @@ def run_train_worker(*, shadow: bool = False) -> None:
         publish_fn=publish_fn,
         head_revision_fn=head_revision_fn,
         cursor=cursor,
-        stride=int(os.environ.get("RELIQUARY_TRAINER_WINDOW_STRIDE", "1")),
+        stride=_environment_positive_int(
+            "RELIQUARY_TRAINER_WINDOW_STRIDE",
+            "1",
+        ),
         publish_every=CHECKPOINT_PUBLISH_INTERVAL_WINDOWS,
         last_published_revision=last_revision,
         shadow=shadow,
         freeze_fn=freeze_fn,
+        cursor_writer=cursor_queue.write_step_cursor,
     )
 
     logger.info(

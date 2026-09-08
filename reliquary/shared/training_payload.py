@@ -18,10 +18,23 @@ from typing import Any
 
 import numpy as np
 
-PAYLOAD_SCHEMA_VERSION = 2
+from reliquary.shared.strict_json import strict_json_loads
+
+PAYLOAD_SCHEMA_VERSION = 4
+EPISODE_PAYLOAD_SCHEMA_VERSION = PAYLOAD_SCHEMA_VERSION
+LEGACY_PAYLOAD_SCHEMA_VERSION = 2
 TOMBSTONE_SCHEMA_VERSION = 2
-_SUPPORTED_PAYLOAD_SCHEMA_VERSIONS = {1, PAYLOAD_SCHEMA_VERSION}
-_SUPPORTED_TOMBSTONE_SCHEMA_VERSIONS = {1, TOMBSTONE_SCHEMA_VERSION}
+# Schemas 3 and 5 only ever carried the retired checkpoint-epoch binding, and
+# that regime never ran outside tests -- no archive holds one.
+_SUPPORTED_PAYLOAD_SCHEMA_VERSIONS = {
+    1,
+    PAYLOAD_SCHEMA_VERSION,
+    LEGACY_PAYLOAD_SCHEMA_VERSION,
+}
+_SUPPORTED_TOMBSTONE_SCHEMA_VERSIONS = {
+    1,
+    TOMBSTONE_SCHEMA_VERSION,
+}
 _TRAINING_IDENTITY_KEYS = (
     "protocol_profile_id",
     "protocol_version",
@@ -32,6 +45,16 @@ _TRAINING_IDENTITY_KEYS = (
 
 class TrainingPayloadProtocolMismatch(RuntimeError):
     """A detached-training artifact belongs to another protocol/run."""
+
+
+def _nonnegative_int(value: object, *, field: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
+    return value
+
+
+
+
 
 
 def active_training_identity() -> dict[str, Any]:
@@ -123,6 +146,7 @@ def encode_training_payload(
     window_start: int,
     checkpoint_revision: str,
     env_order: list[str],
+    env_targets: dict[str, int] | None = None,
     window_quarantine: dict,
 ) -> bytes:
     groups_meta: list[dict[str, Any]] = []
@@ -131,6 +155,7 @@ def encode_training_payload(
     # force span and termination path drive loss masking (PR #167) and
     # must survive the hop as the private attrs training reads.
     validated_spans: list[list[int] | None] = []
+    assistant_spans: list[list[list[int]] | None] = []
     termination_paths: list[str | None] = []
     rewards: list[float] = []
     env_names: list[str] = []
@@ -159,6 +184,19 @@ def encode_training_payload(
                 validated_spans.append(
                     [int(span[0]), int(span[1])] if span else None
                 )
+                episode_spans = getattr(
+                    rollout, "_validated_assistant_spans", None
+                )
+                assistant_spans.append(
+                    (
+                        [
+                            [int(item[0]), int(item[1])]
+                            for item in episode_spans
+                        ]
+                        if episode_spans is not None
+                        else None
+                    )
+                )
                 term = getattr(rollout, "_validated_termination_path", None)
                 termination_paths.append(str(term) if term else None)
                 rewards.append(float(getattr(rollout, "reward", 0.0)))
@@ -167,7 +205,12 @@ def encode_training_payload(
                 tokens_off.append(len(tokens_flat))
                 miner_lp_flat.extend(float(v) for v in miner_lp)
                 miner_lp_off.append(len(miner_lp_flat))
-                pi_old = _pi_old_for_encode(rollout, completion_length)
+                policy_length = (
+                    sum(end - start for start, end in episode_spans)
+                    if episode_spans is not None
+                    else completion_length
+                )
+                pi_old = _pi_old_for_encode(rollout, policy_length)
                 if pi_old is None:
                     has_pi_old.append(False)
                 else:
@@ -175,10 +218,19 @@ def encode_training_payload(
                     pi_old_flat.extend(pi_old)
                 pi_old_off.append(len(pi_old_flat))
 
+    extended = env_targets is not None or any(item is not None for item in assistant_spans)
+    artifact_schema = (
+        EPISODE_PAYLOAD_SCHEMA_VERSION
+        if extended
+        else LEGACY_PAYLOAD_SCHEMA_VERSION
+    )
+    protocol_header = _artifact_protocol_header(
+        latest_schema_version=artifact_schema,
+    )
+    if any(item is not None for item in assistant_spans) and protocol_header["schema_version"] != EPISODE_PAYLOAD_SCHEMA_VERSION:
+        raise ValueError("episode payload requires protocol v5+ and schema 4")
     header = {
-        **_artifact_protocol_header(
-            latest_schema_version=PAYLOAD_SCHEMA_VERSION,
-        ),
+        **protocol_header,
         "window_start": int(window_start),
         "checkpoint_revision": str(checkpoint_revision),
         "env_order": list(env_order),
@@ -188,12 +240,27 @@ def encode_training_payload(
         "validated_spans": validated_spans,
         "termination_paths": termination_paths,
     }
+    if protocol_header["schema_version"] == EPISODE_PAYLOAD_SCHEMA_VERSION:
+        header["assistant_spans"] = assistant_spans
+        resolved_targets = dict(env_targets or {})
+        if not env_order or len(set(env_order)) != len(env_order):
+            raise ValueError(
+                "schema-v2 training payload env_order must be non-empty and unique"
+            )
+        if set(resolved_targets) != set(env_order):
+            raise ValueError(
+                "schema-v2 training payload targets must match env_order"
+            )
+        if any(type(value) is not int or value <= 0 for value in resolved_targets.values()):
+            raise ValueError("training payload targets must be positive")
+        header["env_targets"] = {
+            environment: int(resolved_targets[environment])
+            for environment in env_order
+        }
     buf = io.BytesIO()
     np.savez_compressed(
         buf,
-        header=np.frombuffer(
-            json.dumps(header).encode("utf-8"), dtype=np.uint8
-        ),
+        header=np.frombuffer(json.dumps(header).encode("utf-8"), dtype=np.uint8),
         rewards=np.asarray(rewards, dtype=np.float32),
         env_names=np.asarray(env_names, dtype=np.str_),
         tokens_flat=np.asarray(tokens_flat, dtype=np.int32),
@@ -209,23 +276,52 @@ def encode_training_payload(
 
 class DecodedPayload:
     def __init__(self, arrays: dict[str, np.ndarray]) -> None:
-        header = json.loads(bytes(arrays["header"]).decode("utf-8"))
-        if header["schema_version"] not in _SUPPORTED_PAYLOAD_SCHEMA_VERSIONS:
-            raise ValueError(
-                f"unsupported payload schema {header['schema_version']}"
-            )
-        self.schema_version = header["schema_version"]
+        header = strict_json_loads(bytes(arrays["header"]))
+        if not isinstance(header, dict):
+            raise ValueError("training payload header must be an object")
+        schema_version = header.get("schema_version")
+        if (
+            type(schema_version) is not int
+            or schema_version not in _SUPPORTED_PAYLOAD_SCHEMA_VERSIONS
+        ):
+            raise ValueError(f"unsupported payload schema {schema_version}")
+        self.schema_version = schema_version
         self.training_identity = {
-            key: header.get(key)
-            for key in _TRAINING_IDENTITY_KEYS
+            key: header.get(key) for key in _TRAINING_IDENTITY_KEYS
         }
-        self.window_start = int(header["window_start"])
-        self.checkpoint_revision = str(header["checkpoint_revision"])
+        self.window_start = _nonnegative_int(
+            header.get("window_start"),
+            field="training payload window",
+        )
+        checkpoint_revision = header.get("checkpoint_revision")
+        if (
+            not isinstance(checkpoint_revision, str)
+            or not checkpoint_revision
+            or checkpoint_revision.strip() != checkpoint_revision
+        ):
+            raise ValueError(
+                "training payload checkpoint revision must be canonical text"
+            )
+        self.checkpoint_revision = checkpoint_revision
         self.env_order = list(header["env_order"])
+        has_episode_metadata = "assistant_spans" in header
+        if header.get("checkpoint_epoch") is not None:
+            raise ValueError("payload carries a retired checkpoint epoch binding")
+        requires_targets = self.schema_version >= EPISODE_PAYLOAD_SCHEMA_VERSION or (self.schema_version == 3 and has_episode_metadata)
+        self.env_targets = dict(header.get("env_targets") or {})
+        if requires_targets or self.env_targets:
+            if (
+                not self.env_order or len(set(self.env_order)) != len(self.env_order)
+                or set(self.env_targets) != set(self.env_order)
+            ):
+                raise ValueError("training payload targets must match unique env_order")
+            if any(type(target) is not int or target <= 0 for target in self.env_targets.values()):
+                raise ValueError("training payload targets must be positive integers")
         self.window_quarantine = dict(header["window_quarantine"])
         self._groups_meta = header["groups"]
         self._rollout_meta = header["rollout_meta"]
         self._validated_spans = header.get("validated_spans") or []
+        self._assistant_spans = header.get("assistant_spans") or []
         self._termination_paths = header.get("termination_paths") or []
         self._arrays = arrays
 
@@ -262,6 +358,14 @@ class DecodedPayload:
                         rollout._validated_force_span = (
                             int(span[0]), int(span[1]),
                         )
+                if i < len(self._assistant_spans):
+                    spans = self._assistant_spans[i]
+                    if spans is not None:
+                        rollout._validated_assistant_spans = tuple(
+                            (int(span[0]), int(span[1]))
+                            for span in spans
+                        )
+                if i < len(self._termination_paths):
                     term = self._termination_paths[i]
                     if term:
                         rollout._validated_termination_path = str(term)
@@ -280,20 +384,37 @@ def decode_training_payload(data: bytes) -> DecodedPayload:
 
 
 def encode_tombstone(
-    *, window_start: int, failure_stage: str, failure_type: str
+    *,
+    window_start: int,
+    failure_stage: str,
+    failure_type: str,
 ) -> bytes:
-    return json.dumps({
-        **_artifact_protocol_header(
-            latest_schema_version=TOMBSTONE_SCHEMA_VERSION,
-        ),
+    protocol_header = _artifact_protocol_header(
+        latest_schema_version=TOMBSTONE_SCHEMA_VERSION,
+    )
+    doc = {
+        **protocol_header,
         "window_start": int(window_start),
         "failure_stage": str(failure_stage),
         "failure_type": str(failure_type),
-    }).encode("utf-8")
+    }
+    return json.dumps(doc).encode("utf-8")
 
 
 def decode_tombstone(data: bytes) -> dict[str, Any]:
-    doc = json.loads(data.decode("utf-8"))
-    if doc.get("schema_version") not in _SUPPORTED_TOMBSTONE_SCHEMA_VERSIONS:
+    doc = strict_json_loads(data)
+    if not isinstance(doc, dict):
+        raise ValueError("training tombstone must be an object")
+    schema_version = doc.get("schema_version")
+    if (
+        type(schema_version) is not int
+        or schema_version not in _SUPPORTED_TOMBSTONE_SCHEMA_VERSIONS
+    ):
         raise ValueError("unsupported tombstone schema")
+    _nonnegative_int(
+        doc.get("window_start"),
+        field="training tombstone window",
+    )
+    if doc.get("checkpoint_epoch") is not None:
+        raise ValueError("tombstone carries a retired checkpoint epoch binding")
     return doc

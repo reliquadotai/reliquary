@@ -24,6 +24,10 @@ from reliquary.protocol.submission import (
 )
 
 
+REV_A = "a" * 40
+REV_B = "b" * 40
+
+
 def _always_true_proof(commit, model, randomness):
     import torch
     from reliquary.validator.verifier import ProofResult
@@ -109,7 +113,7 @@ def _request(*, hotkey, prompt_idx, window_start, checkpoint_hash, seed=0):
     )
 
 
-def _make_service(checkpoint_hash="sha256:cp"):
+def _make_service(checkpoint_hash=REV_A):
     """Construct a ValidationService with a mocked checkpoint store (no HF) +
     training stub.
 
@@ -138,7 +142,7 @@ def _make_service(checkpoint_hash="sha256:cp"):
     svc._checkpoint_store.publish = AsyncMock(side_effect=lambda checkpoint_n, model, profile_extra=None: ManifestEntry(
         checkpoint_n=checkpoint_n,
         repo_id="aivolutionedge/reliquary-sn",
-        revision=f"rev_sha_{checkpoint_n:03d}",
+        revision=f"{checkpoint_n:040x}",
         signature=f"ed25519:sig{checkpoint_n}",
     ))
 
@@ -165,6 +169,9 @@ def _patch_open_grpo_window(svc):
         bootstrap=False,
         queue_drained_predicate=None,
         operator_by_hotkey=None,
+        proof_scheduler=None,
+        verify_commitment_proofs_fn=None,
+        batch_target=B_BATCH,
     ):
         b = GrpoWindowBatcher(
             window_start=window_start,
@@ -187,6 +194,7 @@ def _patch_open_grpo_window(svc):
             # Integration tests don't drive wall clock; disable the drand
             # timing gate so submissions with drand_round=0 still accept.
             drand_round_check_enabled=False,
+            batch_target=max(1, batch_target),
         )
         # Match the per-window randomness used in ``_make_commit`` so the
         # WRONG_RANDOMNESS check from PR #23 accepts the test requests.
@@ -321,6 +329,9 @@ async def test_open_window_passes_verify_model_to_batcher(monkeypatch):
         bootstrap=False,
         queue_drained_predicate=None,
         operator_by_hotkey=None,
+        proof_scheduler=None,
+        verify_commitment_proofs_fn=None,
+        batch_target=B_BATCH,
     ):
         captured["model"] = model
         # Return a minimal batcher stub so the rest of _open_window doesn't crash
@@ -336,6 +347,7 @@ async def test_open_window_passes_verify_model_to_batcher(monkeypatch):
             verify_signature_fn=lambda c, h: True,
             completion_text_fn=lambda r: "",
             drand_round_check_enabled=False,
+            batch_target=max(1, batch_target),
         )
 
     with patch.object(svc_mod, "open_grpo_window", side_effect=_capture_open):
@@ -449,20 +461,20 @@ async def test_submission_with_matching_hash_accepted_during_open():
     """Inject an 8-submission batch into an OPEN batcher; all are admitted to the
     pending pool. The window is time-boxed now (v2), so reaching B distinct
     prompts does NOT seal — only the collection deadline does."""
-    svc = _make_service(checkpoint_hash="sha256:cpA")
+    svc = _make_service(checkpoint_hash=REV_A)
 
     # Open a window (hash wired to current_manifest by _open_window)
     with _patch_open_grpo_window(svc):
         svc._open_window()
     batcher = svc._active_batcher
-    assert batcher.current_checkpoint_hash == "sha256:cpA"
+    assert batcher.current_checkpoint_hash == REV_A
 
     # Feed B distinct submissions (k=4 → in zone); unique seed per miner.
     for i in range(B_BATCH):
         req = _request(
             hotkey=f"hk{i}", prompt_idx=i,
             window_start=batcher.window_start,
-            checkpoint_hash="sha256:cpA", seed=i,
+            checkpoint_hash=REV_A, seed=i,
         )
         resp = batcher.accept_submission(req)
         assert resp.accepted, f"unexpected reject for hk{i}: {resp.reason}"
@@ -476,7 +488,7 @@ async def test_submission_with_matching_hash_accepted_during_open():
 
 @pytest.mark.asyncio
 async def test_submission_with_wrong_hash_rejected():
-    svc = _make_service(checkpoint_hash="sha256:cpA")
+    svc = _make_service(checkpoint_hash=REV_A)
     with _patch_open_grpo_window(svc):
         svc._open_window()
     svc._activate_window()
@@ -495,7 +507,7 @@ async def test_submission_with_wrong_hash_rejected():
 @pytest.mark.asyncio
 async def test_timeout_partial_seal_accumulates_without_publishing():
     """A partial seal is retained but cannot train until its target is full."""
-    svc = _make_service(checkpoint_hash="sha256:cpA")
+    svc = _make_service(checkpoint_hash=REV_A)
     with _patch_open_grpo_window(svc):
         svc._open_window()
     batcher = svc._active_batcher
@@ -506,7 +518,7 @@ async def test_timeout_partial_seal_accumulates_without_publishing():
         req = _request(
             hotkey=f"hk{i}", prompt_idx=i,
             window_start=batcher.window_start,
-            checkpoint_hash="sha256:cpA", seed=i,
+            checkpoint_hash=REV_A, seed=i,
         )
         batcher.accept_submission(req)
 
@@ -526,7 +538,7 @@ async def test_timeout_partial_seal_accumulates_without_publishing():
 @pytest.mark.asyncio
 async def test_sparse_windows_train_once_accumulated_target_is_full():
     """Checkpoint-consistent partial windows combine into one full step."""
-    svc = _make_service(checkpoint_hash="sha256:cpA")
+    svc = _make_service(checkpoint_hash=REV_A)
 
     for start, count in ((0, 3), (3, B_BATCH - 3)):
         with _patch_open_grpo_window(svc):
@@ -537,7 +549,7 @@ async def test_sparse_windows_train_once_accumulated_target_is_full():
             req = _request(
                 hotkey=f"hk{i}", prompt_idx=i,
                 window_start=batcher.window_start,
-                checkpoint_hash="sha256:cpA", seed=i,
+                checkpoint_hash=REV_A, seed=i,
             )
             resp = batcher.accept_submission(req)
             assert resp.accepted, resp.reason
@@ -554,7 +566,7 @@ async def test_sparse_windows_train_once_accumulated_target_is_full():
 async def test_checkpoint_rollover_discards_partial_accumulation():
     from reliquary.validator.checkpoint import ManifestEntry
 
-    svc = _make_service(checkpoint_hash="sha256:cpA")
+    svc = _make_service(checkpoint_hash=REV_A)
     with _patch_open_grpo_window(svc):
         svc._open_window()
     svc._activate_window()
@@ -562,7 +574,7 @@ async def test_checkpoint_rollover_discards_partial_accumulation():
         response = svc._active_batcher.accept_submission(_request(
             hotkey=f"hk-a-{i}", prompt_idx=i,
             window_start=svc._active_batcher.window_start,
-            checkpoint_hash="sha256:cpA", seed=i,
+            checkpoint_hash=REV_A, seed=i,
         ))
         assert response.accepted
     await svc._train_and_publish()
@@ -573,7 +585,7 @@ async def test_checkpoint_rollover_discards_partial_accumulation():
     svc._checkpoint_store.current_manifest.return_value = ManifestEntry(
         checkpoint_n=1,
         repo_id="aivolutionedge/reliquary-sn",
-        revision="sha256:cpB",
+        revision=REV_B,
         signature="ed25519:sig1",
     )
     with _patch_open_grpo_window(svc):
@@ -583,13 +595,13 @@ async def test_checkpoint_rollover_discards_partial_accumulation():
         response = svc._active_batcher.accept_submission(_request(
             hotkey=f"hk-b-{i}", prompt_idx=i,
             window_start=svc._active_batcher.window_start,
-            checkpoint_hash="sha256:cpB", seed=i,
+            checkpoint_hash=REV_B, seed=i,
         ))
         assert response.accepted
     await svc._train_and_publish()
 
     snapshot = svc._training_accumulator.snapshot()
-    assert snapshot["checkpoint_revision"] == "sha256:cpB"
+    assert snapshot["checkpoint_revision"] == REV_B
     assert snapshot["counts"] == {"openmathinstruct": 2}
     assert snapshot["source_windows"] == {"openmathinstruct": [2]}
     svc._checkpoint_store.publish.assert_not_awaited()
@@ -599,7 +611,7 @@ async def test_checkpoint_rollover_discards_partial_accumulation():
 async def test_quarantined_partial_window_is_not_accumulated():
     from reliquary.validator.quarantine import TrainingQuarantineDecision
 
-    svc = _make_service(checkpoint_hash="sha256:cpA")
+    svc = _make_service(checkpoint_hash=REV_A)
     with _patch_open_grpo_window(svc):
         svc._open_window()
     svc._activate_window()
@@ -607,7 +619,7 @@ async def test_quarantined_partial_window_is_not_accumulated():
         response = svc._active_batcher.accept_submission(_request(
             hotkey=f"hk{i}", prompt_idx=i,
             window_start=svc._active_batcher.window_start,
-            checkpoint_hash="sha256:cpA", seed=i,
+            checkpoint_hash=REV_A, seed=i,
         ))
         assert response.accepted
 
@@ -630,7 +642,7 @@ async def test_quarantined_partial_window_is_not_accumulated():
 
 @pytest.mark.asyncio
 async def test_disable_train_retains_ready_batch_until_reenabled(monkeypatch):
-    svc = _make_service(checkpoint_hash="sha256:cpA")
+    svc = _make_service(checkpoint_hash=REV_A)
     monkeypatch.setenv("RELIQUARY_DISABLE_TRAIN", "1")
 
     with _patch_open_grpo_window(svc):
@@ -640,7 +652,7 @@ async def test_disable_train_retains_ready_batch_until_reenabled(monkeypatch):
         response = svc._active_batcher.accept_submission(_request(
             hotkey=f"hk{i}", prompt_idx=i,
             window_start=svc._active_batcher.window_start,
-            checkpoint_hash="sha256:cpA", seed=i,
+            checkpoint_hash=REV_A, seed=i,
         ))
         assert response.accepted
     await svc._train_and_publish()
@@ -667,7 +679,7 @@ async def test_disable_train_retains_ready_batch_until_reenabled(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_checkpoint_ceiling_pauses_persistently_until_raised(monkeypatch):
-    svc = _make_service(checkpoint_hash="sha256:cpA")
+    svc = _make_service(checkpoint_hash=REV_A)
     svc._checkpoint_n = 35
     monkeypatch.setattr(
         "reliquary.validator.service.TRAIN_UNTIL_CHECKPOINT_N", 35
@@ -680,7 +692,7 @@ async def test_checkpoint_ceiling_pauses_persistently_until_raised(monkeypatch):
         response = svc._active_batcher.accept_submission(_request(
             hotkey=f"hk{i}", prompt_idx=i,
             window_start=svc._active_batcher.window_start,
-            checkpoint_hash="sha256:cpA", seed=i,
+            checkpoint_hash=REV_A, seed=i,
         ))
         assert response.accepted
     await svc._train_and_publish()
@@ -707,11 +719,11 @@ async def test_checkpoint_ceiling_pauses_persistently_until_raised(monkeypatch):
 async def test_failed_publish_retries_without_an_extra_optimizer_step():
     from reliquary.validator.checkpoint import ManifestEntry
 
-    svc = _make_service(checkpoint_hash="sha256:cpA")
+    svc = _make_service(checkpoint_hash=REV_A)
     published = ManifestEntry(
         checkpoint_n=1,
         repo_id="aivolutionedge/reliquary-sn",
-        revision="sha256:cpB",
+        revision=REV_B,
         signature="ed25519:sig1",
     )
     svc._checkpoint_store.publish = AsyncMock(
@@ -731,7 +743,7 @@ async def test_failed_publish_retries_without_an_extra_optimizer_step():
                     hotkey=f"hk-{window}-{i}",
                     prompt_idx=window * B_BATCH + i,
                     window_start=svc._active_batcher.window_start,
-                    checkpoint_hash="sha256:cpA",
+                    checkpoint_hash=REV_A,
                     seed=window * B_BATCH + i,
                 ))
                 assert response.accepted
@@ -756,7 +768,7 @@ async def test_failed_publish_retries_without_an_extra_optimizer_step():
 async def test_policy_ratio_drift_publishes_prior_safe_updates():
     from reliquary.validator.training import TrainingStepSkipped
 
-    svc = _make_service(checkpoint_hash="sha256:cpA")
+    svc = _make_service(checkpoint_hash=REV_A)
     svc._publish_every = 10
     svc._trained_windows_since_publish = 3
 
@@ -768,7 +780,7 @@ async def test_policy_ratio_drift_publishes_prior_safe_updates():
             hotkey=f"hk{i}",
             prompt_idx=i,
             window_start=svc._active_batcher.window_start,
-            checkpoint_hash="sha256:cpA",
+            checkpoint_hash=REV_A,
             seed=i,
         ))
         assert response.accepted
@@ -803,7 +815,7 @@ async def test_policy_ratio_drift_publishes_prior_safe_updates():
 async def test_non_ratio_health_gate_does_not_force_publish(reason):
     from reliquary.validator.training import TrainingStepSkipped
 
-    svc = _make_service(checkpoint_hash="sha256:cpA")
+    svc = _make_service(checkpoint_hash=REV_A)
     svc._publish_every = 10
     svc._trained_windows_since_publish = 3
 
@@ -815,7 +827,7 @@ async def test_non_ratio_health_gate_does_not_force_publish(reason):
             hotkey=f"hk{i}",
             prompt_idx=i,
             window_start=svc._active_batcher.window_start,
-            checkpoint_hash="sha256:cpA",
+            checkpoint_hash=REV_A,
             seed=i,
         ))
         assert response.accepted
@@ -839,13 +851,13 @@ async def test_adaptive_publish_failure_retries_without_another_train_step():
     from reliquary.validator.checkpoint import ManifestEntry
     from reliquary.validator.training import TrainingStepSkipped
 
-    svc = _make_service(checkpoint_hash="sha256:cpA")
+    svc = _make_service(checkpoint_hash=REV_A)
     svc._publish_every = 10
     svc._trained_windows_since_publish = 3
     published = ManifestEntry(
         checkpoint_n=1,
         repo_id="aivolutionedge/reliquary-sn",
-        revision="sha256:cpB",
+        revision=REV_B,
         signature="ed25519:sig1",
     )
     svc._checkpoint_store.publish = AsyncMock(
@@ -870,7 +882,7 @@ async def test_adaptive_publish_failure_retries_without_another_train_step():
                     hotkey=f"hk-{window}-{i}",
                     prompt_idx=window * B_BATCH + i,
                     window_start=svc._active_batcher.window_start,
-                    checkpoint_hash="sha256:cpA",
+                    checkpoint_hash=REV_A,
                     seed=window * B_BATCH + i,
                 ))
                 assert response.accepted
@@ -913,6 +925,8 @@ async def test_seal_drain_waits_for_inflight_proofs():
         window_start, env, model, *, cooldown_map, content_cooldown_map,
         hash_set, tokenizer, bootstrap=False, queue_drained_predicate=None,
         operator_by_hotkey=None,
+        proof_scheduler=None, verify_commitment_proofs_fn=None,
+        batch_target=B_BATCH,
     ):
         captured["pred"] = queue_drained_predicate
         return GrpoWindowBatcher(
@@ -926,6 +940,7 @@ async def test_seal_drain_waits_for_inflight_proofs():
             verify_signature_fn=lambda c, h: True,
             completion_text_fn=lambda r: "",
             drand_round_check_enabled=False,
+            batch_target=max(1, batch_target),
         )
 
     with patch.object(svc_mod, "open_grpo_window", side_effect=_capture_open):

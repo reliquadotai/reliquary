@@ -5,10 +5,9 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
-from typing import Any
 
 import pytest
+import torch
 
 from reliquary.constants import (
     B_BATCH,
@@ -17,18 +16,26 @@ from reliquary.constants import (
     MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW,
     MAX_SUBMISSIONS_PER_PROMPT,
     M_ROLLOUTS,
+    PROTOCOL_PROFILE_ID,
+    PROTOCOL_VERSION,
 )
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     RejectReason,
     RolloutSubmission,
 )
-from reliquary.validator.batcher import GrpoWindowBatcher
+from reliquary.validator import batcher as batcher_mod
+from reliquary.validator.batcher import (
+    GrpoWindowBatcher,
+    RejectedSubmission,
+    ValidSubmission,
+)
 from reliquary.validator.observability import SubmitTelemetry
 from reliquary.validator.proof_scheduler import (
     GlobalProofScheduler,
     ProofExecution,
 )
+from reliquary.validator.verifier import ProofResult
 
 
 class FakeEnv:
@@ -49,14 +56,10 @@ class PrivateRewardFakeEnv(FakeEnv):
 
 
 def _always_true_grail(commit, model, randomness):
-    import torch
-    from reliquary.validator.verifier import ProofResult
     return ProofResult(all_passed=True, passed=1, checked=1, logits=torch.empty(0))
 
 
 def _always_false_grail(commit, model, randomness):
-    import torch
-    from reliquary.validator.verifier import ProofResult
     return ProofResult(all_passed=False, passed=0, checked=1, logits=torch.empty(0))
 
 
@@ -103,7 +106,10 @@ def _request(
     rewards=None, hotkey="hk",
 ) -> BatchSubmissionRequest:
     if rewards is None:
-        rewards = [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+        # Derived, not literal: a submission carries exactly M_ROLLOUTS
+        # rollouts, and that count differs between protocol profiles.
+        half = M_ROLLOUTS // 2
+        rewards = [1.0] * half + [0.0] * (M_ROLLOUTS - half)
     rollouts = []
     for idx, r in enumerate(rewards):
         # Shift token ids by idx so each rollout has a unique sequence;
@@ -125,7 +131,8 @@ def _request(
         merkle_root="00" * 32,
         rollouts=rollouts,
         checkpoint_hash="sha256:test",
-        protocol_version=2,
+        protocol_version=PROTOCOL_VERSION,
+        generation_profile_id=PROTOCOL_PROFILE_ID,
     )
 
 
@@ -169,8 +176,13 @@ def _make_batcher(**overrides) -> GrpoWindowBatcher:
         tokenizer=_DefaultFakeTokenizer(),
         verify_commitment_proofs_fn=_always_true_grail,
         verify_signature_fn=_always_true_sig,
+        # The marker drives FakeEnv.compute_reward; the box satisfies the
+        # answer contract. v5+ Math is answer_format="boxed", and a completion
+        # without one reads as an uncertain off-format outcome, which the
+        # robust-utility gate rejects as OUT_OF_ZONE before the test's own
+        # assertions ever run.
         completion_text_fn=lambda rollout: (
-            "CORRECT" if rollout.reward > 0.5 else "wrong"
+            r"CORRECT \boxed{1}" if rollout.reward > 0.5 else r"wrong \boxed{0}"
         ),
         hash_set=None,
         # The vast majority of legacy tests construct requests without an
@@ -190,7 +202,7 @@ def _make_batcher(**overrides) -> GrpoWindowBatcher:
     return b
 
 
-def _prove_one(b: GrpoWindowBatcher, req) -> "ValidSubmission | None":
+def _prove_one(b: GrpoWindowBatcher, req) -> ValidSubmission | None:
     """Run one request through its environment's configured proof path.
 
     Auction-enabled Math and Code both defer proof to seal. Returns None when
@@ -319,9 +331,6 @@ def test_ingestion_resets_forced_flag_in_non_math_env():
 
 
 def test_grail_verifier_receives_tokenizer_for_sparse_pstop():
-    import torch
-    from reliquary.validator.verifier import ProofResult
-
     seen_tokenizers = []
 
     def tokenizer_aware_grail(commit, model, randomness, *, tokenizer=None, seed_u_values=None):
@@ -852,10 +861,6 @@ def test_distinct_prompts_in_batch_only():
 
 # --- v2.1 seal_event + checkpoint_hash gating ---
 
-import asyncio
-
-import pytest
-
 
 def _request_v21(prompt_idx=42, window_start=500,
                  rewards=None, hotkey="hk", checkpoint_hash="sha256:abc"):
@@ -1125,9 +1130,6 @@ def test_failed_submission_does_not_consume_bucket_slot():
     anti-starvation invariant moved to seal: a squatter that fails the proof
     does NOT lock the prompt — the honest same-prompt submission behind it is
     promoted and wins the slot."""
-    import torch
-    from reliquary.validator.verifier import ProofResult
-
     calls = {"n": 0}
 
     def grail_fail_first(commit, model, randomness):
@@ -1641,10 +1643,6 @@ def test_constructor_accepts_tokenizer():
     assert b.tokenizer is fake_tok
 
 
-import torch
-from reliquary.validator.verifier import ProofResult
-
-
 def _grail_with_logits(seq_len: int, eos_id: int = 99):
     """Stub that opts into behavioural checks with high EOS probability
     at the termination position. The actual EOS pass/fail depends on
@@ -2002,7 +2000,6 @@ def test_termination_skipped_when_grail_returns_empty_logits():
 
 
 def test_rejected_submissions_list_initialised_empty():
-    from reliquary.validator.batcher import GrpoWindowBatcher, RejectedSubmission
     b = _make_batcher()  # existing helper in this file
     assert hasattr(b, "rejected_submissions")
     assert b.rejected_submissions == []
@@ -2015,7 +2012,6 @@ def test_rejected_submissions_list_initialised_empty():
 
 
 def _empty_logits():
-    import torch
     return torch.empty(0)
 
 
@@ -2026,7 +2022,6 @@ def _build_request(*, hotkey: str = "hk", prompt_idx: int = 42, window_start: in
 
 def test_rejected_grail_fail_omits_sketch_diff_max(monkeypatch):
     """GRAIL_FAIL must NOT expose sketch_diff_max — anti-tuning."""
-    from reliquary.validator.verifier import ProofResult
     from reliquary.protocol.submission import RejectReason
 
     b = _make_batcher()  # existing helper
@@ -2839,7 +2834,7 @@ def test_all_token_auth_shadow_records_without_rejecting(monkeypatch, tmp_path):
     assert sub is not None
     assert sub.all_token_auth_shadow_findings == M_ROLLOUTS * 2
     assert sub.all_token_auth_shadow_min_prob == pytest.approx(4.0e-7)
-    assert sub.all_token_auth_shadow_positive_findings == 4 * 2
+    assert sub.all_token_auth_shadow_positive_findings == (M_ROLLOUTS // 2) * 2
     assert sub.all_token_auth_shadow_positive_min_prob == pytest.approx(7.0e-6)
 
     records = [json.loads(line) for line in forensics_path.read_text().splitlines()]
@@ -3211,9 +3206,6 @@ def test_accept_genuine_wrong_wellformed_answer():
     assert resp.accepted is True
 
 
-from reliquary.validator import batcher as batcher_mod
-
-
 def test_set_prompt_range_none_before_cutover(monkeypatch):
     monkeypatch.setattr(batcher_mod, "PROMPT_RANGE_ENFORCE_FROM_WINDOW", 10_000)
     b = _make_batcher(window_start=500)
@@ -3300,8 +3292,8 @@ def _grail_with_seed_counts(n_stoch: int, n_match: int):
 
 
 def test_forced_seed_group_gate_rejects_below_floor_when_enforcing(monkeypatch):
-    """Aggregate over 8 rollouts: 80 stochastic positions, 8 matches (0.10)
-    is well below FORCED_SEED_CONSISTENCY_FLOOR (0.80). With FORCED_SEED_ENFORCE
+    """The aggregate match rate is 1 / 10 for every rollout,
+    well below FORCED_SEED_CONSISTENCY_FLOOR (0.80). With FORCED_SEED_ENFORCE
     on, the group is rejected SEED_MISMATCH after the per-rollout loop."""
     import reliquary.validator.batcher as batcher_mod
 
@@ -3311,7 +3303,7 @@ def test_forced_seed_group_gate_rejects_below_floor_when_enforcing(monkeypatch):
         verify_commitment_proofs_fn=_grail_with_seed_counts(n_stoch=10, n_match=1),
     )
     b.current_checkpoint_hash = "sha256:test"   # pinned -> seed enforcement active
-    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+    req = _request()
     assert _prove_one(b, req) is None
     assert b.reject_counts[RejectReason.SEED_MISMATCH.value] == 1
     assert len(b.valid_submissions()) == 0
@@ -3331,7 +3323,7 @@ def test_forced_seed_gate_abstains_when_checkpoint_hash_unpinned(monkeypatch):
         verify_commitment_proofs_fn=_grail_with_seed_counts(n_stoch=10, n_match=1),
     )
     b.current_checkpoint_hash = ""              # not yet published -> not pinned
-    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+    req = _request()
     # Unpinned hash -> the gate abstains: the proof passes at seal, not rejected.
     assert _prove_one(b, req) is not None
 
@@ -3346,7 +3338,7 @@ def test_forced_seed_group_gate_shadow_when_not_enforcing(monkeypatch):
         window_start=500,
         verify_commitment_proofs_fn=_grail_with_seed_counts(n_stoch=10, n_match=1),
     )
-    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+    req = _request()
     # Not enforcing -> shadow only: the proof passes at seal, not rejected.
     assert _prove_one(b, req) is not None
 
@@ -3416,7 +3408,7 @@ def test_forced_seed_cdf_gate_rejects_sparse_branch_mismatch(monkeypatch):
     )
     b.current_checkpoint_hash = "sha256:test"
 
-    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+    req = _request()
     assert _prove_one(b, req) is None
     assert b.reject_counts[RejectReason.SEED_MISMATCH.value] == 1
     assert len(recorded) == 1
@@ -3439,7 +3431,7 @@ def test_forced_seed_cdf_gate_is_shadow_until_calibrated(monkeypatch):
     b.current_checkpoint_hash = "sha256:test"
 
     # CDF enforcement off -> shadow only: the proof passes at seal.
-    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+    req = _request()
     assert _prove_one(b, req) is not None
 
 
@@ -3550,3 +3542,16 @@ def test_short_forged_rollout_rejected_at_identity_temperature(monkeypatch):
 
     assert _prove_one(b, req) is None
     assert b.reject_counts[RejectReason.LOGPROB_MISMATCH.value] == 1
+
+
+def test_a_duplicate_payload_hash_is_refused_at_precommit(monkeypatch):
+    """Same group twice is the same tokens paid twice."""
+    import reliquary.validator.batcher as batcher_module
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+
+    batcher = _make_batcher()
+    batcher.mark_window_opened()
+    digest = "a" * 64
+
+    assert batcher._register_payload_digest(digest) is True
+    assert batcher._register_payload_digest(digest) is False

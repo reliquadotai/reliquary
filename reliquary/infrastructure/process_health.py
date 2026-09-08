@@ -38,6 +38,11 @@ _GRADER_FIELDS = frozenset(
         "worker_reap_failures_total",
         "container_deletes_total",
         "container_delete_failures_total",
+        "execution_backend",
+        "runtime_id",
+        "executor",
+        "shadow",
+        "retire_worker_after_batch",
     }
 )
 _KNOWN_INIT_NAMES = frozenset({"docker-init", "tini", "dumb-init"})

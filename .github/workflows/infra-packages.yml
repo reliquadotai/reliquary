@@ -1,0 +1,45 @@
+name: Infrastructure packages
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        role: [cpu_executor, signer]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Build the exact committed role and verify portable evidence
+        env:
+          ROLE: ${{ matrix.role }}
+        run: |
+          ./scripts/build_${ROLE}_artifact.sh artifact "$(git rev-parse HEAD)"
+          mv artifact "$RUNNER_TEMP/reliquary-${ROLE}"
+          ./scripts/verify_${ROLE}_artifact.sh "$RUNNER_TEMP/reliquary-${ROLE}"
+          printf '\ntampered\n' >> "$RUNNER_TEMP/reliquary-${ROLE}/python-packages.txt"
+          if ./scripts/verify_${ROLE}_artifact.sh "$RUNNER_TEMP/reliquary-${ROLE}"; then
+            echo "Verifier accepted altered evidence" >&2
+            exit 1
+          fi
+      - name: Validate the three role playbooks
+        if: matrix.role == 'cpu_executor'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/ansible"
+          "$RUNNER_TEMP/ansible/bin/pip" install ansible-core==2.21.3
+          cd reliquary-infra
+          for role in ctrl cpu-exec signer; do
+            inventory="inventory/${role}.example.yml"
+            if [ "$role" = ctrl ]; then inventory=inventory/hosts.example.yml; fi
+            "$RUNNER_TEMP/ansible/bin/ansible-playbook" -i "$inventory" --syntax-check "playbooks/${role}-01.yml"
+          done

@@ -26,6 +26,8 @@ from reliquary.validator.checkpoint_intake import (
 from tests.unit.test_training_payload_codec import _window_batches
 
 ENV_ORDER = ["openmathinstruct", "opencodeinstruct"]
+REV_0 = "0" * 40
+REV_1 = f"{1:040x}"
 
 
 def _seed_store():
@@ -33,7 +35,7 @@ def _seed_store():
     store = {}
     for n in (101, 102, 103):
         store[payload_key(n)] = encode_training_payload(
-            _window_batches(), window_start=n, checkpoint_revision="rev-0",
+            _window_batches(), window_start=n, checkpoint_revision=REV_0,
             env_order=ENV_ORDER, window_quarantine={"quarantined": False},
         )
     store[tombstone_key(104)] = encode_tombstone(
@@ -53,7 +55,7 @@ class _StubPublisher:
 
     def publish(self, reason):
         self.n += 1
-        revision = f"rev-{self.n}"
+        revision = f"{self.n:040x}"
         self.store[
             f"reliquary/checkpoints/{revision}/model.safetensors"
         ] = b"weights-" + revision.encode()
@@ -78,8 +80,6 @@ def _run_until_waited(worker, limit=50):
 
 
 def _make_worker(store, cursor, *, trained_log, last_revision=None):
-    state = {"cursor": cursor}
-
     def train_fn(decoded):
         trained_log.append(decoded.window_start)
         return True
@@ -122,7 +122,7 @@ def test_full_flow_and_crash_replay(tmp_path):
     assert worker.cursor == 104
 
     manifest = json.loads(store[CANDIDATE_MANIFEST_KEY])
-    assert manifest["revision"] == "rev-1"
+    assert manifest["revision"] == REV_1
     # Published after window 102: the manifest cursor records it.
     assert manifest["trained_window_cursor"] == 102
 
@@ -155,16 +155,18 @@ def test_full_flow_and_crash_replay(tmp_path):
 
     intake = CheckpointIntake(
         r2_client=_R2(), bucket="reliquary", staging_dir=str(tmp_path),
-        installed_revision="rev-0",
+        installed_revision=REV_0,
         validate_fn=lambda p: {"ok": True},
     )
     candidate = intake.poll()
-    assert candidate["revision"] == "rev-1"
+    assert candidate["revision"] == REV_1
     assert intake.stage(candidate) is True
     staged_manifest, staged_dir = intake.take_staged()
-    assert staged_manifest["revision"] == "rev-1"
-    assert (staged_dir / "model.safetensors").read_bytes() == b"weights-rev-1"
-    intake.mark_installed("rev-1", staged_dir)
+    assert staged_manifest["revision"] == REV_1
+    assert (staged_dir / "model.safetensors").read_bytes() == (
+        b"weights-" + REV_1.encode()
+    )
+    intake.mark_installed(REV_1, staged_dir)
     # Installed: the same manifest never re-polls.
     assert intake.poll() is None
 

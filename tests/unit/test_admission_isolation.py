@@ -636,6 +636,48 @@ def test_prepared_reason_parity_for_nonfinite_reward(monkeypatch):
     assert result.reject_stage == "reward"
 
 
+def test_registered_third_environment_scores_authoritatively(monkeypatch):
+    from reliquary.environment.reliquaryverifiable import (
+        ReliquaryVerifiableEnvironment,
+    )
+    import json
+
+    environment = ReliquaryVerifiableEnvironment()
+    problem = environment.get_problem(0)
+    expected = json.loads(problem["ground_truth"])["expected"]
+    correct = json.dumps({"result": expected})
+    incorrect = '{"result":null}'
+    request = _request()
+    for rollout in request.rollouts:
+        rollout.env_name = environment.name
+        # Prove the validator overwrites an untrusted miner placeholder.
+        rollout.reward = 0.0
+    parsed = ParsedSubmission(
+        request=request,
+        rollout_hashes=[],
+        selection_digest=compute_rollouts_selection_digest(request.rollouts),
+    )
+    monkeypatch.setattr(
+        "reliquary.validator.admission.detect_opposite_reward_clones",
+        lambda *_args: SimpleNamespace(suspicious=False),
+    )
+
+    prepared = score_and_finalize_submission(
+        parsed,
+        AdmissionRuntimeMaterials(
+            canonical_prompt_tokens=None,
+            problem=problem,
+            completion_texts=[correct] * 4 + [incorrect] * 4,
+        ),
+        replace(_context(), environment=environment.name),
+        time.monotonic() + 5.0,
+    )
+
+    assert prepared.reject_reason is None
+    assert prepared.rewards == [1.0] * 4 + [0.0] * 4
+    assert [rollout.reward for rollout in request.rollouts] == prepared.rewards
+
+
 @pytest.mark.asyncio
 async def test_admission_pool_recovers_after_worker_crash():
     server, environment = _server_with_admission_pool()

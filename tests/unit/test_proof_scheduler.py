@@ -52,6 +52,7 @@ def _plan(
     deadline: float | None = None,
     revision: str = "rev-a",
     max_attempts: int | None = None,
+    open_ended: bool = False,
 ) -> ProofPlan:
     return ProofPlan(
         plan_id=plan_id,
@@ -61,6 +62,7 @@ def _plan(
         required_passes=required,
         deadline_at=time.monotonic() + 10 if deadline is None else deadline,
         max_attempts=max_attempts,
+        open_ended=open_ended,
     )
 
 

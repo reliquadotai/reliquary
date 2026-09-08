@@ -138,6 +138,36 @@ async def test_submit_weights_maps_hotkeys_to_uids():
 
 
 @pytest.mark.asyncio
+async def test_remote_signer_submits_semantic_weight_vector_without_local_key():
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    signer = MagicMock()
+    signer.set_weights = AsyncMock(return_value=True)
+    wov = WeightOnlyValidator(
+        wallet=_FakeWallet(),
+        netuid=81,
+        signer_client=signer,
+    )
+    fake_meta = MagicMock(hotkeys=["alice", "5FReader"], uids=[10, 11])
+    wov._active_submit_epoch = 1234
+
+    with patch(
+        "reliquary.validator.weight_only.chain.get_metagraph",
+        new=AsyncMock(return_value=fake_meta),
+    ):
+        submitted = await wov._submit_weights(MagicMock(), {"alice": 0.4})
+
+    assert submitted is True
+    signer.set_weights.assert_awaited_once()
+    call = signer.set_weights.await_args.kwargs
+    assert call["epoch_id"] == 1234
+    assert call["netuid"] == 81
+    assert dict(zip(call["uids"], call["weights"])) == pytest.approx(
+        {10: 0.4, 11: 0.6}
+    )
+
+
+@pytest.mark.asyncio
 async def test_deregistered_ema_mass_is_conserved_as_burn():
     """Metagraph filtering must not redistribute vanished miner weight."""
     from reliquary.validator.weight_only import WeightOnlyValidator
@@ -543,10 +573,10 @@ async def test_replay_ema_boundary_fair_split_applies_on_chain():
     from reliquary.constants import EMA_ALPHA, B_BATCH
 
     slot_share = 1.0 / B_BATCH
-    # Boundary scenario: 6 slots filled by round-1 prompts at full
+    # Boundary scenario: all but 2 slots filled by round-1 prompts at full
     # slot_share each, plus a boundary round with 4 prompts sharing 2
     # remaining slots = per_prompt = 2 × slot_share / 4 = slot_share / 2.
-    rewards = {f"r1_p{i}": slot_share for i in range(6)}
+    rewards = {f"r1_p{i}": slot_share for i in range(B_BATCH - 2)}
     for i in range(4):
         rewards[f"boundary_{i}"] = slot_share / 2
 
@@ -555,14 +585,14 @@ async def test_replay_ema_boundary_fair_split_applies_on_chain():
     archive = {
         "window_start": 1,
         "batch": (
-            [{"hotkey": f"r1_p{i}", "prompt_idx": i} for i in range(6)]
+            [{"hotkey": f"r1_p{i}", "prompt_idx": i} for i in range(B_BATCH - 2)]
             + [{"hotkey": f"boundary_{i}", "prompt_idx": 100 + i} for i in range(2)]
         ),
         "rewards_by_hotkey": rewards,
     }
     ema = WeightOnlyValidator._replay_ema([archive])
     # Every miner — including the 2 non-trained boundary ones — earned EMA.
-    for i in range(6):
+    for i in range(B_BATCH - 2):
         assert abs(ema[f"r1_p{i}"] - EMA_ALPHA * slot_share) < 1e-9
     for i in range(4):
         assert abs(ema[f"boundary_{i}"] - EMA_ALPHA * slot_share / 2) < 1e-9

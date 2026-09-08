@@ -110,3 +110,32 @@ async def test_client_error_returns_empty_list():
         from reliquary.infrastructure.storage import list_all_window_keys
         result = await list_all_window_keys()
     assert result == []
+
+
+@pytest.mark.asyncio
+async def test_strict_client_error_is_not_reinterpreted_as_empty_history():
+    from botocore.exceptions import ClientError
+    from reliquary.infrastructure.storage import list_all_window_keys
+
+    mock_client = AsyncMock()
+    paginator = MagicMock()
+
+    async def failing_paginate(*args, **kwargs):
+        raise ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "no"}},
+            "ListObjectsV2",
+        )
+        yield
+
+    paginator.paginate = lambda *args, **kwargs: failing_paginate()
+    mock_client.get_paginator = MagicMock(return_value=paginator)
+    mock_ctx = AsyncMock()
+    mock_ctx.__aenter__.return_value = mock_client
+    mock_ctx.__aexit__.return_value = None
+
+    with patch(
+        "reliquary.infrastructure.storage.get_s3_client",
+        return_value=mock_ctx,
+    ):
+        with pytest.raises(ClientError):
+            await list_all_window_keys(strict=True)

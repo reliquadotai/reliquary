@@ -1,0 +1,51 @@
+{
+  "qualification": "CPU replay only",
+  "repository": "https://github.com/reliquadotai/reliquary-environments",
+  "release": "v0.1.0a1",
+  "release_commit": "cdb998b355ee41355823f2a15cdd21ab19c4718a",
+  "integration_commit": "73285b192f0359ed75635d6d4ff1694ab3a1b106",
+  "wheel_sha256": "f4d5480e57e66265faa78c53e36fa8ab781afe0ae907d7dc5749d2b0f9344155",
+  "artifact_sha256": "9779a3151575687e823567c6c9c5459d93794bab4f27f4bcde987c8414cb50f6",
+  "profile_active": false,
+  "results": [
+    {
+      "index": 0,
+      "task_id": "8f6d66de7e4c86a034bcb91a7fa76612364141d86eb904a17e8b171b185865e2",
+      "reward": 1.0,
+      "state_digest": "849c125fcc7101a007c95d1c120498c2767776a75683710ddfcaa5ca00f38eb2",
+      "golden": {
+        "index": 0,
+        "split": "train",
+        "task_id": "8f6d66de7e4c86a034bcb91a7fa76612364141d86eb904a17e8b171b185865e2",
+        "family": "address_update",
+        "state_digest": "849c125fcc7101a007c95d1c120498c2767776a75683710ddfcaa5ca00f38eb2"
+      }
+    },
+    {
+      "index": 1,
+      "task_id": "dbaba7af6725382b17e31da3ae1c38275fcbb6cfea0470c67dc0d59f0ddcc35b",
+      "reward": 1.0,
+      "state_digest": "7d9c6f890b4b54058fec36f73a89ca48b0f98c07994b9f719208fbf7427489bd",
+      "golden": {
+        "index": 1,
+        "split": "train",
+        "task_id": "dbaba7af6725382b17e31da3ae1c38275fcbb6cfea0470c67dc0d59f0ddcc35b",
+        "family": "refund",
+        "state_digest": "7d9c6f890b4b54058fec36f73a89ca48b0f98c07994b9f719208fbf7427489bd"
+      }
+    },
+    {
+      "index": 2,
+      "task_id": "81a023e027bc7afdaab8f03276195c27cfe0d0ca52ea53118bb4f2cc08a611e4",
+      "reward": 1.0,
+      "state_digest": "2d7bd9d2af859383574ba40bb9f1e42c1c5c3258b51238fd0ae2ddc20c42c83d",
+      "golden": {
+        "index": 2,
+        "split": "train",
+        "task_id": "81a023e027bc7afdaab8f03276195c27cfe0d0ca52ea53118bb4f2cc08a611e4",
+        "family": "support_note",
+        "state_digest": "2d7bd9d2af859383574ba40bb9f1e42c1c5c3258b51238fd0ae2ddc20c42c83d"
+      }
+    }
+  ]
+}

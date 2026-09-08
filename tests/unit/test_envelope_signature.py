@@ -197,6 +197,8 @@ def _signed_request(
 # ---------------------------------------------------------------------------
 
 
+
+
 def test_envelope_binding_is_deterministic():
     """Same inputs must always produce the same bytes."""
     common = dict(

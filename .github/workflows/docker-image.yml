@@ -3,26 +3,19 @@ name: Build and publish validator image
 on:
   push:
     branches: [main]
-    # Docs-only merges must not push a fresh :latest image: watchtower treats
-    # any new digest as deploy-worthy and restarts the live trainer.
+    # Main builds publish revision tags. Promoting latest is a separate action.
     paths-ignore:
       - "docs/**"
       - "**/*.md"
   workflow_dispatch:
+    inputs:
+      promote_latest:
+        description: "Also publish latest from main after deployment review"
+        type: boolean
+        default: false
 
-# Serialize image builds + always let the newest commit win.
-#
-# Why: when two PRs land in rapid succession, GH Actions starts both builds
-# concurrently. They both push to ``:latest``. The slower build pushes LAST,
-# so its (older) commit wins the tag — even though the newer commit was
-# merged later. This caused PR #5 to silently get overwritten by PR #4's
-# slower build on 2026-05-11, leaving the validator on outdated code despite
-# both PRs being merged.
-#
-# ``cancel-in-progress: true`` interrupts any older in-flight build when a
-# newer commit lands. The newer commit's build runs alone and is the only
-# one pushing ``:latest``. Worst case we waste an in-flight build's compute;
-# best case we ship the right code faster.
+# Serialize builds and cancel superseded work. Main pushes publish only
+# revision tags; updating latest requires an explicit dispatch from main.
 concurrency:
   group: docker-image-build
   cancel-in-progress: true
@@ -63,7 +56,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # These tags are fully determined by the push event. Derive them locally
+      # These tags are fully determined by the event. Derive them locally
       # instead of asking the GitHub API through docker/metadata-action: an API
       # outage must not prevent us from building an otherwise releasable image.
       - name: Resolve image tags
@@ -71,10 +64,13 @@ jobs:
         shell: bash
         env:
           IMAGE: ghcr.io/${{ github.repository_owner }}/reliquary-validator
+          PROMOTE_LATEST: ${{ inputs.promote_latest || false }}
         run: |
           {
             echo "tags<<EOF"
-            if [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
+            if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && \
+                  "$GITHUB_REF" == "refs/heads/main" && \
+                  "$PROMOTE_LATEST" == "true" ]]; then
               echo "$IMAGE:latest"
             fi
             echo "$IMAGE:sha-${GITHUB_SHA::7}"

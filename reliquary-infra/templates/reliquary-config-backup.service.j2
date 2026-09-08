@@ -1,0 +1,11 @@
+[Unit]
+Description=Back up Reliquary control configuration locally
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/reliquary-config-backup
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=full
+ReadWritePaths=/var/backups/reliquary

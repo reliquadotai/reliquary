@@ -15,6 +15,7 @@ from reliquary.constants import (
     PROTOCOL_VERSION,
     TRAINING_RUN_ID,
 )
+from reliquary.shared.strict_json import strict_json_loads
 
 
 CHECKPOINT_PROFILE_NAME = "reliquary_protocol_profile.json"
@@ -96,8 +97,8 @@ def validate_checkpoint_profile(
             )
         return None
     try:
-        value = json.loads(profile_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        value = strict_json_loads(profile_path.read_bytes())
+    except (OSError, UnicodeError, ValueError) as exc:
         raise CheckpointProfileMismatch(
             "checkpoint protocol-lineage metadata is unreadable"
         ) from exc

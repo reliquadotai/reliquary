@@ -5,13 +5,27 @@ on:
     paths:
       - "reliquary/environment/grader/**"
       - "reliquary/environment/opencodeinstruct.py"
+      - "reliquary/environment/agentic/**"
+      - "reliquary/environment/manifests/goldens/**"
+      - "reliquary/environment/manifests/reliquary_*_tools_v1.json"
+      - "reliquary/environment/registry.py"
+      - "reliquary/environment/logic_tasks.py"
+      - "reliquary/environment/reliquarylogic.py"
       - "scripts/build_opencodeinstruct_subset.py"
+      - "scripts/emit_episode_determinism.py"
       - ".github/workflows/cross-box-determinism.yml"
   push:
     branches: [main]
     paths:
       - "reliquary/environment/grader/**"
       - "reliquary/environment/opencodeinstruct.py"
+      - "reliquary/environment/agentic/**"
+      - "reliquary/environment/manifests/goldens/**"
+      - "reliquary/environment/manifests/reliquary_*_tools_v1.json"
+      - "reliquary/environment/registry.py"
+      - "reliquary/environment/logic_tasks.py"
+      - "reliquary/environment/reliquarylogic.py"
+      - "scripts/emit_episode_determinism.py"
 
 jobs:
   determinism:
@@ -58,3 +72,95 @@ jobs:
             exit 1
           fi
           echo "All runs identical across runners."
+
+  episode-determinism:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+        python-version: ["3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install package
+        run: pip install -e .
+      - name: Emit Episode v1 determinism corpus
+        env:
+          PYTHONHASHSEED: "random"
+        run: |
+          python scripts/emit_episode_determinism.py \
+            --tasks-per-env 64 \
+            --output /tmp/episode_${{ matrix.os }}.jsonl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: episode-determinism-${{ matrix.os }}
+          path: /tmp/episode_${{ matrix.os }}.jsonl
+
+  compare-episode:
+    needs: episode-determinism
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: episode-determinism-ubuntu-22.04
+          path: r22
+      - uses: actions/download-artifact@v4
+        with:
+          name: episode-determinism-ubuntu-24.04
+          path: r24
+      - name: Diff Episode v1 results
+        run: |
+          if ! diff -u r22/episode_ubuntu-22.04.jsonl r24/episode_ubuntu-24.04.jsonl; then
+            echo "::error::Episode v1 produced different results across runners."
+            exit 1
+          fi
+          echo "All Episode v1 runs are identical across runners."
+
+  logic-determinism:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+        python-version: ["3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install package
+        run: pip install -e .
+      - name: Emit reliquarylogic_v1 determinism corpus
+        env:
+          PYTHONHASHSEED: "random"
+        run: |
+          python scripts/emit_logic_determinism.py \
+            --tasks 4096 \
+            --output /tmp/logic_${{ matrix.os }}.jsonl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: logic-determinism-${{ matrix.os }}
+          path: /tmp/logic_${{ matrix.os }}.jsonl
+
+  compare-logic:
+    needs: logic-determinism
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: logic-determinism-ubuntu-22.04
+          path: r22
+      - uses: actions/download-artifact@v4
+        with:
+          name: logic-determinism-ubuntu-24.04
+          path: r24
+      - name: Diff reliquarylogic_v1 results
+        run: |
+          if ! diff -u r22/logic_ubuntu-22.04.jsonl r24/logic_ubuntu-24.04.jsonl; then
+            echo "::error::reliquarylogic_v1 produced different tasks across runners."
+            exit 1
+          fi
+          echo "All reliquarylogic_v1 tasks are identical across runners."

@@ -6,6 +6,8 @@ live objects. A silently dropped field degrades the model, not the tests
 — so equality is checked on the consumed accessors, not just raw fields.
 """
 
+import io
+import json
 import math
 from types import SimpleNamespace
 
@@ -74,10 +76,37 @@ def _encode_decode(batches):
         window_start=30100,
         checkpoint_revision="rev-abc",
         env_order=["openmathinstruct", "opencodeinstruct"],
+        env_targets={"openmathinstruct": 16, "opencodeinstruct": 16},
         window_quarantine={"quarantined": False, "reasons": []},
     )
     assert isinstance(blob, bytes)
     return decode_training_payload(blob)
+
+
+def _replace_payload_header(blob: bytes, **updates) -> bytes:
+    with np.load(io.BytesIO(blob), allow_pickle=False) as npz:
+        arrays = {key: npz[key] for key in npz.files}
+    header = json.loads(bytes(arrays["header"]))
+    header.update(updates)
+    arrays["header"] = np.frombuffer(
+        json.dumps(header).encode("utf-8"),
+        dtype=np.uint8,
+    )
+    output = io.BytesIO()
+    np.savez_compressed(output, **arrays)
+    return output.getvalue()
+
+
+def _payload_bytes(*, window_start: int = 30100) -> bytes:
+    return encode_training_payload(
+        _window_batches(),
+        window_start=window_start,
+        checkpoint_revision="rev-abc",
+        env_order=["openmathinstruct", "opencodeinstruct"],
+        window_quarantine={"quarantined": False, "reasons": []},
+    )
+
+
 
 
 def test_header_round_trip():
@@ -85,7 +114,50 @@ def test_header_round_trip():
     assert decoded.window_start == 30100
     assert decoded.checkpoint_revision == "rev-abc"
     assert decoded.env_order == ["openmathinstruct", "opencodeinstruct"]
+    # The active legacy v2 profile emits schema 1 and intentionally omits the
+    # additive target map. V5+ payloads pin it in schema 2.
+    assert decoded.env_targets == {}
     assert decoded.window_quarantine == {"quarantined": False, "reasons": []}
+
+
+@pytest.mark.parametrize("schema_version", [True, 2.0, "2"])
+def test_payload_decoder_requires_an_exact_integer_schema(schema_version):
+    blob = _replace_payload_header(
+        _payload_bytes(),
+        schema_version=schema_version,
+    )
+
+    with pytest.raises(ValueError, match="unsupported payload schema"):
+        decode_training_payload(blob)
+
+
+@pytest.mark.parametrize("window_start", [True, 30100.0, "30100", -1])
+def test_payload_decoder_requires_a_canonical_window_identity(window_start):
+    blob = _replace_payload_header(
+        _payload_bytes(),
+        window_start=window_start,
+    )
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        decode_training_payload(blob)
+
+
+@pytest.mark.parametrize(
+    "checkpoint_revision",
+    [True, 7, 7.0, [], {}, None, "", " rev-abc", "rev-abc "],
+)
+def test_payload_decoder_never_normalizes_checkpoint_revision(
+    checkpoint_revision,
+):
+    blob = _replace_payload_header(
+        _payload_bytes(),
+        checkpoint_revision=checkpoint_revision,
+    )
+
+    with pytest.raises(ValueError, match="canonical text"):
+        decode_training_payload(blob)
+
+
 
 
 def test_consumed_accessors_round_trip():
@@ -169,6 +241,45 @@ def test_force_span_and_termination_path_round_trip():
     assert getattr(other, "_validated_force_span", None) is None
 
 
+def test_episode_assistant_spans_round_trip(monkeypatch):
+    from reliquary.validator.training import _policy_token_positions
+
+    monkeypatch.setattr(C, "PROTOCOL_VERSION", 7)
+    monkeypatch.setattr(C, "T_PROTO", 1.0)
+    monkeypatch.setattr(C, "PI_OLD_FROM_VERIFY_LOGPROBS", True)
+    monkeypatch.setattr(C, "RECOMPUTE_PI_OLD_FROM_VERIFY", True)
+    rollout = _roll(
+        1.0,
+        8,
+        env="reliquary_stateful_tools_v1",
+        prompt_length=4,
+    )
+    rollout.commit["rollout"]["episode"] = {"schema_version": "test"}
+    rollout.commit["rollout"]["token_logprobs"] = [-0.2] * 4
+    rollout._validated_assistant_spans = ((4, 6), (9, 11))
+    rollout._validated_termination_path = "finished"
+    rollout._validated_completion_logprobs = [-0.3] * 4
+    batches = {
+        "reliquary_stateful_tools_v1": [_group([rollout], prompt_idx=9)]
+    }
+    blob = encode_training_payload(
+        batches,
+        window_start=30100,
+        checkpoint_revision="rev-episode",
+        env_order=["reliquary_stateful_tools_v1"],
+        env_targets={"reliquary_stateful_tools_v1": 16},
+        window_quarantine={"quarantined": False, "reasons": []},
+    )
+    decoded = decode_training_payload(blob).batches()[
+        "reliquary_stateful_tools_v1"
+    ][0].rollouts[0]
+    assert decoded._validated_assistant_spans == ((4, 6), (9, 11))
+    assert decoded._validated_termination_path == "finished"
+    assert _policy_token_positions(decoded) == [4, 5, 9, 10]
+    assert _completion_token_logprobs(decoded) == pytest.approx([-0.2] * 4)
+    assert _validator_completion_logprobs(decoded, 4) == pytest.approx([-0.3] * 4)
+
+
 def test_tombstone_round_trip():
     doc = decode_tombstone(encode_tombstone(
         window_start=30105, failure_stage="proof_capacity",
@@ -177,6 +288,54 @@ def test_tombstone_round_trip():
     assert doc["window_start"] == 30105
     assert doc["failure_stage"] == "proof_capacity"
     assert doc["failure_type"] == "ProofCapacityAbort"
+
+
+def test_tombstone_rejects_duplicate_durable_identity():
+    encoded = encode_tombstone(
+        window_start=30105,
+        failure_stage="proof_capacity",
+        failure_type="ProofCapacityAbort",
+    )
+    ambiguous = encoded.replace(
+        b'"window_start": 30105',
+        b'"window_start": 1, "window_start": 30105',
+        1,
+    )
+
+    with pytest.raises(ValueError, match="duplicate JSON key: window_start"):
+        decode_tombstone(ambiguous)
+
+
+@pytest.mark.parametrize("schema_version", [True, 2.0, "2"])
+def test_tombstone_requires_an_exact_integer_schema(schema_version):
+    doc = json.loads(
+        encode_tombstone(
+            window_start=30105,
+            failure_stage="proof_capacity",
+            failure_type="ProofCapacityAbort",
+        )
+    )
+    doc["schema_version"] = schema_version
+
+    with pytest.raises(ValueError, match="unsupported tombstone schema"):
+        decode_tombstone(json.dumps(doc).encode("utf-8"))
+
+
+@pytest.mark.parametrize("window_start", [True, 30105.0, "30105", -1])
+def test_tombstone_requires_a_canonical_window_identity(window_start):
+    doc = json.loads(
+        encode_tombstone(
+            window_start=30105,
+            failure_stage="proof_capacity",
+            failure_type="ProofCapacityAbort",
+        )
+    )
+    doc["window_start"] = window_start
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        decode_tombstone(json.dumps(doc).encode("utf-8"))
+
+
 
 
 @pytest.mark.parametrize(
@@ -206,6 +365,10 @@ def test_artifact_schema_preserves_legacy_worker_compatibility(
     if protocol_version >= 5:
         expected = active_training_identity()
         assert decoded.training_identity == expected
+        assert decoded.env_targets == {
+            "openmathinstruct": 16,
+            "opencodeinstruct": 16,
+        }
         for key, value in expected.items():
             assert tombstone[key] == value
     else:
@@ -213,3 +376,16 @@ def test_artifact_schema_preserves_legacy_worker_compatibility(
             value is None for value in decoded.training_identity.values()
         )
         assert not set(active_training_identity()).intersection(tombstone)
+
+
+def test_schema_v2_payload_requires_exact_environment_targets(monkeypatch):
+    monkeypatch.setattr(C, "PROTOCOL_VERSION", 6)
+    with pytest.raises(ValueError, match="targets must match"):
+        encode_training_payload(
+            _window_batches(),
+            window_start=30100,
+            checkpoint_revision="rev-abc",
+            env_order=["openmathinstruct", "opencodeinstruct"],
+            env_targets={"openmathinstruct": 16},
+            window_quarantine={"quarantined": False, "reasons": []},
+        )

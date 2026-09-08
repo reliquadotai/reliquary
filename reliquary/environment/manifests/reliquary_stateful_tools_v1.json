@@ -1,0 +1,40 @@
+{
+  "schema": "reliquary/environment-source/v1",
+  "environment": "reliquary_stateful_tools_v1",
+  "contract": "reliquary/episode/v1",
+  "generator": "reliquary-stateful-tools-generator-v1",
+  "renderer": "reliquary-jsonl-tools-v1",
+  "reward": "deterministic-binary-outcome-v1",
+  "reward_diagnostics": "weighted-state-invariant-checks-v1",
+  "proof": "grail-v8-assistant-policy-spans",
+  "task_families": [
+    "address_update",
+    "refund",
+    "support_note"
+  ],
+  "episode_schema": "reliquary/environment/schemas/episode-v1.schema.json",
+  "episode_schema_sha256": "a9bf6d2a8704440a835f4882b3c9fb37e1e19701cc3c27f4ca017e7ce40ea39a",
+  "golden_fixture": "reliquary/environment/manifests/goldens/reliquary_stateful_tools_v1.jsonl",
+  "golden_fixture_sha256": "d66a02e84520ff2eabddb82bd8f2e36fdaa10c6198499bd2409009df1fa704f2",
+  "implementation_digest_algorithm": "sha256-path-nul-file-sha256-newline-v1",
+  "implementation_files": [
+    "reliquary/environment/agentic/__init__.py",
+    "reliquary/environment/agentic/base.py",
+    "reliquary/environment/agentic/compat.py",
+    "reliquary/environment/agentic/envs/stateful_tools_v1/__init__.py",
+    "reliquary/environment/agentic/envs/stateful_tools_v1/environment.py",
+    "reliquary/environment/agentic/envs/stateful_tools_v1/tasks.py",
+    "reliquary/environment/agentic/envs/stateful_tools_v1/tools.py",
+    "reliquary/environment/agentic/envs/stateful_tools_v1/verifier.py",
+    "reliquary/environment/agentic/renderer.py",
+    "reliquary/environment/agentic/replay.py",
+    "reliquary/environment/agentic/runner.py",
+    "reliquary/environment/agentic/suite.py",
+    "reliquary/environment/agentic/types.py"
+  ],
+  "implementation_sha256": "8e2151c5b2c0f493ded84f9e950fb66170a0c1004342fd21ccfc57408bbc9e0b",
+  "source": "Reliquary-authored procedural retail, support, and CRM worlds",
+  "external_data": false,
+  "network_required": false,
+  "license": "MIT"
+}

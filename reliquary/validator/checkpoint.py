@@ -15,6 +15,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
 
+from reliquary.shared.checkpoint_identity import (
+    canonical_checkpoint_identity,
+    require_checkpoint_number,
+    require_checkpoint_repository,
+    require_checkpoint_successor,
+    require_immutable_checkpoint_revision,
+)
 from reliquary.validator.checkpoint_profile import write_checkpoint_profile
 
 logger = logging.getLogger(__name__)
@@ -37,6 +44,29 @@ class _WalletLike(Protocol):
         ss58_address: str
         @staticmethod
         def sign(data: bytes) -> bytes: ...
+
+
+class _CheckpointSigner(Protocol):
+    def sign_checkpoint(
+        self, *, checkpoint_n: int, repo_id: str, revision: str
+    ) -> bytes: ...
+
+
+class _WalletCheckpointSigner:
+    """Compatibility adapter for the pre-extraction local wallet path."""
+
+    def __init__(self, wallet: _WalletLike) -> None:
+        self.wallet = wallet
+
+    def sign_checkpoint(
+        self, *, checkpoint_n: int, repo_id: str, revision: str
+    ) -> bytes:
+        del repo_id  # The existing on-wire checkpoint payload excludes repo_id.
+        return bytes(
+            self.wallet.hotkey.sign(
+                f"{int(checkpoint_n)}|{revision}".encode("utf-8")
+            )
+        )
 
 
 class CheckpointStore:
@@ -63,20 +93,41 @@ class CheckpointStore:
         tokenizer: Any = None,
         upload_fn: Callable[..., Awaitable[str]] | None = None,
         save_fn: Callable[[Any, Any, Path], None] | None = None,
+        signer: _CheckpointSigner | None = None,
     ) -> None:
         self.validator_hotkey = validator_hotkey
         self.wallet = wallet
-        self.repo_id = repo_id
+        self.repo_id = require_checkpoint_repository(repo_id)
         self.hf_token = hf_token or os.environ.get("HF_TOKEN")
         self.tokenizer = tokenizer
         self.staging_dir = Path(staging_dir_path)
         self.staging_dir.mkdir(parents=True, exist_ok=True)
         self._upload = upload_fn or _default_upload
         self._save = save_fn or _default_save_hf_format
+        self._signer = signer or _WalletCheckpointSigner(wallet)
         self._current: ManifestEntry | None = None
+        self._identity_floor: ManifestEntry | None = None
 
     def current_manifest(self) -> ManifestEntry | None:
         return self._current
+
+    def clear_manifest(self) -> None:
+        """Withdraw the public manifest without assigning a local path ID."""
+
+        self._current = None
+
+    def _floor_identity(self) -> tuple[int, str, str] | None:
+        floor = self._identity_floor or self._current
+        if floor is None:
+            return None
+        identity = canonical_checkpoint_identity(
+            floor.checkpoint_n,
+            floor.repo_id,
+            floor.revision,
+            field="installed checkpoint",
+        )
+        self._identity_floor = floor
+        return identity
 
     async def publish(
         self,
@@ -92,6 +143,16 @@ class CheckpointStore:
         and has no role in recovery or miner reload. Keeping it caused
         unbounded disk creep at ~7.6 GB/training step in v2.1.
         """
+        checkpoint_n = require_checkpoint_number(
+            checkpoint_n,
+            field="published checkpoint number",
+        )
+        floor = self._floor_identity()
+        if floor is not None and checkpoint_n <= floor[0]:
+            raise ValueError(
+                "published checkpoint number must advance monotonically"
+            )
+
         # 1. Save HF-format snapshot locally (dir with safetensors + config + tokenizer).
         snapshot_dir = self.staging_dir / f"ckpt_{checkpoint_n}"
         snapshot_dir.mkdir(parents=True, exist_ok=True)
@@ -110,6 +171,10 @@ class CheckpointStore:
                 repo_id=self.repo_id,
                 commit_message=f"checkpoint {checkpoint_n}",
             )
+            revision = require_immutable_checkpoint_revision(
+                revision,
+                field="checkpoint publisher revision",
+            )
         finally:
             # Always delete the staging copy. HF revision is canonical;
             # a half-written dir on save/upload failure is just waste.
@@ -118,8 +183,11 @@ class CheckpointStore:
             shutil.rmtree(snapshot_dir, ignore_errors=True)
 
         # 3. Sign (n || revision) — strong cross-validator proof
-        sig_payload = f"{checkpoint_n}|{revision}".encode()
-        sig_bytes = self.wallet.hotkey.sign(sig_payload)
+        sig_bytes = await asyncio.to_thread(
+            self.sign_manifest,
+            checkpoint_n,
+            revision,
+        )
         signature = "ed25519:" + sig_bytes.hex()
 
         # 4. Install manifest
@@ -130,6 +198,7 @@ class CheckpointStore:
             signature=signature,
         )
         self._current = entry
+        self._identity_floor = entry
         logger.info(
             "Published checkpoint %d to %s@%s",
             checkpoint_n, self.repo_id, revision[:12],
@@ -143,20 +212,49 @@ class CheckpointStore:
         trainer. The wallet signs at INSTALL time — the attestation
         "this is my current checkpoint" only becomes true once the
         verify plane holds these weights, which is the caller's swap."""
-        sig_payload = f"{int(checkpoint_n)}|{revision}".encode()
-        sig_bytes = self.wallet.hotkey.sign(sig_payload)
+        candidate = canonical_checkpoint_identity(
+            checkpoint_n,
+            self.repo_id,
+            revision,
+            field="external checkpoint",
+        )
+        checkpoint_n, _, revision = candidate
+        if require_checkpoint_successor(
+            self._floor_identity(),
+            candidate,
+            field="external checkpoint",
+        ):
+            assert self._identity_floor is not None
+            self._current = self._identity_floor
+            return self._identity_floor
+
+        sig_bytes = self.sign_manifest(checkpoint_n, revision)
         entry = ManifestEntry(
-            checkpoint_n=int(checkpoint_n),
+            checkpoint_n=checkpoint_n,
             repo_id=self.repo_id,
-            revision=str(revision),
+            revision=revision,
             signature="ed25519:" + sig_bytes.hex(),
         )
         self._current = entry
+        self._identity_floor = entry
         logger.info(
             "Installed external checkpoint %d (%s@%s)",
-            checkpoint_n, self.repo_id, str(revision)[:12],
+            checkpoint_n, self.repo_id, revision[:12],
         )
         return entry
+
+    def sign_manifest(self, checkpoint_n: int, revision: str) -> bytes:
+        """Sign only the existing structured checkpoint claim."""
+        checkpoint_n, repo_id, revision = canonical_checkpoint_identity(
+            checkpoint_n, self.repo_id, revision, field="signed checkpoint"
+        )
+        return bytes(
+            self._signer.sign_checkpoint(
+                checkpoint_n=checkpoint_n,
+                repo_id=repo_id,
+                revision=revision,
+            )
+        )
 
 
 # ---- production defaults (lazy-imported so tests don't drag torch/HF in) ----

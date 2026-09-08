@@ -241,3 +241,138 @@ def test_code_environment_uses_v5_profile_prompt(monkeypatch):
         "After your reasoning, provide the final implementation in the last "
         "fenced Python code block."
     )
+
+
+# ── reliquarylogic_v1 ────────────────────────────────────────────────────
+#
+# The logic profile declared a prompt template from the start, but the
+# environment never rendered it: ``problem_from_task`` returned the bare
+# generated puzzle. The identity template hid the gap, because rendering it
+# and skipping it produced the same bytes.
+
+LOGIC_PROFILE_ID = "qwen3-4b-reliquary-logic-v8-dev1"
+LOGIC_TEMPLATE = (
+    "Solve the following problem step by step.\n\n"
+    "$problem\n\n"
+    "After your reasoning, give the final answer in the last fenced JSON "
+    "code block."
+)
+
+
+def _logic_profile():
+    return profiles.PROFILES[LOGIC_PROFILE_ID]
+
+
+def test_logic_generation_contract_pins_exact_prompt_template():
+    contract = profiles.to_generation_contract(LOGIC_PROFILE_ID)
+    prompt_contract = contract["environments"]["reliquarylogic_v1"][
+        "prompt_template"
+    ]
+
+    assert prompt_contract == {
+        "id": "reliquary-logic-step-by-step-v1",
+        "renderer": "dollar-substitution-v1",
+        "template": LOGIC_TEMPLATE,
+        "sha256": hashlib.sha256(LOGIC_TEMPLATE.encode("utf-8")).hexdigest(),
+    }
+
+
+def test_logic_template_renders_the_exact_canonical_prompt():
+    template = _logic_profile().environments[
+        "reliquarylogic_v1"
+    ].prompt_template
+    assert template is not None
+
+    assert template.render(problem="Is A true?") == (
+        "Solve the following problem step by step.\n\n"
+        "Is A true?\n\n"
+        "After your reasoning, give the final answer in the last fenced JSON "
+        "code block."
+    )
+
+
+def test_logic_environment_uses_profile_prompt(monkeypatch):
+    from reliquary.environment.logic_tasks import generate_logic_task
+    from reliquary.environment.reliquarylogic import ReliquaryLogicEnvironment
+
+    monkeypatch.setattr(
+        profiles, "ACTIVE_PROTOCOL_PROFILE", _logic_profile()
+    )
+    puzzle = generate_logic_task(0).prompt
+    prompt = ReliquaryLogicEnvironment().get_problem(0)["prompt"]
+
+    assert prompt == (
+        "Solve the following problem step by step.\n\n"
+        + puzzle
+        + "\n\nAfter your reasoning, give the final answer in the last "
+        "fenced JSON code block."
+    )
+    # The generated answer shape must survive the wrapper untouched: it is
+    # the only statement of the channel the grader reads.
+    assert '```json\n{"result": <final value>}\n```' in prompt
+
+
+def test_logic_environment_falls_back_to_the_bare_puzzle_off_profile(
+    monkeypatch,
+):
+    """A profile that does not declare logic must not break the generator.
+
+    The live Math+Code profiles have no logic environment, and offline
+    scoring runs under whichever profile happens to be active.
+    """
+    from reliquary.environment.logic_tasks import generate_logic_task
+    from reliquary.environment.reliquarylogic import ReliquaryLogicEnvironment
+
+    monkeypatch.setattr(
+        profiles,
+        "ACTIVE_PROTOCOL_PROFILE",
+        profiles.PROFILES["qwen35-2b-auction-v2"],
+    )
+
+    assert (
+        ReliquaryLogicEnvironment().get_problem(0)["prompt"]
+        == generate_logic_task(0).prompt
+    )
+
+
+def test_logic_problem_id_is_stable_across_the_prompt_contract(monkeypatch):
+    """Identity is the puzzle, not the envelope.
+
+    ``prompt_content_sha256`` burns a problem for the content cooldown, so an
+    id derived from the rendered prompt would silently resurrect every
+    already-consumed index on any future prompt change.
+    """
+    from reliquary.environment.reliquarylogic import ReliquaryLogicEnvironment
+
+    environment = ReliquaryLogicEnvironment()
+    monkeypatch.setattr(
+        profiles,
+        "ACTIVE_PROTOCOL_PROFILE",
+        profiles.PROFILES["qwen35-2b-auction-v2"],
+    )
+    bare = environment.get_problem(7)
+    monkeypatch.setattr(
+        profiles, "ACTIVE_PROTOCOL_PROFILE", _logic_profile()
+    )
+    rendered = environment.get_problem(7)
+
+    assert rendered["prompt"] != bare["prompt"]
+    assert rendered["id"] == bare["id"]
+
+
+def test_logic_budget_matches_the_reasoning_profile():
+    """One base model, one budget to think in.
+
+    v8 pins the same base revision as v4/v5, so a logic rollout has no reason
+    to be allowed less room than a math or code rollout on the same weights —
+    least of all now that its prompt asks for the reasoning first.
+    """
+    v5 = profiles.PROFILES[V5_PROFILE_ID]
+    logic = _logic_profile()
+
+    assert logic.model_id == v5.model_id
+    assert logic.model_revision == v5.model_revision
+    assert logic.environments["reliquarylogic_v1"].max_new_tokens == (
+        v5.environments["openmathinstruct"].max_new_tokens
+    )
+    assert logic.throughput_tiebreak == v5.throughput_tiebreak

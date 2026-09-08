@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
+import json
+from unittest.mock import patch
+
+import pytest
 
 from reliquary.infrastructure.archive_queue import ArchiveQueue
 
@@ -32,6 +37,125 @@ def test_archive_queue_reports_enqueue_continuity_gap(tmp_path):
 
     assert snapshot["enqueue_gaps_total"] == 1
     assert snapshot["last_enqueue_gap"] == {"after": 50, "before": 52}
+
+
+def test_archive_queue_replays_pending_bodies_by_exact_window(tmp_path):
+    queue = ArchiveQueue(str(tmp_path))
+    queue.enqueue(50, {"window_start": 50, "window_status": "aborted"})
+    queue.enqueue(51, {"window_start": 51, "batch": []})
+
+    assert queue.pending_window_numbers() == (50, 51)
+    assert queue.pending_archives(start_window=51, end_window=51) == {
+        51: {"window_start": 51, "batch": []}
+    }
+
+
+def test_archive_queue_rejects_body_key_identity_mismatch(tmp_path):
+    queue = ArchiveQueue(str(tmp_path))
+
+    with pytest.raises(ValueError, match="must match the queue identity"):
+        queue.enqueue(50, {"window_start": 49})
+
+    assert not (tmp_path / "window-50.json.gz").exists()
+    assert not (tmp_path / "window-50.json.gz.tmp").exists()
+
+
+@pytest.mark.parametrize("window_start", [True, -1, 1.0, "1"])
+def test_archive_queue_rejects_noncanonical_queue_identity_before_write(
+    tmp_path,
+    window_start,
+):
+    queue = ArchiveQueue(str(tmp_path))
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        queue.enqueue(window_start, {"window_start": window_start})
+
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("payload", [None, [], "archive"])
+def test_archive_queue_rejects_non_dictionary_body_before_write(
+    tmp_path,
+    payload,
+):
+    queue = ArchiveQueue(str(tmp_path))
+
+    with pytest.raises(TypeError, match="must be a dictionary"):
+        queue.enqueue(1, payload)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("body_window", [True, -1, 1.0, "1"])
+def test_archive_queue_rejects_noncanonical_body_identity_before_write(
+    tmp_path,
+    body_window,
+):
+    queue = ArchiveQueue(str(tmp_path))
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        queue.enqueue(1, {"window_start": body_window})
+
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "window-True.json.gz",
+        "window--1.json.gz",
+        "window-01.json.gz",
+        "window-1.foo.json.gz",
+    ],
+)
+def test_archive_queue_rejects_noncanonical_pending_filename(
+    tmp_path,
+    filename,
+):
+    queue = ArchiveQueue(str(tmp_path))
+    body = gzip.compress(json.dumps({"window_start": 1}).encode())
+    (tmp_path / filename).write_bytes(body)
+
+    with pytest.raises(RuntimeError, match="invalid pending archive path"):
+        queue.pending_window_numbers()
+    with pytest.raises(RuntimeError, match="invalid pending archive path"):
+        queue.pending_archives(start_window=0, end_window=10)
+
+
+@pytest.mark.parametrize("body_window", [True, -1, 1.0, "1"])
+def test_archive_queue_rejects_noncanonical_pending_body_identity(
+    tmp_path,
+    body_window,
+):
+    queue = ArchiveQueue(str(tmp_path))
+    body = gzip.compress(json.dumps({"window_start": body_window}).encode())
+    (tmp_path / "window-1.json.gz").write_bytes(body)
+
+    with pytest.raises(RuntimeError, match="identity mismatch"):
+        queue.pending_window_numbers()
+
+
+def test_archive_queue_rejects_duplicate_keys_in_pending_body(tmp_path):
+    queue = ArchiveQueue(str(tmp_path))
+    raw = b'{"window_start":1,"window_start":1,"batch":[]}'
+    (tmp_path / "window-1.json.gz").write_bytes(gzip.compress(raw))
+
+    with pytest.raises(RuntimeError, match="invalid pending archive body") as exc:
+        queue.pending_window_numbers()
+
+    assert exc.value.__cause__ is not None
+    assert "duplicate JSON key: window_start" in str(exc.value.__cause__)
+
+
+def test_archive_queue_failed_replace_leaves_no_visible_commit(tmp_path):
+    queue = ArchiveQueue(str(tmp_path))
+
+    with patch("os.replace", side_effect=OSError("replace failed")):
+        with pytest.raises(OSError, match="replace failed"):
+            queue.enqueue(50, {"window_start": 50})
+
+    assert not (tmp_path / "window-50.json.gz").exists()
+    assert not (tmp_path / "window-50.json.gz.tmp").exists()
 
 
 def test_archive_queue_snapshot_tracks_success(tmp_path, monkeypatch):

@@ -1,0 +1,8359 @@
+{
+ "model": "Qwen/Qwen3-4B-Base",
+ "revision": "906bfd4b4dc7f14ee4320094d8b41684abff8539",
+ "roster": [
+  "boolean_expressions",
+  "cryptarithm",
+  "dyck_language",
+  "dyck_language_errors",
+  "numbrix",
+  "object_properties",
+  "operation",
+  "time_sequence",
+  "web_of_lies"
+ ],
+ "rollouts": 16,
+ "sigma_min": 0.24,
+ "band": [
+  1,
+  15
+ ],
+ "max_new_tokens": 2048,
+ "rows": [
+  {
+   "family": "boolean_expressions",
+   "index": 711621471,
+   "difficulty": 5,
+   "k": 6,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 211
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1712571197,
+   "difficulty": 5,
+   "k": 8,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 76560682,
+   "difficulty": 4,
+   "k": 8,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1058196492,
+   "difficulty": 4,
+   "k": 11,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 73617964,
+   "difficulty": 2,
+   "k": 10,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 29
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 845334424,
+   "difficulty": 5,
+   "k": 9,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1223747138,
+   "difficulty": 2,
+   "k": 9,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 16
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 917621919,
+   "difficulty": 2,
+   "k": 13,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1105042079,
+   "difficulty": 5,
+   "k": 7,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 286853177,
+   "difficulty": 4,
+   "k": 11,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 230424329,
+   "difficulty": 4,
+   "k": 3,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1878973590,
+   "difficulty": 2,
+   "k": 13,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1182016813,
+   "difficulty": 5,
+   "k": 9,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 159541581,
+   "difficulty": 2,
+   "k": 12,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 224423435,
+   "difficulty": 4,
+   "k": 13,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1410431502,
+   "difficulty": 3,
+   "k": 10,
+   "in_band": true,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 31
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 2131446869,
+   "difficulty": 5,
+   "k": 7,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1272442440,
+   "difficulty": 5,
+   "k": 15,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 68048933,
+   "difficulty": 5,
+   "k": 11,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 237
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 2001073889,
+   "difficulty": 4,
+   "k": 13,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1965178657,
+   "difficulty": 2,
+   "k": 13,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1318171105,
+   "difficulty": 4,
+   "k": 14,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1343560813,
+   "difficulty": 2,
+   "k": 14,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1410032560,
+   "difficulty": 5,
+   "k": 8,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1550073616,
+   "difficulty": 2,
+   "k": 10,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1050302325,
+   "difficulty": 5,
+   "k": 5,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1779499196,
+   "difficulty": 3,
+   "k": 5,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 27
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 789230181,
+   "difficulty": 5,
+   "k": 9,
+   "in_band": true,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 140
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 106149255,
+   "difficulty": 2,
+   "k": 11,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 21
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1549538975,
+   "difficulty": 5,
+   "k": 12,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1727349783,
+   "difficulty": 4,
+   "k": 10,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 2080344801,
+   "difficulty": 2,
+   "k": 11,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 31
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 652366519,
+   "difficulty": 4,
+   "k": 9,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 187783696,
+   "difficulty": 4,
+   "k": 11,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 531099503,
+   "difficulty": 3,
+   "k": 5,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1647631108,
+   "difficulty": 4,
+   "k": 5,
+   "in_band": true,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 163
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1625932049,
+   "difficulty": 2,
+   "k": 9,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 766789396,
+   "difficulty": 4,
+   "k": 8,
+   "in_band": true,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 157
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 655932598,
+   "difficulty": 2,
+   "k": 13,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1666956836,
+   "difficulty": 4,
+   "k": 7,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 439565976,
+   "difficulty": 4,
+   "k": 14,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 658170004,
+   "difficulty": 2,
+   "k": 15,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 117148473,
+   "difficulty": 3,
+   "k": 10,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 114305914,
+   "difficulty": 2,
+   "k": 13,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1364050590,
+   "difficulty": 4,
+   "k": 15,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 160
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 759419129,
+   "difficulty": 2,
+   "k": 11,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1227416288,
+   "difficulty": 5,
+   "k": 12,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 258
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 474138647,
+   "difficulty": 4,
+   "k": 13,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1502693360,
+   "difficulty": 4,
+   "k": 9,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 113666903,
+   "difficulty": 2,
+   "k": 13,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1277699257,
+   "difficulty": 2,
+   "k": 13,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 702362259,
+   "difficulty": 5,
+   "k": 10,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 184
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 2022622047,
+   "difficulty": 2,
+   "k": 15,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 2131214216,
+   "difficulty": 4,
+   "k": 10,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 216656718,
+   "difficulty": 4,
+   "k": 10,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1396128283,
+   "difficulty": 4,
+   "k": 10,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 138339425,
+   "difficulty": 2,
+   "k": 9,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 603498602,
+   "difficulty": 5,
+   "k": 10,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1557828490,
+   "difficulty": 2,
+   "k": 13,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1844167485,
+   "difficulty": 2,
+   "k": 15,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1884282699,
+   "difficulty": 2,
+   "k": 12,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 726561760,
+   "difficulty": 5,
+   "k": 9,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 123
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1497728024,
+   "difficulty": 2,
+   "k": 9,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "boolean_expressions",
+   "index": 1434945326,
+   "difficulty": 5,
+   "k": 12,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 161
+  },
+  {
+   "family": "cryptarithm",
+   "index": 469390093,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 5,
+   "finished": 16,
+   "median_tokens": 339
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1827455576,
+   "difficulty": 2,
+   "k": 1,
+   "in_band": true,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 338
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1732459142,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 458
+  },
+  {
+   "family": "cryptarithm",
+   "index": 735373227,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 300
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1963476881,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 375
+  },
+  {
+   "family": "cryptarithm",
+   "index": 863208941,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 5,
+   "finished": 16,
+   "median_tokens": 491
+  },
+  {
+   "family": "cryptarithm",
+   "index": 310258888,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 513
+  },
+  {
+   "family": "cryptarithm",
+   "index": 844282230,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 8,
+   "finished": 15,
+   "median_tokens": 517
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1349834843,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 6,
+   "finished": 16,
+   "median_tokens": 304
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1432766604,
+   "difficulty": 2,
+   "k": 1,
+   "in_band": true,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 508
+  },
+  {
+   "family": "cryptarithm",
+   "index": 196849365,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 6,
+   "finished": 15,
+   "median_tokens": 597
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1955006837,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 303
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1124333858,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 236
+  },
+  {
+   "family": "cryptarithm",
+   "index": 184045529,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 492
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1793266976,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 6,
+   "finished": 16,
+   "median_tokens": 538
+  },
+  {
+   "family": "cryptarithm",
+   "index": 966774742,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 4,
+   "finished": 15,
+   "median_tokens": 260
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1043787491,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 466
+  },
+  {
+   "family": "cryptarithm",
+   "index": 442225738,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 9,
+   "finished": 15,
+   "median_tokens": 300
+  },
+  {
+   "family": "cryptarithm",
+   "index": 636226707,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 256
+  },
+  {
+   "family": "cryptarithm",
+   "index": 828092199,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 6,
+   "finished": 16,
+   "median_tokens": 379
+  },
+  {
+   "family": "cryptarithm",
+   "index": 440049973,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 6,
+   "finished": 15,
+   "median_tokens": 318
+  },
+  {
+   "family": "cryptarithm",
+   "index": 252842523,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 6,
+   "finished": 14,
+   "median_tokens": 475
+  },
+  {
+   "family": "cryptarithm",
+   "index": 2031879459,
+   "difficulty": 2,
+   "k": 1,
+   "in_band": true,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 187
+  },
+  {
+   "family": "cryptarithm",
+   "index": 833973669,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 3,
+   "finished": 16,
+   "median_tokens": 603
+  },
+  {
+   "family": "cryptarithm",
+   "index": 494203972,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 203
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1595924800,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 7,
+   "finished": 15,
+   "median_tokens": 340
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1384753957,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 5,
+   "finished": 15,
+   "median_tokens": 349
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1811282167,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 7,
+   "finished": 15,
+   "median_tokens": 508
+  },
+  {
+   "family": "cryptarithm",
+   "index": 345446479,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 8,
+   "finished": 14,
+   "median_tokens": 589
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1825948333,
+   "difficulty": 2,
+   "k": 1,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 523
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1419798538,
+   "difficulty": 2,
+   "k": 1,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 140
+  },
+  {
+   "family": "cryptarithm",
+   "index": 928072056,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 9,
+   "finished": 15,
+   "median_tokens": 413
+  },
+  {
+   "family": "cryptarithm",
+   "index": 444491715,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 7,
+   "finished": 15,
+   "median_tokens": 467
+  },
+  {
+   "family": "cryptarithm",
+   "index": 265935870,
+   "difficulty": 2,
+   "k": 1,
+   "in_band": true,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 404
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1713652017,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 283
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1559824859,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 622
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1755491676,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 8,
+   "finished": 15,
+   "median_tokens": 449
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1659672184,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 480
+  },
+  {
+   "family": "cryptarithm",
+   "index": 300915893,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 7,
+   "finished": 15,
+   "median_tokens": 57
+  },
+  {
+   "family": "cryptarithm",
+   "index": 702217670,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 384
+  },
+  {
+   "family": "cryptarithm",
+   "index": 879585454,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 377
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1733759412,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 507
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1547740615,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 356
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1805899621,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 8,
+   "finished": 14,
+   "median_tokens": 386
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1376960309,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 6,
+   "finished": 15,
+   "median_tokens": 444
+  },
+  {
+   "family": "cryptarithm",
+   "index": 600550237,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 7,
+   "finished": 13,
+   "median_tokens": 681
+  },
+  {
+   "family": "cryptarithm",
+   "index": 797546643,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 8,
+   "finished": 15,
+   "median_tokens": 589
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1006770361,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 220
+  },
+  {
+   "family": "cryptarithm",
+   "index": 196835902,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 6,
+   "finished": 15,
+   "median_tokens": 611
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1474818136,
+   "difficulty": 2,
+   "k": 1,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 586
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1475116443,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 491
+  },
+  {
+   "family": "cryptarithm",
+   "index": 769007874,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 9,
+   "finished": 15,
+   "median_tokens": 406
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1882762578,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 15,
+   "median_tokens": 432
+  },
+  {
+   "family": "cryptarithm",
+   "index": 118370224,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 6,
+   "finished": 15,
+   "median_tokens": 378
+  },
+  {
+   "family": "cryptarithm",
+   "index": 2050460524,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 7,
+   "finished": 15,
+   "median_tokens": 407
+  },
+  {
+   "family": "cryptarithm",
+   "index": 57622618,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 6,
+   "finished": 16,
+   "median_tokens": 253
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1212557083,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 4,
+   "finished": 15,
+   "median_tokens": 404
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1980964576,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 9,
+   "finished": 14,
+   "median_tokens": 487
+  },
+  {
+   "family": "cryptarithm",
+   "index": 153490311,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 7,
+   "finished": 14,
+   "median_tokens": 386
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1185669492,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 189
+  },
+  {
+   "family": "cryptarithm",
+   "index": 728106021,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 380
+  },
+  {
+   "family": "cryptarithm",
+   "index": 478405395,
+   "difficulty": 2,
+   "k": 1,
+   "in_band": true,
+   "parsed": 7,
+   "finished": 14,
+   "median_tokens": 196
+  },
+  {
+   "family": "cryptarithm",
+   "index": 988663558,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 6,
+   "finished": 16,
+   "median_tokens": 301
+  },
+  {
+   "family": "cryptarithm",
+   "index": 1872430281,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 6,
+   "finished": 15,
+   "median_tokens": 298
+  },
+  {
+   "family": "dyck_language",
+   "index": 1495086441,
+   "difficulty": 1,
+   "k": 1,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "dyck_language",
+   "index": 1733395257,
+   "difficulty": 1,
+   "k": 0,
+   "in_band": false,
+   "parsed": 6,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "dyck_language",
+   "index": 1335090736,
+   "difficulty": 1,
+   "k": 2,
+   "in_band": true,
+   "parsed": 6,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "dyck_language",
+   "index": 1319838106,
+   "difficulty": 1,
+   "k": 1,
+   "in_band": true,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "dyck_language",
+   "index": 776505409,
+   "difficulty": 1,
+   "k": 0,
+   "in_band": false,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "dyck_language",
+   "index": 252972607,
+   "difficulty": 1,
+   "k": 4,
+   "in_band": true,
+   "parsed": 6,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "dyck_language",
+   "index": 1633991068,
+   "difficulty": 1,
+   "k": 0,
+   "in_band": false,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 14
+  },
+  {
+   "family": "dyck_language",
+   "index": 835509437,
+   "difficulty": 1,
+   "k": 3,
+   "in_band": true,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "dyck_language",
+   "index": 2015242014,
+   "difficulty": 1,
+   "k": 1,
+   "in_band": true,
+   "parsed": 5,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "dyck_language",
+   "index": 1381571935,
+   "difficulty": 1,
+   "k": 2,
+   "in_band": true,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "dyck_language",
+   "index": 1728278760,
+   "difficulty": 1,
+   "k": 1,
+   "in_band": true,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "dyck_language",
+   "index": 1655375427,
+   "difficulty": 1,
+   "k": 0,
+   "in_band": false,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "dyck_language",
+   "index": 2111940524,
+   "difficulty": 1,
+   "k": 0,
+   "in_band": false,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 14
+  },
+  {
+   "family": "dyck_language",
+   "index": 1908307132,
+   "difficulty": 1,
+   "k": 0,
+   "in_band": false,
+   "parsed": 4,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "dyck_language",
+   "index": 1294053579,
+   "difficulty": 1,
+   "k": 0,
+   "in_band": false,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "dyck_language",
+   "index": 89575901,
+   "difficulty": 1,
+   "k": 1,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 14
+  },
+  {
+   "family": "dyck_language",
+   "index": 752786790,
+   "difficulty": 1,
+   "k": 1,
+   "in_band": true,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "dyck_language",
+   "index": 1285327527,
+   "difficulty": 1,
+   "k": 1,
+   "in_band": true,
+   "parsed": 5,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "dyck_language",
+   "index": 1738106755,
+   "difficulty": 1,
+   "k": 2,
+   "in_band": true,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "dyck_language",
+   "index": 976780882,
+   "difficulty": 1,
+   "k": 0,
+   "in_band": false,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "dyck_language",
+   "index": 1982850421,
+   "difficulty": 1,
+   "k": 1,
+   "in_band": true,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 19
+  },
+  {
+   "family": "dyck_language",
+   "index": 317293341,
+   "difficulty": 1,
+   "k": 0,
+   "in_band": false,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "dyck_language",
+   "index": 584789157,
+   "difficulty": 1,
+   "k": 1,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "dyck_language",
+   "index": 166097209,
+   "difficulty": 1,
+   "k": 0,
+   "in_band": false,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "dyck_language",
+   "index": 383118410,
+   "difficulty": 1,
+   "k": 0,
+   "in_band": false,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "dyck_language",
+   "index": 1705920893,
+   "difficulty": 1,
+   "k": 1,
+   "in_band": true,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "dyck_language",
+   "index": 2032150374,
+   "difficulty": 1,
+   "k": 0,
+   "in_band": false,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "dyck_language",
+   "index": 812073841,
+   "difficulty": 1,
+   "k": 1,
+   "in_band": true,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "dyck_language",
+   "index": 953771187,
+   "difficulty": 1,
+   "k": 3,
+   "in_band": true,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "dyck_language",
+   "index": 1209110951,
+   "difficulty": 1,
+   "k": 1,
+   "in_band": true,
+   "parsed": 5,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "dyck_language",
+   "index": 522316,
+   "difficulty": 1,
+   "k": 0,
+   "in_band": false,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "dyck_language",
+   "index": 353879626,
+   "difficulty": 1,
+   "k": 2,
+   "in_band": true,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "dyck_language",
+   "index": 915611845,
+   "difficulty": 1,
+   "k": 1,
+   "in_band": true,
+   "parsed": 5,
+   "finished": 16,
+   "median_tokens": 18
+  },
+  {
+   "family": "dyck_language",
+   "index": 462557861,
+   "difficulty": 1,
+   "k": 3,
+   "in_band": true,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "dyck_language",
+   "index": 1455244255,
+   "difficulty": 1,
+   "k": 1,
+   "in_band": true,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 14
+  },
+  {
+   "family": "dyck_language",
+   "index": 1206859718,
+   "difficulty": 1,
+   "k": 1,
+   "in_band": true,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "dyck_language",
+   "index": 1019027180,
+   "difficulty": 1,
+   "k": 1,
+   "in_band": true,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "dyck_language",
+   "index": 855706405,
+   "difficulty": 1,
+   "k": 1,
+   "in_band": true,
+   "parsed": 6,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "dyck_language",
+   "index": 1229906774,
+   "difficulty": 1,
+   "k": 0,
+   "in_band": false,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "dyck_language",
+   "index": 2141729930,
+   "difficulty": 1,
+   "k": 1,
+   "in_band": true,
+   "parsed": 5,
+   "finished": 16,
+   "median_tokens": 14
+  },
+  {
+   "family": "dyck_language",
+   "index": 1681370477,
+   "difficulty": 1,
+   "k": 1,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "dyck_language",
+   "index": 455245561,
+   "difficulty": 1,
+   "k": 1,
+   "in_band": true,
+   "parsed": 4,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "dyck_language",
+   "index": 1773371230,
+   "difficulty": 1,
+   "k": 3,
+   "in_band": true,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "dyck_language",
+   "index": 131184997,
+   "difficulty": 1,
+   "k": 2,
+   "in_band": true,
+   "parsed": 6,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "dyck_language",
+   "index": 1061582067,
+   "difficulty": 1,
+   "k": 0,
+   "in_band": false,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "dyck_language",
+   "index": 1138800565,
+   "difficulty": 1,
+   "k": 2,
+   "in_band": true,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "dyck_language",
+   "index": 2072438376,
+   "difficulty": 1,
+   "k": 0,
+   "in_band": false,
+   "parsed": 4,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "dyck_language",
+   "index": 1999765649,
+   "difficulty": 1,
+   "k": 1,
+   "in_band": true,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 14
+  },
+  {
+   "family": "dyck_language",
+   "index": 1460142589,
+   "difficulty": 1,
+   "k": 0,
+   "in_band": false,
+   "parsed": 4,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "dyck_language",
+   "index": 1675230174,
+   "difficulty": 1,
+   "k": 0,
+   "in_band": false,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "dyck_language",
+   "index": 1583932541,
+   "difficulty": 1,
+   "k": 1,
+   "in_band": true,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "dyck_language",
+   "index": 1423025444,
+   "difficulty": 1,
+   "k": 2,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "dyck_language",
+   "index": 461883403,
+   "difficulty": 1,
+   "k": 1,
+   "in_band": true,
+   "parsed": 5,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "dyck_language",
+   "index": 973366842,
+   "difficulty": 1,
+   "k": 0,
+   "in_band": false,
+   "parsed": 4,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "dyck_language",
+   "index": 1967913090,
+   "difficulty": 1,
+   "k": 1,
+   "in_band": true,
+   "parsed": 4,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "dyck_language",
+   "index": 173570924,
+   "difficulty": 1,
+   "k": 0,
+   "in_band": false,
+   "parsed": 5,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "dyck_language",
+   "index": 871714345,
+   "difficulty": 1,
+   "k": 1,
+   "in_band": true,
+   "parsed": 6,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "dyck_language",
+   "index": 1205339971,
+   "difficulty": 1,
+   "k": 0,
+   "in_band": false,
+   "parsed": 4,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "dyck_language",
+   "index": 364258563,
+   "difficulty": 1,
+   "k": 1,
+   "in_band": true,
+   "parsed": 2,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "dyck_language",
+   "index": 415513933,
+   "difficulty": 1,
+   "k": 1,
+   "in_band": true,
+   "parsed": 6,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "dyck_language",
+   "index": 721140569,
+   "difficulty": 1,
+   "k": 0,
+   "in_band": false,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "dyck_language",
+   "index": 828326192,
+   "difficulty": 1,
+   "k": 1,
+   "in_band": true,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "dyck_language",
+   "index": 1184151565,
+   "difficulty": 1,
+   "k": 1,
+   "in_band": true,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "dyck_language",
+   "index": 554553068,
+   "difficulty": 1,
+   "k": 0,
+   "in_band": false,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 1516852069,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 262
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 846203264,
+   "difficulty": 2,
+   "k": 1,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 52
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 53538893,
+   "difficulty": 3,
+   "k": 7,
+   "in_band": true,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 129
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 794514901,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 222
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 1132428892,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 110
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 918060649,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 15,
+   "median_tokens": 37
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 686019379,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 14
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 1540579954,
+   "difficulty": 2,
+   "k": 1,
+   "in_band": true,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 278
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 618773037,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 201
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 12360972,
+   "difficulty": 3,
+   "k": 2,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 78
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 599322391,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 238
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 2111588892,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 5,
+   "finished": 16,
+   "median_tokens": 288
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 638590318,
+   "difficulty": 3,
+   "k": 2,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 268
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 2099889881,
+   "difficulty": 4,
+   "k": 6,
+   "in_band": true,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 326
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 1018115075,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 209
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 845450454,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 166
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 336248790,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 329
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 684885731,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 10,
+   "finished": 15,
+   "median_tokens": 204
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 290486180,
+   "difficulty": 2,
+   "k": 2,
+   "in_band": true,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 26
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 254248560,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 8,
+   "finished": 15,
+   "median_tokens": 411
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 242978011,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 153
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 1872797989,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 162
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 1794831948,
+   "difficulty": 3,
+   "k": 2,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 126
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 799082321,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 144
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 384437374,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 6,
+   "finished": 15,
+   "median_tokens": 305
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 621504684,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 8,
+   "finished": 15,
+   "median_tokens": 281
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 927084542,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 170
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 466181544,
+   "difficulty": 3,
+   "k": 2,
+   "in_band": true,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 223
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 930126528,
+   "difficulty": 2,
+   "k": 1,
+   "in_band": true,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 220
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 243914409,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 5,
+   "finished": 16,
+   "median_tokens": 521
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 1041228718,
+   "difficulty": 2,
+   "k": 2,
+   "in_band": true,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 118
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 1154514724,
+   "difficulty": 2,
+   "k": 3,
+   "in_band": true,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 55
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 1839157717,
+   "difficulty": 3,
+   "k": 2,
+   "in_band": true,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 293
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 2134243665,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 397
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 1475740571,
+   "difficulty": 3,
+   "k": 2,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 325
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 1613336637,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 166
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 814320645,
+   "difficulty": 2,
+   "k": 5,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 187
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 1667025859,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 9,
+   "finished": 15,
+   "median_tokens": 194
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 1494733487,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 205
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 1698790284,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 26
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 1920843288,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 14
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 299280777,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 124
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 1346754254,
+   "difficulty": 2,
+   "k": 3,
+   "in_band": true,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 179
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 212115091,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 14
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 1957180179,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 196
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 455216636,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 197
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 1138786724,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 380
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 144203049,
+   "difficulty": 3,
+   "k": 2,
+   "in_band": true,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 337
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 919286571,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 15,
+   "median_tokens": 16
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 150898147,
+   "difficulty": 3,
+   "k": 5,
+   "in_band": true,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 163
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 542078513,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 7,
+   "finished": 15,
+   "median_tokens": 392
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 1149659581,
+   "difficulty": 2,
+   "k": 7,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 25
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 1756007992,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 14
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 102747883,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 322
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 2140275735,
+   "difficulty": 2,
+   "k": 2,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 38
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 1857799552,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 253
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 1157010615,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 363
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 1270564480,
+   "difficulty": 2,
+   "k": 2,
+   "in_band": true,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 37
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 1434536167,
+   "difficulty": 2,
+   "k": 2,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 56
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 950134001,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 8,
+   "finished": 15,
+   "median_tokens": 214
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 1932631847,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 286
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 1388916590,
+   "difficulty": 2,
+   "k": 1,
+   "in_band": true,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 298
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 370245475,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 293
+  },
+  {
+   "family": "dyck_language_errors",
+   "index": 554748842,
+   "difficulty": 4,
+   "k": 3,
+   "in_band": true,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 186
+  },
+  {
+   "family": "numbrix",
+   "index": 1545524063,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 126
+  },
+  {
+   "family": "numbrix",
+   "index": 509114047,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 15,
+   "median_tokens": 117
+  },
+  {
+   "family": "numbrix",
+   "index": 1979695093,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 91
+  },
+  {
+   "family": "numbrix",
+   "index": 105500907,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 174
+  },
+  {
+   "family": "numbrix",
+   "index": 336835980,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 168
+  },
+  {
+   "family": "numbrix",
+   "index": 1834190173,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 203
+  },
+  {
+   "family": "numbrix",
+   "index": 822579643,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 139
+  },
+  {
+   "family": "numbrix",
+   "index": 1318297467,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 157
+  },
+  {
+   "family": "numbrix",
+   "index": 1632976005,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 157
+  },
+  {
+   "family": "numbrix",
+   "index": 1183833792,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 10,
+   "finished": 14,
+   "median_tokens": 231
+  },
+  {
+   "family": "numbrix",
+   "index": 1016668653,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 8,
+   "finished": 15,
+   "median_tokens": 103
+  },
+  {
+   "family": "numbrix",
+   "index": 368642508,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 169
+  },
+  {
+   "family": "numbrix",
+   "index": 1979006506,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 92
+  },
+  {
+   "family": "numbrix",
+   "index": 1626868775,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 92
+  },
+  {
+   "family": "numbrix",
+   "index": 345026917,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 248
+  },
+  {
+   "family": "numbrix",
+   "index": 697180062,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 163
+  },
+  {
+   "family": "numbrix",
+   "index": 957016200,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 91
+  },
+  {
+   "family": "numbrix",
+   "index": 1892602888,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 15,
+   "median_tokens": 404
+  },
+  {
+   "family": "numbrix",
+   "index": 1743936506,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 107
+  },
+  {
+   "family": "numbrix",
+   "index": 107621714,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 15,
+   "median_tokens": 257
+  },
+  {
+   "family": "numbrix",
+   "index": 729716232,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 118
+  },
+  {
+   "family": "numbrix",
+   "index": 1232928531,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 150
+  },
+  {
+   "family": "numbrix",
+   "index": 746158661,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 86
+  },
+  {
+   "family": "numbrix",
+   "index": 813974205,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 109
+  },
+  {
+   "family": "numbrix",
+   "index": 1825606802,
+   "difficulty": 3,
+   "k": 2,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 139
+  },
+  {
+   "family": "numbrix",
+   "index": 378520912,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 197
+  },
+  {
+   "family": "numbrix",
+   "index": 678459737,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 188
+  },
+  {
+   "family": "numbrix",
+   "index": 1876143164,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 122
+  },
+  {
+   "family": "numbrix",
+   "index": 1311931741,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 160
+  },
+  {
+   "family": "numbrix",
+   "index": 2107020376,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 14,
+   "median_tokens": 135
+  },
+  {
+   "family": "numbrix",
+   "index": 1399089948,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 152
+  },
+  {
+   "family": "numbrix",
+   "index": 1710702137,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 12,
+   "finished": 15,
+   "median_tokens": 241
+  },
+  {
+   "family": "numbrix",
+   "index": 1864137310,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 176
+  },
+  {
+   "family": "numbrix",
+   "index": 1960569199,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 158
+  },
+  {
+   "family": "numbrix",
+   "index": 1380288034,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 156
+  },
+  {
+   "family": "numbrix",
+   "index": 583389657,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 15,
+   "median_tokens": 132
+  },
+  {
+   "family": "numbrix",
+   "index": 2080047455,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 135
+  },
+  {
+   "family": "numbrix",
+   "index": 1154168625,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 143
+  },
+  {
+   "family": "numbrix",
+   "index": 649703518,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 163
+  },
+  {
+   "family": "numbrix",
+   "index": 700579059,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 186
+  },
+  {
+   "family": "numbrix",
+   "index": 270368035,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 233
+  },
+  {
+   "family": "numbrix",
+   "index": 1461631040,
+   "difficulty": 3,
+   "k": 4,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 141
+  },
+  {
+   "family": "numbrix",
+   "index": 381775436,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 165
+  },
+  {
+   "family": "numbrix",
+   "index": 148327514,
+   "difficulty": 3,
+   "k": 2,
+   "in_band": true,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 107
+  },
+  {
+   "family": "numbrix",
+   "index": 327467861,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 129
+  },
+  {
+   "family": "numbrix",
+   "index": 1420505754,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 15,
+   "median_tokens": 146
+  },
+  {
+   "family": "numbrix",
+   "index": 1080824825,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 131
+  },
+  {
+   "family": "numbrix",
+   "index": 1162417049,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 234
+  },
+  {
+   "family": "numbrix",
+   "index": 554132632,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 136
+  },
+  {
+   "family": "numbrix",
+   "index": 1453831986,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 259
+  },
+  {
+   "family": "numbrix",
+   "index": 136121413,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 91
+  },
+  {
+   "family": "numbrix",
+   "index": 1714991817,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 140
+  },
+  {
+   "family": "numbrix",
+   "index": 1735027652,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 138
+  },
+  {
+   "family": "numbrix",
+   "index": 2058886338,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 328
+  },
+  {
+   "family": "numbrix",
+   "index": 1323141063,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 144
+  },
+  {
+   "family": "numbrix",
+   "index": 1701877300,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 15,
+   "median_tokens": 188
+  },
+  {
+   "family": "numbrix",
+   "index": 1055192501,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 187
+  },
+  {
+   "family": "numbrix",
+   "index": 1904336894,
+   "difficulty": 3,
+   "k": 2,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 82
+  },
+  {
+   "family": "numbrix",
+   "index": 491586899,
+   "difficulty": 3,
+   "k": 3,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 15,
+   "median_tokens": 139
+  },
+  {
+   "family": "numbrix",
+   "index": 327141441,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 166
+  },
+  {
+   "family": "numbrix",
+   "index": 1079118158,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 120
+  },
+  {
+   "family": "numbrix",
+   "index": 2129352972,
+   "difficulty": 4,
+   "k": 2,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 15,
+   "median_tokens": 160
+  },
+  {
+   "family": "numbrix",
+   "index": 1963267690,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 120
+  },
+  {
+   "family": "numbrix",
+   "index": 1232204353,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 212
+  },
+  {
+   "family": "object_properties",
+   "index": 280646616,
+   "difficulty": 2,
+   "k": 6,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 1347451066,
+   "difficulty": 4,
+   "k": 8,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 1137548661,
+   "difficulty": 2,
+   "k": 2,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 289052463,
+   "difficulty": 2,
+   "k": 10,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 1942734845,
+   "difficulty": 2,
+   "k": 1,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 982711321,
+   "difficulty": 3,
+   "k": 9,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 1514443863,
+   "difficulty": 2,
+   "k": 4,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 1357402094,
+   "difficulty": 4,
+   "k": 2,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 644069911,
+   "difficulty": 4,
+   "k": 10,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "object_properties",
+   "index": 1499889145,
+   "difficulty": 2,
+   "k": 8,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 14
+  },
+  {
+   "family": "object_properties",
+   "index": 1846597804,
+   "difficulty": 4,
+   "k": 8,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 240327703,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 293815531,
+   "difficulty": 2,
+   "k": 9,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 895142006,
+   "difficulty": 3,
+   "k": 7,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 1513639072,
+   "difficulty": 3,
+   "k": 7,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 1433449102,
+   "difficulty": 2,
+   "k": 4,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 20
+  },
+  {
+   "family": "object_properties",
+   "index": 169109517,
+   "difficulty": 2,
+   "k": 10,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 1669701273,
+   "difficulty": 2,
+   "k": 15,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "object_properties",
+   "index": 348649918,
+   "difficulty": 2,
+   "k": 7,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 65900463,
+   "difficulty": 3,
+   "k": 10,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 1785420233,
+   "difficulty": 3,
+   "k": 7,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 316853440,
+   "difficulty": 2,
+   "k": 12,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 1710473466,
+   "difficulty": 3,
+   "k": 3,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 17
+  },
+  {
+   "family": "object_properties",
+   "index": 1195473046,
+   "difficulty": 4,
+   "k": 14,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "object_properties",
+   "index": 30181787,
+   "difficulty": 2,
+   "k": 9,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 51614411,
+   "difficulty": 4,
+   "k": 3,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 15,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 959948212,
+   "difficulty": 4,
+   "k": 11,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 165041146,
+   "difficulty": 4,
+   "k": 6,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 138740302,
+   "difficulty": 3,
+   "k": 11,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "object_properties",
+   "index": 1139436974,
+   "difficulty": 4,
+   "k": 8,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 1603628179,
+   "difficulty": 3,
+   "k": 5,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 1102441663,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 9735927,
+   "difficulty": 4,
+   "k": 3,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 1889631046,
+   "difficulty": 2,
+   "k": 6,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 316388833,
+   "difficulty": 3,
+   "k": 8,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 1751452082,
+   "difficulty": 2,
+   "k": 14,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 431234299,
+   "difficulty": 4,
+   "k": 3,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 1663861872,
+   "difficulty": 2,
+   "k": 5,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "object_properties",
+   "index": 1863569530,
+   "difficulty": 3,
+   "k": 5,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 75179076,
+   "difficulty": 3,
+   "k": 11,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "object_properties",
+   "index": 1322333381,
+   "difficulty": 3,
+   "k": 12,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "object_properties",
+   "index": 430387833,
+   "difficulty": 4,
+   "k": 10,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 15,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 309198092,
+   "difficulty": 4,
+   "k": 13,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 1937885623,
+   "difficulty": 3,
+   "k": 12,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 998235857,
+   "difficulty": 2,
+   "k": 1,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 1883215294,
+   "difficulty": 4,
+   "k": 6,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 14
+  },
+  {
+   "family": "object_properties",
+   "index": 1867408512,
+   "difficulty": 4,
+   "k": 5,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 294102214,
+   "difficulty": 3,
+   "k": 4,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 826578401,
+   "difficulty": 2,
+   "k": 6,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 14
+  },
+  {
+   "family": "object_properties",
+   "index": 1106853701,
+   "difficulty": 3,
+   "k": 2,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 783029048,
+   "difficulty": 3,
+   "k": 4,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 565140736,
+   "difficulty": 4,
+   "k": 2,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 1348938922,
+   "difficulty": 4,
+   "k": 4,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 609235182,
+   "difficulty": 2,
+   "k": 11,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 1277903540,
+   "difficulty": 2,
+   "k": 10,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "object_properties",
+   "index": 2063226546,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 1602433582,
+   "difficulty": 3,
+   "k": 9,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 735525536,
+   "difficulty": 2,
+   "k": 1,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 1055224738,
+   "difficulty": 4,
+   "k": 11,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 89090535,
+   "difficulty": 4,
+   "k": 9,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 474443999,
+   "difficulty": 2,
+   "k": 3,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 1363178635,
+   "difficulty": 4,
+   "k": 4,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 1484978745,
+   "difficulty": 3,
+   "k": 14,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "object_properties",
+   "index": 205917611,
+   "difficulty": 4,
+   "k": 7,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "operation",
+   "index": 1647999605,
+   "difficulty": 2,
+   "k": 7,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 95
+  },
+  {
+   "family": "operation",
+   "index": 1681700205,
+   "difficulty": 3,
+   "k": 5,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 205
+  },
+  {
+   "family": "operation",
+   "index": 216613324,
+   "difficulty": 2,
+   "k": 1,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "operation",
+   "index": 2094171666,
+   "difficulty": 3,
+   "k": 7,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 173
+  },
+  {
+   "family": "operation",
+   "index": 824056009,
+   "difficulty": 2,
+   "k": 2,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "operation",
+   "index": 1887462228,
+   "difficulty": 3,
+   "k": 3,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 16
+  },
+  {
+   "family": "operation",
+   "index": 1683094237,
+   "difficulty": 2,
+   "k": 7,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 133
+  },
+  {
+   "family": "operation",
+   "index": 1845098273,
+   "difficulty": 3,
+   "k": 3,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 323
+  },
+  {
+   "family": "operation",
+   "index": 951093765,
+   "difficulty": 3,
+   "k": 6,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 205
+  },
+  {
+   "family": "operation",
+   "index": 1687709408,
+   "difficulty": 2,
+   "k": 1,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "operation",
+   "index": 683298226,
+   "difficulty": 2,
+   "k": 5,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "operation",
+   "index": 1353480419,
+   "difficulty": 3,
+   "k": 3,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 77
+  },
+  {
+   "family": "operation",
+   "index": 1471018971,
+   "difficulty": 3,
+   "k": 5,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 231
+  },
+  {
+   "family": "operation",
+   "index": 368449157,
+   "difficulty": 2,
+   "k": 2,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 16
+  },
+  {
+   "family": "operation",
+   "index": 488268725,
+   "difficulty": 2,
+   "k": 12,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 126
+  },
+  {
+   "family": "operation",
+   "index": 912548711,
+   "difficulty": 3,
+   "k": 3,
+   "in_band": true,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 24
+  },
+  {
+   "family": "operation",
+   "index": 1527527484,
+   "difficulty": 2,
+   "k": 1,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "operation",
+   "index": 185643633,
+   "difficulty": 2,
+   "k": 5,
+   "in_band": true,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 118
+  },
+  {
+   "family": "operation",
+   "index": 1626273533,
+   "difficulty": 3,
+   "k": 5,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 63
+  },
+  {
+   "family": "operation",
+   "index": 1285868814,
+   "difficulty": 3,
+   "k": 6,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 130
+  },
+  {
+   "family": "operation",
+   "index": 2088253821,
+   "difficulty": 3,
+   "k": 8,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 175
+  },
+  {
+   "family": "operation",
+   "index": 2133468816,
+   "difficulty": 2,
+   "k": 10,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 138
+  },
+  {
+   "family": "operation",
+   "index": 1380410219,
+   "difficulty": 3,
+   "k": 5,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 196
+  },
+  {
+   "family": "operation",
+   "index": 1575342096,
+   "difficulty": 2,
+   "k": 1,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "operation",
+   "index": 175589252,
+   "difficulty": 3,
+   "k": 6,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 16
+  },
+  {
+   "family": "operation",
+   "index": 1596811015,
+   "difficulty": 3,
+   "k": 5,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 15,
+   "median_tokens": 208
+  },
+  {
+   "family": "operation",
+   "index": 238827080,
+   "difficulty": 2,
+   "k": 5,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 68
+  },
+  {
+   "family": "operation",
+   "index": 1625720735,
+   "difficulty": 3,
+   "k": 7,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 119
+  },
+  {
+   "family": "operation",
+   "index": 389198026,
+   "difficulty": 3,
+   "k": 6,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 195
+  },
+  {
+   "family": "operation",
+   "index": 857268924,
+   "difficulty": 3,
+   "k": 4,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 24
+  },
+  {
+   "family": "operation",
+   "index": 794815003,
+   "difficulty": 2,
+   "k": 3,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 68
+  },
+  {
+   "family": "operation",
+   "index": 431356985,
+   "difficulty": 2,
+   "k": 2,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "operation",
+   "index": 1271484082,
+   "difficulty": 3,
+   "k": 6,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 242
+  },
+  {
+   "family": "operation",
+   "index": 1249232890,
+   "difficulty": 3,
+   "k": 6,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 183
+  },
+  {
+   "family": "operation",
+   "index": 1093461951,
+   "difficulty": 3,
+   "k": 3,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "operation",
+   "index": 214361923,
+   "difficulty": 2,
+   "k": 1,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "operation",
+   "index": 892123279,
+   "difficulty": 2,
+   "k": 4,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 68
+  },
+  {
+   "family": "operation",
+   "index": 1075790691,
+   "difficulty": 2,
+   "k": 2,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "operation",
+   "index": 1301150004,
+   "difficulty": 2,
+   "k": 1,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "operation",
+   "index": 291178493,
+   "difficulty": 2,
+   "k": 5,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 141
+  },
+  {
+   "family": "operation",
+   "index": 238007950,
+   "difficulty": 2,
+   "k": 8,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "operation",
+   "index": 1696587032,
+   "difficulty": 3,
+   "k": 7,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 224
+  },
+  {
+   "family": "operation",
+   "index": 1003243486,
+   "difficulty": 3,
+   "k": 4,
+   "in_band": true,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 56
+  },
+  {
+   "family": "operation",
+   "index": 788461364,
+   "difficulty": 3,
+   "k": 4,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 15,
+   "median_tokens": 13
+  },
+  {
+   "family": "operation",
+   "index": 1145278765,
+   "difficulty": 2,
+   "k": 4,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 14
+  },
+  {
+   "family": "operation",
+   "index": 1126395445,
+   "difficulty": 3,
+   "k": 3,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 56
+  },
+  {
+   "family": "operation",
+   "index": 1350011393,
+   "difficulty": 3,
+   "k": 6,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 16
+  },
+  {
+   "family": "operation",
+   "index": 804266994,
+   "difficulty": 2,
+   "k": 5,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "operation",
+   "index": 1338710195,
+   "difficulty": 2,
+   "k": 5,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 68
+  },
+  {
+   "family": "operation",
+   "index": 47187022,
+   "difficulty": 2,
+   "k": 7,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 16
+  },
+  {
+   "family": "operation",
+   "index": 1538418223,
+   "difficulty": 2,
+   "k": 1,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "operation",
+   "index": 450499013,
+   "difficulty": 2,
+   "k": 5,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 68
+  },
+  {
+   "family": "operation",
+   "index": 1188535318,
+   "difficulty": 3,
+   "k": 5,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 242
+  },
+  {
+   "family": "operation",
+   "index": 975980058,
+   "difficulty": 3,
+   "k": 4,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 16
+  },
+  {
+   "family": "operation",
+   "index": 1357187149,
+   "difficulty": 3,
+   "k": 7,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 164
+  },
+  {
+   "family": "operation",
+   "index": 1578435773,
+   "difficulty": 2,
+   "k": 5,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 68
+  },
+  {
+   "family": "operation",
+   "index": 1627179753,
+   "difficulty": 2,
+   "k": 7,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 68
+  },
+  {
+   "family": "operation",
+   "index": 1038691338,
+   "difficulty": 2,
+   "k": 7,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 68
+  },
+  {
+   "family": "operation",
+   "index": 1595292557,
+   "difficulty": 3,
+   "k": 3,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 16
+  },
+  {
+   "family": "operation",
+   "index": 996697023,
+   "difficulty": 3,
+   "k": 6,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 230
+  },
+  {
+   "family": "operation",
+   "index": 223553151,
+   "difficulty": 3,
+   "k": 3,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 14
+  },
+  {
+   "family": "operation",
+   "index": 898899569,
+   "difficulty": 2,
+   "k": 6,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 68
+  },
+  {
+   "family": "operation",
+   "index": 1764079428,
+   "difficulty": 2,
+   "k": 9,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 68
+  },
+  {
+   "family": "operation",
+   "index": 998735862,
+   "difficulty": 3,
+   "k": 3,
+   "in_band": true,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 108
+  },
+  {
+   "family": "time_sequence",
+   "index": 1571306751,
+   "difficulty": 3,
+   "k": 12,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "time_sequence",
+   "index": 1429319277,
+   "difficulty": 5,
+   "k": 3,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 274
+  },
+  {
+   "family": "time_sequence",
+   "index": 1321275334,
+   "difficulty": 5,
+   "k": 5,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 198
+  },
+  {
+   "family": "time_sequence",
+   "index": 188464899,
+   "difficulty": 4,
+   "k": 7,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 214
+  },
+  {
+   "family": "time_sequence",
+   "index": 1750070315,
+   "difficulty": 3,
+   "k": 13,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 25
+  },
+  {
+   "family": "time_sequence",
+   "index": 1856150480,
+   "difficulty": 3,
+   "k": 14,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "time_sequence",
+   "index": 1086832985,
+   "difficulty": 3,
+   "k": 15,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "time_sequence",
+   "index": 1234820840,
+   "difficulty": 5,
+   "k": 7,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 230
+  },
+  {
+   "family": "time_sequence",
+   "index": 1491643388,
+   "difficulty": 3,
+   "k": 7,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 16
+  },
+  {
+   "family": "time_sequence",
+   "index": 2079049588,
+   "difficulty": 4,
+   "k": 3,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 23
+  },
+  {
+   "family": "time_sequence",
+   "index": 1086064772,
+   "difficulty": 3,
+   "k": 3,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "time_sequence",
+   "index": 129864835,
+   "difficulty": 4,
+   "k": 15,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "time_sequence",
+   "index": 825149384,
+   "difficulty": 5,
+   "k": 6,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 190
+  },
+  {
+   "family": "time_sequence",
+   "index": 1311158456,
+   "difficulty": 4,
+   "k": 4,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 20
+  },
+  {
+   "family": "time_sequence",
+   "index": 1890066715,
+   "difficulty": 3,
+   "k": 12,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 15,
+   "median_tokens": 25
+  },
+  {
+   "family": "time_sequence",
+   "index": 1628037049,
+   "difficulty": 3,
+   "k": 13,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "time_sequence",
+   "index": 839908678,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "time_sequence",
+   "index": 1830862137,
+   "difficulty": 5,
+   "k": 3,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 37
+  },
+  {
+   "family": "time_sequence",
+   "index": 832114687,
+   "difficulty": 5,
+   "k": 4,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "time_sequence",
+   "index": 673979072,
+   "difficulty": 3,
+   "k": 15,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "time_sequence",
+   "index": 457587993,
+   "difficulty": 4,
+   "k": 10,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 261
+  },
+  {
+   "family": "time_sequence",
+   "index": 1054546581,
+   "difficulty": 5,
+   "k": 5,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 272
+  },
+  {
+   "family": "time_sequence",
+   "index": 1849535689,
+   "difficulty": 3,
+   "k": 13,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "time_sequence",
+   "index": 118937228,
+   "difficulty": 4,
+   "k": 7,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 18
+  },
+  {
+   "family": "time_sequence",
+   "index": 55364296,
+   "difficulty": 5,
+   "k": 4,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 21
+  },
+  {
+   "family": "time_sequence",
+   "index": 87494373,
+   "difficulty": 4,
+   "k": 13,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "time_sequence",
+   "index": 222068186,
+   "difficulty": 4,
+   "k": 4,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "time_sequence",
+   "index": 864780216,
+   "difficulty": 5,
+   "k": 5,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 129
+  },
+  {
+   "family": "time_sequence",
+   "index": 623625597,
+   "difficulty": 4,
+   "k": 4,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "time_sequence",
+   "index": 1510607581,
+   "difficulty": 4,
+   "k": 12,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 103
+  },
+  {
+   "family": "time_sequence",
+   "index": 1813630716,
+   "difficulty": 3,
+   "k": 6,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 32
+  },
+  {
+   "family": "time_sequence",
+   "index": 1392493595,
+   "difficulty": 5,
+   "k": 8,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 178
+  },
+  {
+   "family": "time_sequence",
+   "index": 1183223644,
+   "difficulty": 4,
+   "k": 3,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 18
+  },
+  {
+   "family": "time_sequence",
+   "index": 726886543,
+   "difficulty": 5,
+   "k": 6,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 56
+  },
+  {
+   "family": "time_sequence",
+   "index": 90304366,
+   "difficulty": 3,
+   "k": 13,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "time_sequence",
+   "index": 2102468524,
+   "difficulty": 5,
+   "k": 3,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 253
+  },
+  {
+   "family": "time_sequence",
+   "index": 555160074,
+   "difficulty": 4,
+   "k": 2,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "time_sequence",
+   "index": 561580488,
+   "difficulty": 3,
+   "k": 12,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "time_sequence",
+   "index": 1490040049,
+   "difficulty": 3,
+   "k": 12,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 16
+  },
+  {
+   "family": "time_sequence",
+   "index": 1966175730,
+   "difficulty": 5,
+   "k": 13,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 21
+  },
+  {
+   "family": "time_sequence",
+   "index": 268302103,
+   "difficulty": 4,
+   "k": 14,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 112
+  },
+  {
+   "family": "time_sequence",
+   "index": 662488454,
+   "difficulty": 5,
+   "k": 5,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 27
+  },
+  {
+   "family": "time_sequence",
+   "index": 1277516708,
+   "difficulty": 4,
+   "k": 13,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 20
+  },
+  {
+   "family": "time_sequence",
+   "index": 1303380023,
+   "difficulty": 5,
+   "k": 6,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 247
+  },
+  {
+   "family": "time_sequence",
+   "index": 18440660,
+   "difficulty": 3,
+   "k": 3,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 164
+  },
+  {
+   "family": "time_sequence",
+   "index": 1462716653,
+   "difficulty": 4,
+   "k": 12,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "time_sequence",
+   "index": 6852382,
+   "difficulty": 5,
+   "k": 5,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 183
+  },
+  {
+   "family": "time_sequence",
+   "index": 1008049884,
+   "difficulty": 4,
+   "k": 4,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "time_sequence",
+   "index": 469213784,
+   "difficulty": 3,
+   "k": 11,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "time_sequence",
+   "index": 1475056187,
+   "difficulty": 3,
+   "k": 10,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "time_sequence",
+   "index": 976620160,
+   "difficulty": 5,
+   "k": 12,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "time_sequence",
+   "index": 939873136,
+   "difficulty": 4,
+   "k": 5,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 18
+  },
+  {
+   "family": "time_sequence",
+   "index": 1767799699,
+   "difficulty": 3,
+   "k": 3,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "time_sequence",
+   "index": 1903289393,
+   "difficulty": 3,
+   "k": 15,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "time_sequence",
+   "index": 641466856,
+   "difficulty": 3,
+   "k": 11,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "time_sequence",
+   "index": 735219273,
+   "difficulty": 3,
+   "k": 15,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "time_sequence",
+   "index": 1320926236,
+   "difficulty": 5,
+   "k": 2,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 47
+  },
+  {
+   "family": "time_sequence",
+   "index": 1426382082,
+   "difficulty": 3,
+   "k": 3,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "time_sequence",
+   "index": 1205575327,
+   "difficulty": 3,
+   "k": 12,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 83
+  },
+  {
+   "family": "time_sequence",
+   "index": 331489627,
+   "difficulty": 3,
+   "k": 15,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "time_sequence",
+   "index": 617614872,
+   "difficulty": 4,
+   "k": 3,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 18
+  },
+  {
+   "family": "time_sequence",
+   "index": 1286388282,
+   "difficulty": 4,
+   "k": 7,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 70
+  },
+  {
+   "family": "time_sequence",
+   "index": 389771845,
+   "difficulty": 3,
+   "k": 11,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 179
+  },
+  {
+   "family": "time_sequence",
+   "index": 914613138,
+   "difficulty": 3,
+   "k": 11,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 31
+  },
+  {
+   "family": "web_of_lies",
+   "index": 880236376,
+   "difficulty": 4,
+   "k": 9,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 1567117653,
+   "difficulty": 3,
+   "k": 3,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 231207032,
+   "difficulty": 4,
+   "k": 7,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 449211882,
+   "difficulty": 3,
+   "k": 3,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 2124546641,
+   "difficulty": 4,
+   "k": 8,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 560452419,
+   "difficulty": 5,
+   "k": 6,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 730639503,
+   "difficulty": 3,
+   "k": 9,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 668144104,
+   "difficulty": 5,
+   "k": 9,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 180
+  },
+  {
+   "family": "web_of_lies",
+   "index": 1981347325,
+   "difficulty": 4,
+   "k": 5,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 584684151,
+   "difficulty": 5,
+   "k": 14,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 128
+  },
+  {
+   "family": "web_of_lies",
+   "index": 1188703597,
+   "difficulty": 3,
+   "k": 11,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 655159837,
+   "difficulty": 5,
+   "k": 7,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 181705039,
+   "difficulty": 4,
+   "k": 10,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 168
+  },
+  {
+   "family": "web_of_lies",
+   "index": 1979802762,
+   "difficulty": 4,
+   "k": 7,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 1516437827,
+   "difficulty": 5,
+   "k": 9,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 1172620868,
+   "difficulty": 5,
+   "k": 8,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 663010,
+   "difficulty": 3,
+   "k": 12,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 669662876,
+   "difficulty": 4,
+   "k": 11,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 322
+  },
+  {
+   "family": "web_of_lies",
+   "index": 230204766,
+   "difficulty": 4,
+   "k": 9,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 1606690792,
+   "difficulty": 4,
+   "k": 8,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 315592251,
+   "difficulty": 3,
+   "k": 9,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 447942672,
+   "difficulty": 5,
+   "k": 6,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 246
+  },
+  {
+   "family": "web_of_lies",
+   "index": 117089275,
+   "difficulty": 4,
+   "k": 7,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 1924508704,
+   "difficulty": 5,
+   "k": 11,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "web_of_lies",
+   "index": 1973059078,
+   "difficulty": 3,
+   "k": 10,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 627716241,
+   "difficulty": 5,
+   "k": 9,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "web_of_lies",
+   "index": 979534637,
+   "difficulty": 3,
+   "k": 10,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 703536730,
+   "difficulty": 4,
+   "k": 6,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 2028568202,
+   "difficulty": 4,
+   "k": 9,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 368408795,
+   "difficulty": 5,
+   "k": 10,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 149
+  },
+  {
+   "family": "web_of_lies",
+   "index": 1331094168,
+   "difficulty": 4,
+   "k": 9,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "web_of_lies",
+   "index": 1361204236,
+   "difficulty": 4,
+   "k": 10,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 185940613,
+   "difficulty": 5,
+   "k": 10,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 1385577389,
+   "difficulty": 3,
+   "k": 6,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 1333043051,
+   "difficulty": 3,
+   "k": 9,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 1945230680,
+   "difficulty": 5,
+   "k": 6,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 548531925,
+   "difficulty": 3,
+   "k": 8,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 1123425397,
+   "difficulty": 4,
+   "k": 6,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 521726436,
+   "difficulty": 5,
+   "k": 9,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "web_of_lies",
+   "index": 400523628,
+   "difficulty": 4,
+   "k": 9,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "web_of_lies",
+   "index": 1653977541,
+   "difficulty": 4,
+   "k": 10,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "web_of_lies",
+   "index": 994547977,
+   "difficulty": 4,
+   "k": 6,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 1877537485,
+   "difficulty": 4,
+   "k": 6,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 15,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 1818255273,
+   "difficulty": 4,
+   "k": 6,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 984866575,
+   "difficulty": 4,
+   "k": 6,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 1730018080,
+   "difficulty": 4,
+   "k": 9,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 1099325751,
+   "difficulty": 4,
+   "k": 7,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 955807939,
+   "difficulty": 3,
+   "k": 7,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 1689325943,
+   "difficulty": 5,
+   "k": 10,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 792065671,
+   "difficulty": 5,
+   "k": 9,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 213
+  },
+  {
+   "family": "web_of_lies",
+   "index": 1789738689,
+   "difficulty": 5,
+   "k": 7,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 135248831,
+   "difficulty": 5,
+   "k": 7,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 307
+  },
+  {
+   "family": "web_of_lies",
+   "index": 623991038,
+   "difficulty": 5,
+   "k": 6,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 596211777,
+   "difficulty": 3,
+   "k": 9,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 2098170292,
+   "difficulty": 5,
+   "k": 13,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "web_of_lies",
+   "index": 290574729,
+   "difficulty": 4,
+   "k": 10,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 1342972798,
+   "difficulty": 3,
+   "k": 11,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 1101854368,
+   "difficulty": 3,
+   "k": 12,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "web_of_lies",
+   "index": 1144980576,
+   "difficulty": 4,
+   "k": 8,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 1845959650,
+   "difficulty": 5,
+   "k": 11,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 1629819916,
+   "difficulty": 4,
+   "k": 11,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 503979772,
+   "difficulty": 4,
+   "k": 12,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 1331497360,
+   "difficulty": 4,
+   "k": 8,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 10
+  },
+  {
+   "family": "web_of_lies",
+   "index": 1384621470,
+   "difficulty": 3,
+   "k": 8,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "cipher*",
+   "index": 0,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 27
+  },
+  {
+   "family": "cipher*",
+   "index": 1,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 25
+  },
+  {
+   "family": "cipher*",
+   "index": 2,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 27
+  },
+  {
+   "family": "cipher*",
+   "index": 3,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 29
+  },
+  {
+   "family": "cipher*",
+   "index": 4,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 26
+  },
+  {
+   "family": "cipher*",
+   "index": 5,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 99
+  },
+  {
+   "family": "cipher*",
+   "index": 6,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 224
+  },
+  {
+   "family": "cipher*",
+   "index": 7,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 95
+  },
+  {
+   "family": "cipher*",
+   "index": 8,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 28
+  },
+  {
+   "family": "cipher*",
+   "index": 9,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 87
+  },
+  {
+   "family": "cipher*",
+   "index": 10,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 222
+  },
+  {
+   "family": "cipher*",
+   "index": 11,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 23
+  },
+  {
+   "family": "cipher*",
+   "index": 12,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 259
+  },
+  {
+   "family": "cipher*",
+   "index": 13,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 19
+  },
+  {
+   "family": "cipher*",
+   "index": 14,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 82
+  },
+  {
+   "family": "cipher*",
+   "index": 15,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 31
+  },
+  {
+   "family": "cipher*",
+   "index": 16,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 19
+  },
+  {
+   "family": "cipher*",
+   "index": 17,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 27
+  },
+  {
+   "family": "cipher*",
+   "index": 18,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 24
+  },
+  {
+   "family": "cipher*",
+   "index": 19,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 28
+  },
+  {
+   "family": "cipher*",
+   "index": 20,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 20
+  },
+  {
+   "family": "cipher*",
+   "index": 21,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 31
+  },
+  {
+   "family": "cipher*",
+   "index": 22,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 99
+  },
+  {
+   "family": "cipher*",
+   "index": 23,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 28
+  },
+  {
+   "family": "cipher*",
+   "index": 24,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 28
+  },
+  {
+   "family": "cipher*",
+   "index": 25,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 171
+  },
+  {
+   "family": "cipher*",
+   "index": 26,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 19
+  },
+  {
+   "family": "cipher*",
+   "index": 27,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 17
+  },
+  {
+   "family": "cipher*",
+   "index": 28,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 21
+  },
+  {
+   "family": "cipher*",
+   "index": 29,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 44
+  },
+  {
+   "family": "cipher*",
+   "index": 30,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 102
+  },
+  {
+   "family": "cipher*",
+   "index": 31,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 26
+  },
+  {
+   "family": "cipher*",
+   "index": 32,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 64
+  },
+  {
+   "family": "cipher*",
+   "index": 33,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 91
+  },
+  {
+   "family": "cipher*",
+   "index": 34,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 125
+  },
+  {
+   "family": "cipher*",
+   "index": 35,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 31
+  },
+  {
+   "family": "cipher*",
+   "index": 36,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 25
+  },
+  {
+   "family": "cipher*",
+   "index": 37,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 24
+  },
+  {
+   "family": "cipher*",
+   "index": 38,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 39
+  },
+  {
+   "family": "cipher*",
+   "index": 39,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 180
+  },
+  {
+   "family": "cipher*",
+   "index": 40,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 176
+  },
+  {
+   "family": "cipher*",
+   "index": 41,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 27
+  },
+  {
+   "family": "cipher*",
+   "index": 42,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 139
+  },
+  {
+   "family": "cipher*",
+   "index": 43,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 24
+  },
+  {
+   "family": "cipher*",
+   "index": 44,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 17
+  },
+  {
+   "family": "cipher*",
+   "index": 45,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 43
+  },
+  {
+   "family": "cipher*",
+   "index": 46,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 32
+  },
+  {
+   "family": "cipher*",
+   "index": 47,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 20
+  },
+  {
+   "family": "cipher*",
+   "index": 48,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 43
+  },
+  {
+   "family": "cipher*",
+   "index": 49,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 115
+  },
+  {
+   "family": "cipher*",
+   "index": 50,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 7,
+   "finished": 16,
+   "median_tokens": 99
+  },
+  {
+   "family": "cipher*",
+   "index": 51,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 190
+  },
+  {
+   "family": "cipher*",
+   "index": 52,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 24
+  },
+  {
+   "family": "cipher*",
+   "index": 53,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 15,
+   "median_tokens": 337
+  },
+  {
+   "family": "cipher*",
+   "index": 54,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 39
+  },
+  {
+   "family": "cipher*",
+   "index": 55,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 24
+  },
+  {
+   "family": "cipher*",
+   "index": 56,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 160
+  },
+  {
+   "family": "cipher*",
+   "index": 57,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 26
+  },
+  {
+   "family": "cipher*",
+   "index": 58,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 15,
+   "median_tokens": 31
+  },
+  {
+   "family": "cipher*",
+   "index": 59,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 25
+  },
+  {
+   "family": "cipher*",
+   "index": 60,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 84
+  },
+  {
+   "family": "cipher*",
+   "index": 61,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 227
+  },
+  {
+   "family": "cipher*",
+   "index": 62,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 25
+  },
+  {
+   "family": "cipher*",
+   "index": 63,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 12,
+   "finished": 15,
+   "median_tokens": 27
+  },
+  {
+   "family": "math_path*",
+   "index": 0,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 16
+  },
+  {
+   "family": "math_path*",
+   "index": 1,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 9,
+   "finished": 15,
+   "median_tokens": 429
+  },
+  {
+   "family": "math_path*",
+   "index": 2,
+   "difficulty": 5,
+   "k": 0,
+   "in_band": false,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 428
+  },
+  {
+   "family": "math_path*",
+   "index": 3,
+   "difficulty": 5,
+   "k": 1,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 318
+  },
+  {
+   "family": "math_path*",
+   "index": 4,
+   "difficulty": 5,
+   "k": 0,
+   "in_band": false,
+   "parsed": 10,
+   "finished": 15,
+   "median_tokens": 424
+  },
+  {
+   "family": "math_path*",
+   "index": 5,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 324
+  },
+  {
+   "family": "math_path*",
+   "index": 6,
+   "difficulty": 5,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 309
+  },
+  {
+   "family": "math_path*",
+   "index": 7,
+   "difficulty": 5,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 352
+  },
+  {
+   "family": "math_path*",
+   "index": 8,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 15,
+   "median_tokens": 16
+  },
+  {
+   "family": "math_path*",
+   "index": 9,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 225
+  },
+  {
+   "family": "math_path*",
+   "index": 10,
+   "difficulty": 5,
+   "k": 1,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 459
+  },
+  {
+   "family": "math_path*",
+   "index": 11,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "math_path*",
+   "index": 12,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 15,
+   "median_tokens": 16
+  },
+  {
+   "family": "math_path*",
+   "index": 13,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 262
+  },
+  {
+   "family": "math_path*",
+   "index": 14,
+   "difficulty": 5,
+   "k": 1,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 419
+  },
+  {
+   "family": "math_path*",
+   "index": 15,
+   "difficulty": 5,
+   "k": 1,
+   "in_band": true,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 367
+  },
+  {
+   "family": "math_path*",
+   "index": 16,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 16
+  },
+  {
+   "family": "math_path*",
+   "index": 17,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 16
+  },
+  {
+   "family": "math_path*",
+   "index": 18,
+   "difficulty": 3,
+   "k": 2,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 148
+  },
+  {
+   "family": "math_path*",
+   "index": 19,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 184
+  },
+  {
+   "family": "math_path*",
+   "index": 20,
+   "difficulty": 5,
+   "k": 0,
+   "in_band": false,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 223
+  },
+  {
+   "family": "math_path*",
+   "index": 21,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 12,
+   "finished": 15,
+   "median_tokens": 304
+  },
+  {
+   "family": "math_path*",
+   "index": 22,
+   "difficulty": 4,
+   "k": 2,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 16
+  },
+  {
+   "family": "math_path*",
+   "index": 23,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 325
+  },
+  {
+   "family": "math_path*",
+   "index": 24,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 231
+  },
+  {
+   "family": "math_path*",
+   "index": 25,
+   "difficulty": 5,
+   "k": 2,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 431
+  },
+  {
+   "family": "math_path*",
+   "index": 26,
+   "difficulty": 5,
+   "k": 0,
+   "in_band": false,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 329
+  },
+  {
+   "family": "math_path*",
+   "index": 27,
+   "difficulty": 5,
+   "k": 1,
+   "in_band": true,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 431
+  },
+  {
+   "family": "math_path*",
+   "index": 28,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 11,
+   "finished": 15,
+   "median_tokens": 173
+  },
+  {
+   "family": "math_path*",
+   "index": 29,
+   "difficulty": 4,
+   "k": 2,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 355
+  },
+  {
+   "family": "math_path*",
+   "index": 30,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 310
+  },
+  {
+   "family": "math_path*",
+   "index": 31,
+   "difficulty": 5,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 369
+  },
+  {
+   "family": "math_path*",
+   "index": 32,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 305
+  },
+  {
+   "family": "math_path*",
+   "index": 33,
+   "difficulty": 5,
+   "k": 0,
+   "in_band": false,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 351
+  },
+  {
+   "family": "math_path*",
+   "index": 34,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 15,
+   "median_tokens": 388
+  },
+  {
+   "family": "math_path*",
+   "index": 35,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 209
+  },
+  {
+   "family": "math_path*",
+   "index": 36,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 290
+  },
+  {
+   "family": "math_path*",
+   "index": 37,
+   "difficulty": 5,
+   "k": 2,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 15,
+   "median_tokens": 382
+  },
+  {
+   "family": "math_path*",
+   "index": 38,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 109
+  },
+  {
+   "family": "math_path*",
+   "index": 39,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 9,
+   "finished": 16,
+   "median_tokens": 275
+  },
+  {
+   "family": "math_path*",
+   "index": 40,
+   "difficulty": 5,
+   "k": 1,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 387
+  },
+  {
+   "family": "math_path*",
+   "index": 41,
+   "difficulty": 4,
+   "k": 2,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 223
+  },
+  {
+   "family": "math_path*",
+   "index": 42,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 16
+  },
+  {
+   "family": "math_path*",
+   "index": 43,
+   "difficulty": 5,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 431
+  },
+  {
+   "family": "math_path*",
+   "index": 44,
+   "difficulty": 5,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 274
+  },
+  {
+   "family": "math_path*",
+   "index": 45,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 258
+  },
+  {
+   "family": "math_path*",
+   "index": 46,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 127
+  },
+  {
+   "family": "math_path*",
+   "index": 47,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 317
+  },
+  {
+   "family": "math_path*",
+   "index": 48,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 361
+  },
+  {
+   "family": "math_path*",
+   "index": 49,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 375
+  },
+  {
+   "family": "math_path*",
+   "index": 50,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "math_path*",
+   "index": 51,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 279
+  },
+  {
+   "family": "math_path*",
+   "index": 52,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 16
+  },
+  {
+   "family": "math_path*",
+   "index": 53,
+   "difficulty": 5,
+   "k": 0,
+   "in_band": false,
+   "parsed": 8,
+   "finished": 16,
+   "median_tokens": 398
+  },
+  {
+   "family": "math_path*",
+   "index": 54,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 236
+  },
+  {
+   "family": "math_path*",
+   "index": 55,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 193
+  },
+  {
+   "family": "math_path*",
+   "index": 56,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 195
+  },
+  {
+   "family": "math_path*",
+   "index": 57,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 155
+  },
+  {
+   "family": "math_path*",
+   "index": 58,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 219
+  },
+  {
+   "family": "math_path*",
+   "index": 59,
+   "difficulty": 4,
+   "k": 2,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 222
+  },
+  {
+   "family": "math_path*",
+   "index": 60,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 315
+  },
+  {
+   "family": "math_path*",
+   "index": 61,
+   "difficulty": 3,
+   "k": 2,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 16
+  },
+  {
+   "family": "math_path*",
+   "index": 62,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 184
+  },
+  {
+   "family": "math_path*",
+   "index": 63,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 29
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 0,
+   "difficulty": 4,
+   "k": 8,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 21
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 1,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 2,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 3,
+   "difficulty": 4,
+   "k": 6,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 4,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 5,
+   "difficulty": 4,
+   "k": 7,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 6,
+   "difficulty": 4,
+   "k": 4,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 7,
+   "difficulty": 4,
+   "k": 6,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 8,
+   "difficulty": 2,
+   "k": 13,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 9,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 54
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 10,
+   "difficulty": 2,
+   "k": 0,
+   "in_band": false,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 11,
+   "difficulty": 2,
+   "k": 9,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 12,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 15,
+   "finished": 15,
+   "median_tokens": 13
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 13,
+   "difficulty": 3,
+   "k": 2,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 15,
+   "median_tokens": 15
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 14,
+   "difficulty": 4,
+   "k": 2,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 250
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 15,
+   "difficulty": 3,
+   "k": 8,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 16,
+   "difficulty": 4,
+   "k": 3,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 17,
+   "difficulty": 2,
+   "k": 7,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 18,
+   "difficulty": 2,
+   "k": 10,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 19,
+   "difficulty": 2,
+   "k": 6,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 20,
+   "difficulty": 3,
+   "k": 7,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 21,
+   "difficulty": 4,
+   "k": 6,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 22,
+   "difficulty": 2,
+   "k": 6,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 31
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 23,
+   "difficulty": 3,
+   "k": 15,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 24,
+   "difficulty": 2,
+   "k": 10,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 25,
+   "difficulty": 3,
+   "k": 6,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 26,
+   "difficulty": 4,
+   "k": 6,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 27,
+   "difficulty": 4,
+   "k": 3,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 28
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 28,
+   "difficulty": 3,
+   "k": 2,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 29,
+   "difficulty": 4,
+   "k": 6,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 30,
+   "difficulty": 4,
+   "k": 9,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 31,
+   "difficulty": 2,
+   "k": 4,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 32,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 33,
+   "difficulty": 2,
+   "k": 6,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 34,
+   "difficulty": 4,
+   "k": 4,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 14
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 35,
+   "difficulty": 4,
+   "k": 5,
+   "in_band": true,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 253
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 36,
+   "difficulty": 2,
+   "k": 5,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 14
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 37,
+   "difficulty": 2,
+   "k": 5,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 14
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 38,
+   "difficulty": 2,
+   "k": 8,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 39,
+   "difficulty": 3,
+   "k": 2,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 40,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 41,
+   "difficulty": 4,
+   "k": 4,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 42,
+   "difficulty": 4,
+   "k": 5,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 14
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 43,
+   "difficulty": 2,
+   "k": 6,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 44,
+   "difficulty": 3,
+   "k": 3,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 45,
+   "difficulty": 4,
+   "k": 6,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 192
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 46,
+   "difficulty": 2,
+   "k": 11,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 47,
+   "difficulty": 4,
+   "k": 10,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 48,
+   "difficulty": 4,
+   "k": 5,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 49,
+   "difficulty": 4,
+   "k": 3,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 50,
+   "difficulty": 3,
+   "k": 4,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 51,
+   "difficulty": 4,
+   "k": 2,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 55
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 52,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 53,
+   "difficulty": 2,
+   "k": 10,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 54,
+   "difficulty": 4,
+   "k": 6,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 55,
+   "difficulty": 4,
+   "k": 13,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 56,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 57,
+   "difficulty": 4,
+   "k": 3,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 58,
+   "difficulty": 4,
+   "k": 6,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 59,
+   "difficulty": 2,
+   "k": 10,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 60,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 43
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 61,
+   "difficulty": 3,
+   "k": 7,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 62,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "space_reasoning*",
+   "index": 63,
+   "difficulty": 2,
+   "k": 4,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 0,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 126
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 1,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 51
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 2,
+   "difficulty": 3,
+   "k": 5,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 94
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 3,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 14
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 4,
+   "difficulty": 4,
+   "k": 3,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 161
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 5,
+   "difficulty": 3,
+   "k": 3,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 32
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 6,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 7,
+   "difficulty": 4,
+   "k": 2,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 73
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 8,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 9,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 28
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 10,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 177
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 11,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 32
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 12,
+   "difficulty": 4,
+   "k": 4,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 140
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 13,
+   "difficulty": 3,
+   "k": 3,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 14,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 15
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 15,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 131
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 16,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 135
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 17,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 17
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 18,
+   "difficulty": 3,
+   "k": 2,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 77
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 19,
+   "difficulty": 3,
+   "k": 2,
+   "in_band": true,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 20,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 21,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 165
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 22,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 210
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 23,
+   "difficulty": 3,
+   "k": 2,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 14
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 24,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 163
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 25,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 53
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 26,
+   "difficulty": 3,
+   "k": 5,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 27,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 19
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 28,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 29,
+   "difficulty": 3,
+   "k": 5,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 30,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 19
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 31,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 131
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 32,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 11
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 33,
+   "difficulty": 4,
+   "k": 2,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 34
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 34,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 130
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 35,
+   "difficulty": 4,
+   "k": 2,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 36,
+   "difficulty": 4,
+   "k": 4,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 77
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 37,
+   "difficulty": 3,
+   "k": 5,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 38,
+   "difficulty": 3,
+   "k": 3,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 39,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 13
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 40,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 12,
+   "finished": 15,
+   "median_tokens": 12
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 41,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 17
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 42,
+   "difficulty": 4,
+   "k": 2,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 207
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 43,
+   "difficulty": 3,
+   "k": 8,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 34
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 44,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 109
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 45,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 45
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 46,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 47,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 18
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 48,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 49,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 34
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 50,
+   "difficulty": 4,
+   "k": 0,
+   "in_band": false,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 51,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 52,
+   "difficulty": 4,
+   "k": 2,
+   "in_band": true,
+   "parsed": 12,
+   "finished": 16,
+   "median_tokens": 139
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 53,
+   "difficulty": 3,
+   "k": 3,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 57
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 54,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 55,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 16,
+   "finished": 16,
+   "median_tokens": 14
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 56,
+   "difficulty": 4,
+   "k": 5,
+   "in_band": true,
+   "parsed": 15,
+   "finished": 16,
+   "median_tokens": 14
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 57,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 196
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 58,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 14
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 59,
+   "difficulty": 3,
+   "k": 3,
+   "in_band": true,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 142
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 60,
+   "difficulty": 4,
+   "k": 1,
+   "in_band": true,
+   "parsed": 11,
+   "finished": 16,
+   "median_tokens": 107
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 61,
+   "difficulty": 3,
+   "k": 1,
+   "in_band": true,
+   "parsed": 14,
+   "finished": 16,
+   "median_tokens": 12
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 62,
+   "difficulty": 3,
+   "k": 0,
+   "in_band": false,
+   "parsed": 10,
+   "finished": 16,
+   "median_tokens": 52
+  },
+  {
+   "family": "word_sorting_mistake*",
+   "index": 63,
+   "difficulty": 4,
+   "k": 2,
+   "in_band": true,
+   "parsed": 13,
+   "finished": 16,
+   "median_tokens": 77
+  }
+ ],
+ "unparsable_samples": {
+  "boolean_expressions": [],
+  "cryptarithm": [],
+  "dyck_language": [],
+  "dyck_language_errors": [],
+  "numbrix": [],
+  "object_properties": [],
+  "operation": [],
+  "time_sequence": [],
+  "web_of_lies": [],
+  "cipher*": [],
+  "math_path*": [],
+  "space_reasoning*": [],
+  "word_sorting_mistake*": []
+ }
+}

@@ -511,11 +511,19 @@ async def test_get_window_state_v2_passes_env_query_param(monkeypatch):
 
     monkeypatch.setattr(httpx.AsyncClient, "get", _get)
     client = httpx.AsyncClient()
-    await get_window_state_v2("http://fake", env="opencode", client=client)
+    await get_window_state_v2(
+        "http://fake",
+        env="opencode",
+        window=116,
+        client=client,
+    )
     assert "env=opencode" in seen["url"]
+    assert "window=116" in seen["url"]
     # No env → no query param (backward compatible).
     await get_window_state_v2("http://fake", client=client)
     assert "?" not in seen["url"]
+    with pytest.raises(ValueError, match="window requires env"):
+        await get_window_state_v2("http://fake", window=116, client=client)
     await client.aclose()
 
 
@@ -541,6 +549,24 @@ async def test_get_runtime_contract_v1_uses_separate_capability_endpoint(
     assert seen["url"] == "http://fake/runtime-contract"
     assert result.telemetry_version == 2
     await client.aclose()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 @pytest.mark.asyncio

@@ -1,0 +1,1985 @@
+{
+  "adversarial": {
+    "reliquary_retrieval_tools_v1": {
+      "passed": true,
+      "tampered_observation_rejected": true,
+      "wrong_action_reward_zero": true
+    },
+    "reliquary_stateful_tools_v1": {
+      "passed": true,
+      "tampered_observation_rejected": true,
+      "wrong_action_reward_zero": true
+    },
+    "reliquary_workspace_tools_v1": {
+      "passed": true,
+      "tampered_observation_rejected": true,
+      "wrong_action_reward_zero": true
+    }
+  },
+  "cpu": {
+    "reliquary_retrieval_tools_v1": {
+      "cases": [
+        {
+          "elapsed_ms": 1.654,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "8ec738748fb56712",
+          "trace_digest": "8f9c67b643760cba58928b73a5926fbbf1e8ec6ea6310a0085545e15a43230db",
+          "turns": 3
+        },
+        {
+          "elapsed_ms": 0.688,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "f94cb9f874d66c45",
+          "trace_digest": "e628060b19aece033037c978aa056858d07d8a3ce01c1a0c058fb7e3bc541daf",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 0.562,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "da92596bd2edc628",
+          "trace_digest": "7ef1bce36e361f06f5eb2c97aa8bd6721fa94e5a1842a5db23fabc4a03a1f4a8",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 0.523,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "be8984ef5b9ee824",
+          "trace_digest": "0b116bf422c9131060791a76c8693843980f0f4b89b7e6be964515a0b9e8667b",
+          "turns": 3
+        },
+        {
+          "elapsed_ms": 0.654,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "7bca01c192e7efb5",
+          "trace_digest": "f615e73be27e8fb377ccf8ea261459f05400b85673d4a986b00403999f9c4014",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 0.607,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "120b43c2a9372e0f",
+          "trace_digest": "5e10ab07a52cd34a2b3e9c054bbe5b08dfcfa57b0c18bb644736b6752ea1fd86",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 0.48,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "3351adc49cb88704",
+          "trace_digest": "2e20dddabaeae1b0fa2fc89ad8bd5b3b137374b0ae5f9615ef971103d088175c",
+          "turns": 3
+        },
+        {
+          "elapsed_ms": 0.669,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "6edbffd123d3a51e",
+          "trace_digest": "1eb3ca37d85fa03a3c36a4ca90dfe10f0e5921fbc56781b8f8d73f0a6060a310",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 0.543,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "8e5e986221489138",
+          "trace_digest": "f40033d6443b2924cf29c7933807a1a477608ae5228ffaf171768069a9db946d",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 0.487,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "ff112118bb085f46",
+          "trace_digest": "7bfbc21326e789e8ca9405719e10d2aa153d0fdff455216b3ab9ef0daec82099",
+          "turns": 3
+        },
+        {
+          "elapsed_ms": 0.663,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "b8a8de7e95c2fcae",
+          "trace_digest": "994e76d21b3de82ffe27366de32fd5b60d991774bfc669ff2b11838a0dfeb173",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 0.571,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "ae00f0144e48667e",
+          "trace_digest": "0937e0f120c85afac7d01f7116b92fdd82982803504144ffc7c9242d9bfafcbc",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 0.502,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "236bc9b4be5ea9bb",
+          "trace_digest": "45712a7ed98243314a6bc91dcbc0bd4578e3500adbcf779c36d771c71cf7ec30",
+          "turns": 3
+        },
+        {
+          "elapsed_ms": 0.662,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "1b149562304e85ce",
+          "trace_digest": "135a1f5dae90c200b4571fab7d4208113a5006f1e1bcf33edf6de995a913ed06",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 0.553,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "0edf94cf1376930b",
+          "trace_digest": "06d78d04f2b8d0c03d29be8261bf62be2324bec41a162312d6b62c862747e622",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 0.467,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "af3c881507d8c2e7",
+          "trace_digest": "0cc18569b135a39a3d4ae8bcbb65aa2b3bb422ff5bfefcbce2aad913abb6de8e",
+          "turns": 3
+        },
+        {
+          "elapsed_ms": 0.665,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "ac0543503cfa444a",
+          "trace_digest": "5278c45861ea595f415e110c0a29439a210f5126735a0d32d6894fb24b2a2001",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 0.55,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "863431ea342b105b",
+          "trace_digest": "2d499f6f6d1e13ae65db077a7c13e09f515b6111a42066ab0078fa2b8a9ce00b",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 0.476,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "589bfafc2831c8ac",
+          "trace_digest": "57acb4e352d3537b9a70f78a85f0a3cda3d92502dc54f6eb34847dd53bead68c",
+          "turns": 3
+        },
+        {
+          "elapsed_ms": 0.664,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "118dfa86a2337261",
+          "trace_digest": "96edaf482c0ad049df90fc336d95802f86d86156fe104b058f2c599b96662d9e",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 0.556,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "aff6c8f513abff8e",
+          "trace_digest": "1fd202a1d7fafbb1d03a8638938fa682b7b6182837cb615eca83ff2f545bd6f1",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 0.47,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "2e3f9bef017d49c5",
+          "trace_digest": "78f6ed82ea939aa967bc91fb7e816d638cd2e8d9f0c725968644e465e74d181e",
+          "turns": 3
+        },
+        {
+          "elapsed_ms": 0.63,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "48fd606222b930d8",
+          "trace_digest": "f8a466a2fadee9fc55a6429f891fec8ec663da139b4909eaf8ccf224ee8e74e0",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 0.576,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "91eef774994f5d9c",
+          "trace_digest": "85b765edbf080bedd39834c3274aae6e91396519b4db6a7d251fcef671827718",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 0.488,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "aa636d8240f861c0",
+          "trace_digest": "15d50767cb540e8fea43a5aab8c457394ea6df3e50509297372d765245f1c151",
+          "turns": 3
+        },
+        {
+          "elapsed_ms": 0.659,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "663b3fd643a17f46",
+          "trace_digest": "fa110c302ca6e2f55e6e5de58a17edfffef652ff8a893f513fe9e6603fa3dcb2",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 0.579,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "25dc2443e0043a5b",
+          "trace_digest": "cd16186fb71e5c8cb6bcf7921ef907449b5bfcdd7e1dc5d0da19c1e87c14adb3",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 0.472,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "3fc8aa62e504ff9f",
+          "trace_digest": "1e54224b4e3ab339835d7f8e76e2b2f00771cee0ac95b00c5b05ccc5d088bf42",
+          "turns": 3
+        },
+        {
+          "elapsed_ms": 0.666,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "566f9313ae130167",
+          "trace_digest": "751feca5d2e6db8fcfd5e2beb1d0686b423b6bd619f50c5c8e01f0c2fff6b501",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 0.542,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "1fa835a27ff463b0",
+          "trace_digest": "084e4d96d45d2fe0e982af0a23151c6c28ebbb5dc620863115a30d82519fcba7",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 0.483,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "ad086bf671342d99",
+          "trace_digest": "a73bfd60ee9533bbba248f9279c3f977679b957f2231e12b4a7020a0510609e9",
+          "turns": 3
+        },
+        {
+          "elapsed_ms": 0.654,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "449af3dcbf63991f",
+          "trace_digest": "5452dbff4f23cfc6497303b4b5ba007d3167926a379f570aaeea0ef243fdc3e1",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 0.568,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "0c8fc63cf7ead12f",
+          "trace_digest": "39a2eb50a35963bcec5ca1996d989fdb3afdf8804a4f52db97bda91677f6f159",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 0.498,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "dc937673dc3a1827",
+          "trace_digest": "3dac212dc247b167f8962d5c1a8482b3b88985ffc2baa4d1b50acdfbfe3bc0b1",
+          "turns": 3
+        },
+        {
+          "elapsed_ms": 0.668,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "765186e23e01b081",
+          "trace_digest": "e285fa8c7f8fb6944183742f5e4439995e6c245217766e517629671f18d24b55",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 0.558,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "5938ac57bc27add3",
+          "trace_digest": "b7d4b5a801f7a5aefc656ad8c3595dfcac6d1efb61d67737ce0ea25cafb6e08e",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 0.479,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "788703e381455c05",
+          "trace_digest": "6c42eb10fdcd5c046eebe9317841d731d3a21f882215367e95b16b6cc1a05fc5",
+          "turns": 3
+        },
+        {
+          "elapsed_ms": 0.646,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "be9b1fef8029f236",
+          "trace_digest": "3d729e811ebabb777f0b3b28c3a15e70269dc21f6d9c4c8d16854896a8f8075c",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 0.562,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "e9764fb2ea288f7d",
+          "trace_digest": "661a40fe2f5a29017e1a351de856878afd7f23d9b179ebc75454d76b32b0b7b3",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 0.466,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "d21ce1e97738cbcb",
+          "trace_digest": "847e766e2c234cf38bb63cd191980cb298839b2b377f004575559fb42ec3afd8",
+          "turns": 3
+        },
+        {
+          "elapsed_ms": 0.668,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "ca2d6c15a37deb9f",
+          "trace_digest": "7b4f9d628af2cb1a2946b0015ce1fed47227c17f469667fe67fa24c1acd90486",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 0.551,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "d650072987867400",
+          "trace_digest": "b08525f99827063ee6b61d23e29c9d769c82abf60bf60de822b7dbb647d5c906",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 0.469,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "743167b3a23e44ca",
+          "trace_digest": "bc59ba6f48dffbb7206d9abc5a37af1a1b87b4bad023291e9ccf9fbfb173bee3",
+          "turns": 3
+        },
+        {
+          "elapsed_ms": 0.648,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "34e5598e90d2cdda",
+          "trace_digest": "6d11ca3bd65bcb11f587050d9a5e45d0f7599ec3cf5573cd920026721fa61753",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 0.531,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "6ff1c3ec6a025e4c",
+          "trace_digest": "6ac86d05ee71ed16290021a624d053e971dc556b14df30200bbdbe907bc167c2",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 0.492,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "dc39f04ca6a39554",
+          "trace_digest": "59f8d5f8b25f6595d040eac4f94bd934f6b0174f7f7af4e27d3eff4cf8f6f58b",
+          "turns": 3
+        },
+        {
+          "elapsed_ms": 0.641,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "3a69527de95fe3cf",
+          "trace_digest": "218fea7071a9ce4f6a5787a031d63fc824722ebf38ed59d4da3a24531648fb3d",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 0.577,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "ece1bf8922e89d97",
+          "trace_digest": "191fa25e799328fe36b6fe804155e12a725c9d5248a4cbc2f1817c6b84eef2f4",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 0.462,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "dbea0c27502b216f",
+          "trace_digest": "b27d49cb005631053d4cabf683cf25c824bde553bf91701c41491a56aefff209",
+          "turns": 3
+        },
+        {
+          "elapsed_ms": 0.656,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "c6ec1b5477349244",
+          "trace_digest": "611876d61d7ac2b2f76f1a7e2bf50a3b2618e902217b395db0c1c90ab05d27a1",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 0.546,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "7d98f64bc9f7b688",
+          "trace_digest": "0d168b5fbc4bb4b7a829c2fd28fe009756443ded8b63dc47032983bf25adebd6",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 0.47,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "c21dbe0f918cedba",
+          "trace_digest": "2c4c5cf2ab0e0aed606b90df5226fe6a3325e8e87d1a98987f117f55f0d250c0",
+          "turns": 3
+        },
+        {
+          "elapsed_ms": 0.671,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "5315bebf6d1840b8",
+          "trace_digest": "d19525a3e0bb12782d668aebb55f3307e191ce847e45a7b30692258f1f3b8281",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 0.533,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "6a39c63d9821966c",
+          "trace_digest": "92ad8b1c995344dc85b8cd7827282189d41f521854d3fcffbbc765d047effec8",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 0.498,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "e772eda4a45c3c1f",
+          "trace_digest": "9a248e0ab9dd8ba605e3903dc24c81bdaad09246fce59ba5c9a3e08b5c3190dd",
+          "turns": 3
+        },
+        {
+          "elapsed_ms": 0.633,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "e91350d1692809f0",
+          "trace_digest": "79d098733e0be1962c01a8e7f28b61c8d9cb10d1ef105147315cbfb5680019e8",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 0.561,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "7aa2616196d8ef13",
+          "trace_digest": "72acab53fb30d965da204e5faefaa84750fe463b3e06c2ea7a1d9a88ae458a8c",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 0.465,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "84c794caea3fa4cb",
+          "trace_digest": "1725bb639078d79b13584c9d6e25b13162ddd8f4a9b29a51f467a493e12c4e79",
+          "turns": 3
+        },
+        {
+          "elapsed_ms": 0.653,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "c2a8dd811b8faee8",
+          "trace_digest": "5394efe60559481c9f8f67400693954cc4b02ca1e16719b803cf73f67facdd09",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 0.547,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "92db32699b59a095",
+          "trace_digest": "9b43714c69cf44f14b2b13eb73159c85f0a88ced7b637d562dff281653448464",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 0.477,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "e8963b65573011a3",
+          "trace_digest": "9d93229b2463fa12856b419a60bfa3533e868c07ef74ecc7d3165cc90be85324",
+          "turns": 3
+        },
+        {
+          "elapsed_ms": 0.645,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "c07a40a1066d9f44",
+          "trace_digest": "51d50becf129f9ed8a8fc2162fcef46daa03777ed83230a512dc0acdccde31ee",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 0.572,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "1557bb30ac133810",
+          "trace_digest": "ea4d75e28321534fa305332b504f6d269f5d916758796c7c2639a1bf2e7d156e",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 0.47,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "91f75efbd4ab0faa",
+          "trace_digest": "f4b4752278e70d7afcee0327a5fcadf782e56241d2b63b4cf7022dba84c0b2c3",
+          "turns": 3
+        }
+      ],
+      "p50_ms": 0.5595000000000001,
+      "p95_ms": 0.669,
+      "passed": true
+    },
+    "reliquary_stateful_tools_v1": {
+      "cases": [
+        {
+          "elapsed_ms": 3.889,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "4d31f1b9c7e8488f",
+          "trace_digest": "1cb38d75863f7e25a41d3563e10acace26209f4a2389d429a80ce1bc576ec464",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.686,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "e3496e106cc8a095",
+          "trace_digest": "5eb5c61b78f2ae142cb99f52eb1632a866a1dcbe900e5f797b08687ae948375c",
+          "turns": 6
+        },
+        {
+          "elapsed_ms": 1.408,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "a78f8b84476bc26e",
+          "trace_digest": "30e53de31754f41fe6dd887fc42086fdb68abacf24e3a70d457fbb6d5fc159f2",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.499,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "d17e994355db92ed",
+          "trace_digest": "5d1075a4f89b6f45c9bfcd900d067145b1593ba0c594ae16abb33ede89afb018",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.608,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "2d705827a69f964c",
+          "trace_digest": "13e5f06a2aaa8768bf63623c25b02ff8851cdc549ba24bc75640ef706189ace2",
+          "turns": 6
+        },
+        {
+          "elapsed_ms": 1.413,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "c3e236b932cfe8d6",
+          "trace_digest": "aee3b30dc1cb79a9a4e4b6707e4b4e5b02ab5e82107c563cfa83adccd7567058",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.425,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "a3730e08ed7a2b25",
+          "trace_digest": "11bf37fa3fd419778e273dba9905add0b55f63e6bd181e3d4e6de0d8fa7cdcd7",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.557,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "751f31109b622444",
+          "trace_digest": "2e60424531632f22e760ccc21803be326baa4f67dc1d777ec9c91c8f61096591",
+          "turns": 6
+        },
+        {
+          "elapsed_ms": 1.38,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "b6c696f0d7937511",
+          "trace_digest": "8b2945725b9097bbe39e39119656b7da5239a8c810eaa871a07062f5e644a0e8",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.45,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "09aae5715ff36b1b",
+          "trace_digest": "5f86f29cd377ea5e8ba1d4952e7333d67fe9a06ed133f750584e7d4608bc6abe",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.497,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "b715efe7d2caeecb",
+          "trace_digest": "1041eefdb6c011f6989d7f0ec72f9bae3bf05cb97077faf7311803804fabf5dc",
+          "turns": 6
+        },
+        {
+          "elapsed_ms": 1.386,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "d2b6cea9c0dc8a25",
+          "trace_digest": "c6e94c4f0f2b63f1d9c580508ee4f8c4eee5b8d4063d74af1a55875fe44489da",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.402,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "00b437e668002715",
+          "trace_digest": "abab31e5deb058f0b3da0867b87bb36e84cc18bf6958a8a14e5cdbb90ae3829d",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.554,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "8f634b56d8fdd8d2",
+          "trace_digest": "0ff98f538a56539e2a3e06e13ac88dacbde24303f2d00be364f182f29616de83",
+          "turns": 6
+        },
+        {
+          "elapsed_ms": 1.457,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "e9c202828b71ec7f",
+          "trace_digest": "75ada041452b9b89432088736fb8d2d66ede6ca47e77fc2987997d88213b6b54",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.439,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "1f78df2b603b49e6",
+          "trace_digest": "7eb68f474eb8bd7f3fcb3b8f9d33ba8e7506c9c4f708efb547fbb79a9020b121",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.564,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "0de8f3e60bed79d7",
+          "trace_digest": "b32c33b5cd5e657fb95046fa63c0056aea36f55ea28fbf402299d4af6c211737",
+          "turns": 6
+        },
+        {
+          "elapsed_ms": 1.435,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "4a1564149356b048",
+          "trace_digest": "f64e49b94bf19834e072f9522d01ba90a0532c623e515e3f5eef20bb91e06adf",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.428,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "bd910660f639248a",
+          "trace_digest": "10a640427491e069fe6e249bec47144f78fdadac1cf1ed684c44c1677fbc8d80",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.547,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "db06aabfdfbcaee6",
+          "trace_digest": "67b7abf4304e4abd55098ed289b150fce6f748ca1081f1a325f983e45a289585",
+          "turns": 6
+        },
+        {
+          "elapsed_ms": 1.437,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "795631407e093f21",
+          "trace_digest": "f8653cb474d502e5381e518c306e2bb15a11ca241f4ce4ed90145c486bd6fa34",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.356,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "ce4290810edb5179",
+          "trace_digest": "7e6f8e54787bf93b99e12f5f8ca7cc019cde64932c27bf332761756c9e2411de",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.526,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "bc6a237a7293ac08",
+          "trace_digest": "487ec96cdbef9dcc30807ee805b86a1dad046d6c8b2024e14ec64dd38f639b7d",
+          "turns": 6
+        },
+        {
+          "elapsed_ms": 1.415,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "44a241ea06fac461",
+          "trace_digest": "5eb09f4c741d40a274a8065c92657ea4fa7707b56d78b8515706583fea539d20",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.359,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "5bc9f2423848d891",
+          "trace_digest": "28bf316f9950bb9531a9674e4445a86e95a790419a199047261477e6bb5d5485",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.495,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "1888567388b95a4d",
+          "trace_digest": "ed9ff2ec8ebbe83240d4c6e0ed6be22eccc0667e1d0bb2fc24ab4fa39af5b72c",
+          "turns": 6
+        },
+        {
+          "elapsed_ms": 1.409,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "5e02264a99367d30",
+          "trace_digest": "116cce6434cb8a18e247ac15eea8c7639c141e0b1c51fbcc81a51ef7256358a8",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.375,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "0182ea2d9be50175",
+          "trace_digest": "baed7cb86352678918128851b16d73405b9b6a20157a44e586b84912e357503a",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.567,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "81f28c1f6572efc2",
+          "trace_digest": "8b78c49fa9c45be61ee8d84e3d2c0950716413f4d1861e631c02d6e4c8fdbb7d",
+          "turns": 6
+        },
+        {
+          "elapsed_ms": 1.379,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "5e74e5931c1bdfe2",
+          "trace_digest": "bcc34a409b18e4d7a18f848ecf45afa37ddada63cc769ad9264181b1f074b6b0",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.437,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "53f1ad35971ef6d7",
+          "trace_digest": "920b2d287f55031f449c95fe271be7e7eedc82cc6bac59e9117cf0c1f876edfc",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.577,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "3b88574749b96437",
+          "trace_digest": "df960631223590f0f11eaefdfe1b9392b9ad4998d30503fd81dc2f4fa64fdb8b",
+          "turns": 6
+        },
+        {
+          "elapsed_ms": 1.428,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "8d21a91238b3f08e",
+          "trace_digest": "0ad7997bdad51d3f298401a094405090699b3b8edd1979fab856d180ee4094a8",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.418,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "473bf37c40fc39a3",
+          "trace_digest": "57b97280054c4df92114c9d8af8e0fcfb2abc3eea9ed074ebb68195c51033add",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.549,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "90343f576cf9fce2",
+          "trace_digest": "8b7ca46d5a63be711972cbfe8cad87a89e2787c53dbac7d04e1cda5cedbb73c1",
+          "turns": 6
+        },
+        {
+          "elapsed_ms": 1.426,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "113ee9334891fe75",
+          "trace_digest": "b3462363c9a2adca26ca735f63ad3868691290daca153330f0fe2628482bf89c",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.445,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "c7d2e16f92e0ba50",
+          "trace_digest": "95012bf7cde434929b3e04f6c8c0553f1499f8c32f448b19ce6f789ed0089d02",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.557,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "86e7de61852b5029",
+          "trace_digest": "2208f26980b231d91b3babf55496603158093121425119a56c9bfb2288346701",
+          "turns": 6
+        },
+        {
+          "elapsed_ms": 1.396,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "e12712761811b389",
+          "trace_digest": "3c6e88188ad1ae29cf2a2a4a06096790666f1d79d3e535116746477d0e52aa8e",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.414,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "1edb5f0546654b84",
+          "trace_digest": "ccf22b711f650b62c82eba5d8862934caf1f4effdc295da1d755d347986a9d1c",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.579,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "a059b1c8b2cc1a8f",
+          "trace_digest": "3193763d6a3a47d225f633e360d81199641390e85bdae7407d843bc8c0170d74",
+          "turns": 6
+        },
+        {
+          "elapsed_ms": 1.439,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "b436712aa11fad15",
+          "trace_digest": "1d44093859f0750faaca9f5a05731adaae1a5793297938f4dca01a90f34cb580",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.445,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "26b4579d394017e3",
+          "trace_digest": "e3e92d855f4ab534e79bdd54466ad9e7387c3721fd7d15609fc7889bb7ed2379",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.541,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "f6df496f32eafe23",
+          "trace_digest": "c1c3d26e2feb7b50027517c47a61c426c642a6a209775afed7e42bcf1f0e7d0c",
+          "turns": 6
+        },
+        {
+          "elapsed_ms": 1.461,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "ae1de7c4d54d79a5",
+          "trace_digest": "2b0fbe85ae1e80bc6d699067b04bb4d4791ebc2ad797f513ce852ded83e4522c",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.422,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "f38fbff43d47a159",
+          "trace_digest": "2db1d24b48338342040bd41e4ea1ea5c6227d355baee4ab30727b6bdcbb86190",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.557,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "cbdee14c1b209ba3",
+          "trace_digest": "fa7a91b9da43f59cfe6838f636eff1f569dfea881ead9b352faad0fb433b7556",
+          "turns": 6
+        },
+        {
+          "elapsed_ms": 1.47,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "d6084be9a6a5b33a",
+          "trace_digest": "8200a9fe66bc268844319fc447d62b82b33e8f2e324e19f13b9e5aeb94fa7c13",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.437,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "d9e6c32a76a115b6",
+          "trace_digest": "96abf8f4b4930b845923239c7c311040002bfebeb3b7f9288f9b079d8d4f2211",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.564,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "148409eeb7ef9eb6",
+          "trace_digest": "22cc3b00b426015542bfba47be0dafe9bad133c8d63c105191247c627eaad558",
+          "turns": 6
+        },
+        {
+          "elapsed_ms": 1.434,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "0161761bbde73452",
+          "trace_digest": "2b2c80777e5359f727b12e5c3085a09d8fb93c44d65891262794dc08fe1e522e",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.421,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "7b250600af079b7f",
+          "trace_digest": "917ac07451d1c17923f5d8e0f5d957296727028eb75e5c6958a626bd3ea3c9ca",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.593,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "62105f307f51dec1",
+          "trace_digest": "be9fac173d9443dea2dbd059ffc77795b1db254b0748a1ed18a3bab2853f22a4",
+          "turns": 6
+        },
+        {
+          "elapsed_ms": 1.416,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "567599536124d1a9",
+          "trace_digest": "ec256502e39beb24806046194308fcfb3aa97d607e3d9d0879c525b699212ed5",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.371,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "7eb196a27b2feb05",
+          "trace_digest": "f64fc02cc69d5ee4b1334a9e2f4437c920c6f3d6f8db42b806d79f7500b7c03a",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.583,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "30880eb4cd9e22cb",
+          "trace_digest": "e3877dc77680f6233698f95057ed93a5852e4192d8bcd73f89a52092f028d90b",
+          "turns": 6
+        },
+        {
+          "elapsed_ms": 1.358,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "dc6de0e66d8e7880",
+          "trace_digest": "2235d99c0b5065b8859ae84ddafff64eefc59fdfc92ce1597f24ebdcb677a5a8",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.377,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "574666be004a9705",
+          "trace_digest": "9d781ff629f17d8d3ac4d7a700e143fea522c20775f5dfadccd531b7d0e015ac",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.561,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "38da31c9fb6fcdc9",
+          "trace_digest": "69c1d53448b2b6f57f0eb7ad73518c3a5bd040e6d1d4f27e58a423bb2d99723f",
+          "turns": 6
+        },
+        {
+          "elapsed_ms": 1.353,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "6628c9f15b0d3cad",
+          "trace_digest": "26ca729c9cd8ce002b036a15754b48787f6d1fb6f3a37e5676fc345739e63871",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.392,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "cfffc37d3b33ae3e",
+          "trace_digest": "a9cfec3dfe43bab2612648aa28ca40ff823afc839df3732ddc6ba15b4254b14d",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.566,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "455b372f9a96f182",
+          "trace_digest": "fed27bb7f85b5173022c758c017f2d6adc434fecb368082fb1dab50f0fa7da03",
+          "turns": 6
+        },
+        {
+          "elapsed_ms": 1.382,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "73c9969f3df7e8d9",
+          "trace_digest": "76ebf5a81a60549484310cad39e77f5d7865101049fdb724696c676b0b1bb0a6",
+          "turns": 5
+        },
+        {
+          "elapsed_ms": 1.411,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "bde3d6479c8cb23a",
+          "trace_digest": "769a282d86cf277101c997a6e31ea9538c849e456495ef325756f72c1bd6cbf4",
+          "turns": 5
+        }
+      ],
+      "p50_ms": 1.437,
+      "p95_ms": 1.593,
+      "passed": true
+    },
+    "reliquary_workspace_tools_v1": {
+      "cases": [
+        {
+          "elapsed_ms": 4.549,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "c5e63239c86a95ed",
+          "trace_digest": "f90ef48f348cd1c4671b8c4617da19131a1b120158789e19054b901076788274",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.801,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "4083868d9aa2d016",
+          "trace_digest": "6e013cc4d3cd7171334faa0991595510f5120a77364e9fe8eac12a7d27a74704",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.626,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "139baa562807ff63",
+          "trace_digest": "04571bc65a54f94f966f1cf1d501f9017a15835bdd0071d05477b0d0ea47cc8f",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.83,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "cc3e8679fd3a3838",
+          "trace_digest": "a2601e177426e471cf2a1ea1a62a42e8828c05bb8968781117b48b194d92f05d",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.605,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "813c996fcd8cba84",
+          "trace_digest": "57f586d9edf9e39fe358f07a58d849a13e5196d1fb3cbeeeb497f164022625f8",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.965,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "b204abddab63d3ee",
+          "trace_digest": "e0a602818d2375e05a478edfd249afc5ee8f90ffce27d56c70bab740547d8bf7",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.632,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "41294434701f2c0e",
+          "trace_digest": "aaa8215569fe5f7dfe3e75e40c03e64401d47484a40f79b0450f8a1fde7d763f",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.61,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "fca1b64f9365477d",
+          "trace_digest": "b501a6eac9bccf094435b2fbe3459d98e0e0ed5418bfec02677927823af195fb",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.576,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "31d712a956e0e236",
+          "trace_digest": "08d4e1ffad77803aa87f355c2e7e26426e5ce5ab22c07cb7617246001a3dd725",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.675,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "4722bb62062c2700",
+          "trace_digest": "154daf783f385a2b09877555e5718430dbd90ce2311b60bbfb6332f771e739c0",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.576,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "7df967fa72e83add",
+          "trace_digest": "c484f2e124a082184834caa9743c67e1e8c8d98c2aa6b307d0992eac8d3cd698",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.46,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "777d9e3fc4b84293",
+          "trace_digest": "f30cfdeb4dbfeae3a1dba485cbc32fe0dcd23c505d9bff5e2daeb927c975d45b",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.481,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "2632b586d1bbddcf",
+          "trace_digest": "3e526ecd86d431b555cd4977de87c0660efb6a7e9eafd9ded122174b1e2ae46e",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.564,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "b24629077488b5bf",
+          "trace_digest": "012b8b9c929a19670ffe9b718c7b81b1676500694ffe3dc67b327eb842d8e516",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.528,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "8a1e67f22cbba8f7",
+          "trace_digest": "9afe5fa8d8bfaa8702b5c42a30d1c3dec12262926d01196adc09d31b4a9eb11b",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.642,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "f653e5c7e200cb6c",
+          "trace_digest": "a48d1250674bdbe95b994b1ffcde0ff4b2cb1ff185f69cffc49a5c935c8b048e",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.619,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "dc5f9e7ccb8311e9",
+          "trace_digest": "d031425c74128e3df22f7c36b245033afa705df9f89f489334ab72fa1ff2627f",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 3.148,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "770e6a3581973afc",
+          "trace_digest": "3d7f82d7cdd4762a5110ebe8a14598f3f7f0c6ad9c879b69858c865b9425df4d",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.674,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "0afb89226858ab59",
+          "trace_digest": "1872387d31a7a5dbbd2c786948ed4bb5b86e0bafe3f9833fcae8301fa1d339b9",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.597,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "6d90198c0646d6ca",
+          "trace_digest": "fd1828add89b8bf0a123c9353918b3933dfbd6b0e362db72dba713e5da23ddd8",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.61,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "6fd96fb3ce77636b",
+          "trace_digest": "8168b50f668b92bce62929c28d0c293c117e665dc165f566a930489dac3bc936",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.609,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "1218c72d0297498b",
+          "trace_digest": "a171302cf0e06d93e0d08c00b2ee59467aad4cfd2854933316d1c401053a8302",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.594,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "10b5c09780db7279",
+          "trace_digest": "1ac8d1632866f012be4e0f6c5ee20adde7893694323274b003eada916e400c67",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.667,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "ac69df920070a12a",
+          "trace_digest": "10f31c4b5dd0f77b082056acfaaea9e0ac966eda823ab18ba66eeb54c8af7312",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.639,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "d3d01cd6089a31dd",
+          "trace_digest": "b3219c6469739f75bedf38d59540a4a7e8db3128de021c03f1d8953334563a4d",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.682,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "0b6492449fbb0ab8",
+          "trace_digest": "c47265640162d355cbc24abd60f1e8b1df826ecc941d6ba1be0cc933bfb3fec1",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.63,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "7587e6cdd2dc9d7a",
+          "trace_digest": "2c2988e4f6eb05185dc25382473803a35099232edbcbfc8dae33e9a1891c32b4",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.662,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "c43356ceeba38848",
+          "trace_digest": "3b5f95e4c7298f247e5f3073e42212331679de5ac3637acd284d5bfc63cd0477",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.622,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "bd4edc3c36f18091",
+          "trace_digest": "289c21103cc10a1ac87e1a975518496f1d513153c52fec50b3f87f32262ec4a1",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.589,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "a8ee29a702cb24ce",
+          "trace_digest": "9b84539f0666ec34e55a035b1ead5dba625e680ac68255811c448f99e08152f3",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.602,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "bb1579901d03e767",
+          "trace_digest": "6202fdede5d39074cd7a29201711b3fa6ed3d50826057c1968997ba82cbb0c31",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.542,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "f46316f70b35526e",
+          "trace_digest": "574c06bba3499eb3111ea6fe7c6110d2105ad48a0fcd1eae3d50ff2b52c34a5e",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.59,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "cfc78fd780ca351b",
+          "trace_digest": "40e7462c4b89747036a3ea5f12fbb5443af65c6b75aa827642f67a6f87c2df79",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.61,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "54553230d3d689b4",
+          "trace_digest": "eab70fe4e5873acfd2293612489a7468ba67b3f5a515dd05857e8e9ec8aaa5fe",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.549,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "91214d8cec42da6d",
+          "trace_digest": "424b1c2db21d9dde04c980ad81dbb66608feb1efb4006baa3337ea48f37a140a",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.565,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "457d5043b4de9e06",
+          "trace_digest": "dbe1a453ce76b43ea689ca1f5745ddb37f1ac59b422c7af3fa3a580733efc007",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.592,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "896ce4348c7e73d6",
+          "trace_digest": "d4b08d65e5ac5421620b4efa49528d338e44d4fcfe34decd0c14322a9a83150f",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.461,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "008412bb19b04bac",
+          "trace_digest": "b1237778ac31df579f785b3b02c32e00808a1974ae2a0192dad8bf18eac6380d",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.511,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "32692a370a25b78c",
+          "trace_digest": "ddc574a7565185b3561003d1a34a940ddcee659ddb1fb2e8c359f81352009896",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.573,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "5eaa8171dd19b10b",
+          "trace_digest": "5ff1c6a5e19a988b2434a62c6262a50a74bca9af569f41bb90dcf4ea96559174",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.571,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "ed8ad91c96c1fae2",
+          "trace_digest": "a351f5d8d8444968ae8de940a0941c6dd619bd59e0c2e617e0bad46a9a27dc2b",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.56,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "d211342e0c9a5c02",
+          "trace_digest": "a2aa3673d62d84a0fc6d85669468415dcb801ee7ffa4c8fd96021ac8bc9a74e4",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.568,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "3369084e4b162eab",
+          "trace_digest": "ab5df35a83b542690f979b495446eb00e79bee597219e187de46d2da8061a0d0",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.54,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "4b6edfeece3062b3",
+          "trace_digest": "3a5791a2e97b8bfe81056ab6c896223991f86087c3cf7be7f8935bedbb013843",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.602,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "055600ad46f5f345",
+          "trace_digest": "adc443e893de075bcd2cc6f7622dce599b1359627c27f5643d8b49dcf933f6cb",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.54,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "12de8ef972e2017f",
+          "trace_digest": "353f47474275779bfe4f851df8a6d87e958532aa84bf59375d0bfcc210034ad8",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.555,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "586ca010c6420f2a",
+          "trace_digest": "7a5319054b94eb07f4b904575d382ed5a8e1a5b6ff6504128764c38e7ef8ac79",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.939,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "1242408033ab1a67",
+          "trace_digest": "ce226859f157a3d55a8db590267fa8122762e2098abc2cdfa9e5e8f574ac61c1",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.557,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "0fab74af46325503",
+          "trace_digest": "e36070bad7c3b3bddd5590ba8887229614c0d397329245478461cf320b1d8e7b",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.509,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "e679ddd322f324f4",
+          "trace_digest": "ce6333fe745e67a829bc8c47166ef969754cee55ae22a767e1dd3dcf9e194215",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.547,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "309f85ff11733924",
+          "trace_digest": "5955c12cad133f6882d27b54deef4ff1504fee12b62af8f1704e2e2eaac251ac",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.698,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "02bd2173a8042bcb",
+          "trace_digest": "b14353d64f1bf42b6cda72148381167a6073a0b316eec4b65d68c4f2fd383c7f",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.569,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "57f52e8deb50e9e4",
+          "trace_digest": "efab453070e246b96cb2059b3093759dc2858237f7d0ed5705fcfbbfee6211bf",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.515,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "949d703288be6743",
+          "trace_digest": "6c545a0c45c50eb9d3d4bd722284e56b9768cfdf238902114b43a0ba5b623426",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.506,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "0270ca509132e5bd",
+          "trace_digest": "b11e55d5c69afeb25fa2eb65baf8508f8ff3949dcf725b5fab0000db866d6a1e",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.582,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "df5e554bb2dbd57d",
+          "trace_digest": "a50793b2fd167ef401f5d9dd51925993277e88645ae2b6b0bd13cd077d2fe941",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.695,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "aa00d37a5ef19b54",
+          "trace_digest": "aed3126224d63ffcf38a66fe67d00593caf47179a4ae5aa6741574e23fed3e21",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.542,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "c658dd0906a4524b",
+          "trace_digest": "9bdaa93c9c9008c8fa2c0229caad8b88018d0851a399768776560f1467363c37",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.52,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "f6ea2b50c14ea2a6",
+          "trace_digest": "81973799a680dff8ba921717f83684b3b90903d5d59251302f9a04009d3ecfad",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.506,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "90ef991bc37ab122",
+          "trace_digest": "ebbf145b5e9d7249c1a4b038298cf50569eeb8576984b04271a217bfb2d6fdc0",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.439,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "88eed143a0344fa7",
+          "trace_digest": "3fe5aad7ea30e75b859cd849c33714dafdaa6b55cfa3d41c26ab8373860d82e0",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.515,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "32ba037af3a24e3d",
+          "trace_digest": "096d5cfa02c51a809b78bfd446a3d04303285608449ee3b049b1a35950568cd7",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.558,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "78d130bff8f85d1d",
+          "trace_digest": "fbb4b9e21199cd3cd276c47f9de40925fa7fba17261c19e9e868a70174a7b3e1",
+          "turns": 4
+        },
+        {
+          "elapsed_ms": 2.55,
+          "error": null,
+          "exact_replay": true,
+          "reward": 1.0,
+          "success": true,
+          "task_id": "193babf7c44c49ea",
+          "trace_digest": "a5196a65cdf72f1b18b78695d354a0cda19c2139ea8fec3160eb107a2ff75ffe",
+          "turns": 4
+        }
+      ],
+      "p50_ms": 2.5854999999999997,
+      "p95_ms": 2.939,
+      "passed": true
+    }
+  },
+  "environment_manifest_sha256": "689a78e389d3407b15312eeddc0669dd86b89ec77d6e4074c4417df0aca7bdca",
+  "environments": [
+    "reliquary_stateful_tools_v1",
+    "reliquary_retrieval_tools_v1",
+    "reliquary_workspace_tools_v1"
+  ],
+  "generation_contract_sha256": "7bc472f92311794f30c026712d3aba5b63cd10c97132a27331cfdc6adffa1e5f",
+  "git": {
+    "revision": "db00f285c8b097c05e3101fec23c5fd62baae295",
+    "tracked_dirty": false
+  },
+  "passed": true,
+  "profile_id": "qwen3-4b-reliquary-episode-v7-dev1",
+  "runtime": {
+    "packages": {
+      "safetensors": "0.8.0",
+      "torch": "2.7.0+cu128",
+      "transformers": "5.9.0"
+    },
+    "platform": "Linux-5.15.0-186-generic-x86_64-with-glibc2.35",
+    "python": "3.12.13"
+  },
+  "schema": "reliquary/episode-qualification/v2"
+}

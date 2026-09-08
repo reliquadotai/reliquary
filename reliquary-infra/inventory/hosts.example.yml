@@ -1,0 +1,6 @@
+all:
+  hosts:
+    ctrl-01:
+      ansible_host: ctrl-01.example.invalid
+      ansible_user: reliquary-admin
+      ansible_python_interpreter: /usr/bin/python3

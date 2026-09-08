@@ -16,12 +16,12 @@ from pathlib import Path
 import typer
 
 from reliquary.constants import (
+    B_BATCH,
     PROOF_PROCESS_ISOLATION,
     DEFAULT_BASE_MODEL,
     DEFAULT_BASE_MODEL_REVISION,
     DEFAULT_ENVIRONMENTS,
     DEFAULT_HF_REPO_ID,
-    ENVIRONMENT_MIX,
     FORENSIC_SAMPLE_PER_WINDOW,
     MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV,
     MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW,
@@ -33,6 +33,8 @@ from reliquary.constants import (
     PROTOCOL_VERSION,
     VALIDATOR_HTTP_PORT,
 )
+from reliquary.environment.registry import resolve_environment_mix
+from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE
 from reliquary.validator.errors import FatalProofPlaneError
 
 _DEFAULT_ENVS = DEFAULT_ENVIRONMENTS
@@ -42,6 +44,15 @@ app = typer.Typer(name="reliquary", help="Reliquary — Verifiable Inference Sub
 logger = logging.getLogger(__name__)
 
 _grader_proc: "subprocess.Popen | None" = None
+
+
+def _resolve_cli_environment_mix(value: str) -> list[tuple[str, int]]:
+    names = [name.strip() for name in value.split(",")]
+    return resolve_environment_mix(
+        names,
+        profile_environments=ACTIVE_PROTOCOL_PROFILE.environments,
+        default_batch_target=B_BATCH,
+    )
 
 
 def _run_validator_event_loop(coroutine) -> None:
@@ -173,14 +184,35 @@ def _ensure_grader_running(use_runsc: "bool | None" = None) -> None:
     from reliquary.constants import GRADER_SOCKET_PATH
 
     _logger = logging.getLogger("reliquary.cli")
+    remote_executor_url = os.environ.get(
+        "RELIQUARY_GRADER_EXECUTOR_URL",
+        "",
+    ).strip()
+    remote_executor_mode = os.environ.get(
+        "RELIQUARY_GRADER_EXECUTOR_MODE",
+        "shadow",
+    ).strip().lower()
+    if remote_executor_url and remote_executor_mode not in {"shadow", "remote"}:
+        raise RuntimeError(
+            "RELIQUARY_GRADER_EXECUTOR_MODE must be 'shadow' or 'remote'"
+        )
+    needs_local_executor = (
+        not remote_executor_url or remote_executor_mode == "shadow"
+    )
 
     if _grader_is_running(GRADER_SOCKET_PATH):
         _logger.info("Grader already running at %s; reusing it", GRADER_SOCKET_PATH)
         return
 
-    if use_runsc is None:
+    if remote_executor_url and remote_executor_mode == "remote" and use_runsc is True:
+        raise RuntimeError(
+            "authoritative remote grader cannot be combined with local runsc"
+        )
+    if remote_executor_url and remote_executor_mode == "remote":
+        use_runsc = False
+    elif needs_local_executor and use_runsc is None:
         use_runsc = bool(shutil.which("runsc")) and _grader_bundle_python().exists()
-    if not use_runsc:
+    if needs_local_executor and not use_runsc:
         if not _env_flag("RELIQUARY_ALLOW_UNSANDBOXED_GRADER", "0"):
             raise RuntimeError(
                 "opencodeinstruct requires the gVisor/runsc grader sandbox. "
@@ -205,8 +237,33 @@ def _ensure_grader_running(use_runsc: "bool | None" = None) -> None:
             "/opt/reliquary/reliquary/environment/grader/bundle",
         ),
     }
+    for name in (
+        "RELIQUARY_GRADER_EXECUTOR_URL",
+        "RELIQUARY_GRADER_EXECUTOR_MODE",
+        "RELIQUARY_GRADER_EXECUTOR_CA",
+        "RELIQUARY_GRADER_EXECUTOR_CERT",
+        "RELIQUARY_GRADER_EXECUTOR_KEY",
+        "RELIQUARY_GRADER_EXECUTOR_ALLOW_INSECURE_LOOPBACK",
+        "RELIQUARY_GRADER_RUNTIME_ID",
+        "GRADER_METRICS_PORT",
+        "GRADER_HEALTH_PATH",
+    ):
+        value = os.environ.get(name)
+        if value:
+            sanitized_env[name] = value
 
-    _logger.info("Launching grader server (use_runsc=%s, scrubbed_env=1) ...", use_runsc)
+    _logger.info(
+        "Launching grader server (backend=%s, scrubbed_env=1) ...",
+        (
+            "local-shadow"
+            if remote_executor_url and remote_executor_mode == "shadow"
+            else (
+                "remote"
+                if remote_executor_url
+                else ("runsc" if use_runsc else "python")
+            )
+        ),
+    )
     _grader_proc = subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,
@@ -238,7 +295,8 @@ def _ensure_grader_running(use_runsc: "bool | None" = None) -> None:
         "Grader server failed to bind %s within 15s. OCI rewards will "
         "be 0 and all OCI submissions will be rejected. Diagnose by "
         "running `python -m reliquary.environment.grader.server%s` manually.",
-        GRADER_SOCKET_PATH, " --use-runsc" if use_runsc else "",
+        GRADER_SOCKET_PATH,
+        " --use-runsc" if use_runsc else "",
     )
 
 
@@ -285,7 +343,8 @@ def mine(
     os.environ["BT_NETWORK"] = network
     os.environ["NETUID"] = str(netuid)
 
-    env_names = [n.strip() for n in environments.split(",") if n.strip()]
+    mix = _resolve_cli_environment_mix(environments)
+    env_names = [name for name, _target in mix]
     logger.info(
         "Starting Reliquary miner (network=%s, netuid=%d, envs=%s)",
         network, netuid, env_names,
@@ -305,6 +364,12 @@ def mine(
         from reliquary.environment import load_environments
         from reliquary.infrastructure.chain import get_subtensor, get_metagraph, NETUID
         from reliquary.miner.engine import MiningEngine
+        from reliquary.miner.checkpoint_identity import (
+            CheckpointIdentityError,
+            MinerCheckpointIdentityStore,
+            checkpoint_identity_from_state,
+            default_checkpoint_identity_path,
+        )
         from reliquary.miner.submitter import discover_validator_url, get_window_state_v2
         from reliquary.shared.modeling import (
             MODEL_SNAPSHOT_ALLOW_PATTERNS,
@@ -317,9 +382,14 @@ def mine(
             wallet_kwargs["path"] = wallet_path
         wallet = bt.Wallet(**wallet_kwargs)
         subtensor = await get_subtensor()
+        checkpoint_identity_store = MinerCheckpointIdentityStore(
+            default_checkpoint_identity_path(wallet.hotkey.ss58_address)
+        )
+        persisted_identity = checkpoint_identity_store.load()
 
         # --- Resolve initial checkpoint from validator if available ---
         initial_path = checkpoint  # fallback to --checkpoint arg
+        initial_checkpoint_identity = None
         try:
             if validator_url:
                 url = validator_url
@@ -331,30 +401,57 @@ def mine(
             from huggingface_hub import snapshot_download
             async with httpx.AsyncClient(timeout=30) as client:
                 state = await get_window_state_v2(url, client=client)
-            if state.checkpoint_repo_id and state.checkpoint_revision:
+            advertised_identity = checkpoint_identity_from_state(state)
+            if advertised_identity is not None:
+                checkpoint_identity_store.assert_advertisement(
+                    advertised_identity
+                )
                 logger.info(
                     "Validator at %s is on checkpoint %d (%s@%s). "
                     "Downloading to seed the miner model.",
-                    url, state.checkpoint_n, state.checkpoint_repo_id,
-                    state.checkpoint_revision[:12],
+                    url,
+                    advertised_identity.checkpoint_n,
+                    advertised_identity.repo_id,
+                    advertised_identity.oid[:12],
                 )
                 initial_path = snapshot_download(
-                    repo_id=state.checkpoint_repo_id,
-                    revision=state.checkpoint_revision,
+                    repo_id=advertised_identity.repo_id,
+                    revision=advertised_identity.oid,
                     allow_patterns=MODEL_SNAPSHOT_ALLOW_PATTERNS,
                 )
+                initial_checkpoint_identity = advertised_identity
                 logger.info("Using initial checkpoint path: %s", initial_path)
+            elif persisted_identity is not None:
+                raise CheckpointIdentityError(
+                    "validator omitted a previously activated checkpoint"
+                )
             else:
                 logger.info(
                     "Validator has no published checkpoint yet — using --checkpoint=%s",
                     checkpoint,
                 )
+        except CheckpointIdentityError:
+            raise
         except Exception as e:
-            logger.warning(
-                "Could not fetch validator checkpoint (%s); falling back to "
-                "--checkpoint=%s",
-                e, checkpoint,
-            )
+            if persisted_identity is None:
+                logger.warning(
+                    "Could not fetch validator checkpoint (%s); falling back "
+                    "to --checkpoint=%s",
+                    e,
+                    checkpoint,
+                )
+            else:
+                logger.warning(
+                    "Could not fetch validator checkpoint (%s); reloading "
+                    "the last durably activated revision",
+                    e,
+                )
+                initial_path = snapshot_download(
+                    repo_id=persisted_identity.repo_id,
+                    revision=persisted_identity.oid,
+                    allow_patterns=MODEL_SNAPSHOT_ALLOW_PATTERNS,
+                )
+                initial_checkpoint_identity = persisted_identity
 
         # --- Load models from resolved path ---
         logger.info("Loading models from %s...", initial_path)
@@ -383,8 +480,10 @@ def mine(
             **base_load_kwargs,
         ).to(proof_device).eval()
 
+        if initial_checkpoint_identity is not None:
+            checkpoint_identity_store.commit(initial_checkpoint_identity)
+
         envs = load_environments(env_names)
-        mix = [(n, w) for n, w in ENVIRONMENT_MIX if n in envs]
         engine = MiningEngine(
             vllm_model,
             hf_model,
@@ -394,6 +493,8 @@ def mine(
             mix=mix,
             proof_gpu=0 if proof_device == "cuda:0" else 1,
             validator_url_override=validator_url or None,
+            checkpoint_identity_store=checkpoint_identity_store,
+            initial_checkpoint_identity=initial_checkpoint_identity,
         )
 
         # Seed engine's _loaded_checkpoint_path so the first
@@ -474,7 +575,8 @@ def validate(
     os.environ["BT_NETWORK"] = network
     os.environ["NETUID"] = str(netuid)
 
-    env_names = [n.strip() for n in environments.split(",") if n.strip()]
+    mix = _resolve_cli_environment_mix(environments) if train else []
+    env_names = [name for name, _target in mix]
     if train and "opencodeinstruct" in env_names:
         _ensure_grader_running()
     if train:
@@ -489,14 +591,31 @@ def validate(
         )
 
     async def _run():
-        import bittensor as bt
-
         from reliquary.infrastructure.chain import get_subtensor
 
-        wallet_kwargs = {"name": wallet_name, "hotkey": hotkey}
-        if wallet_path:
-            wallet_kwargs["path"] = wallet_path
-        wallet = bt.Wallet(**wallet_kwargs)
+        signer_client = None
+        if os.environ.get("RELIQUARY_SIGNER_URL", "").strip():
+            from reliquary.signer.client import RemoteSignerClient
+
+            signer_client = RemoteSignerClient.from_environment(
+                network=network,
+                netuid=netuid,
+                repo_id=hf_repo_id,
+            )
+            health = await asyncio.to_thread(signer_client.assert_ready)
+            wallet = signer_client.public_wallet
+            logger.info(
+                "Remote signer ready (hotkey=%s protocol=%d)",
+                health.signer_hotkey,
+                health.protocol_version,
+            )
+        else:
+            import bittensor as bt
+
+            wallet_kwargs = {"name": wallet_name, "hotkey": hotkey}
+            if wallet_path:
+                wallet_kwargs["path"] = wallet_path
+            wallet = bt.Wallet(**wallet_kwargs)
         subtensor = await get_subtensor()
 
         if train:
@@ -695,7 +814,6 @@ def validate(
                         **base_load_kwargs,
                     ).to(device).eval()
 
-            mix = [(n, w) for n, w in ENVIRONMENT_MIX if n in env_names]
             service = ValidationService(
                 wallet,
                 model,
@@ -708,13 +826,14 @@ def validate(
                 external_port=(external_port or http_port) if external_ip else None,
                 hf_repo_id=hf_repo_id,
                 resume_from=resume_from or None,
-                env_mix=mix if mix else None,
+                env_mix=mix,
                 proof_devices=proof_slots or None,
                 proof_models=proof_models or None,
                 proof_capacity_qualification=(
                     proof_capacity_qualification
                 ),
                 proof_worker_pool=proof_worker_pool,
+                signer_client=signer_client,
             )
             # Run the weight setter in a dedicated OS thread with its own
             # event loop. asyncio is single-threaded, so any sync blocking
@@ -726,7 +845,11 @@ def validate(
 
             def _run_weight_setter() -> None:
                 try:
-                    worker = WeightOnlyValidator(wallet=wallet, netuid=netuid)
+                    worker = WeightOnlyValidator(
+                        wallet=wallet,
+                        netuid=netuid,
+                        signer_client=signer_client,
+                    )
                     asyncio.run(worker.run())
                 except Exception:
                     logger.exception("weight-setter thread crashed")
@@ -740,7 +863,11 @@ def validate(
         else:
             from reliquary.validator.weight_only import WeightOnlyValidator
 
-            validator = WeightOnlyValidator(wallet=wallet, netuid=netuid)
+            validator = WeightOnlyValidator(
+                wallet=wallet,
+                netuid=netuid,
+                signer_client=signer_client,
+            )
             await validator.run()
 
     _run_validator_event_loop(_run())

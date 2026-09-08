@@ -15,7 +15,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator, Sequence
 
 from pydantic import ValidationError
 
@@ -23,10 +23,12 @@ from reliquary.constants import (
     BOOTSTRAP_SIGMA_MIN,
     BFT_ANSWER_BUDGET,
     BFT_THINKING_BUDGET,
+    FILL_CLOSED_ENABLED,
     GRADER_EVAL_TIMEOUT_SECONDS,
     MATH_ANSWER_FORMAT,
     ROBUST_TRUNCATION_UTILITY_ENABLED,
     SIGMA_MIN,
+    episode_limits_for_environment,
     max_new_tokens_for_environment,
     max_truncated_for_environment,
 )
@@ -36,6 +38,7 @@ from reliquary.environment.grader_client import (
 )
 from reliquary.environment.opencodeinstruct import _entry_function_name, _extract_python
 from reliquary.environment.openmathinstruct import _compute_omi_reward
+from reliquary.environment.registry import get_environment_spec
 from reliquary.protocol.legacy_merkle import legacy_submission_merkle_matches
 from reliquary.protocol.signatures import (
     verify_commit_signature,
@@ -105,6 +108,15 @@ class AdmissionRuntimeMaterials:
     problem: dict[str, Any]
     completion_texts: list[str]
     code_cases: list[dict[str, Any]] | None = None
+    reward_materials: Any = None
+
+    @property
+    def effective_reward_materials(self) -> Any:
+        return (
+            self.reward_materials
+            if self.reward_materials is not None
+            else self.code_cases
+        )
 
 
 @dataclass(frozen=True)
@@ -112,6 +124,15 @@ class AdmissionProblemMaterials:
     problem: dict[str, Any]
     rendered_prompt: str
     code_cases: list[dict[str, Any]] | None = None
+    reward_materials: Any = None
+
+    @property
+    def effective_reward_materials(self) -> Any:
+        return (
+            self.reward_materials
+            if self.reward_materials is not None
+            else self.code_cases
+        )
 
 
 @dataclass
@@ -146,6 +167,14 @@ class PreparedSubmission:
     unboxed_count: int = 0
     attainable_rewards: tuple[float, ...] = ()
     robust_utility: float | None = None
+    # v6 per-token payment (see token_rewards.py): completion tokens summed
+    # over rollouts that genuinely terminated on EOS. Computed once here so
+    # distribution only ever reads it (see ``count_eos_completion_tokens``).
+    eos_tokens: int = 0
+    task_family: str | None = None
+    generator_version: str | None = None
+    operation_id: str | None = None
+    difficulty: int | None = None
 
 
 class _AdmissionTimeout(TimeoutError):
@@ -356,7 +385,14 @@ def _natural_cap_termination(
     meta: dict[str, Any],
     context: AdmissionContext,
 ) -> bool:
-    if context.environment != "openmathinstruct":
+    try:
+        uses_math_bft = (
+            get_environment_spec(context.environment).termination_policy
+            == "math_bft"
+        )
+    except ValueError:
+        uses_math_bft = False
+    if not uses_math_bft:
         return False
     if meta.get("forced") or meta.get("force_span") not in (None, []):
         return False
@@ -376,6 +412,23 @@ def _natural_cap_termination(
     return any(int(token) in think_close for token in phase_one)
 
 
+def submission_interaction_matches(request: BatchSubmissionRequest, environment: str) -> bool:
+    """Bind wire episode metadata to the registered environment before grading."""
+    try:
+        episode = get_environment_spec(environment).interaction_mode == "episode"
+    except ValueError:
+        episode = False
+    for rollout in request.rollouts:
+        meta = rollout.commit.get("rollout") or {}
+        value = meta.get("episode") if isinstance(meta, dict) else None
+        if episode:
+            if not isinstance(value, dict):
+                return False
+        elif value is not None:
+            return False
+    return True
+
+
 def _classify_termination(rollout, context: AdmissionContext) -> str:
     """Classify one rollout's termination.
 
@@ -389,6 +442,10 @@ def _classify_termination(rollout, context: AdmissionContext) -> str:
     commit = rollout.commit
     tokens = list(commit.get("tokens") or [])
     meta = commit.get("rollout", {}) or {}
+    # Episode termination is an environment state transition, not a trailing
+    # tokenizer EOS. The authoritative replay gate below validates it.
+    if isinstance(meta.get("episode"), dict):
+        return "ok"
     try:
         prompt_length = int(meta.get("prompt_length", 0))
         completion_length = int(meta.get("completion_length", 0))
@@ -406,10 +463,14 @@ def _classify_termination(rollout, context: AdmissionContext) -> str:
         if len(eos_positions) > 1 or eos_positions[0] != len(completion) - 1:
             return "bad_termination"
         return "ok"
-    if (
-        context.environment == "openmathinstruct"
-        and _forced_cap_termination(meta)
-    ):
+    try:
+        uses_math_bft = (
+            get_environment_spec(context.environment).termination_policy
+            == "math_bft"
+        )
+    except ValueError:
+        uses_math_bft = False
+    if uses_math_bft and _forced_cap_termination(meta):
         if not _force_span_valid(tokens, meta, context):
             return "tampered"
         return "ok"
@@ -454,6 +515,42 @@ def truncated_rollout_indices(
         for index, rollout in enumerate(request.rollouts)
         if _classify_termination(rollout, context) == "truncated"
     )
+
+
+def count_eos_completion_tokens(
+    request: BatchSubmissionRequest,
+    context: AdmissionContext,
+) -> int:
+    """Count validator-observed tokens in eligible EOS-terminated completions.
+
+    ``_classify_termination`` also accepts protocol-defined cap closures, so
+    this accounting path separately requires a genuine final EOS token. The
+    count comes from the validator-observed completion slice rather than a
+    miner-declared metadata value. The calculation is isolated behind the
+    disabled fill capability; existing production profiles continue to archive
+    ``eos_tokens=0``.
+    """
+    if not FILL_CLOSED_ENABLED:
+        return 0
+    if not context.eos_token_ids:
+        return 0
+    eos_ids = set(context.eos_token_ids)
+    total = 0
+    for rollout in request.rollouts:
+        if _classify_termination(rollout, context) != "ok":
+            continue
+        commit = rollout.commit
+        tokens = list(commit.get("tokens") or [])
+        meta = commit.get("rollout", {}) or {}
+        try:
+            prompt_length = int(meta.get("prompt_length", 0))
+            completion_length = int(meta.get("completion_length", 0))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        completion = tokens[prompt_length: prompt_length + completion_length]
+        if completion and int(completion[-1]) in eos_ids:
+            total += len(completion)
+    return total
 
 
 def _termination_reject(
@@ -506,6 +603,12 @@ def parse_and_validate_submission(
                 )
             parse_ms = (time.perf_counter() - parse_started) * 1000.0
             request._payload_bytes = binding.payload_bytes
+            if not submission_interaction_matches(request, context.environment):
+                return _reject_parsed(
+                    RejectReason.BAD_SCHEMA, "environment_interaction",
+                    request=request, body_parse_ms=parse_ms,
+                    preparation_started=started,
+                )
 
             if not _binding_matches(request, binding):
                 return _reject_parsed(
@@ -723,6 +826,30 @@ def _compute_code_rewards(
         executor.shutdown(wait=False, cancel_futures=True)
 
 
+def _score_openmath_adapter(
+    problem: dict[str, Any],
+    completion_texts: list[str],
+    reward_materials: Any = None,
+) -> list[float]:
+    del reward_materials
+    return [
+        float(_compute_omi_reward(problem, text))
+        for text in completion_texts
+    ]
+
+
+def _score_opencode_adapter(
+    problem: dict[str, Any],
+    completion_texts: list[str],
+    reward_materials: Any = None,
+) -> list[float]:
+    del problem
+    return _compute_code_rewards(
+        completion_texts,
+        list(reward_materials or []),
+    )
+
+
 def score_and_finalize_submission(
     parsed: ParsedSubmission,
     materials: AdmissionRuntimeMaterials,
@@ -754,6 +881,14 @@ def score_and_finalize_submission(
             timed_out=parsed.timed_out,
         )
 
+    if not submission_interaction_matches(request, context.environment):
+        return result(
+            request=request, completion_texts=[], rewards=[],
+            rollout_hashes=parsed.rollout_hashes,
+            selection_digest=parsed.selection_digest,
+            reject_reason=RejectReason.BAD_SCHEMA,
+            reject_stage="environment_interaction",
+        )
     reward_ms = 0.0
     try:
         with _deadline(deadline_monotonic):
@@ -784,19 +919,11 @@ def score_and_finalize_submission(
 
             reward_started = time.perf_counter()
             try:
-                if context.environment == "openmathinstruct":
-                    computed = [
-                        float(_compute_omi_reward(materials.problem, text))
-                        for text in materials.completion_texts
-                    ]
-                    authoritative = False
-                elif context.environment == "opencodeinstruct":
-                    computed = _compute_code_rewards(
-                        materials.completion_texts,
-                        materials.code_cases or [],
+                try:
+                    environment_spec = get_environment_spec(
+                        context.environment
                     )
-                    authoritative = True
-                else:
+                except ValueError:
                     return result(
                         request=request,
                         completion_texts=materials.completion_texts,
@@ -808,6 +935,99 @@ def score_and_finalize_submission(
                         body_parse_ms=parsed.body_parse_ms,
                         preparation_ms=parsed.preparation_ms,
                     )
+                if environment_spec.interaction_mode == "episode":
+                    if _WORKER_TOKENIZER is None:
+                        raise RuntimeError("episode replay tokenizer unavailable")
+                    from reliquary.environment.agentic.replay import (
+                        replay_tokenized_episode,
+                    )
+
+                    def encode_piece(text: str) -> list[int]:
+                        encoded = _WORKER_TOKENIZER.encode(
+                            text, add_special_tokens=False
+                        )
+                        return list(getattr(encoded, "ids", encoded))
+
+                    def decode_piece(ids: list[int]) -> str:
+                        return str(_WORKER_TOKENIZER.decode(
+                            list(ids), skip_special_tokens=False
+                        ))
+
+                    computed = []
+                    for rollout in request.rollouts:
+                        raw_meta = rollout.commit.get("rollout", {}) or {}
+                        episode = raw_meta.get("episode")
+                        if not isinstance(episode, dict):
+                            raise ValueError("episode metadata missing")
+                        spans = tuple(
+                            (int(span[0]), int(span[1]))
+                            for span in episode.get("assistant_spans", [])
+                        )
+                        limits = episode_limits_for_environment(
+                            context.environment
+                        )
+                        if limits is None:
+                            raise ValueError("episode limits missing from profile")
+                        (
+                            max_action_tokens,
+                            max_episode_tokens,
+                            max_observation_bytes,
+                        ) = limits
+                        if len(rollout.commit["tokens"]) > max_episode_tokens:
+                            raise ValueError("episode token budget exceeded")
+                        if any(
+                            end - start > max_action_tokens
+                            for start, end in spans
+                        ):
+                            raise ValueError("episode action token budget exceeded")
+                        trace = replay_tokenized_episode(
+                            environment_spec.create(),
+                            task_index=request.prompt_idx,
+                            seed=int(episode["seed"]),
+                            tokens=list(rollout.commit["tokens"]),
+                            assistant_spans=spans,
+                            decode=decode_piece,
+                            encode=encode_piece,
+                            max_episode_tokens=max_episode_tokens,
+                            max_observation_bytes=max_observation_bytes,
+                        )
+                        reward = trace.reward
+                        if reward is None:
+                            raise ValueError("episode replay did not produce reward")
+                        if trace.task_id != str(episode.get("task_id")):
+                            raise ValueError("episode task binding mismatch")
+                        if [action.to_wire() for action in trace.actions] != list(
+                            episode.get("actions") or []
+                        ):
+                            raise ValueError("episode action binding mismatch")
+                        if tuple(trace.tokens) != tuple(rollout.commit["tokens"]):
+                            raise ValueError("episode canonical transcript mismatch")
+                        if trace.assistant_spans != spans:
+                            raise ValueError("episode assistant span mismatch")
+                        if list(trace.observation_digests) != list(
+                            episode.get("observation_digests") or []
+                        ):
+                            raise ValueError("episode observation mismatch")
+                        if trace.termination_reason != str(
+                            episode.get("termination_reason")
+                        ):
+                            raise ValueError("episode termination mismatch")
+                        if reward.state_digest != str(episode.get("state_digest")):
+                            raise ValueError("episode state digest mismatch")
+                        if trace.trace_digest != str(episode.get("trace_digest")):
+                            raise ValueError("episode trace digest mismatch")
+                        rollout._validated_assistant_spans = spans
+                        rollout._validated_episode_trace_digest = trace.trace_digest
+                        computed.append(float(reward.reward))
+                else:
+                    computed = environment_spec.score_many(
+                        materials.problem,
+                        materials.completion_texts,
+                        materials.effective_reward_materials,
+                    )
+                authoritative = (
+                    environment_spec.validator_authoritative_reward
+                )
             except GraderInfrastructureError:
                 raise
             except Exception:
@@ -867,7 +1087,7 @@ def score_and_finalize_submission(
                     if is_missing_final_answer_box(text)
                 )
                 if (
-                    context.environment == "openmathinstruct"
+                    environment_spec.final_answer_policy == "boxed"
                     and MATH_ANSWER_FORMAT == "boxed"
                 )
                 else ()
@@ -886,12 +1106,18 @@ def score_and_finalize_submission(
                     robust_uncertain_reward_utility,
                 )
 
-                total_tests = (
-                    max(1, len(materials.code_cases or ()))
-                    if context.environment == "opencodeinstruct"
-                    else 1
-                )
-                attainable_rewards = fractional_reward_lattice(total_tests)
+                if environment_spec.attainable_rewards:
+                    attainable_rewards = (
+                        environment_spec.attainable_rewards
+                    )
+                else:
+                    total_tests = max(
+                        1,
+                        len(materials.effective_reward_materials or ()),
+                    )
+                    attainable_rewards = fractional_reward_lattice(
+                        total_tests
+                    )
                 robust_utility = robust_uncertain_reward_utility(
                     rewards,
                     sigma_min=(
@@ -921,29 +1147,30 @@ def score_and_finalize_submission(
                     reward_grading_ms=reward_ms,
                 )
 
-            for index, text in enumerate(materials.completion_texts):
-                meta = request.rollouts[index].commit.get("rollout", {}) or {}
-                malformed, _ = has_malformed_final_answer(
-                    rewards[index],
-                    text,
-                    completion_length=int(meta.get("completion_length", 0)),
-                    cap=max_new_tokens_for_environment(
-                        context.environment
-                    ),
-                )
-                if malformed:
-                    return result(
-                        request=request,
-                        completion_texts=materials.completion_texts,
-                        rewards=rewards,
-                        rollout_hashes=parsed.rollout_hashes,
-                        selection_digest=parsed.selection_digest,
-                        reject_reason=RejectReason.MALFORMED_FINAL_ANSWER,
-                        reject_stage="malformed_final_answer",
-                        body_parse_ms=parsed.body_parse_ms,
-                        preparation_ms=parsed.preparation_ms,
-                        reward_grading_ms=reward_ms,
+            if environment_spec.final_answer_policy == "boxed":
+                for index, text in enumerate(materials.completion_texts):
+                    meta = request.rollouts[index].commit.get("rollout", {}) or {}
+                    malformed, _ = has_malformed_final_answer(
+                        rewards[index],
+                        text,
+                        completion_length=int(meta.get("completion_length", 0)),
+                        cap=max_new_tokens_for_environment(
+                            context.environment
+                        ),
                     )
+                    if malformed:
+                        return result(
+                            request=request,
+                            completion_texts=materials.completion_texts,
+                            rewards=rewards,
+                            rollout_hashes=parsed.rollout_hashes,
+                            selection_digest=parsed.selection_digest,
+                            reject_reason=RejectReason.MALFORMED_FINAL_ANSWER,
+                            reject_stage="malformed_final_answer",
+                            body_parse_ms=parsed.body_parse_ms,
+                            preparation_ms=parsed.preparation_ms,
+                            reward_grading_ms=reward_ms,
+                        )
 
             clone_metrics = detect_opposite_reward_clones(
                 materials.completion_texts, rewards
@@ -966,7 +1193,7 @@ def score_and_finalize_submission(
                 meta = rollout.commit.get("rollout")
                 if isinstance(meta, dict):
                     meta["truncated"] = False
-                    if context.environment != "openmathinstruct":
+                    if environment_spec.termination_policy != "math_bft":
                         meta["forced"] = False
 
             return result(
@@ -984,6 +1211,7 @@ def score_and_finalize_submission(
                 unboxed_count=len(unboxed_indices),
                 attainable_rewards=attainable_rewards,
                 robust_utility=robust_utility,
+                eos_tokens=count_eos_completion_tokens(request, context),
                 body_parse_ms=parsed.body_parse_ms,
                 preparation_ms=(
                     parsed.preparation_ms
@@ -1050,6 +1278,7 @@ def materialize_and_score_submission(
                 problem=materials.problem,
                 completion_texts=[],
                 code_cases=materials.code_cases,
+                reward_materials=materials.reward_materials,
             ),
             context,
             deadline_monotonic,
@@ -1058,11 +1287,12 @@ def materialize_and_score_submission(
         with _deadline(deadline_monotonic):
             if _WORKER_TOKENIZER is None:
                 raise RuntimeError("admission worker tokenizer unavailable")
+            encoded_prompt = _WORKER_TOKENIZER.encode(
+                materials.rendered_prompt,
+                add_special_tokens=False,
+            )
             canonical_prompt_tokens = list(
-                _WORKER_TOKENIZER.encode(
-                    materials.rendered_prompt,
-                    add_special_tokens=False,
-                ).ids
+                getattr(encoded_prompt, "ids", encoded_prompt)
             )
             completion_texts = []
             for rollout in request.rollouts:
@@ -1081,6 +1311,7 @@ def materialize_and_score_submission(
                 problem=materials.problem,
                 completion_texts=completion_texts,
                 code_cases=materials.code_cases,
+                reward_materials=materials.reward_materials,
             ),
             context,
             deadline_monotonic,
@@ -1146,5 +1377,48 @@ def prepare_submission(
         materials.problem,
         code_cases=materials.code_cases,
     )
+    prepared.task_family = (
+        str(materials.problem.get("task_family"))
+        if materials.problem.get("task_family") is not None
+        else None
+    )
+    prepared.generator_version = (
+        str(materials.problem.get("generator_version"))
+        if materials.problem.get("generator_version") is not None
+        else None
+    )
+    prepared.operation_id = (
+        str(materials.problem.get("operation_id"))
+        if materials.problem.get("operation_id") is not None
+        else None
+    )
+    try:
+        prepared.difficulty = (
+            int(materials.problem["difficulty"])
+            if "difficulty" in materials.problem
+            else None
+        )
+    except (TypeError, ValueError, OverflowError):
+        prepared.difficulty = None
     prepared.legacy_merkle_status = parsed.legacy_merkle_status
     return prepared
+
+
+def robust_utility_admits(
+    rewards: Sequence[float],
+    *,
+    sigma_min: float,
+    truncated_indices: Iterable[int] = (),
+    attainable_rewards: Iterable[float] = (0.0, 1.0),
+) -> bool:
+    """Require positive utility under every admissible reward completion."""
+    from reliquary.validator.difficulty_auction import (
+        robust_uncertain_reward_utility,
+    )
+
+    return robust_uncertain_reward_utility(
+        rewards,
+        sigma_min=sigma_min,
+        uncertain_indices=truncated_indices,
+        attainable_rewards=attainable_rewards,
+    ) > 0.0

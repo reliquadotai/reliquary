@@ -766,7 +766,14 @@ async def test_worker_drains_predeadline_auction_item_after_collection_closes(
     worker = asyncio.create_task(server._submit_worker())
     try:
         for _ in range(100):
-            if batcher.pending_count == 1:
+            # ``pending_count`` is published inside ``accept_submission``;
+            # the worker releases its in-flight reservation immediately after
+            # that call returns. Observe the completed transfer rather than
+            # the valid, short-lived state between those two operations.
+            if (
+                batcher.pending_count == 1
+                and batcher.inflight_proof_reservations == 0
+            ):
                 break
             await asyncio.sleep(0.01)
         assert batcher.pending_count == 1

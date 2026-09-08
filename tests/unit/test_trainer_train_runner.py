@@ -20,6 +20,8 @@ def _decoded(n=30100):
     ))
 
 
+
+
 def test_accumulates_until_ready_then_trains(monkeypatch):
     monkeypatch.setattr(C, "KL_BETA", 0.0)
     calls = []
@@ -45,6 +47,10 @@ def test_accumulates_until_ready_then_trains(monkeypatch):
     assert len(batches) == 2 and all(len(b) == 2 for b in batches)
     # Accumulator reset after consumption.
     assert runner.step(_decoded(30102)) is False
+
+
+
+
 
 
 def test_quarantined_accumulated_batch_resets_without_training(monkeypatch):

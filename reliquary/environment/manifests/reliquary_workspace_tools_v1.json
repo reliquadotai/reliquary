@@ -1,0 +1,38 @@
+{
+  "schema": "reliquary/environment-source/v1",
+  "environment": "reliquary_workspace_tools_v1",
+  "contract": "reliquary/episode/v1",
+  "generator": "reliquary-workspace-tools-generator-v1",
+  "renderer": "reliquary-jsonl-tools-v1",
+  "reward": "deterministic-binary-outcome-v1",
+  "reward_diagnostics": "weighted-workspace-invariant-checks-v1",
+  "proof": "grail-v8-assistant-policy-spans",
+  "task_families": [
+    "arithmetic_operator",
+    "boundary_condition",
+    "filter_predicate",
+    "string_normalization"
+  ],
+  "episode_schema": "reliquary/environment/schemas/episode-v1.schema.json",
+  "episode_schema_sha256": "a9bf6d2a8704440a835f4882b3c9fb37e1e19701cc3c27f4ca017e7ce40ea39a",
+  "golden_fixture": "reliquary/environment/manifests/goldens/reliquary_workspace_tools_v1.jsonl",
+  "golden_fixture_sha256": "1f4b3ff243bfc549204b4322a4b42ba2da0575823aa8cd0e6a51653b4879565f",
+  "implementation_digest_algorithm": "sha256-path-nul-file-sha256-newline-v1",
+  "implementation_files": [
+    "reliquary/environment/agentic/__init__.py",
+    "reliquary/environment/agentic/base.py",
+    "reliquary/environment/agentic/compat.py",
+    "reliquary/environment/agentic/envs/workspace_tools_v1/__init__.py",
+    "reliquary/environment/agentic/envs/workspace_tools_v1/environment.py",
+    "reliquary/environment/agentic/renderer.py",
+    "reliquary/environment/agentic/replay.py",
+    "reliquary/environment/agentic/runner.py",
+    "reliquary/environment/agentic/suite.py",
+    "reliquary/environment/agentic/types.py"
+  ],
+  "implementation_sha256": "f5a8dec80222894cc0e916e9e5556a9e1be4a8e5c0f991cd886af9616be98322",
+  "source": "Reliquary-authored procedural file-repair workspaces",
+  "external_data": false,
+  "network_required": false,
+  "license": "MIT"
+}

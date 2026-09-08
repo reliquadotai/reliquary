@@ -1,0 +1,115 @@
+map $arg_env $reliquary_state_target {
+    default __unknown__;
+    "" state-default;
+{% for environment in ctrl_snapshot_environments %}
+    "{{ environment }}" state-{{ environment }};
+{% endfor %}
+}
+
+server {
+    listen 127.0.0.1:{{ ctrl_nginx_listen_port }} default_server reuseport;
+    server_name _;
+    server_tokens off;
+    access_log off;
+    error_log /var/log/nginx/reliquary-edge-error.log warn;
+
+    root /var/lib/reliquary-edge/snapshots;
+    gzip_static on;
+    gzip_vary on;
+    etag on;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy no-referrer always;
+
+    location = /livez {
+        default_type application/json;
+        return 200 '{"status":"alive","authority":"shadow"}\n';
+    }
+
+    location = /readyz {
+        default_type application/json;
+        if (!-f /var/lib/reliquary-edge/snapshots/current/state-default/payload.json) {
+            return 503 '{"status":"not_ready","reason":"state_snapshot_unavailable"}\n';
+        }
+        if (!-f /var/lib/reliquary-edge/snapshots/current/health/payload.json) {
+            return 503 '{"status":"not_ready","reason":"health_snapshot_unavailable"}\n';
+        }
+        if (!-f /var/lib/reliquary-edge/snapshots/current/runtime-contract/payload.json) {
+            return 503 '{"status":"not_ready","reason":"runtime_contract_unavailable"}\n';
+        }
+        return 200 '{"status":"ready","authority":"shadow"}\n';
+    }
+
+    location = /state {
+        default_type application/json;
+        add_header Cache-Control "no-cache, stale-if-error=2" always;
+        add_header Vary Accept-Encoding always;
+        if ($reliquary_state_target = __unknown__) {
+            return 404 '{"detail":"unknown_env"}\n';
+        }
+        try_files /current/$reliquary_state_target/payload.json @state_missing;
+    }
+
+    location @state_missing {
+        default_type application/json;
+        add_header Cache-Control "no-store" always;
+        if (-f /var/lib/reliquary-edge/snapshots/current/state-default/payload.json) {
+            return 404 '{"detail":"unknown_env"}\n';
+        }
+        return 503 '{"detail":"no_active_window"}\n';
+    }
+
+    location = /health {
+        default_type application/json;
+        add_header Cache-Control "no-cache" always;
+        add_header Vary Accept-Encoding always;
+        try_files /current/health/payload.json @health_missing;
+    }
+
+    location @health_missing {
+        default_type application/json;
+        add_header Cache-Control "no-store" always;
+        return 503 '{"status":"degraded","reason":"health_snapshot_unavailable"}\n';
+    }
+
+    location = /runtime-contract {
+        default_type application/json;
+        add_header Cache-Control "no-cache" always;
+        add_header Vary Accept-Encoding always;
+        try_files /current/runtime-contract/payload.json @runtime_contract_missing;
+    }
+
+    location @runtime_contract_missing {
+        default_type application/json;
+        add_header Cache-Control "no-store" always;
+        return 503 '{"detail":"runtime_contract_unavailable"}\n';
+    }
+
+    location = /checkpoint {
+        default_type application/json;
+        add_header Cache-Control "no-cache" always;
+        add_header Vary Accept-Encoding always;
+        try_files /current/checkpoint/payload.json @checkpoint_missing;
+    }
+
+    location @checkpoint_missing {
+        default_type application/json;
+        add_header Cache-Control "no-store" always;
+        if (-f /var/lib/reliquary-edge/snapshots/current/state-default/payload.json) {
+            return 404 '{"detail":"no_checkpoint"}\n';
+        }
+        return 503 '{"detail":"checkpoint_unavailable"}\n';
+    }
+
+    # Shadow ctrl-01 never forwards economic writes. Cutover replaces these
+    # locations only after remote CPU/proof parity and signer gates pass.
+    location ~ ^/(submit|verdicts/) {
+        default_type application/json;
+        access_log /var/log/nginx/reliquary-edge-write.log combined;
+        return 503 '{"detail":"control_not_authoritative"}\n';
+    }
+
+    location / {
+        default_type application/json;
+        return 404 '{"detail":"not_found"}\n';
+    }
+}

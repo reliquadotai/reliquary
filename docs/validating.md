@@ -79,7 +79,7 @@ docker logs watchtower | tail -20
 You need:
 
 - A GPU host with NVIDIA driver, CUDA 12.8+, and the NVIDIA Container Toolkit.
-- A capacity-qualified GPU fleet for the active profile, 64 GB RAM, and 150 GB disk. Protocol v5 qualification must cover 16-rollout, near-8192-token proofs and all 34 ranked-plus-forensic attempts per environment.
+- A capacity-qualified GPU fleet for the active profile, 64 GB RAM, and 150 GB disk. Protocol v6 qualification must cover 16-rollout, near-8192-token proofs and all 34 ranked-plus-forensic attempts per environment.
 - A public IP and an open inbound TCP port (default 8080) — miners must reach you.
 - HF Hub token with **write** access to your checkpoint repo.
 - R2 **write** credentials.
@@ -98,13 +98,17 @@ Trainer-specific `.env` keys (full list in `.env.example.trainer`):
 
 ```bash
 RELIQUARY_TRAIN=1
-RELIQUARY_PROTOCOL_PROFILE=qwen3-4b-base-dapo-reasoning-v5
+# A pair: startup refuses the profile without the capability, and the
+# capability without exactly this profile. Every process that imports the
+# constants needs both — validator, detached train-worker, and miners.
+RELIQUARY_PROTOCOL_PROFILE=qwen3-4b-base-dapo-fill-closed-v6
+RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED=1
 RELIQUARY_CHECKPOINT=Qwen/Qwen3-4B-Base
 RELIQUARY_HF_REPO_ID=your-org/reliquary-sn   # HF repo to push checkpoints to
 HF_TOKEN=hf_xxx                              # write access to that repo
 RELIQUARY_EXTERNAL_IP=<your-public-ip>       # advertised on-chain
 RELIQUARY_EXTERNAL_PORT=8080
-# Required fresh, v5-stamped base-reset checkpoint for protocol v5:
+# Required fresh, v6-stamped base-reset checkpoint for protocol v6:
 RELIQUARY_RESUME_FROM=sha:<40-hex-hf-commit>
 RELIQUARY_PROOF_DEVICES=<qualified-canonical-device-list>
 RELIQUARY_PROOF_CAPACITY_MANIFEST=/root/reliquary/state/proof-capacity.json
@@ -115,7 +119,7 @@ RELIQUARY_PROOF_CAPACITY_MANIFEST_SHA256=<64-lowercase-hex>
 
 `RELIQUARY_PROOF_SLOTS_PER_DEVICE` (default `1`) runs more than one proof
 process on each configured GPU. One proof costs roughly
-`60 ms + 0.0145 ms/token`, so at v5 rollout lengths it is ~87% fixed dispatch
+`60 ms + 0.0145 ms/token`, so at these rollout lengths it is ~87% fixed dispatch
 and a single process leaves the card at 39% utilisation. Measured on an H100
 PCIe over 192 archived rollouts:
 
@@ -217,7 +221,7 @@ caps, and operator/prompt dedup apply independently to both environments. Do not
 the mixed trainer until the image contains the grader rootfs, `runsc` starts
 successfully, and the loopback grader canaries pass.
 
-Protocol v5 inherits these pinned training defaults from v4:
+Protocol v6 inherits these pinned training defaults from v4:
 
 ```bash
 RELIQUARY_KL_BETA=0
@@ -229,16 +233,18 @@ RELIQUARY_CHECKPOINT_PUBLISH_INTERVAL_WINDOWS=16
 RELIQUARY_SHAPE_PENALTY=0
 ```
 
-Do not assemble v5 from independent environment overrides. The trainer refuses
+Do not assemble v6 from independent environment overrides. The trainer refuses
 to start unless the selected checkpoint matches the profile, the activation
-checkpoint carries the v5 lineage stamp, and the exact proof fleet/runtime has
+checkpoint carries the v6 lineage stamp, and the exact proof fleet/runtime has
 a release-bound capacity manifest. Re-run qualification whenever the proof
 path, runtime fingerprint, checkpoint, or hardware identity changes.
 
-The v5 baseline must use a newly published, v5-stamped Qwen3-4B-Base reset and
-a new `RELIQUARY_TRAINING_RUN_ID`; a v4-trained checkpoint is only a separately
-labelled warm-start experiment. Follow the complete
-[reasoning-prompt v5 cutover](reasoning-prompt-v5-cutover.md).
+The v6 baseline must use a newly published, v6-stamped Qwen3-4B-Base reset and
+a new `RELIQUARY_TRAINING_RUN_ID`; an earlier-protocol checkpoint is only a
+separately labelled warm-start experiment. The prompt-protocol half of the
+cutover is unchanged from the
+[reasoning-prompt v5 cutover](reasoning-prompt-v5-cutover.md); v6 keeps the
+same model, templates and sampling and changes the window regime.
 
 The 16-step checkpoint cadence limits behavior-policy staleness. If the ratio
 gate still trips before cadence, the rejected update is excluded and the
@@ -348,14 +354,14 @@ For deeper protocol-level issues (high `GRAIL_FAIL`, batches not sealing, EMA dr
 
 ## What the validator actually enforces
 
-These are the protocol-v5 release-candidate values. They are one atomic
+These are the protocol-v6 release-candidate values. They are one atomic
 generation profile; do not assemble them from independent overrides. The same
 current constants are explained from the miner's perspective in
 [mining.md](mining.md#rejection-reasons).
 
 | Constant | Value | Effect |
 |---|---|---|
-| `PROTOCOL_PROFILE_ID` | `qwen3-4b-base-dapo-reasoning-v5` | Signed generation profile required from miners and validators |
+| `PROTOCOL_PROFILE_ID` | `qwen3-4b-base-dapo-fill-closed-v6` | Signed generation profile required from miners and validators |
 | `PROTOCOL_MODEL_ID` | `Qwen/Qwen3-4B-Base` | Base model; revision `906bfd4b4dc7f14ee4320094d8b41684abff8539` |
 | `B_BATCH` | 16 | Maximum proven winners and uniform reward slots per active environment |
 | `M_ROLLOUTS` | 16 | Required rollout count per submission |
@@ -365,12 +371,15 @@ current constants are explained from the miner's perspective in
 | Math `answer_format` | `boxed` | Only a valid final `\boxed{...}` or `\fbox{...}` can earn positive Math reward |
 | Code `answer_format` | `null` | Code grading is validator-authoritative and has no boxed-answer contract |
 | Math / Code `max_new_tokens` | `8192` / `8192` | Per-rollout generation cap for both environments |
-| Math / Code `bft` | `null` / `null` | Budget-forced termination is disabled in v5 |
+| Math / Code `bft` | `null` / `null` | Budget-forced termination is disabled in v6 |
 | `FORCED_SEED_PROTOCOL_VERSION` | 5 | Mandatory hotkey-free forced stream while enforcement is active |
-| `WINDOW_COLLECTION_SECONDS` | 100 | Hard collection ceiling for both Math and Code auction populations |
-| `AUCTION_EARLY_CLOSE_MIN_SECONDS` | 60 | Earliest adaptive close; all drain/GPU/quiet/population gates must also pass |
-| `SUBMISSION_UPLOAD_GRACE_SECONDS` | 33 | Reveal grace for an exact body precommitted before collection cutoff |
-| `PRIMARY_PROOF_GRADING_ATTEMPTS_PER_WINDOW` | 64 | Primary population required before adaptive close |
+| `FILL_CLOSED_EMISSIONS_PER_WINDOW` | 16 | Picks that close a window, and training batches it emits |
+| `FILL_CLOSED_TARGET_GROUPS_PER_ENV` | 256 | Proven groups per environment per window; refused unless it equals emissions x `B_BATCH` |
+| `FILL_CLOSED_MAX_SECONDS` | 1800 | Backstop for a window that never fills — not a collection target |
+| `SUBMISSION_UPLOAD_GRACE_SECONDS` | 33 | Reveal grace for an exact body precommitted before the cutoff |
+| `WINDOW_COLLECTION_SECONDS` | 100 | Classic timed window only; a v6 window closes on its 16th pick, not on this clock |
+| `AUCTION_EARLY_CLOSE_MIN_SECONDS` | 60 | Classic timed window only; the adaptive-close path is not reached under v6 |
+| `PRIMARY_PROOF_GRADING_ATTEMPTS_PER_WINDOW` | 64 | Primary population for the classic adaptive close; inert under v6 |
 | `MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW` | 96 | Productive candidate ceiling per environment/window; 32 default challenger positions |
 | `MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW` | 32 | Ranked seal-time GPU proof ceiling per environment/window |
 | `FORENSIC_SAMPLE_PER_WINDOW` | 2 | Unpaid non-winner proof sample; cannot affect auction selection |
@@ -486,7 +495,7 @@ transient R2 failure, but growing depth or old
 `archive_last_uploaded_window` confirms that a recent archive left the retry
 queue.
 
-Protocol v5 additionally reports the global proof scheduler state, queue and
+Protocol v6 additionally reports the global proof scheduler state, queue and
 active work by device, checkpoint readiness, per-environment proof latency,
 capacity qualification, and capacity abort totals. A required scheduler in any
 state other than `running` makes health degraded and prevents a new window from

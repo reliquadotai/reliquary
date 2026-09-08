@@ -21,11 +21,22 @@ from reliquary.constants import (
     T_PROTO,
 )
 from reliquary.shared.modeling import resolve_eos_token_ids
+from reliquary.environment.registry import get_environment_spec
 
 logger = logging.getLogger(__name__)
 
 _GPU_VOCAB_FLOAT_WORKSPACE_BYTES = 256 * 1024 * 1024
 _UTILITY_ENTROPY_MAX_POSITIONS = 64
+
+
+def _uses_math_bft_environment(env_name: str | None) -> bool:
+    try:
+        return (
+            get_environment_spec(str(env_name or "")).termination_policy
+            == "math_bft"
+        )
+    except ValueError:
+        return False
 
 
 @dataclass(frozen=True)
@@ -195,7 +206,7 @@ def is_natural_bft_cap_candidate(
     ``ProofResult.natural_close_pick_ok`` so a miner cannot manufacture the
     close token.
     """
-    if env_name != "openmathinstruct":
+    if not _uses_math_bft_environment(env_name):
         return False
 
     rollout_meta = commit.get("rollout", {}) or {}
@@ -280,7 +291,7 @@ def verify_termination(
     if (
         prompt_length + completion_length >= protocol_cap
         or (
-            env_name == "openmathinstruct"
+            _uses_math_bft_environment(env_name)
             and is_forced_bft_cap_termination(commit)
         )
     ):
@@ -360,7 +371,7 @@ def is_cap_truncation(
         else MAX_NEW_TOKENS_PROTOCOL_CAP
     )
     if (
-        env_name == "openmathinstruct"
+        _uses_math_bft_environment(env_name)
         and is_forced_bft_cap_termination(commit)
     ):
         return False
@@ -482,6 +493,66 @@ def _lm_head_vocab_size(lm_head: Any) -> int | None:
     return None
 
 
+def policy_token_positions(
+    tokens: list[int], rollout_meta: dict[str, Any]
+) -> list[int]:
+    """Absolute sampled-token positions for legacy or Episode v1 traces."""
+
+    episode = rollout_meta.get("episode")
+    if isinstance(episode, dict):
+        positions: list[int] = []
+        previous = 0
+        for raw_span in episode.get("assistant_spans") or []:
+            if not isinstance(raw_span, (list, tuple)) or len(raw_span) != 2:
+                return []
+            start, end = int(raw_span[0]), int(raw_span[1])
+            if start < previous or end <= start or end > len(tokens):
+                return []
+            positions.extend(range(start, end))
+            previous = end
+        return positions
+    prompt_length = int(rollout_meta.get("prompt_length", 0))
+    completion_length = int(rollout_meta.get("completion_length", 0))
+    return _completion_valid_t(
+        tokens, prompt_length, completion_length, len(tokens)
+    )
+
+
+def proof_challenge_indices(
+    tokens: list[int],
+    rollout_meta: dict[str, Any],
+    randomness: str,
+) -> list[int]:
+    """Select GRAIL positions from the policy span for Episode v1.
+
+    Tool observations and renderer separators are validator-produced and
+    replayed byte-exactly. V8 therefore spends its bounded sketch challenges
+    only on model-generated assistant tokens. Legacy v7 keeps its historical
+    full-sequence selection unchanged.
+    """
+
+    from reliquary.protocol.crypto import indices_from_root
+
+    episode = rollout_meta.get("episode")
+    if isinstance(episode, dict):
+        policy_positions = policy_token_positions(tokens, rollout_meta)
+        if not policy_positions:
+            return []
+        relative = indices_from_root(
+            tokens,
+            randomness,
+            len(policy_positions),
+            min(CHALLENGE_K, len(policy_positions)),
+        )
+        return [policy_positions[index] for index in relative]
+    return indices_from_root(
+        tokens,
+        randomness,
+        len(tokens),
+        min(CHALLENGE_K, len(tokens)),
+    )
+
+
 def verify_commitment_proofs(
     commit: dict,
     model: Any,
@@ -509,7 +580,6 @@ def verify_commitment_proofs(
     counts are computed on GPU the same way. When None (pre-forced-seed
     clients), ``seed_n_stochastic``/``seed_n_match`` stay at 0 — no-op.
     """
-    from reliquary.protocol.crypto import indices_from_root
     from reliquary.protocol.grail_verifier import GRAILVerifier
     from reliquary.shared.forward import forward_single_layer
     from reliquary.shared.hf_compat import resolve_hidden_size
@@ -520,6 +590,7 @@ def verify_commitment_proofs(
     rollout_meta = commit.get("rollout", {}) or {}
     prompt_length = int(rollout_meta.get("prompt_length", 0))
     completion_length = int(rollout_meta.get("completion_length", 0))
+    policy_positions = policy_token_positions(tokens, rollout_meta)
 
     seq_len = len(tokens)
     capture_utility = utility_telemetry_enabled()
@@ -533,10 +604,17 @@ def verify_commitment_proofs(
     verifier = GRAILVerifier(hidden_dim=hidden_dim)
     r_vec = verifier.generate_r_vec(randomness)
 
-    expected_challenges = min(CHALLENGE_K, seq_len)
-    challenge_indices = indices_from_root(
-        tokens, randomness, seq_len, expected_challenges
+    challenge_indices = proof_challenge_indices(
+        tokens,
+        rollout_meta,
+        randomness,
     )
+    challenge_domain_size = (
+        len(policy_positions)
+        if isinstance(rollout_meta.get("episode"), dict)
+        else seq_len
+    )
+    expected_challenges = min(CHALLENGE_K, challenge_domain_size)
 
     device = next(model.parameters()).device
     input_ids = torch.tensor([tokens], device=device)
@@ -562,6 +640,7 @@ def verify_commitment_proofs(
     )
     challenge_lp_indices, challenge_lp_values = _gpu_challenge_logprobs(
         logits_gpu, tokens, prompt_length, completion_length, randomness, device,
+        policy_positions=policy_positions,
     )
     (
         completion_chosen_probs,
@@ -571,6 +650,7 @@ def verify_commitment_proofs(
     ) = _gpu_completion_token_stats(
         logits_gpu, tokens, prompt_length, completion_length, seq_len, device,
         include_entropy=capture_utility,
+        policy_positions=policy_positions,
     )
 
     seed_n_stochastic = 0
@@ -589,7 +669,7 @@ def verify_commitment_proofs(
     natural_close_pick_ok = None
     natural_close_pick_cdf_miss = None
     if seed_u_values is not None:
-        valid_t = _completion_valid_t(tokens, prompt_length, completion_length, seq_len)
+        valid_t = policy_positions
         # Exclude BFT-injected force_span tokens: validator-accepted but not
         # policy-sampled, so they never came from the forced stream and would
         # false-mismatch (mirrors training._completion_keep_list). force_span
@@ -610,16 +690,17 @@ def verify_commitment_proofs(
         else:
             fs0, fs1 = 0, 0
         # completion offset j = t - prompt_length indexes seed_u_values.
-        seed_t = [
-            t for t in valid_t
-            if t - prompt_length < len(seed_u_values) and not (fs0 <= t < fs1)
+        seed_pairs = [
+            (offset, t) for offset, t in enumerate(valid_t)
+            if offset < len(seed_u_values) and not (fs0 <= t < fs1)
         ]
+        seed_t = [t for _offset, t in seed_pairs]
         if seed_t:
             seed_tokens = [tokens[t] for t in seed_t]
-            seed_u = [seed_u_values[t - prompt_length] for t in seed_t]
+            seed_u = [seed_u_values[offset] for offset, _t in seed_pairs]
             seed_diagnostics = _gpu_seed_consistency_diagnostics(
                 logits_gpu, seed_tokens, seed_u,
-                position_offsets=[t - prompt_length for t in seed_t],
+                position_offsets=[offset for offset, _t in seed_pairs],
                 logit_positions=[t - 1 for t in seed_t],
             )
             seed_n_stochastic = seed_diagnostics.n_stochastic
@@ -637,13 +718,16 @@ def verify_commitment_proofs(
             seed_first_hard_mismatch_offset = (
                 seed_diagnostics.first_hard_mismatch_offset
             )
-        terminal_pick_ok, terminal_pick_cdf_miss = (
+        if isinstance(rollout_meta.get("episode"), dict):
+            terminal_pick_ok, terminal_pick_cdf_miss = None, None
+        else:
+            terminal_pick_ok, terminal_pick_cdf_miss = (
             _gpu_terminal_forced_pick_diagnostics(
                 logits_gpu, tokens, prompt_length, seq_len,
                 _eos_set_from_model(model, tokenizer), seed_u_values,
                 (fs0, fs1),
             )
-        )
+            )
         (
             natural_close_pick_ok,
             natural_close_pick_cdf_miss,
@@ -695,7 +779,11 @@ def verify_commitment_proofs(
 
     # SECURITY: All expected challenge positions must be checked and pass.
     # A miner cannot benefit from having fewer positions verified.
-    all_passed = passed == checked and checked >= expected_challenges
+    all_passed = bool(
+        expected_challenges > 0
+        and passed == checked
+        and checked == expected_challenges
+    )
     return ProofResult(
         all_passed=all_passed,
         passed=passed,
@@ -896,6 +984,8 @@ def _gpu_challenge_logprobs(
     completion_length: int,
     randomness: str,
     device: Any,
+    *,
+    policy_positions: list[int] | None = None,
 ) -> tuple[list[int], list[float]]:
     """Recompute the validator's log-prob at each logprob-challenge index.
 
@@ -907,13 +997,26 @@ def _gpu_challenge_logprobs(
     """
     from reliquary.protocol.crypto import indices_from_root_in_range
 
-    if completion_length < CHALLENGE_K:
-        return [], []
-    challenge_idxs = indices_from_root_in_range(
-        tokens, randomness,
-        prompt_length, prompt_length + completion_length,
-        CHALLENGE_K,
+    candidates = (
+        list(policy_positions)
+        if policy_positions is not None
+        else list(range(prompt_length, prompt_length + completion_length))
     )
+    if len(candidates) < CHALLENGE_K:
+        return [], []
+    if policy_positions is None:
+        challenge_idxs = indices_from_root_in_range(
+            tokens, randomness,
+            prompt_length, prompt_length + completion_length,
+            CHALLENGE_K,
+        )
+    else:
+        from reliquary.protocol.crypto import indices_from_root
+
+        offsets = indices_from_root(
+            tokens, randomness, len(candidates), CHALLENGE_K
+        )
+        challenge_idxs = [candidates[offset] for offset in offsets]
     if len(challenge_idxs) != CHALLENGE_K:
         return [], []
 
@@ -956,6 +1059,7 @@ def _gpu_completion_token_stats(
     device: Any,
     *,
     include_entropy: bool = True,
+    policy_positions: list[int] | None = None,
 ) -> tuple[list[float], list[float], list[int], list[float]]:
     """Per completion-producing position under T_PROTO, on GPU, vectorised:
     chosen-token prob, argmax prob, argmax token id, and full-policy entropy.
@@ -963,7 +1067,13 @@ def _gpu_completion_token_stats(
     t - 1 >= seq_len, t >= len(tokens)) are skipped identically across all
     four.
     """
-    valid_t = _completion_valid_t(tokens, prompt_length, completion_length, seq_len)
+    valid_t = (
+        list(policy_positions)
+        if policy_positions is not None
+        else _completion_valid_t(
+            tokens, prompt_length, completion_length, seq_len
+        )
+    )
     if not valid_t:
         return [], [], [], []
 
@@ -1207,6 +1317,8 @@ def verify_logprobs_claim(
     completion_length: int,
     claimed_logprobs: list[float],
     proof: "ProofResult",
+    *,
+    policy_positions: list[int] | None = None,
 ) -> tuple[bool, float]:
     """Hard check: validate miner-claimed per-token logprobs against the
     validator's precomputed log-probs at K=CHALLENGE_K challenged
@@ -1247,8 +1359,19 @@ def verify_logprobs_claim(
         def miner_lp_at(abs_idx: int) -> float:
             return float(claimed_logprobs[abs_idx])
     elif len(claimed_logprobs) == completion_length:
+        policy_offset = (
+            {position: offset for offset, position in enumerate(policy_positions)}
+            if policy_positions is not None
+            else None
+        )
+
         def miner_lp_at(abs_idx: int) -> float:
-            return float(claimed_logprobs[abs_idx - prompt_length])
+            offset = (
+                policy_offset[abs_idx]
+                if policy_offset is not None
+                else abs_idx - prompt_length
+            )
+            return float(claimed_logprobs[offset])
     else:
         return False, float("inf")
 

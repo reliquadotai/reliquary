@@ -8,6 +8,7 @@ Merkle root commitment, HTTP batch submission to validator.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import time
@@ -22,10 +23,18 @@ from reliquary.constants import (
     M_ROLLOUTS,
     PROMPT_RANGE_SIZE,
 )
+from reliquary.miner.checkpoint_identity import (
+    ActivatedCheckpoint,
+    CheckpointIdentityError,
+    MinerCheckpointIdentityStore,
+    checkpoint_identity_from_state,
+    default_checkpoint_identity_path,
+)
 from reliquary.protocol.profiles import (
     ACTIVE_PROTOCOL_PROFILE,
     to_generation_contract,
 )
+from reliquary.environment.registry import get_environment_spec
 from reliquary.shared.prompt_range import window_prompt_range
 from reliquary.infrastructure import chain
 from reliquary.protocol.submission import RolloutSubmission
@@ -34,6 +43,27 @@ if TYPE_CHECKING:
     from reliquary.environment.base import Environment
 
 logger = logging.getLogger(__name__)
+
+
+class CheckpointActivationRestartRequired(RuntimeError):
+    """Checkpoint activation cannot safely continue in the current process."""
+
+
+def _eligible_generation_mix(
+    mix: list[tuple[str, int]],
+    miner_state,
+) -> list[tuple[str, int]]:
+    """Remove lanes that already advertise closed admission."""
+    if miner_state is None:
+        return list(mix)
+    return [
+        (environment, weight)
+        for environment, weight in mix
+        if (
+            environment in miner_state.environments
+            and miner_state.environments[environment].accepting_submissions
+        )
+    ]
 
 
 def _state_matches_active_protocol(state) -> bool:
@@ -50,6 +80,73 @@ def _state_matches_active_protocol(state) -> bool:
         and state.generation_contract
         == to_generation_contract(ACTIVE_PROTOCOL_PROFILE)
     )
+
+
+def _release_state_mismatch_reason(
+    *,
+    initial_state,
+    release_state,
+    request,
+    environment_name: str,
+    environment_size: int,
+    cooldown_prompts: set[int],
+    prompt_range: tuple[int, int] | None,
+    accepting_submissions: bool | None = None,
+    now: float | None = None,
+) -> str | None:
+    """Return why locally prepared work must not cross into live ingress."""
+    from reliquary.protocol.submission import WindowState
+
+    if release_state.state != WindowState.OPEN:
+        return "window_not_open"
+    if release_state.window_n != initial_state.window_n:
+        return "window_changed"
+    if release_state.randomness != initial_state.randomness:
+        return "randomness_changed"
+    if any(
+        getattr(release_state, field, None)
+        != getattr(initial_state, field, None)
+        for field in (
+            "checkpoint_n",
+            "checkpoint_repo_id",
+            "checkpoint_revision",
+            "protocol_version",
+            "generation_profile_id",
+            "generation_contract",
+        )
+    ):
+        return "contract_changed"
+    if not _state_matches_active_protocol(release_state):
+        return "protocol_mismatch"
+    if accepting_submissions is False:
+        return "admission_closed"
+    if request.window_start != release_state.window_n:
+        return "request_window_mismatch"
+    if request.checkpoint_hash != (release_state.checkpoint_revision or ""):
+        return "request_checkpoint_mismatch"
+    if request.protocol_version != FORCED_SEED_PROTOCOL_VERSION:
+        return "request_protocol_mismatch"
+    if (
+        ACTIVE_PROTOCOL_PROFILE.protocol_version >= 3
+        and request.generation_profile_id != release_state.generation_profile_id
+    ):
+        return "request_profile_mismatch"
+    deadline = getattr(release_state, "submission_deadline_at", None)
+    if deadline is not None and (time.time() if now is None else now) >= deadline:
+        return "submission_deadline_passed"
+    if prompt_range is None:
+        prompt_range = window_prompt_range(
+            release_state.randomness,
+            environment_name,
+            environment_size,
+            PROMPT_RANGE_SIZE,
+        )
+    lower, upper = prompt_range
+    if not lower <= request.prompt_idx < upper:
+        return "prompt_out_of_range"
+    if request.prompt_idx in cooldown_prompts:
+        return "prompt_in_cooldown"
+    return None
 
 
 def _initial_runtime_bound_nonce(runtime_fingerprint) -> str:
@@ -71,28 +168,47 @@ def _initial_runtime_bound_nonce(runtime_fingerprint) -> str:
 async def maybe_pull_checkpoint(
     state,
     local_n: int,
+    local_repo_id: str,
     local_hash: str,
     local_model,
     *,
     download_fn,
     load_fn,
 ):
-    """If remote checkpoint_n > local, download via HF and load.
+    """Activate a newer or same-number/different-revision checkpoint.
 
     state.checkpoint_repo_id + state.checkpoint_revision identify the
     HF snapshot. download_fn/load_fn still injected for testability.
 
-    Returns ``(new_local_n, new_local_hash, new_model)``. If no update is
-    needed (remote ≤ local, or remote has no repo/revision yet), returns
-    inputs unchanged.
+    Returns ``(new_local_n, new_repo_id, new_local_hash, new_model)``. If no
+    update is needed (remote is older, identities match, or the remote snapshot
+    is not published yet), returns inputs unchanged.
     """
-    if state.checkpoint_n <= local_n:
-        return local_n, local_hash, local_model
-    if state.checkpoint_repo_id is None or state.checkpoint_revision is None:
-        return local_n, local_hash, local_model
-    local_path = await download_fn(state.checkpoint_repo_id, state.checkpoint_revision)
-    new_model = load_fn(local_path)
-    return state.checkpoint_n, state.checkpoint_revision, new_model
+    remote_identity = checkpoint_identity_from_state(state)
+    if remote_identity is None:
+        return local_n, local_repo_id, local_hash, local_model
+    if remote_identity.checkpoint_n < local_n:
+        return local_n, local_repo_id, local_hash, local_model
+    if remote_identity.checkpoint_n == local_n:
+        if (
+            remote_identity.repo_id == local_repo_id
+            and remote_identity.oid == local_hash
+        ):
+            return local_n, local_repo_id, local_hash, local_model
+        if local_repo_id or local_hash:
+            raise CheckpointIdentityError(
+                "checkpoint number was rebound to a different repository or revision"
+            )
+    local_path = await download_fn(remote_identity.repo_id, remote_identity.oid)
+    new_model = await asyncio.to_thread(load_fn, local_path)
+    if new_model is None:
+        raise RuntimeError("checkpoint loader returned no activated model")
+    return (
+        remote_identity.checkpoint_n,
+        remote_identity.repo_id,
+        remote_identity.oid,
+        new_model,
+    )
 
 
 async def _hf_download(repo_id: str, revision: str) -> str:
@@ -155,6 +271,7 @@ def pick_env_and_prompt(
     rng: _random.Random | None = None,
     max_attempts: int = 1000,
     randomness: str | None = None,
+    prompt_ranges: dict[str, tuple[int, int]] | None = None,
 ) -> tuple[str, int]:
     """Sample env per `mix` weights, then a prompt within that env.
 
@@ -174,8 +291,12 @@ def pick_env_and_prompt(
         avail_weights = [weights[names.index(n)] for n in available]
         env_name = rng.choices(available, weights=avail_weights)[0]
         env = envs[env_name]
-        prompt_range = None
-        if randomness:
+        prompt_range = (
+            prompt_ranges.get(env_name)
+            if prompt_ranges is not None
+            else None
+        )
+        if prompt_range is None and randomness:
             env_label = getattr(env, "name", env_name)
             prompt_range = window_prompt_range(
                 randomness, env_label, len(env), PROMPT_RANGE_SIZE,
@@ -366,6 +487,8 @@ class MiningEngine:
         proof_gpu: int = 1,
         max_new_tokens: int = MAX_NEW_TOKENS_PROTOCOL_CAP,
         validator_url_override: str | None = None,
+        checkpoint_identity_store: MinerCheckpointIdentityStore | None = None,
+        initial_checkpoint_identity: ActivatedCheckpoint | None = None,
     ) -> None:
         self.vllm_model = vllm_model
         self.hf_model = hf_model
@@ -375,6 +498,15 @@ class MiningEngine:
         self.proof_gpu = proof_gpu
         self.max_new_tokens = max_new_tokens
         self.validator_url_override = validator_url_override
+        self._checkpoint_identity_store = (
+            checkpoint_identity_store
+            or MinerCheckpointIdentityStore(
+                default_checkpoint_identity_path(
+                    wallet.hotkey.ss58_address,
+                )
+            )
+        )
+        self._initial_checkpoint_identity = initial_checkpoint_identity
 
         if envs is not None and mix is not None:
             self.envs = envs
@@ -398,6 +530,57 @@ class MiningEngine:
     # Public API
     # ------------------------------------------------------------------
 
+    def build_batch_request_from_generations(
+        self,
+        *,
+        generations: list[dict],
+        problem: dict,
+        environment: "Environment",
+        randomness: str,
+        prompt_idx: int,
+        window_number: int,
+        checkpoint_revision: str,
+        runtime_fingerprint=None,
+    ):
+        """Turn backend-produced token sequences into a protocol request.
+
+        Generation backends only need to return the same small generation
+        dictionaries as the built-in path. Proof construction, token
+        log-probabilities, rewards, signatures, and request formatting remain
+        on the existing canonical implementation.
+        """
+        from reliquary.protocol.submission import BatchSubmissionRequest
+
+        if len(generations) != M_ROLLOUTS:
+            raise ValueError(
+                f"expected {M_ROLLOUTS} generations, got {len(generations)}"
+            )
+        rollouts = [
+            self._build_rollout_submission(
+                generation,
+                problem,
+                randomness,
+                env=environment,
+            )
+            for generation in generations
+        ]
+        return BatchSubmissionRequest(
+            miner_hotkey=self.wallet.hotkey.ss58_address,
+            prompt_idx=prompt_idx,
+            window_start=window_number,
+            merkle_root=_compute_merkle_root(rollouts),
+            rollouts=rollouts,
+            checkpoint_hash=checkpoint_revision,
+            runtime_fingerprint=runtime_fingerprint,
+            nonce=_initial_runtime_bound_nonce(runtime_fingerprint),
+            protocol_version=FORCED_SEED_PROTOCOL_VERSION,
+            generation_profile_id=(
+                ACTIVE_PROTOCOL_PROFILE.profile_id
+                if ACTIVE_PROTOCOL_PROFILE.protocol_version >= 3
+                else ""
+            ),
+        )
+
     async def mine_window(
         self,
         subtensor,
@@ -415,11 +598,17 @@ class MiningEngine:
 
         from reliquary.constants import M_ROLLOUTS, POLL_INTERVAL_SECONDS
         from reliquary.miner.submitter import (
-            SubmissionError, discover_validator_url,
-            get_runtime_contract_v1, get_window_state_v2, submit_batch_v2,
+            EndpointNotFoundError,
+            SubmissionError,
+            discover_validator_url,
+            get_miner_state_v1,
+            monitor_submission_verdicts,
+            get_runtime_contract_v1,
+            get_window_state_v2,
+            submit_batch_v2,
         )
         from reliquary.protocol.submission import (
-            BatchSubmissionRequest, RuntimeFingerprint, WindowState,
+            RuntimeFingerprint, WindowState,
         )
         from reliquary.shared.runtime_fingerprint import (
             collect_runtime_fingerprint,
@@ -439,10 +628,40 @@ class MiningEngine:
         # nothing to pre-fetch. The miner just reads what /state reports.
         rng = random.Random()
         results = []
-        local_n = 0
-        local_hash = ""
+        persisted_identity = self._checkpoint_identity_store.load()
+        initial_identity = self._initial_checkpoint_identity
+        if initial_identity is None and persisted_identity is not None:
+            raise CheckpointActivationRestartRequired(
+                "durable checkpoint identity exists but the active model "
+                "identity was not supplied"
+            )
+        if initial_identity is not None:
+            try:
+                self._checkpoint_identity_store.commit(initial_identity)
+            except CheckpointIdentityError:
+                raise
+            except Exception as exc:
+                raise CheckpointActivationRestartRequired(
+                    "checkpoint identity could not be persisted"
+                ) from exc
+            local_n = initial_identity.checkpoint_n
+            local_repo_id = initial_identity.repo_id
+            local_hash = initial_identity.oid
+        else:
+            local_n = 0
+            local_repo_id = ""
+            local_hash = ""
+        miner_state_supported: bool | None = None
+        cached_miner_state = None
+        miner_state_etag: str | None = None
+        legacy_cooldown_window: int | None = None
+        prompt_ranges: dict[str, tuple[int, int]] = {}
 
-        async with httpx.AsyncClient(timeout=30) as client:
+        submitted = asyncio.Event()
+        async with (
+            httpx.AsyncClient(timeout=30) as client,
+            monitor_submission_verdicts(url, self.wallet.hotkey.ss58_address, client, submitted),
+        ):
             runtime_fingerprint = None
             try:
                 contract = await get_runtime_contract_v1(url, client=client)
@@ -466,7 +685,52 @@ class MiningEngine:
                 logger.info("validator runtime telemetry unavailable")
             while True:
                 try:
-                    state = await get_window_state_v2(url, client=client)
+                    if miner_state_supported is not False:
+                        try:
+                            fetched, new_etag = await get_miner_state_v1(
+                                url,
+                                client=client,
+                                etag=miner_state_etag,
+                            )
+                            miner_state_supported = True
+                            if fetched is not None:
+                                missing = set(self.envs) - set(
+                                    fetched.environments
+                                )
+                                if missing:
+                                    raise SubmissionError(
+                                        "miner-state missing environments: "
+                                        f"{sorted(missing)}"
+                                    )
+                                cached_miner_state = fetched
+                                self._cooldown_per_env = {
+                                    environment: fetched.environments[
+                                        environment
+                                    ].cooldown_prompts()
+                                    for environment in self.envs
+                                }
+                                prompt_ranges = {
+                                    environment: fetched.environments[
+                                        environment
+                                    ].prompt_range
+                                    for environment in self.envs
+                                }
+                            miner_state_etag = new_etag
+                            if cached_miner_state is None:
+                                raise SubmissionError(
+                                    "304 before miner-state cache fill"
+                                )
+                            state = cached_miner_state
+                        except EndpointNotFoundError:
+                            miner_state_supported = False
+                            miner_state_etag = None
+                            cached_miner_state = None
+                            state = await get_window_state_v2(
+                                url,
+                                client=client,
+                            )
+                    else:
+                        state = await get_window_state_v2(url, client=client)
                 except SubmissionError:
                     # /state may return 503 between windows; wait briefly.
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
@@ -476,16 +740,120 @@ class MiningEngine:
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
                     continue
 
+                # Legacy compatibility stays exact: gather every environment
+                # for one immutable window or wait. Never substitute the first
+                # environment's cooldown for a failed per-env request.
+                if (
+                    miner_state_supported is False
+                    and legacy_cooldown_window != state.window_n
+                ):
+                    try:
+                        cooldowns: dict[str, set[int]] = {}
+                        derived_ranges: dict[str, tuple[int, int]] = {}
+                        for environment, env in self.envs.items():
+                            env_state = await get_window_state_v2(
+                                url,
+                                env=environment,
+                                client=client,
+                            )
+                            if any(
+                                getattr(env_state, field)
+                                != getattr(state, field)
+                                for field in (
+                                    "state",
+                                    "window_n",
+                                    "randomness",
+                                    "checkpoint_n",
+                                    "checkpoint_repo_id",
+                                    "checkpoint_revision",
+                                    "protocol_version",
+                                    "generation_profile_id",
+                                    "generation_contract",
+                                )
+                            ):
+                                raise SubmissionError(
+                                    "legacy state crossed a window boundary"
+                                )
+                            cooldowns[environment] = set(
+                                env_state.cooldown_prompts
+                            )
+                            derived_ranges[environment] = window_prompt_range(
+                                env_state.randomness,
+                                getattr(env, "name", environment),
+                                len(env),
+                                PROMPT_RANGE_SIZE,
+                            )
+                        self._cooldown_per_env = cooldowns
+                        prompt_ranges = derived_ranges
+                        legacy_cooldown_window = state.window_n
+                    except Exception as exc:
+                        logger.warning(
+                            "incomplete environment state; waiting: %s",
+                            exc,
+                        )
+                        await asyncio.sleep(1)
+                        continue
+
                 # Pull new checkpoint if needed (works at any state).
                 try:
-                    local_n, local_hash, self.hf_model = await maybe_pull_checkpoint(
-                        state=state, local_n=local_n, local_hash=local_hash,
+                    pulled = await maybe_pull_checkpoint(
+                        state=state,
+                        local_n=local_n,
+                        local_hash=local_hash,
+                        local_repo_id=local_repo_id,
                         local_model=self.hf_model,
                         download_fn=_hf_download,
                         load_fn=self._load_checkpoint,
                     )
+                    pulled_n, pulled_repo, pulled_hash, pulled_model = pulled
+                    if pulled_repo and pulled_hash:
+                        try:
+                            self._checkpoint_identity_store.commit(
+                                ActivatedCheckpoint(
+                                    checkpoint_n=pulled_n,
+                                    repo_id=pulled_repo,
+                                    oid=pulled_hash,
+                                )
+                            )
+                        except CheckpointIdentityError:
+                            raise
+                        except Exception as exc:
+                            raise CheckpointActivationRestartRequired(
+                                "checkpoint identity could not be persisted"
+                            ) from exc
+                    local_n = pulled_n
+                    local_repo_id = pulled_repo
+                    local_hash = pulled_hash
+                    self.hf_model = pulled_model
+                except (CheckpointIdentityError, CheckpointActivationRestartRequired):
+                    logger.exception(
+                        "checkpoint identity or activation is unsafe; "
+                        "terminating for a clean restart"
+                    )
+                    raise
                 except Exception:
                     logger.exception("checkpoint pull failed; keeping local")
+
+                if (
+                    (
+                        state.checkpoint_repo_id
+                        and local_repo_id != state.checkpoint_repo_id
+                    )
+                    or (
+                        state.checkpoint_revision
+                        and local_hash != state.checkpoint_revision
+                    )
+                ):
+                    logger.warning(
+                        "checkpoint activation incomplete; local=%s@%s "
+                        "remote=%s@%s",
+                        local_repo_id or "none",
+                        local_hash[:12] or "none",
+                        state.checkpoint_repo_id or "none",
+                        (state.checkpoint_revision or "")[:12] or "none",
+                    )
+                    await asyncio.sleep(1)
+                    continue
 
                 if state.state != WindowState.OPEN:
                     await asyncio.sleep(1)
@@ -510,26 +878,25 @@ class MiningEngine:
                     await asyncio.sleep(0.1)
                     continue
 
-                # Per-env cooldown: /state's flat ``cooldown_prompts`` covers
-                # only the validator's first env, but ``prompt_idx`` is per-env,
-                # so query each env for its own set. Fall back to the base set
-                # on a fetch error rather than stall the loop.
-                for env_name in self._cooldown_per_env:
-                    try:
-                        env_state = await get_window_state_v2(
-                            url, env=env_name, client=client,
-                        )
-                        self._cooldown_per_env[env_name] = set(
-                            env_state.cooldown_prompts
-                        )
-                    except Exception:
-                        self._cooldown_per_env[env_name] = set(
-                            state.cooldown_prompts
-                        )
+                generation_mix = _eligible_generation_mix(
+                    self.mix,
+                    cached_miner_state if miner_state_supported is True else None,
+                )
+                if not generation_mix:
+                    logger.info(
+                        "all environment admission lanes are closed; waiting"
+                    )
+                    await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                    continue
+
                 try:
                     env_name, prompt_idx = pick_env_and_prompt(
-                        self.envs, self.mix, self._cooldown_per_env, rng=rng,
+                        self.envs,
+                        generation_mix,
+                        self._cooldown_per_env,
+                        rng=rng,
                         randomness=randomness,
+                        prompt_ranges=prompt_ranges or None,
                     )
                 except RuntimeError:
                     logger.info("all envs fully in cooldown; sleeping")
@@ -538,10 +905,19 @@ class MiningEngine:
 
                 env = self.envs[env_name]
                 problem = env.get_problem(prompt_idx)
-                generations = self._generate_m_rollouts(
-                    problem, randomness, env_name=env_name,
-                    prompt_idx=prompt_idx, checkpoint_hash=local_hash,
-                )
+                environment_spec = get_environment_spec(env_name)
+                if environment_spec.interaction_mode == "episode":
+                    generations = self._generate_m_episode_rollouts(
+                        env,
+                        randomness,
+                        prompt_idx=prompt_idx,
+                        checkpoint_hash=local_hash,
+                    )
+                else:
+                    generations = self._generate_m_rollouts(
+                        problem, randomness, env_name=env_name,
+                        prompt_idx=prompt_idx, checkpoint_hash=local_hash,
+                    )
                 if len(generations) < M_ROLLOUTS:
                     logger.warning(
                         "generated %d/%d for prompt %d; skipping",
@@ -549,30 +925,84 @@ class MiningEngine:
                     )
                     continue
 
-                rollout_submissions = [
-                    self._build_rollout_submission(gen, problem, randomness, env=env)
-                    for gen in generations
-                ]
-                merkle_root = _compute_merkle_root(rollout_submissions)
-
-                _runtime_fingerprint = runtime_fingerprint
-                request = BatchSubmissionRequest(
-                    miner_hotkey=self.wallet.hotkey.ss58_address,
+                request = self.build_batch_request_from_generations(
+                    generations=generations,
+                    problem=problem,
+                    environment=env,
+                    randomness=randomness,
                     prompt_idx=prompt_idx,
-                    window_start=state.window_n,
-                    merkle_root=merkle_root,
-                    rollouts=rollout_submissions,
-                    checkpoint_hash=local_hash,
-                    runtime_fingerprint=_runtime_fingerprint,
-                    nonce=_initial_runtime_bound_nonce(_runtime_fingerprint),
-                    # Rollouts are drawn from the forced-seed stream; advertise it.
-                    protocol_version=FORCED_SEED_PROTOCOL_VERSION,
-                    generation_profile_id=(
-                        ACTIVE_PROTOCOL_PROFILE.profile_id
-                        if ACTIVE_PROTOCOL_PROFILE.protocol_version >= 3
-                        else ""
-                    ),
+                    window_number=state.window_n,
+                    checkpoint_revision=local_hash,
+                    runtime_fingerprint=runtime_fingerprint,
                 )
+
+                # Generation and proof construction can span a state
+                # transition. Re-read the exact live lane immediately before
+                # precommit and discard stale work locally.
+                try:
+                    if miner_state_supported is not False:
+                        refreshed, miner_state_etag = await get_miner_state_v1(
+                            url,
+                            client=client,
+                            etag=miner_state_etag,
+                        )
+                        if refreshed is not None:
+                            cached_miner_state = refreshed
+                        release_state = cached_miner_state
+                        if release_state is None:
+                            raise SubmissionError(
+                                "missing cached miner-state at release"
+                            )
+                        env_release = release_state.environments.get(env_name)
+                        if env_release is None:
+                            raise SubmissionError(
+                                "release state omitted the selected environment"
+                            )
+                        release_cooldown = env_release.cooldown_prompts()
+                        release_range = env_release.prompt_range
+                        release_accepting = env_release.accepting_submissions
+                    else:
+                        release_state = await get_window_state_v2(
+                            url,
+                            env=env_name,
+                            client=client,
+                        )
+                        release_cooldown = set(
+                            release_state.cooldown_prompts
+                        )
+                        release_range = window_prompt_range(
+                            release_state.randomness,
+                            getattr(env, "name", env_name),
+                            len(env),
+                            PROMPT_RANGE_SIZE,
+                        )
+                        release_accepting = None
+                except Exception as exc:
+                    logger.info(
+                        "state recheck failed; discarding prepared work: %s",
+                        exc,
+                    )
+                    continue
+
+                mismatch = _release_state_mismatch_reason(
+                    initial_state=state,
+                    release_state=release_state,
+                    request=request,
+                    environment_name=getattr(env, "name", env_name),
+                    environment_size=len(env),
+                    cooldown_prompts=release_cooldown,
+                    prompt_range=release_range,
+                    accepting_submissions=release_accepting,
+                )
+                if mismatch is not None:
+                    logger.info(
+                        "discarding prepared work before ingress: reason=%s "
+                        "window=%d prompt=%d",
+                        mismatch,
+                        request.window_start,
+                        request.prompt_idx,
+                    )
+                    continue
                 try:
                     resp = await submit_batch_v2(
                         url,
@@ -588,6 +1018,10 @@ class MiningEngine:
                         resp.reason.value if hasattr(resp.reason, "value") else resp.reason,
                     )
                     results.append(resp)
+                    if resp.accepted:
+                        submitted.set()
+                    elif resp._retry_after_seconds is not None:
+                        await asyncio.sleep(resp._retry_after_seconds)
                 except SubmissionError as exc:
                     logger.error("submit failed: %s", exc)
 
@@ -612,48 +1046,78 @@ class MiningEngine:
 
         logger.info("Loading checkpoint from %s", local_path)
 
-        # 1. Reload hf_model (for GRAIL proofs) on the proof GPU.
-        try:
-            new_hf = load_text_generation_model(
+        def _load_one(device: int):
+            return load_text_generation_model(
                 local_path,
                 torch_dtype=torch.bfloat16,
                 attn_implementation=ATTN_IMPLEMENTATION,
-            ).to(f"cuda:{self.proof_gpu}").eval()
+            ).to(f"cuda:{device}").eval()
+
+        old_hf = self.hf_model
+        old_gen = self.vllm_model
+
+        # A single-device miner cannot hold both the old pair and a staged new
+        # pair at once. Move the old pair to host memory before loading. Any
+        # failure after that point is terminal for this process: a supervisor
+        # restart reconstructs one coherent pair from the advertised revision.
+        if self.proof_gpu == self.vllm_gpu:
+            new_hf = None
+            new_gen = None
+            try:
+                old_hf.to("cpu")
+                old_gen.to("cpu")
+                torch.cuda.empty_cache()
+                new_hf = _load_one(self.proof_gpu)
+                new_gen = _load_one(self.vllm_gpu)
+            except Exception as exc:
+                del new_hf
+                del new_gen
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                raise CheckpointActivationRestartRequired(
+                    "single-device checkpoint activation requires restart"
+                ) from exc
+
+            self.hf_model = new_hf
+            self.vllm_model = new_gen
+            del old_hf
+            del old_gen
+            self._loaded_checkpoint_path = local_path
+            logger.info("Checkpoint %s loaded into both models", local_path)
+            return self.hf_model
+
+        # Stage both copies before publishing either reference. If one load
+        # fails, the previous generation/proof pair and checkpoint identity
+        # remain active together.
+        try:
+            new_hf = _load_one(self.proof_gpu)
         except Exception:
             logger.exception(
                 "Failed to reload hf_model from %s; keeping old model",
                 local_path,
             )
-            return self.hf_model
+            raise
 
-        old_hf = self.hf_model
-        self.hf_model = new_hf
-        del old_hf
         try:
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
-
-        # 2. Reload vllm_model on the generation GPU.
-        try:
-            new_gen = load_text_generation_model(
-                local_path,
-                torch_dtype=torch.bfloat16,
-                attn_implementation=ATTN_IMPLEMENTATION,
-            ).to(f"cuda:{self.vllm_gpu}").eval()
+            new_gen = _load_one(self.vllm_gpu)
         except Exception:
             logger.exception(
-                "Failed to reload vllm_model from %s; miner generation is "
-                "BROKEN until the next successful pull. hf_model was swapped "
-                "so GRAIL proofs will be inconsistent.",
+                "Failed to stage vllm_model from %s; keeping the prior "
+                "generation/proof pair",
                 local_path,
             )
-            self.vllm_model = None
-            self._loaded_checkpoint_path = None
-            return self.hf_model
+            del new_hf
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            raise
 
-        old_gen = self.vllm_model
+        self.hf_model = new_hf
         self.vllm_model = new_gen
+        del old_hf
         del old_gen
         try:
             torch.cuda.empty_cache()
@@ -687,6 +1151,7 @@ class MiningEngine:
             BFT_ENABLED,
             BFT_FORCE_ANSWER,
             BFT_THINKING_BUDGET,
+            max_new_tokens_for_environment,
         )
         from reliquary.miner.forced_seed_sampler import (
             ForcedSeedLogitsProcessor, forced_seed_generate_kwargs,
@@ -709,9 +1174,23 @@ class MiningEngine:
         active_env_name = env_name
         if active_env_name is None:
             active_env_name = getattr(getattr(self, "env", None), "name", None)
-        bft_applicable = BFT_ENABLED and (
-            active_env_name is None or active_env_name == "openmathinstruct"
+        environment_cap = min(
+            int(self.max_new_tokens),
+            max_new_tokens_for_environment(str(active_env_name or "")),
         )
+        if active_env_name is None:
+            # Legacy single-environment callers omitted env_name and were
+            # always the active Math lane. Preserve that invocation contract.
+            bft_applicable = BFT_ENABLED
+        else:
+            try:
+                bft_applicable = BFT_ENABLED and (
+                    get_environment_spec(
+                        str(active_env_name)
+                    ).termination_policy == "math_bft"
+                )
+            except ValueError:
+                bft_applicable = False
 
         with torch.no_grad():
             input_tensor = torch.tensor(
@@ -726,8 +1205,8 @@ class MiningEngine:
             # rollout index r, resuming at completion offset 0.
             base_kwargs = {
                 "max_new_tokens": (
-                    min(self.max_new_tokens, BFT_THINKING_BUDGET)
-                    if bft_applicable else self.max_new_tokens
+                    min(environment_cap, BFT_THINKING_BUDGET)
+                    if bft_applicable else environment_cap
                 ),
                 "pad_token_id": pad_token_id,
                 "attention_mask": attention_mask,
@@ -780,17 +1259,78 @@ class MiningEngine:
             })
         return rollouts
 
+    def _generate_m_episode_rollouts(
+        self,
+        env,
+        randomness: str,
+        *,
+        prompt_idx: int,
+        checkpoint_hash: str,
+    ) -> list[dict]:
+        """Generate M complete canonical episodes, one turn at a time."""
+
+        from reliquary.environment.agentic.renderer import CanonicalEpisodeRenderer
+        from reliquary.environment.agentic.runner import EpisodeRunner
+        from reliquary.miner.episode_policy import HFEpisodePolicy
+
+        profile = ACTIVE_PROTOCOL_PROFILE.environments[env.name].episode
+        if profile is None:
+            raise RuntimeError(f"episode profile missing for {env.name}")
+
+        def encode(text: str) -> list[int]:
+            encoded = self.tokenizer.encode(text, add_special_tokens=False)
+            return list(getattr(encoded, "ids", encoded))
+
+        renderer = CanonicalEpisodeRenderer(encode)
+        task = env.get_task(prompt_idx)
+        hotkey = self.wallet.hotkey.ss58_address
+        generations: list[dict] = []
+        for rollout_index in range(M_ROLLOUTS):
+            seed_material = (
+                f"{randomness}:{hotkey}:{env.name}:{prompt_idx}:{rollout_index}"
+            ).encode("utf-8")
+            seed = int.from_bytes(hashlib.sha256(seed_material).digest()[:8], "big")
+            policy = HFEpisodePolicy(
+                model=self.vllm_model,
+                tokenizer=self.tokenizer,
+                randomness=randomness,
+                hotkey=hotkey,
+                prompt_idx=prompt_idx,
+                checkpoint_hash=checkpoint_hash,
+                rollout_index=rollout_index,
+                max_action_tokens=profile.max_action_tokens,
+                max_episode_tokens=profile.max_episode_tokens,
+            )
+            trace = EpisodeRunner(
+                renderer=renderer,
+                max_turns=min(profile.max_turns, env.max_turns),
+                max_episode_tokens=profile.max_episode_tokens,
+                max_observation_bytes=profile.max_observation_bytes,
+            ).run(env, task, seed=seed, policy=policy)
+            if not trace.assistant_spans:
+                raise RuntimeError("episode generated no assistant actions")
+            generations.append({
+                "tokens": list(trace.tokens),
+                "prompt_length": int(trace.assistant_spans[0][0]),
+                "forced": False,
+                "trace": trace,
+            })
+        return generations
+
     def _build_rollout_submission(self, generation, problem, randomness, *, env=None):
         """Build a RolloutSubmission: completion + claimed reward + GRAIL commit."""
         active_env = env if env is not None else self.env
         all_tokens = generation["tokens"]
         prompt_length = generation["prompt_length"]
-        completion_tokens = all_tokens[prompt_length:]
-        completion_text = self.tokenizer.decode(completion_tokens)
-        if getattr(active_env, "validator_authoritative_reward", False):
+        if generation.get("trace") is not None:
             reward = 0.0
         else:
-            reward = active_env.compute_reward(problem, completion_text)
+            completion_tokens = all_tokens[prompt_length:]
+            completion_text = self.tokenizer.decode(completion_tokens)
+            if getattr(active_env, "validator_authoritative_reward", False):
+                reward = 0.0
+            else:
+                reward = active_env.compute_reward(problem, completion_text)
 
         commit = self._build_grail_commit(generation, randomness)
         return RolloutSubmission(
@@ -815,8 +1355,14 @@ class MiningEngine:
         """
         import torch
 
-        from reliquary.constants import GRAIL_PROOF_VERSION
-        from reliquary.protocol.signatures import sign_commit_binding
+        from reliquary.constants import (
+            GRAIL_EPISODE_PROOF_VERSION,
+            GRAIL_PROOF_VERSION,
+        )
+        from reliquary.protocol.signatures import (
+            sign_commit_binding,
+            sign_episode_commit_binding,
+        )
         from reliquary.shared.forward import forward_single_layer
 
         all_tokens: list[int] = generation["tokens"]
@@ -839,23 +1385,62 @@ class MiningEngine:
 
         # fp32 log_softmax to match the validator and reduce tail-token drift.
         log_probs = torch.log_softmax(logits[0].float(), dim=-1)
+        trace = generation.get("trace")
+        policy_positions = (
+            [
+                position
+                for start, end in trace.assistant_spans
+                for position in range(start, end)
+            ]
+            if trace is not None
+            else list(range(prompt_length, len(all_tokens)))
+        )
         token_logprobs: list[float] = []
-        for i in range(prompt_length, len(all_tokens)):
+        for i in policy_positions:
             token_logprobs.append(log_probs[i - 1, all_tokens[i]].item())
 
-        # Sign
         model_name: str = getattr(self.hf_model, "name_or_path", "unknown")
-        signature = sign_commit_binding(
-            all_tokens, randomness, model_name, LAYER_INDEX,
-            commitments, self.wallet,
-        )
+        rollout_metadata = _rollout_metadata(generation, token_logprobs)
+        if trace is not None:
+            reward = trace.reward
+            if reward is None:
+                raise RuntimeError("episode trace has no reward report")
+            episode = {
+                "schema_version": trace.schema,
+                "renderer_id": "reliquary-jsonl-tools-v1",
+                "task_id": trace.task_id,
+                "seed": trace.seed,
+                "actions": [action.to_wire() for action in trace.actions],
+                "assistant_spans": [list(span) for span in trace.assistant_spans],
+                "observation_digests": list(trace.observation_digests),
+                "termination_reason": trace.termination_reason,
+                "state_digest": reward.state_digest,
+                "trace_digest": trace.trace_digest,
+            }
+            rollout_metadata["episode"] = episode
+            signature = sign_episode_commit_binding(
+                all_tokens,
+                randomness,
+                model_name,
+                LAYER_INDEX,
+                commitments,
+                episode,
+                self.wallet,
+            )
+            proof_version = GRAIL_EPISODE_PROOF_VERSION
+        else:
+            signature = sign_commit_binding(
+                all_tokens, randomness, model_name, LAYER_INDEX,
+                commitments, self.wallet,
+            )
+            proof_version = GRAIL_PROOF_VERSION
 
         return {
             "tokens": all_tokens,
             "commitments": commitments,
-            "proof_version": GRAIL_PROOF_VERSION,
+            "proof_version": proof_version,
             "model": {"name": model_name, "layer_index": LAYER_INDEX},
             "signature": signature.hex(),
             "beacon": {"randomness": randomness},
-            "rollout": _rollout_metadata(generation, token_logprobs),
+            "rollout": rollout_metadata,
         }
