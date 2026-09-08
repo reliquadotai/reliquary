@@ -3,9 +3,7 @@
 ## V1 integration — 2026-09-08
 
 The three-role source package is reconciled into `integration/reliquary-v1-final`,
-including Romain's fill-closed V6 and EnvScaler updates through `589fd436`.
-Start with the [Romain handoff](11-v1-reconciliation-handoff.md) for the exact
-inputs, conflict decisions, validation and remaining work.
+including the fill-closed V6 and EnvScaler updates through `589fd436`.
 
 The control playbook installs a wallet-free **shadow snapshot edge**, not an
 authoritative CPU-only validator. Remote GPU proof transport and the final

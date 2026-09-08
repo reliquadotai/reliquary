@@ -3,7 +3,6 @@
 Status: CPU executor and signer source packages are integrated into V1.
 The control role remains a shadow snapshot edge; a CPU-only authoritative
 validator still needs remote proof transport and a wallet-free deployment.
-See the [current reconciliation handoff](11-v1-reconciliation-handoff.md).
 
 ## The role switch
 
