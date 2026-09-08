@@ -1,4 +1,4 @@
-"""Strict bridge from a pinned standalone wheel to Episode v1."""
+"""Strict bridges from pinned standalone wheels to Reliquary runtimes."""
 
 from __future__ import annotations
 
@@ -466,9 +466,14 @@ class _ArtifactSourceLoader(importlib.abc.MetaPathFinder, importlib.abc.Loader):
         _VERIFIED_MODULES[module.__name__] = (self.digest, module)
 
 
-def load_external_episode_environment(
-    spec: EnvironmentSpec,
-) -> ExternalEpisodeEnvironment:
+def load_external_backend(spec: EnvironmentSpec, *, split: str = "train") -> Any:
+    """Import the replay entrypoint only after checking its complete artifact.
+
+    Split selection is for offline qualification. Runtime catalog factories use
+    the fixed train split; a different prompt/generator needs a different pin.
+    """
+    if split not in ("train", "eval", "qualification"):
+        raise ValueError("unsupported external environment split")
     with _IMPORT_LOCK:
         artifact = verify_external_artifact(spec)
         distribution = importlib.metadata.distribution(spec.external_distribution or "")
@@ -501,12 +506,97 @@ def load_external_episode_environment(
         backend_type = getattr(module, attribute_name, None)
         if not callable(backend_type):
             raise TypeError(f"external replay entrypoint is not callable: {entrypoint}")
-        return ExternalEpisodeEnvironment(backend_type(), spec)
+        return backend_type() if split == "train" else backend_type(split=split)
+
+
+class ExternalAnswerEnvironment:
+    """Single-turn answer-json/v1 adapter; reward comes from the pinned checker.
+
+    The problem carries a source index, not an answer supplied by a miner. A
+    scorer reconstructs and compares the task before invoking the checker.
+    """
+
+    def __init__(self, backend: Any, spec: EnvironmentSpec) -> None:
+        if spec.contract_version != "reliquary/answer-json/v1":
+            raise ValueError("unsupported external single-turn contract")
+        for method in ("__len__", "task", "grade"):
+            if not callable(getattr(backend, method, None)):
+                raise TypeError(f"external environment is missing {method}()")
+        if getattr(backend, "name", None) != spec.name:
+            raise ValueError("external environment runtime name mismatch")
+        if getattr(backend, "validator_authoritative_reward", None) is not True:
+            raise ValueError("external answer reward must be validator authoritative")
+        if type(getattr(backend, "max_turns", None)) is not int or backend.max_turns != 1:
+            raise ValueError("external answer environment must be single-turn")
+        self._backend, self._spec = backend, spec
+        self.name = spec.name
+        self.validator_authoritative_reward = True
+
+    def __len__(self) -> int:
+        value = self._backend.__len__()
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError("external answer environment length must be positive")
+        return value
+
+    def get_problem(self, index: int) -> dict[str, Any]:
+        normalized = int(index) % len(self)
+        raw = _object(self._backend.task(normalized), name="external answer task",
+                      required={"id", "prompt", "metadata"})
+        if not isinstance(raw["id"], str) or not isinstance(raw["prompt"], str):
+            raise TypeError("external task id and prompt must be strings")
+        if not isinstance(raw["metadata"], Mapping):
+            raise TypeError("external task metadata must be an object")
+        return {**dict(raw["metadata"]), "id": raw["id"], "prompt": raw["prompt"],
+                "ground_truth": canonical_json({"environment": self.name,
+                                                "index": normalized}),
+                "environment": self.name, "generator_index": normalized,
+                "metadata": dict(raw["metadata"])}
+
+    def compute_reward(self, problem: dict, completion: str) -> float:
+        index = problem.get("generator_index")
+        if (not isinstance(index, int) or isinstance(index, bool) or index < 0
+                or problem != self.get_problem(index) or not isinstance(completion, str)):
+            return 0.0
+        raw = _object(self._backend.grade(index, completion),
+                      name="external answer reward",
+                      required={"reward", "success", "state_digest"})
+        reward = _number(raw["reward"], name="external answer reward")
+        if reward not in self._spec.attainable_rewards:
+            raise ValueError("external answer reward is outside its declared lattice")
+        if not isinstance(raw["success"], bool) or raw["success"] != (reward == 1.0):
+            raise ValueError("external answer success and reward disagree")
+        _digest(raw["state_digest"], name="external answer state digest")
+        return reward
+
+
+def load_external_episode_environment(spec: EnvironmentSpec) -> ExternalEpisodeEnvironment:
+    return ExternalEpisodeEnvironment(load_external_backend(spec), spec)
+
+
+def load_external_answer_environment(spec: EnvironmentSpec) -> ExternalAnswerEnvironment:
+    return ExternalAnswerEnvironment(load_external_backend(spec), spec)
+
+
+def score_external_answers(problem: dict, completion_texts: list[str],
+                           reward_materials: Any = None) -> list[float]:
+    """Module-level scorer for the CPU admission worker process."""
+    from reliquary.environment.registry import get_environment_spec
+
+    del reward_materials
+    spec = get_environment_spec(problem.get("environment", ""))
+    if spec.external_distribution is None or spec.interaction_mode != "single_turn":
+        raise ValueError("external answer scorer requires a registered answer environment")
+    environment = load_external_answer_environment(spec)
+    return [environment.compute_reward(problem, text) for text in completion_texts]
 
 
 __all__ = [
     "ARTIFACT_SCHEMA",
     "ExternalEpisodeEnvironment",
+    "ExternalAnswerEnvironment",
+    "load_external_backend",
+    "load_external_answer_environment",
     "load_external_episode_environment",
+    "score_external_answers",
     "verify_external_artifact",
 ]

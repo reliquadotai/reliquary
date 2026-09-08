@@ -1,0 +1,10 @@
+{
+  "schema": "reliquary/environment-release-pin/v1",
+  "repository": "https://github.com/reliquadotai/reliquary-environments",
+  "source_commit": "641de1ab263933b22032cb91fb910ba9db9a52f7",
+  "tag": "logic-v0.1.0a1",
+  "wheel": "reliquary_logic-0.1.0a1-py3-none-any.whl",
+  "wheel_sha256": "d12e4258fa9b190f29a33a055cee11ae632d813aed5f51b28a20a3727212b527",
+  "artifact_sha256": "1e4e05cae799d8e71d8876b0f7526c5b09ca1d5a9ab05f364fb35539288c5019",
+  "verifiers_commit": "b2e4e8157783b2c0dffc7821044c87f29f1c3ccf"
+}

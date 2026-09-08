@@ -1,4 +1,5 @@
 .git
+.logic-source
 .venv
 __pycache__
 *.pyc
