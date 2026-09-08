@@ -35,7 +35,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from reliquary.constants import (
+from reliquary.environment.grader import (
     GRADER_EVAL_TIMEOUT_SECONDS,
     GRADER_POOL_SIZE,
     GRADER_SOCKET_PATH,

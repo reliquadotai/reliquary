@@ -72,6 +72,10 @@ v2 and signer protocol v1 are separate internal APIs, not economic profile IDs.
 6. Infra tests are included in normal CPU CI; the V6 job also exercises the
    new signer/executor seams. Linux CI builds both roles at the PR source SHA,
    verifies a moved bundle and checks that tampered evidence is rejected.
+7. Linux image construction exposed an eager controller-catalog import in the
+   executor. Environment factories now import the catalog when called; shared
+   grader defaults preserve their values without importing controller corpus
+   checks. The controller still validates its selected corpus at startup.
 
 ## Validation and reproduction
 
@@ -105,8 +109,9 @@ control/executor runtime identities must agree before selecting remote mode.
 6. Implement and qualify the remote GPU proof boundary around the current
    scheduler, then the wallet-free authoritative validator deployment.
 7. Qualify fill-closed mid-window crash/restart and exact GPU end-to-end
-   checkpoint publication/adoption. Retain current production as rollback until
-   the separate cutover, monitoring and backup gates pass.
+   checkpoint publication/adoption. Preserve the last qualified revision,
+   configuration and a tested recovery path through the separate cutover,
+   monitoring and backup gates.
 
 The pre-existing V1 backlog remains separate: historical non-epoch episode
 schema-3 reads are currently rejected; the retired epoch flag is silently

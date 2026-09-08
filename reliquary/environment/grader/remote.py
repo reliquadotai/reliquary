@@ -26,7 +26,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import ValidationError
 
-from reliquary.constants import GRADER_EVAL_TIMEOUT_SECONDS, GRADER_POOL_SIZE
+from reliquary.environment.grader import GRADER_EVAL_TIMEOUT_SECONDS, GRADER_POOL_SIZE
 from reliquary.environment.grader.executor import (
     EXECUTOR_PROTOCOL_VERSION,
     MAX_EXECUTOR_REQUEST_BYTES,

@@ -82,6 +82,8 @@ RUNSC_VERSION="$(
   docker run --rm --network none --entrypoint runsc "${IMAGE_ID}" --version
 )"
 docker run --rm --network none --entrypoint python "${IMAGE_ID}" \
+  -m reliquary.environment.grader.remote --help > /dev/null
+docker run --rm --network none --entrypoint python "${IMAGE_ID}" \
   -m pip freeze --all > "${OUTPUT_DIR}/python-packages.txt"
 docker image inspect "${IMAGE_ID}" > "${OUTPUT_DIR}/image-inspect.json"
 docker history --no-trunc "${IMAGE_ID}" > "${OUTPUT_DIR}/image-history.txt"

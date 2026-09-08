@@ -8,6 +8,11 @@ import math as _math
 import os as _os
 
 from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE
+from reliquary.environment.grader import (
+    GRADER_EVAL_TIMEOUT_SECONDS as GRADER_EVAL_TIMEOUT_SECONDS,
+    GRADER_POOL_SIZE as GRADER_POOL_SIZE,
+    GRADER_SOCKET_PATH as GRADER_SOCKET_PATH,
+)
 
 # ────────────────  GRAIL PROOF VERSION  ────────────────
 
@@ -1576,24 +1581,6 @@ SAMPLING_LOW_Q10_MAX = (
 # under the validator's forward; honest low-confidence answer tokens stay
 # above ~10⁻³. Threshold sits in the gap.
 BOXED_ANSWER_MIN_PROB = 0.001
-
-# ────────────────  CODE EXECUTION GRADER  ────────────────
-
-# Path to the Unix domain socket the grader server listens on.
-# Default lives in /tmp so both validator and grader processes can reach it.
-GRADER_SOCKET_PATH = "/tmp/reliquary-grader.sock"
-
-# Number of warm gVisor workers in the grader pool. Sized to handle
-# M_ROLLOUTS in parallel for a single submission with headroom for
-# concurrent submissions. Increase for high-throughput validators.
-GRADER_POOL_SIZE = 4 * M_ROLLOUTS
-
-# Wall-clock timeout (seconds) for one structured OpenCode evaluation.
-# Subprocess inside the sandbox is killed if it exceeds this. Tuned
-# so that pathological miner code (infinite loops, slow algorithms)
-# fails fast without blocking the queue.
-GRADER_EVAL_TIMEOUT_SECONDS = 5
-
 
 # Token authenticity: a completion token whose chosen probability collapses
 # below this while the model's argmax sits at >= TOKEN_AUTH_ARGMAX_CONF was not

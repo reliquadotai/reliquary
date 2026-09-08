@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -14,6 +15,28 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
+
+
+def test_executor_import_does_not_load_controller_corpora():
+    subprocess.run(
+        [sys.executable, "-c", """
+import sys
+sys.modules['reliquary.constants'] = None
+sys.modules['reliquary.environment.registry'] = None
+from reliquary.environment.grader.remote import create_cpu_executor_app
+from reliquary.environment.grader import GRADER_POOL_SIZE
+from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE
+assert GRADER_POOL_SIZE == 4 * ACTIVE_PROTOCOL_PROFILE.sampling.rollouts
+from reliquary.environment import load_environment
+try:
+    load_environment('openmathinstruct')
+except ModuleNotFoundError:
+    pass
+else:
+    raise AssertionError('environment loading bypassed the corpus registry')
+"""],
+        check=True, timeout=15,
+    )
 
 
 def _case(expected: int = 3) -> dict:

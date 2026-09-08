@@ -14,7 +14,6 @@ from reliquary.environment.abi import (
 )
 from reliquary.environment.base import Environment
 from reliquary.environment.agentic.base import EpisodeEnvironment
-from reliquary.environment.registry import get_environment_spec
 
 
 def load_environment(name: str) -> Environment | EpisodeEnvironment:
@@ -23,6 +22,8 @@ def load_environment(name: str) -> Environment | EpisodeEnvironment:
     Raises:
         ValueError: if *name* is not a recognised environment.
     """
+    from reliquary.environment.registry import get_environment_spec
+
     return get_environment_spec(name).create()
 
 
@@ -39,6 +40,8 @@ def load_environments(
 
 
 def load_episode_environment(name: str) -> EpisodeEnvironment:
+    from reliquary.environment.registry import get_environment_spec
+
     spec = get_environment_spec(name)
     if spec.interaction_mode != "episode":
         raise ValueError(f"environment {name!r} is not episode-based")
