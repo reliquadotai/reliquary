@@ -185,6 +185,9 @@ class TrainerPublisher:
     def _snapshot(self, transaction: dict) -> Path:
         return self.staging_dir / f"ckpt_{transaction['manifest']['checkpoint_n']}"
 
+    def has_pending(self) -> bool:
+        return self._pending.exists()
+
     def _read_candidate(self) -> tuple[dict | None, str | None]:
         from botocore.exceptions import ClientError
 

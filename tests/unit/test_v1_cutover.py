@@ -55,6 +55,41 @@ def test_trainer_drain_publishes_below_cadence_and_stops_at_target(tmp_path):
     assert worker.run_once() == "trained" and worker.cursor == 103
 
 
+def test_retry_of_pending_publication_preserves_live_training_state():
+    env = _Env({101: ("payload", _Decoded(101))})
+    pending = [False]
+    worker = _worker(env, publish_every=1, publication_pending_fn=lambda: pending[0])
+
+    def publish(reason):
+        if not pending[0]:
+            pending[0] = True
+            env.head = "exact-committed-revision"
+            raise OSError("R2 upload interrupted after HF committed")
+        # Production publisher verifies this exact transaction and its parent.
+        assert env.head == "exact-committed-revision"
+        pending[0] = False
+        return env.head
+
+    worker._publish_fn = publish
+    assert worker.run_once() == "trained"
+    with pytest.raises(OSError):
+        worker.run_once()
+    assert worker.cursor == 101 and worker.trained_since_publish == 1
+    assert worker.run_once() == "published"
+    assert worker.last_published_revision == env.head
+    assert len(env.trained) == 1
+
+
+def test_tombstone_only_drain_preserves_restored_lr_position(monkeypatch):
+    from reliquary.trainer.cli import _publication_lr_step
+    from reliquary.validator import training
+
+    monkeypatch.setattr(training, "current_lr_schedule_step", lambda: None)
+    assert _publication_lr_step(123) == 123
+    monkeypatch.setattr(training, "current_lr_schedule_step", lambda: 124)
+    assert _publication_lr_step(123) == 124
+
+
 def test_trainer_flushes_balanced_partial_and_halts_on_optimizer_failure(monkeypatch):
     monkeypatch.setattr(C, "KL_BETA", 0.0)
     monkeypatch.setattr(C, "RECOMPUTE_PI_OLD_FROM_VERIFY", False)

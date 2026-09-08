@@ -37,6 +37,7 @@ class TrainerWorker:
         cursor_writer: Callable[[int], None] | None = None,
         drain_request_fn: Callable[[], dict] | None = None,
         finish_fn: Callable[[], bool] | None = None,
+        publication_pending_fn: Callable[[], bool] | None = None,
     ) -> None:
         self._journal = journal
         self._train_fn = train_fn
@@ -50,6 +51,7 @@ class TrainerWorker:
         self._freeze_fn = freeze_fn
         self._drain_request_fn = drain_request_fn
         self._finish_fn = finish_fn
+        self._publication_pending_fn = publication_pending_fn
         self._published_cursor = self.cursor
         # Amendment v6.1 (trainer-paced picks): advisory pacing telemetry,
         # written every time the journal cursor advances -- unconditional
@@ -104,11 +106,13 @@ class TrainerWorker:
             self.adaptive_publication_pending = False
             self._published_cursor = self.cursor
             return "published"
-        head = self._head_revision_fn()
-        if head is None:
+        pending = self._publication_pending_fn is not None and self._publication_pending_fn()
+        head = self._head_revision_fn() if not pending else None
+        if head is None and not pending:
             raise RuntimeError("checkpoint repo HEAD unavailable; refusing unguarded publication")
         if (
             self.last_published_revision is not None
+            and not pending
             and head is not None
             and head != self.last_published_revision
         ):

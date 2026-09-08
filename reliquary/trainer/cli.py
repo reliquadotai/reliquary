@@ -19,6 +19,13 @@ from reliquary.shared.checkpoint_identity import require_checkpoint_number
 logger = logging.getLogger(__name__)
 
 
+def _publication_lr_step(restored_step: int | None) -> int | None:
+    from reliquary.validator.training import current_lr_schedule_step
+
+    current = current_lr_schedule_step()
+    return current if current is not None else restored_step
+
+
 def _profile_nonnegative_int(
     profile: Mapping[str, object],
     key: str,
@@ -156,7 +163,7 @@ def run_train_worker(*, shadow: bool = False) -> None:
         migrate_journal_cursor,
         r2_fetch_fn,
     )
-    from reliquary.trainer.publisher import TrainerPublisher
+    from reliquary.trainer.publisher import PublicationConflict, TrainerPublisher
     from reliquary.trainer.resume import resolve_resume_point
     from reliquary.trainer.train_runner import TrainRunner, TrainerStateUnsafe
     from reliquary.trainer.worker import TrainerLockLost, TrainerWorker
@@ -176,6 +183,12 @@ def run_train_worker(*, shadow: bool = False) -> None:
     ))
     client = _r2_client()
     fetch = r2_fetch_fn(client, bucket)
+    early_publisher = TrainerPublisher(
+        repo_id=repo_id, staging_dir=str(state_dir / "staging"),
+        tokenizer=None, r2_client=client, bucket=bucket,
+    )
+    if not shadow:
+        asyncio.run(early_publisher.recover_pending())
 
     expected_identity = (
         {**active_training_identity(), "repo_id": repo_id}
@@ -288,15 +301,22 @@ def run_train_worker(*, shadow: bool = False) -> None:
     publish_state = {"checkpoint_n": checkpoint_n}
 
     def publish_fn(reason: str) -> str:
-        from reliquary.validator.training import current_lr_schedule_step
-
         next_checkpoint = publish_state["checkpoint_n"] + 1
+        if publisher.has_pending():
+            recovered = asyncio.run(publisher.recover_pending())
+            if recovered is not None:
+                if (recovered["checkpoint_n"] != next_checkpoint
+                        or recovered["trained_window_cursor"] != worker.cursor):
+                    raise PublicationConflict("pending publication differs from the live trainer position")
+                publish_state["checkpoint_n"] = recovered["checkpoint_n"]
+                return recovered["revision"]
         published = asyncio.run(publisher.publish(
             runner.model,
             checkpoint_n=next_checkpoint,
-            lr_schedule_step=current_lr_schedule_step(),
+            lr_schedule_step=_publication_lr_step(runner.global_step_hint),
             trained_window_cursor=worker.cursor,
             reason=reason,
+            parent_revision=worker.last_published_revision,
         ))
         publish_state["checkpoint_n"] = next_checkpoint
         return published
@@ -371,6 +391,7 @@ def run_train_worker(*, shadow: bool = False) -> None:
         cursor_writer=cursor_queue.write_step_cursor,
         drain_request_fn=lambda: control_request,
         finish_fn=runner.finish,
+        publication_pending_fn=publisher.has_pending,
     )
 
     logger.info(
@@ -384,7 +405,7 @@ def run_train_worker(*, shadow: bool = False) -> None:
             outcome = worker.run_once()
             control.report(control_request, phase=outcome,
                            **worker.snapshot(), **runner.snapshot())
-        except (TrainerLockLost, TrainerStateUnsafe):
+        except (TrainerLockLost, TrainerStateUnsafe, PublicationConflict):
             control.report(control_request, phase="unsafe", **worker.snapshot())
             logger.critical("trainer state unsafe; exiting", exc_info=True)
             raise SystemExit(3)
