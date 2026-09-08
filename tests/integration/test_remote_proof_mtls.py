@@ -475,3 +475,62 @@ def test_capacity_requires_network_measurements_and_actual_gpu_identity(pki, tmp
         write()
         with pytest.raises(ProofWorkerUnavailable, match="measured"):
             client.qualify(REV)
+
+
+def test_another_role_ca_and_wrong_server_name_are_refused(pki, tmp_path):
+    other = tmp_path / "unrelated-role-pki"
+    script = Path(__file__).resolve().parents[2] / "scripts/generate_signer_pki.sh"
+    subprocess.run([str(script), str(other), "127.0.0.1"], check=True, capture_output=True)
+    with endpoint(pki, CPUProofBackend()) as client:
+        wrong_role = ssl.create_default_context(cafile=str(pki / "ca/ca.crt"))
+        wrong_role.load_cert_chain(str(other / "signer-client/client.crt"), str(other / "signer-client/client.key"))
+        with httpx.Client(verify=wrong_role, trust_env=False) as http:
+            with pytest.raises(httpx.HTTPError):
+                http.get(str(client._client.base_url) + "/v1/health", timeout=1)
+        correct_role = ssl.create_default_context(cafile=str(pki / "ca/ca.crt"))
+        correct_role.load_cert_chain(str(pki / "signer-client/client.crt"), str(pki / "signer-client/client.key"))
+        with socket.create_connection(("127.0.0.1", client._client.base_url.port), timeout=1) as sock:
+            with pytest.raises(ssl.SSLCertVerificationError):
+                correct_role.wrap_socket(sock, server_hostname="different-proof-host.invalid")
+
+
+def test_health_probe_cannot_invalidate_a_new_adoption(pki):
+    backend = CPUProofBackend()
+    with endpoint(pki, backend) as client:
+        entered = threading.Event()
+        release = threading.Event()
+        held_once = False
+        def health_descriptions():
+            nonlocal held_once
+            descriptions = [backend.describe("cuda:0")]
+            if not held_once:
+                held_once = True
+                entered.set()
+                assert release.wait(2)
+            return descriptions
+        backend.health_descriptions = health_descriptions
+        errors = []
+        def run(fn):
+            try:
+                fn()
+            except Exception as exc:
+                errors.append(exc)
+        health = threading.Thread(target=run, args=(client.assert_ready,))
+        health.start()
+        assert entered.wait(2)
+        next_revision = "d" * 40
+        client.bind_checkpoint(8, IDENTITY["repo_id"], next_revision)
+        adoption = threading.Thread(target=run, args=(lambda: client.reload(
+            "cuda:0", None, next_revision, IDENTITY["repo_id"]),))
+        adoption.start()
+        try:
+            time.sleep(.03)
+            assert backend.adoptions == 1  # Waits until old health reply is consumed.
+        finally:
+            release.set()
+            health.join(3)
+            adoption.join(3)
+        assert not errors
+        assert not health.is_alive() and not adoption.is_alive()
+        assert client.revision("cuda:0") == next_revision
+        assert client.assert_ready().checkpoint.checkpoint_n == 8

@@ -187,7 +187,7 @@ class RemoteProofPool:
         del snapshot_dir  # Controller paths are never sent to another host.
         with self._lock:
             cp = self._checkpoint
-            if not self.health or cp is None or cp.revision != checkpoint_revision or cp.repo_id != repo_id or device_id not in self.devices:
+            if self._closed or not self.health or cp is None or cp.revision != checkpoint_revision or cp.repo_id != repo_id or device_id not in self.devices:
                 raise ProofWorkerUnavailable("remote proof adoption requires an exact bound checkpoint")
             if self._adopted == cp:
                 return
@@ -212,18 +212,20 @@ class RemoteProofPool:
         return self._adopted.revision
 
     def assert_ready(self):
-        if self._closed or self._adopted is None:
-            raise ProofWorkerUnavailable("remote proof checkpoint is not adopted")
-        try:
-            health = self._validate_health(ProofHealth.read(
-                self._request("GET", "/v1/health", timeout=self.request_timeout)))
-            if health.checkpoint != self._adopted or any(s.revision != self._adopted.revision for s in health.slots):
-                raise ProofWorkerUnavailable("remote proof lost its adopted checkpoint")
-            self._health_checked_at = time.monotonic()
-            return health
-        except Exception:
-            self._adopted = None
-            raise
+        # A health reply from before an adoption must not clear the new ack.
+        with self._lock:
+            if self._closed or self._adopted is None:
+                raise ProofWorkerUnavailable("remote proof checkpoint is not adopted")
+            try:
+                health = self._validate_health(ProofHealth.read(
+                    self._request("GET", "/v1/health", timeout=self.request_timeout)))
+                if health.checkpoint != self._adopted or any(s.revision != self._adopted.revision for s in health.slots):
+                    raise ProofWorkerUnavailable("remote proof lost its adopted checkpoint")
+                self._health_checked_at = time.monotonic()
+                return health
+            except Exception:
+                self._adopted = None
+                raise
 
     def readiness_snapshot(self):
         if (self._adopted is not None and time.monotonic() - self._health_checked_at > 2
@@ -345,6 +347,7 @@ class RemoteProofPool:
 class ShadowProofPool:
     """Local remains authoritative; bounded shadow work never delays it."""
     is_remote = False
+    is_shadow = True
 
     def __init__(self, local, remote):
         self.local, self.remote = local, remote
@@ -357,6 +360,11 @@ class ShadowProofPool:
 
     def bind_checkpoint(self, checkpoint_n, repo_id, revision):
         self.remote.bind_checkpoint(checkpoint_n, repo_id, revision)
+
+    def shadow_snapshot(self):
+        return {"mode": "shadow", "worker_id": self.remote.worker_id,
+                "compared": self.compared, "diverged": self.diverged,
+                "unavailable": self.unavailable, "dropped": self.dropped}
 
     def reload(self, device_id, snapshot_dir, checkpoint_revision, repo_id=None):
         self.local.reload(device_id, snapshot_dir, checkpoint_revision, repo_id)
@@ -389,7 +397,9 @@ class ShadowProofPool:
                         candidate = remote_verify(frozen.commit(), proxy, frozen.randomness,
                                                    seed_u_values=frozen.seed_u_values)
                         self.compared += 1
-                        self.diverged += ProofValues.from_kernel(candidate) != ProofValues.from_kernel(result)
+                        if ProofValues.from_kernel(candidate) != ProofValues.from_kernel(result):
+                            self.diverged += 1
+                            logger.warning("shadow proof diverged window=%s environment=%s", window, environment)
                     except Exception:
                         self.unavailable += 1
                         logger.warning("shadow GPU proof unavailable", exc_info=True)

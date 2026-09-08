@@ -1273,6 +1273,8 @@ class ValidationService:
         if published_revision and active_revision != published_revision:
             degraded_reasons.append("scheduler_checkpoint_mismatch")
         pool = getattr(self, "_proof_worker_pool", None)
+        if getattr(pool, "is_shadow", False) is True:
+            snapshot["shadow_proof"] = pool.shadow_snapshot()
         if getattr(self, "_network_proof", False):
             remote = pool.readiness_snapshot()
             snapshot["remote_proof"] = remote

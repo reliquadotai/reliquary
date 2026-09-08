@@ -275,3 +275,34 @@ def test_worker_adoption_binds_real_published_number_profile_and_loaded_oid(monk
     pool.describe = lambda device: {"revision": None}
     with pytest.raises(ProofWorkerUnavailable, match="acknowledge"):
         backend.adopt(cp)
+
+
+def test_server_publishes_gpu_fingerprint_without_recollecting_cpu_runtime(monkeypatch):
+    import reliquary.validator.server as module
+    from reliquary.shared.runtime_fingerprint import runtime_profile_hash
+
+    server = module.ValidatorServer.__new__(module.ValidatorServer)
+    server._active_batchers = {}
+    server._reset_window_scoped_state = lambda: None
+    runtime = {"cuda_available": True, "gpu_name": "test-GPU"}
+    runtime["profile_hash"] = runtime_profile_hash(runtime)
+    server.set_proof_runtime_fingerprint(runtime)
+    monkeypatch.setattr(module, "collect_runtime_fingerprint", lambda **kwargs: pytest.fail("CPU runtime substituted"))
+    server.set_active_batchers({"fake": SimpleNamespace(model=ProofModelProxy("cuda:0"))})
+    assert server._runtime_fingerprint == runtime
+    with pytest.raises(ValueError):
+        server.set_proof_runtime_fingerprint({"cuda_available": False})
+
+
+def test_remote_unavailability_is_visible_before_new_window(controller):
+    from reliquary.validator.service import FatalProofPlaneError
+    service, pool, _ = controller
+    asyncio.run(service._apply_resume_from())
+    service._checkpoint_store.current_manifest = lambda: SimpleNamespace(revision=REV)
+    assert service._proof_scheduler_health_snapshot()["remote_proof"]["ready"] is True
+    pool.installed = None
+    snapshot = service._proof_scheduler_health_snapshot()
+    assert snapshot["remote_proof"]["ready"] is False
+    assert "remote_proof_unavailable" in snapshot["degraded_reasons"]
+    with pytest.raises(FatalProofPlaneError):
+        asyncio.run(service._ensure_proof_scheduler_ready())
