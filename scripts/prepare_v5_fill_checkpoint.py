@@ -70,6 +70,8 @@ def prepare_transition(source: dict, *, repo_id: str, revision: str,
         if type(source.get(key)) is not type(value) or source.get(key) != value:
             raise ValueError(f"source V5 lineage mismatch for {key}")
     target = active_checkpoint_profile()
+    if target["profile_id"] != v6.profile_id:
+        raise ValueError("this continuation requires the exact Math+Code fill-closed V6 profile")
     run_id = source.get("training_run_id")
     if (not isinstance(run_id, str) or not run_id or run_id.strip() != run_id
             or run_id != target["training_run_id"]):

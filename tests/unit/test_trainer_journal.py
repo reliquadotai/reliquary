@@ -109,7 +109,9 @@ def test_a_raw_cursor_is_multiplied_once_when_v6_is_armed(monkeypatch):
 
     cursor, key_space = migrate_journal_cursor(30_000, "raw")
 
-    assert cursor == 30_000 * emissions
+    assert cursor == 30_001 * emissions - 1
+    assert (cursor + 1) // emissions == 30_001
+    assert (cursor + 1) % emissions == 0
     assert key_space == "fill_closed"
 
 
@@ -137,10 +139,12 @@ def test_a_fill_closed_cursor_is_divided_when_the_gate_is_off(monkeypatch):
     monkeypatch.setattr(journal_module, "FILL_CLOSED_ENABLED", False)
     emissions = journal_module.FILL_CLOSED_EMISSIONS_PER_WINDOW
 
-    cursor, key_space = migrate_journal_cursor(30_000 * emissions, "fill_closed")
+    cursor, key_space = migrate_journal_cursor(30_001 * emissions - 1, "fill_closed")
 
     assert cursor == 30_000
     assert key_space == "raw"
+    with pytest.raises(ValueError, match="partially consumed"):
+        migrate_journal_cursor(30_000 * emissions, "fill_closed")
 
 
 def test_an_absent_marker_reads_as_raw(monkeypatch):
@@ -151,7 +155,7 @@ def test_an_absent_marker_reads_as_raw(monkeypatch):
     monkeypatch.setattr(journal_module, "FILL_CLOSED_ENABLED", True)
     emissions = journal_module.FILL_CLOSED_EMISSIONS_PER_WINDOW
 
-    assert migrate_journal_cursor(7, None) == (7 * emissions, "fill_closed")
+    assert migrate_journal_cursor(7, None) == (8 * emissions - 1, "fill_closed")
 
 
 def test_an_unknown_marker_refuses_to_guess(monkeypatch):

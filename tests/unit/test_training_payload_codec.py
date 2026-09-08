@@ -9,6 +9,7 @@ live objects. A silently dropped field degrades the model, not the tests
 import io
 import json
 import math
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -118,6 +119,17 @@ def test_header_round_trip():
     # additive target map. V5+ payloads pin it in schema 2.
     assert decoded.env_targets == {}
     assert decoded.window_quarantine == {"quarantined": False, "reasons": []}
+
+
+def test_original_episode_schema3_is_readable_but_epoch_variants_are_rejected():
+    blob = (Path(__file__).parents[1] / "fixtures/payloads/historical-episode-schema3.npz").read_bytes()
+    decoded = decode_training_payload(blob)
+    rollout = decoded.batches()["reliquary_stateful_tools_v1"][0].rollouts[0]
+    assert decoded.schema_version == 3
+    assert rollout._validated_assistant_spans == ((4, 6), (9, 11))
+    for edits in ({"checkpoint_epoch": {}}, {"assistant_spans": [None]}, {"schema_version": 5}):
+        with pytest.raises(ValueError):
+            decode_training_payload(_replace_payload_header(blob, **edits))
 
 
 @pytest.mark.parametrize("schema_version", [True, 2.0, "2"])

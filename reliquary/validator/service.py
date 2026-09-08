@@ -1580,13 +1580,11 @@ class ValidationService:
                 "the pipelined in-process half cannot publish while the next "
                 "open is held behind its successor-checkpoint barrier"
             )
-        # Construct the queue before the HTTP server or any window.  Its
-        # fill-mode recovery pass finishes receipt-backed visible renames and
-        # rejects an unreceipted staging body, which cannot be reconciled with
-        # lost in-memory reward/index state after a process restart.
-        self._training_payload_queue_ref()
         if getattr(self, "_fill_closed_rotation_store", None) is not None:
             return
+        from reliquary.infrastructure.archive_queue import get_archive_queue
+        from reliquary.infrastructure.training_payload_queue import _default_queue_dir
+        from reliquary.validator.fill_closed_recovery import FillClosedRecoveryStore
         from reliquary.validator.fill_closed_rotation import (
             FillClosedRotationStore,
         )
@@ -1594,8 +1592,15 @@ class ValidationService:
         state_dir = Path(
             os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")
         )
+        recovery = FillClosedRecoveryStore(state_dir)
+        queue_dir = getattr(getattr(self, "_training_payload_queue", None), "queue_dir", Path(_default_queue_dir()))
+        recovery.quarantine_uncommitted(Path(queue_dir))
+        queue = self._training_payload_queue_ref()
         store = FillClosedRotationStore(state_dir)
+        for window in recovery.windows():
+            recovery.recover(window, queue=queue, archives=get_archive_queue(), rotation=store)
         gate = store.load()
+        self._fill_closed_recovery_store = recovery
         self._fill_closed_rotation_store = store
         self._fill_closed_rotation_gate = gate
 
@@ -2328,6 +2333,10 @@ class ValidationService:
                 "see the assembler's own log line for which)",
                 previous_assembler.window_start, remainder,
             )
+        recovery = getattr(self, "_fill_closed_recovery_store", None)
+        if FILL_CLOSED_ENABLED and recovery is not None:
+            recovery.begin(target_window, checkpoint_n=cp.checkpoint_n,
+                           revision=cp_hash, targets=dict(self.env_mix))
         fill_closed_assembler = (
             FillClosedBatchAssembler(
                 window_start=target_window,
@@ -2339,6 +2348,7 @@ class ValidationService:
                 # the only place a v6 window's assembled batches are
                 # known, and under v6 there is no auction to pay at seal.
                 window_pool=1.0,
+                commit_fn=self._commit_fill_closed_batch if recovery is not None else None,
             )
             if FILL_CLOSED_ENABLED
             else None
@@ -4729,8 +4739,12 @@ class ValidationService:
         # Main-loop window iteration is unblocked even if R2 is down for
         # hours, and queued payloads survive process restarts.
         from reliquary.infrastructure.archive_queue import get_archive_queue
-        get_archive_queue().enqueue(first_batcher.window_start, archive)
         archived_window = int(first_batcher.window_start)
+        recovery = getattr(self, "_fill_closed_recovery_store", None)
+        if FILL_CLOSED_ENABLED and recovery is not None:
+            recovery.finish(archived_window, archive, get_archive_queue())
+        else:
+            get_archive_queue().enqueue(archived_window, archive)
         self._archive_enqueued_windows.add(archived_window)
         self._cooldown_durable_window = max(
             getattr(self, "_cooldown_durable_window", 0),
@@ -4888,6 +4902,20 @@ class ValidationService:
             key = encoded_window_journal_key(int(window_start), index)
             self._write_fill_closed_training_tombstone(key, data)
 
+    def _commit_fill_closed_batch(self, key, data, is_tombstone, batches) -> None:
+        from reliquary.constants import FILL_CLOSED_EMISSIONS_PER_WINDOW, WRITE_TRAINING_PAYLOADS
+        from reliquary.validator.fill_closed_recovery import accounting_rows
+
+        if not WRITE_TRAINING_PAYLOADS:
+            raise RuntimeError("fill-closed trainer journal writing is disabled")
+        queue = self._training_payload_queue_ref()
+        if is_tombstone:
+            queue.enqueue_committed_tombstone(key, data)
+        else:
+            queue.enqueue_committed_payload(key, data, accounting=accounting_rows(
+                batches, batch_index=key % FILL_CLOSED_EMISSIONS_PER_WINDOW,
+            ))
+
     def _write_fill_closed_training_payload(
         self, key: int, data: bytes,
     ) -> None:
@@ -4953,6 +4981,18 @@ class ValidationService:
         first_batcher = next(iter(batchers.values()))
         window_start = int(first_batcher.window_start)
         if window_start in getattr(self, "_archive_enqueued_windows", set()):
+            return
+        recovery = getattr(self, "_fill_closed_recovery_store", None)
+        if FILL_CLOSED_ENABLED and recovery is not None:
+            from reliquary.infrastructure.archive_queue import get_archive_queue
+
+            recovery.quarantine_uncommitted(self._training_payload_queue_ref().queue_dir)
+            recovery.recover(window_start, queue=self._training_payload_queue_ref(),
+                             archives=get_archive_queue(), rotation=self._fill_closed_rotation_store)
+            self._fill_closed_rotation_gate = self._fill_closed_rotation_store.load()
+            getattr(self, "_fill_closed_assemblers", {}).pop(window_start, None)
+            self._archive_enqueued_windows.add(window_start)
+            self._cooldown_durable_window = max(getattr(self, "_cooldown_durable_window", 0), window_start)
             return
         iteration_stage = getattr(
             self, "_window_iteration_stage", "seal_train_archive"
@@ -5230,9 +5270,50 @@ class ValidationService:
             },
         )
 
+    async def _pause_for_control_drain(self) -> bool:
+        """Finish the owed pipeline half, then wait closed while uploads drain."""
+        from reliquary.constants import WRITE_TRAINING_PAYLOADS
+        from reliquary.infrastructure.training_payload_queue import encoded_window_journal_key
+        from reliquary.constants import FILL_CLOSED_EMISSIONS_PER_WINDOW
+
+        request = self._control_store.request()
+        if request["target_cursor"] is not None:
+            raise ValueError("validator drain does not accept a trainer target cursor")
+        if request["mode"] != "drain":
+            self._control_store.report(request, phase="running", window=self._window_n)
+            return False
+        self.server.set_active_batchers({})
+        self._set_state(WindowState.READY)
+        if self._gpu_backlog is not None:
+            batchers, window, verify_task, drops, rejects = self._gpu_backlog
+            self._control_store.report(request, phase="finishing_window", window=window)
+            self._window_iteration_stage = "pipelined_train_archive"
+            await self._train_and_publish(
+                batchers=batchers, window_n=window, verify_task=verify_task,
+                late_drops=drops, server_reject_counts=rejects,
+            )
+            self._gpu_backlog = None
+        archives = self._archive_queue.snapshot()
+        payloads = self._training_payload_queue_ref().snapshot() if WRITE_TRAINING_PAYLOADS else {"depth": 0}
+        self._control_store.report(
+            request, phase="drained" if not archives["depth"] and not payloads["depth"] else "uploading",
+            window=self._window_n, archives=archives, payloads=payloads,
+            required_trainer_cursor=encoded_window_journal_key(
+                self._window_n, FILL_CLOSED_EMISSIONS_PER_WINDOW - 1,
+            ),
+        )
+        await asyncio.sleep(2.0)
+        return True
+
     async def run(self, subtensor) -> None:
         from reliquary.infrastructure.archive_queue import get_archive_queue
+        from reliquary.validator.control import ControlStore
 
+        self._control_store = ControlStore(
+            os.getenv("RELIQUARY_STATE_DIR", "/root/reliquary/state"),
+            start_closed=os.getenv("RELIQUARY_CONTROL_START_CLOSED", "0").lower()
+            in {"1", "true", "yes", "on"},
+        )
         # Load a persisted experimental rotation barrier before any startup
         # path can construct or expose a new window.  Corrupt state raises and
         # keeps the validator closed rather than guessing past the barrier.
@@ -5243,7 +5324,6 @@ class ValidationService:
         self.server.configure_registration_gate()
         await self._refresh_registered_hotkeys(force=True, reason="startup")
         await self.server.start()
-        await self._serve_axon_on_chain(subtensor)
         await self._apply_resume_from()                  # ← resume before bootstrap
         await self._bootstrap_state_from_external()
         if (
@@ -5297,9 +5377,15 @@ class ValidationService:
         # that ships new behavior; greppable via:
         #   docker logs reliquary-trainer | grep "Reliquary build:"
         logger.info("Reliquary build: r2-reliability-suite (Layers 1+2+3)")
+        axon_served = False
         try:
             while True:
                 try:
+                    if await self._pause_for_control_drain():
+                        continue
+                    if not axon_served:
+                        await self._serve_axon_on_chain(subtensor)
+                        axon_served = True
                     # Safe to clear even in pipelined mode: at loop top the
                     # in-flight windows (stashed + about-to-open) have not
                     # archived yet, so no live entry is lost.
@@ -5501,7 +5587,8 @@ class ValidationService:
                             "this window on the SERIAL path",
                             self._window_n,
                         )
-                    if PIPELINED_WINDOWS and not self._publication_due_next_half():
+                    if (PIPELINED_WINDOWS and not self._publication_due_next_half()
+                            and self._control_store.request()["mode"] == "run"):
                         # Stash the sealed window; its GPU half runs at the
                         # top of the next iteration, after the next window's
                         # collection has opened. State is frozen at seal, so

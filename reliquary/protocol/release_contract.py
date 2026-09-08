@@ -31,6 +31,11 @@ CAP_MINER_SELECTED_INTENTS = "market.miner-selected-intents/v1"
 CAP_SELECTED_SLOT_REWARD = "reward.selected-slot/v1"
 CAP_STREAMING_TICKET_VALIDATION = "verification.streaming-ticketed/v1"
 CAP_TRAINER_PACED_LANES = "training.trainer-paced-lanes/v1"
+CAP_FILL_CLOSED_WINDOWS = "market.fill-closed-rate/v1"
+CAP_ANSWER_JSON_ABI = "environment.answer-json-abi/v1"
+CAP_PROGRESSIVE_PROOFS = "verification.progressive-proofs/v1"
+CAP_EOS_TOKEN_REWARD = "reward.eos-tokens-per-batch/v1"
+CAP_TRAINER_PACED_ADMISSION = "training.trainer-paced-admission/v1"
 
 _IDENTIFIER_RE = re.compile(r"[a-z0-9][a-z0-9._/-]{0,126}[a-z0-9]$")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}$")
@@ -176,17 +181,16 @@ class CapabilityBundle:
 
 
 RELIQUARY_1_CAPABILITIES = CapabilityBundle.from_iterable(
-    "reliquary-1-ticketed-paced/v1",
+    "reliquary-1-fill-closed/v1",
     (
         CAP_CHECKPOINT_ADOPTION_GATE,
         CAP_DURABLE_LANE_JOURNAL,
         CAP_ENVIRONMENT_EPISODE_ABI,
-        CAP_FRESH_POST_SEAL_ORDERING,
-        CAP_MANIFEST_16_LANES,
-        CAP_MINER_SELECTED_INTENTS,
-        CAP_SELECTED_SLOT_REWARD,
-        CAP_STREAMING_TICKET_VALIDATION,
-        CAP_TRAINER_PACED_LANES,
+        CAP_ANSWER_JSON_ABI,
+        CAP_FILL_CLOSED_WINDOWS,
+        CAP_PROGRESSIVE_PROOFS,
+        CAP_EOS_TOKEN_REWARD,
+        CAP_TRAINER_PACED_ADMISSION,
     ),
 )
 
@@ -412,14 +416,19 @@ def parse_release_contract(raw: bytes) -> ReleaseContract:
 
 
 __all__ = [
+    "CAP_ANSWER_JSON_ABI",
     "CAP_CHECKPOINT_ADOPTION_GATE",
     "CAP_DURABLE_LANE_JOURNAL",
     "CAP_ENVIRONMENT_EPISODE_ABI",
+    "CAP_EOS_TOKEN_REWARD",
+    "CAP_FILL_CLOSED_WINDOWS",
     "CAP_FRESH_POST_SEAL_ORDERING",
     "CAP_MANIFEST_16_LANES",
     "CAP_MINER_SELECTED_INTENTS",
+    "CAP_PROGRESSIVE_PROOFS",
     "CAP_SELECTED_SLOT_REWARD",
     "CAP_STREAMING_TICKET_VALIDATION",
+    "CAP_TRAINER_PACED_ADMISSION",
     "CAP_TRAINER_PACED_LANES",
     "CapabilityBundle",
     "ContractComponent",

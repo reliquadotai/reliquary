@@ -20,6 +20,10 @@ from reliquary.validator.training_accumulator import (
 logger = logging.getLogger(__name__)
 
 
+class TrainerStateUnsafe(RuntimeError):
+    """An optimizer call failed; its in-memory mutations cannot be retried."""
+
+
 class TrainRunner:
     def __init__(
         self,
@@ -56,6 +60,7 @@ class TrainRunner:
         # _lazy_init consumes it once).
         self.global_step_hint = global_step_hint
         self.groups_dropped_missing_pi_old = 0
+        self._last_decoded = None
 
     def _filter_missing_pi_old(self, batches: dict) -> dict:
         """Drop whole groups lacking validator pi_old on any rollout.
@@ -132,14 +137,11 @@ class TrainRunner:
             )
         except TrainingStepSkipped:
             raise  # worker handles health gates (adaptive publication)
-        except Exception:
-            # Parity with the in-process path: a failed step is consumed rather
-            # than replayed ambiguously against partially-mutated optimizer state.
-            logger.exception(
-                "train_step failed for window %s; skipping this batch",
-                decoded.window_start,
-            )
-            return False
+        except Exception as exc:
+            raise TrainerStateUnsafe(
+                f"optimizer failed at window {decoded.window_start}; "
+                "reload the last published checkpoint before resuming"
+            ) from exc
         finally:
             self._accumulator.reset()
         return True
@@ -161,9 +163,18 @@ class TrainRunner:
             window_n=decoded.window_start,
             checkpoint_revision=decoded.checkpoint_revision,
         )
+        self._last_decoded = decoded
         if not self._accumulator.ready:
             return False
         return self._run_ready_step(decoded)
+
+    def finish(self) -> bool:
+        """Flush a balanced final partial step; never silently discard a tail."""
+        if not any(self._accumulator.snapshot()["counts"].values()):
+            return False
+        if not self._accumulator.has_groups_for_all_targets:
+            raise RuntimeError("drain blocked: incomplete environment mix in accumulator")
+        return self._run_ready_step(self._last_decoded, allow_partial=True)
 
 
 

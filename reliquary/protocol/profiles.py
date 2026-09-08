@@ -534,6 +534,38 @@ _PROFILE_VALUES = (
         throughput_tiebreak=None,
     ),
     ProtocolProfile(
+        profile_id="qwen3-4b-base-dapo-reliquary-v1",
+        model_id="Qwen/Qwen3-4B-Base",
+        model_revision="906bfd4b4dc7f14ee4320094d8b41684abff8539",
+        protocol_version=6,
+        collection_seconds=100,
+        upload_grace_seconds=33,
+        prompt_encoding="raw",
+        sampling=_SAMPLING_DAPO,
+        environments={
+            "openmathinstruct": EnvironmentProfile(
+                max_new_tokens=8192, bft=None, answer_format="boxed",
+                prompt_template=_MATH_REASONING_PROMPT,
+            ),
+            "opencodeinstruct": EnvironmentProfile(
+                max_new_tokens=8192, bft=None,
+                prompt_template=_CODE_REASONING_PROMPT,
+            ),
+            "reliquary_logic_v2": EnvironmentProfile(
+                max_new_tokens=8192, bft=None,
+                answer_format="last_json_object_v1", batch_target=16,
+                prompt_template=PromptTemplateProfile(
+                    "reliquary-external-prompt-v1", "$problem",
+                ),
+                environment_contract_id="reliquary/answer-json/v1",
+                environment_manifest_sha256=(
+                    "1e4e05cae799d8e71d8876b0f7526c5b09ca1d5a9ab05f364fb35539288c5019"
+                ),
+            ),
+        },
+        throughput_tiebreak=None,
+    ),
+    ProtocolProfile(
         profile_id="qwen3-4b-reliquary-verifiable-v6-dev1",
         # Isolated infrastructure/frontier profile. It deliberately reuses the
         # exact pinned v4/v5 base revision without joining their Math+Code

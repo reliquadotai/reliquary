@@ -88,7 +88,11 @@ def migrate_journal_cursor(
     if stored == active:
         return cursor, active
     if active == FILL_CLOSED_JOURNAL_KEY_SPACE:
-        return cursor * FILL_CLOSED_EMISSIONS_PER_WINDOW, active
+        # A cursor is the LAST consumed key. The next read must address
+        # batch zero of the following window, not batch one of the old one.
+        return (cursor + 1) * FILL_CLOSED_EMISSIONS_PER_WINDOW - 1, active
+    if cursor % FILL_CLOSED_EMISSIONS_PER_WINDOW != FILL_CLOSED_EMISSIONS_PER_WINDOW - 1:
+        raise ValueError("cannot migrate a partially consumed fill-closed window")
     return cursor // FILL_CLOSED_EMISSIONS_PER_WINDOW, active
 
 

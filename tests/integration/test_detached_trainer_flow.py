@@ -88,7 +88,7 @@ def _make_worker(store, cursor, *, trained_log, last_revision=None):
     publisher = _StubPublisher(store, lambda: {
         "cursor": worker_holder["w"].cursor,
     })
-    head = {"rev": last_revision}
+    head = {"rev": last_revision or REV_0}
 
     def publish_fn(reason):
         rev = publisher.publish(reason)
