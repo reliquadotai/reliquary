@@ -59,3 +59,10 @@ jobs:
         with:
           name: native-verifiers-conformance-${{ github.sha }}
           path: ${{ runner.temp }}/conformance.log
+      - name: Resolve the three-environment V1 profile against the installed wheel
+        run: |
+          docker run --rm --network none \
+            -e RELIQUARY_PROTOCOL_PROFILE=qwen3-4b-base-dapo-reliquary-v1 \
+            -e RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED=1 \
+            reliquary-native-interop:cpu python -c \
+            'from reliquary import constants as c; from scripts.install_logic_runtime import verify_runtime; assert len(c.ENVIRONMENT_MIX) == 3; assert c.M_ROLLOUTS == 16 and c.B_BATCH == 16 and c.FILL_CLOSED_ENABLED; print(verify_runtime()); print(c.PROTOCOL_PROFILE_ID, c.ENVIRONMENT_MIX)'

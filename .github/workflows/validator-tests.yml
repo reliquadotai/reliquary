@@ -47,8 +47,12 @@ jobs:
   fill-closed-v6:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [qwen3-4b-base-dapo-fill-closed-v6, qwen3-4b-base-dapo-reliquary-v1]
     env:
-      RELIQUARY_PROTOCOL_PROFILE: qwen3-4b-base-dapo-fill-closed-v6
+      RELIQUARY_PROTOCOL_PROFILE: ${{ matrix.profile }}
       RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED: "1"
     steps:
       - uses: actions/checkout@v4
@@ -89,7 +93,12 @@ jobs:
             tests/unit/test_prepare_v5_fill_checkpoint.py \
             tests/unit/test_semantic_signer.py \
             tests/unit/test_checkpoint_store.py \
-            tests/unit/test_weight_only_validator.py
+            tests/unit/test_weight_only_validator.py \
+            tests/unit/test_v1_bootstrap.py \
+            tests/unit/test_v1_cutover.py \
+            tests/unit/test_trainer_publication_recovery.py \
+            tests/unit/test_remote_proof_controller.py \
+            tests/integration/test_remote_proof_mtls.py
       - name: Check inherited V5 authenticity boundaries
         run: |
           pytest -q tests/unit/test_grpo_window_batcher.py \

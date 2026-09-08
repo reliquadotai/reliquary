@@ -199,13 +199,14 @@ sudo scripts/verify_cpu_executor_artifact.sh \
   /var/lib/reliquary-build/cpu-executor/<git-revision>
 ```
 
-Copy `reliquary-infra/inventory/cpu-exec.example.yml` outside Git, fill it
-from the artifact manifest and PKI output, then provision the new host:
+Deployment playbooks now live in the separate private
+`reliquadotai/reliquary-infra` repository. From its clean checkout, copy
+`inventory/cpu-exec.example.yml` outside Git, fill it from the artifact manifest
+and PKI output, then use its pinned-core deployment wrapper:
 
 ```bash
-ansible-playbook \
-  -i /secure/cpu-exec-01.yml \
-  reliquary-infra/playbooks/cpu-exec-01.yml
+./deploy_role.sh cpu-exec-01 /secure/cpu-exec-01.yml \
+  /absolute/reliquary-core /secure/pinned-known_hosts
 ```
 
 The playbook refuses missing KVM, swap, wallets, an uploaded CA private key,

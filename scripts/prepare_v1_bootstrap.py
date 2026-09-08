@@ -75,7 +75,8 @@ def prepare_bootstrap(source: dict, *, repo_id: str, revision: str, checkpoint_n
         "private_storage_migration": {
             "source_bucket": source_bucket, "target_bucket": target_bucket,
             "source_run": old_run, "target_run": new_run,
-            "archive_boundary": last_archived_window, "scoring_history_windows": 72,
+            "archive_boundary": last_archived_window, "scoring_history_windows": 216,
+            "archive_history_min_windows": 300,
             "carry_prompt_and_content_cooldowns": ["openmathinstruct", "opencodeinstruct"],
             "initialize_empty_cooldowns": ["reliquary_logic_v2"],
             "exclude": ["reliquary/training/", "pending_training_payloads/", "control.json"],

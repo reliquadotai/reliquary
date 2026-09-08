@@ -32,14 +32,3 @@ jobs:
             echo "Verifier accepted altered evidence" >&2
             exit 1
           fi
-      - name: Validate the three role playbooks
-        if: matrix.role == 'cpu_executor'
-        run: |
-          python3 -m venv "$RUNNER_TEMP/ansible"
-          "$RUNNER_TEMP/ansible/bin/pip" install ansible-core==2.21.3
-          cd reliquary-infra
-          for role in ctrl cpu-exec signer; do
-            inventory="inventory/${role}.example.yml"
-            if [ "$role" = ctrl ]; then inventory=inventory/hosts.example.yml; fi
-            "$RUNNER_TEMP/ansible/bin/ansible-playbook" -i "$inventory" --syntax-check "playbooks/${role}-01.yml"
-          done
