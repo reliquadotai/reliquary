@@ -663,8 +663,10 @@ class ValidationService:
         proof_models: dict[str, Any] | None = None,
         proof_capacity_qualification: dict[str, Any] | None = None,
         proof_worker_pool: Any = None,
+        signer_client: Any | None = None,
     ) -> None:
         self.wallet = wallet
+        self._signer_client = signer_client
         import importlib.metadata as _im
         try:
             reliquary_version = _im.version("reliquary")
@@ -929,6 +931,7 @@ class ValidationService:
             repo_id=self.hf_repo_id,
             staging_dir_path=CHECKPOINT_STAGING_DIR_DEFAULT,
             tokenizer=tokenizer,
+            signer=signer_client,
         )
         # Multi-batcher: one GrpoWindowBatcher per active env.
         self._active_batchers: dict[str, GrpoWindowBatcher] = {}
@@ -1420,8 +1423,10 @@ class ValidationService:
                 await asyncio.to_thread(
                     self._synchronize_proof_models, revision, str(staged_dir),
                 )
-            entry = self._checkpoint_store.install_external(
-                checkpoint_n, revision,
+            entry = await asyncio.to_thread(
+                self._checkpoint_store.install_external,
+                checkpoint_n,
+                revision,
             )
             self._checkpoint_n = checkpoint_n
             self.server.set_current_checkpoint(entry)
@@ -2177,7 +2182,8 @@ class ValidationService:
         if isinstance(source, ShaSource):
             revision_str = source.sha
             self._verify_model_checkpoint_revision = revision_str
-            entry = self._checkpoint_store.install_external(
+            entry = await asyncio.to_thread(
+                self._checkpoint_store.install_external,
                 checkpoint_n,
                 revision_str,
             )
@@ -5717,6 +5723,31 @@ class ValidationService:
                 "--validator-url on the miner side."
             )
             return
+        if self._signer_client is not None:
+            try:
+                accepted = await self._signer_client.serve_axon(
+                    netuid=self.netuid,
+                    ip=self.external_ip,
+                    port=self.external_port,
+                )
+                if not accepted:
+                    logger.error(
+                        "remote signer rejected serve_axon for %s:%d on netuid %d",
+                        self.external_ip,
+                        self.external_port,
+                        self.netuid,
+                    )
+                    return
+                logger.info(
+                    "remote signer published axon: %s:%d on netuid %d",
+                    self.external_ip,
+                    self.external_port,
+                    self.netuid,
+                )
+                return
+            except Exception:
+                logger.exception("remote signer serve_axon operation failed")
+                return
         try:
             import bittensor as bt
 

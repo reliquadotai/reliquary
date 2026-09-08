@@ -1,0 +1,458 @@
+---
+- name: Provision the Reliquary isolated semantic signer
+  hosts: signer-01
+  become: true
+  gather_facts: true
+  vars:
+    signer_infra_dir: "{{ playbook_dir | dirname }}"
+    signer_repo_dir: "{{ (playbook_dir | dirname) | dirname }}"
+    signer_wallet_file: >-
+      /var/lib/reliquary-signer/wallets/{{ signer_wallet_name }}/hotkeys/{{ signer_hotkey_name }}
+
+  pre_tasks:
+    - name: Require every signer policy, identity, and artifact input
+      ansible.builtin.assert:
+        that:
+          - signer_admin_user is defined
+          - signer_admin_authorized_key is defined
+          - signer_admin_authorized_key | length > 80
+          - signer_management_cidr is defined
+          - signer_bind_ip is defined
+          - signer_ctrl_source_cidr is defined
+          - signer_network is defined
+          - signer_netuid | int == 81
+          - signer_repo_id is match('^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')
+          - signer_expected_hotkey | length >= 40
+          - signer_wallet_name | length > 0
+          - signer_hotkey_name | length > 0
+          - signer_image_archive is file
+          - signer_image_archive_sha256 is match('^[0-9a-f]{64}$')
+          - signer_image_id is match('^sha256:[0-9a-f]{64}$')
+          - signer_image_revision is match('^[0-9a-f]{40}$')
+          - signer_pki_source_dir is defined
+          - (signer_axon_ip | default('') | length == 0) or (signer_axon_port | int > 0)
+        fail_msg: "signer-01 requires explicit fixed policy, network, PKI, and immutable artifact inputs"
+
+    - name: Require Ubuntu 24.04 or newer on x86-64
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "Ubuntu"
+          - ansible_distribution_version is version('24.04', '>=')
+          - ansible_architecture == "x86_64"
+        fail_msg: "signer-01 requires x86-64 Ubuntu 24.04 or newer"
+
+    - name: Verify artifact and signer leaf identities on the Ansible controller
+      ansible.builtin.assert:
+        that:
+          - signer_image_archive is file
+          - (signer_pki_source_dir + '/server.crt') is file
+          - (signer_pki_source_dir + '/server.key') is file
+          - (signer_pki_source_dir + '/ca.crt') is file
+          - not ((signer_pki_source_dir + '/ca.key') is file)
+        fail_msg: "signer artifact/server PKI is missing, or the offline CA key is in the upload directory"
+      delegate_to: localhost
+      become: false
+
+    - name: Refuse wallet copies outside the dedicated signer directory
+      ansible.builtin.shell: |
+        set -o pipefail
+        ! find /root /home /opt /etc -maxdepth 5 -type d -name wallets -path '*/.bittensor/*' -print -quit | grep -q .
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+  tasks:
+    - name: Set the signer hostname
+      ansible.builtin.hostname:
+        name: signer-01
+
+    - name: Install the minimal signer host and security packages
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+        name:
+          - auditd
+          - audispd-plugins
+          - ca-certificates
+          - chrony
+          - curl
+          - docker-compose-v2
+          - docker.io
+          - fail2ban
+          - jq
+          - nftables
+          - prometheus-node-exporter
+          - python3
+          - unattended-upgrades
+          - ufw
+        state: present
+
+    - name: Apply available package upgrades
+      ansible.builtin.apt:
+        upgrade: dist
+        update_cache: true
+
+    - name: Create the administrative account
+      ansible.builtin.user:
+        name: "{{ signer_admin_user }}"
+        groups: sudo
+        append: true
+        shell: /bin/bash
+        create_home: true
+
+    - name: Install the administrative SSH key
+      ansible.builtin.file:
+        path: "/home/{{ signer_admin_user }}/.ssh"
+        state: directory
+        owner: "{{ signer_admin_user }}"
+        group: "{{ signer_admin_user }}"
+        mode: "0700"
+
+    - name: Authorize only the explicit administrative key
+      ansible.builtin.copy:
+        dest: "/home/{{ signer_admin_user }}/.ssh/authorized_keys"
+        content: "{{ signer_admin_authorized_key }}\n"
+        owner: "{{ signer_admin_user }}"
+        group: "{{ signer_admin_user }}"
+        mode: "0600"
+
+    - name: Allow passwordless infrastructure automation for the admin
+      ansible.builtin.copy:
+        dest: "/etc/sudoers.d/90-{{ signer_admin_user }}"
+        owner: root
+        group: root
+        mode: "0440"
+        validate: /usr/sbin/visudo -cf %s
+        content: "{{ signer_admin_user }} ALL=(ALL:ALL) NOPASSWD: ALL\n"
+
+    - name: Create the fixed unprivileged signer group
+      ansible.builtin.group:
+        name: reliquary-signer
+        gid: 10001
+        system: true
+
+    - name: Create the fixed unprivileged signer identity
+      ansible.builtin.user:
+        name: reliquary-signer
+        uid: 10001
+        group: reliquary-signer
+        system: true
+        create_home: false
+        shell: /usr/sbin/nologin
+
+    - name: Create signer service directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - {path: /etc/reliquary, owner: root, group: root, mode: "0755"}
+        - {path: /etc/reliquary/signer-pki, owner: root, group: reliquary-signer, mode: "0750"}
+        - {path: /etc/nftables.d, owner: root, group: root, mode: "0755"}
+        - {path: /opt/reliquary-signer, owner: root, group: root, mode: "0755"}
+        - {path: /var/lib/reliquary-artifacts, owner: root, group: root, mode: "0700"}
+        - {path: /var/lib/reliquary-signer, owner: reliquary-signer, group: reliquary-signer, mode: "0700"}
+        - {path: /var/lib/reliquary-signer/wallets, owner: reliquary-signer, group: reliquary-signer, mode: "0700"}
+        - {path: /var/lib/reliquary-signer/state, owner: reliquary-signer, group: reliquary-signer, mode: "0700"}
+        - {path: /var/lib/prometheus/node-exporter, owner: root, group: root, mode: "0755"}
+
+    - name: Require the operator-staged hotkey and no coldkey
+      ansible.builtin.stat:
+        path: "{{ signer_wallet_file }}"
+      register: staged_hotkey
+
+    - name: Refuse service activation without the exact hotkey-only wallet
+      ansible.builtin.assert:
+        that:
+          - staged_hotkey.stat.exists
+          - staged_hotkey.stat.isreg
+          - staged_hotkey.stat.uid == 10001
+          - staged_hotkey.stat.gid == 10001
+          - staged_hotkey.stat.mode == '0600'
+        fail_msg: >-
+          Stage only {{ signer_wallet_file }} as uid/gid 10001 mode 0600;
+          never stage a coldkey or wallet directory on ctrl-01.
+
+    - name: Check that coldkey material is absent
+      ansible.builtin.stat:
+        path: "/var/lib/reliquary-signer/wallets/{{ signer_wallet_name }}/{{ item }}"
+      loop:
+        - coldkey
+        - coldkeypub.txt
+      register: signer_coldkey_files
+
+    - name: Refuse coldkey material on signer-01
+      ansible.builtin.assert:
+        that: not item.stat.exists
+        fail_msg: "coldkey material must remain offline"
+      loop: "{{ signer_coldkey_files.results }}"
+
+    - name: Install only signer server leaf and public CA
+      ansible.builtin.copy:
+        src: "{{ signer_pki_source_dir }}/{{ item.name }}"
+        dest: "/etc/reliquary/signer-pki/{{ item.name }}"
+        owner: root
+        group: reliquary-signer
+        mode: "{{ item.mode }}"
+      loop:
+        - {name: ca.crt, mode: "0640"}
+        - {name: server.crt, mode: "0640"}
+        - {name: server.key, mode: "0640"}
+      no_log: true
+
+    - name: Verify signer certificate validity, CA, purpose, and address
+      ansible.builtin.command: "{{ item }}"
+      loop:
+        - openssl x509 -checkend 1209600 -noout -in /etc/reliquary/signer-pki/server.crt
+        - openssl verify -purpose sslserver -CAfile /etc/reliquary/signer-pki/ca.crt /etc/reliquary/signer-pki/server.crt
+        - openssl verify -verify_ip {{ signer_bind_ip | quote }} -CAfile /etc/reliquary/signer-pki/ca.crt /etc/reliquary/signer-pki/server.crt
+      changed_when: false
+
+    - name: Install hardened Docker, kernel, SSH, monitoring, and egress policy
+      ansible.builtin.template:
+        src: "{{ signer_infra_dir }}/templates/{{ item.src }}"
+        dest: "{{ item.dest }}"
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - {src: docker-daemon-signer.json.j2, dest: /etc/docker/daemon.json, mode: "0644"}
+        - {src: 99-reliquary-sysctl.conf.j2, dest: /etc/sysctl.d/99-reliquary.conf, mode: "0644"}
+        - {src: 50-reliquary-signer-sshd.conf.j2, dest: /etc/ssh/sshd_config.d/00-reliquary.conf, mode: "0644"}
+        - {src: reliquary-fail2ban.local.j2, dest: /etc/fail2ban/jail.d/reliquary.local, mode: "0644"}
+        - {src: prometheus-node-exporter.default.j2, dest: /etc/default/prometheus-node-exporter, mode: "0644"}
+        - {src: reliquary-signer-egress.nft.j2, dest: /etc/nftables.d/reliquary-signer-egress.nft, mode: "0600"}
+        - {src: reliquary-signer-egress.service.j2, dest: /etc/systemd/system/reliquary-signer-egress.service, mode: "0644"}
+      notify:
+        - Restart Docker
+        - Reload sysctl
+        - Restart SSH
+        - Restart fail2ban
+        - Restart node exporter
+        - Restart signer egress
+
+    - name: Validate SSH configuration before root login is disabled
+      ansible.builtin.command: sshd -t
+      changed_when: false
+
+    - name: Disable swap now
+      ansible.builtin.command: swapoff -a
+      when: ansible_swaptotal_mb | int > 0
+      changed_when: true
+
+    - name: Disable swap persistently
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^(\s*[^#\n]+\s+[^\s]+\s+swap\s+.*)$'
+        replace: '# disabled-by-reliquary: \1'
+
+    - name: Read firewall state
+      ansible.builtin.command: ufw status verbose
+      register: signer_ufw
+      changed_when: false
+
+    - name: Set deny-by-default firewall policy
+      ansible.builtin.command: "{{ item }}"
+      loop:
+        - ufw default deny incoming
+        - ufw default allow outgoing
+      changed_when: true
+      when: "'Default: deny (incoming), allow (outgoing)' not in signer_ufw.stdout"
+
+    - name: Allow management SSH only from the operator network
+      ansible.builtin.command: >-
+        ufw allow proto tcp from {{ signer_management_cidr | quote }}
+        to any port 22 comment 'Reliquary management SSH'
+      register: signer_ssh_rule
+      changed_when: "'Rule added' in signer_ssh_rule.stdout"
+
+    - name: Allow the semantic signer only from ctrl-01
+      ansible.builtin.command: >-
+        ufw allow proto tcp from {{ signer_ctrl_source_cidr | quote }}
+        to {{ signer_bind_ip | quote }} port {{ signer_port | default(8444) }}
+        comment 'Reliquary ctrl mTLS signer'
+      register: signer_api_rule
+      changed_when: "'Rule added' in signer_api_rule.stdout"
+
+    - name: Enable the firewall
+      ansible.builtin.command: ufw --force enable
+      changed_when: true
+      when: "'Status: active' not in signer_ufw.stdout"
+
+    - name: Install the immutable signer Compose and configuration
+      ansible.builtin.copy:
+        src: "{{ signer_repo_dir }}/docker/docker-compose.signer.yml"
+        dest: /opt/reliquary-signer/compose.yml
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart signer
+
+    - name: Render the fixed signer policy
+      ansible.builtin.template:
+        src: "{{ signer_infra_dir }}/templates/signer.env.j2"
+        dest: /etc/reliquary/signer.env
+        owner: root
+        group: reliquary-signer
+        mode: "0640"
+      no_log: true
+      notify: Restart signer
+
+    - name: Record the expected signer image ID
+      ansible.builtin.copy:
+        dest: /etc/reliquary/signer-image-id
+        content: "{{ signer_image_id }}\n"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Check whether the exact signer image exists
+      ansible.builtin.command: "docker image inspect {{ signer_image_id }}"
+      register: signer_image_present
+      changed_when: false
+      failed_when: false
+
+    - name: Stage and verify the signer image archive
+      ansible.builtin.copy:
+        src: "{{ signer_image_archive }}"
+        dest: /var/lib/reliquary-artifacts/signer.tar.gz
+        owner: root
+        group: root
+        mode: "0600"
+      when: signer_image_present.rc != 0
+
+    - name: Digest the staged signer image
+      ansible.builtin.command: sha256sum /var/lib/reliquary-artifacts/signer.tar.gz
+      register: staged_signer_digest
+      changed_when: false
+      when: signer_image_present.rc != 0
+
+    - name: Refuse a corrupt signer archive
+      ansible.builtin.assert:
+        that: staged_signer_digest.stdout.split()[0] == signer_image_archive_sha256
+      when: signer_image_present.rc != 0
+
+    - name: Import the verified signer image
+      ansible.builtin.shell: |
+        set -o pipefail
+        gzip --decompress --stdout /var/lib/reliquary-artifacts/signer.tar.gz | docker image load
+      args:
+        executable: /bin/bash
+      when: signer_image_present.rc != 0
+      changed_when: true
+      notify: Restart signer
+
+    - name: Verify the exact signer image after import
+      ansible.builtin.command: "docker image inspect {{ signer_image_id }}"
+      changed_when: false
+
+    - name: Remove the signer staging archive
+      ansible.builtin.file:
+        path: /var/lib/reliquary-artifacts/signer.tar.gz
+        state: absent
+
+    - name: Install signer systemd and validation commands
+      ansible.builtin.template:
+        src: "{{ signer_infra_dir }}/templates/reliquary-signer.service.j2"
+        dest: /etc/systemd/system/reliquary-signer.service
+        owner: root
+        group: root
+        mode: "0644"
+      notify:
+        - Reload systemd
+        - Restart signer
+
+    - name: Install signer host validator
+      ansible.builtin.copy:
+        src: "{{ signer_infra_dir }}/scripts/validate_signer_01.sh"
+        dest: /usr/local/sbin/reliquary-validate-signer
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Enable signer host services
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+      loop:
+        - auditd
+        - chrony
+        - docker
+        - fail2ban
+        - prometheus-node-exporter
+        - reliquary-signer-egress
+        - reliquary-signer
+
+    - name: Flush signer configuration changes
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for the signer container health gate
+      ansible.builtin.command: >-
+        docker inspect --format {% raw %}'{{.State.Health.Status}}'{% endraw %}
+        reliquary-signer
+      register: signer_container_health
+      changed_when: false
+      retries: 40
+      delay: 3
+      until: signer_container_health.stdout == 'healthy'
+
+    - name: Run complete signer-host validation
+      ansible.builtin.command: /usr/local/sbin/reliquary-validate-signer
+      changed_when: false
+
+    - name: Check whether package upgrades require reboot
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: signer_reboot_required
+
+    - name: Report the explicit signer reboot gate
+      ansible.builtin.debug:
+        msg: >-
+          Host package upgrades require a reboot. Reboot, reconnect as
+          {{ signer_admin_user }}, and rerun this playbook before qualification.
+      when: signer_reboot_required.stat.exists
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+    - name: Restart Docker
+      ansible.builtin.systemd_service:
+        name: docker
+        state: restarted
+
+    - name: Reload sysctl
+      ansible.builtin.command: sysctl --system
+      changed_when: true
+
+    - name: Restart SSH
+      ansible.builtin.systemd_service:
+        name: ssh
+        state: restarted
+
+    - name: Restart fail2ban
+      ansible.builtin.systemd_service:
+        name: fail2ban
+        state: restarted
+
+    - name: Restart node exporter
+      ansible.builtin.systemd_service:
+        name: prometheus-node-exporter
+        state: restarted
+
+    - name: Restart signer egress
+      ansible.builtin.systemd_service:
+        name: reliquary-signer-egress
+        state: restarted
+        daemon_reload: true
+
+    - name: Restart signer
+      ansible.builtin.systemd_service:
+        name: reliquary-signer
+        state: restarted
+        daemon_reload: true

@@ -184,14 +184,35 @@ def _ensure_grader_running(use_runsc: "bool | None" = None) -> None:
     from reliquary.constants import GRADER_SOCKET_PATH
 
     _logger = logging.getLogger("reliquary.cli")
+    remote_executor_url = os.environ.get(
+        "RELIQUARY_GRADER_EXECUTOR_URL",
+        "",
+    ).strip()
+    remote_executor_mode = os.environ.get(
+        "RELIQUARY_GRADER_EXECUTOR_MODE",
+        "shadow",
+    ).strip().lower()
+    if remote_executor_url and remote_executor_mode not in {"shadow", "remote"}:
+        raise RuntimeError(
+            "RELIQUARY_GRADER_EXECUTOR_MODE must be 'shadow' or 'remote'"
+        )
+    needs_local_executor = (
+        not remote_executor_url or remote_executor_mode == "shadow"
+    )
 
     if _grader_is_running(GRADER_SOCKET_PATH):
         _logger.info("Grader already running at %s; reusing it", GRADER_SOCKET_PATH)
         return
 
-    if use_runsc is None:
+    if remote_executor_url and remote_executor_mode == "remote" and use_runsc is True:
+        raise RuntimeError(
+            "authoritative remote grader cannot be combined with local runsc"
+        )
+    if remote_executor_url and remote_executor_mode == "remote":
+        use_runsc = False
+    elif needs_local_executor and use_runsc is None:
         use_runsc = bool(shutil.which("runsc")) and _grader_bundle_python().exists()
-    if not use_runsc:
+    if needs_local_executor and not use_runsc:
         if not _env_flag("RELIQUARY_ALLOW_UNSANDBOXED_GRADER", "0"):
             raise RuntimeError(
                 "opencodeinstruct requires the gVisor/runsc grader sandbox. "
@@ -216,8 +237,33 @@ def _ensure_grader_running(use_runsc: "bool | None" = None) -> None:
             "/opt/reliquary/reliquary/environment/grader/bundle",
         ),
     }
+    for name in (
+        "RELIQUARY_GRADER_EXECUTOR_URL",
+        "RELIQUARY_GRADER_EXECUTOR_MODE",
+        "RELIQUARY_GRADER_EXECUTOR_CA",
+        "RELIQUARY_GRADER_EXECUTOR_CERT",
+        "RELIQUARY_GRADER_EXECUTOR_KEY",
+        "RELIQUARY_GRADER_EXECUTOR_ALLOW_INSECURE_LOOPBACK",
+        "RELIQUARY_GRADER_RUNTIME_ID",
+        "GRADER_METRICS_PORT",
+        "GRADER_HEALTH_PATH",
+    ):
+        value = os.environ.get(name)
+        if value:
+            sanitized_env[name] = value
 
-    _logger.info("Launching grader server (use_runsc=%s, scrubbed_env=1) ...", use_runsc)
+    _logger.info(
+        "Launching grader server (backend=%s, scrubbed_env=1) ...",
+        (
+            "local-shadow"
+            if remote_executor_url and remote_executor_mode == "shadow"
+            else (
+                "remote"
+                if remote_executor_url
+                else ("runsc" if use_runsc else "python")
+            )
+        ),
+    )
     _grader_proc = subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,
@@ -249,7 +295,8 @@ def _ensure_grader_running(use_runsc: "bool | None" = None) -> None:
         "Grader server failed to bind %s within 15s. OCI rewards will "
         "be 0 and all OCI submissions will be rejected. Diagnose by "
         "running `python -m reliquary.environment.grader.server%s` manually.",
-        GRADER_SOCKET_PATH, " --use-runsc" if use_runsc else "",
+        GRADER_SOCKET_PATH,
+        " --use-runsc" if use_runsc else "",
     )
 
 
@@ -544,14 +591,31 @@ def validate(
         )
 
     async def _run():
-        import bittensor as bt
-
         from reliquary.infrastructure.chain import get_subtensor
 
-        wallet_kwargs = {"name": wallet_name, "hotkey": hotkey}
-        if wallet_path:
-            wallet_kwargs["path"] = wallet_path
-        wallet = bt.Wallet(**wallet_kwargs)
+        signer_client = None
+        if os.environ.get("RELIQUARY_SIGNER_URL", "").strip():
+            from reliquary.signer.client import RemoteSignerClient
+
+            signer_client = RemoteSignerClient.from_environment(
+                network=network,
+                netuid=netuid,
+                repo_id=hf_repo_id,
+            )
+            health = await asyncio.to_thread(signer_client.assert_ready)
+            wallet = signer_client.public_wallet
+            logger.info(
+                "Remote signer ready (hotkey=%s protocol=%d)",
+                health.signer_hotkey,
+                health.protocol_version,
+            )
+        else:
+            import bittensor as bt
+
+            wallet_kwargs = {"name": wallet_name, "hotkey": hotkey}
+            if wallet_path:
+                wallet_kwargs["path"] = wallet_path
+            wallet = bt.Wallet(**wallet_kwargs)
         subtensor = await get_subtensor()
 
         if train:
@@ -769,6 +833,7 @@ def validate(
                     proof_capacity_qualification
                 ),
                 proof_worker_pool=proof_worker_pool,
+                signer_client=signer_client,
             )
             # Run the weight setter in a dedicated OS thread with its own
             # event loop. asyncio is single-threaded, so any sync blocking
@@ -780,7 +845,11 @@ def validate(
 
             def _run_weight_setter() -> None:
                 try:
-                    worker = WeightOnlyValidator(wallet=wallet, netuid=netuid)
+                    worker = WeightOnlyValidator(
+                        wallet=wallet,
+                        netuid=netuid,
+                        signer_client=signer_client,
+                    )
                     asyncio.run(worker.run())
                 except Exception:
                     logger.exception("weight-setter thread crashed")
@@ -794,7 +863,11 @@ def validate(
         else:
             from reliquary.validator.weight_only import WeightOnlyValidator
 
-            validator = WeightOnlyValidator(wallet=wallet, netuid=netuid)
+            validator = WeightOnlyValidator(
+                wallet=wallet,
+                netuid=netuid,
+                signer_client=signer_client,
+            )
             await validator.run()
 
     _run_validator_event_loop(_run())

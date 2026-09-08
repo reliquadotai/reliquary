@@ -6,8 +6,20 @@
 #   2. Validator main process
 set -euo pipefail
 
-: "${BT_WALLET_NAME:?BT_WALLET_NAME is required}"
-: "${BT_HOTKEY:?BT_HOTKEY is required}"
+REMOTE_SIGNER_URL="${RELIQUARY_SIGNER_URL:-}"
+if [[ -n "${REMOTE_SIGNER_URL}" ]]; then
+  : "${RELIQUARY_SIGNER_EXPECTED_HOTKEY:?required in remote signer mode}"
+  : "${RELIQUARY_SIGNER_CA:?required in remote signer mode}"
+  : "${RELIQUARY_SIGNER_CERT:?required in remote signer mode}"
+  : "${RELIQUARY_SIGNER_KEY:?required in remote signer mode}"
+  BT_WALLET_NAME="${BT_WALLET_NAME:-remote-signer}"
+  BT_HOTKEY="${BT_HOTKEY:-remote-signer}"
+  BT_WALLET_PATH="${BT_WALLET_PATH:-/nonexistent/remote-signer-wallet}"
+  export BT_WALLET_NAME BT_HOTKEY BT_WALLET_PATH
+else
+  : "${BT_WALLET_NAME:?BT_WALLET_NAME is required}"
+  : "${BT_HOTKEY:?BT_HOTKEY is required}"
+fi
 
 GRADER_PID=""
 VALIDATOR_PID=""
@@ -70,54 +82,98 @@ trap terminate_children TERM INT
 trap cleanup EXIT
 
 # ── Credential permissions ────────────────────────────────────────────────
-DEFAULT_WALLET_PATH="/opt/reliquary/wallets"
-LEGACY_WALLET_PATH="/root/.bittensor/wallets"
-if [[ -n "${BT_WALLET_PATH:-}" ]]; then
-  WALLET_DIR="${BT_WALLET_PATH}"
-elif [[ -d "${DEFAULT_WALLET_PATH}" ]]; then
-  WALLET_DIR="${DEFAULT_WALLET_PATH}"
-elif [[ -d "${LEGACY_WALLET_PATH}" ]]; then
-  WALLET_DIR="${LEGACY_WALLET_PATH}"
-else
-  WALLET_DIR="${DEFAULT_WALLET_PATH}"
-fi
-export BT_WALLET_PATH="${WALLET_DIR}"
-if [[ ! -d "${WALLET_DIR}" ]]; then
-  echo "[entrypoint] FATAL: credential directory is not mounted" >&2
-  exit 1
-fi
-if [[ "${RELIQUARY_DROP_VALIDATOR_PRIVILEGES:-0}" == "1" ]]; then
-  read_check=(setpriv --reuid=1000 --regid=1000 --clear-groups test -r "${WALLET_DIR}")
-else
-  read_check=(test -r "${WALLET_DIR}")
-fi
-if ! "${read_check[@]}"; then
-  echo "[entrypoint] FATAL: credential directory is not readable" >&2
-  exit 1
+if [[ -z "${REMOTE_SIGNER_URL}" ]]; then
+  DEFAULT_WALLET_PATH="/opt/reliquary/wallets"
+  LEGACY_WALLET_PATH="/root/.bittensor/wallets"
+  if [[ -n "${BT_WALLET_PATH:-}" ]]; then
+    WALLET_DIR="${BT_WALLET_PATH}"
+  elif [[ -d "${DEFAULT_WALLET_PATH}" ]]; then
+    WALLET_DIR="${DEFAULT_WALLET_PATH}"
+  elif [[ -d "${LEGACY_WALLET_PATH}" ]]; then
+    WALLET_DIR="${LEGACY_WALLET_PATH}"
+  else
+    WALLET_DIR="${DEFAULT_WALLET_PATH}"
+  fi
+  export BT_WALLET_PATH="${WALLET_DIR}"
+  if [[ ! -d "${WALLET_DIR}" ]]; then
+    echo "[entrypoint] FATAL: credential directory is not mounted" >&2
+    exit 1
+  fi
+  if [[ "${RELIQUARY_DROP_VALIDATOR_PRIVILEGES:-0}" == "1" ]]; then
+    read_check=(setpriv --reuid=1000 --regid=1000 --clear-groups test -r "${WALLET_DIR}")
+  else
+    read_check=(test -r "${WALLET_DIR}")
+  fi
+  if ! "${read_check[@]}"; then
+    echo "[entrypoint] FATAL: credential directory is not readable" >&2
+    exit 1
+  fi
 fi
 
 ENVIRONMENTS="${RELIQUARY_ENVIRONMENTS:-openmathinstruct}"
 
 if [[ "${RELIQUARY_TRAIN:-0}" == "1" && ",${ENVIRONMENTS}," == *",opencodeinstruct,"* ]]; then
-  # The published image must contain the runsc bundle. Building it at
-  # container start would require a Docker socket in the validator container.
-  BUNDLE_ROOTFS="/opt/reliquary/reliquary/environment/grader/bundle/rootfs"
-  if [[ ! -x "${BUNDLE_ROOTFS}/usr/local/bin/python3" ]]; then
-    echo "[entrypoint] FATAL: grader bundle rootfs is missing from the image" >&2
-    exit 1
+  GRADER_REMOTE_URL="${RELIQUARY_GRADER_EXECUTOR_URL:-}"
+  GRADER_REMOTE_MODE="${RELIQUARY_GRADER_EXECUTOR_MODE:-shadow}"
+  grader_args=()
+  grader_env=(
+    "PATH=/opt/reliquary-venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    "HOME=/tmp"
+    "GRADER_SOCKET_PATH=/tmp/reliquary-grader.sock"
+    "GRADER_BUNDLE_PATH=/opt/reliquary/reliquary/environment/grader/bundle"
+  )
+
+  if [[ -n "${GRADER_REMOTE_URL}" ]]; then
+    if [[ "${GRADER_REMOTE_MODE}" != "shadow" && "${GRADER_REMOTE_MODE}" != "remote" ]]; then
+      echo "[entrypoint] FATAL: grader executor mode must be shadow or remote" >&2
+      exit 1
+    fi
+    # Both rollout modes keep expected answers and comparison here. Shadow
+    # preserves local runsc authority while the new host is qualified.
+    grader_env+=(
+      "RELIQUARY_GRADER_EXECUTOR_URL=${GRADER_REMOTE_URL}"
+      "RELIQUARY_GRADER_EXECUTOR_MODE=${GRADER_REMOTE_MODE}"
+    )
+    for name in \
+      RELIQUARY_GRADER_EXECUTOR_CA \
+      RELIQUARY_GRADER_EXECUTOR_CERT \
+      RELIQUARY_GRADER_EXECUTOR_KEY \
+      RELIQUARY_GRADER_EXECUTOR_ALLOW_INSECURE_LOOPBACK \
+      RELIQUARY_GRADER_RUNTIME_ID \
+      GRADER_METRICS_PORT \
+      GRADER_HEALTH_PATH
+    do
+      value="${!name:-}"
+      [[ -n "${value}" ]] && grader_env+=("${name}=${value}")
+    done
+  fi
+
+  if [[ -z "${GRADER_REMOTE_URL}" || "${GRADER_REMOTE_MODE}" == "shadow" ]]; then
+    # Local fallback: the published image must contain the runsc bundle.
+    # Building it at container start would require a Docker socket.
+    BUNDLE_ROOTFS="/opt/reliquary/reliquary/environment/grader/bundle/rootfs"
+    if [[ ! -x "${BUNDLE_ROOTFS}/usr/local/bin/python3" ]]; then
+      echo "[entrypoint] FATAL: grader bundle rootfs is missing from the image" >&2
+      exit 1
+    fi
+    grader_args+=(--use-runsc)
   fi
 
   # ── Launch grader server ───────────────────────────────────────────────
-  echo "[entrypoint] Starting grader server..."
-  # runsc needs root inside this privileged container to create its state and
-  # cgroups. The trusted supervisor gets a scrubbed env; untrusted miner code
-  # still runs inside the runsc worker as the UID/GID from config.json.
-  env -i \
-      PATH="/opt/reliquary-venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-      HOME="/tmp" \
-      GRADER_SOCKET_PATH="/tmp/reliquary-grader.sock" \
-      GRADER_BUNDLE_PATH="/opt/reliquary/reliquary/environment/grader/bundle" \
-    python -m reliquary.environment.grader.server --use-runsc &
+  if [[ -z "${GRADER_REMOTE_URL}" ]]; then
+    GRADER_BACKEND="local-runsc"
+  elif [[ "${GRADER_REMOTE_MODE}" == "shadow" ]]; then
+    GRADER_BACKEND="local-runsc+remote-shadow"
+  else
+    GRADER_BACKEND="remote"
+  fi
+  echo "[entrypoint] Starting grader coordinator (backend=${GRADER_BACKEND})..."
+  # Local runsc needs root inside the privileged legacy container. Remote mode
+  # does not: the control container can be unprivileged because hostile worker
+  # lifecycle has moved to cpu-exec-01. In both modes the coordinator receives
+  # a scrubbed environment.
+  env -i "${grader_env[@]}" \
+    python -m reliquary.environment.grader.server "${grader_args[@]}" &
   GRADER_PID=$!
 
   # Wait briefly for the grader socket to appear. Hard-fail if it doesn't.

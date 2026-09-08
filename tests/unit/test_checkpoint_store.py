@@ -276,6 +276,66 @@ async def test_signature_includes_n_and_revision(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_remote_signer_receives_only_structured_checkpoint_claim(tmp_path):
+    captured = {}
+
+    class SemanticSigner:
+        def sign_checkpoint(self, *, checkpoint_n, repo_id, revision):
+            captured.update(
+                checkpoint_n=checkpoint_n,
+                repo_id=repo_id,
+                revision=revision,
+            )
+            return b"remote-signature"
+
+    async def fake_upload(*, folder_path, repo_id, commit_message):
+        assert folder_path
+        assert repo_id == "aivolutionedge/reliquary-sn"
+        assert commit_message == "checkpoint 42"
+        return "a" * 40
+
+    store = CheckpointStore(
+        validator_hotkey="5FHk",
+        wallet=FakeWallet(),
+        repo_id="aivolutionedge/reliquary-sn",
+        staging_dir_path=str(tmp_path),
+        upload_fn=fake_upload,
+        save_fn=_save_stub,
+        signer=SemanticSigner(),
+    )
+    entry = await store.publish(42, model=object())
+
+    assert captured == {
+        "checkpoint_n": 42,
+        "repo_id": "aivolutionedge/reliquary-sn",
+        "revision": "a" * 40,
+    }
+    assert entry.signature == "ed25519:" + b"remote-signature".hex()
+
+
+def test_remote_signer_preserves_immutable_checkpoint_floor(tmp_path):
+    signer = MagicMock()
+    signer.sign_checkpoint.return_value = b"remote-signature"
+    store = CheckpointStore(
+        validator_hotkey="5FHk",
+        wallet=FakeWallet(),
+        repo_id="org/repo",
+        staging_dir_path=str(tmp_path),
+        signer=signer,
+    )
+    installed = store.install_external(5, REV_A)
+    store.clear_manifest()
+    assert store.install_external(5, REV_A) is installed
+    for checkpoint_n, revision in ((4, REV_B), (5, REV_B), (6, "/tmp/model")):
+        with pytest.raises(ValueError):
+            store.install_external(checkpoint_n, revision)
+    signer.sign_checkpoint.assert_called_once_with(
+        checkpoint_n=5, repo_id="org/repo", revision=REV_A
+    )
+    assert store.current_manifest() is installed
+
+
+@pytest.mark.asyncio
 async def test_repo_id_stored_in_manifest(tmp_path):
     """ManifestEntry carries the repo_id so miners can do from_pretrained(repo_id, revision)."""
     async def fake_upload(folder_path, repo_id, commit_message):

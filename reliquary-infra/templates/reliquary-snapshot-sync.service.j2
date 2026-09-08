@@ -1,0 +1,39 @@
+[Unit]
+Description=Reliquary immutable state snapshot publisher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=reliquary-edge
+Group=reliquary-edge
+EnvironmentFile=/etc/reliquary/snapshot-sync.env
+ExecStartPre=/usr/bin/find /var/lib/reliquary-edge/snapshots/current -type l -delete
+ExecStart=/usr/local/lib/reliquary/snapshot_sync.py $RELIQUARY_SNAPSHOT_ARGS
+ExecStopPost=/usr/bin/find /var/lib/reliquary-edge/snapshots/current -type l -delete
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=10s
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+UMask=0027
+ReadWritePaths=/var/lib/reliquary-edge/snapshots /var/lib/prometheus/node-exporter
+
+[Install]
+WantedBy=multi-user.target

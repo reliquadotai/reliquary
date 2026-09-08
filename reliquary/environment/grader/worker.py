@@ -19,6 +19,11 @@ import math
 import sys
 from typing import Any
 
+
+# A miner-controlled return value must not turn the worker's stdout protocol
+# into a memory-amplification path on the execution host.
+MAX_WORKER_OUTPUT_BYTES = 256 * 1024
+
 # Armed before anything redirects sys.stderr, so a hard death (SIGSEGV,
 # SIGABRT) still writes a Python traceback to the real fd 2, which the server
 # keeps and reports. Without it such a worker dies silently and the crash is
@@ -301,7 +306,17 @@ def evaluate_call(
             output = fn(*args, **kwargs)
             if not _critical_builtins_intact():
                 return None, "tampered"
-            return _json_safe(output), "ok"
+            safe_output = _json_safe(output)
+            encoded_size = len(
+                json.dumps(
+                    safe_output,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+            if encoded_size > MAX_WORKER_OUTPUT_BYTES:
+                return None, "bad_output"
+            return safe_output, "ok"
         except ImportError as e:
             if "not available in the grader sandbox" in str(e):
                 return None, "forbidden_import"

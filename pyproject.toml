@@ -54,7 +54,7 @@ build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests"]
+testpaths = ["tests", "reliquary-infra/tests"]
 markers = [
     "classic_window: asserts the pre-v6 timed-window behaviour. These pass under the default profile and are deselected by the v6 job, where the product answers differently by design.",
 ]

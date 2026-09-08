@@ -76,4 +76,8 @@ jobs:
             tests/unit/test_prove_on_arrival.py \
             tests/unit/test_pick_by_rate.py \
             tests/unit/test_pick_pacing.py \
-            tests/unit/test_rate_ordered_admission.py
+            tests/unit/test_rate_ordered_admission.py \
+            tests/unit/test_remote_cpu_executor.py \
+            tests/unit/test_semantic_signer.py \
+            tests/unit/test_checkpoint_store.py \
+            tests/unit/test_weight_only_validator.py

@@ -340,6 +340,22 @@ def test_production_runsc_argv_disables_cgroups():
     assert "/opt/grader/bundle" in argv
 
 
+def test_production_runsc_argv_can_select_bare_metal_kvm():
+    from reliquary.environment.grader import server as srv
+
+    argv = srv.runsc_worker_argv("/opt/grader/bundle", platform="kvm")
+
+    assert "--platform=kvm" in argv
+    assert argv.index("--platform=kvm") < argv.index("run")
+
+
+def test_production_runsc_argv_rejects_unknown_platform():
+    from reliquary.environment.grader import server as srv
+
+    with pytest.raises(ValueError, match="runsc platform"):
+        srv.runsc_worker_argv("/opt/grader/bundle", platform="not-a-platform")
+
+
 def test_runsc_respawn_uses_fresh_id_before_cleanup(monkeypatch, tmp_path):
     from reliquary.environment.grader import server as srv
 

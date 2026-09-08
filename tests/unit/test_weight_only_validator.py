@@ -138,6 +138,36 @@ async def test_submit_weights_maps_hotkeys_to_uids():
 
 
 @pytest.mark.asyncio
+async def test_remote_signer_submits_semantic_weight_vector_without_local_key():
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    signer = MagicMock()
+    signer.set_weights = AsyncMock(return_value=True)
+    wov = WeightOnlyValidator(
+        wallet=_FakeWallet(),
+        netuid=81,
+        signer_client=signer,
+    )
+    fake_meta = MagicMock(hotkeys=["alice", "5FReader"], uids=[10, 11])
+    wov._active_submit_epoch = 1234
+
+    with patch(
+        "reliquary.validator.weight_only.chain.get_metagraph",
+        new=AsyncMock(return_value=fake_meta),
+    ):
+        submitted = await wov._submit_weights(MagicMock(), {"alice": 0.4})
+
+    assert submitted is True
+    signer.set_weights.assert_awaited_once()
+    call = signer.set_weights.await_args.kwargs
+    assert call["epoch_id"] == 1234
+    assert call["netuid"] == 81
+    assert dict(zip(call["uids"], call["weights"])) == pytest.approx(
+        {10: 0.4, 11: 0.6}
+    )
+
+
+@pytest.mark.asyncio
 async def test_deregistered_ema_mass_is_conserved_as_burn():
     """Metagraph filtering must not redistribute vanished miner weight."""
     from reliquary.validator.weight_only import WeightOnlyValidator

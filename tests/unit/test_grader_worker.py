@@ -79,6 +79,20 @@ def f():
     assert output is None
 
 
+def test_oversized_json_output_is_rejected():
+    from reliquary.environment.grader.worker import evaluate_call
+
+    output, status = evaluate_call(
+        "def huge(): return 'x' * 300_000",
+        {"kind": "function", "name": "huge"},
+        [],
+        {},
+        timeout_s=5.0,
+    )
+    assert status == "bad_output"
+    assert output is None
+
+
 def test_print_does_not_leak_to_stdout(capsys):
     from reliquary.environment.grader.worker import evaluate_call
 
