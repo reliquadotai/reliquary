@@ -10,7 +10,13 @@ from __future__ import annotations
 import importlib.metadata
 import json
 
-from reliquary.environment.agentic.types import AssistantAction, EpisodeTask, EpisodeTrace
+from reliquary.environment.agentic.types import (
+    MAX_ACTION_BYTES,
+    AssistantAction,
+    EpisodeTask,
+    EpisodeTrace,
+    _load_json_object,
+)
 
 VERIFIERS_COMMIT = "b2e4e8157783b2c0dffc7821044c87f29f1c3ccf"
 
@@ -83,28 +89,43 @@ def native_prime_v1_trace(task, *, completion: str | None = None,
 def actions_from_prime_v1_trace(trace) -> tuple[AssistantAction, ...]:
     """Recover bounded Episode actions from a native Trace/WireTrace.
 
-    Tool observations and trace rewards are ignored: the Reliquary environment
-    must replay the recovered actions to establish an authoritative outcome.
+    Use sampled assistant nodes on the final branch, as the pinned native
+    Taskset does. Tool observations and trace rewards are ignored: the Reliquary
+    environment must replay actions to establish an authoritative outcome.
     """
     vf = pinned_verifiers_v1()
     if not isinstance(trace, (vf.Trace, vf.WireTrace)):
         raise TypeError("native interop requires a Verifiers Trace or WireTrace")
+    if trace.version != 1:
+        raise ValueError("unsupported Verifiers trace version")
+    # Validate before asking Verifiers to walk parents: malformed wire graphs
+    # can otherwise loop forever or resolve negative Python list indices.
+    for index, node in enumerate(trace.nodes):
+        if node.parent is not None and not 0 <= node.parent < index:
+            raise ValueError("Verifiers trace parents must precede their children")
+    branches = trace.branches
+    messages = [node.message for node in branches[-1].nodes
+                if node.sampled and isinstance(node.message, vf.AssistantMessage)] if branches else []
     actions = []
-    for node in trace.nodes:
-        message = getattr(node, "message", None)
-        if not isinstance(message, vf.AssistantMessage):
-            continue
+    call_ids = set()
+    for index, message in enumerate(messages):
         if message.tool_calls:
             if message.content or len(message.tool_calls) != 1:
                 raise ValueError("Episode v1 requires one tool call per assistant turn")
             call = message.tool_calls[0]
-            # Delegate strict duplicate-key, size and finite-number checks to
-            # the existing canonical action parser, before any replay.
-            actions.append(AssistantAction.from_json(
-                '{"tool":' + json.dumps(call.name) + ',"arguments":' + call.arguments + '}'
+            if call.type != "function" or not call.id or call.id in call_ids:
+                raise ValueError("Episode tool calls require unique nonempty function IDs")
+            call_ids.add(call.id)
+            # This is structured API JSON, not free-form model reasoning.
+            # Never extract a later action-shaped object from malformed input.
+            arguments = _load_json_object(call.arguments, max_bytes=MAX_ACTION_BYTES)
+            actions.append(AssistantAction.from_wire(
+                {"tool": call.name, "arguments": arguments}
             ))
         else:
-            actions.append(AssistantAction.final(message.content or ""))
+            if index != len(messages) - 1 or not isinstance(message.content, str):
+                raise ValueError("Episode final text must be the last sampled turn")
+            actions.append(AssistantAction.final(message.content))
     return tuple(actions)
 
 

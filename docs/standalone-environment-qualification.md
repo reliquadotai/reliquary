@@ -52,11 +52,46 @@ qualification, exact native/ABI prompt identity, packaged goldens, malformed
 answers, and authoritative reward recomputation after a wire roundtrip. Episode
 actions are recovered from the native trace and replayed in Reliquary. Trace
 reward fields and tool observations are never accepted as authoritative state.
+The importer follows the final branch, matching the published Stateful Tools
+Taskset, and takes only sampled assistant nodes. It validates graph parents
+before traversal, rejects unsupported trace versions, duplicate tool-call IDs,
+non-object/duplicate-key/non-finite/trailing JSON arguments, and turns after a
+final answer. Episode v1 accepts one function call per turn with no mixed
+assistant content; parallel calls and mixed-content traces need a reviewed
+adapter. Prompt examples and discarded branches are not replayed as actions.
+
+The native CPU workflow also runs `tests/unit/test_prime_v1_interop.py` against
+the installed pinned Verifiers and wheels, including reward agreement with the
+published Taskset after adding a prompt example and a discarded branch. Run
+this standard-library test runner in the same dedicated environment with
+`PYTHONPATH=. python tests/unit/test_prime_v1_interop.py` (the optional tests skip
+when Verifiers is absent; the workflow first requires both wheels and their
+full conformance check). This is transcript/replay interoperability, not a
+Prime-RL optimizer run or a signed Reliquary mining submission.
 
 These are two reviewed first-party Tasksets, not universal Prime catalog
 support. Other environments need an explicit deterministic ABI, artifact pin,
 resource policy and conformance tests. The legacy `export_prime_v1_*` helpers
 remain JSON exports; `native_prime_v1_trace` is the optional actual API bridge.
+
+To onboard another environment, review these concrete boundaries first:
+
+1. Pin its native **v1 Taskset**, source, wheel and dependencies. A legacy
+   `vf.load_environment` factory is a different API. Installing an arbitrary
+   Prime package does not register a Reliquary environment.
+2. Implement one of the reviewed deterministic answer or episode replay ABIs,
+   with fixed task identity/splits, bounded actions and state, a declared reward
+   lattice, and an explicit resource policy. A network tool, model judge or
+   untrusted Python dependency is not made authoritative or isolated by this
+   adapter; external wheel code executes in the importing process.
+3. Add a distinct immutable catalog artifact and conformance cases for native
+   scoring, serialization, malformed traces, deterministic replay and resource
+   limits. The source loader currently supports the reviewed eagerly imported
+   Python packages; lazy modules/native extensions need separate loader review.
+4. Qualify the actual miner/tokenizer/renderer, admission/GRAIL, training,
+   publication and resume path on the target runtime before adding an approved
+   signed profile and explicitly activating it. Catalog registration, successful
+   `Task.score` and Prime-RL configuration validation do not complete this gate.
 
 Build the CPU import image using the same installer as the runtime image:
 

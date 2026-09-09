@@ -5,6 +5,7 @@ on:
       - "reliquary/environment/**"
       - "scripts/*logic*"
       - "scripts/qualify_verifiers_interop.py"
+      - "tests/unit/test_prime_v1_interop.py"
       - "docker/logic*"
       - "docker/Dockerfile.environment-qualification"
       - ".github/workflows/verifiers-interop.yml"
@@ -50,9 +51,11 @@ jobs:
       - name: Recompute native and wire rewards with network disabled
         run: |
           docker run --rm --network none \
-            -v "${{ runner.temp }}/wheels:/wheels:ro" reliquary-native-interop:cpu \
-            sh -e -c 'python -m pip install --no-deps /wheels/reliquary_stateful_tools-0.1.0a1-py3-none-any.whl; python scripts/qualify_verifiers_interop.py --logic-wheel /wheels/reliquary_logic-0.1.0a1-py3-none-any.whl --stateful-wheel /wheels/reliquary_stateful_tools-0.1.0a1-py3-none-any.whl' \
-            > "${{ runner.temp }}/conformance.log"
+            -v "${{ runner.temp }}/wheels:/wheels:ro" \
+            -v "$PWD/tests/unit/test_prime_v1_interop.py:/tests/test_prime_v1_interop.py:ro" \
+            reliquary-native-interop:cpu \
+            sh -e -c 'python -m pip install --no-deps /wheels/reliquary_stateful_tools-0.1.0a1-py3-none-any.whl; python scripts/qualify_verifiers_interop.py --logic-wheel /wheels/reliquary_logic-0.1.0a1-py3-none-any.whl --stateful-wheel /wheels/reliquary_stateful_tools-0.1.0a1-py3-none-any.whl; python /tests/test_prime_v1_interop.py' \
+            > "${{ runner.temp }}/conformance.log" 2>&1
           cat "${{ runner.temp }}/conformance.log"
       - uses: actions/upload-artifact@v4
         if: always()
