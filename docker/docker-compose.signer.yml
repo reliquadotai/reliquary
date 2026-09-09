@@ -15,7 +15,7 @@ services:
     security_opt:
       - no-new-privileges:true
     ipc: private
-    pid: private
+    # Omit pid: Docker's default is private; an explicit "private" is invalid.
     tmpfs:
       - /tmp:rw,nosuid,nodev,noexec,size=16m,mode=0700,uid=10001,gid=10001
     pids_limit: 128
