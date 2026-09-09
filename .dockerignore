@@ -1,8 +1,12 @@
 .git
+.logic-source
 .venv
 __pycache__
 *.pyc
 *.pyo
 .pytest_cache
 docs/superpowers
-tests
+tests/*
+!tests/fixtures
+tests/fixtures/*
+!tests/fixtures/reliquarylogic_v1.jsonl

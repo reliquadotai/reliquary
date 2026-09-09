@@ -117,6 +117,52 @@ def test_execution_request_has_a_bounded_overall_batch_deadline():
     assert capped.batch_timeout_s == MAX_EXECUTOR_BATCH_TIMEOUT_SECONDS
 
 
+@pytest.mark.parametrize("timeout_s", (1, 1.0))
+def test_integer_timeout_survives_request_transport_and_validation(timeout_s):
+    from reliquary.environment.grader.executor import (
+        RemoteSandboxExecutor, SandboxBatchRequest, make_sandbox_batch_request,
+    )
+
+    request = make_sandbox_batch_request(
+        runtime_id="grader-test-v1", code="def add(a, b): return a + b",
+        cases=[_case()], timeout_s=timeout_s,
+    )
+    received = []
+
+    def handler(http_request):
+        parsed = SandboxBatchRequest.model_validate_json(http_request.content)
+        assert parsed == request
+        received.append(parsed)
+        return httpx.Response(200, json=_result(parsed).model_dump(mode="json"))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        executor = RemoteSandboxExecutor(
+            "https://cpu.internal", runtime_id=request.runtime_id, client=client,
+        )
+        assert executor.execute(request).results[0].output == 3
+    assert len(received) == 1
+    assert request.timeout_s == request.batch_timeout_s == 1.0
+
+
+@pytest.mark.parametrize("timeout_s", (5, 5.0))
+@pytest.mark.parametrize("batch_timeout_s", (5, 5.0))
+def test_explicit_integer_deadlines_bind_to_existing_float_job_id(timeout_s, batch_timeout_s):
+    from reliquary.environment.grader.executor import (
+        SandboxBatchRequest, compute_sandbox_job_id,
+    )
+
+    expected = _request()
+    payload = expected.model_dump()
+    payload.update(timeout_s=timeout_s, batch_timeout_s=batch_timeout_s)
+    payload["job_id"] = compute_sandbox_job_id(
+        protocol_version=expected.protocol_version, runtime_id=expected.runtime_id,
+        code_sha256=expected.code_sha256, cases=expected.cases,
+        timeout_s=timeout_s, batch_timeout_s=batch_timeout_s,
+    )
+    assert payload["job_id"] == expected.job_id
+    assert SandboxBatchRequest.model_validate(payload) == expected
+
+
 def test_execution_contract_rejects_expected_field_on_remote_case():
     from reliquary.environment.grader.executor import SandboxCase
 

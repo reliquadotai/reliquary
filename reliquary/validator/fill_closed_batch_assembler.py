@@ -70,11 +70,13 @@ class FillClosedBatchAssembler:
         enqueue_fn: Callable[[int, bytes], None],
         tombstone_fn: Callable[[int, bytes], None],
         window_pool: float = 1.0,
+        commit_fn: Callable[[int, bytes, bool, dict | None], None] | None = None,
     ) -> None:
         self.window_start = int(window_start)
         self._env_order = list(env_order)
         self._enqueue_fn = enqueue_fn
         self._tombstone_fn = tombstone_fn
+        self._commit_fn = commit_fn
         # R20: this window's whole emission budget. v6 has no auction --
         # and the seal path IS the auction -- so payment is computed here,
         # the only place a v6 window's ASSEMBLED batches are known. See
@@ -383,7 +385,9 @@ class FillClosedBatchAssembler:
             raise RuntimeError("prepared journal key is no longer current")
         before = self._join_state_snapshot_locked()
         try:
-            if entry.is_tombstone:
+            if self._commit_fn is not None:
+                self._commit_fn(entry.key, entry.data, entry.is_tombstone, entry.window_batches)
+            elif entry.is_tombstone:
                 self._tombstone_fn(entry.key, entry.data)
             else:
                 self._enqueue_fn(entry.key, entry.data)

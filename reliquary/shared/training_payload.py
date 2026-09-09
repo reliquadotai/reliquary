@@ -24,12 +24,13 @@ PAYLOAD_SCHEMA_VERSION = 4
 EPISODE_PAYLOAD_SCHEMA_VERSION = PAYLOAD_SCHEMA_VERSION
 LEGACY_PAYLOAD_SCHEMA_VERSION = 2
 TOMBSTONE_SCHEMA_VERSION = 2
-# Schemas 3 and 5 only ever carried the retired checkpoint-epoch binding, and
-# that regime never ran outside tests -- no archive holds one.
+# Schema 3 was also used by the original Episode ABI. Accept that unambiguous
+# shape below; epoch-bound variants and schema 5 remain retired.
 _SUPPORTED_PAYLOAD_SCHEMA_VERSIONS = {
     1,
     PAYLOAD_SCHEMA_VERSION,
     LEGACY_PAYLOAD_SCHEMA_VERSION,
+    3,
 }
 _SUPPORTED_TOMBSTONE_SCHEMA_VERSIONS = {
     1,
@@ -307,6 +308,11 @@ class DecodedPayload:
         has_episode_metadata = "assistant_spans" in header
         if header.get("checkpoint_epoch") is not None:
             raise ValueError("payload carries a retired checkpoint epoch binding")
+        if self.schema_version == 3 and not (
+            isinstance(header.get("assistant_spans"), list)
+            and any(header["assistant_spans"])
+        ):
+            raise ValueError("schema 3 requires unambiguous episode assistant spans")
         requires_targets = self.schema_version >= EPISODE_PAYLOAD_SCHEMA_VERSION or (self.schema_version == 3 and has_episode_metadata)
         self.env_targets = dict(header.get("env_targets") or {})
         if requires_targets or self.env_targets:

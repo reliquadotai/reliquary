@@ -16,7 +16,7 @@ services:
     privileged: true
     cgroup: host
     ipc: private
-    pid: private
+    # Omit pid: Docker's default is private; an explicit "private" is invalid.
     # Host networking avoids Docker's port-forwarding rules bypassing the host
     # firewall. The agent itself must bind only cpu-exec-01's private address.
     network_mode: host

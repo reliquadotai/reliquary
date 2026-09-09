@@ -19,6 +19,13 @@ from reliquary.shared.checkpoint_identity import require_checkpoint_number
 logger = logging.getLogger(__name__)
 
 
+def _publication_lr_step(restored_step: int | None) -> int | None:
+    from reliquary.validator.training import current_lr_schedule_step
+
+    current = current_lr_schedule_step()
+    return current if current is not None else restored_step
+
+
 def _profile_nonnegative_int(
     profile: Mapping[str, object],
     key: str,
@@ -156,10 +163,11 @@ def run_train_worker(*, shadow: bool = False) -> None:
         migrate_journal_cursor,
         r2_fetch_fn,
     )
-    from reliquary.trainer.publisher import TrainerPublisher
+    from reliquary.trainer.publisher import PublicationConflict, TrainerPublisher
     from reliquary.trainer.resume import resolve_resume_point
-    from reliquary.trainer.train_runner import TrainRunner
+    from reliquary.trainer.train_runner import TrainRunner, TrainerStateUnsafe
     from reliquary.trainer.worker import TrainerLockLost, TrainerWorker
+    from reliquary.validator.control import ControlStore
     from reliquary.shared.training_payload import active_training_identity
     from reliquary.validator.checkpoint_profile import (
         validate_checkpoint_profile,
@@ -175,6 +183,12 @@ def run_train_worker(*, shadow: bool = False) -> None:
     ))
     client = _r2_client()
     fetch = r2_fetch_fn(client, bucket)
+    early_publisher = TrainerPublisher(
+        repo_id=repo_id, staging_dir=str(state_dir / "staging"),
+        tokenizer=None, r2_client=client, bucket=bucket,
+    )
+    if not shadow:
+        asyncio.run(early_publisher.recover_pending())
 
     expected_identity = (
         {**active_training_identity(), "repo_id": repo_id}
@@ -287,16 +301,25 @@ def run_train_worker(*, shadow: bool = False) -> None:
     publish_state = {"checkpoint_n": checkpoint_n}
 
     def publish_fn(reason: str) -> str:
-        from reliquary.validator.training import current_lr_schedule_step
-
-        publish_state["checkpoint_n"] += 1
-        return asyncio.run(publisher.publish(
+        next_checkpoint = publish_state["checkpoint_n"] + 1
+        if publisher.has_pending():
+            recovered = asyncio.run(publisher.recover_pending())
+            if recovered is not None:
+                if (recovered["checkpoint_n"] != next_checkpoint
+                        or recovered["trained_window_cursor"] != worker.cursor):
+                    raise PublicationConflict("pending publication differs from the live trainer position")
+                publish_state["checkpoint_n"] = recovered["checkpoint_n"]
+                return recovered["revision"]
+        published = asyncio.run(publisher.publish(
             runner.model,
-            checkpoint_n=publish_state["checkpoint_n"],
-            lr_schedule_step=current_lr_schedule_step(),
+            checkpoint_n=next_checkpoint,
+            lr_schedule_step=_publication_lr_step(runner.global_step_hint),
             trained_window_cursor=worker.cursor,
             reason=reason,
+            parent_revision=worker.last_published_revision,
         ))
+        publish_state["checkpoint_n"] = next_checkpoint
+        return published
 
     def head_revision_fn() -> str | None:
         from huggingface_hub import HfApi
@@ -304,16 +327,11 @@ def run_train_worker(*, shadow: bool = False) -> None:
         try:
             return HfApi().model_info(repo_id).sha
         except Exception:
-            logger.exception("HF HEAD lookup failed; skipping guard")
+            logger.exception("HF HEAD lookup failed; publication remains blocked")
             return None
 
-    # Startup reconciliation: a crash between the HF upload and the
-    # manifest PUT leaves an orphaned HEAD that would trip the
-    # single-writer guard on every publish forever. Adopt the observed
-    # HEAD as "ours" at startup (loudly): our weights/cursor still come
-    # from the manifest, and the next publish supersedes the orphan. A
-    # REAL foreign publisher keeps moving HEAD and still trips the guard
-    # on the next in-run publish.
+    # An orphaned publication and a foreign writer are indistinguishable
+    # here. Recover the publisher's exact pending transaction explicitly.
     startup_head = head_revision_fn()
     last_revision = revision
     if (
@@ -321,13 +339,10 @@ def run_train_worker(*, shadow: bool = False) -> None:
         and revision is not None
         and startup_head != revision
     ):
-        logger.warning(
-            "HF HEAD %s != manifest revision %s at startup — adopting "
-            "HEAD (orphaned half-publish or foreign publisher; the "
-            "single-writer guard stays armed for the rest of the run)",
-            startup_head[:12], revision[:12],
+        raise TrainerLockLost(
+            f"HF HEAD {startup_head} differs from resume revision {revision}; "
+            "recover the pending publication before starting this trainer"
         )
-        last_revision = startup_head
 
     def freeze_fn() -> str | None:
         from reliquary.constants import TRAIN_UNTIL_CHECKPOINT_N
@@ -353,6 +368,9 @@ def run_train_worker(*, shadow: bool = False) -> None:
         name="trainer-cursor-queue-drain",
     ).start()
 
+    control = ControlStore(state_dir, start_closed=os.getenv(
+        "RELIQUARY_CONTROL_START_CLOSED", "0").lower() in {"1", "true", "yes", "on"})
+    control_request = control.request()
     worker = TrainerWorker(
         journal=WindowJournal(
             fetch_fn=fetch,
@@ -371,6 +389,9 @@ def run_train_worker(*, shadow: bool = False) -> None:
         shadow=shadow,
         freeze_fn=freeze_fn,
         cursor_writer=cursor_queue.write_step_cursor,
+        drain_request_fn=lambda: control_request,
+        finish_fn=runner.finish,
+        publication_pending_fn=publisher.has_pending,
     )
 
     logger.info(
@@ -380,15 +401,20 @@ def run_train_worker(*, shadow: bool = False) -> None:
     transient_failures = 0
     while True:
         try:
+            control_request = control.request()
             outcome = worker.run_once()
-        except TrainerLockLost:
-            logger.critical("trainer lock lost; exiting", exc_info=True)
+            control.report(control_request, phase=outcome,
+                           **worker.snapshot(), **runner.snapshot())
+        except (TrainerLockLost, TrainerStateUnsafe, PublicationConflict):
+            control.report(control_request, phase="unsafe", **worker.snapshot())
+            logger.critical("trainer state unsafe; exiting", exc_info=True)
             raise SystemExit(3)
         except Exception:
             # Transient R2/HF error mid-poll or mid-publish: the cursor
             # never advanced, so retrying is always safe. Backoff, don't
             # die — a process exit costs the optimizer moments.
             transient_failures += 1
+            control.report(control_request, phase="blocked", **worker.snapshot())
             delay = min(60.0, 5.0 * transient_failures)
             logger.exception(
                 "worker iteration failed (attempt %d); retrying in %.0fs",
@@ -397,7 +423,7 @@ def run_train_worker(*, shadow: bool = False) -> None:
             time.sleep(delay)
             continue
         transient_failures = 0
-        if outcome == "waited":
+        if outcome in {"waited", "closed", "drained"}:
             time.sleep(5.0)
         elif outcome == "frozen":
             time.sleep(30.0)

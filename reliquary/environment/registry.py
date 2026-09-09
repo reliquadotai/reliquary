@@ -126,10 +126,18 @@ class EnvironmentSpec:
                 "external distribution and artifact resource must be set together"
             )
         if self.external_distribution is not None:
-            if self.interaction_mode != "episode" or digest is None:
+            if digest is None:
                 raise ValueError(
-                    "external environments require episode mode and a manifest digest"
+                    "external environments require a manifest digest"
                 )
+            if self.interaction_mode == "single_turn" and (
+                self.contract_version != "reliquary/answer-json/v1"
+                or self.final_answer_policy != "json"
+                or not self.validator_authoritative_reward
+                or self.reward_lattice_policy != "binary-v1"
+                or self.attainable_rewards != (0.0, 1.0)
+            ):
+                raise ValueError("external single-turn environments require answer-json/v1 binary rewards")
 
     def create(self) -> Environment | EpisodeEnvironment:
         if self.required_data_env_var and not os.environ.get(
@@ -144,10 +152,13 @@ class EnvironmentSpec:
             )
         if self.external_distribution is not None:
             from reliquary.environment.agentic.external import (
+                load_external_answer_environment,
                 load_external_episode_environment,
             )
 
-            environment = load_external_episode_environment(self)
+            environment = (load_external_episode_environment(self)
+                           if self.interaction_mode == "episode"
+                           else load_external_answer_environment(self))
         else:
             factory = _import_attribute(self.factory_path)
             if not callable(factory):
@@ -178,6 +189,8 @@ class EnvironmentSpec:
     ) -> list[float]:
         if self.interaction_mode == "episode":
             raise TypeError("episode environments must be scored by replay")
+        if self.external_distribution and problem.get("environment") != self.name:
+            raise ValueError("external answer problem environment mismatch")
         scorer = _import_attribute(self.scorer_path)
         if not callable(scorer):
             raise TypeError(f"environment scorer {self.scorer_path!r} is not callable")
@@ -396,6 +409,24 @@ _SPEC_VALUES = (
             "9cb29e487321b2e6c005f2a1a89ccff"
             "ecf01b1c09bfd03337094e338ab912ca9"
         ),
+    ),
+    EnvironmentSpec(
+        name="reliquary_logic_v2",
+        factory_path="reliquary_logic:LogicEnvironment",
+        scorer_path="reliquary.environment.agentic.external:score_external_answers",
+        validator_authoritative_reward=True,
+        admission_resource_class="cpu",
+        termination_policy="eos_or_cap",
+        final_answer_policy="json",
+        reward_lattice_policy="binary-v1",
+        attainable_rewards=(0.0, 1.0),
+        contract_version="reliquary/answer-json/v1",
+        environment_manifest_sha256=(
+            "1e4e05cae799d8e71d8876b0f7526c5b09"
+            "ca1d5a9ab05f364fb35539288c5019"
+        ),
+        external_distribution="reliquary-logic",
+        external_artifact_resource="reliquary_logic/artifact.json",
     ),
     EnvironmentSpec(
         name="reliquary_stateful_tools_v1",

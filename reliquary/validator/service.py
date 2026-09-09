@@ -667,6 +667,12 @@ class ValidationService:
     ) -> None:
         self.wallet = wallet
         self._signer_client = signer_client
+        self._network_proof = getattr(proof_worker_pool, "is_remote", False) is True
+        if self._network_proof:
+            from reliquary.constants import DETACHED_TRAINER
+            from reliquary.validator.proof_worker import ProofModelProxy
+            if not DETACHED_TRAINER or not isinstance(model, ProofModelProxy) or KL_BASE_MODEL:
+                raise ValueError("CPU controller requires detached training and a remote model proxy")
         import importlib.metadata as _im
         try:
             reliquary_version = _im.version("reliquary")
@@ -697,8 +703,10 @@ class ValidationService:
         # verifies commitment proofs and can independently supply PPO's old
         # policy. In rolling mode it is also the KL reference; fixed mode uses
         # a separately pinned base model. Refreshed only after publication.
-        self.train_model = model
-        if model is not None:
+        self.train_model = None if self._network_proof else model
+        if self._network_proof:
+            self.verify_model = model
+        elif model is not None:
             try:
                 self.verify_model = copy.deepcopy(model)
                 self.verify_model.eval()
@@ -780,6 +788,8 @@ class ValidationService:
         self.proof_capacity_qualification = dict(
             proof_capacity_qualification or {}
         )
+        from reliquary.validator.proof_measurements import ProofMeasurements
+        self._proof_measurements = ProofMeasurements.from_environment(proof_worker_pool)
         self.proof_scheduler: GlobalProofScheduler | None = None
         if proof_devices:
             normalized_devices = tuple(
@@ -1139,7 +1149,9 @@ class ValidationService:
         execute = getattr(payload, "execute", None)
         if not callable(execute):
             raise TypeError("scheduled proof payload is not executable")
-        submission = execute(model)
+        measurements = getattr(self, "_proof_measurements", None)
+        submission = (measurements.execute(invocation, model, execute)
+                      if measurements is not None else execute(model))
         return ProofExecution(
             passed=submission is not None,
             value=submission,
@@ -1264,6 +1276,14 @@ class ValidationService:
             degraded_reasons.append("verify_checkpoint_mismatch")
         if published_revision and active_revision != published_revision:
             degraded_reasons.append("scheduler_checkpoint_mismatch")
+        pool = getattr(self, "_proof_worker_pool", None)
+        if getattr(pool, "is_shadow", False) is True:
+            snapshot["shadow_proof"] = pool.shadow_snapshot()
+        if getattr(self, "_network_proof", False):
+            remote = pool.readiness_snapshot()
+            snapshot["remote_proof"] = remote
+            if remote.get("ready") is not True:
+                degraded_reasons.append("remote_proof_unavailable")
         snapshot.update({
             "required": PROTOCOL_VERSION >= 3,
             "profile_id": PROTOCOL_PROFILE_ID,
@@ -1416,9 +1436,13 @@ class ValidationService:
             # this candidate, so a failed swap remains closed; a crash after a
             # successful install can recover the proof from this record.
             self._record_fill_closed_checkpoint_candidate(manifest)
-            await asyncio.to_thread(
-                self._refresh_verify_model_from_dir, staged_dir, revision,
-            )
+            bind = getattr(getattr(self, "_proof_worker_pool", None), "bind_checkpoint", None)
+            if callable(bind):
+                bind(checkpoint_n, repo_id, revision)
+            if not getattr(self, "_network_proof", False):
+                await asyncio.to_thread(
+                    self._refresh_verify_model_from_dir, staged_dir, revision,
+                )
             if self.proof_scheduler is not None:
                 await asyncio.to_thread(
                     self._synchronize_proof_models, revision, str(staged_dir),
@@ -1580,13 +1604,11 @@ class ValidationService:
                 "the pipelined in-process half cannot publish while the next "
                 "open is held behind its successor-checkpoint barrier"
             )
-        # Construct the queue before the HTTP server or any window.  Its
-        # fill-mode recovery pass finishes receipt-backed visible renames and
-        # rejects an unreceipted staging body, which cannot be reconciled with
-        # lost in-memory reward/index state after a process restart.
-        self._training_payload_queue_ref()
         if getattr(self, "_fill_closed_rotation_store", None) is not None:
             return
+        from reliquary.infrastructure.archive_queue import get_archive_queue
+        from reliquary.infrastructure.training_payload_queue import _default_queue_dir
+        from reliquary.validator.fill_closed_recovery import FillClosedRecoveryStore
         from reliquary.validator.fill_closed_rotation import (
             FillClosedRotationStore,
         )
@@ -1594,8 +1616,15 @@ class ValidationService:
         state_dir = Path(
             os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")
         )
+        recovery = FillClosedRecoveryStore(state_dir)
+        queue_dir = getattr(getattr(self, "_training_payload_queue", None), "queue_dir", Path(_default_queue_dir()))
+        recovery.quarantine_uncommitted(Path(queue_dir))
+        queue = self._training_payload_queue_ref()
         store = FillClosedRotationStore(state_dir)
+        for window in recovery.windows():
+            recovery.recover(window, queue=queue, archives=get_archive_queue(), rotation=store)
         gate = store.load()
+        self._fill_closed_recovery_store = recovery
         self._fill_closed_rotation_store = store
         self._fill_closed_rotation_gate = gate
 
@@ -1876,7 +1905,8 @@ class ValidationService:
             raise RuntimeError(
                 "proof scheduler requires a published checkpoint revision"
             )
-        if self._verify_model_checkpoint_revision != checkpoint_revision:
+        if (self._verify_model_checkpoint_revision != checkpoint_revision
+                and not getattr(self, "_network_proof", False)):
             raise RuntimeError(
                 "verify model weights are not certified for the checkpoint"
             )
@@ -1917,6 +1947,12 @@ class ValidationService:
             self._synchronize_proof_workers(
                 checkpoint_revision, snapshot_dir,
             )
+            if getattr(self, "_network_proof", False):
+                self._proof_worker_pool.assert_ready()
+                self._verify_model_checkpoint_revision = checkpoint_revision
+                self.server.set_proof_runtime_fingerprint(
+                    self._proof_worker_pool.runtime_fingerprint,
+                )
             scheduler.resume(checkpoint_revision)
             return
         reference_state = self.verify_model.state_dict()
@@ -1949,6 +1985,11 @@ class ValidationService:
             raise RuntimeError(
                 "scheduled proving requires a published checkpoint"
             )
+        if getattr(self, "_network_proof", False):
+            try:
+                await asyncio.to_thread(self._proof_worker_pool.assert_ready)
+            except Exception as exc:
+                raise FatalProofPlaneError("remote proof worker is unavailable") from exc
         if self._verify_model_checkpoint_revision != checkpoint.revision:
             from reliquary.constants import DETACHED_TRAINER as _detached
 
@@ -2132,7 +2173,13 @@ class ValidationService:
 
         def _download(repo_id, revision):
             from huggingface_hub import snapshot_download
-            return snapshot_download(repo_id=repo_id, revision=revision)
+            options = {}
+            if getattr(self, "_network_proof", False):
+                options["allow_patterns"] = [
+                    "reliquary_protocol_profile.json", "config.json", "generation_config.json",
+                    "tokenizer*", "special_tokens_map.json", "vocab.json", "merges.txt",
+                ]
+            return snapshot_download(repo_id=repo_id, revision=revision, **options)
 
         source = parse_resume_source(self._resume_from)
         local_path, checkpoint_n = resolve_resume_source(
@@ -2161,6 +2208,20 @@ class ValidationService:
         self._resumed_lr_schedule_step = _coerce_lr_schedule_step(
             (resumed_profile or {}).get("lr_schedule_step")
         )
+        bind = getattr(getattr(self, "_proof_worker_pool", None), "bind_checkpoint", None)
+        if callable(bind) and isinstance(source, ShaSource):
+            bind(checkpoint_n, self._checkpoint_store.repo_id, source.sha)
+        if getattr(self, "_network_proof", False):
+            if not isinstance(source, ShaSource):
+                raise ValueError("remote proof resume requires a published immutable SHA")
+            await asyncio.to_thread(self._synchronize_proof_models, source.sha)
+            entry = await asyncio.to_thread(
+                self._checkpoint_store.install_external, checkpoint_n, source.sha,
+            )
+            self._checkpoint_n = checkpoint_n
+            self.server.set_current_checkpoint(entry)
+            self._local_resume_unadvertised = False
+            return
         # Load weights — this replaces both models loaded at __init__.
         # verify_model gets the resumed weights too (so the batcher
         # verifies miners against the resumed checkpoint, which is what
@@ -2328,6 +2389,10 @@ class ValidationService:
                 "see the assembler's own log line for which)",
                 previous_assembler.window_start, remainder,
             )
+        recovery = getattr(self, "_fill_closed_recovery_store", None)
+        if FILL_CLOSED_ENABLED and recovery is not None:
+            recovery.begin(target_window, checkpoint_n=cp.checkpoint_n,
+                           revision=cp_hash, targets=dict(self.env_mix))
         fill_closed_assembler = (
             FillClosedBatchAssembler(
                 window_start=target_window,
@@ -2339,6 +2404,7 @@ class ValidationService:
                 # the only place a v6 window's assembled batches are
                 # known, and under v6 there is no auction to pay at seal.
                 window_pool=1.0,
+                commit_fn=self._commit_fill_closed_batch if recovery is not None else None,
             )
             if FILL_CLOSED_ENABLED
             else None
@@ -2390,6 +2456,11 @@ class ValidationService:
                 open_kwargs["verify_commitment_proofs_fn"] = (
                     self._remote_commitment_verifier
                 )
+                factory = getattr(self._proof_worker_pool, "verifier_for_window", None)
+                if callable(factory):
+                    open_kwargs["verify_commitment_proofs_fn"] = factory(
+                        target_window, env_name, cp_hash,
+                    )
                 # Paths that prove without naming a device — the forensic
                 # sample, and the legacy non-auction admission — fall back to
                 # the batcher's own model. In isolated mode that has to be a
@@ -4729,8 +4800,12 @@ class ValidationService:
         # Main-loop window iteration is unblocked even if R2 is down for
         # hours, and queued payloads survive process restarts.
         from reliquary.infrastructure.archive_queue import get_archive_queue
-        get_archive_queue().enqueue(first_batcher.window_start, archive)
         archived_window = int(first_batcher.window_start)
+        recovery = getattr(self, "_fill_closed_recovery_store", None)
+        if FILL_CLOSED_ENABLED and recovery is not None:
+            recovery.finish(archived_window, archive, get_archive_queue())
+        else:
+            get_archive_queue().enqueue(archived_window, archive)
         self._archive_enqueued_windows.add(archived_window)
         self._cooldown_durable_window = max(
             getattr(self, "_cooldown_durable_window", 0),
@@ -4888,6 +4963,19 @@ class ValidationService:
             key = encoded_window_journal_key(int(window_start), index)
             self._write_fill_closed_training_tombstone(key, data)
 
+    def _commit_fill_closed_batch(self, key, data, is_tombstone, batches) -> None:
+        from reliquary.constants import FILL_CLOSED_EMISSIONS_PER_WINDOW, WRITE_TRAINING_PAYLOADS
+        from reliquary.validator.fill_closed_recovery import accounting_rows
+
+        if not WRITE_TRAINING_PAYLOADS:
+            raise RuntimeError("fill-closed trainer journal writing is disabled")
+        queue = self._training_payload_queue_ref()
+        accounting = accounting_rows(batches, batch_index=key % FILL_CLOSED_EMISSIONS_PER_WINDOW)
+        if is_tombstone:
+            queue.enqueue_committed_tombstone(key, data, accounting=accounting)
+        else:
+            queue.enqueue_committed_payload(key, data, accounting=accounting)
+
     def _write_fill_closed_training_payload(
         self, key: int, data: bytes,
     ) -> None:
@@ -4953,6 +5041,18 @@ class ValidationService:
         first_batcher = next(iter(batchers.values()))
         window_start = int(first_batcher.window_start)
         if window_start in getattr(self, "_archive_enqueued_windows", set()):
+            return
+        recovery = getattr(self, "_fill_closed_recovery_store", None)
+        if FILL_CLOSED_ENABLED and recovery is not None:
+            from reliquary.infrastructure.archive_queue import get_archive_queue
+
+            recovery.quarantine_uncommitted(self._training_payload_queue_ref().queue_dir)
+            recovery.recover(window_start, queue=self._training_payload_queue_ref(),
+                             archives=get_archive_queue(), rotation=self._fill_closed_rotation_store)
+            self._fill_closed_rotation_gate = self._fill_closed_rotation_store.load()
+            getattr(self, "_fill_closed_assemblers", {}).pop(window_start, None)
+            self._archive_enqueued_windows.add(window_start)
+            self._cooldown_durable_window = max(getattr(self, "_cooldown_durable_window", 0), window_start)
             return
         iteration_stage = getattr(
             self, "_window_iteration_stage", "seal_train_archive"
@@ -5230,9 +5330,50 @@ class ValidationService:
             },
         )
 
+    async def _pause_for_control_drain(self) -> bool:
+        """Finish the owed pipeline half, then wait closed while uploads drain."""
+        from reliquary.constants import WRITE_TRAINING_PAYLOADS
+        from reliquary.infrastructure.training_payload_queue import encoded_window_journal_key
+        from reliquary.constants import FILL_CLOSED_EMISSIONS_PER_WINDOW
+
+        request = self._control_store.request()
+        if request["target_cursor"] is not None:
+            raise ValueError("validator drain does not accept a trainer target cursor")
+        if request["mode"] != "drain":
+            self._control_store.report(request, phase="running", window=self._window_n)
+            return False
+        self.server.set_active_batchers({})
+        self._set_state(WindowState.READY)
+        if self._gpu_backlog is not None:
+            batchers, window, verify_task, drops, rejects = self._gpu_backlog
+            self._control_store.report(request, phase="finishing_window", window=window)
+            self._window_iteration_stage = "pipelined_train_archive"
+            await self._train_and_publish(
+                batchers=batchers, window_n=window, verify_task=verify_task,
+                late_drops=drops, server_reject_counts=rejects,
+            )
+            self._gpu_backlog = None
+        archives = self._archive_queue.snapshot()
+        payloads = self._training_payload_queue_ref().snapshot() if WRITE_TRAINING_PAYLOADS else {"depth": 0}
+        self._control_store.report(
+            request, phase="drained" if not archives["depth"] and not payloads["depth"] else "uploading",
+            window=self._window_n, archives=archives, payloads=payloads,
+            required_trainer_cursor=encoded_window_journal_key(
+                self._window_n, FILL_CLOSED_EMISSIONS_PER_WINDOW - 1,
+            ),
+        )
+        await asyncio.sleep(2.0)
+        return True
+
     async def run(self, subtensor) -> None:
         from reliquary.infrastructure.archive_queue import get_archive_queue
+        from reliquary.validator.control import ControlStore
 
+        self._control_store = ControlStore(
+            os.getenv("RELIQUARY_STATE_DIR", "/root/reliquary/state"),
+            start_closed=os.getenv("RELIQUARY_CONTROL_START_CLOSED", "0").lower()
+            in {"1", "true", "yes", "on"},
+        )
         # Load a persisted experimental rotation barrier before any startup
         # path can construct or expose a new window.  Corrupt state raises and
         # keeps the validator closed rather than guessing past the barrier.
@@ -5243,7 +5384,6 @@ class ValidationService:
         self.server.configure_registration_gate()
         await self._refresh_registered_hotkeys(force=True, reason="startup")
         await self.server.start()
-        await self._serve_axon_on_chain(subtensor)
         await self._apply_resume_from()                  # ← resume before bootstrap
         await self._bootstrap_state_from_external()
         if (
@@ -5297,9 +5437,15 @@ class ValidationService:
         # that ships new behavior; greppable via:
         #   docker logs reliquary-trainer | grep "Reliquary build:"
         logger.info("Reliquary build: r2-reliability-suite (Layers 1+2+3)")
+        axon_served = False
         try:
             while True:
                 try:
+                    if await self._pause_for_control_drain():
+                        continue
+                    if not axon_served:
+                        await self._serve_axon_on_chain(subtensor)
+                        axon_served = True
                     # Safe to clear even in pipelined mode: at loop top the
                     # in-flight windows (stashed + about-to-open) have not
                     # archived yet, so no live entry is lost.
@@ -5501,7 +5647,8 @@ class ValidationService:
                             "this window on the SERIAL path",
                             self._window_n,
                         )
-                    if PIPELINED_WINDOWS and not self._publication_due_next_half():
+                    if (PIPELINED_WINDOWS and not self._publication_due_next_half()
+                            and self._control_store.request()["mode"] == "run"):
                         # Stash the sealed window; its GPU half runs at the
                         # top of the next iteration, after the next window's
                         # collection has opened. State is frozen at seal, so

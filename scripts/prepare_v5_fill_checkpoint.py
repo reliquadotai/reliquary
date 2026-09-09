@@ -39,6 +39,23 @@ def _json_bytes(value: dict) -> bytes:
     return (json.dumps(value, sort_keys=True, indent=2) + "\n").encode()
 
 
+def validate_v5_source(source: dict) -> None:
+    if not isinstance(source, dict):
+        raise ValueError("source checkpoint profile must be an object")
+    v5 = resolve_protocol_profile("qwen3-4b-base-dapo-reasoning-v5")
+    expected = {
+        "schema_version": 2, "profile_id": v5.profile_id,
+        "protocol_version": 5, "base_model_id": v5.model_id,
+        "base_model_revision": v5.model_revision,
+        "generation_contract_sha256": hashlib.sha256(json.dumps(
+            v5.to_generation_contract(), sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest(),
+    }
+    for key, value in expected.items():
+        if type(source.get(key)) is not type(value) or source.get(key) != value:
+            raise ValueError(f"source V5 lineage mismatch for {key}")
+
+
 def prepare_transition(source: dict, *, repo_id: str, revision: str,
                        checkpoint_n: int, last_archived_window: int) -> dict:
     """Keep weights/run/LR, advance identity, and start at the first V6 batch."""
@@ -48,8 +65,7 @@ def prepare_transition(source: dict, *, repo_id: str, revision: str,
     require_checkpoint_number(last_archived_window, field="last archived window")
     if not FILL_CLOSED_ENABLED:
         raise ValueError("select the exact fill-closed V6 profile and capability")
-    if not isinstance(source, dict):
-        raise ValueError("source checkpoint profile must be an object")
+    validate_v5_source(source)
     v5 = resolve_protocol_profile("qwen3-4b-base-dapo-reasoning-v5")
     v6 = resolve_protocol_profile("qwen3-4b-base-dapo-fill-closed-v6")
     old_contract = v5.to_generation_contract()
@@ -58,18 +74,9 @@ def prepare_transition(source: dict, *, repo_id: str, revision: str,
     if ({k: v for k, v in old_contract.items() if k not in window_fields} !=
             {k: v for k, v in new_contract.items() if k not in window_fields}):
         raise ValueError("generation semantics differ beyond the window transition")
-    expected = {
-        "schema_version": 2, "profile_id": v5.profile_id,
-        "protocol_version": 5, "base_model_id": v5.model_id,
-        "base_model_revision": v5.model_revision,
-        "generation_contract_sha256": hashlib.sha256(json.dumps(
-            old_contract, sort_keys=True, separators=(",", ":"),
-        ).encode()).hexdigest(),
-    }
-    for key, value in expected.items():
-        if type(source.get(key)) is not type(value) or source.get(key) != value:
-            raise ValueError(f"source V5 lineage mismatch for {key}")
     target = active_checkpoint_profile()
+    if target["profile_id"] != v6.profile_id:
+        raise ValueError("this continuation requires the exact Math+Code fill-closed V6 profile")
     run_id = source.get("training_run_id")
     if (not isinstance(run_id, str) or not run_id or run_id.strip() != run_id
             or run_id != target["training_run_id"]):

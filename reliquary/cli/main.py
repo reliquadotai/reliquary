@@ -638,181 +638,211 @@ def validate(
             )
             tokenizer = load_tokenizer(checkpoint, **base_load_kwargs)
 
-            # Resolve the proof plane's topology BEFORE loading this process's
-            # replica: whether the plane is isolated decides which device that
-            # replica belongs on, and "isolated" means a plane was actually
-            # built, not merely that the flag is set.
-            from reliquary.constants import DETACHED_TRAINER
-            from reliquary.validator.proof_capacity import expand_proof_slots
-            from reliquary.validator.proof_worker import (
-                assert_isolation_supported,
-                assert_proof_slots_supported,
+            from reliquary.validator.remote_proof import (
+                RemoteProofPool, ShadowProofPool, executor_mode,
             )
+            from reliquary.constants import DETACHED_TRAINER, KL_BASE_MODEL
 
-            assert_isolation_supported(
-                isolation=PROOF_PROCESS_ISOLATION,
-                detached_trainer=DETACHED_TRAINER,
-            )
-            proof_device_identities = _configured_proof_device_identities(
-                torch
-            )
-            proof_devices = tuple(
-                identity.device_id for identity in proof_device_identities
-            )
-            assert_proof_slots_supported(
-                slots_per_device=PROOF_SLOTS_PER_DEVICE,
-                isolation=PROOF_PROCESS_ISOLATION,
-                proof_devices=proof_devices,
-            )
-            # Capacity is validated against the PHYSICAL devices below and must
-            # stay that way — it is a claim about cards, not processes. Only
-            # the plane is widened to one entry per proof slot.
-            proof_slots = expand_proof_slots(
-                proof_devices, PROOF_SLOTS_PER_DEVICE
-            )
-            isolated_plane = bool(PROOF_PROCESS_ISOLATION and proof_slots)
-
-            # The CPU move turns VRAM into a permanent host-RSS floor. Say so
-            # before paying for it, not hours later through an OOM restart.
-            from reliquary.constants import KL_BASE_MODEL as _kl_base
-            from reliquary.validator.proof_worker import (
-                assert_host_memory_for_cpu_replicas,
-            )
-
-            assert_host_memory_for_cpu_replicas(
-                isolated_plane=isolated_plane,
-                kl_base_model=bool(_kl_base),
-            )
-            model = load_validator_replica(
-                checkpoint,
-                isolated_plane=isolated_plane,
-                **base_load_kwargs,
-            )
-
-            proof_capacity_qualification = None
-            if PROTOCOL_VERSION >= 3:
-                from reliquary.shared.runtime_fingerprint import (
-                    collect_runtime_fingerprint,
-                )
-                from reliquary.validator.observability import (
-                    immutable_build_revision,
-                )
-                from reliquary.validator.proof_capacity import (
-                    load_proof_capacity_qualification,
-                )
-
-                manifest_path = os.environ.get(
-                    "RELIQUARY_PROOF_CAPACITY_MANIFEST", ""
-                ).strip()
-                manifest_sha256 = os.environ.get(
-                    "RELIQUARY_PROOF_CAPACITY_MANIFEST_SHA256", ""
-                ).strip()
-                if not manifest_path or not manifest_sha256:
+            proof_mode = executor_mode()
+            remote_pool = None
+            if proof_mode != "local":
+                if not DETACHED_TRAINER or KL_BASE_MODEL:
                     raise RuntimeError(
-                        f"{PROTOCOL_PROFILE_ID} requires a pinned "
-                        "proof-capacity manifest"
+                        "remote/shadow proofs require detached training and no "
+                        "controller-side fixed KL model"
                     )
-                qualification = load_proof_capacity_qualification(
-                    manifest_path,
-                    expected_sha256=manifest_sha256,
+                remote_pool = RemoteProofPool.from_environment(repo_id=hf_repo_id)
+                remote_pool.start()
+            if proof_mode == "remote":
+                proof_worker_pool = remote_pool
+                proof_slots = remote_pool.devices
+                proof_models = remote_pool.proxies()
+                model = next(iter(proof_models.values()))
+                proof_capacity_qualification = remote_pool.qualify(
+                    activation_checkpoint_revision,
                 )
-                hardware = tuple(
-                    identity.hardware_class
-                    for identity in proof_device_identities
-                )
-                device_uuids = tuple(
-                    identity.device_uuid
-                    for identity in proof_device_identities
-                )
-                runtime_fingerprint_hash = collect_runtime_fingerprint(
-                    generation_model=model,
-                    proof_model=model,
-                )["profile_hash"]
-                from reliquary.validator.proof_capacity import (
-                    compute_proof_path_hash,
-                )
-
-                proof_capacity_qualification = qualification.validate(
-                    profile_id=PROTOCOL_PROFILE_ID,
-                    model_revision=PROTOCOL_MODEL_REVISION,
-                    software_revision=immutable_build_revision(),
-                    checkpoint_revision=(
-                        activation_checkpoint_revision or ""
-                    ),
-                    runtime_fingerprint_hash=runtime_fingerprint_hash,
-                    proof_path_hash=compute_proof_path_hash(),
-                    configured_devices=proof_devices,
-                    configured_hardware=hardware,
-                    configured_device_uuids=device_uuids,
-                    proof_wall_seconds=MAX_PROOF_WALL_SECONDS,
-                    minimum_proofs_per_environment=(
-                        MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW
-                        + FORENSIC_SAMPLE_PER_WINDOW
-                    ),
-                    minimum_completion_tokens_per_environment={
-                        environment: math.ceil(cap * 0.9)
-                        for environment, cap in (
-                            MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV.items()
-                        )
-                    },
-                )
-                carried_from = proof_capacity_qualification.get(
-                    "qualification_carried_over_from"
-                )
-                if carried_from:
-                    logger.info(
-                        "Proof capacity qualification carried over from "
-                        "image %s: this image's proof path is byte-identical",
-                        carried_from,
-                    )
-                logger.info(
-                    "Proof capacity qualified: %s",
-                    proof_capacity_qualification,
-                )
-            proof_models = {}
-            proof_worker_pool = None
-            if isolated_plane:
-                # The proof plane leaves this interpreter: every replica is
-                # loaded by a worker, this process keeps its own pair on the
-                # CPU, and the event loop can no longer convoy a proof thread
-                # off the GIL. Several slots may share one card.
-                from reliquary.validator.proof_worker import (
-                    build_isolated_proof_plane,
-                )
-
-                logger.info(
-                    "Starting isolated proof plane: %d slot(s) over %d GPU(s) "
-                    "(%s); replicas load in the workers",
-                    len(proof_slots),
-                    len(proof_devices),
-                    ", ".join(proof_slots),
-                )
-                proof_worker_pool, proof_models = build_isolated_proof_plane(
-                    devices=proof_slots,
-                    checkpoint=checkpoint,
-                    load_kwargs=base_load_kwargs,
-                    reference_model=model,
-                )
-                proof_worker_pool.start()
-                logger.info(
-                    "Isolated proof plane ready on %s",
-                    ", ".join(proof_slots),
-                )
+                logger.info("CPU controller: remote proof slots %s", proof_slots)
             else:
-                for device in proof_devices:
-                    if device == "cuda:0":
-                        continue
-                    logger.info(
-                        "Loading frozen proof replica on %s from %s",
-                        device,
-                        checkpoint,
+                # Resolve the proof plane's topology BEFORE loading this process's
+                # replica: whether the plane is isolated decides which device that
+                # replica belongs on, and "isolated" means a plane was actually
+                # built, not merely that the flag is set.
+                from reliquary.constants import DETACHED_TRAINER
+                from reliquary.validator.proof_capacity import expand_proof_slots
+                from reliquary.validator.proof_worker import (
+                    assert_isolation_supported,
+                    assert_proof_slots_supported,
+                )
+
+                assert_isolation_supported(
+                    isolation=PROOF_PROCESS_ISOLATION,
+                    detached_trainer=DETACHED_TRAINER,
+                )
+                proof_device_identities = _configured_proof_device_identities(
+                    torch
+                )
+                proof_devices = tuple(
+                    identity.device_id for identity in proof_device_identities
+                )
+                assert_proof_slots_supported(
+                    slots_per_device=PROOF_SLOTS_PER_DEVICE,
+                    isolation=PROOF_PROCESS_ISOLATION,
+                    proof_devices=proof_devices,
+                )
+                # Capacity is validated against the PHYSICAL devices below and must
+                # stay that way — it is a claim about cards, not processes. Only
+                # the plane is widened to one entry per proof slot.
+                proof_slots = expand_proof_slots(
+                    proof_devices, PROOF_SLOTS_PER_DEVICE
+                )
+                isolated_plane = bool(PROOF_PROCESS_ISOLATION and proof_slots)
+
+                # The CPU move turns VRAM into a permanent host-RSS floor. Say so
+                # before paying for it, not hours later through an OOM restart.
+                from reliquary.constants import KL_BASE_MODEL as _kl_base
+                from reliquary.validator.proof_worker import (
+                    assert_host_memory_for_cpu_replicas,
+                )
+
+                assert_host_memory_for_cpu_replicas(
+                    isolated_plane=isolated_plane,
+                    kl_base_model=bool(_kl_base),
+                )
+                model = load_validator_replica(
+                    checkpoint,
+                    isolated_plane=isolated_plane,
+                    **base_load_kwargs,
+                )
+
+                proof_capacity_qualification = None
+                if PROTOCOL_VERSION >= 3:
+                    from reliquary.shared.runtime_fingerprint import (
+                        collect_runtime_fingerprint,
                     )
-                    proof_models[device] = load_text_generation_model(
-                        checkpoint,
-                        torch_dtype=torch.bfloat16,
-                        attn_implementation=ATTN_IMPLEMENTATION,
-                        **base_load_kwargs,
-                    ).to(device).eval()
+                    from reliquary.validator.observability import (
+                        immutable_build_revision,
+                    )
+                    from reliquary.validator.proof_capacity import (
+                        load_proof_capacity_qualification,
+                    )
+
+                    manifest_path = os.environ.get(
+                        "RELIQUARY_PROOF_CAPACITY_MANIFEST", ""
+                    ).strip()
+                    manifest_sha256 = os.environ.get(
+                        "RELIQUARY_PROOF_CAPACITY_MANIFEST_SHA256", ""
+                    ).strip()
+                    if not manifest_path or not manifest_sha256:
+                        raise RuntimeError(
+                            f"{PROTOCOL_PROFILE_ID} requires a pinned "
+                            "proof-capacity manifest"
+                        )
+                    qualification = load_proof_capacity_qualification(
+                        manifest_path,
+                        expected_sha256=manifest_sha256,
+                    )
+                    hardware = tuple(
+                        identity.hardware_class
+                        for identity in proof_device_identities
+                    )
+                    device_uuids = tuple(
+                        identity.device_uuid
+                        for identity in proof_device_identities
+                    )
+                    runtime_fingerprint_hash = collect_runtime_fingerprint(
+                        generation_model=model,
+                        proof_model=model,
+                    )["profile_hash"]
+                    from reliquary.validator.proof_capacity import (
+                        compute_proof_path_hash,
+                    )
+
+                    proof_capacity_qualification = qualification.validate(
+                        profile_id=PROTOCOL_PROFILE_ID,
+                        model_revision=PROTOCOL_MODEL_REVISION,
+                        software_revision=immutable_build_revision(),
+                        checkpoint_revision=(
+                            activation_checkpoint_revision or ""
+                        ),
+                        runtime_fingerprint_hash=runtime_fingerprint_hash,
+                        proof_path_hash=compute_proof_path_hash(),
+                        configured_devices=proof_devices,
+                        configured_hardware=hardware,
+                        configured_device_uuids=device_uuids,
+                        proof_wall_seconds=MAX_PROOF_WALL_SECONDS,
+                        minimum_proofs_per_environment=(
+                            MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW
+                            + FORENSIC_SAMPLE_PER_WINDOW
+                        ),
+                        minimum_completion_tokens_per_environment={
+                            environment: math.ceil(cap * 0.9)
+                            for environment, cap in (
+                                MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV.items()
+                            )
+                        },
+                    )
+                    carried_from = proof_capacity_qualification.get(
+                        "qualification_carried_over_from"
+                    )
+                    if carried_from:
+                        logger.info(
+                            "Proof capacity qualification carried over from "
+                            "image %s: this image's proof path is byte-identical",
+                            carried_from,
+                        )
+                    logger.info(
+                        "Proof capacity qualified: %s",
+                        proof_capacity_qualification,
+                    )
+                proof_models = {}
+                proof_worker_pool = None
+                if isolated_plane:
+                    # The proof plane leaves this interpreter: every replica is
+                    # loaded by a worker, this process keeps its own pair on the
+                    # CPU, and the event loop can no longer convoy a proof thread
+                    # off the GIL. Several slots may share one card.
+                    from reliquary.validator.proof_worker import (
+                        build_isolated_proof_plane,
+                    )
+
+                    logger.info(
+                        "Starting isolated proof plane: %d slot(s) over %d GPU(s) "
+                        "(%s); replicas load in the workers",
+                        len(proof_slots),
+                        len(proof_devices),
+                        ", ".join(proof_slots),
+                    )
+                    proof_worker_pool, proof_models = build_isolated_proof_plane(
+                        devices=proof_slots,
+                        checkpoint=checkpoint,
+                        load_kwargs=base_load_kwargs,
+                        reference_model=model,
+                    )
+                    proof_worker_pool.start()
+                    logger.info(
+                        "Isolated proof plane ready on %s",
+                        ", ".join(proof_slots),
+                    )
+                else:
+                    for device in proof_devices:
+                        if device == "cuda:0":
+                            continue
+                        logger.info(
+                            "Loading frozen proof replica on %s from %s",
+                            device,
+                            checkpoint,
+                        )
+                        proof_models[device] = load_text_generation_model(
+                            checkpoint,
+                            torch_dtype=torch.bfloat16,
+                            attn_implementation=ATTN_IMPLEMENTATION,
+                            **base_load_kwargs,
+                        ).to(device).eval()
+
+                if proof_mode == "shadow":
+                    if proof_worker_pool is None:
+                        raise RuntimeError("shadow proofs require local process isolation")
+                    proof_worker_pool = ShadowProofPool(proof_worker_pool, remote_pool)
 
             service = ValidationService(
                 wallet,
@@ -871,6 +901,13 @@ def validate(
             await validator.run()
 
     _run_validator_event_loop(_run())
+
+
+@app.command("proof-worker")
+def proof_worker() -> None:
+    """Serve typed GRAIL proofs on a dedicated, mutually authenticated GPU host."""
+    from reliquary.validator.remote_proof_server import main
+    main()
 
 
 @app.command("train-worker")

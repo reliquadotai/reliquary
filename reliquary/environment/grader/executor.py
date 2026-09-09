@@ -133,8 +133,10 @@ def compute_sandbox_job_id(
         "runtime_id": runtime_id,
         "code_sha256": code_sha256,
         "cases": [case.model_dump(mode="json") for case in cases],
-        "timeout_s": timeout_s,
-        "batch_timeout_s": batch_timeout_s,
+        # Strict Pydantic float fields still accept ints and normalize to float.
+        # Bind the same numeric representation before and after wire validation.
+        "timeout_s": float(timeout_s),
+        "batch_timeout_s": float(batch_timeout_s),
     }
     return hashlib.sha256(_canonical_json(material)).hexdigest()
 

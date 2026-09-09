@@ -1,0 +1,71 @@
+name: Native Verifiers interoperability
+on:
+  pull_request:
+    paths:
+      - "reliquary/environment/**"
+      - "scripts/*logic*"
+      - "scripts/qualify_verifiers_interop.py"
+      - "tests/unit/test_prime_v1_interop.py"
+      - "docker/logic*"
+      - "docker/Dockerfile.environment-qualification"
+      - ".github/workflows/verifiers-interop.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  installed-wheel-cpu:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read reviewed external source
+        id: logic
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          from pathlib import Path
+          pin = json.loads(Path('docker/logic-release.json').read_text())
+          print('source_commit=' + pin['source_commit'])
+          PY
+      - uses: actions/checkout@v4
+        with:
+          repository: reliquadotai/reliquary-environments
+          ref: ${{ steps.logic.outputs.source_commit }}
+          path: .logic-source
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.11.10"
+          python-version: "3.12"
+      - name: Reproduce the reviewed Logic wheel
+        working-directory: .logic-source
+        run: uv run --no-project --python 3.12 python scripts/build_logic_release.py --output "${{ runner.temp }}/wheels"
+      - name: Obtain the second pinned native Taskset
+        run: |
+          curl -fsSL https://github.com/reliquadotai/reliquary-environments/releases/download/v0.1.0a1/reliquary_stateful_tools-0.1.0a1-py3-none-any.whl -o "${{ runner.temp }}/wheels/reliquary_stateful_tools-0.1.0a1-py3-none-any.whl"
+          echo 'f4d5480e57e66265faa78c53e36fa8ab781afe0ae907d7dc5749d2b0f9344155  ${{ runner.temp }}/wheels/reliquary_stateful_tools-0.1.0a1-py3-none-any.whl' | sha256sum -c -
+      - name: Build the same installer used by the optional runtime variant
+        run: |
+          docker build -f docker/Dockerfile.environment-qualification \
+            --secret id=logic_wheel,src="${{ runner.temp }}/wheels/reliquary_logic-0.1.0a1-py3-none-any.whl" \
+            -t reliquary-native-interop:cpu .
+      - name: Recompute native and wire rewards with network disabled
+        run: |
+          docker run --rm --network none \
+            -v "${{ runner.temp }}/wheels:/wheels:ro" \
+            -v "$PWD/tests/unit/test_prime_v1_interop.py:/tests/test_prime_v1_interop.py:ro" \
+            reliquary-native-interop:cpu \
+            sh -e -c 'python -m pip install --no-deps /wheels/reliquary_stateful_tools-0.1.0a1-py3-none-any.whl; python scripts/qualify_verifiers_interop.py --logic-wheel /wheels/reliquary_logic-0.1.0a1-py3-none-any.whl --stateful-wheel /wheels/reliquary_stateful_tools-0.1.0a1-py3-none-any.whl; python /tests/test_prime_v1_interop.py' \
+            > "${{ runner.temp }}/conformance.log" 2>&1
+          cat "${{ runner.temp }}/conformance.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-verifiers-conformance-${{ github.sha }}
+          path: ${{ runner.temp }}/conformance.log
+      - name: Resolve the three-environment V1 profile against the installed wheel
+        run: |
+          docker run --rm --network none \
+            -e RELIQUARY_PROTOCOL_PROFILE=qwen3-4b-base-dapo-reliquary-v1 \
+            -e RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED=1 \
+            reliquary-native-interop:cpu python -c \
+            'from reliquary import constants as c; from scripts.install_logic_runtime import verify_runtime; assert len(c.ENVIRONMENT_MIX) == 3; assert c.M_ROLLOUTS == 16 and c.B_BATCH == 16 and c.FILL_CLOSED_ENABLED; print(verify_runtime()); print(c.PROTOCOL_PROFILE_ID, c.ENVIRONMENT_MIX)'

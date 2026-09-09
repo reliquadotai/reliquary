@@ -74,6 +74,7 @@ def _load_samples(
     runtime_fingerprint_hash: str,
     hardware_class: str,
     benchmark_device_count: int,
+    remote_proof: dict | None = None,
 ) -> tuple[
     dict[str, dict[str, list[float]]],
     tuple[str, ...],
@@ -128,6 +129,8 @@ def _load_samples(
                 raise ValueError(
                     f"{field} mismatch at line {line_number}"
                 )
+        if remote_proof is not None and row.get("remote_proof") != remote_proof:
+            raise ValueError(f"remote proof measurement mismatch at line {line_number}")
         if row.get("rollout_count") != ROLLOUTS_PER_PROOF:
             raise ValueError(
                 f"rollout_count mismatch at line {line_number}"
@@ -191,6 +194,8 @@ def main() -> int:
     parser.add_argument("--benchmark-device-count", type=int, required=True)
     parser.add_argument("--measured-at", required=True)
     parser.add_argument("--headroom", type=float, default=0.2)
+    parser.add_argument("--remote-proof-worker-id",
+                        help="Require every source sample to cover validator end-to-end mTLS proof execution")
     args = parser.parse_args()
 
     if PROTOCOL_VERSION < 3:
@@ -222,6 +227,12 @@ def main() -> int:
             "--runtime-fingerprint-hash must be lowercase SHA-256"
         )
 
+    remote_proof = None
+    if args.remote_proof_worker_id:
+        from reliquary.validator.remote_proof_protocol import RemoteProofMeasurement, transport_hash
+        remote_proof = RemoteProofMeasurement(
+            worker_id=args.remote_proof_worker_id, transport_sha256=transport_hash(),
+        ).model_dump()
     source_payload = args.samples.read_bytes()
     samples, benchmark_device_uuids, minimum_completion_tokens = _load_samples(
         args.samples,
@@ -230,6 +241,7 @@ def main() -> int:
         runtime_fingerprint_hash=args.runtime_fingerprint_hash,
         hardware_class=args.hardware_class,
         benchmark_device_count=args.benchmark_device_count,
+        remote_proof=remote_proof,
     )
     p95_by_environment_and_device = {
         environment: {
@@ -299,6 +311,8 @@ def main() -> int:
         # qualification over instead of re-benchmarking.
         "proof_path_hash": compute_proof_path_hash(),
     }
+    if remote_proof is not None:
+        manifest["remote_proof"] = remote_proof
     qualification = ProofCapacityQualification.from_mapping(manifest)
     # Validate the benchmark fleet itself. A manifest that already needs more
     # devices than were exercised is not qualification evidence.

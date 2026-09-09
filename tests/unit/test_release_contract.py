@@ -57,7 +57,7 @@ def test_release_contract_round_trip_and_hash_vector_are_stable() -> None:
 
     assert parse_release_contract(release.to_bytes()) == release
     assert release.canonical_sha256 == (
-        "05cb885b71e347310e4e1b0df02f44f802f5212142e0f71911e92a36ad4f988a"
+        "e12491f2157999c3b5c1035c76eaf7656b4ade05d0c84bb356001c3b6530793f"
     )
 
 
@@ -115,8 +115,8 @@ def test_component_ids_are_globally_unique() -> None:
 def test_capabilities_replace_numeric_feature_dispatch() -> None:
     release = _release()
 
-    assert release.supports(CAP_FRESH_POST_SEAL_ORDERING)
-    assert not release.supports("market.fill-closed-rate/v1")
+    assert not release.supports(CAP_FRESH_POST_SEAL_ORDERING)
+    assert release.supports("market.fill-closed-rate/v1")
 
     source = inspect.getsource(release_contract_module)
     assert "protocol_version" not in source

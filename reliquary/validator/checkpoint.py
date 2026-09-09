@@ -295,4 +295,6 @@ def _default_save_hf_format(model: Any, tokenizer: Any, path: Path) -> None:
     # safe_serialization=True writes a real safetensors file, not a torch pickle.
     model.save_pretrained(path, safe_serialization=True)
     if tokenizer is not None:
-        tokenizer.save_pretrained(path)
+        from reliquary.shared.modeling import save_tokenizer
+
+        save_tokenizer(tokenizer, path)

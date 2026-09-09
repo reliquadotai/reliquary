@@ -342,11 +342,15 @@ class TrainingPayloadQueue:
         receipt: Any, *, source: str,
     ) -> dict[str, Any]:
         fields = {"schema_version", "journal_key", "kind", "sha256", "size"}
+        if isinstance(receipt, dict) and receipt.get("schema_version") == 2:
+            fields.add("accounting")
         if not isinstance(receipt, dict) or set(receipt) != fields:
             raise RuntimeError(f"journal commit receipt {source} has invalid fields")
         schema_version = receipt.get("schema_version")
-        if type(schema_version) is not int or schema_version != 1:
+        if type(schema_version) is not int or schema_version not in {1, 2}:
             raise RuntimeError(f"journal commit receipt {source} has invalid schema")
+        if schema_version == 2 and not isinstance(receipt["accounting"], list):
+            raise RuntimeError(f"journal commit receipt {source} has invalid accounting")
         slot = receipt.get("journal_key")
         size = receipt.get("size")
         kind = receipt.get("kind")
@@ -482,6 +486,7 @@ class TrainingPayloadQueue:
         data: bytes,
         *,
         is_tombstone: bool,
+        accounting: list[dict] | None = None,
     ) -> Path:
         """Create one immutable fill-closed journal slot.
 
@@ -517,6 +522,11 @@ class TrainingPayloadQueue:
             "sha256": digest,
             "size": len(body),
         }
+        if accounting is not None:
+            receipt.update(schema_version=2, accounting=accounting)
+        receipt_bytes = json.dumps(
+            receipt, sort_keys=True, separators=(",", ":"), allow_nan=False,
+        ).encode("utf-8")
 
         with self._journal_commit_lock:
             try:
@@ -531,13 +541,7 @@ class TrainingPayloadQueue:
                 existing_receipt = self._validate_journal_receipt(
                     existing_receipt, source=receipt_path.name,
                 )
-                expected = {
-                    "schema_version": 1,
-                    "journal_key": slot,
-                    "kind": kind,
-                    "sha256": digest,
-                    "size": len(body),
-                }
+                expected = receipt
                 if existing_receipt != expected:
                     raise RuntimeError(
                         f"journal key {slot} already has a different commit"
@@ -586,9 +590,7 @@ class TrainingPayloadQueue:
                 )
             self._enqueue_durable(
                 str(Path("journal_commits") / receipt_path.name),
-                json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode(
-                    "utf-8"
-                ),
+                receipt_bytes,
             )
             # A legacy/pre-staging artifact may have been uploaded while the
             # receipt was written.  Otherwise publish the hidden body now.
@@ -602,18 +604,20 @@ class TrainingPayloadQueue:
             )
             return final_path
 
-    def enqueue_committed_payload(self, window_start: int, data: bytes) -> Path:
+    def enqueue_committed_payload(
+        self, window_start: int, data: bytes, *, accounting: list[dict] | None = None,
+    ) -> Path:
         """Durably create or byte-identically replay one payload slot."""
         return self._enqueue_committed_journal_entry(
-            window_start, data, is_tombstone=False,
+            window_start, data, is_tombstone=False, accounting=accounting,
         )
 
     def enqueue_committed_tombstone(
-        self, window_start: int, data: bytes,
+        self, window_start: int, data: bytes, *, accounting: list[dict] | None = None,
     ) -> Path:
         """Durably create or byte-identically replay one tombstone slot."""
         return self._enqueue_committed_journal_entry(
-            window_start, data, is_tombstone=True,
+            window_start, data, is_tombstone=True, accounting=accounting,
         )
 
 

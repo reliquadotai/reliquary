@@ -35,6 +35,9 @@ class TrainerWorker:
         shadow: bool = False,
         freeze_fn: Callable[[], str | None] | None = None,
         cursor_writer: Callable[[int], None] | None = None,
+        drain_request_fn: Callable[[], dict] | None = None,
+        finish_fn: Callable[[], bool] | None = None,
+        publication_pending_fn: Callable[[], bool] | None = None,
     ) -> None:
         self._journal = journal
         self._train_fn = train_fn
@@ -46,6 +49,10 @@ class TrainerWorker:
         self.last_published_revision = last_published_revision
         self.shadow = bool(shadow)
         self._freeze_fn = freeze_fn
+        self._drain_request_fn = drain_request_fn
+        self._finish_fn = finish_fn
+        self._publication_pending_fn = publication_pending_fn
+        self._published_cursor = self.cursor
         # Amendment v6.1 (trainer-paced picks): advisory pacing telemetry,
         # written every time the journal cursor advances -- unconditional
         # on every profile. The trainer has no notion of FILL_CLOSED and
@@ -91,16 +98,21 @@ class TrainerWorker:
             or self.adaptive_publication_pending
         )
 
-    def _publish(self) -> str:
+    def _publish(self, reason: str | None = None) -> str:
         if self.shadow:
             # Shadow mode trains but never publishes; reset counters so
             # the loop keeps consuming.
             self.trained_since_publish = 0
             self.adaptive_publication_pending = False
+            self._published_cursor = self.cursor
             return "published"
-        head = self._head_revision_fn()
+        pending = self._publication_pending_fn is not None and self._publication_pending_fn()
+        head = self._head_revision_fn() if not pending else None
+        if head is None and not pending:
+            raise RuntimeError("checkpoint repo HEAD unavailable; refusing unguarded publication")
         if (
             self.last_published_revision is not None
+            and not pending
             and head is not None
             and head != self.last_published_revision
         ):
@@ -108,13 +120,14 @@ class TrainerWorker:
                 f"checkpoint repo HEAD {head!r} is not ours "
                 f"({self.last_published_revision!r}); refusing to publish"
             )
-        reason = (
+        reason = reason or (
             "adaptive_policy_ratio_drift"
             if self.adaptive_publication_pending else "cadence"
         )
         self.last_published_revision = self._publish_fn(reason)
         self.trained_since_publish = 0
         self.adaptive_publication_pending = False
+        self._published_cursor = self.cursor
         return "published"
 
     def run_once(self) -> str:
@@ -126,6 +139,22 @@ class TrainerWorker:
             if reason:
                 logger.warning("trainer frozen: %s", reason)
                 return "frozen"
+        if self._drain_request_fn is not None:
+            request = self._drain_request_fn()
+            if request["mode"] == "drain":
+                target = request["target_cursor"]
+                if target is None:
+                    return "closed"
+                if target < self.cursor or (target - self.cursor) % self.stride:
+                    raise ValueError("drain cursor is behind the trainer or misaligned")
+                if target == self.cursor:
+                    if self._finish_fn is None:
+                        raise RuntimeError("trainer drain requires accumulator flush wiring")
+                    if self._finish_fn():
+                        self.trained_since_publish += 1
+                    if self.trained_since_publish or self._published_cursor != self.cursor:
+                        return self._publish("cutover_drain")
+                    return "drained"
         if self._publication_due():
             return self._publish()
         entry = self._journal.next_entry(self.cursor, stride=self.stride)

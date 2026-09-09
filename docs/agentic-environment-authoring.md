@@ -102,7 +102,11 @@ without the corresponding contract update prevents the process from starting.
 
 - `agentic/adapters/mcp.py` converts public MCP tool-list/tool-call shapes.
 - `agentic/adapters/prime_v1.py` exports JSON-native Task/Trace material for a
-  pinned Prime Verifiers v1 integration.
+  pinned Prime Verifiers v1 integration. The optional `native_prime_v1_trace`
+  and `actions_from_prime_v1_trace` bridge uses actual native objects; it follows
+  the final branch and replays only sampled assistant actions. The legacy
+  `export_prime_v1_*` dictionaries alone do not establish native compatibility.
+  See [pinned CPU qualification and onboarding gates](standalone-environment-qualification.md).
 
 Adapters must not bypass Reliquary replay, manifests, signatures or reward
 checks. External packages should be pinned by exact commit in the deployment

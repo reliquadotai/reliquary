@@ -5,6 +5,7 @@ FROM ${GRADER_PY_IMAGE} AS grader-rootfs
 FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu24.04
 
 ARG RELIQUARY_BUILD_REVISION=unknown
+ARG RELIQUARY_INSTALL_LOGIC=0
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -60,6 +61,19 @@ RUN pip install boto3
 # wandb for trainer telemetry (lazy-imported in reliquary.validator.telemetry).
 # No-op at runtime if WANDB_API_KEY is unset.
 RUN pip install wandb
+
+# Explicit candidate variant only. Hash-check before install, then verify the
+# installed artifact/import/reward. A local release candidate can be supplied
+# with --secret id=logic_wheel,src=/absolute/path/to/the/reviewed.whl.
+RUN --mount=type=secret,id=logic_wheel,target=/tmp/logic.whl \
+    case "${RELIQUARY_INSTALL_LOGIC}" in \
+      0) ;; \
+      1) if [ -f /tmp/logic.whl ]; then \
+           python scripts/install_logic_runtime.py --wheel /tmp/logic.whl; \
+         else python scripts/install_logic_runtime.py; fi ;; \
+      *) echo "RELIQUARY_INSTALL_LOGIC must be 0 or 1" >&2; exit 2 ;; \
+    esac
+LABEL ai.reliquary.logic-runtime="${RELIQUARY_INSTALL_LOGIC}"
 
 # ────────────────  GRADER SANDBOX  ────────────────
 # Install gVisor (runsc) for the OpenCodeInstruct env's sandbox.

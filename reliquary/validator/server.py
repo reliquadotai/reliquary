@@ -1612,10 +1612,18 @@ class ValidatorServer:
         self._active_batchers = batchers
         # Legacy scalar: first batcher in dict (or None if empty).
         self.active_batcher = next(iter(batchers.values())) if batchers else None
-        if self.active_batcher is not None:
+        if self.active_batcher is not None and not getattr(self, "_proof_runtime_override", False):
             self._runtime_fingerprint = collect_runtime_fingerprint(
                 proof_model=getattr(self.active_batcher, "model", None),
             )
+
+    def set_proof_runtime_fingerprint(self, value: dict) -> None:
+        """Publish the acknowledged GPU runtime, never the CPU controller's."""
+        from reliquary.shared.runtime_fingerprint import runtime_profile_hash
+        if value.get("cuda_available") is not True or value.get("profile_hash") != runtime_profile_hash(value):
+            raise ValueError("invalid remote proof runtime fingerprint")
+        self._runtime_fingerprint = dict(value)
+        self._proof_runtime_override = True
 
 
     def set_active_batcher(self, batcher: GrpoWindowBatcher | None) -> None:
@@ -4030,6 +4038,8 @@ class ValidatorServer:
                     scheduler = self._proof_scheduler_health_callback()
                     if scheduler.get("required") and scheduler.get("state") != "running":
                         reasons.append("proof_scheduler_unavailable")
+                    if scheduler.get("remote_proof", {}).get("ready") is False:
+                        reasons.append("remote_proof_unavailable")
             except Exception:
                 reasons.append("local_health_unavailable")
             return JSONResponse(

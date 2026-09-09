@@ -6,6 +6,108 @@ New environment source belongs in
 [reliquary-environments](https://github.com/reliquadotai/reliquary-environments),
 not in Reliquary core; the embedded v1 suite remains a historical implementation.
 
+## Logic candidate and native Verifiers interoperability
+
+`reliquary_logic_v2` is a single-turn CPU environment with the
+`reliquary/answer-json/v1` ABI. Its signed profile eligibility is separate from
+installing the wheel and from enabling fill-closed operation. The existing
+Stateful Tools wheel remains an optional conformance fixture outside that
+profile; it does not add a fourth training environment.
+
+The candidate pin is committed in `docker/logic-release.json`:
+
+- External source: `f95be97372a9b114376657f075fd0d00b88eb563`.
+- Planned release tag: `logic-v0.1.0a1` (the source/candidate build is usable
+  before publication; the release URL is usable only after that tag is published).
+- Wheel: `reliquary_logic-0.1.0a1-py3-none-any.whl`.
+- Wheel SHA-256: `d12e4258fa9b190f29a33a055cee11ae632d813aed5f51b28a20a3727212b527`.
+- Artifact SHA-256: `1e4e05cae799d8e71d8876b0f7526c5b09ca1d5a9ab05f364fb35539288c5019`.
+- Factory: `reliquary_logic:LogicEnvironment`; native Taskset:
+  `reliquary_logic:LogicTaskset`.
+
+From a clean checkout of the exact external source, build the candidate with
+`uv run --no-project --python 3.12 python scripts/build_logic_release.py --output /absolute/empty/output`.
+The builder verifies two byte-identical builds against the reviewed hashes.
+It emits the wheel, `release.json` and relative `SHA256SUMS`. Source changes
+require a reviewed release pin; never substitute a wheel under an existing pin.
+
+In a dedicated Python 3.12 virtual environment containing pip, install from
+that candidate and run conformance from the core checkout:
+
+```sh
+python scripts/install_logic_runtime.py --wheel /absolute/output/reliquary_logic-0.1.0a1-py3-none-any.whl
+# Obtain the already published Stateful Tools fixture with the downloader below,
+# then install its verified wheel with --no-deps in this same isolated environment.
+python scripts/qualify_verifiers_interop.py \
+  --logic-wheel /absolute/output/reliquary_logic-0.1.0a1-py3-none-any.whl \
+  --stateful-wheel /absolute/output/reliquary_stateful_tools-0.1.0a1-py3-none-any.whl
+```
+
+The installer checks the wheel hash before invoking pip, installs the locked
+optional dependency set and exact Verifiers source commit, checks installed
+dependency consistency, and imports the digest-bound artifact. The qualifier
+uses real `vf.load_taskset`, `Task.score`, `Trace` and `WireTrace` objects.
+It covers all 12 Logic and 3 Stateful Tools families across train, eval and
+qualification, exact native/ABI prompt identity, packaged goldens, malformed
+answers, and authoritative reward recomputation after a wire roundtrip. Episode
+actions are recovered from the native trace and replayed in Reliquary. Trace
+reward fields and tool observations are never accepted as authoritative state.
+The importer follows the final branch, matching the published Stateful Tools
+Taskset, and takes only sampled assistant nodes. It validates graph parents
+before traversal, rejects unsupported trace versions, duplicate tool-call IDs,
+non-object/duplicate-key/non-finite/trailing JSON arguments, and turns after a
+final answer. Episode v1 accepts one function call per turn with no mixed
+assistant content; parallel calls and mixed-content traces need a reviewed
+adapter. Prompt examples and discarded branches are not replayed as actions.
+
+The native CPU workflow also runs `tests/unit/test_prime_v1_interop.py` against
+the installed pinned Verifiers and wheels, including reward agreement with the
+published Taskset after adding a prompt example and a discarded branch. Run
+this standard-library test runner in the same dedicated environment with
+`PYTHONPATH=. python tests/unit/test_prime_v1_interop.py` (the optional tests skip
+when Verifiers is absent; the workflow first requires both wheels and their
+full conformance check). This is transcript/replay interoperability, not a
+Prime-RL optimizer run or a signed Reliquary mining submission.
+
+These are two reviewed first-party Tasksets, not universal Prime catalog
+support. Other environments need an explicit deterministic ABI, artifact pin,
+resource policy and conformance tests. The legacy `export_prime_v1_*` helpers
+remain JSON exports; `native_prime_v1_trace` is the optional actual API bridge.
+
+To onboard another environment, review these concrete boundaries first:
+
+1. Pin its native **v1 Taskset**, source, wheel and dependencies. A legacy
+   `vf.load_environment` factory is a different API. Installing an arbitrary
+   Prime package does not register a Reliquary environment.
+2. Implement one of the reviewed deterministic answer or episode replay ABIs,
+   with fixed task identity/splits, bounded actions and state, a declared reward
+   lattice, and an explicit resource policy. A network tool, model judge or
+   untrusted Python dependency is not made authoritative or isolated by this
+   adapter; external wheel code executes in the importing process.
+3. Add a distinct immutable catalog artifact and conformance cases for native
+   scoring, serialization, malformed traces, deterministic replay and resource
+   limits. The source loader currently supports the reviewed eagerly imported
+   Python packages; lazy modules/native extensions need separate loader review.
+4. Qualify the actual miner/tokenizer/renderer, admission/GRAIL, training,
+   publication and resume path on the target runtime before adding an approved
+   signed profile and explicitly activating it. Catalog registration, successful
+   `Task.score` and Prime-RL configuration validation do not complete this gate.
+
+Build the CPU import image using the same installer as the runtime image:
+
+```sh
+docker build -f docker/Dockerfile.environment-qualification \
+  --secret id=logic_wheel,src=/absolute/output/reliquary_logic-0.1.0a1-py3-none-any.whl \
+  -t reliquary-logic-qualification:reviewed .
+docker run --rm --network none reliquary-logic-qualification:reviewed
+```
+
+The common CUDA image includes Logic only with `RELIQUARY_INSTALL_LOGIC=1`.
+Pass the same BuildKit secret to build from a reviewed candidate; without it,
+the installer downloads the pinned published release. CPU executor and signer
+images do not install this stack. The image workflow's explicit `include_logic`
+input builds a separate `sha-<revision>-logic` tag and cannot promote `latest`.
+
 ## Exact release
 
 - Release: [v0.1.0a1](https://github.com/reliquadotai/reliquary-environments/releases/tag/v0.1.0a1).
@@ -70,6 +172,8 @@ and resume, frozen held-out evaluation, and the full miner/admission/GRAIL/
 trainer path. The old Nebius and Verda hosts must not be contacted.
 
 Existing embedded-v1 H200 evidence remains historical and is not evidence for
-this wheel or the reconciled V1 branch. The broader ticket-only 16-lane epoch
-still has the implementation/ownership and crash-recovery gates recorded in
-`checkpoint-epoch-proof-streaming-gate.md`; CPU success is not activation.
+these wheels or the final three-environment fill-closed profile. Activation
+also requires the exact runtime/checkpoint proof-capacity manifest, a durable
+drain boundary, checkpoint publication and resume, recovery or abort of the
+active window, and economic accounting evidence. Native Prime conformance and
+a Prime-RL config dry-run do not replace those Reliquary DAPO/GRAIL gates.

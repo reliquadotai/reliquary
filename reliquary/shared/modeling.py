@@ -8,6 +8,7 @@ changes do not drift across call sites.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 
@@ -87,6 +88,24 @@ def load_tokenizer(source: str, **kwargs):
     tokenizer = AutoTokenizer.from_pretrained(source, **kwargs)
     ensure_tokenizer_padding(tokenizer)
     return tokenizer
+
+
+def save_tokenizer(tokenizer: Any, directory) -> Any:
+    """Reject untrusted template filenames before the pinned runtime writes them.
+
+    CVE-2026-9856 affects Transformers <5.10. Keep numerical runtime pins while
+    applying the upstream path boundary to every tokenizer save in Reliquary.
+    """
+    templates = getattr(tokenizer, "chat_template", None)
+    if isinstance(templates, dict):
+        destination = Path(directory).resolve()
+        template_dir = destination / "additional_chat_templates"
+        for name in templates:
+            if (not isinstance(name, str) or not name or name in {".", ".."}
+                    or "/" in name or "\\" in name or ":" in name or "\0" in name
+                    or (template_dir / f"{name}.jinja").resolve().parent != template_dir):
+                raise ValueError("invalid tokenizer chat template filename")
+    return tokenizer.save_pretrained(directory)
 
 
 def ensure_tokenizer_padding(tokenizer: Any) -> Any:

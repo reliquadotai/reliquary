@@ -749,19 +749,25 @@ _FILL_CLOSED_REQUESTED = _os.environ.get(
     "RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
 _FILL_CLOSED_PROFILE_ID = "qwen3-4b-base-dapo-fill-closed-v6"
+_FILL_CLOSED_PROFILE_IDS = {
+    _FILL_CLOSED_PROFILE_ID,
+    "qwen3-4b-base-dapo-reliquary-v1",
+}
+if _os.environ.get("RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED", "0").strip().lower() not in {"", "0", "false", "no", "off"}:
+    raise ValueError("RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED is retired; remove it")
 FILL_CLOSED_ENABLED = (
-    PROTOCOL_PROFILE_ID == _FILL_CLOSED_PROFILE_ID
+    PROTOCOL_PROFILE_ID in _FILL_CLOSED_PROFILE_IDS
     and _FILL_CLOSED_REQUESTED
 )
 
-if _FILL_CLOSED_REQUESTED and PROTOCOL_PROFILE_ID != _FILL_CLOSED_PROFILE_ID:
+if _FILL_CLOSED_REQUESTED and PROTOCOL_PROFILE_ID not in _FILL_CLOSED_PROFILE_IDS:
     raise ValueError(
         "RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED requires the exact "
-        f"{_FILL_CLOSED_PROFILE_ID!r} profile"
+        f"fill-closed profiles {sorted(_FILL_CLOSED_PROFILE_IDS)!r}"
     )
-if PROTOCOL_PROFILE_ID == _FILL_CLOSED_PROFILE_ID and not FILL_CLOSED_ENABLED:
+if PROTOCOL_PROFILE_ID in _FILL_CLOSED_PROFILE_IDS and not FILL_CLOSED_ENABLED:
     raise ValueError(
-        f"the {_FILL_CLOSED_PROFILE_ID!r} profile requires its explicit "
+        f"the {PROTOCOL_PROFILE_ID!r} profile requires its explicit "
         "experimental fill-closed capability"
     )
 

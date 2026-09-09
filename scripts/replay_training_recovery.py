@@ -661,7 +661,9 @@ def main() -> int:
     if status == "stepped" and args.save_model is not None:
         args.save_model.mkdir(parents=True, exist_ok=True)
         train_model.save_pretrained(args.save_model)
-        tokenizer.save_pretrained(args.save_model)
+        from reliquary.shared.modeling import save_tokenizer
+
+        save_tokenizer(tokenizer, args.save_model)
         saved_model_snapshot_sha256 = _directory_snapshot_sha256(
             args.save_model
         )
