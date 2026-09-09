@@ -30,8 +30,14 @@ def test_new_curriculum_bootstrap_preserves_parent_but_resets_run_and_cursor(mon
     assert plan["parent_commit"] == "a" * 40
     assert len(transition["environment_targets"]) == 3
     assert "private_storage_migration" not in transition
+    assert plan["private_storage_migration"]["storage_mode"] == "distinct-bucket"
+    reused = prepare.prepare_bootstrap(source, **{**args, "target_bucket": "old-run"},
+                                      storage_mode="reuse-after-fence")
+    assert reused["files"] == plan["files"]  # Storage choice changes no model/run contract.
+    assert reused["private_storage_migration"]["source_bucket"] == reused["private_storage_migration"]["target_bucket"]
     for changes in ({"target_bucket": "old-run"}, {"last_archived_window": 51},
-                    {"checkpoint_n": True}, {"lr_start_step": -1}):
+                    {"checkpoint_n": True}, {"lr_start_step": -1},
+                    {"storage_mode": "reuse-after-fence"}, {"storage_mode": "unknown"}):
         with pytest.raises(ValueError):
             prepare.prepare_bootstrap(source, **{**args, **changes})
     target["training_run_id"] = source["training_run_id"]

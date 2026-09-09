@@ -61,6 +61,7 @@ def publish_prepared(directory: Path, *, api, download, apply=False,
         revision=plan["parent_commit"], checkpoint_n=transition["source_checkpoint_n"],
         last_archived_window=migration["archive_boundary"],
         source_bucket=migration["source_bucket"], target_bucket=migration["target_bucket"],
+        storage_mode=migration.get("storage_mode", "distinct-bucket"),
         lr_start_step=files[CHECKPOINT_PROFILE_NAME]["lr_schedule_step"],
     )
     if files != expected["files"] or any(

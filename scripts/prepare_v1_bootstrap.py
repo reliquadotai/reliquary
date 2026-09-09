@@ -28,11 +28,12 @@ from scripts.prepare_v5_fill_checkpoint import _json_bytes, source_checkpoint_nu
 
 PROFILE = "qwen3-4b-base-dapo-reliquary-v1"
 TRANSITION = "reliquary_v1_bootstrap.json"
+STORAGE_MODES = ("distinct-bucket", "reuse-after-fence")
 
 
 def prepare_bootstrap(source: dict, *, repo_id: str, revision: str, checkpoint_n: int,
                       last_archived_window: int, source_bucket: str, target_bucket: str,
-                      lr_start_step: int = 0) -> dict:
+                      lr_start_step: int = 0, storage_mode: str = "distinct-bucket") -> dict:
     checkpoint_n, repo_id, revision = canonical_checkpoint_identity(checkpoint_n, repo_id, revision)
     validate_v5_source(source)
     require_checkpoint_number(last_archived_window, field="last archived window")
@@ -47,8 +48,10 @@ def prepare_bootstrap(source: dict, *, repo_id: str, revision: str, checkpoint_n
     for bucket in (source_bucket, target_bucket):
         if not isinstance(bucket, str) or not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket):
             raise ValueError("invalid storage bucket identity")
-    if source_bucket == target_bucket:
-        raise ValueError("RUN_ID is not storage isolation; use a distinct V1 bucket")
+    if storage_mode not in STORAGE_MODES:
+        raise ValueError("unknown storage mode")
+    if (source_bucket == target_bucket) != (storage_mode == "reuse-after-fence"):
+        raise ValueError("same bucket requires explicit reuse-after-fence; distinct-bucket requires different buckets")
     cursor = require_checkpoint_number(source.get("trained_window_cursor"), field="source cursor")
     require_checkpoint_number(source.get("lr_schedule_step"), field="source LR step")
     if cursor != last_archived_window or source.get("journal_key_space", "raw") != "raw":
@@ -73,6 +76,7 @@ def prepare_bootstrap(source: dict, *, repo_id: str, revision: str, checkpoint_n
         "commit_message": f"checkpoint {checkpoint_n + 1} (reliquary-v1-bootstrap)",
         "files": {CHECKPOINT_PROFILE_NAME: target, TRANSITION: provenance},
         "private_storage_migration": {
+            "storage_mode": storage_mode,
             "source_bucket": source_bucket, "target_bucket": target_bucket,
             "source_run": old_run, "target_run": new_run,
             "archive_boundary": last_archived_window, "scoring_history_windows": 216,
@@ -92,6 +96,8 @@ def main() -> None:
     parser.add_argument("--last-archived-window", type=int, required=True)
     parser.add_argument("--source-bucket", required=True)
     parser.add_argument("--target-bucket", required=True)
+    parser.add_argument("--storage-mode", choices=STORAGE_MODES, default="distinct-bucket",
+                        help="reuse-after-fence keeps the existing bucket after both V5 writers are stopped")
     parser.add_argument("--lr-start-step", type=int, default=0)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
@@ -107,7 +113,7 @@ def main() -> None:
     plan = prepare_bootstrap(source, repo_id=args.repo_id, revision=args.source_revision,
                              checkpoint_n=number, last_archived_window=args.last_archived_window,
                              source_bucket=args.source_bucket, target_bucket=args.target_bucket,
-                             lr_start_step=args.lr_start_step)
+                             lr_start_step=args.lr_start_step, storage_mode=args.storage_mode)
     source_checkpoint_number(list(api.list_repo_commits(args.repo_id)), args.source_revision)
     args.output_dir.mkdir(mode=0o700, parents=True)
     for name, value in plan["files"].items():

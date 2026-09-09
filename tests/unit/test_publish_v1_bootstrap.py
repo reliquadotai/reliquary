@@ -11,7 +11,8 @@ from scripts.publish_v1_bootstrap import publish_prepared
 from tests.unit.test_prepare_v5_fill_checkpoint import _profile
 
 
-def test_bootstrap_is_prepare_only_then_recovers_exact_uncertain_commit(tmp_path, monkeypatch):
+@pytest.mark.parametrize("storage_mode", ["distinct-bucket", "reuse-after-fence"])
+def test_bootstrap_is_prepare_only_then_recovers_exact_uncertain_commit(tmp_path, monkeypatch, storage_mode):
     source = {**_profile("qwen3-4b-base-dapo-reasoning-v5"),
               "trained_window_cursor": 50, "lr_schedule_step": 800}
     target = {**_profile(prepare.PROFILE), "training_run_id": "reliquary-v1-test"}
@@ -23,7 +24,8 @@ def test_bootstrap_is_prepare_only_then_recovers_exact_uncertain_commit(tmp_path
     parent, child = "a" * 40, "b" * 40
     plan = prepare.prepare_bootstrap(source, repo_id="owner/model", revision=parent,
                                     checkpoint_n=100, last_archived_window=50,
-                                    source_bucket="old-run", target_bucket="new-run")
+                                    source_bucket="old-run", target_bucket="old-run" if storage_mode == "reuse-after-fence" else "new-run",
+                                    storage_mode=storage_mode)
     for name, value in plan["files"].items():
         (tmp_path / name).write_bytes(prepare._json_bytes(value))
     private_plan = {**{k: v for k, v in plan.items() if k != "files"},
