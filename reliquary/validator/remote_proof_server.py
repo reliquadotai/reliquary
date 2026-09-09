@@ -5,6 +5,7 @@ import asyncio
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+import json
 import logging
 import os
 import ssl
@@ -114,8 +115,11 @@ def create_proof_app(*, backend, worker_id: str, profile_id: str,
             training_run_id=training_run_id, repo_id=repo_id,
             software_revision=software_revision, proof_path_hash=proof_path_hash,
             transport_sha256=transport_hash(),
-            checkpoint=checkpoint, slots=slots, config=descriptions[0]["config"],
-            generation_config=descriptions[0]["generation_config"],
+            checkpoint=checkpoint, slots=slots,
+            # HF dictionaries retain integer id2label keys and tuple settings.
+            # Validate their actual JSON representation at this wire boundary.
+            config=json.loads(canonical_bytes(descriptions[0]["config"])),
+            generation_config=json.loads(canonical_bytes(descriptions[0]["generation_config"])),
         )
 
     @asynccontextmanager
