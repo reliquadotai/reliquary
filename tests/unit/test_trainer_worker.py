@@ -158,6 +158,39 @@ def test_writes_cursor_after_trained_payload():
     assert written == [101]
 
 
+@pytest.mark.parametrize("shadow", [False, True])
+def test_only_live_consumption_writes_pacing_cursor(tmp_path, shadow):
+    from reliquary.infrastructure.training_payload_queue import TrainingPayloadQueue
+
+    env = _Env({
+        101: ("payload", _Decoded(101)),
+        102: ("tombstone", {"failure_stage": "s"}),
+        103: ("payload", _Decoded(103, quarantined=True)),
+        104: ("payload", _Decoded(104)),
+    })
+    queue = TrainingPayloadQueue(queue_dir=str(tmp_path / "cursor_queue"))
+    queue.write_step_cursor(100)
+    cursor_file = tmp_path / "cursor_queue" / "step-cursor.json"
+    original = cursor_file.read_bytes()
+    w = _worker(env, shadow=shadow, cursor_writer=queue.write_step_cursor)
+    assert w.run_once() == "trained"
+    assert w.run_once() == "tombstone"
+    assert w.run_once() == "quarantined"
+
+    def skip(decoded):
+        raise TrainingStepSkipped("grad_norm", 123.0)
+
+    w._train_fn = skip
+    assert w.run_once() == "trained"
+    assert w.run_once() == "waited"
+    assert w.cursor == 104
+    assert len(env.trained) == 1
+    assert w.tombstones_seen == w.quarantined_seen == w.health_skips == 1
+    assert queue.read_step_cursor() == (100 if shadow else 104)
+    if shadow:
+        assert cursor_file.read_bytes() == original
+
+
 def test_writes_cursor_after_tombstone():
     """Tombstones advance the walk but are not training steps. They MUST
     still bump the cursor: the validator paces on consumption of journal

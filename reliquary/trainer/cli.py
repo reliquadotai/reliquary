@@ -359,14 +359,18 @@ def run_train_worker(*, shadow: bool = False) -> None:
         return None
 
     # v6.1 (Amendment: trainer-paced picks) — advisory telemetry only,
-    # wired unconditionally on every profile (see TrainerWorker docs).
-    cursor_queue = _build_cursor_queue(state_dir)
-    threading.Thread(
-        target=_drain_cursor_queue_forever,
-        args=(cursor_queue,),
-        daemon=True,
-        name="trainer-cursor-queue-drain",
-    ).start()
+    # wired on every live profile. A shadow restart must not upload a
+    # cursor left in this state directory by a previous live run.
+    cursor_writer = None
+    if not shadow:
+        cursor_queue = _build_cursor_queue(state_dir)
+        threading.Thread(
+            target=_drain_cursor_queue_forever,
+            args=(cursor_queue,),
+            daemon=True,
+            name="trainer-cursor-queue-drain",
+        ).start()
+        cursor_writer = cursor_queue.write_step_cursor
 
     control = ControlStore(state_dir, start_closed=os.getenv(
         "RELIQUARY_CONTROL_START_CLOSED", "0").lower() in {"1", "true", "yes", "on"})
@@ -388,7 +392,7 @@ def run_train_worker(*, shadow: bool = False) -> None:
         last_published_revision=last_revision,
         shadow=shadow,
         freeze_fn=freeze_fn,
-        cursor_writer=cursor_queue.write_step_cursor,
+        cursor_writer=cursor_writer,
         drain_request_fn=lambda: control_request,
         finish_fn=runner.finish,
         publication_pending_fn=publisher.has_pending,
