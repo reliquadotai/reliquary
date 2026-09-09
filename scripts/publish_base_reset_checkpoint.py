@@ -264,7 +264,9 @@ def main() -> None:
             safe_serialization=True,
             max_shard_size=args.max_shard_size,
         )
-        tokenizer.save_pretrained(snapshot_dir)
+        from reliquary.shared.modeling import save_tokenizer
+
+        save_tokenizer(tokenizer, snapshot_dir)
         write_checkpoint_profile(snapshot_dir)
 
         manifest = _build_recovery_manifest(
