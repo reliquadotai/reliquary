@@ -788,6 +788,8 @@ class ValidationService:
         self.proof_capacity_qualification = dict(
             proof_capacity_qualification or {}
         )
+        from reliquary.validator.proof_measurements import ProofMeasurements
+        self._proof_measurements = ProofMeasurements.from_environment(proof_worker_pool)
         self.proof_scheduler: GlobalProofScheduler | None = None
         if proof_devices:
             normalized_devices = tuple(
@@ -1147,7 +1149,9 @@ class ValidationService:
         execute = getattr(payload, "execute", None)
         if not callable(execute):
             raise TypeError("scheduled proof payload is not executable")
-        submission = execute(model)
+        measurements = getattr(self, "_proof_measurements", None)
+        submission = (measurements.execute(invocation, model, execute)
+                      if measurements is not None else execute(model))
         return ProofExecution(
             passed=submission is not None,
             value=submission,

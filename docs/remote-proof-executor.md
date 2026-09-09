@@ -145,3 +145,81 @@ An old local manifest, another worker, changed transport implementation or
 unmeasured physical GPU is refused in remote mode. Obtain fresh measurements
 after a transport change; the historical faster-runtime option cannot bypass
 this extra transport binding.
+
+The manifest's checkpoint pin is checked against the startup activation
+checkpoint. Ordinary checkpoint rotation within that running validator keeps
+the existing capacity policy and instead requires the normal exact N/OID
+adoption acknowledgement from every worker. It does not run the capacity
+qualifier on each training publication. A later startup still undergoes the
+existing startup pin checks; this collector changes none of those rules.
+
+### Producing real measurements
+
+The optional `RELIQUARY_PRIVATE_REMOTE_PROOF_MEASUREMENTS=/absolute/new.jsonl`
+records complete groups at `ValidationService._execute_scheduled_proof` in
+authoritative remote mode. It does not enable remote mode or bypass any
+capacity/readiness check. Use a new private path for each process; the file is
+created exclusively with mode 0600. Local/shadow pools cannot emit this marker.
+The timer surrounds `execute(model)`: every rollout's JSON/mTLS call and all
+the batcher's proof-dependent gates. Scheduler queue wait, cheap admission,
+grading and miner generation are outside this per-proof interval.
+
+Each row retains successes, rejections and infrastructure errors. A passing
+row requires a complete `ValidSubmission` and one authenticated network receipt
+per rollout, all bound to the scheduled slot/environment/window/checkpoint.
+Completion lengths come from authenticated sparse-output coverage. The private
+file contains receipt hashes/identities and timings, not tokens, prompts,
+signatures, credentials or kernel diagnostics. A failed/partial group cannot
+become a passing capacity sample. The qualifier rejects a file containing
+nonpassing or unrepresentative samples; preserve such evidence and diagnose it
+rather than relabelling timings.
+
+To bootstrap capacity before a public validator is allowed to start, use a
+**dedicated isolated proof worker** and the same immutable image on a CPU
+benchmark process. Run `scripts/measure_remote_proof_capacity.py`; it never
+constructs `ValidationService.run`, a public HTTP listener, wallet, chain
+client, trainer, publisher or storage writer. It adopts the exact checkpoint,
+prepares candidates through the actual batcher, and submits complete proof
+payloads to `GlobalProofScheduler` with the same service execution method. No
+prior capacity manifest is needed in this isolated command. Production startup
+continues to require its pinned manifest, and the benchmark never opens it.
+
+The input is private JSONL with exactly these fields per group:
+
+```text
+{"environment":"<active environment>","randomness":"<window randomness>",
+ "request":<complete BatchSubmissionRequest JSON including valid signatures>}
+```
+
+Use genuine signed groups generated for the target profile and N/OID. The
+envelope, per-rollout signatures, prompt/token binding, reward grading and all
+proof gates are rechecked. This offline corpus is not evidence of live HTTP
+arrival timing, admission fairness or metagraph eligibility. No historical
+cooldown or economic state is copied into the benchmark; each group is isolated
+and never selected for payment/training. Identical input groups are refused.
+The existing Code grader must be available; no unsandboxed grading fallback is
+introduced. The ordinary prompt range applies to the recorded randomness.
+
+With the remote TLS/profile/run environment configured as above, run in the
+CPU benchmark image (paths and identities below are placeholders):
+
+```sh
+python scripts/measure_remote_proof_capacity.py /private/signed-groups.jsonl \
+  --output /private/new-proof-measurements.jsonl \
+  --hf-repo-id PUBLIC_CHECKPOINT_REPO --checkpoint-n CHECKPOINT_N \
+  --checkpoint-revision FULL_CHECKPOINT_OID --timeout-seconds 7200
+```
+
+Retain the JSON report printed by this command; it binds corpus/sample hashes,
+checkpoint identity, software and runtime. Run the existing qualifier against
+that exact JSONL and matching report/worker identities, with
+`--remote-proof-worker-id`. Its existing gate still requires at least 20 passed
+groups per physical GPU per active environment, **every rollout** at least 90%
+of that environment's token cap, and the configured headroom. Supply enough
+independent groups to cover every device; the scheduler uses its ordinary
+dispatch policy. Tiny CPU/fake-GPU tests of this producer are implementation
+tests only and cannot satisfy the actual target GPU qualification.
+
+Transport hashing now also covers the full batcher/service path and collector.
+Build and measure the final merged image on both hosts; a pre-merge or earlier
+collector build cannot reuse the same remote capacity marker.

@@ -40,7 +40,8 @@ def transport_hash() -> str:
     root = Path(__file__).parent
     return digest({name: hashlib.sha256((root / name).read_bytes()).hexdigest()
                    for name in ("remote_proof_protocol.py", "remote_proof.py",
-                                "remote_proof_server.py", "proof_worker.py")})
+                                "remote_proof_server.py", "proof_worker.py",
+                                "proof_measurements.py", "batcher.py", "service.py")})
 
 
 class WireModel(BaseModel):

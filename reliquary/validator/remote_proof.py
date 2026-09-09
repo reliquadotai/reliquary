@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import logging
 import os
 import ssl
@@ -65,6 +66,19 @@ class RemoteProofPool:
         self._closed = False
         self._health_checked_at = 0.0
         self._health_probe = None
+        self._measurements = threading.local()
+
+    @contextmanager
+    def measure_group(self):
+        """Capture authenticated wire completions on this scheduler thread only."""
+        if getattr(self._measurements, "receipts", None) is not None:
+            raise ProofWorkerUnavailable("nested proof measurement")
+        receipts = []
+        self._measurements.receipts = receipts
+        try:
+            yield receipts
+        finally:
+            self._measurements.receipts = None
 
     @classmethod
     def from_environment(cls, *, repo_id):
@@ -327,6 +341,12 @@ class RemoteProofPool:
             ):
                 raise ProofWorkerUnavailable("remote proof response binding mismatch")
             result.result.validate_input_coverage(payload)
+            receipts = getattr(self._measurements, "receipts", None)
+            if receipts is not None:
+                receipts.append({key: getattr(result, key) for key in (
+                    "job_id", "attempt", "device_id", "window", "environment", "content_sha256",
+                )} | {"checkpoint": result.checkpoint.model_dump(),
+                     "policy_tokens": len(result.result.completion_chosen_probs)})
             return result.result.to_kernel()
         except ProofWorkerUnavailable:
             self._adopted = None
