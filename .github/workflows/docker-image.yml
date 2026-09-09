@@ -132,4 +132,7 @@ jobs:
           secret-files: |
             ${{ inputs.include_logic && format('logic_wheel={0}/logic-release/{1}', runner.temp, steps.logic.outputs.wheel) || '' }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # The optional CUDA+Logic variant already publishes its image to
+          # GHCR. Exporting its multi-GB cache delayed the candidate job long
+          # after that push completed; leave normal main caching unchanged.
+          cache-to: ${{ !inputs.include_logic && 'type=gha,mode=max' || '' }}
