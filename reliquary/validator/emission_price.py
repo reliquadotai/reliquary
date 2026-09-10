@@ -10,8 +10,16 @@ for collection faster than the cycle's own incompressible time buys nothing.
 The target is therefore our own performance, so repairing the proof plane
 lowers the price with no constant to retune.
 
-Every quantity is in BLOCKS. See the module's test for why that is not a
-stylistic choice.
+Every quantity is in DRAND ROUNDS -- quicknet, one every 3 seconds. Not
+windows: see the module's test for why that is not a stylistic choice. Not
+chain blocks either, though they would serve: the window loop makes no chain
+call, while ``window_open_drand_round`` is already computed at window open and
+the whole seal path already reasons in rounds. Rounds are three times finer and
+cost nothing extra.
+
+Whichever it is, the unit must be named honestly. Calling a round a "block"
+would be the same unit confusion that quietly turned EMA_ALPHA into a 28-hour
+time constant.
 
 Purity matters as much as the arithmetic: any weight-only node must be able to
 replay this from the published archives and land on the same number, exactly as
@@ -34,38 +42,38 @@ class PriceParams:
 
     start: float
     decay: float
-    blocks_per_step: int
+    rounds_per_step: int
     deadband: float
     snap: float
     floor: float
     cap: float
-    median_blocks: int
+    median_rounds: int
 
 
 @dataclass(frozen=True, slots=True)
 class WindowOutcome:
     """What one archived window contributes to the price.
 
-    ``collect_ready_block`` is when the N-th ADMISSIBLE candidate arrived, not
+    ``collect_ready_round`` is when the N-th ADMISSIBLE candidate arrived, not
     when it was proven. The distinction is the whole sensor: a fill-closed
     window closes on PROVEN groups, so a proof-clock reading would measure our
     own plane (11 proofs/min) and never the market.
     """
 
-    open_block: int
-    close_block: int
-    collect_ready_block: int | None
-    training_blocks: float
-    validation_blocks: float
+    open_round: int
+    close_round: int
+    collect_ready_round: int | None
+    training_rounds: float
+    validation_rounds: float
 
     @property
-    def elapsed_blocks(self) -> int:
-        return int(self.close_block) - int(self.open_block)
+    def elapsed_rounds(self) -> int:
+        return int(self.close_round) - int(self.open_round)
 
     @property
     def filled(self) -> bool:
         """Whether the window gathered its target at all."""
-        return self.collect_ready_block is not None
+        return self.collect_ready_round is not None
 
     @property
     def ratio(self) -> float | None:
@@ -75,12 +83,12 @@ class WindowOutcome:
         stage durations were never recorded carries no information either way.
         Shortage is ``filled`` being false, and only that.
         """
-        if self.collect_ready_block is None:
+        if self.collect_ready_round is None:
             return None
-        incompressible = max(self.training_blocks, self.validation_blocks)
+        incompressible = max(self.training_rounds, self.validation_rounds)
         if incompressible <= 0:
             return None
-        return (int(self.collect_ready_block) - int(self.open_block)) / incompressible
+        return (int(self.collect_ready_round) - int(self.open_round)) / incompressible
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,9 +115,9 @@ class PriceDecision:
 
 
 def _smoothed_ratio(
-    recent: Sequence[WindowOutcome], median_blocks: int
+    recent: Sequence[WindowOutcome], median_rounds: int
 ) -> float | None:
-    """Median ``r`` over the trailing ``median_blocks``, or None if not finite.
+    """Median ``r`` over the trailing ``median_rounds``, or None if not finite.
 
     A window that never filled contributes ``inf``: it is maximally slow, and
     letting it be absent would allow a run of failures to leave the median
@@ -117,10 +125,10 @@ def _smoothed_ratio(
     ratio -- and no finite value could be archived either, since Reliquary's
     canonical JSON refuses non-finite floats.
     """
-    cutoff = recent[-1].close_block - median_blocks
+    cutoff = recent[-1].close_round - median_rounds
     samples: list[float] = []
     for outcome in recent:
-        if outcome.close_block <= cutoff:
+        if outcome.close_round <= cutoff:
             continue
         if not outcome.filled:
             samples.append(math.inf)
@@ -142,7 +150,7 @@ def advance(
     """Decide the price after one window.
 
     ``recent`` is the trailing run of outcomes, oldest first, whose LAST element
-    is the window being decided; anything outside ``median_blocks`` is dropped
+    is the window being decided; anything outside ``median_rounds`` is dropped
     here rather than trusted from the caller.
 
     Taking a ``PriceState`` instead of the whole chain is what makes this
@@ -152,7 +160,7 @@ def advance(
     """
     outcome = recent[-1]
     r = outcome.ratio
-    r_smoothed = _smoothed_ratio(recent, params.median_blocks)
+    r_smoothed = _smoothed_ratio(recent, params.median_rounds)
     price = state.price
     last_good = state.last_good
     if not outcome.filled:
@@ -163,7 +171,7 @@ def advance(
         price = max(price, last_good) * params.snap
         regime = "snap"
     elif r_smoothed is not None and r_smoothed < params.deadband:
-        price *= params.decay ** (outcome.elapsed_blocks / params.blocks_per_step)
+        price *= params.decay ** (outcome.elapsed_rounds / params.rounds_per_step)
         regime = "descend"
     else:
         regime = "hold"
@@ -200,12 +208,12 @@ def replay(
 
 # Absent from every archive written before this shipped. Their absence is how
 # the replay tells "not instrumented" from "did not fill": the latter is an
-# explicit ``collect_ready_block: null`` INSIDE an otherwise complete record.
+# explicit ``collect_ready_round: null`` INSIDE an otherwise complete record.
 _REQUIRED_ARCHIVE_FIELDS = (
-    "window_open_block",
-    "window_close_block",
-    "training_blocks",
-    "validation_blocks",
+    "window_open_round",
+    "window_close_round",
+    "training_rounds",
+    "validation_rounds",
 )
 
 
@@ -219,11 +227,40 @@ def outcome_from_archive(record: Mapping[str, Any]) -> WindowOutcome | None:
         return None
     if any(record.get(field) is None for field in _REQUIRED_ARCHIVE_FIELDS):
         return None
-    ready = record.get("collect_ready_block")
+    ready = record.get("collect_ready_round")
     return WindowOutcome(
-        open_block=int(record["window_open_block"]),
-        close_block=int(record["window_close_block"]),
-        collect_ready_block=None if ready is None else int(ready),
-        training_blocks=float(record["training_blocks"]),
-        validation_blocks=float(record["validation_blocks"]),
+        open_round=int(record["window_open_round"]),
+        close_round=int(record["window_close_round"]),
+        collect_ready_round=None if ready is None else int(ready),
+        training_rounds=float(record["training_rounds"]),
+        validation_rounds=float(record["validation_rounds"]),
     )
+
+
+def ready_round(arrival_rounds: Sequence[int], target: int) -> int | None:
+    """The round by which ``target`` admissible candidates had arrived.
+
+    ``None`` means supply never reached the target -- the shortage that snaps
+    the price up.
+    """
+    if target <= 0 or len(arrival_rounds) < target:
+        return None
+    return sorted(arrival_rounds)[target - 1]
+
+
+def window_ready_round(
+    arrivals_by_environment: Mapping[str, Sequence[int]],
+    targets_by_environment: Mapping[str, int],
+) -> int | None:
+    """The round the SLOWEST environment reached its target.
+
+    A fill-closed window is not ready until every environment holds its own
+    target, so averaging across them would report a readiness neither one had.
+    """
+    rounds = []
+    for environment, target in targets_by_environment.items():
+        reached = ready_round(arrivals_by_environment.get(environment, ()), target)
+        if reached is None:
+            return None
+        rounds.append(reached)
+    return max(rounds) if rounds else None

@@ -29,12 +29,12 @@ def _params(**overrides) -> PriceParams:
     base = dict(
         start=1.0,
         decay=0.5,          # a big step so arithmetic stays readable
-        blocks_per_step=100,
+        rounds_per_step=100,
         deadband=0.80,
         snap=1.20,
         floor=0.01,
         cap=1.0,
-        median_blocks=1_000_000,   # effectively "all history" unless overridden
+        median_rounds=1_000_000,   # effectively "all history" unless overridden
     )
     base.update(overrides)
     return PriceParams(**base)
@@ -43,25 +43,25 @@ def _params(**overrides) -> PriceParams:
 _INCOMPRESSIBLE = 100
 
 
-def _window(open_block: int, span: int, *, r: float | None) -> WindowOutcome:
+def _window(open_round: int, span: int, *, r: float | None) -> WindowOutcome:
     """A window whose collection landed at ratio ``r``; ``r=None`` never filled."""
-    ready = None if r is None else open_block + round(r * _INCOMPRESSIBLE)
+    ready = None if r is None else open_round + round(r * _INCOMPRESSIBLE)
     return WindowOutcome(
-        open_block=open_block,
-        close_block=open_block + span,
-        collect_ready_block=ready,
-        training_blocks=_INCOMPRESSIBLE,
-        validation_blocks=_INCOMPRESSIBLE // 2,
+        open_round=open_round,
+        close_round=open_round + span,
+        collect_ready_round=ready,
+        training_rounds=_INCOMPRESSIBLE,
+        validation_rounds=_INCOMPRESSIBLE // 2,
     )
 
 
-def _masked(open_block: int, span: int) -> WindowOutcome:
+def _masked(open_round: int, span: int) -> WindowOutcome:
     """Collection finished well inside the incompressible time.
 
     ``r`` lands at 0.1, far below any sane deadband, so this is the unambiguous
     "we are paying for speed we cannot use" case.
     """
-    return _window(open_block, span, r=0.1)
+    return _window(open_round, span, r=0.1)
 
 
 def test_oversupply_walks_the_price_down_geometrically():
@@ -217,8 +217,8 @@ def test_the_smoothing_window_is_counted_in_blocks():
         _window(300, 100, r=0.9),
     ]
 
-    long_lookback = replay(history, _params(median_blocks=1000))
-    short_lookback = replay(history, _params(median_blocks=150))
+    long_lookback = replay(history, _params(median_rounds=1000))
+    short_lookback = replay(history, _params(median_rounds=150))
 
     assert long_lookback.regime == "descend"
     assert short_lookback.regime == "hold"
@@ -234,13 +234,13 @@ def test_one_step_needs_only_the_previous_state_and_the_lookback():
     own state, and the next step consumes only that plus the smoothing
     lookback.
     """
-    params = _params(median_blocks=250)
+    params = _params(median_rounds=250)
     history = [_masked(0, 100), _masked(100, 100), _masked(200, 100), _masked(300, 100)]
 
     whole_chain = replay(history, params)
 
     previous = replay(history[:-1], params)
-    # close_block > 400 - 250 keeps the last three windows, the decided one included.
+    # close_round > 400 - 250 keeps the last three windows, the decided one included.
     one_step = advance(previous.state, history[-3:], params)
 
     assert one_step.price == whole_chain.price
@@ -270,11 +270,11 @@ def test_missing_stage_telemetry_is_not_a_shortage():
     """
     params = _params(cap=2.0)
     unmeasured = WindowOutcome(
-        open_block=0,
-        close_block=100,
-        collect_ready_block=10,      # it DID fill
-        training_blocks=0,           # but nothing was measured
-        validation_blocks=0,
+        open_round=0,
+        close_round=100,
+        collect_ready_round=10,      # it DID fill
+        training_rounds=0,           # but nothing was measured
+        validation_rounds=0,
     )
 
     decision = replay([unmeasured], params)
@@ -287,11 +287,11 @@ def test_an_unmeasured_window_does_not_enter_the_median():
     """It carries no information, so it must not dilute the ones that do."""
     params = _params(deadband=0.80)
     unmeasured = WindowOutcome(
-        open_block=100,
-        close_block=200,
-        collect_ready_block=110,
-        training_blocks=0,
-        validation_blocks=0,
+        open_round=100,
+        close_round=200,
+        collect_ready_round=110,
+        training_rounds=0,
+        validation_rounds=0,
     )
 
     decision = replay([_masked(0, 100), unmeasured, _masked(200, 100)], params)
