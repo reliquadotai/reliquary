@@ -878,6 +878,48 @@ def test_gpu_completion_entropy_matches_uniform_distribution():
     assert entropy == pytest.approx([math.log(4.0)])
 
 
+@pytest.mark.parametrize("gap", [17.0, 32.0, 1000.0])
+def test_gpu_completion_entropy_remains_nonnegative_for_concentrated_logits(gap, monkeypatch):
+    # The old logsumexp(z) - E[z] loses the tiny entropy by subtracting
+    # nearly equal float32 values (and becomes negative at gap=17).
+    monkeypatch.setattr(verifier, "T_PROTO", 1.0)
+    logits = torch.tensor([[gap, 0.0, 0.0, 0.0]]) + 1000.0
+    chosen, amax_p, amax_id, entropy = verifier._gpu_completion_token_stats(
+        logits, [0, 0], prompt_length=1, completion_length=1,
+        seq_len=1, device="cpu",
+    )
+    assert len(entropy) == 1
+    assert math.isfinite(entropy[0]) and entropy[0] >= 0.0
+    if gap < 1000.0:
+        assert entropy[0] > 0.0  # Clamping a cancelled zero would lose entropy.
+    else:
+        assert entropy == [0.0]  # Underflowed tail still has a finite entropy.
+    without_entropy = verifier._gpu_completion_token_stats(
+        logits, [0, 0], prompt_length=1, completion_length=1,
+        seq_len=1, device="cpu", include_entropy=False,
+    )
+    assert (chosen, amax_p, amax_id) == without_entropy[:3]
+
+
+@pytest.mark.parametrize("offset", [-1000.0, 64.0, 1000.0])
+def test_gpu_completion_entropy_is_invariant_to_logit_offset(offset, monkeypatch):
+    # Integer logits/offsets at unit temperature isolate entropy cancellation
+    # from the independent rounding of the temperature division.
+    monkeypatch.setattr(verifier, "T_PROTO", 1.0)
+    logits = torch.tensor([[17.0, 0.0, 0.0, 0.0], [2.0, 1.0, 0.0, -1.0]])
+
+    def stats(values):
+        return verifier._gpu_completion_token_stats(
+            values, [0, 0, 0], prompt_length=1, completion_length=2,
+            seq_len=2, device="cpu",
+        )
+
+    base = stats(logits)
+    shifted = stats(logits + offset)
+    assert shifted[:3] == base[:3]
+    assert shifted[3] == pytest.approx(base[3], rel=1e-6, abs=1e-12)
+
+
 def test_gpu_completion_entropy_is_stratified_and_bounded(monkeypatch):
     monkeypatch.setattr(verifier, "_UTILITY_ENTROPY_MAX_POSITIONS", 3)
     logits = torch.zeros(11, 4)
