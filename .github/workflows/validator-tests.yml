@@ -84,6 +84,8 @@ jobs:
             tests/unit/test_fill_closed_batch_assembler.py \
             tests/unit/test_fill_closed_profile.py \
             tests/unit/test_fill_closed_rotation.py \
+            tests/unit/test_bounded_fill_service.py \
+            tests/unit/test_trainer_macro_boundary.py \
             tests/unit/test_prove_on_arrival.py \
             tests/unit/test_pick_by_rate.py \
             tests/unit/test_pick_pacing.py \

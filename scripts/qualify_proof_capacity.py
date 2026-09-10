@@ -201,6 +201,8 @@ def main() -> int:
     parser.add_argument("--maximum-context-tokens", type=int,
                         help="Exact adopted model context; required for combined v4 and checked again at runtime")
     parser.add_argument("--headroom", type=float, default=0.2)
+    parser.add_argument("--bounded-fill-service", action="store_true",
+                        help="Qualify bounded online partial service, not completion of every admission")
     parser.add_argument("--remote-proof-worker-id",
                         help="Require every source sample to cover validator end-to-end mTLS proof execution")
     args = parser.parse_args()
@@ -242,6 +244,11 @@ def main() -> int:
         ).model_dump()
     if args.stress_samples and (remote_proof is None or not args.maximum_context_tokens or not args.natural_corpus):
         parser.error("combined v4 requires --remote-proof-worker-id, --maximum-context-tokens and --natural-corpus")
+    bounded = capacity_budget()["mode"] == "fill_closed_bounded"
+    if args.bounded_fill_service != bounded:
+        parser.error("--bounded-fill-service must match RELIQUARY_FILL_CLOSED_PROOF_SERVICE_MODE")
+    if bounded and not args.stress_samples:
+        parser.error("bounded fill service requires combined natural and full-envelope stress evidence")
     source_payload = args.samples.read_bytes()
     samples, benchmark_device_uuids, minimum_completion_tokens = _load_samples(
         args.samples,
@@ -283,6 +290,7 @@ def main() -> int:
     proofs_per_environment = {environment: budget["proofs_per_environment"] for environment in ENVIRONMENTS}
     manifest = {
         "schema_version": 3,
+        "service_mode": "bounded" if bounded else "strict",
         "profile_id": PROTOCOL_PROFILE_ID,
         "model_revision": PROTOCOL_MODEL_REVISION,
         "software_revision": args.software_revision,
@@ -334,7 +342,7 @@ def main() -> int:
     qualification = ProofCapacityQualification.from_mapping(manifest)
     # Validate the benchmark fleet itself. A manifest that already needs more
     # devices than were exercised is not qualification evidence.
-    qualification.validate(
+    report = qualification.validate(
         profile_id=PROTOCOL_PROFILE_ID,
         model_revision=PROTOCOL_MODEL_REVISION,
         software_revision=args.software_revision,
@@ -366,6 +374,7 @@ def main() -> int:
     print(f"path={args.output}")
     print(f"sha256={hashlib.sha256(payload).hexdigest()}")
     print(f"p95={json.dumps(p95_by_environment, sort_keys=True)}")
+    print(f"service={json.dumps({key: report[key] for key in ('service_mode', 'all_admitted_proofs_qualified', 'qualified_group_seconds_with_headroom')}, sort_keys=True)}")
     return 0
 
 

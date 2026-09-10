@@ -60,6 +60,10 @@ class SchedulerNotRunning(ProofSchedulerError):
     pass
 
 
+class ProofPlanClosed(ValueError, ProofSchedulerError):
+    """An online plan stopped accepting candidates at its dispatch cutoff."""
+
+
 class CheckpointNotReady(ProofSchedulerError):
     pass
 
@@ -108,6 +112,9 @@ class ProofPlan:
     # simply not produced the next candidate yet. It ends on its target, its
     # deadline, or an explicit ``seal``.
     open_ended: bool = False
+    # Bounded online plans stop queued dispatch before the hard fault deadline;
+    # genuine results of already-active calls remain authoritative.
+    dispatch_deadline_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -449,11 +456,14 @@ class GlobalProofScheduler:
         with self._condition:
             state = self._plans.get(plan_id)
             if state is None:
+                if plan_id in self._retired_plan_id_set:
+                    raise ProofPlanClosed(f"plan {plan_id!r} no longer accepts work")
                 raise ValueError(f"unknown plan_id {plan_id!r}")
             if not state.plan.open_ended:
                 raise ValueError(f"plan {plan_id!r} is not open-ended")
+            self._stop_at_dispatch_deadline_locked(state)
             if state.sealed or state.final_result is not None:
-                raise ValueError(f"plan {plan_id!r} no longer accepts work")
+                raise ProofPlanClosed(f"plan {plan_id!r} no longer accepts work")
 
             added = tuple(sorted(candidates, key=lambda item: item.rank))
             highest = state.candidates[-1].rank if state.candidates else None
@@ -503,6 +513,19 @@ class GlobalProofScheduler:
             state.sealed = True
             self._reevaluate_plan_locked(state)
             self._finalize_if_terminal_locked(state)
+            self._condition.notify_all()
+
+    def stop_dispatch(self, plan_id: str, *, reason: str = "dispatch_budget_exhausted") -> None:
+        """Close a bounded online plan; queued work releases, active work settles."""
+        with self._condition:
+            state = self._plans.get(plan_id)
+            if state is None and plan_id in self._retired_plan_id_set:
+                return
+            if state is None:
+                raise ValueError(f"unknown plan_id {plan_id!r}")
+            if state.plan.dispatch_deadline_at is None:
+                raise ValueError("stop_dispatch requires a bounded online plan")
+            self._stop_dispatch_locked(state, reason)
             self._condition.notify_all()
 
     def expire_deadlines(self) -> None:
@@ -754,6 +777,13 @@ class GlobalProofScheduler:
 
     @staticmethod
     def _validate_plan(plan: ProofPlan) -> None:
+        if plan.dispatch_deadline_at is not None and (
+            not plan.open_ended or not plan.allow_shortfall or plan.complete_all
+            or not math.isfinite(plan.dispatch_deadline_at)
+            or not math.isfinite(plan.deadline_at)
+            or plan.dispatch_deadline_at >= plan.deadline_at
+        ):
+            raise ValueError("dispatch cutoff requires an online shortfall plan before its hard deadline")
         if plan.required_passes < 0:
             raise ValueError("required_passes cannot be negative")
         if plan.complete_all and plan.required_passes != 0:
@@ -845,6 +875,10 @@ class GlobalProofScheduler:
                     if selected is not None:
                         state, candidate = selected
                         started_at = self._clock()
+                        if (state.plan.dispatch_deadline_at is not None
+                                and started_at >= state.plan.dispatch_deadline_at):
+                            self._stop_dispatch_locked(state, "dispatch_budget_exhausted")
+                            continue
                         state.phases[candidate.job_id] = _JobPhase.ACTIVE
                         state.active_job_ids.add(candidate.job_id)
                         self._active_resource_keys.update(
@@ -978,6 +1012,7 @@ class GlobalProofScheduler:
     def _next_candidate_locked(
         self, state: _PlanState
     ) -> RankedProof | None:
+        self._stop_at_dispatch_deadline_locked(state)
         if (
             state.stop_dispatch
             or state.final_result is not None
@@ -1300,6 +1335,23 @@ class GlobalProofScheduler:
             if phase is _JobPhase.PENDING:
                 state.phases[job_id] = _JobPhase.NOT_NEEDED
 
+    def _stop_dispatch_locked(self, state: _PlanState, reason: str) -> None:
+        if state.final_result is not None:
+            return
+        state.sealed = True
+        state.stop_dispatch = True
+        state.completion_reason = reason
+        for job_id, phase in state.phases.items():
+            if phase is _JobPhase.PENDING:
+                state.phases[job_id] = _JobPhase.NOT_NEEDED
+        self._apply_ready_locked(state)
+        self._finalize_if_terminal_locked(state)
+
+    def _stop_at_dispatch_deadline_locked(self, state: _PlanState) -> None:
+        cutoff = state.plan.dispatch_deadline_at
+        if cutoff is not None and self._clock() >= cutoff:
+            self._stop_dispatch_locked(state, "dispatch_budget_exhausted")
+
     def _stop_with_shortfall_locked(self, state: _PlanState) -> None:
         state.stop_dispatch = True
         state.completion_reason = "insufficient_distinct_prompts"
@@ -1385,7 +1437,7 @@ class GlobalProofScheduler:
             and state.passed < state.plan.required_passes
         ):
             if state.plan.allow_shortfall:
-                state.completion_reason = "insufficient_distinct_prompts"
+                state.completion_reason = state.completion_reason or "insufficient_distinct_prompts"
             else:
                 state.abort_reason = (
                     CapacityAbortReason.INSUFFICIENT_DISTINCT_PROMPTS
@@ -1483,6 +1535,9 @@ class GlobalProofScheduler:
     def _expire_deadlines_locked(self) -> None:
         now = self._clock()
         for state in self._unfinished_plans_locked():
+            self._stop_at_dispatch_deadline_locked(state)
+            if state.final_result is not None:
+                continue
             if now >= state.plan.deadline_at:
                 self._apply_ready_locked(state)
                 if state.final_result is not None:

@@ -284,8 +284,8 @@ At least 20% headroom is required. Natural p95s and lengths remain separately
 reported as actually measured. This is a conservative measured workload,
 not a mathematical guarantee for every token sequence.
 
-The shared budget helper matches the active scheduler. V1 fill windows reserve
-**512 admitted groups per ENV** by default (failures consume this monotone
+In the default **strict** service mode, the shared budget helper requires
+capacity for **512 admitted groups per ENV** by default (failures consume this monotone
 budget), targeting 256 proven groups in 16 picks; their backstop is
 `RELIQUARY_FILL_CLOSED_MAX_SECONDS` (default 1800). The legacy seal-time path
 keeps 34 groups and `RELIQUARY_MAX_PROOF_WALL_SECONDS`. Raising that legacy knob
@@ -297,3 +297,40 @@ This budget covers **post-admission proof execution**. Admission/reward-grader
 latencies are recorded separately; public HTTP concurrency, late supply,
 trainer pacing, storage/recovery and live end-to-end adoption remain separate
 release checks. A capacity manifest is not a go-live acknowledgement.
+
+
+### Bounded online fill service
+
+For a fleet that cannot guarantee every admitted worst-case group within the
+window, explicitly set `RELIQUARY_FILL_CLOSED_PROOF_SERVICE_MODE=bounded` in the
+qualification and controller configuration. This requires schema 4 and
+`--bounded-fill-service` on the qualifier; an existing strict manifest cannot
+activate it. All authentic proofs, numerical rejection checks, full-envelope
+samples, exact identities and resource/topology bindings still apply.
+
+`RELIQUARY_FILL_CLOSED_PROOF_DRAIN_SECONDS` reserves time before the hard window
+backstop (default 240 seconds). Qualification requires the **maximum combined
+group bound across every ENV/GPU, divided by (1 - headroom)** to fit this margin.
+Choose the margin from actual measurements; its default is not a qualification.
+The advertised precommit horizon leaves both the upload grace and this margin.
+The scheduler checks its dispatch cutoff under the same lock that starts work,
+so a queued group cannot start at or after the cutoff. Queued unproved groups
+receive `NOT_NEEDED / dispatch_budget_exhausted`; their concurrency reservations
+release exactly once, without refunding the monotone admission budget. Active
+proofs retain their genuine verdicts and can supply a final balanced pick.
+A proof still active at the hard deadline faults the plane normally.
+
+The 512 admission ceiling, M16 proofs, 256-group target, 16 balanced picks,
+trainer pacing, authenticity and payment rules are unchanged. A full window
+closes once its picks and active proofs settle. A time-limited window uses the
+existing partial-seal path: only complete, proven balanced picks enter training,
+unpicked groups burn, and remaining journal slots become explicit tombstones.
+No checkpoint publication or trainer acknowledgement is invented.
+
+The report explicitly states `all_admitted_proofs_qualified: false` and
+`guaranteed_picks_per_window: 0`. It qualifies bounded online service and active
+proof draining on the measured fleet; it does **not** promise all 512 proofs,
+16 picks, HTTP/grader throughput, or useful training throughput in adversarial
+full-context traffic. Genuine natural-supply end-to-end training/adoption and
+operational latency remain separate release gates. The strict schema-3 and
+schema-4 fleet-throughput checks remain available and unchanged.

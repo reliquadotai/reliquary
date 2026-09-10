@@ -67,6 +67,7 @@ def test_cli_consumes_its_codec_and_keeps_manifest_repo_guard(
         model_info=lambda _: SimpleNamespace(sha=None)))
 
     def check_journal(**kwargs):
+        assert kwargs["fill_closed"] == constants.FILL_CLOSED_ENABLED
         actual_kind, decoded = kwargs["journal"].next_entry(100, stride=1)
         assert actual_kind == kind
         assert (decoded.window_start if kind == "payload" else decoded["window_start"]) == 101

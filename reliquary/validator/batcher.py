@@ -37,6 +37,8 @@ from reliquary.constants import (
     MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW,
     MIN_EOS_PROBABILITY,
     FILL_CLOSED_ENABLED,
+    FILL_CLOSED_BOUNDED_PROOFS,
+    FILL_CLOSED_PROOF_DISPATCH_SECONDS,
     FILL_CLOSED_MAX_SECONDS,
     FORENSIC_SAMPLE_PER_WINDOW,
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
@@ -131,6 +133,7 @@ from reliquary.validator.proof_scheduler import (
     ProofDecisionStatus,
     ProofPlan,
     ProofPlanHandle,
+    ProofPlanClosed,
     ProofPlanOutcome,
     RankedProof,
 )
@@ -1620,6 +1623,13 @@ class GrpoWindowBatcher:
         """
         self._payload_digests_seen.discard(str(digest))
 
+    def _fill_proof_admission_closed(self) -> bool:
+        if not FILL_CLOSED_BOUNDED_PROOFS or self.fill_state is None:
+            return False
+        with self.fill_state.lock:
+            return (self._seal_flag.is_set() or self.fill_state.is_closed()
+                    or self._time_fn() >= self.window_opened_at + FILL_CLOSED_PROOF_DISPATCH_SECONDS)
+
     def _extend_proof_plan(self, candidates: list[RankedProof]) -> None:
         """Hand newly-admitted candidates to this window's open-ended plan.
 
@@ -1657,6 +1667,10 @@ class GrpoWindowBatcher:
                     priority=0,
                     allow_shortfall=True,
                     open_ended=True,
+                    dispatch_deadline_at=(
+                        self.window_opened_at + FILL_CLOSED_PROOF_DISPATCH_SECONDS
+                        if FILL_CLOSED_BOUNDED_PROOFS else None
+                    ),
                 )
             )
             self._open_proof_plan_id = plan_id
@@ -1707,7 +1721,10 @@ class GrpoWindowBatcher:
         if self._proof_scheduler is None or self._open_proof_plan_id is None:
             return
         try:
-            self._proof_scheduler.seal(self._open_proof_plan_id)
+            if FILL_CLOSED_BOUNDED_PROOFS:
+                self._proof_scheduler.stop_dispatch(self._open_proof_plan_id)
+            else:
+                self._proof_scheduler.seal(self._open_proof_plan_id)
         except ValueError:
             pass
         environment = str(getattr(self.env, "name", ""))
@@ -1776,6 +1793,15 @@ class GrpoWindowBatcher:
         self._reconcile_fill_state_decisions(environment)
         while True:
             with self.fill_state.lock:
+                if FILL_CLOSED_BOUNDED_PROOFS and (
+                    self._seal_flag.is_set() or self.fill_state.is_closed()
+                    or self._time_fn() >= self.window_opened_at + FILL_CLOSED_PROOF_DISPATCH_SECONDS
+                ):
+                    # These buffered bodies never reserved a proof. Their
+                    # retained pending records remain available to the seal
+                    # audit; none can earn a payment or trainer payload.
+                    self._arrival_proof_buffer.clear()
+                    return
                 if not self._arrival_proof_buffer:
                     return
                 if not self.fill_state.may_admit(environment):
@@ -1828,7 +1854,7 @@ class GrpoWindowBatcher:
                         entry.rate, entry.payload_bytes, entry.receipt_id,
                     )
                     self._extend_proof_plan([candidate])
-            except Exception:
+            except Exception as exc:
                 # ``_proof_plan_lock`` has already been released by the
                 # ``with`` block above by the time control reaches here, so
                 # this never nests the two locks -- no ordering to keep
@@ -1839,6 +1865,10 @@ class GrpoWindowBatcher:
                     self._arrival_proof_meta.pop(job_id, None)
                 with self.fill_state.lock:
                     self.fill_state.release(environment)
+                if FILL_CLOSED_BOUNDED_PROOFS and isinstance(exc, ProofPlanClosed):
+                    # The cutoff can race expensive admission preparation.
+                    # Admission stays spent; only concurrency releases.
+                    continue
                 raise
 
     def _reconcile_fill_state_decisions(self, environment: str) -> None:
@@ -1921,6 +1951,10 @@ class GrpoWindowBatcher:
         if self.fill_state is None:
             return False
         environment = str(getattr(self.env, "name", ""))
+        # A final scheduler notification may occur after the verifier callback
+        # returned; always reconcile terminal facts before the service picks.
+        if FILL_CLOSED_BOUNDED_PROOFS:
+            self._reconcile_fill_state_decisions(environment)
         with self.fill_state.lock:
             # This environment's OWN ordinal, not the window-wide close
             # (R37): while a sibling still owes its half of the event in
@@ -2183,6 +2217,8 @@ class GrpoWindowBatcher:
             return False, "collection_not_open", None
         if received_at > self.window_opened_wall_ts + self.collection_seconds:
             return False, "collection_closed", None
+        if self._fill_proof_admission_closed():
+            return False, "proof_dispatch_closed", None
         now = self._time_fn()
         with self._upload_precommit_lock:
             self._prune_upload_precommits_locked(now)
@@ -2744,6 +2780,19 @@ class GrpoWindowBatcher:
             return False
         now = self._time_fn()
         if FILL_CLOSED_ENABLED and self.fill_state is not None:
+            if FILL_CLOSED_BOUNDED_PROOFS:
+                # The native scheduler owns the exact cutoff under its lock.
+                # Poll only reconciles and prevents sealing over active work.
+                if self._proof_scheduler is not None:
+                    self._proof_scheduler.expire_deadlines()
+                self._reconcile_fill_state_decisions(str(self.env.name))
+                with self.fill_state.lock:
+                    filled = self.fill_state.is_closed()
+                if filled:
+                    self._seal_v6_proof_plan()
+                    handle = self._open_proof_plan_handle
+                    if handle is not None and not handle.done():
+                        return False
             # v6 replaces the clock with a count: the auction's early-close
             # and fixed-deadline branches below never run for this window,
             # and neither does the seal-time proof wall they share (v6
@@ -3698,6 +3747,13 @@ class GrpoWindowBatcher:
                 0.0, (commit_started - lock_wait_started) * 1000.0
             )
         try:
+            if self._fill_proof_admission_closed():
+                self.cancel_logical_group_reservation(request)
+                return self._reject(
+                    RejectReason.BATCH_FILLED, hotkey=request.miner_hotkey,
+                    prompt_idx=request.prompt_idx, telemetry=telemetry,
+                    reject_stage="proof_dispatch_closed",
+                )
             if self.seal_snapshot_started:
                 self.cancel_logical_group_reservation(request)
                 return self._reject(
@@ -4309,6 +4365,9 @@ class GrpoWindowBatcher:
                 0.0, (commit_started - lock_wait_started) * 1000.0
             )
         try:
+            if self._fill_proof_admission_closed():
+                self.cancel_logical_group_reservation(request)
+                return reject(RejectReason.BATCH_FILLED, "proof_dispatch_closed")
             if self.seal_snapshot_started:
                 self.cancel_logical_group_reservation(request)
                 return reject(RejectReason.BATCH_FILLED, "seal_snapshot")

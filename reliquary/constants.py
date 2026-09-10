@@ -818,6 +818,26 @@ FILL_CLOSED_MAX_SECONDS = float(_os.environ.get(
 if not _math.isfinite(FILL_CLOSED_MAX_SECONDS) or FILL_CLOSED_MAX_SECONDS <= 0:
     raise ValueError("RELIQUARY_FILL_CLOSED_MAX_SECONDS must be positive")
 
+# Explicit opt-in: bounded online service may leave admitted work unproved.
+# Strict qualification retains its complete admission-budget guarantee.
+FILL_CLOSED_PROOF_SERVICE_MODE = _os.environ.get(
+    "RELIQUARY_FILL_CLOSED_PROOF_SERVICE_MODE", "strict"
+)
+if FILL_CLOSED_PROOF_SERVICE_MODE not in {"strict", "bounded"}:
+    raise ValueError("RELIQUARY_FILL_CLOSED_PROOF_SERVICE_MODE must be strict or bounded")
+FILL_CLOSED_BOUNDED_PROOFS = FILL_CLOSED_PROOF_SERVICE_MODE == "bounded"
+if FILL_CLOSED_BOUNDED_PROOFS and not FILL_CLOSED_ENABLED:
+    raise ValueError("bounded proof service requires the explicit fill-closed profile")
+FILL_CLOSED_PROOF_DRAIN_SECONDS = float(_os.environ.get(
+    "RELIQUARY_FILL_CLOSED_PROOF_DRAIN_SECONDS", "240"
+))
+if (not _math.isfinite(FILL_CLOSED_PROOF_DRAIN_SECONDS)
+        or FILL_CLOSED_PROOF_DRAIN_SECONDS <= 0):
+    raise ValueError("RELIQUARY_FILL_CLOSED_PROOF_DRAIN_SECONDS must be positive")
+FILL_CLOSED_PROOF_DISPATCH_SECONDS = FILL_CLOSED_MAX_SECONDS - (
+    FILL_CLOSED_PROOF_DRAIN_SECONDS if FILL_CLOSED_BOUNDED_PROOFS else 0
+)
+
 # A fill-closed precommit must leave enough time for its advertised upload
 # grace before the window's hard backstop.  Reusing the profile's 100-second
 # collection value made the macro window keep running while ingress had already
@@ -825,18 +845,18 @@ if not _math.isfinite(FILL_CLOSED_MAX_SECONDS) or FILL_CLOSED_MAX_SECONDS <= 0:
 # V4/V5 collection window or changing any profile contract.
 FILL_CLOSED_PRECOMMIT_SECONDS = float(_os.environ.get(
     "RELIQUARY_FILL_CLOSED_PRECOMMIT_SECONDS",
-    str(FILL_CLOSED_MAX_SECONDS - SUBMISSION_UPLOAD_GRACE_SECONDS),
+    str(FILL_CLOSED_PROOF_DISPATCH_SECONDS - SUBMISSION_UPLOAD_GRACE_SECONDS),
 ))
 if (
     not _math.isfinite(FILL_CLOSED_PRECOMMIT_SECONDS)
     or FILL_CLOSED_PRECOMMIT_SECONDS <= 0
     or FILL_CLOSED_PRECOMMIT_SECONDS + SUBMISSION_UPLOAD_GRACE_SECONDS
-    > FILL_CLOSED_MAX_SECONDS
+    > FILL_CLOSED_PROOF_DISPATCH_SECONDS
 ):
     raise ValueError(
         "RELIQUARY_FILL_CLOSED_PRECOMMIT_SECONDS must be positive and leave "
         "SUBMISSION_UPLOAD_GRACE_SECONDS before "
-        "RELIQUARY_FILL_CLOSED_MAX_SECONDS"
+        "the proof dispatch cutoff (including the bounded proof drain margin)"
     )
 
 # Qualification-only bound on productive admissions per environment. It is
@@ -1292,6 +1312,8 @@ SUBNET_START_BLOCK = 0
 # if fewer than B valid submissions have landed. The unused slots burn.
 # Set generously — this is a backstop, not the cadence.
 WINDOW_TIMEOUT_SECONDS = 7200
+if FILL_CLOSED_BOUNDED_PROOFS and FILL_CLOSED_MAX_SECONDS > WINDOW_TIMEOUT_SECONDS:
+    raise ValueError("bounded fill backstop must not exceed the service window timeout")
 
 
 # Local directory for staged checkpoint files before R2 upload.
