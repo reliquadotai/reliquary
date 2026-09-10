@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Verify a prepared V1 metadata commit; publish only with an explicit fenced parent.
 
-Weights and all other files are inherited unchanged. This command never opens
-admission, writes R2, signs, or changes the old writer. Freeze that writer and
-complete the private storage migration before using --apply.
+By default weights and other files are inherited unchanged. An explicit prepared
+base reset copies the pinned base repository tree, preserving the V5 parent in
+history. This command never opens admission, writes R2, signs, or changes the old
+writer. Freeze that writer and complete the private storage migration before --apply.
 """
 from __future__ import annotations
 
@@ -41,6 +42,17 @@ def _tree(api, repo: str, revision: str) -> dict:
     return result
 
 
+def _validate_weight_index(tree, *, download, repo, revision):
+    if "model.safetensors" not in tree:
+        index = strict_json_loads(Path(download(repo, "model.safetensors.index.json", revision=revision)).read_bytes())
+        mapping = index.get("weight_map") if isinstance(index, dict) else None
+        if not isinstance(mapping, dict) or not mapping or not all(
+            isinstance(name, str) and name.endswith(".safetensors") and name in tree
+            for name in mapping.values()
+        ):
+            raise ValueError("source checkpoint has an incomplete weight index")
+
+
 def publish_prepared(directory: Path, *, api, download, apply=False,
                      fenced_parent: str | None = None) -> dict:
     plan = strict_json_loads((directory / "commit-plan.json").read_bytes())
@@ -63,6 +75,7 @@ def publish_prepared(directory: Path, *, api, download, apply=False,
         source_bucket=migration["source_bucket"], target_bucket=migration["target_bucket"],
         storage_mode=migration.get("storage_mode", "distinct-bucket"),
         lr_start_step=files[CHECKPOINT_PROFILE_NAME]["lr_schedule_step"],
+        reset_to_base="base_weights" in transition,
     )
     if files != expected["files"] or any(
         plan.get(key) != value for key, value in expected.items() if key != "files"
@@ -75,14 +88,15 @@ def publish_prepared(directory: Path, *, api, download, apply=False,
     if source_checkpoint_number(list(api.list_repo_commits(repo, revision=parent)), parent) != transition["source_checkpoint_n"]:
         raise ValueError("source checkpoint number differs from prepared provenance")
     source_tree = _tree(api, repo, parent)
-    if "model.safetensors" not in source_tree:
-        index = strict_json_loads(Path(download(repo, "model.safetensors.index.json", revision=parent)).read_bytes())
-        mapping = index.get("weight_map") if isinstance(index, dict) else None
-        if not isinstance(mapping, dict) or not mapping or not all(
-            isinstance(name, str) and name.endswith(".safetensors") and name in source_tree
-            for name in mapping.values()
-        ):
-            raise ValueError("source checkpoint has an incomplete weight index")
+    _validate_weight_index(source_tree, download=download, repo=repo, revision=parent)
+    base_weights = transition.get("base_weights")
+    expected_tree = source_tree
+    if base_weights is not None:
+        expected_tree = _tree(api, base_weights["repo_id"], base_weights["revision"])
+        _validate_weight_index(expected_tree, download=download,
+                               repo=base_weights["repo_id"], revision=base_weights["revision"])
+        if names.intersection(expected_tree):
+            raise ValueError("base repository already contains Reliquary bootstrap metadata")
     commits = list(api.list_repo_commits(repo))
     if not commits:
         raise ValueError("checkpoint repository is empty")
@@ -94,14 +108,24 @@ def publish_prepared(directory: Path, *, api, download, apply=False,
                     "checkpoint_n": transition["target_checkpoint_n"]}
         if fenced_parent != parent:
             raise ValueError("--apply requires the exact confirmed fenced parent")
-        from huggingface_hub import CommitOperationAdd
+        from huggingface_hub import CommitOperationAdd, CommitOperationCopy, CommitOperationDelete
+
+        operations = [CommitOperationAdd(path_in_repo=name,
+                      path_or_fileobj=str(directory / name)) for name in sorted(names)]
+        if base_weights is not None:
+            # Hub >=1.30 copies LFS server-side and regular files byte-for-byte.
+            # No model load/re-serialization and no learned V5 files survive in HEAD.
+            operations += [CommitOperationCopy(src_path_in_repo=name, path_in_repo=name,
+                           src_repo_id=base_weights["repo_id"], src_repo_type="model",
+                           src_revision=base_weights["revision"]) for name in sorted(expected_tree)]
+            operations += [CommitOperationDelete(path_in_repo=name)
+                           for name in sorted(source_tree.keys() - expected_tree.keys() - names)]
 
         # HF compare-and-swap owns the race with any writer advancing HEAD.
         # A lost acknowledgement leaves the unchanged local plan for exact retry.
         head = api.create_commit(
             repo_id=repo, parent_commit=parent, commit_message=plan["commit_message"],
-            operations=[CommitOperationAdd(path_in_repo=name,
-                        path_or_fileobj=str(directory / name)) for name in sorted(names)],
+            operations=operations,
         ).oid
     target_commits = list(api.list_repo_commits(repo, revision=head))
     if (len(target_commits) < 2 or target_commits[0].commit_id != head
@@ -111,10 +135,10 @@ def publish_prepared(directory: Path, *, api, download, apply=False,
     if source_checkpoint_number(target_commits, head) != transition["target_checkpoint_n"]:
         raise ValueError("bootstrap checkpoint number differs")
     target_tree = _tree(api, repo, head)
-    if {k: v for k, v in source_tree.items() if k not in names} != {
+    if {k: v for k, v in expected_tree.items() if k not in names} != {
         k: v for k, v in target_tree.items() if k not in names
     }:
-        raise ValueError("bootstrap changed weights or unrelated repository files")
+        raise ValueError("bootstrap changed weights or unrelated repository files from the expected source")
     for name, identity in identities.items():
         found = target_tree.get(name)
         if found is None or found != (
@@ -130,6 +154,8 @@ def publish_prepared(directory: Path, *, api, download, apply=False,
                "trained_window_cursor": profile["trained_window_cursor"],
                "training_run_id": profile["training_run_id"], "parent_commit": parent,
                "metadata_sha256": {name: value["sha256"] for name, value in identities.items()}}
+    if base_weights is not None:
+        receipt["base_weights"] = base_weights
     if apply:
         write_json(directory / "published-receipt.json", receipt)
     return receipt

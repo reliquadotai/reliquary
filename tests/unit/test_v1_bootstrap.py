@@ -31,12 +31,24 @@ def test_new_curriculum_bootstrap_preserves_parent_but_resets_run_and_cursor(mon
     assert len(transition["environment_targets"]) == 3
     assert "private_storage_migration" not in transition
     assert plan["private_storage_migration"]["storage_mode"] == "distinct-bucket"
+    reset = prepare.prepare_bootstrap(source, **args, reset_to_base=True)
+    reset_transition = reset["files"][prepare.TRANSITION]
+    assert reset_transition["weights"] == "reset_from_pinned_base_model"
+    assert reset_transition["base_weights"] == {
+        "repo_id": target["base_model_id"], "revision": target["base_model_revision"],
+    }
+    assert reset["files"][prepare.CHECKPOINT_PROFILE_NAME] == profile
+    assert reset["private_storage_migration"]["carry_prompt_and_content_cooldowns"] == []
+    assert reset["private_storage_migration"]["initialize_empty_cooldowns"] == list(transition["environment_targets"])
+    with pytest.raises(ValueError, match="LR step zero"):
+        prepare.prepare_bootstrap(source, **args, reset_to_base=True, lr_start_step=800)
     reused = prepare.prepare_bootstrap(source, **{**args, "target_bucket": "old-run"},
                                       storage_mode="reuse-after-fence")
     assert reused["files"] == plan["files"]  # Storage choice changes no model/run contract.
     assert reused["private_storage_migration"]["source_bucket"] == reused["private_storage_migration"]["target_bucket"]
     for changes in ({"target_bucket": "old-run"}, {"last_archived_window": 51},
                     {"checkpoint_n": True}, {"lr_start_step": -1},
+                    {"reset_to_base": "true"},
                     {"storage_mode": "reuse-after-fence"}, {"storage_mode": "unknown"}):
         with pytest.raises(ValueError):
             prepare.prepare_bootstrap(source, **{**args, **changes})
