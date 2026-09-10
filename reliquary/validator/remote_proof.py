@@ -106,6 +106,7 @@ class RemoteProofPool:
         raw = None if body is None else canonical_bytes(body.model_dump())
         if raw is not None and len(raw) > MAX_REQUEST_BYTES:
             raise ProofWorkerUnavailable("proof request exceeds transport bound")
+        retry = retry or method == "GET"  # A stale keep-alive must not fence a healthy worker.
         for attempt in range(2 if retry else 1):
             try:
                 with self._client.stream(method, path, content=raw,
@@ -119,7 +120,7 @@ class RemoteProofPool:
                     return bytes(result)
             except httpx.TransportError as exc:
                 if retry and attempt == 0:
-                    continue  # Same job/attempt/body; server returns a cached result.
+                    continue  # Idempotent GET or the same cached proof job/attempt/body.
                 raise ProofWorkerUnavailable("proof transport unavailable",
                                               remote_error_type=type(exc).__name__) from exc
             except httpx.HTTPStatusError as exc:
