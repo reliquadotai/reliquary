@@ -18,9 +18,17 @@ from reliquary.shared.strict_json import strict_json_loads
 PROOF_PROTOCOL = "reliquary.remote-proof/v1"
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
-MAX_PROOF_BATCH = 4
-MAX_BATCH_REQUEST_BYTES = MAX_PROOF_BATCH * MAX_REQUEST_BYTES + 1024
-MAX_BATCH_RESPONSE_BYTES = MAX_PROOF_BATCH * MAX_RESPONSE_BYTES + 1024
+# One batch per training group. A group is B_BATCH=16 rollouts, so a batch of
+# four split every group across four round trips: measured in production each
+# trip cost ~1.2 s of which only ~0.44 s was the forward, i.e. ~60% of proof
+# wall time was round-trip overhead and windows could not fill.
+MAX_PROOF_BATCH = 16
+# Deliberately not MAX_PROOF_BATCH * MAX_REQUEST_BYTES. A sixteen-item batch
+# measures ~500 KB in production, so these ceilings already keep two orders of
+# magnitude of headroom, and a larger batch must not enlarge the buffer a
+# single mTLS peer can make the worker allocate.
+MAX_BATCH_REQUEST_BYTES = 4 * MAX_REQUEST_BYTES + 1024
+MAX_BATCH_RESPONSE_BYTES = 4 * MAX_RESPONSE_BYTES + 1024
 MAX_TOKENS = 65536
 Hash = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 OID = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
