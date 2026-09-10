@@ -4602,6 +4602,13 @@ class GrpoWindowBatcher:
         seed_cdf_per_rollout: list[dict[str, Any]] = []
         utility_rollouts: list[dict[str, Any]] = []
 
+        remote_batch = getattr(self._verify_commitment, "batch", None)
+        prefetched_proofs = []
+        def seed_uniforms(index, commit):
+            positions = policy_token_positions(list(commit.get("tokens") or []), commit.get("rollout") or {})
+            return [u_at(self.randomness, request.prompt_idx, request.checkpoint_hash, index, j)
+                    for j in range(len(positions))]
+
         for rollout_idx, rollout in enumerate(request.rollouts):
             # Never carry a validator-derived carve across re-validation of the
             # same Pydantic object. The private value is set only after the
@@ -4641,21 +4648,23 @@ class GrpoWindowBatcher:
             rollout_sketch_metrics = sketch_commitment_metrics(
                 rollout.commit.get("commitments") or []
             )
-            seed_u = [
-                u_at(
-                    self.randomness, request.prompt_idx,
-                    request.checkpoint_hash, rollout_idx, j,
-                )
-                for j in range(_seed_completion_len)
-            ]
+            seed_u = seed_uniforms(rollout_idx, rollout.commit)
             try:
-                proof = self._verify_commitment(
-                    rollout.commit,
-                    proof_model,
-                    self.randomness,
-                    tokenizer=self.tokenizer,
-                    seed_u_values=seed_u,
-                )
+                if remote_batch is not None:
+                    if not prefetched_proofs:
+                        from reliquary.validator.remote_proof_protocol import MAX_PROOF_BATCH
+                        inputs = [(r.commit, seed_uniforms(index, r.commit)) for index, r in
+                                  enumerate(request.rollouts[rollout_idx:rollout_idx + MAX_PROOF_BATCH], rollout_idx)]
+                        prefetched_proofs = remote_batch(inputs, proof_model, self.randomness)
+                    proof = prefetched_proofs.pop(0)
+                else:
+                    proof = self._verify_commitment(
+                        rollout.commit,
+                        proof_model,
+                        self.randomness,
+                        tokenizer=self.tokenizer,
+                        seed_u_values=seed_u,
+                    )
             except TypeError as exc:
                 # Backward-compat fallback for stub verifiers (tests, legacy
                 # callers) that don't accept one or both of the newer kwargs.

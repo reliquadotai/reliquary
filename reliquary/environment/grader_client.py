@@ -54,6 +54,7 @@ class GraderClient:
 
     def __init__(self, socket_path: str = GRADER_SOCKET_PATH) -> None:
         self.socket_path = socket_path
+        self.deadline_monotonic: float | None = None
 
     def evaluate_cases(self, code: str, cases: list[dict[str, Any]], timeout_s: float) -> float:
         """Send (code, structured cases) and return passed/total in [0, 1].
@@ -71,6 +72,13 @@ class GraderClient:
             "cases": cases,
             "timeout_s": timeout_s,
         }
+        # One lot contains all cases. Admission supplies its earlier deadline.
+        from reliquary.environment.grader.executor import MAX_EXECUTOR_BATCH_TIMEOUT_SECONDS
+        req["deadline_monotonic"] = min(
+            time.monotonic() + min(MAX_EXECUTOR_BATCH_TIMEOUT_SECONDS,
+                                   timeout_s * len(cases)) + _SOCKET_TIMEOUT_HEADROOM_S,
+            self.deadline_monotonic if self.deadline_monotonic is not None else float("inf"),
+        )
         # One retry with short backoff for transient failures (grader
         # restarting, accept queue full).
         for attempt in (1, 2):
@@ -102,12 +110,20 @@ class GraderClient:
         return passed / total
 
     def _round_trip(self, req: dict) -> dict:
+        deadline = req.get("deadline_monotonic", time.monotonic() + req["timeout_s"] + _SOCKET_TIMEOUT_HEADROOM_S)
+        def remaining():
+            seconds = deadline - time.monotonic()
+            if seconds <= 0:
+                raise GraderInfrastructureError("admission_deadline_exceeded")
+            return seconds
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.settimeout(req["timeout_s"] + _SOCKET_TIMEOUT_HEADROOM_S)
+            s.settimeout(remaining())
             s.connect(self.socket_path)
+            s.settimeout(remaining())
             s.sendall(json.dumps(req).encode() + b"\n")
             buf = b""
             while True:
+                s.settimeout(remaining())
                 chunk = s.recv(4096)
                 if not chunk:
                     break

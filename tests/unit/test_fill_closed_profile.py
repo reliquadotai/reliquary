@@ -132,7 +132,7 @@ def test_a_target_past_the_emission_ceiling_refuses_to_import():
     )
 
     assert result.returncode != 0
-    assert "FILL_CLOSED_EMISSIONS_PER_WINDOW" in result.stderr
+    assert "picks per window * B_BATCH" in result.stderr
     assert "journal" in result.stderr
 
 
@@ -142,8 +142,8 @@ def test_a_target_below_the_pick_horizon_also_refuses_to_import():
     )
 
     assert result.returncode != 0
-    assert "must equal FILL_CLOSED_EMISSIONS_PER_WINDOW" in result.stderr
-    assert "pick horizon" in result.stderr
+    assert "must equal picks per window * B_BATCH" in result.stderr
+    assert "journal range" in result.stderr
 
 
 def test_fill_closed_runtime_bounds_are_coherent_and_finite():
@@ -301,3 +301,22 @@ def test_submission_quota_covers_fill_window_without_changing_legacy():
         env.update(RELIQUARY_PROTOCOL_PROFILE=profile, RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED=enabled)
         result = subprocess.run([sys.executable, "-c", source], env=env, check=True, capture_output=True, text=True)
         assert result.stdout.strip() == f"{quota} 2"
+
+
+def test_ten_picks_keep_the_existing_profile_and_sixteen_journal_keys():
+    env = {k: v for k, v in os.environ.items() if not k.startswith('RELIQUARY_')}
+    env.update(RELIQUARY_PROTOCOL_PROFILE='qwen3-4b-base-dapo-fill-closed-v6',
+               RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED='1',
+               RELIQUARY_FILL_CLOSED_PICKS_PER_WINDOW='10')
+    script = '''from reliquary import constants as c
+from reliquary.infrastructure.training_payload_queue import encoded_window_journal_key
+assert c.FILL_CLOSED_PICKS_PER_WINDOW == 10
+assert c.FILL_CLOSED_TARGET_GROUPS_PER_ENV == 160
+assert c.FILL_CLOSED_EMISSIONS_PER_WINDOW == 16
+assert c.MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW == 512
+assert c.M_ROLLOUTS == 16
+assert encoded_window_journal_key(42, 15) == 687
+assert encoded_window_journal_key(43, 0) == 688
+'''
+    result = subprocess.run([sys.executable, '-c', script], env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr

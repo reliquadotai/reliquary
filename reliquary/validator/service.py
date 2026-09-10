@@ -1297,6 +1297,15 @@ class ValidationService:
             "verify_checkpoint_revision": verify_revision,
             "degraded_reasons": degraded_reasons,
         })
+        missing = {}
+        for environment, batcher in getattr(self, "_active_batchers", {}).items():
+            fill = getattr(batcher, "fill_state", None)
+            if fill is not None:
+                with fill.lock:
+                    groups = getattr(batcher, "_proven_groups", {}).get(environment, [])
+                    missing[environment] = max(0, B_BATCH - sum(not group.picked for group in groups))
+        snapshot["next_batch_missing_groups_by_environment"] = missing
+        snapshot["pick_wait_reason"] = getattr(self, "_fill_pick_wait_reason", None)
         return snapshot
 
     def _refresh_verify_model_from_train(
@@ -2301,7 +2310,7 @@ class ValidationService:
         verification in ``indices_from_root`` if the chain call that fills
         randomness fails (e.g. finney WebSocket returns 503).
         """
-        from reliquary.constants import FILL_CLOSED_EMISSIONS_PER_WINDOW
+        from reliquary.constants import FILL_CLOSED_PICKS_PER_WINDOW
         from reliquary.validator.fill_closed_batch_assembler import (
             FillClosedBatchAssembler,
         )
@@ -2347,7 +2356,7 @@ class ValidationService:
                     env_name: FILL_CLOSED_ADMISSION_BUDGET_PER_ENV
                     for env_name in self.envs
                 },
-                picks_target=FILL_CLOSED_EMISSIONS_PER_WINDOW,
+                picks_target=FILL_CLOSED_PICKS_PER_WINDOW,
             )
             if FILL_CLOSED_ENABLED
             else None
@@ -3022,11 +3031,14 @@ class ValidationService:
                 return False
             next_pick = int(fill_state.snapshot()["picks_emitted"]) + 1
         if not all(batcher.can_pick() for batcher in picking):
+            self._fill_pick_wait_reason = "candidate_shortfall"
             return False
         if not self._fill_closed_pick_gate_open(
             picking[0], next_pick=next_pick
         ):
+            self._fill_pick_wait_reason = "first_pick_floor" if next_pick == 1 else "trainer_cursor"
             return False
+        self._fill_pick_wait_reason = None
         refused = [
             str(getattr(getattr(batcher, "env", None), "name", "?"))
             for batcher in picking
@@ -5371,6 +5383,14 @@ class ValidationService:
         await asyncio.sleep(2.0)
         return True
 
+    async def _control_heartbeat(self) -> None:
+        while True:
+            try:
+                self._control_store.heartbeat(window=self._window_n)
+            except OSError:
+                logger.exception("control heartbeat could not be persisted")
+            await asyncio.sleep(5)
+
     async def run(self, subtensor) -> None:
         from reliquary.infrastructure.archive_queue import get_archive_queue
         from reliquary.validator.control import ControlStore
@@ -5449,6 +5469,7 @@ class ValidationService:
         #   docker logs reliquary-trainer | grep "Reliquary build:"
         logger.info("Reliquary build: r2-reliability-suite (Layers 1+2+3)")
         axon_served = False
+        control_heartbeat = asyncio.create_task(self._control_heartbeat())
         try:
             while True:
                 try:
@@ -5852,6 +5873,11 @@ class ValidationService:
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
         finally:
             # Cancel the archive worker and let it drain in-flight uploads
+            control_heartbeat.cancel()
+            try:
+                await control_heartbeat
+            except asyncio.CancelledError:
+                pass
             # before we tear down the server. The worker survives many
             # window cycles so we shut it down deliberately rather than
             # waiting for process exit to GC it.

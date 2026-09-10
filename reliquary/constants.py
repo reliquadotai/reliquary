@@ -488,8 +488,8 @@ if (
 MAX_PENDING_PROOF_QUEUE_DEPTH = 64
 
 # Reward admission runs before deferred GRAIL proof. Math grading benefits from
-# bounded CPU parallelism; four Code group workers each fan eight rollouts over
-# the 32-slot sandbox pool. These are validator-runtime capacities, not miner
+# bounded CPU parallelism; four Code group workers each fan sixteen rollouts through
+# the shared capacity-bounded remote executor client. These are validator-runtime capacities, not miner
 # wire constants.
 MATH_ADMISSION_WORKERS = int(
     _os.environ.get("RELIQUARY_MATH_ADMISSION_WORKERS", "8")
@@ -771,44 +771,20 @@ if PROTOCOL_PROFILE_ID in _FILL_CLOSED_PROFILE_IDS and not FILL_CLOSED_ENABLED:
         "experimental fill-closed capability"
     )
 
-# Proven groups that close one environment. 16 optimizer steps x B_BATCH.
-FILL_CLOSED_TARGET_GROUPS_PER_ENV = int(_os.environ.get(
-    "RELIQUARY_FILL_CLOSED_TARGET_GROUPS_PER_ENV",
-    str(CHECKPOINT_PUBLISH_INTERVAL_WINDOWS * B_BATCH),
-))
-if FILL_CLOSED_TARGET_GROUPS_PER_ENV <= 0:
-    raise ValueError(
-        "RELIQUARY_FILL_CLOSED_TARGET_GROUPS_PER_ENV must be positive"
-    )
-
-# How many training-payload emissions one v6 window can produce, for the
-# journal key encoding (R11): window_start * FILL_CLOSED_EMISSIONS_PER_
-# WINDOW + batch_index. Derived from CHECKPOINT_PUBLISH_INTERVAL_WINDOWS
-# for the same reason FILL_CLOSED_TARGET_GROUPS_PER_ENV is derived from it
-# above -- one B_BATCH-per-environment emission per optimizer step, and a
-# window's target is exactly CHECKPOINT_PUBLISH_INTERVAL_WINDOWS steps
-# worth of groups. A literal, not separately env-overridable: an operator
-# changing this without changing the target (or vice versa) would size
-# the journal's per-window key range out of step with how many emissions
-# a window can actually produce.
+# The durable key stride cannot change in an existing training run. A smaller
+# operational pick target closes earlier and pads the unused keys with tombstones.
 FILL_CLOSED_EMISSIONS_PER_WINDOW = CHECKPOINT_PUBLISH_INTERVAL_WINDOWS
-
-# The target, pick horizon and journal key range are one shape. v6.1 closes
-# after ``FILL_CLOSED_EMISSIONS_PER_WINDOW`` complete B_BATCH picks, so a
-# smaller target is just as incoherent as a larger one: the former cannot close
-# and the latter writes past its key range. Keep the old environment variable
-# only as a validated deployment input; it may not redefine one field alone.
-_FILL_CLOSED_TRAINABLE_GROUPS_PER_ENV = (
-    FILL_CLOSED_EMISSIONS_PER_WINDOW * B_BATCH
-)
-if FILL_CLOSED_TARGET_GROUPS_PER_ENV != _FILL_CLOSED_TRAINABLE_GROUPS_PER_ENV:
-    raise ValueError(
-        "RELIQUARY_FILL_CLOSED_TARGET_GROUPS_PER_ENV="
-        f"{FILL_CLOSED_TARGET_GROUPS_PER_ENV} must equal "
-        f"FILL_CLOSED_EMISSIONS_PER_WINDOW ({FILL_CLOSED_EMISSIONS_PER_WINDOW})"
-        f" * B_BATCH ({B_BATCH}) so the pick horizon, admission target and "
-        "journal key range cannot diverge"
-    )
+FILL_CLOSED_PICKS_PER_WINDOW = int(_os.environ.get(
+    "RELIQUARY_FILL_CLOSED_PICKS_PER_WINDOW", str(FILL_CLOSED_EMISSIONS_PER_WINDOW),
+))
+if not 1 <= FILL_CLOSED_PICKS_PER_WINDOW <= FILL_CLOSED_EMISSIONS_PER_WINDOW:
+    raise ValueError("fill-closed picks must fit the immutable journal key range")
+FILL_CLOSED_TARGET_GROUPS_PER_ENV = int(_os.environ.get(
+    "RELIQUARY_FILL_CLOSED_TARGET_GROUPS_PER_ENV", str(FILL_CLOSED_PICKS_PER_WINDOW * B_BATCH),
+))
+if FILL_CLOSED_TARGET_GROUPS_PER_ENV != FILL_CLOSED_PICKS_PER_WINDOW * B_BATCH:
+    raise ValueError("fill-closed target must equal picks per window * B_BATCH within the journal range")
+_FILL_CLOSED_TRAINABLE_GROUPS_PER_ENV = FILL_CLOSED_TARGET_GROUPS_PER_ENV
 
 # Backstop only. A window normally ends on its fill; this stops stalled
 # candidate supply holding one open forever, and seals whatever is proven.
@@ -1046,7 +1022,7 @@ HASH_DEDUP_RETENTION_WINDOWS = int(
 # the full window with the same 2x attempt margin. GPU/admission budgets and
 # proof-failure limits remain independently enforced. Legacy quotas stay fixed.
 MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW = (
-    2 * FILL_CLOSED_TARGET_GROUPS_PER_ENV if FILL_CLOSED_ENABLED
+    2 * FILL_CLOSED_EMISSIONS_PER_WINDOW * B_BATCH if FILL_CLOSED_ENABLED
     else 2 * B_BATCH if PROTOCOL_VERSION >= 4 else B_BATCH
 )
 

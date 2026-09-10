@@ -37,6 +37,7 @@ class ControlStore:
         self.path = Path(state_dir) / "control.json"
         self.status_path = self.path.with_name("control-status.json")
         self.start_closed = start_closed
+        self._last_report: dict | None = None
 
     def request(self) -> dict:
         try:
@@ -74,9 +75,18 @@ class ControlStore:
         return request
 
     def report(self, request: dict, *, phase: str, **details) -> None:
-        write_json(self.status_path, {"schema_version": 1,
+        report = {"schema_version": 1,
                    "request_id": request["request_id"], "phase": phase,
-                   "updated_at": time.time(), "pid": os.getpid(), **details})
+                   "updated_at": time.time(), "pid": os.getpid(), **details}
+        write_json(self.status_path, report)
+        self._last_report = report
+
+    def heartbeat(self, **details) -> None:
+        # Refresh only an acknowledged request, never acknowledge a new drain.
+        if self._last_report is not None:
+            report = {**self._last_report, **details, "updated_at": time.time()}
+            write_json(self.status_path, report)
+            self._last_report = report
 
     def status(self) -> dict:
         request = self.request()

@@ -583,3 +583,52 @@ def test_worker_utility_workload_setting_is_bound_to_controller(pki):
         changed=client.health.model_copy(update={'utility_telemetry_enabled':not utility_telemetry_enabled()})
         with pytest.raises(ProofWorkerUnavailable,match='utility telemetry setting differs'):
             client._validate_health(changed)
+
+
+def test_four_item_batches_preserve_receipts_and_retry_without_recomputing(pki):
+    from reliquary.validator.remote_proof_protocol import ProofBatchRequest
+    backend = CPUProofBackend()
+    with endpoint(pki, backend) as client:
+        value = payload()
+        posts = []
+        original = client._request
+        def capture(method, path, body=None, **kwargs):
+            if method == 'POST':
+                posts.append((path, body, kwargs))
+            return original(method, path, body, **kwargs)
+        client._request = capture
+        with client.measure_group() as receipts:
+            for _ in range(4):
+                result = client.prove_many('cuda:0', [(value.commit(), value.seed_u_values)] * 4,
+                    value.randomness, window=42, environment='openmathinstruct', checkpoint=client._adopted)
+                assert len(result) == 4 and all(r.all_passed for r in result)
+        assert len(posts) == 4 and backend.calls == len(receipts) == 16
+        path, body, kwargs = posts[0]
+        assert path == '/v1/prove-batch' and isinstance(body, ProofBatchRequest)
+        original('POST', path, body, **kwargs)  # Lost complete response.
+        original('POST', '/v1/prove', body.items[0], timeout=2)  # Same item, other route.
+        assert backend.calls == 16
+        rebound = body.items[0].model_copy(update={'window': 43})
+        with pytest.raises(ProofWorkerUnavailable, match='409'):
+            original('POST', '/v1/prove', rebound, timeout=2)
+        assert backend.calls == 16
+
+
+def test_batch_stops_at_first_grail_failure_and_rejects_mixed_identity(pki):
+    from reliquary.validator.remote_proof_protocol import ProofBatchRequest
+    backend = CPUProofBackend()
+    original = backend.prove
+    def fail_first(request):
+        value = original(request)
+        value.all_passed = False
+        value.passed = 0
+        return value
+    backend.prove = fail_first
+    with endpoint(pki, backend) as client:
+        value = payload()
+        result = client.prove_many('cuda:0', [(value.commit(), value.seed_u_values)] * 4,
+            value.randomness, window=42, environment='openmathinstruct', checkpoint=client._adopted)
+        assert len(result) == 1 and not result[0].all_passed and backend.calls == 1
+        items = [request_for(client, job_id='a'), request_for(client, job_id='b', window=43)]
+        with pytest.raises(ValueError, match='same|share'):
+            ProofBatchRequest(items=items)

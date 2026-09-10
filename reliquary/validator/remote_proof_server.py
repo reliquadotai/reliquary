@@ -19,10 +19,33 @@ from reliquary.validator.proof_worker import ProofWorkerUnavailable
 from reliquary.validator.remote_proof_protocol import (
     MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, AdoptionRequest, CheckpointBinding,
     ProofHealth, ProofRequest, ProofResponse, ProofValues, SlotState,
-    canonical_bytes, digest, transport_hash,
+    canonical_bytes, digest, transport_hash, ProofBatchRequest, ProofBatchResponse,
+    MAX_BATCH_REQUEST_BYTES, MAX_BATCH_RESPONSE_BYTES,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def prune_checkpoint_cache(repo_id, protected):
+    """Bound public weight downloads; never touch another repo or shared blobs."""
+    from huggingface_hub import scan_cache_dir
+    from huggingface_hub.constants import HF_HUB_CACHE
+    from pathlib import Path
+
+    if not Path(HF_HUB_CACHE).is_dir():
+        return
+    cache = scan_cache_dir(HF_HUB_CACHE)
+    for repo in cache.repos:
+        if repo.repo_id != repo_id or repo.repo_type != "model":
+            continue
+        recent = sorted(repo.revisions, key=lambda r: r.last_modified, reverse=True)[:2]
+        keep = set(protected) | {r.commit_hash for r in recent}
+        obsolete = [r.commit_hash for r in repo.revisions if r.commit_hash not in keep]
+        if obsolete:
+            strategy = cache.delete_revisions(*obsolete)
+            logger.info("proof_cache_prune revisions=%d bytes=%d", len(obsolete),
+                        strategy.expected_freed_size)
+            strategy.execute()
 
 
 class ProofBackend:
@@ -32,6 +55,7 @@ class ProofBackend:
         self.pool = pool
         self.devices = pool.devices
         self._descriptions = {}
+        self._anchor_revision = None
 
     def describe(self, device):
         description = self.pool.describe(device)
@@ -68,6 +92,12 @@ class ProofBackend:
         for key in ("profile_id", "generation_contract_sha256", "training_run_id"):
             if profile.get(key) != getattr(checkpoint, key):
                 raise ValueError(f"checkpoint profile mismatch: {key}")
+        if self._anchor_revision is None:
+            self._anchor_revision = checkpoint.revision
+        prune_checkpoint_cache(checkpoint.repo_id, {
+            self._anchor_revision, checkpoint.revision,
+            *(self.pool.revision(device) for device in self.devices),
+        })
         for device in self.devices:
             self.pool.reload(device, None, checkpoint.revision, checkpoint.repo_id)
             # The local pool's parent cache is not evidence of loaded weights.
@@ -134,16 +164,16 @@ def create_proof_app(*, backend, worker_id: str, profile_id: str,
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 
-    async def read(request, cls):
+    async def read(request, cls, limit=MAX_REQUEST_BYTES):
         if request.headers.get("content-type", "").split(";", 1)[0] != "application/json":
             raise HTTPException(415, "application/json required")
         body = bytearray()
         async for chunk in request.stream():
             body.extend(chunk)
-            if len(body) > MAX_REQUEST_BYTES:
+            if len(body) > limit:
                 raise HTTPException(413, "request too large")
         try:
-            return cls.read(bytes(body))
+            return cls.read(bytes(body), limit=limit)
         except (ValueError, TypeError, RecursionError) as exc:
             raise HTTPException(422, "invalid proof protocol message") from exc
 
@@ -221,21 +251,33 @@ def create_proof_app(*, backend, worker_id: str, profile_id: str,
             logger.warning("proof adoption failed: %s", type(exc).__name__)
             raise HTTPException(503, "checkpoint adoption failed") from exc
 
-    @app.post("/v1/prove")
-    async def prove(request: Request):
+    async def prove_values(values, *, batch):
         nonlocal cache_bytes
-        value = await read(request, ProofRequest)
-        check_identity(value)
-        if value.environment not in environments:
-            raise HTTPException(409, "environment is not in the proof profile")
+        hashes = []
         now_ms = int(clock() * 1000)
-        if not now_ms < value.expires_at_ms <= now_ms + 3_600_000:
-            raise HTTPException(409, "proof deadline expired or unbounded")
-        key = (value.job_id, value.attempt)
-        request_hash = digest(value.model_dump())
+        for value in values:
+            check_identity(value)
+            if value.environment not in environments:
+                raise HTTPException(409, "environment is not in the proof profile")
+            if not now_ms < value.expires_at_ms <= now_ms + 3_600_000:
+                raise HTTPException(409, "proof deadline expired or unbounded")
+            raw = canonical_bytes(value.model_dump())
+            if len(raw) > MAX_REQUEST_BYTES:
+                raise HTTPException(413, "proof item too large")
+            hashes.append(digest(value.model_dump()))
+        first = values[0]
+        # Ordered batch cache plus per-item receipts: retry either endpoint without
+        # executing completed work again. A running/failed attempt stays fenced.
+        key = ("batch:" + digest(hashes), 0) if batch else (first.job_id, first.attempt)
+        request_hash = digest(hashes) if batch else hashes[0]
+        limit = MAX_BATCH_RESPONSE_BYTES if batch else MAX_RESPONSE_BYTES
         with state_lock:
-            if value.checkpoint != checkpoint:
+            if any(value.checkpoint != checkpoint for value in values):
                 raise HTTPException(409, "checkpoint not adopted")
+            for value, bound_hash in zip(values, hashes):
+                previous = cache.get((value.job_id, value.attempt))
+                if previous is not None and previous[0] != bound_hash:
+                    raise HTTPException(409, "proof attempt was rebound")
             previous = cache.get(key)
             if previous is not None:
                 if previous[0] != request_hash:
@@ -243,14 +285,16 @@ def create_proof_app(*, backend, worker_id: str, profile_id: str,
                 if not previous[1]:
                     raise HTTPException(503, "proof attempt is running or failed")
                 return Response(previous[1], media_type="application/json")
-            lock = locks.get(value.device_id)
+            lock = locks.get(first.device_id)
             if lock is None:
                 raise HTTPException(409, "unknown proof slot")
             if not lock.acquire(blocking=False):
                 raise HTTPException(503, "proof slot busy")
-            # Keep running entries until completion; at most one per slot.
-            while len(cache) >= 128 or cache_bytes >= cache_limit:
-                old_key = next((k for k, (_, body) in cache.items() if body is not None), None)
+            reserved = {key} | {(value.job_id, value.attempt) for value in values}
+            # Reserve room for both the batch envelope and per-item receipts.
+            while len(cache) + len(reserved) > 128 or cache_bytes + 2 * limit > cache_limit:
+                old_key = next((k for k, (_, body) in cache.items()
+                                if body is not None and k not in reserved), None)
                 if old_key is None:
                     lock.release()
                     raise HTTPException(503, "proof retry cache full")
@@ -260,32 +304,62 @@ def create_proof_app(*, backend, worker_id: str, profile_id: str,
 
         def execute():
             nonlocal cache_bytes
+            results = []
             try:
-                description = backend.describe(value.device_id)
-                if description["revision"] != value.checkpoint.revision or description["runtime"]["profile_hash"] != value.runtime_hash:
-                    raise ProofWorkerUnavailable("loaded proof identity changed")
-                result = ProofValues.from_kernel(backend.prove(value))
-                result.validate_input_coverage(value.payload)
-                if int(clock() * 1000) >= value.expires_at_ms:
-                    raise ProofWorkerUnavailable("proof completed after deadline")
-                raw = canonical_bytes(ProofResponse(
-                    request_sha256=request_hash,
-                    **{k: getattr(value, k) for k in (
-                        "job_id", "attempt", "worker_id", "session_id", "device_id",
-                        "runtime_hash", "checkpoint", "window", "environment", "content_sha256",
-                    )}, result=result,
-                ).model_dump())
-                if len(raw) > MAX_RESPONSE_BYTES:
+                for value, bound_hash in zip(values, hashes):
+                    item_key = (value.job_id, value.attempt)
+                    if int(clock() * 1000) >= value.expires_at_ms:
+                        raise ProofWorkerUnavailable("proof deadline expired before execution")
+                    with state_lock:
+                        old = cache.get(item_key) if batch else None
+                        if old is not None and not old[1]:
+                            raise ProofWorkerUnavailable("proof attempt is running or failed")
+                        if old is None:
+                            cache[item_key] = (bound_hash, None)
+                    if old is not None:
+                        result = ProofResponse.read(old[1], limit=MAX_RESPONSE_BYTES)
+                    else:
+                        started = time.perf_counter()
+                        description = backend.describe(value.device_id)
+                        if description["revision"] != value.checkpoint.revision or description["runtime"]["profile_hash"] != value.runtime_hash:
+                            raise ProofWorkerUnavailable("loaded proof identity changed")
+                        backend_started = time.perf_counter()
+                        proof = ProofValues.from_kernel(backend.prove(value))
+                        backend_ms = (time.perf_counter() - backend_started) * 1000
+                        proof.validate_input_coverage(value.payload)
+                        if int(clock() * 1000) >= value.expires_at_ms:
+                            raise ProofWorkerUnavailable("proof completed after deadline")
+                        result = ProofResponse(request_sha256=bound_hash,
+                            **{k: getattr(value, k) for k in (
+                                "job_id", "attempt", "worker_id", "session_id", "device_id",
+                                "runtime_hash", "checkpoint", "window", "environment", "content_sha256",
+                            )}, result=proof)
+                        raw = canonical_bytes(result.model_dump())
+                        if len(raw) > MAX_RESPONSE_BYTES:
+                            raise ProofWorkerUnavailable("proof response exceeded bound")
+                        with state_lock:
+                            cache[item_key] = (bound_hash, raw)
+                            cache_bytes += len(raw)
+                        logger.info("proof_backend job=%s window=%d env=%s identity_ms=%.3f backend_ms=%.3f total_ms=%.3f",
+                                    value.job_id, value.window, value.environment,
+                                    (backend_started - started) * 1000, backend_ms,
+                                    (time.perf_counter() - started) * 1000)
+                    results.append(result)
+                    if not result.result.all_passed:
+                        break
+                raw = canonical_bytes((ProofBatchResponse(items=results) if batch else results[0]).model_dump())
+                if len(raw) > limit:
                     raise ProofWorkerUnavailable("proof response exceeded bound")
-                with state_lock:
-                    cache[key] = (request_hash, raw)
-                    cache_bytes += len(raw)
+                if batch:
+                    with state_lock:
+                        cache[key] = (request_hash, raw)
+                        cache_bytes += len(raw)
                 return raw
             except Exception:
-                # Preserve the attempt tombstone (bounded with cache entries).
-                # A retry cannot quietly execute a second possibly-running job.
                 with state_lock:
-                    cache[key] = (request_hash, b"")
+                    for failed_key, (bound_hash, body) in list(cache.items()):
+                        if failed_key in reserved and body is None:
+                            cache[failed_key] = (bound_hash, b"")
                 raise
 
         try:
@@ -305,14 +379,25 @@ def create_proof_app(*, backend, worker_id: str, profile_id: str,
             raw = await asyncio.wrap_future(future)
             return Response(raw, media_type="application/json")
         except Exception as exc:
-            logger.warning("proof failed job=%s cause=%s", value.job_id, type(exc).__name__)
+            logger.warning("proof failed job=%s cause=%s", first.job_id, type(exc).__name__)
             raise HTTPException(503, "proof infrastructure failure") from exc
+
+    @app.post("/v1/prove")
+    async def prove(request: Request):
+        return await prove_values([await read(request, ProofRequest)], batch=False)
+
+    @app.post("/v1/prove-batch")
+    async def prove_batch(request: Request):
+        value = await read(request, ProofBatchRequest, MAX_BATCH_REQUEST_BYTES)
+        return await prove_values(value.items, batch=True)
 
     return app
 
 
 def main():
     import uvicorn
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(name)s %(levelname)s %(message)s")
     from reliquary import constants as c
     from reliquary.validator.observability import immutable_build_revision
     from reliquary.validator.proof_capacity import (
@@ -365,7 +450,7 @@ def main():
         )
         uvicorn.run(app, host=host,
                     port=int(os.environ.get("RELIQUARY_PROOF_PORT", "8445")),
-                    access_log=False, server_header=False,
+                    access_log=False, server_header=False, timeout_keep_alive=120,
                     limit_concurrency=len(pool.devices) * 2 + 4, **tls)
     finally:
         pool.close(force=True)

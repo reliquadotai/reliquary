@@ -254,6 +254,25 @@ class _FakePool:
         return "grader_executor_requests_total 1\n"
 
 
+def test_shared_admission_deadline_reaches_executor_and_expiry_is_infrastructure():
+    from reliquary.environment.grader.remote import create_cpu_executor_app
+    class Pool(_FakePool):
+        def execute_sandbox_batch(self, request, *, deadline_monotonic=None):
+            assert 0 < deadline_monotonic - time.monotonic() <= 30
+            return super().execute_sandbox_batch(request)
+    request = _request()
+    pool = Pool()
+    app = create_cpu_executor_app(pool, runtime_id=request.runtime_id,
+                                 executor_id="cpu-test", max_inflight=1)
+    with TestClient(app) as client:
+        for offset, status in ((30, 200), (-1, 503), (200, 503)):
+            result = client.post("/v1/execute", content=request.model_dump_json(),
+                headers={"content-type": "application/json",
+                         "X-Reliquary-Deadline-Ms": str(int((time.time() + offset) * 1000))})
+            assert result.status_code == status
+    assert pool.requests == [request]
+
+
 def test_cpu_executor_api_validates_runtime_and_exposes_health():
     from reliquary.environment.grader.remote import create_cpu_executor_app
 
@@ -629,3 +648,48 @@ def test_remote_pool_replaces_sandbox_after_each_hostile_batch(tmp_path):
     assert replacement_pid != initial_pid
     assert health["retire_worker_after_batch"] is True
     assert health["worker_restarts_total"]["batch_isolation"] == 1
+
+
+def test_real_shared_http_pool_bounds_64_calls_to_16_connections():
+    from concurrent.futures import ThreadPoolExecutor
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+    import time
+    from reliquary.environment.grader.executor import RemoteSandboxExecutor
+    lock = threading.Lock()
+    active = peak = 0
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
+        def do_POST(self):
+            nonlocal active, peak
+            from reliquary.environment.grader.executor import SandboxBatchRequest
+            request = SandboxBatchRequest.model_validate_json(self.rfile.read(int(self.headers['Content-Length'])))
+            with lock:
+                active += 1
+                peak = max(active, peak)
+            time.sleep(.025)
+            with lock:
+                active -= 1
+            body = _result(request).model_dump_json().encode()
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *_):
+            pass
+    class Server(ThreadingHTTPServer):
+        request_queue_size = 128
+    server = Server(('127.0.0.1', 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    executor = RemoteSandboxExecutor(f'http://127.0.0.1:{server.server_port}',
+        runtime_id=_request().runtime_id, allow_insecure_loopback=True, max_connections=16)
+    try:
+        with ThreadPoolExecutor(max_workers=64) as pool:
+            results = list(pool.map(lambda _: executor.execute(_request()), range(64)))
+        assert len(results) == 64 and 1 < peak <= 16
+    finally:
+        executor.close()
+        server.shutdown()
+        server.server_close()
+        thread.join()

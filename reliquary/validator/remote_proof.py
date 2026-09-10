@@ -22,6 +22,8 @@ from reliquary.validator.remote_proof_protocol import (
     MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, AdoptionRequest, CheckpointBinding,
     ProofHealth, ProofInput, ProofRequest, ProofResponse, ProofValues,
     RemoteProofMeasurement, canonical_bytes, digest, transport_hash,
+    ProofBatchRequest, ProofBatchResponse, MAX_PROOF_BATCH,
+    MAX_BATCH_REQUEST_BYTES, MAX_BATCH_RESPONSE_BYTES,
 )
 
 logger = logging.getLogger(__name__)
@@ -52,7 +54,8 @@ class RemoteProofPool:
         tls.minimum_version = ssl.TLSVersion.TLSv1_2
         tls.load_cert_chain(cert_path, key_path)
         self._client = httpx.Client(base_url=base_url.rstrip("/"), verify=tls,
-                                    trust_env=False, follow_redirects=False)
+                                    trust_env=False, follow_redirects=False,
+                                    limits=httpx.Limits(max_connections=66, max_keepalive_connections=2, keepalive_expiry=90))
         self.worker_id = expected_worker_id
         self._identity = dict(profile_id=profile_id,
                               generation_contract_sha256=generation_contract_sha256,
@@ -67,6 +70,9 @@ class RemoteProofPool:
         self._health_checked_at = 0.0
         self._health_probe = None
         self._measurements = threading.local()
+        self._rpc_lock = threading.Lock()
+        self._rpc_stats = dict(calls=0, reconnects=0, seconds=0.0,
+                               request_bytes=0, response_bytes=0, rollouts=0)
 
     @contextmanager
     def measure_group(self):
@@ -102,21 +108,38 @@ class RemoteProofPool:
                    request_timeout=c.PROOF_WORKER_REQUEST_TIMEOUT_SECONDS,
                    reload_timeout=c.PROOF_WORKER_RELOAD_TIMEOUT_SECONDS)
 
-    def _request(self, method, path, body=None, *, timeout, retry=False):
+    def _request(self, method, path, body=None, *, timeout, retry=False,
+                 request_limit=MAX_REQUEST_BYTES, response_limit=MAX_RESPONSE_BYTES):
+        started = time.perf_counter()
+        reconnects = 0
+        def trace(event, _info):
+            nonlocal reconnects
+            if event == "connection.connect_tcp.started":
+                reconnects += 1
         raw = None if body is None else canonical_bytes(body.model_dump())
-        if raw is not None and len(raw) > MAX_REQUEST_BYTES:
+        if raw is not None and len(raw) > request_limit:
             raise ProofWorkerUnavailable("proof request exceeds transport bound")
         retry = retry or method == "GET"  # A stale keep-alive must not fence a healthy worker.
         for attempt in range(2 if retry else 1):
             try:
                 with self._client.stream(method, path, content=raw,
-                        headers={"content-type": "application/json"}, timeout=timeout) as response:
+                        headers={"content-type": "application/json"}, timeout=timeout,
+                        extensions={"trace": trace}) as response:
                     response.raise_for_status()
                     result = bytearray()
                     for chunk in response.iter_bytes():
                         result.extend(chunk)
-                        if len(result) > MAX_RESPONSE_BYTES:
+                        if len(result) > response_limit:
                             raise ProofWorkerUnavailable("proof response exceeds transport bound")
+                    if path in {"/v1/prove", "/v1/prove-batch"}:
+                        with self._rpc_lock:
+                            self._rpc_stats["calls"] += 1
+                            self._rpc_stats["reconnects"] += reconnects
+                            self._rpc_stats["seconds"] += time.perf_counter() - started
+                            self._rpc_stats["request_bytes"] += len(raw or b"")
+                            self._rpc_stats["response_bytes"] += len(result)
+                    logger.info("proof_rpc path=%s request_bytes=%d response_bytes=%d elapsed_ms=%.3f reconnects=%d retry=%d",
+                                path, len(raw or b""), len(result), (time.perf_counter() - started) * 1000, reconnects, attempt)
                     return bytes(result)
             except httpx.TransportError as exc:
                 if retry and attempt == 0:
@@ -256,7 +279,9 @@ class RemoteProofPool:
             self._health_probe = threading.Thread(target=probe, daemon=True,
                                                   name="remote-proof-health")
             self._health_probe.start()
-        return {"mode": "remote", "worker_id": self.worker_id,
+        with self._rpc_lock:
+            transport = dict(self._rpc_stats)
+        return {"mode": "remote", "worker_id": self.worker_id, "transport": transport,
                 "ready": self._adopted is not None and not self._closed
                     and time.monotonic() - self._health_checked_at <= 10,
                 "revision": self._adopted.revision if self._adopted else None}
@@ -328,45 +353,72 @@ class RemoteProofPool:
                 raise ProofWorkerUnavailable("remote proof requires a model metadata proxy")
             return self.prove(model.device_id, commit, window_randomness, seed_u_values,
                               window=window, environment=environment, checkpoint=binding)
+        def verify_batch(inputs, model, window_randomness):
+            if not isinstance(model, ProofModelProxy):
+                raise ProofWorkerUnavailable("remote proof requires a model metadata proxy")
+            return self.prove_many(model.device_id, inputs, window_randomness,
+                                   window=window, environment=environment, checkpoint=binding)
+        verify.batch = verify_batch
         return verify
 
     def prove(self, device_id, commit, randomness, seed_u_values, *, window, environment, checkpoint):
+        return self.prove_many(device_id, [(commit, seed_u_values)], randomness,
+                               window=window, environment=environment, checkpoint=checkpoint)[0]
+
+    def prove_many(self, device_id, inputs, randomness, *, window, environment, checkpoint):
         if self._closed or checkpoint != self._adopted or device_id not in self.devices:
             raise ProofWorkerUnavailable("remote proof device/checkpoint is not ready")
         try:
-            payload = ProofInput(tokens=commit["tokens"], commitments=commit["commitments"],
-                                 rollout=commit.get("rollout") or {}, randomness=randomness,
-                                 seed_u_values=seed_u_values)
-            request = ProofRequest(job_id=uuid.uuid4().hex, attempt=0,
-                worker_id=self.worker_id, session_id=self.health.session_id,
-                device_id=device_id, runtime_hash=self.runtime_fingerprint["profile_hash"],
-                checkpoint=checkpoint, window=window, environment=environment,
-                expires_at_ms=int((time.time() + self.request_timeout) * 1000),
-                content_sha256=digest(payload.model_dump()), payload=payload)
-            raw = self._request("POST", "/v1/prove", request,
-                                timeout=self.request_timeout, retry=True)
-            result = ProofResponse.read(raw, limit=MAX_RESPONSE_BYTES)
-            if time.time() * 1000 >= request.expires_at_ms:
-                raise ProofWorkerUnavailable("remote proof response expired")
-            if result.request_sha256 != digest(request.model_dump()) or any(
-                getattr(result, key) != getattr(request, key) for key in (
-                    "job_id", "attempt", "worker_id", "session_id", "device_id", "runtime_hash",
-                    "checkpoint", "window", "environment", "content_sha256",
-                )
-            ):
-                raise ProofWorkerUnavailable("remote proof response binding mismatch")
-            result.result.validate_input_coverage(payload)
+            if not 1 <= len(inputs) <= MAX_PROOF_BATCH:
+                raise ValueError("proof batch size exceeded")
+            requests = []
+            for commit, seed_u_values in inputs:
+                payload = ProofInput(tokens=commit["tokens"], commitments=commit["commitments"],
+                                     rollout=commit.get("rollout") or {}, randomness=randomness,
+                                     seed_u_values=seed_u_values)
+                requests.append(ProofRequest(job_id=uuid.uuid4().hex, attempt=0,
+                    worker_id=self.worker_id, session_id=self.health.session_id,
+                    device_id=device_id, runtime_hash=self.runtime_fingerprint["profile_hash"],
+                    checkpoint=checkpoint, window=window, environment=environment,
+                    expires_at_ms=int((time.time() + self.request_timeout) * 1000),
+                    content_sha256=digest(payload.model_dump()), payload=payload))
+            if len(requests) == 1:
+                raw = self._request("POST", "/v1/prove", requests[0], timeout=self.request_timeout, retry=True)
+                results = [ProofResponse.read(raw, limit=MAX_RESPONSE_BYTES)]
+            else:
+                raw = self._request("POST", "/v1/prove-batch", ProofBatchRequest(items=requests),
+                                    timeout=self.request_timeout, retry=True,
+                                    request_limit=MAX_BATCH_REQUEST_BYTES, response_limit=MAX_BATCH_RESPONSE_BYTES)
+                results = ProofBatchResponse.read(raw, limit=MAX_BATCH_RESPONSE_BYTES).items
+            if (len(results) > len(requests) or
+                (len(results) < len(requests) and results[-1].result.all_passed)):
+                raise ProofWorkerUnavailable("remote proof batch coverage mismatch")
             receipts = getattr(self._measurements, "receipts", None)
-            if receipts is not None:
-                receipts.append({key: getattr(result, key) for key in (
-                    "job_id", "attempt", "device_id", "window", "environment", "content_sha256",
-                )} | {"checkpoint": result.checkpoint.model_dump(),
-                     "policy_tokens": len(result.result.completion_chosen_probs)})
-            return result.result.to_kernel()
+            for request, result in zip(requests, results):
+                if time.time() * 1000 >= request.expires_at_ms:
+                    raise ProofWorkerUnavailable("remote proof response expired")
+                if result.request_sha256 != digest(request.model_dump()) or any(
+                    getattr(result, key) != getattr(request, key) for key in (
+                        "job_id", "attempt", "worker_id", "session_id", "device_id", "runtime_hash",
+                        "checkpoint", "window", "environment", "content_sha256",
+                    )
+                ):
+                    raise ProofWorkerUnavailable("remote proof response binding mismatch")
+                result.result.validate_input_coverage(request.payload)
+            # Record only after every returned receipt is validated.
+            for result in results:
+                if receipts is not None:
+                    receipts.append({key: getattr(result, key) for key in (
+                        "job_id", "attempt", "device_id", "window", "environment", "content_sha256",
+                    )} | {"checkpoint": result.checkpoint.model_dump(),
+                         "policy_tokens": len(result.result.completion_chosen_probs)})
+            with self._rpc_lock:
+                self._rpc_stats["rollouts"] += len(results)
+            return [result.result.to_kernel() for result in results]
         except ProofWorkerUnavailable:
             self._adopted = None
             raise
-        except (ValueError, TypeError, KeyError) as exc:
+        except (ValueError, TypeError, KeyError, IndexError) as exc:
             self._adopted = None
             raise ProofWorkerUnavailable("invalid remote proof payload/result") from exc
 
