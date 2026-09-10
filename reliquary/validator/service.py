@@ -173,7 +173,7 @@ def _bind_public_window_randomness(
 logger = logging.getLogger(__name__)
 
 _HF_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
-_STARTUP_HASH_REBUILD_TIMEOUT_SECONDS = 30.0
+_STARTUP_HASH_REBUILD_TIMEOUT_SECONDS = 180.0
 
 # v6.1 (R39): how often the between-windows rotation gate re-asks the
 # trainer's consumption cursor. Deliberately NOT the seal loop's 0.5 s --
