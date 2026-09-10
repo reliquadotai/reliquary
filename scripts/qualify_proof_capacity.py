@@ -18,8 +18,9 @@ Input is JSONL with one completed proof per row:
     }
 
 Use only end-to-end validator proofs generated against the exact release
-candidate and model revision. Synthetic forward-pass estimates are not valid
-qualification evidence.
+candidate and model revision. Synthetic forward-pass estimates are not valid qualification evidence alone.
+With --stress-samples, schema 4 combines genuine natural E2E groups with
+separately labeled measured full-context GPU/transport/post-proof CPU work.
 """
 
 from __future__ import annotations
@@ -37,10 +38,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from reliquary.constants import (  # noqa: E402
-    FORENSIC_SAMPLE_PER_WINDOW,
     MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV,
-    MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW,
-    MAX_PROOF_WALL_SECONDS,
     M_ROLLOUTS,
     PROTOCOL_MODEL_REVISION,
     PROTOCOL_PROFILE_ID,
@@ -48,6 +46,7 @@ from reliquary.constants import (  # noqa: E402
 )
 from reliquary.validator.proof_capacity import (  # noqa: E402
     ProofCapacityQualification,
+    capacity_budget,
     compute_proof_path_hash,
 )
 
@@ -75,6 +74,7 @@ def _load_samples(
     hardware_class: str,
     benchmark_device_count: int,
     remote_proof: dict | None = None,
+    natural_completions: bool = False,
 ) -> tuple[
     dict[str, dict[str, list[float]]],
     tuple[str, ...],
@@ -84,10 +84,10 @@ def _load_samples(
         environment: {} for environment in ENVIRONMENTS
     }
     minimum_completion_tokens = {
-        environment: math.ceil(
+        environment: (MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV[environment] if natural_completions else math.ceil(
             MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV[environment]
             * MINIMUM_CAP_FRACTION
-        )
+        ))
         for environment in ENVIRONMENTS
     }
     for line_number, line in enumerate(
@@ -142,7 +142,7 @@ def _load_samples(
             or any(
                 not isinstance(length, int)
                 or isinstance(length, bool)
-                or length < minimum_completion_tokens[environment]
+                or length < (1 if natural_completions else minimum_completion_tokens[environment])
                 or length
                 > MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV[environment]
                 for length in completion_lengths
@@ -152,6 +152,8 @@ def _load_samples(
                 "completion_token_lengths are not representative at "
                 f"line {line_number}"
             )
+        if natural_completions:
+            minimum_completion_tokens[environment] = min(minimum_completion_tokens[environment], *completion_lengths)
         device_uuid = str(row.get("device_uuid", "")).strip().casefold()
         if not device_uuid:
             raise ValueError(
@@ -193,6 +195,11 @@ def main() -> int:
     parser.add_argument("--hardware-class", required=True)
     parser.add_argument("--benchmark-device-count", type=int, required=True)
     parser.add_argument("--measured-at", required=True)
+    parser.add_argument("--stress-samples", type=Path,
+                        help="Explicit v4: real passing natural groups plus separately measured full-envelope stress")
+    parser.add_argument("--natural-corpus", type=Path, help="Original signed corpus retained by combined-natural measurement")
+    parser.add_argument("--maximum-context-tokens", type=int,
+                        help="Exact adopted model context; required for combined v4 and checked again at runtime")
     parser.add_argument("--headroom", type=float, default=0.2)
     parser.add_argument("--remote-proof-worker-id",
                         help="Require every source sample to cover validator end-to-end mTLS proof execution")
@@ -233,6 +240,8 @@ def main() -> int:
         remote_proof = RemoteProofMeasurement(
             worker_id=args.remote_proof_worker_id, transport_sha256=transport_hash(),
         ).model_dump()
+    if args.stress_samples and (remote_proof is None or not args.maximum_context_tokens or not args.natural_corpus):
+        parser.error("combined v4 requires --remote-proof-worker-id, --maximum-context-tokens and --natural-corpus")
     source_payload = args.samples.read_bytes()
     samples, benchmark_device_uuids, minimum_completion_tokens = _load_samples(
         args.samples,
@@ -242,6 +251,7 @@ def main() -> int:
         hardware_class=args.hardware_class,
         benchmark_device_count=args.benchmark_device_count,
         remote_proof=remote_proof,
+        natural_completions=args.stress_samples is not None,
     )
     p95_by_environment_and_device = {
         environment: {
@@ -269,13 +279,8 @@ def main() -> int:
         }
         for environment, device_samples in samples.items()
     }
-    proofs_per_environment = {
-        environment: (
-            MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW
-            + FORENSIC_SAMPLE_PER_WINDOW
-        )
-        for environment in ENVIRONMENTS
-    }
+    budget = capacity_budget()
+    proofs_per_environment = {environment: budget["proofs_per_environment"] for environment in ENVIRONMENTS}
     manifest = {
         "schema_version": 3,
         "profile_id": PROTOCOL_PROFILE_ID,
@@ -287,7 +292,7 @@ def main() -> int:
         "hardware_class": args.hardware_class,
         "benchmark_device_count": args.benchmark_device_count,
         "benchmark_device_uuids": list(benchmark_device_uuids),
-        "proof_wall_seconds": MAX_PROOF_WALL_SECONDS,
+        "proof_wall_seconds": budget["wall_seconds"],
         "headroom_fraction": args.headroom,
         "proofs_per_environment": proofs_per_environment,
         "p95_seconds_per_proof": p95_by_environment,
@@ -313,6 +318,19 @@ def main() -> int:
     }
     if remote_proof is not None:
         manifest["remote_proof"] = remote_proof
+    if args.stress_samples is not None:
+        from reliquary.validator.proof_capacity_combined import load_stress_samples
+        manifest["schema_version"] = 4
+        manifest["combined_evidence"] = load_stress_samples(
+            args.stress_samples, natural_path=args.samples, corpus_path=args.natural_corpus,
+            expected_identity={key: manifest[key] for key in (
+                "profile_id", "model_revision", "software_revision", "checkpoint_revision",
+                "runtime_fingerprint_hash", "hardware_class")},
+            device_uuids=benchmark_device_uuids,
+            completion_caps=MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV,
+            maximum_context_tokens=args.maximum_context_tokens, remote_proof=remote_proof,
+            natural_samples=samples, natural_samples_sha256=manifest["samples_sha256"])
+
     qualification = ProofCapacityQualification.from_mapping(manifest)
     # Validate the benchmark fleet itself. A manifest that already needs more
     # devices than were exercised is not qualification evidence.
@@ -331,12 +349,12 @@ def main() -> int:
             for _index in range(args.benchmark_device_count)
         ),
         configured_device_uuids=benchmark_device_uuids,
-        proof_wall_seconds=MAX_PROOF_WALL_SECONDS,
-        minimum_proofs_per_environment=(
-            MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW
-            + FORENSIC_SAMPLE_PER_WINDOW
-        ),
+        proof_wall_seconds=budget["wall_seconds"],
+        minimum_proofs_per_environment=budget["proofs_per_environment"],
         minimum_completion_tokens_per_environment=minimum_completion_tokens,
+        configured_slots=manifest.get("combined_evidence", {}).get("configured_slots"),
+        maximum_context_tokens=args.maximum_context_tokens,
+        full_completion_tokens_per_environment=MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV,
     )
 
     payload = (

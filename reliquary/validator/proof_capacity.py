@@ -20,6 +20,24 @@ class ProofCapacityQualificationError(RuntimeError):
     pass
 
 
+def capacity_budget() -> dict[str, Any]:
+    """Match the active scheduler's real admission budget and hard deadline.
+
+    FillState admits at most its monotone budget (including failed proofs);
+    fill windows bypass the seal-time auction/forensic proof plan entirely.
+    Admission grading and trainer pacing are separate from this proof budget.
+    """
+    from reliquary import constants as c
+    if c.FILL_CLOSED_ENABLED:
+        return {"mode": "fill_closed", "proofs_per_environment": c.FILL_CLOSED_ADMISSION_BUDGET_PER_ENV,
+            "wall_seconds": c.FILL_CLOSED_MAX_SECONDS,
+            "target_groups_per_environment": c.FILL_CLOSED_TARGET_GROUPS_PER_ENV,
+            "picks_per_window": c.FILL_CLOSED_EMISSIONS_PER_WINDOW}
+    return {"mode": "seal_time_auction",
+        "proofs_per_environment": c.MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW + c.FORENSIC_SAMPLE_PER_WINDOW,
+        "wall_seconds": c.MAX_PROOF_WALL_SECONDS}
+
+
 # The files whose bytes determine what one proof costs on the GPU. Pinning
 # these (plus the parameter values below) lets a qualification legitimately
 # survive an image deploy that does not touch the proof path — the full
@@ -232,6 +250,7 @@ class ProofCapacityQualification:
     # Optional: content hash of the proof path at benchmark time. Absent on
     # legacy manifests, which keep the strict same-image behavior.
     proof_path_hash: str | None = None
+    combined_evidence: Mapping[str, Any] | None = None
 
     @classmethod
     def from_mapping(
@@ -243,6 +262,7 @@ class ProofCapacityQualification:
             if not isinstance(qualified, bool):
                 raise TypeError("qualified must be a boolean")
             return cls(
+                combined_evidence=value.get("combined_evidence"),
                 schema_version=int(value["schema_version"]),
                 profile_id=str(value["profile_id"]),
                 model_revision=str(value["model_revision"]),
@@ -339,11 +359,19 @@ class ProofCapacityQualification:
         proof_wall_seconds: float,
         minimum_proofs_per_environment: int,
         minimum_completion_tokens_per_environment: Mapping[str, int],
+        configured_slots: Mapping[str, str] | None = None,
+        maximum_context_tokens: int | None = None,
+        full_completion_tokens_per_environment: Mapping[str, int] | None = None,
     ) -> dict[str, Any]:
-        if self.schema_version != 3:
+        if self.schema_version not in (3, 4):
             raise ProofCapacityQualificationError(
                 "unsupported proof-capacity manifest schema"
             )
+        if self.schema_version == 4:
+            budget = capacity_budget()
+            if (proof_wall_seconds != budget["wall_seconds"]
+                    or minimum_proofs_per_environment != budget["proofs_per_environment"]):
+                raise ProofCapacityQualificationError("combined capacity caller does not match the active scheduler budget")
         if not self.qualified:
             raise ProofCapacityQualificationError(
                 "proof-capacity benchmark did not qualify"
@@ -364,6 +392,11 @@ class ProofCapacityQualification:
             raise ProofCapacityQualificationError(
                 "proof-capacity software revision mismatch"
             )
+        if self.schema_version == 4 and (
+            self.software_revision != software_revision
+            or self.runtime_fingerprint_hash != runtime_fingerprint_hash
+        ):
+            raise ProofCapacityQualificationError("combined capacity requires the exact measured runtime")
         qualification_carried_over_from: str | None = None
         if self.software_revision != software_revision:
             # Carry-over: a different image is acceptable iff the proof path
@@ -504,6 +537,25 @@ class ProofCapacityQualification:
                 "configured proof hardware differs from benchmark"
             )
 
+        combined_bounds = None
+        if self.schema_version == 4:
+            from reliquary.validator.proof_capacity_combined import validate_combined_evidence
+            try:
+                combined_bounds = validate_combined_evidence(
+                    self.combined_evidence, device_uuids=benchmark_uuids,
+                    environments=minimum_completion_tokens_per_environment,
+                    maximum_context_tokens=maximum_context_tokens,
+                    completion_caps=full_completion_tokens_per_environment,
+                    minimum_samples=self.minimum_samples_per_device_per_environment,
+                    natural_p95=self.p95_seconds_per_proof_by_environment_and_device,
+                    natural_samples_sha256=self.samples_sha256, configured_slots=configured_slots,
+                )
+            except (ValueError, TypeError, KeyError, OSError) as exc:
+                raise ProofCapacityQualificationError(f"invalid combined capacity evidence: {exc}") from exc
+            if self.headroom_fraction < 0.2:
+                raise ProofCapacityQualificationError("combined capacity requires at least 20% headroom")
+        elif self.combined_evidence is not None:
+            raise ProofCapacityQualificationError("combined evidence requires schema 4")
         required_device_seconds = 0.0
         if self.minimum_samples_per_device_per_environment < 20:
             raise ProofCapacityQualificationError(
@@ -584,7 +636,7 @@ class ProofCapacityQualification:
             if (
                 required_completion_tokens is None
                 or measured_completion_tokens is None
-                or measured_completion_tokens < required_completion_tokens
+                or measured_completion_tokens < (1 if combined_bounds is not None else required_completion_tokens)
             ):
                 raise ProofCapacityQualificationError(
                     f"{environment} benchmark is not representative of "
@@ -608,7 +660,9 @@ class ProofCapacityQualification:
                 raise ProofCapacityQualificationError(
                     f"{environment} aggregate p95 is not the worst GPU p95"
                 )
-            required_device_seconds += proof_count * p95_seconds
+            required_device_seconds += proof_count * (
+                max(combined_bounds[environment].values()) if combined_bounds is not None else p95_seconds
+            )
 
         usable_seconds_per_device = proof_wall_seconds * (
             1.0 - self.headroom_fraction
@@ -624,6 +678,8 @@ class ProofCapacityQualification:
 
         return {
             "qualified": True,
+            "schema_version": self.schema_version,
+            "combined_seconds_per_proof_bound": combined_bounds,
             "qualification_carried_over_from": qualification_carried_over_from,
             "profile_id": self.profile_id,
             "model_revision": self.model_revision,

@@ -556,3 +556,12 @@ def test_health_serializes_native_hf_configuration(pki):
         assert client.health.generation_config["exponential_decay_length_penalty"] == [8, 1.01]
     # The process-local description retains the native HF representation.
     assert set(backend.describe("cuda:0")["config"]["id2label"]) == {0, 1}
+
+
+def test_worker_utility_workload_setting_is_bound_to_controller(pki):
+    from reliquary.validator.utility_telemetry import utility_telemetry_enabled
+    with endpoint(pki, CPUProofBackend()) as client:
+        assert client.health.utility_telemetry_enabled == utility_telemetry_enabled()
+        changed=client.health.model_copy(update={'utility_telemetry_enabled':not utility_telemetry_enabled()})
+        with pytest.raises(ProofWorkerUnavailable,match='utility telemetry setting differs'):
+            client._validate_health(changed)

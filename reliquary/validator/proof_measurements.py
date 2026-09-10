@@ -70,6 +70,7 @@ class ProofMeasurements:
                     "infrastructure_error_type": failure, "complete_remote_group": complete,
                     "profile_id": health.profile_id, "model_revision": PROTOCOL_MODEL_REVISION,
                     "software_revision": health.software_revision, "checkpoint_revision": checkpoint.revision,
+                    "session_id": health.session_id,
                     "checkpoint_n": checkpoint.checkpoint_n, "repo_id": checkpoint.repo_id,
                     "training_run_id": checkpoint.training_run_id,
                     "runtime_fingerprint_hash": slot.runtime["profile_hash"],

@@ -22,10 +22,7 @@ from reliquary.constants import (
     DEFAULT_BASE_MODEL_REVISION,
     DEFAULT_ENVIRONMENTS,
     DEFAULT_HF_REPO_ID,
-    FORENSIC_SAMPLE_PER_WINDOW,
     MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV,
-    MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW,
-    MAX_PROOF_WALL_SECONDS,
     PROOF_SLOTS_PER_DEVICE,
     PROTOCOL_MODEL_ID,
     PROTOCOL_MODEL_REVISION,
@@ -754,9 +751,10 @@ def validate(
                         proof_model=model,
                     )["profile_hash"]
                     from reliquary.validator.proof_capacity import (
-                        compute_proof_path_hash,
+                        capacity_budget, compute_proof_path_hash,
                     )
 
+                    budget = capacity_budget()
                     proof_capacity_qualification = qualification.validate(
                         profile_id=PROTOCOL_PROFILE_ID,
                         model_revision=PROTOCOL_MODEL_REVISION,
@@ -769,11 +767,8 @@ def validate(
                         configured_devices=proof_devices,
                         configured_hardware=hardware,
                         configured_device_uuids=device_uuids,
-                        proof_wall_seconds=MAX_PROOF_WALL_SECONDS,
-                        minimum_proofs_per_environment=(
-                            MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW
-                            + FORENSIC_SAMPLE_PER_WINDOW
-                        ),
+                        proof_wall_seconds=budget["wall_seconds"],
+                        minimum_proofs_per_environment=budget["proofs_per_environment"],
                         minimum_completion_tokens_per_environment={
                             environment: math.ceil(cap * 0.9)
                             for environment, cap in (

@@ -103,6 +103,7 @@ def create_proof_app(*, backend, worker_id: str, profile_id: str,
     cache_limit = 64 * 1024 * 1024
 
     def describe():
+        from reliquary.validator.utility_telemetry import utility_telemetry_enabled
         descriptions = (backend.health_descriptions() if hasattr(backend, "health_descriptions")
                         else [backend.describe(device) for device in locks])
         slots = [SlotState.model_validate({k: d[k] for k in SlotState.model_fields})
@@ -110,6 +111,7 @@ def create_proof_app(*, backend, worker_id: str, profile_id: str,
         if checkpoint is not None and any(s.revision != checkpoint.revision for s in slots):
             raise ProofWorkerUnavailable("a GPU slot lost the installed checkpoint")
         return ProofHealth(
+            utility_telemetry_enabled=utility_telemetry_enabled(),
             worker_id=worker_id, session_id=session_id, profile_id=profile_id,
             generation_contract_sha256=generation_contract_sha256,
             training_run_id=training_run_id, repo_id=repo_id,
