@@ -4458,6 +4458,14 @@ class GrpoWindowBatcher:
         isolated, while shared reject/debt accounting is protected by the
         batcher's existing locks.
         """
+        _t_start = time.perf_counter()
+        _t_prep_done = _t_start
+        _t_proof_total = 0.0
+        _tmark = _t_start
+        _t_degen = 0.0
+        _t_sketch = 0.0
+        _t_term = 0.0
+        _t_lp = 0.0
         proof_model = self.model if model is None else model
         request = pending.request
         telemetry = pending.telemetry
@@ -4602,6 +4610,7 @@ class GrpoWindowBatcher:
         seed_cdf_per_rollout: list[dict[str, Any]] = []
         utility_rollouts: list[dict[str, Any]] = []
 
+        _t_prep_done = time.perf_counter()
         remote_batch = getattr(self._verify_commitment, "batch", None)
         prefetched_proofs = []
         def seed_uniforms(index, commit):
@@ -4642,12 +4651,16 @@ class GrpoWindowBatcher:
             _seed_completion_tokens = [
                 _seed_tokens[position] for position in _policy_positions
             ]
+            _tmark = time.perf_counter()
             rollout_token_metrics = token_degeneracy_metrics(
                 _seed_completion_tokens
             )
+            _t_degen += time.perf_counter() - _tmark
+            _tmark = time.perf_counter()
             rollout_sketch_metrics = sketch_commitment_metrics(
                 rollout.commit.get("commitments") or []
             )
+            _t_sketch += time.perf_counter() - _tmark
             seed_u = seed_uniforms(rollout_idx, rollout.commit)
             try:
                 if remote_batch is not None:
@@ -4655,7 +4668,9 @@ class GrpoWindowBatcher:
                         from reliquary.validator.remote_proof_protocol import MAX_PROOF_BATCH
                         inputs = [(r.commit, seed_uniforms(index, r.commit)) for index, r in
                                   enumerate(request.rollouts[rollout_idx:rollout_idx + MAX_PROOF_BATCH], rollout_idx)]
+                        _t_proof0 = time.perf_counter()
                         prefetched_proofs = remote_batch(inputs, proof_model, self.randomness)
+                        _t_proof_total += time.perf_counter() - _t_proof0
                     proof = prefetched_proofs.pop(0)
                 else:
                     proof = self._verify_commitment(
@@ -4800,6 +4815,7 @@ class GrpoWindowBatcher:
                         "termination",
                         sketch_diff_max=sketch_diff_max,
                     )
+                _tmark = time.perf_counter()
                 termination_ok = verify_termination(
                     rollout.commit,
                     self.tokenizer,
@@ -4807,6 +4823,7 @@ class GrpoWindowBatcher:
                     proof_model,
                     env_name=getattr(self.env, "name", ""),
                 )
+                _t_term += time.perf_counter() - _tmark
                 cap_truncated = is_cap_truncation(
                     rollout.commit,
                     self.tokenizer,
@@ -4976,6 +4993,7 @@ class GrpoWindowBatcher:
                 proof.sketch_diff_max
             )
 
+            _tmark = time.perf_counter()
             lp_ok, lp_dev = verify_logprobs_claim(
                 tokens=rollout.commit["tokens"],
                 prompt_length=prompt_len,
@@ -4984,6 +5002,7 @@ class GrpoWindowBatcher:
                 proof=proof,
                 policy_positions=(policy_positions if _is_episode else None),
             )
+            _t_lp += time.perf_counter() - _tmark
             if not lp_ok and completion_len < CHALLENGE_K:
                 # The sampled-challenge check is a deterministic fail below
                 # CHALLENGE_K tokens (measured: 100% of its rejections, on
@@ -4995,6 +5014,7 @@ class GrpoWindowBatcher:
                 # an unverifiable one (T != 1, degenerate coverage) keeps the
                 # original reject, so a rollback to v2/v3 (T=0.6) or a
                 # coverage hole can never flip this into an accept.
+                _tmark = time.perf_counter()
                 short_ok, short_dev = _verify_short_logprob_claim(
                     rollout._validated_completion_logprobs,
                     rollout.commit["tokens"],
@@ -5003,6 +5023,7 @@ class GrpoWindowBatcher:
                     claimed_lp,
                     policy_positions=(policy_positions if _is_episode else None),
                 )
+                _t_lp += time.perf_counter() - _tmark
                 with self._proof_admission_lock:
                     self.logprob_short_full_coverage_checks += 1
                     if short_ok is None:
@@ -5518,6 +5539,27 @@ class GrpoWindowBatcher:
         )
         # The caller decides whether this is an auction winner or an immediate
         # legacy admission.
+        # Phase timing: the window only fills if this whole call stays short.
+        # prep covers get_problem + reward//text derivation, proof_rpc is the
+        # batched remote GRAIL call, gates is every proof-dependent check.
+        _t_end = time.perf_counter()
+        _t_named = _t_degen + _t_sketch + _t_term + _t_lp
+        logger.info(
+            "verify_expensive_timing env=%s prompt=%s rollouts=%d "
+            "prep_ms=%.1f proof_rpc_ms=%.1f degen_ms=%.1f sketch_ms=%.1f "
+            "termination_ms=%.1f logprob_ms=%.1f other_gates_ms=%.1f total_ms=%.1f",
+            getattr(self.env, "name", "?"),
+            pi,
+            len(request.rollouts),
+            (_t_prep_done - _t_start) * 1000.0,
+            _t_proof_total * 1000.0,
+            _t_degen * 1000.0,
+            _t_sketch * 1000.0,
+            _t_term * 1000.0,
+            _t_lp * 1000.0,
+            (_t_end - _t_prep_done - _t_proof_total - _t_named) * 1000.0,
+            (_t_end - _t_start) * 1000.0,
+        )
         return new_sub
 
     def _execute_scheduled_proof(
