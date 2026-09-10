@@ -913,6 +913,35 @@ def test_gpu_completion_entropy_can_be_disabled():
     assert entropy == []
 
 
+def test_long_policy_entropy_roundtrips_real_stats_without_weakening_wire_coverage():
+    from reliquary.validator.remote_proof_protocol import ProofInput, ProofValues, canonical_bytes
+
+    payload = ProofInput(tokens=[0] * 129, commitments=[{"sketch": 0}] * 129,
+        rollout={"prompt_length": 1, "completion_length": 128},
+        randomness="ab" * 32, seed_u_values=None)
+    chosen, amax_p, amax_id, entropy = verifier._gpu_completion_token_stats(
+        torch.zeros(129, 4), payload.tokens, prompt_length=1,
+        completion_length=128, seq_len=129, device="cpu")
+    challenges = verifier.proof_challenge_indices(payload.tokens, payload.rollout, payload.randomness)
+    result = verifier.ProofResult(all_passed=True, passed=len(challenges), checked=len(challenges),
+        has_sparse_outputs=True, completion_chosen_probs=chosen,
+        completion_argmax_probs=amax_p, completion_argmax_ids=amax_id,
+        completion_entropies=entropy)
+    wire = ProofValues.read(canonical_bytes(ProofValues.from_kernel(result).model_dump()))
+    assert len(wire.completion_chosen_probs) == len(wire.completion_argmax_ids) == 128
+    assert len(wire.completion_entropies) == 64
+    wire.validate_input_coverage(payload)
+    for count in (1, 63, 65, 128):
+        truncated = wire.model_copy(update={"completion_entropies": [1.] * count})
+        with pytest.raises(ValueError, match="entropy vector is incomplete"):
+            truncated.validate_input_coverage(payload)
+    truncated = wire.model_copy(update={"completion_chosen_probs": chosen[:-1],
+        "completion_argmax_probs": amax_p[:-1], "completion_argmax_ids": amax_id[:-1]})
+    with pytest.raises(ValueError, match="every required token"):
+        truncated.validate_input_coverage(payload)
+    wire.model_copy(update={"completion_entropies": []}).validate_input_coverage(payload)
+
+
 def test_hidden_anchor_telemetry_skips_terminal_eos_and_force_span():
     hidden = torch.arange(30, dtype=torch.float32).reshape(6, 5)
     start, delta, dim, end_offset, shift_norm = (

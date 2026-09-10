@@ -177,12 +177,18 @@ class ProofValues(WireModel):
         return ProofResult(**self.model_dump())
 
     def validate_input_coverage(self, payload: ProofInput) -> None:
-        from reliquary.validator.verifier import policy_token_positions, proof_challenge_indices
+        from reliquary.validator.verifier import (
+            _UTILITY_ENTROPY_MAX_POSITIONS, _stratified_indices,
+            policy_token_positions, proof_challenge_indices,
+        )
         positions = policy_token_positions(payload.tokens, payload.rollout)
         challenges = proof_challenge_indices(payload.tokens, payload.rollout, payload.randomness)
         if self.checked != len(challenges) or len(self.completion_chosen_probs) != len(positions):
             raise ValueError("remote proof did not cover every required token/challenge")
-        if self.completion_entropies and len(self.completion_entropies) != len(positions):
+        # Utility entropy is optional and sampled by the real kernel. Policy
+        # probabilities/argmax retain full coverage, independently of telemetry.
+        entropy_count = len(_stratified_indices(len(positions), _UTILITY_ENTROPY_MAX_POSITIONS))
+        if self.completion_entropies and len(self.completion_entropies) != entropy_count:
             raise ValueError("remote proof entropy vector is incomplete")
         if any(index not in positions for index in self.challenge_lp_indices):
             raise ValueError("remote logprob result refers to another policy span")
