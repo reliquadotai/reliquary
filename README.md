@@ -54,7 +54,71 @@ The key incentive shift is simple: miners are not paid for producing the most
 rollouts. They compete to contribute verified rollout groups the trainer can
 use.
 
-## The production loop
+## V1.0 miner migration
+
+Adapt your existing miner deployment; no separate starter package is required.
+Stop the old miner before starting V1 and preserve your registered hotkey,
+miner state directory and Hugging Face cache.
+
+Use the pinned miner image (the controller has additional server-only fixes):
+
+```sh
+docker pull ghcr.io/reliquadotai/reliquary-validator:sha-3b3af1d-logic@sha256:7bb847499605308b1ad7b21f5430b1662eae506deacb6899d682bc0c11ce2742
+```
+
+Set these variables **inside your existing miner service or container**:
+
+```dotenv
+RELIQUARY_PROTOCOL_PROFILE=qwen3-4b-base-dapo-reliquary-v1
+RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED=1
+RELIQUARY_TRAINING_RUN_ID=qwen3-4b-base-dapo-reliquary-v1-20260910
+```
+
+Keep your existing GPU selection, wallet mounts and persistent state/cache
+paths. Inside that configured environment, adapt your existing miner command:
+
+```sh
+reliquary mine \
+  --network finney --netuid 81 \
+  --wallet-name YOUR_EXISTING_WALLET \
+  --hotkey YOUR_REGISTERED_HOTKEY \
+  --wallet-path YOUR_EXISTING_WALLET_DIRECTORY \
+  --validator-url http://62.238.81.36:8000 \
+  --environments openmathinstruct,opencodeinstruct,reliquary_logic_v2
+```
+
+Choose any nonempty subset of **Math** (`openmathinstruct`), **Code**
+(`opencodeinstruct`) and **Logic** (`reliquary_logic_v2`). Running all three is
+optional. Use one miner process per hotkey/state directory.
+
+Before starting, follow the current operator notice and check readiness:
+
+```sh
+curl --fail --silent --show-error --max-time 10 http://62.238.81.36:8000/readyz
+curl --fail --silent --show-error --max-time 10 http://62.238.81.36:8000/state
+```
+
+A failed readiness check or HTTP 503 means keep the miner paused. This README
+is configuration guidance, not a live GO notice. The initial V1 checkpoint is
+**N1812**, repository `ReliquaryForge/qwen3-4b-base-dapo-v4`, revision
+`6c3f02be8e720d3ccfd1bd320de8ea7f864a04e6`. Follow the validator's advertised
+successor checkpoints automatically; do not permanently pin N1812 or delete
+checkpoint identity records to bypass a mismatch.
+
+V1 uses **fill-closed windows**. Follow the deadlines and phase in `/state`:
+windows may close underfilled, and an upload acknowledgement is not a final
+proof, selection or payment verdict. No extra controller bounded-service flag
+is needed on miners. See [Mining](docs/mining.md) for the submission lifecycle.
+
+Logic uses a pinned integration with the **Prime Intellect Verifiers format
+for supported environment contracts**. This supports further integrations;
+it does not certify every Prime environment.
+
+## Legacy auction profile loop
+
+The fixed-window values below describe the legacy auction profiles. For V1
+configuration and fill-closed timing, use the migration instructions above and
+the validator's advertised runtime state.
 
 <p align="center">
   <img
@@ -91,10 +155,13 @@ The normative mechanism and rejection semantics live in
 [Concepts](docs/concepts.md). Historical design documents are evidence of how
 the protocol evolved; they are not the production contract.
 
-## Deployment status
+## Feature status
+
+Runtime availability is reported by `/readyz`; this table is not a GO notice.
 
 | Layer | State |
 | --- | --- |
+| V1 profile: fill-closed windows with Math, Code and Logic | Configuration above; follow operator notices and runtime readiness |
 | Qwen3-4B Base DAPO reasoning-v5 profile, deferred-proof auction, and GRAIL verification | **Release candidate — runtime gates pending** |
 | Mixed OpenMath + OpenCode collection and validator-authoritative rewards | **Live** |
 | Canonical prompt-content identity and one-shot cooldown | **Live** |
