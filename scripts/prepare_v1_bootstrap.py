@@ -4,6 +4,8 @@
 No remote writes. The new profile explicitly changes curriculum and resets
 optimizer/LR warmup. This is preparation evidence, not GPU or model-quality
 qualification. The existing Math+Code continuation has a separate command.
+An explicit base reset replaces inherited weights with the profile's pinned
+base model and starts all three new-run cooldown maps empty.
 """
 
 from __future__ import annotations
@@ -33,11 +35,14 @@ STORAGE_MODES = ("distinct-bucket", "reuse-after-fence")
 
 def prepare_bootstrap(source: dict, *, repo_id: str, revision: str, checkpoint_n: int,
                       last_archived_window: int, source_bucket: str, target_bucket: str,
-                      lr_start_step: int = 0, storage_mode: str = "distinct-bucket") -> dict:
+                      lr_start_step: int = 0, storage_mode: str = "distinct-bucket",
+                      reset_to_base: bool = False) -> dict:
     checkpoint_n, repo_id, revision = canonical_checkpoint_identity(checkpoint_n, repo_id, revision)
     validate_v5_source(source)
     require_checkpoint_number(last_archived_window, field="last archived window")
     require_checkpoint_number(lr_start_step, field="new run LR step")
+    if type(reset_to_base) is not bool or (reset_to_base and lr_start_step != 0):
+        raise ValueError("base reset requires an explicit boolean and LR step zero")
     if not FILL_CLOSED_ENABLED or PROTOCOL_PROFILE_ID != PROFILE:
         raise ValueError("bootstrap requires the explicit three-environment V1 profile and fill capability")
     target = active_checkpoint_profile()
@@ -71,6 +76,10 @@ def prepare_bootstrap(source: dict, *, repo_id: str, revision: str, checkpoint_n
         "optimizer_state": "recreated", "lr_schedule": "explicit_new_run_warmup",
         "environment_targets": {name: 16 for name in resolve_protocol_profile(PROFILE).environments},
     }
+    if reset_to_base:
+        provenance.update(weights="reset_from_pinned_base_model", base_weights={
+            "repo_id": target["base_model_id"], "revision": target["base_model_revision"],
+        })
     return {
         "repo_id": repo_id, "parent_commit": revision,
         "commit_message": f"checkpoint {checkpoint_n + 1} (reliquary-v1-bootstrap)",
@@ -81,8 +90,8 @@ def prepare_bootstrap(source: dict, *, repo_id: str, revision: str, checkpoint_n
             "source_run": old_run, "target_run": new_run,
             "archive_boundary": last_archived_window, "scoring_history_windows": 216,
             "archive_history_min_windows": 300,
-            "carry_prompt_and_content_cooldowns": ["openmathinstruct", "opencodeinstruct"],
-            "initialize_empty_cooldowns": ["reliquary_logic_v2"],
+            "carry_prompt_and_content_cooldowns": [] if reset_to_base else ["openmathinstruct", "opencodeinstruct"],
+            "initialize_empty_cooldowns": list(resolve_protocol_profile(PROFILE).environments) if reset_to_base else ["reliquary_logic_v2"],
             "exclude": ["reliquary/training/", "pending_training_payloads/", "control.json"],
         },
         "status": "prepared_only_requires_evaluation_target_oid_qualification_and_cutover",
@@ -99,6 +108,8 @@ def main() -> None:
     parser.add_argument("--storage-mode", choices=STORAGE_MODES, default="distinct-bucket",
                         help="reuse-after-fence keeps the existing bucket after both V5 writers are stopped")
     parser.add_argument("--lr-start-step", type=int, default=0)
+    parser.add_argument("--reset-to-base", action="store_true",
+                        help="reset weights to the immutable profile base model, LR to zero and new-run cooldowns to empty")
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
     if args.output_dir.exists():
@@ -113,7 +124,8 @@ def main() -> None:
     plan = prepare_bootstrap(source, repo_id=args.repo_id, revision=args.source_revision,
                              checkpoint_n=number, last_archived_window=args.last_archived_window,
                              source_bucket=args.source_bucket, target_bucket=args.target_bucket,
-                             lr_start_step=args.lr_start_step, storage_mode=args.storage_mode)
+                             lr_start_step=args.lr_start_step, storage_mode=args.storage_mode,
+                             reset_to_base=args.reset_to_base)
     source_checkpoint_number(list(api.list_repo_commits(args.repo_id)), args.source_revision)
     args.output_dir.mkdir(mode=0o700, parents=True)
     for name, value in plan["files"].items():
