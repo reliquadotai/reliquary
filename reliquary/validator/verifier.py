@@ -1111,12 +1111,12 @@ def _gpu_completion_token_stats(
             )
             entropy_scaled = scaled.index_select(0, entropy_positions)
             entropy_probs = probs.index_select(0, entropy_positions)
-            # H(p) = logsumexp(z) - sum(p * z). The full vocabulary is used at
-            # every sampled position; only the number of trajectory positions
-            # is bounded so telemetry cannot dominate proof verification.
-            entropy = torch.logsumexp(
-                entropy_scaled, dim=-1
-            ) - entropy_probs.mul_(entropy_scaled).sum(dim=-1)
+            # H(p) = -sum(p * log_softmax(z)) avoids cancellation between
+            # large, nearly equal terms for concentrated policies. The full
+            # vocabulary is used at each bounded sampled position.
+            entropy = -entropy_probs.mul_(
+                torch.log_softmax(entropy_scaled, dim=-1)
+            ).sum(dim=-1)
             entropy_values.extend(entropy.tolist())
         chosen_values.extend(chosen.tolist())
         argmax_prob_values.extend(amax_probs.tolist())
