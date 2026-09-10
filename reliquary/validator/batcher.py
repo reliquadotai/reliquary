@@ -5000,13 +5000,18 @@ class GrpoWindowBatcher:
                         self.logprob_short_unverifiable += 1
                 if short_ok is True:
                     lp_ok, lp_dev = True, short_dev
+                elif short_dev is not None and math.isfinite(short_dev):
+                    # Keep the rejection, but archive the measured full-coverage
+                    # deviation instead of the sampled check's sentinel inf.
+                    lp_dev = short_dev
             if lp_dev is not None and lp_dev != float("inf"):
                 if lp_dev_max is None or lp_dev > lp_dev_max:
                     lp_dev_max = float(lp_dev)
             if not lp_ok:
                 logger.info(
-                    "reject reason=logprob_mismatch hotkey=%s median_dev=%.4f",
-                    request.miner_hotkey, lp_dev,
+                    "reject reason=logprob_mismatch hotkey=%s median_dev=%.4f "
+                    "completion_length=%d",
+                    request.miner_hotkey, lp_dev, completion_len,
                 )
                 return reject(
                     RejectReason.LOGPROB_MISMATCH,
