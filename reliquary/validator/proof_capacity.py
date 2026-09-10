@@ -32,7 +32,7 @@ def capacity_budget() -> dict[str, Any]:
         budget = {"mode": "fill_closed", "proofs_per_environment": c.FILL_CLOSED_ADMISSION_BUDGET_PER_ENV,
             "wall_seconds": c.FILL_CLOSED_MAX_SECONDS,
             "target_groups_per_environment": c.FILL_CLOSED_TARGET_GROUPS_PER_ENV,
-            "picks_per_window": c.FILL_CLOSED_EMISSIONS_PER_WINDOW}
+            "picks_per_window": c.FILL_CLOSED_PICKS_PER_WINDOW}
         if c.FILL_CLOSED_BOUNDED_PROOFS:
             budget.update(mode="fill_closed_bounded",
                 drain_seconds=c.FILL_CLOSED_PROOF_DRAIN_SECONDS,

@@ -14,6 +14,7 @@ import signal
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Iterable, Iterator, Sequence
 
@@ -252,6 +253,9 @@ def admission_worker_ready(hold_seconds: float = 0.0) -> int:
     return os.getpid()
 
 
+_ADMISSION_DEADLINE = ContextVar("admission_deadline", default=None)
+
+
 @contextmanager
 def _deadline(deadline_monotonic: float) -> Iterator[None]:
     remaining = float(deadline_monotonic) - time.monotonic()
@@ -263,9 +267,11 @@ def _deadline(deadline_monotonic: float) -> Iterator[None]:
 
     previous = signal.signal(signal.SIGALRM, _raise_timeout)
     signal.setitimer(signal.ITIMER_REAL, remaining)
+    token = _ADMISSION_DEADLINE.set(deadline_monotonic)
     try:
         yield
     finally:
+        _ADMISSION_DEADLINE.reset(token)
         signal.setitimer(signal.ITIMER_REAL, 0.0)
         signal.signal(signal.SIGALRM, previous)
 
@@ -804,6 +810,7 @@ def _compute_code_rewards(
     cases: list[dict[str, Any]],
 ) -> list[float]:
     client = GraderClient()
+    client.deadline_monotonic = _ADMISSION_DEADLINE.get()
     # Must grade the same span as OpenCodeInstructEnvironment.compute_reward:
     # a divergence here rejects honest miners on reward_mismatch.
     entry_name = _entry_function_name(cases)

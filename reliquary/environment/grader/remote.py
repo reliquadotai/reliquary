@@ -19,6 +19,7 @@ import socket
 import ssl
 import sys
 import threading
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -133,6 +134,16 @@ def create_cpu_executor_app(
         if execution_request.runtime_id != runtime_id:
             raise HTTPException(status_code=409, detail="runtime mismatch")
 
+        deadline = None
+        if "x-reliquary-deadline-ms" in request.headers:
+            try:
+                remaining = int(request.headers["x-reliquary-deadline-ms"]) / 1000 - time.time()
+                if not 0 < remaining <= 126:
+                    raise ValueError("expired or unbounded deadline")
+                deadline = time.monotonic() + remaining
+            except ValueError as exc:
+                raise HTTPException(503, "admission deadline exceeded") from exc
+
         if not capacity.acquire(blocking=False):
             with api_lock:
                 api_requests["busy"] += 1
@@ -144,7 +155,8 @@ def create_cpu_executor_app(
             api_peak_inflight = max(api_peak_inflight, api_inflight)
 
         def _execute() -> SandboxBatchResult:
-            result = pool.execute_sandbox_batch(execution_request)
+            result = pool.execute_sandbox_batch(execution_request,
+                **({"deadline_monotonic": deadline} if deadline is not None else {}))
             return SandboxBatchResult(
                 **{
                     **result.model_dump(mode="python"),

@@ -111,13 +111,14 @@ def test_trainer_flushes_balanced_partial_and_halts_on_optimizer_failure(monkeyp
         runner.finish()
 
 
-def _recovery_setup(tmp_path, monkeypatch):
+def _recovery_setup(tmp_path, monkeypatch, picks=16):
     import reliquary.infrastructure.training_payload_queue as queue_module
     import reliquary.validator.fill_closed_recovery as recovery_module
 
     monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
     monkeypatch.setattr(queue_module, "FILL_CLOSED_EMISSIONS_PER_WINDOW", 16)
     monkeypatch.setattr(recovery_module, "FILL_CLOSED_EMISSIONS_PER_WINDOW", 16)
+    monkeypatch.setattr(recovery_module, "FILL_CLOSED_PICKS_PER_WINDOW", picks)
     store = FillClosedRecoveryStore(tmp_path)
     store.begin(42, checkpoint_n=7, revision="a" * 40, targets={"math": 16, "code": 16})
     queue = TrainingPayloadQueue(str(tmp_path / "payloads"))
@@ -286,3 +287,35 @@ def test_live_accounting_commit_and_abort_release_stale_assembler(tmp_path, monk
     assert svc._fill_closed_assembler is None and not svc._fill_closed_assemblers
     assert receipt_path.read_bytes() == original
     assert archives.pending_archives(start_window=42, end_window=42)[42]["batch"] == rows
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_recovery_preserves_original_payment_denominator_and_journal_stride(tmp_path, monkeypatch, legacy):
+    import reliquary.validator.fill_closed_recovery as recovery
+    from reliquary.validator.control import write_json
+    monkeypatch.setattr(recovery, 'FILL_CLOSED_PICKS_PER_WINDOW', 10)
+    store, queue, archives, rotation = _recovery_setup(tmp_path, monkeypatch, picks=10)
+    if legacy:
+        record = store.load(42)
+        record.pop('picks_target')
+        write_json(store._path(42), record)
+    rows = [{'env_name': env, 'batch_index': 0, 'hotkey': 'alice', 'prompt_idx': 1,
+             'eos_tokens': 16, 'claimed_checkpoint_hash': 'a' * 40} for env in ('math', 'code')]
+    queue.enqueue_committed_payload(42 * 16, b'committed-training-body', accounting=rows)
+    store.recover(42, queue=queue, archives=archives, rotation=rotation)
+    record = archives.pending_archives(start_window=42, end_window=42)[42]
+    assert record['rewards_by_hotkey'] == {'alice': 1 / (16 if legacy else 10)}
+    assert len(list(queue._journal_commit_dir.glob('window-*.json'))) == 16
+    assert rotation.load().required_journal_key == 42 * 16 + 15
+
+
+def test_control_heartbeat_never_acknowledges_a_new_request(tmp_path):
+    from reliquary.validator.control import ControlStore
+    store = ControlStore(tmp_path)
+    run = store.set_mode('run')
+    store.report(run, phase='running', window=10)
+    store.heartbeat(window=11)
+    assert store.status()['fresh'] and store.status()['status']['window'] == 11
+    store.set_mode('drain')
+    store.heartbeat(window=11)
+    assert not store.status()['fresh'] and not store.status()['drained']

@@ -34,7 +34,7 @@ import logging
 import threading
 from typing import Any, Callable, NamedTuple, Sequence
 
-from reliquary.constants import B_BATCH, FILL_CLOSED_EMISSIONS_PER_WINDOW
+from reliquary.constants import B_BATCH, FILL_CLOSED_EMISSIONS_PER_WINDOW, FILL_CLOSED_PICKS_PER_WINDOW
 from reliquary.infrastructure.training_payload_queue import (
     encoded_window_journal_key,
 )
@@ -73,6 +73,7 @@ class FillClosedBatchAssembler:
         commit_fn: Callable[[int, bytes, bool, dict | None], None] | None = None,
     ) -> None:
         self.window_start = int(window_start)
+        self.picks_target = FILL_CLOSED_PICKS_PER_WINDOW
         self._env_order = list(env_order)
         self._enqueue_fn = enqueue_fn
         self._tombstone_fn = tombstone_fn
@@ -279,6 +280,8 @@ class FillClosedBatchAssembler:
         self, *, allow_partial: bool
     ) -> _PreparedWrite:
         """Encode one entry without advancing accounting or journal state."""
+        if self.next_batch_index >= self.picks_target:
+            raise RuntimeError("fill-closed payload exceeds the window pick target")
         extracted = self._accumulator.training_batches(
             self._env_order, allow_partial=allow_partial,
         )
@@ -451,7 +454,7 @@ class FillClosedBatchAssembler:
         batch_pool_per_env = (
             self._window_pool
             / len(self._env_order)
-            / FILL_CLOSED_EMISSIONS_PER_WINDOW
+            / self.picks_target
         )
         for environment, env_batch in window_batches.items():
             self._paid_groups.setdefault(environment, []).extend(
@@ -564,7 +567,7 @@ class FillClosedBatchAssembler:
             # committed and a later ``close()`` resumes exactly at the failed
             # key; accepts are still allowed because their upstream picks were
             # not durably claimed.
-            while self.next_batch_index < FILL_CLOSED_EMISSIONS_PER_WINDOW:
+            while self.next_batch_index < self.picks_target:
                 # Absorb whatever fits without forcing anything -- the
                 # SAME merge ``accept()`` uses, including writing any
                 # full cross-env cycle it completes along the way.
@@ -674,6 +677,8 @@ class FillClosedBatchAssembler:
                 "last_batch_index": self._last_straggler_batch_index,
             }
         return {
+            "picks_target": self.picks_target,
+            "journal_slots": FILL_CLOSED_EMISSIONS_PER_WINDOW,
             "in_accumulator": dict(counts),
             "pending": pending,
             "stragglers": stragglers,

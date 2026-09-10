@@ -9,6 +9,7 @@ behavior). Otherwise consume exactly one journal entry or report
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Callable
 
 from reliquary.validator.training import TrainingStepSkipped
@@ -42,6 +43,9 @@ class TrainerWorker:
     ) -> None:
         self._journal = journal
         self._train_fn = train_fn
+        self.last_train_seconds = None
+        self.last_fetch_seconds = None
+        self.last_publish_seconds = None
         self._publish_fn = publish_fn
         self._head_revision_fn = head_revision_fn
         self.cursor = int(cursor)
@@ -138,7 +142,10 @@ class TrainerWorker:
             "adaptive_policy_ratio_drift"
             if self.adaptive_publication_pending else "cadence"
         )
+        started = time.monotonic()
         self.last_published_revision = self._publish_fn(reason)
+        self.last_publish_seconds = time.monotonic() - started
+        logger.info("trainer_publish cursor=%d seconds=%.3f", self.cursor, self.last_publish_seconds)
         self.trained_since_publish = 0
         self.adaptive_publication_pending = False
         self._published_cursor = self.cursor
@@ -185,7 +192,9 @@ class TrainerWorker:
             return self._publish("fill_closed_boundary")
         if self._publication_due():
             return self._publish()
+        fetch_started = time.monotonic()
         entry = self._journal.next_entry(self.cursor, stride=self.stride)
+        self.last_fetch_seconds = time.monotonic() - fetch_started
         if entry is None:
             return "waited"
         kind, value = entry
@@ -204,6 +213,7 @@ class TrainerWorker:
                 self.cursor,
             )
             return "quarantined"
+        train_started = time.monotonic()
         try:
             trained = self._train_fn(value)
         except TrainingStepSkipped as exc:
@@ -217,6 +227,10 @@ class TrainerWorker:
                 exc.reason,
             )
             return "trained"
+        finally:
+            self.last_train_seconds = time.monotonic() - train_started
+            logger.info("trainer_step cursor=%d train_seconds=%.3f fetch_seconds=%.3f",
+                        self.cursor, self.last_train_seconds, self.last_fetch_seconds)
         self._advance_cursor(payload=True)
         if trained:
             self.trained_since_publish += 1
@@ -225,6 +239,9 @@ class TrainerWorker:
     def snapshot(self) -> dict[str, Any]:
         return {
             "cursor": self.cursor,
+            "last_train_seconds": self.last_train_seconds,
+            "last_fetch_seconds": self.last_fetch_seconds,
+            "last_publish_seconds": self.last_publish_seconds,
             "trained_since_publish": self.trained_since_publish,
             "adaptive_publication_pending": self.adaptive_publication_pending,
             "last_published_revision": self.last_published_revision,

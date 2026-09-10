@@ -326,6 +326,7 @@ class RemoteSandboxExecutor:
         client_key: str | None = None,
         allow_insecure_loopback: bool = False,
         client: httpx.Client | None = None,
+        max_connections: int = 16,
     ) -> None:
         parsed = urlparse(endpoint)
         host = (parsed.hostname or "").lower()
@@ -352,6 +353,11 @@ class RemoteSandboxExecutor:
             raise ValueError("invalid remote executor runtime_id")
 
         self.endpoint = endpoint.rstrip("/")
+        if not 1 <= max_connections <= 1024:
+            raise ValueError("executor connection limit must be within [1, 1024]")
+        self.max_connections = max_connections
+        limits = httpx.Limits(max_connections=max_connections,
+                             max_keepalive_connections=max_connections)
         self.runtime_id = runtime_id
         self._lock = threading.Lock()
         self._requests_total = 0
@@ -368,9 +374,9 @@ class RemoteSandboxExecutor:
             context = ssl.create_default_context(cafile=ca_cert)
             context.minimum_version = ssl.TLSVersion.TLSv1_2
             context.load_cert_chain(certfile=client_cert, keyfile=client_key)
-            self._client = httpx.Client(verify=context, trust_env=False)
+            self._client = httpx.Client(verify=context, trust_env=False, limits=limits)
         else:
-            self._client = httpx.Client(trust_env=False)
+            self._client = httpx.Client(trust_env=False, limits=limits)
 
     def _record_success(self, latency_ms: float) -> None:
         with self._lock:
@@ -387,7 +393,8 @@ class RemoteSandboxExecutor:
             self._last_failure_reason = reason
             self._last_latency_ms = latency_ms
 
-    def execute(self, request: SandboxBatchRequest) -> SandboxBatchResult:
+    def execute(self, request: SandboxBatchRequest, *,
+                deadline_monotonic: float | None = None) -> SandboxBatchResult:
         if request.runtime_id != self.runtime_id:
             raise SandboxExecutorError("local_runtime_mismatch")
         body = request.model_dump_json().encode("utf-8")
@@ -395,21 +402,28 @@ class RemoteSandboxExecutor:
             raise SandboxExecutorError("request_too_large")
 
         started = time.perf_counter()
+        remaining = (request.batch_timeout_s + REMOTE_EXECUTOR_TIMEOUT_HEADROOM_SECONDS
+                     if deadline_monotonic is None else deadline_monotonic - time.monotonic())
+        if not math.isfinite(remaining) or remaining <= 0:
+            raise SandboxExecutorError("admission_deadline_exceeded")
+        deadline = time.monotonic() + remaining
+        headers = {"Content-Type": "application/json"}
+        if deadline_monotonic is not None:
+            headers["X-Reliquary-Deadline-Ms"] = str(int((time.time() + remaining) * 1000))
         try:
             response_body = bytearray()
             with self._client.stream(
                 "POST",
                 f"{self.endpoint}/v1/execute",
                 content=body,
-                headers={"Content-Type": "application/json"},
-                timeout=(
-                    request.batch_timeout_s
-                    + REMOTE_EXECUTOR_TIMEOUT_HEADROOM_SECONDS
-                ),
+                headers=headers,
+                timeout=remaining,
             ) as response:
                 if response.status_code != 200:
                     raise SandboxExecutorError(f"http_{response.status_code}")
                 for chunk in response.iter_bytes():
+                    if time.monotonic() >= deadline:
+                        raise SandboxExecutorError("admission_deadline_exceeded")
                     response_body.extend(chunk)
                     if len(response_body) > MAX_EXECUTOR_RESPONSE_BYTES:
                         raise SandboxExecutorError("response_too_large")
@@ -418,6 +432,8 @@ class RemoteSandboxExecutor:
                 parse_constant=_reject_nonfinite_json,
             )
             result = SandboxBatchResult.model_validate(raw)
+            if time.monotonic() >= deadline:
+                raise SandboxExecutorError("admission_deadline_exceeded")
             expected_case_ids = [case.case_id for case in request.cases]
             actual_case_ids = [case.case_id for case in result.results]
             if (
@@ -456,6 +472,7 @@ class RemoteSandboxExecutor:
             )
             return {
                 "backend": "remote",
+                "max_connections": self.max_connections,
                 "runtime_id": self.runtime_id,
                 "requests_total": self._requests_total,
                 "failures_total": self._failures_total,
@@ -491,6 +508,7 @@ def remote_executor_from_env() -> RemoteSandboxExecutor | None:
         client_cert=os.environ.get("RELIQUARY_GRADER_EXECUTOR_CERT") or None,
         client_key=os.environ.get("RELIQUARY_GRADER_EXECUTOR_KEY") or None,
         allow_insecure_loopback=allow_insecure,
+        max_connections=int(os.environ.get("RELIQUARY_CPU_EXECUTOR_MAX_INFLIGHT", "16")),
     )
 
 

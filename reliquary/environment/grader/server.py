@@ -656,13 +656,20 @@ class GraderServer:
             }
 
         try:
+            deadline = req.get("deadline_monotonic")
+            if deadline is not None and (
+                not isinstance(deadline, (int, float)) or not math.isfinite(deadline)
+                or not 0 < deadline - time.monotonic() <= 126
+            ):
+                raise SandboxExecutorError("admission_deadline_exceeded")
             execution_request = make_sandbox_batch_request(
                 runtime_id=self.runtime_id,
                 code=str(req.get("code", "")),
                 cases=cases,
                 timeout_s=float(req.get("timeout_s", self.eval_timeout_s)),
             )
-            execution_result = self.execute_sandbox_batch(execution_request)
+            execution_result = self.execute_sandbox_batch(
+                execution_request, **({"deadline_monotonic": deadline} if deadline is not None else {}))
         except (SandboxExecutorError, TypeError, ValueError) as exc:
             reason = getattr(exc, "reason", type(exc).__name__)
             logger.warning(
@@ -730,15 +737,17 @@ class GraderServer:
     def execute_sandbox_batch(
         self,
         request: SandboxBatchRequest,
+        *, deadline_monotonic: float | None = None,
     ) -> SandboxBatchResult:
         """Execute without trusted expected values or reward comparison."""
         backend = "remote" if self.sandbox_executor is not None else "local"
         started = time.perf_counter()
         try:
             result = (
-                self.sandbox_executor.execute(request)
+                self.sandbox_executor.execute(request, **({"deadline_monotonic": deadline_monotonic}
+                    if deadline_monotonic is not None else {}))
                 if self.sandbox_executor is not None
-                else self._execute_local_sandbox_batch(request)
+                else self._execute_local_sandbox_batch(request, deadline_monotonic=deadline_monotonic)
             )
         except SandboxExecutorError:
             self._metrics.inc(
@@ -843,9 +852,15 @@ class GraderServer:
     def _execute_local_sandbox_batch(
         self,
         request: SandboxBatchRequest,
+        *, deadline_monotonic: float | None = None,
     ) -> SandboxBatchResult:
         started = time.perf_counter()
-        worker = self._acquire_worker(timeout=self.worker_acquire_timeout_s)
+        acquire_timeout = self.worker_acquire_timeout_s
+        if deadline_monotonic is not None:
+            acquire_timeout = min(acquire_timeout, deadline_monotonic - time.monotonic())
+            if acquire_timeout <= 0:
+                raise SandboxExecutorError("admission_deadline_exceeded")
+        worker = self._acquire_worker(timeout=acquire_timeout)
         if worker is None:
             raise SandboxExecutorError("capacity_unavailable")
         # Capacity wait is infrastructure latency, never a candidate timeout.
@@ -861,6 +876,8 @@ class GraderServer:
                     request.batch_timeout_s if not results
                     else batch_deadline - time.perf_counter()
                 )
+                if deadline_monotonic is not None:
+                    remaining_batch_s = min(remaining_batch_s, deadline_monotonic - time.monotonic())
                 if remaining_batch_s <= 0.0:
                     raise SandboxExecutorError("batch_deadline_exceeded")
                 worker_request = {

@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from reliquary.constants import FILL_CLOSED_EMISSIONS_PER_WINDOW
+from reliquary.constants import FILL_CLOSED_EMISSIONS_PER_WINDOW, FILL_CLOSED_PICKS_PER_WINDOW
 from reliquary.shared.checkpoint_identity import require_immutable_checkpoint_revision
 from reliquary.shared.strict_json import strict_json_loads
 from reliquary.shared.training_payload import (
@@ -59,7 +59,7 @@ class FillClosedRecoveryStore:
 
     def load(self, window: int) -> dict:
         value = strict_json_loads(self._path(window).read_bytes())
-        if not isinstance(value, dict) or set(value) != {
+        if not isinstance(value, dict) or set(value) - {"picks_target"} != {
             "schema_version", "window_start", "identity", "parent_checkpoint_n",
             "parent_revision", "environments", "batch_targets", "archive",
         } or type(value["schema_version"]) is not int or value["schema_version"] != 1:
@@ -75,6 +75,9 @@ class FillClosedRecoveryStore:
                 or not isinstance(targets, dict) or set(targets) != set(environments)
                 or any(type(n) is not int or n <= 0 for n in targets.values())):
             raise ValueError("invalid active window environments")
+        picks = value.get("picks_target", FILL_CLOSED_EMISSIONS_PER_WINDOW)
+        if type(picks) is not int or not 1 <= picks <= FILL_CLOSED_EMISSIONS_PER_WINDOW:
+            raise ValueError("invalid active window pick target")
         return value
 
     def windows(self) -> list[int]:
@@ -93,6 +96,7 @@ class FillClosedRecoveryStore:
             "identity": active_training_identity(), "parent_checkpoint_n": checkpoint_n,
             "parent_revision": revision, "environments": list(targets),
             "batch_targets": targets, "archive": None,
+            "picks_target": FILL_CLOSED_PICKS_PER_WINDOW,
         })
         self.load(window)
 
@@ -156,6 +160,8 @@ class FillClosedRecoveryStore:
                 raise RuntimeError("paid window recovery requires accounting receipts")
             payload_count += int(receipt["kind"] == "payload")
             paid = receipt["accounting"]
+            if (paid or receipt["kind"] == "payload") and index >= record.get("picks_target", FILL_CLOSED_EMISSIONS_PER_WINDOW):
+                raise RuntimeError("paid batch exceeds the window target")
             for row in paid:
                 if (row["env_name"] not in environments or row["batch_index"] != index
                         or type(row["eos_tokens"]) is not int or row["eos_tokens"] < 0
@@ -166,7 +172,7 @@ class FillClosedRecoveryStore:
                 shares = split_environment_pool([
                     AcceptedGroup(row["hotkey"], row["hotkey"], row["eos_tokens"])
                     for row in paid if row["env_name"] == environment
-                ], pool=1.0 / len(environments) / FILL_CLOSED_EMISSIONS_PER_WINDOW)
+                ], pool=1.0 / len(environments) / record.get("picks_target", FILL_CLOSED_EMISSIONS_PER_WINDOW))
                 for hotkey, reward in shares.items():
                     rewards[hotkey] = rewards.get(hotkey, 0.0) + reward
         gate = FillClosedRotationGate(
@@ -188,6 +194,7 @@ class FillClosedRecoveryStore:
             "rewards_by_hotkey": rewards, "training_identity": record["identity"],
             "checkpoint_revision": record["parent_revision"],
             "durable_payload_count": payload_count,
+            "picks_target": record.get("picks_target", FILL_CLOSED_EMISSIONS_PER_WINDOW),
             "runners_up": [], "rejected": [], "reject_summary": {},
             "training_quarantine": {"quarantined": False, "reasons": [], "metrics": {}},
         }

@@ -338,6 +338,7 @@ def test_capacity_budget_matches_actual_fill_state_not_legacy_proof_knob(monkeyp
     monkeypatch.setattr(c,'FILL_CLOSED_ADMISSION_BUDGET_PER_ENV',512)
     monkeypatch.setattr(c,'FILL_CLOSED_TARGET_GROUPS_PER_ENV',256)
     monkeypatch.setattr(c,'FILL_CLOSED_EMISSIONS_PER_WINDOW',16)
+    monkeypatch.setattr(c,'FILL_CLOSED_PICKS_PER_WINDOW',16)
     monkeypatch.setattr(c,'FILL_CLOSED_MAX_SECONDS',1800.)
     monkeypatch.setattr(c,'MAX_PROOF_WALL_SECONDS',999.)
     assert capacity_budget()=={'mode':'fill_closed','proofs_per_environment':512,'wall_seconds':1800.,
@@ -346,6 +347,11 @@ def test_capacity_budget_matches_actual_fill_state_not_legacy_proof_knob(monkeyp
     assert capacity_budget()['wall_seconds']==1800.
     monkeypatch.setattr(c,'FILL_CLOSED_MAX_SECONDS',3600.)
     assert capacity_budget()['wall_seconds']==3600.
+    monkeypatch.setattr(c,'FILL_CLOSED_PICKS_PER_WINDOW',10)
+    monkeypatch.setattr(c,'FILL_CLOSED_TARGET_GROUPS_PER_ENV',160)
+    assert capacity_budget()['picks_per_window']==10
+    assert capacity_budget()['target_groups_per_environment']==160
+    assert c.FILL_CLOSED_EMISSIONS_PER_WINDOW==16
     monkeypatch.setattr(c,'FILL_CLOSED_ENABLED',False)
     monkeypatch.setattr(c,'MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW',32)
     monkeypatch.setattr(c,'FORENSIC_SAMPLE_PER_WINDOW',2)

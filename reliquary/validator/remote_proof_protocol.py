@@ -18,6 +18,9 @@ from reliquary.shared.strict_json import strict_json_loads
 PROOF_PROTOCOL = "reliquary.remote-proof/v1"
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+MAX_PROOF_BATCH = 4
+MAX_BATCH_REQUEST_BYTES = MAX_PROOF_BATCH * MAX_REQUEST_BYTES + 1024
+MAX_BATCH_RESPONSE_BYTES = MAX_PROOF_BATCH * MAX_RESPONSE_BYTES + 1024
 MAX_TOKENS = 65536
 Hash = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 OID = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
@@ -209,6 +212,26 @@ class ProofResponse(WireModel):
     environment: Name
     content_sha256: Hash
     result: ProofValues
+
+
+class ProofBatchRequest(WireModel):
+    items: Annotated[list[ProofRequest], Field(min_length=1, max_length=MAX_PROOF_BATCH)]
+
+    @model_validator(mode="after")
+    def same_slot(self):
+        first = self.items[0]
+        fields = ("worker_id", "session_id", "device_id", "runtime_hash",
+                  "checkpoint", "window", "environment")
+        if any(any(getattr(item, key) != getattr(first, key) for key in fields)
+               for item in self.items):
+            raise ValueError("proof batch must share one slot, window and checkpoint")
+        if len({(item.job_id, item.attempt) for item in self.items}) != len(self.items):
+            raise ValueError("duplicate proof attempt in batch")
+        return self
+
+
+class ProofBatchResponse(WireModel):
+    items: Annotated[list[ProofResponse], Field(min_length=1, max_length=MAX_PROOF_BATCH)]
 
 
 class AdoptionRequest(WireModel):

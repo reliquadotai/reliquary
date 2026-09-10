@@ -848,3 +848,26 @@ def test_close_retries_from_the_first_undurable_key_without_double_commit(
     assert assembler.durable_tombstone_count == (
         FILL_CLOSED_EMISSIONS_PER_WINDOW - 1
     )
+
+
+def test_ten_batches_pay_one_pool_and_pad_remaining_durable_slots(monkeypatch):
+    import reliquary.validator.fill_closed_batch_assembler as module
+    import reliquary.infrastructure.training_payload_queue as queue
+    monkeypatch.setattr(module, 'FILL_CLOSED_PICKS_PER_WINDOW', 10)
+    monkeypatch.setattr(module, 'FILL_CLOSED_EMISSIONS_PER_WINDOW', 16)
+    monkeypatch.setattr(queue, 'FILL_CLOSED_EMISSIONS_PER_WINDOW', 16)
+    monkeypatch.setattr(queue, 'FILL_CLOSED_ENABLED', True)
+    writes = []
+    assembler = FillClosedBatchAssembler(window_start=42, env_order=ENV_ORDER,
+        enqueue_fn=lambda key, data: writes.append((key, False)),
+        tombstone_fn=lambda key, data: writes.append((key, True)))
+    for batch in range(10):
+        for env in ENV_ORDER:
+            groups = _chunk(batch, env)
+            for group in groups:
+                group.eos_tokens = 10
+            assembler.accept(env, groups, 42, 'rev')
+    assembler.close()
+    assert [key for key, _ in writes] == list(range(42 * 16, 43 * 16))
+    assert all(is_tombstone for _, is_tombstone in writes[10:])
+    assert abs(sum(assembler.reward_map().values()) - 1) < 1e-9
