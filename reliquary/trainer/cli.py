@@ -190,11 +190,10 @@ def run_train_worker(*, shadow: bool = False) -> None:
     if not shadow:
         asyncio.run(early_publisher.recover_pending())
 
-    expected_identity = (
-        {**active_training_identity(), "repo_id": repo_id}
-        if PROTOCOL_VERSION >= 5
-        else {"repo_id": repo_id}
-    )
+    # Journal payloads carry the run identity; only checkpoint manifests carry
+    # repo_id. Requiring the manifest header on payloads rejects our own codec.
+    payload_identity = active_training_identity() if PROTOCOL_VERSION >= 5 else {}
+    expected_identity = {**payload_identity, "repo_id": repo_id}
     revision, cursor, checkpoint_n = resolve_resume_point(
         fetch,
         env=os.environ,
@@ -378,7 +377,7 @@ def run_train_worker(*, shadow: bool = False) -> None:
     worker = TrainerWorker(
         journal=WindowJournal(
             fetch_fn=fetch,
-            expected_identity=expected_identity,
+            expected_identity=payload_identity,
         ),
         train_fn=runner.step,
         publish_fn=publish_fn,
