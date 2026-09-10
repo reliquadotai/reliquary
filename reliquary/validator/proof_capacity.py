@@ -29,10 +29,17 @@ def capacity_budget() -> dict[str, Any]:
     """
     from reliquary import constants as c
     if c.FILL_CLOSED_ENABLED:
-        return {"mode": "fill_closed", "proofs_per_environment": c.FILL_CLOSED_ADMISSION_BUDGET_PER_ENV,
+        budget = {"mode": "fill_closed", "proofs_per_environment": c.FILL_CLOSED_ADMISSION_BUDGET_PER_ENV,
             "wall_seconds": c.FILL_CLOSED_MAX_SECONDS,
             "target_groups_per_environment": c.FILL_CLOSED_TARGET_GROUPS_PER_ENV,
             "picks_per_window": c.FILL_CLOSED_EMISSIONS_PER_WINDOW}
+        if c.FILL_CLOSED_BOUNDED_PROOFS:
+            budget.update(mode="fill_closed_bounded",
+                drain_seconds=c.FILL_CLOSED_PROOF_DRAIN_SECONDS,
+                dispatch_seconds=c.FILL_CLOSED_PROOF_DISPATCH_SECONDS,
+                precommit_seconds=c.FILL_CLOSED_PRECOMMIT_SECONDS,
+                upload_grace_seconds=c.SUBMISSION_UPLOAD_GRACE_SECONDS)
+        return budget
     return {"mode": "seal_time_auction",
         "proofs_per_environment": c.MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW + c.FORENSIC_SAMPLE_PER_WINDOW,
         "wall_seconds": c.MAX_PROOF_WALL_SECONDS}
@@ -251,6 +258,9 @@ class ProofCapacityQualification:
     # legacy manifests, which keep the strict same-image behavior.
     proof_path_hash: str | None = None
     combined_evidence: Mapping[str, Any] | None = None
+    # Strict remains the default for all existing manifests. Bounded service
+    # qualifies a drain envelope, never completion of the admission ceiling.
+    service_mode: str = "strict"
 
     @classmethod
     def from_mapping(
@@ -263,6 +273,7 @@ class ProofCapacityQualification:
                 raise TypeError("qualified must be a boolean")
             return cls(
                 combined_evidence=value.get("combined_evidence"),
+                service_mode=str(value.get("service_mode", "strict")),
                 schema_version=int(value["schema_version"]),
                 profile_id=str(value["profile_id"]),
                 model_revision=str(value["model_revision"]),
@@ -367,8 +378,13 @@ class ProofCapacityQualification:
             raise ProofCapacityQualificationError(
                 "unsupported proof-capacity manifest schema"
             )
+        budget = capacity_budget()
+        bounded = budget["mode"] == "fill_closed_bounded"
+        if self.service_mode != ("bounded" if bounded else "strict"):
+            raise ProofCapacityQualificationError("proof service mode differs from runtime")
+        if bounded and self.schema_version != 4:
+            raise ProofCapacityQualificationError("bounded fill service requires combined schema 4 evidence")
         if self.schema_version == 4:
-            budget = capacity_budget()
             if (proof_wall_seconds != budget["wall_seconds"]
                     or minimum_proofs_per_environment != budget["proofs_per_environment"]):
                 raise ProofCapacityQualificationError("combined capacity caller does not match the active scheduler budget")
@@ -670,7 +686,16 @@ class ProofCapacityQualification:
         minimum_devices = math.ceil(
             required_device_seconds / usable_seconds_per_device
         )
-        if len(configured_devices) < minimum_devices:
+        bounded_group_seconds = None
+        if bounded:
+            bounded_group_seconds = max(
+                value for devices in combined_bounds.values() for value in devices.values()
+            ) / (1.0 - self.headroom_fraction)
+            if bounded_group_seconds > budget["drain_seconds"]:
+                raise ProofCapacityQualificationError(
+                    "measured group bound with headroom exceeds bounded proof drain margin"
+                )
+        elif len(configured_devices) < minimum_devices:
             raise ProofCapacityQualificationError(
                 "configured proof fleet is below measured capacity: "
                 f"requires {minimum_devices}, has {len(configured_devices)}"
@@ -679,6 +704,11 @@ class ProofCapacityQualification:
         return {
             "qualified": True,
             "schema_version": self.schema_version,
+            "service_mode": self.service_mode,
+            "window_budget": budget,
+            "all_admitted_proofs_qualified": not bounded,
+            "guaranteed_picks_per_window": 0 if bounded else None,
+            "qualified_group_seconds_with_headroom": bounded_group_seconds,
             "combined_seconds_per_proof_bound": combined_bounds,
             "qualification_carried_over_from": qualification_carried_over_from,
             "profile_id": self.profile_id,
@@ -693,8 +723,9 @@ class ProofCapacityQualification:
             "hardware_class": self.hardware_class,
             "configured_device_count": len(configured_devices),
             "configured_device_uuids": sorted(runtime_uuids),
-            "minimum_device_count": minimum_devices,
-            "required_device_seconds": required_device_seconds,
+            "minimum_device_count": None if bounded else minimum_devices,
+            "required_device_seconds": None if bounded else required_device_seconds,
+            "all_admission_demand_device_seconds": required_device_seconds,
             "available_device_seconds": (
                 len(configured_devices) * usable_seconds_per_device
             ),
