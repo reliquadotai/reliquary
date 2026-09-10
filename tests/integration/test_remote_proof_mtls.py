@@ -534,3 +534,25 @@ def test_health_probe_cannot_invalidate_a_new_adoption(pki):
         assert not health.is_alive() and not adoption.is_alive()
         assert client.revision("cuda:0") == next_revision
         assert client.assert_ready().checkpoint.checkpoint_n == 8
+
+
+def test_health_serializes_native_hf_configuration(pki):
+    from transformers import GenerationConfig, Qwen3Config
+
+    class NativeMetadataBackend(CPUProofBackend):
+        def describe(self, device):
+            value = super().describe(device)
+            value["config"] = Qwen3Config().to_dict()
+            value["generation_config"] = GenerationConfig(
+                exponential_decay_length_penalty=(8, 1.01),
+            ).to_dict()
+            return value
+
+    backend = NativeMetadataBackend()
+    assert set(backend.describe("cuda:0")["config"]["id2label"]) == {0, 1}
+    with endpoint(pki, backend) as client:
+        assert client.health.config["id2label"] == {"0": "LABEL_0", "1": "LABEL_1"}
+        assert client.health.config["hidden_size"] == Qwen3Config().hidden_size
+        assert client.health.generation_config["exponential_decay_length_penalty"] == [8, 1.01]
+    # The process-local description retains the native HF representation.
+    assert set(backend.describe("cuda:0")["config"]["id2label"]) == {0, 1}
