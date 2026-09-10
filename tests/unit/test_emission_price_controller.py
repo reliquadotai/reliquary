@@ -50,8 +50,7 @@ def _window(open_round: int, span: int, *, r: float | None) -> WindowOutcome:
         open_round=open_round,
         close_round=open_round + span,
         collect_ready_round=ready,
-        training_rounds=_INCOMPRESSIBLE,
-        validation_rounds=_INCOMPRESSIBLE // 2,
+        incompressible_rounds=_INCOMPRESSIBLE,
     )
 
 
@@ -273,8 +272,7 @@ def test_missing_stage_telemetry_is_not_a_shortage():
         open_round=0,
         close_round=100,
         collect_ready_round=10,      # it DID fill
-        training_rounds=0,           # but nothing was measured
-        validation_rounds=0,
+        incompressible_rounds=0,     # but nothing was measured
     )
 
     decision = replay([unmeasured], params)
@@ -290,8 +288,7 @@ def test_an_unmeasured_window_does_not_enter_the_median():
         open_round=100,
         close_round=200,
         collect_ready_round=110,
-        training_rounds=0,
-        validation_rounds=0,
+        incompressible_rounds=0,
     )
 
     decision = replay([_masked(0, 100), unmeasured, _masked(200, 100)], params)

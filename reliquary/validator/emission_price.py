@@ -63,8 +63,7 @@ class WindowOutcome:
     open_round: int
     close_round: int
     collect_ready_round: int | None
-    training_rounds: float
-    validation_rounds: float
+    incompressible_rounds: float
 
     @property
     def elapsed_rounds(self) -> int:
@@ -85,10 +84,11 @@ class WindowOutcome:
         """
         if self.collect_ready_round is None:
             return None
-        incompressible = max(self.training_rounds, self.validation_rounds)
-        if incompressible <= 0:
+        if self.incompressible_rounds <= 0:
             return None
-        return (int(self.collect_ready_round) - int(self.open_round)) / incompressible
+        return (
+            int(self.collect_ready_round) - int(self.open_round)
+        ) / self.incompressible_rounds
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,8 +212,6 @@ def replay(
 _REQUIRED_ARCHIVE_FIELDS = (
     "window_open_round",
     "window_close_round",
-    "training_rounds",
-    "validation_rounds",
 )
 
 
@@ -228,12 +226,25 @@ def outcome_from_archive(record: Mapping[str, Any]) -> WindowOutcome | None:
     if any(record.get(field) is None for field in _REQUIRED_ARCHIVE_FIELDS):
         return None
     ready = record.get("collect_ready_round")
+    open_round = int(record["window_open_round"])
+    close_round = int(record["window_close_round"])
+    measured = max(
+        float(record.get("training_rounds") or 0.0),
+        float(record.get("validation_rounds") or 0.0),
+    )
+    # A fill-closed window closes when the LAST constraint is lifted, so its
+    # span IS max(t_collect, t_stages) -- the denominator r wants, for free,
+    # where per-stage timing does not exist in the window loop at all today.
+    # The ratio it yields is capped at 1 and so cannot report how far past the
+    # stages collection ran; that costs the controller nothing (it has no
+    # raise-on-slow regime -- shortage is a window that never filled), and real
+    # stage timings sharpen it without a schema change.
+    incompressible = measured if measured > 0 else float(close_round - open_round)
     return WindowOutcome(
-        open_round=int(record["window_open_round"]),
-        close_round=int(record["window_close_round"]),
+        open_round=open_round,
+        close_round=close_round,
         collect_ready_round=None if ready is None else int(ready),
-        training_rounds=float(record["training_rounds"]),
-        validation_rounds=float(record["validation_rounds"]),
+        incompressible_rounds=incompressible,
     )
 
 

@@ -59,3 +59,45 @@ def test_an_aborted_window_carries_no_signal():
     An aborted window's timings describe the abort, not the market.
     """
     assert outcome_from_archive(_instrumented(window_status="aborted")) is None
+
+
+def test_the_window_span_stands_in_for_unmeasured_stages():
+    """A fill-closed window closes when the LAST constraint is lifted.
+
+    Its span is therefore ``max(t_collect, t_stages)`` by construction, which is
+    exactly the denominator ``r`` wants -- and it costs no new instrumentation,
+    where per-stage timing does not exist in the window loop at all today.
+
+    The ratio it yields is a lower bound: capped at 1, it cannot report HOW far
+    past the stages collection ran. That costs nothing in the controller, which
+    has no raise-on-slow regime (shortage is a window that never filled), but
+    real stage timings will sharpen the shadow numbers when they exist.
+    """
+    record = {
+        "window_status": "completed",
+        "window_open_round": 1000,
+        "window_close_round": 1100,
+        "collect_ready_round": 1025,
+        # no training_rounds, no validation_rounds
+    }
+
+    outcome = outcome_from_archive(record)
+
+    assert outcome is not None
+    assert outcome.ratio == 0.25   # 25 rounds of collection against the 100-round span
+
+
+def test_measured_stages_take_precedence_over_the_span():
+    """When the stages ARE timed, they are the sharper answer."""
+    record = _instrumented(
+        window_open_round=1000,
+        window_close_round=1100,
+        collect_ready_round=1025,
+        training_rounds=50.0,
+        validation_rounds=20.0,
+    )
+
+    outcome = outcome_from_archive(record)
+
+    assert outcome is not None
+    assert outcome.ratio == 0.5    # 25 rounds against max(50, 20), not against 100
