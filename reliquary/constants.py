@@ -1042,8 +1042,12 @@ HASH_DEDUP_RETENTION_WINDOWS = int(
 # work is capped independently (MAX_RANKED_PROOF_ATTEMPTS = 2·B_BATCH, grading =
 # MAX_PROOF_GRADING_ATTEMPTS), so this only widens cheap admission bandwidth,
 # not GPU proof load. v3 stays at B_BATCH so live economics are byte-identical.
+# Fill-closed windows contain multiple batches; permit one hotkey to cover
+# the full window with the same 2x attempt margin. GPU/admission budgets and
+# proof-failure limits remain independently enforced. Legacy quotas stay fixed.
 MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW = (
-    2 * B_BATCH if PROTOCOL_VERSION >= 4 else B_BATCH
+    2 * FILL_CLOSED_TARGET_GROUPS_PER_ENV if FILL_CLOSED_ENABLED
+    else 2 * B_BATCH if PROTOCOL_VERSION >= 4 else B_BATCH
 )
 
 # A signed upload precommit grants only a bounded right to upload.  There is no

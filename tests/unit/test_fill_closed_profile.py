@@ -292,3 +292,12 @@ def test_fill_profile_refuses_to_run_as_an_ordinary_auction():
 
     assert result.returncode != 0
     assert "requires its explicit" in result.stderr
+
+
+def test_submission_quota_covers_fill_window_without_changing_legacy():
+    source = "from reliquary import constants as c; print(c.MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW, c.MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW)"
+    for profile, enabled, quota in [("qwen3-4b-base-dapo-fill-closed-v6", "1", 512), ("qwen3-4b-base-dapo-reasoning-v5", "0", 32)]:
+        env = {k: v for k, v in os.environ.items() if not k.startswith("RELIQUARY_")}
+        env.update(RELIQUARY_PROTOCOL_PROFILE=profile, RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED=enabled)
+        result = subprocess.run([sys.executable, "-c", source], env=env, check=True, capture_output=True, text=True)
+        assert result.stdout.strip() == f"{quota} 2"
