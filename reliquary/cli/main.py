@@ -655,9 +655,17 @@ def validate(
                 proof_slots = remote_pool.devices
                 proof_models = remote_pool.proxies()
                 model = next(iter(proof_models.values()))
-                proof_capacity_qualification = remote_pool.qualify(
-                    activation_checkpoint_revision,
+                from reliquary.validator.observed_proof_rollout import (
+                    authorize_observed_live, observed_live_requested,
                 )
+                proof_capacity_qualification = (
+                    authorize_observed_live(remote_pool, activation_checkpoint_revision)
+                    if observed_live_requested()
+                    else remote_pool.qualify(activation_checkpoint_revision)
+                )
+                if proof_capacity_qualification.get("mode") == "observed_live":
+                    logger.warning("Explicit observed live rollout, capacity NOT qualified: %s",
+                                   proof_capacity_qualification)
                 logger.info("CPU controller: remote proof slots %s", proof_slots)
             else:
                 # Resolve the proof plane's topology BEFORE loading this process's

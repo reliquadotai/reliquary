@@ -125,6 +125,50 @@ def test_single_token_completion():
     assert ok is False
 
 
+def test_rejected_short_claim_archives_measured_deviation(monkeypatch, caplog):
+    import logging
+
+    import reliquary.constants as constants
+    from reliquary.protocol.submission import RejectReason
+    from reliquary.validator.verifier import ProofResult
+    from tests.unit.test_grpo_window_batcher import (
+        _make_batcher, _make_commit, _prove_one, _request,
+    )
+
+    monkeypatch.setattr(constants, "T_PROTO", 1.0)
+    request = _request()
+    rollout = request.rollouts[0]
+    tokens = [10] * constants.CHALLENGE_K + [99]
+    rollout.commit = _make_commit(
+        tokens=tokens, prompt_length=constants.CHALLENGE_K,
+        success=True, total_reward=rollout.reward,
+    )
+    rollout.tokens = tokens
+    delta = 0.125
+    rollout.commit["rollout"]["token_logprobs"] = [math.log(0.5) + delta]
+
+    def proof(*args, **kwargs):
+        return ProofResult(
+            all_passed=True, passed=1, checked=1, has_sparse_outputs=True,
+            p_stop=0.5, completion_chosen_probs=[0.5],
+            completion_argmax_probs=[0.5], completion_argmax_ids=[99],
+        )
+
+    batcher = _make_batcher(verify_commitment_proofs_fn=proof)
+    with caplog.at_level(logging.INFO, logger="reliquary.validator.batcher"):
+        assert _prove_one(batcher, request) is None
+
+    assert batcher.reject_counts[RejectReason.LOGPROB_MISMATCH.value] == 1
+    assert batcher.logprob_short_full_coverage_checks == 1
+    assert batcher.logprob_short_unverifiable == 0
+    assert len(batcher.rejected_submissions) == 1
+    rejected = batcher.rejected_submissions[0]
+    assert rejected.reason == RejectReason.LOGPROB_MISMATCH.value
+    assert math.isfinite(rejected.lp_dev_max)
+    assert rejected.lp_dev_max == pytest.approx(math.expm1(delta))
+    assert "median_dev=0.1331 completion_length=1" in caplog.text
+
+
 def test_overflow_claim_does_not_raise():
     """A crafted -1e30 logprob must NOT raise OverflowError (which would
     fault the whole proof plane). The median tolerates a single outlier by
