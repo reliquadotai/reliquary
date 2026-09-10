@@ -321,3 +321,31 @@ def price_signal_fields(
             targets_by_environment,
         ),
     }
+
+
+# Versioned in the image on purpose, and deliberately NOT in constants.py: the
+# replay has to be reproducible from a release, while constants.py is where
+# env-overridable settings live. An operator turning a knob at runtime would
+# put two weight-only nodes on two different prices.
+#
+# None of these numbers is settled. They are a starting point whose whole job
+# is to produce a shadow curve legible enough to calibrate them against.
+PRODUCTION_PRICE_PARAMS = PriceParams(
+    # Today's pool, so the first armed window changes nothing.
+    start=1.0,
+    # -1% per step. Quicknet is 3 s, so one step per ~50 minutes: roughly
+    # -25%/day, putting a descent to 0.05 about ten days out. Slow enough to
+    # watch, fast enough to matter.
+    decay=0.99,
+    rounds_per_step=1000,
+    # Collection close to the incompressible time is the target, not a signal.
+    deadband=0.80,
+    snap=1.20,
+    # A liveness guard, not an economic opinion. Where the cliff actually sits
+    # is what the shadow phase exists to find out.
+    floor=0.05,
+    cap=1.0,
+    # ~4 hours: several windows of confirmation before spending less, against a
+    # loop delay of one miner spin-up plus one window.
+    median_rounds=4800,
+)
