@@ -430,7 +430,8 @@ def test_server_rejects_unknown_protocol_extra_fields_and_bad_digest(pki):
         assert response.status_code == 413
 
 
-def test_capacity_requires_network_measurements_and_actual_gpu_identity(pki, tmp_path, monkeypatch):
+@pytest.mark.parametrize("fill_closed", [False, True])
+def test_capacity_requires_network_measurements_and_actual_gpu_identity(pki, tmp_path, monkeypatch, fill_closed):
     import hashlib
     from reliquary import constants as c
     from reliquary.validator.remote_proof_protocol import RemoteProofMeasurement, transport_hash
@@ -442,14 +443,18 @@ def test_capacity_requires_network_measurements_and_actual_gpu_identity(pki, tmp
     monkeypatch.setattr(c, "MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW", 1)
     monkeypatch.setattr(c, "FORENSIC_SAMPLE_PER_WINDOW", 0)
     monkeypatch.setattr(c, "MAX_PROOF_WALL_SECONDS", 240.)
+    monkeypatch.setattr(c, "FILL_CLOSED_ENABLED", fill_closed)
+    monkeypatch.setattr(c, "FILL_CLOSED_ADMISSION_BUDGET_PER_ENV", 512)
+    monkeypatch.setattr(c, "FILL_CLOSED_MAX_SECONDS", 1800.)
+    wall_seconds, proof_count = (1800., 512) if fill_closed else (240., 1)
     manifest_path = tmp_path / "capacity.json"
     with endpoint(pki, CPUProofBackend()) as client:
         manifest = dict(schema_version=3, profile_id=IDENTITY["profile_id"],
             model_revision="1" * 40, software_revision="c" * 40, checkpoint_revision=REV,
             samples_sha256="2" * 64, runtime_fingerprint_hash=client.runtime_fingerprint["profile_hash"],
             hardware_class=client.health.slots[0].hardware_class, benchmark_device_count=1,
-            benchmark_device_uuids=["gpu-test-0"], proof_wall_seconds=240., headroom_fraction=.2,
-            proofs_per_environment={"openmathinstruct": 1}, p95_seconds_per_proof={"openmathinstruct": .01},
+            benchmark_device_uuids=["gpu-test-0"], proof_wall_seconds=wall_seconds, headroom_fraction=.2,
+            proofs_per_environment={"openmathinstruct": proof_count}, p95_seconds_per_proof={"openmathinstruct": .01},
             p95_seconds_per_proof_by_environment_and_device={"openmathinstruct": {"gpu-test-0": .01}},
             sample_count_by_environment={"openmathinstruct": 20},
             sample_count_by_environment_and_device={"openmathinstruct": {"gpu-test-0": 20}},
@@ -467,6 +472,19 @@ def test_capacity_requires_network_measurements_and_actual_gpu_identity(pki, tmp
         manifest["remote_proof"] = RemoteProofMeasurement(worker_id="proof-test", transport_sha256=transport_hash()).model_dump()
         write()
         assert client.qualify(REV)["qualified"] is True
+        if fill_closed:
+            # Legacy wall and attempt limits cannot qualify a fill window,
+            # even with authentic remote measurements and the correct GPU.
+            manifest["proof_wall_seconds"] = 240.
+            write()
+            with pytest.raises(ProofCapacityQualificationError, match="wall"):
+                client.qualify(REV)
+            manifest["proof_wall_seconds"] = wall_seconds
+            manifest["proofs_per_environment"]["openmathinstruct"] = 1
+            write()
+            with pytest.raises(ProofCapacityQualificationError, match="reserve enough proofs"):
+                client.qualify(REV)
+            manifest["proofs_per_environment"]["openmathinstruct"] = proof_count
         manifest["benchmark_device_uuids"] = ["gpu-someone-else"]
         write()
         with pytest.raises(ProofCapacityQualificationError, match="UUID"):
@@ -556,3 +574,12 @@ def test_health_serializes_native_hf_configuration(pki):
         assert client.health.generation_config["exponential_decay_length_penalty"] == [8, 1.01]
     # The process-local description retains the native HF representation.
     assert set(backend.describe("cuda:0")["config"]["id2label"]) == {0, 1}
+
+
+def test_worker_utility_workload_setting_is_bound_to_controller(pki):
+    from reliquary.validator.utility_telemetry import utility_telemetry_enabled
+    with endpoint(pki, CPUProofBackend()) as client:
+        assert client.health.utility_telemetry_enabled == utility_telemetry_enabled()
+        changed=client.health.model_copy(update={'utility_telemetry_enabled':not utility_telemetry_enabled()})
+        with pytest.raises(ProofWorkerUnavailable,match='utility telemetry setting differs'):
+            client._validate_health(changed)

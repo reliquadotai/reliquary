@@ -213,7 +213,7 @@ python scripts/measure_remote_proof_capacity.py /private/signed-groups.jsonl \
 Retain the JSON report printed by this command; it binds corpus/sample hashes,
 checkpoint identity, software and runtime. Run the existing qualifier against
 that exact JSONL and matching report/worker identities, with
-`--remote-proof-worker-id`. Its existing gate still requires at least 20 passed
+`--remote-proof-worker-id`. Its default schema-3 gate requires at least 20 passed
 groups per physical GPU per active environment, **every rollout** at least 90%
 of that environment's token cap, and the configured headroom. Supply enough
 independent groups to cover every device; the scheduler uses its ordinary
@@ -223,3 +223,77 @@ tests only and cannot satisfy the actual target GPU qualification.
 Transport hashing now also covers the full batcher/service path and collector.
 Build and measure the final merged image on both hosts; a pre-merge or earlier
 collector build cannot reuse the same remote capacity marker.
+
+
+### Combined V1 qualification (schema 4)
+
+Natural EOS is not a resource ceiling: a correct Logic answer may be short.
+The explicit combined path keeps **20 genuinely passing M16 groups per active
+ENV and physical GPU**, and separately measures 20 full-envelope groups per
+configured slot/ENV. Every configured slot runs concurrently. Synthetic inputs
+contain 24,576 prompt tokens and 8,192 policy tokens; they exercise the real
+32,768-token forward, full forced-seed CDF checks, 32 GRAIL challenges, sparse
+outputs, and authenticated mTLS. Their invalid GRAIL verdicts remain invalid.
+They never become submissions, rewards, training data or passing proofs.
+
+The CPU supplement executes native post-proof helpers on the actual responses,
+then explicitly labeled CPU-only fixtures cover full scans that random invalid
+proofs may reject early. Native forensic JSONL serializers/appends run in
+throwaway files on the controller state filesystem and their cost is included.
+Code counterfactual sandbox regrading is excluded: set
+`RELIQUARY_CODE_SEMANTIC_COUNTERFACTUAL_ENABLED=0` in both benchmark and final
+controller. This disables extra forensic regrading only, preserving authenticity
+checks. All other measured flags (including GPU utility entropy) remain bound.
+
+Run the following in the exact controller image with its actual bounded CPU,
+memory, state-filesystem mount, active profile/run and client PKI. Output paths
+must be private, new, and on that state filesystem. The same immutable image
+must run the isolated GPU worker. Use genuine native corpus generation; the
+infra generator's `--natural-completions` preserves normal EOS without changing
+sampling, signatures or caps.
+
+```sh
+python scripts/measure_remote_proof_capacity.py /private/corpus.jsonl \
+  --combined-natural --output /state/private/natural.jsonl \
+  --hf-repo-id CHECKPOINT_REPO --checkpoint-n CHECKPOINT_N \
+  --checkpoint-revision FULL_CHECKPOINT_OID --timeout-seconds 86400
+python scripts/measure_remote_proof_stress.py \
+  --output /state/private/stress.jsonl \
+  --hf-repo-id CHECKPOINT_REPO --checkpoint-n CHECKPOINT_N \
+  --checkpoint-revision FULL_CHECKPOINT_OID --timeout-seconds 86400
+python scripts/qualify_proof_capacity.py /state/private/natural.jsonl \
+  --natural-corpus /private/corpus.jsonl --stress-samples /state/private/stress.jsonl \
+  --maximum-context-tokens 32768 --output /state/private/capacity.json \
+  --software-revision FULL_IMAGE_COMMIT --checkpoint-revision FULL_CHECKPOINT_OID \
+  --runtime-fingerprint-hash OBSERVED_RUNTIME_SHA256 --hardware-class OBSERVED_GPU_NAME \
+  --benchmark-device-count PHYSICAL_GPU_COUNT --measured-at UTC_TIMESTAMP \
+  --remote-proof-worker-id WORKER_ID
+```
+
+Keep the original corpus and both sibling `.attempts.jsonl` and
+`.proof-attempts.jsonl` ledgers. Every original input, admission duration,
+normal out-of-zone rejection and proof decision remains hash-bound to the
+selected output. Infrastructure errors/timeouts cannot produce final passing
+output. Canonical GRAIL, logprob or seed failures **block qualification**;
+there is no numerical-rejection override.
+
+Per ENV/GPU, the bound is **maximum measured full-envelope duration plus maximum
+measured authentic post-admission group duration**. This intentionally counts
+some work twice instead of mistaking a short-response p95 for a full-cap cost.
+At least 20% headroom is required. Natural p95s and lengths remain separately
+reported as actually measured. This is a conservative measured workload,
+not a mathematical guarantee for every token sequence.
+
+The shared budget helper matches the active scheduler. V1 fill windows reserve
+**512 admitted groups per ENV** by default (failures consume this monotone
+budget), targeting 256 proven groups in 16 picks; their backstop is
+`RELIQUARY_FILL_CLOSED_MAX_SECONDS` (default 1800). The legacy seal-time path
+keeps 34 groups and `RELIQUARY_MAX_PROOF_WALL_SECONDS`. Raising that legacy knob
+does not extend a fill window. Choose the fill backstop/fleet only from observed
+bounds; the qualifier refuses insufficient capacity. A longer backstop does
+not force normal windows to wait once all picks have completed.
+
+This budget covers **post-admission proof execution**. Admission/reward-grader
+latencies are recorded separately; public HTTP concurrency, late supply,
+trainer pacing, storage/recovery and live end-to-end adoption remain separate
+release checks. A capacity manifest is not a go-live acknowledgement.

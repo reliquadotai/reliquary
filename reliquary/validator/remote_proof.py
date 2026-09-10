@@ -127,6 +127,9 @@ class RemoteProofPool:
 
     def _validate_health(self, health):
         from reliquary.validator.proof_capacity import compute_proof_path_hash
+        from reliquary.validator.utility_telemetry import utility_telemetry_enabled
+        if health.utility_telemetry_enabled != utility_telemetry_enabled():
+            raise ProofWorkerUnavailable("remote proof utility telemetry setting differs")
         if health.worker_id != self.worker_id:
             raise ProofWorkerUnavailable("unexpected proof worker identity")
         if any(getattr(health, k) != v for k, v in self._identity.items()):
@@ -261,12 +264,16 @@ class RemoteProofPool:
         """Use the same pinned capacity contract with measured remote GPUs."""
         import math
         from reliquary import constants as c
-        from reliquary.validator.proof_capacity import load_proof_capacity_qualification
+        from reliquary.validator.proof_capacity import capacity_budget, load_proof_capacity_qualification
         path = os.environ.get("RELIQUARY_PROOF_CAPACITY_MANIFEST", "").strip()
         sha = os.environ.get("RELIQUARY_PROOF_CAPACITY_MANIFEST_SHA256", "").strip()
         if not path or not sha or self.health is None:
             raise ProofWorkerUnavailable("remote proof requires a pinned capacity manifest")
         qualification = load_proof_capacity_qualification(path, expected_sha256=sha)
+        if qualification.schema_version == 4:
+            from reliquary.validator.observability import immutable_build_revision
+            if immutable_build_revision() != self.health.software_revision:
+                raise ProofWorkerUnavailable("combined capacity requires the measured controller image too")
         from pathlib import Path
         import hashlib
         from reliquary.shared.strict_json import strict_json_loads
@@ -285,6 +292,8 @@ class RemoteProofPool:
             value = (slot.hardware_class, slot.device_uuid)
             if physical.setdefault(slot.physical_device, value) != value:
                 raise ProofWorkerUnavailable("remote physical GPU identity is ambiguous")
+        from reliquary.shared.hf_compat import resolve_max_context_length
+        budget = capacity_budget()
         report = qualification.validate(
             profile_id=c.PROTOCOL_PROFILE_ID, model_revision=c.PROTOCOL_MODEL_REVISION,
             software_revision=self.health.software_revision,
@@ -294,10 +303,15 @@ class RemoteProofPool:
             configured_devices=tuple(physical),
             configured_hardware=tuple(v[0] for v in physical.values()),
             configured_device_uuids=tuple(v[1] for v in physical.values()),
-            proof_wall_seconds=c.MAX_PROOF_WALL_SECONDS,
-            minimum_proofs_per_environment=c.MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW + c.FORENSIC_SAMPLE_PER_WINDOW,
+            proof_wall_seconds=budget["wall_seconds"],
+            minimum_proofs_per_environment=budget["proofs_per_environment"],
             minimum_completion_tokens_per_environment={e: math.ceil(cap * .9)
                 for e, cap in c.MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV.items()},
+            configured_slots={s.device_id: s.device_uuid.casefold() for s in self.health.slots},
+            maximum_context_tokens=(
+                resolve_max_context_length(SimpleNamespace(**self.health.config))
+                if qualification.schema_version == 4 else None),
+            full_completion_tokens_per_environment=c.MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV,
         )
         report["remote_proof"] = measurement.model_dump()
         return report

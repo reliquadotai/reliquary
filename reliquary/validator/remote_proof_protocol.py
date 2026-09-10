@@ -41,7 +41,8 @@ def transport_hash() -> str:
     return digest({name: hashlib.sha256((root / name).read_bytes()).hexdigest()
                    for name in ("remote_proof_protocol.py", "remote_proof.py",
                                 "remote_proof_server.py", "proof_worker.py",
-                                "proof_measurements.py", "batcher.py", "service.py")})
+                                "proof_measurements.py", "batcher.py", "service.py",
+                                "proof_stress.py", "proof_capacity_combined.py")})
 
 
 class WireModel(BaseModel):
@@ -227,6 +228,7 @@ class SlotState(WireModel):
 
 
 class ProofHealth(WireModel):
+    utility_telemetry_enabled: bool
     protocol: Literal[PROOF_PROTOCOL] = PROOF_PROTOCOL
     worker_id: Name
     session_id: Name
