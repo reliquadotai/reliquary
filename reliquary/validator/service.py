@@ -5051,6 +5051,9 @@ class ValidationService:
                              archives=get_archive_queue(), rotation=self._fill_closed_rotation_store)
             self._fill_closed_rotation_gate = self._fill_closed_rotation_store.load()
             getattr(self, "_fill_closed_assemblers", {}).pop(window_start, None)
+            current = getattr(self, "_fill_closed_assembler", None)
+            if current is not None and current.window_start == window_start:
+                self._fill_closed_assembler = None
             self._archive_enqueued_windows.add(window_start)
             self._cooldown_durable_window = max(getattr(self, "_cooldown_durable_window", 0), window_start)
             return
@@ -5081,6 +5084,9 @@ class ValidationService:
         # ``getattr`` for the same reason the dedup set above uses it: test
         # stubs and partially-built services call this method too.
         getattr(self, "_fill_closed_assemblers", {}).pop(window_start, None)
+        current = getattr(self, "_fill_closed_assembler", None)
+        if current is not None and current.window_start == window_start:
+            self._fill_closed_assembler = None
         env_names = list(batchers)
         from reliquary.environment.registry import get_environment_spec
 

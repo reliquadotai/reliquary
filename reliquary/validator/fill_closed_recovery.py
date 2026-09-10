@@ -39,7 +39,7 @@ def accounting_rows(batches: dict | None, *, batch_index: int) -> list[dict]:
                 "rollouts": [
                     {"tokens": list(rollout.commit["tokens"]),
                      "reward": float(rollout.reward),
-                     **({"hash": group.rollout_hashes[index]}
+                     **({"hash": group.rollout_hashes[index].hex()}
                         if index < len(group.rollout_hashes) else {})}
                     for index, rollout in enumerate(group.rollouts)
                 ],

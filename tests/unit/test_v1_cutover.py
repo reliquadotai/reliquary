@@ -258,3 +258,31 @@ assert not store.windows()
     result = subprocess.run([sys.executable, "-c", recover, str(tmp_path), crash_stage], env=environment,
                             capture_output=True, text=True, timeout=60, check=False)
     assert result.returncode == 0, result.stderr
+
+
+def test_live_accounting_commit_and_abort_release_stale_assembler(tmp_path, monkeypatch):
+    from reliquary.validator.fill_closed_recovery import accounting_rows
+    from reliquary.validator.service import ValidationService
+
+    store, queue, archives, rotation = _recovery_setup(tmp_path, monkeypatch)
+    group = SimpleNamespace(hotkey="alice", prompt_idx=12, sigma=1.0,
+        eos_tokens=30, claimed_checkpoint_hash="a" * 40,
+        merkle_root_bytes=b"m" * 32, selection_digest=b"s" * 32,
+        rollout_hashes=[b"h" * 32],
+        rollouts=[SimpleNamespace(commit={"tokens": [1, 2]}, reward=1.0)])
+    rows = accounting_rows({"math": [group]}, batch_index=0)
+    queue.enqueue_committed_payload(42 * 16, b"training-body", accounting=rows)
+    receipt_path = queue._journal_commit_dir / f"window-{42 * 16}.json"
+    original = receipt_path.read_bytes()
+    assert json.loads(original)["accounting"][0]["rollouts"][0]["hash"] == (b"h" * 32).hex()
+    monkeypatch.setattr("reliquary.validator.service.FILL_CLOSED_ENABLED", True)
+    monkeypatch.setattr("reliquary.infrastructure.archive_queue.get_archive_queue", lambda: archives)
+    stale = SimpleNamespace(window_start=42)
+    svc = SimpleNamespace(_active_batchers={"math": SimpleNamespace(window_start=42)},
+        _archive_enqueued_windows=set(), _fill_closed_recovery_store=store,
+        _training_payload_queue_ref=lambda: queue, _fill_closed_rotation_store=rotation,
+        _fill_closed_assemblers={42: stale}, _fill_closed_assembler=stale)
+    ValidationService._enqueue_aborted_window(svc, failure_stage="active", failure_type="RuntimeError")
+    assert svc._fill_closed_assembler is None and not svc._fill_closed_assemblers
+    assert receipt_path.read_bytes() == original
+    assert archives.pending_archives(start_window=42, end_window=42)[42]["batch"] == rows
