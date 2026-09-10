@@ -152,6 +152,7 @@ def run_train_worker(*, shadow: bool = False) -> None:
         DEFAULT_BASE_MODEL,
         DEFAULT_BASE_MODEL_REVISION,
         ENVIRONMENT_MIX,
+        FILL_CLOSED_ENABLED,
         PROTOCOL_VERSION,
     )
     from reliquary.shared.modeling import (
@@ -395,6 +396,7 @@ def run_train_worker(*, shadow: bool = False) -> None:
         drain_request_fn=lambda: control_request,
         finish_fn=runner.finish,
         publication_pending_fn=publisher.has_pending,
+        fill_closed=FILL_CLOSED_ENABLED,
     )
 
     logger.info(

@@ -38,6 +38,7 @@ class TrainerWorker:
         drain_request_fn: Callable[[], dict] | None = None,
         finish_fn: Callable[[], bool] | None = None,
         publication_pending_fn: Callable[[], bool] | None = None,
+        fill_closed: bool = False,
     ) -> None:
         self._journal = journal
         self._train_fn = train_fn
@@ -45,6 +46,9 @@ class TrainerWorker:
         self._head_revision_fn = head_revision_fn
         self.cursor = int(cursor)
         self.stride = int(stride)
+        self._fill_closed = bool(fill_closed)
+        if self._fill_closed and self.stride != 1:
+            raise ValueError("fill-closed trainer must consume every journal entry")
         self.publish_every = int(publish_every)
         self.last_published_revision = last_published_revision
         self.shadow = bool(shadow)
@@ -53,6 +57,7 @@ class TrainerWorker:
         self._finish_fn = finish_fn
         self._publication_pending_fn = publication_pending_fn
         self._published_cursor = self.cursor
+        self._payload_since_publish = False
         # Amendment v6.1 (trainer-paced picks): advisory pacing telemetry,
         # written every time the live trainer's journal cursor advances,
         # on every profile. Shadow consumption must not pace the validator.
@@ -63,7 +68,7 @@ class TrainerWorker:
         self.quarantined_seen = 0
         self.health_skips = 0
 
-    def _advance_cursor(self) -> None:
+    def _advance_cursor(self, *, payload: bool = False) -> None:
         """The single place the journal cursor moves forward.
 
         Every advance -- trained payload, tombstone, quarantine skip,
@@ -75,6 +80,7 @@ class TrainerWorker:
         never coming back to be trained).
         """
         self.cursor += self.stride
+        self._payload_since_publish |= payload
         self._write_cursor(self.cursor)
 
     def _write_cursor(self, journal_key: int) -> None:
@@ -96,6 +102,15 @@ class TrainerWorker:
             or self.adaptive_publication_pending
         )
 
+    def _window_publication_due(self) -> bool:
+        from reliquary.constants import FILL_CLOSED_EMISSIONS_PER_WINDOW
+
+        return (
+            self._fill_closed
+            and self._payload_since_publish
+            and (self.cursor + 1) % FILL_CLOSED_EMISSIONS_PER_WINDOW == 0
+        )
+
     def _publish(self, reason: str | None = None) -> str:
         if self.shadow:
             # Shadow mode trains but never publishes; reset counters so
@@ -103,6 +118,7 @@ class TrainerWorker:
             self.trained_since_publish = 0
             self.adaptive_publication_pending = False
             self._published_cursor = self.cursor
+            self._payload_since_publish = False
             return "published"
         pending = self._publication_pending_fn is not None and self._publication_pending_fn()
         head = self._head_revision_fn() if not pending else None
@@ -126,6 +142,7 @@ class TrainerWorker:
         self.trained_since_publish = 0
         self.adaptive_publication_pending = False
         self._published_cursor = self.cursor
+        self._payload_since_publish = False
         return "published"
 
     def run_once(self) -> str:
@@ -153,6 +170,19 @@ class TrainerWorker:
                     if self.trained_since_publish or self._published_cursor != self.cursor:
                         return self._publish("cutover_drain")
                     return "drained"
+        if self._window_publication_due():
+            # Tombstones/health skips do not count as optimizer steps. End
+            # each nonempty macro-window at its real journal cursor so a
+            # later full window cannot wait forever on a mid-window publish.
+            if self._finish_fn is None:
+                raise RuntimeError("fill-closed publication requires accumulator flush wiring")
+            try:
+                if self._finish_fn():
+                    self.trained_since_publish += 1
+            except TrainingStepSkipped as exc:
+                self.health_skips += 1
+                logger.warning("boundary train step skipped at %s: %s", self.cursor, exc.reason)
+            return self._publish("fill_closed_boundary")
         if self._publication_due():
             return self._publish()
         entry = self._journal.next_entry(self.cursor, stride=self.stride)
@@ -168,7 +198,7 @@ class TrainerWorker:
         if window_quarantined:
             self.quarantined_seen += 1
         if window_quarantined:
-            self._advance_cursor()
+            self._advance_cursor(payload=True)
             logger.warning(
                 "window %s quarantined at seal; skipping",
                 self.cursor,
@@ -177,7 +207,7 @@ class TrainerWorker:
         try:
             trained = self._train_fn(value)
         except TrainingStepSkipped as exc:
-            self._advance_cursor()
+            self._advance_cursor(payload=True)
             self.health_skips += 1
             if exc.reason == "policy_ratio_drift" and self.trained_since_publish > 0:
                 self.adaptive_publication_pending = True
@@ -187,7 +217,7 @@ class TrainerWorker:
                 exc.reason,
             )
             return "trained"
-        self._advance_cursor()
+        self._advance_cursor(payload=True)
         if trained:
             self.trained_since_publish += 1
         return "trained"
