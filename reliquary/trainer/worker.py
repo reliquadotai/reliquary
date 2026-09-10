@@ -54,10 +54,8 @@ class TrainerWorker:
         self._publication_pending_fn = publication_pending_fn
         self._published_cursor = self.cursor
         # Amendment v6.1 (trainer-paced picks): advisory pacing telemetry,
-        # written every time the journal cursor advances -- unconditional
-        # on every profile. The trainer has no notion of FILL_CLOSED and
-        # should not gain one here; on v5 (or with no writer configured)
-        # this is a harmless no-op.
+        # written every time the live trainer's journal cursor advances,
+        # on every profile. Shadow consumption must not pace the validator.
         self._cursor_writer = cursor_writer
         self.trained_since_publish = 0
         self.adaptive_publication_pending = False
@@ -72,7 +70,7 @@ class TrainerWorker:
         health skip -- is a journal key the
         validator's picker can now count as consumed, whether or not an
         optimizer step happened on it. Publishing the telemetry cursor
-        here, unconditionally, keeps the pacer from stalling on any of
+        here for the live trainer keeps the pacer from stalling on any of
         those non-training advances (a tombstoned or quarantined key is
         never coming back to be trained).
         """
@@ -80,7 +78,7 @@ class TrainerWorker:
         self._write_cursor(self.cursor)
 
     def _write_cursor(self, journal_key: int) -> None:
-        if self._cursor_writer is None:
+        if self.shadow or self._cursor_writer is None:
             return
         try:
             self._cursor_writer(journal_key)
