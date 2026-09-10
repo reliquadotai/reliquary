@@ -248,6 +248,20 @@ def outcome_from_archive(record: Mapping[str, Any]) -> WindowOutcome | None:
     )
 
 
+def distinct_prompt_arrival_rounds(
+    arrivals_by_prompt: Mapping[int, Sequence[int]],
+) -> list[int]:
+    """One round per distinct prompt: its earliest admissible arrival.
+
+    A window's target counts GROUPS, and a group is one prompt.
+    ``MAX_SUBMISSIONS_PER_PROMPT`` lets ten candidates chase the same prompt, so
+    counting raw submissions would report supply the window cannot use.
+    """
+    return [
+        min(rounds) for rounds in arrivals_by_prompt.values() if rounds
+    ]
+
+
 def ready_round(arrival_rounds: Sequence[int], target: int) -> int | None:
     """The round by which ``target`` admissible candidates had arrived.
 

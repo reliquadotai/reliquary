@@ -14,7 +14,11 @@ every CHEAP check and has been graded + scored, but has NOT been proven".
 
 from __future__ import annotations
 
-from reliquary.validator.emission_price import ready_round, window_ready_round
+from reliquary.validator.emission_price import (
+    distinct_prompt_arrival_rounds,
+    ready_round,
+    window_ready_round,
+)
 
 
 def test_the_target_th_arrival_is_what_counts():
@@ -73,3 +77,27 @@ def test_a_window_with_no_environments_has_no_ready_round():
     environment has to fall through to "no signal" like any other unusable one.
     """
     assert window_ready_round({}, {}) is None
+
+
+def test_a_prompt_arrives_when_its_FIRST_admissible_candidate_does():
+    """The target counts distinct groups, so re-submissions do not advance it.
+
+    A window wants 256 proven groups per environment, and a group is one
+    prompt. MAX_SUBMISSIONS_PER_PROMPT lets ten candidates chase the same
+    prompt; counting them all would report supply that the window cannot use.
+    """
+    rounds = distinct_prompt_arrival_rounds({7: [105, 100, 102], 9: [101]})
+
+    assert sorted(rounds) == [100, 101]
+
+
+def test_a_prompt_with_no_admissible_candidate_is_absent():
+    """An empty bucket is a prompt nothing usable ever landed on."""
+    assert distinct_prompt_arrival_rounds({7: [], 9: [101]}) == [101]
+
+
+def test_readiness_composes_over_distinct_prompts():
+    """The two halves meet here: distinct prompts, then the target-th of them."""
+    arrivals = {1: [100, 100], 2: [140], 3: [120]}
+
+    assert ready_round(distinct_prompt_arrival_rounds(arrivals), target=2) == 120
