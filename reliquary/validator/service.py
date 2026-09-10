@@ -170,6 +170,63 @@ def _bind_public_window_randomness(
     return digest.hexdigest()
 
 
+def _price_signal_int(value: Any) -> int | None:
+    """An honest int, or nothing. Mocks and floats are nothing."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return int(value)
+    return None
+
+
+def _window_price_signal(first_batcher, batcher_dict, target_for):
+    """The window's price signal for the archive, or None if unmeasurable.
+
+    Everything it needs already exists at seal: ``window_open_drand_round`` is
+    stamped from the real beacon, ``_seal_trigger_round`` from the seal, and
+    ``_submissions_per_prompt`` retains every admitted candidate for the
+    window's life -- appended to, never pruned. Nothing new is recorded in the
+    admission path.
+
+    Returning None rather than a partial record matters: a record carrying the
+    window bounds but no readiness reads downstream as a SHORTAGE, the one
+    regime that snaps the price up without confirmation. The archive tests
+    drive this with ``MagicMock`` batchers, whose every attribute answers with
+    another Mock, so "no real per-prompt index" has to read as silence.
+    """
+    from reliquary.validator.emission_price import price_signal_fields
+
+    arrivals: dict[str, dict[int, list[int]]] = {}
+    targets: dict[str, int] = {}
+    for env_name, env_batcher in batcher_dict.items():
+        index = getattr(env_batcher, "_submissions_per_prompt", None)
+        if not isinstance(index, dict):
+            return None
+        arrivals[str(env_name)] = {
+            int(prompt_idx): [
+                round_
+                for round_ in (
+                    _price_signal_int(getattr(pending, "drand_round", None))
+                    for pending in pendings
+                )
+                if round_ is not None
+            ]
+            for prompt_idx, pendings in index.items()
+        }
+        target = _price_signal_int(target_for(env_name, env_batcher))
+        if target is None:
+            return None
+        targets[str(env_name)] = target
+    return price_signal_fields(
+        open_round=_price_signal_int(
+            getattr(first_batcher, "window_open_drand_round", None)
+        ),
+        close_round=_price_signal_int(
+            getattr(first_batcher, "_seal_trigger_round", None)
+        ),
+        arrivals_by_environment=arrivals,
+        targets_by_environment=targets,
+    )
+
+
 logger = logging.getLogger(__name__)
 
 _HF_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
@@ -4183,6 +4240,21 @@ class ValidationService:
                 getattr(self, "env_targets", {}).get(env_name, B_BATCH)
             )
 
+        def _price_target_for(env_name: str, batcher) -> int:
+            """Groups the window must HOLD to close, not the training batch.
+
+            Under fill-closed a window closes on
+            FILL_CLOSED_TARGET_GROUPS_PER_ENV proven groups.
+            ``_archive_batch_target`` is the per-emission training batch
+            (B_BATCH), sixteen times smaller, and would call the window ready
+            long before it was.
+            """
+            if FILL_CLOSED_ENABLED:
+                from reliquary.constants import FILL_CLOSED_TARGET_GROUPS_PER_ENV
+
+                return int(FILL_CLOSED_TARGET_GROUPS_PER_ENV)
+            return _archive_batch_target(env_name, batcher)
+
         def _environment_manifest_digest(env_name: str) -> str | None:
             from reliquary.environment.registry import get_environment_spec
 
@@ -4680,6 +4752,12 @@ class ValidationService:
             env_name: _difficulty_auction_payload(env_batcher)
             for env_name, env_batcher in batcher_dict.items()
         }
+        # Absent when the window could not be measured: window bounds without a
+        # readiness read downstream as a SHORTAGE, which snaps the price up
+        # without confirmation. See ``_window_price_signal``.
+        price_signal = _window_price_signal(
+            first_batcher, batcher_dict, _price_target_for
+        )
         archive = {
             "archive_schema_version": 2,
             "window_status": "completed",
@@ -4688,6 +4766,7 @@ class ValidationService:
             "randomness": first_batcher.randomness,
             "environment": env_names_list[0],   # legacy singular, kept for compat
             "environments": env_names_list,      # multi-env canonical field
+            **(price_signal or {}),
             "batch_targets": {
                 env_name: _archive_batch_target(env_name, env_batcher)
                 for env_name, env_batcher in batcher_dict.items()
