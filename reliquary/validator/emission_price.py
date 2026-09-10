@@ -289,3 +289,35 @@ def window_ready_round(
             return None
         rounds.append(reached)
     return max(rounds) if rounds else None
+
+
+def price_signal_fields(
+    *,
+    open_round: int | None,
+    close_round: int | None,
+    arrivals_by_environment: Mapping[str, Mapping[int, Sequence[int]]] | None,
+    targets_by_environment: Mapping[str, int],
+) -> dict[str, Any] | None:
+    """The three fields a window contributes to the archive, or None.
+
+    They travel together or not at all. A record carrying the window bounds but
+    not the readiness reads as a SHORTAGE -- the one regime that needs no
+    confirmation and snaps the price up -- when all that happened is that the
+    validator could not measure. Silence has to look like silence.
+
+    An explicit ``collect_ready_round: None`` INSIDE a complete record is the
+    opposite: measured, and it did not fill. That is real news and it travels.
+    """
+    if open_round is None or close_round is None or arrivals_by_environment is None:
+        return None
+    return {
+        "window_open_round": int(open_round),
+        "window_close_round": int(close_round),
+        "collect_ready_round": window_ready_round(
+            {
+                environment: distinct_prompt_arrival_rounds(arrivals)
+                for environment, arrivals in arrivals_by_environment.items()
+            },
+            targets_by_environment,
+        ),
+    }
