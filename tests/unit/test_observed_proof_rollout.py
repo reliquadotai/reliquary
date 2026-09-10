@@ -137,3 +137,30 @@ def test_incomplete_or_rewritten_native_ledger_rejected(rollout, fault):
     with pytest.raises(ValueError):
         observed._natural_summary(b"\n".join(json.dumps(e).encode() for e in events),
             rollout.pool.health.checkpoint.model_dump(), ["math", "code", "logic"])
+
+
+def test_startup_authorizes_anchor_before_bootstrap_adopts_successor(tmp_path, monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+    from reliquary.validator import service
+
+    monkeypatch.setenv("RELIQUARY_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(service, "PROTOCOL_VERSION", 6)
+    monkeypatch.setattr("reliquary.infrastructure.archive_queue.get_archive_queue", MagicMock())
+    authorize = Mock()
+    monkeypatch.setattr(observed, "assert_proof_start_authorized", authorize)
+    svc = MagicMock()
+    svc.proof_capacity_qualification = {"qualified": False}
+    svc._checkpoint_store.current_manifest.return_value = SimpleNamespace(revision="anchor")
+    svc.server.start = AsyncMock()
+    svc._refresh_registered_hotkeys = AsyncMock()
+    svc._apply_resume_from = AsyncMock()
+
+    async def adopt_successor():
+        authorize.assert_called_once_with(svc.proof_capacity_qualification, svc._proof_worker_pool, "anchor")
+        svc._checkpoint_store.current_manifest.return_value = SimpleNamespace(revision="successor")
+        raise RuntimeError("bootstrap reached after authorization")
+
+    svc._bootstrap_state_from_external = adopt_successor
+    with pytest.raises(RuntimeError, match="bootstrap reached after authorization"):
+        asyncio.run(service.ValidationService.run(svc, None))
