@@ -5391,6 +5391,18 @@ class ValidationService:
         await self._refresh_registered_hotkeys(force=True, reason="startup")
         await self.server.start()
         await self._apply_resume_from()                  # ← resume before bootstrap
+        # Authenticate the pinned activation checkpoint before normal bootstrap
+        # adopts a trainer-published successor (as it does during a live run).
+        if (
+            PROTOCOL_VERSION >= 3
+            and self.proof_capacity_qualification.get("qualified") is not True
+        ):
+            from reliquary.validator.observed_proof_rollout import assert_proof_start_authorized
+            active_manifest = self._checkpoint_store.current_manifest()
+            assert_proof_start_authorized(
+                self.proof_capacity_qualification, self._proof_worker_pool,
+                active_manifest.revision if active_manifest is not None else "",
+            )
         await self._bootstrap_state_from_external()
         if (
             self._local_resume_unadvertised
@@ -5404,16 +5416,6 @@ class ValidationService:
             raise RuntimeError(
                 "auction-v3 requires configured proof replicas; set "
                 "RELIQUARY_PROOF_DEVICES and qualify capacity before launch"
-            )
-        if (
-            PROTOCOL_VERSION >= 3
-            and self.proof_capacity_qualification.get("qualified") is not True
-        ):
-            from reliquary.validator.observed_proof_rollout import assert_proof_start_authorized
-            active_manifest = self._checkpoint_store.current_manifest()
-            assert_proof_start_authorized(
-                self.proof_capacity_qualification, self._proof_worker_pool,
-                active_manifest.revision if active_manifest is not None else "",
             )
         await self._ensure_proof_scheduler_ready()
         self._publish_window_preparation_state()
