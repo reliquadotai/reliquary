@@ -61,12 +61,20 @@ configuration, and configure:
 | `RELIQUARY_PROOF_TLS_CA` | Worker server CA |
 | `RELIQUARY_PROOF_TLS_CERT` / `RELIQUARY_PROOF_TLS_KEY` | Dedicated controller client leaf/key |
 | `RELIQUARY_PROOF_EXPECTED_WORKER_ID` | Exact worker identity |
+| `RELIQUARY_PROOF_PIPELINE_DEPTH` | Proof batches kept in flight per worker slot, 1 to 4 (default 1) |
 | `RELIQUARY_PROOF_CAPACITY_MANIFEST` / `RELIQUARY_PROOF_CAPACITY_MANIFEST_SHA256` | Pinned capacity evidence |
 
 The existing `RELIQUARY_PROOF_WORKER_REQUEST_TIMEOUT_SECONDS` and
 `RELIQUARY_PROOF_WORKER_RELOAD_TIMEOUT_SECONDS` also bound network proof and
 adoption calls. Allow enough reload time for all configured replicas to install.
 Transport deadlines are absolute; keep the hosts' clocks synchronized.
+
+`RELIQUARY_PROOF_PIPELINE_DEPTH` above 1 gives the scheduler that many dispatch
+lanes per worker slot, so uploads and downloads overlap GPU work instead of
+alternating with it. The worker still runs one proof per slot at a time and
+queues the rest, up to `MAX_PROOF_PIPELINE_DEPTH` (4); a request beyond that is
+refused, and a queued proof gives up at its own deadline. Lanes exist only on
+the controller: the wire, receipts and capacity evidence carry the physical slot.
 
 Remote mode uses metadata proxies for every scheduled, forensic and legacy
 proof path. The initial SHA resume downloads only profile/tokenizer/config

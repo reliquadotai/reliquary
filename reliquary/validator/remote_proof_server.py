@@ -18,7 +18,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from reliquary.validator.proof_worker import ProofWorkerUnavailable
 from reliquary.validator.remote_proof_protocol import (
     MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, AdoptionRequest, CheckpointBinding,
-    ProofHealth, ProofRequest, ProofResponse, ProofValues, SlotState,
+    MAX_PROOF_PIPELINE_DEPTH, ProofHealth, ProofRequest, ProofResponse, ProofValues, SlotState,
     canonical_bytes, digest, transport_hash, ProofBatchRequest, ProofBatchResponse,
     MAX_BATCH_REQUEST_BYTES, MAX_BATCH_RESPONSE_BYTES,
 )
@@ -123,9 +123,13 @@ def create_proof_app(*, backend, worker_id: str, profile_id: str,
     locks = {device: threading.Lock() for device in backend.devices}
     if not locks or len(locks) != len(backend.devices):
         raise ValueError("proof slots must be nonempty and distinct")
-    executor = ThreadPoolExecutor(max_workers=len(locks) + 1,
+    # Each accepted proof holds a thread while it waits for its slot; the spare two
+    # keep health and adoption answering.
+    executor = ThreadPoolExecutor(max_workers=len(locks) * MAX_PROOF_PIPELINE_DEPTH + 2,
                                   thread_name_prefix="remote-proof")
     state_lock = threading.Lock()
+    # Proofs accepted per slot and not yet finished: the one on the GPU plus those queued.
+    pending = {device: 0 for device in locks}
     checkpoint = None
     highest_requested = None
     cache: OrderedDict[tuple[str, int], tuple[str, bytes | None]] = OrderedDict()
@@ -288,24 +292,30 @@ def create_proof_app(*, backend, worker_id: str, profile_id: str,
             lock = locks.get(first.device_id)
             if lock is None:
                 raise HTTPException(409, "unknown proof slot")
-            if not lock.acquire(blocking=False):
-                raise HTTPException(503, "proof slot busy")
+            if pending[first.device_id] >= MAX_PROOF_PIPELINE_DEPTH:
+                raise HTTPException(503, "proof slot queue full")
             reserved = {key} | {(value.job_id, value.attempt) for value in values}
             # Reserve room for both the batch envelope and per-item receipts.
             while len(cache) + len(reserved) > 128 or cache_bytes + 2 * limit > cache_limit:
                 old_key = next((k for k, (_, body) in cache.items()
                                 if body is not None and k not in reserved), None)
                 if old_key is None:
-                    lock.release()
                     raise HTTPException(503, "proof retry cache full")
                 _, old_body = cache.pop(old_key)
                 cache_bytes -= len(old_body)
             cache[key] = (request_hash, None)
+            pending[first.device_id] += 1
 
         def execute():
             nonlocal cache_bytes
             results = []
+            acquired = False
             try:
+                # A queued proof waits for the GPU no longer than its own deadline.
+                deadline = min(value.expires_at_ms for value in values) / 1000
+                acquired = lock.acquire(timeout=max(0.0, deadline - clock()))
+                if not acquired:
+                    raise ProofWorkerUnavailable("proof deadline expired waiting for its slot")
                 for value, bound_hash in zip(values, hashes):
                     item_key = (value.job_id, value.attempt)
                     if int(clock() * 1000) >= value.expires_at_ms:
@@ -361,19 +371,22 @@ def create_proof_app(*, backend, worker_id: str, profile_id: str,
                         if failed_key in reserved and body is None:
                             cache[failed_key] = (bound_hash, b"")
                 raise
+            finally:
+                if acquired:
+                    lock.release()
 
         try:
             future = executor.submit(execute)
         except Exception:
             with state_lock:
                 cache[key] = (request_hash, b"")
-            lock.release()
+                pending[first.device_id] -= 1
             raise HTTPException(503, "proof executor stopped")
         def completed(f):
-            if f.cancelled():
-                with state_lock:
+            with state_lock:
+                if f.cancelled():
                     cache[key] = (request_hash, b"")
-            lock.release()
+                pending[first.device_id] -= 1
         future.add_done_callback(completed)
         try:
             raw = await asyncio.wrap_future(future)
@@ -451,7 +464,7 @@ def main():
         uvicorn.run(app, host=host,
                     port=int(os.environ.get("RELIQUARY_PROOF_PORT", "8445")),
                     access_log=False, server_header=False, timeout_keep_alive=120,
-                    limit_concurrency=len(pool.devices) * 2 + 4, **tls)
+                    limit_concurrency=len(pool.devices) * MAX_PROOF_PIPELINE_DEPTH + 4, **tls)
     finally:
         pool.close(force=True)
 

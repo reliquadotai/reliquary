@@ -90,7 +90,7 @@ def pki(tmp_path_factory):
 
 
 @contextmanager
-def endpoint(pki, backend, *, tamper=None, timeout=2.):
+def endpoint(pki, backend, *, tamper=None, timeout=2., pipeline_depth=1):
     app = create_proof_app(backend=backend, worker_id="proof-test", **IDENTITY,
                           software_revision="c" * 40, proof_path_hash=compute_proof_path_hash())
     if tamper:
@@ -123,7 +123,7 @@ def endpoint(pki, backend, *, tamper=None, timeout=2.):
     client = RemoteProofPool(base_url=f"https://127.0.0.1:{listener.getsockname()[1]}",
         ca_path=str(pki / "signer-client/ca.crt"), cert_path=str(pki / "signer-client/client.crt"),
         key_path=str(pki / "signer-client/client.key"), expected_worker_id="proof-test",
-        **IDENTITY, request_timeout=timeout, reload_timeout=2.)
+        **IDENTITY, request_timeout=timeout, reload_timeout=2., pipeline_depth=pipeline_depth)
     try:
         client.start()
         client.bind_checkpoint(7, IDENTITY["repo_id"], REV)
@@ -248,8 +248,6 @@ def test_disconnect_retains_gpu_slot_and_blocks_adoption(pki):
         with pytest.raises(ProofWorkerUnavailable):
             client._request("POST", "/v1/prove", request, timeout=.05)
         assert backend.started.wait(1)
-        with pytest.raises(ProofWorkerUnavailable, match="503"):
-            client._request("POST", "/v1/prove", request_for(client, job_id="job-2"), timeout=1)
         adoption = AdoptionRequest(worker_id=client.worker_id, session_id=client.health.session_id,
                                    checkpoint=client._checkpoint)
         with pytest.raises(ProofWorkerUnavailable, match="503"):
@@ -632,3 +630,202 @@ def test_batch_stops_at_first_grail_failure_and_rejects_mixed_identity(pki):
         items = [request_for(client, job_id='a'), request_for(client, job_id='b', window=43)]
         with pytest.raises(ValueError, match='same|share'):
             ProofBatchRequest(items=items)
+
+
+
+class GatedProofBackend(CPUProofBackend):
+    """Holds each proof until released and records overlapping GPU calls."""
+
+    def __init__(self):
+        super().__init__()
+        self.release = threading.Event()
+        self.active = self.max_active = 0
+        self._guard = threading.Lock()
+
+    def prove(self, request):
+        with self._guard:
+            self.calls += 1
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        self.started.set()
+        try:
+            assert self.release.wait(10)
+            assert request.checkpoint.revision == self.revision
+            return kernel_result()
+        finally:
+            with self._guard:
+                self.active -= 1
+
+
+def in_background(call):
+    outcome = {}
+    def run():
+        try:
+            outcome["value"] = call()
+        except Exception as exc:
+            outcome["error"] = exc
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread, outcome
+
+
+def prove_request(client, job_id):
+    return client._request("POST", "/v1/prove", request_for(
+        client, job_id=job_id, expires_at_ms=int((time.time() + 10) * 1000)), timeout=10)
+
+
+def test_a_batch_arriving_on_a_busy_slot_waits_its_turn(pki):
+    backend = GatedProofBackend()
+    with endpoint(pki, backend, timeout=10.) as client:
+        value = payload()
+        def batch():
+            return client.prove_many("cuda:0", [(value.commit(), value.seed_u_values)] * 4,
+                value.randomness, window=42, environment="openmathinstruct",
+                checkpoint=client._adopted)
+        try:
+            first, first_outcome = in_background(batch)
+            assert backend.started.wait(5)
+            second, second_outcome = in_background(batch)
+            second.join(1)
+            assert second.is_alive(), second_outcome.get("error")
+        finally:
+            backend.release.set()
+        first.join(10)
+        second.join(10)
+        assert "error" not in first_outcome and "error" not in second_outcome
+        assert len(first_outcome["value"]) == len(second_outcome["value"]) == 4
+        assert backend.calls == 8 and backend.max_active == 1
+
+
+def test_a_slot_queues_a_bounded_number_of_proofs(pki):
+    from reliquary.validator.remote_proof_protocol import MAX_PROOF_PIPELINE_DEPTH
+    backend = GatedProofBackend()
+    with endpoint(pki, backend, timeout=10.) as client:
+        try:
+            calls = [in_background(lambda job=f"job-{i}": prove_request(client, job))
+                     for i in range(MAX_PROOF_PIPELINE_DEPTH + 1)]
+            deadline = time.monotonic() + 5
+            while all(thread.is_alive() for thread, _ in calls) and time.monotonic() < deadline:
+                time.sleep(.01)
+            time.sleep(.5)
+        finally:
+            backend.release.set()
+        for thread, _ in calls:
+            thread.join(10)
+        refused = [outcome["error"] for _, outcome in calls if "error" in outcome]
+        assert len(refused) == 1 and "503" in str(refused[0])
+        assert backend.calls == MAX_PROOF_PIPELINE_DEPTH and backend.max_active == 1
+
+
+def test_health_answers_while_proofs_wait_for_the_slot(pki):
+    from reliquary.validator.remote_proof_protocol import MAX_PROOF_PIPELINE_DEPTH
+    backend = GatedProofBackend()
+    with endpoint(pki, backend, timeout=10.) as client:
+        try:
+            calls = [in_background(lambda job=f"job-{i}": prove_request(client, job))
+                     for i in range(MAX_PROOF_PIPELINE_DEPTH)]
+            assert backend.started.wait(5)
+            time.sleep(.5)
+            client._request("GET", "/v1/health", timeout=2)
+        finally:
+            backend.release.set()
+        for thread, _ in calls:
+            thread.join(10)
+        assert all("error" not in outcome for _, outcome in calls)
+
+
+def test_dispatch_lanes_share_one_slot_without_reaching_the_wire(pki):
+    backend = CPUProofBackend()
+    with endpoint(pki, backend, timeout=10., pipeline_depth=3) as client:
+        lanes = client.dispatch_devices
+        assert len(set(lanes)) == 3 and "cuda:0" in lanes
+        proxies = client.proxies()
+        assert set(proxies) == set(lanes)
+        value = payload()
+        verify = client.verifier_for_window(42, "openmathinstruct", REV)
+        for lane in lanes:
+            assert client.revision(lane) == REV
+            client.reload(lane, None, REV, IDENTITY["repo_id"])
+            assert len(verify.batch([(value.commit(), value.seed_u_values)] * 2,
+                                    proxies[lane], value.randomness)) == 2
+        assert backend.calls == 6 and backend.adoptions == 1
+
+
+def test_a_single_lane_keeps_the_slot_identifiers(pki):
+    with endpoint(pki, CPUProofBackend(), timeout=10.) as client:
+        assert client.dispatch_devices == client.devices == ("cuda:0",)
+        assert set(client.proxies()) == {"cuda:0"}
+
+
+@pytest.mark.parametrize("depth", ["zero", "above"])
+def test_pool_refuses_a_depth_the_worker_cannot_queue(pki, depth):
+    from reliquary.validator.remote_proof_protocol import MAX_PROOF_PIPELINE_DEPTH
+    def pool(pipeline_depth):
+        return RemoteProofPool(base_url="https://127.0.0.1:1",
+            ca_path=str(pki / "signer-client/ca.crt"), cert_path=str(pki / "signer-client/client.crt"),
+            key_path=str(pki / "signer-client/client.key"), expected_worker_id="proof-test",
+            **IDENTITY, request_timeout=2., reload_timeout=2., pipeline_depth=pipeline_depth)
+    pool(MAX_PROOF_PIPELINE_DEPTH).close()
+    with pytest.raises(ValueError, match="depth"):
+        pool(0 if depth == "zero" else MAX_PROOF_PIPELINE_DEPTH + 1)
+
+
+def test_every_dispatch_lane_keeps_its_connection_alive(pki):
+    backend = GatedProofBackend()
+    with endpoint(pki, backend, timeout=10., pipeline_depth=3) as client:
+        value = payload()
+        def batch():
+            return client.prove_many("cuda:0", [(value.commit(), value.seed_u_values)] * 2,
+                value.randomness, window=42, environment="openmathinstruct",
+                checkpoint=client._adopted)
+        def three_overlapping_batches():
+            backend.release.clear()
+            try:
+                calls = [in_background(batch) for _ in range(3)]
+                time.sleep(.5)
+            finally:
+                backend.release.set()
+            for thread, _ in calls:
+                thread.join(10)
+            assert all("error" not in outcome for _, outcome in calls)
+        three_overlapping_batches()
+        reconnects = client._rpc_stats["reconnects"]
+        three_overlapping_batches()
+        assert client._rpc_stats["reconnects"] == reconnects
+
+
+def test_a_queued_proof_gives_up_at_its_deadline_without_reaching_the_gpu(pki):
+    backend = GatedProofBackend()
+    with endpoint(pki, backend, timeout=10.) as client:
+        try:
+            running, running_outcome = in_background(lambda: prove_request(client, "job-running"))
+            assert backend.started.wait(5)
+            queued = request_for(client, job_id="job-queued",
+                                 expires_at_ms=int((time.time() + 1) * 1000))
+            with pytest.raises(ProofWorkerUnavailable, match="503"):
+                client._request("POST", "/v1/prove", queued, timeout=5)
+        finally:
+            backend.release.set()
+        running.join(10)
+        assert "error" not in running_outcome
+        time.sleep(.5)
+        assert backend.calls == 1
+
+
+def test_the_controller_takes_its_pipeline_depth_from_configuration(pki, monkeypatch):
+    import reliquary.constants as c
+    monkeypatch.setattr(c, "PROTOCOL_VERSION", 5)
+    monkeypatch.setattr(c, "PROOF_PIPELINE_DEPTH", 3)
+    for name, value in {
+        "RELIQUARY_PROOF_EXECUTOR_URL": "https://127.0.0.1:1",
+        "RELIQUARY_PROOF_TLS_CA": str(pki / "signer-client/ca.crt"),
+        "RELIQUARY_PROOF_TLS_CERT": str(pki / "signer-client/client.crt"),
+        "RELIQUARY_PROOF_TLS_KEY": str(pki / "signer-client/client.key"),
+        "RELIQUARY_PROOF_EXPECTED_WORKER_ID": "proof-test",
+    }.items():
+        monkeypatch.setenv(name, value)
+    pool = RemoteProofPool.from_environment(repo_id=IDENTITY["repo_id"])
+    try:
+        assert pool.pipeline_depth == 3
+    finally:
+        pool.close()
