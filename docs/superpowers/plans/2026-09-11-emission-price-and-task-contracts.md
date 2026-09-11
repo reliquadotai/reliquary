@@ -2,6 +2,10 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Repoussé après l'isolation des tâches (2026-09-11).** Ce plan rend les paramètres de *la*
+> tâche qui tourne modifiables sans release miner. Ce n'est pas ce qui débloque la création
+> d'une deuxième tâche : voir `2026-09-11-task-isolation.md`, à exécuter d'abord.
+
 **Goal:** Finish the emission price (restore its state across restarts, arm it behind a switch) and make a task's generation parameters a contract the miner applies instead of a profile it must be recompiled for.
 
 **Architecture:** The price controller already runs in shadow; it gains a startup restore from archives, a disarmed-by-default switch that feeds its price into the fill-closed window pool, and a recovery journal that remembers the pool a window opened with. Contracts reuse `ProtocolProfile.to_generation_contract()` byte for byte: the profile resolver can build `ACTIVE_PROTOCOL_PROFILE` from a contract file, so every import-time constant derives from it unchanged; a contract may retune only an allowlist of fields of its compiled base profile; a contract-driven miner stages a new contract and restarts onto it, exactly as it already does for checkpoint activation.
